@@ -36,6 +36,7 @@ pub fn route(method: []const u8, path: []const u8) !Route {
         if (parts.next()) |suffix| {
             if (parts.next() != null) return error.MemoryRouteNotFound;
             if (std.mem.eql(u8, suffix, "explain") and std.mem.eql(u8, method, "POST")) return .{ .space = space, .id = id.?, .action = .explain };
+            if (std.mem.eql(u8, suffix, "supersession-candidates") and std.mem.eql(u8, method, "POST")) return .{ .space = space, .id = id.?, .action = .supersession_candidates };
             if (!std.mem.eql(u8, suffix, "history") or !std.mem.eql(u8, method, "GET")) return error.MemoryRouteNotFound;
             return .{ .space = space, .id = id.?, .action = .history };
         }
@@ -45,6 +46,44 @@ pub fn route(method: []const u8, path: []const u8) !Route {
     if (std.mem.eql(u8, resource, "episodes")) {
         if (parts.next() != null or !std.mem.eql(u8, method, "GET")) return error.MemoryRouteNotFound;
         return .{ .space = space, .id = id orelse "", .action = if (id == null) .episodes else .episode };
+    }
+    if (std.mem.eql(u8, resource, "evaluation-datasets")) {
+        if (id) |dataset_id| {
+            if (parts.next()) |suffix| {
+                if (parts.next() != null or !std.mem.eql(u8, suffix, "cases") or !std.mem.eql(u8, method, "GET")) return error.MemoryRouteNotFound;
+                return .{ .space = space, .id = dataset_id, .action = .evaluation_cases };
+            }
+            if (!std.mem.eql(u8, method, "GET")) return error.MethodNotAllowed;
+            return .{ .space = space, .id = dataset_id, .action = .evaluation_dataset };
+        }
+        if (!std.mem.eql(u8, method, "POST")) return error.MethodNotAllowed;
+        return .{ .space = space, .action = .put_evaluation_dataset };
+    }
+    if (std.mem.eql(u8, resource, "evaluations")) {
+        if (id) |run_id| {
+            if (parts.next()) |suffix| {
+                if (parts.next() != null) return error.MemoryRouteNotFound;
+                if (std.mem.eql(u8, suffix, "results") and std.mem.eql(u8, method, "GET")) return .{ .space = space, .id = run_id, .action = .evaluation_results };
+                if (std.mem.eql(u8, suffix, "tasks") and (std.mem.eql(u8, method, "GET") or std.mem.eql(u8, method, "POST"))) return .{ .space = space, .id = run_id, .action = .evaluation_tasks };
+                if (std.mem.eql(u8, suffix, "verdicts") and std.mem.eql(u8, method, "POST")) return .{ .space = space, .id = run_id, .action = .evaluation_verdict };
+                return error.MemoryRouteNotFound;
+            }
+            if (!std.mem.eql(u8, method, "GET")) return error.MethodNotAllowed;
+            return .{ .space = space, .id = run_id, .action = .evaluation_run };
+        }
+        if (!std.mem.eql(u8, method, "POST")) return error.MethodNotAllowed;
+        return .{ .space = space, .action = .start_evaluation };
+    }
+    if (std.mem.eql(u8, resource, "supersession-proposals")) {
+        if (id) |proposal_id| {
+            if (parts.next()) |suffix| {
+                if (parts.next() != null or !std.mem.eql(u8, suffix, "verdict") or !std.mem.eql(u8, method, "POST")) return error.MemoryRouteNotFound;
+                return .{ .space = space, .id = proposal_id, .action = .review_supersession };
+            }
+            if (!std.mem.eql(u8, method, "GET")) return error.MethodNotAllowed;
+            return .{ .space = space, .id = proposal_id, .action = .supersession_proposal };
+        }
+        return .{ .space = space, .action = if (std.mem.eql(u8, method, "GET")) .supersession_proposals else if (std.mem.eql(u8, method, "POST")) .propose_supersession else return error.MethodNotAllowed };
     }
     if (std.mem.eql(u8, resource, "relationship-proposals")) {
         if (id) |proposal_id| {
@@ -85,6 +124,11 @@ pub fn route(method: []const u8, path: []const u8) !Route {
     }
     if (std.mem.eql(u8, resource, "configurations") and id != null and parts.next() == null and std.mem.eql(u8, method, "GET")) return .{ .space = space, .action = .configuration, .id = id.? };
     if (std.mem.eql(u8, resource, "evidence") and id != null and parts.next() == null and std.mem.eql(u8, method, "GET")) return .{ .space = space, .action = .evidence, .id = id.? };
+    if (std.mem.eql(u8, resource, "lineage") and id == null) return .{ .space = space, .action = if (std.mem.eql(u8, method, "GET")) .lineage else return error.MethodNotAllowed };
+    if (id == null and std.mem.eql(u8, method, "POST")) {
+        inline for (.{ .{ "forks", memory.Action.fork_lineage }, .{ "checkpoints", memory.Action.checkpoint_lineage }, .{ "reverts", memory.Action.revert_lineage } }) |entry| if (std.mem.eql(u8, resource, entry[0])) return .{ .space = space, .action = entry[1] };
+    }
+    if (std.mem.eql(u8, resource, "changes") and id == null and (std.mem.eql(u8, method, "GET") or std.mem.eql(u8, method, "POST"))) return .{ .space = space, .action = .changes };
     if (id != null) return error.MemoryRouteNotFound;
     if (std.mem.eql(u8, resource, "entity-corrections") and std.mem.eql(u8, method, "POST")) return .{ .space = space, .action = .curate_entity };
     if (std.mem.eql(u8, resource, "entities") and std.mem.eql(u8, method, "GET")) return .{ .space = space, .action = .entities };
@@ -120,6 +164,7 @@ test "memory route separates native operations and rejects unknown paths" {
 }
 
 pub const Request = struct {
+    branch: []const u8 = "",
     database: []const u8 = "default",
     namespace: []const u8 = "public",
     action: memory.Action,

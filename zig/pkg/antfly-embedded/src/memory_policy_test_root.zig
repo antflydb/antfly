@@ -19,4 +19,7 @@ test {
     _ = @import("memory/schema.zig");
     _ = @import("memory/recall_windows.zig");
     _ = @import("memory/recall_filters.zig");
+    _ = @import("memory/secret_screening.zig");
+    _ = @import("memory/persistent_index.zig");
+    _ = @import("memory/evaluation.zig");
 }

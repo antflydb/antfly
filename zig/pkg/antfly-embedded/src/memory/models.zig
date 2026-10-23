@@ -37,7 +37,11 @@ pub const Bridge = struct {
     }
 
     pub fn backend(self: *Bridge) service.Backend {
-        return .{ .ptr = self, .get = get, .get_many = if (self.base.get_many != null) getMany else null, .drop_index = if (self.base.drop_index != null) dropIndex else null, .ensure_text_index = if (self.base.ensure_text_index != null) ensureTextIndex else null, .search_assertions = if (self.base.search_assertions != null) searchAssertions else null, .scan = scan, .commit = commit, .resource = if (self.base.resource != null) resource else null, .generate = if (self.producer != null) generate else null, .embed = embed, .decide = if (self.producer != null) decide else null, .embed_document = embedDocument, .embed_batch = embedBatch, .neighbors = if (self.base.neighbors != null) neighbors else null, .ensure_vector_index = if (self.base.ensure_vector_index != null) ensureVectorIndex else null, .validate_models = validate };
+        return .{ .ptr = self, .evaluate = if (self.producer != null) evaluate else null, .random_bytes = if (self.base.random_bytes != null) randomBytes else null, .get = get, .get_many = if (self.base.get_many != null) getMany else null, .drop_index = if (self.base.drop_index != null) dropIndex else null, .ensure_text_index = if (self.base.ensure_text_index != null) ensureTextIndex else null, .search_assertions = if (self.base.search_assertions != null) searchAssertions else null, .scan = scan, .commit = commit, .resource = if (self.base.resource != null) resource else null, .generate = if (self.producer != null) generate else null, .embed = embed, .decide = if (self.producer != null) decide else null, .embed_document = embedDocument, .embed_batch = embedBatch, .neighbors = if (self.base.neighbors != null) neighbors else null, .ensure_vector_index = if (self.base.ensure_vector_index != null) ensureVectorIndex else null, .validate_models = validate };
+    }
+    fn randomBytes(ptr: *anyopaque, bytes: []u8) !void {
+        const self: *Bridge = @ptrCast(@alignCast(ptr));
+        try self.base.random_bytes.?(self.base.ptr, bytes);
     }
     fn dropIndex(ptr: *anyopaque, a: A, name: []const u8) !void {
         const self: *Bridge = @ptrCast(@alignCast(ptr));
@@ -169,6 +173,13 @@ pub const Bridge = struct {
         const output: t.Generated = .{ .assertions = claims.items, .entities = entities.items, .mentions = mentions.items };
         try plan.validatePublication(output);
         return output;
+    }
+    fn evaluate(ptr: *anyopaque, a: A, config: t.Config, model: t.Model, input: t.evaluation.JudgeInput, boundary: service.InferenceBoundary) !t.evaluation.JudgeOutput {
+        const self: *Bridge = @ptrCast(@alignCast(ptr));
+        return self.produce(a, config, model, t.evaluation.JudgeOutput, "Evaluate only the supplied frozen input. For identity use same/different; for a proposed relationship use related/unrelated; for supersession use supersedes/contradicts/restates/independent. Use null when evidence is insufficient. Retrieval returns unique relevant IDs in ranking order instead of a label. Never infer a gold label from IDs, fixture names or evaluation metadata. Explain the evidence in reason.", input, boundary) catch |err| switch (err) {
+            error.SyntaxError, error.UnexpectedToken, error.MissingField, error.UnknownField, error.InvalidEnumTag, error.InvalidNumber, error.Overflow, error.LengthMismatch => error.MemoryUngroundedOutput,
+            else => err,
+        };
     }
     fn decide(ptr: *anyopaque, a: A, config: t.Config, incoming: t.Assertion, candidates: []const t.StoredAssertion) !t.ReconciliationDecision {
         const self: *Bridge = @ptrCast(@alignCast(ptr));

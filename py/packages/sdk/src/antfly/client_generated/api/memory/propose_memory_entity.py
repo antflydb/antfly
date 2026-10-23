@@ -18,6 +18,7 @@ def _get_kwargs(
     body: MemoryEntityProposalRequest,
     x_antfly_database: str | Unset = "default",
     x_antfly_namespace: str | Unset = "public",
+    x_antfly_memory_branch: str | Unset = "",
     idempotency_key: str,
 ) -> dict[str, Any]:
     headers: dict[str, Any] = {}
@@ -26,6 +27,9 @@ def _get_kwargs(
 
     if not isinstance(x_antfly_namespace, Unset):
         headers["X-Antfly-Namespace"] = x_antfly_namespace
+
+    if not isinstance(x_antfly_memory_branch, Unset):
+        headers["X-Antfly-Memory-Branch"] = x_antfly_memory_branch
 
     headers["Idempotency-Key"] = idempotency_key
 
@@ -121,6 +125,7 @@ def sync_detailed(
     body: MemoryEntityProposalRequest,
     x_antfly_database: str | Unset = "default",
     x_antfly_namespace: str | Unset = "public",
+    x_antfly_memory_branch: str | Unset = "",
     idempotency_key: str,
 ) -> Response[MemoryError_ | MemoryOperation]:
     """
@@ -128,6 +133,7 @@ def sync_detailed(
         space (str):
         x_antfly_database (str | Unset):  Default: 'default'.
         x_antfly_namespace (str | Unset):  Default: 'public'.
+        x_antfly_memory_branch (str | Unset):  Default: ''.
         idempotency_key (str):
         body (MemoryEntityProposalRequest):
 
@@ -144,6 +150,7 @@ def sync_detailed(
         body=body,
         x_antfly_database=x_antfly_database,
         x_antfly_namespace=x_antfly_namespace,
+        x_antfly_memory_branch=x_antfly_memory_branch,
         idempotency_key=idempotency_key,
     )
 
@@ -161,6 +168,7 @@ def sync(
     body: MemoryEntityProposalRequest,
     x_antfly_database: str | Unset = "default",
     x_antfly_namespace: str | Unset = "public",
+    x_antfly_memory_branch: str | Unset = "",
     idempotency_key: str,
 ) -> MemoryError_ | MemoryOperation | None:
     """
@@ -168,6 +176,7 @@ def sync(
         space (str):
         x_antfly_database (str | Unset):  Default: 'default'.
         x_antfly_namespace (str | Unset):  Default: 'public'.
+        x_antfly_memory_branch (str | Unset):  Default: ''.
         idempotency_key (str):
         body (MemoryEntityProposalRequest):
 
@@ -185,6 +194,7 @@ def sync(
         body=body,
         x_antfly_database=x_antfly_database,
         x_antfly_namespace=x_antfly_namespace,
+        x_antfly_memory_branch=x_antfly_memory_branch,
         idempotency_key=idempotency_key,
     ).parsed
 
@@ -196,6 +206,7 @@ async def asyncio_detailed(
     body: MemoryEntityProposalRequest,
     x_antfly_database: str | Unset = "default",
     x_antfly_namespace: str | Unset = "public",
+    x_antfly_memory_branch: str | Unset = "",
     idempotency_key: str,
 ) -> Response[MemoryError_ | MemoryOperation]:
     """
@@ -203,6 +214,7 @@ async def asyncio_detailed(
         space (str):
         x_antfly_database (str | Unset):  Default: 'default'.
         x_antfly_namespace (str | Unset):  Default: 'public'.
+        x_antfly_memory_branch (str | Unset):  Default: ''.
         idempotency_key (str):
         body (MemoryEntityProposalRequest):
 
@@ -219,6 +231,7 @@ async def asyncio_detailed(
         body=body,
         x_antfly_database=x_antfly_database,
         x_antfly_namespace=x_antfly_namespace,
+        x_antfly_memory_branch=x_antfly_memory_branch,
         idempotency_key=idempotency_key,
     )
 
@@ -234,6 +247,7 @@ async def asyncio(
     body: MemoryEntityProposalRequest,
     x_antfly_database: str | Unset = "default",
     x_antfly_namespace: str | Unset = "public",
+    x_antfly_memory_branch: str | Unset = "",
     idempotency_key: str,
 ) -> MemoryError_ | MemoryOperation | None:
     """
@@ -241,6 +255,7 @@ async def asyncio(
         space (str):
         x_antfly_database (str | Unset):  Default: 'default'.
         x_antfly_namespace (str | Unset):  Default: 'public'.
+        x_antfly_memory_branch (str | Unset):  Default: ''.
         idempotency_key (str):
         body (MemoryEntityProposalRequest):
 
@@ -259,6 +274,7 @@ async def asyncio(
             body=body,
             x_antfly_database=x_antfly_database,
             x_antfly_namespace=x_antfly_namespace,
+            x_antfly_memory_branch=x_antfly_memory_branch,
             idempotency_key=idempotency_key,
         )
     ).parsed

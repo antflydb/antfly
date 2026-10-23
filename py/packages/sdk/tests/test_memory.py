@@ -147,3 +147,33 @@ def test_generated_memory_reads_decode_native_service_fixtures() -> None:
         assert details.inputs.entities[0].revision == 3
         assert details.reason is None
         assert details.stale_configuration is False
+
+
+def test_memory_branch_feed_supersession_and_evaluation_share_authenticated_transport() -> None:
+    client = AntflyClient("http://memory.test", token="reviewer")
+    seen = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(200, json={})
+
+    with httpx.Client(base_url=client.base_url, transport=httpx.MockTransport(respond)) as http:
+        client._client.set_httpx_client(http)
+        client.memory.execute("team", "changes", body={"cursor": "resume"}, branch="fork")
+        client.memory.execute("team", "supersession_candidates", id="claim/a", branch="fork")
+        client.memory.execute("team", "evaluation_tasks", id="run/a")
+        client.memory.execute(
+            "team",
+            "review_supersession",
+            id="pair/a",
+            branch="fork",
+            body={"expected_revision": 7, "verdict": None},
+            idempotency_key="defer",
+        )
+    assert all(request.method == "POST" for request in seen)
+    assert all("idempotency-key" not in request.headers for request in seen[:3])
+    assert seen[0].headers["x-antfly-memory-branch"] == "fork"
+    assert seen[1].url.raw_path == b"/memory/v1/spaces/team/memories/claim%2Fa/supersession-candidates"
+    assert seen[2].url.raw_path == b"/memory/v1/spaces/team/evaluations/run%2Fa/tasks"
+    assert seen[3].url.raw_path == b"/memory/v1/spaces/team/supersession-proposals/pair%2Fa/verdict"
+    assert seen[3].headers["idempotency-key"] == "defer"

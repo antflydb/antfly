@@ -17,6 +17,9 @@ if TYPE_CHECKING:
     from ..models.memory_inspection_state_pending_config_type_0_features import (
         MemoryInspectionStatePendingConfigType0Features,
     )
+    from ..models.memory_inspection_state_pending_config_type_0_intake_screening import (
+        MemoryInspectionStatePendingConfigType0IntakeScreening,
+    )
     from ..models.memory_inspection_state_pending_config_type_0_models import (
         MemoryInspectionStatePendingConfigType0Models,
     )
@@ -46,6 +49,7 @@ class MemoryInspectionStatePendingConfigType0:
         ontology_version (str | Unset):
         policy_version (str | Unset):
         features (MemoryInspectionStatePendingConfigType0Features | Unset):
+        intake_screening (MemoryInspectionStatePendingConfigType0IntakeScreening | Unset):
         models (MemoryInspectionStatePendingConfigType0Models | Unset):
         semantic_discovery (MemoryInspectionStatePendingConfigType0SemanticDiscovery | Unset):
         ontology_pack (MemoryInspectionStatePendingConfigType0OntologyPack | Unset):  Default:
@@ -57,6 +61,7 @@ class MemoryInspectionStatePendingConfigType0:
         max_attempts (int | Unset):  Default: 3.
         max_recall_tokens (int | Unset):  Default: 8192.
         retention_ms (int | None | Unset):
+        change_retention_ms (int | Unset):  Default: 604800000.
     """
 
     version: int | Unset = 1
@@ -68,6 +73,7 @@ class MemoryInspectionStatePendingConfigType0:
     ontology_version: str | Unset = UNSET
     policy_version: str | Unset = UNSET
     features: MemoryInspectionStatePendingConfigType0Features | Unset = UNSET
+    intake_screening: MemoryInspectionStatePendingConfigType0IntakeScreening | Unset = UNSET
     models: MemoryInspectionStatePendingConfigType0Models | Unset = UNSET
     semantic_discovery: MemoryInspectionStatePendingConfigType0SemanticDiscovery | Unset = UNSET
     ontology_pack: MemoryInspectionStatePendingConfigType0OntologyPack | Unset = (
@@ -80,6 +86,7 @@ class MemoryInspectionStatePendingConfigType0:
     max_attempts: int | Unset = 3
     max_recall_tokens: int | Unset = 8192
     retention_ms: int | None | Unset = UNSET
+    change_retention_ms: int | Unset = 604800000
 
     def to_dict(self) -> dict[str, Any]:
         version = self.version
@@ -99,6 +106,10 @@ class MemoryInspectionStatePendingConfigType0:
         features: dict[str, Any] | Unset = UNSET
         if not isinstance(self.features, Unset):
             features = self.features.to_dict()
+
+        intake_screening: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.intake_screening, Unset):
+            intake_screening = self.intake_screening.to_dict()
 
         models: dict[str, Any] | Unset = UNSET
         if not isinstance(self.models, Unset):
@@ -140,6 +151,8 @@ class MemoryInspectionStatePendingConfigType0:
         else:
             retention_ms = self.retention_ms
 
+        change_retention_ms = self.change_retention_ms
+
         field_dict: dict[str, Any] = {}
 
         field_dict.update({})
@@ -157,6 +170,8 @@ class MemoryInspectionStatePendingConfigType0:
             field_dict["policy_version"] = policy_version
         if features is not UNSET:
             field_dict["features"] = features
+        if intake_screening is not UNSET:
+            field_dict["intake_screening"] = intake_screening
         if models is not UNSET:
             field_dict["models"] = models
         if semantic_discovery is not UNSET:
@@ -177,6 +192,8 @@ class MemoryInspectionStatePendingConfigType0:
             field_dict["max_recall_tokens"] = max_recall_tokens
         if retention_ms is not UNSET:
             field_dict["retention_ms"] = retention_ms
+        if change_retention_ms is not UNSET:
+            field_dict["change_retention_ms"] = change_retention_ms
 
         return field_dict
 
@@ -184,6 +201,9 @@ class MemoryInspectionStatePendingConfigType0:
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
         from ..models.memory_inspection_state_pending_config_type_0_features import (
             MemoryInspectionStatePendingConfigType0Features,
+        )
+        from ..models.memory_inspection_state_pending_config_type_0_intake_screening import (
+            MemoryInspectionStatePendingConfigType0IntakeScreening,
         )
         from ..models.memory_inspection_state_pending_config_type_0_models import (
             MemoryInspectionStatePendingConfigType0Models,
@@ -222,6 +242,13 @@ class MemoryInspectionStatePendingConfigType0:
             features = UNSET
         else:
             features = MemoryInspectionStatePendingConfigType0Features.from_dict(_features)
+
+        _intake_screening = d.pop("intake_screening", UNSET)
+        intake_screening: MemoryInspectionStatePendingConfigType0IntakeScreening | Unset
+        if isinstance(_intake_screening, Unset):
+            intake_screening = UNSET
+        else:
+            intake_screening = MemoryInspectionStatePendingConfigType0IntakeScreening.from_dict(_intake_screening)
 
         _models = d.pop("models", UNSET)
         models: MemoryInspectionStatePendingConfigType0Models | Unset
@@ -281,6 +308,8 @@ class MemoryInspectionStatePendingConfigType0:
 
         retention_ms = _parse_retention_ms(d.pop("retention_ms", UNSET))
 
+        change_retention_ms = d.pop("change_retention_ms", UNSET)
+
         memory_inspection_state_pending_config_type_0 = cls(
             version=version,
             generation=generation,
@@ -289,6 +318,7 @@ class MemoryInspectionStatePendingConfigType0:
             ontology_version=ontology_version,
             policy_version=policy_version,
             features=features,
+            intake_screening=intake_screening,
             models=models,
             semantic_discovery=semantic_discovery,
             ontology_pack=ontology_pack,
@@ -299,6 +329,7 @@ class MemoryInspectionStatePendingConfigType0:
             max_attempts=max_attempts,
             max_recall_tokens=max_recall_tokens,
             retention_ms=retention_ms,
+            change_retention_ms=change_retention_ms,
         )
 
         return memory_inspection_state_pending_config_type_0

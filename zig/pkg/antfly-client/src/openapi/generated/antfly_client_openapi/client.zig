@@ -514,6 +514,12 @@ pub const CleanupTransactionSessionsParams = struct {
     cutoff_ns: ?[]const u8 = null,
 };
 
+pub const FollowMemoryChangesParams = struct {
+    cursor: ?[]const u8 = null,
+    limit: ?[]const u8 = null,
+    start: ?[]const u8 = null,
+};
+
 pub const ListMemoryEntitiesParams = struct {
     cursor: ?[]const u8 = null,
     limit: ?[]const u8 = null,
@@ -536,6 +542,21 @@ pub const GetMemoryEpisodeParams = struct {
     known_at: ?[]const u8 = null,
 };
 
+pub const GetMemoryEvaluationCasesParams = struct {
+    cursor: ?[]const u8 = null,
+    limit: ?[]const u8 = null,
+};
+
+pub const GetMemoryEvaluationResultsParams = struct {
+    cursor: ?[]const u8 = null,
+    limit: ?[]const u8 = null,
+};
+
+pub const GetMemoryEvaluationTasksParams = struct {
+    cursor: ?[]const u8 = null,
+    limit: ?[]const u8 = null,
+};
+
 pub const ListMemoriesParams = struct {
     cursor: ?[]const u8 = null,
     limit: ?[]const u8 = null,
@@ -555,6 +576,11 @@ pub const ListMemoriesParams = struct {
 };
 
 pub const GetMemoryHistoryParams = struct {
+    cursor: ?[]const u8 = null,
+    limit: ?[]const u8 = null,
+};
+
+pub const ListMemorySupersessionProposalsParams = struct {
     cursor: ?[]const u8 = null,
     limit: ?[]const u8 = null,
 };
@@ -4949,7 +4975,7 @@ pub const Client = struct {
     }
 
     /// POST /memory/v1/spaces
-    pub fn createMemorySpace(self: *@This(), body: types.MemoryCreateSpaceRequest, x_antfly_database: ?[]const u8, x_antfly_namespace: ?[]const u8, idempotency_key: []const u8) !ApiResponse(types.MemoryOperation) {
+    pub fn createMemorySpace(self: *@This(), body: types.MemoryCreateSpaceRequest, x_antfly_database: ?[]const u8, x_antfly_namespace: ?[]const u8, x_antfly_memory_branch: ?[]const u8, idempotency_key: []const u8) !ApiResponse(types.MemoryOperation) {
         const url = try std.fmt.allocPrint(self.allocator, "{s}/memory/v1/spaces", .{self.base_url});
         defer self.allocator.free(url);
         const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
@@ -4959,13 +4985,14 @@ pub const Client = struct {
         if (self.auth_header) |header| try request_headers.append(self.allocator, header);
         if (x_antfly_database) |value| try request_headers.append(self.allocator, .{ "X-Antfly-Database", value });
         if (x_antfly_namespace) |value| try request_headers.append(self.allocator, .{ "X-Antfly-Namespace", value });
+        if (x_antfly_memory_branch) |value| try request_headers.append(self.allocator, .{ "X-Antfly-Memory-Branch", value });
         try request_headers.append(self.allocator, .{ "Idempotency-Key", idempotency_key });
         var resp = try self.http.post(url, .{ .json = json_body, .headers = request_headers.items });
         return ApiResponse(types.MemoryOperation).fromResponse(self.allocator, &resp);
     }
 
     /// GET /memory/v1/spaces/{space}
-    pub fn getMemorySpace(self: *@This(), space: []const u8, x_antfly_database: ?[]const u8, x_antfly_namespace: ?[]const u8) !ApiResponse(types.MemoryInspection) {
+    pub fn getMemorySpace(self: *@This(), space: []const u8, x_antfly_database: ?[]const u8, x_antfly_namespace: ?[]const u8, x_antfly_memory_branch: ?[]const u8) !ApiResponse(types.MemoryInspection) {
         const encoded_space = try httpx.PercentEncoding.encode(self.allocator, space);
         defer self.allocator.free(encoded_space);
         const url = try std.fmt.allocPrint(self.allocator, "{s}/memory/v1/spaces/{s}", .{ self.base_url, encoded_space });
@@ -4975,12 +5002,13 @@ pub const Client = struct {
         if (self.auth_header) |header| try request_headers.append(self.allocator, header);
         if (x_antfly_database) |value| try request_headers.append(self.allocator, .{ "X-Antfly-Database", value });
         if (x_antfly_namespace) |value| try request_headers.append(self.allocator, .{ "X-Antfly-Namespace", value });
+        if (x_antfly_memory_branch) |value| try request_headers.append(self.allocator, .{ "X-Antfly-Memory-Branch", value });
         var resp = try self.http.get(url, .{ .headers = request_headers.items });
         return ApiResponse(types.MemoryInspection).fromResponse(self.allocator, &resp);
     }
 
     /// PATCH /memory/v1/spaces/{space}
-    pub fn configureMemorySpace(self: *@This(), space: []const u8, body: types.MemoryConfigureRequest, x_antfly_database: ?[]const u8, x_antfly_namespace: ?[]const u8, idempotency_key: []const u8) !ApiResponse(types.MemoryOperation) {
+    pub fn configureMemorySpace(self: *@This(), space: []const u8, body: types.MemoryConfigureRequest, x_antfly_database: ?[]const u8, x_antfly_namespace: ?[]const u8, x_antfly_memory_branch: ?[]const u8, idempotency_key: []const u8) !ApiResponse(types.MemoryOperation) {
         const encoded_space = try httpx.PercentEncoding.encode(self.allocator, space);
         defer self.allocator.free(encoded_space);
         const url = try std.fmt.allocPrint(self.allocator, "{s}/memory/v1/spaces/{s}", .{ self.base_url, encoded_space });
@@ -4992,13 +5020,14 @@ pub const Client = struct {
         if (self.auth_header) |header| try request_headers.append(self.allocator, header);
         if (x_antfly_database) |value| try request_headers.append(self.allocator, .{ "X-Antfly-Database", value });
         if (x_antfly_namespace) |value| try request_headers.append(self.allocator, .{ "X-Antfly-Namespace", value });
+        if (x_antfly_memory_branch) |value| try request_headers.append(self.allocator, .{ "X-Antfly-Memory-Branch", value });
         try request_headers.append(self.allocator, .{ "Idempotency-Key", idempotency_key });
         var resp = try self.http.patch(url, .{ .json = json_body, .headers = request_headers.items });
         return ApiResponse(types.MemoryOperation).fromResponse(self.allocator, &resp);
     }
 
     /// POST /memory/v1/spaces/{space}/assertions
-    pub fn storeMemoryAssertions(self: *@This(), space: []const u8, body: types.MemoryAssertionRequest, x_antfly_database: ?[]const u8, x_antfly_namespace: ?[]const u8, idempotency_key: []const u8) !ApiResponse(types.MemoryOperation) {
+    pub fn storeMemoryAssertions(self: *@This(), space: []const u8, body: types.MemoryAssertionRequest, x_antfly_database: ?[]const u8, x_antfly_namespace: ?[]const u8, x_antfly_memory_branch: ?[]const u8, idempotency_key: []const u8) !ApiResponse(types.MemoryOperation) {
         const encoded_space = try httpx.PercentEncoding.encode(self.allocator, space);
         defer self.allocator.free(encoded_space);
         const url = try std.fmt.allocPrint(self.allocator, "{s}/memory/v1/spaces/{s}/assertions", .{ self.base_url, encoded_space });
@@ -5010,13 +5039,99 @@ pub const Client = struct {
         if (self.auth_header) |header| try request_headers.append(self.allocator, header);
         if (x_antfly_database) |value| try request_headers.append(self.allocator, .{ "X-Antfly-Database", value });
         if (x_antfly_namespace) |value| try request_headers.append(self.allocator, .{ "X-Antfly-Namespace", value });
+        if (x_antfly_memory_branch) |value| try request_headers.append(self.allocator, .{ "X-Antfly-Memory-Branch", value });
+        try request_headers.append(self.allocator, .{ "Idempotency-Key", idempotency_key });
+        var resp = try self.http.post(url, .{ .json = json_body, .headers = request_headers.items });
+        return ApiResponse(types.MemoryOperation).fromResponse(self.allocator, &resp);
+    }
+
+    /// GET /memory/v1/spaces/{space}/changes
+    pub fn followMemoryChanges(self: *@This(), space: []const u8, x_antfly_database: ?[]const u8, x_antfly_namespace: ?[]const u8, x_antfly_memory_branch: ?[]const u8, params: FollowMemoryChangesParams) !ApiResponse(types.MemoryChangePage) {
+        const encoded_space = try httpx.PercentEncoding.encode(self.allocator, space);
+        defer self.allocator.free(encoded_space);
+        var url = try std.fmt.allocPrint(self.allocator, "{s}/memory/v1/spaces/{s}/changes", .{ self.base_url, encoded_space });
+        defer self.allocator.free(url);
+        var query_buf = std.ArrayListUnmanaged(u8).empty;
+        defer query_buf.deinit(self.allocator);
+        var sep: u8 = '?';
+        if (params.cursor) |v| {
+            const encoded_query_value = try httpx.PercentEncoding.encode(self.allocator, v);
+            defer self.allocator.free(encoded_query_value);
+            try query_buf.appendSlice(self.allocator, &.{sep});
+            try query_buf.appendSlice(self.allocator, "cursor=");
+            try query_buf.appendSlice(self.allocator, encoded_query_value);
+            sep = '&';
+        }
+        if (params.limit) |v| {
+            const encoded_query_value = try httpx.PercentEncoding.encode(self.allocator, v);
+            defer self.allocator.free(encoded_query_value);
+            try query_buf.appendSlice(self.allocator, &.{sep});
+            try query_buf.appendSlice(self.allocator, "limit=");
+            try query_buf.appendSlice(self.allocator, encoded_query_value);
+            sep = '&';
+        }
+        if (params.start) |v| {
+            const encoded_query_value = try httpx.PercentEncoding.encode(self.allocator, v);
+            defer self.allocator.free(encoded_query_value);
+            try query_buf.appendSlice(self.allocator, &.{sep});
+            try query_buf.appendSlice(self.allocator, "start=");
+            try query_buf.appendSlice(self.allocator, encoded_query_value);
+            sep = '&';
+        }
+        if (query_buf.items.len > 0) {
+            const new_url = try std.fmt.allocPrint(self.allocator, "{s}{s}", .{ url, query_buf.items });
+            self.allocator.free(url);
+            url = new_url;
+        }
+        var request_headers = std.ArrayListUnmanaged([2][]const u8).empty;
+        defer request_headers.deinit(self.allocator);
+        if (self.auth_header) |header| try request_headers.append(self.allocator, header);
+        if (x_antfly_database) |value| try request_headers.append(self.allocator, .{ "X-Antfly-Database", value });
+        if (x_antfly_namespace) |value| try request_headers.append(self.allocator, .{ "X-Antfly-Namespace", value });
+        if (x_antfly_memory_branch) |value| try request_headers.append(self.allocator, .{ "X-Antfly-Memory-Branch", value });
+        var resp = try self.http.get(url, .{ .headers = request_headers.items });
+        return ApiResponse(types.MemoryChangePage).fromResponse(self.allocator, &resp);
+    }
+
+    /// POST /memory/v1/spaces/{space}/changes
+    pub fn pollMemoryChanges(self: *@This(), space: []const u8, body: types.MemoryChangeRequest, x_antfly_database: ?[]const u8, x_antfly_namespace: ?[]const u8, x_antfly_memory_branch: ?[]const u8) !ApiResponse(types.MemoryChangePage) {
+        const encoded_space = try httpx.PercentEncoding.encode(self.allocator, space);
+        defer self.allocator.free(encoded_space);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/memory/v1/spaces/{s}/changes", .{ self.base_url, encoded_space });
+        defer self.allocator.free(url);
+        const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
+        defer self.allocator.free(json_body);
+        var request_headers = std.ArrayListUnmanaged([2][]const u8).empty;
+        defer request_headers.deinit(self.allocator);
+        if (self.auth_header) |header| try request_headers.append(self.allocator, header);
+        if (x_antfly_database) |value| try request_headers.append(self.allocator, .{ "X-Antfly-Database", value });
+        if (x_antfly_namespace) |value| try request_headers.append(self.allocator, .{ "X-Antfly-Namespace", value });
+        if (x_antfly_memory_branch) |value| try request_headers.append(self.allocator, .{ "X-Antfly-Memory-Branch", value });
+        var resp = try self.http.post(url, .{ .json = json_body, .headers = request_headers.items });
+        return ApiResponse(types.MemoryChangePage).fromResponse(self.allocator, &resp);
+    }
+
+    /// POST /memory/v1/spaces/{space}/checkpoints
+    pub fn checkpointMemoryLineage(self: *@This(), space: []const u8, body: types.MemoryLineageCheckpointRequest, x_antfly_database: ?[]const u8, x_antfly_namespace: ?[]const u8, x_antfly_memory_branch: ?[]const u8, idempotency_key: []const u8) !ApiResponse(types.MemoryOperation) {
+        const encoded_space = try httpx.PercentEncoding.encode(self.allocator, space);
+        defer self.allocator.free(encoded_space);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/memory/v1/spaces/{s}/checkpoints", .{ self.base_url, encoded_space });
+        defer self.allocator.free(url);
+        const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
+        defer self.allocator.free(json_body);
+        var request_headers = std.ArrayListUnmanaged([2][]const u8).empty;
+        defer request_headers.deinit(self.allocator);
+        if (self.auth_header) |header| try request_headers.append(self.allocator, header);
+        if (x_antfly_database) |value| try request_headers.append(self.allocator, .{ "X-Antfly-Database", value });
+        if (x_antfly_namespace) |value| try request_headers.append(self.allocator, .{ "X-Antfly-Namespace", value });
+        if (x_antfly_memory_branch) |value| try request_headers.append(self.allocator, .{ "X-Antfly-Memory-Branch", value });
         try request_headers.append(self.allocator, .{ "Idempotency-Key", idempotency_key });
         var resp = try self.http.post(url, .{ .json = json_body, .headers = request_headers.items });
         return ApiResponse(types.MemoryOperation).fromResponse(self.allocator, &resp);
     }
 
     /// GET /memory/v1/spaces/{space}/configurations/{id}
-    pub fn getMemoryConfiguration(self: *@This(), space: []const u8, id: []const u8, x_antfly_database: ?[]const u8, x_antfly_namespace: ?[]const u8) !ApiResponse(types.MemorySpaceConfig) {
+    pub fn getMemoryConfiguration(self: *@This(), space: []const u8, id: []const u8, x_antfly_database: ?[]const u8, x_antfly_namespace: ?[]const u8, x_antfly_memory_branch: ?[]const u8) !ApiResponse(types.MemorySpaceConfig) {
         const encoded_space = try httpx.PercentEncoding.encode(self.allocator, space);
         defer self.allocator.free(encoded_space);
         const encoded_id = try httpx.PercentEncoding.encode(self.allocator, id);
@@ -5028,12 +5143,13 @@ pub const Client = struct {
         if (self.auth_header) |header| try request_headers.append(self.allocator, header);
         if (x_antfly_database) |value| try request_headers.append(self.allocator, .{ "X-Antfly-Database", value });
         if (x_antfly_namespace) |value| try request_headers.append(self.allocator, .{ "X-Antfly-Namespace", value });
+        if (x_antfly_memory_branch) |value| try request_headers.append(self.allocator, .{ "X-Antfly-Memory-Branch", value });
         var resp = try self.http.get(url, .{ .headers = request_headers.items });
         return ApiResponse(types.MemorySpaceConfig).fromResponse(self.allocator, &resp);
     }
 
     /// POST /memory/v1/spaces/{space}/corrections
-    pub fn correctMemory(self: *@This(), space: []const u8, body: types.MemoryCorrection, x_antfly_database: ?[]const u8, x_antfly_namespace: ?[]const u8, idempotency_key: []const u8) !ApiResponse(types.MemoryOperation) {
+    pub fn correctMemory(self: *@This(), space: []const u8, body: types.MemoryCorrection, x_antfly_database: ?[]const u8, x_antfly_namespace: ?[]const u8, x_antfly_memory_branch: ?[]const u8, idempotency_key: []const u8) !ApiResponse(types.MemoryOperation) {
         const encoded_space = try httpx.PercentEncoding.encode(self.allocator, space);
         defer self.allocator.free(encoded_space);
         const url = try std.fmt.allocPrint(self.allocator, "{s}/memory/v1/spaces/{s}/corrections", .{ self.base_url, encoded_space });
@@ -5045,13 +5161,14 @@ pub const Client = struct {
         if (self.auth_header) |header| try request_headers.append(self.allocator, header);
         if (x_antfly_database) |value| try request_headers.append(self.allocator, .{ "X-Antfly-Database", value });
         if (x_antfly_namespace) |value| try request_headers.append(self.allocator, .{ "X-Antfly-Namespace", value });
+        if (x_antfly_memory_branch) |value| try request_headers.append(self.allocator, .{ "X-Antfly-Memory-Branch", value });
         try request_headers.append(self.allocator, .{ "Idempotency-Key", idempotency_key });
         var resp = try self.http.post(url, .{ .json = json_body, .headers = request_headers.items });
         return ApiResponse(types.MemoryOperation).fromResponse(self.allocator, &resp);
     }
 
     /// POST /memory/v1/spaces/{space}/embeddings
-    pub fn stageMemoryEmbeddings(self: *@This(), space: []const u8, body: types.MemoryEmbeddingBatch, x_antfly_database: ?[]const u8, x_antfly_namespace: ?[]const u8, idempotency_key: []const u8) !ApiResponse(types.MemoryOperation) {
+    pub fn stageMemoryEmbeddings(self: *@This(), space: []const u8, body: types.MemoryEmbeddingBatch, x_antfly_database: ?[]const u8, x_antfly_namespace: ?[]const u8, x_antfly_memory_branch: ?[]const u8, idempotency_key: []const u8) !ApiResponse(types.MemoryOperation) {
         const encoded_space = try httpx.PercentEncoding.encode(self.allocator, space);
         defer self.allocator.free(encoded_space);
         const url = try std.fmt.allocPrint(self.allocator, "{s}/memory/v1/spaces/{s}/embeddings", .{ self.base_url, encoded_space });
@@ -5063,13 +5180,14 @@ pub const Client = struct {
         if (self.auth_header) |header| try request_headers.append(self.allocator, header);
         if (x_antfly_database) |value| try request_headers.append(self.allocator, .{ "X-Antfly-Database", value });
         if (x_antfly_namespace) |value| try request_headers.append(self.allocator, .{ "X-Antfly-Namespace", value });
+        if (x_antfly_memory_branch) |value| try request_headers.append(self.allocator, .{ "X-Antfly-Memory-Branch", value });
         try request_headers.append(self.allocator, .{ "Idempotency-Key", idempotency_key });
         var resp = try self.http.post(url, .{ .json = json_body, .headers = request_headers.items });
         return ApiResponse(types.MemoryOperation).fromResponse(self.allocator, &resp);
     }
 
     /// GET /memory/v1/spaces/{space}/entities
-    pub fn listMemoryEntities(self: *@This(), space: []const u8, x_antfly_database: ?[]const u8, x_antfly_namespace: ?[]const u8, params: ListMemoryEntitiesParams) !ApiResponse(types.MemoryEntityPage) {
+    pub fn listMemoryEntities(self: *@This(), space: []const u8, x_antfly_database: ?[]const u8, x_antfly_namespace: ?[]const u8, x_antfly_memory_branch: ?[]const u8, params: ListMemoryEntitiesParams) !ApiResponse(types.MemoryEntityPage) {
         const encoded_space = try httpx.PercentEncoding.encode(self.allocator, space);
         defer self.allocator.free(encoded_space);
         var url = try std.fmt.allocPrint(self.allocator, "{s}/memory/v1/spaces/{s}/entities", .{ self.base_url, encoded_space });
@@ -5103,12 +5221,13 @@ pub const Client = struct {
         if (self.auth_header) |header| try request_headers.append(self.allocator, header);
         if (x_antfly_database) |value| try request_headers.append(self.allocator, .{ "X-Antfly-Database", value });
         if (x_antfly_namespace) |value| try request_headers.append(self.allocator, .{ "X-Antfly-Namespace", value });
+        if (x_antfly_memory_branch) |value| try request_headers.append(self.allocator, .{ "X-Antfly-Memory-Branch", value });
         var resp = try self.http.get(url, .{ .headers = request_headers.items });
         return ApiResponse(types.MemoryEntityPage).fromResponse(self.allocator, &resp);
     }
 
     /// GET /memory/v1/spaces/{space}/entities/{id}
-    pub fn resolveMemoryEntity(self: *@This(), space: []const u8, id: []const u8, x_antfly_database: ?[]const u8, x_antfly_namespace: ?[]const u8) !ApiResponse(types.MemoryResult) {
+    pub fn resolveMemoryEntity(self: *@This(), space: []const u8, id: []const u8, x_antfly_database: ?[]const u8, x_antfly_namespace: ?[]const u8, x_antfly_memory_branch: ?[]const u8) !ApiResponse(types.MemoryResult) {
         const encoded_space = try httpx.PercentEncoding.encode(self.allocator, space);
         defer self.allocator.free(encoded_space);
         const encoded_id = try httpx.PercentEncoding.encode(self.allocator, id);
@@ -5120,12 +5239,13 @@ pub const Client = struct {
         if (self.auth_header) |header| try request_headers.append(self.allocator, header);
         if (x_antfly_database) |value| try request_headers.append(self.allocator, .{ "X-Antfly-Database", value });
         if (x_antfly_namespace) |value| try request_headers.append(self.allocator, .{ "X-Antfly-Namespace", value });
+        if (x_antfly_memory_branch) |value| try request_headers.append(self.allocator, .{ "X-Antfly-Memory-Branch", value });
         var resp = try self.http.get(url, .{ .headers = request_headers.items });
         return ApiResponse(types.MemoryResult).fromResponse(self.allocator, &resp);
     }
 
     /// POST /memory/v1/spaces/{space}/entities/{id}/candidates
-    pub fn getMemoryEntityCandidates(self: *@This(), space: []const u8, id: []const u8, body: types.MemoryEntityCandidateRequest, x_antfly_database: ?[]const u8, x_antfly_namespace: ?[]const u8) !ApiResponse(types.MemoryEntityCandidatePage) {
+    pub fn getMemoryEntityCandidates(self: *@This(), space: []const u8, id: []const u8, body: types.MemoryEntityCandidateRequest, x_antfly_database: ?[]const u8, x_antfly_namespace: ?[]const u8, x_antfly_memory_branch: ?[]const u8) !ApiResponse(types.MemoryEntityCandidatePage) {
         const encoded_space = try httpx.PercentEncoding.encode(self.allocator, space);
         defer self.allocator.free(encoded_space);
         const encoded_id = try httpx.PercentEncoding.encode(self.allocator, id);
@@ -5139,12 +5259,13 @@ pub const Client = struct {
         if (self.auth_header) |header| try request_headers.append(self.allocator, header);
         if (x_antfly_database) |value| try request_headers.append(self.allocator, .{ "X-Antfly-Database", value });
         if (x_antfly_namespace) |value| try request_headers.append(self.allocator, .{ "X-Antfly-Namespace", value });
+        if (x_antfly_memory_branch) |value| try request_headers.append(self.allocator, .{ "X-Antfly-Memory-Branch", value });
         var resp = try self.http.post(url, .{ .json = json_body, .headers = request_headers.items });
         return ApiResponse(types.MemoryEntityCandidatePage).fromResponse(self.allocator, &resp);
     }
 
     /// POST /memory/v1/spaces/{space}/entities/{id}/view
-    pub fn getMemoryEntityView(self: *@This(), space: []const u8, id: []const u8, body: types.MemoryEntityViewRequest, x_antfly_database: ?[]const u8, x_antfly_namespace: ?[]const u8) !ApiResponse(types.MemoryEntityView) {
+    pub fn getMemoryEntityView(self: *@This(), space: []const u8, id: []const u8, body: types.MemoryEntityViewRequest, x_antfly_database: ?[]const u8, x_antfly_namespace: ?[]const u8, x_antfly_memory_branch: ?[]const u8) !ApiResponse(types.MemoryEntityView) {
         const encoded_space = try httpx.PercentEncoding.encode(self.allocator, space);
         defer self.allocator.free(encoded_space);
         const encoded_id = try httpx.PercentEncoding.encode(self.allocator, id);
@@ -5158,12 +5279,13 @@ pub const Client = struct {
         if (self.auth_header) |header| try request_headers.append(self.allocator, header);
         if (x_antfly_database) |value| try request_headers.append(self.allocator, .{ "X-Antfly-Database", value });
         if (x_antfly_namespace) |value| try request_headers.append(self.allocator, .{ "X-Antfly-Namespace", value });
+        if (x_antfly_memory_branch) |value| try request_headers.append(self.allocator, .{ "X-Antfly-Memory-Branch", value });
         var resp = try self.http.post(url, .{ .json = json_body, .headers = request_headers.items });
         return ApiResponse(types.MemoryEntityView).fromResponse(self.allocator, &resp);
     }
 
     /// POST /memory/v1/spaces/{space}/entity-corrections
-    pub fn curateMemoryEntity(self: *@This(), space: []const u8, body: types.MemoryEntityCorrection, x_antfly_database: ?[]const u8, x_antfly_namespace: ?[]const u8, idempotency_key: []const u8) !ApiResponse(types.MemoryOperation) {
+    pub fn curateMemoryEntity(self: *@This(), space: []const u8, body: types.MemoryEntityCorrection, x_antfly_database: ?[]const u8, x_antfly_namespace: ?[]const u8, x_antfly_memory_branch: ?[]const u8, idempotency_key: []const u8) !ApiResponse(types.MemoryOperation) {
         const encoded_space = try httpx.PercentEncoding.encode(self.allocator, space);
         defer self.allocator.free(encoded_space);
         const url = try std.fmt.allocPrint(self.allocator, "{s}/memory/v1/spaces/{s}/entity-corrections", .{ self.base_url, encoded_space });
@@ -5175,13 +5297,14 @@ pub const Client = struct {
         if (self.auth_header) |header| try request_headers.append(self.allocator, header);
         if (x_antfly_database) |value| try request_headers.append(self.allocator, .{ "X-Antfly-Database", value });
         if (x_antfly_namespace) |value| try request_headers.append(self.allocator, .{ "X-Antfly-Namespace", value });
+        if (x_antfly_memory_branch) |value| try request_headers.append(self.allocator, .{ "X-Antfly-Memory-Branch", value });
         try request_headers.append(self.allocator, .{ "Idempotency-Key", idempotency_key });
         var resp = try self.http.post(url, .{ .json = json_body, .headers = request_headers.items });
         return ApiResponse(types.MemoryOperation).fromResponse(self.allocator, &resp);
     }
 
     /// GET /memory/v1/spaces/{space}/entity-proposals
-    pub fn listMemoryEntityProposals(self: *@This(), space: []const u8, x_antfly_database: ?[]const u8, x_antfly_namespace: ?[]const u8, params: ListMemoryEntityProposalsParams) !ApiResponse(types.MemoryEntityProposalPage) {
+    pub fn listMemoryEntityProposals(self: *@This(), space: []const u8, x_antfly_database: ?[]const u8, x_antfly_namespace: ?[]const u8, x_antfly_memory_branch: ?[]const u8, params: ListMemoryEntityProposalsParams) !ApiResponse(types.MemoryEntityProposalPage) {
         const encoded_space = try httpx.PercentEncoding.encode(self.allocator, space);
         defer self.allocator.free(encoded_space);
         var url = try std.fmt.allocPrint(self.allocator, "{s}/memory/v1/spaces/{s}/entity-proposals", .{ self.base_url, encoded_space });
@@ -5215,12 +5338,13 @@ pub const Client = struct {
         if (self.auth_header) |header| try request_headers.append(self.allocator, header);
         if (x_antfly_database) |value| try request_headers.append(self.allocator, .{ "X-Antfly-Database", value });
         if (x_antfly_namespace) |value| try request_headers.append(self.allocator, .{ "X-Antfly-Namespace", value });
+        if (x_antfly_memory_branch) |value| try request_headers.append(self.allocator, .{ "X-Antfly-Memory-Branch", value });
         var resp = try self.http.get(url, .{ .headers = request_headers.items });
         return ApiResponse(types.MemoryEntityProposalPage).fromResponse(self.allocator, &resp);
     }
 
     /// POST /memory/v1/spaces/{space}/entity-proposals
-    pub fn proposeMemoryEntity(self: *@This(), space: []const u8, body: types.MemoryEntityProposalRequest, x_antfly_database: ?[]const u8, x_antfly_namespace: ?[]const u8, idempotency_key: []const u8) !ApiResponse(types.MemoryOperation) {
+    pub fn proposeMemoryEntity(self: *@This(), space: []const u8, body: types.MemoryEntityProposalRequest, x_antfly_database: ?[]const u8, x_antfly_namespace: ?[]const u8, x_antfly_memory_branch: ?[]const u8, idempotency_key: []const u8) !ApiResponse(types.MemoryOperation) {
         const encoded_space = try httpx.PercentEncoding.encode(self.allocator, space);
         defer self.allocator.free(encoded_space);
         const url = try std.fmt.allocPrint(self.allocator, "{s}/memory/v1/spaces/{s}/entity-proposals", .{ self.base_url, encoded_space });
@@ -5232,13 +5356,14 @@ pub const Client = struct {
         if (self.auth_header) |header| try request_headers.append(self.allocator, header);
         if (x_antfly_database) |value| try request_headers.append(self.allocator, .{ "X-Antfly-Database", value });
         if (x_antfly_namespace) |value| try request_headers.append(self.allocator, .{ "X-Antfly-Namespace", value });
+        if (x_antfly_memory_branch) |value| try request_headers.append(self.allocator, .{ "X-Antfly-Memory-Branch", value });
         try request_headers.append(self.allocator, .{ "Idempotency-Key", idempotency_key });
         var resp = try self.http.post(url, .{ .json = json_body, .headers = request_headers.items });
         return ApiResponse(types.MemoryOperation).fromResponse(self.allocator, &resp);
     }
 
     /// GET /memory/v1/spaces/{space}/entity-proposals/{id}
-    pub fn getMemoryEntityProposal(self: *@This(), space: []const u8, id: []const u8, x_antfly_database: ?[]const u8, x_antfly_namespace: ?[]const u8) !ApiResponse(types.MemoryEntityProposalDetail) {
+    pub fn getMemoryEntityProposal(self: *@This(), space: []const u8, id: []const u8, x_antfly_database: ?[]const u8, x_antfly_namespace: ?[]const u8, x_antfly_memory_branch: ?[]const u8) !ApiResponse(types.MemoryEntityProposalDetail) {
         const encoded_space = try httpx.PercentEncoding.encode(self.allocator, space);
         defer self.allocator.free(encoded_space);
         const encoded_id = try httpx.PercentEncoding.encode(self.allocator, id);
@@ -5250,12 +5375,13 @@ pub const Client = struct {
         if (self.auth_header) |header| try request_headers.append(self.allocator, header);
         if (x_antfly_database) |value| try request_headers.append(self.allocator, .{ "X-Antfly-Database", value });
         if (x_antfly_namespace) |value| try request_headers.append(self.allocator, .{ "X-Antfly-Namespace", value });
+        if (x_antfly_memory_branch) |value| try request_headers.append(self.allocator, .{ "X-Antfly-Memory-Branch", value });
         var resp = try self.http.get(url, .{ .headers = request_headers.items });
         return ApiResponse(types.MemoryEntityProposalDetail).fromResponse(self.allocator, &resp);
     }
 
     /// POST /memory/v1/spaces/{space}/entity-proposals/{id}/verdict
-    pub fn reviewMemoryEntityProposal(self: *@This(), space: []const u8, id: []const u8, body: types.MemoryEntityVerdict, x_antfly_database: ?[]const u8, x_antfly_namespace: ?[]const u8, idempotency_key: []const u8) !ApiResponse(types.MemoryOperation) {
+    pub fn reviewMemoryEntityProposal(self: *@This(), space: []const u8, id: []const u8, body: types.MemoryEntityVerdict, x_antfly_database: ?[]const u8, x_antfly_namespace: ?[]const u8, x_antfly_memory_branch: ?[]const u8, idempotency_key: []const u8) !ApiResponse(types.MemoryOperation) {
         const encoded_space = try httpx.PercentEncoding.encode(self.allocator, space);
         defer self.allocator.free(encoded_space);
         const encoded_id = try httpx.PercentEncoding.encode(self.allocator, id);
@@ -5269,13 +5395,14 @@ pub const Client = struct {
         if (self.auth_header) |header| try request_headers.append(self.allocator, header);
         if (x_antfly_database) |value| try request_headers.append(self.allocator, .{ "X-Antfly-Database", value });
         if (x_antfly_namespace) |value| try request_headers.append(self.allocator, .{ "X-Antfly-Namespace", value });
+        if (x_antfly_memory_branch) |value| try request_headers.append(self.allocator, .{ "X-Antfly-Memory-Branch", value });
         try request_headers.append(self.allocator, .{ "Idempotency-Key", idempotency_key });
         var resp = try self.http.post(url, .{ .json = json_body, .headers = request_headers.items });
         return ApiResponse(types.MemoryOperation).fromResponse(self.allocator, &resp);
     }
 
     /// GET /memory/v1/spaces/{space}/episodes
-    pub fn listMemoryEpisodes(self: *@This(), space: []const u8, x_antfly_database: ?[]const u8, x_antfly_namespace: ?[]const u8, params: ListMemoryEpisodesParams) !ApiResponse(types.MemoryEpisodePage) {
+    pub fn listMemoryEpisodes(self: *@This(), space: []const u8, x_antfly_database: ?[]const u8, x_antfly_namespace: ?[]const u8, x_antfly_memory_branch: ?[]const u8, params: ListMemoryEpisodesParams) !ApiResponse(types.MemoryEpisodePage) {
         const encoded_space = try httpx.PercentEncoding.encode(self.allocator, space);
         defer self.allocator.free(encoded_space);
         var url = try std.fmt.allocPrint(self.allocator, "{s}/memory/v1/spaces/{s}/episodes", .{ self.base_url, encoded_space });
@@ -5317,12 +5444,13 @@ pub const Client = struct {
         if (self.auth_header) |header| try request_headers.append(self.allocator, header);
         if (x_antfly_database) |value| try request_headers.append(self.allocator, .{ "X-Antfly-Database", value });
         if (x_antfly_namespace) |value| try request_headers.append(self.allocator, .{ "X-Antfly-Namespace", value });
+        if (x_antfly_memory_branch) |value| try request_headers.append(self.allocator, .{ "X-Antfly-Memory-Branch", value });
         var resp = try self.http.get(url, .{ .headers = request_headers.items });
         return ApiResponse(types.MemoryEpisodePage).fromResponse(self.allocator, &resp);
     }
 
     /// GET /memory/v1/spaces/{space}/episodes/{id}
-    pub fn getMemoryEpisode(self: *@This(), space: []const u8, id: []const u8, x_antfly_database: ?[]const u8, x_antfly_namespace: ?[]const u8, params: GetMemoryEpisodeParams) !ApiResponse(types.MemoryEpisode) {
+    pub fn getMemoryEpisode(self: *@This(), space: []const u8, id: []const u8, x_antfly_database: ?[]const u8, x_antfly_namespace: ?[]const u8, x_antfly_memory_branch: ?[]const u8, params: GetMemoryEpisodeParams) !ApiResponse(types.MemoryEpisode) {
         const encoded_space = try httpx.PercentEncoding.encode(self.allocator, space);
         defer self.allocator.free(encoded_space);
         const encoded_id = try httpx.PercentEncoding.encode(self.allocator, id);
@@ -5366,12 +5494,234 @@ pub const Client = struct {
         if (self.auth_header) |header| try request_headers.append(self.allocator, header);
         if (x_antfly_database) |value| try request_headers.append(self.allocator, .{ "X-Antfly-Database", value });
         if (x_antfly_namespace) |value| try request_headers.append(self.allocator, .{ "X-Antfly-Namespace", value });
+        if (x_antfly_memory_branch) |value| try request_headers.append(self.allocator, .{ "X-Antfly-Memory-Branch", value });
         var resp = try self.http.get(url, .{ .headers = request_headers.items });
         return ApiResponse(types.MemoryEpisode).fromResponse(self.allocator, &resp);
     }
 
+    /// POST /memory/v1/spaces/{space}/evaluation-datasets
+    pub fn putMemoryEvaluationDataset(self: *@This(), space: []const u8, body: types.MemoryEvaluationDatasetRequest, x_antfly_database: ?[]const u8, x_antfly_namespace: ?[]const u8, x_antfly_memory_branch: ?[]const u8, idempotency_key: []const u8) !ApiResponse(types.MemoryOperation) {
+        const encoded_space = try httpx.PercentEncoding.encode(self.allocator, space);
+        defer self.allocator.free(encoded_space);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/memory/v1/spaces/{s}/evaluation-datasets", .{ self.base_url, encoded_space });
+        defer self.allocator.free(url);
+        const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
+        defer self.allocator.free(json_body);
+        var request_headers = std.ArrayListUnmanaged([2][]const u8).empty;
+        defer request_headers.deinit(self.allocator);
+        if (self.auth_header) |header| try request_headers.append(self.allocator, header);
+        if (x_antfly_database) |value| try request_headers.append(self.allocator, .{ "X-Antfly-Database", value });
+        if (x_antfly_namespace) |value| try request_headers.append(self.allocator, .{ "X-Antfly-Namespace", value });
+        if (x_antfly_memory_branch) |value| try request_headers.append(self.allocator, .{ "X-Antfly-Memory-Branch", value });
+        try request_headers.append(self.allocator, .{ "Idempotency-Key", idempotency_key });
+        var resp = try self.http.post(url, .{ .json = json_body, .headers = request_headers.items });
+        return ApiResponse(types.MemoryOperation).fromResponse(self.allocator, &resp);
+    }
+
+    /// GET /memory/v1/spaces/{space}/evaluation-datasets/{id}
+    pub fn getMemoryEvaluationDataset(self: *@This(), space: []const u8, id: []const u8, x_antfly_database: ?[]const u8, x_antfly_namespace: ?[]const u8, x_antfly_memory_branch: ?[]const u8) !ApiResponse(types.MemoryEvaluationDataset) {
+        const encoded_space = try httpx.PercentEncoding.encode(self.allocator, space);
+        defer self.allocator.free(encoded_space);
+        const encoded_id = try httpx.PercentEncoding.encode(self.allocator, id);
+        defer self.allocator.free(encoded_id);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/memory/v1/spaces/{s}/evaluation-datasets/{s}", .{ self.base_url, encoded_space, encoded_id });
+        defer self.allocator.free(url);
+        var request_headers = std.ArrayListUnmanaged([2][]const u8).empty;
+        defer request_headers.deinit(self.allocator);
+        if (self.auth_header) |header| try request_headers.append(self.allocator, header);
+        if (x_antfly_database) |value| try request_headers.append(self.allocator, .{ "X-Antfly-Database", value });
+        if (x_antfly_namespace) |value| try request_headers.append(self.allocator, .{ "X-Antfly-Namespace", value });
+        if (x_antfly_memory_branch) |value| try request_headers.append(self.allocator, .{ "X-Antfly-Memory-Branch", value });
+        var resp = try self.http.get(url, .{ .headers = request_headers.items });
+        return ApiResponse(types.MemoryEvaluationDataset).fromResponse(self.allocator, &resp);
+    }
+
+    /// GET /memory/v1/spaces/{space}/evaluation-datasets/{id}/cases
+    pub fn getMemoryEvaluationCases(self: *@This(), space: []const u8, id: []const u8, x_antfly_database: ?[]const u8, x_antfly_namespace: ?[]const u8, x_antfly_memory_branch: ?[]const u8, params: GetMemoryEvaluationCasesParams) !ApiResponse(types.MemoryEvaluationCasePage) {
+        const encoded_space = try httpx.PercentEncoding.encode(self.allocator, space);
+        defer self.allocator.free(encoded_space);
+        const encoded_id = try httpx.PercentEncoding.encode(self.allocator, id);
+        defer self.allocator.free(encoded_id);
+        var url = try std.fmt.allocPrint(self.allocator, "{s}/memory/v1/spaces/{s}/evaluation-datasets/{s}/cases", .{ self.base_url, encoded_space, encoded_id });
+        defer self.allocator.free(url);
+        var query_buf = std.ArrayListUnmanaged(u8).empty;
+        defer query_buf.deinit(self.allocator);
+        var sep: u8 = '?';
+        if (params.cursor) |v| {
+            const encoded_query_value = try httpx.PercentEncoding.encode(self.allocator, v);
+            defer self.allocator.free(encoded_query_value);
+            try query_buf.appendSlice(self.allocator, &.{sep});
+            try query_buf.appendSlice(self.allocator, "cursor=");
+            try query_buf.appendSlice(self.allocator, encoded_query_value);
+            sep = '&';
+        }
+        if (params.limit) |v| {
+            const encoded_query_value = try httpx.PercentEncoding.encode(self.allocator, v);
+            defer self.allocator.free(encoded_query_value);
+            try query_buf.appendSlice(self.allocator, &.{sep});
+            try query_buf.appendSlice(self.allocator, "limit=");
+            try query_buf.appendSlice(self.allocator, encoded_query_value);
+            sep = '&';
+        }
+        if (query_buf.items.len > 0) {
+            const new_url = try std.fmt.allocPrint(self.allocator, "{s}{s}", .{ url, query_buf.items });
+            self.allocator.free(url);
+            url = new_url;
+        }
+        var request_headers = std.ArrayListUnmanaged([2][]const u8).empty;
+        defer request_headers.deinit(self.allocator);
+        if (self.auth_header) |header| try request_headers.append(self.allocator, header);
+        if (x_antfly_database) |value| try request_headers.append(self.allocator, .{ "X-Antfly-Database", value });
+        if (x_antfly_namespace) |value| try request_headers.append(self.allocator, .{ "X-Antfly-Namespace", value });
+        if (x_antfly_memory_branch) |value| try request_headers.append(self.allocator, .{ "X-Antfly-Memory-Branch", value });
+        var resp = try self.http.get(url, .{ .headers = request_headers.items });
+        return ApiResponse(types.MemoryEvaluationCasePage).fromResponse(self.allocator, &resp);
+    }
+
+    /// POST /memory/v1/spaces/{space}/evaluations
+    pub fn startMemoryEvaluation(self: *@This(), space: []const u8, body: types.MemoryEvaluationStart, x_antfly_database: ?[]const u8, x_antfly_namespace: ?[]const u8, x_antfly_memory_branch: ?[]const u8, idempotency_key: []const u8) !ApiResponse(types.MemoryOperation) {
+        const encoded_space = try httpx.PercentEncoding.encode(self.allocator, space);
+        defer self.allocator.free(encoded_space);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/memory/v1/spaces/{s}/evaluations", .{ self.base_url, encoded_space });
+        defer self.allocator.free(url);
+        const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
+        defer self.allocator.free(json_body);
+        var request_headers = std.ArrayListUnmanaged([2][]const u8).empty;
+        defer request_headers.deinit(self.allocator);
+        if (self.auth_header) |header| try request_headers.append(self.allocator, header);
+        if (x_antfly_database) |value| try request_headers.append(self.allocator, .{ "X-Antfly-Database", value });
+        if (x_antfly_namespace) |value| try request_headers.append(self.allocator, .{ "X-Antfly-Namespace", value });
+        if (x_antfly_memory_branch) |value| try request_headers.append(self.allocator, .{ "X-Antfly-Memory-Branch", value });
+        try request_headers.append(self.allocator, .{ "Idempotency-Key", idempotency_key });
+        var resp = try self.http.post(url, .{ .json = json_body, .headers = request_headers.items });
+        return ApiResponse(types.MemoryOperation).fromResponse(self.allocator, &resp);
+    }
+
+    /// GET /memory/v1/spaces/{space}/evaluations/{id}
+    pub fn getMemoryEvaluation(self: *@This(), space: []const u8, id: []const u8, x_antfly_database: ?[]const u8, x_antfly_namespace: ?[]const u8, x_antfly_memory_branch: ?[]const u8) !ApiResponse(types.MemoryEvaluationStatus) {
+        const encoded_space = try httpx.PercentEncoding.encode(self.allocator, space);
+        defer self.allocator.free(encoded_space);
+        const encoded_id = try httpx.PercentEncoding.encode(self.allocator, id);
+        defer self.allocator.free(encoded_id);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/memory/v1/spaces/{s}/evaluations/{s}", .{ self.base_url, encoded_space, encoded_id });
+        defer self.allocator.free(url);
+        var request_headers = std.ArrayListUnmanaged([2][]const u8).empty;
+        defer request_headers.deinit(self.allocator);
+        if (self.auth_header) |header| try request_headers.append(self.allocator, header);
+        if (x_antfly_database) |value| try request_headers.append(self.allocator, .{ "X-Antfly-Database", value });
+        if (x_antfly_namespace) |value| try request_headers.append(self.allocator, .{ "X-Antfly-Namespace", value });
+        if (x_antfly_memory_branch) |value| try request_headers.append(self.allocator, .{ "X-Antfly-Memory-Branch", value });
+        var resp = try self.http.get(url, .{ .headers = request_headers.items });
+        return ApiResponse(types.MemoryEvaluationStatus).fromResponse(self.allocator, &resp);
+    }
+
+    /// GET /memory/v1/spaces/{space}/evaluations/{id}/results
+    pub fn getMemoryEvaluationResults(self: *@This(), space: []const u8, id: []const u8, x_antfly_database: ?[]const u8, x_antfly_namespace: ?[]const u8, x_antfly_memory_branch: ?[]const u8, params: GetMemoryEvaluationResultsParams) !ApiResponse(types.MemoryEvaluationResultPage) {
+        const encoded_space = try httpx.PercentEncoding.encode(self.allocator, space);
+        defer self.allocator.free(encoded_space);
+        const encoded_id = try httpx.PercentEncoding.encode(self.allocator, id);
+        defer self.allocator.free(encoded_id);
+        var url = try std.fmt.allocPrint(self.allocator, "{s}/memory/v1/spaces/{s}/evaluations/{s}/results", .{ self.base_url, encoded_space, encoded_id });
+        defer self.allocator.free(url);
+        var query_buf = std.ArrayListUnmanaged(u8).empty;
+        defer query_buf.deinit(self.allocator);
+        var sep: u8 = '?';
+        if (params.cursor) |v| {
+            const encoded_query_value = try httpx.PercentEncoding.encode(self.allocator, v);
+            defer self.allocator.free(encoded_query_value);
+            try query_buf.appendSlice(self.allocator, &.{sep});
+            try query_buf.appendSlice(self.allocator, "cursor=");
+            try query_buf.appendSlice(self.allocator, encoded_query_value);
+            sep = '&';
+        }
+        if (params.limit) |v| {
+            const encoded_query_value = try httpx.PercentEncoding.encode(self.allocator, v);
+            defer self.allocator.free(encoded_query_value);
+            try query_buf.appendSlice(self.allocator, &.{sep});
+            try query_buf.appendSlice(self.allocator, "limit=");
+            try query_buf.appendSlice(self.allocator, encoded_query_value);
+            sep = '&';
+        }
+        if (query_buf.items.len > 0) {
+            const new_url = try std.fmt.allocPrint(self.allocator, "{s}{s}", .{ url, query_buf.items });
+            self.allocator.free(url);
+            url = new_url;
+        }
+        var request_headers = std.ArrayListUnmanaged([2][]const u8).empty;
+        defer request_headers.deinit(self.allocator);
+        if (self.auth_header) |header| try request_headers.append(self.allocator, header);
+        if (x_antfly_database) |value| try request_headers.append(self.allocator, .{ "X-Antfly-Database", value });
+        if (x_antfly_namespace) |value| try request_headers.append(self.allocator, .{ "X-Antfly-Namespace", value });
+        if (x_antfly_memory_branch) |value| try request_headers.append(self.allocator, .{ "X-Antfly-Memory-Branch", value });
+        var resp = try self.http.get(url, .{ .headers = request_headers.items });
+        return ApiResponse(types.MemoryEvaluationResultPage).fromResponse(self.allocator, &resp);
+    }
+
+    /// GET /memory/v1/spaces/{space}/evaluations/{id}/tasks
+    pub fn getMemoryEvaluationTasks(self: *@This(), space: []const u8, id: []const u8, x_antfly_database: ?[]const u8, x_antfly_namespace: ?[]const u8, x_antfly_memory_branch: ?[]const u8, params: GetMemoryEvaluationTasksParams) !ApiResponse(types.MemoryEvaluationTaskPage) {
+        const encoded_space = try httpx.PercentEncoding.encode(self.allocator, space);
+        defer self.allocator.free(encoded_space);
+        const encoded_id = try httpx.PercentEncoding.encode(self.allocator, id);
+        defer self.allocator.free(encoded_id);
+        var url = try std.fmt.allocPrint(self.allocator, "{s}/memory/v1/spaces/{s}/evaluations/{s}/tasks", .{ self.base_url, encoded_space, encoded_id });
+        defer self.allocator.free(url);
+        var query_buf = std.ArrayListUnmanaged(u8).empty;
+        defer query_buf.deinit(self.allocator);
+        var sep: u8 = '?';
+        if (params.cursor) |v| {
+            const encoded_query_value = try httpx.PercentEncoding.encode(self.allocator, v);
+            defer self.allocator.free(encoded_query_value);
+            try query_buf.appendSlice(self.allocator, &.{sep});
+            try query_buf.appendSlice(self.allocator, "cursor=");
+            try query_buf.appendSlice(self.allocator, encoded_query_value);
+            sep = '&';
+        }
+        if (params.limit) |v| {
+            const encoded_query_value = try httpx.PercentEncoding.encode(self.allocator, v);
+            defer self.allocator.free(encoded_query_value);
+            try query_buf.appendSlice(self.allocator, &.{sep});
+            try query_buf.appendSlice(self.allocator, "limit=");
+            try query_buf.appendSlice(self.allocator, encoded_query_value);
+            sep = '&';
+        }
+        if (query_buf.items.len > 0) {
+            const new_url = try std.fmt.allocPrint(self.allocator, "{s}{s}", .{ url, query_buf.items });
+            self.allocator.free(url);
+            url = new_url;
+        }
+        var request_headers = std.ArrayListUnmanaged([2][]const u8).empty;
+        defer request_headers.deinit(self.allocator);
+        if (self.auth_header) |header| try request_headers.append(self.allocator, header);
+        if (x_antfly_database) |value| try request_headers.append(self.allocator, .{ "X-Antfly-Database", value });
+        if (x_antfly_namespace) |value| try request_headers.append(self.allocator, .{ "X-Antfly-Namespace", value });
+        if (x_antfly_memory_branch) |value| try request_headers.append(self.allocator, .{ "X-Antfly-Memory-Branch", value });
+        var resp = try self.http.get(url, .{ .headers = request_headers.items });
+        return ApiResponse(types.MemoryEvaluationTaskPage).fromResponse(self.allocator, &resp);
+    }
+
+    /// POST /memory/v1/spaces/{space}/evaluations/{id}/verdicts
+    pub fn submitMemoryEvaluationVerdicts(self: *@This(), space: []const u8, id: []const u8, body: types.MemoryEvaluationSubmit, x_antfly_database: ?[]const u8, x_antfly_namespace: ?[]const u8, x_antfly_memory_branch: ?[]const u8, idempotency_key: []const u8) !ApiResponse(types.MemoryOperation) {
+        const encoded_space = try httpx.PercentEncoding.encode(self.allocator, space);
+        defer self.allocator.free(encoded_space);
+        const encoded_id = try httpx.PercentEncoding.encode(self.allocator, id);
+        defer self.allocator.free(encoded_id);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/memory/v1/spaces/{s}/evaluations/{s}/verdicts", .{ self.base_url, encoded_space, encoded_id });
+        defer self.allocator.free(url);
+        const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
+        defer self.allocator.free(json_body);
+        var request_headers = std.ArrayListUnmanaged([2][]const u8).empty;
+        defer request_headers.deinit(self.allocator);
+        if (self.auth_header) |header| try request_headers.append(self.allocator, header);
+        if (x_antfly_database) |value| try request_headers.append(self.allocator, .{ "X-Antfly-Database", value });
+        if (x_antfly_namespace) |value| try request_headers.append(self.allocator, .{ "X-Antfly-Namespace", value });
+        if (x_antfly_memory_branch) |value| try request_headers.append(self.allocator, .{ "X-Antfly-Memory-Branch", value });
+        try request_headers.append(self.allocator, .{ "Idempotency-Key", idempotency_key });
+        var resp = try self.http.post(url, .{ .json = json_body, .headers = request_headers.items });
+        return ApiResponse(types.MemoryOperation).fromResponse(self.allocator, &resp);
+    }
+
     /// GET /memory/v1/spaces/{space}/evidence/{id}
-    pub fn getMemoryEvidence(self: *@This(), space: []const u8, id: []const u8, x_antfly_database: ?[]const u8, x_antfly_namespace: ?[]const u8) !ApiResponse(types.MemoryResult) {
+    pub fn getMemoryEvidence(self: *@This(), space: []const u8, id: []const u8, x_antfly_database: ?[]const u8, x_antfly_namespace: ?[]const u8, x_antfly_memory_branch: ?[]const u8) !ApiResponse(types.MemoryResult) {
         const encoded_space = try httpx.PercentEncoding.encode(self.allocator, space);
         defer self.allocator.free(encoded_space);
         const encoded_id = try httpx.PercentEncoding.encode(self.allocator, id);
@@ -5383,12 +5733,13 @@ pub const Client = struct {
         if (self.auth_header) |header| try request_headers.append(self.allocator, header);
         if (x_antfly_database) |value| try request_headers.append(self.allocator, .{ "X-Antfly-Database", value });
         if (x_antfly_namespace) |value| try request_headers.append(self.allocator, .{ "X-Antfly-Namespace", value });
+        if (x_antfly_memory_branch) |value| try request_headers.append(self.allocator, .{ "X-Antfly-Memory-Branch", value });
         var resp = try self.http.get(url, .{ .headers = request_headers.items });
         return ApiResponse(types.MemoryResult).fromResponse(self.allocator, &resp);
     }
 
     /// POST /memory/v1/spaces/{space}/explain
-    pub fn explainMemoryResource(self: *@This(), space: []const u8, body: types.MemoryExplainRequest, x_antfly_database: ?[]const u8, x_antfly_namespace: ?[]const u8) !ApiResponse(types.MemoryExplanation) {
+    pub fn explainMemoryResource(self: *@This(), space: []const u8, body: types.MemoryExplainRequest, x_antfly_database: ?[]const u8, x_antfly_namespace: ?[]const u8, x_antfly_memory_branch: ?[]const u8) !ApiResponse(types.MemoryExplanation) {
         const encoded_space = try httpx.PercentEncoding.encode(self.allocator, space);
         defer self.allocator.free(encoded_space);
         const url = try std.fmt.allocPrint(self.allocator, "{s}/memory/v1/spaces/{s}/explain", .{ self.base_url, encoded_space });
@@ -5400,12 +5751,13 @@ pub const Client = struct {
         if (self.auth_header) |header| try request_headers.append(self.allocator, header);
         if (x_antfly_database) |value| try request_headers.append(self.allocator, .{ "X-Antfly-Database", value });
         if (x_antfly_namespace) |value| try request_headers.append(self.allocator, .{ "X-Antfly-Namespace", value });
+        if (x_antfly_memory_branch) |value| try request_headers.append(self.allocator, .{ "X-Antfly-Memory-Branch", value });
         var resp = try self.http.post(url, .{ .json = json_body, .headers = request_headers.items });
         return ApiResponse(types.MemoryExplanation).fromResponse(self.allocator, &resp);
     }
 
     /// POST /memory/v1/spaces/{space}/forget
-    pub fn forgetMemory(self: *@This(), space: []const u8, body: types.MemoryForgetRequest, x_antfly_database: ?[]const u8, x_antfly_namespace: ?[]const u8, idempotency_key: []const u8) !ApiResponse(types.MemoryOperation) {
+    pub fn forgetMemory(self: *@This(), space: []const u8, body: types.MemoryForgetRequest, x_antfly_database: ?[]const u8, x_antfly_namespace: ?[]const u8, x_antfly_memory_branch: ?[]const u8, idempotency_key: []const u8) !ApiResponse(types.MemoryOperation) {
         const encoded_space = try httpx.PercentEncoding.encode(self.allocator, space);
         defer self.allocator.free(encoded_space);
         const url = try std.fmt.allocPrint(self.allocator, "{s}/memory/v1/spaces/{s}/forget", .{ self.base_url, encoded_space });
@@ -5417,13 +5769,49 @@ pub const Client = struct {
         if (self.auth_header) |header| try request_headers.append(self.allocator, header);
         if (x_antfly_database) |value| try request_headers.append(self.allocator, .{ "X-Antfly-Database", value });
         if (x_antfly_namespace) |value| try request_headers.append(self.allocator, .{ "X-Antfly-Namespace", value });
+        if (x_antfly_memory_branch) |value| try request_headers.append(self.allocator, .{ "X-Antfly-Memory-Branch", value });
         try request_headers.append(self.allocator, .{ "Idempotency-Key", idempotency_key });
         var resp = try self.http.post(url, .{ .json = json_body, .headers = request_headers.items });
         return ApiResponse(types.MemoryOperation).fromResponse(self.allocator, &resp);
     }
 
+    /// POST /memory/v1/spaces/{space}/forks
+    pub fn forkMemoryLineage(self: *@This(), space: []const u8, body: types.MemoryLineageFork, x_antfly_database: ?[]const u8, x_antfly_namespace: ?[]const u8, x_antfly_memory_branch: ?[]const u8, idempotency_key: []const u8) !ApiResponse(types.MemoryOperation) {
+        const encoded_space = try httpx.PercentEncoding.encode(self.allocator, space);
+        defer self.allocator.free(encoded_space);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/memory/v1/spaces/{s}/forks", .{ self.base_url, encoded_space });
+        defer self.allocator.free(url);
+        const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
+        defer self.allocator.free(json_body);
+        var request_headers = std.ArrayListUnmanaged([2][]const u8).empty;
+        defer request_headers.deinit(self.allocator);
+        if (self.auth_header) |header| try request_headers.append(self.allocator, header);
+        if (x_antfly_database) |value| try request_headers.append(self.allocator, .{ "X-Antfly-Database", value });
+        if (x_antfly_namespace) |value| try request_headers.append(self.allocator, .{ "X-Antfly-Namespace", value });
+        if (x_antfly_memory_branch) |value| try request_headers.append(self.allocator, .{ "X-Antfly-Memory-Branch", value });
+        try request_headers.append(self.allocator, .{ "Idempotency-Key", idempotency_key });
+        var resp = try self.http.post(url, .{ .json = json_body, .headers = request_headers.items });
+        return ApiResponse(types.MemoryOperation).fromResponse(self.allocator, &resp);
+    }
+
+    /// GET /memory/v1/spaces/{space}/lineage
+    pub fn getMemoryLineage(self: *@This(), space: []const u8, x_antfly_database: ?[]const u8, x_antfly_namespace: ?[]const u8, x_antfly_memory_branch: ?[]const u8) !ApiResponse(types.MemoryLineageHead) {
+        const encoded_space = try httpx.PercentEncoding.encode(self.allocator, space);
+        defer self.allocator.free(encoded_space);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/memory/v1/spaces/{s}/lineage", .{ self.base_url, encoded_space });
+        defer self.allocator.free(url);
+        var request_headers = std.ArrayListUnmanaged([2][]const u8).empty;
+        defer request_headers.deinit(self.allocator);
+        if (self.auth_header) |header| try request_headers.append(self.allocator, header);
+        if (x_antfly_database) |value| try request_headers.append(self.allocator, .{ "X-Antfly-Database", value });
+        if (x_antfly_namespace) |value| try request_headers.append(self.allocator, .{ "X-Antfly-Namespace", value });
+        if (x_antfly_memory_branch) |value| try request_headers.append(self.allocator, .{ "X-Antfly-Memory-Branch", value });
+        var resp = try self.http.get(url, .{ .headers = request_headers.items });
+        return ApiResponse(types.MemoryLineageHead).fromResponse(self.allocator, &resp);
+    }
+
     /// POST /memory/v1/spaces/{space}/maintenance
-    pub fn maintainMemorySpace(self: *@This(), space: []const u8, x_antfly_database: ?[]const u8, x_antfly_namespace: ?[]const u8, idempotency_key: []const u8) !ApiResponse(types.MemoryOperation) {
+    pub fn maintainMemorySpace(self: *@This(), space: []const u8, x_antfly_database: ?[]const u8, x_antfly_namespace: ?[]const u8, x_antfly_memory_branch: ?[]const u8, idempotency_key: []const u8) !ApiResponse(types.MemoryOperation) {
         const encoded_space = try httpx.PercentEncoding.encode(self.allocator, space);
         defer self.allocator.free(encoded_space);
         const url = try std.fmt.allocPrint(self.allocator, "{s}/memory/v1/spaces/{s}/maintenance", .{ self.base_url, encoded_space });
@@ -5433,13 +5821,14 @@ pub const Client = struct {
         if (self.auth_header) |header| try request_headers.append(self.allocator, header);
         if (x_antfly_database) |value| try request_headers.append(self.allocator, .{ "X-Antfly-Database", value });
         if (x_antfly_namespace) |value| try request_headers.append(self.allocator, .{ "X-Antfly-Namespace", value });
+        if (x_antfly_memory_branch) |value| try request_headers.append(self.allocator, .{ "X-Antfly-Memory-Branch", value });
         try request_headers.append(self.allocator, .{ "Idempotency-Key", idempotency_key });
         var resp = try self.http.post(url, .{ .headers = request_headers.items });
         return ApiResponse(types.MemoryOperation).fromResponse(self.allocator, &resp);
     }
 
     /// GET /memory/v1/spaces/{space}/memories
-    pub fn listMemories(self: *@This(), space: []const u8, x_antfly_database: ?[]const u8, x_antfly_namespace: ?[]const u8, params: ListMemoriesParams) !ApiResponse(types.MemoryRecordPage) {
+    pub fn listMemories(self: *@This(), space: []const u8, x_antfly_database: ?[]const u8, x_antfly_namespace: ?[]const u8, x_antfly_memory_branch: ?[]const u8, params: ListMemoriesParams) !ApiResponse(types.MemoryRecordPage) {
         const encoded_space = try httpx.PercentEncoding.encode(self.allocator, space);
         defer self.allocator.free(encoded_space);
         var url = try std.fmt.allocPrint(self.allocator, "{s}/memory/v1/spaces/{s}/memories", .{ self.base_url, encoded_space });
@@ -5577,12 +5966,13 @@ pub const Client = struct {
         if (self.auth_header) |header| try request_headers.append(self.allocator, header);
         if (x_antfly_database) |value| try request_headers.append(self.allocator, .{ "X-Antfly-Database", value });
         if (x_antfly_namespace) |value| try request_headers.append(self.allocator, .{ "X-Antfly-Namespace", value });
+        if (x_antfly_memory_branch) |value| try request_headers.append(self.allocator, .{ "X-Antfly-Memory-Branch", value });
         var resp = try self.http.get(url, .{ .headers = request_headers.items });
         return ApiResponse(types.MemoryRecordPage).fromResponse(self.allocator, &resp);
     }
 
     /// GET /memory/v1/spaces/{space}/memories/{id}
-    pub fn getMemory(self: *@This(), space: []const u8, id: []const u8, x_antfly_database: ?[]const u8, x_antfly_namespace: ?[]const u8) !ApiResponse(types.MemoryRecord) {
+    pub fn getMemory(self: *@This(), space: []const u8, id: []const u8, x_antfly_database: ?[]const u8, x_antfly_namespace: ?[]const u8, x_antfly_memory_branch: ?[]const u8) !ApiResponse(types.MemoryRecord) {
         const encoded_space = try httpx.PercentEncoding.encode(self.allocator, space);
         defer self.allocator.free(encoded_space);
         const encoded_id = try httpx.PercentEncoding.encode(self.allocator, id);
@@ -5594,12 +5984,13 @@ pub const Client = struct {
         if (self.auth_header) |header| try request_headers.append(self.allocator, header);
         if (x_antfly_database) |value| try request_headers.append(self.allocator, .{ "X-Antfly-Database", value });
         if (x_antfly_namespace) |value| try request_headers.append(self.allocator, .{ "X-Antfly-Namespace", value });
+        if (x_antfly_memory_branch) |value| try request_headers.append(self.allocator, .{ "X-Antfly-Memory-Branch", value });
         var resp = try self.http.get(url, .{ .headers = request_headers.items });
         return ApiResponse(types.MemoryRecord).fromResponse(self.allocator, &resp);
     }
 
     /// POST /memory/v1/spaces/{space}/memories/{id}/explain
-    pub fn explainMemory(self: *@This(), space: []const u8, id: []const u8, body: types.MemoryExplainRequest, x_antfly_database: ?[]const u8, x_antfly_namespace: ?[]const u8) !ApiResponse(types.MemoryExplanation) {
+    pub fn explainMemory(self: *@This(), space: []const u8, id: []const u8, body: types.MemoryExplainRequest, x_antfly_database: ?[]const u8, x_antfly_namespace: ?[]const u8, x_antfly_memory_branch: ?[]const u8) !ApiResponse(types.MemoryExplanation) {
         const encoded_space = try httpx.PercentEncoding.encode(self.allocator, space);
         defer self.allocator.free(encoded_space);
         const encoded_id = try httpx.PercentEncoding.encode(self.allocator, id);
@@ -5613,12 +6004,13 @@ pub const Client = struct {
         if (self.auth_header) |header| try request_headers.append(self.allocator, header);
         if (x_antfly_database) |value| try request_headers.append(self.allocator, .{ "X-Antfly-Database", value });
         if (x_antfly_namespace) |value| try request_headers.append(self.allocator, .{ "X-Antfly-Namespace", value });
+        if (x_antfly_memory_branch) |value| try request_headers.append(self.allocator, .{ "X-Antfly-Memory-Branch", value });
         var resp = try self.http.post(url, .{ .json = json_body, .headers = request_headers.items });
         return ApiResponse(types.MemoryExplanation).fromResponse(self.allocator, &resp);
     }
 
     /// GET /memory/v1/spaces/{space}/memories/{id}/history
-    pub fn getMemoryHistory(self: *@This(), space: []const u8, id: []const u8, x_antfly_database: ?[]const u8, x_antfly_namespace: ?[]const u8, params: GetMemoryHistoryParams) !ApiResponse(types.MemoryRecordPage) {
+    pub fn getMemoryHistory(self: *@This(), space: []const u8, id: []const u8, x_antfly_database: ?[]const u8, x_antfly_namespace: ?[]const u8, x_antfly_memory_branch: ?[]const u8, params: GetMemoryHistoryParams) !ApiResponse(types.MemoryRecordPage) {
         const encoded_space = try httpx.PercentEncoding.encode(self.allocator, space);
         defer self.allocator.free(encoded_space);
         const encoded_id = try httpx.PercentEncoding.encode(self.allocator, id);
@@ -5654,12 +6046,33 @@ pub const Client = struct {
         if (self.auth_header) |header| try request_headers.append(self.allocator, header);
         if (x_antfly_database) |value| try request_headers.append(self.allocator, .{ "X-Antfly-Database", value });
         if (x_antfly_namespace) |value| try request_headers.append(self.allocator, .{ "X-Antfly-Namespace", value });
+        if (x_antfly_memory_branch) |value| try request_headers.append(self.allocator, .{ "X-Antfly-Memory-Branch", value });
         var resp = try self.http.get(url, .{ .headers = request_headers.items });
         return ApiResponse(types.MemoryRecordPage).fromResponse(self.allocator, &resp);
     }
 
+    /// POST /memory/v1/spaces/{space}/memories/{id}/supersession-candidates
+    pub fn getMemorySupersessionCandidates(self: *@This(), space: []const u8, id: []const u8, body: types.MemorySupersessionCandidateRequest, x_antfly_database: ?[]const u8, x_antfly_namespace: ?[]const u8, x_antfly_memory_branch: ?[]const u8) !ApiResponse(types.MemorySupersessionCandidatePage) {
+        const encoded_space = try httpx.PercentEncoding.encode(self.allocator, space);
+        defer self.allocator.free(encoded_space);
+        const encoded_id = try httpx.PercentEncoding.encode(self.allocator, id);
+        defer self.allocator.free(encoded_id);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/memory/v1/spaces/{s}/memories/{s}/supersession-candidates", .{ self.base_url, encoded_space, encoded_id });
+        defer self.allocator.free(url);
+        const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
+        defer self.allocator.free(json_body);
+        var request_headers = std.ArrayListUnmanaged([2][]const u8).empty;
+        defer request_headers.deinit(self.allocator);
+        if (self.auth_header) |header| try request_headers.append(self.allocator, header);
+        if (x_antfly_database) |value| try request_headers.append(self.allocator, .{ "X-Antfly-Database", value });
+        if (x_antfly_namespace) |value| try request_headers.append(self.allocator, .{ "X-Antfly-Namespace", value });
+        if (x_antfly_memory_branch) |value| try request_headers.append(self.allocator, .{ "X-Antfly-Memory-Branch", value });
+        var resp = try self.http.post(url, .{ .json = json_body, .headers = request_headers.items });
+        return ApiResponse(types.MemorySupersessionCandidatePage).fromResponse(self.allocator, &resp);
+    }
+
     /// POST /memory/v1/spaces/{space}/observations
-    pub fn observeMemory(self: *@This(), space: []const u8, body: types.MemoryObservationRequest, x_antfly_database: ?[]const u8, x_antfly_namespace: ?[]const u8, idempotency_key: []const u8) !ApiResponse(types.MemoryOperation) {
+    pub fn observeMemory(self: *@This(), space: []const u8, body: types.MemoryObservationRequest, x_antfly_database: ?[]const u8, x_antfly_namespace: ?[]const u8, x_antfly_memory_branch: ?[]const u8, idempotency_key: []const u8) !ApiResponse(types.MemoryOperation) {
         const encoded_space = try httpx.PercentEncoding.encode(self.allocator, space);
         defer self.allocator.free(encoded_space);
         const url = try std.fmt.allocPrint(self.allocator, "{s}/memory/v1/spaces/{s}/observations", .{ self.base_url, encoded_space });
@@ -5671,13 +6084,14 @@ pub const Client = struct {
         if (self.auth_header) |header| try request_headers.append(self.allocator, header);
         if (x_antfly_database) |value| try request_headers.append(self.allocator, .{ "X-Antfly-Database", value });
         if (x_antfly_namespace) |value| try request_headers.append(self.allocator, .{ "X-Antfly-Namespace", value });
+        if (x_antfly_memory_branch) |value| try request_headers.append(self.allocator, .{ "X-Antfly-Memory-Branch", value });
         try request_headers.append(self.allocator, .{ "Idempotency-Key", idempotency_key });
         var resp = try self.http.post(url, .{ .json = json_body, .headers = request_headers.items });
         return ApiResponse(types.MemoryOperation).fromResponse(self.allocator, &resp);
     }
 
     /// GET /memory/v1/spaces/{space}/operations/{id}
-    pub fn getMemoryOperation(self: *@This(), space: []const u8, id: []const u8, x_antfly_database: ?[]const u8, x_antfly_namespace: ?[]const u8) !ApiResponse(types.MemoryOperation) {
+    pub fn getMemoryOperation(self: *@This(), space: []const u8, id: []const u8, x_antfly_database: ?[]const u8, x_antfly_namespace: ?[]const u8, x_antfly_memory_branch: ?[]const u8) !ApiResponse(types.MemoryOperation) {
         const encoded_space = try httpx.PercentEncoding.encode(self.allocator, space);
         defer self.allocator.free(encoded_space);
         const encoded_id = try httpx.PercentEncoding.encode(self.allocator, id);
@@ -5689,12 +6103,13 @@ pub const Client = struct {
         if (self.auth_header) |header| try request_headers.append(self.allocator, header);
         if (x_antfly_database) |value| try request_headers.append(self.allocator, .{ "X-Antfly-Database", value });
         if (x_antfly_namespace) |value| try request_headers.append(self.allocator, .{ "X-Antfly-Namespace", value });
+        if (x_antfly_memory_branch) |value| try request_headers.append(self.allocator, .{ "X-Antfly-Memory-Branch", value });
         var resp = try self.http.get(url, .{ .headers = request_headers.items });
         return ApiResponse(types.MemoryOperation).fromResponse(self.allocator, &resp);
     }
 
     /// POST /memory/v1/spaces/{space}/operations/{id}
-    pub fn advanceMemoryOperation(self: *@This(), space: []const u8, id: []const u8, x_antfly_database: ?[]const u8, x_antfly_namespace: ?[]const u8, idempotency_key: []const u8) !ApiResponse(types.MemoryOperation) {
+    pub fn advanceMemoryOperation(self: *@This(), space: []const u8, id: []const u8, x_antfly_database: ?[]const u8, x_antfly_namespace: ?[]const u8, x_antfly_memory_branch: ?[]const u8, idempotency_key: []const u8) !ApiResponse(types.MemoryOperation) {
         const encoded_space = try httpx.PercentEncoding.encode(self.allocator, space);
         defer self.allocator.free(encoded_space);
         const encoded_id = try httpx.PercentEncoding.encode(self.allocator, id);
@@ -5706,13 +6121,14 @@ pub const Client = struct {
         if (self.auth_header) |header| try request_headers.append(self.allocator, header);
         if (x_antfly_database) |value| try request_headers.append(self.allocator, .{ "X-Antfly-Database", value });
         if (x_antfly_namespace) |value| try request_headers.append(self.allocator, .{ "X-Antfly-Namespace", value });
+        if (x_antfly_memory_branch) |value| try request_headers.append(self.allocator, .{ "X-Antfly-Memory-Branch", value });
         try request_headers.append(self.allocator, .{ "Idempotency-Key", idempotency_key });
         var resp = try self.http.post(url, .{ .headers = request_headers.items });
         return ApiResponse(types.MemoryOperation).fromResponse(self.allocator, &resp);
     }
 
     /// POST /memory/v1/spaces/{space}/outcomes
-    pub fn recordMemoryOutcome(self: *@This(), space: []const u8, body: types.MemoryOutcome, x_antfly_database: ?[]const u8, x_antfly_namespace: ?[]const u8, idempotency_key: []const u8) !ApiResponse(types.MemoryOperation) {
+    pub fn recordMemoryOutcome(self: *@This(), space: []const u8, body: types.MemoryOutcome, x_antfly_database: ?[]const u8, x_antfly_namespace: ?[]const u8, x_antfly_memory_branch: ?[]const u8, idempotency_key: []const u8) !ApiResponse(types.MemoryOperation) {
         const encoded_space = try httpx.PercentEncoding.encode(self.allocator, space);
         defer self.allocator.free(encoded_space);
         const url = try std.fmt.allocPrint(self.allocator, "{s}/memory/v1/spaces/{s}/outcomes", .{ self.base_url, encoded_space });
@@ -5724,13 +6140,14 @@ pub const Client = struct {
         if (self.auth_header) |header| try request_headers.append(self.allocator, header);
         if (x_antfly_database) |value| try request_headers.append(self.allocator, .{ "X-Antfly-Database", value });
         if (x_antfly_namespace) |value| try request_headers.append(self.allocator, .{ "X-Antfly-Namespace", value });
+        if (x_antfly_memory_branch) |value| try request_headers.append(self.allocator, .{ "X-Antfly-Memory-Branch", value });
         try request_headers.append(self.allocator, .{ "Idempotency-Key", idempotency_key });
         var resp = try self.http.post(url, .{ .json = json_body, .headers = request_headers.items });
         return ApiResponse(types.MemoryOperation).fromResponse(self.allocator, &resp);
     }
 
     /// POST /memory/v1/spaces/{space}/recall
-    pub fn recallMemory(self: *@This(), space: []const u8, body: types.MemoryRecallRequest, x_antfly_database: ?[]const u8, x_antfly_namespace: ?[]const u8) !ApiResponse(types.MemoryRecallResult) {
+    pub fn recallMemory(self: *@This(), space: []const u8, body: types.MemoryRecallRequest, x_antfly_database: ?[]const u8, x_antfly_namespace: ?[]const u8, x_antfly_memory_branch: ?[]const u8) !ApiResponse(types.MemoryRecallResult) {
         const encoded_space = try httpx.PercentEncoding.encode(self.allocator, space);
         defer self.allocator.free(encoded_space);
         const url = try std.fmt.allocPrint(self.allocator, "{s}/memory/v1/spaces/{s}/recall", .{ self.base_url, encoded_space });
@@ -5742,12 +6159,13 @@ pub const Client = struct {
         if (self.auth_header) |header| try request_headers.append(self.allocator, header);
         if (x_antfly_database) |value| try request_headers.append(self.allocator, .{ "X-Antfly-Database", value });
         if (x_antfly_namespace) |value| try request_headers.append(self.allocator, .{ "X-Antfly-Namespace", value });
+        if (x_antfly_memory_branch) |value| try request_headers.append(self.allocator, .{ "X-Antfly-Memory-Branch", value });
         var resp = try self.http.post(url, .{ .json = json_body, .headers = request_headers.items });
         return ApiResponse(types.MemoryRecallResult).fromResponse(self.allocator, &resp);
     }
 
     /// POST /memory/v1/spaces/{space}/relationship-proposals
-    pub fn proposeMemoryRelationship(self: *@This(), space: []const u8, body: types.MemoryRelationshipProposalRequest, x_antfly_database: ?[]const u8, x_antfly_namespace: ?[]const u8, idempotency_key: []const u8) !ApiResponse(types.MemoryOperation) {
+    pub fn proposeMemoryRelationship(self: *@This(), space: []const u8, body: types.MemoryRelationshipProposalRequest, x_antfly_database: ?[]const u8, x_antfly_namespace: ?[]const u8, x_antfly_memory_branch: ?[]const u8, idempotency_key: []const u8) !ApiResponse(types.MemoryOperation) {
         const encoded_space = try httpx.PercentEncoding.encode(self.allocator, space);
         defer self.allocator.free(encoded_space);
         const url = try std.fmt.allocPrint(self.allocator, "{s}/memory/v1/spaces/{s}/relationship-proposals", .{ self.base_url, encoded_space });
@@ -5759,13 +6177,14 @@ pub const Client = struct {
         if (self.auth_header) |header| try request_headers.append(self.allocator, header);
         if (x_antfly_database) |value| try request_headers.append(self.allocator, .{ "X-Antfly-Database", value });
         if (x_antfly_namespace) |value| try request_headers.append(self.allocator, .{ "X-Antfly-Namespace", value });
+        if (x_antfly_memory_branch) |value| try request_headers.append(self.allocator, .{ "X-Antfly-Memory-Branch", value });
         try request_headers.append(self.allocator, .{ "Idempotency-Key", idempotency_key });
         var resp = try self.http.post(url, .{ .json = json_body, .headers = request_headers.items });
         return ApiResponse(types.MemoryOperation).fromResponse(self.allocator, &resp);
     }
 
     /// GET /memory/v1/spaces/{space}/relationship-proposals/{id}
-    pub fn getMemoryRelationshipProposal(self: *@This(), space: []const u8, id: []const u8, x_antfly_database: ?[]const u8, x_antfly_namespace: ?[]const u8) !ApiResponse(types.MemoryRelationshipProposal) {
+    pub fn getMemoryRelationshipProposal(self: *@This(), space: []const u8, id: []const u8, x_antfly_database: ?[]const u8, x_antfly_namespace: ?[]const u8, x_antfly_memory_branch: ?[]const u8) !ApiResponse(types.MemoryRelationshipProposal) {
         const encoded_space = try httpx.PercentEncoding.encode(self.allocator, space);
         defer self.allocator.free(encoded_space);
         const encoded_id = try httpx.PercentEncoding.encode(self.allocator, id);
@@ -5777,12 +6196,13 @@ pub const Client = struct {
         if (self.auth_header) |header| try request_headers.append(self.allocator, header);
         if (x_antfly_database) |value| try request_headers.append(self.allocator, .{ "X-Antfly-Database", value });
         if (x_antfly_namespace) |value| try request_headers.append(self.allocator, .{ "X-Antfly-Namespace", value });
+        if (x_antfly_memory_branch) |value| try request_headers.append(self.allocator, .{ "X-Antfly-Memory-Branch", value });
         var resp = try self.http.get(url, .{ .headers = request_headers.items });
         return ApiResponse(types.MemoryRelationshipProposal).fromResponse(self.allocator, &resp);
     }
 
     /// POST /memory/v1/spaces/{space}/relationship-proposals/{id}/verdict
-    pub fn reviewMemoryRelationshipProposal(self: *@This(), space: []const u8, id: []const u8, body: types.MemoryEntityVerdict, x_antfly_database: ?[]const u8, x_antfly_namespace: ?[]const u8, idempotency_key: []const u8) !ApiResponse(types.MemoryOperation) {
+    pub fn reviewMemoryRelationshipProposal(self: *@This(), space: []const u8, id: []const u8, body: types.MemoryEntityVerdict, x_antfly_database: ?[]const u8, x_antfly_namespace: ?[]const u8, x_antfly_memory_branch: ?[]const u8, idempotency_key: []const u8) !ApiResponse(types.MemoryOperation) {
         const encoded_space = try httpx.PercentEncoding.encode(self.allocator, space);
         defer self.allocator.free(encoded_space);
         const encoded_id = try httpx.PercentEncoding.encode(self.allocator, id);
@@ -5796,6 +6216,124 @@ pub const Client = struct {
         if (self.auth_header) |header| try request_headers.append(self.allocator, header);
         if (x_antfly_database) |value| try request_headers.append(self.allocator, .{ "X-Antfly-Database", value });
         if (x_antfly_namespace) |value| try request_headers.append(self.allocator, .{ "X-Antfly-Namespace", value });
+        if (x_antfly_memory_branch) |value| try request_headers.append(self.allocator, .{ "X-Antfly-Memory-Branch", value });
+        try request_headers.append(self.allocator, .{ "Idempotency-Key", idempotency_key });
+        var resp = try self.http.post(url, .{ .json = json_body, .headers = request_headers.items });
+        return ApiResponse(types.MemoryOperation).fromResponse(self.allocator, &resp);
+    }
+
+    /// POST /memory/v1/spaces/{space}/reverts
+    pub fn revertMemoryLineage(self: *@This(), space: []const u8, body: types.MemoryLineageRevert, x_antfly_database: ?[]const u8, x_antfly_namespace: ?[]const u8, x_antfly_memory_branch: ?[]const u8, idempotency_key: []const u8) !ApiResponse(types.MemoryOperation) {
+        const encoded_space = try httpx.PercentEncoding.encode(self.allocator, space);
+        defer self.allocator.free(encoded_space);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/memory/v1/spaces/{s}/reverts", .{ self.base_url, encoded_space });
+        defer self.allocator.free(url);
+        const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
+        defer self.allocator.free(json_body);
+        var request_headers = std.ArrayListUnmanaged([2][]const u8).empty;
+        defer request_headers.deinit(self.allocator);
+        if (self.auth_header) |header| try request_headers.append(self.allocator, header);
+        if (x_antfly_database) |value| try request_headers.append(self.allocator, .{ "X-Antfly-Database", value });
+        if (x_antfly_namespace) |value| try request_headers.append(self.allocator, .{ "X-Antfly-Namespace", value });
+        if (x_antfly_memory_branch) |value| try request_headers.append(self.allocator, .{ "X-Antfly-Memory-Branch", value });
+        try request_headers.append(self.allocator, .{ "Idempotency-Key", idempotency_key });
+        var resp = try self.http.post(url, .{ .json = json_body, .headers = request_headers.items });
+        return ApiResponse(types.MemoryOperation).fromResponse(self.allocator, &resp);
+    }
+
+    /// GET /memory/v1/spaces/{space}/supersession-proposals
+    pub fn listMemorySupersessionProposals(self: *@This(), space: []const u8, x_antfly_database: ?[]const u8, x_antfly_namespace: ?[]const u8, x_antfly_memory_branch: ?[]const u8, params: ListMemorySupersessionProposalsParams) !ApiResponse(types.MemorySupersessionProposalPage) {
+        const encoded_space = try httpx.PercentEncoding.encode(self.allocator, space);
+        defer self.allocator.free(encoded_space);
+        var url = try std.fmt.allocPrint(self.allocator, "{s}/memory/v1/spaces/{s}/supersession-proposals", .{ self.base_url, encoded_space });
+        defer self.allocator.free(url);
+        var query_buf = std.ArrayListUnmanaged(u8).empty;
+        defer query_buf.deinit(self.allocator);
+        var sep: u8 = '?';
+        if (params.cursor) |v| {
+            const encoded_query_value = try httpx.PercentEncoding.encode(self.allocator, v);
+            defer self.allocator.free(encoded_query_value);
+            try query_buf.appendSlice(self.allocator, &.{sep});
+            try query_buf.appendSlice(self.allocator, "cursor=");
+            try query_buf.appendSlice(self.allocator, encoded_query_value);
+            sep = '&';
+        }
+        if (params.limit) |v| {
+            const encoded_query_value = try httpx.PercentEncoding.encode(self.allocator, v);
+            defer self.allocator.free(encoded_query_value);
+            try query_buf.appendSlice(self.allocator, &.{sep});
+            try query_buf.appendSlice(self.allocator, "limit=");
+            try query_buf.appendSlice(self.allocator, encoded_query_value);
+            sep = '&';
+        }
+        if (query_buf.items.len > 0) {
+            const new_url = try std.fmt.allocPrint(self.allocator, "{s}{s}", .{ url, query_buf.items });
+            self.allocator.free(url);
+            url = new_url;
+        }
+        var request_headers = std.ArrayListUnmanaged([2][]const u8).empty;
+        defer request_headers.deinit(self.allocator);
+        if (self.auth_header) |header| try request_headers.append(self.allocator, header);
+        if (x_antfly_database) |value| try request_headers.append(self.allocator, .{ "X-Antfly-Database", value });
+        if (x_antfly_namespace) |value| try request_headers.append(self.allocator, .{ "X-Antfly-Namespace", value });
+        if (x_antfly_memory_branch) |value| try request_headers.append(self.allocator, .{ "X-Antfly-Memory-Branch", value });
+        var resp = try self.http.get(url, .{ .headers = request_headers.items });
+        return ApiResponse(types.MemorySupersessionProposalPage).fromResponse(self.allocator, &resp);
+    }
+
+    /// POST /memory/v1/spaces/{space}/supersession-proposals
+    pub fn proposeMemorySupersession(self: *@This(), space: []const u8, body: types.MemorySupersessionProposalRequest, x_antfly_database: ?[]const u8, x_antfly_namespace: ?[]const u8, x_antfly_memory_branch: ?[]const u8, idempotency_key: []const u8) !ApiResponse(types.MemoryOperation) {
+        const encoded_space = try httpx.PercentEncoding.encode(self.allocator, space);
+        defer self.allocator.free(encoded_space);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/memory/v1/spaces/{s}/supersession-proposals", .{ self.base_url, encoded_space });
+        defer self.allocator.free(url);
+        const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
+        defer self.allocator.free(json_body);
+        var request_headers = std.ArrayListUnmanaged([2][]const u8).empty;
+        defer request_headers.deinit(self.allocator);
+        if (self.auth_header) |header| try request_headers.append(self.allocator, header);
+        if (x_antfly_database) |value| try request_headers.append(self.allocator, .{ "X-Antfly-Database", value });
+        if (x_antfly_namespace) |value| try request_headers.append(self.allocator, .{ "X-Antfly-Namespace", value });
+        if (x_antfly_memory_branch) |value| try request_headers.append(self.allocator, .{ "X-Antfly-Memory-Branch", value });
+        try request_headers.append(self.allocator, .{ "Idempotency-Key", idempotency_key });
+        var resp = try self.http.post(url, .{ .json = json_body, .headers = request_headers.items });
+        return ApiResponse(types.MemoryOperation).fromResponse(self.allocator, &resp);
+    }
+
+    /// GET /memory/v1/spaces/{space}/supersession-proposals/{id}
+    pub fn getMemorySupersessionProposal(self: *@This(), space: []const u8, id: []const u8, x_antfly_database: ?[]const u8, x_antfly_namespace: ?[]const u8, x_antfly_memory_branch: ?[]const u8) !ApiResponse(types.MemorySupersessionProposalDetail) {
+        const encoded_space = try httpx.PercentEncoding.encode(self.allocator, space);
+        defer self.allocator.free(encoded_space);
+        const encoded_id = try httpx.PercentEncoding.encode(self.allocator, id);
+        defer self.allocator.free(encoded_id);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/memory/v1/spaces/{s}/supersession-proposals/{s}", .{ self.base_url, encoded_space, encoded_id });
+        defer self.allocator.free(url);
+        var request_headers = std.ArrayListUnmanaged([2][]const u8).empty;
+        defer request_headers.deinit(self.allocator);
+        if (self.auth_header) |header| try request_headers.append(self.allocator, header);
+        if (x_antfly_database) |value| try request_headers.append(self.allocator, .{ "X-Antfly-Database", value });
+        if (x_antfly_namespace) |value| try request_headers.append(self.allocator, .{ "X-Antfly-Namespace", value });
+        if (x_antfly_memory_branch) |value| try request_headers.append(self.allocator, .{ "X-Antfly-Memory-Branch", value });
+        var resp = try self.http.get(url, .{ .headers = request_headers.items });
+        return ApiResponse(types.MemorySupersessionProposalDetail).fromResponse(self.allocator, &resp);
+    }
+
+    /// POST /memory/v1/spaces/{space}/supersession-proposals/{id}/verdict
+    pub fn reviewMemorySupersessionProposal(self: *@This(), space: []const u8, id: []const u8, body: types.MemorySupersessionVerdict, x_antfly_database: ?[]const u8, x_antfly_namespace: ?[]const u8, x_antfly_memory_branch: ?[]const u8, idempotency_key: []const u8) !ApiResponse(types.MemoryOperation) {
+        const encoded_space = try httpx.PercentEncoding.encode(self.allocator, space);
+        defer self.allocator.free(encoded_space);
+        const encoded_id = try httpx.PercentEncoding.encode(self.allocator, id);
+        defer self.allocator.free(encoded_id);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/memory/v1/spaces/{s}/supersession-proposals/{s}/verdict", .{ self.base_url, encoded_space, encoded_id });
+        defer self.allocator.free(url);
+        const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
+        defer self.allocator.free(json_body);
+        var request_headers = std.ArrayListUnmanaged([2][]const u8).empty;
+        defer request_headers.deinit(self.allocator);
+        if (self.auth_header) |header| try request_headers.append(self.allocator, header);
+        if (x_antfly_database) |value| try request_headers.append(self.allocator, .{ "X-Antfly-Database", value });
+        if (x_antfly_namespace) |value| try request_headers.append(self.allocator, .{ "X-Antfly-Namespace", value });
+        if (x_antfly_memory_branch) |value| try request_headers.append(self.allocator, .{ "X-Antfly-Memory-Branch", value });
         try request_headers.append(self.allocator, .{ "Idempotency-Key", idempotency_key });
         var resp = try self.http.post(url, .{ .json = json_body, .headers = request_headers.items });
         return ApiResponse(types.MemoryOperation).fromResponse(self.allocator, &resp);

@@ -572,6 +572,7 @@ from .field_representation_sort_lifecycle_state import FieldRepresentationSortLi
 from .field_statistics import FieldStatistics
 from .filter_spec import FilterSpec
 from .filter_spec_operator import FilterSpecOperator
+from .follow_memory_changes_start import FollowMemoryChangesStart
 from .followup_step_config import FollowupStepConfig
 from .foreign_column import ForeignColumn
 from .foreign_key_action import ForeignKeyAction
@@ -1179,6 +1180,11 @@ from .memory_assertion_support_sets_item_evidence_item_span_type_0 import (
     MemoryAssertionSupportSetsItemEvidenceItemSpanType0,
 )
 from .memory_assertion_visibility import MemoryAssertionVisibility
+from .memory_change_page import MemoryChangePage
+from .memory_change_request import MemoryChangeRequest
+from .memory_change_request_start import MemoryChangeRequestStart
+from .memory_claim_pin import MemoryClaimPin
+from .memory_claim_view import MemoryClaimView
 from .memory_configure_request import MemoryConfigureRequest
 from .memory_correction import MemoryCorrection
 from .memory_correction_evidence_item import MemoryCorrectionEvidenceItem
@@ -1298,6 +1304,12 @@ from .memory_episode_page_items_item_turns_item_evidence_evidence_resource_type_
 from .memory_episode_page_items_item_turns_item_evidence_evidence_visibility import (
     MemoryEpisodePageItemsItemTurnsItemEvidenceEvidenceVisibility,
 )
+from .memory_episode_page_items_item_turns_item_evidence_materialization_type_0 import (
+    MemoryEpisodePageItemsItemTurnsItemEvidenceMaterializationType0,
+)
+from .memory_episode_page_items_item_turns_item_evidence_materialization_type_0_screening import (
+    MemoryEpisodePageItemsItemTurnsItemEvidenceMaterializationType0Screening,
+)
 from .memory_episode_request import MemoryEpisodeRequest
 from .memory_episode_turns_item import MemoryEpisodeTurnsItem
 from .memory_episode_turns_item_evidence import MemoryEpisodeTurnsItemEvidence
@@ -1315,7 +1327,53 @@ from .memory_episode_turns_item_evidence_evidence_resource_type_0_kind import (
     MemoryEpisodeTurnsItemEvidenceEvidenceResourceType0Kind,
 )
 from .memory_episode_turns_item_evidence_evidence_visibility import MemoryEpisodeTurnsItemEvidenceEvidenceVisibility
+from .memory_episode_turns_item_evidence_materialization_type_0 import (
+    MemoryEpisodeTurnsItemEvidenceMaterializationType0,
+)
+from .memory_episode_turns_item_evidence_materialization_type_0_screening import (
+    MemoryEpisodeTurnsItemEvidenceMaterializationType0Screening,
+)
 from .memory_error import MemoryError_
+from .memory_evaluation_case import MemoryEvaluationCase
+from .memory_evaluation_case_evidence_item import MemoryEvaluationCaseEvidenceItem
+from .memory_evaluation_case_evidence_item_span_type_0 import MemoryEvaluationCaseEvidenceItemSpanType0
+from .memory_evaluation_case_expected import MemoryEvaluationCaseExpected
+from .memory_evaluation_case_page import MemoryEvaluationCasePage
+from .memory_evaluation_case_task import MemoryEvaluationCaseTask
+from .memory_evaluation_counts import MemoryEvaluationCounts
+from .memory_evaluation_dataset import MemoryEvaluationDataset
+from .memory_evaluation_dataset_request import MemoryEvaluationDatasetRequest
+from .memory_evaluation_dataset_request_visibility import MemoryEvaluationDatasetRequestVisibility
+from .memory_evaluation_dataset_visibility import MemoryEvaluationDatasetVisibility
+from .memory_evaluation_judge_input import MemoryEvaluationJudgeInput
+from .memory_evaluation_judge_input_task import MemoryEvaluationJudgeInputTask
+from .memory_evaluation_judge_output import MemoryEvaluationJudgeOutput
+from .memory_evaluation_judge_output_label import MemoryEvaluationJudgeOutputLabel
+from .memory_evaluation_judge_task import MemoryEvaluationJudgeTask
+from .memory_evaluation_policy_input import MemoryEvaluationPolicyInput
+from .memory_evaluation_prediction import MemoryEvaluationPrediction
+from .memory_evaluation_prediction_label import MemoryEvaluationPredictionLabel
+from .memory_evaluation_report import MemoryEvaluationReport
+from .memory_evaluation_result import MemoryEvaluationResult
+from .memory_evaluation_result_entry import MemoryEvaluationResultEntry
+from .memory_evaluation_result_model_type_0 import MemoryEvaluationResultModelType0
+from .memory_evaluation_result_page import MemoryEvaluationResultPage
+from .memory_evaluation_run import MemoryEvaluationRun
+from .memory_evaluation_run_judge_type_0 import MemoryEvaluationRunJudgeType0
+from .memory_evaluation_run_mode import MemoryEvaluationRunMode
+from .memory_evaluation_run_phase import MemoryEvaluationRunPhase
+from .memory_evaluation_run_thresholds_type_0 import MemoryEvaluationRunThresholdsType0
+from .memory_evaluation_run_visibility import MemoryEvaluationRunVisibility
+from .memory_evaluation_start import MemoryEvaluationStart
+from .memory_evaluation_start_judge_type_0 import MemoryEvaluationStartJudgeType0
+from .memory_evaluation_start_mode import MemoryEvaluationStartMode
+from .memory_evaluation_start_thresholds_type_0 import MemoryEvaluationStartThresholdsType0
+from .memory_evaluation_status import MemoryEvaluationStatus
+from .memory_evaluation_stored_case import MemoryEvaluationStoredCase
+from .memory_evaluation_submit import MemoryEvaluationSubmit
+from .memory_evaluation_submit_model_type_0 import MemoryEvaluationSubmitModelType0
+from .memory_evaluation_task_page import MemoryEvaluationTaskPage
+from .memory_evaluation_verdict import MemoryEvaluationVerdict
 from .memory_evidence import MemoryEvidence
 from .memory_evidence_resource_selector_type_0 import MemoryEvidenceResourceSelectorType0
 from .memory_evidence_resource_selector_type_0_kind import MemoryEvidenceResourceSelectorType0Kind
@@ -1344,6 +1402,14 @@ from .memory_inspection_state import MemoryInspectionState
 from .memory_inspection_state_config import MemoryInspectionStateConfig
 from .memory_inspection_state_config_features import MemoryInspectionStateConfigFeatures
 from .memory_inspection_state_config_features_reconciliation import MemoryInspectionStateConfigFeaturesReconciliation
+from .memory_inspection_state_config_intake_screening import MemoryInspectionStateConfigIntakeScreening
+from .memory_inspection_state_config_intake_screening_custom_rules_item import (
+    MemoryInspectionStateConfigIntakeScreeningCustomRulesItem,
+)
+from .memory_inspection_state_config_intake_screening_custom_rules_item_alphabet import (
+    MemoryInspectionStateConfigIntakeScreeningCustomRulesItemAlphabet,
+)
+from .memory_inspection_state_config_intake_screening_mode import MemoryInspectionStateConfigIntakeScreeningMode
 from .memory_inspection_state_config_models import MemoryInspectionStateConfigModels
 from .memory_inspection_state_config_models_decider_type_0 import MemoryInspectionStateConfigModelsDeciderType0
 from .memory_inspection_state_config_models_embedder_type_0 import MemoryInspectionStateConfigModelsEmbedderType0
@@ -1361,6 +1427,18 @@ from .memory_inspection_state_pending_config_type_0 import MemoryInspectionState
 from .memory_inspection_state_pending_config_type_0_features import MemoryInspectionStatePendingConfigType0Features
 from .memory_inspection_state_pending_config_type_0_features_reconciliation import (
     MemoryInspectionStatePendingConfigType0FeaturesReconciliation,
+)
+from .memory_inspection_state_pending_config_type_0_intake_screening import (
+    MemoryInspectionStatePendingConfigType0IntakeScreening,
+)
+from .memory_inspection_state_pending_config_type_0_intake_screening_custom_rules_item import (
+    MemoryInspectionStatePendingConfigType0IntakeScreeningCustomRulesItem,
+)
+from .memory_inspection_state_pending_config_type_0_intake_screening_custom_rules_item_alphabet import (
+    MemoryInspectionStatePendingConfigType0IntakeScreeningCustomRulesItemAlphabet,
+)
+from .memory_inspection_state_pending_config_type_0_intake_screening_mode import (
+    MemoryInspectionStatePendingConfigType0IntakeScreeningMode,
 )
 from .memory_inspection_state_pending_config_type_0_models import MemoryInspectionStatePendingConfigType0Models
 from .memory_inspection_state_pending_config_type_0_models_decider_type_0 import (
@@ -1391,6 +1469,19 @@ from .memory_inspection_state_pending_config_type_0_semantic_discovery import (
 from .memory_inspection_state_pending_config_type_0_source_rules_item import (
     MemoryInspectionStatePendingConfigType0SourceRulesItem,
 )
+from .memory_intake_materialization import MemoryIntakeMaterialization
+from .memory_intake_materialization_screening import MemoryIntakeMaterializationScreening
+from .memory_intake_screening import MemoryIntakeScreening
+from .memory_intake_screening_custom_rules_item import MemoryIntakeScreeningCustomRulesItem
+from .memory_intake_screening_custom_rules_item_alphabet import MemoryIntakeScreeningCustomRulesItemAlphabet
+from .memory_intake_screening_mode import MemoryIntakeScreeningMode
+from .memory_intake_screening_report import MemoryIntakeScreeningReport
+from .memory_lineage_checkpoint_request import MemoryLineageCheckpointRequest
+from .memory_lineage_fork import MemoryLineageFork
+from .memory_lineage_fork_visibility import MemoryLineageForkVisibility
+from .memory_lineage_head import MemoryLineageHead
+from .memory_lineage_head_visibility import MemoryLineageHeadVisibility
+from .memory_lineage_revert import MemoryLineageRevert
 from .memory_observation_request import MemoryObservationRequest
 from .memory_observation_request_entities_item import MemoryObservationRequestEntitiesItem
 from .memory_observation_request_entities_item_evidence_item import MemoryObservationRequestEntitiesItemEvidenceItem
@@ -1475,6 +1566,12 @@ from .memory_recall_result_episodes_item_turns_item_evidence_evidence_resource_t
 )
 from .memory_recall_result_episodes_item_turns_item_evidence_evidence_visibility import (
     MemoryRecallResultEpisodesItemTurnsItemEvidenceEvidenceVisibility,
+)
+from .memory_recall_result_episodes_item_turns_item_evidence_materialization_type_0 import (
+    MemoryRecallResultEpisodesItemTurnsItemEvidenceMaterializationType0,
+)
+from .memory_recall_result_episodes_item_turns_item_evidence_materialization_type_0_screening import (
+    MemoryRecallResultEpisodesItemTurnsItemEvidenceMaterializationType0Screening,
 )
 from .memory_recall_result_graph_type_0 import MemoryRecallResultGraphType0
 from .memory_recall_result_items_item import MemoryRecallResultItemsItem
@@ -1667,6 +1764,10 @@ from .memory_relationship_proposal_views_type_0_item_dependencies_item_resource_
     MemoryRelationshipProposalViewsType0ItemDependenciesItemResourceKind,
 )
 from .memory_result import MemoryResult
+from .memory_space_change import MemorySpaceChange
+from .memory_space_change_kind import MemorySpaceChangeKind
+from .memory_space_change_target_type_0 import MemorySpaceChangeTargetType0
+from .memory_space_change_target_type_0_kind import MemorySpaceChangeTargetType0Kind
 from .memory_space_config import MemorySpaceConfig
 from .memory_space_config_features import MemorySpaceConfigFeatures
 from .memory_space_config_features_reconciliation import MemorySpaceConfigFeaturesReconciliation
@@ -1681,6 +1782,25 @@ from .memory_space_config_predicates_item_cardinality import MemorySpaceConfigPr
 from .memory_space_config_processing import MemorySpaceConfigProcessing
 from .memory_space_config_semantic_discovery import MemorySpaceConfigSemanticDiscovery
 from .memory_space_config_source_rules_item import MemorySpaceConfigSourceRulesItem
+from .memory_supersession_candidate import MemorySupersessionCandidate
+from .memory_supersession_candidate_page import MemorySupersessionCandidatePage
+from .memory_supersession_candidate_page_retrieval import MemorySupersessionCandidatePageRetrieval
+from .memory_supersession_candidate_page_semantic_discovery import MemorySupersessionCandidatePageSemanticDiscovery
+from .memory_supersession_candidate_request import MemorySupersessionCandidateRequest
+from .memory_supersession_candidate_request_mode import MemorySupersessionCandidateRequestMode
+from .memory_supersession_proposal import MemorySupersessionProposal
+from .memory_supersession_proposal_detail import MemorySupersessionProposalDetail
+from .memory_supersession_proposal_evidence_item import MemorySupersessionProposalEvidenceItem
+from .memory_supersession_proposal_evidence_item_span_type_0 import MemorySupersessionProposalEvidenceItemSpanType0
+from .memory_supersession_proposal_model_type_0 import MemorySupersessionProposalModelType0
+from .memory_supersession_proposal_page import MemorySupersessionProposalPage
+from .memory_supersession_proposal_request import MemorySupersessionProposalRequest
+from .memory_supersession_proposal_verdict import MemorySupersessionProposalVerdict
+from .memory_supersession_verdict import MemorySupersessionVerdict
+from .memory_supersession_verdict_evidence_item import MemorySupersessionVerdictEvidenceItem
+from .memory_supersession_verdict_evidence_item_span_type_0 import MemorySupersessionVerdictEvidenceItemSpanType0
+from .memory_supersession_verdict_model_type_0 import MemorySupersessionVerdictModelType0
+from .memory_supersession_verdict_verdict import MemorySupersessionVerdictVerdict
 from .merge_config import MergeConfig
 from .merge_config_weights import MergeConfigWeights
 from .merge_profile import MergeProfile
@@ -2834,6 +2954,7 @@ __all__ = (
     "FieldStatistics",
     "FilterSpec",
     "FilterSpecOperator",
+    "FollowMemoryChangesStart",
     "FollowupStepConfig",
     "ForeignColumn",
     "ForeignKeyAction",
@@ -3437,6 +3558,11 @@ __all__ = (
     "MemoryAssertionSupportSetsItemEvidenceItem",
     "MemoryAssertionSupportSetsItemEvidenceItemSpanType0",
     "MemoryAssertionVisibility",
+    "MemoryChangePage",
+    "MemoryChangeRequest",
+    "MemoryChangeRequestStart",
+    "MemoryClaimPin",
+    "MemoryClaimView",
     "MemoryConfigureRequest",
     "MemoryCorrection",
     "MemoryCorrectionEvidenceItem",
@@ -3530,6 +3656,8 @@ __all__ = (
     "MemoryEpisodePageItemsItemTurnsItemEvidenceEvidenceResourceType0",
     "MemoryEpisodePageItemsItemTurnsItemEvidenceEvidenceResourceType0Kind",
     "MemoryEpisodePageItemsItemTurnsItemEvidenceEvidenceVisibility",
+    "MemoryEpisodePageItemsItemTurnsItemEvidenceMaterializationType0",
+    "MemoryEpisodePageItemsItemTurnsItemEvidenceMaterializationType0Screening",
     "MemoryEpisodeRequest",
     "MemoryEpisodeTurnsItem",
     "MemoryEpisodeTurnsItemEvidence",
@@ -3539,7 +3667,49 @@ __all__ = (
     "MemoryEpisodeTurnsItemEvidenceEvidenceResourceType0",
     "MemoryEpisodeTurnsItemEvidenceEvidenceResourceType0Kind",
     "MemoryEpisodeTurnsItemEvidenceEvidenceVisibility",
+    "MemoryEpisodeTurnsItemEvidenceMaterializationType0",
+    "MemoryEpisodeTurnsItemEvidenceMaterializationType0Screening",
     "MemoryError_",
+    "MemoryEvaluationCase",
+    "MemoryEvaluationCaseEvidenceItem",
+    "MemoryEvaluationCaseEvidenceItemSpanType0",
+    "MemoryEvaluationCaseExpected",
+    "MemoryEvaluationCasePage",
+    "MemoryEvaluationCaseTask",
+    "MemoryEvaluationCounts",
+    "MemoryEvaluationDataset",
+    "MemoryEvaluationDatasetRequest",
+    "MemoryEvaluationDatasetRequestVisibility",
+    "MemoryEvaluationDatasetVisibility",
+    "MemoryEvaluationJudgeInput",
+    "MemoryEvaluationJudgeInputTask",
+    "MemoryEvaluationJudgeOutput",
+    "MemoryEvaluationJudgeOutputLabel",
+    "MemoryEvaluationJudgeTask",
+    "MemoryEvaluationPolicyInput",
+    "MemoryEvaluationPrediction",
+    "MemoryEvaluationPredictionLabel",
+    "MemoryEvaluationReport",
+    "MemoryEvaluationResult",
+    "MemoryEvaluationResultEntry",
+    "MemoryEvaluationResultModelType0",
+    "MemoryEvaluationResultPage",
+    "MemoryEvaluationRun",
+    "MemoryEvaluationRunJudgeType0",
+    "MemoryEvaluationRunMode",
+    "MemoryEvaluationRunPhase",
+    "MemoryEvaluationRunThresholdsType0",
+    "MemoryEvaluationRunVisibility",
+    "MemoryEvaluationStart",
+    "MemoryEvaluationStartJudgeType0",
+    "MemoryEvaluationStartMode",
+    "MemoryEvaluationStartThresholdsType0",
+    "MemoryEvaluationStatus",
+    "MemoryEvaluationStoredCase",
+    "MemoryEvaluationSubmit",
+    "MemoryEvaluationSubmitModelType0",
+    "MemoryEvaluationTaskPage",
+    "MemoryEvaluationVerdict",
     "MemoryEvidence",
     "MemoryEvidenceResourceSelectorType0",
     "MemoryEvidenceResourceSelectorType0Kind",
@@ -3566,6 +3736,10 @@ __all__ = (
     "MemoryInspectionStateConfig",
     "MemoryInspectionStateConfigFeatures",
     "MemoryInspectionStateConfigFeaturesReconciliation",
+    "MemoryInspectionStateConfigIntakeScreening",
+    "MemoryInspectionStateConfigIntakeScreeningCustomRulesItem",
+    "MemoryInspectionStateConfigIntakeScreeningCustomRulesItemAlphabet",
+    "MemoryInspectionStateConfigIntakeScreeningMode",
     "MemoryInspectionStateConfigModels",
     "MemoryInspectionStateConfigModelsDeciderType0",
     "MemoryInspectionStateConfigModelsEmbedderType0",
@@ -3580,6 +3754,10 @@ __all__ = (
     "MemoryInspectionStatePendingConfigType0",
     "MemoryInspectionStatePendingConfigType0Features",
     "MemoryInspectionStatePendingConfigType0FeaturesReconciliation",
+    "MemoryInspectionStatePendingConfigType0IntakeScreening",
+    "MemoryInspectionStatePendingConfigType0IntakeScreeningCustomRulesItem",
+    "MemoryInspectionStatePendingConfigType0IntakeScreeningCustomRulesItemAlphabet",
+    "MemoryInspectionStatePendingConfigType0IntakeScreeningMode",
     "MemoryInspectionStatePendingConfigType0Models",
     "MemoryInspectionStatePendingConfigType0ModelsDeciderType0",
     "MemoryInspectionStatePendingConfigType0ModelsEmbedderType0",
@@ -3591,6 +3769,19 @@ __all__ = (
     "MemoryInspectionStatePendingConfigType0Processing",
     "MemoryInspectionStatePendingConfigType0SemanticDiscovery",
     "MemoryInspectionStatePendingConfigType0SourceRulesItem",
+    "MemoryIntakeMaterialization",
+    "MemoryIntakeMaterializationScreening",
+    "MemoryIntakeScreening",
+    "MemoryIntakeScreeningCustomRulesItem",
+    "MemoryIntakeScreeningCustomRulesItemAlphabet",
+    "MemoryIntakeScreeningMode",
+    "MemoryIntakeScreeningReport",
+    "MemoryLineageCheckpointRequest",
+    "MemoryLineageFork",
+    "MemoryLineageForkVisibility",
+    "MemoryLineageHead",
+    "MemoryLineageHeadVisibility",
+    "MemoryLineageRevert",
     "MemoryObservationRequest",
     "MemoryObservationRequestEntitiesItem",
     "MemoryObservationRequestEntitiesItemEvidenceItem",
@@ -3640,6 +3831,8 @@ __all__ = (
     "MemoryRecallResultEpisodesItemTurnsItemEvidenceEvidenceResourceType0",
     "MemoryRecallResultEpisodesItemTurnsItemEvidenceEvidenceResourceType0Kind",
     "MemoryRecallResultEpisodesItemTurnsItemEvidenceEvidenceVisibility",
+    "MemoryRecallResultEpisodesItemTurnsItemEvidenceMaterializationType0",
+    "MemoryRecallResultEpisodesItemTurnsItemEvidenceMaterializationType0Screening",
     "MemoryRecallResultGraphType0",
     "MemoryRecallResultItemsItem",
     "MemoryRecallResultItemsItemCitationsItem",
@@ -3741,6 +3934,10 @@ __all__ = (
     "MemoryRelationshipProposalViewsType0ItemDependenciesItemResource",
     "MemoryRelationshipProposalViewsType0ItemDependenciesItemResourceKind",
     "MemoryResult",
+    "MemorySpaceChange",
+    "MemorySpaceChangeKind",
+    "MemorySpaceChangeTargetType0",
+    "MemorySpaceChangeTargetType0Kind",
     "MemorySpaceConfig",
     "MemorySpaceConfigFeatures",
     "MemorySpaceConfigFeaturesReconciliation",
@@ -3755,6 +3952,25 @@ __all__ = (
     "MemorySpaceConfigProcessing",
     "MemorySpaceConfigSemanticDiscovery",
     "MemorySpaceConfigSourceRulesItem",
+    "MemorySupersessionCandidate",
+    "MemorySupersessionCandidatePage",
+    "MemorySupersessionCandidatePageRetrieval",
+    "MemorySupersessionCandidatePageSemanticDiscovery",
+    "MemorySupersessionCandidateRequest",
+    "MemorySupersessionCandidateRequestMode",
+    "MemorySupersessionProposal",
+    "MemorySupersessionProposalDetail",
+    "MemorySupersessionProposalEvidenceItem",
+    "MemorySupersessionProposalEvidenceItemSpanType0",
+    "MemorySupersessionProposalModelType0",
+    "MemorySupersessionProposalPage",
+    "MemorySupersessionProposalRequest",
+    "MemorySupersessionProposalVerdict",
+    "MemorySupersessionVerdict",
+    "MemorySupersessionVerdictEvidenceItem",
+    "MemorySupersessionVerdictEvidenceItemSpanType0",
+    "MemorySupersessionVerdictModelType0",
+    "MemorySupersessionVerdictVerdict",
     "MergeConfig",
     "MergeConfigWeights",
     "MergeProfile",

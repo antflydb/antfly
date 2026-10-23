@@ -715,6 +715,7 @@ pub fn executeMemoryMcpRequest(server_ptr: anytype, request: McpRequest, authent
         fn call(ptr: *anyopaque, a: std.mem.Allocator, args: std.json.Value) !mcp.CallToolResult {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             const Arguments = struct {
+                branch: []const u8 = "",
                 space: []const u8,
                 database: []const u8 = "default",
                 namespace: []const u8 = "public",
@@ -725,6 +726,7 @@ pub fn executeMemoryMcpRequest(server_ptr: anytype, request: McpRequest, authent
             const input = std.json.parseFromSliceLeaky(Arguments, a, try @import("antfly-json").stringifyValueAlloc(a, args), .{ .ignore_unknown_fields = false, .parse_numbers = false }) catch return mcpError(a, "invalid memory tool arguments");
             if (memory_api.memory.operations.idRequired(self.action) and input.id.len == 0) return mcpError(a, "missing memory resource id");
             var response = try self.server.executeMemoryService(input.space, .{
+                .branch = input.branch,
                 .database = input.database,
                 .namespace = input.namespace,
                 .action = self.action,

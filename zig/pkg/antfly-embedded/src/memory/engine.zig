@@ -131,7 +131,13 @@ pub const Routed = struct {
     request: @import("../api/operation.zig").RequestContext = .{},
 
     pub fn backend(self: *Routed) service.Backend {
-        return .{ .ptr = self, .get = get, .get_many = getMany, .scan = scan, .commit = commit, .resource = if (self.resource_fn != null) resource else null, .neighbors = neighbors, .ensure_vector_index = ensureVectorIndex, .drop_index = dropIndex, .ensure_text_index = ensureTextIndex, .search_assertions = searchAssertions };
+        return .{ .ptr = self, .random_bytes = if (self.request.fanout_io != null or self.request.deadline_io != null) randomBytes else null, .get = get, .get_many = getMany, .scan = scan, .commit = commit, .resource = if (self.resource_fn != null) resource else null, .neighbors = neighbors, .ensure_vector_index = ensureVectorIndex, .drop_index = dropIndex, .ensure_text_index = ensureTextIndex, .search_assertions = searchAssertions };
+    }
+    fn randomBytes(ptr: *anyopaque, bytes: []u8) !void {
+        const self: *Routed = @ptrCast(@alignCast(ptr));
+        const borrow = self.request.fanout_io orelse self.request.deadline_io orelse return error.MemoryCapabilityUnavailable;
+        var receiver = try borrow.receive();
+        @import("antfly_platform").entropy.fill(receiver.io(), bytes) catch return error.MemoryCapabilityUnavailable;
     }
     fn dropIndex(ptr: *anyopaque, a: A, name: []const u8) !void {
         const self: *Routed = @ptrCast(@alignCast(ptr));
@@ -259,7 +265,11 @@ pub fn Native(comptime DB: type) type {
         resource_fn: ?*const fn (*anyopaque, A, service.types.provenance.Resource) anyerror!service.types.provenance.Snapshot = null,
         const Self = @This();
         pub fn backend(self: *Self) service.Backend {
-            return .{ .ptr = self, .get = get, .get_many = getMany, .scan = scan, .commit = commit, .resource = if (self.resource_fn != null) resource else null, .neighbors = neighbors, .ensure_vector_index = ensureVectorIndex, .drop_index = dropIndex, .ensure_text_index = ensureTextIndex, .search_assertions = searchAssertions };
+            return .{ .ptr = self, .random_bytes = if (self.db.backend_runtime.io() != null) randomBytes else null, .get = get, .get_many = getMany, .scan = scan, .commit = commit, .resource = if (self.resource_fn != null) resource else null, .neighbors = neighbors, .ensure_vector_index = ensureVectorIndex, .drop_index = dropIndex, .ensure_text_index = ensureTextIndex, .search_assertions = searchAssertions };
+        }
+        fn randomBytes(ptr: *anyopaque, bytes: []u8) !void {
+            const self: *Self = @ptrCast(@alignCast(ptr));
+            @import("antfly_platform").entropy.fill(self.db.backend_runtime.io() orelse return error.MemoryCapabilityUnavailable, bytes) catch return error.MemoryCapabilityUnavailable;
         }
         fn dropIndex(ptr: *anyopaque, _: A, name: []const u8) !void {
             const self: *Self = @ptrCast(@alignCast(ptr));

@@ -42,7 +42,7 @@ published. Upgrade every public ingress and metadata peer before enabling spaces
 The private catalog protocol preserves ownership across restart and projections;
 unsupported catalog providers fail closed instead of creating an ordinary table.
 
-The embedded JSON envelope is `{action, id?, body?, idempotency_key?, principal?}`.
+The embedded JSON envelope is `{action, id?, body?, idempotency_key?, principal?, branch?}`.
 The database owner is its authority; local `principal` is attribution. Remote
 transports derive principals and table grants from Antfly authentication.
 No protocol accepts a caller-supplied authorization override. Arbitrary extra
@@ -708,8 +708,262 @@ policy. Labels are supplied as external verdicts; this tests admission/lifecycle
 and does **not** reproduce or claim hosted/local model precision. Additional
 native cases cover descriptions, graph rank/budgets, ordered episodes, repeated
 mentions, correction and causal forgetting. Live Codex extraction/retrieval,
-note-file changes, fork/revert and product cutover remain consumer qualification
+note-file changes, Codex fork/revert adapter integration and product cutover remain consumer qualification
 work; no Antfly-only test claims to execute that separate application.
+
+## Supersession review, lineage, changes and judge evaluation
+
+These contracts are implemented in the shared native service. HTTP, the dedicated
+`/memory/v1/mcp` catalog, and the Lite JSON C ABI use the same operations, grants,
+control CAS, receipts, source checks and publication fences. They do not require
+an entity extractor, decider or generator merely to store external judgments.
+
+### Supersession discovery and outside verdicts
+
+`POST /spaces/{space}/memories/{id}/supersession-candidates` accepts `limit`
+(1–64), `mode` (`lexical`, `semantic`, `union_search`), separate lexical and
+semantic thresholds, and an explicit bounded response-byte budget. It returns a
+seed claim view and candidate views with separate lexical coverage and
+self-normalized semantic similarity. Views omit vectors and carry a fingerprint,
+assertion revision and configuration generation. Similarity is discovery data.
+
+Discovery uses the existing assertion projections in Antfly's shared full-text
+and vector indexes. Derived recall projection version 3 adds hashed raw-subject
+terms. The canonical subject's alias family is pushed into the native query,
+along with exact-or-global scope and wildcard environment/task filters. Each
+lane retrieves at most `limit + 1` neighbors; lexical and ANN results are unioned
+before the live policy gate. Candidates must share the canonical subject,
+visibility and private-owner partition, overlap scope and half-open validity,
+and retain accessible evidence. There is no assertion-table fallback advertised
+as ANN. Pending projection work reports `retrieval: not_ready`; semantic discovery
+separately reports `indexed`, `disabled` or `not_ready`.
+
+Managed claim documents use the provider's **document** role. Candidate queries
+and ordinary recall use its **query** role. Vector provenance records that role,
+model identity/revision, embedding generation and statement fingerprint. Backfill
+rebuilds legacy managed query-role claim vectors before advertising version-three
+readiness; externally supplied vectors retain their explicit document contract.
+Semantic similarity is `cosine(query, candidate_document) /
+cosine(query, seed_document)`; a zero self-score cannot advertise semantic
+readiness. Thresholds are configurable request parameters, not merge/replacement
+policy or calibrated factual confidence.
+
+`POST /supersession-proposals` freezes an incoming/previous pair using exact claim
+revisions, rendered-view fingerprints and the configuration generation. Stored
+proposals contain references, not duplicate claim text. The native open queue is
+partitioned by branch and paged by key; getting a proposal reconstructs retained
+historical inputs through current authorization. `POST
+/supersession-proposals/{id}/verdict` takes `supersedes`, `contradicts`, `restates`,
+`independent`, or null to defer. Curator grants admit discovery/review workflows;
+actors remain attribution and never confer authority. Review rechecks pinned
+views, native sources, the current curator grant and configuration at commit.
+
+Supersession still requires the native replacement partition and applicability
+rules. An insufficiently authoritative, hypothetical or provisional incoming
+claim cannot displace a stronger factual claim. A bounded-validity replacement
+cannot erase the broader remainder of an older claim. Contradiction records
+bilateral explicit dispositions, with provenance retained through identity
+rebuilds. Restatement records a typed relationship without collapsing claim IDs
+or dropping independent citations. Independent closes the proposal without a
+belief mutation. Null retains the proposal in the indexed open queue. Operation
+receipts, decision targets and metadata-only feed events are published atomically.
+
+### Forks and checkpoints
+
+Enable `features.lineage` for branch-aware memory. The empty branch selects main;
+`main` is reserved. Select another branch with `X-Antfly-Memory-Branch`, the MCP
+`branch` argument, or the C ABI envelope's `branch`. Ordinary table/source access,
+configuration and identity curation remain space-wide governance. A branch
+selector is not a table grant, and branch-local requests cannot configure the
+space, publish embeddings or perform space-wide identity/relationship curation.
+
+`POST /forks`, `/checkpoints` and `/reverts` require space revision preconditions.
+`GET /lineage` reports the selected head, parent/inherited revision and migration
+readiness. Branches are private by default. Forking a team-visible branch does
+not expose another owner's private source material. A named branch's owner or
+an administrator controls its writes; all ordinary record/source gates still
+apply independently.
+
+A fork inherits the parent's **accepted record versions**, not its future writes.
+Persistent ordered roots map evidence, assertion, entity and history membership
+to native immutable version references. Roots also contain the canonical claim
+partition index. Forks and checkpoints share a root in constant space; writes copy
+logarithmic paths. Revert atomically selects a retained checkpoint root, restoring
+belief dispositions and excluding later evidence, claims and history. A child
+fork retains its own snapshot after the parent reverts. IDs remain immutable
+across branches; branch-local corrections create distinct lifecycle revisions.
+Global forgetting, expiry, source authorization and identity suppression stay
+live and cannot be undone by restoring an old root.
+
+The native transaction publishes root references with domain changes and receipts.
+Content-addressed nodes hold hashed keys and record paths, not source text. Node
+height and per-operation work are bounded. Transactional reference counts cover
+child edges, branch heads, checkpoints, dataset versions and evaluation runs.
+Unpublished paths and retired roots enter a bounded owner-maintenance queue;
+reclamation rechecks zero references and waits a five-minute grace after the last
+unlink. A stale earlier queue entry cannot shorten that grace. Retained checkpoints
+remain explicit durable roots. Legacy adoption visits at most 128 rows from one
+primary/history lane per quantum and rejects forks until all lanes are complete.
+Once enabled, lineage cannot be disabled to bypass its visibility contract.
+
+Pending extraction is bound to its originating branch. Reverting away an accepted
+input cancels late publication; a fork does not acquire later results from its
+parent's pending producer. Provider work remains outside writer leases and checks
+the original control snapshot after reacquisition. Claim lexical/ANN projections are shared across branches; bounded hydration
+resolves each hit through the selected root. Entity semantic names/views have
+branch-qualified native index namespaces, dependency bindings, timers and readiness.
+A durable fair owner queue backfills inherited entities after the constant-size
+fork transaction. Backfill enumerates the branch's persistent entity index rather
+than scanning other branches. Matching parent document/query vectors can be reused
+only under identical text, model, generation, audience and fresh source fences;
+new branch provenance is published independently. Revert invalidates that branch's
+semantic readiness and schedules a bounded rebuild; it never serves its old view
+projection as current. Window exhaustion is reported as truncation, rather than widening
+visibility or scanning a branch's entire corpus. Enumeration and exact history
+resolve branch membership before returning payloads. Forget cleanup also scrubs
+copied entity histories while preserving the irreversible source fences.
+
+### Durable space changes
+
+`GET /changes` (or read-only `POST /changes`) accepts `cursor`, `limit` (1–256)
+and `start: beginning|latest` (default latest). A page returns metadata-only events,
+a resume cursor, the observed revision, `caught_up` and retention bounds. The cursor
+survives writes, is bound to the catalog identity, space incarnation, branch,
+authenticated principal and audience, and expires independently of physical
+cleanup. A missed retention horizon returns `MemoryCursorStale`; consumers must
+refresh their cached context before resuming. `change_retention_ms` defaults to
+seven days and is bounded to ninety days. A monotonic cutoff prevents an increased
+retention setting from resurrecting previously expired events.
+
+Assertion lifecycle changes, observed evidence, entity changes, proposal opening,
+deferral/decision, configuration, lineage and evaluation progress are committed
+with their domain transaction. Final staged values coalesce intermediate planner
+writes. Events include their originating branch, so consumers can fetch the corresponding
+record view. Private branch heads further restrict the indexed audience, independently
+of a record's team visibility. Each target is checked against its current branch
+root and source grants. Events carry IDs/revisions, never claim text, judge explanations or source
+payloads. Separate team/private and curator audience indexes bound page work.
+Current source grants and retention are rechecked on every target. An unavailable
+or forgotten target becomes a generic `context_invalidated` event with no target
+ID. An event is not a read lease. Agents, UIs or approval routers may poll this feed;
+the service does not send Slack messages or create an additional event broker.
+
+### Stored evaluation datasets and runs
+
+`POST /evaluation-datasets` atomically upserts/removes at most 128 labelled cases
+against an expected space revision. Every revision has an immutable root over
+individual native case rows, so changing a label copies logarithmic paths rather
+than rewriting a dataset blob. Cases cover identity, proposed typed relationships,
+four-way supersession, and retrieval with relevant-ID sets. Native production
+inputs carry evidence fences; independently uploaded fixtures remain private by
+default. Intake screening applies to fixtures and judge predictions too.
+
+`POST /evaluations` pins a dataset revision, native configuration fingerprint,
+model identity/revision, prompt revision and evaluation profile. Managed judges
+use the existing admitted Antfly producer/provider path with storage leases
+released around inference. `external` runs expose bounded `/evaluations/{id}/tasks`
+pages and accept attributed `/verdicts` batches. Gold labels and relevant-ID sets
+never enter judge requests. Dataset/label administration and starting runs require
+admin; task consumption and external verdicts use curator admission plus dataset
+visibility. The native owner records unavailable inputs and resumes managed work
+one case per quantum, with ordinary retry and final-publication grant checks.
+A case is bounded to one MiB of encoded native data. Persistent reference metadata
+carries byte costs, so case/task hydration stays within a one-MiB page budget before
+issuing grouped native reads. Completion checks use tiny atomic decision markers,
+not entire saved explanations. Administrative `/evaluations/{id}/results` pages
+include frozen gold inputs and predictions, default/cap at eight entries, and
+reserve a smaller input budget before fetching bounded explanations. The complete
+wire response remains bounded to four MiB. Reference nonces use the private input
+HMAC key when available so public root digests do not expose a small dictionary
+of gold-dependent record sizes.
+
+`policy` runs exercise native entity candidates, supersession candidates or recall.
+Cases may provide a separate typed `policy` input while retaining the same frozen
+judge input and gold labels. Discovery-threshold overrides can be evaluated without
+activating them; alternate judge models likewise do not replace the production
+judge. Native-policy runs pin the corpus's knowledge revision and cancel if the
+corpus/configuration changes. Managed/external judge runs evaluate their frozen
+inputs with live evidence/erasure gates. Configuration changes never silently
+switch a pending run to a new policy.
+
+Reports include per-task precision, recall, F1, coverage, accuracy, unavailable
+inputs, invalid outputs and abstentions. Invalid structured or credential-bearing
+managed judge output is recorded as an invalid abstention instead of repeatedly
+calling a failing judge or fabricating a verdict. External consumers can explicitly
+report an invalid output; their verdict contract has no native candidate-admission
+field. Per-case results preserve attribution and expose these distinctions. As with
+all writes, current source checks follow the final authorization check. A private
+view that depended on administrative access upgrades the durable receipt's required
+grant and rechecks that grant; a cached admin bit is never sufficient after revocation.
+Metrics with a zero denominator are null. Retrieval scores unique
+ranked IDs against the labelled relevant set. Candidate admission has separate
+statistics: returning an identity or supersession candidate is not a judge verdict.
+The legacy Codex supersession corpus uses `expected_supersedes` to preserve its
+binary replacement annotation; its negative examples are **not** relabelled as
+independent claims. Reports count those binary cases explicitly. Forgetting hides
+frozen inputs immediately and bounded cleanup removes duplicated fixture payloads,
+gold labels and retained judge explanations; a scrubbed task can still count as
+unavailable without restoring its input.
+
+`scripts/bench/memory_judges.py --prepare-only --output <file>` exports the pinned
+Codex corpus reproducibly. Against a server it uploads a dataset and starts an
+external run, or a managed run when given a revision-qualified `--judge` file.
+Its manifest records fixture digests. There are 94 identity cases, 141 proposed
+predicate checks derived from 47 relation annotations, and 13 binary supersession
+cases. The service also accepts consumer-specific retrieval sets. Fixture replay
+checks policy/metric mechanics; measured model accuracy requires actual predictions.
+No gold replay is reported as a model-quality result.
+
+### Native workflow qualification
+
+The native policy suite covers 272 tests, including all four outside supersession
+verdicts and deferral, fork/checkpoint/revert isolation, forgotten-source fences,
+branch projection reuse, private feed audiences, labelled evaluation scoring,
+invalid judge output, live administrative revocation and credential screening.
+The persistent-index qualification uses 10,000 entries: a cold single-record
+update and a 16-entry seek each stay below 128 native reads/writes. Native indexed
+recall over 10,002 assertions issues one search, hydrates one candidate and performs
+zero primary scans. The ANN fixture uses 128 seeds and 256 bounded neighbor calls
+with zero primary scans. These are bounded-work checks, not model-quality or
+production-latency claims. The fixture exporter produces 248 reproducible labelled
+judge tasks; a new judge's precision/recall still requires its actual predictions.
+
+### Intake credential screening
+
+`intake_screening` is versioned native configuration. Its default `reject` mode
+refuses recognizable credentials before writing evidence, claims or a receipt.
+`redact` replaces detected content with `[REDACTED]`. Identifier/key changes are
+refused rather than silently renaming an entity or source. Counts and detector
+categories appear in operation status; matches and credential-bearing snippets
+do not appear in errors or reports. External vectors are refused if their source
+statement was redacted. Imported evidence spans are refused when redaction changed
+the referenced text, so an old offset cannot silently cite a different substring.
+Managed extraction sees the sanitized source and produces offsets against it.
+Redacted evidence records the detector counts, whether its text changed, and the
+SHA-256 digest of its stored text. The native resource revision and digest still
+identify the original pinned source used for authorization and invalidation.
+External explanation payloads separately report their returned-text digest and
+whether screening changed that text.
+
+The bounded deterministic scanner covers known provider-token prefixes, private
+keys, credential assignments, sensitive JSON fields, HTTP credentials and URL
+userinfo/credential query parameters. URL detection shares Antfly's native
+credential-safety implementation. Administrators can add bounded prefix rules
+and exact SHA-256 exception fingerprints. Native materialized source JSON and
+managed output pass through the same boundary; no model call or second credential
+store is used for screening. Explain redacts external payloads before rendering.
+The private control row holds a securely generated HMAC key for raw-input receipt
+fingerprints in redaction mode; inspection and schemas never disclose it. This
+preserves exact replay without persisting an unkeyed hash of credential-bearing
+input. Legacy hash-version receipts remain replayable under their original format.
+
+Pattern screening cannot identify every arbitrary secret. It complements source
+connectors and client redaction; it does not retroactively rewrite legacy evidence
+or turn a shared database into a secret store. Provider configuration still uses
+server-owned keystore/environment references. Pattern maintenance follows primary
+provider documentation such as [GitHub's supported secret patterns](https://docs.github.com/en/code-security/reference/secret-security/supported-secret-scanning-patterns),
+[AWS access-key guidance](https://docs.aws.amazon.com/IAM/latest/UserGuide/id_credentials_access-keys.html),
+and [Slack token types](https://docs.slack.dev/authentication/tokens/).
 
 ## Public operations and bounded execution
 
@@ -796,7 +1050,7 @@ with no HTTP server or Wasmtime runtime.
 | POST `/recall` | `recall` | Context/temporal filters, lexical/vector ranking and rendered-byte token bound |
 | GET `/memories` | `list` | Exact accessible enumeration with explicit pagination |
 | GET `/memories/{id}` / `/history` | `get` / `history` | Authoritative record and version history |
-| GET `/evidence/{id}` | `evidence` | Authorized source version and original text |
+| GET `/evidence/{id}` | `evidence` | Authorized source version and stored screened text |
 | POST `/corrections` / `/forget` | `correct` / `forget` | Revision-fenced lifecycle/stability changes; non-resurrection fences |
 | POST `/outcomes` | `outcome` | Utility feedback, independent of assertion truth |
 | GET / POST `/operations/{id}` | `operation` / `advance` | Durable stage status and bounded explicit progress |
@@ -1722,9 +1976,9 @@ Keep Codex session lifecycle, thread persistence, queue/goals, approval enforcem
 - Suppression can help with generic concepts, but identity suppression is different from source-content deletion or forgetting.
 - Native derived entity views now follow canonical identity reverse indexes and regenerate from retained assertions. This removes the separate manual description-table rebuild from the service design; Codex must still switch its consumer and explicitly reconsider previously committed identities when appropriate.
 
-### Remaining design gaps beyond the Codex implementation
+### Remaining Codex integration qualification
 
-The proposed assertion model adds structured subject/predicate/value, explicit scope/applicability, modality and epistemic role, valid/recorded time, source-authority policy, exact structural queries, dependency-aware long-lived procedures, and direct stored-state evaluation. Current cross-thread supersession uses a small similarity-selected candidate set and should not be treated as complete conflict detection. Model thresholds measured on the integration's small fixtures are baselines to preserve and expand, not universal precision guarantees.
+The native assertion model provides structured subject/predicate/value, explicit scope/applicability, modality and epistemic role, valid/recorded time, source-authority policy, structural queries and dependency-aware procedures. The native service now implements outside-verdict supersession, fork/checkpoint/revert lineage, the change feed, stored evaluations and intake screening described above. The acceptance items below qualify the Codex consumer migration. Bounded similarity retrieval does not guarantee complete conflict detection. Model thresholds measured on the integration's small fixtures are baselines to preserve and expand, not universal precision guarantees.
 
 ### Integration acceptance additions
 

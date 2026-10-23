@@ -1781,7 +1781,7 @@ pub const AntflyApiHandler = struct {
         module.memory.types.validateId(name) catch |err| return memoryFailure(ctx, err);
         var query_body: std.json.ObjectMap = .empty;
         if (ctx.request.method == .GET) {
-            inline for (.{ "cursor", "subject", "predicate", "scope", "task", "environment", "kind", "relationship", "target_id", "missing_relationship" }) |field| if (try ctx.queryDecoded(field)) |decoded| {
+            inline for (.{ "cursor", "start", "subject", "predicate", "scope", "task", "environment", "kind", "relationship", "target_id", "missing_relationship" }) |field| if (try ctx.queryDecoded(field)) |decoded| {
                 try query_body.put(a, field, .{ .string = decoded });
             };
             inline for (.{ "limit", "valid_at", "known_at" }) |field| if (ctx.query(field)) |v| {
@@ -1797,6 +1797,7 @@ pub const AntflyApiHandler = struct {
         const identifier = (try decodePathParamOrBadRequest(ctx, selected.id)) orelse return ctx.text("invalid memory id");
         defer ctx.allocator.free(identifier);
         var response = try self.api_server.executeMemoryService(name, .{
+            .branch = ctx.header("x-antfly-memory-branch") orelse "",
             .database = ctx.header("x-antfly-database") orelse "default",
             .namespace = ctx.header("x-antfly-namespace") orelse "public",
             .action = selected.action,
@@ -18594,6 +18595,19 @@ test "native memory HTTP and MCP share persistent storage and private provenance
     defer accepted.deinit();
     if (accepted.status.code != 200) std.debug.print("memory HTTP: {s}\n", .{accepted.body orelse ""});
     try std.testing.expectEqual(@as(u16, 200), accepted.status.code);
+    const feed_url = try std.fmt.allocPrint(a, "{s}/memory/v1/spaces/team/changes?start=beginning&limit=16", .{base});
+    defer a.free(feed_url);
+    var feed = try requestWithRetry(&client, threaded.io(), .GET, feed_url, "", &.{}, 20);
+    defer feed.deinit();
+    try std.testing.expectEqual(@as(u16, 200), feed.status.code);
+    try std.testing.expect(std.mem.indexOf(u8, feed.body.?, "next_cursor") != null);
+    try std.testing.expect(std.mem.indexOf(u8, feed.body.?, "Production uses Terraform") == null);
+    const candidate_url = try std.fmt.allocPrint(a, "{s}/memory/v1/spaces/team/memories/a1/supersession-candidates", .{base});
+    defer a.free(candidate_url);
+    var candidates = try requestWithRetry(&client, threaded.io(), .POST, candidate_url, "{}", &.{.{ "content-type", "application/json" }}, 20);
+    defer candidates.deinit();
+    try std.testing.expectEqual(@as(u16, 200), candidates.status.code);
+    try std.testing.expect(std.mem.indexOf(u8, candidates.body.?, "semantic_discovery") != null);
     const view_url = try std.fmt.allocPrint(a, "{s}/memory/v1/spaces/team/entities/production/view", .{base});
     defer a.free(view_url);
     var derived_view = try requestWithRetry(&client, threaded.io(), .POST, view_url, "{}", &.{.{ "content-type", "application/json" }}, 20);
@@ -18654,6 +18668,15 @@ test "native memory HTTP and MCP share persistent storage and private provenance
     defer mcp_response.deinit(a);
     try std.testing.expectEqual(@as(u16, 200), mcp_response.status);
     try std.testing.expect(std.mem.indexOf(u8, mcp_response.body, "Production uses Terraform") != null);
+    var mcp_feed = try @import("protocol_adapters.zig").executeMemoryMcpRequest(&api, .{
+        .method = .post,
+        .endpoint_path = "/memory/v1/mcp",
+        .session_id = session_id,
+        .body = "{\"jsonrpc\":\"2.0\",\"id\":20,\"method\":\"tools/call\",\"params\":{\"name\":\"memory_changes\",\"arguments\":{\"space\":\"team\",\"body\":{\"start\":\"beginning\",\"limit\":16}}}}",
+    }, @as(?AuthenticatedIdentity, null));
+    defer mcp_feed.deinit(a);
+    try std.testing.expectEqual(@as(u16, 200), mcp_feed.status);
+    try std.testing.expect(std.mem.indexOf(u8, mcp_feed.body, "next_cursor") != null);
     var graph_recalled = try @import("protocol_adapters.zig").executeMemoryMcpRequest(&api, .{
         .method = .post,
         .endpoint_path = "/memory/v1/mcp",

@@ -10446,3 +10446,95 @@ test "capi native memory accepted judgment context and forgetting survive reopen
         }
     }
 }
+
+fn nativeMemoryBranchCall(handle: ?*anyopaque, alloc: Allocator, branch: []const u8, action: @import("../memory/service.zig").Action, body: anytype, token: []const u8, name: []const u8) ![]const u8 {
+    const request = try std.json.Stringify.valueAlloc(alloc, .{ .branch = branch, .action = action, .principal = "alice", .id = name, .body = body, .idempotency_key = token }, .{});
+    var output: capi.Buffer = .{};
+    const code = antfly_db_memory_json(handle, .fromSlice("personal"), .fromSlice(request), &output);
+    if (code != .ok) std.debug.print("memory C ABI branch: {s}\n", .{std.mem.span(capi.lastErrorDetail())});
+    try std.testing.expectEqual(capi.ErrorCode.ok, code);
+    defer std.heap.c_allocator.free(output.ptr.?[0..output.len]);
+    return alloc.dupe(u8, output.ptr.?[0..output.len]);
+}
+
+test "capi native memory lineage screening feed and labelled evaluations survive reopen" {
+    const memory = @import("../memory/service.zig");
+    const t = memory.types;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var directory = try TestDirectory.init("native-memory-workflows-reopen");
+    defer directory.cleanup();
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, directory.path());
+    const path = try std.fmt.allocPrintSentinel(a, "{s}/db.aflite", .{directory.path()}, 0);
+    var handle: ?*anyopaque = null;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_create(path, &handle));
+    defer if (handle != null) antfly_db_close(handle);
+    _ = try nativeMemoryTestCall(handle, a, "alice", .create, t.Config{ .features = .{ .lineage = true }, .intake_screening = .{ .mode = .redact } }, "create", "");
+    const observed = try std.json.parseFromSliceLeaky(t.OperationStatus, a, try nativeMemoryTestCall(handle, a, "alice", .observe, t.ObservationRequest{ .evidence = &.{.{ .id = "e", .source_id = "fixture", .source_version = "1", .text = "password=synthetic-fixture" }} }, "observe", ""), .{});
+    try std.testing.expect(observed.intake_screening.redactions > 0);
+    const fact: t.Assertion = .{ .id = "fact", .subject = "deployment", .predicate = "uses", .value = "Helm", .statement = "Deployment uses Helm", .evidence = &.{.{ .id = "e" }} };
+    const asserted = try std.json.parseFromSliceLeaky(t.OperationStatus, a, try nativeMemoryTestCall(handle, a, "alice", .assertions, .{ .assertions = &.{fact} }, "assert", ""), .{});
+    const forked = try std.json.parseFromSliceLeaky(t.OperationStatus, a, try nativeMemoryTestCall(handle, a, "alice", .fork_lineage, t.LineageFork{ .id = "fork", .expected_revision = asserted.revision }, "fork", ""), .{});
+    const saved = try std.json.parseFromSliceLeaky(t.OperationStatus, a, try nativeMemoryBranchCall(handle, a, "fork", .checkpoint_lineage, t.LineageCheckpointRequest{ .id = "before", .expected_revision = forked.revision }, "checkpoint", ""), .{});
+    const corrected = try std.json.parseFromSliceLeaky(t.OperationStatus, a, try nativeMemoryBranchCall(handle, a, "fork", .correct, t.Correction{ .id = "fact", .expected_revision = asserted.revision, .lifecycle = .retracted, .reason = "Fork-only correction" }, "correct", ""), .{});
+    _ = saved;
+    const dataset = try std.json.parseFromSliceLeaky(t.OperationStatus, a, try nativeMemoryTestCall(handle, a, "alice", .put_evaluation_dataset, t.evaluation.DatasetRequest{ .id = "labels", .expected_revision = corrected.revision, .cases = &.{.{ .id = "pair", .task = .identity, .input = try std.json.parseFromSliceLeaky(std.json.Value, a, "{\"left\":\"KG\",\"right\":\"knowledge graph\"}", .{}), .expected = .same }} }, "dataset", ""), .{});
+    const started = try std.json.parseFromSliceLeaky(t.OperationStatus, a, try nativeMemoryTestCall(handle, a, "alice", .start_evaluation, t.evaluation.Start{ .id = "run", .dataset = "labels", .expected_revision = dataset.revision }, "run", ""), .{});
+    antfly_db_close(handle);
+    handle = null;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_open(path, &handle));
+    const evidence = try nativeMemoryTestCall(handle, a, "alice", .evidence, .{}, "", "e");
+    try std.testing.expect(std.mem.indexOf(u8, evidence, "synthetic-fixture") == null);
+    const main_fact = try std.json.parseFromSliceLeaky(t.StoredAssertion, a, try nativeMemoryTestCall(handle, a, "alice", .get, .{}, "", "fact"), .{});
+    const branch_fact = try std.json.parseFromSliceLeaky(t.StoredAssertion, a, try nativeMemoryBranchCall(handle, a, "fork", .get, .{}, "", "fact"), .{});
+    try std.testing.expectEqual(t.Lifecycle.active, main_fact.lifecycle);
+    try std.testing.expectEqual(t.Lifecycle.retracted, branch_fact.lifecycle);
+    const tasks = try std.json.parseFromSliceLeaky(t.evaluation.TaskPage, a, try nativeMemoryTestCall(handle, a, "alice", .evaluation_tasks, @import("../memory/operations.zig").Page{}, "", "run"), .{});
+    try std.testing.expectEqual(@as(usize, 1), tasks.items.len);
+    const task = tasks.items[0];
+    const judged = try std.json.parseFromSliceLeaky(t.OperationStatus, a, try nativeMemoryTestCall(handle, a, "alice", .evaluation_verdict, t.evaluation.Submit{ .expected_revision = started.revision, .verdicts = &.{.{ .case_id = task.case_id, .case_revision = task.case_revision, .input_fingerprint = task.input_fingerprint, .prediction = .{ .label = .same } }} }, "verdict", "run"), .{});
+    const status = try std.json.parseFromSliceLeaky(t.evaluation.Status, a, try nativeMemoryTestCall(handle, a, "alice", .evaluation_run, .{}, "", "run"), .{});
+    try std.testing.expectEqual(@as(f64, 1), status.identity.recall.?);
+    _ = try nativeMemoryBranchCall(handle, a, "fork", .revert_lineage, t.LineageRevert{ .checkpoint = "before", .expected_revision = judged.revision }, "revert", "");
+    const restored = try std.json.parseFromSliceLeaky(t.StoredAssertion, a, try nativeMemoryBranchCall(handle, a, "fork", .get, .{}, "", "fact"), .{});
+    try std.testing.expectEqual(t.Lifecycle.active, restored.lifecycle);
+    const changes = try std.json.parseFromSliceLeaky(t.ChangePage, a, try nativeMemoryTestCall(handle, a, "alice", .changes, t.ChangeRequest{ .start = .beginning }, "", ""), .{});
+    try std.testing.expect(changes.items.len >= 4);
+}
+
+test "capi native memory supersession uses filtered lexical indexes and durable external verdicts" {
+    const memory = @import("../memory/service.zig");
+    const t = memory.types;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var directory = try TestDirectory.init("native-memory-supersession-indexed");
+    defer directory.cleanup();
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, directory.path());
+    const path = try std.fmt.allocPrintSentinel(a, "{s}/db.aflite", .{directory.path()}, 0);
+    var handle: ?*anyopaque = null;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_create(path, &handle));
+    defer if (handle != null) antfly_db_close(handle);
+    _ = try nativeMemoryTestCall(handle, a, "alice", .create, t.Config{}, "create", "");
+    var claims: [3]t.Assertion = undefined;
+    for (&claims, 0..) |*claim, i| claim.* = .{ .id = try std.fmt.allocPrint(a, "claim-{d}", .{i}), .subject = if (i < 2) "production" else "unrelated", .predicate = "deploys", .value = try std.fmt.allocPrint(a, "value-{d}", .{i}), .statement = "Deployment uses Helm", .evidence = &.{.{ .id = "e" }} };
+    _ = try nativeMemoryTestCall(handle, a, "alice", .observe, t.ObservationRequest{ .evidence = &.{.{ .id = "e", .source_id = "fixture", .source_version = "1", .text = "Deployment uses Helm" }}, .assertions = &claims }, "observe", "");
+    for (0..16) |step| _ = try nativeMemoryTestCall(handle, a, "alice", .advance, .{}, try std.fmt.allocPrint(a, "index-{d}", .{step}), "");
+    const candidates = try std.json.parseFromSliceLeaky(t.SupersessionCandidatePage, a, try nativeMemoryTestCall(handle, a, "alice", .supersession_candidates, t.SupersessionCandidateRequest{ .mode = .lexical }, "", "claim-0"), .{});
+    try std.testing.expectEqual(.indexed, candidates.retrieval);
+    try std.testing.expectEqual(.disabled, candidates.semantic_discovery);
+    try std.testing.expectEqual(@as(usize, 1), candidates.items.len);
+    try std.testing.expectEqualStrings("claim-1", candidates.items[0].view.memory.assertion.id);
+    const seed = candidates.seed;
+    const previous = candidates.items[0].view;
+    const proposal = try std.json.parseFromSliceLeaky(t.OperationStatus, a, try nativeMemoryTestCall(handle, a, "alice", .propose_supersession, t.SupersessionProposalRequest{ .id = "pair", .expected_revision = candidates.revision, .incoming = .{ .id = seed.memory.assertion.id, .revision = seed.memory.revision, .fingerprint = seed.fingerprint }, .previous = .{ .id = previous.memory.assertion.id, .revision = previous.memory.revision, .fingerprint = previous.fingerprint } }, "proposal", ""), .{});
+    _ = try nativeMemoryTestCall(handle, a, "alice", .review_supersession, t.SupersessionVerdict{ .expected_revision = proposal.revision, .verdict = .supersedes, .reason = "Explicit external replacement verdict" }, "verdict", "pair");
+    antfly_db_close(handle);
+    handle = null;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_open(path, &handle));
+    const record = try std.json.parseFromSliceLeaky(t.StoredAssertion, a, try nativeMemoryTestCall(handle, a, "alice", .get, .{}, "", "claim-1"), .{});
+    try std.testing.expectEqual(t.Lifecycle.superseded, record.lifecycle);
+    const detail = try std.json.parseFromSliceLeaky(t.SupersessionProposalDetail, a, try nativeMemoryTestCall(handle, a, "alice", .supersession_proposal, .{}, "", "pair"), .{});
+    try std.testing.expectEqual(t.SupersessionRelation.supersedes, detail.proposal.verdict.?);
+}

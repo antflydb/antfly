@@ -59,6 +59,12 @@ fn build(comptime T: type, a: std.mem.Allocator, comptime strict: bool) anyerror
             try any.append(a, try std.json.parseFromSliceLeaky(std.json.Value, a, "{\"type\":\"null\"}", .{}));
             try object.put(a, "anyOf", .{ .array = std.array_list.Managed(std.json.Value).fromOwnedSlice(a, try any.toOwnedSlice(a)) });
         },
+        .array => |info| {
+            try object.put(a, "type", .{ .string = "array" });
+            try object.put(a, "items", try build(info.child, a, strict));
+            try object.put(a, "minItems", .{ .integer = info.len });
+            try object.put(a, "maxItems", .{ .integer = info.len });
+        },
         .pointer => |info| {
             if (info.size != .slice) @compileError("memory schema supports slices only");
             try object.put(a, "type", .{ .string = if (info.child == u8) "string" else "array" });

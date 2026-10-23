@@ -15373,6 +15373,13 @@ paths:
             default: public
             x-go-type-skip-optional-pointer: false
           description: Catalog scope for this memory space.
+        - name: X-Antfly-Memory-Branch
+          in: header
+          schema:
+            type: string
+            default: ''
+            x-go-type-skip-optional-pointer: false
+          description: Catalog scope for this memory space.
         - name: Idempotency-Key
           in: header
           required: true
@@ -15472,6 +15479,13 @@ paths:
             default: public
             x-go-type-skip-optional-pointer: false
           description: Catalog scope for this memory space.
+        - name: X-Antfly-Memory-Branch
+          in: header
+          schema:
+            type: string
+            default: ''
+            x-go-type-skip-optional-pointer: false
+          description: Catalog scope for this memory space.
       responses:
         '200':
           description: Accepted durable operation or requested memory result.
@@ -15555,6 +15569,13 @@ paths:
           schema:
             type: string
             default: public
+            x-go-type-skip-optional-pointer: false
+          description: Catalog scope for this memory space.
+        - name: X-Antfly-Memory-Branch
+          in: header
+          schema:
+            type: string
+            default: ''
             x-go-type-skip-optional-pointer: false
           description: Catalog scope for this memory space.
         - name: Idempotency-Key
@@ -15656,6 +15677,13 @@ paths:
             default: public
             x-go-type-skip-optional-pointer: false
           description: Catalog scope for this memory space.
+        - name: X-Antfly-Memory-Branch
+          in: header
+          schema:
+            type: string
+            default: ''
+            x-go-type-skip-optional-pointer: false
+          description: Catalog scope for this memory space.
         - name: Idempotency-Key
           in: header
           required: true
@@ -15753,6 +15781,13 @@ paths:
           schema:
             type: string
             default: public
+            x-go-type-skip-optional-pointer: false
+          description: Catalog scope for this memory space.
+        - name: X-Antfly-Memory-Branch
+          in: header
+          schema:
+            type: string
+            default: ''
             x-go-type-skip-optional-pointer: false
           description: Catalog scope for this memory space.
         - name: Idempotency-Key
@@ -15854,6 +15889,13 @@ paths:
             default: public
             x-go-type-skip-optional-pointer: false
           description: Catalog scope for this memory space.
+        - name: X-Antfly-Memory-Branch
+          in: header
+          schema:
+            type: string
+            default: ''
+            x-go-type-skip-optional-pointer: false
+          description: Catalog scope for this memory space.
         - name: Idempotency-Key
           in: header
           required: true
@@ -15951,6 +15993,13 @@ paths:
           schema:
             type: string
             default: public
+            x-go-type-skip-optional-pointer: false
+          description: Catalog scope for this memory space.
+        - name: X-Antfly-Memory-Branch
+          in: header
+          schema:
+            type: string
+            default: ''
             x-go-type-skip-optional-pointer: false
           description: Catalog scope for this memory space.
         - name: Idempotency-Key
@@ -16052,6 +16101,13 @@ paths:
             default: public
             x-go-type-skip-optional-pointer: false
           description: Catalog scope for this memory space.
+        - name: X-Antfly-Memory-Branch
+          in: header
+          schema:
+            type: string
+            default: ''
+            x-go-type-skip-optional-pointer: false
+          description: Catalog scope for this memory space.
         - name: Idempotency-Key
           in: header
           required: true
@@ -16151,6 +16207,13 @@ paths:
             default: public
             x-go-type-skip-optional-pointer: false
           description: Catalog scope for this memory space.
+        - name: X-Antfly-Memory-Branch
+          in: header
+          schema:
+            type: string
+            default: ''
+            x-go-type-skip-optional-pointer: false
+          description: Catalog scope for this memory space.
         - name: Idempotency-Key
           in: header
           required: true
@@ -16225,6 +16288,2001 @@ paths:
           application/json:
             schema:
               $ref: '#/components/schemas/MemoryOutcome'
+  /memory/v1/spaces/{space}/memories/{id}/supersession-candidates:
+    post:
+      operationId: getMemorySupersessionCandidates
+      tags:
+        - memory
+      parameters:
+        - name: space
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: X-Antfly-Database
+          in: header
+          schema:
+            type: string
+            default: default
+            x-go-type-skip-optional-pointer: false
+          description: Catalog scope for this memory space.
+        - name: X-Antfly-Namespace
+          in: header
+          schema:
+            type: string
+            default: public
+            x-go-type-skip-optional-pointer: false
+          description: Catalog scope for this memory space.
+        - name: X-Antfly-Memory-Branch
+          in: header
+          schema:
+            type: string
+            default: ''
+            x-go-type-skip-optional-pointer: false
+          description: Catalog scope for this memory space.
+      responses:
+        '200':
+          description: Accepted durable operation or requested memory result.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemorySupersessionCandidatePage'
+        '400':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '401':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '403':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '404':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '409':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '413':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '422':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '429':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '503':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/MemorySupersessionCandidateRequest'
+  /memory/v1/spaces/{space}/supersession-proposals:
+    post:
+      operationId: proposeMemorySupersession
+      tags:
+        - memory
+      parameters:
+        - name: space
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: X-Antfly-Database
+          in: header
+          schema:
+            type: string
+            default: default
+            x-go-type-skip-optional-pointer: false
+          description: Catalog scope for this memory space.
+        - name: X-Antfly-Namespace
+          in: header
+          schema:
+            type: string
+            default: public
+            x-go-type-skip-optional-pointer: false
+          description: Catalog scope for this memory space.
+        - name: X-Antfly-Memory-Branch
+          in: header
+          schema:
+            type: string
+            default: ''
+            x-go-type-skip-optional-pointer: false
+          description: Catalog scope for this memory space.
+        - name: Idempotency-Key
+          in: header
+          required: true
+          schema:
+            type: string
+            maxLength: 256
+          description: Stable per-principal operation key. Conflicting reuse returns 409.
+      responses:
+        '200':
+          description: Accepted durable operation or requested memory result.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryOperation'
+        '400':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '401':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '403':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '404':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '409':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '413':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '422':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '429':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '503':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/MemorySupersessionProposalRequest'
+    get:
+      operationId: listMemorySupersessionProposals
+      tags:
+        - memory
+      parameters:
+        - name: space
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: X-Antfly-Database
+          in: header
+          schema:
+            type: string
+            default: default
+            x-go-type-skip-optional-pointer: false
+          description: Catalog scope for this memory space.
+        - name: X-Antfly-Namespace
+          in: header
+          schema:
+            type: string
+            default: public
+            x-go-type-skip-optional-pointer: false
+          description: Catalog scope for this memory space.
+        - name: X-Antfly-Memory-Branch
+          in: header
+          schema:
+            type: string
+            default: ''
+            x-go-type-skip-optional-pointer: false
+          description: Catalog scope for this memory space.
+        - name: cursor
+          in: query
+          schema:
+            type: string
+            x-go-type-skip-optional-pointer: false
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 256
+            x-go-type-skip-optional-pointer: false
+      responses:
+        '200':
+          description: Accepted durable operation or requested memory result.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemorySupersessionProposalPage'
+        '400':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '401':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '403':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '404':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '409':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '413':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '422':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '429':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '503':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+  /memory/v1/spaces/{space}/supersession-proposals/{id}:
+    get:
+      operationId: getMemorySupersessionProposal
+      tags:
+        - memory
+      parameters:
+        - name: space
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: X-Antfly-Database
+          in: header
+          schema:
+            type: string
+            default: default
+            x-go-type-skip-optional-pointer: false
+          description: Catalog scope for this memory space.
+        - name: X-Antfly-Namespace
+          in: header
+          schema:
+            type: string
+            default: public
+            x-go-type-skip-optional-pointer: false
+          description: Catalog scope for this memory space.
+        - name: X-Antfly-Memory-Branch
+          in: header
+          schema:
+            type: string
+            default: ''
+            x-go-type-skip-optional-pointer: false
+          description: Catalog scope for this memory space.
+      responses:
+        '200':
+          description: Accepted durable operation or requested memory result.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemorySupersessionProposalDetail'
+        '400':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '401':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '403':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '404':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '409':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '413':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '422':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '429':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '503':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+  /memory/v1/spaces/{space}/supersession-proposals/{id}/verdict:
+    post:
+      operationId: reviewMemorySupersessionProposal
+      tags:
+        - memory
+      parameters:
+        - name: space
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: X-Antfly-Database
+          in: header
+          schema:
+            type: string
+            default: default
+            x-go-type-skip-optional-pointer: false
+          description: Catalog scope for this memory space.
+        - name: X-Antfly-Namespace
+          in: header
+          schema:
+            type: string
+            default: public
+            x-go-type-skip-optional-pointer: false
+          description: Catalog scope for this memory space.
+        - name: X-Antfly-Memory-Branch
+          in: header
+          schema:
+            type: string
+            default: ''
+            x-go-type-skip-optional-pointer: false
+          description: Catalog scope for this memory space.
+        - name: Idempotency-Key
+          in: header
+          required: true
+          schema:
+            type: string
+            maxLength: 256
+          description: Stable per-principal operation key. Conflicting reuse returns 409.
+      responses:
+        '200':
+          description: Accepted durable operation or requested memory result.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryOperation'
+        '400':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '401':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '403':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '404':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '409':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '413':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '422':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '429':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '503':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/MemorySupersessionVerdict'
+  /memory/v1/spaces/{space}/evaluation-datasets:
+    post:
+      operationId: putMemoryEvaluationDataset
+      tags:
+        - memory
+      parameters:
+        - name: space
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: X-Antfly-Database
+          in: header
+          schema:
+            type: string
+            default: default
+            x-go-type-skip-optional-pointer: false
+          description: Catalog scope for this memory space.
+        - name: X-Antfly-Namespace
+          in: header
+          schema:
+            type: string
+            default: public
+            x-go-type-skip-optional-pointer: false
+          description: Catalog scope for this memory space.
+        - name: X-Antfly-Memory-Branch
+          in: header
+          schema:
+            type: string
+            default: ''
+            x-go-type-skip-optional-pointer: false
+          description: Catalog scope for this memory space.
+        - name: Idempotency-Key
+          in: header
+          required: true
+          schema:
+            type: string
+            maxLength: 256
+          description: Stable per-principal operation key. Conflicting reuse returns 409.
+      responses:
+        '200':
+          description: Accepted durable operation or requested memory result.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryOperation'
+        '400':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '401':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '403':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '404':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '409':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '413':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '422':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '429':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '503':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/MemoryEvaluationDatasetRequest'
+  /memory/v1/spaces/{space}/evaluation-datasets/{id}:
+    get:
+      operationId: getMemoryEvaluationDataset
+      tags:
+        - memory
+      parameters:
+        - name: space
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: X-Antfly-Database
+          in: header
+          schema:
+            type: string
+            default: default
+            x-go-type-skip-optional-pointer: false
+          description: Catalog scope for this memory space.
+        - name: X-Antfly-Namespace
+          in: header
+          schema:
+            type: string
+            default: public
+            x-go-type-skip-optional-pointer: false
+          description: Catalog scope for this memory space.
+        - name: X-Antfly-Memory-Branch
+          in: header
+          schema:
+            type: string
+            default: ''
+            x-go-type-skip-optional-pointer: false
+          description: Catalog scope for this memory space.
+      responses:
+        '200':
+          description: Accepted durable operation or requested memory result.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryEvaluationDataset'
+        '400':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '401':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '403':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '404':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '409':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '413':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '422':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '429':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '503':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+  /memory/v1/spaces/{space}/evaluation-datasets/{id}/cases:
+    get:
+      operationId: getMemoryEvaluationCases
+      tags:
+        - memory
+      parameters:
+        - name: space
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: X-Antfly-Database
+          in: header
+          schema:
+            type: string
+            default: default
+            x-go-type-skip-optional-pointer: false
+          description: Catalog scope for this memory space.
+        - name: X-Antfly-Namespace
+          in: header
+          schema:
+            type: string
+            default: public
+            x-go-type-skip-optional-pointer: false
+          description: Catalog scope for this memory space.
+        - name: X-Antfly-Memory-Branch
+          in: header
+          schema:
+            type: string
+            default: ''
+            x-go-type-skip-optional-pointer: false
+          description: Catalog scope for this memory space.
+        - name: cursor
+          in: query
+          schema:
+            type: string
+            x-go-type-skip-optional-pointer: false
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 128
+            x-go-type-skip-optional-pointer: false
+      responses:
+        '200':
+          description: Accepted durable operation or requested memory result.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryEvaluationCasePage'
+        '400':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '401':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '403':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '404':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '409':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '413':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '422':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '429':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '503':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+  /memory/v1/spaces/{space}/evaluations:
+    post:
+      operationId: startMemoryEvaluation
+      tags:
+        - memory
+      parameters:
+        - name: space
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: X-Antfly-Database
+          in: header
+          schema:
+            type: string
+            default: default
+            x-go-type-skip-optional-pointer: false
+          description: Catalog scope for this memory space.
+        - name: X-Antfly-Namespace
+          in: header
+          schema:
+            type: string
+            default: public
+            x-go-type-skip-optional-pointer: false
+          description: Catalog scope for this memory space.
+        - name: X-Antfly-Memory-Branch
+          in: header
+          schema:
+            type: string
+            default: ''
+            x-go-type-skip-optional-pointer: false
+          description: Catalog scope for this memory space.
+        - name: Idempotency-Key
+          in: header
+          required: true
+          schema:
+            type: string
+            maxLength: 256
+          description: Stable per-principal operation key. Conflicting reuse returns 409.
+      responses:
+        '200':
+          description: Accepted durable operation or requested memory result.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryOperation'
+        '400':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '401':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '403':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '404':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '409':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '413':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '422':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '429':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '503':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/MemoryEvaluationStart'
+  /memory/v1/spaces/{space}/evaluations/{id}:
+    get:
+      operationId: getMemoryEvaluation
+      tags:
+        - memory
+      parameters:
+        - name: space
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: X-Antfly-Database
+          in: header
+          schema:
+            type: string
+            default: default
+            x-go-type-skip-optional-pointer: false
+          description: Catalog scope for this memory space.
+        - name: X-Antfly-Namespace
+          in: header
+          schema:
+            type: string
+            default: public
+            x-go-type-skip-optional-pointer: false
+          description: Catalog scope for this memory space.
+        - name: X-Antfly-Memory-Branch
+          in: header
+          schema:
+            type: string
+            default: ''
+            x-go-type-skip-optional-pointer: false
+          description: Catalog scope for this memory space.
+      responses:
+        '200':
+          description: Accepted durable operation or requested memory result.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryEvaluationStatus'
+        '400':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '401':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '403':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '404':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '409':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '413':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '422':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '429':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '503':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+  /memory/v1/spaces/{space}/evaluations/{id}/results:
+    get:
+      operationId: getMemoryEvaluationResults
+      tags:
+        - memory
+      parameters:
+        - name: space
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: X-Antfly-Database
+          in: header
+          schema:
+            type: string
+            default: default
+            x-go-type-skip-optional-pointer: false
+          description: Catalog scope for this memory space.
+        - name: X-Antfly-Namespace
+          in: header
+          schema:
+            type: string
+            default: public
+            x-go-type-skip-optional-pointer: false
+          description: Catalog scope for this memory space.
+        - name: X-Antfly-Memory-Branch
+          in: header
+          schema:
+            type: string
+            default: ''
+            x-go-type-skip-optional-pointer: false
+          description: Catalog scope for this memory space.
+        - name: cursor
+          in: query
+          schema:
+            type: string
+            x-go-type-skip-optional-pointer: false
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 8
+            x-go-type-skip-optional-pointer: false
+      responses:
+        '200':
+          description: Accepted durable operation or requested memory result.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryEvaluationResultPage'
+        '400':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '401':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '403':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '404':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '409':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '413':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '422':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '429':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '503':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+  /memory/v1/spaces/{space}/evaluations/{id}/tasks:
+    get:
+      operationId: getMemoryEvaluationTasks
+      tags:
+        - memory
+      parameters:
+        - name: space
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: X-Antfly-Database
+          in: header
+          schema:
+            type: string
+            default: default
+            x-go-type-skip-optional-pointer: false
+          description: Catalog scope for this memory space.
+        - name: X-Antfly-Namespace
+          in: header
+          schema:
+            type: string
+            default: public
+            x-go-type-skip-optional-pointer: false
+          description: Catalog scope for this memory space.
+        - name: X-Antfly-Memory-Branch
+          in: header
+          schema:
+            type: string
+            default: ''
+            x-go-type-skip-optional-pointer: false
+          description: Catalog scope for this memory space.
+        - name: cursor
+          in: query
+          schema:
+            type: string
+            x-go-type-skip-optional-pointer: false
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 128
+            x-go-type-skip-optional-pointer: false
+      responses:
+        '200':
+          description: Accepted durable operation or requested memory result.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryEvaluationTaskPage'
+        '400':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '401':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '403':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '404':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '409':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '413':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '422':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '429':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '503':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+  /memory/v1/spaces/{space}/evaluations/{id}/verdicts:
+    post:
+      operationId: submitMemoryEvaluationVerdicts
+      tags:
+        - memory
+      parameters:
+        - name: space
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: X-Antfly-Database
+          in: header
+          schema:
+            type: string
+            default: default
+            x-go-type-skip-optional-pointer: false
+          description: Catalog scope for this memory space.
+        - name: X-Antfly-Namespace
+          in: header
+          schema:
+            type: string
+            default: public
+            x-go-type-skip-optional-pointer: false
+          description: Catalog scope for this memory space.
+        - name: X-Antfly-Memory-Branch
+          in: header
+          schema:
+            type: string
+            default: ''
+            x-go-type-skip-optional-pointer: false
+          description: Catalog scope for this memory space.
+        - name: Idempotency-Key
+          in: header
+          required: true
+          schema:
+            type: string
+            maxLength: 256
+          description: Stable per-principal operation key. Conflicting reuse returns 409.
+      responses:
+        '200':
+          description: Accepted durable operation or requested memory result.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryOperation'
+        '400':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '401':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '403':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '404':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '409':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '413':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '422':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '429':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '503':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/MemoryEvaluationSubmit'
+  /memory/v1/spaces/{space}/lineage:
+    get:
+      operationId: getMemoryLineage
+      tags:
+        - memory
+      parameters:
+        - name: space
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: X-Antfly-Database
+          in: header
+          schema:
+            type: string
+            default: default
+            x-go-type-skip-optional-pointer: false
+          description: Catalog scope for this memory space.
+        - name: X-Antfly-Namespace
+          in: header
+          schema:
+            type: string
+            default: public
+            x-go-type-skip-optional-pointer: false
+          description: Catalog scope for this memory space.
+        - name: X-Antfly-Memory-Branch
+          in: header
+          schema:
+            type: string
+            default: ''
+            x-go-type-skip-optional-pointer: false
+          description: Catalog scope for this memory space.
+      responses:
+        '200':
+          description: Accepted durable operation or requested memory result.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryLineageHead'
+        '400':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '401':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '403':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '404':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '409':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '413':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '422':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '429':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '503':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+  /memory/v1/spaces/{space}/forks:
+    post:
+      operationId: forkMemoryLineage
+      tags:
+        - memory
+      parameters:
+        - name: space
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: X-Antfly-Database
+          in: header
+          schema:
+            type: string
+            default: default
+            x-go-type-skip-optional-pointer: false
+          description: Catalog scope for this memory space.
+        - name: X-Antfly-Namespace
+          in: header
+          schema:
+            type: string
+            default: public
+            x-go-type-skip-optional-pointer: false
+          description: Catalog scope for this memory space.
+        - name: X-Antfly-Memory-Branch
+          in: header
+          schema:
+            type: string
+            default: ''
+            x-go-type-skip-optional-pointer: false
+          description: Catalog scope for this memory space.
+        - name: Idempotency-Key
+          in: header
+          required: true
+          schema:
+            type: string
+            maxLength: 256
+          description: Stable per-principal operation key. Conflicting reuse returns 409.
+      responses:
+        '200':
+          description: Accepted durable operation or requested memory result.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryOperation'
+        '400':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '401':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '403':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '404':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '409':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '413':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '422':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '429':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '503':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/MemoryLineageFork'
+  /memory/v1/spaces/{space}/checkpoints:
+    post:
+      operationId: checkpointMemoryLineage
+      tags:
+        - memory
+      parameters:
+        - name: space
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: X-Antfly-Database
+          in: header
+          schema:
+            type: string
+            default: default
+            x-go-type-skip-optional-pointer: false
+          description: Catalog scope for this memory space.
+        - name: X-Antfly-Namespace
+          in: header
+          schema:
+            type: string
+            default: public
+            x-go-type-skip-optional-pointer: false
+          description: Catalog scope for this memory space.
+        - name: X-Antfly-Memory-Branch
+          in: header
+          schema:
+            type: string
+            default: ''
+            x-go-type-skip-optional-pointer: false
+          description: Catalog scope for this memory space.
+        - name: Idempotency-Key
+          in: header
+          required: true
+          schema:
+            type: string
+            maxLength: 256
+          description: Stable per-principal operation key. Conflicting reuse returns 409.
+      responses:
+        '200':
+          description: Accepted durable operation or requested memory result.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryOperation'
+        '400':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '401':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '403':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '404':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '409':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '413':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '422':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '429':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '503':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/MemoryLineageCheckpointRequest'
+  /memory/v1/spaces/{space}/reverts:
+    post:
+      operationId: revertMemoryLineage
+      tags:
+        - memory
+      parameters:
+        - name: space
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: X-Antfly-Database
+          in: header
+          schema:
+            type: string
+            default: default
+            x-go-type-skip-optional-pointer: false
+          description: Catalog scope for this memory space.
+        - name: X-Antfly-Namespace
+          in: header
+          schema:
+            type: string
+            default: public
+            x-go-type-skip-optional-pointer: false
+          description: Catalog scope for this memory space.
+        - name: X-Antfly-Memory-Branch
+          in: header
+          schema:
+            type: string
+            default: ''
+            x-go-type-skip-optional-pointer: false
+          description: Catalog scope for this memory space.
+        - name: Idempotency-Key
+          in: header
+          required: true
+          schema:
+            type: string
+            maxLength: 256
+          description: Stable per-principal operation key. Conflicting reuse returns 409.
+      responses:
+        '200':
+          description: Accepted durable operation or requested memory result.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryOperation'
+        '400':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '401':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '403':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '404':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '409':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '413':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '422':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '429':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '503':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/MemoryLineageRevert'
+  /memory/v1/spaces/{space}/changes:
+    get:
+      operationId: followMemoryChanges
+      tags:
+        - memory
+      parameters:
+        - name: space
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: X-Antfly-Database
+          in: header
+          schema:
+            type: string
+            default: default
+            x-go-type-skip-optional-pointer: false
+          description: Catalog scope for this memory space.
+        - name: X-Antfly-Namespace
+          in: header
+          schema:
+            type: string
+            default: public
+            x-go-type-skip-optional-pointer: false
+          description: Catalog scope for this memory space.
+        - name: X-Antfly-Memory-Branch
+          in: header
+          schema:
+            type: string
+            default: ''
+            x-go-type-skip-optional-pointer: false
+          description: Catalog scope for this memory space.
+        - name: cursor
+          in: query
+          schema:
+            type: string
+            x-go-type-skip-optional-pointer: false
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 256
+            x-go-type-skip-optional-pointer: false
+        - name: start
+          in: query
+          schema:
+            type: string
+            enum:
+              - beginning
+              - latest
+            default: latest
+            x-go-type-skip-optional-pointer: false
+      responses:
+        '200':
+          description: Accepted durable operation or requested memory result.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryChangePage'
+        '400':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '401':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '403':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '404':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '409':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '413':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '422':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '429':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '503':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+    post:
+      operationId: pollMemoryChanges
+      tags:
+        - memory
+      parameters:
+        - name: space
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: X-Antfly-Database
+          in: header
+          schema:
+            type: string
+            default: default
+            x-go-type-skip-optional-pointer: false
+          description: Catalog scope for this memory space.
+        - name: X-Antfly-Namespace
+          in: header
+          schema:
+            type: string
+            default: public
+            x-go-type-skip-optional-pointer: false
+          description: Catalog scope for this memory space.
+        - name: X-Antfly-Memory-Branch
+          in: header
+          schema:
+            type: string
+            default: ''
+            x-go-type-skip-optional-pointer: false
+          description: Catalog scope for this memory space.
+      responses:
+        '200':
+          description: Accepted durable operation or requested memory result.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryChangePage'
+        '400':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '401':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '403':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '404':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '409':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '413':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '422':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '429':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+        '503':
+          description: Memory validation, authorization, concurrency, capability, or execution error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemoryError'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/MemoryChangeRequest'
   /memory/v1/spaces/{space}/entities/{id}/view:
     post:
       operationId: getMemoryEntityView
@@ -16253,6 +18311,13 @@ paths:
           schema:
             type: string
             default: public
+            x-go-type-skip-optional-pointer: false
+          description: Catalog scope for this memory space.
+        - name: X-Antfly-Memory-Branch
+          in: header
+          schema:
+            type: string
+            default: ''
             x-go-type-skip-optional-pointer: false
           description: Catalog scope for this memory space.
       responses:
@@ -16345,6 +18410,13 @@ paths:
           schema:
             type: string
             default: public
+            x-go-type-skip-optional-pointer: false
+          description: Catalog scope for this memory space.
+        - name: X-Antfly-Memory-Branch
+          in: header
+          schema:
+            type: string
+            default: ''
             x-go-type-skip-optional-pointer: false
           description: Catalog scope for this memory space.
         - name: cursor
@@ -16457,6 +18529,13 @@ paths:
             default: public
             x-go-type-skip-optional-pointer: false
           description: Catalog scope for this memory space.
+        - name: X-Antfly-Memory-Branch
+          in: header
+          schema:
+            type: string
+            default: ''
+            x-go-type-skip-optional-pointer: false
+          description: Catalog scope for this memory space.
         - name: cursor
           in: query
           schema:
@@ -16560,6 +18639,13 @@ paths:
           schema:
             type: string
             default: public
+            x-go-type-skip-optional-pointer: false
+          description: Catalog scope for this memory space.
+        - name: X-Antfly-Memory-Branch
+          in: header
+          schema:
+            type: string
+            default: ''
             x-go-type-skip-optional-pointer: false
           description: Catalog scope for this memory space.
         - name: Idempotency-Key
@@ -16666,6 +18752,13 @@ paths:
             default: public
             x-go-type-skip-optional-pointer: false
           description: Catalog scope for this memory space.
+        - name: X-Antfly-Memory-Branch
+          in: header
+          schema:
+            type: string
+            default: ''
+            x-go-type-skip-optional-pointer: false
+          description: Catalog scope for this memory space.
       responses:
         '200':
           description: Accepted durable operation or requested memory result.
@@ -16755,6 +18848,13 @@ paths:
           schema:
             type: string
             default: public
+            x-go-type-skip-optional-pointer: false
+          description: Catalog scope for this memory space.
+        - name: X-Antfly-Memory-Branch
+          in: header
+          schema:
+            type: string
+            default: ''
             x-go-type-skip-optional-pointer: false
           description: Catalog scope for this memory space.
         - name: Idempotency-Key
@@ -16861,6 +18961,13 @@ paths:
             default: public
             x-go-type-skip-optional-pointer: false
           description: Catalog scope for this memory space.
+        - name: X-Antfly-Memory-Branch
+          in: header
+          schema:
+            type: string
+            default: ''
+            x-go-type-skip-optional-pointer: false
+          description: Catalog scope for this memory space.
       responses:
         '200':
           description: Accepted durable operation or requested memory result.
@@ -16951,6 +19058,13 @@ paths:
           schema:
             type: string
             default: public
+            x-go-type-skip-optional-pointer: false
+          description: Catalog scope for this memory space.
+        - name: X-Antfly-Memory-Branch
+          in: header
+          schema:
+            type: string
+            default: ''
             x-go-type-skip-optional-pointer: false
           description: Catalog scope for this memory space.
         - name: Idempotency-Key
@@ -17049,6 +19163,13 @@ paths:
           schema:
             type: string
             default: public
+            x-go-type-skip-optional-pointer: false
+          description: Catalog scope for this memory space.
+        - name: X-Antfly-Memory-Branch
+          in: header
+          schema:
+            type: string
+            default: ''
             x-go-type-skip-optional-pointer: false
           description: Catalog scope for this memory space.
         - name: cursor
@@ -17154,6 +19275,13 @@ paths:
             default: public
             x-go-type-skip-optional-pointer: false
           description: Catalog scope for this memory space.
+        - name: X-Antfly-Memory-Branch
+          in: header
+          schema:
+            type: string
+            default: ''
+            x-go-type-skip-optional-pointer: false
+          description: Catalog scope for this memory space.
       responses:
         '200':
           description: Accepted durable operation or requested memory result.
@@ -17243,6 +19371,13 @@ paths:
           schema:
             type: string
             default: public
+            x-go-type-skip-optional-pointer: false
+          description: Catalog scope for this memory space.
+        - name: X-Antfly-Memory-Branch
+          in: header
+          schema:
+            type: string
+            default: ''
             x-go-type-skip-optional-pointer: false
           description: Catalog scope for this memory space.
         - name: Idempotency-Key
@@ -17344,6 +19479,13 @@ paths:
             default: public
             x-go-type-skip-optional-pointer: false
           description: Catalog scope for this memory space.
+        - name: X-Antfly-Memory-Branch
+          in: header
+          schema:
+            type: string
+            default: ''
+            x-go-type-skip-optional-pointer: false
+          description: Catalog scope for this memory space.
       responses:
         '200':
           description: Accepted durable operation or requested memory result.
@@ -17441,6 +19583,13 @@ paths:
             default: public
             x-go-type-skip-optional-pointer: false
           description: Catalog scope for this memory space.
+        - name: X-Antfly-Memory-Branch
+          in: header
+          schema:
+            type: string
+            default: ''
+            x-go-type-skip-optional-pointer: false
+          description: Catalog scope for this memory space.
       responses:
         '200':
           description: Accepted durable operation or requested memory result.
@@ -17533,6 +19682,13 @@ paths:
             default: public
             x-go-type-skip-optional-pointer: false
           description: Catalog scope for this memory space.
+        - name: X-Antfly-Memory-Branch
+          in: header
+          schema:
+            type: string
+            default: ''
+            x-go-type-skip-optional-pointer: false
+          description: Catalog scope for this memory space.
       responses:
         '200':
           description: Accepted durable operation or requested memory result.
@@ -17623,6 +19779,13 @@ paths:
           schema:
             type: string
             default: public
+            x-go-type-skip-optional-pointer: false
+          description: Catalog scope for this memory space.
+        - name: X-Antfly-Memory-Branch
+          in: header
+          schema:
+            type: string
+            default: ''
             x-go-type-skip-optional-pointer: false
           description: Catalog scope for this memory space.
         - name: cursor
@@ -17805,6 +19968,13 @@ paths:
             default: public
             x-go-type-skip-optional-pointer: false
           description: Catalog scope for this memory space.
+        - name: X-Antfly-Memory-Branch
+          in: header
+          schema:
+            type: string
+            default: ''
+            x-go-type-skip-optional-pointer: false
+          description: Catalog scope for this memory space.
       responses:
         '200':
           description: Accepted durable operation or requested memory result.
@@ -17894,6 +20064,13 @@ paths:
           schema:
             type: string
             default: public
+            x-go-type-skip-optional-pointer: false
+          description: Catalog scope for this memory space.
+        - name: X-Antfly-Memory-Branch
+          in: header
+          schema:
+            type: string
+            default: ''
             x-go-type-skip-optional-pointer: false
           description: Catalog scope for this memory space.
         - name: cursor
@@ -17999,6 +20176,13 @@ paths:
             default: public
             x-go-type-skip-optional-pointer: false
           description: Catalog scope for this memory space.
+        - name: X-Antfly-Memory-Branch
+          in: header
+          schema:
+            type: string
+            default: ''
+            x-go-type-skip-optional-pointer: false
+          description: Catalog scope for this memory space.
       responses:
         '200':
           description: Accepted durable operation or requested memory result.
@@ -18087,6 +20271,13 @@ paths:
           schema:
             type: string
             default: public
+            x-go-type-skip-optional-pointer: false
+          description: Catalog scope for this memory space.
+        - name: X-Antfly-Memory-Branch
+          in: header
+          schema:
+            type: string
+            default: ''
             x-go-type-skip-optional-pointer: false
           description: Catalog scope for this memory space.
         - name: Idempotency-Key
@@ -18180,6 +20371,13 @@ paths:
           schema:
             type: string
             default: public
+            x-go-type-skip-optional-pointer: false
+          description: Catalog scope for this memory space.
+        - name: X-Antfly-Memory-Branch
+          in: header
+          schema:
+            type: string
+            default: ''
             x-go-type-skip-optional-pointer: false
           description: Catalog scope for this memory space.
         - name: Idempotency-Key
@@ -18280,6 +20478,13 @@ paths:
             default: public
             x-go-type-skip-optional-pointer: false
           description: Catalog scope for this memory space.
+        - name: X-Antfly-Memory-Branch
+          in: header
+          schema:
+            type: string
+            default: ''
+            x-go-type-skip-optional-pointer: false
+          description: Catalog scope for this memory space.
       responses:
         '200':
           description: Accepted durable operation or requested memory result.
@@ -18371,6 +20576,13 @@ paths:
             default: public
             x-go-type-skip-optional-pointer: false
           description: Catalog scope for this memory space.
+        - name: X-Antfly-Memory-Branch
+          in: header
+          schema:
+            type: string
+            default: ''
+            x-go-type-skip-optional-pointer: false
+          description: Catalog scope for this memory space.
       responses:
         '200':
           description: Accepted durable operation or requested memory result.
@@ -18455,6 +20667,13 @@ paths:
           schema:
             type: string
             default: public
+            x-go-type-skip-optional-pointer: false
+          description: Catalog scope for this memory space.
+        - name: X-Antfly-Memory-Branch
+          in: header
+          schema:
+            type: string
+            default: ''
             x-go-type-skip-optional-pointer: false
           description: Catalog scope for this memory space.
         - name: Idempotency-Key
@@ -18561,6 +20780,13 @@ paths:
             default: public
             x-go-type-skip-optional-pointer: false
           description: Catalog scope for this memory space.
+        - name: X-Antfly-Memory-Branch
+          in: header
+          schema:
+            type: string
+            default: ''
+            x-go-type-skip-optional-pointer: false
+          description: Catalog scope for this memory space.
       responses:
         '200':
           description: Accepted durable operation or requested memory result.
@@ -18645,6 +20871,13 @@ paths:
           schema:
             type: string
             default: public
+            x-go-type-skip-optional-pointer: false
+          description: Catalog scope for this memory space.
+        - name: X-Antfly-Memory-Branch
+          in: header
+          schema:
+            type: string
+            default: ''
             x-go-type-skip-optional-pointer: false
           description: Catalog scope for this memory space.
         - name: cursor
@@ -50876,6 +53109,1836 @@ components:
           x-go-type-skip-optional-pointer: false
           x-go-type: uint32
       additionalProperties: false
+    MemorySupersessionCandidateRequest:
+      type: object
+      properties:
+        max_bytes:
+          type: integer
+          minimum: 0
+          maximum: 4294967295
+          format: uint32
+          default: 262144
+          x-go-type-skip-optional-pointer: false
+          x-go-type: uint32
+        limit:
+          type: integer
+          minimum: 0
+          maximum: 65535
+          format: uint32
+          default: 32
+          x-go-type-skip-optional-pointer: false
+          x-go-type: uint32
+        mode:
+          type: string
+          enum:
+            - lexical
+            - semantic
+            - union_search
+          default: union_search
+          x-go-type-skip-optional-pointer: false
+        lexical_threshold:
+          type: number
+          format: double
+          default: 0.1
+          x-go-type-skip-optional-pointer: false
+        semantic_threshold:
+          type: number
+          format: double
+          default: 0.8
+          x-go-type-skip-optional-pointer: false
+      additionalProperties: false
+    MemorySupersessionCandidatePage:
+      type: object
+      properties:
+        seed:
+          $ref: '#/components/schemas/MemoryClaimView'
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/MemorySupersessionCandidate'
+        retrieval:
+          type: string
+          enum:
+            - indexed
+            - not_ready
+        semantic_discovery:
+          type: string
+          enum:
+            - indexed
+            - disabled
+            - not_ready
+        truncated:
+          type: boolean
+        revision:
+          type: integer
+          minimum: 0
+          maximum: 18446744073709551615
+          format: uint64
+          x-go-type: uint64
+      required:
+        - seed
+        - items
+        - retrieval
+        - semantic_discovery
+        - truncated
+        - revision
+      additionalProperties: false
+    MemorySupersessionProposalRequest:
+      type: object
+      properties:
+        id:
+          type: string
+        expected_revision:
+          type: integer
+          minimum: 0
+          maximum: 18446744073709551615
+          format: uint64
+          x-go-type: uint64
+        incoming:
+          $ref: '#/components/schemas/MemoryClaimPin'
+        previous:
+          $ref: '#/components/schemas/MemoryClaimPin'
+        actor:
+          type: string
+      required:
+        - id
+        - expected_revision
+        - incoming
+        - previous
+      additionalProperties: false
+    MemorySupersessionProposalDetail:
+      type: object
+      properties:
+        proposal:
+          $ref: '#/components/schemas/MemorySupersessionProposal'
+        incoming:
+          $ref: '#/components/schemas/MemoryClaimView'
+        previous:
+          $ref: '#/components/schemas/MemoryClaimView'
+        stale_configuration:
+          type: boolean
+      required:
+        - proposal
+        - incoming
+        - previous
+        - stale_configuration
+      additionalProperties: false
+    MemorySupersessionProposalPage:
+      type: object
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/MemorySupersessionProposal'
+        next_cursor:
+          type: string
+          nullable: true
+          x-go-type-skip-optional-pointer: false
+        complete:
+          type: boolean
+        revision:
+          type: integer
+          minimum: 0
+          maximum: 18446744073709551615
+          format: uint64
+          x-go-type: uint64
+      required:
+        - items
+        - next_cursor
+        - complete
+        - revision
+      additionalProperties: false
+    MemorySupersessionVerdict:
+      type: object
+      properties:
+        expected_revision:
+          type: integer
+          minimum: 0
+          maximum: 18446744073709551615
+          format: uint64
+          x-go-type: uint64
+        verdict:
+          type: string
+          enum:
+            - supersedes
+            - contradicts
+            - restates
+            - independent
+          default: null
+          nullable: true
+          x-go-type-skip-optional-pointer: false
+        reason:
+          type: string
+        actor:
+          type: string
+        evidence:
+          type: array
+          items:
+            type: object
+            properties:
+              id:
+                type: string
+              span:
+                type: object
+                properties:
+                  start:
+                    type: integer
+                    minimum: 0
+                    maximum: 4294967295
+                    format: uint32
+                    x-go-type: uint32
+                  end:
+                    type: integer
+                    minimum: 0
+                    maximum: 4294967295
+                    format: uint32
+                    x-go-type: uint32
+                required:
+                  - start
+                  - end
+                additionalProperties: false
+                default: null
+                nullable: true
+            required:
+              - id
+            additionalProperties: false
+        model:
+          type: object
+          properties:
+            provider:
+              type: string
+            model:
+              type: string
+            revision:
+              type: string
+            dimensions:
+              type: integer
+              minimum: 0
+              maximum: 4294967295
+              format: uint32
+              x-go-type: uint32
+              default: null
+              nullable: true
+              x-go-type-skip-optional-pointer: false
+          required:
+            - provider
+            - model
+            - revision
+          additionalProperties: false
+          default: null
+          nullable: true
+      required:
+        - expected_revision
+      additionalProperties: false
+    MemoryIntakeScreening:
+      type: object
+      properties:
+        version:
+          type: integer
+          minimum: 0
+          maximum: 65535
+          format: uint32
+          default: 1
+          x-go-type-skip-optional-pointer: false
+          x-go-type: uint32
+        mode:
+          type: string
+          enum:
+            - reject
+            - redact
+          default: reject
+          x-go-type-skip-optional-pointer: false
+        custom_rules:
+          type: array
+          items:
+            type: object
+            properties:
+              id:
+                type: string
+              prefix:
+                type: string
+              min_length:
+                type: integer
+                minimum: 0
+                maximum: 65535
+                format: uint32
+                x-go-type: uint32
+              max_length:
+                type: integer
+                minimum: 0
+                maximum: 65535
+                format: uint32
+                default: 4096
+                x-go-type-skip-optional-pointer: false
+                x-go-type: uint32
+              alphabet:
+                type: string
+                enum:
+                  - alphanumeric
+                  - base64url
+                  - hex
+                  - non_separator
+                default: base64url
+                x-go-type-skip-optional-pointer: false
+            required:
+              - id
+              - prefix
+              - min_length
+            additionalProperties: false
+        allow_fingerprints:
+          type: array
+          items:
+            type: string
+      additionalProperties: false
+    MemoryIntakeScreeningReport:
+      type: object
+      properties:
+        policy_version:
+          type: integer
+          minimum: 0
+          maximum: 65535
+          format: uint32
+          default: 1
+          x-go-type-skip-optional-pointer: false
+          x-go-type: uint32
+        redactions:
+          type: integer
+          minimum: 0
+          maximum: 4294967295
+          format: uint32
+          default: 0
+          x-go-type-skip-optional-pointer: false
+          x-go-type: uint32
+        known_tokens:
+          type: integer
+          minimum: 0
+          maximum: 4294967295
+          format: uint32
+          default: 0
+          x-go-type-skip-optional-pointer: false
+          x-go-type: uint32
+        private_keys:
+          type: integer
+          minimum: 0
+          maximum: 4294967295
+          format: uint32
+          default: 0
+          x-go-type-skip-optional-pointer: false
+          x-go-type: uint32
+        credential_assignments:
+          type: integer
+          minimum: 0
+          maximum: 4294967295
+          format: uint32
+          default: 0
+          x-go-type-skip-optional-pointer: false
+          x-go-type: uint32
+        credential_urls:
+          type: integer
+          minimum: 0
+          maximum: 4294967295
+          format: uint32
+          default: 0
+          x-go-type-skip-optional-pointer: false
+          x-go-type: uint32
+        sensitive_fields:
+          type: integer
+          minimum: 0
+          maximum: 4294967295
+          format: uint32
+          default: 0
+          x-go-type-skip-optional-pointer: false
+          x-go-type: uint32
+        custom:
+          type: integer
+          minimum: 0
+          maximum: 4294967295
+          format: uint32
+          default: 0
+          x-go-type-skip-optional-pointer: false
+          x-go-type: uint32
+      additionalProperties: false
+    MemoryIntakeMaterialization:
+      type: object
+      properties:
+        screening:
+          type: object
+          properties:
+            policy_version:
+              type: integer
+              minimum: 0
+              maximum: 65535
+              format: uint32
+              default: 1
+              x-go-type-skip-optional-pointer: false
+              x-go-type: uint32
+            redactions:
+              type: integer
+              minimum: 0
+              maximum: 4294967295
+              format: uint32
+              default: 0
+              x-go-type-skip-optional-pointer: false
+              x-go-type: uint32
+            known_tokens:
+              type: integer
+              minimum: 0
+              maximum: 4294967295
+              format: uint32
+              default: 0
+              x-go-type-skip-optional-pointer: false
+              x-go-type: uint32
+            private_keys:
+              type: integer
+              minimum: 0
+              maximum: 4294967295
+              format: uint32
+              default: 0
+              x-go-type-skip-optional-pointer: false
+              x-go-type: uint32
+            credential_assignments:
+              type: integer
+              minimum: 0
+              maximum: 4294967295
+              format: uint32
+              default: 0
+              x-go-type-skip-optional-pointer: false
+              x-go-type: uint32
+            credential_urls:
+              type: integer
+              minimum: 0
+              maximum: 4294967295
+              format: uint32
+              default: 0
+              x-go-type-skip-optional-pointer: false
+              x-go-type: uint32
+            sensitive_fields:
+              type: integer
+              minimum: 0
+              maximum: 4294967295
+              format: uint32
+              default: 0
+              x-go-type-skip-optional-pointer: false
+              x-go-type: uint32
+            custom:
+              type: integer
+              minimum: 0
+              maximum: 4294967295
+              format: uint32
+              default: 0
+              x-go-type-skip-optional-pointer: false
+              x-go-type: uint32
+          additionalProperties: false
+        text_redacted:
+          type: boolean
+        text_sha256:
+          type: string
+      required:
+        - screening
+        - text_redacted
+        - text_sha256
+      additionalProperties: false
+    MemoryClaimView:
+      type: object
+      properties:
+        memory:
+          $ref: '#/components/schemas/MemoryRecord'
+        fingerprint:
+          type: string
+        config_generation:
+          type: integer
+          minimum: 0
+          maximum: 18446744073709551615
+          format: uint64
+          x-go-type: uint64
+      required:
+        - memory
+        - fingerprint
+        - config_generation
+      additionalProperties: false
+    MemoryClaimPin:
+      type: object
+      properties:
+        id:
+          type: string
+        revision:
+          type: integer
+          minimum: 0
+          maximum: 18446744073709551615
+          format: uint64
+          x-go-type: uint64
+        fingerprint:
+          type: string
+      required:
+        - id
+        - revision
+        - fingerprint
+      additionalProperties: false
+    MemorySupersessionCandidate:
+      type: object
+      properties:
+        view:
+          $ref: '#/components/schemas/MemoryClaimView'
+        lexical_score:
+          type: number
+          format: double
+        semantic_similarity:
+          type: number
+          format: double
+          nullable: true
+          x-go-type-skip-optional-pointer: false
+      required:
+        - view
+        - lexical_score
+        - semantic_similarity
+      additionalProperties: false
+    MemorySupersessionProposal:
+      type: object
+      properties:
+        branch:
+          type: string
+        id:
+          type: string
+        incoming:
+          $ref: '#/components/schemas/MemoryClaimPin'
+        previous:
+          $ref: '#/components/schemas/MemoryClaimPin'
+        owner:
+          type: string
+        actor:
+          type: string
+        config_generation:
+          type: integer
+          minimum: 0
+          maximum: 18446744073709551615
+          format: uint64
+          x-go-type: uint64
+        revision:
+          type: integer
+          minimum: 0
+          maximum: 18446744073709551615
+          format: uint64
+          x-go-type: uint64
+        recorded_at:
+          type: integer
+          minimum: -9223372036854775808
+          maximum: 9223372036854775807
+          format: int64
+          x-go-type: int64
+        verdict:
+          type: string
+          enum:
+            - supersedes
+            - contradicts
+            - restates
+            - independent
+          default: null
+          nullable: true
+          x-go-type-skip-optional-pointer: false
+        verdict_revision:
+          type: integer
+          minimum: 0
+          maximum: 18446744073709551615
+          format: uint64
+          x-go-type: uint64
+          default: null
+          nullable: true
+          x-go-type-skip-optional-pointer: false
+        verdict_principal:
+          type: string
+        verdict_actor:
+          type: string
+        reason:
+          type: string
+        evidence:
+          type: array
+          items:
+            type: object
+            properties:
+              id:
+                type: string
+              span:
+                type: object
+                properties:
+                  start:
+                    type: integer
+                    minimum: 0
+                    maximum: 4294967295
+                    format: uint32
+                    x-go-type: uint32
+                  end:
+                    type: integer
+                    minimum: 0
+                    maximum: 4294967295
+                    format: uint32
+                    x-go-type: uint32
+                required:
+                  - start
+                  - end
+                additionalProperties: false
+                default: null
+                nullable: true
+            required:
+              - id
+            additionalProperties: false
+        model:
+          type: object
+          properties:
+            provider:
+              type: string
+            model:
+              type: string
+            revision:
+              type: string
+            dimensions:
+              type: integer
+              minimum: 0
+              maximum: 4294967295
+              format: uint32
+              x-go-type: uint32
+              default: null
+              nullable: true
+              x-go-type-skip-optional-pointer: false
+          required:
+            - provider
+            - model
+            - revision
+          additionalProperties: false
+          default: null
+          nullable: true
+      required:
+        - id
+        - incoming
+        - previous
+        - owner
+        - actor
+        - config_generation
+        - revision
+        - recorded_at
+      additionalProperties: false
+    MemorySpaceChange:
+      type: object
+      properties:
+        branch:
+          type: string
+        id:
+          type: string
+        kind:
+          type: string
+          enum:
+            - assertion_changed
+            - assertion_superseded
+            - assertion_disputed
+            - assertion_retracted
+            - evidence_observed
+            - entity_changed
+            - proposal_opened
+            - proposal_deferred
+            - proposal_decided
+            - configuration_changed
+            - context_invalidated
+            - lineage_changed
+            - evaluation_changed
+        target:
+          type: object
+          properties:
+            kind:
+              type: string
+              enum:
+                - assertion
+                - evidence
+                - entity
+                - entity_proposal
+                - relationship_proposal
+                - supersession_proposal
+                - lineage
+                - evaluation
+                - configuration
+            id:
+              type: string
+            revision:
+              type: integer
+              minimum: 0
+              maximum: 18446744073709551615
+              format: uint64
+              x-go-type: uint64
+          required:
+            - kind
+            - id
+            - revision
+          additionalProperties: false
+          nullable: true
+        revision:
+          type: integer
+          minimum: 0
+          maximum: 18446744073709551615
+          format: uint64
+          x-go-type: uint64
+        recorded_at:
+          type: integer
+          minimum: -9223372036854775808
+          maximum: 9223372036854775807
+          format: int64
+          x-go-type: int64
+      required:
+        - id
+        - kind
+        - target
+        - revision
+        - recorded_at
+      additionalProperties: false
+    MemoryEvaluationCase:
+      type: object
+      properties:
+        id:
+          type: string
+        task:
+          type: string
+          enum:
+            - identity
+            - relationship
+            - supersession
+            - retrieval
+        input: {}
+        policy:
+          allOf:
+            - $ref: '#/components/schemas/MemoryEvaluationPolicyInput'
+          nullable: true
+          default: null
+        expected:
+          type: string
+          enum:
+            - same
+            - different
+            - related
+            - unrelated
+            - supersedes
+            - contradicts
+            - restates
+            - independent
+          default: null
+          nullable: true
+          x-go-type-skip-optional-pointer: false
+        expected_supersedes:
+          type: boolean
+          default: null
+          nullable: true
+          x-go-type-skip-optional-pointer: false
+        relevant_ids:
+          type: array
+          items:
+            type: string
+        evidence:
+          type: array
+          items:
+            type: object
+            properties:
+              id:
+                type: string
+              span:
+                type: object
+                properties:
+                  start:
+                    type: integer
+                    minimum: 0
+                    maximum: 4294967295
+                    format: uint32
+                    x-go-type: uint32
+                  end:
+                    type: integer
+                    minimum: 0
+                    maximum: 4294967295
+                    format: uint32
+                    x-go-type: uint32
+                required:
+                  - start
+                  - end
+                additionalProperties: false
+                default: null
+                nullable: true
+            required:
+              - id
+            additionalProperties: false
+      required:
+        - id
+        - task
+        - input
+      additionalProperties: false
+    MemoryEvaluationStoredCase:
+      type: object
+      properties:
+        forgotten:
+          type: boolean
+          default: false
+          x-go-type-skip-optional-pointer: false
+        value:
+          $ref: '#/components/schemas/MemoryEvaluationCase'
+        dataset:
+          type: string
+        revision:
+          type: integer
+          minimum: 0
+          maximum: 18446744073709551615
+          format: uint64
+          x-go-type: uint64
+        owner:
+          type: string
+        branch:
+          type: string
+        recorded_at:
+          type: integer
+          minimum: -9223372036854775808
+          maximum: 9223372036854775807
+          format: int64
+          x-go-type: int64
+        fingerprint:
+          type: string
+      required:
+        - value
+        - dataset
+        - revision
+        - owner
+        - branch
+        - recorded_at
+        - fingerprint
+      additionalProperties: false
+    MemoryEvaluationRun:
+      type: object
+      properties:
+        version:
+          type: integer
+          minimum: 0
+          maximum: 255
+          format: uint32
+          default: 1
+          x-go-type-skip-optional-pointer: false
+          x-go-type: uint32
+        id:
+          type: string
+        dataset:
+          type: string
+        dataset_revision:
+          type: integer
+          minimum: 0
+          maximum: 18446744073709551615
+          format: uint64
+          x-go-type: uint64
+        root:
+          type: string
+          nullable: true
+          x-go-type-skip-optional-pointer: false
+        case_count:
+          type: integer
+          minimum: 0
+          maximum: 18446744073709551615
+          format: uint64
+          x-go-type: uint64
+        owner:
+          type: string
+        branch:
+          type: string
+        visibility:
+          type: string
+          enum:
+            - private
+            - team
+        mode:
+          type: string
+          enum:
+            - external
+            - managed
+            - policy
+        knowledge_revision:
+          type: integer
+          minimum: 0
+          maximum: 18446744073709551615
+          format: uint64
+          x-go-type: uint64
+        config_generation:
+          type: integer
+          minimum: 0
+          maximum: 18446744073709551615
+          format: uint64
+          x-go-type: uint64
+        config_fingerprint:
+          type: string
+        source_config_fingerprint:
+          type: string
+        thresholds:
+          type: object
+          properties:
+            enabled:
+              type: boolean
+              default: false
+              x-go-type-skip-optional-pointer: false
+            name_threshold:
+              type: number
+              format: double
+              default: 0.8
+              x-go-type-skip-optional-pointer: false
+            view_threshold:
+              type: number
+              format: double
+              default: 0.85
+              x-go-type-skip-optional-pointer: false
+            neighbors:
+              type: integer
+              minimum: 0
+              maximum: 65535
+              format: uint32
+              default: 32
+              x-go-type-skip-optional-pointer: false
+              x-go-type: uint32
+          additionalProperties: false
+          default: null
+          nullable: true
+        judge:
+          type: object
+          properties:
+            provider:
+              type: string
+            model:
+              type: string
+            revision:
+              type: string
+            dimensions:
+              type: integer
+              minimum: 0
+              maximum: 4294967295
+              format: uint32
+              x-go-type: uint32
+              default: null
+              nullable: true
+              x-go-type-skip-optional-pointer: false
+          required:
+            - provider
+            - model
+            - revision
+          additionalProperties: false
+          nullable: true
+        prompt_revision:
+          type: string
+        fingerprint:
+          type: string
+        phase:
+          type: string
+          enum:
+            - pending
+            - completed
+            - cancelled
+          default: pending
+          x-go-type-skip-optional-pointer: false
+        error_code:
+          type: string
+          default: null
+          nullable: true
+          x-go-type-skip-optional-pointer: false
+        completed:
+          type: integer
+          minimum: 0
+          maximum: 18446744073709551615
+          format: uint64
+          default: 0
+          x-go-type-skip-optional-pointer: false
+          x-go-type: uint64
+        cursor:
+          type: string
+          default: null
+          nullable: true
+          x-go-type-skip-optional-pointer: false
+        counts:
+          type: array
+          items:
+            $ref: '#/components/schemas/MemoryEvaluationCounts'
+          minItems: 4
+          maxItems: 4
+        admission:
+          type: array
+          items:
+            $ref: '#/components/schemas/MemoryEvaluationCounts'
+          minItems: 3
+          maxItems: 3
+        revision:
+          type: integer
+          minimum: 0
+          maximum: 18446744073709551615
+          format: uint64
+          x-go-type: uint64
+        recorded_at:
+          type: integer
+          minimum: -9223372036854775808
+          maximum: 9223372036854775807
+          format: int64
+          x-go-type: int64
+      required:
+        - id
+        - dataset
+        - dataset_revision
+        - root
+        - case_count
+        - owner
+        - branch
+        - visibility
+        - mode
+        - knowledge_revision
+        - config_generation
+        - config_fingerprint
+        - source_config_fingerprint
+        - judge
+        - fingerprint
+        - revision
+        - recorded_at
+      additionalProperties: false
+    MemoryEvaluationCounts:
+      type: object
+      properties:
+        cases:
+          type: integer
+          minimum: 0
+          maximum: 18446744073709551615
+          format: uint64
+          default: 0
+          x-go-type-skip-optional-pointer: false
+          x-go-type: uint64
+        binary_supersession_cases:
+          type: integer
+          minimum: 0
+          maximum: 18446744073709551615
+          format: uint64
+          default: 0
+          x-go-type-skip-optional-pointer: false
+          x-go-type: uint64
+        graded:
+          type: integer
+          minimum: 0
+          maximum: 18446744073709551615
+          format: uint64
+          default: 0
+          x-go-type-skip-optional-pointer: false
+          x-go-type: uint64
+        abstained:
+          type: integer
+          minimum: 0
+          maximum: 18446744073709551615
+          format: uint64
+          default: 0
+          x-go-type-skip-optional-pointer: false
+          x-go-type: uint64
+        invalid_outputs:
+          type: integer
+          minimum: 0
+          maximum: 18446744073709551615
+          format: uint64
+          default: 0
+          x-go-type-skip-optional-pointer: false
+          x-go-type: uint64
+        unavailable:
+          type: integer
+          minimum: 0
+          maximum: 18446744073709551615
+          format: uint64
+          default: 0
+          x-go-type-skip-optional-pointer: false
+          x-go-type: uint64
+        correct:
+          type: integer
+          minimum: 0
+          maximum: 18446744073709551615
+          format: uint64
+          default: 0
+          x-go-type-skip-optional-pointer: false
+          x-go-type: uint64
+        true_positive:
+          type: integer
+          minimum: 0
+          maximum: 18446744073709551615
+          format: uint64
+          default: 0
+          x-go-type-skip-optional-pointer: false
+          x-go-type: uint64
+        false_positive:
+          type: integer
+          minimum: 0
+          maximum: 18446744073709551615
+          format: uint64
+          default: 0
+          x-go-type-skip-optional-pointer: false
+          x-go-type: uint64
+        false_negative:
+          type: integer
+          minimum: 0
+          maximum: 18446744073709551615
+          format: uint64
+          default: 0
+          x-go-type-skip-optional-pointer: false
+          x-go-type: uint64
+        true_negative:
+          type: integer
+          minimum: 0
+          maximum: 18446744073709551615
+          format: uint64
+          default: 0
+          x-go-type-skip-optional-pointer: false
+          x-go-type: uint64
+      additionalProperties: false
+    MemoryEvaluationReport:
+      type: object
+      properties:
+        counts:
+          $ref: '#/components/schemas/MemoryEvaluationCounts'
+        precision:
+          type: number
+          format: double
+          nullable: true
+          x-go-type-skip-optional-pointer: false
+        recall:
+          type: number
+          format: double
+          nullable: true
+          x-go-type-skip-optional-pointer: false
+        f1:
+          type: number
+          format: double
+          nullable: true
+          x-go-type-skip-optional-pointer: false
+        coverage:
+          type: number
+          format: double
+          nullable: true
+          x-go-type-skip-optional-pointer: false
+        accuracy:
+          type: number
+          format: double
+          nullable: true
+          x-go-type-skip-optional-pointer: false
+      required:
+        - counts
+        - precision
+        - recall
+        - f1
+        - coverage
+        - accuracy
+      additionalProperties: false
+    MemoryEvaluationJudgeTask:
+      type: object
+      properties:
+        case_id:
+          type: string
+        case_revision:
+          type: integer
+          minimum: 0
+          maximum: 18446744073709551615
+          format: uint64
+          x-go-type: uint64
+        input_fingerprint:
+          type: string
+        input:
+          $ref: '#/components/schemas/MemoryEvaluationJudgeInput'
+      required:
+        - case_id
+        - case_revision
+        - input_fingerprint
+        - input
+      additionalProperties: false
+    MemoryEvaluationJudgeInput:
+      type: object
+      properties:
+        task:
+          type: string
+          enum:
+            - identity
+            - relationship
+            - supersession
+            - retrieval
+        input: {}
+        prompt_revision:
+          type: string
+      required:
+        - task
+        - input
+      additionalProperties: false
+    MemoryEvaluationPrediction:
+      type: object
+      properties:
+        admitted:
+          type: boolean
+          default: null
+          nullable: true
+          x-go-type-skip-optional-pointer: false
+        label:
+          type: string
+          enum:
+            - same
+            - different
+            - related
+            - unrelated
+            - supersedes
+            - contradicts
+            - restates
+            - independent
+          default: null
+          nullable: true
+          x-go-type-skip-optional-pointer: false
+        ranking:
+          type: array
+          items:
+            type: string
+          default: null
+          nullable: true
+        reason:
+          type: string
+      additionalProperties: false
+    MemoryEvaluationJudgeOutput:
+      type: object
+      properties:
+        label:
+          type: string
+          enum:
+            - same
+            - different
+            - related
+            - unrelated
+            - supersedes
+            - contradicts
+            - restates
+            - independent
+          default: null
+          nullable: true
+          x-go-type-skip-optional-pointer: false
+        ranking:
+          type: array
+          items:
+            type: string
+          default: null
+          nullable: true
+        reason:
+          type: string
+      additionalProperties: false
+    MemoryEvaluationResult:
+      type: object
+      properties:
+        invalid_output:
+          type: boolean
+          default: false
+          x-go-type-skip-optional-pointer: false
+        scrubbed:
+          type: boolean
+          default: false
+          x-go-type-skip-optional-pointer: false
+        run:
+          type: string
+        case_id:
+          type: string
+        case_revision:
+          type: integer
+          minimum: 0
+          maximum: 18446744073709551615
+          format: uint64
+          x-go-type: uint64
+        input_fingerprint:
+          type: string
+        prediction:
+          allOf:
+            - $ref: '#/components/schemas/MemoryEvaluationPrediction'
+          nullable: true
+          default: null
+        unavailable:
+          type: boolean
+          default: false
+          x-go-type-skip-optional-pointer: false
+        principal:
+          type: string
+        actor:
+          type: string
+        model:
+          type: object
+          properties:
+            provider:
+              type: string
+            model:
+              type: string
+            revision:
+              type: string
+            dimensions:
+              type: integer
+              minimum: 0
+              maximum: 4294967295
+              format: uint32
+              x-go-type: uint32
+              default: null
+              nullable: true
+              x-go-type-skip-optional-pointer: false
+          required:
+            - provider
+            - model
+            - revision
+          additionalProperties: false
+          nullable: true
+        revision:
+          type: integer
+          minimum: 0
+          maximum: 18446744073709551615
+          format: uint64
+          x-go-type: uint64
+        recorded_at:
+          type: integer
+          minimum: -9223372036854775808
+          maximum: 9223372036854775807
+          format: int64
+          x-go-type: int64
+      required:
+        - run
+        - case_id
+        - case_revision
+        - input_fingerprint
+        - principal
+        - actor
+        - model
+        - revision
+        - recorded_at
+      additionalProperties: false
+    MemoryEvaluationResultEntry:
+      type: object
+      properties:
+        case:
+          $ref: '#/components/schemas/MemoryEvaluationStoredCase'
+        result:
+          allOf:
+            - $ref: '#/components/schemas/MemoryEvaluationResult'
+          nullable: true
+      required:
+        - case
+        - result
+      additionalProperties: false
+    MemoryEvaluationResultPage:
+      type: object
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/MemoryEvaluationResultEntry'
+        next_cursor:
+          type: string
+          nullable: true
+          x-go-type-skip-optional-pointer: false
+        complete:
+          type: boolean
+        run_fingerprint:
+          type: string
+      required:
+        - items
+        - next_cursor
+        - complete
+        - run_fingerprint
+      additionalProperties: false
+    MemoryEvaluationVerdict:
+      type: object
+      properties:
+        case_id:
+          type: string
+        case_revision:
+          type: integer
+          minimum: 0
+          maximum: 18446744073709551615
+          format: uint64
+          x-go-type: uint64
+        input_fingerprint:
+          type: string
+        prediction:
+          $ref: '#/components/schemas/MemoryEvaluationJudgeOutput'
+        invalid_output:
+          type: boolean
+          default: false
+          x-go-type-skip-optional-pointer: false
+      required:
+        - case_id
+        - case_revision
+        - input_fingerprint
+        - prediction
+      additionalProperties: false
+    MemoryEvaluationPolicyInput:
+      type: object
+      properties:
+        seed:
+          type: string
+        target:
+          type: string
+        entity_candidates:
+          $ref: '#/components/schemas/MemoryEntityCandidateRequest'
+        supersession_candidates:
+          $ref: '#/components/schemas/MemorySupersessionCandidateRequest'
+        recall:
+          $ref: '#/components/schemas/MemoryRecallRequest'
+      additionalProperties: false
+    MemoryEvaluationDatasetRequest:
+      type: object
+      properties:
+        id:
+          type: string
+        expected_revision:
+          type: integer
+          minimum: 0
+          maximum: 18446744073709551615
+          format: uint64
+          x-go-type: uint64
+        cases:
+          type: array
+          items:
+            $ref: '#/components/schemas/MemoryEvaluationCase'
+        remove:
+          type: array
+          items:
+            type: string
+        visibility:
+          type: string
+          enum:
+            - private
+            - team
+          default: private
+          x-go-type-skip-optional-pointer: false
+      required:
+        - id
+        - expected_revision
+      additionalProperties: false
+    MemoryEvaluationDataset:
+      type: object
+      properties:
+        id:
+          type: string
+        root:
+          type: string
+          default: null
+          nullable: true
+          x-go-type-skip-optional-pointer: false
+        revision:
+          type: integer
+          minimum: 0
+          maximum: 18446744073709551615
+          format: uint64
+          x-go-type: uint64
+        owner:
+          type: string
+        branch:
+          type: string
+        visibility:
+          type: string
+          enum:
+            - private
+            - team
+          default: private
+          x-go-type-skip-optional-pointer: false
+        cases:
+          type: integer
+          minimum: 0
+          maximum: 18446744073709551615
+          format: uint64
+          default: 0
+          x-go-type-skip-optional-pointer: false
+          x-go-type: uint64
+        recorded_at:
+          type: integer
+          minimum: -9223372036854775808
+          maximum: 9223372036854775807
+          format: int64
+          x-go-type: int64
+      required:
+        - id
+        - revision
+        - owner
+        - branch
+        - recorded_at
+      additionalProperties: false
+    MemoryEvaluationCasePage:
+      type: object
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/MemoryEvaluationStoredCase'
+        next_cursor:
+          type: string
+          nullable: true
+          x-go-type-skip-optional-pointer: false
+        complete:
+          type: boolean
+        revision:
+          type: integer
+          minimum: 0
+          maximum: 18446744073709551615
+          format: uint64
+          x-go-type: uint64
+      required:
+        - items
+        - next_cursor
+        - complete
+        - revision
+      additionalProperties: false
+    MemoryEvaluationStart:
+      type: object
+      properties:
+        id:
+          type: string
+        dataset:
+          type: string
+        dataset_revision:
+          type: integer
+          minimum: 0
+          maximum: 18446744073709551615
+          format: uint64
+          x-go-type: uint64
+          default: null
+          nullable: true
+          x-go-type-skip-optional-pointer: false
+        expected_revision:
+          type: integer
+          minimum: 0
+          maximum: 18446744073709551615
+          format: uint64
+          x-go-type: uint64
+        mode:
+          type: string
+          enum:
+            - external
+            - managed
+            - policy
+          default: external
+          x-go-type-skip-optional-pointer: false
+        judge:
+          type: object
+          properties:
+            provider:
+              type: string
+            model:
+              type: string
+            revision:
+              type: string
+            dimensions:
+              type: integer
+              minimum: 0
+              maximum: 4294967295
+              format: uint32
+              x-go-type: uint32
+              default: null
+              nullable: true
+              x-go-type-skip-optional-pointer: false
+          required:
+            - provider
+            - model
+            - revision
+          additionalProperties: false
+          default: null
+          nullable: true
+        thresholds:
+          type: object
+          properties:
+            enabled:
+              type: boolean
+              default: false
+              x-go-type-skip-optional-pointer: false
+            name_threshold:
+              type: number
+              format: double
+              default: 0.8
+              x-go-type-skip-optional-pointer: false
+            view_threshold:
+              type: number
+              format: double
+              default: 0.85
+              x-go-type-skip-optional-pointer: false
+            neighbors:
+              type: integer
+              minimum: 0
+              maximum: 65535
+              format: uint32
+              default: 32
+              x-go-type-skip-optional-pointer: false
+              x-go-type: uint32
+          additionalProperties: false
+          default: null
+          nullable: true
+      required:
+        - id
+        - dataset
+        - expected_revision
+      additionalProperties: false
+    MemoryEvaluationStatus:
+      type: object
+      properties:
+        run:
+          $ref: '#/components/schemas/MemoryEvaluationRun'
+        identity:
+          $ref: '#/components/schemas/MemoryEvaluationReport'
+        relationship:
+          $ref: '#/components/schemas/MemoryEvaluationReport'
+        supersession:
+          $ref: '#/components/schemas/MemoryEvaluationReport'
+        retrieval:
+          $ref: '#/components/schemas/MemoryEvaluationReport'
+        identity_admission:
+          $ref: '#/components/schemas/MemoryEvaluationReport'
+        relationship_admission:
+          $ref: '#/components/schemas/MemoryEvaluationReport'
+        supersession_admission:
+          $ref: '#/components/schemas/MemoryEvaluationReport'
+      required:
+        - run
+        - identity
+        - relationship
+        - supersession
+        - retrieval
+        - identity_admission
+        - relationship_admission
+        - supersession_admission
+      additionalProperties: false
+    MemoryEvaluationTaskPage:
+      type: object
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/MemoryEvaluationJudgeTask'
+        next_cursor:
+          type: string
+          nullable: true
+          x-go-type-skip-optional-pointer: false
+        complete:
+          type: boolean
+        run_fingerprint:
+          type: string
+      required:
+        - items
+        - next_cursor
+        - complete
+        - run_fingerprint
+      additionalProperties: false
+    MemoryEvaluationSubmit:
+      type: object
+      properties:
+        expected_revision:
+          type: integer
+          minimum: 0
+          maximum: 18446744073709551615
+          format: uint64
+          x-go-type: uint64
+        verdicts:
+          type: array
+          items:
+            $ref: '#/components/schemas/MemoryEvaluationVerdict'
+        actor:
+          type: string
+        model:
+          type: object
+          properties:
+            provider:
+              type: string
+            model:
+              type: string
+            revision:
+              type: string
+            dimensions:
+              type: integer
+              minimum: 0
+              maximum: 4294967295
+              format: uint32
+              x-go-type: uint32
+              default: null
+              nullable: true
+              x-go-type-skip-optional-pointer: false
+          required:
+            - provider
+            - model
+            - revision
+          additionalProperties: false
+          default: null
+          nullable: true
+      required:
+        - expected_revision
+        - verdicts
+      additionalProperties: false
+    MemoryLineageHead:
+      type: object
+      properties:
+        id:
+          type: string
+        root:
+          type: string
+          default: null
+          nullable: true
+          x-go-type-skip-optional-pointer: false
+        revision:
+          type: integer
+          minimum: 0
+          maximum: 18446744073709551615
+          format: uint64
+          x-go-type: uint64
+        owner:
+          type: string
+        visibility:
+          type: string
+          enum:
+            - private
+            - team
+          default: private
+          x-go-type-skip-optional-pointer: false
+        created_at:
+          type: integer
+          minimum: -9223372036854775808
+          maximum: 9223372036854775807
+          format: int64
+          x-go-type: int64
+        parent:
+          type: string
+          default: null
+          nullable: true
+          x-go-type-skip-optional-pointer: false
+        inherited_revision:
+          type: integer
+          minimum: 0
+          maximum: 18446744073709551615
+          format: uint64
+          x-go-type: uint64
+          default: null
+          nullable: true
+          x-go-type-skip-optional-pointer: false
+        complete:
+          type: boolean
+          default: true
+          x-go-type-skip-optional-pointer: false
+        cursor:
+          type: string
+          default: null
+          nullable: true
+          x-go-type-skip-optional-pointer: false
+        migration_lane:
+          type: integer
+          minimum: 0
+          maximum: 255
+          format: uint32
+          default: 0
+          x-go-type-skip-optional-pointer: false
+          x-go-type: uint32
+      required:
+        - id
+        - revision
+        - owner
+        - created_at
+      additionalProperties: false
+    MemoryLineageFork:
+      type: object
+      properties:
+        id:
+          type: string
+        from:
+          type: string
+        checkpoint:
+          type: string
+          default: null
+          nullable: true
+          x-go-type-skip-optional-pointer: false
+        expected_revision:
+          type: integer
+          minimum: 0
+          maximum: 18446744073709551615
+          format: uint64
+          x-go-type: uint64
+        visibility:
+          type: string
+          enum:
+            - private
+            - team
+          default: private
+          x-go-type-skip-optional-pointer: false
+      required:
+        - id
+        - expected_revision
+      additionalProperties: false
+    MemoryLineageCheckpointRequest:
+      type: object
+      properties:
+        id:
+          type: string
+        expected_revision:
+          type: integer
+          minimum: 0
+          maximum: 18446744073709551615
+          format: uint64
+          x-go-type: uint64
+      required:
+        - id
+        - expected_revision
+      additionalProperties: false
+    MemoryLineageRevert:
+      type: object
+      properties:
+        checkpoint:
+          type: string
+        expected_revision:
+          type: integer
+          minimum: 0
+          maximum: 18446744073709551615
+          format: uint64
+          x-go-type: uint64
+      required:
+        - checkpoint
+        - expected_revision
+      additionalProperties: false
+    MemoryChangeRequest:
+      type: object
+      properties:
+        cursor:
+          type: string
+          default: null
+          nullable: true
+          x-go-type-skip-optional-pointer: false
+        start:
+          type: string
+          enum:
+            - beginning
+            - latest
+          default: latest
+          x-go-type-skip-optional-pointer: false
+        limit:
+          type: integer
+          minimum: 0
+          maximum: 65535
+          format: uint32
+          default: 64
+          x-go-type-skip-optional-pointer: false
+          x-go-type: uint32
+      additionalProperties: false
+    MemoryChangePage:
+      type: object
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/MemorySpaceChange'
+        next_cursor:
+          type: string
+        caught_up:
+          type: boolean
+        revision:
+          type: integer
+          minimum: 0
+          maximum: 18446744073709551615
+          format: uint64
+          x-go-type: uint64
+        retained_from:
+          type: string
+        retained_after:
+          type: integer
+          minimum: -9223372036854775808
+          maximum: 9223372036854775807
+          format: int64
+          x-go-type: int64
+      required:
+        - items
+        - next_cursor
+        - caught_up
+        - revision
+        - retained_from
+        - retained_after
+      additionalProperties: false
     MemorySpaceConfig:
       type: object
       properties:
@@ -50918,6 +54981,10 @@ components:
         features:
           type: object
           properties:
+            lineage:
+              type: boolean
+              default: false
+              x-go-type-skip-optional-pointer: false
             semantic_recall:
               type: boolean
               default: false
@@ -50943,6 +55010,8 @@ components:
               default: explicit
               x-go-type-skip-optional-pointer: false
           additionalProperties: false
+        intake_screening:
+          $ref: '#/components/schemas/MemoryIntakeScreening'
         models:
           type: object
           properties:
@@ -51176,6 +55245,14 @@ components:
           default: null
           nullable: true
           x-go-type-skip-optional-pointer: false
+        change_retention_ms:
+          type: integer
+          minimum: 0
+          maximum: 18446744073709551615
+          format: uint64
+          default: 604800000
+          x-go-type-skip-optional-pointer: false
+          x-go-type: uint64
       additionalProperties: false
     MemoryConfigureRequest:
       type: object
@@ -52244,6 +56321,15 @@ components:
     MemoryOperation:
       type: object
       properties:
+        evaluation_id:
+          type: string
+          default: null
+          nullable: true
+          x-go-type-skip-optional-pointer: false
+        branch:
+          type: string
+        intake_screening:
+          $ref: '#/components/schemas/MemoryIntakeScreeningReport'
         proposal_id:
           type: string
           default: null
@@ -54025,6 +58111,88 @@ components:
               evidence:
                 type: object
                 properties:
+                  materialization:
+                    type: object
+                    properties:
+                      screening:
+                        type: object
+                        properties:
+                          policy_version:
+                            type: integer
+                            minimum: 0
+                            maximum: 65535
+                            format: uint32
+                            default: 1
+                            x-go-type-skip-optional-pointer: false
+                            x-go-type: uint32
+                          redactions:
+                            type: integer
+                            minimum: 0
+                            maximum: 4294967295
+                            format: uint32
+                            default: 0
+                            x-go-type-skip-optional-pointer: false
+                            x-go-type: uint32
+                          known_tokens:
+                            type: integer
+                            minimum: 0
+                            maximum: 4294967295
+                            format: uint32
+                            default: 0
+                            x-go-type-skip-optional-pointer: false
+                            x-go-type: uint32
+                          private_keys:
+                            type: integer
+                            minimum: 0
+                            maximum: 4294967295
+                            format: uint32
+                            default: 0
+                            x-go-type-skip-optional-pointer: false
+                            x-go-type: uint32
+                          credential_assignments:
+                            type: integer
+                            minimum: 0
+                            maximum: 4294967295
+                            format: uint32
+                            default: 0
+                            x-go-type-skip-optional-pointer: false
+                            x-go-type: uint32
+                          credential_urls:
+                            type: integer
+                            minimum: 0
+                            maximum: 4294967295
+                            format: uint32
+                            default: 0
+                            x-go-type-skip-optional-pointer: false
+                            x-go-type: uint32
+                          sensitive_fields:
+                            type: integer
+                            minimum: 0
+                            maximum: 4294967295
+                            format: uint32
+                            default: 0
+                            x-go-type-skip-optional-pointer: false
+                            x-go-type: uint32
+                          custom:
+                            type: integer
+                            minimum: 0
+                            maximum: 4294967295
+                            format: uint32
+                            default: 0
+                            x-go-type-skip-optional-pointer: false
+                            x-go-type: uint32
+                        additionalProperties: false
+                      text_redacted:
+                        type: boolean
+                      text_sha256:
+                        type: string
+                    required:
+                      - screening
+                      - text_redacted
+                      - text_sha256
+                    additionalProperties: false
+                    default: null
+                    nullable: true
                   context_only:
                     type: boolean
                     default: false
@@ -54267,6 +58435,88 @@ components:
                     evidence:
                       type: object
                       properties:
+                        materialization:
+                          type: object
+                          properties:
+                            screening:
+                              type: object
+                              properties:
+                                policy_version:
+                                  type: integer
+                                  minimum: 0
+                                  maximum: 65535
+                                  format: uint32
+                                  default: 1
+                                  x-go-type-skip-optional-pointer: false
+                                  x-go-type: uint32
+                                redactions:
+                                  type: integer
+                                  minimum: 0
+                                  maximum: 4294967295
+                                  format: uint32
+                                  default: 0
+                                  x-go-type-skip-optional-pointer: false
+                                  x-go-type: uint32
+                                known_tokens:
+                                  type: integer
+                                  minimum: 0
+                                  maximum: 4294967295
+                                  format: uint32
+                                  default: 0
+                                  x-go-type-skip-optional-pointer: false
+                                  x-go-type: uint32
+                                private_keys:
+                                  type: integer
+                                  minimum: 0
+                                  maximum: 4294967295
+                                  format: uint32
+                                  default: 0
+                                  x-go-type-skip-optional-pointer: false
+                                  x-go-type: uint32
+                                credential_assignments:
+                                  type: integer
+                                  minimum: 0
+                                  maximum: 4294967295
+                                  format: uint32
+                                  default: 0
+                                  x-go-type-skip-optional-pointer: false
+                                  x-go-type: uint32
+                                credential_urls:
+                                  type: integer
+                                  minimum: 0
+                                  maximum: 4294967295
+                                  format: uint32
+                                  default: 0
+                                  x-go-type-skip-optional-pointer: false
+                                  x-go-type: uint32
+                                sensitive_fields:
+                                  type: integer
+                                  minimum: 0
+                                  maximum: 4294967295
+                                  format: uint32
+                                  default: 0
+                                  x-go-type-skip-optional-pointer: false
+                                  x-go-type: uint32
+                                custom:
+                                  type: integer
+                                  minimum: 0
+                                  maximum: 4294967295
+                                  format: uint32
+                                  default: 0
+                                  x-go-type-skip-optional-pointer: false
+                                  x-go-type: uint32
+                              additionalProperties: false
+                            text_redacted:
+                              type: boolean
+                            text_sha256:
+                              type: string
+                          required:
+                            - screening
+                            - text_redacted
+                            - text_sha256
+                          additionalProperties: false
+                          default: null
+                          nullable: true
                         context_only:
                           type: boolean
                           default: false
@@ -56057,6 +60307,88 @@ components:
                     evidence:
                       type: object
                       properties:
+                        materialization:
+                          type: object
+                          properties:
+                            screening:
+                              type: object
+                              properties:
+                                policy_version:
+                                  type: integer
+                                  minimum: 0
+                                  maximum: 65535
+                                  format: uint32
+                                  default: 1
+                                  x-go-type-skip-optional-pointer: false
+                                  x-go-type: uint32
+                                redactions:
+                                  type: integer
+                                  minimum: 0
+                                  maximum: 4294967295
+                                  format: uint32
+                                  default: 0
+                                  x-go-type-skip-optional-pointer: false
+                                  x-go-type: uint32
+                                known_tokens:
+                                  type: integer
+                                  minimum: 0
+                                  maximum: 4294967295
+                                  format: uint32
+                                  default: 0
+                                  x-go-type-skip-optional-pointer: false
+                                  x-go-type: uint32
+                                private_keys:
+                                  type: integer
+                                  minimum: 0
+                                  maximum: 4294967295
+                                  format: uint32
+                                  default: 0
+                                  x-go-type-skip-optional-pointer: false
+                                  x-go-type: uint32
+                                credential_assignments:
+                                  type: integer
+                                  minimum: 0
+                                  maximum: 4294967295
+                                  format: uint32
+                                  default: 0
+                                  x-go-type-skip-optional-pointer: false
+                                  x-go-type: uint32
+                                credential_urls:
+                                  type: integer
+                                  minimum: 0
+                                  maximum: 4294967295
+                                  format: uint32
+                                  default: 0
+                                  x-go-type-skip-optional-pointer: false
+                                  x-go-type: uint32
+                                sensitive_fields:
+                                  type: integer
+                                  minimum: 0
+                                  maximum: 4294967295
+                                  format: uint32
+                                  default: 0
+                                  x-go-type-skip-optional-pointer: false
+                                  x-go-type: uint32
+                                custom:
+                                  type: integer
+                                  minimum: 0
+                                  maximum: 4294967295
+                                  format: uint32
+                                  default: 0
+                                  x-go-type-skip-optional-pointer: false
+                                  x-go-type: uint32
+                              additionalProperties: false
+                            text_redacted:
+                              type: boolean
+                            text_sha256:
+                              type: string
+                          required:
+                            - screening
+                            - text_redacted
+                            - text_sha256
+                          additionalProperties: false
+                          default: null
+                          nullable: true
                         context_only:
                           type: boolean
                           default: false
@@ -56965,6 +61297,10 @@ components:
                 features:
                   type: object
                   properties:
+                    lineage:
+                      type: boolean
+                      default: false
+                      x-go-type-skip-optional-pointer: false
                     semantic_recall:
                       type: boolean
                       default: false
@@ -56989,6 +61325,66 @@ components:
                         - model
                       default: explicit
                       x-go-type-skip-optional-pointer: false
+                  additionalProperties: false
+                intake_screening:
+                  type: object
+                  properties:
+                    version:
+                      type: integer
+                      minimum: 0
+                      maximum: 65535
+                      format: uint32
+                      default: 1
+                      x-go-type-skip-optional-pointer: false
+                      x-go-type: uint32
+                    mode:
+                      type: string
+                      enum:
+                        - reject
+                        - redact
+                      default: reject
+                      x-go-type-skip-optional-pointer: false
+                    custom_rules:
+                      type: array
+                      items:
+                        type: object
+                        properties:
+                          id:
+                            type: string
+                          prefix:
+                            type: string
+                          min_length:
+                            type: integer
+                            minimum: 0
+                            maximum: 65535
+                            format: uint32
+                            x-go-type: uint32
+                          max_length:
+                            type: integer
+                            minimum: 0
+                            maximum: 65535
+                            format: uint32
+                            default: 4096
+                            x-go-type-skip-optional-pointer: false
+                            x-go-type: uint32
+                          alphabet:
+                            type: string
+                            enum:
+                              - alphanumeric
+                              - base64url
+                              - hex
+                              - non_separator
+                            default: base64url
+                            x-go-type-skip-optional-pointer: false
+                        required:
+                          - id
+                          - prefix
+                          - min_length
+                        additionalProperties: false
+                    allow_fingerprints:
+                      type: array
+                      items:
+                        type: string
                   additionalProperties: false
                 models:
                   type: object
@@ -57223,6 +61619,14 @@ components:
                   default: null
                   nullable: true
                   x-go-type-skip-optional-pointer: false
+                change_retention_ms:
+                  type: integer
+                  minimum: 0
+                  maximum: 18446744073709551615
+                  format: uint64
+                  default: 604800000
+                  x-go-type-skip-optional-pointer: false
+                  x-go-type: uint64
               additionalProperties: false
             pending_config:
               type: object
@@ -57266,6 +61670,10 @@ components:
                 features:
                   type: object
                   properties:
+                    lineage:
+                      type: boolean
+                      default: false
+                      x-go-type-skip-optional-pointer: false
                     semantic_recall:
                       type: boolean
                       default: false
@@ -57290,6 +61698,66 @@ components:
                         - model
                       default: explicit
                       x-go-type-skip-optional-pointer: false
+                  additionalProperties: false
+                intake_screening:
+                  type: object
+                  properties:
+                    version:
+                      type: integer
+                      minimum: 0
+                      maximum: 65535
+                      format: uint32
+                      default: 1
+                      x-go-type-skip-optional-pointer: false
+                      x-go-type: uint32
+                    mode:
+                      type: string
+                      enum:
+                        - reject
+                        - redact
+                      default: reject
+                      x-go-type-skip-optional-pointer: false
+                    custom_rules:
+                      type: array
+                      items:
+                        type: object
+                        properties:
+                          id:
+                            type: string
+                          prefix:
+                            type: string
+                          min_length:
+                            type: integer
+                            minimum: 0
+                            maximum: 65535
+                            format: uint32
+                            x-go-type: uint32
+                          max_length:
+                            type: integer
+                            minimum: 0
+                            maximum: 65535
+                            format: uint32
+                            default: 4096
+                            x-go-type-skip-optional-pointer: false
+                            x-go-type: uint32
+                          alphabet:
+                            type: string
+                            enum:
+                              - alphanumeric
+                              - base64url
+                              - hex
+                              - non_separator
+                            default: base64url
+                            x-go-type-skip-optional-pointer: false
+                        required:
+                          - id
+                          - prefix
+                          - min_length
+                        additionalProperties: false
+                    allow_fingerprints:
+                      type: array
+                      items:
+                        type: string
                   additionalProperties: false
                 models:
                   type: object
@@ -57524,6 +61992,14 @@ components:
                   default: null
                   nullable: true
                   x-go-type-skip-optional-pointer: false
+                change_retention_ms:
+                  type: integer
+                  minimum: 0
+                  maximum: 18446744073709551615
+                  format: uint64
+                  default: 604800000
+                  x-go-type-skip-optional-pointer: false
+                  x-go-type: uint64
               additionalProperties: false
               nullable: true
             revision:

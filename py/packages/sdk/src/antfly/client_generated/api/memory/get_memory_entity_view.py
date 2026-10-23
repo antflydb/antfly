@@ -19,6 +19,7 @@ def _get_kwargs(
     body: MemoryEntityViewRequest,
     x_antfly_database: str | Unset = "default",
     x_antfly_namespace: str | Unset = "public",
+    x_antfly_memory_branch: str | Unset = "",
 ) -> dict[str, Any]:
     headers: dict[str, Any] = {}
     if not isinstance(x_antfly_database, Unset):
@@ -26,6 +27,9 @@ def _get_kwargs(
 
     if not isinstance(x_antfly_namespace, Unset):
         headers["X-Antfly-Namespace"] = x_antfly_namespace
+
+    if not isinstance(x_antfly_memory_branch, Unset):
+        headers["X-Antfly-Memory-Branch"] = x_antfly_memory_branch
 
     _kwargs: dict[str, Any] = {
         "method": "post",
@@ -121,6 +125,7 @@ def sync_detailed(
     body: MemoryEntityViewRequest,
     x_antfly_database: str | Unset = "default",
     x_antfly_namespace: str | Unset = "public",
+    x_antfly_memory_branch: str | Unset = "",
 ) -> Response[MemoryEntityView | MemoryError_]:
     """
     Args:
@@ -128,6 +133,7 @@ def sync_detailed(
         id (str):
         x_antfly_database (str | Unset):  Default: 'default'.
         x_antfly_namespace (str | Unset):  Default: 'public'.
+        x_antfly_memory_branch (str | Unset):  Default: ''.
         body (MemoryEntityViewRequest):
 
     Raises:
@@ -144,6 +150,7 @@ def sync_detailed(
         body=body,
         x_antfly_database=x_antfly_database,
         x_antfly_namespace=x_antfly_namespace,
+        x_antfly_memory_branch=x_antfly_memory_branch,
     )
 
     response = client.get_httpx_client().request(
@@ -161,6 +168,7 @@ def sync(
     body: MemoryEntityViewRequest,
     x_antfly_database: str | Unset = "default",
     x_antfly_namespace: str | Unset = "public",
+    x_antfly_memory_branch: str | Unset = "",
 ) -> MemoryEntityView | MemoryError_ | None:
     """
     Args:
@@ -168,6 +176,7 @@ def sync(
         id (str):
         x_antfly_database (str | Unset):  Default: 'default'.
         x_antfly_namespace (str | Unset):  Default: 'public'.
+        x_antfly_memory_branch (str | Unset):  Default: ''.
         body (MemoryEntityViewRequest):
 
     Raises:
@@ -185,6 +194,7 @@ def sync(
         body=body,
         x_antfly_database=x_antfly_database,
         x_antfly_namespace=x_antfly_namespace,
+        x_antfly_memory_branch=x_antfly_memory_branch,
     ).parsed
 
 
@@ -196,6 +206,7 @@ async def asyncio_detailed(
     body: MemoryEntityViewRequest,
     x_antfly_database: str | Unset = "default",
     x_antfly_namespace: str | Unset = "public",
+    x_antfly_memory_branch: str | Unset = "",
 ) -> Response[MemoryEntityView | MemoryError_]:
     """
     Args:
@@ -203,6 +214,7 @@ async def asyncio_detailed(
         id (str):
         x_antfly_database (str | Unset):  Default: 'default'.
         x_antfly_namespace (str | Unset):  Default: 'public'.
+        x_antfly_memory_branch (str | Unset):  Default: ''.
         body (MemoryEntityViewRequest):
 
     Raises:
@@ -219,6 +231,7 @@ async def asyncio_detailed(
         body=body,
         x_antfly_database=x_antfly_database,
         x_antfly_namespace=x_antfly_namespace,
+        x_antfly_memory_branch=x_antfly_memory_branch,
     )
 
     response = await client.get_async_httpx_client().request(**kwargs)
@@ -234,6 +247,7 @@ async def asyncio(
     body: MemoryEntityViewRequest,
     x_antfly_database: str | Unset = "default",
     x_antfly_namespace: str | Unset = "public",
+    x_antfly_memory_branch: str | Unset = "",
 ) -> MemoryEntityView | MemoryError_ | None:
     """
     Args:
@@ -241,6 +255,7 @@ async def asyncio(
         id (str):
         x_antfly_database (str | Unset):  Default: 'default'.
         x_antfly_namespace (str | Unset):  Default: 'public'.
+        x_antfly_memory_branch (str | Unset):  Default: ''.
         body (MemoryEntityViewRequest):
 
     Raises:
@@ -259,5 +274,6 @@ async def asyncio(
             body=body,
             x_antfly_database=x_antfly_database,
             x_antfly_namespace=x_antfly_namespace,
+            x_antfly_memory_branch=x_antfly_memory_branch,
         )
     ).parsed

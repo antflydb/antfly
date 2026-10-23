@@ -17,6 +17,7 @@
 //! owning Antfly database. Every mutation fences the space control row and
 //! atomically commits records, revision history, operation receipt and work.
 const std = @import("std");
+const screening = @import("secret_screening.zig");
 pub const types = @import("types.zig");
 pub const generation_policy = @import("generation.zig");
 pub const operations = @import("operations.zig");
@@ -103,6 +104,8 @@ pub const RecallSearchRequest = struct {
 };
 pub const RecallSearchPage = struct { keys: []const []const u8, more: bool };
 pub const Backend = struct {
+    evaluate: ?*const fn (*anyopaque, A, t.Config, t.Model, t.evaluation.JudgeInput, InferenceBoundary) anyerror!t.evaluation.JudgeOutput = null,
+    random_bytes: ?*const fn (*anyopaque, []u8) anyerror!void = null,
     ptr: *anyopaque,
     get: *const fn (*anyopaque, A, []const u8) anyerror!?Row,
     // Bounded data-only hydration; never used for control CAS tokens.
@@ -125,6 +128,7 @@ pub const Backend = struct {
     validate_models: ?*const fn (*anyopaque, t.Config) anyerror!void = null,
 };
 pub const Context = struct {
+    branch: []const u8 = "",
     table_id: u64 = 0,
     database: []const u8 = "default",
     namespace: []const u8 = "public",
@@ -175,6 +179,12 @@ pub const mutates = operations.mutates;
 pub fn isProcessingTimeout(err: anyerror) bool {
     return err == error.Timeout or err == error.DeadlineExceeded;
 }
+/// Transport admission uses this before provisioning a catalogue resource.
+/// Raw credentials cannot become permanent space/branch/resource identifiers.
+pub fn screenIdentity(a: A, value: []const u8) !void {
+    _ = try screening.text(a, value, .{}, true);
+}
+
 pub const Service = struct {
     backend: Backend,
     context: Context,
@@ -199,6 +209,7 @@ pub const Service = struct {
         var arena = std.heap.ArenaAllocator.init(alloc);
         defer arena.deinit();
         const a = arena.allocator();
+        if (action == .create) try screenIdentity(a, self.context.space);
         var run: Run = .{ .service = self, .a = a, .explanation_snapshot_scratch = .init(a), .lexical_allocator = alloc, .processing_failure = execution.processing_failure, .defer_timeouts = execution.defer_timeouts };
         defer run.explanation_snapshot_scratch.deinit();
         defer if (run.lexical_query) |*query| query.deinit();
@@ -216,23 +227,30 @@ pub const Service = struct {
             if (run.state.table_id != 0 and self.context.table_id != 0 and run.state.table_id != self.context.table_id) return error.MemorySpaceBindingChanged;
             if (run.state.space.len > 0 and self.context.space.len > 0 and (!eql(u8, run.state.space, self.context.space) or !eql(u8, run.state.database, self.context.database) or !eql(u8, run.state.namespace, self.context.namespace))) return error.MemorySpaceBindingChanged;
         }
-        const fingerprint = try hash(a, .{ .action = action, .id = id, .body = body, .principal = self.context.principal });
-        const receipt_key = if (idempotency_key.len > 0) try key(a, "operation", try hash(a, .{ self.context.principal, idempotency_key })) else "";
-        const required_grant = if (mutates(action)) try run.requiredGrant(action, id, body) else if (actionGrant(action) == .curator) t.RequiredGrant.curator else null;
+        try run.prepareLineage(action, id);
+        var fingerprint: []const u8 = "";
+        var hash_version: u8 = 0;
+        const receipt_identity = if (run.service.context.branch.len == 0) try hash(a, .{ self.context.principal, idempotency_key }) else try hash(a, .{ self.context.principal, run.service.context.branch, idempotency_key });
+        const receipt_key = if (idempotency_key.len > 0) try key(a, "operation", receipt_identity) else "";
+        const required_grant = if (mutates(action)) try run.requiredGrant(action, id, body) else if (actionGrant(action) == .curator) t.RequiredGrant.curator else if (actionGrant(action) == .admin) t.RequiredGrant.admin else null;
         if (required_grant) |grant| try self.context.requireGrant(grant);
         if (mutates(action)) {
             if (idempotency_key.len == 0 or idempotency_key.len > 256) return error.MemoryIdempotencyKeyRequired;
             if (try run.read(t.Operation, receipt_key)) |receipt| {
+                fingerprint = try inputFingerprint(a, .{ .action = action, .id = id, .body = body, .principal = self.context.principal }, run.state.input_digest_key, receipt.request_hash_version);
                 if (!eql(u8, receipt.request_hash, fingerprint)) return error.MemoryIdempotencyConflict;
                 try self.context.requireGrant(operationGrant(receipt));
                 try self.context.finish();
                 return try std.json.Stringify.valueAlloc(alloc, publicOperation(receipt), .{});
             }
+            _ = try screening.text(a, idempotency_key, run.state.config.intake_screening, true);
+            _ = try screening.text(a, id, run.state.config.intake_screening, true);
+            _ = try screening.text(a, run.service.context.branch, run.state.config.intake_screening, true);
             if (execution.expected_revision) |revision| if (run.state.revision != revision) return error.MemoryRevisionConflict;
             if (run.state.pending_config != null and action != .advance and action != .forget and action != .stage_embeddings) return error.MemoryConfigurationTransition;
             if (action == .create) {
                 if (state_row != null) return error.MemorySpaceExists;
-                try self.validate(run.state.config);
+                try self.validate(a, run.state.config, run.state.input_digest_key.len == 64);
             }
             if (run.state.revision == std.math.maxInt(u64)) return error.MemoryCorruptState;
             run.state.revision += 1;
@@ -240,13 +258,36 @@ pub const Service = struct {
         // A current ingestion budget cannot invalidate a committed receipt or
         // prevent the control operations needed to recover/configure a space.
         if (operations.usesInputBudget(action) and body.len > run.state.config.max_input_bytes) return error.MemoryInputTooLarge;
+        if (mutates(action)) {
+            if (run.state.input_digest_key.len == 0) {
+                if (self.backend.random_bytes) |random| {
+                    var secret: [32]u8 = undefined;
+                    try random(self.backend.ptr, &secret);
+                    run.state.input_digest_key = try a.dupe(u8, &std.fmt.bytesToHex(secret, .lower));
+                } else if (run.state.config.intake_screening.mode == .redact) return error.MemoryCapabilityUnavailable;
+            }
+            if (run.state.input_digest_key.len != 0 and run.state.input_digest_key.len != 64) return error.MemoryCorruptState;
+            hash_version = if (run.state.input_digest_key.len == 64) 1 else 0;
+            fingerprint = try inputFingerprint(a, .{ .action = action, .id = id, .body = body, .principal = self.context.principal }, run.state.input_digest_key, hash_version);
+        }
+        var admitted_body = body;
+        var intake_report: screening.Report = .{};
+        if (screenedAction(action)) {
+            const admitted = try screenBody(a, action, body, run.state.config.intake_screening);
+            admitted_body = admitted.value;
+            intake_report = admitted.report;
+        }
+        run.intake_report = intake_report;
         var op: t.Operation = .{
             .required_grant = required_grant,
             .execution_principal = self.context.execution_principal,
             .execution_signature = self.context.execution_signature,
-            .id = if (receipt_key.len > 0) try hash(a, .{ self.context.principal, idempotency_key }) else "",
+            .id = if (receipt_key.len > 0) receipt_identity else "",
+            .branch = run.service.context.branch,
             .action = @tagName(action),
             .request_hash = fingerprint,
+            .request_hash_version = hash_version,
+            .intake_screening = intake_report,
             .owner = self.context.principal,
             .revision = run.state.revision,
             .config_generation = run.state.config.generation,
@@ -254,12 +295,30 @@ pub const Service = struct {
         };
         var output: ?[]const u8 = null;
         switch (action) {
+            .put_evaluation_dataset => try run.putEvaluationDataset(try parse(t.evaluation.DatasetRequest, a, admitted_body)),
+            .evaluation_dataset => output = try run.encode(try run.evaluationDataset(id)),
+            .evaluation_cases => output = try run.evaluationCases(id, try parse(operations.Page, a, admitted_body)),
+            .start_evaluation => try run.startEvaluation(try parse(t.evaluation.Start, a, admitted_body), &op),
+            .evaluation_run => output = try run.evaluationStatus(id),
+            .evaluation_results => output = try run.evaluationResults(id, try parse(operations.EvaluationResultRequest, a, admitted_body)),
+            .evaluation_tasks => output = try run.evaluationTasks(id, try parse(operations.Page, a, admitted_body)),
+            .evaluation_verdict => try run.evaluationVerdict(id, try parse(t.evaluation.Submit, a, admitted_body), &op),
+            .lineage => output = try run.encode(run.lineage_head orelse return error.MemoryCapabilityUnavailable),
+            .fork_lineage => try run.forkLineage(try parse(t.LineageFork, a, admitted_body)),
+            .checkpoint_lineage => try run.checkpointLineage(try parse(t.LineageCheckpointRequest, a, admitted_body)),
+            .revert_lineage => try run.revertLineage(try parse(t.LineageRevert, a, admitted_body)),
+            .supersession_candidates => output = try run.supersessionCandidates(id, try parse(t.SupersessionCandidateRequest, a, admitted_body)),
+            .propose_supersession => try run.proposeSupersession(try parse(t.SupersessionProposalRequest, a, admitted_body), &op),
+            .supersession_proposals => output = try run.supersessionProposals(try parse(operations.Page, a, admitted_body)),
+            .supersession_proposal => output = try run.encode(try run.supersessionProposalDetail(id)),
+            .review_supersession => try run.reviewSupersession(id, try parse(t.SupersessionVerdict, a, admitted_body), &op),
+            .changes => output = try run.spaceChanges(try parse(t.ChangeRequest, a, admitted_body)),
             .create => {
                 try run.put(try configKey(a, run.state.config.generation), run.state.config);
                 try run.put("entity-candidate-index", Run.CandidateIndex{ .complete = true });
                 if (self.backend.search_assertions != null) try run.put("assertion-recall-index", t.RecallIndex{ .generation = run.state.config.generation, .backfill_complete = true, .complete = true });
             },
-            .explain => output = try run.explain(id, try parse(prov.ExplainRequest, a, body)),
+            .explain => output = try run.explain(id, try parse(prov.ExplainRequest, a, admitted_body)),
             .configuration => {
                 const generation = std.fmt.parseInt(u64, id, 10) catch return error.InvalidMemoryRequest;
                 const config = (try run.read(t.Config, try configKey(a, generation))) orelse return error.MemoryNotFound;
@@ -268,15 +327,16 @@ pub const Service = struct {
             .inspect => output = try run.encode(.{ .state = .{ .table_id = run.state.table_id, .database = run.state.database, .namespace = run.state.namespace, .space = run.state.space, .config = run.state.config, .pending_config = run.state.pending_config, .revision = run.state.revision, .owner = run.state.owner, .created_at = run.state.created_at }, .capabilities = .{ .native = true, .model_free = true, .generator_available = self.backend.generate != null, .embedder_available = self.backend.embed != null } }),
             .configure => {
                 try run.requireAdmin();
-                try run.put("entity-semantic-index", t.SemanticIndex{});
+                try run.put(try run.semanticPath("entity-semantic-index"), t.SemanticIndex{});
                 try run.put("cleanup", .{ .cursor = @as(?[]const u8, null) });
-                const request = try parse(operations.Configure, a, body);
+                const request = try parse(operations.Configure, a, admitted_body);
                 if (request.expected_revision != run.state.revision - 1) return error.MemoryRevisionConflict;
                 var config = request.config;
+                if (run.state.config.features.lineage and !config.features.lineage) return error.InvalidMemoryConfig;
                 // Admission revisions are durable and never reused, including failed
                 // builds. Serving generations are not allocation counters.
                 config.generation = run.state.revision;
-                try self.validate(config);
+                try self.validate(a, config, run.state.input_digest_key.len == 64);
                 if (self.context.execution_signature.len > 0) {
                     run.state.execution_principal = self.context.execution_principal;
                     run.state.execution_signature = self.context.execution_signature;
@@ -296,16 +356,24 @@ pub const Service = struct {
                 try run.put(try configKey(a, config.generation), config);
             },
             .observe => {
-                const request = try parse(t.ObservationRequest, a, body);
+                var request = try parse(t.ObservationRequest, a, admitted_body);
+                const original = try parse(t.ObservationRequest, a, body);
+                run.original_evidence = original.evidence;
+                const sources = try a.dupe(t.Evidence, request.evidence);
+                for (sources, original.evidence) |*source, supplied| {
+                    if (!eql(u8, source.text, supplied.text)) try run.intake_redacted_evidence.put(a, supplied.id, {});
+                    if (supplied.resource != null or supplied.resource_selector != null) source.text = supplied.text;
+                }
+                request.evidence = sources;
                 try run.observe(request, &op);
             },
             .assertions => {
-                const request = try parse(t.AssertionRequest, a, body);
+                const request = try parse(t.AssertionRequest, a, admitted_body);
                 try run.assertions(request.assertions, false);
             },
-            .correct => try run.correct(try parse(t.Correction, a, body)),
-            .forget => try run.forget(try parse(t.Forget, a, body)),
-            .outcome => try run.outcome(try parse(t.Outcome, a, body)),
+            .correct => try run.correct(try parse(t.Correction, a, admitted_body)),
+            .forget => try run.forget(try parse(t.Forget, a, admitted_body)),
+            .outcome => try run.outcome(try parse(t.Outcome, a, admitted_body)),
             .advance => try run.advance(id, &op),
             .evidence => {
                 const source = (try run.evidence(id)) orelse return error.MemoryNotFound;
@@ -321,55 +389,82 @@ pub const Service = struct {
             },
             .operation => {
                 const receipt = (try run.read(t.Operation, try key(a, "operation", id))) orelse return error.MemoryNotFound;
-                if (!eql(u8, receipt.owner, self.context.principal) and !self.context.admin) return error.Forbidden;
+                try run.authorize(receipt.owner, .private);
                 output = try run.encode(publicOperation(receipt));
             },
-            .history => output = try run.history(id, try parse(operations.Page, a, body)),
-            .recall => output = try run.recall(try parse(t.Recall, a, body)),
-            .list => output = try run.enumerate(try parse(t.Recall, a, body)),
-            .stage_embeddings => try run.stageEmbeddings(try parse(t.EmbeddingBatch, a, body)),
-            .curate_entity => try run.curateEntity(try parse(t.EntityCorrection, a, body)),
-            .propose_relationship => try run.proposeRelationship(try parse(t.RelationshipProposalRequest, a, body), &op),
+            .history => output = try run.history(id, try parse(operations.Page, a, admitted_body)),
+            .recall => output = try run.recall(try parse(t.Recall, a, admitted_body)),
+            .list => output = try run.enumerate(try parse(t.Recall, a, admitted_body)),
+            .stage_embeddings => try run.stageEmbeddings(try parse(t.EmbeddingBatch, a, admitted_body)),
+            .curate_entity => try run.curateEntity(try parse(t.EntityCorrection, a, admitted_body)),
+            .propose_relationship => try run.proposeRelationship(try parse(t.RelationshipProposalRequest, a, admitted_body), &op),
             .relationship_proposal => output = try run.encode(try run.publicRelationshipProposal(id)),
-            .review_relationship => try run.reviewRelationship(id, try parse(t.EntityVerdict, a, body), &op),
-            .entity_view => output = try run.encode(try run.entityView(id, try parse(t.EntityViewRequest, a, body))),
-            .episodes => output = try run.episodes(try parse(t.EpisodeRequest, a, body)),
-            .episode => output = try run.encode(try run.episode(id, try parse(t.EpisodeRequest, a, body))),
-            .entity_candidates => output = try run.entityCandidates(id, try parse(t.EntityCandidateRequest, a, body)),
-            .propose_entity => try run.proposeEntity(try parse(t.EntityProposalRequest, a, body), &op),
-            .entity_proposals => output = try run.entityProposals(try parse(operations.Page, a, body)),
+            .review_relationship => try run.reviewRelationship(id, try parse(t.EntityVerdict, a, admitted_body), &op),
+            .entity_view => output = try run.encode(try run.entityView(id, try parse(t.EntityViewRequest, a, admitted_body))),
+            .episodes => output = try run.episodes(try parse(t.EpisodeRequest, a, admitted_body)),
+            .episode => output = try run.encode(try run.episode(id, try parse(t.EpisodeRequest, a, admitted_body))),
+            .entity_candidates => output = try run.entityCandidates(id, try parse(t.EntityCandidateRequest, a, admitted_body)),
+            .propose_entity => try run.proposeEntity(try parse(t.EntityProposalRequest, a, admitted_body), &op),
+            .entity_proposals => output = try run.entityProposals(try parse(operations.Page, a, admitted_body)),
             .entity_proposal => output = try run.entityProposal(id),
-            .review_entity => try run.reviewEntity(id, try parse(t.EntityVerdict, a, body), &op),
+            .review_entity => try run.reviewEntity(id, try parse(t.EntityVerdict, a, admitted_body), &op),
             .resolve_entity => output = try run.resolveEntity(id),
-            .entities => output = try run.entityList(try parse(operations.Page, a, body)),
+            .entities => output = try run.entityList(try parse(operations.Page, a, admitted_body)),
         }
         if (mutates(action)) {
+            op.intake_screening = run.intake_report;
             try run.recordDecision(op);
             try run.put(receipt_key, op);
             try run.recordOperationVersions(op);
-            if (op.phase == .pending and (action == .observe or action == .configure)) try run.put(try key(a, "pending", op.id), .{ .id = op.id });
+            if (op.phase == .pending and (action == .observe or action == .configure or action == .start_evaluation)) try run.put(try key(a, "pending", op.id), .{ .id = op.id });
+            if (action == .configure or action == .curate_entity or action == .review_entity or action == .forget) try run.invalidateSemanticBranches();
+            try run.publishKnowledgeRevision(action);
+            try run.publishLineage(action);
+            try run.publishRootReferences();
+            if (action == .advance and id.len == 0 and run.state.persistent_roots) try run.reclaimNativeNodes();
+            try run.publishFeed(op);
             try run.put("control", run.state);
-            try self.context.finish();
-            if (run.inferred or switch (action) {
-                .observe, .assertions, .correct, .curate_entity, .propose_entity, .review_entity, .propose_relationship, .review_relationship, .stage_embeddings => true,
-                else => false,
-            }) try run.validateResources();
-            try run.validateJudgedViews();
+            // Authorization callbacks may perform I/O. Revalidate frozen views
+            // and source snapshots after the final grant check. A newly used
+            // administrative view upgrades the receipt and repeats this fence;
+            // the requirement is monotonic, so at most two passes are possible.
+            while (true) {
+                const administrative = run.administrative_view;
+                if (administrative) {
+                    try self.context.requireGrant(.admin);
+                    if (op.required_grant != .admin) {
+                        op.required_grant = .admin;
+                        try run.put(receipt_key, op);
+                        try run.recordOperationVersions(op);
+                    }
+                }
+                try self.context.finish();
+                try run.validateJudgedViews();
+                try run.validateResources();
+                if (administrative or !run.administrative_view) break;
+            }
             try self.backend.commit(self.backend.ptr, a, state_row, run.changes.items);
             try run.finishSemanticPublication();
             try run.finishRecallPublication();
             output = try run.encode(publicOperation(op));
         } else {
+            if (run.administrative_view) try self.context.requireGrant(.admin);
+            try self.context.finish();
+            // A frozen view is not a permission lease after its initial lookup.
+            try run.validateResources();
             // Reads spanning pages must not report a mixture of revisions.
             const latest = (try self.backend.get(self.backend.ptr, a, "control")) orelse return error.MemorySpaceNotFound;
             const state = try parse(t.State, a, latest.json);
             if (state.revision != run.state.revision) return error.MemoryRevisionConflict;
-            try self.context.finish();
         }
         return try alloc.dupe(u8, output.?);
     }
 
-    fn validate(self: Service, config: t.Config) !void {
+    fn validate(self: Service, a: A, config: t.Config, has_digest_key: bool) !void {
+        var screening_config = config.intake_screening;
+        screening_config.mode = .reject;
+        _ = try screening.typed(t.Config, a, config, screening_config);
+        if (config.intake_screening.mode == .redact and !has_digest_key and self.backend.random_bytes == null) return error.MemoryCapabilityUnavailable;
         try config.validate();
         if (self.context.durable_execution_required and self.context.execution_signature.len == 0 and (config.features.assertion_distillation or config.features.entity_extraction or config.features.summaries or ((config.features.semantic_recall or config.semantic_discovery.enabled) and !eql(u8, config.models.embedder.?.provider, "external")) or config.retention_ms != null)) return error.MemoryExecutionIdentityRequired;
         if (config.features.assertion_distillation and self.backend.generate == null) return error.MemoryCapabilityUnavailable;
@@ -416,10 +511,12 @@ const Run = struct {
     support_work: usize = 0,
     historical_resource_reads: bool = false,
     retention_maintenance: bool = false,
+    administrative_view: bool = false,
     resource_states: std.StringHashMapUnmanaged(ResourceRead) = .empty,
     judged_views: std.ArrayList(t.EntityViewInput) = .empty,
     inferred: bool = false,
     semantic_ready_after_commit: bool = false,
+    semantic_publication_branch: ?[]const u8 = null,
     recall_ready_after_commit: bool = false,
     temporal_tracking: bool = false,
     semantic_assertions: ResourceSet = .empty,
@@ -427,6 +524,9 @@ const Run = struct {
     temporal_denied: bool = false,
     inference_epoch: u64 = 0,
     capturing_resources: ?*ResourceSet = null,
+    intake_report: screening.Report = .{},
+    intake_redacted_evidence: ResourceSet = .empty,
+    original_evidence: []const t.Evidence = &.{},
     processing_failure: ?anyerror = null,
     defer_timeouts: bool = false,
     explanation_decisions: std.StringHashMapUnmanaged(void) = .empty,
@@ -439,7 +539,868 @@ const Run = struct {
     views: std.StringHashMapUnmanaged(bool) = .empty,
     backend_rows: std.StringHashMapUnmanaged(?[]const u8) = .empty,
     historical: std.StringHashMapUnmanaged(?t.StoredAssertion) = .empty,
+    lineage_head: ?t.LineageHead = null,
+    lineage_index: ?@import("persistent_index.zig").Index = null,
+    lineage_raw: bool = false,
 
+    fn publishKnowledgeRevision(self: *Run, action: Action) !void {
+        var changed = action == .revert_lineage or action == .curate_entity or action == .forget;
+        for (self.changes.items) |change| {
+            if (!std.mem.startsWith(u8, change.key, "assertion/") and !std.mem.startsWith(u8, change.key, "evidence/") and !std.mem.startsWith(u8, change.key, "entity/") and !eql(u8, change.key, "entity-policy")) continue;
+            const old = if (self.backend_rows.getEntry(change.key)) |cached| cached.value_ptr.* else blk: {
+                const row = try self.service.backend.get(self.service.backend.ptr, self.a, change.key);
+                break :blk if (row) |value| value.json else null;
+            };
+            if (!optionalEqual(old, change.json)) {
+                changed = true;
+                break;
+            }
+        }
+        if (changed) self.state.knowledge_revision = try std.math.add(u64, self.state.knowledge_revision, 1);
+    }
+    fn persistentIndex(self: *Run) *@import("persistent_index.zig").Index {
+        if (self.lineage_index == null) self.lineage_index = .{ .a = self.a, .store = .{ .ptr = self, .get = lineageNodeGet, .put = lineageNodePut }, .prefix = "lineage-node/" };
+        return &self.lineage_index.?;
+    }
+    const EvaluationReference = struct { version: u8 = 1, path: []const u8, bytes: u32, nonce: []const u8 };
+    const EvaluationIndexItem = struct { key: []const u8, value: []const u8 };
+    const EvaluationIndexPage = struct { items: []const EvaluationIndexItem, next: ?[]const u8 };
+    fn evaluationReference(self: *Run, value: []const u8) !EvaluationReference {
+        // Early manifests stored only the native immutable record path.
+        if (std.mem.startsWith(u8, value, "evaluation-case/")) return .{ .path = value, .bytes = 1024 * 1024, .nonce = "" };
+        const reference = try parse(EvaluationReference, self.a, value);
+        if (reference.version != 1 or !std.mem.startsWith(u8, reference.path, "evaluation-case/") or reference.bytes > 1024 * 1024) return error.MemoryCorruptState;
+        return reference;
+    }
+    fn evaluationIndexPage(self: *Run, root: ?[]const u8, after: ?[]const u8, limit: usize, max_bytes: usize) !EvaluationIndexPage {
+        const page = try self.persistentIndex().page(root, "", null, after, limit);
+        var items: std.ArrayList(EvaluationIndexItem) = .empty;
+        var bytes: usize = 0;
+        var next = page.next;
+        var last = after;
+        for (page.items) |item| {
+            const reference = try self.evaluationReference(item.value);
+            if (items.items.len > 0 and bytes + reference.bytes > max_bytes) {
+                next = last;
+                break;
+            }
+            bytes += reference.bytes;
+            try items.append(self.a, .{ .key = item.key, .value = reference.path });
+            last = item.key;
+        }
+        return .{ .items = items.items, .next = next };
+    }
+    fn evaluationDecidedKey(self: *Run, run: []const u8, case_key: []const u8) ![]const u8 {
+        return std.fmt.allocPrint(self.a, "evaluation-decided/{s}/{s}", .{ try hash(self.a, run), case_key });
+    }
+    fn evaluationDecided(self: *Run, run: t.evaluation.Run, case_key: []const u8) !bool {
+        if (try self.read(bool, try self.evaluationDecidedKey(run.id, case_key)) != null) return true;
+        if (run.version >= 2) return false;
+        return try self.read(t.evaluation.Result, try std.fmt.allocPrint(self.a, "evaluation-result/{s}/{s}", .{ try hash(self.a, run.id), case_key })) != null;
+    }
+    fn evaluationCaseAvailable(self: *Run, value: t.evaluation.StoredCase) !bool {
+        if (value.forgotten or try self.read(bool, "forgotten-all") != null) return false;
+        for (value.value.evidence) |ref| {
+            const source = (try self.evidence(ref.id)) orelse return false;
+            if (!self.retention_maintenance) self.authorize(source.owner, source.evidence.visibility) catch return false;
+            if (!try self.evidenceRetained(source)) return false;
+        }
+        return true;
+    }
+    fn evaluationDataset(self: *Run, id: []const u8) !t.evaluation.Dataset {
+        if (try self.read(bool, "forgotten-all") != null) return error.MemoryNotFound;
+        const value = (try self.read(t.evaluation.Dataset, try key(self.a, "evaluation-dataset", id))) orelse return error.MemoryNotFound;
+        if (!eql(u8, value.branch, self.service.context.branch)) return error.MemoryNotFound;
+        try self.authorize(value.owner, value.visibility);
+        return value;
+    }
+    fn putEvaluationDataset(self: *Run, request: t.evaluation.DatasetRequest) !void {
+        if (request.expected_revision != self.state.revision - 1) return error.MemoryRevisionConflict;
+        try t.validateId(request.id);
+        if (request.cases.len + request.remove.len == 0 or request.cases.len + request.remove.len > 128) return error.InvalidMemoryRequest;
+        const path = try key(self.a, "evaluation-dataset", request.id);
+        var dataset = (try self.read(t.evaluation.Dataset, path)) orelse t.evaluation.Dataset{ .id = request.id, .revision = self.state.revision, .owner = self.service.context.principal, .branch = self.service.context.branch, .visibility = request.visibility, .recorded_at = self.service.context.now_ms };
+        if (!eql(u8, dataset.branch, self.service.context.branch)) return error.MemoryVisibilityConflict;
+        try self.authorize(dataset.owner, .private);
+        if (dataset.visibility != request.visibility) return error.MemoryVisibilityConflict;
+        var seen: std.StringHashMapUnmanaged(void) = .empty;
+        for (request.cases) |value| {
+            try t.evaluation.validateCase(value);
+            if (try encodedSize(value) > 1024 * 1024 - 8192) return error.MemoryInputTooLarge;
+            const entry = try seen.getOrPut(self.a, value.id);
+            if (entry.found_existing) return error.InvalidMemoryRequest;
+            try self.reviewEvidence(value.evidence);
+            if (dataset.visibility == .team) for (value.evidence) |ref| {
+                if ((try self.evidence(ref.id)).?.evidence.visibility != .team) return error.MemoryVisibilityConflict;
+            };
+            const node_key = try hash(self.a, value.id);
+            if (try self.persistentIndex().get(dataset.root, node_key) == null) dataset.cases += 1;
+            const reference = try std.fmt.allocPrint(self.a, "evaluation-case/{s}/{s}/{d:0>20}", .{ try hash(self.a, request.id), node_key, self.state.revision });
+            const stored: t.evaluation.StoredCase = .{ .value = value, .dataset = request.id, .revision = self.state.revision, .owner = self.service.context.principal, .branch = self.service.context.branch, .recorded_at = self.service.context.now_ms, .fingerprint = try hash(self.a, t.evaluation.JudgeInput{ .task = value.task, .input = value.input }) };
+            const size = try encodedSize(stored);
+            if (size > 1024 * 1024) return error.MemoryInputTooLarge;
+            try self.put(reference, stored);
+            const descriptor: EvaluationReference = .{ .path = reference, .bytes = @intCast(size), .nonce = try inputFingerprint(self.a, .{ .domain = "evaluation-case-ref/v1", .path = reference }, self.state.input_digest_key, if (self.state.input_digest_key.len == 64) 1 else 0) };
+            dataset.root = try self.persistentIndex().put(dataset.root, node_key, try self.encode(descriptor));
+        }
+        for (request.remove) |id| {
+            try t.validateId(id);
+            const entry = try seen.getOrPut(self.a, id);
+            if (entry.found_existing) return error.InvalidMemoryRequest;
+            const node_key = try hash(self.a, id);
+            if (try self.persistentIndex().get(dataset.root, node_key) != null) {
+                dataset.root = try self.persistentIndex().remove(dataset.root, node_key);
+                dataset.cases -= 1;
+            }
+        }
+        dataset.revision = self.state.revision;
+        try self.put(path, dataset);
+        try self.put(try std.fmt.allocPrint(self.a, "evaluation-dataset-version/{s}/{d:0>20}", .{ try hash(self.a, dataset.id), dataset.revision }), dataset);
+    }
+    fn evaluationCursor(self: *Run, scope: []const u8, position: ?[]const u8) !?[]const u8 {
+        return if (position) |value| try std.fmt.allocPrint(self.a, "{s}:{s}", .{ try hash(self.a, .{ "evaluation/v1", scope, self.service.context.principal, self.service.context.branch }), value }) else null;
+    }
+    fn evaluationPosition(self: *Run, scope: []const u8, cursor: ?[]const u8) !?[]const u8 {
+        const value = cursor orelse return null;
+        const colon = std.mem.indexOfScalar(u8, value, ':') orelse return error.InvalidMemoryCursor;
+        const position = value[colon + 1 ..];
+        if (position.len != 64 or !eql(u8, value, (try self.evaluationCursor(scope, position)).?)) return error.InvalidMemoryCursor;
+        for (position) |byte| if (!std.ascii.isHex(byte)) return error.InvalidMemoryCursor;
+        return position;
+    }
+    fn evaluationCases(self: *Run, id: []const u8, request: operations.Page) ![]const u8 {
+        if (request.limit == 0 or request.limit > 128) return error.InvalidMemoryRequest;
+        const dataset = try self.evaluationDataset(id);
+        const scope = try hash(self.a, .{ id, dataset.root, dataset.revision });
+        const page = try self.evaluationIndexPage(dataset.root, try self.evaluationPosition(scope, request.cursor), request.limit, 1024 * 1024);
+        var references: std.ArrayList([]const u8) = .empty;
+        for (page.items) |item| try references.append(self.a, item.value);
+        try self.prefetch(references.items);
+        var values: std.ArrayList(t.evaluation.StoredCase) = .empty;
+        var next = page.next;
+        var last = try self.evaluationPosition(scope, request.cursor);
+        var bytes: usize = 4096;
+        for (page.items) |item| if (try self.read(t.evaluation.StoredCase, item.value)) |value| {
+            if (try self.evaluationCaseAvailable(value)) {
+                const size = try encodedSize(value);
+                if (bytes + size > 4 * 1024 * 1024) {
+                    if (values.items.len == 0) return error.MemoryInputTooLarge;
+                    next = last;
+                    break;
+                }
+                bytes += size;
+                try values.append(self.a, value);
+            }
+            last = item.key;
+        };
+        return self.encode(t.evaluation.CasePage{ .items = values.items, .next_cursor = try self.evaluationCursor(scope, next), .complete = next == null, .revision = dataset.revision });
+    }
+    fn startEvaluation(self: *Run, request: t.evaluation.Start, operation: *t.Operation) !void {
+        if (request.expected_revision != self.state.revision - 1) return error.MemoryRevisionConflict;
+        try t.validateId(request.id);
+        var dataset = try self.evaluationDataset(request.dataset);
+        if (request.dataset_revision) |revision| {
+            dataset = (try self.read(t.evaluation.Dataset, try std.fmt.allocPrint(self.a, "evaluation-dataset-version/{s}/{d:0>20}", .{ try hash(self.a, request.dataset), revision }))) orelse return error.MemoryNotFound;
+            try self.authorize(dataset.owner, dataset.visibility);
+        }
+        const path = try key(self.a, "evaluation-run", request.id);
+        if (try self.read(t.evaluation.Run, path) != null) return error.MemoryEntityConflict;
+        const judge = if (request.mode == .managed) request.judge orelse self.state.config.models.decider orelse self.state.config.models.generator orelse return error.MemoryModelRequired else request.judge;
+        if (request.mode == .policy and judge != null) return error.InvalidMemoryRequest;
+        if (judge) |model| {
+            try t.validateId(model.provider);
+            try t.validateId(model.model);
+            try t.validateId(model.revision);
+        }
+        if (request.mode == .managed) {
+            if (self.service.backend.evaluate == null) return error.MemoryCapabilityUnavailable;
+            if (self.service.backend.validate_models) |validate_models| {
+                var qualification = self.state.config;
+                qualification.features.reconciliation = .model;
+                qualification.models.decider = judge;
+                try validate_models(self.service.backend.ptr, qualification);
+                try self.inferenceCompleted(.empty);
+            }
+        }
+        if (self.service.context.durable_execution_required and self.service.context.execution_signature.len == 0) return error.MemoryExecutionIdentityRequired;
+        var evaluated_config = self.state.config;
+        if (request.thresholds) |thresholds| {
+            if (request.mode != .policy or thresholds.enabled != self.state.config.semantic_discovery.enabled) return error.InvalidMemoryRequest;
+            evaluated_config.semantic_discovery = thresholds;
+            try evaluated_config.validate();
+        }
+        const run: t.evaluation.Run = .{ .version = 2, .id = request.id, .dataset = dataset.id, .dataset_revision = dataset.revision, .root = dataset.root, .case_count = dataset.cases, .owner = self.service.context.principal, .branch = self.service.context.branch, .visibility = dataset.visibility, .mode = request.mode, .knowledge_revision = self.state.knowledge_revision, .config_generation = self.state.config.generation, .config_fingerprint = try hash(self.a, evaluated_config), .source_config_fingerprint = try hash(self.a, self.state.config), .thresholds = request.thresholds, .judge = judge, .fingerprint = try hash(self.a, .{ dataset.id, dataset.revision, dataset.root, evaluated_config, request.mode, judge, t.evaluation.prompt_revision }), .phase = if (dataset.cases == 0) .completed else .pending, .revision = self.state.revision, .recorded_at = self.service.context.now_ms };
+        try self.put(path, run);
+        operation.evaluation_id = run.id;
+        if (run.phase == .pending) operation.phase = .pending;
+    }
+    fn evaluationRun(self: *Run, id: []const u8) !t.evaluation.Run {
+        const run = (try self.read(t.evaluation.Run, try key(self.a, "evaluation-run", id))) orelse return error.MemoryNotFound;
+        if (!eql(u8, run.branch, self.service.context.branch)) return error.MemoryNotFound;
+        try self.authorize(run.owner, run.visibility);
+        return run;
+    }
+    fn evaluationStatus(self: *Run, id: []const u8) ![]const u8 {
+        const run = try self.evaluationRun(id);
+        return self.encode(t.evaluation.Status{ .run = run, .identity = run.counts[0].report(), .relationship = run.counts[1].report(), .supersession = run.counts[2].report(), .retrieval = run.counts[3].report(), .identity_admission = run.admission[0].report(), .relationship_admission = run.admission[1].report(), .supersession_admission = run.admission[2].report() });
+    }
+    fn evaluationResultKey(self: *Run, run: []const u8, case_id: []const u8) ![]const u8 {
+        return std.fmt.allocPrint(self.a, "evaluation-result/{s}/{s}", .{ try hash(self.a, run), try hash(self.a, case_id) });
+    }
+    fn evaluationTasks(self: *Run, id: []const u8, request: operations.Page) ![]const u8 {
+        if (request.limit == 0 or request.limit > 128) return error.InvalidMemoryRequest;
+        const run = try self.evaluationRun(id);
+        if (run.mode != .external) return error.InvalidMemoryRequest;
+        if (run.phase != .pending) return self.encode(t.evaluation.TaskPage{ .items = &.{}, .next_cursor = null, .complete = true, .run_fingerprint = run.fingerprint });
+        const page = try self.evaluationIndexPage(run.root, (try self.evaluationPosition(run.fingerprint, request.cursor)) orelse run.cursor, request.limit, 1024 * 1024);
+        var references: std.ArrayList([]const u8) = .empty;
+        for (page.items) |item| {
+            try references.append(self.a, item.value);
+            try references.append(self.a, try self.evaluationDecidedKey(run.id, item.key));
+        }
+        try self.prefetch(references.items);
+        var values: std.ArrayList(t.evaluation.JudgeTask) = .empty;
+        var next = page.next;
+        var last = (try self.evaluationPosition(run.fingerprint, request.cursor)) orelse run.cursor;
+        var bytes: usize = 4096;
+        for (page.items) |item| if (try self.read(t.evaluation.StoredCase, item.value)) |value| {
+            if (try self.evaluationDecided(run, item.key) or !try self.evaluationCaseAvailable(value)) {
+                last = item.key;
+                continue;
+            }
+            const task: t.evaluation.JudgeTask = .{ .case_id = value.value.id, .case_revision = value.revision, .input_fingerprint = value.fingerprint, .input = .{ .task = value.value.task, .input = value.value.input } };
+            const size = try encodedSize(task);
+            if (bytes + size > 4 * 1024 * 1024) {
+                if (values.items.len == 0) return error.MemoryInputTooLarge;
+                next = last;
+                break;
+            }
+            bytes += size;
+            try values.append(self.a, task);
+            last = item.key;
+        };
+        return self.encode(t.evaluation.TaskPage{ .items = values.items, .next_cursor = try self.evaluationCursor(run.fingerprint, next), .complete = next == null, .run_fingerprint = run.fingerprint });
+    }
+    fn evaluationResults(self: *Run, id: []const u8, request: operations.EvaluationResultRequest) ![]const u8 {
+        if (request.limit == 0 or request.limit > 8) return error.InvalidMemoryRequest;
+        const run = try self.evaluationRun(id);
+        const position = try self.evaluationPosition(run.fingerprint, request.cursor);
+        const page = try self.evaluationIndexPage(run.root, position, request.limit, 512 * 1024);
+        var paths: std.ArrayList([]const u8) = .empty;
+        for (page.items) |item| {
+            try paths.append(self.a, item.value);
+            try paths.append(self.a, try std.fmt.allocPrint(self.a, "evaluation-result/{s}/{s}", .{ try hash(self.a, run.id), item.key }));
+        }
+        try self.prefetch(paths.items);
+        var values: std.ArrayList(t.evaluation.ResultEntry) = .empty;
+        var next = page.next;
+        var last = position;
+        var bytes: usize = 4096;
+        for (page.items) |item| {
+            const value = (try self.read(t.evaluation.StoredCase, item.value)) orelse continue;
+            if (!try self.evaluationCaseAvailable(value)) {
+                last = item.key;
+                continue;
+            }
+            const result = try self.read(t.evaluation.Result, try std.fmt.allocPrint(self.a, "evaluation-result/{s}/{s}", .{ try hash(self.a, run.id), item.key }));
+            if (result != null and result.?.scrubbed) {
+                last = item.key;
+                continue;
+            }
+            const entry: t.evaluation.ResultEntry = .{ .case = value, .result = result };
+            const size = try encodedSize(entry);
+            if (bytes + size > 4 * 1024 * 1024) {
+                if (values.items.len == 0) return error.MemoryInputTooLarge;
+                next = last;
+                break;
+            }
+            bytes += size;
+            try values.append(self.a, entry);
+            last = item.key;
+        }
+        return self.encode(t.evaluation.ResultPage{ .items = values.items, .next_cursor = try self.evaluationCursor(run.fingerprint, next), .complete = next == null, .run_fingerprint = run.fingerprint });
+    }
+    fn evaluationCase(self: *Run, run: t.evaluation.Run, id: []const u8) !t.evaluation.StoredCase {
+        const reference = (try self.persistentIndex().get(run.root, try hash(self.a, id))) orelse return error.MemoryNotFound;
+        return (try self.read(t.evaluation.StoredCase, (try self.evaluationReference(reference)).path)) orelse return error.MemoryNotFound;
+    }
+    fn recordEvaluationResult(self: *Run, run: *t.evaluation.Run, value: t.evaluation.StoredCase, case_key: []const u8, prediction: ?t.evaluation.Prediction, declared_invalid: bool, actor: []const u8, model: ?t.Model) !void {
+        const path = try std.fmt.allocPrint(self.a, "evaluation-result/{s}/{s}", .{ try hash(self.a, run.id), case_key });
+        var invalid = declared_invalid;
+        if (prediction) |result| {
+            if (result.reason.len > t.max_text_bytes) invalid = true;
+            if (result.admitted) |admitted| {
+                if (run.mode != .policy) return error.InvalidMemoryRequest;
+                try t.evaluation.scoreAdmission(&run.admission[@backingInt(value.value.task)], value.value, admitted);
+            }
+        }
+        if (try self.evaluationDecided(run.*, case_key)) return error.MemoryEntityConflict;
+        const task = @backingInt(value.value.task);
+        var normalized = prediction;
+        if (value.value.task != .retrieval and normalized != null and normalized.?.ranking != null and normalized.?.ranking.?.len == 0) normalized.?.ranking = null;
+        if (invalid) normalized = .{ .reason = "Invalid judge output" };
+        var counts = run.counts[task];
+        t.evaluation.score(&counts, value.value, normalized) catch |err| switch (err) {
+            error.InvalidMemoryRequest, error.InvalidMemoryId => {
+                invalid = true;
+                normalized = .{ .reason = "Invalid judge output" };
+                counts = run.counts[task];
+                try t.evaluation.score(&counts, value.value, normalized);
+            },
+        };
+        if (invalid) counts.invalid_outputs += 1;
+        run.counts[task] = counts;
+        try self.put(path, t.evaluation.Result{ .invalid_output = invalid, .run = run.id, .case_id = value.value.id, .case_revision = value.revision, .input_fingerprint = value.fingerprint, .prediction = normalized, .unavailable = normalized == null, .principal = self.service.context.principal, .actor = actor, .model = model, .revision = self.state.revision, .recorded_at = self.service.context.now_ms });
+        try self.put(try self.evaluationDecidedKey(run.id, case_key), true);
+        run.completed += 1;
+        if (run.completed > run.case_count) return error.MemoryCorruptState;
+        if (run.completed == run.case_count) run.phase = .completed;
+        run.revision = self.state.revision;
+    }
+    fn evaluationVerdict(self: *Run, id: []const u8, request: t.evaluation.Submit, operation: *t.Operation) !void {
+        if (request.expected_revision != self.state.revision - 1) return error.MemoryRevisionConflict;
+        if (request.verdicts.len == 0 or request.verdicts.len > 32) return error.InvalidMemoryRequest;
+        if (request.actor.len > 0) try t.validateId(request.actor);
+        var run = try self.evaluationRun(id);
+        if (run.mode != .external or run.phase != .pending) return error.MemoryEntityConflict;
+        if (!valueEqual(?t.Model, run.judge, request.model)) return error.MemoryModelRevisionMismatch;
+        if (!eql(u8, run.source_config_fingerprint, try hash(self.a, self.state.config))) return error.MemoryConfigurationChanged;
+        for (request.verdicts) |verdict| {
+            const value = try self.evaluationCase(run, verdict.case_id);
+            if (verdict.case_revision != value.revision or !eql(u8, verdict.input_fingerprint, value.fingerprint)) return error.MemoryResourceChanged;
+            if (!try self.evaluationCaseAvailable(value)) return error.MemoryForgotten;
+            try self.recordEvaluationResult(&run, value, try hash(self.a, value.value.id), verdict.prediction.prediction(), verdict.invalid_output, request.actor, request.model);
+        }
+        try self.put(try key(self.a, "evaluation-run", id), run);
+        operation.evaluation_id = id;
+        if (request.actor.len > 0) operation.origin = .{ .agent = .{ .id = request.actor, .kind = .agent } };
+    }
+    fn evaluatePolicy(self: *Run, value: t.evaluation.StoredCase) !t.evaluation.Prediction {
+        const input = value.value.policy orelse try parse(t.evaluation.PolicyInput, self.a, try self.encode(value.value.input));
+        switch (value.value.task) {
+            .identity, .relationship => {
+                var request = input.entity_candidates;
+                request.kind = if (value.value.task == .identity) .identity else .relationship;
+                const page = try parse(t.EntityCandidatePage, self.a, try self.entityCandidates(input.seed, request));
+                if (page.retrieval != .indexed_lexical or self.state.config.semantic_discovery.enabled and page.semantic_discovery != .indexed) return .{};
+                for (page.items) |candidate| if (eql(u8, candidate.entity.entity.id, input.target)) return .{ .admitted = true };
+                if (!page.complete or page.semantic_discovery == .not_ready) return .{};
+                return .{ .admitted = false };
+            },
+            .supersession => {
+                // Candidate inclusion measures admission recall. A candidate
+                // is not evidence for a four-way semantic replacement verdict.
+                const page = try parse(t.SupersessionCandidatePage, self.a, try self.supersessionCandidates(input.seed, input.supersession_candidates));
+                if (page.retrieval != .indexed) return .{};
+                for (page.items) |candidate| if (eql(u8, candidate.view.memory.assertion.id, input.target)) return .{ .admitted = true };
+                return if (page.truncated) .{} else .{ .admitted = false };
+            },
+            .retrieval => {
+                const page = try parse(t.RecallResult, self.a, try self.recall(input.recall));
+                const ranking = try self.a.alloc([]const u8, page.items.len);
+                for (page.items, ranking) |hit, *id| id.* = hit.memory.assertion.id;
+                return .{ .ranking = ranking };
+            },
+        }
+    }
+    fn evaluationQuantum(self: *Run, path: []const u8, pending: *t.Operation, receipt: *t.Operation) !void {
+        const id = pending.evaluation_id orelse return error.MemoryCorruptState;
+        var run = try self.evaluationRun(id);
+        receipt.evaluation_id = id;
+        if (run.phase != .pending) {
+            pending.phase = if (run.phase == .completed) .succeeded else .cancelled;
+        } else if (!eql(u8, run.source_config_fingerprint, try hash(self.a, self.state.config)) or run.mode == .policy and run.knowledge_revision != self.state.knowledge_revision) {
+            run.phase = .cancelled;
+            run.error_code = "MemoryConfigurationChanged";
+            pending.phase = .cancelled;
+        } else {
+            const page = try self.evaluationIndexPage(run.root, run.cursor, 1, 1024 * 1024);
+            if (page.items.len == 0) return error.MemoryCorruptState;
+            const value = (try self.read(t.evaluation.StoredCase, page.items[0].value)) orelse return error.MemoryForgotten;
+            const existing_result = try self.evaluationDecided(run, page.items[0].key);
+            if (existing_result) {
+                run.cursor = page.items[0].key;
+                run.revision = self.state.revision;
+                try self.put(try key(self.a, "evaluation-run", run.id), run);
+                pending.next_retry_at = null;
+                try self.put(path, pending.*);
+                return;
+            }
+            const captured = try self.captureResources(evaluationCaseAvailable, .{value});
+            if (captured.result and run.mode == .external) {
+                pending.next_retry_at = self.service.context.now_ms +| 30000;
+                try self.put(path, pending.*);
+                return;
+            }
+            var prediction: ?t.evaluation.Prediction = null;
+            var invalid_output = false;
+            if (captured.result) {
+                if (run.mode == .policy) {
+                    const previous = self.state.config.semantic_discovery;
+                    defer self.state.config.semantic_discovery = previous;
+                    if (run.thresholds) |thresholds| self.state.config.semantic_discovery = thresholds;
+                    prediction = try self.evaluatePolicy(value);
+                } else if (run.mode == .managed) {
+                    const Fence = struct {
+                        run: *Run,
+                        resources: ResourceSet,
+                        fn complete(ptr: *anyopaque) !void {
+                            const fence: *@This() = @ptrCast(@alignCast(ptr));
+                            try fence.run.inferenceCompleted(fence.resources);
+                        }
+                    };
+                    var fence: Fence = .{ .run = self, .resources = captured.resources };
+                    const output = self.service.backend.evaluate.?(self.service.backend.ptr, self.a, self.state.config, run.judge.?, .{ .task = value.value.task, .input = value.value.input }, .{ .ptr = &fence, .complete_fn = Fence.complete }) catch |err| switch (err) {
+                        error.MemoryUngroundedOutput => blk: {
+                            invalid_output = true;
+                            break :blk t.evaluation.JudgeOutput{};
+                        },
+                        else => return err,
+                    };
+                    try self.inferenceCompleted(captured.resources);
+                    const clean = self.screenTyped(t.evaluation.JudgeOutput, output) catch |err| switch (err) {
+                        error.MemorySecretDetected => blk: {
+                            invalid_output = true;
+                            break :blk t.evaluation.JudgeOutput{};
+                        },
+                        else => return err,
+                    };
+                    prediction = clean.prediction();
+                } else return error.InvalidMemoryRequest;
+            }
+            try self.recordEvaluationResult(&run, value, page.items[0].key, prediction, invalid_output, "", run.judge);
+            run.cursor = page.items[0].key;
+            pending.phase = if (run.phase == .completed) .succeeded else .pending;
+            pending.attempts = 0;
+            pending.error_code = null;
+            pending.next_retry_at = null;
+        }
+        run.revision = self.state.revision;
+        try self.put(try key(self.a, "evaluation-run", id), run);
+        try self.put(path, pending.*);
+        if (pending.phase != .pending) try self.remove(try key(self.a, "pending", pending.id));
+    }
+    const NativeNodeMeta = struct { references: u64 = 0, retired_at: ?i64 = null };
+    const root_gc_grace_ms = 5 * 60 * 1000;
+    fn nodeReference(self: *Run, id: []const u8, add: bool) !void {
+        const path = try std.fmt.allocPrint(self.a, "lineage-node-meta/{s}", .{id});
+        var meta = (try self.rawRead(NativeNodeMeta, path)) orelse return error.MemoryCorruptState;
+        if (add) {
+            meta.references = try std.math.add(u64, meta.references, 1);
+            meta.retired_at = null;
+        } else {
+            if (meta.references == 0) return error.MemoryCorruptState;
+            meta.references -= 1;
+            if (meta.references == 0) meta.retired_at = self.service.context.now_ms;
+        }
+        try self.stageChange(path, try self.encode(meta));
+        if (meta.references == 0) try self.queueNodeReclamation(id);
+    }
+    fn queueNodeReclamation(self: *Run, id: []const u8) !void {
+        const due: u64 = @intCast(@max(0, self.service.context.now_ms +| root_gc_grace_ms));
+        try self.stageChange(try std.fmt.allocPrint(self.a, "lineage-gc/{d:0>20}/{s}", .{ due, id }), try self.encode(id));
+    }
+    fn publishRootReferences(self: *Run) !void {
+        const changes = try self.a.dupe(Change, self.changes.items);
+        for (changes) |change| {
+            if (!std.mem.startsWith(u8, change.key, "lineage-head/") and !std.mem.startsWith(u8, change.key, "lineage-checkpoint/") and !std.mem.startsWith(u8, change.key, "evaluation-dataset/") and !std.mem.startsWith(u8, change.key, "evaluation-dataset-version/") and !std.mem.startsWith(u8, change.key, "evaluation-run/")) continue;
+            const Root = struct { root: ?[]const u8 = null };
+            const next = if (change.json) |json| (try std.json.parseFromSliceLeaky(Root, self.a, json, .{ .ignore_unknown_fields = true })).root else null;
+            const old_row = try self.service.backend.get(self.service.backend.ptr, self.a, change.key);
+            const old = if (old_row) |row| (try std.json.parseFromSliceLeaky(Root, self.a, row.json, .{ .ignore_unknown_fields = true })).root else null;
+            if (optionalEqual(old, next)) continue;
+            if (next) |id| try self.nodeReference(id, true);
+            if (old) |id| try self.nodeReference(id, false);
+        }
+    }
+    fn reclaimNativeNodes(self: *Run) !void {
+        const page = try self.service.backend.scan(self.service.backend.ptr, self.a, "lineage-gc/", null, 32);
+        for (page.rows) |row| {
+            const position = row.key["lineage-gc/".len..];
+            const slash = std.mem.indexOfScalar(u8, position, '/') orelse return error.MemoryCorruptState;
+            const due = std.fmt.parseInt(i64, position[0..slash], 10) catch return error.MemoryCorruptState;
+            if (due > self.service.context.now_ms) break;
+            const id = try parse([]const u8, self.a, row.json);
+            const meta_path = try std.fmt.allocPrint(self.a, "lineage-node-meta/{s}", .{id});
+            const meta = (try self.rawRead(NativeNodeMeta, meta_path)) orelse {
+                try self.remove(row.key);
+                continue;
+            };
+            if (meta.references == 0 and (meta.retired_at == null or meta.retired_at.? +| root_gc_grace_ms > self.service.context.now_ms)) {
+                try self.queueNodeReclamation(id);
+            } else if (meta.references == 0) {
+                const path = try std.fmt.allocPrint(self.a, "lineage-node/{s}", .{id});
+                const Node = struct { left: ?[]const u8 = null, right: ?[]const u8 = null };
+                const raw = (try self.service.backend.get(self.service.backend.ptr, self.a, path)) orelse return error.MemoryCorruptState;
+                const node = try std.json.parseFromSliceLeaky(Node, self.a, raw.json, .{ .ignore_unknown_fields = true });
+                if (node.left) |child| try self.nodeReference(child, false);
+                if (node.right) |child| try self.nodeReference(child, false);
+                try self.remove(path);
+                try self.remove(meta_path);
+            }
+            try self.remove(row.key);
+        }
+    }
+    fn lineageNodeGet(ptr: *anyopaque, _: A, path: []const u8) !?[]const u8 {
+        const self: *Run = @ptrCast(@alignCast(ptr));
+        if (self.change_positions.get(path)) |position| return self.changes.items[position].json;
+        return if (try self.service.backend.get(self.service.backend.ptr, self.a, path)) |row| row.json else null;
+    }
+    fn lineageNodePut(ptr: *anyopaque, _: A, path: []const u8, json: []const u8) !void {
+        const self: *Run = @ptrCast(@alignCast(ptr));
+        // Content-addressed nodes deduplicate across roots and branches. Their
+        // outgoing references are charged exactly once, on first publication.
+        if (try lineageNodeGet(ptr, self.a, path) != null) return;
+        try self.stageChange(path, json);
+        const id = path["lineage-node/".len..];
+        try self.stageChange(try std.fmt.allocPrint(self.a, "lineage-node-meta/{s}", .{id}), try self.encode(NativeNodeMeta{ .retired_at = self.service.context.now_ms }));
+        self.state.persistent_roots = true;
+        const Edges = struct { left: ?[]const u8 = null, right: ?[]const u8 = null };
+        const edges = try std.json.parseFromSliceLeaky(Edges, self.a, json, .{ .ignore_unknown_fields = true });
+        if (edges.left) |child| try self.nodeReference(child, true);
+        if (edges.right) |child| try self.nodeReference(child, true);
+        try self.queueNodeReclamation(id);
+    }
+    fn prepareLineage(self: *Run, action: Action, id: []const u8) !void {
+        if (action == .advance and id.len > 0) {
+            const pending = (try self.rawRead(t.Operation, try key(self.a, "operation", id))) orelse return error.MemoryNotFound;
+            self.service.context.branch = pending.branch;
+        }
+        if (!self.state.config.features.lineage) {
+            if (self.service.context.branch.len > 0) return error.MemoryCapabilityUnavailable;
+            return;
+        }
+        self.lineage_index = .{ .a = self.a, .store = .{ .ptr = self, .get = lineageNodeGet, .put = lineageNodePut }, .prefix = "lineage-node/" };
+        const branch = self.service.context.branch;
+        if (eql(u8, branch, "main")) return error.InvalidMemoryRequest;
+        if (branch.len > 0) {
+            try t.validateId(branch);
+            switch (action) {
+                .create, .configure, .stage_embeddings, .curate_entity, .propose_entity, .review_entity, .propose_relationship, .review_relationship => return error.InvalidMemoryRequest,
+                else => {},
+            }
+            if (action == .advance and id.len == 0) return error.InvalidMemoryRequest;
+        }
+        const head = (try self.rawRead(t.LineageHead, try key(self.a, "lineage-head", if (branch.len == 0) "main" else branch))) orelse blk: {
+            if (branch.len > 0) return error.MemoryNotFound;
+            break :blk t.LineageHead{ .id = "", .revision = self.state.revision, .owner = self.state.owner, .visibility = .team, .created_at = self.state.created_at, .complete = action == .create };
+        };
+        try self.authorize(head.owner, head.visibility);
+        if (branch.len > 0 and mutates(action)) try self.authorize(head.owner, .private);
+        if (!head.complete and branch.len > 0) return error.MemoryCapabilityUnavailable;
+        self.lineage_head = head;
+        self.lineage_raw = action == .advance and id.len == 0;
+    }
+    fn lineageRootPut(self: *Run, path: []const u8, json: []const u8) !void {
+        var head = self.lineage_head orelse return;
+        var reference: []const u8 = path;
+        if (std.mem.startsWith(u8, path, "assertion/")) {
+            const record = try parse(t.StoredAssertion, self.a, json);
+            reference = try historyKey(self.a, record.assertion.id, record.revision);
+            // Legacy snapshots may predate the immutable history row.
+            if (try self.rawRead(t.StoredAssertion, reference) == null) try self.stageChange(reference, json);
+            head.root = try self.lineage_index.?.put(head.root, reference, reference);
+            const group_path = try groupKey(self.a, record.assertion, record.owner);
+            head.root = try self.lineage_index.?.put(head.root, group_path, path);
+        } else if (std.mem.startsWith(u8, path, "entity/")) {
+            const record = try parse(t.EntityRecord, self.a, json);
+            reference = try std.fmt.allocPrint(self.a, "lineage-entity/{s}/{d:0>20}", .{ path["entity/".len..], record.revision });
+            try self.stageChange(reference, json);
+        }
+        head.root = try self.lineage_index.?.put(head.root, path, reference);
+        self.lineage_head = head;
+    }
+    fn publishLineage(self: *Run, action: Action) !void {
+        if (self.lineage_head == null) return;
+        const was_complete = self.lineage_head.?.complete;
+        if (!self.lineage_raw) {
+            const changes = try self.a.dupe(Change, self.changes.items);
+            for (changes) |change| if (change.json) |json| {
+                if (std.mem.startsWith(u8, change.key, "assertion/") or std.mem.startsWith(u8, change.key, "evidence/") or std.mem.startsWith(u8, change.key, "entity/")) try self.lineageRootPut(change.key, json);
+            };
+        } else if (!self.lineage_head.?.complete) {
+            // One bounded migration quantum; new writes also update the root.
+            // Native primary keys, not a process cache, own resumption.
+            const lanes = [_][]const u8{ "assertion/", "entity/", "evidence/", "history/" };
+            if (self.lineage_head.?.migration_lane >= lanes.len) return error.MemoryCorruptState;
+            const page = try self.service.backend.scan(self.service.backend.ptr, self.a, lanes[self.lineage_head.?.migration_lane], self.lineage_head.?.cursor, 128);
+            for (page.rows) |row| try self.lineageRootPut(row.key, row.json);
+            self.lineage_head.?.cursor = page.next;
+            if (page.next == null) self.lineage_head.?.migration_lane += 1;
+            self.lineage_head.?.complete = self.lineage_head.?.migration_lane == lanes.len;
+        }
+        if (self.lineage_raw and was_complete and action != .create) return;
+        self.lineage_head.?.revision = self.state.revision;
+        try self.put(try key(self.a, "lineage-head", if (self.service.context.branch.len == 0) "main" else self.service.context.branch), self.lineage_head.?);
+    }
+    fn forkLineage(self: *Run, request: t.LineageFork) !void {
+        if (!self.state.config.features.lineage) return error.MemoryCapabilityUnavailable;
+        if (request.expected_revision != self.state.revision - 1) return error.MemoryRevisionConflict;
+        try t.validateId(request.id);
+        if (eql(u8, request.id, "main")) return error.InvalidMemoryRequest;
+        const path = try key(self.a, "lineage-head", request.id);
+        if (try self.rawRead(t.LineageHead, path) != null) return error.MemoryEntityConflict;
+        const parent = (try self.rawRead(t.LineageHead, try key(self.a, "lineage-head", if (request.from.len == 0) "main" else request.from))) orelse return error.MemoryNotFound;
+        try self.authorize(parent.owner, parent.visibility);
+        if (!parent.complete) return error.MemoryCapabilityUnavailable;
+        var root = parent.root;
+        var revision = parent.revision;
+        if (request.checkpoint) |id| {
+            const checkpoint = (try self.rawRead(t.LineageCheckpoint, try key(self.a, "lineage-checkpoint", id))) orelse return error.MemoryNotFound;
+            try self.authorize(checkpoint.owner, checkpoint.visibility);
+            if (!eql(u8, checkpoint.branch, request.from)) return error.InvalidMemoryRequest;
+            root = checkpoint.root;
+            revision = checkpoint.revision;
+        }
+        try self.queueSemanticBranch(request.id);
+        try self.put(path, t.LineageHead{ .id = request.id, .root = root, .revision = self.state.revision, .owner = self.service.context.principal, .visibility = request.visibility, .created_at = self.service.context.now_ms, .parent = request.from, .inherited_revision = revision });
+    }
+    fn checkpointLineage(self: *Run, request: t.LineageCheckpointRequest) !void {
+        const head = self.lineage_head orelse return error.MemoryCapabilityUnavailable;
+        if (!head.complete) return error.MemoryCapabilityUnavailable;
+        if (request.expected_revision != self.state.revision - 1) return error.MemoryRevisionConflict;
+        try t.validateId(request.id);
+        const path = try key(self.a, "lineage-checkpoint", request.id);
+        if (try self.rawRead(t.LineageCheckpoint, path) != null) return error.MemoryEntityConflict;
+        try self.put(path, t.LineageCheckpoint{ .id = request.id, .branch = self.service.context.branch, .root = head.root, .revision = head.revision, .owner = self.service.context.principal, .visibility = head.visibility, .created_at = self.service.context.now_ms });
+    }
+    fn revertLineage(self: *Run, request: t.LineageRevert) !void {
+        var head = self.lineage_head orelse return error.MemoryCapabilityUnavailable;
+        if (!head.complete) return error.MemoryCapabilityUnavailable;
+        if (request.expected_revision != self.state.revision - 1) return error.MemoryRevisionConflict;
+        const checkpoint = (try self.rawRead(t.LineageCheckpoint, try key(self.a, "lineage-checkpoint", request.checkpoint))) orelse return error.MemoryNotFound;
+        try self.authorize(checkpoint.owner, checkpoint.visibility);
+        if (!eql(u8, checkpoint.branch, self.service.context.branch)) return error.InvalidMemoryRequest;
+        head.root = checkpoint.root;
+        self.lineage_head = head;
+        if (self.state.config.semantic_discovery.enabled) {
+            try self.put(try self.semanticPath("entity-semantic-index"), t.SemanticIndex{});
+            try self.queueSemanticBranch(self.service.context.branch);
+        }
+        self.views.clearRetainingCapacity();
+        self.historical.clearRetainingCapacity();
+    }
+    const FeedRecord = struct { event: t.SpaceChange, audiences: []const []const u8 };
+    fn feedTail(self: *Run) ![]const u8 {
+        return std.fmt.allocPrint(self.a, "{d:0>20}/9999999999", .{self.state.revision});
+    }
+    fn feedAudience(self: *Run, owner: []const u8, visibility: t.Visibility, curator: bool) ![]const u8 {
+        if (visibility == .team) return if (curator) "curator-team" else "team";
+        return std.fmt.allocPrint(self.a, "{s}/{s}", .{ if (curator) "curator-private" else "private", try hash(self.a, owner) });
+    }
+    fn feedEmit(self: *Run, items: *std.ArrayList(FeedRecord), kind: t.ChangeKind, target: ?t.ChangeTarget, owner: []const u8, visibility: t.Visibility, curator: bool) !void {
+        const position = try std.fmt.allocPrint(self.a, "{d:0>20}/{d:0>10}", .{ self.state.revision, items.items.len });
+        const audiences = try self.a.alloc([]const u8, 1);
+        const private_branch = if (self.lineage_head) |head| self.service.context.branch.len > 0 and head.visibility == .private else false;
+        audiences[0] = try self.feedAudience(if (private_branch) self.lineage_head.?.owner else owner, if (private_branch) .private else visibility, curator);
+        try items.append(self.a, .{ .event = .{ .branch = self.service.context.branch, .id = position, .kind = kind, .target = target, .revision = self.state.revision, .recorded_at = self.service.context.now_ms }, .audiences = audiences });
+    }
+    fn publishFeed(self: *Run, operation: t.Operation) !void {
+        // Inspect the final staged values, so retried planners and intermediate
+        // revisions cannot publish notifications for work that rolled back.
+        var items: std.ArrayList(FeedRecord) = .empty;
+        var invalidated = eql(u8, operation.action, "curate_entity") or eql(u8, operation.action, "forget");
+        for (self.changes.items) |change| {
+            if (change.json == null) {
+                if (std.mem.startsWith(u8, change.key, "assertion/") or std.mem.startsWith(u8, change.key, "evidence/") or std.mem.startsWith(u8, change.key, "entity/")) invalidated = true;
+                continue;
+            }
+            if (eql(u8, operation.action, "advance") and std.mem.startsWith(u8, change.key, "resource-watch/")) invalidated = true;
+            const json = change.json.?;
+            if (std.mem.startsWith(u8, change.key, "assertion/")) {
+                const record = try parse(t.StoredAssertion, self.a, json);
+                if (record.revision != self.state.revision) continue;
+                try self.feedEmit(&items, if (record.stale) .context_invalidated else switch (record.lifecycle) {
+                    .superseded => .assertion_superseded,
+                    .disputed => .assertion_disputed,
+                    .retracted => .assertion_retracted,
+                    else => .assertion_changed,
+                }, .{ .kind = .assertion, .id = record.assertion.id, .revision = record.revision }, record.owner, record.assertion.visibility, false);
+            } else if (std.mem.startsWith(u8, change.key, "evidence/")) {
+                const record = try parse(t.StoredEvidence, self.a, json);
+                if (record.revision != self.state.revision) continue;
+                try self.feedEmit(&items, if (record.forgotten) .context_invalidated else .evidence_observed, .{ .kind = .evidence, .id = record.evidence.id, .revision = record.revision }, record.owner, record.evidence.visibility, false);
+            } else if (std.mem.startsWith(u8, change.key, "entity/")) {
+                const record = try parse(t.EntityRecord, self.a, json);
+                if (record.revision != self.state.revision) continue;
+                try self.feedEmit(&items, .entity_changed, .{ .kind = .entity, .id = record.entity.id, .revision = record.revision }, record.owner, record.entity.visibility, false);
+            }
+        }
+        if (operation.evaluation_id != null) try self.feedEmit(&items, .evaluation_changed, null, operation.owner, .team, true);
+        if (eql(u8, operation.action, "fork_lineage") or eql(u8, operation.action, "checkpoint_lineage") or eql(u8, operation.action, "revert_lineage")) try self.feedEmit(&items, .lineage_changed, null, operation.owner, .team, false);
+        if (operation.proposal_id) |id| {
+            // Proposal access is narrower than ordinary team record access.
+            const supersession = eql(u8, operation.action, "propose_supersession") or eql(u8, operation.action, "review_supersession");
+            const relationship = eql(u8, operation.action, "propose_relationship") or eql(u8, operation.action, "review_relationship");
+            var proposal_kind: t.ChangeKind = if (std.mem.startsWith(u8, operation.action, "propose_")) .proposal_opened else .proposal_decided;
+            if (proposal_kind == .proposal_decided) {
+                const open = if (supersession) ((try self.read(t.SupersessionProposal, try key(self.a, "supersession-proposal", id))) orelse return error.MemoryCorruptState).verdict == null else if (relationship) ((try self.read(t.RelationshipProposal, try key(self.a, "relationship-proposal", id))) orelse return error.MemoryCorruptState).state == .open else blk: {
+                    const policy = (try self.read(EntityPolicy, "entity-policy")) orelse EntityPolicy{};
+                    for (policy.state.proposals) |proposal| if (eql(u8, proposal.id, id)) break :blk proposal.state == .open;
+                    break :blk false;
+                };
+                if (open) proposal_kind = .proposal_deferred;
+            }
+            try self.feedEmit(&items, proposal_kind, .{ .kind = if (supersession) .supersession_proposal else if (relationship) .relationship_proposal else .entity_proposal, .id = id, .revision = self.state.revision }, operation.owner, .team, true);
+        }
+        if (invalidated) {
+            // Erasure and native source/TTL fences affect every retained root,
+            // even when requested from a private branch. Never expose a retired
+            // target ID merely to explain which cached context must refresh.
+            const saved_branch = self.service.context.branch;
+            self.service.context.branch = "";
+            defer self.service.context.branch = saved_branch;
+            try self.feedEmit(&items, .context_invalidated, null, operation.owner, .team, false);
+        }
+        if (eql(u8, operation.action, "configure") or eql(u8, operation.action, "create")) try self.feedEmit(&items, .configuration_changed, null, operation.owner, .team, false);
+        for (items.items) |item| {
+            try self.put(try std.fmt.allocPrint(self.a, "change-log/{s}", .{item.event.id}), item);
+            for (item.audiences) |audience| try self.put(try std.fmt.allocPrint(self.a, "change-audience/{s}/{s}", .{ audience, item.event.id }), item.event.id);
+        }
+        // Bounded prefix reclamation. Expiry is checked on reads even while
+        // physical cleanup is behind. The monotonic cutoff prevents a later
+        // retention increase from resurrecting previously expired events.
+        self.state.change_min_recorded_at = @max(self.state.change_min_recorded_at, self.service.context.now_ms -| @as(i64, @intCast(self.state.config.change_retention_ms)));
+        self.state.next_change_expiry_at = if (items.items.len > 0) self.service.context.now_ms +| @as(i64, @intCast(self.state.config.change_retention_ms)) else null;
+        const page = try self.service.backend.scan(self.service.backend.ptr, self.a, "change-log/", null, 32);
+        for (page.rows) |row| {
+            const record = try parse(FeedRecord, self.a, row.json);
+            if (record.event.recorded_at > self.state.change_min_recorded_at) {
+                const due = record.event.recorded_at +| @as(i64, @intCast(self.state.config.change_retention_ms));
+                self.state.next_change_expiry_at = @min(self.state.next_change_expiry_at orelse due, due);
+                break;
+            }
+            try self.remove(row.key);
+            for (record.audiences) |audience| try self.remove(try std.fmt.allocPrint(self.a, "change-audience/{s}/{s}", .{ audience, record.event.id }));
+            if (std.mem.order(u8, record.event.id, self.state.change_floor) == .gt) self.state.change_floor = record.event.id;
+            if (page.next != null) self.state.next_change_expiry_at = self.service.context.now_ms;
+        }
+    }
+    fn feedCursor(self: *Run, position: []const u8, version: u8, issued_at: i64) ![]const u8 {
+        const scope = try inputFingerprint(self.a, .{ "changes/v1", self.state.table_id, self.state.database, self.state.namespace, self.state.space, self.state.created_at, self.service.context.branch, self.service.context.principal, self.service.context.admin, self.service.context.curator, position, issued_at }, self.state.input_digest_key, version);
+        return std.fmt.allocPrint(self.a, "{d}:{s}:{s}:{d}", .{ version, scope, position, issued_at });
+    }
+    fn feedAvailable(self: *Run, event: t.SpaceChange) !bool {
+        const saved_branch = self.service.context.branch;
+        const saved_head = self.lineage_head;
+        const saved_raw = self.lineage_raw;
+        defer {
+            self.service.context.branch = saved_branch;
+            self.lineage_head = saved_head;
+            self.lineage_raw = saved_raw;
+        }
+        if (self.state.config.features.lineage) {
+            const head = (try self.rawRead(t.LineageHead, try key(self.a, "lineage-head", if (event.branch.len == 0) "main" else event.branch))) orelse return false;
+            self.authorize(head.owner, head.visibility) catch return false;
+            self.service.context.branch = event.branch;
+            self.lineage_head = head;
+            self.lineage_raw = false;
+        }
+        const target = event.target orelse return true;
+        switch (target.kind) {
+            .assertion => {
+                const record = (try self.assertion(target.id)) orelse return false;
+                self.authorize(record.owner, record.assertion.visibility) catch return false;
+                return self.retained(record, 0);
+            },
+            .evidence => {
+                const record = (try self.evidence(target.id)) orelse return false;
+                self.authorize(record.owner, record.evidence.visibility) catch return false;
+                return self.evidenceRetained(record);
+            },
+            .entity => return (try self.visibleCanonicalEntity(target.id, null)) != null,
+            .entity_proposal => {
+                self.service.context.requireGrant(.curator) catch return false;
+                const binding = (try self.read(ProposalBinding, try key(self.a, "proposal-input", target.id))) orelse return false;
+                return self.proposalInputsRetained(binding);
+            },
+            .supersession_proposal => {
+                self.service.context.requireGrant(.curator) catch return false;
+                const proposal = (try self.read(t.SupersessionProposal, try key(self.a, "supersession-proposal", target.id))) orelse return false;
+                return self.supersessionProposalRetained(proposal);
+            },
+            .relationship_proposal => {
+                self.service.context.requireGrant(.curator) catch return false;
+                _ = self.publicRelationshipProposal(target.id) catch |err| switch (err) {
+                    error.MemoryNotFound, error.Forbidden, error.MemoryForgotten => return false,
+                    else => return err,
+                };
+                return true;
+            },
+            else => return false,
+        }
+    }
+    fn spaceChanges(self: *Run, request: t.ChangeRequest) ![]const u8 {
+        if (request.limit == 0 or request.limit > 256) return error.InvalidMemoryRequest;
+        const tail = try self.feedTail();
+        var position: []const u8 = if (request.start == .latest) tail else self.state.change_floor;
+        if (request.cursor) |cursor| {
+            var parts = std.mem.splitScalar(u8, cursor, ':');
+            const version = std.fmt.parseInt(u8, parts.next() orelse return error.InvalidMemoryCursor, 10) catch return error.InvalidMemoryCursor;
+            _ = parts.next() orelse return error.InvalidMemoryCursor;
+            position = parts.next() orelse return error.InvalidMemoryCursor;
+            const issued_at = std.fmt.parseInt(i64, parts.next() orelse return error.InvalidMemoryCursor, 10) catch return error.InvalidMemoryCursor;
+            if (parts.next() != null or version > 1 or issued_at > self.service.context.now_ms or !eql(u8, cursor, try self.feedCursor(position, version, issued_at))) return error.InvalidMemoryCursor;
+            if (issued_at <= @max(self.state.change_min_recorded_at, self.service.context.now_ms -| @as(i64, @intCast(self.state.config.change_retention_ms)))) return error.MemoryCursorStale;
+            if (std.mem.order(u8, position, self.state.change_floor) == .lt) return error.MemoryCursorStale;
+            if (std.mem.order(u8, position, tail) == .gt) return error.InvalidMemoryCursor;
+        }
+        const Candidate = struct { position: []const u8, path: []const u8 };
+        var feed_candidates: std.ArrayList(Candidate) = .empty;
+        var audiences: std.ArrayList([]const u8) = .empty;
+        if (self.service.context.admin) {
+            try self.requireAdmin();
+            try audiences.append(self.a, "");
+        } else {
+            try audiences.append(self.a, "team");
+            try audiences.append(self.a, try self.feedAudience(self.service.context.principal, .private, false));
+            if (self.service.context.curator) {
+                try audiences.append(self.a, "curator-team");
+                try audiences.append(self.a, try self.feedAudience(self.service.context.principal, .private, true));
+            }
+        }
+        for (audiences.items) |audience| {
+            const prefix = if (audience.len == 0) "change-log/" else try std.fmt.allocPrint(self.a, "change-audience/{s}/", .{audience});
+            const page = try self.service.backend.scan(self.service.backend.ptr, self.a, prefix, if (position.len == 0) null else try std.fmt.allocPrint(self.a, "{s}{s}", .{ prefix, position }), @as(u32, request.limit) + 1);
+            for (page.rows) |row| {
+                const next = row.key[prefix.len..];
+                if (std.mem.order(u8, next, tail) == .gt) continue;
+                try feed_candidates.append(self.a, .{ .position = next, .path = try std.fmt.allocPrint(self.a, "change-log/{s}", .{next}) });
+            }
+        }
+        std.mem.sort(Candidate, feed_candidates.items, {}, struct {
+            fn less(_: void, x: Candidate, y: Candidate) bool {
+                return std.mem.order(u8, x.position, y.position) == .lt;
+            }
+        }.less);
+        var items: std.ArrayList(t.SpaceChange) = .empty;
+        var scanned: usize = 0;
+        const cutoff = @max(self.state.change_min_recorded_at, self.service.context.now_ms -| @as(i64, @intCast(self.state.config.change_retention_ms)));
+        for (feed_candidates.items) |candidate| {
+            if (eql(u8, candidate.position, position)) continue;
+            if (scanned == request.limit) break;
+            scanned += 1;
+            position = candidate.position;
+            const record = (try self.read(FeedRecord, candidate.path)) orelse continue;
+            if (record.event.recorded_at <= cutoff) continue;
+            var event = record.event;
+            if (!try self.feedAvailable(event)) {
+                event.kind = .context_invalidated;
+                event.target = null;
+                event.branch = "";
+            }
+            try items.append(self.a, event);
+        }
+        const caught_up = feed_candidates.items.len <= scanned;
+        if (caught_up) position = tail;
+        return self.encode(t.ChangePage{ .items = items.items, .next_cursor = try self.feedCursor(position, if (self.state.input_digest_key.len == 64) 1 else 0, self.service.context.now_ms), .caught_up = caught_up, .revision = self.state.revision, .retained_from = self.state.change_floor, .retained_after = cutoff });
+    }
+
+    fn screenTyped(self: *Run, comptime T: type, value: T) !T {
+        const result = try screening.typed(T, self.a, value, self.state.config.intake_screening);
+        self.intake_report.add(result.report);
+        return result.value;
+    }
     fn encode(self: *Run, value: anytype) ![]const u8 {
         return std.json.Stringify.valueAlloc(self.a, value, .{});
     }
@@ -512,7 +1473,18 @@ const Run = struct {
         self.historical.clearRetainingCapacity();
         for (checkpoint) |change| try self.stageChange(change.key, change.json);
     }
+    fn snapshotPath(self: *Run, path: []const u8) !?[]const u8 {
+        if (self.change_positions.contains(path)) return path;
+        if (self.lineage_head) |head| if (head.complete and !self.lineage_raw) {
+            if (std.mem.startsWith(u8, path, "assertion/") or std.mem.startsWith(u8, path, "evidence/") or std.mem.startsWith(u8, path, "entity/") or std.mem.startsWith(u8, path, "history/")) return self.lineage_index.?.get(head.root, path);
+        };
+        return path;
+    }
     fn read(self: *Run, comptime T: type, path: []const u8) !?T {
+        if (comptime T == t.StoredAssertion or T == t.StoredEvidence or T == t.EntityRecord) return self.rawRead(T, (try self.snapshotPath(path)) orelse return null);
+        return self.rawRead(T, path);
+    }
+    fn rawRead(self: *Run, comptime T: type, path: []const u8) !?T {
         if (self.change_positions.get(path)) |position| return if (self.changes.items[position].json) |json| try self.parseRead(T, path, json) else null;
         if (self.backend_rows.getEntry(path)) |entry| return if (entry.value_ptr.*) |json| try self.parseRead(T, path, json) else null;
         const row = try self.service.backend.get(self.service.backend.ptr, self.a, path);
@@ -523,7 +1495,8 @@ const Run = struct {
     fn prefetch(self: *Run, paths: []const []const u8) !void {
         var batch: std.ArrayList([]const u8) = .empty;
         var seen: ResourceSet = .empty;
-        for (paths) |path| {
+        for (paths) |requested| {
+            const path = (try self.snapshotPath(requested)) orelse continue;
             if (self.change_positions.contains(path) or self.backend_rows.contains(path) or seen.contains(path)) continue;
             try seen.put(self.a, path, {});
             try batch.append(self.a, path);
@@ -590,6 +1563,7 @@ const Run = struct {
         if (snapshot.state == .denied or snapshot.state == .changed) self.trackTime(self.service.context.now_ms +| resource_check_interval_ms);
     }
     fn requireAdmin(self: *Run) !void {
+        self.administrative_view = true;
         try self.service.context.requireGrant(.admin);
     }
     fn requiredGrant(self: *Run, action: Action, id: []const u8, body: []const u8) !t.RequiredGrant {
@@ -748,7 +1722,10 @@ const Run = struct {
         return result.items;
     }
     fn authorize(self: *Run, owner: []const u8, visibility: t.Visibility) !void {
-        if (visibility == .private and !eql(u8, owner, self.service.context.principal) and !self.service.context.admin) return error.Forbidden;
+        if (visibility == .private and !eql(u8, owner, self.service.context.principal)) {
+            if (!self.service.context.admin) return error.Forbidden;
+            if (!self.administrative_view) try self.requireAdmin();
+        }
     }
     fn assertion(self: *Run, id: []const u8) !?t.StoredAssertion {
         return self.read(t.StoredAssertion, try key(self.a, "assertion", id));
@@ -850,6 +1827,11 @@ const Run = struct {
         try self.inferenceCompleted(inputs);
         return result;
     }
+    fn embedClaimDocument(self: *Run, model: t.Model, text: []const u8, inputs: ResourceSet) ![]const f32 {
+        const result = if (self.service.backend.embed_document) |document| try document(self.service.backend.ptr, self.a, model, text) else try self.service.backend.embed.?(self.service.backend.ptr, self.a, model, text);
+        try self.inferenceCompleted(inputs);
+        return result;
+    }
     fn embeddingInputs(self: *Run, claim: t.Assertion, generated: bool) !void {
         try self.validateAssertion(claim, generated);
         if (!try self.generationVisible("assertion", claim.id)) return error.MemoryForgotten;
@@ -865,6 +1847,9 @@ const Run = struct {
         return snapshot.state == .current or (self.historical_resource_reads and snapshot.state == .changed);
     }
     fn evidenceRetained(self: *Run, source: t.StoredEvidence) !bool {
+        if (self.lineage_head) |head| if (head.complete and !self.lineage_raw and !self.change_positions.contains(try key(self.a, "evidence", source.evidence.id))) {
+            if (try self.lineage_index.?.get(head.root, try key(self.a, "evidence", source.evidence.id)) == null) return false;
+        };
         if (source.forgotten or self.isExpired(source) or
             try self.read(bool, "forgotten-all") != null or
             try self.read(bool, try key(self.a, "forgotten-source", source.evidence.source_id)) != null or
@@ -974,7 +1959,7 @@ const Run = struct {
         self.support_work += 1;
     }
     fn viewKey(self: *Run, kind: []const u8, id: []const u8, revision: u64, known: ?i64, valid: ?i64, depth: u8) ![]const u8 {
-        return hash(self.a, .{ kind, id, revision, known, valid, depth, self.state.config.generation, self.service.context.principal, self.service.context.admin, self.retention_maintenance });
+        return hash(self.a, .{ kind, id, revision, known, valid, depth, self.state.config.generation, self.service.context.branch, if (self.lineage_head) |head| head.root else null, self.service.context.principal, self.service.context.admin, self.retention_maintenance });
     }
     fn retained(self: *Run, record: t.StoredAssertion, depth: u8) anyerror!bool {
         if (depth >= max_dependency_depth) return error.MemoryWorkLimit;
@@ -1008,6 +1993,9 @@ const Run = struct {
         return true;
     }
     fn retainedInner(self: *Run, record: t.StoredAssertion, depth: u8) anyerror!bool {
+        if (self.lineage_head) |head| if (head.complete and !self.lineage_raw and !self.change_positions.contains(try key(self.a, "assertion", record.assertion.id))) {
+            if (try self.lineage_index.?.get(head.root, try key(self.a, "assertion", record.assertion.id)) == null or try self.lineage_index.?.get(head.root, try historyKey(self.a, record.assertion.id, record.revision)) == null) return false;
+        };
         if (depth >= max_dependency_depth) return error.MemoryWorkLimit;
         if (try self.read(bool, "forgotten-all") != null or try self.read(bool, try key(self.a, "forgotten-assertion", record.assertion.id)) != null) return false;
         if (!try self.generationRetained("assertion", record.assertion.id)) return false;
@@ -1035,7 +2023,7 @@ const Run = struct {
         return self.evidenceVisibleDepth(record, 0);
     }
     fn asOf(self: *Run, id: []const u8, known: i64) !?t.StoredAssertion {
-        const cache_key = try hash(self.a, .{ id, known });
+        const cache_key = try hash(self.a, .{ id, known, self.service.context.branch });
         if (self.historical.getEntry(cache_key)) |entry| return entry.value_ptr.*;
         const prefix = try std.fmt.allocPrint(self.a, "history/{s}/", .{try hash(self.a, id)});
         var after: ?[]const u8 = null;
@@ -1047,7 +2035,7 @@ const Run = struct {
                 try self.supportStep();
                 count += 1;
                 if (count > 4096) return error.MemoryWorkLimit;
-                const version = try parse(t.StoredAssertion, self.a, row.json);
+                const version = (try self.read(t.StoredAssertion, row.key)) orelse continue;
                 if (version.recorded_at <= known and (selected == null or version.revision > selected.?.revision)) selected = version;
             }
             after = page.next;
@@ -1131,7 +2119,11 @@ const Run = struct {
         }
         if (request.evidence.len == 0 or request.evidence.len > t.max_items or request.context_evidence_ids.len > t.max_items or request.entities.len > self.state.config.max_output_items) return error.InvalidMemoryRequest;
         var inputs: std.ArrayList([]const u8) = .empty;
-        for (request.evidence) |original| {
+        for (request.evidence, 0..) |original, source_index| {
+            var materialization_report: screening.Report = .{};
+            if (self.state.config.intake_screening.mode == .redact and source_index < self.original_evidence.len) {
+                materialization_report = (try screening.typed(t.Evidence, self.a, self.original_evidence[source_index], self.state.config.intake_screening)).report;
+            }
             var source = original;
             if (self.state.config.processing == .managed) source.managed = true;
             if (source.resource_selector) |selector| {
@@ -1172,13 +2164,21 @@ const Run = struct {
                 if (snapshot.state != .current) return error.MemoryResourceChanged;
                 if (snapshot.payload_truncated) return error.MemoryInputTooLarge;
                 if (source.text.len > 0 and !eql(u8, source.text, snapshot.json)) return error.MemoryResourceChanged;
-                source.text = snapshot.json;
+                const screened = try screening.json(self.a, snapshot.json, self.state.config.intake_screening);
+                self.intake_report.add(screened.report);
+                materialization_report.add(screened.report);
+                if (!eql(u8, source.text, screened.value) and screened.report.redactions > 0) try self.intake_redacted_evidence.put(self.a, source.id, {});
+                source.text = screened.value;
                 if (source.source_id.len == 0) source.source_id = try hash(self.a, .{ reference.database, reference.namespace, reference.table_id, reference.kind, reference.id });
                 if (source.source_version.len == 0) source.source_version = try std.fmt.allocPrint(self.a, "{d}", .{reference.revision});
                 try self.put(try std.fmt.allocPrint(self.a, "resource-evidence/{s}/{s}", .{ try hash(self.a, reference.identity()), try hash(self.a, source.id) }), .{ .evidence_id = source.id });
                 try self.put(try key(self.a, "resource-watch", source.id), .{ .evidence_id = source.id, .last_state = snapshot.state });
                 self.scheduleResourceCheck();
             }
+            const screened_source = try screening.typed(t.Evidence, self.a, source, self.state.config.intake_screening);
+            self.intake_report.add(screened_source.report);
+            materialization_report.add(screened_source.report);
+            source = screened_source.value;
             try t.validateId(source.id);
             try t.validateId(source.source_id);
             try t.validateId(source.source_version);
@@ -1204,7 +2204,14 @@ const Run = struct {
                 // Evidence identifiers name immutable versions. Source edits
                 // use a fresh evidence ID, preserving historical provenance.
                 if (!eql(u8, try self.encode(old.evidence), try self.encode(source))) return error.MemoryEvidenceConflict;
-            } else try self.put(path, t.StoredEvidence{ .evidence = source, .owner = self.service.context.principal, .recorded_at = self.service.context.now_ms, .revision = self.state.revision });
+            } else {
+                const existing = if (self.lineage_head != null) try self.rawRead(t.StoredEvidence, path) else null;
+                if (existing) |old| {
+                    try self.authorize(old.owner, .private);
+                    if (!valueEqual(t.Evidence, old.evidence, source)) return error.MemoryEvidenceConflict;
+                }
+                try self.put(path, existing orelse t.StoredEvidence{ .materialization = if (materialization_report.redactions > 0) .{ .screening = materialization_report, .text_redacted = self.intake_redacted_evidence.contains(source.id), .text_sha256 = try textDigest(self.a, source.text) } else null, .evidence = source, .owner = self.service.context.principal, .recorded_at = self.service.context.now_ms, .revision = self.state.revision });
+            }
             try self.indexEpisode((try self.evidence(source.id)).?);
             const expires = self.evidenceExpiry((try self.evidence(source.id)).?);
             if (expires) |time| if (self.state.next_expiry_at == null or time < self.state.next_expiry_at.?) {
@@ -1302,6 +2309,7 @@ const Run = struct {
             // cannot borrow managed evidence through an alternative branch.
             if (!generated and source.evidence.managed) return error.MemoryProducerConflict;
             if (claim.visibility == .team and source.evidence.visibility == .private) return error.MemoryVisibilityConflict;
+            if (ref.span != null and self.intake_redacted_evidence.contains(ref.id)) return error.InvalidMemorySpan;
             if (ref.span) |span| {
                 if (span.start >= span.end or span.end > source.evidence.text.len or !std.unicode.utf8ValidateSlice(source.evidence.text[span.start..span.end])) return error.InvalidMemorySpan;
             }
@@ -1342,7 +2350,10 @@ const Run = struct {
             for (vector) |value| if (!std.math.isFinite(value)) return error.MemoryEmbeddingMismatch;
         }
     }
-    fn assertions(self: *Run, claims: []const t.Assertion, generated: bool) !void {
+    fn assertions(self: *Run, input: []const t.Assertion, generated: bool) !void {
+        const before = self.intake_report.redactions;
+        const claims = try self.screenTyped([]const t.Assertion, input);
+        if (self.intake_report.redactions != before) for (claims) |claim| if (claim.embedding != null) return error.MemoryEmbeddingMismatch;
         if (claims.len > self.state.config.max_output_items) return error.MemoryInputTooLarge;
         for (claims) |original| {
             var claim = original;
@@ -1367,8 +2378,12 @@ const Run = struct {
                 if (!eql(u8, try self.encode(prior_claim), try self.encode(claim))) return error.MemoryAssertionConflict;
                 continue;
             }
+            if (self.lineage_head != null) if (try self.rawRead(t.StoredAssertion, try key(self.a, "assertion", claim.id))) |existing| {
+                try self.authorize(existing.owner, .private);
+                if (existing.input_hash.len == 0 or !eql(u8, existing.input_hash, input_hash)) return error.MemoryAssertionConflict;
+            };
             if (self.state.config.features.semantic_recall and claim.embedding == null) {
-                claim.embedding = try self.embed(self.state.config.models.embedder.?, claim.statement, embedding_inputs);
+                claim.embedding = try self.embedClaimDocument(self.state.config.models.embedder.?, claim.statement, embedding_inputs);
                 claim.embedding_model = self.state.config.models.embedder;
             }
             try self.validateAssertion(claim, generated);
@@ -1426,8 +2441,9 @@ const Run = struct {
         const prior = inputs.result;
         if (prior.len == 0) return null;
         const incoming = claim.*;
-        const decision = try decide(self.service.backend.ptr, self.a, self.state.config, incoming, prior);
+        const raw_decision = try decide(self.service.backend.ptr, self.a, self.state.config, incoming, prior);
         try self.inferenceCompleted(inputs.resources);
+        const decision = try self.screenTyped(t.ReconciliationDecision, raw_decision);
         if (decision.reason.len == 0 or decision.reason.len > t.max_text_bytes) return error.MemoryUngroundedOutput;
         for (decision.supersedes) |target| {
             var found = false;
@@ -1488,6 +2504,246 @@ const Run = struct {
             try result.append(self.a, try self.publicRecord(old));
         }
         return result.items;
+    }
+    fn claimView(self: *Run, record: t.StoredAssertion) !t.ClaimView {
+        try self.authorize(record.owner, record.assertion.visibility);
+        if (!try self.evidenceVisible(record)) return error.MemoryNotFound;
+        var public = try self.publicRecord(record);
+        public.assertion.embedding = null;
+        public.assertion.embedding_model = null;
+        return .{ .memory = public, .fingerprint = try hash(self.a, .{ public, self.state.config.generation }), .config_generation = self.state.config.generation };
+    }
+    fn pinnedClaim(self: *Run, pin: t.ClaimPin, current: bool, generation: u64) !t.ClaimView {
+        const present = (try self.assertion(pin.id)) orelse return error.MemoryNotFound;
+        try self.authorize(present.owner, present.assertion.visibility);
+        if (!try self.retained(present, 0)) return error.MemoryForgotten;
+        const record = if (current) present else (try self.read(t.StoredAssertion, try historyKey(self.a, pin.id, pin.revision))) orelse return error.MemoryNotFound;
+        if (record.revision != pin.revision) return error.MemoryRevisionConflict;
+        // Re-render even a frozen revision through live source authorization.
+        // Access loss may alter the input without changing a memory revision.
+        var public = try self.publicRecord(record);
+        public.assertion.embedding = null;
+        public.assertion.embedding_model = null;
+        if (!try self.retained(record, 0)) return error.MemoryForgotten;
+        const fingerprint = try hash(self.a, .{ public, generation });
+        if (!eql(u8, fingerprint, pin.fingerprint)) return error.MemoryResourceChanged;
+        return .{ .memory = public, .fingerprint = fingerprint, .config_generation = generation };
+    }
+    fn claimsOverlap(self: *Run, lhs: t.StoredAssertion, rhs: t.StoredAssertion) !bool {
+        const left = lhs.assertion;
+        const right = rhs.assertion;
+        if (eql(u8, left.id, right.id) or left.visibility != right.visibility or (left.visibility == .private and !eql(u8, lhs.owner, rhs.owner))) return false;
+        const subject = (try self.canonical(left.subject)) orelse return false;
+        if (!eql(u8, subject, (try self.canonical(right.subject)) orelse return false)) return false;
+        if (left.scope.len != 0 and right.scope.len != 0 and !eql(u8, left.scope, right.scope)) return false;
+        if (left.task != null and right.task != null and !optionalEqual(left.task, right.task)) return false;
+        if (left.environment != null and right.environment != null and !optionalEqual(left.environment, right.environment)) return false;
+        return intervalsOverlap(left, right);
+    }
+    fn supersessionCandidates(self: *Run, id: []const u8, request: t.SupersessionCandidateRequest) ![]const u8 {
+        if (request.max_bytes < 4096 or request.max_bytes > 4 * 1024 * 1024 or request.limit == 0 or request.limit > 64 or !std.math.isFinite(request.lexical_threshold) or request.lexical_threshold <= 0 or request.lexical_threshold > 1 or !std.math.isFinite(request.semantic_threshold) or request.semantic_threshold <= 0) return error.InvalidMemoryRequest;
+        const seed_record = (try self.assertion(id)) orelse return error.MemoryNotFound;
+        const captured = try self.captureResources(claimView, .{seed_record});
+        const seed = captured.result;
+        if (try encodedSize(seed) + 1024 > request.max_bytes) return error.MemoryInputTooLarge;
+        const index = (try self.read(t.RecallIndex, "assertion-recall-index")) orelse t.RecallIndex{};
+        const ready = self.service.backend.search_assertions != null and index.version == t.recall_index_version and index.generation == self.state.config.generation and index.complete and (try self.service.backend.scan(self.service.backend.ptr, self.a, "assertion-recall-work/", null, 1)).rows.len == 0;
+        var page: t.SupersessionCandidatePage = .{ .seed = seed, .items = &.{}, .retrieval = if (ready) .indexed else .not_ready, .semantic_discovery = if (!self.state.config.features.semantic_recall) .disabled else .not_ready, .truncated = false, .revision = self.state.revision };
+        if (!ready) return self.encode(page);
+        var query_vector: ?[]const f32 = null;
+        var self_similarity: f64 = 0;
+        if (request.mode != .lexical and self.state.config.features.semantic_recall and self.service.backend.embed != null and !eql(u8, self.state.config.models.embedder.?.provider, "external")) {
+            if (try self.vectorFor(self.state.config, seed_record.assertion)) |document| {
+                query_vector = try self.embed(self.state.config.models.embedder.?, seed.memory.assertion.statement, captured.resources);
+                self_similarity = try cosine(query_vector.?, document);
+                if (self_similarity > 0) page.semantic_discovery = .indexed;
+            }
+        }
+        if (request.mode == .semantic and page.semantic_discovery != .indexed) return self.encode(page);
+        var text: std.ArrayList([]const u8) = .empty;
+        var dense: std.ArrayList([]const u8) = .empty;
+        const audience = try self.recallAudience(seed_record);
+        if (try self.read(bool, try self.recallAudienceKey(self.state.config, audience)) == null) return self.encode(page);
+        try text.append(self.a, try self.recallIndexName(self.state.config, audience, false));
+        if (page.semantic_discovery == .indexed) try dense.append(self.a, try self.recallIndexName(self.state.config, audience, true));
+        var found: RecallSearchPage = .{ .keys = &.{}, .more = false };
+        var discovered: std.StringHashMapUnmanaged(void) = .empty;
+        var found_keys: std.ArrayList([]const u8) = .empty;
+        for ([_]bool{ false, true }) |semantic_lane| {
+            if (semantic_lane and dense.items.len == 0 or !semantic_lane and request.mode == .semantic) continue;
+            const lane = try self.service.backend.search_assertions.?(self.service.backend.ptr, self.a, .{ .text_indexes = text.items, .vector_indexes = if (semantic_lane) dense.items else &.{}, .query = if (semantic_lane) "" else seed.memory.assertion.statement, .filters = .{ .subjects = try self.identityMembers(seed_record.assertion.subject), .overlapping_scope = if (seed_record.assertion.scope.len > 0) seed_record.assertion.scope else null, .environment = seed_record.assertion.environment, .task = seed_record.assertion.task }, .embedding = if (semantic_lane) query_vector else null, .limit = request.limit + 1 });
+            if (lane.keys.len > request.limit + 1) return error.MemoryCorruptState;
+            found.more = found.more or lane.more;
+            for (lane.keys) |path| {
+                const entry = try discovered.getOrPut(self.a, path);
+                if (!entry.found_existing) try found_keys.append(self.a, path);
+            }
+        }
+        found.keys = found_keys.items;
+        if (found.keys.len > 256) return error.MemoryCorruptState;
+        var rows: std.ArrayList(t.StoredAssertion) = .empty;
+        var offset: usize = 0;
+        while (offset < found.keys.len) {
+            const end = @min(found.keys.len, offset + 128);
+            try rows.appendSlice(self.a, try self.indexedRecallPage(found.keys[offset..end]));
+            offset = end;
+        }
+        var query = try lexical.PreparedQuery.init(self.lexical_allocator, seed.memory.assertion.statement);
+        defer query.deinit();
+        var items: std.ArrayList(t.SupersessionCandidate) = .empty;
+        for (rows.items) |record| {
+            if (record.lifecycle != .active or record.stale or !try self.claimsOverlap(seed_record, record)) continue;
+            self.authorize(record.owner, record.assertion.visibility) catch continue;
+            if (!try self.evidenceVisible(record)) continue;
+            const lexical_score = query.coverage(record.assertion.statement);
+            const semantic: ?f64 = if (query_vector != null and self_similarity > 0) if (try self.vectorFor(self.state.config, record.assertion)) |document| (try cosine(query_vector.?, document)) / self_similarity else null else null;
+            if (!(request.mode != .semantic and lexical_score >= request.lexical_threshold) and !(request.mode != .lexical and semantic != null and semantic.? >= request.semantic_threshold)) continue;
+            try items.append(self.a, .{ .view = try self.claimView(record), .lexical_score = lexical_score, .semantic_similarity = semantic });
+        }
+        std.mem.sort(t.SupersessionCandidate, items.items, {}, struct {
+            fn less(_: void, left: t.SupersessionCandidate, right: t.SupersessionCandidate) bool {
+                const l = @max(left.lexical_score, left.semantic_similarity orelse 0);
+                const r = @max(right.lexical_score, right.semantic_similarity orelse 0);
+                return l > r or (l == r and std.mem.lessThan(u8, left.view.memory.assertion.id, right.view.memory.assertion.id));
+            }
+        }.less);
+        page.truncated = found.more or items.items.len > request.limit;
+        page.items = items.items[0..@min(items.items.len, request.limit)];
+        while (true) {
+            const output = try self.encode(page);
+            if (output.len <= request.max_bytes) return output;
+            if (page.items.len == 0) return error.MemoryInputTooLarge;
+            page.items = page.items[0 .. page.items.len - 1];
+            page.truncated = true;
+        }
+    }
+    fn supersessionOpenKey(self: *Run, id: []const u8) ![]const u8 {
+        return std.fmt.allocPrint(self.a, "supersession-open/{s}/{s}", .{ try hash(self.a, self.service.context.branch), try hash(self.a, id) });
+    }
+    fn supersessionProposalRetained(self: *Run, proposal: t.SupersessionProposal) !bool {
+        for ([_]t.ClaimPin{ proposal.incoming, proposal.previous }) |pin| {
+            const record = (try self.assertion(pin.id)) orelse return false;
+            self.authorize(record.owner, record.assertion.visibility) catch return false;
+            if (!try self.retained(record, 0)) return false;
+        }
+        for (proposal.evidence) |ref| {
+            const source = (try self.evidence(ref.id)) orelse return false;
+            self.authorize(source.owner, source.evidence.visibility) catch return false;
+            if (!try self.evidenceRetained(source)) return false;
+        }
+        return true;
+    }
+    fn supersessionProposal(self: *Run, id: []const u8) !t.SupersessionProposal {
+        try self.service.context.requireGrant(.curator);
+        const proposal = (try self.read(t.SupersessionProposal, try key(self.a, "supersession-proposal", id))) orelse return error.MemoryNotFound;
+        if (!eql(u8, proposal.branch, self.service.context.branch) or !try self.supersessionProposalRetained(proposal)) return error.MemoryNotFound;
+        return proposal;
+    }
+    fn supersessionProposalDetail(self: *Run, id: []const u8) !t.SupersessionProposalDetail {
+        const proposal = try self.supersessionProposal(id);
+        return .{ .proposal = proposal, .incoming = try self.pinnedClaim(proposal.incoming, false, proposal.config_generation), .previous = try self.pinnedClaim(proposal.previous, false, proposal.config_generation), .stale_configuration = proposal.config_generation != self.state.config.generation };
+    }
+    fn supersessionProposals(self: *Run, request: operations.Page) ![]const u8 {
+        try self.service.context.requireGrant(.curator);
+        if (request.limit == 0 or request.limit > 256) return error.InvalidMemoryRequest;
+        const prefix = try std.fmt.allocPrint(self.a, "supersession-open/{s}/", .{try hash(self.a, self.service.context.branch)});
+        const page = try self.service.backend.scan(self.service.backend.ptr, self.a, prefix, try self.decodeCursor(prefix, request.cursor), request.limit);
+        var items: std.ArrayList(t.SupersessionProposal) = .empty;
+        for (page.rows) |row| {
+            const id = try parse([]const u8, self.a, row.json);
+            const proposal = (try self.read(t.SupersessionProposal, try key(self.a, "supersession-proposal", id))) orelse continue;
+            if (proposal.verdict == null and try self.supersessionProposalRetained(proposal)) try items.append(self.a, proposal);
+        }
+        return self.encode(t.SupersessionProposalPage{ .items = items.items, .next_cursor = try self.encodeCursor(prefix, page.next), .complete = page.next == null, .revision = self.state.revision });
+    }
+    fn proposeSupersession(self: *Run, request: t.SupersessionProposalRequest, receipt: *t.Operation) !void {
+        if (request.expected_revision != self.state.revision - 1) return error.MemoryRevisionConflict;
+        try t.validateId(request.id);
+        if (request.actor.len > 0) try t.validateId(request.actor);
+        if (try self.read(bool, try key(self.a, "forgotten-supersession-proposal", request.id)) != null) return error.MemoryForgotten;
+        if (try self.read(t.SupersessionProposal, try key(self.a, "supersession-proposal", request.id)) != null) return error.MemoryEntityConflict;
+        const incoming = try self.pinnedClaim(request.incoming, true, self.state.config.generation);
+        const previous = try self.pinnedClaim(request.previous, true, self.state.config.generation);
+        if (incoming.memory.lifecycle != .active or previous.memory.lifecycle != .active or !try self.claimsOverlap(incoming.memory, previous.memory)) return error.MemoryInvalidSupersession;
+        try self.put(try key(self.a, "supersession-proposal", request.id), t.SupersessionProposal{ .branch = self.service.context.branch, .id = request.id, .incoming = request.incoming, .previous = request.previous, .owner = self.service.context.principal, .actor = request.actor, .config_generation = self.state.config.generation, .revision = self.state.revision, .recorded_at = self.service.context.now_ms });
+        try self.put(try self.supersessionOpenKey(request.id), request.id);
+        receipt.proposal_id = request.id;
+        if (request.actor.len > 0) receipt.origin = .{ .agent = .{ .id = request.actor, .kind = .agent } };
+    }
+    fn reviewSupersession(self: *Run, id: []const u8, request: t.SupersessionVerdict, receipt: *t.Operation) !void {
+        if (request.expected_revision != self.state.revision - 1) return error.MemoryRevisionConflict;
+        if (request.reason.len > t.max_text_bytes or !std.unicode.utf8ValidateSlice(request.reason)) return error.InvalidMemoryRequest;
+        if (request.actor.len > 0) try t.validateId(request.actor);
+        if (request.model) |model| {
+            try t.validateId(model.provider);
+            try t.validateId(model.model);
+            try t.validateId(model.revision);
+        }
+        var proposal = try self.supersessionProposal(id);
+        if (proposal.verdict != null) return error.MemoryEntityConflict;
+        if (proposal.config_generation != self.state.config.generation) return error.MemoryConfigurationChanged;
+        const incoming_view = try self.pinnedClaim(proposal.incoming, true, proposal.config_generation);
+        const previous_view = try self.pinnedClaim(proposal.previous, true, proposal.config_generation);
+        var incoming = (try self.assertion(proposal.incoming.id)).?;
+        var previous = (try self.assertion(proposal.previous.id)).?;
+        if (incoming.lifecycle != .active or previous.lifecycle != .active or !try self.claimsOverlap(incoming, previous)) return error.MemoryInvalidSupersession;
+        try self.reviewEvidence(request.evidence);
+        if (request.verdict) |verdict| {
+            const valid = incoming.assertion.valid_from;
+            const incoming_authority = (try self.authority(incoming.assertion, valid)) orelse return error.MemoryForgotten;
+            const previous_authority = (try self.authority(previous.assertion, valid)) orelse return error.MemoryForgotten;
+            if (incoming.assertion.visibility == .team) for (request.evidence) |ref| {
+                if ((try self.evidence(ref.id)).?.evidence.visibility != .team) return error.MemoryVisibilityConflict;
+            };
+            if (verdict == .supersedes or verdict == .contradicts) {
+                if (incoming_authority < previous_authority or incoming.assertion.modality != .actual or incoming.assertion.role == .hypothesized or incoming.assertion.stability != .settled or previous.assertion.modality != .actual) return error.MemoryInvalidSupersession;
+            }
+            if (verdict == .supersedes) {
+                // Similarity and an outside judgment cannot broaden the native
+                // replacement policy's subject, predicate or scope partition.
+                if (!try self.sameCanonicalGroup(incoming.assertion, previous.assertion)) return error.MemoryInvalidSupersession;
+                if (incoming.assertion.valid_to) |end| if (previous.asserted_valid_to == null or end < previous.asserted_valid_to.?) return error.MemoryInvalidSupersession;
+                var claim = incoming.assertion;
+                claim.supersedes = &.{previous.assertion.id};
+                claim.reconciliation_reason = request.reason;
+                try self.applySupersessions(claim, incoming.owner, null);
+                var links: std.ArrayList([]const u8) = .empty;
+                try links.appendSlice(self.a, incoming.assertion.supersedes);
+                for (links.items) |link| if (eql(u8, link, previous.assertion.id)) return error.MemoryInvalidSupersession;
+                if (links.items.len >= t.max_items) return error.MemoryWorkLimit;
+                try links.append(self.a, previous.assertion.id);
+                incoming.assertion.supersedes = links.items;
+                incoming.assertion.reconciliation_reason = request.reason;
+                incoming.revision = self.state.revision;
+                try self.putAssertion(incoming);
+            } else if (verdict == .contradicts) {
+                try self.conflict(&previous, incoming.assertion.id, request.reason);
+                try self.conflict(&incoming, previous.assertion.id, request.reason);
+                for ([_]*t.StoredAssertion{ &incoming, &previous }) |record| {
+                    record.revision = self.state.revision;
+                    record.explicit_disposition = explicitDisposition(record.*);
+                    record.explicit_disposition.?.provenance = .{ .principal = self.service.context.principal, .recorded_at = self.service.context.now_ms, .evidence = request.evidence };
+                    try self.putAssertion(record.*);
+                    try self.invalidate("assertion", record.assertion.id);
+                }
+            }
+            // Restatement records a relationship without merging claim IDs or
+            // discarding independent citations. Independent is an explicit no-op.
+            try self.put(try std.fmt.allocPrint(self.a, "claim-verdict/{s}/{s}", .{ try hash(self.a, incoming.assertion.id), try hash(self.a, previous.assertion.id) }), .{ .proposal_id = id, .relation = verdict });
+            try self.remove(try self.supersessionOpenKey(id));
+        }
+        for ([_]t.ClaimView{ incoming_view, previous_view }) |view| try self.decision_targets.append(self.a, try self.resourceRef(.assertion, view.memory.assertion.id, view.memory.revision));
+        proposal.verdict = request.verdict;
+        proposal.verdict_revision = self.state.revision;
+        proposal.verdict_principal = self.service.context.principal;
+        proposal.verdict_actor = request.actor;
+        proposal.reason = request.reason;
+        proposal.evidence = request.evidence;
+        proposal.model = request.model;
+        proposal.revision = self.state.revision;
+        try self.put(try key(self.a, "supersession-proposal", id), proposal);
+        receipt.proposal_id = id;
+        if (request.actor.len > 0) receipt.origin = .{ .agent = .{ .id = request.actor, .kind = .agent } };
     }
     fn objectTyped(self: *Run, predicate: []const u8) bool {
         if (self.state.config.ontology_pack == .software_team_v1 and isConceptRelation(predicate)) return true;
@@ -1551,9 +2807,28 @@ const Run = struct {
             var raw = claim;
             raw.subject = subject;
             const prefix = try groupPrefix(self.a, raw, owner);
+            if (self.lineage_head) |head| if (head.complete and !self.lineage_raw) {
+                for (self.changes.items) |change| if (change.json != null and std.mem.startsWith(u8, change.key, prefix) and try self.lineage_index.?.get(head.root, change.key) == null) {
+                    const entry = try parse(struct { id: []const u8 }, self.a, change.json.?);
+                    if (try self.assertion(entry.id)) |record| {
+                        if (records.items.len >= 4096) return error.MemoryWorkLimit;
+                        try records.append(self.a, record);
+                    }
+                };
+            };
             var cursor: ?[]const u8 = null;
             while (true) {
                 try self.service.context.check();
+                if (self.lineage_head) |head| if (head.complete and !self.lineage_raw) {
+                    const page = try self.lineage_index.?.page(head.root, prefix, try std.mem.concat(self.a, u8, &.{ prefix, "~" }), cursor, 128);
+                    for (page.items) |item| if (try self.read(t.StoredAssertion, item.value)) |record| {
+                        if (records.items.len >= 4096) return error.MemoryWorkLimit;
+                        try records.append(self.a, record);
+                    };
+                    cursor = page.next;
+                    if (cursor == null) break;
+                    continue;
+                };
                 const page = try self.scanOverlay(prefix, cursor, 128);
                 for (page.rows) |row| {
                     const entry = try parse(struct { id: []const u8 }, self.a, row.json);
@@ -1576,7 +2851,7 @@ const Run = struct {
             while (true) {
                 const page = try self.scanOverlay(prefix, cursor, 128);
                 for (page.rows) |row| {
-                    const entry = try parse(struct { child: []const u8 }, self.a, row.json);
+                    const entry = try parse(struct { child: []const u8, branch: []const u8 = "" }, self.a, row.json);
                     const seed = (try self.assertion(entry.child)) orelse continue;
                     if (!names.contains(seed.assertion.subject) and !(self.objectTyped(seed.assertion.predicate) and names.contains(seed.assertion.value))) continue;
                     for (try self.canonicalGroup(seed.assertion, seed.owner)) |record| {
@@ -1972,6 +3247,7 @@ const Run = struct {
             const source = (try self.evidence(ref.id)) orelse return error.MemoryEvidenceRequired;
             try self.authorize(source.owner, source.evidence.visibility);
             if (!try self.evidenceRetained(source) or !try self.resourceCurrent(source)) return error.MemoryForgotten;
+            if (ref.span != null and self.intake_redacted_evidence.contains(ref.id)) return error.InvalidMemorySpan;
             if (ref.span) |span| if (span.start >= span.end or span.end > source.evidence.text.len or !std.unicode.utf8ValidateSlice(source.evidence.text[span.start..span.end])) return error.InvalidMemorySpan;
         }
     }
@@ -2024,7 +3300,10 @@ const Run = struct {
         }
     }
     fn scanEpisodeRows(self: *Run, prefix: []const u8, after: ?[]const u8, limit: u32) !Page {
-        if (self.service.context.admin) return self.service.backend.scan(self.service.backend.ptr, self.a, prefix, after, limit);
+        if (self.service.context.admin) {
+            try self.requireAdmin();
+            return self.service.backend.scan(self.service.backend.ptr, self.a, prefix, after, limit);
+        }
         var rows: std.ArrayList(Row) = .empty;
         var more = false;
         for ([_][]const u8{ try self.episodeAudience(.team, ""), try self.episodeAudience(.private, self.service.context.principal) }) |root| {
@@ -2063,6 +3342,7 @@ const Run = struct {
         for (value.evidence) |ref| {
             const source = (try self.evidence(ref.id)).?;
             if (value.visibility == .team and source.evidence.visibility == .private) return error.MemoryVisibilityConflict;
+            if (ref.span != null and self.intake_redacted_evidence.contains(ref.id)) return error.InvalidMemorySpan;
             if (ref.span) |span| if (span.start >= span.end or span.end > source.evidence.text.len or !std.unicode.utf8ValidateSlice(source.evidence.text[span.start..span.end])) return error.InvalidMemorySpan;
         }
         const path = try key(self.a, "mention", value.id);
@@ -2086,7 +3366,7 @@ const Run = struct {
         const prefix = try std.fmt.allocPrint(self.a, "dependency/mention-evidence/{s}/", .{try hash(self.a, source.evidence.id)});
         const page = try self.scanOverlay(prefix, null, 64);
         for (page.rows) |row| {
-            const binding = try parse(struct { child: []const u8 }, self.a, row.json);
+            const binding = try parse(struct { child: []const u8, branch: []const u8 = "" }, self.a, row.json);
             const stored = (try self.read(t.StoredMention, try key(self.a, "mention", binding.child))) orelse continue;
             if (!try self.mentionVisible(stored, known)) continue;
             const canonical_id = (try self.canonical(stored.mention.entity_id)) orelse continue;
@@ -2197,12 +3477,12 @@ const Run = struct {
             complete = complete and page.next == null;
             var paths: std.ArrayList([]const u8) = .empty;
             for (page.rows) |row| {
-                const entry = try parse(struct { child: []const u8 }, self.a, row.json);
+                const entry = try parse(struct { child: []const u8, branch: []const u8 = "" }, self.a, row.json);
                 try paths.append(self.a, try key(self.a, "assertion", entry.child));
             }
             try self.prefetch(paths.items);
             for (page.rows) |row| {
-                const entry = try parse(struct { child: []const u8 }, self.a, row.json);
+                const entry = try parse(struct { child: []const u8, branch: []const u8 = "" }, self.a, row.json);
                 const record = (try self.assertion(entry.child)) orelse continue;
                 if (!eql(u8, name, record.assertion.subject) and !(self.objectTyped(record.assertion.predicate) and eql(u8, name, record.assertion.value))) continue;
                 try records.put(self.a, record.assertion.id, record);
@@ -2564,10 +3844,92 @@ const Run = struct {
     }
     const SemanticMatch = struct { id: []const u8, names: ?f64 = null, view: ?f64 = null };
     const SemanticMatches = struct { items: []const SemanticMatch = &.{}, queries: [2]?[]const f32 = .{ null, null }, self_scores: [2]f64 = .{ 0, 0 }, state: @FieldType(t.EntityCandidatePage, "semantic_discovery") = .not_indexed };
+    fn semanticPath(self: *Run, path: []const u8) ![]const u8 {
+        if (self.service.context.branch.len == 0) return path;
+        return std.fmt.allocPrint(self.a, "entity-semantic-branch/{s}/{s}", .{ try hash(self.a, self.service.context.branch), path });
+    }
+    fn semanticKey(self: *Run, prefix: []const u8, id: []const u8) ![]const u8 {
+        return self.semanticPath(try key(self.a, prefix, id));
+    }
+    fn semanticChildKey(self: *Run, kind: []const u8, parent: []const u8, id: []const u8) ![]const u8 {
+        return dependencyKey(self.a, kind, parent, if (self.service.context.branch.len == 0) id else try hash(self.a, .{ self.service.context.branch, id }));
+    }
+    fn queueSemanticBranch(self: *Run, branch: []const u8) !void {
+        if (!self.state.config.features.lineage or !self.state.config.semantic_discovery.enabled) return;
+        const binding = try key(self.a, "branch-semantic-binding", if (branch.len == 0) "main" else branch);
+        if (try self.read([]const u8, binding) != null) return;
+        const path = try std.fmt.allocPrint(self.a, "branch-semantic-work/{d:0>20}/{s}", .{ self.state.revision, try hash(self.a, branch) });
+        try self.put(path, .{ .branch = branch });
+        try self.put(binding, path);
+    }
+    fn invalidateSemanticBranches(self: *Run) !void {
+        if (self.state.config.features.lineage and self.state.config.semantic_discovery.enabled) try self.put("branch-semantic-invalidation", .{ .cursor = @as(?[]const u8, null) });
+    }
+    fn semanticBranchFanout(self: *Run) !void {
+        const work = (try self.read(struct { cursor: ?[]const u8 }, "branch-semantic-invalidation")) orelse return;
+        const page = try self.service.backend.scan(self.service.backend.ptr, self.a, "lineage-head/", work.cursor, 8);
+        const old_branch = self.service.context.branch;
+        defer self.service.context.branch = old_branch;
+        for (page.rows) |row| {
+            const head = try parse(t.LineageHead, self.a, row.json);
+            if (!head.complete) continue;
+            self.service.context.branch = head.id;
+            try self.put(try self.semanticPath("entity-semantic-index"), t.SemanticIndex{});
+            try self.queueSemanticBranch(head.id);
+        }
+        if (page.next) |next| try self.put("branch-semantic-invalidation", .{ .cursor = next }) else try self.remove("branch-semantic-invalidation");
+    }
+    fn semanticEntityPage(self: *Run, initial: bool, after: ?[]const u8) !Page {
+        if (initial) if (self.lineage_head) |head| if (head.complete) {
+            const page = try self.persistentIndex().page(head.root, "entity/", "entity/~", after, 8);
+            var paths: std.ArrayList([]const u8) = .empty;
+            for (page.items) |item| try paths.append(self.a, item.value);
+            try self.prefetch(paths.items);
+            var rows: std.ArrayList(Row) = .empty;
+            for (page.items) |item| if (try self.rawRead(t.EntityRecord, item.value)) |record| try rows.append(self.a, .{ .key = item.key, .json = try self.encode(record) });
+            return .{ .rows = rows.items, .next = page.next };
+        };
+        return self.service.backend.scan(self.service.backend.ptr, self.a, if (initial) "entity/" else try self.semanticPath("entity-semantic-work/"), after, 8);
+    }
+    fn semanticMaintenance(self: *Run) !void {
+        if (!self.state.config.semantic_discovery.enabled) return;
+        try self.requireAdmin();
+        try self.semanticBranchFanout();
+        const jobs = if (self.state.config.features.lineage) try self.service.backend.scan(self.service.backend.ptr, self.a, "branch-semantic-work/", null, 1) else Page{ .rows = &.{}, .next = null };
+        const saved_branch = self.service.context.branch;
+        const saved_head = self.lineage_head;
+        const saved_raw = self.lineage_raw;
+        defer {
+            self.service.context.branch = saved_branch;
+            self.lineage_head = saved_head;
+            self.lineage_raw = saved_raw;
+            self.views.clearRetainingCapacity();
+            self.historical.clearRetainingCapacity();
+        }
+        if (jobs.rows.len > 0) {
+            const branch = (try parse(struct { branch: []const u8 }, self.a, jobs.rows[0].json)).branch;
+            const head = (try self.rawRead(t.LineageHead, try key(self.a, "lineage-head", if (branch.len == 0) "main" else branch))) orelse return error.MemoryCorruptState;
+            try self.remove(jobs.rows[0].key);
+            try self.remove(try key(self.a, "branch-semantic-binding", if (branch.len == 0) "main" else branch));
+            if (!head.complete) return;
+            self.service.context.branch = branch;
+            self.lineage_head = head;
+        }
+        self.lineage_raw = false;
+        self.views.clearRetainingCapacity();
+        self.historical.clearRetainingCapacity();
+        try self.semanticMaintenanceScope();
+        if (self.semantic_ready_after_commit) self.semantic_publication_branch = self.service.context.branch;
+        if (self.state.config.features.lineage) {
+            const index = (try self.read(t.SemanticIndex, try self.semanticPath("entity-semantic-index"))) orelse return error.MemoryCorruptState;
+            if (!index.backfill_complete or (try self.service.backend.scan(self.service.backend.ptr, self.a, try self.semanticPath("entity-semantic-work/"), null, 1)).rows.len != 0) try self.queueSemanticBranch(self.service.context.branch);
+        }
+    }
     fn semanticDirty(self: *Run, id: []const u8) anyerror!void {
-        try self.put(try key(self.a, "entity-semantic-work", id), .{ .id = id });
+        try self.queueSemanticBranch(self.service.context.branch);
+        try self.put(try self.semanticKey("entity-semantic-work", id), .{ .id = id });
         if (try self.canonical(id)) |selected| if (!eql(u8, selected, id)) {
-            try self.put(try key(self.a, "entity-semantic-work", selected), .{ .id = selected });
+            try self.put(try self.semanticKey("entity-semantic-work", selected), .{ .id = selected });
         };
     }
     fn semanticQueryKey(self: *Run, record: t.EntityRecord, kind: t.ProjectionKind) ![]const u8 {
@@ -2579,7 +3941,8 @@ const Run = struct {
     fn semanticIndexName(self: *Run, record: t.EntityRecord, kind: t.ProjectionKind) ![]const u8 {
         // Separate native index namespaces enforce the audience before ANN,
         // without a corpus-sized postfilter or an ordinal membership scan.
-        return std.fmt.allocPrint(self.a, "memory_{s}_{s}", .{ @tagName(kind), try hash(self.a, .{ self.state.config.embedding_generation, self.state.config.models.embedder, record.entity.visibility, if (record.entity.visibility == .private) record.owner else "" }) });
+        const audience = .{ self.state.config.embedding_generation, self.state.config.models.embedder, record.entity.visibility, if (record.entity.visibility == .private) record.owner else "" };
+        return std.fmt.allocPrint(self.a, "memory_{s}_{s}", .{ @tagName(kind), if (self.service.context.branch.len == 0) try hash(self.a, audience) else try hash(self.a, .{ audience, self.service.context.branch }) });
     }
     const SemanticSnapshot = struct { view: ?t.EntityView = null, canonical: bool = true };
     fn semanticSnapshot(self: *Run, record: t.EntityRecord) !SemanticSnapshot {
@@ -2613,7 +3976,21 @@ const Run = struct {
         }
         return text.items;
     }
+    fn inheritedSemanticProjection(self: *Run, record: t.EntityRecord, kind: t.ProjectionKind, query: bool) !?t.EntityProjection {
+        const head = self.lineage_head orelse return null;
+        if (self.service.context.branch.len == 0) return null;
+        const parent = head.parent orelse return null;
+        const branch = self.service.context.branch;
+        self.service.context.branch = parent;
+        defer self.service.context.branch = branch;
+        return self.read(t.EntityProjection, if (query) try self.semanticQueryKey(record, kind) else try self.semanticProjectionKey(record, kind));
+    }
+    fn reusableSemanticVector(self: *Run, prior: t.EntityProjection, record: t.EntityRecord, kind: t.ProjectionKind, text: []const u8) bool {
+        const model = self.state.config.models.embedder.?;
+        return prior.kind == kind and eql(u8, prior.entity_id, record.entity.id) and eql(u8, prior.owner, record.owner) and prior.visibility == record.entity.visibility and prior.generation == self.state.config.embedding_generation and prior.embedding.len == model.dimensions.? and valueEqual(t.Model, prior.model, model) and eql(u8, prior.text, text);
+    }
     fn semanticCurrent(self: *Run, projection: t.EntityProjection, record: t.EntityRecord, view: t.EntityView) !bool {
+        if (!eql(u8, projection.branch, self.service.context.branch)) return false;
         if (projection.embedding.len != self.state.config.models.embedder.?.dimensions.? or projection.entity_revision != record.revision or projection.generation != self.state.config.embedding_generation or projection.config_generation != self.state.config.generation or !eql(u8, projection.entity_id, record.entity.id) or !eql(u8, projection.owner, record.owner) or projection.visibility != record.entity.visibility or !valueEqual(t.Model, projection.model, self.state.config.models.embedder.?)) return false;
         if (!eql(u8, projection.fingerprint, view.fingerprint) or !valueEqual([]const t.DerivedDependency, projection.dependencies, view.dependencies)) return false;
         if (projection.kind == .view) return eql(u8, projection.text, view.description);
@@ -2644,7 +4021,7 @@ const Run = struct {
         if ((try self.service.backend.scan(self.service.backend.ptr, self.a, prefix, null, 1)).rows.len != 0) try self.invalidate("semantic-assertion", input);
     }
     fn semanticBindings(self: *Run, id: []const u8, resources: ResourceSet, projections: []const []const u8, assertion_inputs: ResourceSet) !void {
-        const path = try key(self.a, "entity-semantic-binding", id);
+        const path = try self.semanticKey("entity-semantic-binding", id);
         const prior = (try self.read(SemanticBinding, path)) orelse SemanticBinding{ .id = id };
         var current: std.StringHashMapUnmanaged(void) = .empty;
         var inputs = resources.keyIterator();
@@ -2657,22 +4034,22 @@ const Run = struct {
             };
             if (!keep) try self.remove(projection);
         }
-        for (prior.resources) |resource| if (!current.contains(resource)) try self.remove(try dependencyKey(self.a, "semantic-resource", resource, id));
+        for (prior.resources) |resource| if (!current.contains(resource)) try self.remove(try self.semanticChildKey("semantic-resource", resource, id));
         const ids = try self.a.alloc([]const u8, current.count());
         var iterator = current.keyIterator();
         var i: usize = 0;
         while (iterator.next()) |resource| : (i += 1) {
             ids[i] = resource.*;
-            try self.put(try dependencyKey(self.a, "semantic-resource", resource.*, id), .{ .child = id });
+            try self.put(try self.semanticChildKey("semantic-resource", resource.*, id), .{ .child = id, .branch = self.service.context.branch });
         }
         std.mem.sort([]const u8, ids, {}, stringLess);
-        for (prior.assertions) |assertion_id| if (!assertion_inputs.contains(assertion_id)) try self.remove(try dependencyKey(self.a, "semantic-assertion", assertion_id, id));
+        for (prior.assertions) |assertion_id| if (!assertion_inputs.contains(assertion_id)) try self.remove(try self.semanticChildKey("semantic-assertion", assertion_id, id));
         const assertion_ids = try self.a.alloc([]const u8, assertion_inputs.count());
         var assertion_iterator = assertion_inputs.keyIterator();
         i = 0;
         while (assertion_iterator.next()) |assertion_id| : (i += 1) {
             assertion_ids[i] = assertion_id.*;
-            try self.put(try dependencyKey(self.a, "semantic-assertion", assertion_id.*, id), .{ .child = id });
+            try self.put(try self.semanticChildKey("semantic-assertion", assertion_id.*, id), .{ .child = id, .branch = self.service.context.branch });
         }
         std.mem.sort([]const u8, assertion_ids, {}, stringLess);
         if (ids.len == 0 and projections.len == 0 and assertion_ids.len == 0) try self.remove(path) else try self.put(path, SemanticBinding{ .id = id, .resources = ids, .projections = projections, .assertions = assertion_ids });
@@ -2686,16 +4063,16 @@ const Run = struct {
             if (try self.read(t.EntityProjection, query_path) != null) try self.remove(query_path);
         }
     }
-    const SemanticTimer = struct { id: []const u8, at: i64 };
+    const SemanticTimer = struct { branch: []const u8 = "", id: []const u8, at: i64 };
     fn semanticTimerKey(self: *Run, timer: SemanticTimer) ![]const u8 {
         const ordered = @as(u64, @bitCast(timer.at)) ^ (@as(u64, 1) << 63);
-        return std.fmt.allocPrint(self.a, "entity-semantic-due/{d:0>20}/{s}", .{ ordered, try hash(self.a, timer.id) });
+        return std.fmt.allocPrint(self.a, "entity-semantic-due/{d:0>20}/{s}", .{ ordered, if (timer.branch.len == 0) try hash(self.a, timer.id) else try hash(self.a, .{ timer.branch, timer.id }) });
     }
     fn scheduleSemanticTimer(self: *Run, id: []const u8, at: ?i64) !void {
-        const path = try key(self.a, "entity-semantic-timer", id);
+        const path = try self.semanticKey("entity-semantic-timer", id);
         if (try self.read(SemanticTimer, path)) |prior| try self.remove(try self.semanticTimerKey(prior));
         if (at) |time| {
-            const timer: SemanticTimer = .{ .id = id, .at = time };
+            const timer: SemanticTimer = .{ .branch = self.service.context.branch, .id = id, .at = time };
             try self.put(path, timer);
             try self.put(try self.semanticTimerKey(timer), timer);
         } else try self.remove(path);
@@ -2705,8 +4082,11 @@ const Run = struct {
         for (page.rows) |row| {
             const timer = try parse(SemanticTimer, self.a, row.json);
             if (timer.at > self.service.context.now_ms) break;
+            const old_branch = self.service.context.branch;
+            self.service.context.branch = timer.branch;
+            defer self.service.context.branch = old_branch;
             try self.remove(row.key);
-            const path = try key(self.a, "entity-semantic-timer", timer.id);
+            const path = try self.semanticKey("entity-semantic-timer", timer.id);
             if (try self.read(SemanticTimer, path)) |current| if (current.at == timer.at) {
                 try self.remove(path);
                 if (self.state.config.semantic_discovery.enabled) try self.semanticDirty(timer.id);
@@ -2723,16 +4103,16 @@ const Run = struct {
         // A failed invocation can release an embedded lease too. Restore the
         // complete source/control/authority fence before publishing retry debt.
         try self.inferenceCompleted(inputs);
-        const path = try key(self.a, "entity-semantic-failure", record.entity.id);
+        const path = try self.semanticKey("entity-semantic-failure", record.entity.id);
         const previous = try self.read(SemanticFailure, path);
         const attempts = if (previous != null and previous.?.generation == self.state.config.generation) previous.?.attempts +| 1 else @as(u16, 1);
         const delay: i64 = @min(300000, @as(i64, 1000) << @intCast(@min(attempts, 9)));
         const retry_at = self.service.context.currentTime() +| delay;
         try self.put(path, SemanticFailure{ .id = record.entity.id, .generation = self.state.config.generation, .attempts = attempts, .error_code = @errorName(failure), .next_retry_at = retry_at });
-        try self.put(try key(self.a, "entity-semantic-blocked", record.entity.id), .{ .id = record.entity.id });
-        const timer = try self.read(SemanticTimer, try key(self.a, "entity-semantic-timer", record.entity.id));
+        try self.put(try self.semanticKey("entity-semantic-blocked", record.entity.id), .{ .id = record.entity.id });
+        const timer = try self.read(SemanticTimer, try self.semanticKey("entity-semantic-timer", record.entity.id));
         try self.scheduleSemanticTimer(record.entity.id, if (timer) |current| @min(current.at, retry_at) else retry_at);
-        try self.remove(try key(self.a, "entity-semantic-work", record.entity.id));
+        try self.remove(try self.semanticKey("entity-semantic-work", record.entity.id));
         return error.MemorySemanticDeferred;
     }
     fn semanticEmbedding(self: *Run, record: t.EntityRecord, model: t.Model, text: []const u8, inputs: ResourceSet, progressed: bool, comptime query: bool) ![]const f32 {
@@ -2797,13 +4177,15 @@ const Run = struct {
             old_documents[slot] = old;
             old_queries[slot] = old_query;
             const text = if (kind == .names) try self.semanticNames(record.entity) else view.description;
-            const reusable = if (old) |prior| prior.generation == self.state.config.embedding_generation and prior.embedding.len == model.dimensions.? and valueEqual(t.Model, prior.model, model) and eql(u8, prior.text, text) else false;
-            documents[slot] = .{ .entity_id = record.entity.id, .entity_revision = record.revision, .model = model, .generation = self.state.config.embedding_generation, .config_generation = self.state.config.generation, .owner = record.owner, .visibility = record.entity.visibility, .kind = kind, .fingerprint = view.fingerprint, .dependencies = view.dependencies, .text = text, .embedding = if (reusable) old.?.embedding else &.{} };
+            const cached_document = old orelse try self.inheritedSemanticProjection(record, kind, false);
+            const cached_query = old_query orelse try self.inheritedSemanticProjection(record, kind, true);
+            const reusable = if (cached_document) |prior| self.reusableSemanticVector(prior, record, kind, text) else false;
+            documents[slot] = .{ .branch = self.service.context.branch, .entity_id = record.entity.id, .entity_revision = record.revision, .model = model, .generation = self.state.config.embedding_generation, .config_generation = self.state.config.generation, .owner = record.owner, .visibility = record.entity.visibility, .kind = kind, .fingerprint = view.fingerprint, .dependencies = view.dependencies, .text = text, .embedding = if (reusable) cached_document.?.embedding else &.{} };
             if (!reusable) {
                 try missing_slots.append(self.a, slot);
                 try missing_texts.append(self.a, text);
             }
-            if (reusable and old.?.query_embedding != null and old.?.query_embedding.?.len == model.dimensions.?) queries[slot] = old.?.query_embedding else if (old_query) |prior| {
+            if (reusable and cached_document.?.query_embedding != null and cached_document.?.query_embedding.?.len == model.dimensions.?) queries[slot] = cached_document.?.query_embedding else if (cached_query) |prior| {
                 if (prior.generation == self.state.config.embedding_generation and prior.embedding.len == model.dimensions.? and valueEqual(t.Model, prior.model, model) and eql(u8, prior.text, text)) queries[slot] = prior.embedding;
             }
         }
@@ -2837,14 +4219,14 @@ const Run = struct {
             }
         }
     }
-    fn semanticMaintenance(self: *Run) !void {
+    fn semanticMaintenanceScope(self: *Run) !void {
         if (!self.state.config.semantic_discovery.enabled) return;
         try self.requireAdmin();
-        var index = (try self.read(t.SemanticIndex, "entity-semantic-index")) orelse t.SemanticIndex{};
+        var index = (try self.read(t.SemanticIndex, try self.semanticPath("entity-semantic-index"))) orelse t.SemanticIndex{};
         if (index.version != t.semantic_index_version or index.generation != self.state.config.generation) index = .{ .version = t.semantic_index_version, .generation = self.state.config.generation };
         const initial = !index.backfill_complete;
         index.complete = false;
-        const page = try self.service.backend.scan(self.service.backend.ptr, self.a, if (initial) "entity/" else "entity-semantic-work/", if (initial) index.cursor else index.work_cursor, 8);
+        const page = try self.semanticEntityPage(initial, if (initial) index.cursor else index.work_cursor);
         var position = if (initial) index.cursor else index.work_cursor;
         var progressed = false;
         var yielded = false;
@@ -2868,7 +4250,7 @@ const Run = struct {
             index.backfill_complete = !yielded and page.next == null;
         } else index.work_cursor = if (yielded) position else page.next;
         self.semantic_ready_after_commit = index.backfill_complete and !yielded;
-        try self.put("entity-semantic-index", index);
+        try self.put(try self.semanticPath("entity-semantic-index"), index);
     }
     fn semanticEntity(self: *Run, row: Row, initial: bool, progressed: *bool) !void {
         const record = if (initial) try parse(t.EntityRecord, self.a, row.json) else blk: {
@@ -2876,8 +4258,8 @@ const Run = struct {
             break :blk (try self.read(t.EntityRecord, try key(self.a, "entity", work.id))) orelse {
                 try self.semanticBindings(work.id, .empty, &.{}, .empty);
                 try self.scheduleSemanticTimer(work.id, null);
-                try self.remove(try key(self.a, "entity-semantic-blocked", work.id));
-                try self.remove(try key(self.a, "entity-semantic-failure", work.id));
+                try self.remove(try self.semanticKey("entity-semantic-blocked", work.id));
+                try self.remove(try self.semanticKey("entity-semantic-failure", work.id));
                 try self.remove(row.key);
                 return;
             };
@@ -2926,13 +4308,15 @@ const Run = struct {
                         const model = self.state.config.models.embedder.?;
                         const index_name = try self.semanticIndexName(record, kind);
                         try self.ensureMemoryIndex(index_name, .{ .kind = .semantic, .generation = self.state.config.embedding_generation }, model.dimensions.?);
-                        const reusable = if (existing) |prior| prior.generation == self.state.config.embedding_generation and prior.embedding.len == model.dimensions.? and eql(u8, prior.text, text) and valueEqual(t.Model, prior.model, model) else false;
-                        const embedding = if (reusable) existing.?.embedding else blk: {
+                        const cached_document = existing orelse try self.inheritedSemanticProjection(record, kind, false);
+                        const cached_query = query_prior orelse try self.inheritedSemanticProjection(record, kind, true);
+                        const reusable = if (cached_document) |prior| self.reusableSemanticVector(prior, record, kind, text) else false;
+                        const embedding = if (reusable) cached_document.?.embedding else blk: {
                             break :blk try self.semanticEmbedding(record, model, text, captured.resources, progressed.*, false);
                         };
                         if (embedding.len != model.dimensions.?) return error.MemoryEmbeddingMismatch;
                         for (embedding) |value| if (!std.math.isFinite(value)) return error.MemoryEmbeddingMismatch;
-                        const projection: t.EntityProjection = .{ .entity_id = record.entity.id, .entity_revision = record.revision, .model = model, .generation = self.state.config.embedding_generation, .config_generation = self.state.config.generation, .owner = record.owner, .visibility = record.entity.visibility, .kind = kind, .fingerprint = view.fingerprint, .dependencies = view.dependencies, .text = text, .embedding = embedding };
+                        const projection: t.EntityProjection = .{ .branch = self.service.context.branch, .entity_id = record.entity.id, .entity_revision = record.revision, .model = model, .generation = self.state.config.embedding_generation, .config_generation = self.state.config.generation, .owner = record.owner, .visibility = record.entity.visibility, .kind = kind, .fingerprint = view.fingerprint, .dependencies = view.dependencies, .text = text, .embedding = embedding };
                         // Checkpoint the document role before another provider call.
                         // Legacy backfills and retries never recompute that vector.
                         if (existing == null or existing.?.query_embedding != null or !try self.semanticCurrent(existing.?, record, view)) {
@@ -2940,10 +4324,10 @@ const Run = struct {
                             progressed.* = true;
                         }
                         var query_projection = projection;
-                        query_projection.embedding = if (reusable and existing.?.query_embedding != null and existing.?.query_embedding.?.len == model.dimensions.?)
-                            existing.?.query_embedding.?
-                        else if (query_prior != null and query_prior.?.embedding.len == model.dimensions.? and query_prior.?.generation == projection.generation and eql(u8, query_prior.?.text, text) and valueEqual(t.Model, query_prior.?.model, model))
-                            query_prior.?.embedding
+                        query_projection.embedding = if (reusable and cached_document.?.query_embedding != null and cached_document.?.query_embedding.?.len == model.dimensions.?)
+                            cached_document.?.query_embedding.?
+                        else if (cached_query != null and self.reusableSemanticVector(cached_query.?, record, kind, text))
+                            cached_query.?.embedding
                         else
                             try self.semanticEmbedding(record, model, text, captured.resources, progressed.*, true);
                         if (query_projection.embedding.len != model.dimensions.?) return error.MemoryEmbeddingMismatch;
@@ -2963,9 +4347,9 @@ const Run = struct {
                     // Preserve readiness debt separately from runnable work.
                     // The durable deadline retries denial at the poll cadence,
                     // allowing both healthy jobs and retention work to advance.
-                    try self.put(try key(self.a, "entity-semantic-blocked", record.entity.id), .{ .id = record.entity.id });
+                    try self.put(try self.semanticKey("entity-semantic-blocked", record.entity.id), .{ .id = record.entity.id });
                     try self.scheduleSemanticTimer(record.entity.id, self.temporal_boundary orelse (self.service.context.now_ms +| resource_check_interval_ms));
-                    try self.remove(try key(self.a, "entity-semantic-work", record.entity.id));
+                    try self.remove(try self.semanticKey("entity-semantic-work", record.entity.id));
                     return;
                 }
                 // A changed pinned source remains historical, rather than an
@@ -2973,12 +4357,15 @@ const Run = struct {
                 try self.scheduleSemanticTimer(record.entity.id, self.temporal_boundary);
             } else try self.scheduleSemanticTimer(record.entity.id, null);
         }
-        try self.remove(try key(self.a, "entity-semantic-work", record.entity.id));
-        try self.remove(try key(self.a, "entity-semantic-blocked", record.entity.id));
-        try self.remove(try key(self.a, "entity-semantic-failure", record.entity.id));
+        try self.remove(try self.semanticKey("entity-semantic-work", record.entity.id));
+        try self.remove(try self.semanticKey("entity-semantic-blocked", record.entity.id));
+        try self.remove(try self.semanticKey("entity-semantic-failure", record.entity.id));
     }
     fn finishSemanticPublication(self: *Run) !void {
         if (!self.semantic_ready_after_commit) return;
+        const old_branch = self.service.context.branch;
+        self.service.context.branch = self.semantic_publication_branch orelse old_branch;
+        defer self.service.context.branch = old_branch;
         // Phase one committed its durable cursor with complete=false and
         // waited for full index publication. Only its acknowledged success
         // authorizes this second CAS. A crash or ambiguous phase-one outcome
@@ -2986,16 +4373,16 @@ const Run = struct {
         const backend = self.service.backend;
         const control = (try backend.get(backend.ptr, self.a, "control")) orelse return error.MemorySpaceNotFound;
         if (!eql(u8, control.json, try self.encode(self.state))) return;
-        if ((try backend.scan(backend.ptr, self.a, "entity-semantic-work/", null, 1)).rows.len != 0 or
-            (try backend.scan(backend.ptr, self.a, "entity-semantic-blocked/", null, 1)).rows.len != 0) return;
-        const row = (try backend.get(backend.ptr, self.a, "entity-semantic-index")) orelse return;
+        if ((try backend.scan(backend.ptr, self.a, try self.semanticPath("entity-semantic-work/"), null, 1)).rows.len != 0 or
+            (try backend.scan(backend.ptr, self.a, try self.semanticPath("entity-semantic-blocked/"), null, 1)).rows.len != 0) return;
+        const row = (try backend.get(backend.ptr, self.a, try self.semanticPath("entity-semantic-index"))) orelse return;
         var index = try parse(t.SemanticIndex, self.a, row.json);
         if (index.version != t.semantic_index_version or !index.backfill_complete or index.generation != self.state.config.generation) return;
         index.complete = true;
         try self.service.context.requireGrant(.admin);
         try self.service.context.finish();
         if (self.inferred) try self.validateResources();
-        try backend.commit(backend.ptr, self.a, control, &.{ .{ .key = "entity-semantic-index", .json = try self.encode(index) }, .{ .key = "control", .json = control.json } });
+        try backend.commit(backend.ptr, self.a, control, &.{ .{ .key = try self.semanticPath("entity-semantic-index"), .json = try self.encode(index) }, .{ .key = "control", .json = control.json } });
     }
     const candidate_pending_limit = 3 * 64;
     const candidate_semantic_limit = 2 * 64;
@@ -3041,9 +4428,9 @@ const Run = struct {
         var result: SemanticMatches = .{ .state = .not_ready };
         const selected = (try self.canonical(input_seed.entity.id)) orelse return result;
         const seed = (try self.read(t.EntityRecord, try key(self.a, "entity", selected))) orelse return result;
-        const index = (try self.read(t.SemanticIndex, "entity-semantic-index")) orelse return result;
+        const index = (try self.read(t.SemanticIndex, try self.semanticPath("entity-semantic-index"))) orelse return result;
         if (index.version != t.semantic_index_version or !index.complete or !index.backfill_complete or index.generation != self.state.config.generation) return result;
-        if ((try self.service.backend.scan(self.service.backend.ptr, self.a, "entity-semantic-work/", null, 1)).rows.len != 0) return result;
+        if ((try self.service.backend.scan(self.service.backend.ptr, self.a, try self.semanticPath("entity-semantic-work/"), null, 1)).rows.len != 0) return result;
         const view = try self.candidateView(rendered, seed.entity.id);
         var matches: std.StringHashMapUnmanaged(SemanticMatch) = .empty;
         inline for (.{ t.ProjectionKind.names, t.ProjectionKind.view }) |kind| {
@@ -3536,6 +4923,7 @@ const Run = struct {
         for (value.evidence) |ref| {
             const source = (try self.evidence(ref.id)).?;
             if (value.visibility == .team and source.evidence.visibility == .private) return error.MemoryVisibilityConflict;
+            if (ref.span != null and self.intake_redacted_evidence.contains(ref.id)) return error.InvalidMemorySpan;
             if (ref.span) |span| if (span.start >= span.end or span.end > source.evidence.text.len or !std.unicode.utf8ValidateSlice(source.evidence.text[span.start..span.end])) return error.InvalidMemorySpan;
         }
         if (value.aliases.len > t.max_items or value.distinct_from.len > t.max_items) return error.MemoryInputTooLarge;
@@ -3545,6 +4933,10 @@ const Run = struct {
             if (eql(u8, other, value.id)) return error.MemoryEntityConflict;
         }
         const path = try key(self.a, "entity", value.id);
+        if (self.lineage_head != null) if (try self.rawRead(t.EntityRecord, path)) |existing| {
+            try self.authorize(existing.owner, .private);
+            if (!valueEqual(t.Entity, existing.entity, value)) return error.MemoryEntityConflict;
+        };
         if (try self.read(t.EntityRecord, path)) |old| {
             try self.authorize(old.owner, .private);
             if (!eql(u8, try self.encode(old.entity), try self.encode(value))) return error.MemoryEntityConflict;
@@ -3733,6 +5125,7 @@ const Run = struct {
             try self.authorize(source.owner, source.evidence.visibility);
             if (!try self.supportVisible(&.{ref}, &.{}, 0)) return error.MemoryForgotten;
             if (record.assertion.visibility == .team and source.evidence.visibility == .private) return error.MemoryVisibilityConflict;
+            if (ref.span != null and self.intake_redacted_evidence.contains(ref.id)) return error.InvalidMemorySpan;
             if (ref.span) |span| if (span.start >= span.end or span.end > source.evidence.text.len or !std.unicode.utf8ValidateSlice(source.evidence.text[span.start..span.end])) return error.InvalidMemorySpan;
         }
         record.lifecycle = request.lifecycle;
@@ -3823,7 +5216,7 @@ const Run = struct {
         receipt.config_generation = pending.config_generation;
         defer projectProgress(pending, receipt);
         try self.service.context.requireGrant(operationGrant(pending));
-        if (!eql(u8, pending.owner, self.service.context.principal) and !self.service.context.admin) return error.Forbidden;
+        try self.authorize(pending.owner, .private);
         if (pending.phase == .succeeded or pending.phase == .cancelled) return;
         if (pending.phase == .failed) return error.MemoryRetryExhausted;
         if (pending.next_retry_at) |time| if (time > self.service.context.now_ms) return error.MemoryRetryNotReady;
@@ -3844,6 +5237,21 @@ const Run = struct {
                 }
             };
             if (pending.phase == .succeeded) try self.decision_targets.append(self.a, try self.resourceRef(.configuration, try std.fmt.allocPrint(self.a, "{d}", .{pending.config_generation}), pending.config_generation));
+            return;
+        }
+        if (eql(u8, pending.action, "start_evaluation")) {
+            self.evaluationQuantum(path, &pending, receipt) catch |err| {
+                if (err == error.MemorySourceAccessDenied or err == error.Forbidden) return err;
+                pending.attempts += 1;
+                try self.processingFailure(path, &pending, err);
+                if (pending.phase == .failed or pending.phase == .cancelled) {
+                    var evaluation_run = try self.evaluationRun(pending.evaluation_id.?);
+                    evaluation_run.phase = .cancelled;
+                    evaluation_run.error_code = @errorName(err);
+                    evaluation_run.revision = self.state.revision;
+                    try self.put(try key(self.a, "evaluation-run", evaluation_run.id), evaluation_run);
+                }
+            };
             return;
         }
         if (pending.config_generation != self.state.config.generation) {
@@ -3946,6 +5354,10 @@ const Run = struct {
         self.decision_targets.clearRetainingCapacity();
         // A rejected model output publishes no partial assertions or entities.
         try self.resetChanges(&.{});
+        // No source-derived changes survive this rollback. Retire its read set
+        // as well, so a terminal source-change cancellation can be committed.
+        // Any subsequent work captures and fences its own live dependencies.
+        self.resource_states.clearRetainingCapacity();
         pending.phase = if (err == error.MemoryForgotten or err == error.MemoryResourceChanged) .cancelled else if (pending.attempts >= self.state.config.max_attempts) .failed else .pending;
         pending.error_code = @errorName(err);
         pending.assertions_ready = false;
@@ -3953,7 +5365,9 @@ const Run = struct {
         try self.put(path, pending.*);
         if (pending.phase == .failed or pending.phase == .cancelled) try self.remove(try key(self.a, "pending", pending.id));
     }
-    fn publishGenerated(self: *Run, pending: t.Operation, generated: t.Generated, sources: []const t.StoredEvidence) !void {
+    fn publishGenerated(self: *Run, pending: t.Operation, raw: t.Generated, sources: []const t.StoredEvidence) !void {
+        const generated = try self.screenTyped(t.Generated, raw);
+        try checkScreenedEmbeddings(raw.assertions, generated.assertions);
         // Reconstruct ownership from immutable admitted evidence; never trust
         // a model's producer label, kind, citations or branch ordering.
         try (generation_policy.Plan{ .config = self.state.config, .sources = sources }).validatePublication(generated);
@@ -3988,7 +5402,7 @@ const Run = struct {
         };
         try self.assertions(generated.assertions, true);
     }
-    const VectorProjection = struct { assertion_id: []const u8, generation: u64, model: t.Model, statement_hash: []const u8, embedding: []const f32 };
+    const VectorProjection = struct { role: ?EmbeddingRole = null, assertion_id: []const u8, generation: u64, model: t.Model, statement_hash: []const u8, embedding: []const f32 };
     fn recallScope(self: *Run, config: t.Config, audience: []const u8) ![]const u8 {
         return hash(self.a, .{ "recall/v2", config.generation, config.embedding_generation, config.models.embedder, audience });
     }
@@ -4054,7 +5468,7 @@ const Run = struct {
         const embedding = if (config.features.semantic_recall) try self.vectorFor(config, record.assertion) else null;
         const statement_hash = try hash(self.a, record.assertion.statement);
         if (try self.read(t.RecallProjection, path)) |prior| {
-            if (prior.version == 2 and prior.generation == config.generation and eql(u8, prior.owner, record.owner) and prior.visibility == record.assertion.visibility and eql(u8, prior.statement_hash, statement_hash) and valueEqual(?[]const f32, prior.embedding, embedding)) {
+            if (prior.version == t.recall_index_version and prior.generation == config.generation and eql(u8, prior.owner, record.owner) and prior.visibility == record.assertion.visibility and eql(u8, prior.statement_hash, statement_hash) and valueEqual(?[]const f32, prior.embedding, embedding)) {
                 try self.remove(try key(self.a, "assertion-recall-work", record.assertion.id));
                 try self.remove(try key(self.a, "assertion-recall-blocked", record.assertion.id));
                 return;
@@ -4074,7 +5488,7 @@ const Run = struct {
             text_indexes[i] = try self.recallIndexName(config, scope, false);
             vector_indexes[i] = try self.recallIndexName(config, scope, true);
         }
-        try self.put(path, t.RecallProjection{ .version = 2, .assertion_id = record.assertion.id, .assertion_key = try key(self.a, "assertion", record.assertion.id), .generation = config.generation, .statement_hash = statement_hash, .owner = record.owner, .visibility = record.assertion.visibility, .text = record.assertion.statement, .filter_terms = try recall_filters.terms(self.a, record.assertion), .text_indexes = &text_indexes, .vector_indexes = if (embedding != null) &vector_indexes else &.{}, .embedding = embedding });
+        try self.put(path, t.RecallProjection{ .version = t.recall_index_version, .assertion_id = record.assertion.id, .assertion_key = try key(self.a, "assertion", record.assertion.id), .generation = config.generation, .statement_hash = statement_hash, .owner = record.owner, .visibility = record.assertion.visibility, .text = record.assertion.statement, .filter_terms = try recall_filters.terms(self.a, record.assertion), .text_indexes = &text_indexes, .vector_indexes = if (embedding != null) &vector_indexes else &.{}, .embedding = embedding });
         const binding_key = try key(self.a, "assertion-recall-binding", record.assertion.id);
         const Binding = struct { paths: []const []const u8 = &.{} };
         const old = (try self.read(Binding, binding_key)) orelse Binding{};
@@ -4096,8 +5510,8 @@ const Run = struct {
         if (self.service.backend.search_assertions == null) return;
         try self.requireAdmin();
         var index = (try self.read(t.RecallIndex, "assertion-recall-index")) orelse t.RecallIndex{};
-        if (index.version != 2 or index.generation != self.state.config.generation) {
-            if (index.version != 2) try self.put("cleanup", .{ .cursor = @as(?[]const u8, null) });
+        if (index.version != t.recall_index_version or index.generation != self.state.config.generation) {
+            if (index.version != t.recall_index_version) try self.put("cleanup", .{ .cursor = @as(?[]const u8, null) });
             index = .{ .generation = self.state.config.generation };
         }
         index.complete = false;
@@ -4176,7 +5590,7 @@ const Run = struct {
         const model = config.models.embedder orelse return error.MemoryModelRequired;
         if (embedding.len != model.dimensions.?) return error.MemoryEmbeddingMismatch;
         for (embedding) |value| if (!std.math.isFinite(value)) return error.MemoryEmbeddingMismatch;
-        try self.put(try self.vectorKey(config.embedding_generation, claim.id), VectorProjection{ .assertion_id = claim.id, .generation = config.embedding_generation, .model = model, .statement_hash = try hash(self.a, claim.statement), .embedding = embedding });
+        try self.put(try self.vectorKey(config.embedding_generation, claim.id), VectorProjection{ .role = .document, .assertion_id = claim.id, .generation = config.embedding_generation, .model = model, .statement_hash = try hash(self.a, claim.statement), .embedding = embedding });
         // Pending vectors are already durable reindex progress. Their serving
         // projection backfill starts at cutover; they must not dirty the active
         // generation's recall queue while uploads or inference are in progress.
@@ -4185,6 +5599,7 @@ const Run = struct {
     fn vectorFor(self: *Run, config: t.Config, claim: t.Assertion) !?[]const f32 {
         const projection = (try self.read(VectorProjection, try self.vectorKey(config.embedding_generation, claim.id))) orelse return null;
         if (projection.generation != config.embedding_generation or !eql(u8, projection.assertion_id, claim.id) or !eql(u8, projection.statement_hash, try hash(self.a, claim.statement)) or !valueEqual(?t.Model, projection.model, config.models.embedder)) return error.MemoryEmbeddingMismatch;
+        if (projection.role != .document and !eql(u8, projection.model.provider, "external")) return null;
         return projection.embedding;
     }
     fn stageEmbeddings(self: *Run, request: t.EmbeddingBatch) !void {
@@ -4239,7 +5654,7 @@ const Run = struct {
         self.inferred = true;
         if (try self.vectorFor(config, record.assertion) != null) return;
         if (eql(u8, config.models.embedder.?.provider, "external")) return error.MemoryExternalVectorRequired;
-        const embedding = try self.embed(config.models.embedder.?, record.assertion.statement, inputs.resources);
+        const embedding = try self.embedClaimDocument(config.models.embedder.?, record.assertion.statement, inputs.resources);
         try self.putVector(config, record.assertion, embedding);
     }
     fn retireAssertion(self: *Run, id: []const u8) !void {
@@ -4378,8 +5793,11 @@ const Run = struct {
         return true;
     }
     fn maintainChild(self: *Run, row: Row, item: DependencyWork) anyerror!void {
-        const child = try parse(struct { child: []const u8 }, self.a, row.json);
+        const child = try parse(struct { child: []const u8, branch: []const u8 = "" }, self.a, row.json);
         if (eql(u8, item.kind, "semantic-resource") or eql(u8, item.kind, "semantic-assertion")) {
+            const old_branch = self.service.context.branch;
+            self.service.context.branch = child.branch;
+            defer self.service.context.branch = old_branch;
             if (self.state.config.semantic_discovery.enabled and try self.read(t.EntityRecord, try key(self.a, "entity", child.child)) != null) try self.semanticDirty(child.child) else try self.remove(row.key);
             return;
         }
@@ -4407,6 +5825,41 @@ const Run = struct {
             // Also scrub policy rows left by earlier implementations
             // or a restored pre-cleanup snapshot of a forgotten space.
             if (try self.read(bool, "forgotten-all") != null) try self.remove(row.key);
+        } else if (std.mem.startsWith(u8, row.key, "evaluation-case/")) {
+            var value = try parse(t.evaluation.StoredCase, self.a, row.json);
+            if (!value.forgotten and !try self.evaluationCaseAvailable(value)) {
+                value.forgotten = true;
+                value.value = .{ .id = try hash(self.a, value.value.id), .task = value.value.task, .input = .null };
+                value.fingerprint = "";
+                try self.put(row.key, value);
+            }
+        } else if (std.mem.startsWith(u8, row.key, "evaluation-result/")) {
+            var result = try parse(t.evaluation.Result, self.a, row.json);
+            if (!result.scrubbed) {
+                const run = (try self.read(t.evaluation.Run, try key(self.a, "evaluation-run", result.run))) orelse return error.MemoryCorruptState;
+                const value = self.evaluationCase(run, result.case_id) catch |err| switch (err) {
+                    error.MemoryNotFound => null,
+                    else => return err,
+                };
+                if (value == null or !try self.evaluationCaseAvailable(value.?)) {
+                    result.prediction = null;
+                    result.unavailable = true;
+                    result.scrubbed = true;
+                    result.case_id = try hash(self.a, result.case_id);
+                    result.input_fingerprint = "";
+                    try self.put(row.key, result);
+                }
+            }
+        } else if (std.mem.startsWith(u8, row.key, "lineage-entity/")) {
+            const entity_record = try parse(t.EntityRecord, self.a, row.json);
+            if (!try self.entityRetained(entity_record)) try self.remove(row.key);
+        } else if (std.mem.startsWith(u8, row.key, "supersession-proposal/")) {
+            const proposal = try parse(t.SupersessionProposal, self.a, row.json);
+            if (!try self.supersessionProposalRetained(proposal)) {
+                try self.remove(row.key);
+                try self.remove(try std.fmt.allocPrint(self.a, "supersession-open/{s}/{s}", .{ try hash(self.a, proposal.branch), try hash(self.a, proposal.id) }));
+                try self.put(try key(self.a, "forgotten-supersession-proposal", proposal.id), true);
+            }
         } else if (std.mem.startsWith(u8, row.key, "evidence/")) {
             const source = try parse(t.StoredEvidence, self.a, row.json);
             const expires = self.evidenceExpiry(source);
@@ -4435,7 +5888,7 @@ const Run = struct {
                 try self.remove(row.key);
             }
         } else if (std.mem.startsWith(u8, row.key, "dependency/mention-")) {
-            const binding = try parse(struct { child: []const u8 }, self.a, row.json);
+            const binding = try parse(struct { child: []const u8, branch: []const u8 = "" }, self.a, row.json);
             if (try self.read(t.StoredMention, try key(self.a, "mention", binding.child)) == null) try self.remove(row.key);
         } else if (std.mem.startsWith(u8, row.key, "episode-turn/")) {
             const binding = try parse(struct { id: []const u8 }, self.a, row.json);
@@ -4499,10 +5952,25 @@ const Run = struct {
             try self.remove(row.key);
         } else if (std.mem.startsWith(u8, row.key, "assertion-recall/")) {
             const projection = try parse(t.RecallProjection, self.a, row.json);
-            if (projection.version < 2 or (projection.generation != self.state.config.generation and (self.state.pending_config == null or projection.generation != self.state.pending_config.?.generation)) or try self.assertion(projection.assertion_id) == null) try self.remove(row.key);
+            if (projection.version < t.recall_index_version or (projection.generation != self.state.config.generation and (self.state.pending_config == null or projection.generation != self.state.pending_config.?.generation)) or try self.assertion(projection.assertion_id) == null) try self.remove(row.key);
         } else if (std.mem.startsWith(u8, row.key, "entity-semantic/") or std.mem.startsWith(u8, row.key, "entity-semantic-query/")) {
             const query_role = std.mem.startsWith(u8, row.key, "entity-semantic-query/");
             const projection = try parse(t.EntityProjection, self.a, row.json);
+            const saved_branch = self.service.context.branch;
+            const saved_head = self.lineage_head;
+            const saved_raw = self.lineage_raw;
+            defer {
+                self.service.context.branch = saved_branch;
+                self.lineage_head = saved_head;
+                self.lineage_raw = saved_raw;
+                self.views.clearRetainingCapacity();
+            }
+            self.service.context.branch = projection.branch;
+            if (self.state.config.features.lineage) {
+                self.lineage_head = try self.rawRead(t.LineageHead, try key(self.a, "lineage-head", if (projection.branch.len == 0) "main" else projection.branch));
+                self.lineage_raw = false;
+            }
+            self.views.clearRetainingCapacity();
             const record = try self.read(t.EntityRecord, try key(self.a, "entity", projection.entity_id));
             const lease: IndexLease = .{ .kind = .semantic, .generation = projection.generation };
             if (!query_role and !indexLeaseLive(self.state.config, lease) and (self.state.pending_config == null or !indexLeaseLive(self.state.pending_config.?, lease))) {
@@ -4527,6 +5995,14 @@ const Run = struct {
                     }
                 }
             }
+        } else if (std.mem.startsWith(u8, row.key, "entity-semantic-branch/")) {
+            const target = try std.json.parseFromSliceLeaky(struct { id: ?[]const u8 = null }, self.a, row.json, .{ .ignore_unknown_fields = true });
+            if (try self.read(bool, "forgotten-all") != null) {
+                try self.remove(row.key);
+            } else if (target.id) |id| {
+                const record = try self.rawRead(t.EntityRecord, try key(self.a, "entity", id));
+                if (!self.state.config.semantic_discovery.enabled or record == null or !try self.entityRetained(record.?)) try self.remove(row.key);
+            }
         } else if (std.mem.startsWith(u8, row.key, "entity-semantic-binding/")) {
             const binding = try parse(SemanticBinding, self.a, row.json);
             const record = try self.read(t.EntityRecord, try key(self.a, "entity", binding.id));
@@ -4537,7 +6013,10 @@ const Run = struct {
             if (!self.state.config.semantic_discovery.enabled or record == null or !try self.entityRetained(record.?)) try self.scheduleSemanticTimer(timer.id, null);
         } else if (std.mem.startsWith(u8, row.key, "entity-semantic-due/")) {
             const timer = try parse(SemanticTimer, self.a, row.json);
-            const current = try self.read(SemanticTimer, try key(self.a, "entity-semantic-timer", timer.id));
+            const saved_branch = self.service.context.branch;
+            self.service.context.branch = timer.branch;
+            defer self.service.context.branch = saved_branch;
+            const current = try self.read(SemanticTimer, try self.semanticKey("entity-semantic-timer", timer.id));
             if (current == null or current.?.at != timer.at) try self.remove(row.key);
         } else if (std.mem.startsWith(u8, row.key, "entity-semantic-failure/")) {
             const failure = try parse(SemanticFailure, self.a, row.json);
@@ -4610,7 +6089,10 @@ const Run = struct {
             else => .applied,
         };
         if (operation.proposal_id) |proposal_id| {
-            if (eql(u8, operation.action, "propose_relationship") or eql(u8, operation.action, "review_relationship")) {
+            if (eql(u8, operation.action, "propose_supersession") or eql(u8, operation.action, "review_supersession")) {
+                const proposal = (try self.read(t.SupersessionProposal, try key(self.a, "supersession-proposal", proposal_id))) orelse return error.MemoryCorruptState;
+                status = if (proposal.verdict == null) .proposed else .applied;
+            } else if (eql(u8, operation.action, "propose_relationship") or eql(u8, operation.action, "review_relationship")) {
                 const proposal = (try self.read(t.RelationshipProposal, try key(self.a, "relationship-proposal", proposal_id))) orelse return error.MemoryCorruptState;
                 status = switch (proposal.state) {
                     .open => .proposed,
@@ -4891,6 +6373,7 @@ const Run = struct {
                 return parse(std.json.Value, self.a, try self.encode(.{ .snapshot_json = @as(?[]const u8, null), .revision = ref.revision, .digest = ref.digest, .source_state = snapshot.state, .payload_truncated = true }));
             }
             var json = snapshot.json;
+            var payload_redacted = false;
             if (snapshot.state == .changed or request.known_at != null) {
                 // Look up immutable identity, not mutable routing/display hints.
                 const source = switch (try self.capturedSource(ref.*, request)) {
@@ -4909,7 +6392,13 @@ const Run = struct {
                     },
                 };
                 json = source.evidence.text;
+                if (source.materialization) |materialization| payload_redacted = materialization.text_redacted;
             }
+            var source_screening = self.state.config.intake_screening;
+            source_screening.mode = .redact;
+            const sanitized = try screening.json(self.a, json, source_screening);
+            payload_redacted = payload_redacted or sanitized.report.redactions > 0;
+            json = sanitized.value;
             const DeclaredEnvelope = struct { provenance: ?prov.Envelope = null };
             const declaration: DeclaredEnvelope = std.json.parseFromSliceLeaky(DeclaredEnvelope, self.a, json, .{ .ignore_unknown_fields = true }) catch |err| switch (err) {
                 error.OutOfMemory => return err,
@@ -4935,7 +6424,7 @@ const Run = struct {
                     }
                 }
             }
-            return parse(std.json.Value, self.a, try self.encode(.{ .snapshot_json = json, .revision = ref.revision, .digest = ref.digest, .source_state = snapshot.state, .metadata_assurance = "source_declared" }));
+            return parse(std.json.Value, self.a, try self.encode(.{ .snapshot_json = json, .payload_redacted = payload_redacted, .payload_sha256 = try textDigest(self.a, json), .revision = ref.revision, .digest = ref.digest, .source_state = snapshot.state, .metadata_assurance = "source_declared" }));
         }
         if (ref.storage_name != null) return error.InvalidResourceReference;
         const own_table = try std.fmt.allocPrint(self.a, "memory_{s}", .{self.state.space});
@@ -5004,7 +6493,10 @@ const Run = struct {
                             try self.appendProvenanceLinks(artifact.inputs, links);
                             // Minimal admission decisions can be shared with an
                             // output's readers; private review text cannot.
-                            if ((self.service.context.admin or eql(u8, record.initiator.id, self.service.context.principal)) and artifact.reason.len > 0) try value.object.put(self.a, "recorded_rationale", .{ .string = artifact.reason });
+                            if ((self.service.context.admin or eql(u8, record.initiator.id, self.service.context.principal)) and artifact.reason.len > 0) {
+                                if (!eql(u8, record.initiator.id, self.service.context.principal)) try self.requireAdmin();
+                                try value.object.put(self.a, "recorded_rationale", .{ .string = artifact.reason });
+                            }
                         } else self.explanation_incomplete_history = true;
                     } else self.explanation_incomplete_history = true;
                 }
@@ -5030,6 +6522,7 @@ const Run = struct {
                         if (artifact.reason.len > 0) try value.object.put(self.a, "recorded_rationale", .{ .string = artifact.reason });
                     } else self.explanation_incomplete_history = true;
                 } else if (eql(u8, record.action, "review_relationship") or eql(u8, record.action, "review_entity")) self.explanation_incomplete_history = true;
+                if (self.service.context.admin) try self.requireAdmin();
                 if (self.service.context.admin) if (try self.read(ProposalAttempt, try key(self.a, "proposal-attempt", record.id))) |attempt| {
                     if (attempt.inputs.operation) |operation| if (operation.revision == ref.revision and try self.proposalInputsRetained(attempt.inputs)) {
                         var projected = attempt;
@@ -5095,7 +6588,7 @@ const Run = struct {
     }
     fn encodeCursor(self: *Run, prefix: []const u8, position: ?[]const u8) !?[]const u8 {
         const value = position orelse return null;
-        return try std.fmt.allocPrint(self.a, "{d}:{s}:{s}", .{ self.state.revision, try hash(self.a, .{ self.state.space, self.service.context.principal, prefix }), value });
+        return try std.fmt.allocPrint(self.a, "{d}:{s}:{s}", .{ self.state.revision, try hash(self.a, .{ self.state.space, self.service.context.branch, self.service.context.principal, prefix }), value });
     }
     fn decodeCursor(self: *Run, prefix: []const u8, cursor_value: ?[]const u8) !?[]const u8 {
         const value = cursor_value orelse return null;
@@ -5105,7 +6598,7 @@ const Run = struct {
         const path = parts.next() orelse return error.InvalidMemoryCursor;
         if (parts.next() != null or !std.mem.startsWith(u8, path, prefix)) return error.InvalidMemoryCursor;
         if (revision != self.state.revision) return error.MemoryCursorStale;
-        if (!eql(u8, scope, try hash(self.a, .{ self.state.space, self.service.context.principal, prefix }))) return error.InvalidMemoryCursor;
+        if (!eql(u8, scope, try hash(self.a, .{ self.state.space, self.service.context.branch, self.service.context.principal, prefix }))) return error.InvalidMemoryCursor;
         return path;
     }
     fn history(self: *Run, id: []const u8, request: anytype) ![]const u8 {
@@ -5117,7 +6610,7 @@ const Run = struct {
         const page = try self.service.backend.scan(self.service.backend.ptr, self.a, prefix, try self.decodeCursor(prefix, request.cursor), request.limit);
         var records: std.ArrayList(t.StoredAssertion) = .empty;
         for (page.rows) |row| {
-            const value = try parse(t.StoredAssertion, self.a, row.json);
+            const value = (try self.read(t.StoredAssertion, row.key)) orelse continue;
             try self.authorize(value.owner, value.assertion.visibility);
             try records.append(self.a, try self.publicRecord(value));
         }
@@ -5138,7 +6631,7 @@ const Run = struct {
                 after = row.key;
                 visited += 1;
                 more = index + 1 < page.rows.len or page.next != null;
-                var record = try parse(t.StoredAssertion, self.a, row.json);
+                var record = (try self.read(t.StoredAssertion, row.key)) orelse continue;
                 if (request.known_at) |known| record = (try self.asOf(record.assertion.id, known)) orelse continue;
                 self.authorize(record.owner, record.assertion.visibility) catch continue;
                 if (!try self.evidenceVisibleTime(record, request.known_at, request.valid_at orelse if (!request.include_history) self.service.context.now_ms else null, 0)) continue;
@@ -5262,7 +6755,7 @@ const Run = struct {
                         graph.work += page.rows.len + 1;
                         graph.complete = graph.complete and page.next == null;
                         for (page.rows) |row| {
-                            const binding = try parse(struct { child: []const u8 }, self.a, row.json);
+                            const binding = try parse(struct { child: []const u8, branch: []const u8 = "" }, self.a, row.json);
                             const mention_record = (try self.read(t.StoredMention, try key(self.a, "mention", binding.child))) orelse continue;
                             if (!try self.mentionVisible(mention_record, request.known_at)) continue;
                             if (options.include_episodes) for (mention_record.mention.evidence) |ref| {
@@ -5342,7 +6835,7 @@ const Run = struct {
         return .{ .status = .{ .nodes = graph.nodes.items.len, .edges = graph.edges.items.len, .iterations = options.iterations, .complete = graph.complete, .omitted = graph.omitted }, .entities = entities.items, .episodes = episodes_out.items };
     }
     fn recallHit(self: *Run, original: t.StoredAssertion, request: t.Recall, vector: ?[]const f32, require_match: bool) !?t.RecallHit {
-        var record = original;
+        var record = if (self.lineage_head != null and !self.lineage_raw) (try self.assertion(original.assertion.id)) orelse return null else original;
         self.authorize(record.owner, record.assertion.visibility) catch return null;
         if (request.known_at) |known| record = (try self.asOf(record.assertion.id, known)) orelse return null;
         const valid = request.valid_at orelse if (!request.include_history) self.service.context.now_ms else null;
@@ -5386,6 +6879,7 @@ const Run = struct {
     fn recallWindow(self: *Run, request: t.Recall, vector: ?[]const f32) !recall_windows.Window {
         var text: std.ArrayList([]const u8) = .empty;
         var dense: std.ArrayList([]const u8) = .empty;
+        if (self.service.context.admin) try self.requireAdmin();
         const scopes: []const []const u8 = if (self.service.context.admin) &.{"all"} else &.{ "team", try std.fmt.allocPrint(self.a, "private/{s}", .{self.service.context.principal}) };
         for (scopes) |scope| {
             if (try self.read(bool, try self.recallAudienceKey(self.state.config, scope)) == null) continue;
@@ -5444,13 +6938,13 @@ const Run = struct {
         if (explicit_seeds and request.cursor != null) return error.InvalidMemoryRequest;
         var scoped_request = request;
         scoped_request.cursor = null;
-        const indexed_scope = try std.fmt.allocPrint(self.a, "recall/v2/{s}/", .{try hash(self.a, .{ scoped_request, self.state.table_id, self.state.database, self.state.namespace, self.state.space, self.state.created_at, self.state.revision, self.state.config.generation, self.service.context.principal })});
+        const indexed_scope = try std.fmt.allocPrint(self.a, "recall/v2/{s}/", .{try hash(self.a, .{ scoped_request, self.state.table_id, self.state.database, self.state.namespace, self.state.space, self.state.created_at, self.service.context.branch, self.state.revision, self.state.config.generation, self.service.context.principal })});
         const legacy_cursor = if (request.cursor) |cursor| blk: {
             const colon = std.mem.lastIndexOfScalar(u8, cursor, ':') orelse return error.InvalidMemoryCursor;
             break :blk std.mem.startsWith(u8, cursor[colon + 1 ..], "assertion/");
         } else false;
         const index = if (self.service.backend.search_assertions != null) try self.read(t.RecallIndex, "assertion-recall-index") else null;
-        const indexed = !explicit_seeds and !legacy_cursor and (request.query.len > 0 or vector != null) and index != null and index.?.version == 2 and index.?.complete and index.?.generation == self.state.config.generation and (try self.service.backend.scan(self.service.backend.ptr, self.a, "assertion-recall-work/", null, 1)).rows.len == 0;
+        const indexed = !explicit_seeds and !legacy_cursor and (request.query.len > 0 or vector != null) and index != null and index.?.version == t.recall_index_version and index.?.complete and index.?.generation == self.state.config.generation and (try self.service.backend.scan(self.service.backend.ptr, self.a, "assertion-recall-work/", null, 1)).rows.len == 0;
         if (indexed) {
             const now = self.service.context.currentTime();
             var offset: usize = 0;
@@ -5575,10 +7069,10 @@ const Run = struct {
         const page = try self.service.backend.scan(self.service.backend.ptr, self.a, "entity/", try self.decodeCursor("entity/", request.cursor), request.limit);
         var values: std.ArrayList(std.json.Value) = .empty;
         for (page.rows) |row| {
-            const stored = try parse(t.EntityRecord, self.a, row.json);
+            const stored = (try self.read(t.EntityRecord, row.key)) orelse continue;
             self.authorize(stored.owner, stored.entity.visibility) catch continue;
             if (try self.read(bool, "forgotten-all") != null or !try self.entityVisible(stored)) continue;
-            try values.append(self.a, try parse(std.json.Value, self.a, row.json));
+            try values.append(self.a, try parse(std.json.Value, self.a, try self.encode(stored)));
         }
         return self.encode(.{ .items = values.items, .next_cursor = try self.encodeCursor("entity/", page.next), .complete = page.next == null });
     }
@@ -5621,8 +7115,8 @@ fn relationsMatch(request: t.Recall, claim: t.Assertion) bool {
 }
 pub fn actionGrant(action: Action) t.RequiredGrant {
     return switch (action) {
-        .create, .configure, .stage_embeddings => .admin,
-        .curate_entity, .propose_entity, .review_entity, .entity_proposals, .entity_proposal, .propose_relationship, .relationship_proposal, .review_relationship => .curator,
+        .evaluation_results, .put_evaluation_dataset, .evaluation_dataset, .evaluation_cases, .start_evaluation, .create, .configure, .stage_embeddings => .admin,
+        .evaluation_run, .evaluation_tasks, .evaluation_verdict, .propose_supersession, .supersession_proposals, .supersession_proposal, .review_supersession, .curate_entity, .propose_entity, .review_entity, .entity_proposals, .entity_proposal, .propose_relationship, .relationship_proposal, .review_relationship => .curator,
         else => .write,
     };
 }
@@ -5637,6 +7131,11 @@ fn publicOperation(input: t.Operation) t.OperationStatus {
 
 fn parse(comptime T: type, a: A, bytes: []const u8) !T {
     return std.json.parseFromSliceLeaky(T, a, if (bytes.len == 0) "{}" else bytes, .{ .allocate = .alloc_always, .ignore_unknown_fields = false });
+}
+fn textDigest(a: A, bytes: []const u8) ![]const u8 {
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
+    return a.dupe(u8, &std.fmt.bytesToHex(digest, .lower));
 }
 fn hash(a: A, value: anytype) ![]const u8 {
     const bytes = try std.json.Stringify.valueAlloc(a, value, .{});
@@ -5907,4 +7406,43 @@ test "memory index retirement retains an embedding generation still reserved by 
     config.embedding_generation = 8;
     config.semantic_discovery.enabled = true;
     try std.testing.expect(!Run.indexLeaseLive(config, .{ .kind = .semantic, .generation = 7 }));
+}
+
+fn inputFingerprint(a: A, value: anytype, secret: []const u8, version: u8) ![]const u8 {
+    if (version == 0) return hash(a, value);
+    if (version != 1 or secret.len != 64) return error.MemoryCorruptState;
+    var key_bytes: [32]u8 = undefined;
+    _ = std.fmt.hexToBytes(&key_bytes, secret) catch return error.MemoryCorruptState;
+    const raw = try std.json.Stringify.valueAlloc(a, value, .{});
+    var digest: [32]u8 = undefined;
+    std.crypto.auth.hmac.sha2.HmacSha256.create(&digest, raw, &key_bytes);
+    return a.dupe(u8, &std.fmt.bytesToHex(digest, .lower));
+}
+fn screenedAction(action: Action) bool {
+    return switch (action) {
+        .recall, .start_evaluation, .fork_lineage, .checkpoint_lineage, .revert_lineage, .put_evaluation_dataset, .evaluation_verdict, .propose_supersession, .review_supersession, .observe, .assertions, .correct, .outcome, .curate_entity, .propose_entity, .review_entity, .propose_relationship, .review_relationship => true,
+        else => false,
+    };
+}
+
+fn screenBody(a: A, action: Action, body: []const u8, config: screening.Config) !screening.Result {
+    inline for (@typeInfo(Action).@"enum".field_names) |name| {
+        const candidate = @field(Action, name);
+        if (comptime screenedAction(candidate)) {
+            if (action == candidate) {
+                const T = operations.Body(candidate);
+                const value = try parse(T, a, body);
+                const result = try screening.typed(T, a, value, config);
+                if (comptime candidate == .assertions or candidate == .observe) {
+                    try checkScreenedEmbeddings(value.assertions, result.value.assertions);
+                }
+                return .{ .value = if (result.report.redactions == 0) body else try std.json.Stringify.valueAlloc(a, result.value, .{}), .report = result.report };
+            }
+        }
+    }
+    return .{ .value = body };
+}
+
+fn checkScreenedEmbeddings(original: []const t.Assertion, admitted: []const t.Assertion) !void {
+    for (original, admitted) |before, after| if (before.embedding != null and !eql(u8, before.statement, after.statement)) return error.MemoryEmbeddingMismatch;
 }

@@ -92,3 +92,21 @@ repeats a candidate; similarity alone does not establish ANN discovery. The
 extra non-synonym admissions are candidates for the external judge, not accepted
 merges. See [the machine-readable qualification](discovery-embeddinggemma2.json)
 for the fixture digest, complete model revision, method and scale counters.
+
+## Stored judge datasets
+
+The same corpus can be uploaded to the native evaluation harness:
+
+```sh
+python3 scripts/bench/memory_judges.py --prepare-only --output /tmp/codex-judge-dataset.json
+python3 scripts/bench/memory_judges.py --url http://127.0.0.1:8080 \
+  --judge /path/to/qualified-judge.json --output /tmp/codex-judge-results.json
+```
+
+The upload has 94 identity inputs, 141 typed-predicate checks from the 47 relation
+annotations, and 13 binary replacement inputs. It removes fixture gold fields
+from judge inputs. Binary non-replacement labels are not fabricated four-way
+"independent" annotations. Without `--judge`, the run waits for outside predictions
+on its native task/verdict endpoints. Dataset roots, profiles, model/prompt
+revisions, fixture digests and reports remain available for reproducible comparisons.
+The server owns model credentials; the judge file carries identity/revision only.

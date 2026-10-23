@@ -47,9 +47,28 @@ class MemoryOperations:
         idempotency_key: str = "",
         database: str = "default",
         namespace: str = "public",
+        branch: str = "",
     ) -> Any:
         """Use the same action names as the native embedded memory envelope."""
         routes = {
+            "changes": ("POST", "/changes"),
+            "lineage": ("GET", "/lineage"),
+            "fork_lineage": ("POST", "/forks"),
+            "checkpoint_lineage": ("POST", "/checkpoints"),
+            "revert_lineage": ("POST", "/reverts"),
+            "supersession_candidates": ("POST", "/memories/" + quote(id, safe="") + "/supersession-candidates"),
+            "propose_supersession": ("POST", "/supersession-proposals"),
+            "supersession_proposals": ("GET", "/supersession-proposals"),
+            "supersession_proposal": ("GET", "/supersession-proposals/" + quote(id, safe="")),
+            "review_supersession": ("POST", "/supersession-proposals/" + quote(id, safe="") + "/verdict"),
+            "put_evaluation_dataset": ("POST", "/evaluation-datasets"),
+            "evaluation_dataset": ("GET", "/evaluation-datasets/" + quote(id, safe="")),
+            "evaluation_cases": ("GET", "/evaluation-datasets/" + quote(id, safe="") + "/cases"),
+            "start_evaluation": ("POST", "/evaluations"),
+            "evaluation_results": ("GET", "/evaluations/" + quote(id, safe="") + "/results"),
+            "evaluation_run": ("GET", "/evaluations/" + quote(id, safe="")),
+            "evaluation_tasks": ("POST", "/evaluations/" + quote(id, safe="") + "/tasks"),
+            "evaluation_verdict": ("POST", "/evaluations/" + quote(id, safe="") + "/verdicts"),
             "inspect": ("GET", ""),
             "configure": ("PATCH", ""),
             "observe": ("POST", "/observations"),
@@ -87,11 +106,20 @@ class MemoryOperations:
         method, suffix = routes[action]
         if (
             method != "GET"
-            and action not in ("recall", "explain", "entity_candidates", "entity_view")
+            and action
+            not in (
+                "changes",
+                "supersession_candidates",
+                "evaluation_tasks",
+                "recall",
+                "explain",
+                "entity_candidates",
+                "entity_view",
+            )
             and not idempotency_key
         ):
             raise ValueError("memory mutations require idempotency_key")
-        headers = {"X-Antfly-Database": database, "X-Antfly-Namespace": namespace}
+        headers = {"X-Antfly-Database": database, "X-Antfly-Namespace": namespace, "X-Antfly-Memory-Branch": branch}
         if idempotency_key:
             headers["Idempotency-Key"] = idempotency_key
         kwargs: dict[str, Any] = {"headers": headers}

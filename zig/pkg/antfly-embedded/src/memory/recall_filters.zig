@@ -16,6 +16,8 @@
 const std = @import("std");
 const A = std.mem.Allocator;
 pub const Filters = struct {
+    subjects: ?[]const []const u8 = null,
+    overlapping_scope: ?[]const u8 = null,
     predicate: ?[]const u8 = null,
     scope: ?[]const u8 = null,
     kind: ?[]const u8 = null,
@@ -34,9 +36,9 @@ fn token(a: A, field: []const u8, value: []const u8) ![]const u8 {
     return std.fmt.allocPrint(a, "mm{s}{s}0", .{ field, std.fmt.bytesToHex(hash, .lower) });
 }
 pub fn terms(a: A, claim: anytype) ![]const u8 {
-    return std.fmt.allocPrint(a, "{s} {s} {s} {s} {s}", .{
-        try token(a, "p", claim.predicate),                                       try token(a, "s", claim.scope),                             try token(a, "k", @tagName(claim.kind)),
-        if (claim.environment) |v| try token(a, "e", v) else "mmenvironmentany0", if (claim.task) |v| try token(a, "t", v) else "mmtaskany0",
+    return std.fmt.allocPrint(a, "{s} {s} {s} {s} {s} {s}", .{
+        try token(a, "p", claim.predicate),                                                 try token(a, "s", claim.scope),                                           try token(a, "k", @tagName(claim.kind)),
+        try token(a, "u", if (@hasField(@TypeOf(claim), "subject")) claim.subject else ""), if (claim.environment) |v| try token(a, "e", v) else "mmenvironmentany0", if (claim.task) |v| try token(a, "t", v) else "mmtaskany0",
     });
 }
 // Use analyzed-field match rather than scalar equality: the lane field holds
@@ -64,6 +66,22 @@ pub fn query(a: A, index_field: []const u8, filters: Filters) ![]const u8 {
                 try clauses.append(.{ .object = disjunction });
             } else try clauses.append(exact);
         }
+    }
+    if (filters.subjects) |subjects| {
+        if (subjects.len == 0 or subjects.len > 4096) return error.InvalidMemoryRequest;
+        var alternatives = std.json.Array.init(a);
+        for (subjects) |subject| try alternatives.append(try term(a, index_field, try token(a, "u", subject)));
+        var disjunction: std.json.ObjectMap = .empty;
+        try disjunction.put(a, "disjuncts", .{ .array = alternatives });
+        try clauses.append(.{ .object = disjunction });
+    }
+    if (filters.overlapping_scope) |scope| {
+        var alternatives = std.json.Array.init(a);
+        try alternatives.append(try term(a, index_field, try token(a, "s", scope)));
+        try alternatives.append(try term(a, index_field, try token(a, "s", "")));
+        var disjunction: std.json.ObjectMap = .empty;
+        try disjunction.put(a, "disjuncts", .{ .array = alternatives });
+        try clauses.append(.{ .object = disjunction });
     }
     var root: std.json.ObjectMap = .empty;
     try root.put(a, "conjuncts", .{ .array = clauses });

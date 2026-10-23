@@ -19,6 +19,7 @@ const engine = @import("../memory/engine.zig");
 const memory = engine.service;
 
 pub const Request = struct {
+    branch: []const u8 = "",
     action: memory.Action,
     id: []const u8 = "",
     idempotency_key: []const u8 = "",
@@ -62,6 +63,7 @@ pub fn execute(guard: *@import("db.zig").HandleGuard, handle_ptr: ?*anyopaque, a
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
     const a = arena.allocator();
+    try memory.screenIdentity(a, space);
     const request = try std.json.parseFromSliceLeaky(Request, a, request_json, .{ .ignore_unknown_fields = false, .parse_numbers = false });
     const table = try std.fmt.allocPrint(a, "memory_{s}", .{space});
     const tables = @import("tables.zig");
@@ -73,7 +75,7 @@ pub fn execute(guard: *@import("db.zig").HandleGuard, handle_ptr: ?*anyopaque, a
     if (memory.mutates(request.action) and !h.liteOpenModeCanWrite(handle.open_mode)) return error.SqlReadOnlyTransaction;
     if (request.action == .create) try tables.create(handle.parent_handle orelse handle, table, "{}", true);
     const database = try tables.get(handle.parent_handle orelse handle, table);
-    const context: memory.Context = .{ .table_id = database.core.identity_namespace.table_id, .space = space, .principal = request.principal, .admin = true, .clock_ms_fn = clockMs, .now_ms = @intCast(@import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms) };
+    const context: memory.Context = .{ .branch = request.branch, .table_id = database.core.identity_namespace.table_id, .space = space, .principal = request.principal, .admin = true, .clock_ms_fn = clockMs, .now_ms = @intCast(@import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms) };
     var resources: ResourceReader = .{ .guard = guard };
     var adapter: engine.Native(h.db_mod.DB) = .{ .db = database, .context = context, .resource_ptr = &resources, .resource_fn = ResourceReader.read };
     // Provider lifetime is independent of the storage generation. Retain it

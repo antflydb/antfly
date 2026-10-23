@@ -43,26 +43,42 @@ fn blocked(err: anyerror) bool {
     };
 }
 pub fn retentionDue(backend: m.Backend, a: A, now: i64, state: m.types.State) !bool {
+    if (state.persistent_roots) {
+        const due = try backend.scan(backend.ptr, a, "lineage-gc/", null, 1);
+        if (due.rows.len > 0) {
+            const value = due.rows[0].key["lineage-gc/".len..];
+            const slash = std.mem.indexOfScalar(u8, value, '/') orelse return error.MemoryCorruptState;
+            if ((std.fmt.parseInt(i64, value[0..slash], 10) catch return error.MemoryCorruptState) <= now) return true;
+        }
+    }
+    if (state.config.features.lineage) {
+        var digest: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash("\"main\"", &digest, .{});
+        const path = try std.fmt.allocPrint(a, "lineage-head/{s}", .{std.fmt.bytesToHex(digest, .lower)});
+        const row = try backend.get(backend.ptr, a, path);
+        if (row == null or !(try std.json.parseFromSliceLeaky(m.types.LineageHead, a, row.?.json, .{})).complete) return true;
+    }
     const candidate_index = try backend.get(backend.ptr, a, "entity-candidate-index");
     const index_complete = if (candidate_index) |row| (try std.json.parseFromSliceLeaky(struct { cursor: ?[]const u8 = null, complete: bool = false }, a, row.json, .{})).complete else false;
-    if (!index_complete or (state.next_resource_check_at != null and state.next_resource_check_at.? <= now) or
+    if (!index_complete or (state.next_change_expiry_at != null and state.next_change_expiry_at.? <= now) or (state.next_resource_check_at != null and state.next_resource_check_at.? <= now) or
         (state.next_expiry_at != null and state.next_expiry_at.? <= now) or
         (try backend.get(backend.ptr, a, "cleanup")) != null or
         (try backend.scan(backend.ptr, a, "dependency/work/", null, 1)).rows.len != 0) return true;
     const due = try backend.scan(backend.ptr, a, "entity-semantic-due/", null, 1);
-    return due.rows.len != 0 and (try std.json.parseFromSliceLeaky(struct { id: []const u8, at: i64 }, a, due.rows[0].json, .{})).at <= now;
+    return due.rows.len != 0 and (try std.json.parseFromSliceLeaky(struct { id: []const u8, at: i64, branch: []const u8 = "" }, a, due.rows[0].json, .{})).at <= now;
 }
 pub fn recallDue(backend: m.Backend, a: A, now: i64, state: m.types.State) !bool {
     if (backend.search_assertions != null) {
         const row = try backend.get(backend.ptr, a, "assertion-recall-index");
         if (row == null) return true;
         const index = try std.json.parseFromSliceLeaky(m.types.RecallIndex, a, row.?.json, .{});
-        if (index.version != 2 or index.generation != state.config.generation or !index.backfill_complete or (try backend.scan(backend.ptr, a, "assertion-recall-work/", null, 1)).rows.len != 0 or (!index.complete and index.next_retry_at <= now)) return true;
+        if (index.version != m.types.recall_index_version or index.generation != state.config.generation or !index.backfill_complete or (try backend.scan(backend.ptr, a, "assertion-recall-work/", null, 1)).rows.len != 0 or (!index.complete and index.next_retry_at <= now)) return true;
     }
     return false;
 }
 pub fn semanticDue(backend: m.Backend, a: A, state: m.types.State) !bool {
     if (!state.config.semantic_discovery.enabled) return false;
+    if (state.config.features.lineage and ((try backend.get(backend.ptr, a, "branch-semantic-invalidation")) != null or (try backend.scan(backend.ptr, a, "branch-semantic-work/", null, 1)).rows.len != 0)) return true;
     const row = (try backend.get(backend.ptr, a, "entity-semantic-index")) orelse return true;
     const index = try std.json.parseFromSliceLeaky(m.types.SemanticIndex, a, row.json, .{});
     if (index.version != m.types.semantic_index_version or index.generation != state.config.generation or !index.backfill_complete) return true;

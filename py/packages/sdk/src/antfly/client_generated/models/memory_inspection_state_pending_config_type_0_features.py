@@ -17,6 +17,7 @@ T = TypeVar("T", bound="MemoryInspectionStatePendingConfigType0Features")
 class MemoryInspectionStatePendingConfigType0Features:
     """
     Attributes:
+        lineage (bool | Unset):  Default: False.
         semantic_recall (bool | Unset):  Default: False.
         entity_extraction (bool | Unset):  Default: False.
         assertion_distillation (bool | Unset):  Default: False.
@@ -25,6 +26,7 @@ class MemoryInspectionStatePendingConfigType0Features:
             MemoryInspectionStatePendingConfigType0FeaturesReconciliation.EXPLICIT.
     """
 
+    lineage: bool | Unset = False
     semantic_recall: bool | Unset = False
     entity_extraction: bool | Unset = False
     assertion_distillation: bool | Unset = False
@@ -34,6 +36,8 @@ class MemoryInspectionStatePendingConfigType0Features:
     )
 
     def to_dict(self) -> dict[str, Any]:
+        lineage = self.lineage
+
         semantic_recall = self.semantic_recall
 
         entity_extraction = self.entity_extraction
@@ -49,6 +53,8 @@ class MemoryInspectionStatePendingConfigType0Features:
         field_dict: dict[str, Any] = {}
 
         field_dict.update({})
+        if lineage is not UNSET:
+            field_dict["lineage"] = lineage
         if semantic_recall is not UNSET:
             field_dict["semantic_recall"] = semantic_recall
         if entity_extraction is not UNSET:
@@ -65,6 +71,8 @@ class MemoryInspectionStatePendingConfigType0Features:
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
         d = dict(src_dict)
+        lineage = d.pop("lineage", UNSET)
+
         semantic_recall = d.pop("semantic_recall", UNSET)
 
         entity_extraction = d.pop("entity_extraction", UNSET)
@@ -81,6 +89,7 @@ class MemoryInspectionStatePendingConfigType0Features:
             reconciliation = MemoryInspectionStatePendingConfigType0FeaturesReconciliation(_reconciliation)
 
         memory_inspection_state_pending_config_type_0_features = cls(
+            lineage=lineage,
             semantic_recall=semantic_recall,
             entity_extraction=entity_extraction,
             assertion_distillation=assertion_distillation,

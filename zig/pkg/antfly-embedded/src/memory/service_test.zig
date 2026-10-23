@@ -7166,3 +7166,535 @@ test "memory index creation intents survive interrupted DDL and retire obsolete 
     try std.testing.expectEqual(@as(usize, 1), store.index_drops);
     try std.testing.expectEqual(@as(usize, 2), (try Store.scan(&store, a, "memory-index/", null, 8)).rows.len);
 }
+
+const ScreeningFixture = struct {
+    fn random(_: *anyopaque, output: []u8) !void {
+        @memset(output, 0x42);
+    }
+    fn service(store: *Store, now: i64) m.Service {
+        var svc = store.service("alice", true, now);
+        svc.backend.random_bytes = random;
+        return svc;
+    }
+};
+test "memory intake rejects detected secrets without accepting evidence or a receipt" {
+    var store = Store.init();
+    defer store.deinit();
+    const a = store.arena.allocator();
+    const svc = ScreeningFixture.service(&store, 1);
+    _ = try svc.execute(a, .create, "", "{}", "create");
+    const revision = store.revision;
+    try std.testing.expectError(error.MemorySecretDetected, svc.execute(a, .observe, "", "{\"evidence\":[{\"id\":\"e\",\"source_id\":\"s\",\"source_version\":\"1\",\"text\":\"password=synthetic-fixture\"}]}", "reject"));
+    try std.testing.expectEqual(revision, store.revision);
+    try std.testing.expectEqual(@as(usize, 0), (try Store.scan(&store, a, "evidence/", null, 8)).rows.len);
+    try std.testing.expectEqual(@as(usize, 1), (try Store.scan(&store, a, "operation/", null, 8)).rows.len);
+}
+test "memory redaction persists sanitized content and keyed replay hashes without exposing the key" {
+    var store = Store.init();
+    defer store.deinit();
+    const a = store.arena.allocator();
+    const svc = ScreeningFixture.service(&store, 1);
+    _ = try svc.execute(a, .create, "", "{\"intake_screening\":{\"mode\":\"redact\"}}", "create");
+    const body = "{\"evidence\":[{\"id\":\"e\",\"source_id\":\"s\",\"source_version\":\"1\",\"text\":\"password=synthetic-fixture\"}]}";
+    const result = try svc.execute(a, .observe, "", body, "redact");
+    const receipt = try std.json.parseFromSliceLeaky(m.types.OperationStatus, a, result, .{});
+    try std.testing.expect(receipt.intake_screening.redactions > 0);
+    try std.testing.expectEqualStrings(result, try svc.execute(a, .observe, "", body, "redact"));
+    const rows = try Store.scan(&store, a, "evidence/", null, 8);
+    const evidence = try std.json.parseFromSliceLeaky(m.types.StoredEvidence, a, rows.rows[0].json, .{});
+    try std.testing.expectEqualStrings("password=[REDACTED]", evidence.evidence.text);
+    try std.testing.expect(evidence.materialization.?.text_redacted);
+    try std.testing.expectEqual(@as(usize, 64), evidence.materialization.?.text_sha256.len);
+    try std.testing.expect(evidence.materialization.?.screening.redactions > 0);
+    const state = try std.json.parseFromSliceLeaky(m.types.State, a, store.values.get("control").?, .{});
+    try std.testing.expectEqual(@as(usize, 64), state.input_digest_key.len);
+    const info = try svc.execute(a, .inspect, "", "{}", "");
+    try std.testing.expect(std.mem.indexOf(u8, info, state.input_digest_key) == null);
+    var it = store.values.valueIterator();
+    while (it.next()) |json| try std.testing.expect(std.mem.indexOf(u8, json.*, "synthetic-fixture") == null);
+}
+test "memory materialized resources and model output pass through intake screening" {
+    for ([_]bool{ false, true }) |redact| {
+        var store = Store.init();
+        defer store.deinit();
+        const a = store.arena.allocator();
+        const svc = ScreeningFixture.service(&store, 1);
+        _ = try svc.execute(a, .create, "", if (redact) "{\"intake_screening\":{\"mode\":\"redact\"}}" else "{}", "create");
+        store.resource_json = "{\"api_key\":\"synthetic-fixture\"}";
+        const body = "{\"evidence\":[{\"id\":\"e\",\"resource_selector\":{\"table\":\"business\",\"id\":\"approval\"}}]}";
+        if (!redact) {
+            try std.testing.expectError(error.MemorySecretDetected, svc.execute(a, .observe, "", body, "resource"));
+        } else {
+            _ = try svc.execute(a, .observe, "", body, "resource");
+            const record = try svc.execute(a, .evidence, "e", "{}", "");
+            try std.testing.expect(std.mem.indexOf(u8, record, "synthetic-fixture") == null);
+            try std.testing.expect(std.mem.indexOf(u8, record, "[REDACTED]") != null);
+        }
+    }
+    const Provider = struct {
+        fn generate(_: *anyopaque, a: A, _: m.types.Config, _: []const m.types.StoredEvidence, _: m.InferenceBoundary) !m.types.Generated {
+            const assertions = try a.alloc(m.types.Assertion, 1);
+            assertions[0] = .{ .id = "managed", .subject = "s", .predicate = "p", .value = "v", .statement = "password=synthetic-fixture", .evidence = &.{.{ .id = "e1" }} };
+            return .{ .assertions = assertions };
+        }
+    };
+    var store = Store.init();
+    defer store.deinit();
+    const a = store.arena.allocator();
+    var svc = ScreeningFixture.service(&store, 1);
+    svc.backend.generate = Provider.generate;
+    _ = try svc.execute(a, .create, "", try std.json.Stringify.valueAlloc(a, m.types.Config{ .processing = .managed, .features = .{ .assertion_distillation = true }, .models = .{ .generator = fake_model }, .intake_screening = .{ .mode = .redact } }, .{}), "create");
+    const receipt = try std.json.parseFromSliceLeaky(m.types.OperationStatus, a, try svc.execute(a, .observe, "", source, "observe"), .{});
+    _ = try svc.execute(a, .advance, receipt.id, "{}", "generate");
+    const result = try svc.execute(a, .get, "managed", "{}", "");
+    try std.testing.expect(std.mem.indexOf(u8, result, "synthetic-fixture") == null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "[REDACTED]") != null);
+}
+
+test "memory change feed resumes across writes with bounded audience indexes and live retention" {
+    var store = Store.init();
+    defer store.deinit();
+    const a = store.arena.allocator();
+    var svc = ScreeningFixture.service(&store, 1);
+    _ = try svc.execute(a, .create, "", "{}", "create");
+    const latest = try std.json.parseFromSliceLeaky(m.types.ChangePage, a, try svc.execute(a, .changes, "", "{}", ""), .{});
+    try std.testing.expectEqual(@as(usize, 0), latest.items.len);
+    _ = try svc.execute(a, .observe, "", source, "observe");
+    _ = try svc.execute(a, .assertions, "", helm, "assertions");
+    const body = try std.json.Stringify.valueAlloc(a, m.types.ChangeRequest{ .cursor = latest.next_cursor, .limit = 1 }, .{});
+    const first = try std.json.parseFromSliceLeaky(m.types.ChangePage, a, try svc.execute(a, .changes, "", body, ""), .{});
+    try std.testing.expectEqual(@as(usize, 1), first.items.len);
+    try std.testing.expect(!first.caught_up);
+    try std.testing.expectEqual(m.types.ChangeKind.evidence_observed, first.items[0].kind);
+    const second = try std.json.parseFromSliceLeaky(m.types.ChangePage, a, try svc.execute(a, .changes, "", try std.json.Stringify.valueAlloc(a, m.types.ChangeRequest{ .cursor = first.next_cursor, .limit = 8 }, .{}), ""), .{});
+    try std.testing.expectEqual(@as(usize, 1), second.items.len);
+    try std.testing.expect(second.caught_up);
+    try std.testing.expectEqual(m.types.ChangeKind.assertion_changed, second.items[0].kind);
+    const bob = store.service("bob", false, 1);
+    try std.testing.expectError(error.InvalidMemoryCursor, bob.execute(a, .changes, "", body, ""));
+    const hidden = try std.json.parseFromSliceLeaky(m.types.ChangePage, a, try bob.execute(a, .changes, "", "{\"start\":\"beginning\"}", ""), .{});
+    for (hidden.items) |event| try std.testing.expect(event.target == null);
+    _ = try svc.execute(a, .forget, "", "{\"evidence_ids\":[\"e1\"]}", "forget");
+    const retained = try std.json.parseFromSliceLeaky(m.types.ChangePage, a, try svc.execute(a, .changes, "", try std.json.Stringify.valueAlloc(a, m.types.ChangeRequest{ .cursor = latest.next_cursor }, .{}), ""), .{});
+    for (retained.items) |event| try std.testing.expect(event.target == null);
+    svc.context.now_ms = 8 * 24 * 60 * 60 * 1000;
+    const expired = try std.json.parseFromSliceLeaky(m.types.ChangePage, a, try svc.execute(a, .changes, "", "{\"start\":\"beginning\"}", ""), .{});
+    try std.testing.expectEqual(@as(usize, 0), expired.items.len);
+    _ = try svc.execute(a, .outcome, "", "{\"id\":\"outcome\",\"task_id\":\"test\",\"used_memory_ids\":[],\"success\":true}", "cleanup");
+    try std.testing.expectError(error.MemoryCursorStale, svc.execute(a, .changes, "", body, ""));
+}
+
+const SupersessionFixture = struct {
+    fn pin(svc: m.Service, a: A, id: []const u8) !m.types.ClaimPin {
+        const record = try std.json.parseFromSliceLeaky(m.types.StoredAssertion, a, try svc.execute(a, .get, id, "{}", ""), .{});
+        const info = try std.json.parseFromSliceLeaky(m.types.Inspection, a, try svc.execute(a, .inspect, "", "{}", ""), .{});
+        var digest: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(try std.json.Stringify.valueAlloc(a, .{ record, info.state.config.generation }, .{}), &digest, .{});
+        return .{ .id = id, .revision = record.revision, .fingerprint = try a.dupe(u8, &std.fmt.bytesToHex(digest, .lower)) };
+    }
+    fn revision(svc: m.Service, a: A) !u64 {
+        return (try std.json.parseFromSliceLeaky(m.types.Inspection, a, try svc.execute(a, .inspect, "", "{}", ""), .{})).state.revision;
+    }
+    fn propose(svc: m.Service, a: A, proposal_id: []const u8) !void {
+        _ = try svc.execute(a, .propose_supersession, "", try std.json.Stringify.valueAlloc(a, m.types.SupersessionProposalRequest{ .id = proposal_id, .expected_revision = try revision(svc, a), .incoming = try pin(svc, a, "new"), .previous = try pin(svc, a, "old"), .actor = "outside-judge" }, .{}), proposal_id);
+    }
+};
+test "memory supersession external verdicts are frozen attributed native decisions with deferred queues" {
+    for ([_]m.types.SupersessionRelation{ .supersedes, .contradicts, .restates, .independent }) |relation| {
+        var store = Store.init();
+        defer store.deinit();
+        const a = store.arena.allocator();
+        const svc = store.service("alice", true, 200);
+        _ = try svc.execute(a, .create, "", "{}", "create");
+        _ = try svc.execute(a, .observe, "", source, "observe");
+        const claims: [2]m.types.Assertion = .{
+            .{ .id = "old", .subject = "deployment", .predicate = "uses", .value = "helm", .statement = "Deployment uses Helm", .valid_from = 100, .evidence = &.{.{ .id = "e1" }} },
+            .{ .id = "new", .subject = "deployment", .predicate = "uses", .value = "terraform", .statement = "Deployment uses Terraform", .valid_from = 200, .evidence = &.{.{ .id = "e1" }} },
+        };
+        _ = try svc.execute(a, .assertions, "", try std.json.Stringify.valueAlloc(a, .{ .assertions = claims }, .{}), "claims");
+        try SupersessionFixture.propose(svc, a, "pair");
+        _ = try svc.execute(a, .review_supersession, "pair", try std.json.Stringify.valueAlloc(a, m.types.SupersessionVerdict{ .expected_revision = try SupersessionFixture.revision(svc, a), .actor = "judge", .reason = "Insufficient certainty" }, .{}), "defer");
+        const open = try std.json.parseFromSliceLeaky(m.types.SupersessionProposalPage, a, try svc.execute(a, .supersession_proposals, "", "{}", ""), .{});
+        try std.testing.expectEqual(@as(usize, 1), open.items.len);
+        const body = try std.json.Stringify.valueAlloc(a, m.types.SupersessionVerdict{ .expected_revision = try SupersessionFixture.revision(svc, a), .verdict = relation, .actor = "judge", .reason = "Grounded comparison", .evidence = &.{.{ .id = "e1" }} }, .{});
+        const receipt = try svc.execute(a, .review_supersession, "pair", body, "verdict");
+        try std.testing.expectEqualStrings(receipt, try svc.execute(a, .review_supersession, "pair", body, "verdict"));
+        const detail = try std.json.parseFromSliceLeaky(m.types.SupersessionProposalDetail, a, try svc.execute(a, .supersession_proposal, "pair", "{}", ""), .{});
+        try std.testing.expectEqual(relation, detail.proposal.verdict.?);
+        try std.testing.expectEqualStrings("alice", detail.proposal.verdict_principal);
+        try std.testing.expectEqualStrings("judge", detail.proposal.verdict_actor);
+        const old = try std.json.parseFromSliceLeaky(m.types.StoredAssertion, a, try svc.execute(a, .get, "old", "{}", ""), .{});
+        try std.testing.expectEqual(switch (relation) {
+            .supersedes => m.types.Lifecycle.superseded,
+            .contradicts => m.types.Lifecycle.disputed,
+            else => m.types.Lifecycle.active,
+        }, old.lifecycle);
+        const closed = try std.json.parseFromSliceLeaky(m.types.SupersessionProposalPage, a, try svc.execute(a, .supersession_proposals, "", "{}", ""), .{});
+        try std.testing.expectEqual(@as(usize, 0), closed.items.len);
+        _ = try svc.execute(a, .forget, "", "{\"evidence_ids\":[\"e1\"]}", "forget");
+        try std.testing.expectError(error.MemoryNotFound, svc.execute(a, .supersession_proposal, "pair", "{}", ""));
+    }
+}
+
+test "memory lineage forks share pinned beliefs and revert fences descendants without undoing forgetting" {
+    var store = Store.init();
+    defer store.deinit();
+    const a = store.arena.allocator();
+    const svc = store.service("alice", true, 200);
+    _ = try svc.execute(a, .create, "", "{\"features\":{\"lineage\":true}}", "create");
+    _ = try svc.execute(a, .observe, "", source, "observe");
+    _ = try svc.execute(a, .assertions, "", helm, "claims");
+    _ = try svc.execute(a, .fork_lineage, "", try std.json.Stringify.valueAlloc(a, m.types.LineageFork{ .id = "fork", .expected_revision = try SupersessionFixture.revision(svc, a) }, .{}), "fork");
+    var branch = svc;
+    branch.context.branch = "fork";
+    const initial = try branch.execute(a, .get, "helm", "{}", "");
+    _ = try branch.execute(a, .checkpoint_lineage, "", try std.json.Stringify.valueAlloc(a, m.types.LineageCheckpointRequest{ .id = "before", .expected_revision = try SupersessionFixture.revision(branch, a) }, .{}), "checkpoint");
+    const old = try std.json.parseFromSliceLeaky(m.types.StoredAssertion, a, initial, .{});
+    _ = try branch.execute(a, .correct, "", try std.json.Stringify.valueAlloc(a, m.types.Correction{ .id = "helm", .expected_revision = old.revision, .lifecycle = .retracted, .reason = "Undone on fork" }, .{}), "correct");
+    try std.testing.expectEqualStrings(initial, try svc.execute(a, .get, "helm", "{}", ""));
+    _ = try branch.execute(a, .observe, "", "{\"evidence\":[{\"id\":\"e2\",\"source_id\":\"fork\",\"source_version\":\"1\",\"text\":\"Fork uses Terraform\"}],\"assertions\":[{\"id\":\"fork-only\",\"subject\":\"production\",\"predicate\":\"deploys_with\",\"value\":\"Terraform\",\"statement\":\"Fork uses Terraform\",\"evidence\":[{\"id\":\"e2\"}]}]}", "fork-observe");
+    try std.testing.expectError(error.MemoryNotFound, svc.execute(a, .get, "fork-only", "{}", ""));
+    _ = try branch.execute(a, .fork_lineage, "", try std.json.Stringify.valueAlloc(a, m.types.LineageFork{ .id = "child", .from = "fork", .expected_revision = try SupersessionFixture.revision(branch, a) }, .{}), "child");
+    var child = svc;
+    child.context.branch = "child";
+    const fork_only = try child.execute(a, .get, "fork-only", "{}", "");
+    const reads = store.reads;
+    _ = try branch.execute(a, .revert_lineage, "", try std.json.Stringify.valueAlloc(a, m.types.LineageRevert{ .checkpoint = "before", .expected_revision = try SupersessionFixture.revision(branch, a) }, .{}), "revert");
+    try std.testing.expect(store.reads - reads < 64);
+    try std.testing.expectEqualStrings(initial, try branch.execute(a, .get, "helm", "{}", ""));
+    try std.testing.expectError(error.MemoryNotFound, branch.execute(a, .get, "fork-only", "{}", ""));
+    try std.testing.expectEqualStrings(fork_only, try child.execute(a, .get, "fork-only", "{}", ""));
+    const page = try std.json.parseFromSliceLeaky(m.types.RecordPage, a, try branch.execute(a, .list, "", "{}", ""), .{});
+    try std.testing.expectEqual(@as(usize, 1), page.items.len);
+    try std.testing.expectEqual(m.types.Lifecycle.active, page.items[0].lifecycle);
+    _ = try svc.execute(a, .forget, "", "{\"evidence_ids\":[\"e1\"]}", "forget");
+    try std.testing.expectError(error.MemoryNotFound, branch.execute(a, .get, "helm", "{}", ""));
+    try std.testing.expectError(error.MemoryNotFound, child.execute(a, .get, "helm", "{}", ""));
+    var stranger = store.service("bob", false, 200);
+    stranger.context.branch = "fork";
+    try std.testing.expectError(error.Forbidden, stranger.execute(a, .lineage, "", "{}", ""));
+}
+
+const EvaluationFixture = struct {
+    fn dataset(svc: m.Service, a: A, evidence: bool) !void {
+        const values: [2]m.types.evaluation.Case = .{
+            .{ .id = "identity", .task = .identity, .input = try std.json.parseFromSliceLeaky(std.json.Value, a, "{\"left\":\"KG\",\"right\":\"knowledge graph\"}", .{}), .expected = .same, .evidence = if (evidence) &.{.{ .id = "e1" }} else &.{} },
+            .{ .id = "retrieval", .task = .retrieval, .input = try std.json.parseFromSliceLeaky(std.json.Value, a, "{\"query\":\"Deployment\"}", .{}), .relevant_ids = &.{ "a", "b" }, .evidence = if (evidence) &.{.{ .id = "e1" }} else &.{} },
+        };
+        _ = try svc.execute(a, .put_evaluation_dataset, "", try std.json.Stringify.valueAlloc(a, m.types.evaluation.DatasetRequest{ .id = "labels", .expected_revision = try SupersessionFixture.revision(svc, a), .cases = &values, .visibility = .team }, .{}), "dataset");
+    }
+    fn start(svc: m.Service, a: A, mode: @FieldType(m.types.evaluation.Start, "mode"), judge: ?m.types.Model) !m.types.OperationStatus {
+        return std.json.parseFromSliceLeaky(m.types.OperationStatus, a, try svc.execute(a, .start_evaluation, "", try std.json.Stringify.valueAlloc(a, m.types.evaluation.Start{ .id = "run", .dataset = "labels", .expected_revision = try SupersessionFixture.revision(svc, a), .mode = mode, .judge = judge }, .{}), "start"), .{});
+    }
+};
+test "memory evaluation pins dataset revisions hides gold and scores external verdicts without changing beliefs" {
+    var store = Store.init();
+    defer store.deinit();
+    const a = store.arena.allocator();
+    const svc = store.service("alice", true, 1);
+    _ = try svc.execute(a, .create, "", "{}", "create");
+    try EvaluationFixture.dataset(svc, a, false);
+    const started = try EvaluationFixture.start(svc, a, .external, null);
+    try std.testing.expectEqual(m.types.Stage.pending, started.phase);
+    const original = try std.json.parseFromSliceLeaky(m.types.evaluation.Dataset, a, try svc.execute(a, .evaluation_dataset, "labels", "{}", ""), .{});
+    // A later label edit never changes a run's pinned labelled revision.
+    _ = try svc.execute(a, .put_evaluation_dataset, "", try std.json.Stringify.valueAlloc(a, m.types.evaluation.DatasetRequest{ .id = "labels", .expected_revision = try SupersessionFixture.revision(svc, a), .cases = &.{.{ .id = "identity", .task = .identity, .input = .null, .expected = .different }}, .visibility = .team }, .{}), "edit");
+    var curator = store.service("judge-principal", false, 1);
+    curator.context.curator = true;
+    const tasks_json = try curator.execute(a, .evaluation_tasks, "run", "{}", "");
+    try std.testing.expect(std.mem.indexOf(u8, tasks_json, "expected") == null);
+    try std.testing.expect(std.mem.indexOf(u8, tasks_json, "relevant_ids") == null);
+    const tasks = try std.json.parseFromSliceLeaky(m.types.evaluation.TaskPage, a, tasks_json, .{});
+    try std.testing.expectEqual(@as(usize, 2), tasks.items.len);
+    var verdicts: [2]m.types.evaluation.Verdict = undefined;
+    for (tasks.items, &verdicts) |task, *verdict| verdict.* = .{ .case_id = task.case_id, .case_revision = task.case_revision, .input_fingerprint = task.input_fingerprint, .prediction = if (task.input.task == .identity) .{ .label = .same } else .{ .ranking = &.{ "b", "c" } } };
+    const body = try std.json.Stringify.valueAlloc(a, m.types.evaluation.Submit{ .expected_revision = try SupersessionFixture.revision(svc, a), .verdicts = &verdicts, .actor = "outside-judge" }, .{});
+    const receipt = try curator.execute(a, .evaluation_verdict, "run", body, "predictions");
+    try std.testing.expectEqualStrings(receipt, try curator.execute(a, .evaluation_verdict, "run", body, "predictions"));
+    try std.testing.expectError(error.Forbidden, curator.execute(a, .evaluation_cases, "labels", "{}", ""));
+    const status = try std.json.parseFromSliceLeaky(m.types.evaluation.Status, a, try curator.execute(a, .evaluation_run, "run", "{}", ""), .{});
+    try std.testing.expectEqual(original.revision, status.run.dataset_revision);
+    try std.testing.expectEqual(@as(f64, 1), status.identity.precision.?);
+    try std.testing.expectEqual(@as(f64, 1), status.identity.recall.?);
+    try std.testing.expectEqual(@as(f64, 0.5), status.retrieval.precision.?);
+    try std.testing.expectEqual(@as(f64, 0.5), status.retrieval.recall.?);
+    try std.testing.expectEqual(@as(usize, 0), (try Store.scan(&store, a, "assertion/", null, 8)).rows.len);
+}
+
+test "memory managed evaluations run bounded native judge work and exclude forgotten inputs" {
+    const Judge = struct {
+        fn evaluate(ptr: *anyopaque, _: A, _: m.types.Config, _: m.types.Model, input: m.types.evaluation.JudgeInput, fence: m.InferenceBoundary) !m.types.evaluation.JudgeOutput {
+            const store: *Store = @ptrCast(@alignCast(ptr));
+            store.decisions += 1;
+            try fence.complete();
+            return if (input.task == .identity) .{ .label = .same } else .{ .ranking = &.{"a"} };
+        }
+    };
+    var store = Store.init();
+    defer store.deinit();
+    const a = store.arena.allocator();
+    var svc = store.service("alice", true, 1);
+    svc.backend.evaluate = Judge.evaluate;
+    _ = try svc.execute(a, .create, "", "{}", "create");
+    const team_source = "{\"evidence\":[{\"id\":\"e1\",\"source_id\":\"runbook\",\"source_version\":\"v1\",\"text\":\"Production uses Helm\",\"visibility\":\"team\"}]}";
+    _ = try svc.execute(a, .observe, "", team_source, "observe");
+    try EvaluationFixture.dataset(svc, a, true);
+    const started = try EvaluationFixture.start(svc, a, .managed, fake_model);
+    _ = try svc.execute(a, .advance, started.id, "{}", "judge-one");
+    try std.testing.expectEqual(@as(usize, 1), store.decisions);
+    _ = try svc.execute(a, .forget, "", "{\"evidence_ids\":[\"e1\"]}", "forget");
+    _ = try svc.execute(a, .advance, started.id, "{}", "judge-two");
+    try std.testing.expectEqual(@as(usize, 1), store.decisions);
+    const status = try std.json.parseFromSliceLeaky(m.types.evaluation.Status, a, try svc.execute(a, .evaluation_run, "run", "{}", ""), .{});
+    try std.testing.expectEqual(@as(u64, 2), status.run.completed);
+    try std.testing.expectEqual(@as(u64, 1), status.identity.counts.unavailable + status.retrieval.counts.unavailable);
+    const cases = try std.json.parseFromSliceLeaky(m.types.evaluation.CasePage, a, try svc.execute(a, .evaluation_cases, "labels", "{}", ""), .{});
+    try std.testing.expectEqual(@as(usize, 0), cases.items.len);
+    for (0..64) |i| {
+        if (store.values.get("cleanup") == null) break;
+        _ = try svc.execute(a, .advance, "", "{}", try std.fmt.allocPrint(a, "scrub-eval-{d}", .{i}));
+    }
+    const retained_cases = try Store.scan(&store, a, "evaluation-case/", null, 8);
+    for (retained_cases.rows) |row| {
+        const value = try std.json.parseFromSliceLeaky(m.types.evaluation.StoredCase, a, row.json, .{});
+        try std.testing.expect(value.forgotten);
+        try std.testing.expect(value.value.input == .null);
+        try std.testing.expect(value.value.expected == null);
+    }
+}
+
+test "memory lineage reclaims unpublished paths but retains every live branch and checkpoint root" {
+    var store = Store.init();
+    defer store.deinit();
+    const a = store.arena.allocator();
+    var svc = store.service("alice", true, 1);
+    _ = try svc.execute(a, .create, "", "{\"features\":{\"lineage\":true}}", "create");
+    _ = try svc.execute(a, .observe, "", source, "observe");
+    _ = try svc.execute(a, .assertions, "", helm, "claims");
+    _ = try svc.execute(a, .fork_lineage, "", try std.json.Stringify.valueAlloc(a, m.types.LineageFork{ .id = "fork", .expected_revision = try SupersessionFixture.revision(svc, a) }, .{}), "fork");
+    var branch = svc;
+    branch.context.branch = "fork";
+    _ = try branch.execute(a, .checkpoint_lineage, "", try std.json.Stringify.valueAlloc(a, m.types.LineageCheckpointRequest{ .id = "saved", .expected_revision = try SupersessionFixture.revision(branch, a) }, .{}), "checkpoint");
+    const expected = try branch.execute(a, .get, "helm", "{}", "");
+    for (0..12) |i| {
+        const before = try std.json.parseFromSliceLeaky(m.types.StoredAssertion, a, try svc.execute(a, .get, "helm", "{}", ""), .{});
+        _ = try svc.execute(a, .correct, "", try std.json.Stringify.valueAlloc(a, m.types.Correction{ .id = "helm", .expected_revision = before.revision, .lifecycle = if (i % 2 == 0) .retracted else .active, .reason = "Explicit correction" }, .{}), try std.fmt.allocPrint(a, "correct-{d}", .{i}));
+    }
+    const nodes_before = (try Store.scan(&store, a, "lineage-node/", null, 1000)).rows.len;
+    for (0..16) |round| {
+        svc.context.now_ms += 5 * 60 * 1000 + 1;
+        for (0..8) |quantum| _ = try svc.execute(a, .advance, "", "{}", try std.fmt.allocPrint(a, "gc-{d}-{d}", .{ round, quantum }));
+    }
+    const nodes_after = (try Store.scan(&store, a, "lineage-node/", null, 1000)).rows.len;
+    try std.testing.expect(nodes_after < nodes_before);
+    branch.context.now_ms = svc.context.now_ms;
+    try std.testing.expectEqualStrings(expected, try branch.execute(a, .get, "helm", "{}", ""));
+    _ = try branch.execute(a, .revert_lineage, "", try std.json.Stringify.valueAlloc(a, m.types.LineageRevert{ .checkpoint = "saved", .expected_revision = try SupersessionFixture.revision(branch, a) }, .{}), "restore");
+    try std.testing.expectEqualStrings(expected, try branch.execute(a, .get, "helm", "{}", ""));
+}
+
+test "memory lineage legacy adoption is bounded and late extraction cannot publish after revert" {
+    var store = Store.init();
+    defer store.deinit();
+    const a = store.arena.allocator();
+    var svc = reviewService(&store, 1);
+    _ = try svc.execute(a, .create, "", "{}", "create");
+    _ = try svc.execute(a, .observe, "", source, "observe");
+    _ = try svc.execute(a, .assertions, "", helm, "claims");
+    var config: m.types.Config = .{ .features = .{ .lineage = true, .assertion_distillation = true }, .processing = .managed, .models = .{ .generator = fake_model } };
+    svc.backend.generate = fakeGenerate;
+    _ = try svc.execute(a, .configure, "", try std.json.Stringify.valueAlloc(a, .{ .expected_revision = try SupersessionFixture.revision(svc, a), .config = config }, .{}), "configure");
+    for (0..8) |i| _ = try svc.execute(a, .advance, "", "{}", try std.fmt.allocPrint(a, "adopt-{d}", .{i}));
+    const head = try std.json.parseFromSliceLeaky(m.types.LineageHead, a, try svc.execute(a, .lineage, "", "{}", ""), .{});
+    try std.testing.expect(head.complete);
+    _ = try svc.execute(a, .checkpoint_lineage, "", try std.json.Stringify.valueAlloc(a, m.types.LineageCheckpointRequest{ .id = "before", .expected_revision = try SupersessionFixture.revision(svc, a) }, .{}), "checkpoint");
+    const pending = try std.json.parseFromSliceLeaky(m.types.OperationStatus, a, try svc.execute(a, .observe, "", "{\"evidence\":[{\"id\":\"pending\",\"source_id\":\"branch\",\"source_version\":\"1\",\"text\":\"Pending extraction\",\"managed\":true}]}", "observe-pending"), .{});
+    _ = try svc.execute(a, .revert_lineage, "", try std.json.Stringify.valueAlloc(a, m.types.LineageRevert{ .checkpoint = "before", .expected_revision = try SupersessionFixture.revision(svc, a) }, .{}), "revert");
+    const advanced = try std.json.parseFromSliceLeaky(m.types.OperationStatus, a, try svc.execute(a, .advance, pending.id, "{}", "late-extraction"), .{});
+    try std.testing.expectEqual(m.types.Stage.cancelled, advanced.phase);
+    try std.testing.expectEqualStrings("MemoryForgotten", advanced.error_code.?);
+    config.features.lineage = false;
+    try std.testing.expectError(error.InvalidMemoryConfig, svc.execute(a, .configure, "", try std.json.Stringify.valueAlloc(a, .{ .expected_revision = try SupersessionFixture.revision(svc, a), .config = config }, .{}), "disable-lineage"));
+}
+
+test "memory lineage semantic descriptions have independent native generations and readiness per branch" {
+    var store = Store.init();
+    defer store.deinit();
+    const a = store.arena.allocator();
+    const svc = SemanticFixture.service(&store, 100);
+    const config: m.types.Config = .{ .features = .{ .lineage = true }, .models = .{ .embedder = fake_model }, .semantic_discovery = .{ .enabled = true } };
+    _ = try svc.execute(a, .create, "", try std.json.Stringify.valueAlloc(a, config, .{}), "create");
+    const entities: [2]m.types.Entity = .{ .{ .id = "a", .name = "Deployment", .evidence = &.{.{ .id = "e" }} }, .{ .id = "b", .name = "Release", .evidence = &.{.{ .id = "e" }} } };
+    _ = try svc.execute(a, .observe, "", try std.json.Stringify.valueAlloc(a, m.types.ObservationRequest{ .evidence = &.{.{ .id = "e", .source_id = "fixture", .source_version = "1", .text = "Deployment descriptions" }}, .entities = &entities }, .{}), "observe");
+    try IndexedRecallFixture.drain(svc, a, "main-ready");
+    const main = try std.json.parseFromSliceLeaky(m.types.EntityCandidatePage, a, try svc.execute(a, .entity_candidates, "a", "{}", ""), .{});
+    try std.testing.expectEqual(.indexed, main.semantic_discovery);
+    _ = try svc.execute(a, .fork_lineage, "", try std.json.Stringify.valueAlloc(a, m.types.LineageFork{ .id = "fork", .expected_revision = try SupersessionFixture.revision(svc, a) }, .{}), "fork");
+    var branch = svc;
+    branch.context.branch = "fork";
+    _ = try branch.execute(a, .checkpoint_lineage, "", try std.json.Stringify.valueAlloc(a, m.types.LineageCheckpointRequest{ .id = "before", .expected_revision = try SupersessionFixture.revision(branch, a) }, .{}), "checkpoint");
+    _ = try branch.execute(a, .assertions, "", try std.json.Stringify.valueAlloc(a, m.types.AssertionRequest{ .assertions = &.{.{ .id = "fork-description", .subject = "a", .predicate = "description", .value = "fork", .statement = "Only this branch uses Terraform", .evidence = &.{.{ .id = "e" }} }} }, .{}), "branch-fact");
+    const unready = try std.json.parseFromSliceLeaky(m.types.EntityCandidatePage, a, try branch.execute(a, .entity_candidates, "a", "{}", ""), .{});
+    try std.testing.expectEqual(.not_ready, unready.semantic_discovery);
+    try IndexedRecallFixture.drain(svc, a, "branch-ready");
+    const ready = try std.json.parseFromSliceLeaky(m.types.EntityCandidatePage, a, try branch.execute(a, .entity_candidates, "a", "{}", ""), .{});
+    try std.testing.expectEqual(.indexed, ready.semantic_discovery);
+    try std.testing.expect(std.mem.indexOf(u8, ready.seed_view.description, "Terraform") != null);
+    const unchanged = try std.json.parseFromSliceLeaky(m.types.EntityCandidatePage, a, try svc.execute(a, .entity_candidates, "a", "{}", ""), .{});
+    try std.testing.expectEqual(.indexed, unchanged.semantic_discovery);
+    try std.testing.expectEqualStrings(main.seed_view.fingerprint, unchanged.seed_view.fingerprint);
+    _ = try branch.execute(a, .revert_lineage, "", try std.json.Stringify.valueAlloc(a, m.types.LineageRevert{ .checkpoint = "before", .expected_revision = try SupersessionFixture.revision(branch, a) }, .{}), "revert");
+    try IndexedRecallFixture.drain(svc, a, "restored-ready");
+    const restored = try std.json.parseFromSliceLeaky(m.types.EntityCandidatePage, a, try branch.execute(a, .entity_candidates, "a", "{}", ""), .{});
+    try std.testing.expectEqual(.indexed, restored.semantic_discovery);
+    try std.testing.expectEqualStrings(main.seed_view.fingerprint, restored.seed_view.fingerprint);
+}
+
+test "memory lineage reuses qualified parent projection vectors without repeating provider work" {
+    const Counted = struct {
+        fn document(ptr: *anyopaque, a: A, _: m.types.Model, _: []const u8) ![]const f32 {
+            const store: *Store = @ptrCast(@alignCast(ptr));
+            store.document_batches += 1;
+            return a.dupe(f32, &.{ 1, 0 });
+        }
+        fn query(ptr: *anyopaque, a: A, _: m.types.Model, _: []const u8) ![]const f32 {
+            const store: *Store = @ptrCast(@alignCast(ptr));
+            store.query_batches += 1;
+            return a.dupe(f32, &.{ 1, 0 });
+        }
+    };
+    var store = Store.init();
+    defer store.deinit();
+    const a = store.arena.allocator();
+    var svc = SemanticFixture.service(&store, 100);
+    svc.backend.embed_document = Counted.document;
+    svc.backend.embed = Counted.query;
+    const config: m.types.Config = .{ .features = .{ .lineage = true }, .models = .{ .embedder = fake_model }, .semantic_discovery = .{ .enabled = true } };
+    _ = try svc.execute(a, .create, "", try std.json.Stringify.valueAlloc(a, config, .{}), "create");
+    _ = try svc.execute(a, .observe, "", "{\"evidence\":[{\"id\":\"e\",\"source_id\":\"fixture\",\"source_version\":\"1\",\"text\":\"Deployment descriptions\"}],\"entities\":[{\"id\":\"a\",\"name\":\"Deployment\",\"evidence\":[{\"id\":\"e\"}]}]}", "observe");
+    try IndexedRecallFixture.drain(svc, a, "main-ready");
+    const documents = store.document_batches;
+    const queries = store.query_batches;
+    try std.testing.expect(documents > 0 and queries > 0);
+    _ = try svc.execute(a, .fork_lineage, "", try std.json.Stringify.valueAlloc(a, m.types.LineageFork{ .id = "fork", .expected_revision = try SupersessionFixture.revision(svc, a) }, .{}), "fork");
+    try IndexedRecallFixture.drain(svc, a, "fork-ready");
+    try std.testing.expectEqual(documents, store.document_batches);
+    try std.testing.expectEqual(queries, store.query_batches);
+    var branch = svc;
+    branch.context.branch = "fork";
+    const candidates = try std.json.parseFromSliceLeaky(m.types.EntityCandidatePage, a, try branch.execute(a, .entity_candidates, "a", "{}", ""), .{});
+    try std.testing.expectEqual(.indexed, candidates.semantic_discovery);
+}
+
+test "memory feed isolates private branches and globally invalidates context on source expiry" {
+    var store = Store.init();
+    defer store.deinit();
+    const a = store.arena.allocator();
+    var svc = store.service("alice", true, 1);
+    _ = try svc.execute(a, .create, "", "{\"features\":{\"lineage\":true}}", "create");
+    _ = try svc.execute(a, .observe, "", "{\"evidence\":[{\"id\":\"e\",\"source_id\":\"fixture\",\"source_version\":\"1\",\"text\":\"Branch evidence\",\"visibility\":\"team\",\"expires_at\":100}]}", "observe");
+    _ = try svc.execute(a, .fork_lineage, "", try std.json.Stringify.valueAlloc(a, m.types.LineageFork{ .id = "private-fork", .expected_revision = try SupersessionFixture.revision(svc, a) }, .{}), "fork");
+    var branch = svc;
+    branch.context.branch = "private-fork";
+    _ = try branch.execute(a, .assertions, "", "{\"assertions\":[{\"id\":\"private-branch-fact\",\"subject\":\"s\",\"predicate\":\"p\",\"value\":\"v\",\"statement\":\"Private branch fact\",\"evidence\":[{\"id\":\"e\"}],\"visibility\":\"team\"}]}", "branch-fact");
+    var owner = store.service("alice", false, 1);
+    const visible = try std.json.parseFromSliceLeaky(m.types.ChangePage, a, try owner.execute(a, .changes, "", "{\"start\":\"beginning\"}", ""), .{});
+    var found = false;
+    for (visible.items) |event| if (event.target) |target| {
+        if (std.mem.eql(u8, target.id, "private-branch-fact")) {
+            found = true;
+            try std.testing.expectEqualStrings("private-fork", event.branch);
+        }
+    };
+    try std.testing.expect(found);
+    var stranger = store.service("bob", false, 1);
+    const hidden = try stranger.execute(a, .changes, "", "{\"start\":\"beginning\"}", "");
+    try std.testing.expect(std.mem.indexOf(u8, hidden, "private-fork") == null);
+    try std.testing.expect(std.mem.indexOf(u8, hidden, "private-branch-fact") == null);
+    const position = try std.json.parseFromSliceLeaky(m.types.ChangePage, a, try stranger.execute(a, .changes, "", "{}", ""), .{});
+    svc.context.now_ms = 101;
+    owner.context.now_ms = 101;
+    stranger.context.now_ms = 101;
+    for (0..12) |i| _ = try svc.execute(a, .advance, "", "{}", try std.fmt.allocPrint(a, "expire-{d}", .{i}));
+    const changes = try std.json.parseFromSliceLeaky(m.types.ChangePage, a, try stranger.execute(a, .changes, "", try std.json.Stringify.valueAlloc(a, m.types.ChangeRequest{ .cursor = position.next_cursor }, .{}), ""), .{});
+    var invalidated = false;
+    for (changes.items) |event| if (event.kind == .context_invalidated) {
+        invalidated = true;
+        try std.testing.expect(event.target == null);
+        try std.testing.expectEqualStrings("", event.branch);
+    };
+    try std.testing.expect(invalidated);
+}
+
+test "memory cached admin visibility cannot outlive the live administrative grant" {
+    const Revocation = struct {
+        fn get(ptr: *anyopaque, a: A, path: []const u8) !?m.Row {
+            const row = try Store.get(ptr, a, path);
+            const store: *Store = @ptrCast(@alignCast(ptr));
+            if (std.mem.startsWith(u8, path, "assertion/")) store.public_output = true;
+            return row;
+        }
+        fn require(ptr: *anyopaque, grant: m.types.RequiredGrant) !void {
+            const store: *Store = @ptrCast(@alignCast(ptr));
+            store.required_grant = grant;
+            // The caller still has ordinary write/read rights. Only its
+            // administrative grant disappeared during the record lookup.
+            if (grant == .admin and store.public_output) return error.Forbidden;
+        }
+    };
+    var store = Store.init();
+    defer store.deinit();
+    const a = store.arena.allocator();
+    try setup(&store);
+    _ = try store.service("alice", true, 200).execute(a, .assertions, "", helm, "claim");
+    const fact = try std.json.parseFromSliceLeaky(m.types.StoredAssertion, a, try store.service("alice", true, 200).execute(a, .get, "helm", "{}", ""), .{});
+    const revision = store.revision;
+    var stale_admin = store.service("bob", true, 200);
+    stale_admin.backend.get = Revocation.get;
+    stale_admin.context.grant_ptr = &store;
+    stale_admin.context.require_grant_fn = Revocation.require;
+    store.public_output = false;
+    try std.testing.expectError(error.Forbidden, stale_admin.execute(a, .get, "helm", "{}", ""));
+    store.public_output = false;
+    try std.testing.expectError(error.Forbidden, stale_admin.execute(a, .correct, "", try std.json.Stringify.valueAlloc(a, m.types.Correction{ .id = "helm", .expected_revision = fact.revision, .lifecycle = .retracted, .reason = "Attempt after admin revocation" }, .{}), "correct"));
+    try std.testing.expectEqual(revision, store.revision);
+    try std.testing.expectEqual(m.types.RequiredGrant.admin, store.required_grant);
+}
+
+test "memory evaluation records invalid judge outputs as abstentions and exposes frozen admin results" {
+    const Invalid = struct {
+        fn evaluate(ptr: *anyopaque, _: A, _: m.types.Config, _: m.types.Model, input: m.types.evaluation.JudgeInput, boundary: m.InferenceBoundary) !m.types.evaluation.JudgeOutput {
+            const store: *Store = @ptrCast(@alignCast(ptr));
+            store.decisions += 1;
+            try boundary.complete();
+            if (input.task == .retrieval) return error.MemoryUngroundedOutput;
+            // A valid label from the wrong task is not a valid identity answer.
+            return .{ .label = .related };
+        }
+    };
+    var store = Store.init();
+    defer store.deinit();
+    const a = store.arena.allocator();
+    var svc = store.service("alice", true, 1);
+    svc.backend.evaluate = Invalid.evaluate;
+    _ = try svc.execute(a, .create, "", "{}", "create");
+    try EvaluationFixture.dataset(svc, a, false);
+    const receipt = try EvaluationFixture.start(svc, a, .managed, fake_model);
+    _ = try svc.execute(a, .advance, receipt.id, "{}", "first");
+    _ = try svc.execute(a, .advance, receipt.id, "{}", "second");
+    try std.testing.expectEqual(@as(usize, 2), store.decisions);
+    const status = try std.json.parseFromSliceLeaky(m.types.evaluation.Status, a, try svc.execute(a, .evaluation_run, "run", "{}", ""), .{});
+    try std.testing.expectEqual(@as(u64, 2), status.run.completed);
+    try std.testing.expectEqual(@as(u64, 1), status.identity.counts.invalid_outputs);
+    try std.testing.expectEqual(@as(u64, 1), status.retrieval.counts.invalid_outputs);
+    try std.testing.expectEqual(@as(f64, 0), status.identity.coverage.?);
+    const results = try std.json.parseFromSliceLeaky(m.types.evaluation.ResultPage, a, try svc.execute(a, .evaluation_results, "run", "{}", ""), .{});
+    try std.testing.expectEqual(@as(usize, 2), results.items.len);
+    for (results.items) |entry| {
+        try std.testing.expect(entry.result.?.invalid_output);
+        try std.testing.expect(!entry.result.?.unavailable);
+    }
+    var curator = store.service("judge", false, 1);
+    curator.context.curator = true;
+    try std.testing.expectError(error.Forbidden, curator.execute(a, .evaluation_results, "run", "{}", ""));
+}

@@ -18,13 +18,14 @@ const std = @import("std");
 const t = @import("types.zig");
 const schema = @import("schema.zig");
 
-pub const Action = enum { create, inspect, configure, observe, assertions, recall, get, history, correct, forget, outcome, operation, advance, list, entities, curate_entity, resolve_entity, evidence, stage_embeddings, configuration, explain, entity_candidates, propose_entity, entity_proposals, entity_proposal, review_entity, entity_view, episodes, episode, propose_relationship, relationship_proposal, review_relationship };
+pub const Action = enum { evaluation_results, put_evaluation_dataset, evaluation_dataset, evaluation_cases, start_evaluation, evaluation_run, evaluation_tasks, evaluation_verdict, lineage, fork_lineage, checkpoint_lineage, revert_lineage, supersession_candidates, propose_supersession, supersession_proposals, supersession_proposal, review_supersession, changes, create, inspect, configure, observe, assertions, recall, get, history, correct, forget, outcome, operation, advance, list, entities, curate_entity, resolve_entity, evidence, stage_embeddings, configuration, explain, entity_candidates, propose_entity, entity_proposals, entity_proposal, review_entity, entity_view, episodes, episode, propose_relationship, relationship_proposal, review_relationship };
 pub const Configure = struct { expected_revision: u64, config: t.Config };
 pub const Page = struct { cursor: ?[]const u8 = null, limit: u16 = 64 };
+pub const EvaluationResultRequest = struct { cursor: ?[]const u8 = null, limit: u16 = 8 };
 
 pub fn mutates(action: Action) bool {
     return switch (action) {
-        .inspect, .recall, .get, .history, .operation, .list, .entities, .resolve_entity, .evidence, .configuration, .explain, .entity_candidates, .entity_proposals, .entity_proposal, .entity_view, .episodes, .episode, .relationship_proposal => false,
+        .evaluation_results, .evaluation_dataset, .evaluation_cases, .evaluation_run, .evaluation_tasks, .lineage, .supersession_candidates, .supersession_proposals, .supersession_proposal, .changes, .inspect, .recall, .get, .history, .operation, .list, .entities, .resolve_entity, .evidence, .configuration, .explain, .entity_candidates, .entity_proposals, .entity_proposal, .entity_view, .episodes, .episode, .relationship_proposal => false,
         else => true,
     };
 }
@@ -34,13 +35,26 @@ pub fn mutates(action: Action) bool {
 /// small ingestion budget never locks out inspection, erasure or recovery.
 pub fn usesInputBudget(action: Action) bool {
     return switch (action) {
-        .observe, .assertions, .correct, .outcome, .curate_entity, .stage_embeddings, .recall, .propose_entity, .review_entity, .propose_relationship, .review_relationship => true,
-        .create, .configure, .forget, .advance, .inspect, .get, .history, .operation, .list, .entities, .resolve_entity, .evidence, .configuration, .explain, .entity_candidates, .entity_proposals, .entity_proposal, .entity_view, .episodes, .episode, .relationship_proposal => false,
+        .put_evaluation_dataset, .evaluation_verdict, .propose_supersession, .review_supersession, .observe, .assertions, .correct, .outcome, .curate_entity, .stage_embeddings, .recall, .propose_entity, .review_entity, .propose_relationship, .review_relationship => true,
+        .evaluation_results, .evaluation_dataset, .evaluation_cases, .start_evaluation, .evaluation_run, .evaluation_tasks, .lineage, .fork_lineage, .checkpoint_lineage, .revert_lineage, .supersession_candidates, .supersession_proposals, .supersession_proposal, .changes, .create, .configure, .forget, .advance, .inspect, .get, .history, .operation, .list, .entities, .resolve_entity, .evidence, .configuration, .explain, .entity_candidates, .entity_proposals, .entity_proposal, .entity_view, .episodes, .episode, .relationship_proposal => false,
     };
 }
 
 pub fn Body(comptime action: Action) type {
     return switch (action) {
+        .put_evaluation_dataset => t.evaluation.DatasetRequest,
+        .start_evaluation => t.evaluation.Start,
+        .evaluation_verdict => t.evaluation.Submit,
+        .evaluation_results => EvaluationResultRequest,
+        .evaluation_cases, .evaluation_tasks => Page,
+        .fork_lineage => t.LineageFork,
+        .checkpoint_lineage => t.LineageCheckpointRequest,
+        .revert_lineage => t.LineageRevert,
+        .supersession_candidates => t.SupersessionCandidateRequest,
+        .propose_supersession => t.SupersessionProposalRequest,
+        .review_supersession => t.SupersessionVerdict,
+        .supersession_proposals => Page,
+        .changes => t.ChangeRequest,
         .create => t.Config,
         .configure => Configure,
         .observe => t.ObservationRequest,
@@ -67,7 +81,7 @@ pub fn Body(comptime action: Action) type {
 
 pub fn idRequired(action: Action) bool {
     return switch (action) {
-        .get, .history, .operation, .resolve_entity, .evidence, .configuration, .entity_candidates, .entity_proposal, .review_entity, .entity_view, .episode, .relationship_proposal, .review_relationship => true,
+        .evaluation_results, .evaluation_dataset, .evaluation_cases, .evaluation_run, .evaluation_tasks, .evaluation_verdict, .supersession_candidates, .supersession_proposal, .review_supersession, .get, .history, .operation, .resolve_entity, .evidence, .configuration, .entity_candidates, .entity_proposal, .review_entity, .entity_view, .episode, .relationship_proposal, .review_relationship => true,
         else => false,
     };
 }
@@ -85,6 +99,24 @@ pub fn description(action: Action) []const u8 {
         .entity_proposals => "Page through retained entity review proposals. Requires administrator access.",
         .entity_proposal => "Get an entity proposal and its retained external verdict attribution. Requires administrator access.",
         .review_entity => "Submit an external accept/reject/defer verdict; apply through native curation policy atomically. Rejecting a merge may pin distinct identities. Requires administrator access.",
+        .put_evaluation_dataset => "Create or revise a labelled evaluation dataset using immutable case records and a persistent indexed root. Requires administrator access.",
+        .evaluation_results => "Inspect a run's pinned gold inputs, predictions and per-case attribution. Requires administrator access.",
+        .evaluation_dataset => "Inspect the current labelled dataset revision. Requires administrator access.",
+        .evaluation_cases => "Page through a labelled dataset. Gold labels require administrator access.",
+        .start_evaluation => "Pin a dataset revision, native configuration and judge model for a reproducible external, managed or native-policy evaluation. Requires administrator access.",
+        .evaluation_run => "Inspect reproducible per-task precision, recall, coverage and abstention counts for an evaluation run.",
+        .evaluation_tasks => "Page through frozen external judge inputs without exposing gold labels.",
+        .evaluation_verdict => "Submit attributed revision-pinned evaluation predictions without changing production beliefs. Requires curator access.",
+        .lineage => "Inspect the selected branch and its inherited snapshot revision.",
+        .fork_lineage => "Fork a branch from a live branch or retained checkpoint without copying its records.",
+        .checkpoint_lineage => "Retain the selected branch root under an immutable checkpoint ID.",
+        .revert_lineage => "Atomically restore a retained checkpoint root; forgetting and source authorization remain live.",
+        .supersession_candidates => "Discover bounded indexed claims about the same canonical subject with overlapping scope and validity. Similarity never authorizes a replacement.",
+        .propose_supersession => "Queue a pair of frozen claim views for an external supersession judge with revision, configuration and source fences.",
+        .supersession_proposals => "Page through retained open supersession proposals.",
+        .supersession_proposal => "Get a retained supersession proposal and attributed verdict.",
+        .review_supersession => "Apply supersedes, contradicts, restates or independent through native claim policy; null defers. Requires curator access.",
+        .changes => "Follow bounded durable space changes with a resume cursor that survives writes. Events carry metadata only; current authorization and retention are rechecked.",
         .create => "Create a native memory space. Omit body for model-free defaults. Requires administrator access.",
         .inspect => "Inspect a space's effective configuration, capabilities, revision and pending configuration.",
         .configure => "Configure a space with an expected_revision fence. Requires administrator access; a rebuild may return a pending operation.",
@@ -117,6 +149,7 @@ pub fn mcpTools(a: std.mem.Allocator) !std.json.Value {
     inline for (@typeInfo(Action).@"enum".field_names) |name| {
         const action = @field(Action, name);
         const Envelope = struct {
+            branch: []const u8 = "",
             space: []const u8,
             database: []const u8 = "default",
             namespace: []const u8 = "public",

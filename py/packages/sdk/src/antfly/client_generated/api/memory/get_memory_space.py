@@ -16,6 +16,7 @@ def _get_kwargs(
     *,
     x_antfly_database: str | Unset = "default",
     x_antfly_namespace: str | Unset = "public",
+    x_antfly_memory_branch: str | Unset = "",
 ) -> dict[str, Any]:
     headers: dict[str, Any] = {}
     if not isinstance(x_antfly_database, Unset):
@@ -23,6 +24,9 @@ def _get_kwargs(
 
     if not isinstance(x_antfly_namespace, Unset):
         headers["X-Antfly-Namespace"] = x_antfly_namespace
+
+    if not isinstance(x_antfly_memory_branch, Unset):
+        headers["X-Antfly-Memory-Branch"] = x_antfly_memory_branch
 
     _kwargs: dict[str, Any] = {
         "method": "get",
@@ -111,12 +115,14 @@ def sync_detailed(
     client: AuthenticatedClient | Client,
     x_antfly_database: str | Unset = "default",
     x_antfly_namespace: str | Unset = "public",
+    x_antfly_memory_branch: str | Unset = "",
 ) -> Response[MemoryError_ | MemoryInspection]:
     """
     Args:
         space (str):
         x_antfly_database (str | Unset):  Default: 'default'.
         x_antfly_namespace (str | Unset):  Default: 'public'.
+        x_antfly_memory_branch (str | Unset):  Default: ''.
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -130,6 +136,7 @@ def sync_detailed(
         space=space,
         x_antfly_database=x_antfly_database,
         x_antfly_namespace=x_antfly_namespace,
+        x_antfly_memory_branch=x_antfly_memory_branch,
     )
 
     response = client.get_httpx_client().request(
@@ -145,12 +152,14 @@ def sync(
     client: AuthenticatedClient | Client,
     x_antfly_database: str | Unset = "default",
     x_antfly_namespace: str | Unset = "public",
+    x_antfly_memory_branch: str | Unset = "",
 ) -> MemoryError_ | MemoryInspection | None:
     """
     Args:
         space (str):
         x_antfly_database (str | Unset):  Default: 'default'.
         x_antfly_namespace (str | Unset):  Default: 'public'.
+        x_antfly_memory_branch (str | Unset):  Default: ''.
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -165,6 +174,7 @@ def sync(
         client=client,
         x_antfly_database=x_antfly_database,
         x_antfly_namespace=x_antfly_namespace,
+        x_antfly_memory_branch=x_antfly_memory_branch,
     ).parsed
 
 
@@ -174,12 +184,14 @@ async def asyncio_detailed(
     client: AuthenticatedClient | Client,
     x_antfly_database: str | Unset = "default",
     x_antfly_namespace: str | Unset = "public",
+    x_antfly_memory_branch: str | Unset = "",
 ) -> Response[MemoryError_ | MemoryInspection]:
     """
     Args:
         space (str):
         x_antfly_database (str | Unset):  Default: 'default'.
         x_antfly_namespace (str | Unset):  Default: 'public'.
+        x_antfly_memory_branch (str | Unset):  Default: ''.
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -193,6 +205,7 @@ async def asyncio_detailed(
         space=space,
         x_antfly_database=x_antfly_database,
         x_antfly_namespace=x_antfly_namespace,
+        x_antfly_memory_branch=x_antfly_memory_branch,
     )
 
     response = await client.get_async_httpx_client().request(**kwargs)
@@ -206,12 +219,14 @@ async def asyncio(
     client: AuthenticatedClient | Client,
     x_antfly_database: str | Unset = "default",
     x_antfly_namespace: str | Unset = "public",
+    x_antfly_memory_branch: str | Unset = "",
 ) -> MemoryError_ | MemoryInspection | None:
     """
     Args:
         space (str):
         x_antfly_database (str | Unset):  Default: 'default'.
         x_antfly_namespace (str | Unset):  Default: 'public'.
+        x_antfly_memory_branch (str | Unset):  Default: ''.
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -227,5 +242,6 @@ async def asyncio(
             client=client,
             x_antfly_database=x_antfly_database,
             x_antfly_namespace=x_antfly_namespace,
+            x_antfly_memory_branch=x_antfly_memory_branch,
         )
     ).parsed

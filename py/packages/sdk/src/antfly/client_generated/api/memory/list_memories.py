@@ -31,6 +31,7 @@ def _get_kwargs(
     known_at: int | None | Unset = UNSET,
     x_antfly_database: str | Unset = "default",
     x_antfly_namespace: str | Unset = "public",
+    x_antfly_memory_branch: str | Unset = "",
 ) -> dict[str, Any]:
     headers: dict[str, Any] = {}
     if not isinstance(x_antfly_database, Unset):
@@ -38,6 +39,9 @@ def _get_kwargs(
 
     if not isinstance(x_antfly_namespace, Unset):
         headers["X-Antfly-Namespace"] = x_antfly_namespace
+
+    if not isinstance(x_antfly_memory_branch, Unset):
+        headers["X-Antfly-Memory-Branch"] = x_antfly_memory_branch
 
     params: dict[str, Any] = {}
 
@@ -186,6 +190,7 @@ def sync_detailed(
     known_at: int | None | Unset = UNSET,
     x_antfly_database: str | Unset = "default",
     x_antfly_namespace: str | Unset = "public",
+    x_antfly_memory_branch: str | Unset = "",
 ) -> Response[MemoryError_ | MemoryRecordPage]:
     """
     Args:
@@ -207,6 +212,7 @@ def sync_detailed(
         known_at (int | None | Unset):
         x_antfly_database (str | Unset):  Default: 'default'.
         x_antfly_namespace (str | Unset):  Default: 'public'.
+        x_antfly_memory_branch (str | Unset):  Default: ''.
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -235,6 +241,7 @@ def sync_detailed(
         known_at=known_at,
         x_antfly_database=x_antfly_database,
         x_antfly_namespace=x_antfly_namespace,
+        x_antfly_memory_branch=x_antfly_memory_branch,
     )
 
     response = client.get_httpx_client().request(
@@ -265,6 +272,7 @@ def sync(
     known_at: int | None | Unset = UNSET,
     x_antfly_database: str | Unset = "default",
     x_antfly_namespace: str | Unset = "public",
+    x_antfly_memory_branch: str | Unset = "",
 ) -> MemoryError_ | MemoryRecordPage | None:
     """
     Args:
@@ -286,6 +294,7 @@ def sync(
         known_at (int | None | Unset):
         x_antfly_database (str | Unset):  Default: 'default'.
         x_antfly_namespace (str | Unset):  Default: 'public'.
+        x_antfly_memory_branch (str | Unset):  Default: ''.
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -315,6 +324,7 @@ def sync(
         known_at=known_at,
         x_antfly_database=x_antfly_database,
         x_antfly_namespace=x_antfly_namespace,
+        x_antfly_memory_branch=x_antfly_memory_branch,
     ).parsed
 
 
@@ -339,6 +349,7 @@ async def asyncio_detailed(
     known_at: int | None | Unset = UNSET,
     x_antfly_database: str | Unset = "default",
     x_antfly_namespace: str | Unset = "public",
+    x_antfly_memory_branch: str | Unset = "",
 ) -> Response[MemoryError_ | MemoryRecordPage]:
     """
     Args:
@@ -360,6 +371,7 @@ async def asyncio_detailed(
         known_at (int | None | Unset):
         x_antfly_database (str | Unset):  Default: 'default'.
         x_antfly_namespace (str | Unset):  Default: 'public'.
+        x_antfly_memory_branch (str | Unset):  Default: ''.
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -388,6 +400,7 @@ async def asyncio_detailed(
         known_at=known_at,
         x_antfly_database=x_antfly_database,
         x_antfly_namespace=x_antfly_namespace,
+        x_antfly_memory_branch=x_antfly_memory_branch,
     )
 
     response = await client.get_async_httpx_client().request(**kwargs)
@@ -416,6 +429,7 @@ async def asyncio(
     known_at: int | None | Unset = UNSET,
     x_antfly_database: str | Unset = "default",
     x_antfly_namespace: str | Unset = "public",
+    x_antfly_memory_branch: str | Unset = "",
 ) -> MemoryError_ | MemoryRecordPage | None:
     """
     Args:
@@ -437,6 +451,7 @@ async def asyncio(
         known_at (int | None | Unset):
         x_antfly_database (str | Unset):  Default: 'default'.
         x_antfly_namespace (str | Unset):  Default: 'public'.
+        x_antfly_memory_branch (str | Unset):  Default: ''.
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -467,5 +482,6 @@ async def asyncio(
             known_at=known_at,
             x_antfly_database=x_antfly_database,
             x_antfly_namespace=x_antfly_namespace,
+            x_antfly_memory_branch=x_antfly_memory_branch,
         )
     ).parsed

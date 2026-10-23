@@ -171,6 +171,79 @@ def main():
     schemas["MemoryEntityProposalDetail"]["properties"]["inputs"] = ref(
         "MemoryEntityProposalInputs"
     )
+    # Named native contracts keep all transports and SDKs on the same reusable
+    # case/view/prediction types instead of duplicating anonymous request trees.
+    for owner, field, target in (
+        ("MemorySpaceConfig", "intake_screening", "MemoryIntakeScreening"),
+        ("MemoryOperation", "intake_screening", "MemoryIntakeScreeningReport"),
+        ("MemoryClaimView", "memory", "MemoryRecord"),
+        ("MemorySupersessionCandidate", "view", "MemoryClaimView"),
+        ("MemorySupersessionCandidatePage", "seed", "MemoryClaimView"),
+        ("MemorySupersessionProposal", "incoming", "MemoryClaimPin"),
+        ("MemorySupersessionProposal", "previous", "MemoryClaimPin"),
+        ("MemorySupersessionProposalRequest", "incoming", "MemoryClaimPin"),
+        ("MemorySupersessionProposalRequest", "previous", "MemoryClaimPin"),
+        ("MemorySupersessionProposalDetail", "proposal", "MemorySupersessionProposal"),
+        ("MemorySupersessionProposalDetail", "incoming", "MemoryClaimView"),
+        ("MemorySupersessionProposalDetail", "previous", "MemoryClaimView"),
+        ("MemoryEvaluationStoredCase", "value", "MemoryEvaluationCase"),
+        ("MemoryEvaluationStatus", "run", "MemoryEvaluationRun"),
+        ("MemoryEvaluationReport", "counts", "MemoryEvaluationCounts"),
+        ("MemoryEvaluationJudgeTask", "input", "MemoryEvaluationJudgeInput"),
+        ("MemoryEvaluationVerdict", "prediction", "MemoryEvaluationJudgeOutput"),
+        ("MemoryEvaluationResultEntry", "case", "MemoryEvaluationStoredCase"),
+        (
+            "MemoryEvaluationPolicyInput",
+            "entity_candidates",
+            "MemoryEntityCandidateRequest",
+        ),
+        (
+            "MemoryEvaluationPolicyInput",
+            "supersession_candidates",
+            "MemorySupersessionCandidateRequest",
+        ),
+        ("MemoryEvaluationPolicyInput", "recall", "MemoryRecallRequest"),
+    ):
+        schemas[owner]["properties"][field] = ref(target)
+    for owner, field, target in (
+        ("MemorySupersessionCandidatePage", "items", "MemorySupersessionCandidate"),
+        ("MemorySupersessionProposalPage", "items", "MemorySupersessionProposal"),
+        ("MemoryChangePage", "items", "MemorySpaceChange"),
+        ("MemoryEvaluationDatasetRequest", "cases", "MemoryEvaluationCase"),
+        ("MemoryEvaluationCasePage", "items", "MemoryEvaluationStoredCase"),
+        ("MemoryEvaluationRun", "counts", "MemoryEvaluationCounts"),
+        ("MemoryEvaluationRun", "admission", "MemoryEvaluationCounts"),
+        ("MemoryEvaluationTaskPage", "items", "MemoryEvaluationJudgeTask"),
+        ("MemoryEvaluationSubmit", "verdicts", "MemoryEvaluationVerdict"),
+        ("MemoryEvaluationResultPage", "items", "MemoryEvaluationResultEntry"),
+    ):
+        schemas[owner]["properties"][field]["items"] = ref(target)
+    for field in (
+        "identity",
+        "relationship",
+        "supersession",
+        "retrieval",
+        "identity_admission",
+        "relationship_admission",
+        "supersession_admission",
+    ):
+        schemas["MemoryEvaluationStatus"]["properties"][field] = ref(
+            "MemoryEvaluationReport"
+        )
+    schemas["MemoryEvaluationCase"]["properties"]["policy"] = {
+        "allOf": [ref("MemoryEvaluationPolicyInput")],
+        "nullable": True,
+        "default": None,
+    }
+    schemas["MemoryEvaluationResultEntry"]["properties"]["result"] = {
+        "allOf": [ref("MemoryEvaluationResult")],
+        "nullable": True,
+    }
+    schemas["MemoryEvaluationResult"]["properties"]["prediction"] = {
+        "allOf": [ref("MemoryEvaluationPrediction")],
+        "nullable": True,
+        "default": None,
+    }
     paths = {}
 
     def operation(path, method, name, request=None, response=None, mutation=False):
@@ -206,9 +279,15 @@ def main():
             for name, value in (
                 ("X-Antfly-Database", "default"),
                 ("X-Antfly-Namespace", "public"),
+                ("X-Antfly-Memory-Branch", ""),
             )
         )
         if method == "get" and name in (
+            "getMemoryEvaluationResults",
+            "getMemoryEvaluationCases",
+            "getMemoryEvaluationTasks",
+            "listMemorySupersessionProposals",
+            "followMemoryChanges",
             "listMemories",
             "getMemoryHistory",
             "listMemoryEntities",
@@ -220,6 +299,20 @@ def main():
                 "cursor": {"type": "string"},
                 "limit": {"type": "integer", "minimum": 1, "maximum": 256},
             }
+            if name in (
+                "getMemoryEvaluationCases",
+                "getMemoryEvaluationTasks",
+                "getMemoryEvaluationResults",
+            ):
+                fields["limit"]["maximum"] = (
+                    8 if name == "getMemoryEvaluationResults" else 128
+                )
+            if name == "followMemoryChanges":
+                fields["start"] = {
+                    "type": "string",
+                    "enum": ["beginning", "latest"],
+                    "default": "latest",
+                }
             if name in ("listMemoryEpisodes", "getMemoryEpisode"):
                 fields["limit"]["maximum"] = 64
                 fields["known_at"] = {
@@ -317,6 +410,130 @@ def main():
         ("outcomes", "recordMemoryOutcome", "MemoryOutcome"),
     ):
         operation(prefix + "/{space}/" + suffix, "post", name, request, mutation=True)
+    operation(
+        prefix + "/{space}/memories/{id}/supersession-candidates",
+        "post",
+        "getMemorySupersessionCandidates",
+        "MemorySupersessionCandidateRequest",
+        "MemorySupersessionCandidatePage",
+    )
+    operation(
+        prefix + "/{space}/supersession-proposals",
+        "post",
+        "proposeMemorySupersession",
+        "MemorySupersessionProposalRequest",
+        mutation=True,
+    )
+    operation(
+        prefix + "/{space}/supersession-proposals",
+        "get",
+        "listMemorySupersessionProposals",
+        response="MemorySupersessionProposalPage",
+    )
+    operation(
+        prefix + "/{space}/supersession-proposals/{id}",
+        "get",
+        "getMemorySupersessionProposal",
+        response="MemorySupersessionProposalDetail",
+    )
+    operation(
+        prefix + "/{space}/supersession-proposals/{id}/verdict",
+        "post",
+        "reviewMemorySupersessionProposal",
+        "MemorySupersessionVerdict",
+        mutation=True,
+    )
+    operation(
+        prefix + "/{space}/evaluation-datasets",
+        "post",
+        "putMemoryEvaluationDataset",
+        "MemoryEvaluationDatasetRequest",
+        mutation=True,
+    )
+    operation(
+        prefix + "/{space}/evaluation-datasets/{id}",
+        "get",
+        "getMemoryEvaluationDataset",
+        response="MemoryEvaluationDataset",
+    )
+    operation(
+        prefix + "/{space}/evaluation-datasets/{id}/cases",
+        "get",
+        "getMemoryEvaluationCases",
+        response="MemoryEvaluationCasePage",
+    )
+    operation(
+        prefix + "/{space}/evaluations",
+        "post",
+        "startMemoryEvaluation",
+        "MemoryEvaluationStart",
+        mutation=True,
+    )
+    operation(
+        prefix + "/{space}/evaluations/{id}",
+        "get",
+        "getMemoryEvaluation",
+        response="MemoryEvaluationStatus",
+    )
+    operation(
+        prefix + "/{space}/evaluations/{id}/results",
+        "get",
+        "getMemoryEvaluationResults",
+        response="MemoryEvaluationResultPage",
+    )
+    operation(
+        prefix + "/{space}/evaluations/{id}/tasks",
+        "get",
+        "getMemoryEvaluationTasks",
+        response="MemoryEvaluationTaskPage",
+    )
+    operation(
+        prefix + "/{space}/evaluations/{id}/verdicts",
+        "post",
+        "submitMemoryEvaluationVerdicts",
+        "MemoryEvaluationSubmit",
+        mutation=True,
+    )
+    operation(
+        prefix + "/{space}/lineage",
+        "get",
+        "getMemoryLineage",
+        response="MemoryLineageHead",
+    )
+    operation(
+        prefix + "/{space}/forks",
+        "post",
+        "forkMemoryLineage",
+        "MemoryLineageFork",
+        mutation=True,
+    )
+    operation(
+        prefix + "/{space}/checkpoints",
+        "post",
+        "checkpointMemoryLineage",
+        "MemoryLineageCheckpointRequest",
+        mutation=True,
+    )
+    operation(
+        prefix + "/{space}/reverts",
+        "post",
+        "revertMemoryLineage",
+        "MemoryLineageRevert",
+        mutation=True,
+    )
+    operation(
+        prefix + "/{space}/changes",
+        "get",
+        "followMemoryChanges",
+        response="MemoryChangePage",
+    )
+    operation(
+        prefix + "/{space}/changes",
+        "post",
+        "pollMemoryChanges",
+        "MemoryChangeRequest",
+        "MemoryChangePage",
+    )
     operation(
         prefix + "/{space}/entities/{id}/view",
         "post",

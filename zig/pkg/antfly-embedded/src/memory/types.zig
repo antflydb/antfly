@@ -17,6 +17,7 @@
 const std = @import("std");
 
 pub const provenance = @import("../common/provenance.zig");
+pub const evaluation = @import("evaluation.zig");
 pub const schema_version: u32 = 1;
 pub const max_items = 256;
 pub const max_id_bytes = 256;
@@ -48,6 +49,7 @@ pub const Models = struct {
     decider: ?Model = null,
 };
 pub const Features = struct {
+    lineage: bool = false,
     semantic_recall: bool = false,
     entity_extraction: bool = false,
     assertion_distillation: bool = false,
@@ -63,6 +65,7 @@ pub const SemanticDiscovery = struct {
 };
 pub const ProjectionKind = enum { names, view };
 pub const EntityProjection = struct {
+    branch: []const u8 = "",
     entity_id: []const u8,
     entity_revision: u64,
     model: Model,
@@ -97,7 +100,10 @@ pub const RecallProjection = struct {
     vector_indexes: []const []const u8 = &.{},
     embedding: ?[]const f32 = null,
 };
-pub const RecallIndex = struct { version: u32 = 2, generation: u64 = 0, cursor: ?[]const u8 = null, backfill_complete: bool = false, complete: bool = false, next_retry_at: i64 = 0, yield_to_semantic: bool = false };
+pub const recall_index_version: u32 = 3;
+pub const RecallIndex = struct { version: u32 = recall_index_version, generation: u64 = 0, cursor: ?[]const u8 = null, backfill_complete: bool = false, complete: bool = false, next_retry_at: i64 = 0, yield_to_semantic: bool = false };
+pub const IntakeScreening = @import("secret_screening.zig").Config;
+pub const IntakeScreeningReport = @import("secret_screening.zig").Report;
 pub const Config = struct {
     version: u32 = schema_version,
     generation: u64 = 1,
@@ -106,6 +112,7 @@ pub const Config = struct {
     ontology_version: []const u8 = "memory/v1",
     policy_version: []const u8 = "memory/v1",
     features: Features = .{},
+    intake_screening: IntakeScreening = .{},
     models: Models = .{},
     semantic_discovery: SemanticDiscovery = .{},
     ontology_pack: enum { none, software_team_v1 } = .none,
@@ -116,8 +123,11 @@ pub const Config = struct {
     max_attempts: u8 = 3,
     max_recall_tokens: u32 = 8192,
     retention_ms: ?u64 = null,
+    change_retention_ms: u64 = 7 * 24 * 60 * 60 * 1000,
 
     pub fn validate(self: Config) !void {
+        try self.intake_screening.validate();
+        if (self.change_retention_ms == 0 or self.change_retention_ms > 90 * 24 * 60 * 60 * 1000) return error.InvalidMemoryConfig;
         if (self.version != schema_version or self.generation == 0 or self.ontology_version.len == 0 or self.policy_version.len == 0) return error.InvalidMemoryConfig;
         if (self.max_input_bytes == 0 or self.max_input_bytes > 4 * 1024 * 1024 or self.max_output_items == 0 or self.max_output_items > max_items or self.max_attempts == 0 or self.max_attempts > 16 or self.max_recall_tokens == 0 or self.max_recall_tokens > 65536) return error.InvalidMemoryConfig;
         if (self.semantic_discovery.enabled and (self.semantic_discovery.neighbors == 0 or self.semantic_discovery.neighbors > 64 or !std.math.isFinite(self.semantic_discovery.name_threshold) or !std.math.isFinite(self.semantic_discovery.view_threshold) or self.semantic_discovery.name_threshold <= 0 or self.semantic_discovery.view_threshold <= 0)) return error.InvalidMemoryConfig;
@@ -250,6 +260,13 @@ pub const Recall = struct {
     embedding_model: ?Model = null,
 };
 pub const State = struct {
+    // Private native HMAC key: inspection and public schemas never expose it.
+    input_digest_key: []const u8 = &.{},
+    persistent_roots: bool = false,
+    knowledge_revision: u64 = 0,
+    change_floor: []const u8 = "",
+    next_change_expiry_at: ?i64 = null,
+    change_min_recorded_at: i64 = std.math.minInt(i64),
     table_id: u64 = 0,
     database: []const u8 = "default",
     namespace: []const u8 = "public",
@@ -266,7 +283,8 @@ pub const State = struct {
     owner: []const u8,
     created_at: i64,
 };
-pub const StoredEvidence = struct { context_only: bool = false, evidence: Evidence, owner: []const u8, recorded_at: i64, revision: u64, forgotten: bool = false };
+pub const IntakeMaterialization = struct { screening: @import("secret_screening.zig").Report, text_redacted: bool, text_sha256: []const u8 };
+pub const StoredEvidence = struct { materialization: ?IntakeMaterialization = null, context_only: bool = false, evidence: Evidence, owner: []const u8, recorded_at: i64, revision: u64, forgotten: bool = false };
 /// Explicit human/producer decisions are the baseline for identity-policy
 /// projection. Rebuilding canonical groups never erases these decisions.
 pub const CorrectionProvenance = struct {
@@ -309,6 +327,8 @@ pub const StoredAssertion = struct {
 pub const Stage = enum { pending, running, succeeded, failed, cancelled };
 pub const RequiredGrant = enum { write, curator, admin };
 pub const Operation = struct {
+    evaluation_id: ?[]const u8 = null,
+    branch: []const u8 = "",
     proposal_id: ?[]const u8 = null,
     origin: ?provenance.Origin = null,
     required_grant: ?RequiredGrant = null,
@@ -317,6 +337,8 @@ pub const Operation = struct {
     id: []const u8,
     action: []const u8,
     request_hash: []const u8,
+    request_hash_version: u8 = 0,
+    intake_screening: IntakeScreeningReport = .{},
     owner: []const u8,
     revision: u64,
     config_generation: u64,
@@ -367,6 +389,9 @@ pub const EmbeddingBatch = struct {
 
 /// Public receipts contain no durable execution grants or worker cursors.
 pub const OperationStatus = struct {
+    evaluation_id: ?[]const u8 = null,
+    branch: []const u8 = "",
+    intake_screening: IntakeScreeningReport = .{},
     proposal_id: ?[]const u8 = null,
     id: []const u8,
     action: []const u8,
@@ -533,3 +558,28 @@ pub const RelationshipProposal = struct {
     verdict_evidence: []const EvidenceRef = &.{},
     reason: []const u8 = "",
 };
+
+/// Metadata-only durable notifications. A notification is never a read grant.
+pub const ChangeKind = enum { assertion_changed, assertion_superseded, assertion_disputed, assertion_retracted, evidence_observed, entity_changed, proposal_opened, proposal_deferred, proposal_decided, configuration_changed, context_invalidated, lineage_changed, evaluation_changed };
+pub const ChangeTarget = struct { kind: enum { assertion, evidence, entity, entity_proposal, relationship_proposal, supersession_proposal, lineage, evaluation, configuration }, id: []const u8, revision: u64 };
+pub const SpaceChange = struct { branch: []const u8 = "", id: []const u8, kind: ChangeKind, target: ?ChangeTarget, revision: u64, recorded_at: i64 };
+pub const ChangeRequest = struct { cursor: ?[]const u8 = null, start: enum { beginning, latest } = .latest, limit: u16 = 64 };
+pub const ChangePage = struct { items: []const SpaceChange, next_cursor: []const u8, caught_up: bool, revision: u64, retained_from: []const u8, retained_after: i64 };
+
+pub const ClaimView = struct { memory: StoredAssertion, fingerprint: []const u8, config_generation: u64 };
+pub const ClaimPin = struct { id: []const u8, revision: u64, fingerprint: []const u8 };
+pub const SupersessionCandidateRequest = struct { max_bytes: u32 = 256 * 1024, limit: u16 = 32, mode: enum { lexical, semantic, union_search } = .union_search, lexical_threshold: f64 = 0.1, semantic_threshold: f64 = 0.8 };
+pub const SupersessionCandidate = struct { view: ClaimView, lexical_score: f64, semantic_similarity: ?f64 };
+pub const SupersessionCandidatePage = struct { seed: ClaimView, items: []const SupersessionCandidate, retrieval: enum { indexed, not_ready }, semantic_discovery: enum { indexed, disabled, not_ready }, truncated: bool, revision: u64 };
+pub const SupersessionRelation = enum { supersedes, contradicts, restates, independent };
+pub const SupersessionProposalRequest = struct { id: []const u8, expected_revision: u64, incoming: ClaimPin, previous: ClaimPin, actor: []const u8 = "" };
+pub const SupersessionVerdict = struct { expected_revision: u64, verdict: ?SupersessionRelation = null, reason: []const u8 = "", actor: []const u8 = "", evidence: []const EvidenceRef = &.{}, model: ?Model = null };
+pub const SupersessionProposal = struct { branch: []const u8 = "", id: []const u8, incoming: ClaimPin, previous: ClaimPin, owner: []const u8, actor: []const u8, config_generation: u64, revision: u64, recorded_at: i64, verdict: ?SupersessionRelation = null, verdict_revision: ?u64 = null, verdict_principal: []const u8 = "", verdict_actor: []const u8 = "", reason: []const u8 = "", evidence: []const EvidenceRef = &.{}, model: ?Model = null };
+pub const SupersessionProposalPage = struct { items: []const SupersessionProposal, next_cursor: ?[]const u8, complete: bool, revision: u64 };
+pub const SupersessionProposalDetail = struct { proposal: SupersessionProposal, incoming: ClaimView, previous: ClaimView, stale_configuration: bool };
+
+pub const LineageHead = struct { id: []const u8, root: ?[]const u8 = null, revision: u64, owner: []const u8, visibility: Visibility = .private, created_at: i64, parent: ?[]const u8 = null, inherited_revision: ?u64 = null, complete: bool = true, cursor: ?[]const u8 = null, migration_lane: u8 = 0 };
+pub const LineageFork = struct { id: []const u8, from: []const u8 = "", checkpoint: ?[]const u8 = null, expected_revision: u64, visibility: Visibility = .private };
+pub const LineageCheckpointRequest = struct { id: []const u8, expected_revision: u64 };
+pub const LineageRevert = struct { checkpoint: []const u8, expected_revision: u64 };
+pub const LineageCheckpoint = struct { id: []const u8, branch: []const u8, root: ?[]const u8, revision: u64, owner: []const u8, visibility: Visibility, created_at: i64 };

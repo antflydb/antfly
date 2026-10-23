@@ -21654,6 +21654,7 @@ pub const ApiHttpServer = struct {
         var arena = std.heap.ArenaAllocator.init(self.alloc);
         defer arena.deinit();
         const a = arena.allocator();
+        try module.memory.screenIdentity(a, space);
         const table_label = try std.fmt.allocPrint(a, "memory_{s}", .{space});
         const logical = if (self.source.vtable.system_catalog != null) try (system_catalog.Target{ .database = input.database, .namespace = input.namespace, .table = table_label }).resourceNameAlloc(a) else table_label;
         var identity = try cloneCatalogIdentity(self.alloc, borrowed_identity);
@@ -21704,6 +21705,7 @@ pub const ApiHttpServer = struct {
         } else "";
         var publication: MemoryPublicationAuthority = .{ .server = self, .alloc = a, .executor = executor, .signature = signature, .payload = grant_payload, .logical = logical, .table = table, .identity = &identity, .request = &request, .required = required };
         const context: module.memory.Context = .{
+            .branch = input.branch,
             .table_id = table_id orelse 0,
             .grant_ptr = &publication,
             .require_grant_fn = MemoryPublicationAuthority.requireGrant,
