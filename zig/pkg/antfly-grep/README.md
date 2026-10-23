@@ -4708,3 +4708,13 @@ release-packaging checks and the Apache boundary pass. Rebuilt macOS, Linux and
 Windows CLI binaries are byte-identical to the fully tested binaries above.
 Main's unified CLI and Apache licensing are preserved; the compact report records
 the final native binary and both pre-/post-main measurement sets separately.
+
+
+The final main refresh through `2aed23bb0e` (#1264/#1265) is merged in
+`5447f58f3a`. Both 288-case CLI suites pass again, along with shared PDF/mock OCR
+integration, 149 query contracts, 15 identity/storage cases, 91 logical-field
+cases (one skip), generated error-name checks and both error-transport tests.
+Windows CLI cross-compilation and the Apache boundary pass. Relevant query/storage
+source hashes and macOS/Linux CLI bytes match the qualified build. Native server
+integration and timings remain pinned to the recorded `9ca2e6e28f` build; the
+compact report distinguishes this final targeted validation.

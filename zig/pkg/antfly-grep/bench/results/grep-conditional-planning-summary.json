@@ -976,5 +976,59 @@
       "availability": "local, unpublished",
       "sha256": "809d64b31ad3c07a6a72de5dc7176917915947bf0dbb0b793eae2e68c6c2bbae"
     }
+  },
+  "final_main_refresh": {
+    "main_commit": "2aed23bb0e43b51e0a674b6c2f54dd940706d0cb",
+    "merge_commit": "5447f58f3a",
+    "main_changes": "#1264 CI/inference build fixes and #1265 symbolic Type1 PDF Unicode recovery",
+    "merge_resolution": "Regenerated private error-name table with Zig 0.17.0; generator check and both transport tests pass.",
+    "query_contracts": 149,
+    "identity_storage_tests": 15,
+    "logical_field_tests": 91,
+    "logical_field_skips": 1,
+    "leaks": 0,
+    "pdf_tests": "lib-pdf-test passed (shared PDF and mock OCR integration)",
+    "error_transport_tests": 2,
+    "cli_macos_passed": 286,
+    "cli_macos_skipped": 2,
+    "cli_linux_vm_passed": 285,
+    "cli_linux_vm_skipped": 3,
+    "apache_source_files": 2203,
+    "core_source_hashes_unchanged_from_native_qualification": true,
+    "cli_macos_sha256": "faafe6832f4c44a74da8d07faf698de36bdf48119fcf898f573317712c9769ad",
+    "cli_linux_sha256": "9bfdd5b3cd713fefa56966390286a222d15d5d45cd669957e4f284636dac9c44",
+    "windows_cross_compilation": "passed",
+    "windows_cli_sha256": "f9d4900f91439325b805c1fbb7622afeefe4834093bc662fc548a50d7149c5c1",
+    "native_validation_scope": "Native server integration and performance remain pinned to the recorded 9ca2e6e28f build. This final refresh changes PDF/inference/CI paths; relevant query/storage source hashes and macOS/Linux CLI bytes are unchanged.",
+    "artifacts": {
+      "conditional-latest-cli-macos.log": {
+        "availability": "local, unpublished",
+        "sha256": "1ccaece6c979e24e94e4d836d93bb0b7acc60b4f6c35731cb6c5a6701674fdbe"
+      },
+      "conditional-latest-cli-linux.log": {
+        "availability": "local, unpublished",
+        "sha256": "7956c2af78f4d5885b098881e9498cc6cc0ea15bd6d5deb523edbbe692c52c9c"
+      },
+      "conditional-latest-contracts-pdf.log": {
+        "availability": "local, unpublished",
+        "sha256": "1c8b332fe9c59021b46688861d683a0d894498b0c89fcac2737a7c47fc91dea0"
+      },
+      "conditional-latest-error-transport.log": {
+        "availability": "local, unpublished",
+        "sha256": "527eb1106307ccf2f36cac7305730ef2d98e2cd0305758c7642e8fc7529ffd04"
+      },
+      "conditional-latest-boundary.log": {
+        "availability": "local, unpublished",
+        "sha256": "d419304086e969f41f709425c365ed1f01eaa5342262b6b6fc9831255afa4529"
+      },
+      "conditional-latest-compatibility.log": {
+        "availability": "local, unpublished",
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "conditional-latest-windows-build.log": {
+        "availability": "local, unpublished",
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      }
+    }
   }
 }
