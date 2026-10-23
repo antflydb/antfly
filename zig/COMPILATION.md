@@ -282,21 +282,31 @@ model pulls, CLI checks, storage/API and standalone process composition.
 Optimizing the serving graph covers attention and quantization as well as
 matrix multiplication; model assertions and request limits stay unchanged.
 
-The full CLI is a separate, heavier build profile. At PR #1264's `7c4df469bb`,
+The standalone inference development CLI (`antfly-inference-dev`) is a
+separate, heavier build profile. At PR #1264's `7c4df469bb`,
 its native x86_64 GNU, baseline CPU, unstripped ReleaseFast build measured
 10,717,630,464 bytes of compiler RSS and 49 minutes cold wall time. It used the
 exact Nix/glibc Zig derivation pinned in `scripts/ci/toolchain-policy.json`.
-The corresponding aarch64 Darwin-hosted Linux cross-build measured 12,537,217,024
-bytes. Reserve the measured peak plus 25%, rounded up to 64 MiB: 12,800 MiB
+The corresponding aarch64 Darwin-hosted Linux cross-build measured
+12,537,217,024 bytes. Reserve the measured peak plus 25%, rounded up to 64 MiB: 12,800 MiB
 native and 14,976 MiB cross-built. Scope these claims to the measured host,
-target, baseline CPU, accelerator-free, optimization and unstripped profiles; other profiles keep their
-existing claims. `-Dinference-compile-memory-mb` remains an explicit override.
+target, baseline CPU, accelerator-free, optimization and unstripped profiles;
+other profiles keep their existing claims. `-Dinference-compile-memory-mb`
+remains an explicit override.
 
 These claims do not change runner resources or model-process budgets. The
 native full CLI leaves 9.5 GiB for concurrent steps inside the existing
 22 GiB aggregate build budget. Model CI uses the HTTP target's independent
-reservation rather than inheriting this full-CLI claim. Qualify its memory
-and elapsed time separately before changing its admission profile.
+reservation rather than inheriting this development-CLI claim.
+
+The root build forwards `strip` into its inference workflow context; the
+field is required so another wrapper cannot silently retain debug information
+against the requested profile. Native HTTP admission is qualified separately
+with baseline CPU, ReleaseFast and explicit stripping. Its measured claim
+must fit beside two 8 GiB steps within the existing 22 GiB aggregate budget.
+
+The stripped HTTP executable also passes all 25 speech E2E cases locally;
+public CLI configuration contracts continue testing the Debug product.
 
 ### October macOS compile-memory follow-up
 

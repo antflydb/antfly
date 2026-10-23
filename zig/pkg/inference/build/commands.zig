@@ -60,14 +60,28 @@ pub fn addCommands(ctx: Context, install_default: bool) *std.Build.Step.Compile 
     const bench_server_step = ctx.step("bench-server", "Build the production HTTP server without the other CLI commands");
     bench_server_step.dependOn(&install_bench_server.step);
 
+    const http_baseline_cpu = switch (ctx.target.query.cpu_model) {
+        .baseline => true,
+        else => false,
+    };
+    const native_cpu_http_release = ctx.b.graph.host.result.os.tag == .linux and
+        ctx.b.graph.host.result.cpu.arch == .x86_64 and ctx.target.result.os.tag == .linux and
+        ctx.target.result.cpu.arch == .x86_64 and ctx.target.result.abi == .gnu and
+        http_baseline_cpu and ctx.optimize == .fast and ctx.strip and !ctx.hasAccelerator();
+    // CI's pinned Nix/glibc compiler measured 3,174,465,536 bytes for this
+    // stripped CPU profile. Peak + 25%, rounded up to 64 MiB, is 3,840 MiB.
+    // That fits beside two 8 GiB steps inside the existing 22 GiB budget.
+    // Other host/target, backend and optimization profiles keep their claims.
+    // HTTP-only ReleaseSmall with Metal measured a 4.46 GiB build-tree
+    // peak on an M4, under a 10 GiB watchdog with no additional swap.
+    // Other optimization modes retain the broader Metal allowance.
+    const http_default_memory_gib: usize = if (ctx.target.result.os.tag == .macos and ctx.backend.enable_metal)
+        (if (ctx.optimize == .small) 10 else 14)
+    else if (ctx.hasAccelerator()) 8 else 6;
+    const http_compile_memory_mb: usize = if (native_cpu_http_release) 3840 else http_default_memory_gib * 1024;
     const http_server = b.addExecutable(.{
         .name = "antfly-inference-http-server",
-        // HTTP-only ReleaseSmall with Metal measured a 4.46 GiB build-tree
-        // peak on an M4, under a 10 GiB watchdog with no additional swap.
-        // Other optimization modes retain the broader Metal allowance.
-        .max_rss = @as(usize, if (ctx.target.result.os.tag == .macos and ctx.backend.enable_metal)
-            (if (ctx.optimize == .small) 10 else 14)
-        else if (ctx.hasAccelerator()) 8 else 6) * 1024 * 1024 * 1024,
+        .max_rss = http_compile_memory_mb * 1024 * 1024,
         .root_module = b.createModule(.{
             .root_source_file = ctx.path("src/http_server.zig"),
             .target = ctx.target,
