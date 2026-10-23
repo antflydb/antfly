@@ -75,6 +75,23 @@ class QualificationTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.run_models()
 
+    def test_reference_output_uses_versioned_protocol(self):
+        import struct
+        (self.root / 'reference.bin').write_bytes(struct.pack('<f', 1) + b'guard')
+        case = dict(name='packed.rows', kernel='packed_rows', grid=[1, 1, 1], threads=[32, 1, 1],
+                    arguments=[dict(kind='reference_output', file='reference.bin', written_bytes=4)])
+        self.config.write_text(json.dumps(dict(cases=[case])))
+        self.assertTrue(qualification.pack_cuda(self.args))
+        raw = (self.root / 'cuda-cases.bin').read_bytes()
+        self.assertEqual(struct.unpack_from('<II', raw), (0x4b464332, 1))
+        role_offset = 8 + 4 + len(case['name']) + 4 + len(case['kernel']) + 32
+        self.assertEqual(struct.unpack_from('<IQQ', raw, role_offset), (3, 4, 9))
+        self.assertEqual(raw[role_offset + 20:], (self.root / 'reference.bin').read_bytes())
+        case['arguments'][0]['kind'] = 'output'
+        self.config.write_text(json.dumps(dict(cases=[case])))
+        self.assertTrue(qualification.pack_cuda(self.args))
+        self.assertEqual(struct.unpack_from('<I', (self.root / 'cuda-cases.bin').read_bytes())[0], 0x4b464331)
+
 
 if __name__ == '__main__':
     unittest.main()

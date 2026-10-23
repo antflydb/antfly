@@ -123,5 +123,18 @@ threads, dynamic scratch, math mode and balanced timing protocol. Build it with
 pinned `nvcc -O3 -arch=native -lcuda`. The Metal executable takes
 `MANIFEST RECEIPT`; CUDA takes `BASELINE_IMAGE CANDIDATE_IMAGE CASES_BIN RECEIPT`.
 Both compare every declared output and guard byte, then time fixed addresses
-with balanced arms; CUDA uses captured graphs. Keep independent operator
-references and model/lifetime gates alongside these direct baseline comparisons.
+with balanced arms. CUDA also checks outputs, guards and persistent workspaces
+after captured replay against separate correctness buffers. Optional `--long`
+after `RECEIPT` selects 32 balanced arms with 4,000 kernels per arm; the default
+uses 16 arms with 1,000 kernels per arm. Event time is divided by the actual
+kernel count in either protocol.
+
+CUDA arguments use `kind: value`, `buffer`, `output`, or `reference_output`, plus
+`file` and an output `written_bytes` extent. A reference-output fixture contains
+CPU-expected bytes followed by guards. The runner poisons the writable prefix,
+requires both versions to reproduce the independent reference exactly, and
+checks guards before and after replay. `pack-cuda` selects protocol v2 when a
+reference output is present; older runners reject it. Ordinary manifests retain
+v1 compatibility. These byte-level references also support exact integer and
+packed-header contracts. Keep independent operator references and model/lifetime
+gates alongside direct baseline comparisons.

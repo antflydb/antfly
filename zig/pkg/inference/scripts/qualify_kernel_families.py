@@ -176,7 +176,8 @@ def source_ledger(args):
 
 def pack_cuda(args):
     config = json.loads(args.config.read_text())
-    data = bytearray(struct.pack('<II', 0x4b464331, len(config['cases'])))
+    reference = any(arg['kind'] == 'reference_output' for case in config['cases'] for arg in case['arguments'])
+    data = bytearray(struct.pack('<II', 0x4b464332 if reference else 0x4b464331, len(config['cases'])))
     def string(value, pattern):
         if len(value) > 256 or not re.fullmatch(pattern, value):
             raise ValueError('Invalid CUDA case/kernel name')
@@ -189,9 +190,9 @@ def pack_cuda(args):
                             [case.get('shared_bytes', 0), len(case['arguments'])]))
         for arg in case['arguments']:
             raw = (args.config.parent / arg['file']).read_bytes()
-            role = {'value': 0, 'buffer': 1, 'output': 2}[arg['kind']]
+            role = {'value': 0, 'buffer': 1, 'output': 2, 'reference_output': 3}[arg['kind']]
             written = arg.get('written_bytes', 0)
-            if not raw or written > len(raw):
+            if not raw or written < 0 or written > len(raw) or (role >= 2 and written == 0):
                 raise ValueError('Invalid fixture extent')
             data += struct.pack('<IQQ', role, written, len(raw)) + raw
     (args.results / 'cuda-cases.bin').write_bytes(data)
