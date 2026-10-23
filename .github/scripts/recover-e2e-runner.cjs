@@ -25,9 +25,11 @@ function interruptedE2e(job, log) {
   const before = log.slice(0, shutdown);
   if (build) {
     // A failed shell needs an explicit interruption status. Ordinary nonzero
-    // exits (including OOM/137) are not evidence of external interruption.
-    if (active.conclusion === 'failure' &&
-        !/##\[error\]Process completed with exit code (?:130|143)\./.test(before)) return false;
+    // exits (including OOM/137) remain failures even when GitHub marks the
+    // active step cancelled as it subsequently shuts the runner down.
+    const exits = [...before.matchAll(/##\[error\]Process completed with exit code (\d+)\./g)];
+    if (exits.some(exit => !['130', '143'].includes(exit[1]))) return false;
+    if (active.conclusion === 'failure' && exits.length === 0) return false;
   }
   // Rebuild only externally interrupted compilers. A compiler/smoke failure
   // already present before shutdown must remain visible. The job-specific

@@ -83,6 +83,9 @@ test('interrupted build shells can have cancelled teardown, but independent fail
     }
   }
   for (const code of [1, 2, 137]) assert.equal(interruptedE2e(interruptedShellJob(), shellShutdown(code)), false);
+  const cancelled = buildJob('Build optimized model E2E executable');
+  for (const code of [1, 2, 137]) assert.equal(interruptedE2e(cancelled, shellShutdown(code)), false);
+  assert.equal(interruptedE2e(interruptedShellJob(), `${shellShutdown(137)}\n${shellShutdown(130)}`), false);
   assert.equal(interruptedE2e(interruptedShellJob(), shutdown), false);
   assert.equal(interruptedE2e({...interruptedShellJob(), conclusion: 'cancelled'}, shellShutdown(130)), false);
 });
