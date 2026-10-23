@@ -19,7 +19,7 @@ const runtime_build = @import("runtime.zig");
 
 pub fn addCommands(ctx: Context, install_default: bool) *std.Build.Step.Compile {
     const b = ctx.b;
-    const exe = runtime_build.addStandaloneExecutable(b, ctx.graph, ctx.target, ctx.optimize, ctx.paths.inference_root, ctx.backend.link_libc, ctx.strip);
+    const exe = runtime_build.addStandaloneExecutable(b, ctx.graph, ctx.target, ctx.optimize, ctx.paths.inference_root, ctx.backend.link_libc, .{ .strip = ctx.strip, .has_accelerator = ctx.hasAccelerator() });
     const install_exe = b.addInstallArtifact(exe, .{
         .dest_sub_path = "antfly-inference-dev",
     });
