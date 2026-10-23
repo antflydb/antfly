@@ -817,7 +817,10 @@ pub const ActiveMemTable = struct {
                 const input = self.source.entryAt(self.index);
                 if (self.pending == null) {
                     const account = self.candidate.ordered.account.?;
-                    if (input.shared != null and (input.shared.?.account == null or input.shared.?.account == account)) {
+                    // Reuse only bytes already owned by the backend account.
+                    // Unaccounted input can have independent producer pins and
+                    // construction credit; copying keeps those owners separate.
+                    if (input.shared != null and input.shared.?.account == account) {
                         self.pending = input.retainShared();
                     } else {
                         const ns_len = if (input.namespace_name) |name| name.len else 0;

@@ -241,7 +241,13 @@ pub fn SummarizedIndex(comptime Entry: type, comptime compare: fn (Entry, Entry)
         /// Conservative allocation bound, including pointer-vector growth.
         pub fn prepareMemoryBound(self: *const Self, edits: usize) !u64 {
             const needed = try self.preparedNodeCount(edits);
-            return std.math.add(u64, @sizeOf(Account), try std.math.mul(u64, needed, @sizeOf(Node) + 2 * @sizeOf(*Node)));
+            // ArrayList growth includes a cache-line minimum, which can exceed
+            // twice a small node count (notably on 128-byte cache-line hosts).
+            // Include both vector allocations during a possible relocation.
+            const capacity = if (needed == 0) 0 else std.ArrayListUnmanaged(*Node).growCapacity(needed);
+            const vectors = try std.math.mul(u64, capacity, 2 * @sizeOf(*Node));
+            const nodes = try std.math.mul(u64, needed, @sizeOf(Node));
+            return std.math.add(u64, @sizeOf(Account), try std.math.add(u64, nodes, vectors));
         }
 
         pub fn prepareEdits(self: *Self, allocator: std.mem.Allocator, edits: usize) !void {

@@ -4501,6 +4501,36 @@ pub const ResourceManager = struct {
         if (bounded_parent) self.pressure_change.advanceLocked() else self.notifyPressureChange();
     }
 
+    /// Reserve a stable observer's ledger metadata before physical construction.
+    /// A zero-valued identity remains registered until reconciliation retires
+    /// it; subsequent adoption needs no observer-map growth or allocation.
+    pub fn prepareUsageWithAdmission(self: *ResourceManager, slice: Slice, current: *u64, control: read_admission.Port) !void {
+        while (true) {
+            self.prepareUsageOnceWithAdmission(slice, current, control) catch |cause| {
+                if (cause != error.ParentMemoryBusy) return cause;
+                try control.waitForProgress();
+                continue;
+            };
+            return;
+        }
+    }
+
+    fn prepareUsageOnceWithAdmission(self: *ResourceManager, slice: Slice, current: *u64, control: read_admission.Port) !void {
+        try @import("../common/bounded_mutex.zig").lockAtomic(&self.mutex, control);
+        defer self.mutex.unlock();
+        if (!self.pressure_change.tryLock()) return error.ParentMemoryBusy;
+        defer self.pressure_change.unlock();
+        const key: ObserverKey = .{ .slice = slice, .identity = @intFromPtr(current) };
+        if (self.observer_identities.getPtr(key)) |owned| {
+            if (owned.current != current.* or owned.host_current != current.*) return error.ResourceAccountingMismatch;
+            return;
+        }
+        if (current.* != 0) return error.ResourceAccountingMismatch;
+        const entry = try self.observer_identities.getOrPutWithParentPolicy(self, key, true);
+        std.debug.assert(!entry.found_existing);
+        entry.value_ptr.* = .{ .current = 0 };
+    }
+
     /// Move construction credit into an observed retained owner atomically.
     /// Destination growth includes metadata; only its excess over transferred
     /// credit adds host usage. No reclamation callback runs under this lock.
@@ -5454,6 +5484,17 @@ const ConstructionCleanup = struct {
 pub const ConstructionCredit = struct {
     manager: *ResourceManager,
     slot: ?*ConstructionCleanup,
+
+    /// Adopt only prepaid bytes into a stable retained observer. Keep the
+    /// cleanup slot and unused reservation owned until construction/retirement
+    /// finishes, including when the original rejects a ledger or parent wait.
+    pub fn adoptUsageWithAdmission(self: *ConstructionCredit, destination: Slice, current: *u64, bytes: u64, control: read_admission.Port) !void {
+        const slot = self.slot orelse return error.ReservationReleased;
+        const credit = &slot.credit.?;
+        if (bytes > credit.bytes) return error.ResourceBudgetExceeded;
+        if (bytes == 0) return control.checkpoint();
+        try self.manager.adoptReservationUsageWithAdmission(credit, destination, current, bytes, control);
+    }
 
     /// Transfer successful construction credit to the published physical owner.
     pub fn transfer(self: *ConstructionCredit) Reservation {

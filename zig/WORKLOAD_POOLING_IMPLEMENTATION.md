@@ -24784,3 +24784,66 @@ the prepared successor with owning WAL append. Admitted final backend flush,
 retirement and equivalent Lite/object provider adoption remain open. This
 preparation owner does not enable the complete default pooling gate; the full
 goal remains active and full GNU qualification remains waived.
+
+### Mutable publication construction credit and retained accounting
+
+`Backend.QuiescedMutablePublication` now owns the successor's construction
+credit, preparation and accounting through publication or abandonment. The
+backend and its usage identity must stay stable and quiesced throughout this
+owner. Input uses the backend allocator and has its own residency credit;
+encoded and frozen WAL bytes also remain separate obligations.
+
+Preparation first reserves observer metadata under original admission, including
+an empty backend's zero-valued usage identity. It then reserves construction
+credit against the checked successor bound before any successor allocation.
+The manager-owned construction cleanup slot remains owned across preparation,
+OOM, rejected adoption and WAL work. Adoption transfers only prepaid actual
+growth into the backend's retained observer; it cannot silently admit excess
+growth. The observer and reservation metadata are already present, so adoption
+requires no new allocator capacity. Neither child nor parent ledger contention
+retains Backend.mu or replaces the original caller's wait authority.
+
+Actual successor growth is measured from its allocation account and node-pointer
+pool. The owner retains that account until physical retirement finishes, avoiding
+a full backend observer scan at the WAL boundary. Publication performs only the
+prepared swap, with no ledger access, snapshot destruction or allocation. Cached
+mutable snapshots must already be detached before creating the owner; debug
+guards check that precondition at construction and publication.
+
+Admitted retirement keeps released physical bytes charged until the child and
+parent ledgers accept reconciliation. A speculative account header is physically
+freed before its capacity is released, and the saved target survives rejected
+ledger retries. Unused construction credit retires into the existing finite
+manager-owned cleanup protocol. Published allocations remain charged in the
+backend observer. Mandatory quiesced destruction follows the same ownership
+ordering after the owning WAL operation joins.
+
+Preparation reuses packed input only when it already belongs to the backend's
+account. Unaccounted input is copied, preserving independent producer pins and
+their construction credit through consumer abandonment. The ordered-tree bound
+now includes ArrayList's actual cache-line minimum and vector relocation peak;
+the former two-pointer-per-node estimate undercounted small pools on this host.
+
+The real backend WAL regression now uses the credit-owning publication with a
+resource manager for successful adoption, abandoned publication and actual
+partial-append failure. Final receipt `mutable-publication-credit-v5` passes all
+68 build steps, 31 physical/WAL cases, 32 storage-read cases, 16 independently
+compiled archive cases and 45/1/8 identity cases without skips, failures or
+leaks. Tests deny slice and parent capacity before data allocation, reject all
+three original errors with the child ledger held before adoption and the parent
+held after physical retirement, adopt with both allocators exhausted, and retain
+producer data across partial new-account retirement. Exact retained usage matches
+the backend's independent full estimate. Source/log hashes match all 5,541
+inputs. Earlier receipts preserve the private-helper correction, detected bound
+underestimate and fresh-fixture baseline correction; v4 passes before the final
+snapshot guards and parent-contention coverage.
+
+Default close adoption remains open. Before this delta owner is used there,
+controlled close must detach snapshots and reconcile existing backend usage on
+bounded admitted CPU. A fresh backend's cleanup queue is an example of existing
+metadata that must be included in that baseline. Captured input and both WAL
+representations still need their owning credits, alongside manifest debt and
+the final status/WAL state machine. Admitted final backend flush/retirement and
+Lite/object provider adoption remain unfinished. No complete default pooling
+gate is enabled; the full goal remains active and full GNU qualification remains
+waived.

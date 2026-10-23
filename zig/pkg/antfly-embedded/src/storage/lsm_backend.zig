@@ -2211,6 +2211,141 @@ pub const Backend = struct {
         }
     }
 
+    /// Own construction credit and a bounded mutable successor through WAL
+    /// publication and old-state retirement. The backend, its observed usage
+    /// identity and every unrelated account mutation must remain quiesced and
+    /// stable until this owner retires. Input/WAL residency is prepaid by their
+    /// respective owners; this reservation covers additional successor bytes.
+    /// The caller first reconciles existing backend usage while quiescing it;
+    /// this delta owner cannot repair unobserved legacy allocations. Default
+    /// controlled close must detach cached mutable snapshots and establish
+    /// that baseline on admitted CPU before creating this owner.
+    pub const QuiescedMutablePublication = struct {
+        const Account = state_mod.memory_account.Account;
+        backend: *Backend,
+        cpu: ActiveMemTable.PublicationPreparation,
+        credit: ?resource_manager_mod.ConstructionCredit = null,
+        meter: ?*Account,
+        baseline_account_bytes: u64,
+        baseline_spare_bytes: u64,
+        baseline_usage: u64,
+        adopted: bool = false,
+        retirement_usage: ?u64 = null,
+        retired: bool = false,
+
+        pub fn init(backend: *Backend, source: *State) @This() {
+            std.debug.assert(backend.mutable_read_snapshot == null);
+            const account = backend.mutable.ordered.account;
+            const bytes = if (account) |a| a.bytes.load(.acquire) else 0;
+            const spares = spareBytes(&backend.mutable);
+            if (backend.options.resource_manager != null) {
+                const queue = if (backend.options.unpublished_outputs) |q| q.observedMemoryBytes() else 0;
+                std.debug.assert(backend.tracked_in_memory_state_bytes >= bytes + spares + queue);
+            }
+            return .{
+                .backend = backend,
+                .cpu = .init(&backend.mutable, source),
+                .meter = if (account) |a| a.retain() else null,
+                .baseline_account_bytes = bytes,
+                .baseline_spare_bytes = spares,
+                .baseline_usage = backend.tracked_in_memory_state_bytes,
+            };
+        }
+
+        fn spareBytes(table: *const ActiveMemTable) u64 {
+            return table.ordered.spare.capacity * @sizeOf(*anyopaque);
+        }
+
+        fn pinMeter(self: *@This()) void {
+            if (self.meter == null) {
+                if (self.cpu.candidate.ordered.account) |a| self.meter = a.retain();
+            }
+        }
+
+        pub fn resumeWithAdmission(self: *@This(), original: read_admission.Port) !void {
+            std.debug.assert(!self.retired and self.retirement_usage == null and !self.cpu.published);
+            const bound = try self.cpu.memoryBoundWithAdmission(original);
+            if (self.backend.options.resource_manager) |manager| {
+                try manager.prepareUsageWithAdmission(.lsm_in_memory_state, &self.backend.tracked_in_memory_state_bytes, original);
+                if (self.credit == null)
+                    self.credit = try manager.reserveConstructionWithAdmission(.lsm_table_builder_working_set, bound, original);
+            }
+            self.cpu.resumeWithAdmission(self.backend.allocator, original) catch |cause| {
+                self.pinMeter();
+                return cause;
+            };
+            self.pinMeter();
+            if (!self.adopted) {
+                const bytes = if (self.meter) |a| a.bytes.load(.acquire) else 0;
+                std.debug.assert(bytes >= self.baseline_account_bytes);
+                const added = bytes - self.baseline_account_bytes + spareBytes(&self.cpu.candidate);
+                std.debug.assert(added <= bound);
+                if (self.credit) |*credit| {
+                    if (added != 0) try credit.adoptUsageWithAdmission(.lsm_in_memory_state, &self.backend.tracked_in_memory_state_bytes, added, original);
+                }
+                self.adopted = true;
+            }
+        }
+
+        /// Called only by the owning WAL coordinator's infallible callback.
+        /// No ledger lock, observer scan or retirement can occur here.
+        pub fn publish(self: *@This()) void {
+            std.debug.assert(self.adopted and !self.retired);
+            std.debug.assert(self.backend.mutable_read_snapshot == null);
+            self.cpu.publish(&self.backend.mutable);
+        }
+
+        fn finishPhysicalRetirement(self: *@This()) void {
+            if (self.retirement_usage != null) return;
+            std.debug.assert(self.cpu.retired);
+            const current_account = self.backend.mutable.ordered.account;
+            const bytes = if (current_account) |a| blk: {
+                std.debug.assert(a == self.meter.?);
+                break :blk a.bytes.load(.acquire);
+            } else blk: {
+                if (self.meter) |a| std.debug.assert(a.bytes.load(.acquire) == @sizeOf(Account));
+                break :blk @as(u64, 0);
+            };
+            self.retirement_usage = if (self.backend.options.resource_manager != null)
+                self.baseline_usage - self.baseline_account_bytes - self.baseline_spare_bytes + bytes + spareBytes(&self.backend.mutable)
+            else
+                0;
+            // Free a speculative account header before making its capacity
+            // available. A rejected ledger retry retains the target and charge.
+            if (self.meter) |a| a.release();
+            self.meter = null;
+        }
+
+        pub fn retireWithAdmission(self: *@This(), original: read_admission.Port) !void {
+            try original.checkpoint();
+            if (self.retired) return;
+            self.pinMeter();
+            try self.cpu.retireWithAdmission(self.backend.allocator, original);
+            self.finishPhysicalRetirement();
+            if (self.backend.options.resource_manager) |manager| {
+                const next = self.retirement_usage.?;
+                std.debug.assert(next <= self.backend.tracked_in_memory_state_bytes);
+                try manager.adjustUsageWithAdmission(.lsm_in_memory_state, &self.backend.tracked_in_memory_state_bytes, next, original);
+            }
+            if (self.credit) |*credit| credit.retire();
+            self.credit = null;
+            self.retired = true;
+        }
+
+        /// Mandatory quiesced fallback after the owning WAL operation joins.
+        pub fn deinit(self: *@This()) void {
+            if (self.retired) return;
+            self.pinMeter();
+            self.cpu.deinit(self.backend.allocator);
+            self.finishPhysicalRetirement();
+            if (self.backend.options.resource_manager) |manager|
+                std.debug.assert(manager.tryObserveUsage(.lsm_in_memory_state, &self.backend.tracked_in_memory_state_bytes, self.retirement_usage.?));
+            if (self.credit) |*credit| credit.retire();
+            self.credit = null;
+            self.retired = true;
+        }
+    };
+
     /// Payload owns a prepared bounded CPU publication and its credits. It
     /// provides publish(AppendResult), requireRecovery() and release(). The
     /// caller fences all same-backend writers/readers/maintenance and retains
@@ -29388,6 +29523,176 @@ test "controlled physical sync WAL retirement keeps peer publication blocked unt
     acquired.release();
 }
 
+const MutablePublicationCreditControl = struct {
+    manager: *resource_manager_mod.ResourceManager,
+    owner: *Backend.QuiescedMutablePublication,
+    failure: anyerror = error.Cancelled,
+    hold_ready: bool = false,
+    hold_retired: bool = false,
+    held: bool = false,
+    hold_target: ?*resource_manager_mod.ResourceManager = null,
+    waits: usize = 0,
+    freeze_identity: ?*std.testing.FailingAllocator = null,
+
+    fn check(raw: *anyopaque) !void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        if (self.owner.cpu.ready) {
+            if (self.freeze_identity) |failing| failing.fail_index = failing.alloc_index;
+        }
+        if (!self.held and ((self.hold_ready and self.owner.cpu.ready) or (self.hold_retired and self.owner.cpu.retired))) {
+            std.debug.assert((self.hold_target orelse self.manager).mutex.tryLock());
+            self.held = true;
+        }
+    }
+    fn lifetime(_: *anyopaque) !void {}
+    fn wait(raw: *anyopaque) !void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        self.waits += 1;
+        // Neither preparation nor ledger waits may retain Backend.mu.
+        std.debug.assert(self.owner.backend.mu.tryLock());
+        self.owner.backend.mu.unlock();
+        if (self.hold_target != null and self.hold_target.? != self.manager) {
+            std.debug.assert(self.manager.mutex.tryLock());
+            self.manager.mutex.unlock();
+        }
+        return self.failure;
+    }
+    fn unlock(self: *@This()) void {
+        if (self.held) (self.hold_target orelse self.manager).mutex.unlock();
+        self.held = false;
+        self.hold_ready = false;
+        self.hold_retired = false;
+        self.hold_target = null;
+    }
+};
+
+test "controlled physical sync mutable publication prepays capacity and retains credit across rejected adoption and retirement" {
+    const admission = @import("../common/read_admission.zig");
+    const resources = resource_manager_mod;
+    const a = std.testing.allocator;
+    for ([_]anyerror{ error.Cancelled, error.DeadlineExceeded, error.FileNotFound }) |failure| {
+        var parent = resources.ResourceManager.init(.{ .identity_allocator = a });
+        defer parent.deinit(a);
+        var identity_failing = std.testing.FailingAllocator.init(a, .{});
+        var manager = resources.ResourceManager.init(.{ .identity_allocator = identity_failing.allocator() });
+        defer manager.deinit(a);
+        try manager.installMemoryParent(parent.memoryParentPort());
+        var failing = std.testing.FailingAllocator.init(a, .{});
+        const allocator = failing.allocator();
+        var backend = Backend.init(allocator, .{ .resource_manager = &manager, .wal_enabled = false });
+        defer backend.close();
+        try backend.mutable.upsert(allocator, .{}, "status", "old", false);
+        backend.syncTrackedInMemoryStateUsageCurrentLocked();
+        var pinned = try backend.mutable.snapshot(allocator);
+        defer pinned.deinit(allocator);
+        var source: State = .{};
+        defer source.deinit(allocator);
+        try source.upsert(allocator, .{}, "status", "new", false);
+        var owner = Backend.QuiescedMutablePublication.init(&backend, &source);
+        defer owner.deinit();
+        var control: MutablePublicationCreditControl = .{ .manager = &manager, .owner = &owner, .failure = failure };
+        defer control.unlock();
+        const payload: admission.Payload = .{ .ptr = &control, .vtable = &.{ .checkpoint = MutablePublicationCreditControl.check, .check_lifetime = MutablePublicationCreditControl.lifetime, .wait_for_progress = MutablePublicationCreditControl.wait } };
+        const original = admission.Port.init(&payload);
+        const bound = try owner.cpu.memoryBoundWithAdmission(original);
+        const before_allocations = failing.alloc_index;
+        const baseline = backend.tracked_in_memory_state_bytes;
+        const root = backend.mutable.ordered.root;
+        const builder_slice = @backingInt(resources.Slice.lsm_table_builder_working_set);
+        manager.slices[builder_slice].budget.hard_limit_bytes = bound - 1;
+        try std.testing.expectError(error.ResourceBudgetExceeded, owner.resumeWithAdmission(original));
+        try std.testing.expect(owner.credit == null);
+        try std.testing.expectEqual(before_allocations, failing.alloc_index);
+        try std.testing.expectEqual(root, backend.mutable.ordered.root);
+        manager.slices[builder_slice].budget.hard_limit_bytes = 0;
+        parent.memory.budget.hard_limit_bytes = parent.snapshot().memory.used_bytes + bound - 1;
+        try std.testing.expectError(error.ResourceBudgetExceeded, owner.resumeWithAdmission(original));
+        try std.testing.expect(owner.credit == null);
+        try std.testing.expectEqual(before_allocations, failing.alloc_index);
+        parent.memory.budget.hard_limit_bytes = 0;
+        control.hold_ready = true;
+        try std.testing.expectError(failure, owner.resumeWithAdmission(original));
+        control.unlock();
+        try std.testing.expect(owner.cpu.ready and !owner.adopted and owner.credit != null);
+        try std.testing.expectEqual(baseline, backend.tracked_in_memory_state_bytes);
+        try std.testing.expectEqual(bound, manager.sliceStats(.lsm_table_builder_working_set).used_bytes);
+        const prepared = owner.cpu.candidate.ordered.root;
+        failing.fail_index = failing.alloc_index;
+        identity_failing.fail_index = identity_failing.alloc_index;
+        try owner.resumeWithAdmission(original);
+        try std.testing.expect(owner.adopted);
+        try std.testing.expectEqual(prepared, owner.cpu.candidate.ordered.root);
+        try std.testing.expectEqual(backend.estimateInMemoryStateBytesWithCandidateLocked(&owner.cpu.candidate), backend.tracked_in_memory_state_bytes);
+        // Publication needs neither additional heap nor the held ledger.
+        std.debug.assert(manager.mutex.tryLock());
+        owner.publish();
+        manager.mutex.unlock();
+        failing.fail_index = std.math.maxInt(usize);
+        try std.testing.expectEqualStrings("new", try backend.mutable.get(.{}, "status"));
+        try std.testing.expectEqualStrings("old", try pinned.get(.{}, "status"));
+        const charged = backend.tracked_in_memory_state_bytes;
+        control.hold_target = &parent;
+        control.hold_retired = true;
+        try std.testing.expectError(failure, owner.retireWithAdmission(original));
+        control.unlock();
+        try std.testing.expect(owner.cpu.retired and !owner.retired and owner.credit != null);
+        try std.testing.expectEqual(charged, backend.tracked_in_memory_state_bytes);
+        try owner.retireWithAdmission(original);
+        try std.testing.expect(owner.retired and owner.credit == null);
+        try std.testing.expectEqual(backend.estimateInMemoryStateBytesLocked(), backend.tracked_in_memory_state_bytes);
+        try std.testing.expectEqual(@as(u64, 0), manager.sliceStats(.lsm_table_builder_working_set).used_bytes);
+        try std.testing.expectEqual(@as(u64, 0), manager.snapshot().memory.accounting_errors);
+        try std.testing.expectEqual(@as(u64, 0), parent.snapshot().memory.accounting_errors);
+        try std.testing.expectEqual(@as(usize, 2), control.waits);
+    }
+}
+
+test "controlled physical sync mutable publication abandonment keeps producer credit separate and retires partial new accounts" {
+    const admission = @import("../common/read_admission.zig");
+    const a = std.testing.allocator;
+    for ([_]bool{ false, true }) |allocation_failure| {
+        var identity_failing = std.testing.FailingAllocator.init(a, .{});
+        var manager = resource_manager_mod.ResourceManager.init(.{ .identity_allocator = identity_failing.allocator() });
+        defer manager.deinit(a);
+        var failing = std.testing.FailingAllocator.init(a, .{});
+        const allocator = failing.allocator();
+        var backend = Backend.init(allocator, .{ .resource_manager = &manager, .wal_enabled = false });
+        defer backend.close();
+        var producer: ActiveMemTable = .{ .ordered_enabled = false };
+        defer producer.deinit(allocator);
+        try producer.upsert(allocator, .{}, "status", "producer-owned", false);
+        var source = try producer.clone(allocator);
+        defer source.deinit(allocator);
+        var owner = Backend.QuiescedMutablePublication.init(&backend, &source);
+        defer owner.deinit();
+        var control: MutablePublicationCreditControl = .{ .manager = &manager, .owner = &owner, .freeze_identity = &identity_failing };
+        defer control.unlock();
+        const payload: admission.Payload = .{ .ptr = &control, .vtable = &.{ .checkpoint = MutablePublicationCreditControl.check, .check_lifetime = MutablePublicationCreditControl.lifetime, .wait_for_progress = MutablePublicationCreditControl.wait } };
+        const original = admission.Port.init(&payload);
+        if (allocation_failure) failing.fail_index = failing.alloc_index + 3;
+        const result = owner.resumeWithAdmission(original);
+        failing.fail_index = std.math.maxInt(usize);
+        if (allocation_failure) {
+            try std.testing.expectError(error.OutOfMemory, result);
+            try std.testing.expect(!owner.adopted and owner.credit != null);
+        } else {
+            try result;
+            try std.testing.expect(owner.adopted);
+            try std.testing.expect(owner.cpu.candidate.entryAt(0).shared != producer.entryAt(0).shared);
+        }
+        try std.testing.expect(producer.entryAt(0).shared.?.account == null);
+        control.hold_retired = true;
+        try std.testing.expectError(error.Cancelled, owner.retireWithAdmission(original));
+        control.unlock();
+        try std.testing.expect(owner.meter == null and owner.cpu.retired and owner.credit != null);
+        try std.testing.expectEqualStrings("producer-owned", try producer.get(.{}, "status"));
+        try owner.retireWithAdmission(original);
+        try std.testing.expectEqual(backend.estimateInMemoryStateBytesLocked(), backend.tracked_in_memory_state_bytes);
+        try std.testing.expectEqual(@as(u64, 0), manager.sliceStats(.lsm_table_builder_working_set).used_bytes);
+        try std.testing.expectEqual(@as(u64, 0), manager.snapshot().memory.accounting_errors);
+    }
+}
+
 test "controlled physical sync backend WAL append owns actual publication and a prepared mutable successor" {
     if (builtin.os.tag == .windows or builtin.os.tag == .wasi or builtin.os.tag == .freestanding) return error.SkipZigTest;
     const Mode = enum { publish, abandon, partial_failure };
@@ -29408,35 +29713,40 @@ test "controlled physical sync backend WAL append owns actual publication and a 
         defer a.free(root);
         var pool = storage_io.NativeStoragePool.initWithCapacityForTest(a, 16);
         defer pool.deinit();
-        var backend = try Backend.open(a, root, .{ .native_storage_pool = &pool });
+        var manager = resource_manager_mod.ResourceManager.init(.{ .identity_allocator = a });
+        defer manager.deinit(a);
+        var backend: Backend = undefined;
+        try backend.openInto(a, root, .{ .native_storage_pool = &pool, .resource_manager = &manager });
         defer backend.close();
         var marker: u8 = 0;
         const payload: admission.Payload = .{ .ptr = &marker, .vtable = &.{ .checkpoint = Control.check, .check_lifetime = Control.check, .deadline_ns = Control.deadline }, .execution_wait = .{ .ptr = &marker, .begin = Control.begin, .end = Control.end } };
         const original = admission.Port.init(&payload);
+        // Establish the existing allocation baseline before the delta owner.
+        // This fresh fixture has only fixed cleanup-queue metadata to observe.
+        try manager.adjustUsageWithAdmission(.lsm_in_memory_state, &backend.tracked_in_memory_state_bytes, backend.estimateInMemoryStateBytesLocked(), original);
         var incoming: ActiveMemTable = .{ .ordered_enabled = false };
         defer incoming.deinit(a);
         try incoming.upsert(a, .{ .name = "docs" }, "final", "status", false);
         var source = try incoming.toStateMove(a);
         defer source.deinit(a);
-        var preparation = ActiveMemTable.PublicationPreparation.init(&backend.mutable, &source);
-        defer preparation.deinit(a);
-        _ = try preparation.memoryBoundWithAdmission(original);
-        try preparation.resumeWithAdmission(a, original);
-        const record = try wal_mod.prepareStateRecordWithAdmission(a, &preparation.source, original);
+        var preparation = Backend.QuiescedMutablePublication.init(&backend, &source);
+        defer preparation.deinit();
+        try preparation.resumeWithAdmission(original);
+        const record = try wal_mod.prepareStateRecordWithAdmission(a, &preparation.cpu.source, original);
         defer a.free(record);
         var published = false;
         var recover = false;
         var releases: usize = 0;
         const Publication = struct {
             backend: *Backend,
-            preparation: *ActiveMemTable.PublicationPreparation,
+            preparation: *Backend.QuiescedMutablePublication,
             published: *bool,
             recover: *bool,
             releases: *usize,
             pub fn publish(self: *@This(), _: wal_mod.AppendResult) void {
                 std.debug.assert(!self.published.*);
-                self.backend.invalidateMutableReadSnapshot();
-                self.preparation.publish(&self.backend.mutable);
+                std.debug.assert(self.backend.mutable_read_snapshot == null);
+                self.preparation.publish();
                 self.published.* = true;
             }
             pub fn requireRecovery(self: *@This()) void {
@@ -29492,6 +29802,8 @@ test "controlled physical sync backend WAL append owns actual publication and a 
         if (mode != .publish) try std.testing.expectError(error.RecoveryRequired, backend.tryBeginQuiescedWalAppendWithAdmission(record, publication, original));
         var shared = (try backend.tryAcquireWalOperationLock(.shared)) orelse return error.TestUnexpectedResult;
         shared.release();
-        try preparation.retireWithAdmission(a, original);
+        try preparation.retireWithAdmission(original);
+        try std.testing.expectEqual(backend.estimateInMemoryStateBytesLocked(), backend.tracked_in_memory_state_bytes);
+        try std.testing.expectEqual(@as(u64, 0), manager.snapshot().memory.accounting_errors);
     }
 }
