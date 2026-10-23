@@ -56,10 +56,18 @@ def main():
         help="enable conditional source identities on the fixture server",
     )
     parser.add_argument("--delay-ms", type=float, default=20)
+    parser.add_argument(
+        "--question-miss",
+        action="store_true",
+        help="also measure a changed question with warm validation facts and cold scores",
+    )
     parser.add_argument("--slow-first-ms", type=float, default=0)
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
+    phases = (
+        ("cold", "warm", "question_miss") if args.question_miss else ("cold", "warm")
+    )
     if (
         args.rounds < 1
         or not 1 <= args.units <= 16
@@ -153,7 +161,7 @@ def main():
                     case.server.source_projection_mode = (
                         "enabled" if args.source_projection else None
                     )
-                    for phase in ("cold", "warm"):
+                    for phase in phases:
                         case.server.requests.clear()
                         case.server.index_requests.clear()
                         case.server.projected_asset_bytes = 0
@@ -170,6 +178,10 @@ def main():
                             "--decision-concurrency=8",
                             "--decision-batch-wait-ms=20",
                         ]
+                        if phase == "question_miss":
+                            command[command.index("--ask") + 1] = (
+                                "find visual errors and retries"
+                            )
                         if args.stream:
                             command.append("--no-rank")
                         result = subprocess.run(
@@ -245,7 +257,7 @@ def main():
         fixture.CliTests.tearDownClass()
     medians = []
     for variant in binaries:
-        for phase in ("cold", "warm"):
+        for phase in phases:
             selected = [
                 r for r in samples if r["variant"] == variant and r["phase"] == phase
             ]
@@ -286,6 +298,7 @@ def main():
         "slow_first_ms": args.slow_first_ms,
         "batch_size": args.batch_size,
         "conditional_source_projection": args.source_projection,
+        "question_miss": args.question_miss,
         "binaries": {
             name: {
                 "path": str(path),

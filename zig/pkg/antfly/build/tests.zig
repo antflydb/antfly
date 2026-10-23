@@ -233,6 +233,9 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const logical_field_tests = b.addTest(.{ .root_module = functions_test_mod, .filters = selectTestFilters(b, &.{ "logical value", "logical query", "projection checkpoint external storage" }) });
     b.step("logical-field-query-test", "Verify logical query parsing, planning and original-value membership").dependOn(&b.addRunArtifact(logical_field_tests).step);
 
+    const source_identity_tests = b.addTest(.{ .root_module = functions_test_mod, .filters = &.{ "logical value conditional", "document mutation revision", "public graph metric borrowed wire cached content authority", "public graph metric borrowed wire backfill", "projected authority backfill" } });
+    b.step("source-value-identity-test", "Verify atomic source identity publication, migration and conditional reads").dependOn(&b.addRunArtifact(source_identity_tests).step);
+
     const api_http_runtime_test_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/api_http_runtime_test_root.zig"),
         .target = target,
@@ -6927,6 +6930,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "storage.enrichment.",
             "storage.engine.",
             "storage.logical_source.",
+            "storage.conditional_source.",
+            "storage.source_proof_registry.",
             "storage.document_projection.",
             "storage.filesystem_capacity.",
             "storage.generation_publication.",

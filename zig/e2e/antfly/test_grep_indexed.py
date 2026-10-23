@@ -2669,12 +2669,21 @@ def test_conditional_source_projection_binds_current_values_and_query_selection(
     table = f"conditional_source_{time.time_ns()}"
     stateful_api.post(f"/tables/{table}", {"num_shards": num_shards})
     item = {
-        "body": {"image": "large-image-" * 4096, "null": None},
+        "body": {
+            "image": "large-image-" * 4096,
+            "null": None,
+            "number": 1.5,
+            "integer": 9007199254740993,
+            "boolean": True,
+            "escaped": 'line\nquote"\\ café',
+        },
         "revision": "caller-revision",
+        "padding": "x" * (32 * 1024),
     }
     stateful_api.batch_write(table, inserts={"a": item}, sync_level="full_index")
     url = stateful_api.url + f"/tables/{table}/query"
-    fields = [{"field": f"body.{name}"} for name in ("image", "null", "absent")]
+    names = ("image", "null", "absent", "number", "integer", "boolean", "escaped")
+    fields = [{"field": f"body.{name}"} for name in names]
     request = {
         "query": {"match_all": {}},
         "fields": ["body"],
@@ -2697,6 +2706,16 @@ def test_conditional_source_projection_binds_current_values_and_query_selection(
     assert states["body.absent"] == {"state": "missing"}
     token = states["body.image"]["identity"]
     assert token.startswith("sv1-") and len(token) == 68
+    projections = (
+        ["*"],
+        ["body.*"],
+        ["-revision"],
+        [*(f"body.{name}" for name in names), "revision"],
+    )
+    for projection in projections:
+        selected = query({**request, "fields": projection})[0]
+        assert selected["_source"]["body"]["image"] == item["body"]["image"]
+        assert selected["_source_projection"] == states
     fields[0]["if_match"] = [{"id": "a", "identity": token}]
     warm = query(request)[0]
     assert "image" not in warm["_source"]["body"]
@@ -2705,6 +2724,10 @@ def test_conditional_source_projection_binds_current_values_and_query_selection(
         "state": "unchanged",
         "identity": token,
     }
+    for projection in projections:
+        selected = query({**request, "fields": projection})[0]
+        assert "image" not in selected["_source"]["body"]
+        assert selected["_source_projection"] == warm["_source_projection"]
     # Expected identities cannot cause an excluded document to become a hit.
     assert query({**request, "query": {"bool": {"filter": {"ids": ["other"]}}}}) == []
     # Caller revision metadata is not authority for the image identity.

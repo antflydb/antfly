@@ -4564,9 +4564,8 @@ and text-stage searches keep serial metadata admission. Server-owned conditional
 source identities use the generic [conditional projection contract](../../../docs/design/antfly-grep.md#conditional-source-projection-and-future-storage-authorities).
 Warm descriptor and decision hits can omit image transfers after a current
 permission/revision check. Changed values or unavailable scores materialize and
-validate full bytes. Older servers retain full-value fallback. The current
-server reference path still reads and hashes selected values; source-free
-storage authority lookup remains future work.
+validate full bytes. Older servers retain full-value fallback. That qualification used the server reference path, which reads and hashes
+selected values. The follow-up below adds bounded storage-owned scalar proofs.
 
 The [rolling-evidence qualification](bench/results/grep-rolling-evidence-summary.json)
 compares this implementation with the preceding cross-parent binary. In a
@@ -4622,8 +4621,8 @@ increases. Both variants already make zero warm provider calls.
 These are generated-image/constant-score loopback fixtures with 20 ms artificial
 HTTP delays. Linux runs in a two-CPU, 1-GiB container in the existing VM on the
 same physical Mac. The server fixture's hashing contributes to wall time but
-not CLI child CPU. The native server implementation still reads and hashes
-selected values; these measurements do not establish server CPU/storage savings,
+not CLI child CPU. The native server used for those measurements reads and hashes
+selected values; those measurements do not establish server CPU/storage savings,
 live-provider token savings, or independent cross-host performance. The compact
 report pins binary and driver hashes; raw trials and logs remain ignored.
 
@@ -4635,3 +4634,65 @@ revision and snapshot fences. SDK, MCP/OpenAPI, packaging and boundary checks
 also pass. The broad macOS suite has an intermittent watcher assertion; affected
 cases pass in isolation, and the inventory-visit failure reproduces on the merged
 baseline. The report preserves this qualification and exact artifact hashes.
+
+
+The [conditional planning qualification](bench/results/grep-conditional-planning-summary.json)
+compares the reviewed PR binary with score-aware retrieval and bounded cache
+writer serialization. Changed questions now request full grouped values directly;
+warm hits retain the exact descriptors used to make their conditional requests.
+Conditional response bytes and full-image processing scratch have separate
+admission estimates, with the existing shared processing limit unchanged.
+
+Five alternating rounds of the same 128-image fixture show these medians:
+
+| Host | Changed-question elapsed | Warm elapsed | Warm CLI child CPU |
+|---|---:|---:|---:|
+| macOS ARM64 | 693 → 534 ms | 220 → 214 ms | 17.3 → 12.1 ms |
+| Linux ARM64 VM, 2 CPUs / 1 GiB | 654 → 473 ms | 222 → 192 ms | 35.6 → 11.8 ms |
+
+Changed-question index requests fall from 33 to 17. Warm requests fall from
+17/18 to 10, with zero image bytes on both candidate hosts. Both baselines
+already avoid warm inference. Cold CPU and peak RSS do not improve uniformly.
+These constant-score fixtures impose 20 ms HTTP delays; child CPU excludes the
+Python server. Linux shares the physical Mac. These results establish neither
+live model cost savings nor a universal speed or memory guarantee.
+
+The native source-only retrieval path now publishes bounded canonical-value
+certificates atomically with storage writes. Current scalar leaves can be
+omitted without loading or hashing their payloads, after fresh authorization
+and publication checks. Certificates bind content, directory and canonicalizer
+ABI; unsupported/stale cases use reference delivery and bounded repair. Other
+selected fields and storage layouts can still require source reads. The metadata
+and write hashing cost are explicit in the design, rather than implying free
+reads or writes. `e2e/antfly/bench_source_projection.py` separately qualifies
+native server ingestion, full delivery and conditional delivery without a model.
+
+
+The same qualification also measures the final native server separately, using
+five alternating rounds, eight fresh documents with 256 KiB ASCII values, one
+shard, exact response hashes and mandatory certificate-hit checks. Each candidate
+round records 16 certificate hits and no full-value fallbacks. Median times:
+
+| Native phase | Elapsed, baseline → current | Server process CPU, baseline → current |
+|---|---:|---:|
+| Ingestion | 41.22 → 43.33 ms | 52.49 → 55.39 ms |
+| Full delivery | 10.39 → 10.94 ms | 8.45 → 9.05 ms |
+| Conditional delivery | 7.51 → 1.37 ms | 6.87 → 0.68 ms |
+
+Conditional delivery is about 82% faster and uses 90% less server CPU in this
+synthetic corpus. Publishing proofs adds about 5% ingestion time/CPU; full
+delivery takes about 5–7% more time/CPU. Conditional peak RSS is 148.0 → 149.5 MiB.
+Whole-process CPU includes background work, and sampled RSS is not an allocation
+bound. These are fresh native JSON certificates on the shared Mac, not a physical
+I/O or live-model qualification. Unsupported/stale layouts retain reference
+execution. Proof reuse shifts work to bounded metadata and writes; authorization
+and remaining selected source reads still have a cost.
+
+Final validation: 288 CLI cases on each host (286 macOS / 285 Linux passed;
+two/three platform skips), 149 query contracts, 15 identity/publication/snapshot
+cases, 91 logical-field cases plus one skip, and 27 native integration cases plus
+seven opt-in benchmark skips. Contract tests report zero leaks. The real storage
+regression verifies published certificates, retained read cuts and replacement
+visibility; parsed ID-query worker round trips exercise the actual eligible
+request shape. Storage discovery, compatibility, license boundaries and Windows
+CLI cross-compilation pass. Raw trials and logs remain ignored.

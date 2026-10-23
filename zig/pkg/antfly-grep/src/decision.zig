@@ -103,6 +103,11 @@ pub const Input = struct {
         json.endWriteRaw();
     }
 };
+/// One stable evidence/key representation for planning and authorized scoring.
+pub fn visualInput(a: Allocator, path: []const u8, unit: @import("antfly_source_evidence").Unit, image: @import("antfly_source_evidence").Image) !Input {
+    const listing = try std.json.Stringify.valueAlloc(a, .{ .path = path, .id = unit.id, .kind = unit.kind, .location = unit.location, .text = unit.text, .label = unit.label, .asset = unit.asset }, .{ .emit_null_optional_fields = false });
+    return .{ .id = unit.id, .input = try std.fmt.allocPrint(a, "TARGET visual evidence unit (image is authoritative; text is context):\n{s}", .{listing}), .image = image };
+}
 pub const Client = struct {
     a: Allocator,
     http: httpx.Client,
@@ -173,6 +178,22 @@ pub const Client = struct {
     }
     pub fn search(self: *Client, inputs: []const Input, scores: []f64) !void {
         try self.decideBatches(inputs, scores);
+    }
+    /// Planning hint only: does not authorize source reuse, dispatch inference,
+    /// repair cache records, or add result hit/age accounting. Authorization and
+    /// cache freshness are checked again by the ordinary scoring path.
+    pub fn probeScores(self: *Client, a: Allocator, inputs: []const Input, scores: []f64) !void {
+        std.debug.assert(inputs.len == scores.len);
+        @memset(scores, std.math.nan(f64));
+        if (self.options.no_cache or self.options.cache_ttl_seconds == 0 or self.options.cache_dir == null) return;
+        const hits = self.cache_hits;
+        defer self.cache_hits = hits;
+        const keys = try a.alloc([64]u8, inputs.len);
+        const written = try a.alloc(?i64, inputs.len);
+        const repairs = try a.alloc(bool, std.math.divCeil(usize, inputs.len, self.options.decisionBatchSize()) catch unreachable);
+        @memset(written, null);
+        @memset(repairs, false);
+        try self.cachedWave(a, inputs, scores, keys, written, repairs);
     }
 
     pub fn passes(self: *Client, input: Input) !bool {

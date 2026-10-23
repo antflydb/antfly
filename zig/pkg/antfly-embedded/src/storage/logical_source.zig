@@ -226,7 +226,8 @@ pub fn loadProfiled(a: A, scratch: A, scope: anytype, physical: []const []const 
                 index = parent;
             }
         }
-        try writer.object(&out.writer, 0, item.directory.root_count);
+        writer.object(&out.writer, 0, item.directory.root_count) catch |err|
+            return if (err == error.WriteFailed) error.OutOfMemory else err;
         result[item.index] = .{ .bytes = try out.toOwnedSlice(), .original_bytes = proofs[item.index].?.bytes, .projected = true, .repair_authority = repair[item.index] };
     }
     ReadProfile.add(profile, "reconstruct_ns", phase);

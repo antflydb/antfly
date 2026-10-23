@@ -1995,8 +1995,7 @@ pub const Search = struct {
                         charged[i] = true;
                         self.summary.bytes += image.bytes;
                     }
-                    const listing = try std.json.Stringify.valueAlloc(a, .{ .path = doc.path, .id = unit.id, .kind = unit.kind, .location = unit.location, .text = unit.text, .label = unit.label, .asset = unit.asset }, .{ .emit_null_optional_fields = false });
-                    inputs[count] = .{ .id = unit.id, .input = try std.fmt.allocPrint(a, "TARGET visual evidence unit (image is authoritative; text is context):\n{s}", .{listing}), .image = image };
+                    inputs[count] = try decision.visualInput(a, doc.path, unit, image);
                     inputs[count].serialized_evidence_bytes = try inputs[count].evidenceBytes();
                     if (inputs[count].serialized_evidence_bytes.? > 1024 * 1024) {
                         failure = failure orelse error.DecisionLimitExceeded;

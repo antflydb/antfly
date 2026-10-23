@@ -4087,11 +4087,17 @@ class CliTests(unittest.TestCase):
             ),
             128,
         )
-        # The conservative byte bound admits seven 16-unit parents together,
-        # then the last parent. No unused eight-field preload is issued.
-        self.assertEqual(len(self.server.index_requests), 3)
-        self.assertEqual(self.server.index_requests[1][2]["limit"], 7)
-        self.assertEqual(self.server.index_requests[2][2]["limit"], 1)
+        # Transfer admission is independent of decoded/provider scratch. All
+        # eight tiny-image parents fit one response; the shared 64 MiB working
+        # set gate still bounds processing. Cover all 16 fields in that read.
+        self.assertEqual(len(self.server.index_requests), 2)
+        projection = self.server.index_requests[1][2]
+        self.assertEqual(projection["limit"], 8)
+        self.assertEqual(
+            set(projection["fields"]),
+            {"grep.revision", "grep.permissions"}
+            | {f"payloads.preview{i}" for i in range(16)},
+        )
 
     def test_media_shared_provider_pool_honors_requested_concurrency(self):
         config = self.visual_parents()
@@ -4482,6 +4488,7 @@ class CliTests(unittest.TestCase):
             "--table-config",
             config,
             "--no-rank",
+            "--decision-concurrency=8",
         ]
         cold = self.raw_cli(*args)
         self.assertEqual(cold.returncode, 0, cold.stderr)
@@ -4521,10 +4528,25 @@ class CliTests(unittest.TestCase):
         self.server.projected_asset_bytes = 0
         changed_args = list(args)
         changed_args[changed_args.index("--ask") + 1] = "find visual error messages"
+        changed_before = len(self.server.index_requests)
         changed = self.raw_cli(*changed_args)
         self.assertEqual(changed.returncode, 0, changed.stderr)
         self.assertGreater(self.server.projected_asset_bytes, 0)
         self.assertGreater(len(self.server.requests), provider_count)
+        # Cache planning must preserve grouped full reads for a new question.
+        # Three manifest requests and two grouped asset reads serve eight parents.
+        changed_requests = self.server.index_requests[changed_before:]
+        self.assertEqual(len(changed_requests), 5)
+        self.assertEqual(
+            sum("order_by" not in body for _, _, body in changed_requests), 2
+        )
+        self.assertFalse(
+            any(
+                field.get("if_match")
+                for _, _, body in changed_requests
+                for field in body.get("source_projection", {}).get("fields", [])
+            )
+        )
         # An unchanged caller manifest cannot hide a changed stored payload.
         row = self.server.index_documents[0]
         row["_source"]["payloads"]["preview0"] = row["_source"]["payloads"]["preview1"]

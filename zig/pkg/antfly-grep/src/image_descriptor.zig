@@ -62,8 +62,11 @@ pub fn load(a: A, io: std.Io, options: *const Options, context: Context, unit: m
     const bytes = bucket.load(a, io, key(context, unit.asset.field)) orelse return null;
     defer a.free(bytes);
     const record = std.json.parseFromSliceLeaky(Record, a, bytes, .{ .allocate = .alloc_always }) catch return null;
-    if (!validIdentity(record.identity) or record.bytes != unit.asset.byte_length or record.bytes > options.max_image_bytes or record.width == 0 or record.height == 0 or @as(u64, record.width) * record.height > options.max_image_pixels or !std.mem.eql(u8, record.mime_type, unit.asset.mime_type) or !std.mem.eql(u8, &std.fmt.bytesToHex(record.sha256, .lower), unit.asset.sha256)) return null;
+    if (!matches(options, unit, record)) return null;
     return record;
+}
+pub fn matches(options: *const Options, unit: media.Unit, record: Record) bool {
+    return validIdentity(record.identity) and record.bytes == unit.asset.byte_length and record.bytes <= options.max_image_bytes and record.width != 0 and record.height != 0 and @as(u64, record.width) * record.height <= options.max_image_pixels and std.mem.eql(u8, record.mime_type, unit.asset.mime_type) and std.mem.eql(u8, &std.fmt.bytesToHex(record.sha256, .lower), unit.asset.sha256);
 }
 pub fn store(a: A, io: std.Io, options: *const Options, context: Context, unit: media.Unit, image: media.Image, identity: []const u8) void {
     const out = cache(options) orelse return;

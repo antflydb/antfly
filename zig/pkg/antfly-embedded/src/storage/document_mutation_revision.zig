@@ -19,6 +19,7 @@
 const std = @import("std");
 const keys = @import("internal_keys.zig");
 const projection = @import("document_projection.zig");
+const value_identity = @import("source_value_identity.zig");
 const prefix = "\x00\x00__metadata__:document_mutation_revision_v1:";
 pub const Key = [prefix.len + 32]u8;
 const content_prefix = "\x00\x00__metadata__:document_content_authority_v1:";
@@ -244,7 +245,7 @@ const backfill_key = "\x00\x00__metadata__:document_content_backfill_v2";
 /// Cursor and cache records share one physical transaction; user data and
 /// logical mutation revisions are never rewritten by this migration.
 pub const BackfillPage = struct {
-    const Entry = struct { physical: []const u8, content: Content, directory: ?[]const u8 };
+    const Entry = struct { physical: []const u8, content: Content, directory: ?[]const u8, identities: ?[]const u8 = null };
     arena: std.heap.ArenaAllocator,
     before: ?[]const u8,
     after: []const u8,
@@ -313,7 +314,14 @@ pub const BackfillPage = struct {
                         if (err == error.NotFound) break :blk true;
                         return err;
                     };
-                    break :blk !try projection.isCurrent(a, encoded, proof);
+                    if (!try projection.isCurrent(a, encoded, proof)) break :blk true;
+                    const paths = (try projection.Directory.open(a, encoded, proof)) orelse break :blk false;
+                    if (paths.version < 2) break :blk true;
+                    const certificate = metadata.get(&value_identity.keyForRevision(keyForPhysical(last).?)) catch |err| {
+                        if (err == error.NotFound) break :blk true;
+                        return err;
+                    };
+                    break :blk value_identity.Certificate.open(certificate, encoded, proof) == null;
                 } else false;
                 if (cached == null or needs_projection) {
                     // Independently scoped primary bytes die after this row;
@@ -326,7 +334,8 @@ pub const BackfillPage = struct {
                         break :blk Content{ .revision = try load(&metadata, keyForPhysical(last).?), .bytes = raw.len, .kind = last[last.len - 1], .digest = digest };
                     };
                     const directory = try projection.buildAuthority(a, raw, content.kind, content.digest);
-                    if (cached == null or directory != null) try entries.append(a, .{ .physical = last, .content = content, .directory = directory });
+                    const identities = if (directory) |paths| try value_identity.build(a, raw, content.kind, content.digest, paths) else null;
+                    if (cached == null or directory != null) try entries.append(a, .{ .physical = last, .content = content, .directory = directory, .identities = identities });
                     bytes +|= raw.len;
                 }
             }
@@ -351,6 +360,7 @@ pub const BackfillPage = struct {
             if (entry.directory) |directory| if (try loadContent(txn, entry.physical)) |current_content| {
                 if (std.meta.eql(current_content, entry.content)) {
                     try txn.put(&projection.keyForRevision(keyForPhysical(entry.physical).?), directory);
+                    if (entry.identities) |identities| try txn.put(&value_identity.keyForRevision(keyForPhysical(entry.physical).?), identities);
                     changed = true;
                 }
             };
@@ -364,14 +374,17 @@ pub const BackfillPage = struct {
 /// One revision per affected document per transaction, including artifact-only
 /// commits. Capture fixed keys rather than retaining every artifact key.
 pub const Capture = struct {
-    const Change = union(enum) { unchanged, deleted, written: struct { proof: Content, directory: ?[]u8 } };
+    const Change = union(enum) { unchanged, deleted, written: struct { proof: Content, directory: ?[]u8, identities: ?[]u8 = null } };
     documents: std.AutoHashMapUnmanaged(Key, Change) = .empty,
     staged: bool = false,
     poisoned: bool = false,
 
     pub fn deinit(self: *Capture, alloc: std.mem.Allocator) void {
         var values = self.documents.valueIterator();
-        while (values.next()) |value| if (value.* == .written) if (value.written.directory) |directory| alloc.free(directory);
+        while (values.next()) |value| if (value.* == .written) {
+            if (value.written.directory) |directory| alloc.free(directory);
+            if (value.written.identities) |identities| alloc.free(identities);
+        };
         self.documents.deinit(alloc);
     }
 
@@ -394,9 +407,15 @@ pub const Capture = struct {
             var digest: [32]u8 = undefined;
             std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
             const kind = physical[physical.len - 1];
-            break :blk .{ .written = .{ .proof = .{ .revision = 0, .bytes = bytes.len, .kind = kind, .digest = digest }, .directory = try projection.buildAuthority(alloc, bytes, kind, digest) } };
+            const directory = try projection.buildAuthority(alloc, bytes, kind, digest);
+            errdefer if (directory) |paths| alloc.free(paths);
+            const identities = if (directory) |paths| try value_identity.build(alloc, bytes, kind, digest, paths) else null;
+            break :blk .{ .written = .{ .proof = .{ .revision = 0, .bytes = bytes.len, .kind = kind, .digest = digest }, .directory = directory, .identities = identities } };
         } else .deleted;
-        if (entry.* == .written) if (entry.written.directory) |directory| alloc.free(directory);
+        if (entry.* == .written) {
+            if (entry.written.directory) |directory| alloc.free(directory);
+            if (entry.written.identities) |identities| alloc.free(identities);
+        }
         entry.* = next;
     }
 
@@ -435,12 +454,18 @@ pub const Capture = struct {
             switch (entry.value_ptr.*) {
                 .written => |value| if (value.directory) |directory| {
                     try txn.put(&projection.keyForRevision(key), directory);
+                    if (value.identities) |identities| try txn.put(&value_identity.keyForRevision(key), identities);
                 },
                 // Small writes do not add a cache lookup/delete to the hot
                 // path. A previous directory is harmless: digest/length checks
                 // exclude it, and a rewrite or deletion replaces/removes it.
-                .deleted => txn.delete(&projection.keyForRevision(key)) catch |err| {
-                    if (err != error.NotFound) return err;
+                .deleted => {
+                    txn.delete(&projection.keyForRevision(key)) catch |err| {
+                        if (err != error.NotFound) return err;
+                    };
+                    txn.delete(&value_identity.keyForRevision(key)) catch |err| {
+                        if (err != error.NotFound) return err;
+                    };
                 },
                 .unchanged => {},
             }

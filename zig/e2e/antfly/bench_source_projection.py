@@ -1,0 +1,291 @@
+# Copyright 2026 Antfly, Inc.
+# SPDX-License-Identifier: Elastic-2.0
+#
+# Licensed under the Elastic License 2.0 (ELv2); you may not use this file
+# except in compliance with the Elastic License 2.0. You may obtain a copy of
+# the Elastic License 2.0 at
+#
+#     https://www.antfly.io/licensing/ELv2-license
+#
+# Unless required by applicable law or agreed to in writing, software distributed
+# under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
+# WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+# Elastic License 2.0 for the specific language governing permissions and
+# limitations.
+
+"""Paired native-server source delivery qualification; no model or live data."""
+
+import argparse
+import hashlib
+import json
+import os
+import platform
+import re
+import statistics
+import threading
+import time
+from pathlib import Path
+
+import requests
+
+from conftest import StandaloneAntflyServer, find_free_port
+from test_grep_indexed import logical_process_reader
+
+
+def file_info(path):
+    return {
+        "path": str(path),
+        "bytes": path.stat().st_size,
+        "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+    }
+
+
+def measure(read, operation):
+    before = read()
+    peaks = dict(before)
+    stop = threading.Event()
+
+    def sample():
+        while not stop.wait(0.005):
+            current = read()
+            for key in ("rss_bytes", "footprint_bytes"):
+                if current[key] is not None:
+                    peaks[key] = max(peaks[key] or 0, current[key])
+
+    sampler = threading.Thread(target=sample)
+    sampler.start()
+    started = time.monotonic_ns()
+    try:
+        response = operation()
+        elapsed = time.monotonic_ns() - started
+        after = read()
+    finally:
+        stop.set()
+        sampler.join()
+    assert response.ok, (response.status_code, response.text[:4096])
+    for key in ("rss_bytes", "footprint_bytes"):
+        if after[key] is not None:
+            peaks[key] = max(peaks[key] or 0, after[key])
+    return response, {
+        "elapsed_ns": elapsed,
+        "server_cpu_ns": after["cpu_ns"] - before["cpu_ns"],
+        "peak_rss_bytes": peaks["rss_bytes"],
+        "peak_footprint_bytes": peaks["footprint_bytes"],
+        "response_bytes": len(response.content),
+    }
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("binary", type=Path)
+    parser.add_argument("--baseline", required=True, type=Path)
+    parser.add_argument("--rounds", type=int, default=5)
+    parser.add_argument("--documents", type=int, default=8)
+    parser.add_argument("--value-bytes", type=int, default=262144)
+    parser.add_argument("--output", required=True, type=Path)
+    args = parser.parse_args()
+    if (
+        not 1 <= args.documents <= 64
+        or not 16384 <= args.value_bytes <= 1048576
+        or args.rounds < 1
+    ):
+        parser.error(
+            "1..64 documents, 16 KiB..1 MiB values and positive rounds required"
+        )
+    binaries = {"baseline": args.baseline.resolve(), "candidate": args.binary.resolve()}
+    documents = {
+        f"doc-{i:04}": {
+            "metadata": {"revision": "r1", "allowed": True},
+            "payload": {"large": "x" * args.value_bytes + str(i)},
+        }
+        for i in range(args.documents)
+    }
+    corpus = hashlib.sha256(json.dumps(documents, sort_keys=True).encode()).hexdigest()
+    samples = []
+    output_hashes = {}
+    certificate_counts = []
+    previous_profile = os.environ.get("ANTFLY_BENCH_QUERY_PROFILE")
+    os.environ["ANTFLY_BENCH_QUERY_PROFILE"] = "1"
+    try:
+        for round_id in range(args.rounds):
+            order = (
+                ("baseline", "candidate")
+                if round_id % 2 == 0
+                else ("candidate", "baseline")
+            )
+            for variant in order:
+                server = StandaloneAntflyServer(
+                    str(binaries[variant]), "127.0.0.1", find_free_port()
+                )
+                try:
+                    session = requests.Session()
+                    base = server.api_url + "/tables/identity_bench"
+                    created = session.post(base, json={"num_shards": 1}, timeout=60)
+                    created.raise_for_status()
+                    deadline = time.monotonic() + 30
+                    while session.get(base, timeout=5).status_code != 200:
+                        if time.monotonic() >= deadline:
+                            raise AssertionError(
+                                "committed table did not become visible"
+                            )
+                        time.sleep(0.05)
+                    read = logical_process_reader(server.proc.pid)
+                    _, ingestion = measure(
+                        read,
+                        lambda: session.post(
+                            base + "/batch",
+                            json={"inserts": documents, "sync_level": "full_index"},
+                            timeout=60,
+                        ),
+                    )
+                    samples.append(
+                        {
+                            "variant": variant,
+                            "round": round_id,
+                            "phase": "ingest",
+                            **ingestion,
+                        }
+                    )
+                    request = {
+                        "query": {"bool": {"filter": {"ids": list(documents)}}},
+                        "fields": [
+                            "metadata.revision",
+                            "metadata.allowed",
+                            "payload.large",
+                        ],
+                        "limit": args.documents,
+                        "source_projection": {"fields": [{"field": "payload.large"}]},
+                    }
+                    for phase in ("full", "conditional"):
+                        response, usage = measure(
+                            read,
+                            lambda: session.post(
+                                base + "/query", json=request, timeout=60
+                            ),
+                        )
+                        result = response.json()["responses"][0]
+                        assert result["status"] == 200, result
+                        hits = result["hits"]["hits"]
+                        assert {h["_id"] for h in hits} == set(documents), result
+                        evidence = sorted(
+                            (h["_id"], h["_source"], h["_source_projection"])
+                            for h in hits
+                        )
+                        digest = hashlib.sha256(
+                            json.dumps(evidence, sort_keys=True).encode()
+                        ).hexdigest()
+                        assert output_hashes.setdefault(phase, digest) == digest, (
+                            "baseline/candidate source delivery differs"
+                        )
+                        for hit in hits:
+                            state = hit["_source_projection"]["payload.large"]
+                            assert state["state"] == (
+                                "value" if phase == "full" else "unchanged"
+                            ), hit
+                            assert hit["_source"]["metadata"] == {
+                                "revision": "r1",
+                                "allowed": True,
+                            }
+                            assert ("large" in hit["_source"].get("payload", {})) == (
+                                phase == "full"
+                            )
+                        samples.append(
+                            {
+                                "variant": variant,
+                                "round": round_id,
+                                "phase": phase,
+                                **usage,
+                            }
+                        )
+                        request["source_projection"]["fields"][0]["if_match"] = [
+                            {
+                                "id": h["_id"],
+                                "identity": h["_source_projection"]["payload.large"][
+                                    "identity"
+                                ],
+                            }
+                            for h in hits
+                        ]
+                    logs = server.log_path.read_text(errors="replace")
+                    counts = [
+                        (int(a), int(b))
+                        for a, b in re.findall(
+                            r"antfly_bench_conditional_source certificate_hits=(\d+) full_fallbacks=(\d+)",
+                            logs,
+                        )
+                    ]
+                    if (
+                        variant == "candidate"
+                        and sum(a for a, _ in counts) < 2 * args.documents
+                    ):
+                        failure = args.output.with_suffix(".server-failure.log")
+                        failure.parent.mkdir(parents=True, exist_ok=True)
+                        failure.write_text(logs)
+                        raise AssertionError(
+                            f"Missing certificate-hit evidence: {counts}; see {failure}"
+                        )
+                    certificate_counts.append(
+                        {
+                            "variant": variant,
+                            "round": round_id,
+                            "certificate_hits": sum(a for a, _ in counts),
+                            "full_fallbacks": sum(b for _, b in counts),
+                        }
+                    )
+                    session.close()
+                except BaseException:
+                    failure = args.output.with_suffix(f".{variant}-failure.log")
+                    failure.parent.mkdir(parents=True, exist_ok=True)
+                    failure.write_text(server.log_path.read_text(errors="replace"))
+                    raise
+                finally:
+                    server.stop()
+    finally:
+        if previous_profile is None:
+            os.environ.pop("ANTFLY_BENCH_QUERY_PROFILE", None)
+        else:
+            os.environ["ANTFLY_BENCH_QUERY_PROFILE"] = previous_profile
+    medians = []
+    for variant in binaries:
+        for phase in ("ingest", "full", "conditional"):
+            selected = [
+                s for s in samples if s["variant"] == variant and s["phase"] == phase
+            ]
+            medians.append(
+                {
+                    "variant": variant,
+                    "phase": phase,
+                    **{
+                        key: statistics.median(s[key] for s in selected)
+                        for key in (
+                            "elapsed_ns",
+                            "server_cpu_ns",
+                            "peak_rss_bytes",
+                            "response_bytes",
+                        )
+                    },
+                }
+            )
+    report = {
+        "schema_version": 1,
+        "scope": "Native single-shard JSON tables, synthetic ASCII source values, warm filesystem/storage caches after ingestion; whole server process CPU includes background work; RSS sampled every 5 ms and is not an allocation bound; shared host; no inference",
+        "platform": platform.platform(),
+        "machine": platform.machine(),
+        "cpu_count": os.cpu_count(),
+        "rounds": args.rounds,
+        "documents": args.documents,
+        "value_bytes": args.value_bytes,
+        "corpus_sha256": corpus,
+        "binaries": {k: file_info(v) for k, v in binaries.items()},
+        "output_sha256": output_hashes,
+        "certificate_counts": certificate_counts,
+        "medians": medians,
+        "samples": samples,
+    }
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+    args.output.write_text(json.dumps(report, indent=2) + "\n")
+    print(json.dumps(medians, indent=2))
+
+
+if __name__ == "__main__":
+    main()

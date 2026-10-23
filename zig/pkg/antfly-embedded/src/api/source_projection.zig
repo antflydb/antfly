@@ -26,6 +26,33 @@ pub const Request = struct { fields: []const Field };
 pub const State = enum { value, unchanged, missing };
 pub const Identity = struct { state: State, identity: ?[]const u8 = null };
 
+/// Only final source hydration may use storage identities. Retrieval filters
+/// still run normally; source-dependent coordinator operations retain bytes.
+pub fn storageEligible(req: anytype) bool {
+    if (req.source_projection_json.len == 0 or !req.include_stored or req.include_all_fields or req.fields.len == 0 or req.fields.len > 64 or
+        req.document_authority_mode != .none or req.return_mode != .parent or req.hasHitEvaluation() or req.evaluation_json.len != 0 or
+        req.reranker != null or req.pruner != null or req.highlight != null or req.aggregations_json.len != 0 or
+        req.graph_queries.len != 0 or req.graph_metric_queries.len != 0 or req.graph_metric_rerank != null or
+        req.hierarchy_children != null or req.hierarchy_grouped_matches or req.dense != null or req.sparse != null or
+        req.dense_queries.len != 0 or req.sparse_queries.len != 0 or req.full_text_queries.len != 0) return false;
+    switch (req.query) {
+        .match_all, .doc_id => {},
+        else => return false,
+    }
+    // Public ID/filter buckets normalize to a match-all text root. This is
+    // membership scaffolding, with no source-dependent lexical scoring.
+    if (req.full_text) |query| switch (query) {
+        .match_all => {},
+        else => return false,
+    };
+    for (req.fields) |field| {
+        if (field.len == 0 or field[0] == '-' or std.mem.indexOfAny(u8, field, "*?[]") != null) return false;
+        var parts = std.mem.splitScalar(u8, field, '.');
+        while (parts.next()) |part| if (part.len == 0 or part[0] == '_') return false;
+    }
+    return true;
+}
+
 pub fn validate(a: A, request: Request, fields: []const []const u8, include_all: bool) !void {
     if (request.fields.len == 0 or request.fields.len > 64) return error.InvalidQueryRequest;
     var conditions: usize = 0;
@@ -35,12 +62,7 @@ pub fn validate(a: A, request: Request, fields: []const []const u8, include_all:
         while (parts.next()) |part| if (part.len == 0) return error.InvalidQueryRequest;
         // Overlapping requests would make omission depend on request order.
         for (request.fields[0..i]) |prior| if (covers(prior.field, entry.field) or covers(entry.field, prior.field)) return error.InvalidQueryRequest;
-        if (!include_all) {
-            const selected = for (fields) |field| {
-                if (covers(field, entry.field)) break true;
-            } else false;
-            if (!selected) return error.InvalidQueryRequest;
-        }
+        if (!selectedPath(fields, include_all, entry.field)) return error.InvalidQueryRequest;
         conditions += entry.if_match.len;
         if (conditions > 4096) return error.InvalidQueryRequest;
         var seen: std.StringHashMapUnmanaged(void) = .empty;
@@ -51,6 +73,33 @@ pub fn validate(a: A, request: Request, fields: []const []const u8, include_all:
         }
     }
 }
+/// Field masks use the document projector's segment wildcard and exclusion
+/// semantics. Conditional paths themselves remain exact object paths.
+pub fn selectedPath(fields: []const []const u8, include_all: bool, path: []const u8) bool {
+    if (fields.len == 0) return include_all;
+    var has_include = false;
+    var selected = false;
+    for (fields) |field| {
+        if (std.mem.startsWith(u8, field, "-")) {
+            if (patternCovers(field[1..], path)) return false;
+        } else {
+            has_include = true;
+            selected = selected or patternCovers(field, path);
+        }
+    }
+    return selected or !has_include;
+}
+fn patternCovers(pattern: []const u8, path: []const u8) bool {
+    var p = std.mem.tokenizeScalar(u8, pattern, '.');
+    var value = std.mem.splitScalar(u8, path, '.');
+    var count: usize = 0;
+    while (p.next()) |part| {
+        const component = value.next() orelse return false;
+        if (!std.mem.eql(u8, part, "*") and !std.mem.eql(u8, part, component)) return false;
+        count += 1;
+    }
+    return count != 0;
+}
 fn covers(parent: []const u8, child: []const u8) bool {
     return std.mem.eql(u8, parent, child) or (child.len > parent.len and child[parent.len] == '.' and std.mem.startsWith(u8, child, parent));
 }
@@ -59,33 +108,7 @@ pub fn validIdentity(bytes: []const u8) bool {
     for (bytes[4..]) |c| if (!std.ascii.isDigit(c) and (c < 'a' or c > 'f')) return false;
     return true;
 }
-const HashWriter = struct {
-    hash: std.crypto.hash.sha2.Sha256 = .init(.{}),
-    writer: std.Io.Writer = .{ .vtable = &.{ .drain = drain }, .buffer = &.{} },
-    fn drain(w: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
-        const self: *@This() = @alignCast(@fieldParentPtr("writer", w));
-        var count: usize = 0;
-        for (data[0 .. data.len - 1]) |bytes| {
-            self.hash.update(bytes);
-            count += bytes.len;
-        }
-        for (0..splat) |_| {
-            const bytes = data[data.len - 1];
-            self.hash.update(bytes);
-            count += bytes.len;
-        }
-        return count;
-    }
-};
-pub fn identity(value: V) ![68]u8 {
-    var out: HashWriter = .{};
-    out.hash.update("antfly.source.value.v1\x00");
-    try std.json.Stringify.value(value, .{}, &out.writer);
-    try out.writer.flush();
-    var digest: [32]u8 = undefined;
-    out.hash.final(&digest);
-    return "sv1-".* ++ std.fmt.bytesToHex(digest, .lower);
-}
+pub const identity = @import("../storage/source_value_identity.zig").identity;
 fn at(source: *V, path: []const u8) ?*V {
     var current = source;
     var parts = std.mem.splitScalar(u8, path, '.');
@@ -192,4 +215,15 @@ test "api query contract source identities bind typed values, distinguish missin
     try std.testing.expectEqual(State.value, result.map.get("body.null").?.state);
     try std.testing.expectEqual(State.missing, result.map.get("body.absent").?.state);
     try std.testing.expectError(error.InvalidQueryRequest, validate(a, .{ .fields = &.{ .{ .field = "body" }, .{ .field = "body.image" } } }, &.{}, true));
+}
+
+test "api query contract conditional paths respect projection wildcards and exclusions" {
+    const a = std.testing.allocator;
+    const request: Request = .{ .fields = &.{.{ .field = "body.image" }} };
+    for ([_][]const []const u8{ &.{"*"}, &.{"body.*"}, &.{"*.image"}, &.{"-revision"}, &.{ "*", "-body.private" } }) |fields| {
+        try validate(a, request, fields, false);
+    }
+    for ([_][]const []const u8{ &.{}, &.{"revision"}, &.{ "*", "-body" }, &.{ "body.*", "-*.image" }, &.{"-*"} }) |fields| {
+        try std.testing.expectError(error.InvalidQueryRequest, validate(a, request, fields, false));
+    }
 }

@@ -1604,3 +1604,34 @@ routing metadata.
   size, and repair-scan counts per projection
 - avoid whole-range logical prune during parent finalize where runtime storage
   metadata can answer the same question, and reclaim retired segments cleanly
+
+
+### Conditional source value certificates
+
+Source-only query delivery may use the optional `SVI1` canonical-value sidecar
+in `storage/source_value_identity.zig`. It is installed in the same transaction
+as primary JSON bytes, the existing DPD2 projection directory, content proof and
+mutation revision. It does not change DPD2 coverage or admission limits; rows
+below the existing 16 KiB threshold do not receive certificates.
+
+A certificate binds primary byte length/SHA-256, source kind, exact directory
+SHA-256 and canonicalizer/compiler ABI. Up to 512 sorted directory-index/digest
+pairs certify disjoint scalar leaves, with a total bound of 17,519 bytes.
+Canonical identities hash the typed JSON value with the versioned source-value
+domain; directory hashes are binding checks, never interchangeable identities.
+Deletion removes the sidecar. Stale optional metadata cannot authorize omission.
+
+`conditional_source.zig` checks these bindings under the ordinary publication
+lease and read scope. Each bounded window uses an ordinary read transaction;
+current-tip point probes do not support value scopes. Only eligible source-only queries forward omission to
+storage owners. Source-dependent operators retain complete values. Unsupported
+layouts and missing/stale certificates retain reference projection and hashing;
+existing bounded authority backfill installs certificates without advancing the
+logical revision. ABI changes invalidate old certificates and trigger safe
+fallback/repair. This is an internal storage optimization of the existing public
+`source_projection` contract, not another caller-managed proof field.
+
+Qualify native delivery with `e2e/antfly/bench_source_projection.py` using pinned
+baseline/candidate servers. Its certificate-hit counters establish proof reuse,
+not physical disk-read counts. Remaining metadata, frame layout and ordinary
+source fallback still determine physical I/O.

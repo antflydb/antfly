@@ -442,23 +442,40 @@ has no identity. Stored null is a value, distinct from an absent path. Only an
 exact expected identity for the same record ID can cause omission. Conditions
 never authorize a read, bypass query filters, resurrect absent documents, or
 change source-dependent ranking, evaluation, highlighting or aggregation.
-Conditional delivery runs at the final coordinator boundary; worker retrieval
-retains complete ordinary projections. Column-backed sources use the same final
-boundary. Requests allow 64 non-overlapping exact paths and 4,096 conditions
+Source-only match-all/ID retrieval can finalize conditional delivery at the
+storage owner, under the ordinary authorization and publication lease. A bounded
+window uses one read transaction and short-lived value scopes, pinning content,
+directory and certificates to the same read cut. The
+parser’s synthesized match-all text root for ID/filter buckets is membership
+scaffolding and remains eligible; named or scoring text searches are not. Queries
+with source-dependent operators retain complete worker values and finalize at
+the coordinator; column-backed sources retain that reference path. Ordinary
+projection masks, including `*`, nested wildcards and exclusions, determine
+whether an exact conditional path is selected. Requests allow 64 non-overlapping exact paths and 4,096 conditions
 in total. Duplicate IDs and overlapping paths are rejected. Conditions are
 indexed once per response; per-hit lookup is independent of the condition count.
 
 `sv1` is a versioned server-computed identity over the typed JSON value delivered
 by that authorized read cut. Hashing streams into SHA-256 without allocating an
-encoded copy. The reference implementation reads current selected values before
-hashing and omission. It reduces response bytes and client decoding, but **does
-not eliminate server storage reads or hashing**. Persisting an authenticated,
-canonical-value digest in storage-owned projection authorities is a further
-optimization; raw directory digests, caller metadata, segment IDs and cached
-permission grants cannot substitute for that proof. A future authority adapter
-must preserve versioned identity semantics and publication fences, or use a new
-identity version with safe full-value fallback. Old/missing authorities retain
-the current full-value reference path.
+encoded copy. The reference path reads current selected values before
+hashing and omission. Eligible native JSON retrieval instead uses bounded,
+storage-owned canonical-value certificates published atomically with the primary
+value, content proof, projection directory and mutation revision. Certificates
+bind the original content length/digest, exact directory digest, value kind and
+canonicalizer/compiler ABI. They certify disjoint scalar leaves; raw directory
+hashes are never value identities. The existing directory format and coverage
+budget are unchanged. Rows below the existing 16 KiB projection threshold
+receive no certificate. Each optional certificate is bounded below 18 KiB.
+
+A current certificate permits unchanged leaves to be omitted without loading or
+hashing those payloads. Current permissions, revision, query membership and
+publication fences still apply. Missing, stale, unsupported or ABI-incompatible
+certificates use the full-value reference path. Existing bounded authority
+backfill repairs eligible legacy rows without changing their logical revisions.
+Opaque/subtree values and source-dependent operators retain reference execution.
+Other selected metadata may still require storage-frame reads or a full-layout
+fallback: certificate reuse is not a guarantee of zero physical disk I/O.
+
 
 The CLI retains bounded verified descriptors (digest, MIME, dimensions, length
 and server identity), never image payloads, in the existing atomic artifact
@@ -466,11 +483,21 @@ cache. Keys include endpoint, table, parent, field and credential context, plus
 a build digest of the image validators. The cache uses 256 buckets and four
 1 KiB slots per bucket; records can be evicted at any time. Current permissions
 and expected revision are rechecked before any descriptor is accepted. Lower
-current image-byte/pixel limits still apply. Changed questions, expired/evicted
-scores and concurrent descriptor eviction force ordinary materialization.
+current image-byte/pixel limits still apply. Before grouped retrieval, a bounded score-cache probe identifies fields whose
+current question already has a reusable decision. Changed questions request full
+values immediately in the same grouped query, avoiding conditional-then-full
+round trips. This probe is only a planning hint; actual score use rechecks expiry
+after fresh authorization and identity verification. The request retains the
+exact verified descriptors it sends, so later cache eviction does not require
+reopening them. Expired/evicted scores still force ordinary materialization.
 Descriptors never enter provider requests: an explicit materialization guard
 runs before coalescing and dispatch. Conditional fallback retains ordinary
 source/request budgets and avoids charging the same logical image twice.
+Conditional-response transfer admission accounts for small identity responses
+separately from full-image processing scratch. The shared processing admission
+budget remains unchanged. Bucket-striped writer locks serialize cache bucket
+read/choose/publish operations within the process, preserving fitting colliding
+entries; readers remain lock-free and cross-process races remain safe misses.
 Disabling caches also disables conditional identity work. Older servers that
 ignore the extension return full values; those rejecting it receive one ordinary
 projection retry, charged to the same request budget. No permission result is

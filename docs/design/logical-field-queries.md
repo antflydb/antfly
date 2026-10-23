@@ -884,5 +884,10 @@ unchanged and missing values. Stored null remains a value. Authorization and
 source-dependent operators run before final delivery, including distributed and
 column-backed execution. See [the grep design](antfly-grep.md#conditional-source-projection-and-future-storage-authorities)
 for the wire contract, bounded verified-image reuse, old-server fallback and
-remaining storage-authority optimization. The initial reference path hashes
-current projected values and cannot claim source-free server execution.
+storage-owned canonical-value certificates. Eligible source-only native JSON
+retrieval can reuse current, atomically published scalar identities at the owner;
+source-dependent operators and unsupported layouts retain the full-value
+reference path. Certificates bind content, directory and canonicalizer ABI, never
+permissions. Missing or stale certificates safely fall back and can be repaired
+by bounded backfill. Remaining selected values may still require physical source
+reads; this does not promise zero server I/O.

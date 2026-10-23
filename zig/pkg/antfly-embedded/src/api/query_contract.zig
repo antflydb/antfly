@@ -59,11 +59,33 @@ pub const testing = if (builtin.is_test) struct {
         defer owned.deinit(a);
         try std.testing.expect(owned.req.source_projection_json.len > 0);
         try std.testing.expectError(error.InvalidQueryRequest, parseQueryRequest(a, null, "docs", "{\"fields\":[\"title\"],\"source_projection\":{\"fields\":[{\"field\":\"body.image\"}]}}"));
-        // Worker retrieval must not omit bytes before coordinator-owned ranking,
-        // filtering, highlighting and final authorization have finished.
+        // Source-only requests may finalize at the physical owner. Any source
+        // operator retains full worker bytes for coordinator execution.
         const worker = try @import("query_execution_contract.zig").encodeQueryRequest(a, owned.req);
         defer a.free(worker);
-        try std.testing.expect(std.mem.indexOf(u8, worker, "source_projection") == null);
+        try std.testing.expect(std.mem.indexOf(u8, worker, "source_projection") != null);
+        // Exercise the actual public ID query, whose filter bucket synthesizes
+        // a match-all text marker. It must reach owner-side final hydration.
+        var ids = try parseQueryRequest(a, null, "docs",
+            \\{"query":{"bool":{"filter":{"ids":["a","b"]}}},"fields":["metadata.revision","payload.large"],"source_projection":{"fields":[{"field":"payload.large"}]}}
+        );
+        defer ids.deinit(a);
+        try std.testing.expect(source_projection.storageEligible(ids.req));
+        var named_text = ids.req;
+        named_text.full_text = null;
+        named_text.full_text_queries = &.{.{ .name = "lexical", .index_name = "search", .query = .{ .match_all = {} } }};
+        try std.testing.expect(!source_projection.storageEligible(named_text));
+        const ids_worker = try @import("query_execution_contract.zig").encodeQueryRequest(a, ids.req);
+        defer a.free(ids_worker);
+        try std.testing.expect(std.mem.indexOf(u8, ids_worker, "source_projection") != null);
+        var worker_ids = try parseQueryRequest(a, null, "docs", ids_worker);
+        defer worker_ids.deinit(a);
+        try std.testing.expect(source_projection.storageEligible(worker_ids.req));
+        var evaluated = owned.req;
+        evaluated.evaluation_limit = 10;
+        const worker_full = try @import("query_execution_contract.zig").encodeQueryRequest(a, evaluated);
+        defer a.free(worker_full);
+        try std.testing.expect(std.mem.indexOf(u8, worker_full, "source_projection") == null);
         var arena = std.heap.ArenaAllocator.init(a);
         defer arena.deinit();
         const temp = arena.allocator();
@@ -4352,6 +4374,11 @@ fn toOpenApiHitPrepared(alloc: std.mem.Allocator, req: db_mod.types.SearchReques
         .hierarchy = try searchHitHierarchyOpenApiValue(alloc, req, hit),
         ._highlights = try highlightsJsonValue(alloc, hit.highlights),
     };
+    if (projection != null and hit.source_projection_json != null) {
+        if (!source_projection.storageEligible(req)) return error.InvalidQueryResponse;
+        api_hit._source_projection = try std.json.parseFromSliceLeaky(@typeInfo(@FieldType(metadata_openapi.QueryHit, "_source_projection")).optional.child, alloc, hit.source_projection_json.?, .{ .allocate = .alloc_always });
+        return api_hit;
+    }
     if (projection != null and hit.column_source == null) {
         if (api_hit._source) |source| {
             var value = std.json.Value{ .object = source.map };
