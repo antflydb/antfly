@@ -23,7 +23,7 @@ T = TypeVar("T", bound="InferenceChatMessage")
 class InferenceChatMessage:
     """
     Attributes:
-        role (InferenceRole): Role of the message sender in a generation/chat conversation
+        role (InferenceRole): Chat message role, including developer instructions preserved by context management.
         content (list[ImageURLContentPart | MediaContentPart | TextContentPart] | str | Unset): Message content.
             Supports two formats:
             - Simple string: "Hello, how are you?"

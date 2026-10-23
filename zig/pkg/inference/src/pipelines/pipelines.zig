@@ -56,6 +56,7 @@ pub const GenerationPipeline = @import("generation.zig").GenerationPipeline;
 pub const GenerationConfig = @import("generation.zig").GenerationConfig;
 pub const GenerationResult = @import("generation.zig").GenerationResult;
 pub const GenerationMessage = @import("generation.zig").Message;
+pub const chat_context = @import("chat_context.zig");
 pub const EncoderDecoderPipeline = @import("encoder_decoder.zig").EncoderDecoderPipeline;
 pub const DecoderConfig = @import("encoder_decoder.zig").DecoderConfig;
 pub const EncoderDecoderResult = @import("encoder_decoder.zig").EncoderDecoderResult;
@@ -112,6 +113,7 @@ test {
     _ = @import("classification.zig");
     _ = @import("ner.zig");
     _ = @import("generation.zig");
+    _ = @import("chat_context.zig");
     _ = @import("encoder_decoder.zig");
     _ = @import("seq2seq_decode.zig");
     _ = @import("rewriting.zig");

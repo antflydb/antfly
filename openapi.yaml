@@ -13020,6 +13020,191 @@ paths:
         - BasicAuth: []
         - ApiKeyAuth: []
         - BearerAuth: []
+  /ai/v1/chat/context/checkpoint:
+    post:
+      summary: Prepare a portable native KV checkpoint
+      description: >
+        Prefills text and tool messages and fits the native attention-matching KV
+
+        cache on the qualified Gemma 4 E4B CUDA f16 route. The request uses the
+
+        ordinary generation prompt/template and reserves one continuation position
+
+        within the 32768-token native checkpoint window. It does not generate
+
+        an answer; max_tokens does not change checkpoint preparation.
+
+        stream must be false. Native checkpoint operations default cache_dtype
+
+        to f16 and reject other cache precisions. Draft models, media, prompt caches, compiled/graph
+
+        execution and other context/cache policies are unsupported.
+
+
+        The response is an AFATT001 envelope: JSON metadata followed by exactly
+
+        one application/vnd.antfly.kv-checkpoint attachment. The checkpoint is
+
+        a V3 binary file by default (V2 for f32, V4 for rotated4), containing original token positions,
+        fitted global KV,
+
+        exact local KV, saved next-token logits, loaded-model fingerprints and
+
+        an integrity digest. It is usable only with the same model revision,
+
+        tokenizer, chat template and KV layout. Metadata reports the actual
+
+        global-cache savings. If safe fitting cannot meet 1.5x savings, outcome
+
+        is unchanged_insufficient_savings and the attachment preserves the
+
+        original exact state. This fallback is not a successful compaction.
+
+
+        Consume and validate the entire envelope before publishing a checkpoint.
+
+        A partial streamed response is never a valid checkpoint. Metadata is
+
+        limited to 2 MiB and the checkpoint to 2 GiB. Capacity admission bounds
+
+        concurrent native checkpoint work and returns a retryable response when busy.
+      operationId: prepareNativeKvCheckpoint
+      parameters:
+        - in: header
+          name: X-Antfly-KV-Encoding
+          description: Checkpoint encoding. f16 is lossless for the supported cache. fp8 stores validated
+            fitted history in FP8 and restores it to f16, with per-head f16 fallback. rotated4 stores
+            and serves validated fitted rows in a mixed rotated 4-bit/f16 representation, preserving protected
+            rows exactly. f32 exports legacy V2.
+          required: false
+          schema:
+            type: string
+            enum:
+              - f32
+              - f16
+              - fp8
+              - rotated4
+            default: f16
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/InferenceGenerateRequest'
+      responses:
+        '200':
+          description: Native checkpoint envelope; metadata conforms to NativeKvCheckpointMetadata
+          content:
+            application/vnd.antfly.attachments.v1:
+              schema:
+                type: string
+                format: binary
+        '400':
+          description: Invalid request or unsupported model/runtime
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InferenceError'
+        '413':
+          description: Checkpoint exceeds transfer or state limits
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InferenceError'
+        '503':
+          $ref: '#/components/responses/TransientCapacity'
+          description: Inference service unavailable. The unified Antfly server also returns this status
+            when authentication is enabled but its backend is not ready.
+        '507':
+          description: Insufficient inference memory budget
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InferenceError'
+        '401':
+          description: Authentication is enabled and valid credentials were not supplied
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InferenceError'
+  /ai/v1/chat/context/resume:
+    post:
+      summary: Generate from a portable native KV checkpoint
+      description: >
+        Accepts one AFATT001 envelope whose JSON metadata is a GenerateRequest
+
+        and whose single application/vnd.antfly.kv-checkpoint attachment is a
+
+        complete native checkpoint. The metadata supplies the complete messages,
+
+        tool definitions and template options. Their rendered tokens must have
+
+        the checkpoint tokens as an exact prefix; prefix rewriting is rejected.
+
+        Only the suffix is evaluated. An empty suffix uses saved next-token
+
+        logits, without replaying the final prefix token. At most 8192 prompt
+
+        tokens may be appended, and the full prompt plus reserved output must
+
+        fit the 32768-token native checkpoint window.
+
+
+        The loaded model supplies the trusted identity and geometry. Checksum,
+
+        framing, token-prefix, layout and resource checks run before generation.
+
+        Unsupported routes and malformed files do not replace a live cache.
+
+        The response uses normal generation JSON or SSE according to metadata.stream.
+
+        The original checkpoint remains immutable and reusable.
+      operationId: resumeNativeKvCheckpoint
+      requestBody:
+        required: true
+        content:
+          application/vnd.antfly.attachments.v1:
+            schema:
+              type: string
+              format: binary
+      responses:
+        '200':
+          description: Generated response or token stream
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InferenceGenerateResponse'
+            text/event-stream:
+              schema:
+                type: string
+        '400':
+          description: Invalid checkpoint, prefix/model mismatch or unsupported runtime
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InferenceError'
+        '413':
+          description: Checkpoint exceeds transfer or state limits
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InferenceError'
+        '503':
+          $ref: '#/components/responses/TransientCapacity'
+          description: Inference service unavailable. The unified Antfly server also returns this status
+            when authentication is enabled but its backend is not ready.
+        '507':
+          description: Insufficient inference memory budget
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InferenceError'
+        '401':
+          description: Authentication is enabled and valid credentials were not supplied
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InferenceError'
   /ai/v1/embed:
     post:
       summary: Create embeddings (alias of `/embeddings`)
@@ -13629,6 +13814,65 @@ paths:
                 $ref: '#/components/schemas/InferenceError'
         '502':
           description: Remote content fetch failed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InferenceError'
+        '503':
+          $ref: '#/components/responses/TransientCapacity'
+          description: Inference service unavailable. The unified Antfly server also returns this status
+            when authentication is enabled but its backend is not ready.
+        '507':
+          description: Generation request exceeds the configured memory budget
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InferenceError'
+        '401':
+          description: Authentication is enabled and valid credentials were not supplied
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InferenceError'
+  /ai/v1/chat/context/prepare:
+    post:
+      summary: Inspect or prepare bounded chat context
+      description: >
+        Plans a chat transcript against the selected model's input budget. `inspect`
+
+        reports the plan without changing the supplied messages. `window` may drop old
+
+        turns while retaining recent turns. `compact` may also return a portable
+
+        structured-memory checkpoint when that capability is available. The response
+
+        diagnostics describe the action actually taken; clients must not infer semantic
+
+        equivalence from a successful response. This route budgets the target model only;
+
+        speculative draft-model preparation is not supported.
+      operationId: prepareChatContext
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/InferenceContextPrepareRequest'
+      responses:
+        '200':
+          description: Prepared messages and context diagnostics
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InferenceContextPrepareResponse'
+        '400':
+          description: Invalid context preparation request
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InferenceError'
+        '404':
+          description: Model not found
           content:
             application/json:
               schema:
@@ -44510,7 +44754,14 @@ components:
           type: string
           description: The name of the function to call
     InferenceRole:
-      $ref: '#/components/schemas/ChatMessageRole'
+      type: string
+      enum:
+        - user
+        - assistant
+        - system
+        - developer
+        - tool
+      description: Chat message role, including developer instructions preserved by context management.
     InferenceFinishReason:
       type: string
       enum:
@@ -44576,7 +44827,12 @@ components:
           type: array
           items:
             $ref: '#/components/schemas/InferenceChatMessage'
-          description: Conversation messages (OpenAI-compatible format)
+          description: >
+            Conversation messages (OpenAI-compatible format). When
+
+            `context_management.checkpoint` is supplied, this array is the active suffix;
+
+            the archived prefix represented by the checkpoint is not resent.
         logprobs:
           type: boolean
           default: false
@@ -44752,6 +45008,10 @@ components:
             The resident HTTP server currently rejects non-null values with `UNSUPPORTED_FEATURE`;
 
             device-backed compaction is not yet supported.
+        context_management:
+          $ref: '#/components/schemas/InferenceContextManagement'
+        kv_cache:
+          $ref: '#/components/schemas/InferenceKvCachePolicy'
         prompt_cache_key:
           type: string
           maxLength: 256
@@ -44867,6 +45127,306 @@ components:
           nullable: true
           allOf:
             - $ref: '#/components/schemas/InferenceGenerateSpeculationStatus'
+        context:
+          $ref: '#/components/schemas/InferenceContextDiagnostics'
+        checkpoint:
+          $ref: '#/components/schemas/InferenceContextCheckpoint'
+          description: >
+            Validated structured memory for an archived prefix. `covered_messages` is
+
+            provenance for that archive and does not index the current request's active
+
+            `messages` suffix.
+    InferenceContextManagement:
+      type: object
+      additionalProperties: false
+      required:
+        - mode
+      properties:
+        mode:
+          type: string
+          enum:
+            - reject
+            - window
+          description: >
+            `reject` fails when the rendered input exceeds the model budget. `window`
+
+            permits deterministic removal of older turns. Omission preserves the
+
+            server's existing reject-on-overflow behavior.
+        checkpoint:
+          $ref: '#/components/schemas/InferenceContextCheckpoint'
+        max_input_tokens:
+          type: integer
+          minimum: 1
+          maximum: 2147483647
+          description: Optional client ceiling below the model's effective input limit.
+        keep_recent_turns:
+          type: integer
+          minimum: 0
+          maximum: 2147483647
+          default: 2
+          description: Minimum number of most recent complete turns retained by windowing.
+    InferenceKvCachePolicy:
+      type: object
+      additionalProperties: false
+      required:
+        - mode
+      properties:
+        mode:
+          type: string
+          enum:
+            - exact_hybrid
+            - select_v1
+          description: >
+            Requested KV retention policy. `exact_hybrid` uses only model-native exact
+
+            local/global attention retention. `select_v1` requests the versioned lossy
+
+            selector and is rejected when the loaded model/backend has not qualified it.
+        version:
+          type: string
+          enum:
+            - v1
+          default: v1
+          description: Wire-contract version. The initial policies use `v1` only.
+    InferenceContextToolEvidence:
+      type: object
+      additionalProperties: false
+      required:
+        - tool_call_id
+        - tool_name
+        - facts
+      properties:
+        tool_call_id:
+          type: string
+        tool_name:
+          type: string
+        facts:
+          type: string
+          description: Compacted evidence attributed to this completed tool call.
+    InferenceContextUnresolvedToolCall:
+      type: object
+      additionalProperties: false
+      required:
+        - tool_call_id
+        - tool_name
+      properties:
+        tool_call_id:
+          type: string
+        tool_name:
+          type: string
+    InferenceContextStructuredMemory:
+      type: object
+      additionalProperties: false
+      required:
+        - conversation
+        - tool_evidence
+        - unresolved_tool_calls
+      properties:
+        conversation:
+          type: string
+          description: Compacted conversation memory excluding attributed tool evidence.
+        tool_evidence:
+          type: array
+          items:
+            $ref: '#/components/schemas/InferenceContextToolEvidence'
+        unresolved_tool_calls:
+          type: array
+          items:
+            $ref: '#/components/schemas/InferenceContextUnresolvedToolCall'
+    InferenceContextCheckpoint:
+      type: object
+      additionalProperties: false
+      required:
+        - version
+        - covered_messages
+        - covered_prefix_sha256
+        - memory_sha256
+        - model_revision
+        - tokenizer_revision
+        - template_revision
+        - memory
+      properties:
+        version:
+          type: string
+          enum:
+            - v1
+          description: Structured-memory checkpoint wire version.
+        covered_messages:
+          type: integer
+          minimum: 0
+          description: Number of authoritative leading messages represented by this checkpoint.
+        covered_prefix_sha256:
+          type: string
+          pattern: ^[0-9a-f]{64}$
+          description: SHA-256 of the canonical covered message prefix.
+        parent_checkpoint_sha256:
+          type: string
+          pattern: ^[0-9a-f]{64}$
+        memory_sha256:
+          type: string
+          pattern: ^[0-9a-f]{64}$
+          description: SHA-256 of the canonical structured memory payload.
+        model_revision:
+          type: string
+        tokenizer_revision:
+          type: string
+        template_revision:
+          type: string
+        memory:
+          $ref: '#/components/schemas/InferenceContextStructuredMemory'
+    InferenceContextDiagnostics:
+      type: object
+      additionalProperties: false
+      required:
+        - policy
+        - applied
+        - original_input_tokens
+        - effective_input_tokens
+        - target_input_tokens
+        - reserved_output_tokens
+        - dropped_messages
+        - retained_messages
+        - retained_from_message
+        - checkpoint_applied
+        - windowed
+        - compacted
+      properties:
+        policy:
+          type: string
+          enum:
+            - reject
+            - inspect
+            - window
+            - compact
+          description: Context action evaluated by the server.
+        applied:
+          type: boolean
+          description: Whether the returned generation context differs from the supplied transcript.
+        original_input_tokens:
+          type: integer
+          minimum: 0
+        effective_input_tokens:
+          type: integer
+          minimum: 0
+          description: Token count after checkpoint application and windowing.
+        target_input_tokens:
+          type: integer
+          minimum: 1
+          description: Effective input-token ceiling after output reservation and client limits.
+        reserved_output_tokens:
+          type: integer
+          minimum: 0
+        dropped_messages:
+          type: integer
+          minimum: 0
+        retained_messages:
+          type: integer
+          minimum: 0
+        retained_from_message:
+          type: integer
+          minimum: 0
+          description: >
+            Original zero-based boundary for the retained active suffix. Instruction
+
+            messages before this boundary may also be returned verbatim.
+        checkpoint_applied:
+          type: boolean
+          default: false
+        checkpoint_sha256:
+          type: string
+          pattern: ^[0-9a-f]{64}$
+        windowed:
+          type: boolean
+        compacted:
+          type: boolean
+        checkpoint_created:
+          type: boolean
+          default: false
+        kv_cache_mode:
+          type: string
+          enum:
+            - exact_hybrid
+            - select_v1
+          description: Effective KV policy, when generation selected one.
+        kv_cache_version:
+          type: string
+          enum:
+            - v1
+    InferenceContextPrepareRequest:
+      type: object
+      additionalProperties: false
+      required:
+        - model
+        - messages
+      properties:
+        model:
+          type: string
+        messages:
+          type: array
+          items:
+            $ref: '#/components/schemas/InferenceChatMessage'
+        tools:
+          type: array
+          items:
+            $ref: '#/components/schemas/InferenceTool'
+        tool_choice:
+          $ref: '#/components/schemas/InferenceToolChoice'
+          description: Tool-selection control included in exact chat-template budgeting.
+        chat_template_kwargs:
+          $ref: '#/components/schemas/InferenceGenerateChatTemplateKwargs'
+          description: Chat-template options included in exact input-token budgeting.
+        max_tokens:
+          type: integer
+          minimum: 1
+          maximum: 2147483647
+          default: 256
+          description: Output-token reservation used to calculate the input budget.
+        mode:
+          type: string
+          enum:
+            - inspect
+            - window
+            - compact
+          default: inspect
+        checkpoint:
+          $ref: '#/components/schemas/InferenceContextCheckpoint'
+        max_input_tokens:
+          type: integer
+          minimum: 1
+          maximum: 2147483647
+        keep_recent_turns:
+          type: integer
+          minimum: 0
+          maximum: 2147483647
+          default: 2
+    InferenceContextPrepareResponse:
+      type: object
+      additionalProperties: false
+      required:
+        - messages
+        - context
+        - usage
+      properties:
+        messages:
+          type: array
+          items:
+            $ref: '#/components/schemas/InferenceChatMessage'
+          description: >
+            Messages ready to send in a subsequent generation request. Original
+
+            instruction messages are retained byte-for-byte even when they precede a
+
+            checkpoint-covered archive; clients send these returned instructions with
+
+            the active suffix and checkpoint.
+        checkpoint:
+          $ref: '#/components/schemas/InferenceContextCheckpoint'
+        context:
+          $ref: '#/components/schemas/InferenceContextDiagnostics'
+        usage:
+          $ref: '#/components/schemas/InferenceGenerateUsage'
     InferenceGenerateSpeculationStatus:
       type: object
       description: Effective speculative-decoding decision for this completion.
@@ -45096,6 +45656,12 @@ components:
           type: array
           items:
             $ref: '#/components/schemas/InferenceGenerateChunkChoice'
+        context:
+          $ref: '#/components/schemas/InferenceContextDiagnostics'
+          description: >
+            Effective context and KV policy diagnostics. Managed generation emits this
+
+            on a metadata chunk with an empty `choices` array before token chunks.
         usage:
           x-go-type-skip-optional-pointer: false
           nullable: true

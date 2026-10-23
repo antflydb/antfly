@@ -10,6 +10,8 @@ from ..models.inference_generate_response_object import InferenceGenerateRespons
 from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
+    from ..models.inference_context_checkpoint import InferenceContextCheckpoint
+    from ..models.inference_context_diagnostics import InferenceContextDiagnostics
     from ..models.inference_generate_choice import InferenceGenerateChoice
     from ..models.inference_generate_speculation_status import InferenceGenerateSpeculationStatus
     from ..models.inference_generate_usage import InferenceGenerateUsage
@@ -31,6 +33,8 @@ class InferenceGenerateResponse:
         usage (InferenceGenerateUsage | None | Unset): Provider-reported token usage, or null when the provider does not
             supply it.
         speculation (InferenceGenerateSpeculationStatus | None | Unset):
+        context (InferenceContextDiagnostics | Unset):
+        checkpoint (InferenceContextCheckpoint | Unset):
     """
 
     id: str
@@ -40,6 +44,8 @@ class InferenceGenerateResponse:
     choices: list[InferenceGenerateChoice]
     usage: InferenceGenerateUsage | None | Unset = UNSET
     speculation: InferenceGenerateSpeculationStatus | None | Unset = UNSET
+    context: InferenceContextDiagnostics | Unset = UNSET
+    checkpoint: InferenceContextCheckpoint | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -75,6 +81,14 @@ class InferenceGenerateResponse:
         else:
             speculation = self.speculation
 
+        context: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.context, Unset):
+            context = self.context.to_dict()
+
+        checkpoint: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.checkpoint, Unset):
+            checkpoint = self.checkpoint.to_dict()
+
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
         field_dict.update(
@@ -90,11 +104,17 @@ class InferenceGenerateResponse:
             field_dict["usage"] = usage
         if speculation is not UNSET:
             field_dict["speculation"] = speculation
+        if context is not UNSET:
+            field_dict["context"] = context
+        if checkpoint is not UNSET:
+            field_dict["checkpoint"] = checkpoint
 
         return field_dict
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
+        from ..models.inference_context_checkpoint import InferenceContextCheckpoint
+        from ..models.inference_context_diagnostics import InferenceContextDiagnostics
         from ..models.inference_generate_choice import InferenceGenerateChoice
         from ..models.inference_generate_speculation_status import InferenceGenerateSpeculationStatus
         from ..models.inference_generate_usage import InferenceGenerateUsage
@@ -149,6 +169,20 @@ class InferenceGenerateResponse:
 
         speculation = _parse_speculation(d.pop("speculation", UNSET))
 
+        _context = d.pop("context", UNSET)
+        context: InferenceContextDiagnostics | Unset
+        if isinstance(_context, Unset):
+            context = UNSET
+        else:
+            context = InferenceContextDiagnostics.from_dict(_context)
+
+        _checkpoint = d.pop("checkpoint", UNSET)
+        checkpoint: InferenceContextCheckpoint | Unset
+        if isinstance(_checkpoint, Unset):
+            checkpoint = UNSET
+        else:
+            checkpoint = InferenceContextCheckpoint.from_dict(_checkpoint)
+
         inference_generate_response = cls(
             id=id,
             object_=object_,
@@ -157,6 +191,8 @@ class InferenceGenerateResponse:
             choices=choices,
             usage=usage,
             speculation=speculation,
+            context=context,
+            checkpoint=checkpoint,
         )
 
         inference_generate_response.additional_properties = d

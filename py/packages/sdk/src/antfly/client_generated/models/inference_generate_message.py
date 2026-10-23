@@ -20,7 +20,7 @@ T = TypeVar("T", bound="InferenceGenerateMessage")
 class InferenceGenerateMessage:
     """
     Attributes:
-        role (InferenceRole): Role of the message sender in a generation/chat conversation
+        role (InferenceRole): Chat message role, including developer instructions preserved by context management.
         content (None | str | Unset): The generated message content (null when tool_calls is present)
         reasoning_content (None | str | Unset): Model reasoning emitted on a private reasoning channel, separate from
             public content

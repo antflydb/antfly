@@ -761,6 +761,8 @@ pub const AttentionRenderPlan = struct {
 /// `AttentionKernelKind`: decode plans own serial/producer/consumer/reduction
 /// fields that have no meaning for this one-launch production ABI.
 pub const FlashPrefillKernelKind = enum {
+    gqa_prefill_flash_sm89_e4b_hd256_swa512_f32,
+    gqa_prefill_flash_sm89_e4b_hd512_global_f32,
     gqa_prefill_flash_sm89_hd256_swa512_f32,
     gqa_prefill_flash_sm89_hd512_global_f32,
 };
@@ -769,6 +771,10 @@ pub const generated_flash_prefill_hd256_kernel_id =
     "antfly_gqa_attention_prefill_flash_sm89_hd256_swa512_f32_v1";
 pub const generated_flash_prefill_hd512_kernel_id =
     "antfly_gqa_attention_prefill_flash_sm89_hd512_global_f32_v1";
+pub const generated_flash_prefill_e4b_hd256_kernel_id =
+    "antfly_gqa_attention_prefill_flash_sm89_e4b_hd256_swa512_f32_v1";
+pub const generated_flash_prefill_e4b_hd512_kernel_id =
+    "antfly_gqa_attention_prefill_flash_sm89_e4b_hd512_global_f32_v1";
 pub const generated_flash_prefill_query_tile: u16 = 16;
 pub const generated_flash_prefill_key_tile: u16 = 16;
 pub const generated_flash_prefill_page_size_tokens: u16 = 16;
@@ -779,9 +785,13 @@ pub const FlashPrefillQueryLengthPolicy = enum {
     /// Qualified production buckets: q512 at prefixes 0/512/1024/1536 and the
     /// final q3 tail at prefix 2048. q1 always remains on the decode route.
     gemma4_q512_or_q3_v1,
+    /// E4B: bounded prompt chunks through 32K; q1 stays on decode.
+    gemma4_e4b_q2_to_8192_32k_v1,
 
     pub fn accepts(self: FlashPrefillQueryLengthPolicy, q_len: usize, query_position_offset: usize) bool {
         return switch (self) {
+            .gemma4_e4b_q2_to_8192_32k_v1 => q_len >= 2 and q_len <= 8192 and
+                query_position_offset <= 32768 - q_len,
             .gemma4_q512_or_q3_v1 => (q_len == 512 and
                 (query_position_offset == 0 or query_position_offset == 512 or
                     query_position_offset == 1024 or query_position_offset == 1536)) or
@@ -799,6 +809,16 @@ pub fn generatedFlashPrefillDynamicSharedBytes(head_dim: u16) ?u32 {
         3 * generated_flash_prefill_query_tile * @sizeOf(u32) +
         4 * generated_flash_prefill_query_tile * @sizeOf(f32) +
         @sizeOf(u32);
+}
+
+pub const generated_flash_prefill_e4b_query_tile: u16 = 64;
+
+pub fn generatedFlashPrefillE4bDynamicSharedBytes(head_dim: u16) ?u32 {
+    if (head_dim != 256 and head_dim != 512) return null;
+    const query_rows: u32 = generated_flash_prefill_e4b_query_tile;
+    const key_rows: u32 = generated_flash_prefill_key_tile;
+    return (query_rows + 2 * key_rows) * @as(u32, head_dim) * @sizeOf(f16) +
+        query_rows * key_rows * @sizeOf(f16) + (key_rows + 1) * @sizeOf(u32) + 3 * query_rows * @sizeOf(f32);
 }
 
 pub const FlashPrefillLowering = struct {
@@ -823,8 +843,9 @@ pub const FlashPrefillLowering = struct {
     pub fn validate(self: FlashPrefillLowering) !void {
         if (self.kind != .prefill_flash or
             (self.head_dim != 256 and self.head_dim != 512) or
-            self.query_heads != 8 or self.kv_heads != 1 or
-            self.query_tile != generated_flash_prefill_query_tile or
+            self.query_heads != 8 or (self.kv_heads != 1 and self.kv_heads != 2) or
+            self.query_length_policy != @as(FlashPrefillQueryLengthPolicy, if (self.kv_heads == 2) .gemma4_e4b_q2_to_8192_32k_v1 else .gemma4_q512_or_q3_v1) or
+            self.query_tile != (if (self.kv_heads == 2) generated_flash_prefill_e4b_query_tile else generated_flash_prefill_query_tile) or
             self.key_tile != generated_flash_prefill_key_tile or
             self.page_size_tokens != generated_flash_prefill_page_size_tokens or
             self.sliding_window != @as(u16, if (self.head_dim == 256) 512 else 0) or
@@ -1706,6 +1727,14 @@ pub fn flashPrefillPlanFor(kind: FlashPrefillKernelKind) FlashPrefillRenderPlan 
             "antfly_flash_prefill_sm89_hd256_swa512_f32_v1",
             generated_flash_prefill_hd256_kernel_id,
         ),
+        .gqa_prefill_flash_sm89_e4b_hd256_swa512_f32 => flashPrefillPlan(
+            kind,
+            256,
+            512,
+            "antfly_gqa_attention_prefill_flash_sm89_e4b_hd256_swa512_f32_v1",
+            "antfly_flash_prefill_sm89_e4b_hd256_swa512_f32_v1",
+            generated_flash_prefill_e4b_hd256_kernel_id,
+        ),
         .gqa_prefill_flash_sm89_hd512_global_f32 => flashPrefillPlan(
             kind,
             512,
@@ -1713,6 +1742,14 @@ pub fn flashPrefillPlanFor(kind: FlashPrefillKernelKind) FlashPrefillRenderPlan 
             "antfly_gqa_attention_prefill_flash_sm89_hd512_global_f32_v1",
             "antfly_flash_prefill_sm89_hd512_global_f32_v1",
             generated_flash_prefill_hd512_kernel_id,
+        ),
+        .gqa_prefill_flash_sm89_e4b_hd512_global_f32 => flashPrefillPlan(
+            kind,
+            512,
+            0,
+            "antfly_gqa_attention_prefill_flash_sm89_e4b_hd512_global_f32_v1",
+            "antfly_flash_prefill_sm89_e4b_hd512_global_f32_v1",
+            generated_flash_prefill_e4b_hd512_kernel_id,
         ),
     };
 }
@@ -1725,24 +1762,29 @@ fn flashPrefillPlan(
     namespace_id: []const u8,
     kernel_id: []const u8,
 ) FlashPrefillRenderPlan {
+    const e4b = kind == .gqa_prefill_flash_sm89_e4b_hd256_swa512_f32 or
+        kind == .gqa_prefill_flash_sm89_e4b_hd512_global_f32;
     return .{
         .kind = kind,
         .source_id = source_id,
         .namespace_id = namespace_id,
         .kernel_id = kernel_id,
-        .production_baseline = "termite_gqa_attention_prefill_tiled_f16_warp_f32",
-        .production_enabled = true,
-        .runtime_default_enabled = true,
+        .production_baseline = if (e4b)
+            "termite_gqa_attention_prefill_turboquant_fast_f32"
+        else
+            "termite_gqa_attention_prefill_tiled_f16_warp_f32",
+        .production_enabled = !e4b,
+        .runtime_default_enabled = !e4b,
         .exact_token_parity_required_for_default = true,
-        .exact_token_parity_qualified = true,
+        .exact_token_parity_qualified = !e4b,
         .launch = .{
             .grid = .query_heads_by_query_tiles,
             .threads_per_block = generated_flash_prefill_threads,
-            .output_rows_per_block = generated_flash_prefill_query_tile,
+            .output_rows_per_block = if (e4b) generated_flash_prefill_e4b_query_tile else generated_flash_prefill_query_tile,
             .output_cols_per_block = head_dim,
             .static_shared_memory_bytes = 0,
-            .dynamic_shared_memory_bytes = generatedFlashPrefillDynamicSharedBytes(head_dim).?,
-            .rows = .{ .min = 3, .max = 512 },
+            .dynamic_shared_memory_bytes = if (e4b) generatedFlashPrefillE4bDynamicSharedBytes(head_dim).? else generatedFlashPrefillDynamicSharedBytes(head_dim).?,
+            .rows = .{ .min = if (e4b) 2 else 3, .max = if (e4b) 2048 else 512 },
             .input_dim = .{ .min = head_dim, .max = head_dim, .fixed = head_dim },
             .output_dim = .{},
         },
@@ -1750,12 +1792,12 @@ fn flashPrefillPlan(
             .kind = .prefill_flash,
             .head_dim = head_dim,
             .query_heads = 8,
-            .kv_heads = 1,
-            .query_tile = generated_flash_prefill_query_tile,
+            .kv_heads = if (e4b) 2 else 1,
+            .query_tile = if (e4b) generated_flash_prefill_e4b_query_tile else generated_flash_prefill_query_tile,
             .key_tile = generated_flash_prefill_key_tile,
             .page_size_tokens = generated_flash_prefill_page_size_tokens,
             .sliding_window = sliding_window,
-            .query_length_policy = .gemma4_q512_or_q3_v1,
+            .query_length_policy = if (e4b) .gemma4_e4b_q2_to_8192_32k_v1 else .gemma4_q512_or_q3_v1,
             .query_storage = .f32,
             .key_storage = .paged_f16,
             .value_storage = .paged_f16,
@@ -2050,6 +2092,11 @@ const flash_prefill_f16_sm89_template =
 
 pub fn flashPrefillPlanId(plan: FlashPrefillRenderPlan, allocator: std.mem.Allocator) ![]u8 {
     try plan.validate();
+    if (plan.lowering.kv_heads == 2) return std.fmt.allocPrint(
+        allocator,
+        "cuda/attention/prefill_flash/sm89/e4b/hd{d}/gqa8-kv2/page16/q2-2048-kv32k/swa{d}/f32q-f16kv-hmma",
+        .{ plan.lowering.head_dim, plan.lowering.sliding_window },
+    );
     return std.fmt.allocPrint(
         allocator,
         "cuda/attention/prefill_flash/sm89/hd{d}/gqa8/page16/q512-or-q3/swa{d}/f32q-f16kv-hmma",
@@ -2067,12 +2114,14 @@ pub fn renderFlashPrefillBodyAlloc(
     try appendFmt(allocator, &out,
         \\#define ANTFLY_FLASH_NAMESPACE {s}
         \\#define ANTFLY_FLASH_KERNEL {s}
+        \\#define ANTFLY_FLASH_KV_HEADS {d}
         \\#define ANTFLY_FLASH_HEAD_DIM {d}
         \\#define ANTFLY_FLASH_SLIDING_WINDOW {d}
         \\
     , .{
         plan.namespace_id,
         plan.kernel_id,
+        plan.lowering.kv_heads,
         plan.lowering.head_dim,
         plan.lowering.sliding_window,
     });
@@ -2080,6 +2129,7 @@ pub fn renderFlashPrefillBodyAlloc(
     if (out.items.len == 0 or out.items[out.items.len - 1] != '\n') try out.append(allocator, '\n');
     try out.appendSlice(allocator,
         \\#undef ANTFLY_FLASH_SLIDING_WINDOW
+        \\#undef ANTFLY_FLASH_KV_HEADS
         \\#undef ANTFLY_FLASH_HEAD_DIM
         \\#undef ANTFLY_FLASH_KERNEL
         \\#undef ANTFLY_FLASH_NAMESPACE
@@ -5510,4 +5560,28 @@ test "split-KV chronological merge matches direct online softmax" {
         direct_max = next_max;
     }
     try std.testing.expectApproxEqAbs(direct_value / direct_denom, merged_value / merged_denom, 1e-6);
+}
+
+test "E4B Flash bounds and plan identity keep E2B qualification separate" {
+    const policy = FlashPrefillQueryLengthPolicy.gemma4_e4b_q2_to_8192_32k_v1;
+    try std.testing.expect(policy.accepts(2048, 30720));
+    try std.testing.expect(policy.accepts(8192, 24576));
+    try std.testing.expect(!policy.accepts(8192, 24577));
+    try std.testing.expect(policy.accepts(2045, 6144));
+    try std.testing.expect(policy.accepts(3, 32765));
+    try std.testing.expect(!policy.accepts(1, 32767));
+    try std.testing.expect(!policy.accepts(8193, 0));
+    try std.testing.expect(!policy.accepts(2048, 30721));
+    try std.testing.expect(!policy.accepts(512, std.math.maxInt(usize)));
+    inline for (.{ FlashPrefillKernelKind.gqa_prefill_flash_sm89_e4b_hd256_swa512_f32, FlashPrefillKernelKind.gqa_prefill_flash_sm89_e4b_hd512_global_f32 }) |kind| {
+        const plan = flashPrefillPlanFor(kind);
+        try plan.validate();
+        try std.testing.expectEqual(@as(u8, 2), plan.lowering.kv_heads);
+        try std.testing.expectEqual(@as(u16, 64), plan.launch.output_rows_per_block);
+        try std.testing.expectEqual(@as(u32, if (plan.lowering.head_dim == 256) 52_036 else 101_188), plan.launch.dynamic_shared_memory_bytes);
+        try std.testing.expect(!plan.runtime_default_enabled);
+        const id = try flashPrefillPlanId(plan, std.testing.allocator);
+        defer std.testing.allocator.free(id);
+        try std.testing.expect(std.mem.containsAtLeast(u8, id, 1, "e4b"));
+    }
 }
