@@ -1,110 +1,129 @@
-# Antfly Quickstart Demo
-# Usage: vhs quickstart.tape
-# Requires: antfly binary in PATH, models pre-downloaded, standalone running on :8080
-
-Output quickstart.gif
+# Full human-output quickstart. See scripts/quickstart/README.md for setup.
+# Run from the repository root against a fresh, isolated local server.
+# OpenAI generation is billed; embeddings, reranking and retrieval stay local.
+Output .recordings/quickstart.mp4
+Output .recordings/quickstart.txt
 
 Set Shell "zsh"
-Set FontSize 14
+Set FontSize 18
 Set Width 1200
-Set Height 600
+Set Height 640
+Set Framerate 10
 Set Theme "Catppuccin Mocha"
 Set Padding 20
-Set TypingSpeed 50ms
-
+Set TypingSpeed 18ms
 Hide
-Type `export PATH="$(pwd):$PATH" ANTFLY_AGENT_MODE=0`
+Type `setopt interactivecomments; export PATH="$(pwd):$PATH" ANTFLY_AGENT_MODE=0 COLUMNS=96; export ANTFLY_URL="${ANTFLY_URL:-http://127.0.0.1:18089}"; unset ANTFLY_TOKEN ANTFLY_USERNAME ANTFLY_PASSWORD ANTFLY_DATABASE ANTFLY_NAMESPACE OPENAI_API_KEY`
 Enter
-Sleep 500ms
-# Colored prompt + input text via zsh preexec/precmd
-# Input text renders in lavender (183), output resets to default
-Type `export PS1=$'\033[38;5;183m❯ '`
+Type `antfly() { command antfly "$@"; local demo_rc=$?; printf '%s %s %d\n' "$1" "$2" "$demo_rc" >> .recordings/quickstart-commands.log; (( demo_rc == 0 )) || exit "$demo_rc"; }`
 Enter
-Type `export PS2=$'\033[38;5;183m  '`
+Type `export PS1=$'\033[38;5;183m❯ '; export PS2='  '; preexec() { printf '\033[0m'; }`
 Enter
-Type `preexec() { printf "\033[0m"; }`
-Enter
-Sleep 500ms
-Type `antfly table drop -t wikipedia 2>/dev/null; true`
-Enter
-Sleep 1s
 Type `clear`
 Enter
 Sleep 500ms
 Show
-
-# --- Create table with text + image indexes ---
-
-Type@75ms `antfly table create -t wikipedia -f wikipedia-config.json`
+Type `# Full quickstart - waits shortened for this demo`
 Enter
-Wait+Screen@60s /Create table command successful\./
+Type `antfly table create -t wikipedia -f wikipedia-config.json`
+Enter
+Sleep 700ms
+Hide
+Wait@60s /❯/
+Show
+Sleep 2s
+Ctrl+L
+Type `antfly load -t wikipedia -f wiki-articles.jsonl \`
+Enter
+Type `  --id-field title --sync-level full_text`
+Enter
 Sleep 1s
-
-# --- Load data ---
-
-Type@75ms `antfly load -t wikipedia -f wiki-articles.jsonl --id-field title --sync-level full_text`
+Hide
+Wait@180s /❯/
+Show
+Sleep 2s
+Type `antfly sql --statement 'SELECT count(*) FROM wikipedia'`
 Enter
-Wait+Screen@120s /Bulk load command successful\./
-Sleep 1s
-
-# Wait for a meaningful, query-visible slice of the embedding corpus. The
-# remaining source documents continue indexing after the threshold is reached.
-Type@75ms `antfly index wait -t wikipedia -i title_body --until source-covered=10% --timeout 45m`
+Sleep 500ms
+Hide
+Wait@60s /❯/
+Show
+Sleep 2s
+Ctrl+L
+Type `# Indexing wait shortened; ready at 10% source coverage`
 Enter
-# Follow the prompt after a long scrolling wait; VHS Screen matching reads old scrollback.
+Type `antfly index wait -t wikipedia -i title_body \`
+Enter
+Type `  --until source-covered=10% --timeout 45m`
+Enter
+Sleep 2s
+Hide
 Wait@2700s /❯/
-Sleep 1s
-
-# --- Full-text search ---
-
-Type@60ms `antfly query -t wikipedia \`
-Enter
-Type@60ms `  --full-text-search 'body:Einstein' \`
-Enter
-Type@60ms `  --fields "title,url" --limit 5`
-Enter
+Show
 Sleep 2s
-
-# --- Semantic search ---
-
-Type@60ms `antfly query -t wikipedia \`
+Ctrl+L
+Type `antfly query -t wikipedia \`
 Enter
-Type@60ms `  --semantic-search "anatomy and physiology" \`
+Type `  --full-text-search 'body:Einstein' \`
 Enter
-Type@60ms `  -i title_body --fields "title,url" --limit 5`
+Type `  --fields title,url --limit 5`
 Enter
-Sleep 2s
-
-# --- Hybrid search with reranker ---
-
-Type@60ms `antfly query -t wikipedia \`
+Sleep 500ms
+Hide
+Wait@60s /❯/
+Show
+Sleep 4s
+Ctrl+L
+Type `antfly query -t wikipedia \`
 Enter
-Type@60ms `  --full-text-search 'body:Einstein' \`
+Type `  --semantic-search 'anatomy and physiology' \`
 Enter
-Type@60ms `  --semantic-search "theory of relativity and physics" \`
+Type `  -i title_body --fields title,url --limit 5`
 Enter
-Type@60ms `  -i title_body --fields "title,url" --limit 10 \`
-Enter
-Type@60ms `  --reranker '{"provider": "antfly", "model": "mixedbread-ai/mxbai-rerank-base-v1", "field": "body"}' \`
-Enter
-Type@60ms `  --pruner '{"min_score_ratio": 0.01}'`
-Enter
-Sleep 5s
-
-# --- RAG ---
-
-Type@60ms `antfly agents retrieval -t wikipedia \`
-Enter
-Type@60ms `  --semantic-search "What are the major events in Korean history?" \`
-Enter
-Type@60ms `  -i title_body --fields "title,body" --limit 5 \`
-Enter
-Type@60ms `  --generator '{"provider":"antfly","model":"ggml-org/gemma-4-E4B-it-GGUF","max_tokens":128}' \`
-Enter
-Type@60ms `  --max-context-tokens 2048 \`
-Enter
-Type@60ms `  --classify --reasoning --generate --followup`
-Enter
+Sleep 500ms
+Hide
 Wait@120s /❯/
-
-Sleep 8s
+Show
+Sleep 4s
+Ctrl+L
+Type `antfly query -t wikipedia \`
+Enter
+Type `  --full-text-search 'body:Einstein' \`
+Enter
+Type `  --semantic-search 'theory of relativity and physics' \`
+Enter
+Type `  -i title_body --fields title,url --limit 5 \`
+Enter
+Type `  --reranker '{"provider":"antfly","model":"mixedbread-ai/mxbai-rerank-base-v1","field":"body"}' \`
+Enter
+Type `  --pruner '{"min_score_ratio":0.01}'`
+Enter
+Sleep 500ms
+Hide
+Wait@120s /❯/
+Show
+Sleep 5s
+Ctrl+L
+Type `# Grounded answer: OpenAI generation, local retrieval`
+Enter
+Type `antfly agents retrieval -t wikipedia \`
+Enter
+Type `  --full-text-search 'title:"Korean history textbook controversies"' \`
+Enter
+Type `  --prompt 'Why are Korean history textbooks controversial?' \`
+Enter
+Type `  --fields title,body --limit 3 \`
+Enter
+Type `  --generator "$(cat scripts/quickstart/generator.json)" \`
+Enter
+Type `  --max-context-tokens 2048 \`
+Enter
+Type `  --system-prompt 'Use only sources. Answer in two short sentences and cite source titles.' \`
+Enter
+Type `  --generate`
+Enter
+Sleep 1s
+Hide
+Wait@120s /❯/
+Show
+Sleep 9s
