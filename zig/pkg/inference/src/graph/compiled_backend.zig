@@ -104,42 +104,18 @@ pub const Definition = struct {
         mode: CompileMode,
         request: model_runtime.ForwardRequest,
     ) anyerror!?[]f32 = null,
-    execute_model_forward_direct: ?*const fn (
+    resolve_model_runtime: ?*const fn (
         allocator: std.mem.Allocator,
         cache: *cache_mod.GraphCache,
         context: AttachContext,
         mode: CompileMode,
-        request: model_runtime.ForwardRequest,
-    ) anyerror!?[]f32 = null,
-    execute_model_forward_output_direct: ?*const fn (
-        allocator: std.mem.Allocator,
-        cache: *cache_mod.GraphCache,
-        context: AttachContext,
-        mode: CompileMode,
-        request: model_runtime.ForwardRequest,
-    ) anyerror!?model_runtime.ModelOutput = null,
-    execute_model_greedy_direct: ?*const fn (
-        allocator: std.mem.Allocator,
-        cache: *cache_mod.GraphCache,
-        context: AttachContext,
-        mode: CompileMode,
-        request: model_runtime.ForwardRequest,
-        vocab_size: usize,
-    ) anyerror!?i64 = null,
-    execute_model_sample_direct: ?*const fn (
-        allocator: std.mem.Allocator,
-        cache: *cache_mod.GraphCache,
-        context: AttachContext,
-        mode: CompileMode,
-        request: model_runtime.SampledDecodeRequest,
-    ) anyerror!?i64 = null,
-    prepare_model_runtime_direct: ?*const fn (
-        allocator: std.mem.Allocator,
-        cache: *cache_mod.GraphCache,
-        context: AttachContext,
-        mode: CompileMode,
-        request: model_runtime.PrepareRequest,
-    ) anyerror!bool = null,
+    ) anyerror!?*model_runtime.ModelRuntime = null,
+
+    pub fn candidate(self: Definition, allocator: std.mem.Allocator, cache: *cache_mod.GraphCache, context: AttachContext, mode: CompileMode) !?@import("../execution/model_candidate.zig").Candidate {
+        const resolve = self.resolve_model_runtime orelse return null;
+        const runtime = (try resolve(allocator, cache, context, mode)) orelse return null;
+        return .{ .runtime = runtime };
+    }
 
     pub fn capability(
         self: Definition,

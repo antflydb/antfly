@@ -27,6 +27,7 @@ extern fn unsetenv(name: [*:0]const u8) c_int;
 
 pub const backends = @import("backends/backends.zig");
 pub const platform = @import("antfly_platform");
+pub const execution = @import("execution/root.zig");
 pub const execution_control = @import("execution_control.zig");
 pub const InferenceExecutionControl = execution_control.InferenceExecutionControl;
 pub const HardCancellationWatchdog = @import("hard_cancellation_watchdog.zig").HardCancellationWatchdog;
@@ -172,6 +173,7 @@ test {
     _ = registry;
     _ = tabular;
     _ = models;
+    _ = @import("models/session_contract.zig");
     _ = gguf;
     _ = runtime;
     _ = util;

@@ -1232,7 +1232,8 @@ fn debugRuntimeTensorFinite(comptime label: []const u8, layer_index: usize, tens
     if (getenvUsize("TERMITE_METAL_DEBUG_RUNTIME_TENSOR_LAYER")) |target| {
         if (target != layer_index) return;
     }
-    var tensor_mut = tensor;
+    var tensor_mut = tensor.readView() catch return;
+    defer tensor_mut.deinit();
     const data = tensor_mut.toHostSlice() catch |err| {
         std.debug.print("metal-runtime-finite label={s} layer={d} error={s}\n", .{ label, layer_index, @errorName(err) });
         return;
@@ -1350,25 +1351,17 @@ pub const CompressedAttentionGatedAttentionPath = enum {
     quantized_residual,
 };
 
-fn tensorHostSlice(tensor: anytype) ![]f32 {
-    const T = @TypeOf(tensor);
-    if (T == MetalTensor) {
-        var tmp = tensor;
-        return tmp.toHostSlice();
-    }
-    if (T == *MetalTensor) return tensor.toHostSlice();
-    if (T == *const MetalTensor) {
-        var tmp = tensor.*;
-        return tmp.toHostSlice();
-    }
-    @compileError("unsupported tensorHostSlice argument type");
+fn tensorHostSlice(tensor: *MetalTensor) ![]f32 {
+    // Materialization mutates mirror ownership. A value copy cannot publish
+    // that ownership back to its caller; use a scoped readView for borrows.
+    return tensor.toHostSlice();
 }
 
-fn tensorHostConstPtr(tensor: anytype) ![*c]const f32 {
+fn tensorHostConstPtr(tensor: *MetalTensor) ![*c]const f32 {
     return (try tensorHostSlice(tensor)).ptr;
 }
 
-fn tensorHostPtr(tensor: anytype) ![*]f32 {
+fn tensorHostPtr(tensor: *MetalTensor) ![*]f32 {
     return @ptrCast((try tensorHostSlice(tensor)).ptr);
 }
 
@@ -2262,8 +2255,10 @@ pub fn decoderRuntimePrepareAbsoluteEmbeddings(self: anytype, request: anytype) 
     if (@as(usize, @intCast(request.token_embedding.dim(1))) != request.hidden_size) return false;
     if (@as(usize, @intCast(request.position_embedding.dim(1))) != request.hidden_size) return false;
 
-    var token_embedding = request.token_embedding;
-    var position_embedding = request.position_embedding;
+    var token_embedding = try request.token_embedding.readView();
+    defer token_embedding.deinit();
+    var position_embedding = try request.position_embedding.readView();
+    defer position_embedding.deinit();
     const rc = termite_metal_decode_runtime_prepare_absolute_embeddings(
         runtime,
         try tensorHostConstPtr(&token_embedding),
@@ -2344,7 +2339,8 @@ pub fn decoderRuntimeEmbeddingLookup(self: anytype, request: anytype) !?MetalTen
             output.deinit();
         }
     } else {
-        var weight = request.weight;
+        var weight = try request.weight.readView();
+        defer weight.deinit();
         const prep_rc = termite_metal_decode_runtime_prepare_embedding_table(
             runtime,
             try tensorHostConstPtr(&weight),
@@ -2369,7 +2365,8 @@ pub fn decoderRuntimeEmbeddingLookup(self: anytype, request: anytype) !?MetalTen
 
     const output = try std.heap.c_allocator.alloc(f32, request.total * request.dim);
     errdefer std.heap.c_allocator.free(output);
-    var weight = request.weight;
+    var weight = try request.weight.readView();
+    defer weight.deinit();
     const rc = termite_metal_decode_runtime_embedding_lookup(
         runtime,
         try tensorHostConstPtr(&weight),
@@ -2439,9 +2436,12 @@ pub fn decoderRuntimeDebertaEmbeddingsF32Device(self: anytype, request: anytype)
             output.deinit();
             return null;
         }
-        var weight = request.weight;
-        var gamma = request.gamma;
-        var beta = request.beta;
+        var weight = try request.weight.readView();
+        defer weight.deinit();
+        var gamma = try request.gamma.readView();
+        defer gamma.deinit();
+        var beta = try request.beta.readView();
+        defer beta.deinit();
         break :blk termite_metal_decode_runtime_deberta_embeddings_f32(
             runtime,
             try tensorHostConstPtr(&weight),
@@ -2982,7 +2982,8 @@ pub fn decoderRuntimeApplyRope(self: anytype, request: anytype) !?MetalTensor {
 
     const output = try std.heap.c_allocator.alloc(f32, total_values);
     errdefer std.heap.c_allocator.free(output);
-    var input = request.input;
+    var input = try request.input.readView();
+    defer input.deinit();
     const rc = termite_metal_decode_runtime_apply_rope(
         runtime,
         try tensorHostConstPtr(&input),
@@ -3553,9 +3554,12 @@ pub fn decoderRuntimeApplyAttentionF32(self: anytype, request: anytype) !?MetalT
 
     const output = try std.heap.c_allocator.alloc(f32, request.q_len * request.num_heads * request.head_dim);
     errdefer std.heap.c_allocator.free(output);
-    var q = request.q;
-    var k = request.k;
-    var v = request.v;
+    var q = try request.q.readView();
+    defer q.deinit();
+    var k = try request.k.readView();
+    defer k.deinit();
+    var v = try request.v.readView();
+    defer v.deinit();
     var bias_mut: ?MetalTensor = if (bias_tensor) |tensor| tensor else null;
     const rc = termite_metal_decode_runtime_apply_attention_f32(
         runtime,
@@ -4122,7 +4126,8 @@ pub fn sampleLogitsDevice(self: anytype, request: anytype) !?usize {
     if (penalty_entries.token_ids.len > 512 and request.top_k > 64) return null;
     var token_id: u32 = 0;
     if (!request.input.isDevice()) {
-        var input = request.input;
+        var input = try request.input.readView();
+        defer input.deinit();
         const input_host = try tensorHostSlice(&input);
         return sampleLogits(input_host, request);
     }
@@ -4296,17 +4301,21 @@ pub fn decoderRuntimePrepareLayerNorm(self: anytype, request: anytype) !bool {
     if (@as(usize, @intCast(request.weight.dim(0))) != request.hidden_size) return false;
     if (@as(usize, @intCast(request.bias.dim(0))) != request.hidden_size) return false;
 
-    var weight = request.weight;
-    var bias = request.bias;
+    var weight = try request.weight.readView();
+    defer weight.deinit();
+    var bias = try request.bias.readView();
+    defer bias.deinit();
     const weight_values = try tensorHostConstPtr(&weight);
     const bias_values = try tensorHostConstPtr(&bias);
     // Allocate fallback ownership before publishing device state. Neither
     // allocation failure nor a rejected C preparation replaces the old slot.
     var published = false;
-    var weight_for_clone = request.weight;
+    var weight_for_clone = try request.weight.readView();
+    defer weight_for_clone.deinit();
     var weight_copy = try MetalTensor.ownedCloneFrom(try tensorHostSlice(&weight_for_clone), request.weight.shape());
     defer if (!published) weight_copy.deinit();
-    var bias_for_clone = request.bias;
+    var bias_for_clone = try request.bias.readView();
+    defer bias_for_clone.deinit();
     var bias_copy = try MetalTensor.ownedCloneFrom(try tensorHostSlice(&bias_for_clone), request.bias.shape());
     defer if (!published) bias_copy.deinit();
     const storage: OwnedF32SlotStorage = if (@hasField(@TypeOf(request), "owned_f32_slot_storage")) request.owned_f32_slot_storage else .private;
@@ -4360,12 +4369,14 @@ pub fn decoderRuntimePrepareRmsNorm(self: anytype, request: anytype) !bool {
         }
     }
 
-    var weight = request.weight;
+    var weight = try request.weight.readView();
+    defer weight.deinit();
     const weight_values = try tensorHostConstPtr(&weight);
     // Acquire fallback ownership before publishing the device slot. Failure
     // leaves both the old host mirror and the old device snapshot intact.
     var published = false;
-    var weight_for_clone = request.weight;
+    var weight_for_clone = try request.weight.readView();
+    defer weight_for_clone.deinit();
     var weight_copy = try MetalTensor.ownedCloneFrom(try tensorHostSlice(&weight_for_clone), request.weight.shape());
     defer if (!published) weight_copy.deinit();
     const storage: OwnedF32SlotStorage = if (@hasField(@TypeOf(request), "owned_f32_slot_storage")) request.owned_f32_slot_storage else .private;
@@ -4414,7 +4425,8 @@ pub fn decoderRuntimeApplyLayerNorm(self: anytype, request: anytype, stats: anyt
 
     const output = try std.heap.c_allocator.alloc(f32, rows * request.hidden_size);
     errdefer std.heap.c_allocator.free(output);
-    var input = request.input;
+    var input = try request.input.readView();
+    defer input.deinit();
     const rc = termite_metal_decode_runtime_apply_layer_norm(
         runtime,
         request.slot,
@@ -4603,7 +4615,8 @@ pub fn decoderRuntimeEmbeddingLookupDeviceToken(self: anytype, weight: MetalTens
             dim,
         ) != 0) return null;
     } else {
-        var host_weight = weight;
+        var host_weight = try weight.readView();
+        defer host_weight.deinit();
         if (termite_metal_decode_runtime_prepare_embedding_table(
             runtime,
             try tensorHostConstPtr(&host_weight),
@@ -4700,7 +4713,8 @@ pub fn decoderRuntimeApplyRmsNorm(self: anytype, request: anytype, stats: anytyp
     }
     if (rows != 1) {
         var weight_tensor = self.raw_rms_norm_slot_weights[request.slot] orelse return null;
-        var input = request.input;
+        var input = try request.input.readView();
+        defer input.deinit();
         const input_slice = try tensorHostSlice(&input);
         const input_host = try std.heap.c_allocator.alloc(f32, input_slice.len);
         errdefer std.heap.c_allocator.free(input_host);
@@ -4731,7 +4745,8 @@ pub fn decoderRuntimeApplyRmsNorm(self: anytype, request: anytype, stats: anytyp
 
     const output = try std.heap.c_allocator.alloc(f32, request.hidden_size);
     errdefer std.heap.c_allocator.free(output);
-    var input = request.input;
+    var input = try request.input.readView();
+    defer input.deinit();
     const rc = termite_metal_decode_runtime_apply_rms_norm(
         runtime,
         request.slot,
@@ -5001,7 +5016,8 @@ pub fn decoderRuntimeApplyLayerNormLinearArgmax(self: anytype, request: anytype)
     if (frame_active) return null;
 
     var token_id: u32 = 0;
-    var input = request.input;
+    var input = try request.input.readView();
+    defer input.deinit();
     const rc = termite_metal_decode_runtime_apply_layer_norm_linear_argmax(
         runtime,
         request.norm_slot,
@@ -5052,7 +5068,8 @@ pub fn decoderRuntimeApplyLayerNormLinear(self: anytype, request: anytype) !?Met
 
     const output = try std.heap.c_allocator.alloc(f32, request.out_dim);
     errdefer std.heap.c_allocator.free(output);
-    var input = request.input;
+    var input = try request.input.readView();
+    defer input.deinit();
     const rc = termite_metal_decode_runtime_apply_layer_norm_linear(
         runtime,
         request.norm_slot,
@@ -5093,7 +5110,8 @@ pub fn decoderRuntimeApplyLayerNormLinearSample(self: anytype, request: anytype)
             var penalty_entries = try buildSamplePenaltyEntries(std.heap.c_allocator, request.token_history);
             defer penalty_entries.deinit(std.heap.c_allocator);
             if (penalty_entries.token_ids.len > 512 and request.top_k > 64) return null;
-            var input = request.input;
+            var input = try request.input.readView();
+            defer input.deinit();
             const input_host = try tensorHostSlice(&input);
             var token_id: u32 = 0;
             const seed = makeSampleSeed(&input_host[0]);
@@ -5124,7 +5142,8 @@ pub fn decoderRuntimeApplyLayerNormLinearSample(self: anytype, request: anytype)
 
     const logits_host = try std.heap.c_allocator.alloc(f32, request.out_dim);
     defer std.heap.c_allocator.free(logits_host);
-    var input = request.input;
+    var input = try request.input.readView();
+    defer input.deinit();
     const rc = termite_metal_decode_runtime_apply_layer_norm_linear(
         runtime,
         request.norm_slot,
@@ -5248,7 +5267,8 @@ pub fn decoderRuntimeApplyRmsNormLinearArgmax(self: anytype, request: anytype) !
     }
 
     var token_id: u32 = 0;
-    var input = request.input;
+    var input = try request.input.readView();
+    defer input.deinit();
     const rc = termite_metal_decode_runtime_apply_rms_norm_linear_argmax(
         runtime,
         request.norm_slot,
@@ -5719,7 +5739,8 @@ fn argmaxSingleRowLogits(self: anytype, logits: MetalTensor, out_dim: usize, sup
             try argmaxLogitsSuppressDevice(self, logits, out_dim, suppress_token_ids);
         if (token_id) |id| return id;
     }
-    var logits_mut = logits;
+    var logits_mut = try logits.readView();
+    defer logits_mut.deinit();
     const host = try tensorHostSlice(&logits_mut);
     if (host.len != out_dim) return null;
     var best_idx: ?usize = null;
@@ -5762,7 +5783,8 @@ pub fn decoderRuntimeApplyLinearArgmax(self: anytype, request: anytype) !?usize 
     }
 
     var token_id: u32 = 0;
-    var input = request.input;
+    var input = try request.input.readView();
+    defer input.deinit();
     const rc = termite_metal_decode_runtime_apply_linear_argmax(
         runtime,
         request.slot,
@@ -5832,7 +5854,8 @@ pub fn decoderRuntimeApplyRmsNormLinearSample(self: anytype, request: anytype) !
             var penalty_entries = try buildSamplePenaltyEntries(std.heap.c_allocator, request.token_history);
             defer penalty_entries.deinit(std.heap.c_allocator);
             if (penalty_entries.token_ids.len > 512 and request.top_k > 64) return null;
-            var input = request.input;
+            var input = try request.input.readView();
+            defer input.deinit();
             const input_host = try tensorHostSlice(&input);
             var token_id: u32 = 0;
             const seed = makeSampleSeed(&input_host[0]);
@@ -5863,7 +5886,8 @@ pub fn decoderRuntimeApplyRmsNormLinearSample(self: anytype, request: anytype) !
 
     const logits_host = try std.heap.c_allocator.alloc(f32, request.out_dim);
     defer std.heap.c_allocator.free(logits_host);
-    var input = request.input;
+    var input = try request.input.readView();
+    defer input.deinit();
     const rc = termite_metal_decode_runtime_apply_rms_norm_linear(
         runtime,
         request.norm_slot,
@@ -6063,7 +6087,8 @@ pub fn decoderRuntimeApplyActivation(self: anytype, request: anytype, stats: any
     }
 
     if (rows != 1) {
-        var input = request.input;
+        var input = try request.input.readView();
+        defer input.deinit();
         const input_slice = try tensorHostSlice(&input);
         const input_host = try std.heap.c_allocator.alloc(f32, input_slice.len);
         errdefer std.heap.c_allocator.free(input_host);
@@ -6076,7 +6101,8 @@ pub fn decoderRuntimeApplyActivation(self: anytype, request: anytype, stats: any
     const output = try std.heap.c_allocator.alloc(f32, request.dim);
     errdefer std.heap.c_allocator.free(output);
     stats.decoder_runtime_apply_activation_calls += 1;
-    var input = request.input;
+    var input = try request.input.readView();
+    defer input.deinit();
     const rc = termite_metal_decode_runtime_apply_activation(
         runtime,
         @backingInt(request.kind),
@@ -9189,8 +9215,10 @@ pub fn decoderRuntimeApplyAdd(self: anytype, request: anytype, stats: anytype) !
     if (rows == 0 or @as(usize, @intCast(request.rhs.dim(0))) != rows) return null;
     if (@as(usize, @intCast(request.lhs.dim(1))) != request.dim or @as(usize, @intCast(request.rhs.dim(1))) != request.dim) return null;
     if (rows != 1) {
-        var lhs = request.lhs;
-        var rhs = request.rhs;
+        var lhs = try request.lhs.readView();
+        defer lhs.deinit();
+        var rhs = try request.rhs.readView();
+        defer rhs.deinit();
         const lhs_slice = try tensorHostSlice(&lhs);
         const rhs_slice = try tensorHostSlice(&rhs);
         if (lhs_slice.len == 0 or rhs_slice.len == 0) return null;
@@ -9225,8 +9253,10 @@ pub fn decoderRuntimeApplyAdd(self: anytype, request: anytype, stats: anytype) !
     const output = try std.heap.c_allocator.alloc(f32, request.dim);
     errdefer std.heap.c_allocator.free(output);
     stats.decoder_runtime_apply_add_calls += 1;
-    var lhs = request.lhs;
-    var rhs = request.rhs;
+    var lhs = try request.lhs.readView();
+    defer lhs.deinit();
+    var rhs = try request.rhs.readView();
+    defer rhs.deinit();
     const rc = termite_metal_decode_runtime_apply_add(
         runtime,
         try tensorHostConstPtr(&lhs),
@@ -9525,8 +9555,10 @@ pub fn decoderRuntimeApplyMultiply(
     if (rows == 0 or @as(usize, @intCast(rhs.dim(0))) != rows) return null;
     if (@as(usize, @intCast(lhs.dim(1))) != dim or @as(usize, @intCast(rhs.dim(1))) != dim) return null;
     if (rows != 1) {
-        var lhs_host = lhs;
-        var rhs_host = rhs;
+        var lhs_host = try lhs.readView();
+        defer lhs_host.deinit();
+        var rhs_host = try rhs.readView();
+        defer rhs_host.deinit();
         const lhs_slice = try tensorHostSlice(&lhs_host);
         const rhs_slice = try tensorHostSlice(&rhs_host);
         if (lhs_slice.len == 0 or rhs_slice.len == 0) return null;
@@ -9559,8 +9591,10 @@ pub fn decoderRuntimeApplyMultiply(
 
     const output = try std.heap.c_allocator.alloc(f32, dim);
     errdefer std.heap.c_allocator.free(output);
-    var lhs_mut = lhs;
-    var rhs_mut = rhs;
+    var lhs_mut = try lhs.readView();
+    defer lhs_mut.deinit();
+    var rhs_mut = try rhs.readView();
+    defer rhs_mut.deinit();
     const rc = termite_metal_decode_runtime_apply_multiply(
         runtime,
         try tensorHostConstPtr(&lhs_mut),
@@ -10566,7 +10600,8 @@ pub fn decoderRuntimeApplyLinearActivationLinearResidual(self: anytype, request:
     const output = try std.heap.c_allocator.alloc(f32, request.hidden_size);
     errdefer std.heap.c_allocator.free(output);
 
-    var input = request.input;
+    var input = try request.input.readView();
+    defer input.deinit();
     var residual = request.residual;
     const rc = termite_metal_decode_runtime_apply_linear_activation_linear_residual(
         runtime,
@@ -10925,7 +10960,8 @@ pub fn decoderRuntimeApplyLinear(self: anytype, request: anytype) !?MetalTensor 
     if (rows != 1) return null;
     const output = try std.heap.c_allocator.alloc(f32, request.out_dim);
     errdefer std.heap.c_allocator.free(output);
-    var input = request.input;
+    var input = try request.input.readView();
+    defer input.deinit();
     if (!(try tryRawLinearHost(self, effective_slot, try tensorHostConstPtr(&input), request.in_dim, request.out_dim, output.ptr))) {
         std.heap.c_allocator.free(output);
         return null;
@@ -10998,7 +11034,8 @@ pub fn decoderRuntimeApplyRmsNormLinear(self: anytype, request: anytype) !?Metal
         if (frame_active) return null;
         const direct_output = try std.heap.c_allocator.alloc(f32, request.out_dim);
         errdefer std.heap.c_allocator.free(direct_output);
-        var request_input = request.input;
+        var request_input = try request.input.readView();
+        defer request_input.deinit();
         const direct_rc: c_int = switch (ensureQuantizedRuntimeLinearSlotPrepared(
             self,
             effective_slot,
@@ -11073,7 +11110,8 @@ pub fn decoderRuntimeApplyRmsNormLinear(self: anytype, request: anytype) !?Metal
 
     const output = try std.heap.c_allocator.alloc(f32, request.out_dim);
     errdefer std.heap.c_allocator.free(output);
-    var request_input = request.input;
+    var request_input = try request.input.readView();
+    defer request_input.deinit();
     const rc = termite_metal_decode_runtime_apply_rms_norm_linear(
         runtime,
         request.norm_slot,
@@ -11152,7 +11190,8 @@ pub fn decoderRuntimePrepareLinear(self: anytype, request: anytype, stats: anyty
         stats.decoder_runtime_prepare_linear_bias_shape_failures += 1;
         return false;
     }
-    var bias = request.bias;
+    var bias = try request.bias.readView();
+    defer bias.deinit();
     const bias_base: [*c]const f32 = try tensorHostConstPtr(&bias);
     var bias_is_zero = true;
     for (bias_base[0..request.out_dim]) |value| {
@@ -11553,7 +11592,8 @@ pub fn decoderRuntimePrepareLinear(self: anytype, request: anytype, stats: anyty
         return false;
     }
 
-    var weight = request.weight;
+    var weight = try request.weight.readView();
+    defer weight.deinit();
     const weight_base: [*c]const f32 = try tensorHostConstPtr(&weight);
     var transposed_weight_owned: ?[]f32 = null;
     defer if (transposed_weight_owned) |owned| std.heap.c_allocator.free(owned);
@@ -26700,7 +26740,8 @@ pub fn tryApplyQuantizedRuntimeLinear(
     const force_reference = kind == .q4_0 and rows == 1 and !q4_0SingleRowDeviceLinearEnabled();
     if (referenceQuantizedRuntimeLinearDebug() or force_reference) {
         const storage = self.raw_linear_slot_quantized_storage[slot] orelse return null;
-        var input_host_tensor = input;
+        var input_host_tensor = try input.readView();
+        defer input_host_tensor.deinit();
         const input_host = try tensorHostSlice(&input_host_tensor);
         const weight_host = try std.heap.c_allocator.alloc(f32, out_dim * in_dim);
         defer std.heap.c_allocator.free(weight_host);
@@ -26767,7 +26808,8 @@ pub fn tryApplyQuantizedRuntimeLinear(
 
     if (frame_active) return null;
 
-    var input_mut = input;
+    var input_mut = try input.readView();
+    defer input_mut.deinit();
     const input_base = try tensorHostConstPtr(&input_mut);
 
     const output = try std.heap.c_allocator.alloc(f32, rows * out_dim);
@@ -27347,8 +27389,7 @@ pub fn tryApplyQuantizedRuntimeLinearPair(
         var first = (try tryApplyQuantizedRuntimeLinear(self, slot_a, input, rows, in_dim, out_dim)) orelse return null;
         errdefer first.deinit();
         const second = (try tryApplyQuantizedRuntimeLinear(self, slot_b, input, rows, in_dim, out_dim)) orelse {
-            var first_mut = first;
-            first_mut.deinit();
+            first.deinit();
             return null;
         };
         return .{
@@ -27399,8 +27440,7 @@ pub fn tryApplyQuantizedRuntimeLinearPair(
         var first = (try tryApplyQuantizedRuntimeLinear(self, slot_a, input, rows, in_dim, out_dim)) orelse return null;
         errdefer first.deinit();
         const second = (try tryApplyQuantizedRuntimeLinear(self, slot_b, input, rows, in_dim, out_dim)) orelse {
-            var first_mut = first;
-            first_mut.deinit();
+            first.deinit();
             return null;
         };
         return .{
@@ -27412,7 +27452,8 @@ pub fn tryApplyQuantizedRuntimeLinearPair(
     if (!has_direct_pair) return null;
     if (frame_active) return null;
 
-    var input_mut = input;
+    var input_mut = try input.readView();
+    defer input_mut.deinit();
     const input_base = try tensorHostConstPtr(&input_mut);
 
     const first_out = try std.heap.c_allocator.alloc(f32, rows * out_dim);
@@ -27519,7 +27560,8 @@ pub fn tryApplyDenseRuntimeLinear(
     const output = try std.heap.c_allocator.alloc(f32, output_elements);
     errdefer std.heap.c_allocator.free(output);
 
-    var input_mut = input;
+    var input_mut = try input.readView();
+    defer input_mut.deinit();
     const rc = termite_metal_decode_runtime_apply_linear_multi_row(
         runtime,
         slot,
@@ -28027,7 +28069,8 @@ pub fn tryApplyDenseRuntimeLinearPair(
 
     if (frame_active) return null;
 
-    var input_mut = input;
+    var input_mut = try input.readView();
+    defer input_mut.deinit();
     const input_base = try tensorHostConstPtr(&input_mut);
 
     const first_out = try std.heap.c_allocator.alloc(f32, rows * out_dim);
@@ -28293,7 +28336,8 @@ pub fn tryApplyDenseRuntimeLinearQkv(
 
     if (frame_active) return null;
 
-    var input_mut = input;
+    var input_mut = try input.readView();
+    defer input_mut.deinit();
     const input_base = try tensorHostConstPtr(&input_mut);
     const q_out = try std.heap.c_allocator.alloc(f32, q_elements);
     errdefer std.heap.c_allocator.free(q_out);
@@ -28504,22 +28548,14 @@ pub fn tryApplyQuantizedRuntimeLinearQkv(
     if (referenceQuantizedRuntimeLinearDebug()) {
         var q_out = (try tryApplyQuantizedRuntimeLinear(self, q_slot, input, rows, in_dim, q_out_dim)) orelse return null;
         errdefer q_out.deinit();
-        const k_out = (try tryApplyQuantizedRuntimeLinear(self, k_slot, input, rows, in_dim, kv_out_dim)) orelse {
-            var q_out_mut = q_out;
-            q_out_mut.deinit();
+        var k_out = (try tryApplyQuantizedRuntimeLinear(self, k_slot, input, rows, in_dim, kv_out_dim)) orelse {
+            q_out.deinit();
             return null;
         };
-        errdefer {
-            var q_out_mut = q_out;
-            q_out_mut.deinit();
-            var k_out_mut = k_out;
-            k_out_mut.deinit();
-        }
+        errdefer k_out.deinit();
         const v_out = (try tryApplyQuantizedRuntimeLinear(self, v_slot, input, rows, in_dim, kv_out_dim)) orelse {
-            var q_out_mut = q_out;
-            q_out_mut.deinit();
-            var k_out_mut = k_out;
-            k_out_mut.deinit();
+            q_out.deinit();
+            k_out.deinit();
             return null;
         };
         return .{
@@ -28653,22 +28689,14 @@ pub fn tryApplyQuantizedRuntimeLinearQkv(
     {
         var q_out = (try tryApplyQuantizedRuntimeLinear(self, q_slot, input, rows, in_dim, q_out_dim)) orelse return null;
         errdefer q_out.deinit();
-        const k_out = (try tryApplyQuantizedRuntimeLinear(self, k_slot, input, rows, in_dim, kv_out_dim)) orelse {
-            var q_out_mut = q_out;
-            q_out_mut.deinit();
+        var k_out = (try tryApplyQuantizedRuntimeLinear(self, k_slot, input, rows, in_dim, kv_out_dim)) orelse {
+            q_out.deinit();
             return null;
         };
-        errdefer {
-            var q_out_mut = q_out;
-            q_out_mut.deinit();
-            var k_out_mut = k_out;
-            k_out_mut.deinit();
-        }
+        errdefer k_out.deinit();
         const v_out = (try tryApplyQuantizedRuntimeLinear(self, v_slot, input, rows, in_dim, kv_out_dim)) orelse {
-            var q_out_mut = q_out;
-            q_out_mut.deinit();
-            var k_out_mut = k_out;
-            k_out_mut.deinit();
+            q_out.deinit();
+            k_out.deinit();
             return null;
         };
         return .{
@@ -28682,7 +28710,8 @@ pub fn tryApplyQuantizedRuntimeLinearQkv(
     if (host_case == .q8_0) return null;
     if (frame_active) return null;
 
-    var input_mut = input;
+    var input_mut = try input.readView();
+    defer input_mut.deinit();
     const input_base = try tensorHostConstPtr(&input_mut);
 
     const q_out = try std.heap.c_allocator.alloc(f32, rows * q_out_dim);
@@ -29940,8 +29969,10 @@ pub fn runCompressedAttentionGatedPostGateQuantizedFfn(
         )) {
             const out = try std.heap.c_allocator.alloc(f32, request.hidden_size);
             errdefer std.heap.c_allocator.free(out);
-            var ffn_normed_mut = ffn_normed;
-            var attn_res_mut = attn_res;
+            var ffn_normed_mut = try ffn_normed.readView();
+            defer ffn_normed_mut.deinit();
+            var attn_res_mut = try attn_res.readView();
+            defer attn_res_mut.deinit();
             if (try tryRawQuantizedGatedFfnResidualHost(self, .{
                 .input = try tensorHostConstPtr(&ffn_normed_mut),
                 .residual = try tensorHostConstPtr(&attn_res_mut),
@@ -30004,8 +30035,10 @@ pub fn runCompressedAttentionGatedPostGateQuantizedFfn(
             const out = try std.heap.c_allocator.alloc(f32, request.hidden_size);
             errdefer std.heap.c_allocator.free(out);
             const post_gate_direct_started_at = monotonicNowNs();
-            var gated_tensor_mut = gated_tensor;
-            var attn_res_mut = attn_res;
+            var gated_tensor_mut = try gated_tensor.readView();
+            defer gated_tensor_mut.deinit();
+            var attn_res_mut = try attn_res.readView();
+            defer attn_res_mut.deinit();
             if (!frame_active and try tryRawPostGateI2SResidualHost(
                 self,
                 try tensorHostConstPtr(&gated_tensor_mut),
@@ -30101,8 +30134,10 @@ pub fn runCompressedAttentionGatedPostGateQuantizedFfn(
             const out = try std.heap.c_allocator.alloc(f32, request.hidden_size);
             errdefer std.heap.c_allocator.free(out);
             const post_gate_direct_started_at = monotonicNowNs();
-            var gated_tensor_mut = gated_tensor;
-            var attn_res_mut = attn_res;
+            var gated_tensor_mut = try gated_tensor.readView();
+            defer gated_tensor_mut.deinit();
+            var attn_res_mut = try attn_res.readView();
+            defer attn_res_mut.deinit();
             if (!frame_active and try tryRawPostGateI2SResidualHost(
                 self,
                 try tensorHostConstPtr(&gated_tensor_mut),
@@ -30182,8 +30217,10 @@ fn runQuantizedGatedFfnResidualMetalTensor(
     if (@as(usize, @intCast(residual.dim(0))) != rows) return null;
     const output = try std.heap.c_allocator.alloc(f32, rows * request.hidden_size);
     errdefer std.heap.c_allocator.free(output);
-    var input_mut = input;
-    var residual_mut = residual;
+    var input_mut = try input.readView();
+    defer input_mut.deinit();
+    var residual_mut = try residual.readView();
+    defer residual_mut.deinit();
     if (!(try tryRawQuantizedGatedFfnResidualHost(self, .{
         .input = try tensorHostConstPtr(&input_mut),
         .residual = try tensorHostConstPtr(&residual_mut),
@@ -31286,9 +31323,9 @@ pub fn runCompressedAttentionGatedDecoderBlockQuantized(
             const arr_array = coerceExternalArrayHandle(arr);
             defer _ = c.backend_array_free(arr_array);
             var arr_shape_buf: [metal_tensor.max_dims]i32 = undefined;
-            const arr_mt = try metal_tensor_bridge.borrowBackendArrayAsMetalTensor(arr_array, arr_shape_buf[0..]);
-            var arr_mt_mut = arr_mt;
-            break :blk try MetalTensor.ownedCloneFrom(try tensorHostSlice(&arr_mt_mut), arr_mt.shape());
+            var arr_mt = try metal_tensor_bridge.borrowBackendArrayAsMetalTensor(arr_array, arr_shape_buf[0..]);
+            defer arr_mt.deinit();
+            break :blk try MetalTensor.ownedCloneFrom(try tensorHostSlice(&arr_mt), arr_mt.shape());
         },
         .direct_dense => return null,
     };
@@ -31455,7 +31492,8 @@ pub fn sliceRows(self: anytype, arr: MetalTensor, start_row: usize, row_count: u
 
     const buf = try std.heap.c_allocator.alloc(f32, row_count * row_width);
     errdefer std.heap.c_allocator.free(buf);
-    var arr_mut = arr;
+    var arr_mut = try arr.readView();
+    defer arr_mut.deinit();
     const src = try tensorHostSlice(&arr_mut);
     @memcpy(buf, src[start_row * row_width ..][0 .. row_count * row_width]);
     return MetalTensor.owned(buf, &shape);
@@ -31489,8 +31527,10 @@ pub fn concatenateRows(self: anytype, lhs: MetalTensor, rhs: MetalTensor) !Metal
 
     const buf = try std.heap.c_allocator.alloc(f32, total_rows * row_width);
     errdefer std.heap.c_allocator.free(buf);
-    var lhs_host = lhs;
-    var rhs_host = rhs;
+    var lhs_host = try lhs.readView();
+    defer lhs_host.deinit();
+    var rhs_host = try rhs.readView();
+    defer rhs_host.deinit();
     @memcpy(buf[0 .. lhs_rows * row_width], try tensorHostSlice(&lhs_host));
     @memcpy(buf[lhs_rows * row_width ..][0 .. rhs_rows * row_width], try tensorHostSlice(&rhs_host));
     return MetalTensor.owned(buf, &shape);
@@ -31661,10 +31701,12 @@ pub fn cloneGatheredSpanRows(
 ) !?struct { k: []f32, v: []f32 } {
     const entry = self.gathered_spans.getPtr(key) orelse return null;
     if (entry.token_count != token_count or entry.position_offset != position_offset) return null;
-    var k_tensor = entry.k;
+    var k_tensor = try entry.k.readView();
+    defer k_tensor.deinit();
     const k = try allocator.dupe(f32, try tensorHostSlice(&k_tensor));
     errdefer allocator.free(k);
-    var v_tensor = entry.v;
+    var v_tensor = try entry.v.readView();
+    defer v_tensor.deinit();
     const v = try allocator.dupe(f32, try tensorHostSlice(&v_tensor));
     return .{ .k = k, .v = v };
 }
@@ -31739,8 +31781,10 @@ fn maybeWriteCompressedBlockKvSuffix(request: anytype, k_suffix: MetalTensor, v_
         }
     }
 
-    var k_suffix_mut = k_suffix;
-    var v_suffix_mut = v_suffix;
+    var k_suffix_mut = try k_suffix.readView();
+    defer k_suffix_mut.deinit();
+    var v_suffix_mut = try v_suffix.readView();
+    defer v_suffix_mut.deinit();
     const k_rows = try tensorHostSlice(&k_suffix_mut);
     const v_rows = try tensorHostSlice(&v_suffix_mut);
 
@@ -31842,7 +31886,8 @@ pub fn encodeCompressedKeyRowsForRuntime(
     };
     if (key_row_bytes == 0) return error.UnsupportedKvHeadDim;
 
-    var k_mut = k;
+    var k_mut = try k.readView();
+    defer k_mut.deinit();
     const k_ptr = (try tensorHostSlice(&k_mut)).ptr;
     const encoded = try std.heap.c_allocator.alloc(u8, kv_tokens * key_row_bytes);
     errdefer std.heap.c_allocator.free(encoded);
@@ -32511,7 +32556,8 @@ pub fn runCompressedAttentionResidual(self: anytype, request: anytype, stats: an
         var cursor: usize = 0;
         for (pieces[0..piece_count]) |piece| {
             const piece_len: usize = @intCast(piece.dim(0));
-            var piece_mut = piece;
+            var piece_mut = try piece.readView();
+            defer piece_mut.deinit();
             @memcpy(concat_buf[cursor..][0 .. piece_len * row_width], try tensorHostSlice(&piece_mut));
             cursor += piece_len * row_width;
         }
@@ -32546,8 +32592,10 @@ pub fn runCompressedAttentionResidual(self: anytype, request: anytype, stats: an
     )) orelse return null;
     stats.compressed_block_span_prep_nanos += @intCast(monotonicNowNs() - span_prep_started_at);
 
-    var q_tensor = request.q;
-    var residual_tensor = request.residual;
+    var q_tensor = try request.q.readView();
+    defer q_tensor.deinit();
+    var residual_tensor = try request.residual.readView();
+    defer residual_tensor.deinit();
     const v_row_stride: usize = @intCast(gathered.v.dim(1));
     if (q_tensor.isDevice() and residual_tensor.isDevice() and gathered.k.isDevice() and gathered.v.isDevice()) {
         if (try decoderRuntimeApplyQuantizedKvAttention(self, .{
@@ -32660,7 +32708,8 @@ pub fn runCompressedAttentionResidual(self: anytype, request: anytype, stats: an
     };
     const encoded_ptr: [*c]const u8 = if (gathered.encoded_key) |encoded| encoded.ptr else null;
     const q_ptr = try tensorHostConstPtr(&q_tensor);
-    var gathered_v = gathered.v;
+    var gathered_v = try gathered.v.readView();
+    defer gathered_v.deinit();
     const v_ptr = try tensorHostConstPtr(&gathered_v);
     const residual_ptr = try tensorHostConstPtr(&residual_tensor);
 
@@ -33012,7 +33061,7 @@ pub fn runCompressedAttentionDenseDecoderBlockDirect(self: anytype, request: any
         return result;
     }
 
-    var q_tensor = maybe_q orelse blk: {
+    const q_source = maybe_q orelse blk: {
         const attention_input = maybe_attention_input orelse return null;
         const fused_qkv_linear_slot = maybe_fused_qkv_linear_slot orelse return null;
         if (attention_input.ndim() != 2 or @as(usize, @intCast(attention_input.dim(0))) != 1) return null;
@@ -33032,6 +33081,8 @@ pub fn runCompressedAttentionDenseDecoderBlockDirect(self: anytype, request: any
         projected_v = try fused_qkv.retainedView((q_dim + kv_dim) * @sizeOf(f32), kv_dim * @sizeOf(f32), &kv_shape);
         break :blk projected_q.?;
     };
+    var q_tensor = try q_source.readView();
+    defer q_tensor.deinit();
     var k_suffix_tensor = maybe_k_suffix orelse projected_k orelse return null;
     var v_suffix_tensor = maybe_v_suffix orelse projected_v orelse return null;
     if (q_tensor.ndim() != 2 or
@@ -33080,7 +33131,8 @@ pub fn runCompressedAttentionDenseDecoderBlockDirect(self: anytype, request: any
     )) orelse return null;
     stats.compressed_block_span_prep_nanos += @intCast(monotonicNowNs() - span_prep_started_at);
 
-    var residual_tensor = request.residual;
+    var residual_tensor = try request.residual.readView();
+    defer residual_tensor.deinit();
     const none = std.math.maxInt(usize);
     const v_row_stride: usize = @intCast(gathered.v.dim(1));
 
@@ -33152,7 +33204,8 @@ pub fn runCompressedAttentionDenseDecoderBlockDirect(self: anytype, request: any
         return device_output;
     }
 
-    var gathered_v = gathered.v;
+    var gathered_v = try gathered.v.readView();
+    defer gathered_v.deinit();
     const v_ptr = try tensorHostConstPtr(&gathered_v);
     ensureGatheredSpanHostEncoding(
         self,
@@ -33279,8 +33332,10 @@ pub fn runCompressedAttentionGatedDecoderBlockDirect(
     )) orelse return null;
     stats.compressed_block_span_prep_nanos += @intCast(monotonicNowNs() - span_prep_started_at);
 
-    var q_tensor = selected_qkv.q;
-    var residual_tensor = request.residual;
+    var q_tensor = try selected_qkv.q.readView();
+    defer q_tensor.deinit();
+    var residual_tensor = try request.residual.readView();
+    defer residual_tensor.deinit();
 
     const none = std.math.maxInt(usize);
     const v_row_stride: usize = @intCast(gathered.v.dim(1));
@@ -33426,9 +33481,11 @@ pub fn runCompressedAttentionGatedDecoderBlockDirect(
         return device_output;
     }
 
-    var gathered_v = gathered.v;
+    var gathered_v = try gathered.v.readView();
+    defer gathered_v.deinit();
     const v_ptr = try tensorHostConstPtr(&gathered_v);
-    var gathered_k = gathered.k;
+    var gathered_k = try gathered.k.readView();
+    defer gathered_k.deinit();
     const k_ptr = try tensorHostConstPtr(&gathered_k);
     const q_ptr = try tensorHostConstPtr(&q_tensor);
     const residual_ptr = try tensorHostConstPtr(&residual_tensor);
@@ -33604,9 +33661,9 @@ pub fn selectCompressedAttentionGatedQkv(
             defer _ = c.backend_array_free(q_projected);
             stats.compressed_block_project_nanos += @intCast(monotonicNowNs() - project_started_at);
             var q_scratch: [metal_tensor.max_dims]i32 = undefined;
-            const q_borrowed = try metal_tensor_bridge.borrowBackendArrayAsMetalTensor(q_projected, q_scratch[0..]);
-            var q_borrowed_mut = q_borrowed;
-            const q_owned = try MetalTensor.ownedCloneFrom(try tensorHostSlice(&q_borrowed_mut), q_borrowed.shape());
+            var q_borrowed = try metal_tensor_bridge.borrowBackendArrayAsMetalTensor(q_projected, q_scratch[0..]);
+            defer q_borrowed.deinit();
+            const q_owned = try MetalTensor.ownedCloneFrom(try tensorHostSlice(&q_borrowed), q_borrowed.shape());
             errdefer {
                 var q_mut = q_owned;
                 q_mut.deinit();
@@ -33686,23 +33743,23 @@ pub fn selectCompressedAttentionGatedQkv(
         var q_scratch: [metal_tensor.max_dims]i32 = undefined;
         var ks_scratch: [metal_tensor.max_dims]i32 = undefined;
         var vs_scratch: [metal_tensor.max_dims]i32 = undefined;
-        const q_borrowed = try metal_tensor_bridge.borrowBackendArrayAsMetalTensor(q_projected, q_scratch[0..]);
-        const k_borrowed = try metal_tensor_bridge.borrowBackendArrayAsMetalTensor(kv_projected.first, ks_scratch[0..]);
-        const v_borrowed = try metal_tensor_bridge.borrowBackendArrayAsMetalTensor(kv_projected.second, vs_scratch[0..]);
-        var q_borrowed_mut = q_borrowed;
-        const q_owned = try MetalTensor.ownedCloneFrom(try tensorHostSlice(&q_borrowed_mut), q_borrowed.shape());
+        var q_borrowed = try metal_tensor_bridge.borrowBackendArrayAsMetalTensor(q_projected, q_scratch[0..]);
+        defer q_borrowed.deinit();
+        var k_borrowed = try metal_tensor_bridge.borrowBackendArrayAsMetalTensor(kv_projected.first, ks_scratch[0..]);
+        defer k_borrowed.deinit();
+        var v_borrowed = try metal_tensor_bridge.borrowBackendArrayAsMetalTensor(kv_projected.second, vs_scratch[0..]);
+        defer v_borrowed.deinit();
+        const q_owned = try MetalTensor.ownedCloneFrom(try tensorHostSlice(&q_borrowed), q_borrowed.shape());
         errdefer {
             var q_mut = q_owned;
             q_mut.deinit();
         }
-        var k_borrowed_mut = k_borrowed;
-        const k_owned = try MetalTensor.ownedCloneFrom(try tensorHostSlice(&k_borrowed_mut), k_borrowed.shape());
+        const k_owned = try MetalTensor.ownedCloneFrom(try tensorHostSlice(&k_borrowed), k_borrowed.shape());
         errdefer {
             var k_mut = k_owned;
             k_mut.deinit();
         }
-        var v_borrowed_mut = v_borrowed;
-        const v_owned = try MetalTensor.ownedCloneFrom(try tensorHostSlice(&v_borrowed_mut), v_borrowed.shape());
+        const v_owned = try MetalTensor.ownedCloneFrom(try tensorHostSlice(&v_borrowed), v_borrowed.shape());
         return .{
             .source = .projected_qkv,
             .q = q_owned,
@@ -33860,7 +33917,8 @@ pub fn tryRawAttentionResidualHost(
     defer if (pre_normed_storage) |buf| std.heap.c_allocator.free(buf);
     const linear_input: [*c]const f32 = if (attention_pre_linear_rms_norm_slot) |norm_slot| blk: {
         if (!self.raw_rms_norm_slots_prepared[norm_slot] or self.raw_rms_norm_slot_hidden_sizes[norm_slot] != attention_input_size) return false;
-        var weight_tensor = self.raw_rms_norm_slot_weights[norm_slot] orelse return false;
+        var weight_tensor = try (self.raw_rms_norm_slot_weights[norm_slot] orelse return false).readView();
+        defer weight_tensor.deinit();
         const normed = try std.heap.c_allocator.alloc(f32, attention_input_size);
         pre_normed_storage = normed;
         @memcpy(normed, attention_input[0..attention_input_size]);
@@ -33894,7 +33952,8 @@ pub fn tryRawAttentionResidualHost(
 
     if (attention_post_linear_rms_norm_slot) |norm_slot| {
         if (!self.raw_rms_norm_slots_prepared[norm_slot] or self.raw_rms_norm_slot_hidden_sizes[norm_slot] != hidden_size) return false;
-        const weight_tensor = self.raw_rms_norm_slot_weights[norm_slot] orelse return false;
+        var weight_tensor = try (self.raw_rms_norm_slot_weights[norm_slot] orelse return false).readView();
+        defer weight_tensor.deinit();
         activations.rmsNorm(projected, (try tensorHostSlice(&weight_tensor))[0..hidden_size], hidden_size, eps);
     }
 
@@ -34883,9 +34942,11 @@ test "metal native quantized projections write in place into slab rows" {
     var q = (try tryApplyQuantizedRuntimeLinearQkvInto(&provider, 0, 1, 2, x, dim, dim, dim, k_view, v_view)) orelse return error.UnexpectedNull;
     defer q.deinit();
     {
-        var q_mut = q;
+        var q_mut = try q.readView();
+        defer q_mut.deinit();
         const q_host = try tensorHostSlice(&q_mut);
-        var slab_mut = slab;
+        var slab_mut = try slab.readView();
+        defer slab_mut.deinit();
         const slab_host = try tensorHostSlice(&slab_mut);
         try std.testing.expectEqual(@as(usize, slab_rows * dim), slab_host.len);
         for (0..dim) |col| {
@@ -34911,9 +34972,11 @@ test "metal native quantized projections write in place into slab rows" {
     defer q2.deinit();
     try std.testing.expect(try tryApplyQuantizedRuntimeLinearInto(&provider, 2, x, 1, dim, dim, row3_view));
     {
-        var q_mut = q2;
+        var q_mut = try q2.readView();
+        defer q_mut.deinit();
         const q_host = try tensorHostSlice(&q_mut);
-        var slab_mut = slab2;
+        var slab_mut = try slab2.readView();
+        defer slab_mut.deinit();
         const slab_host = try tensorHostSlice(&slab_mut);
         for (0..dim) |col| {
             try std.testing.expectApproxEqAbs(Ref.dot(&q_raw, dim, col, &x_data, false) + q_bias_data[col], q_host[col], 1e-3);
@@ -37601,7 +37664,8 @@ test "metal native q4_k gated ffn keeps planned frame coalesced" {
     }, &stats)) orelse return error.UnexpectedNull;
     defer expected_tensor.deinit();
 
-    var expected_mut = expected_tensor;
+    var expected_mut = try expected_tensor.readView();
+    defer expected_mut.deinit();
     const expected = try tensorHostSlice(&expected_mut);
     try std.testing.expectEqual(expected.len, output_host.len);
     for (expected, output_host, 0..) |exp, got, i| {
@@ -38023,7 +38087,8 @@ fn testQ4GatedFfnRows(comptime rows: usize, comptime invariant: bool, comptime h
     }
 
     var expected_mut = expected_tensor;
-    var direct_mut = direct;
+    var direct_mut = try direct.readView();
+    defer direct_mut.deinit();
     const expected = try tensorHostSlice(&expected_mut);
     const actual = try tensorHostSlice(&direct_mut);
     try std.testing.expectEqual(expected.len, actual.len);
@@ -38253,7 +38318,8 @@ test "metal native q4_0 gate up q6_k down device path matches decomposed" {
     );
 
     var expected_mut = expected_tensor;
-    var direct_mut = direct;
+    var direct_mut = try direct.readView();
+    defer direct_mut.deinit();
     const expected = try tensorHostSlice(&expected_mut);
     const actual = try tensorHostSlice(&direct_mut);
     try std.testing.expectEqual(expected.len, actual.len);
@@ -38453,7 +38519,8 @@ test "metal native q4_k gate up q6_k down device path matches decomposed" {
     try std.testing.expect(after_direct.q6_k_linear_reduce > before_direct.q6_k_linear_reduce);
 
     var expected_mut = expected_tensor;
-    var direct_mut = direct;
+    var direct_mut = try direct.readView();
+    defer direct_mut.deinit();
     const expected = try tensorHostSlice(&expected_mut);
     const actual = try tensorHostSlice(&direct_mut);
     try std.testing.expectEqual(expected.len, actual.len);
@@ -39243,9 +39310,11 @@ test "metal native activation device active frame keeps inline params stable" {
     applyActivationHost(&expected_multiplied, .quick_gelu);
     for (&expected_multiplied, up_data) |*lhs, rhs| lhs.* *= rhs;
 
-    var activated_mut = activated;
+    var activated_mut = try activated.readView();
+    defer activated_mut.deinit();
     const activated_actual = try tensorHostSlice(&activated_mut);
-    var multiplied_mut = multiplied;
+    var multiplied_mut = try multiplied.readView();
+    defer multiplied_mut.deinit();
     const multiplied_actual = try tensorHostSlice(&multiplied_mut);
     for (expected_activated, activated_actual, 0..) |exp, got, i| {
         if (!std.math.isFinite(got)) {
@@ -39958,7 +40027,8 @@ test "metal native PLE residual q4_k single row uses fused activation rhs" {
     defer expected_tensor.deinit();
 
     var fused_mut = fused;
-    var expected_mut = expected_tensor;
+    var expected_mut = try expected_tensor.readView();
+    defer expected_mut.deinit();
     const actual = try tensorHostSlice(&fused_mut);
     const expected = try tensorHostSlice(&expected_mut);
     try std.testing.expectEqual(expected.len, actual.len);

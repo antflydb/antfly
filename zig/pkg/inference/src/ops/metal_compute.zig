@@ -2539,28 +2539,29 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const byte_len = rows * hidden_size * @sizeOf(f32);
         const shape = [_]i32{ @intCast(rows), @intCast(hidden_size) };
 
-        var front_tensor = MetalTensor.deviceOwned(
-            runtime,
-            metal_runtime.hiddenStateBuffer(runtime, .front) orelse return error.UnexpectedNull,
-            0,
-            byte_len,
-            &shape,
-        );
-        errdefer front_tensor.deinit();
-        const front = try self.metalTensorBufWithHostMaterialization(front_tensor, false);
+        const front = front_view: {
+            var tensor = MetalTensor.deviceOwned(
+                runtime,
+                metal_runtime.hiddenStateBuffer(runtime, .front) orelse return error.UnexpectedNull,
+                0,
+                byte_len,
+                &shape,
+            );
+            errdefer tensor.deinit();
+            break :front_view try self.metalTensorBufWithHostMaterialization(tensor, false);
+        };
         errdefer freeOp(self, front);
-
-        var back_tensor = MetalTensor.deviceOwned(
-            runtime,
-            metal_runtime.hiddenStateBuffer(runtime, .back) orelse return error.UnexpectedNull,
-            0,
-            byte_len,
-            &shape,
-        );
-        errdefer back_tensor.deinit();
-        const back = try self.metalTensorBufWithHostMaterialization(back_tensor, false);
-        errdefer freeOp(self, back);
-
+        const back = back_view: {
+            var tensor = MetalTensor.deviceOwned(
+                runtime,
+                metal_runtime.hiddenStateBuffer(runtime, .back) orelse return error.UnexpectedNull,
+                0,
+                byte_len,
+                &shape,
+            );
+            errdefer tensor.deinit();
+            break :back_view try self.metalTensorBufWithHostMaterialization(tensor, false);
+        };
         return .{
             .front = front,
             .back = back,
@@ -3163,7 +3164,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             .allocator = self.allocator,
             .owned = false,
             .logical_shape = logical_shape,
-            .metal_tensor = tensor,
+            .metal_tensor = tensor_mut,
             .integer_storage = tensor.dtype != .f32,
             .resident_owner = self,
         };
@@ -3603,7 +3604,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         buf.view_base_offset = 0;
     }
 
-    fn logicalValueAtFlat(buf: *const Buf, flat: usize) !f32 {
+    fn logicalValueAtFlat(buf: *Buf, flat: usize) !f32 {
         if (buf.quantized_storage != null) return error.UnsupportedTensorType;
         // Resolve the raw physical bytes first; view metadata (if any)
         // then remaps the logical address into them. A metal-backed buf
@@ -3612,10 +3613,10 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         // fallbacks (hostFallbackBinary) then consumed a silently
         // PERMUTED operand (identical abs-sum, wrong order): the GLiNER2
         // LoRA batch-tile divergence class.
-        const source: []const f32 = if (buf.metal_tensor) |metal_tensor| blk: {
-            var tensor_mut = metal_tensor;
-            break :blk try tensor_mut.toHostSlice();
-        } else buf.data;
+        const source: []const f32 = if (buf.metal_tensor) |*metal_tensor|
+            try metal_tensor.toHostSlice()
+        else
+            buf.data;
         if (!hasHostView(buf)) {
             return source[wrapRepeatedBufferIndex(flat, source.len)];
         }
@@ -8853,6 +8854,27 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         return result;
     }
 
+    fn allocatePhysicalStorageOp(ctx: *anyopaque, byte_size: usize) anyerror!?CT {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        const runtime = self.provider_impl.raw_decode_runtime orelse return null;
+        if (byte_size == 0 or byte_size % @sizeOf(f32) != 0 or byte_size / @sizeOf(f32) > std.math.maxInt(i32)) return error.InvalidShape;
+        // Published storage must bypass frame/arena reuse even when the
+        // snapshot is encoded inside an active planned decoder frame.
+        const shape = [_]i32{@intCast(byte_size / @sizeOf(f32))};
+        var tensor = try MetalTensor.deviceAllocateFresh(@ptrCast(runtime), byte_size, .private, &shape);
+        errdefer tensor.deinit();
+        return self.ctFromOwnedMetalTensor(tensor);
+    }
+
+    fn readFloat32IntoOp(_: *anyopaque, tensor: CT, output: []f32) anyerror!bool {
+        const buf = toBuf(tensor);
+        if (buf.integer_storage or hasHostView(buf) or buf.lazy_multiply != null or buf.quantized_storage != null or buf.runtime_quantized_storage != null or buf.owned_quantized_storage != null) return false;
+        const source = buf.metal_tensor orelse return false;
+        if (!source.isDevice() or source.dtype != .f32 or source.deviceByteLen() != output.len * @sizeOf(f32)) return false;
+        try source.downloadBytesInto(std.mem.sliceAsBytes(output));
+        return true;
+    }
+
     fn toFloat32Op(ctx: *anyopaque, tensor: CT, allocator: std.mem.Allocator) anyerror![]f32 {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
         const buf = toBuf(tensor);
@@ -10398,14 +10420,11 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         var lazy_rhs_raw_abs: f64 = -1;
         if (buf.lazy_multiply) |*lazy| {
             phys_len = lazy.lhs.elemCount();
-            var lhs_copy = lazy.lhs;
-            var rhs_copy = lazy.rhs;
-            lazy_lhs_raw_abs = lhs_copy.debugRawDeviceAbsSum() catch -1;
-            lazy_rhs_raw_abs = rhs_copy.debugRawDeviceAbsSum() catch -1;
+            lazy_lhs_raw_abs = lazy.lhs.debugRawDeviceAbsSum() catch -1;
+            lazy_rhs_raw_abs = lazy.rhs.debugRawDeviceAbsSum() catch -1;
         } else if (buf.metal_tensor) |*metal_tensor| {
             phys_len = metal_tensor.elemCount();
-            var metal_copy = metal_tensor.*;
-            raw_dev_abs = metal_copy.debugRawDeviceAbsSum() catch -1;
+            raw_dev_abs = metal_tensor.debugRawDeviceAbsSum() catch -1;
         }
         var host_abs: f64 = -1;
         var first4: [4]f32 = .{ 0, 0, 0, 0 };
@@ -11287,6 +11306,19 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             @intCast(out_w),
         };
         return self.exportCtFromHostNative(&native_ctx, n_output, &out_shape);
+    }
+
+    fn relativePositionBiasOp(ctx: *anyopaque, weight: CT, q_len: usize, k_len: usize, num_heads: usize, num_buckets: usize, max_distance: usize, bidirectional: bool) !CT {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        var native_ctx = try HostFallbackNative.init(self.allocator);
+        defer native_ctx.deinit();
+        const shape = [_]i64{ @intCast(num_heads), @intCast(num_buckets) };
+        const native_weight = try self.importCtToHostNative(&native_ctx, weight, &shape);
+        defer native_ctx.cb.free(native_weight);
+        const output = try native_ctx.cb.relativePositionBias(native_weight, q_len, k_len, num_heads, num_buckets, max_distance, bidirectional);
+        defer native_ctx.cb.free(output);
+        const output_shape = [_]i64{ @intCast(num_heads), @intCast(q_len), @intCast(k_len) };
+        return self.exportCtFromHostNative(&native_ctx, output, &output_shape);
     }
 
     fn hostFallbackSoftmax(self: *MetalCompute, input: CT, last_dim_size: u32, log_softmax: bool) !CT {
@@ -14967,22 +14999,13 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         rhs_batch: []const u8,
     ) !?CT {
         if (lhs_batch.len != 0 or rhs_batch.len != 0) return null;
-        if (lhs_contracting.len != 1 or rhs_contracting.len != 1) return null;
-        if (lhs_shape.len != 2 or rhs_shape.len != 2) return null;
-        if (lhs_contracting[0] > 1 or (rhs_contracting[0] != 0 and rhs_contracting[0] != 1)) return null;
+        const geometry = ops.kernel_descriptor.kernel_geometry.planDenseDotGeneral(lhs_shape, rhs_shape, lhs_contracting, rhs_contracting, lhs_batch, rhs_batch) catch return null;
         if (bufHasAnyQuantizedStorage(toBuf(lhs)) or bufHasAnyQuantizedStorage(toBuf(rhs))) return null;
-        // A contraction over the lhs rows (a weight gradient, dY^T X) runs as
-        // a transposed-left MPS GEMM instead of materializing the transpose.
-        if (lhs_contracting[0] == 0) return self.tryDeviceDotGeneral2DTransposedLeft(lhs, rhs, lhs_shape, rhs_shape, rhs_contracting[0]);
-
-        const m_i64 = lhs_shape[0];
-        const k_i64 = lhs_shape[1];
-        const rhs_k_i64 = rhs_shape[rhs_contracting[0]];
-        const n_i64 = rhs_shape[1 - @as(usize, rhs_contracting[0])];
-        if (m_i64 <= 0 or k_i64 <= 0 or rhs_k_i64 <= 0 or n_i64 <= 0 or k_i64 != rhs_k_i64) return null;
-        const m: usize = @intCast(m_i64);
-        const n: usize = @intCast(n_i64);
-        const k: usize = @intCast(k_i64);
+        // Preserve the target's transposed-left MPS schedule for gradients.
+        if (!geometry.lhs_contract_last) return self.tryDeviceDotGeneral2DTransposedLeft(lhs, rhs, lhs_shape, rhs_shape, rhs_contracting[0]);
+        const m = geometry.m;
+        const n = geometry.n;
+        const k = geometry.k;
 
         var lhs_mt = try self.ownedDeviceMetalTensorFromCt(lhs);
         defer lhs_mt.deinit();
@@ -15061,41 +15084,16 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         lhs_batch: []const u8,
         rhs_batch: []const u8,
     ) !?CT {
-        if (lhs_contracting.len != 1 or rhs_contracting.len != 1) return null;
-        if (lhs_batch.len == 0 or lhs_batch.len != rhs_batch.len) return null;
-        if (lhs_shape.len != rhs_shape.len or lhs_shape.len != lhs_batch.len + 2) return null;
-        if (lhs_shape.len == 0 or lhs_shape.len > ml.graph.shape.max_rank) return null;
+        const geometry = ops.kernel_descriptor.kernel_geometry.planBatchedDotGeneral(lhs_shape, rhs_shape, lhs_contracting, rhs_contracting, lhs_batch, rhs_batch) catch return null;
+        // Metal's existing batched kernel expects the left contraction last.
+        // The separate transposed-left adapter remains responsible otherwise.
+        if (!geometry.lhs_contract_last) return null;
         if (bufHasAnyQuantizedStorage(toBuf(lhs)) or bufHasAnyQuantizedStorage(toBuf(rhs))) return null;
-
         const rank = lhs_shape.len;
-        const m_axis = rank - 2;
-        const k_axis = rank - 1;
-        if (lhs_contracting[0] != k_axis) return null;
-        const rhs_contract_axis: usize = rhs_contracting[0];
-        if (rhs_contract_axis != k_axis and rhs_contract_axis != m_axis) return null;
-
-        var batch_count: usize = 1;
         var output_shape_buf: [ml.graph.shape.max_rank]i32 = undefined;
-        for (lhs_batch, 0..) |lhs_axis_u8, idx| {
-            const lhs_axis: usize = lhs_axis_u8;
-            const rhs_axis: usize = rhs_batch[idx];
-            if (lhs_axis != idx or rhs_axis != idx) return null;
-            const dim = lhs_shape[idx];
-            if (dim <= 0 or rhs_shape[idx] != dim) return null;
-            batch_count = std.math.mul(usize, batch_count, @intCast(dim)) catch return null;
-            output_shape_buf[idx] = @intCast(dim);
-        }
-
-        const m_i64 = lhs_shape[m_axis];
-        const k_i64 = lhs_shape[k_axis];
-        const rhs_k_i64 = rhs_shape[rhs_contract_axis];
-        const n_i64 = rhs_shape[if (rhs_contract_axis == k_axis) m_axis else k_axis];
-        if (m_i64 <= 0 or k_i64 <= 0 or rhs_k_i64 <= 0 or n_i64 <= 0 or k_i64 != rhs_k_i64) return null;
-        const m: usize = @intCast(m_i64);
-        const n: usize = @intCast(n_i64);
-        const k: usize = @intCast(k_i64);
-        output_shape_buf[m_axis] = @intCast(m);
-        output_shape_buf[k_axis] = @intCast(n);
+        for (lhs_shape, 0..) |dim, axis| output_shape_buf[axis] = std.math.cast(i32, dim) orelse return null;
+        output_shape_buf[rank - 2] = std.math.cast(i32, geometry.m) orelse return null;
+        output_shape_buf[rank - 1] = std.math.cast(i32, geometry.n) orelse return null;
 
         var lhs_mt = try self.ownedDeviceMetalTensorFromCt(lhs);
         defer lhs_mt.deinit();
@@ -15108,11 +15106,11 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             self.provider_impl,
             lhs_mt,
             rhs_mt,
-            batch_count,
-            m,
-            n,
-            k,
-            @intCast(rhs_contract_axis - m_axis),
+            geometry.batch_count,
+            geometry.m,
+            geometry.n,
+            geometry.k,
+            @intFromBool(geometry.rhs_contract_last),
             output_shape_buf[0..rank],
         )) |tensor| return try self.ctFromOwnedMetalTensor(tensor);
         return null;
@@ -15306,6 +15304,23 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     /// session; identity-keyed device caches may retain a copy of it.
     fn immutableTable(buf: *const Buf) bool {
         return !buf.mutable_state and (buf.weight_handle_name != null or buf.lazy_entry != null or buf.boundary_immutable_f32);
+    }
+
+    fn embeddingLookupTensorOp(ctx: *anyopaque, weight: CT, indices: CT, total: usize, dim: usize) anyerror!?CT {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        const source = toBuf(weight);
+        const index = toBuf(indices);
+        if (!index.integer_storage or index.integer_bounds == null or source.integer_storage or source.quantized_storage != null or source.runtime_quantized_storage != null) return null;
+        if (dim == 0 or bufElemCount(index) != total or bufElemCount(source) % dim != 0) return error.InvalidTensorShape;
+        const rows = std.math.cast(i64, bufElemCount(source) / dim) orelse return error.InvalidTensorShape;
+        const bounds = index.integer_bounds.?;
+        if (bounds.minimum < 0 or bounds.maximum >= rows) return error.IndexOutOfBounds;
+        const shape = [_]i64{ rows, @intCast(dim) };
+        const stored = source.logical_shape orelse return null;
+        if (!std.mem.eql(i64, stored, &shape)) return null;
+        const gathered = try primGatherOp(self, weight, indices, 0, &shape);
+        defer freeOp(self, gathered);
+        return try primReshapeOp(self, gathered, &.{ @intCast(total), @intCast(dim) });
     }
 
     fn embeddingLookupOp(ctx: *anyopaque, weight: CT, ids: []const i64, total: usize, dim: usize) anyerror!CT {
@@ -20553,7 +20568,8 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     ) !void {
         const target = dumpDecodeKvLayerTarget() orelse return;
         if (target != layer_index) return;
-        var tensor_copy = tensor;
+        var tensor_copy = try tensor.readView();
+        defer tensor_copy.deinit();
         const values = try tensor_copy.toHostSlice();
         if (values.len < row_width or row_width == 0) return;
         const row_count = values.len / row_width;
@@ -20586,6 +20602,30 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         );
     }
 
+    fn cloneBackendKvEntry(
+        self: *MetalCompute,
+        k_rows: []const f32,
+        v_rows: []const f32,
+        token_count: usize,
+        row_width: usize,
+        position_offset: usize,
+        block_signature: u64,
+        write_serial: u64,
+    ) !BackendKvCacheEntry {
+        var k = try self.cloneMetalTensorRows(k_rows, token_count, row_width);
+        errdefer k.deinit();
+        const v = try self.cloneMetalTensorRows(v_rows, token_count, row_width);
+        return .{
+            .k = k,
+            .v = v,
+            .row_width = row_width,
+            .token_count = token_count,
+            .position_offset = position_offset,
+            .block_signature = block_signature,
+            .write_serial = write_serial,
+        };
+    }
+
     fn updateBackendKvLayerCache(
         self: *MetalCompute,
         key: BackendKvCacheKey,
@@ -20611,48 +20651,19 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 return false;
             }
             errdefer _ = self.backend_kv_cache.remove(key);
-            gop.value_ptr.* = .{
-                .k = try self.cloneMetalTensorRows(k_rows, kv_tokens, row_width),
-                .v = try self.cloneMetalTensorRows(v_rows, kv_tokens, row_width),
-                .row_width = row_width,
-                .token_count = kv_tokens,
-                .position_offset = kv_position_offset,
-                .block_signature = block_signature,
-                .write_serial = write_serial,
-            };
+            gop.value_ptr.* = try self.cloneBackendKvEntry(k_rows, v_rows, kv_tokens, row_width, kv_position_offset, block_signature, write_serial);
             return true;
         }
 
         const entry = gop.value_ptr;
-        if (entry.row_width != row_width) {
+        if (entry.row_width != row_width or query_sequence_len == kv_tokens) {
+            // A geometry change needs the complete history. Prepare both
+            // owners before retiring the old entry so a failed clone leaves
+            // the prior cache intact.
+            if (query_sequence_len != kv_tokens) return false;
+            const replacement = try self.cloneBackendKvEntry(k_rows, v_rows, kv_tokens, row_width, kv_position_offset, block_signature, write_serial);
             entry.deinit();
-            entry.* = .{
-                .k = try self.cloneMetalTensorRows(k_rows, kv_tokens, row_width),
-                .v = try self.cloneMetalTensorRows(v_rows, kv_tokens, row_width),
-                .row_width = row_width,
-                .token_count = kv_tokens,
-                .position_offset = kv_position_offset,
-                .block_signature = block_signature,
-                .write_serial = write_serial,
-            };
-            return true;
-        }
-
-        if (query_sequence_len == kv_tokens) {
-            var next_k = try self.cloneMetalTensorRows(k_rows, kv_tokens, row_width);
-            errdefer next_k.deinit();
-            var next_v = try self.cloneMetalTensorRows(v_rows, kv_tokens, row_width);
-            errdefer next_v.deinit();
-            entry.deinit();
-            entry.* = .{
-                .k = next_k,
-                .v = next_v,
-                .row_width = row_width,
-                .token_count = kv_tokens,
-                .position_offset = kv_position_offset,
-                .block_signature = block_signature,
-                .write_serial = write_serial,
-            };
+            entry.* = replacement;
             return true;
         }
 
@@ -20666,9 +20677,9 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             (block_signature == 0 or entry.block_signature == 0 or entry.block_signature == block_signature))
         {
             var k_suffix = try self.cloneMetalTensorRows(k_rows, query_sequence_len, row_width);
-            errdefer k_suffix.deinit();
+            defer k_suffix.deinit();
             var v_suffix = try self.cloneMetalTensorRows(v_rows, query_sequence_len, row_width);
-            errdefer v_suffix.deinit();
+            defer v_suffix.deinit();
             var next_k = try metal_runtime.concatenateRows(self.provider_impl, entry.k, k_suffix);
             errdefer next_k.deinit();
             var next_v = try metal_runtime.concatenateRows(self.provider_impl, entry.v, v_suffix);
@@ -24790,9 +24801,12 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         defer projected.deinit();
         if (canonical_attention_residual == null) try self.maybeDumpDecodeStageTensor("attn-proj", attention_layer_index, projected, request.hidden_size);
 
-        var attn_post: MetalTensor = undefined;
-        var attn_res: MetalTensor = undefined;
-        var ffn_normed: MetalTensor = undefined;
+        var attn_post = MetalTensor.empty;
+        defer attn_post.deinit();
+        var attn_res = MetalTensor.empty;
+        defer attn_res.deinit();
+        var ffn_normed = MetalTensor.empty;
+        defer ffn_normed.deinit();
         {
             const residual_scope = if (block_scope) false else self.beginActivePlannedComputeScopeIfPossible(.rms_norm, .ffn_norm);
             defer self.endActivePlannedComputeScope(residual_scope);
@@ -24813,7 +24827,6 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 }
             else
                 try projected.retainedCopy();
-            errdefer attn_post.deinit();
             if (canonical_attention_residual == null) try self.maybeDumpDecodeStageTensor("attn-post", attention_layer_index, attn_post, request.hidden_size);
             self.activePlannedComputeBarrier(residual_scope or block_scope);
             attn_res = if (canonical_attention_residual) |tensor|
@@ -24830,7 +24843,6 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                     );
                     return null;
                 };
-            errdefer attn_res.deinit();
             try self.maybeDumpDecodeStageTensor("attn-residual", attention_layer_index, attn_res, request.hidden_size);
             self.activePlannedComputeBarrier(residual_scope or block_scope);
             if (request.attention.mode == .dense_causal)
@@ -24851,9 +24863,6 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             };
             try self.maybeDumpDecodeStageTensor("ffn-norm", attention_layer_index, ffn_normed, request.hidden_size);
         }
-        defer attn_post.deinit();
-        defer attn_res.deinit();
-        defer ffn_normed.deinit();
 
         if (try metal_runtime.tryDeviceQuantizedGatedFfnResidual(self.provider_impl, .{
             .output = if (ffn_output_ct) |ct| try self.borrowedMetalTensorFromCt(ct) else @as(?MetalTensor, null),
@@ -35881,8 +35890,22 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         break :blk vt;
     };
 
+    const kernel_backend_impl = ops.KernelBackend{ .readFloat32Into = readFloat32IntoOp, .allocatePhysicalStorage = allocatePhysicalStorageOp };
+
     const vtable_impl = blk: {
         var vt = native_compute_mod.vtable_impl;
+        // Optional CPU hooks cast the context/tensors to native storage. New
+        // native optimizations must remain absent until Metal installs its own
+        // implementation, including metadata-only and consume/donation hooks.
+        for (@typeInfo(ops.ComputeBackend.VTable).@"struct".field_names) |field| {
+            if (@typeInfo(@FieldType(ops.ComputeBackend.VTable, field)) == .optional) @field(vt, field) = null;
+        }
+        vt.relativePositionBias = relativePositionBiasOp;
+        // Replace the target table as a unit; native tensor/storage callbacks
+        // cannot be inherited into Metal's representation.
+        vt.kernels = &kernel_backend_impl;
+        vt.hostFloat32Read = null;
+        vt.hostFloat32Write = null;
         vt.backendKind = backendKindOp;
         vt.deinitBackend = deinitBackendOp;
         vt.getIo = getIoOp;
@@ -35901,6 +35924,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         vt.fromFloat32Shape = fromFloat32ShapeOp;
         vt.fromInt32Shape = fromInt32ShapeOp;
         vt.fromConstantBytes = fromConstantBytesOp;
+        vt.embeddingLookupTensor = embeddingLookupTensorOp;
         vt.convertDType = convertDTypeOp;
         vt.cumulativeSum = cumulativeSumOp;
         vt.glinerBoundaryDevice = glinerBoundaryDeviceOp;
@@ -48263,4 +48287,426 @@ test "embeddinggemma2 video Metal input frame gathers projects and positions wit
             (positions[(row % 3) * 768 + h] + positions[(axis + (row / 3) % 3) * 768 + h]);
         try std.testing.expectApproxEqAbs(expected, v, 1e-6);
     }
+}
+
+test "Metal target kernel table never inherits native representation callbacks" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    const metal_functions = MetalCompute.vtable_impl.kernels.?;
+    const native_functions = native_compute_mod.vtable_impl.kernels.?;
+    inline for (@typeInfo(ops.KernelBackend).@"struct".field_names) |field| {
+        if (@field(metal_functions, field)) |implementation| {
+            if (@field(native_functions, field)) |native_implementation| try std.testing.expect(implementation != native_implementation);
+        }
+    }
+    try std.testing.expect(MetalCompute.vtable_impl.hostFloat32Read == null);
+    try std.testing.expect(MetalCompute.vtable_impl.hostFloat32Write == null);
+}
+
+test "metal_compute: small dense gated FFN preserves every row of paired projections" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    if (!metal_runtime_mod.metalDeviceAvailable()) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const hidden = 16;
+    const intermediate = 64;
+    var gate_weight: [intermediate * hidden]f32 = undefined;
+    var up_weight: [intermediate * hidden]f32 = undefined;
+    var down_weight: [hidden * intermediate]f32 = undefined;
+    for (&gate_weight, &up_weight, 0..) |*gate, *up, i| {
+        gate.* = @sin(@as(f32, @floatFromInt(i)) * 0.37) * 0.02;
+        up.* = @cos(@as(f32, @floatFromInt(i)) * 0.23) * 0.02;
+    }
+    for (&down_weight, 0..) |*value, i| value.* = @sin(@as(f32, @floatFromInt(i)) * 0.13) * 0.02;
+    var store = testMetalWeightStoreInit(a);
+    defer store.lazy_weights.deinit(a);
+    try addLegacyGlinerMpsTestWeight(&store, "gate.weight", &gate_weight, &.{ intermediate, hidden });
+    try addLegacyGlinerMpsTestWeight(&store, "up.weight", &up_weight, &.{ intermediate, hidden });
+    try addLegacyGlinerMpsTestWeight(&store, "down.weight", &down_weight, &.{ hidden, intermediate });
+    initPrefetchQueue(&store, a);
+    defer deinitPrefetchQueue(&store);
+    defer deinitSharedNativeProvider(&store);
+    var compute = try MetalCompute.init(a, &store, null);
+    defer compute.deinit();
+    const cb = compute.computeBackend();
+    const gate = try cb.getWeight("gate.weight");
+    defer cb.free(gate);
+    const up = try cb.getWeight("up.weight");
+    defer cb.free(up);
+    const down = try cb.getWeight("down.weight");
+    defer cb.free(down);
+    for ([_]usize{ 1, 4, 8 }) |rows| for ([_]bool{ false, true }) |flat| for ([_]bool{ false, true }) |framed| {
+        var values: [8 * hidden]f32 = undefined;
+        for (values[0 .. rows * hidden], 0..) |*value, i| value.* = @sin(@as(f32, @floatFromInt(i)) * 0.31);
+        const input_shape: []const i32 = if (flat) &.{@intCast(rows * hidden)} else &.{ @intCast(rows), hidden };
+        const input = try cb.fromFloat32Shape(values[0 .. rows * hidden], input_shape);
+        defer cb.free(input);
+        if (framed) try std.testing.expect(try cb.decoderRuntimeBeginFrame());
+        defer if (framed) cb.decoderRuntimeCancelFrame() catch {};
+        const pair = try cb.linearNoBiasPair(input, gate, up, rows, hidden, intermediate);
+        defer cb.free(pair.first);
+        defer cb.free(pair.second);
+        const activated = (try cb.activationMultiply(pair.first, pair.second, .silu)) orelse blk: {
+            const gate_activation = try cb.silu(pair.first);
+            defer cb.free(gate_activation);
+            break :blk try cb.multiply(gate_activation, pair.second);
+        };
+        defer cb.free(activated);
+        const output = try cb.linearNoBias(activated, down, rows, intermediate, hidden);
+        defer cb.free(output);
+        if (framed) try cb.decoderRuntimeSubmitAndWaitFrame();
+        const actual = try cb.toFloat32(output, a);
+        defer a.free(actual);
+        for (0..rows) |row| {
+            var gated: [intermediate]f64 = undefined;
+            for (0..intermediate) |column| {
+                var gate_value: f64 = 0;
+                var up_value: f64 = 0;
+                for (0..hidden) |inner| {
+                    gate_value += @as(f64, values[row * hidden + inner]) * gate_weight[column * hidden + inner];
+                    up_value += @as(f64, values[row * hidden + inner]) * up_weight[column * hidden + inner];
+                }
+                gated[column] = gate_value / (1 + @exp(-gate_value)) * up_value;
+            }
+            for (0..hidden) |column| {
+                var expected: f64 = 0;
+                for (0..intermediate) |inner| expected += gated[inner] * down_weight[column * intermediate + inner];
+                try std.testing.expectApproxEqAbs(@as(f32, @floatCast(expected)), actual[row * hidden + column], 1e-5);
+            }
+        }
+    };
+}
+
+test "metal_compute: checkpoint gated FFN matches CPU across prefill row counts" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    const path = @import("antfly_platform").env.getenv("ANTFLY_UNIFIED_DECODER_FIXTURE") orelse return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const factory = @import("../architectures/session_factory.zig");
+    var cpu_session = try factory.createNativeSession(a, path);
+    defer cpu_session.close();
+    var gpu_session = try factory.createMetalSession(a, path);
+    defer gpu_session.close();
+    factory.attachIo(cpu_session, std.testing.io);
+    factory.attachIo(gpu_session, std.testing.io);
+    var cpu = try factory.getComputeBackend(cpu_session, a);
+    defer cpu.deinit();
+    var gpu = try factory.getComputeBackend(gpu_session, a);
+    defer gpu.deinit();
+    var borrowed = try factory.getComputeBackendBorrowingSharedProvider(gpu_session, a);
+    defer borrowed.deinit();
+    const config = factory.getGptConfig(cpu_session).?;
+    const h = config.hidden_size;
+    const d = config.intermediate_size;
+    const values = try a.alloc(f32, 8 * h);
+    defer a.free(values);
+    for (values, 0..) |*value, i| value.* = @sin(@as(f32, @floatFromInt(i)) * 0.31);
+    const Case = struct {
+        fn run(cb: *const ops.ComputeBackend, input: []const f32, rows: usize, hidden: usize, intermediate: usize, model_config: @import("../models/gpt.zig").Config, semantic: bool, flat: bool) !CT {
+            const shape: []const i32 = if (flat) &.{@intCast(rows * hidden)} else &.{ @intCast(rows), @intCast(hidden) };
+            const uploaded = try cb.fromFloat32Shape(input, shape);
+            defer cb.free(uploaded);
+            const norm_weight = try cb.getWeight("model.layers.0.post_attention_layernorm.weight");
+            defer cb.free(norm_weight);
+            const x = try cb.rmsNorm(uploaded, norm_weight, hidden, 1e-6);
+            defer cb.free(x);
+            if (semantic) {
+                var name: [256]u8 = undefined;
+                return @import("../architectures/gpt.zig").debugFeedForward(cb, std.testing.allocator, model_config, x, rows, 0, &name, null);
+            }
+            const g = try cb.getWeight("model.layers.0.mlp.gate_proj.weight");
+            defer cb.free(g);
+            const u = try cb.getWeight("model.layers.0.mlp.up_proj.weight");
+            defer cb.free(u);
+            const w = try cb.getWeight("model.layers.0.mlp.down_proj.weight");
+            defer cb.free(w);
+            const pair = try cb.linearNoBiasPair(x, g, u, rows, hidden, intermediate);
+            defer cb.free(pair.first);
+            defer cb.free(pair.second);
+            const product = (try cb.activationMultiply(pair.first, pair.second, .silu)) orelse blk: {
+                const activated = try cb.silu(pair.first);
+                defer cb.free(activated);
+                break :blk try cb.multiply(activated, pair.second);
+            };
+            defer cb.free(product);
+            return cb.linearNoBias(product, w, rows, intermediate, hidden);
+        }
+    };
+    for ([_]bool{ false, true }) |prepared| {
+        if (prepared) _ = try @import("../backends/decoder_gated_runtime.zig").prepareDecodeRuntime(&gpu, a, config, 16, config.num_hidden_layers);
+        for ([_]*const ops.ComputeBackend{ &gpu, &borrowed }) |target| for ([_]usize{ 1, 4, 8 }) |rows| for ([_]bool{ false, true }) |semantic| for ([_]bool{ false, true }) |flat| {
+            const expected_tensor = try Case.run(&cpu, values[0 .. rows * h], rows, h, d, config, semantic, flat);
+            defer cpu.free(expected_tensor);
+            const actual_tensor = try Case.run(target, values[0 .. rows * h], rows, h, d, config, semantic, flat);
+            defer target.free(actual_tensor);
+            const expected = try cpu.toFloat32(expected_tensor, a);
+            defer a.free(expected);
+            const actual = try target.toFloat32(actual_tensor, a);
+            defer a.free(actual);
+            for (actual, expected) |value, reference| try std.testing.expectApproxEqAbs(reference, value, 1e-5);
+        };
+    }
+    const candidate = @import("../execution/model_candidate.zig");
+    var cpu_executor = (try candidate.createSessionExecutor(a, cpu_session, .{})).?;
+    defer cpu_executor.deinit();
+    var gpu_executor = (try candidate.createSessionExecutor(a, gpu_session, .{})).?;
+    defer gpu_executor.deinit();
+    var cpu_runtime = try cpu_executor.createRuntime(a);
+    defer cpu_runtime.deinit();
+    var gpu_runtime = try gpu_executor.createRuntime(a);
+    defer gpu_runtime.deinit();
+    _ = try gpu_runtime.prepare(a, .{ .kv_tokens_hint = 16 });
+    const request = @import("../graph/model_runtime.zig").PrefillRequest{ .input_ids = &.{ 1, 2, 3, 4, 5, 6, 7, 8 }, .seq_len = 8, .query_seq_len = 8, .attention_mode = .paged_prefill, .force_host_logits = true };
+    var reference_output = try cpu_runtime.prefill(a, request);
+    defer reference_output.deinit(a);
+    var actual_output = try gpu_runtime.prefill(a, request);
+    defer actual_output.deinit(a);
+    const reference_logits = try reference_output.hostLogits(a);
+    const actual_logits = try actual_output.hostLogits(a);
+    try std.testing.expectEqual(reference_logits.len, actual_logits.len);
+    for (actual_logits, reference_logits) |value, reference| try std.testing.expectApproxEqAbs(reference, value, 1e-3);
+    try gpu_runtime.reset();
+    var resident_request = request;
+    resident_request.force_host_logits = false;
+    var retained = try gpu_runtime.prefill(a, resident_request);
+    defer retained.deinit(a);
+    // This tiny geometry declines the specialized block route. Its host
+    // fallback must release both reserved hidden-state handles on every call.
+    const fallback_logits = try retained.hostLogits(a);
+    for (fallback_logits, reference_logits) |value, reference| try std.testing.expectApproxEqAbs(reference, value, 1e-3);
+}
+
+test "Metal target tensor table never inherits native context or storage callbacks" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    inline for (@typeInfo(ops.ComputeBackend.VTable).@"struct".field_names) |field| {
+        const native_implementation = @field(native_compute_mod.vtable_impl, field);
+        const target = @field(MetalCompute.vtable_impl, field);
+        switch (@typeInfo(@FieldType(ops.ComputeBackend.VTable, field))) {
+            .pointer => |pointer| if (@typeInfo(pointer.child) == .@"fn") {
+                if (target == native_implementation) std.debug.print("inherited native tensor callback: {s}\n", .{field});
+                try std.testing.expect(target != native_implementation);
+            },
+            .optional => |optional| if (@typeInfo(optional.child) == .pointer and @typeInfo(@typeInfo(optional.child).pointer.child) == .@"fn") {
+                if (target != null and native_implementation != null) {
+                    if (target.? == native_implementation.?) std.debug.print("inherited native tensor callback: {s}\n", .{field});
+                    try std.testing.expect(target.? != native_implementation.?);
+                }
+            },
+            else => {},
+        }
+    }
+}
+
+test "metal_compute: F32 pair entrypoints preserve all prefill rows and device offsets" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    if (!metal_runtime_mod.metalDeviceAvailable()) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var store = testMetalWeightStoreInit(a);
+    defer store.lazy_weights.deinit(a);
+    var compute = try MetalCompute.init(a, &store, null);
+    defer compute.deinit();
+    const cb = compute.computeBackend();
+    const runtime = compute.provider_impl.raw_decode_runtime.?;
+    const hidden = 16;
+    const width = 64;
+    var weights: [2][hidden * width]f32 = undefined;
+    var bias: [width]f32 = undefined;
+    for (&bias, 0..) |*v, i| v.* = @as(f32, @floatFromInt(i % 7)) * 0.001;
+    for (&weights, 0..) |*matrix, slot| {
+        for (matrix, 0..) |*v, i| v.* = @sin(@as(f32, @floatFromInt(i + slot * 31)) * 0.13) * 0.02;
+        // Explicitly prepare F32 slots: automatic upload policies may select
+        // F16, which previously hid this bug by declining the pair fast path.
+        try std.testing.expectEqual(@as(c_int, 0), metal_runtime_mod.termite_metal_decode_runtime_prepare_linear_owned_shared(runtime, slot, matrix, &bias, hidden, width));
+    }
+    for ([_]usize{ 1, 4, 8 }) |rows| {
+        var input_values: [8 * hidden]f32 = undefined;
+        for (input_values[0 .. rows * hidden], 0..) |*v, i| v.* = @sin(@as(f32, @floatFromInt(i)) * 0.31);
+        var host_outputs: [2][8 * width]f32 = @splat(@splat(std.math.nan(f32)));
+        try std.testing.expectEqual(@as(c_int, 0), metal_runtime_mod.termite_metal_decode_runtime_apply_linear_pair_slots(runtime, 0, 1, &input_values, rows, hidden, width, &host_outputs[0], &host_outputs[1]));
+        const uploaded = try cb.ensureDeviceResidentOwned(try cb.fromFloat32Shape(input_values[0 .. rows * hidden], &.{ @intCast(rows), hidden }));
+        defer cb.free(uploaded);
+        const device_input = try compute.borrowedMetalTensorFromCt(uploaded);
+        const offset = 64;
+        var first = try MetalTensor.deviceAllocate(runtime, offset + rows * width * 4, .private, &.{@intCast(offset / 4 + rows * width)});
+        defer first.deinit();
+        var second = try MetalTensor.deviceAllocate(runtime, offset + rows * width * 4, .private, &.{@intCast(offset / 4 + rows * width)});
+        defer second.deinit();
+        for ([_]bool{ false, true }) |framed| {
+            if (framed) try std.testing.expect(try cb.decoderRuntimeBeginFrame());
+            defer if (framed) cb.decoderRuntimeCancelFrame() catch {};
+            try std.testing.expectEqual(@as(c_int, 0), metal_runtime_mod.termite_metal_decode_runtime_apply_linear_pair_slots_device(runtime, 0, 1, device_input.deviceHandle(), device_input.deviceByteOffset(), rows, hidden, width, first.deviceHandle(), offset, second.deviceHandle(), offset));
+            if (framed) try cb.decoderRuntimeSubmitAndWaitFrame();
+            // The download mirror must be fresh for each execution.
+            first.invalidateHostMirror();
+            second.invalidateHostMirror();
+            const device_outputs = [2][]f32{ (try first.toHostSlice())[offset / 4 ..], (try second.toHostSlice())[offset / 4 ..] };
+            for (0..2) |slot| for (0..rows) |row| for (0..width) |column| {
+                var expected: f64 = bias[column];
+                for (0..hidden) |inner| expected += @as(f64, input_values[row * hidden + inner]) * weights[slot][column * hidden + inner];
+                const index = row * width + column;
+                try std.testing.expectApproxEqAbs(@as(f32, @floatCast(expected)), host_outputs[slot][index], 1e-6);
+                try std.testing.expectApproxEqAbs(@as(f32, @floatCast(expected)), device_outputs[slot][index], 1e-6);
+            };
+        }
+    }
+}
+
+test "metal_compute: relative position bias fallback owns native tensors and audits device reads" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    if (!metal_runtime_mod.metalDeviceAvailable()) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var store = testMetalWeightStoreInit(a);
+    defer store.lazy_weights.deinit(a);
+    var compute = try MetalCompute.init(a, &store, null);
+    defer compute.deinit();
+    const metal = compute.computeBackend();
+    var cpu_store = native_compute_mod.WeightStore{ .allocator = a, .resident_weights = .empty, .lazy_weights = .empty };
+    defer cpu_store.resident_weights.deinit(a);
+    defer cpu_store.lazy_weights.deinit(a);
+    var cpu_compute = native_compute_mod.NativeCompute.init(a, &cpu_store, null);
+    defer cpu_compute.deinit();
+    const cpu = cpu_compute.computeBackend();
+    var table: [2 * 32]f32 = undefined;
+    for (&table, 0..) |*v, i| v.* = @as(f32, @floatFromInt(i)) * 0.125;
+    const host = try cpu.fromFloat32Shape(&table, &.{ 2, 32 });
+    defer cpu.free(host);
+    const device = try metal.ensureDeviceResidentOwned(try metal.fromFloat32Shape(&table, &.{ 2, 32 }));
+    defer metal.free(device);
+    const transfer_audit = @import("../execution/transfer_audit.zig");
+    var strict = transfer_audit.Audit{ .forbid_device_host_access = true };
+    try transfer_audit.begin(&strict);
+    const rejected = metal.relativePositionBias(device, 4, 6, 2, 32, 128, true);
+    transfer_audit.end();
+    try std.testing.expectError(error.DeviceReadbackForbidden, rejected);
+    for ([_]bool{ false, true }) |bidirectional| {
+        const expected_tensor = try cpu.relativePositionBias(host, 4, 6, 2, 32, 128, bidirectional);
+        defer cpu.free(expected_tensor);
+        const actual_tensor = try metal.relativePositionBias(device, 4, 6, 2, 32, 128, bidirectional);
+        defer metal.free(actual_tensor);
+        const expected = try cpu.toFloat32(expected_tensor, a);
+        defer a.free(expected);
+        const actual = try metal.toFloat32(actual_tensor, a);
+        defer a.free(actual);
+        try std.testing.expectEqualSlices(f32, expected, actual);
+    }
+}
+
+test "metal_compute: reserved hidden pair has one metadata owner at every allocation failure" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    if (!metal_runtime_mod.metalDeviceAvailable()) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var store = testMetalWeightStoreInit(a);
+    defer store.lazy_weights.deinit(a);
+    var compute = try MetalCompute.init(a, &store, null);
+    defer compute.deinit();
+    const backend = compute.computeBackend();
+    for (0..5) |failure_index| {
+        var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = failure_index });
+        compute.allocator = failing.allocator();
+        defer compute.allocator = a;
+        const pair = MetalCompute.reserveHiddenStatePair(&backend, 4, 16);
+        if (failure_index < 4) {
+            try std.testing.expectError(error.OutOfMemory, pair);
+        } else {
+            const owned = (try pair).?;
+            backend.free(owned.front);
+            backend.free(owned.back);
+        }
+        try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+    }
+}
+
+test "metal_compute: row snapshots escape active frame scratch without activation readback" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    if (!metal_runtime_mod.metalDeviceAvailable()) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var store = testMetalWeightStoreInit(a);
+    defer store.lazy_weights.deinit(a);
+    var compute = try MetalCompute.init(a, &store, null);
+    defer compute.deinit();
+    const cb = compute.computeBackend();
+    const input = try cb.ensureDeviceResidentOwned(try cb.fromFloat32Shape(&.{ 1, 2, 3, 4 }, &.{ 2, 2 }));
+    defer cb.free(input);
+    const replacement = try cb.ensureDeviceResidentOwned(try cb.fromFloat32Shape(&.{ 9, 9, 9, 9 }, &.{ 2, 2 }));
+    defer cb.free(replacement);
+    const pair = (try MetalCompute.reserveHiddenStatePair(&cb, 2, 2)).?;
+    defer cb.free(pair.front);
+    defer cb.free(pair.back);
+    for ([_]bool{ false, true }) |framed| {
+        try std.testing.expect(try MetalCompute.copyTensorInto(&cb, input, pair.front));
+        const transfer_audit = @import("../execution/transfer_audit.zig");
+        var audit = transfer_audit.Audit{ .forbid_device_host_access = true };
+        try transfer_audit.begin(&audit);
+        var auditing = true;
+        defer if (auditing) transfer_audit.end();
+        if (framed) try std.testing.expect(try cb.decoderRuntimeBeginFrame());
+        defer if (framed) cb.decoderRuntimeCancelFrame() catch {};
+        const snapshot = try cb.snapshotRows2D(a, pair.front, 1, 1, 2);
+        defer cb.free(snapshot);
+        if (framed) try cb.decoderRuntimeSubmitAndWaitFrame();
+        try std.testing.expect(try MetalCompute.copyTensorInto(&cb, replacement, pair.front));
+        try std.testing.expectEqual(@as(u64, 0), audit.download_calls);
+        transfer_audit.end();
+        auditing = false;
+        const values = try cb.toFloat32(snapshot, a);
+        defer a.free(values);
+        try std.testing.expectEqualSlices(f32, &.{ 3, 4 }, values);
+    }
+}
+
+test "metal_compute: scoped reads release private mirrors and borrow existing caches" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    if (!metal_runtime_mod.metalDeviceAvailable()) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var store = testMetalWeightStoreInit(a);
+    defer store.lazy_weights.deinit(a);
+    var compute = try MetalCompute.init(a, &store, null);
+    defer compute.deinit();
+    const baseline = metal_tensor_mod.memoryStatsSnapshot().host_mirror_live_bytes;
+    {
+        const raw = compute.provider_impl.raw_decode_runtime orelse return error.SkipZigTest;
+        var tensor = try MetalTensor.deviceAllocate(@ptrCast(raw), 4 * @sizeOf(f32), .private, &.{4});
+        defer tensor.deinit();
+        const expected = [_]f32{ 1, 3, 5, 7 };
+        try tensor.uploadBytes(std.mem.asBytes(&expected));
+        for (0..8) |_| {
+            var view = try tensor.readView();
+            defer view.deinit();
+            try std.testing.expectEqualSlices(f32, &expected, try view.toHostSlice());
+            try std.testing.expectEqual(@as(usize, 0), tensor.len);
+        }
+        try std.testing.expectEqual(baseline, metal_tensor_mod.memoryStatsSnapshot().host_mirror_live_bytes);
+        const original = try tensor.toHostSlice();
+        const cached = metal_tensor_mod.memoryStatsSnapshot().host_mirror_live_bytes;
+        {
+            var view = try tensor.readView();
+            defer view.deinit();
+            const borrowed = try view.toHostSlice();
+            try std.testing.expectEqual(original.ptr, borrowed.ptr);
+            try std.testing.expectEqualSlices(f32, &expected, borrowed);
+        }
+        try std.testing.expectEqual(cached, metal_tensor_mod.memoryStatsSnapshot().host_mirror_live_bytes);
+        try std.testing.expectEqualSlices(f32, &expected, try tensor.toHostSlice());
+    }
+    try std.testing.expectEqual(baseline, metal_tensor_mod.memoryStatsSnapshot().host_mirror_live_bytes);
+}
+
+test "metal_compute: K V cache append preserves history across geometry declines" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    if (!metal_runtime_mod.metalDeviceAvailable()) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var store = testMetalWeightStoreInit(a);
+    defer store.lazy_weights.deinit(a);
+    var compute = try MetalCompute.init(a, &store, null);
+    defer compute.deinit();
+    const key = MetalCompute.BackendKvCacheKey{ .source_ptr_id = @intFromPtr(&compute), .sequence_id = 1, .layer_index = 0 };
+    try std.testing.expect(try compute.updateBackendKvLayerCache(key, &.{ 1, 2 }, &.{ 3, 4 }, 1, 1, 0, 2, 1));
+    try std.testing.expect(try compute.updateBackendKvLayerCache(key, &.{ 5, 6 }, &.{ 7, 8 }, 1, 2, 0, 2, 1));
+    const entry = compute.backend_kv_cache.getPtr(key).?;
+    try std.testing.expectEqualSlices(f32, &.{ 1, 2, 5, 6 }, try entry.k.toHostSlice());
+    try std.testing.expectEqualSlices(f32, &.{ 3, 4, 7, 8 }, try entry.v.toHostSlice());
+    const previous = entry.k.data;
+    try std.testing.expect(!try compute.updateBackendKvLayerCache(key, &.{9}, &.{10}, 1, 3, 0, 1, 1));
+    try std.testing.expectEqual(previous, entry.k.data);
+    try std.testing.expectEqual(@as(usize, 2), entry.token_count);
+    try std.testing.expect(try compute.updateBackendKvLayerCache(key, &.{ 9, 10, 11 }, &.{ 12, 13, 14 }, 3, 3, 0, 1, 1));
+    try std.testing.expectEqualSlices(f32, &.{ 9, 10, 11 }, try entry.k.toHostSlice());
+    try std.testing.expectEqualSlices(f32, &.{ 12, 13, 14 }, try entry.v.toHostSlice());
 }

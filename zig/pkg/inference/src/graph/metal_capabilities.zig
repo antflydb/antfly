@@ -20,6 +20,17 @@
 //! host-assisted diagnostics.
 
 const std = @import("std");
+const cost_model = @import("cost.zig");
+const nodeElementCost = cost_model.nodeElementCost;
+const tensorByteSize = cost_model.tensorByteSize;
+const descByteSize = cost_model.descByteSize;
+const nodeComputeCost = cost_model.nodeComputeCost;
+const dotGeneralCost = cost_model.dotGeneralCost;
+const mul3Cost = cost_model.mul3Cost;
+const checkedMul = cost_model.checkedMul;
+const checkedAdd = cost_model.checkedAdd;
+const nodeInputBytes = cost_model.nodeInputBytes;
+
 const ml = @import("ml");
 
 const contracts = @import("backend_contracts.zig");
@@ -423,13 +434,8 @@ fn metalDotGeneralHasResidentShape(query: CapabilityQuery) bool {
             quant_matmul.packedFormatDescriptor(rhs_desc.quant_format orelse return false).supported();
     };
     if (!rhs_dense_f32 and !rhs_quant) return false;
-    const m = positiveShapeDim(lhs_shape, 0) orelse return false;
-    const k = positiveShapeDim(lhs_shape, 1) orelse return false;
-    const rhs_axis: usize = @intCast(attrs.rhs_contracting[0]);
-    const rhs_k = positiveShapeDim(rhs_shape, rhs_axis) orelse return false;
-    const n = positiveShapeDim(rhs_shape, 1 - rhs_axis) orelse return false;
-    if (k != rhs_k) return false;
-    return output_shape.dim(0) == @as(i64, @intCast(m)) and output_shape.dim(1) == @as(i64, @intCast(n));
+    const geometry = @import("../ops/kernel_geometry.zig").planDenseDotGeneral(lhs_shape.dims[0..2], rhs_shape.dims[0..2], attrs.lhs_contracting[0..1], attrs.rhs_contracting[0..1], &.{}, &.{}) catch return false;
+    return output_shape.dim(0) == @as(i64, @intCast(geometry.m)) and output_shape.dim(1) == @as(i64, @intCast(geometry.n));
 }
 
 fn metalBatchedDotGeneralHasResidentShape(
@@ -442,25 +448,18 @@ fn metalBatchedDotGeneralHasResidentShape(
     const rank = lhs_shape.rank();
     if (rank == 0 or rank != rhs_shape.rank() or rank != output_shape.rank()) return false;
     if (attrs.num_batch == 0 or rank != attrs.num_batch + 2) return false;
-    const m_axis: u8 = @intCast(rank - 2);
-    const k_axis: u8 = @intCast(rank - 1);
-    if (attrs.lhs_contracting[0] != k_axis) return false;
-    if (attrs.rhs_contracting[0] != k_axis and attrs.rhs_contracting[0] != m_axis) return false;
-
-    for (0..attrs.num_batch) |idx| {
-        if (attrs.lhs_batch[idx] != idx or attrs.rhs_batch[idx] != idx) return false;
-        const dim = lhs_shape.dim(@intCast(idx));
-        if (dim <= 0 or rhs_shape.dim(@intCast(idx)) != dim or output_shape.dim(@intCast(idx)) != dim) return false;
-    }
-
-    const m = lhs_shape.dim(m_axis);
-    const k = lhs_shape.dim(k_axis);
-    const rhs_contract_axis = attrs.rhs_contracting[0];
-    const n_axis: u8 = if (rhs_contract_axis == k_axis) m_axis else k_axis;
-    const rhs_k = rhs_shape.dim(rhs_contract_axis);
-    const n = rhs_shape.dim(n_axis);
-    if (m <= 0 or k <= 0 or rhs_k <= 0 or n <= 0 or k != rhs_k) return false;
-    return output_shape.dim(m_axis) == m and output_shape.dim(k_axis) == n and
+    const geometry = @import("../ops/kernel_geometry.zig").planBatchedDotGeneral(
+        lhs_shape.dims[0..rank],
+        rhs_shape.dims[0..rank],
+        attrs.lhs_contracting[0..1],
+        attrs.rhs_contracting[0..1],
+        attrs.lhs_batch[0..attrs.num_batch],
+        attrs.rhs_batch[0..attrs.num_batch],
+    ) catch return false;
+    if (!geometry.lhs_contract_last) return false;
+    for (0..attrs.num_batch) |axis| if (output_shape.dims[axis] != lhs_shape.dims[axis]) return false;
+    return output_shape.dims[rank - 2] == @as(i64, @intCast(geometry.m)) and
+        output_shape.dims[rank - 1] == @as(i64, @intCast(geometry.n)) and
         shapeHasConcreteElements(lhs_shape) and shapeHasConcreteElements(rhs_shape) and shapeHasConcreteElements(output_shape);
 }
 
@@ -890,54 +889,6 @@ fn inputDesc(descs: []const ?contracts.TensorDesc, input_id: NodeId) ?contracts.
     return descs[index];
 }
 
-fn nodeComputeCost(graph: *const Graph, node_id: NodeId) u64 {
-    const n = graph.node(node_id);
-    return switch (n.op) {
-        .fused_linear, .fused_linear_no_bias, .fused_linear_no_bias_pair => |attrs| mul3Cost(attrs.rows, attrs.in_dim, attrs.out_dim),
-        .dot_general => |attrs| dotGeneralCost(graph, node_id, attrs) orelse nodeElementCost(graph, node_id),
-        else => nodeElementCost(graph, node_id),
-    };
-}
-
-fn dotGeneralCost(graph: *const Graph, node_id: NodeId, attrs: ml.graph.node.DotGeneralAttrs) ?u64 {
-    if (attrs.num_contracting != 1) return null;
-    const n = graph.node(node_id);
-    if (n.num_inputs < 2) return null;
-    const lhs = graph.node(n.inputs[0]).output_shape;
-    const lhs_axis = attrs.lhs_contracting[0];
-    if (lhs_axis >= lhs.rank()) return null;
-    const k = lhs.dims[lhs_axis];
-    if (k <= 0) return null;
-    return checkedMul(nodeElementCost(graph, node_id), @intCast(k));
-}
-
-fn nodeElementCost(graph: *const Graph, node_id: NodeId) u64 {
-    const shape = graph.node(node_id).output_shape;
-    const elems = shape.maxElements() orelse shape.numElements() orelse 1;
-    if (elems <= 0) return 1;
-    return @intCast(elems);
-}
-
-fn tensorByteSize(shape: ml.graph.Shape) u64 {
-    const elems = shape.maxElements() orelse shape.numElements() orelse 1;
-    if (elems <= 0) return @intCast(shape.dtype.byteSize());
-    return checkedMul(@intCast(elems), @intCast(shape.dtype.byteSize()));
-}
-
-fn descByteSize(desc: contracts.TensorDesc) u64 {
-    return tensorByteSize(desc.shape);
-}
-
-fn nodeInputBytes(query: CapabilityQuery) u64 {
-    const descs = query.tensor_descs orelse return 0;
-    const n = query.graph.node(query.node_id);
-    var total: u64 = 0;
-    for (n.getInputs()) |input_id| {
-        if (inputDesc(descs, input_id)) |desc| total = checkedAdd(total, descByteSize(desc));
-    }
-    return total;
-}
-
 fn metalHostTransferCost(query: CapabilityQuery) u64 {
     const descs = query.tensor_descs orelse return tensorByteSize(query.graph.node(query.node_id).output_shape);
     const n = query.graph.node(query.node_id);
@@ -1043,18 +994,6 @@ fn descIsMetalResident(desc: contracts.TensorDesc) bool {
 
 fn metalEstimatedCost(query: CapabilityQuery) u64 {
     return checkedAdd(nodeComputeCost(query.graph, query.node_id) / 16, metalHostTransferCost(query));
-}
-
-fn mul3Cost(a: u32, b: u32, c: u32) u64 {
-    return checkedMul(checkedMul(a, b), c);
-}
-
-fn checkedMul(a: u64, b: u64) u64 {
-    return std.math.mul(u64, a, b) catch std.math.maxInt(u64);
-}
-
-fn checkedAdd(a: u64, b: u64) u64 {
-    return std.math.add(u64, a, b) catch std.math.maxInt(u64);
 }
 
 const metalHostMatmulMinComputeCost: u64 = 128 * 1024;

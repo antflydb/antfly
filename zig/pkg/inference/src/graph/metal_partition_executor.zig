@@ -1189,7 +1189,7 @@ const ChunkLocalOutputPool = struct {
         if (slot.backend != .metal or slot.storage != .metal_buffer) return null;
         if (slot.allocation == buffer_plan_mod.invalid_allocation) return null;
         const boundary_node_id = node_ids[chunk_boundary_pos];
-        if (slot.last_use > @as(u32, @intCast(boundary_node_id))) return null;
+        if (slot.last_use > buffer_plan.positionForNode(boundary_node_id)) return null;
         if (valueReferencedAfterBoundary(graph, node_ids, chunk_boundary_pos, node_id)) return null;
         const allocation = buffer_plan.allocationForSlot(slot.id) orelse return null;
         if (!allocation.reusable or allocation.kind != .tensor) return null;
@@ -3586,7 +3586,7 @@ fn arenaAliasStillLive(
     if (alias_index >= last_use.len) return true;
     if (last_use[alias_index] == std.math.maxInt(u32)) return true;
     const slot = buffer_plan.slotForNode(alias_node) orelse return true;
-    if (slot.last_use >= @as(u32, @intCast(node_pos))) return true;
+    if (slot.last_use >= buffer_plan.positionForNode(current_node)) return true;
     if (last_use[alias_index] >= @as(u32, @intCast(current_node))) return true;
     if (valueReferencedAtOrAfterPosition(graph, node_ids, node_pos, alias_node)) return true;
     if (slot.roles.graph_output or slot.roles.partition_output or slot.roles.transfer_source) return true;
@@ -13732,18 +13732,7 @@ fn validatePartitionView(
     }
 }
 
-const RuntimeUnaryOp = enum {
-    negate,
-    sqrt,
-    rsqrt,
-    exp,
-    log,
-    sin,
-    cos,
-    tanh,
-    erf,
-    abs,
-};
+const RuntimeUnaryOp = ops_mod.kernel_descriptor.Unary;
 
 fn runtimeUnaryActivationKind(op: RuntimeUnaryOp) u32 {
     return switch (op) {
@@ -13757,6 +13746,7 @@ fn runtimeUnaryActivationKind(op: RuntimeUnaryOp) u32 {
         .tanh => 13,
         .erf => 14,
         .abs => 15,
+        .gelu, .gelu_exact, .relu, .silu => unreachable,
     };
 }
 
@@ -13785,6 +13775,7 @@ fn executeRuntimeUnary(
         .tanh => cb.primTanh(input),
         .erf => cb.primErf(input),
         .abs => cb.primAbs(input),
+        .gelu, .gelu_exact, .relu, .silu => unreachable,
     } catch |err| switch (err) {
         error.UnsupportedPrimitiveOp, error.UnsupportedShape, error.ShapeMismatch => null,
         else => return err,
@@ -13923,16 +13914,7 @@ fn tryExecuteMetalCommand(
             break :blk transposed;
         },
         .broadcast_in_dim => |attrs| try executeRuntimeBroadcast(cb, values, inputs, graph.node(inputs[0]).output_shape, attrs, output_hint),
-        .neg => try executeRuntimeUnary(cb, values, inputs, .negate, output_hint),
-        .sqrt => try executeRuntimeUnary(cb, values, inputs, .sqrt, output_hint),
-        .rsqrt => try executeRuntimeUnary(cb, values, inputs, .rsqrt, output_hint),
-        .exp => try executeRuntimeUnary(cb, values, inputs, .exp, output_hint),
-        .log => try executeRuntimeUnary(cb, values, inputs, .log, output_hint),
-        .sin => try executeRuntimeUnary(cb, values, inputs, .sin, output_hint),
-        .cos => try executeRuntimeUnary(cb, values, inputs, .cos, output_hint),
-        .tanh => try executeRuntimeUnary(cb, values, inputs, .tanh, output_hint),
-        .erf => try executeRuntimeUnary(cb, values, inputs, .erf, output_hint),
-        .abs => try executeRuntimeUnary(cb, values, inputs, .abs, output_hint),
+        .neg, .sqrt, .rsqrt, .exp, .log, .sin, .cos, .tanh, .erf, .abs => try executeRuntimeUnary(cb, values, inputs, ops_mod.kernel_descriptor.unary(n.op).?, output_hint),
         .slice => |attrs| try executeRuntimeSlice(graph, cb, values, inputs, attrs),
         .concat_prim => |attrs| try executeRuntimeConcatPrim(graph, cb, values, inputs, attrs),
         .gather => |attrs| try executeRuntimeGather(graph, cb, values, node_id, inputs, attrs, stats, resident_input_cache),
@@ -14353,21 +14335,9 @@ fn executeRuntimeEmbeddingLookup(
     exec_state: *interpreter.ExecState,
 ) !?CT {
     const weight = valueFor(values, inputs[0]) orelse return null;
-    var owned_ids: ?[]i64 = null;
-    defer if (owned_ids) |buf| std.heap.page_allocator.free(buf);
-    const ids = blk: {
-        if (graph.node(inputs[1]).op == .fused_from_float32) {
-            break :blk exec_state.options.embedding_ids orelse return error.MissingRuntimeInput;
-        }
-        const ids_ct = valueFor(values, inputs[1]) orelse return null;
-        const raw = try cb.toFloat32(ids_ct, std.heap.page_allocator);
-        defer std.heap.page_allocator.free(raw);
-        const converted = try std.heap.page_allocator.alloc(i64, raw.len);
-        for (converted, raw) |*dst, value| dst.* = @intFromFloat(@round(value));
-        owned_ids = converted;
-        break :blk converted;
-    };
-    return cb.embeddingLookup(weight, ids, attrs.total, attrs.dim) catch |err| switch (err) {
+    const indices = valueFor(values, inputs[1]) orelse return null;
+    const host_ids = if (graph.node(inputs[1]).op == .fused_from_float32) exec_state.options.embedding_ids orelse return error.MissingRuntimeInput else null;
+    return interpreter.executeEmbeddingLookup(cb, weight, indices, host_ids, attrs.total, attrs.dim) catch |err| switch (err) {
         error.UnsupportedOperation, error.UnsupportedPrimitiveOp, error.UnsupportedShape, error.ShapeMismatch => null,
         else => return err,
     };

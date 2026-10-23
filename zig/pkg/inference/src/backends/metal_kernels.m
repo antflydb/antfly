@@ -16895,69 +16895,74 @@ static void termite_metal_end_scoped_compute_encoder(id<MTLComputeCommandEncoder
     if (owned && encoder != nil) [encoder endEncoding];
 }
 
+// These C entry points are also called from Zig threads without an outer
+// Objective-C pool. Runtime fields retain active encoders; temporary driver
+// objects must drain at the call boundary, including early returns.
 int termite_metal_decode_runtime_begin_planned_compute_scope(termite_metal_decode_runtime *runtime, size_t source, size_t region) {
-    if (runtime == NULL) return -1;
-    if (runtime->active_frame_cb == nil) return -2;
-    if (source >= TERMITE_METAL_COMPUTE_COUNTER_COUNT) source = TERMITE_METAL_COMPUTE_SOURCE_OTHER;
-    if (region >= TERMITE_METAL_COMPUTE_REGION_COUNTER_COUNT) region = TERMITE_METAL_COMPUTE_REGION_OTHER;
-    if (region == TERMITE_METAL_COMPUTE_REGION_OTHER) region = termite_metal_default_compute_region_for_source(source);
+    @autoreleasepool {
+        if (runtime == NULL) return -1;
+        if (runtime->active_frame_cb == nil) return -2;
+        if (source >= TERMITE_METAL_COMPUTE_COUNTER_COUNT) source = TERMITE_METAL_COMPUTE_SOURCE_OTHER;
+        if (region >= TERMITE_METAL_COMPUTE_REGION_COUNTER_COUNT) region = TERMITE_METAL_COMPUTE_REGION_OTHER;
+        if (region == TERMITE_METAL_COMPUTE_REGION_OTHER) region = termite_metal_default_compute_region_for_source(source);
 
-    termite_metal_stage_sample_frame *stage_frame = &runtime->active_stage_sample;
-    const uint8_t stage_detail = termite_metal_stage_detail_for_region(runtime, region);
-    if (runtime->active_planned_compute_encoder != nil &&
-        stage_frame->selected != 0 && stage_frame->complete != 0 &&
-        stage_frame->reserved != 0 && stage_frame->has_current_bucket != 0 &&
-        stage_frame->current_bucket != stage_detail)
-    {
-        if (runtime->embedding_workspace_bounded) {
-            termite_metal_stage_timing_fail_frame(runtime, stage_frame, NULL);
-        } else {
-            termite_metal_decode_runtime_close_planned_compute_encoder_for_transition(runtime);
+        termite_metal_stage_sample_frame *stage_frame = &runtime->active_stage_sample;
+        const uint8_t stage_detail = termite_metal_stage_detail_for_region(runtime, region);
+        if (runtime->active_planned_compute_encoder != nil &&
+            stage_frame->selected != 0 && stage_frame->complete != 0 &&
+            stage_frame->reserved != 0 && stage_frame->has_current_bucket != 0 &&
+            stage_frame->current_bucket != stage_detail)
+        {
+            if (runtime->embedding_workspace_bounded) {
+                termite_metal_stage_timing_fail_frame(runtime, stage_frame, NULL);
+            } else {
+                termite_metal_decode_runtime_close_planned_compute_encoder_for_transition(runtime);
+            }
         }
-    }
 
-    if (runtime->active_planned_compute_encoder != nil) {
-        if (!termite_metal_should_coalesce_planned_compute_encoder(runtime)) return -3;
+        if (runtime->active_planned_compute_encoder != nil) {
+            if (!termite_metal_should_coalesce_planned_compute_encoder(runtime)) return -3;
+            runtime->active_planned_compute_scope_closed_for_encoder_transition = false;
+            runtime->active_planned_compute_source = source;
+            runtime->active_planned_compute_region = region;
+            runtime->active_frame_planned_compute_scope_count += 1;
+            runtime->active_frame_compute_source_counts[source] += 1;
+            runtime->active_frame_compute_region_counts[region] += 1;
+            runtime->active_frame_compute_region_source_counts[region][source] += 1;
+            termite_metal_stage_timing_sample_boundary(
+                runtime,
+                runtime->active_planned_compute_encoder,
+                stage_detail,
+                false);
+            return 0;
+        }
+
+        id<MTLComputeCommandEncoder> encoder = termite_metal_stage_timing_compute_encoder(
+            runtime,
+            runtime->active_frame_cb,
+            stage_detail,
+            termite_metal_concurrent_planned_dispatch_enabled(runtime));
+        if (encoder == nil) return -4;
+        if (termite_metal_trace_encoders_enabled()) fprintf(stderr, "metal_encoder_trace: planned scope open source=%zu region=%zu\n", source, region);
+        termite_metal_debug_dispatch_profile_install_on_encoder(encoder);
+        runtime->active_planned_compute_encoder = encoder;
         runtime->active_planned_compute_scope_closed_for_encoder_transition = false;
         runtime->active_planned_compute_source = source;
         runtime->active_planned_compute_region = region;
+        termite_metal_decode_runtime_reset_planned_compute_ranges(runtime);
+        runtime->compute_encoder_count += 1;
+        runtime->active_frame_compute_encoder_count += 1;
         runtime->active_frame_planned_compute_scope_count += 1;
         runtime->active_frame_compute_source_counts[source] += 1;
         runtime->active_frame_compute_region_counts[region] += 1;
         runtime->active_frame_compute_region_source_counts[region][source] += 1;
         termite_metal_stage_timing_sample_boundary(
             runtime,
-            runtime->active_planned_compute_encoder,
+            encoder,
             stage_detail,
             false);
         return 0;
     }
-
-    id<MTLComputeCommandEncoder> encoder = termite_metal_stage_timing_compute_encoder(
-        runtime,
-        runtime->active_frame_cb,
-        stage_detail,
-        termite_metal_concurrent_planned_dispatch_enabled(runtime));
-    if (encoder == nil) return -4;
-    if (termite_metal_trace_encoders_enabled()) fprintf(stderr, "metal_encoder_trace: planned scope open source=%zu region=%zu\n", source, region);
-    termite_metal_debug_dispatch_profile_install_on_encoder(encoder);
-    runtime->active_planned_compute_encoder = encoder;
-    runtime->active_planned_compute_scope_closed_for_encoder_transition = false;
-    runtime->active_planned_compute_source = source;
-    runtime->active_planned_compute_region = region;
-    termite_metal_decode_runtime_reset_planned_compute_ranges(runtime);
-    runtime->compute_encoder_count += 1;
-    runtime->active_frame_compute_encoder_count += 1;
-    runtime->active_frame_planned_compute_scope_count += 1;
-    runtime->active_frame_compute_source_counts[source] += 1;
-    runtime->active_frame_compute_region_counts[region] += 1;
-    runtime->active_frame_compute_region_source_counts[region][source] += 1;
-    termite_metal_stage_timing_sample_boundary(
-        runtime,
-        encoder,
-        stage_detail,
-        false);
-    return 0;
 }
 
 int termite_metal_decode_runtime_planned_compute_barrier(termite_metal_decode_runtime *runtime) {
@@ -17540,30 +17545,32 @@ static id<MTLComputeCommandEncoder> termite_metal_stage_timing_transition_a4b_de
 }
 
 int termite_metal_decode_runtime_end_planned_compute_scope(termite_metal_decode_runtime *runtime) {
-    if (runtime == NULL) return -1;
-    id<MTLComputeCommandEncoder> encoder = runtime->active_planned_compute_encoder;
-    if (encoder == nil) {
-        if (runtime->active_planned_compute_scope_closed_for_encoder_transition) {
+    @autoreleasepool {
+        if (runtime == NULL) return -1;
+        id<MTLComputeCommandEncoder> encoder = runtime->active_planned_compute_encoder;
+        if (encoder == nil) {
+            if (runtime->active_planned_compute_scope_closed_for_encoder_transition) {
+                runtime->active_planned_compute_scope_closed_for_encoder_transition = false;
+                runtime->active_planned_compute_source = TERMITE_METAL_COMPUTE_SOURCE_OTHER;
+                runtime->active_planned_compute_region = TERMITE_METAL_COMPUTE_REGION_OTHER;
+                return 0;
+            }
+            return -2;
+        }
+        if (termite_metal_should_coalesce_planned_compute_encoder(runtime)) {
             runtime->active_planned_compute_scope_closed_for_encoder_transition = false;
             runtime->active_planned_compute_source = TERMITE_METAL_COMPUTE_SOURCE_OTHER;
             runtime->active_planned_compute_region = TERMITE_METAL_COMPUTE_REGION_OTHER;
             return 0;
         }
-        return -2;
-    }
-    if (termite_metal_should_coalesce_planned_compute_encoder(runtime)) {
+        [encoder endEncoding];
+        runtime->active_planned_compute_encoder = nil;
+        termite_metal_decode_runtime_reset_planned_compute_ranges(runtime);
         runtime->active_planned_compute_scope_closed_for_encoder_transition = false;
         runtime->active_planned_compute_source = TERMITE_METAL_COMPUTE_SOURCE_OTHER;
         runtime->active_planned_compute_region = TERMITE_METAL_COMPUTE_REGION_OTHER;
         return 0;
     }
-    [encoder endEncoding];
-    runtime->active_planned_compute_encoder = nil;
-    termite_metal_decode_runtime_reset_planned_compute_ranges(runtime);
-    runtime->active_planned_compute_scope_closed_for_encoder_transition = false;
-    runtime->active_planned_compute_source = TERMITE_METAL_COMPUTE_SOURCE_OTHER;
-    runtime->active_planned_compute_region = TERMITE_METAL_COMPUTE_REGION_OTHER;
-    return 0;
 }
 
 static id<MTLBlitCommandEncoder> termite_metal_tracked_blit_command_encoder_for_runtime(termite_metal_decode_runtime *runtime, id<MTLCommandBuffer> command_buffer) {
@@ -18380,7 +18387,11 @@ static id<MTLDevice> termite_metal_shared_device(void) {
 // Video preparers retain it and own independent queues. Cold video requests
 // must be able to prepare before the first model backend has been constructed.
 void *termite_metal_video_preparation_device(void) {
-    return (__bridge void *)termite_metal_shared_device();
+    // The process-wide strong reference keeps this borrowed handle valid.
+    // Drain the ARC helper's temporary ownership even on a plain Zig thread.
+    @autoreleasepool {
+        return (__bridge void *)termite_metal_shared_device();
+    }
 }
 
 static id<MTLCommandBuffer> termite_metal_new_command_buffer(id<MTLCommandQueue> queue, const char *label_cstr) {
@@ -37497,7 +37508,7 @@ int termite_metal_decode_runtime_apply_linear_multi_row(
     }
 }
 
-int termite_metal_decode_runtime_apply_linear_multi_row_device(
+static int termite_metal_decode_runtime_encode_linear_multi_row_device(
     termite_metal_decode_runtime *runtime,
     size_t slot,
     void *input_handle,
@@ -37506,7 +37517,10 @@ int termite_metal_decode_runtime_apply_linear_multi_row_device(
     size_t in_dim,
     size_t out_dim,
     void *output_handle,
-    size_t output_offset
+    size_t output_offset,
+    id<MTLCommandBuffer> command_buffer,
+    bool frame_owned,
+    bool *used_mps
 ) {
     if (runtime == NULL || input_handle == NULL || output_handle == NULL) return -1;
     if (runtime->linear_multi_row_pipeline == nil || runtime->linear_bf16_multi_row_pipeline == nil || runtime->linear_f16_multi_row_pipeline == nil ||
@@ -37549,11 +37563,6 @@ int termite_metal_decode_runtime_apply_linear_multi_row_device(
             if (weight_bytes <= runtime->linear_weight_buffers[slot].length &&
                 bias_bytes <= runtime->linear_bias_buffers[slot].length)
             {
-                const bool frame_owned = (runtime->active_frame_cb == nil);
-                id<MTLCommandBuffer> command_buffer = frame_owned
-                    ? termite_metal_new_command_buffer(runtime->queue, __func__)
-                    : runtime->active_frame_cb;
-                if (command_buffer == nil) return -10;
                 MPSMatrixMultiplication *mm = termite_metal_decode_runtime_cached_mps_mm(runtime, slot, rows, in_dim, out_dim);
                 MPSMatrix *left = nil;
                 MPSMatrix *right = nil;
@@ -37603,31 +37612,18 @@ int termite_metal_decode_runtime_apply_linear_multi_row_device(
                     [bias_encoder endEncoding];
                 }
 
+                *used_mps = true;
                 if (!frame_owned) {
                     runtime->mps_dense_linear_active_frame_calls += 1;
                     runtime->active_frame_mps_dense_linear_count += 1;
-                    return 0;
+                } else {
+                    runtime->mps_dense_linear_standalone_calls += 1;
                 }
-                runtime->mps_dense_linear_standalone_calls += 1;
-                const uint64_t wait_start = termite_metal_clock_monotonic_nanos();
-                [command_buffer commit];
-                [command_buffer waitUntilCompleted];
-                const uint64_t wait_end = termite_metal_clock_monotonic_nanos();
-                if (wait_end > wait_start) runtime->mps_dense_linear_standalone_wait_nanos += wait_end - wait_start;
-                if (command_buffer.status == MTLCommandBufferStatusCompleted) {
-                    runtime->mps_dense_linear_standalone_gpu_nanos += termite_metal_command_buffer_gpu_elapsed_nanos(command_buffer);
-                    return 0;
-                }
-                return -12;
+                return 0;
             }
         }
         // Small F16 projections (including scalar scoring heads) use the
         // native F16 kernels below, preserving F32 inputs and accumulation.
-        const bool frame_owned = (runtime->active_frame_cb == nil);
-        id<MTLCommandBuffer> command_buffer = frame_owned
-            ? termite_metal_new_command_buffer(runtime->queue, __func__)
-            : runtime->active_frame_cb;
-        if (command_buffer == nil) return -10;
         if (!frame_owned) {
             if (termite_metal_decode_runtime_retain_frame_resource(runtime, input_buffer) != 0) return -10;
             if (termite_metal_decode_runtime_retain_frame_resource(runtime, output_buffer) != 0) return -10;
@@ -37706,10 +37702,51 @@ int termite_metal_decode_runtime_apply_linear_multi_row_device(
             [encoder dispatchThreads:MTLSizeMake(total, 1, 1) threadsPerThreadgroup:MTLSizeMake(thread_width, 1, 1)];
         }
         if (!planned_encoder) [encoder endEncoding];
-        if (!frame_owned) return 0;
-        [command_buffer commit];
-        [command_buffer waitUntilCompleted];
-        return command_buffer.status == MTLCommandBufferStatusCompleted ? 0 : -12;
+        return 0;
+    }
+}
+
+// Complete standalone dense work once, including MPS telemetry. Framed work
+// remains owned by the caller; encoding a pair never introduces another wait.
+static int termite_metal_decode_runtime_finish_linear_command_buffer(
+    termite_metal_decode_runtime *runtime,
+    id<MTLCommandBuffer> command_buffer,
+    bool frame_owned,
+    bool used_mps,
+    int failure_code
+) {
+    const uint64_t wait_start = used_mps && frame_owned ? termite_metal_clock_monotonic_nanos() : 0;
+    const int result = termite_metal_decode_runtime_finish_command_buffer(command_buffer, frame_owned, failure_code);
+    if (used_mps && frame_owned) {
+        const uint64_t wait_end = termite_metal_clock_monotonic_nanos();
+        if (wait_end > wait_start) runtime->mps_dense_linear_standalone_wait_nanos += wait_end - wait_start;
+        if (result == 0) runtime->mps_dense_linear_standalone_gpu_nanos += termite_metal_command_buffer_gpu_elapsed_nanos(command_buffer);
+    }
+    return result;
+}
+
+int termite_metal_decode_runtime_apply_linear_multi_row_device(
+    termite_metal_decode_runtime *runtime,
+    size_t slot,
+    void *input_handle,
+    size_t input_offset,
+    size_t rows,
+    size_t in_dim,
+    size_t out_dim,
+    void *output_handle,
+    size_t output_offset
+) {
+    if (runtime == NULL || input_handle == NULL || output_handle == NULL) return -1;
+    @autoreleasepool {
+        bool frame_owned = true;
+        id<MTLCommandBuffer> command_buffer = termite_metal_decode_runtime_command_buffer(runtime, __func__, &frame_owned);
+        if (command_buffer == nil) return -10;
+        bool used_mps = false;
+        const int rc = termite_metal_decode_runtime_encode_linear_multi_row_device(
+            runtime, slot, input_handle, input_offset, rows, in_dim, out_dim,
+            output_handle, output_offset, command_buffer, frame_owned, &used_mps);
+        if (rc != 0) return rc;
+        return termite_metal_decode_runtime_finish_linear_command_buffer(runtime, command_buffer, frame_owned, used_mps, -12);
     }
 }
 
@@ -41812,6 +41849,55 @@ int termite_metal_decode_runtime_apply_linear_bias_device(
     }
 }
 
+// Host and resident pair APIs share encoding, without duplicating shaders or
+// confusing the 1x parameter ABI with the multi-row ABI. Packed active-frame
+// pairs still use their existing packed GEMM/split implementation.
+static int termite_metal_decode_runtime_encode_linear_pair_slots(
+    termite_metal_decode_runtime *runtime,
+    const size_t slots[2],
+    id<MTLBuffer> input_buffer,
+    size_t input_offset,
+    size_t rows,
+    size_t in_dim,
+    size_t out_dim,
+    id<MTLBuffer> const outputs[2],
+    const size_t output_offsets[2],
+    id<MTLCommandBuffer> command_buffer,
+    bool frame_owned,
+    bool *used_mps
+) {
+    for (size_t i = 0; i < 2; ++i) {
+        if (rows > 1) {
+            const int rc = termite_metal_decode_runtime_encode_linear_multi_row_device(
+                runtime, slots[i], (__bridge void *)input_buffer, input_offset, rows, in_dim, out_dim,
+                (__bridge void *)outputs[i], output_offsets[i], command_buffer, frame_owned, used_mps);
+            if (rc != 0) return rc;
+            continue;
+        }
+        id<MTLComputeCommandEncoder> encoder = runtime->active_planned_compute_encoder;
+        const BOOL planned_encoder = (encoder != nil);
+        if (!planned_encoder) encoder = termite_metal_tracked_compute_command_encoder_for(command_buffer, TERMITE_METAL_COMPUTE_SOURCE_DENSE_LINEAR);
+        if (encoder == nil) return -13;
+        if (termite_metal_decode_runtime_prepare_planned_dense_linear_accesses(
+                runtime, input_buffer, input_offset, in_dim * sizeof(float),
+                runtime->linear_weight_buffers[slots[i]], runtime->linear_bias_buffers[slots[i]],
+                outputs[i], output_offsets[i], out_dim * sizeof(float), -13) != 0) return -13;
+        const termite_metal_apply_linear_params params = {
+            .in_dim = (uint32_t)in_dim,
+            .out_dim = (uint32_t)out_dim,
+        };
+        [encoder setComputePipelineState:runtime->linear_pipeline];
+        [encoder setBuffer:input_buffer offset:input_offset atIndex:0];
+        [encoder setBuffer:runtime->linear_weight_buffers[slots[i]] offset:0 atIndex:1];
+        [encoder setBuffer:runtime->linear_bias_buffers[slots[i]] offset:0 atIndex:2];
+        [encoder setBuffer:outputs[i] offset:output_offsets[i] atIndex:3];
+        [encoder setBytes:&params length:sizeof(params) atIndex:4];
+        [encoder dispatchThreads:MTLSizeMake(out_dim, 1, 1) threadsPerThreadgroup:MTLSizeMake(termite_metal_thread_width(runtime->linear_pipeline, out_dim), 1, 1)];
+        if (!planned_encoder) [encoder endEncoding];
+    }
+    return 0;
+}
+
 int termite_metal_decode_runtime_apply_linear_pair_slots(
     termite_metal_decode_runtime *runtime,
     size_t slot_a,
@@ -41833,6 +41919,7 @@ int termite_metal_decode_runtime_apply_linear_pair_slots(
     if (runtime->linear_in_dims[slot_a] != in_dim || runtime->linear_in_dims[slot_b] != in_dim) return -6;
     if (runtime->linear_out_dims[slot_a] != out_dim || runtime->linear_out_dims[slot_b] != out_dim) return -7;
     if (rows == 0 || rows > UINT32_MAX || in_dim > UINT32_MAX || out_dim > UINT32_MAX) return -8;
+    if (termite_metal_decode_runtime_host_io_sync(runtime) != 0) return -10;
     @autoreleasepool {
         const size_t input_bytes = rows * in_dim * sizeof(float);
         const size_t output_bytes = rows * out_dim * sizeof(float);
@@ -41844,43 +41931,18 @@ int termite_metal_decode_runtime_apply_linear_pair_slots(
         if (output_b_buffer == nil) output_b_buffer = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:output_b length:output_bytes options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
         if (input_buffer == nil || output_a_buffer == nil || output_b_buffer == nil) return -9;
 
-        termite_metal_apply_linear_params params = {
-            .in_dim = (uint32_t)in_dim,
-            .out_dim = (uint32_t)out_dim,
-        };
-
         id<MTLCommandBuffer> command_buffer = termite_metal_new_command_buffer(runtime->queue, __func__);
         if (command_buffer == nil) return -10;
-
-        id<MTLComputeCommandEncoder> encoder_a = termite_metal_tracked_compute_command_encoder(command_buffer);
-        if (encoder_a == nil) return -11;
-        [encoder_a setComputePipelineState:runtime->linear_pipeline];
-        [encoder_a setBuffer:input_buffer offset:0 atIndex:0];
-        [encoder_a setBuffer:runtime->linear_weight_buffers[slot_a] offset:0 atIndex:1];
-        [encoder_a setBuffer:runtime->linear_bias_buffers[slot_a] offset:0 atIndex:2];
-        [encoder_a setBuffer:output_a_buffer offset:0 atIndex:3];
-        [encoder_a setBytes:&params length:sizeof(params) atIndex:4];
-        const size_t total = rows * out_dim;
-        NSUInteger thread_width = runtime->linear_pipeline.maxTotalThreadsPerThreadgroup;
-        if (thread_width == 0) thread_width = 64;
-        if (thread_width > total && total > 0) thread_width = total;
-        [encoder_a dispatchThreads:MTLSizeMake(total, 1, 1) threadsPerThreadgroup:MTLSizeMake(thread_width, 1, 1)];
-        [encoder_a endEncoding];
-
-        id<MTLComputeCommandEncoder> encoder_b = termite_metal_tracked_compute_command_encoder(command_buffer);
-        if (encoder_b == nil) return -12;
-        [encoder_b setComputePipelineState:runtime->linear_pipeline];
-        [encoder_b setBuffer:input_buffer offset:0 atIndex:0];
-        [encoder_b setBuffer:runtime->linear_weight_buffers[slot_b] offset:0 atIndex:1];
-        [encoder_b setBuffer:runtime->linear_bias_buffers[slot_b] offset:0 atIndex:2];
-        [encoder_b setBuffer:output_b_buffer offset:0 atIndex:3];
-        [encoder_b setBytes:&params length:sizeof(params) atIndex:4];
-        [encoder_b dispatchThreads:MTLSizeMake(total, 1, 1) threadsPerThreadgroup:MTLSizeMake(thread_width, 1, 1)];
-        [encoder_b endEncoding];
-
-        [command_buffer commit];
-        [command_buffer waitUntilCompleted];
-        if (command_buffer.status != MTLCommandBufferStatusCompleted) return -13;
+        const size_t slots[2] = {slot_a, slot_b};
+        id<MTLBuffer> const outputs[2] = {output_a_buffer, output_b_buffer};
+        const size_t offsets[2] = {0, 0};
+        bool used_mps = false;
+        const int rc = termite_metal_decode_runtime_encode_linear_pair_slots(
+            runtime, slots, input_buffer, 0, rows, in_dim, out_dim, outputs, offsets,
+            command_buffer, true, &used_mps);
+        if (rc != 0) return rc;
+        const int result = termite_metal_decode_runtime_finish_linear_command_buffer(runtime, command_buffer, true, used_mps, -13);
+        if (result != 0) return result;
         // newBufferWithBytes (the non-page-aligned fallback) snapshots the caller's
         // buffer instead of aliasing it, so results must be copied back after the wait.
         if (output_a_buffer.contents != (void *)output_a) memcpy(output_a, output_a_buffer.contents, output_bytes);
@@ -41923,70 +41985,18 @@ int termite_metal_decode_runtime_apply_linear_pair_slots_device(
         if (output_a_offset + output_bytes > output_a_buffer.length) return -10;
         if (output_b_offset + output_bytes > output_b_buffer.length) return -11;
 
-        termite_metal_apply_linear_params params = {
-            .in_dim = (uint32_t)in_dim,
-            .out_dim = (uint32_t)out_dim,
-        };
-
         bool frame_owned = true;
         id<MTLCommandBuffer> command_buffer = termite_metal_decode_runtime_command_buffer(runtime, __func__, &frame_owned);
         if (command_buffer == nil) return -12;
-
-        id<MTLComputeCommandEncoder> encoder_a = runtime->active_planned_compute_encoder;
-        const BOOL planned_encoder = (encoder_a != nil);
-        if (!planned_encoder) {
-            encoder_a = termite_metal_tracked_compute_command_encoder_for(command_buffer, TERMITE_METAL_COMPUTE_SOURCE_DENSE_LINEAR);
-        }
-        if (encoder_a == nil) return -13;
-        if (termite_metal_decode_runtime_prepare_planned_dense_linear_accesses(
-                runtime,
-                input_buffer,
-                input_offset,
-                input_bytes,
-                runtime->linear_weight_buffers[slot_a],
-                runtime->linear_bias_buffers[slot_a],
-                output_a_buffer,
-                output_a_offset,
-                output_bytes,
-                -13) != 0) return -13;
-        [encoder_a setComputePipelineState:runtime->linear_pipeline];
-        [encoder_a setBuffer:input_buffer offset:input_offset atIndex:0];
-        [encoder_a setBuffer:runtime->linear_weight_buffers[slot_a] offset:0 atIndex:1];
-        [encoder_a setBuffer:runtime->linear_bias_buffers[slot_a] offset:0 atIndex:2];
-        [encoder_a setBuffer:output_a_buffer offset:output_a_offset atIndex:3];
-        [encoder_a setBytes:&params length:sizeof(params) atIndex:4];
-        const size_t total = rows * out_dim;
-        NSUInteger thread_width = runtime->linear_pipeline.maxTotalThreadsPerThreadgroup;
-        if (thread_width == 0) thread_width = 64;
-        if (thread_width > total && total > 0) thread_width = total;
-        [encoder_a dispatchThreads:MTLSizeMake(total, 1, 1) threadsPerThreadgroup:MTLSizeMake(thread_width, 1, 1)];
-        if (!planned_encoder) [encoder_a endEncoding];
-
-        id<MTLComputeCommandEncoder> encoder_b = planned_encoder
-            ? encoder_a
-            : termite_metal_tracked_compute_command_encoder_for(command_buffer, TERMITE_METAL_COMPUTE_SOURCE_DENSE_LINEAR);
-        if (encoder_b == nil) return -14;
-        if (termite_metal_decode_runtime_prepare_planned_dense_linear_accesses(
-                runtime,
-                input_buffer,
-                input_offset,
-                input_bytes,
-                runtime->linear_weight_buffers[slot_b],
-                runtime->linear_bias_buffers[slot_b],
-                output_b_buffer,
-                output_b_offset,
-                output_bytes,
-                -14) != 0) return -14;
-        [encoder_b setComputePipelineState:runtime->linear_pipeline];
-        [encoder_b setBuffer:input_buffer offset:input_offset atIndex:0];
-        [encoder_b setBuffer:runtime->linear_weight_buffers[slot_b] offset:0 atIndex:1];
-        [encoder_b setBuffer:runtime->linear_bias_buffers[slot_b] offset:0 atIndex:2];
-        [encoder_b setBuffer:output_b_buffer offset:output_b_offset atIndex:3];
-        [encoder_b setBytes:&params length:sizeof(params) atIndex:4];
-        [encoder_b dispatchThreads:MTLSizeMake(total, 1, 1) threadsPerThreadgroup:MTLSizeMake(thread_width, 1, 1)];
-        if (!planned_encoder) [encoder_b endEncoding];
-
-        return termite_metal_decode_runtime_finish_command_buffer(command_buffer, frame_owned, -15);
+        const size_t slots[2] = {slot_a, slot_b};
+        id<MTLBuffer> const outputs[2] = {output_a_buffer, output_b_buffer};
+        const size_t offsets[2] = {output_a_offset, output_b_offset};
+        bool used_mps = false;
+        const int rc = termite_metal_decode_runtime_encode_linear_pair_slots(
+            runtime, slots, input_buffer, input_offset, rows, in_dim, out_dim, outputs, offsets,
+            command_buffer, frame_owned, &used_mps);
+        if (rc != 0) return rc;
+        return termite_metal_decode_runtime_finish_linear_command_buffer(runtime, command_buffer, frame_owned, used_mps, -15);
     }
 }
 
@@ -44638,35 +44648,37 @@ int termite_metal_decode_runtime_apply_ple_residual_q8_0_device(
     void *output_handle,
     size_t output_offset
 ) {
-    if (runtime == NULL) return -1;
-    const bool frame_owned = (runtime->active_frame_cb == nil);
-    id<MTLCommandBuffer> command_buffer = frame_owned
-        ? termite_metal_new_command_buffer(runtime->queue, __func__)
-        : runtime->active_frame_cb;
-    if (command_buffer == nil) return -14;
-    const int rc = termite_metal_encode_ple_residual_q8_0_device(
-        runtime,
-        TERMITE_METAL_QUANT_FORMAT_Q8_0,
-        command_buffer,
-        hidden_handle,
-        hidden_offset,
-        ple_handle,
-        ple_offset,
-        gate_linear_slot,
-        proj_linear_slot,
-        post_norm_slot,
-        rows,
-        hidden_size,
-        ple_hidden_size,
-        eps,
-        activation_kind,
-        0,
-        1.0f,
-        output_handle,
-        output_offset
-    );
-    if (rc != 0) return rc;
-    return termite_metal_decode_runtime_finish_command_buffer(command_buffer, frame_owned, -21);
+    @autoreleasepool {
+        if (runtime == NULL) return -1;
+        const bool frame_owned = (runtime->active_frame_cb == nil);
+        id<MTLCommandBuffer> command_buffer = frame_owned
+            ? termite_metal_new_command_buffer(runtime->queue, __func__)
+            : runtime->active_frame_cb;
+        if (command_buffer == nil) return -14;
+        const int rc = termite_metal_encode_ple_residual_q8_0_device(
+            runtime,
+            TERMITE_METAL_QUANT_FORMAT_Q8_0,
+            command_buffer,
+            hidden_handle,
+            hidden_offset,
+            ple_handle,
+            ple_offset,
+            gate_linear_slot,
+            proj_linear_slot,
+            post_norm_slot,
+            rows,
+            hidden_size,
+            ple_hidden_size,
+            eps,
+            activation_kind,
+            0,
+            1.0f,
+            output_handle,
+            output_offset
+        );
+        if (rc != 0) return rc;
+        return termite_metal_decode_runtime_finish_command_buffer(command_buffer, frame_owned, -21);
+    }
 }
 
 int termite_metal_decode_runtime_apply_ple_residual_quantized_device(
@@ -44687,35 +44699,37 @@ int termite_metal_decode_runtime_apply_ple_residual_quantized_device(
     void *output_handle,
     size_t output_offset
 ) {
-    if (runtime == NULL) return -1;
-    const bool frame_owned = (runtime->active_frame_cb == nil);
-    id<MTLCommandBuffer> command_buffer = frame_owned
-        ? termite_metal_new_command_buffer(runtime->queue, __func__)
-        : runtime->active_frame_cb;
-    if (command_buffer == nil) return -14;
-    const int rc = termite_metal_encode_ple_residual_q8_0_device(
-        runtime,
-        ple_quant_format,
-        command_buffer,
-        hidden_handle,
-        hidden_offset,
-        ple_handle,
-        ple_offset,
-        gate_linear_slot,
-        proj_linear_slot,
-        post_norm_slot,
-        rows,
-        hidden_size,
-        ple_hidden_size,
-        eps,
-        activation_kind,
-        0,
-        1.0f,
-        output_handle,
-        output_offset
-    );
-    if (rc != 0) return rc;
-    return termite_metal_decode_runtime_finish_command_buffer(command_buffer, frame_owned, -21);
+    @autoreleasepool {
+        if (runtime == NULL) return -1;
+        const bool frame_owned = (runtime->active_frame_cb == nil);
+        id<MTLCommandBuffer> command_buffer = frame_owned
+            ? termite_metal_new_command_buffer(runtime->queue, __func__)
+            : runtime->active_frame_cb;
+        if (command_buffer == nil) return -14;
+        const int rc = termite_metal_encode_ple_residual_q8_0_device(
+            runtime,
+            ple_quant_format,
+            command_buffer,
+            hidden_handle,
+            hidden_offset,
+            ple_handle,
+            ple_offset,
+            gate_linear_slot,
+            proj_linear_slot,
+            post_norm_slot,
+            rows,
+            hidden_size,
+            ple_hidden_size,
+            eps,
+            activation_kind,
+            0,
+            1.0f,
+            output_handle,
+            output_offset
+        );
+        if (rc != 0) return rc;
+        return termite_metal_decode_runtime_finish_command_buffer(command_buffer, frame_owned, -21);
+    }
 }
 
 typedef struct termite_metal_whisper_logits_params_host {
@@ -65863,8 +65877,12 @@ int termite_metal_decode_runtime_reset_state(termite_metal_decode_runtime *runti
 // to a single CB per layer (first pass) or per token (final pass).
 static void termite_metal_decode_runtime_clear_frame_resources(CFMutableArrayRef *resources) {
     if (resources == NULL || *resources == NULL) return;
-    CFRelease(*resources);
-    *resources = NULL;
+    // Metal buffer destruction itself autoreleases device objects. Frame
+    // retirement is also called directly from Zig without an outer pool.
+    @autoreleasepool {
+        CFRelease(*resources);
+        *resources = NULL;
+    }
 }
 
 static void termite_metal_decode_runtime_finish_frame_scratch_releases(termite_metal_decode_runtime *runtime) {

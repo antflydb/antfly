@@ -945,6 +945,7 @@ const Buf = struct {
     weight_handle_name: ?[]const u8 = null,
     weight_handle_refs: usize = 0,
     shared_data_refcount: ?*usize = null,
+    physical_lease: ?*ops.physical_storage.Lease = null,
     logical_shape: ?[]i64 = null,
     logical_shape_inline: bool = false,
     inline_logical_shape: [8]i64 = undefined,
@@ -4028,17 +4029,15 @@ const WeightF32View = struct {
 fn denseWeightView(self: *NativeCompute, weight: CT) !WeightF32View {
     const buf = toBuf(weight);
     if (buf.data.len != 0) return .{ .data = buf.data };
-    if (buf.source_tensor) |tensor| {
-        const converted = try convertTensorToOwnedF32(self.allocator, tensor);
-        return .{ .data = converted, .owned = converted };
-    }
+    if (buf.source_tensor) |tensor| return tensorF32View(self, tensor);
     return error.MissingWeight;
 }
 
 fn denseTensorView(self: *NativeCompute, tensor: CT) !WeightF32View {
     const buf = toBuf(tensor);
     if (buf.data.len != 0 or buf.view_strides != null) return .{ .data = try getDataChecked(tensor) };
-    if (buf.source_tensor != null or buf.quantized_storage != null or buf.lazy_entry != null) {
+    if (buf.source_tensor) |source| return tensorF32View(self, source);
+    if (buf.quantized_storage != null or buf.lazy_entry != null) {
         const converted = try toFloat32Op(self, tensor, self.allocator);
         return .{ .data = converted, .owned = converted };
     }
@@ -5089,7 +5088,15 @@ fn getIo(ctx: *anyopaque) ?std.Io {
     return self.io;
 }
 
+const kernel_backend_impl = ops.KernelBackend{
+    .physicalTensorView = &physicalTensorViewOp,
+    .runAssignedKernel = &runAssignedKernelOp,
+    .readFloat32Into = &readFloat32IntoOp,
+    .retainImmutableTensor = &retainImmutableTensorOp,
+};
+
 pub const vtable_impl = ComputeBackend.VTable{
+    .kernels = &kernel_backend_impl,
     .backendKind = &backendKind,
     .deinitBackend = &deinitBackend,
     .freeTensor = &freeTensor,
@@ -5301,7 +5308,9 @@ fn freeTensor(ctx: *anyopaque, tensor: CT) void {
         self.allocator.destroy(source);
     }
     const parent = b.retained_parent;
+    const physical_lease = b.physical_lease;
     b.allocator.destroy(b);
+    if (physical_lease) |lease| lease.release();
     if (parent) |value| freeTensor(ctx, value);
 }
 
@@ -6660,14 +6669,16 @@ fn dispatchQuantizedLinearStrictF32(request: QuantLinearRequest) !bool {
 }
 
 fn linearOp(ctx: *anyopaque, input: CT, weight: CT, bias: CT, rows: usize, in_dim: usize, out_dim: usize) anyerror!CT {
+    return allocateLinearOutput(ctx, input, weight, bias, rows, in_dim, out_dim);
+}
+
+fn linearInto(ctx: *anyopaque, input: CT, weight: CT, bias: CT, rows: usize, in_dim: usize, out_dim: usize, output: []f32) anyerror!void {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
     defer maybeDiscardMappedWeightAfterUse(self, weight);
-    const output = try self.allocator.alloc(f32, rows * out_dim);
-    errdefer self.allocator.free(output);
     const weight_buf = toBuf(weight);
     if (try canonicalPanelLinear(self, input, weight, output, rows, in_dim, out_dim)) {
         addLinearBiasRows(output, getData(bias), rows, out_dim);
-        return makeLinearNoBiasResult(self, output, rows, out_dim);
+        return;
     }
 
     if (weight_buf.quantized_storage) |storage| {
@@ -6683,7 +6694,7 @@ fn linearOp(ctx: *anyopaque, input: CT, weight: CT, bias: CT, rows: usize, in_di
             .bias_a = getData(bias),
             .output_a = output,
         })) {
-            return makeLinearNoBiasResult(self, output, rows, out_dim);
+            return;
         }
         if (getData(weight).len == 0) {
             std.log.err(
@@ -6724,8 +6735,6 @@ fn linearOp(ctx: *anyopaque, input: CT, weight: CT, bias: CT, rows: usize, in_di
             addLinearBiasRows(output, getData(bias), rows, out_dim);
         } else try self.dispatchSgemmTransB(rows, out_dim, in_dim, 1.0, getData(input), weight_view.data, 1.0, output);
     }
-    const result = try self.makeBuf(output, true);
-    return self.withLogicalShape(result, &.{ @intCast(rows), @intCast(out_dim) });
 }
 
 fn addLinearBiasRows(output: []f32, bias: []const f32, rows: usize, out_dim: usize) void {
@@ -7334,37 +7343,12 @@ fn applyUnaryConsume(op: ops.UnaryConsumeOp, data: []f32) void {
         .tanh_act, .tanh_prim => {
             for (data) |*v| v.* = std.math.tanh(v.*);
         },
-        .negate => {
-            var i: usize = 0;
-            while (i + VEC_LEN <= data.len) : (i += VEC_LEN) {
-                const va: F32xN = data[i..][0..VEC_LEN].*;
-                data[i..][0..VEC_LEN].* = -va;
-            }
-            while (i < data.len) : (i += 1) data[i] = -data[i];
-        },
-        .sqrt => {
-            for (data) |*v| v.* = @sqrt(v.*);
-        },
-        .rsqrt => {
-            for (data) |*v| v.* = 1.0 / @sqrt(v.*);
-        },
-        .exp => {
-            for (data) |*v| v.* = @exp(v.*);
-        },
-        .log => {
-            for (data) |*v| v.* = @log(v.*);
-        },
-        .sin => {
-            for (data) |*v| v.* = @sin(v.*);
-        },
-        .cos => {
-            for (data) |*v| v.* = @cos(v.*);
+        .negate, .sqrt, .rsqrt, .exp, .log, .sin, .cos, .abs => switch (op) {
+            inline .negate, .sqrt, .rsqrt, .exp, .log, .sin, .cos, .abs => |tag| primitiveUnaryInto(@field(ops.kernel_descriptor.Unary, @tagName(tag)), data, data),
+            else => unreachable,
         },
         .erf => {
             for (data) |*v| v.* = erfApprox(v.*);
-        },
-        .abs => {
-            for (data) |*v| v.* = @abs(v.*);
         },
     }
 }
@@ -8436,13 +8420,15 @@ fn preparedEmbeddingGemma2Linear(self: *NativeCompute, input: []const f32, sourc
 }
 
 fn linearNoBiasOp(ctx: *anyopaque, input: CT, weight: CT, rows: usize, in_dim: usize, out_dim: usize) anyerror!CT {
+    return allocateLinearOutput(ctx, input, weight, null, rows, in_dim, out_dim);
+}
+
+fn linearNoBiasInto(ctx: *anyopaque, input: CT, weight: CT, rows: usize, in_dim: usize, out_dim: usize, output: []f32) anyerror!void {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
     defer maybeDiscardMappedWeightAfterUse(self, weight);
-    const output = try self.allocator.alloc(f32, rows * out_dim);
-    errdefer self.allocator.free(output);
     const weight_buf = toBuf(weight);
     if (try canonicalPanelLinear(self, input, weight, output, rows, in_dim, out_dim)) {
-        return makeLinearNoBiasResult(self, output, rows, out_dim);
+        return;
     }
     if (weight_buf.quantized_storage) |storage| {
         @memset(output, 0.0);
@@ -8457,7 +8443,7 @@ fn linearNoBiasOp(ctx: *anyopaque, input: CT, weight: CT, rows: usize, in_dim: u
             .name_a = weight_buf.name,
             .output_a = output,
         })) {
-            return makeLinearNoBiasResult(self, output, rows, out_dim);
+            return;
         }
         if (getData(weight).len == 0) {
             std.log.err(
@@ -8469,19 +8455,19 @@ fn linearNoBiasOp(ctx: *anyopaque, input: CT, weight: CT, rows: usize, in_dim: u
     }
     if (weight_buf.source_tensor) |tensor| {
         try linearNoBiasSourceTensorChunked(self, getData(input), tensor, output, rows, in_dim, out_dim);
-        return makeLinearNoBiasResult(self, output, rows, out_dim);
+        return;
     }
     if (weight_buf.lazy_entry) |entry| {
         if (weight_buf.data.len == 0 and canFallbackDenseBudgetPressure(weight_buf.name, entry)) {
             try linearNoBiasLazyEntryChunked(self, getData(input), entry, output, rows, in_dim, out_dim);
-            return makeLinearNoBiasResult(self, output, rows, out_dim);
+            return;
         }
     }
     const weight_view = try denseWeightView(self, weight);
     defer if (weight_view.owned) |owned| self.allocator.free(owned);
     if (!try preparedEmbeddingGemma2Linear(self, getData(input), weight_view.data, output, rows, out_dim, in_dim))
         try self.dispatchSgemmTransB(rows, out_dim, in_dim, 1.0, getData(input), weight_view.data, 0.0, output);
-    return makeLinearNoBiasResult(self, output, rows, out_dim);
+    return;
 }
 
 fn linearNoBiasPlannedOp(ctx: *anyopaque, request: *const ops.LinearNoBiasPlannedRequest) anyerror!CT {
@@ -39187,46 +39173,52 @@ fn divideOp(ctx: *anyopaque, a: CT, b: CT) anyerror!CT {
     return propagateLogicalShapeFromBinaryOperands(self, result, a, b);
 }
 
-fn negateOp(ctx: *anyopaque, a: CT) anyerror!CT {
-    const self: *NativeCompute = @ptrCast(@alignCast(ctx));
-    const a_data = getData(a);
-    const output = try self.allocator.alloc(f32, a_data.len);
-    var raw_output: ?[]f32 = output;
-    errdefer if (raw_output) |raw| self.allocator.free(raw);
-    var i: usize = 0;
-    while (i + VEC_LEN <= a_data.len) : (i += VEC_LEN) {
-        const va: F32xN = a_data[i..][0..VEC_LEN].*;
-        output[i..][0..VEC_LEN].* = -va;
-    }
-    while (i < a_data.len) : (i += 1) output[i] = -a_data[i];
-    const result = try self.makeBuf(output, true);
-    raw_output = null;
-    errdefer freeTensor(self, result);
-    return propagateLogicalShapeLike(self, result, a);
+fn negateOp(ctx: *anyopaque, input: CT) anyerror!CT {
+    return primUnaryOp(.negate, ctx, input);
 }
 
-fn primUnaryOp(comptime op: enum { sqrt, rsqrt, exp, log, sin, cos, tanh_prim, abs }, ctx: *anyopaque, a: CT) anyerror!CT {
-    const self: *NativeCompute = @ptrCast(@alignCast(ctx));
-    const a_data = getData(a);
-    const output = try self.allocator.alloc(f32, a_data.len);
-    var raw_output: ?[]f32 = output;
-    errdefer if (raw_output) |raw| self.allocator.free(raw);
-    for (a_data, 0..) |v, i| {
-        output[i] = switch (op) {
-            .sqrt => @sqrt(v),
-            .rsqrt => 1.0 / @sqrt(v),
-            .exp => @exp(v),
-            .log => @log(v),
-            .sin => @sin(v),
-            .cos => @cos(v),
-            .tanh_prim => std.math.tanh(v),
-            .abs => @abs(v),
+/// Allocating, consuming and planned primitives share one vector/scalar loop.
+fn primitiveUnaryInto(comptime op: ops.kernel_descriptor.Unary, input: []const f32, output: []f32) void {
+    if (op == .negate) {
+        var i: usize = 0;
+        while (i + VEC_LEN <= input.len) : (i += VEC_LEN) {
+            const values: F32xN = input[i..][0..VEC_LEN].*;
+            output[i..][0..VEC_LEN].* = -values;
+        }
+        while (i < input.len) : (i += 1) output[i] = -input[i];
+        return;
+    }
+    for (input, output) |value, *target| {
+        target.* = switch (op) {
+            .sqrt => @sqrt(value),
+            .rsqrt => 1.0 / @sqrt(value),
+            .exp => @exp(value),
+            .log => @log(value),
+            .sin => @sin(value),
+            .cos => @cos(value),
+            .tanh => std.math.tanh(value),
+            .abs => @abs(value),
+            .erf => blk: {
+                const x = @abs(value);
+                const t = 1.0 / (1.0 + 0.3275911 * x);
+                const poly = t * (0.254829592 + t * (-0.284496736 + t * (1.421413741 + t * (-1.453152027 + t * 1.061405429))));
+                const result = 1.0 - poly * @exp(-x * x);
+                break :blk if (value >= 0) result else -result;
+            },
+            .negate => unreachable,
+            else => @compileError("activation uses its existing specialized implementation"),
         };
     }
-    const result = try self.makeBuf(output, true);
-    raw_output = null;
+}
+
+fn primUnaryOp(comptime op: ops.kernel_descriptor.Unary, ctx: *anyopaque, input: CT) anyerror!CT {
+    const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    const data = getData(input);
+    const output = try self.allocator.alloc(f32, data.len);
+    primitiveUnaryInto(op, data, output);
+    const result = try self.makeOwnedBuf(output);
     errdefer freeTensor(self, result);
-    return propagateLogicalShapeLike(self, result, a);
+    return propagateLogicalShapeLike(self, result, input);
 }
 
 fn primSqrtOp(ctx: *anyopaque, a: CT) anyerror!CT {
@@ -39248,30 +39240,14 @@ fn primCosOp(ctx: *anyopaque, a: CT) anyerror!CT {
     return primUnaryOp(.cos, ctx, a);
 }
 fn primTanhOp(ctx: *anyopaque, a: CT) anyerror!CT {
-    return primUnaryOp(.tanh_prim, ctx, a);
+    return primUnaryOp(.tanh, ctx, a);
 }
 fn primAbsOp(ctx: *anyopaque, a: CT) anyerror!CT {
     return primUnaryOp(.abs, ctx, a);
 }
 
-fn primErfOp(ctx: *anyopaque, a: CT) anyerror!CT {
-    const self: *NativeCompute = @ptrCast(@alignCast(ctx));
-    const a_data = getData(a);
-    const output = try self.allocator.alloc(f32, a_data.len);
-    var raw_output: ?[]f32 = output;
-    errdefer if (raw_output) |raw| self.allocator.free(raw);
-    // Abramowitz & Stegun approximation (max error ~1.5e-7)
-    for (a_data, 0..) |v, i| {
-        const x = @abs(v);
-        const t = 1.0 / (1.0 + 0.3275911 * x);
-        const poly = t * (0.254829592 + t * (-0.284496736 + t * (1.421413741 + t * (-1.453152027 + t * 1.061405429))));
-        const result = 1.0 - poly * @exp(-x * x);
-        output[i] = if (v >= 0) result else -result;
-    }
-    const result = try self.makeBuf(output, true);
-    raw_output = null;
-    errdefer freeTensor(self, result);
-    return propagateLogicalShapeLike(self, result, a);
+fn primErfOp(ctx: *anyopaque, input: CT) anyerror!CT {
+    return primUnaryOp(.erf, ctx, input);
 }
 
 fn lessThanOp(ctx: *anyopaque, a: CT, b: CT) anyerror!CT {
@@ -39672,7 +39648,44 @@ fn primArgMaxOp(ctx: *anyopaque, input: CT, axis: u8, keepdims: bool, input_shap
     return self.withLogicalShape(result, out_shape_buf[0..out_rank]);
 }
 
-fn primReduceOp(self: *NativeCompute, input: CT, axes: []const u8, input_shape: []const i64, mode: enum { sum, max, mean }) anyerror!CT {
+fn reduceInto(input: []const f32, output: []f32, geometry: ops.kernel_descriptor.ReductionGeometry, mode: ops.kernel_descriptor.ReductionMode) void {
+    switch (mode) {
+        .sum, .mean => @memset(output, 0.0),
+        .max => @memset(output, -std.math.inf(f32)),
+    }
+    var input_strides: [8]usize = undefined;
+    var output_strides: [8]usize = undefined;
+    var in_stride: usize = 1;
+    var out_stride: usize = 1;
+    var axis: usize = geometry.rank;
+    while (axis > 0) {
+        axis -= 1;
+        input_strides[axis] = in_stride;
+        output_strides[axis] = out_stride;
+        in_stride *= geometry.dims[axis];
+        out_stride *= @intCast(geometry.output_dims[axis]);
+    }
+    // Preserve the existing flat input traversal and accumulation order.
+    for (input, 0..) |value, flat| {
+        var remaining = flat;
+        var output_index: usize = 0;
+        for (0..geometry.rank) |d| {
+            const coord = remaining / input_strides[d];
+            remaining %= input_strides[d];
+            if (!geometry.reduced(d)) output_index += coord * output_strides[d];
+        }
+        switch (mode) {
+            .sum, .mean => output[output_index] += value,
+            .max => output[output_index] = @max(output[output_index], value),
+        }
+    }
+    if (mode == .mean) {
+        const scale: f32 = 1.0 / @as(f32, @floatFromInt(geometry.reduce_count));
+        for (output) |*value| value.* *= scale;
+    }
+}
+
+fn primReduceOp(self: *NativeCompute, input: CT, axes: []const u8, input_shape: []const i64, mode: ops.kernel_descriptor.ReductionMode) anyerror!CT {
     const buf = toBuf(input);
     var materialized_input: ?[]f32 = null;
     defer if (materialized_input) |owned| self.allocator.free(owned);
@@ -39697,63 +39710,17 @@ fn primReduceOp(self: *NativeCompute, input: CT, axes: []const u8, input_shape: 
         }
         break :blk resolved_input_shape_buf[0..effective_input_shape.len];
     };
-    const rank = resolved_input_shape.len;
-
-    // Compute output shape with keepdims semantics.
-    var out_shape_buf: [8]i64 = resolved_input_shape_buf;
-    var is_reduced = @as([8]bool, @splat(false));
-    for (axes) |ax| is_reduced[ax] = true;
-    for (0..rank) |d| {
-        out_shape_buf[d] = if (is_reduced[d]) 1 else resolved_input_shape[d];
-    }
-    const out_numel = if (rank == 0) @as(usize, 1) else shapeNumel(out_shape_buf[0..rank]);
-
-    const output = try self.allocator.alloc(f32, out_numel);
+    const geometry = try ops.kernel_descriptor.ReductionGeometry.init(resolved_input_shape, axes);
+    if (in_data.len != geometry.input_count) return error.InvalidTensorShape;
+    const output = try self.allocator.alloc(f32, geometry.output_count);
     var raw_output: ?[]f32 = output;
     errdefer if (raw_output) |raw| self.allocator.free(raw);
-    switch (mode) {
-        .sum, .mean => @memset(output, 0.0),
-        .max => @memset(output, -std.math.inf(f32)),
-    }
-
-    // Compute input strides.
-    var in_strides: [8]usize = undefined;
-    computeStrides(resolved_input_shape, in_strides[0..rank]);
-    var out_strides: [8]usize = undefined;
-    if (rank > 0) computeStrides(out_shape_buf[0..rank], out_strides[0..rank]);
-
-    // For each input element, compute its output index by dropping reduced dims.
-    const in_numel = shapeNumel(resolved_input_shape);
-    for (0..in_numel) |flat_in| {
-        // Decompose flat index into multi-index.
-        var remaining = flat_in;
-
-        // Compute output flat index by zeroing reduced dims.
-        var out_flat: usize = 0;
-        for (0..rank) |d| {
-            const coord = remaining / in_strides[d];
-            remaining %= in_strides[d];
-            const out_coord = if (is_reduced[d]) @as(usize, 0) else coord;
-            out_flat += out_coord * out_strides[d];
-        }
-
-        switch (mode) {
-            .sum, .mean => output[out_flat] += in_data[flat_in],
-            .max => output[out_flat] = @max(output[out_flat], in_data[flat_in]),
-        }
-    }
-
-    if (mode == .mean) {
-        var reduce_count: usize = 1;
-        for (axes) |ax| reduce_count *= @as(usize, @intCast(resolved_input_shape[ax]));
-        const scale: f32 = 1.0 / @as(f32, @floatFromInt(reduce_count));
-        for (output) |*v| v.* *= scale;
-    }
+    reduceInto(in_data, output, geometry, mode);
 
     const result = try self.makeBuf(output, true);
     raw_output = null;
     errdefer freeTensor(self, result);
-    return self.withLogicalShape(result, out_shape_buf[0..rank]);
+    return self.withLogicalShape(result, geometry.output_dims[0..geometry.rank]);
 }
 
 fn primReshapeOp(ctx: *anyopaque, input: CT, new_shape: []const i64) anyerror!CT {
@@ -40078,6 +40045,24 @@ fn primBroadcastInDimOp(ctx: *anyopaque, input: CT, target_shape: []const i64, b
     return self.withLogicalShape(result, resolved_target_shape[0..out_rank]);
 }
 
+fn denseDotInto(lhs: []const f32, rhs: []const f32, output: []f32, plan: ops.kernel_descriptor.Dot) void {
+    // Preserve NativeCompute's f64 accumulator and batch/row/column traversal.
+    for (0..plan.batch_count) |batch| {
+        const lhs_base = batch * plan.m * plan.k;
+        const rhs_base = batch * plan.n * plan.k;
+        const output_base = batch * plan.m * plan.n;
+        for (0..plan.m) |row| for (0..plan.n) |column| {
+            var acc: f64 = 0;
+            for (0..plan.k) |inner| {
+                const li = lhs_base + (if (plan.lhs_contract_last) row * plan.k + inner else inner * plan.m + row);
+                const ri = rhs_base + (if (plan.rhs_contract_last) column * plan.k + inner else inner * plan.n + column);
+                acc += @as(f64, lhs[li]) * @as(f64, rhs[ri]);
+            }
+            output[output_base + row * plan.n + column] = @floatCast(acc);
+        };
+    }
+}
+
 fn primDotGeneralOp(ctx: *anyopaque, lhs: CT, rhs: CT, lhs_shape: []const i64, rhs_shape: []const i64, lhs_contracting: []const u8, rhs_contracting: []const u8, lhs_batch: []const u8, rhs_batch: []const u8) anyerror!CT {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
     const lhs_buf = toBuf(lhs);
@@ -40182,18 +40167,7 @@ fn primDotGeneralOp(ctx: *anyopaque, lhs: CT, rhs: CT, lhs_shape: []const i64, r
             if (lhs_buf.view_strides == null and rhs_buf.view_strides == null and rhs_buf.source_tensor == null) {
                 const lhs_data = getData(lhs);
                 const rhs_dense = getData(rhs);
-                // General 2D dot: C[i,j] = sum_k A[..] * B[..]
-                for (0..m) |i| {
-                    for (0..n) |j| {
-                        var acc: f64 = 0.0;
-                        for (0..k) |ki| {
-                            const a_idx = if (lc == 1) i * k + ki else ki * m + i;
-                            const b_idx = if (rc == 0) ki * n + j else j * k + ki;
-                            acc += @as(f64, lhs_data[a_idx]) * @as(f64, rhs_dense[b_idx]);
-                        }
-                        output[i * n + j] = @floatCast(acc);
-                    }
-                }
+                denseDotInto(lhs_data, rhs_dense, output, .{ .batch_count = 1, .m = m, .n = n, .k = k, .lhs_contract_last = lc == 1, .rhs_contract_last = rc == 1 });
                 const result = try self.makeBuf(output, true);
                 raw_output = null;
                 errdefer freeTensor(self, result);
@@ -41772,8 +41746,12 @@ fn primSliceOp(ctx: *anyopaque, input: CT, starts: []const i64, limits: []const 
 
 fn primConcatPrimOp(ctx: *anyopaque, a: CT, b: CT, axis: u8, a_shape: []const i64, b_shape: []const i64) anyerror!CT {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
-    const a_data = getData(a);
-    const b_data = getData(b);
+    const a_view = try denseTensorView(self, a);
+    defer if (a_view.owned) |owned| self.allocator.free(owned);
+    const b_view = try denseTensorView(self, b);
+    defer if (b_view.owned) |owned| self.allocator.free(owned);
+    const a_data = a_view.data;
+    const b_data = b_view.data;
     const effective_a_shape_raw = storedOrDeclaredShape(a, a_shape);
     const effective_b_shape_raw = storedOrDeclaredShape(b, b_shape);
     const effective_a_shape = if (effective_a_shape_raw.len != effective_b_shape_raw.len and a_shape.len == b_shape.len) a_shape else effective_a_shape_raw;
@@ -41945,16 +41923,9 @@ fn primConcatPrimOp(ctx: *anyopaque, a: CT, b: CT, axis: u8, a_shape: []const i6
     return result;
 }
 
-fn primSoftmaxOp(ctx: *anyopaque, input: CT, dim: u32) anyerror!CT {
-    const self: *NativeCompute = @ptrCast(@alignCast(ctx));
-    const data = getData(input);
-    const d = resolveSoftmaxLastDim(input, dim) orelse return error.InvalidTensorShape;
-    if (d == 0 or data.len % d != 0) return error.InvalidTensorShape;
+/// Shared numerical loop for allocating and assigned-output execution.
+fn softmaxInto(data: []const f32, output: []f32, d: usize) void {
     const rows = data.len / d;
-    const output = try self.allocator.alloc(f32, data.len);
-    var raw_output: ?[]f32 = output;
-    errdefer if (raw_output) |raw| self.allocator.free(raw);
-
     for (0..rows) |r| {
         const row = data[r * d ..][0..d];
         const out = output[r * d ..][0..d];
@@ -41974,6 +41945,18 @@ fn primSoftmaxOp(ctx: *anyopaque, input: CT, dim: u32) anyerror!CT {
         const inv_sum = 1.0 / sum;
         for (out) |*o| o.* *= inv_sum;
     }
+}
+
+fn primSoftmaxOp(ctx: *anyopaque, input: CT, dim: u32) anyerror!CT {
+    const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    const data = getData(input);
+    const d = resolveSoftmaxLastDim(input, dim) orelse return error.InvalidTensorShape;
+    if (d == 0 or data.len % d != 0) return error.InvalidTensorShape;
+    const output = try self.allocator.alloc(f32, data.len);
+    var raw_output: ?[]f32 = output;
+    errdefer if (raw_output) |raw| self.allocator.free(raw);
+
+    softmaxInto(data, output, d);
     const result = try self.makeBuf(output, true);
     raw_output = null;
     errdefer freeTensor(self, result);
@@ -42375,6 +42358,12 @@ test "embeddinggemma2 CPU segment attention output transfer frees data on alloca
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
 }
 
+fn retainImmutableTensorOp(_: *anyopaque, tensor: CT) anyerror!?CT {
+    const source = toBuf(tensor);
+    source.tensor_refs = try std.math.add(usize, source.tensor_refs, 1);
+    return tensor;
+}
+
 fn cloneTensorShapeOp(ctx: *anyopaque, input: CT, shape: []const i32) anyerror!?CT {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
     const source = integerSource(input) orelse return null;
@@ -42382,6 +42371,17 @@ fn cloneTensorShapeOp(ctx: *anyopaque, input: CT, shape: []const i32) anyerror!?
     var logical_shape: [8]i64 = undefined;
     for (shape, 0..) |dim, index| logical_shape[index] = dim;
     return try copyIntegerTensorWithShape(self, source, logical_shape[0..shape.len]);
+}
+
+fn readFloat32IntoOp(ctx: *anyopaque, tensor: CT, output: []f32) anyerror!bool {
+    const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    const source = toBuf(tensor);
+    if (source.quantized_storage != null or source.lazy_entry != null) return false;
+    const view = try denseTensorView(self, tensor);
+    defer if (view.owned) |owned| self.allocator.free(owned);
+    if (output.len != view.data.len) return error.InvalidTensorShape;
+    @memcpy(output, view.data);
+    return true;
 }
 
 fn toFloat32Op(ctx: *anyopaque, tensor: CT, allocator: std.mem.Allocator) anyerror![]f32 {
@@ -54399,4 +54399,130 @@ test "embeddinggemma2 video host borrows avoid copies and writable views reject 
     cb.free(output); // The retained row still owns the parent allocation.
     try std.testing.expectEqualSlices(f32, &.{ 4, 5, 6 }, (try cb.hostFloat32Read(view)).?);
     cb.free(view);
+}
+
+fn physicalTensorViewOp(ctx: *anyopaque, request: ops.physical_storage.View) anyerror!?CT {
+    const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    const source = toBuf(request.storage.tensor);
+    var count: usize = 1;
+    if (request.shape.len > 8 or source.view_strides != null) return null;
+    var shape: [8]i64 = undefined;
+    for (request.shape, 0..) |dim, i| {
+        if (dim <= 0) return error.InvalidShape;
+        count = try std.math.mul(usize, count, @intCast(dim));
+        shape[i] = dim;
+    }
+    if (count > source.data.len) return error.InvalidShape;
+    const view = try self.makeBuf(source.data[0..count], false);
+    errdefer freeTensor(self, view);
+    _ = try self.withLogicalShape(view, shape[0..request.shape.len]);
+    request.storage.retain();
+    toBuf(view).physical_lease = request.storage;
+    return view;
+}
+
+fn runAssignedKernelOp(ctx: *anyopaque, request: ops.kernel_descriptor.Invocation) anyerror!bool {
+    const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    const descriptor = request.descriptor;
+    if (descriptor.operation == .transpose or descriptor.operation == .broadcast) return false;
+    if (request.inputs.len != descriptor.input_count) return error.InvalidTensorShape;
+    for (request.inputs, 0..) |input, i| {
+        const buf = toBuf(input);
+        if (descriptor.operation == .linear and i == 1 and buf.view_strides == null and buf.quantized_storage == null) {
+            if (buf.source_tensor) |tensor| {
+                if (tensor.elementCount() == descriptor.input_shapes[i].numElements().? and
+                    (tensor.dtype == .f32 or tensor.dtype == .f16 or tensor.dtype == .bf16)) continue;
+            }
+        }
+        if (buf.view_strides != null or (buf.declared_dtype != null and buf.declared_dtype != .f32) or
+            buf.data.len != descriptor.input_shapes[i].numElements().?) return false;
+    }
+    if (descriptor.operation == .linear and toBuf(request.inputs[1]).quantized_storage != null) return false;
+    if (descriptor.operation == .dot and (toBuf(request.inputs[0]).quantized_storage != null or toBuf(request.inputs[1]).quantized_storage != null)) return false;
+    const output_ct = request.output orelse return true;
+    const target = toBuf(output_ct);
+    const output = target.data;
+    if (target.physical_lease == null or output.len != descriptor.elements()) return error.InvalidTensorShape;
+    switch (descriptor.operation) {
+        .transpose, .broadcast => unreachable,
+        .dot => |dot| denseDotInto(toBuf(request.inputs[0]).data, toBuf(request.inputs[1]).data, output, dot),
+        .reduction => |reduction| reduceInto(toBuf(request.inputs[0]).data, output, reduction.geometry, reduction.mode),
+        .norm => |norm| {
+            const input = toBuf(request.inputs[0]).data;
+            if (output.ptr != input.ptr) @memcpy(output, input);
+            defer maybeDiscardMappedWeightAfterUse(self, request.inputs[1]);
+            if (norm.kind == .layer) {
+                defer maybeDiscardMappedWeightAfterUse(self, request.inputs[2]);
+                activations_mod.layerNorm(output, getData(request.inputs[1]), getData(request.inputs[2]), norm.dim, norm.eps);
+            } else activations_mod.rmsNorm(output, getData(request.inputs[1]), norm.dim, norm.eps);
+        },
+        .softmax => |softmax| {
+            const input = toBuf(request.inputs[0]).data;
+            if (softmax.logarithmic) {
+                if (output.ptr != input.ptr) @memcpy(output, input);
+                activations_mod.logSoftmaxInPlace(output, softmax.width);
+            } else softmaxInto(input, output, softmax.width);
+        },
+        .linear => |linear| {
+            if (linear.bias) try linearInto(ctx, request.inputs[0], request.inputs[1], request.inputs[2], linear.rows, linear.in_dim, linear.out_dim, output) else try linearNoBiasInto(ctx, request.inputs[0], request.inputs[1], linear.rows, linear.in_dim, linear.out_dim, output);
+        },
+        .unary => |op| switch (op) {
+            .gelu, .gelu_exact, .relu, .silu => {
+                const input = toBuf(request.inputs[0]).data;
+                if (output.ptr != input.ptr) @memcpy(output, input);
+                switch (op) {
+                    .gelu => try applyGeluForSession(self, output),
+                    .gelu_exact => activations_mod.geluExact(output),
+                    .relu => activations_mod.relu(output),
+                    .silu => activations_mod.silu(output),
+                    else => unreachable,
+                }
+            },
+            inline else => |tag| primitiveUnaryInto(tag, toBuf(request.inputs[0]).data, output),
+        },
+        .binary => |op| {
+            const a = toBuf(request.inputs[0]).data;
+            const b = toBuf(request.inputs[1]).data;
+            const scalar_a = a[0];
+            const scalar_b = b[0];
+            inline for (std.meta.tags(ops.kernel_descriptor.Binary)) |kind| {
+                if (op == kind) {
+                    var i: usize = 0;
+                    while (i + VEC_LEN <= output.len) : (i += VEC_LEN) {
+                        const av: F32xN = if (a.len == 1) @splat(scalar_a) else a[i..][0..VEC_LEN].*;
+                        const bv: F32xN = if (b.len == 1) @splat(scalar_b) else b[i..][0..VEC_LEN].*;
+                        output[i..][0..VEC_LEN].* = switch (kind) {
+                            .add => av + bv,
+                            .subtract => av - bv,
+                            .multiply => av * bv,
+                            .divide => av / bv,
+                        };
+                    }
+                    while (i < output.len) : (i += 1) {
+                        const av = if (a.len == 1) scalar_a else a[i];
+                        const bv = if (b.len == 1) scalar_b else b[i];
+                        output[i] = switch (kind) {
+                            .add => av + bv,
+                            .subtract => av - bv,
+                            .multiply => av * bv,
+                            .divide => av / bv,
+                        };
+                    }
+                    break;
+                }
+            }
+        },
+    }
+    return true;
+}
+
+fn allocateLinearOutput(ctx: *anyopaque, input: CT, weight: CT, bias: ?CT, rows: usize, in_dim: usize, out_dim: usize) anyerror!CT {
+    const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    var owned: ?[]f32 = try self.allocator.alloc(f32, try std.math.mul(usize, rows, out_dim));
+    errdefer if (owned) |data| self.allocator.free(data);
+    if (bias) |value| try linearInto(ctx, input, weight, value, rows, in_dim, out_dim, owned.?) else try linearNoBiasInto(ctx, input, weight, rows, in_dim, out_dim, owned.?);
+    const result = try self.makeBuf(owned.?, true);
+    owned = null;
+    errdefer freeTensor(ctx, result);
+    return self.withLogicalShape(result, &.{ @intCast(rows), @intCast(out_dim) });
 }

@@ -16,6 +16,7 @@
 const std = @import("std");
 const context_mod = @import("context.zig");
 const driver_mod = @import("driver.zig");
+const transfer_audit = @import("../../execution/transfer_audit.zig");
 
 pub const HostBuffer = struct {
     ptr: ?*anyopaque = null,
@@ -117,17 +118,20 @@ pub const DeviceBuffer = struct {
             std.log.err("CUDA cuMemcpyHtoDAsync failed: bytes={d} error={s} ({s})", .{ bytes.len, ctx.driver.errorName(result), ctx.driver.errorString(result) });
             return error.CudaDriverError;
         }
+        transfer_audit.upload(bytes.len);
     }
 
-    pub fn copyToHost(self: DeviceBuffer, ctx: *context_mod.CudaContext, bytes: []u8) driver_mod.Error!void {
+    pub fn copyToHost(self: DeviceBuffer, ctx: *context_mod.CudaContext, bytes: []u8) (driver_mod.Error || error{DeviceReadbackForbidden})!void {
         if (bytes.len > self.len) return error.InvalidCudaState;
         if (bytes.len == 0) return;
+        try transfer_audit.checkDeviceHostAccess();
         try ctx.makeCurrent();
         const result = ctx.driver.fns.cuMemcpyDtoHAsync(bytes.ptr, self.ptr, bytes.len, ctx.stream);
         if (result != driver_mod.CUDA_SUCCESS) {
             std.log.err("CUDA cuMemcpyDtoHAsync failed: bytes={d} error={s} ({s})", .{ bytes.len, ctx.driver.errorName(result), ctx.driver.errorString(result) });
             return error.CudaDriverError;
         }
+        transfer_audit.download(bytes.len);
     }
 
     pub fn copyFromDevice(self: DeviceBuffer, ctx: *context_mod.CudaContext, src: DeviceBuffer, len: usize) driver_mod.Error!void {
@@ -181,4 +185,15 @@ test "embeddinggemma2 CUDA graph suballocation error cleanup never frees its are
     borrowed.free(undefined);
     try std.testing.expectEqual(@as(usize, 0), borrowed.len);
     try std.testing.expectEqual(@as(driver_mod.CUdeviceptr, 0), borrowed.ptr);
+}
+
+test "CUDA strict transfer audit rejects downloads before any driver access" {
+    var scope = transfer_audit.Audit{ .forbid_device_host_access = true };
+    try transfer_audit.begin(&scope);
+    defer transfer_audit.end();
+    var bytes: [4]u8 = undefined;
+    const storage = DeviceBuffer{ .ptr = 4096, .len = 4 };
+    try std.testing.expectError(error.DeviceReadbackForbidden, storage.copyToHost(undefined, &bytes));
+    try std.testing.expectEqual(@as(u64, 0), scope.download_calls);
+    try std.testing.expectError(error.InvalidCudaState, (DeviceBuffer{ .ptr = 4096, .len = 2 }).copyToHost(undefined, &bytes));
 }

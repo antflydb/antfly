@@ -36,6 +36,9 @@ const ml = @import("ml");
 /// (native CPU uses f32 slices, device backends use opaque handles). Tensors are always
 /// freed via the ComputeBackend that created them.
 pub const CT = backend_contracts.CT;
+pub const kernel_descriptor = @import("kernel_descriptor.zig");
+pub const physical_storage = @import("physical_storage.zig");
+pub const KernelBackend = @import("kernel_backend.zig").VTable;
 
 /// Result of an optional backend lookup for immutable scalar model metadata.
 /// `unsupported` lets callers retain their existing weight-loading path;
@@ -1917,6 +1920,7 @@ pub const ComputeBackend = struct {
 
     pub const VTable = struct {
         backendKind: *const fn (ctx: *anyopaque) BackendKind,
+        kernels: ?*const KernelBackend = null,
         deinitBackend: *const fn (ctx: *anyopaque) void,
         freeTensor: *const fn (ctx: *anyopaque, tensor: CT) void,
         /// Optional backend-provided device-write hook installer. CUDA and
@@ -3961,6 +3965,30 @@ pub const ComputeBackend = struct {
         return false;
     }
 
+    /// Publish F32 rows independently of mutable decoder/arena storage. This
+    /// copies on the selected backend; it never stages activations through host.
+    pub fn snapshotRows2D(self: *const ComputeBackend, allocator: std.mem.Allocator, input: CT, start_row: usize, rows: usize, cols: usize) !CT {
+        if (rows == 0 or cols == 0 or rows > std.math.maxInt(i32) or cols > std.math.maxInt(i32)) return error.InvalidShape;
+        if (try self.tensorDType(input) != .f32) return error.UnsupportedTensorType;
+        const count = try std.math.mul(usize, rows, cols);
+        if (count > std.math.maxInt(i32)) return error.InvalidShape;
+        const shape = [_]i32{ @intCast(rows), @intCast(cols) };
+        const output = stable_storage: {
+            // Stable target storage bypasses temporary arena slots. The owned
+            // reshape retains the flat allocation through the published value.
+            if (self.vtable.kernels) |functions| if (functions.allocatePhysicalStorage) |allocate| {
+                const storage = (try allocate(self.ptr, try std.math.mul(usize, count, @sizeOf(f32)))) orelse return error.UnsupportedBackendOp;
+                defer self.free(storage);
+                const dimensions = [_]i64{ @intCast(rows), @intCast(cols) };
+                break :stable_storage try self.primReshape(storage, &dimensions);
+            };
+            break :stable_storage (try self.allocUninitF32Shape(&shape)) orelse return error.UnsupportedBackendOp;
+        };
+        errdefer self.free(output);
+        if (!try self.copyRows2D(allocator, output, 0, input, start_row, rows, cols)) return error.UnsupportedBackendOp;
+        return output;
+    }
+
     /// Whether this backend exposes the device-to-device row-copy primitive.
     /// Callers may use this to choose an in-place layout-preserving algorithm
     /// without probing by partially mutating a destination tensor.
@@ -5274,6 +5302,23 @@ pub const ComputeBackend = struct {
         if (self.vtable.cancelI32ScalarDownload) |cancel_i32_scalar_download| {
             cancel_i32_scalar_download(self.ptr, pending);
         }
+    }
+
+    pub fn readFloat32Into(self: *const ComputeBackend, tensor: CT, output: []f32) !bool {
+        try self.checkExecutionControl();
+        const functions = self.vtable.kernels orelse return false;
+        const read = functions.readFloat32Into orelse return false;
+        return read(self.ptr, tensor, output);
+    }
+
+    pub fn retainImmutableTensor(self: *const ComputeBackend, tensor: CT, allocator: std.mem.Allocator) !?CT {
+        if (self.vtable.kernels) |functions| if (functions.retainImmutableTensor) |retain| return retain(self.ptr, tensor);
+        const dims = try self.tensorShape(tensor, allocator);
+        defer allocator.free(dims);
+        if (dims.len > 8) return error.UnsupportedShape;
+        var shape: [8]i32 = undefined;
+        for (dims, 0..) |dim, axis| shape[axis] = std.math.cast(i32, dim) orelse return error.UnsupportedShape;
+        return self.cloneTensorShape(tensor, shape[0..dims.len]);
     }
 
     pub fn cloneTensorShape(self: *const ComputeBackend, tensor: CT, shape: []const i32) !?CT {

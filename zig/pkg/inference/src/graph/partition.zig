@@ -31,6 +31,17 @@
 // parallelism: partitioning across devices uses the same mechanism.
 
 const std = @import("std");
+const cost_model = @import("cost.zig");
+const nodeElementCost = cost_model.nodeElementCost;
+const tensorByteSize = cost_model.tensorByteSize;
+const descByteSize = cost_model.descByteSize;
+const nodeComputeCost = cost_model.nodeComputeCost;
+const dotGeneralCost = cost_model.dotGeneralCost;
+const mul3Cost = cost_model.mul3Cost;
+const checkedMul = cost_model.checkedMul;
+const checkedAdd = cost_model.checkedAdd;
+const nodeInputBytes = cost_model.nodeInputBytes;
+
 const ml = @import("ml");
 
 const Graph = ml.graph.Graph;
@@ -62,162 +73,7 @@ pub const PartitionExecutor = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
 
-    pub const ExecutionStats = struct {
-        partitions_executed: u64 = 0,
-        cross_device_transfers: u64 = 0,
-        runtime_input_transfers: u64 = 0,
-        device_resident_transfers: u64 = 0,
-        backend_command_dispatches: u64 = 0,
-        planned_operator_dispatches: u64 = 0,
-        quant_kernel_planned_ops: u64 = 0,
-        quant_kernel_handwritten_production: u64 = 0,
-        quant_kernel_generated_production: u64 = 0,
-        quant_kernel_unsupported_routes: u64 = 0,
-        quant_kernel_generated_candidates: u64 = 0,
-        quant_kernel_fallback_generated_artifact_missing: u64 = 0,
-        quant_kernel_fallback_generated_runtime_not_wired: u64 = 0,
-        quant_kernel_fallback_unsupported_format: u64 = 0,
-        quant_kernel_fallback_unsupported_shape: u64 = 0,
-        quant_kernel_fallback_unsupported_epilogue: u64 = 0,
-        quant_kernel_fallback_unsupported_backend: u64 = 0,
-        quant_kernel_fallback_tensor_core_repack_required: u64 = 0,
-        quant_kernel_fallback_unsupported: u64 = 0,
-        metadata_aliases: u64 = 0,
-        descriptor_materializations: u64 = 0,
-        constant_materializations: u64 = 0,
-        graph_regions: u64 = 0,
-        graph_region_ops: u64 = 0,
-        graph_region_fallbacks: u64 = 0,
-        metal_qkv_regions: u64 = 0,
-        metal_attention_regions: u64 = 0,
-        metal_ffn_regions: u64 = 0,
-        metal_deberta_ffn_forward_regions: u64 = 0,
-        metal_deberta_encoder_lora_layer_regions: u64 = 0,
-        metal_deberta_encoder_lora_residual_layernorm_regions: u64 = 0,
-        metal_deberta_encoder_lora_layer_scaffold_regions: u64 = 0,
-        metal_deberta_encoder_lora_layer_fallbacks: u64 = 0,
-        metal_lora_linear_regions: u64 = 0,
-        metal_lora_qkv_regions: u64 = 0,
-        metal_lora_backward_regions: u64 = 0,
-        metal_low_rank_lora_backward_regions: u64 = 0,
-        metal_rank_adapter_backward_regions: u64 = 0,
-        metal_ffn_gelu_backward_regions: u64 = 0,
-        metal_head_mlp_forward_regions: u64 = 0,
-        metal_head_mlp_backward_regions: u64 = 0,
-        metal_command_dot_general_dispatches: u64 = 0,
-        metal_command_head_dot_dispatches: u64 = 0,
-        metal_command_transpose_dispatches: u64 = 0,
-        metal_command_gather_dispatches: u64 = 0,
-        metal_command_reduce_dispatches: u64 = 0,
-        metal_command_elementwise_dispatches: u64 = 0,
-        metal_command_activation_dispatches: u64 = 0,
-        metal_command_activation_backward_dispatches: u64 = 0,
-        metal_command_other_dispatches: u64 = 0,
-        metal_ple_regions: u64 = 0,
-        metal_tail_regions: u64 = 0,
-        fused_graph_pattern_dispatches: u64 = 0,
-        fused_graph_nodes_elided: u64 = 0,
-        graph_output_elision_overrides: u64 = 0,
-        metal_attention_output_residual_fusions: u64 = 0,
-        metal_attention_output_residual_partial_fallbacks: u64 = 0,
-        metal_gated_ffn_residual_fusions: u64 = 0,
-        metal_linear_pair_fusions: u64 = 0,
-        interpreter_fallbacks: u64 = 0,
-        device_resident_outputs: u64 = 0,
-        host_materialized_outputs: u64 = 0,
-        host_materialized_command_outputs: u64 = 0,
-        host_materialized_interpreter_outputs: u64 = 0,
-        host_materialized_pre_materialized_constant_outputs: u64 = 0,
-        host_materialized_runtime_region_outputs: u64 = 0,
-        host_materialized_parameter_outputs: u64 = 0,
-        host_materialized_unattributed_outputs: u64 = 0,
-        device_resident_parameter_outputs: u64 = 0,
-        boundary_output_materializations: u64 = 0,
-        graph_output_owned_copies: u64 = 0,
-        metal_frame_chunk_boundaries: u64 = 0,
-        metal_frame_chunk_promoted_values: u64 = 0,
-        metal_frame_chunk_swept_values: u64 = 0,
-        metal_chunk_local_output_peak_bytes: u64 = 0,
-        metal_chunk_local_output_live_bytes: u64 = 0,
-        metal_chunk_local_output_allocations: u64 = 0,
-        metal_chunk_local_output_reuse_hits: u64 = 0,
-        metal_chunk_local_output_consumed_hints: u64 = 0,
-        metal_chunk_local_output_unconsumed_hints: u64 = 0,
-        metal_chunk_local_output_spill_bytes: u64 = 0,
-        metal_chunk_local_output_alias_conflicts: u64 = 0,
-        metal_chunk_local_output_resets: u64 = 0,
-        metal_chunk_local_output_reset_freed_bytes: u64 = 0,
-        metal_chunk_local_output_discard_freed_bytes: u64 = 0,
-        metal_chunk_local_output_reset_live_carry_values: u64 = 0,
-        metal_gather_input_promotions: u64 = 0,
-        metal_gather_input_promotion_bytes: u64 = 0,
-        metal_gather_input_promotion_ns: u64 = 0,
-        metal_gather_output_promotions: u64 = 0,
-        metal_gather_output_promotion_bytes: u64 = 0,
-        metal_gather_output_promotion_ns: u64 = 0,
-        metal_reduce_input_promotions: u64 = 0,
-        metal_reduce_input_promotion_bytes: u64 = 0,
-        metal_reduce_input_promotion_ns: u64 = 0,
-        metal_resident_input_cache_hits: u64 = 0,
-        metal_resident_input_cache_misses: u64 = 0,
-        metal_resident_input_cache_unique_promotions: u64 = 0,
-        metal_resident_input_cache_retained_live_bytes: u64 = 0,
-        metal_resident_input_cache_retained_peak_bytes: u64 = 0,
-        metal_resident_input_cache_reused_bytes: u64 = 0,
-        metal_resident_input_cache_released_bytes: u64 = 0,
-        metal_eager_arena_peak_bytes: u64 = 0,
-        metal_eager_arena_live_bytes: u64 = 0,
-        metal_eager_arena_reuse_hits: u64 = 0,
-        metal_eager_arena_allocations: u64 = 0,
-        metal_eager_arena_spill_bytes: u64 = 0,
-        metal_eager_arena_hazard_declines: u64 = 0,
-        metal_eager_arena_alias_conflicts: u64 = 0,
-        metal_eager_arena_alias_reclaims: u64 = 0,
-        metal_eager_arena_alias_reclaim_bytes: u64 = 0,
-        graph_plan_slots_reserved: u64 = 0,
-        graph_plan_bytes_reserved: u64 = 0,
-        runtime_region_plan_compiles: u64 = 0,
-        runtime_region_plan_regions: u64 = 0,
-        runtime_region_plan_dispatches: u64 = 0,
-        runtime_region_plan_active_regions: u64 = 0,
-        runtime_region_plan_covered_nodes: u64 = 0,
-        runtime_region_plan_elided_nodes: u64 = 0,
-        runtime_region_pre_skipped_nodes: u64 = 0,
-        runtime_region_pre_skipped_transposes: u64 = 0,
-        runtime_region_pre_skip_declined_external_consumers: u64 = 0,
-        runtime_region_plan_reuses: u64 = 0,
-        runtime_prepare_slot_calls: u64 = 0,
-        runtime_prepare_slot_cache_hits: u64 = 0,
-        runtime_region_fallbacks: u64 = 0,
-        runtime_frame_candidates: u64 = 0,
-        runtime_frame_eligible: u64 = 0,
-        runtime_frame_metadata_ready: u64 = 0,
-        runtime_frame_ineligible_no_regions: u64 = 0,
-        runtime_frame_ineligible_missing_qkv: u64 = 0,
-        runtime_frame_ineligible_missing_attention: u64 = 0,
-        runtime_frame_ineligible_missing_ffn: u64 = 0,
-        runtime_frame_ineligible_missing_ple: u64 = 0,
-        runtime_frame_ineligible_single_row: u64 = 0,
-        runtime_frame_ineligible_non_layer_order: u64 = 0,
-        runtime_frame_ineligible_shape_mismatch: u64 = 0,
-        runtime_frame_ineligible_missing_model_metadata: u64 = 0,
-        gemma_qkv_hits: u64 = 0,
-        gemma_qkv_fallbacks: u64 = 0,
-        gemma_o_proj_hits: u64 = 0,
-        gemma_o_proj_fallbacks: u64 = 0,
-        gemma_mlp_proj_hits: u64 = 0,
-        gemma_mlp_proj_fallbacks: u64 = 0,
-        gemma_attention_matmul_hits: u64 = 0,
-        gemma_attention_matmul_fallbacks: u64 = 0,
-        gemma_rms_norm_hits: u64 = 0,
-        gemma_rms_norm_fallbacks: u64 = 0,
-        gemma_softmax_hits: u64 = 0,
-        gemma_softmax_fallbacks: u64 = 0,
-        gemma_residual_add_hits: u64 = 0,
-        gemma_residual_add_fallbacks: u64 = 0,
-        gemma_elementwise_mul_hits: u64 = 0,
-        gemma_elementwise_mul_fallbacks: u64 = 0,
-    };
+    pub const ExecutionStats = @import("../execution/stats.zig").ExecutionStats;
 
     pub const ExecutionContext = struct {
         allocator: ?std.mem.Allocator = null,
@@ -298,6 +154,9 @@ pub const CapabilityReason = enum {
 };
 
 pub const CapabilityDiagnostics = struct {
+    coalesced_regions: usize = 0,
+    coalesced_nodes: usize = 0,
+    estimated_region_cost_saved: u64 = 0,
     counts: [@typeInfo(CapabilityReason).@"enum".field_names.len]usize = @splat(0),
     operator_stats: operator_plan.Stats = .{},
 
@@ -386,6 +245,7 @@ pub const CapabilityDecision = struct {
 pub const PartitionOptions = struct {
     tensor_descs: ?[]const ?contracts.TensorDesc = null,
     diagnostics: ?*CapabilityDiagnostics = null,
+    region_costs: ?@import("../execution/placement.zig").RegionCosts = null,
 };
 
 /// A backend's capability declaration: which graph nodes it should execute.
@@ -525,6 +385,15 @@ pub fn partitionWithOptions(
         node_operator_plans[i] = assignment.operator_plan;
     }
 
+    if (options.region_costs) |model| {
+        const refined = try @import("../execution/placement.zig").refine(allocator, graph, backend_assignment, node_operator_plans, capabilities, tensor_descs, model);
+        if (options.diagnostics) |diagnostics| {
+            diagnostics.coalesced_regions = refined.regions;
+            diagnostics.coalesced_nodes = refined.nodes;
+            diagnostics.estimated_region_cost_saved = refined.estimated_saved_cost;
+        }
+    }
+
     // Step 2: Group contiguous runs of the same backend into partitions.
     // Since the graph is in topological order, we can greedily merge
     // adjacent nodes with the same backend assignment.
@@ -652,6 +521,16 @@ fn assignNode(
     tensor_descs: ?[]const ?contracts.TensorDesc,
     diagnostics: ?*CapabilityDiagnostics,
 ) NodeAssignmentDecision {
+    // A supplied parameter already exists. Its partition expresses storage
+    // ownership; consumer edges decide whether any transfer is necessary.
+    // Uploadability hints alone must never override that ownership.
+    if (op == .parameter) {
+        if (tensor_descs) |descriptors| if (descriptors[node_id]) |descriptor| {
+            if (descriptor.current_backend) |current| for (capabilities) |capability| {
+                if (capability.backend == current) return .{ .backend = current };
+            };
+        };
+    }
     const query = CapabilityQuery{
         .graph = graph,
         .node_id = node_id,
@@ -1265,68 +1144,8 @@ fn blasCandidate(query: CapabilityQuery) bool {
 
 const blasMinComputeCost: u64 = 32 * 1024;
 
-fn nodeElementCost(graph: *const Graph, node_id: NodeId) u64 {
-    const shape = graph.node(node_id).output_shape;
-    const elems = shape.maxElements() orelse shape.numElements() orelse 1;
-    if (elems <= 0) return 1;
-    return @intCast(elems);
-}
-
-fn tensorByteSize(shape: ml.graph.Shape) u64 {
-    const elems = shape.maxElements() orelse shape.numElements() orelse 1;
-    if (elems <= 0) return @intCast(shape.dtype.byteSize());
-    return checkedMul(@intCast(elems), @intCast(shape.dtype.byteSize()));
-}
-
-fn descByteSize(desc: contracts.TensorDesc) u64 {
-    return tensorByteSize(desc.shape);
-}
-
-fn nodeComputeCost(graph: *const Graph, node_id: NodeId) u64 {
-    const n = graph.node(node_id);
-    return switch (n.op) {
-        .fused_linear, .fused_linear_no_bias, .fused_linear_no_bias_pair => |attrs| mul3Cost(attrs.rows, attrs.in_dim, attrs.out_dim),
-        .dot_general => |attrs| dotGeneralCost(graph, node_id, attrs) orelse nodeElementCost(graph, node_id),
-        else => nodeElementCost(graph, node_id),
-    };
-}
-
-fn dotGeneralCost(graph: *const Graph, node_id: NodeId, attrs: ml.graph.node.DotGeneralAttrs) ?u64 {
-    if (attrs.num_contracting != 1) return null;
-    const n = graph.node(node_id);
-    if (n.num_inputs < 2) return null;
-    const lhs = graph.node(n.inputs[0]).output_shape;
-    const lhs_axis = attrs.lhs_contracting[0];
-    if (lhs_axis >= lhs.rank()) return null;
-    const k = lhs.dims[lhs_axis];
-    if (k <= 0) return null;
-    return checkedMul(nodeElementCost(graph, node_id), @intCast(k));
-}
-
-fn mul3Cost(a: u32, b: u32, c: u32) u64 {
-    return checkedMul(checkedMul(a, b), c);
-}
-
-fn checkedMul(a: u64, b: u64) u64 {
-    return std.math.mul(u64, a, b) catch std.math.maxInt(u64);
-}
-
-fn checkedAdd(a: u64, b: u64) u64 {
-    return std.math.add(u64, a, b) catch std.math.maxInt(u64);
-}
-
 fn blasEstimatedCost(query: CapabilityQuery) u64 {
     return checkedAdd(nodeComputeCost(query.graph, query.node_id) / 8, nodeInputBytes(query));
-}
-
-fn nodeInputBytes(query: CapabilityQuery) u64 {
-    const descs = query.tensor_descs orelse return 0;
-    const n = query.graph.node(query.node_id);
-    var total: u64 = 0;
-    for (n.getInputs()) |input_id| {
-        if (inputDesc(descs, input_id)) |desc| total = checkedAdd(total, descByteSize(desc));
-    }
-    return total;
 }
 
 fn nodeHasPackedQuantInput(query: CapabilityQuery) bool {
@@ -1913,4 +1732,103 @@ test "partition executor enforces execution control around backend dispatch" {
     var after = Probe{ .cancel_on_check = 2 };
     try std.testing.expectError(error.Cancelled, after.executor().execute(&values, &devices, &node_ids, 0, after.context()));
     try std.testing.expect(after.called);
+}
+
+test "region placement coalesces pure GPU work between CPU fallbacks with explicit costs" {
+    const a = std.testing.allocator;
+    var graph = Graph.init(a);
+    defer graph.deinit();
+    var b = ml.graph.Builder.init(&graph);
+    const x = try b.parameter("x", ml.graph.Shape.init(.f32, &.{16}));
+    const activation = try graph.addNode(.{ .op = .{ .fused_relu = {} }, .output_shape = graph.node(x).output_shape, .inputs = .{ x, null_node, null_node, null_node }, .num_inputs = 1 });
+    const out = try b.add(activation, x);
+    try graph.markOutput(out);
+    const OnlyActivation = struct {
+        fn supports(op: OpCode) bool {
+            return op == .fused_relu;
+        }
+    };
+    const caps = [_]Capability{
+        .{ .backend = .metal, .priority = 10, .supports = &OnlyActivation.supports },
+        .{ .backend = .native, .priority = 0, .supports = &supportsAll },
+    };
+    var diagnostics = CapabilityDiagnostics{};
+    var plan = try partitionWithOptions(a, &graph, &caps, .{ .region_costs = .{}, .diagnostics = &diagnostics });
+    defer plan.deinit();
+    try std.testing.expectEqual(BackendKind.native, plan.partitions[plan.node_assignment[activation]].backend);
+    try std.testing.expectEqual(@as(usize, 1), diagnostics.coalesced_regions);
+    try std.testing.expectEqual(@as(usize, 1), diagnostics.coalesced_nodes);
+    try std.testing.expect(diagnostics.estimated_region_cost_saved > 0);
+    // A cheap device with free boundaries must retain the faster legal path.
+    var cheap = try partitionWithOptions(a, &graph, &caps, .{ .region_costs = .{ .launch = 0, .transfer_latency = 0, .transfer_bytes_per_unit = std.math.maxInt(u64) } });
+    defer cheap.deinit();
+    try std.testing.expectEqual(BackendKind.metal, cheap.partitions[cheap.node_assignment[activation]].backend);
+    // Output ownership is a separate request contract; do not move an exposed
+    // value using only the internal-region cost model.
+    try graph.markOutput(activation);
+    var exposed = try partitionWithOptions(a, &graph, &caps, .{ .region_costs = .{} });
+    defer exposed.deinit();
+    try std.testing.expectEqual(BackendKind.metal, exposed.partitions[exposed.node_assignment[activation]].backend);
+}
+
+test "region placement accounts for both native and device consumers of a small island" {
+    const a = std.testing.allocator;
+    var graph = Graph.init(a);
+    defer graph.deinit();
+    var b = ml.graph.Builder.init(&graph);
+    const x = try b.parameter("x", ml.graph.Shape.init(.f32, &.{16}));
+    const activation = try graph.addNode(.{ .op = .{ .fused_relu = {} }, .output_shape = graph.node(x).output_shape, .inputs = .{ x, null_node, null_node, null_node }, .num_inputs = 1 });
+    const host = try b.add(activation, x);
+    const resident = try b.softmax(activation);
+    try graph.markOutput(host);
+    try graph.markOutput(resident);
+    const Candidate = struct {
+        fn supports(op: OpCode) bool {
+            return op == .fused_relu or op == .fused_softmax;
+        }
+    };
+    const caps = [_]Capability{
+        .{ .backend = .metal, .priority = 10, .supports = Candidate.supports },
+        .{ .backend = .native, .priority = 0, .supports = supportsAll },
+    };
+    var diagnostics = CapabilityDiagnostics{};
+    var plan = try partitionWithOptions(a, &graph, &caps, .{ .region_costs = .{}, .diagnostics = &diagnostics });
+    defer plan.deinit();
+    try std.testing.expectEqual(BackendKind.native, plan.partitions[plan.node_assignment[activation]].backend);
+    try std.testing.expectEqual(BackendKind.metal, plan.partitions[plan.node_assignment[resident]].backend);
+    try std.testing.expectEqual(@as(usize, 1), diagnostics.coalesced_regions);
+    var cheap = try partitionWithOptions(a, &graph, &caps, .{ .region_costs = .{ .launch = 0, .transfer_latency = 0, .transfer_bytes_per_unit = std.math.maxInt(u64) } });
+    defer cheap.deinit();
+    try std.testing.expectEqual(BackendKind.metal, cheap.partitions[cheap.node_assignment[activation]].backend);
+}
+
+test "parameter current storage stays separate from proposed uploadable residency" {
+    const a = std.testing.allocator;
+    var graph = Graph.init(a);
+    defer graph.deinit();
+    var b = ml.graph.Builder.init(&graph);
+    const x = try b.parameter("x", ml.graph.Shape.init(.f32, &.{16}));
+    const out = try b.relu(x);
+    try graph.markOutput(out);
+    const caps = [_]Capability{
+        .{ .backend = .metal, .priority = 10, .supports = &supportsAll },
+        .{ .backend = .native, .priority = 0, .supports = &supportsAll },
+    };
+    const seeds = try allocTensorDescriptorSeeds(a, &graph);
+    defer a.free(seeds);
+    try seedAllUploadableResidency(seeds, &graph, .metal, 0);
+    var predicted = try partitionWithOptions(a, &graph, &caps, .{ .tensor_descs = seeds });
+    defer predicted.deinit();
+    try std.testing.expectEqual(BackendKind.metal, predicted.partitions[predicted.node_assignment[x]].backend);
+    seeds[x].?.current_backend = .native;
+    var actual_host = try partitionWithOptions(a, &graph, &caps, .{ .tensor_descs = seeds });
+    defer actual_host.deinit();
+    try std.testing.expectEqual(BackendKind.native, actual_host.partitions[actual_host.node_assignment[x]].backend);
+    try std.testing.expectEqual(BackendKind.metal, actual_host.partitions[actual_host.node_assignment[out]].backend);
+    try std.testing.expectEqual(@as(usize, 1), actual_host.partitions[actual_host.node_assignment[out]].external_inputs.len);
+    seeds[x].?.current_backend = .metal;
+    var actual_device = try partitionWithOptions(a, &graph, &caps, .{ .tensor_descs = seeds });
+    defer actual_device.deinit();
+    try std.testing.expectEqual(BackendKind.metal, actual_device.partitions[actual_device.node_assignment[x]].backend);
+    try std.testing.expectEqual(@as(usize, 0), actual_device.partitions[actual_device.node_assignment[out]].external_inputs.len);
 }

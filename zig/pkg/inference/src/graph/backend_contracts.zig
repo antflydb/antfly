@@ -417,6 +417,9 @@ pub const TensorDesc = struct {
     attention_storage: ?quant_matmul.AttentionStorage = null,
     view_source: ?ml.graph.NodeId = null,
     resident_backend: ?BackendKind = null,
+    /// Proven storage location for a supplied parameter. Unlike uploadability
+    /// seeding (`resident_backend`), this never predicts a future transfer.
+    current_backend: ?BackendKind = null,
     device_id: u32 = 0,
 
     pub fn init(shape: ml.graph.Shape, storage: TensorStorageClass) TensorDesc {

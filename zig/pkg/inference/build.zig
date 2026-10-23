@@ -1591,6 +1591,58 @@ pub fn build(b: *std.Build) void {
     const reranker_e2e_bench_step = b.step("bench-reranker-e2e", "Run real-bundle text reranker E2E benchmarks");
     reranker_e2e_bench_step.dependOn(&run_reranker_e2e_bench.step);
 
+    const unified_execution_bench_exe = b.addExecutable(.{
+        .name = "antfly-inference-unified-execution-bench",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/bench/unified_execution.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    unified_execution_bench_exe.root_module.addImport("build_options", build_options_mod);
+    unified_execution_bench_exe.root_module.addImport("ml", ml_mod);
+    if (pjrt_mod) |pjrt| unified_execution_bench_exe.root_module.addImport("pjrt", pjrt);
+    unified_execution_bench_exe.root_module.addImport("inference_linalg", inference_linalg_mod);
+    unified_execution_bench_exe.root_module.addImport("inference_hf_tokenizer", inference_hf_tokenizer_mod);
+    unified_execution_bench_exe.root_module.addImport("antfly_image", antfly_image_mod);
+    unified_execution_bench_exe.root_module.addImport("inference_audio", inference_audio_mod);
+    unified_execution_bench_exe.root_module.addImport("protobuf", protobuf_mod);
+    unified_execution_bench_exe.root_module.addImport("onnx_graph", onnx.graph);
+    unified_execution_bench_exe.root_module.addImport("onnx_data", onnx.data);
+    unified_execution_bench_exe.root_module.addImport("inference_internal", inference_internal_mod);
+    runtime_graph.identities.addImports(unified_execution_bench_exe.root_module);
+    unified_execution_bench_exe.root_module.link_libc = true;
+    const run_unified_execution_bench = b.addRunArtifact(unified_execution_bench_exe);
+    run_unified_execution_bench.addPassthruArgs();
+    const unified_execution_bench_step = b.step("bench-unified-execution", "Run pretokenized encoder correctness and performance acceptance workloads");
+    unified_execution_bench_step.dependOn(&run_unified_execution_bench.step);
+
+    const unified_fixtures_bench_exe = b.addExecutable(.{
+        .name = "antfly-inference-unified-fixtures-bench",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/bench/unified_fixtures.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    unified_fixtures_bench_exe.root_module.addImport("build_options", build_options_mod);
+    unified_fixtures_bench_exe.root_module.addImport("ml", ml_mod);
+    if (pjrt_mod) |pjrt| unified_fixtures_bench_exe.root_module.addImport("pjrt", pjrt);
+    unified_fixtures_bench_exe.root_module.addImport("inference_linalg", inference_linalg_mod);
+    unified_fixtures_bench_exe.root_module.addImport("inference_hf_tokenizer", inference_hf_tokenizer_mod);
+    unified_fixtures_bench_exe.root_module.addImport("antfly_image", antfly_image_mod);
+    unified_fixtures_bench_exe.root_module.addImport("inference_audio", inference_audio_mod);
+    unified_fixtures_bench_exe.root_module.addImport("protobuf", protobuf_mod);
+    unified_fixtures_bench_exe.root_module.addImport("onnx_graph", onnx.graph);
+    unified_fixtures_bench_exe.root_module.addImport("onnx_data", onnx.data);
+    unified_fixtures_bench_exe.root_module.addImport("inference_internal", inference_internal_mod);
+    runtime_graph.identities.addImports(unified_fixtures_bench_exe.root_module);
+    unified_fixtures_bench_exe.root_module.link_libc = true;
+    const run_unified_fixtures_bench = b.addRunArtifact(unified_fixtures_bench_exe);
+    run_unified_fixtures_bench.addPassthruArgs();
+    const unified_fixtures_bench_step = b.step("bench-unified-fixtures", "Export equivalent BERT ONNX and GGUF acceptance fixtures");
+    unified_fixtures_bench_step.dependOn(&run_unified_fixtures_bench.step);
+
     workflows_benches.addAudio(workflow_ctx);
 
     // Tests

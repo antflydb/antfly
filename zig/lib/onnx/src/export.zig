@@ -717,7 +717,7 @@ fn exportGraphResultMaybeStream(
     defer if (lowered) |*l| l.deinit();
 
     const effective_graph: *const Graph = if (opts.lower_fused) blk: {
-        lowered = try ml.graph.lower.lower(alloc, graph);
+        lowered = try ml.graph.lower.lowerWithOptions(alloc, graph, .{ .preserve_activation_kernels = false });
         break :blk &lowered.?.graph;
     } else graph;
 
@@ -824,6 +824,7 @@ fn exportGraphResultMaybeStream(
         const n = effective_graph.node(@intCast(i));
         switch (n.op) {
             .reduce_sum, .reduce_max, .reduce_mean => effective_opset_version = @max(effective_opset_version, 21),
+            .fused_gelu, .fused_gelu_exact => effective_opset_version = @max(effective_opset_version, 20),
             .average_pool => effective_opset_version = @max(effective_opset_version, 19),
             else => {},
         }
@@ -930,6 +931,18 @@ fn exportGraphResultMaybeStream(
                 else
                     try makeRawConstantTensor(alloc, names[i], n.output_shape, data);
                 try initializers.append(alloc, tensor);
+            },
+            .rsqrt => {
+                // Rsqrt has no standard ONNX operator. Preserve its primitive
+                // arithmetic with Sqrt followed by Reciprocal.
+                const temporary = blk: {
+                    const name = try std.fmt.allocPrint(alloc, "{s}__sqrt", .{names[i]});
+                    errdefer alloc.free(name);
+                    try quant_extras.append(alloc, name);
+                    break :blk name;
+                };
+                try appendSimpleNode(alloc, &onnx_nodes, "Sqrt", temporary, &.{names[n.inputs[0]]}, &.{temporary});
+                try appendSimpleNode(alloc, &onnx_nodes, "Reciprocal", names[i], &.{temporary}, &.{names[i]});
             },
             .fused_zero_tensor => {
                 const elem_count = try shapeElementCount(n.output_shape);
@@ -1344,10 +1357,63 @@ fn appendDotGeneralSubgraph(
 ) !void {
     const inputs = n.getInputs();
     if (inputs.len != 2) return error.UnsupportedShape;
+    const attrs = n.op.dot_general;
+    const lhs_shape = graph.node(inputs[0]).output_shape;
+    const rhs_shape = graph.node(inputs[1]).output_shape;
+    // ONNX MatMul contracts the final LHS axis with the penultimate RHS
+    // axis. Preserve IR contractions explicitly instead of silently treating
+    // every dot_general as an already-canonical MatMul.
+    if (attrs.num_contracting != 1 or lhs_shape.rank() == 0 or rhs_shape.rank() == 0) return error.UnsupportedShape;
+    const lc = attrs.lhs_contracting[0];
+    const rc = attrs.rhs_contracting[0];
+    if (lc >= lhs_shape.rank() or rc >= rhs_shape.rank()) return error.UnsupportedShape;
+    var lhs_perm: [8]u8 = undefined;
+    var rhs_perm: [8]u8 = undefined;
+    for (0..lhs_shape.rank()) |axis| lhs_perm[axis] = @intCast(axis);
+    for (0..rhs_shape.rank()) |axis| rhs_perm[axis] = @intCast(axis);
+    if (attrs.num_batch == 0) {
+        if (rhs_shape.rank() > 2) return error.UnsupportedShape;
+        var next: usize = 0;
+        for (0..lhs_shape.rank()) |axis| {
+            if (axis == lc) continue;
+            lhs_perm[next] = @intCast(axis);
+            next += 1;
+        }
+        lhs_perm[next] = lc;
+    } else {
+        if (lhs_shape.rank() < 2 or lhs_shape.rank() != rhs_shape.rank() or attrs.num_batch != lhs_shape.rank() - 2) return error.UnsupportedShape;
+        for (0..attrs.num_batch) |axis| {
+            if (attrs.lhs_batch[axis] != axis or attrs.rhs_batch[axis] != axis or lc == axis or rc == axis) return error.UnsupportedShape;
+        }
+        if (lc == lhs_shape.rank() - 2) std.mem.swap(u8, &lhs_perm[lhs_shape.rank() - 2], &lhs_perm[lhs_shape.rank() - 1]);
+    }
+    if (rhs_shape.rank() > 1) {
+        if (rc == rhs_shape.rank() - 1) std.mem.swap(u8, &rhs_perm[rhs_shape.rank() - 2], &rhs_perm[rhs_shape.rank() - 1]) else if (rc != rhs_shape.rank() - 2) return error.UnsupportedShape;
+    }
     const target_dtype = n.output_shape.dtype;
-    const lhs_name = try ensureNodeAsDType(alloc, onnx_nodes, extra_names, names[inputs[0]], "dot_lhs", node_id, graph.node(inputs[0]).output_shape.dtype, target_dtype);
-    const rhs_name = try ensureNodeAsDType(alloc, onnx_nodes, extra_names, names[inputs[1]], "dot_rhs", node_id, graph.node(inputs[1]).output_shape.dtype, target_dtype);
+    const lhs_cast = try ensureNodeAsDType(alloc, onnx_nodes, extra_names, names[inputs[0]], "dot_lhs", node_id, lhs_shape.dtype, target_dtype);
+    const rhs_cast = try ensureNodeAsDType(alloc, onnx_nodes, extra_names, names[inputs[1]], "dot_rhs", node_id, rhs_shape.dtype, target_dtype);
+    const lhs_name = try appendDotOperandLayout(alloc, onnx_nodes, extra_names, lhs_cast, node_id, "lhs", lhs_perm[0..lhs_shape.rank()]);
+    const rhs_name = try appendDotOperandLayout(alloc, onnx_nodes, extra_names, rhs_cast, node_id, "rhs", rhs_perm[0..rhs_shape.rank()]);
     try appendSimpleNode(alloc, onnx_nodes, "MatMul", names[node_id], &.{ lhs_name, rhs_name }, &.{names[node_id]});
+}
+
+fn appendDotOperandLayout(alloc: Allocator, nodes: *std.ArrayListUnmanaged(NodeProto), extra_names: *std.ArrayListUnmanaged([]u8), input: []const u8, id: NodeId, role: []const u8, perm: []const u8) ![]const u8 {
+    var identity = true;
+    for (perm, 0..) |axis, index| if (axis != index) {
+        identity = false;
+    };
+    if (identity) return input;
+    const name = try std.fmt.allocPrint(alloc, "node_{d}__dot_{s}_transpose", .{ id, role });
+    extra_names.append(alloc, name) catch |err| {
+        alloc.free(name);
+        return err;
+    };
+    try appendSimpleNode(alloc, nodes, "Transpose", name, &.{input}, &.{name});
+    var attrs = ml.graph.node.TransposeAttrs{ .num_axes = @intCast(perm.len) };
+    @memcpy(attrs.perm[0..perm.len], perm);
+    nodes.items[nodes.items.len - 1].attributes = (try transposeOp(alloc, attrs)).attrs;
+    return name;
 }
 
 fn ensureNodeAsDType(
@@ -2117,10 +2183,8 @@ fn mapOp(alloc: Allocator, graph: *const Graph, n: *const Node) !OpMapping {
         // Elementwise unary
         .neg => simpleOp("Neg"),
         .sqrt => simpleOp("Sqrt"),
-        // ONNX has no Rsqrt; emit as a termite-domain op to preserve semantics.
-        // Consumers should either handle the custom op or run the lowering
-        // pass before export (which decomposes rsqrt via its vjp_alternate).
-        .rsqrt => .{ .op_type = "Rsqrt", .attrs = &.{} },
+        // Serialized by the standard Sqrt/Reciprocal subgraph above.
+        .rsqrt => return error.UnsupportedShape,
         .exp => simpleOp("Exp"),
         .log => simpleOp("Log"),
         .sin => simpleOp("Sin"),
@@ -2169,7 +2233,8 @@ fn mapOp(alloc: Allocator, graph: *const Graph, n: *const Node) !OpMapping {
 
         // Fused activations
         .fused_relu => simpleOp("Relu"),
-        .fused_gelu => simpleOp("Gelu"),
+        .fused_gelu => try stringAttrOp(alloc, "Gelu", "approximate", "tanh"),
+        .fused_gelu_exact => try stringAttrOp(alloc, "Gelu", "approximate", "none"),
         .fused_sigmoid => simpleOp("Sigmoid"),
         .fused_tanh_act => simpleOp("Tanh"),
         .fused_silu => simpleOp("Silu"),
@@ -2179,8 +2244,8 @@ fn mapOp(alloc: Allocator, graph: *const Graph, n: *const Node) !OpMapping {
         .fused_elem_multiply => simpleOp("Mul"),
 
         // Fused softmax
-        .fused_softmax => |a| try intAttrOp(alloc, "Softmax", "axis", @as(i64, @intCast(a.dim))),
-        .fused_log_softmax => |a| try intAttrOp(alloc, "LogSoftmax", "axis", @as(i64, @intCast(a.dim))),
+        .fused_softmax => try intAttrOp(alloc, "Softmax", "axis", @as(i64, -1)),
+        .fused_log_softmax => try intAttrOp(alloc, "LogSoftmax", "axis", @as(i64, -1)),
 
         // Fused norms
         .fused_layer_norm => |a| try normOp(alloc, "LayerNormalization", a),
@@ -2247,6 +2312,12 @@ fn argReduceOp(alloc: Allocator, op_type: []const u8, attrs_in: ml.graph.node.Ar
     const attrs = try alloc.alloc(AttributeProto, 2);
     attrs[0] = .{ .name = "axis", .i = attrs_in.axis, .attr_type = .int };
     attrs[1] = .{ .name = "keepdims", .i = if (attrs_in.keepdims) 1 else 0, .attr_type = .int };
+    return .{ .op_type = op_type, .attrs = attrs };
+}
+
+fn stringAttrOp(alloc: Allocator, op_type: []const u8, name: []const u8, value: []const u8) !OpMapping {
+    const attrs = try alloc.alloc(AttributeProto, 1);
+    attrs[0] = .{ .name = name, .s = value, .attr_type = .string };
     return .{ .op_type = op_type, .attrs = attrs };
 }
 
@@ -3417,4 +3488,45 @@ test "exportGraph preserves GatherND and batch_dims" {
     try std.testing.expectEqualStrings("GatherND", node.op_type);
     try std.testing.expectEqualStrings("batch_dims", node.attributes[0].name);
     try std.testing.expectEqual(@as(i64, 1), node.attributes[0].i);
+}
+
+test "encoder activation export roundtrips standard rsqrt exact GELU and last-axis softmax" {
+    const allocator = std.testing.allocator;
+    var graph = Graph.init(allocator);
+    defer graph.deinit();
+    var b = ml.graph.Builder.init(&graph);
+    const x = try b.parameter("x", Shape.init(.f32, &.{ 2, 4 }));
+    const output = try b.softmax(try b.geluExact(try b.rsqrt(x)));
+    try graph.markOutput(output);
+    for ([_]bool{ false, true }) |lower_fused| {
+        const bytes = try exportGraph(allocator, &graph, .{ .lower_fused = lower_fused });
+        defer allocator.free(bytes);
+        var model = try @import("root.zig").parse(allocator, bytes);
+        defer model.deinit();
+        var saw_reciprocal = false;
+        var saw_gelu = false;
+        var saw_erf = false;
+        for (model.graph().?.nodes) |node| {
+            try std.testing.expect(!std.mem.eql(u8, node.op_type, "Rsqrt"));
+            try std.testing.expect(!std.mem.eql(u8, node.op_type, "fused_gelu_exact"));
+            if (std.mem.eql(u8, node.op_type, "Reciprocal")) saw_reciprocal = true;
+            if (std.mem.eql(u8, node.op_type, "Erf")) saw_erf = true;
+            if (std.mem.eql(u8, node.op_type, "Gelu")) {
+                saw_gelu = true;
+                for (node.attributes) |attr| if (std.mem.eql(u8, attr.name, "approximate")) try std.testing.expectEqualStrings("none", attr.s);
+            }
+            if (std.mem.eql(u8, node.op_type, "Softmax")) {
+                for (node.attributes) |attr| if (std.mem.eql(u8, attr.name, "axis")) try std.testing.expectEqual(@as(i64, -1), attr.i);
+            }
+        }
+        try std.testing.expect(saw_reciprocal);
+        if (lower_fused) try std.testing.expect(!saw_gelu and saw_erf) else {
+            try std.testing.expect(saw_gelu);
+            try std.testing.expect(model.opsetVersion() >= 20);
+        }
+        var imported = try model.convertToGraph(allocator);
+        defer imported.deinit(allocator);
+        const shape = imported.graph.node(imported.output_ids[0]).output_shape;
+        try std.testing.expectEqualSlices(i64, &.{ 2, 4 }, shape.dims[0..shape.rank()]);
+    }
 }

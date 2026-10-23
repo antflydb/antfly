@@ -68,6 +68,10 @@ pub const CudaTensor = struct {
     owns_resident_indices: bool = true,
     resident_parent: ?*CudaTensor = null,
     resident_references: usize = 1,
+    physical_lease: ?*ops.physical_storage.Lease = null,
+    /// Plan-owned addresses never enter the learned ordinal/temp cache. Their
+    /// last lease retires the direct allocation after the frame's fence.
+    physical_storage_base: bool = false,
     // Constant snapshots bypass the temporary pool. The last borrower owns
     // both the direct allocation and its retained shared-admission lease.
     model_constant: bool = false,
@@ -1778,6 +1782,7 @@ const CudaGraphReplayOutputKind = enum {
 };
 
 const CudaGraphReplaySlot = struct {
+    physical_storage: ops.physical_storage.CapturedLeases = .{},
     exec: driver_mod.CUgraphExec = null,
     replay_key: u64 = 0,
     input_storage: buffer_mod.DeviceBuffer = .{},
@@ -2251,6 +2256,8 @@ pub const CudaCompute = struct {
     florence_image_projection_source_ptr: driver_mod.CUdeviceptr = 0,
     florence_image_projection_vision_dim: usize = 0,
     florence_image_projection_projection_dim: usize = 0,
+    physical_execution_storage: ?[]const ?*ops.physical_storage.Lease = null,
+    capturing_physical_storage: ops.physical_storage.CapturedLeases = .{},
     debug_cuda_graph_capture_active: bool = false,
     debug_cuda_graph_capture_disabled: bool = false,
     debug_cuda_graph_capture_inhibit_once: bool = false,
@@ -3149,6 +3156,14 @@ pub const CudaCompute = struct {
     }
 
     pub fn deinit(self: *CudaCompute) void {
+        // Captured executions own addresses in both the prepared plan and
+        // backend caches. Retire them before tearing down either owner.
+        if (self.debug_cuda_graph_capture_active) abortDebugCudaGraphCapture(self, self.debug_cuda_graph_active_slot orelse 0);
+        if (self.capturing_physical_storage.values.items.len != 0) {
+            self.ctx.synchronize() catch {};
+            self.capturing_physical_storage.deinit(self.allocator);
+        }
+        for (&self.debug_cuda_graph_slots) |*slot| deinitCudaGraphReplaySlot(self, slot);
         self.audio_plans.clear();
         const retained_cleanup_failed = failed: {
             self.embedding_gemma2_resize.clear(&self.ctx) catch break :failed true;
@@ -3189,9 +3204,6 @@ pub const CudaCompute = struct {
         while (lazy_it.next()) |entry| self.allocator.free(entry.key_ptr.*);
         self.lazy_device_epochs.deinit(self.allocator);
         deinitDenseStreamCache(self);
-        for (&self.debug_cuda_graph_slots) |*slot| {
-            deinitCudaGraphReplaySlot(self, slot);
-        }
         if (self.a4b_runtime) |*runtime| {
             runtime.deinit(self);
             self.a4b_runtime = null;
@@ -5926,6 +5938,7 @@ fn deinitBackendClearRunBudget(ctx: *anyopaque) void {
 }
 
 fn freeCudaTensorStorage(self: *CudaCompute, cuda_tensor: *CudaTensor) void {
+    if (cuda_tensor.physical_storage_base) return freeCudaTensorStorageUncached(self, cuda_tensor);
     if (cuda_tensor.owns_resident_indices) if (cuda_tensor.resident_indices) |indices| self.allocator.free(indices);
     cuda_tensor.resident_indices = null;
     if (cuda_tensor.owns_tc_quant) {
@@ -7792,6 +7805,7 @@ fn beginI32ScalarDownloadOp(ctx: *anyopaque, tensor: CT) anyerror!?ops.PendingI3
     if (cuda_tensor.quant_type != null) return null;
     if (cuda_tensor.dtype != .i32 or cuda_tensor.elem_count != 1) return null;
 
+    try @import("../../execution/transfer_audit.zig").checkDeviceHostAccess();
     const byte_len = @sizeOf(i32);
     var eligibility_probe: [byte_len]u8 = undefined;
     if (!pinnedScalarDownloadEligible(self, eligibility_probe[0..])) return null;
@@ -7850,6 +7864,7 @@ fn beginI32ScalarDownloadOp(ctx: *anyopaque, tensor: CT) anyerror!?ops.PendingI3
         try self.ctx.recordEvent(self.async_i32_scalar_download.ready_event);
         try self.ctx.driver.check(self.ctx.driver.fns.cuStreamWaitEvent(self.async_i32_scalar_download.copy_stream, self.async_i32_scalar_download.ready_event, 0));
         try self.ctx.driver.check(self.ctx.driver.fns.cuMemcpyDtoHAsync(slot.ptr, self.async_i32_scalar_download.staging.ptr, byte_len, self.async_i32_scalar_download.copy_stream));
+        @import("../../execution/transfer_audit.zig").download(byte_len);
         try self.ctx.driver.check(self.ctx.driver.fns.cuEventRecord(self.async_i32_scalar_download.event, self.async_i32_scalar_download.copy_stream));
         self.stats.d2h_bytes += byte_len;
         staged_download_started = true;
@@ -9946,18 +9961,26 @@ fn allocDeviceBufferOrdinary(self: *CudaCompute, len: usize) !buffer_mod.DeviceB
         std.log.warn("cuda_graph_capture_probe: unpinned_temp_during_capture seq={d} bytes={d} disabled=1", .{ seq, len });
         return error.CudaGraphCaptureUnsafeTempAlloc;
     }
+    return allocUnpinnedDeviceBufferUnlocked(self, len, seq, true);
+}
+
+/// Common cache/admission path. Prepared allocations bypass learned ordinals
+/// and pinned slots, while retaining physical quota accounting and reclamation.
+fn allocUnpinnedDeviceBufferUnlocked(self: *CudaCompute, len: usize, seq: usize, reuse_cached: bool) !buffer_mod.DeviceBuffer {
     const stable_reuse = self.resident_training_cache or cudaTempStableReuseEnabled();
     var best_index: ?usize = null;
     var best_len: usize = std.math.maxInt(usize);
-    for (self.temp_buffers.items, 0..) |buffer, i| {
-        if (stable_reuse) {
-            if (buffer.len == len) {
+    if (reuse_cached) {
+        for (self.temp_buffers.items, 0..) |buffer, i| {
+            if (stable_reuse) {
+                if (buffer.len == len) {
+                    best_index = i;
+                    break;
+                }
+            } else if (buffer.len >= len and buffer.len < best_len) {
                 best_index = i;
-                break;
+                best_len = buffer.len;
             }
-        } else if (buffer.len >= len and buffer.len < best_len) {
-            best_index = i;
-            best_len = buffer.len;
         }
     }
     if (best_index) |i| {
@@ -10133,8 +10156,10 @@ fn freeTensor(ctx: *anyopaque, tensor: CT) void {
     cuda_tensor.resident_references -= 1;
     if (cuda_tensor.resident_references != 0) return;
     if (cuda_tensor.resident_parent) |parent| freeTensor(ctx, parent);
+    const physical_lease = cuda_tensor.physical_lease;
     freeCudaTensorStorage(self, cuda_tensor);
     self.allocator.destroy(cuda_tensor);
+    if (physical_lease) |lease| lease.release();
 }
 
 fn borrowedSlotTensor(tensor: *const CudaTensor) CudaTensor {
@@ -10657,6 +10682,13 @@ fn debugCudaGraphCaptureBegin(ctx: *anyopaque, label: []const u8) !bool {
         self.debug_cuda_decode_scalars_host[2] != 0 and
         self.debug_cuda_decode_scalars_host[3] != 0 and
         decodeScalarsCanPreAdvance(self.debug_cuda_decode_scalars_host, auto_decode_scalars_delta);
+    // Keep every warmed planned address alive for the captured executable.
+    // New physical device allocations remain forbidden during capture.
+    std.debug.assert(self.capturing_physical_storage.values.items.len == 0);
+    errdefer self.capturing_physical_storage.deinit(self.allocator);
+    if (self.physical_execution_storage) |leases| for (leases) |lease| {
+        if (lease) |value| if (value.backend.ptr == @as(*anyopaque, @ptrCast(self))) try self.capturing_physical_storage.retain(self.allocator, value);
+    };
     var decode_scalars_pre_advanced = false;
     var capture_started = false;
     errdefer {
@@ -10865,6 +10897,10 @@ fn resetCudaGraphReplaySlotMetadata(self: *CudaCompute, slot: *CudaGraphReplaySl
         self.ctx.destroyGraphExec(exec);
         slot.exec = null;
     }
+    // Destruction/eviction is cold. A graph launch is asynchronous, so its
+    // address owners must survive the final submission as well as the exec.
+    if (slot.physical_storage.values.items.len != 0) self.ctx.synchronize() catch {};
+    slot.physical_storage.deinit(self.allocator);
     resetCudaGraphReplaySlotMetadataKeepExec(self, slot);
     slot.temp_arena_generation = 0;
     slot.captured_temp_allocation_count = 0;
@@ -11148,6 +11184,7 @@ fn abortDebugCudaGraphCapture(self: *CudaCompute, slot_idx: usize) void {
         } else |_| {}
     }
     resetCudaGraphReplaySlotMetadata(self, &self.debug_cuda_graph_slots[slot_idx]);
+    self.capturing_physical_storage.deinit(self.allocator);
     clearDebugCudaGraphCaptureState(self);
     restoreDebugCudaGraphDecodeScalars(self, slot_idx);
 }
@@ -11991,6 +12028,10 @@ fn debugCudaGraphCaptureEnd(ctx: *anyopaque, replay: bool) !void {
     var capture_executed = false;
     var capture_cached = false;
     defer {
+        if (self.capturing_physical_storage.values.items.len != 0) {
+            if (replay) self.ctx.synchronize() catch {};
+            self.capturing_physical_storage.deinit(self.allocator);
+        }
         clearDebugCudaGraphCaptureState(self);
         if (!capture_cached) {
             resetCudaGraphReplaySlotMetadata(self, &self.debug_cuda_graph_slots[slot_idx]);
@@ -12016,6 +12057,12 @@ fn debugCudaGraphCaptureEnd(ctx: *anyopaque, replay: bool) !void {
                 slot.temp_arena_generation = self.temp_arena_generation;
                 slot.captured_temp_allocation_count = captured_temp_allocation_count;
                 try replayCapturedDebugGraphWithUpdate(self, slot_idx, graph);
+                // Updating an exec may replace all of its addresses. Retire
+                // previous owners only after their last launch has completed.
+                if (slot.physical_storage.values.items.len != 0) try self.ctx.synchronize();
+                slot.physical_storage.deinit(self.allocator);
+                slot.physical_storage = self.capturing_physical_storage;
+                self.capturing_physical_storage = .{};
                 capture_cached = true;
             } else {
                 try replayCapturedDebugGraphOneShot(self, graph);
@@ -12043,86 +12090,79 @@ fn fromFloat32Op(ctx: *anyopaque, data: []const f32) anyerror!CT {
     return fromFloat32ShapeOp(ctx, data, &shape);
 }
 
-fn fromFloat32ShapeOp(ctx: *anyopaque, data: []const f32, shape: []const i32) anyerror!CT {
+/// Common typed upload for imported constants and eager tensors. Preserve the
+/// byte representation; arithmetic eligibility is checked by kernel selection.
+fn fromConstantBytesOp(ctx: *anyopaque, data: []const u8, dtype: ops.GraphDType, shape: []const i64) anyerror!?CT {
     const self: *CudaCompute = @ptrCast(@alignCast(ctx));
+    if (shape.len > 8) return error.InvalidShape;
     var elem_count: usize = 1;
     for (shape) |dim| {
         if (dim < 0) return error.InvalidShape;
         elem_count = try std.math.mul(usize, elem_count, @intCast(dim));
     }
-    if (elem_count != data.len) return error.InvalidShape;
-
-    const shape_i64 = try self.allocator.alloc(i64, shape.len);
-    errdefer self.allocator.free(shape_i64);
-    for (shape, 0..) |dim, i| shape_i64[i] = dim;
-
-    var device = try allocDeviceBuffer(self, data.len * @sizeOf(f32));
+    const tensor_dtype: tensor_mod.DType = switch (dtype) {
+        inline else => |tag| @field(tensor_mod.DType, @tagName(tag)),
+    };
+    if (try std.math.mul(usize, elem_count, tensor_dtype.byteSize()) != data.len) return error.InvalidShape;
+    const owned_shape = try self.allocator.dupe(i64, shape);
+    errdefer self.allocator.free(owned_shape);
+    var device = try allocDeviceBuffer(self, data.len);
     errdefer device.free(&self.ctx);
-    const data_bytes = std.mem.sliceAsBytes(data);
-    const tried_pinned_scalar_upload = pinnedScalarUploadEligible(self, data_bytes);
-    const copied_from_pinned = (try copyFromPinnedScalarUploadRing(self, device, data_bytes)) or
-        (try copyFromPinnedUploadArena(self, device, data_bytes));
+    const tried_pinned_scalar_upload = pinnedScalarUploadEligible(self, data);
+    const copied_from_pinned = (try copyFromPinnedScalarUploadRing(self, device, data)) or
+        (try copyFromPinnedUploadArena(self, device, data));
     if (!copied_from_pinned) {
         if (tried_pinned_scalar_upload) self.stats.pinned_scalar_upload_fallbacks += 1;
-        try copyFromHostTracked(self, device, data_bytes);
+        try copyFromHostTracked(self, device, data);
         try synchronizeAndDrainDeferredDeviceFrees(self);
         self.stats.upload_syncs += 1;
     }
     self.stats.from_float32_calls += 1;
-    const byte_len = data.len * @sizeOf(f32);
-    self.stats.from_float32_bytes += byte_len;
-    noteUploadBucket(&self.stats, byte_len);
-    noteTopTransferSize(&self.stats.upload_top_sizes, &self.stats.upload_top_counts, byte_len);
-
+    self.stats.from_float32_bytes += data.len;
+    noteUploadBucket(&self.stats, data.len);
+    noteTopTransferSize(&self.stats.upload_top_sizes, &self.stats.upload_top_counts, data.len);
     const tensor = try self.allocator.create(CudaTensor);
-    tensor.* = .{
-        .buffer = device,
-        .dtype = .f32,
-        .shape = shape_i64,
-        .elem_count = elem_count,
-    };
+    tensor.* = .{ .buffer = device, .dtype = tensor_dtype, .shape = owned_shape, .elem_count = elem_count };
     return tensor;
 }
 
-fn fromInt32ShapeOp(ctx: *anyopaque, data: []const i32, shape: []const i32) anyerror!?CT {
-    const self: *CudaCompute = @ptrCast(@alignCast(ctx));
-    var elem_count: usize = 1;
-    for (shape) |dim| {
-        if (dim < 0) return error.InvalidShape;
-        elem_count = try std.math.mul(usize, elem_count, @intCast(dim));
-    }
-    if (elem_count != data.len) return error.InvalidShape;
-
-    const shape_i64 = try self.allocator.alloc(i64, shape.len);
-    errdefer self.allocator.free(shape_i64);
+fn uploadTypedShape(ctx: *anyopaque, data: []const u8, dtype: ops.GraphDType, shape: []const i32) !CT {
+    if (shape.len > 8) return error.InvalidShape;
+    var shape_i64: [8]i64 = undefined;
     for (shape, 0..) |dim, i| shape_i64[i] = dim;
+    return (try fromConstantBytesOp(ctx, data, dtype, shape_i64[0..shape.len])).?;
+}
 
-    var device = try allocDeviceBuffer(self, data.len * @sizeOf(i32));
-    errdefer device.free(&self.ctx);
-    const data_bytes = std.mem.sliceAsBytes(data);
-    const tried_pinned_scalar_upload = pinnedScalarUploadEligible(self, data_bytes);
-    const copied_from_pinned = (try copyFromPinnedScalarUploadRing(self, device, data_bytes)) or
-        (try copyFromPinnedUploadArena(self, device, data_bytes));
-    if (!copied_from_pinned) {
-        if (tried_pinned_scalar_upload) self.stats.pinned_scalar_upload_fallbacks += 1;
-        try copyFromHostTracked(self, device, data_bytes);
-        try synchronizeAndDrainDeferredDeviceFrees(self);
-        self.stats.upload_syncs += 1;
-    }
-    self.stats.from_float32_calls += 1;
-    const byte_len = data.len * @sizeOf(i32);
-    self.stats.from_float32_bytes += byte_len;
-    noteUploadBucket(&self.stats, byte_len);
-    noteTopTransferSize(&self.stats.upload_top_sizes, &self.stats.upload_top_counts, byte_len);
+fn fromFloat32ShapeOp(ctx: *anyopaque, data: []const f32, shape: []const i32) anyerror!CT {
+    return uploadTypedShape(ctx, std.mem.sliceAsBytes(data), .f32, shape);
+}
 
-    const tensor = try self.allocator.create(CudaTensor);
-    tensor.* = .{
-        .buffer = device,
-        .dtype = .i32,
-        .shape = shape_i64,
-        .elem_count = elem_count,
-    };
-    return tensor;
+fn fromInt32ShapeOp(ctx: *anyopaque, data: []const i32, shape: []const i32) anyerror!?CT {
+    return try uploadTypedShape(ctx, std.mem.sliceAsBytes(data), .i32, shape);
+}
+
+fn writePhysicalFloat32Op(ctx: *anyopaque, output: CT, input: []const f32) anyerror!void {
+    const self: *CudaCompute = @ptrCast(@alignCast(ctx));
+    const target = tensorFromCt(output);
+    if (target.physical_lease == null or target.dtype != .f32 or target.elem_count != input.len) return error.InvalidPhysicalTransferSize;
+    try copyFromHostTracked(self, target.buffer, std.mem.sliceAsBytes(input));
+}
+
+fn readFloat32IntoOp(ctx: *anyopaque, tensor: CT, output: []f32) anyerror!bool {
+    const self: *CudaCompute = @ptrCast(@alignCast(ctx));
+    const source = tensorFromCt(tensor);
+    if (source.dtype != .f32 or source.quant_type != null) return false;
+    if (source.elem_count != output.len) return error.InvalidTensorShape;
+    try copyToHostTrackedAndSync(self, source.buffer, std.mem.sliceAsBytes(output));
+    noteFloat32Download(self, output.len * @sizeOf(f32));
+    return true;
+}
+
+fn noteFloat32Download(self: *CudaCompute, bytes: usize) void {
+    self.stats.to_float32_calls += 1;
+    self.stats.to_float32_bytes += bytes;
+    noteDownloadBucket(&self.stats, bytes);
+    noteTopTransferSize(&self.stats.download_top_sizes, &self.stats.download_top_counts, bytes);
 }
 
 fn toFloat32Op(ctx: *anyopaque, tensor: CT, allocator: std.mem.Allocator) anyerror![]f32 {
@@ -12137,10 +12177,7 @@ fn toFloat32Op(ctx: *anyopaque, tensor: CT, allocator: std.mem.Allocator) anyerr
     const out = try allocator.alloc(f32, cuda_tensor.elem_count);
     errdefer allocator.free(out);
     const byte_len = try downloadTensorToFloat32(self, cuda_tensor, allocator, out);
-    self.stats.to_float32_calls += 1;
-    self.stats.to_float32_bytes += byte_len;
-    noteDownloadBucket(&self.stats, byte_len);
-    noteTopTransferSize(&self.stats.download_top_sizes, &self.stats.download_top_counts, byte_len);
+    noteFloat32Download(self, byte_len);
     return out;
 }
 
@@ -13170,59 +13207,26 @@ fn primitiveReduceF32(
     input_ct: CT,
     axes: []const u8,
     input_shape: []const i64,
-    mode: enum(u32) { sum = 0, max = 1, mean = 2 },
+    mode: ops.kernel_descriptor.ReductionMode,
 ) anyerror!CT {
     const self: *CudaCompute = @ptrCast(@alignCast(ctx));
     const input = tensorFromCt(input_ct);
     try ensureF32(input);
     const rank = input_shape.len;
     if (rank == 0 or rank > 8 or input.shape.len != rank) return error.InvalidShape;
-    var dims = @as([8]u32, @splat(1));
-    var input_count: usize = 1;
-    for (0..rank) |idx| {
-        const dim_i64 = input.shape[idx];
-        if (dim_i64 <= 0 or dim_i64 > std.math.maxInt(u32)) return error.InvalidShape;
-        dims[idx] = @intCast(dim_i64);
-        input_count = try checkedMul(input_count, @intCast(dim_i64));
-    }
-    if (input_count != input.elem_count) return error.InvalidShape;
-
-    var reduce_mask: u32 = 0;
-    var reduce_count: usize = 1;
-    for (axes) |axis| {
-        if (axis >= rank) return error.InvalidShape;
-        const bit = @as(u32, 1) << @intCast(axis);
-        if ((reduce_mask & bit) != 0) continue;
-        reduce_mask |= bit;
-        reduce_count = try checkedMul(reduce_count, dims[axis]);
-    }
-    if (reduce_mask == 0) return (try cloneTensorShapeOp(ctx, input_ct, blk: {
+    const geometry = try ops.kernel_descriptor.ReductionGeometry.init(input.shape, axes);
+    if (geometry.input_count != input.elem_count) return error.InvalidShape;
+    if (geometry.mask == 0) {
         var shape_buf: [8]i32 = undefined;
         for (input.shape, 0..) |dim, idx| shape_buf[idx] = @intCast(dim);
-        break :blk shape_buf[0..rank];
-    })) orelse error.InvalidShape;
-
-    const output_shape = try self.allocator.alloc(i64, rank);
-    errdefer self.allocator.free(output_shape);
-    var output_count: usize = 1;
-    for (0..rank) |idx| {
-        output_shape[idx] = if ((reduce_mask & (@as(u32, 1) << @intCast(idx))) != 0) 1 else input.shape[idx];
-        output_count = try checkedMul(output_count, @intCast(output_shape[idx]));
+        return (try cloneTensorShapeOp(ctx, input_ct, shape_buf[0..rank])) orelse error.InvalidShape;
     }
+    const output_shape = try dupeShape(self.allocator, geometry.output_dims[0..rank]);
+    errdefer self.allocator.free(output_shape);
+    const output_count = geometry.output_count;
     var device = try allocDeviceBuffer(self, output_count * @sizeOf(f32));
     errdefer device.free(&self.ctx);
-    try self.kernels.launchPrimitiveReduceF32(
-        &self.ctx,
-        device,
-        input.buffer,
-        input_count,
-        output_count,
-        dims,
-        rank,
-        reduce_mask,
-        @backingInt(mode),
-        reduce_count,
-    );
+    try self.kernels.launchPrimitiveReduceF32(&self.ctx, device, input.buffer, geometry.input_count, output_count, geometry.dims, rank, geometry.mask, @backingInt(mode), geometry.reduce_count);
     return createTensor(self, device, output_shape, output_count);
 }
 
@@ -13310,65 +13314,7 @@ fn primBroadcastInDimOp(ctx: *anyopaque, input_ct: CT, target_shape: []const i64
     return createTensor(self, device, output_shape, output_count);
 }
 
-const BatchedDotGeneralPlan = struct {
-    batch_count: usize,
-    m: usize,
-    n: usize,
-    k: usize,
-    lhs_contract_last: bool,
-    rhs_contract_last: bool,
-};
-
-fn planBatchedDotGeneral(
-    lhs_shape: []const i64,
-    rhs_shape: []const i64,
-    lhs_contracting: []const u8,
-    rhs_contracting: []const u8,
-    lhs_batch: []const u8,
-    rhs_batch: []const u8,
-) !BatchedDotGeneralPlan {
-    if (lhs_contracting.len != 1 or rhs_contracting.len != 1) return error.UnsupportedShape;
-    if (lhs_batch.len == 0 or lhs_batch.len != rhs_batch.len) return error.UnsupportedShape;
-    if (lhs_shape.len != rhs_shape.len or lhs_shape.len != lhs_batch.len + 2 or lhs_shape.len > 8) {
-        return error.UnsupportedShape;
-    }
-
-    const rank = lhs_shape.len;
-    const matrix_axis0 = rank - 2;
-    const matrix_axis1 = rank - 1;
-    const lhs_contract_axis: usize = lhs_contracting[0];
-    const rhs_contract_axis: usize = rhs_contracting[0];
-    if ((lhs_contract_axis != matrix_axis0 and lhs_contract_axis != matrix_axis1) or
-        (rhs_contract_axis != matrix_axis0 and rhs_contract_axis != matrix_axis1))
-    {
-        return error.UnsupportedShape;
-    }
-    const lhs_free_axis = if (lhs_contract_axis == matrix_axis0) matrix_axis1 else matrix_axis0;
-    const rhs_free_axis = if (rhs_contract_axis == matrix_axis0) matrix_axis1 else matrix_axis0;
-
-    var batch_count: usize = 1;
-    for (lhs_batch, 0..) |lhs_axis, idx| {
-        const rhs_axis = rhs_batch[idx];
-        if (lhs_axis != idx or rhs_axis != idx) return error.UnsupportedShape;
-        const batch_dim = lhs_shape[idx];
-        if (batch_dim <= 0 or rhs_shape[idx] != batch_dim) return error.InvalidShape;
-        batch_count = try checkedMul(batch_count, @intCast(batch_dim));
-    }
-
-    const m_i64 = lhs_shape[lhs_free_axis];
-    const k_i64 = lhs_shape[lhs_contract_axis];
-    const rhs_k_i64 = rhs_shape[rhs_contract_axis];
-    const n_i64 = rhs_shape[rhs_free_axis];
-    if (m_i64 <= 0 or k_i64 <= 0 or n_i64 <= 0 or rhs_k_i64 != k_i64) return error.InvalidShape;
-    return .{
-        .batch_count = batch_count,
-        .m = @intCast(m_i64),
-        .n = @intCast(n_i64),
-        .k = @intCast(k_i64),
-        .lhs_contract_last = lhs_contract_axis == matrix_axis1,
-        .rhs_contract_last = rhs_contract_axis == matrix_axis1,
-    };
-}
+const planBatchedDotGeneral = @import("../kernel_geometry.zig").planBatchedDotGeneral;
 
 fn primDotGeneralOp(
     ctx: *anyopaque,
@@ -13657,13 +13603,13 @@ fn reshapeOp(ctx: *anyopaque, input: CT, new_shape: []const i64) anyerror!CT {
 
     const shape = try self.allocator.dupe(i64, new_shape);
     errdefer self.allocator.free(shape);
-    // Graph values use independent tensor handles and the interpreter may free
-    // an owned input at its last use. Preserve that ownership contract with an
-    // exact device copy, but retain the source dtype: token IDs are native i32
-    // on CUDA and BF16 activations must not be reinterpreted as four-byte f32.
     if (input_tensor.quant_type != null) return error.UnsupportedTensorType;
     const byte_len = try checkedMul(input_tensor.elem_count, input_tensor.dtype.byteSize());
     if (byte_len > input_tensor.buffer.len) return error.InvalidShape;
+    // Owning values and physical leases can produce a retained metadata view.
+    // Borrowed runtime slot handles keep their existing independent-copy path.
+    if (input_tensor.owned_by_tensor or input_tensor.physical_lease != null)
+        return makeRetainedTensorView(self, input_tensor, input_tensor.buffer, shape, input_tensor.elem_count);
     var device = try allocDeviceBuffer(self, byte_len);
     errdefer device.free(&self.ctx);
     try copyFromDeviceTracked(self, device, input_tensor.buffer, byte_len);
@@ -13694,19 +13640,7 @@ fn reshape2DOp(
     }
     const shape = try self.allocator.dupe(i64, &[_]i64{ @intCast(new_rows), @intCast(new_cols) });
     errdefer self.allocator.free(shape);
-    const tensor = try self.allocator.create(CudaTensor);
-    tensor.* = .{
-        .buffer = input_tensor.buffer,
-        .dtype = input_tensor.dtype,
-        .shape = shape,
-        .elem_count = input_tensor.elem_count,
-        .quant_type = input_tensor.quant_type,
-        .owns_buffer = false,
-        .owns_bf16_mirror = false,
-        .owns_training_upload_host = false,
-        .owns_shape = true,
-    };
-    return tensor;
+    return makeRetainedTensorView(self, input_tensor, input_tensor.buffer, shape, input_tensor.elem_count);
 }
 
 fn reshape2dOp(ctx: *anyopaque, input: CT, rows: usize, cols: usize) anyerror!CT {
@@ -13741,20 +13675,7 @@ fn sliceRows2DOp(
 
     const shape = try allocShape2(self.allocator, row_count, cols);
     errdefer self.allocator.free(shape);
-    const tensor = try self.allocator.create(CudaTensor);
-    tensor.* = .{
-        .buffer = .{
-            .ptr = input_tensor.buffer.ptr + @as(u64, @intCast(byte_offset)),
-            .len = byte_len,
-        },
-        .dtype = input_tensor.dtype,
-        .shape = shape,
-        .elem_count = out_count,
-        .quant_type = input_tensor.quant_type,
-        .owns_buffer = false,
-        .owns_shape = true,
-    };
-    return tensor;
+    return makeRetainedTensorView(self, input_tensor, .{ .ptr = input_tensor.buffer.ptr + @as(u64, @intCast(byte_offset)), .len = byte_len }, shape, out_count);
 }
 
 fn allocUninitF32ShapeOp(ctx: *anyopaque, shape_i32: []const i32) anyerror!?CT {
@@ -14060,6 +13981,13 @@ fn sliceLastDimOp(ctx: *anyopaque, input: CT, start: usize, stop: usize) anyerro
     try self.kernels.launchSliceLastDimF32(&self.ctx, device, input_tensor.buffer, rows, cols, start, out_cols);
     self.stats.launch_other += 1;
     return try createTensor(self, device, shape, out_count);
+}
+
+fn retainImmutableTensorOp(_: *anyopaque, tensor: CT) anyerror!?CT {
+    const source = tensorFromCt(tensor);
+    if (!source.owned_by_tensor) return null;
+    source.resident_references = try std.math.add(usize, source.resident_references, 1);
+    return tensor;
 }
 
 fn cloneTensorShapeOp(ctx: *anyopaque, input: CT, shape_i32: []const i32) anyerror!?CT {
@@ -15571,19 +15499,23 @@ fn linear(ctx: *anyopaque, input: CT, weight: CT, bias: CT, rows: usize, in_dim:
             else => return error.UnsupportedTensorType,
         }
     } else {
-        if (try tryCublasLtF32Linear(self, device, input_tensor.buffer, weight_tensor.buffer, rows, in_dim, out_dim)) {
-            try self.kernels.launchAddBiasRowsF32(&self.ctx, device, bias_tensor.buffer, rows, out_dim);
-            self.dispatch_stats.note(self.allocator, .linear, .f32, .dense_lt, .bias, .none, rows, in_dim, out_dim, 0);
-        } else if (rows >= 2 and in_dim >= 256 and out_dim >= 4) {
-            try self.kernels.launchLinearBiasTile4Rows2F32(&self.ctx, device, input_tensor.buffer, weight_tensor.buffer, bias_tensor.buffer, rows, in_dim, out_dim);
-            self.dispatch_stats.note(self.allocator, .linear, .f32, .f32_cuda, .bias, .none, rows, in_dim, out_dim, 0);
-        } else {
-            try self.kernels.launchLinearBiasF32(&self.ctx, device, input_tensor.buffer, weight_tensor.buffer, bias_tensor.buffer, rows, in_dim, out_dim);
-            self.dispatch_stats.note(self.allocator, .linear, .f32, .f32_cuda, .bias, .none, rows, in_dim, out_dim, 0);
-        }
+        try linearF32BiasInto(self, device, input_tensor, weight_tensor, bias_tensor, rows, in_dim, out_dim);
     }
     self.stats.launch_linear += 1;
     return createTensor(self, device, shape, out_count);
+}
+
+fn linearF32BiasInto(self: *CudaCompute, device: buffer_mod.DeviceBuffer, input_tensor: *const CudaTensor, weight_tensor: *const CudaTensor, bias_tensor: *const CudaTensor, rows: usize, in_dim: usize, out_dim: usize) !void {
+    if (try tryCublasLtF32Linear(self, device, input_tensor.buffer, weight_tensor.buffer, rows, in_dim, out_dim)) {
+        try self.kernels.launchAddBiasRowsF32(&self.ctx, device, bias_tensor.buffer, rows, out_dim);
+        self.dispatch_stats.note(self.allocator, .linear, .f32, .dense_lt, .bias, .none, rows, in_dim, out_dim, 0);
+    } else if (rows >= 2 and in_dim >= 256 and out_dim >= 4) {
+        try self.kernels.launchLinearBiasTile4Rows2F32(&self.ctx, device, input_tensor.buffer, weight_tensor.buffer, bias_tensor.buffer, rows, in_dim, out_dim);
+        self.dispatch_stats.note(self.allocator, .linear, .f32, .f32_cuda, .bias, .none, rows, in_dim, out_dim, 0);
+    } else {
+        try self.kernels.launchLinearBiasF32(&self.ctx, device, input_tensor.buffer, weight_tensor.buffer, bias_tensor.buffer, rows, in_dim, out_dim);
+        self.dispatch_stats.note(self.allocator, .linear, .f32, .f32_cuda, .bias, .none, rows, in_dim, out_dim, 0);
+    }
 }
 
 fn linearPlanned(ctx: *anyopaque, request: *const ops.LinearPlannedRequest) anyerror!CT {
@@ -16351,28 +16283,32 @@ fn linearNoBiasWithPolicy(ctx: *anyopaque, input: CT, weight: CT, rows: usize, i
             self.dispatch_stats.note(self.allocator, .linear_no_bias, .bf16, .dense_cuda, .none, .none, rows, in_dim, out_dim, 0);
         }
     } else {
-        if (primitive_training and self.training_blas != null) {
-            const blas = try trainingBlas(self);
-            try blas.linear(self.ctx.stream, @ptrFromInt(device.ptr), @ptrFromInt(input_tensor.buffer.ptr), @ptrFromInt(weight_tensor.buffer.ptr), rows, in_dim, out_dim, false);
-            self.dispatch_stats.note(self.allocator, .linear_no_bias, .f32, .dense_blas, .none, .none, rows, in_dim, out_dim, 0);
-        } else if (try tryCublasLtF32Linear(self, device, input_tensor.buffer, weight_tensor.buffer, rows, in_dim, out_dim)) {
-            self.dispatch_stats.note(self.allocator, .linear_no_bias, .f32, .dense_lt, .none, .none, rows, in_dim, out_dim, 0);
-        } else if (cudaF32LinearTiledEnabled() and rows <= 16 and in_dim >= 512 and
-            (out_dim >= 512 or
-                (self.a4b_runtime != null and isA4bRouterDecodeShape(rows, in_dim, out_dim))))
-        {
-            self.kernels.launchLinearF32Tiled(&self.ctx, device, input_tensor.buffer, weight_tensor.buffer, rows, in_dim, out_dim) catch |tiled_err| switch (tiled_err) {
-                error.CudaKernelUnavailable, error.InvalidCudaState => try self.kernels.launchLinearF32(&self.ctx, device, input_tensor.buffer, weight_tensor.buffer, rows, in_dim, out_dim),
-                else => return tiled_err,
-            };
-            self.dispatch_stats.note(self.allocator, .linear_no_bias, .f32, .f32_cuda, .none, .none, rows, in_dim, out_dim, 0);
-        } else {
-            try self.kernels.launchLinearF32(&self.ctx, device, input_tensor.buffer, weight_tensor.buffer, rows, in_dim, out_dim);
-            self.dispatch_stats.note(self.allocator, .linear_no_bias, .f32, .f32_cuda, .none, .none, rows, in_dim, out_dim, 0);
-        }
+        try linearF32NoBiasInto(self, device, input_tensor, weight_tensor, rows, in_dim, out_dim, primitive_training);
     }
     self.stats.launch_linear += 1;
     return createTensor(self, device, shape, out_count);
+}
+
+fn linearF32NoBiasInto(self: *CudaCompute, device: buffer_mod.DeviceBuffer, input_tensor: *const CudaTensor, weight_tensor: *const CudaTensor, rows: usize, in_dim: usize, out_dim: usize, primitive_training: bool) !void {
+    if (primitive_training and self.training_blas != null) {
+        const blas = try trainingBlas(self);
+        try blas.linear(self.ctx.stream, @ptrFromInt(device.ptr), @ptrFromInt(input_tensor.buffer.ptr), @ptrFromInt(weight_tensor.buffer.ptr), rows, in_dim, out_dim, false);
+        self.dispatch_stats.note(self.allocator, .linear_no_bias, .f32, .dense_blas, .none, .none, rows, in_dim, out_dim, 0);
+    } else if (try tryCublasLtF32Linear(self, device, input_tensor.buffer, weight_tensor.buffer, rows, in_dim, out_dim)) {
+        self.dispatch_stats.note(self.allocator, .linear_no_bias, .f32, .dense_lt, .none, .none, rows, in_dim, out_dim, 0);
+    } else if (cudaF32LinearTiledEnabled() and rows <= 16 and in_dim >= 512 and
+        (out_dim >= 512 or
+            (self.a4b_runtime != null and isA4bRouterDecodeShape(rows, in_dim, out_dim))))
+    {
+        self.kernels.launchLinearF32Tiled(&self.ctx, device, input_tensor.buffer, weight_tensor.buffer, rows, in_dim, out_dim) catch |tiled_err| switch (tiled_err) {
+            error.CudaKernelUnavailable, error.InvalidCudaState => try self.kernels.launchLinearF32(&self.ctx, device, input_tensor.buffer, weight_tensor.buffer, rows, in_dim, out_dim),
+            else => return tiled_err,
+        };
+        self.dispatch_stats.note(self.allocator, .linear_no_bias, .f32, .f32_cuda, .none, .none, rows, in_dim, out_dim, 0);
+    } else {
+        try self.kernels.launchLinearF32(&self.ctx, device, input_tensor.buffer, weight_tensor.buffer, rows, in_dim, out_dim);
+        self.dispatch_stats.note(self.allocator, .linear_no_bias, .f32, .f32_cuda, .none, .none, rows, in_dim, out_dim, 0);
+    }
 }
 
 fn linearNoBiasForQ4Route(
@@ -25905,7 +25841,20 @@ fn debugTimingSnapshotOp(ctx: *anyopaque) ops.BackendDebugTimingSnapshot {
     };
 }
 
+const kernel_backend_impl = ops.KernelBackend{
+    .physicalExecutionScope = &physicalExecutionScopeOp,
+    .allocatePhysicalStorage = &allocatePhysicalStorageOp,
+    .physicalTensorView = &physicalTensorViewOp,
+    .assignedKernelWorkspace = &assignedKernelWorkspaceOp,
+    .runAssignedKernel = &runAssignedKernelOp,
+    .createPhysicalCompletion = &createPhysicalCompletionOp,
+    .readFloat32Into = &readFloat32IntoOp,
+    .writePhysicalFloat32 = &writePhysicalFloat32Op,
+    .retainImmutableTensor = &retainImmutableTensorOp,
+};
+
 const vtable = ops.ComputeBackend.VTable{
+    .kernels = &kernel_backend_impl,
     .backendKind = &backendKind,
     .modelConstant = &modelConstantOp,
     .audioFrontend = &audioFrontendOp,
@@ -26080,6 +26029,7 @@ const vtable = ops.ComputeBackend.VTable{
     .gqaPagedAttention = &gqaPagedAttention,
     .fromFloat32 = &fromFloat32Op,
     .fromFloat32Shape = &fromFloat32ShapeOp,
+    .fromConstantBytes = &fromConstantBytesOp,
     .fromInt32Shape = &fromInt32ShapeOp,
     .toFloat32 = &toFloat32Op,
     .exportTensorData = &exportTensorDataOp,
@@ -27409,4 +27359,403 @@ test "embeddinggemma2 CUDA active audio plan declines recursion and cache reclam
     try std.testing.expectError(error.CudaGraphCaptureUnsafeHostCopy, copyFromHostTracked(&compute, undefined, &bytes));
     try std.testing.expectError(error.CudaGraphCaptureUnsafeHostCopy, copyToHostTracked(&compute, undefined, &bytes));
     try std.testing.expectError(error.CudaGraphCaptureUnsafeHostCopy, copyToHostTrackedAndSync(&compute, undefined, &bytes));
+}
+
+fn physicalExecutionScopeOp(ctx: *anyopaque, leases: ?[]const ?*ops.physical_storage.Lease) anyerror!void {
+    const self: *CudaCompute = @ptrCast(@alignCast(ctx));
+    if (leases != null and self.physical_execution_storage != null) return error.PhysicalExecutionScopeActive;
+    self.physical_execution_storage = leases;
+}
+
+fn retainPhysicalCaptureTensor(self: *CudaCompute, value: CT) !void {
+    if (!self.debug_cuda_graph_capture_active) return;
+    if (tensorFromCt(value).physical_lease) |lease| try self.capturing_physical_storage.retain(self.allocator, lease);
+}
+
+fn physicalTensorViewOp(ctx: *anyopaque, request: ops.physical_storage.View) anyerror!?CT {
+    const self: *CudaCompute = @ptrCast(@alignCast(ctx));
+    const source = tensorFromCt(request.storage.tensor);
+    if (source.dtype != .f32 or request.shape.len > 8) return null;
+    var count: usize = 1;
+    const shape = try self.allocator.alloc(i64, request.shape.len);
+    errdefer self.allocator.free(shape);
+    for (request.shape, shape) |dim, *target| {
+        if (dim <= 0) return error.InvalidShape;
+        count = try checkedMul(count, @intCast(dim));
+        target.* = dim;
+    }
+    if (count > source.elem_count) return error.InvalidShape;
+    if (self.debug_cuda_graph_capture_active) try self.capturing_physical_storage.retain(self.allocator, request.storage);
+    const tensor = try createTensor(self, .{ .ptr = source.buffer.ptr, .len = count * @sizeOf(f32) }, shape, count);
+    tensorFromCt(tensor).owns_buffer = false;
+    request.storage.retain();
+    tensorFromCt(tensor).physical_lease = request.storage;
+    return tensor;
+}
+
+fn assignedKernelWorkspaceOp(_: *anyopaque, descriptor: *const ops.kernel_descriptor.Descriptor) anyerror!ops.kernel_descriptor.WorkspaceRequirement {
+    if (descriptor.operation == .dot and descriptor.input_shapes[0].rank() == 2 and descriptor.operation.dot.lhs_contract_last and !descriptor.operation.dot.rhs_contract_last)
+        return .{ .byte_size = @as(usize, @intCast(descriptor.input_shapes[1].numElements().?)) * @sizeOf(f32) };
+    return .{};
+}
+
+fn runAssignedKernelOp(ctx: *anyopaque, request: ops.kernel_descriptor.Invocation) anyerror!bool {
+    const self: *CudaCompute = @ptrCast(@alignCast(ctx));
+    const descriptor = request.descriptor;
+    if (request.inputs.len != descriptor.input_count) return error.InvalidShape;
+    for (request.inputs, 0..) |input, i| {
+        const tensor = tensorFromCt(input);
+        if (tensor.dtype != .f32 or tensor.quant_type != null or tensor.elem_count != descriptor.input_shapes[i].numElements().?) return false;
+    }
+    if (descriptor.operation == .linear) {
+        const weight = tensorFromCt(request.inputs[1]);
+        if (weight.bf16_mirror.ptr != 0 or boundaryMixedWeight(self, weight) != null) return false;
+    }
+    // RMS normalization may create a BF16 mirror used by later mixed GEMMs.
+    // Keep that qualified route until auxiliary storage is in the descriptor.
+    if (descriptor.operation == .norm and descriptor.operation.norm.kind == .rms) return false;
+    if (descriptor.operation == .dot) {
+        const dot = descriptor.operation.dot;
+        const weight = tensorFromCt(request.inputs[1]);
+        const unbatched = descriptor.input_shapes[0].rank() == 2;
+        if (unbatched and dot.lhs_contract_last and self.training_blas == null) {
+            if (weight.bf16_mirror.ptr != 0 or boundaryMixedWeight(self, weight) != null) return false;
+        }
+    }
+    const output_ct = request.output orelse return true;
+    const output = tensorFromCt(output_ct);
+    if (output.physical_lease == null or output.elem_count != descriptor.elements()) return error.InvalidShape;
+    for (request.inputs) |input| try retainPhysicalCaptureTensor(self, input);
+    try retainPhysicalCaptureTensor(self, output_ct);
+    if (request.workspace) |workspace| try retainPhysicalCaptureTensor(self, workspace);
+    const a = tensorFromCt(request.inputs[0]);
+    switch (descriptor.operation) {
+        .transpose, .broadcast => |layout| {
+            var input_dims: [8]u32 = @splat(1);
+            var output_dims: [8]u32 = @splat(1);
+            for (descriptor.input_shapes[0].dims[0..layout.input_rank], 0..) |dim, axis| input_dims[axis] = @intCast(dim);
+            if (descriptor.operation == .transpose) {
+                try self.kernels.launchPrimitiveTransposeF32(&self.ctx, output.buffer, a.buffer, a.elem_count, input_dims, layout.axes, layout.input_rank);
+            } else {
+                for (descriptor.output_shape.dims[0..layout.output_rank], 0..) |dim, axis| output_dims[axis] = @intCast(dim);
+                try self.kernels.launchPrimitiveBroadcastF32(&self.ctx, output.buffer, a.buffer, a.elem_count, output.elem_count, input_dims, output_dims, layout.axes, layout.input_rank, layout.output_rank);
+            }
+            return true;
+        },
+        .dot => |dot| {
+            const rhs = tensorFromCt(request.inputs[1]);
+            const unbatched = descriptor.input_shapes[0].rank() == 2;
+            if (unbatched and self.training_blas != null) {
+                try self.ctx.makeCurrent();
+                try self.training_blas.?.matrix(self.ctx.stream, @ptrFromInt(output.buffer.ptr), @ptrFromInt(a.buffer.ptr), @ptrFromInt(rhs.buffer.ptr), dot.m, dot.k, dot.n, !dot.lhs_contract_last, dot.rhs_contract_last, false);
+            } else if (unbatched and dot.lhs_contract_last) {
+                if (dot.rhs_contract_last) {
+                    try linearF32NoBiasInto(self, output.buffer, a, rhs, dot.m, dot.k, dot.n, true);
+                } else {
+                    const workspace = tensorFromCt(request.workspace orelse return error.MissingAssignedWorkspace);
+                    if (workspace.physical_lease == null or workspace.dtype != .f32 or workspace.elem_count < rhs.elem_count) return error.InvalidShape;
+                    const dims = [8]u32{ @intCast(dot.k), @intCast(dot.n), 1, 1, 1, 1, 1, 1 };
+                    const perm = [8]u32{ 1, 0, 0, 0, 0, 0, 0, 0 };
+                    try self.kernels.launchPrimitiveTransposeF32(&self.ctx, workspace.buffer, rhs.buffer, rhs.elem_count, dims, perm, 2);
+                    var transposed = rhs.*;
+                    transposed.buffer = workspace.buffer;
+                    try linearF32NoBiasInto(self, output.buffer, a, &transposed, dot.m, dot.k, dot.n, true);
+                }
+            } else try self.kernels.launchPrimitiveBatchedDotF32(&self.ctx, output.buffer, a.buffer, rhs.buffer, dot.batch_count, dot.m, dot.n, dot.k, dot.lhs_contract_last, dot.rhs_contract_last);
+            self.stats.launch_linear += 1;
+            return true;
+        },
+        .reduction => |reduction| {
+            const geometry = reduction.geometry;
+            if (geometry.mask == 0) {
+                try copyFromDeviceTracked(self, output.buffer, a.buffer, output.elem_count * @sizeOf(f32));
+                return true;
+            }
+            try self.kernels.launchPrimitiveReduceF32(&self.ctx, output.buffer, a.buffer, geometry.input_count, geometry.output_count, geometry.dims, geometry.rank, geometry.mask, @backingInt(reduction.mode), geometry.reduce_count);
+            return true;
+        },
+        .norm => |norm| {
+            try self.kernels.launchLayerNormF32(&self.ctx, output.buffer, a.buffer, tensorFromCt(request.inputs[1]).buffer, tensorFromCt(request.inputs[2]).buffer, a.elem_count / norm.dim, norm.dim, norm.eps);
+            self.stats.launch_norm += 1;
+            self.stats.launch_norm_layer += 1;
+            return true;
+        },
+        .softmax => |softmax| {
+            try self.kernels.launchPrimitiveSoftmaxF32(&self.ctx, output.buffer, a.buffer, a.elem_count, softmax.width, softmax.logarithmic);
+            return true;
+        },
+        .linear => |linear_desc| {
+            const weight = tensorFromCt(request.inputs[1]);
+            if (linear_desc.bias) try linearF32BiasInto(self, output.buffer, a, weight, tensorFromCt(request.inputs[2]), linear_desc.rows, linear_desc.in_dim, linear_desc.out_dim) else try linearF32NoBiasInto(self, output.buffer, a, weight, linear_desc.rows, linear_desc.in_dim, linear_desc.out_dim, false);
+            self.stats.launch_linear += 1;
+            return true;
+        },
+        .unary => |op| switch (op) {
+            inline else => |tag| try self.kernels.launchElementwiseF32(&self.ctx, output.buffer, a.buffer, .{}, output.elem_count, @field(kernels_mod.ElementwiseOp, @tagName(tag))),
+        },
+        .binary => |op| {
+            const b = tensorFromCt(request.inputs[1]);
+            const kernel_op: kernels_mod.ElementwiseOp = switch (op) {
+                .add => .add,
+                .subtract => .subtract,
+                .multiply => .multiply,
+                .divide => .divide,
+            };
+            if (a.elem_count == b.elem_count) {
+                try self.kernels.launchElementwiseF32(&self.ctx, output.buffer, a.buffer, b.buffer, output.elem_count, kernel_op);
+            } else {
+                const left = a.elem_count == 1;
+                const data = if (left) b else a;
+                const scalar = if (left) a else b;
+                try self.kernels.launchBinaryScalarF32(&self.ctx, output.buffer, data.buffer, scalar.buffer, output.elem_count, kernel_op, left);
+            }
+        },
+    }
+    self.stats.launch_elementwise += 1;
+    return true;
+}
+
+const PhysicalCompletionContext = struct {
+    compute: *CudaCompute,
+    event: driver_mod.CUevent,
+    recorded_stream: driver_mod.CUstream = null,
+    recorded: bool = false,
+    const vtable = ops.physical_storage.Completion.VTable{ .record = record, .before_reuse = beforeReuse, .wait = wait, .deinit = deinit };
+    fn record(raw: *anyopaque) !void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        try self.compute.ctx.recordEvent(self.event);
+        self.recorded_stream = self.compute.ctx.stream;
+        self.recorded = true;
+    }
+    fn beforeReuse(raw: *anyopaque) !void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        // Commands in one CUDA stream are ordered already. A changed stream
+        // must explicitly depend on the recorded submission before reuse.
+        if (self.recorded and self.recorded_stream != self.compute.ctx.stream) try self.compute.ctx.waitEvent(self.event);
+    }
+    fn wait(raw: *anyopaque) !void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        if (!self.recorded) return;
+        try self.compute.ctx.makeCurrent();
+        try self.compute.ctx.driver.check(self.compute.ctx.driver.fns.cuEventSynchronize(self.event));
+    }
+    fn deinit(raw: *anyopaque) void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        self.compute.ctx.destroyEvent(self.event);
+        self.compute.allocator.destroy(self);
+    }
+};
+fn createPhysicalCompletionOp(ctx: *anyopaque) anyerror!ops.physical_storage.Completion {
+    const compute: *CudaCompute = @ptrCast(@alignCast(ctx));
+    const self = try compute.allocator.create(PhysicalCompletionContext);
+    errdefer compute.allocator.destroy(self);
+    self.* = .{ .compute = compute, .event = try compute.ctx.createStreamEvent() };
+    return .{ .ptr = self, .vtable = &PhysicalCompletionContext.vtable };
+}
+
+/// The view owns its metadata and retains storage without issuing a device
+/// copy. Borrowed backend slot records remain scoped to their backend owner.
+fn makeRetainedTensorView(self: *CudaCompute, source: *CudaTensor, buffer: buffer_mod.DeviceBuffer, shape: []i64, count: usize) !CT {
+    if (source.quant_type == null and try checkedMul(count, source.dtype.byteSize()) > buffer.len) return error.InvalidShape;
+    const tensor = try self.allocator.create(CudaTensor);
+    tensor.* = .{
+        .buffer = buffer,
+        .dtype = source.dtype,
+        .shape = shape,
+        .elem_count = count,
+        .quant_type = source.quant_type,
+        .owns_buffer = false,
+        .owns_tc_quant = false,
+        .owns_bf16_mirror = false,
+        .owns_training_upload_host = false,
+    };
+    if (source.physical_lease) |lease| {
+        lease.retain();
+        tensor.physical_lease = lease;
+    } else if (source.owned_by_tensor) {
+        source.resident_references += 1;
+        tensor.resident_parent = source;
+    }
+    return tensor;
+}
+
+test "CUDA retained reshape and row views preserve owning metadata without GPU access" {
+    const Case = struct {
+        fn run(a: std.mem.Allocator) !void {
+            var compute: CudaCompute = undefined;
+            compute.allocator = a;
+            const source = try a.create(CudaTensor);
+            source.* = .{ .buffer = .{ .ptr = 4096, .len = 64 }, .dtype = .f32, .shape = @constCast(&[_]i64{ 4, 4 }), .elem_count = 16, .owns_buffer = false, .owns_shape = false };
+            var source_owned = true;
+            defer if (source_owned) freeTensor(&compute, source);
+            const reshaped = try reshapeOp(&compute, source, &.{ 2, 8 });
+            defer freeTensor(&compute, reshaped);
+            const sliced = try sliceRows2DOp(&compute, source, 1, 2, 4);
+            defer freeTensor(&compute, sliced);
+            const matrix = try reshape2DOp(&compute, source, 4, 4, 8, 2);
+            defer freeTensor(&compute, matrix);
+            try std.testing.expectEqual(@as(usize, 4), source.resident_references);
+            freeTensor(&compute, source);
+            source_owned = false;
+            try std.testing.expectEqual(@as(u64, 4096), tensorFromCt(reshaped).buffer.ptr);
+            try std.testing.expectEqual(@as(u64, 4112), tensorFromCt(sliced).buffer.ptr);
+            try std.testing.expectEqualSlices(i64, &.{ 8, 2 }, tensorFromCt(matrix).shape);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
+}
+
+fn allocatePhysicalStorageOp(ctx: *anyopaque, byte_size: usize) anyerror!?CT {
+    const self: *CudaCompute = @ptrCast(@alignCast(ctx));
+    if (byte_size == 0 or byte_size % @sizeOf(f32) != 0) return error.InvalidShape;
+    // Stable addresses must be prepared before capture. Never silently learn
+    // another ordinal or borrow a pinned temporary allocation for a plan slot.
+    if (self.debug_cuda_graph_capture_active) {
+        self.debug_cuda_graph_capture_disabled = true;
+        return error.CudaGraphCaptureUnsafeTempAlloc;
+    }
+    const shape = try self.allocator.dupe(i64, &.{@intCast(byte_size / @sizeOf(f32))});
+    errdefer self.allocator.free(shape);
+    while (!self.temp_buffer_mutex.tryLock()) std.atomic.spinLoopHint();
+    var device = allocUnpinnedDeviceBufferUnlocked(self, byte_size, self.temp_trace_seq, false) catch |err| {
+        self.temp_buffer_mutex.unlock();
+        return err;
+    };
+    self.temp_buffer_mutex.unlock();
+    errdefer device.free(&self.ctx);
+    const tensor = try createTensor(self, device, shape, byte_size / @sizeOf(f32));
+    tensorFromCt(tensor).physical_storage_base = true;
+    return tensor;
+}
+
+test "CUDA physical completion orders default stream changes and waits only at retirement" {
+    const Fake = struct {
+        var records: usize = 0;
+        var dependencies: usize = 0;
+        var waits: usize = 0;
+        fn current(_: driver_mod.CUcontext) callconv(.c) driver_mod.CUresult {
+            return driver_mod.CUDA_SUCCESS;
+        }
+        fn record(_: driver_mod.CUevent, _: driver_mod.CUstream) callconv(.c) driver_mod.CUresult {
+            records += 1;
+            return driver_mod.CUDA_SUCCESS;
+        }
+        fn depend(_: driver_mod.CUstream, _: driver_mod.CUevent, _: c_uint) callconv(.c) driver_mod.CUresult {
+            dependencies += 1;
+            return driver_mod.CUDA_SUCCESS;
+        }
+        fn wait(_: driver_mod.CUevent) callconv(.c) driver_mod.CUresult {
+            waits += 1;
+            return driver_mod.CUDA_SUCCESS;
+        }
+    };
+    Fake.records = 0;
+    Fake.dependencies = 0;
+    Fake.waits = 0;
+    var driver: driver_mod.CudaDriver = undefined;
+    driver.fns.cuCtxSetCurrent = Fake.current;
+    driver.fns.cuEventRecord = Fake.record;
+    driver.fns.cuStreamWaitEvent = Fake.depend;
+    driver.fns.cuEventSynchronize = Fake.wait;
+    var compute: CudaCompute = undefined;
+    compute.ctx.driver = driver;
+    compute.ctx.ctx = @ptrFromInt(1);
+    compute.ctx.stream = null;
+    var fence = PhysicalCompletionContext{ .compute = &compute, .event = @ptrFromInt(3) };
+    try PhysicalCompletionContext.wait(&fence);
+    try std.testing.expectEqual(@as(usize, 0), Fake.waits);
+    try PhysicalCompletionContext.record(&fence);
+    try PhysicalCompletionContext.beforeReuse(&fence);
+    try std.testing.expectEqual(@as(usize, 0), Fake.dependencies);
+    compute.ctx.stream = @ptrFromInt(2);
+    try PhysicalCompletionContext.beforeReuse(&fence);
+    try std.testing.expectEqual(@as(usize, 1), Fake.dependencies);
+    try std.testing.expectEqual(@as(usize, 0), Fake.waits);
+    try PhysicalCompletionContext.wait(&fence);
+    try std.testing.expectEqual(@as(usize, 1), Fake.waits);
+    try std.testing.expectEqual(@as(usize, 1), Fake.records);
+}
+
+test "CUDA immutable retention shares typed payload and metadata without GPU submission" {
+    const a = std.testing.allocator;
+    var compute: CudaCompute = undefined;
+    compute.allocator = a;
+    const source = try a.create(CudaTensor);
+    source.* = .{ .buffer = .{ .ptr = 4096, .len = 16 }, .dtype = .i32, .shape = @constCast(&[_]i64{4}), .elem_count = 4, .owns_buffer = false, .owns_shape = false };
+    const retained = (try retainImmutableTensorOp(&compute, source)).?;
+    try std.testing.expectEqual(source, tensorFromCt(retained));
+    try std.testing.expectEqual(@as(usize, 2), source.resident_references);
+    freeTensor(&compute, source);
+    try std.testing.expectEqual(@as(u64, 4096), tensorFromCt(retained).buffer.ptr);
+    try std.testing.expectEqual(.i32, tensorFromCt(retained).dtype);
+    freeTensor(&compute, retained);
+}
+
+test "CUDA planned transfers reject host copies during capture before device submission" {
+    var compute: CudaCompute = undefined;
+    compute.audio_scope = null;
+    compute.debug_cuda_graph_capture_active = true;
+    compute.debug_cuda_graph_capture_disabled = false;
+    var tensor = CudaTensor{ .buffer = .{ .ptr = 4096, .len = 4 }, .dtype = .f32, .shape = @constCast(&[_]i64{1}), .elem_count = 1, .owns_buffer = false, .owns_shape = false, .physical_lease = @ptrFromInt(8) };
+    try std.testing.expectError(error.CudaGraphCaptureUnsafeHostCopy, writePhysicalFloat32Op(&compute, &tensor, &.{1}));
+    try std.testing.expect(compute.debug_cuda_graph_capture_disabled);
+    compute.debug_cuda_graph_capture_disabled = false;
+    var output = [_]f32{99};
+    try std.testing.expectError(error.CudaGraphCaptureUnsafeHostCopy, readFloat32IntoOp(&compute, &tensor, &output));
+    try std.testing.expect(compute.debug_cuda_graph_capture_disabled);
+    try std.testing.expectEqual(@as(f32, 99), output[0]);
+    compute.debug_cuda_graph_capture_disabled = false;
+    try std.testing.expectError(error.InvalidPhysicalTransferSize, writePhysicalFloat32Op(&compute, &tensor, &.{ 1, 2 }));
+    try std.testing.expect(!compute.debug_cuda_graph_capture_disabled);
+}
+
+test "CUDA physical capture scopes reject nesting and retain operand addresses" {
+    if (comptime @import("build_options").enable_wasm) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var context = try @import("../../backends/compute_context.zig").BackendContext.init(a, .native, null);
+    defer context.deinit(a);
+    const lease = (try ops.physical_storage.Lease.create(a, context.computeBackend(), 16)).?;
+    defer lease.release();
+    var compute: CudaCompute = undefined;
+    compute.allocator = a;
+    compute.physical_execution_storage = null;
+    compute.capturing_physical_storage = .{};
+    defer compute.capturing_physical_storage.deinit(a);
+    compute.debug_cuda_graph_capture_active = false;
+    const leases = [_]?*ops.physical_storage.Lease{lease};
+    try physicalExecutionScopeOp(&compute, &leases);
+    try std.testing.expectError(error.PhysicalExecutionScopeActive, physicalExecutionScopeOp(&compute, &leases));
+    try physicalExecutionScopeOp(&compute, null);
+    try std.testing.expect(compute.physical_execution_storage == null);
+    var tensor: CudaTensor = undefined;
+    tensor.physical_lease = lease;
+    try retainPhysicalCaptureTensor(&compute, @ptrCast(&tensor));
+    try std.testing.expect(lease.unique());
+    compute.debug_cuda_graph_capture_active = true;
+    try retainPhysicalCaptureTensor(&compute, @ptrCast(&tensor));
+    try retainPhysicalCaptureTensor(&compute, @ptrCast(&tensor));
+    try std.testing.expectEqual(@as(usize, 2), lease.references.load(.acquire));
+    // A scalar-mode change can keep an exec for update. Its old addresses
+    // remain owned until that exec has actually been replaced or destroyed.
+    var slot = CudaGraphReplaySlot{ .physical_storage = compute.capturing_physical_storage };
+    compute.capturing_physical_storage = .{};
+    defer slot.physical_storage.deinit(a);
+    resetCudaGraphReplaySlotMetadataKeepExec(&compute, &slot);
+    try std.testing.expectEqual(@as(usize, 2), lease.references.load(.acquire));
+}
+
+test "CUDA row snapshots use stable allocation and fail closed before capture device access" {
+    const Probe = struct {
+        fn dtype(_: *anyopaque, _: CT) anyerror!tensor_mod.DType {
+            return .f32;
+        }
+    };
+    var compute: CudaCompute = undefined;
+    compute.debug_cuda_graph_capture_active = true;
+    compute.debug_cuda_graph_capture_disabled = false;
+    var callbacks = vtable;
+    callbacks.tensorDType = Probe.dtype;
+    const backend = ops.ComputeBackend{ .ptr = &compute, .vtable = &callbacks };
+    try std.testing.expectError(error.CudaGraphCaptureUnsafeTempAlloc, backend.snapshotRows2D(std.testing.allocator, @ptrFromInt(8), 0, 2, 2));
+    try std.testing.expect(compute.debug_cuda_graph_capture_disabled);
 }

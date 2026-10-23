@@ -199,16 +199,6 @@ fn ensureModelExecutor(
     return &cached.executor;
 }
 
-fn resetRuntimeAtPrefillStart(runtime: *model_runtime.ModelRuntime, request: model_runtime.PrefillRequest) !void {
-    // A fresh prompt starts at position zero. Later chunks must retain the
-    // runtime-owned KV written by earlier chunks.
-    if (request.seq_len == request.query_seq_len) {
-        try request.check();
-        try runtime.reset();
-        try request.check();
-    }
-}
-
 fn executeModelForward(
     allocator: std.mem.Allocator,
     cache: *cache_mod.GraphCache,
@@ -233,107 +223,7 @@ fn executeModelForward(
         executor,
     );
 
-    var output = switch (request) {
-        .prefill => |prefill_request| blk: {
-            try resetRuntimeAtPrefillStart(runtime, prefill_request);
-            break :blk runtime.prefill(allocator, prefill_request) catch |err| switch (err) {
-                error.UnsupportedShape,
-                error.UnsupportedDecode,
-                error.MissingPastKeyValue,
-                error.MissingValue,
-                => return null,
-                else => return err,
-            };
-        },
-        .decode => |decode_request| runtime.decode(allocator, decode_request) catch |err| switch (err) {
-            error.UnsupportedShape,
-            error.UnsupportedDecode,
-            error.MissingPastKeyValue,
-            error.MissingValue,
-            => return null,
-            else => return err,
-        },
-    };
-    return try output.takeHostLogits(allocator);
-}
-
-fn executeRuntimeForward(
-    allocator: std.mem.Allocator,
-    runtime: *model_runtime.ModelRuntime,
-    request: model_runtime.ForwardRequest,
-) !?[]f32 {
-    var output = (try executeRuntimeOutput(allocator, runtime, request)) orelse return null;
-    return try output.takeHostLogits(allocator);
-}
-
-fn executeRuntimeOutput(
-    allocator: std.mem.Allocator,
-    runtime: *model_runtime.ModelRuntime,
-    request: model_runtime.ForwardRequest,
-) !?model_runtime.ModelOutput {
-    const output = switch (request) {
-        .prefill => |prefill_request| blk: {
-            try resetRuntimeAtPrefillStart(runtime, prefill_request);
-            break :blk runtime.prefill(allocator, prefill_request) catch |err| switch (err) {
-                error.UnsupportedShape,
-                error.UnsupportedDecode,
-                error.MissingPastKeyValue,
-                error.MissingValue,
-                => return null,
-                else => return err,
-            };
-        },
-        .decode => |decode_request| runtime.decode(allocator, decode_request) catch |err| switch (err) {
-            error.UnsupportedShape,
-            error.UnsupportedDecode,
-            error.MissingPastKeyValue,
-            error.MissingValue,
-            => return null,
-            else => return err,
-        },
-    };
-    return output;
-}
-
-fn executeRuntimeGreedy(
-    allocator: std.mem.Allocator,
-    runtime: *model_runtime.ModelRuntime,
-    request: model_runtime.ForwardRequest,
-    vocab_size: usize,
-) !?i64 {
-    return switch (request) {
-        .prefill => blk: {
-            var output = (try executeRuntimeOutput(allocator, runtime, request)) orelse return null;
-            defer output.deinit(allocator);
-            break :blk try output.greedyToken(allocator, vocab_size);
-        },
-        .decode => |decode_request| blk: {
-            const greedy = runtime.decodeGreedy(allocator, decode_request) catch |err| switch (err) {
-                error.UnsupportedShape,
-                error.UnsupportedDecode,
-                error.UnsupportedGreedyDecode,
-                error.MissingPastKeyValue,
-                error.MissingValue,
-                => return null,
-                else => return err,
-            };
-            break :blk greedy.token_id;
-        },
-    };
-}
-
-fn executeRuntimeSample(
-    allocator: std.mem.Allocator,
-    runtime: *model_runtime.ModelRuntime,
-    request: model_runtime.SampledDecodeRequest,
-) !?i64 {
-    // This is the commit boundary. Returning null is allowed only before the
-    // runtime submits a decode frame. Once decodeSample starts, every error is
-    // propagated and the caller must not replay the token through another
-    // forward path.
-    if (!runtime.supportsSampleDecodeRequest(request)) return null;
-    const sampled = try runtime.decodeSample(allocator, request);
-    return sampled.token_id;
+    return (@import("../execution/model_candidate.zig").Candidate{ .runtime = runtime }).forward(allocator, request);
 }
 
 fn directSessionRuntime(
@@ -372,62 +262,6 @@ fn directSessionRuntime(
     );
 }
 
-fn executeModelForwardDirect(
-    allocator: std.mem.Allocator,
-    cache: *cache_mod.GraphCache,
-    context: compiled_backend.AttachContext,
-    mode: compiled_backend.CompileMode,
-    request: model_runtime.ForwardRequest,
-) !?[]f32 {
-    const runtime = try directSessionRuntime(allocator, cache, context, mode) orelse return null;
-    return executeRuntimeForward(allocator, runtime, request);
-}
-
-fn executeModelForwardOutputDirect(
-    allocator: std.mem.Allocator,
-    cache: *cache_mod.GraphCache,
-    context: compiled_backend.AttachContext,
-    mode: compiled_backend.CompileMode,
-    request: model_runtime.ForwardRequest,
-) !?model_runtime.ModelOutput {
-    const runtime = try directSessionRuntime(allocator, cache, context, mode) orelse return null;
-    return executeRuntimeOutput(allocator, runtime, request);
-}
-
-fn executeModelGreedyDirect(
-    allocator: std.mem.Allocator,
-    cache: *cache_mod.GraphCache,
-    context: compiled_backend.AttachContext,
-    mode: compiled_backend.CompileMode,
-    request: model_runtime.ForwardRequest,
-    vocab_size: usize,
-) !?i64 {
-    const runtime = try directSessionRuntime(allocator, cache, context, mode) orelse return null;
-    return executeRuntimeGreedy(allocator, runtime, request, vocab_size);
-}
-
-fn executeModelSampleDirect(
-    allocator: std.mem.Allocator,
-    cache: *cache_mod.GraphCache,
-    context: compiled_backend.AttachContext,
-    mode: compiled_backend.CompileMode,
-    request: model_runtime.SampledDecodeRequest,
-) !?i64 {
-    const runtime = try directSessionRuntime(allocator, cache, context, mode) orelse return null;
-    return executeRuntimeSample(allocator, runtime, request);
-}
-
-fn prepareModelRuntimeDirect(
-    allocator: std.mem.Allocator,
-    cache: *cache_mod.GraphCache,
-    context: compiled_backend.AttachContext,
-    mode: compiled_backend.CompileMode,
-    request: model_runtime.PrepareRequest,
-) !bool {
-    const runtime = try directSessionRuntime(allocator, cache, context, mode) orelse return false;
-    return runtime.prepare(allocator, request);
-}
-
 pub const backend = compiled_backend.Definition{
     .kind = .metal,
     .priority = 10,
@@ -438,86 +272,5 @@ pub const backend = compiled_backend.Definition{
     .has_compilable_partition = &hasCompilablePartition,
     .attach_executors = &attachExecutors,
     .execute_model_forward = &executeModelForward,
-    .execute_model_forward_direct = &executeModelForwardDirect,
-    .execute_model_forward_output_direct = &executeModelForwardOutputDirect,
-    .execute_model_greedy_direct = &executeModelGreedyDirect,
-    .execute_model_sample_direct = &executeModelSampleDirect,
-    .prepare_model_runtime_direct = &prepareModelRuntimeDirect,
+    .resolve_model_runtime = &directSessionRuntime,
 };
-
-test "sampled runtime declines before submission when capability rejects request" {
-    const Probe = struct {
-        decode_calls: usize = 0,
-
-        fn supports(_: *anyopaque, _: model_runtime.SampledDecodeRequest) bool {
-            return false;
-        }
-
-        fn decode(ctx: *anyopaque, _: std.mem.Allocator, _: model_runtime.SampledDecodeRequest) !model_runtime.SampledDecodeOutput {
-            const self: *@This() = @ptrCast(@alignCast(ctx));
-            self.decode_calls += 1;
-            return .{ .token_id = 7 };
-        }
-
-        fn prefill(_: *anyopaque, _: std.mem.Allocator, _: model_runtime.PrefillRequest) !model_runtime.ModelOutput {
-            return error.UnexpectedPrefill;
-        }
-
-        fn deinit(_: *anyopaque) void {}
-
-        const vtable = model_runtime.ModelRuntime.VTable{
-            .prefill = prefill,
-            .decode_sample = decode,
-            .supports_sample_decode_request = supports,
-            .deinit = deinit,
-        };
-    };
-
-    var probe = Probe{};
-    var runtime = model_runtime.ModelRuntime{ .ptr = &probe, .vtable = &Probe.vtable };
-    const result = try executeRuntimeSample(std.testing.allocator, &runtime, .{
-        .decode = .{ .token_id = 1, .position = 1 },
-        .sampling = .{ .temperature = 0.8, .top_p = 0.95 },
-        .token_history = &.{1},
-    });
-    try std.testing.expectEqual(@as(?i64, null), result);
-    try std.testing.expectEqual(@as(usize, 0), probe.decode_calls);
-}
-
-test "sampled runtime propagates post-commit error without replay" {
-    const Probe = struct {
-        decode_calls: usize = 0,
-
-        fn supports(_: *anyopaque, _: model_runtime.SampledDecodeRequest) bool {
-            return true;
-        }
-
-        fn decode(ctx: *anyopaque, _: std.mem.Allocator, _: model_runtime.SampledDecodeRequest) !model_runtime.SampledDecodeOutput {
-            const self: *@This() = @ptrCast(@alignCast(ctx));
-            self.decode_calls += 1;
-            return error.InjectedPostCommitFailure;
-        }
-
-        fn prefill(_: *anyopaque, _: std.mem.Allocator, _: model_runtime.PrefillRequest) !model_runtime.ModelOutput {
-            return error.UnexpectedPrefill;
-        }
-
-        fn deinit(_: *anyopaque) void {}
-
-        const vtable = model_runtime.ModelRuntime.VTable{
-            .prefill = prefill,
-            .decode_sample = decode,
-            .supports_sample_decode_request = supports,
-            .deinit = deinit,
-        };
-    };
-
-    var probe = Probe{};
-    var runtime = model_runtime.ModelRuntime{ .ptr = &probe, .vtable = &Probe.vtable };
-    try std.testing.expectError(error.InjectedPostCommitFailure, executeRuntimeSample(std.testing.allocator, &runtime, .{
-        .decode = .{ .token_id = 1, .position = 1 },
-        .sampling = .{ .temperature = 0.8, .top_p = 0.95 },
-        .token_history = &.{1},
-    }));
-    try std.testing.expectEqual(@as(usize, 1), probe.decode_calls);
-}

@@ -607,6 +607,8 @@ pub const Model = struct {
         try converted.put(allocator, name, null_node);
         errdefer _ = converted.remove(name);
 
+        if (node.inputs.len > 16 or node.outputs.len > 8) return error.UnsupportedOp;
+
         // Recursively convert all inputs (up to 16 for ops like BatchNorm with 5)
         var input_ids: [16]NodeId = @splat(null_node);
         for (node.inputs, 0..) |input_name, i| {
@@ -660,12 +662,13 @@ pub const Model = struct {
                 const extra_id = if (ei < extra_slice.len and extra_slice[ei] != null_node)
                     extra_slice[ei]
                 else
-                    result_id; // fallback to primary if not populated
+                    return error.UnsupportedOp;
                 try converted.put(allocator, out_name, extra_id);
             }
         }
 
-        return result_id;
+        // The recursive walk may have requested a secondary output first.
+        return converted.get(name) orelse error.OutputNotFound;
     }
 };
 
@@ -1902,4 +1905,31 @@ test "Model.convertToGraphWithInputShapes binds unnamed request dimensions" {
         }
     }
     try std.testing.expect(found);
+}
+
+test "Model conversion returns secondary outputs requested before the primary" {
+    const a = std.testing.allocator;
+    var inputs = [_][]const u8{"x"};
+    var outputs = [_][]const u8{ "first", "second" };
+    var attributes = [_]proto.AttributeProto{.{ .name = "axis", .i = 0, .attr_type = .int }};
+    var nodes = [_]NodeProto{.{ .op_type = "Split", .inputs = &inputs, .outputs = &outputs, .attributes = &attributes }};
+    var x = [_]f32{ 1, 2, 3, 4 };
+    var dims = [_]i64{4};
+    var initializers = [_]TensorProto{.{ .name = "x", .data_type = .float32, .dims = &dims, .raw_data = std.mem.sliceAsBytes(&x) }};
+    var output_info = [_]ValueInfoProto{ .{ .name = "second" }, .{ .name = "first" } };
+    var model = try Model.init(a, .{ .graph = .{ .nodes = &nodes, .initializers = &initializers, .outputs = &output_info } });
+    defer {
+        model.output_to_node.deinit(a);
+        model.initializer_map.deinit(a);
+        model.input_set.deinit(a);
+    }
+    var converted = try model.convertToGraph(a);
+    defer converted.deinit(a);
+    try std.testing.expect(converted.output_ids[0] != converted.output_ids[1]);
+    const second = converted.graph.node(converted.output_ids[0]);
+    const first = converted.graph.node(converted.output_ids[1]);
+    try std.testing.expectEqual(@as(i64, 2), second.op.slice.starts[0]);
+    try std.testing.expectEqual(@as(i64, 0), first.op.slice.starts[0]);
+    nodes[0].op_type = "Identity";
+    try std.testing.expectError(error.UnsupportedOp, model.convertToGraph(a));
 }
