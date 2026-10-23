@@ -118,6 +118,40 @@ def _create_stateful_table(api, table_name: str, **kwargs) -> dict:
     return created
 
 
+def test_stateful_graph_diagnostic_identifies_later_incoming_operation(stateful_api):
+    api = stateful_api
+    table = f"graph_capability_{time.time_ns()}"
+    _create_stateful_table(
+        api, table, num_shards=2, indexes={"knowledge": {"type": "graph"}}
+    )
+    start = {"identities": [{"table": table, "key": "seed"}]}
+    response = api._request(
+        "POST",
+        f"/tables/{table}/query",
+        {
+            "graph_queries": {
+                "supported_incoming": {
+                    "index": "knowledge",
+                    "traverse": {"start": start, "direction": "in", "max_depth": 1},
+                },
+                "seed_paths": {
+                    "index": "knowledge",
+                    "traverse": {
+                        "start": start,
+                        "direction": "in",
+                        "max_depth": 1,
+                        "deduplicate_nodes": False,
+                    },
+                },
+            }
+        },
+    )
+    assert response.status_code == 422, response.text
+    error = response.json()
+    assert error["operation"] == "seed_paths", error
+    assert error["reason"] == "deduplicate_nodes_must_be_true", error
+
+
 def _batch_write_stateful(api, table_name: str, **kwargs) -> dict:
     batch = wait_until(
         lambda: _try_batch_write(api, table_name, **kwargs),
