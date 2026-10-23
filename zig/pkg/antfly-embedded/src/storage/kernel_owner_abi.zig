@@ -46,7 +46,8 @@ const failure_abi = @import("runtime_failure_abi");
 // Graph metric producer close precedes derived and durable dependency fences.
 // Close preflight drains detached index pins before durable backend admission closes.
 // Storage durability providers return owning physical sync operations.
-pub const abi_version: u32 = 158;
+// Storage durability metadata uses owning bounded read operations.
+pub const abi_version: u32 = 159;
 pub const Status = failure_abi.Status;
 pub const FailureBoundary = failure_abi.FailureBoundary;
 pub const FailureIdentity = failure_abi.FailureIdentity;

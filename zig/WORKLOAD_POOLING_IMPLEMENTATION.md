@@ -24332,3 +24332,56 @@ correction. It does not qualify complete controlled WAL or final DB persistence.
 Ordered WAL metadata preparation/sync, status persistence, backend flush and
 physical retirement still require owning coordinator phases. Full GNU/Linux
 qualification remains waived; the full design is unfinished.
+
+### Owning bounded durability metadata reads
+
+Storage now exposes an owning control-file read with a hard 4 KiB limit. Caller
+CPU validates the requested limit and prepares bounded path/output storage plus
+shared descriptor admission before dispatch. The physical task opens one file,
+observes its size and reads at most the admitted bytes through that same handle.
+Oversized files return the observed size and no payload; no unbounded file is
+hydrated. WAL checksum/format validation remains on admitted caller CPU.
+
+The operation retains its result buffer, native storage state, executor and
+shared descriptor permit across rejected handoff, lifetime and reentry. Successful
+original reentry precedes physical join and result observation. Returned bytes
+borrow from that operation until explicit deinit; repeated waits observe the same
+bytes rather than rereading a replaced CURRENT path. Missing owning providers,
+invalid size budgets, allocation rejection and executor saturation fail closed.
+The shared native physical-operation implementation now supplies file/parent sync
+and control-file reads while preserving their distinct result contracts. Native
+ABI 99 and storage-owner ABI 159 fence the provider/result extensions.
+
+This provides the physical metadata stage required by controlled WAL sync. It
+is not yet a WAL coordinator or final-close adoption. A coordinator must retain
+WAL publication ownership and arrange minimum reusable completion resources
+before taking that lock. Holding a publication lock and then waiting for a new
+descriptor/worker grant can create a dependency cycle. Compound acquisition must
+release tentative resources before waiting when publication cannot be acquired;
+accepted physical stages retain all their ownership through failure and retry.
+Further work includes that completion-resource/coordinator contract, ordered
+CURRENT/segment durability, final status/backend persistence and physical reader/
+I/O retirement. The full goal remains active. Full GNU/Linux qualification remains
+waived; Linux builds require pinned Nix/glibc Zig.
+
+Pinned Darwin Debug foundation receipt `owning-control-read-v1` passes all 68
+steps and 86 maintenance/execution-service tests. The identical native/schema
+inputs pass all 82 steps in `owning-control-read-v2`, including two fresh linked
+C-entry close tests and the qualified unchanged maintenance/archive cases. Simple
+runners pass seven named physical-operation cases, 32 storage-read admission
+cases, 32 DB cases, 45 named graph-runtime cases and 21 local-close cases without
+skips, failures or leaks. Error ABI (45), released status ABI (1) and failure
+identity (8) pass in both receipts. Input and immutable log hashes match the final
+source.
+
+The metadata matrix rejects original handoff, reentry and lifetime expiration
+while a physical read is accepted. Native owner destruction preserves the read,
+buffer, descriptor admission and executor until explicit retirement. Repeated
+waits return the same original bytes after another native owner replaces CURRENT,
+without reissuing the read. Oversized metadata reports its size with zero hydrated
+bytes; zero/over-limit budgets, missing providers, real executor refusal and all
+three pre-dispatch allocation failures return without leaked descriptor capacity.
+The original five sync cases and descriptor/read regressions remain qualified.
+This is bounded physical metadata-read qualification, not full WAL/final-close
+coordinator qualification. Full GNU/Linux qualification remains waived and the
+full design remains unfinished.

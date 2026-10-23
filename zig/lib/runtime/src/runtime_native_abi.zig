@@ -104,7 +104,8 @@ const builtin = @import("builtin");
 // Graph metric owners use shared maintenance and exclusive controlled joins.
 // Index managers permanently fence detached graph snapshots during controlled close.
 // Physical sync operations retain native state and descriptor admission through controlled retries.
-pub const abi_version: u32 = 98;
+// Bounded control-file read owners retain physical buffers through durability retries.
+pub const abi_version: u32 = 99;
 
 pub const zig_compiler_id: u64 = stableId(builtin.zig_version_string);
 

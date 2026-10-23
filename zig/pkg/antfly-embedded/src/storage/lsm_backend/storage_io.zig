@@ -323,6 +323,29 @@ pub const SyncOperation = struct {
     }
 };
 
+/// Bounded control-file bytes remain borrowed from this owner until deinit.
+/// File-size validation and decoding belong on admitted caller CPU.
+pub const ControlFileResult = struct { file_size: u64, bytes: []const u8 };
+pub const max_control_file_bytes: usize = 4096;
+pub const ControlFileReadOperation = struct {
+    ptr: *anyopaque,
+    vtable: *const VTable,
+    boundary_dispatch: BoundaryAbi.Dispatch = BoundaryAbi.local_dispatch,
+    pub const VTable = struct {
+        wait_with_admission: *const fn (*anyopaque, read_admission.Port) anyerror!ControlFileResult,
+        deinit: *const fn (*anyopaque) void,
+    };
+    const BoundaryAbi = runtime_callback_abi.Boundary(VTable);
+    pub fn waitWithAdmission(self: *ControlFileReadOperation, original: read_admission.Port) !ControlFileResult {
+        return BoundaryAbi.call("wait_with_admission", self.boundary_dispatch, self.vtable.wait_with_admission, .{ self.ptr, original });
+    }
+    /// Quiesced mandatory join; rejected waits retain this owner for retry.
+    pub fn deinit(self: *ControlFileReadOperation) void {
+        self.vtable.deinit(self.ptr);
+        self.* = undefined;
+    }
+};
+
 pub const ReadRuntime = if (builtin.os.tag == .freestanding)
     struct {
         pub fn getIo(_: *const ReadRuntime) ?std.Io {
@@ -716,6 +739,7 @@ pub const Storage = struct {
         supports_native_path_locks: bool = false,
         begin_sync_contents_with_admission: ?*const fn (*anyopaque, []const u8, read_admission.Port) anyerror!SyncOperation = null,
         begin_sync_parent_with_admission: ?*const fn (*anyopaque, []const u8, read_admission.Port) anyerror!SyncOperation = null,
+        begin_control_file_read_with_admission: ?*const fn (*anyopaque, []const u8, usize, read_admission.Port) anyerror!ControlFileReadOperation = null,
     };
     const BoundaryAbi = runtime_callback_abi.Boundary(VTable);
 
@@ -991,6 +1015,13 @@ pub const Storage = struct {
     pub fn coldSequentialReaderCapacity(self: Storage) usize {
         if (self.vtable.cold_sequential_reader_capacity) |capacity| return capacity(self.ptr);
         return std.math.maxInt(usize);
+    }
+
+    pub fn beginControlFileReadWithAdmission(self: Storage, path: []const u8, limit: usize, original: read_admission.Port) !ControlFileReadOperation {
+        try original.checkpoint();
+        if (limit == 0 or limit > max_control_file_bytes) return error.ResourceBudgetExceeded;
+        const begin = self.vtable.begin_control_file_read_with_admission orelse return error.ExecutionWaitUnsupported;
+        return BoundaryAbi.call("begin_control_file_read_with_admission", self.boundary_dispatch, begin, .{ self.ptr, path, limit, original });
     }
 
     /// Fail closed without an owning provider; a legacy synchronous sync is
@@ -2874,21 +2905,37 @@ pub const NativeSyncTestControl = struct {
     pub var started: std.atomic.Value(bool) = .init(false);
     pub var release: std.atomic.Value(bool) = .init(false);
     pub var calls: std.atomic.Value(usize) = .init(0);
+    pub var reads: std.atomic.Value(usize) = .init(0);
 };
 
-const NativeSyncOperation = if (!supports_native_storage or builtin.os.tag == .freestanding) struct {} else struct {
-    const Kind = enum { contents, directory };
+const NativePhysicalOperation = if (!supports_native_storage or builtin.os.tag == .freestanding) struct {} else struct {
+    const Kind = enum { contents, directory, control_read };
     allocator: Allocator,
     permit: NativeFdPermit,
     path: []u8,
     kind: Kind,
+    buffer: ?[]u8 = null,
+    file_size: u64 = 0,
+    read_len: usize = 0,
     future: ?std.Io.Future(void) = null,
     done: std.atomic.Value(bool) = .init(false),
     failure: ?anyerror = null,
 
     const vtable: SyncOperation.VTable = .{ .wait_with_admission = waitWithAdmission, .deinit = deinit };
+    const read_vtable: ControlFileReadOperation.VTable = .{ .wait_with_admission = waitReadWithAdmission, .deinit = deinit };
+
+    fn createControlRead(state: *NativeStorageState, path: []const u8, limit: usize, original: read_admission.Port) !ControlFileReadOperation {
+        if (limit == 0 or limit > max_control_file_bytes) return error.ResourceBudgetExceeded;
+        const operation = try prepare(state, path, .control_read, limit, original);
+        return .{ .ptr = operation, .vtable = &read_vtable };
+    }
 
     fn create(state: *NativeStorageState, path: []const u8, kind: Kind, original: read_admission.Port) !SyncOperation {
+        const operation = try prepare(state, path, kind, 0, original);
+        return .{ .ptr = operation, .vtable = &vtable };
+    }
+
+    fn prepare(state: *NativeStorageState, path: []const u8, kind: Kind, limit: usize, original: read_admission.Port) !*NativePhysicalOperation {
         if (comptime !supports_posix_fd_cache) return error.ExecutionWaitUnsupported;
         if (path.len >= std.fs.max_path_bytes) return error.NameTooLong;
         _ = (try original.executionWaitAfterLifetime()) orelse return error.ExecutionWaitUnsupported;
@@ -2900,42 +2947,67 @@ const NativeSyncOperation = if (!supports_native_storage or builtin.os.tag == .f
         // shared descriptor permit until deinit bounds accepted operation
         // metadata as well as physical descriptors, including rejected waits.
         const allocator = state.allocator;
-        const self = try allocator.create(NativeSyncOperation);
+        const self = try allocator.create(NativePhysicalOperation);
         errdefer allocator.destroy(self);
         const path_copy = try allocator.dupe(u8, path);
         errdefer allocator.free(path_copy);
-        self.* = .{ .allocator = allocator, .permit = permit, .path = path_copy, .kind = kind };
+        const buffer = if (kind == .control_read) try allocator.alloc(u8, limit) else null;
+        errdefer if (buffer) |bytes| allocator.free(bytes);
+        self.* = .{ .allocator = allocator, .permit = permit, .path = path_copy, .kind = kind, .buffer = buffer };
         try original.checkpoint();
         // Refuse dispatch failure instead of doing an unbounded synchronous
         // fallback. Preparation and descriptor admission ran on caller CPU.
         self.future = try permit.io.concurrent(run, .{self});
-        return .{ .ptr = self, .vtable = &vtable };
+        return self;
     }
 
-    fn run(self: *NativeSyncOperation) void {
+    fn run(self: *NativePhysicalOperation) void {
         defer self.done.store(true, .release);
         if (builtin.is_test and NativeSyncTestControl.pause.load(.acquire)) {
             NativeSyncTestControl.started.store(true, .release);
             while (!NativeSyncTestControl.release.load(.acquire))
                 self.permit.io.sleep(.fromMilliseconds(1), .awake) catch {};
         }
-        if (builtin.is_test) _ = NativeSyncTestControl.calls.fetchAdd(1, .release);
-        // This worker only opens, syncs and closes the prepared physical path.
+        if (builtin.is_test) {
+            if (self.kind == .control_read) _ = NativeSyncTestControl.reads.fetchAdd(1, .release) else _ = NativeSyncTestControl.calls.fetchAdd(1, .release);
+        }
+        // This worker only opens, reads/syncs and closes the prepared path.
         // It performs no WAL decoding, flush, manifest work or admission call.
         const result = switch (self.kind) {
             .contents => fs_paths.syncFilePortable(self.permit.io, self.path),
             .directory => fs_paths.syncDirPortable(self.permit.io, self.path),
+            .control_read => self.readControl(),
         };
         result catch |cause| {
             self.failure = cause;
         };
     }
 
+    fn readControl(self: *NativePhysicalOperation) !void {
+        const io = self.permit.io;
+        const file = if (std.fs.path.isAbsolute(self.path)) try std.Io.Dir.openFileAbsolute(io, self.path, .{}) else try std.Io.Dir.cwd().openFile(io, self.path, .{});
+        defer file.close(io);
+        self.file_size = (try file.stat(io)).size;
+        const buffer = self.buffer.?;
+        // Oversized metadata is reported without hydrating or decoding it.
+        if (self.file_size > buffer.len) return;
+        var reader = file.reader(io, &.{});
+        const bytes = buffer[0..@intCast(self.file_size)];
+        try reader.interface.readSliceAll(bytes);
+        self.read_len = bytes.len;
+    }
+
+    fn waitReadWithAdmission(raw: *anyopaque, original: read_admission.Port) !ControlFileResult {
+        try waitWithAdmission(raw, original);
+        const self: *NativePhysicalOperation = @ptrCast(@alignCast(raw));
+        return .{ .file_size = self.file_size, .bytes = self.buffer.?[0..self.read_len] };
+    }
+
     fn waitWithAdmission(raw: *anyopaque, original: read_admission.Port) !void {
-        const self: *NativeSyncOperation = @ptrCast(@alignCast(raw));
+        const self: *NativePhysicalOperation = @ptrCast(@alignCast(raw));
         const Ready = struct {
             fn get(ptr: *anyopaque) anyerror!bool {
-                const operation: *NativeSyncOperation = @ptrCast(@alignCast(ptr));
+                const operation: *NativePhysicalOperation = @ptrCast(@alignCast(ptr));
                 return operation.done.load(.acquire);
             }
         };
@@ -2948,10 +3020,11 @@ const NativeSyncOperation = if (!supports_native_storage or builtin.os.tag == .f
     }
 
     fn deinit(raw: *anyopaque) void {
-        const self: *NativeSyncOperation = @ptrCast(@alignCast(raw));
+        const self: *NativePhysicalOperation = @ptrCast(@alignCast(raw));
         if (self.future) |*future| future.await(self.permit.io);
         const allocator = self.allocator;
         var permit = self.permit;
+        if (self.buffer) |buffer| allocator.free(buffer);
         allocator.free(self.path);
         allocator.destroy(self);
         // Release last: the storage state may destroy its executor/allocator.
@@ -3049,6 +3122,7 @@ const EventedNativeStorage = struct {
         .supports_native_path_locks = true,
         .begin_sync_contents_with_admission = beginSyncContents,
         .begin_sync_parent_with_admission = beginSyncParent,
+        .begin_control_file_read_with_admission = beginControlRead,
     };
 
     pub fn init(allocator: Allocator, kind: RuntimeKind) !NativeStorage {
@@ -3274,10 +3348,16 @@ const EventedNativeStorage = struct {
         return nativeColdSequentialReaderCapacity(self.state);
     }
 
+    fn beginControlRead(ptr: *anyopaque, path: []const u8, limit: usize, original: read_admission.Port) !ControlFileReadOperation {
+        const self: *NativeStorage = @ptrCast(@alignCast(ptr));
+        const state = self.state;
+        return NativePhysicalOperation.createControlRead(state, path, limit, original);
+    }
+
     fn beginSyncContents(ptr: *anyopaque, path: []const u8, original: read_admission.Port) !SyncOperation {
         const self: *NativeStorage = @ptrCast(@alignCast(ptr));
         const state = self.state;
-        return NativeSyncOperation.create(state, path, .contents, original);
+        return NativePhysicalOperation.create(state, path, .contents, original);
     }
 
     fn beginSyncParent(ptr: *anyopaque, path: []const u8, original: read_admission.Port) !SyncOperation {
@@ -3285,7 +3365,7 @@ const EventedNativeStorage = struct {
         const self: *NativeStorage = @ptrCast(@alignCast(ptr));
         const state = self.state;
         const parent = std.fs.path.dirname(path) orelse if (std.fs.path.isAbsolute(path)) "/" else ".";
-        return NativeSyncOperation.create(state, parent, .directory, original);
+        return NativePhysicalOperation.create(state, parent, .directory, original);
     }
 
     fn syncFileContentsAbsolute(ptr: *anyopaque, path: []const u8) !void {
@@ -3424,6 +3504,7 @@ const ThreadedNativeStorage = struct {
         .supports_native_path_locks = true,
         .begin_sync_contents_with_admission = beginSyncContents,
         .begin_sync_parent_with_admission = beginSyncParent,
+        .begin_control_file_read_with_admission = beginControlRead,
     };
 
     pub fn init(allocator: Allocator, kind: RuntimeKind) !NativeStorage {
@@ -3656,16 +3737,21 @@ const ThreadedNativeStorage = struct {
         return nativeColdSequentialReaderCapacity(state);
     }
 
+    fn beginControlRead(ptr: *anyopaque, path: []const u8, limit: usize, original: read_admission.Port) !ControlFileReadOperation {
+        const state: *NativeStorageState = @ptrCast(@alignCast(ptr));
+        return NativePhysicalOperation.createControlRead(state, path, limit, original);
+    }
+
     fn beginSyncContents(ptr: *anyopaque, path: []const u8, original: read_admission.Port) !SyncOperation {
         const state: *NativeStorageState = @ptrCast(@alignCast(ptr));
-        return NativeSyncOperation.create(state, path, .contents, original);
+        return NativePhysicalOperation.create(state, path, .contents, original);
     }
 
     fn beginSyncParent(ptr: *anyopaque, path: []const u8, original: read_admission.Port) !SyncOperation {
         if (path.len >= std.fs.max_path_bytes) return error.NameTooLong;
         const state: *NativeStorageState = @ptrCast(@alignCast(ptr));
         const parent = std.fs.path.dirname(path) orelse if (std.fs.path.isAbsolute(path)) "/" else ".";
-        return NativeSyncOperation.create(state, parent, .directory, original);
+        return NativePhysicalOperation.create(state, parent, .directory, original);
     }
 
     fn syncFileContentsAbsolute(ptr: *anyopaque, path: []const u8) !void {
@@ -7071,4 +7157,129 @@ test "controlled physical sync refuses actual executor saturation without inline
     defer operation.deinit();
     try std.testing.expectError(error.FileNotFound, operation.waitWithAdmission(original));
     try std.testing.expectEqual(@as(usize, 1), NativeSyncTestControl.calls.load(.acquire));
+}
+
+test "controlled physical sync metadata read preserves bounded bytes through original failure and owner close" {
+    if (!supports_posix_fd_cache) return error.SkipZigTest;
+    const cpu = SyncTestControl.cpu;
+    const now = SyncTestControl.now;
+    for (std.enums.values(SyncTestControl.Mode)) |mode| {
+        const a = std.testing.allocator;
+        var pool = NativeStoragePool.initWithCapacityForTest(a, 8);
+        defer pool.deinit();
+        var native = try NativeStorage.initWithPool(a, .threaded, &pool);
+        var native_live = true;
+        defer if (native_live) native.deinit();
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/CURRENT", .{tmp.sub_path});
+        defer a.free(path);
+        try native.storage().writeFileAbsolute(path, "old-control");
+        var slots = try cpu.Scheduler.init(.{ .slots = 3, .control_slots = 1, .cleanup_slots = 1 });
+        defer slots.close();
+        var execution: cpu.Execution = .{};
+        defer execution.finish();
+        try execution.start(&slots, .{ .io = std.testing.io, .native_now_ns = now, .allow_wait = true, .deadline_ns = now() + 5 * std.time.ns_per_s }, .query);
+        var control: SyncTestControl = .{ .execution = &execution, .scheduler = &slots };
+        var payload = control.payload();
+        const original = read_admission.Port.init(&payload);
+        NativeSyncTestControl.pause.store(true, .release);
+        NativeSyncTestControl.started.store(false, .release);
+        NativeSyncTestControl.release.store(false, .release);
+        NativeSyncTestControl.reads.store(0, .release);
+        defer NativeSyncTestControl.pause.store(false, .release);
+        var operation = try native.storage().beginControlFileReadWithAdmission(path, 64, original);
+        var live = true;
+        defer {
+            NativeSyncTestControl.release.store(true, .release);
+            if (live) operation.deinit();
+        }
+        const until = now() + 5 * std.time.ns_per_s;
+        while (!NativeSyncTestControl.started.load(.acquire)) {
+            if (now() >= until) return error.TestUnexpectedResult;
+            try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+        }
+        native.deinit();
+        native_live = false;
+        control.mode = mode;
+        var result: ControlFileResult = undefined;
+        const first = operation.waitWithAdmission(original);
+        if (mode == .success) result = try first else {
+            try std.testing.expectError(switch (mode) {
+                .begin_failure => error.NotFound,
+                .end_failure => error.Canceled,
+                .expired => error.DeadlineExceeded,
+                else => unreachable,
+            }, first);
+            try std.testing.expectEqual(@as(usize, 1), pool.retainedStates());
+            try std.testing.expectEqual(@as(usize, 1), pool.snapshotStats().fd_admitted_descriptors);
+            if (mode == .begin_failure) try std.testing.expectEqual(@as(usize, 0), NativeSyncTestControl.reads.load(.acquire));
+            if (mode == .end_failure) try execution.enter(.query);
+            control.mode = .success;
+            NativeSyncTestControl.release.store(true, .release);
+            result = try operation.waitWithAdmission(original);
+        }
+        try std.testing.expectEqual(@as(u64, 11), result.file_size);
+        try std.testing.expectEqualStrings("old-control", result.bytes);
+        var replacement = try NativeStorage.init(a, .threaded);
+        defer replacement.deinit();
+        try replacement.storage().writeFileAbsolute(path, "replacement");
+        const again = try operation.waitWithAdmission(original);
+        try std.testing.expect(again.bytes.ptr == result.bytes.ptr);
+        try std.testing.expectEqualStrings("old-control", again.bytes);
+        try std.testing.expectEqual(@as(usize, 1), NativeSyncTestControl.reads.load(.acquire));
+        operation.deinit();
+        live = false;
+        try std.testing.expectEqual(@as(usize, 0), pool.retainedStates());
+        try std.testing.expectEqual(@as(usize, 0), pool.snapshotStats().fd_admitted_descriptors);
+    }
+}
+
+test "controlled physical sync metadata size guard rejects hydration and dispatch allocation failures" {
+    if (!supports_posix_fd_cache) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var pool = NativeStoragePool.initWithCapacityForTest(a, 4);
+    defer pool.deinit();
+    var native = try NativeStorage.initWithPool(a, .threaded, &pool);
+    defer native.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/oversized-control", .{tmp.sub_path});
+    defer a.free(path);
+    const large: [8192]u8 = @splat('x');
+    try native.storage().writeFileAbsolute(path, &large);
+    var control: SyncTestControl = .{ .deadline_ns = SyncTestControl.now() + 5 * std.time.ns_per_s };
+    var payload = control.payload();
+    const original = read_admission.Port.init(&payload);
+    var read = try native.storage().beginControlFileReadWithAdmission(path, 36, original);
+    const result = try read.waitWithAdmission(original);
+    try std.testing.expectEqual(@as(u64, large.len), result.file_size);
+    try std.testing.expectEqual(@as(usize, 0), result.bytes.len);
+    read.deinit();
+    for ([_]usize{ 0, max_control_file_bytes + 1 }) |limit|
+        try std.testing.expectError(error.ResourceBudgetExceeded, native.storage().beginControlFileReadWithAdmission(path, limit, original));
+    try std.testing.expectEqual(@as(usize, 0), pool.snapshotStats().fd_admitted_descriptors);
+    var memory = MemoryStorage.init(a);
+    defer memory.deinit();
+    try std.testing.expectError(error.ExecutionWaitUnsupported, memory.storage().beginControlFileReadWithAdmission(path, 36, original));
+    const old_limit = native.state.threaded.concurrent_limit;
+    native.state.threaded.concurrent_limit = .nothing;
+    try std.testing.expectError(error.ConcurrencyUnavailable, native.storage().beginControlFileReadWithAdmission(path, 36, original));
+    native.state.threaded.concurrent_limit = old_limit;
+    try std.testing.expectEqual(@as(usize, 0), pool.snapshotStats().fd_admitted_descriptors);
+    // All three caller-side allocations precede physical dispatch.
+    for (0..3) |offset| {
+        var failing = std.testing.FailingAllocator.init(a, .{});
+        var candidate = try NativeStorage.initWithPool(failing.allocator(), .threaded, &pool);
+        defer candidate.deinit();
+        failing.fail_index = failing.alloc_index + offset;
+        const attempt = candidate.storage().beginControlFileReadWithAdmission(path, 36, original);
+        failing.fail_index = std.math.maxInt(usize);
+        if (attempt) |value| {
+            var unexpected = value;
+            unexpected.deinit();
+            return error.TestUnexpectedResult;
+        } else |cause| try std.testing.expectEqual(error.OutOfMemory, cause);
+        try std.testing.expectEqual(@as(usize, 0), pool.snapshotStats().fd_admitted_descriptors);
+    }
 }
