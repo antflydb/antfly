@@ -872,7 +872,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .dependOn(&deferred_check_storage_run.step);
     const fk_validation_scan_tests = b.addTest(.{
         .root_module = relational_index_system_mod,
-        .filters = &.{"relational index system foreign key validation scan"},
+        .filters = &.{"relational index system foreign key validation"},
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     const fk_validation_scan_run = addFilteredTestRunArtifact(b, fk_validation_scan_tests);

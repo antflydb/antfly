@@ -36,7 +36,18 @@ pub const RowSummary = struct {
     records: u64,
     rows: u64,
     cursor_digest: Digest,
+    reference_coverage: ?contract.ReferenceCoverage = null,
 
+    pub fn jsonStringify(self: @This(), writer: anytype) @TypeOf(writer.*).Error!void {
+        try writer.beginObject();
+        inline for (@typeInfo(@This()).@"struct".field_names) |field| {
+            if (!std.mem.eql(u8, field, "reference_coverage") or self.reference_coverage != null) {
+                try writer.objectField(field);
+                try writer.write(@field(self, field));
+            }
+        }
+        try writer.endObject();
+    }
     pub fn validate(self: @This()) !void {
         try self.validateCoverage(true);
     }
@@ -45,6 +56,9 @@ pub const RowSummary = struct {
     }
     fn validateCoverage(self: @This(), comptime complete: bool) !void {
         try self.header.validate();
+        if ((self.header.binding.purpose == .not_null) != (self.reference_coverage == null)) return error.InvalidSchemaValidationJob;
+        if (self.reference_coverage) |coverage| try coverage.validate(self.header.binding.purpose, self.records, self.rows, self.header.binding.columns);
+        if (complete and self.coverage != .none and self.header.phase != .released and !std.meta.eql(self.reference_coverage, self.header.reference_coverage)) return error.InvalidSchemaValidationJob;
         try self.snapshot_cut.requireNamespace(self.header.binding.fence.namespace);
         if (!std.meta.eql(self.snapshot_cut, self.header.updated) and
             !self.snapshot_cut.strictlyAfter(self.header.updated)) return error.InvalidSchemaValidationJob;

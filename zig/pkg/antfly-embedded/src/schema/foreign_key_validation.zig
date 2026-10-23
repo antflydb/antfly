@@ -168,7 +168,30 @@ test "foreign key validation candidate is allocation atomic" {
 /// Prepare catalog bytes from independently parsed before/after declarations.
 /// The returned update retains all native generations. This establishes exact
 /// schema/catalog identity only; it supplies no source, parent or install proof.
+pub const CatalogPreparation = struct {
+    alloc: std.mem.Allocator,
+    before: @import("mod.zig").PreparedSchemaDefinition,
+    after: @import("mod.zig").PreparedSchemaDefinition,
+    catalog: @import("../storage/db/relational_integrity_catalog.zig").Update,
+
+    pub fn deinit(self: *@This()) void {
+        self.before.deinit(self.alloc);
+        self.after.deinit(self.alloc);
+        self.catalog.deinit();
+        self.* = undefined;
+    }
+};
+
 pub fn prepareCatalog(a: std.mem.Allocator, table_id: u64, before_json: []const u8, after_json: []const u8, predecessor: []const u8, names: []const []const u8) !@import("../storage/db/relational_integrity_catalog.zig").Update {
+    var prepared = try prepareCatalogOwned(a, table_id, before_json, after_json, predecessor, names);
+    prepared.before.deinit(a);
+    prepared.after.deinit(a);
+    return prepared.catalog;
+}
+
+/// Retain both compiled declarations for owner preparation. Consumers borrow
+/// these immutable definitions instead of parsing/compiling the schemas again.
+pub fn prepareCatalogOwned(a: std.mem.Allocator, table_id: u64, before_json: []const u8, after_json: []const u8, predecessor: []const u8, names: []const []const u8) !CatalogPreparation {
     const api = @import("mod.zig");
     const declarations = @import("relational_declarations.zig");
     const catalog = @import("../storage/db/relational_integrity_catalog.zig");
@@ -183,9 +206,9 @@ pub fn prepareCatalog(a: std.mem.Allocator, table_id: u64, before_json: []const 
     const summary = try verifyTransition(old, next, names);
     if (summary.changed != names.len) return error.InvalidSchemaUpdateRequest;
     var before = try api.PreparedSchemaDefinition.init(a, before_json);
-    defer before.deinit(a);
+    errdefer before.deinit(a);
     var after = try api.PreparedSchemaDefinition.init(a, after_json);
-    defer after.deinit(a);
+    errdefer after.deinit(a);
     if (before.runtime_schema.storage_mode != .relational or after.runtime_schema.storage_mode != .relational or after.runtime_schema.version != (std.math.add(u32, before.runtime_schema.version, 1) catch return error.InvalidSchemaUpdateRequest)) return error.InvalidSchemaUpdateRequest;
     var previous = try catalog.decode(a, predecessor);
     defer previous.deinit();
@@ -198,7 +221,8 @@ pub fn prepareCatalog(a: std.mem.Allocator, table_id: u64, before_json: []const 
     const bytes = try native_schema.serializeSchema(a, after.runtime_schema);
     defer a.free(bytes);
     const digest = @import("../storage/db/relational_integrity_contract.zig").hash(bytes);
-    return catalog.prepareForeignKeyValidation(a, predecessor, try catalog.incarnationFromTableId(table_id), after.runtime_schema.version, digest, definitions, names, previous.checks_digest);
+    const update = try catalog.prepareForeignKeyValidation(a, predecessor, try catalog.incarnationFromTableId(table_id), after.runtime_schema.version, digest, definitions, names, previous.checks_digest);
+    return .{ .alloc = a, .before = before, .after = after, .catalog = update };
 }
 
 test "foreign key validation declaration preparation preserves real compiler generations and rejects unproven catalog inputs" {

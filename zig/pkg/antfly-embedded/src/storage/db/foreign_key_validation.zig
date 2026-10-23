@@ -26,43 +26,7 @@ const expressions = @import("../../schema/relational_expression.zig");
 const A = std.mem.Allocator;
 pub const Control = @import("relational_nullability.zig").Control;
 
-/// Count plus addition modulo 2^256 of domain-separated key hashes. Unlike
-/// XOR, duplicate pairs do not disappear. Source and parent owners may combine
-/// disjoint ranges in any order. Full cohort/root/epoch verification is separate.
-pub const Witness = struct {
-    count: u64 = 0,
-    sum: [32]u8 = @splat(0),
-
-    pub fn identity(key: []const u8) ![32]u8 {
-        if ((try contract.parseKey(key)).kind != .reference) return error.InvalidSchemaValidationJob;
-        var state = std.crypto.hash.Blake3.init(.{});
-        state.update("antfly/fk-validation-reference-set/v1");
-        state.update(key);
-        var result: [32]u8 = undefined;
-        state.final(&result);
-        return result;
-    }
-    pub fn validate(self: Witness) !void {
-        if (self.count == 0 and !std.mem.allEqual(u8, &self.sum, 0)) return error.InvalidSchemaValidationJob;
-    }
-    pub fn combine(self: *Witness, other: Witness) !void {
-        try self.validate();
-        try other.validate();
-        const count = std.math.add(u64, self.count, other.count) catch return error.InvalidSchemaValidationJob;
-        const sum = std.mem.readInt(u256, &self.sum, .little) +% std.mem.readInt(u256, &other.sum, .little);
-        std.mem.writeInt(u256, &self.sum, sum, .little);
-        self.count = count;
-    }
-    pub fn addIdentity(self: *Witness, identity_hash: [32]u8) !void {
-        try self.combine(.{ .count = 1, .sum = identity_hash });
-    }
-    pub fn addReference(self: *Witness, key: []const u8) !void {
-        try self.addIdentity(try identity(key));
-    }
-    pub fn eql(self: Witness, other: Witness) bool {
-        return self.count == other.count and std.mem.eql(u8, &self.sum, &other.sum);
-    }
-};
+pub const Witness = @import("relational_reference_witness.zig").Witness;
 
 pub const Rule = struct {
     name: []const u8,
@@ -604,4 +568,77 @@ test "foreign key validation repeated historical rows retain scratch without hea
     for (0..10000) |_| try plan.addRow("row", row, &witness);
     try std.testing.expectEqual(@as(u64, 10001), witness.count);
     try std.testing.expect(!failure.has_induced_failure);
+}
+
+/// Metadata links these compact parent facts to separately signed parent-owner
+/// preparations. A child owner proves its own schema/catalog and tuple codec;
+/// it does not copy every parent's complete catalog into every child input.
+/// These descriptors alone grant no parent or publication authority.
+pub const ParentScope = struct {
+    constraint_name: []const u8,
+    declared_parent: []const u8,
+    parent_table: []const u8,
+    parent_table_id: u64,
+    parent_schema_version: u32,
+    parent_schema: [32]u8,
+    parent_public: [32]u8,
+    parent_catalog: [32]u8,
+    parent_unique: []const u8,
+    parent_generation: contract.Generation,
+};
+pub const SourceConfig = struct {
+    purpose: @import("relational_schema_owner_contract.zig").Purpose = .foreign_key_source,
+    table_name: []const u8,
+    parents: []const ParentScope,
+
+    pub fn validate(self: @This()) !void {
+        if (self.purpose != .foreign_key_source or self.parents.len == 0 or self.parents.len > 256 or self.table_name.len == 0 or self.table_name.len > 4096 or std.mem.indexOfScalar(u8, self.table_name, 0) != null) return error.InvalidSchemaValidationJob;
+        var name_bytes: usize = self.table_name.len;
+        for (self.parents, 0..) |scope, i| {
+            if (scope.parent_table_id == 0 or scope.parent_schema_version == 0 or std.mem.allEqual(u8, &scope.parent_generation, 0)) return error.InvalidSchemaValidationJob;
+            inline for (.{ "parent_schema", "parent_public", "parent_catalog" }) |field| if (std.mem.allEqual(u8, &@field(scope, field), 0)) return error.InvalidSchemaValidationJob;
+            inline for (.{ "constraint_name", "declared_parent", "parent_table", "parent_unique" }) |field| {
+                const name = @field(scope, field);
+                name_bytes = std.math.add(usize, name_bytes, name.len) catch return error.InvalidSchemaValidationJob;
+                if (name.len == 0 or name.len > 4096 or name_bytes > 1024 * 1024 or std.mem.indexOfScalar(u8, name, 0) != null) return error.InvalidSchemaValidationJob;
+            }
+            for (self.parents[0..i]) |prior| if (std.mem.eql(u8, prior.constraint_name, scope.constraint_name)) return error.InvalidSchemaValidationJob;
+        }
+    }
+};
+
+test "foreign key validation source candidate owns compact scopes through every allocation failure" {
+    const a = std.testing.allocator;
+    const job = @import("relational_nullability_job.zig");
+    const api = @import("../../schema/mod.zig");
+    const declarations = @import("../../schema/relational_declarations.zig");
+    const F = struct {
+        const before =
+            \\{"version":1,"storage_mode":"relational","default_type":"row","foreign_keys":[{"name":"fk_a","child_columns":["n"],"parent_table":"parents","parent_columns":["id"],"not_valid":true},{"name":"fk_b","child_columns":["n"],"parent_table":"others","parent_columns":["id"],"not_valid":true}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"n":{"type":"integer","nullable":true}},"additionalProperties":false}}}}
+        ;
+        const after =
+            \\{"version":2,"storage_mode":"relational","default_type":"row","foreign_keys":[{"name":"fk_a","child_columns":["n"],"parent_table":"parents","parent_columns":["id"],"not_valid":false},{"name":"fk_b","child_columns":["n"],"parent_table":"others","parent_columns":["id"],"not_valid":false}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"n":{"type":"integer","nullable":true}},"additionalProperties":false}}}}
+        ;
+        fn run(backing: A, previous: []const u8) !void {
+            var candidate = try job.Candidate.initForeignKeySource(backing, 71, before, after, previous, .{ .table_name = "children", .parents = &.{
+                .{ .constraint_name = "fk_a", .declared_parent = "parents", .parent_table = "parents", .parent_table_id = 88, .parent_schema_version = 1, .parent_schema = @splat(1), .parent_public = @splat(2), .parent_catalog = @splat(3), .parent_unique = "pk", .parent_generation = @splat(4) },
+                .{ .constraint_name = "fk_b", .declared_parent = "others", .parent_table = "others", .parent_table_id = 89, .parent_schema_version = 1, .parent_schema = @splat(5), .parent_public = @splat(6), .parent_catalog = @splat(7), .parent_unique = "pk", .parent_generation = @splat(8) },
+            } }, .{});
+            defer candidate.deinit();
+            try std.testing.expectEqual(@as(usize, 2), candidate.projectionCount());
+            try std.testing.expectEqual(@as(usize, 1), candidate.plan.names.len);
+            const bytes = try codec.serializeOrdinal(backing, 1, candidate.foreign_source.?.view.tableSchema().relational_columns, &.{.{ .ordinal = 0, .path = "n", .value_type = .i64_val, .value = .{ .i64_val = 9_007_199_254_740_993 } }}, @splat(0));
+            defer backing.free(bytes);
+            const source = &candidate.foreign_source.?;
+            const row = try codec.ordinalRowViewSelective(bytes, source.view.tableSchema().*, source.view.physicalLayout());
+            var witness: Witness = .{};
+            try source.addRow("row", row, &witness);
+            try std.testing.expectEqual(@as(u64, 2), witness.count);
+        }
+    };
+    var before = try api.PreparedSchemaDefinition.init(a, F.before);
+    defer before.deinit(a);
+    var previous = try declarations.compileCatalog(a, before.public_schema, 71, null);
+    defer previous.deinit();
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, F.run, .{previous.value});
 }

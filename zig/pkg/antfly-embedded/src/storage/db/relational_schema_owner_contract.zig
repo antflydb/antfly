@@ -70,7 +70,36 @@ pub fn hash(bytes: []const u8) Digest {
 fn eq(a: Digest, b: Digest) bool {
     return std.mem.eql(u8, &a, &b);
 }
+// Delegate field values to std.json. In particular byte-array formatting must
+// remain identical to existing signed NOT NULL records and receipt identities.
+fn writeFields(value: anytype, writer: anytype) @TypeOf(writer.*).Error!void {
+    try writer.beginObject();
+    inline for (@typeInfo(@TypeOf(value)).@"struct".field_names) |field| {
+        if (!value.nativeJsonSkipField(field)) {
+            try writer.objectField(field);
+            try writer.write(@field(value, field));
+        }
+    }
+    try writer.endObject();
+}
+
+pub const Purpose = enum { not_null, foreign_key_source, foreign_key_parent, foreign_key_dual };
+pub const ReferenceCoverage = struct {
+    expected: @import("relational_reference_witness.zig").Witness = .{},
+    observed: @import("relational_reference_witness.zig").Witness = .{},
+
+    pub fn validate(self: @This(), purpose: Purpose, records: u64, rows: u64, columns: u16) !void {
+        try self.expected.validate();
+        try self.observed.validate();
+        const maximum = std.math.mul(u64, rows, columns) catch return error.InvalidSchemaValidationJob;
+        if (purpose == .not_null or self.expected.count > maximum or self.observed.count > records or
+            (purpose == .foreign_key_source and self.observed.count != 0) or
+            (purpose == .foreign_key_parent and self.expected.count != 0)) return error.InvalidSchemaValidationJob;
+    }
+};
+
 pub const Binding = struct {
+    purpose: Purpose = .not_null,
     id: [16]u8,
     plan_digest: Digest,
     owner: Digest,
@@ -88,13 +117,21 @@ pub const Binding = struct {
     inputs: Digest,
     projection_identity: Digest,
 
+    pub fn nativeJsonSkipField(self: @This(), comptime field: []const u8) bool {
+        return std.mem.eql(u8, field, "purpose") and self.purpose == .not_null;
+    }
+    pub fn jsonStringify(self: @This(), writer: anytype) @TypeOf(writer.*).Error!void {
+        return writeFields(self, writer);
+    }
     pub fn validate(self: Binding) !void {
         _ = try self.fence.encode();
         if (self.fence.role != .schema_validation or self.fence.owner_group_id != self.fence.peer_group_id or
             self.fence.namespace.shard_id == 0 or self.fence.namespace.range_id == 0 or
             self.columns == 0 or self.columns > max_columns or std.mem.allEqual(u8, &self.id, 0) or
-            self.after_version != (std.math.add(u32, self.before_version, 1) catch return error.InvalidSchemaValidationJob))
+            self.after_version != (if (self.purpose == .foreign_key_parent) self.before_version else (std.math.add(u32, self.before_version, 1) catch return error.InvalidSchemaValidationJob)))
             return error.InvalidSchemaValidationJob;
+        if (self.purpose == .foreign_key_parent and (!eq(self.before_schema, self.after_schema) or
+            !eq(self.before_public, self.after_public) or !eq(self.fence.catalog_digest, self.after_catalog))) return error.InvalidSchemaValidationJob;
         inline for (.{ "plan_digest", "owner", "before_schema", "after_schema", "before_public", "after_public", "after_catalog", "physical_catalog", "inputs", "projection_identity" }) |field|
             if (std.mem.allEqual(u8, &@field(self, field), 0)) return error.InvalidSchemaValidationJob;
     }
@@ -135,9 +172,18 @@ pub const Header = struct {
     failure_column: ?u16 = null,
     installation: ?Installation = null,
     release: ?Release = null,
+    reference_coverage: ?ReferenceCoverage = null,
 
+    pub fn nativeJsonSkipField(self: @This(), comptime field: []const u8) bool {
+        return std.mem.eql(u8, field, "reference_coverage") and self.reference_coverage == null;
+    }
+    pub fn jsonStringify(self: @This(), writer: anytype) @TypeOf(writer.*).Error!void {
+        return writeFields(self, writer);
+    }
     pub fn validate(self: Header) !void {
         try self.binding.validate();
+        if ((self.binding.purpose == .not_null) != (self.reference_coverage == null)) return error.InvalidSchemaValidationJob;
+        if (self.reference_coverage) |coverage| try coverage.validate(self.binding.purpose, self.records, self.rows_scanned, self.binding.columns);
         inline for (.{ "cursor_digest", "chain", "last_effect" }) |field|
             if (std.mem.allEqual(u8, &@field(self, field), 0)) return error.InvalidSchemaValidationJob;
         if (self.revision == 0 or self.rows_scanned > self.records or
@@ -255,6 +301,7 @@ pub const PageCommand = struct {
     binding: Binding,
     expected: Digest,
     boundary: NullabilityReplayBoundary,
+    reference_coverage: ?ReferenceCoverage = null,
     pub const max_wire_bytes = 48 + max_header + max_cursor;
     const Descriptor = struct {
         binding: Binding,
@@ -263,17 +310,27 @@ pub const PageCommand = struct {
         rows: usize,
         violation: ?usize,
         more: bool,
+        reference_coverage: ?ReferenceCoverage = null,
+
+        pub fn nativeJsonSkipField(self: @This(), comptime field: []const u8) bool {
+            return std.mem.eql(u8, field, "reference_coverage") and self.reference_coverage == null;
+        }
+        pub fn jsonStringify(self: @This(), writer: anytype) @TypeOf(writer.*).Error!void {
+            return writeFields(self, writer);
+        }
     };
     pub fn validate(self: @This()) !void {
         try self.binding.validate();
         try self.boundary.validate();
+        if ((self.binding.purpose == .not_null) != (self.reference_coverage == null)) return error.InvalidSchemaValidationPageCommand;
+        if (self.reference_coverage) |coverage| try coverage.validate(self.binding.purpose, self.boundary.records_examined, self.boundary.rows_examined, self.binding.columns);
         if (std.mem.allEqual(u8, &self.expected, 0) or
             (self.boundary.violation_column != null and self.boundary.violation_column.? >= self.binding.columns)) return error.InvalidSchemaValidationPageCommand;
     }
     pub fn effect(self: @This()) !Digest {
         try self.validate();
         var state = std.crypto.hash.Blake3.init(.{});
-        state.update("schema-validation-page/v1");
+        state.update(if (self.reference_coverage == null) "schema-validation-page/v1" else "schema-validation-page/v2");
         state.update(&self.expected);
         state.update(&hash(self.boundary.after));
         var numbers: [25]u8 = undefined;
@@ -282,19 +339,27 @@ pub const PageCommand = struct {
         std.mem.writeInt(u64, numbers[16..24], if (self.boundary.violation_column) |column| column else std.math.maxInt(u64), .little);
         numbers[24] = @intFromBool(self.boundary.more);
         state.update(&numbers);
+        if (self.reference_coverage) |coverage| {
+            for ([_]@import("relational_reference_witness.zig").Witness{ coverage.expected, coverage.observed }) |witness| {
+                var count: [8]u8 = undefined;
+                std.mem.writeInt(u64, &count, witness.count, .little);
+                state.update(&count);
+                state.update(&witness.sum);
+            }
+        }
         var result: Digest = undefined;
         state.final(&result);
         return result;
     }
     pub fn encode(self: @This(), a: A) ![]u8 {
         try self.validate();
-        const descriptor: Descriptor = .{ .binding = self.binding, .expected = self.expected, .records = self.boundary.records_examined, .rows = self.boundary.rows_examined, .violation = self.boundary.violation_column, .more = self.boundary.more };
+        const descriptor: Descriptor = .{ .binding = self.binding, .expected = self.expected, .records = self.boundary.records_examined, .rows = self.boundary.rows_examined, .violation = self.boundary.violation_column, .more = self.boundary.more, .reference_coverage = self.reference_coverage };
         var buffer: [max_header]u8 = undefined;
         var writer = std.Io.Writer.fixed(&buffer);
         try std.json.Stringify.value(descriptor, .{}, &writer);
         const metadata = writer.buffered();
         const bytes = try a.alloc(u8, 48 + metadata.len + self.boundary.after.len);
-        @memcpy(bytes[0..8], "ASVP\x01\x00\x00\x00");
+        @memcpy(bytes[0..8], if (self.reference_coverage == null) "ASVP\x01\x00\x00\x00" else "ASVP\x02\x00\x00\x00");
         std.mem.writeInt(u32, bytes[8..12], @intCast(metadata.len), .little);
         std.mem.writeInt(u32, bytes[12..16], @intCast(self.boundary.after.len), .little);
         @memcpy(bytes[16..][0..metadata.len], metadata);
@@ -305,7 +370,7 @@ pub const PageCommand = struct {
     /// The returned cursor borrows bytes. All descriptor fields are owned
     /// values; no JSON parser allocation or request arena escapes this call.
     pub fn decode(bytes: []const u8) !@This() {
-        if (bytes.len < 48 or bytes.len > max_wire_bytes or !std.mem.eql(u8, bytes[0..8], "ASVP\x01\x00\x00\x00") or
+        if (bytes.len < 48 or bytes.len > max_wire_bytes or (!std.mem.eql(u8, bytes[0..8], "ASVP\x01\x00\x00\x00") and !std.mem.eql(u8, bytes[0..8], "ASVP\x02\x00\x00\x00")) or
             !eq(hash(bytes[0 .. bytes.len - 32]), bytes[bytes.len - 32 ..][0..32].*)) return error.InvalidSchemaValidationPageCommand;
         const metadata_len: usize = std.mem.readInt(u32, bytes[8..12], .little);
         const cursor_len: usize = std.mem.readInt(u32, bytes[12..16], .little);
@@ -314,11 +379,12 @@ pub const PageCommand = struct {
         var buffer: [64 * 1024]u8 = undefined;
         var scratch = std.heap.FixedBufferAllocator.init(&buffer);
         const descriptor = std.json.parseFromSliceLeaky(Descriptor, scratch.allocator(), bytes[16..][0..metadata_len], .{}) catch return error.InvalidSchemaValidationPageCommand;
+        if ((bytes[4] == 1) != (descriptor.reference_coverage == null)) return error.InvalidSchemaValidationPageCommand;
         var canonical: [max_header]u8 = undefined;
         var writer = std.Io.Writer.fixed(&canonical);
         try std.json.Stringify.value(descriptor, .{}, &writer);
         if (!std.mem.eql(u8, writer.buffered(), bytes[16..][0..metadata_len])) return error.InvalidSchemaValidationPageCommand;
-        const result: @This() = .{ .binding = descriptor.binding, .expected = descriptor.expected, .boundary = .{ .records_examined = descriptor.records, .rows_examined = descriptor.rows, .violation_column = descriptor.violation, .more = descriptor.more, .after = bytes[16 + metadata_len ..][0..cursor_len] } };
+        const result: @This() = .{ .binding = descriptor.binding, .expected = descriptor.expected, .reference_coverage = descriptor.reference_coverage, .boundary = .{ .records_examined = descriptor.records, .rows_examined = descriptor.rows, .violation_column = descriptor.violation, .more = descriptor.more, .after = bytes[16 + metadata_len ..][0..cursor_len] } };
         try result.validate();
         return result;
     }
@@ -386,11 +452,18 @@ test "schema validation publication immutable inputs remain raw bounded and allo
 /// The provisional plan digest is deliberately excluded from intent identity:
 /// the final immutable cohort commits all preparations before it can exist.
 pub const PreparationDescriptor = struct {
+    purpose: Purpose = .not_null,
     id: [16]u8,
     provisional_plan: Digest,
     fence: topology.Fence,
     authority: @import("../source_authority.zig").Kind,
 
+    pub fn nativeJsonSkipField(self: @This(), comptime field: []const u8) bool {
+        return std.mem.eql(u8, field, "purpose") and self.purpose == .not_null;
+    }
+    pub fn jsonStringify(self: @This(), writer: anytype) @TypeOf(writer.*).Error!void {
+        return writeFields(self, writer);
+    }
     pub fn validate(self: @This()) !void {
         _ = try self.fence.encode();
         if (std.mem.allEqual(u8, &self.id, 0) or std.mem.allEqual(u8, &self.provisional_plan, 0) or
@@ -618,3 +691,98 @@ pub const Command = struct {
         }
     }
 };
+
+const ValidationContractFixture = struct {
+    fn binding() Binding {
+        return .{ .id = @splat(1), .plan_digest = @splat(2), .owner = @splat(3), .fence = .{ .transition_id = 4, .attempt = 1, .admission_epoch = 1, .owner_group_id = 72, .peer_group_id = 72, .namespace = .{ .table_id = 7, .shard_id = 172, .range_id = 272 }, .catalog_digest = @splat(5), .role = .schema_validation }, .authority = .native, .before_version = 1, .after_version = 2, .columns = 1, .before_schema = @splat(6), .after_schema = @splat(7), .before_public = @splat(8), .after_public = @splat(9), .after_catalog = @splat(10), .physical_catalog = @splat(11), .inputs = @splat(12), .projection_identity = @splat(13) };
+    }
+    fn legacyBinding(b: Binding) @TypeOf(.{ .id = b.id, .plan_digest = b.plan_digest, .owner = b.owner, .fence = b.fence, .authority = b.authority, .before_version = b.before_version, .after_version = b.after_version, .columns = b.columns, .before_schema = b.before_schema, .after_schema = b.after_schema, .before_public = b.before_public, .after_public = b.after_public, .after_catalog = b.after_catalog, .physical_catalog = b.physical_catalog, .inputs = b.inputs, .projection_identity = b.projection_identity }) {
+        return .{ .id = b.id, .plan_digest = b.plan_digest, .owner = b.owner, .fence = b.fence, .authority = b.authority, .before_version = b.before_version, .after_version = b.after_version, .columns = b.columns, .before_schema = b.before_schema, .after_schema = b.after_schema, .before_public = b.before_public, .after_public = b.after_public, .after_catalog = b.after_catalog, .physical_catalog = b.physical_catalog, .inputs = b.inputs, .projection_identity = b.projection_identity };
+    }
+    fn ready(b: Binding) Header {
+        return .{ .binding = b, .phase = .ready, .admitted = .{ .native = .{ .namespace = b.fence.namespace, .sequence = 1 } }, .frozen = .{ .native = .{ .namespace = b.fence.namespace, .sequence = 2 } }, .updated = .{ .native = .{ .namespace = b.fence.namespace, .sequence = 3 } }, .revision = 3, .records = 2, .rows_scanned = 2, .cursor_digest = hash("cursor"), .chain = @splat(14), .last_effect = @splat(15) };
+    }
+};
+
+test "foreign key validation owner roles retain existing NOT NULL bytes and receipt identities" {
+    const a = std.testing.allocator;
+    const b = ValidationContractFixture.binding();
+    try b.validate();
+    const legacy = try std.json.Stringify.valueAlloc(a, ValidationContractFixture.legacyBinding(b), .{});
+    defer a.free(legacy);
+    const current = try std.json.Stringify.valueAlloc(a, b, .{});
+    defer a.free(current);
+    try std.testing.expectEqualSlices(u8, legacy, current);
+    const header = ValidationContractFixture.ready(b);
+    const old_header = try std.json.Stringify.valueAlloc(a, .{ .binding = ValidationContractFixture.legacyBinding(b), .phase = header.phase, .admitted = header.admitted, .frozen = header.frozen, .updated = header.updated, .revision = header.revision, .records = header.records, .rows_scanned = header.rows_scanned, .cursor_digest = header.cursor_digest, .chain = header.chain, .last_effect = header.last_effect, .failure_column = header.failure_column, .installation = header.installation, .release = header.release }, .{});
+    defer a.free(old_header);
+    const encoded = try header.encode(a);
+    defer a.free(encoded);
+    try std.testing.expectEqualSlices(u8, old_header, encoded[12 .. encoded.len - 32]);
+    try std.testing.expectEqualSlices(u8, &hash(old_header), &try header.digest());
+    try std.testing.expectEqualDeep(header, try Header.decode(encoded));
+    const page: PageCommand = .{ .binding = b, .expected = try header.digest(), .boundary = .{ .records_examined = 2, .rows_examined = 2, .violation_column = null, .after = "\x00\xffcursor", .more = true } };
+    const frame = try page.encode(a);
+    defer a.free(frame);
+    try std.testing.expectEqual(@as(u8, 1), frame[4]);
+    const old_descriptor = try std.json.Stringify.valueAlloc(a, .{ .binding = ValidationContractFixture.legacyBinding(b), .expected = page.expected, .records = page.boundary.records_examined, .rows = page.boundary.rows_examined, .violation = page.boundary.violation_column, .more = page.boundary.more }, .{});
+    defer a.free(old_descriptor);
+    try std.testing.expectEqualSlices(u8, old_descriptor, frame[16..][0..std.mem.readInt(u32, frame[8..12], .little)]);
+    const decoded = try PageCommand.decode(frame);
+    try std.testing.expectEqualSlices(u8, &try page.effect(), &try decoded.effect());
+}
+
+test "foreign key validation owner coverage binds source parent and dual roles without authority conversion" {
+    const a = std.testing.allocator;
+    var b = ValidationContractFixture.binding();
+    b.purpose = .foreign_key_source;
+    var header = ValidationContractFixture.ready(b);
+    try std.testing.expectError(error.InvalidSchemaValidationJob, header.validate());
+    header.reference_coverage = .{ .expected = .{ .count = 2, .sum = @splat(4) } };
+    try header.validate();
+    const source = try header.encode(a);
+    defer a.free(source);
+    try std.testing.expectEqualDeep(header, try Header.decode(source));
+    header.binding.purpose = .not_null;
+    try std.testing.expectError(error.InvalidSchemaValidationJob, header.validate());
+    header.binding.purpose = .foreign_key_parent;
+    try std.testing.expectError(error.InvalidSchemaValidationJob, header.validate());
+    header.binding.after_version = header.binding.before_version;
+    header.binding.after_schema = header.binding.before_schema;
+    header.binding.after_public = header.binding.before_public;
+    header.binding.after_catalog = header.binding.fence.catalog_digest;
+    try std.testing.expectError(error.InvalidSchemaValidationJob, header.validate());
+    header.reference_coverage = .{ .observed = .{ .count = 2, .sum = @splat(4) } };
+    try header.validate();
+    var parent = header.binding;
+    parent.after_schema[0] ^= 1;
+    try std.testing.expectError(error.InvalidSchemaValidationJob, parent.validate());
+    header = ValidationContractFixture.ready(b);
+    header.binding.purpose = .foreign_key_dual;
+    header.reference_coverage = .{ .expected = .{ .count = 2, .sum = @splat(4) }, .observed = .{ .count = 2, .sum = @splat(4) } };
+    try header.validate();
+    header.reference_coverage.?.observed.count = 3;
+    try std.testing.expectError(error.InvalidSchemaValidationJob, header.validate());
+}
+
+test "foreign key validation owner page proofs bind witness bytes and reject frame version laundering" {
+    const a = std.testing.allocator;
+    var b = ValidationContractFixture.binding();
+    b.purpose = .foreign_key_source;
+    const page: PageCommand = .{ .binding = b, .expected = @splat(3), .boundary = .{ .records_examined = 2, .rows_examined = 2, .violation_column = null, .after = "\x00\xffcursor", .more = true }, .reference_coverage = .{ .expected = .{ .count = 2, .sum = @splat(4) } } };
+    const bytes = try page.encode(a);
+    defer a.free(bytes);
+    try std.testing.expectEqual(@as(u8, 2), bytes[4]);
+    const decoded = try PageCommand.decode(bytes);
+    try std.testing.expectEqualDeep(page.reference_coverage, decoded.reference_coverage);
+    try std.testing.expectEqualSlices(u8, page.boundary.after, decoded.boundary.after);
+    try std.testing.expectEqualSlices(u8, &try page.effect(), &try decoded.effect());
+    var changed = page;
+    changed.reference_coverage.?.expected.sum[0] ^= 1;
+    try std.testing.expect(!std.mem.eql(u8, &try page.effect(), &try changed.effect()));
+    changed.reference_coverage = null;
+    try std.testing.expectError(error.InvalidSchemaValidationPageCommand, changed.validate());
+    bytes[4] = 1;
+    @memcpy(bytes[bytes.len - 32 ..], &hash(bytes[0 .. bytes.len - 32]));
+    try std.testing.expectError(error.InvalidSchemaValidationPageCommand, PageCommand.decode(bytes));
+}

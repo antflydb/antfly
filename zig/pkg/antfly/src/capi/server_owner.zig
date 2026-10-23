@@ -5032,24 +5032,20 @@ pub fn storageOwnerSchemaPreparationJson(owner: ?*anyopaque, request: *const ker
     var budget = if (handle.db.core.index_manager.resource_manager) |manager| resources.BudgetedAllocator.initReclaiming(manager, .relational_preparation_working_set, handle.alloc, 1) else null;
     defer if (budget) |*value| value.deinit();
     const task_alloc = if (budget) |*value| value.allocator() else handle.alloc;
-    const inputs = contract.inputParts(request.inputs.slice()) catch |err| return Failure.result(err, out_failure);
-    var names = std.json.parseFromSlice([]const []const u8, task_alloc, inputs[3], .{}) catch |err| {
-        if (budget) |value| if (value.denied()) return Failure.result(error.ResourceBudgetExceeded, out_failure);
-        return Failure.result(err, out_failure);
-    };
-    defer names.deinit();
+
     const Check = struct {
         fn active(raw: ?*anyopaque) anyerror!void {
             const value: *const local.api_operation.RequestContext = @ptrCast(@alignCast(raw.?));
             try value.ensureActive();
         }
     };
-    var candidate = local.storage_db_relational_nullability_job.Candidate.init(task_alloc, descriptor.fence.namespace.table_id, inputs[0], inputs[1], inputs[2], names.value, .{ .context = @constCast(&context), .checkpoint = Check.active }) catch |err| {
+    var candidate = local.storage_db_relational_nullability_job.Candidate.fromPreparationInputs(task_alloc, request.inputs.slice(), descriptor.fence.namespace.table_id, descriptor.purpose, .{ .context = @constCast(&context), .checkpoint = Check.active }) catch |err| {
         if (budget) |value| if (value.denied()) return Failure.result(error.ResourceBudgetExceeded, out_failure);
         return Failure.result(err, out_failure);
     };
     defer candidate.deinit();
     if (!std.mem.eql(u8, candidate.inputs, request.inputs.slice())) return Failure.result(error.InvalidSchemaValidationJob, out_failure);
+    if (candidate.foreign_source) |source| if (!std.mem.eql(u8, source.table_name, request.table_name.slice())) return Failure.result(error.SchemaValidationJobChanged, out_failure);
     const observed = handle.db.prepareSchemaOwnerObservation(&candidate, descriptor.id, descriptor.provisional_plan, descriptor.fence, descriptor.authority, context) catch |err| {
         if (budget) |value| if (value.denied()) return Failure.result(error.ResourceBudgetExceeded, out_failure);
         return Failure.result(err, out_failure);

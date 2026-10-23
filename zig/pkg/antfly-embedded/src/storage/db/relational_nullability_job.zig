@@ -25,6 +25,7 @@ const api = @import("../../schema/mod.zig");
 const compiler = @import("../../schema/relational_declarations.zig");
 const logical = @import("../../schema/column_nullability.zig");
 const projection = @import("relational_nullability.zig");
+const foreign_validation = @import("foreign_key_validation.zig");
 const codec = @import("algebraic/relational_row_codec.zig");
 const topology = @import("relational_integrity_topology.zig");
 const positions = @import("receipt_position.zig");
@@ -73,8 +74,14 @@ pub const Candidate = struct {
     plan: projection.Plan,
     before_version: u32,
     after_version: u32,
+    purpose: contract.Purpose = .not_null,
+    foreign_source: ?foreign_validation.ChildPlan = null,
 
+    pub fn projectionCount(self: *const Candidate) usize {
+        return if (self.foreign_source) |source| source.rules.len else self.plan.names.len;
+    }
     pub fn deinit(self: *Candidate) void {
+        if (self.foreign_source) |*source| source.deinit();
         self.alloc.free(self.inputs);
         self.alloc.free(self.native_before);
         self.alloc.free(self.native_after);
@@ -130,6 +137,63 @@ pub const Candidate = struct {
         try control.ensureActive();
         return .{ .alloc = a, .inputs = inputs, .native_before = native_before, .native_after = native_after, .catalog_after = catalog_after, .plan = plan, .before_version = before.runtime_schema.version, .after_version = after.runtime_schema.version };
     }
+    /// Exact child-side preparation. Parent descriptors remain untrusted
+    /// until metadata joins them to the full signed parent-owner cohort.
+    pub fn initForeignKeySource(a: A, table_id: u64, before_json: []const u8, after_json: []const u8, predecessor: []const u8, config: foreign_validation.SourceConfig, control: projection.Control) !Candidate {
+        try control.ensureActive();
+        try config.validate();
+        var counter = std.Io.Writer.Discarding.init(&.{});
+        try std.json.Stringify.value(config, .{}, &counter.writer);
+        if (counter.fullCount() > max_names) return error.InvalidSchemaValidationJob;
+        const raw_config = try std.json.Stringify.valueAlloc(a, config, .{});
+        defer a.free(raw_config);
+        var temporary = std.heap.ArenaAllocator.init(a);
+        defer temporary.deinit();
+        const scratch = temporary.allocator();
+        const names = try scratch.alloc([]const u8, config.parents.len);
+        for (config.parents, names) |scope, *name| name.* = scope.constraint_name;
+        var prepared_catalog = try @import("../../schema/foreign_key_validation.zig").prepareCatalogOwned(a, table_id, before_json, after_json, predecessor, names);
+        defer prepared_catalog.deinit();
+        const before = &prepared_catalog.before;
+        const after = &prepared_catalog.after;
+        if (before.runtime_schema.external_base_source != null or after.runtime_schema.external_base_source != null) return error.InvalidSchemaValidationJob;
+        const previous = prepared_catalog.catalog.catalog;
+        const native_before = try schema.serializeSchema(a, before.runtime_schema);
+        errdefer a.free(native_before);
+        const native_after = try schema.serializeSchema(a, after.runtime_schema);
+        errdefer a.free(native_after);
+        const definitions = try before.public_schema.relationalForeignKeyDefinitions(scratch);
+        const uniques = try before.public_schema.relationalUniqueDefinitions(scratch);
+        const rules = try scratch.alloc(foreign_validation.Rule, config.parents.len);
+        for (config.parents, rules) |scope, *rule| {
+            try control.ensureActive();
+            const definition = for (definitions) |fk| {
+                if (std.mem.eql(u8, fk.name, scope.constraint_name)) break fk;
+            } else return error.InvalidSchemaValidationJob;
+            if (!definition.not_valid or !std.mem.eql(u8, definition.parent_table, scope.declared_parent)) return error.InvalidSchemaValidationJob;
+            const generation = previous.find(.foreign_key, definition.name) orelse return error.IntegrityCatalogChanged;
+            if (scope.parent_table_id == table_id) {
+                const target = try @import("../../schema/relational_foreign_key_target.zig").resolveUnique(uniques, definition.parent_columns);
+                const unique = previous.find(.unique, target.name) orelse return error.IntegrityCatalogChanged;
+                if (!std.mem.eql(u8, scope.parent_table, config.table_name) or scope.parent_schema_version != before.runtime_schema.version or
+                    !std.mem.eql(u8, scope.parent_unique, target.name) or !eq(scope.parent_schema, hash(native_before)) or
+                    !eq(scope.parent_public, hash(before_json)) or !eq(scope.parent_catalog, hash(predecessor)) or
+                    !std.mem.eql(u8, &scope.parent_generation, &unique.generation)) return error.SchemaValidationJobChanged;
+            }
+            rule.* = .{ .name = definition.name, .columns = definition.child_columns, .generation = generation.generation, .parent_generation = scope.parent_generation, .match = definition.match };
+        }
+        var source = try foreign_validation.ChildPlan.init(a, config.table_name, before.runtime_schema, rules);
+        errdefer source.deinit();
+        var plan = try projection.Plan.init(a, before.runtime_schema, source.view.physicalLayout(), source.names, control);
+        errdefer plan.deinit();
+        plan.identity = source.identity;
+        const inputs = try contract.encodeInputs(a, .{ before_json, after_json, predecessor, raw_config });
+        errdefer a.free(inputs);
+        const catalog_after = try a.dupe(u8, prepared_catalog.catalog.value);
+        errdefer a.free(catalog_after);
+        try control.ensureActive();
+        return .{ .alloc = a, .inputs = inputs, .native_before = native_before, .native_after = native_after, .catalog_after = catalog_after, .plan = plan, .before_version = before.runtime_schema.version, .after_version = after.runtime_schema.version, .purpose = .foreign_key_source, .foreign_source = source };
+    }
     pub const parts = contract.inputParts;
     pub fn load(a: A, txn: anytype, binding: Binding, control: projection.Control) !Candidate {
         const raw = (try optional(txn, inputs_key)) orelse return error.SchemaValidationJobRequired;
@@ -139,12 +203,26 @@ pub const Candidate = struct {
     /// immutable inputs retained by metadata, never caller-asserted columns.
     pub fn fromInputs(a: A, raw: []const u8, binding: Binding, control: projection.Control) !Candidate {
         if (!eq(hash(raw), binding.inputs)) return error.SchemaValidationJobChanged;
-        const view = try parts(raw);
-        var names = try std.json.parseFromSlice([]const []const u8, a, view[3], .{});
-        defer names.deinit();
-        var result = try init(a, binding.fence.namespace.table_id, view[0], view[1], view[2], names.value, control);
+        var result = try fromPreparationInputs(a, raw, binding.fence.namespace.table_id, binding.purpose, control);
         errdefer result.deinit();
         try requireCandidate(binding, &result);
+        return result;
+    }
+    /// Read-only construction before the final binding exists. The native
+    /// owner captures its own current catalog/root and signs the resulting cut.
+    pub fn fromPreparationInputs(a: A, raw: []const u8, table_id: u64, purpose: contract.Purpose, control: projection.Control) !Candidate {
+        const view = try parts(raw);
+        var result: Candidate = if (purpose == .foreign_key_source) block: {
+            var config = try std.json.parseFromSlice(foreign_validation.SourceConfig, a, view[3], .{ .ignore_unknown_fields = false });
+            defer config.deinit();
+            break :block try initForeignKeySource(a, table_id, view[0], view[1], view[2], config.value, control);
+        } else if (purpose == .not_null) block: {
+            var names = try std.json.parseFromSlice([]const []const u8, a, view[3], .{});
+            defer names.deinit();
+            break :block try init(a, table_id, view[0], view[1], view[2], names.value, control);
+        } else return error.InvalidSchemaValidationJob;
+        errdefer result.deinit();
+        if (!std.mem.eql(u8, raw, result.inputs)) return error.InvalidSchemaValidationJob;
         return result;
     }
 };
@@ -154,6 +232,7 @@ pub const Binding = contract.Binding;
 pub fn prepareBinding(txn: anytype, candidate: *const Candidate, id: [16]u8, plan_digest: Digest, fence: topology.Fence, kind: authority.Kind) !Binding {
     const parts = try Candidate.parts(candidate.inputs);
     const result: Binding = .{
+        .purpose = candidate.purpose,
         .id = id,
         .plan_digest = plan_digest,
         .fence = fence,
@@ -161,7 +240,7 @@ pub fn prepareBinding(txn: anytype, candidate: *const Candidate, id: [16]u8, pla
         .owner = try activation.ownership(txn),
         .before_version = candidate.before_version,
         .after_version = candidate.after_version,
-        .columns = @intCast(candidate.plan.names.len),
+        .columns = @intCast(candidate.projectionCount()),
         .before_schema = hash(candidate.native_before),
         .after_schema = hash(candidate.native_after),
         .before_public = hash(parts[0]),
@@ -177,9 +256,10 @@ pub fn prepareBinding(txn: anytype, candidate: *const Candidate, id: [16]u8, pla
 }
 pub fn requireCandidate(self: Binding, candidate: *const Candidate) !void {
     try self.validate();
+    if (self.purpose != candidate.purpose) return error.InvalidSchemaValidationJob;
     const parts = try Candidate.parts(candidate.inputs);
     if (self.before_version != candidate.before_version or self.after_version != candidate.after_version or
-        self.columns != candidate.plan.names.len or !eq(self.projection_identity, candidate.plan.identity) or
+        self.columns != candidate.projectionCount() or !eq(self.projection_identity, candidate.plan.identity) or
         !eq(self.inputs, hash(candidate.inputs)) or !eq(self.before_schema, hash(candidate.native_before)) or
         !eq(self.after_schema, hash(candidate.native_after)) or !eq(self.before_public, hash(parts[0])) or
         !eq(self.after_public, hash(parts[1])) or !eq(self.after_catalog, hash(candidate.catalog_after)) or
@@ -458,6 +538,7 @@ fn requireSuccessorDefinition(a: A, txn: anytype, binding: Binding) !void {
 /// those writes. The containing transaction must also stage replay/outbox.
 /// No fence release, signature, public RPC or coordinator ACK occurs here.
 pub fn stageInstalled(a: A, txn: anytype, binding: Binding, ready_digest: Digest, decision: Digest, physical_catalog: Digest, entry: ?receipts.OrderedApplyReceipt) !Header {
+    if (binding.purpose != .not_null) return error.ForeignKeyValidationRequired;
     var header = (try load(txn)) orelse return error.SchemaValidationJobRequired;
     try requireCommitted(txn, header);
     if (!std.meta.eql(header.binding, binding) or header.phase != .ready or
@@ -611,7 +692,7 @@ pub fn stageBegin(a: A, txn: anytype, binding: Binding, candidate: *const Candid
     }
     if (try topology.current(txn) != null) return error.IntegrityTopologyBusy;
     const position = try nextPosition(txn, binding, entry);
-    const header: Header = .{ .binding = binding, .phase = .fencing, .admitted = position, .updated = position, .cursor_digest = hash(""), .chain = hash(candidate.inputs), .last_effect = hash("schema-validation-begin/v1") };
+    const header: Header = .{ .binding = binding, .phase = .fencing, .admitted = position, .updated = position, .cursor_digest = hash(""), .chain = hash(candidate.inputs), .last_effect = hash("schema-validation-begin/v1"), .reference_coverage = if (binding.purpose == .not_null) null else .{} };
     try txn.put(inputs_key, candidate.inputs);
     try txn.put(cursor_key, "");
     try save(a, txn, header);
@@ -699,7 +780,7 @@ pub const RowAudit = struct {
         }
         pub fn validate(self: *const @This()) !void {
             const value = self.summary;
-            try value.header.validate();
+            try value.validateProgress();
             try value.snapshot_cut.requireNamespace(value.header.binding.fence.namespace);
             try precedesOrEqual(value.header.updated, value.snapshot_cut);
             if (value.coverage != coverageFor(value.header.phase) or value.rows > value.records or self.after.len > max_cursor or
@@ -736,6 +817,7 @@ pub const RowAudit = struct {
     coverage: Coverage,
     records: u64 = 0,
     rows_examined: u64 = 0,
+    reference_coverage: ?contract.ReferenceCoverage = null,
     cursor_digest: Digest,
     done: bool = false,
     invalid: bool = false,
@@ -763,7 +845,7 @@ pub const RowAudit = struct {
         // A fresh reader starts at the real beginning. Projection binding is
         // deferred until its first page or authenticated checkpoint resume.
         const snapshot_cut = try currentPosition(&reader.read, binding);
-        var result: @This() = .{ .alloc = a, .reader = reader, .candidate = candidate, .header = header, .snapshot_cut = snapshot_cut, .coverage = coverage, .cursor_digest = hash("") };
+        var result: @This() = .{ .alloc = a, .reader = reader, .candidate = candidate, .header = header, .snapshot_cut = snapshot_cut, .coverage = coverage, .reference_coverage = if (binding.purpose == .not_null) null else .{}, .cursor_digest = hash("") };
         if (coverage == .none) result.done = true else if (coverage == .prefix and header.records == 0) {
             if (header.phase == .failed or header.rows_scanned != 0 or !eq(header.cursor_digest, hash(""))) return error.SchemaValidationRuntimeRecoveryRequired;
             result.done = true;
@@ -788,7 +870,10 @@ pub const RowAudit = struct {
         if (self.invalid or self.records != 0 or self.reader.after.items.len != 0 or
             !std.meta.eql(self.header, progress.summary.header) or !std.meta.eql(self.snapshot_cut, progress.summary.snapshot_cut) or
             self.coverage != progress.summary.coverage) return error.SchemaValidationRuntimeRecoveryRequired;
-        try self.reader.resumeNullabilityScan(&self.candidate.plan, .{ .projection_identity = self.header.binding.projection_identity, .after = progress.after }, control);
+        if (self.candidate.foreign_source) |*source| {
+            try self.reader.resumeForeignKeyValidationScan(source, .{ .projection_identity = self.header.binding.projection_identity, .after = progress.after }, control);
+        } else try self.reader.resumeNullabilityScan(&self.candidate.plan, .{ .projection_identity = self.header.binding.projection_identity, .after = progress.after }, control);
+        self.reference_coverage = progress.summary.reference_coverage;
         self.records = progress.summary.records;
         self.rows_examined = progress.summary.rows;
         self.cursor_digest = progress.summary.cursor_digest;
@@ -804,13 +889,23 @@ pub const RowAudit = struct {
         if (self.done) return true;
         var bounded = budget;
         if (self.coverage == .prefix) bounded.records = @intCast(@min(@as(u64, @intCast(budget.records)), self.header.records - self.records));
-        var page = try self.reader.nextNullabilityPage(self.alloc, io, bounded, &self.candidate.plan, control);
+        var delta: ?contract.ReferenceCoverage = null;
+        var page = if (self.candidate.foreign_source) |*source| block: {
+            const value = try self.reader.nextForeignKeyValidationPage(self.alloc, io, bounded, source, control);
+            delta = .{ .expected = value.witness };
+            break :block value.scan;
+        } else try self.reader.nextNullabilityPage(self.alloc, io, bounded, &self.candidate.plan, control);
         defer page.deinit();
         // A rejected page has advanced the retained reader. Never retry it as
         // an empty EOF page and accidentally qualify the previous counters.
         errdefer self.invalid = true;
         const records = try std.math.add(u64, self.records, page.page.records_examined);
         const examined = try std.math.add(u64, self.rows_examined, page.rows_examined);
+        var reference_coverage = self.reference_coverage;
+        if (delta) |value| {
+            try reference_coverage.?.expected.combine(value.expected);
+            try reference_coverage.?.observed.combine(value.observed);
+        }
         if (self.header.phase != .released and (records > self.header.records or examined > self.header.rows_scanned)) return error.SchemaValidationRuntimeRecoveryRequired;
         const cursor = hash(page.after);
         const violation: ?u16 = if (page.violation_column) |column| std.math.cast(u16, column) orelse return error.InvalidSchemaValidationJob else null;
@@ -818,6 +913,7 @@ pub const RowAudit = struct {
         if (violation != null and (self.header.phase != .failed or !finished)) return error.SchemaValidationRuntimeRecoveryRequired;
         if (self.coverage == .prefix and !finished and !page.page.more) return error.SchemaValidationRuntimeRecoveryRequired;
         if (finished) {
+            if (self.header.phase != .released and !std.meta.eql(reference_coverage, self.header.reference_coverage)) return error.SchemaValidationRuntimeRecoveryRequired;
             if (self.coverage == .prefix or self.header.phase != .released) {
                 if (records != self.header.records or examined != self.header.rows_scanned or
                     !eq(cursor, self.header.cursor_digest) or violation != self.header.failure_column)
@@ -826,6 +922,7 @@ pub const RowAudit = struct {
         }
         self.records = records;
         self.rows_examined = examined;
+        self.reference_coverage = reference_coverage;
         self.cursor_digest = cursor;
         self.done = finished;
         return finished;
@@ -857,7 +954,7 @@ pub const RowAudit = struct {
     }
 
     fn snapshotSummary(self: *const @This()) Summary {
-        return .{ .header = self.header, .snapshot_cut = self.snapshot_cut, .coverage = self.coverage, .records = self.records, .rows = self.rows_examined, .cursor_digest = self.cursor_digest };
+        return .{ .header = self.header, .snapshot_cut = self.snapshot_cut, .coverage = self.coverage, .records = self.records, .rows = self.rows_examined, .cursor_digest = self.cursor_digest, .reference_coverage = self.reference_coverage };
     }
 };
 
@@ -866,6 +963,7 @@ pub const RowAudit = struct {
 pub const PreparedPage = struct {
     page: rows.NullabilityPage,
     expected: Header,
+    reference_coverage: ?contract.ReferenceCoverage = null,
     pub fn deinit(self: *PreparedPage) void {
         self.page.deinit();
         self.* = undefined;
@@ -882,7 +980,7 @@ pub const PreparedPage = struct {
     /// The cursor borrows this prepared page. encode owns its output, allowing
     /// transport/recovery to discard the original page before replay.
     pub fn command(self: *const PreparedPage) !PageCommand {
-        return .{ .binding = self.expected.binding, .expected = try self.expected.digest(), .boundary = .{ .records_examined = self.page.page.records_examined, .rows_examined = self.page.rows_examined, .violation_column = self.page.violation_column, .after = self.page.after, .more = self.page.page.more } };
+        return .{ .binding = self.expected.binding, .expected = try self.expected.digest(), .boundary = .{ .records_examined = self.page.page.records_examined, .rows_examined = self.page.rows_examined, .violation_column = self.page.violation_column, .after = self.page.after, .more = self.page.page.more }, .reference_coverage = self.reference_coverage };
     }
     fn prepareMode(a: A, core: anytype, binding: Binding, budget: rows.Budget, control: projection.Control, replay_command: ?PageCommand) !PreparedPage {
         try control.ensureActive();
@@ -898,6 +996,14 @@ pub const PreparedPage = struct {
         defer a.free(cursor);
         var candidate = try Candidate.load(a, &reader.read, binding, control);
         defer candidate.deinit();
+        if (candidate.foreign_source) |*source| {
+            try reader.resumeForeignKeyValidationScan(source, .{ .projection_identity = binding.projection_identity, .after = cursor }, control);
+            const page = if (replay_command) |expected|
+                try reader.nextForeignKeyValidationReplayPage(a, null, .{ .scan = expected.boundary, .witness = expected.reference_coverage.?.expected }, source, control)
+            else
+                try reader.nextForeignKeyValidationPage(a, null, budget, source, control);
+            return .{ .page = page.scan, .expected = header, .reference_coverage = .{ .expected = page.witness } };
+        }
         try reader.resumeNullabilityScan(&candidate.plan, .{ .projection_identity = binding.projection_identity, .after = cursor }, control);
         const page = if (replay_command) |expected|
             try reader.nextNullabilityReplayPage(a, null, expected.boundary, &candidate.plan, control)
@@ -922,6 +1028,11 @@ pub fn stagePage(a: A, txn: anytype, manager: *transactions.TxnManager, prepared
         return error.SchemaValidationJobChanged;
     header.records = try std.math.add(u64, header.records, prepared.page.page.records_examined);
     header.rows_scanned = try std.math.add(u64, header.rows_scanned, prepared.page.rows_examined);
+    if ((header.reference_coverage == null) != (prepared.reference_coverage == null)) return error.InvalidSchemaValidationJob;
+    if (prepared.reference_coverage) |delta| {
+        try header.reference_coverage.?.expected.combine(delta.expected);
+        try header.reference_coverage.?.observed.combine(delta.observed);
+    }
     header.revision = try std.math.add(u64, header.revision, 1);
     header.cursor_digest = hash(prepared.page.after);
     header.failure_column = if (prepared.page.violation_column) |column| std.math.cast(u16, column) orelse return error.InvalidSchemaValidationJob else null;
@@ -964,7 +1075,7 @@ pub fn stageCancel(a: A, txn: anytype, manager: *transactions.TxnManager, bindin
     if (try topology.completed(txn)) |done| if (done.admission_epoch >= binding.fence.admission_epoch) return error.SchemaValidationJobChanged;
     const position = try nextPosition(txn, binding, entry);
     if (previous) |prior| try precedes(prior.updated, position);
-    var header: Header = if (previous != null and std.meta.eql(previous.?.binding, binding)) previous.? else .{ .binding = binding, .phase = .canceling, .admitted = null, .updated = position, .cursor_digest = hash(""), .chain = hash("schema-validation-unvisited/v1"), .last_effect = hash("schema-validation-cancel/v1") };
+    var header: Header = if (previous != null and std.meta.eql(previous.?.binding, binding)) previous.? else .{ .binding = binding, .phase = .canceling, .admitted = null, .updated = position, .cursor_digest = hash(""), .chain = hash("schema-validation-unvisited/v1"), .last_effect = hash("schema-validation-cancel/v1"), .reference_coverage = if (binding.purpose == .not_null) null else .{} };
     header.phase = .canceling;
     header.failure_column = null;
     header.updated = position;

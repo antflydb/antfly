@@ -188,11 +188,7 @@ pub const Prepared = struct {
             self.command.payload = self.owned.?;
         }
         if (command.action == .begin) {
-            const parts = try job.Candidate.parts(command.payload);
-            var names = try std.json.parseFromSlice([]const []const u8, a, parts[3], .{});
-            defer names.deinit();
-            self.candidate = try job.Candidate.init(a, command.binding.fence.namespace.table_id, parts[0], parts[1], parts[2], names.value, control(&context));
-            try job.requireCandidate(command.binding, &self.candidate.?);
+            self.candidate = try job.Candidate.fromInputs(a, command.payload, command.binding, control(&context));
             self.command.payload = self.candidate.?.inputs;
         }
         var read = try core.store.beginReadTxn();
@@ -227,6 +223,7 @@ pub const Prepared = struct {
             },
             .page => self.page = try job.PreparedPage.replay(a, core, try job.PageCommand.decode(self.command.payload), control(&context)),
             .install => {
+                if (command.binding.purpose != .not_null) return error.ForeignKeyValidationRequired;
                 const ready = try job.requireReady(&read, command.binding);
                 if (!equal(try ready.digest(), self.command.payload[32..64].*)) return error.SchemaValidationJobChanged;
                 var candidate = try job.Candidate.load(a, &read, command.binding, control(&context));

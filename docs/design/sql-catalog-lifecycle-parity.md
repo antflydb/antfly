@@ -91,6 +91,23 @@ their existing behavior and cannot acquire validation authority through this
 constructor. No schema publication, source fence or parent proof is granted by
 these native helpers.
 
+The child side now executes through the existing durable schema-validation
+job and native control/journal paths. Compact parent descriptors are bound into
+immutable inputs; they are not parent-validation authority. Owned preparation
+reuses both compiled declarations and retains the catalog successor instead of
+compiling the schemas again. Source, parent and dual roles are explicit in the
+binding. New binary page frames commit both the replay boundary and reference
+witness; omitted FK-only fields preserve existing NOT NULL bytes and signatures.
+
+Source pages persist expected reference coverage atomically with job progress.
+Lost-page replay, cold reopen, success and MATCH FULL failure, cancellation,
+retained audit checkpoints and forged checkpoint witnesses are covered by the
+native fixture. Independent audits recompute the expected witness rather than
+trusting restored counters. A fixture supplies sentinel parent facts and does
+not claim an authenticated distributed parent proof. Native installation and
+metadata admission explicitly refuse FK roles until the whole cohort protocol
+is implemented, so a successful child scan cannot clear the validity flag.
+
 The remaining case closure is the integrated durable lifecycle: admit the exact
 child/parent cohort through existing schema-validation machinery; authenticate
 all child freeze acknowledgements before parent coverage; persist/recover the
@@ -100,12 +117,15 @@ restore through authenticated SQL owners and the PostgreSQL oracle. Existing
 SQL VALIDATE guards remain in place until that lifecycle is implemented. The
 original-case counts and next-100 progress above are unchanged.
 
-The strict Debug qualification currently covers fourteen native FK projection,
-parent-page, declaration/catalog and allocation-failure tests; two cold LSM
-source scan/replay/resume tests; and both existing NOT NULL scan regressions.
-After warm-up, ten thousand additional historical-row projections perform no
-heap allocations. Catalog rollback, commit, stale CAS and cold reopen retain
-all active/retired generation identities. These are native implementation
+Strict Debug qualification currently covers eighteen native FK/owner-contract,
+preparation and allocation-failure tests; three cold LSM scan/source-job tests;
+the existing 35-test NOT NULL recovery selection; 37 metadata publication tests;
+and five SQL presentation checks. The production Debug server builds and its
+CLI smoke check passes. After warm-up, ten thousand additional historical-row
+projections perform no heap allocations. A source candidate with two FKs sharing
+one column verifies rule counts independently of projection width through every
+allocation failure. The exhaustive metadata snapshot registry now classifies
+column-comment writes as column-identity state. These are native implementation
 checks, not the missing distributed SQL lifecycle evidence.
 
 ### Column comments: stable attributes and bounded catalog admission

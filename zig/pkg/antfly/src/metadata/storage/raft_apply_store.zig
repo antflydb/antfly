@@ -27668,6 +27668,7 @@ pub const RaftApplyStore = struct {
     /// without classifying its durable output is therefore a compile error.
     fn transitionCommandProjectionMask(tag: std.meta.Tag(TransitionCommand)) MetadataSnapshotProjectionMask {
         const mask = switch (tag) {
+            .comment_column => metadataSnapshotProjectionBit(.sql_column_identities),
             .apply_sql_sequence_counter => metadataSnapshotProjectionBit(.sql_sequence_counters),
             .accept_relational_index_delivery => metadataSnapshotProjectionBit(.index_delivery_source) | metadataSnapshotProjectionBit(.index_delivery_target) | metadataSnapshotProjectionBit(.index_publication_owner) | metadataSnapshotProjectionBit(.standalone_native_owner),
             .complete_relational_index_source => metadataSnapshotProjectionBit(.index_delivery_source) | metadataSnapshotProjectionBit(.index_publication_owner) | metadataSnapshotProjectionBit(.index_publication_head) | metadataSnapshotProjectionBit(.standalone_native_owner),
@@ -53495,6 +53496,7 @@ test "resolver curation namespace propagation rejects source edits racing propos
 
 test "SQL COMMENT column codec retains guarded identity and rejects truncated admission" {
     const a = std.testing.allocator;
+    try std.testing.expectEqual(RaftApplyStore.metadataSnapshotProjectionBit(.sql_column_identities), RaftApplyStore.transitionCommandProjectionMask(.comment_column));
     const command: TransitionCommand = .{ .comment_column = .{
         .guard = .{ .target = .{ .name = "rows" }, .logical_table = "rows", .owner = .{ .table_id = 7, .schema_version = 1, .schema_digest = @splat(1), .kind = .table }, .incarnation = @splat(2) },
         .column = .{ .name = "status", .value = "a 'quoted' Ω" },

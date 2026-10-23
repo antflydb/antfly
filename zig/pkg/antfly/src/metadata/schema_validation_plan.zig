@@ -163,6 +163,7 @@ pub const Plan = struct {
             const binding = intent.binding;
             ranges[i] = intent.range;
             try binding.validate();
+            if (binding.purpose != .not_null) return error.InvalidGenerationPublication;
             if (intent.range.group_id != binding.fence.owner_group_id or intent.range.table_id != self.before.table_id or
                 binding.fence.namespace.shard_id != tables.rangeDocIdentityShardId(intent.range) or
                 binding.fence.namespace.range_id != tables.rangeDocIdentityRangeId(intent.range) or
@@ -458,4 +459,16 @@ test "schema validation publication immutable plan prepares the maximum owner co
     try std.testing.expectEqual(@as(usize, barriers.max_owners), prepared.owners.len);
     try std.testing.expect(prepared.encoded.len < max_bytes);
     try barriers.validateCohort(prepared.head, prepared.owners);
+}
+
+test "schema validation publication rejects FK role substitution before complete parent cohort admission" {
+    const a = std.testing.allocator;
+    var fixture = try Fixture.init(a);
+    defer fixture.deinit();
+    for ([_]contract.Purpose{ .foreign_key_source, .foreign_key_dual }) |purpose| {
+        fixture.intents[0].binding.purpose = purpose;
+        // Prepared.init recomputes the plan commitment. Refusal must be the
+        // role/cohort guard rather than an accidentally stale plan digest.
+        try std.testing.expectError(error.InvalidGenerationPublication, Prepared.init(a, fixture.plan()));
+    }
 }

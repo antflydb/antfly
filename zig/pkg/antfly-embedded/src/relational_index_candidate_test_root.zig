@@ -18,6 +18,7 @@ test {
     _ = @import("storage/db/relational_integrity.zig");
     _ = @import("storage/db/foreign_key_validation.zig");
     _ = @import("storage/db/relational_integrity_catalog.zig");
+    _ = @import("storage/db/relational_schema_owner_contract.zig");
     _ = @import("schema/foreign_key_validation.zig");
     _ = @import("api/relational_integrity.zig");
     _ = @import("storage/db/relational_index_candidate.zig");
