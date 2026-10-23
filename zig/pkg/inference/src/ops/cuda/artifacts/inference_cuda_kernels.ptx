@@ -34,8 +34,6 @@
 // _ZZ23antfly_audio_logmel_f32E6values has been demoted
 // _ZZ23antfly_audio_logmel_f32E3mag has been demoted
 // _ZZ24termite_linear_f32_tiledE7partial has been demoted
-// _ZZ36termite_linear_bf16_weight_f32_tiledE7partial has been demoted
-// _ZZ35termite_linear_f16_weight_f32_tiledE7partial has been demoted
 // _ZZ27termite_argmax_last_row_f32E11best_values has been demoted
 // _ZZ27termite_argmax_last_row_f32E12best_indices has been demoted
 // _ZZ23termite_argmax_rows_f32E11best_values has been demoted
@@ -504,6 +502,8 @@
 // _ZZ42termite_embedding_gemma2_packed_heads_bf16E4sums has been demoted
 // _ZZ42termite_embedding_gemma2_packed_heads_bf16E3inv has been demoted
 // _ZZ42termite_embedding_gemma2_packed_heads_bf16E10normalized has been demoted
+// _ZZ40termite_linear_u16_weight_f32_tiled_implILb1EEvPfPKfPKtjjjE7partial has been demoted
+// _ZZ40termite_linear_u16_weight_f32_tiled_implILb0EEvPfPKfPKtjjjE7partial has been demoted
 // _ZZ38termite_linear_bias_f32_tile_rows_colsILj2ELj4ELj0EEvPfPKfS2_S2_S2_jjjE7partial has been demoted
 // _ZZ38termite_linear_bias_f32_tile_rows_colsILj2ELj4ELj1EEvPfPKfS2_S2_S2_jjjE7partial has been demoted
 // _ZZ38termite_linear_bias_f32_tile_rows_colsILj2ELj4ELj2EEvPfPKfS2_S2_S2_jjjE7partial has been demoted
@@ -22203,7 +22203,7 @@ $L__BB65_2:
 	.reg .b32 	%r<30>;
 	.reg .b64 	%rd<13>;
 	// demoted variable
-	.shared .align 4 .b8 _ZZ36termite_linear_bf16_weight_f32_tiledE7partial[1024];
+	.shared .align 4 .b8 _ZZ40termite_linear_u16_weight_f32_tiled_implILb1EEvPfPKfPKtjjjE7partial[1024];
 
 	ld.param.u64 	%rd3, [termite_linear_bf16_weight_f32_tiled_param_0];
 	ld.param.u64 	%rd4, [termite_linear_bf16_weight_f32_tiled_param_1];
@@ -22255,7 +22255,7 @@ $L__BB66_2:
 
 $L__BB66_5:
 	shl.b32 	%r23, %r2, 2;
-	mov.u32 	%r24, _ZZ36termite_linear_bf16_weight_f32_tiledE7partial;
+	mov.u32 	%r24, _ZZ40termite_linear_u16_weight_f32_tiled_implILb1EEvPfPKfPKtjjjE7partial;
 	add.s32 	%r8, %r24, %r23;
 	st.shared.f32 	[%r8], %f13;
 	bar.sync 	0;
@@ -22285,7 +22285,7 @@ $L__BB66_9:
 	setp.ne.s32 	%p7, %r2, 0;
 	@%p7 bra 	$L__BB66_11;
 
-	ld.shared.f32 	%f11, [_ZZ36termite_linear_bf16_weight_f32_tiledE7partial];
+	ld.shared.f32 	%f11, [_ZZ40termite_linear_u16_weight_f32_tiled_implILb1EEvPfPKfPKtjjjE7partial];
 	cvta.to.global.u64 	%rd10, %rd3;
 	mul.wide.u32 	%rd11, %r1, 4;
 	add.s64 	%rd12, %rd10, %rd11;
@@ -22311,7 +22311,7 @@ $L__BB66_11:
 	.reg .b32 	%r<28>;
 	.reg .b64 	%rd<13>;
 	// demoted variable
-	.shared .align 4 .b8 _ZZ35termite_linear_f16_weight_f32_tiledE7partial[1024];
+	.shared .align 4 .b8 _ZZ40termite_linear_u16_weight_f32_tiled_implILb0EEvPfPKfPKtjjjE7partial[1024];
 
 	ld.param.u64 	%rd3, [termite_linear_f16_weight_f32_tiled_param_0];
 	ld.param.u64 	%rd4, [termite_linear_f16_weight_f32_tiled_param_1];
@@ -22365,7 +22365,7 @@ $L__BB67_2:
 
 $L__BB67_5:
 	shl.b32 	%r21, %r2, 2;
-	mov.u32 	%r22, _ZZ35termite_linear_f16_weight_f32_tiledE7partial;
+	mov.u32 	%r22, _ZZ40termite_linear_u16_weight_f32_tiled_implILb0EEvPfPKfPKtjjjE7partial;
 	add.s32 	%r8, %r22, %r21;
 	st.shared.f32 	[%r8], %f13;
 	bar.sync 	0;
@@ -22395,7 +22395,7 @@ $L__BB67_9:
 	setp.ne.s32 	%p7, %r2, 0;
 	@%p7 bra 	$L__BB67_11;
 
-	ld.shared.f32 	%f11, [_ZZ35termite_linear_f16_weight_f32_tiledE7partial];
+	ld.shared.f32 	%f11, [_ZZ40termite_linear_u16_weight_f32_tiled_implILb0EEvPfPKfPKtjjjE7partial];
 	cvta.to.global.u64 	%rd10, %rd3;
 	mul.wide.u32 	%rd11, %r1, 4;
 	add.s64 	%rd12, %rd10, %rd11;
@@ -274960,10 +274960,8 @@ $L__BB344_2:
 	add.s64 	%rd6, %rd4, %rd5;
 	shr.u32 	%r11, %r10, 5;
 	and.b32  	%r12, %r10, 16;
-	and.b32  	%r13, %r10, 15;
-	add.s32 	%r14, %r13, 2;
-	shr.u32 	%r15, %r2, 5;
-	cvt.u64.u32 	%rd7, %r15;
+	shr.u32 	%r13, %r2, 5;
+	cvt.u64.u32 	%rd7, %r13;
 	ld.global.u64 	%rd8, [%rd6];
 	mul.lo.s64 	%rd9, %rd8, %rd7;
 	cvt.u64.u32 	%rd10, %r11;
@@ -274971,6 +274969,8 @@ $L__BB344_2:
 	mul.lo.s64 	%rd12, %rd11, 18;
 	cvta.to.global.u64 	%rd13, %rd2;
 	add.s64 	%rd14, %rd13, %rd12;
+	and.b32  	%r14, %r10, 15;
+	add.s32 	%r15, %r14, 2;
 	ld.global.u8 	%r16, [%rd14];
 	ld.global.u8 	%r17, [%rd14+1];
 	prmt.b32 	%r18, %r17, %r16, 30212;
@@ -274979,7 +274979,7 @@ $L__BB344_2:
 	{  cvt.f32.f16 %f2, %rs1;}
 
 	// end inline asm
-	cvt.u64.u32 	%rd15, %r14;
+	cvt.u64.u32 	%rd15, %r15;
 	add.s64 	%rd16, %rd14, %rd15;
 	setp.eq.s32 	%p2, %r12, 0;
 	ld.global.u8 	%r19, [%rd16];
@@ -275621,15 +275621,15 @@ $L__BB350_2:
 	ld.global.u32 	%r11, [%rd6];
 	shr.u32 	%r12, %r10, 5;
 	and.b32  	%r13, %r10, 16;
-	and.b32  	%r14, %r10, 15;
-	add.s32 	%r15, %r14, 2;
-	shr.u32 	%r16, %r2, 5;
-	mul.wide.u32 	%rd7, %r11, %r16;
+	shr.u32 	%r14, %r2, 5;
+	mul.wide.u32 	%rd7, %r11, %r14;
 	cvt.u64.u32 	%rd8, %r12;
 	add.s64 	%rd9, %rd7, %rd8;
 	mul.lo.s64 	%rd10, %rd9, 18;
 	cvta.to.global.u64 	%rd11, %rd2;
 	add.s64 	%rd12, %rd11, %rd10;
+	and.b32  	%r15, %r10, 15;
+	add.s32 	%r16, %r15, 2;
 	ld.global.u8 	%r17, [%rd12];
 	ld.global.u8 	%r18, [%rd12+1];
 	prmt.b32 	%r19, %r18, %r17, 30212;
@@ -275638,7 +275638,7 @@ $L__BB350_2:
 	{  cvt.f32.f16 %f2, %rs1;}
 
 	// end inline asm
-	cvt.u64.u32 	%rd13, %r15;
+	cvt.u64.u32 	%rd13, %r16;
 	add.s64 	%rd14, %rd12, %rd13;
 	setp.eq.s32 	%p2, %r13, 0;
 	ld.global.u8 	%r20, [%rd14];

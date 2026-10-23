@@ -6778,6 +6778,50 @@ fn denseDequantForSgemm(
     return .{ .data = scratch, .owned = scratch };
 }
 
+fn tryLinearQuantizedDequantSgemmGrouped(
+    comptime count: usize,
+    comptime with_bias: bool,
+    self: *NativeCompute,
+    storages: [count]*const QuantizedStorage,
+    names: [count][]const u8,
+    biases: [count][]const f32,
+    input: []const f32,
+    outputs: [count][]f32,
+    rows: usize,
+    in_dim: usize,
+    out_dim: usize,
+) !bool {
+    const dequant_start = nativeQuantPhaseStart();
+    var dense: [count]DenseDequantForSgemm = undefined;
+    var acquired: usize = 0;
+    defer while (acquired != 0) {
+        acquired -= 1;
+        dense[acquired].deinit(self.allocator);
+    };
+    inline for (0..count) |i| {
+        dense[i] = (try denseDequantForSgemm(self, storages[i], names[i], in_dim, out_dim)) orelse return false;
+        acquired += 1;
+    }
+    noteNativeQuantDispatch(switch (count) {
+        1 => .dequant_sgemm,
+        2 => .dequant_sgemm_pair,
+        3 => .dequant_sgemm_triple,
+        else => @compileError("unsupported grouped SGEMM arity"),
+    });
+    noteNativeQuantPhase(.dequant_fetch, dequant_start);
+    if (with_bias) for (0..rows) |row| {
+        inline for (0..count) |i| {
+            @memcpy(outputs[i][row * out_dim ..][0..out_dim], biases[i][0..out_dim]);
+        }
+    };
+    const sgemm_start = nativeQuantPhaseStart();
+    inline for (0..count) |i| {
+        try self.dispatchSgemmTransB(rows, out_dim, in_dim, 1.0, input, dense[i].data, if (with_bias) 1.0 else 0.0, outputs[i]);
+    }
+    noteNativeQuantPhase(.dequant_sgemm_compute, sgemm_start);
+    return true;
+}
+
 fn tryLinearQuantizedDequantSgemm(
     self: *NativeCompute,
     storage: *const QuantizedStorage,
@@ -6789,20 +6833,7 @@ fn tryLinearQuantizedDequantSgemm(
     in_dim: usize,
     out_dim: usize,
 ) !bool {
-    const dequant_start = nativeQuantPhaseStart();
-    var dense_weight = (try denseDequantForSgemm(self, storage, name, in_dim, out_dim)) orelse return false;
-    defer dense_weight.deinit(self.allocator);
-    noteNativeQuantDispatch(.dequant_sgemm);
-    noteNativeQuantPhase(.dequant_fetch, dequant_start);
-
-    const bias_row = bias[0..out_dim];
-    for (0..rows) |row| {
-        @memcpy(output[row * out_dim ..][0..out_dim], bias_row);
-    }
-    const sgemm_start = nativeQuantPhaseStart();
-    try self.dispatchSgemmTransB(rows, out_dim, in_dim, 1.0, input, dense_weight.data, 1.0, output);
-    noteNativeQuantPhase(.dequant_sgemm_compute, sgemm_start);
-    return true;
+    return tryLinearQuantizedDequantSgemmGrouped(1, true, self, .{storage}, .{name}, .{bias}, input, .{output}, rows, in_dim, out_dim);
 }
 
 fn tryLinearQuantizedDequantSgemmNoBias(
@@ -6815,15 +6846,7 @@ fn tryLinearQuantizedDequantSgemmNoBias(
     in_dim: usize,
     out_dim: usize,
 ) !bool {
-    const dequant_start = nativeQuantPhaseStart();
-    var dense_weight = (try denseDequantForSgemm(self, storage, name, in_dim, out_dim)) orelse return false;
-    defer dense_weight.deinit(self.allocator);
-    noteNativeQuantDispatch(.dequant_sgemm);
-    noteNativeQuantPhase(.dequant_fetch, dequant_start);
-    const sgemm_start = nativeQuantPhaseStart();
-    try self.dispatchSgemmTransB(rows, out_dim, in_dim, 1.0, input, dense_weight.data, 0.0, output);
-    noteNativeQuantPhase(.dequant_sgemm_compute, sgemm_start);
-    return true;
+    return tryLinearQuantizedDequantSgemmGrouped(1, false, self, .{storage}, .{name}, .{&.{}}, input, .{output}, rows, in_dim, out_dim);
 }
 
 fn tryLinearQuantizedDequantSgemmPair(
@@ -6841,23 +6864,7 @@ fn tryLinearQuantizedDequantSgemmPair(
     in_dim: usize,
     out_dim: usize,
 ) !bool {
-    const dequant_start = nativeQuantPhaseStart();
-    var dense_a = (try denseDequantForSgemm(self, storage_a, name_a, in_dim, out_dim)) orelse return false;
-    defer dense_a.deinit(self.allocator);
-    var dense_b = (try denseDequantForSgemm(self, storage_b, name_b, in_dim, out_dim)) orelse return false;
-    defer dense_b.deinit(self.allocator);
-    noteNativeQuantDispatch(.dequant_sgemm_pair);
-    noteNativeQuantPhase(.dequant_fetch, dequant_start);
-
-    for (0..rows) |row| {
-        @memcpy(output_a[row * out_dim ..][0..out_dim], bias_a[0..out_dim]);
-        @memcpy(output_b[row * out_dim ..][0..out_dim], bias_b[0..out_dim]);
-    }
-    const sgemm_start = nativeQuantPhaseStart();
-    try self.dispatchSgemmTransB(rows, out_dim, in_dim, 1.0, input, dense_a.data, 1.0, output_a);
-    try self.dispatchSgemmTransB(rows, out_dim, in_dim, 1.0, input, dense_b.data, 1.0, output_b);
-    noteNativeQuantPhase(.dequant_sgemm_compute, sgemm_start);
-    return true;
+    return tryLinearQuantizedDequantSgemmGrouped(2, true, self, .{ storage_a, storage_b }, .{ name_a, name_b }, .{ bias_a, bias_b }, input, .{ output_a, output_b }, rows, in_dim, out_dim);
 }
 
 fn tryLinearQuantizedDequantSgemmTriple(
@@ -6879,27 +6886,7 @@ fn tryLinearQuantizedDequantSgemmTriple(
     in_dim: usize,
     out_dim: usize,
 ) !bool {
-    const dequant_start = nativeQuantPhaseStart();
-    var dense_a = (try denseDequantForSgemm(self, storage_a, name_a, in_dim, out_dim)) orelse return false;
-    defer dense_a.deinit(self.allocator);
-    var dense_b = (try denseDequantForSgemm(self, storage_b, name_b, in_dim, out_dim)) orelse return false;
-    defer dense_b.deinit(self.allocator);
-    var dense_c = (try denseDequantForSgemm(self, storage_c, name_c, in_dim, out_dim)) orelse return false;
-    defer dense_c.deinit(self.allocator);
-    noteNativeQuantDispatch(.dequant_sgemm_triple);
-    noteNativeQuantPhase(.dequant_fetch, dequant_start);
-
-    for (0..rows) |row| {
-        @memcpy(output_a[row * out_dim ..][0..out_dim], bias_a[0..out_dim]);
-        @memcpy(output_b[row * out_dim ..][0..out_dim], bias_b[0..out_dim]);
-        @memcpy(output_c[row * out_dim ..][0..out_dim], bias_c[0..out_dim]);
-    }
-    const sgemm_start = nativeQuantPhaseStart();
-    try self.dispatchSgemmTransB(rows, out_dim, in_dim, 1.0, input, dense_a.data, 1.0, output_a);
-    try self.dispatchSgemmTransB(rows, out_dim, in_dim, 1.0, input, dense_b.data, 1.0, output_b);
-    try self.dispatchSgemmTransB(rows, out_dim, in_dim, 1.0, input, dense_c.data, 1.0, output_c);
-    noteNativeQuantPhase(.dequant_sgemm_compute, sgemm_start);
-    return true;
+    return tryLinearQuantizedDequantSgemmGrouped(3, true, self, .{ storage_a, storage_b, storage_c }, .{ name_a, name_b, name_c }, .{ bias_a, bias_b, bias_c }, input, .{ output_a, output_b, output_c }, rows, in_dim, out_dim);
 }
 
 fn cachedQuantDequantDenseWeight(
@@ -12174,19 +12161,7 @@ fn dispatchAndCheckQuantWorkers(
     }
 }
 
-const Q4KPreparedWorkerCtx = struct {
-    input: []const f32,
-    prepared_blocks: []const u8,
-    output: []f32,
-    rows: usize,
-    in_dim: usize,
-    out_dim: usize,
-    out_start: usize = 0,
-    out_end: usize = 0,
-    err: ?anyerror = null,
-};
-
-const Q6KPreparedWorkerCtx = struct {
+const KPreparedWorkerCtx = struct {
     input: []const f32,
     prepared_blocks: []const u8,
     output: []f32,
@@ -12356,25 +12331,13 @@ fn chooseActivationQuantParallelPlan(
     return .{ .worker_count = @min(capped_cpu_count, rows) };
 }
 
-fn q4KPreparedWorker(ctx: *Q4KPreparedWorkerCtx) void {
-    linearQ4KPreparedTiledRange(
-        ctx.input,
-        ctx.prepared_blocks,
-        ctx.output,
-        ctx.rows,
-        ctx.in_dim,
-        ctx.out_dim,
-        ctx.out_start,
-        ctx.out_end,
-    ) catch |err| {
-        ctx.err = err;
-        return;
+fn kPreparedWorker(comptime kind: gguf_tensor_types.KnownTensorType, ctx: *KPreparedWorkerCtx) void {
+    const compute = switch (kind) {
+        .Q4_K => linearQ4KPreparedTiledRange,
+        .Q6_K => linearQ6KPreparedTiledRange,
+        else => @compileError("unsupported prepared worker format"),
     };
-    ctx.err = null;
-}
-
-fn q6KPreparedWorker(ctx: *Q6KPreparedWorkerCtx) void {
-    linearQ6KPreparedTiledRange(
+    compute(
         ctx.input,
         ctx.prepared_blocks,
         ctx.output,
@@ -12459,7 +12422,8 @@ fn quantizedLinearPairWorker(ctx: *QuantizedLinearPairWorkerCtx) void {
     ctx.err = null;
 }
 
-fn linearNoBiasQ4KPreparedParallel(
+fn linearNoBiasKPreparedParallel(
+    comptime kind: gguf_tensor_types.KnownTensorType,
     io: ?std.Io,
     input: []const f32,
     prepared_blocks: []const u8,
@@ -12468,7 +12432,7 @@ fn linearNoBiasQ4KPreparedParallel(
     in_dim: usize,
     out_dim: usize,
 ) !bool {
-    const tensor_type: gguf_tensor_types.TensorType = .{ .known = .Q4_K };
+    const tensor_type: gguf_tensor_types.TensorType = .{ .known = kind };
     const values_per_block = gguf_tensor_types.valuesPerBlock(tensor_type).?;
     if (in_dim % values_per_block != 0) return error.InvalidQuantizedLinearShape;
     const row_blocks = in_dim / values_per_block;
@@ -12483,13 +12447,13 @@ fn linearNoBiasQ4KPreparedParallel(
     if (col_plan.worker_count > 1) {
         if (quantParallelDebugRequested()) {
             std.debug.print(
-                "q4k_parallel_cols workers={d} rows={d} out={d} row_blocks={d}\n",
+                (if (kind == .Q4_K) "q4k" else "q6k") ++ "_parallel_cols workers={d} rows={d} out={d} row_blocks={d}\n",
                 .{ col_plan.worker_count, rows, out_dim, row_blocks },
             );
         }
         var chunks: [max_q4_k_parallel_workers]QuantColChunk = undefined;
         const num_chunks = chunkColsForWorkers(out_dim, col_plan, &chunks);
-        var contexts: [max_q4_k_parallel_workers]Q4KPreparedWorkerCtx = undefined;
+        var contexts: [max_q4_k_parallel_workers]KPreparedWorkerCtx = undefined;
         var jobs: [max_q4_k_parallel_workers]linalg.pool.Job = undefined;
         for (chunks[0..num_chunks], 0..) |chunk, i| {
             contexts[i] = .{
@@ -12503,7 +12467,7 @@ fn linearNoBiasQ4KPreparedParallel(
                 .out_end = chunk.end,
                 .err = null,
             };
-            jobs[i] = .{ .fn_ptr = q4KPreparedWorkerJob, .ctx = @ptrCast(&contexts[i]) };
+            jobs[i] = .{ .fn_ptr = preparedWorkerJob(kind), .ctx = @ptrCast(&contexts[i]) };
         }
         try dispatchAndCheckQuantWorkers(io, jobs[0..num_chunks], contexts[0..num_chunks]);
         return true;
@@ -12519,14 +12483,14 @@ fn linearNoBiasQ4KPreparedParallel(
     if (plan.worker_count <= 1) return false;
     if (quantParallelDebugRequested()) {
         std.debug.print(
-            "q4k_parallel workers={d} rows={d} out={d} row_blocks={d}\n",
+            (if (kind == .Q4_K) "q4k" else "q6k") ++ "_parallel workers={d} rows={d} out={d} row_blocks={d}\n",
             .{ plan.worker_count, rows, out_dim, row_blocks },
         );
     }
 
     var chunks: [max_q4_k_parallel_workers]QuantRowChunk = undefined;
     const num_chunks = chunkRowsForWorkers(rows, plan, &chunks);
-    var contexts: [max_q4_k_parallel_workers]Q4KPreparedWorkerCtx = undefined;
+    var contexts: [max_q4_k_parallel_workers]KPreparedWorkerCtx = undefined;
     var jobs: [max_q4_k_parallel_workers]linalg.pool.Job = undefined;
     for (chunks[0..num_chunks], 0..) |chunk, i| {
         contexts[i] = .{
@@ -12540,10 +12504,22 @@ fn linearNoBiasQ4KPreparedParallel(
             .out_end = out_dim,
             .err = null,
         };
-        jobs[i] = .{ .fn_ptr = q4KPreparedWorkerJob, .ctx = @ptrCast(&contexts[i]) };
+        jobs[i] = .{ .fn_ptr = preparedWorkerJob(kind), .ctx = @ptrCast(&contexts[i]) };
     }
     try dispatchAndCheckQuantWorkers(io, jobs[0..num_chunks], contexts[0..num_chunks]);
     return true;
+}
+
+fn linearNoBiasQ4KPreparedParallel(
+    io: ?std.Io,
+    input: []const f32,
+    prepared_blocks: []const u8,
+    output: []f32,
+    rows: usize,
+    in_dim: usize,
+    out_dim: usize,
+) !bool {
+    return linearNoBiasKPreparedParallel(.Q4_K, io, input, prepared_blocks, output, rows, in_dim, out_dim);
 }
 
 fn linearNoBiasQ6KPreparedParallel(
@@ -12555,82 +12531,7 @@ fn linearNoBiasQ6KPreparedParallel(
     in_dim: usize,
     out_dim: usize,
 ) !bool {
-    const tensor_type: gguf_tensor_types.TensorType = .{ .known = .Q6_K };
-    const values_per_block = gguf_tensor_types.valuesPerBlock(tensor_type).?;
-    if (in_dim % values_per_block != 0) return error.InvalidQuantizedLinearShape;
-    const row_blocks = in_dim / values_per_block;
-    const col_plan = chooseQuantLinearColumnParallelPlan(
-        quantParallelEnabled(),
-        quantParallelDispatchAvailable(io),
-        rows,
-        out_dim,
-        row_blocks,
-        quantParallelMaxWorkers(),
-    );
-    if (col_plan.worker_count > 1) {
-        if (quantParallelDebugRequested()) {
-            std.debug.print(
-                "q6k_parallel_cols workers={d} rows={d} out={d} row_blocks={d}\n",
-                .{ col_plan.worker_count, rows, out_dim, row_blocks },
-            );
-        }
-        var chunks: [max_q4_k_parallel_workers]QuantColChunk = undefined;
-        const num_chunks = chunkColsForWorkers(out_dim, col_plan, &chunks);
-        var contexts: [max_q4_k_parallel_workers]Q6KPreparedWorkerCtx = undefined;
-        var jobs: [max_q4_k_parallel_workers]linalg.pool.Job = undefined;
-        for (chunks[0..num_chunks], 0..) |chunk, i| {
-            contexts[i] = .{
-                .input = input,
-                .prepared_blocks = prepared_blocks,
-                .output = output,
-                .rows = rows,
-                .in_dim = in_dim,
-                .out_dim = out_dim,
-                .out_start = chunk.start,
-                .out_end = chunk.end,
-                .err = null,
-            };
-            jobs[i] = .{ .fn_ptr = q6KPreparedWorkerJob, .ctx = @ptrCast(&contexts[i]) };
-        }
-        try dispatchAndCheckQuantWorkers(io, jobs[0..num_chunks], contexts[0..num_chunks]);
-        return true;
-    }
-
-    const plan = chooseQuantLinearParallelPlan(
-        quantParallelEnabled(),
-        rows,
-        out_dim,
-        row_blocks,
-        quantParallelMaxWorkers(),
-    );
-    if (plan.worker_count <= 1) return false;
-    if (quantParallelDebugRequested()) {
-        std.debug.print(
-            "q6k_parallel workers={d} rows={d} out={d} row_blocks={d}\n",
-            .{ plan.worker_count, rows, out_dim, row_blocks },
-        );
-    }
-
-    var chunks: [max_q4_k_parallel_workers]QuantRowChunk = undefined;
-    const num_chunks = chunkRowsForWorkers(rows, plan, &chunks);
-    var contexts: [max_q4_k_parallel_workers]Q6KPreparedWorkerCtx = undefined;
-    var jobs: [max_q4_k_parallel_workers]linalg.pool.Job = undefined;
-    for (chunks[0..num_chunks], 0..) |chunk, i| {
-        contexts[i] = .{
-            .input = input[chunk.start * in_dim .. chunk.end * in_dim],
-            .prepared_blocks = prepared_blocks,
-            .output = output[chunk.start * out_dim .. chunk.end * out_dim],
-            .rows = chunk.end - chunk.start,
-            .in_dim = in_dim,
-            .out_dim = out_dim,
-            .out_start = 0,
-            .out_end = out_dim,
-            .err = null,
-        };
-        jobs[i] = .{ .fn_ptr = q6KPreparedWorkerJob, .ctx = @ptrCast(&contexts[i]) };
-    }
-    try dispatchAndCheckQuantWorkers(io, jobs[0..num_chunks], contexts[0..num_chunks]);
-    return true;
+    return linearNoBiasKPreparedParallel(.Q6_K, io, input, prepared_blocks, output, rows, in_dim, out_dim);
 }
 
 fn linearQ4KPreparedTripleParallel(
@@ -12741,15 +12642,15 @@ fn linearQ4KPreparedTripleParallel(
     return true;
 }
 
-// Adapter that turns the existing `q4KPreparedWorker(ctx: *Ctx)` into a
+// Adapter that turns the format-specialized prepared worker into a
 // `pool.Job.fn_ptr` (`fn(*anyopaque) void`).  Defining one tiny adapter
-// per worker keeps `q4KPreparedWorker` pure-data and reusable.
-fn q4KPreparedWorkerJob(raw: *anyopaque) void {
-    q4KPreparedWorker(@ptrCast(@alignCast(raw)));
-}
-
-fn q6KPreparedWorkerJob(raw: *anyopaque) void {
-    q6KPreparedWorker(@ptrCast(@alignCast(raw)));
+// per worker keeps the leaf kernel pure-data and reusable.
+fn preparedWorkerJob(comptime kind: gguf_tensor_types.KnownTensorType) *const fn (*anyopaque) void {
+    return struct {
+        fn run(raw: *anyopaque) void {
+            kPreparedWorker(kind, @ptrCast(@alignCast(raw)));
+        }
+    }.run;
 }
 
 fn q4KPreparedTripleWorkerJob(raw: *anyopaque) void {
@@ -45568,51 +45469,57 @@ test "quantized storage budget bytes include packed q4_k qkv panel16 cache" {
 }
 
 test "prepared q4_k tiled range matches full tiled output" {
-    const allocator = std.testing.allocator;
-    const rows = 2;
-    const in_dim = 256;
-    const out_dim = 9;
-    const tensor_type: gguf_tensor_types.TensorType = .{ .known = .Q4_K };
-    const block_size = gguf_tensor_types.bytesPerBlock(tensor_type).?;
+    inline for (.{ gguf_tensor_types.KnownTensorType.Q4_K, gguf_tensor_types.KnownTensorType.Q6_K }) |kind| {
+        const allocator = std.testing.allocator;
+        const rows = 2;
+        const in_dim = 256;
+        const out_dim = 9;
+        const tensor_type: gguf_tensor_types.TensorType = .{ .known = kind };
+        const block_size = gguf_tensor_types.bytesPerBlock(tensor_type).?;
 
-    var input: [rows * in_dim]f32 = undefined;
-    for (&input, 0..) |*value, idx| {
-        const signed: i32 = @intCast(idx % 11);
-        value.* = @floatFromInt(signed - 5);
-    }
+        var input: [rows * in_dim]f32 = undefined;
+        for (&input, 0..) |*value, idx| {
+            const signed: i32 = @intCast(idx % 11);
+            value.* = @floatFromInt(signed - 5);
+        }
 
-    const weight_raw = try allocator.alloc(u8, out_dim * block_size);
-    defer allocator.free(weight_raw);
-    for (weight_raw, 0..) |*byte, idx| byte.* = @truncate((idx * 23 + 9) & 0xFF);
-    for (0..out_dim) |row| {
-        const base = row * block_size;
-        weight_raw[base] = 0x00;
-        weight_raw[base + 1] = 0x3C;
-        weight_raw[base + 2] = 0x00;
-        weight_raw[base + 3] = 0x3C;
-    }
+        const weight_raw = try allocator.alloc(u8, out_dim * block_size);
+        defer allocator.free(weight_raw);
+        for (weight_raw, 0..) |*byte, idx| byte.* = @truncate((idx * 23 + 9) & 0xFF);
+        for (0..out_dim) |row| {
+            const base = row * block_size;
+            if (kind == .Q4_K) {
+                weight_raw[base..][0..4].* = .{ 0x00, 0x3C, 0x00, 0x3C };
+            } else {
+                weight_raw[base + block_size - 2 ..][0..2].* = .{ 0x00, 0x3C };
+            }
+        }
 
-    var storage = QuantizedStorage{
-        .tensor_type = tensor_type,
-        .raw_bytes = weight_raw,
-        .shape = try allocator.dupe(i64, &.{ out_dim, in_dim }),
-        .raw_owned = false,
-        .allocator = allocator,
-    };
-    defer storage.deinit();
-    try prepareNativeQuantizedStorage(&storage);
-    const prepared = storage.preparedBytes(.row_major_blocks).?;
+        var storage = QuantizedStorage{
+            .tensor_type = tensor_type,
+            .raw_bytes = weight_raw,
+            .shape = try allocator.dupe(i64, &.{ out_dim, in_dim }),
+            .raw_owned = false,
+            .allocator = allocator,
+        };
+        defer storage.deinit();
+        try prepareNativeQuantizedStorage(&storage);
+        const prepared = storage.preparedBytes(.row_major_blocks).?;
 
-    var full_output: [rows * out_dim]f32 = @as([(rows * out_dim)]f32, @splat(0.0));
-    try linearNoBiasQ4KPreparedTiled(&input, prepared, &full_output, rows, in_dim, out_dim);
+        var full_output: [rows * out_dim]f32 = @as([(rows * out_dim)]f32, @splat(0.0));
+        const full = if (kind == .Q4_K) linearQ4KPreparedTiledRange else linearQ6KPreparedTiledRange;
+        try full(&input, prepared, &full_output, rows, in_dim, out_dim, 0, out_dim);
 
-    var ranged_output: [rows * out_dim]f32 = @as([(rows * out_dim)]f32, @splat(0.0));
-    try linearQ4KPreparedTiledRange(&input, prepared, &ranged_output, rows, in_dim, out_dim, 1, 5);
-    try linearQ4KPreparedTiledRange(&input, prepared, &ranged_output, rows, in_dim, out_dim, 0, 1);
-    try linearQ4KPreparedTiledRange(&input, prepared, &ranged_output, rows, in_dim, out_dim, 5, out_dim);
+        var ranged_output: [rows * out_dim]f32 = @as([(rows * out_dim)]f32, @splat(0.0));
+        for ([_][2]usize{ .{ 1, 5 }, .{ 0, 1 }, .{ 5, out_dim } }) |range| {
+            var ctx = KPreparedWorkerCtx{ .input = &input, .prepared_blocks = prepared, .output = &ranged_output, .rows = rows, .in_dim = in_dim, .out_dim = out_dim, .out_start = range[0], .out_end = range[1] };
+            preparedWorkerJob(kind)(@ptrCast(&ctx));
+            try std.testing.expect(ctx.err == null);
+        }
 
-    for (ranged_output, full_output) |actual, expected| {
-        try std.testing.expectApproxEqAbs(expected, actual, 1e-4);
+        for (ranged_output, full_output) |actual, expected| {
+            try std.testing.expectApproxEqAbs(expected, actual, 1e-4);
+        }
     }
 }
 

@@ -629,7 +629,8 @@ extern "C" __global__ void termite_round_f32(
     dst[idx] = nearbyintf(input[idx]);
 }
 
-extern "C" __global__ void termite_linear_bf16_weight_f32_tiled(
+template<bool Bf16>
+__device__ __forceinline__ void termite_linear_u16_weight_f32_tiled_impl(
     float* dst,
     const float* input,
     const unsigned short* weight,
@@ -646,7 +647,7 @@ extern "C" __global__ void termite_linear_bf16_weight_f32_tiled(
     __shared__ float partial[256];
     float acc = 0.0f;
     for (unsigned int i = tid; i < in_dim; i += blockDim.x) {
-        acc += input[row * in_dim + i] * termite_bf16_to_f32(weight[col * in_dim + i]);
+        acc += input[row * in_dim + i] * (Bf16 ? termite_bf16_to_f32(weight[col * in_dim + i]) : __half2float(__ushort_as_half(weight[col * in_dim + i])));
     }
     partial[tid] = acc;
     __syncthreads();
@@ -655,6 +656,17 @@ extern "C" __global__ void termite_linear_bf16_weight_f32_tiled(
         __syncthreads();
     }
     if (tid == 0u) dst[global] = partial[0];
+}
+
+extern "C" __global__ void termite_linear_bf16_weight_f32_tiled(
+    float* dst,
+    const float* input,
+    const unsigned short* weight,
+    unsigned int rows,
+    unsigned int in_dim,
+    unsigned int out_dim
+) {
+    termite_linear_u16_weight_f32_tiled_impl<true>(dst, input, weight, rows, in_dim, out_dim);
 }
 
 // Compatibility route for native FP16 encoder weights when cuBLASLt cannot
@@ -670,24 +682,7 @@ extern "C" __global__ void termite_linear_f16_weight_f32_tiled(
     unsigned int in_dim,
     unsigned int out_dim
 ) {
-    unsigned int global = blockIdx.x;
-    unsigned int total = rows * out_dim;
-    if (global >= total) return;
-    unsigned int row = global / out_dim;
-    unsigned int col = global - row * out_dim;
-    unsigned int tid = threadIdx.x;
-    __shared__ float partial[256];
-    float acc = 0.0f;
-    for (unsigned int i = tid; i < in_dim; i += blockDim.x) {
-        acc += input[row * in_dim + i] * __half2float(__ushort_as_half(weight[col * in_dim + i]));
-    }
-    partial[tid] = acc;
-    __syncthreads();
-    for (unsigned int stride = blockDim.x >> 1; stride > 0u; stride >>= 1u) {
-        if (tid < stride) partial[tid] += partial[tid + stride];
-        __syncthreads();
-    }
-    if (tid == 0u) dst[global] = partial[0];
+    termite_linear_u16_weight_f32_tiled_impl<false>(dst, input, weight, rows, in_dim, out_dim);
 }
 
 extern "C" __global__ void termite_argmax_last_row_f32(
@@ -2378,6 +2373,25 @@ extern "C" __global__ void termite_activation_multiply_fused_gate_up_f32(
     dst[i] = termite_decoder_activation_f32(fused_row[col], activation) * fused_row[f + col];
 }
 
+template<unsigned int Format, typename Weight, typename Index>
+__device__ __forceinline__ void termite_embedding_dense_impl(
+    float* dst, const Weight* weight, const Index* ids,
+    unsigned int total, unsigned int dim, float scale)
+{
+    unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    unsigned int count = total * dim;
+    if (idx >= count) return;
+    unsigned int row = idx / dim;
+    unsigned int col = idx - row * dim;
+    unsigned long long id = sizeof(Index) == 4 ? (unsigned long long)((unsigned int)ids[row]) : (unsigned long long)ids[row];
+    unsigned long long at = id * dim + col;
+    float value;
+    if (Format == 0u) value = weight[at];
+    else if (Format == 1u) value = termite_bf16_to_f32(weight[at]);
+    else value = __half2float(reinterpret_cast<const __half*>(weight)[at]);
+    dst[idx] = value * scale;
+}
+
 extern "C" __global__ void termite_embedding_lookup_f32(
     float* dst,
     const float* weight,
@@ -2386,13 +2400,7 @@ extern "C" __global__ void termite_embedding_lookup_f32(
     unsigned int dim,
     float scale
 ) {
-    unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    unsigned int count = total * dim;
-    if (idx >= count) return;
-    unsigned int row = idx / dim;
-    unsigned int col = idx - row * dim;
-    long long id = ids[row];
-    dst[idx] = weight[(unsigned long long)id * dim + col] * scale;
+    termite_embedding_dense_impl<0u>(dst, weight, ids, total, dim, scale);
 }
 
 extern "C" __global__ void termite_embedding_lookup_bf16_weight_f32(
@@ -2403,13 +2411,7 @@ extern "C" __global__ void termite_embedding_lookup_bf16_weight_f32(
     unsigned int dim,
     float scale
 ) {
-    unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    unsigned int count = total * dim;
-    if (idx >= count) return;
-    unsigned int row = idx / dim;
-    unsigned int col = idx - row * dim;
-    long long id = ids[row];
-    dst[idx] = termite_bf16_to_f32(weight[(unsigned long long)id * dim + col]) * scale;
+    termite_embedding_dense_impl<1u>(dst, weight, ids, total, dim, scale);
 }
 
 extern "C" __global__ void termite_embedding_lookup_f16_weight_f32(
@@ -2420,14 +2422,7 @@ extern "C" __global__ void termite_embedding_lookup_f16_weight_f32(
     unsigned int dim,
     float scale
 ) {
-    unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    unsigned int count = total * dim;
-    if (idx >= count) return;
-    unsigned int row = idx / dim;
-    unsigned int col = idx - row * dim;
-    long long id = ids[row];
-    __half value = reinterpret_cast<const __half*>(weight)[(unsigned long long)id * dim + col];
-    dst[idx] = __half2float(value) * scale;
+    termite_embedding_dense_impl<2u>(dst, weight, ids, total, dim, scale);
 }
 
 extern "C" __global__ void termite_embedding_lookup_i32_f32(
@@ -2438,13 +2433,7 @@ extern "C" __global__ void termite_embedding_lookup_i32_f32(
     unsigned int dim,
     float scale
 ) {
-    unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    unsigned int count = total * dim;
-    if (idx >= count) return;
-    unsigned int row = idx / dim;
-    unsigned int col = idx - row * dim;
-    int id = ids[row];
-    dst[idx] = weight[(unsigned long long)((unsigned int)id) * dim + col] * scale;
+    termite_embedding_dense_impl<0u>(dst, weight, ids, total, dim, scale);
 }
 
 extern "C" __global__ void termite_embedding_lookup_i32_bf16_weight_f32(
@@ -2455,13 +2444,7 @@ extern "C" __global__ void termite_embedding_lookup_i32_bf16_weight_f32(
     unsigned int dim,
     float scale
 ) {
-    unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    unsigned int count = total * dim;
-    if (idx >= count) return;
-    unsigned int row = idx / dim;
-    unsigned int col = idx - row * dim;
-    int id = ids[row];
-    dst[idx] = termite_bf16_to_f32(weight[(unsigned long long)((unsigned int)id) * dim + col]) * scale;
+    termite_embedding_dense_impl<1u>(dst, weight, ids, total, dim, scale);
 }
 
 extern "C" __global__ void termite_embedding_lookup_i32_f16_weight_f32(
@@ -2472,14 +2455,7 @@ extern "C" __global__ void termite_embedding_lookup_i32_f16_weight_f32(
     unsigned int dim,
     float scale
 ) {
-    unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    unsigned int count = total * dim;
-    if (idx >= count) return;
-    unsigned int row = idx / dim;
-    unsigned int col = idx - row * dim;
-    int id = ids[row];
-    __half value = reinterpret_cast<const __half*>(weight)[(unsigned long long)((unsigned int)id) * dim + col];
-    dst[idx] = __half2float(value) * scale;
+    termite_embedding_dense_impl<2u>(dst, weight, ids, total, dim, scale);
 }
 
 extern "C" __global__ void termite_take_rows_f32(
@@ -12671,41 +12647,8 @@ __device__ __forceinline__ float termite_q4_0_q8_1_partial_mmvq2(
     return q4_d * q8_d * (float)sumi;
 }
 
-extern "C" __global__ void termite_quantize_f32_q8_1_rows(
-    unsigned char* dst,
-    const float* input,
-    unsigned int rows,
-    unsigned int in_dim
-) {
-    unsigned int tid = threadIdx.x;
-    unsigned int lane = tid & 31u;
-    unsigned int warp = tid >> 5;
-    unsigned int warps_per_block = blockDim.x >> 5;
-    unsigned int row_blocks = in_dim / 32u;
-    unsigned int q8_block = blockIdx.x * warps_per_block + warp;
-    unsigned int total_blocks = rows * row_blocks;
-    if (q8_block >= total_blocks) return;
-
-    unsigned int row = q8_block / row_blocks;
-    unsigned int block = q8_block - row * row_blocks;
-    float x = input[row * in_dim + block * 32u + lane];
-    float amax = termite_warp_reduce_max_f32(fabsf(x));
-    float d = amax > 0.0f ? amax / 127.0f : 0.0f;
-    int q = 0;
-    if (d > 0.0f) {
-        q = __float2int_rn(x / d);
-        q = max(-127, min(127, q));
-    }
-    unsigned char* bp = dst + q8_block * 36u;
-    bp[4u + lane] = (unsigned char)(signed char)q;
-    if (lane == 0u) {
-        termite_store_half_bytes(bp, d);
-        bp[2u] = 0u;
-        bp[3u] = 0u;
-    }
-}
-
-extern "C" __global__ void termite_quantize_gated_f32_q8_1_rows(
+template<bool Gated>
+__device__ __forceinline__ void termite_quantize_q8_1_rows_impl(
     unsigned char* dst,
     const float* gate,
     const float* up,
@@ -12725,7 +12668,7 @@ extern "C" __global__ void termite_quantize_gated_f32_q8_1_rows(
     unsigned int row = q8_block / row_blocks;
     unsigned int block = q8_block - row * row_blocks;
     unsigned int index = row * in_dim + block * 32u + lane;
-    float x = termite_decoder_activation_f32(gate[index], activation) * up[index];
+    float x = Gated ? termite_decoder_activation_f32(gate[index], activation) * up[index] : gate[index];
     float amax = termite_warp_reduce_max_f32(fabsf(x));
     float d = amax > 0.0f ? amax / 127.0f : 0.0f;
     int q = 0;
@@ -12740,6 +12683,26 @@ extern "C" __global__ void termite_quantize_gated_f32_q8_1_rows(
         bp[2u] = 0u;
         bp[3u] = 0u;
     }
+}
+
+extern "C" __global__ void termite_quantize_f32_q8_1_rows(
+    unsigned char* dst,
+    const float* input,
+    unsigned int rows,
+    unsigned int in_dim
+) {
+    termite_quantize_q8_1_rows_impl<false>(dst, input, nullptr, rows, in_dim, 0u);
+}
+
+extern "C" __global__ void termite_quantize_gated_f32_q8_1_rows(
+    unsigned char* dst,
+    const float* gate,
+    const float* up,
+    unsigned int rows,
+    unsigned int in_dim,
+    unsigned int activation
+) {
+    termite_quantize_q8_1_rows_impl<true>(dst, gate, up, rows, in_dim, activation);
 }
 
 template <unsigned int COLS>
@@ -19890,6 +19853,31 @@ extern "C" __global__ void termite_linear_q4_k_q4_k_f32_qkv_nobias_tiled(
     if (tid == 0u) dst[local] = partial[0];
 }
 
+template<unsigned int Format, typename Index>
+__device__ __forceinline__ void termite_embedding_quant_impl(
+    float* dst, const unsigned char* weight, const Index* ids,
+    unsigned int total, unsigned int dim, float scale)
+{
+    unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    unsigned int count = total * dim;
+    if (idx >= count) return;
+    unsigned int out_row = idx / dim;
+    unsigned int col = idx - out_row * dim;
+    unsigned long long src_row = sizeof(Index) == 4 ? (unsigned long long)((unsigned int)ids[out_row]) : (unsigned long long)ids[out_row];
+    const unsigned int values = Format < 2u ? 256u : 32u;
+    const unsigned long long bytes = Format == 0u ? 144ull : Format == 1u ? 210ull : Format == 2u ? 34ull : 18ull;
+    unsigned int row_blocks = dim / values;
+    unsigned int block = col / values;
+    unsigned int lane = col - block * values;
+    const unsigned char* bp = weight + (src_row * row_blocks + block) * bytes;
+    float value;
+    if (Format == 0u) value = termite_q4k_value(bp, lane);
+    else if (Format == 1u) value = termite_q6k_value(bp, lane);
+    else if (Format == 2u) value = termite_q8_0_value(bp, lane);
+    else value = termite_q4_0_value_nibble(bp, 2u + (lane & 15u), lane >> 4u);
+    dst[idx] = value * scale;
+}
+
 extern "C" __global__ void termite_embedding_lookup_q4_k_f32(
     float* dst,
     const unsigned char* weight,
@@ -19898,17 +19886,7 @@ extern "C" __global__ void termite_embedding_lookup_q4_k_f32(
     unsigned int dim,
     float scale
 ) {
-    unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    unsigned int count = total * dim;
-    if (idx >= count) return;
-    unsigned int out_row = idx / dim;
-    unsigned int col = idx - out_row * dim;
-    unsigned long long src_row = (unsigned long long)ids[out_row];
-    unsigned int row_blocks = dim / 256u;
-    unsigned int block = col / 256u;
-    unsigned int value_index = col - block * 256u;
-    const unsigned char* bp = weight + (src_row * row_blocks + block) * 144ull;
-    dst[idx] = termite_q4k_value(bp, value_index) * scale;
+    termite_embedding_quant_impl<0u>(dst, weight, ids, total, dim, scale);
 }
 
 extern "C" __global__ void termite_embedding_lookup_q6_k_f32(
@@ -19919,17 +19897,7 @@ extern "C" __global__ void termite_embedding_lookup_q6_k_f32(
     unsigned int dim,
     float scale
 ) {
-    unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    unsigned int count = total * dim;
-    if (idx >= count) return;
-    unsigned int out_row = idx / dim;
-    unsigned int col = idx - out_row * dim;
-    unsigned long long src_row = (unsigned long long)ids[out_row];
-    unsigned int row_blocks = dim / 256u;
-    unsigned int block = col / 256u;
-    unsigned int value_index = col - block * 256u;
-    const unsigned char* bp = weight + (src_row * row_blocks + block) * 210ull;
-    dst[idx] = termite_q6k_value(bp, value_index) * scale;
+    termite_embedding_quant_impl<1u>(dst, weight, ids, total, dim, scale);
 }
 
 extern "C" __global__ void termite_embedding_lookup_q8_0_f32(
@@ -19940,17 +19908,7 @@ extern "C" __global__ void termite_embedding_lookup_q8_0_f32(
     unsigned int dim,
     float scale
 ) {
-    unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    unsigned int count = total * dim;
-    if (idx >= count) return;
-    unsigned int out_row = idx / dim;
-    unsigned int col = idx - out_row * dim;
-    unsigned long long src_row = (unsigned long long)ids[out_row];
-    unsigned int row_blocks = dim / 32u;
-    unsigned int block = col / 32u;
-    unsigned int lane = col - block * 32u;
-    const unsigned char* bp = weight + (src_row * row_blocks + block) * 34ull;
-    dst[idx] = termite_q8_0_value(bp, lane) * scale;
+    termite_embedding_quant_impl<2u>(dst, weight, ids, total, dim, scale);
 }
 
 extern "C" __global__ void termite_embedding_lookup_q4_0_f32(
@@ -19961,19 +19919,7 @@ extern "C" __global__ void termite_embedding_lookup_q4_0_f32(
     unsigned int dim,
     float scale
 ) {
-    unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    unsigned int count = total * dim;
-    if (idx >= count) return;
-    unsigned int out_row = idx / dim;
-    unsigned int col = idx - out_row * dim;
-    unsigned long long src_row = (unsigned long long)ids[out_row];
-    unsigned int row_blocks = dim / 32u;
-    unsigned int block = col / 32u;
-    unsigned int lane = col - block * 32u;
-    unsigned int q_offset = 2u + (lane & 15u);
-    unsigned int high_nibble = lane >> 4u;
-    const unsigned char* bp = weight + (src_row * row_blocks + block) * 18ull;
-    dst[idx] = termite_q4_0_value_nibble(bp, q_offset, high_nibble) * scale;
+    termite_embedding_quant_impl<3u>(dst, weight, ids, total, dim, scale);
 }
 
 extern "C" __global__ void termite_embedding_lookup_i32_q4_k_f32(
@@ -19984,17 +19930,7 @@ extern "C" __global__ void termite_embedding_lookup_i32_q4_k_f32(
     unsigned int dim,
     float scale
 ) {
-    unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    unsigned int count = total * dim;
-    if (idx >= count) return;
-    unsigned int out_row = idx / dim;
-    unsigned int col = idx - out_row * dim;
-    unsigned long long src_row = (unsigned long long)((unsigned int)ids[out_row]);
-    unsigned int row_blocks = dim / 256u;
-    unsigned int block = col / 256u;
-    unsigned int value_index = col - block * 256u;
-    const unsigned char* bp = weight + (src_row * row_blocks + block) * 144ull;
-    dst[idx] = termite_q4k_value(bp, value_index) * scale;
+    termite_embedding_quant_impl<0u>(dst, weight, ids, total, dim, scale);
 }
 
 extern "C" __global__ void termite_embedding_lookup_i32_q6_k_f32(
@@ -20005,17 +19941,7 @@ extern "C" __global__ void termite_embedding_lookup_i32_q6_k_f32(
     unsigned int dim,
     float scale
 ) {
-    unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    unsigned int count = total * dim;
-    if (idx >= count) return;
-    unsigned int out_row = idx / dim;
-    unsigned int col = idx - out_row * dim;
-    unsigned long long src_row = (unsigned long long)((unsigned int)ids[out_row]);
-    unsigned int row_blocks = dim / 256u;
-    unsigned int block = col / 256u;
-    unsigned int value_index = col - block * 256u;
-    const unsigned char* bp = weight + (src_row * row_blocks + block) * 210ull;
-    dst[idx] = termite_q6k_value(bp, value_index) * scale;
+    termite_embedding_quant_impl<1u>(dst, weight, ids, total, dim, scale);
 }
 
 extern "C" __global__ void termite_embedding_add_weighted_i32_q6_k_f32(
@@ -20097,17 +20023,7 @@ extern "C" __global__ void termite_embedding_lookup_i32_q8_0_f32(
     unsigned int dim,
     float scale
 ) {
-    unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    unsigned int count = total * dim;
-    if (idx >= count) return;
-    unsigned int out_row = idx / dim;
-    unsigned int col = idx - out_row * dim;
-    unsigned long long src_row = (unsigned long long)((unsigned int)ids[out_row]);
-    unsigned int row_blocks = dim / 32u;
-    unsigned int block = col / 32u;
-    unsigned int lane = col - block * 32u;
-    const unsigned char* bp = weight + (src_row * row_blocks + block) * 34ull;
-    dst[idx] = termite_q8_0_value(bp, lane) * scale;
+    termite_embedding_quant_impl<2u>(dst, weight, ids, total, dim, scale);
 }
 
 extern "C" __global__ void termite_embedding_lookup_i32_q4_0_f32(
@@ -20118,19 +20034,7 @@ extern "C" __global__ void termite_embedding_lookup_i32_q4_0_f32(
     unsigned int dim,
     float scale
 ) {
-    unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    unsigned int count = total * dim;
-    if (idx >= count) return;
-    unsigned int out_row = idx / dim;
-    unsigned int col = idx - out_row * dim;
-    unsigned long long src_row = (unsigned long long)((unsigned int)ids[out_row]);
-    unsigned int row_blocks = dim / 32u;
-    unsigned int block = col / 32u;
-    unsigned int lane = col - block * 32u;
-    unsigned int q_offset = 2u + (lane & 15u);
-    unsigned int high_nibble = lane >> 4u;
-    const unsigned char* bp = weight + (src_row * row_blocks + block) * 18ull;
-    dst[idx] = termite_q4_0_value_nibble(bp, q_offset, high_nibble) * scale;
+    termite_embedding_quant_impl<3u>(dst, weight, ids, total, dim, scale);
 }
 
 __device__ __forceinline__ bool termite_deberta_attention_key_valid(

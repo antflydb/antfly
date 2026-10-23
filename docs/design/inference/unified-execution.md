@@ -699,7 +699,8 @@ Metal/CUDA runtime regions) and whitespace checks pass.
 
 ## Planned bulk consolidation campaign
 
-Status: planned; no production implementation in this section has landed.
+Status: implementation in progress. The foundation/broad-family cohort below is
+qualified; the quantized-compute and attention cohorts remain under validation.
 Baseline: `dd1ee1b4ffd1a4a3a14878c648355b18a4096b8f`. Treat the following as one
 implementation campaign with four work waves and one integrated acceptance
 checkpoint, rather than another sequence of single-family requests. Keep the
@@ -762,6 +763,68 @@ to make its syntax resemble another one.
 | 22 | CPU grouped projection adapters | Unify matching pair/triple dequantize-SGEMM and projection-result construction through comptime arity. Preserve prepared-cache identity, bias, partial failure cleanup and grouped input reuse. |
 | 23 | CPU prepared quantized tile scaffolds | Share matching prepared tile/range loops and boundary handling across formats; retain format-specific SIMD decode, panel layout, accumulator width and summation order. Reuse existing generic panel kernels rather than reintroducing them. |
 | 24 | Retire superseded bodies and qualify the composition | Delete replaced implementations and unused helpers, check every entry point has one intended owner, regenerate once per completed work wave, and run full integrated numerical/model/lifetime gates. Report authored, generated, binary and infrastructure changes independently. |
+
+### Foundation and broad-family checkpoint (2026-10-23)
+
+Packages 01–02, 11–12, 17–21 and the dequantize-SGEMM part of 22 now have a
+qualified implementation. The mathematical descriptor remains separate from
+native schedule policy; the helpers encode actual storage, arity, reduction and
+addressing choices at compile time. No unused descriptor fields or new kernel
+language were introduced.
+
+- CPU shares Q4_K/Q6_K prepared-worker contexts/job construction and grouped
+  dequantize-SGEMM acquisition, cleanup and dispatch for one/two/three outputs.
+- Metal shares SIMD4 RMS/clamp, five argmax/sampling partial-tree entry points,
+  and packed read/copy loops for nine formats: 25 entry points in total.
+- CUDA shares F16/BF16 dense load variants, plain/gated Q8_1 quantization and
+  dense/quantized embeddings with I32/I64 indices: 18 entry points.
+- Reusable fixture-driven Metal/CUDA direct runners, a balanced model runner,
+  seven-architecture CUDA instruction/resource reports and a source-owner
+  ledger replace cohort-specific qualification executables. Six failure-gate
+  tests cover the model runner.
+
+Against frozen production baseline `dd1ee1b4ff`, this cohort removes **196 net
+authored production lines / 14,524 bytes**, including its extra inline native
+coverage. Qualification scripts/tests/documentation add **550 lines** separately;
+generated production lines do not contribute to the authored saving. CUDA PTX
+text changes without instruction/resource changes; the fatbin grows 16 bytes,
+and the SM89 cubin is byte-identical. Source deletion is not a binary-size claim.
+
+All 439 CUDA functions have identical instructions and resources on each of
+SM75/80/89/90/100/110/120. All 48 direct captured CUDA cases pass exact outputs,
+guards and the 5% timing gate on Glowworm GB10 (worst ratio 1.027802). All 63
+Metal direct cases pass exact outputs, guards, pipeline limits, static scratch
+and timing (worst ratio 1.038841 in the longer whole-cohort series). Native
+prepared/SGEMM reference tests, Metal packed-row/RMS/sampling tests, product
+checks and generated-source freshness pass.
+
+All six CPU model cases have finite, byte-identical complete outputs and pass
+5% median / 10% p95 ceilings in the final balanced whole-cohort series:
+
+| CPU model | p50 ratio | p95 ratio |
+| --- | ---: | ---: |
+| MiniLM F32, b1/s16 | 0.998997 | 1.001543 |
+| MiniLM F32, b1/s128 | 1.003679 | 1.029130 |
+| MiniLM F32, b2/s16 | 1.000850 | 1.000861 |
+| MiniLM GGUF, b1/s16 | 0.997080 | 1.021316 |
+| Reranker F16 | 0.979493 | 0.965380 |
+| Reranker Q4_K | 1.003329 | 1.004721 |
+
+The first CPU series exceeded Q4_K p95; a longer series resolved that case but
+exceeded F16 median. Both failures remain recorded. The final whole-cohort
+protocol uses 32 balanced arms, 25 warmups, 201 measurements for ordinary cases
+and 1,001 for Q4_K, alternating executables more frequently while preserving the
+frozen binaries. Earlier Metal timing failures likewise remain alongside its
+longer complete-cohort result. These are cohort gates; the full final
+CPU/Metal/CUDA model and lifetime checkpoint is still required.
+
+Ignored raw receipts, fixtures, source/image hashes and frozen executables are
+under `.benchmark-assets/1166/bulk/`: `metal-wave1/long-receipt.json`,
+`receipts/wave1-static/cuda-static.json`, `receipts/wave1/cuda-direct.json`, and
+`receipts/wave1/cpu-models-interleaved/receipt.json`. Local model executable SHA256
+is `a0f8cb070791c8b4e9d37292553ea12dac01f1a29cf63239010f67b2c21891b7`;
+baseline SHA256 is
+`8c1cff7bf5f0a17dedd90f2f98a50594034237775a9e166f094e1342d30140fa`.
 
 ### Execution order
 

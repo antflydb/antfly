@@ -96,3 +96,32 @@ After changing production CUDA source, rebuild its artifacts with the pinned
 CUDA toolkit contract in `regen-cuda-artifacts.sh`, then run the affected device,
 capture and model performance gates on the same host for baseline and candidate.
 Host conformance and portable product compilation do not replace those gates.
+
+## Kernel family consolidation qualification
+
+`qualify_kernel_families.py` retains baseline/candidate receipts for a complete
+campaign. `models` takes a JSON config with `arm_order` and
+`cases: [{"name": "case", "args": ["--model-dir", "...", "--backend", "native",
+"--warmup-iters", "25", "--measure-iters", "201"]}]`, plus optional
+`environment` and Linux `cpu_affinity`. Supply `--config`, `--baseline`,
+`--candidate` and `--results`. It records every arm, requires finite,
+byte-identical output, and applies the 5% median / 10% p95 model budgets.
+
+`source-ledger --revision REV --results DIR` counts all changed authored source,
+including new templates/renderers and inline tests, separately from generated
+regions. `cuda-static --baseline IMAGE --candidate IMAGE --cuobjdump TOOL
+--results DIR` reports all instruction/resource differences on the seven packaged
+architectures; differences require review and device qualification, not automatic
+promotion. Run `test_qualify_kernel_families.py` for the runner's failure gates.
+
+`kernel_family_metal.mm` consumes a JSON manifest describing full baseline/current
+shader files, buffer fixture files, constant-byte bindings, output extents, grid,
+threads, dynamic scratch, math mode and balanced timing protocol. Build it with
+`clang++ -std=c++17 -O2 -fobjc-arc -framework Foundation -framework Metal`.
+`kernel_family_cuda.cu` uses the corresponding CUDA manifest packed by
+`qualify_kernel_families.py pack-cuda --config MANIFEST --results DIR`; build with
+pinned `nvcc -O3 -arch=native -lcuda`. The Metal executable takes
+`MANIFEST RECEIPT`; CUDA takes `BASELINE_IMAGE CANDIDATE_IMAGE CASES_BIN RECEIPT`.
+Both compare every declared output and guard byte, then time fixed addresses
+with balanced arms; CUDA uses captured graphs. Keep independent operator
+references and model/lifetime gates alongside these direct baseline comparisons.
