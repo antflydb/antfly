@@ -61,6 +61,8 @@ const Worker = struct {
     join_waiters: std.atomic.Value(u32) = .init(0),
     finalization: struct {
         started: bool = false,
+        aborting: bool = false,
+        sequence: u64 = 0,
         cursor: ?replay_source_mod.MatchingCursor = null,
         had_session: bool = false,
         token: CatchUpSessionToken = .{},
@@ -79,6 +81,7 @@ const Worker = struct {
     catch_up_close_requested: bool = false,
     catch_up_close_active: bool = false,
     catch_up_close_failed: bool = false,
+    abort_pending: bool = false,
     replay_cursor: ?replay_source_mod.MatchingCursor = null,
     replay_cursor_open_sequence: u64 = 0,
     catch_up_active: bool = false,
@@ -535,7 +538,7 @@ pub const DerivedRuntime = if (builtin.os.tag == .freestanding) struct {
         const final = &worker.finalization;
         if (final.done) return;
         const io = self.ioContext();
-        const finish_sequence = if (worker.pending_publication) |pending| pending.sequence else worker.applied_sequence;
+        const finish_sequence = if (final.started) final.sequence else if (worker.abort_pending) worker.applied_sequence else if (worker.pending_publication) |pending| pending.sequence else worker.applied_sequence;
         if (!final.started) {
             try self.lockFinalizationMetadata(original);
             if (worker.catch_up_close_failed) {
@@ -544,6 +547,9 @@ pub const DerivedRuntime = if (builtin.os.tag == .freestanding) struct {
             }
             // Transfer into runtime-owned retry state before any subsequent
             // checkpoint can reject. Never leave a cursor/token on the stack.
+            final.aborting = worker.abort_pending;
+            final.sequence = finish_sequence;
+            worker.abort_pending = false;
             final.cursor = worker.replay_cursor;
             final.had_session = worker.catch_up_open;
             final.token = worker.catch_up_token;
@@ -572,10 +578,10 @@ pub const DerivedRuntime = if (builtin.os.tag == .freestanding) struct {
                 if (self.finish_catch_up_fn) |finish| {
                     var attempt: runtime_types.FinishAttempt = .{};
                     const call = if (original != null and self.finish_with_admission != null)
-                        self.finish_with_admission.?(self.ctx, worker.kind, final.token, finish_sequence, original, &attempt)
+                        self.finish_with_admission.?(self.ctx, worker.kind, final.token, finish_sequence, !final.aborting, original, &attempt)
                     else legacy: {
                         attempt.consumed = true;
-                        break :legacy finish(self.ctx, worker.kind, final.token, finish_sequence, true);
+                        break :legacy finish(self.ctx, worker.kind, final.token, finish_sequence, !final.aborting);
                     };
                     const result = call catch |cause| failed: {
                         if (attempt.completed) |receipt| {
@@ -1247,7 +1253,7 @@ fn workerMain(worker: *Worker) void {
     var close_success = true;
     defer if (!close_success or workerIsStopping(runtime, worker, io)) {
         _ = closeWorkerCatchUpState(runtime, worker, worker.applied_sequence, close_success) catch |err| {
-            runtime.recordError(io, worker, "close_session", err);
+            if (!retryDeferredClose(worker, err)) runtime.recordError(io, worker, "close_session", err);
         };
     };
 
@@ -1261,6 +1267,16 @@ fn workerMain(worker: *Worker) void {
             // its retry deadline instead of letting hot writers defeat backoff.
             worker.next_delay_ms = @max(1, (retry_remaining +| (std.time.ns_per_ms - 1)) / std.time.ns_per_ms);
             runtime.mutex.unlock(io);
+            return;
+        }
+        if (worker.abort_pending) {
+            runtime.mutex.unlock(io);
+            _ = closeWorkerCatchUpState(runtime, worker, worker.applied_sequence, false) catch |cause| {
+                if (retryDeferredClose(worker, cause)) return;
+                close_success = false;
+                runtime.recordError(io, worker, "pending_abort", cause);
+                return;
+            };
             return;
         }
         if (!runtime.closing.load(.acquire) and !runtime.shutdown and !worker.stop and !worker.paused and runtime.last_error_name == null and worker.last_error_name == null and worker.target_sequence <= worker.applied_sequence) {
@@ -1359,6 +1375,7 @@ fn workerMain(worker: *Worker) void {
                 if (workerIsStopping(runtime, worker, io)) return;
                 if (isRecoverableCatchUpError(worker, err)) {
                     _ = closeWorkerCatchUpState(runtime, worker, worker.applied_sequence, false) catch |close_err| {
+                        if (retryDeferredClose(worker, close_err)) return;
                         close_success = false;
                         runtime.recordError(io, worker, "recoverable_begin_catch_up_close", close_err);
                         return;
@@ -1378,6 +1395,7 @@ fn workerMain(worker: *Worker) void {
                 if (workerIsStopping(runtime, worker, io)) return;
                 if (isRecoverableCatchUpError(worker, err)) {
                     _ = closeWorkerCatchUpState(runtime, worker, worker.applied_sequence, false) catch |close_err| {
+                        if (retryDeferredClose(worker, close_err)) return;
                         close_success = false;
                         runtime.recordError(io, worker, "recoverable_catch_up_close", close_err);
                         return;
@@ -1419,6 +1437,7 @@ fn workerMain(worker: *Worker) void {
                         if (workerIsStopping(runtime, worker, io)) return;
                         if (isRecoverableCatchUpError(worker, err)) {
                             _ = closeWorkerCatchUpState(runtime, worker, worker.applied_sequence, false) catch |close_err| {
+                                if (retryDeferredClose(worker, close_err)) return;
                                 close_success = false;
                                 runtime.recordError(io, worker, "recoverable_refresh_replay_cursor_close", close_err);
                                 return;
@@ -1438,6 +1457,7 @@ fn workerMain(worker: *Worker) void {
                         if (workerIsStopping(runtime, worker, io)) return;
                         if (isRecoverableCatchUpError(worker, err)) {
                             _ = closeWorkerCatchUpState(runtime, worker, worker.applied_sequence, false) catch |close_err| {
+                                if (retryDeferredClose(worker, close_err)) return;
                                 close_success = false;
                                 runtime.recordError(io, worker, "recoverable_refreshed_catch_up_close", close_err);
                                 return;
@@ -1475,6 +1495,7 @@ fn workerMain(worker: *Worker) void {
                 from_sequence;
             if (collected_sequence == from_sequence and stats.shouldTryTargetAdvance(from_sequence, target_sequence)) {
                 _ = closeWorkerCatchUpState(runtime, worker, worker.applied_sequence, false) catch |err| {
+                    if (retryDeferredClose(worker, err)) return;
                     close_success = false;
                     runtime.recordError(io, worker, "coverage_gap_close", err);
                     return;
@@ -1709,12 +1730,14 @@ fn closeWorkerCatchUpState(
     var replay_cursor = worker.replay_cursor;
     const catch_up_open = worker.catch_up_open;
     const token = worker.catch_up_token;
-    const finish_sequence = if (success and worker.pending_publication != null) worker.pending_publication.?.sequence else applied_sequence;
-    if (!success and worker.pending_publication != null and worker.pending_publication.?.finished == null) worker.pending_publication = null;
+    const finish_success = success and !worker.abort_pending;
+    if (catch_up_open and !finish_success) worker.abort_pending = true;
+    const finish_sequence = if (finish_success and worker.pending_publication != null) worker.pending_publication.?.sequence else applied_sequence;
+    if (!finish_success and worker.pending_publication != null and worker.pending_publication.?.finished == null) worker.pending_publication = null;
     // Only the ordinary raw maintenance dispatch has no foreground execution
     // to lend. Structural pause/removal and physical teardown retain their
     // existing callback until their caller authority is explicitly supplied.
-    const owning_finish = success and worker.dispatch_active and runtime.finish_with_admission != null;
+    const owning_finish = worker.dispatch_active and runtime.finish_with_admission != null;
     worker.replay_cursor = null;
     worker.replay_cursor_open_sequence = 0;
     worker.catch_up_open = false;
@@ -1736,7 +1759,7 @@ fn closeWorkerCatchUpState(
     var finish_result: CatchUpFinishResult = .{};
     const outcome = if (owning_finish) owned: {
         var attempt: runtime_types.FinishAttempt = .{};
-        const call = runtime.finish_with_admission.?(runtime.ctx, worker.kind, token, finish_sequence, null, &attempt);
+        const call = runtime.finish_with_admission.?(runtime.ctx, worker.kind, token, finish_sequence, finish_success, null, &attempt);
         if (call) |result| {
             if (!attempt.consumed or (attempt.completed != null and !std.meta.eql(attempt.completed.?, result)))
                 break :owned @as(anyerror!CatchUpFinishResult, RuntimeError.AsyncWorkerFailed);
@@ -1750,7 +1773,7 @@ fn closeWorkerCatchUpState(
             }
             if (!attempt.consumed) {
                 runtime.mutex.lockUncancelable(io);
-                worker.pending_publication = .{ .sequence = finish_sequence };
+                if (finish_success) worker.pending_publication = .{ .sequence = finish_sequence };
                 worker.catch_up_open = true;
                 worker.catch_up_token = token;
                 worker.catch_up_close_requested = true;
@@ -1762,13 +1785,14 @@ fn closeWorkerCatchUpState(
             break :owned @as(anyerror!CatchUpFinishResult, cause);
         }
     } else if (runtime.finish_catch_up_fn) |finish|
-        finish(runtime.ctx, worker.kind, token, finish_sequence, success)
+        finish(runtime.ctx, worker.kind, token, finish_sequence, finish_success)
     else
         @as(anyerror!CatchUpFinishResult, .{});
     finish_result = outcome catch |cause| {
         runtime.mutex.lockUncancelable(io);
         worker.catch_up_close_active = false;
         worker.catch_up_close_failed = true;
+        worker.abort_pending = false;
         worker.pending_publication = null;
         runtime.cond.broadcast(io);
         runtime.mutex.unlock(io);
@@ -1778,13 +1802,14 @@ fn closeWorkerCatchUpState(
         runtime.mutex.lockUncancelable(io);
         worker.catch_up_close_active = false;
         worker.catch_up_close_failed = false;
+        worker.abort_pending = false;
         if (worker.pending_publication) |*pending| pending.finished = finish_result;
         runtime.cond.broadcast(io);
         runtime.mutex.unlock(io);
     }
     if (worker.kind.kind == .dense_vector and @import("../../dense_perf_experiments.zig").enabled("ANTFLY_EXPERIMENT_CAPTURE_STAGES"))
         std.log.info("dense replay capture finish token={} sequence={} success={} applied_sequence_persisted={}", .{
-            token.value, applied_sequence, success, finish_result.applied_sequence_persisted,
+            token.value, finish_sequence, finish_success, finish_result.applied_sequence_persisted,
         });
     return finish_result;
 }
@@ -1806,6 +1831,12 @@ fn settlePendingPublication(runtime: *DerivedRuntime, worker: *Worker) !void {
     runtime.cond.broadcast(io);
     runtime.mutex.unlock(io);
     if (advanced) if (runtime.applied_sequence_advanced_fn) |callback| callback(runtime.ctx, worker.name, pending.sequence);
+}
+
+fn retryDeferredClose(worker: *Worker, cause: anyerror) bool {
+    if (!worker.catch_up_open or worker.catch_up_close_failed or !catch_up_policy.isRecoverableAdmissionError(cause)) return false;
+    scheduleRecoverableCatchUpRetry(worker, cause);
+    return true;
 }
 
 fn isRecoverablePublishError(worker: *const Worker, err: anyerror) bool {
@@ -3693,7 +3724,7 @@ const FinalizationProbe = struct {
         if (self.fail_finish) return error.OutOfMemory;
         return .{ .applied_sequence_persisted = self.durable_finish };
     }
-    fn controlledFinish(raw: *anyopaque, _: index_manager_mod.ManagedIndexRef, token: CatchUpSessionToken, _: u64, original: ?@import("../../../common/read_admission.zig").Port, attempt: *runtime_types.FinishAttempt) !CatchUpFinishResult {
+    fn controlledFinish(raw: *anyopaque, _: index_manager_mod.ManagedIndexRef, token: CatchUpSessionToken, _: u64, _: bool, original: ?@import("../../../common/read_admission.zig").Port, attempt: *runtime_types.FinishAttempt) !CatchUpFinishResult {
         const self: *@This() = @ptrCast(@alignCast(raw));
         std.debug.assert(token.value == 7);
         self.controlled_calls += 1;
@@ -4098,7 +4129,7 @@ test "controlled dense finalization ordinary dispatch retains rejected capture a
             self.legacy_calls += 1;
             return .{};
         }
-        fn finish(raw: *anyopaque, _: index_manager_mod.ManagedIndexRef, token: CatchUpSessionToken, sequence: u64, original: ?@import("../../../common/read_admission.zig").Port, attempt: *runtime_types.FinishAttempt) !CatchUpFinishResult {
+        fn finish(raw: *anyopaque, _: index_manager_mod.ManagedIndexRef, token: CatchUpSessionToken, sequence: u64, _: bool, original: ?@import("../../../common/read_admission.zig").Port, attempt: *runtime_types.FinishAttempt) !CatchUpFinishResult {
             const self: *@This() = @ptrCast(@alignCast(raw));
             try std.testing.expect(original == null);
             try std.testing.expectEqual(@as(u64, 7), token.value);
@@ -4155,7 +4186,7 @@ test "controlled dense finalization ordinary dispatch retains rejected capture a
 test "controlled dense finalization ordinary publication retries finish and persistence without replaying the applied window" {
     const alloc = std.testing.allocator;
     const Hooks = struct {
-        fn finish(raw: *anyopaque, ref: index_manager_mod.ManagedIndexRef, token: CatchUpSessionToken, sequence: u64, original: ?@import("../../../common/read_admission.zig").Port, attempt: *runtime_types.FinishAttempt) !CatchUpFinishResult {
+        fn finish(raw: *anyopaque, ref: index_manager_mod.ManagedIndexRef, token: CatchUpSessionToken, sequence: u64, _: bool, original: ?@import("../../../common/read_admission.zig").Port, attempt: *runtime_types.FinishAttempt) !CatchUpFinishResult {
             const capture: *TestThreadedRuntimeCapture = @ptrCast(@alignCast(raw));
             try std.testing.expect(original == null);
             if (capture.fail_next_publish.swap(false, .monotonic)) return error.SchedulerFull;
@@ -4212,5 +4243,117 @@ test "controlled dense finalization shutdown retains the prepared target and com
         try std.testing.expect(worker.pending_publication == null);
         try std.testing.expectEqual(@as(usize, if (finished) 0 else 1), probe.finishes);
         try std.testing.expectEqual(@as(usize, 0), probe.persists);
+    }
+}
+
+test "controlled dense finalization ordinary abort admission retries before any further replay" {
+    const alloc = std.testing.allocator;
+    const Hooks = struct {
+        fn finish(raw: *anyopaque, ref: index_manager_mod.ManagedIndexRef, token: CatchUpSessionToken, sequence: u64, success: bool, original: ?@import("../../../common/read_admission.zig").Port, attempt: *runtime_types.FinishAttempt) !CatchUpFinishResult {
+            const capture: *TestThreadedRuntimeCapture = @ptrCast(@alignCast(raw));
+            try std.testing.expect(original == null);
+            if (!success) {
+                // A new apply or a replacement capture before abort finishes
+                // would violate the exact ownership of the rejected cleanup.
+                try std.testing.expectEqual(@as(u64, 1), token.value);
+                try std.testing.expectEqual(@as(u64, 1), capture.apply_calls.load(.monotonic));
+                try std.testing.expectEqual(@as(u64, 1), capture.begin_calls.load(.monotonic));
+                if (capture.publish_failures.fetchAdd(1, .monotonic) == 0) {
+                    return if (capture.fail_next_publish.swap(false, .monotonic)) error.SchedulerFull else error.ResourceTemporarilyUnavailable;
+                }
+            } else try std.testing.expectEqual(@as(u64, 2), token.value);
+            attempt.consumed = true;
+            const result = try testThreadedRuntimeFinishCatchUp(raw, ref, token, sequence, success);
+            attempt.completed = result;
+            return result;
+        }
+    };
+    for ([_]bool{ false, true }) |scheduler_full| {
+        for ([_]bool{ false, true }) |deferred_capture| {
+            var tmp = std.testing.tmpDir(.{});
+            defer tmp.cleanup();
+            const path = try std.fmt.allocPrintSentinel(alloc, ".zig-cache/tmp/{s}/retained-abort", .{tmp.sub_path}, 0);
+            defer alloc.free(path);
+            var journal = try change_journal_mod.Journal.open(path, testThreadedRuntimeJournalOpenOptions());
+            defer journal.close();
+            try appendTestThreadedRuntimeRecord(&journal, alloc, .{ .sequence = 1, .changed_doc_keys = &.{"doc:a"}, .target_hints = &.{.dense_vector} });
+            var capture: TestThreadedRuntimeCapture = .{ .fail_next_apply_resource_budget = .init(true), .fail_next_publish = .init(scheduler_full) };
+            var manager = resource_manager_mod.ResourceManager.init(.{});
+            defer manager.deinit(alloc);
+            manager.dense_deferred_source_capture = deferred_capture;
+            var runtime = try DerivedRuntime.init(alloc, replay_source_mod.Source.fromJournal(&journal), &capture, testThreadedRuntimeApply, testThreadedRuntimePersist, testThreadedRuntimeTruncate, testThreadedRuntimeBeginCatchUp, testThreadedRuntimeFinishCatchUp, null, null, &manager);
+            defer runtime.deinit();
+            runtime.finish_with_admission = Hooks.finish;
+            try runtime.addWorker("idx", .{ .name = "idx", .kind = .dense_vector }, 0);
+            runtime.notifySequence(1);
+            try runtime.waitForAll(1);
+            try runtime.failIfUnhealthy();
+            try std.testing.expectEqual(@as(u64, 2), capture.apply_calls.load(.monotonic));
+            try std.testing.expectEqual(@as(u64, 2), capture.begin_calls.load(.monotonic));
+            try std.testing.expectEqual(@as(u64, 2), capture.publish_failures.load(.monotonic));
+            try std.testing.expectEqual(@as(u64, 2), capture.finish_calls.load(.monotonic));
+            try std.testing.expectEqual(@as(u64, 1), capture.persisted_sequence.load(.monotonic));
+        }
+    }
+}
+
+test "controlled dense finalization shutdown retains abort intent and its consumed receipt across caller rejection" {
+    const admission = @import("../../../common/read_admission.zig");
+    const Probe = struct {
+        after_receipt: bool,
+        calls: usize = 0,
+        persists: usize = 0,
+        legacy_calls: usize = 0,
+        fn check(_: *anyopaque) !void {}
+        fn deadline(_: *anyopaque) !?u64 {
+            return 1000;
+        }
+        fn apply(_: *anyopaque, _: derived_types.DerivedBatch, _: index_manager_mod.ManagedIndexRef, _: CatchUpSessionToken) !bool {
+            return true;
+        }
+        fn persist(raw: *anyopaque, _: []const u8, _: u64, _: bool) !bool {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.persists += 1;
+            return true;
+        }
+        fn truncate(_: *anyopaque, _: u64) !void {}
+        fn legacy(raw: *anyopaque, _: index_manager_mod.ManagedIndexRef, _: CatchUpSessionToken, _: u64, _: bool) !CatchUpFinishResult {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.legacy_calls += 1;
+            return error.TestUnexpectedResult;
+        }
+        fn finish(raw: *anyopaque, _: index_manager_mod.ManagedIndexRef, token: CatchUpSessionToken, sequence: u64, success: bool, original: ?admission.Port, attempt: *runtime_types.FinishAttempt) !CatchUpFinishResult {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expect(!success and original != null);
+            try std.testing.expectEqual(@as(u64, 7), token.value);
+            // The unpublished replay target must never be passed to abort.
+            try std.testing.expectEqual(@as(u64, 0), sequence);
+            self.calls += 1;
+            if (self.calls == 1) return error.ResourceTemporarilyUnavailable;
+            attempt.* = .{ .consumed = true, .completed = .{} };
+            if (self.after_receipt) return error.NotFound;
+            return .{};
+        }
+    };
+    for ([_]bool{ false, true }) |after_receipt| {
+        var probe: Probe = .{ .after_receipt = after_receipt };
+        var runtime = try DerivedRuntime.init(std.testing.allocator, undefined, &probe, Probe.apply, Probe.persist, Probe.truncate, null, Probe.legacy, null, null, null);
+        defer runtime.deinit();
+        runtime.finish_with_admission = Probe.finish;
+        const worker = try std.testing.allocator.create(Worker);
+        const name = try std.testing.allocator.dupe(u8, "abort-finalizer");
+        worker.* = .{ .runtime = &runtime, .name = name, .kind = .{ .name = name, .kind = .dense_vector }, .applied_sequence = 0, .persisted_sequence = 0, .target_sequence = 1, .abort_pending = true, .catch_up_open = true, .catch_up_token = .{ .value = 7 }, .pending_publication = .{ .sequence = 1 } };
+        try runtime.workers.append(std.testing.allocator, worker);
+        var payload: admission.Payload = .{ .ptr = &probe, .vtable = &.{ .checkpoint = Probe.check, .check_lifetime = Probe.check, .deadline_ns = Probe.deadline }, .execution_wait = .{ .ptr = &probe, .begin = Probe.check, .end = Probe.check } };
+        try std.testing.expectError(error.ResourceTemporarilyUnavailable, runtime.finalizeWithAdmission(.init(&payload)));
+        try std.testing.expect(worker.finalization.aborting and worker.finalization.token.value == 7);
+        if (after_receipt) try std.testing.expectError(error.NotFound, runtime.finalizeWithAdmission(.init(&payload))) else try runtime.finalizeWithAdmission(.init(&payload));
+        try runtime.finalizeWithAdmission(.init(&payload));
+        try std.testing.expectEqual(@as(usize, 2), probe.calls);
+        try std.testing.expectEqual(@as(usize, 0), probe.persists);
+        try std.testing.expectEqual(@as(usize, 0), probe.legacy_calls);
+        try std.testing.expectEqual(@as(u64, 0), worker.applied_sequence);
+        try std.testing.expectEqual(@as(u64, 0), worker.persisted_sequence);
+        try std.testing.expect(worker.pending_publication == null and worker.finalization.done);
     }
 }

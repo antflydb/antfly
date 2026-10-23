@@ -47,7 +47,7 @@ pub const FinishAttempt = struct {
 };
 /// A null original is reserved for an ordinary dispatch owning no foreground
 /// grant. It must use capture-funded execution and the same consumption receipt.
-pub const FinishWithAdmissionFn = *const fn (ctx: *anyopaque, index_ref: index_manager_mod.ManagedIndexRef, token: CatchUpSessionToken, applied_sequence: u64, original: ?@import("../../../common/read_admission.zig").Port, attempt: *FinishAttempt) anyerror!CatchUpFinishResult;
+pub const FinishWithAdmissionFn = *const fn (ctx: *anyopaque, index_ref: index_manager_mod.ManagedIndexRef, token: CatchUpSessionToken, applied_sequence: u64, success: bool, original: ?@import("../../../common/read_admission.zig").Port, attempt: *FinishAttempt) anyerror!CatchUpFinishResult;
 pub const CanAdvanceToTargetFn = *const fn (ctx: *anyopaque, index_ref: index_manager_mod.ManagedIndexRef, from_sequence: u64, target_sequence: u64) anyerror!bool;
 pub const AppliedSequenceAdvancedFn = *const fn (ctx: *anyopaque, index_name: []const u8, applied_sequence: u64) void;
 

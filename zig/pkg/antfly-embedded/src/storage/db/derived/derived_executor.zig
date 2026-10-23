@@ -909,7 +909,7 @@ fn ioThreadedFinalize(ptr: *anyopaque, original: @import("../../../common/read_a
 
 test "controlled dense finalization config requires a physical close callback" {
     const F = struct {
-        fn finish(_: *anyopaque, _: index_manager_mod.ManagedIndexRef, _: CatchUpSessionToken, _: u64, _: ?@import("../../../common/read_admission.zig").Port, _: *runtime_types.FinishAttempt) !CatchUpFinishResult {
+        fn finish(_: *anyopaque, _: index_manager_mod.ManagedIndexRef, _: CatchUpSessionToken, _: u64, _: bool, _: ?@import("../../../common/read_admission.zig").Port, _: *runtime_types.FinishAttempt) !CatchUpFinishResult {
             return .{};
         }
     };

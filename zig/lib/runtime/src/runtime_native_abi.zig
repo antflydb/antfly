@@ -98,7 +98,7 @@ const builtin = @import("builtin");
 // Coverage outcome transitions join final-writer metadata programs.
 // Owned replay binding recipes and whole-operation refresh expand native state.
 // Owned assemblies retain checked memory state; native retries observe commits.
-pub const abi_version: u32 = 91;
+pub const abi_version: u32 = 92;
 
 pub const zig_compiler_id: u64 = stableId(builtin.zig_version_string);
 

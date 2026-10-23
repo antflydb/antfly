@@ -23844,3 +23844,51 @@ reservations and server runtime budgets are unchanged. The compiler-policy tests
 also retain main's four-GiB CLI default alongside the measured GNU ReleaseSafe
 specialization. Intermediate failures and final source hashes remain in the
 qualification receipts. Full GNU/Linux qualification remains waived.
+
+### Retain execution and abort intent through dense cleanup
+
+The consumption-reporting callback now carries the finish/abort decision.
+Ordinary Io-derived aborts enter their capture's already funded cleanup root;
+controlled shutdown can delegate abort to that same root and rejoin its original
+caller afterward. The exact token, snapshot and root remain owned when
+preparation rejects. A deferred abort is explicit worker state and drains before
+another replay window can collect or apply. Shutdown freezes both the abort
+intent and its original applied sequence; a retry cannot publish an unfinished
+window or invoke an already consumed abort again.
+
+Abort preparation acquires apply/catalog admission and only tries the sequence
+mutex while those guards are held. Contention drops the guards before CPU
+lending. Once all guards are available, it consumes the exact capture and
+invalidates its pending sequence before native abort can change index state.
+This preserves the sequence-before-apply flusher's ordering without blocking in
+the reverse order. Errors before consumption retain the pending sequence and
+capture. Completion receipts survive rejected original reentry. An already
+retired token is acknowledged only at the registry boundary, so a caller's
+lifetime error is preserved and a delayed abort cannot touch a newer capture.
+
+Native ABI 92 and storage-owner ABI 150 fence the callback and frozen teardown
+state. Physical callback I/O and cooperative CPU bounds remain unqualified.
+Manual execution, structural caller CPU handoff and uncontrolled physical
+deinitialization still require explicit execution propagation, alongside other
+backend teardown, metadata charging and broader cross-engine/fault/default-policy
+gates. Strong required providers remain disabled. The full goal remains open;
+full GNU/Linux qualification remains waived, and Linux uses pinned Nix/glibc Zig.
+
+Pinned Darwin Debug validation passes all 76 build steps and 150 reported tests
+in `dense-abort-retained-execution-v2`: 72 derived visibility/finalization,
+56 maintenance shutdown, 20 execution-service and two linked close tests.
+The simple runners pass 25 DB/session and 21 local-close cases; error ABI (45),
+released status ABI (1) and failure identity (8) pass. The real DB matrix now
+runs finish and abort under the sole cleanup CPU, and exercises abort sequence
+contention, rejection after lending CPU, exact retry and delayed-token isolation
+from a replacement capture. A journal-backed worker fixture rejects abort
+admission for eager and deferred captures and proves no new apply/capture occurs
+before the original abort finishes. Shutdown tests preserve abort mode and the
+old applied sequence across preparation and post-consumption caller rejection,
+with no duplicate abort or persistence of the unfinished replay target.
+
+The first run rejected a shutdown fixture missing its required wait capability;
+the corrected fixture and guard-ordering checks are included in the final
+receipt. Source hashes and intermediate/final logs remain in the qualification
+receipts. Full GNU/Linux qualification remains waived; the full design remains
+unfinished.

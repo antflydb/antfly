@@ -59742,6 +59742,7 @@ fn finishDerivedCatchUpSessionAsyncWithAdmission(
     index_ref: index_manager_mod.ManagedIndexRef,
     token: derived_executor_mod.CatchUpSessionToken,
     applied_sequence: u64,
+    success: bool,
     original: ?@import("../../common/read_admission.zig").Port,
     attempt: *@import("derived/runtime_types.zig").FinishAttempt,
 ) !derived_executor_mod.CatchUpFinishResult {
@@ -59749,28 +59750,45 @@ fn finishDerivedCatchUpSessionAsyncWithAdmission(
     if (index_ref.kind == .dense_vector and ctx.capture_cleanup_owner != null) {
         if (original) |control| {
             if (try control.executionDelegation()) |delegation| {
-                if (try finishDenseWithReservedExecution(ctx, index_ref, token, applied_sequence, control, attempt, delegation)) |result| return result;
+                if (try finishDenseWithReservedExecution(ctx, index_ref, token, applied_sequence, success, control, attempt, delegation)) |result| return result;
             }
         } else {
             // An ordinary dispatch owns no foreground capsule. Claim without
             // waiting before activating the capture's already funded cleanup.
-            var claim = (try ctx.dense_admission.sessions.tryClaimFinish(index_ref.name, token)) orelse return error.ResourceTemporarilyUnavailable;
+            const maybe_claim = ctx.dense_admission.sessions.tryClaimFinish(index_ref.name, token) catch |cause| {
+                if (!success and cause == error.DenseCatchUpSessionSuperseded) {
+                    attempt.* = .{ .consumed = true, .completed = .{} };
+                    return .{};
+                }
+                return cause;
+            };
+            var claim = maybe_claim orelse return error.ResourceTemporarilyUnavailable;
             defer claim.deinit();
             if (try claim.reservation()) |reserved|
-                return finishDenseOnReservedExecution(ctx, index_ref, applied_sequence, null, attempt, &claim, reserved);
+                return finishDenseOnReservedExecution(ctx, index_ref, applied_sequence, success, null, attempt, &claim, reserved);
         }
     }
-    return finishDerivedCatchUpSessionAsyncImpl(ctx_ptr, index_ref, token, applied_sequence, true, original, attempt, null);
+    return finishDerivedCatchUpSessionAsyncImpl(ctx_ptr, index_ref, token, applied_sequence, success, original, attempt, null);
 }
 
-fn finishDenseWithReservedExecution(ctx: *AsyncContext, index_ref: index_manager_mod.ManagedIndexRef, token: derived_executor_mod.CatchUpSessionToken, applied_sequence: u64, original: @import("../../common/read_admission.zig").Port, attempt: *@import("derived/runtime_types.zig").FinishAttempt, delegation: @import("../../common/read_admission.zig").Delegation) !?derived_executor_mod.CatchUpFinishResult {
-    const preparation = @import("dense_finalization_admission.zig");
-    var claim = try preparation.claimWithAdmission(ctx.index_manager, &ctx.dense_admission.sessions, index_ref, token, original);
+fn finishDenseWithReservedExecution(ctx: *AsyncContext, index_ref: index_manager_mod.ManagedIndexRef, token: derived_executor_mod.CatchUpSessionToken, applied_sequence: u64, success: bool, original: @import("../../common/read_admission.zig").Port, attempt: *@import("derived/runtime_types.zig").FinishAttempt, delegation: @import("../../common/read_admission.zig").Delegation) !?derived_executor_mod.CatchUpFinishResult {
+    var claim = while (true) {
+        try original.checkpoint();
+        const maybe_claim = ctx.dense_admission.sessions.tryClaimFinish(index_ref.name, token) catch |cause| {
+            if (!success and cause == error.DenseCatchUpSessionSuperseded) {
+                attempt.* = .{ .consumed = true, .completed = .{} };
+                return .{};
+            }
+            return cause;
+        };
+        if (maybe_claim) |value| break value;
+        try @import("../../common/cleanup_wait.zig").waitForRetry(ctx.index_manager.checkpointIo(), original);
+    };
     defer claim.deinit();
     const reserved = (try claim.reservation()) orelse return null;
     if (reserved.owner.enter_cleanup_root == null or (try original.deadlineNs()) == null) return error.ExecutionWaitUnsupported;
     try delegation.beginDelegation();
-    const outcome = finishDenseOnReservedExecution(ctx, index_ref, applied_sequence, original, attempt, &claim, reserved);
+    const outcome = finishDenseOnReservedExecution(ctx, index_ref, applied_sequence, success, original, attempt, &claim, reserved);
     const resumed = delegation.endDelegation();
     if (outcome) |result| {
         try resumed;
@@ -59783,7 +59801,7 @@ fn finishDenseWithReservedExecution(ctx: *AsyncContext, index_ref: index_manager
     }
 }
 
-fn finishDenseOnReservedExecution(ctx: *AsyncContext, index_ref: index_manager_mod.ManagedIndexRef, applied_sequence: u64, original: ?@import("../../common/read_admission.zig").Port, attempt: *@import("derived/runtime_types.zig").FinishAttempt, claim: *@import("dense_catch_up_session_owner.zig").FinishClaim, reserved: *@import("antfly_runtime_abi").runnable_abi.ReservedCleanup) !derived_executor_mod.CatchUpFinishResult {
+fn finishDenseOnReservedExecution(ctx: *AsyncContext, index_ref: index_manager_mod.ManagedIndexRef, applied_sequence: u64, success: bool, original: ?@import("../../common/read_admission.zig").Port, attempt: *@import("derived/runtime_types.zig").FinishAttempt, claim: *@import("dense_catch_up_session_owner.zig").FinishClaim, reserved: *@import("antfly_runtime_abi").runnable_abi.ReservedCleanup) !derived_executor_mod.CatchUpFinishResult {
     const Restriction = struct {
         fn check(raw: *anyopaque) callconv(.c) @import("antfly_runtime_abi").error_abi.Status {
             const control: *const ?@import("../../common/read_admission.zig").Port = @ptrCast(@alignCast(raw));
@@ -59797,14 +59815,49 @@ fn finishDenseOnReservedExecution(ctx: *AsyncContext, index_ref: index_manager_m
         _ = grant.borrow.park(grant.borrow.context, @backingInt(@import("antfly_runtime_abi").runnable_abi.Wait.resource));
     };
     var control: @import("dense_finalization_execution.zig").Control = .{ .grant = grant, .original = original };
-    var prepared = try @import("dense_finalization_admission.zig").prepareClaim(ctx.index_manager, claim, index_ref, control.port());
+    var prepared = if (success)
+        try @import("dense_finalization_admission.zig").prepareClaim(ctx.index_manager, claim, index_ref, control.port())
+    else
+        try prepareDenseAbortClaim(ctx, claim, index_ref, control.port());
     // tryTake freed registry metadata. Move the reservation out of Session so
     // the delegated execution outlives every physical finish/retirement defer.
     var owned_execution = prepared.session.cleanup.?;
     prepared.session.cleanup = null;
     registry_owns_execution = false;
     defer owned_execution.deinit();
-    return finishDerivedCatchUpSessionAsyncImpl(ctx, index_ref, claim.token, applied_sequence, true, null, attempt, prepared);
+    return finishDerivedCatchUpSessionAsyncImpl(ctx, index_ref, claim.token, applied_sequence, success, null, attempt, prepared);
+}
+
+// Invalidate the pending sequence before abort can change native index state.
+// A flusher holds sequence before apply. We never block in the reverse order:
+// failed sequence acquisition releases apply/catalog before lending execution.
+fn prepareDenseAbortClaim(ctx: *AsyncContext, claim: *@import("dense_catch_up_session_owner.zig").FinishClaim, index_ref: index_manager_mod.ManagedIndexRef, control: @import("../../common/read_admission.zig").Port) !@import("dense_finalization_admission.zig").Prepared {
+    while (true) {
+        var guard = try ctx.index_manager.lockManagedIndexApplyWithAdmission(index_ref, control);
+        if (!ctx.applied_sequence_mutex.tryLock()) {
+            guard.unlock();
+            try @import("../../common/cleanup_wait.zig").waitForRetry(ctx.index_manager.checkpointIo(), control);
+            continue;
+        }
+        control.checkLifetime() catch |cause| {
+            ctx.applied_sequence_mutex.unlock();
+            guard.unlock();
+            return cause;
+        };
+        const maybe_session = claim.tryTake() catch |cause| {
+            ctx.applied_sequence_mutex.unlock();
+            guard.unlock();
+            return cause;
+        };
+        if (maybe_session) |session| {
+            ctx.applied_sequence_coalescer.removePending(ctx.alloc, index_ref.name);
+            ctx.applied_sequence_mutex.unlock();
+            return .{ .session = session, .apply_guard = guard };
+        }
+        ctx.applied_sequence_mutex.unlock();
+        guard.unlock();
+        try @import("../../common/cleanup_wait.zig").waitForRetry(ctx.index_manager.checkpointIo(), control);
+    }
 }
 
 fn finishDerivedCatchUpSessionAsyncImpl(
@@ -59831,23 +59884,50 @@ fn finishDerivedCatchUpSessionAsyncImpl(
         // A delayed close cannot act on a newer session. Its exact token has
         // already been retired, so even coalescer cleanup must happen only
         // after this callback proves ownership of the exact session.
-        var session = takeAsyncDenseCatchUpSession(ctx, index_ref.name, token) catch |cause| switch (cause) {
-            error.DenseCatchUpSessionSuperseded => return .{},
+        var admitted_guard: ?index_manager_mod.IndexManager.ManagedIndexApplyGuard = null;
+        var session = if (delegated) |prepared| blk: {
+            admitted_guard = prepared.apply_guard;
+            break :blk prepared.session;
+        } else if (original) |control| blk: {
+            var claim = try @import("dense_finalization_admission.zig").claimWithAdmission(ctx.index_manager, &ctx.dense_admission.sessions, index_ref, token, control);
+            defer claim.deinit();
+            const prepared = try prepareDenseAbortClaim(ctx, &claim, index_ref, control);
+            admitted_guard = prepared.apply_guard;
+            break :blk prepared.session;
+        } else takeAsyncDenseCatchUpSession(ctx, index_ref.name, token) catch |cause| switch (cause) {
+            error.DenseCatchUpSessionSuperseded => {
+                if (attempt) |state| state.* = .{ .consumed = true, .completed = .{} };
+                return .{};
+            },
             else => return cause,
         };
+        if (attempt) |state| state.consumed = true;
+        var completed = true;
+        // Publish only after physical users/guards retire. Errors after take
+        // remain terminal and must never be mistaken for deferred preparation.
+        defer if (completed) {
+            if (attempt) |state| state.completed = .{};
+        };
+        errdefer completed = false;
+        defer if (admitted_guard) |*guard| guard.unlock();
         defer if (session.cleanup) |*cleanup| cleanup.deinit();
         defer ctx.alloc.free(session.index_name);
         defer if (session.snapshot_replay) |*lease| lease.release();
         defer if (session.lease) |lease| if (lease.ownsLifecycle())
             ctx.index_manager.cancelDensePostingSidecarCaptureLeaseByName(index_ref.name, lease) catch {};
         _ = ctx.stats.dense_catch_up.abort_calls.fetchAdd(1, .monotonic);
-        var seq_lock = lockAtomicWithBackoffProfiled(&ctx.applied_sequence_mutex, &ctx.stats.applied_sequence_mutex);
-        ctx.applied_sequence_coalescer.removePending(ctx.alloc, index_ref.name);
-        seq_lock.unlock();
         var catch_up_tracked = true;
         defer if (catch_up_tracked) finishDenseCatchUpSessionTracked(ctx, index_ref.name);
+        if (admitted_guard == null) {
+            // Compatibility callers take no admitted apply guard. Preserve
+            // their original sequence-before-apply ordering as well.
+            var seq_lock = lockAtomicWithBackoffProfiled(&ctx.applied_sequence_mutex, &ctx.stats.applied_sequence_mutex);
+            ctx.applied_sequence_coalescer.removePending(ctx.alloc, index_ref.name);
+            seq_lock.unlock();
+        }
         {
-            var index_apply_guard = try ctx.index_manager.lockManagedIndexApply(index_ref);
+            var index_apply_guard = if (admitted_guard) |guard| guard else try ctx.index_manager.lockManagedIndexApply(index_ref);
+            admitted_guard = null;
             defer index_apply_guard.unlock();
             ctx.index_manager.validateDenseIndexIncarnationByName(index_ref.name, session.index_incarnation) catch |err| switch (err) {
                 error.PostingWalCaptureSuperseded, error.IndexNotFound => return .{},
@@ -150105,7 +150185,7 @@ test "controlled dense finalization DB callback retains real capture through rej
             .begin_failure => error.NotFound,
             .end_failure => error.Canceled,
             .lifetime_in_wait => error.DeadlineExceeded,
-        }, finishDerivedCatchUpSessionAsyncWithAdmission(ctx, ref, token, sequence, @import("../../common/read_admission.zig").Port.init(&payload), &attempt));
+        }, finishDerivedCatchUpSessionAsyncWithAdmission(ctx, ref, token, sequence, true, @import("../../common/read_admission.zig").Port.init(&payload), &attempt));
         try std.testing.expect(!attempt.consumed);
         try std.testing.expect(attempt.completed == null);
         try std.testing.expectEqual(funded_bytes, owner.owner.scheduler.stats().retained_bytes);
@@ -150117,7 +150197,7 @@ test "controlled dense finalization DB callback retains real capture through rej
         control.case = .begin_failure;
         // The retry needs no waits: all guards are free and the original
         // exact capture is still owned. No newly minted session is accepted.
-        const finish_result = try finishDerivedCatchUpSessionAsyncWithAdmission(ctx, ref, token, sequence, @import("../../common/read_admission.zig").Port.init(&payload), &attempt);
+        const finish_result = try finishDerivedCatchUpSessionAsyncWithAdmission(ctx, ref, token, sequence, true, @import("../../common/read_admission.zig").Port.init(&payload), &attempt);
         try std.testing.expect(attempt.consumed);
         try std.testing.expectEqualDeep(finish_result, attempt.completed.?);
         try std.testing.expectEqual(@as(usize, 0), owner.owner.scheduler.stats().operations);
@@ -150140,160 +150220,201 @@ test "controlled dense finalization DB callback delegates the sole cleanup CPU a
             return now_ns;
         }
     };
-    const Case = enum { success, begin_rejection, preparation_rejection, reentry_rejection, apply_contention, wait_rejection, owning_success, owning_claim_rejection };
-    for (std.enums.values(Case)) |case| {
-        Clock.now_ns = 0;
-        defer Clock.now_ns = 0;
-        var directory = try TestDirectory.init("db");
-        defer directory.cleanup();
-        var db = try DB.open(std.testing.allocator, directory.path(), .{ .start_index_workers = false, .start_optional_runtimes = false, .start_independent_maintenance = false });
-        defer db.close();
-        try db.addIndex(.{ .name = "dv_v1", .kind = .dense_vector, .config_json = "{\"field\":\"embedding\",\"dims\":3}" });
-        try db.batch(.{ .writes = &.{.{ .key = "doc:a", .value = "{\"embedding\":[1,0,0]}" }}, .sync_level = .write });
-        try db.runUntilIdle();
-        var owner: OwnerState = .{ .owner_alloc = std.testing.allocator, .owner = try @FieldType(OwnerState, "owner").init(.{ .slots = 3, .control_slots = 1, .cleanup_slots = 1, .max_operations = 8 }), .native_now_ns = Clock.now };
-        defer owner.owner.deinit();
-        const ctx = db.async_context;
-        ctx.capture_cleanup_owner = owner.port();
-        defer {
-            ctx.dense_admission.sessions.deinit(ctx.alloc, ctx.index_manager);
-            ctx.capture_cleanup_owner = null;
-        }
-        const ref: index_manager_mod.ManagedIndexRef = .{ .name = "dv_v1", .kind = .dense_vector };
-        const token = try beginDerivedCatchUpSessionAsync(ctx, ref);
-        const sequence = ctx.store.lastReplaySequence(0);
-        const port = owner.port();
-        const io = ctx.io.?;
-        const io_borrow = runtime.native_abi.IoBorrow.init(&io);
-        var caller: ?*anyopaque = null;
-        const deadline = 200 * std.time.ns_per_ms;
-        // This caller occupies the sole cleanup CPU. The reserved capsule can
-        // run only after delegation releases it, without a second operation.
-        const status = port.start(port.context, &.{ .io = &io_borrow, .class = @backingInt(runtime.runnable_abi.Class.control), .cleanup = 1, .allow_wait = 0, .has_deadline = 1, .native_deadline = 1, .deadline_ns = deadline, .out_handle = &caller });
-        if (!status.isOk()) return runtime.error_abi.errorFromStatus(status);
-        defer port.finish(caller.?);
-        const charged = owner.owner.scheduler.stats().retained_bytes;
-        const Control = struct {
-            execution: runtime.runnable_abi.Borrowed,
-            owner: *OwnerState,
-            ctx: *AsyncContext,
-            case: Case,
-            parked: bool = false,
-            reject_preparation: bool = true,
-            begins: usize = 0,
-            ends: usize = 0,
-            held_apply: ?*std.atomic.Mutex = null,
-            reject_parked_lifetime: bool = false,
-            delegated_started: bool = false,
-            fn checked(value: runtime.error_abi.Status) !void {
-                if (!value.isOk()) return runtime.error_abi.errorFromStatus(value);
+    const Case = enum { success, begin_rejection, preparation_rejection, reentry_rejection, apply_contention, wait_rejection, owning_success, owning_claim_rejection, abort_sequence_contention, abort_sequence_rejection };
+    for ([_]bool{ true, false }) |success| {
+        for (std.enums.values(Case)) |case| {
+            if (success and (case == .abort_sequence_contention or case == .abort_sequence_rejection)) continue;
+            Clock.now_ns = 0;
+            defer Clock.now_ns = 0;
+            var directory = try TestDirectory.init("db");
+            defer directory.cleanup();
+            var db = try DB.open(std.testing.allocator, directory.path(), .{ .start_index_workers = false, .start_optional_runtimes = false, .start_independent_maintenance = false });
+            defer db.close();
+            try db.addIndex(.{ .name = "dv_v1", .kind = .dense_vector, .config_json = "{\"field\":\"embedding\",\"dims\":3}" });
+            try db.batch(.{ .writes = &.{.{ .key = "doc:a", .value = "{\"embedding\":[1,0,0]}" }}, .sync_level = .write });
+            try db.runUntilIdle();
+            var owner: OwnerState = .{ .owner_alloc = std.testing.allocator, .owner = try @FieldType(OwnerState, "owner").init(.{ .slots = 3, .control_slots = 1, .cleanup_slots = 1, .max_operations = 8 }), .native_now_ns = Clock.now };
+            defer owner.owner.deinit();
+            const ctx = db.async_context;
+            ctx.capture_cleanup_owner = owner.port();
+            defer {
+                ctx.dense_admission.sessions.deinit(ctx.alloc, ctx.index_manager);
+                ctx.capture_cleanup_owner = null;
             }
-            fn lifetime(raw: *anyopaque) !void {
-                const self: *@This() = @ptrCast(@alignCast(raw));
-                try self.execution.checkLifetime();
-                if (self.parked and self.owner.owner.scheduler.stats().runnable_slots != 0) self.delegated_started = true;
-                if (self.parked and self.delegated_started and self.owner.owner.scheduler.stats().runnable_slots == 0) {
-                    if (self.held_apply) |mutex| {
-                        try std.testing.expect(self.ctx.index_manager.catalog_mutex.tryLockExclusive());
-                        self.ctx.index_manager.catalog_mutex.unlockExclusive();
-                        mutex.unlock();
-                        self.held_apply = null;
-                        if (self.case == .wait_rejection) self.reject_parked_lifetime = true;
+            const ref: index_manager_mod.ManagedIndexRef = .{ .name = "dv_v1", .kind = .dense_vector };
+            const token = try beginDerivedCatchUpSessionAsync(ctx, ref);
+            const sequence = ctx.store.lastReplaySequence(0);
+            const aborts_before = ctx.stats.dense_catch_up.abort_calls.load(.monotonic);
+            if (!success) try ctx.applied_sequence_coalescer.note(ctx.alloc, ref.name, sequence + 1);
+            const port = owner.port();
+            const io = ctx.io.?;
+            const io_borrow = runtime.native_abi.IoBorrow.init(&io);
+            var caller: ?*anyopaque = null;
+            const deadline = 200 * std.time.ns_per_ms;
+            // This caller occupies the sole cleanup CPU. The reserved capsule can
+            // run only after delegation releases it, without a second operation.
+            const status = port.start(port.context, &.{ .io = &io_borrow, .class = @backingInt(runtime.runnable_abi.Class.control), .cleanup = 1, .allow_wait = 0, .has_deadline = 1, .native_deadline = 1, .deadline_ns = deadline, .out_handle = &caller });
+            if (!status.isOk()) return runtime.error_abi.errorFromStatus(status);
+            defer port.finish(caller.?);
+            const charged = owner.owner.scheduler.stats().retained_bytes;
+            const Control = struct {
+                execution: runtime.runnable_abi.Borrowed,
+                owner: *OwnerState,
+                ctx: *AsyncContext,
+                case: Case,
+                parked: bool = false,
+                reject_preparation: bool = true,
+                begins: usize = 0,
+                ends: usize = 0,
+                held_apply: ?*std.atomic.Mutex = null,
+                held_sequence: bool = false,
+                reject_parked_lifetime: bool = false,
+                delegated_started: bool = false,
+                fn checked(value: runtime.error_abi.Status) !void {
+                    if (!value.isOk()) return runtime.error_abi.errorFromStatus(value);
+                }
+                fn lifetime(raw: *anyopaque) !void {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    try self.execution.checkLifetime();
+                    if (self.parked and self.owner.owner.scheduler.stats().runnable_slots != 0) self.delegated_started = true;
+                    if (self.parked and self.delegated_started and self.owner.owner.scheduler.stats().runnable_slots == 0) {
+                        if (self.held_sequence) {
+                            try std.testing.expect(self.ctx.index_manager.catalog_mutex.tryLockExclusive());
+                            self.ctx.index_manager.catalog_mutex.unlockExclusive();
+                            const mutex = self.ctx.index_manager.denseIndex("dv_v1").?.apply_mutex;
+                            try std.testing.expect(mutex.tryLock());
+                            mutex.unlock();
+                            self.ctx.applied_sequence_mutex.unlock();
+                            self.held_sequence = false;
+                            if (self.case == .abort_sequence_rejection) self.reject_parked_lifetime = true;
+                        }
+                        if (self.held_apply) |mutex| {
+                            try std.testing.expect(self.ctx.index_manager.catalog_mutex.tryLockExclusive());
+                            self.ctx.index_manager.catalog_mutex.unlockExclusive();
+                            mutex.unlock();
+                            self.held_apply = null;
+                            if (self.case == .wait_rejection) self.reject_parked_lifetime = true;
+                        }
+                    }
+                    if (self.reject_parked_lifetime) return error.NotFound;
+                    if (self.parked and self.case == .preparation_rejection and self.reject_preparation) {
+                        self.reject_preparation = false;
+                        return error.NotFound;
                     }
                 }
-                if (self.reject_parked_lifetime) return error.NotFound;
-                if (self.parked and self.case == .preparation_rejection and self.reject_preparation) {
-                    self.reject_preparation = false;
-                    return error.NotFound;
+                fn checkpoint(raw: *anyopaque) !void {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    try lifetime(raw);
+                    try checked(self.execution.checkpoint(self.execution.context));
+                }
+                fn deadlineNs(_: *anyopaque) !?u64 {
+                    return deadline;
+                }
+                fn begin(raw: *anyopaque) !void {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    self.begins += 1;
+                    if (self.case == .begin_rejection) return error.Forbidden;
+                    try checkpoint(raw);
+                    try checked(self.execution.park(self.execution.context, @backingInt(runtime.runnable_abi.Wait.resource)));
+                    self.parked = true;
+                    try std.testing.expectEqual(@as(usize, 0), self.owner.owner.scheduler.stats().runnable_slots);
+                }
+                fn reentry(raw: *anyopaque) callconv(.c) runtime.error_abi.Status {
+                    lifetime(raw) catch |cause| return runtime.error_abi.statusFromError(cause);
+                    return .ok;
+                }
+                fn end(raw: *anyopaque) !void {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    self.ends += 1;
+                    self.reject_parked_lifetime = false;
+                    // Both CPU lanes and all index guards must be free before the
+                    // original grant is requested, including on preparation error.
+                    try std.testing.expectEqual(@as(usize, 0), self.owner.owner.scheduler.stats().runnable_slots);
+                    try std.testing.expect(self.ctx.index_manager.catalog_mutex.tryLockExclusive());
+                    self.ctx.index_manager.catalog_mutex.unlockExclusive();
+                    const index = self.ctx.index_manager.denseIndex("dv_v1").?;
+                    try std.testing.expect(index.apply_mutex.tryLock());
+                    index.apply_mutex.unlock();
+                    if (self.case == .reentry_rejection) Clock.now_ns = deadline;
+                    try self.execution.enterChecked(.control, &.{ .context = self, .check = reentry });
+                    self.parked = false;
+                }
+            };
+            var control: Control = .{ .execution = try runtime.runnable_abi.Borrowed.fromOwner(port, caller.?, 1, .control), .owner = &owner, .ctx = ctx, .case = case };
+            if (case == .apply_contention or case == .wait_rejection) {
+                const mutex = ctx.index_manager.denseIndex(ref.name).?.apply_mutex;
+                try std.testing.expect(mutex.tryLock());
+                control.held_apply = mutex;
+            }
+            defer if (control.held_apply) |mutex| mutex.unlock();
+            if (case == .abort_sequence_contention or case == .abort_sequence_rejection) {
+                try std.testing.expect(ctx.applied_sequence_mutex.tryLock());
+                control.held_sequence = true;
+            }
+            defer if (control.held_sequence) ctx.applied_sequence_mutex.unlock();
+            var payload: admission.Payload = .{ .ptr = &control, .vtable = &.{ .checkpoint = Control.checkpoint, .check_lifetime = Control.lifetime, .deadline_ns = Control.deadlineNs }, .execution_wait = .{ .ptr = &control, .begin = Control.begin, .end = Control.end }, .delegation = .{ .suspension = .{ .ptr = &control, .begin = Control.begin, .end = Control.end } } };
+            var attempt: @import("derived/runtime_types.zig").FinishAttempt = .{};
+            const owning = case == .owning_success or case == .owning_claim_rejection;
+            if (owning) try Control.checked(control.execution.park(control.execution.context, @backingInt(runtime.runnable_abi.Wait.resource)));
+            var registry_held = false;
+            defer if (registry_held) ctx.dense_admission.sessions.mutex.unlock();
+            if (case == .owning_claim_rejection) {
+                try std.testing.expect(ctx.dense_admission.sessions.mutex.tryLock());
+                registry_held = true;
+            }
+            const outcome = finishDerivedCatchUpSessionAsyncWithAdmission(ctx, ref, token, sequence, success, if (owning) null else admission.Port.init(&payload), &attempt);
+            switch (case) {
+                .success, .apply_contention, .owning_success, .abort_sequence_contention => _ = try outcome,
+                .owning_claim_rejection => {
+                    try std.testing.expectError(error.ResourceTemporarilyUnavailable, outcome);
+                    try std.testing.expect(!attempt.consumed and attempt.completed == null);
+                    try std.testing.expect(ctx.dense_admission.sessions.sessions.contains(token.value));
+                    try std.testing.expectEqual(charged, owner.owner.scheduler.stats().retained_bytes);
+                    ctx.dense_admission.sessions.mutex.unlock();
+                    registry_held = false;
+                    _ = try finishDerivedCatchUpSessionAsyncWithAdmission(ctx, ref, token, sequence, success, null, &attempt);
+                },
+                .reentry_rejection => {
+                    try std.testing.expectError(error.DeadlineExceeded, outcome);
+                    try std.testing.expect(attempt.consumed and attempt.completed != null);
+                    try std.testing.expectEqual(@as(usize, 0), owner.owner.scheduler.stats().runnable_slots);
+                },
+                .begin_rejection, .preparation_rejection, .wait_rejection, .abort_sequence_rejection => {
+                    try std.testing.expectError(if (case == .begin_rejection) error.Forbidden else error.NotFound, outcome);
+                    try std.testing.expect(!attempt.consumed and attempt.completed == null);
+                    try std.testing.expect(ctx.dense_admission.sessions.sessions.contains(token.value));
+                    try std.testing.expectEqual(charged, owner.owner.scheduler.stats().retained_bytes);
+                    if (!success) try std.testing.expectEqual(sequence + 1, ctx.applied_sequence_coalescer.pending.get(ref.name).?);
+                    try std.testing.expectEqual(@as(usize, 2), owner.owner.scheduler.stats().operations);
+                    control.case = .success;
+                    _ = try finishDerivedCatchUpSessionAsyncWithAdmission(ctx, ref, token, sequence, success, admission.Port.init(&payload), &attempt);
+                },
+            }
+            try std.testing.expect(attempt.consumed and attempt.completed != null);
+            try std.testing.expect(!ctx.dense_admission.sessions.sessions.contains(token.value));
+            try std.testing.expectEqual(@as(usize, 1), owner.owner.scheduler.stats().operations);
+            try std.testing.expectEqual(@as(usize, 1), owner.owner.borrowers);
+            try std.testing.expectEqual(control.begins - @intFromBool(case == .begin_rejection), control.ends);
+            try std.testing.expectEqual(aborts_before + @intFromBool(!success), ctx.stats.dense_catch_up.abort_calls.load(.monotonic));
+            if (!success) {
+                try std.testing.expect(!ctx.applied_sequence_coalescer.pending.contains(ref.name));
+                try std.testing.expect(!attempt.completed.?.applied_sequence_persisted);
+                // The old token is retired. A delayed abort may acknowledge that
+                // fact but cannot disturb a new incarnation of this session.
+                const replacement = if (case == .owning_success) try beginDerivedCatchUpSessionAsync(ctx, ref) else null;
+                var retired: @import("derived/runtime_types.zig").FinishAttempt = .{};
+                _ = try finishDerivedCatchUpSessionAsyncWithAdmission(ctx, ref, token, sequence, false, null, &retired);
+                try std.testing.expect(retired.consumed and retired.completed != null);
+                try std.testing.expectEqual(aborts_before + 1, ctx.stats.dense_catch_up.abort_calls.load(.monotonic));
+                if (replacement) |fresh| {
+                    try std.testing.expect(ctx.dense_admission.sessions.sessions.contains(fresh.value));
+                    var closing: @import("derived/runtime_types.zig").FinishAttempt = .{};
+                    _ = try finishDerivedCatchUpSessionAsyncWithAdmission(ctx, ref, fresh, sequence, false, null, &closing);
+                    try std.testing.expect(closing.consumed and closing.completed != null);
+                    try std.testing.expectEqual(@as(usize, 1), owner.owner.scheduler.stats().operations);
                 }
             }
-            fn checkpoint(raw: *anyopaque) !void {
-                const self: *@This() = @ptrCast(@alignCast(raw));
-                try lifetime(raw);
-                try checked(self.execution.checkpoint(self.execution.context));
-            }
-            fn deadlineNs(_: *anyopaque) !?u64 {
-                return deadline;
-            }
-            fn begin(raw: *anyopaque) !void {
-                const self: *@This() = @ptrCast(@alignCast(raw));
-                self.begins += 1;
-                if (self.case == .begin_rejection) return error.Forbidden;
-                try checkpoint(raw);
-                try checked(self.execution.park(self.execution.context, @backingInt(runtime.runnable_abi.Wait.resource)));
-                self.parked = true;
-                try std.testing.expectEqual(@as(usize, 0), self.owner.owner.scheduler.stats().runnable_slots);
-            }
-            fn reentry(raw: *anyopaque) callconv(.c) runtime.error_abi.Status {
-                lifetime(raw) catch |cause| return runtime.error_abi.statusFromError(cause);
-                return .ok;
-            }
-            fn end(raw: *anyopaque) !void {
-                const self: *@This() = @ptrCast(@alignCast(raw));
-                self.ends += 1;
-                self.reject_parked_lifetime = false;
-                // Both CPU lanes and all index guards must be free before the
-                // original grant is requested, including on preparation error.
-                try std.testing.expectEqual(@as(usize, 0), self.owner.owner.scheduler.stats().runnable_slots);
-                try std.testing.expect(self.ctx.index_manager.catalog_mutex.tryLockExclusive());
-                self.ctx.index_manager.catalog_mutex.unlockExclusive();
-                const index = self.ctx.index_manager.denseIndex("dv_v1").?;
-                try std.testing.expect(index.apply_mutex.tryLock());
-                index.apply_mutex.unlock();
-                if (self.case == .reentry_rejection) Clock.now_ns = deadline;
-                try self.execution.enterChecked(.control, &.{ .context = self, .check = reentry });
-                self.parked = false;
-            }
-        };
-        var control: Control = .{ .execution = try runtime.runnable_abi.Borrowed.fromOwner(port, caller.?, 1, .control), .owner = &owner, .ctx = ctx, .case = case };
-        if (case == .apply_contention or case == .wait_rejection) {
-            const mutex = ctx.index_manager.denseIndex(ref.name).?.apply_mutex;
-            try std.testing.expect(mutex.tryLock());
-            control.held_apply = mutex;
         }
-        defer if (control.held_apply) |mutex| mutex.unlock();
-        var payload: admission.Payload = .{ .ptr = &control, .vtable = &.{ .checkpoint = Control.checkpoint, .check_lifetime = Control.lifetime, .deadline_ns = Control.deadlineNs }, .execution_wait = .{ .ptr = &control, .begin = Control.begin, .end = Control.end }, .delegation = .{ .suspension = .{ .ptr = &control, .begin = Control.begin, .end = Control.end } } };
-        var attempt: @import("derived/runtime_types.zig").FinishAttempt = .{};
-        const owning = case == .owning_success or case == .owning_claim_rejection;
-        if (owning) try Control.checked(control.execution.park(control.execution.context, @backingInt(runtime.runnable_abi.Wait.resource)));
-        var registry_held = false;
-        defer if (registry_held) ctx.dense_admission.sessions.mutex.unlock();
-        if (case == .owning_claim_rejection) {
-            try std.testing.expect(ctx.dense_admission.sessions.mutex.tryLock());
-            registry_held = true;
-        }
-        const outcome = finishDerivedCatchUpSessionAsyncWithAdmission(ctx, ref, token, sequence, if (owning) null else admission.Port.init(&payload), &attempt);
-        switch (case) {
-            .success, .apply_contention, .owning_success => _ = try outcome,
-            .owning_claim_rejection => {
-                try std.testing.expectError(error.ResourceTemporarilyUnavailable, outcome);
-                try std.testing.expect(!attempt.consumed and attempt.completed == null);
-                try std.testing.expect(ctx.dense_admission.sessions.sessions.contains(token.value));
-                try std.testing.expectEqual(charged, owner.owner.scheduler.stats().retained_bytes);
-                ctx.dense_admission.sessions.mutex.unlock();
-                registry_held = false;
-                _ = try finishDerivedCatchUpSessionAsyncWithAdmission(ctx, ref, token, sequence, null, &attempt);
-            },
-            .reentry_rejection => {
-                try std.testing.expectError(error.DeadlineExceeded, outcome);
-                try std.testing.expect(attempt.consumed and attempt.completed != null);
-                try std.testing.expectEqual(@as(usize, 0), owner.owner.scheduler.stats().runnable_slots);
-            },
-            .begin_rejection, .preparation_rejection, .wait_rejection => {
-                try std.testing.expectError(if (case == .begin_rejection) error.Forbidden else error.NotFound, outcome);
-                try std.testing.expect(!attempt.consumed and attempt.completed == null);
-                try std.testing.expect(ctx.dense_admission.sessions.sessions.contains(token.value));
-                try std.testing.expectEqual(charged, owner.owner.scheduler.stats().retained_bytes);
-                try std.testing.expectEqual(@as(usize, 2), owner.owner.scheduler.stats().operations);
-                control.case = .success;
-                _ = try finishDerivedCatchUpSessionAsyncWithAdmission(ctx, ref, token, sequence, admission.Port.init(&payload), &attempt);
-            },
-        }
-        try std.testing.expect(attempt.consumed and attempt.completed != null);
-        try std.testing.expect(!ctx.dense_admission.sessions.sessions.contains(token.value));
-        try std.testing.expectEqual(@as(usize, 1), owner.owner.scheduler.stats().operations);
-        try std.testing.expectEqual(@as(usize, 1), owner.owner.borrowers);
-        try std.testing.expectEqual(control.begins - @intFromBool(case == .begin_rejection), control.ends);
     }
 }
 
