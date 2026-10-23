@@ -587,31 +587,48 @@ def test_runtime_entity_curation_preserves_future_promotion(
         assert bare.status_code == 422, bare.text
         assert bare.json()["reason"] == "qualified_start_identity_required", bare.text
     qualified = {"identities": [{"table": destination, "key": seed}]}
-    # A valid incoming query must not be blamed for a later query's missing
-    # qualification when the error crosses an independently compiled archive.
-    mixed = api._request(
-        "POST",
-        f"/tables/{source}/query",
-        {
-            "graph_queries": {
-                "valid": {
-                    "index": "knowledge",
-                    "traverse": {"start": qualified, "direction": "in", "max_depth": 1},
-                },
-                "invalid": {
-                    "index": "knowledge",
-                    "traverse": {
-                        "start": {"keys": [seed]},
-                        "direction": "in",
-                        "max_depth": 1,
+    # A valid incoming query must not be blamed for a later query's rejection
+    # when the error crosses an independently compiled archive.
+    for invalid_params, reason in (
+        ({"start": {"keys": [seed]}}, "qualified_start_identity_required"),
+        (
+            {"start": qualified, "deduplicate_nodes": False},
+            "deduplicate_nodes_must_be_true",
+        ),
+    ):
+        mixed = api._request(
+            "POST",
+            f"/tables/{source}/query",
+            {
+                "graph_queries": {
+                    "valid": {
+                        "index": "knowledge",
+                        "traverse": {
+                            "start": qualified,
+                            "direction": "in",
+                            "max_depth": 1,
+                        },
                     },
-                },
-            }
-        },
-    )
-    assert mixed.status_code == 422, mixed.text
-    assert mixed.json()["operation"] == "invalid", mixed.text
-    assert mixed.json()["reason"] == "qualified_start_identity_required", mixed.text
+                    "invalid": {
+                        "index": "knowledge",
+                        "traverse": {
+                            "direction": "in",
+                            "max_depth": 1,
+                            **invalid_params,
+                        },
+                    },
+                }
+            },
+        )
+        if mixed.ok and reason == "deduplicate_nodes_must_be_true":
+            # An unauthenticated complete single-group snapshot can retain
+            # per-seed paths locally. Only coordinator admission rejects it.
+            results = mixed.json()["responses"][0]["graph_results"]
+            assert "valid" in results and "invalid" in results, mixed.text
+            continue
+        assert mixed.status_code == 422, mixed.text
+        assert mixed.json()["operation"] == "invalid", mixed.text
+        assert mixed.json()["reason"] == reason, mixed.text
 
     expected_nodes = {"note-0", "note-1"} if action == "merge" else {"note-0"}
 
