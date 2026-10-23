@@ -1135,17 +1135,28 @@ pub fn create(b: *std.Build) ?Artifacts {
         6 * 1024 * 1024 * 1024,
     );
 
-    const install_antfly = b.addInstallArtifact(antfly_main, .{ .dest_sub_path = antfly_bin_name });
-    if (install_apple_bridge) |install| install_antfly.step.dependOn(&install.step);
+    const install_antfly: *std.Build.Step = if (target.result.os.tag == .macos and optimize == .debug and target.result.cpu.arch == b.graph.host.result.cpu.arch) native_debug: {
+        // The large Debug server exceeds Zig's Mach-O relocation range. Use
+        // the same native final linker as checked owners and storage probes.
+        const native = @import("build_support/embedded/shared_library.zig");
+        const object = b.addObject(.{ .name = "antfly-debug-entry", .root_module = antfly_main.root_module, .use_llvm = true });
+        object.entry = .enabled;
+        object.bundle_compiler_rt = false;
+        object.bundle_ubsan_rt = false;
+        const image = native.nativeExecutableLink(b, object, "antfly");
+        native.addNativeExecutableLinks(b, image, object, antfly_main.root_module);
+        break :native_debug &b.addInstallFileWithDir(image.binary, .bin, antfly_bin_name).step;
+    } else &b.addInstallArtifact(antfly_main, .{ .dest_sub_path = antfly_bin_name }).step;
+    if (install_apple_bridge) |install| install_antfly.dependOn(&install.step);
     const install_antfarm_assets = b.addInstallDirectory(.{
         .source_dir = b.path("pkg/antfly/antfarm"),
         .install_dir = .prefix,
         .install_subdir = "share/antfly/antfarm",
     });
-    b.getInstallStep().dependOn(&install_antfly.step);
+    b.getInstallStep().dependOn(install_antfly);
     b.getInstallStep().dependOn(&install_antfarm_assets.step);
     const antfly_step = b.step("antfly", "Build and install the top-level Antfly CLI");
-    antfly_step.dependOn(&install_antfly.step);
+    antfly_step.dependOn(install_antfly);
     antfly_step.dependOn(&install_antfarm_assets.step);
     const cli_licenses = @import("lib/product_licenses/build.zig").installApache(b, b.path(".."), "antfly", "share/licenses/antfly");
     antfly_step.dependOn(cli_licenses);
