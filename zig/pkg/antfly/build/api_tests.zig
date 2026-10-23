@@ -3901,6 +3901,21 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     b.step("antfly-dense-finalization-test", "Verify controlled preparation retains a real dense capture until acceptance")
         .dependOn(&b.addRunArtifact(dense_finalization_db_tests).step);
 
+    const graph_maintenance_runtime_tests = b.addTest(.{
+        .name = "graph-maintenance-runtime-tests",
+        .root_module = dense_finalization_db_root,
+        .filters = &.{ "graph metric runtime background", "graph metric runtime lease", "graph metric runtime role", "graph metric runtime config", "graph metric runtime requires", "graph metric runtime worker pool identity", "graph metric runtime boundary tick", "graph metric runtime retirement", "graph metric shared maintenance" },
+        .max_rss = 16 * 1024 * 1024 * 1024,
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    const graph_maintenance_runtime_run = b.addRunArtifact(graph_maintenance_runtime_tests);
+    // Runtime filters reject missing test discovery instead of accepting only
+    // anonymous semantic-analysis roots as a successful graph qualification.
+    for (graph_maintenance_runtime_tests.filters) |filter| graph_maintenance_runtime_run.addArgs(&.{ "--test-filter", filter });
+    graph_maintenance_runtime_run.addArg("--require-no-skips");
+    b.step("antfly-graph-maintenance-runtime-test", "Verify shared graph metric cadence, lease ownership, wakeups and controlled retirement")
+        .dependOn(&graph_maintenance_runtime_run.step);
+
     const enrichment_progress_tests = b.addTest(.{
         .name = "enrichment-progress-mailbox-tests",
         .root_module = derived_visibility_wait_root,

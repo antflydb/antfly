@@ -20,5 +20,6 @@ pub const consumer_tests_only = true;
 test {
     _ = @import("storage/cache_close_admission_test.zig");
     _ = @import("storage/db/maintenance/producer_close_admission_test.zig");
+    _ = @import("storage/db/maintenance/graph_metric_runtime.zig");
     _ = @import("storage/db/db.zig");
 }

@@ -24144,3 +24144,62 @@ receipt records unchanged native/schema inputs and the immutable log hash.
 `producer-close-v1` contains the initial passing foundation run, before the
 additional early-fence regression and Io-mutex concurrency coverage. Full GNU/Linux
 qualification remains waived and the full design is unfinished.
+
+### Shared graph-metric supervision and controlled producer close
+
+Graph-metric owners now retain a shared maintenance registration instead of a
+per-runtime sleeping future. Each callback performs one existing bounded tick and
+returns its active, idle or error delay to the scheduler. An empty metric catalog
+releases the durable runtime lease and returns no timer; the registration retains
+no callback worker while idle. Catalog installation wakes that same owner.
+Notifications during callbacks coalesce in the shared scheduler and survive the
+callback's returned delay. Registration itself queues the initial callback, so
+startup does not manufacture a second pass. Domain/lease clocks still inherit or
+override the backend clock; recurring dispatch uses the shared executor's clock.
+
+Close permanently fences start, notification and manual combined/coordinator/
+worker/pool entry points. It joins through the original finite cleanup execution,
+retaining the exact registration after rejected handoff/lifetime/reentry for
+retry. No runtime mutex remains held while the caller lends CPU. The permanent
+quiesced stop uses the same exclusive finisher as controlled stop. DB preflight
+joins graph metrics after TTL/sparse producers and before native projection,
+enrichment, derived finalization and durable dependency fencing.
+
+Controlled and quiesced stops retain the lease. Physical deinit still chooses
+normal durable lease release or deinitPreserveLease for crash simulation. Native
+ABI 96 and storage-owner ABI 156 fence the changed runtime layout and preflight
+contract. Physical backend teardown, callback I/O/CPU cooperation and runnable
+adoption, remaining resource charging, and broader original design gates remain
+unfinished. The full goal stays active. Full GNU/Linux qualification remains
+waived; Linux builds require pinned Nix/glibc Zig.
+
+Pinned Darwin Debug receipt `graph-shared-close-v3` passes all 76 build steps and
+88 build-runner tests (63 maintenance, 23 execution-service and two linked C-entry
+close tests). The simple runners pass 45 named graph-runtime cases, 31 DB cases
+and 21 local-owner-close cases without skips, failures or leaks. The graph target
+explicitly imports its test module and requires every runtime filter to match
+at least one declared test; anonymous semantic-analysis roots cannot stand in
+for graph qualification. Error ABI (45), released status ABI (1) and failure
+identity (8) also pass. The native/schema inputs and immutable log hash match
+the final source.
+
+The graph cases cover default degree/pagerank progress, paused/failed/removed
+metrics, borrowed VoprIo clocks and teardown, split coordinator/worker/pool roles,
+reopened handles, duplicate/stale lease owners, cadence, active wake coalescing,
+empty owners releasing their callback worker and lease, and catalog reactivation.
+The new physical-retirement matrix preserves a lease after rejected cleanup,
+then verifies normal deinit removes it while deinitPreserveLease keeps its exact
+owner. Early close fences a scheduled pass even before shutdown can be published
+under the mutex. The DB single-CPU matrix now includes graph metrics through
+rejected handoff, lifetime and reentry with exact retry and denied late manual
+entry. The linked close test retains graph ownership after preflight alongside
+TTL and sparse compaction.
+
+The first intermediate run qualified the DB/shared-service changes but exposed
+that graph tests needed explicit discovery. The second passed 45 named graph
+cases and 16 root checks. Final qualification additionally removes the obsolete
+idle-owner wake from beginTeardown and enforces nonempty runtime filters. The
+next physical-close audit covers final status persistence, index destruction and
+primary backend close; these paths still need an explicit controlled retirement
+contract. Full GNU/Linux qualification remains waived; the full design is not
+complete.

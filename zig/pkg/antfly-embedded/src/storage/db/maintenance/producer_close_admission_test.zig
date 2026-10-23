@@ -22,7 +22,10 @@ const now = @import("antfly_platform").time.monotonicNs;
 
 test "maintenance producer close retains real DB owners through original failures and lends sole CPU" {
     const Mode = enum { success, begin_failure, end_failure, expired };
-    inline for (.{ true, false }) |is_ttl| {
+    const Kind = enum { ttl, sparse, graph };
+    inline for (std.enums.values(Kind)) |kind| {
+        const is_ttl = kind == .ttl;
+        const is_graph = kind == .graph;
         for (std.enums.values(Mode)) |mode| {
             const a = std.testing.allocator;
             var backend = try background.BackendRuntimeHandle.init(a, .{});
@@ -41,15 +44,25 @@ test "maintenance producer close retains real DB owners through original failure
                 .start_independent_maintenance = false,
             });
             defer db.close();
-            if (is_ttl) try db.initOptionalTtlRuntime(.{ .enabled = true, .lease_owned = true }) else try db.initOptionalSparseCompactionRuntime(.{ .enabled = true });
-            const runtime = if (is_ttl) db.ttl_runtime.? else db.sparse_compaction_runtime.?;
+            switch (kind) {
+                .ttl => try db.initOptionalTtlRuntime(.{ .enabled = true, .lease_owned = true }),
+                .sparse => try db.initOptionalSparseCompactionRuntime(.{ .enabled = true }),
+                .graph => try db.initOptionalGraphMetricRuntime(.{ .start_background_loop = false }),
+            }
+            const runtime = switch (kind) {
+                .ttl => db.ttl_runtime.?,
+                .sparse => db.sparse_compaction_runtime.?,
+                .graph => db.graph_metric_runtime.?,
+            };
             // Ordinary stop remains restartable until permanent close.
-            try runtime.start();
-            _ = runtime.stop();
-            try runtime.start();
-            _ = runtime.stop();
-            if (is_ttl) {
-                try runtime.runOnce();
+            if (!is_graph) {
+                try runtime.start();
+                _ = runtime.stop();
+                try runtime.start();
+                _ = runtime.stop();
+            }
+            if (is_ttl or is_graph) {
+                _ = try runtime.runOnce();
                 try std.testing.expect(runtime.stats().has_lease);
             }
             var slots = try cpu.Scheduler.init(.{ .slots = 3, .control_slots = 1, .cleanup_slots = 1 });
@@ -80,8 +93,10 @@ test "maintenance producer close retains real DB owners through original failure
                     var execution: cpu.Execution = .{};
                     defer execution.finish();
                     try execution.start(self.slots, .{ .io = self.io, .native_now_ns = now, .allow_wait = true, .deadline_ns = now() + 5 * std.time.ns_per_s }, .background);
-                    if (!self.runtime.lifecycle_mutex.tryLock()) return error.TestUnexpectedResult;
-                    if (is_ttl) self.runtime.lifecycle_mutex.unlock(self.io) else self.runtime.lifecycle_mutex.unlock();
+                    if (!is_graph) {
+                        if (!self.runtime.lifecycle_mutex.tryLock()) return error.TestUnexpectedResult;
+                        if (is_ttl) self.runtime.lifecycle_mutex.unlock(self.io) else self.runtime.lifecycle_mutex.unlock();
+                    }
                     if (!self.runtime.mutex.tryLock()) return error.TestUnexpectedResult;
                     self.runtime.mutex.unlock(self.io);
                     self.guards_free = true;
@@ -154,13 +169,22 @@ test "maintenance producer close retains real DB owners through original failure
             try std.testing.expect(control.begins != 0);
             try std.testing.expectEqual(control.begins, control.ends + @as(usize, if (mode == .begin_failure) 1 else 0));
             try std.testing.expectError(error.Canceled, runtime.start());
-            try std.testing.expectError(error.Canceled, runtime.resumeAfterPause());
-            try std.testing.expectError(error.Canceled, runtime.ensureRunning());
+            if (!is_graph) {
+                try std.testing.expectError(error.Canceled, runtime.resumeAfterPause());
+                try std.testing.expectError(error.Canceled, runtime.ensureRunning());
+            } else {
+                try std.testing.expectError(error.Canceled, runtime.runCoordinatorOnce(true));
+                try std.testing.expectError(error.Canceled, runtime.runWorkerOnce("late"));
+                try std.testing.expectError(error.Canceled, runtime.runWorkerPoolOnce());
+            }
             try std.testing.expectError(error.Canceled, runtime.runOnce());
             if (is_ttl) {
                 try std.testing.expect(runtime.stats().has_lease);
                 try std.testing.expect(db.ttl_cleanup_context != null);
-            } else runtime.notify();
+            } else {
+                if (is_graph) try std.testing.expect(runtime.stats().has_lease);
+                runtime.notify();
+            }
             try runtime.stopWithAdmission(original);
             try std.testing.expectEqual(@as(usize, 0), scheduler.snapshot().owned_registrations);
         }

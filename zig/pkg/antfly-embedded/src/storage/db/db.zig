@@ -6263,6 +6263,7 @@ pub const DB = struct {
         // producers while their dependencies and primary backend remain open.
         if (self.ttl_runtime) |runtime| try runtime.stopWithAdmission(original);
         if (self.sparse_compaction_runtime) |runtime| try runtime.stopWithAdmission(original);
+        if (self.graph_metric_runtime) |runtime| try runtime.stopWithAdmission(original);
         try self.async_context.native_projection_owner.stopWithAdmission(self.backend_runtime.io(), original);
         {
             defer self.async_context.enrichment_desired_running.store(false, .release);

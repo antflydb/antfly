@@ -7075,6 +7075,10 @@ test "controlled owner close preflight C entry drains a real DB with the origina
         try handle.db.initOptionalSparseCompactionRuntime(.{ .enabled = true });
         const sparse = handle.db.sparse_compaction_runtime.?;
         try sparse.start();
+        try handle.db.initOptionalGraphMetricRuntime(.{ .start_background_loop = false });
+        const graph_metrics = handle.db.graph_metric_runtime.?;
+        _ = try graph_metrics.runOnce();
+        try std.testing.expect(graph_metrics.stats().has_lease);
         try text_merge.start();
         try std.testing.expect(text_merge.future != null);
         try enrichment.start();
@@ -7146,6 +7150,10 @@ test "controlled owner close preflight C entry drains a real DB with the origina
         try std.testing.expect(handle.db.ttl_cleanup_context != null);
         try std.testing.expectError(error.Canceled, ttl.start());
         try std.testing.expectError(error.Canceled, sparse.start());
+        try std.testing.expect(graph_metrics.joined.isSet() and graph_metrics.future == null);
+        try std.testing.expect(graph_metrics.stats().has_lease);
+        try std.testing.expectError(error.Canceled, graph_metrics.start());
+        try std.testing.expectError(error.Canceled, graph_metrics.runOnce());
         try std.testing.expectError(error.TextMergeRuntimeShutdown, text_merge.acquireProducerPermit("late", 1, 1));
         try std.testing.expectError(error.Canceled, text_merge.start());
         try std.testing.expectError(error.WorkerStopping, handle.db.executor.addWorker("late", .{ .name = "late", .kind = .full_text }, 0));
