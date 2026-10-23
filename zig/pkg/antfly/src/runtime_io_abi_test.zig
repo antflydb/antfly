@@ -411,3 +411,94 @@ test "executor archive boundary durability grant retains physical authority and 
     defer healthy.deinit();
     try std.testing.expectEqualStrings("archive-control", (try healthy.waitWithAdmission(original)).bytes);
 }
+
+test "executor archive boundary WAL sync distinguishes original missing-file rejection from absent CURRENT" {
+    const os = @import("builtin").os.tag;
+    if (os == .windows or os == .wasi or os == .freestanding) return error.SkipZigTest;
+    const abi = @import("antfly_runtime_abi");
+    const local = @import("antfly_local_sources");
+    const admission = local.common_read_admission;
+    const wal = local.storage_lsm_backend_wal;
+    const Publication = struct {
+        held: *bool,
+        releases: *usize,
+        pub fn release(self: *@This()) void {
+            self.held.* = false;
+            self.releases.* += 1;
+        }
+    };
+    const Shim = struct {
+        var upstream: @FieldType(retained_io.ControlFileReadOperation, "boundary_dispatch") = undefined;
+        var inside: bool = false;
+        var calls: usize = 0;
+        fn dispatch(contract: *const abi.native_abi.CallContract, callback: *const anyopaque, args: *const anyopaque, output: ?*anyopaque) callconv(.c) abi.error_abi.Status {
+            calls += 1;
+            inside = true;
+            defer inside = false;
+            return upstream(contract, callback, args, output);
+        }
+    };
+    const Control = struct {
+        rejected: bool = false,
+        fn check(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            // Reject inside the independently compiled read implementation,
+            // after the coordinator has entered its physical-wait boundary.
+            if (self.rejected and Shim.inside) return error.FileNotFound;
+        }
+        fn deadline(_: *anyopaque) !?u64 {
+            return std.math.maxInt(u64);
+        }
+        fn begin(_: *anyopaque) !void {}
+        fn end(_: *anyopaque) !void {}
+    };
+    const a = std.testing.allocator;
+    var lease: retained_io.Storage.Lease = undefined;
+    var owner: ?*anyopaque = null;
+    defer if (owner) |context| runtime_io_abi_test_durability_owner_close(context);
+    const contract = abi.native_abi.TypeContract.of(retained_io.Storage.Lease);
+    const status = runtime_io_abi_test_durability_storage(&contract, &lease, &owner);
+    if (!status.isOk()) return abi.error_abi.errorFromStatus(status);
+    var leased = true;
+    defer if (leased) lease.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer a.free(root);
+    var state: local.storage_lsm_backend_state.State = .{};
+    defer state.deinit(a);
+    try state.upsert(a, .{ .name = "docs" }, "doc", "state", false);
+    _ = try wal.appendState(lease.view, a, root, &state, false);
+    var control: Control = .{};
+    const payload: admission.Payload = .{ .ptr = &control, .vtable = &.{ .checkpoint = Control.check, .check_lifetime = Control.check, .deadline_ns = Control.deadline }, .execution_wait = .{ .ptr = &control, .begin = Control.begin, .end = Control.end } };
+    const original = admission.Port.init(&payload);
+    var held = true;
+    var releases: usize = 0;
+    var operation = try wal.CurrentStateSync(Publication).prepare(root);
+    var resources = (try lease.view.tryPrepareDurabilityWithAdmission(original)) orelse return error.TestUnexpectedResult;
+    operation.start(resources, .{ .held = &held, .releases = &releases }, original) catch |cause| {
+        resources.deinit();
+        return cause;
+    };
+    defer operation.deinit();
+    Shim.upstream = operation.pending.read.boundary_dispatch;
+    Shim.calls = 0;
+    operation.pending.read.boundary_dispatch = Shim.dispatch;
+    control.rejected = true;
+    try std.testing.expectError(error.FileNotFound, operation.waitWithAdmission(original));
+    try std.testing.expect(held and operation.stage == .current);
+    try std.testing.expectEqual(@as(usize, 0), releases);
+    try std.testing.expectEqual(@as(usize, 1), Shim.calls);
+    runtime_io_abi_test_durability_owner_close(owner.?);
+    owner = null;
+    lease.deinit();
+    leased = false;
+    control.rejected = false;
+    const result = try operation.waitWithAdmission(original);
+    try std.testing.expectEqual(@as(u64, 1), result.segment_syncs);
+    try std.testing.expectEqual(@as(u64, 1), result.index_syncs);
+    try std.testing.expect(!held);
+    try std.testing.expectEqual(@as(usize, 1), releases);
+    _ = try operation.waitWithAdmission(original);
+    try std.testing.expectEqual(@as(usize, 2), Shim.calls);
+}

@@ -24462,3 +24462,76 @@ are reused from the qualified foundation and v4 run. Error/status/failure identi
 remains 45/1/8. All 5,539 captured native/schema inputs and immutable log hashes
 match the final source. This is completion-resource qualification; full WAL and
 final-persistence coordinator adoption remains unfinished.
+
+### Owning WAL durability cut and compound publication acquisition
+
+The local LSM backend can now prepare bounded paths and try to acquire a reusable
+completion grant together with its existing process/native WAL publication guards.
+A busy publication guard drops the idle grant before the original execution waits.
+FD pressure likewise leaves no publication ownership. This path requires already
+prepared lock files/root metadata and never opens them as an implicit acquisition
+fallback. Waiting uses the supplied finite execution authority without extending
+its deadline. No backend mutex survives acquisition or physical waits.
+
+`CurrentStateSync(Publication)` owns the grant, publication and one pending phase.
+It reads actual CURRENT (`wal/index`) through one bounded physical operation,
+validates its exact size, format, checksum and nonzero segment on admitted CPU,
+then syncs the named segment before CURRENT. It uses prepared descriptor/worker/
+buffer resources for every physical phase. A missing referenced segment is an
+error rather than permission to create an empty replacement. Corrupt or oversized
+metadata cannot proceed to either barrier. A genuinely absent CURRENT returns an
+empty sync result. An original FileNotFound rejection is identified by its
+rejection trace and preserves the pending read and publication instead.
+
+Rejected handoff, lifetime or reentry leaves the accepted phase available for
+retry without replaying completed I/O. Successful admitted observation advances
+only that phase; completed results and terminal physical/validation failures are
+stable. Publication releases after admitted terminal observation. Mandatory
+quiesced destruction joins the currently accepted physical operation before
+releasing publication, then retires the idle worker and descriptor. It performs
+no new decoding or unissued sync stages during destruction.
+
+The backend entry points are explicitly for a quiesced, retained backend with a
+single owning sync/close continuation. Its caller must fence writers/maintenance,
+retain the backend until retirement and ensure cleanup reentry can progress while
+legacy publication acquirers hold ordinary capacity. The real-backend tests use
+an independently reserved, finite protected cleanup root. These are internal
+coordinator APIs; existing native payload layouts/vtables remain ABI 100 and
+storage-owner ABI 160. Default final-close adoption remains open.
+
+The physical suite now has 15 named cases. A three-phase by three-failure matrix
+proves retention, exact read/sync counts and actual segment-before-CURRENT path
+order under exhausted allocator, descriptor and dispatch capacity, including
+native-owner shutdown and protected control progress. Metadata cases cover absent
+CURRENT, size/checksum/zero-segment corruption, a missing referenced segment and
+successful idempotent completion. Real-backend cases leave only one descriptor
+available and prove the publication holder can acquire it when cleanup parks;
+acquisition rejection owns no tentative grant. Accepted read rejection retains
+both actual guards, and missing prepared metadata fails without an implicit open.
+A real read-only peer remains blocked during mandatory join of a paused read and
+acquires both publication guards after retirement, while backend metadata remains
+unlocked throughout.
+
+Foundation receipt `owning-wal-sync-v2` passes 68/68 build steps, 86 maintenance/
+execution-service tests, the then-14 physical cases, 32 storage-read cases and
+45/1/8 error/status/failure-identity cases. The earlier v1 receipt preserves the
+scheduler test-class correction. Broader receipt `owning-wal-sync-v3` passes all
+82 build steps and 88 build-runner tests, including two fresh linked C-entry close
+tests; simple runners pass all 15 physical, 32 storage-read, 32 DB, 21 local-close
+and 45 graph-runtime cases without skips, failures or leaks.
+
+Final receipt `owning-wal-sync-v4` passes all 92 build steps, all 14 independent
+I/O archive cases and those same simple-runner scopes, plus 45/1/8 identity cases.
+Its new archive case injects an original FileNotFound inside the foreign physical
+read callback, proves publication/pending-read retention, destroys the producer's
+storage owner and lease, and successfully resumes both ordered barriers using the
+same grant. A repeat observes completion without reissuing the read. Inputs and
+immutable log hashes match the final source.
+
+Next, final status writes, backend flush and physical retirement need admitted
+phases and a stored/resumable coordinator in the close owner. Serving and producer
+fences must precede its publication cut; writes must not follow a supposedly final
+durability barrier, nor should successful controlled finalization be followed by
+a duplicate legacy full sync. Equivalent provider adoption remains open. The full
+goal remains active. Full GNU/Linux qualification remains waived, and Linux builds
+require the pinned Nix/glibc toolchain.

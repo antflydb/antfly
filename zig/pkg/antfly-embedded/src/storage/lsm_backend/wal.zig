@@ -320,6 +320,152 @@ pub fn syncCurrentState(storage: storage_io.Storage, allocator: Allocator, root_
     return .{ .segment_syncs = 1, .index_syncs = 1 };
 }
 
+/// Owns one WAL durability cut after its caller has acquired publication and
+/// reusable completion resources. Publication must provide release(). The
+/// backend/publication owner outlives this value, and callers serialize methods.
+/// This performs only CURRENT metadata and ordered barriers, not backend flush.
+pub fn CurrentStateSync(comptime Publication: type) type {
+    return struct {
+        const Self = @This();
+        const Stage = enum { current, segment, index, complete, failed };
+        const Pending = union(enum) { none, read: storage_io.ControlFileReadOperation, sync: storage_io.SyncOperation };
+        index_path: [std.fs.max_path_bytes]u8 = undefined,
+        index_len: usize = 0,
+        segment_path: [std.fs.max_path_bytes]u8 = undefined,
+        segment_prefix_len: usize = 0,
+        segment_len: usize = 0,
+        resources: ?storage_io.DurabilityResources = null,
+        publication: ?Publication = null,
+        pending: Pending = .none,
+        stage: Stage = .current,
+        result: SyncResult = .{},
+        failure: ?anyerror = null,
+
+        /// Prepare bounded paths before acquiring any publication lock. This
+        /// value is movable: it stores lengths, never slices into itself.
+        pub fn prepare(root_dir: []const u8) !Self {
+            var self: Self = .{};
+            if (root_dir.len >= std.fs.max_path_bytes) return error.NameTooLong;
+            const separator = if (root_dir.len == 0 or std.mem.endsWith(u8, root_dir, "/")) "" else "/";
+            const prefix = std.fmt.bufPrint(&self.segment_path, "{s}{s}{s}/", .{ root_dir, separator, wal_dir_name }) catch return error.NameTooLong;
+            if (prefix.len + 24 >= self.segment_path.len) return error.NameTooLong;
+            self.segment_prefix_len = prefix.len;
+            const path = std.fmt.bufPrint(&self.index_path, "{s}{s}", .{ prefix, wal_index_file_name }) catch return error.NameTooLong;
+            self.index_len = path.len;
+            return self;
+        }
+
+        /// Transfer both grants only after the initial read is accepted. A
+        /// pre-dispatch failure leaves both arguments owned by the caller.
+        pub fn start(self: *Self, resources: storage_io.DurabilityResources, publication: Publication, original: @import("../../common/read_admission.zig").Port) !void {
+            std.debug.assert(self.resources == null and self.publication == null);
+            var prepared = resources;
+            const read = try prepared.beginControlRead(self.index_path[0..self.index_len], control_pair_len, original);
+            self.resources = prepared;
+            self.publication = publication;
+            self.pending = .{ .read = read };
+        }
+
+        pub fn waitWithAdmission(self: *Self, original: @import("../../common/read_admission.zig").Port) !SyncResult {
+            const admission = @import("../../common/read_admission.zig");
+            _ = (try original.executionWaitAfterLifetime()) orelse return error.ExecutionWaitUnsupported;
+            _ = (try original.deadlineNs()) orelse return error.ExecutionWaitUnsupported;
+            while (true) {
+                try original.checkpoint();
+                switch (self.stage) {
+                    .complete => return self.result,
+                    .failed => return self.failure.?,
+                    .current => {
+                        std.debug.assert(self.pending == .read);
+                        var trace: admission.RejectionTrace = .{};
+                        const control = trace.bind(original).?;
+                        const current = self.pending.read.waitWithAdmission(control) catch |cause| {
+                            // An original FileNotFound is a rejected waiter,
+                            // never evidence that CURRENT is absent.
+                            if (trace.failure) |rejected| return rejected;
+                            if (cause == error.FileNotFound) {
+                                self.retirePending();
+                                self.stage = .complete;
+                                self.releasePublication();
+                                continue;
+                            }
+                            return self.fail(cause);
+                        };
+                        // Only successful reentry authorizes format/checksum
+                        // CPU. Rejection preserves the exact read and bytes.
+                        try original.checkpoint();
+                        if (current.file_size != control_pair_len or current.bytes.len != control_pair_len)
+                            return self.fail(error.CorruptLsmWalIndex);
+                        const payload = decodeControl(current.bytes, .current_segment, 16) catch |cause| return self.fail(cause);
+                        const segment = std.mem.readInt(u64, payload[0..8], .little);
+                        if (segment == 0) return self.fail(error.CorruptLsmWalIndex);
+                        const name = std.fmt.bufPrint(self.segment_path[self.segment_prefix_len..], "{d:0>20}.log", .{segment}) catch unreachable;
+                        self.segment_len = self.segment_prefix_len + name.len;
+                        self.retirePending();
+                        self.stage = .segment;
+                    },
+                    .segment, .index => {
+                        if (self.pending == .none) {
+                            const path = if (self.stage == .segment) self.segment_path[0..self.segment_len] else self.index_path[0..self.index_len];
+                            // These phases use the already admitted worker,
+                            // descriptor and fixed buffers, even under pressure.
+                            self.pending = .{ .sync = try self.resources.?.beginSyncContents(path, original) };
+                        }
+                        var trace: admission.RejectionTrace = .{};
+                        self.pending.sync.waitWithAdmission(trace.bind(original).?) catch |cause| {
+                            if (trace.failure) |rejected| return rejected;
+                            return self.fail(cause);
+                        };
+                        self.retirePending();
+                        if (self.stage == .segment) {
+                            self.result.segment_syncs = 1;
+                            self.stage = .index;
+                        } else {
+                            self.result.index_syncs = 1;
+                            self.stage = .complete;
+                            self.releasePublication();
+                        }
+                    },
+                }
+            }
+        }
+
+        fn fail(self: *Self, cause: anyerror) anyerror {
+            // Called only after admitted observation of physical completion or
+            // admitted validation. A terminal error cannot replay a phase.
+            self.retirePending();
+            self.failure = cause;
+            self.stage = .failed;
+            self.releasePublication();
+            return cause;
+        }
+
+        fn retirePending(self: *Self) void {
+            switch (self.pending) {
+                .read => |*read| read.deinit(),
+                .sync => |*sync| sync.deinit(),
+                .none => {},
+            }
+            self.pending = .none;
+        }
+
+        fn releasePublication(self: *Self) void {
+            if (self.publication) |*publication| publication.release();
+            self.publication = null;
+        }
+
+        /// Mandatory quiesced retirement, never automatic cleanup after a
+        /// rejected wait. Accepted physical work finishes before publication
+        /// is released; the idle worker and descriptor are retired last.
+        pub fn deinit(self: *Self) void {
+            self.retirePending();
+            self.releasePublication();
+            if (self.resources) |*resources| resources.deinit();
+            self.* = undefined;
+        }
+    };
+}
+
 pub fn replayIntoMutable(
     storage: storage_io.Storage,
     allocator: Allocator,
@@ -2606,5 +2752,239 @@ test "WAL allocator owner replay scratch preserves the physical root across ABI 
         scratch.free(bytes);
         try std.testing.expectError(error.OutOfMemory, scratch.alloc(u8, 2 * 1024 * 1024));
         try std.testing.expectEqual(@as(u64, 0), budget.liveBytesThreadSafe());
+    }
+}
+
+const ControlledSyncPublication = struct {
+    held: *bool,
+    releases: *usize,
+    pub fn release(self: *@This()) void {
+        std.debug.assert(self.held.*);
+        self.held.* = false;
+        self.releases.* += 1;
+    }
+};
+
+test "controlled physical sync WAL coordinator retains each accepted phase across original failures" {
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi or builtin.os.tag == .freestanding) return error.SkipZigTest;
+    const cpu = @import("../../common/runnable_scheduler.zig");
+    const admission = @import("../../common/read_admission.zig");
+    const now = platform.time.monotonicNs;
+    const Operation = CurrentStateSync(ControlledSyncPublication);
+    const Mode = enum { begin_failure, end_failure, lifetime_failure };
+    const Target = @FieldType(Operation, "stage");
+    for ([_]Target{ .current, .segment, .index }) |target| for (std.enums.values(Mode)) |mode| {
+        const a = std.testing.allocator;
+        var backing = std.testing.FailingAllocator.init(a, .{});
+        var pool = storage_io.NativeStoragePool.initWithCapacityForTest(a, 16);
+        defer pool.deinit();
+        var native = try storage_io.NativeStorage.initWithPool(backing.allocator(), .threaded, &pool);
+        var native_live = true;
+        defer if (native_live) native.deinit();
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+        defer a.free(root);
+        const directory = try walDirPathAlloc(a, root);
+        defer a.free(directory);
+        try native.storage().createDirPath(directory);
+        try writeCurrentSegment(native.storage(), a, root, 7, 5);
+        const segment = try segmentPathAlloc(a, root, 7);
+        defer a.free(segment);
+        const index_path = try indexPathAlloc(a, root);
+        defer a.free(index_path);
+        try native.storage().writeFileAbsolute(segment, "state");
+        var slots = try cpu.Scheduler.init(.{ .slots = 3, .control_slots = 1, .cleanup_slots = 1 });
+        defer slots.close();
+        var execution: cpu.Execution = .{};
+        defer execution.finish();
+        try execution.start(&slots, .{ .io = std.testing.io, .native_now_ns = now, .allow_wait = true, .deadline_ns = now() + 10 * std.time.ns_per_s }, .query);
+        var health: cpu.Execution = .{};
+        defer health.finish();
+        try health.start(&slots, .{ .io = std.testing.io, .native_now_ns = now }, .control);
+        var operation = try Operation.prepare(root);
+        var held = true;
+        var releases: usize = 0;
+        const Control = struct {
+            operation: *Operation,
+            execution: *cpu.Execution,
+            slots: *cpu.Scheduler,
+            target: Target,
+            mode: ?Mode,
+            previous: ?Target = null,
+            triggered: bool = false,
+            fn lifetime(raw: *anyopaque) !void {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                try self.execution.checkLifetime();
+                if (self.triggered and self.mode == .lifetime_failure) return error.DeadlineExceeded;
+            }
+            fn checkpoint(raw: *anyopaque) !void {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                try lifetime(raw);
+                if (self.slots.state(&self.execution.entry.?) != .running) return error.InvalidRunnableTransition;
+                if (self.previous != self.operation.stage) {
+                    self.previous = self.operation.stage;
+                    storage_io.NativeSyncTestControl.release.store(false, .release);
+                }
+            }
+            fn deadline(raw: *anyopaque) !?u64 {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                return self.execution.entry.?.options.deadline_ns;
+            }
+            fn begin(raw: *anyopaque) !void {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                if (self.operation.stage == self.target and self.mode != null) {
+                    self.triggered = true;
+                    if (self.mode == .begin_failure) return error.FileNotFound;
+                }
+                try self.execution.park(.resource_blocked);
+                if (!(self.triggered and self.mode == .lifetime_failure))
+                    storage_io.NativeSyncTestControl.release.store(true, .release);
+            }
+            fn end(raw: *anyopaque) !void {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                storage_io.NativeSyncTestControl.release.store(true, .release);
+                if (self.triggered and self.mode == .end_failure) return error.Canceled;
+                try self.execution.enter(.query);
+            }
+        };
+        var control: Control = .{ .operation = &operation, .execution = &execution, .slots = &slots, .target = target, .mode = mode };
+        const payload: admission.Payload = .{ .ptr = &control, .vtable = &.{ .checkpoint = Control.checkpoint, .check_lifetime = Control.lifetime, .deadline_ns = Control.deadline }, .execution_wait = .{ .ptr = &control, .begin = Control.begin, .end = Control.end } };
+        const original = admission.Port.init(&payload);
+        storage_io.NativeSyncTestControl.pause.store(true, .release);
+        storage_io.NativeSyncTestControl.release.store(false, .release);
+        storage_io.NativeSyncTestControl.reads.store(0, .release);
+        storage_io.NativeSyncTestControl.calls.store(0, .release);
+        defer {
+            storage_io.NativeSyncTestControl.release.store(true, .release);
+            storage_io.NativeSyncTestControl.pause.store(false, .release);
+        }
+        var resources = (try native.storage().tryPrepareDurabilityWithAdmission(original)) orelse return error.TestUnexpectedResult;
+        operation.start(resources, .{ .held = &held, .releases = &releases }, original) catch |cause| {
+            resources.deinit();
+            return cause;
+        };
+        defer {
+            storage_io.NativeSyncTestControl.release.store(true, .release);
+            execution.finish();
+            operation.deinit();
+        }
+        native.state.threaded.concurrent_limit = .nothing;
+        backing.fail_index = backing.alloc_index;
+        backing.resize_fail_index = backing.resize_index;
+        const alloc_index = backing.alloc_index;
+        const resize_index = backing.resize_index;
+        var reserved: usize = 0;
+        while (pool.tryReserveDescriptorsForTest(std.testing.io, 1)) reserved += 1;
+        defer pool.releaseDescriptorsForTest(std.testing.io, reserved);
+        native.deinit();
+        native_live = false;
+        try std.testing.expectError(switch (mode) {
+            .begin_failure => error.FileNotFound,
+            .end_failure => error.Canceled,
+            .lifetime_failure => error.DeadlineExceeded,
+        }, operation.waitWithAdmission(original));
+        try std.testing.expect(control.triggered);
+        try std.testing.expectEqual(target, operation.stage);
+        try std.testing.expect(held);
+        try std.testing.expectEqual(@as(usize, 0), releases);
+        if (mode == .end_failure) try execution.enter(.query);
+        control.mode = null;
+        storage_io.NativeSyncTestControl.release.store(true, .release);
+        const result = try operation.waitWithAdmission(original);
+        try std.testing.expectEqual(@as(u64, 1), result.segment_syncs);
+        try std.testing.expectEqual(@as(u64, 1), result.index_syncs);
+        try std.testing.expect(!held);
+        try std.testing.expectEqual(@as(usize, 1), releases);
+        _ = try operation.waitWithAdmission(original);
+        try std.testing.expectEqual(@as(usize, 1), storage_io.NativeSyncTestControl.reads.load(.acquire));
+        try std.testing.expectEqual(@as(usize, 2), storage_io.NativeSyncTestControl.calls.load(.acquire));
+        try std.testing.expectEqual(std.hash.Wyhash.hash(0, segment), storage_io.NativeSyncTestControl.sync_path_hashes[0].load(.acquire));
+        try std.testing.expectEqual(std.hash.Wyhash.hash(0, index_path), storage_io.NativeSyncTestControl.sync_path_hashes[1].load(.acquire));
+        try std.testing.expectEqual(alloc_index, backing.alloc_index);
+        try std.testing.expectEqual(resize_index, backing.resize_index);
+        try std.testing.expectEqual(cpu.State.running, slots.state(&health.entry.?));
+    };
+}
+
+test "controlled physical sync WAL coordinator rejects corrupt metadata and never creates a missing segment" {
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi or builtin.os.tag == .freestanding) return error.SkipZigTest;
+    const admission = @import("../../common/read_admission.zig");
+    const Operation = CurrentStateSync(ControlledSyncPublication);
+    const Case = enum { absent, oversized, checksum, zero_segment, missing_segment, valid };
+    const Control = struct {
+        fn check(_: *anyopaque) !void {}
+        fn deadline(_: *anyopaque) !?u64 {
+            return std.math.maxInt(u64);
+        }
+        fn begin(_: *anyopaque) !void {}
+        fn end(_: *anyopaque) !void {}
+    };
+    var marker: u8 = 0;
+    const payload: admission.Payload = .{ .ptr = &marker, .vtable = &.{ .checkpoint = Control.check, .check_lifetime = Control.check, .deadline_ns = Control.deadline }, .execution_wait = .{ .ptr = &marker, .begin = Control.begin, .end = Control.end } };
+    const original = admission.Port.init(&payload);
+    for (std.enums.values(Case)) |case| {
+        const a = std.testing.allocator;
+        var native = try storage_io.NativeStorage.init(a, .threaded);
+        defer native.deinit();
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+        defer a.free(root);
+        const directory = try walDirPathAlloc(a, root);
+        defer a.free(directory);
+        try native.storage().createDirPath(directory);
+        const index = try indexPathAlloc(a, root);
+        defer a.free(index);
+        const segment = try segmentPathAlloc(a, root, 7);
+        defer a.free(segment);
+        switch (case) {
+            .absent => {},
+            .oversized => {
+                const bytes: [8192]u8 = @splat(0);
+                try native.storage().writeFileAbsolute(index, &bytes);
+            },
+            .checksum => {
+                var bytes: [control_pair_len]u8 = undefined;
+                const pair: [16]u8 = @splat(0);
+                encodeControl(&bytes, .current_segment, &pair);
+                bytes[bytes.len - 1] ^= 1;
+                try native.storage().writeFileAbsolute(index, &bytes);
+            },
+            .zero_segment => try writeCurrentSegment(native.storage(), a, root, 0, 0),
+            .missing_segment => try writeCurrentSegment(native.storage(), a, root, 7, 5),
+            .valid => {
+                try writeCurrentSegment(native.storage(), a, root, 7, 5);
+                try native.storage().writeFileAbsolute(segment, "state");
+            },
+        }
+        var held = true;
+        var releases: usize = 0;
+        var operation = try Operation.prepare(root);
+        var resources = (try native.storage().tryPrepareDurabilityWithAdmission(original)) orelse return error.TestUnexpectedResult;
+        operation.start(resources, .{ .held = &held, .releases = &releases }, original) catch |cause| {
+            resources.deinit();
+            return cause;
+        };
+        defer operation.deinit();
+        storage_io.NativeSyncTestControl.reads.store(0, .release);
+        storage_io.NativeSyncTestControl.calls.store(0, .release);
+        // Only sync counters are asserted: the initial read may already run
+        // by the time the caller resets its observation counters.
+        const result = operation.waitWithAdmission(original);
+        if (case == .absent or case == .valid) {
+            const stats = try result;
+            try std.testing.expectEqual(@as(u64, @intFromBool(case == .valid)), stats.segment_syncs);
+            try std.testing.expectEqual(stats.segment_syncs, stats.index_syncs);
+            _ = try operation.waitWithAdmission(original);
+        } else {
+            const expected: anyerror = if (case == .missing_segment) error.FileNotFound else error.CorruptLsmWalIndex;
+            try std.testing.expectError(expected, result);
+            try std.testing.expectError(expected, operation.waitWithAdmission(original));
+            try std.testing.expectError(error.FileNotFound, native.storage().fileSize(segment));
+        }
+        try std.testing.expect(!held);
+        try std.testing.expectEqual(@as(usize, 1), releases);
+        try std.testing.expectEqual(@as(usize, if (case == .valid) 2 else if (case == .missing_segment) 1 else 0), storage_io.NativeSyncTestControl.calls.load(.acquire));
     }
 }

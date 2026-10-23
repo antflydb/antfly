@@ -2097,7 +2097,7 @@ pub const Backend = struct {
         process_lock_mode: ?storage_io.NativePathLockMode = null,
         native_locked: bool = false,
 
-        fn release(self: *WalOperationLock) void {
+        pub fn release(self: *WalOperationLock) void {
             if (self.native_locked) {
                 self.backend.wal_operation_lock_file.?.unlock();
                 self.native_locked = false;
@@ -2137,6 +2137,10 @@ pub const Backend = struct {
     }
 
     fn tryAcquireWalOperationLock(self: *Backend, mode: storage_io.NativePathLockMode) !?WalOperationLock {
+        return self.tryAcquireWalOperationLockImpl(mode, true);
+    }
+
+    fn tryAcquireWalOperationLockImpl(self: *Backend, mode: storage_io.NativePathLockMode, prepare_if_missing: bool) !?WalOperationLock {
         var guard = WalOperationLock{ .backend = self };
         if (!self.options.wal_enabled or self.root_dir == null) return guard;
 
@@ -2151,7 +2155,10 @@ pub const Backend = struct {
         errdefer guard.release();
 
         if (self.storage.?.supportsNativePathLocks()) {
-            if (self.wal_operation_lock_file == null) try self.prepareWalOperationLockFile();
+            if (self.wal_operation_lock_file == null) {
+                if (!prepare_if_missing) return error.ExecutionWaitUnsupported;
+                try self.prepareWalOperationLockFile();
+            }
             if (self.wal_operation_lock_file) |*lock_file| {
                 if (!try lock_file.tryLock(mode)) {
                     guard.release();
@@ -2161,6 +2168,47 @@ pub const Backend = struct {
             }
         }
         return guard;
+    }
+
+    pub const QuiescedWalSync = wal_mod.CurrentStateSync(WalOperationLock);
+
+    /// The caller has fenced this backend's writers/maintenance and retains
+    /// the backend through operation retirement. No backend mutex is held
+    /// while publication or physical I/O is awaited. Legacy acquirers must
+    /// not occupy every CPU slot needed for this cleanup execution's reentry.
+    pub fn tryBeginQuiescedWalSyncWithAdmission(self: *Backend, original: read_admission.Port) !?QuiescedWalSync {
+        try original.checkpoint();
+        if (!self.options.wal_enabled or self.root_dir == null or self.storage == null) return error.ExecutionWaitUnsupported;
+        // Opening lock files or installing root state here would introduce
+        // hidden descriptor/metadata acquisition into compound publication.
+        if (!self.storage.?.supportsNativePathLocks() or self.root_lock_state == null or self.wal_operation_lock_file == null)
+            return error.ExecutionWaitUnsupported;
+        var operation = try QuiescedWalSync.prepare(self.root_dir.?);
+        var resources = (try self.storage.?.tryPrepareDurabilityWithAdmission(original)) orelse return null;
+        var publication = (self.tryAcquireWalOperationLockImpl(.exclusive, false) catch |cause| {
+            resources.deinit();
+            return cause;
+        }) orelse {
+            // The publication holder may need this descriptor. Never wait
+            // for publication while retaining even an idle tentative grant.
+            resources.deinit();
+            return null;
+        };
+        operation.start(resources, publication, original) catch |cause| {
+            publication.release();
+            resources.deinit();
+            return cause;
+        };
+        return operation;
+    }
+
+    pub fn beginQuiescedWalSyncWithAdmission(self: *Backend, io: std.Io, original: read_admission.Port) !QuiescedWalSync {
+        while (true) {
+            if (try self.tryBeginQuiescedWalSyncWithAdmission(original)) |operation| return operation;
+            // Both publication and tentative completion resources are gone
+            // before relinquishing CPU and waiting under the original scope.
+            try @import("../common/cleanup_wait.zig").waitForRetry(io, original);
+        }
     }
 
     fn resolveBackgroundExecutor(configured: ?*const BackgroundExecutor) BackgroundExecutor {
@@ -29044,4 +29092,227 @@ test "LSM streaming block leased reads lend only original runnable ownership and
         try std.testing.expectEqual(@as(usize, 0), scheduler.stats().operations);
         try std.testing.expectEqual(@as(u64, 0), scheduler.stats().retained_bytes);
     }
+}
+
+test "controlled physical sync WAL compound acquisition drops tentative resources before publication waits" {
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi or builtin.os.tag == .freestanding) return error.SkipZigTest;
+    const admission = @import("../common/read_admission.zig");
+    const cpu = @import("../common/runnable_scheduler.zig");
+    const now = platform.time.monotonicNs;
+    const Mode = enum { success, begin_failure, end_failure, lifetime_failure };
+    for (std.enums.values(Mode)) |mode| {
+        const a = std.testing.allocator;
+        var pool = storage_io.NativeStoragePool.initWithCapacityForTest(a, 32);
+        defer pool.deinit();
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+        defer a.free(root);
+        var backend = try Backend.open(a, root, .{ .native_storage_pool = &pool, .flush_threshold = 1024 * 1024 });
+        defer backend.close();
+        {
+            var store = try backend.runtimeStore(a, .{ .name = "docs" });
+            defer store.deinit();
+            var write = try store.beginWrite();
+            errdefer write.abort();
+            try write.put("doc", "state");
+            try write.commit();
+        }
+        var slots = try cpu.Scheduler.init(.{ .slots = 3, .control_slots = 1, .cleanup_slots = 1 });
+        defer slots.close();
+        var cleanup: cpu.Execution = .{};
+        defer cleanup.finish();
+        try cleanup.reserveCleanupRoot(&slots, .{ .io = std.testing.io, .native_now_ns = now, .allow_wait = true }, 10 * std.time.ns_per_s);
+        try cleanup.activateCleanup();
+        // A legacy query retains the sole ordinary slot while cleanup must
+        // still relinquish and reenter its protected execution capacity.
+        var query: cpu.Execution = .{};
+        defer query.finish();
+        try query.start(&slots, .{ .io = std.testing.io, .native_now_ns = now }, .query);
+        var publication = try backend.acquireWalOperationLock(.exclusive);
+        var publication_live = true;
+        defer if (publication_live) publication.release();
+        var reserved: usize = 0;
+        while (pool.tryReserveDescriptorsForTest(std.testing.io, 1)) reserved += 1;
+        defer pool.releaseDescriptorsForTest(std.testing.io, reserved);
+        try std.testing.expect(reserved != 0);
+        pool.releaseDescriptorsForTest(std.testing.io, 1);
+        reserved -= 1; // Leave exactly one completion descriptor available.
+        const expected_fds = pool.snapshotStats().fd_admitted_descriptors;
+        const Control = struct {
+            cleanup: *cpu.Execution,
+            slots: *cpu.Scheduler,
+            pool: *storage_io.NativeStoragePool,
+            publication: *Backend.WalOperationLock,
+            publication_live: *bool,
+            reserved: *usize,
+            expected_fds: usize,
+            mode: Mode,
+            begins: usize = 0,
+            fn lifetime(raw: *anyopaque) !void {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                try self.cleanup.checkLifetime();
+                if (self.begins != 0 and self.mode == .lifetime_failure) return error.DeadlineExceeded;
+            }
+            fn checkpoint(raw: *anyopaque) !void {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                try lifetime(raw);
+                if (self.slots.state(&self.cleanup.entry.?) != .running) return error.InvalidRunnableTransition;
+            }
+            fn deadline(raw: *anyopaque) !?u64 {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                return self.cleanup.entry.?.options.deadline_ns;
+            }
+            fn begin(raw: *anyopaque) !void {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                self.begins += 1;
+                if (self.publication_live.*) {
+                    // There is no tentative grant left when CPU is parked:
+                    // the publication holder can still acquire the last FD.
+                    try std.testing.expectEqual(self.expected_fds, self.pool.snapshotStats().fd_admitted_descriptors);
+                    try std.testing.expect(self.pool.tryReserveDescriptorsForTest(std.testing.io, 1));
+                    self.pool.releaseDescriptorsForTest(std.testing.io, 1);
+                    if (self.mode == .begin_failure) return error.FileNotFound;
+                }
+                try self.cleanup.park(.resource_blocked);
+                if (self.publication_live.*) {
+                    self.publication.release();
+                    self.publication_live.* = false;
+                    self.pool.releaseDescriptorsForTest(std.testing.io, self.reserved.*);
+                    self.reserved.* = 0;
+                }
+            }
+            fn end(raw: *anyopaque) !void {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                if (self.mode == .end_failure) return error.Canceled;
+                try self.cleanup.enter(.write);
+            }
+        };
+        var control: Control = .{ .cleanup = &cleanup, .slots = &slots, .pool = &pool, .publication = &publication, .publication_live = &publication_live, .reserved = &reserved, .expected_fds = expected_fds, .mode = mode };
+        const payload: admission.Payload = .{ .ptr = &control, .vtable = &.{ .checkpoint = Control.checkpoint, .check_lifetime = Control.lifetime, .deadline_ns = Control.deadline }, .execution_wait = .{ .ptr = &control, .begin = Control.begin, .end = Control.end } };
+        const original = admission.Port.init(&payload);
+        try std.testing.expect(try backend.tryBeginQuiescedWalSyncWithAdmission(original) == null);
+        try std.testing.expectEqual(expected_fds, pool.snapshotStats().fd_admitted_descriptors);
+        const first = backend.beginQuiescedWalSyncWithAdmission(std.testing.io, original);
+        var operation: Backend.QuiescedWalSync = undefined;
+        if (mode == .success) operation = try first else {
+            try std.testing.expectError(switch (mode) {
+                .begin_failure => error.FileNotFound,
+                .end_failure => error.Canceled,
+                .lifetime_failure => error.DeadlineExceeded,
+                .success => unreachable,
+            }, first);
+            if (mode == .end_failure) try cleanup.enter(.write);
+            control.mode = .success;
+            operation = try backend.beginQuiescedWalSyncWithAdmission(std.testing.io, original);
+        }
+        defer {
+            cleanup.finish();
+            operation.deinit();
+        }
+        try std.testing.expect(try backend.tryAcquireWalOperationLock(.shared) == null);
+        control.mode = .lifetime_failure;
+        try std.testing.expectError(error.DeadlineExceeded, operation.waitWithAdmission(original));
+        // Accepted CURRENT work retains both actual publication guards even
+        // when the original scope rejects before observing its completion.
+        try std.testing.expect(try backend.tryAcquireWalOperationLock(.shared) == null);
+        control.mode = .success;
+        const result = try operation.waitWithAdmission(original);
+        try std.testing.expectEqual(@as(u64, 1), result.segment_syncs);
+        try std.testing.expectEqual(@as(u64, 1), result.index_syncs);
+        try std.testing.expect(!publication_live);
+        try std.testing.expectEqual(cpu.State.running, slots.state(&query.entry.?));
+        try std.testing.expect(control.begins != 0);
+        // Completion released both real publication locks, before the grant's
+        // explicit retirement; no backend metadata lock was retained either.
+        var acquired = (try backend.tryAcquireWalOperationLock(.shared)) orelse return error.TestUnexpectedResult;
+        acquired.release();
+        try std.testing.expect(backend.mu.tryLock());
+        backend.mu.unlock();
+        backend.closeWalOperationLockFile();
+        const without_prepared_file = pool.snapshotStats().fd_admitted_descriptors;
+        try std.testing.expectError(error.ExecutionWaitUnsupported, backend.tryBeginQuiescedWalSyncWithAdmission(original));
+        try std.testing.expect(backend.wal_operation_lock_file == null);
+        try std.testing.expectEqual(without_prepared_file, pool.snapshotStats().fd_admitted_descriptors);
+        try backend.prepareWalOperationLockFile();
+    }
+}
+
+test "controlled physical sync WAL retirement keeps peer publication blocked until accepted I/O finishes" {
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi or builtin.os.tag == .freestanding) return error.SkipZigTest;
+    const admission = @import("../common/read_admission.zig");
+    const a = std.testing.allocator;
+    var pool = storage_io.NativeStoragePool.initWithCapacityForTest(a, 32);
+    defer pool.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer a.free(root);
+    var backend = try Backend.open(a, root, .{ .native_storage_pool = &pool });
+    defer backend.close();
+    var peer = try Backend.open(a, root, .{ .native_storage_pool = &pool, .backend = .{ .read_only = true, .create_if_missing = false } });
+    defer peer.close();
+    const Control = struct {
+        fn check(_: *anyopaque) !void {}
+        fn deadline(_: *anyopaque) !?u64 {
+            return std.math.maxInt(u64);
+        }
+        fn begin(_: *anyopaque) !void {}
+        fn end(_: *anyopaque) !void {}
+    };
+    var marker: u8 = 0;
+    const payload: admission.Payload = .{ .ptr = &marker, .vtable = &.{ .checkpoint = Control.check, .check_lifetime = Control.check, .deadline_ns = Control.deadline }, .execution_wait = .{ .ptr = &marker, .begin = Control.begin, .end = Control.end } };
+    const original = admission.Port.init(&payload);
+    const before = pool.snapshotStats().fd_admitted_descriptors;
+    storage_io.NativeSyncTestControl.pause.store(true, .release);
+    storage_io.NativeSyncTestControl.started.store(false, .release);
+    storage_io.NativeSyncTestControl.release.store(false, .release);
+    storage_io.NativeSyncTestControl.reads.store(0, .release);
+    storage_io.NativeSyncTestControl.calls.store(0, .release);
+    defer {
+        storage_io.NativeSyncTestControl.release.store(true, .release);
+        storage_io.NativeSyncTestControl.pause.store(false, .release);
+    }
+    var operation = try backend.beginQuiescedWalSyncWithAdmission(std.testing.io, original);
+    var transferred = false;
+    defer if (!transferred) {
+        storage_io.NativeSyncTestControl.release.store(true, .release);
+        operation.deinit();
+    };
+    const until = platform.time.monotonicNs() + 5 * std.time.ns_per_s;
+    while (!storage_io.NativeSyncTestControl.started.load(.acquire)) {
+        if (platform.time.monotonicNs() >= until) return error.TestUnexpectedResult;
+        try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+    }
+    const Join = struct {
+        operation: *Backend.QuiescedWalSync,
+        joining: std.Io.Event = .unset,
+        retired: std.atomic.Value(bool) = .init(false),
+        fn run(self: *@This()) void {
+            self.joining.set(std.testing.io);
+            self.operation.deinit();
+            self.retired.store(true, .release);
+        }
+    };
+    var join: Join = .{ .operation = &operation };
+    var thread = try std.testing.io.concurrent(Join.run, .{&join});
+    transferred = true;
+    defer {
+        storage_io.NativeSyncTestControl.release.store(true, .release);
+        thread.await(std.testing.io);
+    }
+    try join.joining.waitTimeout(std.testing.io, .{ .duration = .{ .raw = .fromSeconds(5), .clock = .awake } });
+    try std.testing.expect(!join.retired.load(.acquire));
+    try std.testing.expect(try peer.tryAcquireWalOperationLock(.shared) == null);
+    try std.testing.expect(backend.mu.tryLock());
+    backend.mu.unlock();
+    try std.testing.expectEqual(@as(usize, 0), storage_io.NativeSyncTestControl.reads.load(.acquire));
+    storage_io.NativeSyncTestControl.release.store(true, .release);
+    thread.await(std.testing.io);
+    try std.testing.expect(join.retired.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 1), storage_io.NativeSyncTestControl.reads.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 0), storage_io.NativeSyncTestControl.calls.load(.acquire));
+    try std.testing.expectEqual(before, pool.snapshotStats().fd_admitted_descriptors);
+    var acquired = (try peer.tryAcquireWalOperationLock(.shared)) orelse return error.TestUnexpectedResult;
+    acquired.release();
 }

@@ -2439,6 +2439,11 @@ pub const NativeStoragePool = struct {
         self.fd_cache.signalAdmissionChanged(io);
     }
 
+    pub fn tryReserveDescriptorsForTest(self: *NativeStoragePool, io: std.Io, count: usize) bool {
+        if (!builtin.is_test) unreachable;
+        return self.fd_cache.tryReserveDescriptors(io, count);
+    }
+
     pub fn reserveDescriptorsForTest(self: *NativeStoragePool, io: std.Io, count: usize) !void {
         if (!builtin.is_test) unreachable;
         try self.fd_cache.reserveDescriptors(io, count);
@@ -2950,6 +2955,15 @@ pub const NativeSyncTestControl = struct {
     pub var release: std.atomic.Value(bool) = .init(false);
     pub var calls: std.atomic.Value(usize) = .init(0);
     pub var reads: std.atomic.Value(usize) = .init(0);
+    pub var sync_path_hashes: [2]std.atomic.Value(u64) = .{ .init(0), .init(0) };
+    fn observe(read: bool, path: []const u8) void {
+        if (read) {
+            _ = reads.fetchAdd(1, .release);
+        } else {
+            const index = calls.fetchAdd(1, .release);
+            if (index < sync_path_hashes.len) sync_path_hashes[index].store(std.hash.Wyhash.hash(0, path), .release);
+        }
+    }
 };
 
 const NativePhysicalOperation = if (!supports_native_storage or builtin.os.tag == .freestanding) struct {} else struct {
@@ -3012,9 +3026,7 @@ const NativePhysicalOperation = if (!supports_native_storage or builtin.os.tag =
             while (!NativeSyncTestControl.release.load(.acquire))
                 self.permit.io.sleep(.fromMilliseconds(1), .awake) catch {};
         }
-        if (builtin.is_test) {
-            if (self.kind == .control_read) _ = NativeSyncTestControl.reads.fetchAdd(1, .release) else _ = NativeSyncTestControl.calls.fetchAdd(1, .release);
-        }
+        if (builtin.is_test) NativeSyncTestControl.observe(self.kind == .control_read, self.path);
         // This worker only opens, reads/syncs and closes the prepared path.
         // It performs no WAL decoding, flush, manifest work or admission call.
         const result = switch (self.kind) {
@@ -3181,10 +3193,8 @@ const NativeDurabilityResources = if (!supports_native_storage or builtin.os.tag
                 while (!NativeSyncTestControl.release.load(.acquire))
                     io.sleep(.fromMilliseconds(1), .awake) catch {};
             }
-            if (builtin.is_test) {
-                if (self.kind == .control_read) _ = NativeSyncTestControl.reads.fetchAdd(1, .release) else _ = NativeSyncTestControl.calls.fetchAdd(1, .release);
-            }
             const path = self.path[0..self.path_len];
+            if (builtin.is_test) NativeSyncTestControl.observe(self.kind == .control_read, path);
             const result = switch (self.kind) {
                 .contents => fs_paths.syncFilePortable(io, path),
                 .directory => fs_paths.syncDirPortable(io, path),
