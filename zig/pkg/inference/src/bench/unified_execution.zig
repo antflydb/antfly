@@ -20,7 +20,12 @@ const inference = @import("inference_internal");
 const Tensor = inference.backends.Tensor;
 const backend_choice = inference.native_backend_choice;
 
+const Primitive = enum { norm_backward };
+
 const Options = struct {
+    primitive: ?Primitive = null,
+    rows: usize = 17,
+    dim: usize = 768,
     model_dir: []const u8 = "",
     backend: backend_choice.Choice = .native,
     batch: usize = 1,
@@ -41,7 +46,14 @@ pub fn main(init: std.process.Init) !void {
     var options = Options{};
     while (args.next()) |arg| {
         const value = args.next() orelse return error.MissingArgument;
-        if (std.mem.eql(u8, arg, "--model-dir")) options.model_dir = value else if (std.mem.eql(u8, arg, "--backend")) options.backend = backend_choice.parse(value) orelse return error.InvalidBackend else if (std.mem.eql(u8, arg, "--batch")) options.batch = try std.fmt.parseInt(usize, value, 10) else if (std.mem.eql(u8, arg, "--seq-len")) options.seq_len = try std.fmt.parseInt(usize, value, 10) else if (std.mem.eql(u8, arg, "--warmup-iters")) options.warmup = try std.fmt.parseInt(usize, value, 10) else if (std.mem.eql(u8, arg, "--measure-iters")) options.iterations = try std.fmt.parseInt(usize, value, 10) else if (std.mem.eql(u8, arg, "--output")) options.output = value else if (std.mem.eql(u8, arg, "--diagnostics")) options.diagnostics = if (std.mem.eql(u8, value, "true")) true else if (std.mem.eql(u8, value, "false")) false else return error.InvalidArgument else if (std.mem.eql(u8, arg, "--decoder-steps")) options.decoder_steps = try std.fmt.parseInt(usize, value, 10) else if (std.mem.eql(u8, arg, "--soak-seconds")) options.soak_seconds = try std.fmt.parseInt(u64, value, 10) else if (std.mem.eql(u8, arg, "--soak-pause-ms")) options.soak_pause_ms = try std.fmt.parseInt(u64, value, 10) else if (std.mem.eql(u8, arg, "--soak-allocator")) options.soak_allocator = std.meta.stringToEnum(@TypeOf(options.soak_allocator), value) orelse return error.InvalidArgument else return error.InvalidArgument;
+        if (std.mem.eql(u8, arg, "--primitive")) options.primitive = std.meta.stringToEnum(Primitive, value) orelse return error.InvalidArgument else if (std.mem.eql(u8, arg, "--rows")) options.rows = try std.fmt.parseInt(usize, value, 10) else if (std.mem.eql(u8, arg, "--dim")) options.dim = try std.fmt.parseInt(usize, value, 10) else if (std.mem.eql(u8, arg, "--model-dir")) options.model_dir = value else if (std.mem.eql(u8, arg, "--backend")) options.backend = backend_choice.parse(value) orelse return error.InvalidBackend else if (std.mem.eql(u8, arg, "--batch")) options.batch = try std.fmt.parseInt(usize, value, 10) else if (std.mem.eql(u8, arg, "--seq-len")) options.seq_len = try std.fmt.parseInt(usize, value, 10) else if (std.mem.eql(u8, arg, "--warmup-iters")) options.warmup = try std.fmt.parseInt(usize, value, 10) else if (std.mem.eql(u8, arg, "--measure-iters")) options.iterations = try std.fmt.parseInt(usize, value, 10) else if (std.mem.eql(u8, arg, "--output")) options.output = value else if (std.mem.eql(u8, arg, "--diagnostics")) options.diagnostics = if (std.mem.eql(u8, value, "true")) true else if (std.mem.eql(u8, value, "false")) false else return error.InvalidArgument else if (std.mem.eql(u8, arg, "--decoder-steps")) options.decoder_steps = try std.fmt.parseInt(usize, value, 10) else if (std.mem.eql(u8, arg, "--soak-seconds")) options.soak_seconds = try std.fmt.parseInt(u64, value, 10) else if (std.mem.eql(u8, arg, "--soak-pause-ms")) options.soak_pause_ms = try std.fmt.parseInt(u64, value, 10) else if (std.mem.eql(u8, arg, "--soak-allocator")) options.soak_allocator = std.meta.stringToEnum(@TypeOf(options.soak_allocator), value) orelse return error.InvalidArgument else return error.InvalidArgument;
+    }
+    if (options.primitive) |primitive| {
+        if (options.backend != .native or options.rows == 0 or options.dim == 0 or options.iterations == 0 or options.soak_seconds != 0) return error.InvalidGeometry;
+        switch (primitive) {
+            .norm_backward => try runNormBackward(init, options),
+        }
+        return;
     }
     if (options.model_dir.len == 0 or options.batch == 0 or options.seq_len < 4 or options.iterations == 0) return error.InvalidGeometry;
     // Keep the timing allocator unchanged; the C backing isolates long-run
@@ -422,4 +434,67 @@ fn runDecoder(init: std.process.Init, model: *inference.server.model_manager.Loa
     const stats = runtime.debugTimingStats();
     std.debug.print("unified_decoder backend={s} prompt={d} decode_steps={d} iterations={d} output_elements={d} checksum={d:.9} p50_ns={d} p95_ns={d} min_ns={d} reset_parity=exact chunked_prefill_tolerance=0.0001\n", .{ @tagName(model.session.backend()), prompt.len, options.decoder_steps, options.iterations, reference.items.len, checksum, samples[samples.len / 2], samples[@min(samples.len - 1, samples.len * 95 / 100)], samples[0] });
     std.debug.print("decoder_kernels prefill_calls={d} decode_greedy_calls={d} prepared_hits={d} runtime_prepared_hits={d}\n", .{ stats.prefill_calls, stats.decode_greedy_calls, stats.ensure_prepared_fast_hits, stats.runtime_prepare_fast_hits });
+}
+
+fn runNormBackward(init: std.process.Init, options: Options) !void {
+    const a = std.heap.smp_allocator;
+    const native = inference.native_compute.native;
+    var store = native.WeightStore{ .allocator = a, .resident_weights = .{}, .lazy_weights = .{} };
+    defer store.deinitOwned();
+    var compute = native.NativeCompute.initWithIo(a, &store, null, init.io);
+    defer compute.deinit();
+    const backend = compute.computeBackend();
+    const count = try std.math.mul(usize, options.rows, options.dim);
+    const x = try a.alloc(f32, count);
+    defer a.free(x);
+    const dy = try a.alloc(f32, count);
+    defer a.free(dy);
+    const gamma = try a.alloc(f32, options.dim);
+    defer a.free(gamma);
+    const beta = try a.alloc(f32, options.dim);
+    defer a.free(beta);
+    @memset(beta, 0);
+    for (x, dy, 0..) |*value, *gradient, i| {
+        value.* = @as(f32, @floatFromInt(@as(i32, @intCast(i % 37)) - 18)) * 0.125;
+        gradient.* = @as(f32, @floatFromInt(@as(i32, @intCast(i % 23)) - 11)) * 0.0625;
+    }
+    for (gamma, 0..) |*value, i| value.* = 0.5 + @as(f32, @floatFromInt(i % 5)) * 0.125;
+    const input = try backend.fromFloat32(x);
+    defer backend.free(input);
+    const upstream = try backend.fromFloat32(dy);
+    defer backend.free(upstream);
+    const weight = try backend.fromFloat32(gamma);
+    defer backend.free(weight);
+    const bias = try backend.fromFloat32(beta);
+    defer backend.free(bias);
+    const samples = try a.alloc(u64, options.iterations);
+    defer a.free(samples);
+    var checksum: f64 = 0;
+    var elements: usize = 0;
+    // Batch tiny invocations so timer granularity cannot dominate allocation
+    // and arithmetic costs. Both revisions use this identical harness.
+    const repeats: u64 = if (count <= 1024) 1024 else 1;
+    for (0..options.warmup + options.iterations) |iteration| {
+        const start = inference.platform.time.awakeNs(init.io);
+        for (0..repeats - 1) |_| {
+            const repeated = (try backend.layerNormBackward(input, weight, bias, upstream, options.dim, 1e-5)) orelse return error.UnsupportedOperation;
+            backend.free(repeated);
+        }
+        const result = (try backend.layerNormBackward(input, weight, bias, upstream, options.dim, 1e-5)) orelse return error.UnsupportedOperation;
+        const elapsed = (inference.platform.time.awakeNs(init.io) - start) / repeats;
+        defer backend.free(result);
+        if (iteration >= options.warmup) samples[iteration - options.warmup] = elapsed;
+        if (iteration + 1 == options.warmup + options.iterations) {
+            const values = try backend.toFloat32(result, a);
+            defer a.free(values);
+            elements = values.len;
+            for (values) |value| {
+                if (!std.math.isFinite(value)) return error.NonFiniteOutput;
+                checksum += value;
+            }
+            if (options.output) |path| try std.Io.Dir.cwd().writeFile(init.io, .{ .sub_path = path, .data = std.mem.sliceAsBytes(values) });
+        }
+    }
+    std.mem.sort(u64, samples, {}, std.sort.asc(u64));
+    std.debug.print("unified_primitive primitive=norm_backward backend=native rows={d} dim={d} iterations={d} output_elements={d} checksum={d:.9} p50_ns={d} p95_ns={d} min_ns={d}\n", .{ options.rows, options.dim, options.iterations, elements, checksum, samples[samples.len / 2], samples[@min(samples.len - 1, samples.len * 95 / 100)], samples[0] });
 }

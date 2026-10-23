@@ -12831,15 +12831,9 @@ fn createTensorWithDTypeAndBf16Mirror(
     elem_count: usize,
     dtype: tensor_mod.DType,
 ) !CT {
-    const tensor = try self.allocator.create(CudaTensor);
-    tensor.* = .{
-        .buffer = device,
-        .bf16_mirror = bf16_mirror,
-        .dtype = dtype,
-        .shape = shape,
-        .elem_count = elem_count,
-    };
-    return tensor;
+    const result = try createTensorWithDType(self, device, shape, elem_count, dtype);
+    tensorFromCt(result).bf16_mirror = bf16_mirror;
+    return result;
 }
 
 fn convertDTypeOp(ctx: *anyopaque, tensor_ct: CT, target: ops.GraphDType) anyerror!?CT {
@@ -27907,4 +27901,28 @@ test "CUDA shared descriptors execute resident operations with strict transfer a
     defer context.deinit(a);
     var cb = context.computeBackend();
     try @import("../testing/assigned_kernel_conformance.zig").run(&cb, true);
+}
+
+test "CUDA owned output construction preserves caller resources on allocation failure" {
+    const Check = struct {
+        fn run(a: std.mem.Allocator) !void {
+            // Construction touches host ownership metadata only. Device buffers
+            // remain caller-owned on failure and are never submitted here.
+            var compute: CudaCompute = undefined;
+            compute.allocator = a;
+            const shape = try a.dupe(i64, &.{ 2, 3 });
+            defer a.free(shape);
+            const device = buffer_mod.DeviceBuffer{ .ptr = 16, .len = 24 };
+            const mirror = buffer_mod.DeviceBuffer{ .ptr = 32, .len = 12 };
+            const result = try createTensorWithDTypeAndBf16Mirror(&compute, device, mirror, shape, 6, .f32);
+            const tensor = tensorFromCt(result);
+            defer a.destroy(tensor);
+            try std.testing.expectEqual(device, tensor.buffer);
+            try std.testing.expectEqual(mirror, tensor.bf16_mirror);
+            try std.testing.expectEqualSlices(i64, &.{ 2, 3 }, tensor.shape);
+            try std.testing.expectEqual(@as(usize, 6), tensor.elem_count);
+            try std.testing.expectEqual(tensor_mod.DType.f32, tensor.dtype);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Check.run, .{});
 }

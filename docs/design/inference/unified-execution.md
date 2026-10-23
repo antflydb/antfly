@@ -1273,6 +1273,65 @@ and AdamW references; nonfinite optimizer cases verify baseline behavior and
 flag publication. Fixtures include empty/tail outputs, both storage policies
 and multiple projection shapes. Receipts: `next-bulk/metal-leaves/`.
 
+### Native schedule audit and final-composition work
+
+N13 shares the matching fixed A4B gate/up and down traversal with compile-time
+input addressing and geometry; both retain exact four-element accumulators.
+All twelve referenced safe/fast cases pass, including invalid expert IDs and
+extra route threadgroups. N31 shares ordinary, paired and head-RMS rotary
+indexing without merging position sources, transcendental evaluation or norm
+reductions; all 28 referenced safe/fast cases pass. N26 replaces 98 repeated
+three-buffer/constant binding blocks with one forced-inline native ABI owner.
+Encoder/resource ownership, slots, offsets and submission counts stay at their
+original callers. Host model qualification is still required for this cohort.
+
+The N14 audit retains the existing prefill schedules. HD256 uses four simdgroups
+and page-local eight-token loads, configurable KC32/KC64 staging and a direct
+full-query-tile store. HD512 uses eight simdgroups, KC64 staging, and serializes
+eight output owners through a shared tail tile with barriers between owners.
+Both already consume the shared parameter-field and page-address owners.
+Their mask and epilogue fragments are coupled to these different schedules;
+another policy/helper layer would duplicate metadata without removing a common
+traversal. The dense compatibility prefill remains a separate barrier schedule.
+
+N22 likewise retains distinct row/channel acquisition and staging. Rows4
+preloads four Q8 frames before the column loop; rows8/c2 loads a frame inside
+the row loop. Their wave counts, scratch extents and output mapping differ.
+Only the identical final quantized-output writer is shared. It explicitly owns
+the zero auxiliary header used by these producers, preserving its distinction
+from raw-sum GGML Q8_1. The protected rows2 and F32 epilogue contexts remain
+separate. The new writer's all-architecture and device qualification is pending.
+
+N24 makes the 362 typed CUDA export fields the loading/clearing registry, with
+63 required exports and explicit native-name/JIT-only exceptions. N27 shares
+thirteen format-specific extent checks. N30 supplies dimensions to eleven named
+CUDA records through the existing `Linear` descriptor, with no new operation
+fields. Actual capture/replay and malformed/empty-input probes pass; integrated
+model gates remain pending.
+
+N28 uses one native transfer owner for eight adapters and delegates CUDA BF16
+mirror construction to the existing typed tensor constructor. Allocation-failure
+probes cover partial construction, shape publication and both normalization
+storage policies. N29 shares backward arithmetic and writes larger packed
+results directly. Measurements reject the single-allocation policy for tiny
+single rows; the faster original storage policy is retained below width 32.
+All five matched-harness shapes pass byte parity and timing across 32 balanced
+arms. P50 ratios are 0.891 (1×8), 0.867 (1×16), 0.632 (1×32), 0.861
+(17×768) and 0.877 (128×2048). Full model/training composition remains pending.
+
+N33 emits one serial attention implementation per complete head/thread/GQA
+schedule identity, retaining every exported split-count entry. Standalone
+artifacts contain the same owner and wrapper. Deterministic-source, export,
+standalone/bundle and renderer checks pass; all 67 generated files and runtime
+regions are fresh. N34 now includes shared contracts, the launch ABI consumer
+and the complete local CUDA header closure in qualification/cache dependencies.
+The transitive-include coverage check and all five artifact-script tests pass.
+
+The expanded native/compiler/renderer selection checks 133 cases: 132 pass,
+with one CUDA-device skip on the Mac. Actual CUDA ABI tests run on the Spark separately.
+Frozen composition qualification, artifact resource review, final models,
+training/lifetime/soak checks and final source accounting are still in progress.
+
 ### Six implementation waves
 
 1. **Ownership and contracts — N01–N04.** Freeze the source/images/executables;

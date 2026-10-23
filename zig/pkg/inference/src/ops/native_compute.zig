@@ -7019,15 +7019,119 @@ fn linearLoRAOp(
     return result;
 }
 
+/// Exactly one cleanup owner before and after tensor construction. Taking a
+/// result consumes raw storage even if handle/shape construction fails.
+const OwnedDenseOutput = struct {
+    compute: *NativeCompute,
+    storage: ?[]f32,
+
+    fn alloc(compute: *NativeCompute, elements: usize) !@This() {
+        return .{ .compute = compute, .storage = try compute.allocator.alloc(f32, elements) };
+    }
+    fn copy(compute: *NativeCompute, source: []const f32) !@This() {
+        return .{ .compute = compute, .storage = try compute.allocator.dupe(f32, source) };
+    }
+    fn deinit(output: *@This()) void {
+        if (output.storage) |storage| output.compute.allocator.free(storage);
+        output.storage = null;
+    }
+    fn intoResult(output: *@This()) !CT {
+        const storage = output.storage.?;
+        output.storage = null;
+        return output.compute.makeOwnedBuf(storage);
+    }
+    fn intoLike(output: *@This(), input: CT) !CT {
+        const result = try output.intoResult();
+        errdefer freeTensor(output.compute, result);
+        return propagateLogicalShapeLike(output.compute, result, input);
+    }
+    fn intoShape(output: *@This(), shape: []const i64) !CT {
+        const result = try output.intoResult();
+        errdefer freeTensor(output.compute, result);
+        return output.compute.withLogicalShape(result, shape);
+    }
+};
+
+test "native owned dense output adapters release every partial allocation" {
+    const Check = struct {
+        fn run(a: std.mem.Allocator) !void {
+            var store = WeightStore{ .allocator = a, .resident_weights = .{}, .lazy_weights = .{} };
+            defer store.deinitOwned();
+            var compute = NativeCompute.init(a, &store, null);
+            defer compute.deinit();
+            var values = [_]f32{ 1, 2, 3, 4, 5, 6, 7, 8 };
+            var weights = [_]f32{ 1, 1, 1, 1 };
+            var zeros = [_]f32{ 0, 0, 0, 0 };
+            var qkv: [24]f32 = @splat(1);
+            const input = try compute.makeBuf(&values, false);
+            defer freeTensor(&compute, input);
+            const gamma = try compute.makeBuf(&weights, false);
+            defer freeTensor(&compute, gamma);
+            const zero = try compute.makeBuf(&zeros, false);
+            defer freeTensor(&compute, zero);
+            const packed_input = try compute.makeBuf(&qkv, false);
+            defer freeTensor(&compute, packed_input);
+            {
+                const result = try ropeTableOp(&compute, input, gamma, zero, 4, 4, false);
+                defer freeTensor(&compute, result);
+                try std.testing.expectEqualSlices(f32, &values, getData(result));
+            }
+            {
+                const result = try qkvRopeTableOp(&compute, packed_input, gamma, zero, 4, 4, false);
+                defer freeTensor(&compute, result);
+                try std.testing.expectEqualSlices(i64, &.{ 6, 4 }, tensorStoredShape(result).?);
+            }
+            {
+                const result = try gegluOp(&compute, input, 4);
+                defer freeTensor(&compute, result);
+            }
+            {
+                const result = try gegluBackwardOp(&compute, input, gamma, 4);
+                defer freeTensor(&compute, result);
+            }
+            {
+                const result = (try clampSiluOp(&compute, input, null, null)).?;
+                defer freeTensor(&compute, result);
+            }
+            {
+                const result = try layerNormOp(&compute, input, gamma, zero, 4, 1e-5);
+                defer freeTensor(&compute, result);
+            }
+            {
+                const result = try rmsNormOp(&compute, input, gamma, 4, 1e-5);
+                defer freeTensor(&compute, result);
+            }
+            {
+                const result = (try rmsNormResidualOp(&compute, input, gamma, input, 4, 1e-5, 1, 1)).?;
+                defer freeTensor(&compute, result);
+            }
+            const single_row = try compute.makeBuf(values[0..4], false);
+            defer freeTensor(&compute, single_row);
+            for ([_]CT{ single_row, input }) |source| {
+                const result = try layerNormBackwardOp(&compute, source, gamma, zero, source, 4, 1e-5);
+                defer freeTensor(&compute, result);
+                try std.testing.expectEqual(getData(source).len + 8, getData(result).len);
+            }
+            // Exercise the extra shape-allocation failure beyond inline storage.
+            var output = try OwnedDenseOutput.alloc(&compute, 1);
+            defer output.deinit();
+            output.storage.?[0] = 1;
+            const result = try output.intoShape(&@as([9]i64, @splat(1)));
+            defer freeTensor(&compute, result);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Check.run, .{});
+}
+
 fn layerNormOp(ctx: *anyopaque, input: CT, gamma: CT, beta: CT, dim: usize, eps: f32) anyerror!CT {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
     defer maybeDiscardMappedWeightAfterUse(self, gamma);
     defer maybeDiscardMappedWeightAfterUse(self, beta);
-    const output = try self.allocator.dupe(f32, getData(input));
+    var owned_output = try OwnedDenseOutput.copy(self, getData(input));
+    defer owned_output.deinit();
+    const output = owned_output.storage.?;
     activations_mod.layerNorm(output, getData(gamma), getData(beta), dim, eps);
-    const result = try self.makeOwnedBuf(output);
-    errdefer freeTensor(self, result);
-    return propagateLogicalShapeLike(self, result, input);
+    return owned_output.intoLike(input);
 }
 
 fn layerNormConsumeInputOp(ctx: *anyopaque, input: CT, gamma: CT, beta: CT, dim: usize, eps: f32) anyerror!?CT {
@@ -7062,16 +7166,36 @@ pub fn debertaLayerNormBackwardHost(
     dim: usize,
     eps: f32,
 ) !LayerNormBackwardGrads {
-    if (dim == 0) return error.InvalidTensorShape;
-    if (input.len < rows * dim or dy.len < rows * dim or gamma.len < dim) return error.InvalidTensorShape;
-    const dx = try allocator.alloc(f32, rows * dim);
+    const count = try validateLayerNormBackward(input, gamma, dy, rows, dim);
+    const dx = try allocator.alloc(f32, count);
     errdefer allocator.free(dx);
     const dgamma = try allocator.alloc(f32, dim);
     errdefer allocator.free(dgamma);
     const dbeta = try allocator.alloc(f32, dim);
     errdefer allocator.free(dbeta);
-    @memset(dgamma, 0.0);
-    @memset(dbeta, 0.0);
+    const result = LayerNormBackwardGrads{ .dx = dx, .dgamma = dgamma, .dbeta = dbeta };
+    try layerNormBackwardInto(true, input, gamma, dy, rows, dim, eps, result.dx, result.dgamma, result.dbeta);
+    return result;
+}
+
+fn validateLayerNormBackward(input: []const f32, gamma: []const f32, dy: []const f32, rows: usize, dim: usize) !usize {
+    if (dim == 0) return error.InvalidTensorShape;
+    const count = rows * dim;
+    if (input.len < count or dy.len < count or gamma.len < dim) return error.InvalidTensorShape;
+    return count;
+}
+
+/// Outputs are disjoint, caller-owned planes. Validation precedes all writes;
+/// the packed backend result can use one allocation without temporary copies.
+fn layerNormBackwardInto(comptime initialize_planes: bool, input: []const f32, gamma: []const f32, dy: []const f32, rows: usize, dim: usize, eps: f32, dx: []f32, dgamma_plane: []f32, dbeta_plane: []f32) !void {
+    const count = try validateLayerNormBackward(input, gamma, dy, rows, dim);
+    if (dx.len < count or dgamma_plane.len < dim or dbeta_plane.len < dim) return error.InvalidTensorShape;
+    const dgamma = dgamma_plane[0..dim];
+    const dbeta = dbeta_plane[0..dim];
+    if (initialize_planes) {
+        @memset(dgamma, 0.0);
+        @memset(dbeta, 0.0);
+    }
 
     const dim_f: f32 = @floatFromInt(dim);
     const inv_dim: f32 = 1.0 / dim_f;
@@ -7109,8 +7233,13 @@ pub fn debertaLayerNormBackwardHost(
             dx[r * dim + i] = inv_std * (g - mean_g - xhat * mean_g_xhat);
         }
     }
+}
 
-    return .{ .dx = dx, .dgamma = dgamma, .dbeta = dbeta };
+/// One contiguous output owner, with the exact same scalar arithmetic leaf.
+/// Known short rows let the CPU compiler unroll without changing reductions.
+inline fn fillPackedLayerNormBackward(packed_grads: []f32, input: []const f32, gamma: []const f32, dy: []const f32, rows: usize, dim: usize, eps: f32) !void {
+    @memset(packed_grads[rows * dim ..], 0.0);
+    try layerNormBackwardInto(false, input, gamma, dy, rows, dim, eps, packed_grads[0 .. rows * dim], packed_grads[rows * dim ..][0..dim], packed_grads[(rows + 1) * dim ..]);
 }
 
 /// `fused_layer_norm_backward` vtable impl. Inputs: input/gamma/beta/dy
@@ -7122,28 +7251,56 @@ fn layerNormBackwardOp(ctx: *anyopaque, input: CT, gamma: CT, beta: CT, dy: CT, 
     const in_data = getData(input);
     if (dim == 0 or in_data.len % dim != 0) return error.InvalidTensorShape;
     const rows = in_data.len / dim;
-    const grads = try debertaLayerNormBackwardHost(self.allocator, in_data, getData(gamma), getData(dy), rows, dim, eps);
-    defer self.allocator.free(grads.dx);
-    defer self.allocator.free(grads.dgamma);
-    defer self.allocator.free(grads.dbeta);
-
+    const in_gamma = getData(gamma);
+    const in_dy = getData(dy);
+    // Below a full short-row tile the original separate allocation classes
+    // are faster. Keep that storage policy while sharing all arithmetic.
+    if (rows == 1 and dim < 32) {
+        const grads = try debertaLayerNormBackwardHost(self.allocator, in_data, in_gamma, in_dy, rows, dim, eps);
+        defer self.allocator.free(grads.dx);
+        defer self.allocator.free(grads.dgamma);
+        defer self.allocator.free(grads.dbeta);
+        const packed_result = try self.allocator.alloc(f32, (rows + 2) * dim);
+        errdefer self.allocator.free(packed_result);
+        @memcpy(packed_result[0 .. rows * dim], grads.dx);
+        @memcpy(packed_result[rows * dim ..][0..dim], grads.dgamma);
+        @memcpy(packed_result[(rows + 1) * dim ..], grads.dbeta);
+        return self.makeBuf(packed_result, true);
+    }
+    _ = try validateLayerNormBackward(in_data, in_gamma, in_dy, rows, dim);
     const packed_grads = try self.allocator.alloc(f32, (rows + 2) * dim);
     errdefer self.allocator.free(packed_grads);
-    @memcpy(packed_grads[0 .. rows * dim], grads.dx[0 .. rows * dim]);
-    @memcpy(packed_grads[rows * dim .. (rows + 1) * dim], grads.dgamma[0..dim]);
-    @memcpy(packed_grads[(rows + 1) * dim .. (rows + 2) * dim], grads.dbeta[0..dim]);
+    const filled = short_row: {
+        inline for (.{32}) |width| {
+            if (rows == 1 and dim == width) {
+                try fillPackedLayerNormBackward(packed_grads, in_data, in_gamma, in_dy, 1, width, eps);
+                break :short_row true;
+            }
+        }
+        break :short_row false;
+    };
+    if (!filled) try fillPackedLayerNormBackward(packed_grads, in_data, in_gamma, in_dy, rows, dim, eps);
     return self.makeBuf(packed_grads, true);
+}
+
+test "native layer norm backward into rejects invalid planes before writes" {
+    const x = [_]f32{ 1, 2, 3, 4, 5, 6 };
+    const gamma = [_]f32{ 1, 1, 1 };
+    var dx: [6]f32 = @splat(9);
+    var dgamma: [3]f32 = @splat(9);
+    var dbeta: [3]f32 = @splat(9);
+    try std.testing.expectError(error.InvalidTensorShape, layerNormBackwardInto(true, &x, &gamma, &x, 2, 3, 1e-5, dx[0..5], &dgamma, &dbeta));
+    for ([_][]const f32{ &dx, &dgamma, &dbeta }) |plane| for (plane) |value| try std.testing.expectEqual(@as(f32, 9), value);
 }
 
 fn ropeTableOp(ctx: *anyopaque, input: CT, cos: CT, sin: CT, width: usize, head_dim: usize, inverse: bool) anyerror!CT {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
     const x = getData(input);
-    const output = try self.allocator.alloc(f32, x.len);
-    errdefer self.allocator.free(output);
+    var owned_output = try OwnedDenseOutput.alloc(self, x.len);
+    defer owned_output.deinit();
+    const output = owned_output.storage.?;
     try ops.rope_table.apply(output, x, getData(cos), getData(sin), width, head_dim, inverse);
-    const result = try self.makeOwnedBuf(output);
-    errdefer freeTensor(self, result);
-    return propagateLogicalShapeLike(self, result, input);
+    return owned_output.intoLike(input);
 }
 
 fn dropoutMaskOp(ctx: *anyopaque, shape: []const i32, probability: f32, seed: u64) anyerror!CT {
@@ -7159,35 +7316,32 @@ fn dropoutMaskOp(ctx: *anyopaque, shape: []const i32, probability: f32, seed: u6
 fn qkvRopeTableOp(ctx: *anyopaque, input: CT, cos: CT, sin: CT, width: usize, head_dim: usize, inverse: bool) anyerror!CT {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
     const x = getData(input);
-    const output = try self.allocator.alloc(f32, x.len);
-    errdefer self.allocator.free(output);
+    var owned_output = try OwnedDenseOutput.alloc(self, x.len);
+    defer owned_output.deinit();
+    const output = owned_output.storage.?;
     try ops.rope_table.applyQkv(output, x, getData(cos), getData(sin), width, head_dim, inverse);
-    const result = try self.makeOwnedBuf(output);
-    errdefer freeTensor(self, result);
     const rows: i64 = @intCast(x.len / (3 * width));
-    return if (inverse) self.withLogicalShape(result, &.{ rows, @intCast(3 * width) }) else self.withLogicalShape(result, &.{ 3 * rows, @intCast(width) });
+    return if (inverse) owned_output.intoShape(&.{ rows, @intCast(3 * width) }) else owned_output.intoShape(&.{ 3 * rows, @intCast(width) });
 }
 
 fn gegluOp(ctx: *anyopaque, input: CT, width: usize) anyerror!CT {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
     const x = getData(input);
-    const output = try self.allocator.alloc(f32, x.len / 2);
-    errdefer self.allocator.free(output);
+    var owned_output = try OwnedDenseOutput.alloc(self, x.len / 2);
+    defer owned_output.deinit();
+    const output = owned_output.storage.?;
     try ops.geglu.forward(output, x, width);
-    const result = try self.makeOwnedBuf(output);
-    errdefer freeTensor(self, result);
-    return self.withLogicalShape(result, &.{ @intCast(x.len / (2 * width)), @intCast(width) });
+    return owned_output.intoShape(&.{ @intCast(x.len / (2 * width)), @intCast(width) });
 }
 
 fn gegluBackwardOp(ctx: *anyopaque, input: CT, dout: CT, width: usize) anyerror!CT {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
     const x = getData(input);
-    const output = try self.allocator.alloc(f32, x.len);
-    errdefer self.allocator.free(output);
+    var owned_output = try OwnedDenseOutput.alloc(self, x.len);
+    defer owned_output.deinit();
+    const output = owned_output.storage.?;
     try ops.geglu.backward(output, x, getData(dout), width);
-    const result = try self.makeOwnedBuf(output);
-    errdefer freeTensor(self, result);
-    return propagateLogicalShapeLike(self, result, input);
+    return owned_output.intoLike(input);
 }
 
 fn packedGeluMultiplyOp(ctx: *anyopaque, input: CT, rows: usize, width: usize) anyerror!?CT {
@@ -35695,30 +35849,30 @@ fn rmsNormResidualOp(ctx: *anyopaque, input: CT, weight: CT, residual: CT, dim: 
     const w = getData(weight);
     const res = getData(residual);
     if (dim == 0 or x.len == 0 or x.len % dim != 0 or w.len != dim or res.len != x.len) return error.InvalidTensorShape;
-    const output = try self.allocator.alloc(f32, x.len);
+    var owned_output = try OwnedDenseOutput.alloc(self, x.len);
+    defer owned_output.deinit();
+    const output = owned_output.storage.?;
     activations_mod.rmsNormResidual(output, x, w, res, dim, eps, norm_scale, output_scale);
-    const result = try self.makeOwnedBuf(output);
-    errdefer freeTensor(self, result);
-    return propagateLogicalShapeLike(self, result, input);
+    return owned_output.intoLike(input);
 }
 
 fn clampSiluOp(ctx: *anyopaque, input: CT, min_value: ?f32, max_value: ?f32) anyerror!?CT {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
-    const output = try self.allocator.alloc(f32, getData(input).len);
+    var owned_output = try OwnedDenseOutput.alloc(self, getData(input).len);
+    defer owned_output.deinit();
+    const output = owned_output.storage.?;
     activations_mod.clampSilu(output, getData(input), min_value, max_value);
-    const result = try self.makeOwnedBuf(output);
-    errdefer freeTensor(self, result);
-    return propagateLogicalShapeLike(self, result, input);
+    return owned_output.intoLike(input);
 }
 
 fn rmsNormOp(ctx: *anyopaque, input: CT, weight: CT, dim: usize, eps: f32) anyerror!CT {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
     defer maybeDiscardMappedWeightAfterUse(self, weight);
-    const output = try self.allocator.dupe(f32, getData(input));
+    var owned_output = try OwnedDenseOutput.copy(self, getData(input));
+    defer owned_output.deinit();
+    const output = owned_output.storage.?;
     activations_mod.rmsNorm(output, getData(weight), dim, eps);
-    const result = try self.makeOwnedBuf(output);
-    errdefer freeTensor(self, result);
-    return propagateLogicalShapeLike(self, result, input);
+    return owned_output.intoLike(input);
 }
 
 fn rmsNormConsumeInputOp(ctx: *anyopaque, input: CT, weight: CT, dim: usize, eps: f32) anyerror!?CT {

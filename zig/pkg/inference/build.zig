@@ -1623,6 +1623,7 @@ pub fn build(b: *std.Build) void {
     unified_execution_bench_exe.root_module.addImport("inference_internal", inference_internal_mod);
     runtime_graph.identities.addImports(unified_execution_bench_exe.root_module);
     unified_execution_bench_exe.root_module.link_libc = true;
+    b.step("build-unified-execution-bench", "Install the reproducible inference acceptance benchmark").dependOn(&b.addInstallArtifact(unified_execution_bench_exe, .{}).step);
     const run_unified_execution_bench = b.addRunArtifact(unified_execution_bench_exe);
     run_unified_execution_bench.addPassthruArgs();
     const unified_execution_bench_step = b.step("bench-unified-execution", "Run pretokenized encoder correctness and performance acceptance workloads");
