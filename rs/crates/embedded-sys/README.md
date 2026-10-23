@@ -35,7 +35,7 @@ cargo build --features libantfly
 ```
 
 The archive's relocatable `lib/pkgconfig/libantfly.pc` also works with Go
-and C build tools. Keep `lib/` and `include/` together. No ELv2 server is
+and C build tools. Keep `lib/` and `include/` together. No database server is
 required. For cross-compilation, point pkg-config at a target installation
 using its target-specific configuration; do not allow it to select host
 libraries. Alternatively set `ANTFLY_LIB_DIR` to a target library directory.

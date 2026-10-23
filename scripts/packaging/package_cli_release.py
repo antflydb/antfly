@@ -283,8 +283,8 @@ def package_python_wheel(
     metadata["Version"] = python_version
     metadata["Summary"] = "Native Antfly CLI installer package"
     metadata["Author-email"] = "Antfly, Inc. <ajroetker@antfly.io>"
-    metadata["License-Expression"] = "Elastic-2.0 AND Apache-2.0"
-    for license_name in ("Elastic-2.0.txt", "Apache-2.0.txt"):
+    metadata["License-Expression"] = "Apache-2.0"
+    for license_name in ("Apache-2.0.txt",):
         metadata["License-File"] = f"LICENSES/{license_name}"
     metadata["Requires-Python"] = project_requires_python(
         repo_root / "py" / "packages" / "cli" / "pyproject.toml"
@@ -313,7 +313,7 @@ def package_python_wheel(
                 ):
                     rel = path.relative_to(extracted)
                     write_file(zf, f"{package_name}/{rel.as_posix()}", path)
-        for license_name in ("Elastic-2.0.txt", "Apache-2.0.txt"):
+        for license_name in ("Apache-2.0.txt",):
             write_file(
                 zf,
                 f"{dist_info}/licenses/LICENSES/{license_name}",

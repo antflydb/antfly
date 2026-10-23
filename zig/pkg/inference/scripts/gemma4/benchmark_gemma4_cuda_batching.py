@@ -532,7 +532,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--antfly-bin",
         type=pathlib.Path,
-        default=repo / "zig/pkg/inference/zig-out/bin/antfly-inference",
+        default=repo / "zig/pkg/inference/zig-out/bin/antfly-inference-dev",
     )
     parser.add_argument(
         "--model",

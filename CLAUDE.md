@@ -11,7 +11,7 @@ Work in a git worktree under `.worktrees/<name>` created from `origin/main`. Kee
 What Antfly is, install options, and features are in `README.md`. Where things live:
 
 - `zig/`: the Antfly server (`zig/pkg/antfly`), storage engine shared with embedded Lite (`zig/pkg/antfly-embedded`), and inference runtime (`zig/pkg/inference`)
-- `go/`: SDK, embedded bindings, operator, proxy, and supporting libraries. Each module in `GO_MODULES` (Makefile) is independent; build it from its own directory with `GOWORK=off GOEXPERIMENT=simd go` (Make targets set this)
+- `go/`: SDK, embedded bindings, and supporting libraries (managed operator/proxy code lives in Colony). Each module in `GO_MODULES` (Makefile) is independent; build it from its own directory with `GOWORK=off GOEXPERIMENT=simd go` (Make targets set this)
 - `ts/`, `py/`, `rs/`: TypeScript packages and apps, Python SDK, Rust SDK
 - `specs/openapi/`: API source of truth; `openapi.yaml` at the root is generated
 - `docs/`: hand-written documentation, synced into colony/frontend/apps/www-antfly at build time

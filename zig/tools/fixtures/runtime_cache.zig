@@ -110,8 +110,6 @@ pub fn build(b: *std.Build) void {
                     vopr_test_found = true;
                 }
                 if (std.mem.endsWith(u8, path.sub_path, "/template_test_root.zig")) template = artifact;
-                if (artifact.kind.isTest() and std.mem.endsWith(u8, path.sub_path, "/lite_main.zig"))
-                    unit_tests.dependOn(&b.addRunArtifact(artifact).step);
             },
             else => {},
         };
