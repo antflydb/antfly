@@ -98,7 +98,7 @@ pub const Borrowed = struct {
         _ = (try control.deadlineNs()) orelse return error.ExecutionWaitUnsupported;
         while (true) {
             try control.checkpoint();
-            self.lock();
+            try @import("../../common/cleanup_wait.zig").lockAtomic(self.mutex, io, control);
             if (self.joined.isSet()) {
                 self.mutex.unlock();
                 return;
@@ -139,7 +139,7 @@ test "maintenance runtime controlled owner stops preserve registrations across o
     const independent = @import("independent_maintenance.zig").Owner;
     const graph = @import("graph_cleanup_owner.zig").Owner;
     const Case = enum { success, begin_failure, end_failure, lifetime_in_wait };
-    inline for (.{ independent, graph, @import("quarantine_recovery.zig").Owner, @import("native_query_warming.zig").Owner }) |Owner| {
+    inline for (.{ independent, graph, @import("quarantine_recovery.zig").Owner, @import("native_query_warming.zig").Owner, @import("native_projection_owner.zig").Owner }) |Owner| {
         for (std.enums.values(Case)) |case| {
             var backend = try runtime.BackendRuntimeHandle.init(std.testing.allocator, .{});
             defer backend.deinit();
@@ -185,7 +185,7 @@ test "maintenance runtime controlled owner stops preserve registrations across o
             var f: F = .{ .io = io };
             defer {
                 f.release.set(io);
-                if (Owner == graph) owner.stop(io) else owner.stop(backend.ptr());
+                if (Owner == graph or Owner == @import("native_projection_owner.zig").Owner) owner.stop(io) else owner.stop(backend.ptr());
             }
             const slot = if (@hasField(Owner, "future")) &owner.future else &owner.registration;
             const scheduler = try backend.ptr().maintenanceScheduler();
@@ -193,7 +193,7 @@ test "maintenance runtime controlled owner stops preserve registrations across o
             try f.entered.wait(io);
             var controls: Control = .{ .f = &f, .case = case };
             var payload: admission.Payload = .{ .ptr = &controls, .vtable = &.{ .checkpoint = Control.check, .check_lifetime = Control.check, .deadline_ns = Control.deadline }, .execution_wait = .{ .ptr = &controls, .begin = Control.begin, .end = Control.end } };
-            const result = if (Owner == graph) owner.stopWithAdmission(io, .init(&payload)) else owner.stopWithAdmission(backend.ptr(), .init(&payload));
+            const result = if (Owner == graph or Owner == @import("native_projection_owner.zig").Owner) owner.stopWithAdmission(io, .init(&payload)) else owner.stopWithAdmission(backend.ptr(), .init(&payload));
             if (case == .success) try result else {
                 try std.testing.expectError(switch (case) {
                     .begin_failure => error.NotFound,
@@ -205,7 +205,7 @@ test "maintenance runtime controlled owner stops preserve registrations across o
                 try std.testing.expect(owner.stop_progress.isSet());
                 try std.testing.expectEqual(@as(usize, 1), scheduler.snapshot().owned_registrations);
                 f.release.set(io);
-                if (Owner == graph) owner.stop(io) else owner.stop(backend.ptr());
+                if (Owner == graph or Owner == @import("native_projection_owner.zig").Owner) owner.stop(io) else owner.stop(backend.ptr());
             }
             try std.testing.expect(owner.stopping.load(.acquire));
             try std.testing.expect(owner.joined.isSet() and slot.* == null and f.retired);
@@ -274,4 +274,86 @@ test "maintenance runtime abandoned controlled finisher wakes a competing quiesc
     f.thread = null;
     try std.testing.expect(f.joined and owner.joined.isSet());
     try std.testing.expectEqual(@as(usize, 0), scheduler.snapshot().owned_registrations);
+}
+
+test "maintenance runtime controlled lifecycle mutex contention lends CPU before claiming a finisher" {
+    const runtime = @import("../background_runtime.zig");
+    const Owner = @import("graph_cleanup_owner.zig").Owner;
+    const Mode = enum { success, begin_failure, end_failure, expired };
+    for (std.enums.values(Mode)) |mode| {
+        var backend = try runtime.BackendRuntimeHandle.init(std.testing.allocator, .{});
+        defer backend.deinit();
+        const io = backend.ptr().io().?;
+        var owner: Owner = .{};
+        const F = struct {
+            owner: *Owner,
+            io: std.Io,
+            mode: Mode,
+            held: bool = false,
+            begins: usize = 0,
+            ends: usize = 0,
+            fn check(raw: *anyopaque) !void {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                if (self.mode == .expired and self.begins != 0) return error.DeadlineExceeded;
+            }
+            fn deadline(_: *anyopaque) !?u64 {
+                return 1000;
+            }
+            fn begin(raw: *anyopaque) !void {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                self.begins += 1;
+                if (self.mode == .begin_failure) return error.NotFound;
+                self.owner.mutex.unlock();
+                self.held = false;
+            }
+            fn end(raw: *anyopaque) !void {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                self.ends += 1;
+                try std.testing.expect(self.owner.mutex.tryLock());
+                self.owner.mutex.unlock();
+                if (self.mode == .end_failure) return error.Canceled;
+            }
+            fn step(_: *@This()) ?u64 {
+                return null;
+            }
+        };
+        var f: F = .{ .owner = &owner, .io = io, .mode = mode };
+        defer {
+            if (f.held) owner.mutex.unlock();
+            owner.stop(io);
+        }
+        const scheduler = try backend.ptr().maintenanceScheduler();
+        owner.registration = try scheduler.register(&f, F.step);
+        // Isolate lifecycle-lock contention from callback completion races.
+        owner.registration.?.requestStop();
+        const deadline_ns = @import("antfly_platform").time.monotonicNs() + 5 * std.time.ns_per_s;
+        while (!try owner.registration.?.readyToFinish()) {
+            if (@import("antfly_platform").time.monotonicNs() >= deadline_ns) return error.Timeout;
+            try io.sleep(.fromMilliseconds(1), .awake);
+        }
+        try std.testing.expect(owner.mutex.tryLock());
+        f.held = true;
+        const payload: admission.Payload = .{ .ptr = &f, .vtable = &.{ .checkpoint = F.check, .check_lifetime = F.check, .deadline_ns = F.deadline }, .execution_wait = .{ .ptr = &f, .begin = F.begin, .end = F.end } };
+        const result = owner.stopWithAdmission(io, .init(&payload));
+        if (mode == .success) try result else {
+            try std.testing.expectError(switch (mode) {
+                .begin_failure => error.NotFound,
+                .end_failure => error.Canceled,
+                .expired => error.DeadlineExceeded,
+                else => unreachable,
+            }, result);
+            try std.testing.expect(owner.stopping.load(.acquire));
+            try std.testing.expect(!owner.stop_started and !owner.joined.isSet() and owner.registration != null);
+            if (f.held) {
+                owner.mutex.unlock();
+                f.held = false;
+            }
+            f.mode = .success;
+            try owner.stopWithAdmission(io, .init(&payload));
+        }
+        try std.testing.expect(owner.joined.isSet() and owner.registration == null);
+        try std.testing.expectEqual(@as(usize, 0), scheduler.snapshot().owned_registrations);
+        try std.testing.expectEqual(@as(usize, 1), f.begins);
+        try std.testing.expectEqual(@as(usize, if (mode == .begin_failure) 0 else 1), f.ends);
+    }
 }

@@ -23933,3 +23933,50 @@ Error ABI (45), released status ABI (1) and failure identity (8) also pass. All
 maintenance-only test root lacked the decoder's physical DB binding; the final
 run puts these cases in the existing DB qualification root. Both receipts remain
 available; no full GNU/Linux qualification was run.
+
+### Shared native projection maintenance supervision
+
+Native projection supervision now retains a shared maintenance registration in
+place of a per-owner long-lived I/O future and wake event. Each callback performs
+one existing projection round and returns the worker; pending or retryable work
+requests the existing 50 ms cadence. Idle registrations consume no active worker.
+Source notifications use the scheduler's coalesced wake mechanism, including
+notifications arriving during a round. Initial registration already schedules its
+first callback, so creation does not issue a second, racing wake.
+
+DB initialization binds the stable backend runtime into the projection owner.
+Serving-owner close fences preparation admission and then stops projection
+supervision through the original finite cleanup control, before derived
+finalization and physical index teardown. The recurring-owner join helper retains
+the registration on failed handoff, lifetime or original reentry, permits retry,
+and fences redispatch permanently. Its controlled path now also lends execution
+while acquiring the owner's lifecycle mutex instead of spinning with CPU held.
+Native ABI 93 and storage-owner ABI 152 fence the changed owner layout and close
+contract. Physical close remains available for independently quiesced callers.
+
+Projection rounds still use the compatibility maintenance callback contract;
+this migration does not certify their physical I/O waits or cooperative CPU
+checkpoints. Explicit runnable adoption and physical/backend teardown, parent
+metadata charging, broader cross-engine/fault/default-policy gates, and enabling
+required providers remain unfinished. The full goal remains active. Full GNU/Linux
+qualification remains waived; Linux uses the pinned Nix/glibc compiler.
+
+Pinned Darwin Debug receipt `projection-shared-maintenance-v2` passes all 73 build
+steps and 81 reported tests: 59 maintenance shutdown, 20 execution-service and
+two linked C-entry close cases. The simple runners pass 28 DB/finalization/cache
+and 21 local-close cases without skips, failures or leaks. The new projection
+owner test uses a real shared registration and a real runnable scheduler with one
+ordinary CPU slot, alongside a running protected control operation. Successful
+close lends that CPU so the blocked projection callback can finish; rejected
+handoff/reentry retain the registration until retry, and all registrations retire.
+The shared recurring-owner matrix also covers projection shutdown lifetime
+rejection. Lifecycle-mutex contention tests prove no finisher is claimed before
+successful execution reentry. The DB publication test now uses real registration
+wakeups to check raced source completion and absence of an invented second pass.
+Error ABI (45), released status ABI (1) and failure identity (8) pass; all 5,537
+recorded native/schema input hashes match the final source.
+
+The first run's single-CPU fixture requested only two backend I/O lanes, below
+the existing maintenance coordinator's eight-lane minimum. The final fixture uses
+eight I/O lanes while retaining the same single ordinary runnable CPU slot. Both
+receipts are preserved. No full GNU/Linux qualification was run.

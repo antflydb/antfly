@@ -3894,7 +3894,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const dense_finalization_db_tests = b.addTest(.{
         .name = "dense-finalization-db-tests",
         .root_module = dense_finalization_db_root,
-        .filters = &.{ "controlled dense finalization DB callback", "controlled dense finalization session claim", "dense session owner", "maintenance runtime cache close" },
+        .filters = &.{ "controlled dense finalization DB callback", "controlled dense finalization session claim", "dense session owner", "maintenance runtime cache close", "native publication finalization forwards raced source completion" },
         .max_rss = 16 * 1024 * 1024 * 1024,
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
@@ -4240,7 +4240,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const maintenance_shutdown_admission_tests = b.addTest(.{
         .name = "maintenance-shutdown-admission-tests",
         .root_module = maintenance_shutdown_admission_root,
-        .filters = &.{ "independent maintenance", "maintenance scheduler", "maintenance runtime", "graph cleanup owner", "quarantine recovery", "external lake native warming", "publication recovery registration", "schema reconciliation", "portable activation finite recovery" },
+        .filters = &.{ "independent maintenance", "maintenance scheduler", "maintenance runtime", "graph cleanup owner", "quarantine recovery", "external lake native warming", "publication recovery registration", "schema reconciliation", "portable activation finite recovery", "native projection owner" },
         .max_rss = 3 * 1024 * 1024 * 1024,
     });
     b.step("antfly-maintenance-shutdown-admission-test", "Verify recurring maintenance stops admitting stages and physically joins current callbacks")

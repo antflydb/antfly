@@ -39,7 +39,8 @@ const failure_abi = @import("runtime_failure_abi");
 // Owned replay binding recipes and whole-operation refresh expand native state.
 // Owned assemblies retain checked memory state; native retries observe commits.
 // Close preflight drains restore/rewrite cache callbacks with caller execution.
-pub const abi_version: u32 = 151;
+// Projection supervision uses shared maintenance dispatch and controlled close.
+pub const abi_version: u32 = 152;
 pub const Status = failure_abi.Status;
 pub const FailureBoundary = failure_abi.FailureBoundary;
 pub const FailureIdentity = failure_abi.FailureIdentity;

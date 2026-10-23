@@ -5457,7 +5457,7 @@ pub const DB = struct {
             .snapshot_replay_admission = async_resources.snapshot_replay_admission,
             .repair_replay_mutex = async_resources.repair_replay_mutex,
             .io = self.backend_runtime.io(),
-            .native_projection_owner = .{ .enabled = self.start_index_workers },
+            .native_projection_owner = .{ .enabled = self.start_index_workers, .runtime = self.backend_runtime },
             .require_graph_resolution_contract = true,
             .visibility_observer = .{},
             .text_merge_runtime = null,
@@ -6259,6 +6259,7 @@ pub const DB = struct {
         }.invoke);
         if (self.closed) return;
         try self.drainPreparedAssembliesWithAdmission(original);
+        try self.async_context.native_projection_owner.stopWithAdmission(self.backend_runtime.io(), original);
         {
             defer self.async_context.enrichment_desired_running.store(false, .release);
             try self.enrichment_owner.closeWithAdmission(self.backend_runtime.io(), original);
@@ -53845,9 +53846,9 @@ test "native publication reports contention separately from an empty pass" {
 
 test "native publication finalization forwards raced source completion" {
     const alloc = std.testing.allocator;
-    var runtime = std.Io.Threaded.init(alloc, .{});
-    defer runtime.deinit();
-    const io = runtime.io();
+    var backend = try background_runtime_mod.BackendRuntimeHandle.init(alloc, .{});
+    defer backend.deinit();
+    const io = backend.ptr().io().?;
     var apply_mutex: apply_rw_lock_mod.ApplyRwLock = .{};
     var ctx = AsyncContext{
         .alloc = alloc,
@@ -53855,28 +53856,43 @@ test "native publication finalization forwards raced source completion" {
         .index_manager = undefined,
         .apply_mutex = &apply_mutex,
         .io = io,
-        .native_projection_owner = .{ .enabled = true },
+        .native_projection_owner = .{ .enabled = true, .runtime = backend.ptr() },
     };
     defer ctx.deinit(alloc);
-    // Keep an owned task installed without a consumer racing the observation.
-    // Its only purpose is to exercise the real scheduler's wakeup path.
-    ctx.native_projection_owner.future = try io.concurrent(struct {
-        fn run() void {}
-    }.run, .{});
+    const F = struct {
+        io: std.Io,
+        called: std.Io.Event = .unset,
+        calls: std.atomic.Value(usize) = .init(0),
+        fn round(raw: *anyopaque) !bool {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            _ = self.calls.fetchAdd(1, .release);
+            self.called.set(self.io);
+            return false;
+        }
+    };
+    var f: F = .{ .io = io };
+    // Use a real shared registration with a harmless round; the incomplete
+    // AsyncContext deliberately has no index catalog to publish against.
+    ctx.native_projection_owner.schedule(.{ .ptr = &f, .io = io, .closing = &ctx.background_closing, .round = F.round });
+    const timeout: std.Io.Timeout = .{ .duration = .{ .raw = .fromSeconds(5), .clock = .awake } };
+    try f.called.waitTimeout(io, timeout);
+    f.called.reset();
     var guard = lockAtomicWithBackoffProfiled(&ctx.dense_admission.mutex, &ctx.stats.dense_finish_mutex);
     try std.testing.expect(tryClaimDenseProjectionFinalizationLocked(&ctx));
     try std.testing.expect(!tryClaimOrRequestDenseProjectionFinalizationLocked(&ctx));
     guard.unlock();
     finishDenseProjectionFinalization(&ctx);
-    try std.testing.expect(ctx.native_projection_owner.wake.isSet());
+    try f.called.waitTimeout(io, timeout);
+    try std.testing.expectEqual(@as(usize, 2), f.calls.load(.acquire));
     try std.testing.expect(!ctx.dense_admission.finalization_requested);
     try std.testing.expect(!ctx.dense_admission.finalizing.load(.acquire));
-    ctx.native_projection_owner.wake.reset();
+    f.called.reset();
     guard = lockAtomicWithBackoffProfiled(&ctx.dense_admission.mutex, &ctx.stats.dense_finish_mutex);
     try std.testing.expect(tryClaimOrRequestDenseProjectionFinalizationLocked(&ctx));
     guard.unlock();
     finishDenseProjectionFinalization(&ctx);
-    try std.testing.expect(!ctx.native_projection_owner.wake.isSet());
+    try std.testing.expectError(error.Timeout, f.called.waitTimeout(io, .{ .duration = .{ .raw = .fromMilliseconds(5), .clock = .awake } }));
+    try std.testing.expectEqual(@as(usize, 2), f.calls.load(.acquire));
 }
 
 test "external dense bulk waiter owns admission across catch-up handoff" {
