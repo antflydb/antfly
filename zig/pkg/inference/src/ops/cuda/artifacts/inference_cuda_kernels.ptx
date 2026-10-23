@@ -80,8 +80,6 @@
 // _ZZ48termite_attention_f32_bert_prefill_s256_hd64_mmaE5alpha has been demoted
 // _ZZ34termite_channel_scores_softmax_f32E10row_scores has been demoted
 // _ZZ34termite_channel_scores_softmax_f32E7scratch has been demoted
-// _ZZ31termite_rms_norm_heads_rope_f32E7partial has been demoted
-// _ZZ46termite_rms_norm_heads_rope_decode_scalars_f32E7partial has been demoted
 // _ZZ45termite_gqa_attention_decode_scalars_fast_f32E9warp_sums has been demoted
 // _ZZ45termite_gqa_attention_decode_scalars_fast_f32E16shared_max_score has been demoted
 // _ZZ45termite_gqa_attention_decode_scalars_fast_f32E12shared_denom has been demoted
@@ -527,6 +525,8 @@
 // _ZZ30termite_bert_prefill_hd64_implILj8EjEvPfPKfS2_S2_PKxS2_jjjjjjjjE7kv_tile has been demoted
 // _ZZ30termite_bert_prefill_hd64_implILj16EyEvPfPKfS2_S2_PKxS2_jjjjjjjjE6scores has been demoted
 // _ZZ30termite_bert_prefill_hd64_implILj16EyEvPfPKfS2_S2_PKxS2_jjjjjjjjE7kv_tile has been demoted
+// _ZZ32termite_rms_norm_heads_rope_implILb0EEvPfPKfS2_jjjfffjjjjfPKjE7partial has been demoted
+// _ZZ32termite_rms_norm_heads_rope_implILb1EEvPfPKfS2_jjjfffjjjjfPKjE7partial has been demoted
 // _ZZ27termite_q8_0_tile_rows_colsILj2ELj4ELj0EEvPfPKfPKhS2_S2_jjjE7partial has been demoted
 // _ZZ27termite_q8_0_tile_rows_colsILj2ELj4ELj1EEvPfPKfPKhS2_S2_jjjE7partial has been demoted
 // _ZZ27termite_q8_0_tile_rows_colsILj2ELj4ELj2EEvPfPKfPKhS2_S2_jjjE7partial has been demoted
@@ -48746,7 +48746,7 @@ $L__BB146_18:
 	.reg .f64 	%fd<5>;
 	.reg .b64 	%rd<68>;
 	// demoted variable
-	.shared .align 4 .b8 _ZZ31termite_rms_norm_heads_rope_f32E7partial[1024];
+	.shared .align 4 .b8 _ZZ32termite_rms_norm_heads_rope_implILb0EEvPfPKfS2_jjjfffjjjjfPKjE7partial[1024];
 
 	mov.u64 	%SPL, __local_depot147;
 	ld.param.u64 	%rd17, [termite_rms_norm_heads_rope_f32_param_0];
@@ -48793,7 +48793,7 @@ $L__BB147_3:
 
 $L__BB147_4:
 	shl.b32 	%r71, %r164, 2;
-	mov.u32 	%r72, _ZZ31termite_rms_norm_heads_rope_f32E7partial;
+	mov.u32 	%r72, _ZZ32termite_rms_norm_heads_rope_implILb0EEvPfPKfS2_jjjfffjjjjfPKjE7partial;
 	add.s32 	%r7, %r72, %r71;
 	st.shared.f32 	[%r7], %f192;
 	bar.sync 	0;
@@ -48822,7 +48822,7 @@ $L__BB147_7:
 $L__BB147_8:
 	setp.ge.u32 	%p10, %r164, %r63;
 	cvt.rn.f32.u32 	%f55, %r63;
-	ld.shared.f32 	%f56, [_ZZ31termite_rms_norm_heads_rope_f32E7partial];
+	ld.shared.f32 	%f56, [_ZZ32termite_rms_norm_heads_rope_implILb0EEvPfPKfS2_jjjfffjjjjfPKjE7partial];
 	div.rn.f32 	%f57, %f56, %f55;
 	add.f32 	%f58, %f57, %f45;
 	rsqrt.approx.f32 	%f4, %f58;
@@ -49374,7 +49374,7 @@ $L__BB147_55:
 	.reg .f64 	%fd<5>;
 	.reg .b64 	%rd<70>;
 	// demoted variable
-	.shared .align 4 .b8 _ZZ46termite_rms_norm_heads_rope_decode_scalars_f32E7partial[1024];
+	.shared .align 4 .b8 _ZZ32termite_rms_norm_heads_rope_implILb1EEvPfPKfS2_jjjfffjjjjfPKjE7partial[1024];
 
 	mov.u64 	%SPL, __local_depot148;
 	ld.param.u64 	%rd17, [termite_rms_norm_heads_rope_decode_scalars_f32_param_0];
@@ -49429,7 +49429,7 @@ $L__BB148_5:
 
 $L__BB148_6:
 	shl.b32 	%r73, %r167, 2;
-	mov.u32 	%r74, _ZZ46termite_rms_norm_heads_rope_decode_scalars_f32E7partial;
+	mov.u32 	%r74, _ZZ32termite_rms_norm_heads_rope_implILb1EEvPfPKfS2_jjjfffjjjjfPKjE7partial;
 	add.s32 	%r9, %r74, %r73;
 	st.shared.f32 	[%r9], %f192;
 	bar.sync 	0;
@@ -49458,7 +49458,7 @@ $L__BB148_9:
 $L__BB148_10:
 	setp.ge.u32 	%p11, %r167, %r65;
 	cvt.rn.f32.u32 	%f55, %r65;
-	ld.shared.f32 	%f56, [_ZZ46termite_rms_norm_heads_rope_decode_scalars_f32E7partial];
+	ld.shared.f32 	%f56, [_ZZ32termite_rms_norm_heads_rope_implILb1EEvPfPKfS2_jjjfffjjjjfPKjE7partial];
 	div.rn.f32 	%f57, %f56, %f55;
 	add.f32 	%f58, %f57, %f45;
 	rsqrt.approx.f32 	%f4, %f58;

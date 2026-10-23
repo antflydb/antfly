@@ -590,6 +590,69 @@ attention, segmented-audio and parallel local-attention reference suite passes
 all four selected tests with no skips, covering admitted fallback, F64 masks and
 scale, short/fused tails and invalid-key semantics.
 
+## Typed Metal scans and CUDA rotary family consolidation
+
+Building on `c56aeb5f727bce2a789fcb8c3642299d941e2fcf`, six Metal cumulative-sum
+entry points share `termite_cumulative_sum_impl<T>`. Accumulator, prefix scratch
+and output all retain the original F32 or unsigned 8/16/32/64-bit type; signed
+integer entry points retain their bitwise wrapping representation. The
+256-thread chunk schedule, prefix tree, barriers, strided indexing and
+reverse/exclusive behavior remain unchanged. Static scratch stays in each
+entry-point wrapper.
+
+Four CUDA plain/scaled RoPE kernels share a compile-time scaled/decode family;
+the fused RMSNorm+RoPE pair shares a second family. Plain rotary decode keeps
+its optional device-scalar load before bounds checking, while fused rotary
+normalization keeps that load after its original guard. Unscaled kernels do
+not introduce a multiplication by one. Pair layout, partial rotary dimensions,
+frequency arithmetic, reduction tree and scale placement remain unchanged.
+Per-item and multimodal rotary schedules remain separate. There is no host
+interface, dispatch or CPU production change.
+
+Including every new helper and wrapper, this removes **105 maintained lines /
+7,575 bytes**: Metal removes 85 lines / 6,630 bytes and CUDA removes 20 lines /
+945 bytes. The three successive GPU-family checkpoints therefore remove
+**928 maintained lines / 60,197 bytes** relative to `f79d38374f`. Generated
+artifact churn is excluded from these counts.
+
+Qualification receipts and exact protocols are retained under the ignored
+`.benchmark-assets/1166/scan-rope-families/` directory, with baseline/candidate
+source hashes and full Metal shader snapshots. CUDA full disassemblies and
+baseline images also remain on Glowworm in the corresponding directory.
+
+- All four existing Metal scan/reference tests pass without skips, including
+  graph constants across all integer widths and dynamic reverse/exclusive axes.
+- All 168 direct Metal cases are byte-identical to baseline and an independent
+  sequential reference. They cover all six entry points, widths
+  0/1/255/256/257/513/4097, both reverse/exclusive flags, two strided batches,
+  wrapping integer patterns and guarded output tails. F32 reference inputs are
+  exactly representable dyadic values. Production safe-math mode is used;
+  static threadgroup storage and maximum supported threads are unchanged.
+- The first eight-arm scan timing run had one failure among 48 timed cases
+  (F32 forward exclusive, width 513, ratio 1.30217). The complete matrix was
+  investigated with 250 warmups and sixteen balanced
+  `ABBABAABABBAABBA` arms of 1,000 dispatches each, retaining per-arm timings.
+  All 48 cases pass that longer protocol: worst ratio 1.00261 (+0.26%); the
+  initially failing case measures 0.99993. Both initial and longer receipts
+  are retained; the source did not change between them.
+- All 120 direct CUDA cases on GB10 pass byte-identical output and independent
+  F64 references (maximum error 5.09e-6). Coverage includes split/consecutive
+  pairs, odd and partial dimensions, empty launches, null device scalars,
+  scaling and fused normalization. Captured graphs observe device position
+  changes without recapture, with guarded output tails preserved.
+- CUDA 13.2.86 regeneration passes for portable PTX, the seven-target fatbin and
+  SM89 cubin. All 439 kernels retain identical disassembled instructions and
+  resource usage on SM75/80/89/90/100/110/120: **3,073 unchanged comparisons**,
+  including all six refactored entry points. This is static specialization
+  evidence; actual device execution was on GB10 SM121 with driver 580.178.04.
+  No new cross-architecture hardware throughput claim is made.
+
+Final CPU/Metal/CUDA product compilation, generated-source freshness (67 files
+plus Metal/CUDA runtime regions), CUDA source policy and whitespace checks pass.
+All four local CUDA source/image hashes match the qualified remote snapshot;
+the SM89 cubin remains byte-identical. Required cache collection completed on
+both hosts.
+
 ## Original checkpoint qualification
 
 Use repository-pinned Zig 0.17.0. Real Metal tests need access to the host GPU;

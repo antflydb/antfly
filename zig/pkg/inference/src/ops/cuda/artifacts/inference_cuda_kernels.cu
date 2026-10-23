@@ -3958,6 +3958,36 @@ __device__ float termite_rope_value(
     return second ? (x0 * s + x1 * c) : (x0 * c - x1 * s);
 }
 
+// Scalar reads stay before bounds checks, matching decode replay semantics.
+template<bool Scaled, bool Decode>
+__device__ __forceinline__ void termite_rope_impl(
+    float* dst,
+    const float* input,
+    unsigned int total_chunks,
+    unsigned int head_dim,
+    unsigned int rope_dim,
+    float theta,
+    float freq_scale,
+    unsigned int position_offset,
+    unsigned int seq_len,
+    unsigned int chunks_per_position,
+    unsigned int consecutive_pairs,
+    float scale,
+    const unsigned int* decode_scalars
+) {
+    if (Decode && decode_scalars != 0) position_offset = decode_scalars[0];
+    unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    unsigned int total = total_chunks * head_dim;
+    if (idx >= total) return;
+    unsigned int chunk = idx / head_dim;
+    unsigned int d = idx - chunk * head_dim;
+    unsigned int token_pos = (chunk / chunks_per_position) % seq_len;
+    unsigned int position = position_offset + token_pos;
+    unsigned int base = chunk * head_dim;
+    float value = termite_rope_value(input, base, d, head_dim, rope_dim, position, theta, freq_scale, consecutive_pairs);
+    dst[idx] = Scaled ? value * scale : value;
+}
+
 extern "C" __global__ void termite_rope_f32(
     float* dst,
     const float* input,
@@ -3971,15 +4001,7 @@ extern "C" __global__ void termite_rope_f32(
     unsigned int chunks_per_position,
     unsigned int consecutive_pairs
 ) {
-    unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    unsigned int total = total_chunks * head_dim;
-    if (idx >= total) return;
-    unsigned int chunk = idx / head_dim;
-    unsigned int d = idx - chunk * head_dim;
-    unsigned int token_pos = (chunk / chunks_per_position) % seq_len;
-    unsigned int position = position_offset + token_pos;
-    unsigned int base = chunk * head_dim;
-    dst[idx] = termite_rope_value(input, base, d, head_dim, rope_dim, position, theta, freq_scale, consecutive_pairs);
+    termite_rope_impl<false, false>(dst, input, total_chunks, head_dim, rope_dim, theta, freq_scale, position_offset, seq_len, chunks_per_position, consecutive_pairs, 1.0f, nullptr);
 }
 
 // Qwen3-VL text M-RoPE. Positions are axis-major [3, token_count], while
@@ -4075,16 +4097,7 @@ extern "C" __global__ void termite_rope_decode_scalars_f32(
     unsigned int consecutive_pairs,
     const unsigned int* decode_scalars
 ) {
-    if (decode_scalars != 0) position_offset = decode_scalars[0];
-    unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    unsigned int total = total_chunks * head_dim;
-    if (idx >= total) return;
-    unsigned int chunk = idx / head_dim;
-    unsigned int d = idx - chunk * head_dim;
-    unsigned int token_pos = (chunk / chunks_per_position) % seq_len;
-    unsigned int position = position_offset + token_pos;
-    unsigned int base = chunk * head_dim;
-    dst[idx] = termite_rope_value(input, base, d, head_dim, rope_dim, position, theta, freq_scale, consecutive_pairs);
+    termite_rope_impl<false, true>(dst, input, total_chunks, head_dim, rope_dim, theta, freq_scale, position_offset, seq_len, chunks_per_position, consecutive_pairs, 1.0f, decode_scalars);
 }
 
 extern "C" __global__ void termite_decode_scalars_advance(
@@ -4117,16 +4130,7 @@ extern "C" __global__ void termite_rope_scaled_f32(
     unsigned int consecutive_pairs,
     float scale
 ) {
-    unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    unsigned int total = total_chunks * head_dim;
-    if (idx >= total) return;
-    unsigned int chunk = idx / head_dim;
-    unsigned int d = idx - chunk * head_dim;
-    unsigned int token_pos = (chunk / chunks_per_position) % seq_len;
-    unsigned int position = position_offset + token_pos;
-    unsigned int base = chunk * head_dim;
-    float value = termite_rope_value(input, base, d, head_dim, rope_dim, position, theta, freq_scale, consecutive_pairs);
-    dst[idx] = value * scale;
+    termite_rope_impl<true, false>(dst, input, total_chunks, head_dim, rope_dim, theta, freq_scale, position_offset, seq_len, chunks_per_position, consecutive_pairs, scale, nullptr);
 }
 
 extern "C" __global__ void termite_rope_scaled_decode_scalars_f32(
@@ -4144,17 +4148,7 @@ extern "C" __global__ void termite_rope_scaled_decode_scalars_f32(
     float scale,
     const unsigned int* decode_scalars
 ) {
-    if (decode_scalars != 0) position_offset = decode_scalars[0];
-    unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    unsigned int total = total_chunks * head_dim;
-    if (idx >= total) return;
-    unsigned int chunk = idx / head_dim;
-    unsigned int d = idx - chunk * head_dim;
-    unsigned int token_pos = (chunk / chunks_per_position) % seq_len;
-    unsigned int position = position_offset + token_pos;
-    unsigned int base = chunk * head_dim;
-    float value = termite_rope_value(input, base, d, head_dim, rope_dim, position, theta, freq_scale, consecutive_pairs);
-    dst[idx] = value * scale;
+    termite_rope_impl<true, true>(dst, input, total_chunks, head_dim, rope_dim, theta, freq_scale, position_offset, seq_len, chunks_per_position, consecutive_pairs, scale, decode_scalars);
 }
 
 extern "C" __global__ void termite_rope_per_item_f32(
@@ -4188,7 +4182,9 @@ extern "C" __global__ void termite_rope_per_item_f32(
     dst[idx] = termite_rope_value(input, base, d, head_dim, rope_dim, position, theta, freq_scale, consecutive_pairs);
 }
 
-extern "C" __global__ void termite_rms_norm_heads_rope_f32(
+// Fused normalization keeps its guarded scalar load and original reduction.
+template<bool Decode>
+__device__ __forceinline__ void termite_rms_norm_heads_rope_impl(
     float* dst,
     const float* input,
     const float* weight,
@@ -4202,11 +4198,13 @@ extern "C" __global__ void termite_rms_norm_heads_rope_f32(
     unsigned int seq_len,
     unsigned int chunks_per_position,
     unsigned int consecutive_pairs,
-    float output_scale
+    float output_scale,
+    const unsigned int* decode_scalars
 ) {
     unsigned int chunk = blockIdx.x;
     unsigned int tid = threadIdx.x;
     if (chunk >= total_chunks || head_dim == 0u) return;
+    if (Decode && decode_scalars != 0) position_offset = decode_scalars[0];
     unsigned int base = chunk * head_dim;
 
     float sumsq = 0.0f;
@@ -4243,6 +4241,25 @@ extern "C" __global__ void termite_rms_norm_heads_rope_f32(
     }
 }
 
+extern "C" __global__ void termite_rms_norm_heads_rope_f32(
+    float* dst,
+    const float* input,
+    const float* weight,
+    unsigned int total_chunks,
+    unsigned int head_dim,
+    unsigned int rope_dim,
+    float eps,
+    float theta,
+    float freq_scale,
+    unsigned int position_offset,
+    unsigned int seq_len,
+    unsigned int chunks_per_position,
+    unsigned int consecutive_pairs,
+    float output_scale
+) {
+    termite_rms_norm_heads_rope_impl<false>(dst, input, weight, total_chunks, head_dim, rope_dim, eps, theta, freq_scale, position_offset, seq_len, chunks_per_position, consecutive_pairs, output_scale, nullptr);
+}
+
 extern "C" __global__ void termite_rms_norm_heads_rope_decode_scalars_f32(
     float* dst,
     const float* input,
@@ -4260,44 +4277,7 @@ extern "C" __global__ void termite_rms_norm_heads_rope_decode_scalars_f32(
     float output_scale,
     const unsigned int* decode_scalars
 ) {
-    unsigned int chunk = blockIdx.x;
-    unsigned int tid = threadIdx.x;
-    if (chunk >= total_chunks || head_dim == 0u) return;
-    if (decode_scalars != 0) position_offset = decode_scalars[0];
-    unsigned int base = chunk * head_dim;
-
-    float sumsq = 0.0f;
-    for (unsigned int i = tid; i < head_dim; i += blockDim.x) {
-        float x = input[base + i];
-        sumsq += x * x;
-    }
-    __shared__ float partial[256];
-    partial[tid] = sumsq;
-    __syncthreads();
-    for (unsigned int stride = blockDim.x >> 1; stride > 0u; stride >>= 1) {
-        if (tid < stride) partial[tid] += partial[tid + stride];
-        __syncthreads();
-    }
-    float norm_scale = rsqrtf(partial[0] / (float)head_dim + eps);
-
-    for (unsigned int d = tid; d < head_dim; d += blockDim.x) {
-        float value = input[base + d] * norm_scale * weight[d];
-        unsigned int idx0;
-        unsigned int idx1;
-        unsigned int pair_index;
-        unsigned int second;
-        if (termite_rope_pair_info(d, head_dim, rope_dim, consecutive_pairs, &idx0, &idx1, &pair_index, &second)) {
-            unsigned int token_pos = (chunk / chunks_per_position) % seq_len;
-            unsigned int position = position_offset + token_pos;
-            float angle = ((float)position) * freq_scale * termite_rope_frequency(pair_index, rope_dim, theta);
-            float s = sinf(angle);
-            float c = cosf(angle);
-            float x0 = input[base + idx0] * norm_scale * weight[idx0];
-            float x1 = input[base + idx1] * norm_scale * weight[idx1];
-            value = second ? (x0 * s + x1 * c) : (x0 * c - x1 * s);
-        }
-        dst[base + d] = value * output_scale;
-    }
+    termite_rms_norm_heads_rope_impl<true>(dst, input, weight, total_chunks, head_dim, rope_dim, eps, theta, freq_scale, position_offset, seq_len, chunks_per_position, consecutive_pairs, output_scale, decode_scalars);
 }
 
 extern "C" __global__ void termite_gqa_attention_f32(
