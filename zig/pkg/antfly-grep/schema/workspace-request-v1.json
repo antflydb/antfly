@@ -1,0 +1,304 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "antfly-grep private workspace request v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "version",
+    "id",
+    "op"
+  ],
+  "properties": {
+    "version": {
+      "const": 1
+    },
+    "id": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 18446744073709551615
+    },
+    "op": {
+      "enum": [
+        "search",
+        "invalidate",
+        "refresh",
+        "trim",
+        "close",
+        "register",
+        "forget"
+      ]
+    },
+    "revision": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "args": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "if_result_token": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "force_rescan": {
+      "type": "boolean",
+      "default": false
+    },
+    "query_handle": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "compact": {
+      "type": "boolean",
+      "default": true
+    },
+    "delta": {
+      "type": "boolean",
+      "default": false
+    },
+    "acknowledgement": {
+      "enum": [
+        "full",
+        "minimal"
+      ],
+      "default": "full",
+      "description": "Minimal is opt-in for registered conditional lexical searches. A valid hit is one terminal workspace_not_modified frame, with complete/exit_code and no begin/summary/end; otherwise ordinary output follows."
+    },
+    "batches": {
+      "type": "boolean",
+      "default": false,
+      "description": "Opt-in register-only compact lexical result schema v3. Bounded per-file match/context batches; first row streams immediately. Incompatible with decision search, finite output limits or line buffering."
+    },
+    "row_format": {
+      "enum": [
+        "objects",
+        "tuples"
+      ],
+      "default": "objects",
+      "description": "Tuple rows require compact batched lexical registration and advertise result schema v4."
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "op": {
+            "const": "search"
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "revision"
+        ],
+        "properties": {
+          "revision": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "required": [
+          "if_result_token"
+        ],
+        "properties": {
+          "if_result_token": {
+            "type": "string"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "op": {
+            "const": "search"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "required": [
+          "force_rescan"
+        ],
+        "properties": {
+          "force_rescan": {
+            "const": true
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "op": {
+            "const": "refresh"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "required": [
+          "query_handle"
+        ],
+        "properties": {
+          "query_handle": {
+            "type": "string"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "op": {
+            "enum": [
+              "search",
+              "forget"
+            ]
+          },
+          "args": {
+            "maxItems": 0
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "op": {
+            "const": "forget"
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "query_handle"
+        ],
+        "properties": {
+          "query_handle": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "required": [
+          "delta"
+        ],
+        "properties": {
+          "delta": {
+            "const": true
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "query_handle",
+          "if_result_token"
+        ],
+        "properties": {
+          "op": {
+            "const": "search"
+          },
+          "query_handle": {
+            "type": "string"
+          },
+          "if_result_token": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "required": [
+          "acknowledgement"
+        ],
+        "properties": {
+          "acknowledgement": {
+            "const": "minimal"
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "query_handle",
+          "if_result_token"
+        ],
+        "properties": {
+          "op": {
+            "const": "search"
+          },
+          "query_handle": {
+            "type": "string"
+          },
+          "if_result_token": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "required": [
+          "batches"
+        ],
+        "properties": {
+          "batches": {
+            "const": true
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "op": {
+            "const": "register"
+          },
+          "compact": {
+            "const": true
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "required": [
+          "row_format"
+        ],
+        "properties": {
+          "row_format": {
+            "const": "tuples"
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "batches"
+        ],
+        "properties": {
+          "op": {
+            "const": "register"
+          },
+          "batches": {
+            "const": true
+          },
+          "compact": {
+            "const": true
+          }
+        }
+      }
+    }
+  ],
+  "$comment": "Each UTF-8 JSON request occupies at most 65535 bytes before LF. Requests execute serially. Search revision must equal the current non-invalidated workspace_ready revision. Refresh is transactional and a failed refresh leaves the session invalidated. Trim releases optional process-local caches, provider resources, and idle workers; it preserves the source snapshot and invalidated state. Search may supply if_result_token; a valid complete cache hit can emit workspace_unchanged instead of result rows, followed by fresh summary/end. Tokens expire with all evidence and are process-local. Refresh force_rescan discards optional kernel witnesses and reads every eligible file. Default refresh is conservative; --workspace-watch opts into native event visibility assumptions. Register binds immutable effective options/provider credentials and compiled patterns to a bounded process-local query_handle, compact by default. Search may supply args or a handle; overrides with a handle are rejected. Forget and trim retire handles. Delta with a retained matching baseline can emit workspace_delta(order, removed) and only upserted file payloads. Clients atomically commit the new view/token only after complete summary and successful workspace_end; unknown baselines fall back to full output. Incremental state admission/coverage/TTL loss uses ordinary search. acknowledgement=minimal requires a registered conditional search. A complete lexical certificate can return one terminal workspace_not_modified frame carrying id, revision, result_token, observed_at, complete and exit_code (0 or 1), with no begin/summary/end. Any fallback uses the ordinary protocol. workspace_ready includes observed_at and query_registered advertises supports_lexical_delta. Client-side omission is valid only for an already materialized pinned revision; refresh is explicit."
+}

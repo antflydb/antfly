@@ -13,8 +13,6 @@ go/pkg/
   evalaf/            LLM/RAG evaluation framework
   genkit/            Firebase Genkit plugins (antfly, openrouter)
   memoryaf/          Memory-focused Antfly helpers
-  operator/          Kubernetes operator
-  proxy/             Antfly and Inference proxy packages
 ts/
   packages/sdk/      TypeScript SDK (@antfly/sdk)
   packages/embedded/    TypeScript embedded binding (@antfly/embedded)
@@ -69,15 +67,6 @@ Run `make help` for the full list. Key targets:
 | `make license-headers` | Add first-party license headers |
 | `make license-check` | Verify first-party license headers are present |
 
-### Operator targets
-
-| Target | Description |
-|--------|-------------|
-| `make operator-build` | Build the antfly-operator binary |
-| `make operator-test` | Run operator tests |
-| `make operator-lint` | Lint operator code |
-| `make operator-docker-build` | Build operator Docker image |
-
 ### Minikube targets
 
 | Target | Description |
@@ -109,8 +98,6 @@ The repository contains multiple independent Go modules (no `go.work`). Each mus
 |--------|-----------|
 | Antfly embedded binding | `go/pkg/embedded/` |
 | Go SDK | `go/pkg/sdk/` |
-| Operator | `go/pkg/operator/` |
-| Proxies (Antfly gateway, inference) | `go/pkg/proxy/` |
 | docsaf | `go/pkg/docsaf/` |
 | evalaf | `go/pkg/evalaf/` |
 | evalaf antfly plugin | `go/pkg/evalaf/plugins/antfly/` |
@@ -210,29 +197,20 @@ Example configs live in `configs/`:
 Release tags:
 
 - `v*` — Zig runtime archives, CLI packages, and container images
-- `go/pkg/operator/v*` — operator container build
 
-The previous standalone operator tag streams were consolidated into
-`go/pkg/operator/v*`.
+Colony owns the Kubernetes operator, hosted proxies, and operator release tags
+and image publishing. They are developed and tested in that repository.
 
 See [RELEASE.md](RELEASE.md) for the Zig release pipeline.
 
 ## License
 
-Antfly is a mixed-license repository. The embedded engine, Lite CLI, native library, inference runtime, and language bindings are Apache-2.0; the database server and orchestration remain ELv2. See [LICENSING.md](LICENSING.md) for the per-tree and per-file boundary before contributing.
+All first-party Antfly code is Apache-2.0, including the database server,
+orchestration, embedded engine, inference, CLI, SDKs, and language bindings.
+See [LICENSING.md](LICENSING.md) for source ownership and third-party notices.
 
-## Contribution rights and inbound licenses
+## Contribution rights and inbound license
 
 By submitting a contribution, you confirm that you have the right to submit it
-under the applicable inbound licenses below. Contributions containing third-party
-material must retain its original notices and comply with its license.
-`Signed-off-by` trailers are optional.
-
-The inbound license for a first-party Apache-2.0 file is Apache-2.0. For a
-first-party ELv2 file, contributors submit their copyrightable changes under
-ELv2 **and** grant Antfly, Inc. permission to distribute those changes under
-Apache-2.0 if the file or an extracted shared component later moves to the
-Apache boundary. The file's current outbound license remains ELv2 until its
-license notice and the boundary map are changed. By submitting a contribution,
-you confirm that you have the right to make these grants. This policy applies
-prospectively; it does not supply rights for earlier contributions.
+under Apache-2.0. Contributions containing third-party material must retain its
+original notices and comply with its license. `Signed-off-by` trailers are optional.

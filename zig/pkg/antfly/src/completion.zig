@@ -1,17 +1,17 @@
 // Copyright 2026 Antfly, Inc.
-// SPDX-License-Identifier: Elastic-2.0
+// SPDX-License-Identifier: Apache-2.0
 //
-// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
-// except in compliance with the Elastic License 2.0. You may obtain a copy of
-// the Elastic License 2.0 at
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-//     https://www.antfly.io/licensing/ELv2-license
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// Unless required by applicable law or agreed to in writing, software distributed
-// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
-// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
-// Elastic License 2.0 for the specific language governing permissions and
-// limitations.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 const std = @import("std");
 const maintenance = @import("maintenance_commands.zig");
@@ -39,6 +39,7 @@ pub const Command = struct {
     hidden: bool = false,
 };
 
+const backup_subcommands = [_][]const u8{"inspect"};
 const table_subcommands = [_][]const u8{ "create", "drop", "list", "get" };
 const index_subcommands = [_][]const u8{ "create", "drop", "list", "get", "wait", "maintenance" };
 const standby_subcommands = [_][]const u8{ "status", "slot", "seed", "fence", "promote", "rejoin", "follow", "switchover", "stream", "commit", "artifact" };
@@ -47,11 +48,13 @@ const agents_subcommands = [_][]const u8{ "retrieval", "query-builder" };
 const connections_subcommands = [_][]const u8{ "login", "list", "models", "logout" };
 const auth_subcommands = [_][]const u8{ "me", "users", "permissions", "roles", "row-filters", "subjects", "api-keys" };
 const inference_subcommands = [_][]const u8{
-    "run",          "embed",            "classify",  "generate",
-    "chat",         "compile-artifact", "export",    "quantize",
-    "run-artifact", "transcribe",       "read",      "extract",
-    "compare",      "finetune",         "smoke",     "list",
-    "pull",         "convert",          "cuda-info",
+    "run",          "embed",            "classify",             "generate",
+    "chat",         "compile-artifact", "export",               "quantize",
+    "run-artifact", "transcribe",       "read",                 "extract",
+    "compare",      "finetune",         "smoke",                "list",
+    "pull",         "convert",          "cuda-info",            "rerank",
+    "decisions",    "a4b-pack",         "quant-kernel-codegen", "metal-info",
+    "bench-cuda",   "version",
 };
 const lite_subcommands = [_][]const u8{
     "init",           "status",  "info",   "batch",      "lookup",
@@ -89,7 +92,7 @@ pub const commands = [_]Command{
     .{ .name = "insert", .description = "Insert a document", .route = .cli },
     .{ .name = "delete", .description = "Delete a document", .route = .cli },
     .{ .name = "agents", .description = "Run AI agents", .route = .cli, .subcommands = &agents_subcommands },
-    .{ .name = "backup", .description = "Back up tables", .route = .cli },
+    .{ .name = "backup", .description = "Back up tables and inspect backup files", .route = .cli, .subcommands = &backup_subcommands },
     .{ .name = "restore", .description = "Restore tables", .route = .cli },
     .{ .name = "storage", .description = "Manage table storage", .route = .storage, .subcommands = &.{"migrate"} },
     .{ .name = "connections", .description = "Manage provider connections", .route = .cli, .subcommands = &connections_subcommands },

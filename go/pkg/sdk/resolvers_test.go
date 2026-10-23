@@ -135,3 +135,62 @@ func TestResolverFirstEditRevisionFenceRejectsConcurrentRetry(t *testing.T) {
 		})
 	}
 }
+
+func TestCurationProposalAcceptReturnsPendingReplay(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.EscapedPath() != "/db/v1/databases/app/namespaces/private/tables/entities/curation/proposals/proposal%2Fone:accept" {
+			t.Errorf("unexpected request %s %s", r.Method, r.URL.EscapedPath())
+		}
+		var body map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatal(err)
+		}
+		if body["actor"] != "curator" {
+			t.Errorf("lost attribution: %+v", body)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusAccepted)
+		_, _ = w.Write([]byte(`{"proposal":{"id":"proposal/one","action":"suppress","key":"concept/noise","origin":{"origin":"manual"},"state":"accepted"},"complete":true,"applied":false,"results":[]}`))
+	}))
+	defer server.Close()
+	client, err := NewAntflyClient(server.URL, server.Client())
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := client.NamespaceAcceptCurationProposal(context.Background(), "app", "private", "entities", "proposal/one", NamespaceAcceptCurationProposalJSONRequestBody{Actor: "curator"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Applied || !result.Complete || result.Proposal.Id != "proposal/one" {
+		t.Fatalf("lost pending result: %+v", result)
+	}
+}
+
+func TestCurationProposalPreservesExplicitZeroAndEmptyOptions(t *testing.T) {
+	cases := []struct {
+		name, input, field string
+		value              any
+	}{
+		{"request zero confidence", `{"action":"suppress","key":"concept/noise","confidence":0}`, "confidence", new(CurationProposalRequest)},
+		{"response zero confidence", `{"id":"id","action":"suppress","key":"concept/noise","state":"open","origin":{},"confidence":0}`, "confidence", new(CurationProposal)},
+		{"empty options override", `{"options":{}}`, "options", new(CurationProposalDecisionRequest)},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := json.Unmarshal([]byte(tc.input), tc.value); err != nil {
+				t.Fatal(err)
+			}
+			encoded, err := json.Marshal(tc.value)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var fields map[string]json.RawMessage
+			if err := json.Unmarshal(encoded, &fields); err != nil {
+				t.Fatal(err)
+			}
+			if _, exists := fields[tc.field]; !exists {
+				t.Fatalf("lost explicit %s in %s", tc.field, encoded)
+			}
+		})
+	}
+}

@@ -840,6 +840,10 @@ const aggregation_descriptor: aggregation_contract.Descriptor = .{
 fn getAggregationDescriptor() callconv(.c) *const aggregation_contract.Descriptor {
     return &aggregation_descriptor;
 }
+fn getCAllocator() callconv(.c) ?*const Allocator {
+    if (comptime @import("builtin").link_libc) return &std.heap.c_allocator;
+    return null;
+}
 fn getDescriptor() callconv(.c) *const engine.Descriptor {
     return &descriptor;
 }
@@ -947,4 +951,5 @@ comptime {
     @export(&setError, .{ .name = "antfly_storage_error_set_v1", .visibility = .hidden });
     @export(&getAggregationDescriptor, .{ .name = "antfly_storage_engine_get_aggregation_descriptor_v1", .visibility = .hidden });
     @export(&getDescriptor, .{ .name = "antfly_storage_engine_get_descriptor_v28", .visibility = .hidden });
+    @export(&getCAllocator, .{ .name = "antfly_storage_engine_c_allocator_v1", .visibility = .hidden });
 }

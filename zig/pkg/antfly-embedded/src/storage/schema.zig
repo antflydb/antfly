@@ -2142,6 +2142,7 @@ pub const IndexSortMembership = struct {
 };
 
 pub const FieldCapability = struct {
+    logical_field: ?[]const u8 = null,
     name: ?[]const u8 = null,
     field: ?[]const u8 = null,
     path_pattern: ?[]const u8 = null,
@@ -2229,6 +2230,7 @@ pub fn declaredFieldCapability(schema: TableSchema, field: DeclaredField) FieldC
     const doc_value_coverage = if (mapping.doc_values) "schema_declared" else "not_declared";
     return .{
         .field = field.field,
+        .logical_field = declaredLogicalSource(schema, field.field) orelse field.field,
         .field_type = mapping.field_type,
         .searchable = mapping.do_index,
         .filterable = mappingIsFilterable(mapping),
@@ -2253,6 +2255,7 @@ pub fn exactFieldCapability(schema: TableSchema, field: ExactField) FieldCapabil
     const doc_value_coverage = if (mapping.doc_values) "schema_declared" else "not_declared";
     return .{
         .field = field.field,
+        .logical_field = field.source_field,
         .field_type = mapping.field_type,
         .searchable = mapping.do_index,
         .filterable = mappingIsFilterable(mapping),
@@ -2274,9 +2277,10 @@ pub fn fullTextFieldCapability(schema: TableSchema, document_name: []const u8, f
     const capability_field = if (exact_keyword) field.emitted_name else field.path;
     return .{
         .field = capability_field,
+        .logical_field = field.path,
         .emitted_name = field.emitted_name,
         .document_schema = document_name,
-        .field_type = if (exact_keyword) .keyword else .text,
+        .field_type = if (exact_keyword) .keyword else if (std.mem.eql(u8, field.analyzer, "substring")) .substring else if (std.mem.startsWith(u8, field.analyzer, "search_as_you_type")) .search_as_you_type else .text,
         .searchable = true,
         .filterable = exact_keyword,
         .aggregatable = false,
@@ -2299,6 +2303,7 @@ pub fn observedDynamicFieldCapability(schema: ?TableSchema, field: []const u8, m
     const doc_value_coverage = if (mapping.doc_values) "observed_declared" else "not_declared";
     return .{
         .field = field,
+        .logical_field = if (schema) |declared| declaredLogicalSource(declared, field) else null,
         .field_type = mapping.field_type,
         .searchable = mapping.do_index,
         .filterable = mappingIsFilterable(mapping),
@@ -2386,6 +2391,8 @@ pub fn freeFieldCapabilities(alloc: Allocator, capabilities: []FieldCapability) 
 
 pub fn cloneFieldCapabilityAlloc(alloc: Allocator, capability: FieldCapability) !FieldCapability {
     var cloned = capability;
+    cloned.logical_field = if (capability.logical_field) |value| try alloc.dupe(u8, value) else null;
+    errdefer if (cloned.logical_field) |value| alloc.free(value);
     cloned.name = if (capability.name) |value| try alloc.dupe(u8, value) else null;
     errdefer if (cloned.name) |value| alloc.free(value);
     cloned.field = if (capability.field) |value| try alloc.dupe(u8, value) else null;
@@ -2430,6 +2437,7 @@ pub fn cloneFieldCapabilitiesAlloc(alloc: Allocator, capabilities: []const Field
 }
 
 pub fn freeOwnedFieldCapability(alloc: Allocator, capability: FieldCapability) void {
+    if (capability.logical_field) |value| alloc.free(value);
     if (capability.name) |value| alloc.free(value);
     if (capability.field) |value| alloc.free(value);
     if (capability.path_pattern) |value| alloc.free(value);
@@ -4223,5 +4231,135 @@ test "schema v02 public binding preserves writer fields and refuses modern confl
         const actual = try store.get(alloc, key);
         defer alloc.free(actual);
         try std.testing.expectEqualSlices(u8, bytes, actual);
+    }
+}
+
+pub const LogicalDocValues = struct { field: []const u8, mapping: FieldMapping };
+
+/// Prefer an explicitly addressed typed representation. A text source may use
+/// one unambiguous raw keyword companion; conflicting alternatives fail closed.
+pub fn resolveLogicalDocValues(schema: TableSchema, source: []const u8) ?LogicalDocValues {
+    if (resolveDeclaredFieldType(schema, source)) |mapping| {
+        if (mappingHasNativeDocValues(mapping) and mapping.field_type != .text and mapping.field_type != .html and mapping.field_type != .substring and mapping.field_type != .search_as_you_type) return .{ .field = source, .mapping = mapping };
+    }
+    var selected: ?LogicalDocValues = null;
+    for (schema.exact_fields) |field| {
+        if (!std.mem.eql(u8, field.source_field, source) or !std.mem.eql(u8, field.mapping.analyzer, "keyword") or field.mapping.field_type != .keyword or !mappingHasNativeDocValues(field.mapping)) continue;
+        if (selected) |previous| if (!std.mem.eql(u8, previous.field, field.field)) return null;
+        selected = .{ .field = field.field, .mapping = field.mapping };
+    }
+    return selected;
+}
+
+/// Conservative source-to-index resolution shared by logical value planning.
+/// Every document schema must agree; never infer compatibility from a suffix.
+pub fn resolveLogicalTextRepresentation(schema: TableSchema, source: []const u8, analyzer: []const u8) ?[]const u8 {
+    if (schema.full_text_documents.len == 0) {
+        var selected: ?[]const u8 = null;
+        for (schema.exact_fields) |field| {
+            if (!std.mem.eql(u8, field.source_field, source) or !field.mapping.do_index or !std.mem.eql(u8, field.mapping.analyzer, analyzer)) continue;
+            if (selected) |previous| if (!std.mem.eql(u8, previous, field.field)) return null;
+            selected = field.field;
+        }
+        return selected;
+    }
+    var selected: ?[]const u8 = null;
+    for (schema.full_text_documents) |document| {
+        var found: ?[]const u8 = null;
+        for (document.fields) |field| {
+            if (!std.mem.eql(u8, field.path, source) or !std.mem.eql(u8, field.analyzer, analyzer)) continue;
+            if (found != null and !std.mem.eql(u8, found.?, field.emitted_name)) return null;
+            found = field.emitted_name;
+        }
+        if (found == null) return null;
+        if (selected != null and !std.mem.eql(u8, selected.?, found.?)) return null;
+        selected = found;
+    }
+    return selected;
+}
+
+/// Resolve a declared generated analyzer through its source association. The
+/// suffix is the generator's representation contract, never a source-field guess.
+pub fn resolveLogicalAutocompleteRoot(schema: TableSchema, source: []const u8) ?[]const u8 {
+    var root: ?[]const u8 = null;
+    if (resolveLogicalTextRepresentation(schema, source, "search_as_you_type_2gram")) |companion| {
+        const suffix = "._2gram";
+        if (!std.mem.endsWith(u8, companion, suffix)) return null;
+        root = companion[0 .. companion.len - suffix.len];
+    }
+    // Detailed x-antfly-field mappings also support explicitly named analyzed
+    // representations. Their configured analyzer is executable on the root;
+    // they do not necessarily emit the shorthand's generated shingle fields.
+    for (schema.exact_fields) |field| {
+        if (!std.mem.eql(u8, field.source_field, source) or field.mapping.field_type != .search_as_you_type or !field.mapping.do_index) continue;
+        if (root) |previous| if (!std.mem.eql(u8, previous, field.field)) return null;
+        root = field.field;
+    }
+    return root;
+}
+
+/// Observed emitted fields must recover their source from a declaration; their
+/// spelling alone cannot establish that a JSON source property exists.
+fn declaredLogicalSource(schema: TableSchema, emitted: []const u8) ?[]const u8 {
+    for (schema.exact_fields) |field| if (std.mem.eql(u8, field.field, emitted)) return field.source_field;
+    var source: ?[]const u8 = null;
+    for (schema.full_text_documents) |doc| for (doc.fields) |field| {
+        if (!std.mem.eql(u8, field.emitted_name, emitted)) continue;
+        if (source) |previous| if (!std.mem.eql(u8, previous, field.path)) return null;
+        source = field.path;
+    };
+    return source;
+}
+
+test "logical query representation resolution rejects ambiguity and preserves explicit fields" {
+    const schema: TableSchema = .{ .exact_fields = &.{
+        .{ .source_field = "title", .field = "title", .mapping = .{ .field_type = .text, .analyzer = "standard" } },
+        .{ .source_field = "title", .field = "title._keyword", .mapping = .{ .field_type = .keyword, .analyzer = "keyword", .doc_values = true, .sortable = true } },
+    } };
+    try std.testing.expectEqualStrings("title._keyword", resolveLogicalDocValues(schema, "title").?.field);
+    try std.testing.expectEqualStrings("title._keyword", resolveLogicalDocValues(schema, "title._keyword").?.field);
+    const ambiguous: TableSchema = .{ .exact_fields = &.{
+        schema.exact_fields[0],                                                                        schema.exact_fields[1],
+        .{ .source_field = "title", .field = "title.raw", .mapping = schema.exact_fields[1].mapping },
+    } };
+    try std.testing.expect(resolveLogicalDocValues(ambiguous, "title") == null);
+    try std.testing.expect(resolveLogicalTextRepresentation(ambiguous, "title", "keyword") == null);
+}
+
+test "logical query autocomplete follows named source representations and rejects ambiguity" {
+    const schema: TableSchema = .{ .full_text_documents = &.{.{ .name = "doc", .fields = &.{
+        .{ .path = "title", .emitted_name = "title.suggest._2gram", .analyzer = "search_as_you_type_2gram" },
+    } }} };
+    try std.testing.expectEqualStrings("title.suggest", resolveLogicalAutocompleteRoot(schema, "title").?);
+    try std.testing.expect(resolveLogicalAutocompleteRoot(schema, "absent") == null);
+    const observed = observedDynamicFieldCapability(schema, "title.suggest._2gram", .{ .field_type = .search_as_you_type });
+    try std.testing.expectEqualStrings("title", observed.logical_field.?);
+    const unknown = observedDynamicFieldCapability(schema, "unknown._2gram", .{ .field_type = .search_as_you_type });
+    try std.testing.expect(unknown.logical_field == null);
+}
+
+test "logical query named autocomplete supports detailed mappings without generated shingles" {
+    const schema: TableSchema = .{
+        .exact_fields = &.{
+            .{ .source_field = "title", .field = "title", .mapping = .{ .field_type = .text } },
+            .{ .source_field = "title", .field = "title.suggest", .mapping = .{ .field_type = .search_as_you_type, .analyzer = "search_as_you_type" } },
+        },
+        .full_text_documents = &.{.{ .name = "doc", .fields = &.{.{ .path = "title", .emitted_name = "title", .analyzer = "standard" }} }},
+    };
+    try std.testing.expectEqualStrings("title.suggest", resolveLogicalAutocompleteRoot(schema, "title").?);
+    var ambiguous = schema;
+    ambiguous.exact_fields = &.{ schema.exact_fields[1], .{ .source_field = "title", .field = "title.other", .mapping = .{ .field_type = .search_as_you_type } } };
+    try std.testing.expect(resolveLogicalAutocompleteRoot(ambiguous, "title") == null);
+}
+
+test "declared scalar shorthand capabilities retain their logical source" {
+    const schema: TableSchema = .{ .declared_fields = &.{
+        .{ .field = "size", .mapping = .{ .field_type = .numeric } },
+        .{ .field = "modified_at", .mapping = .{ .field_type = .datetime } },
+    } };
+    for (schema.declared_fields) |field| {
+        const capability = declaredFieldCapability(schema, field);
+        try std.testing.expectEqualStrings(field.field, capability.logical_field.?);
+        try std.testing.expect(!capability.sortable);
     }
 }

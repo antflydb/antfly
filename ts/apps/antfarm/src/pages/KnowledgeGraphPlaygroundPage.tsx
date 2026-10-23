@@ -6,7 +6,6 @@ import {
   CardHeader,
   CardTitle,
   Checkbox,
-  DashboardPage,
   DashboardPageActions,
   DashboardPageDescription,
   DashboardPageHeader,
@@ -21,11 +20,14 @@ import {
   TabsTrigger,
   Textarea,
 } from "@antfly/design-system";
-import { ReloadIcon } from "@radix-ui/react-icons";
 import { Clock, GitBranch, Hash, Network, Plus, RotateCcw, X, Zap } from "lucide-react";
 import type React from "react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { useSearchParams } from "react-router-dom";
+import {
+  AIWorkflowContextBar,
+  AIWorkflowPage,
+  AIWorkflowSubmitButton,
+} from "@/components/ai-workflow";
 import { PlaygroundEmptyState } from "@/components/branded-empty-state";
 import { Combobox } from "@/components/Combobox";
 import { BackendInfoBar } from "@/components/playground/BackendInfoBar";
@@ -33,9 +35,11 @@ import { NoModelsGuide } from "@/components/playground/NoModelsGuide";
 import type { SamplePreset } from "@/components/playground/SamplePresets";
 import { SamplePresets } from "@/components/playground/SamplePresets";
 import { useApiConfig } from "@/hooks/use-api-config";
-import { useSelectedInferenceModelNames } from "@/hooks/use-connections";
+import { useSelectedInferenceModels } from "@/hooks/use-connections";
+import { useModelSelection } from "@/hooks/use-model-selection";
 import { extractionUnavailableReason } from "@/lib/extraction-model";
-import { fetchWithRetry } from "@/lib/utils";
+import { modelsAcceptingInput } from "@/lib/inference-playground-contracts";
+import { beginAbortableRequest, fetchInferenceJson, finishAbortableRequest } from "@/lib/utils";
 
 // Entity and relation response types matching the Antfly extraction API.
 interface ExtractEntity {
@@ -179,17 +183,14 @@ function getNodeColor(type: string): string {
   return ENTITY_TYPE_COLORS[type.toLowerCase()] || ENTITY_TYPE_COLORS.default;
 }
 
-// Get the actual model name (strip "rel:" prefix for REBEL models)
-function getModelName(model: string): string {
-  if (model.startsWith("rel:")) {
-    return model.slice(4);
-  }
-  return model;
+function untypedRelationName(label: string): string {
+  const parts = label.split("::");
+  return parts.length === 3 ? parts[1] : label;
 }
 
 const KnowledgeGraphPlaygroundPage: React.FC = () => {
   const { inferenceUrl } = useApiConfig();
-  const [searchParams, setSearchParams] = useSearchParams();
+  const requestEndpoint = inferenceUrl("extract");
 
   // Restore state from localStorage
   const [inputText, setInputText] = useState(() => {
@@ -201,7 +202,7 @@ const KnowledgeGraphPlaygroundPage: React.FC = () => {
     }
     return "";
   });
-  const [selectedModel, setSelectedModel] = useState(() => {
+  const storedModel = useMemo(() => {
     try {
       const saved = localStorage.getItem(STORAGE_KEY);
       if (saved) return JSON.parse(saved).selectedModel || "";
@@ -209,7 +210,7 @@ const KnowledgeGraphPlaygroundPage: React.FC = () => {
       /* ignore */
     }
     return "";
-  });
+  }, []);
   const [entityLabels, setEntityLabels] = useState<string[]>(() => {
     try {
       const saved = localStorage.getItem(STORAGE_KEY);
@@ -259,13 +260,32 @@ const KnowledgeGraphPlaygroundPage: React.FC = () => {
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [processingTime, setProcessingTime] = useState<number | null>(null);
-  const [availableModels, setAvailableModels] = useState<string[]>([]);
-  const [modelsLoaded, setModelsLoaded] = useState(false);
   const [selectedNode, setSelectedNode] = useState<KGNode | null>(null);
   const [selectedEdge, setSelectedEdge] = useState<KGEdge | null>(null);
   const abortControllerRef = useRef<AbortController | null>(null);
-  const { models: connectionModels, loading: modelsLoading } =
-    useSelectedInferenceModelNames("extractor");
+  const { models: connectedModels, loading: modelsLoading } =
+    useSelectedInferenceModels("extractor");
+  const connectionModels = useMemo(
+    () =>
+      modelsAcceptingInput(connectedModels, "text")
+        .filter((model) => !model.capabilities || model.capabilities.includes("relations"))
+        .map((model) => model.name),
+    [connectedModels]
+  );
+  const availableModels = connectionModels;
+  const modelsLoaded = !modelsLoading;
+  const { model: selectedModel, setModel: setSelectedModel } = useModelSelection({
+    models: connectionModels,
+    defaultModel: storedModel,
+    preserveRequestedModel: true,
+  });
+
+  const selectedModelInfo = connectedModels.find((model) => model.name === selectedModel);
+  // Prefer server-resolved schema capabilities, including renamed artifacts.
+  // Older servers identify REBEL only by its conventional model basename.
+  const untypedEntities =
+    selectedModelInfo?.capabilities?.includes("untyped_entities") ||
+    selectedModel.split("/").at(-1)?.toLowerCase().includes("rebel") === true;
 
   // Persist state to localStorage
   useEffect(() => {
@@ -275,34 +295,21 @@ const KnowledgeGraphPlaygroundPage: React.FC = () => {
     );
   }, [inputText, selectedModel, entityLabels, relationLabels, config]);
 
+  // biome-ignore lint/correctness/useExhaustiveDependencies: model/backend identity invalidates in-flight results
   useEffect(() => {
-    const models = connectionModels.map((model) =>
-      model.toLowerCase().includes("rebel") ? `rel:${model}` : model
-    );
-    setAvailableModels(models);
-    setSelectedModel((current: string) => current || models[0] || "");
-    setModelsLoaded(!modelsLoading);
-  }, [connectionModels, modelsLoading]);
+    abortControllerRef.current?.abort();
+    abortControllerRef.current = null;
+    setIsLoading(false);
+    setResult(null);
+    setSelectedNode(null);
+    setSelectedEdge(null);
+    setError(null);
+    setProcessingTime(null);
+    return () => abortControllerRef.current?.abort();
+  }, [selectedModel, requestEndpoint]);
 
-  // Handle ?model= URL param from Model Directory "Open in Playground"
-  useEffect(() => {
-    const modelParam = searchParams.get("model");
-    if (modelParam && modelsLoaded) {
-      setSelectedModel(modelParam);
-      setSearchParams(
-        (prev) => {
-          prev.delete("model");
-          return prev;
-        },
-        { replace: true }
-      );
-    }
-  }, [searchParams, modelsLoaded, setSearchParams]);
-
-  // Check if the selected model is a REBEL model
-  const isRebelModel = selectedModel.startsWith("rel:");
   const unavailableReason = extractionUnavailableReason(
-    getModelName(selectedModel),
+    selectedModel,
     connectionModels,
     modelsLoading
   );
@@ -323,18 +330,12 @@ const KnowledgeGraphPlaygroundPage: React.FC = () => {
       return;
     }
 
-    // Only require entity labels for GLiNER models (REBEL doesn't need them)
-    if (!isRebelModel && entityLabels.length === 0) {
+    if (!untypedEntities && entityLabels.length === 0) {
       setError("Please add at least one entity label");
       return;
     }
 
-    // Cancel any previous request
-    if (abortControllerRef.current) {
-      abortControllerRef.current.abort();
-    }
-
-    abortControllerRef.current = new AbortController();
+    const controller = beginAbortableRequest(abortControllerRef);
     setIsLoading(true);
     setError(null);
     setResult(null);
@@ -352,11 +353,13 @@ const KnowledgeGraphPlaygroundPage: React.FC = () => {
 
       // The current serving listing exposes the legacy extraction protocol.
       const requestBody: Record<string, unknown> = {
-        model: getModelName(selectedModel),
+        model: selectedModel,
         inputs: texts.map((content: string) => ({ content })),
         schema: {
-          relations: relationLabels.map((type) => ({ type })),
-          ...(!isRebelModel ? { entities: entityLabels } : {}),
+          relations: relationLabels.map((type) => ({
+            type: untypedEntities ? untypedRelationName(type) : type,
+          })),
+          entities: untypedEntities ? ["ENTITY"] : entityLabels,
         },
         options: {
           include_confidence: true,
@@ -365,25 +368,23 @@ const KnowledgeGraphPlaygroundPage: React.FC = () => {
         },
       };
 
-      const response = await fetchWithRetry(inferenceUrl("extract"), {
+      const data = await fetchInferenceJson<ExtractResponse>(requestEndpoint, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
         },
         body: JSON.stringify(requestBody),
-        signal: abortControllerRef.current.signal,
+        signal: controller.signal,
       });
-
-      if (!response.ok) {
-        const errorText = await response.text();
-        throw new Error(errorText || `HTTP ${response.status}`);
-      }
-
-      const data: ExtractResponse = await response.json();
+      if (abortControllerRef.current !== controller || controller.signal.aborted) return;
       setResult(buildGraphFromResponse(data));
       setProcessingTime(performance.now() - startTime);
     } catch (err) {
-      if (err instanceof Error && err.name === "AbortError") {
+      if (
+        abortControllerRef.current !== controller ||
+        controller.signal.aborted ||
+        (err instanceof Error && err.name === "AbortError")
+      ) {
         return;
       }
       setError(
@@ -392,17 +393,17 @@ const KnowledgeGraphPlaygroundPage: React.FC = () => {
           : "Failed to connect to Antfly inference. Make sure the runtime is running."
       );
     } finally {
-      setIsLoading(false);
+      if (finishAbortableRequest(abortControllerRef, controller)) setIsLoading(false);
     }
   }, [
     inputText,
     selectedModel,
-    isRebelModel,
     unavailableReason,
+    untypedEntities,
     entityLabels,
     relationLabels,
     config,
-    inferenceUrl,
+    requestEndpoint,
   ]);
 
   // Cmd+Enter shortcut
@@ -418,6 +419,9 @@ const KnowledgeGraphPlaygroundPage: React.FC = () => {
   }, [handleBuildGraph]);
 
   const handleReset = () => {
+    abortControllerRef.current?.abort();
+    abortControllerRef.current = null;
+    setIsLoading(false);
     setInputText("");
     setEntityLabels(DEFAULT_ENTITY_LABELS);
     setRelationLabels(DEFAULT_RELATION_LABELS);
@@ -627,14 +631,14 @@ const KnowledgeGraphPlaygroundPage: React.FC = () => {
   }, [result, selectedNode, selectedEdge]);
 
   return (
-    <DashboardPage className="h-full space-y-3">
+    <AIWorkflowPage className="h-full space-y-3">
       <DashboardPageHeader>
         <div>
           <DashboardPageTitle className="font-aeonik">
             Knowledge Graph Playground
           </DashboardPageTitle>
           <DashboardPageDescription>
-            Build knowledge graphs from text using REBEL or GLiNER models
+            Build knowledge graphs from text with a relation-capable extraction model
           </DashboardPageDescription>
         </div>
         <DashboardPageActions>
@@ -645,9 +649,9 @@ const KnowledgeGraphPlaygroundPage: React.FC = () => {
           </Button>
         </DashboardPageActions>
       </DashboardPageHeader>
-
-      <BackendInfoBar />
-
+      <AIWorkflowContextBar>
+        <BackendInfoBar />
+      </AIWorkflowContextBar>
       {modelsLoaded && availableModels.length === 0 && (
         <NoModelsGuide
           modelType="extractor"
@@ -655,7 +659,6 @@ const KnowledgeGraphPlaygroundPage: React.FC = () => {
           typeName="relation extraction"
         />
       )}
-
       {/* Configuration Panel */}
       <Card>
         <CardHeader className="pb-4">
@@ -669,7 +672,7 @@ const KnowledgeGraphPlaygroundPage: React.FC = () => {
               <Combobox
                 options={availableModels.map((model) => ({
                   value: model,
-                  label: model.startsWith("rel:") ? `${model.slice(4)} (REBEL)` : model,
+                  label: model,
                 }))}
                 value={selectedModel}
                 onChange={setSelectedModel}
@@ -679,11 +682,6 @@ const KnowledgeGraphPlaygroundPage: React.FC = () => {
                 allowCustomValue
                 disabled={!modelsLoaded}
               />
-              {isRebelModel && (
-                <p className="text-xs text-muted-foreground">
-                  REBEL models extract 200+ relation types automatically
-                </p>
-              )}
               {unavailableReason && (
                 <p className="text-xs text-muted-foreground">{unavailableReason}</p>
               )}
@@ -708,99 +706,104 @@ const KnowledgeGraphPlaygroundPage: React.FC = () => {
             </div>
           </div>
 
-          {/* Labels Configuration - only for GLiNER models */}
-          {!isRebelModel && (
-            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-              {/* Entity Labels */}
-              <div className="space-y-2">
-                <Label>Entity Labels</Label>
-                <div className="flex flex-wrap gap-2 mb-2">
-                  {entityLabels.map((label) => (
-                    <Badge
-                      key={label}
-                      style={{
-                        backgroundColor: `${getNodeColor(label)}20`,
-                        borderColor: getNodeColor(label),
-                      }}
-                      className="border gap-1"
+          {/* Labels Configuration */}
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+            {/* Entity Labels */}
+            <div className="space-y-2">
+              <Label>Entity Labels</Label>
+              {untypedEntities ? (
+                <p className="text-sm text-muted-foreground">
+                  This model emits generic ENTITY nodes. Relation names can be constrained below.
+                </p>
+              ) : null}
+              <div className="flex flex-wrap gap-2 mb-2">
+                {(untypedEntities ? ["ENTITY"] : entityLabels).map((label) => (
+                  <Badge
+                    key={label}
+                    style={{
+                      backgroundColor: `${getNodeColor(label)}20`,
+                      borderColor: getNodeColor(label),
+                    }}
+                    className="border gap-1"
+                  >
+                    {label}
+                    <button
+                      type="button"
+                      disabled={untypedEntities}
+                      onClick={() => setEntityLabels(entityLabels.filter((l) => l !== label))}
+                      className="ml-1 hover:opacity-70"
                     >
-                      {label}
-                      <button
-                        type="button"
-                        onClick={() => setEntityLabels(entityLabels.filter((l) => l !== label))}
-                        className="ml-1 hover:opacity-70"
-                      >
-                        <X className="h-3 w-3" />
-                      </button>
-                    </Badge>
-                  ))}
-                </div>
-                <div className="flex gap-2">
-                  <Input
-                    placeholder="Add entity label..."
-                    value={newEntityLabel}
-                    onChange={(e) => setNewEntityLabel(e.target.value)}
-                    onKeyDown={(e) => {
-                      if (e.key === "Enter") {
-                        e.preventDefault();
-                        handleAddEntityLabel();
-                      }
-                    }}
-                    className="flex-1"
-                  />
-                  <Button
-                    variant="outline"
-                    size="sm"
-                    onClick={handleAddEntityLabel}
-                    disabled={!newEntityLabel.trim()}
-                  >
-                    <Plus className="h-4 w-4" />
-                  </Button>
-                </div>
+                      <X className="h-3 w-3" />
+                    </button>
+                  </Badge>
+                ))}
               </div>
-
-              {/* Relation Labels */}
-              <div className="space-y-2">
-                <Label>Relation Labels</Label>
-                <div className="flex flex-wrap gap-2 mb-2">
-                  {relationLabels.map((label) => (
-                    <Badge key={label} className="gap-1">
-                      {label}
-                      <button
-                        type="button"
-                        onClick={() => setRelationLabels(relationLabels.filter((l) => l !== label))}
-                        className="ml-1 hover:opacity-70"
-                      >
-                        <X className="h-3 w-3" />
-                      </button>
-                    </Badge>
-                  ))}
-                </div>
-                <div className="flex gap-2">
-                  <Input
-                    placeholder="Add relation label..."
-                    value={newRelationLabel}
-                    onChange={(e) => setNewRelationLabel(e.target.value)}
-                    onKeyDown={(e) => {
-                      if (e.key === "Enter") {
-                        e.preventDefault();
-                        handleAddRelationLabel();
-                      }
-                    }}
-                    className="flex-1"
-                  />
-                  <Button
-                    variant="outline"
-                    size="sm"
-                    onClick={handleAddRelationLabel}
-                    disabled={!newRelationLabel.trim()}
-                  >
-                    <Plus className="h-4 w-4" />
-                  </Button>
-                </div>
+              <div className="flex gap-2">
+                <Input
+                  disabled={untypedEntities}
+                  placeholder="Add entity label..."
+                  value={newEntityLabel}
+                  onChange={(e) => setNewEntityLabel(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter") {
+                      e.preventDefault();
+                      handleAddEntityLabel();
+                    }
+                  }}
+                  className="flex-1"
+                />
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={handleAddEntityLabel}
+                  disabled={untypedEntities || !newEntityLabel.trim()}
+                >
+                  <Plus className="h-4 w-4" />
+                </Button>
               </div>
             </div>
-          )}
+
+            {/* Relation Labels */}
+            <div className="space-y-2">
+              <Label>Relation Labels</Label>
+              <div className="flex flex-wrap gap-2 mb-2">
+                {relationLabels.map((label) => (
+                  <Badge key={label} className="gap-1">
+                    {untypedEntities ? untypedRelationName(label) : label}
+                    <button
+                      type="button"
+                      onClick={() => setRelationLabels(relationLabels.filter((l) => l !== label))}
+                      className="ml-1 hover:opacity-70"
+                    >
+                      <X className="h-3 w-3" />
+                    </button>
+                  </Badge>
+                ))}
+              </div>
+              <div className="flex gap-2">
+                <Input
+                  placeholder="Add relation label..."
+                  value={newRelationLabel}
+                  onChange={(e) => setNewRelationLabel(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter") {
+                      e.preventDefault();
+                      handleAddRelationLabel();
+                    }
+                  }}
+                  className="flex-1"
+                />
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={handleAddRelationLabel}
+                  disabled={!newRelationLabel.trim()}
+                >
+                  <Plus className="h-4 w-4" />
+                </Button>
+              </div>
+            </div>
+          </div>
 
           {/* Advanced Options */}
           <div className="flex flex-wrap gap-x-6 gap-y-2 text-sm">
@@ -837,33 +840,29 @@ const KnowledgeGraphPlaygroundPage: React.FC = () => {
           </div>
 
           <FormActions>
-            <Button
+            <AIWorkflowSubmitButton
               onClick={handleBuildGraph}
               disabled={isLoading || !inputText.trim() || !selectedModel || !!unavailableReason}
+              running={isLoading}
+              runningLabel="Building"
+              onCancel={() => {
+                abortControllerRef.current?.abort();
+                abortControllerRef.current = null;
+                setIsLoading(false);
+              }}
             >
-              {isLoading ? (
-                <>
-                  <ReloadIcon className="h-4 w-4 mr-2 animate-spin" />
-                  Building
-                </>
-              ) : (
-                <>
-                  <Network className="h-4 w-4 mr-2" />
-                  Build Graph
-                </>
-              )}
-            </Button>
+              <Network className="h-4 w-4 mr-2" />
+              Build Graph
+            </AIWorkflowSubmitButton>
           </FormActions>
         </CardContent>
       </Card>
-
       {/* Error Display */}
       {error && (
         <div className="rounded-none border border-destructive/30 bg-destructive/10 p-4 text-sm text-destructive">
           {error}
         </div>
       )}
-
       {/* Results Stats Bar */}
       {result && (
         <DashboardToolbar className="flex-row items-center gap-3 md:items-center">
@@ -887,7 +886,6 @@ const KnowledgeGraphPlaygroundPage: React.FC = () => {
           )}
         </DashboardToolbar>
       )}
-
       {/* Main Content */}
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
         {/* Input Panel */}
@@ -1036,7 +1034,6 @@ const KnowledgeGraphPlaygroundPage: React.FC = () => {
           </CardContent>
         </Card>
       </div>
-
       {/* Help text */}
       <div className="text-xs text-muted-foreground space-y-1">
         <p>
@@ -1053,7 +1050,7 @@ const KnowledgeGraphPlaygroundPage: React.FC = () => {
           GLiNER2.5 uses strict schema v2 JointIE with typed endpoints.
         </p>
       </div>
-    </DashboardPage>
+    </AIWorkflowPage>
   );
 };
 

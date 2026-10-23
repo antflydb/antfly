@@ -24,6 +24,46 @@ const catalog = dependencies.sql_catalog;
 const key = "\x00antfly/embedded/sql-commit/v1";
 const Record = struct { id: h.db_mod.types.TxnId, timestamp: u64, tables: []const []const u8 };
 
+/// Serializes recovery with live preparation/decision and promotion's
+/// canonical read/merge. Never retain this gate during provider computation or
+/// request visibility waits. Native path admission is acquired before this gate.
+pub const Coordinator = struct {
+    handle: *h.Handle,
+    pub fn release(self: Coordinator) void {
+        self.handle.sql_commit_mutex.unlock(h.handleLockIo());
+    }
+    pub fn recover(self: Coordinator) !void {
+        return recoverLocked(self.handle);
+    }
+    pub fn commit(self: Coordinator, requests: []const contract.TableCommitRequest, out_id: *?h.db_mod.types.TxnId) !catalog.MutationOutcome {
+        return commitLocked(self.handle, requests, out_id);
+    }
+};
+const TestHook = struct { ptr: *anyopaque, run: *const fn (*anyopaque) anyerror!void };
+var test_after_prepare: if (h.builtin.is_test) ?TestHook else void = if (h.builtin.is_test) null else {};
+var test_contended_acquire: if (h.builtin.is_test) ?TestHook else void = if (h.builtin.is_test) null else {};
+
+pub fn acquire(handle: *h.Handle) Coordinator {
+    if (comptime h.builtin.is_test) {
+        if (handle.sql_commit_mutex.tryLock()) return .{ .handle = handle };
+        if (test_contended_acquire) |hook| hook.run(hook.ptr) catch @panic("coordinator test hook failed");
+    }
+    handle.sql_commit_mutex.lockUncancelable(h.handleLockIo());
+    return .{ .handle = handle };
+}
+
+pub fn recover(handle: *h.Handle) !void {
+    const coordinator = acquire(handle);
+    defer coordinator.release();
+    return coordinator.recover();
+}
+
+pub fn commit(handle: *h.Handle, requests: []const contract.TableCommitRequest, out_id: *?h.db_mod.types.TxnId) !catalog.MutationOutcome {
+    const coordinator = acquire(handle);
+    defer coordinator.release();
+    return coordinator.commit(requests, out_id);
+}
+
 fn store(handle: *h.Handle, record: ?Record) !void {
     handle.sql_commit_recovery_needed = true;
     const bytes = if (record) |value| try std.json.Stringify.valueAlloc(handle.alloc, value, .{}) else null;
@@ -34,7 +74,7 @@ fn store(handle: *h.Handle, record: ?Record) !void {
     try write.commit();
 }
 
-pub fn recover(handle: *h.Handle) !void {
+fn recoverLocked(handle: *h.Handle) !void {
     if (handle.sql_decision_uncertain) return error.SqlMutationOutcomeUnknown;
     if (!handle.sql_commit_recovery_needed) return;
     if (h.builtin.is_test) handle.sql_commit_recovery_scans +%= 1;
@@ -82,9 +122,9 @@ pub fn recover(handle: *h.Handle) !void {
     handle.db.markTransactionParticipantsResolved(record.id, record.tables) catch return;
 }
 
-pub fn commit(handle: *h.Handle, requests: []const contract.TableCommitRequest, out_id: *?h.db_mod.types.TxnId) !catalog.MutationOutcome {
+fn commitLocked(handle: *h.Handle, requests: []const contract.TableCommitRequest, out_id: *?h.db_mod.types.TxnId) !catalog.MutationOutcome {
     if (requests.len == 0) return .committed;
-    try recover(handle);
+    try recoverLocked(handle);
     const io = handle.db.backend_runtime.io() orelse return error.UnsupportedSqlExecution;
     const now: u64 = @intCast(@max(0, std.Io.Clock.real.now(io).nanoseconds));
     var id: h.db_mod.types.TxnId = undefined;
@@ -98,7 +138,7 @@ pub fn commit(handle: *h.Handle, requests: []const contract.TableCommitRequest, 
     _ = try handle.db.beginTransactionScoped(id, now, now, names, true, true, null);
     var decision_started = false;
     errdefer if (!decision_started) {
-        recover(handle) catch {};
+        recoverLocked(handle) catch {};
     };
     for (requests) |request| {
         const db = try @import("tables.zig").get(handle, request.table_name);
@@ -116,6 +156,7 @@ pub fn commit(handle: *h.Handle, requests: []const contract.TableCommitRequest, 
             .relational_retirement = request.relational_retirement,
         });
     }
+    if (comptime h.builtin.is_test) if (test_after_prepare) |hook| try hook.run(hook.ptr);
     out_id.* = id;
     decision_started = true;
     handle.db.commitTransaction(id, now +| 1) catch {
@@ -128,7 +169,64 @@ pub fn commit(handle: *h.Handle, requests: []const contract.TableCommitRequest, 
             return error.SqlMutationOutcomeUnknown;
         }
     };
-    recover(handle) catch return .committed_pending;
+    recoverLocked(handle) catch return .committed_pending;
     out_id.* = null;
     return .committed;
+}
+
+test "capi coordinator recovery waits for a live prepared decision" {
+    const api = @import("db.zig");
+    const tables = @import("tables.zig");
+    var tmp = try api.TestDirectory.init("coordinator-live-prepare");
+    defer tmp.cleanup();
+    const root = try api.openDefaultDirectoryHandle(std.mem.span(tmp.path().ptr));
+    defer h.closeHandle(root);
+    try tables.create(root, "entities", "{}", false);
+    const State = struct {
+        root: *h.Handle,
+        waiting: std.Io.Event = .unset,
+        finished: std.atomic.Value(bool) = .init(false),
+        thread: ?std.Thread = null,
+        failure: ?anyerror = null,
+        fn reader(self: *@This()) void {
+            recover(self.root) catch |err| {
+                self.failure = err;
+            };
+            self.finished.store(true, .release);
+        }
+        fn contended(ptr: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.waiting.set(h.handleLockIo());
+        }
+        fn prepared(ptr: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.thread = try std.Thread.spawn(.{ .stack_size = 16 * 1024 * 1024 }, reader, .{self});
+            try self.waiting.waitTimeout(h.handleLockIo(), .{ .duration = .{ .raw = .fromSeconds(15), .clock = .awake } });
+            try std.testing.expect(!self.finished.load(.acquire));
+            var read = try self.root.db.core.store.beginReadTxn();
+            defer read.abort();
+            const raw = try read.get(key);
+            const record = try std.json.parseFromSlice(Record, std.testing.allocator, raw, .{});
+            defer record.deinit();
+            try std.testing.expectEqual(h.transactions_mod.TxnStatus.pending, try self.root.db.getTransactionStatus(record.value.id));
+        }
+    };
+    var state = State{ .root = root };
+    defer if (state.thread) |thread| thread.join();
+    test_after_prepare = .{ .ptr = &state, .run = State.prepared };
+    test_contended_acquire = .{ .ptr = &state, .run = State.contended };
+    defer {
+        test_after_prepare = null;
+        test_contended_acquire = null;
+    }
+    var transaction: ?h.db_mod.types.TxnId = null;
+    const outcome = try commit(root, &.{.{ .table_name = "entities", .writes = &.{.{ .key = "entity/ada", .value = "{\"name\":\"Ada\"}" }} }}, &transaction);
+    try std.testing.expectEqual(catalog.MutationOutcome.committed, outcome);
+    state.thread.?.join();
+    state.thread = null;
+    if (state.failure) |err| return err;
+    try std.testing.expect(state.finished.load(.acquire));
+    var row = (try (try tables.get(root, "entities")).lookup(std.testing.allocator, "entity/ada", .{})) orelse return error.TestUnexpectedResult;
+    defer row.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("{\"name\":\"Ada\"}", row.json);
 }

@@ -125,6 +125,9 @@ fn encodedParameterKeyIsSensitive(encoded: []const u8) bool {
         index += 1;
     }
     const key = std.mem.trim(u8, decoded_buffer[0..decoded_len], &std.ascii.whitespace);
+    // Escaped separators remain part of one literal name, not another
+    // credential parameter (for example note%26token=example).
+    if (std.mem.indexOfAny(u8, key, "&;=") != null) return false;
     return fieldNameIsSensitive(key);
 }
 
@@ -168,4 +171,20 @@ test "credential URL detection covers authority query fragment and secret refere
     try std.testing.expect(urlContainsCredentials("https://example.com/v1#access_token=secret"));
     try std.testing.expect(!urlContainsCredentials("https://example.com/v1?timeout=10#section"));
     try std.testing.expect(containsSecretReference("${secret:inference_url}"));
+}
+
+test "URL credential aliases preserve encoded parameter boundaries" {
+    for ([_][]const u8{
+        "https://example.com?api_key=secret",
+        "https://example.com?%61pi_key=secret",
+        "https://example.com?bearer_token=secret",
+        "https://example.com?api-token=secret",
+        "https://example.com#capability_token=secret",
+        "https://example.com?note=example;api_key=secret",
+    }) |url| try std.testing.expect(urlContainsCredentials(url));
+    for ([_][]const u8{
+        "https://example.com?note=literal%26token%3Dexample",
+        "https://example.com?note%26token=literal",
+        "https://example.com?note%3Dtoken=literal",
+    }) |url| try std.testing.expect(!urlContainsCredentials(url));
 }

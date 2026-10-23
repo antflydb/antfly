@@ -1,17 +1,17 @@
 // Copyright 2026 Antfly, Inc.
-// SPDX-License-Identifier: Elastic-2.0
+// SPDX-License-Identifier: Apache-2.0
 //
-// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
-// except in compliance with the Elastic License 2.0. You may obtain a copy of
-// the Elastic License 2.0 at
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-//     https://www.antfly.io/licensing/ELv2-license
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// Unless required by applicable law or agreed to in writing, software distributed
-// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
-// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
-// Elastic License 2.0 for the specific language governing permissions and
-// limitations.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 const server_group_metadata = @import("../storage/server_group_metadata.zig");
 const builtin = @import("builtin");
@@ -13258,6 +13258,40 @@ test "metadata table topology protocol fences namespace writers and restored dec
     try std.testing.expectEqual(version, transitionRequiredCoordinatedDecoderVersion(.{ .compare_and_replace_table = .{ .expected = table, .replacement = table } }));
     try std.testing.expectEqual(version, transitionRequiredCoordinatedDecoderVersion(.{ .apply_extension_lifecycle_v2 = .{ .upsert_tables = &.{table} } }));
     try std.testing.expectEqual(version, transitionRequiredCoordinatedDecoderVersion(.{ .apply_restore_staging = "{\"indexes_json\":\"{\\\"_resolver_namespaces\\\":{}}\"}" }));
+    // The predecessor advertises v35 but cannot parse the provenance fields
+    // emitted even by an otherwise empty new curation state. Every table
+    // writer, including reserved-only retired/proposal metadata, must fence it.
+    try std.testing.expect(version > 35);
+    for ([_][]const u8{
+        "{\"_curation_proposals\":{\"proposals\":[]}}",
+        "{\"_resolver_curation\":{\"identities\":[]}}",
+        "{\"_resolver_namespaces\":{\"namespaces\":[]}}",
+    }) |indexes| {
+        var replacement = table;
+        replacement.indexes_json = indexes;
+        try std.testing.expectEqual(version, transitionRequiredCoordinatedDecoderVersion(.{ .upsert_table = replacement }));
+        try std.testing.expectEqual(version, transitionRequiredCoordinatedDecoderVersion(.{ .compare_and_replace_table = .{ .expected = table, .replacement = replacement } }));
+        try std.testing.expectEqual(version, transitionRequiredCoordinatedDecoderVersion(.{ .apply_extension_lifecycle = .{ .upsert_tables = &.{replacement} } }));
+        try std.testing.expectEqual(version, transitionRequiredCoordinatedDecoderVersion(.{ .apply_extension_lifecycle_v2 = .{ .upsert_tables = &.{replacement} } }));
+        const encoded = try std.json.Stringify.valueAlloc(std.testing.allocator, .{ .indexes_json = indexes }, .{});
+        defer std.testing.allocator.free(encoded);
+        try std.testing.expectEqual(version, transitionRequiredCoordinatedDecoderVersion(.{ .apply_restore_staging = encoded }));
+        try std.testing.expectEqual(version, transitionRequiredCoordinatedDecoderVersion(.{ .apply_system_catalog = encoded }));
+    }
+    const incarnation: metadata_mod.MetadataClusterIncarnation = "0123456789abcdef0123456789abcdef".*;
+    var predecessor = MetadataStatus{
+        .metadata_group_id = 42,
+        .metadata_incarnation = incarnation,
+        .metadata_raft_local_node_id = 7,
+        .table_topology_protocol_version = 35,
+        .metrics = .{},
+    };
+    for ([_]u16{ 35, 36 }) |old_version| {
+        predecessor.table_topology_protocol_version = old_version;
+        try std.testing.expect(!tableTopologyProtocolCompatible(predecessor, 42, 7, incarnation, version));
+    }
+    predecessor.table_topology_protocol_version = version;
+    try std.testing.expect(tableTopologyProtocolCompatible(predecessor, 42, 7, incarnation, version));
 }
 
 test "metadata table topology protocol checks the command's required version and exact replica" {

@@ -18,6 +18,12 @@
 
 const db_zig = @import("db.zig");
 const DB = db_zig.DB;
+const schema_mod = @import("../schema.zig");
+const range_cardinality = @import("range_cardinality.zig");
+const apply_state = @import("derived/apply_state.zig");
+const openStoredLogicalSourcesCallback = db_zig.openStoredLogicalSourcesCallback;
+const requestHasLogicalValues = db_zig.requestHasLogicalValues;
+const textQueryHasLogicalValues = db_zig.textQueryHasLogicalValues;
 const TestDirectory = @import("../../common/test_directory.zig").TestDirectory;
 const algebraic_mod = @import("algebraic/mod.zig");
 const ant_json = @import("antfly-json");
@@ -300,6 +306,71 @@ pub fn searchLockedWithExecutionContext(
 
 pub fn searchLockedWithExecutionContextImpl(self: *DB, alloc: Allocator, req: types.SearchRequest, exec_ctx: types.ExecutionContext, externalize_artifact_ids: bool, dense_profile_sink: ?*db_query_search.DenseSearchProfile) !types.SearchResult {
     var request = req;
+    // A caller cannot promote a mutable DB into an immutable cache scope.
+    request.value_search_scope = self.retained_value_scope;
+    if (requestHasLogicalValues(req)) if (self.core.textIndexEntry(req.index_name)) |entry| {
+        // A declared mapping is not a completeness proof. Do not let a
+        // lagging or partial projection exclude a newer primary value.
+        if (!entry.coversPrimaryDocuments() or entry.backfill_active.load(.acquire) != 0) return error.IndexRebuilding;
+        // Retained/restored owners may have a persisted checkpoint newer
+        // than a newly attached worker's in-memory observation.
+        var applied = try self.core.loadAppliedSequence(alloc, entry.config.name);
+        if (self.executor.appliedSequence(entry.config.name)) |live| applied = @max(applied, live);
+        if (applied < self.core.nextDerivedSequence() and self.retained_remote_query_lease != null) {
+            if (self.primary_lsm_storage) |storage| {
+                const checkpoint_path = try apply_state.checkpointPathAlloc(alloc, self.core.path);
+                defer alloc.free(checkpoint_path);
+                const retained = apply_state.loadProjectionCheckpointFromStorage(alloc, storage, checkpoint_path, entry.config.name) catch |err| switch (err) {
+                    error.FileNotFound => null,
+                    else => return err,
+                };
+                if (retained) |checkpoint| applied = @max(applied, checkpoint.applied_sequence);
+            }
+        }
+        // The global tail also includes work for unrelated projections.
+        // Match the existing readiness/debt contract: inspect replay hints
+        // only on the slow path where a global sequence gap exists.
+        const target = if (applied >= self.core.nextDerivedSequence()) applied else try self.probeDerivedReplayTargetSequence(
+            alloc,
+            self.core.replaySource(),
+            .{ .name = entry.config.name, .kind = .full_text },
+            applied,
+        );
+        if (applied < target) {
+            // Empty replicated batches can advance a text replay hint
+            // without producing an index commit/checkpoint. Require both
+            // source and index emptiness; a stale index with deleted rows
+            // must still fail closed, including under boolean negation.
+            const primary_count = try range_cardinality.loadOrProveEmpty(alloc, self.core.store);
+            const empty_projection = if (primary_count != null and primary_count.? == 0) empty: {
+                const empty_snapshot = entry.persistent.acquireSnapshot();
+                defer empty_snapshot.release();
+                break :empty empty_snapshot.liveDocCount() == 0;
+            } else false;
+            if (!empty_projection) {
+                std.log.debug("logical value index checkpoint behind index={s} applied={d} target={d}", .{ entry.config.name, applied, target });
+                return error.IndexRebuilding;
+            }
+        }
+    };
+    var logical_planning = std.heap.ArenaAllocator.init(alloc);
+    defer logical_planning.deinit();
+    if (self.core.schema) |schema| {
+        var changed = false;
+        for (req.order_by) |field| if (schema_mod.resolveLogicalDocValues(schema, field.field)) |resolved| {
+            if (!std.mem.eql(u8, resolved.field, field.field)) changed = true;
+        };
+        if (changed) {
+            const fields = try logical_planning.allocator().dupe(types.SortField, req.order_by);
+            for (fields) |*field| if (schema_mod.resolveLogicalDocValues(schema, field.field)) |resolved| {
+                field.field = resolved.field;
+            };
+            request.order_by = fields;
+        }
+    }
+    var value_work: @import("../../search/value_query.zig").Work = .{};
+    defer value_work.deinit(alloc);
+    if (request.value_search_work == null) request.value_search_work = &value_work;
     var projection: ?document_query.SpanProjectionPlan = null;
     defer if (projection) |*plan| plan.deinit();
     const projection_opts: types.LookupOptions = .{ .fields = req.fields, .include_all_fields = req.include_all_fields };
@@ -310,6 +381,9 @@ pub fn searchLockedWithExecutionContextImpl(self: *DB, alloc: Allocator, req: ty
     }
     var result = try self.searchLockedWithExecutionContextRaw(alloc, request, exec_ctx, externalize_artifact_ids, dense_profile_sink);
     errdefer result.deinit();
+    if (req.profile and req.value_search_work == null) {
+        result.value_search_profile_json = try value_work.profileAlloc(alloc);
+    }
     try self.attachDistributedDocumentAuthority(alloc, req, &result);
     return result;
 }
@@ -551,6 +625,10 @@ pub fn searchText(self: *DB, alloc: Allocator, req: types.SearchRequest) !types.
 }
 
 pub fn searchTextQuery(self: *DB, alloc: Allocator, req: types.SearchRequest, text_query: types.TextQuery) !types.SearchResult {
+    if (self.core.textIndexEntry(req.index_name) == null and (textQueryHasLogicalValues(text_query) or (if (req.filter_text) |filter| textQueryHasLogicalValues(filter) else false) or (if (req.exclusion_text) |filter| textQueryHasLogicalValues(filter) else false))) {
+        return self.searchLogicalValuesWithoutTextIndex(alloc, req, text_query);
+    }
+
     // A primary-document projection may also contain generated members.
     // For a plain source-parent match_all those members cannot add a parent
     // or improve its constant score. Read the primary population directly,
@@ -633,6 +711,9 @@ pub fn searchTextQuery(self: *DB, alloc: Allocator, req: types.SearchRequest, te
         null
     else
         try db_query_search.resolveStructuredTextDocNumFilterForComposedAlloc(alloc, execution_req, .{
+            .load_stored = loadStoredSearchDocumentCallback,
+            .load_many_stored_values = loadStoredSearchDocumentManyCallback,
+            .open_logical_sources = openStoredLogicalSourcesCallback,
             .ctx = self,
             .text_index_entry = textIndexEntryCallback,
             .resolve_doc_set_doc_ids = resolveDocSetDocIdsCallback,
@@ -667,6 +748,8 @@ pub fn searchTextQuery(self: *DB, alloc: Allocator, req: types.SearchRequest, te
         .search_match_all = searchMatchAllCallback,
         .project_stored_search = projectStoredBytesForSearchCallback,
         .load_stored = loadStoredSearchDocumentCallback,
+        .load_many_stored_values = loadStoredSearchDocumentManyCallback,
+        .open_logical_sources = openStoredLogicalSourcesCallback,
         .load_projected_documents = loadProjectedSearchDocumentManyCallback,
         .is_expired_key = isNonvisibleStoredSearchKeyCallback,
         .resolve_doc_set_doc_ids = resolveDocSetDocIdsCallback,
@@ -1138,6 +1221,9 @@ pub fn searchRequestWithAlgebraicDocFilterAlloc(self: *DB, req: types.SearchRequ
 
 pub fn searchRequestWithDynamicStructuredDocFilterAlloc(self: *DB, req: types.SearchRequest) !?AlgebraicDocFilterRequest {
     var resolved = (try db_query_search.resolveStructuredDocFilterForComposedAlloc(self.alloc, req, .{
+        .load_stored = loadStoredSearchDocumentCallback,
+        .load_many_stored_values = loadStoredSearchDocumentManyCallback,
+        .open_logical_sources = openStoredLogicalSourcesCallback,
         .ctx = self,
         .text_index_entry = textIndexEntryCallback,
         .resolve_doc_set_doc_ids = resolveDocSetDocIdsCallback,

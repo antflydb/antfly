@@ -872,6 +872,7 @@ pub const ReviewDecision = struct {
     decision: resolver_lib.Decision,
     table: []const u8,
     key: []const u8,
+    origin: ?resolver_lib.curation.Origin = null,
 };
 
 pub fn buildReviewDecisionBytesAlloc(
@@ -906,6 +907,10 @@ pub fn buildReviewDecisionsBytesAlloc(gpa: std.mem.Allocator, existing_raw: ?[]c
         try value.put(scratch, "decision", .{ .string = @tagName(update.decision) });
         try value.put(scratch, "table", .{ .string = update.table });
         try value.put(scratch, "key", .{ .string = update.key });
+        if (update.origin) |origin| {
+            try origin.validate();
+            try value.put(scratch, "origin", try std.json.parseFromSliceLeaky(std.json.Value, scratch, try std.json.Stringify.valueAlloc(scratch, origin, .{}), .{}));
+        }
         try object.put(scratch, update.local_id, .{ .object = value });
     }
     return std.json.Stringify.valueAlloc(gpa, std.json.Value{ .object = object }, .{});

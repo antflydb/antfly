@@ -532,9 +532,9 @@ fn upsertBatch(ptr: *anyopaque, allocator: std.mem.Allocator, entries: []const c
     defer if (admission) |guard| guard.leave(guard.ptr);
     // Source-table workers share one destination coordinator. Serialize only
     // canonical read/merge/commit, never extraction, embedding or candidate work.
-    handle.promotion_commit_mutex.lockUncancelable(h.handleLockIo());
-    defer handle.promotion_commit_mutex.unlock(h.handleLockIo());
-    try @import("sql_commit.zig").recover(handle);
+    const coordinator = @import("sql_commit.zig").acquire(handle);
+    defer coordinator.release();
+    try coordinator.recover();
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -568,7 +568,7 @@ fn upsertBatch(ptr: *anyopaque, allocator: std.mem.Allocator, entries: []const c
         request.* = .{ .table_name = participant.name, .writes = writes.items, .deletes = deletes.items, .predicates = predicates.items };
     }
     var transaction: ?types.TxnId = null;
-    const outcome = try @import("sql_commit.zig").commit(handle, requests, &transaction);
+    const outcome = try coordinator.commit(requests, &transaction);
     if (outcome != .committed) return error.EntityPromotionUnavailable;
 }
 
@@ -581,15 +581,21 @@ pub fn runUntilIdle(handle: *h.Handle) !void {
     try tables.loadAvailable(root);
     for (0..1024) |_| {
         const before = replaySequence(root);
-        try root.db.runUntilIdle();
+        try drainDatabase(root, &root.db);
         var iterator = root.embedded_tables.valueIterator();
-        while (iterator.next()) |table| try table.*.db.runUntilIdle();
+        while (iterator.next()) |table| try drainDatabase(root, &table.*.db);
         if (before == replaySequence(root)) {
             collectEmbeddingCache(root, false) catch {};
             return;
         }
     }
     return error.RunUntilIdleDidNotConverge;
+}
+
+fn drainDatabase(root: *h.Handle, database: *h.db_mod.DB) !void {
+    if (root.lite_connection_context) |connection|
+        return database.runUntilIdleWithGroupSourceState(try connection.owner.groupSourceState(database));
+    return database.runUntilIdle();
 }
 
 fn replaySequence(handle: *h.Handle) u128 {
@@ -1372,13 +1378,40 @@ test "capi Lite models_dir loads a real extractor for graph enrichment" {
         found = true;
     };
     try std.testing.expect(found);
+    // Quiesce the automatic maintenance worker before checking query side
+    // effects. Inference releases the writer gate, so renewal of unrelated
+    // job leases/status observations would otherwise race this assertion.
+    // Foreground draining still completes all actual setup/replay work.
+    const owner = blk: {
+        const guard = api.enterHandle(id, .read).?;
+        defer guard.leave();
+        break :blk guard.connection.?.owner;
+    };
+    owner.stopping.store(true, .release);
+    owner.wake.set(h.handleLockIo());
+    if (owner.worker) |worker| worker.join();
+    owner.worker = null;
+    owner.stopping.store(false, .release);
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_run_until_idle(id));
     // The ad-hoc text route runs the configured extractor and resolves its
     // real, non-empty mentions against the entities promoted above.
     var query_result: h.capi.Buffer = .{};
     defer api.antfly_buffer_free(&query_result);
-    const before = api.enterHandle(id, .read).?;
-    const sequence = before.handle.owned_lite_backend.?.native_docstore.?.file.activeCheckpoint().commit_sequence;
-    before.leave();
+    const native = @import("../storage/lite/native.zig");
+    const baseline = blk: {
+        const before = api.enterHandle(id, .read).?;
+        defer before.leave();
+        const file = &before.handle.owned_lite_backend.?.native_docstore.?.file;
+        const documents = try file.snapshotDocumentsAlloc(a);
+        errdefer native.NativeFile.freeSnapshotDocuments(a, documents);
+        const catalog = try file.snapshotCatalogRecordsAlloc(a);
+        errdefer native.NativeFile.freeSnapshotCatalogRecords(a, catalog);
+        const indexes = try file.snapshotIndexCatalogRecordsAlloc(a);
+        break :blk .{ .documents = documents, .catalog = catalog, .indexes = indexes };
+    };
+    defer native.NativeFile.freeSnapshotDocuments(a, baseline.documents);
+    defer native.NativeFile.freeSnapshotCatalogRecords(a, baseline.catalog);
+    defer native.NativeFile.freeSnapshotCatalogRecords(a, baseline.indexes);
     try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_resolve_query_json(id, .fromSlice("concepts"), .fromSlice("{\"text\":\"Apple CEO Tim Cook announced iPhone 15 in Cupertino yesterday.\"}"), &query_result));
     const query_json = try std.json.parseFromSlice(std.json.Value, a, query_result.ptr.?[0..query_result.len], .{});
     defer query_json.deinit();
@@ -1392,9 +1425,32 @@ test "capi Lite models_dir loads a real extractor for graph enrichment" {
         api.antfly_buffer_free(&entity_response);
         try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_lookup_json(entities, .fromSlice(entity.object.get("doc_ref").?.object.get("key").?.string), &entity_response));
     }
-    const after = api.enterHandle(id, .read).?;
-    try std.testing.expectEqual(sequence, after.handle.owned_lite_backend.?.native_docstore.?.file.activeCheckpoint().commit_sequence);
-    after.leave();
+    {
+        const after = api.enterHandle(id, .read).?;
+        defer after.leave();
+        const file = &after.handle.owned_lite_backend.?.native_docstore.?.file;
+        // Candidate readers publish artifact leases, advancing the physical
+        // checkpoint. Query resolution must preserve every document, index,
+        // and non-lease metadata record, including derived-work state.
+        const documents = try file.snapshotDocumentsAlloc(a);
+        defer native.NativeFile.freeSnapshotDocuments(a, documents);
+        try std.testing.expectEqualDeep(baseline.documents, documents);
+        const indexes = try file.snapshotIndexCatalogRecordsAlloc(a);
+        defer native.NativeFile.freeSnapshotCatalogRecords(a, indexes);
+        try std.testing.expectEqualDeep(baseline.indexes, indexes);
+        const catalog = try file.snapshotCatalogRecordsAlloc(a);
+        defer native.NativeFile.freeSnapshotCatalogRecords(a, catalog);
+        var position: usize = 0;
+        for (baseline.catalog) |expected| {
+            if (std.mem.startsWith(u8, expected.key, native.NativeFile.artifact_lease_key_prefix)) continue;
+            while (position < catalog.len and std.mem.startsWith(u8, catalog[position].key, native.NativeFile.artifact_lease_key_prefix)) : (position += 1) {}
+            try std.testing.expect(position < catalog.len);
+            try std.testing.expectEqualDeep(expected, catalog[position]);
+            position += 1;
+        }
+        while (position < catalog.len and std.mem.startsWith(u8, catalog[position].key, native.NativeFile.artifact_lease_key_prefix)) : (position += 1) {}
+        try std.testing.expectEqual(catalog.len, position);
+    }
     api.antfly_db_close(entities);
     entities = null;
     api.antfly_db_close(id);
@@ -1404,16 +1460,19 @@ test "capi Lite models_dir loads a real extractor for graph enrichment" {
     try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_open_with_options(path, &readonly, &id));
     api.antfly_buffer_free(&query_result);
     try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_resolve_query_json(id, .fromSlice("concepts"), .fromSlice("{\"text\":\"Apple CEO Tim Cook announced iPhone 15 in Cupertino yesterday.\"}"), &query_result));
-    const readonly_guard = api.enterHandle(id, .read).?;
-    const cached_producer = readonly_guard.handle.query_producer orelse return error.TestExpectedEqual;
-    const readonly_sequence = readonly_guard.handle.owned_lite_backend.?.native_docstore.?.file.activeCheckpoint().commit_sequence;
-    readonly_guard.leave();
+    const cached_producer, const readonly_sequence = blk: {
+        const readonly_guard = api.enterHandle(id, .read).?;
+        defer readonly_guard.leave();
+        break :blk .{ readonly_guard.handle.query_producer orelse return error.TestExpectedEqual, readonly_guard.handle.owned_lite_backend.?.native_docstore.?.file.activeCheckpoint().commit_sequence };
+    };
     api.antfly_buffer_free(&query_result);
     try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_resolve_query_json(id, .fromSlice("concepts"), .fromSlice("{\"text\":\"Apple CEO Tim Cook announced iPhone 15 in Cupertino yesterday.\"}"), &query_result));
-    const repeated_guard = api.enterHandle(id, .read).?;
-    try std.testing.expectEqual(cached_producer, repeated_guard.handle.query_producer.?);
-    try std.testing.expectEqual(readonly_sequence, repeated_guard.handle.owned_lite_backend.?.native_docstore.?.file.activeCheckpoint().commit_sequence);
-    repeated_guard.leave();
+    {
+        const repeated_guard = api.enterHandle(id, .read).?;
+        defer repeated_guard.leave();
+        try std.testing.expectEqual(cached_producer, repeated_guard.handle.query_producer.?);
+        try std.testing.expectEqual(readonly_sequence, repeated_guard.handle.owned_lite_backend.?.native_docstore.?.file.activeCheckpoint().commit_sequence);
+    }
     var readonly_table: ?*anyopaque = null;
     try std.testing.expectEqual(h.capi.ErrorCode.ok, tables.antfly_db_open_table(id, .fromSlice("queries"), &readonly_table));
     defer api.antfly_db_close(readonly_table);
@@ -1421,10 +1480,12 @@ test "capi Lite models_dir loads a real extractor for graph enrichment" {
     defer api.antfly_buffer_free(&table_query);
     const text_request = "{\"text\":\"Apple CEO Tim Cook announced iPhone 15 in Cupertino yesterday.\"}";
     try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_resolve_query_json(readonly_table, .fromSlice("concepts"), .fromSlice(text_request), &table_query));
-    const child, const slot = api.handleRegistry().enter(readonly_table).?;
-    try std.testing.expect(child.query_producer == null);
-    try std.testing.expect(child.parent_handle.?.query_producer != null);
-    api.HandleRegistry.leave(slot);
+    {
+        const child, const slot = api.handleRegistry().enter(readonly_table).?;
+        defer api.HandleRegistry.leave(slot);
+        try std.testing.expect(child.query_producer == null);
+        try std.testing.expect(child.parent_handle.?.query_producer != null);
+    }
     var writer: ?*anyopaque = null;
     try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_open_with_options(path, &options, &writer));
     defer api.antfly_db_close(writer);
@@ -1433,11 +1494,13 @@ test "capi Lite models_dir loads a real extractor for graph enrichment" {
     try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_batch_json(writer, .fromSlice("{\"inserts\":{\"refresh_probe\":{\"body\":\"snapshot changed\"}}}"), &write_result));
     // Entering any read refreshes the owner, invalidating child caches before
     // freeing the old provider. No stale producer survives to the next query.
-    const refreshed = api.enterHandle(readonly_table, .read).?;
-    try std.testing.expect(refreshed.entry_error == null);
-    try std.testing.expect(refreshed.handle.query_producer == null);
-    try std.testing.expect(refreshed.handle.parent_handle.?.query_producer == null);
-    refreshed.leave();
+    {
+        const refreshed = api.enterHandle(readonly_table, .read).?;
+        defer refreshed.leave();
+        try std.testing.expect(refreshed.entry_error == null);
+        try std.testing.expect(refreshed.handle.query_producer == null);
+        try std.testing.expect(refreshed.handle.parent_handle.?.query_producer == null);
+    }
     api.antfly_buffer_free(&table_query);
     try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_resolve_query_json(readonly_table, .fromSlice("concepts"), .fromSlice(text_request), &table_query));
     try std.testing.expect(table_query.len > 0);
@@ -2280,4 +2343,197 @@ test "capi resolver curation suppression replays mention and relation edge contr
     try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_run_until_idle(id));
     try Edges.count(id, "source", "mentions", 2);
     try Edges.count(id, "concept/alpha", "uses", 1);
+}
+
+test "capi resolver curation proposals persist decisions and resume per resolver receipts" {
+    const api = @import("db.zig");
+    const a = std.testing.allocator;
+    var tmp = try api.TestDirectory.init("resolver-curation-proposals");
+    defer tmp.cleanup();
+    const root = try api.openDefaultDirectoryHandle(std.mem.span(tmp.path().ptr));
+    const id = try api.publishHandle(root);
+    var closed = false;
+    defer if (!closed) api.antfly_db_close(id);
+    try root.db.addResolver(.{ .name = "concepts", .table = "default", .source_artifact = "kg", .resolution_artifact = "resolved", .key_template = "concept/{{uslug _entity.text}}", .promote = false });
+    var out: h.capi.Buffer = .{};
+    defer api.antfly_buffer_free(&out);
+    const create = "{\"action\":\"merge\",\"key\":\"concept/a\",\"into\":\"concept/b\",\"actor\":\"screen\",\"reason\":\"same concept\"}";
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_propose_curation_json(id, .fromSlice("default"), .fromSlice(create), &out));
+    const proposal = try std.json.parseFromSlice(std.json.Value, a, out.ptr.?[0..out.len], .{});
+    defer proposal.deinit();
+    const proposal_id = proposal.value.object.get("id").?.string;
+    api.antfly_buffer_free(&out);
+    // Source-level edits settle proposals in the destination queue too. The
+    // batch suppression resource uses add/remove rather than a single key.
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_propose_curation_json(id, .fromSlice("default"), .fromSlice("{\"action\":\"suppress\",\"key\":\"concept/source-edit\"}"), &out));
+    const local_proposal = try std.json.parseFromSlice(std.json.Value, a, out.ptr.?[0..out.len], .{});
+    defer local_proposal.deinit();
+    const local_id = local_proposal.value.object.get("id").?.string;
+    api.antfly_buffer_free(&out);
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_suppress_resolver_keys_json(id, .fromSlice("concepts"), .fromSlice("{\"add\":{\"keys\":[\"concept/source-edit\"]},\"actor\":\"local-curator\"}"), &out));
+    api.antfly_buffer_free(&out);
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_get_curation_proposal_json(id, .fromSlice("default"), .fromSlice(local_id), &out));
+    try std.testing.expect(std.mem.indexOf(u8, out.ptr.?[0..out.len], "\"state\":\"superseded\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.ptr.?[0..out.len], "local-curator") != null);
+    api.antfly_buffer_free(&out);
+    const manifest_before = try root.db.core.store.get(a, @import("antfly_resolver").curation.proposal_store_key);
+    defer a.free(manifest_before);
+
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_decide_curation_proposal_json(id, .fromSlice("default"), .fromSlice(proposal_id), .fromSlice("{\"accept\":true,\"actor\":\"curator\",\"reason\":\"confirmed\",\"wait\":{\"timeout_ms\":10}}"), &out));
+    try std.testing.expect(std.mem.indexOf(u8, out.ptr.?[0..out.len], "\"complete\":true") != null);
+    {
+        const observed = try std.json.parseFromSlice(std.json.Value, a, out.ptr.?[0..out.len], .{});
+        defer observed.deinit();
+        try std.testing.expect(observed.value.object.get("applied").? == .bool);
+    }
+    api.antfly_buffer_free(&out);
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_resolver_curation_json(id, .fromSlice("concepts"), &out));
+    try std.testing.expect(std.mem.indexOf(u8, out.ptr.?[0..out.len], "\"origin\":\"review\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.ptr.?[0..out.len], "\"actor\":\"curator\"") != null);
+    api.antfly_buffer_free(&out);
+    try std.testing.expectEqual(h.capi.ErrorCode.invalid_argument, api.antfly_db_entity_suppress_json(id, .fromSlice("default"), .fromSlice("concept/b"), .fromSlice("{}"), &out));
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_entity_suppress_json(id, .fromSlice("default"), .fromSlice("concept/b"), .fromSlice("{\"absorbed\":\"suppress\",\"actor\":\"user\"}"), &out));
+    try std.testing.expect(std.mem.indexOf(u8, out.ptr.?[0..out.len], "\"disposition\":\"suppress\"") != null);
+    api.antfly_buffer_free(&out);
+    // An already accepted proposal must never undo a later direct correction.
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_decide_curation_proposal_json(id, .fromSlice("default"), .fromSlice(proposal_id), .fromSlice("{\"accept\":true}"), &out));
+    api.antfly_buffer_free(&out);
+    // Simulate a crash after a resolver committed its receipt and before
+    // the root fanout record was finalized. Later direct policy stays intact.
+    var unfinished = try std.json.parseFromSlice(std.json.Value, a, manifest_before, .{});
+    defer unfinished.deinit();
+    const scratch = unfinished.arena.allocator();
+    try unfinished.value.object.put(scratch, "pending_id", .{ .string = proposal_id });
+    try unfinished.value.object.put(scratch, "pending_decision", try std.json.parseFromSliceLeaky(std.json.Value, scratch, "{\"accept\":true,\"actor\":\"curator\",\"reason\":\"confirmed\",\"wait\":{\"timeout_ms\":10}}", .{}));
+    try unfinished.value.object.put(scratch, "pending_origin", try std.json.parseFromSliceLeaky(std.json.Value, scratch, "{\"actor\":\"curator\",\"reason\":\"confirmed\",\"created_at_ms\":1}", .{}));
+    const pending_bytes = try std.json.Stringify.valueAlloc(a, unfinished.value, .{});
+    defer a.free(pending_bytes);
+    try root.db.core.store.put(@import("antfly_resolver").curation.proposal_store_key, pending_bytes);
+    // A second identity tests migration into a busy destination as well as
+    // leaving/resetting the namespace whose receipt is already committed.
+    try @import("tables.zig").create(root, "other", "{}", false);
+    try root.db.addResolver(.{ .name = "other_concepts", .table = "other", .source_artifact = "other_kg", .resolution_artifact = "other_resolved", .key_template = "other/{{uslug _entity.text}}", .promote = false });
+    // Resolver-level writes share the pending-decision fence; they cannot
+    // race an unfinished fanout and invalidate its frozen receipt set.
+    try std.testing.expectEqual(h.capi.ErrorCode.busy, api.antfly_db_unsuppress_resolver_key_json(id, .fromSlice("concepts"), .fromSlice("{\"key\":\"concept/b\"}"), &out));
+    api.antfly_buffer_free(&out);
+    try std.testing.expectEqual(h.capi.ErrorCode.busy, api.antfly_db_set_resolver_namespace_json(id, .fromSlice("concepts"), .fromSlice("{\"table\":\"other\",\"key_template\":\"other/{{uslug _entity.text}}\",\"reset_merges\":true,\"reset_curation\":true}")));
+    try std.testing.expectEqual(h.capi.ErrorCode.busy, api.antfly_db_set_resolver_namespace_json(id, .fromSlice("concepts"), .fromSlice("{\"table\":\"default\",\"key_template\":\"concept/{{uslug _entity.text}}\",\"reset_merges\":true,\"reset_curation\":true}")));
+    try std.testing.expectEqual(h.capi.ErrorCode.busy, api.antfly_db_set_resolver_namespace_json(id, .fromSlice("other_concepts"), .fromSlice("{\"table\":\"default\",\"key_template\":\"concept/{{uslug _entity.text}}\",\"reset_merges\":true,\"reset_curation\":true}")));
+    api.antfly_db_close(id);
+    closed = true;
+    const reopened = try api.openDefaultDirectoryHandle(std.mem.span(tmp.path().ptr));
+    const reopened_id = try api.publishHandle(reopened);
+    defer api.antfly_db_close(reopened_id);
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_decide_curation_proposal_json(reopened_id, .fromSlice("default"), .fromSlice(proposal_id), .fromSlice("{\"accept\":true,\"actor\":\"curator\",\"reason\":\"confirmed\",\"wait\":{\"timeout_ms\":10}}"), &out));
+    try std.testing.expect(std.mem.indexOf(u8, out.ptr.?[0..out.len], "\"complete\":true") != null);
+    {
+        const observed = try std.json.parseFromSlice(std.json.Value, a, out.ptr.?[0..out.len], .{});
+        defer observed.deinit();
+        try std.testing.expect(observed.value.object.get("applied").? == .bool);
+    }
+    api.antfly_buffer_free(&out);
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_resolver_curation_json(reopened_id, .fromSlice("concepts"), &out));
+    try std.testing.expect(std.mem.indexOf(u8, out.ptr.?[0..out.len], "\"origin\":\"cascade\"") != null);
+    api.antfly_buffer_free(&out);
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_get_curation_proposal_json(reopened_id, .fromSlice("default"), .fromSlice(proposal_id), &out));
+    try std.testing.expect(std.mem.indexOf(u8, out.ptr.?[0..out.len], "\"state\":\"accepted\"") != null);
+    api.antfly_buffer_free(&out);
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_propose_curation_json(reopened_id, .fromSlice("default"), .fromSlice("{\"action\":\"suppress\",\"key\":\"concept/noise\"}"), &out));
+    const suppression = try std.json.parseFromSlice(std.json.Value, a, out.ptr.?[0..out.len], .{});
+    defer suppression.deinit();
+    const suppression_id = suppression.value.object.get("id").?.string;
+    api.antfly_buffer_free(&out);
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_decide_curation_proposal_json(reopened_id, .fromSlice("default"), .fromSlice(suppression_id), .fromSlice("{\"accept\":false}"), &out));
+    api.antfly_buffer_free(&out);
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_propose_curation_json(reopened_id, .fromSlice("default"), .fromSlice("{\"action\":\"suppress\",\"key\":\"concept/noise\"}"), &out));
+    try std.testing.expect(std.mem.indexOf(u8, out.ptr.?[0..out.len], "\"state\":\"rejected\"") != null);
+    api.antfly_buffer_free(&out);
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_list_curation_proposals_json(reopened_id, .fromSlice("default"), .fromSlice("{\"state\":\"all\",\"limit\":1}"), &out));
+    const page = try std.json.parseFromSlice(std.json.Value, a, out.ptr.?[0..out.len], .{});
+    defer page.deinit();
+    try std.testing.expectEqual(@as(usize, 1), page.value.object.get("proposals").?.array.items.len);
+    try std.testing.expect(page.value.object.get("next_cursor").? != .null);
+    api.antfly_buffer_free(&out);
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_propose_curation_json(reopened_id, .fromSlice("default"), .fromSlice("{\"action\":\"suppress\",\"key\":\"concept/later\"}"), &out));
+    const later = try std.json.parseFromSlice(std.json.Value, a, out.ptr.?[0..out.len], .{});
+    defer later.deinit();
+    const later_id = later.value.object.get("id").?.string;
+    api.antfly_buffer_free(&out);
+    const before_direct = try reopened.db.core.store.get(a, @import("antfly_resolver").curation.proposal_store_key);
+    defer a.free(before_direct);
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_entity_suppress_json(reopened_id, .fromSlice("default"), .fromSlice("concept/later"), .fromSlice("{\"actor\":\"user\"}"), &out));
+    api.antfly_buffer_free(&out);
+    // A crash before the root queue update leaves a dirty marker. Inspection
+    // recovers the supersession from the resolver's atomic receipt.
+    var interrupted = try std.json.parseFromSlice(std.json.Value, a, before_direct, .{});
+    defer interrupted.deinit();
+    try interrupted.value.object.put(interrupted.arena.allocator(), "refresh_required", .{ .bool = true });
+    const interrupted_bytes = try std.json.Stringify.valueAlloc(a, interrupted.value, .{});
+    defer a.free(interrupted_bytes);
+    try reopened.db.core.store.put(@import("antfly_resolver").curation.proposal_store_key, interrupted_bytes);
+    try reopened.db.addResolver(.{ .name = "places", .table = "default", .source_artifact = "places_kg", .resolution_artifact = "places_resolved", .key_template = "place/{{uslug _entity.text}}", .promote = false });
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_entity_suppress_json(reopened_id, .fromSlice("default"), .fromSlice("place/unrelated"), .fromSlice("{}"), &out));
+    api.antfly_buffer_free(&out);
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_get_curation_proposal_json(reopened_id, .fromSlice("default"), .fromSlice(later_id), &out));
+    try std.testing.expect(std.mem.indexOf(u8, out.ptr.?[0..out.len], "\"state\":\"superseded\"") != null);
+    api.antfly_buffer_free(&out);
+    // Repeat the same crash cut through a resolver-level writer. It must
+    // reconcile the other namespace before clearing the shared dirty marker.
+    try reopened.db.core.store.put(@import("antfly_resolver").curation.proposal_store_key, interrupted_bytes);
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_suppress_resolver_keys_json(reopened_id, .fromSlice("places"), .fromSlice("{\"add\":{\"keys\":[\"place/second\"]}}"), &out));
+    api.antfly_buffer_free(&out);
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_get_curation_proposal_json(reopened_id, .fromSlice("default"), .fromSlice(later_id), &out));
+    try std.testing.expect(std.mem.indexOf(u8, out.ptr.?[0..out.len], "\"state\":\"superseded\"") != null);
+    api.antfly_buffer_free(&out);
+    // Migration must persist dirty supersessions before clearing their source
+    // receipts, even when no acceptance is pending anymore.
+    try reopened.db.core.store.put(@import("antfly_resolver").curation.proposal_store_key, interrupted_bytes);
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_set_resolver_namespace_json(reopened_id, .fromSlice("concepts"), .fromSlice("{\"table\":\"other\",\"key_template\":\"other/{{uslug _entity.text}}\",\"reset_merges\":true,\"reset_curation\":true}")));
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_get_curation_proposal_json(reopened_id, .fromSlice("default"), .fromSlice(later_id), &out));
+    try std.testing.expect(std.mem.indexOf(u8, out.ptr.?[0..out.len], "\"state\":\"superseded\"") != null);
+}
+
+test "capi resolver curation recreated destination applies a fresh proposal with the same ID" {
+    const api = @import("db.zig");
+    const table_ops = @import("tables.zig");
+    const pure = @import("antfly_resolver").curation;
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    var tmp = try api.TestDirectory.init("resolver-queue-incarnation");
+    defer tmp.cleanup();
+    const root = try api.openDefaultDirectoryHandle(std.mem.span(tmp.path().ptr));
+    const handle = try api.publishHandle(root);
+    defer api.antfly_db_close(handle);
+    try table_ops.create(root, "entities", "{}", false);
+    try root.db.addResolver(.{ .name = "concepts", .table = "entities", .source_artifact = "kg", .resolution_artifact = "resolved", .key_template = "concept/{{uslug _entity.text}}", .promote = false });
+    var out: h.capi.Buffer = .{};
+    defer api.antfly_buffer_free(&out);
+    const request = "{\"action\":\"suppress\",\"key\":\"concept/x\"}";
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_propose_curation_json(handle, .fromSlice("entities"), .fromSlice(request), &out));
+    const proposal = try std.json.parseFromSliceLeaky(pure.Proposal, scratch, out.ptr.?[0..out.len], .{ .allocate = .alloc_always });
+    api.antfly_buffer_free(&out);
+    const original = try pure.parseProposalManifest(scratch, try (try table_ops.get(root, "entities")).core.store.get(scratch, pure.proposal_store_key));
+    try std.testing.expect(original.queue.receipt_scope != null);
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_decide_curation_proposal_json(handle, .fromSlice("entities"), .fromSlice(proposal.id), .fromSlice("{\"accept\":true}"), &out));
+    api.antfly_buffer_free(&out);
+    try table_ops.drop(root, "entities", false);
+    try table_ops.create(root, "entities", "{}", false);
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_unsuppress_resolver_key_json(handle, .fromSlice("concepts"), .fromSlice("{\"key\":\"concept/x\"}"), &out));
+    api.antfly_buffer_free(&out);
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_propose_curation_json(handle, .fromSlice("entities"), .fromSlice(request), &out));
+    const fresh = try std.json.parseFromSliceLeaky(pure.Proposal, scratch, out.ptr.?[0..out.len], .{ .allocate = .alloc_always });
+    try std.testing.expectEqualStrings(proposal.id, fresh.id);
+    api.antfly_buffer_free(&out);
+    const current = try pure.parseProposalManifest(scratch, try (try table_ops.get(root, "entities")).core.store.get(scratch, pure.proposal_store_key));
+    try std.testing.expect(!pure.sameReceiptScope(original.queue.receipt_scope, current.queue.receipt_scope));
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_decide_curation_proposal_json(handle, .fromSlice("entities"), .fromSlice(fresh.id), .fromSlice("{\"accept\":true}"), &out));
+    api.antfly_buffer_free(&out);
+    const configs = try root.db.core.index_manager.listResolverIdentities(scratch);
+    const state = try pure.parseState(scratch, configs[0].curation_json);
+    try std.testing.expectEqual(@as(usize, 1), state.suppress.keys.len);
+    try std.testing.expectEqualStrings("concept/x", state.suppress.keys[0]);
+    try std.testing.expect(pure.sameReceiptScope(current.queue.receipt_scope, state.receipt_scope));
 }

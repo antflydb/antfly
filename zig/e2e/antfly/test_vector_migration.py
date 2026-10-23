@@ -1,17 +1,17 @@
 # Copyright 2026 Antfly, Inc.
-# SPDX-License-Identifier: Elastic-2.0
+# SPDX-License-Identifier: Apache-2.0
 #
-# Licensed under the Elastic License 2.0 (ELv2); you may not use this file
-# except in compliance with the Elastic License 2.0. You may obtain a copy of
-# the Elastic License 2.0 at
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
 #
-#     https://www.antfly.io/licensing/ELv2-license
+#     http://www.apache.org/licenses/LICENSE-2.0
 #
-# Unless required by applicable law or agreed to in writing, software distributed
-# under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
-# WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
-# Elastic License 2.0 for the specific language governing permissions and
-# limitations.
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 """Source ownership migration through the production compiled owner and catalog."""
 
@@ -24,6 +24,7 @@ import time
 
 import pytest
 import requests
+from conftest import ready_index_status
 from helpers import wait_until
 from test_vector_store import hit_ids
 
@@ -75,9 +76,16 @@ def seed(api, table):
         },
         sync_level="full_index",
     )
-    assert wait_until(
-        lambda: nearest(api, table, "model_a", [1, 0, 0]) == ["a", "b"], timeout_s=90
-    )
+    # Index admission returns before structural publication finishes. Capture
+    # a complete two-index cohort before a test freezes it or kills the server;
+    # seeing model_a's rows alone says nothing about model_b's publication.
+    for index, vector in (("model_a", [1, 0, 0]), ("model_b", [0, 1, 0])):
+        assert wait_until(
+            lambda: api.get_index(table, index),
+            ready_when=lambda value: ready_index_status(value, until="complete"),
+            timeout_s=90,
+        ), api.get_index(table, index)
+        assert nearest(api, table, index, vector) == ["a", "b"]
 
 
 def nearest(api, table, index, vector):

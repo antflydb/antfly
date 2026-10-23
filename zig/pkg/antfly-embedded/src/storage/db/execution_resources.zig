@@ -1005,6 +1005,19 @@ pub const RelationalPriorMembership = struct {
     }
 };
 
+/// Owned visibility handoff from commit to its small outer completion frame.
+/// Targets retain the exact admitted identities; no catalog re-lookup is used.
+pub const BatchVisibilityCompletion = struct {
+    sequence: ?u64 = null,
+    sync_level: types.SyncLevel = .write,
+    targets: ManagedSyncTargets = .{},
+    enrichment_fully_precomputed: bool = false,
+
+    pub fn deinit(self: *@This(), alloc: Allocator) void {
+        self.targets.deinit(alloc);
+    }
+};
+
 pub const BatchExecutionOptions = struct {
     resolver_review_command: ?*const @import("resolver_review.zig").Command = null,
     group_source_command: ?*const @import("group_source_contract.zig").Command = null,
@@ -1025,6 +1038,7 @@ pub const BatchExecutionOptions = struct {
     store_batch_options: backend_types.BatchOptions = .{},
     snapshot_mutation: ?*const snapshot_admission_mod.SnapshotAdmission.MutationLease = null,
     wait_for_sync_level: bool = true,
+    visibility_completion: ?*BatchVisibilityCompletion = null,
     force_generated_artifact_names: []const []const u8 = &.{},
     document_child_range_dispatcher: ?DocumentArtifactChildRangeDispatcher = null,
     committed_batch_effects_observer: ?CommittedBatchEffectsObserver = null,

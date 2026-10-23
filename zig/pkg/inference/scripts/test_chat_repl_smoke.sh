@@ -23,7 +23,7 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 PKG_DIR="$ROOT_DIR/pkg/inference"
 
-ANTFLY_BIN="${ANTFLY_BIN:-$PKG_DIR/zig-out/bin/antfly-inference}"
+ANTFLY_BIN="${ANTFLY_BIN:-$PKG_DIR/zig-out/bin/antfly-inference-dev}"
 MODEL_DIR="${ANTFLY_INFERENCE_CHAT_SMOKE_MODEL:-$HOME/.antfly/inference/models/google/gemma-4-E2B-it-qat-q4_0-gguf}"
 MAX_TOKENS="${ANTFLY_INFERENCE_CHAT_SMOKE_MAX_TOKENS:-512}"
 BACKEND="${ANTFLY_INFERENCE_CHAT_SMOKE_BACKEND:-auto}"

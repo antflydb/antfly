@@ -1,22 +1,27 @@
 // Copyright 2026 Antfly, Inc.
-// SPDX-License-Identifier: Elastic-2.0
+// SPDX-License-Identifier: Apache-2.0
 //
-// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
-// except in compliance with the Elastic License 2.0. You may obtain a copy of
-// the Elastic License 2.0 at
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-//     https://www.antfly.io/licensing/ELv2-license
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// Unless required by applicable law or agreed to in writing, software distributed
-// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
-// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
-// Elastic License 2.0 for the specific language governing permissions and
-// limitations.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 pub const storage_backend_erased = @import("antfly_local_sources").storage_backend_erased;
 pub const lsm_backend = @import("antfly_local_sources").storage_lsm_backend;
 pub const antfly_sources = @import("source_owner_physical.zig");
 test {
+    // Value-only filters must reach their helpers without compiling DB query
+    // fixtures merely to discover their private test dependencies.
+    _ = @import("antfly_local_sources").storage_db_query_search_exec;
+    _ = @import("antfly_local_sources").sql_document_row;
+    _ = @import("antfly_local_sources").storage_document_mutation_revision;
     _ = @import("antfly_local_sources").functions_decisions;
     _ = @import("antfly_local_sources").functions_expressions;
     _ = @import("antfly_local_sources").functions_runtime;

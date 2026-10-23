@@ -1,19 +1,20 @@
 // Copyright 2026 Antfly, Inc.
-// SPDX-License-Identifier: Elastic-2.0
+// SPDX-License-Identifier: Apache-2.0
 //
-// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
-// except in compliance with the Elastic License 2.0. You may obtain a copy of
-// the Elastic License 2.0 at
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-//     https://www.antfly.io/licensing/ELv2-license
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// Unless required by applicable law or agreed to in writing, software distributed
-// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
-// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
-// Elastic License 2.0 for the specific language governing permissions and
-// limitations.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 const std = @import("std");
+const index_metadata = @import("antfly_local_sources").api_index_metadata;
 const join_planning = @import("join_planning.zig");
 const system_catalog = @import("antfly_local_sources").system_catalog_domain;
 const system_catalog_routes = @import("../system_catalog/routes.zig");
@@ -43,6 +44,7 @@ const batch_api = @import("antfly_local_sources").api_batch;
 const cluster_api_http = @import("cluster_api_http.zig");
 const public_table_http = @import("public_table_http.zig");
 const query_request_diagnostics = @import("query_request_diagnostics.zig");
+const graph_query_diagnostic = @import("graph_query_diagnostic.zig");
 const graph_wire_envelope = @import("antfly_local_sources").api_graph_wire_envelope;
 const linear_merge_api = @import("linear_merge.zig");
 const cluster = @import("cluster.zig");
@@ -3972,6 +3974,7 @@ pub const ApiHttpServer = struct {
     backup_cohort_recovery_cursor_len: usize = 0,
     mcp_sessions: mcp.InMemorySessionStore = .{},
     a2a_tasks: a2a.InMemoryTaskStore = .{},
+    inference_sessions: @import("antfly_local_sources").common_provider_registry.gateway.Sessions = .{},
     connections_cache: connections_api.Cache = .{ .alloc = undefined },
     local_resource_manager: resource_manager_mod.ResourceManager,
     shared_resource_manager: ?*resource_manager_mod.ResourceManager,
@@ -4751,6 +4754,7 @@ pub const ApiHttpServer = struct {
             registry.deinit(self.owner_alloc);
             self.owner_alloc.destroy(registry);
         }
+        self.inference_sessions.deinit(self.owner_alloc);
         self.connections_cache.deinit();
         self.query_embedding_cache.deinit(self.inferenceCacheBudget());
         self.sql_plan_cache.deinit(queryEmbeddingCacheIo(self.cfg));
@@ -4912,12 +4916,27 @@ pub const ApiHttpServer = struct {
         include_param: ?[]const u8,
         refresh_param: ?[]const u8,
     ) ![]u8 {
-        var arena_impl = std.heap.ArenaAllocator.init(self.alloc);
+        return self.listConnectionsJsonAllocWithContext(alloc, types_param, include_param, refresh_param, null);
+    }
+
+    pub fn listConnectionsJsonAllocWithContext(
+        self: *ApiHttpServer,
+        alloc: std.mem.Allocator,
+        types_param: ?[]const u8,
+        include_param: ?[]const u8,
+        refresh_param: ?[]const u8,
+        request_context: ?@import("antfly_inference_execution_context").RequestContext,
+    ) ![]u8 {
+        var arena_impl = std.heap.ArenaAllocator.init(alloc);
         defer arena_impl.deinit();
         const arena = arena_impl.allocator();
 
-        var snapshot_opt = self.source.cachedAdminSnapshot() catch null;
-        if (snapshot_opt == null) snapshot_opt = self.source.adminSnapshot() catch null;
+        if (request_context) |context| try context.check();
+        // Inference inventory has no table/replication status dependency. Do
+        // not put an unrelated metadata snapshot RPC on its request lifetime.
+        const inference_only = if (types_param) |types| std.mem.eql(u8, types, "inference") else false;
+        var snapshot_opt = if (inference_only) null else self.source.cachedAdminSnapshot() catch null;
+        if (!inference_only and snapshot_opt == null) snapshot_opt = self.source.adminSnapshot() catch null;
         defer if (snapshot_opt) |*snapshot| self.source.freeAdminSnapshot(snapshot);
 
         const node_config = self.cfg.node_config;
@@ -4931,6 +4950,7 @@ pub const ApiHttpServer = struct {
             .network_io = self.sharedApiNetworkIo(),
             .filesystem_io = self.sharedApiFilesystemIo(),
         }, &self.connections_cache, .{
+            .request_context = request_context,
             .include_models = connections_api.includeHasModels(include_param),
             .probe = connections_api.includeHasStatus(include_param),
             .refresh = if (refresh_param) |value| std.mem.eql(u8, value, "true") else false,
@@ -7998,11 +8018,16 @@ pub const ApiHttpServer = struct {
         return self.rowPolicyProof(alloc, identity, context, table_id, physical_table, database, schema_version, .write);
     }
 
+    pub fn publicInferenceEnabled(self: *const ApiHttpServer) bool {
+        return if (self.cfg.node_config) |config| config.public_inference.enabled else false;
+    }
+
     pub fn authorizeInferenceRequest(
         self: *ApiHttpServer,
         request: AuthenticatedRequest,
         permission: kernel_abi.InferencePermission,
     ) !kernel_abi.AuthorizationDecision {
+        if (permission == .write and !self.publicInferenceEnabled()) return .forbidden;
         if (!self.cfg.auth_enabled and self.cfg.trusted_principal_secret == null and
             request.trusted_principal == null)
             return .allowed;
@@ -9385,7 +9410,7 @@ pub const ApiHttpServer = struct {
         const runtime_schema = try schema_mod.deriveRuntimeTableSchema(self.alloc, parsed_schema);
         defer storage_schema.freeSchema(self.alloc, runtime_schema);
 
-        const physical_sort_fields = try publicPhysicalSortFieldsAlloc(self.alloc, query_req.order_by);
+        const physical_sort_fields = try publicPhysicalSortFieldsAlloc(self.alloc, query_req.order_by, runtime_schema);
         defer if (physical_sort_fields.len > 0) self.alloc.free(physical_sort_fields);
         // External lake sorts are validated against their pinned native column
         // source. A local shard's full-text index is neither the owner nor
@@ -14172,6 +14197,7 @@ pub const ApiHttpServer = struct {
             error.GraphAnchorFilterRequiresIndex => return error.GraphAnchorFilterRequiresIndex,
             error.GraphMatchOperationLimitExceeded => return error.GraphMatchOperationLimitExceeded,
             error.GraphQueryModeUnsupported => return error.GraphQueryModeUnsupported,
+            error.GraphStartIdentityRequired => return error.GraphStartIdentityRequired,
             error.GraphExternalAliasDocumentFilterUnsupported => return error.GraphExternalAliasDocumentFilterUnsupported,
             error.GraphExternalAliasSourceUnsupported => return error.GraphExternalAliasSourceUnsupported,
             error.GraphReverseVariablePathUnsupported => return error.GraphReverseVariablePathUnsupported,
@@ -14181,6 +14207,8 @@ pub const ApiHttpServer = struct {
             error.EmbedRateLimited => return error.EmbedRateLimited,
             error.EmbedTransientFailure => return error.EmbedTransientFailure,
             error.EmbedUpstreamFailure => return error.EmbedUpstreamFailure,
+            error.ValueSearchRequiresScan => return error.ValueSearchRequiresScan,
+            error.ValueSearchLimitExceeded => return error.ValueSearchLimitExceeded,
             error.DecisionLimitExceeded => return error.DecisionLimitExceeded,
             error.RerankRateLimited => return error.RerankRateLimited,
             error.RerankTransientFailure => return error.RerankTransientFailure,
@@ -14244,15 +14272,13 @@ pub const ApiHttpServer = struct {
         var local_catalog = CatalogQueryResolver{ .arena = catalog_arena.allocator() };
         const resolver = catalog_resolver orelse &local_catalog;
 
-        const ReadInput = struct { read_requirements: ?@import("antfly_local_sources").sql_read_requirements.Requirements = null, lake_read: ?struct { wait_ms: u32 = 5000 } = null };
+        const ReadInput = struct { read_requirements: ?@import("antfly_local_sources").sql_read_requirements.Requirements = null };
         var read_input = std.json.parseFromSlice(ReadInput, alloc, body, .{ .ignore_unknown_fields = true }) catch return error.InvalidQueryRequest;
         defer read_input.deinit();
         if (read_input.value.read_requirements) |read| {
-            if (read_input.value.lake_read != null) return error.InvalidQueryRequest;
             read.validate(.search) catch |err| return if (err == error.UnsupportedReadVisibility) error.UnsupportedQueryRequest else error.InvalidQueryRequest;
         }
-        if (read_input.value.lake_read) |read| if (read.wait_ms > 60000) return error.InvalidQueryRequest;
-        const retry_timeout_ns: u64 = if (read_input.value.read_requirements) |read| @as(u64, read.wait_ms orelse 5000) * std.time.ns_per_ms else if (read_input.value.lake_read) |read| @as(u64, read.wait_ms) * std.time.ns_per_ms else if (self.table_writes != null) 5 * std.time.ns_per_s else 0;
+        const retry_timeout_ns: u64 = if (read_input.value.read_requirements) |read| @as(u64, read.wait_ms orelse 5000) * std.time.ns_per_ms else if (self.table_writes != null) 5 * std.time.ns_per_s else 0;
         const retry_poll_ns = 50 * std.time.ns_per_ms;
         const retry_io = self.sharedApiIo();
         const start_ns = retryMonotonicNs(retry_io);
@@ -14516,6 +14542,7 @@ pub const ApiHttpServer = struct {
                 error.GraphAnchorFilterRequiresIndex,
                 error.GraphMatchOperationLimitExceeded,
                 error.GraphQueryModeUnsupported,
+                error.GraphStartIdentityRequired,
                 error.GraphExternalAliasDocumentFilterUnsupported,
                 error.GraphExternalAliasSourceUnsupported,
                 error.GraphReverseVariablePathUnsupported,
@@ -14588,6 +14615,7 @@ pub const ApiHttpServer = struct {
             error.GraphAnchorFilterRequiresIndex,
             error.GraphMatchOperationLimitExceeded,
             error.GraphQueryModeUnsupported,
+            error.GraphStartIdentityRequired,
             error.GraphExternalAliasDocumentFilterUnsupported,
             error.GraphExternalAliasSourceUnsupported,
             error.GraphReverseVariablePathUnsupported,
@@ -14705,6 +14733,7 @@ pub const ApiHttpServer = struct {
             error.GraphAnchorFilterRequiresIndex,
             error.GraphMatchOperationLimitExceeded,
             error.GraphQueryModeUnsupported,
+            error.GraphStartIdentityRequired,
             error.GraphExternalAliasDocumentFilterUnsupported,
             error.GraphExternalAliasSourceUnsupported,
             error.GraphReverseVariablePathUnsupported,
@@ -15046,7 +15075,7 @@ pub const ApiHttpServer = struct {
     }
 
     fn validateSupportedForeignPublicQueryRequest(request: anytype) !void {
-        if (request.lake_read != null or request.read_requirements != null) return error.UnsupportedQueryRequest;
+        if (request.read_requirements != null) return error.UnsupportedQueryRequest;
         if (request.full_text_search != null) return error.UnsupportedQueryRequest;
         if (request.full_text_index != null) return error.UnsupportedQueryRequest;
         if (request.semantic_search != null) return error.UnsupportedQueryRequest;
@@ -15216,6 +15245,7 @@ pub const ApiHttpServer = struct {
             try ensureRequestDeadline(deadline);
         }
         query_req.req.cancellation = cancellation;
+        if (query_req.req.graph_queries.len > 0) query_req.req.graph_query_diagnostic_sink = graph_query_diagnostic.sink();
         query_req.req.response_table_name = response_label;
         if (query_req.req.remote_snapshot == null and (query_req.req.order_by.len != 0 or query_req.req.search_after.len != 0 or query_req.req.search_before.len != 0)) {
             if (query_req.req.search_after.len != 0 or query_req.req.search_before.len != 0) return error.CatalogGenerationChanged;
@@ -22189,6 +22219,11 @@ pub const ApiHttpServer = struct {
                 try public_table_http.graphMatchOperationLimitExceededBody(self.alloc, body),
                 false,
             ),
+            error.GraphStartIdentityRequired => contextual_operations.jsonWithStatus(
+                422,
+                try public_table_http.graphQueryCapabilityUnsupportedBody(self.alloc, body, "qualified_start_identity_required"),
+                false,
+            ),
             error.GraphQueryModeUnsupported => contextual_operations.jsonWithStatus(
                 422,
                 try public_table_http.graphQueryUnsupportedBody(self.alloc, body),
@@ -22216,6 +22251,8 @@ pub const ApiHttpServer = struct {
             error.EmbedRateLimited => try contextualQueryDependencyErrorResponse(self.alloc, 429, "query_embedding_rate_limited", "query embedding rate limited", true),
             error.EmbedTransientFailure => try contextualQueryTemporarilyUnavailableResponse(self.alloc, .query_embedding_temporarily_unavailable),
             error.EmbedUpstreamFailure => try contextualQueryDependencyErrorResponse(self.alloc, 502, "query_embedding_upstream_failure", "query embedding provider failed", false),
+            error.ValueSearchRequiresScan => try contextualQueryDependencyErrorResponse(self.alloc, 422, "value_verification_requires_scan", "no compatible indexed candidate plan; explicitly permit scans with execution.value_verification.allow_scan", false),
+            error.ValueSearchLimitExceeded => try contextualQueryDependencyErrorResponse(self.alloc, 422, "value_verification_limit_exceeded", "logical value search exceeded its verification budget", false),
             error.DecisionLimitExceeded => try contextualQueryDependencyErrorResponse(self.alloc, 422, "decision_limit_exceeded", "decision evaluation budget exceeded", false),
             error.UnknownDecider, error.InvalidDeciderConfig, error.InvalidDecisionSpecification, error.InvalidFunctionExpression, error.FunctionTypeMismatch, error.UnknownFunctionBinding, error.CyclicFunctionBinding, error.UnknownQueryFunction => try contextualQueryDependencyErrorResponse(self.alloc, 400, "invalid_decision_evaluation", "invalid decision evaluation", false),
             error.DecisionProviderUnavailable, error.MissingDecisionApiKey => try contextualQueryTemporarilyUnavailableResponse(self.alloc, .decision_provider_unavailable),
@@ -25862,12 +25899,16 @@ fn validatePublicQuerySortCapabilitiesAgainstRuntimeWithEvidence(
         if (std.mem.eql(u8, field.field, "_id")) continue;
         if (std.mem.eql(u8, field.field, "_score")) continue;
 
-        if (storage_schema.resolveDeclaredFieldType(runtime_schema, field.field)) |mapping| {
+        const physical = if (storage_schema.resolveLogicalDocValues(runtime_schema, field.field)) |resolved|
+            resolved.field
+        else
+            field.field;
+        if (storage_schema.resolveDeclaredFieldType(runtime_schema, physical)) |mapping| {
             try validatePublicMappedSortField(field.field, mapping);
             if (try validatePublicSortCapabilityEvidence(
                 observed_dynamic_capability_sets,
                 query_req.primary_text_index_name orelse query_req.index_name,
-                field.field,
+                physical,
                 mapping.field_type,
             ) == null) {
                 if (physical_evidence_available) try validatePublicMappedSortCoverage(field.field, mapping);
@@ -25879,7 +25920,7 @@ fn validatePublicQuerySortCapabilitiesAgainstRuntimeWithEvidence(
         if (try validatePublicSortCapabilityEvidence(
             observed_dynamic_capability_sets,
             query_req.primary_text_index_name orelse query_req.index_name,
-            field.field,
+            physical,
             null,
         )) |field_type| {
             if (cursor.len > 0) try validatePublicMappedSortCursor(field.field, field_type, cursor[i]);
@@ -25943,6 +25984,7 @@ fn publicSearchRequestHasSortPageControls(query_req: db_mod.types.SearchRequest)
 fn publicPhysicalSortFieldsAlloc(
     alloc: std.mem.Allocator,
     order_by: []const db_mod.types.SortField,
+    runtime_schema: storage_schema.TableSchema,
 ) ![]const []const u8 {
     var fields = std.ArrayListUnmanaged([]const u8).empty;
     defer fields.deinit(alloc);
@@ -25950,14 +25992,18 @@ fn publicPhysicalSortFieldsAlloc(
         if (std.mem.eql(u8, sort_field.field, "_id") or
             std.mem.eql(u8, sort_field.field, "_score") or
             std.mem.eql(u8, sort_field.field, "_hierarchy.position")) continue;
+        const physical = if (storage_schema.resolveLogicalDocValues(runtime_schema, sort_field.field)) |resolved|
+            resolved.field
+        else
+            sort_field.field;
         var duplicate = false;
         for (fields.items) |field| {
-            if (std.mem.eql(u8, field, sort_field.field)) {
+            if (std.mem.eql(u8, field, physical)) {
                 duplicate = true;
                 break;
             }
         }
-        if (!duplicate) try fields.append(alloc, sort_field.field);
+        if (!duplicate) try fields.append(alloc, physical);
     }
     return try fields.toOwnedSlice(alloc);
 }
@@ -27582,6 +27628,14 @@ pub fn requiredPermissionForRequest(alloc: std.mem.Allocator, method: Authorizat
         return .{ .resource_type = resource_type, .resource = try system_catalog_routes.resourceNameAlloc(alloc, route), .permission_type = permission, .owns_resource = true };
     }
 
+    // Public gateway execution uses the same inference authority as physical
+    // connection invocation. Inventory is read-only; sessions require write
+    // authority even for GET event streams or status requests.
+    if (@import("inference_gateway.zig").ownsPath(path)) return .{
+        .resource_type = .inference,
+        .resource = "*",
+        .permission_type = if (@import("inference_gateway.zig").isDiscoveryPath(path)) .read else .write,
+    };
     if (method == .POST and routes.Routes.matchInferenceConnectionInvocation(path) != null) return .{
         .resource_type = .inference,
         .resource = "*",
@@ -27950,8 +28004,11 @@ test "internal service credentials cannot authorize public inference routes" {
         }
     };
     const alloc = std.testing.allocator;
+    var public_config = try common_config.Config.parseFromSlice(alloc, "{\"public_inference\":{\"enabled\":true}}");
+    defer public_config.deinit();
     const secret = "inference-audience-test-secret";
     var server = ApiHttpServer.init(alloc, .{
+        .node_config = &public_config,
         .trusted_principal_secret = secret,
         .trusted_principal_issuer = "cluster-a",
     }, FakeSource.iface(), null, null);
@@ -28222,7 +28279,7 @@ fn graphResolverValueDestinationsAllowed(
             }
             var it = object.iterator();
             while (it.next()) |entry| {
-                if (std.mem.eql(u8, entry.key_ptr.*, "resolvers")) continue;
+                if (std.mem.eql(u8, entry.key_ptr.*, "resolvers") or index_metadata.isOpaqueEntry(entry.key_ptr.*)) continue;
                 if (!(try graphResolverValueDestinationsAllowed(authenticated_identity, entry.value_ptr.*))) return false;
             }
         },
@@ -28946,7 +29003,7 @@ pub fn normalizeQueryEmbeddingOperationalError(err: anyerror) ?anyerror {
 }
 
 pub fn normalizeQueryOperationalError(err: anyerror) ?anyerror {
-    if (err == error.MetricNotReady or err == error.MetricStale or err == error.DecisionLimitExceeded) return err;
+    if (err == error.ValueSearchRequiresScan or err == error.ValueSearchLimitExceeded or err == error.MetricNotReady or err == error.MetricStale or err == error.DecisionLimitExceeded) return err;
     if (normalizeQueryEmbeddingOperationalError(err)) |normalized| return normalized;
     return switch (reranking_runtime.normalizeOperationalError(err)) {
         error.RerankRateLimited,
@@ -32727,11 +32784,24 @@ test "api http exact sort observation selects only unique physical fields" {
         .{ .field = "_id" },
         .{ .field = "_hierarchy.position" },
     };
-    const fields = try publicPhysicalSortFieldsAlloc(std.testing.allocator, &order);
+    const fields = try publicPhysicalSortFieldsAlloc(std.testing.allocator, &order, .{});
     defer if (fields.len > 0) std.testing.allocator.free(fields);
     try std.testing.expectEqual(@as(usize, 2), fields.len);
     try std.testing.expectEqualStrings("price", fields[0]);
     try std.testing.expectEqualStrings("quantity", fields[1]);
+}
+
+test "api http public sort capability gate resolves logical keyword fields" {
+    const schema = storage_schema.TableSchema{ .exact_fields = &.{
+        .{ .source_field = "title", .field = "title", .mapping = .{ .field_type = .text, .analyzer = "standard" } },
+        .{ .source_field = "title", .field = "title.keyword", .mapping = .{ .field_type = .keyword, .analyzer = "keyword", .doc_values = true, .sortable = true } },
+    } };
+    const order = [_]db_mod.types.SortField{.{ .field = "title" }};
+    const fields = try publicPhysicalSortFieldsAlloc(std.testing.allocator, &order, schema);
+    defer std.testing.allocator.free(fields);
+    try std.testing.expectEqualStrings("title.keyword", fields[0]);
+    // Routed admission validates the same physical mapping as the shard.
+    try validatePublicQuerySortCapabilitiesAgainstRuntimeWithEvidence(.{ .order_by = &order }, schema, &.{}, false);
 }
 
 test "api http public sort gate accepts synthetic hierarchy child positions" {
@@ -58194,6 +58264,7 @@ test "resolver curation HTTP resources share atomic metadata revisions and retir
         stress_reads: usize = 0,
         incompatible_last_page: bool = false,
         destination_cut_changed: bool = false,
+        destination_cut_failures: u8 = 0,
         fn status(_: *anyopaque) !metadata_api.MetadataStatus {
             return .{ .metadata_group_id = 1, .metrics = .{} };
         }
@@ -58247,6 +58318,10 @@ test "resolver curation HTTP resources share atomic metadata revisions and retir
             const input = call.resolver_catalog_read;
             if (input.expected_revision) |revision| try std.testing.expectEqual(self.commits, revision);
             if (self.destination_cut_changed and input.mode == .table and std.mem.eql(u8, input.table_name, "entities")) return error.CatalogGenerationChanged;
+            if (input.mode == .table and std.mem.eql(u8, input.table_name, "entities") and self.destination_cut_failures != 0) {
+                self.destination_cut_failures -= 1;
+                return error.CatalogGenerationChanged;
+            }
             const wire = @import("../metadata/resolver_catalog_read.zig");
             if (input.mode == .table and std.mem.eql(u8, input.table_name, "source")) {
                 if (self.observation_failure) |err| return err;
@@ -58316,8 +58391,37 @@ test "resolver curation HTTP resources share atomic metadata revisions and retir
     try Run.call(&server, .merge, "source", "concepts", "", "{\"from\":\"concept/race\",\"to\":\"concept/target\"}", 409);
     try std.testing.expectEqual(@as(u64, 0), source.commits);
     source.destination_cut_changed = false;
+    {
+        // Creating a proposal is queue-only, but establishes destination-owned
+        // judgments. Source-only edits cannot bypass that authority before the
+        // first entity action has materialized a namespace policy.
+        var queued = try resources.handle(&server, alloc, .proposal_create, "entities", "", "", "{\"action\":\"suppress\",\"key\":\"concept/queued\"}", "", .{});
+        defer queued.deinit(alloc);
+        try std.testing.expectEqual(@as(u16, 200), queued.status);
+        try std.testing.expect(std.mem.indexOf(u8, source.tables[1].indexes_json, "_resolver_namespaces") == null);
+        const before_guard = source.commits;
+        for ([_]StatusSource{ source.iface(), source.narrowIface() }) |iface| {
+            source.forbid_snapshot = false;
+            server.source = iface;
+            try Run.call(&server, .suppress, "source", "concepts", "", "{\"keys\":[\"concept/queued\"]}", 409);
+        }
+        try std.testing.expectEqual(before_guard, source.commits);
+        // Remove only this isolated fixture's queue; the legacy-path checks
+        // below start from their original empty destination catalog.
+        if (source.owned[1]) |bytes| alloc.free(bytes);
+        source.owned[1] = null;
+        source.tables[1].indexes_json = "{}";
+        source.commits = 0;
+        source.forbid_snapshot = true;
+        server.source = source.narrowIface();
+    }
     try Run.call(&server, .list, "source", "", "", "", 200);
+    // A transient destination-cut race retries from a fresh source cut, while
+    // persistent races above fail closed and explicit curation conflicts do
+    // not retry. Exactly one mutation commits.
+    source.destination_cut_failures = 1;
     try Run.call(&server, .merge, "source", "concepts", "", "{\"from\":\"concept/a\",\"to\":\"concept/b\"}", 202);
+    try std.testing.expectEqual(@as(u8, 0), source.destination_cut_failures);
     try Run.call(&server, .merge, "source", "concepts", "", "{\"from\":\"concept/a\",\"to\":\"concept/b\"}", 202);
     try std.testing.expectEqual(@as(u64, 1), source.commits);
     try Run.call(&server, .suppress, "source", "concepts", "", "{\"keys\":[\"concept/b\"]}", 400);
@@ -58511,6 +58615,135 @@ test "resolver curation HTTP resources share atomic metadata revisions and retir
     try std.testing.expect(std.mem.indexOf(u8, timed_out.body, "\"changed\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, timed_out.body, "\"applied\":false") != null);
     try Run.call(&server, .get, "source", "concepts", "", "", 200);
+    // Entity proposals share the destination CAS, preserving evidence and
+    // terminal history while queue-only edits leave policy revisions alone.
+    {
+        const before = source.commits;
+        var created = try resources.handle(&server, alloc, .proposal_create, "entities", "", "", "{\"action\":\"merge\",\"key\":\"concept/review-a\",\"into\":\"concept/review-b\",\"actor\":\"judge\",\"evidence\":{\"resolvers\":[{\"invalid\":true}]}}", "", .{});
+        defer created.deinit(alloc);
+        try std.testing.expectEqual(@as(u16, 200), created.status);
+        try std.testing.expectEqual(before + 1, source.commits);
+        const parsed = try std.json.parseFromSlice(std.json.Value, alloc, created.body, .{});
+        defer parsed.deinit();
+        const proposal_id = parsed.value.object.get("id").?.string;
+        const before_retry = source.commits;
+        try Run.call(&server, .proposal_create, "entities", "", "", "{\"action\":\"merge\",\"key\":\"concept/review-a\",\"into\":\"concept/review-b\"}", 200);
+        try std.testing.expectEqual(before_retry, source.commits);
+        var accepted = try resources.handle(&server, alloc, .proposal_accept, "entities", "", proposal_id, "{\"actor\":\"curator\",\"reason\":\"confirmed\"}", "", .{});
+        defer accepted.deinit(alloc);
+        if (accepted.status != 202) std.debug.print("proposal accept {d}: {s}\n", .{ accepted.status, accepted.body });
+        try std.testing.expectEqual(@as(u16, 202), accepted.status);
+        try std.testing.expectEqual(before_retry + 1, source.commits);
+        try std.testing.expect(std.mem.indexOf(u8, accepted.body, "\"state\":\"accepted\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, source.tables[1].indexes_json, "\"origin\":\"review\"") != null);
+        try Run.call(&server, .entity_suppress, "entities", "", "concept/review-b", "{}", 400);
+        var cascade = try resources.handle(&server, alloc, .entity_suppress, "entities", "", "concept/review-b", "{\"absorbed\":\"suppress\",\"actor\":\"user\"}", "", .{});
+        defer cascade.deinit(alloc);
+        try std.testing.expectEqual(@as(u16, 202), cascade.status);
+        try std.testing.expect(std.mem.indexOf(u8, cascade.body, "\"disposition\":\"suppress\"") != null);
+        const before_terminal = source.commits;
+        var retried = try resources.handle(&server, alloc, .proposal_accept, "entities", "", proposal_id, "{}", "", .{});
+        defer retried.deinit(alloc);
+        try std.testing.expectEqual(@as(u16, 202), retried.status);
+        const retry_result = try std.json.parseFromSlice(std.json.Value, alloc, retried.body, .{});
+        defer retry_result.deinit();
+        try std.testing.expect(!retry_result.value.object.get("changed").?.bool);
+        try std.testing.expect(!retry_result.value.object.get("applied").?.bool);
+        try std.testing.expectEqual(@as(usize, 1), retry_result.value.object.get("results").?.array.items.len);
+        // The retry observes today's policy after a subsequent cascade. It
+        // must not restore the accepted proposal's now-removed redirect.
+        try std.testing.expect(std.mem.indexOf(u8, source.tables[1].indexes_json, "\"cascade_from\":\"concept/review-b\"") != null);
+        // Terminal observation keeps only compact identities across 32 MiB
+        // of paged schemas, using the same 16 MiB budget as direct curation.
+        server.source = source.narrowIface();
+        source.forbid_snapshot = true;
+        source.stress_pages = 64;
+        var bounded_retry = try resources.handle(&server, budget.allocator(), .proposal_accept, "entities", "", proposal_id, "{}", "", .{});
+        try std.testing.expectEqual(@as(u16, 202), bounded_retry.status);
+        const bounded_replay = try std.json.parseFromSlice(std.json.Value, alloc, bounded_retry.body, .{});
+        defer bounded_replay.deinit();
+        try std.testing.expectEqual(@as(usize, 64), bounded_replay.value.object.get("results").?.array.items.len);
+        bounded_retry.deinit(budget.allocator());
+        try std.testing.expectEqual(@as(usize, 0), budget.live);
+        source.stress_pages = 0;
+        source.forbid_snapshot = false;
+        server.source = source.iface();
+        source.expire_wait = true;
+        var waited = try resources.handle(&server, alloc, .proposal_accept, "entities", "", proposal_id, "{\"wait\":{\"timeout_ms\":100}}", "", .{});
+        defer waited.deinit(alloc);
+        source.expire_wait = false;
+        try std.testing.expectEqual(@as(u16, 202), waited.status);
+        try std.testing.expect(std.mem.indexOf(u8, waited.body, "DeadlineExceeded") != null);
+        try Run.call(&server, .proposal_accept, "entities", "", proposal_id, "{\"wait\":{\"timeout_ms\":0}}", 400);
+        try std.testing.expectEqual(before_terminal, source.commits);
+        try Run.call(&server, .proposal_reject, "entities", "", proposal_id, "{}", 409);
+        var denied_proposal = try resources.handle(&server, alloc, .proposal_create, "entities", "", "", "{\"action\":\"suppress\",\"key\":\"concept/forbidden\"}", "", .{ .principal = .{ .kind = .user, .subject = "limited" }, .table_write_authorization = .{ .ptr = &authority_context, .allows = Denied.allows } });
+        defer denied_proposal.deinit(alloc);
+        try std.testing.expectEqual(@as(u16, 403), denied_proposal.status);
+        try std.testing.expectEqual(before_terminal, source.commits);
+        var screened = try resources.handle(&server, alloc, .proposal_create, "entities", "", "", "{\"action\":\"suppress\",\"key\":\"concept/screened\"}", "", .{});
+        defer screened.deinit(alloc);
+        const screening = try std.json.parseFromSlice(std.json.Value, alloc, screened.body, .{});
+        defer screening.deinit();
+        const screen_id = screening.value.object.get("id").?.string;
+        const before_reject = source.commits;
+        var rejected = try resources.handle(&server, alloc, .proposal_reject, "entities", "", screen_id, "{\"reason\":\"specific project term\"}", "", .{});
+        defer rejected.deinit(alloc);
+        try std.testing.expectEqual(@as(u16, 200), rejected.status);
+        const rejection = try std.json.parseFromSlice(std.json.Value, alloc, rejected.body, .{});
+        defer rejection.deinit();
+        try std.testing.expectEqualStrings("rejected", rejection.value.object.get("proposal").?.object.get("state").?.string);
+        try std.testing.expect(rejection.value.object.get("changed").?.bool);
+        try std.testing.expect(rejection.value.object.get("complete").?.bool);
+        try std.testing.expect(rejection.value.object.get("applied").?.bool);
+        try std.testing.expectEqual(@as(usize, 0), rejection.value.object.get("results").?.array.items.len);
+        try std.testing.expectEqual(before_reject + 1, source.commits);
+        var reject_retry = try resources.handle(&server, alloc, .proposal_reject, "entities", "", screen_id, "{}", "", .{});
+        defer reject_retry.deinit(alloc);
+        const reject_receipt = try std.json.parseFromSlice(std.json.Value, alloc, reject_retry.body, .{});
+        defer reject_receipt.deinit();
+        try std.testing.expectEqual(@as(u16, 200), reject_retry.status);
+        try std.testing.expect(!reject_receipt.value.object.get("changed").?.bool);
+        try std.testing.expect(reject_receipt.value.object.get("applied").?.bool);
+        try std.testing.expectEqualStrings("specific project term", reject_receipt.value.object.get("proposal").?.object.get("decided").?.object.get("reason").?.string);
+        try std.testing.expectEqual(before_reject + 1, source.commits);
+        // A pinned rejection has policy replay even when the retry body
+        // omits pin_distinct. Its durable decision, not this body, owns that.
+        var pin_created = try resources.handle(&server, alloc, .proposal_create, "entities", "", "", "{\"action\":\"merge\",\"key\":\"concept/pin-a\",\"into\":\"concept/pin-b\"}", "", .{});
+        defer pin_created.deinit(alloc);
+        const pin_record = try std.json.parseFromSlice(std.json.Value, alloc, pin_created.body, .{});
+        defer pin_record.deinit();
+        const pin_id = pin_record.value.object.get("id").?.string;
+        try Run.call(&server, .proposal_reject, "entities", "", pin_id, "{\"pin_distinct\":true}", 202);
+        const before_pin_retry = source.commits;
+        var pin_retry = try resources.handle(&server, alloc, .proposal_reject, "entities", "", pin_id, "{}", "", .{});
+        defer pin_retry.deinit(alloc);
+        try std.testing.expectEqual(@as(u16, 202), pin_retry.status);
+        const pin_receipt = try std.json.parseFromSlice(std.json.Value, alloc, pin_retry.body, .{});
+        defer pin_receipt.deinit();
+        try std.testing.expectEqualStrings("rejected", pin_receipt.value.object.get("proposal").?.object.get("state").?.string);
+        try std.testing.expect(!pin_receipt.value.object.get("applied").?.bool);
+        try std.testing.expectEqual(@as(usize, 1), pin_receipt.value.object.get("results").?.array.items.len);
+        try std.testing.expectEqual(before_pin_retry, source.commits);
+        var repeated = try resources.handle(&server, alloc, .proposal_create, "entities", "", "", "{\"action\":\"suppress\",\"key\":\"concept/screened\"}", "", .{});
+        defer repeated.deinit(alloc);
+        try std.testing.expect(std.mem.indexOf(u8, repeated.body, "\"state\":\"rejected\"") != null);
+        var proposed_direct = try resources.handle(&server, alloc, .proposal_create, "entities", "", "", "{\"action\":\"suppress\",\"key\":\"concept/direct\"}", "", .{});
+        defer proposed_direct.deinit(alloc);
+        const direct = try std.json.parseFromSlice(std.json.Value, alloc, proposed_direct.body, .{});
+        defer direct.deinit();
+        const direct_id = direct.value.object.get("id").?.string;
+        try Run.call(&server, .entity_suppress, "entities", "", "concept/direct", "{\"actor\":\"user\"}", 202);
+        var superseded = try resources.handle(&server, alloc, .proposal, "entities", "", direct_id, "", "", .{});
+        defer superseded.deinit(alloc);
+        try std.testing.expect(std.mem.indexOf(u8, superseded.body, "\"state\":\"superseded\"") != null);
+        var listed = try resources.handle(&server, alloc, .proposals, "entities", "", "", "", "state=all&limit=1", .{});
+        defer listed.deinit(alloc);
+        const page = try std.json.parseFromSlice(std.json.Value, alloc, listed.body, .{});
+        defer page.deinit();
+        try std.testing.expectEqual(@as(usize, 1), page.value.object.get("proposals").?.array.items.len);
+        try std.testing.expect(page.value.object.get("next_cursor").? != .null);
+    }
     const retired = (try indexes_api.removeIndexFromTableIndexesJson(alloc, source.tables[0].indexes_json, "knowledge")).?;
     defer alloc.free(retired);
     _ = try Source.replace(&source, source.tables[0], blk: {
@@ -58768,4 +59001,16 @@ test "external lake read refresh hints coalesce without superseding active publi
     try std.testing.expect(server.index_installation_queue.items[0].generation != generation);
     try std.testing.expectEqual(@as(u8, 0), server.index_installation_queue.items[0].failures);
     try std.testing.expectEqual(@as(u64, 0), server.index_installation_queue.items[0].retry_after_ns);
+}
+
+test "resolver curation HTTP destination checks ignore opaque control metadata" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const payload = try std.json.parseFromSliceLeaky(std.json.Value, a,
+        \\{"_curation_proposals":{"resolvers":"invalid evidence"},"_resolver_curation":{"resolvers":[{"table":"protected"}]},"_resolver_namespaces":{"resolvers":false}}
+    , .{});
+    try std.testing.expect(try graphResolverValueDestinationsAllowed(null, payload));
+    const actual = try std.json.parseFromSliceLeaky(std.json.Value, a, "{\"graph\":{\"resolvers\":false}}", .{});
+    try std.testing.expectError(error.InvalidCreateTableRequest, graphResolverValueDestinationsAllowed(null, actual));
 }

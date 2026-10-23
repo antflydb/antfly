@@ -798,6 +798,34 @@ export class AntflyClient {
     return data;
   }
 
+  /** Named inference uses the same authentication as database requests.
+   * Mutations are issued once; callers control retry policy and cancellation.
+   * A streamed Response remains owned by its caller until consumed/canceled.
+   */
+  inference = {
+    models: async (signal?: AbortSignal): Promise<InferenceGatewayCatalog> => {
+      const response = await fetch(this.url("/ai/v1/models"), {
+        headers: this.requestHeaders({ Accept: "application/json" }),
+        signal,
+      });
+      if (!response.ok) throw new Error(`Inference catalog failed (${response.status})`);
+      const { text, truncated } = await readLimitedResponseText(response, 16 << 20);
+      if (truncated) throw new Error("Inference catalog exceeded its size limit");
+      return JSON.parse(text) as InferenceGatewayCatalog;
+    },
+    invoke: (
+      operation: InferenceGatewayOperation,
+      body: Record<string, unknown>,
+      signal?: AbortSignal
+    ): Promise<Response> =>
+      fetch(this.url(operation === "predict" ? "/ml/v1/predict" : `/ai/v1/${operation}`), {
+        method: "POST",
+        headers: this.requestHeaders(),
+        body: JSON.stringify(body),
+        signal,
+      }),
+  };
+
   connections = {
     /**
      * List configured external connections (inference providers, web search,
@@ -1096,8 +1124,10 @@ export class AntflyClient {
    */
   private async performRetrievalAgent(
     request: RetrievalAgentRequest,
-    callbacks?: RetrievalAgentStreamCallbacks
+    callbacks?: RetrievalAgentStreamCallbacks,
+    options?: QueryExecutionOptions
   ): Promise<RetrievalAgentResult | AbortController> {
+    options?.signal?.throwIfAborted();
     const headers: Record<string, string> = {
       "Content-Type": "application/json",
       Accept: "text/event-stream, application/json",
@@ -1113,13 +1143,16 @@ export class AntflyClient {
     Object.assign(headers, this.config.headers);
 
     const abortController = new AbortController();
+    const signal = options?.signal
+      ? AbortSignal.any([abortController.signal, options.signal])
+      : abortController.signal;
     const response = await fetch(
       `${normalizeBaseUrl(this.config.baseUrl)}/db/v1/agents/retrieval`,
       {
         method: "POST",
         headers,
         body: JSON.stringify(request),
-        signal: abortController.signal,
+        signal,
       }
     );
 
@@ -1145,6 +1178,7 @@ export class AntflyClient {
     // Handle JSON response (non-streaming)
     if (isJSON) {
       const result = (await response.json()) as RetrievalAgentResult;
+      signal.throwIfAborted();
       return result;
     }
 
@@ -1165,7 +1199,7 @@ export class AntflyClient {
     void (async () => {
       try {
         for await (const frame of parseSSEFrames(stream, "Retrieval agent")) {
-          if (abortController.signal.aborted) return;
+          if (signal.aborted) return;
           switch (frame.event) {
             case "classification":
               callbacks.onClassification?.(JSON.parse(frame.data));
@@ -1227,7 +1261,7 @@ export class AntflyClient {
         }
         throw new Error("Retrieval agent stream ended before done");
       } catch (error) {
-        if (!abortController.signal.aborted) {
+        if (!signal.aborted) {
           const detail = error instanceof Error ? error : new Error(String(error));
           callbacks.onErrorDetail?.(detail);
           callbacks.onError?.(detail.message);
@@ -1244,21 +1278,31 @@ export class AntflyClient {
    * Use streamRetrievalAgent when incremental events are required. Keeping the
    * two response modes separate avoids runtime shape checks on the result.
    */
-  async retrievalAgent(request: RetrievalAgentRequest): Promise<RetrievalAgentResult>;
+  async retrievalAgent(
+    request: RetrievalAgentRequest,
+    callbacks?: undefined,
+    options?: QueryExecutionOptions
+  ): Promise<RetrievalAgentResult>;
   /**
    * @deprecated Use streamRetrievalAgent(request, callbacks). This overload is
    * retained for source compatibility and will be removed in a future major release.
    */
   async retrievalAgent(
     request: RetrievalAgentRequest,
-    callbacks: RetrievalAgentStreamCallbacks
+    callbacks: RetrievalAgentStreamCallbacks,
+    options?: QueryExecutionOptions
   ): Promise<AbortController>;
   async retrievalAgent(
     request: RetrievalAgentRequest,
-    callbacks?: RetrievalAgentStreamCallbacks
+    callbacks?: RetrievalAgentStreamCallbacks,
+    options?: QueryExecutionOptions
   ): Promise<RetrievalAgentResult | AbortController> {
-    if (callbacks) return this.streamRetrievalAgent(request, callbacks);
-    const result = await this.performRetrievalAgent({ ...request, stream: false });
+    if (callbacks) return this.streamRetrievalAgent(request, callbacks, options);
+    const result = await this.performRetrievalAgent(
+      { ...request, stream: false },
+      undefined,
+      options
+    );
     if (result instanceof AbortController) {
       result.abort();
       throw new Error("Retrieval agent returned a stream for a JSON request");
@@ -1269,9 +1313,14 @@ export class AntflyClient {
   /** Run the retrieval agent as an SSE stream. */
   async streamRetrievalAgent(
     request: RetrievalAgentRequest,
-    callbacks: RetrievalAgentStreamCallbacks
+    callbacks: RetrievalAgentStreamCallbacks,
+    options?: QueryExecutionOptions
   ): Promise<AbortController> {
-    const result = await this.performRetrievalAgent({ ...request, stream: true }, callbacks);
+    const result = await this.performRetrievalAgent(
+      { ...request, stream: true },
+      callbacks,
+      options
+    );
     if (result instanceof AbortController) return result;
 
     // A proxy or older server may still answer with JSON. Preserve the complete
@@ -2717,7 +2766,87 @@ export class AntflyClient {
     },
   };
 
+  curationProposals = {
+    create: async (
+      tableName: string,
+      body: components["schemas"]["CurationProposalRequest"],
+      options?: { signal?: AbortSignal }
+    ) => {
+      const { data, error } = await this.client.POST(
+        "/db/v1/tables/{tableName}/curation/proposals",
+        { signal: options?.signal, params: { path: { tableName } }, body }
+      );
+      if (error) throw new Error(`curationProposals.create: ${error.error}`);
+      if (!data) throw new Error("curationProposals.create: empty response");
+      return data;
+    },
+    list: async (
+      tableName: string,
+      query?: { state?: string; action?: string; cursor?: string; limit?: number },
+      options?: { signal?: AbortSignal }
+    ) => {
+      const { data, error } = await this.client.GET(
+        "/db/v1/tables/{tableName}/curation/proposals",
+        { signal: options?.signal, params: { path: { tableName }, query } }
+      );
+      if (error) throw new Error(`curationProposals.list: ${error.error}`);
+      if (!data) throw new Error("curationProposals.list: empty response");
+      return data;
+    },
+    get: async (tableName: string, proposalId: string, options?: { signal?: AbortSignal }) => {
+      const { data, error } = await this.client.GET(
+        "/db/v1/tables/{tableName}/curation/proposals/{proposalId}",
+        { signal: options?.signal, params: { path: { tableName, proposalId } } }
+      );
+      if (error) throw new Error(`curationProposals.get: ${error.error}`);
+      if (!data) throw new Error("curationProposals.get: empty response");
+      return data;
+    },
+    accept: async (
+      tableName: string,
+      proposalId: string,
+      body: components["schemas"]["CurationProposalDecisionRequest"] = {},
+      options?: { signal?: AbortSignal }
+    ) => {
+      const { data, error } = await this.client.POST(
+        "/db/v1/tables/{tableName}/curation/proposals/{proposalId}:accept",
+        { signal: options?.signal, params: { path: { tableName, proposalId } }, body }
+      );
+      if (error) throw new Error(`curationProposals.accept: ${error.error}`);
+      if (!data) throw new Error("curationProposals.accept: empty response");
+      return data;
+    },
+    reject: async (
+      tableName: string,
+      proposalId: string,
+      body: components["schemas"]["CurationProposalDecisionRequest"] = {},
+      options?: { signal?: AbortSignal }
+    ) => {
+      const { data, error } = await this.client.POST(
+        "/db/v1/tables/{tableName}/curation/proposals/{proposalId}:reject",
+        { signal: options?.signal, params: { path: { tableName, proposalId } }, body }
+      );
+      if (error) throw new Error(`curationProposals.reject: ${error.error}`);
+      if (!data) throw new Error("curationProposals.reject: empty response");
+      return data;
+    },
+  };
+
   entities = {
+    distinct: async (
+      tableName: string,
+      key: string,
+      body: components["schemas"]["EntityDistinctRequest"],
+      options?: { signal?: AbortSignal }
+    ) => {
+      const { data, error } = await this.client.POST(
+        "/db/v1/tables/{tableName}/entities/{key}:distinct",
+        { signal: options?.signal, params: { path: { tableName, key } }, body }
+      );
+      if (error) throw new Error(`pinEntitiesDistinct: ${error.error}`);
+      if (!data) throw new Error("pinEntitiesDistinct: empty response");
+      return data;
+    },
     state: async (tableName: string, key: string, options?: { signal?: AbortSignal }) => {
       const { data, error } = await this.client.GET(
         "/db/v1/tables/{tableName}/entities/{key}/redirects",
@@ -2758,7 +2887,7 @@ export class AntflyClient {
     suppress: async (
       tableName: string,
       key: string,
-      body: components["schemas"]["ResolverUnmergeRequest"],
+      body: components["schemas"]["EntitySuppressRequest"],
       options?: { signal?: AbortSignal }
     ) => {
       const { data, error } = await this.client.POST(
@@ -3057,7 +3186,125 @@ export class AntflyClient {
     },
   };
 
+  namespaceCurationProposals = {
+    create: async (
+      databaseName: string,
+      namespaceName: string,
+      tableName: string,
+      body: components["schemas"]["CurationProposalRequest"],
+      options?: { signal?: AbortSignal }
+    ) => {
+      const { data, error } = await this.client.POST(
+        "/db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/curation/proposals",
+        {
+          signal: options?.signal,
+          params: { path: { databaseName, namespaceName, tableName } },
+          body,
+        }
+      );
+      if (error) throw new Error(`namespaceCurationProposals.create: ${error.error}`);
+      if (!data) throw new Error("namespaceCurationProposals.create: empty response");
+      return data;
+    },
+    list: async (
+      databaseName: string,
+      namespaceName: string,
+      tableName: string,
+      query?: { state?: string; action?: string; cursor?: string; limit?: number },
+      options?: { signal?: AbortSignal }
+    ) => {
+      const { data, error } = await this.client.GET(
+        "/db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/curation/proposals",
+        {
+          signal: options?.signal,
+          params: { path: { databaseName, namespaceName, tableName }, query },
+        }
+      );
+      if (error) throw new Error(`namespaceCurationProposals.list: ${error.error}`);
+      if (!data) throw new Error("namespaceCurationProposals.list: empty response");
+      return data;
+    },
+    get: async (
+      databaseName: string,
+      namespaceName: string,
+      tableName: string,
+      proposalId: string,
+      options?: { signal?: AbortSignal }
+    ) => {
+      const { data, error } = await this.client.GET(
+        "/db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/curation/proposals/{proposalId}",
+        {
+          signal: options?.signal,
+          params: { path: { databaseName, namespaceName, tableName, proposalId } },
+        }
+      );
+      if (error) throw new Error(`namespaceCurationProposals.get: ${error.error}`);
+      if (!data) throw new Error("namespaceCurationProposals.get: empty response");
+      return data;
+    },
+    accept: async (
+      databaseName: string,
+      namespaceName: string,
+      tableName: string,
+      proposalId: string,
+      body: components["schemas"]["CurationProposalDecisionRequest"] = {},
+      options?: { signal?: AbortSignal }
+    ) => {
+      const { data, error } = await this.client.POST(
+        "/db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/curation/proposals/{proposalId}:accept",
+        {
+          signal: options?.signal,
+          params: { path: { databaseName, namespaceName, tableName, proposalId } },
+          body,
+        }
+      );
+      if (error) throw new Error(`namespaceCurationProposals.accept: ${error.error}`);
+      if (!data) throw new Error("namespaceCurationProposals.accept: empty response");
+      return data;
+    },
+    reject: async (
+      databaseName: string,
+      namespaceName: string,
+      tableName: string,
+      proposalId: string,
+      body: components["schemas"]["CurationProposalDecisionRequest"] = {},
+      options?: { signal?: AbortSignal }
+    ) => {
+      const { data, error } = await this.client.POST(
+        "/db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/curation/proposals/{proposalId}:reject",
+        {
+          signal: options?.signal,
+          params: { path: { databaseName, namespaceName, tableName, proposalId } },
+          body,
+        }
+      );
+      if (error) throw new Error(`namespaceCurationProposals.reject: ${error.error}`);
+      if (!data) throw new Error("namespaceCurationProposals.reject: empty response");
+      return data;
+    },
+  };
+
   namespaceEntities = {
+    distinct: async (
+      databaseName: string,
+      namespaceName: string,
+      tableName: string,
+      key: string,
+      body: components["schemas"]["EntityDistinctRequest"],
+      options?: { signal?: AbortSignal }
+    ) => {
+      const { data, error } = await this.client.POST(
+        "/db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/entities/{key}:distinct",
+        {
+          signal: options?.signal,
+          params: { path: { databaseName, namespaceName, tableName, key } },
+          body,
+        }
+      );
+      if (error) throw new Error(`pinEntitiesDistinct: ${error.error}`);
+      if (!data) throw new Error("pinEntitiesDistinct: empty response");
+      return data;
+    },
     state: async (
       databaseName: string,
       namespaceName: string,
@@ -3121,7 +3368,7 @@ export class AntflyClient {
       namespaceName: string,
       tableName: string,
       key: string,
-      body: components["schemas"]["ResolverUnmergeRequest"],
+      body: components["schemas"]["EntitySuppressRequest"],
       options?: { signal?: AbortSignal }
     ) => {
       const { data, error } = await this.client.POST(
@@ -3402,4 +3649,40 @@ export class ChatGPTConnectionError extends Error {
     super(code);
     this.name = "ChatGPTConnectionError";
   }
+}
+
+export type InferenceGatewayOperation =
+  | "chat/completions"
+  | "decisions"
+  | "embeddings"
+  | "embed"
+  | "rerank"
+  | "chunk"
+  | "read"
+  | "extract"
+  | "rewrite"
+  | "transcribe"
+  | "dictate"
+  | "synthesize"
+  | "predict"
+  | "generate"
+  | "generate/batch";
+export interface InferenceGatewayModel {
+  id: string;
+  object: "model";
+  task?: string;
+  /** Known supported tasks; task is omitted when discovery is ambiguous. */
+  tasks?: string[];
+  connection?: string;
+  backend_model?: string;
+  availability?: string;
+  freshness?: string;
+  gateway_capabilities?: Record<string, "supported" | "unsupported" | "unknown">;
+}
+export interface InferenceGatewayCatalog {
+  /** Deployment policy; omitted by servers predating public inference controls. */
+  public_inference_enabled?: boolean;
+  object: "list";
+  data: InferenceGatewayModel[];
+  [group: string]: unknown;
 }

@@ -31,8 +31,9 @@ class DecisionBatchItem:
             GeneratedMultiChoiceAnswer | GeneratedPredicateAnswer | GeneratedScoreAnswer | TrainedChoiceAnswer |
             TrainedPredicateAnswer | TrainedScoreAnswer]):
         id (str | Unset):
-        error (str | Unset): Generated batches preserve valid siblings; a failed item has an empty answers array and
-            this error code.
+        error (str | Unset): Named gateway and generated batches preserve valid siblings; a failed item has an empty
+            answers array and this error code. Invalid input or request budgets fail validation before dispatch.
+        model (str | Unset): Resolved model reported for a successful named gateway batch item.
     """
 
     input_index: int
@@ -49,6 +50,7 @@ class DecisionBatchItem:
     ]
     id: str | Unset = UNSET
     error: str | Unset = UNSET
+    model: str | Unset = UNSET
 
     def to_dict(self) -> dict[str, Any]:
         from ..models.embedding_choice_answer import EmbeddingChoiceAnswer
@@ -90,6 +92,8 @@ class DecisionBatchItem:
 
         error = self.error
 
+        model = self.model
+
         field_dict: dict[str, Any] = {}
 
         field_dict.update(
@@ -102,6 +106,8 @@ class DecisionBatchItem:
             field_dict["id"] = id
         if error is not UNSET:
             field_dict["error"] = error
+        if model is not UNSET:
+            field_dict["model"] = model
 
         return field_dict
 
@@ -215,11 +221,14 @@ class DecisionBatchItem:
 
         error = d.pop("error", UNSET)
 
+        model = d.pop("model", UNSET)
+
         decision_batch_item = cls(
             input_index=input_index,
             answers=answers,
             id=id,
             error=error,
+            model=model,
         )
 
         return decision_batch_item

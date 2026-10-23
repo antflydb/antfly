@@ -24,7 +24,7 @@ separate; a source build or native archive does not imply wheel/npm support.
  Source checkouts
 can build the shared library with "Library discovery" below. From the
 `antfly` monorepo source tree, build it
-with `cd zig && zig build lite` (produces `zig/zig-out/lib/libantfly.*`);
+with `cd zig && zig build libantfly` (produces `zig/zig-out/lib/libantfly.*`);
 this package does not build it for you.
 
 ## Quick start

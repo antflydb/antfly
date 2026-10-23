@@ -57,3 +57,72 @@ def test_catalog_errors_preserve_shared_envelope(operation, status, code):
     assert isinstance(result, Error)
     assert result.error == code
     assert result.code == code
+
+
+def test_table_capabilities_preserve_logical_groups_and_concrete_views():
+    from antfly.client_generated.api.table_management import get_table
+    from antfly.client_generated.models.table_status import TableStatus
+    from antfly.client_generated.types import UNSET
+
+    representation = {
+        "field": "title._keyword",
+        "type": "keyword",
+        "query_modes": ["exact"],
+        "sortable": True,
+        "provenance": "document_schema",
+        "missing_null_policy": "missing_rejected",
+        "sort_lifecycle_state": "declared",
+        "doc_value_coverage": "schema_declared",
+        "queryability_state": "declared",
+        "analyzer": "keyword",
+    }
+    capabilities = [
+        {
+            "field": "title",
+            "kind": "source",
+            "value_operations": ["equals", "contains", "matches"],
+            "sortable": True,
+            "sort_lifecycle_state": "declared",
+            "sort_requires_scoring": False,
+            "representations": [representation],
+        },
+        {
+            "field": "_score",
+            "kind": "computed",
+            "value_operations": [],
+            "sortable": True,
+            "sort_lifecycle_state": "queryable",
+            "sort_requires_scoring": True,
+            "representations": [],
+        },
+        {
+            "kind": "unassociated",
+            "value_operations": [],
+            "sortable": False,
+            "sort_lifecycle_state": "unsupported",
+            "sort_requires_scoring": False,
+            "representations": [{**representation, "field": "unknown._keyword", "provenance": "observed_dynamic"}],
+        },
+    ]
+    result = get_table._parse_response(
+        client=Client(base_url="http://unused", raise_on_unexpected_status=True),
+        response=httpx.Response(
+            200,
+            json={
+                "name": "docs",
+                "indexes": {},
+                "shards": {},
+                "storage_status": {},
+                "field_capabilities": capabilities,
+            },
+        ),
+    )
+    assert isinstance(result, TableStatus)
+    assert isinstance(result.field_capabilities, list)
+    source, score, unknown = result.field_capabilities
+    assert source.field == "title"
+    assert source.representations[0].field == "title._keyword"
+    assert score.sort_requires_scoring is True
+    assert unknown.field is UNSET
+    assert unknown.representations[0].field == "unknown._keyword"
+    assert result.to_dict()["field_capabilities"] == capabilities

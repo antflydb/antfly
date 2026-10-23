@@ -1,17 +1,17 @@
 # Copyright 2026 Antfly, Inc.
-# SPDX-License-Identifier: Elastic-2.0
+# SPDX-License-Identifier: Apache-2.0
 #
-# Licensed under the Elastic License 2.0 (ELv2); you may not use this file
-# except in compliance with the Elastic License 2.0. You may obtain a copy of
-# the Elastic License 2.0 at
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
 #
-#     https://www.antfly.io/licensing/ELv2-license
+#     http://www.apache.org/licenses/LICENSE-2.0
 #
-# Unless required by applicable law or agreed to in writing, software distributed
-# under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
-# WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
-# Elastic License 2.0 for the specific language governing permissions and
-# limitations.
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 """Stateful public API backup and restore tests."""
 
@@ -57,6 +57,37 @@ BACKUP_CONNECTION = "e2e-backups"
 def _file_location(path: str | Path) -> str:
     """Return a canonical file URI accepted by no-symlink backup traversal."""
     return Path(path).resolve().as_uri()
+
+
+def _wait_for_constraints_enforced(
+    session: requests.Session,
+    api_url: str,
+    table_name: str,
+    *,
+    timeout_s: float = 90.0,
+) -> bool:
+    """Observe setup readiness within one budget, including timed-out reads."""
+    deadline = time.monotonic() + timeout_s
+    while (remaining := deadline - time.monotonic()) > 0:
+        try:
+            response = session.get(
+                f"{api_url}/tables/{table_name}/constraints/status",
+                timeout=min(5.0, remaining),
+            )
+        except requests.Timeout:
+            # A slow metadata read must consume the existing readiness budget,
+            # not abort it at the first five-second request timeout.
+            pass
+        else:
+            if response.status_code == 200:
+                if response.json().get("state") == "enforced":
+                    return time.monotonic() <= deadline
+            else:
+                assert response.status_code in (404, 409, 503), response.text
+        remaining = deadline - time.monotonic()
+        if remaining > 0:
+            time.sleep(min(1.0, remaining))
+    return False
 
 
 def _wait_for_terminal_restore_job(
@@ -2342,18 +2373,9 @@ def _exercise_online_document_merge(
     if timings:
         timings.mark("parent.replicated_topology")
     if schema and (schema.get("unique_constraints") or schema.get("foreign_keys")):
-
-        def enforced():
-            response = session.get(
-                f"{cluster.data_api_urls[0]}/tables/{table_name}/constraints/status",
-                timeout=5,
-            )
-            if response.status_code == 200:
-                return response.json().get("state") == "enforced"
-            assert response.status_code in (404, 409, 503), response.text
-            return False
-
-        assert wait_until(enforced, timeout_s=90), cluster.debug_logs()
+        assert _wait_for_constraints_enforced(
+            session, cluster.data_api_urls[0], table_name
+        ), cluster.debug_logs()
     if timings:
         timings.mark("parent.constraints_enforced")
     documents = (

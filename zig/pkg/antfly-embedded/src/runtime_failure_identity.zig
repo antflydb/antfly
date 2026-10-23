@@ -362,6 +362,8 @@ const mappings = [_]Mapping{
     .{ .status = .invalid_aggregation, .err = error.InvalidAggregation },
     .{ .status = .unsupported_aggregation, .err = error.UnsupportedAggregation },
     .{ .status = .query_candidate_budget_exceeded, .err = error.QueryCandidateBudgetExceeded },
+    .{ .status = .value_verification_requires_scan, .err = error.ValueSearchRequiresScan },
+    .{ .status = .value_verification_limit_exceeded, .err = error.ValueSearchLimitExceeded },
     .{ .status = .decision_limit_exceeded, .err = error.DecisionLimitExceeded },
     .{ .status = .invalid_index_config, .err = error.InvalidIndexConfig },
     .{ .status = .algebraic_planner_scan_too_large, .err = error.AlgebraicPlannerScanTooLarge },
@@ -632,6 +634,7 @@ const mappings = [_]Mapping{
     .{ .status = .graph_min_weight_domain_violation, .err = error.GraphMinWeightDomainViolation },
     .{ .status = .graph_path_weight_overflow, .err = error.GraphPathWeightOverflow },
     .{ .status = .graph_query_mode_unsupported, .err = error.GraphQueryModeUnsupported },
+    .{ .status = .graph_start_identity_required, .err = error.GraphStartIdentityRequired },
     .{ .status = .graph_reverse_variable_path_unsupported, .err = error.GraphReverseVariablePathUnsupported },
     .{ .status = .graph_work_budget_exceeded, .err = error.GraphWorkBudgetExceeded },
     .{ .status = .invalid_graph_edges, .err = error.InvalidGraphEdges },
@@ -1099,4 +1102,18 @@ test "external lake evaluation limits survive the compiled query owner boundary"
     try validateFailureEnvelope(failure.status, &failure, abi.abi_version);
     try std.testing.expectError(error.DecisionLimitExceeded, statusToError(failure.status));
     try std.testing.expectEqualStrings("DecisionLimitExceeded", failure.errorName());
+}
+
+test "logical value query policy errors retain identity across compiled storage boundaries" {
+    inline for (.{ error.ValueSearchRequiresScan, error.ValueSearchLimitExceeded }) |err| {
+        try std.testing.expect(statusFromError(err) != .internal);
+        try std.testing.expectError(err, statusToError(statusFromError(err)));
+    }
+}
+
+test "graph start identity requirement survives the compiled query boundary" {
+    const failure = failureFromError(error.GraphStartIdentityRequired, .local_query, abi.abi_version, 4);
+    try validateFailureEnvelope(failure.status, &failure, abi.abi_version);
+    try std.testing.expectError(error.GraphStartIdentityRequired, statusToError(failure.status));
+    try std.testing.expectEqualStrings("GraphStartIdentityRequired", failure.errorName());
 }

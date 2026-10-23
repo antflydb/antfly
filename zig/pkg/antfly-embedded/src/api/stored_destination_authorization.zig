@@ -22,6 +22,7 @@
 //! grant by including it in its request.
 
 const std = @import("std");
+const index_metadata = @import("index_metadata.zig");
 const usermgr = @import("../usermgr/user_manager.zig");
 
 pub const grant_field = "_antfly_destination_authorization_v1";
@@ -199,7 +200,7 @@ fn valueHasResolverDestination(value: std.json.Value) !bool {
             }
             var it = object.iterator();
             while (it.next()) |entry| {
-                if (std.mem.eql(u8, entry.key_ptr.*, "resolvers")) continue;
+                if (std.mem.eql(u8, entry.key_ptr.*, "resolvers") or index_metadata.isOpaqueEntry(entry.key_ptr.*)) continue;
                 if (try valueHasResolverDestination(entry.value_ptr.*)) return true;
             }
         },
@@ -368,7 +369,7 @@ fn validateResolverGrants(
             var it = object.iterator();
             while (it.next()) |entry| {
                 if (std.mem.eql(u8, entry.key_ptr.*, "resolvers") or
-                    std.mem.eql(u8, entry.key_ptr.*, grant_field)) continue;
+                    std.mem.eql(u8, entry.key_ptr.*, grant_field) or index_metadata.isOpaqueEntry(entry.key_ptr.*)) continue;
                 try validateResolverGrants(alloc, entry.value_ptr.*, source_table, authorizer);
             }
         },
@@ -445,7 +446,9 @@ fn appendValueSealingResolvers(
                 first = false;
                 try appendJsonValue(alloc, out, .{ .string = entry.key_ptr.* });
                 try out.append(alloc, ':');
-                if (std.mem.eql(u8, entry.key_ptr.*, "resolvers")) {
+                if (index_metadata.isOpaqueEntry(entry.key_ptr.*)) {
+                    try appendJsonValue(alloc, out, entry.value_ptr.*);
+                } else if (std.mem.eql(u8, entry.key_ptr.*, "resolvers")) {
                     const resolvers = entry.value_ptr.*;
                     if (resolvers != .array) return error.InvalidStoredDestinationConfig;
                     try out.append(alloc, '[');

@@ -3036,6 +3036,10 @@ fn rejectDisallowedModel(
 const transient_capacity_retry_after_seconds = "1";
 const transient_capacity_retry_after_ms = 1000;
 
+fn isModelPublicationError(err: anyerror) bool {
+    return err == error.ModelArtifactsChanging or err == error.IncompleteManagedDownload;
+}
+
 fn isTransientInferenceCapacityError(err: anyerror) bool {
     return err == error.ResourceTemporarilyUnavailable or err == error.ConcurrencyUnavailable or err == error.GenerationCapacityUnavailable;
 }
@@ -3118,6 +3122,7 @@ fn modelLoadFailureResponse(ctx: *httpx.Context, err: anyerror) !httpx.Response 
 
 fn inferenceFailureResponse(ctx: *httpx.Context, err: anyerror) !httpx.Response {
     if (isTransientInferenceCapacityError(err)) return modelResourceBusyResponse(ctx);
+    if (isModelPublicationError(err)) return modelArtifactsChangingResponse(ctx);
     return switch (err) {
         error.MemoryBudgetExceeded => ctx.status(507).json(.{
             .@"error" = "MEMORY_BUDGET_EXCEEDED",
@@ -3512,12 +3517,22 @@ fn loadedModelRequestIdentifier(canonical_models_dir: []const u8, canonical_mode
     return identifier;
 }
 
-fn loadedModelRequestIdentifierAlloc(
+const LoadedModelRequestIdentity = struct {
+    value: []u8,
+    source: enum { managed, relative },
+
+    fn instanceIdentifier(self: @This()) []const u8 {
+        // Receipt names already carry the authoritative Hub namespace.
+        return if (self.source == .managed) self.value else Node.stripRuntimeTaskPrefix(self.value);
+    }
+};
+
+fn loadedModelRequestIdentityAlloc(
     allocator: std.mem.Allocator,
     io: std.Io,
     canonical_models_dir: []const u8,
     canonical_model_dir: []const u8,
-) !?[]u8 {
+) !?LoadedModelRequestIdentity {
     const managed_identifier = registry_mod.managedModelRequestNameAlloc(
         allocator,
         io,
@@ -3526,13 +3541,72 @@ fn loadedModelRequestIdentifierAlloc(
         error.OutOfMemory => return err,
         else => null,
     };
-    if (managed_identifier) |identifier| return identifier;
+    if (managed_identifier) |identifier| return .{ .value = identifier, .source = .managed };
 
     const relative = loadedModelRequestIdentifier(
         canonical_models_dir,
         canonical_model_dir,
     ) orelse return null;
-    return try allocator.dupe(u8, relative);
+    return .{ .value = try allocator.dupe(u8, relative), .source = .relative };
+}
+
+fn loadedModelRequestIdentifierAlloc(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    canonical_models_dir: []const u8,
+    canonical_model_dir: []const u8,
+) !?[]u8 {
+    const identity = (try loadedModelRequestIdentityAlloc(allocator, io, canonical_models_dir, canonical_model_dir)) orelse return null;
+    return identity.value;
+}
+
+test "instance identifiers preserve managed task namespaces and strip only legacy directories" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "models/artifact");
+    try tmp.dir.writeFile(io, .{ .sub_path = "models/artifact/model.gguf", .data = "decoder" });
+    const models_root = try tmp.dir.realPathFileAlloc(io, "models", allocator);
+    defer allocator.free(models_root);
+    const artifact_dir = try tmp.dir.realPathFileAlloc(io, "models/artifact", allocator);
+    defer allocator.free(artifact_dir);
+
+    for (Node.runtime_model_tasks) |task| {
+        const owner = Node.runtimeTaskDir(task);
+        for ([_][]const u8{ "auto", "gguf:Q4_K_M" }) |variant| {
+            const receipt = try std.fmt.allocPrint(
+                allocator,
+                "{{\"version\":2,\"source\":{{\"owner\":\"{s}\",\"name\":\"example\",\"variant\":\"{s}\"}},\"artifacts\":[{{\"path\":\"model.gguf\",\"size\":7}}]}}",
+                .{ owner, variant },
+            );
+            defer allocator.free(receipt);
+            try tmp.dir.writeFile(io, .{ .sub_path = "models/artifact/.antfly-download-complete.json", .data = receipt });
+            const identity = (try loadedModelRequestIdentityAlloc(allocator, io, models_root, artifact_dir)).?;
+            defer allocator.free(identity.value);
+            const expected = if (std.mem.eql(u8, variant, "auto"))
+                try std.fmt.allocPrint(allocator, "{s}/example", .{owner})
+            else
+                try std.fmt.allocPrint(allocator, "{s}/example:{s}", .{ owner, variant });
+            defer allocator.free(expected);
+            try std.testing.expectEqual(.managed, identity.source);
+            try std.testing.expectEqualStrings(expected, identity.instanceIdentifier());
+            // Catalog callers continue to receive the identical receipt name.
+            const catalog_name = (try loadedModelRequestIdentifierAlloc(allocator, io, models_root, artifact_dir)).?;
+            defer allocator.free(catalog_name);
+            try std.testing.expectEqualStrings(expected, catalog_name);
+        }
+        // A missing legacy directory still identifies an already loaded model.
+        // Strip one task directory, preserving an owner with the same spelling.
+        const legacy_dir = try std.fs.path.join(allocator, &.{ models_root, owner, owner, "example" });
+        defer allocator.free(legacy_dir);
+        const legacy = (try loadedModelRequestIdentityAlloc(allocator, io, models_root, legacy_dir)).?;
+        defer allocator.free(legacy.value);
+        const legacy_expected = try std.fmt.allocPrint(allocator, "{s}/example", .{owner});
+        defer allocator.free(legacy_expected);
+        try std.testing.expectEqual(.relative, legacy.source);
+        try std.testing.expectEqualStrings(legacy_expected, legacy.instanceIdentifier());
+    }
 }
 
 test "loaded model listing uses model directories and safe relative identifiers" {
@@ -4060,11 +4134,14 @@ pub const Node = struct {
         else
             null;
         errdefer if (hard_cancellation_watchdog) |watchdog| watchdog.destroy();
+        var runtime_epoch_bytes: [8]u8 = undefined;
+        try fillRandomBytes(&runtime_epoch_bytes);
+        const runtime_epoch = std.mem.readInt(u64, &runtime_epoch_bytes, .little);
         var node: Node = .{
             .config = config,
             .allocator = allocator,
             .session_manager = session_manager,
-            .model_manager = model_manager_mod.ModelManager.init(allocator, session_manager),
+            .model_manager = model_manager_mod.ModelManager.initWithRuntimeEpoch(allocator, session_manager, runtime_epoch),
             .registry = registry_mod.ModelRegistry.init(allocator, config.models_dir),
             .extraction_reader_resolver = extractors_mod.ReaderResolver.init(allocator),
             .tabular_registry = tabular_mod.registry.Registry.init(allocator),
@@ -6080,7 +6157,8 @@ pub const Node = struct {
             .generator => try self.warmGeneratorWithBackend(allocator, model.name, model.backend, a4b_request),
             .embedder => try self.warmEmbedder(allocator, model.name, model.backend, materialize_optional_sessions),
             .reranker => try self.warmReranker(allocator, model.name, model.backend),
-            .chunker, .classifier, .rewriter, .reader, .transcriber, .extractor => try self.warmLoadOnlyModel(allocator, model),
+            .transcriber => try self.warmTranscriber(allocator, model),
+            .chunker, .classifier, .rewriter, .reader, .extractor => try self.warmLoadOnlyModel(allocator, model),
         }
         if (materialize_optional_sessions and model.kind != .embedder) {
             try self.materializeWarmModelOptionalSessions(allocator, model);
@@ -6315,6 +6393,40 @@ pub const Node = struct {
         defer model_handle.release();
         model_handle.pin();
         std.log.info("loaded inference {s} model={s} elapsed_ms={d}", .{ @tagName(model.kind), model.name, elapsedMs(started_at_ns, embedTimingNowNs()) });
+    }
+
+    fn warmTranscriber(self: *Node, allocator: std.mem.Allocator, model: WarmModel) !void {
+        if (model.name.len == 0) return error.InvalidGenerationRequest;
+        var owned_io: ?std.Io.Threaded = null;
+        defer if (owned_io) |*io_impl| io_impl.deinit();
+        const io = self.inferenceIo(allocator, null, &owned_io);
+        const resolved_path = try self.resolveModelPath(io, model.name, "transcribers");
+        defer self.allocator.free(resolved_path);
+        // Requests use canonical paths, including when models_dir is relative
+        // or the installed artifact is reached through a symlink.
+        const model_path = try realPathExistingAlloc(allocator, io, resolved_path);
+        defer allocator.free(model_path);
+        const enc_dec_mod = @import("../pipelines/encoder_decoder.zig");
+        if (enc_dec_mod.findEncoderDecoderPaths(allocator, model_path)) |paths| {
+            defer allocator.free(paths.encoder);
+            defer allocator.free(paths.decoder);
+            const preferred_backends = if (model.backend) |backend|
+                singleBackendPreference(backend)
+            else
+                self.model_manager.session_manager.preferred_backends;
+            var handle = try self.model_manager.acquireCompositeRuntimeWithPreferredBackends(
+                model_path,
+                &.{ paths.encoder, paths.decoder },
+                preferred_backends,
+                .transcriber,
+                .whisper,
+                null,
+            );
+            defer handle.release();
+            try handle.markStartupManaged();
+            return;
+        } else |_| {}
+        try self.warmLoadOnlyModel(allocator, model);
     }
 
     pub fn embedDenseJsonInputDirect(
@@ -8965,7 +9077,8 @@ pub const Node = struct {
         else
             return error.InvalidWhisperDecoderConfig;
         var prompt_scratch: [3]whisper_prompt.ForcedDecoderId = undefined;
-        const forced_ids = try prompt_cache.resolve(&prompt_scratch, request.language);
+        const timestamps = request.timestamps orelse false;
+        const forced_ids = try prompt_cache.resolveWithTimestamps(&prompt_scratch, request.language, timestamps);
         var pipeline = transcription.TranscriptionPipeline.init(
             allocator,
             model.session,
@@ -8981,6 +9094,8 @@ pub const Node = struct {
                 .forced_decoder_ids = forced_ids,
                 .max_decode_working_bytes = audio_admission.max_decode_working_bytes,
                 .language_tokens = prompt_cache.language_tokens,
+                .no_timestamps_id = prompt_cache.no_timestamps_id,
+                .timestamps = timestamps,
             },
         );
         pipeline.execution_control = control;
@@ -17119,9 +17234,10 @@ pub const Node = struct {
         var config = try rebel_mod.loadConfig(allocator, model_path);
         var config_owned = true;
         errdefer if (config_owned) config.deinit();
-        var runtime_handle = try self.model_manager.acquireCompositeRuntime(
+        var runtime_handle = try self.model_manager.acquireCompositeRuntimeForModelType(
             model_path,
             &.{ paths.encoder, paths.decoder },
+            .extractor,
             .seq2seq,
             execution_control,
         );
@@ -17711,6 +17827,91 @@ pub const Node = struct {
         });
     }
 
+    pub fn antfarmReaders(_: *Node, ctx: *httpx.Context) !httpx.Response {
+        return ctx.json(.{ .apple_ocr = .{ .available = readers_api.apple.enabled } });
+    }
+
+    /// Antfarm's native OCR adapter uses the existing reader contract and the
+    /// same request permits, media policy, cancellation, and memory admission.
+    pub fn antfarmAppleOcr(self: *Node, ctx: *httpx.Context) !httpx.Response {
+        if (!readers_api.apple.enabled) return ctx.status(501).json(.{ .@"error" = "APPLE_OCR_UNAVAILABLE", .message = "Apple OCR is unavailable on this server" });
+        const Request = struct {
+            images: []const struct { url: []const u8 },
+            recognition_level: @FieldType(readers_api.Config, "recognition_level") = .accurate,
+            recognition_languages: []const []const u8 = &.{"en-US"},
+            uses_language_correction: bool = false,
+        };
+        var parsed = (try ctx.parseJson(Request)) orelse return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "Request body required" });
+        defer parsed.deinit();
+        const body = parsed.value;
+        if (body.images.len == 0 or body.images.len > readers_api.apple.max_images)
+            return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "Provide between one and eight images" });
+        const cfg = readers_api.Config{ .provider = .apple, .recognition_level = body.recognition_level, .recognition_languages = body.recognition_languages, .uses_language_correction = body.uses_language_correction };
+        cfg.validate() catch return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "Invalid OCR recognition options" });
+        var source_bytes: usize = 0;
+        for (body.images) |item| source_bytes = addReadInlineSourceBytes(source_bytes, item.url, readInlineSourceByteCap(self)) catch
+            return ctx.status(413).json(.{ .@"error" = "BATCH_TOO_LARGE", .message = "Inline image sources exceed server capacity" });
+        const admission = readRequestAdmission(self, body.images.len, source_bytes, null);
+        if (try self.acquireSlotUnits(ctx, admission.units)) |response| return response;
+        defer self.releaseSlotUnits(admission.units);
+        const limits = self.config.generation_budget_overrides.apply(self.defaultGenerationLimits(.cpu));
+        var lease = self.model_manager.acquireRunResourceAmounts(.cpu, limits, .{
+            .host_scratch_bytes = readers_api.apple.native_workspace_reservation_bytes + readers_api.apple.max_batch_bytes + readers_api.apple.default_response_bytes,
+        }) catch |err| return inferenceFailureResponse(ctx, err);
+        defer lease.release();
+        const control = httpInferenceExecutionControl(self, ctx);
+        const Cancel = struct {
+            fn check(raw: *const anyopaque) bool {
+                const active: *const InferenceExecutionControl = @ptrCast(@alignCast(raw));
+                active.check() catch return true;
+                return false;
+            }
+        };
+        self.metrics.incRequest("read");
+        defer self.metrics.decActive();
+        const owned = try ctx.allocator.alloc(scraping.DownloadedContent, body.images.len);
+        var filled: usize = 0;
+        defer {
+            for (owned[0..filled]) |*item| item.deinit(ctx.allocator);
+            ctx.allocator.free(owned);
+        }
+        const encoded = try ctx.allocator.alloc(readers_api.EncodedImage, body.images.len);
+        defer ctx.allocator.free(encoded);
+        var bytes: usize = 0;
+        var pixels = ReadDecodedImageBudget.init(admission, effectiveRequestContentSecurity(self).max_image_dimension);
+        for (body.images, 0..) |item, i| {
+            owned[i] = downloadReadBatchContentForRequest(self, ctx.allocator, item.url, @min(admission.byte_cap, readers_api.apple.max_batch_bytes), bytes, .{ .io = ctx.io, .control = control }) catch |err|
+                return remoteContentErrorResponse(ctx, err);
+            filled += 1;
+            bytes += owned[i].data.len;
+            pixels.addImage(owned[i].data) catch |err| return readImageErrorResponse(ctx, err);
+            encoded[i] = .{ .bytes = owned[i].data, .mime_type = image_pipeline.mimeEssenceForEncoded(owned[i].data) orelse return inferenceExecutorContractFailureResponse(ctx, error.InvalidInferenceMedia) };
+        }
+        var result = readers_api.apple.readEncoded(ctx.allocator, cfg, .{ .images = encoded }, .{
+            .timeout_ms = try remainingInferenceDeadlineMs(control.deadline_ns, embedTimingNowNs()),
+            .cancellation = .{ .ptr = &control, .is_cancelled_fn = Cancel.check },
+        }) catch |err| switch (err) {
+            error.AppleOcrBusy => return ctx.status(503).json(.{ .@"error" = "APPLE_OCR_BUSY", .message = "Apple OCR is busy; try again", .retryable = true }),
+            error.UnsupportedAppleOcrLanguage => return ctx.status(400).json(.{ .@"error" = "UNSUPPORTED_LANGUAGE", .message = "The selected OCR language is unavailable on this server" }),
+            error.InferenceDecodedPixelsExceeded, error.InferenceEncodedBytesExceeded, error.ResponseTooLarge => return ctx.status(413).json(.{ .@"error" = "REQUEST_TOO_LARGE", .message = "OCR input or output exceeds server capacity" }),
+            error.InvalidInferenceMedia, error.UnsupportedInferenceMimeType => return ctx.status(400).json(.{ .@"error" = "INVALID_IMAGE", .message = "Apple OCR accepts PNG and JPEG images" }),
+            else => return inferenceFailureResponse(ctx, err),
+        };
+        defer result.deinit(ctx.allocator);
+        // Preserve native pixel coordinates and confidence without a lossy
+        // conversion through the model reader's region representation.
+        var arena = std.heap.ArenaAllocator.init(ctx.allocator);
+        defer arena.deinit();
+        const alloc = arena.allocator();
+        const Item = struct { object: []const u8 = "read", index: usize, text: []const u8, regions: std.json.Value };
+        const items = try alloc.alloc(Item, result.items.len);
+        for (result.items, items, 0..) |item, *out, i| {
+            const regions = try std.json.parseFromSlice(std.json.Value, alloc, item.regions_json orelse "[]", .{ .allocate = .alloc_always });
+            out.* = .{ .index = i, .text = item.text, .regions = regions.value };
+        }
+        return ctx.json(.{ .object = "list", .model = "Apple Vision OCR", .data = items });
+    }
+
     pub fn readImages(self: *Node, ctx: *httpx.Context) !httpx.Response {
         const execution_control = httpInferenceExecutionControl(self, ctx);
         const uses_attachment_envelope = requestUsesAttachmentEnvelope(ctx);
@@ -18292,7 +18493,7 @@ pub const Node = struct {
             execution_control,
             &stage,
         ) catch |err| return whisperRuntimeFailureResponse(ctx, stage, err);
-        var pipeline = whisper.pipeline(body.language, audio_admission.max_decode_working_bytes, execution_control, false, .full) catch |err|
+        var pipeline = whisper.pipeline(body.language, audio_admission.max_decode_working_bytes, execution_control, body.timestamps orelse false, .full) catch |err|
             return whisperRuntimeFailureResponse(ctx, .language, err);
         var result = long_transcription.transcribeLong(
             ctx.allocator,
@@ -18807,7 +19008,7 @@ pub const Node = struct {
                 execution_control,
                 &stage,
             ) catch |err| return whisperRuntimeFailureResponse(ctx, stage, err);
-            var pipeline = whisper.pipeline(body.language, audio_admission.max_decode_working_bytes, execution_control, true, audioContextFromRequest(body.audio_context, .full)) catch |err|
+            var pipeline = whisper.pipeline(body.language, audio_admission.max_decode_working_bytes, execution_control, body.timestamps orelse true, audioContextFromRequest(body.audio_context, .full)) catch |err|
                 return whisperRuntimeFailureResponse(ctx, .language, err);
             break :blk long_transcription.transcribeLong(
                 ctx.allocator,
@@ -20303,9 +20504,11 @@ pub const Node = struct {
             try c.put(a, &schema, "schema", invocation.schema);
             try c.put(a, &format, "json_schema", schema);
             try c.put(a, &body, "response_format", format);
-            const input = try std.json.Stringify.valueAlloc(a, .{ .instructions = invocation.instructions, .items = invocation.items, .validation_error = invocation.validation_error }, .{ .emit_null_optional_fields = false });
             const system = try std.fmt.allocPrint(a, "Return one structured result per input. Preserve item IDs. JSON schema: {s}", .{try std.json.Stringify.valueAlloc(a, invocation.schema, .{})});
-            try c.put(a, &body, "messages", try std.json.parseFromSliceLeaky(std.json.Value, a, try std.json.Stringify.valueAlloc(a, .{ .{ .role = "system", .content = system }, .{ .role = "user", .content = input } }, .{}), .{}));
+            const messages = try c.evidenceMessages(a, invocation, system, false);
+            const wire = try c.chatRequestJsonWithOptionsAlloc(a, self.model, messages, .termite_native, .{});
+            const message_envelope = try std.json.parseFromSliceLeaky(std.json.Value, a, wire, .{});
+            try c.put(a, &body, "messages", message_envelope.object.get("messages").?);
             var request = try httpx.Request.init(a, .POST, "/generate");
             defer request.deinit();
             request.body = try std.json.Stringify.valueAlloc(a, body, .{});
@@ -20315,14 +20518,19 @@ pub const Node = struct {
             ctx.cancellation_probe = .{ .ptr = self, .is_cancelled = cancelled };
             var response = try self.node.generateContent(&ctx);
             defer response.deinit();
+            const bytes = response.body orelse return error.InvalidConstrainedOutput;
+            if (bytes.len > 1024 * 1024) return error.ResponseTooLarge;
+            const result = std.json.parseFromSliceLeaky(std.json.Value, a, bytes, .{ .allocate = .alloc_always }) catch |err| {
+                if (!response.ok()) return c.localGenerationStatusError(a, response.status.code, response.body);
+                return err;
+            };
+            if (invocation.usage) |usage| usage.recordResponse(result);
             try self.control.check();
             if (!response.ok()) {
                 const failure = c.localGenerationStatusError(a, response.status.code, response.body);
                 if (failure == error.InvalidStructuredOutput) return .{ .value = try std.json.parseFromSliceLeaky(std.json.Value, a, "{\"items\":[]}", .{}) };
                 return failure;
             }
-            if ((response.body orelse return error.InvalidConstrainedOutput).len > 1024 * 1024) return error.ResponseTooLarge;
-            const result = try std.json.parseFromSliceLeaky(std.json.Value, a, response.body orelse return error.InvalidConstrainedOutput, .{ .allocate = .alloc_always });
             const choices = result.object.get("choices") orelse return error.InvalidConstrainedOutput;
             if (choices != .array or choices.array.items.len != 1) return error.InvalidConstrainedOutput;
             const raw = choices.array.items[0].object.get("message").?.object.get("content").?;
@@ -20336,7 +20544,7 @@ pub const Node = struct {
         }
     };
 
-    fn admitStructuredGenerator(self: *Node, a: std.mem.Allocator, io: std.Io, generator: std.json.Value, output: @import("antfly_structured").Output, probabilities: @import("antfly_structured").Probabilities) !@import("antfly_structured").Output {
+    fn admitStructuredGenerator(self: *Node, a: std.mem.Allocator, io: std.Io, generator: std.json.Value, output: @import("antfly_structured").Output, probabilities: @import("antfly_structured").Probabilities, images: bool) !@import("antfly_structured").Capabilities {
         const c = @import("antfly_structured");
         var parsed = try std.json.parseFromValue(c.extraction.GeneratorConfig, a, generator, .{ .allocate = .alloc_always });
         defer parsed.deinit();
@@ -20346,7 +20554,11 @@ pub const Node = struct {
         var manifest = try manifest_mod.loadListingFromDir(a, path);
         defer manifest.deinit();
         const native = resolvedExecutorKind("generate", &manifest) == .native_generation;
-        return (c.Capabilities{ .grammar = native, .token_logprobs = native }).select(output, probabilities);
+        const contract = try resolvedInferenceExecutorContract(self, "generate", &manifest);
+        if (images and !contract.accepts_image) return error.UnsupportedInferenceFeature;
+        const caps = c.Capabilities{ .grammar = native, .token_logprobs = native, .images = contract.accepts_image, .limits = c.Limits.fromNativeBatch(contract.batch) };
+        _ = try caps.select(output, probabilities);
+        return caps;
     }
 
     fn generatedExtractionJson(self: *Node, allocator: std.mem.Allocator, envelope: std.json.Value, control: InferenceExecutionControl) ![]u8 {
@@ -20379,7 +20591,8 @@ pub const Node = struct {
         };
         const io = self.inferenceIo(a, control.io, &owned_io);
         const generator = config_value.object.get("generator").?;
-        const mode = try self.admitStructuredGenerator(a, io, generator, config.output, config.probabilities);
+        const caps = try self.admitStructuredGenerator(a, io, generator, config.output, config.probabilities, false);
+        const mode = try caps.select(config.output, config.probabilities);
         var backend = StructuredGeneration{ .node = self, .io = io, .control = self.extractionExecutionControl(control), .generator = generator, .model = config.generator.model, .logprobs = config.probabilities == .token_logprobs };
         var validation = extractor.Validation{ .config = config };
         const Combined = struct {
@@ -20415,7 +20628,13 @@ pub const Node = struct {
         var owned_io: ?std.Io.Threaded = null;
         defer if (owned_io) |*value| value.deinit();
         const io = self.inferenceIo(a, if (control) |effective| effective.io else null, &owned_io);
-        const mode = try self.admitStructuredGenerator(a, io, request.generator, request.output, request.probabilities);
+        var images = false;
+        for (request.inputs) |item| {
+            const input = try contract.evidence.Input.fromJson(item.input);
+            images = images or input.imageCount() > 0;
+        }
+        const caps = try self.admitStructuredGenerator(a, io, request.generator, request.output, request.probabilities, images);
+        const mode = try caps.select(request.output, request.probabilities);
         const options = generated.Options{ .model = request.model, .probabilities = request.probabilities };
         const Validation = struct {
             options: generated.Options,
@@ -20447,9 +20666,9 @@ pub const Node = struct {
             }
         };
         var combined = Combined{ .backend = &backend, .validation = &validation };
-        const inputs = try a.alloc([]const u8, request.inputs.len);
+        const inputs = try a.alloc(std.json.Value, request.inputs.len);
         for (inputs, request.inputs) |*input, item| input.* = item.input;
-        const result = try c.execute(a, .{ .ptr = &combined, .invoke = Combined.invoke, .checkpoint = Combined.check, .validate_item = Combined.validate }, mode, try generated.questionSchema(a, request.questions), request.instructions, request.batch, inputs);
+        const result = try c.executeEvidence(a, .{ .limits = caps.limits, .ptr = &combined, .invoke = Combined.invoke, .checkpoint = Combined.check, .validate_item = Combined.validate }, mode, try generated.questionSchema(a, request.questions), request.instructions, request.batch, inputs);
         var root = c.object();
         try c.put(a, &root, "model", .{ .string = request.model });
         try c.put(a, &root, "usage", try std.json.parseFromSliceLeaky(std.json.Value, a, try std.json.Stringify.valueAlloc(a, .{ .input_tokens = result.input_tokens, .output_tokens = result.output_tokens }, .{}), .{}));
@@ -20863,6 +21082,7 @@ pub const Node = struct {
             error.InvalidGeneratorConfig,
             error.InvalidConstrainedGenerationConfig,
             error.UnsupportedConstrainedOutput,
+            error.UnsupportedInferenceFeature,
             error.UnsupportedConstrainedProbabilities,
             error.UnexpectedToken,
             error.UnknownField,
@@ -20918,6 +21138,276 @@ pub const Node = struct {
         }
 
         return image_datas;
+    }
+
+    fn runtimeModelKind(model_type: manifest_mod.ModelType) api.ModelKind {
+        return switch (model_type) {
+            .generator => .generator,
+            .embedder => .embedder,
+            .reranker => .reranker,
+            .chunker => .chunker,
+            .classifier => .classifier,
+            .rewriter => .rewriter,
+            .reader => .reader,
+            .transcriber => .transcriber,
+            .extractor => .extractor,
+        };
+    }
+
+    fn runtimeTaskDir(task: api.ModelKind) []const u8 {
+        return switch (task) {
+            .generator => "generators",
+            .embedder => "embedders",
+            .reranker => "rerankers",
+            .chunker => "chunkers",
+            .classifier => "classifiers",
+            .rewriter => "rewriters",
+            .reader => "readers",
+            .transcriber => "transcribers",
+            .extractor => "extractors",
+        };
+    }
+
+    fn runtimeListingTask(task: api.ModelKind) []const u8 {
+        return if (task == .classifier) "deciders" else runtimeTaskDir(task);
+    }
+
+    const runtime_model_tasks = [_]api.ModelKind{
+        .generator,
+        .embedder,
+        .reranker,
+        .chunker,
+        .classifier,
+        .rewriter,
+        .reader,
+        .transcriber,
+        .extractor,
+    };
+
+    fn runtimeManifestMatchesTask(
+        preferred_task: ?api.ModelKind,
+        task: api.ModelKind,
+        manifest: *const manifest_mod.ModelManifest,
+    ) bool {
+        if (preferred_task) |wanted| return task == wanted;
+        return manifestMatchesModelListingTask(
+            runtimeListingTask(task),
+            @tagName(manifest.model_type),
+            manifest,
+        );
+    }
+
+    fn runtimeTaskBit(task: api.ModelKind) u16 {
+        for (runtime_model_tasks, 0..) |candidate, index| {
+            if (candidate == task) return @as(u16, 1) << @intCast(index);
+        }
+        unreachable;
+    }
+
+    fn runtimeManifestTaskMask(manifest: *const manifest_mod.ModelManifest) u16 {
+        var mask: u16 = 0;
+        for (runtime_model_tasks) |task| {
+            if (runtimeManifestMatchesTask(null, task, manifest)) mask |= runtimeTaskBit(task);
+        }
+        return mask;
+    }
+
+    fn stripRuntimeTaskPrefix(identifier: []const u8) []const u8 {
+        for (runtime_model_tasks) |task| {
+            const scope = runtimeTaskDir(task);
+            if (std.mem.startsWith(u8, identifier, scope) and
+                identifier.len > scope.len and identifier[scope.len] == std.fs.path.sep)
+            {
+                return identifier[scope.len + 1 ..];
+            }
+        }
+        return identifier;
+    }
+
+    fn apiRuntime(
+        allocator: std.mem.Allocator,
+        entry: model_manager_mod.RuntimeSnapshotEntry,
+        model: []const u8,
+        tasks: []const api.ModelKind,
+    ) !api.ModelInstance {
+        return .{
+            .id = try std.fmt.allocPrint(allocator, "{x:0>32}", .{entry.runtime_id}),
+            .model = model,
+            .tasks = tasks,
+            .state = if (entry.state == .loading) "loading" else "loaded",
+            .active_handles = @intCast(entry.active_handles),
+            .startup_managed = entry.startup_managed,
+            .unloadable = entry.unloadable,
+            .unload_blocked_reason = if (entry.startup_managed) "startup_managed" else if (entry.state == .loading) "loading" else if (!entry.unloadable) "in_use" else null,
+            .backend = if (entry.backend) |backend| @tagName(backend) else null,
+            .residency_mode = switch (entry.residency_mode) {
+                .backend_managed => "backend_managed",
+                .streamed => "streamed",
+                .resident => "resident",
+            },
+            .idle_ms = @intCast(entry.last_used_ms),
+        };
+    }
+
+    fn runtimeIdentifier(
+        self: *Node,
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        canonical_models_dir: []const u8,
+        entry: model_manager_mod.RuntimeSnapshotEntry,
+    ) !?[]const u8 {
+        _ = self;
+        const identity = (try loadedModelRequestIdentityAlloc(
+            allocator,
+            io,
+            canonical_models_dir,
+            entry.model_dir,
+        )) orelse return null;
+        return identity.instanceIdentifier();
+    }
+
+    /// Build one resource per incarnation, independent of task catalog aliases.
+    fn runtimeModelsAlloc(
+        self: *Node,
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        only_runtime_id: ?model_manager_mod.RuntimeId,
+        preferred_task: ?api.ModelKind,
+    ) ![]const api.ModelInstance {
+        var snapshot = try self.model_manager.runtimeSnapshot(allocator, runtimeManifestTaskMask);
+        defer snapshot.deinit();
+        var instances = std.ArrayList(api.ModelInstance).empty;
+        defer instances.deinit(allocator);
+        if (snapshot.entries.len == 0) return try instances.toOwnedSlice(allocator);
+        const canonical_models_dir = try realPathExistingAlloc(allocator, io, self.config.models_dir);
+        defer allocator.free(canonical_models_dir);
+        for (snapshot.entries) |entry| {
+            if (only_runtime_id) |wanted| if (entry.runtime_id != wanted) continue;
+            var task_mask = entry.task_mask;
+            var listing_manifest: ?manifest_mod.ModelManifest = null;
+            defer if (listing_manifest) |*manifest| manifest.deinit();
+            if (task_mask == 0 and entry.model_type == null) {
+                listing_manifest = (manifest_mod.loadListingCandidateFromDir(allocator, entry.model_dir) catch null);
+                if (listing_manifest) |*manifest| task_mask = runtimeManifestTaskMask(manifest);
+            }
+            var tasks = std.ArrayList(api.ModelKind).empty;
+            defer tasks.deinit(allocator);
+            for (runtime_model_tasks) |task| {
+                if (task_mask != 0) {
+                    if (task_mask & runtimeTaskBit(task) == 0) continue;
+                } else if (entry.model_type) |kind| {
+                    if (runtimeModelKind(kind) != task) continue;
+                } else {
+                    if (preferred_task == null or preferred_task.? != task) continue;
+                }
+                try tasks.append(allocator, task);
+            }
+            const model = (try self.runtimeIdentifier(allocator, io, canonical_models_dir, entry)) orelse continue;
+            try instances.append(allocator, try apiRuntime(allocator, entry, model, try tasks.toOwnedSlice(allocator)));
+        }
+        return try instances.toOwnedSlice(allocator);
+    }
+
+    pub fn listModelInstances(self: *Node, ctx: *httpx.Context) !httpx.Response {
+        var arena = std.heap.ArenaAllocator.init(ctx.allocator);
+        defer arena.deinit();
+        const instances = try self.runtimeModelsAlloc(arena.allocator(), ctx.io, null, null);
+        return ctx.json(api.ModelInstanceList{ .object = "list", .data = instances });
+    }
+
+    pub fn loadModelInstance(self: *Node, ctx: *httpx.Context) !httpx.Response {
+        var parsed = (try ctx.parseJson(api.ModelInstanceLoadRequest)) orelse
+            return ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = "Request body required" });
+        defer parsed.deinit();
+        const request = parsed.value;
+        if (request.task == .chunker and canonicalFixedChunkModel(request.model) != null) {
+            return ctx.status(400).json(.{
+                .@"error" = "MODEL_INSTANCE_UNAVAILABLE",
+                .message = "fixed chunking is built in and has no model instance",
+            });
+        }
+
+        const execution_control = httpInferenceExecutionControl(self, ctx);
+        execution_control.check() catch |err| return inferenceFailureResponse(ctx, err);
+        const model_path = if (request.task == .reader)
+            self.resolveReadRequestModelPath(ctx.allocator, ctx.io, request.model)
+        else
+            self.resolveRequestModelPath(ctx.allocator, ctx.io, request.model, runtimeTaskDir(request.task));
+        const resolved_path = model_path catch |err| return requestModelResolutionError(ctx, err);
+        defer ctx.allocator.free(resolved_path);
+
+        var manifest = manifest_mod.loadFromDir(ctx.allocator, resolved_path) catch |err|
+            return modelLoadFailureResponse(ctx, err);
+        defer manifest.deinit();
+        if (!manifestMatchesModelListingTask(runtimeListingTask(request.task), @tagName(manifest.model_type), &manifest)) {
+            return ctx.status(400).json(.{ .@"error" = "INVALID_MODEL", .message = "model does not support the requested task" });
+        }
+
+        var runtime_id: model_manager_mod.RuntimeId = 0;
+        if (request.task == .reader and !isQwen3VlReadModel(&manifest)) {
+            var reader = readers_mod.LoadedReader.loadFromDirWithControl(
+                ctx.allocator,
+                resolved_path,
+                &self.session_manager,
+                &self.model_manager,
+                execution_control,
+            ) catch |err| return modelLoadFailureResponse(ctx, err);
+            defer reader.deinit();
+            const handle = reader.cachedModelHandle() orelse return ctx.status(400).json(.{
+                .@"error" = "MODEL_INSTANCE_UNAVAILABLE",
+                .message = "this reader owns sessions per request and has no persistent model instance",
+            });
+            runtime_id = handle.get().runtime_id;
+        } else if (request.task == .transcriber or request.task == .rewriter or
+            (request.task == .extractor and rebel_mod.isRebelModel(ctx.allocator, resolved_path)))
+        {
+            const enc_dec_mod = @import("../pipelines/encoder_decoder.zig");
+            if (enc_dec_mod.findEncoderDecoderPaths(ctx.allocator, resolved_path)) |paths| {
+                defer ctx.allocator.free(paths.encoder);
+                defer ctx.allocator.free(paths.decoder);
+                var handle = self.model_manager.acquireCompositeRuntimeForModelType(
+                    resolved_path,
+                    &.{ paths.encoder, paths.decoder },
+                    switch (request.task) {
+                        .extractor => .extractor,
+                        .rewriter => .rewriter,
+                        else => .transcriber,
+                    },
+                    if (request.task == .transcriber) .whisper else .seq2seq,
+                    execution_control,
+                ) catch |err| return modelLoadFailureResponse(ctx, err);
+                runtime_id = handle.get().runtime_id;
+                handle.release();
+            } else |_| {
+                var handle = self.model_manager.acquireFromDirWithControl(resolved_path, execution_control) catch |err|
+                    return modelLoadFailureResponse(ctx, err);
+                runtime_id = handle.get().runtime_id;
+                handle.release();
+            }
+        } else {
+            var handle = self.model_manager.acquireFromDirWithControl(resolved_path, execution_control) catch |err|
+                return modelLoadFailureResponse(ctx, err);
+            runtime_id = handle.get().runtime_id;
+            handle.release();
+        }
+
+        var arena = std.heap.ArenaAllocator.init(ctx.allocator);
+        defer arena.deinit();
+        const models = try self.runtimeModelsAlloc(arena.allocator(), ctx.io, runtime_id, request.task);
+        if (models.len == 0) return ctx.status(409).json(.{ .@"error" = "INSTANCE_EVICTED", .message = "instance was evicted after loading; retry", .retryable = true });
+        return ctx.json(models[0]);
+    }
+
+    pub fn unloadModelInstance(self: *Node, ctx: *httpx.Context, instance_id: []const u8) !httpx.Response {
+        const runtime_id = model_manager_mod.parseRuntimeId(instance_id) catch
+            return ctx.status(400).json(.{ .@"error" = "INVALID_INSTANCE_ID", .message = "instance_id is invalid" });
+        return switch (self.model_manager.unloadRuntime(runtime_id)) {
+            .unloaded => ctx.json(api.ModelInstanceUnloadResponse{ .outcome = "unloaded" }),
+            .already_unloaded => ctx.json(api.ModelInstanceUnloadResponse{ .outcome = "already_unloaded" }),
+            .loading => ctx.status(409).json(.{ .@"error" = "INSTANCE_LOADING", .message = "instance is still loading", .retryable = true }),
+            .in_use => ctx.status(409).json(.{ .@"error" = "INSTANCE_IN_USE", .message = "instance has active owners", .retryable = true }),
+            .startup_managed => ctx.status(409).json(.{ .@"error" = "INSTANCE_STARTUP_MANAGED", .message = "instance is managed by startup preload configuration", .retryable = false }),
+        };
     }
 
     pub fn listModels(self: *Node, ctx: *httpx.Context) !httpx.Response {
@@ -21144,6 +21634,7 @@ pub const Node = struct {
                         modelCatalogDecodedPixelCap(self, task),
                         false,
                         "compatible",
+                        false,
                     );
                     try listed_model_names.put(a, name, {});
                     model_count += 1;
@@ -21192,6 +21683,7 @@ pub const Node = struct {
                     modelCatalogDecodedPixelCap(self, task),
                     chat_template_failed,
                     listing.compatibility_level,
+                    std.mem.eql(u8, task, "extractors") and rebel_mod.isRebelModel(a, entry.path),
                 );
                 try appendQualifiedLimits(&body, a, &listing.manifest);
                 if (isOpenAiListTask(task)) {
@@ -21249,6 +21741,7 @@ pub const Node = struct {
                     modelCatalogDecodedPixelCap(self, task),
                     model.chat_template_failed,
                     @tagName(loaded_compatibility.level),
+                    std.mem.eql(u8, task, "extractors") and rebel_mod.isRebelModel(a, listing.canonical_model_dir),
                 );
                 try appendQualifiedLimits(&body, a, &model.manifest);
                 if (isOpenAiListTask(task)) {
@@ -21273,9 +21766,35 @@ pub const Node = struct {
         }
         try buf.appendSlice(a, "{\"object\":\"list\",\"data\":[");
         try buf.appendSlice(a, openai_data.items);
-        try buf.appendSlice(a, "],");
+        try buf.appendSlice(a, if (build_options.allow_downloads) "],\"allow_downloads\":true," else "],\"allow_downloads\":false,");
+        try buf.appendSlice(a, "\"backends\":{");
+        try buf.appendSlice(a, if (build_options.enable_native) "\"native\":true," else "\"native\":false,");
+        try buf.appendSlice(a, if (build_options.enable_metal) "\"metal\":true," else "\"metal\":false,");
+        try buf.appendSlice(a, if (build_options.enable_cuda) "\"cuda\":true," else "\"cuda\":false,");
+        try buf.appendSlice(a, if (build_options.enable_pjrt) "\"xla\":true," else "\"xla\":false,");
+        try buf.appendSlice(a, if (build_options.enable_wasm) "\"wasm\":true}," else "\"wasm\":false},");
         try buf.appendSlice(a, body.items);
-        try buf.append(a, '}');
+        // Keep ML schemas in their own group while allowing task-aware pool
+        // discovery to find predictors through the same bounded catalog.
+        _ = tabular_mod.discovery.discover(io, a, &self.tabular_registry, self.config.ml_dir) catch {};
+        const predictors = try self.tabular_registry.list(a);
+        defer a.free(predictors);
+        try buf.appendSlice(a, ",\"predictors\":{");
+        for (predictors, 0..) |info, index| {
+            if (index > 0) try buf.append(a, ',');
+            try jsonEncodeString(&buf, a, info.name);
+            try buf.append(a, ':');
+            const encoded = try std.json.Stringify.valueAlloc(a, api.PredictorInfo{
+                .task = predictorTaskFromTabular(info.task),
+                .num_features = @intCast(info.num_features),
+                .num_outputs = @intCast(info.num_outputs),
+                .feature_names = if (info.feature_names.len > 0) info.feature_names else null,
+                .source_framework = if (info.source_framework.len > 0) info.source_framework else null,
+            }, .{});
+            defer a.free(encoded);
+            try buf.appendSlice(a, encoded);
+        }
+        try buf.appendSlice(a, "}}");
 
         var catalog = try std.json.parseFromSlice(std.json.Value, a, buf.items, .{});
         defer catalog.deinit();
@@ -21398,6 +21917,10 @@ pub const Node = struct {
         const router = api.ServerRouter(Node).init(self);
         var prefixed = AiPrefixedServer(prefix, @TypeOf(server.*)){ .inner = server, .node = self };
         try router.register(&prefixed);
+        // Antfarm implementation detail, intentionally absent from OpenAPI/SDKs.
+        // The AI prefix retains the host's inference authentication and permissions.
+        try prefixed.get("/_antfarm/readers", httpx.Handler.bind(self, antfarmReaders));
+        try prefixed.post("/_antfarm/readers/apple", httpx.Handler.bind(self, antfarmAppleOcr));
         // Keep the retired endpoint deterministic when inference routes share
         // the standalone public server. Without an explicit tombstone, httpx
         // reports 405 because nearby generated routes match the path shape,
@@ -23885,11 +24408,13 @@ fn appendModelInfo(
     chat_template_failed: bool,
     /// Artifact compatibility derived for the current build.
     compatibility_level: []const u8,
+    /// REBEL emits generic ENTITY nodes and accepts untyped relation names.
+    untyped_entities: bool,
 ) !void {
     const inferred_classification = model_caps.modelSupportsCapability(model_kind, gliner_model_type, capabilities, "classification") and !model_caps.hasCapability(capabilities, "classification");
     const inferred_zero_shot = zero_shot_classification and !model_caps.hasCapability(capabilities, "zero_shot");
     const inferred_multi_label = zero_shot_classification and !model_caps.hasCapability(capabilities, "multi_label");
-    const inferred_relations = model_caps.modelSupportsCapability(model_kind, gliner_model_type, capabilities, "relations") and !model_caps.hasCapability(capabilities, "relations");
+    const inferred_relations = (untyped_entities or model_caps.modelSupportsCapability(model_kind, gliner_model_type, capabilities, "relations")) and !model_caps.hasCapability(capabilities, "relations");
     const inferred_extraction = model_caps.modelSupportsCapability(model_kind, gliner_model_type, capabilities, "extraction") and !model_caps.hasCapability(capabilities, "extraction");
     const effective_native_batch_read = executor_kind == .native_florence_reader and effectiveNativeReadBatchSize() > 1;
     const inferred_native_batch_read = effective_native_batch_read and !model_caps.hasCapability(capabilities, "native_batch_read");
@@ -23954,6 +24479,11 @@ fn appendModelInfo(
     if (inferred_relations) {
         if (cap_index > 0) try buf.append(allocator, ',');
         try jsonEncodeString(buf, allocator, "relations");
+        cap_index += 1;
+    }
+    if (untyped_entities and !model_caps.hasCapability(capabilities, "untyped_entities")) {
+        if (cap_index > 0) try buf.append(allocator, ',');
+        try jsonEncodeString(buf, allocator, "untyped_entities");
         cap_index += 1;
     }
     if (inferred_extraction) {
@@ -24140,6 +24670,39 @@ test "executor capability resolution never advertises raw documents" {
     try std.testing.expect(chunk.text and chunk.image and chunk.audio and !chunk.document);
 }
 
+test "REBEL catalog advertises generic entity schema independently of model names" {
+    var body = std.ArrayListUnmanaged(u8).empty;
+    defer body.deinit(std.testing.allocator);
+    try appendModelInfo(
+        &body,
+        std.testing.allocator,
+        "extractor",
+        "",
+        &.{},
+        &.{"text"},
+        false,
+        false,
+        false,
+        .compatibility,
+        null,
+        "extractors",
+        16 * 1024 * 1024,
+        32 * 1024 * 1024,
+        false,
+        "compatible",
+        true,
+    );
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body.items, .{});
+    defer parsed.deinit();
+    var generic = false;
+    var relations = false;
+    for (parsed.value.object.get("capabilities").?.array.items) |capability| {
+        generic = generic or std.mem.eql(u8, capability.string, "untyped_entities");
+        relations = relations or std.mem.eql(u8, capability.string, "relations");
+    }
+    try std.testing.expect(generic and relations);
+}
+
 test "reranker catalog advertises rerank documents" {
     var body = std.ArrayListUnmanaged(u8).empty;
     defer body.deinit(std.testing.allocator);
@@ -24160,6 +24723,7 @@ test "reranker catalog advertises rerank documents" {
         32 * 1024 * 1024,
         false,
         "compatible",
+        false,
     );
     var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body.items, .{});
     defer parsed.deinit();
@@ -24189,6 +24753,7 @@ test "fixed chunk catalog advertises its multimodal transport truth" {
         32 * 1024 * 1024,
         false,
         "compatible",
+        false,
     );
     var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body.items, .{});
     defer parsed.deinit();
@@ -25563,6 +26128,7 @@ test "standalone inference model catalog publishes resolved native reader batchi
         8 * 1024 * 1024,
         false,
         "compatible",
+        false,
     );
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, body.items, .{});
     defer parsed.deinit();
@@ -25807,6 +26373,7 @@ test "normalized inference capabilities cover every model family" {
             8 * 1024 * 1024,
             false,
             "compatible",
+            false,
         );
         var parsed = try std.json.parseFromSlice(std.json.Value, alloc, body.items, .{});
         defer parsed.deinit();
@@ -25833,10 +26400,13 @@ const InferenceHttpRouteAdmission = enum { none, inference };
 fn inferenceHttpRouteAdmission(comptime method: []const u8, comptime path: []const u8) InferenceHttpRouteAdmission {
     if (comptime std.mem.eql(u8, method, "GET")) {
         if (comptime std.mem.eql(u8, path, "/models") or
+            std.mem.eql(u8, path, "/models/instances") or
+            std.mem.eql(u8, path, "/_antfarm/readers") or
             std.mem.eql(u8, path, "/predictors") or
             std.mem.eql(u8, path, "/transcription/sessions/:session_id") or
             std.mem.eql(u8, path, "/transcription/sessions/:session_id/events")) return .none;
     } else if (comptime std.mem.eql(u8, method, "DELETE")) {
+        if (comptime std.mem.eql(u8, path, "/models/instances/:instance_id")) return .none;
         if (comptime std.mem.eql(u8, path, "/transcription/sessions/:session_id")) return .none;
     } else if (comptime std.mem.eql(u8, method, "POST")) {
         if (comptime std.mem.eql(u8, path, "/chat/completions") or
@@ -25851,6 +26421,8 @@ fn inferenceHttpRouteAdmission(comptime method: []const u8, comptime path: []con
             std.mem.eql(u8, path, "/extract") or
             std.mem.eql(u8, path, "/generate") or
             std.mem.eql(u8, path, "/generate/batch") or
+            std.mem.eql(u8, path, "/models/instances") or
+            std.mem.eql(u8, path, "/_antfarm/readers/apple") or
             std.mem.eql(u8, path, "/predict") or
             std.mem.eql(u8, path, "/read") or
             std.mem.eql(u8, path, "/rerank") or
@@ -25911,8 +26483,10 @@ fn PrefixedServer(comptime prefix: []const u8, comptime Inner: type) type {
         models_handler: ?httpx.Handler = null,
 
         pub fn post(self: *const @This(), comptime path: []const u8, handler: httpx.Handler) !void {
-            comptime std.debug.assert(inferenceHttpRouteAdmission("POST", path) == .inference);
-            const wrapped = httpx.Handler.wrap(self.node, handler, admittedInferenceHandler);
+            const wrapped = if (comptime inferenceHttpRouteAdmission("POST", path) == .inference)
+                httpx.Handler.wrap(self.node, handler, admittedInferenceHandler)
+            else
+                handler;
             if (comptime inferenceRouteStreamsRawBody(path) and @hasDecl(Inner, "postStreamingRaw"))
                 try self.inner.postStreamingRaw(prefix ++ path, wrapped)
             else if (comptime inferenceRouteSupportsFramedAttachments(path) and @hasDecl(Inner, "postStreaming"))
@@ -25953,8 +26527,10 @@ fn AiPrefixedServer(comptime prefix: []const u8, comptime Inner: type) type {
 
         pub fn post(self: *const @This(), comptime path: []const u8, handler: httpx.Handler) !void {
             if (comptime isMlOnlyRoute(path)) return;
-            comptime std.debug.assert(inferenceHttpRouteAdmission("POST", path) == .inference);
-            const wrapped = httpx.Handler.wrap(self.node, handler, admittedInferenceHandler);
+            const wrapped = if (comptime inferenceHttpRouteAdmission("POST", path) == .inference)
+                httpx.Handler.wrap(self.node, handler, admittedInferenceHandler)
+            else
+                handler;
             if (comptime inferenceRouteStreamsRawBody(path) and @hasDecl(Inner, "postStreamingRaw"))
                 try self.inner.postStreamingRaw(prefix ++ path, wrapped)
             else if (comptime inferenceRouteSupportsFramedAttachments(path) and @hasDecl(Inner, "postStreaming"))
@@ -27284,9 +27860,9 @@ test "read admission reserves default batch bytes and image pressure without ove
         null,
         0,
     );
-    try std.testing.expectEqual(4 * read_admission_bytes_per_unit, small_capacity.byte_cap);
-    try std.testing.expectEqual(4 * read_admission_bytes_per_unit, small_capacity.resident_byte_cap);
-    try std.testing.expectEqual(@as(usize, 4), small_capacity.units);
+    try std.testing.expectEqual(2 * read_admission_bytes_per_unit, small_capacity.byte_cap);
+    try std.testing.expectEqual(2 * read_admission_bytes_per_unit, small_capacity.resident_byte_cap);
+    try std.testing.expectEqual(@as(usize, 2), small_capacity.units);
 
     const overflow = readRequestAdmissionForLimits(
         std.math.maxInt(usize),
@@ -27296,7 +27872,7 @@ test "read admission reserves default batch bytes and image pressure without ove
         null,
         0,
     );
-    try std.testing.expectEqual(32 * read_admission_bytes_per_unit, overflow.byte_cap);
+    try std.testing.expectEqual(16 * read_admission_bytes_per_unit, overflow.byte_cap);
     var admission = inference_admission_mod.InferenceAdmission.init(32);
     try std.testing.expectEqual(@as(usize, 32), admission.capacityUnits(overflow.units));
 
@@ -27305,7 +27881,7 @@ test "read admission reserves default batch bytes and image pressure without ove
         (32 * read_admission_bytes_per_unit - default_max_request_media_bytes) / read_decoded_working_bytes_per_pixel,
         single.decoded_pixel_cap,
     );
-    try std.testing.expectEqual(@as(usize, 0), small_capacity.decoded_pixel_cap);
+    try std.testing.expectEqual(@as(usize, 2 * 1024 * 1024), small_capacity.decoded_pixel_cap);
     const dimension_limited = readRequestAdmissionForLimits(2, default_max_read_batch_bytes, default_max_request_media_bytes, 32, 2048, 0);
     try std.testing.expectEqual(@as(usize, 2 * 2048 * 2048), dimension_limited.decoded_pixel_cap);
     const unlimited_admission = readRequestAdmissionForLimits(max_read_batch_images, default_max_read_batch_bytes, default_max_request_media_bytes, 0, null, 0);
@@ -28740,6 +29316,14 @@ test "Qwen3-VL read routing admits only generation bundles" {
     try std.testing.expect(isQwen3VlReadModel(&generation_manifest));
     try std.testing.expect(manifestMatchesModelListingTask("generators", "generator", &generation_manifest));
     try std.testing.expect(manifestMatchesModelListingTask("readers", "generator", &generation_manifest));
+    try std.testing.expect(Node.runtimeManifestMatchesTask(null, .generator, &generation_manifest));
+    try std.testing.expect(Node.runtimeManifestMatchesTask(null, .reader, &generation_manifest));
+    try std.testing.expect(Node.runtimeManifestMatchesTask(.reader, .reader, &generation_manifest));
+    try std.testing.expect(!Node.runtimeManifestMatchesTask(.reader, .generator, &generation_manifest));
+    const runtime_task_mask = Node.runtimeManifestTaskMask(&generation_manifest);
+    try std.testing.expect(runtime_task_mask & Node.runtimeTaskBit(.generator) != 0);
+    try std.testing.expect(runtime_task_mask & Node.runtimeTaskBit(.reader) != 0);
+    try std.testing.expectEqualStrings("owner/qwen", Node.stripRuntimeTaskPrefix("generators/owner/qwen"));
 
     generation_manifest.model_type = .reranker;
     try std.testing.expect(!isQwen3VlReadModel(&generation_manifest));
@@ -28752,6 +29336,165 @@ test "Qwen3-VL read routing admits only generation bundles" {
     defer generic_generator.deinit();
     try std.testing.expect(!isQwen3VlReadModel(&generic_generator));
     try std.testing.expect(!manifestMatchesModelListingTask("readers", "generator", &generic_generator));
+}
+
+test "startup split Whisper backend is reused through canonical request paths" {
+    const allocator = std.testing.allocator;
+    const test_ml = @import("ml");
+    var graph = test_ml.graph.Graph.init(allocator);
+    defer graph.deinit();
+    var builder = test_ml.graph.Builder.init(&graph);
+    const input = try builder.parameter("input", test_ml.graph.Shape.init(.f32, &.{4}));
+    const bias = try builder.tensorConst(&.{ 1, 1, 1, 1 }, test_ml.graph.Shape.init(.f32, &.{4}));
+    try graph.markOutput(try builder.add(input, bias));
+    const bytes = try @import("onnx_graph").exportGraph(allocator, &graph, .{});
+    defer allocator.free(bytes);
+    var dir = std.testing.tmpDir(.{});
+    defer dir.cleanup();
+    try dir.dir.createDirPath(std.testing.io, "transcribers/owner/tiny");
+    for ([_][]const u8{ "encoder_model.onnx", "decoder_model.onnx" }) |name| {
+        const path = try std.fs.path.join(allocator, &.{ "transcribers/owner/tiny", name });
+        defer allocator.free(path);
+        try dir.dir.writeFile(std.testing.io, .{ .sub_path = path, .data = bytes });
+    }
+    try dir.dir.writeFile(std.testing.io, .{ .sub_path = "transcribers/owner/tiny/config.json", .data =
+        \\{"model_type":"whisper","vocab_size":4,"d_model":4,"decoder_start_token_id":0,"eos_token_id":0,"max_length":4}
+    });
+    try dir.dir.writeFile(std.testing.io, .{ .sub_path = "transcribers/owner/tiny/tokenizer.json", .data =
+        \\{"version":"1.0","added_tokens":[{"id":0,"content":"<unk>","special":true},{"id":1,"content":"<|en|>","special":true},{"id":2,"content":"<|transcribe|>","special":true},{"id":3,"content":"<|notimestamps|>","special":true}],"model":{"type":"BPE","vocab":{"<unk>":0,"<|en|>":1,"<|transcribe|>":2,"<|notimestamps|>":3},"merges":[]}}
+    });
+    const root = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", dir.sub_path[0..] });
+    defer allocator.free(root);
+    var node = try Node.init(allocator, .{ .models_dir = root, .allow_unknown_models = true });
+    defer node.deinit();
+    try node.attachIo(std.testing.io);
+    node.model_manager.session_manager.preferred_backends = &.{ .native, .metal };
+    try node.warmTranscriber(allocator, .{ .kind = .transcriber, .name = "owner/tiny", .backend = .native });
+    const path = try node.resolveRequestModelPath(allocator, std.testing.io, "owner/tiny", "transcribers");
+    defer allocator.free(path);
+    const paths = try @import("../pipelines/encoder_decoder.zig").findEncoderDecoderPaths(allocator, path);
+    defer allocator.free(paths.encoder);
+    defer allocator.free(paths.decoder);
+    var handle = try node.model_manager.acquireCompositeRuntime(path, &.{ paths.encoder, paths.decoder }, .whisper, null);
+    defer handle.release();
+    try std.testing.expect(handle.get().startup_managed);
+    try std.testing.expectEqual(@as(usize, 1), node.model_manager.composite_assets.count());
+    try std.testing.expectEqualSlices(backends_mod.BackendType, &.{.native}, handle.get().preferred_backends);
+}
+
+test "runtime unload bypasses inference admission while load remains admitted" {
+    try std.testing.expectEqual(InferenceHttpRouteAdmission.none, inferenceHttpRouteAdmission("DELETE", "/models/instances/:instance_id"));
+    try std.testing.expectEqual(InferenceHttpRouteAdmission.inference, inferenceHttpRouteAdmission("POST", "/models/instances"));
+    try std.testing.expectEqual(InferenceHttpRouteAdmission.none, inferenceHttpRouteAdmission("GET", "/models/instances"));
+}
+
+test "runtime model instances preserve shared task identity and survive missing manifests without leaking" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "models");
+    const models_root = try tmp.dir.realPathFileAlloc(std.testing.io, "models", allocator);
+    defer allocator.free(models_root);
+    const missing_model_dir = try std.fs.path.join(allocator, &.{ models_root, "generators", "owner", "removed" });
+    var missing_model_dir_owned = true;
+    errdefer if (missing_model_dir_owned) allocator.free(missing_model_dir);
+
+    var node = try Node.init(allocator, .{ .models_dir = models_root });
+    defer node.deinit();
+    const Probe = struct {
+        closed: bool = false,
+        fn run(_: *anyopaque, _: []const backends_mod.Tensor, a: std.mem.Allocator) ![]backends_mod.Tensor {
+            return a.alloc(backends_mod.Tensor, 0);
+        }
+        fn info(_: *anyopaque) []const backends_mod.TensorInfo {
+            return &.{};
+        }
+        fn backend(_: *anyopaque) backends_mod.BackendType {
+            return .native;
+        }
+        fn close(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.closed = true;
+        }
+        const vtable = backends_mod.Session.VTable{
+            .run = run,
+            .inputInfo = info,
+            .outputInfo = info,
+            .backend = backend,
+            .close = close,
+        };
+    };
+    var probe = Probe{};
+    const model = try allocator.create(model_manager_mod.LoadedModel);
+    var model_owned = true;
+    errdefer if (model_owned) allocator.destroy(model);
+    model.* = .{
+        .runtime_id = 0x1234,
+        .manifest = .{ .allocator = allocator, .model_type = .generator, .inference_bundle_family = try allocator.dupe(u8, manifest_mod.qwen3_vl_gguf_bundle_family) },
+        .hf_tok = null,
+        .sp_tok = null,
+        .session = .{ .ptr = &probe, .vtable = &Probe.vtable },
+        .session_manager = &node.model_manager.session_manager,
+        .model_manager = &node.model_manager,
+        .model_dir = missing_model_dir,
+        .allocator = allocator,
+        .prompt_prefix_cache = runtime.kv.prompt_cache.PromptPrefixCache.init(allocator),
+        .native_generation_graph_cache = graph_mod.cache.GraphCache.init(allocator),
+    };
+    missing_model_dir_owned = false;
+    errdefer if (model_owned) model.deinit();
+    const runtime_key = try allocator.dupe(u8, "runtime-snapshot-missing-manifest");
+    var runtime_key_owned = true;
+    errdefer if (runtime_key_owned) allocator.free(runtime_key);
+    try node.model_manager.loaded.put(allocator, runtime_key, model);
+    runtime_key_owned = false;
+    model_owned = false;
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const models = try node.runtimeModelsAlloc(arena.allocator(), std.testing.io, null, null);
+    try std.testing.expectEqual(@as(usize, 1), models.len);
+    try std.testing.expectEqualSlices(api.ModelKind, &.{ .generator, .reader }, models[0].tasks);
+    try std.testing.expect(models[0].unloadable);
+    try std.testing.expectEqualStrings("owner/removed", models[0].model);
+    try std.testing.expectEqualStrings("00000000000000000000000000001234", models[0].id);
+
+    // Exercise the HTTP handler with a leak-checking allocator, rather than
+    // letting the fixture's arena hide allocations retained by status polling.
+    for (0..3) |_| {
+        var request = try httpx.Request.init(allocator, .GET, "/ai/v1/models/instances");
+        defer request.deinit();
+        var ctx = httpx.Context.init(allocator, std.testing.io, &request);
+        defer ctx.deinit();
+        var response = try node.listModelInstances(&ctx);
+        defer response.deinit();
+        try std.testing.expectEqual(@as(u16, 200), response.status.code);
+        const parsed = try std.json.parseFromSlice(api.ModelInstanceList, allocator, response.body.?, .{});
+        defer parsed.deinit();
+        try std.testing.expectEqual(@as(usize, 1), parsed.value.data.len);
+        try std.testing.expectEqualStrings("owner/removed", parsed.value.data[0].model);
+        try std.testing.expectEqualStrings("00000000000000000000000000001234", parsed.value.data[0].id);
+    }
+    // The public projection reports eviction eligibility rather than guessing
+    // it from a count of HTTP requests.
+    model.active_handles = 1;
+    var busy_request = try httpx.Request.init(allocator, .DELETE, "/ai/v1/models/instances/00000000000000000000000000001234");
+    defer busy_request.deinit();
+    var busy_ctx = httpx.Context.init(allocator, std.testing.io, &busy_request);
+    defer busy_ctx.deinit();
+    var busy_response = try node.unloadModelInstance(&busy_ctx, "00000000000000000000000000001234");
+    defer busy_response.deinit();
+    try std.testing.expectEqual(@as(u16, 409), busy_response.status.code);
+    const busy = try node.runtimeModelsAlloc(arena.allocator(), std.testing.io, null, null);
+    try std.testing.expect(!busy[0].unloadable);
+    try std.testing.expectEqualStrings("in_use", busy[0].unload_blocked_reason.?);
+    model.active_handles = 0;
+    var stale_ctx = httpx.Context.init(allocator, std.testing.io, &busy_request);
+    defer stale_ctx.deinit();
+    var stale_response = try node.unloadModelInstance(&stale_ctx, "00000000000000000000000000001235");
+    defer stale_response.deinit();
+    try std.testing.expectEqual(@as(u16, 200), stale_response.status.code);
+    try std.testing.expect(!probe.closed);
 }
 
 test "read model resolution falls back to generators and keeps reader precedence" {
@@ -29173,6 +29916,31 @@ test "changing model publication returns an explicit retry contract" {
     try std.testing.expect(std.mem.indexOf(u8, response.body.?, "\"retryable\":true") != null);
 }
 
+test "embedding and execution publication races retain the retry contract" {
+    const a = std.testing.allocator;
+    var request = try httpx.Request.init(a, .POST, "/ai/v1/embed");
+    defer request.deinit();
+    var ctx = httpx.Context.init(a, std.testing.io, &request);
+    defer ctx.deinit();
+    for ([_]anyerror{ error.ModelArtifactsChanging, error.IncompleteManagedDownload }) |cause| {
+        var strict = try embedDenseInputFailureResponse(&ctx, cause);
+        defer strict.deinit();
+        try std.testing.expectEqual(@as(u16, 503), strict.status.code);
+        try std.testing.expectEqualStrings("1", strict.header("Retry-After").?);
+        try std.testing.expect(std.mem.indexOf(u8, strict.body.?, "MODEL_ARTIFACTS_CHANGING") != null);
+        try std.testing.expect(std.mem.indexOf(u8, strict.body.?, "\"retryable\":true") != null);
+        const partial = embedItemFailure(3, cause, "execution");
+        try std.testing.expectEqualStrings("MODEL_ARTIFACTS_CHANGING", partial.code);
+        try std.testing.expectEqual(@as(u16, 503), partial.status);
+        try std.testing.expect(partial.retryable);
+        try std.testing.expectEqual(@as(?i64, 1000), partial.retry_after_ms);
+        var execution = try inferenceFailureResponse(&ctx, cause);
+        defer execution.deinit();
+        try std.testing.expectEqual(@as(u16, 503), execution.status.code);
+        try std.testing.expectEqualStrings("1", execution.header("Retry-After").?);
+    }
+}
+
 test "managed download markers return the model publication retry contract" {
     const allocator = std.testing.allocator;
     var request = try httpx.Request.init(allocator, .POST, "/ai/v1/transcribe");
@@ -29230,6 +29998,9 @@ test "registerRoutesOn prefixes embed aliases and metrics route" {
     try std.testing.expect(server.hasRoute(.post, public_api_prefix ++ "/generate/batch"));
     try std.testing.expect(server.hasRoute(.get, public_api_prefix ++ "/models"));
     try std.testing.expectEqual(@as(usize, 1), server.routeCount(.get, public_api_prefix ++ "/models"));
+    try std.testing.expect(!server.hasRoute(.get, public_api_prefix ++ "/models/runtime"));
+    try std.testing.expect(!server.hasRoute(.post, public_api_prefix ++ "/models/load"));
+    try std.testing.expect(!server.hasRoute(.post, public_api_prefix ++ "/models/unload"));
     try std.testing.expect(server.hasRoute(.get, public_api_prefix ++ "/metrics"));
     try std.testing.expect(server.hasRoute(.post, public_api_prefix ++ "/dictate"));
     try std.testing.expect(server.hasRoute(.post, public_api_prefix ++ "/transcription/sessions"));
@@ -30048,6 +30819,14 @@ test "registerAiRoutesOn excludes Traditional ML predictor routes" {
     try std.testing.expect(server.hasRoute(.post, ai_api_prefix ++ "/embeddings"));
     try std.testing.expect(server.hasRoute(.post, ai_api_prefix ++ "/generate/batch"));
     try std.testing.expect(server.hasRoute(.get, ai_api_prefix ++ "/models"));
+    try std.testing.expect(server.hasRoute(.get, ai_api_prefix ++ "/_antfarm/readers"));
+    try std.testing.expect(server.hasRoute(.post, ai_api_prefix ++ "/_antfarm/readers/apple"));
+    try std.testing.expect(server.hasRoute(.get, ai_api_prefix ++ "/models/instances"));
+    try std.testing.expect(server.hasRoute(.post, ai_api_prefix ++ "/models/instances"));
+    try std.testing.expect(server.hasRoute(.delete, ai_api_prefix ++ "/models/instances/:instance_id"));
+    try std.testing.expect(!server.hasRoute(.get, ai_api_prefix ++ "/models/runtime"));
+    try std.testing.expect(!server.hasRoute(.post, ai_api_prefix ++ "/models/load"));
+    try std.testing.expect(!server.hasRoute(.post, ai_api_prefix ++ "/models/unload"));
     try std.testing.expect(server.hasRoute(.post, ai_api_prefix ++ "/recognize"));
     try std.testing.expect(server.hasRoute(.post, ai_api_prefix ++ "/dictate"));
     try std.testing.expect(server.hasRoute(.post, ai_api_prefix ++ "/transcription/sessions/:session_id/audio"));
@@ -30412,6 +31191,9 @@ test "registerRoutesOn supports alternate prefixes through the shared router" {
     try std.testing.expect(server.hasRoute(.post, "/custom/v9/embed"));
     try std.testing.expect(server.hasRoute(.post, "/custom/v9/embeddings"));
     try std.testing.expect(server.hasRoute(.get, "/custom/v9/models"));
+    try std.testing.expect(!server.hasRoute(.get, "/custom/v9/models/runtime"));
+    try std.testing.expect(!server.hasRoute(.post, "/custom/v9/models/load"));
+    try std.testing.expect(!server.hasRoute(.post, "/custom/v9/models/unload"));
     try std.testing.expect(server.hasRoute(.get, "/custom/v9/metrics"));
 }
 
@@ -33292,6 +34074,11 @@ const EmbedDenseInputFailure = struct {
 };
 
 fn embedDenseInputFailure(err: anyerror) EmbedDenseInputFailure {
+    if (isModelPublicationError(err)) return .{
+        .status = 503,
+        .code = "MODEL_ARTIFACTS_CHANGING",
+        .message = "model artifacts are being published; retry with a consistent generation",
+    };
     if (isTransientInferenceCapacityError(err)) return .{
         .status = 503,
         .code = "MODEL_RESOURCE_BUSY",
@@ -33402,6 +34189,7 @@ test "EmbeddingGemma2 grouped image parse failures keep permanent image errors" 
 }
 
 fn embedDenseInputFailureResponse(ctx: *httpx.Context, err: anyerror) !httpx.Response {
+    if (isModelPublicationError(err)) return modelArtifactsChangingResponse(ctx);
     if (isTransientInferenceCapacityError(err)) {
         return modelResourceBusyResponse(ctx);
     }
@@ -33471,6 +34259,18 @@ const DenseEmbedPartialResult = struct {
 };
 
 fn embedItemFailure(index: usize, err: anyerror, stage: []const u8) EmbedItemError {
+    if (isModelPublicationError(err)) {
+        const failure = embedDenseInputFailure(err);
+        return .{
+            .index = @intCast(index),
+            .code = failure.code,
+            .message = failure.message,
+            .stage = stage,
+            .retryable = true,
+            .status = failure.status,
+            .retry_after_ms = transient_capacity_retry_after_ms,
+        };
+    }
     if (isInferenceExecutorContractError(err)) {
         const failure = generateExecutorContractError(err);
         return .{ .index = @intCast(index), .code = failure.batch.code, .message = failure.batch.message, .stage = stage, .retryable = failure.batch.retryable, .status = failure.status };
@@ -36428,10 +37228,14 @@ fn readRequestAdmissionForLimits(
     else
         std.math.mul(usize, max_concurrent_units, read_admission_bytes_per_unit) catch std.math.maxInt(usize);
     const aggregate_image_cap = std.math.mul(usize, image_count, configured_per_image_byte_cap) catch std.math.maxInt(usize);
-    const available_download_bytes = if (max_concurrent_units == 0)
+    // Leave bounded admission capacity for decoded image working memory.
+    // Consuming the whole envelope with a worst-case encoded reservation gives
+    // every image a zero-pixel ceiling before its real dimensions are known.
+    const encoded_resident_cap = if (max_concurrent_units == 0)
         configured_batch_byte_cap
     else
-        capacity_bytes -| inline_source_bytes;
+        capacity_bytes / 2;
+    const available_download_bytes = encoded_resident_cap -| inline_source_bytes;
     const byte_cap = @min(@min(configured_batch_byte_cap, available_download_bytes), aggregate_image_cap);
     const resident_byte_cap = std.math.add(usize, inline_source_bytes, byte_cap) catch std.math.maxInt(usize);
     const byte_units = admissionUnitsFor(resident_byte_cap, read_admission_bytes_per_unit);
@@ -39395,6 +40199,13 @@ test "generated constrained public routes admit native models and reject proxy c
         \\{"decision_method":"generated","generator":{"provider":"antfly","model":"missing-generated-fixture-1187"},"probabilities":"verdict_only","instructions":"Rate the statement between zero and one.","input":"source","questions":[{"name":"score","type":"score"}]}
     ;
     try std.testing.expectError(error.ModelNotFound, node.decideDirectJsonWithControl(a, score, null));
+    const unsupported_image =
+        \\{"decision_method":"generated","generator":{"provider":"antfly","model":"vision"},"probabilities":"verdict_only","input":[{"role":"user","content":[{"type":"input_image","image_url":"https://example.com/image.png"}]}],"questions":[{"name":"answer","type":"predicate","instructions":"Present?"}]}
+    ;
+    try std.testing.expectError(error.UnsupportedInferenceFeature, node.decideDirectJsonWithControl(a, unsupported_image, null));
+    var image_failure = try Node.decideFailureResponse(&ctx, error.UnsupportedInferenceFeature);
+    defer image_failure.deinit();
+    try std.testing.expectEqual(@as(u16, 400), image_failure.status.code);
     const extraction =
         \\{"method":"generated","generator":{"provider":"openai","model":"gpt-4.1"},"probabilities":"verdict_only","inputs":[{"content":"Éva"}],"schema":{"entities":["person"]}}
     ;

@@ -19,6 +19,7 @@ pub const OnnxModules = onnx_build.Modules;
 const jit_identity = @import("jit_identity.zig");
 
 pub const BackendOptions = struct {
+    allow_downloads: bool = true,
     enable_metal: bool = false,
     enable_cuda: bool = false,
     cuda_artifacts: []const u8 = "fatbin",
@@ -198,6 +199,7 @@ pub fn create(config: Config) Graph {
     };
     const scraping_mod = shared.scraping orelse blk: {
         const mod = createSharedModule(config, "lib/scraping/src/mod.zig");
+        mod.addImport("antfly_source_reference", createSharedModule(config, "lib/scraping/src/source_reference.zig"));
         mod.addImport("objectstore", objectstore_mod);
         mod.addImport("httpx", httpx_mod);
         break :blk mod;
@@ -206,6 +208,7 @@ pub fn create(config: Config) Graph {
         const mod = createSharedModule(config, "lib/regex/src/mod.zig");
         mod.addImport("antfly_capture_regex", createSharedModule(config, "lib/regex/src/captures.zig"));
         mod.addImport("antfly_fst", fst_mod);
+        mod.addImport("antfly_grapheme", shared.tokenizer_mod.import_table.get("antfly_grapheme").?);
         mod.addImport("antfly_platform", platform_mod);
         break :blk mod;
     };
@@ -448,6 +451,7 @@ pub fn create(config: Config) Graph {
     });
     inference_internal_mod.addImport("antfly_decisions", decisions_mod);
     inference_internal_mod.addImport("antfly_structured", structured_mod);
+    inference_internal_mod.addImport("antfly_extracting", extracting_mod);
     inference_internal_mod.addImport("build_info", shared.build_info_mod);
     identities.addImports(inference_internal_mod);
     inference_internal_mod.addImport("build_options", build_options_mod);
@@ -524,12 +528,33 @@ pub fn create(config: Config) Graph {
     };
 }
 
-pub fn addStandaloneExecutable(b: *std.Build, graph: Graph, target: std.Build.ResolvedTarget, optimize: std.lang.Optimize, inference_root: []const u8, link_libc: bool) *std.Build.Step.Compile {
+pub const StandaloneCompileOptions = struct {
+    strip: bool,
+    has_accelerator: bool,
+};
+
+pub fn addStandaloneExecutable(b: *std.Build, graph: Graph, target: std.Build.ResolvedTarget, optimize: std.lang.Optimize, inference_root: []const u8, link_libc: bool, options: StandaloneCompileOptions) *std.Build.Step.Compile {
+    // These unstripped ReleaseFast profiles reserve the measured compiler peak
+    // plus 25%, rounded up to 64 MiB. Keep other modes and targets independent.
+    const baseline_cpu = switch (target.query.cpu_model) {
+        .baseline => true,
+        else => false,
+    };
+    const measured_release = !options.strip and !options.has_accelerator and baseline_cpu and optimize == .fast;
+    const darwin_linux_release = measured_release and b.graph.host.result.os.tag == .macos and
+        b.graph.host.result.cpu.arch == .aarch64 and target.result.os.tag == .linux and target.result.cpu.arch == .x86_64 and
+        target.result.abi == .gnu;
+    // CI's native Nix/glibc compiler peaked at 10,717,630,464 bytes, versus
+    // 12,537,217,024 bytes for the Darwin-hosted cross-build.
+    const native_linux_release = measured_release and b.graph.host.result.os.tag == .linux and
+        b.graph.host.result.cpu.arch == .x86_64 and target.result.os.tag == .linux and
+        target.result.cpu.arch == .x86_64 and target.result.abi == .gnu;
+    const default_compile_memory_mb: usize = if (darwin_linux_release) 14976 else if (native_linux_release) 12800 else if (target.result.os.tag == .macos) 14 * 1024 else 7 * 1024;
     const compile_memory_mb = b.option(usize, "inference-compile-memory-mb", "Declared standalone inference compiler memory bound in MiB") orelse
-        @as(usize, if (target.result.os.tag == .macos) 14 * 1024 else 7 * 1024);
+        default_compile_memory_mb;
     if (compile_memory_mb == 0) @panic("inference compiler memory bound must be positive");
     const exe = b.addExecutable(.{
-        .name = "antfly-inference",
+        .name = "antfly-inference-dev",
         // The F32 Metal ReleaseFast CLI measured 12.7 GiB during compilation.
         // Match the inference-test headroom so the scheduler admits this
         // measured build rather than rejecting its completed artifact.
@@ -541,6 +566,7 @@ pub fn addStandaloneExecutable(b: *std.Build, graph: Graph, target: std.Build.Re
         }),
     });
     graph.linkBuildInfo(exe.root_module);
+    exe.root_module.strip = options.strip;
     exe.root_module.addImport("inference", graph.inference_mod);
     exe.root_module.addImport("build_options", graph.build_options_mod);
     exe.root_module.addImport("structlog", graph.structlog_mod);
@@ -632,6 +658,7 @@ fn addExplicitBuildOptions(b: *std.Build, backend: BackendOptions) *std.Build.St
 }
 
 fn addCommonOptions(options: *std.Build.Step.Options, backend: BackendOptions) void {
+    options.addOption(bool, "allow_downloads", backend.allow_downloads);
     options.addOption(bool, "enable_metal", backend.enable_metal);
     options.addOption(bool, "enable_cuda", backend.enable_cuda);
     options.addOption([]const u8, "cuda_artifacts", backend.cuda_artifacts);

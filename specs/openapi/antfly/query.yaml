@@ -31,6 +31,94 @@ components:
         lat:
           type: number
           format: double
+    EqualsQuery:
+      type: object
+      additionalProperties: false
+      description: |
+        Whole string equality on the original logical field value.
+        No normalization is applied. Case-sensitive by default; case_sensitive=false
+        uses Unicode simple case folding, not locale-specific or multi-character folding.
+        Missing, null, and non-string values do not match. Arrays use any-element
+        semantics; a match never spans array elements. Indexes select conservative
+        candidates and original values are verified before counting and pagination.
+      required: [equals, field]
+      properties:
+        equals:
+          type: string
+        field:
+          type: string
+          minLength: 1
+          description: Logical source field path, not a companion index name.
+        case_sensitive:
+          type: boolean
+          default: true
+          x-go-type-skip-optional-pointer: false
+        boost:
+          $ref: '#/components/schemas/Boost'
+    ContainsQuery:
+      type: object
+      additionalProperties: false
+      description: |
+        Contiguous substring search on the original logical field value, including whitespace and punctuation.
+        No normalization is applied. Case-sensitive by default; case_sensitive=false
+        uses Unicode simple case folding, not locale-specific or multi-character folding.
+        Missing, null, and non-string values do not match. Arrays use any-element
+        semantics; a match never spans array elements. Indexes select conservative
+        candidates and original values are verified before counting and pagination.
+      required: [contains, field]
+      properties:
+        contains:
+          type: string
+        field:
+          type: string
+          minLength: 1
+          description: Logical source field path, not a companion index name.
+        case_sensitive:
+          type: boolean
+          default: true
+          x-go-type-skip-optional-pointer: false
+        boost:
+          $ref: '#/components/schemas/Boost'
+    MatchesQuery:
+      type: object
+      additionalProperties: false
+      description: |
+        Unanchored native Unicode regular expression search on the original logical field value. Anchors refer to each complete value; indexed-term regexp semantics are unchanged.
+        No normalization is applied. Case-sensitive by default; case_sensitive=false
+        uses Unicode simple case folding, not locale-specific or multi-character folding.
+        Missing, null, and non-string values do not match. Arrays use any-element
+        semantics; a match never spans array elements. Indexes select conservative
+        candidates and original values are verified before counting and pagination.
+      required: [matches, field]
+      properties:
+        matches:
+          type: string
+        field:
+          type: string
+          minLength: 1
+          description: Logical source field path, not a companion index name.
+        case_sensitive:
+          type: boolean
+          default: true
+          x-go-type-skip-optional-pointer: false
+        boost:
+          $ref: '#/components/schemas/Boost'
+    AutocompleteQuery:
+      type: object
+      additionalProperties: false
+      description: |
+        Analyzed bool-prefix search on a logical field. The planner selects
+        declared search-as-you-type root, shingle and prefix representations.
+        Requires a compatible representation; never silently becomes raw prefix search.
+      required: [autocomplete, field]
+      properties:
+        autocomplete:
+          type: string
+        field:
+          type: string
+          minLength: 1
+        boost:
+          $ref: '#/components/schemas/Boost'
     TermQuery:
       type: object
       properties:
@@ -208,6 +296,7 @@ components:
         - query
     NumericRangeQuery:
       type: object
+      additionalProperties: false
       properties:
         min:
           type: number
@@ -233,6 +322,7 @@ components:
           $ref: "#/components/schemas/Boost"
     TermRangeQuery:
       type: object
+      additionalProperties: false
       properties:
         min:
           type: string
@@ -256,6 +346,7 @@ components:
           $ref: "#/components/schemas/Boost"
     DateRangeStringQuery:
       type: object
+      additionalProperties: false
       properties:
         start:
           type: string
@@ -279,8 +370,42 @@ components:
           $ref: "#/components/schemas/Boost"
         datetime_parser:
           type: string
+    BoolQuery:
+      type: object
+      additionalProperties: false
+      required: [bool]
+      description: Canonical Boolean wrapper. Must clauses score; filter clauses constrain without scoring.
+      properties:
+        bool:
+          $ref: '#/components/schemas/BoolQueryBody'
+    BoolQueryClause:
+      oneOf:
+        - $ref: '#/components/schemas/Query'
+        - type: array
+          items:
+            $ref: '#/components/schemas/Query'
+    BoolQueryBody:
+      type: object
+      additionalProperties: false
+      properties:
+        must:
+          $ref: '#/components/schemas/BoolQueryClause'
+        should:
+          $ref: '#/components/schemas/BoolQueryClause'
+        must_not:
+          $ref: '#/components/schemas/BoolQueryClause'
+        filter:
+          $ref: '#/components/schemas/BoolQueryClause'
+        minimum_should_match:
+          type: integer
+          format: uint32
+          minimum: 0
+          description: Minimum optional clauses required; omission follows the runtime's required-clause defaults.
+        boost:
+          $ref: '#/components/schemas/Boost'
     BooleanQuery:
       type: object
+      additionalProperties: false
       properties:
         must:
           $ref: "#/components/schemas/ConjunctionQuery"
@@ -510,6 +635,10 @@ components:
     #    - k
     Query:
       oneOf:
+        - $ref: "#/components/schemas/EqualsQuery"
+        - $ref: "#/components/schemas/ContainsQuery"
+        - $ref: "#/components/schemas/MatchesQuery"
+        - $ref: "#/components/schemas/AutocompleteQuery"
         - $ref: "#/components/schemas/TermQuery"
         - $ref: "#/components/schemas/MatchQuery"
         - $ref: "#/components/schemas/MultiMatchQuery"
@@ -524,6 +653,7 @@ components:
         - $ref: "#/components/schemas/NumericRangeQuery"
         - $ref: "#/components/schemas/TermRangeQuery"
         - $ref: "#/components/schemas/DateRangeStringQuery"
+        - $ref: "#/components/schemas/BoolQuery"
         - $ref: "#/components/schemas/BooleanQuery"
         - $ref: "#/components/schemas/ConjunctionQuery"
         - $ref: "#/components/schemas/DisjunctionQuery"

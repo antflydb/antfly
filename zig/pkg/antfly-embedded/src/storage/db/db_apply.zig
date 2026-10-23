@@ -18,6 +18,8 @@
 
 const db_zig = @import("db.zig");
 const DB = db_zig.DB;
+const execution_resources = @import("execution_resources.zig");
+const monotonicTimeNs = db_zig.monotonicTimeNs;
 const resolution_runtime_mod = @import("resolution_runtime.zig");
 const localGroupSourceSettled = DB.localGroupSourceSettled;
 const TestDirectory = @import("../../common/test_directory.zig").TestDirectory;
@@ -828,294 +830,28 @@ pub fn applyReplicatedDerivedEffect(self: *DB, change: change_journal_mod.Record
 /// the global serialization fence. The bound prevents catalog churn from
 /// turning one request into unbounded CPU/provider work.
 pub fn batchInternal(self: *DB, req: types.BatchRequest, profile: ?*BatchProfile, opts: BatchExecutionOptions) anyerror!void {
-    if (comptime storage_engine.enabled) return storage_engine.call(@src().fn_name, .{ self, req, profile, opts });
-    try types.validateGraphEndpointCleanupCommand(req);
-    for (req.writes) |write| if ((@import("group_source_identity.zig").isAnchor(write.key) or @import("group_source_transfer.zig").isKey(write.key))) return error.InvalidBatchRequest;
-    for (req.deletes) |document| if ((@import("group_source_identity.zig").isAnchor(document) or @import("group_source_transfer.zig").isKey(document))) return error.InvalidBatchRequest;
-    for (req.transforms) |transform| if ((@import("group_source_identity.zig").isAnchor(transform.key) or @import("group_source_transfer.zig").isKey(transform.key))) return error.InvalidBatchRequest;
-    var lake_schema_view = self.core.acquireSchemaView();
-    defer if (lake_schema_view) |*view| view.release();
-    if (lake_schema_view) |view| if (view.tableSchema().external_base_source != null and
-        (req.writes.len != 0 or req.deletes.len != 0 or req.transforms.len != 0 or req.graph_writes.len != 0 or req.graph_deletes.len != 0)) return error.ExternalLakeReadOnly;
-    if (self.local_execution.initial_child_hidden.load(.acquire) and
-        (req.relational_topology == null or
-            (req.relational_topology.?.action != .provision_initial_child and
-                req.relational_topology.?.action != .release_initial_child and
-                req.relational_topology.?.action != .cancel_initial_child)))
-        return error.InitialChildNotPublished;
-    // Publication has a dedicated deterministic Raft apply path; it must
-    // never be silently treated as an ordinary empty batch.
-    if (req.row_policy_publication != null or req.row_policy_install_bundle.len != 0)
-        return error.InvalidBatchRequest;
-    // Follower/recovery Raft replay applies an already-authorized log
-    // command. Every local direct mutation must retain an admission lease
-    // through commit so a policy activation cannot cross it.
-    var verified_principal: ?std.json.Parsed(row_policy_authority_mod.Payload) = null;
-    defer if (verified_principal) |*principal| principal.deinit();
-    var row_policy_lease: ?row_policy_gate_mod.Gate.Lease = null;
-    const trusted_replay = opts.ordered_apply_receipt != null or opts.native_initial_child_entry != null or opts.replication_applied_lsn_marker != null;
-    // Strict private-command validation above confines this exemption to
-    // derived inline-edge/job maintenance. It cannot mutate user rows,
-    // and must progress while a policy publication is preparing or active.
-    const graph_cleanup_maintenance = req.graph_endpoint_cleanup;
-    if (!trusted_replay and !graph_cleanup_maintenance) try self.maybeFinalizePendingRowPolicyPublication();
-    if (req.row_policy_principal_proof.len != 0) {
-        if (req.row_policy_admitted_at_seconds <= 0 or req.row_policy_database.len == 0 or
-            req.row_policy_publication != null or req.relational_generation_gc != null or
-            req.online_source != null or req.restore_staging != null)
-            return error.RowPolicyAuthenticationRequired;
-        const now_seconds: i64 = @intCast(@divFloor(platform_time.realtimeNs(), std.time.ns_per_s));
-        verified_principal = try self.verifyRowPolicyPrincipal(self.alloc, req.row_policy_principal_proof, req.row_policy_database, .write, if (trusted_replay) req.row_policy_admitted_at_seconds else now_seconds);
-        row_policy_lease = if (trusted_replay)
-            try self.local_execution.row_policy_gate.enterReplicatedPrincipal(&verified_principal.?.value)
-        else
-            try self.local_execution.row_policy_gate.enterVerifiedPrincipal(&verified_principal.?.value, now_seconds);
-    } else if (req.row_policy_database.len != 0 or req.row_policy_admitted_at_seconds != 0) {
-        return error.RowPolicyAuthenticationRequired;
-    } else if (!trusted_replay and !graph_cleanup_maintenance and req.relational_generation_gc == null and opts.transaction_resolution == null) {
-        row_policy_lease = try self.local_execution.row_policy_gate.enterRaw();
-    } else if (self.local_execution.row_policy_gate.currentPhase() != .disabled and
-        (req.writes.len != 0 or req.deletes.len != 0 or req.transforms.len != 0 or
-            req.graph_writes.len != 0 or req.graph_deletes.len != 0) and
-        opts.transaction_resolution == null and req.relational_generation_gc == null and !graph_cleanup_maintenance)
-    {
-        return error.RowPolicyAuthenticationRequired;
-    }
-    defer if (row_policy_lease) |*lease| lease.release();
-    var policy_opts = opts;
-    if (verified_principal) |*principal| policy_opts.row_policy_principal = &principal.value;
-    if (row_policy_lease) |*lease| policy_opts.row_policy_lease = lease;
-    // A topology rewrite cannot inherit an active policy by copying row
-    // bytes: the new owner would lack an authenticated, descriptor-bound
-    // policy publication. Until coordinated bundle handoff exists, reject
-    // every replicated split/merge/restore lifecycle while a publication
-    // is preparing or active. This check also covers trusted Raft replay,
-    // which deliberately bypasses ordinary user-row admission.
-    if (self.local_execution.row_policy_gate.currentPhase() != .disabled and !graph_cleanup_maintenance and
-        (req.online_source != null or req.restore_staging != null or
-            req.relational_topology != null or req.split_transition != null or
-            req.split_checkpoint != null or req.split_replication != null or
-            req.merge_source_transition != null or req.merge_checkpoint != null or
-            req.merge_replication != null or req.merge_page != null or
-            req.merge_artifacts.len != 0)) return error.RowPolicyTopologyUnsupported;
-    try range_protection_mod.validateRequest(req);
-    try merge_page_contract.validateRequest(req);
-    try merge_proof_adoption.validateRequest(req);
-    try online_source_contract.validateRequest(req);
-    try artifact_inventory.validateRequest(req);
-    try artifact_publication_transport.validateBatchRequest(req);
-    try @import("resolver_review.zig").validateRequest(req);
-    if (req.resolver_review) |command| {
-        var review_opts = opts;
-        review_opts.resolver_review_command = &command;
-        review_opts.restore_replication_request = req;
-        review_opts.wait_for_sync_level = false;
-        return self.batchInternal(.{ .sync_level = .write }, profile, review_opts);
-    }
-    try @import("group_source_contract.zig").validateRequest(req);
-    if (req.group_source) |command| {
-        var control_opts = opts;
-        control_opts.group_source_command = &command;
-        control_opts.restore_replication_request = req;
-        control_opts.wait_for_sync_level = false;
-        if (command.finish) |finish| if (opts.ordered_apply_receipt == null and !try self.maintenanceRequiresOrderedApply()) {
-            var arena = std.heap.ArenaAllocator.init(self.runtime_alloc);
-            defer arena.deinit();
-            const owned = arena.allocator();
-            var read = try self.core.store.beginReadTxn();
-            defer read.abort();
-            const observed = try @import("group_source_state.zig").readSnapshot(owned, &read, finish.held.group, finish.held.partition);
-            if (observed) |observed_snapshot| {
-                const generation = self.core.index_manager.writePlanGeneration();
-                if (try localGroupSourceSettled(self, observed_snapshot.sequence, try std.mem.concat(owned, []const u8, &.{ observed_snapshot.units, observed_snapshot.retired }))) {
-                    control_opts.legacy_group_completed_through = observed_snapshot.sequence;
-                    control_opts.legacy_group_plan_generation = generation;
-                }
-            }
+    if (comptime storage_engine.enabled) return storage_engine.call("batchInternal", .{ self, req, profile, opts });
+    if (opts.visibility_completion != null or !opts.wait_for_sync_level or
+        (req.sync_level != .enrichments and req.sync_level != .full_index) or !self.core.index_manager.hasGroupSources())
+        return self.batchInternalCommit(req, profile, opts);
+    var completion: execution_resources.BatchVisibilityCompletion = .{};
+    defer completion.deinit(self.alloc);
+    var commit_opts = opts;
+    commit_opts.visibility_completion = &completion;
+    try self.batchInternalCommit(req, profile, commit_opts);
+    if (completion.sequence) |sequence| {
+        // Group visibility can publish more control mutations. Release the
+        // large preparation/commit frame before driving those writes; small
+        // host stacks must never contain two nested commit frames.
+        const started = monotonicTimeNs();
+        defer if (profile) |active| {
+            const elapsed = monotonicTimeNs() - started;
+            active.total_ns += elapsed;
+            active.sync_wait_ns += elapsed;
+            active.wait_sync_ns += elapsed;
         };
-        return self.batchInternal(.{ .sync_level = .write }, profile, control_opts);
+        try self.waitForSyncLevelWithCancellation(completion.sync_level, sequence, completion.targets, opts.visibility_cancellation, completion.enrichment_fully_precomputed);
     }
-    if (req.merge_proof_adoption != null) return self.applyMergeProofAdoptionBatch(req, opts);
-    if (req.artifact_catalog != null and req.online_source == null and req.merge_checkpoint == null) return self.applyArtifactCatalogBatch(req, opts);
-    if (req.artifact_publication != null) return self.applyArtifactPublicationBatch(req, opts);
-    if (req.artifact_publication_transport != null) return self.applyArtifactPublicationTransportBatch(req, opts);
-    if (req.online_source != null) {
-        if (comptime builtin.os.tag == .freestanding) {
-            return error.UnsupportedPlatform;
-        } else {
-            return self.applyOnlineSourceBatch(req, opts);
-        }
-    }
-    if (self.core.store.retained_effects_cache.load(.acquire) != 1) {
-        var source_read = try self.core.store.beginReadTxn();
-        defer source_read.abort();
-        var source_namespace: [24]u8 = undefined;
-        doc_identity.encodeNamespace(&source_namespace, self.core.identity_namespace);
-        try source_pin_state_mod.requireNoPrepared(&source_read, source_namespace);
-    }
-    if (req.relational_index_maintenance != null and (req.restore_staging != null or req.relational_topology != null)) return error.InvalidBatchRequest;
-    if (req.restore_staging) |control| {
-        if (req.transaction != null or req.relational_topology != null or (req.deletes.len != 0 and control != .rewrite_page) or req.transforms.len != 0 or req.graph_writes.len != 0 or req.graph_deletes.len != 0 or req.integrity.len != 0 or req.integrity_commands.len != 0 or req.relational_activation != null or req.relational_retirement != null or req.predicates.len != 0 or req.relational_repair or req.split_checkpoint != null or req.split_replication != null or req.split_transition != null or req.merge_source_transition != null or req.merge_checkpoint != null or req.merge_replication != null or req.merge_artifacts.len != 0) return error.InvalidRestoreStagingCommand;
-        switch (control) {
-            .begin => |scope| {
-                if (req.writes.len != 0) return error.InvalidRestoreStagingCommand;
-                _ = scope;
-                if (comptime builtin.os.tag == .freestanding) {
-                    return error.UnsupportedPlatform;
-                } else {
-                    return self.applyRestoreStagingControl(req, opts);
-                }
-            },
-            .finish => |finish| {
-                if (req.writes.len != 0) return error.InvalidRestoreStagingCommand;
-                _ = finish;
-                if (comptime builtin.os.tag == .freestanding) {
-                    return error.UnsupportedPlatform;
-                } else {
-                    return self.applyRestoreStagingControl(req, opts);
-                }
-            },
-            .install_generation_admissions => |install| {
-                if (req.writes.len != 0 or req.deletes.len != 0) return error.InvalidRestoreStagingCommand;
-                try install.validate();
-                return self.applyRestoreStagingControl(req, opts);
-            },
-            .import_page, .rewrite_page => |page| {
-                if (req.writes.len +| req.deletes.len > 128 or page.timestamps.len != req.writes.len or page.next.len > 8 * 1024 * 1024) return error.InvalidRestoreStagingCommand;
-                if (page.artifacts.len > (if (page.source_generation_proof_page) @as(usize, 1024) else 128) or
-                    @as(u8, @intFromBool(page.artifact_page)) + @as(u8, @intFromBool(page.projection_page)) + @as(u8, @intFromBool(page.source_generation_proof_page)) > 1 or
-                    ((page.artifact_page or page.projection_page or page.source_generation_proof_page) and (control != .import_page or req.writes.len != 0 or req.deletes.len != 0)) or
-                    (!page.artifact_page and !page.projection_page and !page.source_generation_proof_page and page.artifacts.len != 0)) return error.InvalidRestoreStagingCommand;
-                var timestamps: std.StringHashMapUnmanaged(u64) = .empty;
-                defer timestamps.deinit(self.alloc);
-                var input_bytes: usize = 0;
-                var previous_artifact: ?[]const u8 = null;
-                for (page.artifacts) |artifact| {
-                    if (page.source_generation_proof_page) {
-                        const portable = portable_backup;
-                        const accepted = relational_integrity_generation_admission;
-                        if (!std.mem.startsWith(u8, artifact.key, portable.source_generation_admission_prefix) or
-                            artifact.key.len != portable.source_generation_admission_prefix.len + 32) return error.InvalidRestoreStagingCommand;
-                        const decoded = accepted.Scope.decode(artifact.value) catch return error.InvalidRestoreStagingCommand;
-                        if (decoded.phase != .active) return error.InvalidRestoreStagingCommand;
-                        const key = try accepted.scopeKey(decoded.child_table_name, decoded.constraint_name);
-                        if (!std.mem.eql(u8, artifact.key[portable.source_generation_admission_prefix.len..], key[accepted.prefix.len..]))
-                            return error.InvalidRestoreStagingCommand;
-                    } else if (!(if (page.projection_page) isMergeArtifactKey(artifact.key) else isRestoreArtifactKey(artifact.key))) return error.InvalidRestoreStagingCommand;
-                    if (previous_artifact) |previous| if (std.mem.order(u8, previous, artifact.key) != .lt) return error.InvalidRestoreStagingCommand;
-                    previous_artifact = artifact.key;
-                    if (!page.source_generation_proof_page) {
-                        const owner = (try internal_keys.decodeDocumentComponentAlloc(self.alloc, artifact.key)) orelse return error.InvalidRestoreStagingCommand;
-                        defer self.alloc.free(owner);
-                        if (!self.core.byteRange().contains(owner)) return error.KeyOutOfRange;
-                    }
-                    input_bytes = std.math.add(usize, input_bytes, artifact.key.len +| artifact.value.len) catch return error.TransactionTooLarge;
-                    if (input_bytes > 16 * 1024 * 1024) return error.TransactionTooLarge;
-                }
-                for (page.timestamps, req.writes) |timestamp, row| {
-                    if (timestamp.timestamp == 0 or !std.mem.eql(u8, timestamp.key, row.key)) return error.InvalidRestoreStagingCommand;
-                    input_bytes = std.math.add(usize, input_bytes, row.key.len +| row.value.len) catch return error.TransactionTooLarge;
-                    if (input_bytes > 16 * 1024 * 1024) return error.TransactionTooLarge;
-                    const entry = try timestamps.getOrPut(self.alloc, timestamp.key);
-                    if (entry.found_existing) return error.InvalidRestoreStagingCommand;
-                    entry.value_ptr.* = timestamp.timestamp;
-                }
-                for (req.deletes) |key| {
-                    input_bytes = std.math.add(usize, input_bytes, key.len) catch return error.TransactionTooLarge;
-                    if (input_bytes > 16 * 1024 * 1024) return error.TransactionTooLarge;
-                    const entry = try timestamps.getOrPut(self.alloc, key);
-                    if (entry.found_existing) return error.InvalidRestoreStagingCommand;
-                    entry.value_ptr.* = 0;
-                }
-                var apply_req = req;
-                apply_req.restore_staging = null;
-                apply_req.sync_level = if (page.artifact_page or page.source_generation_proof_page) .write else .full_index;
-                var apply_opts = opts;
-                apply_opts.wait_for_sync_level = !page.artifact_page and !page.source_generation_proof_page;
-                apply_opts.restore_staging = .{ .expected = page.expected, .next = page.next, .scope = page.scope, .rewrite = control == .rewrite_page, .source_effects = page.source_effects, .artifact_page = page.artifact_page, .projection_page = page.projection_page, .source_generation_proof_page = page.source_generation_proof_page };
-                apply_opts.restore_timestamps = &timestamps;
-                apply_opts.restore_replication_request = req;
-                apply_opts.restore_artifacts = page.artifacts;
-                const extra = try self.alloc.alloc(docstore_mod.KVPair, opts.extra_store_writes.len + 1 + @intFromBool(page.artifacts.len != 0 and !page.source_generation_proof_page));
-                defer self.alloc.free(extra);
-                @memcpy(extra[0..opts.extra_store_writes.len], opts.extra_store_writes);
-                extra[opts.extra_store_writes.len] = .{ .key = restore_staging.key, .value = page.next };
-                if (page.artifacts.len != 0 and !page.source_generation_proof_page) {
-                    self.core.artifact_cleanup_maybe.store(true, .release);
-                    extra[extra.len - 1] = .{ .key = internal_keys.artifact_presence_key[0..], .value = "1" };
-                }
-                apply_opts.extra_store_writes = extra;
-                return self.batchInternal(apply_req, profile, apply_opts);
-            },
-        }
-    }
-    if (req.relational_generation_gc != null) return self.applyGenerationGcBatch(req, opts);
-    if (req.relational_topology != null or req.split_transition != null) {
-        return self.applyRelationalTopologyBatch(req, opts);
-    }
-    // One budget spans transforms, provider memoization, optimistic retries
-    // and commit-side consumption. No request-owned allocation may outlive
-    // this context, including generated results moved into derived batches.
-    var preparation: RequestPreparationContext = undefined;
-    preparation.init(self);
-    defer preparation.deinit();
-    var proof_witness_arena = std.heap.ArenaAllocator.init(preparation.guard.allocator());
-    defer proof_witness_arena.deinit();
-    var page_timestamps: std.StringHashMapUnmanaged(u64) = .empty;
-    defer page_timestamps.deinit(self.alloc);
-    var apply_opts = opts;
-    var apply_req = req;
-    var chunk_prepared: ?merge_page_chunks.Prepared = null;
-    defer if (chunk_prepared) |*prepared| prepared.deinit();
-    if (req.merge_page) |page| if (page.chunk != null) {
-        chunk_prepared = self.prepareMergePageChunk(preparation.guard.allocator(), req, opts.visibility_cancellation) catch |err| return preparation.mapError(err);
-        const prepared = &chunk_prepared.?;
-        apply_req = prepared.request;
-        apply_opts.merge_chunk_expected_progress = prepared.expected_progress;
-        const extra_writes = prepared.arena.allocator().alloc(docstore_mod.KVPair, opts.extra_store_writes.len + prepared.writes.len) catch |err| return preparation.mapError(err);
-        @memcpy(extra_writes[0..opts.extra_store_writes.len], opts.extra_store_writes);
-        @memcpy(extra_writes[opts.extra_store_writes.len..], prepared.writes);
-        apply_opts.extra_store_writes = extra_writes;
-        const extra_deletes = prepared.arena.allocator().alloc([]const u8, opts.extra_store_deletes.len + prepared.deletes.len) catch |err| return preparation.mapError(err);
-        @memcpy(extra_deletes[0..opts.extra_store_deletes.len], opts.extra_store_deletes);
-        @memcpy(extra_deletes[opts.extra_store_deletes.len..], prepared.deletes);
-        apply_opts.extra_store_deletes = extra_deletes;
-        // Standby receives the same bounded command, never the assembled
-        // row re-escaped into an oversized replication JSON envelope.
-        apply_opts.restore_replication_request = req;
-    };
-    if (apply_req.merge_page) |page| if (page.provenance_effects.len != 0) {
-        try merge_page_contract.validateRequest(apply_req);
-        const proof_batch = source_proof_batch;
-        const scratch = preparation.guard.allocator();
-        const owned = proof_witness_arena.allocator();
-        const witness_writes = try owned.alloc(docstore_mod.KVPair, apply_opts.extra_store_writes.len + page.provenance_effects.len);
-        @memcpy(witness_writes[0..apply_opts.extra_store_writes.len], apply_opts.extra_store_writes);
-        var namespace: artifact_publication.Namespace = undefined;
-        doc_identity.encodeNamespace(&namespace, page.source.namespace);
-        for (page.provenance_effects, 0..) |effect, index| {
-            const digest = try proof_batch.transferDigest(namespace, page.source.pin_digest, effect.key);
-            var decoded = try proof_batch.decodeValue(scratch, namespace, digest, effect.value orelse return error.InvalidMergePage);
-            const witness_key = proof_batch.witnessKey(namespace, page.source.pin_digest, digest);
-            witness_writes[apply_opts.extra_store_writes.len + index] = .{
-                .key = try owned.dupe(u8, &witness_key),
-                .value = try owned.dupe(u8, &decoded.record_digest),
-            };
-            decoded.deinit();
-        }
-        apply_opts.extra_store_writes = witness_writes;
-    };
-    if (apply_req.merge_page) |page| if (page.phase == .rows or page.phase == .tail) {
-        if (page.chunk) |chunk| {
-            if (apply_req.writes.len != 0) try page_timestamps.put(self.alloc, chunk.row_key, chunk.timestamp);
-        } else for (apply_req.writes, page.timestamps) |row, timestamp| try page_timestamps.put(self.alloc, row.key, timestamp);
-        apply_opts.restore_timestamps = &page_timestamps;
-        apply_opts.preserve_logical_values = true;
-    };
-    apply_opts.row_policy_principal = policy_opts.row_policy_principal;
-    apply_opts.row_policy_lease = policy_opts.row_policy_lease;
-    self.batchInternalWithPreparationAllocator(apply_req, profile, apply_opts, &preparation.guard) catch |err|
-        return preparation.mapError(err);
 }
 
 /// Bind a completion/query proof to this replica's initial materialization.
@@ -1810,7 +1546,30 @@ pub fn runUntilIdleWithReplayDrainOptions(self: *DB, options: ReplayDrainOptions
         if (self.resolution_runtime == null) try self.initResolutionRuntime();
         if (self.promotion_runtime == null) try self.initPromotionRuntime();
     }
-    try self.drainReplayStagesUntilStableWithOptions(options);
+    {
+        const group_state = options.group_source_state orelse self.borrowed_group_source_state orelse &self.group_source_owner.state;
+        const drive_groups = self.async_context.replay_publication == null;
+        if (drive_groups) {
+            // A manual drain owns this producer lane until its fair round
+            // and downstream replay settle. A busy resident slice must not
+            // be mistaken for proof of idle, nor race the idle-round count.
+            while (!group_state.slice_mutex.tryLock()) {
+                try ensureSnapshotActive(options.cancellation);
+                platform_time.yieldNow();
+            }
+            group_state.idle_definitions = 0;
+        }
+        defer if (drive_groups) group_state.slice_mutex.unlock();
+        while (true) {
+            try ensureSnapshotActive(options.cancellation);
+            if (options.deadline_ns) |deadline| if (monotonicTimeNs() >= deadline) return error.RunUntilIdleDidNotConverge;
+            // Detached snapshots compute providers; their connection owner
+            // issues group commands on the current coordinator instead.
+            const group_pending = if (drive_groups) try self.runGroupSourceSliceLocked(group_state) else false;
+            try self.drainReplayStagesUntilStableWithOptions(options);
+            if (!group_pending or options.bounded_replay) break;
+        }
+    }
     if (options.drain_graph_replacements) {
         const replacement_catalog_generation = self.core.index_manager.write_plan_generation.load(.acquire);
         if (options.drain_relational_indexes) {

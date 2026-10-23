@@ -1631,7 +1631,7 @@ pub const Runtime = struct {
         const inputs = try a.alloc(d.Request, requests.len);
         for (inputs, requests) |*input, request| {
             try validateDecisionInput(a, request);
-            input.* = .{ .decider = "materialized", .questions = parsed.value.questions, .input = request.source_text };
+            input.* = .{ .decider = "materialized", .questions = parsed.value.questions, .input = .{ .text = request.source_text } };
         }
         var execution: @import("functions/runtime.zig").Runtime = .{
             .registry = &registry,
@@ -1644,6 +1644,7 @@ pub const Runtime = struct {
             .antfly_url = self.inference_api_url,
             .source_table = self.execution.routing.source_table,
         };
+        defer execution.deinit();
         const results = try execution.evaluateGeneratedPartial(a, "materialized", inputs);
         const items = try alloc.alloc(asset_producer.ProducedItem, requests.len);
         var initialized: usize = 0;
@@ -1686,7 +1687,8 @@ pub const Runtime = struct {
             .antfly_url = self.inference_api_url,
             .source_table = self.execution.routing.source_table,
         };
-        const results = try execution.provider().evaluateBatch(arena.allocator(), &.{.{ .decider = "materialized", .questions = parsed.value.questions, .input = request.source_text }});
+        defer execution.deinit();
+        const results = try execution.provider().evaluateBatch(arena.allocator(), &.{.{ .decider = "materialized", .questions = parsed.value.questions, .input = .{ .text = request.source_text } }});
         var response = results[0];
         var info = try materialization.provenance(arena.allocator(), parsed.value, request.source_fingerprint);
         try d.put(arena.allocator(), &info, "model", response.object.get("model").?);
@@ -4948,119 +4950,11 @@ test "asset producer runtime preserves or aggregates reader batch source fingerp
     try std.testing.expect(!std.mem.eql(u8, first, "first"));
 }
 
-const ReaderSource = struct {
-    images: []const []const u8,
-    prompt: ?[]const u8 = null,
-
-    pub fn deinit(self: *ReaderSource, alloc: Allocator) void {
-        for (self.images) |image| alloc.free(@constCast(image));
-        alloc.free(self.images);
-        if (self.prompt) |prompt| alloc.free(@constCast(prompt));
-        self.* = undefined;
-    }
-};
+const ReaderSource = @import("reader_source.zig").Source;
+const parseReaderSourceWithMetadataOnly = @import("reader_source.zig").parse;
 
 fn parseReaderSource(alloc: Allocator, source_text: []const u8, source_parts_json: ?[]const u8) !ReaderSource {
     return try parseReaderSourceWithMetadataOnly(alloc, source_text, source_parts_json, false);
-}
-
-fn parseReaderSourceWithMetadataOnly(
-    alloc: Allocator,
-    source_text: []const u8,
-    source_parts_json: ?[]const u8,
-    allow_metadata_only: bool,
-) !ReaderSource {
-    if (source_parts_json) |raw_parts| {
-        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, raw_parts, .{});
-        defer parsed.deinit();
-        if (parsed.value == .array) {
-            var images = std.ArrayListUnmanaged([]const u8).empty;
-            errdefer {
-                for (images.items) |image| alloc.free(@constCast(image));
-                images.deinit(alloc);
-            }
-            var prompt = std.ArrayListUnmanaged(u8).empty;
-            errdefer prompt.deinit(alloc);
-
-            for (parsed.value.array.items) |part| {
-                if (part != .object) continue;
-                const type_value = part.object.get("type") orelse continue;
-                if (type_value != .string) continue;
-                if (std.mem.eql(u8, type_value.string, "text")) {
-                    const text = part.object.get("text") orelse continue;
-                    if (text != .string) continue;
-                    if (prompt.items.len > 0) try prompt.append(alloc, '\n');
-                    try prompt.appendSlice(alloc, text.string);
-                } else if (std.mem.eql(u8, type_value.string, "media")) {
-                    if (part.object.get("url")) |url| {
-                        if (url == .string) try images.append(alloc, try alloc.dupe(u8, url.string));
-                    } else if (part.object.get("mime_type")) |mime| {
-                        const data = part.object.get("data") orelse continue;
-                        if (mime == .string and data == .string) {
-                            try images.append(alloc, try std.fmt.allocPrint(alloc, "data:{s};base64,{s}", .{ mime.string, data.string }));
-                        }
-                    }
-                }
-            }
-
-            if (images.items.len > 0 or allow_metadata_only) {
-                const owned_images = try images.toOwnedSlice(alloc);
-                errdefer {
-                    for (owned_images) |image| alloc.free(@constCast(image));
-                    alloc.free(owned_images);
-                }
-                return .{
-                    .images = owned_images,
-                    .prompt = if (prompt.items.len > 0) try prompt.toOwnedSlice(alloc) else null,
-                };
-            }
-            // Preserve the established source_text fallback for ordinary URL
-            // readers. Reset both lists after deinit so their errdefers remain
-            // harmless if parsing source_text subsequently fails.
-            prompt.deinit(alloc);
-            prompt = .empty;
-            images.deinit(alloc);
-            images = .empty;
-        }
-    }
-
-    return try parseReaderSourceText(alloc, source_text);
-}
-
-fn parseReaderSourceText(alloc: Allocator, source_text: []const u8) !ReaderSource {
-    const trimmed = std.mem.trim(u8, source_text, &std.ascii.whitespace);
-    if (trimmed.len > 0 and (trimmed[0] == '[' or trimmed[0] == '"')) {
-        var parsed = std.json.parseFromSlice(std.json.Value, alloc, trimmed, .{}) catch |err| switch (err) {
-            std.mem.Allocator.Error.OutOfMemory => return err,
-            else => null,
-        };
-        if (parsed) |*value| {
-            defer value.deinit();
-            switch (value.value) {
-                .string => |url| return try singleReaderImage(alloc, url),
-                .array => |array| {
-                    var images = std.ArrayListUnmanaged([]const u8).empty;
-                    errdefer {
-                        for (images.items) |image| alloc.free(@constCast(image));
-                        images.deinit(alloc);
-                    }
-                    for (array.items) |item| {
-                        if (item == .string) try images.append(alloc, try alloc.dupe(u8, item.string));
-                    }
-                    return .{ .images = try images.toOwnedSlice(alloc) };
-                },
-                else => {},
-            }
-        }
-    }
-    return try singleReaderImage(alloc, source_text);
-}
-
-fn singleReaderImage(alloc: Allocator, url: []const u8) !ReaderSource {
-    const images = try alloc.alloc([]const u8, 1);
-    errdefer alloc.free(images);
-    images[0] = try alloc.dupe(u8, url);
-    return .{ .images = images };
 }
 
 fn encodeReaderResults(alloc: Allocator, content_type: []const u8, results: []readers.Result) ![]u8 {
@@ -8065,7 +7959,7 @@ test "decision functions materialized enrichment records version model and sourc
     };
     var client = httpx.Client.initWithConfig(a, std.testing.io, .{});
     defer client.deinit();
-    var runtime = Runtime.initWithOptions(a, &client, .{ .antfly_provider = .{ .ptr = undefined, .embed_dense_texts = undefined, .embed_sparse_texts = undefined, .decide_json = Fake.decide } });
+    var runtime = Runtime.initWithOptions(a, &client, .{ .antfly_provider = .{ .ptr = undefined, .owns_invocation_admission = true, .embed_dense_texts = undefined, .embed_sparse_texts = undefined, .decide_json = Fake.decide } });
     defer runtime.deinit();
     const specification = "{\"version\":\"v1\",\"decider\":{\"provider\":\"antfly\",\"model\":\"mock\"},\"questions\":[{\"name\":\"refund\",\"type\":\"predicate\",\"instructions\":\"Refund?\"}]}";
     for ([_]?[]const u8{ null, "[{\"type\":\"text\",\"text\":\"refund\"}]", "[{\"type\":\"text\",\"text\":\"ref\"},{\"type\":\"text\",\"text\":\"und\"}]" }) |parts| {

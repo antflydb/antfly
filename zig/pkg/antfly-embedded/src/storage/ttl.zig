@@ -37,7 +37,7 @@ const platform_time = @import("antfly_platform").time;
 pub const TtlConfig = struct {
     /// TTL duration in nanoseconds.
     duration_ns: u64,
-    /// Grace period for cleanup (prevents deleting docs not yet replicated).
+    /// Wall-clock grace before cleanup eligibility; not a replication fence.
     /// Default: 5 seconds. Query-time filtering does NOT use the grace period.
     grace_period_ns: u64 = 5_000_000_000,
 };

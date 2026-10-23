@@ -39,11 +39,11 @@ class Table:
             read_schema while rebuilding full-text indexes for the new schema.
         replication_sources (list[ReplicationSource] | Unset): PostgreSQL CDC replication sources configured for this
             table.
-        field_capabilities (list[FieldCapability] | Unset): Effective runtime field capabilities for this table. Clients
-            can use this to discover
-            concrete field variants and their supported query modes, such as full_text, exact,
-            range, geo, and autocomplete. Public exact field sort is supported only for `_id`
-            or scalar fields marked sortable whose sort lifecycle is queryable or accelerated.
+        field_capabilities (list[FieldCapability] | Unset): Effective logical-field capabilities for this table. Queries
+            use each
+            entry's field; concrete types, analyzers and index-relative query modes
+            are nested under representations. Declared sortable fields validate
+            coverage on first use. Computed _score ordering requires a score-bearing query.
     """
 
     name: str

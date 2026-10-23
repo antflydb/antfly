@@ -386,12 +386,16 @@ pub const DecideQuestion = union(enum) {
     }
 };
 
-/// Supply exactly one of input (single text) or inputs (Antfly batch extension). Question names must be unique. Single text and named question arrays follow OpenAI Decisions conventions; local models support text input and string choice values. Request bodies are bounded at 16 MiB.
+/// Supply exactly one of input (single evidence item) or inputs (ordered Antfly batch extension; hosted typed deciders also accept multimodal evidence per item). Question names must be unique. Single text and named question arrays follow OpenAI Decisions conventions; local models support text input and string choice values. Request bodies are bounded at 16 MiB.
 pub const DecideRequest = struct {
+    /// Explicit shared-context transport version. Requires batched inputs and contexts; unknown versions are rejected.
+    context_version: ?i64 = null,
+    /// Shared immutable context strings referenced by context_index. Requires context_version 1. Total expanded input bytes are limited to 16 MiB.
+    contexts: ?[]const []const u8 = null,
     model: []const u8,
     /// Pin the exact EmbeddingGemma 2 assets and embedding recipe.
     model_identity: ?[]const u8 = null,
-    input: ?[]const u8 = null,
+    input: ?DecisionEvidence = null,
     inputs: ?[]const DecisionInput = null,
     long_document: ?DecideLongDocument = null,
     questions: []const DecideQuestion,
@@ -399,6 +403,8 @@ pub const DecideRequest = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "context_version", "context_version", true },
+        .{ "contexts", "contexts", true },
         .{ "model", "model", false },
         .{ "model_identity", "model_identity", true },
         .{ "input", "input", true },
@@ -418,6 +424,14 @@ pub const DecideRequest = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.context_version) |value| {
+            try jw.objectField("context_version");
+            try jw.write(value);
+        }
+        if (self.contexts) |value| {
+            try jw.objectField("contexts");
+            try jw.write(value);
+        }
         try jw.objectField("model");
         try jw.write(self.model);
         if (self.model_identity) |value| {
@@ -446,7 +460,7 @@ pub const DecideRequest = struct {
     }
 };
 
-/// Single-input responses have answers. Batch responses have data in input order, with one named answer array per input and aggregate usage.
+/// Single-input responses have answers. Batch responses have data in input order, with one named answer array per input and aggregate usage including reported usage from failed items. Named gateway batches identify the configured model at the top level and resolved models per successful item.
 pub const DecideResponse = struct {
     model: []const u8,
     model_identity: ?[]const u8 = null,
@@ -502,8 +516,10 @@ pub const DecideResponse = struct {
 pub const DecisionBatchItem = struct {
     input_index: i64,
     id: ?[]const u8 = null,
-    /// Generated batches preserve valid siblings; a failed item has an empty answers array and this error code.
+    /// Named gateway and generated batches preserve valid siblings; a failed item has an empty answers array and this error code. Invalid input or request budgets fail validation before dispatch.
     @"error": ?[]const u8 = null,
+    /// Resolved model reported for a successful named gateway batch item.
+    model: ?[]const u8 = null,
     answers: []const DecideAnswer,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
@@ -511,6 +527,7 @@ pub const DecisionBatchItem = struct {
         .{ "input_index", "input_index", false },
         .{ "id", "id", true },
         .{ "error", "error", true },
+        .{ "model", "model", true },
         .{ "answers", "answers", false },
     };
 
@@ -532,6 +549,10 @@ pub const DecisionBatchItem = struct {
         }
         if (self.@"error") |value| {
             try jw.objectField("error");
+            try jw.write(value);
+        }
+        if (self.model) |value| {
+            try jw.objectField("model");
             try jw.write(value);
         }
         try jw.objectField("answers");
@@ -582,14 +603,94 @@ pub const DecisionChoiceProbability = struct {
     probability: f64,
 };
 
+/// Text or ordered user messages containing text and images. Named OpenAI and Jev deciders and constrained generators accept messages. Generated image decisions require a model that supports both images and constrained output; native, Gemini, and Vertex generators require inline images and automatic detail. Native trained and embedding deciders require text. At most 128 images and 1 MiB of serialized evidence per call. Jev requires inline PNG/JPEG data URLs and detail auto; OpenAI also accepts public HTTP(S) image URLs and WebP/GIF. Audio, files, tools, and non-user roles are unsupported.
+pub const DecisionEvidence = std.json.Value;
+
+pub const DecisionEvidenceImage = struct {
+    type: []const u8,
+    /// Base64 data URL (image/png, image/jpeg, image/webp, image/gif), or a public HTTP(S) URL for OpenAI. Antfly never fetches image URLs for decision adapters.
+    image_url: []const u8,
+    detail: ?[]const u8 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "type", "type", false },
+        .{ "image_url", "image_url", false },
+        .{ "detail", "detail", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("type");
+        try jw.write(self.type);
+        try jw.objectField("image_url");
+        try jw.write(self.image_url);
+        if (self.detail) |value| {
+            try jw.objectField("detail");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+pub const DecisionEvidenceMessage = struct {
+    type: ?[]const u8 = null,
+    role: []const u8,
+    content: std.json.Value,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "type", "type", true },
+        .{ "role", "role", false },
+        .{ "content", "content", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.type) |value| {
+            try jw.objectField("type");
+            try jw.write(value);
+        }
+        try jw.objectField("role");
+        try jw.write(self.role);
+        try jw.objectField("content");
+        try jw.write(self.content);
+        try jw.endObject();
+    }
+};
+
+pub const DecisionEvidenceText = struct {
+    type: []const u8,
+    text: []const u8,
+};
+
 pub const DecisionInput = struct {
     id: ?[]const u8 = null,
-    input: []const u8,
+    input: DecisionEvidence,
+    /// Index into request contexts. Requires context_version 1. Text expands to context, newline, then input. Message evidence gets a leading user message containing the context. The 1 MiB per-item and 16 MiB aggregate evidence limits apply after expansion. Native trained and embedding deciders require text. Generated deciders accept image evidence when the selected generator supports images and constrained output.
+    context_index: ?i64 = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
         .{ "id", "id", true },
         .{ "input", "input", false },
+        .{ "context_index", "context_index", true },
     };
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
@@ -608,6 +709,10 @@ pub const DecisionInput = struct {
         }
         try jw.objectField("input");
         try jw.write(self.input);
+        if (self.context_index) |value| {
+            try jw.objectField("context_index");
+            try jw.write(value);
+        }
         try jw.endObject();
     }
 };
@@ -699,6 +804,8 @@ pub const DecisionRequest = union(enum) {
             if (try parseStructuralVariant(GeneratedDecideRequest, allocator, source, options)) |parsed| return .{ .generated_decide_request = parsed };
         }
         if (objectHasAnyKey(source.object, &.{
+            "context_version",
+            "contexts",
             "model",
             "model_identity",
             "input",
@@ -1108,7 +1215,7 @@ pub const GeneratedDecideQuestion = union(enum) {
 pub const GeneratedDecideRequest = struct {
     decision_method: []const u8,
     generator: antfly_generating_openapi.GeneratorConfig,
-    input: ?[]const u8 = null,
+    input: ?DecisionEvidence = null,
     inputs: ?[]const DecisionInput = null,
     questions: []const GeneratedDecideQuestion,
     instructions: ?[]const u8 = null,

@@ -218,7 +218,34 @@ fn computeSingleAggregation(
     allow_algebraic: bool,
 ) anyerror!SearchAggregationResult {
     if (allow_algebraic) {
-        if (try computeAlgebraicAggregation(alloc, request, ctx)) |aggregation| return aggregation;
+        // Source-value aggregation semantics stay logical. Resolve a compatible
+        // typed/keyword representation only for the indexed execution attempt;
+        // a declined plan retains the original source path for fallback.
+        var indexed_request = request;
+        var owned_field: ?[]u8 = null;
+        defer if (owned_field) |field| alloc.free(field);
+        if (ctx.index_manager) |manager| if (manager.textIndexEntry(ctx.full_text_index_name)) |entry| {
+            entry.lockAnalysisShared();
+            defer entry.unlockAnalysisShared();
+            if (entry.runtime_schema) |schema| if (@import("../schema.zig").resolveLogicalDocValues(schema, request.field)) |resolved| {
+                if (!std.mem.eql(u8, resolved.field, request.field)) {
+                    owned_field = try alloc.dupe(u8, resolved.field);
+                    indexed_request.field = owned_field.?;
+                }
+            };
+        };
+        if (try computeAlgebraicAggregation(alloc, indexed_request, ctx)) |aggregation| {
+            var logical_result = aggregation;
+            if (logical_result.owns_labels) {
+                const logical_field = alloc.dupe(u8, request.field) catch |err| {
+                    logical_result.deinit(alloc);
+                    return err;
+                };
+                alloc.free(logical_result.field);
+                logical_result.field = logical_field;
+            } else logical_result.field = request.field;
+            return logical_result;
+        }
     }
     if (std.mem.eql(u8, request.type, "count")) {
         return .{

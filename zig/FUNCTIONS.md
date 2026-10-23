@@ -58,7 +58,7 @@ Decision binding also validates question names, choice IDs, ordered levels,
 provider capabilities, and configured limits before retrieval or model work.
 
 SQL already represents calls in `pkg/antfly/src/sql/ast.zig` and binds typed
-programs in `pkg/antfly/src/sql/scalar.zig`. Reuse those semantics where suitable,
+programs in `zig/pkg/antfly-embedded/src/sql/scalar.zig`. Reuse those semantics where suitable,
 while keeping shared expressions independent of SQL parsing. Existing local
 built-ins can migrate incrementally to descriptors.
 

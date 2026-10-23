@@ -42,16 +42,19 @@ installs:
 
 <DownloadLink version={ANTFLY_VERSION} baseUrl={RELEASES_BASE_URL} />
 
-For the Apache-2.0 embedded database and inference runtime, download the matching
-Embedded archive (for example, `antfly-embedded_{ANTFLY_VERSION}_Linux_x86_64_gnu.tar.gz`
-or `antfly-embedded_{ANTFLY_VERSION}_Darwin_arm64.tar.gz`). It contains
-`antfly-lite`, `antfly-inference`, `libantfly`, `include/antfly.h`, the private
-inference worker, runtime files, and license notices.
+The `antfly` runtime archive provides the CLI and native embedding library.
+Use `antfly lite` for local database files and `antfly inference` for models or
+the inference service.
 
-Run `./antfly-lite help` for database commands or `./antfly-inference --help`
-for inference commands. Python and npm bindings use the same native library and
-private worker without installing public CLI commands; Go and Rust consumers
-link the library from this archive or a local build.
+The separate `antfly-embedded` archive contains only `libantfly`,
+`include/antfly.h`, pkg-config metadata, runtime assets, and notices. It installs
+no executable. Python/npm embedded packages bundle the library; Go/Rust/C
+consumers can link it directly. See the [Lite guide](/docs/guides/lite) for source
+builds and bindings.
+
+Always select filenames listed in the chosen release's assets or
+`artifacts.json`. Earlier releases retain their immutable archive layouts;
+the library-only Embedded layout is identified by source build contract 6.
 
 <PlatformTabs defaultValue="macos-manual" macos="macos-manual" linux="linux" windows="windows">
   <TabsList>

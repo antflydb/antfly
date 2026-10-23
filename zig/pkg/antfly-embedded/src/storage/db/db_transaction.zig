@@ -18,6 +18,7 @@
 
 const db_zig = @import("db.zig");
 const DB = db_zig.DB;
+const IndexRepairSchedulerDirectory = db_zig.IndexRepairSchedulerDirectory;
 const TestDirectory = @import("../../common/test_directory.zig").TestDirectory;
 const builtin = @import("builtin");
 const change_journal_mod = @import("derived/change_journal.zig");
@@ -843,6 +844,11 @@ pub fn advanceIndexRepairIntentOwned(
     var effective_options = options;
     if (effective_options.capacity_source == null) effective_options.capacity_source = self.capacity_source;
 
+    if (effective_options.source_replay_only and !IndexRepairSchedulerDirectory.sourceRecoveryIntent(entry.intent)) {
+        result.deferred = true;
+        return result;
+    }
+
     if (entry.intent.root_generation != self.core.root_generation or
         entry.intent.group_id != self.localRepairGroupId())
     {
@@ -958,6 +964,13 @@ pub fn advanceIndexRepairIntentOwned(
         return result;
     }
 
+    if (effective_options.source_replay_only and entry.intent.source_replay_state == .pending and self.enrichment_runtime == null) {
+        // An unconstructed optional driver is not evidence that source
+        // discovery is complete. Retain its durable cursor for a live owner.
+        result.deferred = true;
+        return result;
+    }
+
     if (entry.intent.phase == .detected and entry.intent.source_replay_state == .pending) {
         // Managed DDL installs the generator for future writes under the
         // synchronous structural fence, but existing-row discovery belongs
@@ -978,7 +991,10 @@ pub fn advanceIndexRepairIntentOwned(
             true,
             entry.intent.source_replay_resume_key,
             128,
-            .{},
+            .{
+                .deadline_ns = if (effective_options.source_replay_only) self.graphReplacementWorkNow() +| 25 * std.time.ns_per_ms else null,
+                .min_records_before_deadline = if (effective_options.source_replay_only) 1 else 0,
+            },
         );
         defer page.deinit(alloc);
         try self.updateIndexRepairIntent(alloc, repair_id, .{
@@ -1076,6 +1092,14 @@ pub fn advanceIndexRepairIntentOwned(
         return result;
     }
 
+    if (effective_options.source_replay_only) {
+        if (try self.retireServiceableInitialBuild(alloc, repair_id, entry.intent)) {
+            result.attempted = true;
+            result.repaired = true;
+        } else result.deferred = true;
+        return result;
+    }
+
     // A managed admission can become queryable before its exact physical
     // cardinality is known. Publish that identity proof before either
     // queryability exit below: the snapshot is ordered with foreground
@@ -1117,16 +1141,7 @@ pub fn advanceIndexRepairIntentOwned(
     // runtime while this managed admission is already complete. Letting
     // unrelated producer work win here keeps a healthy durable intent at
     // the head of a one-slot repair queue forever.
-    if (try self.managedAdmissionGenerationIsServiceable(alloc, entry.intent)) {
-        try self.ensureManagedAdmissionCanonicalWorker(alloc, entry.intent);
-        if (entry.intent.kind == .full_text) {
-            const text = self.core.textIndexEntry(entry.intent.index_name) orelse return error.IndexNotFound;
-            try self.core.index_manager.rebuildState(.full_text, text.rebuild_root_path, text.config).clearWithIo(self.core.index_manager.checkpointIo());
-        }
-        if (entry.intent.candidate_relative_path != null) {
-            try self.discardInactiveIndexRepairCandidate(alloc, repair_id);
-        }
-        try self.removeIndexRepairIntentAndPin(alloc, repair_id);
+    if (try self.retireServiceableInitialBuild(alloc, repair_id, entry.intent)) {
         result.attempted = true;
         result.repaired = true;
         return result;

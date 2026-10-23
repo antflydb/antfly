@@ -119,6 +119,7 @@ fn prepare(cursor: *Cursor, handle: *h.Handle, table_name: []const u8, request_j
         .begin, .commit, .rollback, .savepoint, .rollback_to_savepoint, .release_savepoint => return error.UnsupportedSqlExecution,
         else => {},
     }
+    try api.requireEmbeddedSqlCatalogOwnership(handle, cursor.compiled.statement);
     if (session) |value| if (value.failed) return error.SqlTransactionAborted;
     cursor.adapter = .{ .transaction = session, .handle = handle, .db = &handle.db, .table_name = try a.dupe(u8, table_name), .read_only = !h.liteOpenModeCanWrite(handle.open_mode) or (if (session) |value| value.read_only else false) };
     return request;

@@ -28,7 +28,8 @@ class InferenceGenerateResponse:
         created (int): Unix timestamp (seconds) when the completion was created Example: 1704123456.
         model (str): Model used for generation
         choices (list[InferenceGenerateChoice]): List of completion choices (currently always 1)
-        usage (InferenceGenerateUsage):
+        usage (InferenceGenerateUsage | None | Unset): Provider-reported token usage, or null when the provider does not
+            supply it.
         speculation (InferenceGenerateSpeculationStatus | None | Unset):
     """
 
@@ -37,12 +38,13 @@ class InferenceGenerateResponse:
     created: int
     model: str
     choices: list[InferenceGenerateChoice]
-    usage: InferenceGenerateUsage
+    usage: InferenceGenerateUsage | None | Unset = UNSET
     speculation: InferenceGenerateSpeculationStatus | None | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         from ..models.inference_generate_speculation_status import InferenceGenerateSpeculationStatus
+        from ..models.inference_generate_usage import InferenceGenerateUsage
 
         id = self.id
 
@@ -57,7 +59,13 @@ class InferenceGenerateResponse:
             choices_item = choices_item_data.to_dict()
             choices.append(choices_item)
 
-        usage = self.usage.to_dict()
+        usage: dict[str, Any] | None | Unset
+        if isinstance(self.usage, Unset):
+            usage = UNSET
+        elif isinstance(self.usage, InferenceGenerateUsage):
+            usage = self.usage.to_dict()
+        else:
+            usage = self.usage
 
         speculation: dict[str, Any] | None | Unset
         if isinstance(self.speculation, Unset):
@@ -76,9 +84,10 @@ class InferenceGenerateResponse:
                 "created": created,
                 "model": model,
                 "choices": choices,
-                "usage": usage,
             }
         )
+        if usage is not UNSET:
+            field_dict["usage"] = usage
         if speculation is not UNSET:
             field_dict["speculation"] = speculation
 
@@ -106,7 +115,22 @@ class InferenceGenerateResponse:
 
             choices.append(choices_item)
 
-        usage = InferenceGenerateUsage.from_dict(d.pop("usage"))
+        def _parse_usage(data: object) -> InferenceGenerateUsage | None | Unset:
+            if data is None:
+                return data
+            if isinstance(data, Unset):
+                return data
+            try:
+                if not isinstance(data, dict):
+                    raise TypeError()
+                usage_type_1 = InferenceGenerateUsage.from_dict(data)
+
+                return usage_type_1
+            except (TypeError, ValueError, AttributeError, KeyError):
+                pass
+            return cast(InferenceGenerateUsage | None | Unset, data)
+
+        usage = _parse_usage(d.pop("usage", UNSET))
 
         def _parse_speculation(data: object) -> InferenceGenerateSpeculationStatus | None | Unset:
             if data is None:

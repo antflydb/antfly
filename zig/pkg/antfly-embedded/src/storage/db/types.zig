@@ -1049,6 +1049,8 @@ pub const TextMultiMatchField = struct {
 };
 
 pub const TextQuery = union(enum) {
+    value: @import("../../search/value_query.zig").Spec,
+    autocomplete: struct { field: []const u8, text: []const u8, boost: f32 = 1.0 },
     match_none: void,
     match_all: void,
     phrase: struct {
@@ -1175,6 +1177,14 @@ pub const TextQuery = union(enum) {
 
     pub fn deinit(self: *TextQuery, alloc: Allocator) void {
         switch (self.*) {
+            .value => |v| {
+                alloc.free(v.field);
+                alloc.free(v.text);
+            },
+            .autocomplete => |v| {
+                alloc.free(v.field);
+                alloc.free(v.text);
+            },
             .match_none, .match_all => {},
             .phrase => |phrase| {
                 alloc.free(phrase.field);
@@ -1887,12 +1897,23 @@ pub const NativeKeyPredicate = struct {
     }
 };
 
+/// Borrowed request-owned diagnostics. The callback crosses native runtime
+/// archives without depending on their independent thread-local bindings.
+/// Execution must finish before the request releases the callback context.
+pub const GraphQueryDiagnosticSink = struct {
+    ptr: *anyopaque,
+    record_fn: *const fn (*anyopaque, []const u8, []const u8, []const u8) void,
+};
+
 pub const SearchRequest = struct {
     pub fn hasHitEvaluation(self: @This()) bool {
         return self.evaluation_limit > 0 and !self.evaluation_graph;
     }
 
     /// Trusted request-local preparation, never decoded from public input.
+    value_search_execution: @import("../../search/value_query.zig").Policy = .{},
+    value_search_work: ?*@import("../../search/value_query.zig").Work = null,
+    value_search_scope: ?@import("../../search/value_membership.zig").Scope = null,
     native_text_tie_rank: ?@import("../../search/scorer.zig").TieRank = null,
     text_navigation_plan: ?*const @import("../../search/search.zig").TextNavigationPlan = null,
     text_pattern_programs: ?*@import("../../search/query.zig").PatternPrograms = null,
@@ -2049,6 +2070,8 @@ pub const SearchRequest = struct {
     /// never serialized to a shard worker; it resolves the target table to a
     /// trusted internal row predicate before owner-routed admission.
     graph_table_read_authorizer: ?GraphTableReadAuthorizer = null,
+    /// Local-only, never serialized to remote shard workers.
+    graph_query_diagnostic_sink: ?GraphQueryDiagnosticSink = null,
     identity_read_generation: ?u64 = null,
     execution_deadline_ns: ?u64 = null,
     /// Borrowed listener lifecycle signal. It is request-local and must never
@@ -2087,6 +2110,8 @@ const hierarchy_children_validated_fields = [_][]const u8{
 };
 
 const hierarchy_children_supported_internal_fields = [_][]const u8{
+    "value_search_work",
+    "value_search_scope",
     "document_authority_mode",
     "document_authority_group",
     "document_output_allocator",
@@ -2112,6 +2137,7 @@ const hierarchy_children_supported_internal_fields = [_][]const u8{
     "identity_read_generation",
     "execution_deadline_ns",
     "cancellation",
+    "graph_query_diagnostic_sink",
     "graph_execution_limits",
     "graph_physical_scan_observation",
     "graph_owning_table",
@@ -2120,6 +2146,7 @@ const hierarchy_children_supported_internal_fields = [_][]const u8{
 };
 
 const hierarchy_children_rejected_fields = [_][]const u8{
+    "value_search_execution",
     "evaluation_json",
     "evaluation_limit",
     "evaluation_matches",
@@ -2960,6 +2987,7 @@ pub const ShardIdentityReadGeneration = struct {
 };
 
 pub const SearchResult = struct {
+    value_search_profile_json: ?[]u8 = null,
     /// Only private hydration results may split body ownership from metadata.
     /// Move bodies into the destination before retiring worker scratch.
     stored_data_allocator: ?Allocator = null,
@@ -3009,6 +3037,7 @@ pub const SearchResult = struct {
     }
 
     pub fn deinit(self: *SearchResult) void {
+        if (self.value_search_profile_json) |json| self.alloc.free(json);
         if (self.sort_profile_storage) |storage| self.alloc.free(storage);
         for (self.hits) |*hit| {
             if (self.stored_data_allocator) |body_allocator| {
@@ -4171,6 +4200,10 @@ pub const RepairCapacityCheck = struct {
 };
 
 pub const ArtifactRepairRunOptions = struct {
+    /// Lite's live coordinator may enqueue a bounded source page or retire a
+    /// proven canonical initial build. It must never construct/activate a
+    /// shadow while holding the short connection publication fence.
+    source_replay_only: bool = false,
     /// Absolute local catalog-admission deadline in the source routing clock.
     /// Background admission must not consume the quantum waiting for metadata.
     admission_deadline_ns: ?u64 = null,

@@ -8,8 +8,6 @@ GO := GOWORK=off GOEXPERIMENT=simd go
 GO_MODULES := \
 	./go/pkg/embedded \
 	./go/pkg/sdk \
-	./go/pkg/proxy \
-	./go/pkg/operator \
 	./go/pkg/docsaf \
 	./go/pkg/evalaf \
 	./go/pkg/evalaf/plugins/antfly \
@@ -177,24 +175,6 @@ minikube-status: ## Show Minikube pods, services, and StatefulSets.
 	kubectl --context=minikube get pods,services,statefulsets -l app=antfly
 
 minikube-restart: minikube-delete minikube-start ## Delete and recreate Minikube.
-
-# ====================================================================================
-# Operator
-# ====================================================================================
-
-.PHONY: operator-build operator-test operator-docker-build operator-lint
-
-operator-build: ## Build the antfly-operator binary.
-	(cd ./go/pkg/operator && $(MAKE) build)
-
-operator-test: ## Run antfly-operator tests.
-	(cd ./go/pkg/operator && $(MAKE) test)
-
-operator-lint: ## Run linter on antfly-operator.
-	(cd ./go/pkg/operator && $(MAKE) lint)
-
-operator-docker-build: ## Build the antfly-operator Docker image.
-	docker build -t antfly-operator:latest -f ./go/pkg/operator/Dockerfile .
 
 # ====================================================================================
 # SQL Extraction Audits (intentionally outside default build/test gates)

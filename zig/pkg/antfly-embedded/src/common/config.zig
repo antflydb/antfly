@@ -44,6 +44,8 @@ pub const default_mcp_max_tool_result_bytes: u32 = 96 * 1024;
 pub const minimum_mcp_max_tool_result_bytes: u32 = 512;
 pub const default_backup_operation_timeout_ms: u64 = 60 * 60 * 1_000;
 pub const max_backup_operation_timeout_ms: u64 = 24 * 60 * 60 * 1_000;
+pub const default_inference_connection_id = "default-inference";
+pub const named_inference_connection_id = "named-inference";
 pub const local_inference_connection_id = "local-inference";
 
 pub const DeploymentMode = enum {
@@ -66,6 +68,7 @@ pub const Config = struct {
     transcribers: transcribing.Registry,
     readers: readers.Registry,
     text_to_speech: synthesizing.Registry,
+    public_inference: PublicInferenceConfig = .{},
     auth_enabled: bool = false,
     deployment_mode: DeploymentMode = .distributed,
     health_enabled: bool = true,
@@ -89,6 +92,10 @@ pub const Config = struct {
     connections: ConnectionsConfig = .{},
     connectors: ConnectorsConfig = .{},
     shard_allocation: ShardAllocationConfig = .{},
+
+    pub const PublicInferenceConfig = struct {
+        enabled: bool = false,
+    };
 
     pub const RequestAdmissionConfig = struct {
         /// Zero disables this foreground admission class. Transport safeguards
@@ -570,6 +577,7 @@ pub const Config = struct {
         project_id: ?[]u8 = null,
         location: ?[]u8 = null,
         credentials_path: ?[]u8 = null,
+        max_image_input_tokens: ?u64 = null,
         names: []const []u8 = &.{},
         configured_model_types: []const []u8 = &.{},
 
@@ -790,6 +798,11 @@ pub const Config = struct {
             .object => |object| object,
             else => return error.InvalidConfig,
         };
+        if (root.contains("public_inference")) try validateObjectMemberFields(root, "public_inference", &.{"enabled"});
+        const public_inference_enabled = if (root.get("public_inference")) |policy|
+            try optionalBoolField(policy.object, "enabled") orelse false
+        else
+            false;
         var canonical_inference_max_concurrent_requests: ?u32 = null;
         if (root.get("admission")) |admission_value| {
             try validateObjectMemberFields(root, "admission", &.{ "query", "write", "inference" });
@@ -887,6 +900,25 @@ pub const Config = struct {
 
         var registry = try provider_registry.Registry.parseFromValue(alloc, raw_tree.value);
         errdefer registry.deinit();
+        inline for (.{ .{ "extractor_configs", "models.extract" }, .{ "rewriter_configs", "models.rewrite" }, .{ "predictor_configs", "models.predict" } }) |binding_kind| {
+            for (@field(registry, binding_kind[0]).values()) |binding| {
+                if (std.mem.eql(u8, binding.connection, local_inference_connection_id)) continue;
+                if (std.mem.eql(u8, binding.connection, default_inference_connection_id)) {
+                    const inference = root.get("inference") orelse return error.InvalidConfig;
+                    if (inference != .object or inference.object.get("api_url") == null) return error.InvalidConfig;
+                    continue;
+                }
+                const connection = connections.get(binding.connection) orelse return error.InvalidConfig;
+                if (connection.kind != .inference) return error.InvalidConfig;
+                const configured = connection.inference orelse return error.InvalidConfig;
+                if (!std.mem.eql(u8, configured.provider, "antfly")) return error.InvalidConfig;
+                var qualified = false;
+                for (connection.capabilities) |capability| {
+                    if (std.mem.eql(u8, capability, binding_kind[1])) qualified = true;
+                }
+                if (!qualified) return error.InvalidConfig;
+            }
+        }
         var transcribers = if (root.get("transcribers")) |transcribers_value|
             try transcribing.Registry.parseFromValue(alloc, transcribers_value)
         else
@@ -943,6 +975,7 @@ pub const Config = struct {
             .transcribers = transcribers,
             .readers = reader_registry,
             .text_to_speech = text_to_speech,
+            .public_inference = .{ .enabled = public_inference_enabled },
             .auth_enabled = try optionalBoolField(root, "enable_auth") orelse false,
             .deployment_mode = deployment_mode,
             .health_enabled = try optionalBoolField(root, "health_enabled") orelse true,
@@ -1902,7 +1935,7 @@ fn parseConnectionsConfig(alloc: std.mem.Allocator, maybe_value: ?std.json.Value
 
     var it = value.object.iterator();
     while (it.next()) |entry| {
-        if (std.mem.eql(u8, entry.key_ptr.*, local_inference_connection_id)) return error.InvalidConfig;
+        if (std.mem.eql(u8, entry.key_ptr.*, local_inference_connection_id) or std.mem.eql(u8, entry.key_ptr.*, default_inference_connection_id) or std.mem.eql(u8, entry.key_ptr.*, named_inference_connection_id)) return error.InvalidConfig;
         const id = try alloc.dupe(u8, entry.key_ptr.*);
         errdefer alloc.free(id);
         var connection = try parseConnectionConfig(alloc, entry.value_ptr.*);
@@ -2056,8 +2089,11 @@ fn parseConnectionConfig(alloc: std.mem.Allocator, value: std.json.Value) !Confi
 
 fn parseInferenceConnectionConfig(alloc: std.mem.Allocator, value: std.json.Value) !Config.InferenceConnectionConfig {
     if (value != .object) return error.InvalidConfig;
-    if (!objectContainsOnly(value.object, &.{ "provider", "url", "api_key", "region", "project_id", "location", "credentials_path", "names", "configured_model_types" })) return error.InvalidConfig;
+    if (!objectContainsOnly(value.object, &.{ "provider", "url", "api_key", "region", "project_id", "location", "credentials_path", "names", "configured_model_types", "max_image_input_tokens" })) return error.InvalidConfig;
+    const image_tokens = try optionalU64Field(value.object, "max_image_input_tokens");
+    if (image_tokens == 0) return error.InvalidConfig;
     return .{
+        .max_image_input_tokens = image_tokens,
         .provider = try requiredStringFieldDup(alloc, value.object, "provider"),
         .url = try optionalStringFieldDup(alloc, value.object, "url"),
         .api_key = try optionalStringFieldDup(alloc, value.object, "api_key"),
@@ -3997,4 +4033,38 @@ test "external lake cursor retention and capacity policy reject unbounded admiss
         "{\"lake_indexes\":{\"query_cursors\":{\"max_native_cuts\":0}}}",
         "{\"lake_indexes\":{\"query_cursors\":{\"max_native_retained_bytes\":0}}}",
     }) |bytes| try std.testing.expectError(error.InvalidConfig, Config.parseFromSlice(a, bytes));
+}
+
+test "provider registry gateway public inference policy defaults off and requires explicit opt-in" {
+    const a = std.testing.allocator;
+    for ([_][]const u8{ "{}", "{\"public_inference\":{}}", "{\"public_inference\":{\"enabled\":false}}" }) |body| {
+        var config = try Config.parseFromSlice(a, body);
+        defer config.deinit();
+        try std.testing.expect(!config.public_inference.enabled);
+    }
+    var config = try Config.parseFromSlice(a, "{\"public_inference\":{\"enabled\":true}}");
+    defer config.deinit();
+    try std.testing.expect(config.public_inference.enabled);
+    for ([_][]const u8{
+        "{\"public_inference\":false}",
+        "{\"public_inference\":{\"enabled\":\"false\"}}",
+        "{\"public_inference\":{\"enable\":false}}",
+    }) |invalid| try std.testing.expectError(error.InvalidConfig, Config.parseFromSlice(a, invalid));
+}
+
+test "provider registry gateway connection image token bounds are positive and optional" {
+    const a = std.testing.allocator;
+    for ([_][]const u8{ ",\"max_image_input_tokens\":8192", "" }) |bound| {
+        const input = try std.fmt.allocPrint(a, "{{\"connections\":{{\"vendor\":{{\"kind\":\"inference\",\"capabilities\":[\"models.decide\"],\"inference\":{{\"provider\":\"openai\"{s}}}}}}}}}", .{bound});
+        defer a.free(input);
+        var config = try Config.parseFromSlice(a, input);
+        defer config.deinit();
+        const actual = config.connections.get("vendor").?.inference.?.max_image_input_tokens;
+        try std.testing.expectEqual(if (bound.len == 0) @as(?u64, null) else @as(?u64, 8192), actual);
+    }
+    for ([_][]const u8{ "0", "-1", "\"8192\"" }) |bound| {
+        const input = try std.fmt.allocPrint(a, "{{\"connections\":{{\"vendor\":{{\"kind\":\"inference\",\"capabilities\":[\"models.decide\"],\"inference\":{{\"provider\":\"openai\",\"max_image_input_tokens\":{s}}}}}}}}}", .{bound});
+        defer a.free(input);
+        try std.testing.expectError(error.InvalidConfig, Config.parseFromSlice(a, input));
+    }
 }

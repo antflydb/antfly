@@ -1,17 +1,17 @@
 # Copyright 2026 Antfly, Inc.
-# SPDX-License-Identifier: Elastic-2.0
+# SPDX-License-Identifier: Apache-2.0
 #
-# Licensed under the Elastic License 2.0 (ELv2); you may not use this file
-# except in compliance with the Elastic License 2.0. You may obtain a copy of
-# the Elastic License 2.0 at
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
 #
-#     https://www.antfly.io/licensing/ELv2-license
+#     http://www.apache.org/licenses/LICENSE-2.0
 #
-# Unless required by applicable law or agreed to in writing, software distributed
-# under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
-# WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
-# Elastic License 2.0 for the specific language governing permissions and
-# limitations.
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 """Shared fixtures for antfly-zig E2E tests.
 
@@ -905,6 +905,7 @@ def _write_remote_content_e2e_config(
         json.dumps(
             {
                 "remote_content": {"security": {"block_private_ips": False}},
+                "public_inference": {"enabled": True},
                 **(
                     {
                         "pgwire": {
@@ -2337,11 +2338,19 @@ class PacingSensitiveOpenAiEmbeddingServer:
 
 
 class InferenceEmbeddingServer:
-    def __init__(self, host: str = "127.0.0.1", response_delay_s: float = 0.0):
+    def __init__(
+        self,
+        host: str = "127.0.0.1",
+        response_delay_s: float | None = 0.0,
+        model_identity: str | int | None = None,
+    ):
         port = find_free_port()
         self.base_url = f"http://{host}:{port}"
         self.url = inference_public_api_url(self.base_url)
         self.response_delay_s = response_delay_s
+        self.model_identity = model_identity
+        self.received_model_identities: list[str | None] = []
+        self.received_corpus_model_identities: list[str | None] = []
         self._embedding_request_active = threading.Event()
         self._delay_enabled = threading.Event()
         self._delay_released = threading.Event()
@@ -2422,6 +2431,17 @@ class InferenceEmbeddingServer:
                     f"{INFERENCE_PUBLIC_API_ROOT}/embed",
                     f"{INFERENCE_PUBLIC_API_ROOT}/embeddings",
                 ):
+                    outer.received_model_identities.append(
+                        payload.get("model_identity")
+                    )
+                    if (
+                        outer.model_identity is not None
+                        and self.headers.get("Accept") != "application/json"
+                    ):
+                        self.send_error(
+                            400, "pinned embeddings require identity-bearing JSON"
+                        )
+                        return
                     # Match the inference API's optional, non-nullable strings.
                     # Permissive fixtures previously hid invalid database requests.
                     for field in ("task_type", "instruction"):
@@ -2433,6 +2453,10 @@ class InferenceEmbeddingServer:
                         "antfly embedding dimension probe"
                         in json.dumps(payload.get("input", ""))
                     )
+                    if not is_dimension_probe:
+                        outer.received_corpus_model_identities.append(
+                            payload.get("model_identity")
+                        )
                     with outer._transient_embedding_lock:
                         transient = (
                             outer._transient_embedding_model is not None
@@ -2514,6 +2538,11 @@ class InferenceEmbeddingServer:
                             "object": "list",
                             "data": data,
                             "model": model or "antfly-embed-v1",
+                            **(
+                                {"model_identity": outer.model_identity}
+                                if outer.model_identity is not None
+                                else {}
+                            ),
                             "usage": {
                                 "prompt_tokens": max(1, len(values)),
                                 "total_tokens": max(1, len(values)),

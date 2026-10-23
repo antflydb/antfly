@@ -6,12 +6,15 @@ on the standalone server. The authoritative schemas live in
 [`docs/guides/decisions.md`](../docs/guides/decisions.md) documents requests,
 responses, provider configuration and examples.
 
-The public contract uses text `input`, named question and answer arrays,
+The public contract uses `input`, named question and answer arrays,
 `choice` questions with `choices`, `score` questions with ordered `levels`, and
 `predicate` answers with `probability`. Choice values are strings, every
 question has a unique name, and scores are expected zero-based ordinal indices.
-These conventions align with OpenAI Decisions. Antfly supports a text subset
-and adds embedding similarity, multi-choice set selection and text batches.
+These conventions align with OpenAI Decisions. Supported hosted providers accept
+multimodal evidence under the [gateway decision contract](../docs/reference/inference-gateway.md#public-contracts).
+Native trained/embedding decisions and browser execution retain their text
+restrictions. Antfly also adds embedding similarity, multi-choice set selection
+and text batches.
 
 ## Execution and presentation
 

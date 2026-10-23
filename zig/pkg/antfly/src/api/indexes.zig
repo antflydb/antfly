@@ -1,17 +1,17 @@
 // Copyright 2026 Antfly, Inc.
-// SPDX-License-Identifier: Elastic-2.0
+// SPDX-License-Identifier: Apache-2.0
 //
-// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
-// except in compliance with the Elastic License 2.0. You may obtain a copy of
-// the Elastic License 2.0 at
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-//     https://www.antfly.io/licensing/ELv2-license
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// Unless required by applicable law or agreed to in writing, software distributed
-// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
-// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
-// Elastic License 2.0 for the specific language governing permissions and
-// limitations.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 const std = @import("std");
 const ant_json = @import("antfly-json");
@@ -81,7 +81,7 @@ pub fn addIndexToTableIndexesJsonWithIo(
     index_name: []const u8,
     index_json: []const u8,
 ) ![]u8 {
-    if ((std.mem.eql(u8, index_name, "_resolver_curation") or std.mem.eql(u8, index_name, "_resolver_namespaces"))) return error.InvalidCreateIndexRequest;
+    if (@import("antfly_local_sources").api_index_metadata.isOpaqueEntry(index_name)) return error.InvalidCreateIndexRequest;
     var current = try std.json.parseFromSlice(std.json.Value, alloc, current_indexes_json, .{});
     defer current.deinit();
     var config = try std.json.parseFromSlice(std.json.Value, alloc, index_json, .{});
@@ -195,7 +195,7 @@ pub fn removeIndexFromTableIndexesJson(
     current_indexes_json: []const u8,
     index_name: []const u8,
 ) !?[]u8 {
-    if ((std.mem.eql(u8, index_name, "_resolver_curation") or std.mem.eql(u8, index_name, "_resolver_namespaces"))) return error.ExtensionOwnedObject;
+    if (@import("antfly_local_sources").api_index_metadata.isOpaqueEntry(index_name)) return error.ExtensionOwnedObject;
     var current = try std.json.parseFromSlice(std.json.Value, alloc, current_indexes_json, .{});
     defer current.deinit();
 
@@ -7357,7 +7357,7 @@ fn consumerTests() type {
             );
             try ant_json.testing.expectSubsetJsonText(
                 std.testing.allocator,
-                "{\"searchable_vectors\":2176,\"publication\":{\"target_vectors\":2500,\"searchable_vectors\":2176,\"complete\":false},\"milestones\":{\"complete\":{\"reached\":false,\"blockers\":[\"publication\"]}},\"readiness\":{\"queryable\":true,\"complete\":false,\"pending_reasons\":[\"publication\"]}}",
+                "{\"searchable_vectors\":2176,\"publication\":{\"target_vectors\":2500,\"searchable_vectors\":2176,\"complete\":false},\"milestones\":{\"complete\":{\"reached\":false,\"blockers\":[\"publication\"]}},\"readiness\":{\"queryable\":true,\"complete\":false,\"pending_reasons\":[\"backfill\",\"publication\"]}}",
                 pending.items,
             );
 
@@ -8079,7 +8079,7 @@ fn consumerTests() type {
 
         test "index metadata closes neighbor context graph index references at admission" {
             const conceptualizer =
-                \\{"name":"conceptualize_v1","kind":"asset","field":"name","producer_json":"{\"type\":\"generator\",\"config\":{\"provider\":\"antfly\"}}","neighbor_context":{"graph_index":"taxonomy","edge_types":["started_by"],"direction":"out","limit":8}}
+                \\{"name":"conceptualize_v1","kind":"asset","field":"name","producer_json":"{\"type\":\"generator\",\"config\":{\"provider\":\"antfly\",\"model\":\"fixture\"}}","neighbor_context":{"graph_index":"taxonomy","edge_types":["started_by"],"direction":"out","limit":8}}
             ;
             // The referenced graph index exists on the same table: admitted.
             const valid = try std.fmt.allocPrint(

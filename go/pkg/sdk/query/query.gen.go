@@ -86,6 +86,17 @@ func (e MultiMatchBodyType) Valid() bool {
 	}
 }
 
+// AutocompleteQuery Analyzed bool-prefix search on a logical field. The planner selects
+// declared search-as-you-type root, shingle and prefix representations.
+// Requires a compatible representation; never silently becomes raw prefix search.
+type AutocompleteQuery struct {
+	Autocomplete string `json:"autocomplete"`
+
+	// Boost A floating-point number used to decrease or increase the relevance scores of a query.
+	Boost Boost  `json:"boost,omitempty,omitzero"`
+	Field string `json:"field"`
+}
+
 // BoolFieldQuery defines model for BoolFieldQuery.
 type BoolFieldQuery struct {
 	Bool bool `json:"bool"`
@@ -94,6 +105,32 @@ type BoolFieldQuery struct {
 	Boost Boost  `json:"boost,omitempty,omitzero"`
 	Field string `json:"field,omitempty,omitzero"`
 }
+
+// BoolQuery Canonical Boolean wrapper. Must clauses score; filter clauses constrain without scoring.
+type BoolQuery struct {
+	Bool BoolQueryBody `json:"bool"`
+}
+
+// BoolQueryBody defines model for BoolQueryBody.
+type BoolQueryBody struct {
+	// Boost A floating-point number used to decrease or increase the relevance scores of a query.
+	Boost  Boost           `json:"boost,omitempty,omitzero"`
+	Filter BoolQueryClause `json:"filter,omitempty,omitzero"`
+
+	// MinimumShouldMatch Minimum optional clauses required; omission follows the runtime's required-clause defaults.
+	MinimumShouldMatch uint32          `json:"minimum_should_match,omitempty,omitzero"`
+	Must               BoolQueryClause `json:"must,omitempty,omitzero"`
+	MustNot            BoolQueryClause `json:"must_not,omitempty,omitzero"`
+	Should             BoolQueryClause `json:"should,omitempty,omitzero"`
+}
+
+// BoolQueryClause defines model for BoolQueryClause.
+type BoolQueryClause struct {
+	union json.RawMessage
+}
+
+// BoolQueryClause1 defines model for BoolQueryClause.1.
+type BoolQueryClause1 = []Query
 
 // BooleanQuery defines model for BooleanQuery.
 type BooleanQuery struct {
@@ -113,6 +150,22 @@ type ConjunctionQuery struct {
 	// Boost A floating-point number used to decrease or increase the relevance scores of a query.
 	Boost     Boost   `json:"boost,omitempty,omitzero"`
 	Conjuncts []Query `json:"conjuncts"`
+}
+
+// ContainsQuery Contiguous substring search on the original logical field value, including whitespace and punctuation.
+// No normalization is applied. Case-sensitive by default; case_sensitive=false
+// uses Unicode simple case folding, not locale-specific or multi-character folding.
+// Missing, null, and non-string values do not match. Arrays use any-element
+// semantics; a match never spans array elements. Indexes select conservative
+// candidates and original values are verified before counting and pagination.
+type ContainsQuery struct {
+	// Boost A floating-point number used to decrease or increase the relevance scores of a query.
+	Boost         Boost  `json:"boost,omitempty,omitzero"`
+	CaseSensitive *bool  `json:"case_sensitive,omitempty"`
+	Contains      string `json:"contains"`
+
+	// Field Logical source field path, not a companion index name.
+	Field string `json:"field"`
 }
 
 // DateRangeStringQuery defines model for DateRangeStringQuery.
@@ -142,6 +195,22 @@ type DocIdQuery struct {
 	// Boost A floating-point number used to decrease or increase the relevance scores of a query.
 	Boost Boost    `json:"boost,omitempty,omitzero"`
 	Ids   []string `json:"ids"`
+}
+
+// EqualsQuery Whole string equality on the original logical field value.
+// No normalization is applied. Case-sensitive by default; case_sensitive=false
+// uses Unicode simple case folding, not locale-specific or multi-character folding.
+// Missing, null, and non-string values do not match. Arrays use any-element
+// semantics; a match never spans array elements. Indexes select conservative
+// candidates and original values are verified before counting and pagination.
+type EqualsQuery struct {
+	// Boost A floating-point number used to decrease or increase the relevance scores of a query.
+	Boost         Boost  `json:"boost,omitempty,omitzero"`
+	CaseSensitive *bool  `json:"case_sensitive,omitempty"`
+	Equals        string `json:"equals"`
+
+	// Field Logical source field path, not a companion index name.
+	Field string `json:"field"`
 }
 
 // Fuzziness The fuzziness of the query. Can be an integer or "auto".
@@ -294,6 +363,22 @@ type MatchQuery struct {
 	Match string `json:"match"`
 }
 
+// MatchesQuery Unanchored native Unicode regular expression search on the original logical field value. Anchors refer to each complete value; indexed-term regexp semantics are unchanged.
+// No normalization is applied. Case-sensitive by default; case_sensitive=false
+// uses Unicode simple case folding, not locale-specific or multi-character folding.
+// Missing, null, and non-string values do not match. Arrays use any-element
+// semantics; a match never spans array elements. Indexes select conservative
+// candidates and original values are verified before counting and pagination.
+type MatchesQuery struct {
+	// Boost A floating-point number used to decrease or increase the relevance scores of a query.
+	Boost         Boost `json:"boost,omitempty,omitzero"`
+	CaseSensitive *bool `json:"case_sensitive,omitempty"`
+
+	// Field Logical source field path, not a companion index name.
+	Field   string `json:"field"`
+	Matches string `json:"matches"`
+}
+
 // MultiMatchBody defines model for MultiMatchBody.
 type MultiMatchBody struct {
 	// Boost A floating-point number used to decrease or increase the relevance scores of a query.
@@ -401,6 +486,68 @@ type WildcardQuery struct {
 	Wildcard string `json:"wildcard"`
 }
 
+// AsQuery returns the union data inside the BoolQueryClause as a Query
+func (t BoolQueryClause) AsQuery() (Query, error) {
+	var body Query
+	err := json.Unmarshal(t.union, &body)
+	return body, err
+}
+
+// FromQuery overwrites any union data inside the BoolQueryClause as the provided Query
+func (t *BoolQueryClause) FromQuery(v Query) error {
+	b, err := json.Marshal(v)
+	t.union = b
+	return err
+}
+
+// MergeQuery performs a merge with any union data inside the BoolQueryClause, using the provided Query
+func (t *BoolQueryClause) MergeQuery(v Query) error {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
+
+	merged, err := runtime.JSONMerge(t.union, b)
+	t.union = merged
+	return err
+}
+
+// AsBoolQueryClause1 returns the union data inside the BoolQueryClause as a BoolQueryClause1
+func (t BoolQueryClause) AsBoolQueryClause1() (BoolQueryClause1, error) {
+	var body BoolQueryClause1
+	err := json.Unmarshal(t.union, &body)
+	return body, err
+}
+
+// FromBoolQueryClause1 overwrites any union data inside the BoolQueryClause as the provided BoolQueryClause1
+func (t *BoolQueryClause) FromBoolQueryClause1(v BoolQueryClause1) error {
+	b, err := json.Marshal(v)
+	t.union = b
+	return err
+}
+
+// MergeBoolQueryClause1 performs a merge with any union data inside the BoolQueryClause, using the provided BoolQueryClause1
+func (t *BoolQueryClause) MergeBoolQueryClause1(v BoolQueryClause1) error {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
+
+	merged, err := runtime.JSONMerge(t.union, b)
+	t.union = merged
+	return err
+}
+
+func (t BoolQueryClause) MarshalJSON() ([]byte, error) {
+	b, err := t.union.MarshalJSON()
+	return b, err
+}
+
+func (t *BoolQueryClause) UnmarshalJSON(b []byte) error {
+	err := t.union.UnmarshalJSON(b)
+	return err
+}
+
 // AsFuzziness0 returns the union data inside the Fuzziness as a Fuzziness0
 func (t Fuzziness) AsFuzziness0() (Fuzziness0, error) {
 	var body Fuzziness0
@@ -460,6 +607,110 @@ func (t Fuzziness) MarshalJSON() ([]byte, error) {
 
 func (t *Fuzziness) UnmarshalJSON(b []byte) error {
 	err := t.union.UnmarshalJSON(b)
+	return err
+}
+
+// AsEqualsQuery returns the union data inside the Query as a EqualsQuery
+func (t Query) AsEqualsQuery() (EqualsQuery, error) {
+	var body EqualsQuery
+	err := json.Unmarshal(t.union, &body)
+	return body, err
+}
+
+// FromEqualsQuery overwrites any union data inside the Query as the provided EqualsQuery
+func (t *Query) FromEqualsQuery(v EqualsQuery) error {
+	b, err := json.Marshal(v)
+	t.union = b
+	return err
+}
+
+// MergeEqualsQuery performs a merge with any union data inside the Query, using the provided EqualsQuery
+func (t *Query) MergeEqualsQuery(v EqualsQuery) error {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
+
+	merged, err := runtime.JSONMerge(t.union, b)
+	t.union = merged
+	return err
+}
+
+// AsContainsQuery returns the union data inside the Query as a ContainsQuery
+func (t Query) AsContainsQuery() (ContainsQuery, error) {
+	var body ContainsQuery
+	err := json.Unmarshal(t.union, &body)
+	return body, err
+}
+
+// FromContainsQuery overwrites any union data inside the Query as the provided ContainsQuery
+func (t *Query) FromContainsQuery(v ContainsQuery) error {
+	b, err := json.Marshal(v)
+	t.union = b
+	return err
+}
+
+// MergeContainsQuery performs a merge with any union data inside the Query, using the provided ContainsQuery
+func (t *Query) MergeContainsQuery(v ContainsQuery) error {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
+
+	merged, err := runtime.JSONMerge(t.union, b)
+	t.union = merged
+	return err
+}
+
+// AsMatchesQuery returns the union data inside the Query as a MatchesQuery
+func (t Query) AsMatchesQuery() (MatchesQuery, error) {
+	var body MatchesQuery
+	err := json.Unmarshal(t.union, &body)
+	return body, err
+}
+
+// FromMatchesQuery overwrites any union data inside the Query as the provided MatchesQuery
+func (t *Query) FromMatchesQuery(v MatchesQuery) error {
+	b, err := json.Marshal(v)
+	t.union = b
+	return err
+}
+
+// MergeMatchesQuery performs a merge with any union data inside the Query, using the provided MatchesQuery
+func (t *Query) MergeMatchesQuery(v MatchesQuery) error {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
+
+	merged, err := runtime.JSONMerge(t.union, b)
+	t.union = merged
+	return err
+}
+
+// AsAutocompleteQuery returns the union data inside the Query as a AutocompleteQuery
+func (t Query) AsAutocompleteQuery() (AutocompleteQuery, error) {
+	var body AutocompleteQuery
+	err := json.Unmarshal(t.union, &body)
+	return body, err
+}
+
+// FromAutocompleteQuery overwrites any union data inside the Query as the provided AutocompleteQuery
+func (t *Query) FromAutocompleteQuery(v AutocompleteQuery) error {
+	b, err := json.Marshal(v)
+	t.union = b
+	return err
+}
+
+// MergeAutocompleteQuery performs a merge with any union data inside the Query, using the provided AutocompleteQuery
+func (t *Query) MergeAutocompleteQuery(v AutocompleteQuery) error {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
+
+	merged, err := runtime.JSONMerge(t.union, b)
+	t.union = merged
 	return err
 }
 
@@ -817,6 +1068,32 @@ func (t *Query) FromDateRangeStringQuery(v DateRangeStringQuery) error {
 
 // MergeDateRangeStringQuery performs a merge with any union data inside the Query, using the provided DateRangeStringQuery
 func (t *Query) MergeDateRangeStringQuery(v DateRangeStringQuery) error {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
+
+	merged, err := runtime.JSONMerge(t.union, b)
+	t.union = merged
+	return err
+}
+
+// AsBoolQuery returns the union data inside the Query as a BoolQuery
+func (t Query) AsBoolQuery() (BoolQuery, error) {
+	var body BoolQuery
+	err := json.Unmarshal(t.union, &body)
+	return body, err
+}
+
+// FromBoolQuery overwrites any union data inside the Query as the provided BoolQuery
+func (t *Query) FromBoolQuery(v BoolQuery) error {
+	b, err := json.Marshal(v)
+	t.union = b
+	return err
+}
+
+// MergeBoolQuery performs a merge with any union data inside the Query, using the provided BoolQuery
+func (t *Query) MergeBoolQuery(v BoolQuery) error {
 	b, err := json.Marshal(v)
 	if err != nil {
 		return err
@@ -1274,45 +1551,58 @@ type ClientWithResponsesInterface interface {
 // const string: with thousands of chunks the chained `+` fold is several
 // times slower for the Go compiler than parsing a slice literal.
 var swaggerSpec = []string{
-	"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",
+	"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",
 }
 
 // decodeSpec returns the embedded OpenAPI spec as raw JSON bytes,

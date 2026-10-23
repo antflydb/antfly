@@ -1798,6 +1798,9 @@ pub fn preflightArtifactAdmission(self: *DB, req: types.BatchRequest, entry: any
     try self.lockApplyForPortableRuntime();
     defer self.core.unlockApply();
     if (self.local_execution.row_policy_gate.currentPhase() != .disabled) return error.RowPolicyTopologyUnsupported;
+    // Reject before staging the durable intent. The catalog materializer
+    // cannot change configuration while source ownership is migrating.
+    try self.enforceVectorMigrationConfigurationGate();
     var txn = try self.core.store.beginWriteTxn();
     var preflight_open = true;
     defer if (preflight_open) txn.abort();
@@ -5641,6 +5644,9 @@ test "db ordered artifact inventory producer dispatch is durable and never compl
     for (0..2) |pass| {
         var db = try DB.open(alloc, path, options);
         defer db.close();
+        // Keep the consumer paused so the wakeup can be inspected without
+        // another write or a polling worker concealing a lost notification.
+        try db.reconfigureEnrichmentRuntimePaused(.{ .enable_without_producers = true });
         if (pass == 0) {
             try db.setSchemaJson(alloc, "{}");
             try db.addEnrichment(.{ .name = "extraction", .kind = .asset, .field = "body", .content_type = "application/json" });
@@ -5703,6 +5709,7 @@ test "db ordered artifact inventory producer dispatch is durable and never compl
             expected_sequence = db.core.store.lastReplaySequence(0);
             expected_dispatch_sequence = expected_sequence;
             try std.testing.expect(expected_sequence > before);
+            try std.testing.expectEqual(expected_sequence, db.enrichment_runtime.?.stats().target_sequence);
         }
         _ = try db.advanceArtifactProducerWorkPage();
         try std.testing.expectEqual(expected_sequence, db.core.store.lastReplaySequence(0));
@@ -5728,6 +5735,7 @@ test "db ordered artifact inventory producer dispatch is durable and never compl
             try std.testing.expect(try db.advanceArtifactProducerWorkPage());
             const retried_sequence = db.core.store.lastReplaySequence(0);
             try std.testing.expect(retried_sequence > expected_sequence);
+            try std.testing.expectEqual(retried_sequence, db.enrichment_runtime.?.stats().target_sequence);
             expected_sequence = retried_sequence;
             var read = try db.core.store.beginReadTxn();
             defer read.abort();

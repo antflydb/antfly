@@ -6,7 +6,7 @@ should target this API once and expose storage-specific conveniences on top.
 
 The public header, `include/antfly.h`, is Apache-2.0 so bindings can vendor
 or transcribe it; the Lite bindings built on it are Apache-2.0 too. The
-`libantfly` library itself is ELv2 like the rest of the core.
+`libantfly` library and the rest of first-party Antfly are Apache-2.0.
 
 ## Naming
 
@@ -354,6 +354,17 @@ shortcuts, they cover only operations on the `.aflite` format itself:
 Everything else, including status, backup, import, restore, drains, and
 generated-enrichment replay, is storage-neutral and named `antfly_db_*` or
 `antfly_*`.
+
+### Catalog ownership after standalone adoption
+
+An embedded Lite file adopted by standalone retains its server-owned catalog
+across physical snapshots and file moves. Embedded document reads, writes and
+search remain available. Schema, index, enrichment, resolver, range and table
+changes, backup import and SQL DDL return `ANTFLY_UNSUPPORTED` with an
+ownership diagnostic (SQLSTATE `0A000` for SQL). Make definition changes through
+`antfly standalone` and `/db/v1`; embedded clients do not synchronize a competing
+catalog back into server metadata. The native Zig embedded facade enforces the
+same rule.
 
 ## Testing Expectations
 

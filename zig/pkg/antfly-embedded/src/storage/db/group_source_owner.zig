@@ -16,17 +16,30 @@
 const std = @import("std");
 const runtime = @import("../background_runtime.zig");
 const work = @import("group_source_worker.zig");
+/// Cursor/lease identity belongs to the scheduling owner, not a reopened DB.
+/// Native Lite keeps this state per table across foreground runtime refreshes.
+pub const State = struct {
+    slice_mutex: std.atomic.Mutex = .unlocked,
+    allocator: ?std.mem.Allocator = null,
+    worker: ?work.Worker = null,
+    next_definition: usize = 0,
+    idle_definitions: usize = 0,
+    submitted: u64 = 0,
+
+    pub fn deinit(self: *State) void {
+        if (self.worker) |*worker| worker.deinit();
+        self.worker = null;
+    }
+};
+
 /// Resident-only lifecycle. Stop joins the slice before releasing cursor state.
 pub const Owner = struct {
     pub const Port = struct { ptr: *anyopaque, runtime: *runtime.BackendRuntime, run: *const fn (*anyopaque) anyerror!bool };
     port: Port = undefined,
     registration: ?runtime.MaintenanceScheduler.Handle = null,
     mutex: std.atomic.Mutex = .unlocked,
-    slice_mutex: std.atomic.Mutex = .unlocked,
+    state: State = .{},
     stopping: std.atomic.Value(bool) = .init(false),
-    worker: ?work.Worker = null,
-    next_definition: usize = 0,
-    submitted: u64 = 0,
     pub fn start(self: *Owner, port: Port) void {
         while (!self.mutex.tryLock()) @import("antfly_platform").time.yieldNow();
         defer self.mutex.unlock();
@@ -42,10 +55,9 @@ pub const Owner = struct {
         self.registration = null;
         self.mutex.unlock();
         if (task) |*handle| handle.await(io.?);
-        while (!self.slice_mutex.tryLock()) @import("antfly_platform").time.yieldNow();
-        defer self.slice_mutex.unlock();
-        if (self.worker) |*worker| worker.deinit();
-        self.worker = null;
+        while (!self.state.slice_mutex.tryLock()) @import("antfly_platform").time.yieldNow();
+        defer self.state.slice_mutex.unlock();
+        self.state.deinit();
     }
     fn step(self: *Owner) ?u64 {
         if (self.stopping.load(.acquire)) return null;

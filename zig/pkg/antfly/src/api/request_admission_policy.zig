@@ -1,17 +1,17 @@
 // Copyright 2026 Antfly, Inc.
-// SPDX-License-Identifier: Elastic-2.0
+// SPDX-License-Identifier: Apache-2.0
 //
-// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
-// except in compliance with the Elastic License 2.0. You may obtain a copy of
-// the Elastic License 2.0 at
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-//     https://www.antfly.io/licensing/ELv2-license
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// Unless required by applicable law or agreed to in writing, software distributed
-// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
-// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
-// Elastic License 2.0 for the specific language governing permissions and
-// limitations.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 const std = @import("std");
 const request_admission = @import("antfly_local_sources").common_request_admission;
@@ -59,6 +59,18 @@ pub const public_operation_policies = [_]PublicOperationPolicy{
     .{ .operation_id = "namespaceReviewResolverMention", .class = .write },
     .{ .operation_id = "listEntityResolverState", .class = .none },
     .{ .operation_id = "namespaceListEntityResolverState", .class = .none },
+    .{ .operation_id = "proposeCuration", .class = .write },
+    .{ .operation_id = "namespaceProposeCuration", .class = .write },
+    .{ .operation_id = "listCurationProposals", .class = .none },
+    .{ .operation_id = "namespaceListCurationProposals", .class = .none },
+    .{ .operation_id = "getCurationProposal", .class = .none },
+    .{ .operation_id = "namespaceGetCurationProposal", .class = .none },
+    .{ .operation_id = "acceptCurationProposal", .class = .write },
+    .{ .operation_id = "namespaceAcceptCurationProposal", .class = .write },
+    .{ .operation_id = "rejectCurationProposal", .class = .write },
+    .{ .operation_id = "namespaceRejectCurationProposal", .class = .write },
+    .{ .operation_id = "pinEntitiesDistinct", .class = .write },
+    .{ .operation_id = "namespacePinEntitiesDistinct", .class = .write },
     .{ .operation_id = "mergeEntity", .class = .write },
     .{ .operation_id = "namespaceMergeEntity", .class = .write },
     .{ .operation_id = "unmergeEntity", .class = .write },

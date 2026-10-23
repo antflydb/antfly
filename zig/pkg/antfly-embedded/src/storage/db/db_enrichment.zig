@@ -3903,6 +3903,18 @@ test "db managed vector admission durably seeds missing enrichment artifacts" {
         })) orelse return error.TestUnexpectedResult;
         try std.testing.expect(repair_id != 0);
 
+        {
+            const driver = db.enrichment_runtime;
+            db.enrichment_runtime = null;
+            defer db.enrichment_runtime = driver;
+            const unavailable = try db.advanceIndexRepairIntent(alloc, repair_id, .{ .source_replay_only = true });
+            try std.testing.expect(!unavailable.attempted and !unavailable.repaired);
+            var retained = try db.loadIndexRepairEntryById(alloc, repair_id);
+            defer retained.deinit(alloc);
+            try std.testing.expect(retained.intent.source_replay_state == .pending);
+            try std.testing.expect(retained.intent.source_replay_resume_key == null);
+        }
+
         // Admission installs the generator and durable repair owner, but does
         // no corpus-sized source scan while holding structural ownership.
         try std.testing.expectEqual(before_admission, db.core.nextDerivedSequence());
@@ -3946,10 +3958,8 @@ test "db managed vector admission durably seeds missing enrichment artifacts" {
         .enrichment = .{ .dense_embedder = deterministic.interface() },
     });
     defer reopened.close();
-    const final_page = try reopened.advanceIndexRepairIntent(alloc, repair_id, .{});
-    try std.testing.expect(final_page.attempted);
-    try std.testing.expect(final_page.deferred);
-    try std.testing.expectEqual(@as(u64, 1), final_page.documents_reprocessed);
+    try std.testing.expect(try DB.independentMaintenanceRun(&reopened, .repair));
+    try std.testing.expect(reopened.local_source_recovery_pending);
     var seeded = try reopened.loadIndexRepairEntryById(alloc, repair_id);
     defer seeded.deinit(alloc);
     try std.testing.expect(seeded.intent.source_replay_resume_key == null);
@@ -4900,14 +4910,22 @@ test "db inline dense generation remains rebuilding until outcomes cover the liv
     // finalizer must retry the same rebuilding checkpoint without requiring a
     // new source write or session-close callback.
     try CounterFixture.write(alloc, db.core.store, config.name, generation, .{ 1, 1, 0 });
+    // A no-op replay callback may leave its last cut coalesced. The recurring
+    // owner must flush that cut as well as retry the lifecycle certificate.
+    try db.async_context.applied_sequence_coalescer.note(alloc, config.name, applied);
+    try std.testing.expectEqual(@as(usize, 1), db.async_context.applied_sequence_coalescer.pending.count());
     const deadline = monotonicTimeNs() +| 10 * std.time.ns_per_s;
-    while (!try db.finalizeDenseProjectionLifecycleForIdle()) {
+    while (true) {
+        _ = try DB.independentMaintenanceRun(&db, .repair);
+        checkpoint = try db.core.loadProjectionCheckpoint(alloc, config.name);
+        if (checkpoint.status == .clean) break;
         if (monotonicTimeNs() >= deadline) return error.TestUnexpectedResult;
         try io.sleep(std.Io.Duration.fromMilliseconds(1), .awake);
     }
     checkpoint = try db.core.loadProjectionCheckpoint(alloc, config.name);
     try std.testing.expectEqual(apply_state.ProjectionStatus.clean, checkpoint.status);
     try std.testing.expectEqual(@as(u64, 10), checkpoint.generation);
+    try std.testing.expectEqual(@as(usize, 0), db.async_context.applied_sequence_coalescer.pending.count());
 }
 
 test "db inline dense coverage counters rebase with range ownership" {

@@ -20,6 +20,8 @@ class ResolverReviewDecision:
     """
     Attributes:
         decision (ResolverReviewDecisionDecision):
+        actor (str | Unset):
+        reason (str | Unset):
         key (str | Unset):
         table (str | Unset):
         wait (ResolverWait | Unset): Wait for observed replay completion up to this timeout. A timeout returns accepted
@@ -27,12 +29,18 @@ class ResolverReviewDecision:
     """
 
     decision: ResolverReviewDecisionDecision
+    actor: str | Unset = UNSET
+    reason: str | Unset = UNSET
     key: str | Unset = UNSET
     table: str | Unset = UNSET
     wait: ResolverWait | Unset = UNSET
 
     def to_dict(self) -> dict[str, Any]:
         decision = self.decision.value
+
+        actor = self.actor
+
+        reason = self.reason
 
         key = self.key
 
@@ -49,6 +57,10 @@ class ResolverReviewDecision:
                 "decision": decision,
             }
         )
+        if actor is not UNSET:
+            field_dict["actor"] = actor
+        if reason is not UNSET:
+            field_dict["reason"] = reason
         if key is not UNSET:
             field_dict["key"] = key
         if table is not UNSET:
@@ -65,6 +77,10 @@ class ResolverReviewDecision:
         d = dict(src_dict)
         decision = ResolverReviewDecisionDecision(d.pop("decision"))
 
+        actor = d.pop("actor", UNSET)
+
+        reason = d.pop("reason", UNSET)
+
         key = d.pop("key", UNSET)
 
         table = d.pop("table", UNSET)
@@ -78,6 +94,8 @@ class ResolverReviewDecision:
 
         resolver_review_decision = cls(
             decision=decision,
+            actor=actor,
+            reason=reason,
             key=key,
             table=table,
             wait=wait,

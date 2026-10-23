@@ -28,6 +28,7 @@ pub fn main(init: std.process.Init) !void {
     const allocator = init.gpa;
     const io = init.io;
     try expectServeRemoved(allocator, io, antfly_path);
+    try expectInferenceCommands(allocator, io, antfly_path);
     const pid: u32 = @intCast(std.posix.system.getpid());
     const root = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/lite-cli-smoke-{d}", .{pid});
     defer allocator.free(root);
@@ -220,6 +221,31 @@ fn expectServeRemoved(allocator: std.mem.Allocator, io: std.Io, antfly_path: []c
     }
     if (std.mem.indexOf(u8, result.stderr, "unknown lite subcommand: serve") == null)
         return error.UnexpectedOutput;
+}
+
+fn expectInferenceCommands(allocator: std.mem.Allocator, io: std.Io, antfly_path: []const u8) !void {
+    // Missing arguments must reach each command's validation, without loading
+    // a model. This catches lost routes when consolidating the public CLI.
+    for ([_][]const u8{ "rerank", "decisions", "extract" }) |command| {
+        const argv = [_][]const u8{ antfly_path, "inference", command };
+        const result = try std.process.run(allocator, io, .{
+            .argv = &argv,
+            .stdout_limit = .limited(max_output_bytes),
+            .stderr_limit = .limited(max_output_bytes),
+        });
+        defer allocator.free(result.stdout);
+        defer allocator.free(result.stderr);
+        switch (result.term) {
+            .exited => {},
+            else => return error.CommandFailed,
+        }
+        if (std.mem.indexOf(u8, result.stderr, "unknown command:") != null or
+            std.mem.indexOf(u8, result.stderr, "usage:") == null)
+        {
+            printCommandFailure(&argv, result.stdout, result.stderr);
+            return error.UnexpectedOutput;
+        }
+    }
 }
 
 fn printCommandFailure(argv: []const []const u8, stdout: []const u8, stderr: []const u8) void {

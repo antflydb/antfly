@@ -20,14 +20,14 @@ Converts the same seeded test subsamples as ``baselines.py`` into native Laya
 choice records (one question per text, labels named as in
 ``antenna_datasets``; typed-decisions keeps its per-question labels,
 descriptions and gold distribution, as scripts/laya/prepare_laya_finetune.py
-does) and scores them with ``antfly-inference finetune eval laya`` through the
+does) and scores them with ``antfly-inference-dev finetune eval laya`` through the
 serving pipeline (models/laya/LAYA.md). A dataset with more labels than the
 model admits (20, or 255 when candidate-packed) is recorded as not applicable
 rather than truncated. Typed-decisions questions whose state exceeds 316 Laya
 tokens are dropped, as in LAYA.md's step-0 evaluation (the unpacked
 512-token budget reserves 192 for the question); the report counts them.
 
-    python laya_baselines.py --binary <antfly-inference> --model-dir <laya dir> \\
+    python laya_baselines.py --binary <antfly-inference-dev> --model-dir <laya dir> \\
         --output report.json [--backend metal|native]
 """
 
@@ -116,7 +116,7 @@ def main() -> int:
         "--binary",
         type=Path,
         required=True,
-        help="antfly-inference built from this tree",
+        help="antfly-inference-dev built from this tree",
     )
     parser.add_argument("--model-dir", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)

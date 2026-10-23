@@ -1916,58 +1916,7 @@ pub fn selectIndexRepairSchedulerQuantum(
 }
 
 pub fn selectIndexRepairSchedulerQuantumForIndex(self: *DB, alloc: Allocator, execution_limit: usize, target_index_name: ?[]const u8) !IndexRepairSchedulerSelection {
-    try self.ensureIndexRepairSchedulerDirectory(alloc);
-    var selection: IndexRepairSchedulerSelection = .{};
-    errdefer selection.deinit(alloc);
-    lockAtomic(&self.async_context.index_repair_scheduler_mutex);
-    defer self.async_context.index_repair_scheduler_mutex.unlock();
-    const directory = &self.async_context.index_repair_scheduler;
-    const summary = directory.summaryForIndex(target_index_name);
-    selection.terminal = summary.terminal;
-    selection.deferred = summary.paused;
-    selection.remaining = summary.runnable + summary.paused + summary.terminal;
-    selection.next_retry_at_ms = summary.earliest_retry_at_ms;
-    const target_index = if (target_index_name) |name| directory.by_name.get(name) else null;
-    if (target_index_name != null and target_index == null) return selection;
-    const inspection = if (target_index) |index| IndexRepairInspectionWindow{ .start = index, .budget = @min(execution_limit, 1) } else indexRepairInspectionWindow(
-        directory.records.items.len,
-        execution_limit,
-        @intCast(directory.cursor),
-    );
-    try selection.repairs.ensureTotalCapacity(alloc, inspection.budget);
-    const now_ms = self.indexRepairNowMs();
-    while (selection.inspected < inspection.budget) : (selection.inspected += 1) {
-        const record_index = (inspection.start + selection.inspected) % directory.records.items.len;
-        const record = directory.records.items[record_index];
-        if (target_index_name == null) directory.cursor = (record_index + 1) % directory.records.items.len;
-        if (record.class != .runnable) continue;
-        if (record.next_retry_at_ms > now_ms) {
-            selection.deferred += 1;
-            if (selection.next_retry_at_ms == 0 or record.next_retry_at_ms < selection.next_retry_at_ms) {
-                selection.next_retry_at_ms = record.next_retry_at_ms;
-            }
-            continue;
-        }
-        if (record.progress_wait_until_sequence != null) {
-            // The slow audit deadline fired without a matching progress
-            // callback. Clear the process-local wait before execution so
-            // the new observation can arm a fresh token and deadline.
-            const mutable = &directory.records.items[record_index];
-            mutable.progress_wait_until_sequence = null;
-            directory.progress_waiters -= 1;
-            mutable.next_retry_at_ms = mutable.durable_next_retry_at_ms;
-            directory.rescheduleRunnable(mutable.repair_id);
-            if (directory.progress_waiters == 0) {
-                self.async_context.index_repair_progress_wait_pending.store(false, .release);
-            }
-        }
-        selection.repairs.appendAssumeCapacity(.{
-            .repair_id = record.repair_id,
-            .revision = record.revision,
-            .audit_due = record.audit_wait_armed,
-        });
-    }
-    return selection;
+    return self.selectIndexRepairSchedulerQuantumScoped(alloc, execution_limit, target_index_name, false);
 }
 
 /// Bounded owner-side pass used by managed startup workers and periodic
@@ -1981,7 +1930,7 @@ pub fn repairRecoverableStartupIndexFailures(
 ) !StartupIndexRepairResult {
     if (comptime storage_engine.enabled) return storage_engine.call(@src().fn_name, .{ self, alloc, limit, options });
     var result: StartupIndexRepairResult = .{};
-    const discovery = try self.discoverRecoverableStartupIndexFailures(alloc, limit);
+    const discovery = if (options.source_replay_only) StartupIndexRepairDiscovery{} else try self.discoverRecoverableStartupIndexFailures(alloc, limit);
     result.discovered = discovery.discovered;
     result.automatic_discovery_pending = discovery.automaticDiscoveryPending();
     // Existing terminal intents are counted from the durable state below.
@@ -1989,7 +1938,7 @@ pub fn repairRecoverableStartupIndexFailures(
     // exists, avoiding double-counting checkpointed failures.
     result.terminal = if (options.target_index_name == null) discovery.terminal - discovery.existing_terminal else 0;
 
-    var selection = try self.selectIndexRepairSchedulerQuantumForIndex(alloc, limit, options.target_index_name);
+    var selection = try self.selectIndexRepairSchedulerQuantumScoped(alloc, limit, options.target_index_name, options.source_replay_only);
     defer selection.deinit(alloc);
     result.terminal += selection.terminal;
     result.deferred += selection.deferred;
@@ -2030,8 +1979,8 @@ pub fn repairRecoverableStartupIndexFailures(
     lockAtomic(&self.async_context.index_repair_scheduler_mutex);
     const directory = &self.async_context.index_repair_scheduler;
     const summary = directory.summaryForIndex(options.target_index_name);
-    result.remaining = summary.runnable + summary.paused + summary.terminal;
-    result.wake = summary.wake;
+    result.remaining = if (options.source_replay_only) directory.sourceRecoveryCountForIndex(options.target_index_name) else summary.runnable + summary.paused + summary.terminal;
+    result.wake = if (options.source_replay_only) (if (result.remaining != 0) .immediate else .empty) else summary.wake;
     result.next_retry_at_ms = result.wake.retryAtMs();
     self.async_context.index_repair_scheduler_mutex.unlock();
     return result;

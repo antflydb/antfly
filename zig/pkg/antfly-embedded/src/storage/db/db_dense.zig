@@ -873,6 +873,10 @@ pub fn drainDensePostingMaintenanceForIdle(self: *DB) !usize {
 /// proof; otherwise a finite load depends on unrelated future writes.
 pub fn finalizeDenseProjectionLifecycleForIdle(self: *DB) !bool {
     if (comptime storage_engine.enabled) return storage_engine.call(@src().fn_name, .{self});
+    // A final graph-only replay window may leave a coalesced dense no-op
+    // watermark below the publication cut. Flush it when no dense session
+    // is active; continuous ingestion retains its ordinary deferral.
+    try self.flushAppliedSequences(false);
     // The recurring owner may construct files, but never while holding
     // the shared apply lease used by the small certification below.
     _ = try self.publishVectorBlockBasesOnline(.{});

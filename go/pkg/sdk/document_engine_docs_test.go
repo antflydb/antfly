@@ -51,12 +51,13 @@ func TestDocumentEngineGuideExamplesRoundTrip(t *testing.T) {
 	}
 
 	blocks := extractJSONFenceBlocks(t, content)
-	if got, want := len(blocks), 3; got != want {
+	if got, want := len(blocks), 5; got != want {
 		t.Fatalf("json example block count = %d, want %d", got, want)
 	}
 
+	var sawLogicalQuery bool
 	var sawSchema bool
-	var sawSortedQuery bool
+	var sortedQueries int
 	var sawCursorQuery bool
 	for i, block := range blocks {
 		if bytes.Contains(block, []byte("doc_values")) {
@@ -74,6 +75,22 @@ func TestDocumentEngineGuideExamplesRoundTrip(t *testing.T) {
 			}
 			sawSchema = true
 			assertDocumentEngineSchemaExample(t, block)
+		case root["execution"] != nil:
+			sawLogicalQuery = true
+			var req oapi.QueryRequest
+			if err := json.Unmarshal(block, &req); err != nil {
+				t.Fatal(err)
+			}
+			if !req.Execution.ValueVerification.AllowScan || !req.Profile {
+				t.Fatal("logical example must explicitly permit scans and enable profiling")
+			}
+			var logical oapi.ContainsQuery
+			if err := json.Unmarshal(req.Query, &logical); err != nil {
+				t.Fatal(err)
+			}
+			if logical.Field != "content" || logical.Contains != "connection-refused" {
+				t.Fatal("logical query lost original-value semantics")
+			}
 		case root["order_by"] != nil:
 			hasCursor := root["search_after"] != nil || root["search_before"] != nil
 			if hasCursor {
@@ -82,18 +99,15 @@ func TestDocumentEngineGuideExamplesRoundTrip(t *testing.T) {
 				}
 				sawCursorQuery = true
 			} else {
-				if sawSortedQuery {
-					t.Fatalf("multiple sorted query examples found")
-				}
-				sawSortedQuery = true
+				sortedQueries++
 			}
 			assertDocumentEngineQueryExample(t, block, hasCursor)
 		default:
 			t.Fatalf("json block %d is not a recognized document-engine example: %s", i, block)
 		}
 	}
-	if !sawSchema || !sawSortedQuery || !sawCursorQuery {
-		t.Fatalf("expected schema, sorted query, and cursor query examples; saw schema=%t sorted=%t cursor=%t", sawSchema, sawSortedQuery, sawCursorQuery)
+	if !sawLogicalQuery || !sawSchema || sortedQueries != 2 || !sawCursorQuery {
+		t.Fatalf("expected schema, sorted query, and cursor query examples; saw schema=%t sorted=%t cursor=%t", sawSchema, sortedQueries == 2, sawCursorQuery)
 	}
 }
 
@@ -199,6 +213,9 @@ func assertDocumentEngineQueryExample(t *testing.T, block []byte, expectCursor b
 		}
 	}
 	if expectCursor {
+		if req.RemoteSnapshot == "" {
+			t.Fatal("HTTP continuation must retain the returned remote_snapshot")
+		}
 		if got, want := len(req.SearchAfter), 2; got != want {
 			t.Fatalf("search_after len = %d, want %d", got, want)
 		}

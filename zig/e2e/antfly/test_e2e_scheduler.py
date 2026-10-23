@@ -1,20 +1,21 @@
 # Copyright 2026 Antfly, Inc.
-# SPDX-License-Identifier: Elastic-2.0
+# SPDX-License-Identifier: Apache-2.0
 #
-# Licensed under the Elastic License 2.0 (ELv2); you may not use this file
-# except in compliance with the Elastic License 2.0. You may obtain a copy of
-# the Elastic License 2.0 at
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
 #
-#     https://www.antfly.io/licensing/ELv2-license
+#     http://www.apache.org/licenses/LICENSE-2.0
 #
-# Unless required by applicable law or agreed to in writing, software distributed
-# under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
-# WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
-# Elastic License 2.0 for the specific language governing permissions and
-# limitations.
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 from __future__ import annotations
 
+import ast
 import importlib.util
 import json
 import os
@@ -27,6 +28,7 @@ from unittest.mock import patch
 
 import pytest
 from e2e_scheduler import (
+    ANTFLY_PROCESS_FIXTURES,
     MIXED_PROCESS_GROUP_PREFIX,
     PERSISTENT_PROCESS_GROUP_PREFIX,
     PROCESS_GROUP_PREFIX,
@@ -38,6 +40,90 @@ from e2e_scheduler import (
     pytest_addoption,
     scheduling_group,
 )
+
+
+def test_direct_servers_and_dynamic_process_fixtures_declare_capacity() -> None:
+    """Keep real server workloads out of the scheduler's lightweight pool."""
+    constructors = {
+        "AntflyServer",
+        "PublicAntflyServer",
+        "StatefulAntflyServer",
+        "StandaloneAntflyServer",
+        "ScalingCluster",
+        "MultiNodeScalingCluster",
+        "MetadataBackupCluster",
+        "SplitScalingCluster",
+    }
+
+    def declares_resource(nodes) -> bool:
+        return any(
+            isinstance(call, ast.Call)
+            and isinstance(call.func, (ast.Name, ast.Attribute))
+            and (call.func.id if isinstance(call.func, ast.Name) else call.func.attr)
+            == "e2e_resource"
+            and call.args
+            and isinstance(call.args[0], ast.Constant)
+            and call.args[0].value == "antfly_process"
+            for node in nodes
+            for call in ast.walk(node)
+        )
+
+    missing = []
+    for path in Path(__file__).parent.glob("test_*.py"):
+        module = ast.parse(path.read_text())
+        module_declarations = [
+            node
+            for node in module.body
+            if isinstance(node, ast.Assign)
+            and any(
+                isinstance(target, ast.Name) and target.id == "pytestmark"
+                for target in node.targets
+            )
+        ]
+        if declares_resource(module_declarations):
+            continue
+        for function in module.body:
+            if not isinstance(function, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            fixture = any(
+                (isinstance(dec, ast.Attribute) and dec.attr == "fixture")
+                or (
+                    isinstance(dec, ast.Call)
+                    and isinstance(dec.func, ast.Attribute)
+                    and dec.func.attr == "fixture"
+                )
+                for dec in function.decorator_list
+            )
+            if not function.name.startswith("test_") and not fixture:
+                continue
+            owns_process = False
+            for call in ast.walk(function):
+                if not isinstance(call, ast.Call):
+                    continue
+                name = (
+                    call.func.id
+                    if isinstance(call.func, ast.Name)
+                    else call.func.attr
+                    if isinstance(call.func, ast.Attribute)
+                    else ""
+                )
+                if name in constructors:
+                    owns_process = True
+                if (
+                    name == "getfixturevalue"
+                    and call.args
+                    and isinstance(call.args[0], ast.Constant)
+                ):
+                    owns_process |= call.args[0].value in ANTFLY_PROCESS_FIXTURES
+            if (
+                owns_process
+                and not declares_resource(function.decorator_list)
+                and not (fixture and function.name in ANTFLY_PROCESS_FIXTURES)
+            ):
+                missing.append(f"{path.name}:{function.lineno} {function.name}")
+    assert not missing, "Declare e2e_resource('antfly_process') for:\n" + "\n".join(
+        missing
+    )
 
 
 @pytest.fixture

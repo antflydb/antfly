@@ -24,6 +24,7 @@ pub const MediaContent = generating.MediaContent;
 pub const ContentPart = generating.ContentPart;
 pub const ChatMessageContent = generating.ChatMessageContent;
 pub const ToolCall = generating.ToolCall;
+pub const GenerationUsage = generating.GenerationUsage;
 pub const ChatMessage = generating.ChatMessage;
 
 /// Request-scoped local generation controls. Keep these in the provider
@@ -53,6 +54,7 @@ pub const GenerateMessagesRequest = struct {
 };
 
 pub const localGenerationStatusError = generating.localGenerationStatusError;
+pub const remoteGenerationStatusError = generating.remoteGenerationStatusError;
 
 test "local generation budgets preserve explicit limits and reject overflow" {
     try std.testing.expectEqual(@as(i32, 128), (try GenerationOptions.fromMaxTokens(128)).max_tokens);
@@ -85,231 +87,10 @@ test "local generation bridge round trips request budgets" {
     try std.testing.expectEqual(@as(i32, 256), legacy.value.options.max_tokens);
 }
 
-pub const ChatWireFlavor = enum {
-    openai_compatible,
-    termite_native,
-};
-
-pub const ChatRequestOptions = struct {
-    response_format_json: ?[]const u8 = null,
-    logprobs: bool = false,
-    top_logprobs: u8 = 20,
-    tools_json: ?[]const u8 = null,
-    tool_choice_json: ?[]const u8 = null,
-    max_tokens: ?i64 = null,
-    temperature: ?f32 = null,
-    top_p: ?f32 = null,
-    top_k: ?i64 = null,
-    frequency_penalty: ?f32 = null,
-    presence_penalty: ?f32 = null,
-    enable_thinking: ?bool = null,
-};
-
-pub fn chatRequestJsonAlloc(
-    alloc: std.mem.Allocator,
-    model: []const u8,
-    messages: []const ChatMessage,
-    flavor: ChatWireFlavor,
-) ![]u8 {
-    return try chatRequestJsonWithOptionsAlloc(alloc, model, messages, flavor, .{});
-}
-
-pub fn chatRequestJsonWithOptionsAlloc(
-    alloc: std.mem.Allocator,
-    model: []const u8,
-    messages: []const ChatMessage,
-    flavor: ChatWireFlavor,
-    options: ChatRequestOptions,
-) ![]u8 {
-    var out = std.ArrayListUnmanaged(u8).empty;
-    errdefer out.deinit(alloc);
-    try out.appendSlice(alloc, "{\"model\":");
-    try appendJsonString(alloc, &out, model);
-    try out.appendSlice(alloc, ",\"messages\":[");
-    for (messages, 0..) |message, i| {
-        if (i > 0) try out.append(alloc, ',');
-        try appendChatMessageJson(alloc, &out, message, flavor);
-    }
-    try out.append(alloc, ']');
-    if (options.tools_json) |tools_json| {
-        try out.appendSlice(alloc, ",\"tools\":");
-        try out.appendSlice(alloc, tools_json);
-    }
-    if (options.tool_choice_json) |tool_choice_json| {
-        try out.appendSlice(alloc, ",\"tool_choice\":");
-        try out.appendSlice(alloc, tool_choice_json);
-    }
-    if (options.response_format_json) |format| {
-        try out.appendSlice(alloc, ",\"response_format\":");
-        try out.appendSlice(alloc, format);
-    }
-    if (options.logprobs) {
-        try out.appendSlice(alloc, ",\"logprobs\":true");
-        try appendJsonI64Field(alloc, &out, "top_logprobs", options.top_logprobs);
-    }
-    if (options.max_tokens) |max_tokens| {
-        try appendJsonI64Field(alloc, &out, "max_tokens", max_tokens);
-    }
-    if (options.temperature) |temperature| try appendJsonFloatField(alloc, &out, "temperature", temperature);
-    if (options.top_p) |top_p| try appendJsonFloatField(alloc, &out, "top_p", top_p);
-    if (options.top_k) |top_k| try appendJsonI64Field(alloc, &out, "top_k", top_k);
-    if (options.frequency_penalty) |frequency_penalty| try appendJsonFloatField(alloc, &out, "frequency_penalty", frequency_penalty);
-    if (options.presence_penalty) |presence_penalty| try appendJsonFloatField(alloc, &out, "presence_penalty", presence_penalty);
-    if (options.enable_thinking) |enabled| {
-        try out.appendSlice(alloc, if (enabled) ",\"chat_template_kwargs\":{\"enable_thinking\":true}" else ",\"chat_template_kwargs\":{\"enable_thinking\":false}");
-    }
-    try out.append(alloc, '}');
-    return try out.toOwnedSlice(alloc);
-}
-
-fn appendJsonI64Field(alloc: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), name: []const u8, value: i64) !void {
-    const fragment = try std.fmt.allocPrint(alloc, ",\"{s}\":{d}", .{ name, value });
-    defer alloc.free(fragment);
-    try out.appendSlice(alloc, fragment);
-}
-
-fn appendJsonFloatField(alloc: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), name: []const u8, value: f32) !void {
-    const fragment = try std.fmt.allocPrint(alloc, ",\"{s}\":{f}", .{ name, std.json.fmt(value, .{}) });
-    defer alloc.free(fragment);
-    try out.appendSlice(alloc, fragment);
-}
-
-fn appendChatMessageJson(
-    alloc: std.mem.Allocator,
-    out: *std.ArrayListUnmanaged(u8),
-    message: ChatMessage,
-    flavor: ChatWireFlavor,
-) !void {
-    try out.appendSlice(alloc, "{\"role\":");
-    try appendJsonString(alloc, out, message.role.toSlice());
-    if (message.content) |content| {
-        try out.appendSlice(alloc, ",\"content\":");
-        try appendChatMessageContentJson(alloc, out, content, flavor);
-    }
-    if (message.tool_calls) |tool_calls| {
-        try out.appendSlice(alloc, ",\"tool_calls\":[");
-        for (tool_calls, 0..) |tool_call, i| {
-            if (i > 0) try out.append(alloc, ',');
-            try appendToolCallJson(alloc, out, tool_call);
-        }
-        try out.append(alloc, ']');
-    }
-    if (message.tool_call_id) |tool_call_id| {
-        try out.appendSlice(alloc, ",\"tool_call_id\":");
-        try appendJsonString(alloc, out, tool_call_id);
-    }
-    try out.append(alloc, '}');
-}
-
-fn appendChatMessageContentJson(
-    alloc: std.mem.Allocator,
-    out: *std.ArrayListUnmanaged(u8),
-    content: ChatMessageContent,
-    flavor: ChatWireFlavor,
-) !void {
-    switch (content) {
-        .text => |text| try appendJsonString(alloc, out, text),
-        .parts => |parts| {
-            try out.append(alloc, '[');
-            for (parts, 0..) |part, i| {
-                if (i > 0) try out.append(alloc, ',');
-                try appendContentPartJson(alloc, out, part, flavor);
-            }
-            try out.append(alloc, ']');
-        },
-    }
-}
-
-fn appendContentPartJson(
-    alloc: std.mem.Allocator,
-    out: *std.ArrayListUnmanaged(u8),
-    part: ContentPart,
-    flavor: ChatWireFlavor,
-) !void {
-    switch (part) {
-        .text => |text| {
-            try out.appendSlice(alloc, "{\"type\":\"text\",\"text\":");
-            try appendJsonString(alloc, out, text);
-            try out.append(alloc, '}');
-        },
-        .image_url => |image_url| {
-            try out.appendSlice(alloc, "{\"type\":\"image_url\",\"image_url\":{\"url\":");
-            try appendJsonString(alloc, out, image_url.url);
-            try out.appendSlice(alloc, "}}");
-        },
-        .media => |media| switch (flavor) {
-            .termite_native => {
-                try appendMediaContentPartJson(alloc, out, media);
-            },
-            .openai_compatible => {
-                try appendOpenAiMediaContentPartJson(alloc, out, media);
-            },
-        },
-    }
-}
-
-fn appendOpenAiMediaContentPartJson(
-    alloc: std.mem.Allocator,
-    out: *std.ArrayListUnmanaged(u8),
-    media: MediaContent,
-) !void {
-    if (!std.ascii.startsWithIgnoreCase(media.mime_type, "image/")) return error.UnsupportedOpenAIContentPart;
-    const image_url = if (media.url) |url|
-        url
-    else
-        try std.fmt.allocPrint(alloc, "data:{s};base64,{s}", .{ media.mime_type, media.data });
-    defer if (media.url == null) alloc.free(image_url);
-
-    try out.appendSlice(alloc, "{\"type\":\"image_url\",\"image_url\":{\"url\":");
-    try appendJsonString(alloc, out, image_url);
-    try out.appendSlice(alloc, "}}");
-}
-
-fn appendMediaContentPartJson(
-    alloc: std.mem.Allocator,
-    out: *std.ArrayListUnmanaged(u8),
-    media: MediaContent,
-) !void {
-    try out.appendSlice(alloc, "{\"type\":\"media\"");
-    if (media.url) |url| {
-        try out.appendSlice(alloc, ",\"url\":");
-        try appendJsonString(alloc, out, url);
-        if (media.mime_type.len > 0) {
-            try out.appendSlice(alloc, ",\"mime_type\":");
-            try appendJsonString(alloc, out, media.mime_type);
-        }
-    } else {
-        try out.appendSlice(alloc, ",\"data\":");
-        try appendJsonString(alloc, out, media.data);
-        try out.appendSlice(alloc, ",\"mime_type\":");
-        try appendJsonString(alloc, out, media.mime_type);
-    }
-    try out.append(alloc, '}');
-}
-
-fn appendToolCallJson(
-    alloc: std.mem.Allocator,
-    out: *std.ArrayListUnmanaged(u8),
-    tool_call: ToolCall,
-) !void {
-    try out.appendSlice(alloc, "{\"id\":");
-    try appendJsonString(alloc, out, tool_call.id);
-    try out.appendSlice(alloc, ",\"type\":\"function\",\"function\":{\"name\":");
-    try appendJsonString(alloc, out, tool_call.name);
-    try out.appendSlice(alloc, ",\"arguments\":");
-    try appendJsonString(alloc, out, tool_call.arguments);
-    try out.appendSlice(alloc, "}}");
-}
-
-fn appendJsonString(
-    alloc: std.mem.Allocator,
-    out: *std.ArrayListUnmanaged(u8),
-    value: []const u8,
-) !void {
-    const encoded = try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(value, .{})});
-    defer alloc.free(encoded);
-    try out.appendSlice(alloc, encoded);
-}
+pub const ChatWireFlavor = generating.ChatWireFlavor;
+pub const ChatRequestOptions = generating.ChatRequestOptions;
+pub const chatRequestJsonAlloc = generating.chatRequestJsonAlloc;
+pub const chatRequestJsonWithOptionsAlloc = generating.chatRequestJsonWithOptionsAlloc;
 
 pub const EmbedResult = struct {
     /// One f32 vector per input text.
@@ -340,11 +121,11 @@ pub const SparseEmbedResult = struct {
 
 pub const GenerateResult = struct {
     content: []const u8,
+    usage: ?GenerationUsage = null,
     tool_calls: []ToolCall = &.{},
     tool_calls_synthesized: bool = false,
     token_logprobs_json: ?[]const u8 = null,
     google_parts_json: ?[]const u8 = null,
-    usage: ?struct { input_tokens: u64, output_tokens: u64 } = null,
     allocator: std.mem.Allocator,
 
     pub fn deinit(self: *GenerateResult) void {

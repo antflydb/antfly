@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import Any, TypeVar
+from typing import Any, TypeVar, cast
 
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
@@ -16,26 +16,50 @@ class ConnectedModel:
     """
     Attributes:
         name (str): Model identifier as reported by the provider.
+        id (str | Unset): Canonical public gateway identity when available.
+        availability (str | Unset): Availability observation independent of capability support.
+        freshness (str | Unset): Whether metadata is configured, live, or cached.
         display_name (str | Unset): Human-readable model name when the provider reports one.
         dimensions (int | Unset): Embedding output dimension when known.
         configured (bool | Unset): True when this model is referenced by a configured embedder, generator, reranker, or
             chunker.
+        capabilities (list[str] | Unset): Inference capabilities advertised by the provider for this model and task.
+        inputs (list[str] | Unset): Input modalities accepted by the provider's resolved executor.
     """
 
     name: str
+    id: str | Unset = UNSET
+    availability: str | Unset = UNSET
+    freshness: str | Unset = UNSET
     display_name: str | Unset = UNSET
     dimensions: int | Unset = UNSET
     configured: bool | Unset = UNSET
+    capabilities: list[str] | Unset = UNSET
+    inputs: list[str] | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         name = self.name
+
+        id = self.id
+
+        availability = self.availability
+
+        freshness = self.freshness
 
         display_name = self.display_name
 
         dimensions = self.dimensions
 
         configured = self.configured
+
+        capabilities: list[str] | Unset = UNSET
+        if not isinstance(self.capabilities, Unset):
+            capabilities = self.capabilities
+
+        inputs: list[str] | Unset = UNSET
+        if not isinstance(self.inputs, Unset):
+            inputs = self.inputs
 
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
@@ -44,12 +68,22 @@ class ConnectedModel:
                 "name": name,
             }
         )
+        if id is not UNSET:
+            field_dict["id"] = id
+        if availability is not UNSET:
+            field_dict["availability"] = availability
+        if freshness is not UNSET:
+            field_dict["freshness"] = freshness
         if display_name is not UNSET:
             field_dict["display_name"] = display_name
         if dimensions is not UNSET:
             field_dict["dimensions"] = dimensions
         if configured is not UNSET:
             field_dict["configured"] = configured
+        if capabilities is not UNSET:
+            field_dict["capabilities"] = capabilities
+        if inputs is not UNSET:
+            field_dict["inputs"] = inputs
 
         return field_dict
 
@@ -58,17 +92,32 @@ class ConnectedModel:
         d = dict(src_dict)
         name = d.pop("name")
 
+        id = d.pop("id", UNSET)
+
+        availability = d.pop("availability", UNSET)
+
+        freshness = d.pop("freshness", UNSET)
+
         display_name = d.pop("display_name", UNSET)
 
         dimensions = d.pop("dimensions", UNSET)
 
         configured = d.pop("configured", UNSET)
 
+        capabilities = cast(list[str], d.pop("capabilities", UNSET))
+
+        inputs = cast(list[str], d.pop("inputs", UNSET))
+
         connected_model = cls(
             name=name,
+            id=id,
+            availability=availability,
+            freshness=freshness,
             display_name=display_name,
             dimensions=dimensions,
             configured=configured,
+            capabilities=capabilities,
+            inputs=inputs,
         )
 
         connected_model.additional_properties = d

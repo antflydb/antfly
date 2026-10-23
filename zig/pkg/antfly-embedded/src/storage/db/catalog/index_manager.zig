@@ -15398,7 +15398,7 @@ pub const IndexManager = struct {
                 if (request.source_field.len > 0) alloc.free(request.source_field);
                 if (request.source_template.len > 0) alloc.free(request.source_template);
                 if (request.upstream_artifact_name.len > 0) alloc.free(request.upstream_artifact_name);
-                request.source_field = try alloc.dupe(u8, "_group_unit.text");
+                request.source_field = try alloc.dupe(u8, enrichment_types.grouped_source_field);
                 request.source_template = "";
                 request.upstream_artifact_name = "";
                 request.input_kind = if (request.chunk_size > 0 or request.chunker_json.len > 0) .inline_chunks else .document;
@@ -16790,19 +16790,7 @@ pub const IndexManager = struct {
     }
 
     fn assetGroupRoot(self: *const IndexManager, name: []const u8) []const u8 {
-        var current = name;
-        var depth: usize = 0;
-        while (current.len > 0 and depth <= self.enrichments.items.len) : (depth += 1) {
-            var found: ?*const enrichment_catalog.EnrichmentConfig = null;
-            for (self.enrichments.items) |*cfg| if (std.mem.eql(u8, cfg.name, current)) {
-                found = cfg;
-                break;
-            };
-            const cfg = found orelse return "";
-            if (cfg.group_source_json.len > 0) return cfg.name;
-            current = cfg.source_artifact_name;
-        }
-        return "";
+        return enrichment_types.groupRoot(self.enrichments.items, name) orelse "";
     }
 
     fn assetSourceSupportsUnitGrouping(self: *const IndexManager, artifact_name: []const u8) bool {
@@ -19210,6 +19198,9 @@ pub const IndexManager = struct {
                     projection_batch,
                     entry.text_analysis,
                     .{
+                        .scratch_allocator = introducer_mod.textBuildScratchAllocator(),
+                        .postings_run_io = if (textBuildSpoolDirectory(entry) != null) entry.io else null,
+                        .postings_run_directory = textBuildSpoolDirectory(entry) orelse ".",
                         .target_segment_bytes = @max(@as(usize, 1), textSegmentBuildTargetBytes()),
                         .target_build_memory_bytes = @max(@as(usize, 1), textBuildMemoryTargetBytes()),
                         .doc_scratch_retained_bytes = textDocScratchRetainedBytes(),
@@ -36485,6 +36476,13 @@ const TextProjectionProvenance = struct {
         cfg: types.IndexConfig,
         schema: ?schema_mod.TableSchema,
     ) !TextProjectionProvenance {
+        return fromRuntimeSchemaRevision(alloc, cfg, schema, 2);
+    }
+
+    // Revision zero reproduces the historical witness for upgrade fixtures.
+    // Semantic revisions belong to durable generation identity, independently
+    // of public schema versions and the metadata codec's envelope version.
+    fn fromRuntimeSchemaRevision(alloc: Allocator, cfg: types.IndexConfig, schema: ?schema_mod.TableSchema, named_autocomplete_revision: u32) !TextProjectionProvenance {
         // Field-selective projection uses the second semantic witness. Give
         // only those generations a new durable witness so an
         // existing whole-document posting set cannot be interpreted as if it
@@ -36494,11 +36492,17 @@ const TextProjectionProvenance = struct {
             0x41545052534d0002
         else
             0x41545052534d0001;
-        const schema_fingerprint = if (schema) |value| blk: {
+        var schema_fingerprint = if (schema) |value| blk: {
             const encoded = try schema_mod.serializeTextProjectionSchema(alloc, value);
             defer alloc.free(encoded);
             break :blk std.hash.Wyhash.hash(projection_seed, encoded);
         } else std.hash.Wyhash.hash(projection_seed, "schema-less");
+        if (named_autocomplete_revision != 0 and try usesNamedAutocomplete(alloc, cfg, schema)) {
+            var witness: [12]u8 = undefined;
+            std.mem.writeInt(u64, witness[0..8], schema_fingerprint, .little);
+            std.mem.writeInt(u32, witness[8..12], named_autocomplete_revision, .little);
+            schema_fingerprint = std.hash.Wyhash.hash(0x4154414e414c595a, &witness);
+        }
         return .{
             .coverage_generation = coverageGenerationForConfig(cfg),
             .index_config_hash = types.indexConfigHash(cfg),
@@ -36549,6 +36553,26 @@ const TextProjectionProvenance = struct {
         };
     }
 };
+
+fn usesNamedAutocomplete(alloc: Allocator, cfg: types.IndexConfig, schema: ?schema_mod.TableSchema) !bool {
+    const Names = struct {
+        fn changed(name: []const u8) bool {
+            return std.mem.eql(u8, name, "search_as_you_type") or std.mem.eql(u8, name, "search_as_you_type_analyzer");
+        }
+    };
+    const analysis = try parseTextAnalysisForIndexConfig(alloc, cfg.config_json, schema);
+    defer introducer_mod.freeTextAnalysisConfig(alloc, analysis);
+    for (analysis.field_analyzers) |field| if (Names.changed(field.analyzer_name)) return true;
+    if (schema) |value| {
+        for (value.exact_fields) |field| if (Names.changed(field.mapping.analyzer)) return true;
+        for (value.dynamic_templates) |template| if (Names.changed(template.mapping.analyzer)) return true;
+        for (value.full_text_documents) |doc| {
+            for (doc.fields) |field| if (Names.changed(field.analyzer)) return true;
+            for (doc.dynamic_rules) |rule| for (rule.variants) |variant| if (Names.changed(variant.analyzer)) return true;
+        }
+    }
+    return false;
+}
 
 fn textConfigSelectsField(alloc: Allocator, raw: []const u8) !bool {
     const parsed = try std.json.parseFromSlice(std.json.Value, alloc, raw, .{});
@@ -49217,4 +49241,152 @@ test "backend repair shadow cleanup revalidates publication after inventory (#12
 test "repair shadow markers with invalid owner pids remain protected (#1210)" {
     try std.testing.expect(repairShadowMarkerInProgress(repair_shadow_in_progress_magic ++ "pid=4294967295\n", "/virtual/shadow"));
     try std.testing.expect(repairShadowMarkerInProgress(repair_shadow_in_progress_magic ++ "pid=0\n", "/virtual/shadow"));
+}
+
+test "logical query named analyzer upgrade refuses old physical postings until rebuild" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
+    defer alloc.free(path_z);
+    var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
+    defer store.close();
+    const schema: schema_mod.TableSchema = .{ .full_text_documents = &.{.{ .name = "doc", .fields = &.{.{ .path = "title", .emitted_name = "title", .analyzer = "search_as_you_type" }} }} };
+    _ = try schema_mod.saveSchema(&store, alloc, schema);
+    const config: types.IndexConfig = .{ .name = "legacy-named", .kind = .full_text, .config_json = "{}", .coverage_generation = 11 };
+    const historical = try TextProjectionProvenance.fromRuntimeSchemaRevision(alloc, config, schema, 0);
+    const current = try TextProjectionProvenance.fromRuntimeSchema(alloc, config, schema);
+    try std.testing.expect(!historical.eql(current));
+    // Unaffected dictionaries retain their exact old witness.
+    try std.testing.expect((try TextProjectionProvenance.fromRuntimeSchemaRevision(alloc, config, null, 0)).eql(try TextProjectionProvenance.fromRuntimeSchema(alloc, config, null)));
+    {
+        var manager = try IndexManager.init(alloc, path);
+        defer manager.deinit();
+        manager.updateRange(.{ .start = "", .end = "" });
+        try manager.addAllNoBackfill(&store, &.{config});
+        const entry = manager.textIndexEntry(config.name).?;
+        // Produce actual pre-upgrade prefix-only postings, not merely a stale
+        // metadata fixture. The public schema/config remains unchanged.
+        for (@constCast(entry.text_analysis.field_analyzers)) |*field| {
+            if (std.mem.eql(u8, field.analyzer_name, "search_as_you_type")) {
+                alloc.free(field.analyzer_name);
+                field.analyzer_name = try alloc.dupe(u8, "search_as_you_type_index_prefix");
+            }
+        }
+        try manager.indexBatch(&store, &.{.{ .key = "old", .value = "{\"title\":\"x abcdefghijklmnopqrstuvwxyzzebra\"}" }});
+        {
+            var segment = try entry.persistent.snapshot().leaseSegment(0);
+            defer segment.deinit();
+            var inverted = (try segment.entry.reader.invertedIndexScoped(alloc, "title")).?;
+            defer inverted.deinit();
+            try std.testing.expect(try inverted.lookup("abcdefghijklmnopqrst") != null);
+            try std.testing.expect(try inverted.lookup("abcdefghijklmnopqrstuvwxyzzebra") == null);
+            try std.testing.expect(try inverted.lookup("x") == null);
+        }
+        try saveTextProjectionProvenance(&entry.persistent, alloc, historical);
+    }
+    {
+        var reopened = try IndexManager.init(alloc, path);
+        defer reopened.deinit();
+        reopened.updateRange(.{ .start = "", .end = "" });
+        try reopened.load(&store);
+        try std.testing.expect(reopened.textIndexEntry(config.name) == null);
+        try std.testing.expectEqualStrings("TextProjectionProvenanceMismatch", reopened.loadFailure(config.name).?);
+    }
+    const shadow_path = try std.fmt.allocPrint(alloc, "{s}/rebuilt", .{path});
+    defer alloc.free(shadow_path);
+    {
+        // Build in a private replacement root, as the repair owner does. A
+        // catalog delete/recreate must not be used to relabel the old root.
+        var rebuilt = try IndexManager.init(alloc, shadow_path);
+        defer rebuilt.deinit();
+        rebuilt.updateRange(.{ .start = "", .end = "" });
+        try rebuilt.registerReplacementIndex(&store, config);
+        try rebuilt.indexBatch(&store, &.{.{ .key = "old", .value = "{\"title\":\"x abcdefghijklmnopqrstuvwxyzzebra\"}" }});
+        const entry = rebuilt.textIndexEntry(config.name).?;
+        var segment = try entry.persistent.snapshot().leaseSegment(0);
+        defer segment.deinit();
+        var inverted = (try segment.entry.reader.invertedIndexScoped(alloc, "title")).?;
+        defer inverted.deinit();
+        try std.testing.expect(try inverted.lookup("abcdefghijklmnopqrstuvwxyzzebra") != null);
+        try std.testing.expect(try inverted.lookup("x") != null);
+    }
+    var final = try IndexManager.init(alloc, shadow_path);
+    defer final.deinit();
+    final.updateRange(.{ .start = "", .end = "" });
+    try final.load(&store);
+    try std.testing.expect(final.textIndexEntry(config.name) != null);
+    try std.testing.expect(final.loadFailure(config.name) == null);
+}
+
+test "logical query analyzer revision covers configuration and dynamic schema aliases only" {
+    const a = std.testing.allocator;
+    for ([_][]const u8{ "search_as_you_type", "search_as_you_type_analyzer", "search_as_you_type_index_prefix", "standard" }) |name| {
+        const raw = try std.fmt.allocPrint(a, "{{\"analysis_config\":{{\"field_analyzers\":{{\"title\":\"{s}\"}}}}}}", .{name});
+        defer a.free(raw);
+        const cfg: types.IndexConfig = .{ .name = "ft", .kind = .full_text, .config_json = raw, .coverage_generation = 11 };
+        const changed = !std.mem.eql(u8, name, "standard") and !std.mem.eql(u8, name, "search_as_you_type_index_prefix");
+        try std.testing.expectEqual(changed, !(try TextProjectionProvenance.fromRuntimeSchemaRevision(a, cfg, null, 0)).eql(try TextProjectionProvenance.fromRuntimeSchema(a, cfg, null)));
+        const schema: schema_mod.TableSchema = .{ .dynamic_templates = &.{.{ .name = "named", .mapping = .{ .analyzer = name } }} };
+        const plain_cfg: types.IndexConfig = .{ .name = "ft", .kind = .full_text, .config_json = "{}", .coverage_generation = 11 };
+        try std.testing.expectEqual(changed, !(try TextProjectionProvenance.fromRuntimeSchemaRevision(a, plain_cfg, schema, 0)).eql(try TextProjectionProvenance.fromRuntimeSchema(a, plain_cfg, schema)));
+    }
+}
+
+test "index_manager bounded native prepared text publication spills before admission exhaustion" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer a.free(path);
+    const path_z = try a.dupeSentinel(u8, path, 0);
+    defer a.free(path_z);
+    var store = try docstore_mod.DocStore.open(a, path_z, .{});
+    defer store.close();
+    const fields = [_]schema_mod.FullTextField{
+        .{ .path = "content", .emitted_name = "content", .analyzer = "standard" },
+        .{ .path = "content", .emitted_name = "content._substring", .analyzer = "substring" },
+    };
+    const schema: schema_mod.TableSchema = .{ .version = 0, .default_type = "doc", .full_text_documents = &.{.{ .name = "doc", .fields = &fields }} };
+    _ = try schema_mod.saveSchema(&store, a, schema);
+    var budgets = resource_manager_mod.Options.defaultBudgets();
+    budgets[@backingInt(resource_manager_mod.Slice.full_text_build_working_set)] = .{ .soft_limit_bytes = 96 * 1024 * 1024, .hard_limit_bytes = 128 * 1024 * 1024 };
+    var resources = resource_manager_mod.ResourceManager.init(.{ .budgets = budgets, .disk_safety_floor_bytes = 1024 * 1024, .disk_safety_floor_divisor = 0 });
+    defer resources.deinit(a);
+    var manager = try IndexManager.initWithOptions(a, path, .{ .resource_manager = &resources });
+    defer manager.deinit();
+    manager.setIo(std.testing.io);
+    manager.updateRange(.{ .start = "", .end = "" });
+    try manager.addAllNoBackfill(&store, &.{.{ .name = "ft_v1", .kind = .full_text, .config_json = "{}" }});
+    const text = try a.alloc(u8, 180 * 1024);
+    defer a.free(text);
+    var random = std.Random.DefaultPrng.init(0x51ff1c);
+    for (text) |*byte| byte.* = 'a' + random.random().uintLessThan(u8, 26);
+    const json = try std.fmt.allocPrint(a, "{{\"content\":\"{s}\"}}", .{text});
+    defer a.free(json);
+    const docs = [_]mapper.MapperDoc{ .{ .key = "a", .value = json }, .{ .key = "b", .value = json } };
+    var context = try manager.acquireTextPublicationContext(a, "ft_v1");
+    defer context.deinit();
+    var prepared = try manager.prepareTextMapperDocsPublication(a, &store, "ft_v1", &context, &docs);
+    defer prepared.deinit();
+    const stats = resources.sliceStats(.full_text_build_working_set);
+    try std.testing.expectEqual(@as(u64, 0), stats.used_bytes);
+    try std.testing.expect(stats.peak_bytes <= 128 * 1024 * 1024);
+    var documents: u32 = 0;
+    for (prepared.segments) |segment| {
+        var reader = try segment_mod.SegmentReader.init(a, segment);
+        defer reader.deinit();
+        documents += reader.doc_count;
+        var field = (try reader.invertedIndexScoped(a, "content._substring")).?;
+        defer field.deinit();
+        const found = (try field.lookup(text[0..32])).?;
+        var iterator = try found.iterator(a);
+        defer iterator.deinit();
+        for (0..reader.doc_count) |_| try std.testing.expect((try iterator.next()) != null);
+        try std.testing.expect((try iterator.next()) == null);
+    }
+    try std.testing.expectEqual(@as(u32, 2), documents);
+    std.debug.print("PREPARED_TEXT_SPILL documents={d} peak_bytes={d}\n", .{ documents, stats.peak_bytes });
 }

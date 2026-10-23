@@ -1,6 +1,6 @@
 # Minikube Deployment
 
-Deploys an Antfly cluster to a local Minikube using the manifests in this directory and the published `ghcr.io/antflydb/antfly:latest` image. For production-style Kubernetes deployments, use the operator in `go/pkg/operator`.
+Deploys an Antfly cluster to a local Minikube using the manifests in this directory and the published `ghcr.io/antflydb/antfly:latest` image. These manifests are self-hosting examples. Hosted Kubernetes orchestration is maintained in Colony.
 
 ## Prerequisites
 

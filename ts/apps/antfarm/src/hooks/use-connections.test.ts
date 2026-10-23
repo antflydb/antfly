@@ -4,7 +4,12 @@
 import type { Connection } from "@antfly/sdk";
 import { act, cleanup, renderHook, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { liveModelSuggestions, useConnectionsWithModels } from "./use-connections";
+import {
+  liveModelSuggestions,
+  useConnectedModels,
+  useConnectionsWithModels,
+} from "./use-connections";
+import { transformConnectionModels } from "./use-inference-registry";
 
 const { listConnections, apiUrlRef, client } = vi.hoisted(() => {
   const listConnections = vi.fn();
@@ -18,7 +23,11 @@ const { listConnections, apiUrlRef, client } = vi.hoisted(() => {
 });
 
 vi.mock("@/hooks/use-api-config", () => ({
-  useApiConfig: () => ({ apiUrl: apiUrlRef.current, client }),
+  useApiConfig: () => ({
+    apiUrl: apiUrlRef.current,
+    inferenceApiUrl: "http://inference.test",
+    client,
+  }),
 }));
 
 // The connections cache is module scoped and keyed by API URL, so each test
@@ -99,6 +108,24 @@ describe("liveModelSuggestions", () => {
     expect(suggestions.anthropic).toEqual(["claude-sonnet-4-5"]);
   });
 
+  it("includes chain aliases in generator suggestions without duplicating shared IDs", () => {
+    const suggestions = liveModelSuggestions(
+      [
+        providerConnection({
+          inference: {
+            provider: "antfly",
+            models: {
+              generators: [{ name: "owner/chat" }],
+              chains: [{ name: "chains/support" }, { name: "owner/chat" }],
+            },
+          },
+        }),
+      ],
+      "generator"
+    );
+    expect(suggestions.antfly).toEqual(["owner/chat", "chains/support"]);
+  });
+
   it("merges unclassified models into generator suggestions", () => {
     const suggestions = liveModelSuggestions([providerConnection()], "generator");
     expect(suggestions.openai).toEqual(["gpt-4o"]);
@@ -125,6 +152,91 @@ describe("useConnectionsWithModels", () => {
 
     first.unmount();
     second.unmount();
+  });
+});
+
+describe("useConnectedModels compatibility", () => {
+  const fetchMock = vi.fn<typeof fetch>();
+
+  beforeEach(() => {
+    listConnections.mockReset();
+    isolateCache();
+    fetchMock.mockReset();
+    vi.stubGlobal("fetch", fetchMock);
+  });
+
+  afterEach(() => {
+    cleanup();
+    vi.unstubAllGlobals();
+  });
+
+  it("retains the complete direct catalog and deduplicates configured task aliases", async () => {
+    listConnections.mockResolvedValue(undefined);
+    fetchMock.mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          deciders: { "owner/decider": { capabilities: ["typed_decisions"], inputs: ["text"] } },
+          synthesizers: { "owner/voice": { inputs: ["text"] } },
+          predictors: { risk: {} },
+          generators: { "owner/chat": {} },
+          chains: { "chains/support": {} },
+          other: { unclassified: {} },
+        }),
+        { headers: { "content-type": "application/json" } }
+      )
+    );
+    const hook = renderHook(() => useConnectedModels());
+    await waitFor(() => expect(hook.result.current.providers).toHaveLength(1));
+    const provider = hook.result.current.providers[0];
+    expect(provider.inference?.models).toMatchObject({
+      deciders: [{ name: "owner/decider", capabilities: ["typed_decisions"], inputs: ["text"] }],
+      synthesizers: [{ name: "owner/voice", inputs: ["text"] }],
+      predictors: [{ name: "risk" }],
+      chains: [{ name: "chains/support" }],
+      other: [{ name: "unclassified" }],
+    });
+    expect(provider.inference?.configured_model_types).toEqual(
+      expect.arrayContaining(["decider", "synthesizer", "predictor", "generator", "other"])
+    );
+    expect(
+      provider.inference?.configured_model_types?.filter((kind) => kind === "generator")
+    ).toHaveLength(1);
+    // The same shared taxonomy feeds the visible Models catalog.
+    const catalog = transformConnectionModels([provider]);
+    expect(catalog.map(({ type, source }) => [type, source])).toEqual(
+      expect.arrayContaining([
+        ["decider", "owner/decider"],
+        ["synthesizer", "owner/voice"],
+        ["predictor", "risk"],
+        ["generator", "chains/support"],
+        ["generator", "unclassified"],
+      ])
+    );
+  });
+
+  it("falls back to direct local discovery when the server predates connections", async () => {
+    listConnections.mockResolvedValue(undefined);
+    fetchMock.mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          embedders: { "acme/text-embed": { inputs: ["text"] } },
+        }),
+        { status: 200, headers: { "content-type": "application/json" } }
+      )
+    );
+
+    const hook = renderHook(() => useConnectedModels());
+    await waitFor(() => expect(hook.result.current.loading).toBe(false));
+    await waitFor(() => expect(hook.result.current.providers).toHaveLength(1));
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "http://inference.test/ai/v1/models",
+      expect.objectContaining({ credentials: "same-origin" })
+    );
+    expect(hook.result.current.providers[0]?.inference?.models?.embedders).toEqual([
+      expect.objectContaining({ name: "acme/text-embed", inputs: ["text"] }),
+    ]);
+    hook.unmount();
   });
 });
 
@@ -226,6 +338,8 @@ describe("useConnectionsWithModels revalidation", () => {
     listConnections.mockReturnValueOnce(new Promise((done) => (resolveEndpointB = done)));
     view.rerender();
     await waitFor(() => expect(listConnections).toHaveBeenCalledTimes(3));
+    expect(view.result.current.loading).toBe(true);
+    expect(view.result.current.connections).toEqual([]);
 
     await act(async () => {
       resolveEndpointB({ connections: [providerConnection({ id: "endpoint-b" })] });
