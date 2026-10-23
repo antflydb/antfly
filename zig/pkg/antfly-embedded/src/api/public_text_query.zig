@@ -104,8 +104,10 @@ pub fn parseStatefulDirectTextOperatorQueryAlloc(
     // `fuzziness`/`prefix_length`. Leave that shape for the generated-schema
     // parser below this direct-DSL layer; consuming it here as an exact term
     // silently changes the query semantics.
+    if (value.object.contains("term") and termQueryHasFuzzyOptions(value) and try directCaseInsensitive(value, "term")) return error.InvalidQueryRequest;
     if (!termQueryHasFuzzyOptions(value)) {
         if (try directStringOperatorValue(value, "term", &.{ "term", "value" }, true)) |parsed| {
+            if (try directCaseInsensitive(value, "term")) return try caseInsensitiveTermQuery(alloc, parsed.field, parsed.value, .term, try directOperatorBoost(value, "term", boost));
             const query_boost = try directOperatorBoost(value, "term", boost);
             const field = try alloc.dupe(u8, parsed.field);
             errdefer alloc.free(field);
@@ -145,6 +147,7 @@ pub fn parseStatefulDirectTextOperatorQueryAlloc(
         }
     }
     if (try directStringOperatorValue(value, "prefix", &.{ "prefix", "text", "value" }, true)) |parsed| {
+        if (try directCaseInsensitive(value, "prefix")) return try caseInsensitiveTermQuery(alloc, parsed.field, parsed.value, .prefix, try directOperatorBoost(value, "prefix", boost));
         const query_boost = try directOperatorBoost(value, "prefix", boost);
         const field = try alloc.dupe(u8, parsed.field);
         errdefer alloc.free(field);
@@ -155,6 +158,7 @@ pub fn parseStatefulDirectTextOperatorQueryAlloc(
         } };
     }
     if (try directStringOperatorValue(value, "wildcard", &.{ "pattern", "wildcard", "value" }, false)) |parsed| {
+        if (try directCaseInsensitive(value, "wildcard")) return try caseInsensitiveTermQuery(alloc, parsed.field, parsed.value, .wildcard, try directOperatorBoost(value, "wildcard", boost));
         const query_boost = try directOperatorBoost(value, "wildcard", boost);
         const field = try alloc.dupe(u8, parsed.field);
         errdefer alloc.free(field);
@@ -165,6 +169,7 @@ pub fn parseStatefulDirectTextOperatorQueryAlloc(
         } };
     }
     if (try directStringOperatorValue(value, "regexp", &.{ "pattern", "regexp", "value" }, false)) |parsed| {
+        if (try directCaseInsensitive(value, "regexp")) return try caseInsensitiveTermQuery(alloc, parsed.field, parsed.value, .regexp, try directOperatorBoost(value, "regexp", boost));
         const query_boost = try directOperatorBoost(value, "regexp", boost);
         const field = try alloc.dupe(u8, parsed.field);
         errdefer alloc.free(field);
@@ -446,6 +451,50 @@ const DirectFuzzyOperatorValue = struct {
     prefix_len: u8 = 0,
     auto_fuzzy: bool = false,
 };
+
+// Structured exact-term operators expose explicit ASCII case folding. Analyzed
+// natural-language matching remains `match`; stemming a glob would change its
+// language rather than simply normalizing its literal letters.
+fn directCaseInsensitive(query: std.json.Value, operator: []const u8) !bool {
+    const nested = query.object.get(operator).?;
+    const outer = query.object.get("case_insensitive");
+    const inner = if (nested == .object) nested.object.get("case_insensitive") else null;
+    if (outer != null and inner != null) return error.InvalidQueryRequest;
+    const flag = inner orelse outer orelse return false;
+    if (flag != .bool) return error.InvalidQueryRequest;
+    return flag.bool;
+}
+
+fn caseInsensitiveTermQuery(alloc: std.mem.Allocator, field: []const u8, text: []const u8, kind: enum { term, prefix, wildcard, regexp }, boost: f32) !db_types.TextQuery {
+    const owned_field = try alloc.dupe(u8, field);
+    errdefer alloc.free(owned_field);
+    var pattern: std.ArrayList(u8) = .empty;
+    defer pattern.deinit(alloc);
+    try pattern.appendSlice(alloc, "(?i)");
+    if (kind == .regexp) {
+        try pattern.appendSlice(alloc, if (std.mem.startsWith(u8, text, "(?i)")) text[4..] else text);
+    } else {
+        try pattern.append(alloc, '^');
+        var escaped = false;
+        for (text) |byte| {
+            if (kind == .wildcard and !escaped and byte == '\\') {
+                escaped = true;
+                continue;
+            }
+            if (kind == .wildcard and !escaped and (byte == '*' or byte == '?')) {
+                try pattern.appendSlice(alloc, if (byte == '*') ".*" else ".");
+            } else {
+                if (std.mem.indexOfScalar(u8, ".+*?()[]{}|^$\\", byte) != null) try pattern.append(alloc, '\\');
+                try pattern.append(alloc, byte);
+            }
+            escaped = false;
+        }
+        if (escaped) try pattern.appendSlice(alloc, "\\\\");
+        if (kind == .prefix) try pattern.appendSlice(alloc, ".*");
+        try pattern.append(alloc, '$');
+    }
+    return .{ .regexp = .{ .field = owned_field, .pattern = try pattern.toOwnedSlice(alloc), .boost = boost } };
+}
 
 fn directStringOperatorValue(
     query: std.json.Value,
@@ -775,4 +824,44 @@ fn directOperatorTestValueDeinit(alloc: std.mem.Allocator, value: *std.json.Valu
     }
     value.object.deinit(alloc);
     value.* = undefined;
+}
+
+test "api query contract case insensitive exact operators use bounded FST regex" {
+    const a = std.testing.allocator;
+    const regex = @import("../search/regex.zig");
+    for ([_][]const u8{
+        \\{"prefix":"Ghisl","field":"text","case_insensitive":true}
+        ,
+        \\{"wildcard":{"pattern":"Ghis?*","field":"text","case_insensitive":true}}
+        ,
+        \\{"regexp":"Ghis[a-z]+","field":"text","case_insensitive":true}
+        ,
+        \\{"term":"Ghislaine","field":"text","case_insensitive":true}
+        ,
+    }) |json| {
+        var parsed = try std.json.parseFromSlice(std.json.Value, a, json, .{});
+        defer parsed.deinit();
+        var query = (try parseStatefulDirectTextQueryAlloc(a, parsed.value, 1)).?;
+        defer query.deinit(a);
+        try std.testing.expect(query == .regexp);
+        var compiled = try regex.compile(a, query.regexp.pattern);
+        defer compiled.deinit();
+        try std.testing.expect(regex.matchesCompiled(query.regexp.pattern, &compiled, "GHISLAINE"));
+        try std.testing.expect(!regex.matchesCompiled(query.regexp.pattern, &compiled, "Maxwell"));
+    }
+    var invalid = try std.json.parseFromSlice(std.json.Value, a,
+        \\{"prefix":"Ghisl","field":"text","case_insensitive":"true"}
+    , .{});
+    defer invalid.deinit();
+    try std.testing.expectError(error.InvalidQueryRequest, parseStatefulDirectTextQueryAlloc(a, invalid.value, 1));
+}
+
+test "api query contract insensitive operator ownership survives allocation failure" {
+    const Harness = struct {
+        fn run(a: std.mem.Allocator) !void {
+            var query = try caseInsensitiveTermQuery(a, "text", "Ghis?*", .wildcard, 1);
+            defer query.deinit(a);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Harness.run, .{});
 }
