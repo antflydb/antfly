@@ -24404,3 +24404,61 @@ sandbox-denied loopback bind failures; the final run permits local networking
 and has no failures or leaks. Native/schema inputs remained unchanged during
 qualification. Full GNU/Linux qualification remains waived; the owning WAL and
 final-close coordinator work described above remains unfinished.
+
+### Reusable physical durability completion resources
+
+Storage can now prepare one owning durability grant before acquiring publication.
+Its nonblocking descriptor try honors queued FD waiters and refuses busy admission
+metadata without holding a partial grant. Preparation retains the native state,
+reserves one shared descriptor, allocates fixed pathname/control-file storage and
+admits one mailbox worker. Missing providers or execution-wait/deadline authority,
+allocation rejection and dispatch refusal fail closed; there is no raw-I/O fallback.
+Native ABI 100 and storage-owner ABI 160 fence the added provider and grant vtables.
+
+A serialized phase copies its bounded input on caller CPU and reuses that worker
+and descriptor for a control-file read, file sync or parent-directory sync. The
+worker performs only physical I/O and bounded mailbox bookkeeping. It retains no
+original admission port. Atomic completion publishes results before reuse; a
+rejected wait retains the exact phase and its bytes/error until explicit retirement.
+A second phase cannot overwrite a live result. Quiesced grant retirement finishes
+accepted work before stopping/joining the worker, then releases state/descriptor
+ownership last, outside that worker.
+
+The resource-ordering requirement remains explicit: a coordinator must try WAL
+publication after preparing an idle grant, and drop the tentative grant before
+waiting if publication is busy. Otherwise a legacy publication holder waiting for
+an FD could deadlock against a closer retaining FDs while waiting for publication.
+This change supplies the reusable completion resources; it does not yet acquire
+WAL publication or replace default DB final persistence with controlled phases.
+The next implementation is compound acquisition and an owning, ordered CURRENT
+read/validation, segment-sync and CURRENT-sync coordinator. Final status writes,
+backend flush, reader/I/O retirement and provider adoption remain open. The full
+goal is active; full GNU/Linux qualification remains waived, and Linux builds
+require the pinned Nix/glibc toolchain.
+
+The physical-operation suite now has 11 cases. Its four-mode grant matrix retains
+accepted work across handoff/reentry/lifetime failures and native-owner shutdown.
+For each mode it completes 193 read/sync phases while all remaining descriptors,
+further allocations and new worker dispatch are unavailable, and preserves the
+protected control slot. Other cases exercise queued-FD fairness, busy guards,
+preparation rollback, mandatory join of an accepted unwaited request, fixed metadata
+limits, stable physical failures and clean subsequent reuse. An independent
+producer/consumer archive test verifies the real grant after producer-owner and
+storage-lease destruction, original SessionLeaseLost transport, stable FileNotFound
+and healthy subsequent phases. Windows, WASI and freestanding test targets skip that case.
+
+Foundation receipt `durability-grant-v3` passes all 68 steps and 86 maintenance/
+shared-service tests, all 11 physical cases, 32 storage-read cases and error/status/
+failure-identity suites (45/1/8). Receipt `durability-grant-v4` adds 92/92 build steps,
+two fresh linked C-entry close tests and 13/13 independent I/O archive tests, plus
+32 DB, 21 local-close and 45 graph-runtime cases. The first two intermediate
+receipts preserve the atomic enum-width correction and threaded-view callback-cast
+correction. The final `durability-grant-v5` receipt includes the platform test guard.
+
+Final receipt `durability-grant-v5` passes all 92 build steps, all 13 I/O archive
+tests and the same simple-runner scopes with no skips, failures or leaks. The
+unchanged maintenance/execution-service tests and linked C-entry close artifacts
+are reused from the qualified foundation and v4 run. Error/status/failure identity
+remains 45/1/8. All 5,539 captured native/schema inputs and immutable log hashes
+match the final source. This is completion-resource qualification; full WAL and
+final-persistence coordinator adoption remains unfinished.

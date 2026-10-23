@@ -105,7 +105,8 @@ const builtin = @import("builtin");
 // Index managers permanently fence detached graph snapshots during controlled close.
 // Physical sync operations retain native state and descriptor admission through controlled retries.
 // Bounded control-file read owners retain physical buffers through durability retries.
-pub const abi_version: u32 = 99;
+// Storage durability grants retain reusable worker, descriptor and buffer ownership.
+pub const abi_version: u32 = 100;
 
 pub const zig_compiler_id: u64 = stableId(builtin.zig_version_string);
 

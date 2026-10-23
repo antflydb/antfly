@@ -328,3 +328,86 @@ test "executor archive boundary outbound view uses the calling archive error dom
     const security: scraping.ContentSecurityConfig = .{ .block_private_ips = false, .allowed_hosts = &hosts, .max_download_size_bytes = 1024 };
     try std.testing.expectError(error.ConnectionRefused, scraping.downloadContentOutcomeAllocWithHeadersAndContext(std.testing.allocator, .{ .io = io, .timeout_ms = 1000 }, url, &security, null, null));
 }
+
+extern fn runtime_io_abi_test_durability_storage(*const @import("antfly_runtime_abi").native_abi.TypeContract, *retained_io.Storage.Lease, *?*anyopaque) callconv(.c) @import("antfly_runtime_abi").error_abi.Status;
+extern fn runtime_io_abi_test_durability_owner_close(*anyopaque) callconv(.c) void;
+
+test "executor archive boundary durability grant retains physical authority and original errors" {
+    const os = @import("builtin").os.tag;
+    if (os == .windows or os == .wasi or os == .freestanding) return error.SkipZigTest;
+    const abi = @import("antfly_runtime_abi");
+    const admission = @import("antfly_local_sources").common_read_admission;
+    const Control = struct {
+        rejected: bool = false,
+        deadline_ns: u64,
+        fn check(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.rejected) return error.SessionLeaseLost;
+        }
+        fn deadline(raw: *anyopaque) !?u64 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            return self.deadline_ns;
+        }
+        fn begin(_: *anyopaque) !void {}
+        fn end(_: *anyopaque) !void {}
+    };
+    var lease: retained_io.Storage.Lease = undefined;
+    var owner: ?*anyopaque = null;
+    defer if (owner) |context| runtime_io_abi_test_durability_owner_close(context);
+    const contract = abi.native_abi.TypeContract.of(retained_io.Storage.Lease);
+    var older = contract;
+    older.version -= 1;
+    const refused = runtime_io_abi_test_durability_storage(&older, &lease, &owner);
+    try std.testing.expectEqual(error.UnsupportedVersion, abi.error_abi.errorFromStatus(refused));
+    try std.testing.expect(owner == null);
+    const status = runtime_io_abi_test_durability_storage(&contract, &lease, &owner);
+    if (!status.isOk()) return abi.error_abi.errorFromStatus(status);
+    var leased = true;
+    defer if (leased) lease.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/CURRENT", .{tmp.sub_path});
+    defer std.testing.allocator.free(path);
+    const missing = try std.fmt.allocPrint(std.testing.allocator, "{s}.missing", .{path});
+    defer std.testing.allocator.free(missing);
+    try lease.view.writeFileAbsolute(path, "archive-control");
+    var control: Control = .{ .deadline_ns = @import("antfly_platform").time.monotonicNs() + 5 * std.time.ns_per_s };
+    const payload: admission.Payload = .{ .ptr = &control, .vtable = &.{ .checkpoint = Control.check, .check_lifetime = Control.check, .deadline_ns = Control.deadline }, .execution_wait = .{ .ptr = &control, .begin = Control.begin, .end = Control.end } };
+    const original = admission.Port.init(&payload);
+    var grant = (try lease.view.tryPrepareDurabilityWithAdmission(original)) orelse return error.TestUnexpectedResult;
+    defer grant.deinit();
+    var read = try grant.beginControlRead(path, 36, original);
+    var read_live = true;
+    defer if (read_live) read.deinit();
+    control.rejected = true;
+    try std.testing.expectError(error.SessionLeaseLost, read.waitWithAdmission(original));
+    // The producer's original owner and storage lease may both close while a
+    // rejected consumer still owns a phase and its reusable completion grant.
+    runtime_io_abi_test_durability_owner_close(owner.?);
+    owner = null;
+    lease.deinit();
+    leased = false;
+    control.rejected = false;
+    const result = try read.waitWithAdmission(original);
+    try std.testing.expectEqual(@as(u64, 15), result.file_size);
+    try std.testing.expectEqualStrings("archive-control", result.bytes);
+    try std.testing.expectError(error.ResourceBudgetExceeded, grant.beginSyncContents(path, original));
+    read.deinit();
+    read_live = false;
+    var sync = try grant.beginSyncContents(path, original);
+    try sync.waitWithAdmission(original);
+    sync.deinit();
+    var absent = try grant.beginSyncContents(missing, original);
+    try std.testing.expectError(error.FileNotFound, absent.waitWithAdmission(original));
+    try std.testing.expectError(error.FileNotFound, absent.waitWithAdmission(original));
+    absent.deinit();
+    var parent = try grant.beginSyncParent(path, original);
+    try parent.waitWithAdmission(original);
+    parent.deinit();
+    control.rejected = true;
+    try std.testing.expectError(error.SessionLeaseLost, grant.beginControlRead(path, 36, original));
+    control.rejected = false;
+    var healthy = try grant.beginControlRead(path, 36, original);
+    defer healthy.deinit();
+    try std.testing.expectEqualStrings("archive-control", (try healthy.waitWithAdmission(original)).bytes);
+}

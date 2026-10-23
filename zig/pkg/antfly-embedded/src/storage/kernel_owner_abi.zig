@@ -47,7 +47,8 @@ const failure_abi = @import("runtime_failure_abi");
 // Close preflight drains detached index pins before durable backend admission closes.
 // Storage durability providers return owning physical sync operations.
 // Storage durability metadata uses owning bounded read operations.
-pub const abi_version: u32 = 159;
+// Storage durability grants retain reusable worker, descriptor and buffer ownership.
+pub const abi_version: u32 = 160;
 pub const Status = failure_abi.Status;
 pub const FailureBoundary = failure_abi.FailureBoundary;
 pub const FailureIdentity = failure_abi.FailureIdentity;
