@@ -274,7 +274,7 @@
       "model": "lighton4b",
       "mode": "batch",
       "concurrency": 8,
-      "log": "lighton4b-batch-c8.txt",
+      "log": "lighton4b-batch-c8.txt.gz",
       "exit_code": 0,
       "status": "ok",
       "requests": 16,

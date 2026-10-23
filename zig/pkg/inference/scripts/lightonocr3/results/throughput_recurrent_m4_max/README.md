@@ -168,8 +168,8 @@ kernel benchmark build. The final rebuild only strengthens a test's assertions
 so they execute in ReleaseFast; production functions are unchanged. Earlier
 manifests/patches identify intermediate builds. Saved
 reports take runtime identity from their build manifest, even if later source
-edits exist in the worktree. Logs and raw JSONL samples are deterministic gzip
-files under `logs/`; benchmark helper/prototype sources and their checksums are
+edits exist in the worktree. Native and vLLM captured text logs are stored beside their reports as gzip files.
+Additional logs and raw JSONL samples are deterministic gzip files under `logs/`; benchmark helper/prototype sources and their checksums are
 under `experiments/`.
 
 To reproduce the checks, build the filtered `inference-test` target in

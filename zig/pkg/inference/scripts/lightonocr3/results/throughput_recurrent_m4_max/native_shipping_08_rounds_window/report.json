@@ -279,7 +279,7 @@
       "model": "lighton08",
       "mode": "batch",
       "concurrency": 16,
-      "log": "lighton08-batch-c16.txt",
+      "log": "lighton08-batch-c16.txt.gz",
       "exit_code": 0,
       "status": "ok",
       "serial_reference_parity": true,

@@ -323,7 +323,7 @@
       "model": "florence",
       "mode": "batch",
       "concurrency": 8,
-      "log": "florence-batch-c8.txt",
+      "log": "florence-batch-c8.txt.gz",
       "exit_code": 0,
       "status": "ok",
       "requests": 16,
