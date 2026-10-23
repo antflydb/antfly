@@ -34,29 +34,53 @@ const HashWriter = struct {
         return count;
     }
 };
-pub fn identity(value: V) ![68]u8 {
+const domain = "antfly.source.value.v1\x00";
+fn digestValue(value: V) ![32]u8 {
     var out: HashWriter = .{};
-    out.hash.update("antfly.source.value.v1\x00");
+    out.hash.update(domain);
     try std.json.Stringify.value(value, .{}, &out.writer);
     try out.writer.flush();
     var digest: [32]u8 = undefined;
     out.hash.final(&digest);
-    return "sv1-".* ++ std.fmt.bytesToHex(digest, .lower);
+    return digest;
 }
-
+pub fn identity(value: V) ![68]u8 {
+    return "sv1-".* ++ std.fmt.bytesToHex(try digestValue(value), .lower);
+}
+/// Caller has already strictly validated the scalar JSON. Plain UTF-8 strings
+/// are their own canonical encoding: hash borrowed bytes without allocating or
+/// reserializing. Numbers and escaped strings use the typed reference.
+/// Keep this fallback rather than guessing about floating-point normalization.
+pub fn validatedScalarDigest(a: std.mem.Allocator, raw: []const u8) !?[32]u8 {
+    const value = std.mem.trim(u8, raw, " \t\r\n");
+    const plain = value.len >= 2 and value[0] == '"' and value[value.len - 1] == '"' and
+        std.mem.indexOfScalar(u8, value, '\\') == null and std.unicode.utf8ValidateSlice(value);
+    if (plain or std.mem.eql(u8, value, "true") or std.mem.eql(u8, value, "false") or std.mem.eql(u8, value, "null")) {
+        var hash = std.crypto.hash.sha2.Sha256.init(.{});
+        hash.update(domain);
+        hash.update(value);
+        var digest: [32]u8 = undefined;
+        hash.final(&digest);
+        return digest;
+    }
+    var parsed = std.json.parseFromSlice(V, a, value, .{}) catch |err| {
+        if (err == error.OutOfMemory) return err;
+        return null;
+    };
+    defer parsed.deinit();
+    return try digestValue(parsed.value);
+}
 const projection = @import("document_projection.zig");
 const prefix = "\x00\x00__metadata__:source_value_identity_v1:";
 pub const Key = [prefix.len + 32]u8;
-// Disposable proofs must not survive a canonicalizer/compiler change. The
-// public identity remains sv1; a mismatching producer ABI forces full-value
-// delivery and bounded backfill instead of trusting an older implementation.
+// Semantic ABI, deliberately independent of compiler version, comments, tests,
+// lookup algorithms and directory layout. Bump ONLY when typed canonical JSON
+// semantics change; golden vectors gate compiler upgrades. Unknown versions
+// safely fall back and backfill. Public identities remain opaque sv1 tokens.
 const canonical_abi: [32]u8 = abi: {
-    @setEvalBranchQuota(2_000_000);
-    var hash = std.crypto.hash.sha2.Sha256.init(.{});
-    hash.update(@import("builtin").zig_version_string);
-    hash.update(@embedFile("source_value_identity.zig"));
+    @setEvalBranchQuota(100_000);
     var digest: [32]u8 = undefined;
-    hash.final(&digest);
+    std.crypto.hash.sha2.Sha256.hash("antfly.source.canonical-json/1", &digest, .{});
     break :abi digest;
 };
 const header_bytes = 111;
@@ -78,36 +102,55 @@ pub fn build(a: std.mem.Allocator, body: []const u8, kind: u8, digest: [32]u8, d
     const proof = .{ .bytes = @as(u64, body.len), .kind = kind, .digest = digest };
     const paths = (try projection.Directory.open(temp, directory, proof)) orelse return null;
     if (paths.version < 2) return null;
-    const Record = struct { index: u16, digest: [32]u8 };
-    var records: [projection.maximum_fields]Record = undefined;
-    var count: usize = 0;
+    var collector: Collector = .{ .a = temp };
     for (paths.fields) |field| {
-        if (field.kind != .leaf) continue;
-        const raw = body[@intCast(field.offset)..][0..@intCast(field.length)];
-        var parsed = std.json.parseFromSlice(V, temp, raw, .{}) catch |err| {
-            if (err == error.OutOfMemory) return err;
-            continue;
-        };
-        defer parsed.deinit();
-        const token = try identity(parsed.value);
-        records[count].index = field.index;
-        _ = try std.fmt.hexToBytes(&records[count].digest, token[4..]);
-        count += 1;
+        if (field.kind == .leaf) try Collector.visit(&collector, field.index, body[@intCast(field.offset)..][0..@intCast(field.length)]);
     }
-    const output = try a.alloc(u8, header_bytes + count * record_bytes);
-    @memcpy(output[0..4], "SVI1");
-    std.mem.writeInt(u64, output[4..12], body.len, .little);
-    @memcpy(output[12..44], &digest);
-    output[44] = kind;
-    std.crypto.hash.sha2.Sha256.hash(directory, output[45..77], .{});
-    std.mem.writeInt(u16, output[77..79], @intCast(count), .little);
-    @memcpy(output[79..111], &canonical_abi);
-    for (records[0..count], 0..) |record, i| {
-        const offset = header_bytes + i * record_bytes;
-        std.mem.writeInt(u16, output[offset..][0..2], record.index, .little);
-        @memcpy(output[offset + 2 ..][0..32], &record.digest);
+    return try collector.encode(a, body.len, kind, digest, directory);
+}
+const Record = struct { index: u16, digest: [32]u8 };
+const Collector = struct {
+    a: std.mem.Allocator,
+    records: [projection.maximum_fields]Record = undefined,
+    count: usize = 0,
+    fn visit(raw: *anyopaque, index: u16, value: []const u8) !void {
+        const self: *Collector = @ptrCast(@alignCast(raw));
+        const digest = (try validatedScalarDigest(self.a, value)) orelse return;
+        self.records[self.count] = .{ .index = index, .digest = digest };
+        self.count += 1;
     }
-    return output;
+    fn encode(self: *const Collector, a: std.mem.Allocator, bytes: usize, kind: u8, digest: [32]u8, directory: []const u8) ![]u8 {
+        const count = self.count;
+        const output = try a.alloc(u8, header_bytes + count * record_bytes);
+        @memcpy(output[0..4], "SVI1");
+        std.mem.writeInt(u64, output[4..12], bytes, .little);
+        @memcpy(output[12..44], &digest);
+        output[44] = kind;
+        std.crypto.hash.sha2.Sha256.hash(directory, output[45..77], .{});
+        std.mem.writeInt(u16, output[77..79], @intCast(count), .little);
+        @memcpy(output[79..111], &canonical_abi);
+        for (self.records[0..count], 0..) |record, i| {
+            const offset = header_bytes + i * record_bytes;
+            std.mem.writeInt(u16, output[offset..][0..2], record.index, .little);
+            @memcpy(output[offset + 2 ..][0..32], &record.digest);
+        }
+        return output;
+    }
+};
+/// Atomic writers share the directory walk. The two disposable formats retain
+/// independent budgets; failed/unsupported directories never publish partial facts.
+pub const Publication = struct { directory: ?[]u8, identities: ?[]u8 };
+pub fn buildAuthority(a: std.mem.Allocator, body: []const u8, kind: u8, digest: [32]u8) !Publication {
+    var arena = std.heap.ArenaAllocator.init(@import("antfly_platform").allocator.reclaimingScratch(a));
+    defer arena.deinit();
+    var collector: Collector = .{ .a = arena.allocator() };
+    const directory = try projection.buildAuthorityObserved(a, body, kind, digest, .{ .ctx = &collector, .visit = Collector.visit });
+    errdefer if (directory) |value| a.free(value);
+    const identities = if (directory) |paths| if (std.mem.startsWith(u8, paths, "DPD2"))
+        try collector.encode(a, body.len, kind, digest, paths)
+    else
+        null else null;
+    return .{ .directory = directory, .identities = identities };
 }
 pub const Certificate = struct {
     records: []const u8,

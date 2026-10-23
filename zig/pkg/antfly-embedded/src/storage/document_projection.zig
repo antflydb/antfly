@@ -50,7 +50,16 @@ fn less(_: void, left: Field, right: Field) bool {
     return std.mem.order(u8, left.name, right.name) == .lt;
 }
 
+/// Optional leaf consumer shares the successfully bounded directory walk. It
+/// observes final packed indices only, never nodes discarded by width fallback.
+pub const LeafObserver = struct {
+    ctx: *anyopaque,
+    visit: *const fn (*anyopaque, u16, []const u8) anyerror!void,
+};
 pub fn build(a: A, bytes: []const u8, kind: u8, digest: [32]u8) !?[]u8 {
+    return buildObserved(a, bytes, kind, digest, null);
+}
+fn buildObserved(a: A, bytes: []const u8, kind: u8, digest: [32]u8, observer: ?LeafObserver) !?[]u8 {
     if (bytes.len < minimum_bytes or bytes.len > offset_mask) return null;
     var arena = std.heap.ArenaAllocator.init(@import("antfly_platform").allocator.reclaimingScratch(a));
     defer arena.deinit();
@@ -97,7 +106,7 @@ pub fn build(a: A, bytes: []const u8, kind: u8, digest: [32]u8) !?[]u8 {
     for (0..roots) |i| try tree.capture(i, 1);
     // The v2 packed descriptor retains the 50-byte per-field overhead. Budget
     // fallbacks attest opaque subtrees and never manufacture missing members.
-    return try encodeTree(a, bytes.len, kind, digest, &tree);
+    return try encodeTree(a, bytes, kind, digest, &tree, observer);
 }
 
 const Tree = struct {
@@ -172,7 +181,7 @@ const Tree = struct {
         if (try scanner.next() != .end_of_document) return error.SyntaxError;
     }
 };
-fn encodeTree(a: A, source_bytes: usize, kind: u8, digest: [32]u8, tree: *Tree) ![]u8 {
+fn encodeTree(a: A, source: []const u8, kind: u8, digest: [32]u8, tree: *Tree, observer: ?LeafObserver) ![]u8 {
     var order: [maximum_fields]usize = undefined;
     var mapped: [maximum_fields]u16 = undefined;
     var count: usize = 0;
@@ -198,14 +207,17 @@ fn encodeTree(a: A, source_bytes: usize, kind: u8, digest: [32]u8, tree: *Tree) 
         }.less);
     }
     const output = try a.alloc(u8, tree.size);
+    errdefer a.free(output);
     @memcpy(output[0..4], "DPD2");
-    std.mem.writeInt(u64, output[4..12], source_bytes, .little);
+    std.mem.writeInt(u64, output[4..12], source.len, .little);
     @memcpy(output[12..44], &digest);
     output[44] = kind;
     std.mem.writeInt(u16, output[45..47], @intCast(count), .little);
     var pos: usize = header_size;
     for (order[0..count]) |i| {
         const field = tree.nodes.items[i].field;
+        if (observer) |sink| if (field.kind == .leaf)
+            try sink.visit(sink.ctx, mapped[i], source[@intCast(field.offset)..][0..@intCast(field.length)]);
         const parent = if (field.parent == no_parent) no_parent else mapped[field.parent];
         const descriptor = field.offset | (@as(u64, parent) << 53) | (@as(u64, @backingInt(field.kind)) << 62);
         std.mem.writeInt(u16, output[pos..][0..2], @intCast(field.name.len), .little);
@@ -225,8 +237,11 @@ fn encodeTree(a: A, source_bytes: usize, kind: u8, digest: [32]u8, tree: *Tree) 
 /// Remember unsupported large values too, so bounded migration/restarts do
 /// not repeatedly read binary values or objects exceeding directory limits.
 pub fn buildAuthority(a: A, bytes: []const u8, kind: u8, digest: [32]u8) !?[]u8 {
+    return buildAuthorityObserved(a, bytes, kind, digest, null);
+}
+pub fn buildAuthorityObserved(a: A, bytes: []const u8, kind: u8, digest: [32]u8, observer: ?LeafObserver) !?[]u8 {
     if (kind != @import("internal_keys.zig").primary_kind or bytes.len < minimum_bytes) return null;
-    if (try build(a, bytes, kind, digest)) |encoded| return encoded;
+    if (try buildObserved(a, bytes, kind, digest, observer)) |encoded| return encoded;
     const output = try a.alloc(u8, header_size);
     @memcpy(output[0..4], "DPX1");
     std.mem.writeInt(u64, output[4..12], bytes.len, .little);

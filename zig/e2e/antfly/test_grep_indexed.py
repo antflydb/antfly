@@ -2741,3 +2741,79 @@ def test_conditional_source_projection_binds_current_values_and_query_selection(
     token = changed["_source_projection"]["body.image"]["identity"]
     fields[0]["if_match"] = [{"id": "other", "identity": token}]
     assert query(request)[0]["_source"]["body"]["image"] == "changed-payload"
+
+
+def test_conditional_source_projection_upgrades_persisted_certificates(monkeypatch):
+    """An implementation-only upgrade may repair metadata, never change values."""
+    from conftest import StandaloneAntflyServer, find_free_port, resolve_binary_path
+
+    baseline = os.environ.get("ANTFLY_BASELINE_BIN")
+    current = os.environ.get("ANTFLY_BIN")
+    if not baseline or not current:
+        pytest.skip(
+            "Set ANTFLY_BASELINE_BIN and ANTFLY_BIN for persisted upgrade checks"
+        )
+    monkeypatch.setenv("ANTFLY_BENCH_QUERY_PROFILE", "1")
+    server = StandaloneAntflyServer(
+        resolve_binary_path(baseline), "127.0.0.1", find_free_port()
+    )
+    try:
+        base = server.api_url + "/tables/conditional_upgrade"
+        created = requests.post(base, json={"num_shards": 1}, timeout=60)
+        created.raise_for_status()
+        deadline = time.monotonic() + 30
+        while requests.get(base, timeout=5).status_code != 200:
+            assert time.monotonic() < deadline, "table did not become visible"
+            time.sleep(0.05)
+        response = requests.post(
+            base + "/batch",
+            json={
+                "inserts": {"a": {"image": "value-" * 8192, "revision": "r1"}},
+                "sync_level": "full_index",
+            },
+            timeout=60,
+        )
+        response.raise_for_status()
+        request = {
+            "query": {"bool": {"filter": {"ids": ["a"]}}},
+            "fields": ["image", "revision"],
+            "limit": 1,
+            "source_projection": {"fields": [{"field": "image"}]},
+        }
+
+        def query():
+            response = requests.post(base + "/query", json=request, timeout=60)
+            response.raise_for_status()
+            result = response.json()["responses"][0]
+            assert result["status"] == 200, result
+            return result["hits"]["hits"][0]
+
+        original = query()
+        token = original["_source_projection"]["image"]["identity"]
+        request["source_projection"]["fields"][0]["if_match"] = [
+            {"id": "a", "identity": token}
+        ]
+        warm = query()
+        assert warm["_source"] == {"revision": "r1"}
+        assert warm["_source_projection"]["image"]["state"] == "unchanged"
+        server.pause()
+        log_start = server.log_path.stat().st_size
+        server.binary = resolve_binary_path(current)
+        server.resume()
+        deadline = time.monotonic() + 30
+        while True:
+            upgraded = query()
+            assert upgraded["_source"] == warm["_source"]
+            assert upgraded["_source_projection"] == warm["_source_projection"]
+            logs = server.log_path.read_text(errors="replace")[log_start:]
+            if (
+                "antfly_bench_conditional_source certificate_hits=1 full_fallbacks=0"
+                in logs
+            ):
+                break
+            assert time.monotonic() < deadline, (
+                "bounded authority repair did not resume proof reuse"
+            )
+            time.sleep(0.05)
+    finally:
+        server.stop()

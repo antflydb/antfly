@@ -333,8 +333,9 @@ pub const BackfillPage = struct {
                         std.crypto.hash.sha2.Sha256.hash(raw, &digest, .{});
                         break :blk Content{ .revision = try load(&metadata, keyForPhysical(last).?), .bytes = raw.len, .kind = last[last.len - 1], .digest = digest };
                     };
-                    const directory = try projection.buildAuthority(a, raw, content.kind, content.digest);
-                    const identities = if (directory) |paths| try value_identity.build(a, raw, content.kind, content.digest, paths) else null;
+                    const publication = try value_identity.buildAuthority(a, raw, content.kind, content.digest);
+                    const directory = publication.directory;
+                    const identities = publication.identities;
                     if (cached == null or directory != null) try entries.append(a, .{ .physical = last, .content = content, .directory = directory, .identities = identities });
                     bytes +|= raw.len;
                 }
@@ -407,9 +408,9 @@ pub const Capture = struct {
             var digest: [32]u8 = undefined;
             std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
             const kind = physical[physical.len - 1];
-            const directory = try projection.buildAuthority(alloc, bytes, kind, digest);
-            errdefer if (directory) |paths| alloc.free(paths);
-            const identities = if (directory) |paths| try value_identity.build(alloc, bytes, kind, digest, paths) else null;
+            const publication = try value_identity.buildAuthority(alloc, bytes, kind, digest);
+            const directory = publication.directory;
+            const identities = publication.identities;
             break :blk .{ .written = .{ .proof = .{ .revision = 0, .bytes = bytes.len, .kind = kind, .digest = digest }, .directory = directory, .identities = identities } };
         } else .deleted;
         if (entry.* == .written) {

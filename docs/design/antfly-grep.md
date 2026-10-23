@@ -357,10 +357,15 @@ Compatible model work coalesces across parents with unique wire IDs. A
 single-parent window retains intra-document provider parallelism.
 
 An asset window contains at most eight parents and 8 MiB conservative evidence.
-Plan complete first waves, shrinking the parent prefix when its shape or
-conservative byte estimate changes; never preload unused partial waves. Only
-equal image-field projection shapes are grouped. Unioning unrelated fields
-would overfetch those fields on every row. A group is one current ID-filtered
+Plan complete first waves, shrinking the parent prefix at the conservative
+transfer bound; never preload unused partial waves. Within that bounded prefix,
+normalize field order and bucket equal projection shapes, including alternating
+shapes. Singletons retain ordinary point loading. Independent groups use the
+existing persistent worker pool concurrently; one-group windows remain inline.
+Page-memory reservations are apportioned by estimated transfer size before
+launch, with a combined bound of the configured page budget. Join every fetch
+before retiring its manifest, including partial launch and error paths.
+Unioning unrelated fields would overfetch those fields on every row. A group is one current ID-filtered
 query, with no ordering or retained pagination state. Each returned parent
 independently checks access and revision before its payloads are validated.
 Missing/denied/changed parents do not authorize their image bytes or score reuse.
@@ -462,10 +467,30 @@ hashing and omission. Eligible native JSON retrieval instead uses bounded,
 storage-owned canonical-value certificates published atomically with the primary
 value, content proof, projection directory and mutation revision. Certificates
 bind the original content length/digest, exact directory digest, value kind and
-canonicalizer/compiler ABI. They certify disjoint scalar leaves; raw directory
+semantic canonicalizer ABI. They certify disjoint scalar leaves; raw directory
 hashes are never value identities. The existing directory format and coverage
 budget are unchanged. Rows below the existing 16 KiB projection threshold
 receive no certificate. Each optional certificate is bounded below 18 KiB.
+
+The ABI is an explicitly versioned typed-JSON contract, independent of comments,
+tests, compiler identity, and lookup implementation. Fixed canonicalization and
+ABI golden vectors gate toolchain changes; a semantic change requires an ABI
+revision. Unknown ABIs fall back safely. Editing certificate plumbing does not
+invalidate an existing table's proofs. Atomic writes and bounded repair collect
+canonical leaf identities during the successful directory encoding walk, rather
+than reparsing the finished directory. Already validated, unescaped UTF-8 JSON
+strings and booleans/null use borrowed canonical bytes; escaped strings and
+numbers retain typed canonicalization. Both routes must produce identical sv1
+identities. Directory coverage and fallback admission remain unchanged.
+
+Eligible reads prepare at most 64 rows from one pinned transaction. One sorted,
+deduplicated batch loads content/revision/TTL metadata; a second loads required
+directories and certificates. Each directory is decoded once. Bounded owned
+metadata survives backend-buffer retirement; remaining field reads reuse the
+same proof/directory rather than fetching them again. Row scratch is still
+recycled independently. This is request-local work reuse, not an authorization
+or cross-request snapshot cache. Unsupported parent masks bypass preparation;
+small/opaque/stale cases retain ordinary source delivery.
 
 A current certificate permits unchanged leaves to be omitted without loading or
 hashing those payloads. Current permissions, revision, query membership and

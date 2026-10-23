@@ -340,9 +340,9 @@ fn scan(search: anytype, http: *httpx.Client, config: Config, table: Table, coun
             fetcher.submit(.{ .cursor = cursor, .snapshot = snapshot, .page_size = page_size });
             pending = true;
         }
-        var materialized: ?Materialized = null;
+        var materialized: ?MaterializationWindow = null;
         var window_end: usize = 0;
-        defer if (materialized) |group| group.page.deinit(search.a);
+        defer if (materialized) |window| window.deinit(search.a);
         // Active jobs retain their own pages, so discovery can advance while
         // an earlier ordered result is pending. The scheduler bounds leases.
         for (hits.array.items, 0..) |hit, hit_index| {
@@ -350,10 +350,10 @@ fn scan(search: anytype, http: *httpx.Client, config: Config, table: Table, coun
             if (count.* >= search.options.max_index_documents) return error.IndexDocumentBudgetExceeded;
             if (lane_count > 1 and hit_index == window_end) {
                 _ = try scheduler.vacant(lane_count);
-                if (materialized) |group| group.page.deinit(search.a);
+                if (materialized) |window| window.deinit(search.a);
                 materialized = null;
                 window_end = @min(hits.array.items.len, hit_index + @min(lane_count, search.options.max_index_documents - count.*));
-                materialized = try prefetchAssets(search, http, config, table, url, user_filter, a, hits.array.items[hit_index..window_end], &discovery);
+                materialized = try prefetchAssets(search, &pool, http, config, table, url, user_filter, a, hits.array.items[hit_index..window_end], &discovery);
                 if (materialized) |group| window_end = hit_index + group.covered_hits;
             }
             if (search.stopped()) return;
@@ -388,9 +388,9 @@ fn scan(search: anytype, http: *httpx.Client, config: Config, table: Table, coun
                 const slot = try scheduler.vacant(lane_count);
                 const job = &scheduler.jobs[slot];
                 job.resolver = resolver;
-                job.resolver.materialized = materialized;
+                job.resolver.materialized = if (materialized) |window| window.find(id) else null;
                 job.resolver.wave_page = &job.page;
-                if (materialized) |group| {
+                if (job.resolver.materialized) |group| {
                     group.page.retain();
                     job.page = group.page;
                 }
@@ -497,15 +497,35 @@ fn plannedRecords(search: anytype, a: A, config: Config, table: Table, id: []con
 
 const PlannedParent = struct { id: []const u8, records: []const ?descriptors.Record };
 const Materialized = struct { page: *Page, fields: []const []const u8, covered_hits: usize, records: []const PlannedParent };
+const MaterializationWindow = struct {
+    groups: []const Materialized,
+    covered_hits: usize,
+    fn find(self: @This(), id: []const u8) ?Materialized {
+        for (self.groups) |group| for (group.records) |parent| {
+            if (std.mem.eql(u8, parent.id, id)) return group;
+        };
+        return null;
+    }
+    fn deinit(self: @This(), a: A) void {
+        for (self.groups) |group| group.page.deinit(a);
+    }
+};
 
-/// Group only equal projection shapes. Unioning unrelated per-parent fields
-/// would multiply payloads on every row and defeat the byte bound.
-fn prefetchAssets(search: anytype, http: *httpx.Client, config: Config, table: Table, url: []const u8, filter: ?std.json.Value, a: A, hits: []const std.json.Value, discovery: anytype) !?Materialized {
+/// Bucket equal projection shapes within one bounded discovery window, rather
+/// than stopping at the first alternating shape. Never union unrelated fields:
+/// a sparse/wide collection must not multiply payloads across every parent.
+fn prefetchAssets(search: anytype, pool: *@import("worker_pool.zig").Pool, http: *httpx.Client, config: Config, table: Table, url: []const u8, filter: ?std.json.Value, a: A, hits: []const std.json.Value, discovery: anytype) !?MaterializationWindow {
     const media = @import("antfly_source_evidence");
     if (search.options.max_count == 0 or search.options.max_regions_per_file == 0) return null;
-    var ids: std.ArrayList([]const u8) = .empty;
-    var shape: std.ArrayList([]const u8) = .empty;
-    var planned: std.ArrayList(PlannedParent) = .empty;
+    if (hits.len > 8) return error.InvalidIndexResponse;
+    const Plan = struct {
+        shape: []const []const u8,
+        ids: std.ArrayList([]const u8) = .empty,
+        parents: std.ArrayList(PlannedParent) = .empty,
+        estimated: usize = 0,
+    };
+    var plans: [8]Plan = undefined;
+    var plan_count: usize = 0;
     var estimated: usize = 0;
     var covered_hits = hits.len;
     for (hits, 0..) |hit, hit_index| {
@@ -541,6 +561,11 @@ fn prefetchAssets(search: anytype, http: *httpx.Client, config: Config, table: T
             } else false;
             if (!present) try fields.append(a, unit.asset.field);
         }
+        std.mem.sort([]const u8, fields.items, {}, struct {
+            fn less(_: void, left: []const u8, right: []const u8) bool {
+                return std.mem.order(u8, left, right) == .lt;
+            }
+        }.less);
         const records = try plannedRecords(search, a, config, table, id, value, path, selected[0..wave]);
         var bytes: usize = 65536;
         for (selected[0..wave], records[0..wave]) |unit, expected| {
@@ -558,44 +583,112 @@ fn prefetchAssets(search: anytype, http: *httpx.Client, config: Config, table: T
                 record.* = expected;
             }
         }
-        if (ids.items.len == 0) try shape.appendSlice(a, fields.items) else {
-            const equal = if (shape.items.len == fields.items.len) for (shape.items, fields.items) |old, current| {
-                if (!std.mem.eql(u8, old, current)) break false;
-            } else true else false;
-            if (!equal) {
-                covered_hits = hit_index;
-                break;
-            }
-        }
         if (bytes > @min(@as(usize, 8 * 1024 * 1024), config.max_response_bytes) -| estimated) {
             covered_hits = hit_index;
             break;
         }
         estimated +|= bytes;
-        try ids.append(a, id);
-        try planned.append(a, .{ .id = id, .records = field_records });
-    }
-    if (ids.items.len < 2) return null;
-    var fields: std.ArrayList([]const u8) = .empty;
-    try fields.append(a, try std.fmt.allocPrint(a, "{s}.revision", .{table.document_field}));
-    try fields.append(a, try std.fmt.allocPrint(a, "{s}.permissions", .{table.document_field}));
-    try fields.appendSlice(a, shape.items);
-    const encoded = try std.json.Stringify.valueAlloc(a, .{ .bool = .{ .filter = .{ .ids = ids.items } } }, .{});
-    var projected: std.ArrayList(SourceField) = .empty;
-    for (shape.items, 0..) |field, i| {
-        var conditions: std.ArrayList(SourceCondition) = .empty;
-        for (planned.items) |parent| if (parent.records[i]) |record| {
-            try conditions.append(a, .{ .id = parent.id, .identity = record.identity });
+        const slot = for (plans[0..plan_count], 0..) |plan, i| {
+            const equal = if (plan.shape.len == fields.items.len) for (plan.shape, fields.items) |left, right| {
+                if (!std.mem.eql(u8, left, right)) break false;
+            } else true else false;
+            if (equal) break i;
+        } else new: {
+            plans[plan_count] = .{ .shape = fields.items };
+            plan_count += 1;
+            break :new plan_count - 1;
         };
-        try projected.append(a, .{ .field = field, .if_match = conditions.items });
+        plans[slot].estimated +|= bytes;
+        try plans[slot].ids.append(a, id);
+        try plans[slot].parents.append(a, .{ .id = id, .records = field_records });
     }
-    var fetch: Fetch = .{ .a = search.a, .io = search.io, .options = search.options, .limits = &search.limits, .config = config, .url = url, .document_field = table.document_field, .filter = filter, .text_query = try std.json.parseFromSliceLeaky(std.json.Value, a, encoded, .{}), .http = http, .fields = fields.items, .ordered = false, .source_projection = if (descriptors.enabled(search.options)) .{ .fields = projected.items } else null };
-    defer search.summary.index_requests += fetch.summary.index_requests;
-    const page = fetch.load(.{ .cursor = null, .snapshot = null, .page_size = ids.items.len }) catch |err| switch (err) {
-        error.ResponseTooLarge, error.IndexPageMemoryExceeded, error.IndexProjectionTooLarge => return null,
-        else => return err,
+    const GroupFetch = struct {
+        fetch: Fetch,
+        size: usize,
+        shape: []const []const u8,
+        parents: []const PlannedParent,
+        page: ?*Page = null,
+        failure: ?anyerror = null,
+        handle: ?@import("worker_pool.zig").Handle = null,
+        fn run(self: *@This()) void {
+            self.page = self.fetch.load(.{ .cursor = null, .snapshot = null, .page_size = self.size }) catch |err| {
+                self.failure = err;
+                return;
+            };
+        }
+        fn join(self: *@This()) void {
+            if (self.handle) |handle| handle.join();
+            self.handle = null;
+        }
     };
-    return .{ .page = page, .fields = shape.items, .covered_hits = covered_hits, .records = planned.items };
+    var jobs: [8]GroupFetch = undefined;
+    var started: usize = 0;
+    defer for (jobs[0..started]) |*job| {
+        job.join();
+        search.summary.index_requests += job.fetch.summary.index_requests;
+        if (job.page) |page| page.deinit(search.a);
+    };
+    var group_count: usize = 0;
+    var total_estimated: usize = 0;
+    for (plans[0..plan_count]) |plan| if (plan.ids.items.len >= 2) {
+        group_count += 1;
+        total_estimated +|= plan.estimated;
+    };
+    for (plans[0..plan_count]) |plan| {
+        // Singletons use the normal point loader, avoiding speculative work.
+        if (plan.ids.items.len < 2) continue;
+        // Reserve proportional page budgets BEFORE dispatch. Concurrent groups
+        // cannot each spend the whole page budget; skewed shapes retain a fair
+        // share by estimated transfer size. Rounding only reduces the total.
+        var group_config = config;
+        group_config.max_page_memory = @intCast((@as(u128, config.max_page_memory) * plan.estimated) / total_estimated);
+        group_config.max_response_bytes = @min(group_config.max_response_bytes, group_config.max_page_memory);
+        if (group_config.max_page_memory == 0) continue;
+        const ids = plan.ids;
+        const shape = plan.shape;
+        const planned = plan.parents;
+        var fields: std.ArrayList([]const u8) = .empty;
+        try fields.append(a, try std.fmt.allocPrint(a, "{s}.revision", .{table.document_field}));
+        try fields.append(a, try std.fmt.allocPrint(a, "{s}.permissions", .{table.document_field}));
+        try fields.appendSlice(a, shape);
+        const encoded = try std.json.Stringify.valueAlloc(a, .{ .bool = .{ .filter = .{ .ids = ids.items } } }, .{});
+        var projected: std.ArrayList(SourceField) = .empty;
+        for (shape, 0..) |field, i| {
+            var conditions: std.ArrayList(SourceCondition) = .empty;
+            for (planned.items) |parent| if (parent.records[i]) |record| {
+                try conditions.append(a, .{ .id = parent.id, .identity = record.identity });
+            };
+            try projected.append(a, .{ .field = field, .if_match = conditions.items });
+        }
+        const job = &jobs[started];
+        job.* = .{
+            .fetch = .{ .a = search.a, .io = search.io, .options = search.options, .limits = &search.limits, .config = group_config, .url = url, .document_field = table.document_field, .filter = filter, .text_query = try std.json.parseFromSliceLeaky(std.json.Value, a, encoded, .{}), .http = http, .fields = fields.items, .ordered = false, .source_projection = if (descriptors.enabled(search.options)) .{ .fields = projected.items } else null },
+            .size = ids.items.len,
+            .shape = shape,
+            .parents = planned.items,
+        };
+        started += 1;
+        if (group_count == 1) {
+            job.run();
+        } else job.handle = pool.launch(GroupFetch.run, job) catch fallback: {
+            job.run();
+            break :fallback null;
+        };
+    }
+    var groups: std.ArrayList(Materialized) = .empty;
+    errdefer for (groups.items) |group| group.page.deinit(search.a);
+    for (jobs[0..started]) |*job| {
+        job.join();
+        if (job.failure) |err| switch (err) {
+            error.ResponseTooLarge, error.IndexPageMemoryExceeded, error.IndexProjectionTooLarge => continue,
+            else => return err,
+        };
+        const page = job.page orelse return error.InvalidIndexResponse;
+        try groups.append(a, .{ .page = page, .fields = job.shape, .covered_hits = covered_hits, .records = job.parents });
+        job.page = null;
+    }
+    if (groups.items.len == 0) return null;
+    return .{ .groups = groups.items, .covered_hits = covered_hits };
 }
 
 const Page = struct {

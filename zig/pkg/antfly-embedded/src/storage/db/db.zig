@@ -41389,20 +41389,35 @@ pub const DB = struct {
             const end = @min(result.hits.len, start + 64);
             var window = std.heap.ArenaAllocator.init(@import("antfly_platform").allocator.reclaimingScratch(alloc));
             defer window.deinit();
+            var row_scratch = std.heap.ArenaAllocator.init(@import("antfly_platform").allocator.reclaimingScratch(alloc));
+            defer row_scratch.deinit();
             var txn = try self.core.store.beginReadTxn();
             defer txn.abort();
+            const conditional_mod = @import("../conditional_source.zig");
+            var authorities: conditional_mod.Window = .{};
+            var physical_keys: [64][]const u8 = undefined;
+            var ids: [64][]const u8 = undefined;
+            const authenticated = self.core.store.valuesAreAuthenticated() and conditional_mod.exactSelectedValues(req.fields, parsed);
+            if (authenticated) {
+                for (result.hits[start..end], 0..) |hit, i| {
+                    physical_keys[i] = try encodeStoreLookupKeyWithPinnedSchemaAlloc(self, window.allocator(), hit.id, schema);
+                    ids[i] = hit.id;
+                }
+                var scope = try txn.openReadScope(window.allocator());
+                defer scope.close();
+                authorities = try conditional_mod.Window.prepare(window.allocator(), &scope, physical_keys[0 .. end - start], ids[0 .. end - start]);
+            }
             var fallback_keys: [64][]const u8 = undefined;
             var fallback_slots: [64]usize = undefined;
             var count: usize = 0;
             for (result.hits[start..end], start..) |*hit, i| {
                 try db_query_search.checkSearchRequestDeadline(req);
-                if (self.core.store.valuesAreAuthenticated()) {
-                    if (!window.reset(.{ .retain_with_limit = 256 * 1024 })) _ = window.reset(.free_all);
-                    var scope = try txn.openReadScope(window.allocator());
+                if (authenticated) {
+                    if (!row_scratch.reset(.{ .retain_with_limit = 256 * 1024 })) _ = row_scratch.reset(.free_all);
+                    var scope = try txn.openReadScope(row_scratch.allocator());
                     defer scope.close();
-                    const physical = try encodeStoreLookupKeyWithPinnedSchemaAlloc(self, window.allocator(), hit.id, schema);
                     var repair = false;
-                    const conditional = try @import("../conditional_source.zig").loadWithRepair(alloc, window.allocator(), &scope, physical, hit.id, req.fields, prepared, &repair);
+                    const conditional = try conditional_mod.loadPrepared(alloc, row_scratch.allocator(), &scope, physical_keys[i - start], hit.id, req.fields, prepared, authorities.rows[i - start], &repair);
                     if (repair) self.document_authority_backfill_requested.store(true, .release);
                     if (conditional) |value| {
                         hit.clearSource(alloc);

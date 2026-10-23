@@ -46,6 +46,12 @@ def main():
     parser.add_argument("--page-size", type=int, default=16)
     parser.add_argument("--image-bytes", type=int, default=0)
     parser.add_argument(
+        "--shapes",
+        type=int,
+        default=1,
+        help="alternating exact projection shapes (1..parents)",
+    )
+    parser.add_argument(
         "--stream",
         action="store_true",
         help="disable ranking to measure first streaming output",
@@ -72,6 +78,7 @@ def main():
         args.rounds < 1
         or not 1 <= args.units <= 16
         or not 1 <= args.parents <= 64
+        or not 1 <= args.shapes <= args.parents
         or not 1 <= args.page_size <= 1000
         or not 0 <= args.image_bytes <= 500000
         or args.delay_ms < 0
@@ -142,7 +149,11 @@ def main():
                                     + struct.pack(">I", zlib.crc32(b"tEXt" + payload))
                                 )
                                 image = image[:-12] + chunk + image[-12:]
-                            field = f"preview{i}"
+                            field = (
+                                f"preview{i}"
+                                if args.shapes == 1
+                                else f"shape{parent % args.shapes}_preview{i}"
+                            )
                             entry["_source"]["payloads"][field] = (
                                 "data:image/png;base64,"
                                 + base64.b64encode(image).decode()
@@ -290,6 +301,7 @@ def main():
         "machine": platform.machine(),
         "units": args.units,
         "parents": args.parents,
+        "shapes": args.shapes,
         "page_size": args.page_size,
         "requested_image_bytes": args.image_bytes,
         "ranked": not args.stream,

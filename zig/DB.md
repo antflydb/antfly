@@ -1615,11 +1615,25 @@ mutation revision. It does not change DPD2 coverage or admission limits; rows
 below the existing 16 KiB threshold do not receive certificates.
 
 A certificate binds primary byte length/SHA-256, source kind, exact directory
-SHA-256 and canonicalizer/compiler ABI. Up to 512 sorted directory-index/digest
+SHA-256 and semantic canonicalizer ABI. Up to 512 sorted directory-index/digest
 pairs certify disjoint scalar leaves, with a total bound of 17,519 bytes.
 Canonical identities hash the typed JSON value with the versioned source-value
 domain; directory hashes are binding checks, never interchangeable identities.
 Deletion removes the sidecar. Stale optional metadata cannot authorize omission.
+The ABI is explicitly versioned independently of source-file/compiler identity;
+fixed typed-JSON and ABI golden vectors gate upgrades. Lookup/comment/test edits
+cannot invalidate a table's certificates. Unknown semantic versions still reject.
+The ordinary atomic write and repair paths collect identities during the final
+bounded directory walk. Unescaped valid UTF-8 scalar strings, booleans and null
+hash their borrowed canonical bytes directly. Other scalars retain the typed
+reference canonicalizer; raw directory digests remain separate binding hashes.
+
+Window preparation uses two sorted/deduplicated metadata batches for up to 64
+rows: proofs/revisions/TTL, then directories/certificates. Decoded directories and
+owned certificate records remain local to the pinned transaction and are reused
+for the remaining projected field reads. Retained metadata is bounded by 64
+format-limited authorities; row reconstruction scratch remains independently
+recyclable. Parent masks that cannot use these facts bypass preparation entirely.
 
 `conditional_source.zig` checks these bindings under the ordinary publication
 lease and read scope. Each bounded window uses an ordinary read transaction;

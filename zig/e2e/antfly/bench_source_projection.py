@@ -83,6 +83,20 @@ def main():
     parser.add_argument("--documents", type=int, default=8)
     parser.add_argument("--value-bytes", type=int, default=262144)
     parser.add_argument("--output", required=True, type=Path)
+    parser.add_argument(
+        "--workload",
+        choices=(
+            "ascii",
+            "escaped",
+            "unicode",
+            "numeric",
+            "wide",
+            "opaque",
+            "small",
+            "mixed",
+        ),
+        default="ascii",
+    )
     args = parser.parse_args()
     if (
         not 1 <= args.documents <= 64
@@ -93,13 +107,40 @@ def main():
             "1..64 documents, 16 KiB..1 MiB values and positive rounds required"
         )
     binaries = {"baseline": args.baseline.resolve(), "candidate": args.binary.resolve()}
-    documents = {
-        f"doc-{i:04}": {
-            "metadata": {"revision": "r1", "allowed": True},
-            "payload": {"large": "x" * args.value_bytes + str(i)},
-        }
-        for i in range(args.documents)
-    }
+
+    def document(i):
+        workload = args.workload
+        if workload == "mixed":
+            workload = (
+                "ascii",
+                "escaped",
+                "unicode",
+                "numeric",
+                "wide",
+                "opaque",
+                "small",
+            )[i % 7]
+        unit = {"ascii": "x", "escaped": 'line\nquote"\\', "unicode": "café λ 🚀"}.get(
+            workload, "x"
+        )
+        large = (unit * (args.value_bytes // len(unit.encode()) + 1))[
+            : args.value_bytes
+        ] + str(i)
+        if workload == "numeric":
+            large = 9007199254740993 + i
+        elif workload == "opaque":
+            large = [{"text": large, "number": i}]
+        elif workload == "small":
+            large = f"small-{i}"
+        payload = {"large": large}
+        if workload == "wide":
+            payload.update({f"sibling{j:03}": j for j in range(128)})
+        out = {"metadata": {"revision": "r1", "allowed": True}, "payload": payload}
+        if workload == "numeric":
+            out["padding"] = "p" * args.value_bytes
+        return out
+
+    documents = {f"doc-{i:04}": document(i) for i in range(args.documents)}
     corpus = hashlib.sha256(json.dumps(documents, sort_keys=True).encode()).hexdigest()
     samples = []
     output_hashes = {}
@@ -156,11 +197,19 @@ def main():
                         "limit": args.documents,
                         "source_projection": {"fields": [{"field": "payload.large"}]},
                     }
-                    for phase in ("full", "conditional"):
+                    for phase in ("ordinary", "full", "conditional"):
+                        if phase == "ordinary":
+                            phase_request = {
+                                k: v
+                                for k, v in request.items()
+                                if k != "source_projection"
+                            }
+                        else:
+                            phase_request = request
                         response, usage = measure(
                             read,
                             lambda: session.post(
-                                base + "/query", json=request, timeout=60
+                                base + "/query", json=phase_request, timeout=60
                             ),
                         )
                         result = response.json()["responses"][0]
@@ -168,7 +217,7 @@ def main():
                         hits = result["hits"]["hits"]
                         assert {h["_id"] for h in hits} == set(documents), result
                         evidence = sorted(
-                            (h["_id"], h["_source"], h["_source_projection"])
+                            (h["_id"], h["_source"], h.get("_source_projection"))
                             for h in hits
                         )
                         digest = hashlib.sha256(
@@ -178,16 +227,17 @@ def main():
                             "baseline/candidate source delivery differs"
                         )
                         for hit in hits:
-                            state = hit["_source_projection"]["payload.large"]
-                            assert state["state"] == (
-                                "value" if phase == "full" else "unchanged"
-                            ), hit
+                            if phase != "ordinary":
+                                state = hit["_source_projection"]["payload.large"]
+                                assert state["state"] == (
+                                    "value" if phase == "full" else "unchanged"
+                                ), hit
                             assert hit["_source"]["metadata"] == {
                                 "revision": "r1",
                                 "allowed": True,
                             }
                             assert ("large" in hit["_source"].get("payload", {})) == (
-                                phase == "full"
+                                phase != "conditional"
                             )
                         samples.append(
                             {
@@ -197,6 +247,8 @@ def main():
                                 **usage,
                             }
                         )
+                        if phase != "full":
+                            continue
                         request["source_projection"]["fields"][0]["if_match"] = [
                             {
                                 "id": h["_id"],
@@ -216,6 +268,7 @@ def main():
                     ]
                     if (
                         variant == "candidate"
+                        and args.workload in ("ascii", "escaped", "unicode", "numeric")
                         and sum(a for a, _ in counts) < 2 * args.documents
                     ):
                         failure = args.output.with_suffix(".server-failure.log")
@@ -224,6 +277,9 @@ def main():
                         raise AssertionError(
                             f"Missing certificate-hit evidence: {counts}; see {failure}"
                         )
+                    if variant == "candidate" and args.workload in ("small", "opaque"):
+                        assert sum(a for a, _ in counts) == 0, counts
+                        assert sum(b for _, b in counts) >= 2 * args.documents, counts
                     certificate_counts.append(
                         {
                             "variant": variant,
@@ -247,7 +303,7 @@ def main():
             os.environ["ANTFLY_BENCH_QUERY_PROFILE"] = previous_profile
     medians = []
     for variant in binaries:
-        for phase in ("ingest", "full", "conditional"):
+        for phase in ("ingest", "ordinary", "full", "conditional"):
             selected = [
                 s for s in samples if s["variant"] == variant and s["phase"] == phase
             ]
@@ -268,7 +324,8 @@ def main():
             )
     report = {
         "schema_version": 1,
-        "scope": "Native single-shard JSON tables, synthetic ASCII source values, warm filesystem/storage caches after ingestion; whole server process CPU includes background work; RSS sampled every 5 ms and is not an allocation bound; shared host; no inference",
+        "workload": args.workload,
+        "scope": "Native single-shard JSON tables, synthetic varied source values, warm filesystem/storage caches after ingestion; whole server process CPU includes background work; RSS sampled every 5 ms and is not an allocation bound; shared host; no inference",
         "platform": platform.platform(),
         "machine": platform.machine(),
         "cpu_count": os.cpu_count(),

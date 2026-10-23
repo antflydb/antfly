@@ -4488,6 +4488,75 @@ class CliTests(unittest.TestCase):
         self.assertEqual(len(self.server.index_requests), 17)
         self.assertLessEqual(len(self.server.requests), 32)
 
+    def test_media_shape_buckets_preserve_order_without_unioning_unrelated_fields(self):
+        for shapes, point_count in ((1, 1), (2, 2), (8, 8)):
+            with self.subTest(shapes=shapes):
+                config = self.visual_parents(count=8, page_size=8)
+                for i, row in enumerate(self.server.index_documents):
+                    payloads = row["_source"]["payloads"]
+                    field = f"shape{i % shapes}"
+                    payloads[field] = payloads.pop("preview")
+                    row["_source"]["grep"]["evidence"][0]["asset"]["field"] = (
+                        "payloads." + field
+                    )
+                self.server.index_requests.clear()
+                result = self.raw_cli(
+                    *self.decision_args(),
+                    "--media=images",
+                    "--json",
+                    "--no-cache",
+                    "--no-rank",
+                    "--table-config",
+                    config,
+                    "--decision-concurrency=8",
+                )
+                evidence = [
+                    json.loads(line)["data"]
+                    for line in result.stdout.splitlines()
+                    if json.loads(line)["type"] == "evidence"
+                ]
+                self.assertEqual(len(evidence), 8)
+                self.assertEqual(
+                    [e["path"] for e in evidence],
+                    [f"Drive/image-{i:04}.png" for i in range(8)],
+                )
+                points = [
+                    body
+                    for _, _, body in self.server.index_requests
+                    if "order_by" not in body
+                ]
+                self.assertEqual(len(points), point_count)
+                for point in points:
+                    assets = [f for f in point["fields"] if f.startswith("payloads.")]
+                    self.assertEqual(len(assets), 1)
+                if shapes == 2:
+                    # Both independent fetch jobs must retire safely when
+                    # oversized groups fall back or authorization fails.
+                    args = [
+                        *self.decision_args(),
+                        "--media=images",
+                        "--json",
+                        "--no-cache",
+                        "--no-rank",
+                        "--table-config",
+                        config,
+                        "--decision-concurrency=8",
+                    ]
+                    self.server.asset_mode = "oversized_parent_group"
+                    fallback = self.raw_cli(*args)
+                    fallback_paths = [
+                        json.loads(line)["data"]["path"]
+                        for line in fallback.stdout.splitlines()
+                        if json.loads(line)["type"] == "evidence"
+                    ]
+                    self.assertEqual(fallback_paths, [e["path"] for e in evidence])
+                    before = len(self.server.requests)
+                    self.server.asset_mode = "revoked"
+                    denied = self.raw_cli(*args, code=2)
+                    self.assertIn(b"IndexAuthorizationFailed", denied.stderr)
+                    self.assertEqual(len(self.server.requests), before)
+                    self.server.asset_mode = None
+
     def test_media_conditional_projection_avoids_warm_images_and_materializes_score_misses(
         self,
     ):
