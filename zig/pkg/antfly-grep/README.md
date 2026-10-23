@@ -4561,7 +4561,11 @@ The default 1,000-request cap applies to all index and provider attempts across
 lanes. Default-budget image searches can overlap a manifest page only when
 conservative current-page retry/split headroom remains; explicit finite budgets
 and text-stage searches keep serial metadata admission. Server-owned conditional
-source identities remain [future API work](../../../docs/design/antfly-grep.md#future-generic-conditional-source-projection); warm images still receive full byte validation.
+source identities use the generic [conditional projection contract](../../../docs/design/antfly-grep.md#conditional-source-projection-and-future-storage-authorities).
+Warm descriptor and decision hits can omit image transfers after a current
+permission/revision check. Changed values or unavailable scores materialize and
+validate full bytes. Older servers retain full-value fallback. That qualification used the server reference path, which reads and hashes
+selected values. The follow-up below adds bounded storage-owned scalar proofs.
 
 The [rolling-evidence qualification](bench/results/grep-rolling-evidence-summary.json)
 compares this implementation with the preceding cross-parent binary. In a
@@ -4592,3 +4596,164 @@ cases and Windows cross-compilation passed. The report records these final
 validation hashes separately; its performance measurements remain pinned to the
 earlier measured binaries. Failed deferred drains join and discard remaining
 borrowers before retiring any manifest page, including failures inside cleanup.
+
+The [conditional-projection qualification](bench/results/grep-conditional-projection-summary.json)
+compares the merged rolling-lane binary with bounded verified-image descriptors
+and cross-manifest worker refill. Five alternating fixture rounds produced these
+medians (baseline → candidate):
+
+| Fixture | macOS elapsed | Constrained Linux elapsed |
+|---|---:|---:|
+| 128 large images, cold | 454 → 525 ms | 415 → 475 ms |
+| 128 large images, warm | 229 → 205 ms | 210 → 239 ms |
+| 24 single-row pages, slow first parent, cold | 1,872 → 998 ms | 1,767 → 922 ms |
+| 24 single-row pages, warm | 720 → 674 ms | 690 → 658 ms |
+
+For the large-image warm fixture, median CLI child CPU falls from 117.6 to
+17.1 ms on macOS and 187.8 to 33.0 ms in Linux; peak RSS falls from 24.7 to
+7.1 MiB and 40.2 to 16.8 MiB. Projected image bytes fall from 44,742,400 to
+zero on macOS and 5,243,250 in Linux. The bounded best-effort descriptor cache
+can lose facts to collisions or racing writes; those cases safely materialize
+source again. Warm zero-transfer and lower elapsed time are therefore not
+guaranteed. Cold large-image latency regresses, and tiny-image warm child CPU
+increases. Both variants already make zero warm provider calls.
+
+These are generated-image/constant-score loopback fixtures with 20 ms artificial
+HTTP delays. Linux runs in a two-CPU, 1-GiB container in the existing VM on the
+same physical Mac. The server fixture's hashing contributes to wall time but
+not CLI child CPU. The native server used for those measurements reads and hashes
+selected values; those measurements do not establish server CPU/storage savings,
+live-provider token savings, or independent cross-host performance. The compact
+report pins binary and driver hashes; raw trials and logs remain ignored.
+
+Final qualification passed 285 Linux CLI cases (three platform skips), all
+28 macOS media cases, 151 query-contract tests with zero leaks, and 27 native
+server cases (seven opt-in benchmark skips). The native cases include single-
+and two-shard delivery, warm omission, current-value changes, authorization,
+revision and snapshot fences. SDK, MCP/OpenAPI, packaging and boundary checks
+also pass. The broad macOS suite has an intermittent watcher assertion; affected
+cases pass in isolation, and the inventory-visit failure reproduces on the merged
+baseline. The report preserves this qualification and exact artifact hashes.
+
+
+The [conditional planning qualification](bench/results/grep-conditional-planning-summary.json)
+compares the reviewed PR binary with score-aware retrieval and bounded cache
+writer serialization. Changed questions now request full grouped values directly;
+warm hits retain the exact descriptors used to make their conditional requests.
+Conditional response bytes and full-image processing scratch have separate
+admission estimates, with the existing shared processing limit unchanged.
+
+Five alternating rounds of the same 128-image fixture show these medians:
+
+| Host | Changed-question elapsed | Warm elapsed | Warm CLI child CPU |
+|---|---:|---:|---:|
+| macOS ARM64 | 693 → 534 ms | 220 → 214 ms | 17.3 → 12.1 ms |
+| Linux ARM64 VM, 2 CPUs / 1 GiB | 654 → 473 ms | 222 → 192 ms | 35.6 → 11.8 ms |
+
+Changed-question index requests fall from 33 to 17. Warm requests fall from
+17/18 to 10, with zero image bytes on both candidate hosts. Both baselines
+already avoid warm inference. Cold CPU and peak RSS do not improve uniformly.
+These constant-score fixtures impose 20 ms HTTP delays; child CPU excludes the
+Python server. Linux shares the physical Mac. These results establish neither
+live model cost savings nor a universal speed or memory guarantee.
+
+The native source-only retrieval path now publishes bounded canonical-value
+certificates atomically with storage writes. Current scalar leaves can be
+omitted without loading or hashing their payloads, after fresh authorization
+and publication checks. Certificates bind content, directory and canonicalizer
+ABI; unsupported/stale cases use reference delivery and bounded repair. Other
+selected fields and storage layouts can still require source reads. The metadata
+and write hashing cost are explicit in the design, rather than implying free
+reads or writes. `e2e/antfly/bench_source_projection.py` separately qualifies
+native server ingestion, full delivery and conditional delivery without a model.
+
+
+The same qualification measures the final native server after merging main
+through `871c143788` (#1262), using five alternating rounds, eight fresh documents
+with 256 KiB ASCII values, one shard, exact response hashes and mandatory
+certificate-hit checks. Each candidate round records 16 certificate hits and no
+full-value fallbacks. Median times:
+
+| Native phase | Elapsed, baseline → current | Server process CPU, baseline → current |
+|---|---:|---:|
+| Ingestion | 56.36 → 66.24 ms | 64.69 → 80.22 ms |
+| Full delivery | 15.21 → 17.36 ms | 12.42 → 14.83 ms |
+| Conditional delivery | 10.29 → 2.16 ms | 8.89 → 1.09 ms |
+
+Conditional delivery is about 79% faster and uses 88% less server CPU in this
+synthetic corpus. Ingestion/full delivery regress about 14–24% in elapsed/CPU
+terms. Conditional peak RSS is 152.5 → 149.3 MiB. The candidate also includes
+main's CLI unification; this pair does not isolate that merge. The report retains
+the separate pre-main feature qualification, where ingestion/full-delivery costs
+were about 5–7%. Shared-host measurements and background work vary between runs.
+
+Whole-process CPU includes background work, and sampled RSS is not an allocation
+bound. These are fresh native JSON certificates on the shared Mac, with no
+physical-I/O or live-model claim. Unsupported/stale layouts retain reference
+execution. Proof reuse shifts work to bounded metadata and writes; authorization
+and remaining selected source reads still have a cost.
+
+Final validation: 288 CLI cases on each host (286 macOS / 285 Linux passed;
+two/three platform skips), 149 query contracts, 15 identity/publication/snapshot
+cases, 91 logical-field cases plus one skip, and 27 native integration cases plus
+seven opt-in benchmark skips. Contract tests report zero leaks. The real storage
+regression verifies published certificates, retained read cuts and replacement
+visibility; parsed ID-query worker round trips exercise the actual eligible
+request shape. Storage discovery, compatibility, license boundaries and Windows
+CLI cross-compilation pass. Raw trials and logs remain ignored.
+
+After the main merge, 149 query contracts, 15 identity/storage cases, 91 logical
+field cases (one skip), 27 native cases (seven opt-in benchmark skips), four
+release-packaging checks and the Apache boundary pass. Rebuilt macOS, Linux and
+Windows CLI binaries are byte-identical to the fully tested binaries above.
+Main's unified CLI and Apache licensing are preserved; the compact report records
+the final native binary and both pre-/post-main measurement sets separately.
+
+
+The final main refresh through `2aed23bb0e` (#1264/#1265) is merged in
+`5447f58f3a`. Both 288-case CLI suites pass again, along with shared PDF/mock OCR
+integration, 149 query contracts, 15 identity/storage cases, 91 logical-field
+cases (one skip), generated error-name checks and both error-transport tests.
+Windows CLI cross-compilation and the Apache boundary pass. Relevant query/storage
+source hashes and macOS/Linux CLI bytes match the qualified build. Native server
+integration and timings remain pinned to the recorded `9ca2e6e28f` build; the
+compact report distinguishes this final targeted validation.
+
+
+The generic conditional-source follow-up (`611a4ce4ca`, main merged through
+`c1bc94b174`) uses an explicit canonicalization ABI with fixed compatibility
+vectors, collects identities during directory publication, and batches owned
+metadata within one pinned transaction. Equal omission masks share byte-bounded
+source reads. Admission accounts for coalesced range retention or full primary
+sizes according to backend capabilities; each subwindow closes its scope before
+the next opens. One large row can progress, and point reads reuse their metadata
+scope. CLI shape buckets fetch concurrently through the existing worker pool,
+with proportional reservations under one page-memory budget.
+
+The [generic qualification](bench/results/grep-generic-conditional-summary.json)
+records six client controls and thirteen native cases: ASCII, escaped/Unicode,
+numeric, wide, opaque, small and mixed values; 1/8/64 rows; and exact, parent,
+wildcard and exclusion masks. Native cases use five alternating trials and ten
+individually timed reads per phase, with parsing outside timings and every
+response checked. Ordinary reads and fallback layouts are controls, not omitted
+from the results. Raw reports/logs are local and unpublished under `output/`.
+
+Mixed-shape client requests fall from 10 to 4; dense warm-image requests fall
+from 18 to 12. Warm client CPU/latency improve in these fixtures, while tiny cold
+client CPU can increase. Native gains are modest and uneven: eight-row ASCII
+conditional delivery is 1.086 → 0.983 ms; the single-row control is 0.662 →
+0.738 ms and mixed exact delivery is 1.350 → 1.490 ms. These are workload and
+host-dependent tradeoffs, not a universal throughput, memory or zero-cost claim.
+Native caches are warm; the Linux VM shares the Mac host and has two CPUs/1 GiB.
+The report preserves all medians, binary/corpus hashes and reproduction commands.
+
+Final checks pass: 287 macOS CLI cases plus two skips; 286 Linux VM CLI cases
+plus three skips; 149 query, 18 identity/storage and 94 logical-field contracts
+(one skip, zero leaks). The eighteen focused storage tests also pass in the
+Linux VM, including full-value range adapters, scope retirement, mixed masks,
+large-row progress and cancellation/allocation failures. Build them portably
+with `zig build source-value-identity-test-build -Dtarget=aarch64-linux-gnu`
+from `zig/`. All 28 real-server indexed tests pass (seven opt-in benchmark skips),
+including persisted certificate upgrade from the previous server. Windows CLI
+cross-compilation, compatibility/storage discovery and the Apache boundary pass.
+The final source rebuild produces the same qualified native binary hash.

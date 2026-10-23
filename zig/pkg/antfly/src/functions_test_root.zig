@@ -22,6 +22,9 @@ test {
     _ = @import("antfly_local_sources").storage_db_query_search_exec;
     _ = @import("antfly_local_sources").sql_document_row;
     _ = @import("antfly_local_sources").storage_document_mutation_revision;
+    _ = @import("antfly_local_sources").storage_conditional_source;
+    _ = @import("antfly_local_sources").storage_logical_source;
+    _ = @import("antfly_local_sources").storage_document_projection;
     _ = @import("antfly_local_sources").functions_decisions;
     _ = @import("antfly_local_sources").functions_expressions;
     _ = @import("antfly_local_sources").functions_runtime;
@@ -172,4 +175,8 @@ test "decision functions graph evaluation preserves vector hit offset restrictio
     try std.testing.expectError(error.UnsupportedQueryRequest, query.parseQueryRequest(std.testing.allocator, null, "docs",
         \\{"limit":1,"offset":1,"embeddings":{"vector":[0.1,0.2]},"graph_queries":{"customers":{"index":"graph","match":{"anchor":"customer","nodes":{"customer":{}},"edges":[]},"return":{"bindings":["customer"],"include_documents":true,"limit":1}}},"evaluate":{"graph_query":"customers","scope":"candidates","candidate_count":20,"compute":{"x":{"literal":1}}}}
     ));
+}
+
+test "api query contract conditional source projection preserves authorization-stage ownership" {
+    try @import("antfly_local_sources").api_query_contract.testing.expectConditionalSourceProjection();
 }

@@ -1273,6 +1273,7 @@ from .query_hit_hierarchy_level import QueryHitHierarchyLevel
 from .query_hit_highlights import QueryHitHighlights
 from .query_hit_index_scores import QueryHitIndexScores
 from .query_hit_source import QueryHitSource
+from .query_hit_source_projection import QueryHitSourceProjection
 from .query_hits import QueryHits
 from .query_hits_total import QueryHitsTotal
 from .query_hits_total_relation import QueryHitsTotalRelation
@@ -1488,6 +1489,11 @@ from .sort_field import SortField
 from .sort_profile import SortProfile
 from .sort_profile_candidate_source import SortProfileCandidateSource
 from .sort_profile_sort_lifecycle_state import SortProfileSortLifecycleState
+from .source_projection import SourceProjection
+from .source_projection_field import SourceProjectionField
+from .source_value_condition import SourceValueCondition
+from .source_value_identity import SourceValueIdentity
+from .source_value_identity_state import SourceValueIdentityState
 from .sql_array_column_schema import SQLArrayColumnSchema
 from .sql_array_column_schema_type import SQLArrayColumnSchemaType
 from .sql_array_dimension import SQLArrayDimension
@@ -2959,6 +2965,7 @@ __all__ = (
     "QueryHitIndexScores",
     "QueryHits",
     "QueryHitSource",
+    "QueryHitSourceProjection",
     "QueryHitsTotal",
     "QueryHitsTotalRelation",
     "QueryProfile",
@@ -3173,6 +3180,11 @@ __all__ = (
     "SortProfile",
     "SortProfileCandidateSource",
     "SortProfileSortLifecycleState",
+    "SourceProjection",
+    "SourceProjectionField",
+    "SourceValueCondition",
+    "SourceValueIdentity",
+    "SourceValueIdentityState",
     "SQLArrayColumnSchema",
     "SQLArrayColumnSchemaType",
     "SQLArrayDimension",

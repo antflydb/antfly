@@ -1974,33 +1974,52 @@ pub const Search = struct {
             var inputs: [16]decision.Input = undefined;
             var mapping: [16]usize = undefined;
             var count: usize = 0;
-            for (units, loaded[0..units.len], 0..) |unit, item, i| {
-                const image = switch (item) {
-                    .image => |value| value,
-                    .failed => |err| {
-                        failure = failure orelse err;
-                        continue;
-                    },
-                };
-                if (!Limits.reserve(&limits.source_bytes, image.bytes, self.options.max_source_bytes)) {
-                    failure = failure orelse error.SourceBudgetExceeded;
-                    break;
-                }
-                self.summary.bytes += image.bytes;
-                const listing = try std.json.Stringify.valueAlloc(a, .{ .path = doc.path, .id = unit.id, .kind = unit.kind, .location = unit.location, .text = unit.text, .label = unit.label, .asset = unit.asset }, .{ .emit_null_optional_fields = false });
-                inputs[count] = .{ .id = unit.id, .input = try std.fmt.allocPrint(a, "TARGET visual evidence unit (image is authoritative; text is context):\n{s}", .{listing}), .image = image };
-                inputs[count].serialized_evidence_bytes = try inputs[count].evidenceBytes();
-                if (inputs[count].serialized_evidence_bytes.? > 1024 * 1024) {
-                    failure = failure orelse error.DecisionLimitExceeded;
-                    continue;
-                }
-                mapping[count] = i;
-                count += 1;
-            }
             var scores: [16]f64 = @splat(std.math.nan(f64));
-            if (count > 0) self.decider.search(inputs[0..count], scores[0..count]) catch |err| {
-                failure = failure orelse err;
-            };
+            var charged: [16]bool = @splat(false);
+            var materialized_retry = false;
+            score_attempt: while (true) {
+                count = 0;
+                for (units, loaded[0..units.len], 0..) |unit, item, i| {
+                    const image = switch (item) {
+                        .image => |value| value,
+                        .failed => |err| {
+                            failure = failure orelse err;
+                            continue;
+                        },
+                    };
+                    if (!charged[i]) {
+                        if (!Limits.reserve(&limits.source_bytes, image.bytes, self.options.max_source_bytes)) {
+                            failure = failure orelse error.SourceBudgetExceeded;
+                            break;
+                        }
+                        charged[i] = true;
+                        self.summary.bytes += image.bytes;
+                    }
+                    inputs[count] = try decision.visualInput(a, doc.path, unit, image);
+                    inputs[count].serialized_evidence_bytes = try inputs[count].evidenceBytes();
+                    if (inputs[count].serialized_evidence_bytes.? > 1024 * 1024) {
+                        failure = failure orelse error.DecisionLimitExceeded;
+                        continue;
+                    }
+                    mapping[count] = i;
+                    count += 1;
+                }
+                const cache_hits_before = self.decider.cache_hits;
+                const times_before = self.decider.evidence_times;
+                if (count > 0) self.decider.search(inputs[0..count], scores[0..count]) catch |err| {
+                    if (err == error.ImageMaterializationRequired and !materialized_retry) {
+                        self.decider.cache_hits = cache_hits_before;
+                        self.decider.evidence_times = times_before;
+                        materialized_retry = true;
+                        // Old wave backing can retire: none of its output has been
+                        // published, and the same admission lease covers full bytes.
+                        try loader.materialize(a, units, loaded[0..units.len]);
+                        continue :score_attempt;
+                    }
+                    failure = failure orelse err;
+                };
+                break;
+            }
             for (scores[0..count], mapping[0..count]) |score, i| {
                 if (!std.math.isFinite(score)) continue;
                 self.summary.regions_evaluated += 1;

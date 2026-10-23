@@ -2573,19 +2573,25 @@ def test_native_grep_visual_point_reads_reauthorize_without_retained_snapshot(
     provider = ThreadingHTTPServer(("127.0.0.1", 0), Decisions)
     threads = [start_http_server(query), start_http_server(provider)]
     try:
-        result = run_grep(
-            tmp_path,
-            f"http://127.0.0.1:{query.server_port}",
-            table,
+        flags = [
             "--media=images",
             "--ask=Does this contain a chart?",
             "--model=fixture",
             "--endpoint",
             f"http://127.0.0.1:{provider.server_port}/decisions",
-            "--no-cache",
             "--json",
             "--decision-concurrency=8",
             "--decision-batch-wait-ms=20",
+            "--cache-dir",
+            str(tmp_path / "scores"),
+        ]
+        if change:
+            flags.append("--no-cache")
+        result = run_grep(
+            tmp_path,
+            f"http://127.0.0.1:{query.server_port}",
+            table,
+            *flags,
             page_size=16,
         )
         assert len(seen) == 2, (seen, result.stderr.decode())
@@ -2617,8 +2623,197 @@ def test_native_grep_visual_point_reads_reauthorize_without_retained_snapshot(
             assert len(provider_calls) == 1
             assert len(provider_calls[0]["inputs"]) == parents
             assert json.loads(result.stdout.splitlines()[0])["type"] == "evidence"
+            warm = run_grep(
+                tmp_path,
+                f"http://127.0.0.1:{query.server_port}",
+                table,
+                *flags,
+                page_size=16,
+            )
+            assert warm.returncode == 0, warm.stderr.decode()
+            assert len(provider_calls) == 1
+            conditional = [
+                hit
+                for envelope in responses[2:]
+                for result in envelope["responses"]
+                for hit in result.get("hits", {}).get("hits", [])
+                if "_source_projection" in hit
+            ]
+            assert len(conditional) == parents, responses[2:]
+            # Descriptor writes are a bounded best-effort cache. Collisions or
+            # racing writers may require a full value; they cannot change the
+            # warm decision result or send a descriptor to the provider.
+            assert any(
+                hit["_source_projection"]["payloads.image"]["state"] == "unchanged"
+                for hit in conditional
+            ), responses[2:]
+            for hit in conditional:
+                state = hit["_source_projection"]["payloads.image"]["state"]
+                assert state in {"value", "unchanged"}
+                if state == "unchanged":
+                    assert "image" not in hit["_source"].get("payloads", {})
+                else:
+                    assert hit["_source"]["payloads"]["image"]
+
     finally:
         for server, thread in zip((query, provider), threads, strict=True):
             server.shutdown()
             thread.join(timeout=5)
             server.server_close()
+
+
+@pytest.mark.parametrize("num_shards", [1, 2])
+def test_conditional_source_projection_binds_current_values_and_query_selection(
+    stateful_api, num_shards
+):
+    table = f"conditional_source_{time.time_ns()}"
+    stateful_api.post(f"/tables/{table}", {"num_shards": num_shards})
+    item = {
+        "body": {
+            "image": "large-image-" * 4096,
+            "null": None,
+            "number": 1.5,
+            "integer": 9007199254740993,
+            "boolean": True,
+            "escaped": 'line\nquote"\\ café',
+        },
+        "revision": "caller-revision",
+        "padding": "x" * (32 * 1024),
+    }
+    stateful_api.batch_write(table, inserts={"a": item}, sync_level="full_index")
+    url = stateful_api.url + f"/tables/{table}/query"
+    names = ("image", "null", "absent", "number", "integer", "boolean", "escaped")
+    fields = [{"field": f"body.{name}"} for name in names]
+    request = {
+        "query": {"match_all": {}},
+        "fields": ["body"],
+        "source_projection": {"fields": fields},
+        "limit": 10,
+    }
+
+    def query(body):
+        response = requests.post(url, json=body, timeout=60)
+        assert response.status_code == 200, response.text
+        result = response.json()["responses"][0]
+        assert result["status"] == 200, result
+        return result["hits"]["hits"]
+
+    cold = query(request)[0]
+    states = cold["_source_projection"]
+    assert cold["_source"]["body"]["image"] == item["body"]["image"]
+    assert states["body.image"]["state"] == "value"
+    assert states["body.null"]["state"] == "value"
+    assert states["body.absent"] == {"state": "missing"}
+    token = states["body.image"]["identity"]
+    assert token.startswith("sv1-") and len(token) == 68
+    projections = (
+        ["*"],
+        ["body.*"],
+        ["-revision"],
+        [*(f"body.{name}" for name in names), "revision"],
+    )
+    for projection in projections:
+        selected = query({**request, "fields": projection})[0]
+        assert selected["_source"]["body"]["image"] == item["body"]["image"]
+        assert selected["_source_projection"] == states
+    fields[0]["if_match"] = [{"id": "a", "identity": token}]
+    warm = query(request)[0]
+    assert "image" not in warm["_source"]["body"]
+    assert warm["_source"]["body"]["null"] is None
+    assert warm["_source_projection"]["body.image"] == {
+        "state": "unchanged",
+        "identity": token,
+    }
+    for projection in projections:
+        selected = query({**request, "fields": projection})[0]
+        assert "image" not in selected["_source"]["body"]
+        assert selected["_source_projection"] == warm["_source_projection"]
+    # Expected identities cannot cause an excluded document to become a hit.
+    assert query({**request, "query": {"bool": {"filter": {"ids": ["other"]}}}}) == []
+    # Caller revision metadata is not authority for the image identity.
+    item["body"]["image"] = "changed-payload"
+    stateful_api.batch_write(table, inserts={"a": item}, sync_level="full_index")
+    changed = query(request)[0]
+    assert changed["_source"]["body"]["image"] == "changed-payload"
+    assert changed["_source_projection"]["body.image"]["state"] == "value"
+    assert changed["_source_projection"]["body.image"]["identity"] != token
+    # Conditions are scoped to the exact record ID, even for identical values.
+    token = changed["_source_projection"]["body.image"]["identity"]
+    fields[0]["if_match"] = [{"id": "other", "identity": token}]
+    assert query(request)[0]["_source"]["body"]["image"] == "changed-payload"
+
+
+def test_conditional_source_projection_upgrades_persisted_certificates(monkeypatch):
+    """An implementation-only upgrade may repair metadata, never change values."""
+    from conftest import StandaloneAntflyServer, find_free_port, resolve_binary_path
+
+    baseline = os.environ.get("ANTFLY_BASELINE_BIN")
+    current = os.environ.get("ANTFLY_BIN")
+    if not baseline or not current:
+        pytest.skip(
+            "Set ANTFLY_BASELINE_BIN and ANTFLY_BIN for persisted upgrade checks"
+        )
+    monkeypatch.setenv("ANTFLY_BENCH_QUERY_PROFILE", "1")
+    server = StandaloneAntflyServer(
+        resolve_binary_path(baseline), "127.0.0.1", find_free_port()
+    )
+    try:
+        base = server.api_url + "/tables/conditional_upgrade"
+        created = requests.post(base, json={"num_shards": 1}, timeout=60)
+        created.raise_for_status()
+        deadline = time.monotonic() + 30
+        while requests.get(base, timeout=5).status_code != 200:
+            assert time.monotonic() < deadline, "table did not become visible"
+            time.sleep(0.05)
+        response = requests.post(
+            base + "/batch",
+            json={
+                "inserts": {"a": {"image": "value-" * 8192, "revision": "r1"}},
+                "sync_level": "full_index",
+            },
+            timeout=60,
+        )
+        response.raise_for_status()
+        request = {
+            "query": {"bool": {"filter": {"ids": ["a"]}}},
+            "fields": ["image", "revision"],
+            "limit": 1,
+            "source_projection": {"fields": [{"field": "image"}]},
+        }
+
+        def query():
+            response = requests.post(base + "/query", json=request, timeout=60)
+            response.raise_for_status()
+            result = response.json()["responses"][0]
+            assert result["status"] == 200, result
+            return result["hits"]["hits"][0]
+
+        original = query()
+        token = original["_source_projection"]["image"]["identity"]
+        request["source_projection"]["fields"][0]["if_match"] = [
+            {"id": "a", "identity": token}
+        ]
+        warm = query()
+        assert warm["_source"] == {"revision": "r1"}
+        assert warm["_source_projection"]["image"]["state"] == "unchanged"
+        server.pause()
+        log_start = server.log_path.stat().st_size
+        server.binary = resolve_binary_path(current)
+        server.resume()
+        deadline = time.monotonic() + 30
+        while True:
+            upgraded = query()
+            assert upgraded["_source"] == warm["_source"]
+            assert upgraded["_source_projection"] == warm["_source_projection"]
+            logs = server.log_path.read_text(errors="replace")[log_start:]
+            if (
+                "antfly_bench_conditional_source certificate_hits=1 full_fallbacks=0"
+                in logs
+            ):
+                break
+            assert time.monotonic() < deadline, (
+                "bounded authority repair did not resume proof reuse"
+            )
+            time.sleep(0.05)
+    finally:
+        server.stop()

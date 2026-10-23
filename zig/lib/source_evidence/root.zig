@@ -149,8 +149,16 @@ pub const Loader = struct {
     ctx: *anyopaque,
     load: *const fn (*anyopaque, A, Unit) anyerror!Image,
     load_many: ?*const fn (*anyopaque, A, []const Unit, []Loaded) anyerror!void = null,
+    /// Re-materialize a conditionally omitted wave after score eviction/expiry.
+    /// The caller no longer uses earlier wave images when invoking this.
+    materialize_many: ?*const fn (*anyopaque, A, []const Unit, []Loaded) anyerror!void = null,
     /// Retire borrowed wave backing only after its last score/output user.
     release_wave: ?*const fn (*anyopaque) void = null,
+    pub fn materialize(self: Loader, a: A, units: []const Unit, output: []Loaded) !void {
+        self.releaseWave();
+        if (self.materialize_many) |many| return many(self.ctx, a, units, output);
+        return self.batch(a, units, output);
+    }
     pub fn releaseWave(self: Loader) void {
         if (self.release_wave) |release| release(self.ctx);
     }

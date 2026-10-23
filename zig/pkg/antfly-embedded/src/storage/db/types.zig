@@ -1930,6 +1930,9 @@ pub const SearchRequest = struct {
     /// Immutable local projection borrowed until synchronous search completion.
     /// Never serialized or populated by a public request.
     document_projection_plan: ?@import("document_query.zig").BorrowedSpanProjection = null,
+    /// Conditional delivery, forwarded only for final source-only hydration.
+    /// Owned canonical JSON on public ingress, borrowed for synchronous reads.
+    source_projection_json: []const u8 = "",
     evaluation_json: []const u8 = "",
     evaluation_limit: u32 = 0,
     evaluation_matches: bool = false,
@@ -2110,6 +2113,8 @@ const hierarchy_children_validated_fields = [_][]const u8{
 };
 
 const hierarchy_children_supported_internal_fields = [_][]const u8{
+    // Conditional delivery runs after child authorization and retrieval.
+    "source_projection_json",
     "value_search_work",
     "value_search_scope",
     "document_authority_mode",
@@ -2654,6 +2659,8 @@ pub const SearchHit = struct {
     index_scores: []fusion_mod.IndexScore = &.{},
     sort_values: []std.json.Value = &.{},
     stored_data: ?[]u8 = null,
+    /// Storage-certified final delivery states; owned and never caller metadata.
+    source_projection_json: ?[]u8 = null,
     /// Owned typed source for providers that hydrate after source-dependent
     /// ranking/filtering. Highlighting and public projection consume this
     /// directly; encoding happens once at the response boundary. Providers
@@ -2680,6 +2687,7 @@ pub const SearchHit = struct {
             freeIndexScores(alloc, cloned.index_scores);
             freeJsonValues(alloc, cloned.sort_values);
             if (cloned.stored_data) |data| alloc.free(data);
+            if (cloned.source_projection_json) |data| alloc.free(data);
             if (cloned.source_value) |*value| deinitJsonValue(alloc, value);
             if (cloned.column_source) |source| source.deinit();
             if (cloned.ancestor_source_data) |data| alloc.free(data);
@@ -2702,6 +2710,7 @@ pub const SearchHit = struct {
         cloned.index_scores = try cloneIndexScores(alloc, self.index_scores);
         cloned.sort_values = try cloneJsonValues(alloc, self.sort_values);
         cloned.stored_data = if (self.stored_data) |data| try alloc.dupe(u8, data) else null;
+        cloned.source_projection_json = if (self.source_projection_json) |data| try alloc.dupe(u8, data) else null;
         cloned.source_value = if (self.source_value) |value| try cloneJsonValue(alloc, value) else null;
         cloned.column_source = if (self.column_source) |source| try source.cloneInto(alloc) else null;
         cloned.ancestor_source_data = if (self.ancestor_source_data) |data| try alloc.dupe(u8, data) else null;
@@ -2725,6 +2734,17 @@ pub const SearchHit = struct {
         return cloned;
     }
 
+    pub fn clearSource(self: *SearchHit, alloc: Allocator) void {
+        if (self.stored_data) |data| alloc.free(data);
+        if (self.source_projection_json) |data| alloc.free(data);
+        if (self.source_value) |*value| deinitJsonValue(alloc, value);
+        if (self.column_source) |source| source.deinit();
+        self.stored_data = null;
+        self.source_projection_json = null;
+        self.source_value = null;
+        self.column_source = null;
+    }
+
     pub fn deinit(self: *SearchHit, alloc: Allocator) void {
         alloc.free(self.id);
         if (self.document_authority) |proof| alloc.destroy(proof);
@@ -2734,6 +2754,7 @@ pub const SearchHit = struct {
         freeIndexScores(alloc, self.index_scores);
         freeJsonValues(alloc, self.sort_values);
         if (self.stored_data) |data| alloc.free(data);
+        if (self.source_projection_json) |data| alloc.free(data);
         if (self.source_value) |*value| deinitJsonValue(alloc, value);
         if (self.column_source) |source| source.deinit();
         if (self.ancestor_source_data) |data| alloc.free(data);

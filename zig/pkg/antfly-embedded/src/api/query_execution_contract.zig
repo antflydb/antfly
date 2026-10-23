@@ -3278,9 +3278,14 @@ pub fn encodeQueryRequestWithGraphWireMode(
     // Canonical hierarchy requests require an explicit projection at both
     // ingress and storage. Their parser reconstructs deferred projection from
     // these fields, so retain them rather than emitting an invalid envelope.
+    const conditional_delivery = @import("source_projection.zig").storageEligible(req);
+    if (conditional_delivery) {
+        try appendJsonFieldName(alloc, &out, &first, "source_projection");
+        try out.appendSlice(alloc, req.source_projection_json);
+    }
     const requires_hierarchy_fields = req.hierarchy_children != null or
         req.hierarchy_grouped_matches or req.hierarchy_group_level == .unit;
-    if (!req.include_all_fields and (preserve_projection or requires_hierarchy_fields or !(req.include_stored and req.defer_stored_projection))) {
+    if (!req.include_all_fields and (preserve_projection or conditional_delivery or requires_hierarchy_fields or !(req.include_stored and req.defer_stored_projection))) {
         try appendJsonFieldNames(alloc, &out, &first, "fields", req.fields);
     }
     if (req.highlight) |highlight| {
@@ -4902,6 +4907,7 @@ const RemoteSearchParser = struct {
         if (self.authority_group != null) try self.pending_sources.append(self.alloc, pending);
         hit.stored_data = stored;
         stored = null;
+        if (wire._source_projection) |identities| hit.source_projection_json = try std.json.Stringify.valueAlloc(self.alloc, identities, .{ .emit_null_optional_fields = false });
         return hit;
     }
     fn rows(self: *@This()) !void {

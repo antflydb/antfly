@@ -1604,3 +1604,55 @@ routing metadata.
   size, and repair-scan counts per projection
 - avoid whole-range logical prune during parent finalize where runtime storage
   metadata can answer the same question, and reclaim retired segments cleanly
+
+
+### Conditional source value certificates
+
+Source-only query delivery may use the optional `SVI1` canonical-value sidecar
+in `storage/source_value_identity.zig`. It is installed in the same transaction
+as primary JSON bytes, the existing DPD2 projection directory, content proof and
+mutation revision. It does not change DPD2 coverage or admission limits; rows
+below the existing 16 KiB threshold do not receive certificates.
+
+A certificate binds primary byte length/SHA-256, source kind, exact directory
+SHA-256 and semantic canonicalizer ABI. Up to 512 sorted directory-index/digest
+pairs certify disjoint scalar leaves, with a total bound of 17,519 bytes.
+Canonical identities hash the typed JSON value with the versioned source-value
+domain; directory hashes are binding checks, never interchangeable identities.
+Deletion removes the sidecar. Stale optional metadata cannot authorize omission.
+The ABI is explicitly versioned independently of source-file/compiler identity;
+fixed typed-JSON and ABI golden vectors gate upgrades. Lookup/comment/test edits
+cannot invalidate a table's certificates. Unknown semantic versions still reject.
+The ordinary atomic write and repair paths collect identities during the final
+bounded directory walk. Unescaped valid UTF-8 scalar strings, booleans and null
+hash their borrowed canonical bytes directly. Other scalars retain the typed
+reference canonicalizer; raw directory digests remain separate binding hashes.
+
+Window preparation uses two sorted/deduplicated metadata batches for up to 64
+rows: proofs/revisions/TTL, then directories/certificates. Decoded directories and
+owned certificate records remain local to the pinned transaction and are reused
+for the remaining projected field reads. Equal omission masks share logical
+range/full-value batches, bounded to a conservative 1 MiB materialization
+subwindow with one-large-row progress. This bounds additional input residency
+rather than accumulating a whole window of large primary values. Admission uses
+coalesced retained spans for range-capable scopes and original row sizes for
+full-value adapters. A fresh scope per subwindow releases backend input buffers
+and pins before the next chunk; all scopes retain the same transaction cut.
+Singleton reads reuse the metadata scope directly. Request deadlines are checked during planning, per subwindow and per output row.
+Retained metadata is bounded by 64 format-limited authorities; row reconstruction
+scratch remains independently recyclable. Parent masks that cannot use these facts bypass preparation entirely.
+
+`conditional_source.zig` checks these bindings under the ordinary publication
+lease and read scope. Each bounded window uses an ordinary read transaction;
+current-tip point probes do not support value scopes. Only eligible source-only queries forward omission to
+storage owners. Source-dependent operators retain complete values. Unsupported
+layouts and missing/stale certificates retain reference projection and hashing;
+existing bounded authority backfill installs certificates without advancing the
+logical revision. ABI changes invalidate old certificates and trigger safe
+fallback/repair. This is an internal storage optimization of the existing public
+`source_projection` contract, not another caller-managed proof field.
+
+Qualify native delivery with `e2e/antfly/bench_source_projection.py` using pinned
+baseline/candidate servers. Its certificate-hit counters establish proof reuse,
+not physical disk-read counts. Remaining metadata, frame layout and ordinary
+source fallback still determine physical I/O.

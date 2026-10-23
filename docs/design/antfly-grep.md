@@ -349,18 +349,24 @@ a fixed 16-slot reorder buffer also bounds zero-byte result metadata. When that
 buffer approaches capacity, admission waits for the oldest outstanding parent.
 A slow parent therefore cannot grow a corpus-sized queue. Error paths cancel,
 join and release all borrowers without waiting for a missing sequence forever.
-A page-scope deferred drain must also join on its own failure; deferring that
-join to the outer scheduler destructor would let the manifest arena retire first.
-Failed drains discard remaining staged output while preserving already emitted
-records and completed accounting.
+Each job independently retains its manifest and asset pages. Advancing discovery
+releases the coordinator's reference; worker references persist until the jobs
+are joined. Failure paths join every launched job before releasing its final
+page references, including partial launch. Failed drains discard remaining staged
+output while preserving already emitted records and completed accounting.
 Compatible model work coalesces across parents with unique wire IDs. A
 single-parent window retains intra-document provider parallelism.
 
 An asset window contains at most eight parents and 8 MiB conservative evidence.
-Plan complete first waves, shrinking the parent prefix when its shape or
-conservative byte estimate changes; never preload unused partial waves. Only
-equal image-field projection shapes are grouped. Unioning unrelated fields
-would overfetch those fields on every row. A group is one current ID-filtered
+Plan complete first waves, shrinking the parent prefix at the conservative
+transfer bound; never preload unused partial waves. Within that bounded prefix,
+normalize field order and bucket equal projection shapes, including alternating
+shapes. Singletons retain ordinary point loading. Independent groups use the
+existing persistent worker pool concurrently; one-group windows remain inline.
+Page-memory reservations are apportioned by estimated transfer size before
+launch, with a combined bound of the configured page budget. Join every fetch
+before retiring its manifest, including partial launch and error paths.
+Unioning unrelated fields would overfetch those fields on every row. A group is one current ID-filtered
 query, with no ordering or retained pagination state. Each returned parent
 independently checks access and revision before its payloads are validated.
 Missing/denied/changed parents do not authorize their image bytes or score reuse.
@@ -413,35 +419,130 @@ constrained Linux VM; it does not establish zero-cost execution. The later
 measures the rolling scheduler, shared admission and borrowed envelopes, including
 the sustained-image warm-latency/memory tradeoff.
 
-Warm scores still require fresh authorized asset validation. Avoiding those image
-bytes requires a generic server-owned source/asset identity contract: an identity
-must bind the exact stored bytes at the authorized read cut, survive only valid
-immutable revisions, and be distinct from caller-supplied revision or digest
-metadata. A trusted identity may select a previously verified score; absent or
-changed identity must materialize and validate bytes. No caller-written manifest,
-TTL, cached permission result or segment ID establishes that guarantee. The CLI
-retains full validation until that server contract exists.
+Warm scores require a fresh authorized query. The conditional source projection
+contract now permits a server to confirm previously validated image identities
+without transferring the image again. Manifest digests and caller revision fields
+are never identity authority. Missing or changed identities materialize and validate
+bytes; an unavailable score also materializes bytes before provider dispatch.
+
+### Conditional source projection and future storage authorities
+
+The existing query API accepts an optional, general source delivery extension:
+
+```json
+{
+  "query": {"bool": {"filter": {"ids": ["source-1"]}}},
+  "fields": ["grep.revision", "grep.permissions", "payloads.image"],
+  "source_projection": {
+    "fields": [{
+      "field": "payloads.image",
+      "if_match": [{"id": "source-1", "identity": "sv1-<64 lowercase hex characters>"}]
+    }]
+  }
+}
+```
+
+Each hit's `_source_projection` maps exact logical paths to `{state, identity}`.
+`value` retains the selected value; `unchanged` omits only that value; `missing`
+has no identity. Stored null is a value, distinct from an absent path. Only an
+exact expected identity for the same record ID can cause omission. Conditions
+never authorize a read, bypass query filters, resurrect absent documents, or
+change source-dependent ranking, evaluation, highlighting or aggregation.
+Source-only match-all/ID retrieval can finalize conditional delivery at the
+storage owner, under the ordinary authorization and publication lease. A bounded
+window uses one read transaction and short-lived value scopes, pinning content,
+directory and certificates to the same read cut. The
+parser’s synthesized match-all text root for ID/filter buckets is membership
+scaffolding and remains eligible; named or scoring text searches are not. Queries
+with source-dependent operators retain complete worker values and finalize at
+the coordinator; column-backed sources retain that reference path. Ordinary
+projection masks, including `*`, nested wildcards and exclusions, determine
+whether an exact conditional path is selected. Requests allow 64 non-overlapping exact paths and 4,096 conditions
+in total. Duplicate IDs and overlapping paths are rejected. Conditions are
+indexed once per response; per-hit lookup is independent of the condition count.
+
+`sv1` is a versioned server-computed identity over the typed JSON value delivered
+by that authorized read cut. Hashing streams into SHA-256 without allocating an
+encoded copy. The reference path reads current selected values before
+hashing and omission. Eligible native JSON retrieval instead uses bounded,
+storage-owned canonical-value certificates published atomically with the primary
+value, content proof, projection directory and mutation revision. Certificates
+bind the original content length/digest, exact directory digest, value kind and
+semantic canonicalizer ABI. They certify disjoint scalar leaves; raw directory
+hashes are never value identities. The existing directory format and coverage
+budget are unchanged. Rows below the existing 16 KiB projection threshold
+receive no certificate. Each optional certificate is bounded below 18 KiB.
+
+The ABI is an explicitly versioned typed-JSON contract, independent of comments,
+tests, compiler identity, and lookup implementation. Fixed canonicalization and
+ABI golden vectors gate toolchain changes; a semantic change requires an ABI
+revision. Unknown ABIs fall back safely. Editing certificate plumbing does not
+invalidate an existing table's proofs. Atomic writes and bounded repair collect
+canonical leaf identities during the successful directory encoding walk, rather
+than reparsing the finished directory. Already validated, unescaped UTF-8 JSON
+strings and booleans/null use borrowed canonical bytes; escaped strings and
+numbers retain typed canonicalization. Both routes must produce identical sv1
+identities. Directory coverage and fallback admission remain unchanged.
+
+Eligible reads prepare at most 64 rows from one pinned transaction. One sorted,
+deduplicated batch loads content/revision/TTL metadata; a second loads required
+directories and certificates. Each directory is decoded once. Bounded owned
+metadata survives backend-buffer retirement; remaining field reads reuse the
+same proof/directory rather than fetching them again. Equal omission masks share
+logical range/full-value batches; no unrelated values are unioned. Additional
+materialized input is bounded to a conservative 1 MiB subwindow, with one large
+row allowed to make progress. Admission uses coalesced retained range bytes on
+range-capable backends and original row sizes on full-value adapters. Each
+subwindow owns a fresh read scope from the same transaction, releasing backend
+buffers and pins before the next subwindow. Singleton reads reuse their metadata
+scope directly. Deadline checks run during planning, before each
+subwindow and before each output row. Results return to their original slots,
+and partial failures release untransferred sources. Row reconstruction scratch
+is still recycled independently. This is request-local work reuse, not an authorization
+or cross-request snapshot cache. Unsupported parent masks bypass preparation;
+small/opaque/stale cases retain ordinary source delivery.
+
+A current certificate permits unchanged leaves to be omitted without loading or
+hashing those payloads. Current permissions, revision, query membership and
+publication fences still apply. Missing, stale, unsupported or ABI-incompatible
+certificates use the full-value reference path. Existing bounded authority
+backfill repairs eligible legacy rows without changing their logical revisions.
+Opaque/subtree values and source-dependent operators retain reference execution.
+Other selected metadata may still require storage-frame reads or a full-layout
+fallback: certificate reuse is not a guarantee of zero physical disk I/O.
 
 
-### Future generic conditional source projection
+The CLI retains bounded verified descriptors (digest, MIME, dimensions, length
+and server identity), never image payloads, in the existing atomic artifact
+cache. Keys include endpoint, table, parent, field and credential context, plus
+a build digest of the image validators. The cache uses 256 buckets and four
+1 KiB slots per bucket; records can be evicted at any time. Current permissions
+and expected revision are rechecked before any descriptor is accepted. Lower
+current image-byte/pixel limits still apply. Before grouped retrieval, a bounded score-cache probe identifies fields whose
+current question already has a reusable decision. Changed questions request full
+values immediately in the same grouped query, avoiding conditional-then-full
+round trips. This probe is only a planning hint; actual score use rechecks expiry
+after fresh authorization and identity verification. The request retains the
+exact verified descriptors it sends, so later cache eviction does not require
+reopening them. Expired/evicted scores still force ordinary materialization.
+Descriptors never enter provider requests: an explicit materialization guard
+runs before coalescing and dispatch. Conditional fallback retains ordinary
+source/request budgets and avoids charging the same logical image twice.
+Conditional-response transfer admission accounts for small identity responses
+separately from full-image processing scratch. The shared processing admission
+budget remains unchanged. Bucket-striped writer locks serialize cache bucket
+read/choose/publish operations within the process, preserving fitting colliding
+entries; readers remain lock-free and cross-process races remain safe misses.
+Disabling caches also disables conditional identity work. Older servers that
+ignore the extension return full values; those rejecting it receive one ordinary
+projection retry, charged to the same request budget. No permission result is
+cached by this mechanism.
 
-Skipping warm image bytes requires a general query-source contract, rather than
-a grep endpoint or a caller-maintained companion digest. A future conditional
-projection should request explicit logical source paths and return opaque,
-versioned value identities computed or certified by the server. Identities must
-bind exact stored values at the same authorized read cut as returned metadata.
-The server may omit a value only when a supplied previous identity matches that
-current value; a caller-supplied expected identity is a condition, never proof.
-Missing fields must differ from stored nulls, and missing/old authorities require
-value reads or ordinary full projection. Current filters and authorization apply
-before every omission decision, including retained snapshots and distributed or
-external-table reads. No cached authorization grant survives into a later query.
-
-The client would retain only bounded, verified image descriptors (decoded digest,
-MIME, dimensions, length and source identity) beside scores, scoped by endpoint,
-table, parent, field and credential context. Changed identities or missing scores
-materialize and validate payloads again. Capability negotiation must preserve
-full-byte fallback against older servers. Digest persistence belongs with the
-existing storage-owned projection authorities and publication fences, not in an
-ingester-owned schema field. This contract and its client reuse path are future
-work; the current implementation continues to fetch and validate warm bytes.
+Manifest pages have independent worker leases. Completed lanes can refill across
+page boundaries while output stays in discovery order. At most eight active
+jobs, sixteen staged results, the coordinator page and one prefetched page are
+retained; there is no corpus-sized page or reorder inventory. Explicit finite
+evaluation budgets retain serial admission. Every launch, cancellation, decode,
+output and drain failure joins borrowers before releasing their pages. The shared
+64 MiB conservative image admission pool remains in place; warm reuse removes
+transfer and validation work instead of raising that pool's limit.

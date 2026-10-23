@@ -91,11 +91,21 @@ pub fn load(a: A, scratch: A, scope: anytype, physical: []const []const u8, ids:
     return loadProfiled(a, scratch, scope, physical, ids, roots, authenticated, null);
 }
 
+/// Caller-owned proof/directory decoded from the SAME pinned read transaction.
+/// No lifetime or cross-request cache: this only reuses a bounded window's work.
+pub const Authority = struct { proof: ?revision.Content = null, directory: ?projection.Directory = null };
+pub fn loadPrepared(a: A, scratch: A, scope: anytype, physical: []const []const u8, ids: []const []const u8, roots: []const []const u8, authorities: []const Authority) ![]Row {
+    return loadInternal(a, scratch, scope, physical, ids, roots, true, null, authorities);
+}
 pub fn loadProfiled(a: A, scratch: A, scope: anytype, physical: []const []const u8, ids: []const []const u8, roots: []const []const u8, authenticated: bool, profile: ?*ReadProfile) ![]Row {
+    return loadInternal(a, scratch, scope, physical, ids, roots, authenticated, profile, null);
+}
+fn loadInternal(a: A, scratch: A, scope: anytype, physical: []const []const u8, ids: []const []const u8, roots: []const []const u8, authenticated: bool, profile: ?*ReadProfile, authorities: ?[]const Authority) ![]Row {
     const started = ReadProfile.clock(profile);
     defer ReadProfile.add(profile, "total_ns", started);
     if (profile) |p| _ = p.calls.fetchAdd(1, .monotonic);
     if (physical.len > 64 or physical.len != ids.len or roots.len > 64) return error.InvalidBatch;
+    if (authorities) |ready| if (ready.len != ids.len) return error.InvalidBatch;
     const result = try a.alloc(Row, ids.len);
     @memset(result, .{ .bytes = null, .original_bytes = 0 });
     errdefer {
@@ -108,7 +118,9 @@ pub fn loadProfiled(a: A, scratch: A, scope: anytype, physical: []const []const 
     var timestamps: [64]u64 = undefined;
     // Without storage authentication a directory is not authority to omit bytes.
     var phase = ReadProfile.clock(profile);
-    if (authenticated and roots.len != 0) {
+    if (authorities) |ready| {
+        for (ready, 0..) |authority, i| proofs[i] = authority.proof;
+    } else if (authenticated and roots.len != 0) {
         if (comptime @hasDecl(@typeInfo(@TypeOf(scope)).pointer.child, "loadProofWindow")) {
             try scope.loadProofWindow(scratch, physical, ids, proofs[0..ids.len], timestamps[0..ids.len]);
         } else try revision.loadWindow(scope, scratch, physical, ids, proofs[0..ids.len], timestamps[0..ids.len]);
@@ -127,7 +139,7 @@ pub fn loadProfiled(a: A, scratch: A, scope: anytype, physical: []const []const 
         indices[count] = i;
         count += 1;
     };
-    if (count != 0) try many(scope, keys[0..count], raw[0..count]);
+    if (count != 0 and authorities == null) try many(scope, keys[0..count], raw[0..count]);
     ReadProfile.add(profile, "directory_read_ns", phase);
     phase = ReadProfile.clock(profile);
     const Prepared = struct {
@@ -152,13 +164,18 @@ pub fn loadProfiled(a: A, scratch: A, scope: anytype, physical: []const []const 
             continue;
         }
         const proof = proofs[i].?;
-        const encoded_directory = encoded orelse {
+        const directory = if (authorities) |ready| ready[i].directory orelse {
             repair[i] = true;
             continue;
-        };
-        const directory = (try projection.Directory.open(scratch, encoded_directory, proof)) orelse {
-            repair[i] = !try projection.isCurrent(scratch, encoded_directory, proof);
-            continue;
+        } else directory: {
+            const encoded_directory = encoded orelse {
+                repair[i] = true;
+                continue;
+            };
+            break :directory (try projection.Directory.open(scratch, encoded_directory, proof)) orelse {
+                repair[i] = !try projection.isCurrent(scratch, encoded_directory, proof);
+                continue;
+            };
         };
         if (directory.version == 1) repair[i] = true;
         var chosen: [projection.maximum_fields]bool = @splat(false);
@@ -226,7 +243,8 @@ pub fn loadProfiled(a: A, scratch: A, scope: anytype, physical: []const []const 
                 index = parent;
             }
         }
-        try writer.object(&out.writer, 0, item.directory.root_count);
+        writer.object(&out.writer, 0, item.directory.root_count) catch |err|
+            return if (err == error.WriteFailed) error.OutOfMemory else err;
         result[item.index] = .{ .bytes = try out.toOwnedSlice(), .original_bytes = proofs[item.index].?.bytes, .projected = true, .repair_authority = repair[item.index] };
     }
     ReadProfile.add(profile, "reconstruct_ns", phase);

@@ -5056,6 +5056,9 @@ pub const ProvisionedTableReadSource = struct {
     /// under one read lease, before its captured generation is released.
     fn queryRequiresCoordinatorFinalization(req: db_mod.types.SearchRequest) bool {
         return req.evaluation_limit > 0 or req.reranker != null or req.pruner != null or
+            // Worker retrieval deliberately omits delivery conditions. Keep the
+            // final selected source at this coordinator even for one group.
+            req.source_projection_json.len != 0 or
             std.mem.indexOf(u8, req.aggregations_json, "\"algebraic_join\"") != null;
     }
 
@@ -22343,6 +22346,9 @@ fn consumerTests() type {
 
         test "provisioned single-group queries retain coordinator-owned finalization" {
             try std.testing.expect(!ProvisionedTableReadSource.queryRequiresCoordinatorFinalization(.{}));
+            try std.testing.expect(ProvisionedTableReadSource.queryRequiresCoordinatorFinalization(.{
+                .source_projection_json = "{\"fields\":[{\"field\":\"body\"}]}",
+            }));
             try std.testing.expect(ProvisionedTableReadSource.queryRequiresCoordinatorFinalization(.{
                 .pruner = .{ .min_absolute_score = 10 },
             }));

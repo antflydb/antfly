@@ -41358,13 +41358,108 @@ pub const DB = struct {
             projection = try @import("document_query.zig").SpanProjectionPlan.init(alloc, projection_opts);
             if (projection) |*plan| request.document_projection_plan = .{ .plan = plan, .fields = req.fields, .include_all_fields = req.include_all_fields };
         }
+        const conditional_source = @import("../../api/source_projection.zig").storageEligible(req);
+        if (conditional_source) request.include_stored = false;
         var result = try self.searchLockedWithExecutionContextRaw(alloc, request, exec_ctx, externalize_artifact_ids, dense_profile_sink);
         errdefer result.deinit();
+        if (conditional_source) try self.hydrateConditionalSource(alloc, req, &result);
         if (req.profile and req.value_search_work == null) {
             result.value_search_profile_json = try value_work.profileAlloc(alloc);
         }
         try self.attachDistributedDocumentAuthority(alloc, req, &result);
         return result;
+    }
+
+    /// Runs before releasing search's publication/apply lease. Each bounded
+    /// window pins one read transaction and releases per-row scopes promptly.
+    /// Identities and ordinary source fields share the same revision.
+    fn hydrateConditionalSource(self: *DB, alloc: Allocator, req: types.SearchRequest, result: *types.SearchResult) !void {
+        const protocol = @import("../../api/source_projection.zig");
+        var arena = std.heap.ArenaAllocator.init(@import("antfly_platform").allocator.reclaimingScratch(alloc));
+        defer arena.deinit();
+        const temp = arena.allocator();
+        const parsed = try std.json.parseFromSliceLeaky(protocol.Request, temp, req.source_projection_json, .{});
+        const prepared = try protocol.Prepared.init(temp, parsed);
+        var schema = self.core.acquireSchemaView();
+        defer if (schema) |*view| view.release();
+        var start: usize = 0;
+        var certificate_hits: usize = 0;
+        var full_fallbacks: usize = 0;
+        while (start < result.hits.len) {
+            const end = @min(result.hits.len, start + 64);
+            var window = std.heap.ArenaAllocator.init(@import("antfly_platform").allocator.reclaimingScratch(alloc));
+            defer window.deinit();
+            var txn = try self.core.store.beginReadTxn();
+            defer txn.abort();
+            const conditional_mod = @import("../conditional_source.zig");
+            var physical_keys: [64][]const u8 = undefined;
+            var ids: [64][]const u8 = undefined;
+            var repairs: [64]bool = @splat(false);
+            var conditional_rows: ?[]?conditional_mod.Result = null;
+            defer if (conditional_rows) |rows| {
+                for (rows) |row| if (row) |value| {
+                    alloc.free(value.source);
+                    alloc.free(value.identities);
+                };
+                alloc.free(rows);
+            };
+            const authenticated = self.core.store.valuesAreAuthenticated() and conditional_mod.exactSelectedValues(req.fields, parsed);
+            if (authenticated) {
+                try db_query_search.checkSearchRequestDeadline(req);
+                for (result.hits[start..end], 0..) |hit, i| {
+                    physical_keys[i] = try encodeStoreLookupKeyWithPinnedSchemaAlloc(self, window.allocator(), hit.id, schema);
+                    ids[i] = hit.id;
+                }
+                var authorities: conditional_mod.Window = .{};
+                {
+                    var scope = try txn.openReadScope(window.allocator());
+                    defer scope.close();
+                    authorities = try conditional_mod.Window.prepare(window.allocator(), &scope, physical_keys[0 .. end - start], ids[0 .. end - start]);
+                    if (end - start == 1) {
+                        conditional_rows = try alloc.alloc(?conditional_mod.Result, 1);
+                        conditional_rows.?[0] = null;
+                        conditional_rows.?[0] = try conditional_mod.loadPrepared(alloc, window.allocator(), &scope, physical_keys[0], ids[0], req.fields, prepared, authorities.rows[0], &repairs[0]);
+                    }
+                }
+                const Guard = struct {
+                    fn check(raw: *const anyopaque) !void {
+                        const request: *const types.SearchRequest = @ptrCast(@alignCast(raw));
+                        try db_query_search.checkSearchRequestDeadline(request.*);
+                    }
+                };
+                if (end - start != 1) conditional_rows = try conditional_mod.loadPreparedWindow(alloc, window.allocator(), &txn, physical_keys[0 .. end - start], ids[0 .. end - start], req.fields, prepared, authorities.rows[0 .. end - start], repairs[0 .. end - start], .{ .ctx = &req, .run = Guard.check });
+            }
+            var fallback_keys: [64][]const u8 = undefined;
+            var fallback_slots: [64]usize = undefined;
+            var count: usize = 0;
+            for (result.hits[start..end], start..) |*hit, i| {
+                try db_query_search.checkSearchRequestDeadline(req);
+                if (repairs[i - start]) self.document_authority_backfill_requested.store(true, .release);
+                if (conditional_rows) |rows| if (rows[i - start]) |value| {
+                    hit.clearSource(alloc);
+                    hit.stored_data = value.source;
+                    hit.source_projection_json = value.identities;
+                    rows[i - start] = null;
+                    certificate_hits += 1;
+                    continue;
+                };
+                fallback_keys[count] = hit.id;
+                fallback_slots[count] = i;
+                full_fallbacks += 1;
+                count += 1;
+            }
+            if (count != 0) {
+                const rows = try self.loadProjectedSearchDocumentMany(alloc, req, fallback_keys[0..count]);
+                defer freeOptionalOwnedBytes(alloc, rows);
+                for (rows, fallback_slots[0..count]) |*row, i| {
+                    result.hits[i].clearSource(alloc);
+                    result.hits[i].stored_data = row.*;
+                    row.* = null;
+                }
+            }
+            start = end;
+        }
+        if (benchQueryProfileEnabled()) std.log.info("antfly_bench_conditional_source certificate_hits={d} full_fallbacks={d}", .{ certificate_hits, full_fallbacks });
     }
 
     fn attachDistributedDocumentAuthority(self: *DB, alloc: Allocator, req: types.SearchRequest, result: *types.SearchResult) !void {

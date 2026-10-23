@@ -59,6 +59,7 @@ if TYPE_CHECKING:
     from ..models.regexp_query import RegexpQuery
     from ..models.reranker_config import RerankerConfig
     from ..models.sort_field import SortField
+    from ..models.source_projection import SourceProjection
     from ..models.stateful_query_request_graph_searches import StatefulQueryRequestGraphSearches
     from ..models.term_query import TermQuery
     from ..models.term_range_query import TermRangeQuery
@@ -227,6 +228,13 @@ class GlobalStatefulQueryRequest:
             When omitted, Antfly uses the balanced default effort (`0.5`) unless
             lower-level vector search overrides are provided internally.
              Default: 0.5. Example: 0.5.
+        source_projection (SourceProjection | Unset): Conditional delivery of selected logical source fields on
+            authorized hits.
+            Every field must also be selected by `fields` (or the default all-fields
+            projection). Conditions only suppress unchanged source values; they never
+            authorize a read, skip filters, or establish the existence of a record.
+            The response reports value, unchanged, or missing separately for each path.
+            Older servers may omit this extension; callers must retain full-value fallback.
         fields (list[str] | Unset): List of fields to include in the results. If not specified, all fields are returned.
             Use to reduce response size and improve performance. This field is required when
             hierarchy.group_by is present so a grouped query cannot accidentally hydrate an
@@ -534,6 +542,7 @@ class GlobalStatefulQueryRequest:
     aggregations: QueryRequestAggregations | Unset = UNSET
     embeddings: QueryRequestEmbeddings | Unset = UNSET
     search_effort: float | Unset = 0.5
+    source_projection: SourceProjection | Unset = UNSET
     fields: list[str] | Unset = UNSET
     hierarchy: QueryHierarchy | Unset = UNSET
     highlight: QueryHighlight | Unset = UNSET
@@ -840,6 +849,10 @@ class GlobalStatefulQueryRequest:
 
         search_effort = self.search_effort
 
+        source_projection: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.source_projection, Unset):
+            source_projection = self.source_projection.to_dict()
+
         fields: list[str] | Unset = UNSET
         if not isinstance(self.fields, Unset):
             fields = self.fields
@@ -976,6 +989,8 @@ class GlobalStatefulQueryRequest:
             field_dict["embeddings"] = embeddings
         if search_effort is not UNSET:
             field_dict["search_effort"] = search_effort
+        if source_projection is not UNSET:
+            field_dict["source_projection"] = source_projection
         if fields is not UNSET:
             field_dict["fields"] = fields
         if hierarchy is not UNSET:
@@ -1085,6 +1100,7 @@ class GlobalStatefulQueryRequest:
         from ..models.regexp_query import RegexpQuery
         from ..models.reranker_config import RerankerConfig
         from ..models.sort_field import SortField
+        from ..models.source_projection import SourceProjection
         from ..models.stateful_query_request_graph_searches import StatefulQueryRequestGraphSearches
         from ..models.term_query import TermQuery
         from ..models.term_range_query import TermRangeQuery
@@ -2014,6 +2030,13 @@ class GlobalStatefulQueryRequest:
 
         search_effort = d.pop("search_effort", UNSET)
 
+        _source_projection = d.pop("source_projection", UNSET)
+        source_projection: SourceProjection | Unset
+        if isinstance(_source_projection, Unset):
+            source_projection = UNSET
+        else:
+            source_projection = SourceProjection.from_dict(_source_projection)
+
         fields = cast(list[str], d.pop("fields", UNSET))
 
         _hierarchy = d.pop("hierarchy", UNSET)
@@ -2171,6 +2194,7 @@ class GlobalStatefulQueryRequest:
             aggregations=aggregations,
             embeddings=embeddings,
             search_effort=search_effort,
+            source_projection=source_projection,
             fields=fields,
             hierarchy=hierarchy,
             highlight=highlight,
