@@ -809,7 +809,7 @@
   "delivery_verification": {
     "cases": 16,
     "all_stdout_stderr_payloads_match_final_binary": true,
-    "binary_sha256": "97932b347d24c7f6d9e371a59066cc1e1161165b8c2533267359bbe6a8dfcaf5"
+    "binary_sha256": "d66d281307b043a3fd135e67e6a257677776d59720cec4b873b7d89fa0711b55"
   },
   "run_order": "ordinary then agent for each scenario; cache and latency are not counterbalanced",
   "tool_output_tokenizer": "o200k_base common counter; not the Claude model-native tokenizer"
