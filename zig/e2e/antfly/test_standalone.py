@@ -203,9 +203,15 @@ class EmbeddedInferenceStandaloneServer:
             raise
 
     def _start(self) -> None:
+        # This fixture exercises the public inference listener. Standalone keeps
+        # write access disabled unless the operator explicitly enables it.
+        config = self.root / "config.json"
+        config.write_text(json.dumps({"public_inference": {"enabled": True}}))
         command = [
             self.binary,
             "standalone",
+            "--config",
+            str(config),
             "--host",
             self.host,
             "--port",

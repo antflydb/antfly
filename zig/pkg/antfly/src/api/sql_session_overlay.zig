@@ -31,7 +31,7 @@ pub fn needsMerge(staged: *const transactions.OwnedTransactionCommitRequest, tab
         if (!std.mem.eql(u8, staged.physicalName(entry.table_name), table.physical_name)) continue;
         if (entry.schema_version != null and entry.schema_version != table.schema_version) return error.CatalogGenerationChanged;
         if (entry.relational_schema_version != null and entry.relational_schema_version != table.schema_version) return error.CatalogGenerationChanged;
-        writes = writes or entry.batch.writes.len != 0 or entry.batch.deletes.len != 0 or entry.txn_writes.len != 0;
+        writes = writes or entry.batch.writes.len != 0 or entry.batch.deletes.len != 0;
     }
     return writes;
 }
