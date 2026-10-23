@@ -7922,3 +7922,103 @@ def test_constant_sort_keys_preserve_bounded_reads_and_primary_ties(graph_db):
     assert tied["rows"] == primary["rows"]
     with pytest.raises(af.AntflyError, match="CypherDivisionByZero"):
         graph_db.cypher_json("g", {"query": "MATCH (n:D) RETURN n.score ORDER BY 1/0,n.score DESC LIMIT 1"})
+
+
+def test_partial_order_distinct_retains_only_the_distinct_window(graph_db):
+    populate(graph_db, 13000)
+    graph_db.sql("CREATE INDEX ranked ON docs(score DESC)")
+    for projection in ("n.id,n.score", "n.score,n.id IS NULL"):
+        actual = graph_db.cypher_json(
+            "g",
+            {
+                "query": f"MATCH (n:D) RETURN DISTINCT {projection} ORDER BY n.score DESC LIMIT 5",
+                "limits": {"scanned_anchors": 5, "intermediate_states": 6000, "memory_bytes": 1 << 20},
+            },
+        )
+        control = graph_db.cypher_json("g", {"query": f"MATCH (n:D) RETURN {projection} ORDER BY n.score DESC LIMIT 5"})
+        assert actual["rows"] == control["rows"]
+        assert actual["stats"]["scanned_anchors"] == 5
+    graph_db.sql("UPDATE docs SET id='same',score=20000 WHERE score<64")
+    actual = graph_db.cypher_json(
+        "g",
+        {
+            "query": "MATCH (n:D) RETURN DISTINCT n.id,n.score ORDER BY n.score DESC LIMIT 5",
+            "limits": {"scanned_anchors": 100, "intermediate_states": 20000, "memory_bytes": 1 << 20},
+        },
+    )
+    control = graph_db.cypher_json("g", {"query": "MATCH (n:D) RETURN n.id,n.score ORDER BY n.score DESC LIMIT 68"})
+    unique = []
+    for row in control["rows"]:
+        if row not in unique:
+            unique.append(row)
+    assert actual["rows"] == unique[:5]
+
+
+def test_redundant_with_distinct_preserves_source_identity_and_bounded_reads(graph_db):
+    populate(graph_db, 13000)
+    graph_db.sql("CREATE INDEX ranked ON docs(score DESC)")
+    for stage in ("WITH DISTINCT n", "WITH n AS m WITH DISTINCT m WITH m AS n", "WITH DISTINCT *"):
+        actual = graph_db.cypher_json(
+            "g",
+            {
+                "query": f"MATCH (n:D) {stage} RETURN n.score ORDER BY n.score DESC LIMIT 5",
+                "limits": {"scanned_anchors": 5, "intermediate_states": 6000, "memory_bytes": 1 << 20},
+            },
+        )
+        assert [int(row[0]["value"]) for row in actual["rows"]] == list(range(12999, 12994, -1))
+        assert actual["stats"]["scanned_anchors"] == 5
+    count = graph_db.cypher_json(
+        "g",
+        {"query": "MATCH (n:D) WITH DISTINCT n RETURN count(*)", "limits": {"memory_bytes": 2 << 20}},
+    )
+    assert count["rows"] == [[{"type": "integer", "value": "13000"}]]
+    graph_db.sql("UPDATE docs SET score=0 WHERE score<64")
+    assert graph_db.cypher_json("g", {"query": "MATCH (n:D) WITH DISTINCT n.score AS s RETURN s ORDER BY s LIMIT 2"})[
+        "rows"
+    ] == [[{"type": "integer", "value": "0"}], [{"type": "integer", "value": "64"}]]
+    with pytest.raises(af.AntflyError, match="CypherDivisionByZero"):
+        graph_db.cypher_json(
+            "g", {"query": "MATCH (n:D) WITH DISTINCT n,1/n.score AS inv RETURN n.score ORDER BY n.score DESC LIMIT 5"}
+        )
+
+
+def test_composite_index_prefixes_refine_boundary_ties_once(graph_db):
+    populate(graph_db, 13000)
+    graph_db.sql("CREATE INDEX covering ON docs(score DESC,id)")
+    for stage in ("", "WITH DISTINCT n", "WITH n AS m WITH DISTINCT m WITH m AS n"):
+        actual = graph_db.cypher_json(
+            "g",
+            {
+                "query": f"MATCH (n:D) {stage} RETURN n.score ORDER BY n.score DESC LIMIT 5",
+                "limits": {"scanned_anchors": 8, "intermediate_states": 6000, "memory_bytes": 1 << 20},
+            },
+        )
+        assert [int(row[0]["value"]) for row in actual["rows"]] == list(range(12999, 12994, -1))
+        assert actual["stats"]["scanned_anchors"] <= 8
+    graph_db.sql("UPDATE docs SET id=CAST(13000-score AS TEXT),score=30000 WHERE score>=12936")
+    for projection in ("n", "DISTINCT n.id,n.score"):
+        actual = graph_db.cypher_json(
+            "g",
+            {
+                "query": f"MATCH (n:D) RETURN {projection} ORDER BY n.score DESC SKIP 2 LIMIT 5",
+                "limits": {"scanned_anchors": 96, "intermediate_states": 30000, "memory_bytes": 1 << 20},
+            },
+        )
+        control = graph_db.cypher_json(
+            "g", {"query": f"MATCH (n:D) RETURN {projection} ORDER BY n.score+0 DESC SKIP 2 LIMIT 5"}
+        )
+        assert actual["rows"] == control["rows"]
+    # A whole-table tie must be read once; its sort state remains a five-row heap.
+    for start in range(0, 13000, 1000):
+        graph_db.sql(f"UPDATE docs SET score=7 WHERE score>={start} AND score<{start + 1000}")
+    graph_db.sql("UPDATE docs SET score=7 WHERE score=30000")
+    actual = graph_db.cypher_json(
+        "g",
+        {
+            "query": "MATCH (n:D) RETURN DISTINCT n.id,n.score ORDER BY n.score DESC LIMIT 5",
+            "limits": {"scanned_anchors": 13000, "memory_bytes": 2 << 20},
+        },
+    )
+    control = graph_db.cypher_json("g", {"query": "MATCH (n:D) RETURN n.id,n.score LIMIT 5"})
+    assert actual["rows"] == control["rows"]
+    assert actual["stats"]["scanned_anchors"] == 13000

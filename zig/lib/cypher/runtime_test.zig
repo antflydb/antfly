@@ -7867,3 +7867,97 @@ test "constant order streams DISTINCT through authenticated primary-order RPC ow
     try std.testing.expectEqualStrings("b", result.rows[0][0].node.identity.key);
     try std.testing.expectEqual(owners[0].records + owners[1].records, result.stats.scanned_anchors);
 }
+
+test "coarse RPC prefixes refine owner ties and bound partial DISTINCT across windows" {
+    const root = @import("root.zig");
+    const A = std.mem.Allocator;
+    const g: catalog.Graph = .{ .name = "g", .incarnation = 1, .revision = 1, .labels = &.{.{ .name = "Document", .table = "docs" }}, .relationships = &.{} };
+    const F = struct {
+        const Self = @This();
+        nodes: [8]v.Node = undefined,
+        properties: [8][2]v.Entry = undefined,
+        fn init(self: *@This()) void {
+            const ranks = [_]?i64{ 2, 1, 2, null, 2, 1, 0, null };
+            const ids = [_][]const u8{ "x", "p", "x", "n", "y", "p", "q", "n" };
+            const keys = [_][]const u8{ "a", "b", "c", "d", "e", "f", "g", "h" };
+            for (&self.nodes, &self.properties, ranks, ids, keys) |*node, *properties, rank, id, key| {
+                properties.* = .{ .{ .name = "rank", .value = if (rank) |number| .{ .integer = number } else .null }, .{ .name = "id", .value = .{ .string = id } } };
+                node.* = .{ .identity = .{ .table = "docs", .key = key }, .labels = &.{"Document"}, .properties = properties };
+            }
+        }
+        fn check(_: *anyopaque) !void {}
+        fn close(_: *anyopaque) void {}
+        fn bind(_: *anyopaque, _: A, _: catalog.Graph) !void {}
+        fn get(_: *anyopaque, _: A, _: v.Identity) !?*const v.Node {
+            return null;
+        }
+        fn expand(_: *anyopaque, _: A, _: catalog.Relationship, _: v.Identity, _: @import("ast.zig").Direction, _: ?[]const u8, _: usize) !b.Page(*const v.Relationship) {
+            return .{ .items = &.{} };
+        }
+        const Owner = struct {
+            fixture: *Self,
+            partition: usize,
+            records: usize = 0,
+            fn scan(ptr: *anyopaque, a: A, _: []const u8, after: ?[]const u8, limit: usize) !b.Page(*const v.Node) {
+                return page(ptr, a, after, limit, null);
+            }
+            fn ordered(ptr: *anyopaque, a: A, _: []const u8, _: []const b.PropertyFilter, order: []const b.PropertyOrder, after: ?[]const u8, limit: usize, maximum: usize) !?b.Page(*const v.Node) {
+                if (order.len != 1 or !std.mem.eql(u8, order[0].property, "rank")) return null;
+                if (limit == 0) return .{ .items = &.{}, .cursors = &.{}, .next = "0", .examined = 0, .stable_ties = false };
+                return try page(ptr, a, after, @min(limit, maximum), order[0].descending);
+            }
+            fn page(ptr: *anyopaque, a: A, after: ?[]const u8, limit: usize, descending: ?bool) !b.Page(*const v.Node) {
+                const self: *@This() = @ptrCast(@alignCast(ptr));
+                const start = if (after) |bytes| try std.fmt.parseInt(usize, bytes, 10) else 0;
+                const end = @min(4, start + limit);
+                const nodes = try a.alloc(*const v.Node, end - start);
+                const cursors = try a.alloc(?[]const u8, nodes.len);
+                const asc = [_][4]usize{ .{ 1, 2, 0, 3 }, .{ 2, 1, 0, 3 } };
+                const desc = [_][4]usize{ .{ 3, 2, 0, 1 }, .{ 3, 0, 1, 2 } };
+                for (nodes, cursors, start..) |*node, *cursor, ordinal| {
+                    const position = if (descending) |known| (if (known) desc[self.partition][ordinal] else asc[self.partition][ordinal]) else ordinal;
+                    node.* = &self.fixture.nodes[self.partition * 4 + position];
+                    cursor.* = if (ordinal + 1 < 4) try std.fmt.allocPrint(a, "{d}", .{ordinal + 1}) else null;
+                }
+                self.records += nodes.len;
+                return .{ .items = nodes, .cursors = cursors, .next = if (end < 4) try std.fmt.allocPrint(a, "{d}", .{end}) else null, .examined = nodes.len, .stable_ties = descending == null };
+            }
+            fn backend(self: *@This()) b.Backend {
+                return .{ .ptr = self, .vtable = &.{ .bind = Self.bind, .checkpoint = Self.check, .scan = scan, .get = Self.get, .expand = Self.expand, .scan_ordered = ordered } };
+            }
+        };
+        fn invoke(ptr: *anyopaque, a: A, body: []const u8) ![]u8 {
+            const owner: *root.rpc.Owner = @ptrCast(@alignCast(ptr));
+            return owner.execute(a, body);
+        }
+        fn run(a: A, backend: b.Backend, text: []const u8) ![]const u8 {
+            var diagnostic: c.Diagnostic = .{};
+            var compiled = c.compile(a, text, .{}, &diagnostic) catch |err| return a.dupe(u8, @errorName(err));
+            defer compiled.deinit();
+            var result = runtime.execute(a, backend, g, &compiled, &.{}, .{}) catch |err| return a.dupe(u8, @errorName(err));
+            defer result.deinit();
+            return std.json.Stringify.valueAlloc(a, result.rows, .{});
+        }
+    };
+    var fixture: F = .{};
+    fixture.init();
+    // Catalog encounter order intentionally differs from global key order.
+    var owners = [_]F.Owner{ .{ .fixture = &fixture, .partition = 1 }, .{ .fixture = &fixture, .partition = 0 } };
+    var endpoints = [_]root.rpc.Owner{ .{ .backend = owners[0].backend(), .graph = g, .table = "docs" }, .{ .backend = owners[1].backend(), .graph = g, .table = "docs" } };
+    var clients = [_]root.rpc.Client{ .{ .channel = .{ .ptr = &endpoints[0], .call = F.invoke }, .incarnation = 1, .revision = 1 }, .{ .channel = .{ .ptr = &endpoints[1], .call = F.invoke }, .incarnation = 1, .revision = 1 } };
+    const targets = [_]root.distributed.Target{ .{ .table = "docs", .table_id = 1, .group_id = 1 }, .{ .table = "docs", .table_id = 1, .group_id = 2 } };
+    const snapshots = [_]root.distributed.Snapshot{ .{ .backend = clients[0].backend(), .ptr = &fixture, .validate = F.check, .close = F.close }, .{ .backend = clients[1].backend(), .ptr = &fixture, .validate = F.check, .close = F.close } };
+    var set: root.distributed.ReadSet = .{ .a = std.testing.allocator, .targets = &targets, .snapshots = &snapshots, .independent_validations = &.{}, .source = .{ .ptr = &fixture, .checkpoint = F.check, .admit = undefined, .capture = undefined } };
+    for ([_][]const u8{ "", "WITH DISTINCT n ", "WITH n AS m WITH DISTINCT m WITH m AS n " }) |stage|
+        for ([_][]const u8{ "n AS r", "n.id AS r,n.rank AS s", "DISTINCT n.id AS r,n.rank AS s", "DISTINCT n.rank AS r" }) |projection|
+            for ([_][]const u8{ "ASC", "DESC" }) |direction|
+                for ([_]usize{ 0, 1, 3 }) |skip|
+                    for ([_]usize{ 0, 1, 3, 9 }) |limit| {
+                        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+                        defer arena.deinit();
+                        const a = arena.allocator();
+                        const query = try std.fmt.allocPrint(a, "MATCH (n:Document) {s}RETURN {s} ORDER BY n.rank {s} SKIP {d} LIMIT {d}", .{ stage, projection, direction, skip, limit });
+                        const control = try std.fmt.allocPrint(a, "MATCH (n:Document) {s}RETURN {s} ORDER BY CASE WHEN true THEN n.rank ELSE n.rank END {s} SKIP {d} LIMIT {d}", .{ stage, projection, direction, skip, limit });
+                        try std.testing.expectEqualStrings(try F.run(a, set.backend(), control), try F.run(a, set.backend(), query));
+                    };
+}

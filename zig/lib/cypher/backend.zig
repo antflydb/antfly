@@ -44,6 +44,11 @@ pub fn Page(comptime T: type) type {
         next: ?[]const u8 = null,
         examined: ?usize = null,
         unfiltered: bool = false,
+        /// Ordered keys are monotone. False requires boundary-tie refinement
+        /// before a row goal may stop consumption.
+        stable_ties: bool = true,
+        /// Primary encounter provenance for refinement across routed owners.
+        encounter_owners: ?[]const usize = null,
     };
 }
 pub const FilterOp = enum { eq, lt, lte, gt, gte, in };
@@ -138,8 +143,9 @@ pub const Backend = struct {
         /// Typed comparisons are candidate restrictions; the runtime always
         /// rechecks Cypher semantics after authorization and projection.
         scan_where: ?*const fn (*anyopaque, std.mem.Allocator, []const u8, []const PropertyFilter, ?[]const u8, usize) anyerror!Page(*const v.Node) = null,
-        /// A non-null page certifies this exact Cypher order, with primary
-        /// scan encounter order for ties. Null declines before emitting rows.
+        /// A non-null page certifies monotone Cypher order keys. stable_ties
+        /// additionally certifies primary encounter order for equal keys.
+        /// Consumers must refine ties or decline metadata-only coarse proofs.
         /// Empty order requests primary encounter order under the filters;
         /// indexes can attest when every physical key is equality-fixed.
         /// Examined includes hidden/rejected/speculative records across owners.

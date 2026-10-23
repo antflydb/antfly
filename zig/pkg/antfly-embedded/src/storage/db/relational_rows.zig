@@ -1017,6 +1017,18 @@ pub const Reader = struct {
                 break;
             }
         }
+        // A page limit can coincide with the final index entry. Establish
+        // range exhaustion while the index cursor is still open; otherwise a
+        // caller that consumed its exact candidate ceiling would need another
+        // nonempty record budget just to discover EOF. This is a key-only
+        // continuation check: it does not hydrate, filter, emit, or advance past
+        // an unconsumed candidate. Byte-limited rows retain their old cursor.
+        if (!exhausted and self.index != null) if (entry) |last| {
+            if (std.mem.eql(u8, last.key, continuation.items)) {
+                const peek = try cursor.next();
+                exhausted = if (peek) |next| std.mem.order(u8, next.key, self.upper) != .lt else true;
+            }
+        };
         if (!exhausted and self.include_cursor and self.index != null) {
             const prefix = try records.forwardPrefix(self.index.?.id());
             result.next_cursor = try row_cursor_codec.encode(page, self.cursor_identity.?, continuation.items[prefix.len..]);

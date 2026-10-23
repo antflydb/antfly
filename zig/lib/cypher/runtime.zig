@@ -583,6 +583,7 @@ pub const NodeCursor = struct {
         if (!planned.primary) {
             const proof = (try read(backend.ptr, e.a, planned.table, planned.filters, planned.fields, null, 0, 0)) orelse return false;
             if (proof.items.len != 0 or (proof.examined orelse 0) != 0 or proof.next == null) return error.CypherInvalidBackendPage;
+            if (!proof.stable_ties) return false;
             planned.initial_cursor = proof.next;
         }
         planned.active = true;
@@ -1168,7 +1169,13 @@ const NodeOrder = struct {
     alias: []const u8,
     fields: []const backend_mod.PropertyOrder,
     filters: []const backend_mod.PropertyFilter = &.{},
-    distinct: enum { none, unique, adjacent } = .none,
+    distinct: enum { none, unique, adjacent, hashed } = .none,
+    unique_stages: []const usize = &.{},
+    coarse: bool = false,
+    encounter_owner: usize = 0,
+    encounter_key: ?[]const u8 = null,
+    refill: usize = 1,
+    previous_total: ?usize = null,
     primary: bool = false,
     primary_fallback: bool = false,
     primary_index: bool = false,
@@ -6115,7 +6122,8 @@ const Engine = struct {
                     .project => |step| {
                         const projected = try engine.projectUnordered(&.{row}, step.value, false);
                         if (projected.len == 0) return;
-                        if (step.value.distinct and !try fold.distinct[index].accept(engine, fold.retained, projected[0])) return;
+                        const unique = if (engine.node_order) |order| engine.stream_fold == fold and std.mem.indexOfScalar(usize, order.unique_stages, index) != null else false;
+                        if (step.value.distinct and !unique and !try fold.distinct[index].accept(engine, fold.retained, projected[0])) return;
                         const prior_weight = fold.weight;
                         defer fold.weight = prior_weight;
                         if (step.value.distinct) fold.weight = Count.one;
@@ -6159,7 +6167,7 @@ const Engine = struct {
             if (fold.record_rows) fold.matched.* +|= @as(usize, @intCast(fold.weight.cap(std.math.maxInt(usize))));
             if (fold.top.*) |*top| {
                 try top.addWeighted(row, fold.weight);
-                const ordered_input = if (engine.node_order) |order| order.active and engine.stream_fold == fold else false;
+                const ordered_input = if (engine.node_order) |order| order.active and !order.coarse and engine.stream_fold == fold else false;
                 if (fold.projection.limit != null and (fold.projection.order.len == 0 or ordered_input) and top.capacity != 0 and top.total == top.capacity) return error.CypherStreamComplete;
                 return;
             }
@@ -7540,6 +7548,7 @@ const Engine = struct {
                 if (try read(self.backend.ptr, self.a, order.table, order.filters, order.fields, null, 0, 0)) |proof| {
                     if (proof.items.len != 0 or (proof.examined orelse 0) != 0 or proof.next == null) return error.CypherInvalidBackendPage;
                     order.active = true;
+                    order.coarse = !proof.stable_ties;
                     order.initial_cursor = proof.next;
                 } else order.declined = true;
             }
@@ -9485,7 +9494,12 @@ const Engine = struct {
                 if (examined < page.items.len) return error.CypherInvalidBackendPage;
                 if (examined > self.limits.scanned_anchors -| self.stats.scanned_anchors) return error.CypherAnchorBudgetExceeded;
                 self.stats.scanned_anchors += examined;
-                for (page.items) |node| {
+                if (page.encounter_owners) |owners| if (owners.len != page.items.len) return error.CypherInvalidBackendPage;
+                for (page.items, 0..) |node, ordinal| {
+                    if (self.node_order) |order| if (order.active and order.coarse) {
+                        order.encounter_owner = if (page.encounter_owners) |owners| owners[ordinal] else 0;
+                        order.encounter_key = node.identity.key;
+                    };
                     try chargeWork(self, 1 + node.identity.table.len / 64 + node.identity.key.len / 64);
                     if (self.stream_fold == null and self.shortest_count == null) {
                         if ((try seen.getOrPut(self.a, node.identity)).found_existing) continue;
@@ -9914,11 +9928,12 @@ const Engine = struct {
         var filters: std.ArrayList(backend_mod.PropertyFilter) = .empty;
         try filters.appendSlice(self.a, try self.nodeFilters(node, operation.predicate, input[0]));
         const original_filters = filters.items.len;
-        for (middle) |clause| {
+        var unique_stages: std.ArrayList(usize) = .empty;
+        for (middle, 0..) |clause, stage_index| {
             try self.state();
             if (clause.operation != .project) return null;
             const step = clause.operation.project.value;
-            if (step.distinct or step.order.len != 0 or step.skip != null or step.limit != null) return null;
+            if (step.order.len != 0 or step.skip != null or step.limit != null) return null;
             var next: std.StringHashMapUnmanaged(NodeOrigin) = .empty;
             if (step.wildcard) {
                 var bindings = lineage.iterator();
@@ -9932,6 +9947,14 @@ const Engine = struct {
                 const origin = self.nodeOrigin(item.expression, lineage);
                 try next.put(self.a, name, origin orelse .{});
                 next_shape = try self.replace(next_shape, name, .{ .boolean = if (origin) |known| known.node else false });
+            }
+            if (step.distinct) {
+                var bindings = next.iterator();
+                const unique = while (bindings.next()) |entry| {
+                    if (entry.value_ptr.node) break true;
+                } else false;
+                if (!unique) return null;
+                try unique_stages.append(self.a, stage_index);
             }
             var scope = shape;
             for (next_shape) |entry| scope = try self.replace(scope, entry.name, entry.value);
@@ -9955,8 +9978,8 @@ const Engine = struct {
         // consumer. Aggregates, unbounded reads and fallible final projections
         // still evaluate normally over the surviving rows. DISTINCT keeps its
         // original representative encounter order unless proved below.
-        const hinted: ?NodeOrder = if (filters.items.len > original_filters and !projection.distinct)
-            .{ .table = table orelse return null, .alias = alias, .fields = &.{}, .filters = filters.items, .declined = true }
+        const hinted: ?NodeOrder = if ((filters.items.len > original_filters or unique_stages.items.len != 0) and !projection.distinct)
+            .{ .table = table orelse return null, .alias = alias, .fields = &.{}, .filters = filters.items, .unique_stages = unique_stages.items, .declined = true }
         else
             null;
         if ((!external_order and projection.limit == null) or projection.wildcard or projection.predicate != null or projection.order.len == 0 or projection.order.len > 32) return hinted;
@@ -9988,7 +10011,7 @@ const Engine = struct {
             } else false;
             if (!repeated) try fields.append(self.a, .{ .property = name, .descending = order.descending });
         }
-        var result: NodeOrder = .{ .table = table orelse return null, .alias = alias, .fields = fields.items, .filters = filters.items, .primary = projection.order.len != 0 and fields.items.len == 0, .declined = projection.order.len == 0 or (fields.items.len != 0 and self.backend.vtable.scan_ordered == null) };
+        var result: NodeOrder = .{ .table = table orelse return null, .alias = alias, .fields = fields.items, .filters = filters.items, .unique_stages = unique_stages.items, .primary = projection.order.len != 0 and fields.items.len == 0, .declined = projection.order.len == 0 or (fields.items.len != 0 and self.backend.vtable.scan_ordered == null) };
         if (projection.distinct and projection.order.len != 0) distinct: {
             var properties: std.StringHashMapUnmanaged(void) = .empty;
             var unique = false;
@@ -10015,8 +10038,9 @@ const Engine = struct {
                 result.distinct = .unique;
                 break :distinct;
             }
-            for (fields.items) |field| adjacent = adjacent and properties.contains(field.property);
-            if (adjacent) result.distinct = .adjacent;
+            var projected_order = true;
+            for (fields.items) |field| projected_order = projected_order and properties.contains(field.property);
+            if (projected_order) result.distinct = if (adjacent) .adjacent else .hashed;
         }
         // Without a DISTINCT proof, source order must remain unchanged: a
         // nonprojected sort key belongs to the first encountered representative.
@@ -10034,7 +10058,19 @@ const Engine = struct {
         const bounded_demand = @min(demand, @max(@as(usize, 1), self.limits.scanned_anchors -| self.stats.scanned_anchors));
         if (self.lookup) |lookup_plan| if (lookup_plan.complete and std.mem.eql(u8, lookup_plan.table, table)) return lookup_plan.cachedPage(self, cursor, bounded_demand);
         if (self.node_order) |order| if (!order.declined and std.mem.eql(u8, order.table, table) and first.alias != null and std.mem.eql(u8, order.alias, first.alias.?)) {
-            const wanted = if (self.stream_fold) |fold| if (fold.top.*) |top| @min(bounded_demand, top.capacity -| top.total) else bounded_demand else bounded_demand;
+            const wanted = if (self.stream_fold) |fold| if (fold.top.*) |top| wanted: {
+                const remaining = top.capacity -| top.total;
+                const stalled = order.previous_total != null and order.previous_total.? == top.total;
+                if (order.coarse or (order.distinct != .none and stalled)) {
+                    const quantum = order.refill;
+                    order.refill = @min(128, quantum * 2);
+                    order.previous_total = top.total;
+                    break :wanted @min(bounded_demand, @max(remaining, quantum));
+                }
+                order.refill = 1;
+                order.previous_total = top.total;
+                break :wanted @min(bounded_demand, remaining);
+            } else bounded_demand else bounded_demand;
             if (order.primary) {
                 order.active = true;
                 if (!order.primary_fallback and order.filters.len != 0) {
@@ -10052,6 +10088,8 @@ const Engine = struct {
             const read = self.backend.vtable.scan_ordered orelse return error.CypherInvalidBackendPage;
             const filters = order.filters;
             if (try read(self.backend.ptr, self.a, table, filters, order.fields, cursor orelse order.initial_cursor, @max(1, wanted), self.limits.scanned_anchors -| self.stats.scanned_anchors)) |page| {
+                if (order.active and order.coarse == page.stable_ties) return error.CypherInvalidBackendPage;
+                order.coarse = !page.stable_ties;
                 order.active = true;
                 order.initial_cursor = null;
                 return page;
@@ -10285,7 +10323,12 @@ const Engine = struct {
                 if (examined < page.items.len) return error.CypherInvalidBackendPage;
                 if (examined > self.limits.scanned_anchors -| self.stats.scanned_anchors) return error.CypherAnchorBudgetExceeded;
                 self.stats.scanned_anchors += examined;
-                for (page.items) |node| {
+                if (page.encounter_owners) |owners| if (owners.len != page.items.len) return error.CypherInvalidBackendPage;
+                for (page.items, 0..) |node, ordinal| {
+                    if (self.node_order) |order| if (order.active and order.coarse) {
+                        order.encounter_owner = if (page.encounter_owners) |owners| owners[ordinal] else 0;
+                        order.encounter_key = node.identity.key;
+                    };
                     try chargeWork(self, 1 + node.identity.table.len / 64 + node.identity.key.len / 64);
                     if (self.stream_fold == null and self.shortest_count == null) {
                         if ((try seen.getOrPut(self.a, node.identity)).found_existing) continue;
@@ -15309,7 +15352,7 @@ const Engine = struct {
     fn expressionName(self: *Engine, expression: *const ast.Expr) ![]const u8 {
         return @import("expressions.zig").outputName(self.a, self.source, expression);
     }
-    const Projected = struct { row: Row, source: Row, group: ?[]const Row, keys: []const v.Value, sequence: usize = 0, weight: usize = 1, multiplicity: ?Count = null };
+    const Projected = struct { row: Row, source: Row, group: ?[]const Row, keys: []const v.Value, tie_owner: usize = 0, tie_key: ?[]const u8 = null, sequence: usize = 0, weight: usize = 1, multiplicity: ?Count = null };
     const PatternScope = struct {
         columns: @FieldType(Engine, "columns"),
         stages: @FieldType(Engine, "stages"),
@@ -15378,7 +15421,8 @@ const Engine = struct {
             engine.cache_reads = scope.cache_reads;
         }
     };
-    const Pick = struct { arena: std.heap.ArenaAllocator, value: Projected };
+    const DistinctPick = struct { hash: u64, index: usize, previous: ?*@This() = null, next: ?*@This() = null };
+    const Pick = struct { arena: std.heap.ArenaAllocator, value: Projected, distinct: ?*DistinctPick = null };
     fn compareProjected(self: *Engine, left: Projected, right: Projected, orders: []const ast.Order) !std.math.Order {
         try chargeWork(self, 1);
         // Heap entries can be evicted and their allocations recycled. Comparison
@@ -15390,15 +15434,28 @@ const Engine = struct {
             const comparison = try work.order(left.keys[index], right.keys[index]);
             if (comparison != .eq) return if (order.descending) comparison.invert() else comparison;
         }
+        if (left.tie_key) |key| if (right.tie_key) |other| {
+            const owner = std.math.order(left.tie_owner, right.tie_owner);
+            if (owner != .eq) return owner;
+            return work.order(.{ .string = key }, .{ .string = other });
+        };
         return std.math.order(left.sequence, right.sequence);
     }
+    fn swapPicks(picks: []Pick, left: usize, right: usize) void {
+        std.mem.swap(Pick, &picks[left], &picks[right]);
+        if (picks[left].distinct) |entry| entry.index = left;
+        if (picks[right].distinct) |entry| entry.index = right;
+    }
     fn siftPicks(self: *Engine, picks: []Pick, orders: []const ast.Order) !void {
-        var parent: usize = 0;
+        return self.siftPicksFrom(picks, orders, 0);
+    }
+    fn siftPicksFrom(self: *Engine, picks: []Pick, orders: []const ast.Order, start: usize) !void {
+        var parent = start;
         while (parent * 2 + 1 < picks.len) {
             var worst = parent * 2 + 1;
             if (worst + 1 < picks.len and try self.compareProjected(picks[worst + 1].value, picks[worst].value, orders) == .gt) worst += 1;
             if (try self.compareProjected(picks[parent].value, picks[worst].value, orders) != .lt) break;
-            std.mem.swap(Pick, &picks[parent], &picks[worst]);
+            swapPicks(picks, parent, worst);
             parent = worst;
         }
     }
@@ -15437,7 +15494,7 @@ const Engine = struct {
         // Only statement-owned copies can be adopted by the final result.
         // Top-k picks and group scratch arenas must still be copied on escape.
         if (parent) |proof| try proof.adoptClones(&context);
-        return .{ .row = row, .source = &.{}, .group = null, .keys = keys, .sequence = candidate.sequence, .weight = candidate.weight, .multiplicity = if (candidate.multiplicity) |weight| try weight.clone(a) else null };
+        return .{ .row = row, .source = &.{}, .group = null, .keys = keys, .tie_owner = candidate.tie_owner, .tie_key = if (candidate.tie_key) |key| try a.dupe(u8, key) else null, .sequence = candidate.sequence, .weight = candidate.weight, .multiplicity = if (candidate.multiplicity) |weight| try weight.clone(a) else null };
     }
     const TopK = struct {
         engine: *Engine,
@@ -15451,14 +15508,17 @@ const Engine = struct {
         columns: std.ArrayList([]const u8) = .empty,
         distinct_arena: ?std.heap.ArenaAllocator = null,
         distinct_previous: ?Row = null,
+        hashed_distinct: bool = false,
+        distinct_heads: std.AutoHashMapUnmanaged(u64, *DistinctPick) = .{},
         fn init(engine: *Engine, projection: ast.Projection, first: Row) !TopK {
             const skip = if (projection.skip) |expression| try engine.count(expression) else 0;
             // Without a limit this is a result collector. Its storage grows
             // with emitted rows; it never builds the bounded selection heap.
             const limit = if (projection.limit) |expression| try engine.count(expression) else std.math.maxInt(usize) - skip;
             var result: TopK = .{ .engine = engine, .projection = projection, .retained = engine.a, .skip = skip, .capacity = if (limit == 0) 0 else std.math.add(usize, skip, limit) catch return error.CypherLimitExceeded };
-            if (projection.distinct) if (engine.node_order) |order| if (order.active and order.distinct == .adjacent) {
-                result.distinct_arena = std.heap.ArenaAllocator.init(engine.scratch_allocator);
+            if (projection.distinct) if (engine.node_order) |order| if (order.active) {
+                result.hashed_distinct = order.distinct == .hashed or (order.coarse and order.distinct == .adjacent);
+                if (order.distinct == .adjacent and !order.coarse) result.distinct_arena = std.heap.ArenaAllocator.init(engine.scratch_allocator);
             };
             if (projection.wildcard) for (first) |entry| try result.columns.append(engine.a, entry.name);
             for (projection.items) |item| try result.columns.append(engine.a, item.alias orelse try engine.expressionName(item.expression));
@@ -15466,7 +15526,11 @@ const Engine = struct {
         }
         fn deinit(self: *TopK) void {
             if (self.distinct_arena) |*arena| arena.deinit();
-            for (self.picks.items) |*pick| pick.arena.deinit();
+            for (self.picks.items) |*pick| {
+                if (pick.distinct) |entry| self.engine.scratch_allocator.destroy(entry);
+                pick.arena.deinit();
+            }
+            self.distinct_heads.deinit(self.engine.scratch_allocator);
         }
         fn add(self: *TopK, source: Row) !void {
             return self.addWeighted(source, Count.one);
@@ -15492,16 +15556,62 @@ const Engine = struct {
                 _ = arena.reset(.free_all);
                 self.distinct_previous = try cloneRow(arena.allocator(), row.items);
             }
-            const candidate: Projected = .{ .row = row.items, .source = &.{}, .group = null, .keys = keys, .sequence = self.sequence, .weight = @intCast(weight.cap(self.capacity)), .multiplicity = if (self.projection.limit == null) weight else null };
+            const order = engine.node_order;
+            const coarse = if (order) |proof| proof.active and proof.coarse else false;
+            const candidate: Projected = .{ .row = row.items, .source = &.{}, .group = null, .keys = keys, .tie_owner = if (coarse) order.?.encounter_owner else 0, .tie_key = if (coarse) order.?.encounter_key orelse return error.CypherInvalidBackendPage else null, .sequence = self.sequence, .weight = @intCast(weight.cap(self.capacity)), .multiplicity = if (self.projection.limit == null) weight else null };
+            // A coarse source can stop only beyond the complete boundary key
+            // group. The heap repairs primary encounter ties with O(SKIP+LIMIT)
+            // retained rows, regardless of the physical tie-group cardinality.
+            if (coarse and self.capacity != 0 and self.total == self.capacity) {
+                var comparison = candidate;
+                var boundary = self.picks.items[0].value;
+                comparison.tie_key = null;
+                boundary.tie_key = null;
+                comparison.sequence = 0;
+                boundary.sequence = 0;
+                if (try engine.compareProjected(comparison, boundary, self.projection.order) == .gt) return error.CypherStreamComplete;
+            }
             return self.acceptProjected(candidate);
+        }
+        fn forgetDistinct(self: *TopK, entry: *DistinctPick) void {
+            if (entry.previous) |previous| previous.next = entry.next else if (entry.next) |next| self.distinct_heads.getPtr(entry.hash).?.* = next else _ = self.distinct_heads.remove(entry.hash);
+            if (entry.next) |next| next.previous = entry.previous;
+            self.engine.scratch_allocator.destroy(entry);
         }
         fn acceptProjected(self: *TopK, candidate: Projected) !void {
             const engine = self.engine;
             if (self.capacity == 0 or candidate.weight == 0) return;
+            const hash = if (self.hashed_distinct) try engine.rowHash(candidate.row) else null;
+            if (hash) |key| {
+                var current = self.distinct_heads.get(key);
+                while (current) |entry| : (current = entry.next) {
+                    const previous = &self.picks.items[entry.index];
+                    if (!try engine.rowEqual(previous.value.row, candidate.row)) continue;
+                    if (try engine.compareProjected(candidate, previous.value, self.projection.order) != .lt) return;
+                    var replacement = try engine.clonePick(candidate);
+                    replacement.distinct = entry;
+                    previous.arena.deinit();
+                    previous.* = replacement;
+                    try engine.siftPicksFrom(self.picks.items, self.projection.order, entry.index);
+                    return;
+                }
+            }
             if (self.projection.limit != null and self.total == self.capacity and try engine.compareProjected(candidate, self.picks.items[0].value, self.projection.order) != .lt) return;
             var pick = try engine.clonePick(candidate);
             var owned = true;
-            defer if (owned) pick.arena.deinit();
+            defer if (owned) {
+                if (pick.distinct) |entry| self.forgetDistinct(entry);
+                pick.arena.deinit();
+            };
+            if (hash) |key| {
+                const entry = try engine.scratch_allocator.create(DistinctPick);
+                errdefer engine.scratch_allocator.destroy(entry);
+                const bucket = try self.distinct_heads.getOrPut(engine.scratch_allocator, key);
+                entry.* = .{ .hash = key, .index = self.picks.items.len, .next = if (bucket.found_existing) bucket.value_ptr.* else null };
+                if (entry.next) |next| next.previous = entry;
+                bucket.value_ptr.* = entry;
+                pick.distinct = entry;
+            }
             // One heap entry represents a whole identical projected bag.
             // Trim weights at the worst key rather than inserting K copies.
             try self.picks.append(self.retained, pick);
@@ -15512,7 +15622,7 @@ const Engine = struct {
                 while (position > 0) {
                     const parent = (position - 1) / 2;
                     if (try engine.compareProjected(self.picks.items[parent].value, self.picks.items[position].value, self.projection.order) != .lt) break;
-                    std.mem.swap(Pick, &self.picks.items[parent], &self.picks.items[position]);
+                    Engine.swapPicks(self.picks.items, parent, position);
                     position = parent;
                 }
                 while (total > self.capacity) {
@@ -15520,10 +15630,12 @@ const Engine = struct {
                     self.picks.items[0].value.weight -= discarded;
                     total -= discarded;
                     if (self.picks.items[0].value.weight == 0) {
+                        if (self.picks.items[0].distinct) |entry| self.forgetDistinct(entry);
                         self.picks.items[0].arena.deinit();
                         const last = self.picks.pop().?;
                         if (self.picks.items.len != 0) {
                             self.picks.items[0] = last;
+                            if (last.distinct) |entry| entry.index = 0;
                             try engine.siftPicks(self.picks.items, self.projection.order);
                         }
                     }
@@ -15818,6 +15930,10 @@ const Engine = struct {
                     var choose_left = r == end;
                     if (l < middle and r < end) {
                         choose_left = items[l].sequence <= items[r].sequence;
+                        if (items[l].tie_key) |key| if (items[r].tie_key) |other| {
+                            const owner = std.math.order(items[l].tie_owner, items[r].tie_owner);
+                            choose_left = if (owner != .eq) owner == .lt else (try self.values.order(.{ .string = key }, .{ .string = other })) != .gt;
+                        };
                         for (orders, 0..) |order_value, i| {
                             const ordering = try self.values.order(items[l].keys[i], items[r].keys[i]);
                             if (ordering != .eq) {

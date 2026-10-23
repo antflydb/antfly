@@ -251,7 +251,7 @@ pub fn Adapter(comptime DB: type, comptime GraphIndex: type, comptime EdgeScanCu
             }
             return strength;
         }
-        const OrderedCursor = struct { index: []const u8, after: ?[]const u8 = null, schema_version: u32 };
+        const OrderedCursor = struct { coarse: bool = false, index: []const u8, after: ?[]const u8 = null, schema_version: u32 };
         const OrderedPartition = struct {
             parent: *Self,
             filters: []const b.PropertyFilter,
@@ -353,7 +353,39 @@ pub fn Adapter(comptime DB: type, comptime GraphIndex: type, comptime EdgeScanCu
             // continuation protocol over these already-pinned local partitions.
             var merge: root.distributed.ReadSet = .{ .a = temporary, .work = self.work, .ordered_identity_ties = true, .ordered_item_cursors = true, .targets = targets, .snapshots = snapshots, .independent_validations = &.{}, .source = .{ .ptr = self, .checkpoint = checkpoint, .admit = undefined, .capture = undefined } };
             const merged_backend = merge.backend();
-            return merged_backend.vtable.scan_ordered.?(merged_backend.ptr, a, table, &.{}, order, encoded, limit, max_examined);
+            var page = try merged_backend.vtable.scan_ordered.?(merged_backend.ptr, a, table, &.{}, order, encoded, limit, max_examined);
+            // These partitions share one physical owner's primary encounter
+            // domain; their synthetic merge positions are not owner provenance.
+            if (page) |*value| value.encounter_owners = null;
+            return page;
+        }
+        fn orderedIndexPrefix(self: *Self, schema: anytype, index: anytype, filters: []const b.PropertyFilter, order: []const b.PropertyOrder, coarse: bool) !?usize {
+            if (index.predicate != null or index.tuple.keys.len == 0 or index.tuple.keys.len < order.len or (coarse and order.len == 0)) return null;
+            const last = index.tuple.keys.len - order.len;
+            var prefix: usize = if (coarse) 0 else last;
+            candidates: while (prefix <= last) : (prefix += 1) {
+                if (coarse and prefix == last) break;
+                for (index.tuple.keys[0..prefix]) |key| {
+                    switch (key.column_type) {
+                        .integer, .string, .boolean => {},
+                        else => continue :candidates,
+                    }
+                    if (key.expression != null or key.fold_ascii) continue :candidates;
+                    const name = schema.tableSchema().relational_columns[key.ordinal].name;
+                    if (try self.filterStrength(filters, name, key.column_type) != 4) continue :candidates;
+                }
+                for (index.tuple.keys[prefix..][0..order.len], order) |key, requested| {
+                    if (self.work) |work| try work.charge(work.ptr, 1);
+                    if (key.expression != null or key.fold_ascii or key.descending != requested.descending or key.nulls_first != requested.descending) continue :candidates;
+                    if (!std.mem.eql(u8, schema.tableSchema().relational_columns[key.ordinal].name, requested.property)) continue :candidates;
+                    switch (key.column_type) {
+                        .integer, .string, .boolean => {},
+                        else => continue :candidates,
+                    }
+                }
+                return prefix;
+            }
+            return null;
         }
         fn scanOrderedScalar(ptr: *anyopaque, a: A, table: []const u8, filters: []const b.PropertyFilter, order: []const b.PropertyOrder, encoded: ?[]const u8, limit: usize, max_examined: usize, partition: bool) !?b.Page(*const v.Node) {
             if (comptime !@hasDecl(DB, "openRelationalReadSession") or !@hasDecl(DB, "cypherDocumentScanOptions")) return null;
@@ -374,28 +406,9 @@ pub fn Adapter(comptime DB: type, comptime GraphIndex: type, comptime EdgeScanCu
             defer indexes.deinit();
             if (indexes.plan.schemaView().epoch != schema.epoch) return error.CatalogGenerationChanged;
             const cursor = if (encoded) |bytes| try std.json.parseFromSliceLeaky(OrderedCursor, temporary, bytes, .{}) else null;
-            candidates: for (indexes.plan.boundIndexes()) |index| {
-                if (cursor) |position| if (!std.mem.eql(u8, position.index, index.name)) continue;
-                if (index.predicate != null or index.tuple.keys.len == 0 or index.tuple.keys.len < order.len) continue;
-                const prefix = index.tuple.keys.len - order.len;
-                for (index.tuple.keys[0..prefix]) |key| {
-                    switch (key.column_type) {
-                        .integer, .string, .boolean => {},
-                        else => continue :candidates,
-                    }
-                    if (key.expression != null or key.fold_ascii) continue :candidates;
-                    const name = schema.tableSchema().relational_columns[key.ordinal].name;
-                    if (try self.filterStrength(filters, name, key.column_type) != 4) continue :candidates;
-                }
-                for (index.tuple.keys[prefix..], order) |key, requested| {
-                    if (self.work) |work| try work.charge(work.ptr, 1);
-                    if (key.expression != null or key.fold_ascii or key.descending != requested.descending or key.nulls_first != requested.descending) continue :candidates;
-                    if (!std.mem.eql(u8, schema.tableSchema().relational_columns[key.ordinal].name, requested.property)) continue :candidates;
-                    switch (key.column_type) {
-                        .integer, .string, .boolean => {},
-                        else => continue :candidates, // Exact NUMERIC/JSON projection has different ordering semantics.
-                    }
-                }
+            for ([_]bool{ false, true }) |coarse| candidates: for (indexes.plan.boundIndexes()) |index| {
+                if (cursor) |position| if (!std.mem.eql(u8, position.index, index.name) or position.coarse != coarse) continue;
+                const prefix = (try self.orderedIndexPrefix(schema, index, filters, order, coarse)) orelse continue;
                 if (cursor == null) {
                     const leading = index.tuple.keys[0];
                     const strength = try self.filterStrength(filters, schema.tableSchema().relational_columns[leading.ordinal].name, leading.column_type);
@@ -474,20 +487,20 @@ pub fn Adapter(comptime DB: type, comptime GraphIndex: type, comptime EdgeScanCu
                 defer session.deinit();
                 session.reader.now_ns = self.ttl_now_ns;
                 try session.checkpoint();
-                if (limit == 0) return .{ .items = &.{}, .cursors = &.{}, .examined = 0, .next = try std.json.Stringify.valueAlloc(a, OrderedCursor{ .index = index.name, .schema_version = session.reader.active.version(), .after = if (cursor) |position| position.after else null }, .{}) };
+                if (limit == 0) return .{ .items = &.{}, .cursors = &.{}, .examined = 0, .stable_ties = !coarse, .next = try std.json.Stringify.valueAlloc(a, OrderedCursor{ .coarse = coarse, .index = index.name, .schema_version = session.reader.active.version(), .after = if (cursor) |position| position.after else null }, .{}) };
                 var page = try session.reader.nextPage(temporary, null, .{ .rows = @min(limit, 1024), .records = @min(@min(@max(limit, 128), max_examined), 1024), .output_bytes = 16 << 20 });
                 defer page.deinit();
                 var nodes: std.ArrayList(*const v.Node) = .empty;
                 var cursors: std.ArrayList(?[]const u8) = .empty;
                 for (page.rows) |row| if (try self.node(a, table, row.key, row.json)) |node_value| if (node_value.labels.len != 0) {
                     try nodes.append(a, node_value);
-                    try cursors.append(a, try std.json.Stringify.valueAlloc(a, OrderedCursor{ .index = index.name, .schema_version = session.reader.active.version(), .after = row.cursor orelse return error.CypherInvalidBackendCursor }, .{}));
+                    try cursors.append(a, try std.json.Stringify.valueAlloc(a, OrderedCursor{ .coarse = coarse, .index = index.name, .schema_version = session.reader.active.version(), .after = row.cursor orelse return error.CypherInvalidBackendCursor }, .{}));
                 };
-                const next = if (page.more) try std.json.Stringify.valueAlloc(a, OrderedCursor{ .index = index.name, .schema_version = session.reader.active.version(), .after = page.next_cursor orelse return error.CypherInvalidBackendCursor }, .{}) else null;
+                const next = if (page.more) try std.json.Stringify.valueAlloc(a, OrderedCursor{ .coarse = coarse, .index = index.name, .schema_version = session.reader.active.version(), .after = page.next_cursor orelse return error.CypherInvalidBackendCursor }, .{}) else null;
                 if (cursors.items.len != 0) cursors.items[cursors.items.len - 1] = next;
                 try checkpoint(ptr);
-                return .{ .items = try nodes.toOwnedSlice(a), .cursors = try cursors.toOwnedSlice(a), .examined = page.records_examined, .next = next };
-            }
+                return .{ .items = try nodes.toOwnedSlice(a), .cursors = try cursors.toOwnedSlice(a), .examined = page.records_examined, .stable_ties = !coarse, .next = next };
+            };
             if (cursor != null) return error.CatalogGenerationChanged;
             return null;
         }

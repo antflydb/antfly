@@ -2784,9 +2784,11 @@ continuations never switch between primary and index cursor formats.
 Ordered DISTINCT has two streaming proofs. Projecting the source entity retains
 its unique identity in a one-row-per-node pipeline, so no membership set is
 needed. Scalar projections can deduplicate adjacent rows when every varying
-projected key is ordered and every varying order key is projected. Only the
-previous distinct row is retained, in a recyclable arena; SKIP and LIMIT count
-distinct rows. Both proofs require the physical provider's attestation before
+projected key is ordered and every varying order key is projected. Otherwise,
+when all varying order keys are projected, a hash index tracks only the rows in
+the retained SKIP+LIMIT heap. Hash entries follow stable heap slots through swaps,
+replacement and eviction, and hash collisions use full Cypher row equality.
+SKIP and LIMIT count distinct rows. Both proofs require the physical provider's attestation before
 selecting the streaming executor. An unavailable certificate, fallible expression,
 or unprojected varying sort key retains ordinary grouping and its original
 representatives. NULLs and ties use the shared Cypher equality/order rules.
@@ -2801,3 +2803,55 @@ values reads 132 anchors and uses 4,262 states, retaining only one adjacent key.
 The regression suite also exercises NULL runs, both index directions, aliases,
 unbounded and aggregate consumers, residual predicates, and authenticated
 multi-owner primary-order reads.
+
+
+### Partially ordered DISTINCT, identity-preserving stages, and index prefixes
+
+Single-node source lineage propagates entity uniqueness through total projection
+stages. WITH DISTINCT is redundant when the projected row still contains that
+source entity, including renamed entities and wildcard forwarding. Such stages
+retain their normal expression evaluation and predicates but need no membership
+set. Dropping the entity, expanding rows, grouping, or crossing a cardinality or
+fallible-expression barrier retains ordinary DISTINCT execution. Unbounded and
+aggregate consumers share the same uniqueness proof.
+
+Native relational indexes may supply the requested ordered key prefix after any
+enforced equality-fixed leading keys. A complete index-key match certifies stable
+primary ties. Extra trailing keys instead return a coarse ordering certificate;
+opaque continuations retain that certificate mode and schema generation. Exact
+certificates are considered first. The private owner RPC and coordinator merge
+preserve mode and primary encounter provenance; local IN partitions share their
+physical owner's encounter domain.
+
+A coarse source consumes the complete boundary key group once. Its finite heap
+ranks ties by catalog owner encounter order and primary document key, including
+when WITH has removed or renamed the source entity. It may stop only at a strictly
+worse key or end of source. Only SKIP+LIMIT rows are retained, independent of the
+size of a tied group. Partial-order DISTINCT uses the same bounded heap and hash
+index: a duplicate with an earlier primary representative replaces its retained
+row, and evicted entries leave the membership index immediately. No documents or
+large tied groups are serialized into continuations, and no group replay is
+needed. Refills grow to bounded native pages when a tie or duplicate run makes
+progress stall; every lookahead and speculative record is charged.
+
+Consumers that require a fully stable streaming cursor, including the current SQL
+GRAPH_TABLE cursor, decline a coarse-only metadata probe and retain the ordinary
+sort path. They never advertise a stronger order than the provider supplied.
+Regression coverage includes partial DISTINCT with duplicates, redundant identity
+stages, boundary ties ordered differently by trailing index keys, a whole-table
+tie under a small memory ceiling, and two authenticated owners whose catalog
+encounter order differs from global key order.
+
+Native index pages establish exact range exhaustion before returning a
+budget-limited final page. A key-only continuation check distinguishes EOF from
+an unconsumed next candidate without hydrating another row or changing the saved
+continuation. Thus a whole-table tied group can complete at its exact candidate
+ceiling; it does not require an extra record allowance for an empty EOF page.
+Byte-limited unconsumed rows retain their previous continuation.
+
+On both public embedded backends with 13,000 documents, partial-order DISTINCT
+now reads five anchors and uses 215 states, while a redundant WITH DISTINCT reads
+five anchors and uses 164 states. The previous paths read all 13,000 anchors.
+A leading duplicate run completes in 77 anchors and 3,813 states. A composite
+prefix with a 64-row boundary tie completes in 68 anchors; its full-node query
+uses 3,521 states. These bounds include charged lookahead records.
