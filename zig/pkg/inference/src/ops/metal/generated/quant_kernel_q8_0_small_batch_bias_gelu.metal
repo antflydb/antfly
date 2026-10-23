@@ -26,7 +26,22 @@ using namespace metal;
 
 inline float antfly_qk_half_le_to_float(device const uchar *p) { ushort bits = (ushort(p[0]) | (ushort(p[1]) << 8)); return float(as_type<half>(bits)); }
 inline float antfly_qk_gelu(float x) { if (!isfinite(x)) return 0.0f; float inner = 0.7978845608028654f * (x + 0.044715f * x * x * x); if (inner > 10.0f) return x; if (inner < -10.0f) return 0.0f; float y = 0.5f * x * (1.0f + tanh(inner)); return isfinite(y) ? y : 0.0f; }
-inline float antfly_q8_0_dequant_lane_v2(device const uchar *block, int lane) { float d = antfly_qk_half_le_to_float(block); int q = int(as_type<char>(block[2 + lane])); return d * float(q); }
+inline float antfly_q8_0_dequant_lane_v2(device const uchar *block, int lane) {
+    int v0 = lane;
+    int v1 = 0;
+    float v2 = antfly_qk_half_le_to_float(block + v1);
+    int v3 = 2;
+    int v4 = v0 + v3;
+    int v5 = int(block[v4]);
+    int v6 = 128;
+    int v7 = v5 < v6;
+    int v8 = 256;
+    int v9 = v5 - v8;
+    int v10 = v7 ? v5 : v9;
+    float v11 = float(v10);
+    float v12 = v2 * v11;
+    return v12;
+}
 kernel void antfly_q8_0_small_batch_bias_gelu_msl_v1(device const float *input [[buffer(0)]], device const uchar *weight_q8_0 [[buffer(1)]], device const float *bias [[buffer(2)]], device float *output [[buffer(3)]], constant int &rows [[buffer(4)]], constant int &in_dim [[buffer(5)]], constant int &out_dim [[buffer(6)]], uint3 thread_pos [[thread_position_in_threadgroup]], uint3 group_pos [[threadgroup_position_in_grid]]) {
     uint tid = thread_pos.x; int col0 = int(group_pos.x << 1); int col1 = col0 + 1; int row = int(group_pos.y); if (row >= rows || rows < 2 || rows > 8 || col0 >= out_dim || (in_dim & 31) != 0) return; float acc0 = 0.0f; float acc1 = 0.0f; int block_count = in_dim >> 5;
     device const float *row_input = input + row * in_dim; device const uchar *col0_weight = weight_q8_0 + col0 * block_count * 34; bool has_col1 = col1 < out_dim; device const uchar *col1_weight = has_col1 ? weight_q8_0 + col1 * block_count * 34 : col0_weight;

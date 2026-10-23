@@ -88,6 +88,7 @@ pub const AllocationKind = enum {
     tensor,
     transfer,
     workspace,
+    auxiliary,
 };
 
 pub const PhysicalAllocation = struct {
@@ -168,6 +169,24 @@ pub const BufferPlan = struct {
         const id: AllocationId = @intCast(self.allocations.len);
         self.allocations = try self.allocator.realloc(self.allocations, self.allocations.len + 1);
         self.allocations[id] = .{ .id = id, .kind = .workspace, .backend = backend, .storage = storage, .byte_size = bytes, .first_use = 0, .last_use = @intCast(self.node_slots.len), .reusable = true };
+        return id;
+    }
+
+    /// One representation plane per primary allocation and role. Since the
+    /// primary's aliases/outputs already determine reuse, the plane follows
+    /// that same lifetime and can be reused across all nodes sharing it.
+    pub fn addAuxiliaryPlane(self: *BufferPlan, primary_id: AllocationId, bytes: usize) !AllocationId {
+        if (primary_id >= self.allocations.len or bytes == 0) return error.InvalidBufferPlan;
+        const primary = self.allocations[primary_id];
+        if (primary.kind != .tensor) return error.InvalidBufferPlan;
+        const rounded = try std.math.add(usize, bytes, @sizeOf(f32) - 1);
+        if (self.allocations.len >= invalid_allocation) return error.TooManyPhysicalAllocations;
+        const id: AllocationId = @intCast(self.allocations.len);
+        self.allocations = try self.allocator.realloc(self.allocations, self.allocations.len + 1);
+        self.allocations[id] = primary;
+        self.allocations[id].id = id;
+        self.allocations[id].kind = .auxiliary;
+        self.allocations[id].byte_size = rounded / @sizeOf(f32) * @sizeOf(f32);
         return id;
     }
 

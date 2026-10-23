@@ -45,12 +45,32 @@ pub const Descriptor = struct {
 /// Per-invocation scratch. Targets expose their own layout inside this region;
 /// its physical owner and reuse lifetime belong to the executable plan.
 pub const WorkspaceRequirement = struct { byte_size: usize = 0, alignment: u32 = @alignOf(f32) };
+pub const max_auxiliaries = 3;
+/// A representation of the output retained for a downstream implementation,
+/// or a saved mathematical result. Every plane follows its primary output's
+/// physical lifetime; it is never borrowed from per-invocation scratch.
+pub const AuxiliaryRole = enum { bf16_mirror, mean, inverse_std };
+pub const Auxiliary = struct { role: AuxiliaryRole, shape: ml.graph.Shape };
+pub const AuxiliaryRequirements = struct {
+    entries: [max_auxiliaries]Auxiliary = undefined,
+    count: u8 = 0,
+    pub fn items(self: *const AuxiliaryRequirements) []const Auxiliary {
+        return self.entries[0..self.count];
+    }
+};
+pub const AuxiliaryBinding = struct { role: AuxiliaryRole, tensor: CT };
 pub const Invocation = struct {
     descriptor: *const Descriptor,
+    /// Selected implementation policy stays separate from mathematical identity.
+    operator_plan: ?*const @import("../graph/operator_plan.zig").OperatorPlan = null,
     inputs: []const CT,
     /// Null is a legality query. A decline must precede any writes/submission.
     output: ?CT = null,
     workspace: ?CT = null,
+    auxiliaries: []const AuxiliaryBinding = &.{},
+    pub inline fn operatorPlan(self: *const Invocation) ?@import("../graph/operator_plan.zig").OperatorPlan {
+        return if (self.operator_plan) |plan| plan.* else null;
+    }
 };
 
 pub fn unary(op: ml.graph.OpCode) ?Unary {
@@ -162,7 +182,9 @@ pub fn lower(graph: *const ml.graph.Graph, id: ml.graph.NodeId) ?Descriptor {
         if (input == ml.graph.null_node or input >= graph.nodeCount()) return null;
         const input_shape = graph.node(input).output_shape;
         const input_count = input_shape.numElements() orelse return null;
-        if (input_shape.dtype != .f32 or input_count <= 0 or input_count > std.math.maxInt(i32)) return null;
+        const reduced_weight = index == 1 and (operation == .linear or operation == .dot) and
+            (input_shape.dtype == .f16 or input_shape.dtype == .bf16);
+        if ((input_shape.dtype != .f32 and !reduced_weight) or input_count <= 0 or input_count > std.math.maxInt(i32)) return null;
         if ((operation == .unary or operation == .binary or operation == .softmax) and input_count != 1 and !std.mem.eql(i64, input_shape.dims[0..input_shape.rank()], shape.dims[0..shape.rank()])) return null;
         if ((operation == .unary or operation == .softmax) and input_count != count) return null;
         result.input_shapes[index] = input_shape;

@@ -22,6 +22,7 @@
 //! silently diverge in support code.
 
 const std = @import("std");
+const quant_recipe = @import("quant_recipe.zig");
 const quant_matmul = @import("quant_matmul.zig");
 const quant_kernel_op = @import("quant_kernel_op.zig");
 
@@ -1000,7 +1001,16 @@ pub const SplitkOnlineDecodeRenderPlan = struct {
 
 pub const SourceFragment = struct {
     name: []const u8,
-    source: []const u8,
+    source: []const u8 = "",
+    recipe: ?quant_recipe.Recipe = null,
+
+    fn append(self: SourceFragment, allocator: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8)) !void {
+        if (self.recipe) |recipe| {
+            const generated = try quant_recipe.render(allocator, recipe, .cuda, self.name);
+            defer allocator.free(generated);
+            try out.appendSlice(allocator, generated);
+        } else try out.appendSlice(allocator, self.source);
+    }
 };
 
 pub const KernelSupport = struct {
@@ -1955,7 +1965,7 @@ pub fn renderKernel(allocator: std.mem.Allocator, plan: RenderPlan) ![]u8 {
     }
     try out.append(allocator, '\n');
     for (support.helpers) |helper| {
-        try out.appendSlice(allocator, helper.source);
+        try helper.append(allocator, &out);
         try out.appendSlice(allocator, "\n\n");
     }
     try renderBody(allocator, &out, plan);
@@ -2031,12 +2041,12 @@ pub fn renderAttentionKernel(allocator: std.mem.Allocator, plan: AttentionRender
     }
     try out.append(allocator, '\n');
     for (attention_runtime_external_helpers) |helper| {
-        try out.appendSlice(allocator, helper.source);
+        try helper.append(allocator, &out);
         try out.appendSlice(allocator, "\n\n");
     }
     if (plan.lowering.reduction == .parallel_scores_then_serial) {
         for (attention_score_prework_runtime_external_helpers) |helper| {
-            try out.appendSlice(allocator, helper.source);
+            try helper.append(allocator, &out);
             try out.appendSlice(allocator, "\n\n");
         }
     }
@@ -2210,12 +2220,7 @@ pub fn renderSplitkOnlineDecodeKernel(
 
 const helper_half_le_to_float = SourceFragment{
     .name = "antfly_half_le_to_float",
-    .source =
-    \\static __device__ __forceinline__ float antfly_half_le_to_float(const uint8_t *p) {
-    \\    const uint16_t bits = (uint16_t)p[0] | ((uint16_t)p[1] << 8);
-    \\    return __half2float(__ushort_as_half(bits));
-    \\}
-    ,
+    .source = quant_recipe.cuda_half_source,
 };
 
 const helper_warp_reduce_sum = SourceFragment{
@@ -2229,18 +2234,6 @@ const helper_warp_reduce_sum = SourceFragment{
     \\    value += __shfl_down_sync(0xffffffffu, value, 1);
     \\    return value;
     \\}
-    ,
-};
-
-const helper_q4_k_block_view = SourceFragment{
-    .name = "antfly_q4_k_block_view",
-    .source =
-    \\struct antfly_q4_k_block_view {
-    \\    const uint8_t *d;
-    \\    const uint8_t *dmin;
-    \\    const uint8_t *scales;
-    \\    const uint8_t *qs;
-    \\};
     ,
 };
 
@@ -2258,65 +2251,13 @@ const helper_gelu = SourceFragment{
     ,
 };
 
-const helper_q4_k_unpack_scale_min = SourceFragment{
-    .name = "antfly_q4_k_unpack_scale_min",
-    .source =
-    \\static __device__ __forceinline__ void antfly_q4_k_unpack_scale_min(
-    \\    const uint8_t *scales,
-    \\    int sub,
-    \\    float *scale,
-    \\    float *min_v
-    \\) {
-    \\    if (sub < 4) {
-    \\        *scale = (float)(scales[sub] & 63u);
-    \\        *min_v = (float)(scales[sub + 4] & 63u);
-    \\        return;
-    \\    }
-    \\
-    \\    *scale = (float)((scales[sub + 4] & 0x0fu) | ((scales[sub - 4] >> 6) << 4));
-    \\    *min_v = (float)((scales[sub + 4] >> 4) | ((scales[sub] >> 6) << 4));
-    \\}
-    ,
-};
-
 const helper_q4_k_dequant_lane = SourceFragment{
     .name = "antfly_q4_k_dequant_lane",
-    .source =
-    \\static __device__ __forceinline__ float antfly_q4_k_dequant_lane(const uint8_t *block, int lane) {
-    \\    antfly_q4_k_block_view view = {
-    \\        block,
-    \\        block + 2,
-    \\        block + 4,
-    \\        block + 16,
-    \\    };
-    \\    const int sub = lane >> 5;
-    \\    const int q_index = (sub >> 1) * 32 + (lane & 31);
-    \\    const uint8_t packed = view.qs[q_index];
-    \\    const uint8_t q = (sub & 1) == 0 ? (packed & 0x0fu) : (packed >> 4);
-    \\    const float d = antfly_half_le_to_float(view.d);
-    \\    const float dmin = antfly_half_le_to_float(view.dmin);
-    \\    float raw_scale = 0.0f;
-    \\    float raw_min = 0.0f;
-    \\    antfly_q4_k_unpack_scale_min(view.scales, sub, &raw_scale, &raw_min);
-    \\    return d * raw_scale * (float)q - dmin * raw_min;
-    \\}
-    ,
+    .recipe = quant_recipe.forFormat(.q4_k),
 };
 
-const q4_k_helpers = [_]SourceFragment{
-    helper_q4_k_block_view,
-    helper_half_le_to_float,
-    helper_gelu,
-    helper_q4_k_unpack_scale_min,
-    helper_q4_k_dequant_lane,
-};
-
-const q4_k_projection_helpers = [_]SourceFragment{
-    helper_q4_k_block_view,
-    helper_half_le_to_float,
-    helper_q4_k_unpack_scale_min,
-    helper_q4_k_dequant_lane,
-};
+const q4_k_helpers = [_]SourceFragment{ helper_half_le_to_float, helper_gelu, helper_q4_k_dequant_lane };
+const q4_k_projection_helpers = [_]SourceFragment{ helper_half_le_to_float, helper_q4_k_dequant_lane };
 
 const q4_0_helpers = [_]SourceFragment{ helper_half_le_to_float, helper_warp_reduce_sum };
 

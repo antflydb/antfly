@@ -6,7 +6,8 @@ and whole-model implementations remain the selected implementations behind those
 owners. It adds no required external inference runtime.
 
 The implementation branch is based on `origin/main` revision
-`ae0b8856fdc62c7c164125ade966d3ed0cd2dc8e`. Hardware qualification uses CPU and
+`ae0b8856fdc62c7c164125ade966d3ed0cd2dc8e`, refreshed through `origin/main`
+`f95a5a5820` before the shared-recipe follow-on. Hardware qualification uses CPU and
 Metal. CUDA construction, planning, descriptor execution and capture ownership
 are implemented and compile, with host-side regression coverage; CUDA numerical
 and performance qualification still require a CUDA host.
@@ -48,15 +49,21 @@ wrappers do not need to preserve private vtable pointer identity.
 `ops/kernel_descriptor.zig` describes dense F32 unary/binary operations, linear
 projections, normalization, softmax/log-softmax, reductions, contractions and
 layout operations. `ops/kernel_geometry.zig` shares contraction/reduction geometry
-between execution and legality checks. CPU and CUDA consume the descriptors;
-Metal shares contraction geometry and unary identities while retaining its
-existing region/command/arena planner.
+between execution and legality checks. CPU and CUDA consume the descriptors.
+Metal caches descriptors in its prepared region plan and dispatches admitted
+resident operations through them while retaining its region/command/arena
+planner. Region fusions keep priority over individual kernels.
 
 Descriptors describe semantics and requirements, rather than imposing one target
 schedule. Native execution keeps SIMD, threading, BLAS, source-weight conversion
 and packed quantized routes. CUDA keeps cuBLASLt, training GEMM and existing launch
-selection. Mixed/packed operations and auxiliary RMS representations retain their
-existing routes when a descriptor cannot express their full requirements.
+selection. Planned native packed projections and CUDA mixed/packed projections
+share the same implementation selectors as their allocating entry points.
+Operator plans remain separate from semantic descriptors and are cached with
+physical bindings. Invocations borrow the cached plan by pointer. Metal filters
+static target legality during preparation and encodes already admitted device
+views directly, without re-entering general tensor conversion/retention adapters. Unsupported layouts and specialized fusions retain their
+qualified routes.
 
 `ops/kernel_backend.zig` groups target-owned physical storage, descriptor,
 completion and retention hooks. Device backends cannot inherit CPU tensor casts
@@ -102,10 +109,30 @@ learned temporary arena remains for legacy kernels and preserves its capture
 count/generation guards. This integration has host tests, not hardware capture
 qualification.
 
-This is the beginning of shared kernel descriptions, not a replacement shader
-language or a rewrite of every optimized schedule. Quantized encoding recipes,
-all auxiliary results and generated target source can migrate incrementally as
-their existing routes are qualified.
+Auxiliary requirements declare typed representation or saved-result planes.
+Preparation sizes and reuses each plane with its primary allocation's lifetime;
+workspace remains separate. CUDA's fused F32/BF16 RMSNorm writes into a planned
+mirror plane. Published tensors, dense row/reshape views and graph captures retain
+that plane independently of the primary F32 storage. The generic protocol also
+supports saved mean and inverse-standard-deviation planes without backend casts.
+
+`graph/quant_recipe.zig` owns the scalar expression graph for twelve GGUF block
+formats: Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q8_1, Q8_K, Q2_K, Q3_K, Q4_K, Q5_K and
+Q6_K. CPU full-block decoding specializes eight-lane SIMD groups at compile time;
+partial tails use the same expressions. There is no runtime recipe interpreter.
+Metal source lowering replaces twelve independent lane decoders. CUDA's generated
+Q4_K kernels use the same recipe; host source conformance checks CUDA lowering
+for all twelve formats. Q4_K header extraction and Q6_K scale/value components
+let optimized Metal schedules hoist scales and reuse decoded weights across row
+tiles without duplicating format formulas.
+
+Twelve production CPU decoder bodies, twelve Metal lane decoder bodies and the
+independent CUDA Q4_K unpacking helpers are retired in favor of shared recipes.
+The frozen scalar codec under `gguf/testing/` is an independent test and benchmark
+oracle and is not part of production decoding. Existing native dot/accumulation
+kernels, GPU tile/reduction orders, CUDA DP4A/tensor-core helpers and specialized
+attention/FFN schedules remain target implementations. Sharing mathematical
+encoding rules does not impose a common machine schedule.
 
 ## Placement, residency and observability
 
@@ -167,10 +194,100 @@ do not collect partition counters or sample provider snapshots.
 New execution owners live under `execution/`; retained graph/backend modules are
 adapters or the existing implementation providers. Further physical file moves
 can follow without maintaining duplicate implementations. The generic interpreter
-remains the explicit reference/compatibility path. Kernel source generation and
-hardware-specific schedules are separate qualification work.
+remains the explicit reference/compatibility path. Target schedules are retained
+behind common semantic and storage boundaries; specialized schedules outside the
+shared recipe vocabulary continue to require their existing qualification.
 
-## Qualification
+## Follow-on qualification commands
+
+- `zig build bench-quant-recipes`: ReleaseFast comparison with the frozen scalar
+  decoder, alternating arms and reporting median time per decoded value.
+- `zig build quant-recipe-cuda-host-conformance`: compile generated CUDA scalar
+  expressions as host C++ and compare 110,592 values with the independent codec.
+  Includes negative, non-power-of-two, subnormal and zero scales. This checks
+  source syntax and arithmetic; it is not CUDA device or performance evidence.
+- `zig build quant-kernel-metal-runtime-conformance -Dmetal=true`: compile shaders
+  through the actual Metal runtime and run all 50 conformance cases. This works
+  with Command Line Tools installations lacking the offline Metal compiler.
+  The existing offline artifact qualification gates are retained.
+- `zig build test-inference-unit -Dmetal=true -Dcuda=true
+  -Dtest-filter='Metal shared descriptors'`: real-device primitive, activation, binary,
+  contraction, reduction, layout and softmax/log-softmax checks, repeated output
+  reuse, input preservation and strict transfer admission.
+
+Follow-on kernel qualification on the M4 Max:
+
+- Twelve-format scalar/SIMD parity, including partial tails, passes against the
+  frozen independent decoder with 64 packed patterns per format.
+- CUDA host source conformance passes all 110,592 values.
+- Metal device conformance passes all 50 cases; worst absolute error is
+  `0.0000011`.
+- The promoted Metal production regression gate passes all 14 routes, with five
+  repeats and 500 measured iterations per case. All routes/providers are ready;
+  no slow fallback is observed. Worst repeat speedup over the existing handwritten
+  comparison kernels is `1.607x`.
+- CPU SIMD block decoding takes `0.271–0.614x` the frozen scalar decoder's median
+  time across the twelve formats. This measures decoding, not an inference or
+  packed matmul speedup; the existing packed matmul schedules are preserved.
+
+The final follow-on execution suite passes **386 tests with zero skips**. The
+CPU/Metal/CUDA product check and browser artifact are also checked separately.
+CUDA device numerical, capture and performance qualification still require a
+CUDA host; host compilation and ownership tests do not establish those results.
+
+### Follow-on model acceptance
+
+Frozen ReleaseFast executable SHA256:
+`60be8c48366d5f5b22341054a249f5c75f5749673ee35f62d7481c4a75d0de24`.
+The original baseline below remains unchanged. All thirteen follow-on cases
+produce byte-identical outputs to that baseline and meet the 5% p50 / 10% p95
+limits. Worst ratios are `1.0322` and `1.0774` respectively. These are model
+measurements, separate from the decoder throughput and shader gates above.
+
+Ordinary cases use seven warmups, 41 measured requests and A/B/B/A ordering.
+CPU MiniLM sequence 128, Metal Q4_K reranking and Metal ONNX use 25 warmups,
+201 requests and eight A/B/B/A/A/B/B/A arms. CPU Q4_K uses 25 warmups and
+1,001 requests across twelve A/B/B/A/B/A/A/B/A/B/B/A arms. Diagnostics are disabled
+during timing. Longer balanced CPU sampling against both the original baseline
+and the previous validated checkpoint independently confirms parity.
+
+| Workload | Baseline p50 (ms) | Follow-on p50 (ms) | p95 ratio |
+| --- | ---: | ---: | ---: |
+| minilm-st-native-b1-s16 | 1.5005 | 1.4868 | 1.0774 |
+| minilm-st-native-b1-s128 | 8.8043 | 8.7459 | 0.9941 |
+| minilm-st-native-b2-s16 | 2.2469 | 2.2458 | 1.0040 |
+| minilm-gguf-native-b1-s16 | 1.4337 | 1.4638 | 1.0116 |
+| reranker-f16-native-b1-s16 | 79.3858 | 79.3124 | 1.0017 |
+| reranker-q4k-native-b1-s16 | 11.6231 | 11.6560 | 1.0007 |
+| minilm-st-metal-b1-s16 | 2.7093 | 2.3424 | 0.7999 |
+| minilm-st-metal-b1-s128 | 3.1122 | 3.0970 | 0.9963 |
+| minilm-st-metal-b2-s16 | 2.3929 | 2.3792 | 0.9997 |
+| minilm-gguf-metal-b1-s16 | 2.3274 | 2.3540 | 1.0129 |
+| reranker-f16-metal-b1-s16 | 53.0085 | 52.9190 | 0.9972 |
+| reranker-q4k-metal-b1-s16 | 8.3293 | 8.3295 | 1.0003 |
+| minilm-onnx-metal-b1-s16 | 7.6568 | 7.9031 | 1.0497 |
+
+The independent tiny-Llama oracle passes every prefill/decode logit on CPU and
+Metal at tolerance `0.002`. Follow-on receipts, full outputs and per-arm logs live
+under the ignored `.benchmark-assets/1166/acceptance-shared-direct-binding-final/`
+directory. Earlier checkpoint evidence below remains a separate qualification
+of that executable; it is not substituted for follow-on results.
+
+Four concurrent ten-minute follow-on stress runs pass on this same frozen
+executable, with alternating encoder inputs, retained results exceeding the
+four-frame limit, decoder cache eviction and output checks throughout. The Metal
+encoder uses the ONNX fixture to exercise the shared descriptor path. Every run
+reports zero tracked live host bytes at teardown and no denied allocation;
+steady Metal device and host-mirror allocations remain bounded.
+
+| Stress workload | Completed iterations | Runtime evictions |
+| --- | ---: | ---: |
+| encoder-native | 209,506 | — |
+| encoder-metal | 45,193 | — |
+| decoder-native | 949,906 | 3710 |
+| decoder-metal | 16,257 | 63 |
+
+## Original checkpoint qualification
 
 Use repository-pinned Zig 0.17.0. Real Metal tests need access to the host GPU;
 sandboxed runs may report no device and skip the hardware cases.

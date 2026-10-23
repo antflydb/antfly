@@ -394,7 +394,7 @@ pub const Runtime = struct {
         self.buffer_plan = try buffer_plan_mod.build(self.allocator, graph, &self.plan.?.base, .{});
         var physical_backends: [2]*const ComputeBackend = undefined;
         for (devices_buf[0..device_count], 0..) |device, i| physical_backends[i] = device.backend;
-        self.physical_pool = try @import("../execution/physical_buffers.zig").Pool.create(self.allocator, graph, &self.buffer_plan.?, physical_backends[0..device_count]);
+        self.physical_pool = try @import("../execution/physical_buffers.zig").Pool.create(self.allocator, graph, &self.buffer_plan.?, physical_backends[0..device_count], self.plan.?.base.node_operator_plans);
         try self.buffer_plan.?.validate(graph, &self.plan.?.base);
     }
 

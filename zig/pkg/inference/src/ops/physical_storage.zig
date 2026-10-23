@@ -72,7 +72,7 @@ pub const CapturedLeases = struct {
     }
 };
 
-pub const View = struct { storage: *Lease, shape: []const i32 };
+pub const View = struct { storage: *Lease, shape: []const i32, dtype: ops.GraphDType = .f32 };
 
 /// A recorded submission fence. Waiting may enqueue a device dependency; it
 /// need not block the host. The owner records before publishing a frame as idle.

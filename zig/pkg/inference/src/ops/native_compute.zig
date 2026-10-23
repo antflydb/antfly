@@ -8471,66 +8471,30 @@ fn linearNoBiasInto(ctx: *anyopaque, input: CT, weight: CT, rows: usize, in_dim:
 }
 
 fn linearNoBiasPlannedOp(ctx: *anyopaque, request: *const ops.LinearNoBiasPlannedRequest) anyerror!CT {
-    const self: *NativeCompute = @ptrCast(@alignCast(ctx));
-    const weight_buf = toBuf(request.weight);
-    const storage = weight_buf.quantized_storage orelse
-        return linearNoBiasOp(ctx, request.input, request.weight, request.rows, request.in_dim, request.out_dim);
-    defer maybeDiscardMappedWeightAfterUse(self, request.weight);
-    try validateQuantLinearPlan(request.operator_plan, storage, request.rows, request.in_dim, request.out_dim);
-
-    var output_opt: ?[]f32 = try self.allocator.alloc(f32, request.rows * request.out_dim);
-    errdefer if (output_opt) |output| self.allocator.free(output);
-    const output = output_opt.?;
-    @memset(output, 0.0);
-    if (try dispatchQuantizedLinear(.{
-        .compute = self,
-        .kind = .single_no_bias,
-        .input = getData(request.input),
-        .rows = request.rows,
-        .in_dim = request.in_dim,
-        .out_dim = request.out_dim,
-        .storage_a = storage,
-        .name_a = weight_buf.name,
-        .output_a = output,
-        .plan = request.operator_plan,
-    })) {
-        const result = try makeLinearNoBiasResult(self, output, request.rows, request.out_dim);
-        output_opt = null;
-        return result;
-    }
-    return error.UnsupportedOperation;
+    return allocateLinearOutputWithPlan(ctx, request.input, request.weight, null, request.rows, request.in_dim, request.out_dim, request.operator_plan);
 }
-
 fn linearPlannedOp(ctx: *anyopaque, request: *const ops.LinearPlannedRequest) anyerror!CT {
-    const self: *NativeCompute = @ptrCast(@alignCast(ctx));
-    const weight_buf = toBuf(request.weight);
-    const storage = weight_buf.quantized_storage orelse
-        return linearOp(ctx, request.input, request.weight, request.bias, request.rows, request.in_dim, request.out_dim);
-    defer maybeDiscardMappedWeightAfterUse(self, request.weight);
-    try validateQuantLinearPlan(request.operator_plan, storage, request.rows, request.in_dim, request.out_dim);
-
-    var output_opt: ?[]f32 = try self.allocator.alloc(f32, request.rows * request.out_dim);
-    errdefer if (output_opt) |output| self.allocator.free(output);
-    const output = output_opt.?;
-    @memset(output, 0.0);
-    if (try dispatchQuantizedLinear(.{
+    return allocateLinearOutputWithPlan(ctx, request.input, request.weight, request.bias, request.rows, request.in_dim, request.out_dim, request.operator_plan);
+}
+fn plannedQuantLinearInto(self: *NativeCompute, input: CT, weight: CT, bias: ?CT, rows: usize, in_dim: usize, out_dim: usize, output: []f32, plan: ops.OperatorPlan) !void {
+    const weight_buf = toBuf(weight);
+    const storage = weight_buf.quantized_storage orelse return error.InvalidPartitionPlan;
+    defer maybeDiscardMappedWeightAfterUse(self, weight);
+    try validateQuantLinearPlan(plan, storage, rows, in_dim, out_dim);
+    @memset(output, 0);
+    if (!try dispatchQuantizedLinear(.{
         .compute = self,
-        .kind = .single_bias,
-        .input = getData(request.input),
-        .rows = request.rows,
-        .in_dim = request.in_dim,
-        .out_dim = request.out_dim,
+        .kind = if (bias != null) .single_bias else .single_no_bias,
+        .input = getData(input),
+        .rows = rows,
+        .in_dim = in_dim,
+        .out_dim = out_dim,
         .storage_a = storage,
         .name_a = weight_buf.name,
-        .bias_a = getData(request.bias),
+        .bias_a = if (bias) |value| getData(value) else null,
         .output_a = output,
-        .plan = request.operator_plan,
-    })) {
-        const result = try makeLinearNoBiasResult(self, output, request.rows, request.out_dim);
-        output_opt = null;
-        return result;
-    }
-    return error.UnsupportedOperation;
+        .plan = plan,
+    })) return error.UnsupportedOperation;
 }
 
 fn makeLinearNoBiasResult(self: *NativeCompute, output: []f32, rows: usize, out_dim: usize) !CT {
@@ -47596,6 +47560,38 @@ fn expectNativeQuantDispatchBucket(
         try std.testing.expectApproxEqAbs(expected, got, 1e-5);
     }
 
+    // The common physical executor binds the same packed schedule directly to
+    // its output allocation. Dense weight materialization would change counters.
+    const cb = compute.computeBackend();
+    const input_ct = try cb.fromFloat32Shape(input, &.{ @intCast(rows), @intCast(in_dim) });
+    defer cb.free(input_ct);
+    const weight_ct = try compute.makeBufWithEntry(empty_f32[0..], false, "test.weight", null, &storage, null);
+    defer cb.free(weight_ct);
+    const output_lease = (try ops.physical_storage.Lease.create(allocator, cb, rows * out_dim * @sizeOf(f32))).?;
+    defer output_lease.release();
+    const output_ct = (try cb.vtable.kernels.?.physicalTensorView.?(cb.ptr, .{ .storage = output_lease, .shape = &.{ @intCast(rows), @intCast(out_dim) } })).?;
+    defer cb.free(output_ct);
+    const Shape = @import("ml").graph.Shape;
+    const descriptor = ops.kernel_descriptor.Descriptor{
+        .operation = .{ .linear = .{ .rows = @intCast(rows), .in_dim = @intCast(in_dim), .out_dim = @intCast(out_dim), .bias = false } },
+        .output_shape = Shape.init(.f32, &.{ @intCast(rows), @intCast(out_dim) }),
+        .input_shapes = .{ Shape.init(.f32, &.{ @intCast(rows), @intCast(in_dim) }), Shape.init(.f32, &.{ @intCast(out_dim), @intCast(in_dim) }), undefined },
+        .input_count = 2,
+    };
+    const selected_plan = nativeQuantMatmulOperatorPlanForTensor(weight_ct, rows, in_dim, out_dim).?;
+    var invocation = ops.kernel_descriptor.Invocation{ .descriptor = &descriptor, .operator_plan = &selected_plan, .inputs = &.{ input_ct, weight_ct } };
+    resetNativeQuantDispatchStatsForTest();
+    try std.testing.expect(try runAssignedKernelOp(&compute, invocation));
+    invocation.output = output_ct;
+    try std.testing.expect(try runAssignedKernelOp(&compute, invocation));
+    const physical_stats = nativeQuantDispatchStatsForTest();
+    inline for (comptime std.meta.fieldNames(NativeQuantDispatchStats)) |field| {
+        if (!std.mem.endsWith(u8, field, "_ns")) try std.testing.expectEqual(@field(dispatch_stats, field), @field(physical_stats, field));
+    }
+    const physical_values = try cb.toFloat32(output_ct, allocator);
+    defer allocator.free(physical_values);
+    try std.testing.expectEqualSlices(f32, dispatched, physical_values);
+
     const dense_weight = try allocator.alloc(f32, out_dim * in_dim);
     defer allocator.free(dense_weight);
     try quant_codec.dequantizeToFloat32(tensor_type, storage.raw_bytes, dense_weight);
@@ -54402,6 +54398,7 @@ test "embeddinggemma2 video host borrows avoid copies and writable views reject 
 }
 
 fn physicalTensorViewOp(ctx: *anyopaque, request: ops.physical_storage.View) anyerror!?CT {
+    if (request.dtype != .f32) return null;
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
     const source = toBuf(request.storage.tensor);
     var count: usize = 1;
@@ -54428,7 +54425,14 @@ fn runAssignedKernelOp(ctx: *anyopaque, request: ops.kernel_descriptor.Invocatio
     if (request.inputs.len != descriptor.input_count) return error.InvalidTensorShape;
     for (request.inputs, 0..) |input, i| {
         const buf = toBuf(input);
-        if (descriptor.operation == .linear and i == 1 and buf.view_strides == null and buf.quantized_storage == null) {
+        if (descriptor.operation == .linear and i == 1 and buf.view_strides == null) {
+            if (buf.quantized_storage) |storage| {
+                const linear = descriptor.operation.linear;
+                if (storage.packed_expert != null or storage.shape.len != 2 or storage.shape[0] != linear.out_dim or storage.shape[1] != linear.in_dim) return false;
+                const selected = nativeQuantMatmulOperatorPlanForTensor(input, linear.rows, linear.in_dim, linear.out_dim) orelse return false;
+                try validateQuantLinearPlan(request.operatorPlan() orelse selected, storage, linear.rows, linear.in_dim, linear.out_dim);
+                continue;
+            }
             if (buf.source_tensor) |tensor| {
                 if (tensor.elementCount() == descriptor.input_shapes[i].numElements().? and
                     (tensor.dtype == .f32 or tensor.dtype == .f16 or tensor.dtype == .bf16)) continue;
@@ -54437,7 +54441,6 @@ fn runAssignedKernelOp(ctx: *anyopaque, request: ops.kernel_descriptor.Invocatio
         if (buf.view_strides != null or (buf.declared_dtype != null and buf.declared_dtype != .f32) or
             buf.data.len != descriptor.input_shapes[i].numElements().?) return false;
     }
-    if (descriptor.operation == .linear and toBuf(request.inputs[1]).quantized_storage != null) return false;
     if (descriptor.operation == .dot and (toBuf(request.inputs[0]).quantized_storage != null or toBuf(request.inputs[1]).quantized_storage != null)) return false;
     const output_ct = request.output orelse return true;
     const target = toBuf(output_ct);
@@ -54464,7 +54467,11 @@ fn runAssignedKernelOp(ctx: *anyopaque, request: ops.kernel_descriptor.Invocatio
             } else softmaxInto(input, output, softmax.width);
         },
         .linear => |linear| {
-            if (linear.bias) try linearInto(ctx, request.inputs[0], request.inputs[1], request.inputs[2], linear.rows, linear.in_dim, linear.out_dim, output) else try linearNoBiasInto(ctx, request.inputs[0], request.inputs[1], linear.rows, linear.in_dim, linear.out_dim, output);
+            const bias = if (linear.bias) request.inputs[2] else null;
+            if (toBuf(request.inputs[1]).quantized_storage != null) {
+                const selected = request.operatorPlan() orelse nativeQuantMatmulOperatorPlanForTensor(request.inputs[1], linear.rows, linear.in_dim, linear.out_dim).?;
+                try plannedQuantLinearInto(self, request.inputs[0], request.inputs[1], bias, linear.rows, linear.in_dim, linear.out_dim, output, selected);
+            } else if (linear.bias) try linearInto(ctx, request.inputs[0], request.inputs[1], request.inputs[2], linear.rows, linear.in_dim, linear.out_dim, output) else try linearNoBiasInto(ctx, request.inputs[0], request.inputs[1], linear.rows, linear.in_dim, linear.out_dim, output);
         },
         .unary => |op| switch (op) {
             .gelu, .gelu_exact, .relu, .silu => {
@@ -54517,10 +54524,16 @@ fn runAssignedKernelOp(ctx: *anyopaque, request: ops.kernel_descriptor.Invocatio
 }
 
 fn allocateLinearOutput(ctx: *anyopaque, input: CT, weight: CT, bias: ?CT, rows: usize, in_dim: usize, out_dim: usize) anyerror!CT {
+    return allocateLinearOutputWithPlan(ctx, input, weight, bias, rows, in_dim, out_dim, null);
+}
+fn allocateLinearOutputWithPlan(ctx: *anyopaque, input: CT, weight: CT, bias: ?CT, rows: usize, in_dim: usize, out_dim: usize, plan: ?ops.OperatorPlan) anyerror!CT {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    if (plan) |selected| if (toBuf(weight).quantized_storage) |storage| try validateQuantLinearPlan(selected, storage, rows, in_dim, out_dim);
     var owned: ?[]f32 = try self.allocator.alloc(f32, try std.math.mul(usize, rows, out_dim));
     errdefer if (owned) |data| self.allocator.free(data);
-    if (bias) |value| try linearInto(ctx, input, weight, value, rows, in_dim, out_dim, owned.?) else try linearNoBiasInto(ctx, input, weight, rows, in_dim, out_dim, owned.?);
+    if (plan != null and toBuf(weight).quantized_storage != null) {
+        try plannedQuantLinearInto(self, input, weight, bias, rows, in_dim, out_dim, owned.?, plan.?);
+    } else if (bias) |value| try linearInto(ctx, input, weight, value, rows, in_dim, out_dim, owned.?) else try linearNoBiasInto(ctx, input, weight, rows, in_dim, out_dim, owned.?);
     const result = try self.makeBuf(owned.?, true);
     owned = null;
     errdefer freeTensor(ctx, result);

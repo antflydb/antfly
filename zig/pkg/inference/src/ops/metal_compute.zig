@@ -24,6 +24,33 @@ const builtin = @import("builtin");
 const ml = @import("ml");
 const build_options = @import("build_options");
 const ops = @import("ops.zig");
+/// Static target legality is shared by preparation and direct invocation.
+/// Tensor residency remains a runtime property checked by the invocation hook.
+pub fn supportsAssignedDescriptor(descriptor: *const ops.kernel_descriptor.Descriptor) bool {
+    if (descriptor.output_shape.rank() == 0) return false;
+    switch (descriptor.operation) {
+        .linear, .norm => return false,
+        .binary => |binary| if ((binary == .add or binary == .multiply) and descriptor.input_shapes[0].numElements().? != descriptor.input_shapes[1].numElements().?) {
+            return false;
+        },
+        .dot => |dot| if (descriptor.input_shapes[0].rank() != 2 or !dot.lhs_contract_last or dot.k <= 1 or dot.n <= 1) {
+            return false;
+        },
+        .reduction => |reduction| if (reduction.geometry.rank == 0 or reduction.geometry.mask != @as(u32, 1) << @intCast(reduction.geometry.rank - 1)) {
+            return false;
+        },
+        .broadcast => |layout| {
+            if (layout.input_rank == 0 or layout.input_rank != layout.output_rank) return false;
+            for (0..layout.input_rank) |axis| {
+                if (layout.axes[axis] != axis) return false;
+                if (axis + 1 < layout.input_rank and descriptor.input_shapes[0].dims[axis] != descriptor.output_shape.dims[axis]) return false;
+            }
+        },
+        else => {},
+    }
+    return true;
+}
+
 const gpu_hosted_store_mod = @import("gpu_hosted_store.zig");
 const native_compute_mod = @import("native_compute.zig");
 const native = @import("../backends/native.zig");
@@ -8864,6 +8891,82 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         var tensor = try MetalTensor.deviceAllocateFresh(@ptrCast(runtime), byte_size, .private, &shape);
         errdefer tensor.deinit();
         return self.ctFromOwnedMetalTensor(tensor);
+    }
+
+    /// Bind shared semantics to the existing Metal command/arena schedules.
+    /// Admission examines existing device views only: no upload, readback or
+    /// allocation is allowed while answering the null-output legality query.
+    fn runAssignedKernelOp(ctx: *anyopaque, request: ops.kernel_descriptor.Invocation) anyerror!bool {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        if (self.audio_capture != null or !self.provider_impl.hasDecoderRuntime()) return false;
+        const descriptor = request.descriptor;
+        if (!supportsAssignedDescriptor(descriptor)) return false;
+        if (request.inputs.len != descriptor.input_count) return error.InvalidTensorShape;
+        for (request.inputs, 0..) |input, index| {
+            const buf = toBuf(input);
+            if (buf.integer_storage or hasHostView(buf) or buf.lazy_multiply != null or bufHasAnyQuantizedStorage(buf)) return false;
+            const tensor = buf.metal_tensor orelse return false;
+            if (!tensor.isDevice() or tensor.dtype != .f32 or tensor.elemCount() != descriptor.input_shapes[index].numElements().?) return false;
+        }
+        const output = request.output orelse return true;
+        const out_buf = toBuf(output);
+        if (out_buf.integer_storage or hasHostView(out_buf) or out_buf.lazy_multiply != null or bufHasAnyQuantizedStorage(out_buf)) return error.InvalidTensorShape;
+        const out_tensor = out_buf.metal_tensor orelse return error.InvalidTensorShape;
+        if (!out_tensor.isDevice() or out_tensor.dtype != .f32 or out_tensor.elemCount() != descriptor.elements()) return error.InvalidTensorShape;
+        // Inputs and output are already admitted device views. Borrow them for
+        // synchronous encoding instead of retaining/materializing each through
+        // the general CT adapters; the command/frame layer retains GPU resources.
+        const input = toBuf(request.inputs[0]).metal_tensor.?;
+        const written: bool = switch (descriptor.operation) {
+            .unary => |unary| switch (unary) {
+                .gelu, .gelu_exact, .relu, .silu => (try metal_runtime.decoderRuntimeApplyActivationDeviceInto(self.provider_impl, input, @backingInt(switch (unary) {
+                    .gelu => ops.DecoderRuntimeActivationKind.gelu,
+                    .gelu_exact => ops.DecoderRuntimeActivationKind.gelu_exact,
+                    .relu => ops.DecoderRuntimeActivationKind.relu,
+                    .silu => ops.DecoderRuntimeActivationKind.silu,
+                    else => unreachable,
+                }), 1, descriptor.elements(), out_tensor)) != null,
+                inline else => |tag| (try metal_runtime.decoderRuntimeApplyPrimitiveUnaryInto(self.provider_impl, input, primitiveUnaryActivationKind(@field(HostUnaryOp, @tagName(tag))), out_tensor)) != null,
+            },
+            .binary => |binary| blk: {
+                const rhs = toBuf(request.inputs[1]).metal_tensor.?;
+                break :blk switch (binary) {
+                    .add => try metal_runtime.decoderRuntimeApplyAddInto(self.provider_impl, input, rhs, out_tensor, descriptor.elements()),
+                    .subtract => (try metal_runtime.decoderRuntimeApplySubtractInto(self.provider_impl, input, rhs, out_tensor)) != null,
+                    .multiply => try metal_runtime.decoderRuntimeApplyMultiplyInto(self.provider_impl, input, rhs, out_tensor, descriptor.elements()),
+                    .divide => (try metal_runtime.decoderRuntimeApplyDivideInto(self.provider_impl, input, rhs, out_tensor)) != null,
+                };
+            },
+            .softmax => |softmax| try metal_runtime.decoderRuntimeApplySoftmaxDeviceInto(self.provider_impl, input, descriptor.elements() / softmax.width, softmax.width, softmax.logarithmic, out_tensor),
+            .dot => |dot| blk: {
+                const scope = self.beginActivePlannedComputeScopeIfPossible(.tail, .tail);
+                defer self.endActivePlannedComputeScope(scope);
+                break :blk (try metal_runtime.decoderRuntimeDotGeneral2DF32DeviceInto(self.provider_impl, input, toBuf(request.inputs[1]).metal_tensor.?, dot.m, dot.n, dot.k, if (dot.rhs_contract_last) 1 else 0, out_tensor)) != null;
+            },
+            .reduction => |reduction| (try metal_runtime.decoderRuntimeReduceLastDimDeviceInto(self.provider_impl, input, reduction.geometry.output_count, reduction.geometry.reduce_count, @backingInt(reduction.mode), &.{@intCast(reduction.geometry.output_count)}, out_tensor)) != null,
+            .transpose => |layout| blk: {
+                var axes: [8]u8 = undefined;
+                var shape: [8]i32 = undefined;
+                for (0..layout.input_rank) |axis| {
+                    axes[axis] = @intCast(layout.axes[axis]);
+                    shape[axis] = @intCast(descriptor.output_shape.dims[axis]);
+                }
+                break :blk (try metal_runtime.decoderRuntimeTransposeF32DeviceInto(self.provider_impl, input, descriptor.input_shapes[0].dims[0..layout.input_rank], axes[0..layout.input_rank], shape[0..layout.output_rank], out_tensor)) != null;
+            },
+            .broadcast => |layout| blk: {
+                var shape: [8]i32 = undefined;
+                for (0..layout.output_rank) |axis| shape[axis] = @intCast(descriptor.output_shape.dims[axis]);
+                const in_dim: usize = @intCast(descriptor.input_shapes[0].dims[layout.input_rank - 1]);
+                const out_dim: usize = @intCast(descriptor.output_shape.dims[layout.output_rank - 1]);
+                break :blk (try metal_runtime.decoderRuntimeBroadcastLastDimDeviceInto(self.provider_impl, input, descriptor.elements() / out_dim, in_dim, out_dim, shape[0..layout.output_rank], out_tensor)) != null;
+            },
+            .linear, .norm => unreachable,
+        };
+        // A bound admitted operation cannot be replayed after an uncertain
+        // command submission. The existing optimized route owns the failure.
+        if (!written) return error.AssignedKernelDeclinedAfterBinding;
+        if (out_buf.metal_tensor) |*tensor| tensor.invalidateHostMirror();
+        return true;
     }
 
     fn readFloat32IntoOp(_: *anyopaque, tensor: CT, output: []f32) anyerror!bool {
@@ -35890,7 +35993,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         break :blk vt;
     };
 
-    const kernel_backend_impl = ops.KernelBackend{ .readFloat32Into = readFloat32IntoOp, .allocatePhysicalStorage = allocatePhysicalStorageOp };
+    const kernel_backend_impl = ops.KernelBackend{ .readFloat32Into = readFloat32IntoOp, .allocatePhysicalStorage = allocatePhysicalStorageOp, .runAssignedKernel = runAssignedKernelOp };
 
     const vtable_impl = blk: {
         var vt = native_compute_mod.vtable_impl;
@@ -48709,4 +48812,146 @@ test "metal_compute: K V cache append preserves history across geometry declines
     try std.testing.expect(try compute.updateBackendKvLayerCache(key, &.{ 9, 10, 11 }, &.{ 12, 13, 14 }, 3, 3, 0, 1, 1));
     try std.testing.expectEqualSlices(f32, &.{ 9, 10, 11 }, try entry.k.toHostSlice());
     try std.testing.expectEqualSlices(f32, &.{ 12, 13, 14 }, try entry.v.toHostSlice());
+}
+
+test "Metal shared descriptors execute resident operations with strict transfer admission" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    if (!metal_runtime_mod.metalDeviceAvailable()) return error.SkipZigTest;
+    const K = ops.kernel_descriptor;
+    const Shape = ml.graph.Shape;
+    const Case = struct {
+        fn run(compute: *MetalCompute, cb: *ops.ComputeBackend, descriptor: K.Descriptor, data: []const []const f32, expected: []const f32) !void {
+            const a = std.testing.allocator;
+            var inputs: [3]CT = undefined;
+            var count: usize = 0;
+            defer for (inputs[0..count]) |input| cb.free(input);
+            for (data, 0..) |values, i| {
+                const shape = descriptor.input_shapes[i];
+                var dims: [8]i32 = undefined;
+                for (0..shape.rank()) |axis| dims[axis] = @intCast(shape.dims[axis]);
+                inputs[i] = try auditDeviceTensor(compute, cb, values, dims[0..shape.rank()]);
+                count += 1;
+            }
+            var output_dims: [8]i32 = undefined;
+            for (0..descriptor.output_shape.rank()) |axis| output_dims[axis] = @intCast(descriptor.output_shape.dims[axis]);
+            const sentinel = try a.alloc(f32, expected.len);
+            defer a.free(sentinel);
+            @memset(sentinel, -99);
+            const output = try auditDeviceTensor(compute, cb, sentinel, output_dims[0..descriptor.output_shape.rank()]);
+            defer cb.free(output);
+            const dispatch = cb.vtable.kernels.?.runAssignedKernel.?;
+            var request = K.Invocation{ .descriptor = &descriptor, .inputs = inputs[0..count] };
+            const audit_mod = @import("../execution/transfer_audit.zig");
+            for (0..3) |_| {
+                var audit = audit_mod.Audit{ .forbid_device_host_access = true };
+                try audit_mod.begin(&audit);
+                const admitted = dispatch(cb.ptr, request);
+                audit_mod.end();
+                try std.testing.expect(try admitted);
+                // Legality queries leave an already-bound output untouched.
+                if (request.output == null) {
+                    const untouched = try cb.toFloat32(output, a);
+                    defer a.free(untouched);
+                    try std.testing.expectEqualSlices(f32, sentinel, untouched);
+                }
+                request.output = output;
+                try audit_mod.begin(&audit);
+                const executed = dispatch(cb.ptr, request);
+                audit_mod.end();
+                try std.testing.expect(try executed);
+                const actual = try cb.toFloat32(output, a);
+                defer a.free(actual);
+                try std.testing.expectEqual(expected.len, actual.len);
+                for (expected, actual) |want, got| try std.testing.expectApproxEqAbs(want, got, 0.00003);
+            }
+            for (data, inputs[0..count]) |values, input| {
+                const actual = try cb.toFloat32(input, a);
+                defer a.free(actual);
+                try std.testing.expectEqualSlices(f32, values, actual);
+            }
+        }
+    };
+    const a = std.testing.allocator;
+    var store = testMetalWeightStoreInit(a);
+    defer {
+        deinitSharedNativeProvider(&store);
+        store.lazy_weights.deinit(a);
+    }
+    var compute = try MetalCompute.init(a, &store, null);
+    defer compute.deinit();
+    var cb = compute.computeBackend();
+    const shape = Shape.init(.f32, &.{ 2, 17 });
+    var x: [34]f32 = undefined;
+    for (&x, 0..) |*v, i| v.* = @as(f32, @floatFromInt(i + 1)) / 32;
+    inline for (std.meta.tags(K.Unary)) |unary| {
+        var expected = x;
+        switch (unary) {
+            .gelu => activations_mod.gelu(&expected),
+            .gelu_exact => activations_mod.geluExact(&expected),
+            .silu => activations_mod.silu(&expected),
+            else => for (&expected) |*v| {
+                v.* = switch (unary) {
+                    .negate => -v.*,
+                    .sqrt => @sqrt(v.*),
+                    .rsqrt => 1 / @sqrt(v.*),
+                    .exp => @exp(v.*),
+                    .log => @log(v.*),
+                    .sin => @sin(v.*),
+                    .cos => @cos(v.*),
+                    .tanh => std.math.tanh(v.*),
+                    .erf => activations_mod.erfApproxF32(v.*),
+                    .abs => @abs(v.*),
+                    .relu => @max(0, v.*),
+                    else => unreachable,
+                };
+            },
+        }
+        try Case.run(&compute, &cb, .{ .operation = .{ .unary = unary }, .output_shape = shape, .input_shapes = .{ shape, undefined, undefined }, .input_count = 1 }, &.{&x}, &expected);
+    }
+    inline for (std.meta.tags(K.Binary)) |binary| {
+        var expected: [34]f32 = undefined;
+        for (&expected, x) |*v, value| v.* = switch (binary) {
+            .add => value + value,
+            .subtract => 0,
+            .multiply => value * value,
+            .divide => 1,
+        };
+        try Case.run(&compute, &cb, .{ .operation = .{ .binary = binary }, .output_shape = shape, .input_shapes = .{ shape, shape, undefined }, .input_count = 2 }, &.{ &x, &x }, &expected);
+        if (binary == .subtract or binary == .divide) {
+            for ([_]bool{ false, true }) |left| {
+                for (&expected, x) |*v, value| v.* = if (binary == .subtract) (if (left) 2 - value else value - 2) else (if (left) 2 / value else value / 2);
+                try Case.run(&compute, &cb, .{ .operation = .{ .binary = binary }, .output_shape = shape, .input_shapes = if (left) .{ Shape.init(.f32, &.{1}), shape, undefined } else .{ shape, Shape.init(.f32, &.{1}), undefined }, .input_count = 2 }, if (left) &.{ &.{2}, &x } else &.{ &x, &.{2} }, &expected);
+            }
+        }
+    }
+    for ([_]bool{ false, true }) |logarithmic| {
+        var expected: [34]f32 = undefined;
+        for (0..2) |row| {
+            var sum: f32 = 0;
+            for (x[row * 17 ..][0..17]) |value| sum += @exp(value);
+            for (0..17) |column| {
+                const i = row * 17 + column;
+                expected[i] = if (logarithmic) x[i] - @log(sum) else @exp(x[i]) / sum;
+            }
+        }
+        try Case.run(&compute, &cb, .{ .operation = .{ .softmax = .{ .width = 17, .logarithmic = logarithmic } }, .output_shape = shape, .input_shapes = .{ shape, undefined, undefined }, .input_count = 1 }, &.{&x}, &expected);
+    }
+    inline for (std.meta.tags(K.ReductionMode)) |mode| {
+        var expected: [2]f32 = undefined;
+        for (0..2) |row| {
+            var result: f32 = if (mode == .max) -std.math.inf(f32) else 0;
+            for (x[row * 17 ..][0..17]) |value| result = if (mode == .max) @max(result, value) else result + value;
+            expected[row] = if (mode == .mean) result / 17 else result;
+        }
+        const geometry = try K.ReductionGeometry.init(&.{ 2, 17 }, &.{1});
+        try Case.run(&compute, &cb, .{ .operation = .{ .reduction = .{ .mode = mode, .geometry = geometry } }, .output_shape = Shape.init(.f32, &.{ 2, 1 }), .input_shapes = .{ shape, undefined, undefined }, .input_count = 1 }, &.{&x}, &expected);
+    }
+    const small = Shape.init(.f32, &.{ 2, 3 });
+    try Case.run(&compute, &cb, .{ .operation = .{ .transpose = .{ .axes = .{ 1, 0, 0, 0, 0, 0, 0, 0 }, .input_rank = 2, .output_rank = 2 } }, .output_shape = Shape.init(.f32, &.{ 3, 2 }), .input_shapes = .{ small, undefined, undefined }, .input_count = 1 }, &.{&.{ 1, 2, 3, 4, 5, 6 }}, &.{ 1, 4, 2, 5, 3, 6 });
+    try Case.run(&compute, &cb, .{ .operation = .{ .broadcast = .{ .axes = .{ 0, 1, 0, 0, 0, 0, 0, 0 }, .input_rank = 2, .output_rank = 2 } }, .output_shape = small, .input_shapes = .{ Shape.init(.f32, &.{ 2, 1 }), undefined, undefined }, .input_count = 1 }, &.{&.{ 2, 7 }}, &.{ 2, 2, 2, 7, 7, 7 });
+    inline for ([_]bool{ false, true }) |transpose_rhs| {
+        const rhs = if (transpose_rhs) Shape.init(.f32, &.{ 2, 3 }) else Shape.init(.f32, &.{ 3, 2 });
+        const geometry = try K.kernel_geometry.planDenseDotGeneral(&.{ 2, 3 }, rhs.dims[0..rhs.rank()], &.{1}, if (transpose_rhs) &.{1} else &.{0}, &.{}, &.{});
+        try Case.run(&compute, &cb, .{ .operation = .{ .dot = geometry }, .output_shape = Shape.init(.f32, &.{ 2, 2 }), .input_shapes = .{ small, rhs, undefined }, .input_count = 2 }, &.{ &.{ 1, 2, 3, 4, 5, 6 }, if (transpose_rhs) &.{ 1, 3, 5, 2, 4, 6 } else &.{ 1, 2, 3, 4, 5, 6 } }, &.{ 22, 28, 49, 64 });
+    }
 }

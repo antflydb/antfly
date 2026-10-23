@@ -25,6 +25,7 @@ pub const VTable = struct {
     physicalExecutionScope: ?*const fn (ctx: *anyopaque, storages: ?[]const ?*physical_storage.Lease) anyerror!void = null,
     allocatePhysicalStorage: ?*const fn (ctx: *anyopaque, byte_size: usize) anyerror!?CT = null,
     physicalTensorView: ?*const fn (ctx: *anyopaque, request: physical_storage.View) anyerror!?CT = null,
+    assignedKernelAuxiliaries: ?*const fn (ctx: *anyopaque, descriptor: *const kernel_descriptor.Descriptor) anyerror!kernel_descriptor.AuxiliaryRequirements = null,
     assignedKernelWorkspace: ?*const fn (ctx: *anyopaque, descriptor: *const kernel_descriptor.Descriptor) anyerror!kernel_descriptor.WorkspaceRequirement = null,
     runAssignedKernel: ?*const fn (ctx: *anyopaque, request: kernel_descriptor.Invocation) anyerror!bool = null,
     createPhysicalCompletion: ?*const fn (ctx: *anyopaque) anyerror!physical_storage.Completion = null,

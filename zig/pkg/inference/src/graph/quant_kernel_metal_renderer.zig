@@ -17,7 +17,7 @@
 //! kernels. A kernel is `render(kernel_id, decoder, schedule, epilogue)`:
 //! one canonical skeleton parametrized by the launch schedule (threads/cols/
 //! reduction), with the per-format dequant math supplied as a leaf MSL fragment
-//! (`FormatDecoder.lane_decode_msl`).
+//! (`FormatDecoder.recipe`).
 //!
 //! This produces "v2" kernels. They are NOT byte-identical to the frozen v1
 //! bodies — the skeleton is normalized (redundant `if (tid < N)` guards dropped
@@ -36,6 +36,7 @@ const Epilogue = compiler.Epilogue;
 const KernelSchedule = compiler.KernelSchedule;
 const ReductionKind = compiler.ReductionKind;
 const OpKind = quant_kernel_op.OpKind;
+const quant_recipe = @import("quant_recipe.zig");
 
 pub const MicrokernelKind = quant_kernel_op.MicrokernelKind;
 pub const AttentionKind = quant_kernel_op.AttentionKind;
@@ -46,16 +47,13 @@ pub const HelperFragment = struct {
     msl: []const u8,
 };
 
-/// Per-format dequant descriptor. `lane_decode_msl` is a leaf fragment with the
-/// fixed contract `inline float <lane_decode_fn>(device const uchar *block,
-/// int lane)` — a pure function of the block bytes and the lane index, validated
-/// against the CPU reference by conformance tests. `helpers` are the shared
-/// vocabulary fragments the fragment references, in dependency order.
+/// A packed block recipe plus target vocabulary. Arithmetic is shared with
+/// CPU evaluation and CUDA generation; this renderer owns only MSL schedules.
 pub const FormatDecoder = struct {
     format: quant_matmul.Format,
-    weight_param: []const u8, // e.g. "weight_q4_0"
-    lane_decode_fn: []const u8, // e.g. "antfly_q4_0_dequant_lane_v2"
-    lane_decode_msl: []const u8,
+    weight_param: []const u8,
+    lane_decode_fn: []const u8,
+    recipe: quant_recipe.Recipe,
     helpers: []const HelperFragment,
 };
 
@@ -79,30 +77,6 @@ pub const helper_qk_u32_le = HelperFragment{
 pub const helper_qk_gelu = HelperFragment{
     .name = "antfly_qk_gelu",
     .msl = "inline float antfly_qk_gelu(float x) { if (!isfinite(x)) return 0.0f; float inner = 0.7978845608028654f * (x + 0.044715f * x * x * x); if (inner > 10.0f) return x; if (inner < -10.0f) return 0.0f; float y = 0.5f * x * (1.0f + tanh(inner)); return isfinite(y) ? y : 0.0f; }",
-};
-
-pub const helper_qk_unpack_scale_min_6bit = HelperFragment{
-    .name = "antfly_qk_unpack_scale_min_6bit",
-    .msl =
-    \\inline void antfly_qk_unpack_scale_min_6bit(device const uchar *scales, int sub, thread float &scale, thread float &min_v) {
-    \\    if (sub < 4) { scale = float(scales[sub] & 63u); min_v = float(scales[sub + 4] & 63u); return; }
-    \\    scale = float((scales[sub + 4] & 0x0fu) | ((scales[sub - 4] >> 6) << 4)); min_v = float((scales[sub + 4] >> 4) | ((scales[sub] >> 6) << 4));
-    \\}
-    ,
-};
-
-pub const helper_q3_k_raw_scale = HelperFragment{
-    .name = "antfly_q3_k_raw_scale",
-    .msl =
-    \\inline int antfly_q3_k_raw_scale(device const uchar *scale_data, uint sub) {
-    \\    uint i = sub & 3u; uint low = 0u; uint high = 0u;
-    \\    if (sub < 4u) { low = uint(scale_data[i] & 0x0fu); high = uint(scale_data[8u + i] & 0x03u); }
-    \\    else if (sub < 8u) { low = uint(scale_data[4u + i] & 0x0fu); high = uint((scale_data[8u + i] >> 2) & 0x03u); }
-    \\    else if (sub < 12u) { low = uint((scale_data[i] >> 4) & 0x0fu); high = uint((scale_data[8u + i] >> 4) & 0x03u); }
-    \\    else { low = uint((scale_data[4u + i] >> 4) & 0x0fu); high = uint((scale_data[8u + i] >> 6) & 0x03u); }
-    \\    return int(low | (high << 4)) - 32;
-    \\}
-    ,
 };
 
 // ---- Attention helper fragments ------------------------------------------
@@ -137,139 +111,32 @@ pub const helper_paged_attention_1x_page_token = HelperFragment{
     .msl = "inline uint antfly_paged_attention_1x_page_token(device const uint *block_table, constant antfly_paged_attention_1x_params &p, uint logical_token) { if (p.contiguous_blocks != 0u) return p.contiguous_base_token + logical_token; uint logical_block = logical_token / p.page_size; uint token_in_block = logical_token - logical_block * p.page_size; if (logical_block >= p.block_count) return 0xffffffffu; return block_table[logical_block] + token_in_block; }",
 };
 
-// ---- Per-format decoders (v2 fragments) ----------------------------------
-// These are the v1 dequant helpers with the lane fn renamed `_v2`, per-format
-// `half_le_to_float`/`u32_le` calls repointed at the shared `antfly_qk_*`
-// vocabulary, and q8_0 inlined so it no longer needs the external
-// `termite_q8_0_block_scale` helper.
+fn formatDecoder(comptime format: quant_matmul.Format) FormatDecoder {
+    return .{
+        .format = format,
+        .weight_param = "weight_" ++ @tagName(format),
+        .lane_decode_fn = "antfly_" ++ @tagName(format) ++ "_dequant_lane_v2",
+        .recipe = quant_recipe.forFormat(format),
+        .helpers = switch (format) {
+            .q8_k => &.{helper_qk_f32_le_to_float},
+            .q5_0, .q5_1 => &.{ helper_qk_half_le_to_float, helper_qk_u32_le },
+            else => &.{helper_qk_half_le_to_float},
+        },
+    };
+}
 
-pub const decoder_q4_0 = FormatDecoder{
-    .format = .q4_0,
-    .weight_param = "weight_q4_0",
-    .lane_decode_fn = "antfly_q4_0_dequant_lane_v2",
-    .lane_decode_msl = "inline float antfly_q4_0_dequant_lane_v2(device const uchar *block, int lane) { float d = antfly_qk_half_le_to_float(block); int packed_index = lane & 15; uchar packed = block[2 + packed_index]; int q = lane < 16 ? int(packed & 0x0fu) - 8 : int(packed >> 4) - 8; return d * float(q); }",
-    .helpers = &.{helper_qk_half_le_to_float},
-};
-
-pub const decoder_q4_1 = FormatDecoder{
-    .format = .q4_1,
-    .weight_param = "weight_q4_1",
-    .lane_decode_fn = "antfly_q4_1_dequant_lane_v2",
-    .lane_decode_msl = "inline float antfly_q4_1_dequant_lane_v2(device const uchar *block, int lane) { float d = antfly_qk_half_le_to_float(block); float m = antfly_qk_half_le_to_float(block + 2); int packed_index = lane & 15; uchar packed = block[4 + packed_index]; int q = lane < 16 ? int(packed & 0x0fu) : int(packed >> 4); return d * float(q) + m; }",
-    .helpers = &.{helper_qk_half_le_to_float},
-};
-
-pub const decoder_q5_0 = FormatDecoder{
-    .format = .q5_0,
-    .weight_param = "weight_q5_0",
-    .lane_decode_fn = "antfly_q5_0_dequant_lane_v2",
-    .lane_decode_msl = "inline float antfly_q5_0_dequant_lane_v2(device const uchar *block, int lane) { float d = antfly_qk_half_le_to_float(block); uint qh = antfly_qk_u32_le(block + 2); int packed_index = lane & 15; uchar packed = block[6 + packed_index]; int low4 = lane < 16 ? int(packed & 0x0fu) : int(packed >> 4); int high = int((qh >> uint(lane)) & 1u); return d * float((low4 | (high << 4)) - 16); }",
-    .helpers = &.{ helper_qk_half_le_to_float, helper_qk_u32_le },
-};
-
-pub const decoder_q5_1 = FormatDecoder{
-    .format = .q5_1,
-    .weight_param = "weight_q5_1",
-    .lane_decode_fn = "antfly_q5_1_dequant_lane_v2",
-    .lane_decode_msl = "inline float antfly_q5_1_dequant_lane_v2(device const uchar *block, int lane) { float d = antfly_qk_half_le_to_float(block); float m = antfly_qk_half_le_to_float(block + 2); uint qh = antfly_qk_u32_le(block + 4); int packed_index = lane & 15; uchar packed = block[8 + packed_index]; int low4 = lane < 16 ? int(packed & 0x0fu) : int(packed >> 4); int high = int((qh >> uint(lane)) & 1u); return d * float(low4 | (high << 4)) + m; }",
-    .helpers = &.{ helper_qk_half_le_to_float, helper_qk_u32_le },
-};
-
-pub const decoder_q8_0 = FormatDecoder{
-    .format = .q8_0,
-    .weight_param = "weight_q8_0",
-    .lane_decode_fn = "antfly_q8_0_dequant_lane_v2",
-    .lane_decode_msl = "inline float antfly_q8_0_dequant_lane_v2(device const uchar *block, int lane) { float d = antfly_qk_half_le_to_float(block); int q = int(as_type<char>(block[2 + lane])); return d * float(q); }",
-    .helpers = &.{helper_qk_half_le_to_float},
-};
-
-pub const decoder_q8_1 = FormatDecoder{
-    .format = .q8_1,
-    .weight_param = "weight_q8_1",
-    .lane_decode_fn = "antfly_q8_1_dequant_lane_v2",
-    .lane_decode_msl = "inline float antfly_q8_1_dequant_lane_v2(device const uchar *block, int lane) { float d = antfly_qk_half_le_to_float(block); int q = int(as_type<char>(block[4 + lane])); return d * float(q); }",
-    .helpers = &.{helper_qk_half_le_to_float},
-};
-
-pub const decoder_q8_k = FormatDecoder{
-    .format = .q8_k,
-    .weight_param = "weight_q8_k",
-    .lane_decode_fn = "antfly_q8_k_dequant_lane_v2",
-    .lane_decode_msl = "inline float antfly_q8_k_dequant_lane_v2(device const uchar *block, int lane) { float d = antfly_qk_f32_le_to_float(block); int q = int(as_type<char>(block[4 + lane])); return d * float(q); }",
-    .helpers = &.{helper_qk_f32_le_to_float},
-};
-
-pub const decoder_q2_k = FormatDecoder{
-    .format = .q2_k,
-    .weight_param = "weight_q2_k",
-    .lane_decode_fn = "antfly_q2_k_dequant_lane_v2",
-    .lane_decode_msl =
-    \\inline float antfly_q2_k_dequant_lane_v2(device const uchar *block, int lane) {
-    \\    uint sub = uint(lane) >> 4; uint i = uint(lane) & 15u; uchar scale_byte = block[sub]; float dsc = antfly_qk_half_le_to_float(block + 16) * float(scale_byte & 0x0fu); float dmn = antfly_qk_half_le_to_float(block + 18) * float(scale_byte >> 4);
-    \\    uint chunk = sub >> 3; uint group = (sub & 7u) >> 1; uint l_base = (sub & 1u) << 4; uint q_base = chunk << 5; uint shift = group << 1; uint q = (uint(block[20u + q_base + l_base + i]) >> shift) & 0x03u;
-    \\    return dsc * float(q) - dmn;
-    \\}
-    ,
-    .helpers = &.{helper_qk_half_le_to_float},
-};
-
-pub const decoder_q3_k = FormatDecoder{
-    .format = .q3_k,
-    .weight_param = "weight_q3_k",
-    .lane_decode_fn = "antfly_q3_k_dequant_lane_v2",
-    .lane_decode_msl =
-    \\inline float antfly_q3_k_dequant_lane_v2(device const uchar *block, int lane) {
-    \\    uint sub = uint(lane) >> 4; uint i = uint(lane) & 15u; uint chunk = sub >> 3; uint group = (sub & 7u) >> 1; uint l = ((sub & 1u) << 4) + i; uint q_base = chunk << 5; uint shift = group << 1; uint hm_bit = (chunk << 2) + group;
-    \\    int low2 = int((uint(block[32u + q_base + l]) >> shift) & 0x03u); int high1 = int((uint(block[l]) >> hm_bit) & 0x01u); int q = low2 + high1 * 4 - 4;
-    \\    return antfly_qk_half_le_to_float(block + 108) * float(antfly_q3_k_raw_scale(block + 96, sub)) * float(q);
-    \\}
-    ,
-    .helpers = &.{ helper_qk_half_le_to_float, helper_q3_k_raw_scale },
-};
-
-pub const decoder_q4_k = FormatDecoder{
-    .format = .q4_k,
-    .weight_param = "weight_q4_k",
-    .lane_decode_fn = "antfly_q4_k_dequant_lane_v2",
-    .lane_decode_msl =
-    \\inline float antfly_q4_k_dequant_lane_v2(device const uchar *block, int lane) {
-    \\    device const uchar *scales = block + 4; device const uchar *qs = block + 16; int sub = lane >> 5; int q_index = (sub >> 1) * 32 + (lane & 31);
-    \\    uchar packed = qs[q_index]; int q = (sub & 1) == 0 ? int(packed & 0x0fu) : int(packed >> 4);
-    \\    float raw_scale = 0.0f; float raw_min = 0.0f; antfly_qk_unpack_scale_min_6bit(scales, sub, raw_scale, raw_min);
-    \\    return antfly_qk_half_le_to_float(block) * raw_scale * float(q) - antfly_qk_half_le_to_float(block + 2) * raw_min;
-    \\}
-    ,
-    .helpers = &.{ helper_qk_half_le_to_float, helper_qk_unpack_scale_min_6bit },
-};
-
-pub const decoder_q5_k = FormatDecoder{
-    .format = .q5_k,
-    .weight_param = "weight_q5_k",
-    .lane_decode_fn = "antfly_q5_k_dequant_lane_v2",
-    .lane_decode_msl =
-    \\inline float antfly_q5_k_dequant_lane_v2(device const uchar *block, int lane) {
-    \\    device const uchar *scales = block + 4; device const uchar *qh = block + 16; device const uchar *ql = block + 48; int sub = lane >> 5; int i = lane & 31; int q_index = (sub >> 1) * 32 + i;
-    \\    uchar packed = ql[q_index]; int low = (sub & 1) == 0 ? int(packed & 0x0fu) : int(packed >> 4); int high = int((qh[i] >> sub) & 1u); int q = low + high * 16;
-    \\    float raw_scale = 0.0f; float raw_min = 0.0f; antfly_qk_unpack_scale_min_6bit(scales, sub, raw_scale, raw_min);
-    \\    return antfly_qk_half_le_to_float(block) * raw_scale * float(q) - antfly_qk_half_le_to_float(block + 2) * raw_min;
-    \\}
-    ,
-    .helpers = &.{ helper_qk_half_le_to_float, helper_qk_unpack_scale_min_6bit },
-};
-
-pub const decoder_q6_k = FormatDecoder{
-    .format = .q6_k,
-    .weight_param = "weight_q6_k",
-    .lane_decode_fn = "antfly_q6_k_dequant_lane_v2",
-    .lane_decode_msl =
-    \\inline float antfly_q6_k_dequant_lane_v2(device const uchar *block, int lane) {
-    \\    device const uchar *ql = block; device const uchar *qh = block + 128; device const uchar *scales = block + 192; int sub = lane >> 4; int i = lane & 15; int half_idx = sub >> 3; int group = (sub & 7) >> 1; int l = ((sub & 1) << 4) + i;
-    \\    int ql_off = half_idx * 64 + (group & 1) * 32; int qh_off = half_idx * 32; int qh_shift = group * 2; int nibble_shift = (group >> 1) * 4; int low4 = int((ql[ql_off + l] >> nibble_shift) & 0x0fu); int high2 = int((qh[qh_off + l] >> qh_shift) & 0x03u);
-    \\    int scale_u = int(scales[sub]); int scale = scale_u >= 128 ? scale_u - 256 : scale_u; return antfly_qk_half_le_to_float(block + 208) * float(scale) * float((low4 | (high2 << 4)) - 32);
-    \\}
-    ,
-    .helpers = &.{helper_qk_half_le_to_float},
-};
+pub const decoder_q4_0 = formatDecoder(.q4_0);
+pub const decoder_q4_1 = formatDecoder(.q4_1);
+pub const decoder_q5_0 = formatDecoder(.q5_0);
+pub const decoder_q5_1 = formatDecoder(.q5_1);
+pub const decoder_q8_0 = formatDecoder(.q8_0);
+pub const decoder_q8_1 = formatDecoder(.q8_1);
+pub const decoder_q8_k = formatDecoder(.q8_k);
+pub const decoder_q2_k = formatDecoder(.q2_k);
+pub const decoder_q3_k = formatDecoder(.q3_k);
+pub const decoder_q4_k = formatDecoder(.q4_k);
+pub const decoder_q5_k = formatDecoder(.q5_k);
+pub const decoder_q6_k = formatDecoder(.q6_k);
 
 pub const all_decoders = [_]FormatDecoder{
     decoder_q4_0, decoder_q4_1, decoder_q5_0, decoder_q5_1,
@@ -318,8 +185,7 @@ pub fn renderKernel(
     var emitted_names = EmittedNames{};
     for (decoder.helpers) |helper| try emitHelper(allocator, &out, &emitted_names, helper);
     if (epilogue == .bias_gelu) try emitHelper(allocator, &out, &emitted_names, helper_qk_gelu);
-    try out.appendSlice(allocator, decoder.lane_decode_msl);
-    try out.append(allocator, '\n');
+    try emitDecoder(allocator, &out, &emitted_names, decoder);
 
     try renderBody(allocator, &out, kernel_id, decoder, schedule, epilogue, block_values, block_bytes);
     return out.toOwnedSlice(allocator);
@@ -345,8 +211,7 @@ pub fn renderQkvKernel(
     errdefer out.deinit(allocator);
     var emitted_names = EmittedNames{};
     for (decoder.helpers) |helper| try emitHelper(allocator, &out, &emitted_names, helper);
-    try out.appendSlice(allocator, decoder.lane_decode_msl);
-    try out.append(allocator, '\n');
+    try emitDecoder(allocator, &out, &emitted_names, decoder);
     try renderQkvBody(allocator, &out, kernel_id, decoder, schedule, block_values, block_bytes);
     return out.toOwnedSlice(allocator);
 }
@@ -845,7 +710,7 @@ pub fn renderRuntimeRegion(
                 try validateTiledSchedule(k.decoder.format, k.schedule, k.epilogue);
                 for (k.decoder.helpers) |helper| try emitHelper(allocator, &out, &emitted_names, helper);
                 if (k.epilogue == .bias_gelu) try emitHelper(allocator, &out, &emitted_names, helper_qk_gelu);
-                try emitHelper(allocator, &out, &emitted_names, .{ .name = k.decoder.lane_decode_fn, .msl = k.decoder.lane_decode_msl });
+                try emitDecoder(allocator, &out, &emitted_names, k.decoder);
             },
             .microkernel => try validateMicrokernelSchedule(k.microkernel, k.schedule),
             // Attention kernels are self-contained: their params struct + paging
@@ -1183,9 +1048,9 @@ fn renderQ6KTiledBody(
     const cols_per_simdgroup = schedule.cols_per_threadgroup / @as(u8, @intCast(simdgroups));
 
     try appendFmt(allocator, out, "    const uint NSG = {d}u; const uint NC = {d}u; const uint NR = {d}u; const uint first_o = (group_pos.x * NSG + uint(simdgroup_id)) * NC; const uint first_r = group_pos.y * NR;\n", .{ simdgroups, cols_per_simdgroup, schedule.rows_per_threadgroup });
-    try appendFmt(allocator, out, "    if (rows < 2 || in_dim <= 0 || (uint(in_dim) & 255u) != 0u || out_dim <= 0 || first_r >= uint(rows) || first_o >= uint(out_dim)) return; const uint block_count = uint(in_dim) >> 8; const uint sub = uint(lane_id) >> 1; const uint j0 = (uint(lane_id) & 1u) << 3; const uint half_idx = sub >> 3; const uint group = (sub & 7u) >> 1; const uint l0 = ((sub & 1u) << 4) + j0; const uint ql_off = half_idx * 64u + (group & 1u) * 32u; const uint qh_off = half_idx * 32u; const uint qh_shift = group * 2u; const uint nibble_shift = (group >> 1) * 4u; float acc[{d}][{d}]; for (uint c = 0u; c < NC; ++c) for (uint rr = 0u; rr < NR; ++rr) acc[c][rr] = 0.0f;\n", .{ cols_per_simdgroup, schedule.rows_per_threadgroup });
+    try appendFmt(allocator, out, "    if (rows < 2 || in_dim <= 0 || (uint(in_dim) & 255u) != 0u || out_dim <= 0 || first_r >= uint(rows) || first_o >= uint(out_dim)) return; const uint block_count = uint(in_dim) >> 8; const uint sub = uint(lane_id) >> 1; const uint j0 = (uint(lane_id) & 1u) << 3; float acc[{d}][{d}]; for (uint c = 0u; c < NC; ++c) for (uint rr = 0u; rr < NR; ++rr) acc[c][rr] = 0.0f;\n", .{ cols_per_simdgroup, schedule.rows_per_threadgroup });
     try appendFmt(allocator, out, "    for (uint b = 0u; b < block_count; ++b) {{ uint input_off = first_r * uint(in_dim) + b * 256u + sub * 16u + j0; float x[{d}][8]; for (uint rr = 0u; rr < NR; ++rr) for (uint i = 0u; i < 8u; ++i) x[rr][i] = first_r + rr < uint(rows) ? input[input_off + rr * uint(in_dim) + i] : 0.0f;\n", .{schedule.rows_per_threadgroup});
-    try appendFmt(allocator, out, "        for (uint c = 0u; c < NC; ++c) {{ uint col = first_o + c; if (col >= uint(out_dim)) continue; device const uchar *block = {s} + (col * block_count + b) * 210u; device const uchar *ql = block; device const uchar *qh = block + 128u; int scale_u = int(block[192u + sub]); int scale = scale_u >= 128 ? scale_u - 256 : scale_u; float dscale = antfly_qk_half_le_to_float(block + 208u) * float(scale); for (uint i = 0u; i < 8u; ++i) {{ uint l = l0 + i; int low4 = int((ql[ql_off + l] >> nibble_shift) & 0x0fu); int high2 = int((qh[qh_off + l] >> qh_shift) & 0x03u); float w = dscale * float((low4 | (high2 << 4)) - 32); for (uint rr = 0u; rr < NR; ++rr) acc[c][rr] += x[rr][i] * w; }} }} }}\n", .{decoder.weight_param});
+    try appendFmt(allocator, out, "        for (uint c = 0u; c < NC; ++c) {{ uint col = first_o + c; if (col >= uint(out_dim)) continue; device const uchar *block = {s} + (col * block_count + b) * 210u; float dscale = antfly_qk_q6_k_scale(block, int(sub * 16u)); for (uint i = 0u; i < 8u; ++i) {{ float w = dscale * antfly_qk_q6_k_value(block, int(sub * 16u + j0 + i)); for (uint rr = 0u; rr < NR; ++rr) acc[c][rr] += x[rr][i] * w; }} }} }}\n", .{decoder.weight_param});
     const write = try writeExpr(allocator, "total", "col", epilogue);
     defer allocator.free(write);
     try appendFmt(allocator, out, "    for (uint c = 0u; c < NC; ++c) for (uint rr = 0u; rr < NR; ++rr) {{ float total = simd_sum(acc[c][rr]); uint col = first_o + c; uint row = first_r + rr; if (lane_id == 0u && col < uint(out_dim) && row < uint(rows)) output[row * uint(out_dim) + col] = {s}; }}\n", .{write});
@@ -1352,8 +1217,8 @@ test "metal renderer emits a shape-general two-row Q6_K register tile" {
     try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "const uint NSG = 4u; const uint NC = 4u; const uint NR = 2u"));
     try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "rows < 2 || in_dim <= 0"));
     try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "const uint sub = uint(lane_id) >> 1"));
-    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "block[192u + sub]"));
-    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "high2 << 4"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "float dscale = antfly_qk_q6_k_scale(block"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "float w = dscale * antfly_qk_q6_k_value(block"));
     try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "acc[c][rr] += x[rr][i] * w"));
 
     const nr8 = try renderKernel(allocator, "antfly_q6_k_tiled_nr8", decoder_q6_k, .{
@@ -1665,4 +1530,33 @@ test "metal renderer emits the low-memory head-dim-512 flash prefill specializat
     try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "simdgroup_store(mo[dt], output + q0 * q_stride"));
     try std.testing.expect(!std.mem.containsAtLeast(u8, source, 1, "threadgroup half *skv"));
     try std.testing.expectError(error.AttentionFlashHd512KeyChunkMustBe64, renderPrefillFlashKernel(std.testing.allocator, "bad", .{ .threads_per_threadgroup = 256, .cols_per_threadgroup = 1, .reduction = .threadgroup_tree, .key_chunk = 32 }));
+}
+
+fn emitDecoder(allocator: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), names: *EmittedNames, decoder: FormatDecoder) !void {
+    if (decoder.format == .q4_k) {
+        inline for (.{ false, true }) |minimum| {
+            const name = if (minimum) "antfly_qk_header_min" else "antfly_qk_header_scale";
+            const helper_source = try quant_recipe.render(allocator, quant_recipe.scaleMinHeader(minimum), .metal, name);
+            defer allocator.free(helper_source);
+            try emitHelper(allocator, out, names, .{ .name = name, .msl = helper_source });
+        }
+        try emitHelper(allocator, out, names, .{
+            .name = "antfly_qk_unpack_scale_min_6bit",
+            .msl = "inline void antfly_qk_unpack_scale_min_6bit(device const uchar *scales, int sub, thread float &scale, thread float &min_v) { scale = antfly_qk_header_scale(scales, sub); min_v = antfly_qk_header_min(scales, sub); }",
+        });
+    }
+    if (decoder.format == .q6_k) {
+        for ([_]struct { name: []const u8, id: quant_recipe.Id }{
+            .{ .name = "antfly_qk_q6_k_scale", .id = decoder.recipe.scale_component.? },
+            .{ .name = "antfly_qk_q6_k_value", .id = decoder.recipe.value_component.? },
+        }) |part| {
+            const component = decoder.recipe.component(part.id);
+            const source = try quant_recipe.render(allocator, component, .metal, part.name);
+            defer allocator.free(source);
+            try emitHelper(allocator, out, names, .{ .name = part.name, .msl = source });
+        }
+    }
+    const source = try quant_recipe.render(allocator, decoder.recipe, .metal, decoder.lane_decode_fn);
+    defer allocator.free(source);
+    try emitHelper(allocator, out, names, .{ .name = decoder.lane_decode_fn, .msl = source });
 }

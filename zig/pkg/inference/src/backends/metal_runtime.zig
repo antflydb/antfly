@@ -6381,26 +6381,27 @@ fn decoderRuntimeApplyPrimitiveUnaryImpl(self: anytype, input: MetalTensor, acti
     return finishDeviceOutput(&output_device, rc);
 }
 
+pub fn decoderRuntimeApplySoftmaxDeviceInto(self: anytype, input: MetalTensor, rows: usize, dim: usize, log_softmax: bool, output: MetalTensor) !bool {
+    const runtime = self.raw_decode_runtime orelse return false;
+    if (termite_metal_decode_runtime_ready(runtime) == 0) return false;
+    if (!input.isDevice() or !output.isDevice() or input.dtype != .f32 or output.dtype != .f32 or rows == 0 or dim == 0) return false;
+    const count = std.math.mul(usize, rows, dim) catch return false;
+    if (input.elemCount() != count or output.elemCount() != count) return false;
+    return termite_metal_decode_runtime_apply_softmax_device(runtime, input.deviceHandle(), input.deviceByteOffset(), rows, dim, @intFromBool(log_softmax), output.deviceHandle(), output.deviceByteOffset()) == 0;
+}
+
 pub fn decoderRuntimeApplySoftmaxDevice(self: anytype, input: MetalTensor, rows: usize, dim: usize, log_softmax: bool) !?MetalTensor {
     const runtime = self.raw_decode_runtime orelse return null;
-    if (termite_metal_decode_runtime_ready(runtime) == 0) return null;
-    if (!input.isDevice()) return null;
-    if (rows == 0 or dim == 0) return null;
-    if (rows > std.math.maxInt(usize) / dim) return null;
-    if (input.elemCount() != rows * dim) return null;
-    var output_device = try MetalTensor.deviceAllocate(runtime, rows * dim * @sizeOf(f32), .private, input.shape());
-    errdefer output_device.deinit();
-    const rc = termite_metal_decode_runtime_apply_softmax_device(
-        runtime,
-        input.deviceHandle(),
-        input.deviceByteOffset(),
-        rows,
-        dim,
-        @intFromBool(log_softmax),
-        output_device.deviceHandle(),
-        output_device.deviceByteOffset(),
-    );
-    return finishDeviceOutput(&output_device, rc);
+    if (termite_metal_decode_runtime_ready(runtime) == 0 or !input.isDevice() or rows == 0 or dim == 0) return null;
+    const count = std.math.mul(usize, rows, dim) catch return null;
+    if (input.elemCount() != count) return null;
+    var output = try MetalTensor.deviceAllocate(runtime, count * @sizeOf(f32), .private, input.shape());
+    errdefer output.deinit();
+    if (!try decoderRuntimeApplySoftmaxDeviceInto(self, input, rows, dim, log_softmax, output)) {
+        output.deinit();
+        return null;
+    }
+    return output;
 }
 
 pub fn decoderRuntimeSelectMoeRoutesDevice(

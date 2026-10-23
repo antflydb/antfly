@@ -25,7 +25,28 @@
 using namespace metal;
 
 inline float antfly_qk_half_le_to_float(device const uchar *p) { ushort bits = (ushort(p[0]) | (ushort(p[1]) << 8)); return float(as_type<half>(bits)); }
-inline float antfly_q4_0_dequant_lane_v2(device const uchar *block, int lane) { float d = antfly_qk_half_le_to_float(block); int packed_index = lane & 15; uchar packed = block[2 + packed_index]; int q = lane < 16 ? int(packed & 0x0fu) - 8 : int(packed >> 4) - 8; return d * float(q); }
+inline float antfly_q4_0_dequant_lane_v2(device const uchar *block, int lane) {
+    int v0 = lane;
+    int v1 = 2;
+    int v2 = 15;
+    int v3 = v0 & v2;
+    int v4 = v1 + v3;
+    int v5 = int(block[v4]);
+    int v6 = 16;
+    int v7 = v0 < v6;
+    int v8 = 15;
+    int v9 = v5 & v8;
+    int v10 = 4;
+    int v11 = int(uint(v5) >> v10);
+    int v12 = v7 ? v9 : v11;
+    int v13 = 8;
+    int v14 = v12 - v13;
+    int v15 = 0;
+    float v16 = antfly_qk_half_le_to_float(block + v15);
+    float v17 = float(v14);
+    float v18 = v16 * v17;
+    return v18;
+}
 kernel void antfly_q4_0_small_batch_msl_v1(device const float *input [[buffer(0)]], device const uchar *weight_q4_0 [[buffer(1)]], device float *output [[buffer(2)]], constant int &rows [[buffer(3)]], constant int &in_dim [[buffer(4)]], constant int &out_dim [[buffer(5)]], uint3 thread_pos [[thread_position_in_threadgroup]], uint3 group_pos [[threadgroup_position_in_grid]]) {
     uint tid = thread_pos.x; int col = int(group_pos.x); int row = int(group_pos.y); if (row >= rows || rows < 2 || rows > 8 || col >= out_dim || (in_dim & 31) != 0) return; float acc = 0.0f; int block_count = in_dim >> 5;
     for (int block_idx = 0; block_idx < block_count; ++block_idx) { device const uchar *block = weight_q4_0 + ((col * block_count + block_idx) * 18); int base = block_idx << 5; for (int lane = int(tid); lane < 32; lane += 32) acc += input[row * in_dim + base + lane] * antfly_q4_0_dequant_lane_v2(block, lane); }

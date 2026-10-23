@@ -25,18 +25,88 @@
 using namespace metal;
 
 inline float antfly_qk_half_le_to_float(device const uchar *p) { ushort bits = (ushort(p[0]) | (ushort(p[1]) << 8)); return float(as_type<half>(bits)); }
-inline int antfly_q3_k_raw_scale(device const uchar *scale_data, uint sub) {
-    uint i = sub & 3u; uint low = 0u; uint high = 0u;
-    if (sub < 4u) { low = uint(scale_data[i] & 0x0fu); high = uint(scale_data[8u + i] & 0x03u); }
-    else if (sub < 8u) { low = uint(scale_data[4u + i] & 0x0fu); high = uint((scale_data[8u + i] >> 2) & 0x03u); }
-    else if (sub < 12u) { low = uint((scale_data[i] >> 4) & 0x0fu); high = uint((scale_data[8u + i] >> 4) & 0x03u); }
-    else { low = uint((scale_data[4u + i] >> 4) & 0x0fu); high = uint((scale_data[8u + i] >> 6) & 0x03u); }
-    return int(low | (high << 4)) - 32;
-}
 inline float antfly_q3_k_dequant_lane_v2(device const uchar *block, int lane) {
-    uint sub = uint(lane) >> 4; uint i = uint(lane) & 15u; uint chunk = sub >> 3; uint group = (sub & 7u) >> 1; uint l = ((sub & 1u) << 4) + i; uint q_base = chunk << 5; uint shift = group << 1; uint hm_bit = (chunk << 2) + group;
-    int low2 = int((uint(block[32u + q_base + l]) >> shift) & 0x03u); int high1 = int((uint(block[l]) >> hm_bit) & 0x01u); int q = low2 + high1 * 4 - 4;
-    return antfly_qk_half_le_to_float(block + 108) * float(antfly_q3_k_raw_scale(block + 96, sub)) * float(q);
+    int v0 = lane;
+    int v1 = 4;
+    int v2 = int(uint(v0) >> v1);
+    int v3 = 3;
+    int v4 = int(uint(v2) >> v3);
+    int v5 = 7;
+    int v6 = v2 & v5;
+    int v7 = 1;
+    int v8 = int(uint(v6) >> v7);
+    int v9 = 1;
+    int v10 = v2 & v9;
+    int v11 = 4;
+    int v12 = int(uint(v10) << v11);
+    int v13 = 15;
+    int v14 = v0 & v13;
+    int v15 = v12 + v14;
+    int v16 = 5;
+    int v17 = int(uint(v4) << v16);
+    int v18 = v17 + v15;
+    int v19 = 32;
+    int v20 = v18 + v19;
+    int v21 = int(block[v20]);
+    int v22 = 1;
+    int v23 = int(uint(v8) << v22);
+    int v24 = int(uint(v21) >> v23);
+    int v25 = 3;
+    int v26 = v24 & v25;
+    int v27 = int(block[v15]);
+    int v28 = 2;
+    int v29 = int(uint(v4) << v28);
+    int v30 = v29 + v8;
+    int v31 = int(uint(v27) >> v30);
+    int v32 = 1;
+    int v33 = v31 & v32;
+    int v34 = 2;
+    int v35 = int(uint(v33) << v34);
+    int v36 = v26 + v35;
+    int v37 = 4;
+    int v38 = v36 - v37;
+    int v39 = 3;
+    int v40 = v2 & v39;
+    int v41 = 7;
+    int v42 = v2 & v41;
+    int v43 = 4;
+    int v44 = v42 < v43;
+    int v45 = 96;
+    int v46 = 100;
+    int v47 = v44 ? v45 : v46;
+    int v48 = v40 + v47;
+    int v49 = int(block[v48]);
+    int v50 = 8;
+    int v51 = v2 < v50;
+    int v52 = 15;
+    int v53 = v49 & v52;
+    int v54 = 4;
+    int v55 = int(uint(v49) >> v54);
+    int v56 = v51 ? v53 : v55;
+    int v57 = 104;
+    int v58 = 3;
+    int v59 = v2 & v58;
+    int v60 = v57 + v59;
+    int v61 = int(block[v60]);
+    int v62 = 2;
+    int v63 = int(uint(v2) >> v62);
+    int v64 = 1;
+    int v65 = int(uint(v63) << v64);
+    int v66 = int(uint(v61) >> v65);
+    int v67 = 3;
+    int v68 = v66 & v67;
+    int v69 = 4;
+    int v70 = int(uint(v68) << v69);
+    int v71 = v56 | v70;
+    int v72 = 32;
+    int v73 = v71 - v72;
+    int v74 = 108;
+    float v75 = antfly_qk_half_le_to_float(block + v74);
+    float v76 = float(v73);
+    float v77 = v75 * v76;
+    float v78 = float(v38);
+    float v79 = v77 * v78;
+    return v79;
 }
 kernel void antfly_q3_k_small_batch_bias_msl_v1(device const float *input [[buffer(0)]], device const uchar *weight_q3_k [[buffer(1)]], device const float *bias [[buffer(2)]], device float *output [[buffer(3)]], constant int &rows [[buffer(4)]], constant int &in_dim [[buffer(5)]], constant int &out_dim [[buffer(6)]], uint3 thread_pos [[thread_position_in_threadgroup]], uint3 group_pos [[threadgroup_position_in_grid]]) {
     uint tid = thread_pos.x; int col = int(group_pos.x); int row = int(group_pos.y); if (row >= rows || rows < 2 || rows > 8 || col >= out_dim || (in_dim & 255) != 0) return; float acc = 0.0f; int block_count = in_dim >> 8;

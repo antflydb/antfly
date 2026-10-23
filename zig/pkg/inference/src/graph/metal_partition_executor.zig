@@ -337,6 +337,8 @@ const RuntimeRegionPlan = struct {
     // exact same node ordering. Length + endpoints alone can collide across two
     // structurally-different graphs with equal counts and equal first/last ids.
     node_ids_hash: u64 = 0,
+    descriptor_indices: []u32 = &.{},
+    descriptors: []ops_mod.kernel_descriptor.Descriptor = &.{},
     regions_by_pos: []RuntimeRegion = &.{},
     prepared_by_pos: []PreparedRuntimeRegion = &.{},
     attention_input_max_first_node: []NodeId = &.{},
@@ -349,6 +351,8 @@ const RuntimeRegionPlan = struct {
     pre_skip_declined_external_consumer_count: usize = 0,
 
     pub fn deinit(self: *RuntimeRegionPlan, allocator: std.mem.Allocator) void {
+        allocator.free(self.descriptor_indices);
+        allocator.free(self.descriptors);
         allocator.free(self.regions_by_pos);
         allocator.free(self.prepared_by_pos);
         allocator.free(self.attention_input_max_first_node);
@@ -365,6 +369,12 @@ const RuntimeRegionPlan = struct {
         if (node_ids.len == 0) return self.first_node == null_node and self.last_node == null_node;
         if (self.first_node != node_ids[0] or self.last_node != node_ids[node_ids.len - 1]) return false;
         return self.node_ids_hash == hashNodeIds(node_ids);
+    }
+
+    fn descriptorAt(self: RuntimeRegionPlan, position: usize) ?*const ops_mod.kernel_descriptor.Descriptor {
+        if (position >= self.descriptor_indices.len) return null;
+        const index = self.descriptor_indices[position];
+        return if (index < self.descriptors.len) &self.descriptors[index] else null;
     }
 
     fn regionAt(self: RuntimeRegionPlan, node_pos: usize, node_id: NodeId, node_ids: []const NodeId) RuntimeRegion {
@@ -2097,10 +2107,17 @@ pub const MetalPartitionExecutor = struct {
                         }
                         break :blk null;
                     };
-                    const command_output_opt = if (!metalPartitionRuntimeCommandsDisabled())
-                        try tryExecuteMetalCommand(allocator, graph, cb, values, node_id, op_plan, &exec_state, output_hint, &attn_mask_cache, exec_ctx.stats, resident_input_cache_ptr)
-                    else
-                        null;
+                    const command_output_opt = command: {
+                        if (metalPartitionRuntimeCommandsDisabled()) break :command null;
+                        errdefer if (output_hint) |hint| cb.free(hint);
+                        if (runtime_region_plan.descriptorAt(node_pos)) |descriptor| {
+                            if (try tryExecuteAssignedMetal(cb, descriptor, graph.node(node_id).getInputs(), values, output_hint)) |output| {
+                                if (exec_ctx.stats) |stats| stats.assigned_kernel_dispatches += 1;
+                                break :command output;
+                            }
+                        }
+                        break :command try tryExecuteMetalCommand(allocator, graph, cb, values, node_id, op_plan, &exec_state, output_hint, &attn_mask_cache, exec_ctx.stats, resident_input_cache_ptr);
+                    };
                     // Free an unconsumed pooled-output view (op didn't take the hint).
                     if (output_hint) |hint| {
                         const consumed = if (command_output_opt) |co| co == hint else false;
@@ -4076,6 +4093,17 @@ fn buildRuntimeRegionPlan(
     reachable: []const bool,
     last_use: []const u32,
 ) !RuntimeRegionPlan {
+    const descriptor_indices = try allocator.alloc(u32, node_ids.len);
+    errdefer allocator.free(descriptor_indices);
+    @memset(descriptor_indices, std.math.maxInt(u32));
+    var descriptors = std.ArrayListUnmanaged(ops_mod.kernel_descriptor.Descriptor).empty;
+    errdefer descriptors.deinit(allocator);
+    for (node_ids, 0..) |node_id, position| {
+        const descriptor = ops_mod.kernel_descriptor.lower(graph, node_id) orelse continue;
+        if (!metal_compute_mod.supportsAssignedDescriptor(&descriptor)) continue;
+        descriptor_indices[position] = @intCast(descriptors.items.len);
+        try descriptors.append(allocator, descriptor);
+    }
     const regions = try allocator.alloc(RuntimeRegion, node_ids.len);
     errdefer allocator.free(regions);
     @memset(regions, .{ .none = {} });
@@ -4292,6 +4320,8 @@ fn buildRuntimeRegionPlan(
         .first_node = if (node_ids.len == 0) null_node else node_ids[0],
         .last_node = if (node_ids.len == 0) null_node else node_ids[node_ids.len - 1],
         .node_ids_hash = hashNodeIds(node_ids),
+        .descriptor_indices = descriptor_indices,
+        .descriptors = try descriptors.toOwnedSlice(allocator),
         .regions_by_pos = regions,
         .prepared_by_pos = prepared,
         .attention_input_max_first_node = attention_input_max_first_node,
@@ -13780,6 +13810,28 @@ fn executeRuntimeUnary(
         error.UnsupportedPrimitiveOp, error.UnsupportedShape, error.ShapeMismatch => null,
         else => return err,
     };
+}
+
+fn tryExecuteAssignedMetal(cb: *const ComputeBackend, descriptor: *const ops_mod.kernel_descriptor.Descriptor, input_ids: []const NodeId, values: []?CT, output_hint: ?CT) !?CT {
+    // The arena binding belongs to Metal. Reference/simulation executions may
+    // run this executor with a native provider whose hooks require physical leases.
+    if (cb.kind() != .metal) return null;
+    const functions = cb.vtable.kernels orelse return null;
+    const run = functions.runAssignedKernel orelse return null;
+    var inputs: [3]CT = undefined;
+    for (input_ids, 0..) |id, index| inputs[index] = valueFor(values, id) orelse return null;
+    var request = ops_mod.kernel_descriptor.Invocation{ .descriptor = descriptor, .inputs = inputs[0..input_ids.len] };
+    if (!try run(cb.ptr, request)) return null;
+    var shape: [ml.graph.shape.max_rank]i32 = undefined;
+    const rank = descriptor.output_shape.rank();
+    for (descriptor.output_shape.dims[0..rank], 0..) |dimension, axis| shape[axis] = @intCast(dimension);
+    // The backend allocator participates in the current Metal command/arena
+    // plan. An existing pooled output binds directly without another allocation.
+    const output = output_hint orelse (try cb.allocUninitF32Shape(shape[0..rank])) orelse return null;
+    errdefer if (output_hint == null) cb.free(output);
+    request.output = output;
+    if (!try run(cb.ptr, request)) return error.AssignedKernelDeclinedAfterBinding;
+    return output;
 }
 
 fn tryExecuteMetalCommand(

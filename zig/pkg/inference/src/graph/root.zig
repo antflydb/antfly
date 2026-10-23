@@ -48,6 +48,7 @@ pub const quant_kernel_compiler = @import("quant_kernel_compiler.zig");
 pub const kernel_jit = @import("kernel_jit.zig");
 pub const quant_kernel_catalog = @import("quant_kernel_catalog.zig");
 pub const quant_kernel_model_catalog = @import("quant_kernel_model_catalog.zig");
+pub const quant_recipe = @import("quant_recipe.zig");
 pub const quant_kernel_metal_renderer = @import("quant_kernel_metal_renderer.zig");
 pub const model_runtime = @import("model_runtime.zig");
 pub const decode_state_runtime = @import("decode_state_runtime.zig");
@@ -161,6 +162,7 @@ test {
     _ = quant_kernel_catalog;
     _ = quant_kernel_model_catalog;
     _ = quant_kernel_metal_renderer;
+    _ = quant_recipe;
     _ = model_runtime;
     _ = decode_state_runtime;
     _ = live_model_executor;

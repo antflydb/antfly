@@ -69,6 +69,7 @@ pub const CudaTensor = struct {
     resident_parent: ?*CudaTensor = null,
     resident_references: usize = 1,
     physical_lease: ?*ops.physical_storage.Lease = null,
+    auxiliary_leases: [ops.kernel_descriptor.max_auxiliaries]?*ops.physical_storage.Lease = @splat(null),
     /// Plan-owned addresses never enter the learned ordinal/temp cache. Their
     /// last lease retires the direct allocation after the frame's fence.
     physical_storage_base: bool = false,
@@ -10157,9 +10158,11 @@ fn freeTensor(ctx: *anyopaque, tensor: CT) void {
     if (cuda_tensor.resident_references != 0) return;
     if (cuda_tensor.resident_parent) |parent| freeTensor(ctx, parent);
     const physical_lease = cuda_tensor.physical_lease;
+    const auxiliary_leases = cuda_tensor.auxiliary_leases;
     freeCudaTensorStorage(self, cuda_tensor);
     self.allocator.destroy(cuda_tensor);
     if (physical_lease) |lease| lease.release();
+    for (auxiliary_leases) |maybe_lease| if (maybe_lease) |lease| lease.release();
 }
 
 fn borrowedSlotTensor(tensor: *const CudaTensor) CudaTensor {
@@ -10484,6 +10487,8 @@ fn acquireWeight(ctx: *anyopaque, name: []const u8) anyerror!CT {
     handle.shape = try self.allocator.dupe(i64, weight.shape);
     handle.owns_shape = true;
     handle.owned_by_tensor = true;
+    if (handle.physical_lease) |lease| lease.retain();
+    for (handle.auxiliary_leases) |maybe_lease| if (maybe_lease) |lease| lease.retain();
     return @ptrCast(handle);
 }
 
@@ -15395,15 +15400,34 @@ test "GLiNER Decide CUDA Q8 execution mirror is a borrowed dense view" {
     try std.testing.expect(boundaryMixedWeight(&compute, &weight) == null);
 }
 
+fn validateProjectionOperands(input: *const CudaTensor, weight: *const CudaTensor, bias: ?*const CudaTensor, rows: usize, in_dim: usize, out_dim: usize) !void {
+    try ensureF32(input);
+    try ensureF32F16Bf16OrQuantized(weight);
+    try ensureCount(input, try checkedMul(rows, in_dim));
+    try ensureCount(weight, try checkedMul(out_dim, in_dim));
+    if (bias) |value| {
+        try ensureF32(value);
+        try ensureCount(value, out_dim);
+    }
+}
+
 fn linear(ctx: *anyopaque, input: CT, weight: CT, bias: CT, rows: usize, in_dim: usize, out_dim: usize) anyerror!CT {
     const self: *CudaCompute = @ptrCast(@alignCast(ctx));
-    const input_tensor = tensorFromCt(input);
-    const weight_tensor = tensorFromCt(weight);
+    try validateProjectionOperands(tensorFromCt(input), tensorFromCt(weight), tensorFromCt(bias), rows, in_dim, out_dim);
+    const out_count = try checkedMul(rows, out_dim);
+    const shape = try allocShape2(self.allocator, rows, out_dim);
+    errdefer self.allocator.free(shape);
+    var device = try allocDeviceBuffer(self, out_count * @sizeOf(f32));
+    errdefer device.free(&self.ctx);
+    try linearBiasInto(self, device, tensorFromCt(input), tensorFromCt(weight), tensorFromCt(bias), rows, in_dim, out_dim);
+    return createTensor(self, device, shape, out_count);
+}
+
+fn linearBiasInto(self: *CudaCompute, device: buffer_mod.DeviceBuffer, input_tensor: *const CudaTensor, weight_tensor: *const CudaTensor, bias_tensor: *const CudaTensor, rows: usize, in_dim: usize, out_dim: usize) !void {
     if (boundaryMixedWeight(self, weight_tensor)) |reduced| {
         var view = reduced;
-        return linear(ctx, input, @ptrCast(&view), bias, rows, in_dim, out_dim);
+        return linearBiasInto(self, device, input_tensor, &view, bias_tensor, rows, in_dim, out_dim);
     }
-    const bias_tensor = tensorFromCt(bias);
     try ensureF32(input_tensor);
     try ensureF32F16Bf16OrQuantized(weight_tensor);
     try ensureF32(bias_tensor);
@@ -15428,38 +15452,27 @@ fn linear(ctx: *anyopaque, input: CT, weight: CT, bias: CT, rows: usize, in_dim:
     // the entire encoder on CUDA now; specialized bias epilogues can replace
     // this two-launch fallback through the same route later.
     if (isKnownQuant(weight_tensor, .Q4_0)) {
-        const result = try linearNoBias(ctx, input, weight, rows, in_dim, out_dim);
-        errdefer freeTensor(ctx, result);
-        const result_tensor = tensorFromCt(result);
-        try self.kernels.launchAddBiasRowsF32(&self.ctx, result_tensor.buffer, bias_tensor.buffer, rows, out_dim);
+        try linearNoBiasInto(self, device, input_tensor, weight_tensor, rows, in_dim, out_dim, false);
+        try self.kernels.launchAddBiasRowsF32(&self.ctx, device, bias_tensor.buffer, rows, out_dim);
         self.dispatch_stats.note(self.allocator, .linear, .q4_0, .q4_simt, .bias, .none, rows, in_dim, out_dim, 0);
-        return result;
+        return;
     }
     if (isF16Weight(weight_tensor)) {
         // Keep FP32 bias addition separate from the FP16 matmul. A fused
         // cuBLASLt epilogue selects different algorithms and failed the
         // multilingual classification agreement gate.
-        const result = try linearNoBias(ctx, input, weight, rows, in_dim, out_dim);
-        errdefer freeTensor(ctx, result);
-        const result_tensor = tensorFromCt(result);
-        try self.kernels.launchAddBiasRowsF32(&self.ctx, result_tensor.buffer, bias_tensor.buffer, rows, out_dim);
+        try linearNoBiasInto(self, device, input_tensor, weight_tensor, rows, in_dim, out_dim, false);
+        try self.kernels.launchAddBiasRowsF32(&self.ctx, device, bias_tensor.buffer, rows, out_dim);
         self.dispatch_stats.note(self.allocator, .linear, .f16, .dense_lt, .bias, .none, rows, in_dim, out_dim, 0);
-        return result;
+        return;
     }
     if (isBf16Weight(weight_tensor)) {
-        const result = try linearNoBias(ctx, input, weight, rows, in_dim, out_dim);
-        errdefer freeTensor(ctx, result);
-        const result_tensor = tensorFromCt(result);
-        try self.kernels.launchAddBiasRowsF32(&self.ctx, result_tensor.buffer, bias_tensor.buffer, rows, out_dim);
+        try linearNoBiasInto(self, device, input_tensor, weight_tensor, rows, in_dim, out_dim, false);
+        try self.kernels.launchAddBiasRowsF32(&self.ctx, device, bias_tensor.buffer, rows, out_dim);
         self.dispatch_stats.note(self.allocator, .linear, .bf16, .dense_lt, .bias, .none, rows, in_dim, out_dim, 0);
-        return result;
+        return;
     }
 
-    const out_count = try checkedMul(rows, out_dim);
-    const shape = try allocShape2(self.allocator, rows, out_dim);
-    errdefer self.allocator.free(shape);
-    var device = try allocDeviceBuffer(self, out_count * @sizeOf(f32));
-    errdefer device.free(&self.ctx);
     var prefill_profile_scope = beginPrefillProfile(self, prefillProfileCategoryForLinearNoBias(weight_tensor, rows, in_dim, out_dim), rows);
     defer if (prefill_profile_scope) |*scope| scope.end();
     if (weight_tensor.quant_type) |quant_type| {
@@ -15502,7 +15515,7 @@ fn linear(ctx: *anyopaque, input: CT, weight: CT, bias: CT, rows: usize, in_dim:
         try linearF32BiasInto(self, device, input_tensor, weight_tensor, bias_tensor, rows, in_dim, out_dim);
     }
     self.stats.launch_linear += 1;
-    return createTensor(self, device, shape, out_count);
+    return;
 }
 
 fn linearF32BiasInto(self: *CudaCompute, device: buffer_mod.DeviceBuffer, input_tensor: *const CudaTensor, weight_tensor: *const CudaTensor, bias_tensor: *const CudaTensor, rows: usize, in_dim: usize, out_dim: usize) !void {
@@ -15992,12 +16005,22 @@ fn linearNoBias(ctx: *anyopaque, input: CT, weight: CT, rows: usize, in_dim: usi
 
 fn linearNoBiasWithPolicy(ctx: *anyopaque, input: CT, weight: CT, rows: usize, in_dim: usize, out_dim: usize, primitive_training: bool) anyerror!CT {
     const self: *CudaCompute = @ptrCast(@alignCast(ctx));
-    const input_tensor = tensorFromCt(input);
-    const weight_tensor = tensorFromCt(weight);
+    try validateProjectionOperands(tensorFromCt(input), tensorFromCt(weight), null, rows, in_dim, out_dim);
+    const out_count = try checkedMul(rows, out_dim);
+    const shape = try allocShape2(self.allocator, rows, out_dim);
+    errdefer self.allocator.free(shape);
+    var device = try allocDeviceBuffer(self, out_count * @sizeOf(f32));
+    errdefer device.free(&self.ctx);
+    try linearNoBiasInto(self, device, tensorFromCt(input), tensorFromCt(weight), rows, in_dim, out_dim, primitive_training);
+    return createTensor(self, device, shape, out_count);
+}
+
+/// One target schedule for allocating and physically planned projections.
+fn linearNoBiasInto(self: *CudaCompute, device: buffer_mod.DeviceBuffer, input_tensor: *const CudaTensor, weight_tensor: *const CudaTensor, rows: usize, in_dim: usize, out_dim: usize, primitive_training: bool) !void {
     if (!primitive_training) {
         if (boundaryMixedWeight(self, weight_tensor)) |reduced| {
             var view = reduced;
-            return linearNoBiasWithPolicy(ctx, input, @ptrCast(&view), rows, in_dim, out_dim, false);
+            return linearNoBiasInto(self, device, input_tensor, &view, rows, in_dim, out_dim, false);
         }
     }
     try ensureF32(input_tensor);
@@ -16013,11 +16036,6 @@ fn linearNoBiasWithPolicy(ctx: *anyopaque, input: CT, weight: CT, rows: usize, i
         return error.InvalidShape;
     }
 
-    const out_count = try checkedMul(rows, out_dim);
-    const shape = try allocShape2(self.allocator, rows, out_dim);
-    errdefer self.allocator.free(shape);
-    var device = try allocDeviceBuffer(self, out_count * @sizeOf(f32));
-    errdefer device.free(&self.ctx);
     var prefill_profile_scope = beginPrefillProfile(self, prefillProfileCategoryForLinearNoBias(weight_tensor, rows, in_dim, out_dim), rows);
     defer if (prefill_profile_scope) |*scope| scope.end();
     const bf16_mirror = weightBf16MirrorForRows(self, weight_tensor, rows);
@@ -16263,7 +16281,7 @@ fn linearNoBiasWithPolicy(ctx: *anyopaque, input: CT, weight: CT, rows: usize, i
                         };
                         self.dispatch_stats.note(self.allocator, .linear_no_bias, .q6_k, .q6_simt, .none, tcUnavailableReason(), rows, in_dim, out_dim, 0);
                         self.stats.launch_linear += 1;
-                        return createTensor(self, device, shape, out_count);
+                        return;
                     }
                     try self.kernels.launchLinearQ6KTile4F32(&self.ctx, device, input_tensor.buffer, weight_tensor.buffer, rows, in_dim, out_dim);
                     self.dispatch_stats.note(self.allocator, .linear_no_bias, .q6_k, .q6_simt, .none, tcUnavailableReason(), rows, in_dim, out_dim, 0);
@@ -16286,7 +16304,7 @@ fn linearNoBiasWithPolicy(ctx: *anyopaque, input: CT, weight: CT, rows: usize, i
         try linearF32NoBiasInto(self, device, input_tensor, weight_tensor, rows, in_dim, out_dim, primitive_training);
     }
     self.stats.launch_linear += 1;
-    return createTensor(self, device, shape, out_count);
+    return;
 }
 
 fn linearF32NoBiasInto(self: *CudaCompute, device: buffer_mod.DeviceBuffer, input_tensor: *const CudaTensor, weight_tensor: *const CudaTensor, rows: usize, in_dim: usize, out_dim: usize, primitive_training: bool) !void {
@@ -25845,6 +25863,7 @@ const kernel_backend_impl = ops.KernelBackend{
     .physicalExecutionScope = &physicalExecutionScopeOp,
     .allocatePhysicalStorage = &allocatePhysicalStorageOp,
     .physicalTensorView = &physicalTensorViewOp,
+    .assignedKernelAuxiliaries = &assignedKernelAuxiliariesOp,
     .assignedKernelWorkspace = &assignedKernelWorkspaceOp,
     .runAssignedKernel = &runAssignedKernelOp,
     .createPhysicalCompletion = &createPhysicalCompletionOp,
@@ -27370,6 +27389,7 @@ fn physicalExecutionScopeOp(ctx: *anyopaque, leases: ?[]const ?*ops.physical_sto
 fn retainPhysicalCaptureTensor(self: *CudaCompute, value: CT) !void {
     if (!self.debug_cuda_graph_capture_active) return;
     if (tensorFromCt(value).physical_lease) |lease| try self.capturing_physical_storage.retain(self.allocator, lease);
+    for (tensorFromCt(value).auxiliary_leases) |maybe_lease| if (maybe_lease) |lease| try self.capturing_physical_storage.retain(self.allocator, lease);
 }
 
 fn physicalTensorViewOp(ctx: *anyopaque, request: ops.physical_storage.View) anyerror!?CT {
@@ -27384,13 +27404,31 @@ fn physicalTensorViewOp(ctx: *anyopaque, request: ops.physical_storage.View) any
         count = try checkedMul(count, @intCast(dim));
         target.* = dim;
     }
-    if (count > source.elem_count) return error.InvalidShape;
+    const bytes = try checkedMul(count, request.dtype.byteSize());
+    if (bytes > source.buffer.len) return error.InvalidShape;
     if (self.debug_cuda_graph_capture_active) try self.capturing_physical_storage.retain(self.allocator, request.storage);
-    const tensor = try createTensor(self, .{ .ptr = source.buffer.ptr, .len = count * @sizeOf(f32) }, shape, count);
+    const dtype: tensor_mod.DType = switch (request.dtype) {
+        inline else => |tag| @field(tensor_mod.DType, @tagName(tag)),
+    };
+    const tensor = try createTensorWithDType(self, .{ .ptr = source.buffer.ptr, .len = bytes }, shape, count, dtype);
     tensorFromCt(tensor).owns_buffer = false;
     request.storage.retain();
     tensorFromCt(tensor).physical_lease = request.storage;
     return tensor;
+}
+
+fn assignedKernelAuxiliariesOp(ctx: *anyopaque, descriptor: *const ops.kernel_descriptor.Descriptor) anyerror!ops.kernel_descriptor.AuxiliaryRequirements {
+    const self: *CudaCompute = @ptrCast(@alignCast(ctx));
+    if (descriptor.operation != .norm or descriptor.operation.norm.kind != .rms) return .{};
+    const rows = descriptor.elements() / descriptor.operation.norm.dim;
+    if (rows <= 1 or !cudaRmsNormBf16MirrorEnabled() or !cudaCublasLtEnabled() or
+        self.ctx.info.compute_major < 8 or self.cublaslt == null or self.kernels.rms_norm_f32_bf16 == null) return .{};
+    var shape = descriptor.output_shape;
+    shape.dtype = .bf16;
+    var result = ops.kernel_descriptor.AuxiliaryRequirements{};
+    result.entries[0] = .{ .role = .bf16_mirror, .shape = shape };
+    result.count = 1;
+    return result;
 }
 
 fn assignedKernelWorkspaceOp(_: *anyopaque, descriptor: *const ops.kernel_descriptor.Descriptor) anyerror!ops.kernel_descriptor.WorkspaceRequirement {
@@ -27399,35 +27437,50 @@ fn assignedKernelWorkspaceOp(_: *anyopaque, descriptor: *const ops.kernel_descri
     return .{};
 }
 
+fn assignedProjectionWeightSupported(weight: *const CudaTensor, bias: bool) bool {
+    if (weight.quant_type) |quant_type| return switch (quant_type) {
+        .known => |known| switch (known) {
+            .Q4_0, .Q4_K, .Q8_0 => true,
+            .Q6_K => !bias,
+            else => false,
+        },
+        else => false,
+    };
+    return weight.dtype == .f32 or weight.dtype == .f16 or weight.dtype == .bf16;
+}
+
 fn runAssignedKernelOp(ctx: *anyopaque, request: ops.kernel_descriptor.Invocation) anyerror!bool {
     const self: *CudaCompute = @ptrCast(@alignCast(ctx));
     const descriptor = request.descriptor;
     if (request.inputs.len != descriptor.input_count) return error.InvalidShape;
     for (request.inputs, 0..) |input, i| {
         const tensor = tensorFromCt(input);
-        if (tensor.dtype != .f32 or tensor.quant_type != null or tensor.elem_count != descriptor.input_shapes[i].numElements().?) return false;
+        if (tensor.elem_count != descriptor.input_shapes[i].numElements().?) return false;
+        const projected_weight = i == 1 and (descriptor.operation == .linear or
+            (descriptor.operation == .dot and descriptor.input_shapes[0].rank() == 2 and
+                descriptor.operation.dot.lhs_contract_last and descriptor.operation.dot.rhs_contract_last and self.training_blas == null));
+        if (projected_weight) {
+            if (!assignedProjectionWeightSupported(tensor, descriptor.operation == .linear and descriptor.operation.linear.bias)) return false;
+        } else if (tensor.dtype != .f32 or tensor.quant_type != null) return false;
     }
-    if (descriptor.operation == .linear) {
-        const weight = tensorFromCt(request.inputs[1]);
-        if (weight.bf16_mirror.ptr != 0 or boundaryMixedWeight(self, weight) != null) return false;
-    }
-    // RMS normalization may create a BF16 mirror used by later mixed GEMMs.
-    // Keep that qualified route until auxiliary storage is in the descriptor.
-    if (descriptor.operation == .norm and descriptor.operation.norm.kind == .rms) return false;
     if (descriptor.operation == .dot) {
         const dot = descriptor.operation.dot;
         const weight = tensorFromCt(request.inputs[1]);
-        const unbatched = descriptor.input_shapes[0].rank() == 2;
-        if (unbatched and dot.lhs_contract_last and self.training_blas == null) {
-            if (weight.bf16_mirror.ptr != 0 or boundaryMixedWeight(self, weight) != null) return false;
-        }
+        // A transposed packed/reduced operand requires its own qualified layout.
+        if (descriptor.input_shapes[0].rank() == 2 and dot.lhs_contract_last and !dot.rhs_contract_last and
+            (weight.bf16_mirror.ptr != 0 or boundaryMixedWeight(self, weight) != null)) return false;
     }
     const output_ct = request.output orelse return true;
+    if (request.operator_plan) |plan| if (descriptor.operation == .linear) {
+        const projection = descriptor.operation.linear;
+        try recordQuantMatmulPlan(self, tensorFromCt(request.inputs[1]), plan.*, if (projection.bias) .bias else .none);
+    };
     const output = tensorFromCt(output_ct);
-    if (output.physical_lease == null or output.elem_count != descriptor.elements()) return error.InvalidShape;
+    if (output.physical_lease == null or output.dtype != .f32 or output.quant_type != null or output.elem_count != descriptor.elements()) return error.InvalidShape;
     for (request.inputs) |input| try retainPhysicalCaptureTensor(self, input);
     try retainPhysicalCaptureTensor(self, output_ct);
     if (request.workspace) |workspace| try retainPhysicalCaptureTensor(self, workspace);
+    for (request.auxiliaries) |auxiliary| try retainPhysicalCaptureTensor(self, auxiliary.tensor);
     const a = tensorFromCt(request.inputs[0]);
     switch (descriptor.operation) {
         .transpose, .broadcast => |layout| {
@@ -27450,7 +27503,7 @@ fn runAssignedKernelOp(ctx: *anyopaque, request: ops.kernel_descriptor.Invocatio
                 try self.training_blas.?.matrix(self.ctx.stream, @ptrFromInt(output.buffer.ptr), @ptrFromInt(a.buffer.ptr), @ptrFromInt(rhs.buffer.ptr), dot.m, dot.k, dot.n, !dot.lhs_contract_last, dot.rhs_contract_last, false);
             } else if (unbatched and dot.lhs_contract_last) {
                 if (dot.rhs_contract_last) {
-                    try linearF32NoBiasInto(self, output.buffer, a, rhs, dot.m, dot.k, dot.n, true);
+                    try linearNoBiasInto(self, output.buffer, a, rhs, dot.m, dot.k, dot.n, false);
                 } else {
                     const workspace = tensorFromCt(request.workspace orelse return error.MissingAssignedWorkspace);
                     if (workspace.physical_lease == null or workspace.dtype != .f32 or workspace.elem_count < rhs.elem_count) return error.InvalidShape;
@@ -27462,7 +27515,7 @@ fn runAssignedKernelOp(ctx: *anyopaque, request: ops.kernel_descriptor.Invocatio
                     try linearF32NoBiasInto(self, output.buffer, a, &transposed, dot.m, dot.k, dot.n, true);
                 }
             } else try self.kernels.launchPrimitiveBatchedDotF32(&self.ctx, output.buffer, a.buffer, rhs.buffer, dot.batch_count, dot.m, dot.n, dot.k, dot.lhs_contract_last, dot.rhs_contract_last);
-            self.stats.launch_linear += 1;
+            if (!(unbatched and dot.lhs_contract_last and dot.rhs_contract_last and self.training_blas == null)) self.stats.launch_linear += 1;
             return true;
         },
         .reduction => |reduction| {
@@ -27475,9 +27528,28 @@ fn runAssignedKernelOp(ctx: *anyopaque, request: ops.kernel_descriptor.Invocatio
             return true;
         },
         .norm => |norm| {
-            try self.kernels.launchLayerNormF32(&self.ctx, output.buffer, a.buffer, tensorFromCt(request.inputs[1]).buffer, tensorFromCt(request.inputs[2]).buffer, a.elem_count / norm.dim, norm.dim, norm.eps);
+            if (norm.kind == .layer) {
+                try self.kernels.launchLayerNormF32(&self.ctx, output.buffer, a.buffer, tensorFromCt(request.inputs[1]).buffer, tensorFromCt(request.inputs[2]).buffer, a.elem_count / norm.dim, norm.dim, norm.eps);
+                self.stats.launch_norm_layer += 1;
+            } else {
+                const requirements = try assignedKernelAuxiliariesOp(ctx, descriptor);
+                if (requirements.count != request.auxiliaries.len) return error.InvalidAuxiliaryRequirements;
+                if (requirements.count == 1) {
+                    const binding = request.auxiliaries[0];
+                    const mirror = tensorFromCt(binding.tensor);
+                    const lease = mirror.physical_lease orelse return error.InvalidAuxiliaryRequirements;
+                    if (binding.role != .bf16_mirror or mirror.dtype != .bf16 or mirror.elem_count != a.elem_count) return error.InvalidAuxiliaryRequirements;
+                    try self.kernels.launchRmsNormF32Bf16(&self.ctx, output.buffer, mirror.buffer, a.buffer, tensorFromCt(request.inputs[1]).buffer, a.elem_count / norm.dim, norm.dim, norm.eps);
+                    lease.retain();
+                    if (output.auxiliary_leases[0]) |previous| previous.release();
+                    output.auxiliary_leases[0] = lease;
+                    output.bf16_mirror = mirror.buffer;
+                    output.owns_bf16_mirror = false;
+                    self.stats.rms_norm_bf16_mirror_hits += 1;
+                } else try self.kernels.launchRmsNormF32(&self.ctx, output.buffer, a.buffer, tensorFromCt(request.inputs[1]).buffer, a.elem_count / norm.dim, norm.dim, norm.eps);
+                self.stats.launch_norm_rms += 1;
+            }
             self.stats.launch_norm += 1;
-            self.stats.launch_norm_layer += 1;
             return true;
         },
         .softmax => |softmax| {
@@ -27486,8 +27558,7 @@ fn runAssignedKernelOp(ctx: *anyopaque, request: ops.kernel_descriptor.Invocatio
         },
         .linear => |linear_desc| {
             const weight = tensorFromCt(request.inputs[1]);
-            if (linear_desc.bias) try linearF32BiasInto(self, output.buffer, a, weight, tensorFromCt(request.inputs[2]), linear_desc.rows, linear_desc.in_dim, linear_desc.out_dim) else try linearF32NoBiasInto(self, output.buffer, a, weight, linear_desc.rows, linear_desc.in_dim, linear_desc.out_dim, false);
-            self.stats.launch_linear += 1;
+            if (linear_desc.bias) try linearBiasInto(self, output.buffer, a, weight, tensorFromCt(request.inputs[2]), linear_desc.rows, linear_desc.in_dim, linear_desc.out_dim) else try linearNoBiasInto(self, output.buffer, a, weight, linear_desc.rows, linear_desc.in_dim, linear_desc.out_dim, false);
             return true;
         },
         .unary => |op| switch (op) {
@@ -27575,6 +27646,24 @@ fn makeRetainedTensorView(self: *CudaCompute, source: *CudaTensor, buffer: buffe
     } else if (source.owned_by_tensor) {
         source.resident_references += 1;
         tensor.resident_parent = source;
+    }
+    // Dense reshapes and row slices preserve the corresponding representation
+    // range. Pin its owner separately from the primary F32 allocation.
+    if (source.quant_type == null and source.dtype == .f32 and source.bf16_mirror.ptr != 0 and buffer.ptr >= source.buffer.ptr) {
+        const offset = buffer.ptr - source.buffer.ptr;
+        const mirror_offset = offset / @sizeOf(f32) * @sizeOf(u16);
+        const mirror_bytes = count * @sizeOf(u16);
+        if (offset % @sizeOf(f32) == 0 and mirror_offset <= source.bf16_mirror.len and mirror_bytes <= source.bf16_mirror.len - mirror_offset) {
+            tensor.bf16_mirror = .{ .ptr = source.bf16_mirror.ptr + mirror_offset, .len = mirror_bytes };
+            for (source.auxiliary_leases, 0..) |maybe_lease, i| if (maybe_lease) |lease| {
+                lease.retain();
+                tensor.auxiliary_leases[i] = lease;
+            };
+            if (source.physical_lease != null and source.owns_bf16_mirror and source.owned_by_tensor) {
+                source.resident_references += 1;
+                tensor.resident_parent = source;
+            }
+        }
     }
     return tensor;
 }
@@ -27727,8 +27816,7 @@ test "CUDA physical capture scopes reject nesting and retain operand addresses" 
     try std.testing.expectError(error.PhysicalExecutionScopeActive, physicalExecutionScopeOp(&compute, &leases));
     try physicalExecutionScopeOp(&compute, null);
     try std.testing.expect(compute.physical_execution_storage == null);
-    var tensor: CudaTensor = undefined;
-    tensor.physical_lease = lease;
+    var tensor = CudaTensor{ .buffer = .{}, .dtype = .f32, .shape = @constCast(&[_]i64{}), .elem_count = 0, .physical_lease = lease };
     try retainPhysicalCaptureTensor(&compute, @ptrCast(&tensor));
     try std.testing.expect(lease.unique());
     compute.debug_cuda_graph_capture_active = true;
@@ -27758,4 +27846,56 @@ test "CUDA row snapshots use stable allocation and fail closed before capture de
     const backend = ops.ComputeBackend{ .ptr = &compute, .vtable = &callbacks };
     try std.testing.expectError(error.CudaGraphCaptureUnsafeTempAlloc, backend.snapshotRows2D(std.testing.allocator, @ptrFromInt(8), 0, 2, 2));
     try std.testing.expect(compute.debug_cuda_graph_capture_disabled);
+}
+
+test "CUDA planned auxiliary representations retain storage through publication and capture" {
+    if (comptime @import("build_options").enable_wasm) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var context = try @import("../../backends/compute_context.zig").BackendContext.init(a, .native, null);
+    defer context.deinit(a);
+    const lease = (try ops.physical_storage.Lease.create(a, context.computeBackend(), 16)).?;
+    defer lease.release();
+    var compute: CudaCompute = undefined;
+    compute.allocator = a;
+    compute.debug_cuda_graph_capture_active = true;
+    compute.capturing_physical_storage = .{};
+    var capture_live = true;
+    defer if (capture_live) compute.capturing_physical_storage.deinit(a);
+    const tensor = try a.create(CudaTensor);
+    tensor.* = .{ .buffer = .{ .ptr = 4096, .len = 16 }, .bf16_mirror = .{ .ptr = 8192, .len = 8 }, .dtype = .f32, .shape = @constCast(&[_]i64{4}), .elem_count = 4, .owns_buffer = false, .owns_shape = false, .owns_bf16_mirror = false, .owns_training_upload_host = false };
+    lease.retain();
+    tensor.auxiliary_leases[0] = lease;
+    try retainPhysicalCaptureTensor(&compute, tensor);
+    try std.testing.expectEqual(@as(usize, 1), compute.capturing_physical_storage.values.items.len);
+    // Acquired model-binding metadata owns both primary and auxiliary leases
+    // even though its device buffers remain borrowed from the store.
+    compute.a4b_runtime = null;
+    compute.resident_weights = .empty;
+    defer compute.resident_weights.deinit(a);
+    compute.lazy_device_epochs = .empty;
+    try compute.resident_weights.put(a, "mirror", tensor.*);
+    const acquired = try acquireWeight(&compute, "mirror");
+    var acquired_live = true;
+    defer if (acquired_live) freeTensor(&compute, acquired);
+    try std.testing.expectEqual(@as(usize, 4), lease.references.load(.acquire));
+    const published = (try retainImmutableTensorOp(&compute, tensor)).?;
+    const slice_shape = try a.dupe(i64, &.{2});
+    const sliced = try makeRetainedTensorView(&compute, tensor, .{ .ptr = 4104, .len = 8 }, slice_shape, 2);
+    var slice_live = true;
+    defer if (slice_live) freeTensor(&compute, sliced);
+    freeTensor(&compute, tensor);
+    try std.testing.expectEqual(@as(u64, 8192), tensorFromCt(published).bf16_mirror.ptr);
+    try std.testing.expectEqual(@as(u64, 8196), tensorFromCt(sliced).bf16_mirror.ptr);
+    try std.testing.expectEqual(@as(usize, 4), tensorFromCt(sliced).bf16_mirror.len);
+    freeTensor(&compute, published);
+    try std.testing.expect(!lease.unique());
+    compute.capturing_physical_storage.deinit(a);
+    capture_live = false;
+    freeTensor(&compute, acquired);
+    acquired_live = false;
+    // The view owns a lease and a retained parent for its borrowed primary.
+    try std.testing.expectEqual(@as(usize, 3), lease.references.load(.acquire));
+    freeTensor(&compute, sliced);
+    slice_live = false;
+    try std.testing.expect(lease.unique());
 }

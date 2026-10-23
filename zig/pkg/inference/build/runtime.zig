@@ -227,6 +227,7 @@ pub fn create(config: Config) Graph {
     const hash_mod = shared.hash orelse createSharedModule(config, "lib/hash/src/mod.zig");
     const image_mod = shared.image orelse createSharedModule(config, "lib/image/src/mod.zig");
     if (shared.image == null) image_mod.addImport("antfly_hash", hash_mod);
+    structured_mod.addImport("antfly_image", image_mod);
     const prometheus_mod = shared.prometheus;
     const structlog_mod = shared.structlog;
     const jinja_mod = shared.jinja orelse b.dependency("jinja", .{
@@ -282,6 +283,13 @@ pub fn create(config: Config) Graph {
     };
     const reader_config_mod = shared.reader_config orelse createSharedModule(config, "lib/readers/src/config.zig");
     const inference_api_mod = shared.inference_api orelse addInferenceApiModule(b, target, optimize, httpx_mod, backend.skip_openapi, paths, config.register_public_modules, shared_with_generating);
+    const readers_mod = b.modules.get("antfly_readers") orelse createSharedModule(config, "lib/readers/src/mod.zig");
+    readers_mod.addImport("httpx", httpx_mod);
+    readers_mod.addImport("inference_api", inference_api_mod);
+    readers_mod.addImport("antfly_google", google_mod);
+    readers_mod.addImport("antfly_reader_config", reader_config_mod);
+    readers_mod.addImport("antfly_scraping", scraping_mod);
+    readers_mod.addImport("antfly_image", image_mod);
     const s3_openapi_mod = shared.s3_openapi orelse createSharedModule(config, "pkg/antfly-embedded/src/openapi/generated/antfly_s3_openapi/root.zig");
     const audio_openapi_mod = shared.audio_openapi orelse blk: {
         const mod = createSharedModule(config, "pkg/antfly-embedded/src/openapi/generated/antfly_audio_openapi/root.zig");
@@ -311,7 +319,16 @@ pub fn create(config: Config) Graph {
     const apple_native_options = b.addOptions();
     apple_native_options.addOption(bool, "enabled", false);
     const apple_native_mod = createSharedModule(config, "lib/apple_native/src/mod.zig");
-    apple_native_mod.addImport("apple_native_options", apple_native_options.createModule());
+    const apple_options_mod = apple_native_options.createModule();
+    apple_native_mod.addImport("apple_native_options", apple_options_mod);
+    if (!readers_mod.import_table.contains("apple_reader_options")) readers_mod.addImport("apple_reader_options", apple_options_mod);
+    if (!readers_mod.import_table.contains("antfly_inference_work")) {
+        const work_mod = b.createModule(.{ .root_source_file = b.path(pathJoin(b, paths.inference_root, "src/host/work.zig")), .target = target, .optimize = optimize });
+        work_mod.addImport("antfly_scraping", scraping_mod);
+        work_mod.addImport("antfly_image", image_mod);
+        readers_mod.addImport("antfly_inference_work", work_mod);
+    }
+    readers_mod.addImport("antfly_platform", platform_mod);
     apple_native_mod.addImport("antfly_platform", platform_mod);
     apple_native_mod.addImport("httpx", httpx_mod);
     transcribing_mod.addImport("antfly_apple_native", apple_native_mod);
@@ -380,6 +397,7 @@ pub fn create(config: Config) Graph {
     const decisions_mod = b.modules.get("antfly_decisions") orelse b.addModule("antfly_decisions", .{
         .root_source_file = b.path(pathJoin(b, paths.shared_lib_root, "lib/decisions/root.zig")),
     });
+    inference_mod.addImport("antfly_readers", readers_mod);
     inference_mod.addImport("antfly_decisions", decisions_mod);
     inference_mod.addImport("antfly_structured", structured_mod);
     decisions_mod.addImport("antfly_structured", structured_mod);
@@ -449,6 +467,7 @@ pub fn create(config: Config) Graph {
         .target = target,
         .optimize = optimize,
     });
+    inference_internal_mod.addImport("antfly_readers", readers_mod);
     inference_internal_mod.addImport("antfly_decisions", decisions_mod);
     inference_internal_mod.addImport("antfly_structured", structured_mod);
     inference_internal_mod.addImport("antfly_extracting", extracting_mod);

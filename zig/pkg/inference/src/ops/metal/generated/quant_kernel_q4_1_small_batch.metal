@@ -25,7 +25,29 @@
 using namespace metal;
 
 inline float antfly_qk_half_le_to_float(device const uchar *p) { ushort bits = (ushort(p[0]) | (ushort(p[1]) << 8)); return float(as_type<half>(bits)); }
-inline float antfly_q4_1_dequant_lane_v2(device const uchar *block, int lane) { float d = antfly_qk_half_le_to_float(block); float m = antfly_qk_half_le_to_float(block + 2); int packed_index = lane & 15; uchar packed = block[4 + packed_index]; int q = lane < 16 ? int(packed & 0x0fu) : int(packed >> 4); return d * float(q) + m; }
+inline float antfly_q4_1_dequant_lane_v2(device const uchar *block, int lane) {
+    int v0 = lane;
+    int v1 = 4;
+    int v2 = 15;
+    int v3 = v0 & v2;
+    int v4 = v1 + v3;
+    int v5 = int(block[v4]);
+    int v6 = 16;
+    int v7 = v0 < v6;
+    int v8 = 15;
+    int v9 = v5 & v8;
+    int v10 = 4;
+    int v11 = int(uint(v5) >> v10);
+    int v12 = v7 ? v9 : v11;
+    int v13 = 0;
+    float v14 = antfly_qk_half_le_to_float(block + v13);
+    float v15 = float(v12);
+    float v16 = v14 * v15;
+    int v17 = 2;
+    float v18 = antfly_qk_half_le_to_float(block + v17);
+    float v19 = v16 + v18;
+    return v19;
+}
 kernel void antfly_q4_1_small_batch_msl_v1(device const float *input [[buffer(0)]], device const uchar *weight_q4_1 [[buffer(1)]], device float *output [[buffer(2)]], constant int &rows [[buffer(3)]], constant int &in_dim [[buffer(4)]], constant int &out_dim [[buffer(5)]], uint3 thread_pos [[thread_position_in_threadgroup]], uint3 group_pos [[threadgroup_position_in_grid]]) {
     uint tid = thread_pos.x; int col0 = int(group_pos.x << 1); int col1 = col0 + 1; int row = int(group_pos.y); if (row >= rows || rows < 2 || rows > 8 || col0 >= out_dim || (in_dim & 31) != 0) return; float acc0 = 0.0f; float acc1 = 0.0f; int block_count = in_dim >> 5;
     device const float *row_input = input + row * in_dim; device const uchar *col0_weight = weight_q4_1 + col0 * block_count * 20; bool has_col1 = col1 < out_dim; device const uchar *col1_weight = has_col1 ? weight_q4_1 + col1 * block_count * 20 : col0_weight;

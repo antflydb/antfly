@@ -133,6 +133,7 @@ test "prepared executable reuses CPU and Metal plans with resident outputs" {
                 try std.testing.expect(@import("../graph/metal_partition_executor.zig").isMetalDeviceResident(owner, result.outputs[0]));
                 try std.testing.expectEqual(@as(u64, 0), result.stats.boundary_output_materializations);
                 try std.testing.expect(result.stats.backend_command_dispatches > 0);
+                try std.testing.expect(result.stats.assigned_kernel_dispatches > 0);
             }
             if (kind == .native) {
                 const diagnostics = executable.diagnostics.snapshot().?;
@@ -557,10 +558,90 @@ test "prepared Metal fanout placement preserves outputs and removes two boundary
             defer a.free(probabilities);
             for (probabilities, [_]f32{ 0.8807971, 0.11920292, 0.01798621, 0.98201376 }) |actual, expected| try std.testing.expectApproxEqAbs(expected, actual, 1e-6);
             try std.testing.expectEqual(@as(u64, if (refine) 3 else 5), result.stats.cross_device_transfers);
-            try std.testing.expectEqual(@as(u64, if (refine) 1 else 0), result.stats.assigned_kernel_dispatches);
+            // Both placements now dispatch two shared kernels: CPU ReLU plus Metal
+            // softmax after refinement, or Metal ReLU plus Metal softmax before it.
+            try std.testing.expectEqual(@as(u64, 2), result.stats.assigned_kernel_dispatches);
             try std.testing.expectEqual(@as(u64, if (refine) 24 else 40), result.stats.physical_transfer_bytes);
             try std.testing.expectEqual(@as(u64, if (refine) 32 else 48), result.stats.actual_download_bytes);
             if (iteration != 0) try std.testing.expectEqual(@as(u64, 0), result.stats.physical_storage_allocations);
         }
     }
+}
+
+test "prepared auxiliary planes reuse primary lifetimes and survive frame retirement" {
+    if (comptime @import("build_options").enable_wasm) return error.SkipZigTest;
+    const ml = @import("ml");
+    const Native = @import("../ops/native_compute.zig").NativeCompute;
+    const a = std.testing.allocator;
+    const SavedKernel = struct {
+        fn requirement(_: *anyopaque, descriptor: *const ops.kernel_descriptor.Descriptor) !ops.kernel_descriptor.AuxiliaryRequirements {
+            var result = ops.kernel_descriptor.AuxiliaryRequirements{};
+            result.entries[0] = .{ .role = .inverse_std, .shape = descriptor.output_shape };
+            result.count = 1;
+            return result;
+        }
+        fn run(raw: *anyopaque, request: ops.kernel_descriptor.Invocation) !bool {
+            const compute: *Native = @ptrCast(@alignCast(raw));
+            const original = compute.computeBackend();
+            const invoke = original.vtable.kernels.?.runAssignedKernel.?;
+            if (request.output == null) return invoke(raw, request);
+            if (request.auxiliaries.len != 1 or request.auxiliaries[0].role != .inverse_std) return error.MissingAuxiliary;
+            var stage = request;
+            stage.output = request.auxiliaries[0].tensor;
+            stage.auxiliaries = &.{};
+            if (!try invoke(raw, stage)) return error.UnexpectedKernelDecline;
+            stage.inputs = &.{stage.output.?};
+            stage.output = request.output;
+            return invoke(raw, stage);
+        }
+    };
+    var context = try @import("../backends/compute_context.zig").BackendContext.init(a, .native, null);
+    defer context.deinit(a);
+    var cb = context.computeBackend();
+    var vtable = cb.vtable.*;
+    var functions = vtable.kernels.?.*;
+    functions.assignedKernelAuxiliaries = SavedKernel.requirement;
+    functions.runAssignedKernel = SavedKernel.run;
+    vtable.kernels = &functions;
+    cb.vtable = &vtable;
+    var graph = ml.graph.Graph.init(a);
+    defer graph.deinit();
+    var b = ml.graph.Builder.init(&graph);
+    const x = try b.parameter("x", ml.graph.Shape.init(.f32, &.{ 2, 4 }));
+    try graph.markOutput(try b.relu(x));
+    var program = try ModelProgram.init(a, &graph, &.{});
+    defer program.deinit();
+    var executable = try prepare(a, &program, &cb, .compiled_preferred);
+    var executable_live = true;
+    defer if (executable_live) executable.deinit();
+    const pool = executable.runtime.physical_pool.?;
+    var plane_id: @import("../graph/buffer_plan.zig").AllocationId = undefined;
+    for (pool.kernels) |maybe_kernel| if (maybe_kernel) |kernel| {
+        const auxiliary = kernel.auxiliaries[0].?;
+        plane_id = auxiliary.allocation;
+        const primary = pool.plan.allocations[kernel.output_allocation];
+        const plane = pool.plan.allocations[plane_id];
+        try std.testing.expectEqual(primary.first_use, plane.first_use);
+        try std.testing.expectEqual(primary.last_use, plane.last_use);
+        try std.testing.expectEqual(.auxiliary, plane.kind);
+    };
+    const input = try cb.fromFloat32Shape(&.{ -4, -3, -2, -1, 0, 1, 2, 3 }, &.{ 2, 4 });
+    defer cb.free(input);
+    const bindings = [_]interpreter.RuntimeInput{.{ .node_id = program.id_map[x], .value = input }};
+    for (0..4) |iteration| {
+        var result = try executable.run(a, .{ .runtime_inputs = &bindings, .collect_partition_stats = true });
+        defer result.deinit(&executable.runtime);
+        const values = try cb.toFloat32(result.outputs[0], a);
+        defer a.free(values);
+        try std.testing.expectEqualSlices(f32, &.{ 0, 0, 0, 0, 0, 1, 2, 3 }, values);
+        try std.testing.expectEqual(@as(u64, if (iteration == 0) 2 else 0), result.stats.physical_storage_allocations);
+    }
+    const retained_plane = pool.frames.items[0].storages[plane_id].?;
+    retained_plane.retain();
+    defer retained_plane.release();
+    executable.deinit();
+    executable_live = false;
+    const saved_values = try cb.toFloat32(retained_plane.tensor, a);
+    defer a.free(saved_values);
+    try std.testing.expectEqualSlices(f32, &.{ 0, 0, 0, 0, 0, 1, 2, 3 }, saved_values);
 }

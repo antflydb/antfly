@@ -480,6 +480,14 @@ pub fn build(b: *std.Build) void {
         }
         quant_kernel_metal_v2_conformance_step.dependOn(&run_quant_kernel_metal_v2_conformance.step);
 
+        // Runtime compilation is available with Command Line Tools alone.
+        // Keep the offline SDK gate above for artifact qualification, while
+        // exposing an independently reproducible device conformance target.
+        const run_quant_recipe_runtime = b.addRunArtifact(quant_kernel_metal_runtime_check_exe);
+        run_quant_recipe_runtime.addArg("--v2-conformance");
+        run_quant_recipe_runtime.step.dependOn(&quant_kernel_codegen_test_check.step);
+        b.step("quant-kernel-metal-runtime-conformance", "Run generated Metal device conformance using runtime compilation").dependOn(&run_quant_recipe_runtime.step);
+
         const run_quant_kernel_metal_sweep = b.addRunArtifact(quant_kernel_metal_runtime_check_exe);
         run_quant_kernel_metal_sweep.addArg("--sweep");
         run_quant_kernel_metal_sweep.addPassthruArgs();
@@ -1618,6 +1626,24 @@ pub fn build(b: *std.Build) void {
     run_unified_execution_bench.addPassthruArgs();
     const unified_execution_bench_step = b.step("bench-unified-execution", "Run pretokenized encoder correctness and performance acceptance workloads");
     unified_execution_bench_step.dependOn(&run_unified_execution_bench.step);
+
+    const quant_recipe_bench = b.addExecutable(.{
+        .name = "antfly-quant-recipe-bench",
+        .root_module = b.createModule(.{ .root_source_file = b.path("src/bench_quant_recipe.zig"), .target = target, .optimize = .ReleaseFast }),
+    });
+    b.step("bench-quant-recipes", "Compare shared SIMD decoding with the frozen scalar decoder").dependOn(&b.addRunArtifact(quant_recipe_bench).step);
+    const quant_recipe_fixtures = b.addExecutable(.{
+        .name = "antfly-quant-recipe-fixtures",
+        .root_module = b.createModule(.{ .root_source_file = b.path("src/quant_recipe_conformance.zig"), .target = b.graph.host, .optimize = .ReleaseFast }),
+    });
+    const emit_quant_recipe_fixtures = b.addRunArtifact(quant_recipe_fixtures);
+    const quant_recipe_cpp = emit_quant_recipe_fixtures.addOutputFileArg("quant_recipes.cpp");
+    const quant_recipe_host_check = b.addExecutable(.{
+        .name = "antfly-quant-recipe-host-check",
+        .root_module = b.createModule(.{ .target = b.graph.host, .optimize = .ReleaseFast, .link_libc = true }),
+    });
+    quant_recipe_host_check.root_module.addCSourceFile(.{ .file = quant_recipe_cpp, .flags = &.{ "-std=c++17", "-ffp-contract=off" } });
+    b.step("quant-recipe-cuda-host-conformance", "Compile CUDA recipe syntax and compare all formats with the independent GGUF oracle on the host").dependOn(&b.addRunArtifact(quant_recipe_host_check).step);
 
     const unified_fixtures_bench_exe = b.addExecutable(.{
         .name = "antfly-inference-unified-fixtures-bench",

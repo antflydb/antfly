@@ -35,12 +35,16 @@ pub const Stats = struct {
     reused_allocations: u64 = 0,
 };
 
+const AuxiliaryPlan = struct { requirement: kernels.Auxiliary, allocation: buffers.AllocationId };
+
 pub const KernelPlan = struct {
     descriptor: kernels.Descriptor,
+    operator_plan: ?ops.OperatorPlan = null,
     inputs: [3]NodeId,
     backend_index: usize,
     output_allocation: buffers.AllocationId,
     workspace_bytes: usize,
+    auxiliaries: [kernels.max_auxiliaries]?AuxiliaryPlan = @splat(null),
 };
 
 const TransferPlan = struct { shape: ml.graph.Shape, backend_index: usize, allocation: buffers.AllocationId };
@@ -57,7 +61,7 @@ pub const Pool = struct {
     mutex: std.atomic.Mutex = .unlocked,
     max_frames: usize = 4,
 
-    pub fn create(allocator: std.mem.Allocator, graph: *const Graph, plan: *buffers.BufferPlan, backends: []const *const ops.ComputeBackend) !?*Pool {
+    pub fn create(allocator: std.mem.Allocator, graph: *const Graph, plan: *buffers.BufferPlan, backends: []const *const ops.ComputeBackend, operator_plans: []const ?ops.OperatorPlan) !?*Pool {
         const prepared = try allocator.alloc(?KernelPlan, graph.nodeCount());
         errdefer allocator.free(prepared);
         @memset(prepared, null);
@@ -79,9 +83,36 @@ pub const Pool = struct {
                 scratch_requirements[backend_index].alignment = @max(scratch_requirements[backend_index].alignment, workspace.alignment);
                 var inputs: [3]NodeId = @splat(ml.graph.null_node);
                 @memcpy(inputs[0..descriptor.input_count], graph.node(@intCast(id)).getInputs());
-                entry.* = .{ .descriptor = descriptor, .inputs = inputs, .backend_index = backend_index, .output_allocation = slot.allocation, .workspace_bytes = workspace.byte_size };
+                entry.* = .{ .descriptor = descriptor, .operator_plan = if (id < operator_plans.len) operator_plans[id] else null, .inputs = inputs, .backend_index = backend_index, .output_allocation = slot.allocation, .workspace_bytes = workspace.byte_size };
                 count += 1;
                 break;
+            }
+        }
+        // Sharing a representation plane by primary allocation preserves the
+        // primary reuse schedule instead of allocating one mirror per node.
+        var planes = std.AutoHashMap(u64, buffers.AllocationId).init(allocator);
+        defer planes.deinit();
+        for (prepared) |*maybe_kernel| {
+            const kernel = if (maybe_kernel.*) |*value| value else continue;
+            const backend = backends[kernel.backend_index];
+            const get_auxiliaries = backend.vtable.kernels.?.assignedKernelAuxiliaries orelse continue;
+            const requirements = try get_auxiliaries(backend.ptr, &kernel.descriptor);
+            if (requirements.count > kernels.max_auxiliaries) return error.InvalidAuxiliaryRequirements;
+            var roles: u32 = 0;
+            for (requirements.items(), 0..) |requirement, auxiliary_index| {
+                const role_bit = @as(u32, 1) << @intCast(@backingInt(requirement.role));
+                if (roles & role_bit != 0) return error.InvalidAuxiliaryRequirements;
+                roles |= role_bit;
+                const elements = requirement.shape.numElements() orelse return error.InvalidAuxiliaryRequirements;
+                if (elements <= 0 or elements > std.math.maxInt(i32)) return error.InvalidAuxiliaryRequirements;
+                const bytes = try std.math.mul(usize, @intCast(elements), requirement.shape.dtype.byteSize());
+                const key = @as(u64, kernel.output_allocation) << 32 | @backingInt(requirement.role);
+                const entry = try planes.getOrPut(key);
+                if (!entry.found_existing) entry.value_ptr.* = try plan.addAuxiliaryPlane(kernel.output_allocation, bytes);
+                const allocation = entry.value_ptr.*;
+                const padded = try std.math.add(usize, bytes, @sizeOf(f32) - 1);
+                plan.allocations[allocation].byte_size = @max(plan.allocations[allocation].byte_size, padded / @sizeOf(f32) * @sizeOf(f32));
+                kernel.auxiliaries[auxiliary_index] = .{ .requirement = requirement, .allocation = allocation };
             }
         }
         const transfers = try allocator.alloc(?TransferPlan, plan.transfers.len);
@@ -241,7 +272,7 @@ pub const Frame = struct {
     fn viewForShape(_: *Frame, target: *const ops.ComputeBackend, allocation: *storage.Lease, logical: ml.graph.Shape) !CT {
         var shape: [ml.graph.shape.max_rank]i32 = undefined;
         for (logical.dims[0..logical.rank()], 0..) |dim, axis| shape[axis] = @intCast(dim);
-        return (try target.vtable.kernels.?.physicalTensorView.?(target.ptr, .{ .storage = allocation, .shape = shape[0..logical.rank()] })) orelse error.UnsupportedPhysicalTensorView;
+        return (try target.vtable.kernels.?.physicalTensorView.?(target.ptr, .{ .storage = allocation, .shape = shape[0..logical.rank()], .dtype = logical.dtype })) orelse error.UnsupportedPhysicalTensorView;
     }
 
     pub fn transfer(self: *Frame, source: *const ops.ComputeBackend, target: *const ops.ComputeBackend, value: CT, node: NodeId, partition: u32) !?CT {
@@ -286,7 +317,7 @@ pub const Frame = struct {
         const view = functions.physicalTensorView orelse return null;
         var inputs: [3]CT = undefined;
         for (kernel.inputs[0..descriptor.input_count], 0..) |input, input_index| inputs[input_index] = values[input] orelse return error.MissingValue;
-        const request = kernels.Invocation{ .descriptor = descriptor, .inputs = inputs[0..descriptor.input_count] };
+        const request = kernels.Invocation{ .descriptor = descriptor, .operator_plan = if (kernel.operator_plan) |*plan| plan else null, .inputs = inputs[0..descriptor.input_count] };
         if (!try run(cb.ptr, request)) return null;
         const output_storage = (try self.storageFor(cb, index, kernel.output_allocation)) orelse return null;
         var shape: [ml.graph.shape.max_rank]i32 = undefined;
@@ -303,6 +334,17 @@ pub const Frame = struct {
             bound.workspace = (try view(cb.ptr, .{ .storage = scratch, .shape = &.{@intCast(kernel.workspace_bytes / @sizeOf(f32))} })) orelse return error.UnsupportedPhysicalTensorView;
         }
         defer if (bound.workspace) |workspace| cb.free(workspace);
+        var auxiliary_bindings: [kernels.max_auxiliaries]kernels.AuxiliaryBinding = undefined;
+        var auxiliary_count: usize = 0;
+        defer for (auxiliary_bindings[0..auxiliary_count]) |binding| cb.free(binding.tensor);
+        for (kernel.auxiliaries) |maybe_auxiliary| {
+            const auxiliary = maybe_auxiliary orelse break;
+            const allocation = (try self.storageFor(cb, index, auxiliary.allocation)) orelse return error.AuxiliaryStorageUnavailable;
+            const tensor = try self.viewForShape(cb, allocation, auxiliary.requirement.shape);
+            auxiliary_bindings[auxiliary_count] = .{ .role = auxiliary.requirement.role, .tensor = tensor };
+            auxiliary_count += 1;
+        }
+        bound.auxiliaries = auxiliary_bindings[0..auxiliary_count];
         if (!try run(cb.ptr, bound)) return error.AssignedKernelDeclinedAfterBinding;
         self.stats.dispatches += 1;
         return output;
