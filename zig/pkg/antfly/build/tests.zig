@@ -1810,6 +1810,21 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const root_test_step = b.step("root-test", "Run fast root-module compile smoke tests");
     root_test_step.dependOn(&run_lib_unit_tests.step);
 
+    const graph_capability_filters = selectTestFilters(b, &.{
+        "unsupported graph diagnostics identify the rejected operation feature",
+        "graph capability diagnostic",
+        "authenticated single-group graph queries require distributed coordination",
+    });
+    const graph_capability_tests = b.addTest(.{
+        .name = "graph-capability-tests",
+        .root_module = antfly_test_mod,
+        .filters = compileFiltersWithAnchors(b, &.{ "api module compiles", "metadata module compiles" }, graph_capability_filters),
+        .max_rss = 7 * 1024 * 1024 * 1024,
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("antfly-graph-capability-test", "Run graph capability admission and request-owned diagnostic contracts")
+        .dependOn(&addFilteredTestRunArtifactWithRuntimeFilters(b, graph_capability_tests, graph_capability_filters).step);
+
     const lib_bedrock_tests = b.addTest(.{
         .root_module = antfly_test_mod,
         .filters = &.{"bedrock provider request helpers"},
@@ -2086,6 +2101,21 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     b.step("antfly-api-native-query-repository-test", "Run native query checkpoint reuse, retention and executor ownership contracts").dependOn(&addFilteredTestRunArtifactWithRuntimeFilters(b, native_query_repository_tests, native_query_repository_filters).step);
+    const execution_budget_filters = &.{ "internal transaction ingress establishes", "online merge ingress bounds", "public execution", "remote shard query phases propagate deadline and request cancellation", "remote scan fails closed without streaming and honors cancellation before transport", "table reads translate request deadlines into the routing clock" };
+    const execution_budget_tests = b.addTest(.{
+        .root_module = api_http_runtime_test_mod,
+        .filters = execution_budget_filters,
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    const execution_budget_step = b.step("antfly-api-execution-budget-test", "Verify public deadlines and SQL engine budgets");
+    execution_budget_step.dependOn(&addFilteredTestRunArtifactWithRuntimeFilters(b, execution_budget_tests, execution_budget_filters).step);
+    const routing_deadline_filters = &.{ "public execution routing budgets", "metadata routing server converts relative budget to local deadline", "system catalog forwarding retains its executor clock" };
+    const routing_deadline_tests = b.addTest(.{
+        .root_module = metadata_unit_baseline_mods[1],
+        .filters = routing_deadline_filters,
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    execution_budget_step.dependOn(&addFilteredTestRunArtifactWithRuntimeFilters(b, routing_deadline_tests, routing_deadline_filters).step);
     const api_http_runtime_test_step = b.step("antfly-api-test", "Run API contracts and linked-boundary tests");
     // Cross-package imports do not discover their libraries' tests in this
     // root. Compile shared contracts at their own module boundary instead.
@@ -2289,6 +2319,45 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const run_cmd_tests = @import("../../../build_support/antfly/test_support.zig").addCuratedTestRunArtifact(b, cmd_tests, cmd_tests.filters);
     const cmd_test_step = b.step("antfly-cmd-test", "Run Antfly command and client CLI tests");
     cmd_test_step.dependOn(&run_cmd_tests.step);
+    const agent_policy_tests = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly-embedded/src/cmd/cli/agent.zig"),
+        .target = target,
+        .optimize = optimize,
+    }) });
+    cmd_test_step.dependOn(&b.addRunArtifact(agent_policy_tests).step);
+    const human_output_tests = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly-embedded/src/cmd/cli/human.zig"),
+        .target = target,
+        .optimize = optimize,
+    }) });
+    cmd_test_step.dependOn(&b.addRunArtifact(human_output_tests).step);
+    const invocation_tests = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/cli_invocation.zig"),
+        .target = target,
+        .optimize = optimize,
+    }) });
+    cmd_test_step.dependOn(&b.addRunArtifact(invocation_tests).step);
+    const cli_contract_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/cli_contract_main.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    antfly_imports.configureCli(cli_contract_mod, true);
+    const cli_contract_options = b.addOptions();
+    cli_contract_options.addOption(bool, "linked_runtime_boundaries", true);
+    cli_contract_mod.addOptions("standalone_runtime_options", cli_contract_options);
+    cli_contract_mod.addImport("antfly-client", antfly_client_pkg_mod);
+    const cli_contract = b.addExecutable(.{ .name = "antfly-cli-contract", .root_module = cli_contract_mod });
+    const install_cli_contract = b.addInstallArtifact(cli_contract, .{});
+    b.step("antfly-cli-contract-bin", "Build the lightweight process fixture for the full remote CLI contract").dependOn(&install_cli_contract.step);
+    const cli_agent_process_tests = b.addSystemCommand(&.{ "python3", "../scripts/ci/test_cli_agent_contract.py", "--binary" });
+    cli_agent_process_tests.addArtifactArg(cli_contract);
+    const cli_agent_test_step = b.step("antfly-cli-agent-test", "Run CLI unit, process delivery and paired benchmark contracts");
+    cli_agent_test_step.dependOn(&cli_agent_process_tests.step);
+    cli_agent_test_step.dependOn(cmd_test_step);
+    const cli_evaluation_contract_tests = b.addSystemCommand(&.{ "python3", "-B", "-m", "unittest", "discover", "-s", "../scripts/ci", "-p", "test_cli_coding_agent_eval.py" });
+    cli_agent_test_step.dependOn(&cli_evaluation_contract_tests.step);
+    b.step("cli-agent-evaluation-test", "Verify coding-agent answer grading and token/cost usage attribution without model calls").dependOn(&cli_evaluation_contract_tests.step);
     const index_maintenance_cli_tests = b.addTest(.{ .root_module = cmd_test_mod, .filters = &.{ "cmd.cli.maintenance.", "cmd.cli.index_maintenance_replay." } });
     b.step("antfly-index-maintenance-cli-test", "Run existing and relational index maintenance CLI contracts").dependOn(&addFilteredTestRunArtifact(b, index_maintenance_cli_tests).step);
 

@@ -37,3 +37,25 @@ test "public API request body limit matches Go linear merge contract" {
     try std.testing.expect(max_graph_hydrated_bindings <= 10_000);
     try std.testing.expectEqual(@as(usize, 10_000), max_graph_result_items);
 }
+
+/// Public per-request controls. Durations travel as remaining milliseconds,
+/// never as a monotonic timestamp from a different process or clock domain.
+pub const Execution = struct {
+    pub const timeout_header = "x-antfly-timeout-ms";
+    pub const scan_rows_header = "x-antfly-sql-scan-rows";
+    pub const memory_header = "x-antfly-sql-memory-bytes";
+    pub const spill_header = "x-antfly-sql-spill-bytes";
+    pub const max_timeout_ms: u64 = 30 * 60 * 1000;
+
+    pub fn positive(raw: []const u8, maximum: u64) !u64 {
+        const value = std.fmt.parseUnsigned(u64, raw, 10) catch return error.InvalidExecutionBudget;
+        if (value == 0 or value > maximum) return error.InvalidExecutionBudget;
+        return value;
+    }
+};
+
+test "public execution budgets reject unbounded malformed and overflowing controls" {
+    try std.testing.expectEqual(@as(u64, 12), try Execution.positive("12", 20));
+    for ([_][]const u8{ "0", "-1", "20ms", "21", "18446744073709551616" }) |raw|
+        try std.testing.expectError(error.InvalidExecutionBudget, Execution.positive(raw, 20));
+}
