@@ -601,41 +601,47 @@ fn tableListFatal(err: anyerror) noreturn {
     }
 }
 
+pub const usage =
+    \\usage:
+    \\  antfly backup --table <name> --backup-id <id> --connection <id> --location <uri> [--format native|portable] [--out <backup.afb>] [--url <url>]
+    \\  antfly backup --tables <a,b> --backup-id <id> --connection <id> --location <uri> [--format native|portable] [--url <url>]
+    \\  antfly backup --list --connection <id> --location <uri> [--limit <1-1000>] [--cursor <cursor>] [--output json] [--url <url>]
+    \\
+    \\  antfly backup inspect --input FILE [--destination-capabilities FILE] [--max-input-bytes N] [--max-expanded-bytes N]
+    \\
+    \\notes:
+    \\  Network backups are written by the server through the named connection.
+    \\  --connection names an entry in the server's connections configuration.
+    \\  It must grant backup.write (and restore.read to restore). For example:
+    \\    {"connections":{"bk":{"kind":"external_io","capabilities":["backup.write","restore.read"],"external_io":{"protocol":"filesystem","root":"/srv/backups"}}}}
+    \\  Use --connection bk --location file:///srv/backups with this configuration.
+    \\  Table and cluster backups default to the portable format.
+    \\  Backup listing returns one page and includes next_cursor when more results remain.
+    \\  `--out` packages a native backup from a shared file:// location as a self-contained AFB2 artifact.
+    \\  Use `antfly lite backup <db.aflite> --out <backup.afb>` for a local portable AFB2 artifact.
+    \\
+;
+
 fn printBackupUsage() void {
-    std.debug.print(
-        \\usage:
-        \\  antfly backup --table <name> --backup-id <id> --connection <id> --location <uri> [--format native|portable] [--out <backup.afb>] [--url <url>]
-        \\  antfly backup --tables <a,b> --backup-id <id> --connection <id> --location <uri> [--format native|portable] [--url <url>]
-        \\  antfly backup --list --connection <id> --location <uri> [--limit <1-1000>] [--cursor <cursor>] [--output json] [--url <url>]
-        \\
-        \\notes:
-        \\  Network backups are written by the server through the named connection.
-        \\  --connection names an entry in the server's connections configuration.
-        \\  It must grant backup.write (and restore.read to restore). For example:
-        \\    {{"connections":{{"bk":{{"kind":"external_io","capabilities":["backup.write","restore.read"],"external_io":{{"protocol":"filesystem","root":"/srv/backups"}}}}}}}}
-        \\  Use --connection bk --location file:///srv/backups with this configuration.
-        \\  Table and cluster backups default to the portable format.
-        \\  Backup listing returns one page and includes next_cursor when more results remain.
-        \\  `--out` packages a native backup from a shared file:// location as a self-contained AFB2 artifact.
-        \\  Use `antfly lite backup <db.aflite> --out <backup.afb>` for a local portable AFB2 artifact.
-        \\
-    , .{});
+    std.debug.print("{s}", .{usage});
 }
 
+pub const restore_usage =
+    \\usage:
+    \\  antfly restore --table <name> --backup-id <id> --connection <id> --location <uri> [--idempotency-key <key>] [--wait] [--wait-timeout <seconds>] [--url <url>]
+    \\  antfly restore --tables <a,b> --backup-id <id> --connection <id> --location <uri> [--mode <mode>] [--idempotency-key <key>] [--wait] [--wait-timeout <seconds>] [--url <url>]
+    \\  antfly restore --input <db.aflite|backup.afb|backup.afb2> --table <name> --connection <id> --location <shared-uri> [--backup-id <id>] [--idempotency-key <key>] [--wait] [--wait-timeout <seconds>] [--url <url>]
+    \\
+    \\notes:
+    \\  `--input` auto-detects AFB1 portable, AFB2 portable, or AFB2 native.
+    \\  Native input must be a self-contained full bundle.
+    \\  Input restore requires a location writable by this client and readable
+    \\  by the target's named connection. These may use different credentials.
+    \\
+;
+
 fn printRestoreUsage() void {
-    std.debug.print(
-        \\usage:
-        \\  antfly restore --table <name> --backup-id <id> --connection <id> --location <uri> [--idempotency-key <key>] [--wait] [--wait-timeout <seconds>] [--url <url>]
-        \\  antfly restore --tables <a,b> --backup-id <id> --connection <id> --location <uri> [--mode <mode>] [--idempotency-key <key>] [--wait] [--wait-timeout <seconds>] [--url <url>]
-        \\  antfly restore --input <db.aflite|backup.afb|backup.afb2> --table <name> --connection <id> --location <shared-uri> [--backup-id <id>] [--idempotency-key <key>] [--wait] [--wait-timeout <seconds>] [--url <url>]
-        \\
-        \\notes:
-        \\  `--input` auto-detects AFB1 portable, AFB2 portable, or AFB2 native.
-        \\  Native input must be a self-contained full bundle.
-        \\  Input restore requires a location writable by this client and readable
-        \\  by the target's named connection. These may use different credentials.
-        \\
-    , .{});
+    std.debug.print("{s}", .{restore_usage});
 }
 
 fn nextRequired(args: *std.process.Args.Iterator) ![]const u8 {
