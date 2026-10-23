@@ -22,6 +22,9 @@ Usage:
     # Start server automatically:
     ANTFLY_BIN=./zig-out/bin/antfly uv run --project e2e/inference pytest e2e/inference
 
+    # Use the optimized standalone inference executable for real-model tests:
+    ANTFLY_INFERENCE_SERVER_BIN=./zig-out/bin/antfly-inference-http-server uv run --project e2e/inference pytest e2e/inference
+
     # Custom AI and ML directories:
     ANTFLY_INFERENCE_MODELS_DIR=/path/to/models uv run --project e2e/inference pytest e2e/inference
     ANTFLY_INFERENCE_ML_DIR=/path/to/ml uv run --project e2e/inference pytest e2e/inference
@@ -65,7 +68,7 @@ import requests
 from .models import (
     DEFAULT_EXTRACTOR_MODEL,
     bootstrap_models_for_listing,
-    inference_command,
+    inference_server_command,
     maybe_pull_missing_model,
     ml_dir,
     models_dir,
@@ -608,7 +611,7 @@ def base_url():
         return
 
     try:
-        command_prefix = inference_command()
+        command_prefix = inference_server_command()
     except RuntimeError:
         pytest.skip("Set ANTFLY_INFERENCE_URL or ANTFLY_BIN to run E2E tests")
 
