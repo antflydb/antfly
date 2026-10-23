@@ -240,6 +240,12 @@ def run(args, model, label, mode, concurrency, output):
         env["TERMITE_METAL_FLORENCE2_ENCODER_MIRRORS"] = "1"
     elif args.disable_florence_encoder_mirrors:
         env["TERMITE_METAL_FLORENCE2_ENCODER_MIRRORS"] = "0"
+    if args.disable_prefill_pack_reuse:
+        env["TERMITE_METAL_DISABLE_LIGHTONOCR3_PREFILL_PACK_REUSE"] = "1"
+    if args.disable_wide_mpp:
+        env["TERMITE_METAL_DISABLE_LIGHTONOCR3_WIDE_MPP"] = "1"
+    if args.disable_wide_projection_tiles:
+        env["TERMITE_METAL_DISABLE_LIGHTONOCR3_WIDE_PROJECTION_TILES"] = "1"
     if args.bf16_projection_inputs:
         env["TERMITE_METAL_LIGHTONOCR3_BF16_ACTIVATIONS"] = "1"
     if args.disable_batch_projections:
@@ -389,6 +395,30 @@ def run(args, model, label, mode, concurrency, output):
                             key: sum(int(row[index]) for row in frames)
                             for index, key in enumerate(("frames", "gpu_ns", "wait_ns"))
                         }
+                    for counter in (
+                        "prepared_blocks",
+                        "wide_projection_tiles",
+                        "wide_mpp_projections",
+                        "wide_mpp_heads",
+                        "executor_steps",
+                        "executor_tail_steps",
+                        "activation_pool_hits",
+                        "activation_pool_peak_bytes",
+                        "activation_pool_duplicate_retirements",
+                        "phase_gate_wait_ns",
+                    ):
+                        values = [
+                            int(value)
+                            for value in re.findall(
+                                rf"LIGHTONOCR3 {counter}=(\d+)", section
+                            )
+                        ]
+                        sample[counter] = (
+                            max(values, default=0)
+                            if counter.endswith("_peak_bytes")
+                            or counter == "phase_gate_wait_ns"
+                            else sum(values)
+                        )
                     sample["packed_core_rows_observed"] = sorted(
                         {
                             int(row)
@@ -449,7 +479,8 @@ def run(args, model, label, mode, concurrency, output):
                 result["status"] = "frame_policy_requires_rounds"
             for sample in rounds:
                 enabled = sample["policy"] == "flags" or (
-                    sample["policy"] == "current" and args.frame_policy
+                    (sample["policy"] == "current" and args.frame_policy)
+                    or sample["policy"].startswith("engine")
                 )
                 if enabled != (sample["frame_policy_snapshots"] > 0):
                     result["status"] = "frame_policy_control_mismatch"
@@ -690,6 +721,20 @@ def main():
             "direct",
             "copykernel",
             "current",
+            "enginebase",
+            "engineplan",
+            "engineworker",
+            "engineall",
+            "enginepool",
+            "enginecached",
+            "enginephase",
+            "enginepoolphase",
+            "enginefull",
+            "enginetail",
+            "enginetailfair",
+            "enginefullfair",
+            "engineepoch",
+            "enginetailepoch",
         ],
     )
     parser.add_argument("--prefill-core-norm", action="store_true", default=None)
@@ -765,6 +810,9 @@ def main():
     parser.add_argument("--florence-encoder-mirrors", action="store_true")
     parser.add_argument("--disable-florence-encoder-mirrors", action="store_true")
     parser.add_argument("--bf16-projection-inputs", action="store_true")
+    parser.add_argument("--disable-wide-mpp", action="store_true")
+    parser.add_argument("--disable-prefill-pack-reuse", action="store_true")
+    parser.add_argument("--disable-wide-projection-tiles", action="store_true")
     parser.add_argument("--native-read-batch-size", type=int, default=8)
     parser.add_argument("--memory-gib", type=int, default=13)
     parser.add_argument("--shared-memory-gib", type=int, default=24)
@@ -810,14 +858,14 @@ def main():
         parser.error("direct KV prefill requires --prefill-sg-attention")
     if args.policy_rounds and len(args.policy_rounds) > 16:
         parser.error("at most 16 policy rounds are supported")
-    if args.requests < 1 or any(c < 1 or c > 16 for c in args.concurrency):
-        parser.error("requests must be positive; concurrency must be 1..16")
+    if args.requests < 1 or any(c < 1 or c > 32 for c in args.concurrency):
+        parser.error("requests must be positive; concurrency must be 1..32")
     if args.admission_units < 1:
         parser.error("admission units must be positive")
-    if not 1 <= args.pages_per_request <= 8 or not 1 <= args.batch_rows <= 8:
-        parser.error("pages per request and batch rows must be 1..8")
-    if not 1 <= args.batch_window <= 16:
-        parser.error("batch window must be 1..16")
+    if not 1 <= args.pages_per_request <= 8 or not 1 <= args.batch_rows <= 16:
+        parser.error("pages per request must be 1..8; batch rows must be 1..16")
+    if not 1 <= args.batch_window <= 32:
+        parser.error("batch window must be 1..32")
     if not 1 <= args.native_read_batch_size <= 8:
         parser.error("native read batch size must be 1..8")
     if args.florence_encoder_mirrors and args.disable_florence_encoder_mirrors:

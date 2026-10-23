@@ -250,6 +250,10 @@ pub const Config = struct {
     // Weight naming
     weight_prefix: []const u8 = "",
 
+    /// Runtime-only storage choice for the native LightOn reader epoch.
+    /// Recurrent histories remain separately allocated for every linear layer.
+    compact_qwen35_kv: bool = false,
+
     pub fn effectiveKVHeads(self: Config) u32 {
         return if (self.num_key_value_heads > 0) self.num_key_value_heads else self.num_attention_heads;
     }
@@ -501,6 +505,32 @@ pub const Config = struct {
         if (self.gemma4_mtp_assistant) return layer_index < self.num_hidden_layers;
         if (self.num_kv_shared_layers == 0) return false;
         return layer_index >= self.num_hidden_layers - self.num_kv_shared_layers;
+    }
+
+    pub fn usesCompactQwen35Kv(self: Config) bool {
+        if (!self.compact_qwen35_kv or !self.hasQwen35VisionArchitectureContract()) return false;
+        for (0..self.num_hidden_layers) |layer| if (!self.layerUsesQwen35LinearAttention(layer)) return true;
+        return false;
+    }
+
+    pub fn kvStorageLayerCount(self: Config) usize {
+        if (!self.usesCompactQwen35Kv()) return self.num_hidden_layers;
+        var count: usize = 0;
+        for (0..self.num_hidden_layers) |layer| if (!self.layerUsesQwen35LinearAttention(layer)) {
+            count += 1;
+        };
+        return count;
+    }
+
+    pub fn kvStorageLayerIndex(self: Config, layer: usize) ?usize {
+        if (!self.usesCompactQwen35Kv()) return layer;
+        if (layer >= self.num_hidden_layers) return null;
+        if (self.layerUsesQwen35LinearAttention(layer)) return null;
+        var count: usize = 0;
+        for (0..layer) |previous| if (!self.layerUsesQwen35LinearAttention(previous)) {
+            count += 1;
+        };
+        return count;
     }
 
     pub fn layerSharesKv(self: Config, layer_index: usize) bool {

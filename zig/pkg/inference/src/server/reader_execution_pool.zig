@@ -24,6 +24,7 @@ pub const Pool = struct {
     context: ?*anyopaque = null,
     users: usize = 0,
     joins: usize = 0,
+    max_epoch_joins: usize = 64,
     destroy_fn: ?*const fn (*anyopaque) void = null,
 
     pub const Lease = struct {
@@ -39,23 +40,33 @@ pub const Pool = struct {
                 self.owner.context = null;
                 self.owner.destroy_fn = null;
                 self.owner.joins = 0;
+                self.owner.max_epoch_joins = 64;
             }
         }
     };
 
     pub fn join(self: *Pool, control: Control, capacity: usize, factory: *anyopaque, create: *const fn (*anyopaque) anyerror!*anyopaque, destroy: *const fn (*anyopaque) void) !Lease {
-        if (capacity == 0 or capacity > 16) return error.InvalidReaderCapacity;
+        return self.joinBounded(control, capacity, 64, factory, create, destroy);
+    }
+
+    pub fn joinBounded(self: *Pool, control: Control, capacity: usize, max_epoch_joins: usize, factory: *anyopaque, create: *const fn (*anyopaque) anyerror!*anyopaque, destroy: *const fn (*anyopaque) void) !Lease {
+        if (capacity == 0 or capacity > 32 or max_epoch_joins < capacity or max_epoch_joins > 256) return error.InvalidReaderCapacity;
         while (true) {
             try control.lock(&self.mutex);
+            if (self.context != null and self.max_epoch_joins != max_epoch_joins) {
+                self.mutex.unlock();
+                return error.InvalidReaderCapacity;
+            }
             // Bound each epoch as well as its instantaneous occupancy so a
             // permanent stream cannot monopolize the model execution lane.
-            if (self.users < capacity and (self.context == null or self.joins < 64)) {
+            if (self.users < capacity and (self.context == null or self.joins < self.max_epoch_joins)) {
                 if (self.context == null) {
                     self.context = create(factory) catch |err| {
                         self.mutex.unlock();
                         return err;
                     };
                     self.destroy_fn = destroy;
+                    self.max_epoch_joins = max_epoch_joins;
                 }
                 self.users += 1;
                 self.joins += 1;
@@ -124,16 +135,17 @@ test "LightOnOCR3 shared reader pool rejects canceled joins and unwinds failed c
 /// One serialized workspace peak held until the shared runtime is destroyed.
 /// The caller serializes growth; each successful increment retains its exact
 /// admission lease, so cancellation and later page retirement cannot uncharge
-/// a workspace still owned by peers. An epoch accepts at most 64 page joins.
+/// a workspace still owned by peers. An explicitly extended epoch accepts at most 256 page joins.
 pub fn SharedPeak(comptime Lease: type) type {
     return struct {
         bytes: usize = 0,
         count: usize = 0,
-        leases: [64]Lease = undefined,
+        max_increments: usize = 64,
+        leases: [256]Lease = undefined,
 
         pub fn grow(self: *@This(), target: usize, context: anytype, comptime acquire: anytype) !void {
             if (target <= self.bytes) return;
-            if (self.count == self.leases.len) return error.ResourceLimitExceeded;
+            if (self.count >= @min(self.max_increments, self.leases.len)) return error.ResourceLimitExceeded;
             const lease = try acquire(context, target - self.bytes);
             self.leases[self.count] = lease;
             self.count += 1;
@@ -179,4 +191,89 @@ test "LightOnOCR3 shared vision peak preserves caps and reservations across page
     try std.testing.expectEqual(@as(usize, 0), peak.count);
     for (1..65) |target| try peak.grow(target, &controller, Factory.acquire);
     try std.testing.expectError(error.ResourceLimitExceeded, peak.grow(65, &controller, Factory.acquire));
+}
+
+test "LightOnOCR3 logical window keeps thirty-two independent leases bounded" {
+    const Fake = struct {
+        created: usize = 0,
+        destroyed: usize = 0,
+        fn create(raw: *anyopaque) !*anyopaque {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.created += 1;
+            return raw;
+        }
+        fn destroy(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.destroyed += 1;
+        }
+    };
+    var fake = Fake{};
+    var pool = Pool{};
+    try std.testing.expectError(error.InvalidReaderCapacity, pool.join(.{}, 33, &fake, Fake.create, Fake.destroy));
+    var leases: [32]Pool.Lease = undefined;
+    for (&leases) |*lease| lease.* = try pool.join(.{}, 32, &fake, Fake.create, Fake.destroy);
+    try std.testing.expectEqual(@as(usize, 32), pool.users);
+    try std.testing.expectEqual(@as(usize, 1), fake.created);
+    for (1..32) |i| {
+        leases[i].release();
+        leases[i] = try pool.join(.{}, 32, &fake, Fake.create, Fake.destroy);
+        try std.testing.expectEqual(leases[0].context, leases[i].context);
+    }
+    try std.testing.expectEqual(@as(usize, 0), fake.destroyed);
+    for (&leases) |*lease| lease.release();
+    try std.testing.expectEqual(@as(usize, 1), fake.destroyed);
+    try std.testing.expect(pool.context == null and pool.users == 0);
+}
+
+test "LightOnOCR3 extended epoch refills beyond sixty-four pages without changing its bound" {
+    const Fake = struct {
+        created: usize = 0,
+        destroyed: usize = 0,
+        fn create(raw: *anyopaque) !*anyopaque {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.created += 1;
+            return raw;
+        }
+        fn destroy(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.destroyed += 1;
+        }
+    };
+    var fake = Fake{};
+    var pool = Pool{};
+    try std.testing.expectError(error.InvalidReaderCapacity, pool.joinBounded(.{}, 2, 257, &fake, Fake.create, Fake.destroy));
+    var long = try pool.joinBounded(.{}, 2, 256, &fake, Fake.create, Fake.destroy);
+    for (0..200) |_| {
+        var page = try pool.joinBounded(.{}, 2, 256, &fake, Fake.create, Fake.destroy);
+        try std.testing.expectEqual(long.context, page.context);
+        page.release();
+    }
+    try std.testing.expectEqual(@as(usize, 201), pool.joins);
+    try std.testing.expectEqual(@as(usize, 1), fake.created);
+    try std.testing.expectEqual(@as(usize, 0), fake.destroyed);
+    try std.testing.expectError(error.InvalidReaderCapacity, pool.join(.{}, 2, &fake, Fake.create, Fake.destroy));
+    long.release();
+    try std.testing.expectEqual(@as(usize, 1), fake.destroyed);
+    var ordinary = try pool.join(.{}, 2, &fake, Fake.create, Fake.destroy);
+    try std.testing.expectEqual(@as(usize, 64), pool.max_epoch_joins);
+    ordinary.release();
+}
+
+test "LightOnOCR3 extended epoch retains every vision increment until teardown" {
+    const memory = @import("../runtime/tier/memory.zig");
+    const Factory = struct {
+        fn acquire(controller: *memory.AdmissionController, bytes: usize) !memory.AdmissionLease {
+            return controller.tryAcquire(.gpu, .{ .backend_limit_bytes = 300, .scratch_limit_bytes = 300 }, .{ .backend_scratch_bytes = bytes }, false);
+        }
+    };
+    var controller = memory.AdmissionController{};
+    defer controller.deinit();
+    var peak = SharedPeak(memory.AdmissionLease){ .max_increments = 256 };
+    defer peak.deinit();
+    for (1..257) |target| try peak.grow(target, &controller, Factory.acquire);
+    try std.testing.expectEqual(@as(usize, 256), controller.admitted.backend_scratch_bytes);
+    try std.testing.expectError(error.ResourceLimitExceeded, peak.grow(257, &controller, Factory.acquire));
+    try std.testing.expectEqual(@as(usize, 256), peak.bytes);
+    peak.deinit();
+    try std.testing.expectEqual(@as(usize, 0), controller.admitted.backend_scratch_bytes);
 }

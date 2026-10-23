@@ -24,6 +24,7 @@ import argparse
 import base64
 import json
 import os
+import re
 import signal
 import socket
 import subprocess
@@ -36,6 +37,39 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from benchmark_antfly_readers import checkpoint, digest, hardware
+
+
+def cache_override_admission(startup_log, requested):
+    """Reject explicit capacities above the server's own probed safe limit."""
+    if requested is None:
+        return {"mode": "automatic", "admitted": True}
+    matches = re.findall(
+        r"Overriding num_gpu_blocks=(\d+) with num_gpu_blocks_override=(\d+)",
+        startup_log,
+    )
+    if not matches:
+        return {
+            "mode": "explicit",
+            "requested_blocks": requested,
+            "admitted": False,
+            "reason": "Server did not report its automatic capacity before override",
+        }
+    probes = [
+        {"automatic_blocks": int(a), "override_blocks": int(b)} for a, b in matches
+    ]
+    admitted = all(
+        p["override_blocks"] == requested and requested <= p["automatic_blocks"]
+        for p in probes
+    )
+    return {
+        "mode": "explicit",
+        "requested_blocks": requested,
+        "probes": probes,
+        "admitted": admitted,
+        "reason": "Within every reported automatic capacity"
+        if admitted
+        else "Override exceeds automatic capacity or disagrees with request",
+    }
 
 
 def main():
@@ -56,8 +90,8 @@ def main():
     parser.add_argument("--startup-timeout", type=int, default=240)
     parser.add_argument("--output-dir", type=Path, required=True)
     args = parser.parse_args()
-    if args.requests < 1 or any(c < 1 or c > 16 for c in args.concurrency):
-        parser.error("requests must be positive; concurrency must be 1..16")
+    if args.requests < 1 or any(c < 1 or c > 32 for c in args.concurrency):
+        parser.error("requests must be positive; concurrency must be 1..32")
     if args.kv_cache_blocks is not None and args.kv_cache_blocks < 1:
         parser.error("kv-cache-blocks must be positive")
     args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -112,6 +146,7 @@ def main():
         "versions": versions,
         "command": command,
         "kv_cache_block_override": args.kv_cache_blocks,
+        "benchmark_script_sha256": digest(Path(__file__)),
         "model": checkpoint(args.model_dir.resolve()),
         "images": [
             {"path": str(p.resolve()), "sha256": digest(p)} for p in args.images
@@ -204,6 +239,16 @@ def main():
                     if time.monotonic() >= deadline:
                         raise TimeoutError("Server startup timeout; see server.txt")
                     time.sleep(0.5)
+            log.flush()
+            admission = cache_override_admission(
+                (args.output_dir / "server.txt").read_text(), args.kv_cache_blocks
+            )
+            report["cache_override_admission"] = admission
+            save()
+            if not admission["admitted"]:
+                raise RuntimeError(
+                    "Unsafe or unverifiable KV cache override: " + admission["reason"]
+                )
             references = [request(i) for i in range(len(payloads))]
             report["references"] = references
             report["status"] = "running"

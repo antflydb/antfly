@@ -7572,7 +7572,7 @@ pub const Node = struct {
 
     fn benchmarkConcurrentOcr(node: *Node, model_dir: []const u8, fixture: []const u8, max_tokens: usize) !void {
         const concurrency = platform.env.getenvUsize("ANTFLY_TEST_LIGHTONOCR3_CONCURRENCY") orelse return;
-        if (concurrency == 0 or concurrency > 16) return error.InvalidBenchmarkConcurrency;
+        if (concurrency == 0 or concurrency > 32) return error.InvalidBenchmarkConcurrency;
         const requests = platform.env.getenvUsize("ANTFLY_TEST_LIGHTONOCR3_REQUESTS") orelse 16;
         const pages_per_request = platform.env.getenvUsize("ANTFLY_TEST_LIGHTONOCR3_PAGES_PER_REQUEST") orelse 1;
         if (requests == 0 or pages_per_request == 0 or pages_per_request > 8) return error.InvalidBenchmarkConcurrency;
@@ -7638,6 +7638,15 @@ pub const Node = struct {
             "TERMITE_METAL_DISABLE_LIGHTONOCR3_WEIGHT_HANDLES",
             "ANTFLY_LIGHTONOCR3_DISABLE_GATE_PARK",
             "TERMITE_METAL_ENABLE_LIGHTONOCR3_FRAME_POLICY",
+            "ANTFLY_LIGHTONOCR3_PREPARED_DECODE",
+            "ANTFLY_LIGHTONOCR3_EXECUTOR",
+            "ANTFLY_LIGHTONOCR3_STEP_EVENTS",
+            "ANTFLY_LIGHTONOCR3_DECODE_WORKSPACE",
+            "ANTFLY_LIGHTONOCR3_ACTIVATION_POOL",
+            "ANTFLY_LIGHTONOCR3_PHASE_PARK",
+            "ANTFLY_LIGHTONOCR3_EXECUTOR_TAIL",
+            "ANTFLY_LIGHTONOCR3_PHASE_FAIR",
+            "ANTFLY_LIGHTONOCR3_EPOCH_AUX",
         };
         const Env = struct {
             extern "c" fn setenv([*:0]const u8, [*:0]const u8, c_int) c_int;
@@ -7668,7 +7677,8 @@ pub const Node = struct {
                 if (rc != 0) return error.EnvironmentMutationFailed;
             }
             if (!std.mem.eql(u8, policy, "current")) {
-                const all = std.mem.eql(u8, policy, "on") or std.mem.eql(u8, policy, "coalesced") or std.mem.eql(u8, policy, "static") or std.mem.eql(u8, policy, "batched") or std.mem.eql(u8, policy, "window8") or std.mem.eql(u8, policy, "spin") or std.mem.eql(u8, policy, "copyoff") or std.mem.eql(u8, policy, "direct") or std.mem.eql(u8, policy, "copykernel") or std.mem.eql(u8, policy, "pipelineoff") or std.mem.eql(u8, policy, "packedoff") or std.mem.eql(u8, policy, "readyoff") or std.mem.eql(u8, policy, "visionoff") or std.mem.eql(u8, policy, "ready") or std.mem.eql(u8, policy, "handlesoff") or std.mem.eql(u8, policy, "default") or std.mem.eql(u8, policy, "gateoff") or std.mem.eql(u8, policy, "flags");
+                const engine = std.mem.eql(u8, policy, "engineepoch") or std.mem.eql(u8, policy, "enginetailepoch") or std.mem.eql(u8, policy, "enginetailfair") or std.mem.eql(u8, policy, "enginefullfair") or std.mem.eql(u8, policy, "enginetail") or std.mem.eql(u8, policy, "enginephase") or std.mem.eql(u8, policy, "enginepoolphase") or std.mem.eql(u8, policy, "enginefull") or std.mem.eql(u8, policy, "enginepool") or std.mem.eql(u8, policy, "enginecached") or std.mem.eql(u8, policy, "enginebase") or std.mem.eql(u8, policy, "engineplan") or std.mem.eql(u8, policy, "engineworker") or std.mem.eql(u8, policy, "engineall");
+                const all = engine or std.mem.eql(u8, policy, "on") or std.mem.eql(u8, policy, "coalesced") or std.mem.eql(u8, policy, "static") or std.mem.eql(u8, policy, "batched") or std.mem.eql(u8, policy, "window8") or std.mem.eql(u8, policy, "spin") or std.mem.eql(u8, policy, "copyoff") or std.mem.eql(u8, policy, "direct") or std.mem.eql(u8, policy, "copykernel") or std.mem.eql(u8, policy, "pipelineoff") or std.mem.eql(u8, policy, "packedoff") or std.mem.eql(u8, policy, "readyoff") or std.mem.eql(u8, policy, "visionoff") or std.mem.eql(u8, policy, "ready") or std.mem.eql(u8, policy, "handlesoff") or std.mem.eql(u8, policy, "default") or std.mem.eql(u8, policy, "gateoff") or std.mem.eql(u8, policy, "flags");
                 const recurrent = all or std.mem.eql(u8, policy, "recurrent");
                 const attention = all or std.mem.eql(u8, policy, "attention");
                 const norm = all or std.mem.eql(u8, policy, "norm");
@@ -7694,14 +7704,33 @@ pub const Node = struct {
                 if (Env.setenv(policy_flags[22], if (std.mem.eql(u8, policy, "gateoff") or std.mem.eql(u8, policy, "pipelineoff")) "1" else "0", 1) != 0) return error.EnvironmentMutationFailed;
                 if (Env.setenv(policy_flags[23], if (std.mem.eql(u8, policy, "flags")) "1" else "0", 1) != 0) return error.EnvironmentMutationFailed;
             }
+            if (std.mem.startsWith(u8, policy, "engine")) {
+                const flags = [_][:0]const u8{ "TERMITE_METAL_ENABLE_LIGHTONOCR3_RECURRENT_COALESCING", "TERMITE_METAL_ENABLE_LIGHTONOCR3_FRAME_POLICY", "ANTFLY_LIGHTONOCR3_READY_COHORTS", "ANTFLY_LIGHTONOCR3_STEP_EVENTS", "ANTFLY_LIGHTONOCR3_DECODE_WORKSPACE" };
+                for (flags) |flag| if (Env.setenv(flag, "1", 1) != 0) return error.EnvironmentMutationFailed;
+                if (Env.setenv("ANTFLY_LIGHTONOCR3_PREPARED_DECODE", if (std.mem.eql(u8, policy, "engineplan") or std.mem.eql(u8, policy, "engineall") or std.mem.eql(u8, policy, "enginecached") or std.mem.eql(u8, policy, "enginefull") or std.mem.eql(u8, policy, "enginetail") or std.mem.eql(u8, policy, "enginetailfair") or std.mem.eql(u8, policy, "enginefullfair") or std.mem.eql(u8, policy, "engineepoch") or std.mem.eql(u8, policy, "enginetailepoch")) "1" else "0", 1) != 0 or
+                    Env.setenv("ANTFLY_LIGHTONOCR3_EXECUTOR", if (std.mem.eql(u8, policy, "engineworker") or std.mem.eql(u8, policy, "engineall") or std.mem.eql(u8, policy, "enginecached") or std.mem.eql(u8, policy, "enginefull") or std.mem.eql(u8, policy, "enginetail") or std.mem.eql(u8, policy, "enginetailfair") or std.mem.eql(u8, policy, "enginefullfair") or std.mem.eql(u8, policy, "engineepoch") or std.mem.eql(u8, policy, "enginetailepoch")) "1" else "0", 1) != 0) return error.EnvironmentMutationFailed;
+                if (Env.setenv("ANTFLY_LIGHTONOCR3_ACTIVATION_POOL", if (std.mem.eql(u8, policy, "enginepool") or std.mem.eql(u8, policy, "enginecached") or std.mem.eql(u8, policy, "enginepoolphase") or std.mem.eql(u8, policy, "enginefull") or std.mem.eql(u8, policy, "enginetail") or std.mem.eql(u8, policy, "enginetailfair") or std.mem.eql(u8, policy, "enginefullfair") or std.mem.eql(u8, policy, "engineepoch") or std.mem.eql(u8, policy, "enginetailepoch")) "1" else "0", 1) != 0) return error.EnvironmentMutationFailed;
+            }
+            if (std.mem.startsWith(u8, policy, "engine")) {
+                if (Env.setenv("ANTFLY_LIGHTONOCR3_PHASE_PARK", if (std.mem.eql(u8, policy, "enginephase") or std.mem.eql(u8, policy, "enginepoolphase") or std.mem.eql(u8, policy, "enginefull") or std.mem.eql(u8, policy, "enginetail") or std.mem.eql(u8, policy, "enginetailfair") or std.mem.eql(u8, policy, "enginefullfair") or std.mem.eql(u8, policy, "engineepoch") or std.mem.eql(u8, policy, "enginetailepoch")) "1" else "0", 1) != 0) return error.EnvironmentMutationFailed;
+            }
+            if (std.mem.startsWith(u8, policy, "engine")) {
+                if (Env.setenv("ANTFLY_LIGHTONOCR3_EXECUTOR_TAIL", if (std.mem.eql(u8, policy, "enginetail") or std.mem.eql(u8, policy, "enginetailfair") or std.mem.eql(u8, policy, "enginetailepoch")) "1" else "0", 1) != 0) return error.EnvironmentMutationFailed;
+            }
+            if (std.mem.startsWith(u8, policy, "engine")) {
+                if (Env.setenv("ANTFLY_LIGHTONOCR3_PHASE_FAIR", if (std.mem.eql(u8, policy, "enginetailfair") or std.mem.eql(u8, policy, "enginefullfair") or std.mem.eql(u8, policy, "engineepoch") or std.mem.eql(u8, policy, "enginetailepoch")) "1" else "0", 1) != 0) return error.EnvironmentMutationFailed;
+            }
+            if (std.mem.startsWith(u8, policy, "engine")) {
+                if (Env.setenv("ANTFLY_LIGHTONOCR3_EPOCH_AUX", if (std.mem.eql(u8, policy, "engineepoch") or std.mem.eql(u8, policy, "enginetailepoch")) "1" else "0", 1) != 0) return error.EnvironmentMutationFailed;
+            }
             std.debug.print("OCR_POLICY round={d} name={s}\n", .{ round, policy });
             const latencies = try allocator.alloc(u64, requests);
             defer allocator.free(latencies);
             @memset(latencies, 0);
             var start = std.atomic.Value(bool).init(false);
             var next_request = std.atomic.Value(usize).init(0);
-            var tasks: [16]ConcurrentOcrBenchTask = undefined;
-            var threads: [16]std.Thread = undefined;
+            var tasks: [32]ConcurrentOcrBenchTask = undefined;
+            var threads: [32]std.Thread = undefined;
             var spawned: usize = 0;
             var spawn_error: ?anyerror = null;
             const cpu_begin = benchmarkOcrProcessCpuNs();
@@ -7751,8 +7780,9 @@ pub const Node = struct {
         policy.allow_mixed_sequence_lengths = true;
         policy.max_decode_wait_us = @intCast(@min(platform.env.getenvUsize("ANTFLY_LIGHTONOCR3_DECODE_WAIT_US") orelse self.config.generation_batching.max_decode_wait_us, 10000));
         policy.decode_coalesce_rows = policy.max_step_items;
-        policy.decode_coalesce_ready_only = platform.env.getenvBool("ANTFLY_LIGHTONOCR3_READY_COHORTS") and !platform.env.getenvBool("ANTFLY_LIGHTONOCR3_WAIT_FOR_PREFILL_PEERS");
-        policy.contention_wait_us = @intCast(@min(platform.env.getenvUsize("ANTFLY_LIGHTONOCR3_CONTENTION_WAIT_US") orelse 100, 1000));
+        policy.decode_coalesce_ready_only = metal_runtime.lightOnThroughputFeatureEnabled("ANTFLY_LIGHTONOCR3_READY_COHORTS") and !platform.env.getenvBool("ANTFLY_LIGHTONOCR3_WAIT_FOR_PREFILL_PEERS");
+        policy.event_waits = metal_runtime.lightOnThroughputFeatureEnabled("ANTFLY_LIGHTONOCR3_STEP_EVENTS");
+        policy.contention_wait_us = @intCast(@min(platform.env.getenvUsize("ANTFLY_LIGHTONOCR3_CONTENTION_WAIT_US") orelse (if (metal_runtime.lightOnThroughputProfileEnabled()) @as(usize, 1000) else 100), 1000));
         return policy;
     }
 
@@ -7762,6 +7792,10 @@ pub const Node = struct {
         allocator: std.mem.Allocator,
         model: *model_manager_mod.LoadedModel,
         cfg: gpt_model_mod.Config,
+        features: ExecutionFeatures = .{},
+        auxiliary_lease: ?model_manager_mod.GenerationAdmissionLease = null,
+        auxiliary_ready: std.atomic.Value(bool) = .init(false),
+        auxiliary_acquisitions: usize = 0,
         budget: runtime.tier.memory.RunBudget,
         lane: execution_control_mod.ExecutionLane.Lease,
         coordinator: runtime.scheduler.native_generate.NativeGenerateCoordinator,
@@ -7770,10 +7804,17 @@ pub const Node = struct {
         pool: runtime.kv.block.KvPoolId = undefined,
         cb: ?ops.ComputeBackend = null,
         execution_gate_wait_ns: u64 = 0,
+        phase_wait_ns: u64 = 0,
+        phase_fair: bool = false,
+        phase_waiters: std.atomic.Value(usize) = .init(0),
+        phase_priority_yields: usize = 0,
+        published_vision_peak: std.atomic.Value(usize) = .init(0),
         step_mutex: std.atomic.Mutex = .unlocked,
+        step_gate: execution_control_mod.ExecutionLane = .{},
+        gate_events: bool = false,
         kv_mutex: std.atomic.Mutex = .unlocked,
         controls_mutex: std.atomic.Mutex = .unlocked,
-        controls: [16]?InferenceExecutionControl = @splat(null),
+        controls: [32]?InferenceExecutionControl = @splat(null),
         registered_pages: usize = 0,
         registered_window_peak: usize = 0,
         execution_id: u64,
@@ -7781,13 +7822,85 @@ pub const Node = struct {
         vision_broker: executor_microbatch.Broker,
         prefill_broker: executor_microbatch.Broker,
         vision_peak: reader_execution_pool.SharedPeak(model_manager_mod.GenerationAdmissionLease) = .{},
+        worker: ?std.Thread = null,
+        worker_io: ?std.Io.Threaded = null,
+        worker_wake: std.Io.Event = .unset,
+        worker_stop: std.atomic.Value(bool) = .init(false),
+        worker_control: InferenceExecutionControl = .{},
+        worker_kv_dtype: runtime.kv.pool.KvDType = undefined,
+        worker_steps: usize = 0,
+        worker_tail_steps: usize = 0,
 
+        const ExecutionFeatures = struct {
+            prepared: bool = false,
+            activation_pool: bool = false,
+            worker: bool = false,
+            epoch_auxiliary: bool = false,
+            single_frame: bool = false,
+            shared_core_weights: bool = false,
+            stream_first_layers: u8 = 0,
+            batch_attention: bool = false,
+
+            fn fromEnvironment() @This() {
+                const epoch_auxiliary = metal_runtime.lightOnThroughputFeatureEnabled("ANTFLY_LIGHTONOCR3_EPOCH_AUX");
+                return .{
+                    .prepared = metal_runtime.lightOnThroughputFeatureEnabled("ANTFLY_LIGHTONOCR3_PREPARED_DECODE"),
+                    .activation_pool = metal_runtime.lightOnThroughputFeatureEnabled("ANTFLY_LIGHTONOCR3_ACTIVATION_POOL"),
+                    .worker = metal_runtime.lightOnThroughputFeatureEnabled("ANTFLY_LIGHTONOCR3_EXECUTOR"),
+                    .epoch_auxiliary = epoch_auxiliary,
+                    .batch_attention = epoch_auxiliary and metal_runtime.lightOnThroughputFeatureEnabled("ANTFLY_LIGHTONOCR3_BATCH_ATTENTION"),
+                    .shared_core_weights = epoch_auxiliary and platform.env.getenvBool("ANTFLY_LIGHTONOCR3_SHARED_CORE_WEIGHTS"),
+                    .stream_first_layers = if (epoch_auxiliary and metal_runtime.lightOnThroughputFeatureEnabled("ANTFLY_LIGHTONOCR3_PREPARED_DECODE")) @intCast(@min(platform.env.getenvUsize("ANTFLY_LIGHTONOCR3_STREAM_FIRST_LAYERS") orelse 0, 16)) else 0,
+                    .single_frame = platform.env.getenvBool("ANTFLY_LIGHTONOCR3_SINGLE_FRAME"),
+                };
+            }
+            fn fromEnvironmentForModel(cfg: gpt_model_mod.Config) @This() {
+                var features = fromEnvironment();
+                features.shared_core_weights = features.epoch_auxiliary and platform.env.getenvBoolDefault("ANTFLY_LIGHTONOCR3_SHARED_CORE_WEIGHTS", metal_runtime.lightOnThroughputProfileEnabled() and cfg.hidden_size == 2560);
+                return features;
+            }
+            fn auxiliaryAmounts(features: @This()) runtime.tier.memory.AdmissionAmounts {
+                var amounts = runtime.tier.memory.AdmissionAmounts{};
+                // The same conservative envelopes as page admission. Only
+                // their owner changes: these allocations exist once per epoch.
+                if (features.prepared) {
+                    amounts.backend_scratch_bytes += 8 * 1024 * 1024;
+                    amounts.host_scratch_bytes += 1024 * 1024;
+                }
+                if (features.activation_pool) {
+                    amounts.backend_scratch_bytes += 8 * 1024 * 1024;
+                    amounts.host_scratch_bytes += 1024 * 1024;
+                }
+                if (features.worker) amounts.host_scratch_bytes += 32 * 1024 * 1024;
+                if (features.shared_core_weights) {
+                    amounts.backend_scratch_bytes += 8 * 1024 * 1024;
+                    amounts.host_scratch_bytes += 1024 * 1024;
+                }
+                if (features.batch_attention) {
+                    // Two 9 MiB banks permit one submitted prefix plus one
+                    // active suffix without reusing in-flight attention scratch.
+                    amounts.backend_scratch_bytes += 18 * 1024 * 1024;
+                    amounts.host_scratch_bytes += 1024 * 1024;
+                }
+                if (features.stream_first_layers != 0) {
+                    // Bound a prefix in flight while the suffix is encoded.
+                    amounts.backend_scratch_bytes += 8 * 1024 * 1024;
+                    amounts.host_scratch_bytes += 1024 * 1024;
+                }
+                return amounts;
+            }
+            fn needsAuxiliary(features: @This()) bool {
+                return features.epoch_auxiliary and (features.prepared or features.activation_pool or features.worker or features.shared_core_weights or features.stream_first_layers != 0 or features.batch_attention);
+            }
+        };
         const Factory = struct {
             node: *Node,
             model: *model_manager_mod.LoadedModel,
             cfg: gpt_model_mod.Config,
             limits: runtime.tier.memory.Limits,
             physical_rows_limit: usize,
+            epoch_page_limit: usize = 64,
+            features: ExecutionFeatures = .{},
             control: InferenceExecutionControl,
         };
         fn create(raw: *anyopaque) !*anyopaque {
@@ -7798,9 +7911,12 @@ pub const Node = struct {
             errdefer factory.model.unlockNativeGeneration();
             const a = std.heap.smp_allocator;
             const ctx = try a.create(LightOnStreamContext);
-            ctx.* = .{ .allocator = a, .model = factory.model, .cfg = factory.cfg, .budget = runtime.tier.memory.RunBudget.init(factory.limits), .lane = lane, .coordinator = runtime.scheduler.native_generate.NativeGenerateCoordinator.init(a), .manager = runtime.kv.manager.KvManager.init(a), .vision_broker = executor_microbatch.Broker.init(a), .prefill_broker = executor_microbatch.Broker.init(a), .execution_id = lighton_stream_execution_id.fetchAdd(1, .monotonic) };
+            ctx.* = .{ .allocator = a, .model = factory.model, .cfg = factory.cfg, .features = factory.features, .auxiliary_ready = .init(!factory.features.needsAuxiliary()), .budget = runtime.tier.memory.RunBudget.init(factory.limits), .lane = lane, .coordinator = runtime.scheduler.native_generate.NativeGenerateCoordinator.init(a), .manager = runtime.kv.manager.KvManager.init(a), .vision_peak = .{ .max_increments = factory.epoch_page_limit }, .vision_broker = executor_microbatch.Broker.init(a), .prefill_broker = executor_microbatch.Broker.init(a), .execution_id = lighton_stream_execution_id.fetchAdd(1, .monotonic) };
             ctx.coordinator.setPolicy(factory.node.lightOnOcrPolicy(factory.physical_rows_limit));
-            ctx.execution_gate_wait_ns = if (platform.env.getenvBool("ANTFLY_LIGHTONOCR3_DISABLE_GATE_PARK")) 0 else @as(u64, @min(ctx.coordinator.policy.contention_wait_us, 100)) * std.time.ns_per_us;
+            ctx.execution_gate_wait_ns = if (platform.env.getenvBool("ANTFLY_LIGHTONOCR3_DISABLE_GATE_PARK")) 0 else @as(u64, @min(ctx.coordinator.policy.contention_wait_us, 1000)) * std.time.ns_per_us;
+            ctx.phase_wait_ns = if (metal_runtime.lightOnThroughputFeatureEnabled("ANTFLY_LIGHTONOCR3_PHASE_PARK")) ctx.execution_gate_wait_ns else 0;
+            ctx.phase_fair = metal_runtime.lightOnThroughputFeatureEnabled("ANTFLY_LIGHTONOCR3_PHASE_FAIR");
+            ctx.gate_events = ctx.coordinator.usesStepEvents() and platform.env.getenvBoolDefault("ANTFLY_LIGHTONOCR3_GATE_EVENTS", true);
             // New prefill must progress, while already decoding pages retain
             // a bounded streak instead of losing every turn to new arrivals.
             ctx.coordinator.max_decode_streak_before_prefill = 4;
@@ -7809,15 +7925,53 @@ pub const Node = struct {
         fn destroy(raw: *anyopaque) void {
             const ctx: *LightOnStreamContext = @ptrCast(@alignCast(raw));
             std.debug.assert(ctx.registered_pages == 0);
+            // Published results can let the last caller retire while the
+            // executor is still freeing its own output. Join before the CB,
+            // coordinator, model lane, or worker-owned Io can be destroyed.
+            if (ctx.worker) |worker| {
+                ctx.worker_stop.store(true, .release);
+                ctx.worker_wake.set(ctx.worker_io.?.io());
+                worker.join();
+                ctx.coordinator.unregisterExecutor();
+                ctx.worker_io.?.deinit();
+                ctx.worker_io = null;
+            }
             if (platform.env.getenvBool("ANTFLY_BENCH_LIGHTONOCR3")) {
+                std.debug.print("LIGHTONOCR3 gate_events={d} gate_event_acquisitions={d} gate_event_waits={d}\n", .{ @intFromBool(ctx.gate_events), ctx.step_gate.acquisitions, ctx.step_gate.event_waits });
+                std.debug.print("LIGHTONOCR3 executor_steps={d}\n", .{ctx.worker_steps});
+                std.debug.print("LIGHTONOCR3 executor_tail_steps={d}\n", .{ctx.worker_tail_steps});
+                std.debug.print("LIGHTONOCR3 phase_priority_yields={d} phase_fair={d}\n", .{ ctx.phase_priority_yields, @intFromBool(ctx.phase_fair) });
+                const auxiliary = ctx.features.auxiliaryAmounts();
+                std.debug.print("LIGHTONOCR3 epoch_auxiliary={d} auxiliary_acquisitions={d} auxiliary_host_scratch={d} auxiliary_backend_scratch={d}\n", .{ @intFromBool(ctx.features.epoch_auxiliary), ctx.auxiliary_acquisitions, auxiliary.host_scratch_bytes, auxiliary.backend_scratch_bytes });
+                std.debug.print("LIGHTONOCR3 phase_gate_wait_ns={d}\n", .{ctx.phase_wait_ns});
                 const s = ctx.coordinator.stats;
                 if (ctx.cb) |cb| {
                     const t = cb.debugTimingSnapshot().provider;
+                    const pool_stats = if (comptime build_options.enable_metal) @import("../ops/metal_compute.zig").MetalCompute.lightOnActivationPoolStats(&cb) else @as([4]u64, @splat(0));
+                    std.debug.print("LIGHTONOCR3 activation_pool_hits={d}\nLIGHTONOCR3 activation_pool_peak_bytes={d}\nLIGHTONOCR3 activation_pool_duplicate_retirements={d}\n", .{ pool_stats[0], pool_stats[1], pool_stats[3] });
+                    const prepared_blocks = if (comptime build_options.enable_metal) @import("../ops/metal_compute.zig").MetalCompute.lightOnPreparedBlockCount(&cb) else 0;
+                    std.debug.print("LIGHTONOCR3 prepared_blocks={d}\n", .{prepared_blocks});
+                    const wide_tiles = if (comptime build_options.enable_metal) @import("../ops/metal_compute.zig").MetalCompute.lightOnWideProjectionTileCount(&cb) else 0;
+                    std.debug.print("LIGHTONOCR3 wide_projection_tiles={d}\n", .{wide_tiles});
+                    const prefill_pack = if (comptime build_options.enable_metal) @import("../ops/metal_compute.zig").MetalCompute.lightOnPrefillPackStats(&cb) else @as([2]u64, @splat(0));
+                    std.debug.print("LIGHTONOCR3 prefill_pack_calls={d} prefill_pack_reuse_hits={d}\n", .{ prefill_pack[0], prefill_pack[1] });
+                    const attention_batch = if (comptime build_options.enable_metal) @import("../ops/metal_compute.zig").MetalCompute.lightOnBatchAttentionStats(&cb) else @as([3]u64, @splat(0));
+                    std.debug.print("LIGHTONOCR3 attention_batch_calls={d} attention_batch_rows={d}\n", .{ attention_batch[0], attention_batch[1] });
+                    std.debug.print("LIGHTONOCR3 attention_batch_kernel_calls={d}\n", .{attention_batch[2]});
+                    const stream_splits = if (comptime build_options.enable_metal) @import("../ops/metal_compute.zig").MetalCompute.lightOnStreamSplits(&cb) else 0;
+                    std.debug.print("LIGHTONOCR3 stream_forward_splits={d} stream_first_layers={d}\n", .{ stream_splits, ctx.features.stream_first_layers });
+                    const core_weights = if (comptime build_options.enable_metal) @import("../ops/metal_compute.zig").MetalCompute.lightOnSharedCoreWeightStats(&cb) else @as([3]usize, @splat(0));
+                    std.debug.print("LIGHTONOCR3 shared_core_weight_hits={d} shared_core_weight_misses={d} shared_core_weight_bytes={d}\n", .{ core_weights[0], core_weights[1], core_weights[2] });
+                    const wide_mpp = if (comptime build_options.enable_metal) @import("../ops/metal_compute.zig").MetalCompute.lightOnWideMppStats(&cb) else @as([2]u64, @splat(0));
+                    std.debug.print("LIGHTONOCR3 wide_mpp_projections={d}\nLIGHTONOCR3 wide_mpp_heads={d}\n", .{ wide_mpp[0], wide_mpp[1] });
+                    const single_frame = if (comptime build_options.enable_metal) @import("../ops/metal_compute.zig").MetalCompute.lightOnSingleFrameStats(&cb) else @as([2]u64, @splat(0));
+                    std.debug.print("LIGHTONOCR3 single_frame_steps={d} single_frame_topology_mismatches={d}\n", .{ single_frame[0], single_frame[1] });
                     const snapshots = if (comptime build_options.enable_metal) @import("../ops/metal_compute.zig").MetalCompute.lightOnFramePolicySnapshots(&cb) else 0;
                     std.debug.print("LIGHTONOCR3 frame_policy_snapshots={d}\n", .{snapshots});
                     std.debug.print("LIGHTONOCR3 runtime_frames={d} frame_gpu_ns={d} frame_wait_ns={d}\n", .{ t.decoder_runtime_frame_submits, t.decoder_runtime_frame_gpu_nanos, t.decoder_runtime_frame_wait_nanos });
                 }
                 std.debug.print("LIGHTONOCR3 execution_gate_wait_ns={d}\n", .{ctx.execution_gate_wait_ns});
+                std.debug.print("LIGHTONOCR3 kv_storage_layers={d} model_layers={d}\n", .{ ctx.cfg.kvStorageLayerCount(), ctx.cfg.num_hidden_layers });
                 std.debug.print("LIGHTONOCR3 registered_window_peak={d} physical_rows_limit={d}\n", .{ ctx.registered_window_peak, ctx.coordinator.policy.max_step_items });
                 std.debug.print("LIGHTONOCR3 cohort_items={d} decode_steps={d} batched_steps={d} singleton_steps={d} decode_items={d}\n", .{ ctx.completed, s.step_batches_total, s.step_batch_size_2_total + s.step_batch_size_3_4_total + s.step_batch_size_5_8_total, s.step_singleton_batches_total, s.step_decode_items_total });
             }
@@ -7826,6 +7980,15 @@ pub const Node = struct {
             if (ctx.cb != null) ctx.storage.deinit();
             ctx.manager.deinit();
             if (ctx.cb) |*cb| cb.deinit();
+            // The worker has joined and the backend has released plans and
+            // cached activations. Admission waiters may have kept this epoch
+            // alive after its last admitted page retired; retain its own lease
+            // through that interval, independently of every page's lease.
+            if (ctx.auxiliary_lease) |*auxiliary| {
+                auxiliary.release();
+                ctx.auxiliary_lease = null;
+                if (platform.env.getenvBool("ANTFLY_BENCH_LIGHTONOCR3")) std.debug.print("LIGHTONOCR3 auxiliary_release_after_backend=1\n", .{});
+            }
             ctx.coordinator.deinit();
             if (platform.env.getenvBool("ANTFLY_BENCH_LIGHTONOCR3")) std.debug.print("LIGHTONOCR3 shared_vision_peak_bytes={d} peak_segments={d}\n", .{ ctx.vision_peak.bytes, ctx.vision_peak.count });
             ctx.vision_peak.deinit();
@@ -7836,14 +7999,58 @@ pub const Node = struct {
         fn acquireVisionPeak(factory: *Factory, bytes: usize) !model_manager_mod.GenerationAdmissionLease {
             return factory.node.model_manager.acquireGenerationResources(&.{.{ .session = factory.model.session, .resources = .{ .backend_class = .gpu, .limits = factory.limits, .amounts = .{ .backend_scratch_bytes = bytes } } }});
         }
+        fn finishPhaseWait(ctx: *LightOnStreamContext) void {
+            if (ctx.phase_waiters.fetchSub(1, .acq_rel) == 1) if (ctx.worker_io) |*owner| {
+                ctx.worker_wake.set(owner.io());
+            };
+        }
+        fn lockStep(ctx: *LightOnStreamContext, control: InferenceExecutionControl) !void {
+            if (ctx.phase_fair) _ = ctx.phase_waiters.fetchAdd(1, .acq_rel);
+            defer if (ctx.phase_fair) {
+                ctx.finishPhaseWait();
+            };
+            const queued = if (ctx.gate_events) try ctx.step_gate.acquireWithPriority(control, true) else null;
+            errdefer if (queued) |lease| lease.release();
+            try control.lockWithPoll(&ctx.step_mutex, ctx.phase_wait_ns);
+        }
+        fn lockStepForCleanup(ctx: *LightOnStreamContext) void {
+            if (ctx.phase_fair) _ = ctx.phase_waiters.fetchAdd(1, .acq_rel);
+            defer if (ctx.phase_fair) {
+                ctx.finishPhaseWait();
+            };
+            if (ctx.gate_events) {
+                _ = ctx.step_gate.acquireForCleanup(if (ctx.worker_io) |*owner| owner.io() else null, true);
+            }
+            if (ctx.phase_wait_ns == 0) return platform.sync.lockYielding(&ctx.step_mutex);
+            // Cleanup must retain stack-backed state until its owner releases
+            // the backend. An empty control cannot cancel this acquisition.
+            (InferenceExecutionControl{}).lockWithPoll(&ctx.step_mutex, ctx.phase_wait_ns) catch unreachable;
+        }
+        fn unlockStep(ctx: *LightOnStreamContext) void {
+            ctx.step_mutex.unlock();
+            if (ctx.gate_events) (execution_control_mod.ExecutionLane.Lease{ .lane = &ctx.step_gate }).release();
+        }
         fn admitPage(ctx: *LightOnStreamContext, factory: *Factory, peak: ?usize, amounts: runtime.tier.memory.AdmissionAmounts) !model_manager_mod.GenerationAdmissionLease {
-            if (peak) |bytes| {
-                try factory.control.lock(&ctx.step_mutex);
-                defer ctx.step_mutex.unlock();
-                try ctx.vision_peak.grow(bytes, factory, acquireVisionPeak);
+            // Resource-bearing choices are immutable for a shared backend.
+            if (!std.meta.eql(ctx.features, factory.features) or ctx.cfg.compact_qwen35_kv != factory.cfg.compact_qwen35_kv) return error.InvalidBatchDecodeState;
+            const needs_auxiliary = !ctx.auxiliary_ready.load(.acquire);
+            const needs_peak = if (peak) |bytes| ctx.phase_wait_ns == 0 or bytes > ctx.published_vision_peak.load(.acquire) else false;
+            if (needs_auxiliary or needs_peak) {
+                try ctx.lockStep(factory.control);
+                defer ctx.unlockStep();
+                if (!ctx.auxiliary_ready.load(.acquire)) {
+                    ctx.auxiliary_lease = try factory.node.model_manager.acquireGenerationResources(&.{.{ .session = factory.model.session, .resources = .{ .backend_class = .gpu, .limits = factory.limits, .amounts = ctx.features.auxiliaryAmounts() } }});
+                    ctx.auxiliary_acquisitions += 1;
+                    ctx.auxiliary_ready.store(true, .release);
+                }
+                if (peak) |bytes| {
+                    try ctx.vision_peak.grow(bytes, factory, acquireVisionPeak);
+                    if (ctx.phase_wait_ns != 0) ctx.published_vision_peak.store(ctx.vision_peak.bytes, .release);
+                }
             }
             return factory.node.model_manager.acquireGenerationResources(&.{.{ .session = factory.model.session, .resources = .{ .backend_class = .gpu, .limits = factory.limits, .amounts = amounts } }});
         }
+
         fn register(ctx: *LightOnStreamContext, control: InferenceExecutionControl) usize {
             platform.sync.lockYielding(&ctx.controls_mutex);
             defer ctx.controls_mutex.unlock();
@@ -7853,7 +8060,7 @@ pub const Node = struct {
                 ctx.registered_window_peak = @max(ctx.registered_window_peak, ctx.registered_pages);
                 return index;
             };
-            unreachable; // The pool admits at most sixteen live page leases.
+            unreachable; // The pool admits at most thirty-two live page leases.
         }
         fn unregister(ctx: *LightOnStreamContext, index: usize) void {
             platform.sync.lockYielding(&ctx.controls_mutex);
@@ -7876,6 +8083,79 @@ pub const Node = struct {
             };
             return if (timeout) error.Timeout else error.Cancelled;
         }
+        /// Called under step_mutex before this epoch publishes its first page.
+        fn startExecutor(ctx: *LightOnStreamContext, node: *Node, kv_dtype: runtime.kv.pool.KvDType) !void {
+            if (ctx.worker != null or !ctx.features.worker) return;
+            ctx.worker_io = std.Io.Threaded.init(ctx.allocator, .{});
+            errdefer {
+                ctx.worker_io.?.deinit();
+                ctx.worker_io = null;
+            }
+            ctx.worker_control = node.bindExecutionControl(ctx.worker_io.?.io(), .{ .ptr = ctx, .check_fn = check });
+            ctx.worker_kv_dtype = kv_dtype;
+            ctx.coordinator.registerExecutor(&ctx.worker_wake, ctx.worker_io.?.io());
+            errdefer ctx.coordinator.unregisterExecutor();
+            ctx.worker = try std.Thread.spawn(.{}, runExecutor, .{ctx});
+        }
+
+        fn runExecutor(ctx: *LightOnStreamContext) void {
+            const io = ctx.worker_io.?.io();
+            // This pipeline borrows only epoch-owned objects. Request-local
+            // pipelines may disappear immediately after result publication.
+            var pipeline = generation.NativeGenerationPipeline{
+                .allocator = ctx.allocator,
+                .io = io,
+                .cb = ctx.cb.?,
+                .session = ctx.model.session,
+                .gpt_config = ctx.cfg,
+                .kv_dtype = ctx.worker_kv_dtype,
+                .tokenizer = ctx.model.getTokenizer(),
+                .execution_lock = &ctx.step_mutex,
+                .execution_gate = if (ctx.gate_events) &ctx.step_gate else null,
+                .execution_contention_wait_ns = ctx.execution_gate_wait_ns,
+                .execution_control = ctx.worker_control,
+                .prepared_lighton_decode = ctx.features.prepared,
+                .single_frame_lighton_decode = ctx.features.single_frame,
+            };
+            var storage: [16]runtime.scheduler.native_generate.StepItem = undefined;
+            var step = std.ArrayListUnmanaged(runtime.scheduler.native_generate.StepItem).empty;
+            while (!ctx.worker_stop.load(.acquire)) {
+                // Request phases cannot enqueue decode until vision/prompt
+                // preparation obtains this same GPU gate. Do not immediately
+                // reacquire it forever just because continuations stay queued.
+                // Reset before observing phase/queue predicates. A phase
+                // releasing its last waiter always signals this same event.
+                ctx.worker_wake.reset();
+                if (ctx.phase_fair and ctx.phase_waiters.load(.acquire) != 0) {
+                    ctx.phase_priority_yields += 1;
+                    if (ctx.gate_events) {
+                        if (!ctx.worker_stop.load(.acquire)) ctx.worker_wake.waitTimeout(io, .{ .duration = .{ .raw = .fromMilliseconds(10), .clock = .awake } }) catch {};
+                        continue;
+                    }
+                    // Match the admitted epoch's gate parking interval. The
+                    // old fixed 100us loop kept waking during long prefill
+                    // phases even when the configured interval was 1ms.
+                    const wait_us = @max(@as(u64, 100), @min(ctx.execution_gate_wait_ns / std.time.ns_per_us, 1000));
+                    io.sleep(std.Io.Duration.fromMicroseconds(@intCast(wait_us)), .awake) catch {};
+                    continue;
+                }
+                // Both predicates have now been observed after the reset.
+                var budget = ctx.coordinator.defaultStepBudget();
+                platform.sync.lockYielding(&ctx.kv_mutex);
+                if (ctx.manager.poolAvailableBlocks(ctx.pool)) |available|
+                    budget.max_kv_blocks = if (available > 1) available - 1 else 0;
+                ctx.kv_mutex.unlock();
+                if (ctx.coordinator.claimNextStep(budget, &storage, &step)) |claimed_lease| {
+                    var lease = claimed_lease;
+                    pipeline.executeClaimedStep(&ctx.coordinator, &lease, step.items);
+                    ctx.worker_steps += 1;
+                    continue;
+                }
+                if (!ctx.worker_stop.load(.acquire)) ctx.worker_wake.waitTimeout(io, .{ .duration = .{ .raw = .fromMicroseconds(ctx.coordinator.eventWaitUs()), .clock = .awake } }) catch {};
+            }
+            ctx.worker_tail_steps = pipeline.executor_tail_steps;
+        }
+
         fn prepare(ctx: *LightOnStreamContext, kv_dtype: runtime.kv.pool.KvDType) !void {
             if (ctx.cb != null) return;
             var cb = try session_factory.getComputeBackendWithBudget(ctx.model.session, ctx.allocator, &ctx.budget);
@@ -7885,6 +8165,15 @@ pub const Node = struct {
             ctx.storage = try runtime.kv.storage_runtime.KvStorageRuntime.init(ctx.allocator, config);
             errdefer ctx.storage.deinit();
             try cb.provisionKvDeviceWriteHook(&ctx.storage);
+            if (comptime build_options.enable_metal) {
+                if (cb.kind() == .metal) {
+                    const M = @import("../ops/metal_compute.zig").MetalCompute;
+                    try M.setLightOnActivationPool(&cb, ctx.features.activation_pool);
+                    try M.setLightOnSharedCoreWeights(&cb, ctx.features.epoch_auxiliary and ctx.features.shared_core_weights);
+                    try M.setLightOnStreamFirstLayers(&cb, ctx.features.stream_first_layers);
+                    try M.setLightOnBatchAttention(&cb, ctx.features.batch_attention);
+                }
+            }
             ctx.cb = cb;
         }
     };
@@ -7966,8 +8255,8 @@ pub const Node = struct {
             else
                 0;
             if (geometry == 0) {
-                try request.control.lock(&ctx.step_mutex);
-                defer ctx.step_mutex.unlock();
+                try ctx.lockStep(request.control);
+                defer ctx.unlockStep();
                 return qwen3vl_projector.encodeProjectedImagesResident(&ctx.cb.?, allocator, ctx.cfg, images, limits);
             }
             const Cancel = struct {
@@ -8043,11 +8332,11 @@ pub const Node = struct {
             if (selected == null) platform.time.sleepNs(100 * std.time.ns_per_us);
         }
         defer ctx.coordinator.finishTurn(selected.?, .prefill);
-        control.lock(&ctx.step_mutex) catch |err| {
+        ctx.lockStep(control) catch |err| {
             for (items) |item| item.slot.fail(err);
             return;
         };
-        defer ctx.step_mutex.unlock();
+        defer ctx.unlockStep();
         const output = generation.NativeGenerationPipeline.forwardPreparedQwenPrefillBatch(batch[0..items.len]) catch |err| {
             for (items) |item| item.slot.fail(err);
             return;
@@ -8061,11 +8350,11 @@ pub const Node = struct {
         const ctx: *LightOnStreamContext = @ptrCast(@alignCast(raw));
         var group = executor_microbatch.ExecutionControl{ .items = items };
         const control = InferenceExecutionControl{ .ptr = &group, .check_fn = executor_microbatch.ExecutionControl.check };
-        control.lock(&ctx.step_mutex) catch |err| {
+        ctx.lockStep(control) catch |err| {
             for (items) |item| item.slot.fail(err);
             return;
         };
-        defer ctx.step_mutex.unlock();
+        defer ctx.unlockStep();
         var images: [4][]const u8 = undefined;
         for (items, 0..) |item, index| images[index] = item.payloadAs(LightOnVisionPayload).image;
         const a = std.heap.smp_allocator;
@@ -8105,7 +8394,8 @@ pub const Node = struct {
 
     fn runLightOnContinuousPage(self: *Node, model: *model_manager_mod.LoadedModel, model_path: []const u8, image: []const u8, prompt: []const u8, max_tokens: i32, control: InferenceExecutionControl) !Qwen3VlReadResult {
         const a = std.heap.smp_allocator;
-        const cfg = session_factory.getGptConfig(model.session) orelse return error.UnsupportedGeneratorProvider;
+        var cfg = session_factory.getGptConfig(model.session) orelse return error.UnsupportedGeneratorProvider;
+        cfg.compact_qwen35_kv = metal_runtime.lightOnThroughputFeatureEnabled("ANTFLY_LIGHTONOCR3_COMPACT_KV");
         const kv_dtype = session_factory.recommendedKvDTypeForSession(model.session, .metal);
         const messages = [_]generation.Message{.{ .role = "user", .content = prompt, .image_bytes = &.{image}, .content_parts = &.{ .{ .image = 0 }, .{ .text = prompt } } }};
         const estimate = try countPromptTokens(a, model_path, model, cfg, &messages, max_tokens);
@@ -8115,7 +8405,11 @@ pub const Node = struct {
         const ceiling = try runtime.tier.memory.reserveGptGenerationAtLargestChunk(&local_budget, &components, estimate.token_count, @intCast(max_tokens), estimate.token_count);
         if (ceiling != estimate.token_count) return error.MemoryBudgetExceeded;
         const resource = try runtime.tier.memory.estimateGptGeneration(.metal, kv_dtype, cfg, estimate.token_count, @intCast(max_tokens), ceiling);
-        var memory = LightOnCohortMemory{};
+        const features = LightOnStreamContext.ExecutionFeatures.fromEnvironmentForModel(cfg);
+        const prepared_decode = features.prepared;
+        // Page-local KV, projected inputs and recurrent histories stay fully
+        // additive. Shared execution storage optionally has its own epoch lease.
+        var memory = LightOnCohortMemory{ .amounts = if (features.epoch_auxiliary) .{} else features.auxiliaryAmounts() };
         try memory.add(cfg, estimate.token_count, @intCast(max_tokens), runtime.tier.memory.AdmissionAmounts.fromEstimate(resource), try model_manager_mod.projectorRunAdmissionAmounts(model.manifest, .metal, estimate.media_admission));
         // Default vision execution is serialized by step_mutex. Reserve its
         // maximum once for the epoch, while page-local retained state remains
@@ -8128,13 +8422,14 @@ pub const Node = struct {
         if (image.len > @min(readInlineSourceByteCap(self), contract.batch.max_encoded_media_bytes) or
             (try measureExecutorDecodedImages(&model.manifest, &.{image})) > (contract.batch.max_decoded_pixels orelse std.math.maxInt(u64)))
             return error.MicrobatchResourceLimitExceeded;
-        var factory = LightOnStreamContext.Factory{ .node = self, .model = model, .cfg = cfg, .limits = limits, .physical_rows_limit = contract.batch.max_items, .control = control };
+        const epoch_page_limit: usize = if (metal_runtime.lightOnThroughputFeatureEnabled("ANTFLY_LIGHTONOCR3_EXTENDED_EPOCH")) 256 else 64;
+        var factory = LightOnStreamContext.Factory{ .node = self, .model = model, .cfg = cfg, .limits = limits, .physical_rows_limit = contract.batch.max_items, .epoch_page_limit = epoch_page_limit, .features = features, .control = control };
         // Queue before admission and GPU allocation. Only active slots reserve
         // live resources; independently completed pages immediately free slots.
         // Logical occupancy can exceed the physical per-step contract. Every
         // page still acquires its own admission lease; the coordinator caps
         // each GPU forward at the contract's physical row limit.
-        var pool_lease = try model.native_reader_stream.join(control, effectiveLightOnReadWindow(), &factory, LightOnStreamContext.create, LightOnStreamContext.destroy);
+        var pool_lease = try model.native_reader_stream.joinBounded(control, effectiveLightOnReadWindow(), epoch_page_limit, &factory, LightOnStreamContext.create, LightOnStreamContext.destroy);
         var pool_owned = true;
         defer if (pool_owned) pool_lease.release();
         const ctx: *LightOnStreamContext = @ptrCast(@alignCast(pool_lease.context));
@@ -8143,6 +8438,7 @@ pub const Node = struct {
         defer if (registered) ctx.unregister(index);
         const admission_wait_started = platform.time.monotonicNs();
         var logged_wait = false;
+        var retry_delay_ns: u64 = std.time.ns_per_ms;
         var admission = while (true) {
             try control.check();
             const admitted = ctx.admitPage(&factory, if (share_vision_peak) memory.vision_backend_peak else null, amounts) catch |err| {
@@ -8152,9 +8448,17 @@ pub const Node = struct {
                     platform.time.monotonicNs() -| admission_wait_started >= 30 * std.time.ns_per_s) return err;
                 if (!logged_wait and platform.env.getenvBool("ANTFLY_BENCH_LIGHTONOCR3")) {
                     std.debug.print("LIGHTONOCR3 stream_admission_wait=1 reason={s}\n", .{@errorName(err)});
+                    const denial = self.model_manager.memoryAdmissionDiagnostic();
+                    std.debug.print("LIGHTONOCR3 admission_pressure={s} requested_host={d} requested_backend={d} requested_kv={d} requested_scratch={d} admitted_host={d} admitted_backend={d} host_limit={d} backend_limit={d} combined_limit={d} scratch_limit={d}\n", .{
+                        denial.pressure,               denial.requested_host_bytes,    denial.requested_backend_bytes,
+                        denial.requested_kv_bytes,     denial.requested_scratch_bytes, denial.admitted_host_bytes,
+                        denial.admitted_backend_bytes, denial.host_limit_bytes,        denial.backend_limit_bytes,
+                        denial.combined_limit_bytes,   limits.scratch_limit_bytes,
+                    });
                     logged_wait = true;
                 }
-                platform.time.sleepNs(std.time.ns_per_ms);
+                platform.time.sleepNs(retry_delay_ns);
+                if (ctx.phase_wait_ns != 0) retry_delay_ns = @min(retry_delay_ns * 2, 10 * std.time.ns_per_ms);
                 continue;
             };
             break admitted;
@@ -8168,10 +8472,10 @@ pub const Node = struct {
             pool_lease.release();
             pool_owned = false;
         }
-        try control.lock(&ctx.step_mutex);
+        try ctx.lockStep(control);
         const before = ctx.budget;
         const chunk = runtime.tier.memory.reserveGptGenerationAtLargestChunk(&ctx.budget, &components, estimate.token_count, @intCast(max_tokens), ceiling) catch |err| {
-            ctx.step_mutex.unlock();
+            ctx.unlockStep();
             return err;
         };
         const reserved = runtime.tier.memory.AdmissionAmounts{
@@ -8181,32 +8485,36 @@ pub const Node = struct {
             .backend_scratch_bytes = ctx.budget.backend_scratch_bytes - before.backend_scratch_bytes,
         };
         defer {
-            platform.sync.lockYielding(&ctx.step_mutex);
+            ctx.lockStepForCleanup();
             ctx.budget.host_kv_bytes -= reserved.host_kv_bytes;
             ctx.budget.backend_kv_bytes -= reserved.backend_kv_bytes;
             ctx.budget.host_scratch_bytes -= reserved.host_scratch_bytes;
             ctx.budget.backend_scratch_bytes -= reserved.backend_scratch_bytes;
-            ctx.step_mutex.unlock();
+            ctx.unlockStep();
         }
         if (chunk != estimate.token_count) {
-            ctx.step_mutex.unlock();
+            ctx.unlockStep();
             return error.MemoryBudgetExceeded;
         }
         ctx.prepare(kv_dtype) catch |err| {
-            ctx.step_mutex.unlock();
+            ctx.unlockStep();
             return err;
         };
-        ctx.step_mutex.unlock();
+        ctx.startExecutor(self, kv_dtype) catch |err| {
+            ctx.unlockStep();
+            return err;
+        };
+        ctx.unlockStep();
         var lease = try ctx.coordinator.acquire(.{ .requested_units = 1, .prompt_bytes = prompt.len, .prompt_tokens = estimate.token_count, .prefill_chunk_limit = chunk, .max_tokens = max_tokens });
         defer ctx.coordinator.release(lease);
         var state = generation.NativeDecodeState.initPaged(a, &ctx.manager, ctx.pool, model.shared_moe_cache);
         state.kv_storage = &ctx.storage;
         state.kv_lock = &ctx.kv_mutex;
         defer {
-            platform.sync.lockYielding(&ctx.step_mutex);
+            ctx.lockStepForCleanup();
             state.deinit();
             ctx.completed += 1;
-            ctx.step_mutex.unlock();
+            ctx.unlockStep();
         }
         const Continue = struct {
             fn check(raw: *anyopaque) bool {
@@ -8238,7 +8546,14 @@ pub const Node = struct {
             .scheduler = &ctx.coordinator,
             .scheduler_lease = &lease,
             .execution_lock = &ctx.step_mutex,
+            .execution_gate = if (ctx.gate_events) &ctx.step_gate else null,
             .execution_contention_wait_ns = ctx.execution_gate_wait_ns,
+            .prepared_lighton_decode = prepared_decode,
+            .single_frame_lighton_decode = ctx.features.single_frame,
+            .executor_sequence_control = if (platform.env.getenvBool("ANTFLY_LIGHTONOCR3_EXECUTOR_TAIL")) control else null,
+            .execution_phase_waiters = if (ctx.phase_fair) &ctx.phase_waiters else null,
+            .execution_phase_wake = if (ctx.gate_events and ctx.worker != null) &ctx.worker_wake else null,
+            .execution_phase_wake_io = if (ctx.gate_events) if (ctx.worker_io) |*owner| owner.io() else null else null,
             .execution_control = self.bindExecutionControl(control.io, .{ .ptr = ctx, .check_fn = LightOnStreamContext.check }),
             .continue_ctx = &page_control,
             .continue_fn = Continue.check,
@@ -25960,7 +26275,9 @@ pub fn resolvedExecutorBatchImplementation(
     const native_reader = executor_kind == .native_florence_reader and
         effectiveNativeReadBatchSize() > 1;
     const lighton_reader = executor_kind == .native_lighton_reader;
-    const max_items = if (native_reader)
+    const max_items = if (lighton_reader and metal_runtime.lightOnThroughputFeatureEnabled("ANTFLY_LIGHTONOCR3_WIDE_DECODE"))
+        @as(usize, 16)
+    else if (native_reader)
         @min(task_max_items, effectiveNativeReadBatchSize())
     else
         task_max_items;
@@ -25994,11 +26311,16 @@ pub fn resolvedTaskMaxItems(resolved_task: []const u8) usize {
 /// Process-local native reader ceiling shared by catalog publication, linked
 /// capability resolution, and the concrete Florence executor.
 fn effectiveLightOnReadRows() usize {
-    return @min(@max(platform.env.getenvUsize("ANTFLY_LIGHTONOCR3_BATCH_ROWS") orelse (if (metal_runtime.qualifiedM4DeviceDefault()) @as(usize, 8) else 4), 1), 8);
+    const ceiling: usize = if (metal_runtime.lightOnThroughputFeatureEnabled("ANTFLY_LIGHTONOCR3_WIDE_DECODE")) 16 else 8;
+    return @min(@max(platform.env.getenvUsize("ANTFLY_LIGHTONOCR3_BATCH_ROWS") orelse (if (metal_runtime.lightOnThroughputProfileEnabled()) @as(usize, 16) else if (metal_runtime.qualifiedM4DeviceDefault()) @as(usize, 8) else 4), 1), ceiling);
 }
 
 fn effectiveLightOnReadWindow() usize {
-    return @min(@max(platform.env.getenvUsize("ANTFLY_LIGHTONOCR3_BATCH_WINDOW") orelse 8, 1), 16);
+    // A wider logical window can keep the physical sixteen-row forward full
+    // while peers finish vision/prefill or retire. Every page still acquires
+    // its own resource lease; this does not increase a forward's row limit.
+    const ceiling: usize = if (metal_runtime.lightOnThroughputFeatureEnabled("ANTFLY_LIGHTONOCR3_WIDE_DECODE")) 32 else 16;
+    return @min(@max(platform.env.getenvUsize("ANTFLY_LIGHTONOCR3_BATCH_WINDOW") orelse (if (metal_runtime.lightOnThroughputProfileEnabled()) @as(usize, 16) else 8), 1), ceiling);
 }
 
 /// Give concurrent OCR pages time to reach the same cohort before acquiring
@@ -41039,4 +41361,200 @@ test "LightOnOCR3 cohorts reserve one serialized vision peak and every retained 
     var lease = try admission.tryAcquire(.gpu, .{ .combined_limit_bytes = cap }, pair, false);
     lease.release();
     try std.testing.expectEqual(@as(usize, 0), admission.snapshot().backendTotalBytes());
+}
+
+test "LightOnOCR3 epoch admission owns shared scratch across page retirement and failed retries" {
+    const memory = runtime.tier.memory;
+    const Context = Node.LightOnStreamContext;
+    var node: Node = undefined;
+    node.model_manager = model_manager_mod.ModelManager.init(std.testing.allocator, backends_mod.SessionManager.init(std.testing.allocator));
+    defer node.model_manager.deinit();
+    // Initialize the real resource owner without allocating any model or GPU.
+    var bootstrap = try node.model_manager.acquireRunResourceAmounts(.cpu, .{}, .{});
+    bootstrap.release();
+    const controller = &node.model_manager.resource_domain.?.admission;
+    controller.configureSharedLimits(.{});
+    // Model an existing live-memory epoch to keep this test independent of
+    // the machine's free memory. The anchor releases this one-byte reservation.
+    controller.live_capacity_bytes = 1024 * 1024 * 1024;
+    controller.live_pending_bytes = 1;
+    controller.live_epoch = 1;
+    var anchor = try controller.tryAcquire(.cpu, .{}, .{}, false);
+    anchor.live_reserved_bytes = 1;
+    defer anchor.release();
+    const features = Context.ExecutionFeatures{ .prepared = true, .activation_pool = true, .worker = true, .epoch_auxiliary = true };
+    const extra = features.auxiliaryAmounts();
+    const page = memory.AdmissionAmounts{ .backend_scratch_bytes = 1024 * 1024 };
+    const backend_capacity = extra.backend_scratch_bytes + 2 * page.backend_scratch_bytes;
+    const limits = memory.Limits{
+        .host_limit_bytes = extra.host_scratch_bytes,
+        .backend_limit_bytes = backend_capacity,
+        .combined_limit_bytes = extra.host_scratch_bytes + backend_capacity,
+        .scratch_limit_bytes = extra.host_scratch_bytes + backend_capacity,
+    };
+    var model_lease = try controller.tryAcquire(.gpu, limits, .{ .backend_scratch_bytes = backend_capacity }, false);
+    defer model_lease.release();
+    var workspace = memory.ReservedGenerationWorkspace{ .floor = limits, .capacity = .{ .backend_scratch_bytes = backend_capacity } };
+    defer workspace.borrowed.deinit();
+    var model: model_manager_mod.LoadedModel = undefined;
+    model.session = .{ .ptr = &workspace, .vtable = undefined, .generation_workspace = &workspace };
+    var ctx: Context = undefined;
+    ctx.features = features;
+    ctx.cfg = .{};
+    ctx.auxiliary_lease = null;
+    ctx.auxiliary_ready = .init(false);
+    ctx.auxiliary_acquisitions = 0;
+    ctx.phase_wait_ns = 100 * std.time.ns_per_us;
+    ctx.phase_fair = false;
+    ctx.step_mutex = .unlocked;
+    ctx.step_gate = .{};
+    ctx.gate_events = false;
+    defer if (ctx.auxiliary_lease) |*lease| lease.release();
+    var factory = Context.Factory{ .node = &node, .model = &model, .cfg = .{}, .limits = limits, .physical_rows_limit = 16, .features = features, .control = .{} };
+    // Reject the auxiliary host reservation after borrowing backend credit.
+    // The failed acquisition must unwind that credit before a later retry.
+    factory.limits.host_limit_bytes = extra.host_scratch_bytes - 1;
+    try std.testing.expectError(error.ResourceLimitExceeded, ctx.admitPage(&factory, null, page));
+    try std.testing.expect(ctx.auxiliary_lease == null);
+    try std.testing.expect(!ctx.auxiliary_ready.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 0), ctx.auxiliary_acquisitions);
+    try std.testing.expectEqualDeep(memory.AdmissionAmounts{}, workspace.borrowed.snapshot());
+    factory.limits = limits;
+    var first = try ctx.admitPage(&factory, null, page);
+    defer first.release();
+    var second = try ctx.admitPage(&factory, null, page);
+    defer second.release();
+    try std.testing.expectEqual(@as(usize, 1), ctx.auxiliary_acquisitions);
+    try std.testing.expect(ctx.auxiliary_ready.load(.acquire));
+    try std.testing.expectEqual(backend_capacity, workspace.borrowed.snapshot().backend_scratch_bytes);
+    try std.testing.expectEqual(extra.host_scratch_bytes, controller.snapshot().host_scratch_bytes);
+    // Every page still reserves its own bytes. A third page cannot borrow the
+    // two slots already in use, and an incompatible epoch policy cannot join.
+    try std.testing.expectError(error.ResourceTemporarilyUnavailable, ctx.admitPage(&factory, null, page));
+    factory.features.worker = false;
+    try std.testing.expectError(error.InvalidBatchDecodeState, ctx.admitPage(&factory, null, page));
+    factory.features = features;
+    factory.cfg.compact_qwen35_kv = true;
+    try std.testing.expectError(error.InvalidBatchDecodeState, ctx.admitPage(&factory, null, page));
+    factory.cfg.compact_qwen35_kv = false;
+    first.release();
+    var replacement = try ctx.admitPage(&factory, null, page);
+    defer replacement.release();
+    try std.testing.expectEqual(@as(usize, 1), ctx.auxiliary_acquisitions);
+    second.release();
+    replacement.release();
+    // A queued page can keep the context alive after all admitted pages have
+    // retired. The shared reservation remains owned until context teardown.
+    try std.testing.expectEqual(extra.backend_scratch_bytes, workspace.borrowed.snapshot().backend_scratch_bytes);
+    try std.testing.expectEqual(extra.host_scratch_bytes, controller.snapshot().host_scratch_bytes);
+    try std.testing.expectError(error.ResourceTemporarilyUnavailable, node.model_manager.acquireGenerationResources(&.{.{ .session = model.session, .resources = .{ .backend_class = .gpu, .limits = limits, .amounts = extra } }}));
+    ctx.auxiliary_lease.?.release();
+    ctx.auxiliary_lease = null;
+    try std.testing.expectEqualDeep(memory.AdmissionAmounts{}, workspace.borrowed.snapshot());
+    try std.testing.expectEqual(@as(usize, 0), controller.snapshot().host_scratch_bytes);
+    try std.testing.expectEqual(backend_capacity, controller.snapshot().backend_scratch_bytes);
+}
+
+test "LightOnOCR3 shared side-weight storage requires an epoch resource owner" {
+    const a = std.testing.allocator;
+    const Env = struct {
+        extern "c" fn setenv([*:0]const u8, [*:0]const u8, c_int) c_int;
+        extern "c" fn unsetenv([*:0]const u8) c_int;
+    };
+    const names = [_][:0]const u8{ "ANTFLY_LIGHTONOCR3_EPOCH_AUX", "ANTFLY_LIGHTONOCR3_SHARED_CORE_WEIGHTS" };
+    var old: [2]?[:0]u8 = @splat(null);
+    var saved: usize = 0;
+    defer for (names[0..saved], old[0..saved]) |name, value| {
+        if (value) |v| {
+            _ = Env.setenv(name, v, 1);
+            a.free(v);
+        } else _ = Env.unsetenv(name);
+    };
+    for (names, 0..) |name, i| {
+        if (platform.env.getenv(name)) |value| old[i] = try a.dupeSentinel(u8, value, 0);
+        saved += 1;
+    }
+    try std.testing.expectEqual(@as(c_int, 0), Env.setenv(names[0], "0", 1));
+    try std.testing.expectEqual(@as(c_int, 0), Env.setenv(names[1], "1", 1));
+    try std.testing.expect(!Node.LightOnStreamContext.ExecutionFeatures.fromEnvironment().shared_core_weights);
+    try std.testing.expectEqual(@as(c_int, 0), Env.setenv(names[0], "1", 1));
+    try std.testing.expect(Node.LightOnStreamContext.ExecutionFeatures.fromEnvironment().shared_core_weights);
+    const features = Node.LightOnStreamContext.ExecutionFeatures{ .epoch_auxiliary = true, .shared_core_weights = true };
+    try std.testing.expect(features.needsAuxiliary());
+    const amounts = features.auxiliaryAmounts();
+    try std.testing.expectEqual(@as(usize, 8 * 1024 * 1024), amounts.backend_scratch_bytes);
+    try std.testing.expectEqual(@as(usize, 1024 * 1024), amounts.host_scratch_bytes);
+}
+
+test "LightOnOCR3 forward prefix streaming reserves its shared overlap envelope" {
+    const features = Node.LightOnStreamContext.ExecutionFeatures{ .epoch_auxiliary = true, .stream_first_layers = 4 };
+    try std.testing.expect(features.needsAuxiliary());
+    const amounts = features.auxiliaryAmounts();
+    try std.testing.expectEqual(@as(usize, 8 * 1024 * 1024), amounts.backend_scratch_bytes);
+    try std.testing.expectEqual(@as(usize, 1024 * 1024), amounts.host_scratch_bytes);
+    const plain = Node.LightOnStreamContext.ExecutionFeatures{ .epoch_auxiliary = true };
+    try std.testing.expect(!plain.needsAuxiliary());
+}
+
+test "LightOnOCR3 batched attention reserves two disjoint frame scratch banks" {
+    const features = Node.LightOnStreamContext.ExecutionFeatures{ .epoch_auxiliary = true, .batch_attention = true };
+    try std.testing.expect(features.needsAuxiliary());
+    const amounts = features.auxiliaryAmounts();
+    try std.testing.expectEqual(@as(usize, 18 * 1024 * 1024), amounts.backend_scratch_bytes);
+    try std.testing.expectEqual(@as(usize, 1024 * 1024), amounts.host_scratch_bytes);
+}
+
+test "LightOnOCR3 throughput preset preserves explicit overrides and resource ownership" {
+    if (comptime !@import("builtin").link_libc) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const Env = struct {
+        extern "c" fn setenv([*:0]const u8, [*:0]const u8, c_int) c_int;
+        extern "c" fn unsetenv([*:0]const u8) c_int;
+    };
+    const names = [_][:0]const u8{
+        "ANTFLY_LIGHTONOCR3_THROUGHPUT",          "ANTFLY_LIGHTONOCR3_EPOCH_AUX",
+        "ANTFLY_LIGHTONOCR3_PREPARED_DECODE",     "ANTFLY_LIGHTONOCR3_ACTIVATION_POOL",
+        "ANTFLY_LIGHTONOCR3_EXECUTOR",            "ANTFLY_LIGHTONOCR3_BATCH_ATTENTION",
+        "ANTFLY_LIGHTONOCR3_SHARED_CORE_WEIGHTS", "ANTFLY_LIGHTONOCR3_WIDE_DECODE",
+        "ANTFLY_LIGHTONOCR3_BATCH_ROWS",          "ANTFLY_LIGHTONOCR3_BATCH_WINDOW",
+        "ANTFLY_LIGHTONOCR3_SINGLE_FRAME",        "ANTFLY_LIGHTONOCR3_STREAM_FIRST_LAYERS",
+    };
+    var old: [names.len]?[:0]u8 = @splat(null);
+    var saved: usize = 0;
+    defer for (names[0..saved], old[0..saved]) |name, value| {
+        if (value) |v| {
+            _ = Env.setenv(name, v, 1);
+            a.free(v);
+        } else _ = Env.unsetenv(name);
+    };
+    for (names, 0..) |name, i| {
+        if (platform.env.getenv(name)) |value| old[i] = try a.dupeSentinel(u8, value, 0);
+        saved += 1;
+        try std.testing.expectEqual(@as(c_int, 0), Env.unsetenv(name));
+    }
+    try std.testing.expectEqual(@as(c_int, 0), Env.setenv(names[0], "1", 1));
+    const eligible = metal_runtime.qualifiedM4DeviceDefault();
+    const Features = Node.LightOnStreamContext.ExecutionFeatures;
+    const small = Features.fromEnvironmentForModel(.{ .hidden_size = 1024 });
+    const large = Features.fromEnvironmentForModel(.{ .hidden_size = 2560 });
+    try std.testing.expectEqual(eligible, small.prepared and small.worker and small.activation_pool and small.epoch_auxiliary and small.batch_attention);
+    try std.testing.expect(!small.shared_core_weights and !small.single_frame and small.stream_first_layers == 0);
+    try std.testing.expectEqual(eligible, large.shared_core_weights);
+    if (eligible) {
+        try std.testing.expectEqual(@as(usize, 16), effectiveLightOnReadRows());
+        try std.testing.expectEqual(@as(usize, 16), effectiveLightOnReadWindow());
+        const amounts = large.auxiliaryAmounts();
+        try std.testing.expect(amounts.backend_scratch_bytes >= 34 * 1024 * 1024);
+        try std.testing.expect(amounts.host_scratch_bytes >= 35 * 1024 * 1024);
+    }
+    // An explicit false changes the feature and its required shared owner.
+    try std.testing.expectEqual(@as(c_int, 0), Env.setenv(names[1], "0", 1));
+    const separate = Features.fromEnvironmentForModel(.{ .hidden_size = 2560 });
+    try std.testing.expect(!separate.epoch_auxiliary and !separate.batch_attention and !separate.shared_core_weights);
+    try std.testing.expectEqual(@as(c_int, 0), Env.setenv(names[2], "0", 1));
+    try std.testing.expect(!Features.fromEnvironment().prepared);
+    try std.testing.expectEqual(@as(c_int, 0), Env.setenv(names[8], "4", 1));
+    try std.testing.expectEqual(@as(c_int, 0), Env.setenv(names[9], "2", 1));
+    try std.testing.expectEqual(@as(usize, 4), effectiveLightOnReadRows());
+    try std.testing.expectEqual(@as(usize, 2), effectiveLightOnReadWindow());
 }

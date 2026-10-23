@@ -572,6 +572,8 @@ pub const DecodeContext = struct {
     pub const KvCacheView = backend_contracts.KvCacheView;
     pub const KvBatchView = backend_contracts.KvBatchView;
 
+    /// Set only by a reader whose admission includes retained decode plans.
+    prepared_lighton_decode: bool = false,
     attention_mode: AttentionMode = .full_recompute,
     total_sequence_len: usize,
     query_sequence_len: usize,
@@ -2869,6 +2871,14 @@ fn forwardFinalHiddenTensorFromPositionedEmbeddingsWithOptionalLayer0Overrides(
     }
     defer if (owns_qwen3vl_forward_frame) cb.decoderRuntimeCancelFrame() catch {};
 
+    const stream_first_layers: usize = if (comptime build_options.enable_metal) blk: {
+        const layers = metal_compute_mod.MetalCompute.lightOnStreamFirstLayers(cb);
+        break :blk if (lightOnForwardSplitEligible(config, batch, isDecodeStep(decode_context), owns_qwen3vl_forward_frame, layers)) layers else 0;
+    } else 0;
+    // At most one submitted prefix and one active suffix exist. Drain the
+    // submitted prefix on every exit before releasing any borrowed context.
+    defer if (stream_first_layers != 0) cb.decoderRuntimeWaitSubmittedFrame() catch {};
+
     // A long-lived Metal frame may recycle a released buffer immediately for
     // a later encoded layer even though an earlier command still reads it.
     // Keep prior hidden tensors owned until frame completion; this retains the
@@ -2998,6 +3008,14 @@ fn forwardFinalHiddenTensorFromPositionedEmbeddingsWithOptionalLayer0Overrides(
             hidden = cloned_hidden;
             owns_hidden = true;
         }
+        if (stream_first_layers != 0 and layer + 1 == stream_first_layers) {
+            try cb.checkExecutionControl();
+            try cb.decoderRuntimeSubmitFrame();
+            errdefer cb.decoderRuntimeWaitSubmittedFrame() catch {};
+            if (!try cb.decoderRuntimeBeginFrame()) return error.StreamedForwardFrameUnavailable;
+            try cb.decoderRuntimeSetActiveFrameRegime(.decode);
+            if (comptime build_options.enable_metal) metal_compute_mod.MetalCompute.noteLightOnStreamSplit(cb);
+        }
         // Materialize layer groups on lazy backends when the policy asks for a
         // bounded graph. Dense decode can leave this disabled and let the final
         // token read force evaluation of the full stack.
@@ -3059,6 +3077,7 @@ fn forwardFinalHiddenTensorFromPositionedEmbeddingsWithOptionalLayer0Overrides(
     }
     hidden = final_hidden;
     if (owns_qwen3vl_forward_frame) {
+        if (stream_first_layers != 0) try cb.decoderRuntimeWaitSubmittedFrame();
         try cb.decoderRuntimeSubmitAndWaitFrame();
         owns_qwen3vl_forward_frame = false;
     }
@@ -3164,6 +3183,13 @@ pub fn denseQwen3PrefillEligible(config: Config) bool {
         !std.math.isFinite(config.rope_freq_scale) or config.rope_freq_scale <= 0 or
         !std.math.isFinite(config.rope_partial_factor) or config.rope_partial_factor <= 0 or config.rope_partial_factor > 1) return false;
     return true;
+}
+
+fn lightOnForwardSplitEligible(config: Config, batch: usize, decode: bool, owns_frame: bool, layers: usize) bool {
+    return decode and owns_frame and batch >= 2 and batch <= 16 and layers >= 1 and layers <= 16 and
+        layers < config.num_hidden_layers and config.hasQwen35VisionArchitectureContract() and
+        ((config.hidden_size == 1024 and config.num_hidden_layers == 24) or
+            (config.hidden_size == 2560 and config.num_hidden_layers == 32));
 }
 
 pub const DenseQwen3PrefillOptions = struct {
@@ -5887,6 +5913,45 @@ fn decoderBlockImpl(
     const query_seq_len = actualQuerySeqLen(seq_len, decode_context);
     const total = batch * query_seq_len;
 
+    if (comptime build_options.enable_metal) {
+        if (trace_sink == null and decode_context != null and decode_context.?.prepared_lighton_decode and
+            query_seq_len == 1 and batch >= 1 and batch <= 16 and config.hasQwen35VisionArchitectureContract() and
+            config.layerUsesQwen35LinearAttention(layer) and layer < 32 and no_overrides: {
+            inline for (.{ "attn_norm_slots", "attn_q_slots", "attn_k_slots", "attn_v_slots", "fused_qkv_linear_slots", "attn_out_proj_linear_slots", "attn_sub_norm_slots", "ffn_norm_slots", "mlp_fc1_slots", "mlp_fc2_slots", "mlp_gate_slots", "mlp_up_slots", "mlp_sub_norm_slots", "mlp_down_slots" }) |name| {
+                if (@field(raw_overrides, name)[layer] != null) break :no_overrides false;
+            }
+            break :no_overrides true;
+        } and
+            layer0_attn_norm_override == null and layer0_fused_qkv_override == null and layer0_q_override == null and layer0_k_override == null and layer0_v_override == null)
+        {
+            var states: [16]*metal_compute_mod.Qwen35LinearState = undefined;
+            var count: usize = 0;
+            if (batch == 1) {
+                if (decode_context.?.qwen35_linear_cache) |cache| if (cache.layerState(layer)) |state| {
+                    states[0] = &state.device;
+                    count = 1;
+                };
+            } else if (decode_context.?.qwen35_linear_batch) |caches| {
+                if (caches.len == batch) for (caches) |cache| {
+                    const state = if (cache) |value| value.layerState(layer) else null;
+                    if (state == null) break;
+                    states[count] = &state.?.device;
+                    count += 1;
+                };
+            }
+            const Weights = struct {
+                cb: *const ComputeBackend,
+                config: Config,
+                layer: usize,
+                pub fn weight(source: @This(), suffix: []const u8) !CT {
+                    var name: [256]u8 = undefined;
+                    return getModelWeight(source.cb, source.config, try std.fmt.bufPrint(&name, "model.layers.{d}.{s}", .{ source.layer, suffix }));
+                }
+            };
+            if (count == batch) if (try metal_compute_mod.MetalCompute.lightOnPreparedLinearBlock(cb, config, hidden, states[0..count], layer, Weights{ .cb = cb, .config = config, .layer = layer })) |result| return result;
+        }
+    }
+
     var name_buf: [256]u8 = undefined;
     var attn_norm_slot = decoderOverrideLayerSlot(raw_overrides.attn_norm_slots, layer);
     var attn_q_slot = decoderOverrideLayerSlot(raw_overrides.attn_q_slots, layer);
@@ -5989,7 +6054,8 @@ fn decoderBlockImpl(
     }
 
     const shares_kv = config.layerSharesKv(layer) and !disableSharedKvDebug();
-    const kv_layer_index = if (shares_kv) config.kvDonorLayerIndex(layer).? else layer;
+    const kv_source_layer = if (shares_kv) config.kvDonorLayerIndex(layer).? else layer;
+    const kv_layer_index = config.kvStorageLayerIndex(kv_source_layer) orelse return error.InvalidKvLayerIndex;
     if (config.gemma4_mtp_assistant and traceGemma4MtpDonorDebug()) {
         const mode_name = if (decode_context) |ctx| @tagName(ctx.attention_mode) else "none";
         const total_sequence_len = if (decode_context) |ctx| ctx.total_sequence_len else seq_len;
@@ -8013,8 +8079,8 @@ pub fn qwen35LinearAttention(
     defer cb.free(a_proj);
 
     if (comptime build_options.enable_metal) {
-        if (seq_len == 1 and batch > 1 and batch <= 8 and metal_compute_mod.MetalCompute.lightOnDirectCoreOutputEnabled(cb)) {
-            var states: [8]*metal_compute_mod.Qwen35LinearState = undefined;
+        if (seq_len == 1 and batch > 1 and batch <= 16 and metal_compute_mod.MetalCompute.lightOnDirectCoreOutputEnabled(cb)) {
+            var states: [16]*metal_compute_mod.Qwen35LinearState = undefined;
             var count: usize = 0;
             for (decode_context.?.qwen35_linear_batch.?) |cache| {
                 const state = cache.?.layerState(layer) orelse break;
@@ -13023,4 +13089,18 @@ test "LightOnOCR3 page cache initialization releases every earlier layer on allo
         }
     };
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Check.run, .{});
+}
+
+test "LightOnOCR3 forward prefix streaming only splits owned batched decode frames" {
+    inline for (.{ "../models/testdata/lightonocr3/config.json", "../models/testdata/lightonocr3/config-4b.json" }) |path| {
+        const config = try gpt_config.parseConfig(std.testing.allocator, @embedFile(path));
+        try std.testing.expect(lightOnForwardSplitEligible(config, 2, true, true, 4));
+        try std.testing.expect(lightOnForwardSplitEligible(config, 16, true, true, 8));
+        try std.testing.expect(!lightOnForwardSplitEligible(config, 1, true, true, 4));
+        try std.testing.expect(!lightOnForwardSplitEligible(config, 17, true, true, 4));
+        try std.testing.expect(!lightOnForwardSplitEligible(config, 2, false, true, 4));
+        try std.testing.expect(!lightOnForwardSplitEligible(config, 2, true, false, 4));
+        try std.testing.expect(!lightOnForwardSplitEligible(config, 2, true, true, 0));
+        try std.testing.expect(!lightOnForwardSplitEligible(config, 2, true, true, config.num_hidden_layers));
+    }
 }

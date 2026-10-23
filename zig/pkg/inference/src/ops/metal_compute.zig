@@ -789,7 +789,7 @@ const LightOnRuntimePolicy = struct {
         const retain_handles = if (platform.env.getenv("TERMITE_METAL_DISABLE_LIGHTONOCR3_WEIGHT_HANDLES")) |value|
             !platform.env.truthy(value)
         else
-            platform.env.getenvBool("TERMITE_METAL_ENABLE_LIGHTONOCR3_WEIGHT_HANDLES");
+            metal_runtime_mod.lightOnThroughputFeatureEnabled("TERMITE_METAL_ENABLE_LIGHTONOCR3_WEIGHT_HANDLES");
         return .{
             .direct_core_output = !platform.env.getenvBool("TERMITE_METAL_DISABLE_LIGHTONOCR3_DIRECT_CORE_OUTPUT"),
             .packed_core = !platform.env.getenvBool("TERMITE_METAL_DISABLE_LIGHTONOCR3_PACKED_CORE"),
@@ -1276,7 +1276,25 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     qwen35_ocr_deferred_attention: bool = false,
     lightonocr3_projections: bool = false,
     lightonocr3_policy: LightOnRuntimePolicy = .{},
-    lightonocr3_packed_core_reported_rows: u16 = 0,
+    lighton_prepared_layers: [32]?LightOnPreparedLayer = @splat(null),
+    lighton_prepared_workspace: [15]?MetalTensor = @splat(null),
+    lighton_prepared_hidden: usize = 0,
+    lighton_prepared_blocks: usize = 0,
+    lighton_wide_projection_tiles_start: u64 = 0,
+    lighton_single_frame_stats: [2]u64 = @splat(0),
+    lighton_wide_mpp_start: [2]u64 = @splat(0),
+    lighton_activation_pool_enabled: bool = false,
+    lighton_shared_core_weights_enabled: bool = false,
+    lighton_shared_core_weights: std.AutoHashMapUnmanaged(usize, MetalTensor) = .empty,
+    lighton_shared_core_weight_bytes: usize = 0,
+    lighton_shared_core_weight_hits: usize = 0,
+    lighton_shared_core_weight_misses: usize = 0,
+    lighton_stream_first_layers: u8 = 0,
+    lighton_batch_attention: bool = false,
+    lighton_attention_batch_baseline: [3]u64 = @splat(0),
+    lighton_prefill_pack_baseline: [2]u64 = @splat(0),
+    lighton_stream_splits: usize = 0,
+    lightonocr3_packed_core_reported_rows: u32 = 0,
     lightonocr3_weight_handles_reported: bool = false,
     pending_prefill_kv_device_seeds: std.ArrayListUnmanaged(PendingKvDeviceSeed) = .empty,
     timing_stats: ops.NativeQuantTimingStats = .{},
@@ -1319,6 +1337,312 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     logged_quantized_gated_ffn_backend_unsupported_kind: bool = false,
     /// Optional Io for the CPU-fallback linalg path; see NativeCompute.io.
     io: ?std.Io = null,
+
+    const LightOnPreparedLayer = struct {
+        weights: [8]?CT = @splat(null),
+        norms: [2]?MetalTensor = @splat(null),
+        slots: [8]usize = undefined,
+        fn deinit(plan: *LightOnPreparedLayer, self: *MetalCompute) void {
+            for (plan.weights) |weight| if (weight) |value| freeOp(self, value);
+            for (&plan.norms) |*norm| if (norm.*) |*value| value.deinit();
+            plan.* = .{};
+        }
+    };
+
+    pub fn setLightOnActivationPool(cb: *const ops.ComputeBackend, enabled: bool) !void {
+        if (cb.kind() != .metal) return error.RuntimeUnavailable;
+        const self: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
+        const raw = self.provider_impl.raw_decode_runtime orelse {
+            if (enabled) return error.RuntimeUnavailable;
+            self.lighton_activation_pool_enabled = false;
+            return;
+        };
+        if (metal_runtime_mod.termite_metal_decode_runtime_set_lighton_activation_pool(raw, if (enabled) 8 * 1024 * 1024 else 0) != 0) return error.ActivationPoolConfigurationFailed;
+        self.lighton_activation_pool_enabled = enabled;
+        metal_runtime_mod.termite_metal_decode_runtime_lighton_prefill_pack_stats(raw, &self.lighton_prefill_pack_baseline);
+        self.lighton_single_frame_stats = @splat(0);
+        metal_runtime_mod.termite_metal_decode_runtime_lighton_wide_mpp_stats(raw, &self.lighton_wide_mpp_start);
+        self.lighton_wide_projection_tiles_start = metal_runtime_mod.termite_metal_decode_runtime_lighton_wide_projection_tiles(raw);
+    }
+
+    pub fn lightOnActivationPoolStats(cb: *const ops.ComputeBackend) [4]u64 {
+        var values: [4]u64 = @splat(0);
+        if (cb.kind() == .metal) {
+            const self: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
+            metal_runtime_mod.termite_metal_decode_runtime_lighton_activation_pool_stats(self.provider_impl.raw_decode_runtime, &values);
+        }
+        return values;
+    }
+
+    pub fn lightOnWideProjectionTileCount(cb: *const ops.ComputeBackend) u64 {
+        if (cb.kind() != .metal) return 0;
+        const self: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
+        return metal_runtime_mod.termite_metal_decode_runtime_lighton_wide_projection_tiles(self.provider_impl.raw_decode_runtime) -| self.lighton_wide_projection_tiles_start;
+    }
+
+    /// Reserve token readback before a forward can mutate recurrent/KV state.
+    pub fn reserveLightOnFrameArgmax(cb: *const ops.ComputeBackend, rows: usize, vocab: usize) bool {
+        if (cb.kind() != .metal) return false;
+        const self: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
+        return self.lightonocr3_projections and metal_runtime_mod.qualifiedM4DeviceDefault() and
+            metal_runtime_mod.reserveArgmaxRows(self.provider_impl, rows, vocab);
+    }
+
+    pub fn noteLightOnSingleFrame(cb: *const ops.ComputeBackend, submits: u64, argmaxes: u64) void {
+        const self: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
+        self.lighton_single_frame_stats[if (submits == 1 and argmaxes == 1) 0 else 1] += 1;
+    }
+
+    pub fn lightOnSingleFrameStats(cb: *const ops.ComputeBackend) [2]u64 {
+        if (cb.kind() != .metal) return @splat(0);
+        const self: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
+        return self.lighton_single_frame_stats;
+    }
+
+    pub fn argmaxOnFrameCount(cb: *const ops.ComputeBackend) u64 {
+        if (cb.kind() != .metal) return 0;
+        const self: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
+        return metal_runtime_mod.termite_metal_decode_runtime_argmax_on_frame_calls(self.provider_impl.raw_decode_runtime);
+    }
+
+    /// Linear implementations may close their own encoder while retaining the
+    /// caller's command buffer. Token selection must reopen it to consume that
+    /// buffer, otherwise argmax would flush and submit a separate command buffer.
+    pub fn ensureFrameArgmaxScope(cb: *const ops.ComputeBackend) !void {
+        if (cb.kind() != .metal) return error.RuntimeUnavailable;
+        const self: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
+        const raw = self.provider_impl.raw_decode_runtime orelse return error.RuntimeUnavailable;
+        metal_runtime_mod.beginPlannedComputeScope(raw, @backingInt(metal_runtime_mod.ComputeSource.quant_linear), .attention_project) catch |err| switch (err) {
+            error.PlannedScopeActive => {},
+            else => return err,
+        };
+    }
+
+    pub fn lightOnWideMppStats(cb: *const ops.ComputeBackend) [2]u64 {
+        if (cb.kind() != .metal) return @splat(0);
+        const self: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
+        var values: [2]u64 = undefined;
+        metal_runtime_mod.termite_metal_decode_runtime_lighton_wide_mpp_stats(self.provider_impl.raw_decode_runtime, &values);
+        for (&values, self.lighton_wide_mpp_start) |*value, start| value.* -|= start;
+        return values;
+    }
+
+    pub fn setLightOnSharedCoreWeights(cb: *const ops.ComputeBackend, enabled: bool) !void {
+        if (cb.kind() != .metal) return error.RuntimeUnavailable;
+        const self: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
+        if (self.lighton_shared_core_weights.count() != 0) return error.InvalidBatchDecodeState;
+        self.lighton_shared_core_weights_enabled = enabled and self.lightonocr3_projections and metal_runtime_mod.qualifiedM4DeviceDefault();
+    }
+
+    pub fn lightOnSharedCoreWeightStats(cb: *const ops.ComputeBackend) [3]usize {
+        if (cb.kind() != .metal) return @splat(0);
+        const self: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
+        return .{ self.lighton_shared_core_weight_hits, self.lighton_shared_core_weight_misses, self.lighton_shared_core_weight_bytes };
+    }
+
+    /// Compute-owned immutable handles stay alive until deinitWeightCaches.
+    /// Retain that identity, never an address of a transient or mutable tensor.
+    fn qwen35SideWeight(self: *MetalCompute, cb: *const ops.ComputeBackend, input: CT) !MetalTensor {
+        const source = toBuf(input);
+        const key = @intFromPtr(source);
+        const cacheable = self.lighton_shared_core_weights_enabled and source.weight_handle_compute_owned and !source.mutable_state;
+        if (cacheable) if (self.lighton_shared_core_weights.getPtr(key)) |cached| {
+            self.lighton_shared_core_weight_hits += 1;
+            return cached.retainedCopy();
+        };
+        const host = try cb.toFloat32(input, self.allocator);
+        defer self.allocator.free(host);
+        const raw = self.provider_impl.raw_decode_runtime orelse return error.RuntimeUnavailable;
+        var device = try MetalTensor.deviceAllocateFreshWithAllocator(self.allocator, @ptrCast(raw), host.len * 4, .private, &.{@intCast(host.len)});
+        errdefer device.deinit();
+        try device.uploadBytes(std.mem.sliceAsBytes(host));
+        // The shared context separately owns an 8 MiB device envelope and
+        // 1 MiB host envelope for this cache. Keep each page's original
+        // reservations intact; an uncached side weight retains its old owner.
+        if (cacheable and self.lighton_shared_core_weights.count() < 128) {
+            const bytes = metal_runtime_mod.termite_metal_buffer_allocated_size(device.deviceHandle());
+            if (bytes != 0 and bytes <= 8 * 1024 * 1024 - self.lighton_shared_core_weight_bytes) {
+                try self.lighton_shared_core_weights.ensureUnusedCapacity(self.allocator, 1);
+                var retained = try device.retainedCopy();
+                errdefer retained.deinit();
+                self.lighton_shared_core_weights.putAssumeCapacityNoClobber(key, retained);
+                self.lighton_shared_core_weight_bytes += bytes;
+                self.lighton_shared_core_weight_misses += 1;
+            }
+        }
+        return device;
+    }
+
+    pub fn setLightOnBatchAttention(cb: *const ops.ComputeBackend, enabled: bool) !void {
+        if (cb.kind() != .metal) return error.RuntimeUnavailable;
+        const self: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
+        self.lighton_batch_attention = enabled and self.lightonocr3_projections and metal_runtime_mod.qualifiedM4DeviceDefault();
+        metal_runtime_mod.termite_metal_decode_runtime_lighton_attention_batch_stats(self.provider_impl.raw_decode_runtime, &self.lighton_attention_batch_baseline);
+    }
+
+    pub fn lightOnPrefillPackStats(cb: *const ops.ComputeBackend) [2]u64 {
+        if (cb.kind() != .metal) return @splat(0);
+        const self: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
+        var result: [2]u64 = @splat(0);
+        metal_runtime_mod.termite_metal_decode_runtime_lighton_prefill_pack_stats(self.provider_impl.raw_decode_runtime, &result);
+        for (&result, self.lighton_prefill_pack_baseline) |*value, baseline| value.* -|= baseline;
+        return result;
+    }
+
+    pub fn lightOnBatchAttentionStats(cb: *const ops.ComputeBackend) [3]u64 {
+        if (cb.kind() != .metal) return @splat(0);
+        const self: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
+        var result: [3]u64 = @splat(0);
+        metal_runtime_mod.termite_metal_decode_runtime_lighton_attention_batch_stats(self.provider_impl.raw_decode_runtime, &result);
+        for (&result, self.lighton_attention_batch_baseline) |*value, baseline| value.* -|= baseline;
+        return result;
+    }
+
+    pub fn setLightOnStreamFirstLayers(cb: *const ops.ComputeBackend, layers: u8) !void {
+        if (cb.kind() != .metal) return error.RuntimeUnavailable;
+        const self: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
+        self.lighton_stream_first_layers = if (self.lightonocr3_projections and metal_runtime_mod.qualifiedM4DeviceDefault() and
+            metal_runtime_mod.termite_metal_decode_runtime_stream_frames_available(self.provider_impl.raw_decode_runtime) != 0) @min(layers, 16) else 0;
+    }
+
+    pub fn lightOnStreamFirstLayers(cb: *const ops.ComputeBackend) u8 {
+        if (cb.kind() != .metal) return 0;
+        const self: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
+        return self.lighton_stream_first_layers;
+    }
+
+    pub fn noteLightOnStreamSplit(cb: *const ops.ComputeBackend) void {
+        const self: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
+        self.lighton_stream_splits += 1;
+    }
+
+    pub fn lightOnStreamSplits(cb: *const ops.ComputeBackend) usize {
+        if (cb.kind() != .metal) return 0;
+        const self: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
+        return self.lighton_stream_splits;
+    }
+
+    pub fn lightOnPreparedBlockCount(cb: *const ops.ComputeBackend) usize {
+        if (cb.kind() != .metal) return 0;
+        const self: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
+        return self.lighton_prepared_blocks;
+    }
+
+    fn lightOnPreparedConfigEligible(config: @import("../models/gpt.zig").Config) bool {
+        return config.norm_type == .rms_norm and config.activation == .silu and
+            config.norm_weight_offset == 1 and config.norm_eps == 1e-6 and config.qwen35_linear_num_key_heads == 16 and
+            config.qwen35_linear_key_head_dim == 128 and config.qwen35_linear_value_head_dim == 128 and config.qwen35_linear_conv_kernel_dim == 4 and
+            ((config.hidden_size == 1024 and config.intermediate_size == 3584 and config.qwen35_linear_num_value_heads == 16) or
+                (config.hidden_size == 2560 and config.intermediate_size == 9216 and config.qwen35_linear_num_value_heads == 32));
+    }
+
+    /// The reader admits eight MiB backend and one MiB host scratch per page
+    /// before enabling this plan. Slots alias model-owned immutable weights;
+    /// only small adjusted norm vectors and fifteen activation carriers persist.
+    pub fn lightOnPreparedLinearBlock(cb: *const ops.ComputeBackend, config: anytype, hidden: CT, states: []const *Qwen35LinearState, layer: usize, source: anytype) !?CT {
+        if (cb.kind() != .metal or states.len == 0 or states.len > 16 or layer >= 32 or
+            !lightOnPreparedConfigEligible(config)) return null;
+        const self: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
+        const raw = self.provider_impl.raw_decode_runtime orelse return null;
+        if (!self.lightonocr3_projections or !self.lightonocr3_policy.packed_core or !metal_runtime.hasActiveFrame(raw) or cb.decoderRuntimeHasSubmittedFrame() or
+            platform.env.getenvBool("TERMITE_METAL_DISABLE_QWEN35_RECURRENT_CORE")) return null;
+        if (self.lighton_prepared_hidden != 0 and self.lighton_prepared_hidden != config.hidden_size) return null;
+        const rows = states.len;
+        const h = config.hidden_size;
+        const intermediate = config.intermediate_size;
+        const vh: usize = config.qwen35_linear_num_value_heads;
+        const channels = (32 + vh) * 128;
+        const value_width = vh * 128;
+        const runtime: *anyopaque = @ptrCast(raw);
+        for (states) |state| {
+            if (!state.initialized or state.key_heads != 16 or state.value_heads != vh or state.conv[0] == null or state.conv[1] == null or state.recurrent == null) return null;
+            for (state.weights) |weight| if (weight == null) return null;
+            const tensors = [_]*const MetalTensor{ &state.conv[0].?, &state.conv[1].?, &state.recurrent.?, &state.weights[0].?, &state.weights[1].?, &state.weights[2].?, &state.weights[3].? };
+            const counts = [_]usize{ channels * 4, channels * 4, vh * 128 * 128, channels * 4, vh, vh, 128 };
+            for (tensors, counts) |tensor, count| if (!tensor.isDevice() or tensor.dtype != .f32 or tensor.device.?.ref.runtime != runtime or tensor.elemCount() != count) return null;
+        }
+        const input = toBuf(hidden).metal_tensor orelse return null;
+        if (!input.isDevice() or input.dtype != .f32 or input.device.?.ref.runtime != runtime or input.ndim() != 2 or input.dim(0) != @as(i32, @intCast(rows)) or input.dim(1) != @as(i32, @intCast(h))) return null;
+        try cb.checkExecutionControl();
+        if (self.lighton_prepared_layers[layer] == null) {
+            var plan: LightOnPreparedLayer = .{};
+            var committed = false;
+            defer if (!committed) plan.deinit(self);
+            const names = [_][]const u8{ "linear_attn.in_proj_qkv.weight", "linear_attn.in_proj_z.weight", "linear_attn.in_proj_b.weight", "linear_attn.in_proj_a.weight", "linear_attn.out_proj.weight", "mlp.gate_proj.weight", "mlp.up_proj.weight", "mlp.down_proj.weight" };
+            const ins = [_]usize{ h, h, h, h, value_width, h, h, intermediate };
+            const outs = [_]usize{ channels, value_width, vh, vh, h, intermediate, intermediate, h };
+            for (names, ins, outs, 0..) |name, in_dim, out_dim, index| {
+                try cb.checkExecutionControl();
+                const weight = try source.weight(name);
+                plan.weights[index] = weight;
+                const bias = try self.cachedZeroBiasBuf(out_dim);
+                defer freeOp(self, bias);
+                plan.slots[index] = (try self.ensureDynamicLinearSlot(weight, bias, in_dim, out_dim)) orelse return null;
+                // Native BF16 slots own their backing lease. A plan retains
+                // descriptor identities, not an otherwise idle F32 host mirror.
+                if (toBuf(weight).native_dense_host_cache) |mirror| {
+                    toBuf(weight).native_dense_host_cache = null;
+                    freeOp(self, mirror);
+                }
+            }
+            for ([_][]const u8{ "input_layernorm.weight", "post_attention_layernorm.weight" }, 0..) |name, index| {
+                try cb.checkExecutionControl();
+                const weight = try source.weight(name);
+                defer freeOp(self, weight);
+                const values = try toFloat32Op(self, weight, self.allocator);
+                defer self.allocator.free(values);
+                if (values.len != h) return error.InvalidTensorShape;
+                for (values) |*value| value.* += config.norm_weight_offset;
+                plan.norms[index] = try self.deviceTensorFromF32Slice(values, &.{@intCast(h)});
+            }
+            self.lighton_prepared_layers[layer] = plan;
+            committed = true;
+        }
+        const widths = [_]usize{ h, channels, value_width, vh, vh, channels, vh * 2, value_width, value_width, h, h, intermediate, intermediate, intermediate, h };
+        self.lighton_prepared_hidden = h;
+        for (widths, 0..) |width, index| {
+            if (self.lighton_prepared_workspace[index] == null)
+                self.lighton_prepared_workspace[index] = try MetalTensor.deviceAllocateWithAllocator(self.allocator, runtime, 16 * width * 4, .private, &.{ 16, @intCast(width) });
+        }
+        var buffers: [15]?*anyopaque = undefined;
+        var offsets: [15]usize = undefined;
+        for (&self.lighton_prepared_workspace, &buffers, &offsets) |*tensor, *buffer, *offset| {
+            buffer.* = tensor.*.?.deviceHandle();
+            offset.* = tensor.*.?.deviceByteOffset();
+        }
+        const plan = &self.lighton_prepared_layers[layer].?;
+        const norms = [_]?*anyopaque{ plan.norms[0].?.deviceHandle(), plan.norms[1].?.deviceHandle() };
+        const norm_offsets = [_]usize{ plan.norms[0].?.deviceByteOffset(), plan.norms[1].?.deviceByteOffset() };
+        var state_handles: [16 * 7]?*anyopaque = undefined;
+        var state_offsets: [16 * 7]usize = undefined;
+        for (states, 0..) |state, row| {
+            const tensors = [_]*const MetalTensor{ &state.conv[0].?, &state.conv[1].?, &state.recurrent.?, &state.weights[0].?, &state.weights[1].?, &state.weights[2].?, &state.weights[3].? };
+            for (tensors, 0..) |tensor, index| {
+                state_handles[row * 7 + index] = tensor.deviceHandle();
+                state_offsets[row * 7 + index] = tensor.deviceByteOffset();
+            }
+        }
+        const output = try self.ctFromOwnedMetalTensor(try self.lighton_prepared_workspace[14].?.retainedView(0, rows * h * 4, &.{ @intCast(rows), @intCast(h) }));
+        errdefer freeOp(self, output);
+        try cb.checkExecutionControl();
+        const rc = metal_runtime_mod.termite_metal_decode_runtime_lighton_prepared_linear_block(raw, &plan.slots, &norms, &norm_offsets, input.deviceHandle(), input.deviceByteOffset(), &buffers, &offsets, &state_handles, &state_offsets, rows, h, intermediate, vh);
+        if (rc == 0) {
+            freeOp(self, output);
+            return null;
+        }
+        if (rc != 1) return error.LightOnPreparedBlockFailed;
+        for (states) |state| {
+            state.conv[1].?.invalidateHostMirror();
+            state.recurrent.?.invalidateHostMirror();
+            std.mem.swap(?MetalTensor, &state.conv[0], &state.conv[1]);
+        }
+        self.lighton_prepared_blocks += 1;
+        if (rows > 1 and (self.lightonocr3_packed_core_reported_rows & (@as(u32, 1) << @intCast(rows))) == 0 and getenvBool("TERMITE_METAL_TRACE_LIGHTONOCR3_PACKED_CORE")) {
+            self.lightonocr3_packed_core_reported_rows |= @as(u32, 1) << @intCast(rows);
+            std.debug.print("lightonocr3_packed_core: rows={d} prepared=true\n", .{rows});
+        }
+        return output;
+    }
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -1707,7 +2031,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     pub fn lightOnPackedCore(cb: *const ops.ComputeBackend, states: []const *Qwen35LinearState, request: anytype) !?CT {
         if (cb.kind() != .metal) return null;
         const self: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
-        if (states.len < 2 or states.len > 8 or
+        if (states.len < 2 or states.len > 16 or
             request.key_heads != 16 or (request.value_heads != 16 and request.value_heads != 32) or
             request.dim != 128 or request.value_dim != 128 or request.conv_kernel != 4 or request.eps != 1e-6 or
             !self.lightonocr3_policy.packed_core or
@@ -1782,8 +2106,8 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             state.recurrent.?.invalidateHostMirror();
             std.mem.swap(?MetalTensor, &state.conv[0], &state.conv[1]);
         }
-        if ((self.lightonocr3_packed_core_reported_rows & (@as(u16, 1) << @intCast(rows))) == 0 and getenvBool("TERMITE_METAL_TRACE_LIGHTONOCR3_PACKED_CORE")) {
-            self.lightonocr3_packed_core_reported_rows |= @as(u16, 1) << @intCast(rows);
+        if ((self.lightonocr3_packed_core_reported_rows & (@as(u32, 1) << @intCast(rows))) == 0 and getenvBool("TERMITE_METAL_TRACE_LIGHTONOCR3_PACKED_CORE")) {
+            self.lightonocr3_packed_core_reported_rows |= @as(u32, 1) << @intCast(rows);
             std.debug.print("lightonocr3_packed_core: rows={d} scratch_bytes={d}\n", .{ rows, scratch_count * 4 });
         }
         return try self.ctFromOwnedMetalTensor(output);
@@ -1831,12 +2155,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const weight_inputs = [_]CT{ request.conv_weight, request.a_log, request.dt_bias, request.norm_weight };
         for (weight_inputs, &state.weights) |input, *tensor| {
             if (tensor.* == null) {
-                const host = try cb.toFloat32(input, self.allocator);
-                defer self.allocator.free(host);
-                var device = try MetalTensor.deviceAllocateFreshWithAllocator(self.allocator, runtime, host.len * 4, .private, &.{@intCast(host.len)});
-                errdefer device.deinit();
-                try device.uploadBytes(std.mem.sliceAsBytes(host));
-                tensor.* = device;
+                tensor.* = try self.qwen35SideWeight(cb, input);
             }
         }
         var mixed = try self.ownedDeviceMetalTensorFromCt(request.mixed);
@@ -2388,7 +2707,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const runtime = self.provider_impl.raw_decode_runtime orelse return error.MetalRuntimeUnavailable;
         const bytes = try std.math.mul(usize, values, @sizeOf(f32));
         const handle = metal_runtime.termite_metal_buffer_retain_external(runtime, buffer, try std.math.add(usize, offset, bytes)) orelse return error.ForeignResidentVideoBuffer;
-        var tensor = MetalTensor.deviceOwned(@ptrCast(runtime), handle, offset, bytes, &.{ @intCast(values / 768), 768 });
+        var tensor = MetalTensor.deviceRetainedExternal(@ptrCast(runtime), handle, offset, bytes, &.{ @intCast(values / 768), 768 });
         errdefer tensor.deinit();
         return self.ctFromOwnedMetalTensor(tensor);
     }
@@ -2787,7 +3106,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const byte_len = rows * hidden_size * @sizeOf(f32);
         const shape = [_]i32{ @intCast(rows), @intCast(hidden_size) };
 
-        var front_tensor = MetalTensor.deviceOwned(
+        var front_tensor = MetalTensor.deviceRetainedExternal(
             runtime,
             metal_runtime.hiddenStateBuffer(runtime, .front) orelse return error.UnexpectedNull,
             0,
@@ -2798,7 +3117,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const front = try self.metalTensorBufWithHostMaterialization(front_tensor, false);
         errdefer freeOp(self, front);
 
-        var back_tensor = MetalTensor.deviceOwned(
+        var back_tensor = MetalTensor.deviceRetainedExternal(
             runtime,
             metal_runtime.hiddenStateBuffer(runtime, .back) orelse return error.UnexpectedNull,
             0,
@@ -5141,6 +5460,11 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const runtime = self.provider_impl.raw_decode_runtime;
         if (metal_runtime.hasActiveFrame(runtime)) metal_runtime.cancelFrame(runtime) catch {};
         if (metal_runtime.hasSubmittedFrame(runtime)) metal_runtime.waitFrame(runtime) catch {};
+        if (self.lighton_batch_attention) {
+            const attention_release_rc = metal_runtime_mod.termite_metal_decode_runtime_lighton_attention_batch_release(runtime);
+            std.debug.assert(attention_release_rc == 0);
+            self.lighton_batch_attention = false;
+        }
         // The admitted request/epoch still owns the vision workspace lease.
         if (runtime != null) {
             const vision_workspace_rc = metal_runtime.termite_metal_decode_runtime_clear_lightonocr3_vision_workspace(runtime);
@@ -5170,6 +5494,20 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         var v4_it = self.deepseek_v4_device_cache.iterator();
         while (v4_it.next()) |entry| entry.value_ptr.deinit();
         self.deepseek_v4_device_cache.deinit(self.allocator);
+        for (&self.lighton_prepared_layers) |*plan| if (plan.*) |*value| value.deinit(self);
+        for (&self.lighton_prepared_workspace) |*tensor| if (tensor.*) |*value| value.deinit();
+        if (self.lighton_activation_pool_enabled) {
+            // A provider runtime may outlive this backend epoch. Its admitted
+            // activation cache must retire with the epoch rather than persist.
+            const rc = metal_runtime_mod.termite_metal_decode_runtime_set_lighton_activation_pool(self.provider_impl.raw_decode_runtime, 0);
+            std.debug.assert(rc == 0);
+            self.lighton_activation_pool_enabled = false;
+        }
+        // Cache keys are compute-owned weight handles. Release the shared
+        // device copies before retiring those source identities.
+        var core_weight_it = self.lighton_shared_core_weights.valueIterator();
+        while (core_weight_it.next()) |weight| weight.deinit();
+        self.lighton_shared_core_weights.deinit(self.allocator);
         self.deinitWeightCaches();
         var scale_it = self.layer_output_scale_device_cache.iterator();
         while (scale_it.next()) |entry| entry.value_ptr.deinit();
@@ -22302,6 +22640,22 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         num_kv_heads: usize,
         head_dim: usize,
     ) anyerror!CT {
+        return gqaPagedAttentionIntoOp(ctx, Q, K, V, attn_bias, attention, batch, num_heads, num_kv_heads, head_dim, null);
+    }
+
+    fn gqaPagedAttentionIntoOp(
+        ctx: *anyopaque,
+        Q: CT,
+        K: CT,
+        V: CT,
+        attn_bias: ?CT,
+        attention: ops.AttentionContext,
+        batch: usize,
+        num_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        destination: ?MetalTensor,
+    ) anyerror!CT {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
         const has_attention_sink = attention.attention_sink.hasMetadata();
         if (dumpDecodeKvLayerTarget()) |target_layer| {
@@ -22361,6 +22715,17 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             errdefer if (output) |values| self.allocator.free(values);
             if (output) |values| @memset(values, 0.0);
 
+            const all_decode = for (kv_batch) |view| {
+                if ((view.per_item_query_len orelse max_q_rows) != 1 or
+                    (view.per_item_mode orelse attention.mode) != .paged_decode) break false;
+            } else true;
+            const collect_attention = all_decode and self.lighton_batch_attention and batch >= 2 and batch <= 16 and
+                max_q_rows == 1 and resident_output != null and !has_attention_sink and
+                metal_runtime.hasActiveFrame(self.provider_impl.raw_decode_runtime);
+            if (collect_attention and metal_runtime.termite_metal_decode_runtime_lighton_attention_batch_begin(self.provider_impl.raw_decode_runtime) != 0)
+                return error.MetalAttentionBatchFailed;
+            defer if (collect_attention) metal_runtime.termite_metal_decode_runtime_lighton_attention_batch_abort(self.provider_impl.raw_decode_runtime);
+
             for (0..batch) |b| {
                 const view = kv_batch[b];
                 const item_q_len = if (is_mixed) (view.per_item_query_len orelse max_q_rows) else max_q_rows;
@@ -22396,9 +22761,24 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                     break :blk item;
                 };
 
-                const item_ct = try gqaPagedAttentionOp(ctx, q_slice, k_slice, v_slice, null, item_attention, 1, num_heads, num_kv_heads, head_dim);
+                var target: ?MetalTensor = null;
+                defer if (target) |*tensor| tensor.deinit();
+                if (collect_attention) {
+                    const parent = toBuf(resident_output.?).metal_tensor.?;
+                    const shape = [_]i32{ 1, @intCast(h_q) };
+                    target = try parent.retainedView(b * q_span * @sizeOf(f32), q_span * @sizeOf(f32), &shape);
+                }
+                const item_ct = try gqaPagedAttentionIntoOp(ctx, q_slice, k_slice, v_slice, null, item_attention, 1, num_heads, num_kv_heads, head_dim, target);
                 defer freeOp(ctx, item_ct);
                 if (resident_output) |tensor| {
+                    if (collect_attention) {
+                        // Every collected page must use the supplied destination.
+                        // A canonical fallback may have produced a separate tensor;
+                        // encoding its copy now could race deferred attention.
+                        const actual = toBuf(item_ct).metal_tensor orelse return error.MetalAttentionBatchFailed;
+                        if (actual.deviceHandle() != target.?.deviceHandle() or actual.deviceByteOffset() != target.?.deviceByteOffset()) return error.MetalAttentionBatchFailed;
+                        continue;
+                    }
                     if (!try copyRows2DOp(ctx, tensor, b * max_q_rows, item_ct, 0, item_q_len, h_q)) return error.UnsupportedTensorType;
                     continue;
                 }
@@ -22408,6 +22788,8 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 @memcpy(output.?[b * q_span ..][0..item_q_span], item_output);
             }
 
+            if (collect_attention and metal_runtime.termite_metal_decode_runtime_lighton_attention_batch_end(self.provider_impl.raw_decode_runtime) != 0)
+                return error.MetalAttentionBatchFailed;
             if (resident_output) |tensor| return tensor;
             const out_shape = [_]i32{ @intCast(batch * max_q_rows), @intCast(h_q) };
             return denseBuf(self.allocator, output.?, true, &out_shape);
@@ -22468,6 +22850,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                         if (block_offsets_opt) |block_offsets_result| {
                             const block_offsets = block_offsets_result.values();
                             const slot_request = .{
+                                .destination = destination,
                                 .q = q_mt,
                                 .slot = paged_layer.slot,
                                 .format = paged_layer.format,
@@ -22529,6 +22912,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                                             layer_runtime,
                                             self.provider_impl,
                                             .{
+                                                .destination = destination,
                                                 .q = q_mt,
                                                 .slot = paged_layer.slot,
                                                 .format = paged_layer.format,
@@ -26882,7 +27266,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
 
     fn gatedFfnNoBiasOp(ctx: *anyopaque, request: *const ops.GatedFfnNoBiasRequest) anyerror!?CT {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
-        const lighton = self.lightonocr3_projections and request.rows >= 1 and request.rows <= 8 and
+        const lighton = self.lightonocr3_projections and request.rows >= 1 and request.rows <= 16 and
             ((request.hidden_size == 2560 and request.intermediate_size == 9216) or
                 (request.hidden_size == 1024 and request.intermediate_size == 3584)) and request.activation == .silu;
         if (!lighton and (self.data.a4b_inference == null or
@@ -48804,4 +49188,157 @@ test "Florence host argmax matches device nonfinite and tie semantics" {
     try std.testing.expectEqual(@as(u32, 0), MetalCompute.argmaxDenseRowSuppress(&.{ nan, nan }, &.{}));
     try std.testing.expectEqual(@as(u32, 0), MetalCompute.argmaxDenseRowSuppress(&.{ -inf, -inf }, &.{0}));
     try std.testing.expectEqual(@as(u32, 3), MetalCompute.argmaxDenseRowSuppress(&.{ nan, -inf, inf, 5, 5 }, &.{2}));
+}
+
+test "LightOnOCR3 prepared blocks decline incompatible activation and normalization" {
+    var config: @import("../models/gpt.zig").Config = .{
+        .family = .qwen3_5,
+        .hidden_size = 1024,
+        .intermediate_size = 3584,
+        .norm_type = .rms_norm,
+        .activation = .silu,
+        .norm_eps = 1e-6,
+        .norm_weight_offset = 1,
+        .qwen35_linear_num_key_heads = 16,
+        .qwen35_linear_num_value_heads = 16,
+        .qwen35_linear_key_head_dim = 128,
+        .qwen35_linear_value_head_dim = 128,
+        .qwen35_linear_conv_kernel_dim = 4,
+    };
+    try std.testing.expect(MetalCompute.lightOnPreparedConfigEligible(config));
+    config.activation = .gelu;
+    try std.testing.expect(!MetalCompute.lightOnPreparedConfigEligible(config));
+    config.activation = .silu;
+    config.norm_type = .layer_norm;
+    try std.testing.expect(!MetalCompute.lightOnPreparedConfigEligible(config));
+}
+
+test "LightOnOCR3 runtime-owned hidden storage never enters activation reuse" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    const metal_runtime = metal_runtime_mod;
+    if (!metal_runtime.metalDeviceAvailable()) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var weights = testMetalWeightStoreInit(allocator);
+    defer weights.lazy_weights.deinit(allocator);
+    var compute = try MetalCompute.init(allocator, &weights, null);
+    defer compute.deinit();
+    const cb = compute.computeBackend();
+    const raw = compute.provider_impl.raw_decode_runtime orelse return error.SkipZigTest;
+    try MetalCompute.setLightOnActivationPool(&cb, true);
+    const first = (try MetalCompute.reserveHiddenStatePair(&cb, 2, 1024)) orelse return error.SkipZigTest;
+    var first_live = true;
+    defer if (first_live) {
+        cb.free(first.front);
+        cb.free(first.back);
+    };
+    const second = (try MetalCompute.reserveHiddenStatePair(&cb, 2, 1024)) orelse return error.UnexpectedNull;
+    var second_live = true;
+    defer if (second_live) {
+        cb.free(second.front);
+        cb.free(second.back);
+    };
+    const front = MetalCompute.toBuf(first.front).metal_tensor.?.deviceHandle();
+    const back = MetalCompute.toBuf(first.back).metal_tensor.?.deviceHandle();
+    var original: [2048]f32 = undefined;
+    var changed: [2048]f32 = undefined;
+    for (&original, &changed, 0..) |*a, *b, i| {
+        a.* = @as(f32, @floatFromInt(i)) * 0.01;
+        b.* = -a.* - 7;
+    }
+    var state = MetalTensor.deviceBorrowed(@ptrCast(raw), front.?, 0, original.len * 4, &.{ 2, 1024 });
+    defer state.deinit();
+    try MetalTensor.borrowed(&original, original.len, &.{ 2, 1024 }).copyInto(&state);
+    try metal_runtime.beginFrame(raw);
+    try metal_runtime.setActiveFrameRegime(raw, .decode);
+    cb.free(first.front);
+    cb.free(first.back);
+    first_live = false;
+    cb.free(second.front);
+    cb.free(second.back);
+    second_live = false;
+    // Even two independent retained wrappers must leave the runtime's storage
+    // unavailable to an ordinary activation allocation in this same frame.
+    var activation = try MetalTensor.deviceAllocateWithAllocator(allocator, @ptrCast(raw), original.len * 4, .private, &.{ 2, 1024 });
+    var activation_live = true;
+    defer if (activation_live) activation.deinit();
+    try std.testing.expect(activation.deviceHandle() != front and activation.deviceHandle() != back);
+    try MetalTensor.borrowed(&changed, changed.len, &.{ 2, 1024 }).copyInto(&activation);
+    activation.deinit();
+    activation_live = false;
+    try metal_runtime.submitFrame(raw);
+    try metal_runtime.waitFrame(raw);
+    const values = try state.toHostSlice();
+    try std.testing.expectEqualSlices(f32, &original, values);
+    try metal_runtime.beginFrame(raw);
+    try metal_runtime.setActiveFrameRegime(raw, .decode);
+    var reused = try MetalTensor.deviceAllocateWithAllocator(allocator, @ptrCast(raw), original.len * 4, .private, &.{ 2, 1024 });
+    var reused_live = true;
+    defer if (reused_live) reused.deinit();
+    try std.testing.expect(reused.deviceHandle() != front and reused.deviceHandle() != back);
+    reused.deinit();
+    reused_live = false;
+    try metal_runtime.submitFrame(raw);
+    try metal_runtime.waitFrame(raw);
+    try std.testing.expect(MetalCompute.lightOnActivationPoolStats(&cb)[0] > 0);
+}
+
+test "LightOnOCR3 shared side weights retain immutable identities and bounded device ownership" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    if (!metal_runtime_mod.metalDeviceAvailable() or !metal_runtime_mod.qualifiedM4DeviceDefault()) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var store = testMetalWeightStoreInit(allocator);
+    defer store.lazy_weights.deinit(allocator);
+    var compute = try MetalCompute.init(allocator, &store, null);
+    defer compute.deinit();
+    compute.lightonocr3_projections = true;
+    compute.lightonocr3_policy.retain_weight_handles = true;
+    var cb = compute.computeBackend();
+    try MetalCompute.setLightOnSharedCoreWeights(&cb, true);
+    const name = "model.layers.0.linear_attn.norm.weight";
+    const data = try allocator.dupe(f32, &.{ 1, 2, 3, 4 });
+    const shape = allocator.dupe(i64, &.{4}) catch |err| {
+        allocator.free(data);
+        return err;
+    };
+    _ = try compute.getOrInsertCachedDenseWeight(name, data, shape, null, null, null, null);
+    const weight = try cb.getWeight(name);
+    var weight_live = true;
+    defer if (weight_live) cb.free(weight);
+    try std.testing.expect(MetalCompute.toBuf(weight).weight_handle_compute_owned);
+    var first = try compute.qwen35SideWeight(&cb, weight);
+    var first_live = true;
+    defer if (first_live) first.deinit();
+    var second = try compute.qwen35SideWeight(&cb, weight);
+    defer second.deinit();
+    try std.testing.expectEqual(first.deviceHandle(), second.deviceHandle());
+    try std.testing.expectEqual(@as(usize, 1), compute.lighton_shared_core_weight_hits);
+    try std.testing.expectEqual(@as(usize, 1), compute.lighton_shared_core_weight_misses);
+    const retained_bytes = compute.lighton_shared_core_weight_bytes;
+    try std.testing.expect(retained_bytes > 0 and retained_bytes <= 8 * 1024 * 1024);
+    try std.testing.expectEqual(retained_bytes, metal_runtime_mod.termite_metal_buffer_allocated_size(second.deviceHandle()));
+    // Retire a page and its source handle. The compute-owned immutable
+    // identity and the shared buffer remain valid for another page.
+    first.deinit();
+    first_live = false;
+    cb.free(weight);
+    weight_live = false;
+    const again = try cb.getWeight(name);
+    defer cb.free(again);
+    var third = try compute.qwen35SideWeight(&cb, again);
+    defer third.deinit();
+    try std.testing.expectEqual(second.deviceHandle(), third.deviceHandle());
+    try std.testing.expectEqual(@as(usize, 2), compute.lighton_shared_core_weight_hits);
+    const values = try third.toHostSlice();
+    try std.testing.expectEqualSlices(f32, &.{ 1, 2, 3, 4 }, values);
+    // An ordinary tensor can reuse an address after destruction. It must
+    // keep separate page-owned copies rather than becoming a cache identity.
+    const transient = try cb.fromFloat32Shape(&.{ 5, 6, 7, 8 }, &.{4});
+    defer cb.free(transient);
+    var bypass_a = try compute.qwen35SideWeight(&cb, transient);
+    defer bypass_a.deinit();
+    var bypass_b = try compute.qwen35SideWeight(&cb, transient);
+    defer bypass_b.deinit();
+    try std.testing.expect(bypass_a.deviceHandle() != bypass_b.deviceHandle());
+    try std.testing.expectEqual(@as(usize, 1), compute.lighton_shared_core_weights.count());
+    try std.testing.expectEqual(retained_bytes, compute.lighton_shared_core_weight_bytes);
 }

@@ -1097,6 +1097,16 @@ fn getenvFlagEnabled(comptime name: [*:0]const u8) bool {
 /// Qualified serving defaults share one hardware policy. Explicit false values
 /// disable a feature; explicit true values still allow qualification elsewhere.
 /// Model and request eligibility remain the responsibility of each caller.
+/// One opt-in serving preset; individual explicit overrides remain authoritative.
+/// Precision and admission limits are not changed by this profile.
+pub fn lightOnThroughputProfileEnabled() bool {
+    return @import("antfly_platform").env.getenvBool("ANTFLY_LIGHTONOCR3_THROUGHPUT") and qualifiedM4DeviceDefault();
+}
+
+pub fn lightOnThroughputFeatureEnabled(comptime name: [*:0]const u8) bool {
+    return @import("antfly_platform").env.getenvBoolDefault(name, lightOnThroughputProfileEnabled());
+}
+
 pub fn qualifiedM4FeatureEnabled(comptime name: [*:0]const u8, default_eligible: bool) bool {
     // HTTP admission can first read a flag from several concurrent callers.
     // Use the stateless parser here; the hardware decision is initialized once
@@ -3821,12 +3831,12 @@ fn decoderRuntimeApplyPagedKvAttentionSlotOnRuntimeWithFlush(
     const sink_count: usize = if (sinks) |slice| slice.len else 0;
 
     const attention_shape = [_]i32{ @intCast(q_rows), @intCast(attention_input_size) };
-    var output = try MetalTensor.deviceAllocate(
-        @ptrCast(runtime),
-        q_rows * attention_input_size * @sizeOf(f32),
-        .private,
-        &attention_shape,
-    );
+    const destination: ?MetalTensor = if (@hasField(@TypeOf(request), "destination")) request.destination else null;
+    const output_bytes = q_rows * attention_input_size * @sizeOf(f32);
+    var output = if (destination) |target| blk: {
+        if (!target.isDevice() or target.elemCount() != q_rows * attention_input_size or target.deviceByteLen() != output_bytes) return error.InvalidAttentionShape;
+        break :blk try target.retainedView(0, output_bytes, &attention_shape);
+    } else try MetalTensor.deviceAllocate(@ptrCast(runtime), output_bytes, .private, &attention_shape);
     errdefer output.deinit();
 
     const rc = termite_metal_decode_runtime_attention_paged_slot_device(
@@ -3921,12 +3931,12 @@ pub fn decoderRuntimeApplyPagedKvAttentionSlotOnFrame(
     if (request.page_size == 0 or request.block_token_offsets.len == 0) return null;
 
     const attention_shape = [_]i32{ @intCast(q_rows), @intCast(attention_input_size) };
-    var output = try MetalTensor.deviceAllocate(
-        @ptrCast(frame_runtime),
-        q_rows * attention_input_size * @sizeOf(f32),
-        .private,
-        &attention_shape,
-    );
+    const destination: ?MetalTensor = if (@hasField(@TypeOf(request), "destination")) request.destination else null;
+    const output_bytes = q_rows * attention_input_size * @sizeOf(f32);
+    var output = if (destination) |target| blk: {
+        if (!target.isDevice() or target.elemCount() != q_rows * attention_input_size or target.deviceByteLen() != output_bytes) return error.InvalidAttentionShape;
+        break :blk try target.retainedView(0, output_bytes, &attention_shape);
+    } else try MetalTensor.deviceAllocate(@ptrCast(frame_runtime), output_bytes, .private, &attention_shape);
     errdefer output.deinit();
 
     const rc = termite_metal_decode_runtime_attention_paged_slot_device_on_frame(
@@ -49687,3 +49697,46 @@ test "embeddinggemma2 Metal multiplication plans retain full tiles tails and des
 pub extern fn antfly_metal_rotary_table(runtime: ?*RawMetalDecodeRuntime, output: ?*anyopaque, offset: usize, dim: u32, x: u32, y: u32, theta: f32, vision: u32) c_int;
 
 pub extern fn antfly_metal_video_position(runtime: ?*RawMetalDecodeRuntime, input: ?*anyopaque, input_offset: usize, output: ?*anyopaque, output_offset: usize, rows: u32, grid_x: u32, grid_y: u32, axis: u32) c_int;
+
+/// Prepared recurrent decoder blocks borrow model-owned slots and frame-safe
+/// persistent buffers. Zero declines before any encode; negative is fatal.
+pub extern fn termite_metal_decode_runtime_lighton_prepared_linear_block(
+    runtime: ?*RawMetalDecodeRuntime,
+    slots: [*]const usize,
+    norms: [*]const ?*anyopaque,
+    norm_offsets: [*]const usize,
+    input: ?*anyopaque,
+    input_offset: usize,
+    buffers: [*]const ?*anyopaque,
+    offsets: [*]const usize,
+    states: [*]const ?*anyopaque,
+    state_offsets: [*]const usize,
+    rows: usize,
+    hidden: usize,
+    intermediate: usize,
+    value_heads: usize,
+) c_int;
+
+pub extern fn termite_metal_decode_runtime_set_lighton_activation_pool(runtime: ?*RawMetalDecodeRuntime, limit: usize) c_int;
+pub extern fn termite_metal_decode_runtime_lighton_activation_pool_stats(runtime: ?*RawMetalDecodeRuntime, out: *[4]u64) void;
+
+pub extern fn termite_metal_decode_runtime_lighton_wide_projection_tiles(runtime: ?*RawMetalDecodeRuntime) u64;
+
+pub extern fn termite_metal_decode_runtime_argmax_on_frame_calls(runtime: ?*RawMetalDecodeRuntime) u64;
+
+pub extern fn termite_metal_decode_runtime_lighton_wide_mpp_stats(runtime: ?*RawMetalDecodeRuntime, values: *[2]u64) void;
+
+pub extern fn termite_metal_buffer_allocated_size(handle: ?*anyopaque) usize;
+
+pub extern fn termite_metal_decode_runtime_stream_frames_available(runtime: ?*RawMetalDecodeRuntime) c_int;
+
+// Scoped by MetalCompute's decode batch. Every error path aborts collection;
+// the owning forward retains responsibility for draining its frame.
+pub extern fn termite_metal_decode_runtime_lighton_attention_batch_begin(runtime: ?*RawMetalDecodeRuntime) c_int;
+pub extern fn termite_metal_decode_runtime_lighton_attention_batch_end(runtime: ?*RawMetalDecodeRuntime) c_int;
+pub extern fn termite_metal_decode_runtime_lighton_attention_batch_abort(runtime: ?*RawMetalDecodeRuntime) void;
+pub extern fn termite_metal_decode_runtime_lighton_attention_batch_stats(runtime: ?*RawMetalDecodeRuntime, out: *[3]u64) void;
+
+pub extern fn termite_metal_decode_runtime_lighton_attention_batch_release(runtime: ?*RawMetalDecodeRuntime) c_int;
+
+pub extern fn termite_metal_decode_runtime_lighton_prefill_pack_stats(runtime: ?*RawMetalDecodeRuntime, out: *[2]u64) void;
