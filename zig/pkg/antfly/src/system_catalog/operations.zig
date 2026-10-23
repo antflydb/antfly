@@ -2124,6 +2124,10 @@ pub fn call(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestCo
             try request.validate();
             try svc.ensureLinearizableReadWithContext(context);
             const store = svc.projectedStore() orelse return error.MissingMetadataStore;
+            if (request.column) |column| {
+                const stamp = try svc.commentColumnWithContext(context, request.guard, .{ .name = column, .value = request.description });
+                break :blk std.json.Stringify.valueAlloc(alloc, @import("server_call.zig").RelationReplacementResult{ .schema_version = request.guard.owner.schema_version, .stamp = stamp }, .{}) catch return error.MetadataMutationOutcomeUnknown;
+            }
             const before = (try store.getTable(alloc, svc.metadata_group_id, request.guard.owner.table_id)) orelse return error.CatalogGenerationChanged;
             defer table_manager.freeTable(alloc, before);
             var after = try table_manager.cloneTable(alloc, before);

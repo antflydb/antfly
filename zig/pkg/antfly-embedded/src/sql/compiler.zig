@@ -3517,13 +3517,27 @@ const Parser = struct {
         if (self.keyword(.merge)) return .{ .merge = try self.merge() };
         if (self.ddlWord("COMMENT")) {
             try self.expectKeyword(.on);
-            if (!self.keyword(.table)) return self.fail(error.UnsupportedSqlShape, "this comment target requires catalog annotation support");
-            const target = try self.name();
+            const column_comment = self.keyword(.column);
+            if (!column_comment and !self.keyword(.table)) return self.fail(error.UnsupportedSqlShape, "this comment target requires catalog annotation support");
+            var comment_column: ?[]const u8 = null;
+            const target = if (column_comment) column_target: {
+                var parts: [4][]const u8 = undefined;
+                var count: usize = 0;
+                while (true) {
+                    if (count == parts.len) return self.fail(error.InvalidSqlSyntax, "column comment name has too many qualifiers");
+                    parts[count] = try self.identifier();
+                    count += 1;
+                    if (!self.take(.dot)) break;
+                }
+                if (count < 2) return self.fail(error.InvalidSqlSyntax, "column comment requires a table and column");
+                comment_column = parts[count - 1];
+                break :column_target ast.Name{ .database = if (count == 4) parts[0] else null, .namespace = if (count >= 3) parts[count - 3] else null, .table = parts[count - 2] };
+            } else try self.name();
             try self.expectKeyword(.is);
             if (!self.peek(.string) and !(self.pos < self.tokens.len and self.tokens[self.pos].isKeyword(.null)))
                 return self.fail(error.InvalidSqlSyntax, "COMMENT requires a string literal or NULL");
             const text = try self.value();
-            return .{ .catalog_ddl = .{ .kind = .table, .action = .comment, .name = target, .comment_value = if (text == .string) text.string else null } };
+            return .{ .catalog_ddl = .{ .kind = .table, .action = .comment, .name = target, .comment_value = if (text == .string) text.string else null, .comment_column = comment_column } };
         }
         if (self.keyword(.create)) {
             if (self.keyword(.@"or")) {
@@ -4792,4 +4806,16 @@ test "SQL original PostgreSQL invalid grammar retains syntax diagnostics" {
         }
     }
     try std.testing.expectEqual(@as(usize, 0), failures);
+}
+
+test "compiler SQL COMMENT COLUMN binds quoted and qualified identity without schema mutation" {
+    const a = std.testing.allocator;
+    for ([_][]const u8{ "COMMENT ON COLUMN usage_records.status IS 'application state'", "COMMENT ON COLUMN public.usage_records.status IS NULL", "COMMENT ON COLUMN appdb.public.usage_records.status IS ''", "COMMENT ON COLUMN \"usage_records\".\"status\" IS 'a ''quoted'' Ω'" }) |sql| {
+        var compiled = try compile(a, sql, .{});
+        defer compiled.deinit();
+        try std.testing.expectEqualStrings("usage_records", compiled.statement.catalog_ddl.name.table);
+        try std.testing.expectEqualStrings("status", compiled.statement.catalog_ddl.comment_column.?);
+        try std.testing.expectEqual(@as(@FieldType(ast.CatalogDdl, "action"), .comment), compiled.statement.catalog_ddl.action);
+        try std.testing.expect(compiled.statement.catalog_ddl.schema_change == null);
+    }
 }

@@ -526,6 +526,37 @@ fn replaceTableDefinitionGuardedWithReceipt(
     return replaceTableDefinitionGuardedWithContextReceipt(service, expected, replacement, relation_guard, .{});
 }
 
+fn commentColumnWithContextReceipt(service: anytype, context: api_operation.RequestContext, guard: relation_catalog.RelationMutationGuard, column: @import("antfly_local_sources").system_catalog_column_identities.Description) !metadata_api.CatalogMutationStamp {
+    try context.ensureActive();
+    column.validate() catch |err| return if (err == error.CatalogCommandTooLarge) error.ProgramLimitExceeded else err;
+    const store = service.projectedStore() orelse return error.MissingMetadataStore;
+    const table = (try store.getTable(service.alloc, service.metadata_group_id, guard.owner.table_id)) orelse return error.CatalogGenerationChanged;
+    defer metadata_table_manager.freeTable(service.alloc, table);
+    try requireRelationMutationOwnerWithContext(service, table, guard, context);
+    var attributes = try store.getSqlColumnIdentities(service.alloc, service.metadata_group_id, guard);
+    defer attributes.deinit();
+    const id = for (attributes.value.columns) |attribute| {
+        if (std.mem.eql(u8, attribute.name, column.name)) break attribute.id;
+    } else return error.UndefinedColumn;
+    const candidate = attributes.value.encodeDescription(service.alloc, id, column.value) catch |err| return if (err == error.ColumnIdentityLimitExceeded) error.ProgramLimitExceeded else err;
+    service.alloc.free(candidate);
+    try ensureDurableDecoderActivation(service, context, metadata_topology_protocol.sql_column_comments_version);
+    const command: metadata_storage.ColumnDescriptionCommand = .{ .guard = guard, .column = column, .column_id = id, .epoch = attributes.value.epoch };
+    const incarnation = (try service.metadataIncarnation()) orelse return error.MissingMetadataIncarnation;
+    const receipt = try service.proposeTransitionCommandWithReceipt(.{ .comment_column = command });
+    service.waitForTransitionAppliedWithContext(receipt, context) catch return error.MetadataMutationOutcomeUnknown;
+    // After admission, only observation of the exact bound identity and value
+    // proves success; a changed layout/owner is an ambiguous outcome, not retry.
+    var applied = store.getSqlColumnIdentities(service.alloc, service.metadata_group_id, guard) catch return error.MetadataMutationOutcomeUnknown;
+    defer applied.deinit();
+    if (!std.meta.eql(applied.value.epoch, command.epoch)) return error.MetadataMutationOutcomeUnknown;
+    const actual = applied.value.columnById(id) orelse return error.MetadataMutationOutcomeUnknown;
+    const expected = if (column.value) |text| if (text.len != 0) text else null else null;
+    if ((actual.description == null) != (expected == null)) return error.MetadataMutationOutcomeUnknown;
+    if (expected) |text| if (!std.mem.eql(u8, actual.description.?, text)) return error.MetadataMutationOutcomeUnknown;
+    return .{ .metadata_group_id = service.metadata_group_id, .metadata_incarnation = incarnation, .term = receipt.term, .index = receipt.index };
+}
+
 fn replaceTableDefinitionGuardedWithContextReceipt(
     service: anytype,
     expected: metadata_table_manager.TableRecord,
@@ -3529,6 +3560,7 @@ fn resolverRequiredCoordinatedDecoderVersion(command: metadata_storage.Transitio
 }
 
 fn baseRequiredCoordinatedDecoderVersion(command: metadata_storage.TransitionCommand) u16 {
+    if (command == .comment_column) return metadata_topology_protocol.sql_column_comments_version;
     if (command == .apply_sql_sequence_counter) return metadata_topology_protocol.sql_sequence_catalog_version;
     if (command == .apply_sql_settings and @import("schema_reader_wire.zig").requiresRoleDefaults(command.apply_sql_settings)) return metadata_topology_protocol.sql_role_defaults_version;
     if (command == .apply_schema_validation) return metadata_topology_protocol.schema_validation_publication_version;
@@ -7324,6 +7356,10 @@ pub const MetadataService = struct {
         return self.replaceRelationTableDefinitionStampedWithContext(.{}, expected, replacement, guard);
     }
 
+    pub fn commentColumnWithContext(self: *MetadataService, context: api_operation.RequestContext, guard: relation_catalog.RelationMutationGuard, column: @import("antfly_local_sources").system_catalog_column_identities.Description) !metadata_api.CatalogMutationStamp {
+        return commentColumnWithContextReceipt(self, context, guard, column);
+    }
+
     pub fn replaceRelationTableDefinitionStampedWithContext(self: *MetadataService, context: api_operation.RequestContext, expected: metadata_table_manager.TableRecord, replacement: metadata_table_manager.TableRecord, guard: relation_catalog.RelationMutationGuard) !metadata_api.CatalogMutationStamp {
         try requireRelationMutationOwnerWithContext(self, expected, guard, context);
         try ensureDurableDecoderActivation(self, context, if (guard.constraint_name_admission != null) metadata_topology_protocol.constraint_occupancy_version else metadata_topology_protocol.relation_mutation_version);
@@ -10381,6 +10417,10 @@ pub const MetadataHttpService = struct {
 
     pub fn replaceRelationTableDefinitionStamped(self: *MetadataHttpService, expected: metadata_table_manager.TableRecord, replacement: metadata_table_manager.TableRecord, guard: relation_catalog.RelationMutationGuard) !metadata_api.CatalogMutationStamp {
         return self.replaceRelationTableDefinitionStampedWithContext(.{}, expected, replacement, guard);
+    }
+
+    pub fn commentColumnWithContext(self: *MetadataHttpService, context: api_operation.RequestContext, guard: relation_catalog.RelationMutationGuard, column: @import("antfly_local_sources").system_catalog_column_identities.Description) !metadata_api.CatalogMutationStamp {
+        return commentColumnWithContextReceipt(self, context, guard, column);
     }
 
     pub fn replaceRelationTableDefinitionStampedWithContext(self: *MetadataHttpService, context: api_operation.RequestContext, expected: metadata_table_manager.TableRecord, replacement: metadata_table_manager.TableRecord, guard: relation_catalog.RelationMutationGuard) !metadata_api.CatalogMutationStamp {

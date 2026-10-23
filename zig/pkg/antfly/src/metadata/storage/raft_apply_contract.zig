@@ -303,6 +303,7 @@ pub const CatalogProjectionRequest = union(enum) {
     catalog_admission: system_catalog.Mutation,
     catalog_prepare: SystemCatalogCommand,
     sql_sequence_admission_head: void,
+    sql_column_identities: @import("antfly_local_sources").system_catalog_domain.RelationMutationGuard,
     sql_sequence_snapshot: @import("../../system_catalog/sequence_catalog.zig").SnapshotRequest,
     sql_sequence_preflight: @import("../../system_catalog/sequence_catalog.zig").Mutation,
     sql_sequence_outcome: @import("../../system_catalog/sequence_catalog.zig").Mutation,

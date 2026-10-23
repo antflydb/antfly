@@ -2,6 +2,31 @@
   "ledger_format": 1,
   "inventory_sha256": "c203a4dcf0094b75e1d3764e90beebddaf844a9ce604543c0a4dbc0ffe8ae173",
   "gates": {
+    "sql-qualified-column-comment-native-debug": {
+      "command": ["zig", "build", "antfly-api-sql-column-comment-lifecycle-test", "-Doptimize=Debug", "-j1"],
+      "cwd": "zig",
+      "timeout_seconds": 1800
+    },
+    "sql-qualified-column-comment-admission-debug": {
+      "command": ["zig", "build", "antfly-metadata-sql-presentation-test", "-Doptimize=Debug", "-j1"],
+      "cwd": "zig",
+      "timeout_seconds": 1800
+    },
+    "sql-qualified-column-comment-parser-debug": {
+      "command": ["zig", "build", "sql-test", "-Dtest-filter=compiler SQL COMMENT", "-Doptimize=Debug", "-j1"],
+      "cwd": "zig",
+      "timeout_seconds": 1800
+    },
+    "sql-qualified-column-comment-identity-debug": {
+      "command": ["zig", "test", "pkg/antfly-embedded/src/system_catalog/column_identities.zig", "-O", "Debug"],
+      "cwd": "zig",
+      "timeout_seconds": 180
+    },
+    "sql-qualified-column-comment-postgres": {
+      "command": ["uv", "run", "--offline", "--no-project", "--with", "psycopg[binary]==3.3.6", "python", "scripts/generate_sql_column_comment_reference.py", "--check", "zig/pkg/antfly-embedded/src/sql/fixtures/sql_column_comment_reference.json"],
+      "cwd": ".",
+      "timeout_seconds": 180
+    },
     "sql-qualified-sequence-native-debug": {
       "command": ["zig", "build", "antfly-api-sql-sequence-lifecycle-test", "-Dtest-filter=mounted SQL original sequence declarations", "-Doptimize=Debug", "-j1"],
       "cwd": "zig",
@@ -4057,8 +4082,35 @@
     },
     {
       "id": "sql-0143",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The unchanged COMMENT ON COLUMN binds the authorized table incarnation, immutable schema epoch and stable native column ID. Existing catalog transactions retain bounded comments without table-definition, index or user-row rewrites. PostgreSQL and authenticated public SQL agree on quoted/Unicode text, NULL/empty removal and permission errors; missing columns retain 42703 across runtime and forwarding boundaries. The native mounted campaign independently reopens metadata, session and data owners and verifies exact comments, stable IDs, complete row values, versions and digests. Rename/drop-reuse and aggregate encoded-size tests protect identity and bounded storage; stale or over-budget committed commands cannot wedge ordered apply. This qualifies column comments, not index/routine annotations or arbitrary multi-node failure.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_document_mutation_lifecycle_integration_test.zig",
+          "test": "mounted SQL original column comment preserves stable identities rows privileges and cold owners",
+          "gate": "sql-qualified-column-comment-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/metadata/storage/raft_apply_store.zig",
+          "test": "SQL COMMENT column writer fences decoder epoch and stable identity without changing table definition",
+          "gate": "sql-qualified-column-comment-admission-debug"
+        },
+        {
+          "path": "zig/pkg/antfly-embedded/src/sql/compiler.zig",
+          "test": "compiler SQL COMMENT COLUMN binds quoted and qualified identity without schema mutation",
+          "gate": "sql-qualified-column-comment-parser-debug"
+        },
+        {
+          "path": "zig/pkg/antfly-embedded/src/system_catalog/column_identities.zig",
+          "test": "SQL column comments follow stable identities through rename and never survive drop reuse",
+          "gate": "sql-qualified-column-comment-identity-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_document_mutation_lifecycle_integration_test.zig",
+          "test": "mounted SQL original column comment preserves stable identities rows privileges and cold owners",
+          "gate": "sql-qualified-column-comment-postgres"
+        }
+      ]
     },
     {
       "id": "sql-0144",

@@ -30,6 +30,7 @@ const Mapping = struct {
 };
 
 const mappings = [_]Mapping{
+    .{ .status = .undefined_column, .err = error.UndefinedColumn },
     .{ .status = .conflicting_data_apply_batch, .err = error.ConflictingDataApplyBatch },
     .{ .status = .invalid_data_apply_batch, .err = error.InvalidDataApplyBatch },
     .{ .status = .split_source_projection_not_ready, .err = error.SplitSourceProjectionNotReady },

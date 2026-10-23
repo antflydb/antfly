@@ -8,19 +8,45 @@ a completion claim. PostgreSQL is the SQL standard and independent test oracle.
 
 ## Current original-case qualification (2026-10-23)
 
-The ledger now records **762 implemented / 137 rejected / 428 superseded /
-259 unresolved**. The requested next-100 batch has closed **34 original cases**:
+The ledger now records **763 implemented / 137 rejected / 428 superseded /
+258 unresolved**. The requested next-100 batch has closed **35 original cases**:
 `sql-0011`, `sql-0014`, `sql-0570`, `sql-0580`, `sql-0586`, `sql-0591`,
 `sql-0595`, `sql-0883`, `sql-0927`, `sql-0935`, `sql-0343`–`sql-0349`,
 `sql-1456`, `sql-1459`, `sql-1464`, `sql-0005`, `sql-0008`, `sql-0009`,
-`sql-0010`, `sql-0142`, `sql-0311`–`sql-0317`, and `sql-0744`–`sql-0745`;
-**66 of that target remain unfinished**. Twenty-nine are implementations; five are
+`sql-0010`, `sql-0142`–`sql-0143`, `sql-0311`–`sql-0317`, and `sql-0744`–`sql-0745`;
+**65 of that target remain unfinished**. Thirty are implementations; five are
 PostgreSQL-invalid originals (outer recursive MERGE, 42601, and ambiguous
 `RETURNING id`, 42702, ALTER ROLE SET with an expression, 42601, and two
-index names used as constraints, 42704), not thirty-four
+index names used as constraints, 42704), not thirty-five
 newly supported forms. The earlier sixteen mutation witnesses are ten original
-cases, not sixteen completions. **167 unresolved DDL/catalog cases remain open**; the role
+cases, not sixteen completions. **166 unresolved DDL/catalog cases remain open**; the role
 default cohort does not complete that feature work.
+
+### Column comments: stable attributes and bounded catalog admission
+
+The unchanged `sql-0143` COMMENT ON COLUMN now binds the authorized table
+incarnation, schema epoch and stable column ID. It shares the existing catalog
+transaction, native metadata snapshot and hot-standby machinery. No table
+record, schema/index byte or primary row is rewritten. Descriptions follow
+renames; a dropped name receives a fresh identity without the old annotation.
+NULL and empty strings remove the annotation, matching PostgreSQL.
+
+Preparation validates the complete encoded successor before admission. Apply
+revalidates against the current committed state; stale bindings or aggregate
+size conflicts are deterministic no-ops, preserving ordered-log progress.
+Post-admission failure to observe the exact result remains an unknown outcome.
+Missing columns retain `42703` through callback and definite HTTP forwarding
+boundaries; existing released wire identifiers remain unchanged. Decoder
+version 65 is durably activated through the existing membership barrier.
+
+The independent PostgreSQL 18 witness, two parser tests, eight native identity
+tests, five metadata presentation/admission tests and authenticated mounted
+cold-restart campaign pass in Debug without skips, failures or leaks. Complete
+row values, primary digests and versions are unchanged. The Debug production
+CLI builds and runs using the existing native macOS final-link machinery,
+which avoids the large server's Zig Mach-O relocation overflow. This closes
+one original case, advancing the requested batch to **35/100**. Index/routine
+annotations and the separately documented distributed restore work remain open.
 
 ### SET NOT NULL: validation-only publication and durable ACK recovery
 

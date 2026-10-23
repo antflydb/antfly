@@ -410,6 +410,11 @@ pub const RaftApplyStore = struct {
     pub fn sqlSequenceAdmissionHead(self: *RaftApplyStore, group_id: u64) !u64 {
         return self.catalogProjection(u64, self.alloc, group_id, .{ .sql_sequence_admission_head = {} });
     }
+    pub fn getSqlColumnIdentities(self: *RaftApplyStore, alloc: std.mem.Allocator, group: u64, guard: @import("antfly_local_sources").system_catalog_domain.RelationMutationGuard) !std.json.Parsed(@import("antfly_local_sources").system_catalog_column_identities.State) {
+        const bytes = try self.catalogProjection([]u8, alloc, group, .{ .sql_column_identities = guard });
+        defer alloc.free(bytes);
+        return @import("antfly_local_sources").system_catalog_column_identities.State.decode(alloc, bytes);
+    }
     pub fn sqlSequenceSnapshot(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, request: @import("../system_catalog/sequence_catalog.zig").SnapshotRequest, context: @import("antfly_local_sources").api_operation.RequestContext) ![]u8 {
         try context.ensureActive();
         try request.validate();

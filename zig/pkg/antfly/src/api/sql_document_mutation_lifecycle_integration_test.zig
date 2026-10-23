@@ -434,6 +434,137 @@ test "mounted SQL original table comment preserves schema rows privileges and al
     });
 }
 
+test "mounted SQL original column comment preserves stable identities rows privileges and cold owners" {
+    // sql-0143: the existing stable column map owns presentation metadata.
+    const Reference = struct {
+        format: u8,
+        id: []const u8,
+        steps: []const struct { sql: []const u8, description: ?[]const u8 },
+        denied_sqlstate: []const u8,
+    };
+    const TableRecord = @import("../metadata/table_manager.zig").TableRecord;
+    const CommentCampaign = struct {
+        pub const native_sessions = true;
+        pub const native_auth = true;
+        pub const cold_catalog = true;
+        inner: SourceCampaign,
+        reference: Reference,
+        initial: ?TableRecord = null,
+        column_id: u64 = 0,
+
+        fn record(ctx: *fixture.Context, a: std.mem.Allocator) !TableRecord {
+            const domain = local.system_catalog_domain;
+            const source = @import("http_server.zig").StatusSource.fromMetadataHttpService(ctx.metadata.server.svc);
+            const bytes = try source.systemCatalog(ctx.alloc, .{}, .{ .resolve = .{ .table = "usage_records" } });
+            defer ctx.alloc.free(bytes);
+            var resolved = try std.json.parseFromSlice(?domain.ResolvedTable, ctx.alloc, bytes, .{});
+            defer resolved.deinit();
+            const binding = resolved.value orelse return error.MissingSourceRelation;
+            const store = ctx.metadata.server.svc.projectedStore() orelse return error.MissingMetadataStore;
+            return (try store.getTable(a, 2188, binding.table_id)) orelse error.MissingSourceRelation;
+        }
+
+        fn verifyMetadata(self: *@This(), ctx: *fixture.Context, description: ?[]const u8) !void {
+            const manager = @import("../metadata/table_manager.zig");
+            const current = try record(ctx, ctx.alloc);
+            defer manager.freeTable(ctx.alloc, current);
+            try std.testing.expect(manager.tableDefinitionsEqual(self.initial.?, current));
+            var arena = std.heap.ArenaAllocator.init(ctx.alloc);
+            defer arena.deinit();
+            const a = arena.allocator();
+            const api = @import("sql_catalog.zig");
+            const captured = (try api.captureTableAdmission(ctx.metadata.server.owned_public_http_server.?, null, .{}, a, .{ .table = "usage_records" }, false, null)) orelse return error.MissingSourceRelation;
+            const store = ctx.metadata.server.svc.projectedStore() orelse return error.MissingMetadataStore;
+            var attributes = try store.getSqlColumnIdentities(a, 2188, captured.guard);
+            defer attributes.deinit();
+            const column = for (attributes.value.columns) |column| {
+                if (std.mem.eql(u8, column.name, "status")) break column;
+            } else return error.MissingSourceColumn;
+            if (self.column_id == 0) self.column_id = column.id else try std.testing.expectEqual(self.column_id, column.id);
+            if (description) |text| try std.testing.expectEqualStrings(text, column.description.?) else try std.testing.expect(column.description == null);
+            for (attributes.value.columns) |other| if (other.id != column.id) try std.testing.expect(other.description == null);
+            try self.inner.fingerprints(ctx, .prepared);
+            try self.inner.verifyRows(ctx);
+        }
+
+        pub fn beforeRestart(self: *@This(), ctx: *fixture.Context) !void {
+            try self.inner.setup(ctx);
+            // Actual public credentials, not an auth-disabled DDL fixture.
+            ctx.headers = ctx.admin_headers;
+            self.initial = try record(ctx, self.inner.retained.allocator());
+            for (self.reference.steps) |step| {
+                var response = try client.execute(ctx, step.sql, .write_admission);
+                defer response.deinit(ctx.alloc);
+                if (response.status != 200) std.debug.print("table comment status={d} body={s}\n", .{ response.status, response.body });
+                try std.testing.expectEqual(@as(u16, 200), response.status);
+                var output = try std.json.parseFromSlice(wire.SQLResponse, ctx.alloc, response.body, .{});
+                defer output.deinit();
+                try std.testing.expectEqualStrings("COMMENT", output.value.command_tag);
+                try std.testing.expectEqual(@as(i64, 0), output.value.rows_affected);
+                try std.testing.expectEqual(@as(usize, 0), output.value.rows.len);
+                try self.verifyMetadata(ctx, step.description);
+            }
+            var reader = ctx.*;
+            reader.headers = ctx.reader_headers;
+            var rejected = try client.execute(&reader, self.reference.steps[0].sql, .write_admission);
+            defer rejected.deinit(ctx.alloc);
+            try std.testing.expectEqual(@as(u16, 403), rejected.status);
+            var diagnostic = try std.json.parseFromSlice(wire.SQLDiagnostic, ctx.alloc, rejected.body, .{});
+            defer diagnostic.deinit();
+            try std.testing.expectEqualStrings(self.reference.denied_sqlstate, diagnostic.value.code);
+            try self.verifyMetadata(ctx, self.reference.steps[self.reference.steps.len - 1].description);
+            var missing = try client.execute(ctx, "COMMENT ON COLUMN usage_records.missing_column IS 'must not create'", .write_admission);
+            defer missing.deinit(ctx.alloc);
+            if (missing.status != 400) std.debug.print("missing column status={d} body={s}\n", .{ missing.status, missing.body });
+            try std.testing.expectEqual(@as(u16, 400), missing.status);
+            var missing_diagnostic = try std.json.parseFromSlice(wire.SQLDiagnostic, ctx.alloc, missing.body, .{});
+            defer missing_diagnostic.deinit();
+            try std.testing.expectEqualStrings("42703", missing_diagnostic.value.code);
+            try self.verifyMetadata(ctx, self.reference.steps[self.reference.steps.len - 1].description);
+            try self.inner.verify(ctx, false);
+        }
+
+        pub fn afterRestart(self: *@This(), ctx: *fixture.Context) !void {
+            _ = try fixture.waitServingSchema(ctx, "usage_records", 0);
+            try self.verifyMetadata(ctx, self.reference.steps[self.reference.steps.len - 1].description);
+            try self.inner.verify(ctx, true);
+        }
+    };
+    const a = std.testing.allocator;
+    var parsed = try std.json.parseFromSlice(Reference, a, local.sql_parity_fixtures.column_comment_reference, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(u8, 1), parsed.value.format);
+    try std.testing.expectEqualStrings("sql-0143", parsed.value.id);
+    try std.testing.expectEqual(@as(usize, 5), parsed.value.steps.len);
+    var corpus = try local.sql_parity_fixtures.Corpus.init(a);
+    defer corpus.deinit();
+    try std.testing.expectEqualStrings((try corpus.get("sql-0143")).sql, parsed.value.steps[0].sql);
+    var retained = std.heap.ArenaAllocator.init(a);
+    defer retained.deinit();
+    const rows = [_][]const Json{ &.{ .{ .string = "u1" }, .{ .string = "before" } }, &.{ .{ .string = "u9" }, .{ .string = "untouched" } } };
+    try fixture.runWithState(CommentCampaign, .{
+        .reference = parsed.value,
+        .inner = .{
+            .retained = &retained,
+            .entry = .{
+                .id = "sql-0143",
+                .profile = "description",
+                .sqlstate = null,
+                .command_tag = "COMMENT",
+                .affected = 0,
+                .output = .{ .columns = &.{}, .column_oids = &.{}, .rows = &.{} },
+                .tables = &.{.{
+                    .name = "usage_records",
+                    .create = "CREATE TABLE usage_records(id TEXT PRIMARY KEY,status TEXT)",
+                    .seed = "INSERT INTO usage_records(id,status) VALUES ('u1','before'),('u9','untouched')",
+                    .read = "SELECT id,status FROM usage_records ORDER BY id",
+                    .final = .{ .columns = &.{ "id", "status" }, .column_oids = &.{ 25, 25 }, .rows = &rows },
+                }},
+            },
+        },
+    });
+}
+
 test "transaction commit version retains nanoseconds and rejects overflow" {
     const version = local.api_local_transaction_contract.commitVersion;
     try std.testing.expectEqual(@as(u64, 9007199254740994), try version(9007199254740993));

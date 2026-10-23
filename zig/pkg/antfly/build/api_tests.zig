@@ -2238,6 +2238,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "mounted SQL original source mutations preserve constrained postimages errors defaults and cold identities",
             "mounted SQL original prepared CTE sources preserve deferral exact protocol results and cold identities",
             "mounted SQL original table comment preserves schema rows privileges and all cold owners",
+            "mounted SQL original column comment preserves stable identities rows privileges and cold owners",
             "transaction read preflight preserves physical unique absence without relabeling optimistic conflicts",
             "transaction commit version retains nanoseconds and rejects overflow",
             "SQL session overlay staged versions retain original fences through projection and cursor release",
@@ -2363,6 +2364,10 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     sql_table_comment_run.addArg("--require-no-skips");
     b.step("antfly-api-sql-table-comment-lifecycle-test", "Verify existing table-description metadata with stable schemas, primary rows and complete cold recovery")
         .dependOn(&sql_table_comment_run.step);
+    const sql_column_comment_run = addFilteredTestRunArtifactWithRuntimeFilters(b, sql_owner_lifecycle_tests, &.{"mounted SQL original column comment preserves stable identities rows privileges and cold owners"});
+    sql_column_comment_run.addArg("--require-no-skips");
+    b.step("antfly-api-sql-column-comment-lifecycle-test", "Verify original column COMMENT, stable identities, unchanged rows and cold metadata recovery")
+        .dependOn(&sql_column_comment_run.step);
     const sql_owner_admission_run = addFilteredTestRunArtifactWithRuntimeFilters(b, sql_owner_lifecycle_tests, &.{ "SQL catalog lifecycle retries only explicit definite DDL nonadmission", "SQL default lifecycle retries only definite read admission" });
     sql_owner_admission_run.addArg("--require-no-skips");
     b.step("antfly-api-sql-owner-admission-test", "Verify SQL owner campaigns never replay admitted or ambiguous writes")

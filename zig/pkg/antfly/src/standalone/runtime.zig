@@ -3687,6 +3687,19 @@ const LocalStandaloneMetadata = struct {
                 try context.ensureActive();
                 try request.validate();
                 const store = self.lifecycle_store orelse return error.UnsupportedOperation;
+                if (request.column) |name| {
+                    var attributes = try store.getSqlColumnIdentities(alloc, group_ids.main_metadata_group_id, request.guard);
+                    defer attributes.deinit();
+                    const id = for (attributes.value.columns) |attribute| {
+                        if (std.mem.eql(u8, attribute.name, name)) break attribute.id;
+                    } else return error.UndefinedColumn;
+                    const reply = try std.json.Stringify.valueAlloc(alloc, @import("../system_catalog/server_call.zig").RelationReplacementResult{ .schema_version = request.guard.owner.schema_version }, .{});
+                    errdefer alloc.free(reply);
+                    try context.ensureActive();
+                    store.applyStandaloneCommand(group_ids.main_metadata_group_id, .{ .comment_column = .{ .guard = request.guard, .column = .{ .name = name, .value = request.description }, .column_id = id, .epoch = attributes.value.epoch } }) catch |err| return if (err == error.ColumnIdentityLimitExceeded) error.ProgramLimitExceeded else err;
+                    self.reloadLifecycleProjectionLocked() catch return error.MetadataMutationOutcomeUnknown;
+                    return reply;
+                }
                 const before = (try store.getTable(alloc, group_ids.main_metadata_group_id, request.guard.owner.table_id)) orelse return error.CatalogGenerationChanged;
                 defer antfly.metadata.table_manager.freeTable(alloc, before);
                 var after = try antfly.metadata.table_manager.cloneTable(alloc, before);

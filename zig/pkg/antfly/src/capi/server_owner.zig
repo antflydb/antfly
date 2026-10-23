@@ -1948,6 +1948,12 @@ pub fn metadataApplyStoreProjection(
                     const value = handle.store.sqlSequenceAdmissionHead(group_id) catch |err| break :blk storageOwnerStatusFromError(err);
                     break :blk metadataProjectionJson(alloc, out_json, value);
                 },
+                .sql_column_identities => |guard| {
+                    var state = handle.store.getSqlColumnIdentities(a, group_id, guard) catch |err| break :blk storageOwnerStatusFromError(err);
+                    defer state.deinit();
+                    const bytes = state.value.encode(a) catch |err| break :blk storageOwnerStatusFromError(err);
+                    break :blk metadataProjectionJson(alloc, out_json, bytes);
+                },
                 .sql_sequence_snapshot => |input| {
                     if (request.control.version != kernel_owner_abi.abi_version) break :blk .invalid_abi;
                     const context: @import("antfly_local_sources").api_operation.RequestContext = .{ .deadline_ns = if (request.control.has_execution_deadline != 0) request.control.execution_deadline_ns else null, .cancellation = ownerQueryCancellation(&request.control) };

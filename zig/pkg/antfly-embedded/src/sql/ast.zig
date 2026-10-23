@@ -388,6 +388,7 @@ pub const CatalogDdl = struct {
     view_definition: ?ViewDefinition = null,
     role_setting: ?struct { name: []const u8, database: ?[]const u8, value: ?Value } = null,
     comment_value: ?[]const u8 = null,
+    comment_column: ?[]const u8 = null,
     sequence_options: ?SequenceOptions = null,
     sequence_targets: []const Name = &.{},
 };

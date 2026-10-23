@@ -58,9 +58,11 @@ pub const RelationSchemaMutation = struct {
 pub const RelationDescriptionMutation = struct {
     guard: domain.RelationMutationGuard,
     description: []const u8,
+    column: ?[]const u8 = null,
 
     pub fn validate(self: @This()) !void {
         try self.guard.validate();
+        if (self.column) |name| try (@import("antfly_local_sources").system_catalog_column_identities.Description{ .name = name, .value = self.description }).validate();
         if (self.guard.owner.kind != .table or self.guard.constraint_name_admission != null) return error.InvalidCatalogMutation;
         if (self.description.len > 1024 * 1024) return error.CatalogCommandTooLarge;
         if (!std.unicode.utf8ValidateSlice(self.description) or std.mem.indexOfScalar(u8, self.description, 0) != null) return error.InvalidCatalogMutation;

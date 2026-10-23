@@ -294,8 +294,9 @@ fn commentTable(server: *server_mod.ApiHttpServer, identity: ?server_mod.Authent
     const captured = (try captureTableAdmission(server, identity, context, a, target, ddl.name.database != null or ddl.name.namespace != null, path)) orelse return error.TableNotFound;
     var private = context;
     private.setting_admin = true;
-    const response = server.source.systemCatalog(a, private, .{ .relation_description_mutate = .{ .guard = captured.guard, .description = ddl.comment_value orelse "" } }) catch |err| {
+    const response = server.source.systemCatalog(a, private, .{ .relation_description_mutate = .{ .guard = captured.guard, .description = ddl.comment_value orelse "", .column = ddl.comment_column } }) catch |err| {
         if (err == error.MetadataMutationOutcomeUnknown) return error.SqlMutationOutcomeUnknown;
+        if (err == error.CatalogCommandTooLarge) return error.ProgramLimitExceeded;
         return err;
     };
     // A successful reply is a durable metadata receipt, never a schema

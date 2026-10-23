@@ -12742,7 +12742,27 @@ pub fn onlineMergeAdmissionDigest(alloc: std.mem.Allocator, record: metadata.Mer
     return OnlineMergeAdmission.recordDigest(alloc, record);
 }
 
+pub const ColumnDescriptionCommand = struct {
+    guard: system_catalog.RelationMutationGuard,
+    column: column_identities.Description,
+    column_id: u64,
+    epoch: column_identities.Epoch,
+
+    pub fn validate(self: @This()) !void {
+        try self.guard.validate();
+        try self.column.validate();
+        if (self.guard.owner.kind != .table or self.guard.constraint_name_admission != null or self.column_id == 0 or std.mem.allEqual(u8, &self.epoch.digest, 0)) return error.InvalidCatalogMutation;
+    }
+    fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        self.guard.deinitOwned(alloc);
+        alloc.free(self.column.name);
+        if (self.column.value) |value| alloc.free(value);
+        self.* = undefined;
+    }
+};
+
 pub const TransitionCommand = union(enum) {
+    comment_column: ColumnDescriptionCommand,
     apply_sql_sequence_counter: []const u8,
     apply_schema_validation: []const u8,
     accept_relational_index_delivery: []const u8,
@@ -12938,6 +12958,7 @@ pub const TransitionCommand = union(enum) {
             .upsert_table => |*record| {
                 metadata_table_manager.freeTable(alloc, record.*);
             },
+            .comment_column => |*command| command.deinit(alloc),
             .compare_and_replace_table => |*replacement| {
                 metadata_table_manager.freeTable(alloc, replacement.expected);
                 metadata_table_manager.freeTable(alloc, replacement.replacement);
@@ -13078,6 +13099,7 @@ pub fn validateTransitionCommandDataGroupIds(command: TransitionCommand) !void {
                 record.status_generation,
             )) return error.InvalidStoreReporterFence;
         },
+        .comment_column => |annotation| try annotation.validate(),
         .compare_and_replace_table => |replacement| {
             if (replacement.relation_guard) |guard| {
                 try guard.validate();
@@ -18581,6 +18603,10 @@ pub const RaftApplyStore = struct {
         var committed = false;
         defer if (!committed) txn.abort();
         if (self.hasHotStandbyMirror()) txn.mutation_capture = &capture;
+        if (command == .comment_column) {
+            const candidate = try self.prepareColumnDescriptionTxn(&txn, group_id, command.comment_column);
+            self.alloc.free(candidate);
+        }
         if (command == .compare_and_replace_table) if (command.compare_and_replace_table.relation_guard) |guard| {
             try self.validateRelationMutationTxn(&txn, group_id, guard, command.compare_and_replace_table.expected, command.compare_and_replace_table.replacement);
         };
@@ -30510,6 +30536,12 @@ pub const RaftApplyStore = struct {
             .upsert_table => |record| {
                 try self.applyTableUpsertTxn(txn, group_id, record);
             },
+            .comment_column => |annotation| {
+                self.applyColumnDescriptionTxn(txn, group_id, annotation) catch |err| switch (err) {
+                    error.CatalogGenerationChanged, error.CatalogPublicationProofPending, error.CatalogOccupancyNotReady, error.TableTopologyProtocolUpgradeRequired, error.ExtensionOwnedObject, error.UndefinedColumn, error.ColumnIdentityLimitExceeded, error.CatalogCommandTooLarge => return,
+                    else => return err,
+                };
+            },
             .compare_and_replace_table => |replacement| {
                 if (replacement.relation_guard) |guard| self.validateRelationMutationTxn(txn, group_id, guard, replacement.expected, replacement.replacement) catch |err| switch (err) {
                     error.CatalogGenerationChanged, error.CatalogPublicationProofPending, error.CatalogOccupancyNotReady, error.TableTopologyProtocolUpgradeRequired, error.ExtensionOwnedObject => return,
@@ -32843,6 +32875,60 @@ pub const RaftApplyStore = struct {
             defer member.deinitOwned(self.alloc);
             if (try ownership.touches(member)) return error.ExtensionOwnedObject;
         }
+    }
+
+    fn getTableTxn(_: *RaftApplyStore, alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, group: u64, table: u64) !?metadata.TableRecord {
+        var buffer: [160]u8 = undefined;
+        const bytes = try stagingGet(txn, try tableKeyForGroup(&buffer, group, table));
+        return if (bytes) |value| try decodeTableRecord(alloc, value) else null;
+    }
+
+    /// Read-only binding also works before first column-identity bootstrap.
+    /// Only the subsequent guarded committed writer may persist that state.
+    pub fn getSqlColumnIdentities(self: *RaftApplyStore, alloc: std.mem.Allocator, group: u64, guard: system_catalog.RelationMutationGuard) !std.json.Parsed(column_identities.State) {
+        var txn = try self.beginQueryCatalogReadTxn(group);
+        defer txn.abort();
+        const table = (try self.getTableTxn(self.alloc, &txn, group, guard.owner.table_id)) orelse return error.CatalogGenerationChanged;
+        defer metadata_table_manager.freeTable(self.alloc, table);
+        try self.validateRelationMutationTxn(&txn, group, guard, table, table);
+        return self.columnDescriptionStateTxn(alloc, &txn, group, table);
+    }
+
+    fn columnDescriptionStateTxn(self: *RaftApplyStore, alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, group: u64, table: metadata.TableRecord) !std.json.Parsed(column_identities.State) {
+        _ = self;
+        const key = try column_identities.key(.{ .group = group, .table = table.table_id });
+        const existing = try stagingGet(txn, &key);
+        if (existing) |bytes| {
+            var buffer: [160]u8 = undefined;
+            const raw = try txn.get(try tableKeyForGroup(&buffer, group, table.table_id));
+            try validateColumnIdentityRecord(alloc, .{ .group = group, .table = table.table_id }, bytes, raw);
+        }
+        const bootstrap = if (existing == null) try columnIdentityValue(alloc, table, null, &.{}) else null;
+        defer if (bootstrap) |bytes| alloc.free(bytes);
+        return column_identities.State.decode(alloc, existing orelse bootstrap.?);
+    }
+
+    fn prepareColumnDescriptionTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group: u64, command: ColumnDescriptionCommand) ![]u8 {
+        try command.validate();
+        _ = try self.standbyRelationActivationTxn(txn, group, topology_protocol.sql_column_comments_version);
+        const table = (try self.getTableTxn(self.alloc, txn, group, command.guard.owner.table_id)) orelse return error.CatalogGenerationChanged;
+        defer metadata_table_manager.freeTable(self.alloc, table);
+        try self.validateRelationMutationTxn(txn, group, command.guard, table, table);
+        var state = try self.columnDescriptionStateTxn(self.alloc, txn, group, table);
+        defer state.deinit();
+        if (!std.meta.eql(state.value.epoch, command.epoch)) return error.CatalogGenerationChanged;
+        const column = state.value.columnById(command.column_id) orelse return error.CatalogGenerationChanged;
+        if (!std.mem.eql(u8, column.name, command.column.name)) return error.CatalogGenerationChanged;
+        return state.value.encodeDescription(self.alloc, command.column_id, command.column.value);
+    }
+
+    fn applyColumnDescriptionTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group: u64, command: ColumnDescriptionCommand) !void {
+        const bytes = try self.prepareColumnDescriptionTxn(txn, group, command);
+        defer self.alloc.free(bytes);
+        const key = try column_identities.key(.{ .group = group, .table = command.guard.owner.table_id });
+        if (try stagingGet(txn, &key)) |old| if (std.mem.eql(u8, old, bytes)) return;
+        try txn.put(&key, bytes);
+        self.notifyCommittedKeyListeners(.{ .metadata_group_id = group, .key = &key });
     }
 
     fn applyTableCompareAndReplaceTxn(
@@ -37206,6 +37292,7 @@ fn storeRuntimeStatusRecordVersion(record: metadata.StoreRecord) ?u16 {
 }
 
 const TransitionTag = enum(u8) {
+    comment_column = 87,
     apply_sql_sequence_counter = 85,
     apply_schema_validation = 84,
     cancel_relational_index_publication = 83,
@@ -37519,6 +37606,10 @@ pub fn encodeTransitionCommand(alloc: std.mem.Allocator, command: TransitionComm
         .upsert_table => |record| {
             try out.append(alloc, @backingInt(TransitionTag.upsert_table));
             try appendTableRecord(alloc, &out, record);
+        },
+        .comment_column => |annotation| {
+            try out.append(alloc, @backingInt(TransitionTag.comment_column));
+            try appendJsonRecord(alloc, &out, annotation);
         },
         .compare_and_replace_table => |replacement| {
             try out.append(alloc, @backingInt(if (replacement.relation_guard != null) TransitionTag.compare_and_replace_relation_table else TransitionTag.compare_and_replace_table));
@@ -38016,6 +38107,7 @@ pub fn decodeTransitionCommand(alloc: std.mem.Allocator, encoded: []const u8) !?
         .upsert_table => .{
             .upsert_table = try readTableRecord(alloc, encoded, &pos),
         },
+        .comment_column => .{ .comment_column = try readJsonRecord(ColumnDescriptionCommand, alloc, encoded, &pos) },
         .compare_and_replace_table, .compare_and_replace_relation_table => blk: {
             const expected = try readFramedTableRecord(alloc, encoded, &pos);
             errdefer metadata_table_manager.freeTable(alloc, expected);
@@ -53388,4 +53480,89 @@ test "resolver curation namespace propagation rejects source edits racing propos
     try std.testing.expect(try store.resolverProjectionValid(a, group, ordinary));
     try store.applyStandaloneCommand(group, .{ .compare_and_replace_table = .{ .expected = source, .replacement = ordinary } });
     try std.testing.expectEqualStrings(ordinary.schema_json, (try store.getTable(a, group, 2)).?.schema_json);
+}
+
+test "SQL COMMENT column codec retains guarded identity and rejects truncated admission" {
+    const a = std.testing.allocator;
+    const command: TransitionCommand = .{ .comment_column = .{
+        .guard = .{ .target = .{ .name = "rows" }, .logical_table = "rows", .owner = .{ .table_id = 7, .schema_version = 1, .schema_digest = @splat(1), .kind = .table }, .incarnation = @splat(2) },
+        .column = .{ .name = "status", .value = "a 'quoted' Ω" },
+        .column_id = 2,
+        .epoch = .{ .version = 1, .digest = @splat(1) },
+    } };
+    const bytes = try encodeTransitionCommand(a, command);
+    defer a.free(bytes);
+    var decoded = (try decodeTransitionCommand(a, bytes)).?;
+    defer decoded.deinit(a);
+    try std.testing.expectEqualStrings("a 'quoted' Ω", decoded.comment_column.column.value.?);
+    try std.testing.expectEqualDeep(command.comment_column.guard, decoded.comment_column.guard);
+    try std.testing.expectEqual(command.comment_column.column_id, decoded.comment_column.column_id);
+    for (transition_magic.len + 1..bytes.len) |length| try std.testing.expectError(error.InvalidMetadataTransitionEncoding, decodeTransitionCommand(a, bytes[0..length]));
+}
+
+test "SQL COMMENT column writer fences decoder epoch and stable identity without changing table definition" {
+    const a = std.testing.allocator;
+    const group: u64 = 21;
+    const incarnation = "01010101010101010101010101010101".*;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/column-comment", .{tmp.sub_path});
+    defer a.free(root);
+    var store = try RaftApplyStore.init(a, .{ .root_dir = root });
+    defer store.deinit();
+    try store.applyStandaloneCommand(group, .{ .initialize_metadata_incarnation = incarnation });
+    const table: metadata.TableRecord = .{ .table_id = 7, .name = "rows", .schema_json = "{\"version\":1,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"integer\"},\"status\":{\"type\":\"keyword\"}},\"additionalProperties\":false}}}}" };
+    try store.applyStandaloneCommand(group, .{ .upsert_table = table });
+    _ = try adoptLiveRelationWriterForTest(&store, a, group);
+    const old_activation = try std.json.Stringify.valueAlloc(a, topology_protocol.Activation{ .version = topology_protocol.sql_column_comments_version - 1, .incarnation = incarnation, .member_count = 1, .membership_fingerprint = @splat(7) }, .{});
+    defer a.free(old_activation);
+    try store.applyStandaloneCommand(group, .{ .activate_topology_protocol = old_activation });
+    const resolved = try store.resolveSystemCatalogIdentities(a, group, .{ .relations = &.{.{ .name = "rows" }} });
+    defer resolved.deinit(a);
+    const guard: system_catalog.RelationMutationGuard = .{ .target = .{ .name = "rows" }, .logical_table = resolved.relations[0].?.logical_table, .owner = resolved.relations[0].?.owner, .incarnation = resolved.relation_epoch.?.incarnation };
+    var attributes = try store.getSqlColumnIdentities(a, group, guard);
+    defer attributes.deinit();
+    const column = for (attributes.value.columns) |column| {
+        if (std.mem.eql(u8, column.name, "status")) break column;
+    } else return error.TestMissingColumnIdentity;
+    var command: TransitionCommand = .{ .comment_column = .{ .guard = guard, .column = .{ .name = "status", .value = "application state" }, .column_id = column.id, .epoch = attributes.value.epoch } };
+    try std.testing.expectError(error.TableTopologyProtocolUpgradeRequired, store.applyStandaloneCommand(group, command));
+    const activation = try std.json.Stringify.valueAlloc(a, topology_protocol.Activation{ .version = topology_protocol.sql_column_comments_version, .incarnation = incarnation, .member_count = 1, .membership_fingerprint = @splat(7) }, .{});
+    defer a.free(activation);
+    try store.applyStandaloneCommand(group, .{ .activate_topology_protocol = activation });
+    try store.applyStandaloneCommand(group, command);
+    try store.applyStandaloneCommand(group, command); // Exact desired-state retry.
+    {
+        var current = try store.getSqlColumnIdentities(a, group, guard);
+        defer current.deinit();
+        try std.testing.expectEqualStrings("application state", current.value.columnById(column.id).?.description.?);
+    }
+    const unchanged = (try store.getTable(a, group, 7)).?;
+    defer metadata_table_manager.freeTable(a, unchanged);
+    try std.testing.expect(metadata_table_manager.tableDefinitionsEqual(table, unchanged));
+    // Admission checks the complete encoded successor, including escaping.
+    // At replicated apply a concurrent aggregate-size conflict is a no-op,
+    // never an error that wedges the committed log behind a user comment.
+    const oversized = try a.alloc(u8, column_identities.max_encoded_bytes / 2);
+    defer a.free(oversized);
+    @memset(oversized, '"');
+    const prior_value = command.comment_column.column.value;
+    command.comment_column.column.value = oversized;
+    try std.testing.expectError(error.ColumnIdentityLimitExceeded, store.applyStandaloneCommand(group, command));
+    {
+        var txn = try store.store.beginWriteTxn();
+        errdefer txn.abort();
+        try store.applyTransitionCommandTxn(&txn, group, command);
+        try txn.commit();
+    }
+    command.comment_column.column.value = prior_value;
+    try store.applyStandaloneCommand(group, command);
+    command.comment_column.epoch.digest[0] ^= 1;
+    try std.testing.expectError(error.CatalogGenerationChanged, store.applyStandaloneCommand(group, command));
+    command.comment_column.epoch = attributes.value.epoch;
+    command.comment_column.column_id += 1;
+    try std.testing.expectError(error.CatalogGenerationChanged, store.applyStandaloneCommand(group, command));
+    var current = try store.getSqlColumnIdentities(a, group, guard);
+    defer current.deinit();
+    try std.testing.expectEqualStrings("application state", current.value.columnById(column.id).?.description.?);
 }

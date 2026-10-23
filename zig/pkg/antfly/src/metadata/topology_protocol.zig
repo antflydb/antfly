@@ -127,7 +127,9 @@ const std = @import("std");
 /// proposal queues and proposal-owned source-correction fences. Main's v37
 /// resolver floor cannot be reused: this branch already assigned that profile
 /// to earlier SQL catalog support that does not decode these resolver fields.
-pub const current_version: u16 = 64;
+pub const current_version: u16 = 65;
+/// Version 65 retains presentation metadata on stable column identities.
+pub const sql_column_comments_version: u16 = 65;
 /// Role-default patches share this branch's unreleased v63 reader cohort.
 /// Earlier main readers reject empty/global role scopes; never admit one
 /// using only the original v12 setting-catalog floor.

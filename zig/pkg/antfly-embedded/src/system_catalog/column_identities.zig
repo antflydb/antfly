@@ -28,7 +28,33 @@ pub const Key = struct { group: u64, table: u64 };
 pub const Epoch = struct { version: u32, digest: [32]u8 };
 pub const Declaration = struct { name: []const u8, signature: [32]u8 };
 pub const Rename = struct { from: []const u8, to: []const u8 };
-pub const Column = struct { id: u64, name: []const u8, signature: [32]u8 };
+pub const Column = struct {
+    id: u64,
+    name: []const u8,
+    signature: [32]u8,
+    description: ?[]const u8 = null,
+
+    pub fn jsonStringify(self: @This(), writer: anytype) !void {
+        // Unannotated columns keep their exact canonical representation.
+        if (self.description) |description|
+            try writer.write(.{ .id = self.id, .name = self.name, .signature = self.signature, .description = description })
+        else
+            try writer.write(.{ .id = self.id, .name = self.name, .signature = self.signature });
+    }
+};
+
+pub const Description = struct {
+    name: []const u8,
+    value: ?[]const u8,
+
+    pub fn validate(self: @This()) !void {
+        if (!validName(self.name)) return error.InvalidCatalogMutation;
+        if (self.value) |value| {
+            if (value.len > max_encoded_bytes) return error.CatalogCommandTooLarge;
+            if (!std.unicode.utf8ValidateSlice(value) or std.mem.indexOfScalar(u8, value, 0) != null) return error.InvalidCatalogMutation;
+        }
+    }
+};
 
 fn validName(name: []const u8) bool {
     return name.len != 0 and name.len <= max_name_bytes and std.mem.indexOfScalar(u8, name, 0) == null and std.unicode.utf8ValidateSlice(name);
@@ -51,6 +77,9 @@ pub const State = struct {
         var prior: u64 = 0;
         for (self.columns) |column| {
             if (column.id <= prior or column.id >= self.next_id or !validName(column.name) or !validDigest(column.signature)) return error.InvalidColumnIdentityState;
+            if (column.description) |description| {
+                if (description.len == 0 or description.len > max_encoded_bytes or !std.unicode.utf8ValidateSlice(description) or std.mem.indexOfScalar(u8, description, 0) != null) return error.InvalidColumnIdentityState;
+            }
             if ((try names.getOrPut(a, column.name)).found_existing) return error.InvalidColumnIdentityState;
             prior = column.id;
         }
@@ -72,6 +101,23 @@ pub const State = struct {
         const found = self.columnById(id) orelse return error.SqlViewColumnDropped;
         if (!std.mem.eql(u8, &found.signature, &signature)) return error.SqlViewColumnTypeChanged;
         return found;
+    }
+
+    /// Prepare the entire bounded successor before journal admission. The
+    /// same path runs again at apply against the latest committed state.
+    pub fn encodeDescription(self: State, a: A, id: u64, value: ?[]const u8) ![]u8 {
+        const columns = try a.dupe(Column, self.columns);
+        defer a.free(columns);
+        var found = false;
+        for (columns) |*column| if (column.id == id) {
+            column.description = if (value) |text| if (text.len != 0) text else null else null;
+            found = true;
+            break;
+        };
+        if (!found) return error.UndefinedColumn;
+        var updated = self;
+        updated.columns = columns;
+        return updated.encode(a);
     }
 
     pub fn encode(self: State, a: A) ![]u8 {
@@ -144,7 +190,7 @@ pub fn prepare(backing: A, table_id: u64, previous: ?State, epoch: Epoch, declar
             next_id = std.math.add(u64, next_id, 1) catch return error.ColumnIdentityExhausted;
             break :fresh id;
         };
-        out.* = .{ .id = id, .name = try a.dupe(u8, declaration.name), .signature = declaration.signature };
+        out.* = .{ .id = id, .name = try a.dupe(u8, declaration.name), .signature = declaration.signature, .description = if (retained) |found| if (found.description) |description| try a.dupe(u8, description) else null else null };
     }
     std.mem.sort(Column, columns, {}, struct {
         fn less(_: void, left: Column, right: Column) bool {
@@ -330,4 +376,44 @@ fn allocationCase(a: A) !void {
 
 test "SQL column identities release preparation and decode allocations on every failure" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, allocationCase, .{});
+}
+
+test "SQL column comments follow stable identities through rename and never survive drop reuse" {
+    const a = std.testing.allocator;
+    const original: State = .{ .format = 1, .table_id = 7, .epoch = .{ .version = 1, .digest = @splat(1) }, .next_id = 3, .columns = &.{ .{ .id = 1, .name = "id", .signature = @splat(2) }, .{ .id = 2, .name = "status", .signature = @splat(3), .description = "application state" } } };
+    const encoded = try original.encode(a);
+    defer a.free(encoded);
+    var restored = try State.decode(a, encoded);
+    defer restored.deinit();
+    try std.testing.expectEqualStrings("application state", restored.value.columnById(2).?.description.?);
+    var renamed = try prepare(a, 7, restored.value, .{ .version = 2, .digest = @splat(4) }, &.{ .{ .name = "id", .signature = @splat(2) }, .{ .name = "renamed", .signature = @splat(3) } }, &.{.{ .from = "status", .to = "renamed" }});
+    defer renamed.deinit();
+    try std.testing.expectEqualStrings("application state", renamed.value.columnById(2).?.description.?);
+    var dropped = try prepare(a, 7, renamed.value, .{ .version = 3, .digest = @splat(5) }, &.{.{ .name = "id", .signature = @splat(2) }}, &.{});
+    defer dropped.deinit();
+    var recreated = try prepare(a, 7, dropped.value, .{ .version = 4, .digest = @splat(6) }, &.{ .{ .name = "id", .signature = @splat(2) }, .{ .name = "status", .signature = @splat(3) } }, &.{});
+    defer recreated.deinit();
+    try std.testing.expect(recreated.value.columnById(2) == null);
+    try std.testing.expect(recreated.value.columnById(3).?.description == null);
+    try std.testing.expectEqual(@as(usize, 2), recreated.value.columns.len);
+}
+
+test "SQL column comments bound aggregate encoded size without mutating the predecessor" {
+    const a = std.testing.allocator;
+    const original: State = .{ .format = 1, .table_id = 7, .epoch = .{ .version = 1, .digest = @splat(1) }, .next_id = 3, .columns = &.{ .{ .id = 1, .name = "a", .signature = @splat(2) }, .{ .id = 2, .name = "b", .signature = @splat(3) } } };
+    const text = try a.alloc(u8, max_encoded_bytes / 2);
+    defer a.free(text);
+    @memset(text, 'x');
+    const first = try original.encodeDescription(a, 1, text);
+    defer a.free(first);
+    var current = try State.decode(a, first);
+    defer current.deinit();
+    try std.testing.expectError(error.ColumnIdentityLimitExceeded, current.value.encodeDescription(a, 2, text));
+    try std.testing.expect(current.value.columns[1].description == null);
+    try std.testing.expect(original.columns[0].description == null);
+    const removed = try current.value.encodeDescription(a, 1, "");
+    defer a.free(removed);
+    const initial = try original.encode(a);
+    defer a.free(initial);
+    try std.testing.expectEqualStrings(initial, removed);
 }
