@@ -1,0 +1,806 @@
+{
+  "format": 1,
+  "campaigns": [
+    {
+      "format": 1,
+      "reference": "PostgreSQL exact SQL",
+      "create_sql": "CREATE TABLE usage_records(id UUID PRIMARY KEY,email TEXT)",
+      "read_sql": "SELECT id::text AS id,email AS status FROM usage_records ORDER BY id",
+      "table": "usage_records",
+      "setup": [],
+      "cases": [
+        {
+          "id": "sql-0016",
+          "steps": [
+            {
+              "statement": "ALTER TABLE usage_records ADD CONSTRAINT usage_records_email_key UNIQUE (email) DEFERRABLE INITIALLY DEFERRED;",
+              "command_tag": "ALTER TABLE",
+              "inside": [],
+              "outside": []
+            },
+            {
+              "statement": "BEGIN",
+              "command_tag": "BEGIN",
+              "inside": [],
+              "outside": []
+            },
+            {
+              "statement": "INSERT INTO usage_records(id,email) VALUES ('00000000-0000-0000-0000-000000000001','shared@example.test')",
+              "command_tag": "INSERT 0 1",
+              "inside": [
+                [
+                  "00000000-0000-0000-0000-000000000001",
+                  "shared@example.test"
+                ]
+              ],
+              "outside": []
+            },
+            {
+              "statement": "INSERT INTO usage_records(id,email) VALUES ('00000000-0000-0000-0000-000000000002','shared@example.test')",
+              "command_tag": "INSERT 0 1",
+              "inside": [
+                [
+                  "00000000-0000-0000-0000-000000000001",
+                  "shared@example.test"
+                ],
+                [
+                  "00000000-0000-0000-0000-000000000002",
+                  "shared@example.test"
+                ]
+              ],
+              "outside": []
+            },
+            {
+              "statement": "UPDATE usage_records SET email='distinct@example.test' WHERE id='00000000-0000-0000-0000-000000000002'",
+              "command_tag": "UPDATE 1",
+              "inside": [
+                [
+                  "00000000-0000-0000-0000-000000000001",
+                  "shared@example.test"
+                ],
+                [
+                  "00000000-0000-0000-0000-000000000002",
+                  "distinct@example.test"
+                ]
+              ],
+              "outside": []
+            },
+            {
+              "statement": "COMMIT",
+              "command_tag": "COMMIT",
+              "inside": [
+                [
+                  "00000000-0000-0000-0000-000000000001",
+                  "shared@example.test"
+                ],
+                [
+                  "00000000-0000-0000-0000-000000000002",
+                  "distinct@example.test"
+                ]
+              ],
+              "outside": [
+                [
+                  "00000000-0000-0000-0000-000000000001",
+                  "shared@example.test"
+                ],
+                [
+                  "00000000-0000-0000-0000-000000000002",
+                  "distinct@example.test"
+                ]
+              ]
+            },
+            {
+              "statement": "BEGIN",
+              "command_tag": "BEGIN",
+              "inside": [
+                [
+                  "00000000-0000-0000-0000-000000000001",
+                  "shared@example.test"
+                ],
+                [
+                  "00000000-0000-0000-0000-000000000002",
+                  "distinct@example.test"
+                ]
+              ],
+              "outside": [
+                [
+                  "00000000-0000-0000-0000-000000000001",
+                  "shared@example.test"
+                ],
+                [
+                  "00000000-0000-0000-0000-000000000002",
+                  "distinct@example.test"
+                ]
+              ]
+            },
+            {
+              "statement": "SET CONSTRAINTS usage_records_email_key DEFERRED",
+              "command_tag": "SET CONSTRAINTS",
+              "inside": [
+                [
+                  "00000000-0000-0000-0000-000000000001",
+                  "shared@example.test"
+                ],
+                [
+                  "00000000-0000-0000-0000-000000000002",
+                  "distinct@example.test"
+                ]
+              ],
+              "outside": [
+                [
+                  "00000000-0000-0000-0000-000000000001",
+                  "shared@example.test"
+                ],
+                [
+                  "00000000-0000-0000-0000-000000000002",
+                  "distinct@example.test"
+                ]
+              ]
+            },
+            {
+              "statement": "INSERT INTO usage_records(id,email) VALUES ('00000000-0000-0000-0000-000000000003','shared@example.test')",
+              "command_tag": "INSERT 0 1",
+              "inside": [
+                [
+                  "00000000-0000-0000-0000-000000000001",
+                  "shared@example.test"
+                ],
+                [
+                  "00000000-0000-0000-0000-000000000002",
+                  "distinct@example.test"
+                ],
+                [
+                  "00000000-0000-0000-0000-000000000003",
+                  "shared@example.test"
+                ]
+              ],
+              "outside": [
+                [
+                  "00000000-0000-0000-0000-000000000001",
+                  "shared@example.test"
+                ],
+                [
+                  "00000000-0000-0000-0000-000000000002",
+                  "distinct@example.test"
+                ]
+              ]
+            },
+            {
+              "statement": "COMMIT",
+              "command_tag": "",
+              "sqlstate": "23505",
+              "observe_inside": false,
+              "inside": [],
+              "outside": [
+                [
+                  "00000000-0000-0000-0000-000000000001",
+                  "shared@example.test"
+                ],
+                [
+                  "00000000-0000-0000-0000-000000000002",
+                  "distinct@example.test"
+                ]
+              ]
+            },
+            {
+              "statement": "ROLLBACK",
+              "command_tag": "ROLLBACK",
+              "inside": [
+                [
+                  "00000000-0000-0000-0000-000000000001",
+                  "shared@example.test"
+                ],
+                [
+                  "00000000-0000-0000-0000-000000000002",
+                  "distinct@example.test"
+                ]
+              ],
+              "outside": [
+                [
+                  "00000000-0000-0000-0000-000000000001",
+                  "shared@example.test"
+                ],
+                [
+                  "00000000-0000-0000-0000-000000000002",
+                  "distinct@example.test"
+                ]
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "format": 1,
+      "reference": "PostgreSQL exact SQL",
+      "create_sql": "CREATE TABLE usage_records(id UUID PRIMARY KEY,email TEXT)",
+      "read_sql": "SELECT id::text AS id,email AS status FROM usage_records ORDER BY id",
+      "table": "usage_records",
+      "setup": [],
+      "cases": [
+        {
+          "id": "sql-0082",
+          "steps": [
+            {
+              "statement": "ALTER TABLE usage_records ADD CONSTRAINT usage_records_email_key UNIQUE(email) DEFERRABLE INITIALLY IMMEDIATE",
+              "command_tag": "ALTER TABLE",
+              "inside": [],
+              "outside": []
+            },
+            {
+              "statement": "BEGIN",
+              "command_tag": "BEGIN",
+              "inside": [],
+              "outside": []
+            },
+            {
+              "statement": "SET CONSTRAINTS ALL DEFERRED",
+              "command_tag": "SET CONSTRAINTS",
+              "inside": [],
+              "outside": []
+            },
+            {
+              "statement": "INSERT INTO usage_records(id,email) VALUES ('00000000-0000-0000-0000-000000000001','shared@example.test')",
+              "command_tag": "INSERT 0 1",
+              "inside": [
+                [
+                  "00000000-0000-0000-0000-000000000001",
+                  "shared@example.test"
+                ]
+              ],
+              "outside": []
+            },
+            {
+              "statement": "INSERT INTO usage_records(id,email) VALUES ('00000000-0000-0000-0000-000000000002','shared@example.test')",
+              "command_tag": "INSERT 0 1",
+              "inside": [
+                [
+                  "00000000-0000-0000-0000-000000000001",
+                  "shared@example.test"
+                ],
+                [
+                  "00000000-0000-0000-0000-000000000002",
+                  "shared@example.test"
+                ]
+              ],
+              "outside": []
+            },
+            {
+              "statement": "UPDATE usage_records SET email='distinct@example.test' WHERE id='00000000-0000-0000-0000-000000000002'",
+              "command_tag": "UPDATE 1",
+              "inside": [
+                [
+                  "00000000-0000-0000-0000-000000000001",
+                  "shared@example.test"
+                ],
+                [
+                  "00000000-0000-0000-0000-000000000002",
+                  "distinct@example.test"
+                ]
+              ],
+              "outside": []
+            },
+            {
+              "statement": "COMMIT",
+              "command_tag": "COMMIT",
+              "inside": [
+                [
+                  "00000000-0000-0000-0000-000000000001",
+                  "shared@example.test"
+                ],
+                [
+                  "00000000-0000-0000-0000-000000000002",
+                  "distinct@example.test"
+                ]
+              ],
+              "outside": [
+                [
+                  "00000000-0000-0000-0000-000000000001",
+                  "shared@example.test"
+                ],
+                [
+                  "00000000-0000-0000-0000-000000000002",
+                  "distinct@example.test"
+                ]
+              ]
+            },
+            {
+              "statement": "BEGIN",
+              "command_tag": "BEGIN",
+              "inside": [
+                [
+                  "00000000-0000-0000-0000-000000000001",
+                  "shared@example.test"
+                ],
+                [
+                  "00000000-0000-0000-0000-000000000002",
+                  "distinct@example.test"
+                ]
+              ],
+              "outside": [
+                [
+                  "00000000-0000-0000-0000-000000000001",
+                  "shared@example.test"
+                ],
+                [
+                  "00000000-0000-0000-0000-000000000002",
+                  "distinct@example.test"
+                ]
+              ]
+            },
+            {
+              "statement": "SET CONSTRAINTS usage_records_email_key DEFERRED",
+              "command_tag": "SET CONSTRAINTS",
+              "inside": [
+                [
+                  "00000000-0000-0000-0000-000000000001",
+                  "shared@example.test"
+                ],
+                [
+                  "00000000-0000-0000-0000-000000000002",
+                  "distinct@example.test"
+                ]
+              ],
+              "outside": [
+                [
+                  "00000000-0000-0000-0000-000000000001",
+                  "shared@example.test"
+                ],
+                [
+                  "00000000-0000-0000-0000-000000000002",
+                  "distinct@example.test"
+                ]
+              ]
+            },
+            {
+              "statement": "INSERT INTO usage_records(id,email) VALUES ('00000000-0000-0000-0000-000000000003','shared@example.test')",
+              "command_tag": "INSERT 0 1",
+              "inside": [
+                [
+                  "00000000-0000-0000-0000-000000000001",
+                  "shared@example.test"
+                ],
+                [
+                  "00000000-0000-0000-0000-000000000002",
+                  "distinct@example.test"
+                ],
+                [
+                  "00000000-0000-0000-0000-000000000003",
+                  "shared@example.test"
+                ]
+              ],
+              "outside": [
+                [
+                  "00000000-0000-0000-0000-000000000001",
+                  "shared@example.test"
+                ],
+                [
+                  "00000000-0000-0000-0000-000000000002",
+                  "distinct@example.test"
+                ]
+              ]
+            },
+            {
+              "statement": "COMMIT",
+              "command_tag": "",
+              "sqlstate": "23505",
+              "observe_inside": false,
+              "inside": [],
+              "outside": [
+                [
+                  "00000000-0000-0000-0000-000000000001",
+                  "shared@example.test"
+                ],
+                [
+                  "00000000-0000-0000-0000-000000000002",
+                  "distinct@example.test"
+                ]
+              ]
+            },
+            {
+              "statement": "ROLLBACK",
+              "command_tag": "ROLLBACK",
+              "inside": [
+                [
+                  "00000000-0000-0000-0000-000000000001",
+                  "shared@example.test"
+                ],
+                [
+                  "00000000-0000-0000-0000-000000000002",
+                  "distinct@example.test"
+                ]
+              ],
+              "outside": [
+                [
+                  "00000000-0000-0000-0000-000000000001",
+                  "shared@example.test"
+                ],
+                [
+                  "00000000-0000-0000-0000-000000000002",
+                  "distinct@example.test"
+                ]
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "format": 1,
+      "reference": "PostgreSQL exact SQL",
+      "create_sql": "CREATE TABLE usage_stage(tenant_id TEXT,id UUID,status TEXT)",
+      "read_sql": "SELECT id::text AS id,tenant_id||':'||status AS status FROM usage_stage ORDER BY status",
+      "table": "usage_stage",
+      "setup": [],
+      "cases": [
+        {
+          "id": "sql-0018",
+          "steps": [
+            {
+              "statement": "ALTER TABLE usage_stage ADD CONSTRAINT usage_stage_pk PRIMARY KEY (tenant_id, id) DEFERRABLE INITIALLY DEFERRED;",
+              "command_tag": "ALTER TABLE",
+              "inside": [],
+              "outside": []
+            },
+            {
+              "statement": "BEGIN",
+              "command_tag": "BEGIN",
+              "inside": [],
+              "outside": []
+            },
+            {
+              "statement": "INSERT INTO usage_stage(tenant_id,id,status) VALUES ('acme','00000000-0000-0000-0000-000000000001','left')",
+              "command_tag": "INSERT 0 1",
+              "inside": [
+                [
+                  "00000000-0000-0000-0000-000000000001",
+                  "acme:left"
+                ]
+              ],
+              "outside": []
+            },
+            {
+              "statement": "INSERT INTO usage_stage(tenant_id,id,status) VALUES ('acme','00000000-0000-0000-0000-000000000001','right')",
+              "command_tag": "INSERT 0 1",
+              "inside": [
+                [
+                  "00000000-0000-0000-0000-000000000001",
+                  "acme:left"
+                ],
+                [
+                  "00000000-0000-0000-0000-000000000001",
+                  "acme:right"
+                ]
+              ],
+              "outside": []
+            },
+            {
+              "statement": "UPDATE usage_stage SET id='00000000-0000-0000-0000-000000000002' WHERE status='right'",
+              "command_tag": "UPDATE 1",
+              "inside": [
+                [
+                  "00000000-0000-0000-0000-000000000001",
+                  "acme:left"
+                ],
+                [
+                  "00000000-0000-0000-0000-000000000002",
+                  "acme:right"
+                ]
+              ],
+              "outside": []
+            },
+            {
+              "statement": "COMMIT",
+              "command_tag": "COMMIT",
+              "inside": [
+                [
+                  "00000000-0000-0000-0000-000000000001",
+                  "acme:left"
+                ],
+                [
+                  "00000000-0000-0000-0000-000000000002",
+                  "acme:right"
+                ]
+              ],
+              "outside": [
+                [
+                  "00000000-0000-0000-0000-000000000001",
+                  "acme:left"
+                ],
+                [
+                  "00000000-0000-0000-0000-000000000002",
+                  "acme:right"
+                ]
+              ]
+            },
+            {
+              "statement": "INSERT INTO usage_stage(tenant_id,id,status) VALUES (NULL,'00000000-0000-0000-0000-000000000003','null')",
+              "command_tag": "",
+              "sqlstate": "23502",
+              "observe_inside": false,
+              "inside": [],
+              "outside": [
+                [
+                  "00000000-0000-0000-0000-000000000001",
+                  "acme:left"
+                ],
+                [
+                  "00000000-0000-0000-0000-000000000002",
+                  "acme:right"
+                ]
+              ]
+            },
+            {
+              "statement": "BEGIN",
+              "command_tag": "BEGIN",
+              "inside": [
+                [
+                  "00000000-0000-0000-0000-000000000001",
+                  "acme:left"
+                ],
+                [
+                  "00000000-0000-0000-0000-000000000002",
+                  "acme:right"
+                ]
+              ],
+              "outside": [
+                [
+                  "00000000-0000-0000-0000-000000000001",
+                  "acme:left"
+                ],
+                [
+                  "00000000-0000-0000-0000-000000000002",
+                  "acme:right"
+                ]
+              ]
+            },
+            {
+              "statement": "SET CONSTRAINTS usage_stage_pk DEFERRED",
+              "command_tag": "SET CONSTRAINTS",
+              "inside": [
+                [
+                  "00000000-0000-0000-0000-000000000001",
+                  "acme:left"
+                ],
+                [
+                  "00000000-0000-0000-0000-000000000002",
+                  "acme:right"
+                ]
+              ],
+              "outside": [
+                [
+                  "00000000-0000-0000-0000-000000000001",
+                  "acme:left"
+                ],
+                [
+                  "00000000-0000-0000-0000-000000000002",
+                  "acme:right"
+                ]
+              ]
+            },
+            {
+              "statement": "INSERT INTO usage_stage(tenant_id,id,status) VALUES ('acme','00000000-0000-0000-0000-000000000001','pending')",
+              "command_tag": "INSERT 0 1",
+              "inside": [
+                [
+                  "00000000-0000-0000-0000-000000000001",
+                  "acme:left"
+                ],
+                [
+                  "00000000-0000-0000-0000-000000000001",
+                  "acme:pending"
+                ],
+                [
+                  "00000000-0000-0000-0000-000000000002",
+                  "acme:right"
+                ]
+              ],
+              "outside": [
+                [
+                  "00000000-0000-0000-0000-000000000001",
+                  "acme:left"
+                ],
+                [
+                  "00000000-0000-0000-0000-000000000002",
+                  "acme:right"
+                ]
+              ]
+            },
+            {
+              "statement": "COMMIT",
+              "command_tag": "",
+              "sqlstate": "23505",
+              "observe_inside": false,
+              "inside": [],
+              "outside": [
+                [
+                  "00000000-0000-0000-0000-000000000001",
+                  "acme:left"
+                ],
+                [
+                  "00000000-0000-0000-0000-000000000002",
+                  "acme:right"
+                ]
+              ]
+            },
+            {
+              "statement": "ROLLBACK",
+              "command_tag": "ROLLBACK",
+              "inside": [
+                [
+                  "00000000-0000-0000-0000-000000000001",
+                  "acme:left"
+                ],
+                [
+                  "00000000-0000-0000-0000-000000000002",
+                  "acme:right"
+                ]
+              ],
+              "outside": [
+                [
+                  "00000000-0000-0000-0000-000000000001",
+                  "acme:left"
+                ],
+                [
+                  "00000000-0000-0000-0000-000000000002",
+                  "acme:right"
+                ]
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "format": 1,
+      "reference": "PostgreSQL exact SQL",
+      "create_sql": "CREATE TABLE usage_records(id UUID PRIMARY KEY,email TEXT)",
+      "read_sql": "SELECT id::text AS id,email AS status FROM usage_records ORDER BY id",
+      "table": "usage_records",
+      "setup": [
+        {
+          "statement": "CREATE TABLE parents(id TEXT PRIMARY KEY)",
+          "table": "parents"
+        },
+        {
+          "statement": "INSERT INTO parents(id) VALUES ('valid')"
+        }
+      ],
+      "cases": [
+        {
+          "id": "sql-0083",
+          "steps": [
+            {
+              "statement": "ALTER TABLE usage_records ADD CONSTRAINT usage_fk FOREIGN KEY(email) REFERENCES parents(id) DEFERRABLE INITIALLY DEFERRED",
+              "command_tag": "ALTER TABLE",
+              "inside": [],
+              "outside": []
+            },
+            {
+              "statement": "ALTER TABLE usage_records ADD CONSTRAINT usage_check CHECK(email <> 'bad') NOT VALID",
+              "command_tag": "ALTER TABLE",
+              "inside": [],
+              "outside": []
+            },
+            {
+              "statement": "BEGIN",
+              "command_tag": "BEGIN",
+              "inside": [],
+              "outside": []
+            },
+            {
+              "statement": "INSERT INTO usage_records(id,email) VALUES ('00000000-0000-0000-0000-000000000001','missing')",
+              "command_tag": "INSERT 0 1",
+              "inside": [
+                [
+                  "00000000-0000-0000-0000-000000000001",
+                  "missing"
+                ]
+              ],
+              "outside": []
+            },
+            {
+              "statement": "UPDATE usage_records SET email='valid' WHERE id='00000000-0000-0000-0000-000000000001'",
+              "command_tag": "UPDATE 1",
+              "inside": [
+                [
+                  "00000000-0000-0000-0000-000000000001",
+                  "valid"
+                ]
+              ],
+              "outside": []
+            },
+            {
+              "statement": "SET CONSTRAINTS usage_fk, usage_check IMMEDIATE",
+              "command_tag": "SET CONSTRAINTS",
+              "inside": [
+                [
+                  "00000000-0000-0000-0000-000000000001",
+                  "valid"
+                ]
+              ],
+              "outside": []
+            },
+            {
+              "statement": "COMMIT",
+              "command_tag": "COMMIT",
+              "inside": [
+                [
+                  "00000000-0000-0000-0000-000000000001",
+                  "valid"
+                ]
+              ],
+              "outside": [
+                [
+                  "00000000-0000-0000-0000-000000000001",
+                  "valid"
+                ]
+              ]
+            },
+            {
+              "statement": "BEGIN",
+              "command_tag": "BEGIN",
+              "inside": [
+                [
+                  "00000000-0000-0000-0000-000000000001",
+                  "valid"
+                ]
+              ],
+              "outside": [
+                [
+                  "00000000-0000-0000-0000-000000000001",
+                  "valid"
+                ]
+              ]
+            },
+            {
+              "statement": "SET CONSTRAINTS usage_fk IMMEDIATE",
+              "command_tag": "SET CONSTRAINTS",
+              "inside": [
+                [
+                  "00000000-0000-0000-0000-000000000001",
+                  "valid"
+                ]
+              ],
+              "outside": [
+                [
+                  "00000000-0000-0000-0000-000000000001",
+                  "valid"
+                ]
+              ]
+            },
+            {
+              "statement": "INSERT INTO usage_records(id,email) VALUES ('00000000-0000-0000-0000-000000000002','missing')",
+              "command_tag": "",
+              "sqlstate": "23503",
+              "observe_inside": false,
+              "inside": [],
+              "outside": [
+                [
+                  "00000000-0000-0000-0000-000000000001",
+                  "valid"
+                ]
+              ]
+            },
+            {
+              "statement": "ROLLBACK",
+              "command_tag": "ROLLBACK",
+              "inside": [
+                [
+                  "00000000-0000-0000-0000-000000000001",
+                  "valid"
+                ]
+              ],
+              "outside": [
+                [
+                  "00000000-0000-0000-0000-000000000001",
+                  "valid"
+                ]
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

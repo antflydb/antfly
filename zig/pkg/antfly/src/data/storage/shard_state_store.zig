@@ -242,17 +242,21 @@ pub fn currentRaftBatchProtocolVersion(
     return version;
 }
 
-pub fn snapshotRequiresNativePrimary(txn: *docstore.DocStore.Txn, alloc: std.mem.Allocator, group_id: u64) !bool {
+pub fn snapshotProtocolVersion(txn: *docstore.DocStore.Txn, alloc: std.mem.Allocator, group_id: u64) !u16 {
     const key = try groupRaftBatchProtocolKeyAlloc(alloc, group_id);
     defer alloc.free(key);
     const raw = txn.get(key) catch |err| switch (err) {
-        error.NotFound => return false,
+        error.NotFound => return 0,
         else => return err,
     };
     if (raw.len != 2) return error.InvalidRaftBatchProtocolVersion;
     const version = std.mem.readInt(u16, raw[0..2], .little);
     if (version == 0 or version > data_raft_protocol.batch_protocol_version) return error.InvalidRaftBatchProtocolVersion;
-    return version >= data_raft_protocol.batch_native_snapshot_protocol_version;
+    return version;
+}
+
+pub fn snapshotRequiresNativePrimary(txn: *docstore.DocStore.Txn, alloc: std.mem.Allocator, group_id: u64) !bool {
+    return try snapshotProtocolVersion(txn, alloc, group_id) >= data_raft_protocol.batch_native_snapshot_protocol_version;
 }
 
 fn dupeRangeAlloc(alloc: std.mem.Allocator, byte_range: AppliedDataRange) !AppliedDataRange {

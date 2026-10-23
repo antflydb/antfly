@@ -40,6 +40,32 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const antfly_test_mod = options.antfly_test_mod;
     const lib_metadata_runtime_filters = selectTestFilters(b, &.{"metadata."});
     const lib_metadata_test_step = b.step("antfly-metadata-test", "Run root-module metadata tests only");
+    const presentation_tests = b.addTest(.{
+        .root_module = antfly_test_mod,
+        .filters = &.{ "SQL COMMENT table descriptions", "metadata module compiles", "metadata storage module compiles" },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    const presentation_run = addFilteredTestRunArtifact(b, presentation_tests);
+    presentation_run.addArg("--require-no-skips");
+    b.step("antfly-metadata-sql-presentation-test", "Verify bounded body-authorized SQL presentation mutations")
+        .dependOn(&presentation_run.step);
+    const sequence_counter_tests = b.addTest(.{
+        .root_module = antfly_test_mod,
+        .filters = &.{ "sequence catalog", "metadata module compiles", "metadata storage module compiles" },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    const sequence_counter_run = addFilteredTestRunArtifact(b, sequence_counter_tests);
+    sequence_counter_run.addArg("--require-no-skips");
+    b.step("antfly-metadata-sequence-counter-test", "Verify bounded sequence counter transactions, exact retry receipts and native cold reopening")
+        .dependOn(&sequence_counter_run.step);
+    const role_default_tests = b.addTest(.{
+        .root_module = antfly_test_mod,
+        .filters = &.{ "SQL role defaults decoder", "metadata module compiles", "metadata storage module compiles" },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    const role_default_run = addFilteredTestRunArtifact(b, role_default_tests);
+    role_default_run.addArg("--require-no-skips");
+    b.step("antfly-metadata-sql-role-defaults-test", "Verify role default decoder admission, apply, restore and cold replay barriers").dependOn(&role_default_run.step);
     const sql_column_identity_tests = b.addTest(.{
         .root_module = antfly_test_mod,
         .filters = &.{ "system catalog SQL column identities", "SQL column identities", "SQL view catalog", "metadata raft apply store snapshot key registry covers every durable projection class", "metadata module compiles", "metadata storage module compiles" },

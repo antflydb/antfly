@@ -30,6 +30,9 @@ class RelationalUniqueConstraint:
                 ownership.
             primary (bool | Unset): SQL primary-key identity. At most one per relational table; all key columns must be
                 required and nonnullable.
+            include_columns (list[str] | Unset): Non-key payload columns for this constraint's covering ordered index. They
+                never participate in uniqueness, foreign-key target identity, or primary-key nullability. Only column-key,
+                constraint-owned declarations support INCLUDE.
             columns (list[str] | Unset):
             keys (list[RelationalIndexKey] | Unset): Typed native unique keys. Specify either columns or keys.
             where (list[RelationalIndexPredicate] | Unset): Conjunction restricting uniqueness to matching rows.
@@ -47,6 +50,7 @@ class RelationalUniqueConstraint:
     name: str
     origin: RelationalUniqueConstraintOrigin | Unset = UNSET
     primary: bool | Unset = UNSET
+    include_columns: list[str] | Unset = UNSET
     columns: list[str] | Unset = UNSET
     keys: list[RelationalIndexKey] | Unset = UNSET
     where: list[RelationalIndexPredicate] | Unset = UNSET
@@ -62,6 +66,10 @@ class RelationalUniqueConstraint:
             origin = self.origin.value
 
         primary = self.primary
+
+        include_columns: list[str] | Unset = UNSET
+        if not isinstance(self.include_columns, Unset):
+            include_columns = self.include_columns
 
         columns: list[str] | Unset = UNSET
         if not isinstance(self.columns, Unset):
@@ -100,6 +108,8 @@ class RelationalUniqueConstraint:
             field_dict["origin"] = origin
         if primary is not UNSET:
             field_dict["primary"] = primary
+        if include_columns is not UNSET:
+            field_dict["include_columns"] = include_columns
         if columns is not UNSET:
             field_dict["columns"] = columns
         if keys is not UNSET:
@@ -131,6 +141,8 @@ class RelationalUniqueConstraint:
             origin = RelationalUniqueConstraintOrigin(_origin)
 
         primary = d.pop("primary", UNSET)
+
+        include_columns = cast(list[str], d.pop("include_columns", UNSET))
 
         columns = cast(list[str], d.pop("columns", UNSET))
 
@@ -167,6 +179,7 @@ class RelationalUniqueConstraint:
             name=name,
             origin=origin,
             primary=primary,
+            include_columns=include_columns,
             columns=columns,
             keys=keys,
             where=where,

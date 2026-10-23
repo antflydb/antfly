@@ -19,6 +19,39 @@ const std = @import("std");
 const Value = std.json.Value;
 const equal = @import("json_shape.zig").equal;
 
+pub const validation_required_message = "Tightening relational nullability requires coordinated schema validation or an explicit staged rewrite; no schema change was admitted.";
+
+/// Public schema replacement has no globally fenced proof of historical row
+/// validity. Compile the actual runtime null/presence rules before admission;
+/// an unfenced observation that a table appears empty is not sufficient.
+/// Trusted staged rewrite/validation producers use their own exact candidates.
+pub fn validateSchemaUpdate(alloc: std.mem.Allocator, previous_json: []const u8, next_json: []const u8) !void {
+    const api = @import("mod.zig");
+    var previous = try api.PreparedSchemaDefinition.init(alloc, if (previous_json.len == 0) "{}" else previous_json);
+    defer previous.deinit(alloc);
+    if (previous.runtime_schema.storage_mode != .relational) return;
+    var next = try api.PreparedSchemaDefinition.init(alloc, next_json);
+    defer next.deinit(alloc);
+    if (next.runtime_schema.storage_mode != .relational) return;
+    if (previous.runtime_schema.relational_columns.len == next.runtime_schema.relational_columns.len) same_order: {
+        for (previous.runtime_schema.relational_columns, next.runtime_schema.relational_columns) |old, column| {
+            if (!std.mem.eql(u8, old.name, column.name)) break :same_order;
+            if ((column.required and !old.required) or (!column.allows_null and old.allows_null)) return error.SchemaValidationPublicationRequired;
+        }
+        return;
+    }
+    var columns: std.StringHashMapUnmanaged(@import("../storage/schema.zig").RelationalColumn) = .empty;
+    defer columns.deinit(alloc);
+    try columns.ensureTotalCapacity(alloc, @intCast(previous.runtime_schema.relational_columns.len));
+    for (previous.runtime_schema.relational_columns) |column| columns.putAssumeCapacity(column.name, column);
+    for (next.runtime_schema.relational_columns) |column| {
+        if (columns.get(column.name)) |old| {
+            if ((column.required and !old.required) or (!column.allows_null and old.allows_null))
+                return error.SchemaValidationPublicationRequired;
+        } else if (column.required) return error.SchemaValidationPublicationRequired;
+    }
+}
+
 fn list(schema: *Value, alloc: std.mem.Allocator, key: []const u8) !*std.array_list.Managed(Value) {
     const entry = try schema.object.getOrPut(alloc, key);
     if (!entry.found_existing) entry.value_ptr.* = .{ .array = std.array_list.Managed(Value).init(alloc) };
@@ -260,6 +293,25 @@ fn transitionFaults(allocator: std.mem.Allocator) !void {
     try testApply(a, &relaxed, relaxation);
     try std.testing.expectEqualDeep(Summary{ .changed = 1 }, try verifyTransition(a, after, relaxed, &.{relaxation}, .{}));
     try std.testing.expectEqualDeep(Summary{}, try verifyTransition(a, relaxed, relaxed, &.{relaxation}, .{}));
+}
+
+test "schema validation publication public nullability admission rejects historical tightening" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const before = try testValue(arena.allocator(), test_schema);
+    var after = try @import("../common/owned_json.zig").clone(arena.allocator(), before);
+    try testApply(arena.allocator(), &after, .{ .column = "n", .nullable = false });
+    const after_bytes = try std.json.Stringify.valueAlloc(arena.allocator(), after, .{});
+    try std.testing.expectError(error.SchemaValidationPublicationRequired, validateSchemaUpdate(a, test_schema, after_bytes));
+    try validateSchemaUpdate(a, after_bytes, test_schema);
+    try validateSchemaUpdate(a, test_schema, test_schema);
+    try validateSchemaUpdate(a, "{}", test_schema);
+    const old = "{\"version\":1,\"storage_mode\":\"relational\",\"default_type\":\"r\",\"document_schemas\":{\"r\":{\"schema\":{\"type\":\"object\",\"properties\":{\"n\":{\"type\":\"integer\",\"nullable\":true}},\"additionalProperties\":false}}}}";
+    const optional = "{\"version\":2,\"storage_mode\":\"relational\",\"default_type\":\"r\",\"document_schemas\":{\"r\":{\"schema\":{\"type\":\"object\",\"properties\":{\"extra\":{\"type\":\"string\",\"nullable\":true},\"n\":{\"type\":\"integer\",\"nullable\":true}},\"additionalProperties\":false}}}}";
+    const required = "{\"version\":2,\"storage_mode\":\"relational\",\"default_type\":\"r\",\"document_schemas\":{\"r\":{\"schema\":{\"type\":\"object\",\"properties\":{\"extra\":{\"type\":\"string\"},\"n\":{\"type\":\"integer\",\"nullable\":true}},\"required\":[\"extra\"],\"additionalProperties\":false}}}}";
+    try validateSchemaUpdate(a, old, optional);
+    try std.testing.expectError(error.SchemaValidationPublicationRequired, validateSchemaUpdate(a, old, required));
 }
 
 test "column nullability transition isolates requested changes and every allocation failure" {

@@ -3,6 +3,8 @@ import type { RelationalExpressionOp, RelationalExpressionType, SQLBuiltinType }
 const arities: Record<RelationalExpressionOp, readonly [number, number]> = {
   literal: [0, 0],
   column: [0, 0],
+  uuidv4: [0, 0],
+  uuidv7: [0, 0],
   array: [0, 32],
   add: [2, 2],
   subtract: [2, 2],
@@ -267,20 +269,34 @@ export function validateRelationalExpression(
       throw new TypeError(`${location}.op must be a supported relational expression operation`);
     const op = node.op as RelationalExpressionOp;
     const allowed = new Set(
-      op === "literal"
-        ? ["op", "type", "value", "sql_type", "json_null"]
-        : op === "column"
-          ? ["op", "column"]
-          : op === "cast"
-            ? ["op", "type", "sql_type", "numeric_modifier", "args"]
-            : numericOperations.has(op) || op === "array"
-              ? ["op", "args", "sql_type"]
-              : comparisons.has(op)
-                ? ["op", "args", "collation"]
-                : ["op", "args"]
+      op === "uuidv4"
+        ? ["op"]
+        : op === "uuidv7"
+          ? ["op", "shift"]
+          : op === "literal"
+            ? ["op", "type", "value", "sql_type", "json_null"]
+            : op === "column"
+              ? ["op", "column"]
+              : op === "cast"
+                ? ["op", "type", "sql_type", "numeric_modifier", "args"]
+                : numericOperations.has(op) || op === "array"
+                  ? ["op", "args", "sql_type"]
+                  : comparisons.has(op)
+                    ? ["op", "args", "collation"]
+                    : ["op", "args"]
     );
     for (const key of Object.keys(node))
       if (!allowed.has(key)) throw new TypeError(`${location}.${key} is not valid for ${op}`);
+    if (op === "uuidv4" || op === "uuidv7") {
+      if (
+        hasOwn.call(node, "shift") &&
+        (typeof node.shift !== "string" || node.shift.length === 0 || node.shift.length > 128)
+      )
+        throw new TypeError(`${location}.shift requires bounded canonical interval text`);
+      // The server binds canonical interval syntax and permits volatile UUID
+      // generation only in column defaults, never immutable schema expressions.
+      return;
+    }
     const arrayLiteral = op === "literal" && node.type === "sql_array";
     const arrayDomain =
       arrayLiteral || op === "array" || (op === "cast" && node.type === "sql_array");

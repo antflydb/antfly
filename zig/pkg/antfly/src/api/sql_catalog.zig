@@ -32,7 +32,7 @@ fn newReceipt(alloc: std.mem.Allocator, target: domain.Target, table_id: u64, ve
     return .{ .database = database, .namespace = namespace, .table = table, .table_id = try std.fmt.allocPrint(alloc, "{d}", .{table_id}), .schema_version = version, .state = .pending };
 }
 
-const RelationAdmission = struct { table: domain.ResolvedTable, guard: domain.RelationMutationGuard };
+pub const RelationAdmission = struct { table: domain.ResolvedTable, guard: domain.RelationMutationGuard };
 const SearchPath = @import("../pgwire/search_path.zig").Path;
 
 /// Prior read-layout retirement is deterministic maintenance, but it changes
@@ -102,6 +102,7 @@ fn prepareGeneratedAddition(server: *server_mod.ApiHttpServer, context: operatio
         .add_unique => |rule| if (rule.primary) .primary else .unique,
         .add_check => .check,
         .add_foreign_key => .foreign_key,
+        .add_column => .foreign_key,
         else => unreachable,
     };
     const selected = prepared.admission.names[0];
@@ -211,6 +212,35 @@ fn beginIndex(server: *server_mod.ApiHttpServer, context: operation.RequestConte
     return @import("relational_index_admission.zig").submitOwned(server.source, allocators.scratch, io, private, &owned, receipt, allocators.completion);
 }
 
+fn beginSchemaValidation(server: *server_mod.ApiHttpServer, context: operation.RequestContext, allocators: catalog.DdlAllocators, target: domain.Target, guard: domain.RelationMutationGuard, columns: []const []const u8) !catalog.DdlOutcome {
+    const io = server.sharedApiIo() orelse return error.UnsupportedSqlExecution;
+    var private = try context.platformDeadline();
+    // captureTableAdmission already authorized this exact logical table. These
+    // capabilities are never decoded from SQL, tokens, or public request JSON.
+    private.setting_admin = true;
+    private.schema_validation_authority = true;
+    var transport: @import("schema_validation_owner_transport.zig").Transport = .{ .server = server, .alloc = allocators.scratch };
+    defer transport.deinit();
+    var owned = @import("schema_validation_plan_builder.zig").prepare(server.source, &transport, allocators.scratch, io, private, .{ .guard = guard, .columns = columns }) catch |err| switch (err) {
+        error.MetadataReplicationPending => return error.CatalogPublicationProofPending,
+        else => return err,
+    };
+    var transferred = false;
+    defer if (!transferred) owned.deinit();
+    const a = allocators.result;
+    var receipt = try newReceipt(a, target, owned.lookup.table, std.math.add(u32, guard.owner.schema_version, 1) catch return error.SqlLimitExceeded);
+    errdefer {
+        a.free(receipt.database);
+        a.free(receipt.namespace);
+        a.free(receipt.table);
+        a.free(receipt.table_id);
+        if (receipt.schema_validation_token) |token| a.free(token);
+    }
+    receipt.schema_validation_token = try a.dupe(u8, &owned.recovery_token);
+    transferred = true;
+    return @import("schema_validation_admission.zig").submitOwned(server.source, allocators.scratch, io, private, &owned, receipt, allocators.completion);
+}
+
 fn validatesDeferredCheck(schema: std.json.Value, ddl: @import("antfly_local_sources").sql_ast.CatalogDdl) bool {
     const change = ddl.schema_change orelse return false;
     if (change != .validate_constraint or schema != .object) return false;
@@ -226,6 +256,55 @@ fn validatesDeferredCheck(schema: std.json.Value, ddl: @import("antfly_local_sou
     return false;
 }
 
+pub fn captureTableAdmission(server: *server_mod.ApiHttpServer, identity: ?server_mod.AuthenticatedIdentity, context: operation.RequestContext, a: std.mem.Allocator, requested_target: domain.Target, qualified: bool, path: ?*const SearchPath) !?RelationAdmission {
+    const use_path = !qualified and path != null;
+    const namespaces = if (use_path) path.?.len else 1;
+    if (namespaces == 0) return null;
+    if (namespaces > SearchPath.max_namespaces) return error.InvalidParameter;
+    var candidates: [SearchPath.max_namespaces]domain.RelationTarget = undefined;
+    for (0..namespaces) |i| candidates[i] = .{
+        .database = requested_target.database,
+        .namespace = if (use_path) path.?.entries[i].slice() else requested_target.namespace,
+        .name = requested_target.table,
+    };
+    const lookup: domain.ResolveMany = .{ .relations = candidates[0..namespaces], .include_query_definitions = true };
+    const bytes = try server.source.systemCatalog(a, context, .{ .resolve_many = lookup });
+    const snapshot = try std.json.parseFromSliceLeaky(domain.ResolvedMany, a, bytes, .{ .allocate = .alloc_always });
+    try snapshot.validateRelations(lookup);
+    var selected: usize = 0;
+    while (selected < snapshot.relations.len and snapshot.relations[selected] == null) : (selected += 1) {}
+    const owner = if (selected < snapshot.relations.len) snapshot.relations[selected].? else return null;
+    const resolved_target: domain.Target = .{ .database = lookup.relations[selected].database, .namespace = lookup.relations[selected].namespace, .table = owner.logical_table };
+    // A wrong-kind or unauthorized first shadow must not expose/mutate a
+    // later table. Capture authorization and definition in the same cut.
+    try authorizeTable(identity, a, resolved_target);
+    if (owner.owner.kind != .table) return error.SqlWrongObjectType;
+    return .{ .table = owner.table, .guard = .{ .target = lookup.relations[selected], .logical_table = owner.logical_table, .owner = owner.owner, .incarnation = snapshot.relation_epoch.?.incarnation } };
+}
+
+fn commentTable(server: *server_mod.ApiHttpServer, identity: ?server_mod.AuthenticatedIdentity, context: operation.RequestContext, database: []const u8, namespace: []const u8, allocators: catalog.DdlAllocators, ddl: @import("antfly_local_sources").sql_ast.CatalogDdl, path: ?*const SearchPath) !catalog.DdlOutcome {
+    if (ddl.kind != .table or ddl.action != .comment or ddl.conditional or ddl.cascade) return error.InvalidSqlSyntax;
+    if (!server.source.vtable.supports_query_definitions) return error.UnsupportedSqlExecution;
+    var arena = std.heap.ArenaAllocator.init(allocators.scratch);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const target: domain.Target = .{ .database = ddl.name.database orelse database, .namespace = ddl.name.namespace orelse namespace, .table = ddl.name.table };
+    try target.validate();
+    if (ddl.name.database != null or ddl.name.namespace != null or path == null) try authorizeTable(identity, a, target);
+    const captured = (try captureTableAdmission(server, identity, context, a, target, ddl.name.database != null or ddl.name.namespace != null, path)) orelse return error.TableNotFound;
+    var private = context;
+    private.setting_admin = true;
+    const response = server.source.systemCatalog(a, private, .{ .relation_description_mutate = .{ .guard = captured.guard, .description = ddl.comment_value orelse "" } }) catch |err| {
+        if (err == error.MetadataMutationOutcomeUnknown) return error.SqlMutationOutcomeUnknown;
+        return err;
+    };
+    // A successful reply is a durable metadata receipt, never a schema
+    // publication. Comments cannot manufacture an epoch or rewrite rows.
+    const receipt = std.json.parseFromSliceLeaky(@import("../system_catalog/server_call.zig").RelationReplacementResult, a, response, .{}) catch return error.SqlMutationOutcomeUnknown;
+    if (receipt.schema_version != captured.guard.owner.schema_version) return error.SqlMutationOutcomeUnknown;
+    return .{ .mutation_outcome = .committed };
+}
+
 fn alterSchema(server: *server_mod.ApiHttpServer, identity: ?server_mod.AuthenticatedIdentity, context: operation.RequestContext, allocators: catalog.DdlAllocators, requested_target: domain.Target, ddl: @import("antfly_local_sources").sql_ast.CatalogDdl, admission: ?RelationAdmission, path: ?*const SearchPath) !catalog.DdlOutcome {
     const alloc = allocators.result;
     // Compiler labels are not public identities. Do not publish an anonymous
@@ -237,48 +316,8 @@ fn alterSchema(server: *server_mod.ApiHttpServer, identity: ?server_mod.Authenti
     var arena = std.heap.ArenaAllocator.init(allocators.scratch);
     defer arena.deinit();
     const a = arena.allocator();
-    const initially_captured = admission orelse blk: {
-        const use_path = ddl.name.namespace == null and ddl.name.database == null and path != null;
-        const namespaces = if (use_path) path.?.len else 1;
-        if (namespaces == 0) return if (ddl.conditional) .{} else error.TableNotFound;
-        if (namespaces > SearchPath.max_namespaces) return error.InvalidParameter;
-        var candidates: [SearchPath.max_namespaces]domain.RelationTarget = undefined;
-        for (0..namespaces) |i| candidates[i] = .{
-            .database = requested_target.database,
-            .namespace = if (use_path) path.?.entries[i].slice() else requested_target.namespace,
-            .name = requested_target.table,
-        };
-        const lookup: domain.ResolveMany = .{ .relations = candidates[0..namespaces], .include_query_definitions = true };
-        const bytes = try server.source.systemCatalog(a, context, .{ .resolve_many = lookup });
-        const snapshot = try std.json.parseFromSliceLeaky(domain.ResolvedMany, a, bytes, .{ .allocate = .alloc_always });
-        try snapshot.validateRelations(lookup);
-        var selected: usize = 0;
-        while (selected < snapshot.relations.len and snapshot.relations[selected] == null) : (selected += 1) {}
-        // An attested absent owner is the linearization point for IF EXISTS.
-        // Never submit a schema mutation or turn a failed lookup into absence.
-        const owner = if (selected < snapshot.relations.len) snapshot.relations[selected].? else return if (ddl.conditional) .{} else error.TableNotFound;
-        const resolved_target: domain.Target = .{
-            .database = lookup.relations[selected].database,
-            .namespace = lookup.relations[selected].namespace,
-            .table = owner.logical_table,
-        };
-        // Do not skip an unauthorized or wrong-kind shadow to mutate a later
-        // relation. Authorization follows the actual first resolved owner.
-        try authorizeTable(identity, a, resolved_target);
-        if (owner.owner.kind != .table) return error.SqlWrongObjectType;
-        // Pin logical identity, schema digest and incarnation in the same
-        // point lookup as the definition. ALTER TABLE must use the same
-        // metadata-owner CAS as index DDL, not a separate unguarded adapter.
-        break :blk RelationAdmission{
-            .table = owner.table,
-            .guard = .{
-                .target = lookup.relations[selected],
-                .logical_table = owner.logical_table,
-                .owner = owner.owner,
-                .incarnation = snapshot.relation_epoch.?.incarnation,
-            },
-        };
-    };
+    const initially_captured = admission orelse
+        ((try captureTableAdmission(server, identity, context, a, requested_target, ddl.name.namespace != null or ddl.name.database != null, path)) orelse return if (ddl.conditional) .{} else error.TableNotFound);
     var captured = initially_captured;
     const target: domain.Target = .{
         .database = captured.guard.target.database,
@@ -315,6 +354,9 @@ fn alterSchema(server: *server_mod.ApiHttpServer, identity: ?server_mod.Authenti
         }
     };
     var row_validation_required = false;
+    const column_transform = try @import("antfly_local_sources").sql_schema_ddl.prepareColumnTransform(a, schema, ddl, .{ .checkpoint = Checkpoint.check, .checkpoint_context = &preparation_context });
+    if (ddl.schema_change) |change| if (change == .rename_column)
+        try @import("antfly_local_sources").sql_schema_ddl.requireIndependentRenameIndexes(a, definition.indexes_json, change.rename_column.name);
     if (ddl.schema_change != null and ddl.schema_change.? == .set_nullability) {
         const change = ddl.schema_change.?.set_nullability;
         const prepared = try @import("antfly_local_sources").schema_column_nullability.prepareBorrowed(&arena, schema, &.{.{
@@ -334,6 +376,8 @@ fn alterSchema(server: *server_mod.ApiHttpServer, identity: ?server_mod.Authenti
     const proposed = try std.json.Stringify.valueAlloc(a, schema, .{});
     const updated = try server.bindForeignKeySchema(a, target, table.name, proposed, definition.schema_json, identity, context);
     try context.ensureActive();
+    if (column_transform) |transform|
+        return rewriteSchemaWithPolicies(server, identity, context, alloc, target, table.name, table.table_id, native.version, updated, .{ .dropped_columns = if (ddl.schema_change.? == .rename_column) .allow else .reject, .expression_schema = definition.schema_json, .column_transforms = &.{transform} }, null);
     if (declared_check_validation)
         return rewriteSchema(server, identity, context, alloc, target, table.name, table.table_id, native.version, updated, &.{}, null);
     if (!try tables.foreignKeyDefinitionsUnchanged(a, definition.schema_json, updated)) {
@@ -373,8 +417,8 @@ fn alterSchema(server: *server_mod.ApiHttpServer, identity: ?server_mod.Authenti
         .create_index => |index| if (index.unique) return beginIndex(server, context, allocators, target, guard, index.name, updated),
         .add_column => |column| if (!column.nullable or column.default_expression != null or column.generated_expression != null)
             return rewriteSchema(server, identity, context, alloc, target, table.name, table.table_id, native.version, updated, if (column.default_expression != null) &.{column.name} else &.{}, null),
-        .set_nullability => if (row_validation_required)
-            return rewriteSchema(server, identity, context, alloc, target, table.name, table.table_id, native.version, updated, &.{}, null),
+        .set_nullability => |nullability| if (row_validation_required)
+            return beginSchemaValidation(server, context, allocators, target, guard, &.{nullability.column}),
         // A validated declaration must not become visible until every old
         // row passes. Reuse the unpublished generation's snapshot/tail barrier
         // instead of publishing first and turning invalid history into a
@@ -389,7 +433,7 @@ fn alterSchema(server: *server_mod.ApiHttpServer, identity: ?server_mod.Authenti
     const validation = ddl.schema_change.? == .validate_constraint;
     const activation_required = if (ddl.schema_change) |change| switch (change) {
         .create_index => |index| index.unique,
-        .add_unique, .add_check, .add_foreign_key, .validate_constraint, .drop_constraint => true,
+        .add_unique, .add_check, .add_foreign_key, .validate_constraint, .drop_constraint, .rename_constraint => true,
         else => false,
     } else false;
     // Allocate all durable identity fields before submission. Later timeout,
@@ -426,6 +470,10 @@ fn alterSchema(server: *server_mod.ApiHttpServer, identity: ?server_mod.Authenti
 }
 
 fn rewriteSchema(server: *server_mod.ApiHttpServer, identity: ?server_mod.AuthenticatedIdentity, context: operation.RequestContext, alloc: std.mem.Allocator, target: domain.Target, physical: []const u8, table_id: u64, version: u32, schema: []const u8, default_columns: []const []const u8, guard: ?domain.RelationMutationGuard) !catalog.DdlOutcome {
+    return rewriteSchemaWithPolicies(server, identity, context, alloc, target, physical, table_id, version, schema, .{ .default_columns = default_columns }, guard);
+}
+
+fn rewriteSchemaWithPolicies(server: *server_mod.ApiHttpServer, identity: ?server_mod.AuthenticatedIdentity, context: operation.RequestContext, alloc: std.mem.Allocator, target: domain.Target, physical: []const u8, table_id: u64, version: u32, schema: []const u8, policies: @import("antfly_local_sources").storage_db_relational_row_transform.Policies, guard: ?domain.RelationMutationGuard) !catalog.DdlOutcome {
     // Rewrite jobs and their staging plan must be committed by the metadata
     // owner. A data node's local restore history cannot admit this operation.
     if (server.restore_job_store.replicated == null) return error.SqlSchemaRewriteRequiresMetadataOwner;
@@ -466,7 +514,7 @@ fn rewriteSchema(server: *server_mod.ApiHttpServer, identity: ?server_mod.Authen
     receipt.restore_job_id = try std.fmt.allocPrint(alloc, "{d}", .{job_id});
     // Shared native restore machinery reserves the entire dependency cohort,
     // transforms into unpublished storage, validates, and publishes atomically.
-    var response = server.handleSchemaRewriteWithConstraintNameGuard(table.*, schema, receipt.idempotency_key, identity, context, default_columns, guard) catch |err| return rewriteCallFailure(receipt, err);
+    var response = server.handleSchemaRewriteWithPolicies(table.*, schema, receipt.idempotency_key, identity, context, policies, guard) catch |err| return rewriteCallFailure(receipt, err);
     defer response.deinit(server.alloc);
     return rewriteResponse(alloc, response.status, response.body, receipt);
 }
@@ -520,7 +568,16 @@ fn rewriteCallFailure(receipt: catalog.DdlReceipt, err: anyerror) anyerror!catal
         error.Forbidden,
         error.UnsupportedSqlExecution,
         error.AsyncRestoreUnavailable,
+        // Immutable program compilation precedes startRecoverable. These
+        // errors prove nonadmission; inventing an unknown job here leaves a
+        // caller polling an identity that was never durably reserved.
+        error.RelationalExpressionBudgetExceeded,
+        error.RelationalRewriteBudgetExceeded,
         => err,
+        error.RelationalRewriteTypeChange,
+        error.RelationalRewriteColumnDrop,
+        => error.UnsupportedSqlShape,
+        error.InvalidRelationalExpressionType => error.SqlTypeMismatch,
         error.StoredDestinationAuthorizationRevoked => error.Forbidden,
         error.GroupLeaderUnavailable => error.RestoreValidationPending,
         else => unknownRewriteOutcome(receipt),
@@ -544,6 +601,9 @@ test "SQL rewrite response retains admitted and uncertain restore handles" {
     try std.testing.expectEqualStrings("41", unknown.receipt.?.restore_job_id.?);
     try std.testing.expectEqualStrings("auto:abc", unknown.receipt.?.idempotency_key.?);
     try std.testing.expectError(error.SqlWriteCapacityUnavailable, rewriteResponse(alloc, 503, "{\"error\":\"worker unavailable\"}", receipt));
+    // A separately owned index can change after SQL preparation. Its current
+    // predecessor recheck is definite nonadmission, not a nonexistent job.
+    try std.testing.expectError(error.SchemaVersionChanged, rewriteResponse(alloc, 409, "{\"error\":\"Artifact index binding changed\"}", receipt));
     const unclassified = try rewriteResponse(alloc, 500, "{\"error\":\"failed to create restore job\"}", receipt);
     try std.testing.expectEqual(.admission_unknown, unclassified.receipt.?.state);
     try std.testing.expectEqualStrings("41", unclassified.receipt.?.restore_job_id.?);
@@ -552,6 +612,8 @@ test "SQL rewrite response retains admitted and uncertain restore handles" {
     try std.testing.expectError(error.RestoreValidationPending, rewriteCallFailure(receipt, error.RestoreValidationPending));
     try std.testing.expectError(error.RestoreValidationPending, rewriteCallFailure(receipt, error.GroupLeaderUnavailable));
     try std.testing.expectError(error.Forbidden, rewriteCallFailure(receipt, error.StoredDestinationAuthorizationRevoked));
+    try std.testing.expectError(error.UnsupportedSqlShape, rewriteCallFailure(receipt, error.RelationalRewriteTypeChange));
+    try std.testing.expectError(error.RelationalExpressionBudgetExceeded, rewriteCallFailure(receipt, error.RelationalExpressionBudgetExceeded));
     const response_oom = try rewriteCallFailure(receipt, error.OutOfMemory);
     try std.testing.expectEqual(.admission_unknown, response_oom.receipt.?.state);
     try std.testing.expectEqualStrings("41", response_oom.receipt.?.restore_job_id.?);
@@ -764,6 +826,12 @@ pub fn executeWithAllocators(server: *server_mod.ApiHttpServer, identity: ?serve
     const alloc = allocators.result;
     try context.ensureActive();
     if (input == .policy_ddl) return @import("sql_policy_ddl.zig").execute(server, identity, context, database, namespace, alloc, input.policy_ddl);
+    if (input == .catalog_ddl and input.catalog_ddl.kind == .sequence)
+        return @import("sql_sequence_ddl.zig").execute(server, identity, context, database, namespace, allocators, input.catalog_ddl, path);
+    if (input == .catalog_ddl and input.catalog_ddl.action == .comment)
+        return commentTable(server, identity, context, database, namespace, allocators, input.catalog_ddl, path);
+    if (input == .catalog_ddl and input.catalog_ddl.kind == .role)
+        return @import("sql_role_ddl.zig").execute(server, identity, context, allocators, input.catalog_ddl);
     if (input == .catalog_ddl and input.catalog_ddl.kind == .index)
         return executeIndex(server, identity, context, database, namespace, allocators, input.catalog_ddl, path);
     if (input == .catalog_ddl and input.catalog_ddl.kind == .view)
@@ -778,7 +846,7 @@ pub fn executeWithAllocators(server: *server_mod.ApiHttpServer, identity: ?serve
     try target.validate();
     const kind: domain.Kind = switch (input) {
         .catalog_ddl => |ddl| switch (ddl.kind) {
-            .index, .view => unreachable,
+            .index, .view, .role, .sequence => unreachable,
             inline else => |tag| @field(domain.Kind, @tagName(tag)),
         },
         .policy_ddl => unreachable,
@@ -789,7 +857,7 @@ pub fn executeWithAllocators(server: *server_mod.ApiHttpServer, identity: ?serve
     defer alloc.free(resource);
     // Check logical scope before any catalog lookup, including IF EXISTS.
     const permission_kind: @import("../usermgr/mod.zig").ResourceType = switch (kind) {
-        .query_source, .view => .table,
+        .query_source, .view, .sequence => .table,
         inline else => |tag| @field(@import("../usermgr/mod.zig").ResourceType, @tagName(tag)),
     };
     const alter_path_lookup = input == .catalog_ddl and input.catalog_ddl.action == .alter_schema and
@@ -803,7 +871,7 @@ pub fn executeWithAllocators(server: *server_mod.ApiHttpServer, identity: ?serve
         .create_table => .create,
         .drop_table => .drop,
         .catalog_ddl => |ddl| switch (ddl.action) {
-            .alter_schema, .truncate => unreachable,
+            .alter_schema, .truncate, .role_default, .comment, .alter_sequence => unreachable,
             inline else => |tag| @field(domain.Action, @tagName(tag)),
         },
         .policy_ddl => unreachable,
@@ -908,13 +976,13 @@ pub fn executeWithAllocators(server: *server_mod.ApiHttpServer, identity: ?serve
             .database => error.SqlDuplicateDatabase,
             .namespace => error.SqlDuplicateNamespace,
             .tablespace => error.SqlDuplicateTablespace,
-            .table, .query_source, .view => err,
+            .table, .query_source, .view, .sequence => err,
         };
         if (err == error.CatalogNotFound) return switch (kind) {
             .database => error.DatabaseNotFound,
             .namespace => error.NamespaceNotFound,
             .tablespace => error.TablespaceNotFound,
-            .table, .query_source, .view => err,
+            .table, .query_source, .view, .sequence => err,
         };
         return err;
     };
@@ -1109,16 +1177,16 @@ test "SQL catalog DDL readiness retries transient observations without replaying
         // No owner read is needed for a declaration without constraints.
         server.table_reads = .{ .ptr = &fixture, .vtable = &.{ .lookup = undefined, .scan = undefined, .query = undefined } };
         var receipt: catalog.DdlReceipt = .{ .database = "default", .namespace = "public", .table = "new_table", .table_id = "7", .schema_version = 0, .state = .pending };
-        try awaitActivation(&server, .{ .deadline_io = @import("antfly_runtime_abi").io_abi.Borrow.init(&std.testing.io) }, alloc, "new_table", &receipt, .until_deadline);
+        try awaitActivation(&server, .{ .deadline_io = @import("antfly_runtime_abi").io_abi.Borrow.init(&std.testing.io) }, alloc, "new_table", &receipt, .bounded);
         try std.testing.expectEqual(.ready, receipt.state);
         try std.testing.expectEqual(@as(usize, 2), fixture.calls);
         // Invalid data remains a terminal observation error, not a retry.
         fixture.failure = error.InvalidIntegrityDefinition;
         fixture.calls = 0;
-        try std.testing.expectError(error.InvalidIntegrityDefinition, awaitActivation(&server, .{}, alloc, "new_table", &receipt, .until_deadline));
+        try std.testing.expectError(error.InvalidIntegrityDefinition, awaitActivation(&server, .{}, alloc, "new_table", &receipt, .bounded));
         try std.testing.expectEqual(@as(usize, 1), fixture.calls);
         fixture.calls = 0;
-        try std.testing.expectError(error.DeadlineExceeded, awaitActivation(&server, .{ .deadline_ns = 0 }, alloc, "new_table", &receipt, .until_deadline));
+        try std.testing.expectError(error.DeadlineExceeded, awaitActivation(&server, .{ .deadline_ns = 0 }, alloc, "new_table", &receipt, .bounded));
         try std.testing.expectEqual(@as(usize, 0), fixture.calls);
     }
 }
@@ -1313,6 +1381,486 @@ test "SQL index DDL drops the exact qualified owner without a catalog snapshot" 
     try std.testing.expectEqual(empty_writes + 1, source.writes);
 }
 
+test "SQL sequence intent cannot fall back to physical resource creation before activation" {
+    const Source = struct {
+        calls: usize = 0,
+        fn status(raw: *anyopaque) !@import("../metadata/api.zig").MetadataStatus {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            return .{ .metadata_group_id = 1, .metrics = .{} };
+        }
+        fn catalogCall(raw: *anyopaque, _: std.mem.Allocator, _: operation.RequestContext, _: @import("../system_catalog/server_call.zig").Call) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            return error.UnexpectedSequenceCatalogAccess;
+        }
+    };
+    const a = std.testing.allocator;
+    var source: Source = .{};
+    var server = server_mod.ApiHttpServer.init(a, .{}, .{ .ptr = &source, .vtable = &.{ .status = Source.status, .system_catalog = Source.catalogCall, .supports_query_definitions = true } }, null, null);
+    defer server.deinit();
+    for ([_][]const u8{
+        "CREATE SEQUENCE counter CACHE 32", "ALTER SEQUENCE counter RESTART 1000", "DROP SEQUENCE IF EXISTS counter CASCADE",
+    }) |sql| {
+        var compiled = try @import("antfly_local_sources").sql_compiler.compile(a, sql, .{});
+        defer compiled.deinit();
+        try std.testing.expectError(error.UnsupportedSqlExecution, execute(&server, null, .{}, "default", "public", a, .{ .catalog_ddl = compiled.statement.catalog_ddl }));
+    }
+    try std.testing.expectEqual(@as(usize, 0), source.calls);
+}
+
+const SequenceProducerFixture = struct {
+    const seq = @import("../system_catalog/sequence_catalog.zig");
+    const Reply = enum { success, rejected, lost, malformed, invalid_identity, missing };
+    existing: enum { absent, sequence, other } = .absent,
+    reply: Reply = .success,
+    observed: Reply = .success,
+    reads: usize = 0,
+    writes: usize = 0,
+    observations: usize = 0,
+    expected_integer: seq.sequence.Integer = .int64,
+    expected_action: enum { create, alter, rename, drop } = .create,
+    admitted_nonce: [16]u8 = @splat(0),
+    owner_missing: bool = false,
+    owner_stale: bool = false,
+    owner_reads: usize = 0,
+    auth_enabled: bool = false,
+    identity: ?server_mod.AuthenticatedIdentity = null,
+    context: operation.RequestContext = .{},
+    path: ?*const SearchPath = null,
+    missing_first_namespace: bool = false,
+    later_sequence: bool = false,
+    expected_namespace: []const u8 = "public",
+    cancel_after_mutation: ?*std.atomic.Value(bool) = null,
+
+    fn status(_: *anyopaque) !@import("../metadata/api.zig").MetadataStatus {
+        return .{ .metadata_group_id = 1, .metrics = .{} };
+    }
+    fn result(a: std.mem.Allocator, request: seq.Mutation, reply: Reply) ![]u8 {
+        return switch (reply) {
+            .lost => error.OutOfMemory,
+            .malformed => a.dupe(u8, "{\"success\":"),
+            .missing => a.dupe(u8, "null"),
+            .rejected => std.json.Stringify.valueAlloc(a, seq.Outcome{ .rejected = .InvalidSequenceDefinition }, .{}),
+            .success, .invalid_identity => std.json.Stringify.valueAlloc(a, seq.Outcome{ .success = .{
+                .revision = 10,
+                .identity = switch (request.operation) {
+                    .create => .{ .id = 92, .generation = 1 },
+                    .alter => |v| .{ .id = if (reply == .invalid_identity) 93 else v.expected.id, .generation = v.expected.generation + 1 },
+                    .rename => |v| v.expected,
+                    .drop => null,
+                },
+                .removed = if (request.operation == .drop) 1 else 0,
+            } }, .{}),
+        };
+    }
+    fn call(raw: *anyopaque, a: std.mem.Allocator, context: operation.RequestContext, request: @import("../system_catalog/server_call.zig").Call) ![]u8 {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        if (request != .resolve_many) try std.testing.expect(context.setting_admin);
+        switch (request) {
+            .resolve_many => |value| {
+                self.owner_reads += 1;
+                try std.testing.expect(value.include_query_definitions);
+                try std.testing.expectEqual(@as(usize, 1), value.relations.len);
+                const target = value.relations[0];
+                try std.testing.expectEqualStrings("owner_rows", target.name);
+                const table: @import("../metadata/table_manager.zig").TableRecord = .{ .table_id = 17, .name = "table:17", .schema_json = "{\"version\":1}" };
+                var resolved = domain.ResolvedTable.fromTable(table);
+                resolved.query_definition = domain.QueryDefinition.fromTable(table);
+                return std.json.Stringify.valueAlloc(a, domain.ResolvedMany{
+                    .revision = 9,
+                    .tables = &.{},
+                    .relations = &.{.{ .table = resolved, .logical_table = target.name, .owner = .{ .table_id = 17, .schema_version = 1, .schema_digest = @splat(1), .kind = .table } }},
+                    .relation_epoch = .{ .revision = 9, .incarnation = @splat(7) },
+                }, .{});
+            },
+            .sql_sequence_prepare => return a.dupe(u8, "null"),
+            .sql_sequence_snapshot => |value| {
+                self.reads += 1;
+                try value.validate();
+                const record = try seq.sequence.Record.create(.{ .start = 100, .restart = .{ .value = 7 } });
+                const entries = try a.alloc(seq.Snapshot.Entry, value.targets.len);
+                for (entries, value.targets, 0..) |*entry, target, index| {
+                    entry.* = .{
+                        .target = target,
+                        .namespace_id = if (std.mem.eql(u8, target.namespace, "public")) 2 else 3,
+                        .value = switch (if (index > 0 and self.later_sequence) .sequence else self.existing) {
+                            .absent => .absent,
+                            .other => .other,
+                            .sequence => .{ .sequence = try seq.sequence.Descriptor.init(44, record.definition) },
+                        },
+                        .counter = if (value.include_counters and self.existing == .sequence) record.state else null,
+                    };
+                    if (index == 0 and self.missing_first_namespace) {
+                        entry.namespace_id = null;
+                        entry.value = .missing_namespace;
+                        entry.counter = null;
+                    }
+                }
+                if (value.owner != null and self.owner_stale) return error.CatalogGenerationChanged;
+                return std.json.Stringify.valueAlloc(a, seq.Snapshot{ .revision = 9, .head = 3, .incarnation = @splat(7), .entries = entries, .owner = if (value.owner != null and !self.owner_missing) .{
+                    .namespace_id = if (std.mem.eql(u8, value.owner.?.guard.target.namespace, "public")) 2 else 3,
+                    .column = .{ .table_id = 17, .column_id = 9 },
+                } else null }, .{});
+            },
+            .sql_sequence_mutate => |value| {
+                self.writes += 1;
+                try value.validate();
+                try std.testing.expectEqual(@as(u64, 3), value.admission.head);
+                try std.testing.expectEqualSlices(u8, &@as([16]u8, @splat(7)), &value.incarnation);
+                try std.testing.expectEqualStrings("counter", value.target.table);
+                try std.testing.expectEqualStrings(self.expected_namespace, value.target.namespace);
+                try std.testing.expectEqual(@as(u64, if (std.mem.eql(u8, self.expected_namespace, "public")) 2 else 3), value.namespace_id);
+                self.admitted_nonce = value.admission.nonce;
+                try std.testing.expectEqualStrings(@tagName(self.expected_action), @tagName(value.operation));
+                switch (value.operation) {
+                    .create => |v| {
+                        try std.testing.expectEqual(self.expected_integer, v.options.integer orelse .int64);
+                        if (self.owner_reads != 0) {
+                            try std.testing.expectEqualDeep(seq.sequence.OwnedBy{ .table_id = 17, .column_id = 9 }, v.options.owned_by.column);
+                            try std.testing.expectEqual(@as(u64, 17), value.owner_guard.?.owner.table_id);
+                        }
+                    },
+                    .alter => |v| {
+                        try std.testing.expectEqualDeep(seq.Identity{ .id = 44, .generation = 1 }, v.expected);
+                        try std.testing.expectEqual(@as(?i64, 8), v.options.restart.?.value);
+                    },
+                    .rename => |v| try std.testing.expectEqualStrings("renamed", v.name),
+                    .drop => {},
+                }
+                if (self.cancel_after_mutation) |token| token.store(true, .release);
+                return result(a, value, self.reply);
+            },
+            .sql_sequence_outcome => |value| {
+                self.observations += 1;
+                try std.testing.expectEqualSlices(u8, &self.admitted_nonce, &value.admission.nonce);
+                try std.testing.expectEqual(@as(u64, 3), value.admission.head);
+                return result(a, value, self.observed);
+            },
+            else => return error.UnexpectedSequenceCatalogAccess,
+        }
+    }
+    fn run(self: *@This(), sql: []const u8) !catalog.DdlOutcome {
+        const a = std.testing.allocator;
+        var server = server_mod.ApiHttpServer.init(a, .{ .auth_enabled = self.auth_enabled, .imported_runtime_io = .{ .api = std.testing.io } }, .{ .ptr = self, .vtable = &.{ .status = status, .system_catalog = call, .supports_query_definitions = true, .supports_sql_sequences = true } }, null, null);
+        defer server.deinit();
+        var compiled = try @import("antfly_local_sources").sql_compiler.compile(a, sql, .{});
+        defer compiled.deinit();
+        return executeWithPath(&server, self.identity, self.context, "default", "public", a, .{ .catalog_ddl = compiled.statement.catalog_ddl }, self.path);
+    }
+    fn runCommitted(self: *@This(), sql: []const u8) !void {
+        const outcome = try self.run(sql);
+        defer if (outcome.catalog_receipt) |receipt| receipt.deinit(std.testing.allocator);
+        try std.testing.expectEqual(catalog.MutationOutcome.committed, outcome.mutation_outcome.?);
+        if (outcome.catalog_receipt) |receipt| try std.testing.expectEqual(.committed, receipt.state);
+    }
+    fn recover(self: *@This(), token: []const u8) !catalog.CatalogOperationReceipt {
+        const a = std.testing.allocator;
+        // Disabling new DDL must not disable observation of old admissions.
+        var server = server_mod.ApiHttpServer.init(a, .{ .auth_enabled = self.auth_enabled }, .{ .ptr = self, .vtable = &.{ .status = status, .system_catalog = call, .supports_query_definitions = true } }, null, null);
+        defer server.deinit();
+        return @import("sql_catalog_recovery.zig").recover(&server, self.identity, self.context, a, token);
+    }
+};
+
+test "SQL sequence intent producer binds typed options and actual identities without table receipts" {
+    for ([_]struct { sql: []const u8, integer: SequenceProducerFixture.seq.sequence.Integer }{
+        .{ .sql = "CREATE SEQUENCE counter AS smallint", .integer = .int16 },
+        .{ .sql = "CREATE SEQUENCE counter AS integer", .integer = .int32 },
+        .{ .sql = "CREATE SEQUENCE counter AS pg_catalog.int8", .integer = .int64 },
+    }) |example| {
+        var source: SequenceProducerFixture = .{ .expected_integer = example.integer };
+        const outcome = try source.run(example.sql);
+        defer outcome.catalog_receipt.?.deinit(std.testing.allocator);
+        try std.testing.expect(outcome.receipt == null);
+        try std.testing.expectEqual(@as(?u64, 92), outcome.catalog_receipt.?.object_id);
+        try std.testing.expectEqual(@as(usize, 1), source.reads);
+        try std.testing.expectEqual(@as(usize, 1), source.writes);
+        try std.testing.expectEqual(@as(usize, 0), source.observations);
+    }
+    var alter: SequenceProducerFixture = .{ .existing = .sequence, .expected_action = .alter };
+    try alter.runCommitted("ALTER SEQUENCE counter RESTART 8");
+    var rename: SequenceProducerFixture = .{ .existing = .sequence, .expected_action = .rename };
+    try rename.runCommitted("ALTER SEQUENCE counter RENAME TO renamed");
+    var drop: SequenceProducerFixture = .{ .existing = .sequence, .expected_action = .drop };
+    try drop.runCommitted("DROP SEQUENCE counter");
+}
+
+test "SQL sequence intent producer preserves PostgreSQL conditional and option error precedence" {
+    var source: SequenceProducerFixture = .{ .existing = .other };
+    try source.runCommitted("CREATE SEQUENCE IF NOT EXISTS counter AS text CACHE 0 OWNED BY missing.id");
+    try std.testing.expectEqual(@as(usize, 0), source.writes);
+    try std.testing.expectError(error.CatalogAlreadyExists, source.run("CREATE SEQUENCE counter CACHE 0"));
+    try std.testing.expectError(error.SqlWrongObjectType, source.run("ALTER SEQUENCE counter CACHE 0"));
+    source.existing = .absent;
+    try source.runCommitted("ALTER SEQUENCE IF EXISTS counter CACHE 0");
+    try source.runCommitted("DROP SEQUENCE IF EXISTS counter");
+    try std.testing.expectError(error.SequenceNotFound, source.run("DROP SEQUENCE counter"));
+    try std.testing.expectError(error.InvalidSequenceDefinition, source.run("CREATE SEQUENCE counter CACHE 0 OWNED BY missing.id"));
+    try std.testing.expectError(error.InvalidSequenceDefinition, source.run("CREATE SEQUENCE counter AS text"));
+    try std.testing.expectError(error.SqlTypeNotFound, source.run("CREATE SEQUENCE counter AS \"integer\""));
+    try std.testing.expectError(error.SqlTypeNotFound, source.run("CREATE SEQUENCE counter AS pg_catalog.bigint"));
+    try std.testing.expectError(error.UnsupportedSqlExecution, source.run("DROP SEQUENCE counter, another"));
+    try std.testing.expectEqual(@as(usize, 0), source.writes);
+}
+
+test "SQL sequence intent producer binds stable owned attributes and rejects stale or cross schema owners" {
+    var source: SequenceProducerFixture = .{};
+    try source.runCommitted("CREATE SEQUENCE counter OWNED BY owner_rows.id");
+    try std.testing.expectEqual(@as(usize, 2), source.reads);
+    try std.testing.expectEqual(@as(usize, 1), source.owner_reads);
+    try std.testing.expectEqual(@as(usize, 1), source.writes);
+    source = .{ .owner_missing = true };
+    try std.testing.expectError(error.UndefinedColumn, source.run("CREATE SEQUENCE counter OWNED BY owner_rows.missing"));
+    try std.testing.expectEqual(@as(usize, 0), source.writes);
+    source = .{ .owner_stale = true };
+    try std.testing.expectError(error.CatalogGenerationChanged, source.run("CREATE SEQUENCE counter OWNED BY owner_rows.id"));
+    try std.testing.expectEqual(@as(usize, 0), source.writes);
+    source = .{};
+    try std.testing.expectError(error.SqlSequenceOwnershipScope, source.run("CREATE SEQUENCE counter OWNED BY tenant.owner_rows.id"));
+    try std.testing.expectEqual(@as(usize, 0), source.writes);
+}
+
+test "SQL sequence intent producer rejects unauthenticated denied expired and cancelled requests before catalog access" {
+    var source: SequenceProducerFixture = .{ .auth_enabled = true };
+    try std.testing.expectError(error.Forbidden, source.run("CREATE SEQUENCE counter"));
+    source.identity = .{ .username = @constCast("reader") };
+    try std.testing.expectError(error.Forbidden, source.run("CREATE SEQUENCE counter"));
+    source.auth_enabled = false;
+    source.identity = null;
+    source.context.deadline_ns = 0;
+    try std.testing.expectError(error.DeadlineExceeded, source.run("CREATE SEQUENCE counter"));
+    var cancelled = std.atomic.Value(bool).init(true);
+    source.context = .{ .cancellation = operation.CancellationToken.fromAtomic(&cancelled) };
+    try std.testing.expectError(error.Canceled, source.run("CREATE SEQUENCE counter"));
+    try std.testing.expectEqual(@as(usize, 0), source.reads);
+    try std.testing.expectEqual(@as(usize, 0), source.writes);
+}
+
+test "SQL sequence intent producer observes ambiguous admissions once without replay" {
+    for ([_]SequenceProducerFixture.Reply{ .lost, .malformed }) |reply| {
+        var source: SequenceProducerFixture = .{ .reply = reply };
+        try source.runCommitted("CREATE SEQUENCE counter");
+        try std.testing.expectEqual(@as(usize, 1), source.writes);
+        try std.testing.expectEqual(@as(usize, 1), source.observations);
+        source = .{ .reply = reply, .observed = .rejected };
+        try std.testing.expectError(error.InvalidSequenceDefinition, source.run("CREATE SEQUENCE counter"));
+        try std.testing.expectEqual(@as(usize, 1), source.writes);
+        try std.testing.expectEqual(@as(usize, 1), source.observations);
+        for ([_]SequenceProducerFixture.Reply{ .missing, .lost, .malformed }) |observation| {
+            source = .{ .reply = reply, .observed = observation };
+            const unknown = try source.run("CREATE SEQUENCE counter");
+            defer unknown.catalog_receipt.?.deinit(std.testing.allocator);
+            try std.testing.expect(unknown.mutation_outcome == null);
+            try std.testing.expectEqual(.unknown, unknown.catalog_receipt.?.state);
+            try std.testing.expectEqualStrings("40003", unknown.catalog_receipt.?.diagnostic.?.code);
+            try std.testing.expect(!unknown.catalog_receipt.?.diagnostic.?.retryable);
+            try std.testing.expectEqual(@as(usize, 1), source.writes);
+            try std.testing.expectEqual(@as(usize, 1), source.observations);
+        }
+    }
+    var rejected: SequenceProducerFixture = .{ .reply = .rejected };
+    try std.testing.expectError(error.InvalidSequenceDefinition, rejected.run("CREATE SEQUENCE counter"));
+    try std.testing.expectEqual(@as(usize, 0), rejected.observations);
+    var altered: SequenceProducerFixture = .{ .existing = .sequence, .expected_action = .alter, .reply = .invalid_identity };
+    try altered.runCommitted("ALTER SEQUENCE counter RESTART 8");
+    try std.testing.expectEqual(@as(usize, 1), altered.writes);
+    try std.testing.expectEqual(@as(usize, 1), altered.observations);
+}
+
+test "SQL sequence intent producer honors ordered shadows and the first existing create namespace" {
+    var path: SearchPath = .{};
+    try path.append(try @import("../pgwire/search_path.zig").Namespace.init("public"));
+    try path.append(try @import("../pgwire/search_path.zig").Namespace.init("tenant"));
+    var source: SequenceProducerFixture = .{ .path = &path, .later_sequence = true };
+    // CREATE uses the first existing namespace; a later same-named sequence
+    // does not make the selected empty namespace look occupied.
+    try source.runCommitted("CREATE SEQUENCE counter");
+    source = .{ .path = &path, .existing = .other, .later_sequence = true };
+    try std.testing.expectError(error.SqlWrongObjectType, source.run("DROP SEQUENCE counter"));
+    try std.testing.expectEqual(@as(usize, 0), source.writes);
+    source = .{ .path = &path, .missing_first_namespace = true, .expected_namespace = "tenant" };
+    try source.runCommitted("CREATE SEQUENCE counter");
+    const empty: SearchPath = .{};
+    source = .{ .path = &empty };
+    try std.testing.expectError(error.NamespaceNotFound, source.run("CREATE SEQUENCE counter"));
+    try source.runCommitted("DROP SEQUENCE IF EXISTS counter");
+    try std.testing.expectEqual(@as(usize, 0), source.reads);
+}
+
+test "SQL sequence intent producer preserves unknown outcome after post admission cancellation" {
+    var cancelled = std.atomic.Value(bool).init(false);
+    var source: SequenceProducerFixture = .{
+        .reply = .lost,
+        .cancel_after_mutation = &cancelled,
+        .context = .{ .cancellation = operation.CancellationToken.fromAtomic(&cancelled) },
+    };
+    const unknown = try source.run("CREATE SEQUENCE counter");
+    defer unknown.catalog_receipt.?.deinit(std.testing.allocator);
+    try std.testing.expect(unknown.mutation_outcome == null);
+    try std.testing.expectEqual(.unknown, unknown.catalog_receipt.?.state);
+    try std.testing.expectEqual(@as(usize, 1), source.writes);
+    try std.testing.expectEqual(@as(usize, 0), source.observations);
+}
+
+test "SQL catalog recovery observes retained receipts after ingress disable without writes or rebinding" {
+    var source: SequenceProducerFixture = .{ .reply = .lost, .observed = .missing };
+    const unknown = try source.run("CREATE SEQUENCE counter");
+    defer unknown.catalog_receipt.?.deinit(std.testing.allocator);
+    const token = unknown.catalog_receipt.?.recovery_token;
+    try std.testing.expectEqual(.unknown, unknown.catalog_receipt.?.state);
+    const reads = source.reads;
+    for ([_]SequenceProducerFixture.Reply{ .success, .rejected, .missing, .malformed, .lost }) |reply| {
+        source.observed = reply;
+        const receipt = try source.recover(token);
+        defer receipt.deinit(std.testing.allocator);
+        try std.testing.expectEqualStrings(token, receipt.recovery_token);
+        try std.testing.expectEqualStrings("counter", receipt.name);
+        if (reply == .success) {
+            try std.testing.expectEqual(.committed, receipt.state);
+            try std.testing.expectEqual(@as(?u64, 92), receipt.object_id);
+        } else if (reply == .rejected) {
+            try std.testing.expectEqual(.rejected, receipt.state);
+            try std.testing.expectEqualStrings("22023", receipt.diagnostic.?.code);
+        } else {
+            try std.testing.expectEqual(.unknown, receipt.state);
+            try std.testing.expectEqualStrings("40003", receipt.diagnostic.?.code);
+            try std.testing.expect(!receipt.diagnostic.?.retryable);
+        }
+    }
+    try std.testing.expectEqual(reads, source.reads);
+    try std.testing.expectEqual(@as(usize, 1), source.writes);
+    const observed = source.observations;
+    source.auth_enabled = true;
+    try std.testing.expectError(error.Forbidden, source.recover(token));
+    source.identity = .{ .username = @constCast("reader") };
+    try std.testing.expectError(error.Forbidden, source.recover(token));
+    source.auth_enabled = false;
+    source.identity = null;
+    try std.testing.expectError(error.InvalidSqlRecoveryToken, source.recover("not.a.token"));
+    source.context.deadline_ns = 0;
+    try std.testing.expectError(error.DeadlineExceeded, source.recover(token));
+    try std.testing.expectEqual(observed, source.observations);
+}
+
+test "SQL catalog recovery tokens are bounded versioned owned and retain exact unsigned identities" {
+    const recovery = @import("sql_catalog_recovery.zig");
+    const a = std.testing.allocator;
+    var source: SequenceProducerFixture = .{};
+    const outcome = try source.run("CREATE SEQUENCE counter");
+    defer outcome.catalog_receipt.?.deinit(a);
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const decoded = try recovery.decode(arena.allocator(), outcome.catalog_receipt.?.recovery_token);
+    try std.testing.expectEqualStrings("counter", decoded.request.target.table);
+    try std.testing.expectEqualSlices(u8, &source.admitted_nonce, &decoded.request.admission.nonce);
+    var receipt = try recovery.newReceipt(a, arena.allocator(), decoded.request, decoded.observed_revision);
+    defer receipt.deinit(a);
+    {
+        // C/embedded encoders need the same omission policy as generated HTTP,
+        // even when their parent encoder defaults to emitting optional nulls.
+        const unknown_json = try std.json.Stringify.valueAlloc(a, receipt, .{});
+        defer a.free(unknown_json);
+        var parsed = try std.json.parseFromSlice(std.json.Value, a, unknown_json, .{});
+        defer parsed.deinit();
+        try std.testing.expect(!parsed.value.object.contains("object_id"));
+        try std.testing.expect(!parsed.value.object.contains("generation"));
+        try std.testing.expect(!parsed.value.object.contains("catalog_revision"));
+    }
+    recovery.complete(&receipt, .{ .success = .{ .revision = std.math.maxInt(u64), .identity = .{ .id = std.math.maxInt(u64), .generation = 9007199254740993 }, .removed = 0 } });
+    const json = try std.json.Stringify.valueAlloc(a, receipt, .{ .emit_null_optional_fields = false });
+    defer a.free(json);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"object_id\":\"18446744073709551615\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"generation\":\"9007199254740993\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"catalog_revision\":\"18446744073709551615\"") != null);
+    {
+        const committed_json = try std.json.Stringify.valueAlloc(a, receipt, .{});
+        defer a.free(committed_json);
+        var parsed = try std.json.parseFromSlice(std.json.Value, a, committed_json, .{});
+        defer parsed.deinit();
+        try std.testing.expect(!parsed.value.object.contains("diagnostic"));
+        try std.testing.expectEqualStrings("18446744073709551615", parsed.value.object.get("object_id").?.string);
+    }
+    for ([_][]const u8{ "", "!", "e30", "bnVsbA", "AA" }) |invalid| try std.testing.expectError(error.InvalidSqlRecoveryToken, recovery.decode(arena.allocator(), invalid));
+    const oversized = try a.alloc(u8, recovery.max_token_bytes + 1);
+    defer a.free(oversized);
+    @memset(oversized, 'a');
+    try std.testing.expectError(error.InvalidSqlRecoveryToken, recovery.decode(arena.allocator(), oversized));
+    const future = try std.json.Stringify.valueAlloc(a, recovery.Token{ .version = 2, .kind = .sequence, .observed_revision = 10, .request = decoded.request }, .{});
+    defer a.free(future);
+    const encoded = try a.alloc(u8, std.base64.url_safe_no_pad.Encoder.calcSize(future.len));
+    defer a.free(encoded);
+    _ = std.base64.url_safe_no_pad.Encoder.encode(encoded, future);
+    try std.testing.expectError(error.InvalidSqlRecoveryToken, recovery.decode(arena.allocator(), encoded));
+}
+
+test "SQL catalog recovery HTTP observes exact tokens with disabled ingress and rejects malformed requests before reads" {
+    const httpx = @import("httpx");
+    const a = std.testing.allocator;
+    var source: SequenceProducerFixture = .{ .reply = .lost, .observed = .missing };
+    const outcome = try source.run("CREATE SEQUENCE counter");
+    defer outcome.catalog_receipt.?.deinit(a);
+    const token = outcome.catalog_receipt.?.recovery_token;
+    var server = server_mod.ApiHttpServer.init(a, .{ .imported_runtime_io = .{ .api = std.testing.io } }, .{ .ptr = &source, .vtable = &.{ .status = SequenceProducerFixture.status, .system_catalog = SequenceProducerFixture.call, .supports_query_definitions = true } }, null, null);
+    defer server.deinit();
+    var handler: @import("httpx_handler.zig").AntflyApiHandler = .{ .api_server = &server };
+    for ([_]SequenceProducerFixture.Reply{ .missing, .success, .rejected }) |reply| {
+        source.observed = reply;
+        var request = try httpx.Request.init(a, .POST, "http://localhost/db/v1/sql/operations/status");
+        defer request.deinit();
+        const body = try std.json.Stringify.valueAlloc(a, .{ .recovery_token = token }, .{});
+        defer a.free(body);
+        request.body = body;
+        var context = httpx.Context.init(a, std.testing.io, &request);
+        defer context.deinit();
+        var response = try handler.getSQLCatalogOperation(&context);
+        defer response.deinit();
+        try std.testing.expectEqual(@as(u16, 200), response.status.code);
+        const parsed = try std.json.parseFromSlice(std.json.Value, a, response.body.?, .{});
+        defer parsed.deinit();
+        const object = parsed.value.object;
+        try std.testing.expectEqualStrings(token, object.get("recovery_token").?.string);
+        try std.testing.expectEqualStrings(if (reply == .missing) "unknown" else if (reply == .success) "committed" else "rejected", object.get("state").?.string);
+        if (reply == .success) try std.testing.expectEqualStrings("92", object.get("object_id").?.string);
+    }
+    const observations = source.observations;
+    for ([_][]const u8{ "{}", "{\"recovery_token\":\"bad.token\"}", "{\"recovery_token\":123}", "{\"recovery_token\":\"x\",\"unknown\":true}" }) |body| {
+        var request = try httpx.Request.init(a, .POST, "http://localhost/db/v1/sql/operations/status");
+        defer request.deinit();
+        request.body = body;
+        var context = httpx.Context.init(a, std.testing.io, &request);
+        defer context.deinit();
+        var response = try handler.getSQLCatalogOperation(&context);
+        defer response.deinit();
+        try std.testing.expectEqual(@as(u16, 400), response.status.code);
+    }
+    try std.testing.expectEqual(observations, source.observations);
+    try std.testing.expectEqual(@as(usize, 1), source.writes);
+    try std.testing.expectEqual(@as(usize, 1), source.reads);
+}
+
+test "SQL catalog recovery receipt allocation failures reject before mutation admission" {
+    const Check = struct {
+        fn run(result_alloc: std.mem.Allocator) !void {
+            const a = std.testing.allocator;
+            var source: SequenceProducerFixture = .{};
+            var server = server_mod.ApiHttpServer.init(a, .{ .imported_runtime_io = .{ .api = std.testing.io } }, .{ .ptr = &source, .vtable = &.{ .status = SequenceProducerFixture.status, .system_catalog = SequenceProducerFixture.call, .supports_query_definitions = true, .supports_sql_sequences = true } }, null, null);
+            defer server.deinit();
+            var compiled = try @import("antfly_local_sources").sql_compiler.compile(a, "CREATE SEQUENCE counter", .{});
+            defer compiled.deinit();
+            const outcome = executeWithAllocators(&server, null, .{}, "default", "public", .{ .result = result_alloc, .scratch = a }, .{ .catalog_ddl = compiled.statement.catalog_ddl }, null) catch |err| {
+                try std.testing.expectEqual(@as(usize, 0), source.writes);
+                try std.testing.expectEqual(@as(usize, 0), source.observations);
+                return err;
+            };
+            defer outcome.catalog_receipt.?.deinit(result_alloc);
+            try std.testing.expectEqual(@as(usize, 1), source.writes);
+            try std.testing.expectEqual(.committed, outcome.catalog_receipt.?.state);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Check.run, .{});
+}
+
 test "SQL catalog ALTER submits native schema CAS without client generations" {
     const Source = struct {
         updates: usize = 0,
@@ -1431,7 +1979,9 @@ test "SQL catalog ALTER submits native schema CAS without client generations" {
     // It cannot publish a regular UNIQUE declaration before validating rows.
     try std.testing.expectError(error.UnsupportedSqlExecution, execute(&server, null, .{}, "default", "public", result_arena.allocator(), .{ .catalog_ddl = unique.statement.catalog_ddl }));
     try std.testing.expectEqual(@as(usize, 3), source.updates);
-    var check = try @import("antfly_local_sources").sql_compiler.compile(alloc, "ALTER TABLE items ADD CONSTRAINT positive CHECK (id > 0 AND id < 100)", .{});
+    // Only an explicitly unvalidated CHECK may use this metadata-only port.
+    // Validated constraints require the staged historical-row barrier below.
+    var check = try @import("antfly_local_sources").sql_compiler.compile(alloc, "ALTER TABLE items ADD CONSTRAINT positive CHECK (id > 0 AND id < 100) NOT VALID", .{});
     defer check.deinit();
     source.table_lookup = true;
     const checked = try execute(&server, null, .{}, "default", "public", result_arena.allocator(), .{ .catalog_ddl = check.statement.catalog_ddl });
@@ -1441,6 +1991,8 @@ test "SQL catalog ALTER submits native schema CAS without client generations" {
         "ALTER TABLE items ADD COLUMN n integer DEFAULT (2+3)",
         "ALTER TABLE items ADD COLUMN g bigint GENERATED ALWAYS AS (id+1) STORED",
         "ALTER TABLE items ALTER COLUMN id SET NOT NULL",
+        "ALTER TABLE items ADD CONSTRAINT positive CHECK (id > 0 AND id < 100)",
+        "ALTER TABLE items ADD CONSTRAINT unique_id UNIQUE(id)",
     }) |sql| {
         var compiled = try @import("antfly_local_sources").sql_compiler.compile(alloc, sql, .{});
         defer compiled.deinit();

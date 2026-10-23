@@ -128,6 +128,7 @@ pub fn describe(err: anyerror) Diagnostic {
         error.SqlConstraintAlreadyExists => .{ .code = "42710", .message = "The constraint already exists.", .hint = "Inspect the existing table constraint or choose a distinct constraint name.", .retryable = false },
         error.SqlConstraintNotFound => .{ .code = "42704", .message = "The constraint does not exist.", .retryable = false },
         error.ConstraintNotDeferrable => .{ .code = "55000", .message = "The constraint is not deferrable.", .retryable = false },
+        error.ConstraintRetirementRequired => .{ .code = "0A000", .message = "The operation requires coordinated retirement of active relational constraints.", .hint = "Retire table constraints and incoming foreign keys through the native schema lifecycle before removing the table.", .retryable = false },
         error.SqlDependentConstraint => .{ .code = "2BP01", .message = "A foreign key depends on this constraint or table.", .hint = "Drop dependent foreign keys explicitly before removing their target.", .retryable = false },
         error.SqlConstraintOwnedIndex => .{ .code = "2BP01", .message = "The index backs a table constraint and cannot be dropped directly.", .hint = "Use ALTER TABLE DROP CONSTRAINT to remove the owning constraint.", .retryable = false },
         error.SqlDdlPending, error.SchemaInUse, error.ConstraintActivationPending, error.ConstraintActivationUnavailable, error.ConstraintRetirementInProgress, error.TableTransitionActive => .{ .code = "55006", .message = "The table already has an active schema lifecycle operation.", .hint = "Inspect the table schema and constraint status before submitting another change.", .retryable = false },
@@ -159,6 +160,9 @@ pub fn describe(err: anyerror) Diagnostic {
         error.SqlUndefinedFunction => .{ .code = "42883", .message = "No function matches the argument types.", .hint = "Use explicit casts to compatible argument types." },
         error.SqlDistinctOrderMismatch => .{ .code = "42P10", .message = "For SELECT DISTINCT, ORDER BY expressions must appear in the select list." },
         error.SqlDistinctOnOrderMismatch => .{ .code = "42P10", .message = "SELECT DISTINCT ON expressions must match initial ORDER BY expressions." },
+        error.TemporalOutOfRange => .{ .code = "22008", .message = "The temporal value is outside the supported range." },
+        error.InvalidTemporalBinary => .{ .code = "22P03", .message = "The temporal binary representation is invalid." },
+        error.InvalidTemporalText => .{ .code = "22007", .message = "The temporal input is invalid." },
         error.SqlEntropyUnavailable => .{ .code = "55000", .message = "Secure entropy is unavailable for this execution.", .hint = "Execute UUID generation through an I/O-capable invocation." },
         error.SqlArrayAggregateNull => .{ .code = "22004", .message = "Cannot accumulate null arrays." },
         error.SqlArrayAggregateEmpty => .{ .code = "2202E", .message = "Cannot accumulate empty arrays." },
@@ -179,10 +183,12 @@ pub fn describe(err: anyerror) Diagnostic {
         error.SqlInvalidTextRepresentation, error.InvalidSqlArrayShape => .{ .code = "22P02", .message = "A value has invalid input syntax for the requested type.", .hint = "Check the value and the target type." },
         error.SqlNullValueNotAllowed => .{ .code = "22004", .message = "A required SQL argument or JSON path element is null.", .hint = "Supply non-null values for required arguments and path elements." },
         error.SqlTransactionAlreadyActive => .{ .code = "25001", .message = "A transaction is already active in this session.", .retryable = false },
+        error.SqlTransactionCharacteristicsLocked => .{ .code = "25001", .message = "Transaction characteristics cannot change after the first query or within a subtransaction.", .hint = "Set isolation and read-write mode before executing queries.", .retryable = false },
         error.SqlTransactionNotActive => .{ .code = "25P01", .message = "This command requires an active transaction.", .retryable = false },
         error.SessionLeaseLost => .{ .code = "40003", .message = "SQL session ownership changed; reconcile the original transaction before continuing.", .hint = "Reconnect through the active session owner; do not replay staged mutations.", .retryable = false },
         error.SqlTransactionAborted => .{ .code = "25P02", .message = "The transaction is aborted; roll back before continuing.", .retryable = false },
         error.UnknownSetting => .{ .code = "42704", .message = "The SQL setting does not exist in the current catalog scope.", .retryable = false },
+        error.SqlRoleNotFound => .{ .code = "42704", .message = "The requested SQL role does not exist.", .retryable = false },
         error.SettingWriteForbidden => .{ .code = "42501", .message = "The SQL setting cannot be changed by this session.", .retryable = false },
         error.InvalidSettingValue => .{ .code = "22023", .message = "The SQL setting value does not match its catalog type or limit.", .retryable = false },
         error.SettingCatalogChanged => .{ .code = "40001", .message = "The SQL setting definition changed before this statement completed.", .retryable = true },
@@ -197,16 +203,22 @@ pub fn describe(err: anyerror) Diagnostic {
         error.UnsupportedNativeIndexOwner => .{ .code = "0A000", .message = "This table's owners cannot execute atomic index publication.", .hint = "Use owners with the required index publication capabilities; no index build was admitted.", .retryable = false },
         error.SqlSchemaRewriteRequiresMetadataOwner => .{ .code = "0A000", .message = "This schema rewrite requires the metadata-owned SQL endpoint.", .hint = "Submit the DDL to the metadata API; no rewrite job was admitted on this data node.", .retryable = false },
         error.RowPolicyUnsupported, error.RowPolicyTopologyUnsupported => .{ .code = "0A000", .message = "Row policy publication is not supported for this table shape.", .hint = "Remove unsupported indexes or topology features before enabling the policy; no publication was started.", .retryable = false },
+        error.RowPolicyMutationUnsupported => .{ .code = "0A000", .message = "Row security does not support this mutation shape.", .hint = "Use a supported typed relational mutation; the policy has not been bypassed.", .retryable = false },
         error.RowPolicyDenied, error.RowPolicyAuthenticationRequired => .{ .code = "42501", .message = "The row security policy does not authorize this operation.", .retryable = false },
         error.RowPolicyCatalogChanged => .{ .code = "40001", .message = "The row security policy changed before this statement completed.", .hint = "Retry the complete statement after the policy generation has finished publishing.", .retryable = true },
         error.ForeignKeyGenerationPublicationRequired => .{ .code = "0A000", .message = "This foreign-key definition requires parent-owner generation publication.", .hint = "Use a deployment with coordinated foreign-key publication; no schema change was admitted.", .retryable = false },
+        error.SchemaValidationPublicationRequired => .{ .code = "0A000", .message = "This schema change requires coordinated historical-row validation.", .hint = "Use the metadata-owned ALTER TABLE or staged schema rewrite path; no schema change was admitted.", .retryable = false },
         error.ForeignKeyPartialSupportIndexRequired => .{ .code = "0A000", .message = "Initial MATCH PARTIAL foreign keys require atomic parent support-index publication.", .hint = "Create the table without that constraint, then add it with ALTER TABLE. No table publication was admitted.", .retryable = false },
         error.SqlRowIdentityRequired => .{ .code = "0A000", .message = "This mutation requires an explicit row identity.", .hint = "Provide a non-null _id for each inserted row." },
         error.SqlStatementSnapshotRequired => .{ .code = "0A000", .message = "This query requires a consistent statement snapshot that is not available.", .hint = "Narrow the query to one bounded page or use a runtime with statement snapshots." },
         error.SqlRangeTrackingRequired => .{ .code = "0A000", .message = "This transaction requires activated, owner-fenced range protection.", .hint = "Use a runtime that supports the requested isolation level; isolation was not downgraded.", .retryable = false },
         error.InvalidSqlSyntax => .{ .code = "42601", .message = "The SQL statement has invalid syntax.", .hint = "Check the reported position and submit one supported statement." },
         error.SqlInvalidFunctionDefinition => .{ .code = "42P13", .message = "No function body was specified.", .hint = "Supply a routine body in the definition." },
-        error.UndefinedTable, error.TableNotFound, error.NotFound, error.CatalogNotFound => .{ .code = "42P01", .message = "The requested catalog object does not exist.", .hint = "Check the database, namespace, and object name.", .retryable = false },
+        error.UndefinedTable, error.TableNotFound, error.SequenceNotFound, error.NotFound, error.CatalogNotFound => .{ .code = "42P01", .message = "The requested catalog object does not exist.", .hint = "Check the database, namespace, and object name.", .retryable = false },
+        error.InvalidSequenceDefinition => .{ .code = "22023", .message = "The sequence options or integer type are invalid.", .retryable = false },
+        error.InvalidSqlRecoveryToken => .{ .code = "22023", .message = "The catalog recovery token is invalid or unsupported.", .retryable = false },
+        error.SqlTypeNotFound => .{ .code = "42704", .message = "The requested SQL type does not exist.", .retryable = false },
+        error.SqlSequenceOwnershipScope => .{ .code = "55000", .message = "A sequence and its owning table must belong to the same database and schema.", .retryable = false },
         error.CatalogAlreadyExists, error.TableAlreadyExists => .{ .code = "42P07", .message = "The requested catalog object already exists.", .retryable = false },
         error.SqlDuplicateDatabase => .{ .code = "42P04", .message = "The requested database already exists.", .retryable = false },
         error.SqlDuplicateNamespace => .{ .code = "42P06", .message = "The requested schema already exists.", .retryable = false },
@@ -214,7 +226,8 @@ pub fn describe(err: anyerror) Diagnostic {
         error.DatabaseNotFound => .{ .code = "3D000", .message = "The requested database does not exist.", .retryable = false },
         error.NamespaceNotFound => .{ .code = "3F000", .message = "The requested schema does not exist.", .retryable = false },
         error.TablespaceNotFound => .{ .code = "42704", .message = "The requested tablespace does not exist.", .retryable = false },
-        error.DatabaseNotEmpty, error.NamespaceNotEmpty, error.TablespaceInUse, error.ProtectedCatalogResource => .{ .code = "2BP01", .message = "The catalog object cannot be removed while protected or in use.", .retryable = false },
+        error.TablespaceInUse => .{ .code = "55000", .message = "The tablespace is not empty.", .hint = "Move or remove its dependent relations before dropping the tablespace.", .retryable = false },
+        error.DatabaseNotEmpty, error.NamespaceNotEmpty, error.ProtectedCatalogResource => .{ .code = "2BP01", .message = "The catalog object cannot be removed while protected or in use.", .retryable = false },
         error.RelationalIndexColumnNotFound, error.UndefinedColumn, error.UnknownColumn => .{ .code = "42703", .message = "A referenced column does not exist.", .hint = "Check column names against the current table schema." },
         error.DuplicateColumn, error.DuplicateSqlColumn => .{ .code = "42701", .message = "A column was specified more than once.", .hint = "Remove the duplicate column reference." },
         error.DuplicateSqlAssignment => .{ .code = "42601", .message = "A column was assigned more than once.", .hint = "Assign each target column only once per statement.", .retryable = false },
@@ -257,6 +270,7 @@ pub fn describe(err: anyerror) Diagnostic {
         error.SqlNegativeOffset => .{ .code = "2201X", .message = "OFFSET must not be negative." },
         error.InvalidSqlLimit => .{ .code = "54000", .message = "The SQL execution limit is invalid.", .hint = "Choose execution limits within the configured capacity." },
         error.Canceled, error.Cancelled, error.QueryCanceled, error.DeadlineExceeded, error.Timeout => .{ .code = "57014", .message = "The SQL operation was canceled or its deadline expired.", .hint = "Reduce the operation's work or choose a suitable deadline." },
+        error.SequenceCatalogChanged, error.SequenceCounterChanged => .{ .code = "40001", .message = "The sequence definition or counter changed before the operation could commit.", .hint = "Prepare the complete operation again against the current sequence state.", .retryable = true },
         error.CatalogGenerationChanged, error.PreparedGenerationChanged, error.GenerationRetired, error.IntegrityCatalogChanged => .{ .code = "40001", .message = "The table definition changed before the statement could complete.", .hint = "Prepare the statement again against the current schema.", .retryable = true },
         error.SqlWriteConflict, error.PreparedReadSetChanged, error.VersionConflict, error.IntentConflict => .{ .code = "40001", .message = "The mutation conflicted with a concurrent change and was not committed.", .hint = "Read the current rows before retrying the complete statement.", .retryable = true },
         error.FileBusy, error.WouldBlock => .{ .code = "55P03", .message = "The database resource is temporarily locked.", .hint = "Retry the complete statement after the competing operation finishes.", .retryable = true },
@@ -276,6 +290,22 @@ pub fn message(err: anyerror, buffer: []u8) []const u8 {
     const value = describe(err);
     const hint = value.hint orelse return value.message;
     return std.fmt.bufPrint(buffer, "{s} {s}", .{ value.message, hint }) catch value.message;
+}
+
+test "SQL sequence diagnostics retain PostgreSQL identities and distinguish conflicts from uncertain outcomes" {
+    for ([_]struct { err: anyerror, code: []const u8, retryable: bool = false }{
+        .{ .err = error.SequenceNotFound, .code = "42P01" },
+        .{ .err = error.InvalidSequenceDefinition, .code = "22023" },
+        .{ .err = error.SqlTypeNotFound, .code = "42704" },
+        .{ .err = error.SqlSequenceOwnershipScope, .code = "55000" },
+        .{ .err = error.SequenceCatalogChanged, .code = "40001", .retryable = true },
+        .{ .err = error.SequenceCounterChanged, .code = "40001", .retryable = true },
+        .{ .err = error.SqlMutationOutcomeUnknown, .code = "40003" },
+    }) |example| {
+        const diagnostic = describe(example.err);
+        try std.testing.expectEqualStrings(example.code, diagnostic.code);
+        try std.testing.expectEqual(example.retryable, diagnostic.retryable);
+    }
 }
 
 test "SQL view catalog diagnostics distinguish invalid replacement dependencies and corrupt metadata" {
@@ -337,6 +367,18 @@ test "SQL typed parameter syntax errors are actionable client diagnostics" {
     try std.testing.expectEqualStrings("22P02", describe(error.InvalidSqlArrayShape).code);
     try std.testing.expectEqual(@as(u16, 400), describe(error.InvalidSqlArrayShape).httpStatus());
     try std.testing.expectEqualStrings("22P03", describe(error.InvalidSqlBinaryRepresentation).code);
+}
+
+test "SQL policy diagnostics distinguish denial epoch changes and unsupported mutations" {
+    for ([_]anyerror{ error.RowPolicyDenied, error.RowPolicyAuthenticationRequired }) |err| {
+        const value = describe(err);
+        try std.testing.expectEqualStrings("42501", value.code);
+        try std.testing.expectEqual(@as(?bool, false), value.retryable);
+    }
+    try std.testing.expectEqualStrings("40001", describe(error.RowPolicyCatalogChanged).code);
+    try std.testing.expectEqual(@as(?bool, true), describe(error.RowPolicyCatalogChanged).retryable);
+    try std.testing.expectEqualStrings("0A000", describe(error.RowPolicyMutationUnsupported).code);
+    try std.testing.expectEqual(@as(?bool, false), describe(error.RowPolicyMutationUnsupported).retryable);
 }
 
 test "SQL diagnostics hide unrecognized implementation errors" {

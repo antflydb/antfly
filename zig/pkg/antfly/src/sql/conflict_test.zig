@@ -621,7 +621,10 @@ test "SQL deferred scalar has no outer-row binding scope" {
     var compiled = try compiler.compile(std.testing.allocator, "INSERT INTO items (_id,n) VALUES ('existing',3) ON CONFLICT (_id) DO UPDATE SET n=(SELECT excluded.n FROM items)", .{});
     defer compiled.deinit();
     var fixture: Fixture = .{ .guarded = true, .dynamic = true };
-    try std.testing.expectError(error.UndefinedColumn, runtime.execute(std.testing.allocator, fixture.backend(), &compiled, &.{}, .{}));
+    // This deliberately unsupported outer scope remains fail-closed. An
+    // absent relation qualifier is distinct from a missing column on a
+    // visible relation; this test does not claim PostgreSQL parity for it.
+    try std.testing.expectError(error.UndefinedTable, runtime.execute(std.testing.allocator, fixture.backend(), &compiled, &.{}, .{}));
 }
 
 test "SQL uncorrelated deferred scalar is computed once for multiple conflict owners" {

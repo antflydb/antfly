@@ -117,6 +117,7 @@ pub const MetadataServer = struct {
     restore_supervisor_owner_id: u64 = 0,
     restore_supervisor_stop: std.atomic.Value(bool) = .init(false),
     index_reconciliation: index_worker.Coordinator = .{},
+    schema_reconciliation: @import("schema_validation_coordinator.zig").Coordinator = .{},
     index_supervisor_owner_id: u64 = 0,
     index_supervisor_stop: std.atomic.Value(bool) = .init(false),
     index_service_secret: ?[]const u8 = null,
@@ -631,6 +632,9 @@ pub const MetadataServer = struct {
                     error.UnsupportedNativeIndexOwner,
                     error.GenerationPublicationChanged,
                     error.GenerationAdmissionPending,
+                    // Startup/election and rolling-upgrade readiness leave
+                    // the job pending. No owner mutation has been admitted.
+                    error.TableTopologyProtocolUpgradeRequired,
                     error.IndexOwnerReceiptChanged,
                     error.PrivateIndexRootRecoveryRequired,
                     error.ConnectionRefused,
@@ -663,10 +667,19 @@ pub const MetadataServer = struct {
         const incarnation = try self.svc.metadataIncarnation() orelse return false;
         var host: IndexWorkHost = .{ .server = self, .incarnation = incarnation };
         host.expected = try host.currentAuthority();
+        var schema_error: ?anyerror = null;
+        const schema_advanced = self.schema_reconciliation.step(self.alloc, self.svc.metadata_group_id, &host, @import("antfly_platform").time.monotonicNs()) catch |err| blk: {
+            schema_error = err;
+            break :blk false;
+        };
         var transport: IndexTransport = .{ .host = &host, .client = @import("../api/http_client.zig").ApiHttpClient.init(self.alloc, self.svc.raft.host.http_host.request_executor) };
         _ = transport.client.withInternalServiceAuth(self.index_service_secret, self.index_service_issuer);
         const manager = if (self.owned_public_http_server) |api| api.cfg.resource_manager else null;
-        return self.index_reconciliation.step(io, self.alloc, manager, &host, &transport, @import("antfly_platform").time.monotonicNs());
+        const index_advanced = try self.index_reconciliation.step(io, self.alloc, manager, &host, &transport, @import("antfly_platform").time.monotonicNs());
+        // A pending or damaged schema job cannot starve unrelated index
+        // maintenance. Unexpected failures still reach supervisor diagnostics.
+        if (schema_error) |err| if (!@import("schema_validation_coordinator.zig").isDeferred(err)) return err;
+        return index_advanced or schema_advanced;
     }
 
     fn stopIndexSupervisor(self: *MetadataServer) void {

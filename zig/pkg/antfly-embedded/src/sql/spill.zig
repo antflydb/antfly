@@ -786,6 +786,62 @@ pub fn writeFrozenJson(writer: *std.Io.Writer, value: @import("execution_batch.z
     _ = try decoder.walkJson(0, &json);
     if (decoder.position != value.bytes.len) return error.InvalidSqlSpill;
 }
+
+/// SQL JSONB display is not generic JSON serialization: key order, whitespace
+/// and exact decimal display are observable in both pgwire formats. Stream
+/// validated tokens directly; only large objects need bounded sorting scratch.
+/// The caller bounds cumulative writer output; limit also bounds each numeric
+/// expansion before bytes are emitted.
+pub fn writeFrozenJsonb(a: Allocator, writer: *std.Io.Writer, value: @import("execution_batch.zig").FrozenJson, limit: usize, work: *@import("json_order.zig").Budget) !void {
+    var decoder: Decoder = .{ .a = a, .bytes = value.bytes };
+    try decoder.writeJsonb(writer, limit, work, 0);
+    if (decoder.position != value.bytes.len) return error.InvalidSqlSpill;
+}
+
+test "SQL frozen JSONB display sorts large nested objects preserves exact numerics and unwinds scratch failures" {
+    const a = std.testing.allocator;
+    var source = std.heap.ArenaAllocator.init(a);
+    defer source.deinit();
+    const sa = source.allocator();
+    var object: std.json.ObjectMap = .empty;
+    // Reverse insertion order, unequal key lengths and more than 32 fields
+    // exercise allocated sorting scratch, not just the small-object fast path.
+    for (0..48) |ordinal| {
+        const index = 47 - ordinal;
+        const name = try std.fmt.allocPrint(sa, "field_{d}", .{index});
+        try object.put(sa, name, switch (index % 4) {
+            0 => .{ .number_string = "1.2300e2" },
+            1 => .{ .float = 0.1 },
+            2 => .{ .integer = 9007199254740993 },
+            else => .null,
+        });
+    }
+    const nested = try std.json.parseFromSliceLeaky(std.json.Value, sa, "{\"longer\":[1.20,-0.00,true,null],\"é\":{\"z\":2,\"a\":1}}", .{ .parse_numbers = false });
+    try object.put(sa, "a", nested);
+    const root: std.json.Value = .{ .object = object };
+    const bytes = try encodeColumnarBlockVersionAlloc(sa, &.{.{ .values = &.{Datum.json(root)}, .keys = &.{}, .ordinal = 0 }}, 1 << 20, .v2);
+    const block = try decodeColumnarBlockForForwarding(sa, a, bytes, 1 << 20);
+    defer block.deinit();
+    const frozen = (try block.frozenJson(0, 0, false)).?;
+    var work: @import("json_order.zig").Budget = .{};
+    const expected = try @import("jsonb_text.zig").format(sa, root, 16384, &work);
+    const Check = struct {
+        fn run(alloc: Allocator, value: @import("execution_batch.zig").FrozenJson, wanted: []const u8) !void {
+            var buffer: [16384]u8 = undefined;
+            var output: std.Io.Writer = .fixed(&buffer);
+            var budget: @import("json_order.zig").Budget = .{};
+            try writeFrozenJsonb(alloc, &output, value, buffer.len, &budget);
+            try std.testing.expectEqualStrings(wanted, output.buffered());
+        }
+    };
+    try Check.run(a, frozen, expected);
+    try std.testing.checkAllAllocationFailures(a, Check.run, .{ frozen, expected });
+    var denied: std.Io.Writer = .fixed(&.{});
+    work = .{};
+    try std.testing.expectError(error.WriteFailed, writeFrozenJsonb(a, &denied, frozen, 16384, &work));
+    work = .{ .remaining = 2 };
+    try std.testing.expectError(error.SqlProgramLimitExceeded, writeFrozenJsonb(a, &denied, frozen, 16384, &work));
+}
 pub fn frozenJsonText(a: Allocator, value: @import("execution_batch.zig").FrozenJson) ![]const u8 {
     var output: std.Io.Writer.Allocating = .init(a);
     defer output.deinit();
@@ -988,6 +1044,91 @@ const Decoder = struct {
             else => return error.InvalidSqlSpill,
         }
     }
+    /// The enclosing frozen handle already proves token validity and unique
+    /// object names. Still bound every traversal and checked byte coordinate.
+    fn skipJsonb(self: *Decoder, depth: usize, work: *@import("json_order.zig").Budget) anyerror!void {
+        if (depth >= 64) return error.SqlProgramLimitExceeded;
+        try work.consume(1);
+        switch (try self.byte()) {
+            0 => {},
+            1 => _ = try self.take(1),
+            2, 3 => _ = try self.take(8),
+            4, 5 => _ = try self.take(try self.count()),
+            6, 7 => |tag| {
+                const count_ = try self.count();
+                for (0..count_) |_| {
+                    if (tag == 7) _ = try self.take(try self.count());
+                    try self.skipJsonb(depth + 1, work);
+                }
+            },
+            else => return error.InvalidSqlSpill,
+        }
+    }
+
+    fn writeJsonb(self: *Decoder, writer: *std.Io.Writer, limit: usize, work: *@import("json_order.zig").Budget, depth: usize) anyerror!void {
+        if (depth >= 64) return error.SqlProgramLimitExceeded;
+        try work.consume(1);
+        const display = @import("jsonb_text.zig");
+        switch (try self.byte()) {
+            0 => try writer.writeAll("null"),
+            1 => {
+                const boolean = try self.byte();
+                if (boolean > 1) return error.InvalidSqlSpill;
+                try writer.writeAll(if (boolean == 1) "true" else "false");
+            },
+            2 => try writer.print("{d}", .{@as(i64, @bitCast(try self.word()))}),
+            3 => try display.write(self.a, .{ .float = @bitCast(try self.word()) }, writer, limit, work, depth),
+            4 => try display.number(try self.take(try self.count()), writer, limit, work),
+            5 => try display.write(self.a, .{ .string = try self.take(try self.count()) }, writer, limit, work, depth),
+            6 => {
+                const count_ = try self.count();
+                try writer.writeByte('[');
+                for (0..count_) |index| {
+                    if (index != 0) try writer.writeAll(", ");
+                    try self.writeJsonb(writer, limit, work, depth + 1);
+                }
+                try writer.writeByte(']');
+            },
+            7 => {
+                const Entry = struct {
+                    key: []const u8,
+                    begin: usize,
+                    end: usize,
+                    fn less(_: void, left: @This(), right: @This()) bool {
+                        return if (left.key.len != right.key.len) left.key.len < right.key.len else std.mem.lessThan(u8, left.key, right.key);
+                    }
+                };
+                const count_ = try self.count();
+                try work.consume(count_);
+                var local_entries: [32]Entry = undefined;
+                const entries = if (count_ <= local_entries.len) local_entries[0..count_] else try self.a.alloc(Entry, count_);
+                defer if (count_ > local_entries.len) self.a.free(entries);
+                var maximum: usize = 0;
+                for (entries) |*entry| {
+                    const key = try self.take(try self.count());
+                    maximum = @max(maximum, key.len);
+                    const begin = self.position;
+                    try self.skipJsonb(depth + 1, work);
+                    entry.* = .{ .key = key, .begin = begin, .end = self.position };
+                }
+                const levels = if (count_ == 0) 0 else std.math.log2_int_ceil(usize, count_) + 1;
+                try work.consume(std.math.mul(usize, count_, levels *| (maximum +| 1)) catch return error.SqlProgramLimitExceeded);
+                std.mem.sortUnstable(Entry, entries, {}, Entry.less);
+                try writer.writeByte('{');
+                for (entries, 0..) |entry, index| {
+                    if (index != 0) try writer.writeAll(", ");
+                    try display.write(self.a, .{ .string = entry.key }, writer, limit, work, depth + 1);
+                    try writer.writeAll(": ");
+                    var child: Decoder = .{ .a = self.a, .bytes = self.bytes[entry.begin..entry.end] };
+                    try child.writeJsonb(writer, limit, work, depth + 1);
+                    if (child.position != child.bytes.len) return error.InvalidSqlSpill;
+                }
+                try writer.writeByte('}');
+            },
+            else => return error.InvalidSqlSpill,
+        }
+    }
+
     fn json(self: *Decoder, depth: usize) anyerror!std.json.Value {
         if (depth > 64) return error.InvalidSqlSpill;
         return switch (try self.byte()) {
@@ -4826,16 +4967,19 @@ pub const Sort = struct {
         errdefer output.close();
         var arenas: [8]std.heap.ArenaAllocator = undefined;
         var heads: [8]?Row = @splat(null);
-        var blocks: [8]?*Sequential.OwnedBlock = @splat(null);
+        // Merge rows cannot escape this call: every pending cohort is encoded
+        // before advancing an input. Borrow its compact read arena instead of
+        // allocating a refcounted block/arena for every physical pull.
+        var blocks: [8]?Sequential.InputBlock = @splat(null);
         var positions: [8]usize = @splat(0);
         var offsets: [8]u64 = @splat(0);
         for (arenas[0..inputs.len]) |*arena| arena.* = .init(self.a);
         defer for (arenas[0..inputs.len]) |*arena| arena.deinit();
-        defer for (blocks) |block| if (block) |owner| owner.release();
+        defer for (&blocks) |*block| if (block.*) |*owner| owner.deinit();
         for (inputs, 0..) |file, index| if (file.size != 0) {
             try file.seal();
-            blocks[index] = try file.readOwnedBlock(0);
-            var row = try blocks[index].?.keyRowAlloc(arenas[index].allocator(), 0);
+            blocks[index] = try file.readInputBlockBorrowed(0);
+            var row = try blocks[index].?.view().keyRowAlloc(arenas[index].allocator(), 0);
             row.normalized = try self.normalize(row.keys);
             heads[index] = row;
         };
@@ -4849,7 +4993,7 @@ pub const Sort = struct {
                 if (selected == null or (try self.compare(row, heads[selected.?].?)) == .lt) selected = index;
             };
             const index = selected orelse break;
-            const block = blocks[index].?;
+            const block = blocks[index].?.view();
             pending[count] = .{ .block = block, .row = positions[index] };
             ordinals[count] = heads[index].?.ordinal;
             count += 1;
@@ -4862,16 +5006,16 @@ pub const Sort = struct {
                 count = 0;
             }
             if (positions[index] == block.count()) {
+                blocks[index].?.deinit();
                 blocks[index] = null;
-                block.release();
                 if (offsets[index] < inputs[index].size) {
-                    blocks[index] = try inputs[index].readOwnedBlock(offsets[index]);
+                    blocks[index] = try inputs[index].readInputBlockBorrowed(offsets[index]);
                     positions[index] = 0;
                 }
             }
             _ = arenas[index].reset(.retain_capacity);
-            heads[index] = if (blocks[index]) |next_block| blk: {
-                var row = try next_block.keyRowAlloc(arenas[index].allocator(), positions[index]);
+            heads[index] = if (blocks[index]) |*next_block| blk: {
+                var row = try next_block.view().keyRowAlloc(arenas[index].allocator(), positions[index]);
                 row.normalized = try self.normalize(row.keys);
                 break :blk row;
             } else null;
@@ -6378,7 +6522,12 @@ test "SQL typed spill vectors preserve dictionaries nulls exact integers and flo
 }
 
 test "SQL fused sort cohorts reserve shared file capacity for merges" {
-    const a = std.testing.allocator;
+    // Keep allocator safety/leak checks without unwinding allocation/free
+    // backtraces for every row. The shared fixture retains opt-in traces.
+    var fixture_allocator: @import("../storage/test_allocator.zig").TestAllocator = .{};
+    defer fixture_allocator.deinit();
+    var counted = std.testing.FailingAllocator.init(fixture_allocator.allocator(), .{});
+    const a = counted.allocator();
     const Hook = struct {
         fn check(_: *anyopaque) !void {}
     };
@@ -6410,6 +6559,10 @@ test "SQL fused sort cohorts reserve shared file capacity for merges" {
         }
     }
     try std.testing.expectEqual(@as(usize, 0), manager.files);
+    // The same input previously performed 248,154 backing allocations. Keep
+    // head reuse a deterministic work contract, not a Debug timing assertion.
+    try std.testing.expect(counted.allocations < 190_000);
+    std.debug.print("FUSED_SORT_HEADS rows=9216 allocations={d} bytes_allocated={d} bytes_written={d} merges={d} peak_files={d}\n", .{ counted.allocations, counted.allocated_bytes, manager.written_bytes, manager.merges, manager.peak_files });
 }
 
 test "SQL spill sorts singleton rows larger than the preferred run buffer" {

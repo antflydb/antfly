@@ -42,6 +42,11 @@ const index_manager_mod = @import("catalog/index_manager.zig");
 const index_repair_state = @import("derived/index_repair_state.zig");
 const internal_keys = @import("../internal_keys.zig");
 const mapper = @import("document_mapper.zig");
+
+fn preparationValidator(input: anytype, historical: bool) @TypeOf(input) {
+    if (input) |validator| if (historical) return validator.forHistoricalImport();
+    return input;
+}
 const merge_state_mod = @import("merge_state.zig");
 const platform = @import("antfly_platform");
 const platform_clock = @import("antfly_platform").clock;
@@ -532,7 +537,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                         S.ownerField(self, "backend_runtime").*.io(),
                         self,
                         effective_req.writes,
-                        view.validator(),
+                        preparationValidator(view.validator(), opts.restore_staging != null),
                         view.tableSchema().*,
                         view.physicalLayout(),
                         write_plan_snapshot.?.plan().*,
@@ -1513,9 +1518,9 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     break :blk prepared;
                 } else if (apply_schema_view) |view|
                     if (write.json_null_fields.len != 0)
-                        try mapper.PreparedRelationalWrite.initTyped(S.ownerField(self, "alloc").*, S.ownerField(self, "alloc").*, S.ownerField(self, "alloc").*, false, write.key, write.value, view.validator(), view.tableSchema().*, view.physicalLayout(), write.json_null_fields, opts.restore_staging != null or opts.preserve_logical_values)
+                        try mapper.PreparedRelationalWrite.initTyped(S.ownerField(self, "alloc").*, S.ownerField(self, "alloc").*, S.ownerField(self, "alloc").*, false, write.key, write.value, preparationValidator(view.validator(), opts.restore_staging != null), view.tableSchema().*, view.physicalLayout(), write.json_null_fields, opts.restore_staging != null or opts.preserve_logical_values)
                     else if (opts.restore_staging != null or opts.preserve_logical_values)
-                        try mapper.PreparedRelationalWrite.initPreserved(S.ownerField(self, "alloc").*, write.key, write.value, view.validator(), view.tableSchema().*, view.physicalLayout())
+                        try mapper.PreparedRelationalWrite.initPreserved(S.ownerField(self, "alloc").*, write.key, write.value, preparationValidator(view.validator(), opts.restore_staging != null), view.tableSchema().*, view.physicalLayout())
                     else
                         try mapper.PreparedRelationalWrite.initFromIntent(
                             S.ownerField(self, "alloc").*,

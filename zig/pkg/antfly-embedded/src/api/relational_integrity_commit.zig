@@ -268,6 +268,7 @@ const Builder = struct {
     partial_rechecks: std.ArrayList(FinalPartial) = .empty,
     prepared_bytes: usize = 0,
     control: RequestContext = .{},
+    preparation_receiver: ?@import("antfly_runtime_abi").io_abi.Receiver = null,
     repair_tables: []const []const u8 = &.{},
     repair_admission: ?RepairAdmission = null,
     discovered_repairs: std.StringHashMapUnmanaged(bool) = .empty,
@@ -618,6 +619,20 @@ const Builder = struct {
         if (self.queue.items.len > 16_384) return error.TransactionTooLarge;
     }
 
+    fn preparationValidator(self: *Builder, compiled: schema_api.CompiledTableValidator) !schema_api.CompiledTableValidator {
+        // The request owns this borrowed receiver. Never attach mutable runtime
+        // state to the immutable schema view or retain it in prepared rows.
+        if (self.preparation_receiver == null) {
+            if (self.control.fanout_io orelse self.control.deadline_io) |borrow| {
+                self.preparation_receiver = try borrow.receive();
+            }
+        }
+        return if (self.preparation_receiver) |*receiver|
+            compiled.forPreparation(.{ .io = receiver.io() })
+        else
+            compiled;
+    }
+
     fn expandWork(self: *Builder, item: *Work) !planner.Expansion {
         if (item.expansion) |expansion| return expansion;
         const plan = try self.bindingPlan(item.table);
@@ -627,7 +642,7 @@ const Builder = struct {
         const temporary = scratch.allocator();
         var before: ?mapper.PreparedRelationalWrite = if (item.before) |row| try mapper.PreparedRelationalWrite.init(temporary, item.key, row.json, null, view.tableSchema().*, view.physicalLayout()) else null;
         defer if (before) |*row| row.deinit(temporary);
-        var after: ?mapper.PreparedRelationalWrite = if (item.after) |json| try mapper.PreparedRelationalWrite.init(temporary, item.key, json, view.validator(), view.tableSchema().*, view.physicalLayout()) else null;
+        var after: ?mapper.PreparedRelationalWrite = if (item.after) |json| try mapper.PreparedRelationalWrite.init(temporary, item.key, json, if (view.validator()) |validator| try self.preparationValidator(validator) else null, view.tableSchema().*, view.physicalLayout()) else null;
         defer if (after) |*row| row.deinit(temporary);
         if (after) |*row| if (view.validator()) |validator| if (validator.execution.expressions) |expressions| if (expressions.bindings.len != 0 or expressions.modifier_ordinals.len != 0) {
             // Cascading parent assignments and final participant writes must
@@ -648,7 +663,7 @@ const Builder = struct {
         // contradictory cascades are detected rather than silently skipped.
         const json = if (final_row) after else if (item.explicit) item.explicit_after orelse return false else if (item.before) |before| before.json else after;
         const view = item.table.view;
-        var row = try mapper.PreparedRelationalWrite.init(self.alloc, item.key, json, if (item.explicit) view.validator() else null, view.tableSchema().*, view.physicalLayout());
+        var row = try mapper.PreparedRelationalWrite.init(self.alloc, item.key, json, null, view.tableSchema().*, view.physicalLayout());
         defer row.deinit(self.alloc);
         const keys = try self.alloc.alloc(native.RelationalIndexKey, definition.child_columns.len);
         for (keys, definition.child_columns) |*key, column| key.* = .{ .column = column };
@@ -1126,6 +1141,11 @@ fn prepareModeRoutedWithTiming(alloc: Allocator, source: reads.TableReadSource, 
             const item = try builder.getWork(table, entry.key_ptr.*);
             item.explicit = true;
             item.after = entry.value_ptr.*;
+            try builder.enqueue(item);
+            // Materialize volatile defaults before visiting any FK edge. The
+            // cached expansion, explicit assignments and final writes all use
+            // this same normalized afterimage, regardless of traversal order.
+            _ = try builder.expandWork(item);
             item.explicit_after = item.after;
             if (item.after) |json| {
                 try builder.charge(json.len);
@@ -1150,7 +1170,6 @@ fn prepareModeRoutedWithTiming(alloc: Allocator, source: reads.TableReadSource, 
                     try item.assignments.put(builder.alloc, field.key_ptr.*, field.value_ptr.*);
                 }
             }
-            try builder.enqueue(item);
         }
     }
     // Discover the complete bounded cascade closure before beginning 2PC.
@@ -1290,13 +1309,18 @@ pub fn resolveConstraintTiming(alloc: Allocator, source: reads.TableReadSource, 
         if (record.schema_json.len == 0) continue;
         var declaration = try schema_api.parseValidatedTableSchema(scratch.allocator(), record.schema_json);
         defer declaration.deinit(scratch.allocator());
-        if (declaration.unique_constraints == null and declaration.foreign_keys == null) continue;
+        if (declaration.unique_constraints == null and declaration.foreign_keys == null and declaration.checks == null) continue;
         // Namespace names need enumeration, but native authority reads and
         // compiled tuple plans are required only for matching declarations.
         var matches = false;
         var named_uniques: std.StringHashMapUnmanaged(void) = .empty;
         defer named_uniques.deinit(scratch.allocator());
-        for (names) |name| {
+        for (names, 0..) |name, name_index| {
+            if (declaration.checks) |checks| for (checks.value) |check| {
+                if (!std.mem.eql(u8, name, check.name)) continue;
+                if (deferred) return error.ConstraintNotDeferrable;
+                found[name_index] = true;
+            };
             if (declaration.unique_constraints) |uniques| for (uniques.value) |unique| {
                 if ((unique.origin orelse .constraint) != .index and std.mem.eql(u8, name, unique.name)) {
                     matches = true;
@@ -1346,6 +1370,24 @@ test "distributed txn constraint timing excludes index ownership without native 
     for ([_]bool{ false, true }) |deferred| {
         try std.testing.expectError(error.SqlConstraintNotFound, resolveConstraintTiming(std.testing.allocator, source, &metadata, &.{"access_key"}, deferred, .{}));
     }
+    try std.testing.expectEqual(@as(usize, 0), fake.calls);
+    const a = std.testing.allocator;
+    var check_schema = try std.json.parseFromSlice(std.json.Value, a, declaration, .{});
+    defer check_schema.deinit();
+    const temporary = check_schema.arena.allocator();
+    const check_json = try std.json.Stringify.valueAlloc(temporary, .{
+        .{ .name = "immediate_check", .column = "id", .op = "gt", .value = 0 },
+    }, .{});
+    const checks = try std.json.parseFromSliceLeaky(std.json.Value, temporary, check_json, .{});
+    try check_schema.value.object.put(temporary, "checks", checks);
+    const with_check = try std.json.Stringify.valueAlloc(a, check_schema.value, .{});
+    defer a.free(with_check);
+    const check_metadata = [_]TableRecord{.{ .table_id = 1, .name = "rows", .schema_json = with_check }};
+    const modes = try resolveConstraintTiming(a, source, &check_metadata, &.{"immediate_check"}, false, .{});
+    defer a.free(modes);
+    try std.testing.expectEqual(@as(usize, 0), modes.len);
+    const deferred = resolveConstraintTiming(a, source, &check_metadata, &.{"immediate_check"}, true, .{});
+    try std.testing.expectError(error.ConstraintNotDeferrable, deferred);
     try std.testing.expectEqual(@as(usize, 0), fake.calls);
 }
 
@@ -2725,6 +2767,52 @@ test "distributed txn activation projection validates selected fields without fu
     var layout = try @import("../storage/db/algebraic/relational_row_codec.zig").PhysicalLayout.init(alloc, runtime);
     defer layout.deinit();
     try std.testing.expectError(error.InvalidBatchRequest, mapper.PreparedRelationalWrite.init(alloc, "row", "{\"id\":1}", null, runtime, &layout));
+}
+
+test "distributed txn UUID defaults materialize once before integrity traversal" {
+    const alloc = std.testing.allocator;
+    var compiled = try @import("../sql/compiler.zig").compile(alloc, "CREATE TABLE events (id UUID PRIMARY KEY DEFAULT uuidv7(), amount INTEGER)", .{});
+    defer compiled.deinit();
+    const schema_json = try @import("../sql/ddl_runtime.zig").createSchemaAlloc(alloc, compiled.statement.create_table);
+    defer alloc.free(schema_json);
+    const envelope = try testCatalogEnvelope(alloc, 1, schema_json);
+    defer alloc.free(envelope);
+    const Fixture = struct {
+        envelope: []const u8,
+        var random_calls: usize = 0;
+        fn lookup(ptr: *anyopaque, a: Allocator, _: []const u8, _: []const u8, opts: types.LookupOptions, _: @import("../storage/read_consistency.zig").ReadConsistency) !?reads.LookupResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return if (opts.relational_integrity_catalog) .{ .json = try a.dupe(u8, self.envelope), .version = 0 } else null;
+        }
+        fn random(_: ?*anyopaque, output: []u8) std.Io.RandomSecureError!void {
+            random_calls += 1;
+            @memset(output, @intCast(random_calls));
+        }
+    };
+    Fixture.random_calls = 0;
+    defer Fixture.random_calls = 0;
+    var fixture: Fixture = .{ .envelope = envelope };
+    var vtable = std.testing.io.vtable.*;
+    vtable.randomSecure = Fixture.random;
+    const io: std.Io = .{ .userdata = std.testing.io.userdata, .vtable = &vtable };
+    const source: reads.TableReadSource = .{ .ptr = &fixture, .vtable = &.{ .lookup = Fixture.lookup, .scan = undefined, .query = undefined } };
+    const metadata = [_]TableRecord{.{ .table_id = 1, .name = "events", .placement_role = "data", .schema_json = schema_json }};
+    const requests = [_]contract.TableCommitRequest{.{ .table_name = "events", .writes = &.{ .{ .key = "one", .value = "{\"amount\":1}" }, .{ .key = "two", .value = "{\"amount\":2}" } } }};
+    var prepared = try prepareControlled(alloc, source, &metadata, &requests, .{ .fanout_io = @import("antfly_runtime_abi").io_abi.Borrow.init(&io) });
+    defer prepared.deinit();
+    try std.testing.expectEqual(@as(usize, 2), Fixture.random_calls);
+    try std.testing.expectEqual(@as(usize, 2), prepared.tables[0].writes.len);
+    var first_id: ?[]const u8 = null;
+    for (prepared.tables[0].writes) |write| {
+        const row = try std.json.parseFromSlice(std.json.Value, alloc, write.value, .{});
+        defer row.deinit();
+        const id = row.value.object.get("id").?.string;
+        try std.testing.expectEqual(@as(?u4, 7), @import("../common/uuid.zig").version(try @import("../common/uuid.zig").parse(id)));
+        if (first_id) |previous| {
+            defer alloc.free(previous);
+            try std.testing.expect(!std.mem.eql(u8, previous, id));
+        } else first_id = try alloc.dupe(u8, id);
+    }
 }
 
 test "distributed txn public integrity adapter enlists generated parent commands and guarded child writes" {

@@ -1451,6 +1451,10 @@ from .runtime_decl_mode import RuntimeDeclMode
 from .runtime_resolver_suppression import RuntimeResolverSuppression
 from .saved_query_source import SavedQuerySource
 from .scan_keys_request import ScanKeysRequest
+from .schema_validation_failure import SchemaValidationFailure
+from .schema_validation_phase import SchemaValidationPhase
+from .schema_validation_state import SchemaValidationState
+from .schema_validation_status import SchemaValidationStatus
 from .scoped_row_filter import ScopedRowFilter
 from .scoped_row_filter_filter import ScopedRowFilterFilter
 from .score_decision_question import ScoreDecisionQuestion
@@ -1480,6 +1484,11 @@ from .sql_array_dimension import SQLArrayDimension
 from .sql_array_element_type import SQLArrayElementType
 from .sql_array_value import SQLArrayValue
 from .sql_builtin_type import SQLBuiltinType
+from .sql_catalog_object_kind import SQLCatalogObjectKind
+from .sql_catalog_operation_kind import SQLCatalogOperationKind
+from .sql_catalog_operation_receipt import SQLCatalogOperationReceipt
+from .sql_catalog_operation_state import SQLCatalogOperationState
+from .sql_catalog_recovery_request import SQLCatalogRecoveryRequest
 from .sql_column import SQLColumn
 from .sql_column_type import SQLColumnType
 from .sql_connection_open_request import SQLConnectionOpenRequest
@@ -1503,6 +1512,7 @@ from .sql_setting_role_default import SqlSettingRoleDefault
 from .sql_setting_value_type_0 import SqlSettingValueType0
 from .sql_setting_value_type_1 import SqlSettingValueType1
 from .sql_setting_value_type_2 import SqlSettingValueType2
+from .sql_temporal_kind import SQLTemporalKind
 from .sql_transaction_status import SQLTransactionStatus
 from .sqlddl_receipt import SQLDDLReceipt
 from .sqlddl_receipt_state import SQLDDLReceiptState
@@ -3123,6 +3133,10 @@ __all__ = (
     "RuntimeResolverSuppression",
     "SavedQuerySource",
     "ScanKeysRequest",
+    "SchemaValidationFailure",
+    "SchemaValidationPhase",
+    "SchemaValidationState",
+    "SchemaValidationStatus",
     "ScopedRowFilter",
     "ScopedRowFilterFilter",
     "ScoreDecisionQuestion",
@@ -3152,6 +3166,11 @@ __all__ = (
     "SQLArrayElementType",
     "SQLArrayValue",
     "SQLBuiltinType",
+    "SQLCatalogObjectKind",
+    "SQLCatalogOperationKind",
+    "SQLCatalogOperationReceipt",
+    "SQLCatalogOperationState",
+    "SQLCatalogRecoveryRequest",
     "SQLColumn",
     "SQLColumnType",
     "SQLConnectionOpenRequest",
@@ -3177,6 +3196,7 @@ __all__ = (
     "SqlSettingValueType0",
     "SqlSettingValueType1",
     "SqlSettingValueType2",
+    "SQLTemporalKind",
     "SQLTransactionStatus",
     "SSEError",
     "SSEErrorReason",

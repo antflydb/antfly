@@ -17,10 +17,15 @@ class RelationalColumnExpression:
     """
     Attributes:
         column (str):
-        expression (RelationalScalarExpression): Immutable typed scalar expression, limited to 128 nodes and 16 levels.
+        expression (RelationalScalarExpression): Typed scalar expression, limited to 128 nodes and 16 levels. CHECK,
+            generated-column and index expressions must be immutable. UUIDv4 and
+            UUIDv7 generation are permitted only in column defaults and require
+            reader capability version 33. They run once during owned row
+            preparation, never during schema publication or restore verification.
+            The uuidv4 and uuidv7 operations take no args; uuidv7 may specify shift.
             A literal requires type; omitted value means typed null. A column
             requires column; other
-            operations require args. Unknown or irrelevant fields are rejected.
+            operations except uuidv4 and uuidv7 require args. Unknown or irrelevant fields are rejected.
             Arithmetic operands have the same integer or number type. Integer
             division truncates toward zero. Overflow and division by zero reject
             the write. Arithmetic and string operations propagate null. ASCII case

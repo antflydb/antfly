@@ -168,6 +168,11 @@ comptime {
     exportInternal(&storage_kernel_exports.storageOwnerNativeFkGenerationControlJson, "antfly_storage_owner_native_fk_generation_control_json");
     exportInternal(&storage_kernel_exports.storageOwnerNativeIndexControlJson, "antfly_storage_owner_native_index_control_json");
     exportInternal(&storage_kernel_exports.storageOwnerNativeSchemaObservationJson, "antfly_storage_owner_native_schema_observation_json");
+    exportInternal(&storage_kernel_exports.storageOwnerRaftSchemaObservationJson, "antfly_storage_owner_raft_schema_observation_json");
+    exportInternal(&storage_kernel_exports.storageOwnerNativeSchemaControlJson, "antfly_storage_owner_native_schema_control_json");
+    exportInternal(&storage_kernel_exports.storageOwnerSchemaPreparationJson, "antfly_storage_owner_schema_preparation_json");
+    exportInternal(&storage_kernel_exports.storageOwnerPrepareSchemaProposal, "antfly_storage_owner_prepare_schema_proposal");
+    exportInternal(&storage_kernel_exports.storageOwnerSchemaAuditJson, "antfly_storage_owner_schema_audit_json");
     exportInternal(&storage_kernel_exports.storageOwnerApplyRaftSchemaControl, "antfly_storage_owner_apply_raft_schema_control");
     exportInternal(&storage_kernel_exports.storageOwnerPrepareRaftSchemaControl, "antfly_storage_owner_prepare_raft_schema_control");
     exportInternal(&storage_kernel_exports.storageOwnerApplyPreparedRaftSchemaControl, "antfly_storage_owner_apply_prepared_raft_schema_control");

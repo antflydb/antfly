@@ -323,7 +323,10 @@ fn loadMaterialized(context: anytype, bound: *const binding.Bound, grouped_owner
         var merge_arena = std.heap.ArenaAllocator.init(context.alloc);
         defer merge_arena.deinit();
         for (partials) |partial| {
-            _ = merge_arena.reset(.free_all);
+            // Imports own retained states. Reuse bounded per-partial scratch
+            // inside this page; release it before pulling the next page so it
+            // cannot steal the next cursor's admission headroom.
+            _ = merge_arena.reset(.{ .retain_with_limit = 16 * 1024 });
             if (partial.keys.len != recipe.keys.len) return error.InvalidSqlBackendResponse;
             const a = merge_arena.allocator();
             const cells = try a.alloc(Datum, bound.input.columns.len);

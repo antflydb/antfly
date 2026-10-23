@@ -805,7 +805,7 @@ pub const BoundTableWriteSource = struct {
         const db = try self.activeDb();
         if (table.range_guards.len != 0) return error.SqlStatementSnapshotRequired;
         try validateTransactionAgainstLocalSchema(alloc, db, txn_id, table.writes, table.deletes, table.transforms);
-        const commit_version = begin_timestamp + 1;
+        const commit_version = try distributed_txn.commitVersion(begin_timestamp);
         const local_participant = try distributed_txn.participantIdForGroup(alloc, table.table_name, 0);
         defer alloc.free(local_participant);
         const participants = [_][]const u8{local_participant};

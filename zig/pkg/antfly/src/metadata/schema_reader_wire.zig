@@ -18,13 +18,48 @@
 const std = @import("std");
 
 pub fn requiresPublication(bytes: []const u8) bool {
+    return requiresMarker(bytes, "schema_reader_requirements");
+}
+
+pub fn requiresColumnTransforms(bytes: []const u8) bool {
+    return requiresMarker(bytes, "column_transforms");
+}
+
+pub fn requiresTextGenerationBinding(bytes: []const u8) bool {
+    return requiresMarker(bytes, "full_text_read_index");
+}
+
+/// One bounded token walk handles both command envelopes and stored records.
+/// Quoted payload strings are never mistaken for authoritative field names.
+pub fn requiresRoleDefaults(bytes: []const u8) bool {
+    return requiresMarker(bytes, "@sql-role-defaults");
+}
+
+test "SQL role defaults decoder projects escaped fields and ignores JSON payloads" {
+    for ([_][]const u8{
+        "{}",
+        "{\"role_defaults\":[]}",
+        "{\"role_defaults\":[{\"principal\":\"alice\",\"database\":\"main\"}]}",
+        "{\"value\":{\"string\":\"database principal_instance role_defaults_only\"}}",
+    }) |legacy| try std.testing.expect(!requiresRoleDefaults(legacy));
+    for ([_][]const u8{
+        "{\"change\":{\"put\":{\"role_defaults\":[{\"database\":\"\"}]}}}",
+        "{\"role_defaults\":[{\"database\":\"main\",\"principal_instance\":[1]}]}",
+        "{\"role_defaults\":[{\"principal_\\u0069nstance\":null}]}",
+        "{\"role_defaults_only\":false}",
+        "{\"role_defaults_only\":true}",
+        "{",
+    }) |current| try std.testing.expect(requiresRoleDefaults(current));
+}
+
+fn requiresMarker(bytes: []const u8, comptime marker: []const u8) bool {
     if (bytes.len > 64 * 1024 * 1024) return true;
     var buffer: [4096]u8 = undefined;
     var fixed = std.heap.FixedBufferAllocator.init(&buffer);
     var scanner = std.json.Scanner.initCompleteInput(fixed.allocator(), bytes);
     defer scanner.deinit();
     if ((scanner.peekNextTokenType() catch return true) != .object_begin) return true;
-    if (walk(void, false, &scanner, fixed.allocator(), 0) catch return true) return true;
+    if (walk(void, false, marker, &scanner, fixed.allocator(), 0) catch return true) return true;
     return (scanner.next() catch return true) != .end_of_document;
 }
 
@@ -39,13 +74,13 @@ pub fn validatePublication(comptime Requirements: type, bytes: []const u8) !void
     var scanner = std.json.Scanner.initCompleteInput(fixed.allocator(), bytes);
     defer scanner.deinit();
     if ((scanner.peekNextTokenType() catch return) != .object_begin) return;
-    _ = walk(Requirements, true, &scanner, fixed.allocator(), 0) catch |err| switch (err) {
+    _ = walk(Requirements, true, "schema_reader_requirements", &scanner, fixed.allocator(), 0) catch |err| switch (err) {
         error.InvalidSchemaReaderRequirements => return err,
         else => return,
     };
 }
 
-fn walk(comptime Requirements: type, comptime validate: bool, scanner: *std.json.Scanner, alloc: std.mem.Allocator, depth: usize) !bool {
+fn walk(comptime Requirements: type, comptime validate: bool, comptime marker_name: []const u8, scanner: *std.json.Scanner, alloc: std.mem.Allocator, depth: usize) !bool {
     if (depth >= 128) return error.InvalidMetadataTransitionEncoding;
     var found = false;
     switch (try scanner.peekNextTokenType()) {
@@ -53,22 +88,48 @@ fn walk(comptime Requirements: type, comptime validate: bool, scanner: *std.json
             _ = try scanner.next();
             while (try scanner.peekNextTokenType() != .object_end) {
                 const key = try scanner.nextAllocMax(alloc, .alloc_if_needed, 1024);
+                const Marker = enum { none, present, non_null, empty_database };
+                const Match = struct {
+                    fn keyKind(name: []const u8) Marker {
+                        if (comptime std.mem.eql(u8, marker_name, "@sql-role-defaults")) {
+                            if (std.mem.eql(u8, name, "principal_instance") or std.mem.eql(u8, name, "role_defaults_only") or std.mem.eql(u8, name, "database_id")) return .present;
+                            if (std.mem.eql(u8, name, "database")) return .empty_database;
+                            return .none;
+                        }
+                        return if (std.mem.eql(u8, name, marker_name)) .non_null else .none;
+                    }
+                };
                 const marker = switch (key) {
-                    .string => |value| std.mem.eql(u8, value, "schema_reader_requirements"),
+                    .string => |value| Match.keyKind(value),
                     .allocated_string => |value| blk: {
-                        const equal = std.mem.eql(u8, value, "schema_reader_requirements");
+                        const equal = Match.keyKind(value);
                         alloc.free(value);
                         break :blk equal;
                     },
                     else => return error.InvalidMetadataTransitionEncoding,
                 };
-                if (marker and try scanner.peekNextTokenType() != .null) {
+                if (marker == .present) return true;
+                if (marker == .empty_database and try scanner.peekNextTokenType() == .string) {
+                    const value = try scanner.nextAllocMax(alloc, .alloc_if_needed, 1024);
+                    const empty = switch (value) {
+                        .string => |bytes| bytes.len == 0,
+                        .allocated_string => |bytes| blk: {
+                            const is_empty = bytes.len == 0;
+                            alloc.free(bytes);
+                            break :blk is_empty;
+                        },
+                        else => return error.InvalidMetadataTransitionEncoding,
+                    };
+                    if (empty) return true;
+                    continue;
+                }
+                if (marker == .non_null and try scanner.peekNextTokenType() != .null) {
                     if (comptime !validate) return true;
                     const requirement = std.json.innerParse(Requirements, alloc, scanner, .{ .allocate = .alloc_if_needed, .max_value_len = 1024 }) catch
                         return error.InvalidSchemaReaderRequirements;
                     if (!requirement.valid()) return error.InvalidSchemaReaderRequirements;
                     found = true;
-                } else if (try walk(Requirements, validate, scanner, alloc, depth + 1)) {
+                } else if (try walk(Requirements, validate, marker_name, scanner, alloc, depth + 1)) {
                     if (comptime !validate) return true;
                     found = true;
                 }
@@ -78,7 +139,7 @@ fn walk(comptime Requirements: type, comptime validate: bool, scanner: *std.json
         .array_begin => {
             _ = try scanner.next();
             while (try scanner.peekNextTokenType() != .array_end) {
-                if (try walk(Requirements, validate, scanner, alloc, depth + 1)) {
+                if (try walk(Requirements, validate, marker_name, scanner, alloc, depth + 1)) {
                     if (comptime !validate) return true;
                     found = true;
                 }
@@ -104,6 +165,20 @@ test "system catalog schema reader publication projection skips payloads and fin
     const bytes = try std.json.Stringify.valueAlloc(std.testing.allocator, .{ .plan = .{ .child = .{ .schema_json = large }, .table = .{ .schema_reader_requirements = @as(?u32, null) } } }, .{});
     defer std.testing.allocator.free(bytes);
     try std.testing.expect(!requiresPublication(bytes));
+}
+
+test "system catalog USING rewrite decoder projection skips expression payloads and recognizes escaped markers" {
+    try std.testing.expect(!requiresColumnTransforms("{\"expression_json\":\"column_transforms\"}"));
+    try std.testing.expect(!requiresColumnTransforms("{\"column_transforms\":null}"));
+    try std.testing.expect(requiresColumnTransforms("{\"plan\":{\"targets\":[{\"rewrite\":{\"column_\\u0074ransforms\":[{}]}}]}}"));
+    try std.testing.expect(requiresColumnTransforms("{"));
+    const a = std.testing.allocator;
+    const large = try a.alloc(u8, 128 * 1024);
+    defer a.free(large);
+    @memset(large, '"');
+    const bytes = try std.json.Stringify.valueAlloc(a, .{ .source_schema = large, .targets = &.{.{ .rewrite = .{ .column_transforms = &.{.{ .column = "n", .expression_json = large }} } }} }, .{});
+    defer a.free(bytes);
+    try std.testing.expect(requiresColumnTransforms(bytes));
 }
 
 test "system catalog schema reader publication validation checks every pair and preserves envelope decoding" {

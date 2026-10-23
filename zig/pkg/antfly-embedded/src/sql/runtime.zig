@@ -23,7 +23,8 @@ const describe = @import("describe.zig");
 const MemoryBudget = @import("memory_budget.zig");
 const Json = std.json.Value;
 const operators = @import("operators.zig");
-const Datum = @import("scalar.zig").Datum;
+const scalar = @import("scalar.zig");
+const Datum = scalar.Datum;
 
 test {
     _ = @import("explain.zig");
@@ -75,6 +76,7 @@ pub const Output = struct {
     command_tag: []const u8,
     mutation_outcome: ?catalog.MutationOutcome = null,
     ddl_receipt: ?catalog.DdlReceipt = null,
+    catalog_receipt: ?catalog.CatalogOperationReceipt = null,
 
     pub fn rowCount(self: Output) usize {
         return if (self.native_rows) |rows| rows.len else self.rows.len;
@@ -84,7 +86,7 @@ pub const Output = struct {
     /// representation. Keep the public result envelope explicit at every ABI.
     pub fn jsonStringify(self: Output, writer: anytype) !void {
         if (self.native_rows != null) return error.WriteFailed;
-        try writer.write(.{ .columns = self.columns, .rows = self.rows, .sql_nulls = self.sql_nulls, .rows_affected = self.rows_affected, .command_tag = self.command_tag, .mutation_outcome = self.mutation_outcome, .ddl_receipt = self.ddl_receipt });
+        try writer.write(.{ .columns = self.columns, .rows = self.rows, .sql_nulls = self.sql_nulls, .rows_affected = self.rows_affected, .command_tag = self.command_tag, .mutation_outcome = self.mutation_outcome, .ddl_receipt = self.ddl_receipt, .catalog_receipt = self.catalog_receipt });
     }
 };
 pub const Result = struct {
@@ -228,7 +230,7 @@ fn runBound(alloc: std.mem.Allocator, arena: std.mem.Allocator, backend: catalog
     const ddl = @import("ddl_runtime.zig");
     if (ddl.accepts(compiled.statement)) {
         const result = try ddl.execute(.{ .result = arena, .scratch = alloc }, backend, compiled.statement);
-        return .{ .command_tag = result.command_tag, .mutation_outcome = result.mutation_outcome, .ddl_receipt = result.receipt };
+        return .{ .command_tag = result.command_tag, .mutation_outcome = result.mutation_outcome, .ddl_receipt = result.receipt, .catalog_receipt = result.catalog_receipt };
     }
     // Describe and Execute share binding, type inference and authorization.
     // Resolve exactly once so validation and execution cannot pin different
@@ -274,7 +276,7 @@ const ProjectedBatch = struct {
             self.expressions[column].?[self.positions[row].?]
         else
             try self.rows[row].cell(self.fields[column]);
-        return describe.coerceDatum(a, input, self.columns[column].type, self.columns[column].element_type);
+        return describe.coerceDatumTyped(a, input, scalar.columnType(self.columns[column]));
     }
     fn native(self: *@This(), column: usize) bool {
         return self.columns[column].type == .json and (column >= self.expressions.len or self.expressions[column] == null);
@@ -478,7 +480,7 @@ pub const Context = struct {
         if (self.limits.native_result) {
             const cells = try self.arena.alloc(Datum, values.len);
             for (values, columns, cells) |value_, column, *cell| {
-                var checked = try describe.coerceDatum(self.arena, value_, column.type, column.element_type);
+                var checked = try describe.coerceDatumTyped(self.arena, value_, scalar.columnType(column));
                 // Pattern callbacks belong to execution frames. Transports
                 // consume their value representation after those frames close.
                 if (checked.patterns() != null) {
@@ -536,7 +538,7 @@ pub const Context = struct {
             const values = try scratch.allocator().alloc(Datum, row.len);
             for (row, values, self.binding.columns, 0..) |value_, *cell, column, ordinal| {
                 if (column.type == .array) return error.InvalidSqlBackendResponse;
-                cell.* = try describe.coerceDatum(scratch.allocator(), Datum.fromParts(value_, if (output.sql_nulls) |flags| flags[index][ordinal] else value_ == .null, if (output.pattern_sources) |sources| sources[index][ordinal] else null), column.type, column.element_type);
+                cell.* = try describe.coerceDatumTyped(scratch.allocator(), Datum.fromParts(value_, if (output.sql_nulls) |flags| flags[index][ordinal] else value_ == .null, if (output.pattern_sources) |sources| sources[index][ordinal] else null), scalar.columnType(column));
             }
             try sink.append(sink.ptr, values);
         }
@@ -563,7 +565,9 @@ pub const Context = struct {
     pub fn outputDatum(self: Context, datum: Datum, kind: ?ast.ColumnType, element_type: ?@import("array_value.zig").ElementType) !Json {
         if (datum.temporal() != null) {
             var text: [@import("temporal_text.zig").output_capacity]u8 = undefined;
-            return .{ .string = try self.arena.dupe(u8, try @import("scalar.zig").formatTimestampResult(datum, kind, &text)) };
+            if (kind != .datetime) return error.SqlTypeMismatch;
+            try datum.validateTemporal();
+            return .{ .string = try self.arena.dupe(u8, try @import("temporal_text.zig").format(datum.temporal().?.*, &text)) };
         }
         if (kind == .array) {
             const checked = try describe.coerceDatum(self.arena, datum, .array, element_type);
@@ -601,7 +605,7 @@ pub const Context = struct {
         const index = input.parameter;
         if (index == 0 or index > self.parameters.len) return error.InvalidSqlParameters;
         if (self.binding.parameter_invocation) |invocation| if (invocation.frame) |frame| {
-            const datum = try describe.coerceDatum(self.arena, frame.values[index - 1], column.type, column.element_type);
+            const datum = try describe.coerceDatumTyped(self.arena, frame.values[index - 1], scalar.columnType(column));
             if (datum.array != null) return error.UnsupportedSqlShape;
             return if (datum.sql_null) .null else datum.value;
         };
@@ -614,7 +618,7 @@ pub const Context = struct {
         const raw = Datum.fromJson(self.parameters[index]);
         if (index < self.binding.parameter_descriptors.len) {
             const actual = self.binding.parameter_descriptors[index];
-            if (actual.kind) |kind| return describe.coerceDatum(self.arena, raw, kind, actual.element_type);
+            if (actual.kind != null) return describe.coerceDatumTyped(self.arena, raw, actual);
         }
         return raw;
     }
@@ -713,7 +717,7 @@ pub const Context = struct {
             output.empty = true;
             return;
         }
-        const value_ = try describe.coerceDatum(self.arena, raw, column.type, column.element_type);
+        const value_ = try describe.coerceDatumTyped(self.arena, raw, scalar.columnType(column));
         try output.terms.append(self.arena, .{ .column = column.path, .op = op, .value = try self.outputDatum(value_, column.type, column.element_type), .operand = value_ });
         if (output.terms.items.len > 256) return error.SqlProgramLimitExceeded;
     }
@@ -1055,7 +1059,7 @@ pub const Context = struct {
                                 for (self.binding.order_keys, row_keys) |key, *sort_key| sort_key.* = switch (key.source) {
                                     .output => |column| try batch.cell(scratch, lane, column),
                                     .expression => |column| order_values[column].?[selected_positions[physical].?],
-                                    .column => |column| try describe.coerceDatum(scratch, try chunk_rows[physical].cell(column.path), column.type, column.element_type),
+                                    .column => |column| try describe.coerceDatumTyped(scratch, try chunk_rows[physical].cell(column.path), scalar.columnType(column)),
                                 };
                                 out.* = row_keys;
                             }
@@ -1088,7 +1092,7 @@ pub const Context = struct {
                             projection_values[index].?[selected_positions[row_index].?]
                         else blk: {
                             const cell = try row.cell(field);
-                            break :blk try describe.coerceDatum(scratch, cell, columns[index].type, columns[index].element_type);
+                            break :blk try describe.coerceDatumTyped(scratch, cell, scalar.columnType(columns[index]));
                         };
                         const keys = try scratch.alloc(Datum, self.binding.order_keys.len);
                         for (self.binding.order_keys, keys) |key, *out| out.* = switch (key.source) {
@@ -1096,7 +1100,7 @@ pub const Context = struct {
                             .expression => |index| order_values[index].?[selected_positions[row_index].?],
                             .column => |column| blk: {
                                 const cell = try row.cell(column.path);
-                                break :blk try describe.coerceDatum(scratch, cell, column.type, column.element_type);
+                                break :blk try describe.coerceDatumTyped(scratch, cell, scalar.columnType(column));
                             },
                         };
                         try operator.add(.{ .values = values, .keys = keys, .ordinal = visited });
@@ -1111,7 +1115,7 @@ pub const Context = struct {
                         const values = try scratch.alloc(Datum, fields.items.len);
                         for (fields.items, columns, values, 0..) |field, column, *cell, index| {
                             const input = if (index < projection_values.len and projection_values[index] != null) projection_values[index].?[selected_positions[row_index].?] else try row.cell(field);
-                            cell.* = try describe.coerceDatum(scratch, input, column.type, column.element_type);
+                            cell.* = try describe.coerceDatumTyped(scratch, input, scalar.columnType(column));
                         }
                         try sink.append(sink.ptr, values);
                         delivered += 1;
@@ -1127,7 +1131,7 @@ pub const Context = struct {
                             const evaluated = projection_values[index].?[selected_positions[row_index].?];
                             break :blk evaluated;
                         } else try row.cell(field);
-                        const typed = try describe.coerceDatum(self.arena, input_cell, column.type, column.element_type);
+                        const typed = try describe.coerceDatumTyped(self.arena, input_cell, scalar.columnType(column));
                         is_null.* = typed.sql_null;
                         // SQL bigint results are lossless even in JS SDKs.
                         cell.* = try self.outputDatum(typed, column.type, column.element_type);
@@ -1227,7 +1231,7 @@ pub const Context = struct {
                 const cell = try row.cell(field);
                 break :blk cell;
             };
-            out.* = try describe.coerceDatum(alloc, input, column.type, column.element_type);
+            out.* = try describe.coerceDatumTyped(alloc, input, scalar.columnType(column));
         }
         return values;
     }
@@ -1257,7 +1261,7 @@ pub const Context = struct {
                     const cell = try row.cell(field);
                     break :blk cell;
                 };
-                out.* = try describe.coerceDatum(alloc, input, column.type, column.element_type);
+                out.* = try describe.coerceDatumTyped(alloc, input, scalar.columnType(column));
             }
             values.* = projected;
         }
@@ -1360,7 +1364,7 @@ pub const Context = struct {
                     }
                     const json_null = column.type == .json and typed == .null and !datum.sql_null;
                     if (json_null) try json_null_fields.append(self.arena, column.path);
-                    try putField(self.arena, &object, column.path, typed);
+                    try column.assignStorageValue(self.arena, &object, typed, datum.sql_null);
                 }
                 const document: Json = .{ .object = object };
                 retained = std.math.add(usize, retained, jsonSize(document) + key.string.len) catch return error.SqlProgramLimitExceeded;
@@ -1417,8 +1421,8 @@ pub const Context = struct {
             var key: ?[]const u8 = null;
             for (target_columns, bound.columns[0..statement.columns.len], row[0..statement.columns.len], 0..) |target, source_column, value_, cell_index| {
                 if (statement.isDefault(row_index, cell_index)) continue;
-                if (!value_.sql_null and source_column.type != target.type and !@import("builtin_cast.zig").numericAssignmentAllowed(source_column.type, target.type) and !(statement.values_source_rows.len != 0 and source_column.type == .string and (target.type == .datetime or target.type == .json or target.type == .uuid))) return error.SqlTypeMismatch;
-                const typed = try self.storageDatumTyped(value_, target, source_column.element_type);
+                if (!value_.sql_null and source_column.type != target.type and target.type != .string and !@import("builtin_cast.zig").numericAssignmentAllowed(source_column.type, target.type) and !(statement.values_source_rows.len != 0 and source_column.type == .string and (target.type == .datetime or target.type == .json or target.type == .uuid))) return error.SqlTypeMismatch;
+                const typed = try self.storageDatumTyped(value_, target, @import("scalar.zig").assignmentSourceIdentity(source_column.type, source_column.element_type));
                 if (std.mem.eql(u8, target.name, "_id")) {
                     if (value_.sql_null or typed != .string or typed.string.len == 0) return error.SqlRowIdentityRequired;
                     if (!std.unicode.utf8ValidateSlice(typed.string)) return error.SqlTypeMismatch;
@@ -1429,7 +1433,7 @@ pub const Context = struct {
                     try json_null_fields.appendSlice(self.arena, try table.documentRootNulls(self.arena, typed));
                 } else {
                     if (target.type == .json and !value_.sql_null and typed == .null) try json_null_fields.append(self.arena, target.path);
-                    try putField(self.arena, &object, target.path, typed);
+                    try target.assignStorageValue(self.arena, &object, typed, value_.sql_null);
                 }
             }
             const identity = key orelse try (self.backend.vtable.generate_row_id orelse return error.SqlRowIdentityRequired)(self.backend.ptr, self.arena);
@@ -1588,7 +1592,11 @@ pub const Context = struct {
             try replaced.put(self.arena, column.path, {});
         };
         var fields: std.ArrayList([]const u8) = .empty;
-        if (assignments != null) for (table_def.columns) |column| {
+        // Document updates preserve untouched fields from the pinned raw
+        // postimage below, not from independently coerced SQL projections.
+        // Fetch only expression/predicate inputs; cold schema fields may be
+        // large or may not satisfy a later SQL view's declared scalar type.
+        if (assignments != null and table_def.storage_mode != .document) for (table_def.columns) |column| {
             // The native row version still fences the entire row. Loading an
             // overwritten value adds no conflict protection and can dominate
             // I/O/memory for wide JSON/blob-like columns.
@@ -1688,8 +1696,10 @@ pub const Context = struct {
                             }
                         }
                         for (bound_assignments, 0..) |bound, assignment_index| {
+                            var assigned_null = bound.sql_null;
                             const assigned_value = if (bound.program) |program| blk: {
                                 const assigned = if (evaluated) |batch| batch.assignments[assignment_index].?[batch.positions[row_index].?] else try self.evaluate(scratch, program, expression_cells);
+                                assigned_null = assigned.sql_null;
                                 if (assigned.sql_null and !bound.column.nullable) return @import("errors.zig").notNull(self.backend.error_context, bound.column.name);
                                 if (bound.column.type == .json and !assigned.sql_null and assigned.value == .null) try json_null_fields.append(self.arena, bound.column.path);
                                 break :blk try self.storageDatumTyped(assigned, bound.column, program.output_type.element_type);
@@ -1701,7 +1711,7 @@ pub const Context = struct {
                                 if (assigned_value != .object) return error.SqlTypeMismatch;
                                 copy = assigned_value;
                                 try json_null_fields.appendSlice(self.arena, try table_def.documentRootNulls(self.arena, assigned_value));
-                            } else try putField(self.arena, &copy.object, bound.column.path, assigned_value);
+                            } else try bound.column.assignStorageValue(self.arena, &copy.object, assigned_value, assigned_null);
                         }
                         document = copy;
                     }
@@ -1781,7 +1791,7 @@ pub const Context = struct {
             var context = self;
             context.binding = binding.*;
             if (self.binding.returning_query) |query| {
-                const images_adapter = try ReturningImages.init(self.arena, table, null);
+                const images_adapter = try ReturningImages.initAtVersion(self.arena, table, null, self.backend.write_version);
                 const images = try self.arena.alloc(catalog.Row, prepared.len);
                 for (prepared, input, images) |mutation, original, *image| image.* = try images_adapter.row(self.arena, mutation, original);
                 context.returning_rows = images;
@@ -1804,7 +1814,7 @@ pub const Context = struct {
                 var image_fields: std.ArrayList([]const u8) = .empty;
                 for (fields.items) |field| if (field.len != 0) try image_fields.append(self.arena, field);
                 for (binding.scalars.required) |ordinal| try image_fields.append(self.arena, binding.scalars.columns[ordinal].name);
-                const images_adapter = try ReturningImages.init(self.arena, table, image_fields.items);
+                const images_adapter = try ReturningImages.initAtVersion(self.arena, table, image_fields.items, self.backend.write_version);
                 const rows = try self.arena.alloc([]const Json, prepared.len);
                 const flags = try self.arena.alloc([]const bool, prepared.len);
                 const native_rows = if (self.limits.native_result) try self.arena.alloc([]const Datum, prepared.len) else null;
@@ -1875,15 +1885,20 @@ pub const Context = struct {
         table: catalog.Table,
         projection: @import("document_row.zig").Projection,
         layout: ?*const catalog.Row.TypedLayout,
+        write_version: ?u64 = null,
 
         pub fn init(a: std.mem.Allocator, table: catalog.Table, fields: ?[]const []const u8) !ReturningImages {
+            return initAtVersion(a, table, fields, null);
+        }
+
+        pub fn initAtVersion(a: std.mem.Allocator, table: catalog.Table, fields: ?[]const []const u8, write_version: ?u64) !ReturningImages {
             const names = fields orelse blk: {
                 const all = try a.alloc([]const u8, table.columns.len);
                 for (table.columns, all) |column, *name| name.* = column.name;
                 break :blk all;
             };
             const projection = try @import("document_row.zig").Projection.init(a, table, names);
-            return .{ .table = table, .projection = projection, .layout = try projection.pageLayout(a) };
+            return .{ .table = table, .projection = projection, .layout = try projection.pageLayout(a), .write_version = write_version };
         }
 
         pub fn row(self: ReturningImages, a: std.mem.Allocator, mutation: catalog.Mutation, original: catalog.Mutation) !catalog.Row {
@@ -1892,6 +1907,9 @@ pub const Context = struct {
                 mutation.conflict_guard != original.conflict_guard or mutation.predicate_only != original.predicate_only or
                 (mutation.row == null) != (original.row == null)) return error.InvalidSqlBackendResponse;
             const datum = mutation.row orelse return (original.previous orelse return error.InvalidSqlBackendResponse).*;
+            if (self.write_version == null) for (self.projection.columns) |column| {
+                if (self.table.isDocumentVersion(column.name)) return error.UnsupportedSqlExecution;
+            };
             if (datum != .object) return error.InvalidSqlBackendResponse;
             const nulls = try a.alloc(bool, datum.object.count());
             for (datum.object.values(), nulls) |cell, *flag| flag.* = cell == .null;
@@ -1900,7 +1918,7 @@ pub const Context = struct {
                 if (!nulls[index] or (try self.table.column(name)).type != .json) return error.InvalidSqlBackendResponse;
                 nulls[index] = false;
             }
-            return self.projection.adaptBorrowed(a, self.layout, .{ .id = mutation.key, .version = mutation.expected_version, .value = datum, .sql_nulls = nulls, .document = if (self.table.storage_mode == .document) datum else null });
+            return self.projection.adaptBorrowed(a, self.layout, .{ .id = mutation.key, .version = try self.table.preparedVersion(datum, self.write_version orelse mutation.expected_version), .value = datum, .sql_nulls = nulls, .document = if (self.table.storage_mode == .document) datum else null });
         }
     };
 
@@ -1972,7 +1990,7 @@ pub fn encodeStorageDatum(arena: std.mem.Allocator, datum: Datum, column: catalo
 }
 
 pub fn encodeStorageDatumTyped(arena: std.mem.Allocator, datum: Datum, column: catalog.Column, source_identity: ?@import("array_value.zig").ElementType, retained_bytes: usize) !Json {
-    if (datum.temporal() != null) {
+    if (datum.temporal() != null and column.type != .string) {
         try datum.validateTemporal();
         return error.UnsupportedRelationalValueType; // requires schema/layout capability activation
     }
@@ -2052,6 +2070,64 @@ fn jsonSize(value: Json) usize {
         },
         else => @sizeOf(Json),
     };
+}
+
+test "SQL RETURNING write versions require the durable stamp and preserve delete preimages" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const table: catalog.Table = .{ .id = 1, .physical_name = "docs", .schema_version = 1, .storage_mode = .document, .columns = &.{} };
+    const mutation: catalog.Mutation = .{ .key = "doc:a", .expected_version = 42, .row = .{ .object = .empty } };
+    const unstamped = try Context.ReturningImages.init(a, table, &.{"_version"});
+    try std.testing.expectError(error.UnsupportedSqlExecution, unstamped.row(a, mutation, mutation));
+    const stamp: u64 = 9007199254740994;
+    const stamped = try Context.ReturningImages.initAtVersion(a, table, &.{"_version"}, stamp);
+    const image = try stamped.row(a, mutation, mutation);
+    try std.testing.expectEqual(stamp, image.version);
+    try std.testing.expectEqual(@as(i64, stamp), (try image.cell("_version")).value.integer);
+    const previous = try a.create(catalog.Row);
+    previous.* = .{ .id = "doc:a", .version = 42, .value = .{ .object = .empty }, .document_envelope = true };
+    const deletion: catalog.Mutation = .{ .key = "doc:a", .expected_version = 42, .row = null, .previous = previous };
+    const deleted = try stamped.row(a, deletion, deletion);
+    try std.testing.expectEqual(@as(i64, 42), (try deleted.cell("_version")).value.integer);
+    var custom = table;
+    custom.version_field = "expires";
+    var root: std.json.ObjectMap = .empty;
+    var with_ttl = mutation;
+    with_ttl.row = .{ .object = root };
+    const custom_images = try Context.ReturningImages.initAtVersion(a, custom, &.{"_version"}, stamp);
+    try std.testing.expectEqual(stamp, (try custom_images.row(a, with_ttl, with_ttl)).version);
+    for ([_]Json{ .null, .{ .integer = 0 }, .{ .number_string = "9007199254740993" }, .{ .string = "2090-01-01T00:00:00Z" } }, [_]u64{ stamp, 0, 9007199254740993, 3786912000000000000 }) |value, wanted| {
+        try root.put(a, "expires", value);
+        with_ttl.row = .{ .object = root };
+        const result = try custom_images.row(a, with_ttl, with_ttl);
+        try std.testing.expectEqual(wanted, result.version);
+    }
+}
+
+test "SQL RETURNING write stamp demand follows typed expressions without treating strings as columns" {
+    const a = std.testing.allocator;
+    for ([_][]const u8{
+        "INSERT INTO docs(_id) VALUES('a') RETURNING _version",
+        "INSERT INTO docs(_id) VALUES('a') RETURNING docs._version AS v",
+        "UPDATE docs SET n=1 RETURNING coalesce(_version,0)+1",
+        "UPDATE docs SET n=1 RETURNING CASE WHEN _version > 0 THEN _version ELSE 0 END",
+        "UPDATE docs SET n=1 RETURNING _version IN (1,2)",
+    }) |sql| {
+        var compiled = try compiler.compile(a, sql, .{});
+        defer compiled.deinit();
+        try std.testing.expect(ast.returningWriteVersion(compiled.statement));
+    }
+    for ([_][]const u8{
+        "INSERT INTO docs(_id) VALUES('a') RETURNING _id",
+        "UPDATE docs SET n=1 RETURNING '_version' AS text",
+        "DELETE FROM docs RETURNING _version",
+        "SELECT _version FROM docs",
+    }) |sql| {
+        var compiled = try compiler.compile(a, sql, .{});
+        defer compiled.deinit();
+        try std.testing.expect(!ast.returningWriteVersion(compiled.statement));
+    }
 }
 
 fn numericBoundaryScenario(backing: std.mem.Allocator) !void {
@@ -2959,6 +3035,40 @@ test "SQL result boundary preserves array ownership descriptors and NULL provena
 
 test {
     _ = @import("view_lateral_test.zig");
+}
+
+test "SQL UUIDv7 executes through runtime with exact extraction and interval metadata" {
+    const a = std.testing.allocator;
+    var source: TestBackend = .{};
+    var backend = source.iface();
+    backend.execution_io = std.testing.io;
+    var compiled = try compiler.compile(a, "SELECT uuidv7() AS id, uuid_extract_version(uuidv7()) AS version, uuid_extract_timestamp(uuidv7(INTERVAL '1 day')) AS created, INTERVAL '1 month 2 days 3 hours' AS shift", .{});
+    defer compiled.deinit();
+    var result = try execute(a, backend, &compiled, &.{}, .{});
+    defer result.deinit();
+    try std.testing.expectEqual(@as(usize, 1), result.output.rows.len);
+    try std.testing.expectEqual(@as(?u4, 7), @import("../common/uuid.zig").version(try @import("../common/uuid.zig").parse(result.output.rows[0][0].string)));
+    try std.testing.expectEqualStrings("7", result.output.rows[0][1].string);
+    try std.testing.expectEqual(@as(?@import("array_value.zig").ElementType, .int16), result.output.columns[1].element_type);
+    try std.testing.expectEqual(ast.ColumnType.datetime, result.output.columns[2].type);
+    try std.testing.expectEqual(@as(?@import("temporal_value.zig").Kind, .interval), result.output.columns[3].temporal_kind);
+    try std.testing.expectEqualStrings("1 mon 2 days 03:00:00", result.output.rows[0][3].string);
+    for ([_][]const u8{
+        "SELECT uuid_extract_version(uuidv7(d.shift)) FROM (SELECT INTERVAL '1 day' AS shift) d",
+        "SELECT uuid_extract_version(uuidv7(d.shift)) FROM (VALUES (INTERVAL '1 day')) AS d(shift)",
+    }) |sql| {
+        var derived = try compiler.compile(a, sql, .{});
+        defer derived.deinit();
+        var executed = try execute(a, backend, &derived, &.{}, .{});
+        defer executed.deinit();
+        try std.testing.expectEqualStrings("7", executed.output.rows[0][0].string);
+    }
+    for ([_][]const u8{ "SELECT uuidv7(INTERVAL 'infinity')", "SELECT uuidv7(INTERVAL '-100000 years')" }) |sql| {
+        var invalid = try compiler.compile(a, sql, .{});
+        defer invalid.deinit();
+        try std.testing.expectError(error.TemporalOutOfRange, execute(a, backend, &invalid, &.{}, .{}));
+        try std.testing.expectEqualStrings("22008", @import("errors.zig").describe(error.TemporalOutOfRange).code);
+    }
 }
 
 const TestBackend = struct {
@@ -5121,7 +5231,9 @@ test "SQL update reads only preserved columns and shares immutable assignments" 
         writes: usize = 0,
 
         fn resolve(_: *anyopaque, _: std.mem.Allocator, _: ast.Name, action: catalog.Action) !catalog.Table {
-            try std.testing.expectEqual(catalog.Action.read_write, action);
+            // A constant unconditional UPDATE needs write authority, not
+            // SELECT; internal preservation is not a caller-visible read.
+            try std.testing.expectEqual(catalog.Action.write, action);
             return .{ .id = 1, .physical_name = "wide", .schema_version = 1, .columns = &.{
                 .{ .name = "keep", .path = "keep", .type = .integer },
                 .{ .name = "payload", .path = "payload", .type = .string },
@@ -6086,6 +6198,39 @@ test "external lake SQL native aggregate materialization retains projection and 
         }
     };
     var driver: Driver = .{ .recipe = recipe, .partials = partials };
+    {
+        const repeated: [1024]operators.GroupResult = @splat(partials[0]);
+        driver.partials = &repeated;
+        var counting = std.testing.FailingAllocator.init(a, .{});
+        var result = try execute(counting.allocator(), driver.backend(), &reference, &.{}, .{});
+        defer result.deinit();
+        const expected = try std.fmt.allocPrint(a, "{d}", .{@as(i128, 9007199254740993) * 2048});
+        defer a.free(expected);
+        try std.testing.expectEqualStrings(expected, result.output.rows[0][0].string);
+        try std.testing.expectEqualStrings("2048", result.output.rows[0][1].string);
+        try std.testing.expectEqual(@as(usize, 0), driver.base.pages);
+        try std.testing.expectEqual(@as(usize, 1), driver.opened);
+        try std.testing.expectEqual(@as(usize, 1), driver.closed);
+        try std.testing.expect(counting.allocations < 1300);
+        std.debug.print("MATERIALIZED_PARTIAL_SCRATCH partials=1024 allocations={d} bytes_allocated={d}\n", .{ counting.allocations, counting.allocated_bytes });
+        driver.partials = partials;
+        driver.opened = 0;
+        driver.closed = 0;
+    }
+    const Sweep = struct {
+        fn run(allocator: std.mem.Allocator, initial: *const Driver, compiled: *const compiler.Compiled) !void {
+            var isolated = initial.*;
+            // Three partials cross reset boundaries without turning an OOM
+            // sweep into a quadratic stress benchmark over all 1,024 inputs.
+            const repeated: [3]operators.GroupResult = @splat(initial.partials[0]);
+            isolated.partials = &repeated;
+            defer std.debug.assert(isolated.opened == isolated.closed);
+            var result = try execute(allocator, isolated.backend(), compiled, &.{}, .{});
+            defer result.deinit();
+            try std.testing.expectEqualStrings("6", result.output.rows[0][1].string);
+        }
+    };
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, Sweep.run, .{ &driver, &reference });
     for ([_][]const u8{
         "SELECT SUM(id) AS total, COUNT(*) AS n FROM docs HAVING COUNT(*) > 0 ORDER BY SUM(id) DESC LIMIT 1",
         "SELECT SUM(id), COUNT(*) FROM docs WHERE id > 0",
@@ -7057,6 +7202,7 @@ test "SQL document root reads replacements and source inserts share typed prepar
             }
         };
         root: Json,
+        require_narrow: bool = false,
         prepared: usize = 0,
         writes: usize = 0,
         last: ?Json = null,
@@ -7085,6 +7231,7 @@ test "SQL document root reads replacements and source inserts share typed prepar
         }
         fn scan(raw: *anyopaque, a: std.mem.Allocator, _: catalog.Table, request: catalog.Scan) !catalog.Page {
             const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.require_narrow) for (request.fields) |field| try std.testing.expect(!std.mem.eql(u8, field, "metadata"));
             if (request.after != null) return .{ .rows = &.{} };
             const rows = try a.alloc(catalog.Row, 1);
             rows[0] = .{ .id = "doc:a", .version = 1, .value = self.root, .document = self.root, .expected_content_digest = @splat(1) };
@@ -7119,6 +7266,16 @@ test "SQL document root reads replacements and source inserts share typed prepar
     defer arena.deinit();
     const a = arena.allocator();
     const root = try std.json.parseFromSliceLeaky(Json, a, "{\"title\":\"before\",\"unknown\":{\"exact\":9007199254740993.1250,\"null\":null}}", .{ .parse_numbers = false });
+    {
+        var fixture: Fixture = .{ .root = root, .require_narrow = true };
+        var compiled = try compiler.compile(a, "UPDATE docs SET title='after' WHERE _id='doc:a' RETURNING title", .{});
+        defer compiled.deinit();
+        var result = try execute(std.testing.allocator, fixture.backend(), &compiled, &.{}, .{});
+        defer result.deinit();
+        try std.testing.expectEqual(@as(usize, 1), fixture.writes);
+        try std.testing.expectEqualStrings("after", fixture.last.?.object.get("title").?.string);
+        try std.testing.expect(fixture.last.?.object.contains("unknown"));
+    }
     for ([_][]const u8{
         "SELECT _doc FROM docs WHERE _id='doc:a'",
         "WITH c AS (SELECT _doc FROM docs) SELECT _doc FROM c",

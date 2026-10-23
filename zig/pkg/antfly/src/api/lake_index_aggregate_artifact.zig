@@ -778,7 +778,7 @@ const TypedColumn = struct {
             }
             const value = try block.cell(row, physical);
             if (value.sql_null) continue;
-            if (value.numeric != null or value.array != null or value.patterns != null) return null;
+            if (value.numeric != null or value.array != null or value.patterns() != null) return null;
             switch (value.value) {
                 .integer => |n| {
                     tuple[lane * 2] = 2;

@@ -43,14 +43,14 @@ pub const docstore_layout = blk: {
     break :blk native.TypeContract.of(@import("docstore.zig").DocStore);
 };
 extern fn antfly_storage_engine_get_aggregation_descriptor_v1() callconv(.c) *const Descriptor;
-extern fn antfly_storage_engine_computeSearchAggregations_v28() callconv(.c) *const anyopaque;
+extern fn antfly_storage_engine_computeSearchAggregations_v32() callconv(.c) *const anyopaque;
 pub fn compute(alloc: std.mem.Allocator, requests: []const aggregates.SearchAggregationRequest, result: types.SearchResult, context: aggregates.Context) ![]aggregates.SearchAggregationResult {
     const descriptor = antfly_storage_engine_get_aggregation_descriptor_v1();
     if (descriptor.version != 1 or !descriptor.method_layout.matches(method_layout) or
         !descriptor.context_layout.matches(context_layout) or
         (context.index_manager != null and !descriptor.index_manager_layout.matches(index_manager_layout)) or
         (context.doc_store != null and !descriptor.docstore_layout.matches(docstore_layout))) return error.UnsupportedVersion;
-    const method: Method = @ptrCast(@alignCast(antfly_storage_engine_computeSearchAggregations_v28()));
+    const method: Method = @ptrCast(@alignCast(antfly_storage_engine_computeSearchAggregations_v32()));
     const value = try Boundary.call("computeSearchAggregations", descriptor.dispatch, method, .{ alloc, requests, result, context });
     if (value.failure.ptr) |ptr| return @import("storage_engine_errors").fromName(ptr[0..value.failure.len]);
     return value.value;

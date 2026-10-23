@@ -263,6 +263,127 @@ fn parseTime(text: []const u8) ParseError!u64 {
     return std.math.cast(u64, total) orelse return error.TemporalOutOfRange;
 }
 
+/// SQL input is separate from the canonical persisted/wire representation.
+/// Quantities retain decimal precision, without floating-point month/day math.
+pub fn parseInput(kind: temporal.Kind, input: []const u8) ParseError!temporal.Value {
+    if (kind != .interval) return parseCanonical(kind, input);
+    const text = std.mem.trim(u8, input, " \t\r\n");
+    if (text.len == 0 or text.len > 4096) return error.InvalidTemporalText;
+    if (std.ascii.eqlIgnoreCase(text, "infinity")) return parseCanonical(kind, "infinity");
+    if (std.ascii.eqlIgnoreCase(text, "-infinity")) return parseCanonical(kind, "-infinity");
+    var parts = std.mem.tokenizeAny(u8, text, " \t\r\n");
+    var months: i128 = 0;
+    var days: i128 = 0;
+    var micros: i128 = 0;
+    var count: usize = 0;
+    while (parts.next()) |number| {
+        if (std.ascii.eqlIgnoreCase(number, "ago")) {
+            if (count == 0 or parts.next() != null) return error.InvalidTemporalText;
+            months = -months;
+            days = -days;
+            micros = -micros;
+            break;
+        }
+        count += 1;
+        if (std.mem.eql(u8, number, "@") and count == 1) continue;
+        if (std.mem.indexOfScalar(u8, number, ':') != null) {
+            const sign = number[0] == '-' or number[0] == '+';
+            const magnitude = try parseTime(if (sign) number[1..] else number);
+            micros += if (number[0] == '-') -@as(i128, magnitude) else magnitude;
+            continue;
+        }
+        const unit = parts.next() orelse return error.InvalidTemporalText;
+        const decimal = try intervalDecimal(number);
+        const factor: i128 = if (intervalUnit(unit, "millennium", "millennia")) 12000 else if (intervalUnit(unit, "century", "centuries")) 1200 else if (intervalUnit(unit, "decade", "decades")) 120 else if (intervalUnit(unit, "year", "years")) 12 else if (intervalUnit(unit, "month", "months") or intervalUnit(unit, "mon", "mons")) 1 else 0;
+        if (factor != 0) {
+            const value = decimal.value * factor;
+            if (factor != 1) {
+                var rounded = @divTrunc(value, decimal.scale);
+                const remainder = @rem(value, decimal.scale);
+                const magnitude = if (remainder < 0) -remainder else remainder;
+                if (magnitude * 2 > decimal.scale or (magnitude * 2 == decimal.scale and @mod(rounded, 2) != 0)) rounded += if (value < 0) @as(i128, -1) else 1;
+                months += rounded;
+                continue;
+            }
+            months += @divTrunc(value, decimal.scale);
+            const day_value = @rem(value, decimal.scale) * 30;
+            days += @divTrunc(day_value, decimal.scale);
+            micros += intervalRound(@rem(day_value, decimal.scale) * temporal.micros_per_day, decimal.scale);
+        } else if (intervalUnit(unit, "week", "weeks") or intervalUnit(unit, "day", "days")) {
+            const value = decimal.value * @as(i128, if (intervalUnit(unit, "week", "weeks")) 7 else 1);
+            days += @divTrunc(value, decimal.scale);
+            micros += intervalRound(@rem(value, decimal.scale) * temporal.micros_per_day, decimal.scale);
+        } else {
+            const time_factor: i128 = if (intervalUnit(unit, "hour", "hours")) 3_600_000_000 else if (intervalUnit(unit, "minute", "minutes") or intervalUnit(unit, "min", "mins")) 60_000_000 else if (intervalUnit(unit, "second", "seconds") or intervalUnit(unit, "sec", "secs")) 1_000_000 else if (intervalUnit(unit, "millisecond", "milliseconds")) 1000 else if (intervalUnit(unit, "microsecond", "microseconds")) 1 else return error.InvalidTemporalText;
+            micros += intervalRound(decimal.value * time_factor, decimal.scale);
+        }
+    }
+    if (count == 0) return error.InvalidTemporalText;
+    return .{ .interval = .{ .months = std.math.cast(i32, months) orelse return error.TemporalOutOfRange, .days = std.math.cast(i32, days) orelse return error.TemporalOutOfRange, .micros = std.math.cast(i64, micros) orelse return error.TemporalOutOfRange } };
+}
+
+test "SQL UUIDv7 interval input agrees with independent PostgreSQL binary witnesses" {
+    const cases = [_]struct { input: []const u8, binary: []const u8 }{
+        .{ .input = "1 month 2 days 3 hours", .binary = "0000000283baec000000000200000001" },
+        .{ .input = "-1 month", .binary = "000000000000000000000000ffffffff" },
+        .{ .input = "1.5 days", .binary = "0000000a0eebb0000000000100000000" },
+        .{ .input = "0.5 months", .binary = "00000000000000000000000f00000000" },
+        .{ .input = "1 year", .binary = "0000000000000000000000000000000c" },
+        .{ .input = "0.1 years", .binary = "00000000000000000000000000000001" },
+        .{ .input = "0.125 years", .binary = "00000000000000000000000000000002" },
+        .{ .input = "-0.125 years", .binary = "000000000000000000000000fffffffe" },
+        .{ .input = "0.375 years", .binary = "00000000000000000000000000000004" },
+        .{ .input = "2 weeks", .binary = "00000000000000000000000e00000000" },
+        .{ .input = "0.0000005 seconds", .binary = "00000000000000000000000000000000" },
+        .{ .input = "0.0000015 seconds", .binary = "00000000000000010000000000000000" },
+        .{ .input = "1 day ago", .binary = "0000000000000000ffffffff00000000" },
+        .{ .input = "infinity", .binary = "7fffffffffffffff7fffffff7fffffff" },
+    };
+    for (cases) |case| {
+        var expected: [16]u8 = undefined;
+        var actual: [16]u8 = undefined;
+        const value = try parseInput(.interval, case.input);
+        try std.testing.expectEqualSlices(u8, try std.fmt.hexToBytes(&expected, case.binary), try temporal.encode(value, &actual));
+    }
+}
+
+fn intervalUnit(actual: []const u8, singular: []const u8, plural: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(actual, singular) or std.ascii.eqlIgnoreCase(actual, plural);
+}
+
+fn intervalDecimal(input: []const u8) ParseError!struct { value: i128, scale: i128 } {
+    // A bounded exact decimal keeps every intermediate comfortably in i128.
+    var text = input;
+    const negative = text.len != 0 and text[0] == '-';
+    if (text.len != 0 and (text[0] == '-' or text[0] == '+')) text = text[1..];
+    var value: i128 = 0;
+    var scale: i128 = 1;
+    var fraction = false;
+    var digits: usize = 0;
+    for (text) |byte| {
+        if (byte == '.' and !fraction) {
+            fraction = true;
+            continue;
+        }
+        if (byte < '0' or byte > '9') return error.InvalidTemporalText;
+        digits += 1;
+        if (digits > 24) return error.TemporalOutOfRange;
+        value = value * 10 + byte - '0';
+        if (fraction) scale *= 10;
+    }
+    if (digits == 0) return error.InvalidTemporalText;
+    return .{ .value = if (negative) -value else value, .scale = scale };
+}
+
+fn intervalRound(value: i128, scale: i128) i128 {
+    const magnitude = if (value < 0) -value else value;
+    var whole = @divTrunc(magnitude, scale);
+    const remainder = @rem(magnitude, scale);
+    // PostgreSQL interval input truncates exact half-microsecond ties.
+    if (remainder * 2 > scale) whole += 1;
+    return if (value < 0) -whole else whole;
+}
+
 fn parseInterval(text: []const u8) ParseError!temporal.Interval {
     var parts = std.mem.splitScalar(u8, text, ' ');
     var months: i64 = 0;

@@ -13,7 +13,9 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
-test {
+// Discover the owned tests even when a caller's compile filter does not match
+// the anonymous reachability test itself.
+comptime {
     _ = @import("pgwire/mod.zig");
 }
 

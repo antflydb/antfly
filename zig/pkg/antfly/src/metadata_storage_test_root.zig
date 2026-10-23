@@ -26,6 +26,12 @@ test {
     _ = @import("metadata/relational_index_candidate.zig");
     _ = @import("metadata/relational_index_publication.zig");
     _ = @import("metadata/schema_validation_attestation.zig");
+    _ = @import("metadata/schema_validation_publication.zig");
+    _ = @import("metadata/schema_validation_plan.zig");
+    _ = @import("metadata/schema_validation_ledger.zig");
+    _ = @import("metadata/schema_migration_finalization.zig");
+    _ = @import("api/tables.zig");
+    _ = @import("api/native_retained_cut.zig");
     _ = @import("metadata/relational_index_worker.zig");
     _ = @import("metadata/relational_index_delivery_journal.zig");
     _ = @import("api/relational_index_owner_execution.zig");

@@ -37,10 +37,16 @@ pub const max_allocated_bytes = 4 * max_output_bytes;
 
 /// One invocation can span several immutable plans. Work/cancellation remain
 /// sticky across nodes and bindings, independently of retained-byte admission.
+pub const PreparationRuntime = struct {
+    io: std.Io,
+    uuid_clock: ?*@import("../common/uuid.zig").Version7Clock = null,
+};
+
 pub const Execution = struct {
     alloc: Allocator,
     bytes: *usize,
     numeric: exact.Context,
+    preparation_runtime: ?PreparationRuntime = null,
 
     pub fn init(alloc: Allocator, bytes: *usize) Execution {
         return .{ .alloc = alloc, .bytes = bytes, .numeric = .{ .alloc = alloc } };
@@ -66,6 +72,9 @@ pub const PreparedInput = struct {
     nulls: ?*@import("../sql/row_value.zig").JsonNulls,
     entries: std.StringHashMapUnmanaged(Entry),
     preparations: usize,
+    /// Immutable logical-predecessor ordinal -> physical historical ordinal.
+    /// NULL entries denote fields absent in that retained layout.
+    ordinals: ?[]const ?u32 = null,
     const Entry = struct { kind: Kind, sql_type: ?Numeric, value: Value };
 
     pub fn initJson(self: *PreparedInput, execution: *Execution, document: std.json.Value, nulls: ?*@import("../sql/row_value.zig").JsonNulls) !void {
@@ -83,6 +92,11 @@ pub const PreparedInput = struct {
     /// Caller has certified the exact compiler layout and column identity.
     pub fn initBoundRow(self: *PreparedInput, execution: *Execution, row: codec.OrdinalRowView) !void {
         try self.init(execution, .{ .bound_row = row }, null);
+    }
+
+    pub fn initMappedRow(self: *PreparedInput, execution: *Execution, row: codec.OrdinalRowView, ordinals: []const ?u32) !void {
+        try self.initBoundRow(execution, row);
+        self.ordinals = ordinals;
     }
 
     fn init(self: *PreparedInput, execution: *Execution, source: Plan.Source, nulls: ?*@import("../sql/row_value.zig").JsonNulls) !void {
@@ -120,8 +134,18 @@ pub const PreparedInput = struct {
         try execution.charge(0);
     }
 
-    fn read(self: *PreparedInput, execution: *Execution, node: Node) !Value {
+    fn mappedNode(self: *const PreparedInput, logical: Node) !?Node {
+        var node = logical;
+        if (node.op == .column) if (self.ordinals) |mapping| {
+            if (node.ordinal >= mapping.len) return error.InvalidRelationalExpressionInput;
+            node.ordinal = mapping[node.ordinal] orelse return null;
+        };
+        return node;
+    }
+
+    fn read(self: *PreparedInput, execution: *Execution, logical: Node) !Value {
         try self.requireExecution(execution);
+        const node = (try self.mappedNode(logical)) orelse return .null;
         // Ordinary scalar cells already borrow the input. Preserve that path,
         // and preserve streamed base64 comparisons in Plan.borrowedBlob.
         switch (node.kind) {
@@ -743,7 +767,7 @@ fn numericJsonOutput(execution: *Execution, bytes: []const u8) !std.json.Value {
     return scratch.json(parsed.value) catch |err| return scratch.failure(err);
 }
 
-pub const Op = enum { literal, column, add, subtract, multiply, divide, modulo, negate, concat, coalesce, lower_ascii, upper_ascii, eq, ne, gt, gte, lt, lte, is_null, is_not_null, is_distinct, is_not_distinct, @"and", @"or", not, cast, case_when, in_list, not_in_list, array, replace, md5, abs, ceil, floor, round, trunc, sign, sqrt, jsonb_typeof, jsonb_array_length, jsonb_extract_path, jsonb_extract_path_text };
+pub const Op = enum { literal, column, add, subtract, multiply, divide, modulo, negate, concat, coalesce, lower_ascii, upper_ascii, eq, ne, gt, gte, lt, lte, is_null, is_not_null, is_distinct, is_not_distinct, @"and", @"or", not, cast, case_when, in_list, not_in_list, array, replace, md5, abs, ceil, floor, round, trunc, sign, sqrt, jsonb_typeof, jsonb_array_length, jsonb_extract_path, jsonb_extract_path_text, uuidv4, uuidv7 };
 
 fn jsonFunction(op: Op) bool {
     return switch (op) {
@@ -764,6 +788,8 @@ fn numericFunction(op: Op) ?@import("../sql/numeric_functions.zig").Function {
 pub fn acceptsField(op: Op, name: []const u8) bool {
     if (std.mem.eql(u8, name, "op")) return true;
     return switch (op) {
+        .uuidv4 => false,
+        .uuidv7 => std.mem.eql(u8, name, "shift"),
         .literal => std.mem.eql(u8, name, "type") or std.mem.eql(u8, name, "value") or std.mem.eql(u8, name, "sql_type") or std.mem.eql(u8, name, "json_null"),
         .column => std.mem.eql(u8, name, "column"),
         .cast => std.mem.eql(u8, name, "args") or std.mem.eql(u8, name, "type") or std.mem.eql(u8, name, "sql_type") or std.mem.eql(u8, name, "numeric_modifier"),
@@ -776,6 +802,7 @@ pub fn acceptsField(op: Op, name: []const u8) bool {
 pub fn acceptsArity(op: Op, count: usize) bool {
     return switch (op) {
         .literal, .column => false,
+        .uuidv4, .uuidv7 => count == 0,
         .array => count <= 32,
         .jsonb_typeof, .jsonb_array_length => count == 1,
         .jsonb_extract_path, .jsonb_extract_path_text => count >= 2 and count <= 32,
@@ -799,7 +826,109 @@ const Node = struct {
     sql_type: ?Numeric = null,
     numeric_modifier: ?exact.TypeModifier = null,
     replace_pattern: ?text_kernel.Pattern = null,
+    uuid_shift: ?@import("../sql/temporal_value.zig").Interval = null,
 };
+
+test "SQL UUID defaults require owned preparation preserve explicit values and never run during restore" {
+    const a = std.testing.allocator;
+    const sql = @import("../sql/compiler.zig");
+    var compiled = try sql.compile(a, "CREATE TABLE events (id UUID NOT NULL DEFAULT uuidv7(INTERVAL '1 month'))", .{});
+    defer compiled.deinit();
+    const bytes = try @import("../sql/ddl_runtime.zig").createSchemaAlloc(a, compiled.statement.create_table);
+    defer a.free(bytes);
+    var validator = try @import("mod.zig").CompiledTableValidator.init(a, bytes);
+    defer validator.deinit(a);
+    const table = validator.execution.expressions.?.table;
+    try std.testing.expect(table.requires_uuid_defaults);
+    try std.testing.expectEqual(@as(u32, 33), schema.requiredReaderVersion(table));
+    const encoded = try schema.serializeSchema(a, table);
+    defer a.free(encoded);
+    const restored = try schema.deserializeSchema(a, encoded);
+    defer schema.freeSchema(a, restored);
+    try std.testing.expect(restored.requires_uuid_defaults);
+    try std.testing.expect(!(@import("../common/schema_readers.zig").ReaderCapabilities{ .semantic_ceiling = 32, .encoding_ceiling = 32 }).supports(schema.readerRequirementsForSchema(table)));
+    const Input = struct {
+        calls: usize = 0,
+        fn random(raw: ?*anyopaque, output: []u8) std.Io.RandomSecureError!void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.calls += 1;
+            @memset(output, 0x5a);
+        }
+        fn now(_: ?*anyopaque, _: std.Io.Clock) std.Io.Timestamp {
+            return .{ .nanoseconds = 1_706_704_496_123_456_789 };
+        }
+    };
+    var input: Input = .{};
+    var vtable = std.testing.io.vtable.*;
+    vtable.randomSecure = Input.random;
+    vtable.now = Input.now;
+    const io: std.Io = .{ .userdata = &input, .vtable = &vtable };
+    var clock: @import("../common/uuid.zig").Version7Clock = .{};
+    const preparation = validator.forPreparation(.{ .io = io, .uuid_clock = &clock });
+    var document = try std.json.parseFromSlice(std.json.Value, a, "{}", .{});
+    defer document.deinit();
+    try std.testing.expectError(error.SqlEntropyUnavailable, validator.prepareValue(document.arena.allocator(), a, &document.value));
+    try std.testing.expectEqual(@as(usize, 0), input.calls);
+    try preparation.prepareValue(document.arena.allocator(), a, &document.value);
+    try std.testing.expectEqual(@as(usize, 1), input.calls);
+    const uuid = @import("../common/uuid.zig");
+    try std.testing.expectEqual(@as(?u4, 7), uuid.version(try uuid.parse(document.value.object.get("id").?.string)));
+    const saved = try a.dupe(u8, document.value.object.get("id").?.string);
+    defer a.free(saved);
+    try preparation.prepareValue(document.arena.allocator(), a, &document.value);
+    try validator.validateValue(a, &document.value);
+    try std.testing.expectEqual(@as(usize, 1), input.calls);
+    try std.testing.expectEqualStrings(saved, document.value.object.get("id").?.string);
+    // Rebuilding the immutable registry compiles default operations but must
+    // not require or invent an entropy source for historical validation.
+    var reopened = try @import("mod.zig").CompiledTableValidator.init(a, bytes);
+    defer reopened.deinit(a);
+    try reopened.validateValue(a, &document.value);
+    try std.testing.expectEqual(@as(usize, 1), input.calls);
+    var node = try std.json.parseFromSlice(std.json.Value, a, "{\"op\":\"uuidv7\"}", .{});
+    defer node.deinit();
+    try std.testing.expectError(error.InvalidRelationalExpressionType, Plan.init(a, table, node.value, .string));
+    for ([_]struct { expression: []const u8, version: ?u4 }{
+        .{ .expression = "uuidv4()", .version = 4 },
+        .{ .expression = "gen_random_uuid()", .version = 4 },
+        .{ .expression = "COALESCE(NULL::uuid, uuidv7())", .version = 7 },
+        .{ .expression = "uuidv7(NULL::interval)", .version = null },
+        .{ .expression = "CASE WHEN false THEN uuidv7() ELSE NULL::uuid END", .version = null },
+    }) |case| {
+        const statement = try std.fmt.allocPrint(a, "CREATE TABLE variants (id UUID DEFAULT {s})", .{case.expression});
+        defer a.free(statement);
+        var declaration = try sql.compile(a, statement, .{});
+        defer declaration.deinit();
+        const definition = try @import("../sql/ddl_runtime.zig").createSchemaAlloc(a, declaration.statement.create_table);
+        defer a.free(definition);
+        var owner = try @import("mod.zig").CompiledTableValidator.init(a, definition);
+        defer owner.deinit(a);
+        var value = try std.json.parseFromSlice(std.json.Value, a, "{}", .{});
+        defer value.deinit();
+        const calls = input.calls;
+        try owner.forPreparation(.{ .io = io, .uuid_clock = &clock }).prepareValue(value.arena.allocator(), a, &value.value);
+        const actual = value.value.object.get("id").?;
+        if (case.version) |expected| {
+            try std.testing.expectEqual(@as(?u4, expected), uuid.version(try uuid.parse(actual.string)));
+            try std.testing.expectEqual(calls + 1, input.calls);
+        } else {
+            try std.testing.expect(actual == .null);
+            try std.testing.expectEqual(calls, input.calls);
+        }
+        try owner.validateValue(a, &value.value);
+    }
+    var infinite = try sql.compile(a, "CREATE TABLE invalid_shift (id UUID DEFAULT uuidv7(INTERVAL 'infinity'))", .{});
+    defer infinite.deinit();
+    const infinite_schema = try @import("../sql/ddl_runtime.zig").createSchemaAlloc(a, infinite.statement.create_table);
+    defer a.free(infinite_schema);
+    var infinite_owner = try @import("mod.zig").CompiledTableValidator.init(a, infinite_schema);
+    defer infinite_owner.deinit(a);
+    var infinite_row = try std.json.parseFromSlice(std.json.Value, a, "{}", .{});
+    defer infinite_row.deinit();
+    const calls = input.calls;
+    try std.testing.expectError(error.TemporalOutOfRange, infinite_owner.prepareValue(infinite_row.arena.allocator(), a, &infinite_row.value));
+    try std.testing.expectEqual(calls, input.calls);
+}
 
 pub const Plan = struct {
     arena: std.heap.ArenaAllocator,
@@ -814,11 +943,19 @@ pub const Plan = struct {
     prepared_sources: u8 = 0xff,
 
     pub fn init(alloc: Allocator, table: schema.TableSchema, expression: std.json.Value, expected: Kind) !Plan {
+        return initPolicy(alloc, table, expression, expected, false);
+    }
+
+    pub fn initDefault(alloc: Allocator, table: schema.TableSchema, expression: std.json.Value, expected: Kind) !Plan {
+        return initPolicy(alloc, table, expression, expected, true);
+    }
+
+    fn initPolicy(alloc: Allocator, table: schema.TableSchema, expression: std.json.Value, expected: Kind, defaults: bool) !Plan {
         var arena = std.heap.ArenaAllocator.init(alloc);
         errdefer arena.deinit();
         var bytes: usize = max_allocated_bytes;
         var execution = Execution.init(arena.allocator(), &bytes);
-        var compiler: Compiler = .{ .alloc = arena.allocator(), .table = table, .execution = &execution };
+        var compiler: Compiler = .{ .alloc = arena.allocator(), .table = table, .execution = &execution, .allow_uuid_defaults = defaults };
         compiler.hash.update("antfly immutable scalar expression v1");
         const root = try compiler.compile(expression, 0);
         if (compiler.nodes.items[root].kind != expected) return error.InvalidRelationalExpressionType;
@@ -931,11 +1068,14 @@ pub const Plan = struct {
     const Source = union(enum) { values: []const Value, json: std.json.Value, row: codec.OrdinalRowView, bound_row: codec.OrdinalRowView, prepared: *PreparedInput };
 
     fn borrowedBlob(self: *const Plan, source: Source, index: u16) anyerror!BlobOperand {
-        const node = self.nodes[index];
+        return borrowedBlobNode(source, self.nodes[index]);
+    }
+
+    fn borrowedBlobNode(source: Source, node: Node) anyerror!BlobOperand {
         if (node.op == .literal) return BlobOperand.fromValue(node.literal);
         std.debug.assert(node.op == .column and node.kind == .blob);
         return switch (source) {
-            .prepared => |input| self.borrowedBlob(input.source, index),
+            .prepared => |input| if (try input.mappedNode(node)) |physical| borrowedBlobNode(input.source, physical) else .{},
             .values => |values| if (node.ordinal < values.len) BlobOperand.fromValue(values[node.ordinal]) else error.InvalidRelationalExpressionInput,
             .json => |json| BlobOperand.fromJson(json.object.get(node.column_name) orelse .null),
             .row, .bound_row => |row| blk: {
@@ -1009,6 +1149,17 @@ pub const Plan = struct {
     fn evaluateNode(self: *const Plan, execution: *Execution, source: Source, index: u16) anyerror!Value {
         try execution.numeric.charge(1);
         const node = self.nodes[index];
+        if (node.op == .uuidv4 or node.op == .uuidv7) {
+            if (node.uuid_shift) |shift| if (shift.infinity() != 0) return error.TemporalOutOfRange;
+            const runtime = execution.preparation_runtime orelse return error.SqlEntropyUnavailable;
+            const functions = @import("../sql/uuid_functions.zig");
+            const bytes = if (node.op == .uuidv4) try functions.generate4(runtime.io) else try functions.generate(runtime.io, runtime.uuid_clock orelse &functions.process_clock, node.uuid_shift);
+            const formatted = @import("../common/uuid.zig").format(bytes);
+            try execution.charge(formatted.len);
+            const result = try allocateOutput(execution.alloc, formatted.len, execution.bytes);
+            @memcpy(result, &formatted);
+            return .{ .string = result };
+        }
         if (node.op == .literal) return node.literal;
         if (node.op == .array) return self.evaluateArray(execution, source, node);
         if (node.op == .column) return readColumn(execution, source, node);
@@ -2460,6 +2611,7 @@ const Compiler = struct {
     dependencies: std.ArrayList(u32) = .empty,
     hash: std.crypto.hash.Blake3 = std.crypto.hash.Blake3.init(.{}),
     visited: usize = 0,
+    allow_uuid_defaults: bool = false,
     literal_bytes: usize = 0,
 
     fn frame(self: *Compiler, bytes: []const u8) void {
@@ -2484,6 +2636,18 @@ const Compiler = struct {
         self.frame(op_value.string);
         var node: Node = .{ .op = op, .kind = undefined };
         switch (op) {
+            .uuidv4, .uuidv7 => {
+                if (!self.allow_uuid_defaults or !self.table.requires_uuid_defaults) return error.InvalidRelationalExpressionType;
+                node.kind = .string;
+                node.sql_type = .uuid;
+                if (input.object.get("shift")) |shift| {
+                    if (op != .uuidv7 or shift != .string or shift.string.len == 0 or shift.string.len > 128) return error.InvalidRelationalExpression;
+                    const value = try @import("../sql/temporal_text.zig").parseCanonical(.interval, shift.string);
+                    node.uuid_shift = value.interval;
+                    var encoded: [16]u8 = undefined;
+                    self.frame(try @import("../sql/temporal_value.zig").encode(value, &encoded));
+                }
+            },
             .literal => {
                 const kind = input.object.get("type") orelse return error.InvalidRelationalExpression;
                 if (kind != .string) return error.InvalidRelationalExpression;
@@ -3939,7 +4103,7 @@ pub const Set = struct {
                     if (std.mem.eql(u8, column.name, name.string)) break @intCast(i);
                 } else return error.RelationalIndexColumnNotFound;
                 for (bindings[0..initialized]) |binding| if (binding.ordinal == ordinal) return error.InvalidRelationalExpression;
-                var plan = try Plan.init(alloc, table, entry.object.get("expression") orelse return error.InvalidRelationalExpression, table.relational_columns[ordinal].column_type);
+                var plan = if (mode == 0) try Plan.initDefault(alloc, table, entry.object.get("expression") orelse return error.InvalidRelationalExpression, table.relational_columns[ordinal].column_type) else try Plan.init(alloc, table, entry.object.get("expression") orelse return error.InvalidRelationalExpression, table.relational_columns[ordinal].column_type);
                 errdefer plan.deinit();
                 if (plan.result_kind == .sql_array and plan.result_sql_type != table.relational_columns[ordinal].sql_element_type) return error.InvalidRelationalExpressionType;
                 total_nodes += plan.nodes.len;

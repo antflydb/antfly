@@ -347,7 +347,7 @@ pub const Plan = struct {
         if (self.catalog_coverage == .checks_v1) {
             const shape = @import("schema_publication_shape.zig");
             try shape.requireTableImages(alloc, self.child_before, self.child_after);
-            try shape.requireSchemaDelta(alloc, self.child_before.schema_json, self.child_after.schema_json, &.{ "version", "foreign_keys" });
+            try shape.requireForeignKeySchemaDelta(alloc, self.child_before.schema_json, self.child_after.schema_json);
         }
         if (self.constraint_name_guard) |guard| {
             guard.validate() catch return error.InvalidGenerationPublication;
@@ -373,6 +373,7 @@ pub const Plan = struct {
             self.child_after.indexes_json,
             self.child_after.schema_json,
             next_version,
+            self.child_before.full_text_read_index,
         )) return error.InvalidGenerationPublication;
         const catalog_len = std.base64.standard.Decoder.calcSizeForSlice(self.child_catalog_before_b64) catch return error.InvalidGenerationPublication;
         if (catalog_len > integrity_catalog.max_catalog_bytes) return error.InvalidGenerationPublication;

@@ -116,11 +116,13 @@ pub const Session = struct {
     cursor_budget: ?*Budget = null,
     cursor_epoch: u64 = 0,
     statement_timeout: ?u32 = null,
+    statement_timeout_default: ?u32 = null,
     application_name: commands.ApplicationName = .{},
     lake_visibility: commands.ReadRequirements = .{},
     read_receipt_budget: @import("antfly_local_sources").sql_read_requirements.WaitBudget = .{},
     namespace_setting: ?commands.SearchPath = null,
     catalog_settings: ?settings_catalog.OverlayState = null,
+    login_defaults: ?settings_catalog.Baseline = null,
     request_namespace: ?[]const u8 = null,
     request_search_path: ?commands.SearchPath = null,
     transaction_namespace: ?commands.Namespace = null,
@@ -147,6 +149,7 @@ pub const Session = struct {
         self.clearCursorSavepoints();
         self.savepoints.deinit(self.alloc);
         if (self.catalog_settings) |*state| state.deinit();
+        if (self.login_defaults) |*baseline| baseline.deinit();
         if (self.cursor_budget) |budget| self.alloc.destroy(budget);
         if (self.identity) |identity| {
             self.source.vtable.disconnect(self.source.context, identity, self.session_id);
@@ -305,6 +308,7 @@ pub const Session = struct {
                     // Authenticate first; database is only an untrusted
                     // resolution hint carried to the authorized backend.
                     if (database) |value| self.database = try self.alloc.dupe(u8, value);
+                    try self.captureLoginDefaults();
                     if (self.hooks) |hooks| try hooks.register(hooks.context, self);
                     try self.message('R', &.{ 0, 0, 0, 0 });
                     try self.parameterStatus("server_version", "16.0-antfly");
@@ -356,6 +360,7 @@ pub const Session = struct {
             .read_requirements = self.lake_visibility,
             .read_receipt_budget = &self.read_receipt_budget,
             .setting_overlay = if (self.catalog_settings) |*state| state.values() else &.{},
+            .setting_baseline = if (self.login_defaults) |baseline| baseline.entries else null,
             .limit = self.limits.result_rows,
             .io = self.io,
             .deadline = .{ .clock = .awake, .raw = .{ .nanoseconds = self.deadline_ns.load(.acquire) } },
@@ -598,7 +603,8 @@ pub const Session = struct {
             result.rows = rows;
             return result;
         }
-        const update = if (setting == .reset) (commands.TimeoutSetting{ .set = .{ .local = false, .milliseconds = null } }).set else setting.set;
+        var update = if (setting == .reset) (commands.TimeoutSetting{ .set = .{ .local = false, .milliseconds = null } }).set else setting.set;
+        if (update.milliseconds == null) update.milliseconds = self.statement_timeout_default;
         if (update.local and self.status != .in_transaction) return error.NoActiveSqlTransaction;
         // A client may shorten its deadline or request zero, but cannot remove
         // the operator-configured hard statement timeout.
@@ -705,6 +711,26 @@ pub const Session = struct {
         return result;
     }
 
+    fn captureLoginDefaults(self: *Session) !void {
+        const load = self.source.vtable.load_settings orelse return;
+        const identity = self.identity orelse return error.AuthenticationFailed;
+        var scratch = std.heap.ArenaAllocator.init(self.alloc);
+        defer scratch.deinit();
+        const raw = try load(self.source.context, scratch.allocator(), identity, self.request("", &.{}, &.{}));
+        var baseline = try settings_catalog.Baseline.init(self.alloc, raw);
+        errdefer baseline.deinit();
+        var timeout: ?u32 = null;
+        for (raw.definitions, baseline.entries) |definition, entry| {
+            if (std.ascii.eqlIgnoreCase(definition.name, "statement_timeout")) {
+                if (entry.value != .integer) return error.InvalidSettingCatalogSnapshot;
+                timeout = std.math.cast(u32, entry.value.integer) orelse return error.InvalidSettingCatalogSnapshot;
+            }
+        }
+        self.statement_timeout_default = timeout;
+        self.statement_timeout = timeout;
+        self.login_defaults = baseline;
+    }
+
     fn settingsState(self: *Session) *settings_catalog.OverlayState {
         if (self.catalog_settings == null) self.catalog_settings = settings_catalog.OverlayState.init(self.alloc);
         return &self.catalog_settings.?;
@@ -723,7 +749,7 @@ pub const Session = struct {
             }
         };
         var captured = raw;
-        const owner: settings_catalog.Owner = .{ .ptr = &captured, .load = snapshot.read };
+        const owner: settings_catalog.Owner = .{ .ptr = &captured, .load = snapshot.read, .baseline = if (self.login_defaults) |baseline| baseline.entries else null };
         const state = self.settingsState();
         switch (setting) {
             .set => |value| {
@@ -760,7 +786,7 @@ pub const Session = struct {
 
     fn executeResetAll(self: *Session) !backend.Result {
         if (self.status == .failed) return error.InFailedSqlTransaction;
-        self.statement_timeout = null;
+        self.statement_timeout = self.statement_timeout_default;
         self.namespace_setting = null;
         self.application_name = .{};
         self.lake_visibility = .{};
@@ -1072,7 +1098,7 @@ pub const Session = struct {
                 try self.dataResult(try result.view(portal.offset, count), portal.formats);
                 portal.offset += count;
                 if (portal.offset < result.rowCount()) try self.message('s', "") else try self.complete(result);
-                if (result.ddl_receipt_json != null and std.mem.eql(u8, result.command_tag, "DDL PENDING")) {
+                if ((result.ddl_receipt_json != null or result.catalog_receipt_json != null) and std.mem.eql(u8, result.command_tag, "DDL PENDING")) {
                     self.skip_until_sync = true;
                     return;
                 }
@@ -1249,7 +1275,7 @@ pub const Session = struct {
             else
                 result.session_id == null;
             if (!columnsEqual(description.columns, result.columns) or !std.mem.startsWith(u8, result.command_tag, "SELECT") or
-                result.mutation_outcome != null or result.ddl_receipt_json != null or result.continuation != null or
+                result.mutation_outcome != null or result.ddl_receipt_json != null or result.catalog_receipt_json != null or result.continuation != null or
                 result.transaction_status != self.status or !same_session or result.rowCount() > self.limits.result_rows) return error.InvalidResult;
             spool.?.append(result, self.limits.cursor_rows) catch |err| return if (err == error.OutOfMemory) error.ProgramLimitExceeded else err;
         }
@@ -1773,7 +1799,8 @@ pub const Session = struct {
     }
 
     fn complete(self: *Session, result: backend.Result) !void {
-        if (result.ddl_receipt_json) |receipt| {
+        if (result.ddl_receipt_json != null and result.catalog_receipt_json != null) return error.InvalidResult;
+        if (result.catalog_receipt_json orelse result.ddl_receipt_json) |receipt| {
             var bytes = std.Io.Writer.Allocating.init(self.alloc);
             defer bytes.deinit();
             const pending = std.mem.eql(u8, result.command_tag, "DDL PENDING");

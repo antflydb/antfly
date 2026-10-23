@@ -945,7 +945,7 @@ fn Engine(comptime Context: type) type {
         fn normalize(alloc: Allocator, columns: []const binding.Column, values: []const Datum) ![]const Datum {
             if (columns.len != values.len) return error.SqlTypeMismatch;
             const result = try alloc.alloc(Datum, values.len);
-            for (values, columns, result) |value, column, *out| out.* = try describe.coerceDatum(alloc, value, column.type, column.element_type);
+            for (values, columns, result) |value, column, *out| out.* = try describe.coerceDatumTyped(alloc, value, scalar.columnType(column));
             return result;
         }
 
@@ -1268,7 +1268,7 @@ fn Engine(comptime Context: type) type {
                     for (ordinals, types, self.node.columns, 0..) |*ordinal, *type_, column, index| {
                         const original = if (self.node.operation.join.output_order) |order| order[index] else index;
                         ordinal.* = if (!self.flipped_join) original else if (original < width) self.node.operation.join.right.columns.len + original else original - width;
-                        type_.* = .{ .kind = column.type, .element_type = column.element_type, .numeric_modifier = column.numeric_modifier };
+                        type_.* = scalar.columnType(column);
                     }
                     for (selection, 0..) |*index, i| index.* = i;
                     return .{ .mapped = .{ .source = source, .ordinals = ordinals, .types = types, .selection = selection } };
@@ -1300,7 +1300,7 @@ fn Engine(comptime Context: type) type {
                         self.engine.visited += page.selection.len;
                         self.eof = page.after == null;
                         const definitions = try a.alloc(scalar.Column, self.node.columns.len);
-                        for (definitions, scan.source_columns, self.node.columns) |*definition, name, column| definition.* = .{ .name = name, .type = column.type, .element_type = column.element_type, .numeric_modifier = column.numeric_modifier, .nullable = column.nullable };
+                        for (definitions, scan.source_columns, self.node.columns) |*definition, name, column| definition.* = .{ .name = name, .type = column.type, .element_type = column.element_type, .numeric_modifier = column.numeric_modifier, .temporal_kind = column.temporal_kind, .nullable = column.nullable };
                         return .{ .columns = .{ .page = page, .definitions = definitions } };
                     }
                 }
@@ -1344,7 +1344,7 @@ fn Engine(comptime Context: type) type {
                     for (names, self.node.columns, ordinals, types) |name, column, *ordinal, *type_| {
                         ordinal.* = layout.ordinals.get(name) orelse return error.InvalidSqlBackendResponse;
                         if (ordinal.* >= source.width()) return error.InvalidSqlBackendResponse;
-                        type_.* = .{ .kind = column.type, .element_type = column.element_type, .numeric_modifier = column.numeric_modifier };
+                        type_.* = scalar.columnType(column);
                     }
                     const selection = try a.alloc(usize, source.len());
                     for (selection, 0..) |*index, lane| index.* = lane;
@@ -1361,7 +1361,7 @@ fn Engine(comptime Context: type) type {
                     fn cell(raw: *anyopaque, alloc: Allocator, row: usize, column: usize) anyerror!Datum {
                         const view: *@This() = @ptrCast(@alignCast(raw));
                         const definition = view.columns[column];
-                        return describe.coerceDatum(alloc, try view.rows[row].cell(view.names[column]), definition.type, definition.element_type);
+                        return describe.coerceDatumTyped(alloc, try view.rows[row].cell(view.names[column]), scalar.columnType(definition));
                     }
                 };
                 const view = try a.create(View);
@@ -1446,7 +1446,7 @@ fn Engine(comptime Context: type) type {
                             for (names, self.node.columns, values) |name, column, *out| {
                                 const ordinal = layout.ordinals.get(name) orelse return error.InvalidSqlBackendResponse;
                                 if (ordinal >= row.len) return error.InvalidSqlBackendResponse;
-                                out.* = try operators.cloneDatum(alloc, try describe.coerceDatum(alloc, row[ordinal], column.type, column.element_type));
+                                out.* = try operators.cloneDatum(alloc, try describe.coerceDatumTyped(alloc, row[ordinal], scalar.columnType(column)));
                             }
                             self.output_index += 1;
                             break :blk values;
@@ -1457,7 +1457,7 @@ fn Engine(comptime Context: type) type {
                         const values = try alloc.alloc(Datum, self.node.columns.len);
                         for (names, self.node.columns, values) |name, column, *out| {
                             const cell = try row.cell(name);
-                            out.* = try describe.coerceDatum(alloc, cell, column.type, column.element_type);
+                            out.* = try describe.coerceDatumTyped(alloc, cell, scalar.columnType(column));
                         }
                         break :blk values;
                     },
@@ -1483,11 +1483,15 @@ fn Engine(comptime Context: type) type {
                             self.engine.visited += 1;
                             if (self.engine.visited > self.engine.context.limits.scan_rows) return error.SqlProgramLimitExceeded;
                             const values = try alloc.alloc(Datum, self.node.columns.len);
-                            for (scan.source_columns, self.node.columns, values) |name, column, *out| {
+                            for (scan.source_columns, self.node.columns, values, 0..) |name, column, *out, ordinal| {
+                                if (scan.demanded) |mask| if (!mask[ordinal]) {
+                                    out.* = .{};
+                                    continue;
+                                };
                                 const cell = try page.typedCell(alloc, index, name, column.element_type == .numeric);
                                 // Values borrow the current page until the next pull.
                                 // Retaining operators own typed copies at admission.
-                                out.* = try describe.coerceDatum(alloc, cell, column.type, column.element_type);
+                                out.* = try describe.coerceDatumTyped(alloc, cell, scalar.columnType(column));
                             }
                             break :blk values;
                         }
@@ -1509,9 +1513,13 @@ fn Engine(comptime Context: type) type {
                         self.engine.visited += 1;
                         if (self.engine.visited > self.engine.context.limits.scan_rows) return error.SqlProgramLimitExceeded;
                         const values = try alloc.alloc(Datum, self.node.columns.len);
-                        for (scan.source_columns, self.node.columns, values) |name, column, *out| {
+                        for (scan.source_columns, self.node.columns, values, 0..) |name, column, *out, ordinal| {
+                            if (scan.demanded) |mask| if (!mask[ordinal]) {
+                                out.* = .{};
+                                continue;
+                            };
                             const cell = try @import("joined_mutation.zig").cell(alloc, row, name);
-                            out.* = try describe.coerceDatum(alloc, cell, column.type, column.element_type);
+                            out.* = try describe.coerceDatumTyped(alloc, cell, scalar.columnType(column));
                         }
                         break :blk values;
                     },
@@ -1756,7 +1764,7 @@ fn Engine(comptime Context: type) type {
                     const source = try a.create(Batch);
                     source.* = column.*;
                     const types = try a.alloc(scalar.Type, 1);
-                    types[0] = .{ .kind = definition.type, .element_type = definition.element_type, .numeric_modifier = definition.numeric_modifier };
+                    types[0] = scalar.columnType(definition);
                     column.* = .{ .mapped = .{ .source = source, .ordinals = &.{0}, .types = types, .selection = identity } };
                     if (definition.type == .json) continue;
                     if (try column.physicalColumn(a, 0) == null and try column.decimalColumnSelected(a, 0, null) == null) {
@@ -1790,14 +1798,14 @@ fn Engine(comptime Context: type) type {
                 const types = try a.alloc(scalar.Type, ordinals.len);
                 for (query.binding.scalars.columns, ordinals, types) |column, *ordinal, *type_| {
                     ordinal.* = source.get(column.name) orelse std.math.maxInt(usize);
-                    type_.* = .{ .kind = column.type, .element_type = column.element_type, .numeric_modifier = column.numeric_modifier };
+                    type_.* = scalar.columnType(column);
                 }
                 const projected_ordinals = try a.alloc(usize, query.binding.columns.len);
                 const projected_types = try a.alloc(scalar.Type, projected_ordinals.len);
                 var forward = self.query_fields.?.len == query.binding.columns.len;
                 for (query.binding.columns, projected_ordinals, projected_types, 0..) |column, *ordinal, *type_, index| {
                     ordinal.* = std.math.maxInt(usize);
-                    type_.* = .{ .kind = column.type, .element_type = column.element_type, .numeric_modifier = column.numeric_modifier };
+                    type_.* = scalar.columnType(column);
                     const program = if (index < query.binding.scalars.projections.len) query.binding.scalars.projections[index] else null;
                     if (program) |projection| {
                         if (projection.instructions.len != 1 or projection.instructions[projection.root].operation != .column) {
@@ -1821,7 +1829,7 @@ fn Engine(comptime Context: type) type {
                         ordinal.* = std.math.maxInt(usize);
                         continue;
                     }
-                    type_.* = .{ .kind = column.type, .element_type = column.element_type, .numeric_modifier = column.numeric_modifier };
+                    type_.* = scalar.columnType(column);
                 }
                 return .{ .input = .{ .ordinals = ordinals, .types = types }, .outputs = .{ .ordinals = projected_ordinals, .types = projected_types }, .forward = if (forward) .{ .ordinals = projected_ordinals, .types = projected_types } else null };
             }
@@ -1968,7 +1976,7 @@ fn Engine(comptime Context: type) type {
                             for (selected.items, vector) |index, *value| value.* = try input.cell(a, index, ordinal);
                             values.* = vector;
                         }
-                        for (@constCast(values.*), output_errors) |*value, *err| value.* = describe.coerceDatum(a, value.*, definition.type, definition.element_type) catch |cause| blk: {
+                        for (@constCast(values.*), output_errors) |*value, *err| value.* = describe.coerceDatumTyped(a, value.*, scalar.columnType(definition)) catch |cause| blk: {
                             if (cause == error.OutOfMemory) return cause;
                             err.* = err.* orelse cause;
                             break :blk .{};
@@ -2072,7 +2080,7 @@ fn Engine(comptime Context: type) type {
 
             fn setValues(self: *Iterator, alloc: Allocator, values: []const Datum) ![]const Datum {
                 const result = try alloc.alloc(Datum, values.len);
-                for (values, result, self.node.columns) |value, *out, column| out.* = try describe.coerceDatum(alloc, value, column.type, column.element_type);
+                for (values, result, self.node.columns) |value, *out, column| out.* = try describe.coerceDatumTyped(alloc, value, scalar.columnType(column));
                 return result;
             }
             fn nextValues(self: *Iterator, alloc: Allocator) anyerror!?[]const Datum {

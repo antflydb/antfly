@@ -37,6 +37,12 @@ pub const Run = if (@import("builtin").os.tag == .freestanding) struct {
     pub fn compact(_: *@This()) !void {
         return error.NativePostingsRunsUnavailable;
     }
+    pub fn compactStep(_: *@This(), _: usize) !bool {
+        return error.NativePostingsRunsUnavailable;
+    }
+    pub fn compactionWorkBytes(_: *@This()) usize {
+        return 0;
+    }
     pub fn sink(_: *@This()) @import("segment.zig").SegmentSink {
         unreachable;
     }
@@ -86,6 +92,16 @@ const NativeRun = struct {
     next_read_page: usize = 0,
     read_calls: usize = 0,
     write_calls: usize = 0,
+    compaction: ?struct {
+        repack: bool,
+        dead: usize,
+        index: usize = 0,
+        kept: usize = 0,
+        copied: usize = 0,
+        end: usize = 0,
+    } = null,
+    compaction_failed: bool = false,
+    last_compaction_bytes: usize = 0,
 
     pub fn create(allocator: Allocator, io: std.Io, directory: []const u8) !*Run {
         return createWithResources(allocator, io, directory, null);
@@ -150,6 +166,7 @@ const NativeRun = struct {
         self.physical_peak = @max(self.physical_peak, self.persisted);
     }
     pub fn flush(self: *Run) !void {
+        try self.requireAvailable();
         if (self.buffer.items.len == 0) return;
         const bytes = self.buffer.items.len;
         try self.file.writePositionalAll(self.io, self.buffer.items, self.persisted);
@@ -159,6 +176,7 @@ const NativeRun = struct {
         self.buffer.clearRetainingCapacity();
     }
     pub fn appendSlice(self: *Run, bytes: []const u8) !void {
+        try self.requireAvailable();
         const next = try std.math.add(usize, self.length, bytes.len);
         if (bytes.len > 64 * 1024 - self.buffer.items.len) try self.flush();
         try self.admit(try std.math.add(usize, self.buffer.items.len, bytes.len));
@@ -171,6 +189,7 @@ const NativeRun = struct {
         self.length = next;
     }
     pub fn writeAt(self: *Run, offset: usize, bytes: []const u8) !void {
+        try self.requireAvailable();
         if (offset < self.active_logical or offset > self.length or bytes.len > self.length - offset) return error.EndOfStream;
         const physical = self.active_physical + offset - self.active_logical;
         if (physical >= self.persisted and bytes.len <= self.buffer.items.len -| (physical - self.persisted)) {
@@ -185,6 +204,7 @@ const NativeRun = struct {
     /// Seal before exposing a run. Logical coordinates remain stable while
     /// compaction moves live ranges into reclaimed physical file space.
     pub fn seal(self: *Run, start: usize) !void {
+        try self.requireAvailable();
         if (start != self.active_logical) return error.InvalidData;
         try self.flush();
         try self.extents.append(self.allocator, .{ .logical = start, .physical = self.active_physical, .length = self.length - start });
@@ -193,6 +213,7 @@ const NativeRun = struct {
         self.active_physical = self.persisted;
     }
     pub fn releaseRange(self: *Run, start: usize) void {
+        std.debug.assert(self.compaction == null and !self.compaction_failed);
         const extent = self.findExtent(start) orelse unreachable;
         std.debug.assert(extent.logical == start and extent.length != 0);
         self.live_bytes -= extent.length;
@@ -208,43 +229,70 @@ const NativeRun = struct {
         }
         return if (lo == 0) null else &self.extents.items[lo - 1];
     }
-    fn pruneDeadExtents(self: *Run) void {
-        var kept: usize = 0;
-        for (self.extents.items) |extent| if (extent.length != 0) {
-            self.extents.items[kept] = extent;
-            kept += 1;
-        };
-        self.extents.shrinkRetainingCapacity(kept);
-        self.dead_extents = 0;
+    fn requireAvailable(self: *const Run) !void {
+        if (self.compaction != null or self.compaction_failed) return error.InvalidData;
+    }
+    pub fn compactionWorkBytes(self: *const Run) usize {
+        return self.last_compaction_bytes;
     }
     /// Repack only after dead space exceeds live space and one MiB. Each
     /// compaction reclaims at least half the file; copying uses fixed scratch.
     pub fn compact(self: *Run) !void {
+        while (!try self.compactStep(64 * 1024)) {}
+    }
+
+    /// One descriptor or at most max_bytes of physical copying per turn.
+    /// The private run is exclusively owned: reads/appends are forbidden
+    /// until completion, including views obtained before compaction began.
+    pub fn compactStep(self: *Run, max_bytes: usize) !bool {
+        if (max_bytes == 0 or max_bytes > 64 * 1024 or self.compaction_failed) return error.InvalidData;
         std.debug.assert(self.active_logical == self.length);
-        const dead = self.persisted - self.live_bytes;
-        if (dead < 1024 * 1024 or dead < self.live_bytes) {
-            if (self.extents.items.len > 64 and self.dead_extents >= self.extents.items.len / 2) self.pruneDeadExtents();
-            return;
+        self.last_compaction_bytes = 0;
+        if (self.compaction == null) {
+            const dead = self.persisted - self.live_bytes;
+            const repack = dead >= 1024 * 1024 and dead >= self.live_bytes;
+            if (!repack and !(self.extents.items.len > 64 and self.dead_extents >= self.extents.items.len / 2)) return true;
+            self.compaction = .{ .repack = repack, .dead = dead };
+            self.read_pages = @splat(.{});
         }
-        self.read_pages = @splat(.{});
-        var scratch: [64 * 1024]u8 = undefined;
-        var end: usize = 0;
-        for (self.extents.items) |*extent| {
-            var copied: usize = 0;
-            while (extent.physical != end and copied < extent.length) {
-                const take = @min(scratch.len, extent.length - copied);
-                if (try self.file.readPositionalAll(self.io, scratch[0..take], extent.physical + copied) != take) return error.EndOfStream;
-                try self.file.writePositionalAll(self.io, scratch[0..take], end + copied);
-                copied += take;
+        // An interrupted overlapping copy cannot safely replay its previous
+        // source window. The owner must discard/rebuild this private run.
+        errdefer self.compaction_failed = true;
+        const state = &self.compaction.?;
+        if (state.index == self.extents.items.len) {
+            if (state.repack) {
+                try self.file.setLength(self.io, state.end);
+                self.persisted = state.end;
+                self.active_physical = state.end;
+                self.reclaimed_bytes += state.dead;
             }
-            extent.physical = end;
-            end += extent.length;
+            self.extents.shrinkRetainingCapacity(state.kept);
+            self.dead_extents = 0;
+            self.compaction = null;
+            return true;
         }
-        try self.file.setLength(self.io, end);
-        self.persisted = end;
-        self.active_physical = end;
-        self.reclaimed_bytes += dead;
-        self.pruneDeadExtents();
+        const extent = self.extents.items[state.index];
+        if (extent.length == 0) {
+            state.index += 1;
+            return false;
+        }
+        var scratch: [64 * 1024]u8 = undefined;
+        if (state.repack and extent.physical != state.end and state.copied < extent.length) {
+            const take = @min(max_bytes, extent.length - state.copied);
+            if (try self.file.readPositionalAll(self.io, scratch[0..take], extent.physical + state.copied) != take) return error.EndOfStream;
+            try self.file.writePositionalAll(self.io, scratch[0..take], state.end + state.copied);
+            state.copied += take;
+            self.last_compaction_bytes = take;
+            self.read_calls += 1;
+            self.write_calls += 1;
+            if (state.copied != extent.length) return false;
+        }
+        self.extents.items[state.kept] = .{ .logical = extent.logical, .physical = if (state.repack) state.end else extent.physical, .length = extent.length };
+        state.kept += 1;
+        state.index += 1;
+        state.end += extent.length;
+        state.copied = 0;
+        return false;
     }
     pub fn view(self: *Run) !source.View {
         try self.flush();
@@ -253,10 +301,12 @@ const NativeRun = struct {
     /// Already-sealed extents are durable in the descriptor. Reading them must
     /// not flush the active output while a carry copies its input sidecars.
     pub fn sealedView(self: *Run) !source.View {
+        try self.requireAvailable();
         return source.View.init(.{ .ranges = .{ .ptr = self, .length = self.length, .read_into = read, .close = close } }, 0, self.length);
     }
     fn read(raw: *anyopaque, offset: u64, bytes: []u8) !void {
         const self: *Run = @ptrCast(@alignCast(raw));
+        try self.requireAvailable();
         const extent = self.findExtent(offset) orelse return error.EndOfStream;
         const within = offset - extent.logical;
         if (extent.length == 0 or within > extent.length or bytes.len > extent.length - within) return error.EndOfStream;
@@ -332,3 +382,116 @@ const NativeRun = struct {
     }
     const sink_vtable = @import("segment.zig").SegmentSink.VTable{ .len = sinkLen, .append_slice = sinkAppend, .append_byte = sinkByte, .append_ntimes = sinkRepeat, .write_at = sinkWrite, .crc32_prefix = sinkCrcPrefix, .crc32_range = sinkCrcRange, .resident_bytes = resident };
 };
+
+test "postings run compaction bounds physical copying and preserves logical ranges" {
+    if (comptime @import("builtin").os.tag == .freestanding) return error.SkipZigTest;
+    const io = std.testing.io;
+    var directory = try @import("common/test_directory.zig").TestDirectory.init("postings-compact-step");
+    defer directory.cleanup();
+    try std.Io.Dir.cwd().createDirPath(io, directory.path());
+    const run = try Run.create(std.testing.allocator, io, directory.path());
+    defer run.deinit();
+    const block: [4096]u8 = @splat(11);
+    try run.appendSlice(block[0..16]);
+    try run.seal(0);
+    const live_start = run.len();
+    for (0..256) |i| {
+        const payload: [4096]u8 = @splat(@intCast(i));
+        try run.appendSlice(&payload);
+    }
+    try run.appendSlice("seventeen-bytes!!");
+    try run.seal(live_start);
+    const dead_start = run.len();
+    for (0..512) |_| try run.appendSlice(&block);
+    try run.seal(dead_start);
+    const old_view = try run.sealedView();
+    run.releaseRange(0);
+    run.releaseRange(dead_start);
+    try std.testing.expect(!try run.compactStep(4096));
+    try std.testing.expectError(error.InvalidData, run.sealedView());
+    try std.testing.expectError(error.InvalidData, run.appendSlice("forbidden"));
+    var byte: [1]u8 = undefined;
+    try std.testing.expectError(error.InvalidData, old_view.readInto(live_start, &byte));
+    var turns: usize = 1;
+    while (!try run.compactStep(4096)) {
+        turns += 1;
+        try std.testing.expect(run.last_compaction_bytes <= 4096);
+        if (turns > 300) return error.TestUnexpectedResult;
+    }
+    try std.testing.expect(turns > 256);
+    try std.testing.expectEqual(256 * 4096 + "seventeen-bytes!!".len, run.persisted);
+    try std.testing.expectEqual(@as(usize, 2 * 1024 * 1024 + 16), run.reclaimed_bytes);
+    try std.testing.expectEqual(@as(usize, 1), run.extents.items.len);
+    var output: [4096]u8 = undefined;
+    for (0..256) |i| {
+        try old_view.readInto(live_start + i * 4096, &output);
+        try std.testing.expect(std.mem.allEqual(u8, &output, @intCast(i)));
+    }
+    const tail = run.len();
+    try run.appendSlice("tail");
+    try run.seal(tail);
+    const current = try run.sealedView();
+    var suffix: [4]u8 = undefined;
+    try current.readInto(tail, &suffix);
+    try std.testing.expectEqualStrings("tail", &suffix);
+}
+
+test "postings run compaction slices descriptor retirement without rewriting small files" {
+    if (comptime @import("builtin").os.tag == .freestanding) return error.SkipZigTest;
+    const io = std.testing.io;
+    var directory = try @import("common/test_directory.zig").TestDirectory.init("postings-compact-metadata");
+    defer directory.cleanup();
+    try std.Io.Dir.cwd().createDirPath(io, directory.path());
+    const run = try Run.create(std.testing.allocator, io, directory.path());
+    defer run.deinit();
+    for (0..128) |i| {
+        const start = run.len();
+        try run.appendSlice(&.{@intCast(i)});
+        try run.seal(start);
+    }
+    for (0..64) |i| run.releaseRange(i * 2);
+    var turns: usize = 0;
+    while (true) {
+        turns += 1;
+        const done = try run.compactStep(1);
+        try std.testing.expectEqual(@as(usize, 0), run.last_compaction_bytes);
+        if (done) break;
+        if (turns > 130) return error.TestUnexpectedResult;
+    }
+    try std.testing.expectEqual(@as(usize, 129), turns);
+    try std.testing.expectEqual(@as(usize, 64), run.extents.items.len);
+    try std.testing.expectEqual(@as(usize, 128), run.persisted);
+    try std.testing.expectEqual(@as(usize, 0), run.reclaimed_bytes);
+    const view = try run.sealedView();
+    for (0..64) |i| {
+        var byte: [1]u8 = undefined;
+        try view.readInto(i * 2 + 1, &byte);
+        try std.testing.expectEqual(@as(u8, @intCast(i * 2 + 1)), byte[0]);
+    }
+}
+
+test "postings run compaction failure permanently rejects partially moved bytes" {
+    if (comptime @import("builtin").os.tag == .freestanding) return error.SkipZigTest;
+    const io = std.testing.io;
+    var directory = try @import("common/test_directory.zig").TestDirectory.init("postings-compact-fault");
+    defer directory.cleanup();
+    try std.Io.Dir.cwd().createDirPath(io, directory.path());
+    const run = try Run.create(std.testing.allocator, io, directory.path());
+    defer run.deinit();
+    const block: [4096]u8 = @splat(12);
+    for (0..512) |_| try run.appendSlice(&block);
+    try run.seal(0);
+    const live_start = run.len();
+    try run.appendSlice(&block);
+    try run.appendSlice(&block);
+    try run.seal(live_start);
+    run.releaseRange(0);
+    try std.testing.expect(!try run.compactStep(4096)); // dead descriptor
+    try std.testing.expect(!try run.compactStep(4096)); // first copied window
+    // Private-file fault injection: the next source window is truncated.
+    try run.file.setLength(io, live_start + 4096);
+    try std.testing.expectError(error.EndOfStream, run.compactStep(4096));
+    try std.testing.expectError(error.InvalidData, run.compactStep(4096));
+    try std.testing.expectError(error.InvalidData, run.sealedView());
+    try std.testing.expectError(error.InvalidData, run.appendSlice("no retry"));
+}

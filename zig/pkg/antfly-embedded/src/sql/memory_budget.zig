@@ -32,6 +32,25 @@ mutex: std.atomic.Mutex = .unlocked,
 admission: ?struct { ptr: *anyopaque, reserve: *const fn (*anyopaque, usize) bool, release: *const fn (*anyopaque, usize) void } = null,
 admission_exhausted: bool = false,
 
+/// Full replacement capacity, including coexistence with the old buffer.
+/// Use the collection's public growth rule instead of guessing per-row bytes.
+pub fn arrayListGrowthBytes(values: anytype, additional: usize) usize {
+    const required = values.items.len +| additional;
+    if (required <= values.capacity) return 0;
+    return @TypeOf(values).growCapacity(required) *| @sizeOf(@TypeOf(values.items[0]));
+}
+
+/// Conservative replacement bound for the standard 80%-load ordinal maps.
+/// KV size/alignment covers both arrays, metadata and alignment padding; old
+/// capacity is already charged to live memory and must not be subtracted.
+pub fn hashTableGrowthBytes(table: anytype, additional: usize) usize {
+    if (additional <= table.available) return 0;
+    const required = (table.count() +| additional) *| 100 / std.hash_map.default_max_load_percentage +| 1;
+    const capacity = std.math.ceilPowerOfTwo(usize, @max(8, required)) catch return std.math.maxInt(usize);
+    const Entry = @TypeOf(table).KV;
+    return capacity *| (@sizeOf(Entry) + @alignOf(Entry) + 1) +| 64;
+}
+
 /// Sequential row/program admission across independently retained regions.
 /// Unlike live-allocation callbacks, retirement never refunds parent-arena
 /// capacity. begin/finish bracket every operation that can grow the region.

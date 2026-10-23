@@ -720,30 +720,47 @@ pub const ApiHttpClient = struct {
         timeout_ms: ?u32,
         cancellation: ?*const http_common.RequestCancellation,
     ) !LookupResponse {
-        return self.fetchGroupLookupWithMode(base_uri, group_id, table_name, key, fields, read_consistency, timeout_ms, cancellation, false, false, "", "", "", "", "", null, null, false);
+        return self.fetchGroupLookupWithOptions(base_uri, group_id, table_name, key, fields, read_consistency, timeout_ms, cancellation, .{});
     }
 
-    pub fn fetchGroupLookupWithMode(
-        self: *ApiHttpClient,
-        base_uri: []const u8,
-        group_id: u64,
-        table_name: []const u8,
-        key: []const u8,
-        fields: ?[]const u8,
-        read_consistency: []const u8,
-        timeout_ms: ?u32,
-        cancellation: ?*const http_common.RequestCancellation,
-        relational_integrity_catalog: bool,
-        relational_integrity_action: bool,
-        relational_integrity_jobs_json: []const u8,
-        relational_activation_json: []const u8,
-        relational_index_status_json: []const u8,
-        relational_topology_json: []const u8,
-        group_source_query_json: []const u8,
-        restore_staging_scope: ?[32]u8,
-        restore_staging_plan_id: ?[16]u8,
-        include_primary_digest: bool,
-    ) !LookupResponse {
+    pub const GroupLookupOptions = struct {
+        relational_integrity_catalog: bool = false,
+        relational_integrity_action: bool = false,
+        relational_integrity_jobs_json: []const u8 = "",
+        relational_activation_json: []const u8 = "",
+        relational_index_status_json: []const u8 = "",
+        relational_topology_json: []const u8 = "",
+        group_source_query_json: []const u8 = "",
+        restore_staging_scope: ?[32]u8 = null,
+        restore_staging_plan_id: ?[16]u8 = null,
+        include_primary_digest: bool = false,
+        row_policy_principal_proof: []const u8 = "",
+        row_policy_database: []const u8 = "",
+    };
+
+    pub fn fetchGroupLookupWithOptions(self: *ApiHttpClient, base_uri: []const u8, group_id: u64, table_name: []const u8, key: []const u8, fields: ?[]const u8, read_consistency: []const u8, timeout_ms: ?u32, cancellation: ?*const http_common.RequestCancellation, options: GroupLookupOptions) !LookupResponse {
+        const relational_integrity_catalog = options.relational_integrity_catalog;
+        const relational_integrity_action = options.relational_integrity_action;
+        const relational_integrity_jobs_json = options.relational_integrity_jobs_json;
+        const relational_activation_json = options.relational_activation_json;
+        const relational_index_status_json = options.relational_index_status_json;
+        const relational_topology_json = options.relational_topology_json;
+        const group_source_query_json = options.group_source_query_json;
+        const restore_staging_scope = options.restore_staging_scope;
+        const restore_staging_plan_id = options.restore_staging_plan_id;
+        const include_primary_digest = options.include_primary_digest;
+        const authority = @import("../usermgr/mod.zig").row_policy_authority;
+        if ((options.row_policy_principal_proof.len == 0) != (options.row_policy_database.len == 0) or
+            options.row_policy_principal_proof.len > authority.maximum_token_bytes or
+            options.row_policy_database.len > authority.maximum_name_bytes or
+            (options.row_policy_principal_proof.len != 0 and !include_primary_digest)) return error.InvalidArgument;
+        for (options.row_policy_principal_proof) |byte| if (!std.ascii.isAlphanumeric(byte) and byte != ':' and byte != '.' and byte != '-' and byte != '_') return error.InvalidArgument;
+        const policy_database = if (options.row_policy_principal_proof.len != 0) try percentEncodePathComponent(self.alloc, options.row_policy_database) else null;
+        defer if (policy_database) |value| self.alloc.free(value);
+        const policy_headers = [_]http_common.RequestHeader{
+            .{ .name = authority.principal_header, .value = options.row_policy_principal_proof },
+            .{ .name = authority.database_header, .value = policy_database orelse "" },
+        };
         // Group lookups are also used for routed derived-artifact hydration.
         // Those storage keys are binary and contain namespace bytes and NUL
         // component terminators, so every externally represented component
@@ -815,6 +832,7 @@ pub const ApiHttpClient = struct {
         var resp = try self.executeRequest(.{
             .method = .GET,
             .uri = uri,
+            .headers = if (options.row_policy_principal_proof.len != 0) &policy_headers else &.{},
             .timeout_ms = timeout_ms,
             .cancellation = cancellation,
         });
@@ -979,7 +997,7 @@ pub const ApiHttpClient = struct {
         switch (response.status) {
             200 => {},
             400, 409 => return error.RestoreStagingScopeChanged,
-            422 => return error.BackupIntegrityFailure,
+            422 => return @import("restore_source_errors.zig").decodeOwnerFailure(self.alloc, response.body),
             413 => return error.InvalidBackupRequest,
             408, 504 => return error.Timeout,
             404, 503 => return error.RestoreValidationPending,
@@ -1064,6 +1082,57 @@ pub const ApiHttpClient = struct {
 
     pub fn fetchRelationalIndexControl(self: *ApiHttpClient, base_uri: []const u8, group_id: u64, table_name: []const u8, request: @import("relational_index_owner_execution.zig").Request, input_context: @import("antfly_local_sources").api_operation.RequestContext) !std.json.Parsed(@import("relational_index_owner_execution.zig").ControlResponse) {
         return self.fetchRelationalIndexOwner(false, base_uri, group_id, table_name, request, input_context);
+    }
+
+    pub const SchemaPreparationResponse = struct {
+        alloc: std.mem.Allocator,
+        transport: http_common.HttpResponse,
+        value: @import("schema_validation_preparation.zig").Response,
+
+        pub fn deinit(self: *@This()) void {
+            self.transport.deinit(self.alloc);
+            self.* = undefined;
+        }
+    };
+
+    pub fn fetchSchemaValidationPreparation(self: *ApiHttpClient, base_uri: []const u8, group: u64, table: []const u8, request: @import("schema_validation_preparation.zig").Request, input: @import("antfly_local_sources").api_operation.RequestContext) !SchemaPreparationResponse {
+        const preparation = @import("schema_validation_preparation.zig");
+        const context = try input.platformDeadline();
+        try context.ensureActive();
+        try request.validate(group);
+        if (self.internal_service == null) return error.Unauthorized;
+        const name = try percentEncodePathComponent(self.alloc, table);
+        defer self.alloc.free(name);
+        const path = try std.fmt.allocPrint(self.alloc, "{s}{d}{s}{s}{s}", .{ routes.Routes.internal_groups_prefix, group, routes.Routes.tables_prefix, name, routes.Routes.schema_validation_prepare_suffix });
+        defer self.alloc.free(path);
+        const uri = try self.joinRoute(base_uri, path);
+        defer self.alloc.free(uri);
+        const body = try std.json.Stringify.valueAlloc(self.alloc, request, .{});
+        defer self.alloc.free(body);
+        if (body.len > preparation.max_request_bytes) return error.TransactionTooLarge;
+        const control: backup_contract.BackupOperationControl = .{ .deadline_ns = context.deadline_ns orelse platform_time.monotonicNs() +| preparation.max_budget_ms * std.time.ns_per_ms, .cancellation = context.cancellation };
+        const remaining = @min(preparation.max_budget_ms, try control.remainingTimeoutMs());
+        var buffer: [20]u8 = undefined;
+        const budget = try std.fmt.bufPrint(&buffer, "{d}", .{remaining});
+        var cancellation = http_common.RequestCancellation.fromToken(context.cancellation);
+        var response = try self.executeRequest(.{ .method = .POST, .uri = uri, .content_type = "application/json", .body = body, .timeout_ms = remaining, .cancellation = &cancellation, .max_response_bytes = preparation.max_response_bytes, .headers = &.{.{ .name = preparation.remaining_ms_header, .value = budget }} });
+        errdefer response.deinit(self.alloc);
+        if (response.body.len > preparation.max_response_bytes) return error.InvalidSchemaValidationJob;
+        switch (response.status) {
+            200 => {},
+            401, 403 => return error.Unauthorized,
+            400 => return error.InvalidSchemaValidationJob,
+            409 => return error.SchemaValidationJobChanged,
+            413 => return error.TransactionTooLarge,
+            408, 504 => return error.Timeout,
+            404, 503 => return error.GenerationAdmissionPending,
+            else => return error.UnexpectedHttpStatus,
+        }
+        const content_type = response.content_type orelse response.header("content-type") orelse return error.InvalidSchemaValidationJob;
+        if (!std.ascii.eqlIgnoreCase(std.mem.trim(u8, std.mem.sliceTo(content_type, ';'), " \t"), "application/octet-stream")) return error.InvalidSchemaValidationJob;
+        const value = try preparation.decode(response.body);
+        try value.requireFor(group, request);
+        return .{ .alloc = self.alloc, .transport = response, .value = value };
     }
 
     fn fetchRelationalIndexOwner(self: *ApiHttpClient, comptime claims: bool, base_uri: []const u8, group_id: u64, table_name: []const u8, request: if (claims) @import("relational_index_owner_execution.zig").ClaimRequest else @import("relational_index_owner_execution.zig").Request, input_context: @import("antfly_local_sources").api_operation.RequestContext) !std.json.Parsed(if (claims) @import("relational_index_owner_execution.zig").ClaimResponse else @import("relational_index_owner_execution.zig").ControlResponse) {
@@ -4755,10 +4824,11 @@ fn consumerTests() type {
         test "api http client distinguishes invalid restore sources from retryable owners" {
             const Executor = struct {
                 status: u16 = 422,
-                fn execute(ptr: *anyopaque, _: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
+                body: []const u8 = "",
+                fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
                     const self: *@This() = @ptrCast(@alignCast(ptr));
                     try std.testing.expect(std.mem.endsWith(u8, req.uri, routes.Routes.restore_owner_suffix));
-                    return .{ .status = self.status };
+                    return .{ .status = self.status, .body = try alloc.dupe(u8, self.body) };
                 }
             };
             var executor: Executor = .{};
@@ -4768,6 +4838,13 @@ fn consumerTests() type {
                 .scope = .{ .plan_id = @splat(1), .plan_digest = @splat(2), .source_artifact_digest = @splat(3), .source_namespace = .{ .table_id = 1, .shard_id = 11, .range_id = 11 }, .target_namespace = .{ .table_id = 2, .shard_id = 22, .range_id = 22 }, .target_schema_digest = @splat(4) },
             };
             try std.testing.expectError(error.BackupIntegrityFailure, client.fetchRestoreOwner("http://owner", 22, "docs", request, .{}));
+            executor.body = "{\"protocol\":\"restore-owner-error-v1\",\"code\":\"constraint_validation_failed\"}";
+            try std.testing.expectError(error.ConstraintActivationFailed, client.fetchRestoreOwner("http://owner", 22, "docs", request, .{}));
+            for ([_][]const u8{ "{\"code\":\"constraint_validation_failed\"}", "{\"protocol\":\"v2\",\"code\":\"constraint_validation_failed\"}", "{\"protocol\":\"restore-owner-error-v1\",\"code\":\"OutOfMemory\"}", "restore source integrity validation failed" }) |body| {
+                executor.body = body;
+                try std.testing.expectError(error.BackupIntegrityFailure, client.fetchRestoreOwner("http://owner", 22, "docs", request, .{}));
+            }
+            executor.body = "";
             executor.status = 503;
             try std.testing.expectError(error.RestoreValidationPending, client.fetchRestoreOwner("http://owner", 22, "docs", request, .{}));
             executor.status = 408;

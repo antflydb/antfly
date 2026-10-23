@@ -106,6 +106,7 @@ pub const Routes = struct {
     pub const fk_initial_child_suffix = "/fk-initial-child";
     pub const relational_index_claims_suffix = "/relational-index-claims";
     pub const relational_index_control_suffix = "/relational-index-control";
+    pub const schema_validation_prepare_suffix = "/schema-validation-prepare";
     pub const row_policy_install_suffix = "/row-policy-install";
     pub const restore_suffix = "/restore";
     pub const destination_authorization_suffix = "/destination-authorization";

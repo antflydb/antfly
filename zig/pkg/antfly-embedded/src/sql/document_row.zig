@@ -42,10 +42,11 @@ pub fn deriveColumns(alloc: std.mem.Allocator, schema: anytype) ![]const catalog
             const required = for (document.required_fields) |name| {
                 if (std.mem.eql(u8, name, property.name)) break true;
             } else false;
-            const nullable = !required or property.allows_null or property.field_type == null;
+            const nullable = !required or (kind != .json and (property.allows_null or property.field_type == null));
+            const null_is_absent = kind == .json or (!property.allows_null and property.field_type != null);
             const entry = try entries.getOrPut(alloc, property.name);
             if (!entry.found_existing) entry.value_ptr.* = .{
-                .column = .{ .name = property.name, .path = property.name, .type = kind, .element_type = element_type, .nullable = nullable },
+                .column = .{ .name = property.name, .path = property.name, .type = kind, .element_type = element_type, .nullable = nullable, .document_null_is_absent = null_is_absent },
                 .required_count = @intFromBool(!nullable),
             } else {
                 if (entry.value_ptr.column.type != kind or entry.value_ptr.column.element_type != element_type) {
@@ -54,6 +55,7 @@ pub fn deriveColumns(alloc: std.mem.Allocator, schema: anytype) ![]const catalog
                     entry.value_ptr.column.nullable = true;
                 }
                 entry.value_ptr.column.nullable = entry.value_ptr.column.nullable or nullable;
+                entry.value_ptr.column.document_null_is_absent = entry.value_ptr.column.document_null_is_absent or null_is_absent or entry.value_ptr.column.type == .json;
                 entry.value_ptr.required_count += @intFromBool(!nullable);
             }
         }
@@ -126,6 +128,29 @@ pub fn propertyType(property: anytype) ast.ColumnType {
     if (std.mem.eql(u8, name, "string") or std.mem.eql(u8, name, "text") or
         std.mem.eql(u8, name, "keyword") or std.mem.eql(u8, name, "html") or std.mem.eql(u8, name, "link")) return .string;
     return .json;
+}
+
+test "SQL document assignments distinguish absent SQL NULL nullable scalars and raw JSON null" {
+    const Property = struct { name: []const u8, field_type: ?[]const u8 = "keyword", format: ?[]const u8 = null, integer_only: bool = false, allows_null: bool = false };
+    const Document = struct { properties: []const Property, required_fields: []const []const u8 = &.{ "nullable", "json" } };
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const columns = try deriveColumns(a, .{ .document_schemas = &[_]Document{.{ .properties = &.{ .{ .name = "optional" }, .{ .name = "nullable", .allows_null = true }, .{ .name = "json", .field_type = "object", .allows_null = true } } }} });
+    var root = try std.json.parseFromSliceLeaky(Json, a, "{\"optional\":\"old\",\"nullable\":\"old\",\"json\":null,\"opaque\":null}", .{});
+    for (columns) |column| {
+        if (std.mem.eql(u8, column.name, "json")) {
+            try std.testing.expect(!column.nullable);
+            try column.assignStorageValue(a, &root.object, .null, false);
+        } else {
+            try std.testing.expect(column.nullable);
+            try column.assignStorageValue(a, &root.object, .null, true);
+        }
+    }
+    try std.testing.expect(!root.object.contains("optional"));
+    try std.testing.expect(root.object.get("nullable").? == .null);
+    try std.testing.expect(root.object.get("json").? == .null);
+    try std.testing.expect(root.object.get("opaque").? == .null);
 }
 
 test "SQL document version is native envelope metadata not a schema property" {

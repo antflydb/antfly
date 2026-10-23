@@ -31,9 +31,55 @@ const table_reads = @import("antfly_source_root").antfly_sources.table_reads;
 const table_writes = @import("antfly_source_root").antfly_sources.table_writes;
 const shard_state_store = @import("../data/storage/shard_state_store.zig");
 
+test "compiled schema apply control reads retained entries off progress and shuts down" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
+    defer a.free(path);
+    const projection_root = try std.fs.path.join(a, &.{ path, "projection" });
+    defer a.free(projection_root);
+    var store = try @import("data_raft_apply_client.zig").RaftApplyStore.init(a, .{ .root_dir = projection_root });
+    defer store.deinit();
+    const entries = try @import("../raft/state_machine/mod.zig").encodeCommittedEntries(a, &.{.{ .term = 3, .index = 1, .entry_type = .normal, .data = @constCast("opaque\x00\xff") }});
+    defer a.free(entries);
+    try store.applyBatch(81, 1, entries);
+    const before = (try store.latestBatch(81)).?;
+    for ([_]struct { group: u64, term: u64, expected: anyerror }{
+        .{ .group = 81, .term = 3, .expected = error.InvalidReplicatedBatch },
+        .{ .group = 81, .term = 4, .expected = error.ConflictingDataApplyBatch },
+        .{ .group = 82, .term = 3, .expected = error.SchemaValidationRuntimeRecoveryRequired },
+    }) |scenario| {
+        // No catalog or owner exists. Invalid/missing retained evidence must
+        // never become an empty successful apply or trigger catalog lookup.
+        var source = kernel_owner_source.ProvisionedKernelOwnerSource.init(a, path, table_catalog.emptyCatalogSource(), read_gate.alreadyReadSafeBarrier());
+        defer source.deinit();
+        _ = source.withSchemaEntryStore(&store);
+        try std.testing.expectError(error.RaftApplyWriterUnavailable, source.applyPreparedSchemaEntry(scenario.group, scenario.term, 1));
+        try source.startApplyControl(std.testing.io);
+        const limit = @import("antfly_platform").time.monotonicNs() + 5 * std.time.ns_per_s;
+        while (true) {
+            source.applyPreparedSchemaEntry(scenario.group, scenario.term, 1) catch |err| {
+                if (err == error.RaftApplyWriterUnavailable) {
+                    if (@import("antfly_platform").time.monotonicNs() >= limit) return error.TestSchemaControlDidNotComplete;
+                    try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+                    continue;
+                }
+                try std.testing.expectEqual(scenario.expected, err);
+                break;
+            };
+            return error.TestExpectedError;
+        }
+        source.retireSchemaApplyGroup(scenario.group);
+        try std.testing.expectEqual(before, (try store.latestBatch(81)).?);
+    }
+}
+
 test "native index owner adapter inspects cold native ownership and rejects foreign namespaces" {
     const alloc = std.testing.allocator;
     const local = @import("antfly_local_sources");
+    var checkpoint: []const u8 = "native ownership";
+    errdefer std.debug.print("owner source provenance checkpoint={s}\n", .{checkpoint});
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", alloc);
@@ -123,7 +169,7 @@ test "native index owner adapter inspects cold native ownership and rejects fore
         const schema = try owners.nativeSchemaOwnerObservationAtRoot(7501, "items", schema_binding, .{});
         try schema.observation.validateFor(schema_binding);
         try std.testing.expect(schema.observation.header == null and !schema.observation.replication_pending);
-        try std.testing.expectEqual(accepted_root_generation, schema.root_generation);
+        try std.testing.expectEqual(try local.storage_db_root_signing_identity.attestedRootGeneration(accepted_root_generation), schema.root_generation);
         if (physical_root != 0) try std.testing.expectEqual(physical_root, schema.observation.physical_root_incarnation);
         physical_root = schema.observation.physical_root_incarnation;
         // Valid synthetic signing data deliberately cannot turn a real
@@ -156,6 +202,10 @@ test "native index owner adapter inspects cold native ownership and rejects fore
         var stale_scope = signing_scope;
         stale_scope.physical_root_incarnation += 1;
         try std.testing.expectError(error.SchemaValidationRuntimeRecoveryRequired, owners.attestNativeSchemaOwnerAtRoot(7501, "items", schema_binding, stale_scope, signing_root, .{}));
+        const cancel: local.storage_db_relational_schema_owner_contract.Command = .{ .binding = schema_binding, .action = .cancel };
+        try std.testing.expectError(error.SchemaValidationRuntimeRecoveryRequired, owners.applyNativeSchemaOwnerControlAtRoot(7501, "items", cancel, 1, std.time.ns_per_s, .{ .root_generation = schema.root_generation + 1, .physical_root_incarnation = schema.observation.physical_root_incarnation }, .{}));
+        try std.testing.expectError(error.SchemaValidationRuntimeRecoveryRequired, owners.applyNativeSchemaOwnerControlAtRoot(7501, "items", cancel, 1, std.time.ns_per_s, .{ .root_generation = schema.root_generation, .physical_root_incarnation = schema.observation.physical_root_incarnation + 1 }, .{}));
+        try std.testing.expectEqualDeep(schema, try owners.nativeSchemaOwnerObservationAtRoot(7501, "items", schema_binding, .{}));
         var foreign_schema = schema_binding;
         foreign_schema.fence.namespace.range_id += 1;
         try std.testing.expectError(error.IdentityNamespaceMismatch, owners.nativeSchemaOwnerObservationAtRoot(7501, "items", foreign_schema, .{}));
@@ -175,6 +225,67 @@ test "native index owner adapter inspects cold native ownership and rejects fore
     var raft_owners = kernel_owner_source.ProvisionedKernelOwnerSource.init(alloc, raft_root, catalog.source(), read_gate.alreadyReadSafeBarrier());
     defer raft_owners.deinit();
     const empty = try raft_owners.raftIndexOwnerObservationAtRoot(alloc, 7501, "items", identity, .{});
+    var raft_schema_binding = schema_binding;
+    raft_schema_binding.authority = .raft;
+    const empty_schema = try raft_owners.raftSchemaOwnerObservationAtRoot(7501, "items", raft_schema_binding, .{});
+    try std.testing.expect(empty_schema.observation.header == null and empty_schema.observation.applied == null);
+    try std.testing.expect(empty_schema.observation.physical_root_incarnation != 0);
+    try std.testing.expectEqual(empty.root_generation, empty_schema.root_generation);
+    try std.testing.expectError(error.SchemaValidationJobChanged, raft_owners.raftSchemaOwnerObservationAtRoot(7501, "items", schema_binding, .{}));
+    try std.testing.expectError(error.SchemaValidationJobChanged, raft_owners.acquireRaftSchemaOwnerSession(7502, "items", raft_schema_binding, .{}));
+    var foreign_raft_schema = raft_schema_binding;
+    foreign_raft_schema.fence.namespace.range_id += 1;
+    try std.testing.expectError(error.IdentityNamespaceMismatch, raft_owners.acquireRaftSchemaOwnerSession(7501, "items", foreign_raft_schema, .{}));
+    {
+        var canceled = std.atomic.Value(bool).init(false);
+        const context: local.api_operation.RequestContext = .{ .cancellation = local.api_operation.CancellationToken.fromAtomic(&canceled) };
+        var schema_session = try raft_owners.acquireRaftSchemaOwnerSession(7501, "items", raft_schema_binding, context);
+        defer schema_session.deinit();
+        try std.testing.expectEqualDeep(empty_schema, schema_session.initial);
+        try std.testing.expectEqualDeep(empty_schema, try schema_session.observe());
+        schema_session.releaseForApply();
+        try std.testing.expectEqual(@as(usize, 1), raft_owners.retireTable("items"));
+        try schema_session.reacquireAfterApply();
+        try std.testing.expectEqualDeep(empty_schema, try schema_session.recoverCommitted());
+        canceled.store(true, .release);
+        try std.testing.expectError(error.Canceled, schema_session.observe());
+        // An already-leased read of durable facts survives request cancellation;
+        // it does not mint an entry/receipt for this actually empty Raft owner.
+        try std.testing.expectEqualDeep(empty_schema, try schema_session.recoverCommitted());
+        schema_session.releaseForApply();
+        try std.testing.expectError(error.Canceled, schema_session.reacquireAfterApply());
+        canceled.store(false, .release);
+        // Exercise the provenance guards independently. These altered retained
+        // identities are negative fixtures, not evidence of root adoption.
+        schema_session.initial.root_generation += 1;
+        checkpoint = "empty owner retained generation mismatch";
+        try std.testing.expectError(error.SchemaValidationRuntimeRecoveryRequired, schema_session.reacquireAfterApply());
+        schema_session.initial.root_generation -= 1;
+        schema_session.initial.observation.physical_root_incarnation += 1;
+        checkpoint = "empty owner retained physical root mismatch";
+        try std.testing.expectError(error.SchemaValidationRuntimeRecoveryRequired, schema_session.reacquireAfterApply());
+        schema_session.initial.observation.physical_root_incarnation -= 1;
+        try schema_session.reacquireAfterApply();
+        try std.testing.expectEqualDeep(empty_schema, try schema_session.observe());
+        const attestation = @import("../metadata/schema_validation_attestation.zig");
+        const seed: [32]u8 = @splat(9);
+        const pair = try std.crypto.sign.Ed25519.KeyPair.generateDeterministic(seed);
+        const signing_root: local.storage_db_root_signing_identity.State = .{ .seed = seed, .root_incarnation = 7, .public_key = pair.public_key.toBytes() };
+        const scope: attestation.RaftScope = .{
+            .metadata_incarnation = "61616161616161616161616161616161".*,
+            .binding_digest = try attestation.bindingDigest(raft_schema_binding),
+            .identity = .{ .metadata_incarnation = "61616161616161616161616161616161".*, .node_id = 2, .store_id = 3, .root_incarnation = 7, .public_key = signing_root.public_key },
+            .reporter_incarnation = 4,
+            .replica_id = 5,
+            .group_id = 7501,
+            .root_generation = empty_schema.root_generation,
+            .physical_root_incarnation = empty_schema.observation.physical_root_incarnation,
+            .reported_term = 1,
+            .reported_applied_index = 1,
+        };
+        try std.testing.expectError(error.InvalidControlReceiptPosition, schema_session.attest(scope, signing_root));
+        try std.testing.expectError(error.InvalidControlReceiptPosition, raft_owners.attestRaftSchemaOwnerAtRoot(7501, "items", raft_schema_binding, scope, signing_root, .{}));
+    }
     try std.testing.expectError(error.OnlineSourceScopeChanged, raft_owners.nativeSchemaOwnerObservationAtRoot(7501, "items", schema_binding, .{}));
     try std.testing.expect(empty.observation.binding == null and empty.observation.applied == null);
     try std.testing.expectEqual(try local.storage_db_root_signing_identity.attestedRootGeneration(table_reads.backend_current_root_generation), empty.root_generation);
@@ -209,6 +320,867 @@ test "native index owner adapter inspects cold native ownership and rejects fore
     session.root_generation -= 1;
     try session.reacquireAfterApply();
     try std.testing.expectEqualDeep(empty, try session.observe(alloc));
+
+    // The trusted committed-entry driver below exercises the real prepared
+    // schema ticket, not metadata admission or fabricated publication authority.
+    // Its ticket retains the owner even after the submitting session releases.
+    {
+        const schema_root = try std.fs.path.join(alloc, &.{ root, "schema-ticket" });
+        defer alloc.free(schema_root);
+        const seed_path = try std.fs.path.join(alloc, &.{ schema_root, "group-7501", "table-db" });
+        defer alloc.free(seed_path);
+        const tightened =
+            \\{"version":2,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer","nullable":false}},"required":["id"],"additionalProperties":false}}}}
+        ;
+        const inputs = try local.storage_db_relational_schema_owner_contract.encodeInputs(alloc, .{ before_json, tightened, prior.value, "[\"id\"]" });
+        defer alloc.free(inputs);
+        const actual_binding = binding: {
+            var seed = try @import("kernel_owner_client.zig").Owner.open(.{ .path = .fromSlice(seed_path), .table_name = .fromSlice("items"), .group_id = 7501, .lsm_root_generation = table_reads.backend_current_root_generation, .has_identity_namespace = 1, .identity_table_id = 101, .identity_shard_id = 7501, .identity_range_id = 7501, .online_source_authority = 1, .schema_json = .fromSlice(before_json), .indexes_json = .fromSlice("{}") });
+            defer seed.deinit();
+            const lookup = try table_reads.encodeStorageKernelLookupRequest(alloc, "", .{ .relational_topology_json = "{\"mode\":\"identity\"}" });
+            defer alloc.free(lookup);
+            var observed = try seed.lookupJson("items", lookup);
+            defer observed.deinit();
+            var topology = try std.json.parseFromSlice(local.storage_db_relational_integrity_topology_contract.Identity, alloc, observed.bytes(), .{});
+            defer topology.deinit();
+            const schema_prepared_cut = try seed.schemaOwnerPreparation("items", .{ .id = @splat(21), .provisional_plan = @splat(22), .fence = .{ .role = .schema_validation, .transition_id = 23, .attempt = 1, .admission_epoch = topology.value.next_epoch, .owner_group_id = 7501, .peer_group_id = 7501, .namespace = identity.namespace, .catalog_digest = topology.value.catalog_digest }, .authority = .raft }, inputs, .{});
+            break :binding schema_prepared_cut.binding;
+        };
+        var source = kernel_owner_source.ProvisionedKernelOwnerSource.init(alloc, schema_root, catalog.source(), read_gate.alreadyReadSafeBarrier());
+        defer source.deinit();
+        var canceled = std.atomic.Value(bool).init(false);
+        var control = try source.acquireRaftSchemaOwnerSession(7501, "items", actual_binding, .{ .cancellation = local.api_operation.CancellationToken.fromAtomic(&canceled) });
+        defer control.deinit();
+        const bootstrap_root = try local.storage_db_root_signing_identity.loadOrCreate(alloc, std.testing.io, schema_root);
+        const bootstrap_scope: @import("../metadata/schema_validation_attestation.zig").RaftScope = .{
+            .metadata_incarnation = "61616161616161616161616161616161".*,
+            .binding_digest = try @import("../metadata/schema_validation_attestation.zig").bindingDigest(actual_binding),
+            .identity = .{ .metadata_incarnation = "61616161616161616161616161616161".*, .node_id = 2, .store_id = 3, .root_incarnation = bootstrap_root.root_incarnation, .public_key = bootstrap_root.public_key },
+            .reporter_incarnation = 4,
+            .replica_id = 5,
+            .group_id = 7501,
+            .root_generation = control.initial.root_generation,
+            .physical_root_incarnation = control.initial.observation.physical_root_incarnation,
+            .reported_term = 2,
+            .reported_applied_index = 2,
+        };
+        const bootstrap_descriptor: local.storage_db_relational_schema_owner_contract.PreparationDescriptor = .{ .id = actual_binding.id, .provisional_plan = actual_binding.plan_digest, .fence = actual_binding.fence, .authority = .raft };
+        // The native preparation has no data-entry clock/header. The runtime
+        // barrier is a fixture here, not a simulated Raft quorum; production
+        // wiring uses DataServer's actual shared-prefix certifier.
+        try std.testing.expect(control.initial.observation.applied == null);
+        try std.testing.expectError(error.ReadSafetyBarrierUnavailable, source.attestSchemaBootstrapAtRoot(7501, "items", bootstrap_descriptor, inputs, bootstrap_scope, bootstrap_root, .{}));
+        const BootstrapBarrier = struct {
+            calls: usize = 0,
+            fn wait(_: *anyopaque, _: u64, _: []const u8) !void {}
+            fn certify(ptr: *anyopaque, group: u64, term: u64, minimum: u64, _: ?u64, _: local.api_operation.CancellationToken) !read_gate.ReadSafetyBarrier.FrozenProof {
+                const self: *@This() = @ptrCast(@alignCast(ptr));
+                try std.testing.expectEqual(@as(u64, 7501), group);
+                try std.testing.expectEqual(@as(u64, 2), term);
+                try std.testing.expectEqual(@as(u64, 2), minimum);
+                self.calls += 1;
+                return .{ .incarnation = 91, .term = 2, .applied_index = 3 };
+            }
+        };
+        var bootstrap_barrier: BootstrapBarrier = .{};
+        const original_barrier = source.read_safety_barrier;
+        source.read_safety_barrier = .{ .ptr = &bootstrap_barrier, .vtable = &.{ .wait_read_safe = BootstrapBarrier.wait, .certify_completed_prefix = BootstrapBarrier.certify } };
+        const certified = try source.attestSchemaBootstrapAtRoot(7501, "items", bootstrap_descriptor, inputs, bootstrap_scope, bootstrap_root, .{});
+        try certified.verify(bootstrap_scope);
+        try std.testing.expect(certified.preparation.value.position == null);
+        try std.testing.expectEqual(@as(usize, 1), bootstrap_barrier.calls);
+        source.read_safety_barrier = original_barrier;
+        {
+            const before_capture = try source.schemaOwnerStateAtRoot(7501, "items", .{});
+            var captured = try source.captureSchemaPreparationAtRoot(alloc, 7501, "items", .{ .id = actual_binding.id, .provisional_plan = actual_binding.plan_digest, .transition_id = actual_binding.fence.transition_id, .namespace = actual_binding.fence.namespace }, before_json, tightened, &.{"id"}, .{ .identity = bootstrap_scope.identity, .reporter_incarnation = bootstrap_scope.reporter_incarnation, .authority = .{ .raft = bootstrap_scope.replica_id } }, bootstrap_root, .{});
+            defer captured.deinit();
+            try std.testing.expectEqualSlices(u8, inputs, captured.inputs);
+            try std.testing.expectEqualDeep(actual_binding, captured.signed.value.binding);
+            try std.testing.expect(captured.signed.value.position == null);
+            try captured.signed.verifyFor(actual_binding, before_capture.state.physical_root_incarnation);
+            try std.testing.expectEqualDeep(before_capture, try source.schemaOwnerStateAtRoot(7501, "items", .{}));
+            {
+                const builder = @import("../api/schema_validation_plan_builder.zig");
+                const manager = @import("../metadata/table_manager.zig");
+                const before = (try Catalog.snapshot(&catalog)).tables[0];
+                const after = try @import("../api/tables.zig").prepareNullabilityPublicationRecord(alloc, &before, &.{"id"});
+                defer manager.freeTable(alloc, after);
+                const guard: local.system_catalog_domain.RelationMutationGuard = .{ .target = .{ .name = "items" }, .logical_table = "items", .owner = .{ .table_id = 101, .schema_version = 1, .schema_digest = local.storage_db_relational_schema_owner_contract.hash(before.schema_json), .kind = .table }, .incarnation = @splat(0x61) };
+                const cut: @import("../metadata/schema_validation_admission.zig").Cut = .{ .metadata_group_id = 21, .metadata_incarnation = bootstrap_scope.metadata_incarnation, .table_guard = guard, .before = before, .after = after, .ranges = &.{.{ .range_id = 7501, .table_id = 101, .group_id = 7501, .start_key = "", .end_key = null }}, .authority = .raft };
+                const Owners = struct {
+                    source: *kernel_owner_source.ProvisionedKernelOwnerSource,
+                    signer: kernel_owner_source.ProvisionedKernelOwnerSource.SchemaPreparationSigner,
+                    root: local.storage_db_root_signing_identity.State,
+                    calls: usize = 0,
+                    pub fn prepare(self: *@This(), a: std.mem.Allocator, group: u64, table: []const u8, query: @import("../api/schema_validation_preparation.zig").Request, context: local.api_operation.RequestContext) ![]u8 {
+                        self.calls += 1;
+                        var value = try self.source.captureSchemaPreparationAtRoot(a, group, table, .{ .id = query.id, .provisional_plan = query.provisional_plan, .transition_id = query.transition_id, .namespace = query.namespace }, query.before_schema, query.after_schema, query.columns, self.signer, self.root, context);
+                        defer value.deinit();
+                        return @import("../api/schema_validation_preparation.zig").encode(a, value.signed, value.inputs);
+                    }
+                };
+                var actual_owners: Owners = .{ .source = &source, .signer = .{ .identity = bootstrap_scope.identity, .reporter_incarnation = bootstrap_scope.reporter_incarnation, .authority = .{ .raft = bootstrap_scope.replica_id } }, .root = bootstrap_root };
+                const context: local.api_operation.RequestContext = .{ .setting_admin = true, .schema_validation_authority = true };
+                var built = try builder.build(&actual_owners, alloc, std.testing.io, context, cut, .{ .guard = guard, .columns = &.{"id"} });
+                defer built.deinit();
+                try std.testing.expectEqual(@as(usize, 1), actual_owners.calls);
+                try std.testing.expectEqualDeep(before_capture, try source.schemaOwnerStateAtRoot(7501, "items", .{}));
+                var command = try @import("../metadata/schema_validation_ledger.zig").parseCommand(alloc, built.command);
+                defer command.deinit();
+                try std.testing.expectEqual(@as(usize, 1), command.value.begin.inputs.len);
+                try std.testing.expectEqual(@as(usize, 1), command.value.begin.preparations.len);
+                try command.value.begin.preparations[0].verifyFor(built.prepared.owners[0].binding, before_capture.state.physical_root_incarnation);
+                try std.testing.expectEqual(built.lookup.plan_digest, try command.value.begin.plan.digest());
+                try std.testing.expectEqualDeep(built.lookup, try @import("../api/schema_validation_recovery.zig").Token.decode(&built.recovery_token));
+                try std.testing.expect(command.value.begin.plan.before.schema_json.ptr != before.schema_json.ptr);
+                try std.testing.expectError(error.Forbidden, builder.build(&actual_owners, alloc, std.testing.io, .{}, cut, .{ .guard = guard, .columns = &.{"id"} }));
+                try std.testing.expectEqual(@as(usize, 1), actual_owners.calls);
+                try std.testing.expectError(error.DeadlineExceeded, builder.build(&actual_owners, alloc, std.testing.io, .{ .setting_admin = true, .schema_validation_authority = true, .deadline_ns = 0 }, cut, .{ .guard = guard, .columns = &.{"id"} }));
+                var foreign = cut;
+                foreign.authority = .native;
+                try std.testing.expectError(error.SchemaValidationJobChanged, builder.build(&actual_owners, alloc, std.testing.io, context, foreign, .{ .guard = guard, .columns = &.{"id"} }));
+                try std.testing.expectEqualDeep(before_capture, try source.schemaOwnerStateAtRoot(7501, "items", .{}));
+            }
+            const transport = @import("../api/schema_validation_preparation.zig");
+            var request: transport.Request = .{ .group_id = 7501, .metadata_incarnation = bootstrap_scope.metadata_incarnation, .id = actual_binding.id, .provisional_plan = actual_binding.plan_digest, .transition_id = actual_binding.fence.transition_id, .namespace = actual_binding.fence.namespace, .before_schema = before_json, .after_schema = tightened, .columns = &.{"id"} };
+            const frame = try transport.encode(alloc, captured.signed, captured.inputs);
+            defer alloc.free(frame);
+            const decoded = try transport.decode(frame);
+            try decoded.requireFor(7501, request);
+            try std.testing.expectEqualSlices(u8, captured.inputs, decoded.inputs);
+            const Http = @import("../raft/transport/http_common.zig");
+            const Executor = struct {
+                frame: []const u8,
+                calls: usize = 0,
+                mode: enum { valid, wrong_media, lost_reply } = .valid,
+                fn execute(ptr: *anyopaque, a: std.mem.Allocator, req: Http.HttpRequest) !Http.HttpResponse {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    self.calls += 1;
+                    try std.testing.expectEqual(Http.Method.POST, req.method);
+                    try std.testing.expect(std.mem.endsWith(u8, req.uri, "/schema-validation-prepare"));
+                    try std.testing.expect(std.mem.indexOf(u8, req.uri, "items%2Fquoted") != null);
+                    try std.testing.expect(req.header(@import("../api/internal_service_auth.zig").header_name) != null);
+                    try std.testing.expect(req.header(transport.remaining_ms_header) != null);
+                    try std.testing.expectEqual(@as(?usize, transport.max_response_bytes), req.max_response_bytes);
+                    if (self.mode == .lost_reply) return error.ConnectionResetByPeer;
+                    const mime = try a.dupe(u8, if (self.mode == .wrong_media) "text/plain" else "application/octet-stream");
+                    errdefer a.free(mime);
+                    return .{ .status = 200, .content_type = mime, .body = try a.dupe(u8, self.frame) };
+                }
+            };
+            var executor: Executor = .{ .frame = frame };
+            var http = @import("../api/http_client.zig").ApiHttpClient.init(alloc, .{ .ptr = &executor, .vtable = &.{ .execute = Executor.execute } });
+            _ = http.withInternalServiceAuth("schema-preparation-test-secret", "schema-test");
+            {
+                var response = try http.fetchSchemaValidationPreparation("http://owner", 7501, "items/quoted", request, .{});
+                defer response.deinit();
+                try std.testing.expectEqualSlices(u8, captured.inputs, response.value.inputs);
+                try std.testing.expectEqualDeep(captured.signed, response.value.signed);
+            }
+            executor.mode = .wrong_media;
+            try std.testing.expectError(error.InvalidSchemaValidationJob, http.fetchSchemaValidationPreparation("http://owner", 7501, "items/quoted", request, .{}));
+            const before_loss = executor.calls;
+            executor.mode = .lost_reply;
+            try std.testing.expectError(error.ConnectionResetByPeer, http.fetchSchemaValidationPreparation("http://owner", 7501, "items/quoted", request, .{}));
+            try std.testing.expectEqual(before_loss + 1, executor.calls);
+            try std.testing.expectError(error.OutOfMemory, transport.encode(std.testing.failing_allocator, captured.signed, captured.inputs));
+            frame[frame.len - 1] ^= 1;
+            try std.testing.expectError(error.InvalidSchemaValidationJob, transport.decode(frame));
+            frame[frame.len - 1] ^= 1;
+            const omitted = try transport.encode(alloc, captured.signed, "");
+            defer alloc.free(omitted);
+            const compact = try transport.decode(omitted);
+            try std.testing.expectError(error.SchemaValidationJobChanged, compact.requireFor(7501, request));
+            const known = [_][32]u8{actual_binding.inputs};
+            request.known_inputs = &known;
+            try compact.requireFor(7501, request);
+            try std.testing.expect(omitted.len < frame.len);
+            request.before_schema = "{}";
+            try std.testing.expectError(error.SchemaValidationJobChanged, compact.requireFor(7501, request));
+            // Cohort commitment is formed AFTER these physical preparations.
+            // The established signature contract deliberately normalizes only
+            // that provisional digest, avoiding a second native compilation.
+            var final_binding = actual_binding;
+            final_binding.plan_digest = @splat(121);
+            try captured.signed.verifyFor(final_binding, before_capture.state.physical_root_incarnation);
+            final_binding.after_schema[0] ^= 1;
+            try std.testing.expectError(error.SchemaValidationJobChanged, captured.signed.verifyFor(final_binding, before_capture.state.physical_root_incarnation));
+        }
+        const command: local.storage_db_relational_schema_owner_contract.Command = .{ .binding = actual_binding, .action = .begin, .payload = inputs };
+        var foreign_command = command;
+        foreign_command.binding.id = @splat(24);
+        const foreign_bytes = try foreign_command.encodeRaft(alloc);
+        defer alloc.free(foreign_bytes);
+        try std.testing.expectError(error.SchemaValidationJobChanged, control.prepareCommitted(foreign_bytes, 1, 1));
+        const bytes = try command.encodeRaft(alloc);
+        var bytes_live = true;
+        defer if (bytes_live) alloc.free(bytes);
+        var ticket = try control.prepareCommitted(bytes, 1, 1);
+        var ticket_live = true;
+        defer if (ticket_live) ticket.deinit();
+        try std.testing.expectError(error.StorageBusy, control.prepareCommitted(bytes, 1, 1));
+        alloc.free(bytes); // no borrowed committed-entry payload in the ticket
+        bytes_live = false;
+        control.releaseForApply();
+        canceled.store(true, .release);
+        try std.testing.expectError(error.DeadlineExceeded, ticket.apply(.{ .execution_deadline_ns = 0 }));
+        try std.testing.expect((try ticket.observeCommitted()).observation.header == null);
+        try ticket.apply(.{});
+        try ticket.apply(.{}); // exact durable term/index retry
+        const applied = try ticket.observeCommitted();
+        try std.testing.expectEqualDeep(actual_binding, applied.observation.header.?.binding);
+        try std.testing.expectEqual(.fencing, applied.observation.header.?.phase);
+        try std.testing.expectEqual(@as(u64, 1), applied.observation.applied.?.index);
+        try std.testing.expectEqual(@as(u64, 1), applied.observation.applied.?.term);
+        try std.testing.expectEqual(control.initial.observation.physical_root_incarnation, applied.observation.physical_root_incarnation);
+        ticket.deinit();
+        ticket_live = false;
+        // BEGIN has durably installed its topology fence. Preparation must
+        // refuse that fence before it could certify an empty/beginning owner.
+        try std.testing.expectError(error.IntegrityTopologyBusy, source.attestSchemaBootstrapAtRoot(7501, "items", bootstrap_descriptor, inputs, bootstrap_scope, bootstrap_root, .{}));
+        // The preparation is destroyed before its owner can retire. Reopen
+        // independently and recover the same real phase/entry/root, not a flag.
+        try std.testing.expectEqual(@as(usize, 1), source.retireTable("items"));
+        canceled.store(false, .release);
+        try control.reacquireAfterApply();
+        try std.testing.expectEqualDeep(applied, try control.recoverCommitted());
+        {
+            var proposal = try control.prepareProposal(.reconcile_transactions, 1, std.time.ns_per_s);
+            defer proposal.deinit();
+            try std.testing.expectEqual(applied.observation.physical_root_incarnation, proposal.physical_root_incarnation);
+            try std.testing.expectEqualDeep(applied, try control.recoverCommitted());
+            control.initial.root_generation += 1;
+            try std.testing.expectError(error.SchemaValidationRuntimeRecoveryRequired, control.prepareProposal(.reconcile_transactions, 1, std.time.ns_per_s));
+            control.initial.root_generation -= 1;
+        }
+        const recovered_state = try source.schemaOwnerStateAtRoot(7501, "items", .{});
+        try std.testing.expectEqual(applied.root_generation, recovered_state.root_generation);
+        try std.testing.expectEqual(applied.observation.physical_root_incarnation, recovered_state.state.physical_root_incarnation);
+        try std.testing.expectEqualDeep(applied.observation.header, recovered_state.state.header);
+        try std.testing.expectEqualDeep(actual_binding.fence.namespace, recovered_state.state.namespace);
+        {
+            const audit_key = try local.storage_db_root_signing_identity.loadOrCreate(alloc, std.testing.io, schema_root);
+            // The runtime discovers a cold owner before it knows the job and
+            // probes its native continuation before downloading immutable ASVI.
+            const cold_probe = try source.stepSchemaOwnerAuditAtRoot(7501, "items", actual_binding, "", audit_key, .{ .records = 1 }, .{});
+            try std.testing.expectEqual(.needs_inputs, std.meta.activeTag(cold_probe.result));
+            try std.testing.expectEqualDeep(applied, try control.recoverCommitted());
+            try std.testing.expectError(error.InvalidSchemaValidationJob, source.stepSchemaOwnerAuditAtRoot(7501, "items", actual_binding, "wrong-inputs", audit_key, .{}, .{}));
+            const changed_inputs = try local.storage_db_relational_schema_owner_contract.encodeInputs(alloc, .{ before_json, tightened, "different-catalog", "[\"id\"]" });
+            defer alloc.free(changed_inputs);
+            try std.testing.expectError(error.SchemaValidationJobChanged, source.stepSchemaOwnerAuditAtRoot(7501, "items", actual_binding, changed_inputs, audit_key, .{}, .{}));
+            var audited = false;
+            for (0..64) |iteration| {
+                // All later slices borrow the DB-owned snapshot/input state;
+                // no request-owned input bytes survive the initial call.
+                const turn = try source.stepSchemaOwnerAuditAtRoot(7501, "items", actual_binding, if (iteration == 0) inputs else "", audit_key, .{ .records = 1, .time_ns = std.time.ns_per_s }, .{});
+                try std.testing.expectEqual(applied.root_generation, turn.root_generation);
+                try std.testing.expect(turn.result != .needs_inputs);
+                if (turn.result == .complete) {
+                    const image = turn.result.complete;
+                    try image.verify(audit_key.public_key);
+                    try std.testing.expectEqual(applied.observation.physical_root_incarnation, image.value.physical_root);
+                    try std.testing.expectEqualDeep(applied.observation.header.?, image.value.rows.header);
+                    try std.testing.expectEqual(.none, image.value.rows.coverage);
+                    audited = true;
+                    break;
+                }
+            }
+            try std.testing.expect(audited);
+            try std.testing.expectEqualDeep(applied, try control.recoverCommitted());
+            // Cancellation cannot turn a resident continuation into authority,
+            // nor may it destroy progress needed by a subsequent clean slice.
+            canceled.store(true, .release);
+            try std.testing.expectError(error.Canceled, source.schemaOwnerStateAtRoot(7501, "items", .{ .cancellation = .fromAtomic(&canceled) }));
+            try std.testing.expectError(error.Canceled, source.stepSchemaOwnerAuditAtRoot(7501, "items", actual_binding, "", audit_key, .{}, .{ .cancellation = .fromAtomic(&canceled) }));
+            canceled.store(false, .release);
+            const resumed = try source.stepSchemaOwnerAuditAtRoot(7501, "items", actual_binding, "", audit_key, .{}, .{});
+            try std.testing.expectEqual(.complete, std.meta.activeTag(resumed.result));
+            try resumed.result.complete.verify(audit_key.public_key);
+            // Drop every current source lease before the real owner closes.
+            // The signed checkpoint is durable; the resident cache is not.
+            control.releaseForApply();
+            try std.testing.expectEqual(@as(usize, 1), source.retireTable("items"));
+            try control.reacquireAfterApply();
+            const cold_state = try source.schemaOwnerStateAtRoot(7501, "items", .{});
+            try std.testing.expectEqualDeep(recovered_state, cold_state);
+            const cold_again = try source.stepSchemaOwnerAuditAtRoot(7501, "items", actual_binding, "", audit_key, .{}, .{});
+            try std.testing.expect(cold_again.result == .needs_inputs);
+            var recovered_audit = false;
+            for (0..64) |iteration| {
+                const turn = try source.stepSchemaOwnerAuditAtRoot(7501, "items", actual_binding, if (iteration == 0) inputs else "", audit_key, .{ .records = 1, .time_ns = std.time.ns_per_s }, .{});
+                try std.testing.expect(turn.result != .needs_inputs);
+                if (turn.result == .complete) {
+                    try turn.result.complete.verify(audit_key.public_key);
+                    try std.testing.expectEqualDeep(resumed.result.complete.value.rows, turn.result.complete.value.rows);
+                    recovered_audit = true;
+                    break;
+                }
+            }
+            try std.testing.expect(recovered_audit);
+        }
+        {
+            // Real retained kernel observation plus a runtime barrier fixture:
+            // a completed no-op does not rewrite the durable data entry (1,1).
+            const attestation = @import("../metadata/schema_validation_attestation.zig");
+            const Barrier = struct {
+                captures: usize = 0,
+                validations: usize = 0,
+                fail: bool = false,
+                reject_frozen: bool = false,
+                certifications: usize = 0,
+                expected_minimum: u64 = 2,
+                fn wait(_: *anyopaque, _: u64, _: []const u8) !void {}
+                fn capture(ptr: *anyopaque, group: u64) !read_gate.ReadSafetyBarrier.FrozenProof {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    try std.testing.expectEqual(@as(u64, 7501), group);
+                    self.captures += 1;
+                    return .{ .incarnation = 91, .term = 2, .applied_index = 2 };
+                }
+                fn validate(ptr: *anyopaque, group: u64, proof: read_gate.ReadSafetyBarrier.FrozenProof, _: ?u64, _: local.api_operation.CancellationToken) !void {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    try std.testing.expectEqual(@as(u64, 7501), group);
+                    try std.testing.expectEqualDeep(read_gate.ReadSafetyBarrier.FrozenProof{ .incarnation = 91, .term = 2, .applied_index = 2 }, proof);
+                    self.validations += 1;
+                    if (self.fail) return error.NotLeader;
+                    if (self.reject_frozen) return error.ReadUnavailable;
+                }
+                fn certify(ptr: *anyopaque, group: u64, term: u64, minimum: u64, _: ?u64, _: local.api_operation.CancellationToken) !read_gate.ReadSafetyBarrier.FrozenProof {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    try std.testing.expectEqual(@as(u64, 7501), group);
+                    try std.testing.expectEqual(@as(u64, 2), term);
+                    try std.testing.expectEqual(self.expected_minimum, minimum);
+                    self.certifications += 1;
+                    if (self.fail) return error.NotLeader;
+                    return .{ .incarnation = 91, .term = 2, .applied_index = 3 };
+                }
+            };
+            var barrier: Barrier = .{};
+            const previous = source.read_safety_barrier;
+            defer source.read_safety_barrier = previous;
+            source.read_safety_barrier = .{ .ptr = &barrier, .vtable = &.{ .wait_read_safe = Barrier.wait, .capture_frozen = Barrier.capture, .validate_frozen = Barrier.validate } };
+            const pair = try std.crypto.sign.Ed25519.KeyPair.generateDeterministic(@splat(9));
+            const root_key: local.storage_db_root_signing_identity.State = .{ .seed = @splat(9), .root_incarnation = 7, .public_key = pair.public_key.toBytes() };
+            const scope: attestation.RaftScope = .{
+                .metadata_incarnation = "61616161616161616161616161616161".*,
+                .binding_digest = try attestation.bindingDigest(actual_binding),
+                .identity = .{ .metadata_incarnation = "61616161616161616161616161616161".*, .node_id = 2, .store_id = 3, .root_incarnation = 7, .public_key = root_key.public_key },
+                .reporter_incarnation = 4,
+                .replica_id = 5,
+                .group_id = 7501,
+                .root_generation = applied.root_generation,
+                .physical_root_incarnation = applied.observation.physical_root_incarnation,
+                .reported_term = 2,
+                .reported_applied_index = 2,
+            };
+            const signed = try control.attest(scope, root_key);
+            try signed.verify(scope);
+            try std.testing.expectEqualDeep(applied.observation.applied, signed.rooted.observation.applied);
+            try std.testing.expectEqual(@as(u64, 2), signed.rooted.completed.?.applied_index);
+            try std.testing.expectEqual(@as(usize, 1), barrier.captures);
+            try std.testing.expectEqual(@as(usize, 1), barrier.validations);
+            var actual_data_scope = scope;
+            actual_data_scope.reported_applied_index = 1;
+            const fast = try control.attest(actual_data_scope, root_key);
+            try fast.verify(actual_data_scope);
+            try std.testing.expect(fast.rooted.completed == null);
+            try std.testing.expectError(error.ReadSafetyBarrierUnavailable, control.attestCompleted(actual_data_scope, root_key));
+            try std.testing.expectEqual(@as(usize, 1), barrier.captures);
+            try std.testing.expectEqual(@as(usize, 1), barrier.validations);
+            barrier.fail = true;
+            {
+                // Adapter qualification, not a native-stream/SQL activation
+                // claim: a real checkpoint owns an opaque fixture payload and
+                // the actual compiled owner's immutable header/root identity.
+                // Native writer/receiver byte proofs have their own archive gate.
+                barrier.fail = false;
+                defer barrier.fail = true;
+                const payloads = @import("../raft/storage/snapshot_payload_store.zig");
+                const retention = @import("../raft/storage/snapshot_retention_source.zig");
+                const wire = local.storage_db_native_raft_snapshot_contract;
+                const storage = @import("../raft/storage/mod.zig");
+                const parent_root = try std.fs.path.join(alloc, &.{ schema_root, "retained-parent" });
+                defer alloc.free(parent_root);
+                var layout = try storage.ReplicaPathLayout.initForReplica(alloc, parent_root, 7501, 5);
+                defer layout.deinit(alloc);
+                var persisted = try storage.PersistentReplicaState.init(alloc, layout);
+                defer persisted.deinit();
+                try persisted.groupStorage().persistReady(7501, .{
+                    .entries = &.{.{ .index = 1, .term = 1, .data = @constCast("entry") }},
+                    .hard_state = .{ .current_term = 1, .commit_index = 1 },
+                });
+                const header_bytes = try applied.observation.header.?.encode(alloc);
+                defer alloc.free(header_bytes);
+                const witness: wire.MaterializationWitness = .{
+                    .native_offset = 0,
+                    .native_size = 128,
+                    .stream = .{
+                        .identity = .{ .group_id = 7501, .namespace = local.storage_db_online_source_contract.namespaceBytes(actual_binding.fence.namespace), .through_index = 1, .native_term = 1, .native_index = 1, .origin = .{ .physical_root_incarnation = applied.observation.physical_root_incarnation, .namespace = actual_binding.fence.namespace, .authority = .{ .kind = .raft, .namespace = local.storage_db_online_source_contract.namespaceBytes(actual_binding.fence.namespace) }, .applied = .{ .term = applied.observation.applied.?.term, .index = applied.observation.applied.?.index }, .schema_header = local.storage_db_relational_schema_owner_contract.hash(header_bytes), .transaction_directory = null, .schema_outcomes = null }, .schema_header = applied.observation.header },
+                        .footer_digest = @splat(31),
+                    },
+                };
+                const manifest = try std.json.Stringify.valueAlloc(alloc, witness, .{});
+                defer alloc.free(manifest);
+                const spool = try std.fs.path.join(alloc, &.{ parent_root, "spool" });
+                defer alloc.free(spool);
+                const fixture_bytes: [128]u8 = @splat('a');
+                try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = spool, .data = &fixture_bytes });
+                const artifact = try @import("../raft/storage/file_snapshot_artifact.zig").FileSnapshotArtifact.createWithApplicationManifest(alloc, std.testing.io, spool, fixture_bytes.len, manifest);
+                defer artifact.deinit();
+                try persisted.groupStorage().compactSnapshotArtifact(alloc, 7501, .{ .index = 1, .term = 1 }, artifact, 1);
+                const Retainer = struct {
+                    state: *storage.PersistentReplicaState,
+                    tamper: bool = false,
+                    legacy: bool = false,
+                    calls: usize = 0,
+                    reopens: usize = 0,
+                    fn reopen(ptr: *anyopaque, a: std.mem.Allocator, request: retention.Request, _: local.api_operation.RequestContext) !retention.RetainedReader {
+                        const self: *@This() = @ptrCast(@alignCast(ptr));
+                        self.reopens += 1;
+                        return payloads.openRetained(a, std.testing.io, self.state.layout.snapshot_dir, request.reference, .{ .index = request.index, .term = request.term });
+                    }
+                    fn retain(ptr: *anyopaque, a: std.mem.Allocator, request: retention.Request, _: local.api_operation.RequestContext) !retention.RetainedSnapshot {
+                        const self: *@This() = @ptrCast(@alignCast(ptr));
+                        self.calls += 1;
+                        var result = try self.state.retainPublishedSnapshotAlloc(a, .{ .index = request.index, .term = request.term }, request.reference);
+                        errdefer result.deinit(a);
+                        if (self.legacy) {
+                            a.free(result.application_manifest);
+                            result.application_manifest = &.{};
+                            return result;
+                        }
+                        if (self.tamper) {
+                            var arena = std.heap.ArenaAllocator.init(a);
+                            defer arena.deinit();
+                            var changed = try std.json.parseFromSliceLeaky(wire.MaterializationWitness, arena.allocator(), result.application_manifest, .{});
+                            changed.stream.identity.origin.?.physical_root_incarnation += 1;
+                            const changed_manifest = try std.json.Stringify.valueAlloc(a, changed, .{});
+                            a.free(result.application_manifest);
+                            result.application_manifest = changed_manifest;
+                        }
+                        return result;
+                    }
+                };
+                var retainer: Retainer = .{ .state = &persisted };
+                const request: retention.Request = .{ .group_id = 7501, .index = 1, .term = 1, .reference = @splat(23) };
+                try std.testing.expectError(error.NativeSnapshotRequired, control.attestSnapshotParent(alloc, request, scope, root_key));
+                source.schema_snapshot_retention = .{ .ptr = &retainer, .retain = Retainer.retain };
+                defer source.schema_snapshot_retention = null;
+                try std.testing.expectError(error.ReadSafetyBarrierUnavailable, control.attestSnapshotParent(alloc, request, scope, root_key));
+                source.read_safety_barrier.vtable = &.{ .wait_read_safe = Barrier.wait, .capture_frozen = Barrier.capture, .validate_frozen = Barrier.validate, .certify_completed_prefix = Barrier.certify };
+                // The query freeze must still reject a later quorum boundary;
+                // immutable-image authorization certifies actual completion 3.
+                barrier.reject_frozen = true;
+                defer barrier.reject_frozen = false;
+                try std.testing.expectError(error.ReadUnavailable, control.attest(scope, root_key));
+                var parent = try control.attestSnapshotParent(alloc, request, scope, root_key);
+                defer parent.deinit(alloc);
+                defer payloads.releaseRetained(alloc, std.testing.io, layout.snapshot_dir, parent.retained) catch {};
+                try parent.signed.verifyFor(actual_binding, applied.observation.physical_root_incarnation);
+                try std.testing.expectEqualDeep(applied.observation.header.?, parent.source_header);
+                try std.testing.expectEqual(@as(u64, 1), parent.signed.value.through_index);
+                try std.testing.expectEqual(@as(u64, 3), parent.signed.value.completed.applied_index);
+                try std.testing.expectEqual(@as(usize, 1), barrier.certifications);
+                barrier.expected_minimum = 1;
+                const replayed = try control.attestCompleted(actual_data_scope, root_key);
+                try replayed.verify(actual_data_scope);
+                try std.testing.expectEqual(@as(u64, 3), replayed.rooted.completed.?.applied_index);
+                try std.testing.expectEqualDeep(fast.rooted.observation, replayed.rooted.observation);
+                barrier.expected_minimum = 2;
+                try std.testing.expectEqualDeep(witness.stream.footer_digest, parent.signed.value.stream_digest);
+                // Recovery is an explicit capability, never a fallback which
+                // silently creates another retention obligation.
+                try std.testing.expectError(error.NativeSnapshotRequired, control.recoverSnapshotParent(alloc, request, scope, root_key));
+                source.schema_snapshot_retention.?.reopen = Retainer.reopen;
+                control.releaseForApply();
+                try std.testing.expectError(error.SchemaValidationRuntimeRecoveryRequired, control.attestSnapshotParent(alloc, request, scope, root_key));
+                try std.testing.expectError(error.SchemaValidationRuntimeRecoveryRequired, control.recoverSnapshotParent(alloc, request, scope, root_key));
+                try control.reacquireAfterApply();
+                var changed = request;
+                changed.term = 3;
+                try std.testing.expectError(error.InvalidControlReceiptPosition, control.attestSnapshotParent(alloc, changed, scope, root_key));
+                changed = request;
+                changed.index = 3;
+                try std.testing.expectError(error.InvalidControlReceiptPosition, control.attestSnapshotParent(alloc, changed, scope, root_key));
+                try std.testing.expectEqual(@as(usize, 1), retainer.calls);
+                changed.index = 2;
+                try std.testing.expectError(error.SnapshotNotPublished, control.attestSnapshotParent(alloc, changed, scope, root_key));
+                retainer.tamper = true;
+                try std.testing.expectError(error.SchemaValidationRuntimeRecoveryRequired, control.attestSnapshotParent(alloc, request, scope, root_key));
+                retainer.tamper = false;
+                retainer.legacy = true;
+                try std.testing.expectError(error.NativeSnapshotRequired, control.attestSnapshotParent(alloc, request, scope, root_key));
+                retainer.legacy = false;
+                barrier.fail = true;
+                try std.testing.expectError(error.NotLeader, control.attestSnapshotParent(alloc, request, scope, root_key));
+                // Persist the real capture BEFORE certification. Leadership
+                // loss there leaves a recoverable obligation, not a lost pin.
+                const outbox = @import("../metadata/schema_validation_source_outbox.zig");
+                const producer_root = try local.storage_db_root_signing_identity.loadOrCreate(alloc, std.testing.io, schema_root);
+                var producer_scope = scope;
+                producer_scope.identity.root_incarnation = producer_root.root_incarnation;
+                producer_scope.identity.public_key = producer_root.public_key;
+                var producer_request = request;
+                producer_request.reference = @splat(27);
+                producer_request.metadata_digest = try @import("../raft/storage/snapshot_metadata.zig").digest(producer_request.group_id, .{ .index = producer_request.index, .term = producer_request.term });
+                const intent: outbox.Intent = .{
+                    .lookup = .{ .group = 21, .table = actual_binding.fence.namespace.table_id, .id = actual_binding.id, .metadata_incarnation = producer_scope.metadata_incarnation, .plan_digest = actual_binding.plan_digest },
+                    .ordinal = 0,
+                    .revision = 1,
+                    .root_epoch = 0,
+                    .owner_digest = @splat(28),
+                    .binding = actual_binding,
+                    .scope = producer_scope,
+                    .snapshot = .{ .index = producer_request.index, .term = producer_request.term },
+                    .image = producer_request,
+                };
+                try std.testing.expectError(error.NotLeader, outbox.captureParent(@TypeOf(control), &control, alloc, std.testing.io, schema_root, intent, producer_root, .{}));
+                const namespace = local.storage_db_online_source_contract.namespaceBytes(actual_binding.fence.namespace);
+                const capture_serial = serial: {
+                    var slot = try outbox.open(alloc, std.testing.io, schema_root, producer_root.root_incarnation, namespace, .{});
+                    defer slot.deinit();
+                    try std.testing.expectEqual(outbox.Phase.captured, slot.record().?.phase);
+                    break :serial slot.record().?.serial;
+                };
+                var recovered = try payloads.readRetained(alloc, std.testing.io, layout.snapshot_dir, request.reference, .{ .index = 1, .term = 1 });
+                defer recovered.deinit(alloc);
+                try std.testing.expectEqualStrings(manifest, recovered.application_manifest);
+                try persisted.groupStorage().persistReady(7501, .{ .snapshot = .{ .metadata = .{ .index = 2, .term = 1 }, .data = @constCast("new-current") } });
+                const pins = retainer.calls;
+                barrier.fail = false;
+                try std.testing.expectError(error.SnapshotNotPublished, control.attestSnapshotParent(alloc, request, scope, root_key));
+                var old_parent = try control.recoverSnapshotParent(alloc, request, scope, root_key);
+                defer old_parent.deinit(alloc);
+                try old_parent.signed.verifyFor(actual_binding, applied.observation.physical_root_incarnation);
+                try std.testing.expectEqualDeep(parent.signed, old_parent.signed);
+                try std.testing.expectEqualDeep(parent.retained.digest, old_parent.retained.digest);
+                try std.testing.expectEqualStrings(manifest, old_parent.retained.application_manifest);
+                try std.testing.expectEqual(pins + 1, retainer.calls); // Only the explicit failed new pin.
+                var produced = try outbox.captureParent(@TypeOf(control), &control, alloc, std.testing.io, schema_root, intent, producer_root, .{});
+                defer produced.deinit(alloc);
+                defer payloads.releaseRetained(alloc, std.testing.io, layout.snapshot_dir, produced.retained) catch {};
+                try produced.signed.verifyFor(actual_binding, applied.observation.physical_root_incarnation);
+                try std.testing.expectEqualDeep(parent.retained.digest, produced.retained.digest);
+                {
+                    var slot = try outbox.open(alloc, std.testing.io, schema_root, producer_root.root_incarnation, namespace, .{});
+                    defer slot.deinit();
+                    try std.testing.expectEqual(capture_serial, slot.record().?.serial);
+                    try slot.prepare(.{ .lookup = intent.lookup, .ordinal = intent.ordinal, .revision = intent.revision, .root_epoch = intent.root_epoch, .owner_digest = intent.owner_digest, .signed = produced.signed, .source_header = produced.source_header }, "fixture-owned-prepared-grant");
+                }
+                const reopens = retainer.reopens;
+                try std.testing.expectError(error.SchemaValidationRuntimeRecoveryRequired, outbox.captureParent(@TypeOf(control), &control, alloc, std.testing.io, schema_root, intent, producer_root, .{}));
+                try std.testing.expectEqual(reopens, retainer.reopens);
+                changed = request;
+                changed.reference[0] ^= 1;
+                try std.testing.expectError(error.FileNotFound, control.recoverSnapshotParent(alloc, changed, scope, root_key));
+                changed = request;
+                changed.term = 2;
+                try std.testing.expectError(error.SnapshotPayloadIdentityMismatch, control.recoverSnapshotParent(alloc, changed, scope, root_key));
+                barrier.fail = true;
+                try std.testing.expectError(error.NotLeader, control.recoverSnapshotParent(alloc, request, scope, root_key));
+                try std.testing.expectEqual(pins + 1, retainer.calls); // Recovery never repins CURRENT.
+            }
+            try std.testing.expectError(error.NotLeader, control.attest(scope, root_key));
+            source.read_safety_barrier.vtable = &.{ .wait_read_safe = Barrier.wait, .capture_frozen = Barrier.capture };
+            try std.testing.expectError(error.ReadSafetyBarrierUnavailable, control.attest(scope, root_key));
+        }
+        control.releaseForApply();
+        try std.testing.expectEqual(@as(usize, 1), source.retireTable("items"));
+        const retained_path = try std.fs.path.join(alloc, &.{ schema_root, "retained-original" });
+        defer alloc.free(retained_path);
+        const replacement_path = try std.fs.path.join(alloc, &.{ schema_root, "retained-replacement" });
+        defer alloc.free(replacement_path);
+        // Simulate a genuinely different disk at the SAME visible generation.
+        // Preserve both roots in the temporary fixture; do not relabel either.
+        try std.Io.Dir.renameAbsolute(seed_path, retained_path, std.testing.io);
+        checkpoint = "same generation physical disk replacement";
+        try std.testing.expectError(error.SchemaValidationRuntimeRecoveryRequired, control.reacquireAfterApply());
+        // Observing a missing owner must not provision an empty replacement.
+        // Explicit first-use provisioning creates this different physical disk.
+        {
+            var provisioned = try @import("kernel_owner_client.zig").Owner.open(.{ .path = .fromSlice(seed_path), .table_name = .fromSlice("items"), .group_id = 7501, .lsm_root_generation = table_reads.backend_current_root_generation, .has_identity_namespace = 1, .identity_table_id = 101, .identity_shard_id = 7501, .identity_range_id = 7501, .online_source_authority = 1, .schema_json = .fromSlice(before_json), .indexes_json = .fromSlice("{}") });
+            defer provisioned.deinit();
+            // Establish an actual committed replacement owner, not only an
+            // opened descriptor whose lazy catalog has not been exercised.
+            const row = try table_writes.encodeStorageKernelBatchRequest(alloc, .{ .timestamp_ns = 1, .writes = &.{.{ .key = "replacement", .value = "{\"id\":1}" }} });
+            defer alloc.free(row);
+            var committed = try provisioned.replicatedBatchAtRaftEntryJson("items", row, 1, 1);
+            committed.deinit();
+        }
+        checkpoint = "observe committed replacement disk";
+        const replacement = try source.raftSchemaOwnerObservationAtRoot(7501, "items", actual_binding, .{});
+        try std.testing.expectEqual(applied.root_generation, replacement.root_generation);
+        try std.testing.expect(applied.observation.physical_root_incarnation != replacement.observation.physical_root_incarnation);
+        try std.testing.expect(replacement.observation.header == null and replacement.observation.applied == null);
+        try std.testing.expectEqual(@as(usize, 1), source.retireTable("items"));
+        try std.Io.Dir.renameAbsolute(seed_path, replacement_path, std.testing.io);
+        try std.Io.Dir.renameAbsolute(retained_path, seed_path, std.testing.io);
+        try control.reacquireAfterApply();
+        try std.testing.expectEqualDeep(applied, try control.recoverCommitted());
+
+        // Real kernel tickets pin the old physical owner even for a future
+        // entry. The queue fixture supplies a trusted preparation directly:
+        // protocol 26 remains reserved, so this is not raw ASRL admission.
+        const QueueHost = struct {
+            prepared: ?kernel_owner_source.ProvisionedKernelOwnerSource.PreparedRaftSchemaControl,
+            pub fn prepare(self: *@This(), _: @import("../data/schema_apply_queue.zig").Key, _: *const std.atomic.Value(bool)) !kernel_owner_source.ProvisionedKernelOwnerSource.PreparedRaftSchemaControl {
+                const value = self.prepared orelse return error.TestMissingPreparation;
+                self.prepared = null;
+                return value;
+            }
+            pub fn notify(_: *@This()) void {}
+        };
+        const freeze_bytes = try (local.storage_db_relational_schema_owner_contract.Command{ .binding = actual_binding, .action = .freeze }).encodeRaft(alloc);
+        defer alloc.free(freeze_bytes);
+        var queue_host: QueueHost = .{ .prepared = try control.prepareCommitted(freeze_bytes, 1, 2) };
+        defer if (queue_host.prepared) |*value| value.deinit();
+        control.releaseForApply();
+        const future_entry: @import("../data/schema_apply_queue.zig").Key = .{ .group = 7501, .term = 1, .index = 2 };
+        try std.testing.expectError(error.RaftApplyWriterUnavailable, source.schema_apply.applyOrEnqueue(future_entry));
+        try std.testing.expectEqual(.worked, source.schema_apply.step(&queue_host, 0));
+        // A root replacement at cut 1 must also drain the ticket for entry 2.
+        source.discardSchemaApplyForRootReplacement(7501);
+        try std.testing.expectError(error.RaftApplyWriterUnavailable, source.schema_apply.applyOrEnqueue(future_entry));
+        try std.testing.expectEqual(.worked, source.schema_apply.step(&queue_host, 0));
+        try std.testing.expectEqual(@as(usize, 1), source.retireTable("items"));
+        try std.testing.expectEqual(@as(usize, 0), source.entries.items.len);
+        try control.reacquireAfterApply();
+        try std.testing.expectEqualDeep(applied, try control.recoverCommitted());
+        // Same membership/key, independent preparation after cold reopen.
+        // Discard was neither a durable acknowledgement nor retirement.
+        queue_host.prepared = try control.prepareCommitted(freeze_bytes, 1, 2);
+        control.releaseForApply();
+        try std.testing.expectError(error.RaftApplyWriterUnavailable, source.schema_apply.applyOrEnqueue(future_entry));
+        try std.testing.expectEqual(.worked, source.schema_apply.step(&queue_host, 0));
+        try source.schema_apply.applyOrEnqueue(future_entry);
+        try std.testing.expectEqual(.worked, source.schema_apply.step(&queue_host, 0));
+        try control.reacquireAfterApply();
+        const frozen = try control.recoverCommitted();
+        try std.testing.expectEqual(.scanning, frozen.observation.header.?.phase);
+        try std.testing.expectEqual(@as(u64, 2), frozen.observation.applied.?.index);
+        try std.testing.expectEqual(applied.observation.physical_root_incarnation, frozen.observation.physical_root_incarnation);
+        {
+            const cancel_bytes = try (local.storage_db_relational_schema_owner_contract.Command{ .binding = actual_binding, .action = .cancel }).encodeRaft(alloc);
+            defer alloc.free(cancel_bytes);
+            var cancel_ticket = try control.prepareCommitted(cancel_bytes, 1, 3);
+            defer cancel_ticket.deinit();
+            try cancel_ticket.apply(.{});
+        }
+        {
+            // The private ABI must preserve the distinction between a durable
+            // rejection and a failed preparation. The job stays canceled,
+            // while the exact real term/index advances and survives replay.
+            var rejected_ticket = try control.prepareCommitted(freeze_bytes, 1, 4);
+            defer rejected_ticket.deinit();
+            try std.testing.expectError(error.SchemaValidationCommandRejected, rejected_ticket.apply(.{}));
+            try std.testing.expectError(error.SchemaValidationCommandRejected, rejected_ticket.apply(.{}));
+            const rejected_cut = try rejected_ticket.observeCommitted();
+            try std.testing.expectEqual(.canceled, rejected_cut.observation.header.?.phase);
+            try std.testing.expectEqual(@as(u64, 3), rejected_cut.observation.header.?.updated.raft.index);
+            try std.testing.expectEqual(@as(u64, 4), rejected_cut.observation.applied.?.index);
+        }
+        control.releaseForApply();
+        try std.testing.expectEqual(@as(usize, 1), source.retireTable("items"));
+        try control.reacquireAfterApply();
+        try std.testing.expectError(error.SchemaValidationCommandRejected, control.prepareCommitted(freeze_bytes, 1, 4));
+        // Restore/root publication must invalidate the same real pinned
+        // tickets, not depend on the data-Raft snapshot caller doing it first.
+        queue_host.prepared = try control.prepareCommitted(freeze_bytes, 1, 2);
+        control.releaseForApply();
+        try std.testing.expectError(error.RaftApplyWriterUnavailable, source.schema_apply.applyOrEnqueue(future_entry));
+        try std.testing.expectEqual(.worked, source.schema_apply.step(&queue_host, 0));
+        try source.startApplyControl(std.testing.io);
+        var publication = try source.snapshotSource().beginPublication(.{ .io = std.testing.io, .group_id = 7501, .table_name = "items" });
+        defer publication.deinit();
+        try std.testing.expectEqual(@as(usize, 0), source.entries.items.len);
+        publication.deinit();
+        try control.reacquireAfterApply();
+        const after_publication = try control.recoverCommitted();
+        try std.testing.expectEqual(.canceled, after_publication.observation.header.?.phase);
+        try std.testing.expectEqual(@as(u64, 4), after_publication.observation.applied.?.index);
+        checkpoint = "native snapshot schema control replay";
+        try qualifySchemaSnapshotReplay(alloc, schema_root, catalog.source(), before_json, inputs, actual_binding);
+    }
+}
+
+/// Actual native snapshot materialization/installation followed by retained
+/// control replay. Committed entries are fixture inputs, not quorum evidence;
+/// no metadata root adoption or source grant is inferred from applying them.
+fn qualifySchemaSnapshotReplay(
+    a: std.mem.Allocator,
+    root: []const u8,
+    catalog: table_catalog.CatalogSource,
+    before: []const u8,
+    inputs: []const u8,
+    seed_binding: @import("antfly_local_sources").storage_db_relational_schema_owner_contract.Binding,
+) !void {
+    const client = @import("kernel_owner_client.zig");
+    const raw_mod = @import("data_raft_apply_client.zig");
+    const log = @import("../data/schema_control_log.zig");
+    const machine = @import("../raft/state_machine/mod.zig");
+    const group = seed_binding.fence.owner_group_id;
+    const namespace = seed_binding.fence.namespace;
+    const Generation = struct {
+        value: u64,
+        fn get(ptr: *anyopaque, _: u64) u64 {
+            return @as(*@This(), @ptrCast(@alignCast(ptr))).value;
+        }
+        fn source(self: *@This()) table_reads.GroupVisibleRootGenerationSource {
+            return .{ .ptr = self, .visible_root_generation_for_group = get };
+        }
+    };
+    var source_generation: Generation = .{ .value = 11 };
+    var destination_generation: Generation = .{ .value = 7 };
+    const source_root = try std.fs.path.join(a, &.{ root, "snapshot-replay-source" });
+    defer a.free(source_root);
+    const destination_root = try std.fs.path.join(a, &.{ root, "snapshot-replay-destination" });
+    defer a.free(destination_root);
+    const source_path = try std.fmt.allocPrint(a, "{s}/group-{d}/table-db", .{ source_root, group });
+    defer a.free(source_path);
+    const destination_path = try std.fmt.allocPrint(a, "{s}/group-{d}/table-db", .{ destination_root, group });
+    defer a.free(destination_path);
+    const source_projection = try std.fs.path.join(a, &.{ source_root, "projection" });
+    defer a.free(source_projection);
+    const destination_projection = try std.fs.path.join(a, &.{ destination_root, "projection" });
+    defer a.free(destination_projection);
+    const row: db_mod.types.BatchRequest = .{ .timestamp_ns = 17, .writes = &.{.{ .key = "snapshot-row", .value = "{\"id\":17}" }} };
+    const row_json = try table_writes.encodeStorageKernelBatchRequest(a, row);
+    defer a.free(row_json);
+    const lookup = try table_reads.encodeStorageKernelLookupRequest(a, "snapshot-row", .{});
+    defer a.free(lookup);
+    var expected_row: ?[]u8 = null;
+    defer if (expected_row) |value| a.free(value);
+    var expected_version: u64 = 0;
+    var expected_digest: ?[32]u8 = null;
+    const binding = prepared_binding: {
+        var seed = try client.Owner.open(.{ .path = .fromSlice(source_path), .table_name = .fromSlice("items"), .group_id = group, .lsm_root_generation = source_generation.value, .has_identity_namespace = 1, .identity_table_id = namespace.table_id, .identity_shard_id = namespace.shard_id, .identity_range_id = namespace.range_id, .online_source_authority = 1, .schema_json = .fromSlice(before), .indexes_json = .fromSlice("{}") });
+        defer seed.deinit();
+        var written = try seed.replicatedBatchAtRaftEntryJson("items", row_json, 1, 2);
+        written.deinit();
+        var found = try seed.lookupJson("items", lookup);
+        defer found.deinit();
+        expected_row = try a.dupe(u8, found.bytes());
+        expected_version = found.version();
+        expected_digest = found.expectedContentDigest();
+        const identity_request = try table_reads.encodeStorageKernelLookupRequest(a, "", .{ .relational_topology_json = "{\"mode\":\"identity\"}" });
+        defer a.free(identity_request);
+        var identity_bytes = try seed.lookupJson("items", identity_request);
+        defer identity_bytes.deinit();
+        var topology = try std.json.parseFromSlice(@import("antfly_local_sources").storage_db_relational_integrity_topology_contract.Identity, a, identity_bytes.bytes(), .{});
+        defer topology.deinit();
+        var fence = seed_binding.fence;
+        fence.admission_epoch = topology.value.next_epoch;
+        fence.catalog_digest = topology.value.catalog_digest;
+        const ready = try seed.schemaOwnerPreparation("items", .{ .id = seed_binding.id, .provisional_plan = seed_binding.plan_digest, .fence = fence, .authority = .raft }, inputs, .{});
+        break :prepared_binding ready.binding;
+    };
+    var raw = try raw_mod.RaftApplyStore.init(a, .{ .root_dir = source_projection, .native_source_delegate = true });
+    defer raw.deinit();
+    var source = kernel_owner_source.ProvisionedKernelOwnerSource.init(a, source_root, catalog, read_gate.alreadyReadSafeBarrier());
+    defer source.deinit();
+    _ = source.withGroupVisibleRootGeneration(source_generation.source()).withSchemaEntryStore(&raw);
+    try source.startApplyControl(std.testing.io);
+    // Use a real ordered decoder barrier, followed by BEGIN and freeze at
+    // their exact committed positions. The snapshot carries this same cut.
+    const barrier = try @import("../data/raft_batch.zig").encodeProtocolBarrier(a, "items", log.protocol_version);
+    defer a.free(barrier);
+    const begin_bytes = try (@import("antfly_local_sources").storage_db_relational_schema_owner_contract.Command{ .binding = binding, .action = .begin, .payload = inputs }).encodeRaft(a);
+    defer a.free(begin_bytes);
+    const freeze_bytes = try (@import("antfly_local_sources").storage_db_relational_schema_owner_contract.Command{ .binding = binding, .action = .freeze }).encodeRaft(a);
+    defer a.free(freeze_bytes);
+    const begin_frame = try log.encode(a, "items", source_generation.value, begin_bytes);
+    defer a.free(begin_frame);
+    const freeze_frame = try log.encode(a, "items", source_generation.value, freeze_bytes);
+    defer a.free(freeze_frame);
+    const row_frame = try @import("../data/raft_batch.zig").encodeWithStorageOwnerDescriptor(a, "items", row, .{ .lsm_root_generation = source_generation.value, .identity = .{ .table_id = namespace.table_id, .shard_id = namespace.shard_id, .range_id = namespace.range_id }, .schema_json = before, .indexes_json = "{}" });
+    defer a.free(row_frame);
+    const entries = try machine.encodeCommittedEntries(a, &.{
+        .{ .term = 1, .index = 1, .entry_type = .normal, .data = barrier },
+        .{ .term = 1, .index = 2, .entry_type = .normal, .data = row_frame },
+        .{ .term = 1, .index = 3, .entry_type = .normal, .data = begin_frame },
+        .{ .term = 1, .index = 4, .entry_type = .normal, .data = freeze_frame },
+    });
+    defer a.free(entries);
+    try raw.applyBatch(group, 4, entries);
+    try waitSchemaReplay(&source, group, 3);
+    try waitSchemaReplay(&source, group, 4);
+    const frozen = try source.raftSchemaOwnerObservationAtRoot(group, "items", binding, .{});
+    try std.testing.expectEqual(.scanning, frozen.observation.header.?.phase);
+    var prepared = (try raw.prepareSnapshot(group, 4)) orelse return error.TestExpectedSnapshot;
+    defer prepared.deinit();
+    var capture: client.NativeSnapshotCapture = .{ .handle = try source.captureNativeRaftSnapshot(group, 4) };
+    defer capture.deinit();
+    try prepared.attachNative(capture.handle.?);
+    capture.handle = null;
+    var image = try prepared.materializeFile(a);
+    defer image.deinit(a);
+    const encoded = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, image.path, a, .limited(image.size + 1));
+    defer a.free(encoded);
+    var target = try raw_mod.RaftApplyStore.init(a, .{ .root_dir = destination_projection, .native_source_delegate = true });
+    defer target.deinit();
+    const incoming: abi.SnapshotPrepareRequest = .{ .path = .fromSlice(destination_path), .table_name = .fromSlice("items"), .group_id = group, .lsm_root_generation = destination_generation.value, .identity_table_id = namespace.table_id, .identity_shard_id = namespace.shard_id, .identity_range_id = namespace.range_id, .schema_json = .fromSlice(before), .encoded_snapshot = .fromSlice(encoded), .projection_store = target.handle, .expected_applied_index = 4 };
+    {
+        // Abandon a real prepared import before publication. Reopening the
+        // same exact stream must recover without leaving a live writer or
+        // losing the source cut needed by the following committed tail.
+        var interrupted = try client.Snapshot.prepare(incoming);
+        interrupted.deinit();
+    }
+    {
+        var staged = try client.Snapshot.prepare(incoming);
+        defer staged.deinit();
+        try staged.promote();
+        _ = try staged.publishPrepared();
+        try staged.commit();
+    }
+    const cancel_bytes = try (@import("antfly_local_sources").storage_db_relational_schema_owner_contract.Command{ .binding = binding, .action = .cancel }).encodeRaft(a);
+    defer a.free(cancel_bytes);
+    const cancel_frame = try log.encode(a, "items", source_generation.value, cancel_bytes);
+    defer a.free(cancel_frame);
+    const tail = try machine.encodeCommittedEntries(a, &.{.{ .term = 1, .index = 5, .entry_type = .normal, .data = cancel_frame }});
+    defer a.free(tail);
+    try target.applyBatch(group, 5, tail);
+    var installed_root: u128 = 0;
+    for (0..2) |restart| {
+        var destination = kernel_owner_source.ProvisionedKernelOwnerSource.init(a, destination_root, catalog, read_gate.alreadyReadSafeBarrier());
+        defer destination.deinit();
+        _ = destination.withGroupVisibleRootGeneration(destination_generation.source()).withSchemaEntryStore(&target);
+        try destination.startApplyControl(std.testing.io);
+        const restored = try destination.raftSchemaOwnerObservationAtRoot(group, "items", binding, .{});
+        try std.testing.expectEqual(@as(@TypeOf(restored.observation.header.?.phase), if (restart == 0) .scanning else .canceled), restored.observation.header.?.phase);
+        try std.testing.expect(restored.observation.physical_root_incarnation != frozen.observation.physical_root_incarnation);
+        try std.testing.expectEqual(destination_generation.value + 1, restored.root_generation);
+        if (restart == 0) installed_root = restored.observation.physical_root_incarnation else try std.testing.expectEqual(installed_root, restored.observation.physical_root_incarnation);
+        try waitSchemaReplay(&destination, group, 5);
+        const canceled = try destination.raftSchemaOwnerObservationAtRoot(group, "items", binding, .{});
+        try std.testing.expectEqual(.canceled, canceled.observation.header.?.phase);
+        try std.testing.expectEqual(@as(u64, 5), canceled.observation.applied.?.index);
+        try std.testing.expectEqual(installed_root, canceled.observation.physical_root_incarnation);
+        var foreign = binding;
+        foreign.fence.namespace.range_id += 1;
+        try std.testing.expectError(error.IdentityNamespaceMismatch, destination.acquireRaftSchemaOwnerSession(group, "items", foreign, .{}));
+        // Serving reopens the historical owner only after checking the real
+        // catalog. No recovery task or metadata grant is needed to replay an
+        // already-committed terminal entry, including after cold reopening.
+        var found = (try destination.readSource().lookupGroupLocal(a, group, "items", "snapshot-row", .{}, .stale)) orelse return error.TestExpectedRow;
+        defer found.deinit(a);
+        try std.testing.expectEqualStrings(expected_row.?, found.json);
+        try std.testing.expectEqual(expected_version, found.version);
+        try std.testing.expectEqual(expected_digest, found.expected_content_digest);
+    }
+}
+
+fn waitSchemaReplay(source: *kernel_owner_source.ProvisionedKernelOwnerSource, group: u64, index: u64) !void {
+    const limit = @import("antfly_platform").time.monotonicNs() + 5 * std.time.ns_per_s;
+    while (true) {
+        source.applyPreparedSchemaEntry(group, 1, index) catch |err| {
+            if (err != error.RaftApplyWriterUnavailable) return err;
+            if (@import("antfly_platform").time.monotonicNs() >= limit) return error.TestSchemaControlDidNotComplete;
+            try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+            continue;
+        };
+        return;
+    }
 }
 
 test "native index owner adapter executes fresh permission stages and recovers reserved LSM receipts after restart" {

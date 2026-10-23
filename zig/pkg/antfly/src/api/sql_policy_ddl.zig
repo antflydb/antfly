@@ -35,7 +35,8 @@ const SettingLoader = struct {
         context.setting_read_principal = scope.principal;
         const bytes = try self.server.source.systemCatalog(alloc, context, .{ .setting_snapshot = scope });
         defer alloc.free(bytes);
-        return std.json.parseFromSliceLeaky(settings.RawSnapshot, alloc, bytes, .{ .allocate = .alloc_always });
+        const snapshot = try std.json.parseFromSliceLeaky(settings.RawSnapshot, alloc, bytes, .{ .allocate = .alloc_always });
+        return server_mod.authorizeSqlRoleDefaults(self.server, alloc, snapshot);
     }
 };
 

@@ -326,6 +326,8 @@ pub const RaftSchemaPreparation = struct {
     owner: ?*anyopaque,
     term: u64,
     index: u64,
+    root_generation: u64,
+    physical_root_incarnation: u128,
 
     pub fn apply(self: *RaftSchemaPreparation, options: Owner.QueryOptions) !void {
         var failure: abi.FailureIdentity = .{};
@@ -854,6 +856,71 @@ pub const Owner = struct {
         return parsed.value;
     }
 
+    /// Read-only candidate compilation and actual source-cut observation.
+    /// Result owns all fixed-size fields; no response arena survives return.
+    pub fn schemaOwnerPreparation(self: *Owner, table_name: []const u8, descriptor: @import("antfly_local_sources").storage_db_relational_schema_owner_contract.PreparationDescriptor, inputs: []const u8, options: QueryOptions) !@import("antfly_local_sources").storage_db_relational_schema_owner_contract.Preparation {
+        const contract = @import("antfly_local_sources").storage_db_relational_schema_owner_contract;
+        try descriptor.validate();
+        _ = try contract.inputParts(inputs);
+        var buffer: [contract.max_header]u8 = undefined;
+        var writer = std.Io.Writer.fixed(&buffer);
+        try std.json.Stringify.value(descriptor, .{}, &writer);
+        var response: Response = .{};
+        defer response.deinit();
+        var failure: abi.FailureIdentity = .{};
+        const status = abi.antfly_storage_owner_schema_preparation_json(self.handle, &.{
+            .table_name = .fromSlice(table_name),
+            .descriptor_json = .fromSlice(writer.buffered()),
+            .inputs = .fromSlice(inputs),
+            .control = controlledRequest("", "", options.execution_deadline_ns, options.cancellation_ctx, options.cancellation_fn),
+        }, &response.buffer, &failure);
+        if (status != .ok and (failure.boundary != .storage_owner or failure.operation != abi.SchemaOwnerPreparationRequest.operation)) return error.InvalidBoundaryFailureIdentity;
+        try acceptStorageOwnerFailure(status, failure, "schema owner preparation");
+        if (response.bytes().len == 0 or response.bytes().len > contract.Preparation.max_wire_bytes) return error.SchemaValidationJobChanged;
+        var scratch: [128 * 1024]u8 = undefined;
+        var fixed = std.heap.FixedBufferAllocator.init(&scratch);
+        const result = try std.json.parseFromSliceLeaky(contract.Preparation, fixed.allocator(), response.bytes(), .{ .ignore_unknown_fields = false });
+        try result.validate();
+        if (!std.mem.eql(u8, &result.binding.id, &descriptor.id) or
+            !std.mem.eql(u8, &result.binding.plan_digest, &descriptor.provisional_plan) or
+            !result.binding.fence.eql(descriptor.fence) or result.binding.authority != descriptor.authority or
+            !std.mem.eql(u8, &result.binding.inputs, &contract.hash(inputs))) return error.SchemaValidationJobChanged;
+        return result;
+    }
+
+    pub const SchemaAuditRoot = struct { dir: []const u8, incarnation: u128, public_key: [32]u8 };
+
+    /// The kernel retains the actual MVCC audit and continuation. Only fixed
+    /// progress/signed facts cross back; neither raw rows nor DB pointers do.
+    pub fn stepSchemaOwnerAudit(self: *Owner, table_name: []const u8, binding: @import("antfly_local_sources").storage_db_relational_schema_owner_contract.Binding, inputs: []const u8, root: SchemaAuditRoot, budget: @import("antfly_local_sources").storage_db_relational_schema_root_contract.AuditBudget, options: QueryOptions) !@import("antfly_local_sources").storage_db_relational_schema_root_contract.AuditResult {
+        const contract = @import("antfly_local_sources").storage_db_relational_schema_owner_contract;
+        const wire = @import("antfly_local_sources").storage_db_relational_schema_root_contract;
+        try binding.validate();
+        try budget.validate();
+        if (inputs.len != 0) {
+            _ = try contract.inputParts(inputs);
+            if (!std.mem.eql(u8, &contract.hash(inputs), &binding.inputs)) return error.SchemaValidationJobChanged;
+        }
+        if (root.incarnation == 0 or root.dir.len == 0 or root.dir.len > 4096) return error.InvalidArgument;
+        var buffer: [contract.max_header]u8 = undefined;
+        var writer = std.Io.Writer.fixed(&buffer);
+        try std.json.Stringify.value(binding, .{}, &writer);
+        var root_bytes: [16]u8 = undefined;
+        std.mem.writeInt(u128, &root_bytes, root.incarnation, .little);
+        var response: Response = .{};
+        defer response.deinit();
+        var failure: abi.FailureIdentity = .{};
+        const status = abi.antfly_storage_owner_schema_audit_json(self.handle, &.{ .records = budget.records, .time_ns = budget.time_ns, .table_name = .fromSlice(table_name), .binding_json = .fromSlice(writer.buffered()), .inputs = .fromSlice(inputs), .signing_root_dir = .fromSlice(root.dir), .signing_root_incarnation_le = root_bytes, .control = controlledRequest("", "", options.execution_deadline_ns, options.cancellation_ctx, options.cancellation_fn) }, &response.buffer, &failure);
+        if (status != .ok and (failure.boundary != .storage_owner or failure.operation != abi.SchemaOwnerAuditRequest.operation)) return error.InvalidBoundaryFailureIdentity;
+        try acceptStorageOwnerFailure(status, failure, "schema owner full image audit");
+        if (response.bytes().len == 0 or response.bytes().len > wire.AuditResult.max_wire_bytes) return error.SchemaValidationJobChanged;
+        var scratch: [wire.AuditResult.max_wire_bytes * 8]u8 = undefined;
+        var fixed = std.heap.FixedBufferAllocator.init(&scratch);
+        const result = try std.json.parseFromSliceLeaky(wire.AuditResult, fixed.allocator(), response.bytes(), .{ .ignore_unknown_fields = false });
+        try result.requireFor(binding, root.incarnation, root.public_key);
+        return result;
+    }
+
     pub fn nativeSchemaOwnerObservation(self: *Owner, table_name: []const u8, binding: @import("antfly_local_sources").storage_db_relational_schema_owner_contract.Binding, options: QueryOptions) !@import("antfly_local_sources").storage_db_relational_schema_owner_contract.NativeObservation {
         try binding.validate();
         var buffer: [8192]u8 = undefined;
@@ -875,6 +942,125 @@ pub const Owner = struct {
         return result;
     }
 
+    pub fn raftSchemaOwnerObservation(self: *Owner, table_name: []const u8, binding: @import("antfly_local_sources").storage_db_relational_schema_owner_contract.Binding, options: QueryOptions) !@import("antfly_local_sources").storage_db_relational_schema_owner_contract.RaftObservation {
+        try binding.validate();
+        var buffer: [8192]u8 = undefined;
+        var writer = std.Io.Writer.fixed(&buffer);
+        try std.json.Stringify.value(binding, .{}, &writer);
+        var response: Response = .{};
+        defer response.deinit();
+        var failure: abi.FailureIdentity = .{};
+        const status = abi.antfly_storage_owner_raft_schema_observation_json(self.handle, &.{
+            .table_name = .fromSlice(table_name),
+            .binding_json = .fromSlice(writer.buffered()),
+            .control = controlledRequest("", "", options.execution_deadline_ns, options.cancellation_ctx, options.cancellation_fn),
+        }, &response.buffer, &failure);
+        if (status != .ok and (failure.boundary != .storage_owner or failure.operation != abi.RaftSchemaOwnerObservationRequest.operation)) return error.InvalidBoundaryFailureIdentity;
+        try acceptStorageOwnerFailure(status, failure, "Raft schema owner observation");
+        const Observation = @import("antfly_local_sources").storage_db_relational_schema_owner_contract.RaftObservation;
+        if (response.bytes().len == 0 or response.bytes().len > Observation.max_wire_bytes) return error.SchemaValidationJobChanged;
+        var scratch: [128 * 1024]u8 = undefined;
+        var fixed = std.heap.FixedBufferAllocator.init(&scratch);
+        const result = try std.json.parseFromSliceLeaky(Observation, fixed.allocator(), response.bytes(), .{ .ignore_unknown_fields = false });
+        try result.validateFor(binding);
+        return result;
+    }
+
+    /// Native control-lane producer; metadata/root/cohort permission must be
+    /// checked by its receiving service. A page without payload is prepared
+    /// from the actual retained owner checkpoint, never a caller scan result.
+    pub const NativeSchemaOwnerOutcome = struct {
+        header: ?@import("antfly_local_sources").storage_db_relational_schema_owner_contract.Header,
+        position: @import("antfly_local_sources").storage_db_receipt_position.Native,
+        duplicate: bool,
+        replication_pending: bool,
+        failure_name: [256]u8 = undefined,
+        failure_name_len: u16 = 0,
+        failure_name_truncated: bool = false,
+
+        pub fn errorName(self: *const @This()) ?[]const u8 {
+            return if (self.failure_name_len == 0) null else self.failure_name[0..self.failure_name_len];
+        }
+        pub fn copyDiagnostic(self: *@This(), name: []const u8) void {
+            var length = @min(name.len, self.failure_name.len);
+            while (length != 0 and !std.unicode.utf8ValidateSlice(name[0..length])) length -= 1;
+            @memcpy(self.failure_name[0..length], name[0..length]);
+            self.failure_name_len = @intCast(length);
+            self.failure_name_truncated = length != name.len;
+        }
+    };
+
+    pub const SchemaProposal = struct {
+        command: Response,
+        root_generation: u64,
+        physical_root_incarnation: u128,
+        pub fn deinit(self: *@This()) void {
+            self.command.deinit();
+            self.* = undefined;
+        }
+    };
+
+    pub fn prepareSchemaProposal(self: *Owner, table_name: []const u8, binding: @import("antfly_local_sources").storage_db_relational_schema_owner_contract.Binding, action: @import("antfly_local_sources").storage_db_relational_schema_owner_contract.Action, records: u32, time_ns: u64, options: QueryOptions) !SchemaProposal {
+        const contract = @import("antfly_local_sources").storage_db_relational_schema_owner_contract;
+        var buffer: [contract.max_header]u8 = undefined;
+        var writer = std.Io.Writer.fixed(&buffer);
+        try std.json.Stringify.value(contract.CommandDescriptor{ .binding = binding, .action = action }, .{}, &writer);
+        var result: abi.SchemaOwnerProposalResult = .{};
+        var response: Response = .{};
+        errdefer response.deinit();
+        var failure: abi.FailureIdentity = .{};
+        const status = abi.antfly_storage_owner_prepare_schema_proposal(self.handle, &.{
+            .table_name = .fromSlice(table_name),
+            .descriptor_json = .fromSlice(writer.buffered()),
+            .records = records,
+            .time_ns = time_ns,
+            .control = controlledRequest("", "", options.execution_deadline_ns, options.cancellation_ctx, options.cancellation_fn),
+        }, &result, &failure);
+        response.buffer = result.command;
+        if (status != .ok and (failure.boundary != .storage_owner or failure.operation != abi.SchemaOwnerProposalRequest.operation)) return error.InvalidBoundaryFailureIdentity;
+        try acceptStorageOwnerFailure(status, failure, "schema proposal preparation");
+        const physical_root = std.mem.readInt(u128, &result.physical_root_incarnation_le, .little);
+        if (result.version != abi.abi_version or result._reserved != 0 or physical_root == 0 or
+            (response.buffer.len != 0 and response.buffer.ptr == null) or response.buffer.len > contract.Command.max_raft_wire_bytes) return error.InvalidBoundaryFailureIdentity;
+        if (response.bytes().len != 0) {
+            const command = try contract.Command.decodeRaft(response.bytes());
+            if (!std.meta.eql(command.binding, binding) or command.action != action) return error.SchemaValidationJobChanged;
+        } else if (action != .reconcile_transactions) return error.SchemaValidationJobChanged;
+        return .{ .command = response, .root_generation = result.root_generation, .physical_root_incarnation = physical_root };
+    }
+
+    pub fn nativeSchemaOwnerControl(self: *Owner, table_name: []const u8, command: @import("antfly_local_sources").storage_db_relational_schema_owner_contract.Command, records: u32, time_ns: u64, options: QueryOptions) !NativeSchemaOwnerOutcome {
+        const contract = @import("antfly_local_sources").storage_db_relational_schema_owner_contract;
+        var buffer: [contract.max_header]u8 = undefined;
+        var writer = std.Io.Writer.fixed(&buffer);
+        try std.json.Stringify.value(contract.CommandDescriptor{ .binding = command.binding, .action = command.action }, .{}, &writer);
+        var response: Response = .{};
+        defer response.deinit();
+        var failure: abi.FailureIdentity = .{};
+        const status = abi.antfly_storage_owner_native_schema_control_json(self.handle, &.{
+            .table_name = .fromSlice(table_name),
+            .descriptor_json = .fromSlice(writer.buffered()),
+            .payload = .fromSlice(command.payload),
+            .records = records,
+            .time_ns = time_ns,
+            .control = controlledRequest("", "", options.execution_deadline_ns, options.cancellation_ctx, options.cancellation_fn),
+        }, &response.buffer, &failure);
+        if (status != .ok and (failure.boundary != .storage_owner or failure.operation != abi.NativeSchemaOwnerControlRequest.operation)) return error.InvalidBoundaryFailureIdentity;
+        try acceptStorageOwnerFailure(status, failure, "native schema owner control");
+        if (response.bytes().len == 0 or response.bytes().len > contract.NativeObservation.max_wire_bytes) return error.SchemaValidationJobChanged;
+        var scratch: [128 * 1024]u8 = undefined;
+        var fixed = std.heap.FixedBufferAllocator.init(&scratch);
+        const result = try std.json.parseFromSliceLeaky(contract.NativeOutcome, fixed.allocator(), response.bytes(), .{ .ignore_unknown_fields = false });
+        try result.validateFor(command.binding);
+        var owned: NativeSchemaOwnerOutcome = .{ .header = result.header, .position = result.position, .duplicate = result.duplicate, .replication_pending = result.replication_pending };
+        if (result.error_name) |name| {
+            // Auxiliary diagnostics must not turn a valid committed/pending
+            // acknowledgement into an error after its durable effect.
+            owned.copyDiagnostic(name);
+        }
+        return owned;
+    }
+
     /// Trusted committed-entry ingress. The command is already encoded ASVR;
     /// it cannot carry or override the actual state machine's term/index.
     pub fn applyRaftSchemaOwnerControl(self: *Owner, table_name: []const u8, command: []const u8, term: u64, index: u64, options: QueryOptions) !void {
@@ -893,7 +1079,7 @@ pub const Owner = struct {
     /// Control lane only. Command bytes and callbacks need survive only this
     /// call. Drain/destroy the returned ticket before closing this owner.
     pub fn prepareRaftSchemaOwnerControl(self: *Owner, table_name: []const u8, command: []const u8, term: u64, index: u64, options: QueryOptions) !RaftSchemaPreparation {
-        var prepared: ?*anyopaque = null;
+        var prepared: abi.RaftSchemaOwnerPreparationResult = .{};
         var failure: abi.FailureIdentity = .{};
         const status = abi.antfly_storage_owner_prepare_raft_schema_control(self.handle, &.{
             .table_name = .fromSlice(table_name),
@@ -902,10 +1088,12 @@ pub const Owner = struct {
             .index = index,
             .control = controlledRequest("", "", options.execution_deadline_ns, options.cancellation_ctx, options.cancellation_fn),
         }, &prepared, &failure);
-        errdefer abi.antfly_storage_owner_destroy_raft_schema_preparation(prepared);
+        errdefer abi.antfly_storage_owner_destroy_raft_schema_preparation(prepared.prepared);
         if (status != .ok and (failure.boundary != .storage_owner or failure.operation != abi.RaftSchemaOwnerApplyRequest.operation)) return error.InvalidBoundaryFailureIdentity;
         try acceptStorageOwnerFailure(status, failure, "Raft schema owner preparation");
-        return .{ .handle = prepared orelse return error.StorageKernelFailure, .owner = self.handle, .term = term, .index = index };
+        const physical_root = std.mem.readInt(u128, &prepared.physical_root_incarnation_le, .little);
+        if (prepared.version != abi.abi_version or prepared._reserved != 0 or physical_root == 0) return error.InvalidAbiVersion;
+        return .{ .handle = prepared.prepared orelse return error.StorageKernelFailure, .owner = self.handle, .term = term, .index = index, .root_generation = prepared.root_generation, .physical_root_incarnation = physical_root };
     }
 
     pub fn nativeIndexOwnerStateJson(self: *Owner, table_name: []const u8, identity_json: []const u8) !Response {

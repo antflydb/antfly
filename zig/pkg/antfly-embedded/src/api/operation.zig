@@ -137,6 +137,9 @@ pub const RequestContext = struct {
     /// Granted by authenticated, body-bound internal index-owner reads only.
     /// Never reconstructed from a public SQL or serialized request payload.
     index_publication_authority: bool = false,
+    /// Body-bound internal schema-validation owner reads. Never derived from
+    /// setting administrator/index-owner grants or serialized request fields.
+    schema_validation_authority: bool = false,
     /// Set only by the administrator-authorized relational recovery routes.
     relational_recovery: enum { none, repair, retry, retire } = .none,
     relational_retirement_target: ?[]const u8 = null,

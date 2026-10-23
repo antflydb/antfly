@@ -24,6 +24,81 @@ import type {
   SQLPreparedResponse,
 } from "../src/index.js";
 
+it("retains unknown catalog receipts and observes without replaying DDL", async () => {
+  const token = "opaque-retained-operation";
+  const receipt = {
+    kind: "sequence",
+    operation: "create",
+    database: "postgres",
+    namespace: "public",
+    name: "counter",
+    state: "unknown",
+    recovery_token: token,
+    diagnostic: { code: "40003", message: "observe only", retryable: false },
+  };
+  const committed = {
+    ...receipt,
+    state: "committed",
+    object_id: "18446744073709551615",
+    generation: "9007199254740993",
+  };
+  const fetch = vi
+    .fn()
+    .mockResolvedValueOnce(
+      new Response(
+        JSON.stringify({
+          columns: [],
+          rows: [],
+          command_tag: "DDL PENDING",
+          catalog_receipt: receipt,
+        }),
+        { status: 409 }
+      )
+    )
+    .mockResolvedValueOnce(new Response(JSON.stringify(committed)));
+  vi.stubGlobal("fetch", fetch);
+  const client = new AntflyClient({ baseUrl: "http://localhost:8080" });
+  try {
+    await client.executeSQL({ statement: "CREATE SEQUENCE counter" });
+    expect.fail("uncertain DDL must not succeed");
+  } catch (error) {
+    expect(error).toBeInstanceOf(SQLExecutionError);
+    const diagnostic = error as SQLExecutionError;
+    expect(diagnostic.catalogReceipt?.recovery_token).toBe(token);
+    expect(diagnostic.diagnostic.retryable).toBe(false);
+  }
+  expect(await client.getSQLCatalogOperation(token)).toEqual(committed);
+  await expect(client.getSQLCatalogOperation("")).rejects.toThrow("recovery token");
+  expect(fetch).toHaveBeenCalledTimes(2);
+  expect(fetch.mock.calls[1][0]).toBe("http://localhost:8080/db/v1/sql/operations/status");
+  expect(JSON.parse(fetch.mock.calls[1][1].body)).toEqual({ recovery_token: token });
+  expect(fetch.mock.calls[1][1]).toMatchObject({
+    method: "POST",
+    redirect: "error",
+    credentials: "omit",
+  });
+});
+
+it.each([307, 403, 503])("catalog recovery never redirects or retries HTTP %s", async (status) => {
+  const fetch = vi.fn().mockResolvedValue(
+    new Response(
+      JSON.stringify({
+        code: status === 403 ? "42501" : "40003",
+        message: "observe only",
+        retryable: false,
+      }),
+      { status, headers: { Location: "/replayed" } }
+    )
+  );
+  vi.stubGlobal("fetch", fetch);
+  const client = new AntflyClient({ baseUrl: "http://localhost:8080" });
+  await expect(client.getSQLCatalogOperation("opaque-retained-operation")).rejects.toBeInstanceOf(
+    SQLExecutionError
+  );
+  expect(fetch).toHaveBeenCalledTimes(1);
+  expect(fetch.mock.calls[0][1]).toMatchObject({ redirect: "error", credentials: "omit" });
+});
+
 it("exports generated NUMERIC scalar and array result modifiers", () => {
   const modifier: SQLNumericModifier = { precision: 2, scale: -3 };
   for (const type of ["number", "array"] as const) {

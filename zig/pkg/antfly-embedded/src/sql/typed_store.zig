@@ -982,15 +982,10 @@ pub const Store = struct {
     }
 
     fn listGrowth(values: anytype, additional: usize) usize {
-        const required = values.items.len +| additional;
-        if (required <= values.capacity) return 0;
-        return (required *| 2 +| 8) *| @sizeOf(@TypeOf(values.items[0]));
+        return @import("memory_budget.zig").arrayListGrowthBytes(values, additional);
     }
     fn tableGrowth(table: anytype, additional: usize) usize {
-        if (additional <= table.available) return 0;
-        const required = (table.count() +| additional) *| 100 / std.hash_map.default_max_load_percentage +| 1;
-        const capacity = std.math.ceilPowerOfTwo(usize, @max(8, required)) catch return std.math.maxInt(usize);
-        return capacity *| 32 +| 64;
+        return @import("memory_budget.zig").hashTableGrowthBytes(table, additional);
     }
     /// Include replacement vector/hash capacities, not just retained cells.
     /// Numeric/string dictionary sampling may temporarily own both formats.

@@ -746,6 +746,15 @@ pub const UserManager = struct {
         return lease.getUser(username);
     }
 
+    /// Copy just the principal incarnation under the normal authority lock;
+    /// SQL setting capture does not need to clone passwords or metadata.
+    pub fn currentUserInstance(self: *UserManager, username: []const u8) ![16]u8 {
+        var receiver = self.io_borrow.receive() catch @panic("invalid UserManager executor");
+        self.mutation_mutex.lockUncancelable(receiver.io());
+        defer self.mutation_mutex.unlock(receiver.io());
+        return self.user_instances.get(username) orelse error.UserNotFound;
+    }
+
     fn cloneUserUnlocked(self: *UserManager, username: []const u8) !User {
         const password_hash = self.users.get(username) orelse return error.UserNotFound;
         const metadata_json = self.user_metadata.get(username) orelse "{}";

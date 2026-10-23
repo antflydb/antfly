@@ -906,14 +906,16 @@ const DataApplyPreparedSnapshotSource = struct {
         const self: *@This() = @ptrCast(@alignCast(ptr));
         var file = try self.prepared.materializeFile(alloc);
         errdefer file.deinit(alloc);
-        const artifact = try storage.file_snapshot_artifact.FileSnapshotArtifact.create(
+        const artifact = try storage.file_snapshot_artifact.FileSnapshotArtifact.createWithApplicationManifest(
             alloc,
             std.Options.debug_io,
             file.path,
             file.size,
+            file.application_manifest,
         );
         // The artifact duplicated the path and now owns deletion of the file.
         alloc.free(file.path);
+        alloc.free(file.application_manifest);
         file = undefined;
         return .{ .artifact = artifact };
     }

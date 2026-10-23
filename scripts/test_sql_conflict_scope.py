@@ -22,8 +22,13 @@ import psycopg
 from generate_sql_postgres_reference import FIXTURES, postgres
 
 AMBIGUOUS = (
-    "sql-1388", "sql-1389", "sql-1391", "sql-1438",
-    "sql-1444", "sql-1478", "sql-1479",
+    "sql-1388",
+    "sql-1389",
+    "sql-1391",
+    "sql-1438",
+    "sql-1444",
+    "sql-1478",
+    "sql-1479",
 )
 
 
@@ -59,7 +64,9 @@ class ConflictScopeTest(unittest.TestCase):
                         self.assertEqual("42702", caught.exception.sqlstate)
                         self.assertEqual(
                             before,
-                            db.execute("SELECT * FROM usage_records ORDER BY id").fetchall(),
+                            db.execute(
+                                "SELECT * FROM usage_records ORDER BY id"
+                            ).fetchall(),
                         )
             valid = originals["sql-1480"]
             self.assertEqual([], valid["params"])
@@ -89,4 +96,6 @@ class ConflictScopeTest(unittest.TestCase):
                 cursor.execute(valid["sql"])
                 self.assertEqual("INSERT 0 0", cursor.statusmessage)
                 self.assertEqual([], cursor.fetchall())
-            self.assertEqual(before, db.execute("SELECT *,xmin::text FROM usage_records").fetchall())
+            self.assertEqual(
+                before, db.execute("SELECT *,xmin::text FROM usage_records").fetchall()
+            )

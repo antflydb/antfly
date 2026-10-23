@@ -26,6 +26,7 @@ const platform_time = @import("antfly_platform").time;
 
 pub const Session = struct {
     normalization_only: bool = false,
+    preparation_runtime: ?@import("../../schema/relational_expression.zig").PreparationRuntime = null,
     require_normalized_visibility: bool = false,
     row_policy_lease: ?row_policy_gate_mod.Gate.Lease = null,
     range_proofs: ?[]@import("../range_protection.zig").Proof = null,
@@ -80,6 +81,7 @@ pub const Session = struct {
         if (writes.len > 4096) return error.InvalidArgument;
         try session.checkpoint();
         const view = session.reader.active;
+        const validator = if (view.validator()) |compiled| (if (session.preparation_runtime) |runtime| compiled.forPreparation(runtime) else compiled) else null;
         const normalized = try alloc.alloc(types.BatchWrite, writes.len);
         var initialized: usize = 0;
         errdefer {
@@ -94,7 +96,7 @@ pub const Session = struct {
         var output_bytes: usize = 0;
         for (writes, normalized) |write, *out| {
             try session.checkpoint();
-            var prepared = try mapper.PreparedRelationalWrite.initTyped(alloc, alloc, alloc, false, write.key, write.value, view.validator(), view.tableSchema().*, view.physicalLayout(), write.json_null_fields, false);
+            var prepared = try mapper.PreparedRelationalWrite.initTyped(alloc, alloc, alloc, false, write.key, write.value, validator, view.tableSchema().*, view.physicalLayout(), write.json_null_fields, false);
             defer prepared.deinit(alloc);
             try prepared.requireLogicalRoot();
             const value = try std.json.Stringify.valueAlloc(alloc, prepared.parsedValue(), .{});

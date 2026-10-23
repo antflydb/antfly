@@ -36,7 +36,24 @@ pub fn needsMerge(staged: *const transactions.OwnedTransactionCommitRequest, tab
     return writes;
 }
 
+/// Private statement-owned policy evaluator. The merge is eager for staged
+/// postimages, so neither this capability nor its principal outlives open.
+pub const Policy = struct {
+    ptr: *anyopaque,
+    permits: *const fn (*anyopaque, []const u8, Json, []const []const u8) anyerror!bool,
+};
+
 pub fn open(alloc: std.mem.Allocator, native: catalog.Cursor, staged: *const transactions.OwnedTransactionCommitRequest, table: catalog.Table, request: catalog.Scan, row_filter_json: ?[]const u8) !catalog.Cursor {
+    return openAuthorized(alloc, native, staged, table, request, row_filter_json, null);
+}
+
+pub fn openAuthorized(alloc: std.mem.Allocator, native: catalog.Cursor, staged: *const transactions.OwnedTransactionCommitRequest, table: catalog.Table, request: catalog.Scan, row_filter_json: ?[]const u8, policy: ?Policy) !catalog.Cursor {
+    return openAtVersion(alloc, native, staged, table, request, row_filter_json, policy, null);
+}
+
+/// The serialized session supplies the same durable stamp as RETURNING.
+/// Preserve the observed primary fence independently of this SQL projection.
+pub fn openAtVersion(alloc: std.mem.Allocator, native: catalog.Cursor, staged: *const transactions.OwnedTransactionCommitRequest, table: catalog.Table, request: catalog.Scan, row_filter_json: ?[]const u8, policy: ?Policy, write_version: ?u64) !catalog.Cursor {
     const cursor = try alloc.create(Cursor);
     cursor.* = .{ .alloc = alloc, .native = native, .arena = std.heap.ArenaAllocator.init(alloc), .page_arena = std.heap.ArenaAllocator.init(alloc) };
     errdefer {
@@ -73,6 +90,7 @@ pub fn open(alloc: std.mem.Allocator, native: catalog.Cursor, staged: *const tra
             const value = try std.json.parseFromSliceLeaky(Json, arena, write.value, .{ .parse_numbers = false });
             if (value != .object) return error.InvalidSqlBackendResponse;
             if (row_filter) |*filter| if (!try filter.matchesJson(arena, write.key, value)) continue;
+            if (policy) |check| if (!try check.permits(check.ptr, write.key, value, write.json_null_fields)) continue;
             var object: std.json.ObjectMap = .empty;
             var nulls: std.ArrayList(bool) = .empty;
             for (full_projection.columns) |column| {
@@ -88,7 +106,7 @@ pub fn open(alloc: std.mem.Allocator, native: catalog.Cursor, staged: *const tra
             const observed = for (entry.predicates.items) |predicate| {
                 if (std.mem.eql(u8, predicate.key, write.key)) break predicate;
             } else return error.InvalidSqlBackendResponse;
-            const row = try full_projection.adaptBorrowed(arena, full_layout, catalog.Row{ .id = write.key, .version = observed.expected_version, .value = .{ .object = object }, .sql_nulls = nulls.items, .expected_content_digest = observed.expected_content_digest, .document = if (request.include_document) value else null });
+            const row = try full_projection.adaptBorrowed(arena, full_layout, catalog.Row{ .id = write.key, .version = observed.expected_version, .document_version = if (write_version) |stamp| try table.preparedVersion(value, stamp) else null, .value = .{ .object = object }, .sql_nulls = nulls.items, .expected_content_digest = observed.expected_content_digest, .document = if (request.include_document) value else null });
             if (try matches(row, conditions, &numeric_context)) {
                 if (selected_projection.has_typed_cells) {
                     try rows.append(arena, try selected_projection.adaptBorrowed(arena, selected_layout, row));
@@ -102,7 +120,10 @@ pub fn open(alloc: std.mem.Allocator, native: catalog.Cursor, staged: *const tra
                     try projected.put(arena, column.path, cell.value);
                     try projected_nulls.append(arena, cell.sql_null);
                 }
-                try rows.append(arena, .{ .id = row.id, .version = row.version, .value = .{ .object = projected }, .sql_nulls = projected_nulls.items, .expected_content_digest = row.expected_content_digest, .document = row.document });
+                var selected = row;
+                selected.value = .{ .object = projected };
+                selected.sql_nulls = projected_nulls.items;
+                try rows.append(arena, selected);
             }
         }
     }
@@ -225,6 +246,55 @@ const Cursor = struct {
         self.alloc.destroy(self);
     }
 };
+
+test "SQL session overlay authorizes full postimages before projection and shadows denied replacements" {
+    const a = std.testing.allocator;
+    const Native = struct {
+        read: bool = false,
+        fn next(ptr: *anyopaque, alloc: std.mem.Allocator, _: u32) !catalog.Page {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (self.read) return .{ .rows = &.{} };
+            self.read = true;
+            const rows = try alloc.alloc(catalog.Row, 1);
+            rows[0] = .{ .id = "a", .version = 1, .value = try std.json.parseFromSliceLeaky(Json, alloc, "{\"n\":99}", .{}) };
+            return .{ .rows = rows };
+        }
+        fn close(_: *anyopaque) void {}
+    };
+    const Check = struct {
+        calls: usize = 0,
+        fail: bool = false,
+        fn permits(ptr: *anyopaque, _: []const u8, value: Json, _: []const []const u8) !bool {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            if (self.fail) return error.Cancelled;
+            const tenant = value.object.get("tenant").?;
+            return tenant == .number_string and std.mem.eql(u8, tenant.number_string, "1");
+        }
+    };
+    var staged = try transactions.parseCommitRequest(a,
+        \\{"read_set":[{"table":"t","key":"a","version":"1"},{"table":"t","key":"b","version":"0"}],"tables":{"t":{"inserts":{"a":{"n":10,"tenant":0},"b":{"n":20,"tenant":1}}}}}
+    );
+    defer staged.deinit(a);
+    const table: catalog.Table = .{ .id = 1, .physical_name = "t", .schema_version = 1, .columns = &.{
+        .{ .name = "n", .path = "n", .type = .integer, .element_type = .int64 },
+        .{ .name = "tenant", .path = "tenant", .type = .integer, .element_type = .int64 },
+    } };
+    var native: Native = .{};
+    var check: Check = .{};
+    const cursor = try openAuthorized(a, .{ .ptr = &native, .next = Native.next, .close = Native.close }, &staged, table, .{ .fields = &.{"n"}, .limit = 10 }, null, .{ .ptr = &check, .permits = Check.permits });
+    defer cursor.close(cursor.ptr);
+    var output = std.heap.ArenaAllocator.init(a);
+    defer output.deinit();
+    const page = try cursor.next(cursor.ptr, output.allocator(), 10);
+    try std.testing.expectEqual(@as(usize, 2), check.calls);
+    try std.testing.expectEqual(@as(usize, 1), page.rows.len);
+    try std.testing.expectEqualStrings("b", page.rows[0].id);
+    try std.testing.expectEqual(@as(i64, 20), (try page.rows[0].cell("n")).value.integer);
+    try std.testing.expect(!try page.rows[0].hasField("tenant"));
+    check.fail = true;
+    try std.testing.expectError(error.Cancelled, openAuthorized(a, .{ .ptr = &native, .next = Native.next, .close = Native.close }, &staged, table, .{ .fields = &.{"n"}, .limit = 10 }, null, .{ .ptr = &check, .permits = Check.permits }));
+}
 
 test "SQL session overlay merge admission uses physical identity and validates every schema fence" {
     const a = std.testing.allocator;
@@ -483,6 +553,39 @@ test "SQL document session overlay retains full postimage and original conflict 
     var wrong_epoch = table;
     wrong_epoch.schema_version = 3;
     try std.testing.expectError(error.CatalogGenerationChanged, open(alloc, .{ .ptr = &state, .next = Empty.next, .close = Empty.close }, &staged, wrong_epoch, .{ .fields = &.{}, .limit = 1 }, null));
+}
+
+test "SQL session overlay staged versions retain original fences through projection and cursor release" {
+    const a = std.testing.allocator;
+    const Empty = struct {
+        fn next(_: *anyopaque, _: std.mem.Allocator, _: u32) !catalog.Page {
+            return .{ .rows = &.{} };
+        }
+        fn close(_: *anyopaque) void {}
+    };
+    var state: u8 = 0;
+    var staged = try transactions.parseCommitRequest(a, "{\"read_set\":[{\"table\":\"t\",\"key\":\"a\",\"version\":\"7\"}],\"tables\":{\"t\":{\"inserts\":{\"a\":{\"n\":11,\"ttl\":123}}}}}");
+    defer staged.deinit(a);
+    staged.tables[0].predicates.items[0].expected_content_digest = @splat(42);
+    const stamp: u64 = 9007199254740994;
+    for ([_]bool{ false, true }) |typed| for ([_]bool{ false, true }) |ttl| {
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const table: catalog.Table = .{ .id = 1, .physical_name = "t", .schema_version = 1, .storage_mode = .document, .version_field = if (ttl) "ttl" else null, .columns = &.{.{ .name = "n", .path = "n", .type = if (typed) .number else .integer, .element_type = if (typed) .numeric else null }} };
+        const cursor = try openAtVersion(a, .{ .ptr = &state, .next = Empty.next, .close = Empty.close }, &staged, table, .{ .fields = &.{ "n", "_version" }, .limit = 1 }, null, null, stamp);
+        const page = cursor.next(cursor.ptr, arena.allocator(), 1) catch |err| {
+            cursor.close(cursor.ptr);
+            return err;
+        };
+        cursor.close(cursor.ptr);
+        try std.testing.expectEqual(@as(usize, 1), page.rows.len);
+        const row = page.rows[0];
+        try std.testing.expectEqual(@as(u64, 7), row.version);
+        try std.testing.expectEqual(@as([32]u8, @splat(42)), row.expected_content_digest.?);
+        try std.testing.expectEqual(@as(i64, if (ttl) 123 else stamp), (try row.cell("_version")).value.integer);
+        try std.testing.expectEqual(typed, row.typed_cells != null);
+        try std.testing.expectEqual(@as(u64, 7), staged.tables[0].predicates.items[0].expected_version);
+    };
 }
 
 test "SQL session overlay preserves JSON null independently of SQL NULL" {

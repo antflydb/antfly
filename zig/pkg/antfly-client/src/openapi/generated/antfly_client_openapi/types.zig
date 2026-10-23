@@ -37154,6 +37154,8 @@ pub const RelationalExpressionOp = enum {
     jsonb_array_length,
     jsonb_extract_path,
     jsonb_extract_path_text,
+    uuidv4,
+    uuidv7,
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         const s = switch (self) {
@@ -37200,6 +37202,8 @@ pub const RelationalExpressionOp = enum {
             .jsonb_array_length => "jsonb_array_length",
             .jsonb_extract_path => "jsonb_extract_path",
             .jsonb_extract_path_text => "jsonb_extract_path_text",
+            .uuidv4 => "uuidv4",
+            .uuidv7 => "uuidv7",
         };
         try jw.write(s);
     }
@@ -37253,6 +37257,8 @@ pub const RelationalExpressionOp = enum {
             .{ "jsonb_array_length", .jsonb_array_length },
             .{ "jsonb_extract_path", .jsonb_extract_path },
             .{ "jsonb_extract_path_text", .jsonb_extract_path_text },
+            .{ "uuidv4", .uuidv4 },
+            .{ "uuidv7", .uuidv7 },
         });
         return map.get(s) orelse error.UnexpectedToken;
     }
@@ -38082,7 +38088,7 @@ pub const RelationalRowQueryRequest = struct {
     }
 };
 
-/// Immutable typed scalar expression, limited to 128 nodes and 16 levels. A literal requires type; omitted value means typed null. A column requires column; other operations require args. Unknown or irrelevant fields are rejected. Arithmetic operands have the same integer or number type. Integer division truncates toward zero. Overflow and division by zero reject the write. Arithmetic and string operations propagate null. ASCII case operations leave non-ASCII bytes unchanged. No volatile functions are accepted. Allocated results are bounded to 1 MiB each. The replace operation takes three text arguments and performs literal, non-overlapping replacement; an empty search string leaves the input unchanged. md5 takes one text argument and returns 32 lowercase hex characters (a SQL compatibility fingerprint, not a security primitive). Both are strict in SQL NULL and require reader capability version 27, including when nested inside scalar/boolean expressions. Literal search patterns are prepared with immutable plans; matching, copies and dynamic pattern preparation share invocation work/cancellation admission. Numeric functions abs, ceil, floor, round, trunc, sign and sqrt require reader capability version 28, even when nested in boolean programs. They take one NUMERIC or float64 argument; abs also preserves integer widths and float32. round and trunc optionally accept an int32 scale as a second argument only for NUMERIC. Operands must already have their resolved SQL types; SQL lowering inserts required promotions. NUMERIC round uses ties away from zero; float64 round uses ties to even. All selected arguments evaluate before strict NULL propagation. NUMERIC execution never converts through float and shares invocation admission. Allocations and byte-comparison operand work share a 4 MiB evaluation budget per row and expression set. An integer literal may use a decimal string for exact int64 transport; blob uses base64 and datetime uses the normal relational datetime representation. Comparisons require operands of compatible types (integer and number may mix) and return boolean or SQL UNKNOWN (null); is_distinct and is_not_distinct always return a boolean. Unary is_null and is_not_null test presence/null. AND and OR evaluate left to right with SQL three-valued short-circuit semantics; NOT preserves UNKNOWN. CHECK accepts TRUE and UNKNOWN, rejecting FALSE. Numeric literals and arithmetic operations may specify sql_type to retain PostgreSQL builtin overflow and float4 rounding semantics. Without it, integer and number operations retain int64 and float64 semantics. Numeric cast requires type and sql_type, takes one numeric argument, and performs a checked conversion when evaluated (not when the schema is compiled). Floating-to-integer casts round ties to even. The numeric expression type uses exact PostgreSQL NUMERIC values and may specify sql_type numeric. Its literals accept decimal strings or exact JSON numeric lexemes, including string-valued special values. Exact NUMERIC programs require reader capability version 21 even when their result is boolean or integer. Float/integer assignment casts keep their declared PostgreSQL rounding and overflow semantics. A cast to numeric may specify numeric_modifier for PostgreSQL precision and signed-scale coercion. Overflow is checked when the selected cast executes; unselected lazy branches do not fail. Modifier-bearing programs require reader capability version 23 even with integer/boolean output. The sql_array expression type requires sql_type on literals, including typed NULL, to declare the element builtin. Non-null literals use the ordinal SQL array envelope (dimensions with length/lower_bound, values, and sql_nulls), retaining shape and lower bounds. Array columns derive their exact element identity from the immutable schema. Comparisons, IN, COALESCE and CASE require matching array element identities; no element type is inferred from values. Array-dependent programs require reader capability version 24 even with scalar output. Assignment to a NUMERIC array column applies its precision/signed-scale modifier to each element. Array casts require type sql_array and an explicit matching sql_type; identity casts borrow the immutable input. Casts of numeric arrays may additionally specify numeric_modifier, coercing each non-NULL element with PostgreSQL precision and signed-scale semantics while preserving dimensions, lower bounds and NULL slots. Coercion is lazy and shares invocation admission with the surrounding expression. Array-valued ordered index keys and element-changing array casts are not supported by this expression contract. The array constructor requires sql_type and zero to 32 arguments. Constructor programs additionally require reader capability version 25, including constructors hidden inside scalar/boolean expressions. Scalar arguments must have the declared element domain, with explicit width-preserving numeric casts where needed. SQL NULL arguments become NULL elements. Array arguments must all have matching element types, dimensions and lower bounds; one leading dimension with lower bound 1 is added. All empty/NULL subarrays produce an empty array; mixing an empty/NULL subarray with a nonempty one is a dimension mismatch. Child expressions execute once, with shared work/cancellation and byte limits. case_when takes alternating boolean conditions and result expressions, followed by a mandatory fallback result (3 to 31 arguments, at most 15 branches). Conditions are evaluated in order; only the selected result is evaluated, and a NULL condition is not TRUE. All result expressions must have the same physical type. Numeric SQL lowering records builtin result-domain promotions as explicit casts. This operation requires schema capability version 18. modulo takes two same-domain integer or NUMERIC operands and returns the signed remainder (minInt modulo -1 is zero); a zero divisor rejects the write. in_list and not_in_list take one probe followed by 1 to 127 same-domain candidates. The probe is evaluated once; NULL probes return UNKNOWN. A matching candidate wins over NULL candidates; otherwise a NULL candidate makes the result UNKNOWN. These operations require schema capability version 19. JSON expressions require reader capability version 30. The json type carries JSONB semantics, including exact numeric values and display scale. jsonb_typeof and jsonb_array_length take one JSON argument; array length rejects a non-array value. jsonb_extract_path and jsonb_extract_path_text take a JSON argument followed by 1 to 31 text path components. Negative array ordinals count from the end; a missing path returns SQL NULL. JSON extraction retains JSON null; text extraction converts JSON null to SQL NULL. Arguments are evaluated strictly, while enclosing CASE/coalesce retain their short-circuit semantics.
+/// Typed scalar expression, limited to 128 nodes and 16 levels. CHECK, generated-column and index expressions must be immutable. UUIDv4 and UUIDv7 generation are permitted only in column defaults and require reader capability version 33. They run once during owned row preparation, never during schema publication or restore verification. The uuidv4 and uuidv7 operations take no args; uuidv7 may specify shift. A literal requires type; omitted value means typed null. A column requires column; other operations except uuidv4 and uuidv7 require args. Unknown or irrelevant fields are rejected. Arithmetic operands have the same integer or number type. Integer division truncates toward zero. Overflow and division by zero reject the write. Arithmetic and string operations propagate null. ASCII case operations leave non-ASCII bytes unchanged. No volatile functions are accepted. Allocated results are bounded to 1 MiB each. The replace operation takes three text arguments and performs literal, non-overlapping replacement; an empty search string leaves the input unchanged. md5 takes one text argument and returns 32 lowercase hex characters (a SQL compatibility fingerprint, not a security primitive). Both are strict in SQL NULL and require reader capability version 27, including when nested inside scalar/boolean expressions. Literal search patterns are prepared with immutable plans; matching, copies and dynamic pattern preparation share invocation work/cancellation admission. Numeric functions abs, ceil, floor, round, trunc, sign and sqrt require reader capability version 28, even when nested in boolean programs. They take one NUMERIC or float64 argument; abs also preserves integer widths and float32. round and trunc optionally accept an int32 scale as a second argument only for NUMERIC. Operands must already have their resolved SQL types; SQL lowering inserts required promotions. NUMERIC round uses ties away from zero; float64 round uses ties to even. All selected arguments evaluate before strict NULL propagation. NUMERIC execution never converts through float and shares invocation admission. Allocations and byte-comparison operand work share a 4 MiB evaluation budget per row and expression set. An integer literal may use a decimal string for exact int64 transport; blob uses base64 and datetime uses the normal relational datetime representation. Comparisons require operands of compatible types (integer and number may mix) and return boolean or SQL UNKNOWN (null); is_distinct and is_not_distinct always return a boolean. Unary is_null and is_not_null test presence/null. AND and OR evaluate left to right with SQL three-valued short-circuit semantics; NOT preserves UNKNOWN. CHECK accepts TRUE and UNKNOWN, rejecting FALSE. Numeric literals and arithmetic operations may specify sql_type to retain PostgreSQL builtin overflow and float4 rounding semantics. Without it, integer and number operations retain int64 and float64 semantics. Numeric cast requires type and sql_type, takes one numeric argument, and performs a checked conversion when evaluated (not when the schema is compiled). Floating-to-integer casts round ties to even. The numeric expression type uses exact PostgreSQL NUMERIC values and may specify sql_type numeric. Its literals accept decimal strings or exact JSON numeric lexemes, including string-valued special values. Exact NUMERIC programs require reader capability version 21 even when their result is boolean or integer. Float/integer assignment casts keep their declared PostgreSQL rounding and overflow semantics. A cast to numeric may specify numeric_modifier for PostgreSQL precision and signed-scale coercion. Overflow is checked when the selected cast executes; unselected lazy branches do not fail. Modifier-bearing programs require reader capability version 23 even with integer/boolean output. The sql_array expression type requires sql_type on literals, including typed NULL, to declare the element builtin. Non-null literals use the ordinal SQL array envelope (dimensions with length/lower_bound, values, and sql_nulls), retaining shape and lower bounds. Array columns derive their exact element identity from the immutable schema. Comparisons, IN, COALESCE and CASE require matching array element identities; no element type is inferred from values. Array-dependent programs require reader capability version 24 even with scalar output. Assignment to a NUMERIC array column applies its precision/signed-scale modifier to each element. Array casts require type sql_array and an explicit matching sql_type; identity casts borrow the immutable input. Casts of numeric arrays may additionally specify numeric_modifier, coercing each non-NULL element with PostgreSQL precision and signed-scale semantics while preserving dimensions, lower bounds and NULL slots. Coercion is lazy and shares invocation admission with the surrounding expression. Array-valued ordered index keys and element-changing array casts are not supported by this expression contract. The array constructor requires sql_type and zero to 32 arguments. Constructor programs additionally require reader capability version 25, including constructors hidden inside scalar/boolean expressions. Scalar arguments must have the declared element domain, with explicit width-preserving numeric casts where needed. SQL NULL arguments become NULL elements. Array arguments must all have matching element types, dimensions and lower bounds; one leading dimension with lower bound 1 is added. All empty/NULL subarrays produce an empty array; mixing an empty/NULL subarray with a nonempty one is a dimension mismatch. Child expressions execute once, with shared work/cancellation and byte limits. case_when takes alternating boolean conditions and result expressions, followed by a mandatory fallback result (3 to 31 arguments, at most 15 branches). Conditions are evaluated in order; only the selected result is evaluated, and a NULL condition is not TRUE. All result expressions must have the same physical type. Numeric SQL lowering records builtin result-domain promotions as explicit casts. This operation requires schema capability version 18. modulo takes two same-domain integer or NUMERIC operands and returns the signed remainder (minInt modulo -1 is zero); a zero divisor rejects the write. in_list and not_in_list take one probe followed by 1 to 127 same-domain candidates. The probe is evaluated once; NULL probes return UNKNOWN. A matching candidate wins over NULL candidates; otherwise a NULL candidate makes the result UNKNOWN. These operations require schema capability version 19. JSON expressions require reader capability version 30. The json type carries JSONB semantics, including exact numeric values and display scale. jsonb_typeof and jsonb_array_length take one JSON argument; array length rejects a non-array value. jsonb_extract_path and jsonb_extract_path_text take a JSON argument followed by 1 to 31 text path components. Negative array ordinals count from the end; a missing path returns SQL NULL. JSON extraction retains JSON null; text extraction converts JSON null to SQL NULL. Arguments are evaluated strictly, while enclosing CASE/coalesce retain their short-circuit semantics.
 pub const RelationalScalarExpression = struct {
     op: RelationalExpressionOp,
     type: ?RelationalExpressionType = null,
@@ -38092,6 +38098,8 @@ pub const RelationalScalarExpression = struct {
     numeric_modifier: ?SQLNumericModifier = null,
     /// Typed literal value, including null.
     value: OpenApiOptionalNullable(std.json.Value) = .absent,
+    /// Canonical PostgreSQL interval text, accepted only on a uuidv7 default operation. SQL lowering resolves and binds calendar months, days, and microseconds before publication. Omission generates an unshifted UUID; SQL NULL shifts lower to a NULL literal instead. Infinite intervals remain representable declarations but fail when evaluated.
+    shift: ?[]const u8 = null,
     /// For a literal of type json only. True denotes present JSON null and requires value to be omitted or null. False or omission leaves an omitted/null value as SQL NULL. This explicit marker survives SDKs that omit optional null values. Requires reader capability version 30.
     json_null: ?bool = null,
     column: ?[]const u8 = null,
@@ -38106,6 +38114,7 @@ pub const RelationalScalarExpression = struct {
         .{ "sql_type", "sql_type", true },
         .{ "numeric_modifier", "numeric_modifier", true },
         .{ "value", "value", false },
+        .{ "shift", "shift", true },
         .{ "json_null", "json_null", true },
         .{ "column", "column", true },
         .{ "collation", "collation", true },
@@ -38147,6 +38156,10 @@ pub const RelationalScalarExpression = struct {
                 try jw.write(value);
             },
         }
+        if (self.shift) |value| {
+            try jw.objectField("shift");
+            try jw.write(value);
+        }
         if (self.json_null) |value| {
             try jw.objectField("json_null");
             try jw.write(value);
@@ -38173,6 +38186,8 @@ pub const RelationalUniqueConstraint = struct {
     origin: ?RelationalUniqueConstraintOrigin = null,
     /// SQL primary-key identity. At most one per relational table; all key columns must be required and nonnullable.
     primary: ?bool = null,
+    /// Non-key payload columns for this constraint's covering ordered index. They never participate in uniqueness, foreign-key target identity, or primary-key nullability. Only column-key, constraint-owned declarations support INCLUDE.
+    include_columns: ?[]const []const u8 = null,
     columns: ?[]const []const u8 = null,
     /// Typed native unique keys. Specify either columns or keys.
     keys: ?[]const RelationalIndexKey = null,
@@ -38189,6 +38204,7 @@ pub const RelationalUniqueConstraint = struct {
         .{ "name", "name", false },
         .{ "origin", "origin", true },
         .{ "primary", "primary", true },
+        .{ "include_columns", "include_columns", true },
         .{ "columns", "columns", true },
         .{ "keys", "keys", true },
         .{ "where", "where", true },
@@ -38215,6 +38231,10 @@ pub const RelationalUniqueConstraint = struct {
         }
         if (self.primary) |value| {
             try jw.objectField("primary");
+            try jw.write(value);
+        }
+        if (self.include_columns) |value| {
+            try jw.objectField("include_columns");
             try jw.write(value);
         }
         if (self.columns) |value| {
@@ -42950,10 +42970,173 @@ pub const SQLBuiltinType = enum {
     }
 };
 
+/// Native catalog resource kind; never a synthetic physical table.
+pub const SQLCatalogObjectKind = enum {
+    sequence,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .sequence => "sequence",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "sequence", .sequence },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+pub const SQLCatalogOperationKind = enum {
+    create,
+    alter,
+    rename,
+    drop,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .create => "create",
+            .alter => "alter",
+            .rename => "rename",
+            .drop => "drop",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "create", .create },
+            .{ "alter", .alter },
+            .{ "rename", .rename },
+            .{ "drop", .drop },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// Recovery receipt for an atomic native catalog mutation, separate from physical table/schema publication receipts. Retain recovery_token and observe it with getSQLCatalogOperation; never resubmit uncertain DDL. Retention is bounded by catalog activity, not a promised wall-clock interval. Missing, expired, inaccessible or superseded-authority outcomes cannot be inferred from a current object name and remain unknown. This receipt does not make a new request idempotent or recover a token lost with an entire response. All identity integers are exact decimal strings.
+pub const SQLCatalogOperationReceipt = struct {
+    kind: SQLCatalogObjectKind,
+    operation: SQLCatalogOperationKind,
+    database: []const u8,
+    namespace: []const u8,
+    name: []const u8,
+    state: SQLCatalogOperationState,
+    /// Opaque versioned operation handle. Send it unchanged; it is not a reusable admission ticket.
+    recovery_token: []const u8,
+    /// Actual committed catalog identity, when the result carries one; never a predicted allocation.
+    object_id: ?[]const u8 = null,
+    generation: ?[]const u8 = null,
+    catalog_revision: ?[]const u8 = null,
+    diagnostic: ?SQLDiagnostic = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "kind", "kind", false },
+        .{ "operation", "operation", false },
+        .{ "database", "database", false },
+        .{ "namespace", "namespace", false },
+        .{ "name", "name", false },
+        .{ "state", "state", false },
+        .{ "recovery_token", "recovery_token", false },
+        .{ "object_id", "object_id", true },
+        .{ "generation", "generation", true },
+        .{ "catalog_revision", "catalog_revision", true },
+        .{ "diagnostic", "diagnostic", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("kind");
+        try jw.write(self.kind);
+        try jw.objectField("operation");
+        try jw.write(self.operation);
+        try jw.objectField("database");
+        try jw.write(self.database);
+        try jw.objectField("namespace");
+        try jw.write(self.namespace);
+        try jw.objectField("name");
+        try jw.write(self.name);
+        try jw.objectField("state");
+        try jw.write(self.state);
+        try jw.objectField("recovery_token");
+        try jw.write(self.recovery_token);
+        if (self.object_id) |value| {
+            try jw.objectField("object_id");
+            try jw.write(value);
+        }
+        if (self.generation) |value| {
+            try jw.objectField("generation");
+            try jw.write(value);
+        }
+        if (self.catalog_revision) |value| {
+            try jw.objectField("catalog_revision");
+            try jw.write(value);
+        }
+        if (self.diagnostic) |value| {
+            try jw.objectField("diagnostic");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+/// A retained authoritative result, or an unconfirmed outcome. Unknown is never permission to replay DDL.
+pub const SQLCatalogOperationState = enum {
+    committed,
+    rejected,
+    unknown,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .committed => "committed",
+            .rejected => "rejected",
+            .unknown => "unknown",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "committed", .committed },
+            .{ "rejected", .rejected },
+            .{ "unknown", .unknown },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+pub const SQLCatalogRecoveryRequest = struct {
+    recovery_token: []const u8,
+};
+
 pub const SQLColumn = struct {
     /// Display label. Labels need not be unique; rows use matching ordinal positions.
     name: []const u8,
     type: SQLColumnType,
+    temporal_kind: ?SQLTemporalKind = null,
     /// Required for array columns and exact NUMERIC number columns. Identifies scalar widths when supplied. The descriptor applies even to NULL or empty arrays.
     element_type: ?SQLArrayElementType = null,
     /// Present only for constrained NUMERIC scalar or array results. Prepared result metadata is stable before execution-time constant folding.
@@ -42963,6 +43146,7 @@ pub const SQLColumn = struct {
     pub const openApiFieldMetadata = .{
         .{ "name", "name", false },
         .{ "type", "type", false },
+        .{ "temporal_kind", "temporal_kind", true },
         .{ "element_type", "element_type", true },
         .{ "numeric_modifier", "numeric_modifier", true },
     };
@@ -42981,6 +43165,10 @@ pub const SQLColumn = struct {
         try jw.write(self.name);
         try jw.objectField("type");
         try jw.write(self.type);
+        if (self.temporal_kind) |value| {
+            try jw.objectField("temporal_kind");
+            try jw.write(value);
+        }
         if (self.element_type) |value| {
             try jw.objectField("element_type");
             try jw.write(value);
@@ -43082,7 +43270,7 @@ pub const SQLConnectionResponse = struct {
     namespace: []const u8,
 };
 
-/// Durable DDL operation receipt. admission_unknown means admission has not been confirmed; retain the matching restore job, FK publication ID, or index publication token and reconcile its status without replaying DDL. Pending means a durable operation was admitted, not necessarily that its successor schema is published. Invalid means declaration validation failed. Do not replay either. For an index build, observe the exact publication token; otherwise inspect its restore job or table constraint status using this immutable table identity and schema generation. A later generation may supersede the completed operation.
+/// Durable DDL operation receipt. admission_unknown means admission has not been confirmed; retain the matching restore job, FK publication ID, index publication token, or schema validation token and reconcile its status without replaying DDL. Pending means a durable operation was admitted, not necessarily that its successor schema is published. Invalid means declaration validation failed. Do not replay either. For an index build, observe the exact publication token. For validation-only schema changes, observe the exact schema validation token; otherwise inspect its restore job or table constraint status using this immutable table identity and schema generation. A later generation may supersede the completed operation.
 pub const SQLDDLReceipt = struct {
     database: []const u8,
     namespace: []const u8,
@@ -43098,6 +43286,7 @@ pub const SQLDDLReceipt = struct {
     /// Immutable FK-generation publication identity. Retain it when admission is unknown or activation remains pending; do not replay DDL.
     fk_generation_publication_id: ?[]const u8 = null,
     index_publication_token: ?IndexPublicationToken = null,
+    schema_validation_token: ?SchemaValidationToken = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
@@ -43112,6 +43301,7 @@ pub const SQLDDLReceipt = struct {
         .{ "idempotency_key", "idempotency_key", true },
         .{ "fk_generation_publication_id", "fk_generation_publication_id", true },
         .{ "index_publication_token", "index_publication_token", true },
+        .{ "schema_validation_token", "schema_validation_token", true },
     };
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
@@ -43154,6 +43344,10 @@ pub const SQLDDLReceipt = struct {
         }
         if (self.index_publication_token) |value| {
             try jw.objectField("index_publication_token");
+            try jw.write(value);
+        }
+        if (self.schema_validation_token) |value| {
+            try jw.objectField("schema_validation_token");
             try jw.write(value);
         }
         try jw.endObject();
@@ -43296,12 +43490,14 @@ pub const SQLNumericModifier = struct {
 /// Immutable positional input contract. Element identity also preserves primitive widths; array inputs require it. Unknown slots have no SQL constraint.
 pub const SQLParameterDescriptor = struct {
     type: SQLColumnType,
+    temporal_kind: ?SQLTemporalKind = null,
     element_type: ?SQLArrayElementType = null,
     nullable: bool,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
         .{ "type", "type", false },
+        .{ "temporal_kind", "temporal_kind", true },
         .{ "element_type", "element_type", true },
         .{ "nullable", "nullable", false },
     };
@@ -43318,6 +43514,10 @@ pub const SQLParameterDescriptor = struct {
         try jw.beginObject();
         try jw.objectField("type");
         try jw.write(self.type);
+        if (self.temporal_kind) |value| {
+            try jw.objectField("temporal_kind");
+            try jw.write(value);
+        }
         if (self.element_type) |value| {
             try jw.objectField("element_type");
             try jw.write(value);
@@ -43534,6 +43734,7 @@ pub const SQLResponse = struct {
     command_tag: []const u8,
     mutation_outcome: ?SQLMutationOutcome = null,
     ddl_receipt: ?SQLDDLReceipt = null,
+    catalog_receipt: ?SQLCatalogOperationReceipt = null,
     /// Native transaction receipt for visibility or repair reconciliation; never replay a committed statement.
     transaction_id: ?[]const u8 = null,
     /// Opaque SQL session identifier for subsequent requests.
@@ -43549,6 +43750,7 @@ pub const SQLResponse = struct {
         .{ "command_tag", "command_tag", false },
         .{ "mutation_outcome", "mutation_outcome", true },
         .{ "ddl_receipt", "ddl_receipt", true },
+        .{ "catalog_receipt", "catalog_receipt", true },
         .{ "transaction_id", "transaction_id", true },
         .{ "session_id", "session_id", true },
         .{ "transaction_status", "transaction_status", true },
@@ -43584,6 +43786,10 @@ pub const SQLResponse = struct {
             try jw.objectField("ddl_receipt");
             try jw.write(value);
         }
+        if (self.catalog_receipt) |value| {
+            try jw.objectField("catalog_receipt");
+            try jw.write(value);
+        }
         if (self.transaction_id) |value| {
             try jw.objectField("transaction_id");
             try jw.write(value);
@@ -43597,6 +43803,44 @@ pub const SQLResponse = struct {
             try jw.write(value);
         }
         try jw.endObject();
+    }
+};
+
+/// Exact temporal identity for datetime-family SQL values. Omission means timestamp_tz. Intervals preserve separate calendar months, days, and microseconds and use PostgreSQL interval text in JSON results.
+pub const SQLTemporalKind = enum {
+    date,
+    time,
+    time_tz,
+    timestamp,
+    timestamp_tz,
+    interval,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .date => "date",
+            .time => "time",
+            .time_tz => "time_tz",
+            .timestamp => "timestamp",
+            .timestamp_tz => "timestamp_tz",
+            .interval => "interval",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "date", .date },
+            .{ "time", .time },
+            .{ "time_tz", .time_tz },
+            .{ "timestamp", .timestamp },
+            .{ "timestamp_tz", .timestamp_tz },
+            .{ "interval", .interval },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
     }
 };
 
@@ -43928,6 +44172,193 @@ pub const ScanKeysRequest = struct {
         try jw.endObject();
     }
 };
+
+pub const SchemaValidationFailure = enum {
+    requested,
+    not_null_violation,
+    owner_failed,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .requested => "requested",
+            .not_null_violation => "not_null_violation",
+            .owner_failed => "owner_failed",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "requested", .requested },
+            .{ "not_null_violation", .not_null_violation },
+            .{ "owner_failed", .owner_failed },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+pub const SchemaValidationPhase = enum {
+    validating,
+    validated,
+    installing,
+    installed,
+    releasing,
+    succeeded,
+    canceling,
+    canceled,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .validating => "validating",
+            .validated => "validated",
+            .installing => "installing",
+            .installed => "installed",
+            .releasing => "releasing",
+            .succeeded => "succeeded",
+            .canceling => "canceling",
+            .canceled => "canceled",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "validating", .validating },
+            .{ "validated", .validated },
+            .{ "installing", .installing },
+            .{ "installed", .installed },
+            .{ "releasing", .releasing },
+            .{ "succeeded", .succeeded },
+            .{ "canceling", .canceling },
+            .{ "canceled", .canceled },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+pub const SchemaValidationState = enum {
+    admission_unknown,
+    pending,
+    succeeded,
+    canceled,
+    failed,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .admission_unknown => "admission_unknown",
+            .pending => "pending",
+            .succeeded => "succeeded",
+            .canceled => "canceled",
+            .failed => "failed",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "admission_unknown", .admission_unknown },
+            .{ "pending", .pending },
+            .{ "succeeded", .succeeded },
+            .{ "canceled", .canceled },
+            .{ "failed", .failed },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// Historical job completion, not an authorization or promise that a later DDL has not superseded this schema. Success requires all owner installation, metadata publication and fence release barriers. Current table ownership is checked atomically with the job observation.
+pub const SchemaValidationStatus = struct {
+    schema_validation_token: SchemaValidationToken,
+    table_id: []const u8,
+    active_schema_version: i64,
+    state: SchemaValidationState,
+    phase: ?SchemaValidationPhase = null,
+    failure: ?SchemaValidationFailure = null,
+    owner_count: ?i32 = null,
+    ready: ?i32 = null,
+    installed: ?i32 = null,
+    released: ?i32 = null,
+    canceled: ?i32 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "schema_validation_token", "schema_validation_token", false },
+        .{ "table_id", "table_id", false },
+        .{ "active_schema_version", "active_schema_version", false },
+        .{ "state", "state", false },
+        .{ "phase", "phase", true },
+        .{ "failure", "failure", true },
+        .{ "owner_count", "owner_count", true },
+        .{ "ready", "ready", true },
+        .{ "installed", "installed", true },
+        .{ "released", "released", true },
+        .{ "canceled", "canceled", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("schema_validation_token");
+        try jw.write(self.schema_validation_token);
+        try jw.objectField("table_id");
+        try jw.write(self.table_id);
+        try jw.objectField("active_schema_version");
+        try jw.write(self.active_schema_version);
+        try jw.objectField("state");
+        try jw.write(self.state);
+        if (self.phase) |value| {
+            try jw.objectField("phase");
+            try jw.write(value);
+        }
+        if (self.failure) |value| {
+            try jw.objectField("failure");
+            try jw.write(value);
+        }
+        if (self.owner_count) |value| {
+            try jw.objectField("owner_count");
+            try jw.write(value);
+        }
+        if (self.ready) |value| {
+            try jw.objectField("ready");
+            try jw.write(value);
+        }
+        if (self.installed) |value| {
+            try jw.objectField("installed");
+            try jw.write(value);
+        }
+        if (self.released) |value| {
+            try jw.objectField("released");
+            try jw.write(value);
+        }
+        if (self.canceled) |value| {
+            try jw.objectField("canceled");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+/// Opaque immutable validation-only schema job identity. Retain it across timeouts or lost replies and observe its exact status without replaying DDL. It grants no authorization.
+pub const SchemaValidationToken = []const u8;
 
 pub const ScopedRowFilter = struct {
     table_target: CatalogTableScope,

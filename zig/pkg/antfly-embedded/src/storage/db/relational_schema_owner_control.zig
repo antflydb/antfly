@@ -16,7 +16,8 @@
 //! Shared schema-owner preparation and native metadata journal/outbox effects.
 //! Trusted storage adapter only: metadata/root/cohort authorization and
 //! producer capability admission belong to the receiving owner. No public
-//! mutation escape hatch, signature, publication or fence release is provided.
+//! mutation escape hatch or signature is provided. Terminal fence release
+//! requires the outer owner's independently authenticated publication decision.
 const std = @import("std");
 const A = std.mem.Allocator;
 const job = @import("relational_nullability_job.zig");
@@ -123,15 +124,7 @@ pub const Frame = struct {
     }
 };
 
-pub const Outcome = struct {
-    /// Trusted duplicate standby LSNs may skip work without asserting a
-    /// current header. No logical/signed publication receipt is returned.
-    header: ?job.Header,
-    position: Native,
-    duplicate: bool,
-    replication_pending: bool = false,
-    error_name: ?[]const u8 = null,
-};
+pub const Outcome = contract.NativeOutcome;
 
 /// Independently read local facts, never a signed receipt or metadata grant.
 /// Zero is an observed empty native clock, not a fabricated receipt position.
@@ -145,26 +138,50 @@ pub const Prepared = struct {
     alloc: A,
     command: Command,
     context: operation.RequestContext,
+    command_identity: Digest = @splat(0),
+    guard_rejection: ?@import("relational_schema_apply_outcome.zig").Reason = null,
     owned: ?[]u8 = null,
     candidate: ?job.Candidate = null,
     page: ?job.PreparedPage = null,
+    debt_page: ?@import("../transaction_debt.zig").Page = null,
     schema_data: ?SchemaData = null,
     payload: ?Payload = null,
 
     pub fn init(a: A, core: *core_mod.DBCore, command: Command, context: operation.RequestContext) !@This() {
-        return initFor(a, core, command, context, .native);
+        return initFor(a, core, command, context, .native, false);
     }
-    /// Private committed-entry adapter. No position is accepted in command
-    /// bytes; the state machine supplies it separately when applying.
+    /// Producer preparation rejects invalid input before proposal. Positions
+    /// are supplied separately by committed apply, never by command bytes.
     pub fn initRaft(a: A, core: *core_mod.DBCore, command: Command, context: operation.RequestContext) !@This() {
-        return initFor(a, core, command, context, .raft);
+        return initFor(a, core, command, context, .raft, false);
     }
-    fn initFor(a: A, core: *core_mod.DBCore, command: Command, context: operation.RequestContext, authority: @FieldType(job.Binding, "authority")) !@This() {
+    /// Original committed bytes only. Unlike producer preparation, this must
+    /// preserve stale guards as candidates for an atomic durable rejection.
+    pub fn initCommittedRaft(a: A, core: *core_mod.DBCore, command: Command, context: operation.RequestContext) !@This() {
+        return initFor(a, core, command, context, .raft, true);
+    }
+    fn initFor(a: A, core: *core_mod.DBCore, command: Command, context: operation.RequestContext, authority: @FieldType(job.Binding, "authority"), committed: bool) !@This() {
         try context.ensureActive();
-        try command.validateFor(authority);
+        const command_identity: Digest = if (authority == .raft) try command.raftIdentity() else blk: {
+            try command.validateFor(authority);
+            break :blk @splat(0);
+        };
         if (!command.binding.fence.namespace.eql(core.identity_namespace)) return error.IdentityNamespaceMismatch;
-        var self: @This() = .{ .alloc = a, .command = command, .context = context };
+        var self: @This() = .{ .alloc = a, .command = command, .context = context, .command_identity = command_identity };
         errdefer self.deinit();
+        if (committed) {
+            var guard_read = try core.store.beginReadTxn();
+            defer guard_read.abort();
+            self.guard_rejection = try job.guardRejection(&guard_read, command);
+            if (self.guard_rejection != null) {
+                // Keep a trusted rejection candidate, not an apply grant.
+                // Apply must independently recheck durable guards. Own all
+                // bytes before the transport buffer is released.
+                self.owned = try a.dupe(u8, command.payload);
+                self.command.payload = self.owned.?;
+                return self;
+            }
+        }
         // Nonempty payloads must outlive the request/transport buffer.
         if (command.action != .begin and command.payload.len != 0) {
             self.owned = try a.dupe(u8, command.payload);
@@ -184,7 +201,7 @@ pub const Prepared = struct {
         if (current) |header| if (std.meta.eql(header.binding, command.binding)) {
             const observed = try job.observe(a, &read, command.binding);
             if (try duplicate(self.command, observed)) |position| {
-                if (command.action == .install) {
+                if (command.action == .install and observed.phase == .installed) {
                     core.lockApplyShared();
                     defer core.unlockApplyShared();
                     try requireResident(core, observed);
@@ -195,6 +212,19 @@ pub const Prepared = struct {
         };
         switch (command.action) {
             .begin, .freeze, .cancel => {},
+            .reconcile_transactions => {
+                var manager = try core.initTxnManager();
+                defer manager.deinit();
+                self.debt_page = (try manager.prepareTopologyDebtPage(try @import("../transaction_debt.zig").Scope.fromBinding(command.binding), control(&context))) orelse return error.SchemaValidationJobChanged;
+                if (!equal(self.debt_page.?.expected, command.payload[0..32].*)) return error.SchemaValidationPreparationChanged;
+            },
+            .release => {
+                const installed = try job.requireInstalled(a, &read, command.binding, command.payload[0..32].*);
+                if (!equal(try installed.digest(), command.payload[32..64].*)) return error.SchemaValidationJobChanged;
+                core.lockApplyShared();
+                defer core.unlockApplyShared();
+                try requireResident(core, installed);
+            },
             .page => self.page = try job.PreparedPage.replay(a, core, try job.PageCommand.decode(self.command.payload), control(&context)),
             .install => {
                 const ready = try job.requireReady(&read, command.binding);
@@ -238,12 +268,33 @@ pub const Prepared = struct {
         if (binding.authority != .raft) return error.InvalidControlReceiptPosition;
         return preparePageFor(a, core, binding, budget, context);
     }
+    /// A producer can propose these exact owned bytes without running the
+    /// bounded scan twice locally. A remote committed receiver independently
+    /// prepares the same predecessor through initCommittedRaft.
+    pub fn prepareTransactionDebtPage(a: A, core: *core_mod.DBCore, binding: job.Binding, context: operation.RequestContext) !?@This() {
+        try context.ensureActive();
+        try binding.validate();
+        {
+            var read = try core.store.beginReadTxn();
+            defer read.abort();
+            const header = try job.observe(a, &read, binding);
+            if (header.phase != .fencing) return error.SchemaValidationJobChanged;
+        }
+        var manager = try core.initTxnManager();
+        defer manager.deinit();
+        const page = (try manager.prepareTopologyDebtPage(try @import("../transaction_debt.zig").Scope.fromBinding(binding), control(&context))) orelse return null;
+        const payload = try a.dupe(u8, &page.expected);
+        errdefer a.free(payload);
+        const command: Command = .{ .binding = binding, .action = .reconcile_transactions, .payload = payload };
+        return .{ .alloc = a, .command = command, .context = context, .owned = payload, .debt_page = page, .command_identity = if (binding.authority == .raft) try command.raftIdentity() else @splat(0) };
+    }
     fn preparePageFor(a: A, core: *core_mod.DBCore, binding: job.Binding, budget: @import("relational_rows.zig").Budget, context: operation.RequestContext) !@This() {
         var page = try job.PreparedPage.prepare(a, core, binding, budget, control(&context));
         errdefer page.deinit();
         const encoded = try (try page.command()).encode(a);
         errdefer a.free(encoded);
-        return .{ .alloc = a, .command = .{ .binding = binding, .action = .page, .payload = encoded }, .context = context, .owned = encoded, .page = page };
+        const command: Command = .{ .binding = binding, .action = .page, .payload = encoded };
+        return .{ .alloc = a, .command = command, .context = context, .owned = encoded, .page = page, .command_identity = if (binding.authority == .raft) try command.raftIdentity() else @splat(0) };
     }
     pub fn validate(self: *const @This()) !void {
         return self.validateAuthority(.native);
@@ -294,9 +345,9 @@ pub const Prepared = struct {
     fn stageAt(self: *@This(), core: *core_mod.DBCore, txn: anytype, entry: ?@import("apply_receipts.zig").OrderedApplyReceipt) !Staged {
         if (self.requiresSchemaCommit()) return error.SchemaValidationPublicationRequired;
         if (try job.load(txn)) |header| if (std.meta.eql(header.binding, self.command.binding)) {
-            const observed = try job.observe(self.alloc, txn, self.command.binding);
+            const observed = try job.observeForApply(txn, self.command.binding);
             if (try duplicate(self.command, observed)) |position| {
-                if (self.command.action == .install) try requireResident(core, observed);
+                if (self.command.action == .install and observed.phase == .installed) try requireResident(core, observed);
                 return .{ .header = observed, .position = position, .duplicate = true };
             }
         };
@@ -304,10 +355,12 @@ pub const Prepared = struct {
         defer manager.deinit();
         const header = switch (self.command.action) {
             .begin => try job.stageBegin(self.alloc, txn, self.command.binding, if (self.candidate) |*value| value else return error.SchemaValidationJobRequired, entry),
+            .reconcile_transactions => try job.stageTransactionDebtPage(self.alloc, txn, self.command.binding, if (self.debt_page) |*value| value else return error.SchemaValidationJobChanged, entry),
             .freeze => try job.stageFrozen(self.alloc, txn, &manager, self.command.binding, entry),
             .page => try job.stagePage(self.alloc, txn, &manager, if (self.page) |*value| value else return error.SchemaValidationJobChanged, entry),
             .cancel => try job.stageCancel(self.alloc, txn, &manager, self.command.binding, entry),
             .install => return error.SchemaValidationPublicationRequired,
+            .release => try job.stageReleased(self.alloc, txn, &manager, self.command.binding, self.command.payload[0..32].*, self.command.payload[32..64].*, self.command.payload[64..96].*, entry),
         };
         return .{ .header = header, .position = header.updated, .duplicate = false };
     }
@@ -338,12 +391,19 @@ fn control(context: *const operation.RequestContext) @import("relational_nullabi
 
 fn duplicate(command: Command, header: job.Header) !?positions.Position {
     const position: ?positions.Position = switch (command.action) {
+        .reconcile_transactions => if (equal(header.last_effect, contract.transactionDebtEffect(command.payload[0..32].*))) header.updated else null,
         .begin => if (header.phase == .canceled) return error.SchemaValidationCanceled else header.admitted,
         .freeze => if (header.phase == .canceled) return error.SchemaValidationCanceled else header.frozen,
         .cancel => if (header.phase == .canceled) header.updated else null,
-        .install => if (header.phase == .installed) blk: {
+        .install => if (header.phase == .installed or header.phase == .released) blk: {
             if (!equal(header.installation.?.decision, command.payload[0..32].*) or
                 !equal(header.installation.?.ready_digest, command.payload[32..64].*)) return error.SchemaValidationJobChanged;
+            break :blk header.installation.?.position;
+        } else null,
+        .release => if (header.phase == .released) blk: {
+            if (!equal(header.installation.?.decision, command.payload[0..32].*) or
+                !equal(header.release.?.installed_digest, command.payload[32..64].*) or
+                !equal(header.release.?.publication, command.payload[64..96].*)) return error.SchemaValidationJobChanged;
             break :blk header.updated;
         } else null,
         .page => if (equal(header.last_effect, try (try job.PageCommand.decode(command.payload)).effect())) header.updated else null,

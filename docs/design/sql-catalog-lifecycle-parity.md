@@ -6,6 +6,1168 @@ qualification checkpoints are retained below with their exact scope.
 This is an implementation and qualification backlog, not
 a completion claim. PostgreSQL is the SQL standard and independent test oracle.
 
+## Current original-case qualification (2026-10-23)
+
+The ledger now records **762 implemented / 137 rejected / 428 superseded /
+259 unresolved**. The requested next-100 batch has closed **34 original cases**:
+`sql-0011`, `sql-0014`, `sql-0570`, `sql-0580`, `sql-0586`, `sql-0591`,
+`sql-0595`, `sql-0883`, `sql-0927`, `sql-0935`, `sql-0343`–`sql-0349`,
+`sql-1456`, `sql-1459`, `sql-1464`, `sql-0005`, `sql-0008`, `sql-0009`,
+`sql-0010`, `sql-0142`, `sql-0311`–`sql-0317`, and `sql-0744`–`sql-0745`;
+**66 of that target remain unfinished**. Twenty-nine are implementations; five are
+PostgreSQL-invalid originals (outer recursive MERGE, 42601, and ambiguous
+`RETURNING id`, 42702, ALTER ROLE SET with an expression, 42601, and two
+index names used as constraints, 42704), not thirty-four
+newly supported forms. The earlier sixteen mutation witnesses are ten original
+cases, not sixteen completions. **167 unresolved DDL/catalog cases remain open**; the role
+default cohort does not complete that feature work.
+
+### SET NOT NULL: validation-only publication and durable ACK recovery
+
+The exact original `sql-0744` now uses the durable schema-validation coordinator
+rather than a full physical rewrite. Six strict Debug mounted campaigns recover
+before scanning or with ready, installed, released, failed or canceled physical
+work committed but its metadata ACK absent. Metadata and data owners reopen
+independently. Both rows retain their storage-key digests, versions and semantic
+content digests; complete row values, PK/CHECK/generated enforcement, failed-job
+cleanup and a later repaired submission remain correct. Lost BEGIN replies are
+observed through the original receipt without resubmission. Paused installation
+checks logical visibility; serving readiness is required after publication.
+Cold reopening an unchanged physical store does not require inventing a new root.
+
+The independent PostgreSQL 18 oracle executes the unchanged statement on a
+UUID-backed table, verifies no physical row changes on failure or repeated
+success, and retains UUIDv7 defaults and constraint SQLSTATEs. All twenty oracle
+tests pass. The production Debug standalone campaign separately passes failure,
+repair, validation-only publication, no-op epochs and two cold restarts. This
+closes one original case, advancing the batch to **34/100**. Retained-parent
+artifact transfer and arbitrary multi-replica failover remain separately
+unfinished; the mounted campaigns do not claim those fault modes.
+
+### Committed schema controls across native snapshot restoration
+
+Committed schema controls now pin the destination's current local storage
+generation rather than using the source replica's generation as a portable
+root selector. The retained entry still owns the exact group, term, index,
+namespace and immutable job/schema binding. Kernel preparation and apply check
+that binding against the destination's actual persisted state; this is not
+metadata root-adoption permission. An already-committed terminal control can
+therefore replay even after the coordinator has retired its discovery task.
+
+Private Raft schema preparation, observation and snapshot capture use the
+existing durable-catalog open mode. They preserve routed namespace and restore
+admission, read persisted layouts/indexes/settings, and cannot create an empty
+replacement when a physical root is missing. Ordinary table/index provisioning
+keeps its explicit descriptor. Serving can retire a historical control owner
+and reopen through normal current-catalog checks once the ordered tail permits
+it; a deferred historical cache entry cannot permanently strand that transition.
+
+The compiled-owner campaign materializes a genuine native snapshot containing
+an active schema-validation header and a committed user row. It abandons an
+initial prepared import, installs the exact stream under a different local
+generation and physical root, then applies the retained terminal entry through
+the real control executor. A second cold open replays the exact entry again.
+Wrong namespaces reject, and ordinary reads retain complete row bytes, version
+and semantic digest. These retained log inputs are trusted-entry fixtures,
+not manufactured quorum evidence. Full retained-parent producer/grant transport
+and arbitrary multi-node decision faults remain separate unfinished work; this
+campaign does not promote another original SQL case.
+
+The combined strict Debug gate passes all 50 compiled-owner tests, eight managed
+restore tests, and 36 publication/authority tests in each server and metadata
+owner (plus their two-test companion owners), with no skips, failures or leaks.
+The Debug production CLI build also passes. The original-case ledger and all
+20 inventory audits remain unchanged and pass.
+
+### Retained-source recovery: bounded durable discovery
+
+A private pending-namespace index now accompanies signed source checkpoints.
+Its locator is synchronized before an active checkpoint can commit. Terminal
+checkpoint publication precedes locator removal. Reopening authenticates the
+current canonical slot under its namespace lock before repairing or removing a
+locator, so a stale scanner cannot erase a successor's obligation. The cursor
+visits one pending directory entry per call and retains its position across
+maintenance slices; it never opens historical terminal checkpoint records.
+Locators contain no grants or authority and cannot substitute for the signed
+record. Missing, corrupt or mismatched canonical state remains recovery debt.
+
+The production data runtime visits these pending namespaces on the existing
+schema-maintenance executor, with the same request deadline and cancellation.
+It uses the existing authenticated/read-safe metadata receipt route. An uncertain
+submission is never resent, renewed, or replaced with CURRENT. A negative receipt
+or partial cancellation leaves its retained image intact. A complete terminal
+cohort authorizes a durable retirement transition; release and directory sync run
+after closing the checkpoint guard. Lost release replies retry only release,
+without requiring the departed group's leader, provider or serving route.
+Unsubmitted reservations remain owned by their producer.
+
+This activates pending-obligation discovery and terminal retirement, not the
+remaining live snapshot producer, downloadable retained-transfer publication,
+or arbitrary multi-node source/grant fault matrix. No additional original SQL
+case is promoted by these storage recovery contracts.
+
+Verification: all eight outbox recovery contracts, all 50 compiled-owner tests,
+and the three schema-recovery scheduler regressions pass in Debug with no skips,
+failures or leaks. The production Debug build and source/license/inventory audits
+also pass. The physical replacement fixture commits a real row/catalog before
+cold observation; a missing directory or missing committed catalog is normalized
+to recovery-required, never treated as permission to construct a replacement.
+
+### Retained images: node ownership and publication-lane bounds
+
+Retained source images now live in a node-owned spool outside each removable
+replica directory. The WAL/file providers expose only their qualified durable
+receipt while serialized. The control owner prepares the destination before
+entering the shared Raft mutex, pins an inode with bounded envelope reads, then
+releases the mutex before manifest validation, directory synchronization or
+payload copying. No provider pointer or replica-owned executor escapes the pin;
+reopened descriptors retain a shared control-runtime lifetime lease.
+
+Same-filesystem capture uses a hard link. Cross-disk or unsupported-link capture
+uses a fixed 64-KiB buffer, checks cancellation between chunks, verifies the full
+source digest while copying, syncs and closes the writer, and publishes with an
+atomic no-replace rename. Existing references cannot be rebound to different
+bytes. A reserved producer reopening an uncertain link completes its directory
+barrier before the capture may be signed. Ordinary full receiver validation
+remains unchanged.
+
+Signed outbox retirement now calls the same retention-source interface. It
+closes the checkpoint guard before unlinking, preserves captured identity, and
+records retirement only after successful local durability. This lane does not
+require a surviving replica provider or current leadership. An unknown submit
+outcome still permits receipt observation only; losing an unlink response leaves
+the exact retirement ticket recoverable.
+
+Focused Debug tests cover replica-directory deletion before finish, cold reads,
+forced copy fallback, cancellation, corrupt bytes, conflicting references and
+idempotent unlink. The producer recovery campaign checks the real retention
+adapter across a lost unlink response. These are storage/transport-boundary
+witnesses, not invented quorum or metadata authority. Live producer discovery,
+crash-left copy garbage collection, retained-transfer registration/serving and
+full distributed activation remain unfinished; no original SQL disposition or
+capability advertisement changes in this increment.
+
+The production Debug build and the final combined 46 snapshot / 5 producer
+recovery gate pass. The separate 50 compiled-owner / 8 managed-restore regression
+also passes, with no skips, failures or leaks. Formatting, license/ownership
+boundaries and the unchanged original-case inventory audit pass.
+
+### Table comments: existing presentation authority
+
+The original `sql-0142` COMMENT ON TABLE now updates the existing table
+description through the same ID/schema/incarnation-guarded metadata replacement
+used by native table administration. It does not create a second annotation
+database or change a backup format. The request reads one current table record,
+preserves all unrelated fields and uses the existing durable CAS/receipt lane.
+It neither bumps a schema version nor rewrites user rows. Search-path binding
+shares ALTER TABLE's bounded immutable lookup and never skips an unauthorized
+or wrong-kind shadow. Ambiguous committed responses are not replayable errors.
+
+PostgreSQL and native lifecycle checks cover exact command tags, quoted/Unicode
+text, NULL/empty removal and 42501 for a read-only principal. Every unrelated
+table field, schema/index byte and primary identity/version/digest remains
+unchanged, including after independent metadata/session/data reopening.
+Authentication remains live. Other COMMENT targets are still unresolved;
+this table-description feature does not claim column/index/routine annotations.
+
+The five referenced prepared-source/table-comment native, boundary and
+PostgreSQL evidence gates pass together. The ledger audit passes all 20 tests.
+The subsequent broad Debug regression passes 1,298 SQL tests (four opt-in
+benchmark skips) and 236 server SQL tests (no skips), with no failures or leaks
+in either suite. These are separate validation counts, not original-case
+closures; protocol and native lifecycle gates retain their own strict selection.
+
+### Prepared CTEs: original protocol and cold ownership
+
+Four original PREPARE/EXECUTE cases now match PostgreSQL through real
+authenticated pgwire sessions: CTE INSERT, self-read CTE MERGE, recursive read
+and recursive UPDATE. Seven witnesses cover both root-only and parent/child
+graphs. UNION ALL retains duplicate child output; recursive membership updates
+each target once. Preparation-only sessions close without changing any primary
+identity, version or digest, before a separate session prepares and executes the
+unchanged original. Command counts, result names/type OIDs/NULLs, full source and
+target postimages, and subsequent UNIQUE enforcement are checked.
+
+Independent reopening of metadata, the durable SQL session store and data
+owners retains exact primary identities, versions/digests and enforcement.
+Authentication remains live; this is not authentication-store recovery,
+multi-node failover or distributed cancellation qualification. Pgwire transport
+framing is local to the protocol session;
+native metadata/data requests and Raft owners are real. The test never retries
+an admitted or ambiguous mutation: only the existing exact pre-admission read
+unavailability diagnostic permits a bounded retry.
+
+### Sequence DDL: native catalog authority and original-case activation
+
+The private allocator now uses a dedicated ordinary metadata command rather
+than routing each reservation through schema replacement. Its point-read
+preflight returns ready/applied/rejected/unknown, never a prospective lease.
+Only an actual persisted receipt issues values; missing historical outcomes
+remain unknown. Native committed-Raft and standalone tests cover exact replay,
+competing nonces, bounded eviction and cold reopening. Allocation preserves
+catalog/relation epochs and does not reload standalone routing projections.
+The service fault gate checks cancellation before proposal, an unlocked wait,
+lost replies, absent outcomes and post-proposal allocation failure, with no
+mutation retries. HTTP grants bind preparation/allocation/observation bodies.
+
+First-use distributed activation now reuses the existing durable decoder
+activation protocol. Read-only absent-name binding works at constraint-name
+coverage; decoding live sequences and every sequence write still require the
+sequence decoder barrier. Only fully validated, authorized DDL prepares that
+barrier. Seven producer, twelve leaf-contract, seventeen metadata/fault and two
+seed/startup tests pass in Debug with no failures, skips or leaks. The independent
+PostgreSQL oracle again verifies all fifteen original DDL witnesses. The new
+strict authenticated/cold lifecycle campaign passes all fifteen witnesses with
+no skips, failures or leaks, qualifying seven unchanged originals. Production
+metadata, remote data ingress and durable standalone owners now advertise
+sequence DDL; non-durable/mock owners do not implicitly acquire it. The campaign
+compares complete definitions, call flags and cached high-water marks, stable
+ownership and object IDs, exact SQLSTATEs/command tags and every source/collision
+row identity/version/digest after independent metadata/session/data reopening.
+Allocated preconditions use actual native reservations, not fabricated state.
+This does not qualify public nextval/currval, connection caches, serial/identity
+columns, default dependency cascades or multi-node failover. Those remain open.
+The final Debug production install and strict lifecycle rerun pass, including
+explicit profile counts for all seven originals and an actual read-only
+principal's 42501 rejection before creation. The ledger inventory audit and
+all twenty audit tests pass. The combined sequence/owner-admission gates have
+no skips, failures or leaks. No generated public contract changed in this
+allocator/activation increment. Cache cleanup removed no Zig/Rust outputs;
+the pre-existing global uv lock was left untouched.
+
+Public outcome transport now uses a distinct `catalog_receipt`, not a fabricated
+physical-table DDL receipt. Its bounded opaque token contains the original
+admission nonce/head, incarnation and typed request. Metadata's existing
+request-digest-bound outcome journal remains the authority; the token neither
+grants access nor authorizes resubmission. `POST /sql/operations/status` observes
+that exact operation with current authorization, even when new sequence ingress
+is disabled. Missing, evicted, malformed or unavailable outcomes remain unknown,
+with nonretryable SQLSTATE 40003; current name lookup is never used as proof.
+Receipt strings are owned before admission, and completion allocates nothing.
+All public identity integers are decimal strings, including full-width u64 IDs.
+
+Go, Python and TypeScript expose observation helpers and retain uncertain
+receipts on their SQL execution exceptions. Generated OpenAPI types remain the
+shared contract. SQL transport remains bounded, without redirects, ambient
+cookies or automatic mutation retries. Pgwire carries the receipt in diagnostic
+DETAIL and emits no CommandComplete for an uncertain operation. Four strict
+recovery tests cover HTTP, token lifetime/version/bounds, exact integer strings,
+live authorization and every receipt allocation failure before admission.
+Seven sequence-producer tests and the full listener-permitted pgwire gate pass
+in Debug. Cold staged recovery preserves the original CREATE result after both
+live-sequence and history-only installation; a same-nonce/different-body token
+remains unknown without changing the admission head. The production Debug
+binary also builds. SDK checks pass: Go's complete package suite, 49 Python SQL
+tests, 47 TypeScript SQL tests plus type-checking, and 19 Rust library tests.
+Rust generation now retains the public SQL diagnostic/uncertain-response union
+instead of erasing it to a generic error. That transport checkpoint alone
+earned no original-case credit; production activation is qualified above.
+
+The subsequent complete Debug SQL regression passes 1,305 core tests (four
+opt-in benchmark skips) and all 236 server SQL tests, with no failures or leaks.
+Counter outcome recovery now also has a read-only journal operation: two point
+reads authenticate the exact retained lease against its original request and
+current definition, without creating a writer, reserving another lease or advancing
+allocation state. Its generic owner requires only `get`; cold LSM tests verify
+pinned pre-allocation absence, exact post-restart results, nonce substitution,
+receipt eviction and allocation-failure cleanup. This remains internal allocator
+qualification, not public `nextval`, session caches or additional original credit.
+
+Review reproduced a historical boundary-lease hole: a valid allocation of
+9–10 could be rewritten as 3–10 while retaining its request digest, high-water
+mark and legal cache/bound checks. Counter requests now carry the complete
+expected state (generation, revision, last value and call flag), all bound into
+the request digest. Both fresh CAS and historical recovery verify that preimage;
+recovery compares the entire result to its exact pure transition, including
+lease start/count. No additional log, durable history or allocation is needed.
+The ascending/descending cycle regression fails before the fix and passes after
+it; cold native LSM checks also reject a self-consistent shortened receipt while
+preserving the live counter. The independent seven-profile PostgreSQL arithmetic
+oracle is unchanged. This is allocator correctness, not additional case credit.
+
+The next cohort separates immutable definitions from allocation state in the
+existing metadata transaction authority. Allocation-free signed-64-bit
+transitions represent a cached allocation as first/increment/count, not an
+array of values. Even a CACHE of 2^63−1 has constant preparation work and memory.
+Seven independent PostgreSQL profiles check cached high-water marks, ascending
+and descending bounds/cycles, minimum signed increments, setval, narrowing,
+ALTER START and RESTART. PostgreSQL also permits RESTART during CREATE:
+`START 100 RESTART 7` retains a declared START of 100 and an initial counter of
+7. Creation and atomic journal initialization now preserve that distinction;
+an independent native LSM reopening replays the first allocation without
+rewinding to START or allocating again. These are arithmetic/storage contracts, not execution of the
+seven original sequence DDL statements through native SQL.
+
+The counter journal uses generation/revision CAS and request-bound receipts.
+A lost reply returns its original allocation without advancing again; after
+receipt eviction, an old CAS fails closed instead of allocating twice. State
+and receipt writes share one native transaction. Counter records bind group
+and immutable sequence IDs, and never modify the catalog schema revision.
+Persisted format/revision/call-state fields are mandatory: malformed input must
+not receive an initial default that could issue an allocated value again.
+Historical replay also validates the stored result against its bound operation:
+reserve requires a lease, whereas SET requires no lease and the exact requested
+value/called flag. A request digest alone does not authenticate the stored
+result payload. These checks remain constant-space after later allocations
+have advanced the current counter; malformed historical receipts fail closed.
+At most one counter and 64 receipts remain per live sequence; cleanup and DROP
+are bounded point operations, not scans proportional to historical allocation
+volume. ALTER/RESTART construct their successor from typed options and cannot
+overwrite an allocation made since admission.
+
+`zig build system-catalog-sequence-test antfly-metadata-sequence-counter-test
+-Doptimize=Debug -j1` checks the oracle and actual LSM rollback, pinned readers,
+cold reopening, lost replies, injected state/receipt write failures, identity
+substitution, stale alteration, setval, churn and cleanup. Those counter tests
+alone are not metadata Raft or distributed failover qualification.
+
+The native catalog now owns sequence resources without manufacturing physical
+table records. Its mandatory-field descriptor is immutable between definition
+generations; allocation state and bounded receipts remain separate. The native
+metadata transaction atomically owns the namespace binding, descriptor, counter,
+owner-attribute bootstrap and reverse ownership edge. Namespace/incarnation and
+object-generation guards replace a global catalog-revision precondition for
+these intents. Read-only preflight is a preview, not an allocation receipt: the
+test admits an unrelated name between preview and apply and verifies the actual
+new identity instead of returning the predicted one. The internal records share
+this branch's unreleased v63 reader cohort and do not advertise unfinished v64
+validation-publication support.
+
+The real standalone and committed-Raft-entry lifecycle test covers CREATE,
+RESTART, RENAME, DROP, conditional no-ops, wrong-kind rejection, stale admitted
+intent, stable OWNED BY attributes, forged owner proofs, cold reopening and
+binary snapshot installation. Counter rows participate in the existing metadata
+snapshot/projection machinery. Validation checks definitions, generation-bound
+counters, bounded receipts, namespace collisions and ownership closure before
+publication; shared owner layouts are pinned once per validation pass. Missing
+counters/attributes/edges and mismatched counter generations are rejected before
+any target catalog is published. ALTER retires obsolete-generation receipts in
+the same bounded transaction. Existing view/column-identity regressions pass.
+
+Portable definition-only catalog export/import is explicitly guarded until it
+can carry allocator state; it must not silently reset a sequence. This does not
+complete portable restore or distributed fault qualification.
+Standalone's policy-free export path now also consults the native admission
+head: an empty resource projection after conditional DDL or DROP cannot erase
+retry history from the export decision. Full hot-standby checkpoints and Raft
+metadata snapshots now share one sequence closure verifier. The checkpoint
+adapter streams the selected group's catalog/counter namespaces instead of
+copying the metadata database; owner layouts and physical schema/binding reads
+are retained once per distinct owner. A deterministic native read-count test
+checks one physical schema lookup for two sequences sharing a table. Group
+discovery includes orphan counter-only groups. Native checkpoint round trips,
+independent reopening and retained outcomes pass. Correctly framed checkpoint
+files missing counters, stable attributes, ownership edges or the entire
+outcome prefix are rejected; an otherwise identical no-omission file imports
+and serves. Transactional corruption/rollback checks also reject orphan counters.
+These Debug gates establish native checkpoint validation, not fresh-authority
+logical sequence transport or distributed fault qualification.
+Standalone portable export now reads its epoch and extension projection from
+the same durable authority used by its native checkpoint, rather than using
+distributed table-catalog counters/extension rows. A cold native regression
+reproduced revision 2 being exported as epoch 1; it now retains revision 2 and
+the registered extension manifest. Auxiliary-only edits no longer select a
+stale physical-counter epoch or omit the auxiliary extension projection. This
+qualifies export authority, not every paired-seed recovery scenario. Logical catalog and immutable
+policy programs are still captured in that one read transaction; clustered
+exports keep their existing catalog authority.
+Seed packaging now borrows the complete catalog export through one conversion
+to the existing logical topology contract, including immutable active policy
+programs. The serialization regression retains an enabled/default-deny program
+and its exact publication/owner ACKs across JSON encoding; omitting the program
+is rejected before staging. This closes a policy-program omission in seed
+capture, not the unfinished sequence state-transport requirement.
+The Debug standalone export regression passes both warm and independently
+reopened metadata. The storage gate, including all 73 server-storage and ten
+initial-FK/restore prerequisites, and the full production Debug build also pass.
+A stale ACK-migration fixture now constructs an actual pre-index layout rather
+than assuming modern BEGIN omits its membership index; it verifies the modern
+index, failed-migration rollback, exact replay and cold recovery. These are
+regression gates, not additional original SQL case credit.
+
+Native table/layout publication now retires OWNED BY sequences in its own
+metadata transaction. The reverse index selects only that table's edges;
+128-edge pages bound retained scratch independently of the number of owned
+sequences. Cursors close before mutation. Forward descriptors and stable
+attribute IDs must justify every reverse edge; corruption aborts publication.
+Retired counters, bounded receipts, namespace bindings and ownership edges
+disappear atomically. Renamed or retyped attributes retain their dependency
+when the stable ID survives. Table-bearing projection cuts include the counter
+lane too, so projected stores cannot retain orphan allocation state after DROP.
+This is internal lifecycle integration, not public SQL activation or case credit.
+The Debug native tests exercise actual standalone and committed-Raft table and
+column replacement, independent cold reopening, and rollback. A separate
+259-sequence campaign crosses multiple retained/deleted pages, corrupts a late
+dependency after two deletion pages, and checks complete transaction rollback.
+Successful column retirement preserves the other column's sequence and an
+independent sequence; subsequent table retirement preserves only the latter,
+including its allocated high-water mark and retry receipt after reopening.
+Empty ownership prefixes do not decode an attribute registry.
+
+Sequence DDL now has native, bounded admission/outcomes in that same metadata
+transaction. A private nonce and observed DDL head permit unrelated operations
+without an exact global-revision CAS. The catalog owns the durable head; 64
+outcome slots and 64 nonce indexes bound retained state. Exact redelivery
+returns the historical applied identity or precise rejection without executing
+again. Once an outcome is evicted, its old admission expires rather than
+allowing a CREATE to recreate a renamed/dropped object. Unknown/evicted replies
+are not safe automatic-retry signals. Conditional no-ops advance admission
+history but not schema revision, next ID or logical command hash.
+
+Native standalone and committed-Raft tests recover the actual identity after
+an unrelated allocation invalidates its preflight prediction, retain outcomes
+across independent cold opening and snapshot installation, reject nonce/body
+substitution, replay known rejections, and cross the eviction boundary without
+recreating a dropped sequence. Snapshot validation joins the catalog head to
+every retained slot/index; omitting the whole receipt prefix cannot reset that
+head. This is internal native/control-owner outcome plumbing, not authenticated
+public SQL execution, portable state transport or original-case credit.
+The independently linked storage-owner Debug gate exercises actual CREATE and
+RENAME through the opaque owner ABI, reopens the owner, and verifies historical
+outcomes and mismatch diagnostics. Logical catalog bootstrap preserves an
+earlier conditional outcome without fabricating a schema revision. Unexpected
+append collisions abort the outer transaction rather than becoming a semantic
+no-op after provisional definition writes. Persisted result fields are required;
+outcomes cannot claim a future catalog revision or an unallocated identity.
+
+The private catalog RPC now carries typed sequence mutation/outcome data
+through both distributed metadata service variants and standalone's native
+catalog owner. It shares the existing proposal receipts, capability fences and
+hot-standby write barrier. Status/head reads are administrative body-bound
+reads, not mutation calls. Typed preflight rejection crosses the compiled
+owner boundary without losing its SQL diagnostic in a generic runtime error.
+Distributed preparation, linearizable reads and encoding stay outside the
+catalog gate; native apply revalidates ownership and records the actual result.
+Service fault tests cover authorization/deadline rejection before proposal,
+applied-versus-predicted identities, precise rejections, wait failure, evicted
+outcomes and post-admission response-allocation failure without re-proposal.
+This private backplane is not activation of the still-guarded SQL producer.
+The HTTP framing gate verifies each new call with absent, wrong-purpose,
+body-mismatched and valid administrator grants; only the exact authorized
+body reaches the callback. Head/outcome calls retain read-identity fencing
+without being classified as writes or receiving unrelated policy/index grants.
+The full production Debug build is checked separately from filtered unit gates.
+
+A bounded sequence-binding snapshot now carries the admission head, catalog
+incarnation, ordered namespace/name lookups and optional stable owner-column
+binding from one native read transaction. Missing databases/namespaces, absent
+names and occupied non-sequence relations remain distinct; a wrong-kind shadow
+cannot become apparent absence. Owner-name resolution shares the mutation
+owner validator and checks its exact schema/identity guard. Provisional column
+identity preparation remains read-only and is validated again at mutation.
+The response validator rejects substituted target names, malformed namespace
+states and unrequested owner identities. Cancellation/deadline controls cross
+the checked owner ABI and are checked during the bounded lookup. This connects
+the private standalone/distributed binding backplane. The SQL producer now
+uses that cut behind a backend-readiness capability; portable restore and
+public activation remain unfinished and receive no case credit.
+The combined Debug gate passes the native sequence suites, checked-owner
+snapshot/cancellation boundary, error-identity tests and full production binary.
+This is not public SQL activation or additional original-case qualification.
+
+The guarded SQL producer now binds CREATE/ALTER/RENAME/DROP to that native
+mutation lane. ALTER explicitly requests the persisted counter together with
+the immutable descriptor; it never recreates state from the declared START.
+OWNED BY uses the existing table-admission resolver, then binds a stable
+attribute ID in a fresh transaction-pinned sequence/owner cut. A stale owner
+guard or a cross-schema ownership target rejects before mutation. Shared
+namespace-usage authorization is the existing view producer's behavior, not
+a second RLS or permission model.
+
+PostgreSQL probes establish conditional no-op and option/owner error precedence,
+quoted `"integer"` versus the INTEGER grammar alias, and 55000 for cross-schema
+ownership. The producer tests verify those boundaries, typed integer options,
+actual applied identities, authentication/permission/deadline/cancellation
+rejection before catalog access, and stable owned attributes. No sequence
+identity is returned as a fabricated physical-table receipt. After an ambiguous
+mutation response, the producer observes the same bound nonce once within the
+original request budget. Missing, malformed or unavailable outcomes remain
+40003 and non-retryable; no mutation is re-prepared or re-proposed. Definite
+sequence generation/counter conflicts remain retryable 40001 diagnostics.
+
+The Debug public-readiness guard and seven producer tests pass without skips,
+failures or leaks. The capability remains false in every production source;
+public recovery handles and portable allocator-state restoration still have to
+be completed before enabling it. Multi-sequence DROP remains explicitly
+unsupported rather than becoming a loop of independently committed drops.
+These tests are admission qualification, not original-case closures.
+The native Debug gates additionally pass 13 compiler/domain/diagnostic tests,
+11 counter/journal tests and 13 catalog/storage tests without skips, failures
+or leaks. The native counter lookup explicitly preserves START 100 versus
+persisted RESTART 7 in both standalone and committed-Raft paths. PostgreSQL
+rechecks all 15 original-declaration witnesses and seven arithmetic/cache
+profiles. The production Debug server build, control-catalog ownership check
+and all 20 ledger integrity tests pass; original dispositions are unchanged.
+The full Debug SQL regression subsequently passes 1,305 SQL tests (four
+opt-in benchmark skips) and 236 server SQL tests (no skips), with zero failures
+or leaks. The larger lake aggregation stress test remains enabled; its Debug
+allocator stack-tracing overhead was observed, not bypassed for this run.
+
+Continuity capture now reuses the existing checksummed
+`Topology.standalone_metadata` artifact instead of serializing a second
+allocator log. One native read transaction supplies both the streamed checkpoint
+and its logical projection, with the artifact's exact size/checksum embedded
+in that projection. The standalone seed provider uses this paired capture;
+sources without the capability retain the guarded definition-only path.
+The topology validator requires the matching native artifact, including for
+a history-only catalog after its last sequence has been dropped. Logical-only
+startup explicitly rejects paired projections. Native staging validates the
+counter/definition cut, stable ownership attributes, authority incarnation and
+bounded admission history before its projection can be published. Comparing
+only schema revision would be insufficient: allocations do not change it.
+The Debug native gate passes eleven counter/journal and fourteen server
+catalog/seed-reference tests. Standalone and committed-Raft lifecycle paths
+retain exact live state and history-only admissions across paired capture and
+reopening; the compiled-owner boundary also round trips the paired projection
+and exact historical success/rejection outcomes. The production Debug build
+passes. The strict staged gate now also materializes the actual paired seed
+and independently opens standalone metadata for live and history-only
+catalogs. START 100 versus initial counter 7 and allocated high-water 10,
+exact old CREATE outcomes and admission heads survive. Replaying the same
+allocation after recovery returns the original lease without advancing its
+counter again; allocation leaves catalog/schema metadata unchanged. This is
+native allocator transport qualification, not public nextval/session-cache
+execution. A paired logical projection without native state is
+rejected rather than bootstrapped. Distributed fault qualification remains
+unfinished; these internal proofs grant no original-case credit.
+
+Real startup qualification exposed two old standalone readiness gaps. Its
+coordinator advertised only the original protocol-33 decoder floor and built
+relation-only seals. It now durably activates the current single-binary reader
+cohort and shares the replicated worker's constraint-coverage migration and
+proof publication. Existing seals are replaced with new verified generations,
+never relabeled. Startup reads live-root coverage alongside its epoch and
+cannot return ready while the constraint-name replacement is still building.
+The strict Debug gate passes both paired recovery and old-seal migration,
+without synthetic activation or skipped tests. HA exclusion, per-feature SQL
+ingress readiness, owner ACKs and publication guards remain independent.
+Definition-only native export rejection now retains its exact semantic error
+across the checked owner boundary instead of becoming an opaque provider
+failure; the append-only internal failure ABI advances to 71.
+The broad standalone catalog and replicated reconciliation-worker Debug gates
+pass alongside production compilation and checked-owner recovery. The final
+strict seed/readiness and error-identity run completes all 115 build steps.
+All 36 shared reconciliation contracts also pass, including live coverage
+while replacement generations are building. Paired capture refreshes a stale
+local projection under its existing mutex before selecting the native cut;
+a real independent catalog write followed by private-owner capture and staged
+reopening qualifies that authority-epoch boundary (102 Debug build steps).
+No original SQL dispositions change from these architecture/restore gates.
+Fresh-authority logical clones need an explicit authority transition; copying
+old admissions into a new authority, or resetting an in-place restore's
+high-water, is not continuity. The existing definition-only export guard must
+remain until each selected restore mode can establish its complete proof.
+
+**The sequence DDL/serial/identity originals remain unresolved and receive no
+case credit.** The parser now retains typed CREATE/ALTER/DROP/RENAME intent,
+full-width signed constants, explicit/default bounds, reset intent, bounded
+multi-target DROP, and separately owned qualified type/column names. Types and
+OWNED BY remain unresolved names until catalog binding; CACHE-value checks
+remain after object lookup, preserving missing-object error precedence. The
+binding boundary requires an explicit resolved integer kind and immutable
+table/attribute IDs and rejects injected bound fields in an unbound intent.
+This parser change grants no mutation authority: a strict server guard prevents
+fallback into ordinary table/resource creation. Five focused Debug intent/
+binding tests include complete allocation-failure cleanup and compiler-owned
+input lifetimes; the strict server guard and 34 DDL regression tests pass.
+
+`generate_sql_sequence_declaration_reference.py` independently captures 15
+witnesses for the seven exact original declarations: complete definitions,
+allocation state, qualified ownership, collision SQLSTATEs, object identity,
+conditional no-ops and unchanged source row identities. In PostgreSQL, CREATE
+SEQUENCE IF NOT EXISTS skips an existing table, whereas DROP SEQUENCE IF EXISTS
+rejects that table with 42809; native admission must preserve this distinction.
+These oracle witnesses are not native lifecycle qualification or case credit.
+
+Authenticated SQL-to-metadata admission and public durable-outcome transport,
+expression execution, connection cache ownership, public SQL qualification of
+stable-column/table OWNED BY retirement, serial/identity defaults, transactional TRUNCATE identity resets,
+portable import/export and distributed fault qualification remain unfinished.
+The internal catalog kind is present, but public SQL execution remains guarded;
+the seven original declarations receive no native lifecycle case credit yet.
+
+### Nullability relaxation: independent fault and cold-owner qualification
+
+`sql-0745` now has an independent mounted campaign, rather than depending on
+the unfinished SET NOT NULL validation/restore path to establish its prerequisite.
+Its real UUID-primary-key table declares the initial NOT NULL constraint directly.
+The unchanged original uses the existing guarded metadata/schema CAS; no new
+coordinator or row rewrite is introduced. Native primary identities, versions
+and logical digests remain identical through relaxation and an explicit no-op
+retry. Defaults, stored generated expressions, numeric CHECK and primary-key
+enforcement remain live.
+
+The authenticated campaign covers a request positively not sent, a successful
+public SQL response deliberately lost, exactly one transport attempt, observation
+of the published schema, read-only rejection, and rejected writes preserving the
+complete primary/schema image. It independently reopens metadata, SQL session
+and data owners and checks the exact schema/primary stamps and future NULL
+writes. This is a public-response-loss test, not a claim of arbitrary internal
+metadata failover or completion of tightening/root-image recovery.
+
+The separate authority fixture submits that same original through the actual
+metadata service and committed Raft apply. It distinguishes pre-admission
+generation rejection (40001) from lost replies, post-commit allocation failure,
+malformed replies and wrong-version replies (40003, nonretryable). Each path
+performs exactly one schema submission and independently reopens the metadata
+authority, preserving either the exact predecessor or committed successor. It
+does not fabricate a successful apply or treat an ambiguous result as a retry.
+Its single-voter log fixture is not multi-node quorum-failover qualification.
+
+Both listener-permitted Debug campaigns pass with no skips, failures or leaks;
+their gate audits both exact test names before execution. The existing combined
+nullability Debug regression also passes. PostgreSQL 18.6 independently passes
+all 19 lifecycle oracle tests, including the new unchanged-original UUID/default/
+generated/CHECK campaign. Initialization had been blocked by exhausted macOS
+System V shared-memory slots. With explicit user approval, 31 exact segments
+were revalidated as user-owned, empty and unattached with exited creators before
+removal; the other segment and kernel settings were untouched. These empty
+orphans were not positively identified as PostgreSQL allocations.
+
+This closes **only `sql-0745`**, advancing the milestone to **33/100**. It does
+not close SET NOT NULL, distributed validation-root recovery, multi-node quorum
+failover, or complete source-outbox admission/restore activation described below.
+
+### Validation recovery: durable capture and retained-image reopening
+
+The source outbox now connects its durable intent to the compiled owner's
+snapshot-parent capture, not just a standalone checkpoint fixture. It reserves
+the exact lookup, owner/root scope and image reference before pinning. The
+owner invokes a synchronous capture callback after validating the real retained
+manifest and before waiting for quorum completion or signing. That callback
+persists the image witness and closes its checkpoint guard before returning.
+Leadership loss at certification therefore leaves a recoverable captured image.
+
+Recovery never substitutes CURRENT for a captured reference. The data runtime's
+WAL and file-provider adapters open the exact retained inode while serialized;
+checksum verification then streams outside the Raft mutex with a fixed 64-KiB
+buffer and request cancellation/deadline checks between chunks. The descriptor
+owns a shared control-runtime lifetime lease rather than borrowing the replica's
+executor or state pointer. Unlink, replica removal and supersession cannot
+redirect an already-open descriptor. Missing/corrupt/wrong-identity captures
+fail without repinning. Only a still-reserved intent may finish its first pin
+when its exact reference is absent. Root/header/binding validation and a fresh
+actual completed-prefix certificate remain mandatory before signing.
+
+Exact capture recovery is idempotent and preserves the outbox serial. Once an
+admission is prepared, capture is forbidden: recovery must use its saved command
+and body-bound grant, not re-sign another request. The compiled-owner campaign
+uses a real replica checkpoint, actual native owner header/root, and an explicitly
+opaque payload fixture. It exercises saved capture followed by leadership loss,
+independent outbox reopening after snapshot supersession, exact image recovery,
+and prepared-admission recapture rejection. Native NRSP2 stream qualification
+remains a separate storage gate; this adapter campaign is not a substitute.
+
+The pinned Zig production build and all three focused gates pass in Debug:
+`antfly-raft-snapshot-publication-test` (44 tests),
+`antfly-schema-validation-recovery-test` (two tests), and
+`antfly-storage-owner-source-test` with the exact compiled-owner campaign filter
+(one test). There are no skips, failures or leaks. The retained-reader campaign
+also verifies chunk-boundary cancellation without losing the pin, a descriptor
+surviving authorized unlink/supersession, and lifetime release on verification
+failure. Control-source catalog and original-inventory checks pass. These are
+correctness/ownership measurements, not a cold-recovery throughput benchmark.
+
+This completes the capture/reopen portion, not producer-worker activation.
+Production-worker metadata admission/outcome recovery, authorized transfer/adoption and
+retirement, validation-only SQL publication and distributed fault qualification
+remain unfinished. No protocol capability is advertised and no additional
+original SQL case is credited: the milestone remains **33/100**.
+
+### Validation recovery: exact admission dispatch and receipt-only recovery
+
+The producer outbox now connects grant preparation, one-attempt dispatch and
+read-only outcome recovery to the existing metadata HTTP client. Preparation
+persists the exact command bytes alongside the typed parent request and grant;
+the stored command is decoded and checked against that request on write/reopen.
+Submission copies those bytes instead of reserializing JSON. A noncanonical
+encoding therefore remains byte-for-byte identical across cold recovery, and
+an encoding change cannot silently invalidate its body-bound grant.
+
+Before transport the outbox durably enters observing. Its file guard closes
+before any RPC. Only the live attempt's positive non-send provenance can return
+that same serial/receipt to prepared, without renewing the grant. An already
+canceled transport request avoids checkpoint/transport work. If cancellation
+arrives during the attempt, known non-send or acceptance is recorded using an
+independent bounded local cleanup budget while the caller retains the root
+lifecycle lease; that cleanup permits no additional RPC or metadata mutation.
+
+After an uncertain attempt, a cold dispatcher only reads the exact receipt.
+Absent, malformed, mismatched or unavailable observations neither permit replay
+nor grant renewal, recapture or retirement. Exact acceptance becomes durable
+local authorized state; subsequent turns need no repeated acceptance RPC. This
+is historical acceptance, not a new owner-execution or adoption authority.
+
+The production Debug build and 13 focused Debug test executions pass: three
+outbox tests, eight client/ingress tests, one standalone compiled-boundary test
+and one compiled-owner capture campaign, without skips, failures or leaks.
+The new dispatcher campaign uses the real metadata client and real signed
+root-local checkpoints with a transport fixture; it verifies durable observing
+state and independently reacquires the file guard during RPC. Its simulated
+acceptance is not real metadata/Raft failover evidence. The actual ledger and
+ingress have separate authority tests; the active producer worker must still
+join those boundaries end to end before SQL activation is qualified.
+
+An observing record after a crash is deliberately not treated as a proven
+non-send. A timeout or missing receipt cannot seal it. Terminal discharge now
+requires the complete validated succeeded/canceled cohort, not merely its
+decision or a missing parent receipt. Metadata rejects new authorizations after
+that barrier while preserving historical exact receipts. Retirement persists
+before releasing the actual retained image; unlink and sync run outside the
+outbox guard. A lost release/checkpoint reply leaves a retryable retirement,
+and a serial-bound ticket cannot retire a successor obligation.
+
+### Validation recovery: coherent history and restarted reporter authorization
+
+An immutable image-identity index is committed atomically with its accepted
+parent. Restore finds that exact authorization through bounded point reads,
+without depending on a departed source process or scanning grant history.
+The private projection joins the retained authorization and CURRENT head/owner
+in one mirrored metadata snapshot. Raw ASVI recovery inputs stay binary and
+are checked against the admitted binding. This historical projection does not
+grant physical execution or bypass destination audit/adoption.
+
+The joined control builds an adoption request against the current owner/epoch
+CAS. A lost successful reply can observe that metadata already names the exact
+audited physical destination, without allocating another epoch. A superseded
+destination cannot use that observation to roll back the owner. Ordinary
+execution still needs a fresh independently authorized control read.
+
+Read requests may carry a freshly signed preparation/observation from a restarted
+reporter. Metadata verifies the already-accepted physical root, original
+preparation, retained root epoch, signature and current enrollment, placement,
+source report and reader requirements in the same read snapshot. It never
+rewrites a historical reporter/signature, accepts a different root, adds an ACK
+or changes a decision. All private ingress and compiled-owner paths preserve
+the complete request through one common projection adapter. Native clocks are
+not converted to Raft clocks, and capability-loss cleanup remains separately
+guarded.
+
+The four combined authority/publication/submission/recovery gates pass 118
+Debug test executions with no skips, failures or leaks. They cover cold ledger
+reopening, atomic parent/image-index writes, lost adoption replies, superseded
+destinations, exact private HTTP frames and real metadata enrollment/report
+checks before and after reporter replacement. Fresh-fact tests reject corrupt
+epoch history, foreign roots, old reporters, invalid signatures and capability
+loss without changing the accepted preparation, owner or ACKs. This is metadata
+and native-boundary qualification, not a full distributed restore campaign.
+The full production Debug build, control-source catalog check, original-case
+inventory audit, changed-source formatting and whitespace checks also pass.
+
+### Validation recovery: ordinary Raft replay and leader handoff
+
+Root adoption now has two explicit lineage modes. A retained-parent transfer
+keeps its existing source-image checks. Ordinary Raft recovery instead requires
+a complete signed native audit and an independently quorum-certified SHARED
+native/raw applied prefix. A promoted follower need not invent a snapshot
+artifact or contact the former leader. The native producer always invokes the
+actual prefix certifier for this mode, even when its data marker has no gap;
+the normal observation fast path is unchanged.
+
+The accepting metadata writer derives a required cut from the original signed
+preparation and every accepted signed ACK (at most five phases). Both the
+audited native cut and certified prefix must cover it. That cut is retained in
+the immutable epoch and recomputed from archived signatures during recovery.
+Caller-supplied counters, phase ordering and missing source receipts are not
+substitutes. Existing phase/header and installation/publication decisions,
+enrollment, placement, source authority and owner/head/epoch CAS checks remain
+mandatory. Adoption preserves all logical ACKs, original roots and signatures.
+
+Cold discovery uses an atomically staged `(owner group, identity namespace)`
+index and three point reads, not a plan/history scan. Split children can share
+an identity namespace; they must not alias each other's owner ordinal. The
+same private projection returns immutable ASVI bytes after source loss. No new
+public routes or physical operation retries are introduced.
+
+Pre-install cancellation can recover a replacement root after reader-role loss
+only when the SAME writer's metadata head has durably decided cancellation.
+It cannot publish a candidate; enrollment, placement, source/report and replay
+checks still apply. Canceling/canceled native state is rejected without that
+metadata decision. Accepted ACKs cannot have a missing required cut.
+
+The combined gates pass 123 Debug test executions without skips, failures or
+leaks. Real-LSM tests cover promoted replicas without artifacts/grants, cold
+lost-reply observation, pre-job snapshots followed by replay, before/after
+storage-write faults, archived ACK preservation and shared-namespace discovery.
+The real metadata authority fixture covers replay adoption and capability-loss
+cancellation; the compiled-owner fixture covers actual leased observations and
+the certifier callback. Synthetic ledger/image fixtures are not represented as
+an actual multi-node native restore or SQL activation campaign.
+The full production Debug build and control-source catalog check also pass.
+
+Automatic recovery/cohort-worker activation, runtime snapshot-plus-tail
+integration, full distributed restore/fault qualification and validation-only
+SQL publication remain unfinished. Ordinary Raft recovery must reuse the
+existing Raft artifact/runtime lifetime machinery, not depend on a departed
+source's per-job grant. The optional captured-parent producer is not activated:
+a lifecycle lease alone is not exclusion against capture racing terminal
+retirement. That explicit-transfer path still requires its qualified lineage
+and proper exclusion before use; its prototype is not a prerequisite for
+ordinary replay recovery. No protocol capability or additional original SQL
+case is credited (**33/100**).
+
+### Validation-only recovery: shared root-image contract
+
+Native row/debt/transaction/history auditing and metadata now share one pure
+audited-root wire contract. Physical capture, retained-read ownership, locking,
+signing and file installation stay with the native owner. Metadata verification
+does not import the physical DB. The canonical ASRP v1 bytes, signature domain
+and row-summary representation are unchanged; no new scan or proof system is
+introduced. The generated control-source catalog admits this boundary.
+
+A retained parent authorization can now qualify a destination's complete native
+audit against independently resolved live enrollment, placement and report
+facts. It joins the exact source image, stream/footer, job binding, signing and
+physical roots, reported term/applied floors and canonical header predecessors.
+A valid signature, larger counter or later phase alone never establishes that
+join. Forward install/release ancestry must also match metadata's exact durable
+decisions: a canonical local predecessor cannot create a missing decision or
+substitute a different one. Tests cover validly signed wrong images, absent installation lineage,
+stale reports, header substitution, allocation failure and authenticate-before-
+parse behavior. Actual native audit/restore/cold-reopen regressions also pass.
+The final metadata/authority/publication gates pass 105 test executions, and
+the native audit/checked-archive/provisioned-source gates pass 42, all in Debug without
+skips, failures or leaks. The final production Debug build, generated control
+catalog check, inventory integrity, formatting and whitespace checks pass.
+
+Metadata also persists immutable accepted root epochs through its existing
+command, transaction, preflight and durable-receipt machinery. Adoption compares
+the current head and owner preimage, requires a retained source authorization,
+and independently checks destination enrollment/report authority in that same
+writer. Root replacement never resets logical counters, phase chains, the
+immutable plan or the original signed preparation. Each retained ACK names its
+root epoch; displaced signed proofs are archived atomically with the new root,
+owner pointer and head. Exact historical retries need no live source or
+destination. A missing adoption record is unknown, not permission to retry a
+different transition. Cold recovery reverse-checks roots and proof archives.
+
+The real-LSM regression covers two replacements, re-attestation without duplicate
+ACKs, failures before/after each put, lost replies, cold reopen, missing history,
+and typed command/receipt round trips. The real metadata-authority fixture also
+qualifies adoption and current-root install/publication checks, capability-loss
+rejection, cancellation cleanup and historical retries. Ordinary current-root
+receipts retain their three point reads; history resolution never scans a plan
+or walks the root chain on the hot path.
+
+The native full-image auditor is reachable through private compiled-owner ABI
+104 and the provisioned source. One bounded turn retains row/debt/transaction/
+history traversal in the kernel; only owned progress or signed facts cross
+back. Raw immutable schema inputs stay binary. The provisioned source selects
+the signing directory and captures the physical generation from its own lease.
+Pending progress has separate partial-count validation and cannot substitute
+for the complete signed image's strict coverage checks. Completed responses
+are verified against the independently supplied signing identity.
+
+The checked-archive test resumes a two-row partial audit after owner close and
+reopen, verifies exact repeated completion, and rejects invalid ABI/budgets,
+foreign namespaces, expired deadlines and bad signing keys without advancing
+the data log. Provisioned-source tests also check actual leased generation,
+signed fencing images and cancellation before acquisition. These are native
+producer primitives; they do not yet connect durable snapshot completion and
+metadata adoption into an activated restore workflow.
+
+Origin-bearing replica snapshots also carry the canonical schema owner header
+in their bounded manifest prefix. The header and origin are captured from the
+same native probe read under the apply fence, before pinning the checkpoint;
+serialization never recaptures a later live phase. The receiver requires exact
+origin/header presence, canonical record hash, group/namespace and actual data
+cut joins before extracting files. This extends the unreleased data-26 format,
+not legacy snapshot bytes; producers below its durable barrier strip both
+origin and header. The changed internal snapshot return layout uses storage
+engine ABI 33; private owner ABI is 104 for the materialized manifest response.
+
+Native stream serialization returns the actual footer digest and captured
+identity without rereading the image. This is a materialized-stream receipt,
+NOT proof that the outer snapshot artifact was durably published. The archive
+regression captures a ready image, advances the live owner to install or
+cancel, then serializes and verifies the original header/footer; missing or
+substituted headers reject. The focused snapshot test gate now retains its
+compile-only reachability anchor independently of exact runtime filters.
+The actual writer receipt now crosses the opaque materialization boundary as an
+owned, bounded application manifest. Its file artifact retains that copy after
+the native snapshot source is released. Existing local Raft payload publication
+persists it in a checksummed version-two envelope, atomically with the payload;
+empty manifests retain the existing version-one bytes. Manifest corruption is
+rejected before allocating or reading a large payload. Fresh publication hashes
+the stream once, without rereading it to reconstruct provenance. A metadata-only
+read deliberately does not certify payload integrity or checkpoint publication.
+
+Debug qualification covers 21 snapshot-storage and 36 replica-publication tests,
+including cold checkpoint recovery of the manifest, plus the actual opaque native
+capture and four checked-archive tests. The combined Debug production build also
+passes. Source-parent authorization and restore/adoption callbacks still need
+their existing checkpoint, retention and metadata-lifecycle joins.
+
+Local snapshot retention now distinguishes prepared bytes from a successfully
+published replica checkpoint. Both existing replica stores retain the actual
+payload receipt returned by streaming publication or full cold validation;
+checkpoint failures cannot advance that receipt, and asynchronous workers own
+their result until host-thread completion. A retention request joins the exact
+durable identity and receipt before linking immutable bytes into a separately
+owned reference. Pinning reads only the bounded header/manifest, not the entire
+image under replica serialization. Portable `std.Io` hard links avoid copying
+large payloads and remain live across normal supersession and startup GC.
+
+References are fixed-width lifecycle commitments, never caller-supplied paths.
+Conflicting retries cannot replace another image; link/unlink retries finish
+directory synchronization even after an uncertain prior result. Cold retained
+reads fully verify the stream. Explicit retirement checks the retained identity
+and digest; latest-snapshot GC cannot authorize retirement. These are LOCAL
+durability/retention facts, not consensus certificates or metadata parent grants.
+Producer admission bounds, retained-reference recovery/outbox integration,
+authorized retirement and source-parent publication remain required before
+activation. No existing capability floor is advanced by this work.
+
+The final retention Debug gate passes 22 payload/storage and 38 replica
+publication tests, with no skips, failures or leaks, plus the full production
+build. Real checkpoint allocation failures leave new prepared images ineligible;
+pending asynchronous snapshots reject retention until completion. Tests also
+cover exact retries, conflicting references, provenance recovery after startup
+cleanup, corrupt retained payloads, and idempotent authorized retirement.
+Inventory integrity and its 20 regression tests pass with unchanged dispositions.
+
+The source-side parent producer now uses that retention boundary. A provisioned
+schema-owner session obtains the actual published checkpoint through a typed
+data-server callback. That callback uses the existing Raft mutex and provider;
+it neither discovers snapshots by filename nor recreates retired group owners.
+Only the immutable bounded manifest crosses back. The producer joins its exact
+group/index/term, captured schema header, physical root, generation and native
+footer with an independently captured and validated Raft completion proof before
+signing. Released leases, leadership loss, wrong roots and unpublished images
+cannot issue evidence. Valid legacy images without provenance request a native
+snapshot instead of being relabeled or reported as corrupt.
+
+The pure frozen-image contract is shared by writer and producer without importing
+the native DB into the control process. A retained image's through-index and a
+later actual quorum-completed prefix remain distinct signed fields: the latter
+must cover the former, not be fabricated at an older index. Metadata independently
+checks its live enrollment/report and actual completion in the accepting writer;
+destination installation still names the exact original image cut. The real-store
+authority fixture covers older images with newer completion as well as a false
+future prefix. Source adapter qualification uses a real replica checkpoint and
+compiled owner's header/root with an explicitly opaque fixture payload; actual
+NRSP2 bytes are qualified separately by the native writer/receiver gate.
+
+This is still not end-to-end activation. A bounded recoverable producer outbox
+must persist the exact signed admission before metadata submission, recover its
+outcome before recapturing any image, and join transfer/adoption/retirement. The
+current private producer does not activate that worker or advertise capabilities.
+
+Qualified Debug runs pass 106 source-adapter, authority and publication tests,
+plus the separate 22 native snapshot/storage tests. The production Debug build
+passes; the final follow-up changes only the test-only metadata authority fixture.
+Control-source ownership, generated errors, formatting and inventory checks pass.
+That checkpoint changed no original SQL disposition and remained at **32/100**;
+the later independent relaxation qualification above advances it to **33/100**.
+
+Immutable-image authorization now uses a separate completed-prefix certifier.
+After retaining and validating the frozen image, it requests a correlated quorum
+ReadState and waits for the shared installation/apply completion cursor to cover
+that boundary. It returns the actual completed index, not the moving hard-commit
+tip or an invented older index. Runtime incarnation, replica epoch, election term
+and local leadership must remain unchanged. Group-ID reuse therefore invalidates
+an in-flight attempt even within the same process and term. Owner admission uses
+try-lock and the bounded wait uses `std.Io` outside the Raft mutex; cancellation
+and timeout release the correlated waiter.
+
+The source producer requires this explicit capability rather than falling back
+to query-freeze semantics. Existing SQL frozen-read validation remains strict.
+A 64-boundary tracker campaign checks that later quorum responses cannot certify
+incomplete application, but do certify completed immutable prefixes while frozen
+queries still reject them. The compiled source adapter also rejects that query
+freeze and successfully signs its original image with the actual newer certified
+completion. Debug qualification passes both focused tests and five existing
+read-safety regressions, including real busy-owner waiter cleanup and persisted
+but uninstalled snapshots across reopen. The full production Debug build passes.
+The broader distributed fault and end-to-end restore activation work remains open.
+
+The private metadata client now separates grant preparation from submission.
+Preparation performs no network operation; a recoverable producer can persist
+the exact body-bound grant alongside its command before sending. The recovered
+submission method authenticates those bytes before command parsing, never
+refreshes an expired grant or rebinds it to another command, and exposes the
+per-attempt transport delivery tracker. Fresh submissions retain the existing
+one-parse path and avoid a redundant full-body HMAC verification of a grant they
+just created. Neither method retries an uncertain transport operation. Transport
+not-sent provenance is distinct from an exact durable acceptance receipt; absence
+of that receipt remains unknown.
+
+Debug qualification passes nine focused client/ingress tests and the production
+build. Tests check exact grant bytes, no network activity during preparation,
+expired/substituted/malformed-body rejection before transport, one attempt on a
+connection reset, and positive not-sent classification. This is a transport
+boundary, not a completed producer outbox: durable intent before image pinning,
+exact command/grant checkpointing, read-only uncertain-outcome recovery,
+retained-reference reopening and authorized retirement remain unfinished. The
+SQL milestone and capability floors are unchanged.
+
+This is an adoption primitive, NOT end-to-end SQL activation. Pre-begin and
+failure/cancellation ancestry, producer/restore integration, bounded history
+retirement and distributed fault qualification remain required before the
+reserved validation-publication capability can be advertised. No additional
+original case was credited by that primitive; the independent relaxation
+qualification above advances the batch from **32/100** to **33/100**.
+
+### Named arbiters: constraints are not index names
+
+The custom-named primary-constraint upsert `sql-1464` now matches PostgreSQL
+through public declarations and real metadata/data owners. It checks exact
+RETURNING labels/types/rows, the complete postimage, subsequent inferred-key
+upsert and duplicate enforcement, and exact physical versions/digests after
+independent cold owner recovery.
+
+The source originals `sql-1456` and `sql-1459` incorrectly named partial and
+expression UNIQUE indexes in `ON CONSTRAINT`. Both engines reject the unchanged
+SQL with 42704 over real declared indexes, without changing row versions,
+digests, postimages or schema identity. Valid predicate/expression index
+inference continues to work and enforce uniqueness after restart. These are
+two corrected invalid contracts, not two additional supported SQL forms.
+
+### Role defaults: qualified boundary
+
+Six unchanged ALTER ROLE SET/RESET originals now match PostgreSQL 18 through
+authenticated SQL, the existing metadata Raft authority and independent old/new
+connections. Complete catalog postimages, exact setting identities/generations,
+scoped-over-global precedence and cold reopening of both metadata and SQL session
+stores are checked. Connection defaults are a durable login-time baseline, not a
+mutable SET overlay: ALTER ROLE affects future logins and RESET returns an old
+connection to its own baseline. Managed principal incarnation IDs prevent a
+recreated account name from inheriting its predecessor's defaults or connections.
+
+Database-scoped role defaults bind the immutable catalog database ID, not its
+current name. The same catalog transaction refreshes display names on rename
+and removes unreachable defaults on DROP; recreating a name does not inherit
+the old scope. Generic setting-definition replacement cannot mint database-ID
+bindings, and apply, snapshot restore and portable import verify references
+against their own catalog cut. This is not qualification of populated database
+retirement or active/distributed connection barriers.
+
+Fresh-install coverage does not pre-register `statement_timeout`: the first
+global or database-scoped role SET installs its typed definition atomically.
+An explicitly empty login baseline remains pinned, so a later registration
+cannot introduce new role defaults into an already open connection. The
+decoder barrier covers raw proposal admission, durable apply and snapshot
+restore, rather than relying on the HTTP adapter alone.
+
+The native fault campaign checks pre-admission expiry, rejected timeout/database
+values, concurrent global/scoped edits, and a lost client reply after the actual
+HTTP owner commits. It does not replay an ambiguous mutation. Negative timeout
+values now retain SQLSTATE 22023 instead of escaping as an internal error.
+HTTP statement budgets include connection lookup time and never remove the
+operator hard deadline; pgwire independently checks old/new-login timeout and
+RESET behavior in protocol tests. This is not a hosted pgwire/native-role-DDL
+integration claim. The test does not require an observing query to finish in 1ms.
+
+This cohort qualifies registered, non-policy-sensitive custom dotted settings
+and statement_timeout. RLS-sensitive defaults remain fail-closed until the signed
+native policy-setting context carries login defaults consistently to every data
+owner. Undeclared GUCs, other control settings, role creation and SQL privileges
+are not activated by this work. No additional coordinator or replication engine
+has been introduced.
+
+Settings mutation reads now capture only settings records and an optional
+database point binding, not the full table/policy/publication catalog. Maximum
+role-scope duplicate validation and permutation-independent no-op comparison use
+sorted scratch ordinals instead of nested searches. The reproducible
+`zig build sql-role-default-bench -Doptimize=Debug -j1` microbenchmark measured
+about 62–63ms before and 1.9–2.0ms after per 1,024-scope validate/compare iteration
+on this machine (roughly 31–33×). This is not an end-to-end SQL latency claim.
+
+The broader Debug validation also repaired a pgwire JSONB fast-path mismatch:
+generic compact API JSON is not PostgreSQL JSONB text. Frozen validated tokens
+now stream canonical key order, spaces and exact numeric display directly, with
+stack scratch for small objects and bounded sorting scratch for larger objects;
+no DOM or complete intermediate JSON string is constructed on this path.
+Encoded API-JSON fallbacks normalize through the existing shared JSONB codec.
+Large nested objects, exact decimals/floats, output quotas, writer failures and
+allocation-failure cleanup are checked. The complete pgwire Debug gate passes
+132 tests; these correctness repairs do not add original-case credit.
+
+The Debug partitioned-join stress test also exposed expensive scratch turnover.
+Repartitioning now releases a failed hash build and its source block before
+splitting, and reuses bounded block scratch rather than freeing it all each
+turn. The unchanged 1,100-row underestimated-build witness reports two splits,
+four loaded partitions, 18,478 checkpoints and 61,272 peak accounted bytes. A
+deterministic checkpoint ceiling guards against work amplification. This is
+not an isolated before/after throughput benchmark or additional case credit.
+
+External-sort merge heads now borrow each input's bounded reusable read arena
+instead of allocating an owned block and arena for every pull. Pending output
+rows are flushed before an input is retired; public retained output leases keep
+their existing ownership. All 93 spill Debug tests pass, including quota,
+corruption, allocation-failure and wide-payload lease checks. A controlled
+9,216-row, three-cohort stress comparison reduces backing allocations from
+248,154 to 145,648 (41.3%) and cumulative allocated bytes from 89,545,466 to
+66,881,266 (25.3%). Both versions write 3,633,456 bytes, perform 1,296 merges
+and peak at 34 files, with identical sorted output. A deterministic allocation
+ceiling guards this win. These are Debug allocation/work measurements, not
+an isolated end-to-end throughput or latency claim, nor extra case credit.
+
+The high-volume sort witness now uses the existing shared leak-checked fixture
+allocator, rather than unwinding allocation/free backtraces for every row.
+Safety/leak checks, all 9,216 rows, quotas, exact results and the allocation
+ceiling remain enabled; `ANTFLY_TEST_ALLOCATOR_TRACES` restores diagnostic
+backtraces. A direct Debug run completed in 0.84 seconds, excluding compilation,
+with 145,786 allocations, 66,938,764 cumulative requested bytes, the same
+3,633,456 written bytes, 1,296 merges and 34 peak files. Those allocator options
+can change resize behavior, so this is not substituted into the controlled
+same-allocator before/after comparison above. It is test-harness work, not
+additional SQL case credit or an end-to-end latency guarantee.
+
+The materialized-partial merge also reuses at most 16KiB of scratch inside one
+input page, freeing it before the next cursor pull. In a controlled 1,024-partial
+Debug fixture this reduces backing allocations from 2,122 to 1,039 (51.0%) and
+cumulative allocated bytes from 1,654,072 to 1,054,096 (36.3%). Exact SUM/count
+results, zero fallback scans and one cursor open/close are unchanged. An
+allocation ceiling and exhaustive allocation-failure sweep across scratch reset
+boundaries protect the change. This is a component allocation comparison, not
+an end-to-end speedup measurement or additional original-case closure.
+
+The source-mutation gate uses real declared primary keys, defaults and distinct
+Raft-backed source/target relations. It checks PostgreSQL command counts,
+RETURNING labels/types/NULLs and bag semantics, complete postimages of every
+table, unchanged primary identities/versions/digests after a proven abort, and
+independent cold-owner recovery. A self-MERGE swap proves source capture;
+recursive INSERT exercises duplicate production and atomic 23505. Distributed
+failover and large-input scaling remain separate qualification.
+
+Future-write probes run before and after cold restart. They verify that changed
+primary keys release old identities, new keys remain unique, aborted recursive
+batches leak no unique claim, and recovered claims still reject collisions.
+Each successful probe is removed before rechecking the exact original postimage.
+
+The document identity gate runs unchanged SQL through native transaction
+admission, compares PostgreSQL results and exact SQLSTATEs, checks full stored
+documents and real physical versions/digests, and independently reopens owners.
+Write RETURNING uses the durable transaction's exact retained write stamp, not
+the old version predicate or a post-commit reread. Custom TTL fields retain their
+native physical-version semantics through the pinned schema cache. DELETE keeps
+its captured preimage. Implicit COMMIT now preserves native UNIQUE/FK abort
+causes through the same typed mapping as explicit COMMIT; it no longer reports
+every proven abort as retryable 40001. Reserved schema-publication capability
+floors remain unadvertised; this work does not activate unfinished restore work.
+
+Staged document rows carry their SQL-visible prepared version separately from
+the observed primary version/digest used by optimistic conflict checks. Scalar
+and typed projections preserve these channels through cursor close, including
+custom TTL versions; projecting a stamp never weakens a write fence.
+
+Native transaction-characteristics discovery still fails `sql-0084` after an
+independent writer: native SQL recaptures a fresh statement cut and rejects
+changed range proofs instead of reopening the transaction's earlier immutable
+snapshot. Removing proof validation or reading new rows would be incorrect.
+Durable transaction-scoped retained cuts and ownership/recovery integration
+remain necessary; `sql-0084` and `sql-0087` remain unresolved. Original recursive
+MERGE `sql-0014` now matches PostgreSQL's 42601 rejection. Ordinary CTE MERGE
+and recursive queries inside derived sources retain compiler coverage; the
+[PostgreSQL 19 grammar](https://www.postgresql.org/docs/19/sql-merge.html)
+also excludes outer `WITH RECURSIVE` on MERGE.
+
+Validation: both full Debug SQL owners pass (1,297 and 236 tests respectively;
+the four skips are explicitly opt-in benchmarks), as does the 132-test pgwire
+suite. The referenced role-default and named-arbiter native/PostgreSQL gates
+pass; strict native gates have zero skips.
+
 ## Baseline and priorities
 
 The [original inventory](sql/parity-inventory.md) remains authoritative:
@@ -12876,3 +14038,2602 @@ snapshot. Verify complete postimages and cold recovery, not only compilation.
 Tablespace rename/drop has an independent PostgreSQL oracle but no new native
 case credit. Publication/subscription and database-scoped WASM SQL extension
 integration are now explicitly in scope, not implemented by this checkpoint.
+
+### Sequential qualification and document projection (2026-10-19)
+
+The next sequential pass qualifies **66 additional original contracts**, taking
+the ledger from 399 to **333 unresolved** (702 implemented, 135 rejected and 416
+PostgreSQL-standard supersessions). Original SQL, parameters, corpus count and
+inventory checksums are unchanged. This does not meet the below-200 target.
+
+The combined public native Debug campaign passes eleven tests, 86/86 build
+steps, with no skips or leaks. Its contracts cover document root/envelope
+mutations and patches, assignment boundaries, typed-array/UUID mutations,
+DISTINCT/aggregate reads, clocks and exact binding/routine diagnostics. The
+mounted FK lifecycle campaign independently passes original inline constraints
+and MATCH FULL publication, future writes and cold owner recovery. PostgreSQL
+references independently reproduce these results.
+
+Document UPDATE no longer projects every untouched declared SQL column. It
+preserves untouched fields from its already-pinned raw document and projects
+only predicate/expression inputs. Besides avoiding cold-field decoding, this
+allows a raw JSON patch to remove a field whose old value does not satisfy a
+later SQL projection's scalar type. Complete postimages and physical version
+fences remain mandatory. Legacy arbitrary-JSON fixture fields now use native
+unrestricted JSON Schema properties, not the forbidden relational-only raw
+`type=json` spelling; the storage-mode validator is unchanged.
+
+Session overlays now apply the shared typed policy evaluator to full staged
+postimages before projection, compose legacy mandatory filters, bind the signed
+command purpose and use the session settings overlay. Denied replacements
+still shadow their old native rows. Scratch/cell directories are reused, with
+only demanded cells prepared and cleared. Repeated-write action lineage and
+commit-time policy/role epoch fencing remain unfinished and are not credited.
+
+Mounted policy qualification exposed a dropped authority field in remote point
+lookups. The repair uses typed lookup options and bounded private headers, not
+tokens in request URLs. Owner signature/epoch checks remain authoritative;
+legacy unauthenticated internal callers cannot use the observation capability.
+The policy lifecycle campaign must pass before its eleven originals are closed.
+Public CHECK validation also rejects the required rewrite transition before
+support preparation/CAS, so unrelated schema-finalization races cannot replace
+the actionable rewrite guidance. Its mounted lifecycle gate remains unqualified
+until the complete campaign passes.
+
+The broad Debug SQL run passed 1,253 tests with four opt-in skips but exposed one
+stale test asserting SELECT permission for a constant unconditional UPDATE.
+That expectation now requires write authority, matching the command-sensitive
+binder; all three focused permission/projection tests pass. This is not a claim
+that the broad suite has already been rerun successfully after that correction.
+
+### Sequential policy and allocation qualification (2026-10-19)
+
+The current ledger is **322 unresolved** (713 implemented, 133 rejected,
+418 PostgreSQL-standard supersessions): 77 fewer unresolved contracts than the
+399-case checkpoint. The eleven mounted policy originals now pass their exact
+PostgreSQL oracle, public SQL execution, owner enforcement and restart gate.
+Three stale patch compile-time rejection claims were reopened and independently
+requalified at runtime; these are corrected evidence, not three extra closures.
+This remains short of the requested below-200 target.
+
+Authority now survives both the coordinator's prepare codec and the storage
+dispatch reconstruction, including its database and admission timestamp. Stable
+typed policy denials advance rejected Raft entries instead of wedging subsequent
+work; committed transaction decisions cannot be changed into policy rejections.
+The private integrity observation proof is bounded and service-authenticated,
+never transported in a request URL. All 73 server-storage tests and the exact
+mounted eleven-policy campaign pass in Debug.
+
+Scan demand masks retain stable binding ordinals without decoding unused
+document columns (including physical unsigned versions). Hash admission includes
+enclosing quota headroom, cold column directories and full geometric replacement
+allocations rather than only live-entry deltas. All 110 operator/typed-store/
+budget tests pass, including the unchanged small-budget spill regression and
+adversarial sibling-quota and replacement-growth boundaries. The broad Debug
+SQL gate passes 1,258 local tests and 236 dependent tests, with four opt-in skips,
+no failures or leaks, and 25/25 build steps.
+
+CHECK lifecycle qualification remains pending. Its mounted campaign exposed
+both lost constraint diagnostics across owner HTTP transport and fatal Raft
+classification of rejected CHECK imports. The shared restore store now preserves
+the durable failure cause through normal and emergency cleanup; its 44 tests
+pass. Constraint failures have a closed, versioned private transport and typed
+apply rejection contract, while actual corruption remains an integrity failure
+and committed transaction decisions cannot become constraint rejections. The
+complete mounted campaign must pass before those originals receive credit.
+
+The document envelope campaign is being expanded from eight to 18 originals,
+including self-joins, MERGE, duplicate identities, returned versions and real
+PostgreSQL binding diagnostics. Its frozen outcomes are independently reproduced
+on PostgreSQL 18. Completion still requires native execution, complete postimages,
+unchanged-row physical-version checks and cold recovery; no pending case is
+counted merely because the oracle or compiler accepts it.
+Three additional INSERT RETURNING-version contracts remain unqualified: exposing
+the final physical version requires an authoritative commit receipt and an
+allocation-free result handoff, not substituting a preimage version or doing an
+unsafe post-commit read.
+
+Still unfinished: staged policy WITH CHECK and repeated-write lineage, durable
+policy/role fencing and distributed fault qualification; roles/grants, sequences,
+SQL routines/types/domains, replication and SQL WASM extension activation. Existing
+tablespace support also requires lifecycle and placement-consumer qualification.
+These remain in scope rather than being waived to reach a numerical target.
+
+### Historical CHECK import qualification (2026-10-19)
+
+The ledger is now **319 unresolved** (715 implemented, 133 rejected and 419
+PostgreSQL-standard supersessions), 80 fewer than the 399-case checkpoint.
+The mounted schema/FK campaigns cover all 25 scenarios in Debug (23 schema and
+two FK scenarios), including
+UUID-primary-key owners, successful and rejected CHECK validation, preservation
+of unrelated NOT VALID history, future-write enforcement and cold recovery.
+Its independent PostgreSQL oracle also passes. Originals `sql-0737`, `sql-0739`
+and `sql-1412` are qualified; the two nullability originals remain open because
+validation-only publication and their distributed fault qualification are not
+finished. The below-200 target has not been achieved.
+
+Restore preparation now borrows a historical CHECK validation view only for an
+unpublished restore staging generation. It preserves unrelated NOT VALID rows
+without weakening ordinary writer enforcement or modifying immutable shared
+validation plans. The standalone Debug rewrite-receipt gate also passes all
+eleven tests after using the existing native object/system-linker path with an
+explicit compiler/UBSan runtime archive; correctness builds remain Debug.
+
+The expanded document campaign distinguishes PostgreSQL logical SQL NULL from
+its schema-bound native JSON encoding: optional scalar fields whose schemas
+forbid JSON null use absence, while untouched opaque JSON nulls are retained.
+INSERT, INSERT SELECT, UPDATE, joined UPDATE, conflict and MERGE share this
+assignment boundary. Streamed TEXT assignments reuse the typed builtin output
+kernel, retaining numeric widths, array bounds and JSONB formatting rather than
+compiling a cast program per row. Missing relation qualifiers report `42P01`
+without changing unknown-field or internal-column diagnostics. These changes
+do not qualify the pending document originals until their complete native
+campaigns pass. MERGE runs against real native sessions and range proofs, not
+a fixture that disables its production admission barrier.
+
+### Native document MERGE qualification (2026-10-19)
+
+Both expanded native campaigns now pass: four bound public API tests (86/86
+build steps) and the mounted native-session MERGE campaign (83/83), with no
+skips, failures or leaks. All 18 frozen PostgreSQL outcomes independently
+reproduce. Ten additional originals are qualified, bringing the ledger to
+**309 unresolved** (718 implemented, 137 rejected and 422 superseded): 90 fewer
+than the initial checkpoint, but still above the requested below-200 target.
+
+The MERGE witness uses real owner versions, including timestamp 42, and keeps
+serializable native sessions and owner range proofs enabled. It verifies matched
+deletion, conditional updates, the inherently empty self-merge NOT MATCHED arm,
+and PostgreSQL's ambiguous RETURNING rejection. Surviving rows retain complete
+postimages and untouched physical versions/digests through owner restart. This
+does not qualify INSERT RETURNING final-version receipts, session policy
+WITH CHECK/role fencing, or multi-owner fault behavior.
+
+### Restore replay and capability fencing (2026-10-19)
+
+The focused native restore-replay gate passes both tests in Debug (53/53 build
+steps), with no skips or leaks. An actual source row is written before a NOT
+VALID rule is declared, then imported through encoded replicated restore
+commands. The gate checks validated-rule rejection, wrong import scopes,
+duplicate delivery, exact timestamp 42, unchanged replay markers after rejected
+operations, and complete cold postimages/version/digest preservation. Ordinary
+live writes remain strict. The scope-only integrity-effect channel still
+rejects primary row writes; it was not broadened to make a synthetic replay
+fixture pass. This is native import/replay evidence, not a claim that the full
+distributed failover matrix or validation-only nullability publication is done.
+
+The schema reader test now independently names every durable `requires_*`
+field and its minimum reader floor, including the public-schema foundation.
+Adding a field without a corresponding contract fails compilation, without a
+stale hardcoded field count. Publication progress tests derive unsupported
+versions from the declared ceilings and positively round-trip the current
+semantic/encoding pair. All 17 publication-progress tests pass.
+
+Mounted schema, FK, row-policy and document MERGE reruns pass together (101/101
+build steps), and the four document API/restore-transport tests pass (86/86).
+All eleven PostgreSQL reference cohorts reproduce independently. Missing scalar
+and wildcard qualifiers now consistently report `42P01`; eight additional exact
+hidden-alias/LATERAL/wildcard probes reproduce PostgreSQL diagnostics without
+mutation effects. Deliberately unsupported conflict-scalar outer scopes are not
+credited as PostgreSQL parity. The ledger remains **309 unresolved**.
+
+The final broad Debug SQL run passes **1,261 local and 236 dependent tests**,
+with four explicitly opt-in skips, zero failures/leaks and 25/25 build steps.
+The generated private inference error-name catalog was refreshed for the new
+restore-progress test diagnostic; both identity round-trip tests pass. Ledger
+validation and all 20 inventory-checker unit tests pass. Original SQL, parameters,
+the 1,586-case corpus and source/inventory checksums remain unchanged. The
+below-200 target is still open; 204 of the remaining contracts are DDL/catalog
+work, not another already-complete scalar-expression cohort.
+
+### Constraint timing and recovery ownership (2026-10-19)
+
+The next requested milestone is **110 additional DDL/catalog closures from the
+204-contract checkpoint**, not 110 arbitrary dispositions or parser acceptances.
+No new contract is credited until its original SQL, native consumers, cold
+postimages and independently reproduced PostgreSQL behavior are qualified.
+
+This wave adds atomic constraint rename and deferrable primary-key lowering.
+Primary nullability remains immediate; primary uniqueness uses the same native
+deferred constraint machinery as UNIQUE. The new, unpublished reader capability
+32 now describes deferred constraints rather than only deferred CHECK
+validation. Renaming a CHECK preserves its predicate, validation state and
+enforcement; allocation failures cannot partially rename the schema candidate.
+
+The original deferred UNIQUE, composite primary-key, ALL DEFERRED and named
+FK/CHECK timing campaigns use UUID-backed rows, independent observers,
+repaired transient conflicts, failed-commit nonpublication and cold readback.
+PostgreSQL independently reproduces all four campaigns. The original CHECK
+rename is included in the 26-case schema reference.
+
+Native qualification exposed and corrected shared ownership boundaries:
+
+- Session integrity preparation and retroactive timing checks now use REST's
+  existing bounded authoritative catalog selection. A stale data-node cache
+  must not reject a valid session before preparation.
+- Retroactive validation retains physical observations without replacing or
+  copying candidate rows borrowed by the validation result.
+- Durable session recovery decodes directly into the registry allocator rather
+  than adopting memory owned by the durable store. Mixing the two allocators
+  caused a mounted maintenance crash.
+
+Deferred commit aborts retain the native typed constraint cause in their durable
+terminal record. A UNIQUE/FK violation must not become a retryable serialization
+failure. Failed persistence leaves the outcome unknown, not safe to replay.
+Deterministic Debug tests cover persistence failure, reopen, borrowed-row
+ownership and distinct store/registry allocators.
+
+### Transaction characteristics and tablespace consumer witnesses (2026-10-19)
+
+SET TRANSACTION now changes the durable, connection-owned session and retains
+unspecified characteristics. The first-query latch is monotonic across
+savepoint rollback and durable reload. Subsequent reads neither allocate nor
+persist the latch. Read-only mode rolls back with its savepoint; late isolation
+changes and illegal read-write transitions produce PostgreSQL's 25001.
+Unsupported safe-snapshot DEFERRABLE admission remains guarded.
+An otherwise inert BEGIN DEFERRABLE flag is retained durably and restored with
+savepoints. Changing its transaction to SERIALIZABLE READ ONLY cannot silently
+turn that flag into an unimplemented safe-snapshot promise.
+
+**This does not yet qualify sql-0084 or sql-0087.** Their new PostgreSQL
+witnesses include an independent concurrent insert. Native guarded reads reopen
+a statement view and reject changed range proofs rather than return the
+retained PostgreSQL transaction snapshot. The mounted witness exposes that
+40001 difference. Completion requires owner-pinned transaction read cuts,
+bounded lifetime/accounting, commit-time range validation, and explicit
+recovery/owner-transfer semantics. Removing the range check or caching projected
+JSON would not implement that architecture.
+
+Tablespace-name witnesses bind a real table, preserve identity and location
+metadata through rename/restart, reject in-use deletion with PostgreSQL's 55000,
+and verify conditional DROP is a catalog no-op. They do not qualify the original
+filesystem LOCATION contract: Antfly's location remains compatibility metadata
+and native placement remains authoritative.
+
+The original CHECK rename and four timing originals are qualified by the
+mounted Debug gates and independently reproduced PostgreSQL references. The
+timing gate passes all four tests (the four mounted campaigns plus durable
+abort recovery, borrowed-row ownership and pure-observation retry policy), with
+no skips/failures/leaks.
+The initial tablespace witness failed because its new test helper freed the
+JSON buffer while parsed names still borrowed it. The helper now owns its
+strings; no missing catalog mutation was established. All three original
+name-lifecycle cases now pass the corrected mounted test, including cold-owner
+recovery. Setup deliberately uses an unconstrained table: dropping a primary-key
+table still requires coordinated constraint retirement and is not credited by
+the tablespace witness. SQL now reports that guard as a specific unsupported
+operation rather than an internal error.
+
+The final selected Debug run passes **95/95 steps**, seven tests, no skips,
+failures or leaks: four timing tests, the three-case tablespace campaign, and
+two durable transaction-characteristic/recovery tests. Pure fixture observation
+reads can wait for active-session execution capacity within their existing
+deadline; arbitrary SQL, mutations, failed sessions and ambiguous outcomes
+retain their no-replay behavior.
+
+The ledger is **301 unresolved / 196 DDL/catalog unresolved**: **8 of the
+requested 110 new DDL/catalog closures**, leaving 102 more required. The
+production transaction-characteristic snapshot discrepancy remains explicitly
+unqualified. This milestone is not complete.
+
+The broad Debug SQL run passed 1,263 local and 236 dependent tests, with four
+explicit opt-in skips, no failures/leaks and 25/25 steps. The subsequent focused
+SET TRANSACTION parser test passes independently. All four new or expanded
+PostgreSQL references reproduce; the inventory checker and its 20 unit tests
+pass. These are scoped results, not completion of the 110-closure milestone.
+
+### Covering constraint publication and native query reuse (2026-10-19)
+
+Original cases sql-0679 and sql-0732 now support PRIMARY KEY / UNIQUE INCLUDE
+through the existing schema, integrity, index and restore-publication machinery.
+The immutable constraint is the sole catalog owner. Its physical ordered access
+path is derived from that declaration, rather than persisted as a second,
+independently editable same-named index. Renaming or dropping the declaration
+renames or retires that path through the same schema transition.
+
+Payload columns do not participate in uniqueness claims, conflict-arbiter
+inference, FK target identity or primary-key nullability. Integrity plans own
+their copied declaration names. PostgreSQL permits repeated INCLUDE attributes,
+including key columns: the public declaration preserves them, generated names
+use distinct PostgreSQL-compatible attribute labels, and the physical projection
+stores each non-key source column once. CREATE normalization must retain
+different payload definitions even when their uniqueness keys match.
+
+The OpenAPI specification owns the new include_columns field; make generate
+regenerated the public specification, Zig modules and SDKs. Runtime schema
+validation compiles the same covering plan as storage, so invalid payload
+declarations fail before publication. The ordinary SQL correctness gate now
+explicitly reaches DDL lowering and the cross-layer covering-claim contract;
+the mounted covering campaign joins the existing integration aggregate.
+
+The final selected Debug run passes 93/93 steps with no skips, failures or
+leaks. It includes both real-owner original DDL campaigns, future-write probes,
+an included-column update, complete PostgreSQL postimages, public covered reads,
+planner-visible declarations and cold restart. EXPLAIN only attests available
+declarations, not an executed physical choice. The independent native storage
+work-count test proves index-only reads and zero primary lookups before and
+after reopening, despite an unrelated 16 KiB source field. Four focused SQL
+tests and the dependent catalog tests pass; all 28 PostgreSQL schema-lifecycle
+campaigns reproduce independently.
+
+The broad Debug SQL run also passes 1,266 local and 236 dependent tests, with
+four explicit opt-in skips and no failures or leaks. Both registered evidence
+gates pass through the inventory runner, including the unchanged PostgreSQL
+reference. The naming gate passes all 12 tests, including exhaustive allocation
+failures for generated covering names. Generated OpenAPI/private-error checks,
+formatting and all 20 inventory-integrity tests pass.
+
+Current inventory: 299 unresolved overall, 194 DDL/catalog unresolved.
+The requested milestone has 10 verified closures from its 204-case checkpoint;
+100 more closures are still required. Neither this cohort nor its work-count
+evidence completes that milestone or the retained transaction-snapshot work.
+
+### Atomic column references and immutable USING programs (2026-10-19)
+
+This wave qualifies **sql-0726, sql-0749 and sql-0750**. Nullable inline REFERENCES
+adds the column and its FK through one existing child/parent publication cohort,
+including authoritative generated names. The independent plan validator permits
+exactly one nullable property plus its new FK; changed old fields, defaults,
+generated expressions, required lists and unrelated declarations are rejected.
+The complete FK lifecycle requires decoder profile 59, including planless ACKs.
+
+Computed TYPE USING uses the existing staged restore/rewrite coordinator, not a
+second SQL copy engine. A version-3 intent binds typed scalar IR and its exact
+logical predecessor schema. One reference-counted expression set is shared by
+all retained physical layouts. Each layout resolves operand names once into
+direct ordinal maps; absent historical operands are SQL NULL. Unaffected cells
+stay packed. The native work-count witness reads one expression operand while
+preserving an unrelated 16 KiB payload and an integer beyond f64 precision.
+Snapshot rows and retained-tail effects execute the same program identity.
+
+New intents require coordinated decoder profile 60 before durable admission.
+Metadata independently binds the expression schema to its real predecessor.
+Compilation errors have definite nonadmission diagnostics, while post-admission
+ambiguity retains the original recovery handle. User-supplied transforms require
+current whole-cohort admin authority without credential row filters; the worker
+rechecks this authority on subsequent work slices, including recovery.
+
+Qualification caught an overly strict result-tag check: text operators can omit
+a redundant builtin tag. Exact result kinds and target validation remain
+mandatory, as do numeric widths and array element identities. Replacing a raw
+nullable type union now preserves its NULL arm. A canonical unchanged property
+and a lowered direct self-reference are a true no-op: no replacement owner,
+schema epoch or rewrite job is created.
+
+The timestamp identity profile for sql-0748 has a PostgreSQL no-rewrite witness
+and native no-op/restart coverage. **It remains unresolved**: an already-typed
+timestamp is not evidence of a genuine datetime conversion from the original
+source domain. No invalid integer-to-timestamp conversion is invented to close
+the case.
+
+The full Debug SQL run passes 1,269 local and 236 dependent tests, four existing
+opt-in skips, no failures or leaks. Focused native coverage includes exact IR
+reconstruction, historical layout reordering/absence, mapped blob comparisons,
+nullable text results, allocation failures and real LSM snapshot/tail replay
+through cancellation, corruption, duplicate delivery and cold resume. The
+PostgreSQL oracle independently reproduces all 32 schema-lifecycle campaigns.
+All five selected registered gates pass, including the native owner campaigns,
+six native USING/fault tests, independent FK shape/naming admission and durable
+authorization checks. The inventory checker and its 20 unit tests pass; scoped
+Zig formatting, Python lint/formatting and diff whitespace checks pass. Original
+SQL/parameters and the 1,586-case inventory/source checksums remain unchanged.
+
+Inventory is **296 unresolved overall / 191 DDL/catalog unresolved**: 13 verified
+closures from the earlier 204-DDL checkpoint, not completion of its milestone.
+The requested 26-case table/index/catalog cohort still has **23 unresolved**:
+
+- Constraint validation: sql-0734, sql-0736, sql-0744, sql-0745.
+- Table/column contracts: sql-0669, sql-0670, sql-0746, sql-0748.
+- Temporal and index lifecycles: sql-0683, sql-0685, sql-0696, sql-0697, sql-0707,
+  sql-0719, sql-0720, sql-0721, sql-0725.
+- Catalog lifecycle/settings: sql-0105, sql-0107, sql-0108, sql-0109, sql-0110,
+  sql-0158.
+
+These are still required work, not silently deferred or reclassified as generic
+unsupported statements. In particular, native validation-only NOT NULL
+publication, NOT VALID FK enforcement, dependency-aware retirement and genuinely
+online index builds are not completed by this wave.
+
+### Structured column rebinding and PostgreSQL cast admission (2026-10-19)
+
+Column rename now constructs one unpublished successor and binds an immutable
+old-column-to-new-column transform against the exact predecessor. Required
+lists, defaults, generated expressions, CHECKs and ordered-index keys,
+predicates and INCLUDE fields are rebound structurally. Literal strings and
+constraint/index labels are unchanged. Failed preparation discards the entire
+candidate, including on exhaustive allocation failures or preparation limits.
+
+The native work-count witness evaluates one source operand and preserves an
+unrelated 16 KiB packed field and the original write timestamp. The existing
+snapshot/retained-tail protocol owns publication, corruption checks, partial
+frames, duplicate delivery, cancellation and cold recovery. An additional
+PostgreSQL/mounted campaign exercises a real unrelated FK cohort, including
+parent DELETE and child UPDATE enforcement after rename and restart.
+
+This is a safe staged-generation rename, **not** an O(1) metadata-only rename.
+Native stable column identities and coordinated FK/view column rebinding are
+still required for that optimization. Renaming FK operands remains guarded.
+Separately owned artifact field bindings are checked both at initial SQL
+preparation and against the actual rewrite predecessor, preventing a concurrent
+index addition from silently stranding its source field.
+That late conflict is definite retryable nonadmission, not an unknown handle
+for a job that was never created.
+Non-empty enrichment/resolver metadata and non-text artifact indexes remain
+explicitly guarded. Configuration-string searches do not prove that their
+computed bindings are independent. Empty managed metadata is accepted rather
+than misclassified as an invalid index; schema-derived algebraic indexes and
+independent full-text bindings continue through the existing machinery.
+
+Shared owner replacement now rejects dependent views before reservation and
+again before publication. New view definitions cannot acquire a source whose
+owner is reserved for replacement. This closes the admission/publication race;
+it does not implement a view-rebinding cohort.
+
+Source adjudication for sql-0748 found a BIGINT predecessor in the original
+catalog_apply test. PostgreSQL rejects BIGINT::timestamptz with 42846; the old
+already-timestamp identity fixture was not faithful conversion evidence. The
+reference now preserves that BIGINT domain and checks exact historical values,
+unchanged physical owner/schema, and future BIGINT/NULL writes. Scalar binding
+rejects nonexistent temporal casts before evaluation, including typed NULL and
+dead branches, while preserving function-overload diagnostics. No epoch units
+are invented and no text-to-timestamp conversion feature is claimed.
+
+All three selected registered gates pass against the final source: native
+column-rename publication/faults, temporal-cast admission and the independent
+34-campaign PostgreSQL reference. The subsequent late-conflict diagnostic
+refinement passes both mounted API gates again. The broad Debug SQL run passes
+1,273 local and 236 dependent tests, with four existing opt-in skips and no
+failures or leaks. The shared metadata/standby restore regression passes all
+25 tests. The final conservative managed-metadata guard has additional focused
+coverage rather than an unqualified claim of producer rebinding.
+sql-0746 is implemented; sql-0748 is a tested PostgreSQL supersession (42846),
+not a conversion feature. The inventory has **294 unresolved overall / 189
+DDL/catalog unresolved**. That is 15 verified dispositions from the earlier
+204-DDL checkpoint, with 95 still required for its 110-disposition milestone.
+The 26-case table/index/catalog cohort still has 21 unresolved cases.
+The remaining validation-only NOT NULL publication, NOT VALID FK enforcement,
+temporal/GIN/full-text and concurrent index lifecycles, dependency retirement
+and database/settings/placement work are still required; this wave does not
+complete table/index evolution or the earlier DDL milestone.
+
+### Checked owner observations and terminal validation release (2026-10-19)
+
+Schema validation now has actual native and Raft observations, distinct root-
+signature domains, and a shared metadata enrollment/placement/report verifier.
+Raft observations retain the real applied entry alongside the original logical
+phase cut; a newer watermark does not rewrite that phase receipt. An election
+term is not the term of the applied entry. Signing and metadata verification
+keep these facts separate. Unknown source authority, stale reporters, foreign
+namespaces, reader-capability loss and observations ahead of the reported owner
+cut fail closed.
+
+The dedicated terminal release binds the exact installed header and a separate
+coordinator publication decision. Header, completed topology receipt, fence
+removal and preparation-input retirement share one native-clock/Raft-marker and
+standby/outbox transaction. Retries preserve the original release cut after
+normal writes and cold reopening. Missing or conflicting completion receipts,
+retained old fences and copied future cuts cannot become terminal ACKs. Generic
+topology release/cancellation still cannot release a validation owner.
+
+Full schema/history verification stays in retained read preparation outside
+apply. The terminal writer rechecks the installed immutable fence, owner,
+schema epoch and physical catalog with bounded reads. Its work-count fixture
+requires exactly five writes, rejects schema-sized reads, and aborts on either
+side of every write. Existing historical row bytes and index identities remain
+unchanged. This is physical terminal machinery, not authority inferred from an
+opaque digest.
+
+Private owner ABI 98 adds the read-only Raft observation and bounded native
+control producer. The native producer prepares pages locally or independently
+replays supplied page prefixes; it does not accept caller-computed scan truth.
+It pins the shared owner registry, permits one heavy schema preparation per
+owner, charges the shared relational preparation budget and reserves response
+memory before mutation. Decoded acknowledgements own their diagnostic names.
+No post-commit cancellation check turns a durable effect into a rollback claim.
+
+Linked qualification found and fixed two actual integration defects: schema
+preparation/apply used a module-local registry rather than the storage
+descriptor's shared registry, and schema observations exposed raw root
+selections instead of the injective attested-root epoch used by metadata.
+The registry/epoch/release checkpoint passes 100 Debug tests with no skips or
+leaks in `/private/tmp/antfly-schema-validation-registry-epoch-debug.log`.
+The subsequently added native producer and final election-term refinement are
+under qualification in `/private/tmp/antfly-schema-validation-native-producer-debug.log`;
+that pending run is not completion evidence.
+
+Public validation-only SET NOT NULL remains on its guarded staged rewrite.
+Metadata immutable plan admission, durable per-owner ACK/CAS state, all-owner
+publication/release decisions, capability/checkpoint integration and their
+authenticated producer still must be joined before switching that SQL path.
+Neither ABI support nor a local digest grants those permissions. No inventory
+disposition is reclassified: 294 overall / 189 DDL/catalog cases remain open.
+
+### Index-preserving validation descriptors and immutable cohorts (2026-10-20)
+
+A native-LSM restart campaign exposed a real compatibility defect: installation
+preserved a named text index in memory, but cold opening selected the new logical
+schema and rejected the generation's older projection provenance. Named,
+nonempty generations now retain their recorded immutable schema only after an
+exact comparison of text projection semantics with solely the logical version
+normalized. The usual generation/config/fingerprint verification still runs.
+The persisted witness and postings are not rewritten. Missing historical
+layouts, missing witnesses and changed analyzers remain rejected; empty writable
+generations retain their existing safe initialization path.
+
+The native validation campaign now holds a text-query lease through installation
+and terminal release, checks snapshot pointer equality, unchanged coverage and
+index write counters, reopens the database and indexes a subsequent row.
+All 11 native validation tests pass. The seven text-generation tests pass,
+including allocation-failure cuts and rejection of incompatible/missing history
+(`/private/tmp/antfly-schema-validation-text-reuse-debug.log` and
+`/private/tmp/antfly-schema-validation-text-provenance-debug.log`).
+The earlier native producer checkpoint also passed all 101 selected tests;
+its prior “under qualification” note above is superseded by that result.
+
+Table records now have an internal optional `full_text_read_index` binding.
+It names an actual physical index rather than assuming that logical schema
+versions identify physical generations. Explicit selection is strict: a missing
+or non-text target cannot fall back to another named index. Owned table/query
+clones, point projections, retained-query recipes and capability fingerprints
+preserve the binding. Subsequent ordinary schema/FK/index publication seeds
+its successor from that exact index; migration finalization retires the
+physical predecessor, not a nonexistent index for the intervening logical epoch.
+Only managed schema-generation indexes may be retired. A user-named primary
+index remains declared after migration; selecting it does not transfer ownership
+of that declaration to the schema-migration cleaner.
+
+The dedicated NOT NULL descriptor constructor derives only the requested
+tightening and the next immutable schema epoch. It preserves every index byte
+and introduces no migration read schema or fresh index incarnation. Consecutive
+tightenings retain the same primary selection, including named-index and
+indexless tables. This constructor prepares data only; it cannot publish or
+bypass catalog, policy, owner or topology admission.
+
+Storage-metadata extension version 4 carries this binding and an optional reader
+pair without changing unbound table bytes. Typed and nested proposal classifiers
+and snapshot validation require reserved topology profile 61. The advertised
+profile remains 60: understanding these records is not activation of their
+complete writer/worker protocol. New snapshots containing bindings cannot be
+accepted under the currently advertised profile.
+
+`metadata/schema_validation_plan.zig` prepares canonical, bounded immutable
+plans committing predecessor/successor table images, ordered validation
+columns, complete range descriptors, owner bindings, physical preparation roots
+and optional SQL relation guards. It independently derives the only permitted
+successor and joins native schema/public/projection hashes with each binding.
+Initial owner records are fixed-value data rather than borrowed schema buffers.
+Recovery joins the immutable plan with the entire compact ledger and rejects
+missing owners, changed roots, reordered/gapped covers and unrelated table
+images. These checks do not authenticate physical preparation or grant
+root adoption. Metadata must still verify those authorities transactionally.
+
+Schemas/public hashes are computed once per plan rather than once per owner.
+Native and metadata preparation share the ordered-column hash contract.
+Plan encoding counts escaped output without allocating it, enforces a 16 MiB
+frame cap, then reserves exactly one output buffer. Allocation-failure tests
+force arena resize fallback to enumerate deterministic allocation cuts. The
+4,096-owner preparation and compact-barrier campaigns pass. A single Debug
+preparation fixture with full range descriptors measured roughly 1.6 seconds
+locally; this is not a
+production-throughput benchmark or a hot-ACK measurement.
+
+This is still not complete validation-only SQL activation. Production metadata
+plan admission/locks, durable per-owner ACK/proof transactions, transition and
+checkpoint record families, independently authenticated preparation/adoption,
+all-owner table publication and release, backup/restore propagation, and the
+public SQL producer must be joined before switching off the guarded rewrite.
+No case is reclassified by these building blocks: the immutable inventory still
+reports 294 unresolved overall and 189 DDL/catalog unresolved. NOT VALID FKs,
+concurrent index lifecycles and the other outstanding catalog features remain
+required work, not claimed completion.
+
+The combined current-source Debug run passes 123 test executions with zero
+skips/failures/leaks across publication/plan, native validation, linked owner,
+provisioned source and root-authority gates
+(`/private/tmp/antfly-schema-validation-integrated-utc-debug.log`). The extra
+named-primary retirement regression is
+included. A superseded run was stopped after a stack sample identified Python
+blocked in macOS timezone initialization before launching its linker; rerunning
+with `TZ=UTC` passed without changing product synchronization or assertions.
+Scoped formatting, diff whitespace, storage control-catalog, Apache-boundary
+and immutable inventory checks pass.
+
+### Durable validation ledger and bootstrap authority (2026-10-20)
+
+The validation coordinator now has a transactional ledger rather than only a
+barrier reducer. It retains the canonical immutable plan, compact head and
+owner postimages, initial signed preparations, complete signed phase evidence,
+deduplicated execution inputs, active pointer and shared table-lifecycle lock.
+Admission, ordinary ACKs and final unlock use one metadata writer; storage
+failures after any staged write must abort that entire writer. An ordinary
+ACK reads fixed-size progress and performs three writes without decoding the
+plan. The terminal ACK additionally deletes the active pointer and lifecycle
+lock. Exact accepted retries, including lost begin/terminal replies, are
+read-only observations rather than renewed execution permission.
+
+A distinct pre-job signature domain binds independently compiled candidates
+to an actual retained physical cut. It does not manufacture a ready receipt
+or adopt a root from the first progress ACK. Empty native and Raft clocks are
+represented explicitly and accepted only against independently observed empty
+source state. Prior canceled/released jobs no longer prevent read-only
+preparation of their legitimate successor. The new private storage-owner port
+(operation 10, ABI 99) compiles raw inputs under the existing per-owner heavy
+preparation exclusion and resource budget. The provisioned source retains
+one bound physical lease through observation and signing. Metadata checks
+current enrollment, placement/native ownership, reporter, source authority,
+root generation and reader capabilities in the accepting transaction.
+
+Admission frames carry a bounded JSON manifest followed by raw ASVI inputs
+and a checksum. Inputs are not JSON byte arrays or base64. Full input digests
+assign dense ordinals, so identical schemas/catalog preimages shared by many
+owners are persisted once; recovery can reconstruct owner work after losing
+the original coordinator. Each unique input is hashed once during admission
+or recovery, not once per owner. The immutable plan derives cached reader
+requirements and input ordinals; recovery independently reconstructs them.
+No borrowed transport bytes survive their owning request unless copied into
+the transaction.
+
+The accepting metadata adapter verifies every ready owner's current physical
+authority before the irreversible installation decision. Publication rechecks
+installed proofs and stages the exact successor table with the publication
+head in the same metadata/catalog transaction. Progress-only standalone
+commands do not invalidate the visible table projection. Checkpoint recovery
+joins plans, input preimages, preparation and phase signatures, decision chains,
+the exact live table/range cover and shared lifecycle locks; reverse counts
+reject extra/orphan records, and orphan locks cannot evade verification.
+
+Transition tag 84 and the schema-validation snapshot family are wired behind
+reserved coordinated profile 61. The advertised version remains 60. Receiving
+these records does not activate their complete producer/worker/restore protocol.
+Current-version snapshots reject the new family and lock even when no table
+carries a text-generation binding. Restore uses the existing metadata checkpoint
+registry and staged owner machinery; this is not a second independent catalog.
+
+Ordinary schema replacement now rejects stricter relational presence/null rules
+before metadata publication or partial-FK support preparation. It gives an
+explicit conflict response directing callers to coordinated validation or the
+staged rewrite. The existing guarded rewrite and exact validation-candidate
+constructors remain available. This closes a public-admission hole; it does
+not claim that validation-only SQL publication has been enabled.
+
+Qualification includes real LSM abort-at-each-write, cold-reopen, lost-reply,
+cancellation-before-owner-begin, missing/orphan evidence, dense-input
+deduplication, raw-frame/canonical decoding and allocation-failure campaigns.
+The metadata authority matrix now also checks preparation evidence, including
+empty clocks. Linked-archive native/Raft preparation and bound-source tests
+exercise the new port. Current mounted SQL lifecycle qualification is tracked
+with the implementation rather than inferred from component tests.
+
+Still required before activation: authenticated permission/status transport,
+bounded leader-owned worker dispatch, explicit provenance-verified replacement
+root adoption and unified distributed restore/fault qualification, and the
+public SQL producer. Maximum-cohort transport/headroom and off-lock admission
+preparation also require end-to-end qualification. An unmirrored commit or a valid signature alone is never
+permission to dispatch or announce completion. NOT VALID/VALIDATE foreign keys,
+genuine concurrent-index lifecycles, dependency-aware catalog retirement and
+the other outstanding catalog features remain open. No dispositions are
+reclassified: 294 total and 189 DDL/catalog cases remain unresolved.
+
+The final current-source Debug component run passes 170 test executions across
+13 result groups with zero skips, failures or leaks
+(`/private/tmp/antfly-schema-coordinator-final-debug.log`). Every admission,
+ACK, publication and terminal-unlock write cut is exercised both before and
+after staging the write. Four mounted SQL suites additionally pass with zero
+skips/failures/leaks: schema lifecycles, nullability, FK lifecycles and unique
+indexes (`/private/tmp/antfly-schema-coordinator-mounted-localhost-debug.log`).
+The first sandboxed mounted attempt could not bind localhost and was not
+counted as qualification; the rerun retained the no-skips requirement.
+Formatting, whitespace, storage control-catalog, Apache product-boundary and
+immutable inventory checks pass. Changes remain uncommitted.
+
+### Main integration and DDL/catalog priority (2026-10-20)
+
+Merged origin/main at `097588bf5d` in `261bce7d13`, preserving and
+restoring all in-progress SQL changes. Main's released resolver metadata
+profiles 34–35 remain reserved for their original semantics; unreleased SQL
+profiles formerly starting at 34 now start at 36. The current coordinated
+profile is 62, while validation-only schema publication remains reserved at
+63 and is not activated. Data-batch private-index controls use profile 25,
+after main's grouped-source/review profiles 23–24; schema controls remain
+reserved at 26. The combined storage-owner ABI is 100 and failure ABI is 68.
+All 765 released main failure-status identifiers through 834 retain their
+exact values, with unreleased SQL identifiers appended after them.
+
+Resolver projection admission is shared by the prepared table writer.
+Dependency-index and replay-job writes happen only in the publication phase,
+in the same transaction as the accepted table definition, not during
+multi-table preparation. Decoder admission takes the maximum of resolver
+and SQL requirements rather than allowing either classifier to mask the other.
+
+The implementation priority is the outstanding DDL/catalog cases, not further
+unactivated coordinator transport. The inventory remains unchanged at 294
+unresolved overall and 189 DDL/catalog cases. No merge or infrastructure work
+counts as closing a SQL parity case.
+
+Post-merge verification: full `make generate` succeeds against the restored
+working tree. Debug coordinator tests pass 32/32, resolver namespace tests
+5/5, schema-publication tests 46/46 across four result groups, and the standalone
+failure-ABI tests 2/2. All report zero skips and failures. Changed Zig formatting,
+whitespace, control-catalog and immutable inventory checks pass. Merge commit
+is local; the restored implementation and verification adjustments remain
+uncommitted, and nothing was pushed.
+
+### Native document CREATE bridge (2026-10-20)
+
+SQL document table creation now lowers into the same native schema and catalog
+CREATE operation as the public table API. It is an Antfly extension, not syntax
+claimed to be accepted by PostgreSQL:
+
+```sql
+CREATE TABLE docs () WITH (
+  antfly.storage_mode = 'document',
+  antfly.default_type = 'doc',
+  antfly.enforce_types = true
+)
+DOCUMENT SCHEMA doc AS JSON
+  '{"type":"object","properties":{"title":{"type":"text"}},"required":["title"]}';
+```
+
+SQL declarations bind one explicit default document schema; missing/unknown
+defaults, duplicate declarations and unsupported multi-type SQL declarations
+remain rejected, preserving the original negative contracts. Quoted names
+preserve case. Omitting declarations and the default creates a schemaless
+document table. Native API multi-type tables are not reinterpreted or removed.
+TABLESPACE uses the existing catalog binding between
+WITH options and DOCUMENT SCHEMA declarations. SQL row columns/constraints
+cannot be mixed with document declarations: those constraints belong in the
+native document schema. Unknown or duplicate options are rejected.
+
+The compiler retains owned schema literals in its immutable statement arena.
+Lowering preserves exact JSON numbers, validates through the shared native
+schema request parser before catalog dispatch, and carries cancellation checkpoints.
+No row write/read path, public model, metadata protocol or second catalog
+system is introduced. Invalid declarations never publish a table.
+
+Focused Debug compiler/lowering tests pass, including exhaustive allocation
+faults. The real-owner test executes unchanged original sql-0670, checks
+conditional CREATE against an already populated table, exact document values,
+invalid-declaration nonpublication, and reads/new writes across cold recovery.
+The final native gate passes with zero skips, failures or leaks
+(`/private/tmp/antfly-sql-document-ddl-final-native-debug.log`). It also sends
+unchanged malformed JSON/reserved-extension/misplaced-template originals
+sql-0780/0783/0784 against the populated table and proves rejection preserves
+both its schema and data. Missing/unknown default types and duplicate type
+declarations reject as invalid parameters, multi-type SQL declarations remain
+unsupported, and trailing WITH/SYSTEM VERSIONING remains a syntax error.
+
+Reserved native JSON Schema keyword typos and table-only option placement now
+validate through shared request admission, not a SQL-only schema dialect.
+Trusted stored decoding/replayed create requests still accept inert historical
+annotations; ordinary third-party JSON Schema annotations and data property
+names remain valid. The dedicated tests cover that admission/decode separation.
+The focused declaration/rejection gate passes six tests with no skips/leaks.
+
+The complete current-source Debug `sql-test` also passes: 1,278 library SQL
+tests and 236 server SQL tests, plus auxiliary gates. Four opt-in benchmarks
+are skipped; no correctness test failed. The high-cardinality spill stress
+case consumes most of the observed Debug runtime; a one-second CPU sample
+located it in balanced spill merging/decoded blocks and SafeAllocator traces,
+not the document CREATE path.
+
+Only sql-0670 receives new completion credit. Rejection counts and the original
+1,586-case inventory are unchanged: implemented 733, rejected 137, superseded
+423, unresolved 293 overall, including 188 DDL cases. The earlier native build
+lost a cached object during external cache cleanup and was not qualification;
+the final target rebuilt and passed. Source changes remain uncommitted.
+
+### Verified remaining transaction snapshot gap (2026-10-20)
+
+The exact PostgreSQL campaigns for sql-0084 and sql-0087 pass independently,
+and native durable-characteristic/recovery tests pass. The mounted native
+campaign still fails on sql-0084's read after an outside insert: opening a new
+statement cut and merging its current range generations into the earlier
+observations produces a 40001 conflict instead of reopening the earlier view.
+Neither case is marked complete.
+
+The required shape is a transaction-owned physical snapshot descriptor, not
+query-result caching or relaxed range validation. Capture and durably bind one
+coherent visibility cut at the transaction's first snapshot-requiring statement;
+later scans/point reads must reopen that cut with pinned schema/catalog identity,
+current authenticated authority and owner-root-bound leased tokens. New
+participants must prove they can serve the original cut, not capture a newer
+one. Preserve native commit validation, deterministic read-your-writes and
+snapshot lifetime across savepoints. Terminal decisions release leases
+idempotently; bounded maintenance expires abandoned leases. Lost/expired owner
+cuts fail closed across gateway/owner recovery rather than silently recapturing.
+This architecture remains unfinished; the current statement-snapshot callback
+does not provide a durable, transaction-reopenable snapshot contract.
+
+#### Retained-cut lease renewal prerequisite
+
+The private retained-read protocol now has an explicit `renew_snapshot`
+operation. It extends only the lifetime of the exact existing immutable cut;
+it neither captures a new cut nor advances a cursor. Renewal checks the full
+current authenticated scope, original connection, process incarnation and
+slot sequence. It rejects expired/revoked resources even before maintenance
+has swept them, cannot renew mutation capture fences or stateful cursors, and
+cannot shorten a later accepted lease. The owner operation is allocation-free
+and constant-time under the existing std.Io registry mutex. The RPC allocates
+its acknowledgement before changing retention and retains the existing
+30-second per-heartbeat ceiling and bounded owner-side expiry task.
+
+The client preserves ambiguous-delivery poisoning: it never retries or
+recaptures after a lost renewal acknowledgement, but can still close the known
+token. Snapshot retention and request execution remain separate: a heartbeat
+does not extend the client's statement deadline. No background heartbeat has
+been enabled for SQL sessions yet; that requires a durably bound transaction
+descriptor and terminal cleanup, not a request-owned callback kept alive.
+
+Qualification uses `antfly-api-retained-snapshot-test -Doptimize=Debug -j1`
+for owner/client lifetime and transport contracts, plus the isolated Debug
+tests in `storage/retained_read_registry.zig`. The tests cover borrowed cuts,
+scope and connection changes, stale/reused tokens, duplicate heartbeats,
+expiry, disconnect, invalid kinds/limits, acknowledgement allocation failure,
+lost delivery and request-deadline preservation. This prerequisite grants no
+SQL parity completion credit: coherent transaction-wide capture, durable
+descriptor binding/reopen, future-table cuts and terminal/recovery lifecycle
+remain unfinished, including sql-0084 and sql-0087.
+
+Current-source Debug qualification passed seven owner/client tests with zero
+skips/failures/leaks and all six isolated registry tests. The existing SQL
+normalization transport gate also passed all five client tests. Formatting and
+`git diff --check` are clean. The original parity inventory/dispositions were
+not changed by this prerequisite.
+
+### Validation-only owner permission and input reads (2026-10-20)
+
+Schema-validation owner dispatch now has a shared phase reducer and a durable
+ledger read contract. Begin/freeze/page work stops after ready acknowledgement
+and cannot restart after cancellation. Installation requires the committed
+all-ready install decision; release requires the committed all-installed
+catalog publication. Repeated installed/released/canceled work is observed as
+acknowledged rather than executed again. These dispositions are logical
+scheduling facts, never self-authenticating physical capabilities.
+
+The ledger rechecks the shared lifecycle lock for live work and requires an
+explicit authorization callback for every read, including terminal receipts.
+Its control projection uses four point reads while active and two after
+terminal unlock; admission inputs add one deduplicated blob read. Neither path
+decodes the immutable plan or materializes the complete owner cohort. Raw ASVI
+input bytes are returned only after fresh begin permission and input checksum
+and binding-digest validation. They borrow the read transaction; the transport
+adapter owns its response before releasing that snapshot. No large JSON byte
+arrays or base64 copies are introduced.
+
+The production RaftApplyStore read adapter joins those ledger facts with the
+current metadata incarnation, exact predecessor/successor public schema,
+retained signed preparation, enrolled reporter, serving placement, physical
+root generation, source authority and reader floor. It also gates on report
+readiness, relation-writer readiness, the reserved protocol floor and absence
+of an unmirrored metadata outbox. The complete adapter still decodes/hashes the
+one current table record; the compact ledger's record-count bounds do not
+claim constant-time work independent of schema size.
+
+Debug tests cover the complete action/phase matrix, partial-owner barriers,
+requested cancellation and historical NULL failure, active-pointer loss,
+changed lookup commitments, denied authority, terminal authentication and
+cold ledger reopen. The real metadata authority fixture exercises the new
+adapter with native and Raft roots, rejecting changed schema, incarnation and
+physical root. The existing root/enrollment/report fault matrix is retained.
+
+This is not full DDL activation. Coordinator mutation/admission transport,
+physical owner execution, leader-owned dispatch and bounded scan production,
+provenance-safe recovery/restore adoption and the public SQL validation-only
+producer are still required. Read-side transport is described below.
+Protocol 63 stays reserved/unadvertised, sql-0744 remains unresolved,
+and no parity dispositions or original corpus statements change here.
+
+Both current-source Debug gates passed: schema-validation publication ran
+2/23/2/23 tests across its local/server roots, and native owner authority ran
+4/19/18 across its service/local/server roots. Every group reported zero
+skips, failures and leaks. The control-catalog checker, Zig formatting and
+`git diff --check` also pass. The inventory checker still reports 293 overall
+unresolved contracts, including 188 DDL contracts; these reads do not earn
+completion credit before the remaining activation path is qualified.
+
+### Authenticated schema-validation read transport (2026-10-20)
+
+Owner-control and immutable-input reads now use the existing private system
+catalog transport, not public index routes or a second public DDL API. Its
+shared `schema_validation_read.zig` wire contract is independent of durable
+ledger/plan decoding; the ledger retains aliases while its storage keys stay
+private. A dedicated request-context grant is created only after service
+authentication and verification of the body-bound read grant. Ordinary admin,
+FK and index-owner contexts do not grant schema-validation authority. JSON
+cannot supply that flag. Native standalone dispatch independently checks the
+existing physical-root writer lease.
+
+The signed request binds metadata group/incarnation, table, plan ID/digest,
+owner ordinal, action and projection. The control projection is bounded JSON;
+admission inputs remain raw ASVI bytes across HTTP and the isolated metadata
+owner ABI, with explicit response limits and no JSON/base64 inflation. The
+new private ABI query returns raw owned bytes deliberately; existing queries
+retain their JSON envelopes. New union members are appended, not inserted
+among existing tags. These types are private protocol contracts, not public
+OpenAPI/SDK models.
+
+Clients verify media type, metadata identity and control-response scope and
+disposition. Input reads additionally verify framing/checksum and the expected
+immutable input digest. Canonical negative responses require an exact status
+and error name; mismatches/unknown replies cannot authorize a new root or
+physical replay. Read forwarding uses the same checked read path, cannot become
+a mutation/campaign retry, and preserves raw bytes. Responses are no-store.
+
+Tests cover narrow-purpose grants, missing service/read grants, admin-grant
+substitution, tampered request bodies, injected authority fields, changed
+response group/incarnation/plan/owner/action, malformed control responses,
+corrupt or mismatched ASVI frames, exact negative replies, expired budgets
+and single-attempt delivery failure. The compiled-owner test reaches the real
+new ABI projection and verifies refusal before protocol activation without a
+durable revision change. Positive full-job ABI execution remains part of the
+unimplemented activation/recovery qualification; codec and transport fixtures
+are not presented as that evidence.
+
+The broader catalog gate also exposed reader-format test drift from the main
+merge: newly emitted frames use encoding 32, not 31. Derived-encoding assertions
+now follow the writer constant; stored older encodings remain tested. Invalid
+semantic claims use a correct current encoding so semantic/encoding rejection
+stay independently tested, and the corrupt-frame test uses a genuinely unknown
+semantic version instead of the now-supported version 32. No decoder check or
+original corpus expectation was relaxed.
+
+Final current-source Debug verification passed all 123 build steps for
+`antfly-system-catalog-api-test`, `antfly-schema-validation-publication-test`
+and `antfly-storage-owner-test` (filtered to `opaque metadata schema validation`).
+The source/control-catalog checker, formatting and diff checks pass as well.
+Mounted HTTP tests require localhost access; the first sandboxed attempt's
+socket-permission failures were not storage failures. The unchanged inventory
+still has 293 unresolved contracts, including 188 DDL contracts. No completion
+credit is taken for read-side transport before full producer/recovery activation.
+
+### Historical schema-publication acceptance observations
+
+An uncertain coordinator reply can now be observed through a scoped private
+catalog read without rerunning physical work. The observation reuses the existing
+durable head, phase proofs and decision revisions rather than adding an unbounded
+receipt journal. Plan admission is idempotent by immutable plan identity. ACK
+acceptance requires both the logical header digest and the exact retained signed
+proof digest; a later attestation may preserve the logical phase without proving
+that an earlier signature was accepted. Missing or superseded evidence is unknown,
+never evidence of nonadmission or permission to replay an operation.
+
+Historical observations do not depend on the current table definition, live
+owner reports, or physical-root execution permission. They still require a
+linearizable metadata read, the exact current metadata incarnation, the reserved
+protocol capability, writer readiness, no unmirrored outbox, and the dedicated
+body-bound read grant. This is a separate contract from owner-control reads:
+historical acceptance never authorizes root adoption or execution. HTTP and the
+compiled-owner projection preserve that separation and reject caller-injected
+authority flags. These are private contracts; public OpenAPI is unchanged.
+
+Durable-ledger tests inject failures before and after each ACK write, reopen the
+store, and observe acceptance without plan decoding or writes. Admission and
+decision observations use one point read; ACK observations use three. Cold
+terminal receipts remain readable when current owner authorization is denied.
+Full coordinator submission transport, the physical owner worker, recovery and
+restore activation remain unfinished; protocol 63 remains unadvertised and no
+original SQL case receives completion credit for these prerequisites.
+
+The latest main merge includes the SQL activation-budget fix. Its resolution
+preserves the statement deadline through owner admission and tracks the shorter
+HTTP observation window separately, instead of passing a two-second deadline
+into a cold owner open. Both the branch's index-publication test registration
+and main's external-vector-dimension test registration are retained.
+
+The expanded SQL DDL selection exposed two older fixtures that still expected
+validated declarations to publish through metadata-only schema CAS. Their
+contracts now distinguish `CHECK ... NOT VALID` (eligible for declaration CAS)
+from validated CHECK/UNIQUE and private index builds (requiring execution and
+historical-row validation authority). The native metadata-only campaign checks
+definite rejection, no schema mutation, unchanged identity and recovery after
+restart. Positive original-case evidence remains in the mounted index/schema
+lifecycle campaigns; this fixture change takes no additional completion credit.
+
+Post-merge current-source Debug verification passes all 135 build steps for
+`antfly-system-catalog-api-test`, `antfly-schema-validation-publication-test`,
+`antfly-storage-owner-test` (filtered to `opaque metadata schema validation`)
+and `antfly-sql-index-ddl-test`. The SQL DDL selection passes 37/37 tests,
+including both deadline regressions and the corrected metadata-only rejection
+campaign. Formatting, diff checks, the control-catalog boundary checker and the
+original inventory checker pass. Counts remain 293 unresolved overall and 188
+unresolved DDL contracts; this is focused merge qualification, not a full-suite
+or distributed-activation completion claim.
+
+### Schema-publication submission and read-only preflight
+
+The coordinator now has a checked submission path through the existing catalog
+operations and native/replicated metadata writers. Ledger preparation is separated
+from staging for admission, ACKs, install/cancel decisions and publication. A
+read-only snapshot can reject a stale CAS, invalid root proof or incomplete barrier
+without staging any record. Replicated application prepares again in its own
+writer; a preflight result is never a lease or transferable execution authority.
+ACK staging still joins the signed proof and both compact postimages in three
+writes, with terminal cleanup in the same transaction. Exact decision retries
+remain write-free. Publication still rechecks installed proofs and joins the table
+postimage with the durable decision; its preparation does not publish the table.
+
+The private `/internal/v1/schema-validation` route carries original command bytes
+as `application/octet-stream`. BEGIN retains its bounded binary manifest/ASVI
+frame; ACKs and decisions are limited to 64 KiB before JSON parsing, instead of
+inheriting BEGIN's 64 MiB allowance. The ordinary JSON catalog route rejects the
+submission tag, and the catalog client routes this tag directly to binary transport.
+The service credential and body-bound grant remain independent requirements:
+BEGIN needs an administrative grant, while owner ACKs/decisions need the narrow
+read-purpose grant. Only verified ingress creates the private context authority.
+No public OpenAPI or SDK model is introduced for this internal operation.
+
+Submission verifies readiness before and under the catalog gate, establishes a
+linearizable read, and preflights before proposing. Exact prior acceptance returns
+its existing observation without another proposal. The gate is released before
+waiting for application. Every wait/read/decode/allocation failure after proposal
+is an unknown outcome, never evidence that the command was not admitted. The
+client derives the expected receipt from its retained command and returned head,
+not from a server-selected effect, and requires committed outcome framing and the
+exact acceptance. Lost delivery has one attempt; a provably unsent request remains
+distinct from ambiguous delivery. The routed facade preserves unknown outcomes
+even if its final result copy fails after acceptance.
+
+Storage-owner ABI 101 appends raw preflight projection 72. It passes command bytes
+directly to the owner without JSON/base64 expansion and returns bounded receipt
+intent JSON. Native dispatch independently checks the physical-root writer lease
+and shared standby mutation barrier. ACKs/barriers advance local revision accounting
+without full catalog reloads on the expected one-command cut; only publication
+fetches the one changed table. An overtaking writer still requires coherent reload.
+
+Read-only preparation tests use real storage snapshots and count zero writes;
+staging retains fault-injection coverage before/after every ACK write and terminal
+cleanup. Coordinator tests cover stale readiness, preflight rejection, exact prior
+acceptance, proposal rejection, lost waits, malformed/foreign postcommit replies,
+and lock release. HTTP/client tests exercise binary bytes, grant purpose, body
+tampering, JSON-route rejection, exact committed receipts and one-attempt delivery.
+Unsigned framing fixtures are not physical admission evidence. The raw compiled
+preflight test verifies refusal before activation without changing the revision.
+
+Protocol 63 remains reserved and unadvertised. The physical owner worker,
+provenance-safe recovery/adoption, unified restore activation, and public SQL
+validation-only producer still require implementation and combined fault
+qualification. These command-path prerequisites do not close any original parity
+case or justify changing the immutable inventory.
+
+Submission verification has an explicit named discovery anchor and an audited
+`antfly-schema-validation-submission-test` gate. A generic catalog green run was
+not enough evidence: it did not force discovery of the internal HTTP/coordinator
+fixtures. The dedicated gate requires all seven named protocol/authority tests
+plus the native catalog barrier test to appear in declared-test inventories,
+then runs without skips. Both the catalog API gate and ordinary unit-test target
+depend on it. The native guard uses the existing linked-test object/native-link
+helper and checked storage-owner archives, including the standalone composition's
+compile-memory reservation; it does not use a reduced-check optimization mode or
+an independent storage implementation to bypass Debug linker limits.
+
+Committed stale schema/root guards are classified as losing CAS only after the
+shared relation command journal restores storage and the buffered outcome. This
+prevents a preflight-to-apply race from permanently blocking metadata Raft
+application. The classification is schema-command-specific; unsupported decoder
+floors, invalid/corrupt records, bad signatures, allocation failures and storage
+failures are not swallowed. Routing/classification tests do not replace the
+still-required activated-cohort leadership, restore and root-adoption campaigns.
+
+Explicit discovery also exposed older reader fixtures whose numeric "unknown"
+versions are now supported. Those fixtures now derive future ceilings from the
+current reader constants, retain stored older-frame coverage, use the named
+publication/head floors for mixed-membership rejection, and require the strongest
+decoder on malformed restore envelopes. Production decoder checks are unchanged.
+
+The final submission gate run passed 156/156 Debug build steps, including the
+eight explicit transport/coordinator tests, the native authority guard, the
+26-test metadata publication selection and the compiled storage-owner checks.
+The newest main video-pipeline change was subsequently merged without conflicts;
+that earlier run is not presented as post-video-merge qualification.
+
+### Pinned schema-owner execution sessions
+
+The provisioned owner adapter now has a schema-specific Raft session rather than
+requiring a schema job to impersonate an index job. An actual retained owner read
+captures both the serving root generation and durable physical-root incarnation.
+Releasing for ordered apply permits descriptor retirement; reacquisition compares
+both identities before accepting any observation. Equal bindings, schema digests
+or serving generations alone cannot adopt a replacement physical root. Existing
+Raft schema observations and attestations use this admission path.
+
+A control-executor preparation ticket separately retains its applying owner.
+It borrows the original ASVR command during preparation without re-encoding its
+large immutable ASVI payload, validates the exact session binding, and drains the
+kernel ticket before releasing the owner. The progress-facing operation uses the
+prepared kernel entry without parsing, cold opening or signing. Its observation
+reads the applying root directly; cancellation of the initiating request cannot
+erase a committed effect. Opening/reopening an owner still requires an active
+admission context rather than silently bypassing cancellation.
+
+The real-owner regression covers release/retirement/reopen, foreign namespaces,
+request cancellation, independently altered generation/incarnation guards, and a
+genuine NOT NULL job admitted by a trusted test committed-entry driver. It frees
+the transport bytes before apply, verifies concurrent-preparation rejection and
+pre-apply deadline rejection without a mutation, applies/retries the same actual
+term/index, then destroys the preparation and independently reopens the owner to
+recover that phase and entry. Synthetic negative signing/root fixtures do not
+constitute metadata enrollment, successful publication or root-adoption evidence.
+The campaign also replaces the closed disk with a genuinely different root at
+the same visible generation, requires recovery instead of accepting its empty
+state, then restores the preserved original disk and recovers the original entry.
+
+This does not enable schema-control dispatch in the distributed state machine,
+advertise protocol 63, activate the public validation-only SQL producer, or close
+the missing recovery/restore/leadership fault matrix. Those integration steps and
+the original SQL cases remain open; inventory dispositions are unchanged.
+
+Post-main-merge Debug verification passes 101/101 steps for
+`antfly-storage-owner-source-test` (the three `native index owner adapter`
+regressions) and `antfly-schema-validation-publication-test`, with zero skips,
+failures or leaks. The separate compiled-owner selection and handoff/reopen gate
+pass 96/96 steps. Control-catalog boundaries, inventory integrity, formatting and
+diff checks pass. The original 293 unresolved contracts, including 188 DDL
+contracts, are unchanged; the physical-session regression does not substitute for
+an activated distributed SQL publication campaign.
+
+Main advanced again during qualification with lake scan sharing and native
+aggregate state (#1196). Merge `8bfdae76d8` preserves the branch's Datum accessor
+and exact aggregate assertion, main's reclaiming scratch allocator and additional
+lake removal phase, and both schema-job/video error entries. The six overlapping
+uncommitted SQL files were restored from retained stash
+`48437013371f6420e4b8a7ae8f0f90cd6c66649e`; the remaining dirty work was not
+stashed or included in the merge commit.
+
+The merged aggregate fast paths now preserve the canonical reducer contract:
+ordered ARRAY_AGG state is not eligible for primitive fixed lanes, borrowed
+collection clones own their portable state independently, integer AVG retains its
+128-bit sum rather than selecting floating-mean lanes, and BIGINT SUM/integer AVG
+finalization retains NUMERIC output. Fixed native finalizers delegate exact
+integer result construction to the existing SQL helpers. Primitive eligibility
+is an exhaustive aggregate-kind switch so a future variable-state reducer cannot
+silently enter the fixed representation. Tests exercise portable array order,
+duplicates and SQL NULLs under allocation faults, source destruction before clone
+finalization, and direct/borrowed/columnar/fixed-cell finalization across all
+integer widths, including integers above binary64 exact precision. These are
+integration fixes, not additional original-corpus completion credit.
+
+Final current-source qualification after the lake merge and semantic integration
+fixes passes all 129 Debug build steps for `sql-test` (30 selected aggregate
+tests), `lake-test` (486 and 151 tests), `antfly-storage-owner-source-test` (the
+three adapter regressions), and `antfly-schema-validation-publication-test`.
+Every selection reports zero skips, failures and leaks. The control-catalog
+boundary checker, immutable inventory checker, formatting and diff checks pass;
+no unresolved Git entries remain. These focused gates are not a full-suite or
+distributed schema-publication activation claim.
+
+### Fixed-key schema apply/control bridge (decoder still reserved)
+
+Committed schema controls now have a bounded bridge into the existing owner
+control worker. Progress admits only a group/term/index key into four fixed
+slots, or invokes an already-prepared kernel ticket. It does not copy a manifest,
+parse the command, resolve metadata, open an owner or destroy retained work.
+The same Io worker alternates schema preparation/cleanup with ordinary descriptor
+opens. Transient preparation failures back off exponentially with an interruptible
+event wait, rather than accumulating retry work or polling every job at 500 Hz.
+
+The control lane loads original bytes from two indexed records in the raw apply
+store: the retained normal entry and its exact term/type identity. The reads share
+one storage snapshot, enforce the caller's byte ceiling before copying the leased
+value, and refuse missing identity, a foreign term, an administrative entry,
+retired placement or a generation preparation. Missing retained evidence is
+recovery-required, never evidence of noncommit. There is no full-history scan or
+legacy missing-identity fallback. The consumer owns the kernel buffer directly;
+no additional transport copy or JSON/base64 expansion is required.
+
+Storage-owner ABI 102 appends data projection 10 and returns the prepared ticket's
+actual root generation/incarnation from its retained physical owner. Durable
+duplicate preparation therefore does not depend on the original job header still
+being live. Control opens from the persisted catalog, not a stale public schema
+hint, and rechecks root selection before publishing its ticket. Failure ABI 69
+appends exact data-apply conflict/invalid/retired/shutdown/projection-not-ready
+identities without renumbering released statuses.
+
+Group retirement cancels queued/preparing work and drains ready tickets on
+control. A native snapshot replacing the physical owner discards all volatile
+preparation for that group, including entries newer than its cut: those tickets
+also pin the old root and must reprepare on the replacement. Cancellation reaches
+preparation before publication waits for old root pins to drain. That discard
+does not cancel the durable schema job, advance its apply cut or retire
+membership. Already-entered applies finish before their tickets are reclaimed.
+Shutdown joins the shared worker before destroying its remaining preparations.
+Deterministic Io-event tests pause preparation while another group admits work,
+then supersede the paused cut and verify destruction without application. Separate
+tests cover bounded slots, mutex contention, exact prepared retries, foreign terms,
+backoff, retirement during preparation, ready-ticket shutdown and snapshot bounds.
+
+The compiled exact-entry campaign exercises raw NUL/non-UTF-8 bytes, empty normal
+entries, term/type mismatches, missing records, size bounds, old ABI/unused-field
+rejection and unchanged durable revision after reopen. The shared-worker campaign
+checks definite malformed/conflicting/missing retained evidence, not successful
+ASRL activation. The guarded state-machine dispatch hook is wired, but data
+protocol 26 and metadata profile 63 remain unadvertised. Committed stale data-guard
+outcomes, standby envelopes, restored-root provenance/adoption, preparation/apply
+memory headroom, the leader-owned producer and their combined fault matrix still
+require completion before activation. No original parity disposition changes.
+
+The expanded data-runtime selection additionally found two Datum field accesses
+from the lake-main merge. Relational key encoding and lake aggregate lookup now
+use the existing `patterns()` accessor, preserving the same rejection semantics.
+
+The full provisioned-owner selection passes all 50 tests, including both new
+queue cases and the real shared-worker/physical-owner regressions. Broad data
+runtime verification then exposed duplicate discovery anchors from the lake-main
+merge: seven assertion-free import blocks in `group_sources.zig` appeared as
+multiple owners. They are consolidated into one canonical discovery anchor;
+every imported module and named behavioral test remains. The selection auditor
+is unchanged rather than accepting additional duplicate test owners.
+
+Main integration at `4f3077c9c0` includes `fe346043de` (merge recovery and WASM
+fixtures). The additive metadata test-target conflict retains both the SQL
+catalog identity gates and the bounded online-merge driver gate. Four overlapping
+dirty API/build files were preserved separately and reapplied without conflicts.
+Storage compilation boundaries, parity inventory, touched-file formatting and
+whitespace checks pass. The broad post-merge Debug run is not qualified: generated
+SDK configuration and kernel object files disappeared during compilation, and
+the worktree cache was subsequently observed empty. No test success or parity
+completion is inferred from that interrupted run.
+
+Root replacement also invalidates preparations newer than the snapshot cut:
+those tickets pin the replaced physical owner and can otherwise deadlock its
+publication drain. The queue exposes one group-scoped root-replacement operation,
+not a cut-based discard API. Deterministic Debug tests verify group isolation,
+cancellation during preparation, destruction without apply, and fresh same-key
+preparation. The compiled physical-owner regression passes as well: a real
+FREEZE ticket at entry 2 is discarded while durable progress stays at entry 1;
+the old owner fully drains, and a new ticket after cold reopen commits entry 2.
+This uses trusted preparation directly, not ASRL wire activation. The latter is
+still correctly rejected by the reserved decoder gate.
+
+Broad runtime verification also found a stale comparison between raw root
+selection zero and its nonzero attestation epoch. The test now derives its
+expected epoch through the shared `attestedRootGeneration` helper. Transaction
+outcomes, physical native cut and post-rejection progress assertions remain.
+
+Current-source Debug qualification passes all 135 build steps for
+`antfly-storage-owner-source-test`, `antfly-data-runtime-test` and
+`antfly-schema-validation-publication-test`. This includes all 50 provisioned
+owner tests, all 196 runtime consumer tests, the 44 runtime implementation and 3
+local storage tests, and both 26-test/2-test publication selections, each with
+zero skips, failures and leaks. The standalone queue regressions also pass.
+Original parity dispositions are unchanged; decoder/capability reservation and
+the remaining activation requirements above still apply.
+
+### Durable ordered schema-command outcomes (activation still reserved)
+
+Raft schema controls now stage an exact ASVO outcome with their actual ordered
+marker in the same primary-store transaction as the effect. The 120-byte record
+binds immutable namespace, term/index, canonical command digest, accepted/rejected disposition and a
+typed guard reason, with reserved-byte and checksum validation. ASVR command
+identity streams its raw payload off progress rather than allocating another
+schema-sized frame. Replay point-reads the exact outcome, including after later
+commands or job cancellation; a watermark alone cannot turn rejection into
+success. Missing outcomes require recovery, foreign commands conflict, and
+malformed records remain corruption errors.
+
+Keys are scoped by the immutable table/shard/range namespace and then ordered
+by Raft index. A copied parent/old-range outcome therefore cannot collide with
+or satisfy a child/new namespace's clock. Decode also checks the value's
+namespace/index against the requested key; checksummed foreign values cannot
+be relabeled under another namespace. The namespace prefix supports bounded
+retention scans, but does not grant adoption or authorize GC on its own.
+
+Only explicit durable guards produce rejection candidates: job identity
+and cancellation, phase/predecessor, topology, active schema version, physical
+catalog head and range ownership. Apply rechecks those facts independently.
+Rejection stages no attempted schema effect. Preparation/scan, I/O, decoding and
+allocation errors are not blanket-classified as semantic outcomes. A rejection
+candidate whose guard no longer rejects is destroyed on control and prepared
+again, not retried forever as an incomplete ready ticket. Cancellation retains
+its ability to consume an abandoned epoch without requiring the old public
+schema still to be current.
+
+Producer preparation continues to reject invalid input before proposal. Only
+the trusted committed-entry path can retain a rejection candidate; existing
+producer-side negative contracts remain intact. Catalog/version/ownership drift
+inside an already admitted fenced job is recovery-required rather than a
+normal stale-request rejection, and a physical head is decoded before its guard
+digest is compared. Neither a corrupt head nor a future outcome cut is converted
+to a typed consumed failure.
+
+A committed FREEZE/page/release that encounters transaction recovery debt cannot
+wait at that Raft index for the later abort/ACK commands it is blocking. The
+explicit `TransactionTopologyBusy` guard rolls back the entire attempted store
+transaction before staging a `transactions_pending` outcome and marker. Later
+drain and retry at a new index can succeed; replay of the originally rejected
+index must still reject. This retains the existing transaction-drain verifier;
+its history scan still needs a durable bounded debt index before full activation.
+An outcome ahead of the native marker is corruption, not repair permission.
+
+The shared root-publication barrier also cancels schema preparations after
+closing admission and before waiting for owner pins. Restore/root publishers
+therefore use the same drain machinery as native Raft snapshots. The physical
+owner regression drives cleanup through the real shared Io worker, rather than
+depending on a caller to manually release the ticket.
+
+Failure ABI 70 appends command-rejected, preparation-changed and corrupt-outcome
+statuses. The private prepared-ticket bridge retains the decoded command digest;
+data runtime consumes only the durable rejection status as a typed failed
+proposal. The outcome key family is protected by the shared reserved-metadata
+checks, including batch, transaction and schema-metadata ingress.
+
+This is not complete distributed activation. Outcome retention/checkpoint-floor
+GC and restore/adoption qualification, standby envelopes, externally observable
+exact-outcome recovery, memory headroom and the leader-owned producer/fault
+matrix still need completion before advertising data 26 / metadata 64. No
+original SQL case is reclassified by this infrastructure change.
+
+### Main integration: resolver curation and HTTP authorization
+
+Merged origin/main at `9a619236a4` in merge commit `a06f150cc9`, preserving the
+unfinished SQL changes in stash `6144d9fe55de7a04db39324b80cc74ad8730f2c0`
+before reapplying them. The backup is retained. The unrelated API research
+directory was not stashed or changed.
+
+Main's new resolver provenance/proposal decoder uses its profile 37, which this
+branch had already assigned to unrelated SQL CHECK coverage. The combined
+resolver capability therefore uses profile 63; schema-validation publication is
+still reserved and moves to 64. Current advertisement is 63, not 64. Earlier
+ledger references to reserved metadata profile 63 describe the pre-merge state.
+Combined table and extension admission must take the maximum resolver/schema
+requirement. The mixed-floor regression checks this without relying on the old
+ordering of those independent requirements. Main's distinct PATCH/HEAD RBAC
+method mapping remains intact.
+
+Generated Go API and content-hashed dashboard conflicts were resolved by
+regeneration from the merged source contracts, not by selecting one compressed
+specification or dashboard bundle. SQL dispositions remain unchanged: 293
+unresolved original cases, including 188 DDL/catalog cases.
+
+Post-merge validation: `antfly-relation-coordinator-test` passes all 32 Debug
+tests (58/58 build steps, no skips/failures/leaks). The regenerated Go `./oapi`
+tests pass after the required `internal/gensqlpolicy` generator restores SQL
+no-redirect and bounded-body hooks. The dashboard build, reserved-control
+boundary audit, inventory integrity audit and changed-Zig formatting checks
+also pass. These results do not claim distributed schema-validation activation.
+
+The broader Debug compilation found two upstream resolver proposal-list handler
+signatures missing the generated query-parameter argument. Both route families
+now accept that argument and retain pagination/filter parsing in the existing
+shared resolver request path. Generated server dispatch remains specification
+derived; no query fields or validation rules were removed to make it compile.
+
+Final post-merge Debug qualification passes 126/126 build steps: 15 native
+schema-outcome tests, 50 compiled-owner tests, 196 runtime tests, 44 implementation
+tests and 3 local tests, with no skips/failures/leaks. The compile measured
+18,268,717,056 bytes for the Darwin Debug data implementation object, exceeding
+its old 17 GiB scheduler claim. Its scoped reservation is now 22 GiB to retain
+the existing >25% measured headroom policy; Linux, cross-host and release claims
+and Antfly runtime memory limits are unchanged. All 10 memory-policy tests pass,
+and the final full gate has no reservation-overrun diagnostic. Build-cache GC
+completed; the uv cache was locked and skipped. No changes were pushed.
+
+### Exact schema history through shared staged restore
+
+Schema outcomes now carry an additional fixed-size ASVH history head, scoped by
+the immutable table/shard/range namespace. Each accepted or rejected command
+atomically appends its ASVO, updates the head's count/last-position/chained digest
+and advances the actual ordered marker with its schema effect. Duplicate replay
+does not append another outcome. A missing or future head cannot authorize
+replay, repair or replacement of history. The unreleased private format gains no
+legacy compatibility path, and data 26 / metadata 64 remain reserved.
+
+Both shared native restore and transferable-primary verification validate the
+history before publication. The verifier pins one read for namespace, actual
+ordered cut, canonical keys/values, head and referenced job positions. It streams
+the outcome family once, retaining only fixed-size hash/count/position state,
+and checks cancellation throughout. A missing historical rejection is detected
+even when the current job header no longer references that entry. Every Raft
+position explicitly retained by the job header must also name an exact accepted
+outcome; a rejected entry cannot be substituted as phase progress.
+Terminal job progress must also have its durable completion receipt and must
+not retain its old write fence. Reserved mutation admission covers the complete
+version-independent job/outcome/head families, preventing ordinary writes from
+planting a future-version control record. Unknown outcome/head versions in a
+native image fail validation instead of being silently ignored.
+
+Foreign namespace records/heads are checked for canonical bytes and key binding
+but never compared with the destination's unrelated clock or used as adoption
+permission. Nonterminal foreign jobs require explicit owner recovery/adoption.
+This local consistency check is not physical-root attestation, a metadata ACK,
+or a complete distributed restore activation protocol.
+
+The new staged-restore fixture exposed a shared native import bug: logical KV
+snapshots were installed through ordinary DocStore mutation capture, which could
+derive fresh effects from a physical image and reject an otherwise valid source
+authority/identity batch as RetainedEffectsMixedControl. The private physical
+image importer now uses the backend's atomic batch, invalidates process-local
+retention/replay/query/columnar hints, and retains the existing destination-local
+footprint invalidation and pre-publication validation. This also removes the
+temporary second KV array for each imported batch. Ordinary mutations and logical
+portable import retain their existing validation/capture machinery.
+
+Portable metadata admission also previously confused schema_validation job keys
+with the broad schema_v layout prefix. Only canonical numeric layout-version
+keys now match that branch. Source-local job inputs/cursors, outcomes and heads
+are excluded from portable backup/import, including future private job spellings.
+
+New native fixtures cover accepted and rejected cold replay, canonical relabeling
+and cut faults, missing accepted and rejected history, missing/corrupt heads,
+foreign clocks, cancellation, and generation publication/rollback. A separate
+document-table fixture uses the same native restore API and verifies unchanged
+Raft authority/cut without inventing a native clock or reapplying row effects.
+A 10,000-outcome fixture checks exact streamed counts and deterministic bounded
+cancellation; it is a work-contract regression, not a throughput benchmark.
+
+Still required before full schema activation: checkpoint-qualified bounded
+history GC with retained head/anchor semantics, bounded coordinator/ACK debt
+indexing, authenticated physical-root provenance/adoption, standby envelopes,
+externally observable exact-outcome recovery, memory-headroom admission and the
+leader-owned producer/distributed fault matrix.
+Do not delete old outcomes merely because their job is terminal: the history
+commitment and retained-entry/phase references must be checkpointed together.
+Original SQL dispositions are unchanged; no unsupported DDL case receives credit
+from these infrastructure regressions.
+
+The next transaction-debt implementation must not trust an unqualified global
+"index ready" bit. Released writers do not maintain a new directory, so a scan
+completed before the all-member writer barrier can become stale behind its
+cursor. Bind the directory generation to the immutable namespace, admitted
+schema-fence epoch and upgraded writer cohort, and rebuild after that barrier.
+Use generation-scoped transaction-ID membership plus a durable debt count;
+update membership/count in the same primary batch as begin, decision, participant
+ACK, recovery and cleanup. Derive updates from the batch's final record/member
+view, not separately committed counters. Intents, read guards/locks and standby
+outboxes retain their independent constant-work nonempty-prefix checks.
+
+Backfill must page both transaction history and legacy participant evidence,
+dual-writing transactions behind the cursor and publishing readiness only at
+the actual fenced end. A leader-owned reconciliation control must commit each
+bounded page independently: staging migration progress inside a FREEZE that is
+then rolled back as transactions_pending would make recovery livelock. Once
+qualified, topology drain reads the exact generation header/debt directory,
+not all retained terminal decisions on every validation page. Restored/adopted
+roots must requalify this derived directory rather than inheriting an old empty
+count as authority. This is a remaining implementation requirement, not claimed
+coverage or an alternate reduced objective.
+
+Current-source Debug qualification: the native schema/history and portable gate
+passes 68/68 build steps (20 native tests and 36+9 portable tests). The separate
+compiled-owner/data-runtime gate passes 116/116 steps (50 owner, 196 consumer,
+44 implementation and 3 local tests). Existing repeated identity and managed
+restore selections pass 62/62 steps, including the 32-restore identity campaign.
+All selections report zero skips/failures/leaks. Boundary ownership, original
+inventory integrity, changed-Zig formatting and diff checks pass. Inventory stays
+733 implemented / 137 rejected / 423 superseded / 293 unresolved; DDL remains
+188 unresolved, with 7 partial-evidence and 181 no-evidence dispositions. No
+case closure, complete activation, commit or push is claimed by this step.
+
+### Epoch-bound transaction debt: atomic writer groundwork
+
+The private transaction-debt implementation now has a namespace/generation/epoch
+header, generation-scoped membership/counts, bounded history/cohort pages,
+durable legacy deduplication and bounded orphan-work GC. Prepared pages compare
+the exact durable predecessor before staging; concurrent transaction evidence
+invalidates partial work and creates a durable cleanup objective. A ready marker
+alone is insufficient: drain also requires zero debt and empty work directories.
+This remains a private, unactivated implementation, not a global readiness grant.
+
+New transactions install immutable hashed participant membership alongside their
+record and retained participant list. Remote ACKs and local intent completion
+update the indexed resolved-member/count pair atomically with their existing
+effects and completion receipts. The ordinary local path performs point probes,
+not cohort-sized list decode/rewrite. Duplicate ACKs do not increment counts;
+unknown participants and mismatching member bytes fail closed. Released legacy
+resolved lists retain their migration path. Final source-stamped callbacks cannot
+alter any transaction evidence after directory maintenance has run.
+
+Intent snapshot collection now allocates its key vector using the durable
+admission count, rejecting missing/excess members instead of growing and shrinking
+an intermediate vector. This removes an unnecessary remap and makes allocation
+fault coverage independent of whether the backing allocator can shrink in place.
+Native single-payload ownership and bounded key-only retirement remain tested.
+
+Tests cover local ACKs on commit, abort, already-completed retry and predecessor
+completion, duplicate enlisted names, unknown participants, completion receipts,
+epoch isolation, bounded legacy reconciliation and invalidated-work cleanup.
+Migration fixtures explicitly remove the new membership index to exercise actual
+predecessor state. No SQL disposition is changed by these infrastructure tests.
+
+Still required: independently committed owner reconciliation commands, schema
+BEGIN/FREEZE/install/cancel/release lifecycle integration, qualified restore and
+adoption, producer observability/admission and distributed crash/fault coverage.
+The reserved schema capability floors remain unadvertised. Do not switch schema
+drain to this directory before those writer/restore qualification requirements
+are enforced.
+
+After merging origin/main at df846adb90, current-source Debug verification of
+docstore-transaction-debt-test and docstore-transaction-reservations-test passes
+67/67 build steps: 5 focused debt tests and 57 broader transaction tests, zero
+skips/failures/leaks. The final local ACK implementation uses immediate probes,
+not a bound read that clones the mutable LSM state. Control-catalog boundary,
+inventory integrity, changed-source formatting and diff checks pass. Inventory
+remains 293 unresolved (188 DDL); no capability-floor activation or SQL closure
+is claimed. Cache GC completed and skipped in-use build output.
+
+### Independently committed schema transaction reconciliation
+
+Schema BEGIN now initializes the exact immutable binding's transaction-debt
+generation and seeds at most one fixed-size record page. A dedicated private
+reconcile_transactions control carries the expected directory digest. Its
+off-apply preparation owns at most 64 work units; apply checks that predecessor,
+stages the bounded changes and advances the real native/Raft job cut in the same
+primary transaction. Its effect identity is domain separated from row scans.
+Exact retries reuse the accepted cut; a stale committed page is a durable
+predecessor_changed rejection, not permission to overwrite newer ACK evidence.
+Progress is never a tentative sub-effect of a blocked FREEZE.
+
+FREEZE, validation pages and terminal transitions require the exact admitted
+directory to be ready and debt-free. Cancellation and release retire that
+generation atomically with their existing receipts/fence changes. Terminal
+observations may report a retired generation without making it writable again.
+Native and Raft owner observations expose bounded directory revision/count,
+readiness/retirement and predecessor digest. A local producer can retain the
+already prepared page instead of rescanning it before proposal; remote apply
+independently reconstructs it from the committed command and current read.
+
+Metadata cancellation preserves reconciliation permission for an unready owner,
+otherwise a partially indexed generation could become impossible to cancel.
+Installation preparation and serialized commit both recheck drain: a coordinator
+started after the row-validation seal cannot slip through a previously prepared
+schema installation. Transaction-history verification now accepts the SAME
+borrowed read/writer view rather than opening another snapshot at those schema
+barriers. Non-schema topology behavior is unchanged.
+
+The historical transaction check deliberately remains in schema barriers until
+staged restore/adoption can independently requalify every directory/cursor and
+its legacy evidence. Consequently this step does not yet claim directory-only
+constant-work drain after restore, complete activation or any SQL case closure.
+Remaining producer/standby, headroom, root-adoption and distributed-fault gates
+still apply; reserved capability floors remain unadvertised.
+
+The multi-page Raft regression retains 140 terminal decisions plus a live
+participant. It verifies blocked FREEZE consumption, a later ordered abort,
+durable stale-page rejection, independent committed-byte reconstruction, exact
+retry, bounded page units and terminal generation retirement. Allocation failure
+after staging a page leaves its directory, job header and applied marker
+unchanged. Release fault injection now covers both sides of all six writes,
+including directory retirement. Installation tests reject a coordinator begun
+after preparation and preserve the previously validated schema job.
+
+FREEZE also replaces the preceding reconciliation effect identity with its own
+domain-separated effect. Otherwise retrying the final debt command after FREEZE
+could be misreported as a duplicate at the newer freeze cut. A regression
+requires that later proposal to be consumed as a rejection instead.
+
+The integrated Debug lifecycle/transaction/publication selection passes 87/87
+steps (21 native lifecycle tests, 57 transaction tests and 2+26 publication tests
+in each tested compilation boundary). The final freeze-identity/fault selection
+passes 58/58 steps with 21 native tests, zero skips/failures/leaks. Original
+inventory and control-catalog boundary checks remain green and unchanged.
+
+Final current-source Debug qualification passes 170/170 steps across the
+combined lifecycle, transaction, metadata publication, compiled storage owner
+and data-runtime gates. This includes 21 native lifecycle tests, 57 transaction
+tests, 59 real owner tests, 196 runtime consumers, 44 runtime implementation
+tests, 3+4 local tests and 2+26 publication tests at both boundaries; all report
+zero skips/failures/leaks. This supersedes the earlier pre-final owner/runtime
+run for source qualification. The original inventory remains 293 unresolved,
+including 188 DDL cases. Work remains uncommitted and unpushed.
+
+### Shared snapshot qualification of transaction debt
+
+Native transfer verification and staged document/relational restore now validate
+the transaction directory against the SAME pinned image before publication.
+Validation streams the complete private family, rejects unknown versions,
+foreign generations, count/member mismatches, missing dirty members, orphaned
+work, impossible resume cursors and noncanonical work values. A terminal job
+must retain its exact retired generation; a never-visited cancellation may keep
+only an older inert retired head. These are physical facts, not root-adoption
+or metadata-publication authority.
+
+An independent transaction pass verifies released record decoding, immutable
+membership/index counts, original enlistment, indexed/legacy ACK union and
+directory classification. It also verifies cohort facts when no schema job is
+active or its directory is retired: an inert old directory must not hide broken
+participant evidence that a future schema generation would otherwise trust.
+Resumable legacy work is checked against its exact consumed list boundaries,
+unique-prefix counts, resolution-index cursor, remaining seen marks and cleanup
+cursor. Internally consistent but false empty/ready claims therefore fail
+against retained pending decisions rather than granting quiescence.
+
+Small cohort proofs use a fixed 256-identity cache with in-place flag union.
+Large cohorts spill full SHA-256 identities through the existing private-run
+sorter. Complete payload tie ordering prevents a numeric hash-prefix collision
+from becoming identity equality; merge windows remain bounded. Source names
+are borrowed and hashed, not copied into a cohort-sized map. Private runs are
+unlinked on supported hosts and always released; configured resource managers
+account for disk capacity. Fallible cancellation/lease errors survive merge
+loops instead of being flattened to a boolean cancellation. Existing sorter
+callers retain their prior default ordering/error behavior.
+
+Qualification also exposed a real reconciliation race: adding an earlier dirty
+transaction while a later cohort was partially prepared could let that later
+cursor skip the new work. Such a mutation now retires the later partial work
+and restarts in key order. Newly dirty work during GC reopens reconciliation.
+Cleanup's cursor is the existing offset field; the verifier uses that field,
+and the now-unused indexed-counter field is cleared at the cleanup transition.
+
+With restore independently checking the derived facts and admitted writers
+maintaining them in the mutation batch, schema FREEZE/page/install/release
+checks use the exact directory plus intent/lock/read-guard/standby-outbox
+prefix guards. They no longer rescan all retained transaction history under
+apply. Non-schema topology behavior remains unchanged. Unsupported root
+adoption, producer/standby activation, headroom and distributed fault campaigns
+remain separate requirements; no reserved capability floor is advertised.
+
+New evidence includes canonical forged zero-debt claims, false indexed counts,
+ghost members, corrupted legacy counters/offsets, dirty-predecessor/GC races,
+600 complete identities deliberately sharing one numeric sort prefix, duplicate
+ACK union, cancellation and lease loss during spill. The shared staged-restore
+matrix rejects missing/torn/foreign/reopened/future directory state and future
+job keys while preserving the original destination generation. Existing legacy
+reconciliation tests independently validate every committed migration page.
+No SQL disposition is changed by these infrastructure tests.
+
+LSM drain guards also dispatch to the provider's native hasPrefix operation,
+with a keys-only cursor fallback where necessary. A fixed number of seeks must
+not accidentally clone a writer overlay or hydrate values for an absent prefix.
+A dispatch regression supplies a provider with no cursor API at all. The shared
+document restore fixture now retains a pending transaction without any relational
+job; unscoped malformed ACK counters are independently rejected too.
+
+Production snapshot/owner/runtime/portable/native-restore qualification passes
+189/189 Debug steps (21 schema/history tests, 59 transactions, 59 real owners,
+196 runtime consumers, 44 implementation tests, 3+4 local tests, 36+9 portable
+tests and 3 managed/1 repeated-identity restore tests). Final current focused
+qualification, including the native-prefix and document/unscoped additions,
+passes 77/77 steps: 21 schema/history, 59 transaction and 9 debt/proof tests.
+The standalone canonical-header/native-prefix gate also passes both tests.
+All selections report zero skips/failures/leaks. Formatting, diff, ownership
+boundary and original inventory checks pass; inventory remains 293 unresolved
+including 188 DDL. No complete activation, SQL closure, commit or push is claimed.
+
+### Native image origin at the capture fence
+
+V6 native backup captures attach a bounded, owned origin to the existing
+primary manifest: physical source-root incarnation, stored namespace, actual
+source authority/native sequence, actual ordered Raft marker, schema-header
+digest, transaction-directory digest and exact outcome-history head digest.
+The three record digests commit the exact encoded bytes, including their codec
+envelopes; they are not interchangeable with logical phase receipt digests or
+the directory's internal checksum. This remains physical provenance, not a new
+semantic row-content hash.
+These are point reads under the SAME apply fence as primary MVCC/checkpoint
+pinning. Hashing files and serializing the full generation remain off apply.
+An absent value is distinct from a fabricated zero cut. The released embedded
+document default namespace remains representable; active distributed schema
+jobs retain their fully scoped namespace checks.
+Provisioned owners can also have source authority before the first document
+persists an identity namespace. Origin records preserve both facts (authority
+present, document namespace absent), rather than synthesizing an identity row.
+Authority namespace comparison uses the existing durable big-endian encoder,
+not topology-fence field encoding. Malformed/mismatched origin errors retain
+distinct appended storage-owner status identities and are terminal immutable
+restore integrity failures, not indefinitely retryable provider defects.
+
+The common document/relational native restore pipeline compares these source
+facts with one immutable imported image before creating its physical root,
+marking primary import complete or publishing the staged tree. The destination
+receives its own physical incarnation; it does not inherit the source identity.
+Existing V5 and released V3 native manifests without origin evidence remain restorable, but cannot
+serve as evidence for schema-owner root adoption. Portable logical restoration
+is unchanged. New origin evidence cannot be relabeled as an older manifest
+version. The primary checkpoint/KV codec versions are unchanged; the manifest
+schema change has its own explicit version. No new restore subsystem or
+full-table pass is introduced.
+
+This is provenance DATA, not a signature or an adoption grant. Future metadata
+adoption must authenticate the exact source artifact/manifest through the
+existing restore/owner protocol, join that authority with this origin and an
+actual destination-root attestation, and CAS the retained owner without
+regressing any accepted logical phase/cut. A caller-authored manifest or a
+signed copied schema header alone cannot provide that authority. Raft transfer
+envelopes and standby production still require their explicit integration;
+reserved schema/profile capability floors remain disabled. No SQL disposition
+is changed for these infrastructure prerequisites.
+
+Final V6-source qualification passes 154/154 Debug steps: 59 real compiled-owner
+tests, 23 schema/history/provenance tests, 6 shared native-restore tests, 45
+restore-job/error-classification tests, 24 released schema/backup compatibility
+tests plus 6 directory-admission tests, 46 error-identity tests and 4 boundary
+tests. All report zero skips/failures/leaks. The staged provenance test covers
+nine cases (V6 and V5 success plus namespace, authority, header, directory,
+history, future-version and zero-root rejection) without replacing the live
+sentinel. Exact V5 JSON without the new field and released V3 fixtures remain
+readable; provenance mislabeled as an older manifest is rejected.
+
+Ownership/inventory/generated-error/C-header, changed-source formatting and
+diff checks pass. Original inventory remains 733 implemented, 137 rejected,
+423 superseded and 293 unresolved (188 DDL). These tests establish the image
+origin prerequisite, not complete root adoption or public schema activation.
+Work remains uncommitted and unpushed.
+
+### Replica snapshot lineage and read-only root observation
+
+The existing primary Raft snapshot transport now has an NRSP2 reader/writer
+carrying the same source origin as native backups. A fixed canonical 288-byte
+record replaces JSON parsing for this envelope: presence bits, explicit domain
+clocks and namespace encoding, zero padding/absent fields and a checksum are
+all checked. Metadata point hashing has the schema-header size bound. Capture
+uses the same apply fence and primary pin; its already decoded apply marker is
+reused rather than fetching/copying it again.
+
+Automatic C-ABI snapshot production selects NRSP1 for groups below the existing
+reserved schema-owner protocol floor (26). The raw projection's protocol is
+read from its pinned snapshot, not a later live lookup or local binary version.
+NRSP2 is selected only after that durable all-member barrier. The advertised
+data decoder remains 25, so this work does NOT activate protocol 26. Failed
+attachment restores the caller's original capture; ownership transfers only on
+success. NRSP1 images remain readable but gain no fabricated origin evidence.
+
+The receiving physical owner verifies origin, actual ordered marker, schema
+history and transaction directory in one pinned imported-image read. This is
+repeated after derived repair. Only then does the unpublished generation write
+a receiver-owned 416-byte checkpoint binding source origin, destination physical
+root, namespace/group, snapshot stream digest and Raft through-index. The latter
+is independent of the last native data-apply marker; protocol-only entries must
+not become invented storage effects. The checkpoint is synced before generation
+sealing/publication, uses a fixed receiver-selected filename, and is retained by
+the existing generation lifecycle. Idempotent writes must match exactly; reads
+reject another destination root/group/namespace.
+
+Read-only DB handles now load an EXISTING physical-root checkpoint rather than
+reporting zero for every filesystem-managed read. They do not create one for a
+raw/unpublished or older image. Writer/repair initialization still creates the
+fresh destination identity. Supplied runtime filesystem authority is respected;
+this read path creates no hidden executor. The private storage engine descriptor
+is version 29 for the additional verifier and changed pinned-return shape; public
+storage-owner request ABI and released status integers are unchanged.
+
+This is durable evidence, not source authentication or metadata permission.
+Remaining activation must extend audit-backed root recovery/re-attestation and
+metadata CAS, retaining the exact logical phase/cut and immutable binding.
+Current replicas and ordinary leader changes must use their actual replica/root
+authority and physical audit rather than requiring a new backup. Restored-image
+lineage supplements those checks; neither a checksummed checkpoint nor a signed
+copied header alone authorizes adoption. Producer/standby integration, headroom,
+history GC anchors and full capability activation remain open. SQL disposition
+counts are unchanged.
+
+The producer/audit integration must also carry an independently completed Raft
+prefix alongside the actual data-apply marker; a valid snapshot demonstrates
+data entry 5 with completion through 7. The completion-proof bridge below
+addresses the signing clock boundary, not full producer activation or root
+adoption. Completion is never relabeled as a storage effect.
+
+The final gated production selection passes 164/164 Debug steps: 124 data-storage,
+59 real compiled-owner, 18 snapshot-storage, 25 schema/history/provenance,
+8 shared native-restore, 24 released schema/backup compatibility, 6 directory
+admission, 46 runtime error-identity and 4 boundary tests, plus the merge-receiver
+transition regression. Final test-only additions pass 68/68 focused Debug steps
+(18 snapshot and 25 schema/provenance tests). No skips, failures or leaks.
+
+Evidence includes every truncated envelope prefix, corruption at every byte of
+both fixed records, checksum-correct noncanonical absent/padding fields, forged
+origin claims with recomputed stream checksums rejected against the primary,
+post-capture donor writes excluded, correct dispatcher use for retained intents,
+checkpoint idempotence/wrong-root rejection, and read-only absent/existing root
+identity behavior. Protocol enablement tests cover every pre-barrier version.
+The actual opaque-owner crash/recovery test uses the currently supported group
+protocol and therefore verifies NRSP1 compatibility now; its NRSP2 checkpoint
+branch runs when the schema decoder family is genuinely activated. A pre-gating
+117/117-step run exercised that receiver/checkpoint branch with distinct native
+data and completed cuts; this is not a claim that activation is finished.
+
+Original inventory, source ownership, generated errors, public C header,
+changed-source formatting and diff checks pass. The original 293 unresolved
+contracts, including 188 DDL, remain unchanged. No commit or push is claimed.
+
+### Schema observation completion-proof bridge
+
+Raft schema observations may carry the runtime's existing frozen-read proof:
+runtime incarnation, current election term and independently completed prefix.
+When an actual-data observation already covers the report, signing retains its
+strict local fast path without a quorum round trip. Otherwise the retained-owner
+path captures the runtime proof, rereads the actual storage observation and
+quorum-validates the proof for the same group. Leadership loss or a changed
+frozen prefix prevents completion-bearing signing; cancellation or a retired/
+replaced owner prevents either path. Partial barrier implementations fail
+closed when completion is required. A runtime without frozen
+callbacks retains the original strict actual-data freshness requirement; absence
+of a completion proof never waives it.
+
+The actual data marker must be at or behind the completed prefix, and its entry
+term cannot exceed the proof's election term. The permission read's reported
+prefix must be covered by completion, without rewriting the storage marker.
+Completion-bearing signatures use a distinct evidence domain binding all proof
+fields; removing the proof cannot downgrade the signature. Logical phase
+digests remain unchanged. Metadata independently checks its current enrollment,
+placement, root generation and report in the accepting writer transaction; that
+report must cover both the actual data cut and the signed completion proof.
+This reuses ReadIndex and the shared completion tracker, not another completion
+clock or a caller-supplied synthetic Raft entry.
+
+The proof alone grants neither publication nor physical-root adoption. A fresh
+physical audit and exact metadata predecessor CAS remain required for adoption;
+schema producer, standby and reserved protocol activation remain unfinished.
+No SQL inventory disposition changes are justified by this infrastructure.
+
+The focused native-owner-authority and schema-publication Debug gates pass
+84/84 build steps. The final compiled-owner-source Debug rerun passes 56/56
+steps and 50 tests with no skips, failures or leaks, including the no-quorum
+fast path. The source fixture uses a real durable kernel observation and a
+controlled runtime barrier; it is not a claim of full distributed producer
+activation. Ownership, inventory, generated errors and public C-header checks
+pass. The aggregate metadata attempt is not a passing gate: its consolidated
+compile exceeded the declared 16-GiB bound (18.65 GB observed), and forwarding
+metadata-only filters to unrelated test partitions also failed selection. That
+attempt was stopped; the named focused gates ran independently and succeeded.
+
+Integration with main's native grep/logical-source work preserves the released
+`value_search_requires_scan` / `value_search_limit_exceeded` status values 835
+and 836. Only this branch's unpublished additions move to 837–893; explicit
+regression assertions protect main's values. The regenerated Go SDK includes
+both merged specifications, and main's C allocator export is retained alongside
+the private v29 engine descriptor. Pre-merge validation above is not evidence
+for the subsequently merged tree; its Debug gates are rerun separately.
+
+Post-merge Debug evidence passes 127/127 build steps across native-owner
+authority, schema publication, compiled owner source and runtime error
+identities. The owner source suite passes all 50 tests without skips or leaks.
+After correcting the unpublished status boundary assertion, all three storage
+ABI regression tests pass through `runtime-error-identities-test`; the same
+tests now also run with the media-chunking gate. No production behavior changed
+in that final test-wiring correction. The aggregate metadata compile-memory
+limit and the unimplemented activation/adoption obligations remain open.
+
+### Physical row coverage for schema-owner recovery
+
+`relational_nullability_job.RowAudit` reuses the unfiltered typed-row reader and
+the exact immutable ASVI candidate. It owns one schema view and MVCC read, scans
+from the actual beginning rather than trusting a copied continuation, and yields
+after each bounded record/time page. It retains only the prepared candidate,
+reader/cursor and fixed counters, not a table-sized collection or reconstructed
+JSON documents. Its summary records the actual storage snapshot cut separately
+from the header's phase-entry cut and any independently completed Raft prefix.
+Normal validation and recovery share a short schema/data pin helper: the apply
+publication fence ends before reader allocation, range decoding and planning.
+The final pin-helper gate passes 58/58 Debug steps and all 26 job tests.
+
+Scanning/failed jobs require an exact physically reexecuted prefix, including
+counts, continuation digest and the actual first NULL violation. Ready/installed
+jobs require complete non-NULL coverage with matching historical counts and
+cursor. Released jobs verify current non-NULL rows without comparing their count
+to the historical validation count: normal post-release writes are legitimate.
+Released definition/history checks intentionally do not require installation's
+old activation bytes, while installed guards remain unchanged. Fencing and
+cancellation yield explicitly facts-only coverage, never a ready-row proof.
+Terminal audits can use metadata-retained ASVI bytes after local ASVI cleanup;
+the complete immutable input digest and compiled binding must still match.
+
+Cancellation before a page leaves progress unchanged. Once an accepted reader
+page fails audit verification, the audit is permanently invalid: retrying at EOF
+cannot combine an advanced cursor with old counters to qualify forged metadata.
+The tests exercise that attack, missing physical rows behind a ready header,
+snapshot retention across live-row deletion, bad retained inputs, actual NULL
+failure coverage, installed historical layouts with indexes/CHECK progress, and
+Raft released owners after ordinary writes. The phase gate passes 58/58 Debug
+steps and 26 tests with no skips, failures or leaks. The subsequent snapshot-cut
+and shared native-restore gate passes 68/68 Debug steps (26 job tests and 8
+native-restore tests). The Raft terminal audit retains the original released
+header while recording the genuinely newer data entry after normal writes;
+neither is replaced by a completed-prefix clock.
+
+This is a row-coverage component, not a root-adoption grant. Root-local durable
+checkpoint worker/cache integration, combined transaction/provenance qualification, metadata's
+exact predecessor CAS and producer/standby activation remain unfinished. No SQL
+inventory disposition changes are justified by this component alone.
+
+### Authenticated schema row-audit resumption
+
+Schema and index audits now share `root_audit_checkpoint_io`: provisioning-owned
+key checks, namespace file locks, bounded no-symlink reads, private temporary
+files, file sync, atomic rename and directory/parent sync. The existing index
+signed envelope and namespace filenames are unchanged. Schema row audits use a
+separate signature domain and ASRA1 envelope; their binary cursor is not encoded
+as JSON or assumed UTF-8. Each family retains one canonical slot per namespace,
+not another file per retry/job attempt. Retired-namespace cleanup remains a host
+lifecycle obligation, not a claim that all cache/history GC is complete.
+
+The schema checkpoint binds signing root, physical root, immutable job/header,
+actual storage snapshot cut, coverage kind, counters, cursor digest and completion
+state. Authentication precedes header/cursor parsing. Canonical representation
+and structural validity are checked even for correctly signed bytes. Writes and
+evidence derive progress from the owned scanner rather than accepting remotely
+asserted counters. Evidence requires the exact complete state to be persisted;
+matching row counts without the final EOF probe never qualifies full coverage.
+
+After reopening, valid progress can resume only at the same independently pinned
+header and storage cut. Another physical root or a changed header/cut yields no
+resumable prefix. A copied checkpoint signed by another root is rejected; missing
+signing keys are not minted. The native tests close/reopen the DB, resume binary
+cursor bytes, require EOF after a record-boundary checkpoint, reject corrupted
+and truncated frames, reject unchanged-cut/header drift, and discard stale
+temporary files without replacing the prior checkpoint. Signature-invalid cache
+errors remain distinct from a successful audit; any future self-healing policy
+must discard/recompute coverage, never treat corrupted progress as complete.
+
+The combined schema/index checkpoint gates pass 69/69 Debug build steps (27
+schema-job, 14 physical index-page and 12 local index-page tests). Source ownership
+and the unchanged SQL inventory pass. The final canonical-frame gate passes
+58/58 Debug steps and all 27 schema-job tests, including a correctly signed
+whitespace-altered frame rejected as noncanonical. Missing-key and unchanged-cut
+header-drift assertions pass as well. This is still not full producer activation: the retained audit cache
+must preserve immutable read/allocator lifetimes across turns, including busy
+released tables; after process restart a changed cut safely requires recomputation.
+Combined transaction/provenance qualification, metadata adoption CAS, standby
+integration and capability activation remain open. Neither reserved decoder
+floor is advertised by this checkpoint work, and no SQL case is reclassified.
+
+### DB-owned schema audit snapshot lifecycle
+
+`DB.stepSchemaOwnerRowAudit` now owns the bounded-turn row scanner through a
+resident cache. Its key is the actual physical root and immutable header digest,
+not the continually advancing data clock. The released-table regression writes
+between every one-record turn and proves that all turns retain the original
+snapshot with one preparation; after eviction the new audit observes the newer
+clock and rows. Restart resumption still requires an exact authenticated cut.
+
+Each entry owns its heap-stable budget allocator, schema view and read transaction.
+Sixteen resident snapshots is the process-wide ceiling, including evicted entries
+still held by callers. Working-set admission additionally charges the owning
+resource manager. A stable DB registers one idle-maintenance callback and one
+reclaimer, joins both before destruction, and keeps callback state outside
+request lifetimes. Movable stack DBs do not register callbacks that borrow their
+address. Normal writes do not evict an audit; namespace reassignment and restore
+metadata reload do.
+
+An entry's execution mutex serializes its cursor. Eviction retires an active
+lease without destroying its snapshot, and terminal evidence rechecks both live
+metadata and lease retirement. Failed older leases discard only their own entry,
+never a replacement. Cancellation after a cache hit must not unlock the cache
+mutex twice; canceled work waiters release only their borrowed reference and
+cannot unlock another turn's execution mutex. Invalidation during preparation
+prevents the resulting snapshot from being published or returned as usable.
+
+The first lifecycle gate passes 58/58 Debug steps and all 32 tests, covering
+reclamation while leased, idle retirement, backing-allocation failure, resource
+admission failure, process-wide slot exhaustion, cancellation, and replacement
+identity. These are lifecycle and work-count proofs, not latency benchmarks.
+The owned-DB follow-up passes 58/58 Debug steps and all 33 tests, including
+two real scheduler/reclaimer registration-and-close cycles, same-metadata restore
+reload invalidation, and eviction injected during preparation with a clean retry.
+The final combined Debug gate passes 103/103 build steps: all 33 schema/audit
+tests, 50 compiled owner-source regressions, and 47 runtime error-identity tests
+pass with no skips, failures or leaks. The compiled owner gate also verifies
+the private engine descriptor after adding DB-owned audit state; the public
+owner request ABI and advertised capability floors remain unchanged.
+Combined transaction/cohort/provenance coverage, metadata predecessor CAS,
+producer/standby integration and capability-floor activation remain required;
+row-only evidence cannot authorize adoption. No inventory disposition changes.
+
+### Time-sliced structural transaction-directory coverage
+
+`transaction_debt.SnapshotAudit` now retains one read cursor and fixed counters
+across bounded turns. Each turn validates at most 64 physical directory keys,
+with an optional cooperative `std.Io` clock budget. Independent point scopes
+must come from that same retained read; a changed directory header is rejected.
+The existing synchronous restore validator drives this exact state machine,
+rather than maintaining another implementation or reopening a cursor per page.
+
+Counter validation requires a separate EOF probe after an exact record boundary.
+A failure after a turn starts permanently invalidates that audit; advancing the
+cursor and then retrying at EOF cannot qualify stale counters. Cancellation
+before the turn starts leaves it resumable. Neither callbacks nor request
+allocators are retained across turns.
+
+The schema owner's resident entry retains structural directory coverage on the
+row scanner's immutable read, closes its cursor before releasing that read, and
+charges its state and allocations to the existing resource budget. A restored
+authenticated row checkpoint never substitutes for independent directory
+coverage. The LSM owner fault test keeps the valid row checkpoint/header/clock
+unchanged, adds unknown physical directory state, and verifies rejection instead
+of a complete result. Repairing that fault permits a clean bounded retry.
+
+The combined directory/schema gate passes 68/68 Debug build steps, all 11
+transaction-debt tests and all 33 schema/audit tests, with no skips, failures or
+leaks. A 257-member test proves one cursor over 259 one-key turns, including the
+header and final EOF, while a concurrent live write changes the current image.
+The retained image still validates its original 257 members; a fresh image sees
+256. Changed-header point scopes, invalid EOF counts, and mid-turn cancellation
+are explicitly rejected.
+The final compiled-owner/managed-restore/error-identity gate passes 103/103
+Debug steps: all 50 owner-source, 8 managed native-restore and 47 runtime error
+identity tests pass without skips, failures or leaks. Storage ownership,
+generated errors, public C ABI headers and inventory integrity also pass.
+
+This is structural directory coverage, not full transaction qualification.
+Coordinator-record/cohort/ACK scans and their spill-sort merging still need
+retained bounded jobs on the same image. The returned row evidence does not
+claim those unimplemented proofs, and it cannot grant root adoption or metadata
+publication. Composite authenticated provenance, exact metadata predecessor CAS,
+producer/standby activation and capability floors remain unfinished. SQL parity
+dispositions remain unchanged.
+
+### Retained exact cohort proof and bounded private-run work
+
+Cohort ingestion now has explicit backpressure: `tryAddDigest` accepts an owned
+full SHA-256 identity and flags only when it returns true. Initial fixed-cache
+spill is copied in bounded batches. Cached deduplication flags change only after
+the spill sink accepts the extra flags; a full chunk cannot silently consume a
+new ACK on retry. `finishStep` retains grouping state and requires the final
+digest group plus EOF before returning counts. A failed visitor, IO operation,
+or accepted-turn cancellation invalidates the proof permanently. Synchronous
+callers drive these same APIs rather than maintaining a second proof algorithm.
+
+`initRetained` drops request cancellation from stored options. Each turn borrows
+fresh control, and no visitor pointer is retained. Small cohorts keep fixed
+scratch below 16 KiB and allocate no spill state. Large cohorts allocate a
+heap-stable, allocator-charged `FixedSorter(33)` only when the fixed cache fills.
+This avoids embedding the large spill buffer in every small-cohort stack frame.
+
+The shared sorter now uses `MergeJob`: complete payload ties are compared in
+4 KiB windows, output copying uses bounded windows, and input ranges remain live
+until the complete output is sealed. Retained fixed-width jobs yield through
+carry propagation, final merging and file compaction. Chunk sorting has an
+explicit shape bound of 1024 records, each at most 64 bytes; the cohort instance
+is 33 bytes. It is not a claim that arbitrary-length chunk comparisons fit one
+work unit. Existing variable-record synchronous sorts use the same merge kernel.
+
+Private postings-run compaction is also resumable: one descriptor or a bounded
+copy window per turn. It preserves logical coordinates, incrementally retires
+dead descriptors, and rejects reads (including old views) and appends while
+physical bytes move. An interrupted overlapping copy poisons the run instead of
+replaying a possibly overwritten source window. Scratch runs remain unlinked
+and outside catalog/WAL publication.
+
+The retained proof/schema gate passes 68/68 Debug steps with 21 cohort/transaction
+and 33 schema/audit tests. Tests force long full-payload ties, 5000 reverse-ordered
+records with identical navigation prefixes, carry/repack churn, overlapping
+copies, truncation, cancellation and every fixed-sort allocation failure. A
+600-member one-work-unit trace revisits cached participants with ACKs, forces
+backpressure before acceptance, and checks all 600 exact groups and ACKs. Its
+isolated pre-ownership-change Debug run takes 0.19 s; five final runs take 0.04 s
+each. These fixture timings and work bounds are not a production latency or
+throughput claim. Allocation-fault enumeration forces the no-remap growth path
+so OS-dependent in-place heap growth cannot change the fail-index coverage.
+The final combined gate passes 123/123 Debug steps: all 23 cohort/sort, 33
+schema/audit, 8 managed native-restore, 50 compiled-owner and 47 runtime error
+identity tests pass without skips, failures or leaks. Small-cohort heap freedom
+and every large-cohort spill-ownership allocation failure are covered.
+
+One combined compiled-owner run returned `OnlineSourceScopeChanged` instead of
+the expected recovery-required error in a negative provenance fixture. The
+isolated fixture, 100 repeated preceding-test/fixture pairs and a full 50-test
+retry pass without changing the guard. The intermittent diagnostic is not
+declared fixed or normalized away.
+
+The next section wires coordinator-record and participant/list enumeration into
+retained work on the same pinned image. Composite authenticated provenance,
+exact metadata adoption CAS, producer/standby activation and advertised
+capability floors remain unfinished. No SQL parity disposition is changed by
+exposing proof primitives.
+
+### Retained transaction-image traversal
+
+`transaction_snapshot.Audit` now retains coordinator-record, indexed-member,
+ACK, legacy-list, seen-work and orphan-directory traversal. A nested
+`RecordAudit` owns one auxiliary cursor and exact cohort proof. Its parent owns
+the independent point scope on that same immutable read. Cursor-backed names
+and list bodies remain valid until the digest is accepted; backpressure cannot
+skip a list member, ACK counter or progress boundary. All former classifier
+checks remain, including exact legacy offsets/counts, indexed ACK counters,
+cleanup cursor membership and unknown/orphan family rejection.
+
+Source names are hashed in at most 4 KiB CPU windows; ACK/member byte comparison
+uses the same bounded windows. Lookup keys reuse the independently verified
+full digest rather than hashing a long ACK name again to construct its member
+key. Every indexed sidecar still independently verifies its key against its
+value. Existing synchronous transaction validation drives this exact retained
+implementation; the old monolithic classifier/list walker has been removed.
+Backend cursor and point reads retain their existing admitted KV materialization
+contract: CPU windows are not a promise of 4 KiB physical IO or a hard deadline
+on an individual backend read.
+
+The audit owns its scratch-directory bytes and drops request cancellation from
+stored options. Parent/child cursors and point scopes close before releasing the
+read. Schema-owner cache entries now retain this semantic audit after structural
+directory coverage, so neither signed row EOF nor directory counts alone can
+produce local completion. Final live-definition/lease guards remain. The
+returned row artifact is still not composite authenticated provenance or a root
+adoption grant.
+
+The first traversal gate passes 68/68 Debug steps with all 25 cohort/sort and
+33 schema/audit tests. A one-work-unit trace validates three 16 KiB+ binary names,
+including NUL/non-UTF-8 bytes, with exactly three independently required hash
+passes and one member comparison per name. It retains valid old bytes across a
+live corruption, while a fresh read rejects the changed member. A 600-member
+legacy list yields through real spill/merge work and preserves exact counters.
+LSM owner fault tests keep valid signed row/header/cut bytes but inject either
+unknown directory state or an orphan ACK outside that family; both must reject,
+and a clean retry after repair succeeds.
+
+The follow-up local gate passes all 26 cohort/sort and 33 schema/audit tests.
+It sweeps every retained-scope initialization allocation failure, verifies that
+scratch-path/request-control storage is owned, preserves pre-turn cancellation,
+and rejects partial counters after accepted hash work is canceled. Inventory
+accounting remains 733 implemented, 137 rejected, 423 superseded, 293 unresolved.
+The final combined gate passes 123/123 Debug build steps, including all 26
+cohort/sort, 33 schema/audit, 8 managed native-restore, 50 compiled-owner and 47
+runtime error-identity tests, with no skips, failures or leaks. The earlier
+intermittent provenance diagnostic did not recur in this run; it is still not
+declared fixed. Composite authentication/adoption, producer/standby activation
+and capability barriers remain required before case-level completion claims.
+
+### Retained schema-command history qualification
+
+`relational_schema_apply_outcome.SnapshotAudit` now owns one cursor and fixed
+history state on the row audit's retained immutable image. Each turn admits at
+most 64 cursor operations, including family transitions and the final EOF, with
+an optional cooperative `std.Io` clock limit. No request allocator, borrowed
+row bytes or cancellation callback survives a turn. The local applied marker
+and history head are captured from that same image before opening the cursor.
+Full receipt key/value validation, monotonic term/index ordering, count, last
+entry and chained digest checks remain mandatory. Foreign namespace bytes are
+validated without using their independent clocks as local coverage.
+
+Restore's synchronous validation drives this same retained verifier; it no
+longer has a separate whole-history implementation. Schema-owner local
+completion requires history EOF after row, directory and transaction coverage,
+and an invalid history turn retires its exact cache lease. A signed row
+checkpoint cannot bypass this qualification. Cancellation before an accepted
+turn preserves progress; cancellation or corruption after cursor advancement
+permanently poisons that audit, preventing a retry from converting a prefix
+into completion. This adds prerequisite facts, not composite authenticated
+provenance, an adoption grant, or a SQL-case disposition change.
+
+The combined Debug gate passes 102/102 steps: all 34 schema/audit, 50
+compiled-owner and 8 managed native-restore tests, with no skips, failures or
+leaks. A 257-receipt local history plus an inert foreign-clock record takes
+exactly 261 single-operation turns, including head/family/EOF probes. A pinned
+image qualifies after live history deletion while a fresh read rejects the
+missing receipt; canonical altered receipt bytes fail the head digest. The
+same real-LSM fixture passes ten repeated runs, including pre-turn cancellation,
+accepted-turn cancellation poisoning and invalid-budget rejection. The owner
+fixture preserves a valid signed row checkpoint while injecting malformed
+history, requires rejection and exact lease retirement, then completes after
+repair. Busy released tables retain one preparation across normal writes; the
+test pump now includes independent history turns, without weakening cut, row,
+lease or integrity assertions. Storage compilation ownership, generated error
+identities, C ABI synchronization, inventory integrity and whitespace checks
+pass. All 293 original unresolved dispositions remain unresolved.
+
+### Composite authenticated owner-image facts
+
+`relational_schema_root_evidence` adds a domain-separated Ed25519 envelope for
+completed local audit facts. Its payload binds the provisioned signing root,
+actual physical DB root, actual native/Raft storage cut, row coverage and exact
+persisted ASRA1 row-checkpoint digest. It also includes independently qualified
+transaction directory/cohort counters and heads, complete local schema-command
+history coverage, and `Origin` commitments captured on that same immutable read.
+Raw canonical job, directory and history-head records are hashed in full; their
+logical digests or embedded physical checksums cannot substitute for those
+commitments. Native sequences and actual Raft data-entry markers remain distinct
+from independently completed consensus prefixes.
+
+The constructor accepts the owned completed auditors, not remote counters. It
+checks their retained-read pointer identity, directory-head equality and history
+namespace/marker before opening its independent point scope. The directory audit
+now retains its source-read identity for that comparison. A different read with
+identical clocks, headers and completed counters is not interchangeable.
+
+One fixed ASRP1 proof slot per namespace reuses root checkpoint locking, private
+permissions, bounded reads, existing-key-only loading, root/key rechecks,
+temporary-file sync, atomic rename and directory sync. The row lock always
+precedes the proof lock. Signatures are checked before JSON parsing or heap
+allocation; canonical encoding and scalar/clock/head relationships are checked
+after authentication. Corrupt retained proofs are rejected without replacement.
+Authentic older facts may be superseded only after current independent audits
+complete. Identical completion polls reuse the verified proof without another
+signature, temporary file, rename or fsync. ASRA1 remains the separate binary
+cursor continuation and cannot alone produce composite completion.
+
+The private engine interface is version 31 because its completed-result shape
+changed; descriptor, method accessors and aggregation accessor advance together.
+Public storage-owner ABI 102 and released numeric error identities are unchanged.
+No new protocol or schema capability is advertised.
+
+These are authenticated local-image facts, not authenticated source-transfer
+lineage or a metadata adoption grant. Existing NRSP2 installation provenance,
+root enrollment, runtime/quorum liveness, accepted logical phase and exact
+metadata owner/head predecessor CAS must be joined by the receiving protocol.
+Transaction cohort coverage does not imply that all intent/read-guard/outbox
+families are drained or that a coordinator decision is authorized. Producer,
+standby and capability-barrier activation remain unfinished; no SQL disposition
+is credited merely for adding this envelope.
+
+The combined gate passes 123/123 Debug steps, including all 34 schema/audit,
+26 cohort/sort, 50 compiled-owner, 8 managed native-restore and 47 runtime
+error-identity tests, with no skips, failures or leaks. The real-LSM proof
+fixture also passes ten repeated runs. Coverage includes persisted proof reload,
+canonical roundtrip, wrong-key/signature/field/framing rejection before allocator
+use, a trusted signature over noncanonical JSON, and every decode/encode
+allocation failure. Equal completed directory counters from a different read
+image are rejected. A corrupt on-disk proof remains byte-for-byte unchanged
+after independent row/cohort/history requalification fails to seal; explicit
+test repair then permits completion. Released-table tests retain their captured
+cut and one preparation while normal writes advance. Storage compilation,
+generated errors, public C ABI synchronization, inventory and whitespace checks
+pass. Advertised capability floors and all 293 unresolved dispositions remain
+unchanged. The next activation boundary is source-lineage qualification plus
+durable metadata root-adoption CAS, without relabeling accepted logical phases
+or historical ACK evidence.
+
+### Receiver installation lineage and retained source-prefix qualification
+
+The root evidence now includes the receiver-owned native snapshot installation
+record and the independently reconstructed schema-history head at its actual
+source data-entry cut. The shared `native_backup_origin.loadInstallation`
+loader is used by native snapshot transport and schema-owner qualification:
+present records must be fixed-size canonical regular files, without symlink
+following, and must match the actual existing destination root identity, group
+and namespace. Root identity is rechecked after reading. Missing records remain
+explicit absence of lineage; no root identity, signing key, source authority row
+or synthetic applied marker is invented.
+
+`SnapshotAudit.initAnchored` retains an optional source-cut/head commitment and
+full installation-record digest. Its existing bounded pass reconstructs the
+local history prefix at that cut while still validating the whole current
+history. It hashes each receipt only once and opens no extra cursor or second
+history scan. Later commands may advance the destination beyond the source cut;
+the snapshot's completed consensus prefix is never substituted for its actual
+data marker. A source image preceding the first schema command has an explicit
+empty prefix. Foreign namespace clocks never contribute local source coverage.
+
+The receiver record is loaded before history preparation and independently
+reloaded from the actual DB path before sealing. Its whole-record digest must
+match the prepared anchor: changing a stream digest or source-root identity
+cannot relabel a completed traversal even if the cut and head remain identical.
+Both the installation and reconstructed prefix are signed in the composite
+artifact. Once a physical root has signed installation lineage, it cannot
+replace it with a different record or downgrade to absence after restart.
+The old signed proof is retained on failure. A different physical root still
+requires separate metadata adoption; this rule is not an adoption grant.
+
+The private engine descriptor and method/aggregation accessors advance together
+to version 32 for the expanded result shape. Public storage-owner ABI 102,
+released error numbers and advertised capability floors remain unchanged.
+Root enrollment, source-parent authorization, exact metadata owner/head CAS,
+producer/standby activation and distributed decision-fault coverage remain
+unfinished. This section does not claim end-to-end root adoption or close any
+SQL parity disposition.
+
+The combined gate passes 133/133 Debug steps, including all 35 schema/audit,
+26 cohort/sort, 50 compiled-owner, 8 managed native-restore, 47 runtime
+error-identity and 18 native snapshot-storage tests, with no skips, failures or
+leaks. Two real-LSM lineage/prefix fixtures pass ten paired repeated runs.
+The prefix fixture reconstructs a 100-receipt source head inside a 257-receipt
+current history in the same 261 single-operation turns as unanchored validation.
+A deliberately rewritten self-consistent current head passes ordinary snapshot
+validation but fails the source-prefix commitment; a source preceding the first
+command retains explicit empty coverage.
+
+The owner fixture signs a source head at entry 2 and a later destination head
+at entry 3 without relabeling either cut. It rejects a changed stream digest
+with unchanged cut/head, then rejects the changed or missing receiver record
+after cold restart while retaining the original signed artifact. Explicit
+test restoration permits the exact same proof again. Shared loader faults
+cover wrong group/root identity, checksum corruption, truncation, overlength,
+directory substitution and symlinks. Malformed lengths reject before allocator
+use. Actual NRSP1/NRSP2 extraction and receiver-record persistence remain covered
+by the native snapshot-storage gate, independently of the host-only seeded
+record fixture. Static ownership, generated errors, public C ABI synchronization,
+inventory integrity and whitespace checks pass. All 293 unresolved dispositions
+remain unresolved; metadata adoption/activation is not inferred from these tests.
+
+### Snapshot-parent signature and metadata authority boundary
+
+`SignedSnapshotParent` introduces a signature domain separate from schema
+progress, preparation, index receipts and local row checkpoints. The Raft
+source-image witness commits the exact immutable binding, source `Origin`,
+completed snapshot prefix and full NRSP2 stream footer digest. A matching
+control origin alone is not enough to authorize different row/file bytes.
+`requireInstallation` joins that source witness to the receiver's exact source
+origin, group, stable namespace, completed prefix and stream digest. Source
+data-entry markers remain independent of completed prefixes, including an
+explicitly absent marker before the first data mutation.
+
+`verifySchemaValidationSnapshotParentTxn` rejoins the domain-specific signature
+with existing metadata enrollment, live store/reporter, serving replica
+placement, stable namespace, source-authority, reader capability and indexed
+report checks in the same transaction. Completed-index/term evidence must be
+covered by that report. A private snapshot-only option permits a genuinely
+empty data cut under a signed nonzero completed prefix; preparation and progress
+ACK checks retain their previous stricter behavior. The helper is read-only:
+signature validity is not a stored grant, ACK, or root-adoption decision.
+
+This integration exposed and fixes a lineage lookup assumption: the serving
+group ID need not equal the stable document-identity shard ID. Installation
+loading, signing and validation now use `binding.fence.owner_group_id`, while
+retaining the original namespace bytes independently. The real-LSM lineage and
+restart fixture now uses different values and rejects the namespace shard ID
+when it is substituted as the serving group.
+
+Remaining activation order is explicit: finish the source artifact and owned
+capture verification, persist metadata's parent authorization while its source
+can still be authenticated, transfer/qualify the destination, and consume that
+durable authorization in an exact owner/head adoption CAS. The old source must
+not have to remain live for the final adoption. Immutable preparation roots,
+already accepted phase digests/revisions and historical ACK root evidence must
+survive adoption; changing an owner's UUID in place would invalidate recovery.
+Pre-begin and standalone-native recovery need their faithful evidence paths,
+not fabricated Raft clocks. Parent-grant persistence, producer/recovery hooks,
+adoption CAS, standby/capability activation and distributed decision-fault
+qualification remain unfinished. No parity disposition or advertised floor is
+changed by this source-authentication boundary.
+
+### Restore repair shares the dense writer lane
+
+Managed restore exposed an intermittent race between startup target-coverage
+repair and background posting/checkpoint maintenance. Both could open the same
+absent writer, overwrite an owned handle and reject a capture as already active.
+Snapshot and external-bulk admission do not exclude those maintenance writers.
+
+Primary-vector and artifact-backed repair slices now retain the existing
+per-index apply fence through capture setup, session retirement, WAL commit,
+optional vector publication and failure cleanup. Explicit artifact rebuild
+acquires it per chunk and final coverage capture, not around its outer scan.
+Cooperative shadow-repair boundaries remain unchanged. This does not make
+one-shot repair scans time-sliced or introduce a new global lock.
+
+The real-worker fixture checks writer exclusion during startup restore and
+explicit rebuild. All eight focused Debug tests pass, and the formerly leaking
+fixture passes 50 consecutive runs with leak and unexpected-error-log checks.
+The combined authority/publication/schema/owner/restore/snapshot/transaction/
+error-identity Debug gate passes 169/169 steps without skips, failures or leaks.
+Temporary tracing is removed. No SQL disposition is credited: all 293 unresolved
+cases, including durable parent grants, root adoption and activation/fault
+qualification, remain open.
+
+The broader dense lifecycle campaign separately exposed a deterministic fixture
+abort: its manually seeded pending watermark name used the test allocator,
+while the compiled physical owner drained it using `AsyncContext.alloc`. A raw
+abort stack identified the invalid free in `Coalescer.clearPending`; this was
+not a coverage rejection or evidence of a writer-lock deadlock. The fixture now
+allocates through the actual coalescer owner, matching every production caller.
+Its incomplete, corrupt, partial-tuple and completed-coverage assertions are
+unchanged. The focused `dense-inline-coverage-test` gate includes that real-owner
+fixture and the coalescer allocation-failure/cadence tests. All temporary signal,
+stack and phase probes are removed; no production crash-handler or ABI change
+was made for diagnosis.
+
+The clean combined dense lifecycle, inline coverage and managed restore gate
+passes 129/129 Debug steps, including all 61 core dense lifecycle cases, five
+inline/coalescer tests and eight restore tests, without skips, failures or leaks.
+The five-test owner-allocator gate passes ten consecutive runs. Fail-fast
+storage compilation ownership, generated engine errors, public C-header sync,
+inventory integrity, formatting and whitespace checks pass. Work remains
+uncommitted and capability floors/dispositions are unchanged.
+
+Before activation, also qualify the artifact-backed repair source-cut boundary
+under concurrent primary writes. Unlike the primary-vector helper, its
+no-caller-snapshot branch still obtains coverage from the live replay tip after
+the scan, and empty-vector writes defer artifact hydration to the loader. The
+required race proof must join enumerated keys, loaded payloads and published
+coverage to one retained source read; later source changes belong to catch-up.
+This is an explicit remaining audit/implementation boundary, not a claim that
+the existing lifecycle tests prove concurrent source-image consistency.
+
+### Retained repair source images and bounded field-vector matrices
+
+The source-image boundary above now retains one primary read for enumeration,
+payload hydration, routing and the published posting watermark. Caller-provided
+snapshots must match their claimed repair sequence; a cut behind already durable
+postings rejects before mutation. Owned one-shot scans derive coverage from the
+actual read, never the later live replay tip. Per-chunk loader forks preserve
+that same cut while releasing scratch. Insert-time borrowed payloads use a
+separate fork so routing scratch recycling cannot invalidate them.
+
+Repair bypasses unversioned resident vectors and permits a native generation
+only at its retained source cut. Ordinary native query fast paths and explicit
+previous-vector replay-base authority remain separate. Raw-read recycling now
+forks the same snapshot before releasing old scratch; residency fallback does
+not silently reopen the live source.
+
+Source-only field-vector reconstruction cannot require derived embedding
+artifacts that are absent from the restored image. Its matrix loader reads
+sorted primary-row waves of at most 64, projects typed vector cells using a
+bounded immutable schema-view set, and immediately transforms each vector into
+the caller matrix. Artifact-only members retain the pinned-artifact fallback.
+Each borrowed row wave is fully consumed before fallback can recycle scratch.
+Missing-at-source artifacts remain missing even if a later live commit adds
+them; explicit replay-base matrices retain their original stricter path.
+
+The focused Debug gate passes 22 tests. A 137-row source-only matrix uses three
+batch reads, zero scalar reads and no decoded-vector cache; live row overwrites,
+mixed artifact fallback, absent-at-source payloads and reordered matrix positions
+are checked. A separate real-owner fixture reconstructs 137 primary-only rows
+in seven-row chunks. Five source/replay regressions pass ten repeated runs.
+This is operation-count evidence, not a wall-clock speedup claim.
+
+The broader Debug gate hit local linker ENOSPC after the focused tests passed;
+its result must not be reported as green until rerun. The source-only seeded
+fixture also exposes deferred native vector publication when canonical implicit
+artifacts are absent: reconstructed topology is not proof of native projection
+readiness.
+
+Native payload/revision certification is also bound to the retained source
+read now. Its explicit repair finisher verifies the claimed replay cut before
+consuming a capture, then forks that source for native artifact revision and
+reference certification without activating routing TLS for publication.
+Ordinary source publication retains its existing path. A real-LSM/native-WAL
+regression overwrites the live artifact and checks that the published vector
+and revision match the old snapshot, while a mismatched cut leaves its capture
+lease valid. The final focused Debug gate passes 23 tests without skips,
+failures or leaks.
+
+The unchanged-source final retry passes 129/129 Debug steps: 23 focused,
+61 core dense lifecycle, 3 native runtime, 4 metadata, 7 repair-runtime,
+7 repair-status and 8 managed-restore tests, without skips, failures or leaks.
+All seven retained-source/replay regressions pass ten complete repeated runs
+(70 test executions). ENOSPC was a local linker resource failure, resolved by
+removing explicitly verified obsolete compiled objects/binaries/archives, not
+source or test data. Static storage ownership, generated engine errors, public
+C-header synchronization, inventory integrity, formatting and whitespace checks
+pass. The new source-bound methods do not change the physical owner ABI.
+
+Durable parent grants, root adoption, producer/standby activation and distributed
+fault qualification remain open. No disposition or advertised capability floor
+is changed; all 293 unresolved SQL cases remain unresolved.
+
+### Durable pre-transfer parent authorizations
+
+Metadata now retains immutable source-image authorizations under the existing
+schema-validation ledger, transport, writer and checkpoint projection. This
+implements parent-grant persistence, not root adoption or public activation.
+Each authorization identifies the exact lookup, owner ordinal, requested head
+revision, current encoded-owner digest and domain-separated signed NRSP2 parent.
+When a schema header exists, its complete canonical ASVJ frame must hash to the
+header commitment in the signed source origin. The source namespace must be
+explicit and match the immutable binding. An unacknowledged pre-begin image may
+omit its header; an owner with accepted progress may not use that absence to
+discard a phase. Source completion must cover the retained preparation and
+header positions without manufacturing a data-entry marker.
+
+New acceptance joins the exact owner/head predecessor, shared lifecycle lock,
+preparation, live enrolled signer/reporter/placement/source authority and reader
+requirements in the SAME metadata writer. Read-only preflight is discarded;
+replicated application repeats the checks. The only staged postimage is the
+immutable authorization, through the normal metadata durability/standby path.
+It does not change owner ACK counters, decisions, initial preparation roots or
+accepted phase signatures. Admission uses bounded point reads and never decodes
+the full immutable plan. Structural decoding is separate from signature and
+live-authority verification; historical reads independently verify retained
+signatures and their canonical image commitments.
+
+Authorization keys append the complete request digest to the existing scoped
+key codec. Existing key representations and identifiers remain unchanged. Exact
+lost-reply retries and receipt reads consult the retained record, even after
+source loss or later owner progress; they are historical acceptance, never
+execution permission. Checkpoint reverse audits reject wrong request digests,
+foreign scopes and orphan authorizations. The existing snapshot group router and
+reserved capability floor cover these keys without a separate restore system.
+
+New acceptance compares both the requested head revision and complete owner
+digest. The later adoption predecessor guard instead checks the retained source
+image against the still-accepted logical phase: unrelated peer progress or a
+re-attestation of the same header must not force retransferring an unchanged
+artifact. A future adoption transaction must independently compare its CURRENT
+owner/head/epoch, qualify the installed destination and consume the durable
+authorization. Neither this guard nor a historical receipt supplies that CAS.
+Canonical embedded ready/install predecessor digests also admit an authorized
+install or release whose ACK is pending; they are checked against the exact
+metadata installation/publication decision. Different decisions and images
+which lose accepted progress reject. Failure/cancellation ancestry still needs
+retained-history inclusion; no permissive phase-order fallback is provided.
+
+The combined publication, native owner authority and schema submission campaign
+passes 137/137 Debug steps. After the final incarnation and phase-lineage
+guards, the publication/authority gate passes 84/84 Debug steps. Neither gate
+has skips, failures or leaks. The final cold-recovery/snapshot-routing and real
+authority cases pass ten paired runs (30 test executions). The real-LSM fixture
+checks failed writes before/after the put, cold reopen, no-plan/no-write
+preflight, source loss, stale predecessors, unscoped artifacts, header-image
+mismatch, validly signed foreign-incarnation preparation, unacknowledged
+install/release ancestry, wrong decisions and malformed grant keys. A separate
+real metadata authority fixture
+rejects an existing index-build lock, then accepts a grant under the schema
+lock in an abort-only writer. Removing live source authority rejects a DIFFERENT
+grant but preserves exact historical retries. Fixture lock replacement is never
+a production admission bypass. Static ownership, generated errors, public C ABI,
+inventory, formatting and whitespace checks pass.
+
+Remaining activation still requires immutable root-epoch/adoption history that
+preserves preparation and historical ACK roots, destination qualification and
+the exact adoption CAS, owned artifact/producer/outbox recovery hooks,
+standalone-native evidence (not fabricated Raft clocks), bounded grant/artifact
+retirement and distributed decision/standby fault qualification. Protocol and
+reader floors remain unadvertised, and no SQL disposition is credited. All 293
+unresolved cases, including 188 DDL cases, remain unresolved.
+
+### PostgreSQL 18 UUID functions and temporal parameter identity (2026-10-22)
+
+The requested [UUIDv7 feature walkthrough](https://aiven.io/blog/exploring-postgresql-18-new-uuidv7-support)
+is covered by this work; the normative contract is PostgreSQL 18's
+[UUID function documentation](https://www.postgresql.org/docs/18/functions-uuid.html)
+and implementation. The independent local PostgreSQL 18 oracle
+`test_postgresql18_uuid_functions_types_shifts_and_null_contracts` checks native
+result types, both UUIDv4 spellings, qualified UUIDv7 generation, NULL strictness,
+unsupported variants, v1/v7 extraction witnesses, positive/negative/calendar
+interval shifts, and invalid-input SQLSTATEs. It checks volatile properties
+rather than comparing generated UUID bytes to golden outputs. This strengthens
+UUID conformance evidence without promoting an unrelated DDL inventory case.
+
+
+The PostgreSQL 18 UUID function contract is part of the SQL parity scope:
+`uuidv4()` aliases `gen_random_uuid()`; `uuidv7([shift interval])` is volatile;
+`uuid_extract_version(uuid)` returns SMALLINT and
+`uuid_extract_timestamp(uuid)` returns TIMESTAMPTZ. Extraction validates the
+RFC variant and returns SQL NULL for unsupported variants or timestamp versions.
+UUIDv7 timestamp extraction retains millisecond precision, while generation
+uses twelve additional sub-millisecond clock bits and secure random suffixes.
+
+The native generator uses the invocation's `std.Io` clock and secure entropy.
+An atomic producer clock preserves ordering through repeated or regressing
+clock samples without allocation or a direct OS thread dependency. This is not
+a cross-node or cross-restart ordering guarantee. UUID identity, OID 2950,
+canonical bytes and existing primary/foreign-key interpretation remain shared
+between UUID versions. Antfly's LSM workload needs its own measurements before
+claiming the B-tree locality improvements reported for PostgreSQL.
+
+An exact temporal subtype now accompanies SQL datetime-family descriptors.
+The existing omitted subtype means TIMESTAMPTZ; interval inputs retain calendar
+months, days and microseconds and use OID 1186, including the 16-byte PostgreSQL
+binary format. Binding, composed scalar expressions, owned parameter frames,
+prepared/public metadata, result descriptions and pgwire carry this identity.
+SQL INTERVAL input and casts do not activate persistent INTERVAL column storage.
+Calendar UUID shifts use the current supported UTC temporal capability, clamp
+month ends and reject infinite or out-of-range results with SQLSTATE 22008.
+The interval overload checks its microsecond result against the last unsigned
+48-bit millisecond before restoring sub-microsecond clock bits, matching the
+[PostgreSQL 18 implementation](https://github.com/postgres/postgres/blob/REL_18_STABLE/src/backend/utils/adt/uuid.c).
+Boundary regressions distinguish this overload from unshifted UUIDv7 encoding,
+which can represent the remaining fraction of that final millisecond.
+NULL shifts short-circuit without requiring entropy or a clock. The supported
+interval input grammar is not a claim of exhaustive PostgreSQL temporal syntax.
+
+The focused Debug SQL gate passes 18 tests, including real execution, native
+UUID defaults and fourteen independent PostgreSQL interval binary witnesses.
+The interval pgwire contract gate passes, and public OpenAPI/SDK generation
+completes. Native UUID defaults require semantic/encoding reader profile 33,
+derived from the stored expression rather than a caller's capability claim.
+Immutable schema epochs never own invocation I/O. A borrowed preparation view
+supplies the real `std.Io` clock and secure entropy to the native default VM;
+CHECK, generated-column and index plans still reject these volatile operations.
+Strict NULL and lazy branches do not consume entropy. Ordinary inserts,
+typed-row normalization and transaction preparation share this implementation.
+
+Coordinated writes borrow preparation I/O into a request-owned receiver and
+normalize every explicit afterimage before traversing FK dependencies. The
+cached integrity expansion, explicit FK relationship and final participant
+writes retain the same generated UUID. Historical beforeimages and relationship
+probes never reevaluate volatile defaults. A focused Debug regression counts
+secure entropy calls across a multi-row coordinated write; extension data-shape
+validation remains independent of the owner's atomic row preparation capability.
+CHECK failures retain their semantic identity across participant admission and
+owner execution instead of being collapsed into a generic argument error.
+
+A real standalone Debug SQL campaign creates a UUID-primary-key table with
+`DEFAULT uuidv7()`, inserts rows with and without RETURNING, preserves explicit
+IDs, rejects explicit NULL and duplicate primary keys, retains CHECK and stored
+generated-column enforcement, and preserves complete rows through validation-only
+SET NOT NULL publication and two cold restarts. New writes retain UUID generation
+after restart. The native LSM regression additionally
+qualifies both live and unpublished-staging portable restores: historical IDs
+are verified, never regenerated, while subsequent writes receive new IDs.
+
+Online backfill uses the same native transformer and durable staging machinery.
+The first committed snapshot/tail page materializes each newly added UUID
+default together with the receiver cursor; later source afterimages retain the
+committed target value. A bounded page-local encoded-row overlay covers repeated
+keys without parsing or encoding the logical document a second time. Ordinary
+immutable rewrites do not acquire this extra target read snapshot. Physical
+overlay bytes have a separate 16 MiB ceiling. The shared Debug fault campaign
+covers post-cut updates/inserts/deletes, lost-ACK replay, stale progress,
+cancellation, corrupt frame data, partial transfer and cold target reopen.
+
+The production standalone schema-validation lifecycle is now qualified as
+recorded in the current original-case section above. The UUID storage-only
+backfill campaign does not certify every online ALTER publication, retained-parent
+artifact transfer or the entire SQL DDL lifecycle. The current ledger remains
+the count authority; the UUID function/default work does not independently
+promote additional original cases.

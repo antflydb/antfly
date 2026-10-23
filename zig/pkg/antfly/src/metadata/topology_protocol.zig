@@ -120,11 +120,27 @@ const std = @import("std");
 /// including empty default-deny epochs and implicit USING write checks.
 /// Version 60 carries purpose-bound SQL RLS read/normalization capabilities
 /// and per-mutation command provenance through private prepare/journal bytes.
+/// Version 61 admits a nullable column and its FK in one owner-fenced schema
+/// publication. Older validators permit only FK edits to an existing layout.
+/// Version 62 adds immutable column-transform IR to restore/rewrite intents.
 /// Version 63 includes main's curation provenance, cascade dispositions,
 /// proposal queues and proposal-owned source-correction fences. Main's v37
 /// resolver floor cannot be reused: this branch already assigned that profile
 /// to earlier SQL catalog support that does not decode these resolver fields.
-pub const current_version: u16 = 63;
+pub const current_version: u16 = 64;
+/// Role-default patches share this branch's unreleased v63 reader cohort.
+/// Earlier main readers reject empty/global role scopes; never admit one
+/// using only the original v12 setting-catalog floor.
+pub const sql_role_defaults_version: u16 = 63;
+/// Sequence records retain their original SQL reader cohort.
+pub const sql_sequence_catalog_version: u16 = 63;
+/// Version 64 binds validation-only publication to signed physical owner cuts,
+/// durable all-owner installation/publication/release barriers and recovery.
+pub const schema_validation_publication_version: u16 = 64;
+/// The same unreleased cohort decodes bounded native reporter retirement jobs.
+pub const native_reporter_restart_version: u16 = 64;
+pub const sql_column_transform_version: u16 = 62;
+pub const fk_generation_column_addition_version: u16 = 61;
 pub const sql_row_policy_intent_version: u16 = 60;
 pub const sql_deferred_check_validation_version: u16 = 59;
 pub const initial_fk_checks_catalog_version: u16 = 59;

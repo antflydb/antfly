@@ -20080,6 +20080,7 @@ pub const ProvisionedTableWriteSource = struct {
     pub fn source(self: *ProvisionedTableWriteSource) TableWriteSource {
         return .{
             .ptr = self,
+            .prepares_rows_atomically = if (self.groupLocalWriteSource()) |local| local.prepares_rows_atomically else !control_only_storage_sources and self.write_cache != null,
             .supports_sql_range_guards = if (self.raft_batcher) |batcher|
                 batcher.vtable.batch_group_routed_with_cancellation != null
             else
@@ -22209,7 +22210,7 @@ pub const ProvisionedTableWriteSource = struct {
         const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
         try enforceReplicationWriteGateOptional(self.replication_write_gate);
         var worker_impl = distributed_txn.LocalTableWriteParticipantWorker.init(self.source());
-        const commit_version = begin_timestamp + 1;
+        const commit_version = try distributed_txn.commitVersion(begin_timestamp);
         return try distributed_txn.executeMultiTableCommitWithOptions(
             alloc,
             self.catalog,
@@ -26253,7 +26254,7 @@ pub const HostedProvisionedTableWriteSource = struct {
         const self: *HostedProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
         var worker_impl = distributed_txn.HostedParticipantWorker.init(self.catalog, self.router, self.source(), self.executor);
         _ = worker_impl.withInternalServiceAuth(self.internal_service_secret, self.internal_service_issuer);
-        const commit_version = begin_timestamp + 1;
+        const commit_version = try distributed_txn.commitVersion(begin_timestamp);
         return try distributed_txn.executeMultiTableCommitWithOptions(
             alloc,
             self.catalog,

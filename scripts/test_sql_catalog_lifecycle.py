@@ -28,6 +28,61 @@ from psycopg import sql as pgsql
 
 
 class IndexLifecycleTest(unittest.TestCase):
+    def test_postgresql18_uuid_functions_types_shifts_and_null_contracts(self):
+        # Independent oracle for the native UUID codec/evaluator/default tests.
+        # Assertions describe properties; volatile bytes are never golden data.
+        with postgres() as db:
+            db.execute("SET TIME ZONE 'UTC'")
+            self.assertEqual(
+                ("uuid", "smallint", "timestamp with time zone", 4, 4, 7),
+                db.execute(
+                    "SELECT pg_typeof(uuidv7())::text,"
+                    "pg_typeof(uuid_extract_version(uuidv7()))::text,"
+                    "pg_typeof(uuid_extract_timestamp(uuidv7()))::text,"
+                    "uuid_extract_version(uuidv4()),"
+                    "uuid_extract_version(gen_random_uuid()),"
+                    "uuid_extract_version(pg_catalog.uuidv7())"
+                ).fetchone(),
+            )
+            self.assertEqual(
+                (True, True, True, True, True),
+                db.execute(
+                    "SELECT uuidv7(NULL::interval) IS NULL,"
+                    "uuid_extract_version(NULL::uuid) IS NULL,"
+                    "uuid_extract_timestamp(uuidv4()) IS NULL,"
+                    "uuid_extract_version('00000000-0000-7000-0000-000000000000') IS NULL,"
+                    "uuid_extract_timestamp('00000000-0000-7000-0000-000000000000') IS NULL"
+                ).fetchone(),
+            )
+            self.assertEqual(
+                ("2025-02-24 02:46:24.503+00", "2022-02-22 19:22:22+00"),
+                db.execute(
+                    "SELECT uuid_extract_timestamp('019535d9-3df7-79fb-b466-fa907fa17f9e')::text,"
+                    "uuid_extract_timestamp('c232ab00-9414-11ec-b3c8-9f6bdeced846')::text"
+                ).fetchone(),
+            )
+            for shift in ("1 day", "-1 day", "1 month 2 days 3 hours"):
+                # Bracket generation with real clock samples; no fixed timeout
+                # or wall-clock precision is assumed by the oracle assertion.
+                self.assertTrue(
+                    db.execute(
+                        "WITH before AS MATERIALIZED (SELECT clock_timestamp() AS t),"
+                        "generated AS MATERIALIZED (SELECT t,uuidv7(%s::interval) AS id FROM before) "
+                        "SELECT uuid_extract_timestamp(id) >= date_trunc('milliseconds',t + %s::interval) "
+                        "AND uuid_extract_timestamp(id) <= clock_timestamp() + %s::interval FROM generated",
+                        (shift, shift, shift),
+                    ).fetchone()[0]
+                )
+            for expression, state in (
+                ("uuidv7(INTERVAL 'infinity')", "22008"),
+                ("uuidv7(INTERVAL '-100000 years')", "22008"),
+                ("uuidv7(NULL::text)", "42883"),
+                ("uuid_extract_version(NULL::text)", "42883"),
+            ):
+                with self.assertRaises(psycopg.Error) as invalid:
+                    db.execute("SELECT " + expression)
+                self.assertEqual(state, invalid.exception.sqlstate)
+
     def test_original_secondary_index_drop_retires_enforcement_and_reuses_name(self):
         originals = {
             entry["id"]: entry
@@ -92,6 +147,157 @@ class IndexLifecycleTest(unittest.TestCase):
                     "DELETE FROM usage_records "
                     "WHERE id='00000000-0000-0000-0000-000000000003'"
                 )
+
+    def test_original_drop_not_null_preserves_uuid_rows_and_unrelated_enforcement(self):
+        original = next(
+            entry
+            for entry in json.loads(
+                (FIXTURES / "sql_parity_inventory.json").read_text()
+            )["entries"]
+            if entry["id"] == "sql-0745"
+        )
+        self.assertEqual([], original["params"])
+        first, second, third, fourth, probe = [
+            f"00000000-0000-0000-0000-{n:012}" for n in range(1, 6)
+        ]
+        with postgres() as db:
+            db.execute(
+                "CREATE TABLE usage_records(id UUID PRIMARY KEY,"
+                "status TEXT NOT NULL DEFAULT 'open',"
+                "status_upper TEXT GENERATED ALWAYS AS (upper(status)) STORED,"
+                "amount NUMERIC CHECK(amount >= 0))"
+            )
+            db.execute(
+                "INSERT INTO usage_records(id,status,amount) VALUES "
+                f"('{first}','ready',1),('{second}','open',2)"
+            )
+            physical_read = (
+                "SELECT xmin::text,ctid::text,* FROM usage_records ORDER BY id"
+            )
+            before = db.execute(physical_read).fetchall()
+            identity = db.execute("SELECT 'usage_records'::regclass::oid").fetchone()[0]
+            db.execute("CREATE ROLE relaxation_reader")
+            db.execute("GRANT SELECT ON usage_records TO relaxation_reader")
+            with self.assertRaises(psycopg.Error) as denied, db.transaction():
+                db.execute("SET LOCAL ROLE relaxation_reader")
+                db.execute(original["sql"])
+            self.assertEqual("42501", denied.exception.sqlstate)
+            with self.assertRaises(psycopg.Error) as required:
+                db.execute(
+                    f"INSERT INTO usage_records(id,status,amount) VALUES ('{third}',NULL,3)"
+                )
+            self.assertEqual("23502", required.exception.sqlstate)
+            self.assertEqual(before, db.execute(physical_read).fetchall())
+            for _ in range(2):
+                self.assertEqual(
+                    "ALTER TABLE", db.execute(original["sql"]).statusmessage
+                )
+                self.assertEqual(before, db.execute(physical_read).fetchall())
+                self.assertEqual(
+                    identity,
+                    db.execute("SELECT 'usage_records'::regclass::oid").fetchone()[0],
+                )
+            for statement, sqlstate in [
+                ("ALTER TABLE usage_records ALTER COLUMN id DROP NOT NULL", "42P16"),
+                (
+                    f"INSERT INTO usage_records(id,status,amount) VALUES ('{first}',NULL,3)",
+                    "23505",
+                ),
+                (
+                    f"INSERT INTO usage_records(id,status,amount) VALUES ('{third}',NULL,-1)",
+                    "23514",
+                ),
+            ]:
+                with self.assertRaises(psycopg.Error) as rejected:
+                    db.execute(statement)
+                self.assertEqual(sqlstate, rejected.exception.sqlstate)
+                self.assertEqual(before, db.execute(physical_read).fetchall())
+            db.execute(
+                f"INSERT INTO usage_records(id,status,amount) VALUES ('{third}',NULL,3)"
+            )
+            db.execute(f"INSERT INTO usage_records(id,amount) VALUES ('{fourth}',4)")
+            self.assertEqual(
+                [
+                    (first, "ready", "READY", "1"),
+                    (second, "open", "OPEN", "2"),
+                    (third, None, None, "3"),
+                    (fourth, "open", "OPEN", "4"),
+                ],
+                db.execute(
+                    "SELECT id::text,status,status_upper,amount::text "
+                    "FROM usage_records ORDER BY id"
+                ).fetchall(),
+            )
+            stable = db.execute(physical_read).fetchall()
+            db.execute(
+                f"INSERT INTO usage_records(id,status,amount) VALUES ('{probe}',NULL,5)"
+            )
+            db.execute(f"DELETE FROM usage_records WHERE id='{probe}'")
+            self.assertEqual(stable, db.execute(physical_read).fetchall())
+
+    def test_original_uuid_set_not_null_preserves_rows_defaults_and_constraints(self):
+        original = next(
+            entry
+            for entry in json.loads(
+                (FIXTURES / "sql_parity_inventory.json").read_text()
+            )["entries"]
+            if entry["id"] == "sql-0744"
+        )
+        self.assertEqual([], original["params"])
+        first = "00000000-0000-0000-0000-000000000001"
+        second = "00000000-0000-0000-0000-000000000002"
+        with postgres() as db:
+            db.execute(
+                "CREATE TABLE usage_records(id UUID PRIMARY KEY DEFAULT uuidv7(),"
+                "status TEXT DEFAULT 'open',status_upper TEXT GENERATED ALWAYS AS "
+                "(upper(status)) STORED,amount NUMERIC CHECK(amount >= 0))"
+            )
+            db.execute(
+                "INSERT INTO usage_records(id,status,amount) VALUES "
+                "(%s,NULL,1),(%s,'open',2)",
+                (first, second),
+            )
+            read = "SELECT id::text,status,status_upper,amount::text,ctid::text,xmin::text FROM usage_records ORDER BY id"
+            before = db.execute(read).fetchall()
+            with self.assertRaises(psycopg.Error) as rejected:
+                db.execute(original["sql"])
+            self.assertEqual("23502", rejected.exception.sqlstate)
+            self.assertEqual(before, db.execute(read).fetchall())
+            db.execute("UPDATE usage_records SET status='ready' WHERE id=%s", (first,))
+            repaired = db.execute(read).fetchall()
+            self.assertEqual(
+                [(first, "ready", "READY", "1"), (second, "open", "OPEN", "2")],
+                [row[:4] for row in repaired],
+            )
+            for _ in range(2):
+                self.assertEqual(
+                    "ALTER TABLE", db.execute(original["sql"]).statusmessage
+                )
+                self.assertEqual(repaired, db.execute(read).fetchall())
+            for statement, code in (
+                ("INSERT INTO usage_records(status) VALUES(NULL)", "23502"),
+                ("INSERT INTO usage_records(amount) VALUES(-1)", "23514"),
+                (f"INSERT INTO usage_records(id) VALUES('{first}')", "23505"),
+            ):
+                with self.assertRaises(psycopg.Error) as rejected:
+                    db.execute(statement)
+                self.assertEqual(code, rejected.exception.sqlstate)
+            generated = db.execute(
+                "INSERT INTO usage_records(amount) VALUES(3) RETURNING id,status,status_upper"
+            ).fetchone()
+            self.assertEqual(7, generated[0].version)
+            self.assertEqual(("open", "OPEN"), generated[1:])
+            db.execute("INSERT INTO usage_records(amount) VALUES(4)")
+            self.assertEqual(
+                4, db.execute("SELECT count(*) FROM usage_records").fetchone()[0]
+            )
+            self.assertEqual(
+                [(False,)],
+                db.execute(
+                    "SELECT attnotnull FROM pg_attribute "
+                    "WHERE attrelid='usage_records'::regclass AND attname='amount'"
+                ).fetchall(),
+            )
 
     def test_column_nullability_validation_preserves_rows_and_expressions(self):
         with postgres() as db:

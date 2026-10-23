@@ -688,6 +688,10 @@ pub const Work = struct {
     /// generation is still building. Readiness follows this cut, not the
     /// maintenance job's epoch or phase.
     published_epoch: ?Epoch = null,
+    /// Coverage belongs to the admitted live root, not the candidate job.
+    /// Startup must not treat an old relation-only seal as SQL readiness
+    /// while its constraint-name replacement is still being built.
+    published_coverage: ?Coverage = null,
     garbage: ?Retirement = null,
 
     pub fn read(reader: anytype, group: u64, epoch: ?Epoch) !Work {
@@ -698,7 +702,7 @@ pub const Work = struct {
         } else if (revision != 0) return error.InvalidCatalogRecord;
         const verified = try Verifier(@TypeOf(reader.*)).init(reader, group);
         if (revision == 0 and (verified.current != null or verified.root != null)) return error.InvalidCatalogRecord;
-        var result: Work = .{ .epoch = epoch, .current = verified.current, .root = verified.root, .published_epoch = if (verified.live) |live| live.epoch else null };
+        var result: Work = .{ .epoch = epoch, .current = verified.current, .root = verified.root, .published_epoch = if (verified.live) |live| live.epoch else null, .published_coverage = if (verified.live) |live| live.coverage else null };
         var buf: [128]u8 = undefined;
         const prefix = try retirementsForGroup(&buf, group);
         var cursor = try reader.openCursor();
@@ -1956,6 +1960,7 @@ test "relation live root mutations retain pending owners and update exact integr
     try verifyLiveRootForTest(&txn, epoch);
     const work = try Work.read(&txn, 41, epoch);
     try std.testing.expect(work.published_epoch.?.eql(epoch));
+    try std.testing.expectEqual(store.root.coverage, work.published_coverage.?);
     try std.testing.expect(!work.current.?.epoch.eql(epoch));
     const before = store.root;
     const committed_writes = counted.writes;
@@ -2141,6 +2146,7 @@ test "relation live root verification separates published totals from replacemen
     const work = try Work.read(&building, 41, test_epoch);
     try std.testing.expectEqual(.building, work.current.?.phase);
     try std.testing.expect(work.published_epoch.?.eql(test_epoch));
+    try std.testing.expectEqual(root.coverage, work.published_coverage.?);
     var source: TestSource = .{ .rows = &test_rows };
     var page = try Page.prepareSource(a, next, test_epoch, &source);
     defer page.deinit();

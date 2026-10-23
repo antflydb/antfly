@@ -27,30 +27,7 @@ const operation = sources.api_operation;
 const Path = @import("../pgwire/search_path.zig").Path;
 const A = std.mem.Allocator;
 
-fn namespaceUsage(identity: ?http.AuthenticatedIdentity, a: A, target: domain.Target) !bool {
-    const actor = identity orelse return true;
-    const table = try target.resourceNameAlloc(a);
-    // Existing Antfly per-table grants already authorize binding that table's
-    // schema. A namespace read additionally permits definition-only binding
-    // without source SELECT, analogous to PostgreSQL schema USAGE.
-    if (try http.tablePermissionCurrentlyAllowed(actor, table, .read) or
-        try http.tablePermissionCurrentlyAllowed(actor, table, .write)) return true;
-    const namespace = try @import("../system_catalog/routes.zig").resourceNameAlloc(a, .{ .kind = .namespace, .database = target.database, .name = target.namespace });
-    if (!http.permissionsAllow(actor.permissions, .namespace, namespace, .read)) return false;
-    const manager = actor.live_user_manager orelse return true;
-    if (std.mem.startsWith(u8, actor.credential_principal, "api-key:")) {
-        const current = manager.effectiveApiKeyPermissions(actor.credential_principal["api-key:".len..]) catch |err| switch (err) {
-            error.ApiKeyNotFound, error.ApiKeyExpired, error.UserNotFound => return false,
-            else => return err,
-        };
-        defer {
-            for (current) |*permission| permission.deinit(manager.alloc);
-            manager.alloc.free(current);
-        }
-        return http.permissionsAllow(current, .namespace, namespace, .read);
-    }
-    return manager.permissionCurrentlyAllowed(actor.username, .namespace, namespace, .read);
-}
+const namespaceUsage = @import("sql_catalog_auth.zig").namespaceUsage;
 
 fn owner(identity: ?http.AuthenticatedIdentity, auth_enabled: bool) !definitions.Owner {
     const actor = identity orelse return if (auth_enabled) error.Forbidden else .auth_disabled;

@@ -91,6 +91,7 @@ const Backend = struct {
     default_mode: bool = false,
     default_prepare_failure: bool = false,
     generated_mode: bool = false,
+    target_action: catalog.Action = .read_write,
     deny_source: bool = false,
     returning_mode: bool = false,
     cold_source: bool = false,
@@ -110,7 +111,7 @@ const Backend = struct {
     fn resolve(ptr: *anyopaque, alloc: std.mem.Allocator, name: ast.Name, action: catalog.Action) !catalog.Table {
         const self: *@This() = @ptrCast(@alignCast(ptr));
         if (std.mem.eql(u8, name.table, "target")) {
-            try std.testing.expect(action == .read_write);
+            try std.testing.expectEqual(self.target_action, action);
             if (self.arrays) return .{ .id = 1, .physical_name = "target", .schema_version = 1, .storage_mode = if (self.document) .document else .relational, .indexes = if (self.merge_path != .none and self.merge_path != .point) &.{.{ .name = "id_index", .columns = &.{"id"} }} else &.{}, .columns = &.{
                 .{ .name = "id", .path = "id", .type = .string },
                 .{ .name = "n", .path = "n", .type = .integer },
@@ -242,6 +243,28 @@ const Backend = struct {
         return a.dupe(u8, "fresh");
     }
 };
+
+test "SQL joined document scans evaluate physical versions only when demanded" {
+    for ([_]bool{ false, true }) |version_required| {
+        var backend: Backend = .{ .arrays = true, .document = true, .returning_mode = true, .target_action = .read };
+        var compiled = try compiler.compile(std.testing.allocator, if (version_required)
+            "SELECT t._version FROM target t JOIN source s ON t.id=s.id"
+        else
+            "SELECT t.id FROM target t JOIN source s ON t.id=s.id", .{});
+        defer compiled.deinit();
+        // The native fixture carries a u64 version outside SQL BIGINT.
+        // Unused envelope cells must not fail unrelated joined reads, while
+        // an explicit projection must still enforce its declared SQL domain.
+        if (version_required) {
+            try std.testing.expectError(error.SqlNumericOutOfRange, runtime.execute(std.testing.allocator, backend.backend(), &compiled, &.{}, .{}));
+        } else {
+            var result = try runtime.execute(std.testing.allocator, backend.backend(), &compiled, &.{}, .{});
+            defer result.deinit();
+            try std.testing.expectEqual(@as(usize, 2), result.output.rows.len);
+        }
+        try std.testing.expectEqual(@as(usize, 0), backend.commits);
+    }
+}
 
 test "SQL joined numeric assignments coerce before captured atomic commit" {
     for ([_]struct { expression: []const u8, expected: []const u8 }{
@@ -676,6 +699,9 @@ test "SQL UPDATE DEFAULT omits the old cell for native preparation" {
     try std.testing.expectEqual(@as(usize, 1), generated.commits);
     var invalid = try compiler.compile(std.testing.allocator, "UPDATE target SET g=3", .{});
     defer invalid.deinit();
+    // Constant, unconditional assignment does not grant SELECT authority,
+    // even when the generated-column admission check subsequently rejects it.
+    generated.target_action = .write;
     try std.testing.expectError(error.SqlGeneratedColumnWrite, runtime.execute(std.testing.allocator, generated.backend(), &invalid, &.{}, .{}));
     try std.testing.expectEqual(@as(usize, 1), generated.commits);
 }

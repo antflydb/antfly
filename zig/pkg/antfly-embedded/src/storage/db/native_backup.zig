@@ -31,11 +31,10 @@ const Allocator = std.mem.Allocator;
 const Io = std.Io;
 const Sha256 = std.crypto.hash.sha2.Sha256;
 
-/// Current native-generation contract. Versions 1 through 4 existed only on the
-/// development branch and are deliberately not a compatibility surface.
-/// v0.2.0 native backups have no generation manifest and use the legacy repair
-/// path instead.
-pub const format_version: u32 = 5;
+/// V6 adds explicit source-root provenance. Read the existing V5 and released
+/// V3 inventories too, without inventing provenance for those images. V1/V2/V4
+/// were development formats. V0.2.0 backups lack a manifest and use repair.
+pub const format_version: u32 = 6;
 pub const manifest_file_name = "native-generation.json";
 const indexes_directory_name = "indexes";
 const applied_checkpoint_file_name = "derived_apply.checkpoint";
@@ -68,6 +67,9 @@ pub const ProjectionArtifactState = enum {
     repair_required,
 };
 
+pub const Origin = @import("native_backup_origin.zig").Origin;
+pub const InstalledOrigin = @import("native_backup_origin.zig").Installation;
+pub const loadInstalledOrigin = @import("native_backup_origin.zig").loadInstallation;
 pub const Primary = struct {
     /// The format/version pair is the restore compatibility contract.
     /// `source_backend` is diagnostic for logical images and must identify the
@@ -75,6 +77,9 @@ pub const Primary = struct {
     artifact_format: []const u8,
     artifact_version: u32,
     source_backend: []const u8,
+    /// Present on new captures; released images without this evidence remain
+    /// restorable but cannot authenticate physical schema-owner root adoption.
+    origin: ?Origin = null,
 };
 
 pub const ArtifactRole = enum {
@@ -949,13 +954,15 @@ pub fn parseManifestBytes(alloc: Allocator, raw: []const u8) !LoadedManifest {
     var loaded = LoadedManifest{ .alloc = alloc, .parsed = parsed };
     errdefer loaded.deinit();
     const manifest = loaded.value();
-    if ((manifest.format_version != format_version and manifest.format_version != 3) or
+    if ((manifest.format_version != format_version and manifest.format_version != 5 and manifest.format_version != 3) or
         manifest.artifacts.len == 0 or
         manifest.artifacts.len > max_artifacts)
     {
         return error.InvalidNativeBackupManifest;
     }
     try validateProjectionInventory(manifest.capture_target_sequence, manifest.projections);
+    if (manifest.format_version != format_version and manifest.primary.origin != null)
+        return error.InvalidNativeBackupManifest;
     try validatePrimary(manifest.primary);
 
     if (manifest.format_version == 3) {
@@ -1110,6 +1117,7 @@ fn validateProjectionInventory(capture_target_sequence: u64, projections: []cons
 }
 
 fn validatePrimary(primary: Primary) !void {
+    if (primary.origin) |origin| try origin.validate();
     const supported = (std.mem.eql(u8, primary.artifact_format, "antfly-kv-stream") and
         primary.artifact_version == 2) or
         (std.mem.eql(u8, primary.artifact_format, "antfly-lsm-checkpoint") and
@@ -1720,8 +1728,10 @@ test "native v02 released generation manifest recovers only canonical install pa
     const modern = try alloc.dupe(u8, @embedFile("../testdata/v02-server/native-generation.json"));
     defer alloc.free(modern);
     const offset = std.mem.indexOf(u8, modern, "\"format_version\":3").?;
-    modern[offset + "\"format_version\":".len] = '5';
-    try std.testing.expectError(error.InvalidNativeBackupArtifactPath, parseManifestBytes(alloc, modern));
+    inline for (.{ '5', '6' }) |version| {
+        modern[offset + "\"format_version\":".len] = version;
+        try std.testing.expectError(error.InvalidNativeBackupArtifactPath, parseManifestBytes(alloc, modern));
+    }
 }
 
 test "native generation manifest captures validates and materializes generated artifacts" {
@@ -1767,10 +1777,30 @@ test "native generation manifest captures validates and materializes generated a
     const manifest_raw = try readFileAlloc(alloc, std.testing.io, manifest_path, max_manifest_bytes);
     defer alloc.free(manifest_raw);
     var parsed_current = try parseManifestBytes(alloc, manifest_raw);
-    parsed_current.deinit();
+    defer parsed_current.deinit();
+    // Exercise the previous exact schema, with no new field at all, rather
+    // than just serializing a V6 Primary with a null origin.
+    const current = parsed_current.value();
+    const previous = try std.json.Stringify.valueAlloc(alloc, .{
+        .format_version = @as(u32, 5),
+        .capture_target_sequence = current.capture_target_sequence,
+        .artifacts = current.artifacts,
+        .projections = current.projections,
+        .primary = .{ .artifact_format = current.primary.artifact_format, .artifact_version = current.primary.artifact_version, .source_backend = current.primary.source_backend },
+    }, .{});
+    defer alloc.free(previous);
+    var parsed_previous = try parseManifestBytes(alloc, previous);
+    defer parsed_previous.deinit();
+    try std.testing.expectEqual(@as(u32, 5), parsed_previous.value().format_version);
+    try std.testing.expect(parsed_previous.value().primary.origin == null);
+    parsed_current.parsed.value.format_version = 5;
+    parsed_current.parsed.value.primary.origin = .{ .physical_root_incarnation = 7, .namespace = null, .authority = null, .applied = null, .schema_header = null, .transaction_directory = null, .schema_outcomes = null };
+    const mislabeled = try std.json.Stringify.valueAlloc(alloc, parsed_current.parsed.value, .{});
+    defer alloc.free(mislabeled);
+    try std.testing.expectError(error.InvalidNativeBackupManifest, parseManifestBytes(alloc, mislabeled));
     const unreleased = try alloc.dupe(u8, manifest_raw);
     defer alloc.free(unreleased);
-    const version_offset = std.mem.indexOf(u8, unreleased, "\"format_version\":5") orelse
+    const version_offset = std.mem.indexOf(u8, unreleased, "\"format_version\":6") orelse
         return error.TestUnexpectedResult;
     unreleased[version_offset + "\"format_version\":".len] = '4';
     try std.testing.expectError(error.InvalidNativeBackupManifest, parseManifestBytes(alloc, unreleased));

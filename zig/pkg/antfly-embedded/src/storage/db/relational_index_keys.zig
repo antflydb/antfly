@@ -629,7 +629,7 @@ fn vectorValue(vector: @import("../rowsource/types.zig").ColumnVector, kind: sch
 /// The same self-delimiting scalar codec for SQL-owned homogeneous tuples.
 /// Callers bind the SQL type separately; comparison domains are never mixed.
 pub fn appendSqlScalar(a: std.mem.Allocator, out: *std.ArrayList(u8), datum: @import("../../sql/scalar.zig").Datum, nulls_first: bool) !void {
-    if (datum.array != null or datum.patterns != null) return error.InvalidRelationalIndexBound;
+    if (datum.array != null or datum.patterns() != null) return error.InvalidRelationalIndexBound;
     if (!datum.sql_null) if (datum.numeric) |number| {
         var context: NumericContext = .{ .alloc = a };
         const bytes = try @import("../../sql/numeric_key.zig").encodeAlloc(&context, number.*);

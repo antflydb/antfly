@@ -494,6 +494,11 @@ export type {
   SQLRequest,
   SQLResponse,
   SQLDDLReceipt,
+  SQLCatalogOperationReceipt,
+  SQLCatalogOperationState,
+  SQLCatalogOperationKind,
+  SQLCatalogObjectKind,
+  SQLCatalogRecoveryRequest,
   SSEStepStarted,
   SSEToolMode,
   // Table types

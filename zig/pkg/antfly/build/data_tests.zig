@@ -39,6 +39,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const lib_data_runtime_default_filters = [_][]const u8{
         "data runtime ordered artifact upload handoff",
         "data runtime schema reader",
+        "data runtime schema recovery",
         "data runtime hosted FK retirement",
         "pure topology control bypasses only ordinary dense repair writer preflight",
         "data ownership fallback requires a single store across all roles",
@@ -178,6 +179,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "data server registered data raft uses wal state backend by default",
         "data raft read safety deadline and cancellation cover owner lock admission",
         "data raft read safety barrier completes only after matching ReadState apply",
+        "data raft immutable image prefix progresses under churn without weakening frozen reads",
         "data raft native snapshot requires an install completion receipt",
         "data runtime native FK retirement preserves source ownership and exact cold path",
         "data raft read safety barrier rejects pre-restart responses for both read paths",

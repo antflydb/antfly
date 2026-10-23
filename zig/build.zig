@@ -740,6 +740,7 @@ pub fn create(b: *std.Build) ?Artifacts {
     raft_library_test_step.dependOn(&run_raft_library_tests.step);
 
     const owner_tests = antfly_tests_build.addTests(b, .{
+        .native_inference = embedded.native_inference,
         .apple_bridge = if (install_apple_bridge) |install| install.source else null,
         .lmdb_engine = lmdb_engine_mod,
         .vopr = vopr_mod,
@@ -783,6 +784,15 @@ pub fn create(b: *std.Build) ?Artifacts {
     model_chunk_step.dependOn(&chunk_error_run.step);
     const error_identity_step = b.step("runtime-error-identities-test", "Validate native error names and model-aware chunk failure transport");
     error_identity_step.dependOn(&chunk_error_run.step);
+    const storage_status_run = b.addRunArtifact(b.addTest(.{
+        .root_module = production_antfly_imports.storage_boundary.failure,
+    }));
+    error_identity_step.dependOn(&storage_status_run.step);
+    const storage_identity_run = b.addRunArtifact(b.addTest(.{
+        .root_module = production_antfly_imports.storage_boundary.identity,
+    }));
+    error_identity_step.dependOn(&storage_identity_run.step);
+    model_chunk_step.dependOn(&storage_status_run.step);
     const error_provider = b.addLibrary(.{ .name = "chunk-error-test-provider", .root_module = b.createModule(.{
         .root_source_file = b.path("lib/runtime/src/runtime_chunk_error_roundtrip_test.zig"),
         .target = target,

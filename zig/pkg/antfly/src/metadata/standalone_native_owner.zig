@@ -28,6 +28,11 @@ pub const Registration = struct {
     reporter_incarnation: u64,
     expected_reporter_incarnation: ?u64,
     signature: [64]u8,
+    schema_reader: @import("table_manager.zig").SchemaReaderCapabilities = .{},
+    artifact_sources_protocol_version: u16 = 0,
+    native_generation_restore_version: u16 = 0,
+    dense_native_storage_protocol_version: u16 = 0,
+    relational_topology_protocol_version: u16 = 0,
 
     pub fn binding(self: Registration) Binding {
         return .{ .metadata_incarnation = self.identity.metadata_incarnation, .node_id = self.identity.node_id, .store_id = self.identity.store_id, .root_incarnation = self.identity.root_incarnation };
@@ -36,8 +41,16 @@ pub const Registration = struct {
     pub fn message(self: Registration) ![32]u8 {
         if (self.reporter_incarnation == 0) return error.InvalidStandaloneNativeOwner;
         var hash = std.crypto.hash.Blake3.init(.{});
-        hash.update("antfly/standalone-native-reporter/v1");
+        hash.update("antfly/standalone-native-reporter/v2");
         hash.update(&try self.identity.digest());
+        var profile: [16]u8 = undefined;
+        std.mem.writeInt(u32, profile[0..4], self.schema_reader.semantic_ceiling, .little);
+        std.mem.writeInt(u32, profile[4..8], self.schema_reader.encoding_ceiling, .little);
+        std.mem.writeInt(u16, profile[8..10], self.artifact_sources_protocol_version, .little);
+        std.mem.writeInt(u16, profile[10..12], self.native_generation_restore_version, .little);
+        std.mem.writeInt(u16, profile[12..14], self.dense_native_storage_protocol_version, .little);
+        std.mem.writeInt(u16, profile[14..16], self.relational_topology_protocol_version, .little);
+        hash.update(&profile);
         var bytes: [8]u8 = undefined;
         std.mem.writeInt(u64, &bytes, self.reporter_incarnation, .little);
         hash.update(&bytes);
@@ -60,6 +73,7 @@ pub const Registration = struct {
     }
 
     pub fn validate(self: Registration) !void {
+        if (!self.schema_reader.validForReporter(self.reporter_incarnation)) return error.InvalidStandaloneNativeOwner;
         signing.verify(self.identity.public_key, &try self.message(), self.signature) catch return error.InvalidStandaloneNativeOwner;
     }
 };
@@ -82,6 +96,26 @@ pub const RestartObservation = struct {
     gc_fragment: u32,
     gc_fragment_end: u32,
 };
+
+/// Startup commands are body-bound to the original signed reporter request.
+/// The expected observation admits retirement; subsequent steps CAS the exact
+/// durable cursor. Neither form enrolls the signing key or grants a schema ACK.
+pub const Restart = struct {
+    request: Registration,
+    expected: ?RestartObservation = null,
+    progress: ?[32]u8 = null,
+};
+
+pub const RestartProgress = struct {
+    request: Registration,
+    digest: [32]u8,
+};
+
+/// Share the cursor projection so snapshots and standby deltas retain the
+/// startup cursor without inventing a second metadata transport protocol.
+pub fn restartKey(buf: []u8, group_id: u64, store_id: u64) ![]const u8 {
+    return std.fmt.bufPrint(buf, "\x00\x00__metadata__:store_report_cursor_v1:{d}:native_restart:{d}", .{ group_id, store_id });
+}
 
 pub const Binding = struct {
     metadata_incarnation: incarnation.MetadataClusterIncarnation,

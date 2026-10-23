@@ -79,15 +79,26 @@ const Validation = struct {
     fn apply(raw: *anyopaque, alloc: std.mem.Allocator, _: ?*const sessions.OwnedTransactionCommitRequest, candidate: *sessions.OwnedTransactionCommitRequest, _: *const sessions.OwnedTransactionCommitRequest) !void {
         const self: *@This() = @ptrCast(@alignCast(raw));
         for (self.modes) |mode| try candidate.setConstraintTiming(alloc, mode);
-        if (!self.immediate or candidate.tables.len == 0) return;
+        // A named CHECK is already immediate. Resolution verifies its name,
+        // but produces no timing change and must not scan staged rows.
+        if (!self.immediate or self.modes.len == 0 or candidate.tables.len == 0) return;
         if (!try self.server.transactionRequestAuthorized(self.identity, candidate.*)) return error.Forbidden;
-        var snapshot = (try self.server.source.adminSnapshot()) orelse return error.IntegrityCatalogUnavailable;
-        defer self.server.source.freeAdminSnapshot(&snapshot);
         const requests = try candidate.distributedTables(alloc);
         defer alloc.free(requests);
-        var checked = try integrity.validateConstraintTiming(alloc, self.server.table_reads orelse return error.IntegrityCatalogUnavailable, snapshot.tables, requests, self.context, candidate.constraint_timing.items);
+        const selected = (try self.server.selectIntegritySnapshot(alloc, requests, self.context)) orelse return error.IntegrityCatalogUnavailable;
+        var snapshot = selected.snapshot;
+        defer self.server.source.freeAdminSnapshot(&snapshot);
+        if (!selected.coordinated) return;
+        var checked = integrity.validateConstraintTiming(alloc, self.server.table_reads orelse return error.IntegrityCatalogUnavailable, snapshot.tables, requests, self.context, candidate.constraint_timing.items) catch |err| refreshed: {
+            if (err != error.PreparedGenerationChanged) return err;
+            const authoritative = try self.server.authoritativeIntegritySnapshot(self.context);
+            self.server.source.freeAdminSnapshot(&snapshot);
+            snapshot = authoritative;
+            if (!try integrity.metadataRequiresCoordination(alloc, snapshot.tables, requests)) return;
+            break :refreshed try integrity.validateConstraintTiming(alloc, self.server.table_reads orelse return error.IntegrityCatalogUnavailable, snapshot.tables, requests, self.context, candidate.constraint_timing.items);
+        };
         defer checked.deinit();
         // Retain original row observations discovered by retroactive checks.
-        try @import("relational_session_statement.zig").apply(alloc, candidate, checked.tables);
+        try @import("relational_session_statement.zig").retainObservations(alloc, candidate, checked.tables);
     }
 };

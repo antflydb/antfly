@@ -204,14 +204,14 @@ test "SQL mixed wildcard projections expand in the pinned visible input domain" 
     try std.testing.expectEqualStrings("2", repeated.output.rows[0][1].string);
     var missing = try compiler.compile(std.testing.allocator, "SELECT missing.*, 1 FROM (SELECT 1 AS x) t", .{});
     defer missing.deinit();
-    try std.testing.expectError(error.UndefinedColumn, runtime.execute(std.testing.allocator, backend.backend(), &missing, &.{}, .{}));
+    try std.testing.expectError(error.UndefinedTable, runtime.execute(std.testing.allocator, backend.backend(), &missing, &.{}, .{}));
     try std.testing.expectError(error.InvalidSqlSyntax, compiler.compile(std.testing.allocator, "SELECT *, 1", .{}));
     try std.testing.expectError(error.InvalidSqlSyntax, compiler.compile(std.testing.allocator, "SELECT *", .{}));
     // A qualified wildcard can reference a LATERAL parent without a local
     // FROM. Its scope is resolved by binding, not rejected by the parser.
     var no_scope = try compiler.compile(std.testing.allocator, "SELECT t.*", .{});
     defer no_scope.deinit();
-    try std.testing.expectError(error.UndefinedColumn, runtime.execute(std.testing.allocator, backend.backend(), &no_scope, &.{}, .{}));
+    try std.testing.expectError(error.UndefinedTable, runtime.execute(std.testing.allocator, backend.backend(), &no_scope, &.{}, .{}));
 }
 
 test "SQL mixed wildcard preparation releases allocation failures" {

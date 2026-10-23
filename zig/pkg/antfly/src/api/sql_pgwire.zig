@@ -216,7 +216,8 @@ pub const Adapter = struct {
         const scope: @import("antfly_local_sources").sql_setting_catalog.Scope = .{ .principal = credential.sessionPrincipal(), .database = request.database orelse "default" };
         const bytes = try self.server.source.systemCatalog(alloc, context, .{ .setting_snapshot = scope });
         defer alloc.free(bytes);
-        return std.json.parseFromSliceLeaky(@import("antfly_local_sources").sql_setting_catalog.RawSnapshot, alloc, bytes, .{ .allocate = .alloc_always });
+        const snapshot = try std.json.parseFromSliceLeaky(@import("antfly_local_sources").sql_setting_catalog.RawSnapshot, alloc, bytes, .{ .allocate = .alloc_always });
+        return http.authorizeSqlRoleDefaults(self.server, alloc, snapshot);
     }
 
     fn failTransaction(raw: *anyopaque, identity: wire.Identity, request: wire.Request) !void {
@@ -520,6 +521,7 @@ const OwnedRead = struct {
         self.native_adapter = .{ .server = server, .identity = &self.identity, .context = try self.authority.context(), .database = self.authority.request.database.?, .namespace = self.authority.request.namespace.?, .session_id = self.session_id, .read_requirements = request.read_requirements, .shared_receipt_wait_budget = request.read_receipt_budget, .lake_visibility = if (request.read_requirements.visibility) |visibility| if (visibility == .accepted) .accepted else .committed else @fromBackingInt(@intCast(@backingInt(request.lake_visibility))), .setting_overlay = self.authority.request.setting_overlay, .setting_overlay_source = .connection, .expected_setting_epoch = self.authority.request.setting_epoch };
         self.native_adapter.prepared_bindings = try viewBindings(arena, self.authority.request.binding_guard);
         var captured_authorities: std.ArrayListUnmanaged(*const @import("sql_read_authority.zig").Context) = .empty;
+        self.native_adapter.setting_baseline = self.authority.request.setting_baseline;
         self.native_adapter.collect_view_authorities = &captured_authorities;
         var captured_bindings: std.ArrayListUnmanaged(@import("sql_prepared.zig").Binding) = .empty;
         self.native_adapter.collect_prepared_bindings = &captured_bindings;
@@ -623,7 +625,7 @@ const OwnedRead = struct {
         }
         self.policies = policies;
         const columns = try arena.alloc(wire.Column, self.stream.context.binding.columns.len);
-        for (columns, self.stream.context.binding.columns) |*out, column| out.* = .{ .name = try arena.dupe(u8, column.name), .type = try wireType(column.type), .element_type = column.element_type, .numeric_modifier = column.numeric_modifier };
+        for (columns, self.stream.context.binding.columns) |*out, column| out.* = .{ .name = try arena.dupe(u8, column.name), .type = try wireType(column.type), .element_type = column.element_type, .numeric_modifier = column.numeric_modifier, .temporal_kind = column.temporal_kind };
         self.columns = columns;
         self.plan = plan;
         self.admission = admission;
@@ -779,7 +781,13 @@ const OwnedRead = struct {
                 return .{ .json_bytes = bytes, .sql_null = false };
             }
             const value = try self.page.values.cell(alloc, row, column);
-            if (value.temporal() != null) {
+            if (value.temporal()) |temporal_value| {
+                const definition = self.page.columns[column];
+                if (definition.temporal_kind == .interval and temporal_value.kind() == .interval) {
+                    try value.validateTemporal();
+                    var text: [@import("antfly_local_sources").sql_temporal_text.output_capacity]u8 = undefined;
+                    return .{ .value = .{ .string = try alloc.dupe(u8, try @import("antfly_local_sources").sql_temporal_text.format(temporal_value.*, &text)) }, .sql_null = false };
+                }
                 const instant = try @import("antfly_local_sources").sql_scalar.timestampResult(value, self.page.columns[column].type);
                 return .{ .value = try wire_values.timestampEnvelope(alloc, instant), .sql_null = false };
             }
@@ -1018,7 +1026,7 @@ const Job = struct {
         const compiled = lease.compiled();
         const write = self.kind == .execute and switch (compiled.statement) {
             .select, .explain, .copy_to => false,
-            .insert, .update, .delete, .merge, .create_table, .drop_table, .catalog_ddl, .policy_ddl, .begin, .commit, .rollback, .savepoint, .rollback_to_savepoint, .release_savepoint, .set_constraints => true,
+            .insert, .update, .delete, .merge, .create_table, .drop_table, .catalog_ddl, .policy_ddl, .begin, .commit, .rollback, .savepoint, .rollback_to_savepoint, .release_savepoint, .set_constraints, .set_transaction => true,
         };
         const server = self.adapter.server;
         var admission = try server.acquireSqlExecution(write);
@@ -1041,6 +1049,7 @@ const Job = struct {
             .session_id = self.request.session_id,
             .session_namespace = self.request.session_namespace,
             .setting_overlay = self.request.setting_overlay,
+            .setting_baseline = self.request.setting_baseline,
             .setting_overlay_source = .connection,
             .expected_setting_epoch = self.request.setting_epoch,
         };
@@ -1056,7 +1065,7 @@ const Job = struct {
         };
         if (self.kind == .describe) {
             switch (compiled.statement) {
-                .begin, .commit, .rollback, .savepoint, .rollback_to_savepoint, .release_savepoint, .set_constraints => {
+                .begin, .commit, .rollback, .savepoint, .rollback_to_savepoint, .release_savepoint, .set_constraints, .set_transaction => {
                     if (self.request.parameter_types.len != 0) return error.InvalidSqlParameters;
                     self.description = .{ .columns = &.{} };
                     return;
@@ -1075,7 +1084,7 @@ const Job = struct {
             var description = try describe_sql.describe(self.request.scratch_allocator orelse self.alloc, describe_backend, compiled, hints);
             defer description.deinit();
             const columns = try self.alloc.alloc(wire.Column, description.binding.columns.len);
-            for (columns, description.binding.columns) |*out, column| out.* = .{ .name = try self.alloc.dupe(u8, column.name), .type = try wireType(column.type), .element_type = column.element_type, .numeric_modifier = column.numeric_modifier };
+            for (columns, description.binding.columns) |*out, column| out.* = .{ .name = try self.alloc.dupe(u8, column.name), .type = try wireType(column.type), .element_type = column.element_type, .numeric_modifier = column.numeric_modifier, .temporal_kind = column.temporal_kind };
             const parameter_types = try self.alloc.alloc(wire.Type, description.binding.parameter_types.len);
             for (parameter_types, description.binding.parameter_types) |*out, kind| out.* = if (kind) |value| try wireType(value) else .unknown;
             self.description = .{
@@ -1113,14 +1122,14 @@ const Job = struct {
         };
         // Only datetime cells require representation adaptation. Mutate the
         // exclusively owned row cells, not a second copy of every result row.
-        for (result.output.columns, 0..) |column, index| if (column.type == .datetime) {
+        for (result.output.columns, 0..) |column, index| if (column.type == .datetime and (column.temporal_kind orelse .timestamp_tz) == .timestamp_tz) {
             for (0..result.output.rows.len) |row_index| {
                 const row = result.mutableRow(row_index);
                 row[index] = try datetimeResult(self.alloc, row[index]);
             }
         };
         const columns = try self.alloc.alloc(wire.Column, result.output.columns.len);
-        for (columns, result.output.columns) |*out, column| out.* = .{ .name = column.name, .type = try wireType(column.type), .element_type = column.element_type, .numeric_modifier = column.numeric_modifier };
+        for (columns, result.output.columns) |*out, column| out.* = .{ .name = column.name, .type = try wireType(column.type), .element_type = column.element_type, .numeric_modifier = column.numeric_modifier, .temporal_kind = column.temporal_kind };
         const native_owner = if (result.output.native_rows != null) try result.state.arena.allocator().create(NativeResultCells) else null;
         if (native_owner) |owner| owner.* = .{ .result = result };
         self.result = .{
@@ -1135,6 +1144,7 @@ const Job = struct {
             } else null,
             .transaction_id = native_adapter.outcome_transaction_id,
             .ddl_receipt_json = if (result.output.ddl_receipt) |receipt| try std.json.Stringify.valueAlloc(self.alloc, receipt, .{ .emit_null_optional_fields = false }) else null,
+            .catalog_receipt_json = if (result.output.catalog_receipt) |receipt| try std.json.Stringify.valueAlloc(self.alloc, receipt, .{ .emit_null_optional_fields = false }) else null,
             .session_id = if (native_adapter.result_session_id) |id| try self.alloc.dupe(u8, &id) else null,
             .transaction_status = @fromBackingInt(@backingInt(native_adapter.transaction_status)),
             .owner = .{ .context = result.state, .release = releaseResult },
@@ -1306,7 +1316,14 @@ const NativeResultCells = struct {
         const rows = self.result.output.native_rows orelse return error.InvalidSqlBackendResponse;
         if (row >= rows.len or column >= self.result.output.columns.len or rows[row].len != self.result.output.columns.len) return error.InvalidSqlBackendResponse;
         const datum = rows[row][column];
-        return .{ .value = if (!datum.sql_null and self.result.output.columns[column].type == .datetime) try datetimeResult(alloc, datum.value) else datum.value, .sql_null = datum.sql_null, .array = datum.array, .numeric = datum.numeric };
+        if (datum.temporal()) |value| {
+            try datum.validateTemporal();
+            const definition = self.result.output.columns[column];
+            if (definition.type != .datetime or (definition.temporal_kind orelse .timestamp_tz) != value.kind()) return error.InvalidSqlBackendResponse;
+            var text: [@import("antfly_local_sources").sql_temporal_text.output_capacity]u8 = undefined;
+            return .{ .value = .{ .string = try alloc.dupe(u8, try @import("antfly_local_sources").sql_temporal_text.format(value.*, &text)) }, .sql_null = false };
+        }
+        return .{ .value = if (!datum.sql_null and self.result.output.columns[column].type == .datetime and (self.result.output.columns[column].temporal_kind orelse .timestamp_tz) == .timestamp_tz) try datetimeResult(alloc, datum.value) else datum.value, .sql_null = datum.sql_null, .array = datum.array, .numeric = datum.numeric };
     }
 };
 

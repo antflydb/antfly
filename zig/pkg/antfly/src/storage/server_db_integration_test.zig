@@ -80,6 +80,28 @@ const sleepPollInterval = engine.test_support.sleepPollInterval;
 const std = engine.test_support.std;
 const table_catalog_mod = engine.test_support.table_catalog_mod;
 const transactions_mod = engine.test_support.transactions_mod;
+
+test "server transaction prepare never discards supplied row policy authority" {
+    const alloc = std.testing.allocator;
+    for ([_]?OrderedApplyReceipt{ null, .{ .term = 1, .index = 1 } }) |receipt| {
+        var directory = try TestDirectory.init("transaction-policy-authority");
+        defer directory.cleanup();
+        var db = try DB.open(alloc, directory.path(), .{});
+        defer db.close();
+        const txn_id = try db.beginTransaction(100);
+        // No signing keys are installed: supplied authority must fail closed,
+        // even though raw writes on this otherwise unprotected DB are allowed.
+        try std.testing.expectError(error.RowPolicyAuthorityUnavailable, @import("server_transaction_dispatch.zig").applyReplicatedTransactionMutationInternal(alloc, &db, "docs", 7, .{
+            .row_policy_principal_proof = "v1:opaque:signature",
+            .row_policy_database = "default",
+            .row_policy_admitted_at_seconds = 123,
+            .writes = &.{.{ .key = "guarded", .value = "{}" }},
+            .transaction = .{ .prepare = .{ .txn_id = txn_id, .topology_epoch = 1 } },
+        }, .none, receipt));
+        try std.testing.expectEqual(@as(?[]u8, null), try db.get(alloc, "guarded"));
+        try std.testing.expectEqual(@as(?OrderedApplyReceipt, null), try db.orderedApplyReceipt());
+    }
+}
 const tryFinalizePrimarySplitFast = engine.test_support.tryFinalizePrimarySplitFast;
 const types = engine.test_support.types;
 
@@ -4037,6 +4059,32 @@ test "db transaction batched acknowledgement migration preserves legacy replay a
     @memcpy(index_key[0..prefix.len], prefix);
     @memcpy(index_key[prefix.len..], &txn);
     _ = try db.beginReplicatedTransactionAtOrderedReceipt(txn, 10000, 10000, &.{ "a", "b", "c" }, false, false, .{ .term = 3, .index = 1 });
+    {
+        var read = try db.core.store.beginProbeTxn();
+        defer read.abort();
+        const indexed = try read.get(&index_key);
+        try std.testing.expectEqual(@as(usize, 17), indexed.len);
+        try std.testing.expectEqual(@as(u8, 1), indexed[0]);
+        try std.testing.expectEqual(@as(u64, 3), std.mem.readInt(u64, indexed[1..9], .little));
+        try std.testing.expectEqual(@as(u64, 0), std.mem.readInt(u64, indexed[9..17], .little));
+    }
+    // Modern BEGIN already creates the immutable membership index. Build a
+    // genuine pre-index fixture before the legacy single-ACK replay; do not
+    // require production to stop indexing newly created transactions.
+    {
+        var write = try db.core.store.beginWriteTxn();
+        var committed = false;
+        defer if (!committed) write.abort();
+        try write.delete(&index_key);
+        for ([_][]const u8{ "a", "b", "c" }) |participant| {
+            var member_key: [index_key.len + 32]u8 = undefined;
+            @memcpy(member_key[0..index_key.len], &index_key);
+            std.crypto.hash.sha2.Sha256.hash(participant, member_key[index_key.len..][0..32], .{});
+            try write.delete(&member_key);
+        }
+        try write.commit();
+        committed = true;
+    }
     try db.markReplicatedTransactionParticipantResolvedAtOrderedReceipt(txn, "a", .{ .term = 3, .index = 2 });
     {
         var read = try db.core.store.beginProbeTxn();
@@ -4045,7 +4093,27 @@ test "db transaction batched acknowledgement migration preserves legacy replay a
     }
     try std.testing.expectError(error.InvalidParticipant, db.markReplicatedTransactionParticipantsResolvedAtOrderedReceipt(txn, &.{ "b", "absent" }, .{ .term = 3, .index = 3 }));
     try std.testing.expectEqual(@as(u64, 2), (try db.orderedApplyReceipt()).?.index);
+    {
+        var read = try db.core.store.beginProbeTxn();
+        defer read.abort();
+        try std.testing.expectError(error.NotFound, read.get(&index_key));
+    }
+    {
+        const unresolved = try db.getUnresolvedTransactionParticipants(alloc, txn);
+        defer transactions_mod.freeParticipantList(alloc, unresolved);
+        try std.testing.expectEqual(@as(usize, 2), unresolved.len);
+        try std.testing.expectEqualStrings("b", unresolved[0]);
+        try std.testing.expectEqualStrings("c", unresolved[1]);
+    }
     try db.markReplicatedTransactionParticipantsResolvedAtOrderedReceipt(txn, &.{"b"}, .{ .term = 3, .index = 3 });
+    {
+        var read = try db.core.store.beginProbeTxn();
+        defer read.abort();
+        const indexed = try read.get(&index_key);
+        try std.testing.expectEqual(@as(usize, 17), indexed.len);
+        try std.testing.expectEqual(@as(u64, 3), std.mem.readInt(u64, indexed[1..9], .little));
+        try std.testing.expectEqual(@as(u64, 2), std.mem.readInt(u64, indexed[9..17], .little));
+    }
     // Exact replay is fenced before payload admission, preserving the durable
     // marker together with the indexed membership and migrated resolution.
     try db.markReplicatedTransactionParticipantsResolvedAtOrderedReceipt(txn, &.{"absent"}, .{ .term = 3, .index = 3 });

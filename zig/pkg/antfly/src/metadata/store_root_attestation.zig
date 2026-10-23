@@ -24,6 +24,43 @@ pub const Authority = union(enum) {
     native: [32]u8,
 };
 
+pub const RaftReporter = struct {
+    node_id: u64,
+    store_id: u64,
+
+    pub fn validate(self: @This()) !void {
+        if (self.node_id == 0 or self.store_id == 0) return error.InvalidGenerationPublication;
+    }
+};
+
+/// Actual local Raft/catalog facts shared by index and schema control. This
+/// is a snapshot, not a leadership lease or a metadata publication permission.
+pub const RaftLocalScope = struct {
+    group_id: u64,
+    namespace: @import("antfly_local_sources").storage_db_doc_identity.Namespace,
+    reporter: RaftReporter,
+    reporter_incarnation: u64,
+    replica_id: u64,
+    replica_catalog_revision: u64,
+    root_generation: u64,
+    leader_term: u64,
+    completed_index: u64,
+};
+
+/// The shared physical ownership facts. Logical job identity and protocol-
+/// specific signature verification remain the accepting caller's obligation.
+pub const OwnerScope = struct {
+    group_id: u64,
+    namespace: @import("antfly_local_sources").storage_db_doc_identity.Namespace,
+    authority: @import("antfly_local_sources").storage_source_authority.Kind,
+
+    pub fn validate(self: @This()) !void {
+        if (self.group_id == 0 or self.namespace.table_id == 0 or
+            self.namespace.shard_id == 0 or self.namespace.range_id == 0)
+            return error.InvalidGenerationPublication;
+    }
+};
+
 pub fn ProofFor(comptime message_domain: []const u8, comptime accepted_domain: []const u8) type {
     comptime {
         if (message_domain.len == 0 or accepted_domain.len == 0 or std.mem.eql(u8, message_domain, accepted_domain))

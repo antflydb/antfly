@@ -31,6 +31,7 @@ pub const Column = struct {
     /// Derived relations and aliases deliberately do not inherit this scope.
     scope: ?catalog.Table.Scope = null,
     type: ast.ColumnType,
+    temporal_kind: ?@import("temporal_value.zig").Kind = null,
     element_type: ?@import("array_value.zig").ElementType = null,
     numeric_modifier: ?scalar.NumericModifier = null,
     nullable: bool,
@@ -74,7 +75,8 @@ pub fn expandWildcards(alloc: Allocator, columns: []const Column, projections: [
             count += 1;
             if (count > max_output_columns) return error.SqlProgramLimitExceeded;
         }
-        if (projection.field.len != 0 and count == before) return error.UndefinedColumn;
+        if (projection.field.len != 0 and count == before)
+            return if (Builder.containsQualifier(columns, projection.field)) error.UndefinedColumn else error.UndefinedTable;
     }
     if (!has_wildcard) return projections;
     const result = try alloc.alloc(ast.Projection, count);
@@ -136,7 +138,13 @@ pub const Node = struct {
         outer_ref: usize,
         recursive: struct { id: usize, seed: *const Node, step: *const Node, all: bool },
         materialized_ref: *const Node,
-        scan: struct { index: usize, source_columns: []const []const u8 },
+        scan: struct {
+            index: usize,
+            source_columns: []const []const u8,
+            // Keep bound ordinals stable without evaluating unreferenced
+            // cells (including fallible virtual row-envelope conversions).
+            demanded: ?[]bool = null,
+        },
         unnest: struct { source: *const Node, arrays: []const scalar.Program, ordinality: bool },
         join: struct { output_order: ?[]const usize = null, estimated_rows: ?u64 = null, kind: ast.JoinKind, left: *const Node, right: *const Node, condition: ?scalar.Program, left_keys: []const scalar.Program, right_keys: []const scalar.Program, correlation: bool = false, membership: ?struct { correlations: usize } = null },
         apply: struct { id: usize, kind: ast.JoinKind, left: *const Node, right: *const Node, condition: ?scalar.Program, demand: ?scalar.Program = null, single_row: bool = false },
@@ -546,7 +554,7 @@ const Builder = struct {
                 const present = for (shape.shape_columns.items) |known| {
                     if (std.mem.eql(u8, known.name, column.internal)) break true;
                 } else false;
-                if (!present) try shape.shape_columns.append(self.alloc, .{ .name = column.internal, .type = column.type, .element_type = column.element_type, .numeric_modifier = column.numeric_modifier, .nullable = column.nullable });
+                if (!present) try shape.shape_columns.append(self.alloc, .{ .name = column.internal, .type = column.type, .element_type = column.element_type, .numeric_modifier = column.numeric_modifier, .temporal_kind = column.temporal_kind, .nullable = column.nullable });
             };
             const source = try shape.querySource(statement, scope, depth + 1);
             self.identities = shape.identities;
@@ -772,7 +780,7 @@ const Builder = struct {
         } else if ((current.kind == .integer or current.kind == .number) and (inferred.kind == .integer or inferred.kind == .number)) {
             current.element_type = try casts.commonNumeric(current.element_type orelse (if (current.kind == .integer) .int64 else .float64), inferred.element_type orelse (if (inferred.kind == .integer) .int64 else .float64));
             current.kind = if (casts.integral(current.element_type.?)) .integer else .number;
-        } else if (current.kind != inferred.kind) return error.SqlTypeMismatch;
+        } else if (current.kind != inferred.kind or (current.kind == .datetime and (current.temporal_kind orelse .timestamp_tz) != (inferred.temporal_kind orelse .timestamp_tz))) return error.SqlTypeMismatch;
         current.nullable = current.nullable or inferred.nullable;
     }
 
@@ -867,12 +875,12 @@ const Builder = struct {
     }
     fn virtualTable(self: *Builder, columns: []const Column) !catalog.Table {
         const result = try self.alloc.alloc(catalog.Column, columns.len);
-        for (columns, result) |column, *out| out.* = .{ .name = column.internal, .path = column.internal, .type = column.type, .element_type = column.element_type, .numeric_modifier = column.numeric_modifier, .nullable = column.nullable };
+        for (columns, result) |column, *out| out.* = .{ .name = column.internal, .path = column.internal, .type = column.type, .element_type = column.element_type, .numeric_modifier = column.numeric_modifier, .temporal_kind = column.temporal_kind, .nullable = column.nullable };
         return .{ .id = 0, .physical_name = virtual_table_name, .schema_version = 0, .columns = result };
     }
     fn scalarColumns(self: *Builder, columns: []const Column) ![]const scalar.Column {
         const result = try self.alloc.alloc(scalar.Column, columns.len);
-        for (columns, result) |column, *out| out.* = .{ .name = column.internal, .type = column.type, .element_type = column.element_type, .numeric_modifier = column.numeric_modifier, .nullable = column.nullable };
+        for (columns, result) |column, *out| out.* = .{ .name = column.internal, .type = column.type, .element_type = column.element_type, .numeric_modifier = column.numeric_modifier, .temporal_kind = column.temporal_kind, .nullable = column.nullable };
         return result;
     }
     fn field(columns: []const Column, name: []const u8) !Column {
@@ -904,7 +912,16 @@ const Builder = struct {
         return error.UndefinedColumn;
     }
     fn resolveField(self: *Builder, columns: []const Column, name: []const u8) !Column {
-        const column = try field(columns, name);
+        const column = field(columns, name) catch |err| {
+            if (err == error.UndefinedColumn and name.len != 0 and name[0] != 0) if (std.mem.lastIndexOfScalar(u8, name, 0)) |separator| {
+                const qualifier = name[0..separator];
+                var present = containsQualifier(columns, qualifier);
+                var outer = self.outer_scope;
+                while (outer) |frame| : (outer = frame.parent) present = present or containsQualifier(frame.columns, qualifier);
+                if (!present) return error.UndefinedTable;
+            };
+            return err;
+        };
         try self.referenceColumn(column);
         for (0..32) |id| if (column.outer_dependencies & (@as(u32, 1) << @intCast(id)) != 0) {
             self.outer_used[id] = true;
@@ -914,6 +931,13 @@ const Builder = struct {
             if (self.outer_references) |references| try references.put(self.alloc, column.internal, {});
         }
         return column;
+    }
+    fn containsQualifier(columns: []const Column, qualifier: []const u8) bool {
+        for (columns) |column| {
+            if (qualifierMatches(column, qualifier)) return true;
+            if (column.grouped_scope) |scope| if (containsQualifier(scope.*, qualifier)) return true;
+        }
+        return false;
     }
     fn referenceColumn(self: *Builder, column: Column) !void {
         if (self.capture_dependencies and self.dependency_origins.contains(column.internal))
@@ -1111,7 +1135,7 @@ const Builder = struct {
     }
 
     fn valuesOrigin(self: *Builder, arms: []const *const Node, index: usize, common: scalar.Type) anyerror!*const ast.Scalar {
-        if (arms.len == 1) return self.scalarNode(.{ .cast = .{ .operand = arms[0].columns[index].origin orelse return error.InvalidSqlBackendResponse, .type = common.kind.?, .element_type = common.element_type, .numeric_modifier = common.numeric_modifier } });
+        if (arms.len == 1) return self.scalarNode(.{ .cast = .{ .operand = arms[0].columns[index].origin orelse return error.InvalidSqlBackendResponse, .type = common.kind.?, .element_type = common.element_type, .numeric_modifier = common.numeric_modifier, .temporal_kind = common.temporal_kind } });
         const middle = arms.len / 2;
         const arguments = try self.alloc.dupe(*const ast.Scalar, &.{ try self.valuesOrigin(arms[0..middle], index, common), try self.valuesOrigin(arms[middle..], index, common) });
         return self.scalarNode(.{ .call = .{ .name = "coalesce", .args = arguments } });
@@ -1259,6 +1283,7 @@ const Builder = struct {
                         .type = kind.kind orelse .string,
                         .element_type = kind.element_type,
                         .numeric_modifier = kind.numeric_modifier,
+                        .temporal_kind = kind.temporal_kind,
                         .nullable = true,
                         .untyped_null = kind.kind == null,
                     };
@@ -1304,6 +1329,7 @@ const Builder = struct {
                     column.type = inferred.kind.?;
                     column.element_type = inferred.element_type;
                     column.numeric_modifier = inferred.numeric_modifier;
+                    column.temporal_kind = inferred.temporal_kind;
                     column.origin = try self.valuesOrigin(arms, index, inferred);
                     try self.constraints.append(self.alloc, .{ .expression = column.origin.? });
                 }
@@ -1322,11 +1348,12 @@ const Builder = struct {
                     try mergeSetType(&common, try self.setType(column.origin.?, self.shape_columns.items), true);
                     try mergeSetType(&common, try self.setType(other.origin.?, self.shape_columns.items), false);
                     common = resolveUnknown(common);
-                    const args = try self.alloc.dupe(*const ast.Scalar, &.{ try self.scalarNode(.{ .cast = .{ .operand = column.origin.?, .type = common.kind.?, .element_type = common.element_type, .numeric_modifier = common.numeric_modifier } }), try self.scalarNode(.{ .cast = .{ .operand = other.origin.?, .type = common.kind.?, .element_type = common.element_type, .numeric_modifier = common.numeric_modifier } }) });
+                    const args = try self.alloc.dupe(*const ast.Scalar, &.{ try self.scalarNode(.{ .cast = .{ .operand = column.origin.?, .type = common.kind.?, .element_type = common.element_type, .numeric_modifier = common.numeric_modifier, .temporal_kind = common.temporal_kind } }), try self.scalarNode(.{ .cast = .{ .operand = other.origin.?, .type = common.kind.?, .element_type = common.element_type, .numeric_modifier = common.numeric_modifier, .temporal_kind = common.temporal_kind } }) });
                     column.origin = try self.scalarNode(.{ .call = .{ .name = "coalesce", .args = args } });
                     column.type = common.kind.?;
                     column.element_type = common.element_type;
                     column.numeric_modifier = common.numeric_modifier;
+                    column.temporal_kind = common.temporal_kind;
                     try self.constraints.append(self.alloc, .{ .expression = column.origin.? });
                 } else {
                     if (column.type != other.type or column.element_type != other.element_type) return error.SqlSetTypeMismatch;
@@ -1399,6 +1426,7 @@ const Builder = struct {
                     .type = output.kind orelse .string,
                     .element_type = output.element_type,
                     .numeric_modifier = output.numeric_modifier,
+                    .temporal_kind = output.temporal_kind,
                     .nullable = true,
                     .origin = if (resolve_unknown and (output.kind == null or (expression_.* == .literal and expression_.literal == .string))) try self.scalarNode(.{ .cast = .{ .operand = expression_, .type = .string } }) else expression_,
                 };
@@ -1411,7 +1439,7 @@ const Builder = struct {
             for (projections, entry.expressions, entry.types) |*projection, expression_, kind| if (kind.kind) |known| {
                 const actual = try scalar.inferOutputWithInvocation(self.alloc, expression_, column_types, self.parameters, self.backend.parameter_invocation);
                 if (actual.kind != known or actual.element_type != kind.element_type or !scalar.NumericModifier.eql(actual.numeric_modifier, kind.numeric_modifier))
-                    projection.expression = try self.scalarNode(.{ .cast = .{ .operand = projection.expression orelse try self.scalarNode(.{ .column = projection.field }), .type = known, .element_type = kind.element_type, .numeric_modifier = kind.numeric_modifier } });
+                    projection.expression = try self.scalarNode(.{ .cast = .{ .operand = projection.expression orelse try self.scalarNode(.{ .column = projection.field }), .type = known, .element_type = kind.element_type, .numeric_modifier = kind.numeric_modifier, .temporal_kind = kind.temporal_kind } });
             };
             lowered.columns = projections;
         };
@@ -1438,7 +1466,7 @@ const Builder = struct {
                     untyped = untyped or source_column.untyped_null;
                 };
             }
-            out.* = .{ .name = try self.alloc.dupe(u8, if (names.len == 0) column.name else names[index]), .internal = try self.internal(), .qualifier = alias, .type = column.type, .element_type = column.element_type, .numeric_modifier = column.numeric_modifier, .nullable = true, .untyped_null = !resolve_unknown and untyped };
+            out.* = .{ .name = try self.alloc.dupe(u8, if (names.len == 0) column.name else names[index]), .internal = try self.internal(), .qualifier = alias, .type = column.type, .element_type = column.element_type, .numeric_modifier = column.numeric_modifier, .temporal_kind = column.temporal_kind, .nullable = true, .untyped_null = !resolve_unknown and untyped };
         }
         const constants = try self.alloc.alloc(Node.ConstantRef, lowered.invocation_constants.len);
         for (lowered.invocation_constants, constants) |name, *reference| {
@@ -1470,7 +1498,7 @@ const Builder = struct {
         if (prepared.expressions.len != columns.len) return error.SqlTypeMismatch;
         const inputs = try self.scalarColumns(prepared.source.columns);
         for (prepared.expressions, prepared.types, columns) |expression_, *target, column| {
-            const seed: scalar.Type = .{ .kind = column.type, .element_type = scalar.columnElementType(column.type, column.element_type), .numeric_modifier = column.numeric_modifier, .nullable = true };
+            const seed: scalar.Type = .{ .kind = column.type, .element_type = scalar.columnElementType(column.type, column.element_type), .numeric_modifier = column.numeric_modifier, .temporal_kind = column.temporal_kind, .nullable = true };
             var common = seed;
             mergeInferredType(&common, try self.setType(expression_, inputs), false) catch |err| switch (err) {
                 error.SqlCannotCoerce, error.SqlTypeMismatch => return error.SqlRecursiveTypeMismatch,
@@ -1578,7 +1606,7 @@ const Builder = struct {
                         column.outer_ordinal = null;
                         column.outer_dependencies = 0;
                         column.grouped_scope = null;
-                        if (self.shape_only) try self.shape_columns.append(self.alloc, .{ .name = column.internal, .type = column.type, .element_type = column.element_type, .numeric_modifier = column.numeric_modifier, .nullable = column.nullable });
+                        if (self.shape_only) try self.shape_columns.append(self.alloc, .{ .name = column.internal, .type = column.type, .element_type = column.element_type, .numeric_modifier = column.numeric_modifier, .temporal_kind = column.temporal_kind, .nullable = column.nullable });
                     }
                     break :blk try self.node(columns, .{ .prepared_rows = names });
                 }
@@ -1652,7 +1680,7 @@ const Builder = struct {
                     var result = try self.derived(view.query, reference.alias orelse reference.name.table, names, &.{}, depth + 1);
                     if (result.columns.len != view.columns.len) return error.InvalidSqlBackendResponse;
                     for (result.columns, view.columns) |actual, expected| {
-                        const column: catalog.Column = .{ .name = actual.name, .path = actual.name, .type = actual.type, .element_type = actual.element_type, .numeric_modifier = actual.numeric_modifier };
+                        const column: catalog.Column = .{ .name = actual.name, .path = actual.name, .type = actual.type, .element_type = actual.element_type, .numeric_modifier = actual.numeric_modifier, .temporal_kind = actual.temporal_kind };
                         if (!std.mem.eql(u8, &try column.identitySignature(self.alloc), &try expected.identitySignature(self.alloc))) return error.CatalogGenerationChanged;
                     }
                     // Authorization uses the complete view output before a
@@ -1720,7 +1748,7 @@ const Builder = struct {
                 const source_columns = try self.alloc.alloc([]const u8, columns.len);
                 const fields = try self.alloc.alloc([]const u8, table.columns.len);
                 for (table.columns, columns[0..table.columns.len], source_columns[0..table.columns.len], fields, 0..) |column, *out, *source_name, *field_name, position| {
-                    out.* = .{ .name = try self.alloc.dupe(u8, column.name), .internal = try self.internal(), .qualifier = reference.alias orelse reference.name.table, .scope = physicalScope(table, reference.name, reference.alias != null), .type = column.type, .element_type = column.element_type, .numeric_modifier = column.numeric_modifier, .nullable = column.nullable };
+                    out.* = .{ .name = try self.alloc.dupe(u8, column.name), .internal = try self.internal(), .qualifier = reference.alias orelse reference.name.table, .scope = physicalScope(table, reference.name, reference.alias != null), .type = column.type, .element_type = column.element_type, .numeric_modifier = column.numeric_modifier, .temporal_kind = column.temporal_kind, .nullable = column.nullable };
                     source_name.* = column.name;
                     field_name.* = column.path;
                     if (self.capture_dependencies) try self.dependency_origins.put(self.alloc, out.internal, .{ .table_id = table.id, .column = column, .ordinal = @intCast(position), .virtual = false });
@@ -1734,7 +1762,7 @@ const Builder = struct {
                     columns[table.columns.len + virtual_count + i] = .{ .name = name, .internal = try self.internal(), .qualifier = reference.alias orelse reference.name.table, .type = if (i == 2) .json else .string, .nullable = i == 2, .visible = false };
                     source_columns[table.columns.len + virtual_count + i] = name;
                 }
-                if (self.shape_only) for (columns) |column| try self.shape_columns.append(self.alloc, .{ .name = column.internal, .type = column.type, .element_type = column.element_type, .numeric_modifier = column.numeric_modifier, .nullable = column.nullable });
+                if (self.shape_only) for (columns) |column| try self.shape_columns.append(self.alloc, .{ .name = column.internal, .type = column.type, .element_type = column.element_type, .numeric_modifier = column.numeric_modifier, .temporal_kind = column.temporal_kind, .nullable = column.nullable });
                 if (reference.prepared_rows) {
                     if (reference.mutation_target or reference.mutation_document or reference.mutation_presence) return error.InvalidSqlBackendResponse;
                     break :blk try self.node(columns, .{ .prepared_rows = source_columns });
@@ -1889,7 +1917,7 @@ const Builder = struct {
         for (names, merged, columns[0..names.len], projections[0..names.len]) |name, expression_, *column, *projection| {
             const symbolic = if (self.shape_only) try self.inferenceExpression(expression_, source.columns) else expression_;
             const output = try scalar.inferOutputWithInvocation(self.alloc, symbolic, if (self.shape_only) self.shape_columns.items else types, self.parameters, self.backend.parameter_invocation);
-            column.* = .{ .name = name, .internal = try self.internal(), .qualifier = alias orelse "", .type = output.kind orelse .string, .element_type = output.element_type, .numeric_modifier = output.numeric_modifier, .nullable = true, .origin = if (self.shape_only) symbolic else null };
+            column.* = .{ .name = name, .internal = try self.internal(), .qualifier = alias orelse "", .type = output.kind orelse .string, .element_type = output.element_type, .numeric_modifier = output.numeric_modifier, .temporal_kind = output.temporal_kind, .nullable = true, .origin = if (self.shape_only) symbolic else null };
             projection.* = .{ .expression = expression_, .alias = column.internal };
         }
         for (source.columns, columns[names.len..], projections[names.len..]) |input, *column, *projection| {
@@ -1944,13 +1972,13 @@ const Builder = struct {
             // element type. Unlike UNION/VALUES, it does not promote int2[]
             // to int8[] or float[] merely because their cells are numeric.
             if (common.kind == .array and right_column.type == .array and !right_column.untyped_null and common.element_type != right_column.element_type) return error.SqlUndefinedOperator;
-            mergeInferredType(&common, if (right_column.untyped_null) .{} else .{ .kind = right_column.type, .element_type = right_column.element_type, .numeric_modifier = right_column.numeric_modifier, .nullable = right_column.nullable }, false) catch |err| return switch (err) {
+            mergeInferredType(&common, if (right_column.untyped_null) .{} else .{ .kind = right_column.type, .element_type = right_column.element_type, .numeric_modifier = right_column.numeric_modifier, .temporal_kind = right_column.temporal_kind, .nullable = right_column.nullable }, false) catch |err| return switch (err) {
                 error.SqlTypeMismatch, error.SqlCannotCoerce => error.SqlUndefinedOperator,
                 else => err,
             };
             common = resolveUnknown(common);
-            const l = try self.scalarNode(.{ .cast = .{ .operand = left_expression, .type = common.kind.?, .element_type = common.element_type, .numeric_modifier = common.numeric_modifier } });
-            const r = try self.scalarNode(.{ .cast = .{ .operand = right_expression, .type = common.kind.?, .element_type = common.element_type, .numeric_modifier = common.numeric_modifier } });
+            const l = try self.scalarNode(.{ .cast = .{ .operand = left_expression, .type = common.kind.?, .element_type = common.element_type, .numeric_modifier = common.numeric_modifier, .temporal_kind = common.temporal_kind } });
+            const r = try self.scalarNode(.{ .cast = .{ .operand = right_expression, .type = common.kind.?, .element_type = common.element_type, .numeric_modifier = common.numeric_modifier, .temporal_kind = common.temporal_kind } });
             left_programs[index] = try scalar.bindWithSettings(self.alloc, l, left_types, self.parameters, .{ .invocation = self.backend.parameter_invocation }, self.backend.settings_view);
             right_programs[index] = try scalar.bindWithSettings(self.alloc, r, right_types, self.parameters, .{ .invocation = self.backend.parameter_invocation }, self.backend.settings_view);
         }
@@ -2183,8 +2211,15 @@ fn projectScans(builder: *Builder, node: *const Node, needed: *std.StringHashMap
         .scan => |scan| {
             var fields: std.ArrayList([]const u8) = .empty;
             const request = &builder.scans.items[scan.index];
-            for (node.columns, scan.source_columns) |column, name| {
-                if (!needed.contains(column.internal) or std.mem.eql(u8, name, "_id") or @import("joined_mutation.zig").isMetadata(name)) continue;
+            const demanded = scan.demanded orelse blk: {
+                const mask = try builder.alloc.alloc(bool, node.columns.len);
+                @memset(mask, false);
+                @constCast(node).operation.scan.demanded = mask;
+                break :blk mask;
+            };
+            for (node.columns, scan.source_columns, demanded) |column, name, *required| {
+                required.* = required.* or needed.contains(column.internal);
+                if (!required.* or std.mem.eql(u8, name, "_id") or @import("joined_mutation.zig").isMetadata(name)) continue;
                 try fields.append(builder.alloc, (try request.table.column(name)).path);
             }
             request.request.fields = try fields.toOwnedSlice(builder.alloc);
@@ -2375,6 +2410,14 @@ pub fn projectionColumns(alloc: Allocator, backend: catalog.Backend, statement: 
     return (try shape.querySource(statement, &.{}, 0)).columns;
 }
 
+test "SQL missing qualified relations differ from unknown fields and internal metadata" {
+    const columns = [_]Column{.{ .name = "id", .internal = "$id", .qualifier = "known", .type = .string, .nullable = true }};
+    var builder: Builder = .{ .alloc = std.testing.allocator, .backend = undefined, .parameters = &.{} };
+    try std.testing.expectError(error.UndefinedTable, builder.resolveField(&columns, "missing\x00id"));
+    try std.testing.expectError(error.UndefinedColumn, builder.resolveField(&columns, "known\x00missing"));
+    try std.testing.expectError(error.UndefinedColumn, builder.resolveField(&columns, "\x00metadata"));
+}
+
 /// Normalize one expression against an already-bound relation. Mutation arms
 /// use the same qualified-name and ambiguity rules as SELECT, then bind typed
 /// programs against the projected internal column ordinals.
@@ -2390,7 +2433,7 @@ pub fn normalizeTargetProjection(alloc: Allocator, backend: catalog.Backend, tab
     var builder: Builder = .{ .alloc = alloc, .backend = backend, .parameters = &.{} };
     const virtual_columns = table.virtualColumns();
     const columns = try alloc.alloc(Column, table.columns.len + virtual_columns.len);
-    for (table.columns, columns[0..table.columns.len]) |column, *out| out.* = .{ .name = column.name, .internal = column.name, .qualifier = name.table, .scope = physicalScope(table, name, aliased), .type = column.type, .element_type = column.element_type, .numeric_modifier = column.numeric_modifier, .nullable = column.nullable };
+    for (table.columns, columns[0..table.columns.len]) |column, *out| out.* = .{ .name = column.name, .internal = column.name, .qualifier = name.table, .scope = physicalScope(table, name, aliased), .type = column.type, .element_type = column.element_type, .numeric_modifier = column.numeric_modifier, .temporal_kind = column.temporal_kind, .nullable = column.nullable };
     for (virtual_columns, columns[table.columns.len..]) |column, *out| out.* = .{ .name = column.name, .internal = column.name, .qualifier = name.table, .scope = physicalScope(table, name, aliased), .type = column.type, .element_type = column.element_type, .nullable = column.nullable, .visible = false };
     const source: Node = .{ .columns = columns, .operation = .singleton };
     return (try builder.lower(&source, .{ .table = name, .columns = projections })).columns;

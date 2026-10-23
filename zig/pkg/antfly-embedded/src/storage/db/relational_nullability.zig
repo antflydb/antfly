@@ -57,26 +57,17 @@ pub const Plan = struct {
         var seen: std.StringHashMapUnmanaged(void) = .empty;
         defer seen.deinit(alloc);
         try seen.ensureTotalCapacity(alloc, @intCast(fields.len));
-        var name_bytes: usize = 0;
-        var hash = std.crypto.hash.Blake3.init(.{});
-        hash.update("antfly/nullability-projection/v1");
+        var hash = @import("relational_schema_owner_contract.zig").ProjectionHasher.init();
         for (fields, names) |field, *name| {
             try context.ensureActive();
-            name_bytes = std.math.add(usize, name_bytes, field.len) catch return error.InvalidNullabilityProjection;
-            if (field.len == 0 or name_bytes > 1024 * 1024 or std.mem.indexOfScalar(u8, field, 0) != null or seen.contains(field))
-                return error.InvalidNullabilityProjection;
+            try hash.add(field);
+            if (seen.contains(field)) return error.InvalidNullabilityProjection;
             if (layout.ordinalForName(table.relational_columns, field) == null) return error.RelationalIndexColumnNotFound;
             name.* = try alloc.dupe(u8, field);
             initialized += 1;
             seen.putAssumeCapacityNoClobber(name.*, {});
-            var length: [8]u8 = undefined;
-            std.mem.writeInt(u64, &length, name.*.len, .little);
-            hash.update(&length);
-            hash.update(name.*);
         }
-        var identity: [32]u8 = undefined;
-        hash.final(&identity);
-        return .{ .alloc = alloc, .names = names, .identity = identity };
+        return .{ .alloc = alloc, .names = names, .identity = try hash.finish() };
     }
 
     pub fn deinit(self: *Plan) void {

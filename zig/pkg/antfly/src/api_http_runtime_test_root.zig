@@ -19,6 +19,7 @@
 
 const http_server = @import("api/http_server.zig");
 test {
+    _ = @import("api/relational_expression_contract.zig");
     _ = @import("api/row_policy_publication_coordinator.zig");
     _ = @import("api/retained_read_rpc.zig");
     _ = @import("antfly_local_sources").api_batch;
@@ -85,6 +86,15 @@ test "system catalog routing and transport discovery" {
     _ = @import("api/table_catalog.zig");
     _ = @import("api/distributed_candidate_source.zig");
     _ = @import("api/distributed_entity_sink.zig");
+}
+
+test "system catalog schema validation submission discovery" {
+    _ = @import("api/schema_validation_recovery.zig");
+    _ = @import("api/schema_validation_admission.zig");
+    _ = @import("metadata/http_client.zig");
+    _ = @import("metadata/http_server.zig");
+    _ = @import("system_catalog/operations.zig");
+    _ = @import("system_catalog/server_call.zig");
 }
 
 /// Server fixtures retain this compilation root's source and type identity.

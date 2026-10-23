@@ -56,6 +56,7 @@ const transaction_recovery_source = @import("transaction_recovery_source.zig");
 const common_config = @import("antfly_local_sources").common_config;
 const native_index_control = @import("antfly_local_sources").storage_db_relational_index_owner_control;
 const raft_index_control = @import("antfly_local_sources").storage_db_relational_index_raft_contract;
+const snapshot_retention = @import("../raft/storage/snapshot_retention_source.zig");
 const index_owner_job = @import("antfly_local_sources").storage_db_relational_index_owner_job;
 const scraping = @import("antfly_scraping");
 
@@ -99,7 +100,13 @@ test "native index owner adapter rejects cancellation deadline and foreign group
         try std.testing.expectError(expected, source.raftIndexOwnerPreparationAtRoot(std.testing.allocator, 7, "rows", undefined, "manifest", context));
         try std.testing.expectError(expected, source.nativeIndexOwnerState(std.testing.allocator, 7, "rows", identity, context));
         try std.testing.expectError(expected, source.nativeSchemaOwnerObservationAtRoot(7, "rows", undefined, context));
+        try std.testing.expectError(expected, source.attestSchemaPreparationAtRoot(7, "rows", undefined, undefined, undefined, undefined, context));
+        try std.testing.expectError(expected, source.captureSchemaPreparationAtRoot(std.testing.failing_allocator, 7, "rows", undefined, "", "", &.{}, undefined, undefined, context));
         try std.testing.expectError(expected, source.attestNativeSchemaOwnerAtRoot(7, "rows", undefined, undefined, undefined, context));
+        try std.testing.expectError(expected, source.raftSchemaOwnerObservationAtRoot(7, "rows", undefined, context));
+        try std.testing.expectError(expected, source.stepSchemaOwnerAuditAtRoot(7, "rows", undefined, "", undefined, .{}, context));
+        try std.testing.expectError(expected, source.attestRaftSchemaOwnerAtRoot(7, "rows", undefined, undefined, undefined, context));
+        try std.testing.expectError(expected, source.applyNativeSchemaOwnerControlAtRoot(7, "rows", undefined, 1, std.time.ns_per_s, undefined, context));
         try std.testing.expectError(expected, source.readNativeIndexClaimSourceAtRoot(std.testing.allocator, 7, "rows", identity, context));
         try std.testing.expectError(expected, source.nativeIndexOwnerReceipt(std.testing.allocator, 7, "rows", .{ .identity = identity, .effect = .fenced }, context));
         try std.testing.expectError(expected, source.nativeIndexOwnerReceiptAtRoot(std.testing.allocator, 7, "rows", .{ .identity = identity, .effect = .fenced }, context));
@@ -366,6 +373,10 @@ pub const ProvisionedKernelOwnerSource = struct {
     apply_control_pending: std.ArrayListUnmanaged(*ApplyOpen) = .empty,
     apply_control_active: ?*ApplyOpen = null,
     apply_control_stopping: bool = false,
+    schema_entry_store: ?*@import("../storage/data_raft_apply_client.zig").RaftApplyStore = null,
+    schema_snapshot_retention: ?snapshot_retention.Source = null,
+    schema_apply: @import("../data/schema_apply_queue.zig").Queue(PreparedRaftSchemaControl) = .{},
+    schema_control_shutdown: std.atomic.Value(bool) = .init(false),
     apply_ready_wake: ?ApplyReadyWake = null,
     apply_ready_wake_inflight: usize = 0,
     test_apply_control_hooks: ?ApplyControlTestHooks = null,
@@ -621,6 +632,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         // Apply admission never grows the queue under the Raft mutex.
         try self.apply_control_pending.ensureTotalCapacity(self.alloc, apply_control_max_pending);
         self.apply_control_io = io;
+        self.schema_control_shutdown.store(false, .release);
         errdefer self.apply_control_io = null;
         self.apply_control_future = try io.concurrent(applyControlMain, .{self});
         self.apply_control_started.store(true, .release);
@@ -641,6 +653,7 @@ pub const ProvisionedKernelOwnerSource = struct {
     /// sharing one cooperative scheduler must wake all owners before driving
     /// their tasks to completion and reclaiming the sources.
     pub fn beginApplyControlShutdown(self: *ProvisionedKernelOwnerSource) void {
+        self.schema_control_shutdown.store(true, .release);
         lock(&self.mutex);
         self.apply_control_stopping = true;
         self.apply_control_started.store(false, .release);
@@ -654,6 +667,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         const io = self.apply_control_io;
         if (self.apply_control_future) |*future| future.await(io.?);
         self.apply_control_future = null;
+        self.schema_apply.deinit();
         // Keep the borrowed Io value stable until source destruction: an
         // apply-only release that observed started=true before shutdown may
         // still load it while stop waits for attached apply work to drain.
@@ -665,7 +679,13 @@ pub const ProvisionedKernelOwnerSource = struct {
 
     fn applyControlMain(self: *ProvisionedKernelOwnerSource) void {
         const io = self.apply_control_io.?;
+        var schema_host: SchemaApplyHost = .{ .source = self };
+        var schema_turn = true;
         while (true) {
+            if (schema_turn) {
+                schema_turn = false;
+                if (self.schema_apply.step(&schema_host, platform_time.monotonicNs()) == .worked) continue;
+            }
             lock(&self.mutex);
             self.apply_control_wake.reset();
             self.reconcileApplyReleasesLocked();
@@ -688,9 +708,17 @@ pub const ProvisionedKernelOwnerSource = struct {
             self.apply_control_active = pending;
             self.mutex.unlock();
             const request = pending orelse {
-                self.apply_control_wake.wait(io) catch {};
+                switch (self.schema_apply.step(&schema_host, platform_time.monotonicNs())) {
+                    .worked => continue,
+                    .pending => self.apply_control_wake.waitTimeout(io, .{ .duration = .{
+                        .raw = .fromNanoseconds(@intCast(self.schema_apply.retryDelayNs(platform_time.monotonicNs()))),
+                        .clock = .awake,
+                    } }) catch {},
+                    .idle => self.apply_control_wake.wait(io) catch {},
+                }
                 continue;
             };
+            schema_turn = true;
             if (@import("builtin").is_test) if (self.test_apply_control_hooks) |hooks| {
                 if (hooks.before_open) |before_open| before_open(hooks.ptr);
             };
@@ -944,6 +972,7 @@ pub const ProvisionedKernelOwnerSource = struct {
     pub fn writeSource(self: *ProvisionedKernelOwnerSource) table_write_source.TableWriteSource {
         return .{
             .ptr = self,
+            .prepares_rows_atomically = true,
             .vtable = &.{
                 .batch = unsupportedTopLevelBatch,
                 .batch_group_local = batchGroupLocal,
@@ -1000,7 +1029,13 @@ pub const ProvisionedKernelOwnerSource = struct {
         defer self.alloc.free(table_name);
         const lease = try self.alloc.create(Lease);
         errdefer self.alloc.destroy(lease);
-        lease.* = try self.acquire(group_id, table_name);
+        // Snapshot the persisted native catalog at this committed cut; an
+        // active schema fence may deliberately precede metadata publication.
+        lease.* = try self.acquireWithControls(group_id, table_name, .{
+            .allow_deferred_catalog = true,
+            .historical_raft_apply = self.online_source_authority == .raft,
+            .durable_catalog = self.online_source_authority == .raft,
+        });
         errdefer lease.deinit();
         var capture = try lease.owner().captureNativeRaftSnapshot(group_id, applied_index);
         errdefer capture.deinit();
@@ -1412,6 +1447,10 @@ pub const ProvisionedKernelOwnerSource = struct {
         try request.cancellation.check();
         const publication = try self.registerPublication(request.group_id, request.table_name);
         errdefer endPublication(ptr, publication);
+        // Admission is closed before invalidating work. Every physical-root
+        // publisher (restore as well as Raft snapshots) must drain schema
+        // tickets through the same control worker, not wait on their pins.
+        self.discardSchemaApplyForRootReplacement(request.group_id);
         const deadline = std.Io.Clock.awake.now(request.io).nanoseconds + request.drain_timeout_ns;
         while (true) {
             try request.cancellation.check();
@@ -2272,7 +2311,17 @@ pub const ProvisionedKernelOwnerSource = struct {
             target_index_name,
             advance_index_repair,
             true,
+            null,
         );
+    }
+
+    /// A terminal schema owner cannot acknowledge public serving readiness
+    /// while its registry still carries a fence-deferred catalog. Reuse the
+    /// full catalog reconciler under this control turn's deadline, retaining
+    /// the ready owner rather than waiting for an unrelated index repair.
+    pub fn reconcileServingCatalogAtRoot(self: *ProvisionedKernelOwnerSource, group: u64, table: []const u8, context: request_operation.RequestContext) !abi.ReconcileResult {
+        try context.ensureActive();
+        return self.reconcileTableGroupStepWithRetention(group, table, null, false, true, context);
     }
 
     fn reconcileTableGroupStepWithRetention(
@@ -2282,10 +2331,18 @@ pub const ProvisionedKernelOwnerSource = struct {
         target_index_name: ?[]const u8,
         advance_index_repair: bool,
         retain_cold_owner: bool,
+        context: ?request_operation.RequestContext,
     ) !abi.ReconcileResult {
         var descriptor = try self.loadDescriptor(self.alloc, group_id, table_name);
         defer descriptor.deinit(self.alloc);
-        var lease = (try self.acquireDescriptorForReconcile(
+        var lease = if (context) |request| control: {
+            const normalized = try platformDeadlineContext(request);
+            break :control try self.acquireDescriptorWithMode(group_id, table_name, descriptor.path, descriptor.view(), true, .resident, .{
+                .allow_deferred_catalog = true,
+                .execution_deadline_ns = normalized.deadline_ns,
+                .cancellation = normalized.cancellation,
+            });
+        } else (try self.acquireDescriptorForReconcile(
             group_id,
             table_name,
             descriptor.path,
@@ -2380,6 +2437,7 @@ pub const ProvisionedKernelOwnerSource = struct {
             target_index_name,
             advance_index_repair,
             false,
+            null,
         );
         return localStructuralReconcileResult(result);
     }
@@ -3100,6 +3158,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         execution_io: ?@import("antfly_runtime_abi").io_abi.Borrow = null,
         cancellation: ?db_types.CancellationToken = null,
         historical_raft_apply: bool = false,
+        durable_catalog: bool = false,
         allow_deferred_catalog: bool = false,
 
         fn from(req: anytype) ReadControls {
@@ -3144,7 +3203,17 @@ pub const ProvisionedKernelOwnerSource = struct {
         var descriptor = try self.loadDescriptorWithBudget(self.alloc, group_id, table_name, controls.catalogBudget(self.catalog));
         defer descriptor.deinit(self.alloc);
         try controls.check();
-        return self.acquireDescriptorWithMode(group_id, table_name, descriptor.path, descriptor.view(), false, .resident, controls);
+        var view = descriptor.view();
+        if (controls.durable_catalog) {
+            // Routing still supplies namespace, restore admission and local
+            // generation. Persisted schema/index/runtime settings own the cut;
+            // never reconcile a prospective metadata schema while observing it.
+            view.schema_json = "";
+            view.indexes_json = "";
+            view.table_storage = null;
+            view.initial_range = null;
+        }
+        return self.acquireDescriptorWithMode(group_id, table_name, descriptor.path, view, false, .resident, controls);
     }
 
     fn transactionRecoveryStatus(err: anyerror) abi.Status {
@@ -3699,8 +3768,199 @@ pub const ProvisionedKernelOwnerSource = struct {
         return lease;
     }
 
+    /// Observe an existing schema owner without reconciling metadata over its
+    /// live validation fence. Ordinary table/index provisioning keeps its
+    /// explicit descriptor; these private schema operations require a real root.
+    fn acquireSchemaBoundOwner(
+        self: *ProvisionedKernelOwnerSource,
+        group_id: u64,
+        table_name: []const u8,
+        namespace: @import("antfly_local_sources").storage_db_doc_identity.Namespace,
+        context: request_operation.RequestContext,
+    ) !Lease {
+        if (self.online_source_authority != .raft) return self.acquireBoundOwner(group_id, table_name, namespace, context);
+        try context.ensureActive();
+        const normalized = try platformDeadlineContext(context);
+        var lease = self.acquireWithControls(group_id, table_name, .{
+            .allow_deferred_catalog = true,
+            .historical_raft_apply = true,
+            .durable_catalog = true,
+            .execution_deadline_ns = normalized.deadline_ns,
+            .cancellation = normalized.cancellation,
+        }) catch |err| switch (err) {
+            // A present physical directory without its committed table
+            // catalog is no more authoritative than a missing directory.
+            error.FileNotFound, error.NotFound => return error.SchemaValidationRuntimeRecoveryRequired,
+            else => return err,
+        };
+        errdefer lease.deinit();
+        if (lease.entry.identity.table_id != namespace.table_id or
+            lease.entry.identity.shard_id != namespace.shard_id or
+            lease.entry.identity.range_id != namespace.range_id) return error.IdentityNamespaceMismatch;
+        try context.ensureActive();
+        return lease;
+    }
+
     const SchemaAttestation = @import("../metadata/schema_validation_attestation.zig");
     pub const RootedNativeSchemaOwnerObservation = SchemaAttestation.RootedObservation;
+
+    pub const SchemaPreparationSigner = struct {
+        identity: @import("../metadata/store_root_enrollment.zig").Identity,
+        reporter_incarnation: u64,
+        authority: @import("../metadata/store_root_attestation.zig").Authority,
+    };
+
+    /// Candidate compilation, actual physical cut and signature share one
+    /// applying lease. The trusted receiver obtains signer enrollment/authority
+    /// independently from metadata; this method grants neither admission nor
+    /// replacement-root adoption. Metadata repeats that check on durable begin.
+    pub fn attestSchemaPreparationAtRoot(self: *ProvisionedKernelOwnerSource, group_id: u64, table_name: []const u8, descriptor: @import("antfly_local_sources").storage_db_relational_schema_owner_contract.PreparationDescriptor, inputs: []const u8, signer: SchemaPreparationSigner, root: @import("antfly_local_sources").storage_db_root_signing_identity.State, context: request_operation.RequestContext) !SchemaAttestation.SignedPreparation {
+        try context.ensureActive();
+        try descriptor.validate();
+        try signer.identity.validate();
+        if (descriptor.fence.owner_group_id != group_id or (descriptor.authority == .native) != (signer.authority == .native) or signer.reporter_incarnation == 0)
+            return error.SchemaValidationJobChanged;
+        if (signer.authority == .native) {
+            const binding: @import("../metadata/standalone_native_owner.zig").Binding = .{
+                .metadata_incarnation = signer.identity.metadata_incarnation,
+                .node_id = signer.identity.node_id,
+                .store_id = signer.identity.store_id,
+                .root_incarnation = signer.identity.root_incarnation,
+            };
+            if (!std.mem.eql(u8, &try binding.digest(), &signer.authority.native)) return error.SchemaValidationJobChanged;
+        }
+        var lease = try self.acquireSchemaBoundOwner(group_id, table_name, descriptor.fence.namespace, context);
+        defer lease.deinit();
+        return attestSchemaPreparationAtLease(&lease, table_name, descriptor, inputs, signer, root, context);
+    }
+
+    fn attestSchemaPreparationAtLease(lease: *Lease, table_name: []const u8, descriptor: @import("antfly_local_sources").storage_db_relational_schema_owner_contract.PreparationDescriptor, inputs: []const u8, signer: SchemaPreparationSigner, root: @import("antfly_local_sources").storage_db_root_signing_identity.State, context: request_operation.RequestContext) !SchemaAttestation.SignedPreparation {
+        const normalized = try platformDeadlineContext(context);
+        var cancellation = normalized.cancellation;
+        const observed = try lease.owner().schemaOwnerPreparation(table_name, descriptor, inputs, .{
+            .execution_deadline_ns = normalized.deadline_ns,
+            .cancellation_ctx = &cancellation,
+            .cancellation_fn = cancellationTokenRequested,
+        });
+        const generation = @import("antfly_local_sources").storage_db_root_signing_identity.attestedRootGeneration(lease.entry.generation) catch return error.SchemaValidationRuntimeRecoveryRequired;
+        try context.ensureActive();
+        const signed = try SchemaAttestation.SignedPreparation.sign(observed, signer.identity, signer.reporter_incarnation, signer.authority, generation, root);
+        try context.ensureActive();
+        return signed;
+    }
+
+    pub const SchemaPreparationIntent = struct {
+        id: [16]u8,
+        provisional_plan: [32]u8,
+        transition_id: u64,
+        namespace: @import("antfly_local_sources").storage_db_doc_identity_namespace.Namespace,
+    };
+
+    pub const CapturedSchemaPreparation = struct {
+        alloc: std.mem.Allocator,
+        inputs: []u8,
+        signed: SchemaAttestation.SignedPreparation,
+
+        pub fn deinit(self: *@This()) void {
+            self.alloc.free(self.inputs);
+            self.* = undefined;
+        }
+    };
+
+    /// Read-only pre-admission capture. The physical catalog and topology come
+    /// from this exact owner lease, never the coordinator's compiled guesses.
+    /// Native preparation independently rechecks the resulting ASVI against a
+    /// retained cut before signing. A concurrent catalog change rejects before
+    /// admission; it cannot silently produce a different candidate or fence.
+    pub fn captureSchemaPreparationAtRoot(self: *ProvisionedKernelOwnerSource, a: std.mem.Allocator, group_id: u64, table_name: []const u8, intent: SchemaPreparationIntent, before_json: []const u8, after_json: []const u8, columns: []const []const u8, signer: SchemaPreparationSigner, root: @import("antfly_local_sources").storage_db_root_signing_identity.State, context: request_operation.RequestContext) !CapturedSchemaPreparation {
+        const local = @import("antfly_local_sources");
+        const contract = local.storage_db_relational_schema_owner_contract;
+        try context.ensureActive();
+        try signer.identity.validate();
+        if (intent.transition_id == 0 or std.mem.allEqual(u8, &intent.id, 0) or std.mem.allEqual(u8, &intent.provisional_plan, 0) or
+            before_json.len == 0 or before_json.len > contract.max_schema or after_json.len == 0 or after_json.len > contract.max_schema or signer.reporter_incarnation == 0) return error.InvalidSchemaValidationJob;
+        if (signer.authority == .native) {
+            const binding: @import("../metadata/standalone_native_owner.zig").Binding = .{ .metadata_incarnation = signer.identity.metadata_incarnation, .node_id = signer.identity.node_id, .store_id = signer.identity.store_id, .root_incarnation = signer.identity.root_incarnation };
+            if (!std.mem.eql(u8, &try binding.digest(), &signer.authority.native)) return error.SchemaValidationJobChanged;
+        }
+        var projection = contract.ProjectionHasher.init();
+        for (columns) |column| try projection.add(column);
+        _ = try projection.finish();
+        const column_bytes = try std.json.Stringify.valueAlloc(a, columns, .{});
+        defer a.free(column_bytes);
+        if (column_bytes.len > contract.max_names) return error.InvalidNullabilityProjection;
+        var lease = try self.acquireSchemaBoundOwner(group_id, table_name, intent.namespace, context);
+        defer lease.deinit();
+        const normalized = try platformDeadlineContext(context);
+        const identity_request = try table_reads.encodeStorageKernelLookupRequest(a, "", .{ .relational_topology_json = "{\"mode\":\"identity\"}", .execution_deadline_ns = normalized.deadline_ns, .cancellation = normalized.cancellation });
+        defer a.free(identity_request);
+        var identity_bytes = try lease.owner().lookupJson(table_name, identity_request);
+        defer identity_bytes.deinit();
+        if (identity_bytes.bytes().len == 0 or identity_bytes.bytes().len > 8192) return error.InvalidBoundaryFailureIdentity;
+        var identity = try std.json.parseFromSlice(local.storage_db_relational_integrity_topology_contract.Identity, a, identity_bytes.bytes(), .{ .ignore_unknown_fields = false });
+        defer identity.deinit();
+        if (!identity.value.namespace.eql(intent.namespace) or identity.value.next_epoch == 0) return error.IdentityNamespaceMismatch;
+        const catalog_request = try table_reads.encodeStorageKernelLookupRequest(a, "", .{ .relational_integrity_catalog = true, .execution_deadline_ns = normalized.deadline_ns, .cancellation = normalized.cancellation });
+        defer a.free(catalog_request);
+        var catalog_bytes = try lease.owner().lookupJson(table_name, catalog_request);
+        defer catalog_bytes.deinit();
+        const max_catalog = local.storage_db_relational_integrity_catalog.max_catalog_bytes;
+        if (catalog_bytes.bytes().len == 0 or catalog_bytes.bytes().len > std.base64.standard.Encoder.calcSize(max_catalog) + 1024) return error.InvalidBoundaryFailureIdentity;
+        // Reuse the existing owner read contract locally. Only raw ASVI leaves
+        // this adapter; the existing catalog JSON/base64 wrapper does not cross
+        // the preparation transport or enter the durable metadata command.
+        const Catalog = struct { catalog: []const u8, schema_version: u32, table_id: []const u8 };
+        var catalog = try std.json.parseFromSlice(Catalog, a, catalog_bytes.bytes(), .{ .ignore_unknown_fields = false });
+        defer catalog.deinit();
+        var table_id: [20]u8 = undefined;
+        if (!std.mem.eql(u8, catalog.value.table_id, try std.fmt.bufPrint(&table_id, "{d}", .{intent.namespace.table_id}))) return error.IdentityNamespaceMismatch;
+        const length = std.base64.standard.Decoder.calcSizeForSlice(catalog.value.catalog) catch return error.InvalidBoundaryFailureIdentity;
+        if (length == 0 or length > max_catalog) return error.InvalidBoundaryFailureIdentity;
+        const physical = try a.alloc(u8, length);
+        defer a.free(physical);
+        std.base64.standard.Decoder.decode(physical, catalog.value.catalog) catch return error.InvalidBoundaryFailureIdentity;
+        if (!std.mem.eql(u8, &contract.hash(physical), &identity.value.catalog_digest)) return error.IntegrityCatalogChanged;
+        const inputs = try contract.encodeInputs(a, .{ before_json, after_json, physical, column_bytes });
+        errdefer a.free(inputs);
+        const descriptor: contract.PreparationDescriptor = .{ .id = intent.id, .provisional_plan = intent.provisional_plan, .authority = if (signer.authority == .native) .native else .raft, .fence = .{ .role = .schema_validation, .transition_id = intent.transition_id, .attempt = 1, .admission_epoch = identity.value.next_epoch, .owner_group_id = group_id, .peer_group_id = group_id, .namespace = intent.namespace, .catalog_digest = identity.value.catalog_digest } };
+        try descriptor.validate();
+        const signed = try attestSchemaPreparationAtLease(&lease, table_name, descriptor, inputs, signer, root, context);
+        return .{ .alloc = a, .inputs = inputs, .signed = signed };
+    }
+
+    /// Zero-progress root recovery uses real native candidate preparation plus
+    /// an independently completed shared Raft prefix. No job header, data-entry
+    /// index or row-audit evidence is invented for a pre-begin replica.
+    pub fn attestSchemaBootstrapAtRoot(self: *ProvisionedKernelOwnerSource, group_id: u64, table_name: []const u8, descriptor: @import("antfly_local_sources").storage_db_relational_schema_owner_contract.PreparationDescriptor, inputs: []const u8, expected: SchemaAttestation.RaftScope, root: @import("antfly_local_sources").storage_db_root_signing_identity.State, context: request_operation.RequestContext) !@import("../metadata/schema_validation_bootstrap.zig").CertifiedPreparation {
+        try context.ensureActive();
+        try expected.validate();
+        if (descriptor.authority != .raft or expected.group_id != group_id) return error.SchemaValidationJobChanged;
+        var lease = try self.acquireSchemaBoundOwner(group_id, table_name, descriptor.fence.namespace, context);
+        defer lease.deinit();
+        const prepared = try self.attestSchemaPreparationAtRoot(group_id, table_name, descriptor, inputs, .{
+            .identity = expected.identity,
+            .reporter_incarnation = expected.reporter_incarnation,
+            .authority = .{ .raft = expected.replica_id },
+        }, root, context);
+        try expected.requireBinding(prepared.value.binding);
+        if (prepared.value.physical_root_incarnation != expected.physical_root_incarnation or
+            prepared.proof.root_generation != expected.root_generation) return error.SchemaValidationRuntimeRecoveryRequired;
+        const certify = self.read_safety_barrier.vtable.certify_completed_prefix orelse return error.ReadSafetyBarrierUnavailable;
+        const normalized = try platformDeadlineContext(context);
+        const actual_index = if (prepared.value.position) |cut| blk: {
+            if (cut != .raft) return error.InvalidControlReceiptPosition;
+            break :blk cut.raft.index;
+        } else 0;
+        const completed = try certify(self.read_safety_barrier.ptr, group_id, expected.reported_term, @max(actual_index, expected.reported_applied_index), normalized.deadline_ns, normalized.cancellation);
+        lock(&self.mutex);
+        const retired = lease.entry.retired or lease.entry.closing;
+        self.mutex.unlock();
+        const visible = try @import("antfly_local_sources").storage_db_root_signing_identity.attestedRootGeneration(self.visibleRootGeneration(group_id));
+        if (retired or visible != expected.root_generation) return error.SchemaValidationRuntimeRecoveryRequired;
+        const signed = try @import("../metadata/schema_validation_bootstrap.zig").CertifiedPreparation.sign(prepared, completed, expected, root);
+        try context.ensureActive();
+        return signed;
+    }
 
     /// Facts and generation come from the same applying lease. The receiver
     /// still independently obtains metadata permission, enrollment and current
@@ -3709,7 +3969,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         try context.ensureActive();
         try binding.validate();
         if (binding.authority != .native or binding.fence.owner_group_id != group_id) return error.SchemaValidationJobChanged;
-        var lease = try self.acquireBoundOwner(group_id, table_name, binding.fence.namespace, context);
+        var lease = try self.acquireSchemaBoundOwner(group_id, table_name, binding.fence.namespace, context);
         defer lease.deinit();
         return observeSchemaAtLease(&lease, table_name, binding, context);
     }
@@ -3722,7 +3982,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         try context.ensureActive();
         try expected.requireBinding(binding);
         if (binding.fence.owner_group_id != group_id) return error.SchemaValidationJobChanged;
-        var lease = try self.acquireBoundOwner(group_id, table_name, binding.fence.namespace, context);
+        var lease = try self.acquireSchemaBoundOwner(group_id, table_name, binding.fence.namespace, context);
         defer lease.deinit();
         const observed = try observeSchemaAtLease(&lease, table_name, binding, context);
         try expected.require(observed);
@@ -3745,7 +4005,519 @@ pub const ProvisionedKernelOwnerSource = struct {
             .cancellation_fn = cancellationTokenRequested,
         });
         try context.ensureActive();
-        return .{ .root_generation = lease.entry.generation, .observation = result };
+        return .{ .root_generation = @import("antfly_local_sources").storage_db_root_signing_identity.attestedRootGeneration(lease.entry.generation) catch return error.SchemaValidationRuntimeRecoveryRequired, .observation = result };
+    }
+
+    pub const RootedNativeSchemaOwnerOutcome = struct {
+        root_generation: u64,
+        outcome: client.Owner.NativeSchemaOwnerOutcome,
+    };
+
+    pub const SchemaOwnerRoot = struct { root_generation: u64, physical_root_incarnation: u128 };
+
+    /// Native control worker only. The receiving service independently checks
+    /// metadata/root/cohort permission. Keep the same bound physical owner
+    /// across off-lock preparation, atomic apply and response construction.
+    pub fn applyNativeSchemaOwnerControlAtRoot(self: *ProvisionedKernelOwnerSource, group_id: u64, table_name: []const u8, command: @import("antfly_local_sources").storage_db_relational_schema_owner_contract.Command, records: u32, time_ns: u64, expected: SchemaOwnerRoot, context: request_operation.RequestContext) !RootedNativeSchemaOwnerOutcome {
+        try context.ensureActive();
+        try command.binding.validate();
+        if (command.binding.authority != .native or command.binding.fence.owner_group_id != group_id) return error.SchemaValidationJobChanged;
+        var lease = try self.acquireSchemaBoundOwner(group_id, table_name, command.binding.fence.namespace, context);
+        defer lease.deinit();
+        const generation = @import("antfly_local_sources").storage_db_root_signing_identity.attestedRootGeneration(lease.entry.generation) catch return error.SchemaValidationRuntimeRecoveryRequired;
+        const actual = try self.schemaStateAtLease(&lease, table_name, context);
+        if (expected.root_generation == 0 or expected.physical_root_incarnation == 0 or
+            generation != expected.root_generation or actual.state.physical_root_incarnation != expected.physical_root_incarnation)
+            return error.SchemaValidationRuntimeRecoveryRequired;
+        const normalized = try platformDeadlineContext(context);
+        var cancellation = normalized.cancellation;
+        const result = try lease.owner().nativeSchemaOwnerControl(table_name, command, records, time_ns, .{
+            .execution_deadline_ns = normalized.deadline_ns,
+            .cancellation_ctx = &cancellation,
+            .cancellation_fn = cancellationTokenRequested,
+        });
+        // No fallible post-commit deadline/cancellation check. A durable
+        // effect (including explicit pending mirror debt) remains observable.
+        return .{ .root_generation = generation, .outcome = result };
+    }
+
+    pub fn raftSchemaOwnerObservationAtRoot(self: *ProvisionedKernelOwnerSource, group_id: u64, table_name: []const u8, binding: @import("antfly_local_sources").storage_db_relational_schema_owner_contract.Binding, context: request_operation.RequestContext) !SchemaAttestation.RootedRaftObservation {
+        var session = try self.acquireRaftSchemaOwnerSession(group_id, table_name, binding, context);
+        defer session.deinit();
+        return session.initial;
+    }
+
+    /// A preparation/observation lease is not held across ordered apply: apply
+    /// may need to retire the resident descriptor. Reacquisition must prove
+    /// BOTH the serving generation and the physical root retained at admission.
+    /// Neither routing nor an equal schema digest authorizes root adoption.
+    pub const RootedSchemaOwnerAudit = struct {
+        root_generation: u64,
+        result: @import("antfly_local_sources").storage_db_relational_schema_root_contract.AuditResult,
+    };
+
+    pub const RootedSchemaOwnerState = struct {
+        root_generation: u64,
+        state: @import("antfly_local_sources").storage_db_relational_schema_owner_contract.OwnerState,
+    };
+
+    /// Private recovery discovery on the actual bound owner, including before
+    /// the caller knows a job binding. This is not metadata/execute authority.
+    pub fn schemaOwnerStateAtRoot(self: *ProvisionedKernelOwnerSource, group_id: u64, table_name: []const u8, context: request_operation.RequestContext) !RootedSchemaOwnerState {
+        try context.ensureActive();
+        const normalized = try platformDeadlineContext(context);
+        var lease = try self.acquireWithControls(group_id, table_name, .{ .allow_deferred_catalog = true, .historical_raft_apply = self.online_source_authority == .raft, .durable_catalog = self.online_source_authority == .raft, .execution_deadline_ns = normalized.deadline_ns, .cancellation = normalized.cancellation });
+        defer lease.deinit();
+        return self.schemaStateAtLease(&lease, table_name, context);
+    }
+
+    fn schemaStateAtLease(self: *ProvisionedKernelOwnerSource, lease: *Lease, table_name: []const u8, context: request_operation.RequestContext) !RootedSchemaOwnerState {
+        const normalized = try platformDeadlineContext(context);
+        const request = try table_reads.encodeStorageKernelLookupRequest(self.alloc, "", .{ .relational_topology_json = "{\"mode\":\"schema_owner\"}", .execution_deadline_ns = normalized.deadline_ns, .cancellation = normalized.cancellation });
+        defer self.alloc.free(request);
+        var response = try lease.owner().lookupJson(table_name, request);
+        defer response.deinit();
+        var parsed = try std.json.parseFromSlice(@import("antfly_local_sources").storage_db_relational_schema_owner_contract.OwnerState, self.alloc, response.bytes(), .{ .ignore_unknown_fields = false });
+        defer parsed.deinit();
+        const state = parsed.value;
+        if (state.physical_root_incarnation == 0 or state.namespace.table_id != lease.entry.identity.table_id or
+            state.namespace.shard_id != lease.entry.identity.shard_id or state.namespace.range_id != lease.entry.identity.range_id) return error.IdentityNamespaceMismatch;
+        if (state.header) |header| try header.validate();
+        try context.ensureActive();
+        return .{ .root_generation = try @import("antfly_local_sources").storage_db_root_signing_identity.attestedRootGeneration(lease.entry.generation), .state = state };
+    }
+
+    /// A single physical lease owns the generation and native bounded audit.
+    /// The checkpoint/signing directory comes from this provisioned source,
+    /// never from a coordinator request. Enrollment is checked independently.
+    pub fn stepSchemaOwnerAuditAtRoot(self: *ProvisionedKernelOwnerSource, group_id: u64, table_name: []const u8, binding: @import("antfly_local_sources").storage_db_relational_schema_owner_contract.Binding, inputs: []const u8, root: @import("antfly_local_sources").storage_db_root_signing_identity.State, budget: @import("antfly_local_sources").storage_db_relational_schema_root_contract.AuditBudget, context: request_operation.RequestContext) !RootedSchemaOwnerAudit {
+        try context.ensureActive();
+        try binding.validate();
+        try budget.validate();
+        if (binding.fence.owner_group_id != group_id) return error.SchemaValidationJobChanged;
+        var lease = try self.acquireSchemaBoundOwner(group_id, table_name, binding.fence.namespace, context);
+        defer lease.deinit();
+        const normalized = try platformDeadlineContext(context);
+        var cancellation = normalized.cancellation;
+        const result = try lease.owner().stepSchemaOwnerAudit(table_name, binding, inputs, .{ .dir = self.replica_root_dir, .incarnation = root.root_incarnation, .public_key = root.public_key }, budget, .{ .execution_deadline_ns = normalized.deadline_ns, .cancellation_ctx = &cancellation, .cancellation_fn = cancellationTokenRequested });
+        const generation = try @import("antfly_local_sources").storage_db_root_signing_identity.attestedRootGeneration(lease.entry.generation);
+        try context.ensureActive();
+        return .{ .root_generation = generation, .result = result };
+    }
+
+    pub const RaftSchemaOwnerSession = struct {
+        lease: Lease,
+        table_name: []const u8,
+        binding: @import("antfly_local_sources").storage_db_relational_schema_owner_contract.Binding,
+        context: request_operation.RequestContext,
+        initial: SchemaAttestation.RootedRaftObservation,
+
+        pub fn deinit(self: *@This()) void {
+            self.lease.deinit();
+            self.* = undefined;
+        }
+
+        pub fn releaseForApply(self: *@This()) void {
+            self.lease.deinit();
+        }
+
+        pub fn reacquireAfterApply(self: *@This()) !void {
+            std.debug.assert(!self.lease.active);
+            // Admission/cancellation may still bound the owner open. Once a
+            // committed effect is found, recoverCommitted reads it independently
+            // of the initiating request's cancellation, on this exact lease.
+            const source = self.lease.source;
+            try self.context.ensureActive();
+            var next = try source.acquireSchemaBoundOwner(self.binding.fence.owner_group_id, self.table_name, self.binding.fence.namespace, self.context);
+            errdefer next.deinit();
+            // Qualify physical identity BEFORE interpreting its domain/job.
+            // A replacement may not yet carry this job or source authority;
+            // neither absence nor a foreign phase can relabel it as our owner.
+            const actual = try source.schemaStateAtLease(&next, self.table_name, self.context);
+            if (actual.root_generation != self.initial.root_generation or
+                actual.state.physical_root_incarnation != self.initial.observation.physical_root_incarnation)
+                return error.SchemaValidationRuntimeRecoveryRequired;
+            _ = try observeRaftSchemaAtLease(&next, self.table_name, self.binding, self.context);
+            self.lease = next;
+        }
+
+        pub fn observe(self: *@This()) !SchemaAttestation.RootedRaftObservation {
+            return self.observeWithContext(self.context);
+        }
+
+        /// Read-only recovery after known commit. This never proposes a command
+        /// or adopts a root, and cannot suppress an existing effect merely because
+        /// its initiating request expired while ordered application completed.
+        pub fn recoverCommitted(self: *@This()) !SchemaAttestation.RootedRaftObservation {
+            return self.observeWithContext(.{});
+        }
+
+        /// Query-only producer preparation stays on this exact physical lease.
+        /// The returned bytes own their storage and grant no apply authority.
+        pub fn prepareProposal(self: *@This(), action: @import("antfly_local_sources").storage_db_relational_schema_owner_contract.Action, records: u32, time_ns: u64) !client.Owner.SchemaProposal {
+            try self.context.ensureActive();
+            std.debug.assert(self.lease.active);
+            const normalized = try platformDeadlineContext(self.context);
+            var cancellation = normalized.cancellation;
+            var proposal = try self.lease.owner().prepareSchemaProposal(self.table_name, self.binding, action, records, time_ns, .{
+                .execution_deadline_ns = normalized.deadline_ns,
+                .cancellation_ctx = &cancellation,
+                .cancellation_fn = cancellationTokenRequested,
+            });
+            errdefer proposal.deinit();
+            if (proposal.physical_root_incarnation != self.initial.observation.physical_root_incarnation or
+                try @import("antfly_local_sources").storage_db_root_signing_identity.attestedRootGeneration(proposal.root_generation) != self.initial.root_generation)
+                return error.SchemaValidationRuntimeRecoveryRequired;
+            return proposal;
+        }
+
+        /// Control-executor preparation for an actual committed entry, never a
+        /// client-supplied term/index. The ticket owns a separate lease, so the
+        /// caller can release this session without closing its prepared owner.
+        /// Parsing and destruction stay off the Raft progress lane. Borrow the
+        /// actual ASVR entry rather than re-encoding its potentially large ASVI
+        /// payload. The kernel owns its preparation before this call returns.
+        pub fn prepareCommitted(self: *@This(), bytes: []const u8, term: u64, index: u64) !PreparedRaftSchemaControl {
+            try self.context.ensureActive();
+            const command = try @import("antfly_local_sources").storage_db_relational_schema_owner_contract.Command.decodeRaft(bytes);
+            if (!std.meta.eql(command.binding, self.binding)) return error.SchemaValidationJobChanged;
+            const normalized = try platformDeadlineContext(self.context);
+            var cancellation = normalized.cancellation;
+            var lease = self.lease.cloneRead();
+            errdefer lease.deinit();
+            var prepared = try lease.owner().prepareRaftSchemaOwnerControl(self.table_name, bytes, term, index, .{
+                .execution_deadline_ns = normalized.deadline_ns,
+                .cancellation_ctx = &cancellation,
+                .cancellation_fn = cancellationTokenRequested,
+            });
+            errdefer prepared.deinit();
+            if (prepared.physical_root_incarnation != self.initial.observation.physical_root_incarnation or
+                try @import("antfly_local_sources").storage_db_root_signing_identity.attestedRootGeneration(prepared.root_generation) != self.initial.root_generation)
+                return error.SchemaValidationRuntimeRecoveryRequired;
+            return .{ .lease = lease, .prepared = prepared, .table_name = lease.entry.table_name, .binding = self.binding, .root_generation = self.initial.root_generation, .physical_root_incarnation = self.initial.observation.physical_root_incarnation };
+        }
+
+        fn observeWithContext(self: *@This(), context: request_operation.RequestContext) !SchemaAttestation.RootedRaftObservation {
+            std.debug.assert(self.lease.active);
+            const observed = try observeRaftSchemaAtLease(&self.lease, self.table_name, self.binding, context);
+            if (observed.root_generation != self.initial.root_generation or
+                observed.observation.physical_root_incarnation != self.initial.observation.physical_root_incarnation)
+                return error.SchemaValidationRuntimeRecoveryRequired;
+            return observed;
+        }
+
+        pub const SnapshotParent = struct {
+            signed: SchemaAttestation.SignedSnapshotParent,
+            source_header: @import("antfly_local_sources").storage_db_relational_schema_owner_contract.Header,
+            retained: snapshot_retention.RetainedSnapshot,
+
+            pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+                // Memory ownership is independent of the durable reference.
+                // Only a separately authorized lifecycle decision may unlink it.
+                self.retained.deinit(alloc);
+                self.* = undefined;
+            }
+        };
+
+        /// The private retention callback reads the exact published checkpoint;
+        /// requests cannot supply origin, header, footer or completed counters.
+        /// This returns source evidence, NOT metadata admission/adoption.
+        pub fn attestSnapshotParent(self: *@This(), alloc: std.mem.Allocator, request: snapshot_retention.Request, expected: SchemaAttestation.RaftScope, root: @import("antfly_local_sources").storage_db_root_signing_identity.State) !SnapshotParent {
+            return self.attestSnapshotParentMode(alloc, request, expected, root, .retain, null);
+        }
+
+        /// Reopen the exact durable reference after producer recovery, never
+        /// repin a newer CURRENT image or silently replace a missing reference.
+        /// The same live-root, manifest and quorum-completion checks still apply.
+        pub fn recoverSnapshotParent(self: *@This(), alloc: std.mem.Allocator, request: snapshot_retention.Request, expected: SchemaAttestation.RaftScope, root: @import("antfly_local_sources").storage_db_root_signing_identity.State) !SnapshotParent {
+            return self.attestSnapshotParentMode(alloc, request, expected, root, .recover, null);
+        }
+
+        /// The producer must already have a durable intent. A reserved intent
+        /// may finish its first pin if none exists; a captured intent may ONLY
+        /// reopen its old reference. Never use this to regenerate a prepared
+        /// command/grant after a possible metadata submission.
+        pub fn captureSnapshotParent(self: *@This(), alloc: std.mem.Allocator, request: snapshot_retention.Request, expected: SchemaAttestation.RaftScope, root: @import("antfly_local_sources").storage_db_root_signing_identity.State, captured: ?snapshot_retention.CapturedPayload, observer: snapshot_retention.CaptureObserver) !SnapshotParent {
+            return self.attestSnapshotParentMode(alloc, request, expected, root, if (captured) |value| .{ .recover_captured = value } else .recover_or_retain, observer);
+        }
+
+        const SnapshotCaptureMode = union(enum) { retain, recover, recover_or_retain, recover_captured: snapshot_retention.CapturedPayload };
+
+        fn attestSnapshotParentMode(self: *@This(), alloc: std.mem.Allocator, request: snapshot_retention.Request, expected: SchemaAttestation.RaftScope, root: @import("antfly_local_sources").storage_db_root_signing_identity.State, mode: SnapshotCaptureMode, observer: ?snapshot_retention.CaptureObserver) !SnapshotParent {
+            try self.context.ensureActive();
+            if (!self.lease.active) return error.SchemaValidationRuntimeRecoveryRequired;
+            try request.validate();
+            try expected.requireBinding(self.binding);
+            if (request.group_id != self.binding.fence.owner_group_id) return error.SchemaValidationJobChanged;
+            if (self.initial.root_generation != expected.root_generation or
+                self.initial.observation.physical_root_incarnation != expected.physical_root_incarnation) return error.SchemaValidationRuntimeRecoveryRequired;
+            const source = self.lease.source;
+            const retention = source.schema_snapshot_retention orelse return error.NativeSnapshotRequired;
+            const barrier = source.read_safety_barrier;
+            const certify = barrier.vtable.certify_completed_prefix orelse return error.ReadSafetyBarrierUnavailable;
+            if (request.term > expected.reported_term or request.index > expected.reported_applied_index) return error.InvalidControlReceiptPosition;
+            var retained = switch (mode) {
+                .retain => try retention.retainPublished(alloc, request, self.context),
+                .recover => try retention.recoverRetained(alloc, request, self.context),
+                .recover_captured => |captured| try retention.recoverCaptured(alloc, request, captured, self.context),
+                .recover_or_retain => retention.recoverRetained(alloc, request, self.context) catch |err| switch (err) {
+                    error.FileNotFound => try retention.retainPublished(alloc, request, self.context),
+                    else => return err,
+                },
+            };
+            errdefer retained.deinit(alloc);
+            if (retained.identity.index != request.index or retained.identity.term != request.term or
+                !std.mem.eql(u8, &retained.reference, &request.reference) or
+                retained.application_manifest.len > 64 * 1024) return error.InvalidSnapshot;
+            if (retained.application_manifest.len == 0) return error.NativeSnapshotRequired;
+            var arena = std.heap.ArenaAllocator.init(alloc);
+            defer arena.deinit();
+            const wire = @import("antfly_local_sources").storage_db_native_raft_snapshot_contract;
+            const witness = try std.json.parseFromSliceLeaky(wire.MaterializationWitness, arena.allocator(), retained.application_manifest, .{ .ignore_unknown_fields = false, .allocate = .alloc_always, .max_value_len = 64 * 1024 });
+            try witness.requireFor(request.group_id, request.index, request.term, retained.payload_len);
+            const header = witness.stream.identity.schema_header orelse return error.SchemaValidationJobRequired;
+            if (!std.meta.eql(header.binding, self.binding) or witness.stream.identity.origin.?.physical_root_incarnation != expected.physical_root_incarnation)
+                return error.SchemaValidationRuntimeRecoveryRequired;
+            if (observer) |capture| try capture.record(capture.ptr, retained);
+            const normalized = try platformDeadlineContext(self.context);
+            const completed = try certify(barrier.ptr, request.group_id, expected.reported_term, @max(request.index, expected.reported_applied_index), normalized.deadline_ns, normalized.cancellation);
+            if (completed.incarnation == 0 or completed.term != expected.reported_term or completed.applied_index < request.index or
+                completed.applied_index < expected.reported_applied_index) return error.InvalidControlReceiptPosition;
+            // Validate the ACTUAL newer completion proof. Never fabricate a
+            // proof at the older image cut to make it equal the snapshot index.
+            const signed = try SchemaAttestation.SignedSnapshotParent.sign(.{
+                .binding = self.binding,
+                .origin = witness.stream.identity.origin.?,
+                .stream_digest = witness.stream.footer_digest,
+                .through_index = witness.stream.identity.through_index,
+                .completed = completed,
+            }, expected.identity, expected.reporter_incarnation, expected.replica_id, expected.root_generation, root);
+            lock(&source.mutex);
+            const retired = self.lease.entry.retired or self.lease.entry.closing;
+            source.mutex.unlock();
+            const generation = @import("antfly_local_sources").storage_db_root_signing_identity.attestedRootGeneration(source.visibleRootGeneration(request.group_id)) catch return error.SchemaValidationRuntimeRecoveryRequired;
+            if (retired or generation != expected.root_generation) return error.SchemaValidationRuntimeRecoveryRequired;
+            try self.context.ensureActive();
+            return .{ .signed = signed, .source_header = header, .retained = retained };
+        }
+
+        /// Sign only facts read on the retained owner. The receiver obtains the
+        /// expected scope/enrollment independently; metadata revalidates the ACK.
+        pub fn attest(self: *@This(), expected: SchemaAttestation.RaftScope, root: @import("antfly_local_sources").storage_db_root_signing_identity.State) !SchemaAttestation.SignedRaftObservation {
+            return self.attestMode(expected, root, false);
+        }
+
+        /// Replacement-root producer only: even an exact native/data cut
+        /// needs an independently quorum-certified SHARED apply prefix. The
+        /// ordinary observation fast path is not root-adoption evidence.
+        pub fn attestCompleted(self: *@This(), expected: SchemaAttestation.RaftScope, root: @import("antfly_local_sources").storage_db_root_signing_identity.State) !SchemaAttestation.SignedRaftObservation {
+            return self.attestMode(expected, root, true);
+        }
+
+        fn attestMode(self: *@This(), expected: SchemaAttestation.RaftScope, root: @import("antfly_local_sources").storage_db_root_signing_identity.State, require_completed: bool) !SchemaAttestation.SignedRaftObservation {
+            try self.context.ensureActive();
+            try expected.requireBinding(self.binding);
+            const source = self.lease.source;
+            var observed = try self.observe();
+            if (require_completed) {
+                const barrier = source.read_safety_barrier;
+                const certify = barrier.vtable.certify_completed_prefix orelse return error.ReadSafetyBarrierUnavailable;
+                const applied = observed.observation.applied orelse return error.InvalidControlReceiptPosition;
+                const normalized = try platformDeadlineContext(self.context);
+                const completed = try certify(barrier.ptr, self.binding.fence.owner_group_id, expected.reported_term, @max(applied.index, expected.reported_applied_index), normalized.deadline_ns, normalized.cancellation);
+                observed = try self.observe();
+                observed.completed = completed;
+            }
+            // Preserve the strict actual-data fast path. Only a gap caused by
+            // non-data entries needs a separately quorum-validated prefix.
+            if (!require_completed) if (observed.observation.applied) |applied| if (applied.index < expected.reported_applied_index) {
+                const barrier = source.read_safety_barrier;
+                const capture = barrier.vtable.capture_frozen;
+                const validate = barrier.vtable.validate_frozen;
+                if ((capture == null) != (validate == null)) return error.ReadSafetyBarrierUnavailable;
+                if (capture) |capture_fn| {
+                    const proof = try capture_fn(barrier.ptr, self.binding.fence.owner_group_id);
+                    observed = try self.observe();
+                    const normalized = try platformDeadlineContext(self.context);
+                    try validate.?(barrier.ptr, self.binding.fence.owner_group_id, proof, normalized.deadline_ns, normalized.cancellation);
+                    observed.completed = proof;
+                }
+            };
+            // A retained lease keeps memory alive but does not make a retired
+            // physical owner current. Never sign after a root replacement.
+            lock(&source.mutex);
+            const retired = self.lease.entry.retired or self.lease.entry.closing;
+            source.mutex.unlock();
+            const visible_generation = @import("antfly_local_sources").storage_db_root_signing_identity.attestedRootGeneration(source.visibleRootGeneration(self.binding.fence.owner_group_id)) catch return error.SchemaValidationRuntimeRecoveryRequired;
+            if (retired or visible_generation != observed.root_generation)
+                return error.SchemaValidationRuntimeRecoveryRequired;
+            const signed = try SchemaAttestation.SignedRaftObservation.sign(observed, expected, root);
+            try self.context.ensureActive();
+            return signed;
+        }
+    };
+
+    pub const PreparedRaftSchemaControl = struct {
+        lease: Lease,
+        prepared: client.RaftSchemaPreparation,
+        table_name: []const u8,
+        binding: @import("antfly_local_sources").storage_db_relational_schema_owner_contract.Binding,
+        root_generation: u64,
+        physical_root_incarnation: u128,
+
+        /// Control executor only: drain the ticket before releasing its owner.
+        pub fn deinit(self: *@This()) void {
+            self.prepared.deinit();
+            self.lease.deinit();
+            self.* = undefined;
+        }
+
+        /// Progress-lane operation. The kernel rechecks its exact prepared
+        /// owner and committed term/index; no cold open, encoding or signing.
+        pub fn apply(self: *@This(), options: client.Owner.QueryOptions) !void {
+            try self.prepared.apply(options);
+        }
+
+        /// Read-only control-lane recovery on the applying owner. A successful
+        /// apply is not erased by a later initiating-request cancellation.
+        pub fn observeCommitted(self: *@This()) !SchemaAttestation.RootedRaftObservation {
+            const observed = try observeRaftSchemaAtLease(&self.lease, self.table_name, self.binding, .{});
+            if (observed.root_generation != self.root_generation or observed.observation.physical_root_incarnation != self.physical_root_incarnation)
+                return error.SchemaValidationRuntimeRecoveryRequired;
+            return observed;
+        }
+    };
+
+    /// Bind before the shared control worker starts. The raw fold commits first;
+    /// its exact-entry projection is read off-progress, never a public catalog.
+    pub fn withSchemaEntryStore(self: *ProvisionedKernelOwnerSource, store: ?*@import("../storage/data_raft_apply_client.zig").RaftApplyStore) *ProvisionedKernelOwnerSource {
+        std.debug.assert(self.apply_control_future == null);
+        self.schema_entry_store = store;
+        return self;
+    }
+
+    /// Trusted committed-entry lane only. This copies three integers into a
+    /// fixed pool or borrows an already-prepared ticket; no log payload copy.
+    pub fn applyPreparedSchemaEntry(self: *ProvisionedKernelOwnerSource, group: u64, term: u64, index: u64) !void {
+        if (!self.apply_control_started.load(.acquire) or self.schema_entry_store == null) return error.RaftApplyWriterUnavailable;
+        defer self.apply_control_wake.set(self.apply_control_io.?);
+        return self.schema_apply.applyOrEnqueue(.{ .group = group, .term = term, .index = index });
+    }
+
+    pub fn retireSchemaApplyGroup(self: *ProvisionedKernelOwnerSource, group: u64) void {
+        self.schema_apply.cancelGroup(group);
+        if (self.apply_control_started.load(.acquire)) self.apply_control_wake.set(self.apply_control_io.?);
+    }
+
+    pub fn discardSchemaApplyForRootReplacement(self: *ProvisionedKernelOwnerSource, group: u64) void {
+        self.schema_apply.discardForRootReplacement(group);
+        if (self.apply_control_started.load(.acquire)) self.apply_control_wake.set(self.apply_control_io.?);
+    }
+
+    const SchemaApplyHost = struct {
+        source: *ProvisionedKernelOwnerSource,
+
+        pub fn prepare(self: *@This(), key: @import("../data/schema_apply_queue.zig").Key, canceled: *const std.atomic.Value(bool)) !PreparedRaftSchemaControl {
+            return self.source.prepareSchemaEntry(key, canceled);
+        }
+        pub fn notify(self: *@This()) void {
+            const source = self.source;
+            lock(&source.mutex);
+            const wake = source.apply_ready_wake;
+            if (wake != null) source.apply_ready_wake_inflight += 1;
+            source.mutex.unlock();
+            if (wake) |callback| {
+                callback.notify();
+                lock(&source.mutex);
+                source.apply_ready_wake_inflight -= 1;
+                source.mutex.unlock();
+            }
+        }
+    };
+
+    fn prepareSchemaEntry(self: *ProvisionedKernelOwnerSource, key: @import("../data/schema_apply_queue.zig").Key, canceled: *const std.atomic.Value(bool)) !PreparedRaftSchemaControl {
+        const Cancel = struct {
+            local: *const std.atomic.Value(bool),
+            stopping: *const std.atomic.Value(bool),
+            fn check(ptr: *const anyopaque) bool {
+                const value: *const @This() = @ptrCast(@alignCast(ptr));
+                return value.local.load(.acquire) or value.stopping.load(.acquire);
+            }
+        };
+        const cancel: Cancel = .{ .local = canceled, .stopping = &self.schema_control_shutdown };
+        const context: request_operation.RequestContext = .{ .cancellation = .{ .ptr = &cancel, .is_cancelled_fn = Cancel.check } };
+        try context.ensureActive();
+        const store = self.schema_entry_store orelse return error.StorageKernelOwnerUnavailable;
+        const log = @import("../data/schema_control_log.zig");
+        var retained = store.committedNormalEntry(key.group, key.term, key.index, log.max_wire_bytes) catch |err| switch (err) {
+            error.NotFound => return error.SchemaValidationRuntimeRecoveryRequired,
+            else => return err,
+        };
+        defer retained.deinit();
+        var decoded = try log.decode(self.alloc, retained.bytes());
+        defer decoded.deinit();
+        const binding = decoded.command.binding;
+        if (self.online_source_authority != .raft or binding.authority != .raft or binding.fence.owner_group_id != key.group)
+            return error.SchemaValidationJobChanged;
+        // The envelope's generation was local to the submitting replica.
+        // Ordered replay after snapshot publication pins this destination's
+        // current generation instead; namespace and immutable command guards
+        // still validate against its actual persisted schema/job state.
+        const generation = self.visibleRootGeneration(key.group);
+        const path = try std.fmt.allocPrint(self.alloc, "{s}/group-{d}/table-db", .{ self.replica_root_dir, key.group });
+        defer self.alloc.free(path);
+        const descriptor: descriptor_contract.Descriptor = .{
+            .lsm_root_generation = generation,
+            .identity = .{ .table_id = binding.fence.namespace.table_id, .shard_id = binding.fence.namespace.shard_id, .range_id = binding.fence.namespace.range_id },
+        };
+        var lease = try self.acquireDescriptorOnce(key.group, decoded.table(), path, descriptor, .shared, .resident, .{
+            .historical_raft_apply = true,
+            .durable_catalog = true,
+            .cancellation = context.cancellation,
+        });
+        errdefer lease.deinit();
+        var cancellation = context.cancellation;
+        var prepared = try lease.owner().prepareRaftSchemaOwnerControl(lease.entry.table_name, decoded.command_bytes, key.term, key.index, .{
+            .cancellation_ctx = &cancellation,
+            .cancellation_fn = cancellationTokenRequested,
+        });
+        errdefer prepared.deinit();
+        if (prepared.root_generation != generation or self.visibleRootGeneration(key.group) != generation)
+            return error.SchemaValidationRuntimeRecoveryRequired;
+        return .{ .lease = lease, .prepared = prepared, .table_name = lease.entry.table_name, .binding = binding, .root_generation = try @import("antfly_local_sources").storage_db_root_signing_identity.attestedRootGeneration(prepared.root_generation), .physical_root_incarnation = prepared.physical_root_incarnation };
+    }
+
+    pub fn acquireRaftSchemaOwnerSession(self: *ProvisionedKernelOwnerSource, group_id: u64, table_name: []const u8, binding: @import("antfly_local_sources").storage_db_relational_schema_owner_contract.Binding, context: request_operation.RequestContext) !RaftSchemaOwnerSession {
+        try context.ensureActive();
+        try binding.validate();
+        if (binding.authority != .raft or binding.fence.owner_group_id != group_id) return error.SchemaValidationJobChanged;
+        var lease = try self.acquireSchemaBoundOwner(group_id, table_name, binding.fence.namespace, context);
+        errdefer lease.deinit();
+        const initial = try observeRaftSchemaAtLease(&lease, table_name, binding, context);
+        return .{ .lease = lease, .table_name = table_name, .binding = binding, .context = context, .initial = initial };
+    }
+
+    /// Pin one physical owner until the observation is signed. Metadata must
+    /// independently recheck enrollment/placement and the accepted phase; this
+    /// read-only replica evidence does not authorize a Raft proposal or install.
+    pub fn attestRaftSchemaOwnerAtRoot(self: *ProvisionedKernelOwnerSource, group_id: u64, table_name: []const u8, binding: @import("antfly_local_sources").storage_db_relational_schema_owner_contract.Binding, expected: SchemaAttestation.RaftScope, root: @import("antfly_local_sources").storage_db_root_signing_identity.State, context: request_operation.RequestContext) !SchemaAttestation.SignedRaftObservation {
+        try context.ensureActive();
+        try expected.requireBinding(binding);
+        var session = try self.acquireRaftSchemaOwnerSession(group_id, table_name, binding, context);
+        defer session.deinit();
+        return session.attest(expected, root);
+    }
+
+    fn observeRaftSchemaAtLease(lease: *Lease, table_name: []const u8, binding: @import("antfly_local_sources").storage_db_relational_schema_owner_contract.Binding, context: request_operation.RequestContext) !SchemaAttestation.RootedRaftObservation {
+        const normalized = try platformDeadlineContext(context);
+        var cancellation = normalized.cancellation;
+        const result = try lease.owner().raftSchemaOwnerObservation(table_name, binding, .{
+            .execution_deadline_ns = normalized.deadline_ns,
+            .cancellation_ctx = &cancellation,
+            .cancellation_fn = cancellationTokenRequested,
+        });
+        try context.ensureActive();
+        return .{ .root_generation = @import("antfly_local_sources").storage_db_root_signing_identity.attestedRootGeneration(lease.entry.generation) catch return error.SchemaValidationRuntimeRecoveryRequired, .observation = result };
     }
 
     pub const RootedRaftIndexOwnerObservation = struct {
@@ -4989,17 +5761,17 @@ pub const ProvisionedKernelOwnerSource = struct {
                 }
                 return error.StorageKernelOwnerTransitionRequired;
             }
-            if (entry.catalog_deferred and !controls.allow_deferred_catalog and !controls.historical_raft_apply)
+            if (entry.catalog_deferred and !entry.opened_for_historical_apply and !controls.allow_deferred_catalog and !controls.historical_raft_apply)
                 return error.StorageReadTemporarilyUnavailable;
             if ((!controls.historical_raft_apply and entry.opened_for_historical_apply) or
-                !std.mem.eql(u8, entry.schema_json, descriptor.schema_json) or
-                !std.mem.eql(u8, entry.indexes_json, descriptor.indexes_json) or
+                (!controls.durable_catalog and (!std.mem.eql(u8, entry.schema_json, descriptor.schema_json) or
+                    !std.mem.eql(u8, entry.indexes_json, descriptor.indexes_json) or
+                    !std.meta.eql(entry.table_storage, descriptor.table_storage))) or
                 !std.mem.eql(u8, entry.restore_bootstrap_json, descriptor.restore_bootstrap_json) or
                 !std.mem.eql(u8, entry.initial_child_bootstrap_json, descriptor.initial_child_bootstrap_json) or
                 !descriptor_contract.initialRangesEqual(entry.initial_range, descriptor.initial_range) or
                 entry.restore_cancel_recovery != descriptor.restore_cancel_recovery or
-                entry.restore_ha_replay != descriptor.restore_ha_replay or
-                !std.meta.eql(entry.table_storage, descriptor.table_storage))
+                entry.restore_ha_replay != descriptor.restore_ha_replay)
             {
                 // Catalog definition changes do not necessarily publish a new
                 // physical root generation. An API lease is not the only DB
@@ -5082,6 +5854,7 @@ pub const ProvisionedKernelOwnerSource = struct {
             .row_policy_authority_secret = .fromSlice(self.row_policy_authority_secret orelse ""),
             .row_policy_authority_issuer = .fromSlice(self.row_policy_authority_issuer orelse ""),
             .historical_raft_apply = @intFromBool(controls.historical_raft_apply),
+            .catalog_mode = if (controls.durable_catalog) .durable_only else .descriptor,
             .owner_catalog_deferred_out = &catalog_deferred,
             .dense_embedding_storage = if (descriptor.table_storage) |settings| switch (settings.dense_embeddings) {
                 .primary_lsm => .primary_lsm,
@@ -6958,6 +7731,25 @@ pub const ProvisionedKernelOwnerSource = struct {
             return null;
         }
         return .{ .items = try items.toOwnedSlice(alloc) };
+    }
+
+    /// Capture one complete owner observation from its real lease. Native
+    /// metadata publication must not walk every table/range or open a second DB.
+    pub fn runtimeStatusGroupAtRoot(self: *ProvisionedKernelOwnerSource, alloc: std.mem.Allocator, group: u64, table: []const u8, context: request_operation.RequestContext) !runtime_status.LocalTableRuntimeStatus {
+        try context.ensureActive();
+        const normalized = try platformDeadlineContext(context);
+        var lease = try self.acquireWithControls(group, table, .{ .allow_deferred_catalog = true, .execution_deadline_ns = normalized.deadline_ns, .cancellation = normalized.cancellation });
+        defer lease.deinit();
+        var response = try lease.owner().runtimeStatusJson(table);
+        defer response.deinit();
+        var parsed = try std.json.parseFromSlice(runtime_status.LocalTableRuntimeStatus, alloc, response.bytes(), .{});
+        defer parsed.deinit();
+        var observed = try parsed.value.clone(alloc);
+        errdefer observed.deinit(alloc);
+        observed.group_id = group;
+        observed.metadata.lsm_root_generation = lease.entry.generation;
+        try context.ensureActive();
+        return observed;
     }
 
     fn localRuntimeStatusGroupLocal(

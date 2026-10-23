@@ -42,6 +42,7 @@ test "SQL DDL description has no fabricated table or mutation side effects" {
 pub const Column = struct {
     name: []const u8,
     type: ast.ColumnType,
+    temporal_kind: ?@import("temporal_value.zig").Kind = null,
     element_type: ?@import("array_value.zig").ElementType = null,
     numeric_modifier: ?@import("../common/sql_builtin_type.zig").NumericModifier = null,
     /// NULL without a concrete SQL type can adopt an assignment/set context.
@@ -49,6 +50,7 @@ pub const Column = struct {
     untyped_null: bool = false,
 
     pub fn jsonStringify(self: Column, writer: anytype) !void {
+        if (self.temporal_kind) |kind| return writer.write(.{ .name = self.name, .type = self.type, .temporal_kind = kind });
         if (self.numeric_modifier) |modifier| {
             return writer.write(.{ .name = self.name, .type = self.type, .element_type = self.element_type, .numeric_modifier = modifier });
         }
@@ -222,7 +224,7 @@ fn typedValuesSource(allocator: std.mem.Allocator, source: *const ast.Select, in
         const column = try table.column(name);
         if (column.type == .array and original == .string) {
             const cast = try allocator.create(ast.Scalar);
-            cast.* = .{ .cast = .{ .operand = expression, .type = .array, .element_type = column.element_type orelse return error.SqlAssignmentTypeMismatch, .numeric_modifier = column.numeric_modifier } };
+            cast.* = .{ .cast = .{ .operand = expression, .type = .array, .element_type = column.element_type orelse return error.SqlAssignmentTypeMismatch, .numeric_modifier = column.numeric_modifier, .temporal_kind = column.temporal_kind } };
             projection.expression = cast;
             continue;
         }
@@ -427,7 +429,7 @@ fn bindImpl(allocator: std.mem.Allocator, backend: catalog.Backend, compiled: *c
         const window = try allocator.create(@import("window_binding.zig").Bound);
         window.* = try @import("window_binding.zig").bind(allocator, backend, compiled, explicit_parameter_types);
         const columns = try allocator.alloc(Column, window.outputs.len);
-        for (columns, window.names, window.outputs) |*column, name, program| column.* = .{ .name = name, .type = internalKind(program.output_type.kind), .element_type = program.output_type.element_type, .numeric_modifier = program.output_type.numeric_modifier, .untyped_null = program.output_type.kind == null };
+        for (columns, window.names, window.outputs) |*column, name, program| column.* = .{ .name = name, .type = internalKind(program.output_type.kind), .element_type = program.output_type.element_type, .numeric_modifier = program.output_type.numeric_modifier, .temporal_kind = program.output_type.temporal_kind, .untyped_null = program.output_type.kind == null };
         return .{ .table = window.input.table, .action = .read, .columns = columns, .parameter_types = window.input.parameter_types, .json_literals = .empty, .window = window };
     }
     if (compiled.statement == .select and @import("aggregate_binding.zig").accepts(compiled.statement.select)) {
@@ -439,7 +441,7 @@ fn bindImpl(allocator: std.mem.Allocator, backend: catalog.Backend, compiled: *c
         const aggregate = try allocator.create(@import("aggregate_binding.zig").Bound);
         aggregate.* = try @import("aggregate_binding.zig").bindWithInvocation(allocator, table, compiled.statement.select, parameters, backend.settings_view, backend.parameter_invocation);
         const columns = try allocator.alloc(Column, aggregate.outputs.len);
-        for (columns, aggregate.names, aggregate.outputs) |*column, name, program| column.* = .{ .name = name, .type = internalKind(program.output_type.kind), .element_type = program.output_type.element_type, .numeric_modifier = program.output_type.numeric_modifier, .untyped_null = program.output_type.kind == null };
+        for (columns, aggregate.names, aggregate.outputs) |*column, name, program| column.* = .{ .name = name, .type = internalKind(program.output_type.kind), .element_type = program.output_type.element_type, .numeric_modifier = program.output_type.numeric_modifier, .temporal_kind = program.output_type.temporal_kind, .untyped_null = program.output_type.kind == null };
         var json_literals: std.StringHashMapUnmanaged(Json) = .empty;
         if (table) |definition| {
             const contexts = try allocator.alloc(?ast.ColumnType, parameters.len);
@@ -593,7 +595,7 @@ fn bindImpl(allocator: std.mem.Allocator, backend: catalog.Backend, compiled: *c
                 const expression = projection.expression orelse continue;
                 if (expression.* != .literal or expression.literal != .string) continue;
                 const cast = try allocator.create(ast.Scalar);
-                cast.* = .{ .cast = .{ .operand = expression, .type = .array, .element_type = column.element_type orelse return error.SqlAssignmentTypeMismatch, .numeric_modifier = column.numeric_modifier } };
+                cast.* = .{ .cast = .{ .operand = expression, .type = .array, .element_type = column.element_type orelse return error.SqlAssignmentTypeMismatch, .numeric_modifier = column.numeric_modifier, .temporal_kind = column.temporal_kind } };
                 projection.expression = cast;
             }
             source_query.columns = projections;
@@ -615,13 +617,13 @@ fn bindImpl(allocator: std.mem.Allocator, backend: catalog.Backend, compiled: *c
         for (insertion.columns, expected[0..insertion.columns.len], expected_types[0..insertion.columns.len]) |name, *kind, *descriptor| {
             const column = try table.column(name);
             kind.* = column.type;
-            descriptor.* = .{ .kind = column.type, .element_type = column.element_type, .numeric_modifier = column.numeric_modifier };
+            descriptor.* = .{ .kind = column.type, .element_type = column.element_type, .numeric_modifier = column.numeric_modifier, .temporal_kind = column.temporal_kind };
         }
         if (capture_count != 0) for (insertion.conflict.?.assignments) |assignment| if (assignment.capture_ordinal) |ordinal| {
             for (ordinal..ordinal + assignment.capture_span) |capture_index| {
                 const column = try table.column(assignment.field);
                 expected[insertion.columns.len + capture_index] = column.type;
-                expected_types[insertion.columns.len + capture_index] = .{ .kind = column.type, .element_type = column.element_type, .numeric_modifier = column.numeric_modifier };
+                expected_types[insertion.columns.len + capture_index] = .{ .kind = column.type, .element_type = column.element_type, .numeric_modifier = column.numeric_modifier, .temporal_kind = column.temporal_kind };
             }
         };
         try @import("relation_binding.zig").inferExpectedTypes(allocator, backend, source_query, parameters, expected_types);
@@ -633,7 +635,7 @@ fn bindImpl(allocator: std.mem.Allocator, backend: catalog.Backend, compiled: *c
             const destination = try table.column(name);
             if (source_column.type == .array and destination.type == .array and !@import("builtin_cast.zig").assignmentAllowed(source_column.element_type orelse return error.SqlAssignmentTypeMismatch, destination.element_type orelse return error.SqlAssignmentTypeMismatch)) return error.SqlAssignmentTypeMismatch;
             const untyped_null = source_column.untyped_null;
-            if (!untyped_null and source_column.type != destination.type and !@import("builtin_cast.zig").numericAssignmentAllowed(source_column.type, destination.type) and !(insertion.values_source_rows.len != 0 and source_column.type == .string and (destination.type == .datetime or destination.type == .json or destination.type == .uuid))) return error.SqlTypeMismatch;
+            if (!untyped_null and source_column.type != destination.type and destination.type != .string and !@import("builtin_cast.zig").numericAssignmentAllowed(source_column.type, destination.type) and !(insertion.values_source_rows.len != 0 and source_column.type == .string and (destination.type == .datetime or destination.type == .json or destination.type == .uuid))) return error.SqlTypeMismatch;
         }
         result.insert_source = bound;
         result.parameter_types = bound.parameter_types;
@@ -642,7 +644,7 @@ fn bindImpl(allocator: std.mem.Allocator, backend: catalog.Backend, compiled: *c
         const capture_types = try allocator.alloc(@import("scalar.zig").Type, clause.capture_count);
         if (clause.capture_count != 0) {
             const source = result.insert_source orelse return error.InvalidSqlBackendResponse;
-            for (source.columns[compiled.statement.insert.columns.len..], capture_types) |column, *descriptor| descriptor.* = .{ .kind = column.type, .element_type = column.element_type, .numeric_modifier = column.numeric_modifier };
+            for (source.columns[compiled.statement.insert.columns.len..], capture_types) |column, *descriptor| descriptor.* = .{ .kind = column.type, .element_type = column.element_type, .numeric_modifier = column.numeric_modifier, .temporal_kind = column.temporal_kind };
         }
         result.conflict = try @import("conflict.zig").bind(allocator, backend, table, projection_name, target_aliased, clause, parameters, capture_types);
     };
@@ -652,11 +654,9 @@ fn bindImpl(allocator: std.mem.Allocator, backend: catalog.Backend, compiled: *c
         const returning_compiled: compiler.Compiled = .{ .arena = undefined, .statement = .{ .select = selection }, .parameter_count = compiled.parameter_count };
         const returning_bound = try allocator.create(BoundStatement);
         returning_bound.* = try bindInternal(allocator, adapter.iface(), &returning_compiled, result.parameter_types);
-        // A write RETURNING image is prepared before publication. Its version
-        // is not the later durable commit timestamp. Do not expose the old
-        // predicate version as the new version until commit receipts provide
-        // an allocation-free, outcome-preserving result binding.
-        if (table.storage_mode == .document and compiled.statement != .delete) {
+        // Only a native owner with a retained transaction stamp can bind new
+        // versions before commit. Never substitute the old version predicate.
+        if (table.storage_mode == .document and compiled.statement != .delete and !backend.supports_write_versions) {
             for (selection.columns) |projection| if (!projection.wildcard and projection.expression == null and table.isDocumentVersion(projection.field)) return error.UnsupportedSqlShape;
             for (returning_bound.scalars.required) |ordinal| if (table.isDocumentVersion(returning_bound.scalars.columns[ordinal].name)) return error.UnsupportedSqlShape;
         }
@@ -718,7 +718,7 @@ fn bindConstantSelect(alloc: std.mem.Allocator, compiled: *const compiler.Compil
         columns[0] = .{ .name = try alloc.dupe(u8, statement.count_alias orelse "count"), .type = .integer };
     } else for (statement.columns, scalars.projections, columns) |projection, program, *column| {
         const expression = program orelse return error.UndefinedColumn;
-        column.* = .{ .name = try alloc.dupe(u8, projection.alias orelse "?column?"), .type = internalKind(expression.output_type.kind), .element_type = expression.output_type.element_type, .numeric_modifier = expression.output_type.numeric_modifier, .untyped_null = expression.output_type.kind == null };
+        column.* = .{ .name = try alloc.dupe(u8, projection.alias orelse "?column?"), .type = internalKind(expression.output_type.kind), .element_type = expression.output_type.element_type, .numeric_modifier = expression.output_type.numeric_modifier, .temporal_kind = expression.output_type.temporal_kind, .untyped_null = expression.output_type.kind == null };
     }
     // Ordering a singleton changes nothing, but names must still resolve.
     for (statement.order_by) |order| {
@@ -840,7 +840,7 @@ const Context = struct {
         if (statement.columns.len == 0) {
             if (self.table.columns.len > 256) return error.SqlProgramLimitExceeded;
             const columns = try self.allocator.alloc(Column, self.table.columns.len);
-            for (self.table.columns, columns) |column, *output| output.* = .{ .name = try self.allocator.dupe(u8, column.name), .type = internalKind(column.type), .element_type = column.element_type, .numeric_modifier = column.numeric_modifier };
+            for (self.table.columns, columns) |column, *output| output.* = .{ .name = try self.allocator.dupe(u8, column.name), .type = internalKind(column.type), .element_type = column.element_type, .numeric_modifier = column.numeric_modifier, .temporal_kind = column.temporal_kind };
             return columns;
         }
         const columns = try self.allocator.alloc(Column, statement.columns.len);
@@ -849,7 +849,7 @@ const Context = struct {
         for (statement.columns, columns, 0..) |projection, *output, index| {
             if (projection.expression != null) {
                 const program = self.scalars.projections[index] orelse return error.InvalidSqlBackendResponse;
-                output.* = .{ .name = try self.allocator.dupe(u8, projection.alias orelse "?column?"), .type = internalKind(program.output_type.kind), .element_type = program.output_type.element_type, .numeric_modifier = program.output_type.numeric_modifier, .untyped_null = program.output_type.kind == null };
+                output.* = .{ .name = try self.allocator.dupe(u8, projection.alias orelse "?column?"), .type = internalKind(program.output_type.kind), .element_type = program.output_type.element_type, .numeric_modifier = program.output_type.numeric_modifier, .temporal_kind = program.output_type.temporal_kind, .untyped_null = program.output_type.kind == null };
                 continue;
             }
             const column = try self.table.column(projection.field);
@@ -857,7 +857,7 @@ const Context = struct {
                 _ = try native_fields.getOrPut(self.allocator, column.path);
                 if (native_fields.count() > 256 and !statement.internal_projection) return error.SqlProgramLimitExceeded;
             }
-            output.* = .{ .name = try self.allocator.dupe(u8, projection.alias orelse column.name), .type = internalKind(column.type), .element_type = column.element_type, .numeric_modifier = column.numeric_modifier };
+            output.* = .{ .name = try self.allocator.dupe(u8, projection.alias orelse column.name), .type = internalKind(column.type), .element_type = column.element_type, .numeric_modifier = column.numeric_modifier, .temporal_kind = column.temporal_kind };
         }
         return columns;
     }
@@ -1008,8 +1008,29 @@ fn bindOrder(alloc: std.mem.Allocator, table: catalog.Table, statement: ast.Sele
 /// Preserve the source builtin through PostgreSQL assignment casts. In
 /// particular real->numeric must not acquire double precision's formatting.
 pub fn assignDatum(alloc: std.mem.Allocator, raw: @import("scalar.zig").Datum, source_identity: ?@import("array_value.zig").ElementType, kind: ast.ColumnType, element_type: ?@import("array_value.zig").ElementType, limits: @import("scalar.zig").EvalLimits) !@import("scalar.zig").Datum {
-    const assigned = if (kind == .array) try @import("scalar.zig").assignArray(alloc, raw, element_type orelse return error.SqlAssignmentTypeMismatch, limits) else if (kind == .integer or kind == .number) try @import("scalar.zig").assignNumeric(alloc, raw, source_identity, element_type orelse (if (kind == .integer) .int64 else .float64), limits) else raw;
+    const assigned = if (kind == .string) try @import("scalar.zig").assignText(alloc, raw, source_identity, limits) else if (kind == .array) try @import("scalar.zig").assignArray(alloc, raw, element_type orelse return error.SqlAssignmentTypeMismatch, limits) else if (kind == .integer or kind == .number) try @import("scalar.zig").assignNumeric(alloc, raw, source_identity, element_type orelse (if (kind == .integer) .int64 else .float64), limits) else raw;
     return coerceDatum(alloc, assigned, kind, element_type);
+}
+
+/// Logical row/derived relation boundary retains the complete SQL domain.
+/// Physical assignment keeps the older coarse wrapper and cannot acquire an
+/// interval domain merely because its JSON representation is a string.
+pub fn coerceDatumTyped(alloc: std.mem.Allocator, raw: @import("scalar.zig").Datum, descriptor: @import("scalar.zig").Type) !@import("scalar.zig").Datum {
+    if (descriptor.temporal_kind) |kind| {
+        if (descriptor.kind != .datetime or descriptor.element_type != null) return error.SqlTypeMismatch;
+        try raw.validateTemporal();
+        if (raw.sql_null) return raw;
+        if (raw.temporal()) |value| {
+            if (value.kind() != kind) return error.SqlTypeMismatch;
+            return raw;
+        }
+        if (raw.value != .string or raw.array != null or raw.numeric != null or raw.patterns() != null) return error.SqlTypeMismatch;
+        const value = try @import("temporal_text.zig").parseCanonical(kind, raw.value.string);
+        const owned = try alloc.create(@import("temporal_value.zig").Value);
+        owned.* = value;
+        return .typedTemporal(owned);
+    }
+    return coerceDatum(alloc, raw, descriptor.kind orelse return error.UnknownSqlParameterType, descriptor.element_type);
 }
 
 pub fn coerceDatum(alloc: std.mem.Allocator, raw: @import("scalar.zig").Datum, kind: ast.ColumnType, element_type: ?@import("array_value.zig").ElementType) !@import("scalar.zig").Datum {

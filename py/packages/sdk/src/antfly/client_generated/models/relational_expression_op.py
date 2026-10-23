@@ -45,6 +45,8 @@ class RelationalExpressionOp(StrEnum):
     SUBTRACT = "subtract"
     TRUNC = "trunc"
     UPPER_ASCII = "upper_ascii"
+    UUIDV4 = "uuidv4"
+    UUIDV7 = "uuidv7"
 
     def __str__(self) -> str:
         return str(self.value)

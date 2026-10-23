@@ -34,6 +34,7 @@ const NativeOwner = struct {
     svc: *@import("../metadata/service.zig").MetadataService,
     resolutions: usize = 0,
     mutations: usize = 0,
+    fault: enum { none, reject_before, lost_after, oom_after, malformed_after, wrong_version_after } = .none,
 
     fn source(self: *NativeOwner) server_mod.StatusSource {
         return .{ .ptr = self, .vtable = &.{ .status = status, .system_catalog = run, .supports_query_definitions = true } };
@@ -50,7 +51,29 @@ const NativeOwner = struct {
             .snapshot => return error.UnexpectedCatalogSnapshot,
             else => {},
         }
-        return @import("../system_catalog/operations.zig").call(self.svc, a, context, call);
+        const fault = if (call == .relation_schema_mutate) self.fault else .none;
+        if (call == .relation_schema_mutate) self.fault = .none;
+        if (fault == .reject_before) return error.CatalogGenerationChanged;
+        const response = try @import("../system_catalog/operations.zig").call(self.svc, a, context, call);
+        switch (fault) {
+            .none => return response,
+            .reject_before => unreachable,
+            .lost_after, .oom_after => {
+                a.free(response);
+                return if (fault == .oom_after) error.OutOfMemory else error.MetadataMutationOutcomeUnknown;
+            },
+            .malformed_after => {
+                a.free(response);
+                return a.dupe(u8, "{invalid");
+            },
+            .wrong_version_after => {
+                defer a.free(response);
+                var result = try std.json.parseFromSlice(@import("../system_catalog/server_call.zig").RelationReplacementResult, a, response, .{});
+                defer result.deinit();
+                result.value.schema_version += 1;
+                return std.json.Stringify.valueAlloc(a, result.value, .{});
+            },
+        }
     }
 };
 
@@ -114,38 +137,41 @@ fn resolveNativeOwner(a: A, svc: *@import("../metadata/service.zig").MetadataSer
     return store.resolveSystemCatalogIdentities(a, svc.metadata_group_id, .{ .relations = &.{.{ .name = "usage_records" }}, .include_query_definitions = true });
 }
 
-test "httpx SQL catalog original null uniqueness declarations use real leader admission and restart" {
+const NativeCatalogFactory = struct {
+    const raft = @import("raft_engine");
+    const host = @import("../raft/host.zig");
+    alloc: A,
+    store: *raft.core.MemoryStorage,
+    fn iface(self: *@This()) host.ReplicaDescriptorFactory {
+        return .{ .ptr = self, .vtable = &.{ .build_descriptor = build, .free_descriptor = free } };
+    }
+    fn build(raw: *anyopaque, record: host.catalog.ReplicaRecord) !raft.runtime.ReplicaDescriptor {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        return .{ .group = .{
+            .group_id = record.group_id,
+            .local_node_id = record.local_node_id,
+            .raft_config = .{ .id = record.local_node_id, .group_id = record.group_id, .peers = try self.alloc.dupe(raft.core.types.NodeId, &.{record.local_node_id}), .election_tick = 5, .heartbeat_tick = 1, .pre_vote = false, .check_quorum = true },
+            .storage = self.store.storage(),
+        }, .bootstrap = if (record.bootstrap_mode == .empty) .empty else .persisted };
+    }
+    fn free(raw: *anyopaque, _: A, descriptor: *raft.runtime.ReplicaDescriptor) void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        self.alloc.free(descriptor.group.raft_config.peers);
+    }
+};
+
+test "httpx SQL catalog validated declarations require execution authority and preserve native owners across restart" {
     // This is single-voter metadata recovery, not quorum failover or data-owner
     // activation qualification. Original cases receive no completion credit.
     const a = std.testing.allocator;
     const raft = @import("raft_engine");
-    const host = @import("../raft/host.zig");
     const service = @import("../metadata/service.zig");
-    const Factory = struct {
-        alloc: A,
-        store: *raft.core.MemoryStorage,
-        fn iface(self: *@This()) host.ReplicaDescriptorFactory {
-            return .{ .ptr = self, .vtable = &.{ .build_descriptor = build, .free_descriptor = free } };
-        }
-        fn build(raw: *anyopaque, record: host.catalog.ReplicaRecord) !raft.runtime.ReplicaDescriptor {
-            const self: *@This() = @ptrCast(@alignCast(raw));
-            return .{ .group = .{
-                .group_id = record.group_id,
-                .local_node_id = record.local_node_id,
-                .raft_config = .{ .id = record.local_node_id, .group_id = record.group_id, .peers = try self.alloc.dupe(raft.core.types.NodeId, &.{record.local_node_id}), .election_tick = 5, .heartbeat_tick = 1, .pre_vote = false, .check_quorum = true },
-                .storage = self.store.storage(),
-            }, .bootstrap = if (record.bootstrap_mode == .empty) .empty else .persisted };
-        }
-        fn free(raw: *anyopaque, _: A, descriptor: *raft.runtime.ReplicaDescriptor) void {
-            const self: *@This() = @ptrCast(@alignCast(raw));
-            self.alloc.free(descriptor.group.raft_config.peers);
-        }
-    };
+    const Factory = NativeCatalogFactory;
     var corpus = try local.sql_parity_fixtures.Corpus.init(a);
     defer corpus.deinit();
     var runtime = try local.storage_background_runtime.BackendRuntimeHandle.init(a, .{ .backend = .io_threaded });
     defer runtime.deinit();
-    for ([_][]const u8{ "sql-0692", "sql-0706", "sql-0731" }, [_]bool{ true, false, false }) |id, not_distinct| {
+    for ([_][]const u8{ "sql-0692", "sql-0706", "sql-0731" }) |id| {
         const original = try corpus.get(id);
         try std.testing.expectEqual(@as(usize, 0), original.params.len);
         var directory = try local.common_test_directory.TestDirectory.init("sql-catalog-native-owner");
@@ -190,30 +216,34 @@ test "httpx SQL catalog original null uniqueness declarations use real leader ad
         try settleNativeOwner(&svc, "after CREATE and source adoption");
         const resolutions = owner.resolutions;
         const mutations = owner.mutations;
+        var predecessor = try resolveNativeOwner(a, &svc);
+        defer predecessor.deinit(a);
         var response = try request(a, &handler, original.sql);
         defer response.deinit();
-        if (response.status.code != 202) std.debug.print("native catalog {s}: {s}\n", .{ id, response.body orelse "" });
-        try std.testing.expectEqual(@as(u16, 202), response.status.code);
-        const result = try std.json.parseFromSlice(wire.SQLResponse, a, response.body.?, .{});
+        // This fixture owns metadata but has neither the private index build
+        // port nor replicated restore jobs. A validated declaration must not
+        // bypass historical-row validation by falling back to schema CAS.
+        // Successful originals, enforcement and cold postimages are qualified
+        // in the mounted index/schema lifecycle campaigns with real owners.
+        try std.testing.expectEqual(@as(u16, 501), response.status.code);
+        const result = try std.json.parseFromSlice(struct { code: []const u8 }, a, response.body.?, .{ .ignore_unknown_fields = true });
         defer result.deinit();
-        // Without data-owner readiness, committed declarations must retain a
-        // pending receipt rather than claim the unique index is usable.
-        try std.testing.expectEqual(wire.SQLMutationOutcome.committed_pending, result.value.mutation_outcome.?);
-        try std.testing.expectEqual(.pending, result.value.ddl_receipt.?.state);
-        try std.testing.expectEqual(initial_version + 1, result.value.ddl_receipt.?.schema_version);
+        try std.testing.expectEqualStrings("0A000", result.value.code);
         try std.testing.expectEqual(resolutions + 1, owner.resolutions);
-        try std.testing.expectEqual(mutations + 1, owner.mutations);
+        try std.testing.expectEqual(mutations, owner.mutations);
         try settleNativeOwner(&svc, "after ALTER");
         var before = try resolveNativeOwner(a, &svc);
         defer before.deinit(a);
         const table = before.relations[0].?;
+        try std.testing.expectEqual(initial_version, @as(i64, table.owner.schema_version));
+        try std.testing.expect(predecessor.relations[0].?.owner.eql(table.owner));
+        try std.testing.expectEqualStrings(predecessor.relations[0].?.table.query_definition.?.schema_json, table.table.query_definition.?.schema_json);
         var parsed = try local.schema_mod.parseValidatedTableSchema(a, table.table.query_definition.?.schema_json);
         defer parsed.deinit(a);
         var arena = std.heap.ArenaAllocator.init(a);
         defer arena.deinit();
         const definitions = try parsed.relationalUniqueDefinitions(arena.allocator());
-        try std.testing.expectEqual(@as(usize, 2), definitions.len);
-        try std.testing.expectEqual(not_distinct, definitions[1].nulls_not_distinct);
+        try std.testing.expectEqual(@as(usize, 1), definitions.len);
         svc.deinit();
         open = false;
         svc = try service.MetadataService.init(a, config, .{ .host = .{ .host = .{ .descriptor_factory = factory.iface() } } }, .{ .observe_local_replica_root = false });
@@ -227,6 +257,91 @@ test "httpx SQL catalog original null uniqueness declarations use real leader ad
         try std.testing.expect(table.owner.eql(recovered.relations[0].?.owner));
         try std.testing.expectEqualStrings(table.table.query_definition.?.schema_json, recovered.relations[0].?.table.query_definition.?.schema_json);
         try std.testing.expectEqualSlices(u8, &before.relation_epoch.?.incarnation, &recovered.relation_epoch.?.incarnation);
+    }
+}
+
+test "httpx SQL original nullability relaxation preserves ambiguous metadata results across cold authority recovery" {
+    // Complements the authenticated mounted data-owner campaign. Faults here
+    // occur at the actual metadata operation response, not a fabricated apply
+    // result or an outer HTTP reply. Single-voter recovery is not quorum failover.
+    const a = std.testing.allocator;
+    const raft = @import("raft_engine");
+    const service = @import("../metadata/service.zig");
+    var corpus = try local.sql_parity_fixtures.Corpus.init(a);
+    defer corpus.deinit();
+    const original = try corpus.get("sql-0745");
+    try std.testing.expectEqual(@as(usize, 0), original.params.len);
+    var runtime = try local.storage_background_runtime.BackendRuntimeHandle.init(a, .{ .backend = .io_threaded });
+    defer runtime.deinit();
+    for ([_]@FieldType(NativeOwner, "fault"){ .reject_before, .lost_after, .oom_after, .malformed_after, .wrong_version_after }) |fault| {
+        var directory = try local.common_test_directory.TestDirectory.init("sql-relaxation-native-authority");
+        defer directory.cleanup();
+        const catalog_path = try std.fmt.allocPrint(a, "{s}/replicas.txt", .{directory.path()});
+        defer a.free(catalog_path);
+        var raft_store = raft.core.MemoryStorage.init(a);
+        defer raft_store.deinit();
+        var factory: NativeCatalogFactory = .{ .alloc = a, .store = &raft_store };
+        const config: @import("../raft/managed_host.zig").ManagedHostConfig = .{
+            .host = .{ .local_node_id = 1, .metadata_group_id = 1941, .replica_root_dir = directory.path(), .replica_catalog_path = catalog_path },
+        };
+        var svc = try service.MetadataService.init(a, config, .{ .host = .{ .host = .{ .descriptor_factory = factory.iface() } } }, .{ .observe_local_replica_root = false });
+        var live = true;
+        defer if (live) svc.deinit();
+        _ = try svc.ensureMetadataReplica(.{ .group_id = 1941, .replica_id = 1, .local_node_id = 1, .bootstrap_mode = .empty });
+        try svc.campaignMetadataGroup();
+        for (0..8) |_| try svc.runRound();
+        try adoptNativeSources(&svc);
+        try settleNativeOwner(&svc, "before nullability prerequisite");
+        var owner: NativeOwner = .{ .svc = &svc };
+        var server = server_mod.ApiHttpServer.init(a, .{ .backend_runtime = runtime.ptr() }, owner.source(), null, null);
+        defer server.deinit();
+        var handler: handler_mod.AntflyApiHandler = .{ .api_server = &server };
+        {
+            var created = try request(a, &handler, "CREATE TABLE usage_records(id UUID PRIMARY KEY,status TEXT NOT NULL DEFAULT 'open')");
+            defer created.deinit();
+            try std.testing.expectEqual(@as(u16, 202), created.status.code);
+        }
+        try settleNativeOwner(&svc, "before DROP NOT NULL");
+        var before = try resolveNativeOwner(a, &svc);
+        defer before.deinit(a);
+        const predecessor = before.relations[0].?;
+        const attempts = owner.mutations;
+        owner.fault = fault;
+        var response = try request(a, &handler, original.sql);
+        defer response.deinit();
+        if (response.status.code != 409) std.debug.print("metadata relaxation fault={s} status={d} body={s}\n", .{ @tagName(fault), response.status.code, response.body orelse "" });
+        try std.testing.expectEqual(@as(u16, 409), response.status.code);
+        var diagnostic = try std.json.parseFromSlice(wire.SQLDiagnostic, a, response.body.?, .{});
+        defer diagnostic.deinit();
+        try std.testing.expectEqualStrings(if (fault == .reject_before) "40001" else "40003", diagnostic.value.code);
+        try std.testing.expectEqual(@as(?bool, fault == .reject_before), diagnostic.value.retryable);
+        try std.testing.expectEqual(attempts + 1, owner.mutations);
+        try std.testing.expectEqual(.none, owner.fault);
+        try settleNativeOwner(&svc, "after metadata response fault");
+        var after = try resolveNativeOwner(a, &svc);
+        defer after.deinit(a);
+        const current = after.relations[0].?;
+        try std.testing.expectEqual(predecessor.owner.table_id, current.owner.table_id);
+        try std.testing.expectEqual(predecessor.owner.schema_version + @as(u32, if (fault == .reject_before) 0 else 1), current.owner.schema_version);
+        if (fault == .reject_before) {
+            try std.testing.expect(predecessor.owner.eql(current.owner));
+            try std.testing.expectEqualStrings(predecessor.table.query_definition.?.schema_json, current.table.query_definition.?.schema_json);
+        } else try std.testing.expect(!std.mem.eql(u8, predecessor.table.query_definition.?.schema_json, current.table.query_definition.?.schema_json));
+        svc.deinit();
+        live = false;
+        svc = try service.MetadataService.init(a, config, .{ .host = .{ .host = .{ .descriptor_factory = factory.iface() } } }, .{ .observe_local_replica_root = false });
+        live = true;
+        _ = try svc.ensureMetadataReplica(.{ .group_id = 1941, .replica_id = 1, .local_node_id = 1, .bootstrap_mode = .persisted });
+        try svc.campaignMetadataGroup();
+        for (0..8) |_| try svc.runRound();
+        try settleNativeOwner(&svc, "after cold metadata recovery");
+        var recovered = try resolveNativeOwner(a, &svc);
+        defer recovered.deinit(a);
+        const actual = recovered.relations[0].?;
+        try std.testing.expect(current.owner.eql(actual.owner));
+        try std.testing.expectEqualStrings(current.table.query_definition.?.schema_json, actual.table.query_definition.?.schema_json);
+        try std.testing.expectEqualSlices(u8, &after.relation_epoch.?.incarnation, &recovered.relation_epoch.?.incarnation);
+        try std.testing.expectEqual(attempts + 1, owner.mutations); // Cold observation never resubmits.
     }
 }
 

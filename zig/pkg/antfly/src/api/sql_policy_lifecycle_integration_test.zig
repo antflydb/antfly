@@ -229,8 +229,11 @@ const Campaign = struct {
     pub fn afterRestart(self: *@This(), ctx: *fixture.Context) !void {
         ctx.reader_headers = &self.reader;
         try std.testing.expectEqualDeep(self.owner, try fixture.waitServingSchema(ctx, "usage_records", self.owner.version));
-        try @import("sql_policy_owner_test_support.zig").expectNoSearchArtifacts(ctx, self.owner.table_id);
         try self.check(ctx);
+        // Disabled policies need not eagerly open a resident owner during
+        // control recovery. Observe real inventory after the cold SQL reads
+        // have admitted that owner; those reads must not create search indexes.
+        try @import("sql_policy_owner_test_support.zig").expectNoSearchArtifacts(ctx, self.owner.table_id);
         // SQL predicates and legacy mandatory Antfly filters compose; neither
         // replaces the other. Authenticate anew after the filter mutation.
         const manager = ctx.metadata.server.owned_public_http_server.?.cfg.user_manager.?;
@@ -240,14 +243,14 @@ const Campaign = struct {
 };
 
 test "mounted SQL original row policies publish default denial compose filters and recover owner enforcement" {
+    const ids = [_][]const u8{ "sql-0321", "sql-0322", "sql-0323", "sql-0324", "sql-0325", "sql-0326", "sql-0327", "sql-0328", "sql-0329", "sql-0330", "sql-0331" };
     var parsed = try std.json.parseFromSlice(Golden, std.testing.allocator, local.sql_parity_fixtures.policy_lifecycle_reference, .{});
     defer parsed.deinit();
     try std.testing.expectEqual(@as(u8, 1), parsed.value.format);
     try std.testing.expectEqualStrings("PostgreSQL exact SQL", parsed.value.reference);
-    try std.testing.expectEqual(@as(usize, 11), parsed.value.cases.len);
-    for (parsed.value.cases, 321..) |case, number| {
-        var id: [8]u8 = undefined;
-        try std.testing.expectEqualStrings(try std.fmt.bufPrint(&id, "sql-{d:0>4}", .{number}), case.id);
+    try std.testing.expectEqual(ids.len, parsed.value.cases.len);
+    for (parsed.value.cases, ids) |case, id| {
+        try std.testing.expectEqualStrings(id, case.id);
         errdefer std.debug.print("policy lifecycle original={s}\n", .{case.id});
         try fixture.runWithState(Campaign, .{ .golden = &parsed.value, .case = case });
     }

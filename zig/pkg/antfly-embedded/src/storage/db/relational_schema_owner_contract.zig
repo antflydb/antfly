@@ -30,6 +30,38 @@ pub const max_cursor = @import("relational_index_limits.zig").max_cursor_key_byt
 pub const max_header = 8192;
 pub const max_input_bytes = 56 + 2 * max_schema + integrity.max_catalog_bytes + max_names;
 
+/// Shared ordered-column identity for native preparation and metadata plan
+/// verification. This commits names, not a layout, scan result or permission.
+pub const ProjectionHasher = struct {
+    state: std.crypto.hash.Blake3,
+    count: usize = 0,
+    name_bytes: usize = 0,
+
+    pub fn init() ProjectionHasher {
+        var state = std.crypto.hash.Blake3.init(.{});
+        state.update("antfly/nullability-projection/v1");
+        return .{ .state = state };
+    }
+    pub fn add(self: *ProjectionHasher, name: []const u8) !void {
+        const total = std.math.add(usize, self.name_bytes, name.len) catch return error.InvalidNullabilityProjection;
+        if (self.count >= max_columns or name.len == 0 or total > max_names or std.mem.indexOfScalar(u8, name, 0) != null)
+            return error.InvalidNullabilityProjection;
+        var length: [8]u8 = undefined;
+        std.mem.writeInt(u64, &length, name.len, .little);
+        self.state.update(&length);
+        self.state.update(name);
+        self.count += 1;
+        self.name_bytes = total;
+    }
+    pub fn finish(self: ProjectionHasher) !Digest {
+        if (self.count == 0) return error.InvalidNullabilityProjection;
+        var state = self.state;
+        var result: Digest = undefined;
+        state.final(&result);
+        return result;
+    }
+};
+
 pub fn hash(bytes: []const u8) Digest {
     var result: Digest = undefined;
     std.crypto.hash.Blake3.hash(bytes, &result, .{});
@@ -68,7 +100,7 @@ pub const Binding = struct {
     }
 };
 
-pub const Phase = enum { fencing, scanning, ready, failed, canceling, canceled, installed };
+pub const Phase = enum { fencing, scanning, ready, failed, canceling, canceled, installed, released };
 /// Durable local installation evidence, not a signed publication receipt.
 /// The outer owner must authenticate decision/root/cohort authority before
 /// staging this record and commit its replay marker/outbox in the same txn.
@@ -80,6 +112,13 @@ pub const Installation = struct {
     physical_catalog: Digest,
     activation: Digest,
     position: positions.Position,
+};
+/// Immutable terminal predecessor, retained after admission is lifted. The
+/// coordinator's publication digest is distinct from the install decision.
+pub const Release = struct {
+    publication: Digest,
+    installed_digest: Digest,
+    installed_last_effect: Digest,
 };
 pub const Header = struct {
     binding: Binding,
@@ -95,6 +134,7 @@ pub const Header = struct {
     last_effect: Digest,
     failure_column: ?u16 = null,
     installation: ?Installation = null,
+    release: ?Release = null,
 
     pub fn validate(self: Header) !void {
         try self.binding.validate();
@@ -105,16 +145,31 @@ pub const Header = struct {
             (self.failure_column != null and self.failure_column.? >= self.binding.columns) or
             (self.phase != .canceling and self.phase != .canceled and self.admitted == null) or
             (self.frozen != null and self.admitted == null) or
-            (self.phase == .installed) != (self.installation != null)) return error.InvalidSchemaValidationJob;
+            ((self.phase == .installed or self.phase == .released) != (self.installation != null)) or
+            ((self.phase == .released) != (self.release != null))) return error.InvalidSchemaValidationJob;
         if (self.phase == .fencing and (self.frozen != null or self.records != 0 or self.rows_scanned != 0 or !eq(self.cursor_digest, hash(""))))
             return error.InvalidSchemaValidationJob;
-        if ((self.phase == .scanning or self.phase == .ready or self.phase == .failed or self.phase == .installed) and self.frozen == null) return error.InvalidSchemaValidationJob;
+        if ((self.phase == .scanning or self.phase == .ready or self.phase == .failed or self.phase == .installed or self.phase == .released) and self.frozen == null) return error.InvalidSchemaValidationJob;
         for ([_]?positions.Position{ self.admitted, self.frozen, self.updated }) |maybe| if (maybe) |position| {
             try position.requireNamespace(self.binding.fence.namespace);
             if ((position == .native) != (self.binding.authority == .native)) return error.InvalidControlReceiptPosition;
             try precedesOrEqual(position, self.updated);
         };
         if (self.frozen) |cut| try precedes(self.admitted.?, cut);
+        if (self.release) |released| {
+            inline for (.{ "publication", "installed_digest", "installed_last_effect" }) |field|
+                if (std.mem.allEqual(u8, &@field(released, field), 0)) return error.InvalidSchemaValidationJob;
+            var predecessor = self;
+            predecessor.phase = .installed;
+            predecessor.release = null;
+            predecessor.updated = self.installation.?.position;
+            predecessor.last_effect = released.installed_last_effect;
+            predecessor.revision = std.math.sub(u64, self.revision, 1) catch return error.InvalidSchemaValidationJob;
+            try predecessor.validate();
+            try precedes(predecessor.updated, self.updated);
+            if (!eq(try predecessor.digest(), released.installed_digest)) return error.InvalidSchemaValidationJob;
+            return;
+        }
         if (self.installation) |installed| {
             inline for (.{ "decision", "ready_digest", "ready_last_effect", "physical_catalog", "activation" }) |field|
                 if (std.mem.allEqual(u8, &@field(installed, field), 0)) return error.InvalidSchemaValidationJob;
@@ -269,6 +324,27 @@ pub const PageCommand = struct {
     }
 };
 
+/// Raw immutable inputs shared by metadata dispatch and physical preparation.
+/// Encoding validates framing/bounds, not schema semantics or authorization.
+pub fn encodeInputs(a: A, parts: [4][]const u8) ![]u8 {
+    const limits = [_]usize{ max_schema, max_schema, integrity.max_catalog_bytes, max_names };
+    var length: usize = 56;
+    for (parts, limits) |part, limit| {
+        if (part.len == 0 or part.len > limit) return error.InvalidSchemaValidationJob;
+        length += part.len;
+    }
+    const bytes = try a.alloc(u8, length);
+    @memcpy(bytes[0..8], "ASVI\x01\x00\x00\x00");
+    var offset: usize = 24;
+    for (parts, 0..) |part, i| {
+        std.mem.writeInt(u32, bytes[8 + 4 * i ..][0..4], @intCast(part.len), .little);
+        @memcpy(bytes[offset..][0..part.len], part);
+        offset += part.len;
+    }
+    @memcpy(bytes[offset..][0..32], &hash(bytes[0..offset]));
+    return bytes;
+}
+
 pub fn inputParts(bytes: []const u8) ![4][]const u8 {
     if (bytes.len < 56 or bytes.len > max_input_bytes or !std.mem.eql(u8, bytes[0..8], "ASVI\x01\x00\x00\x00") or !eq(hash(bytes[0 .. bytes.len - 32]), bytes[bytes.len - 32 ..][0..32].*))
         return error.InvalidSchemaValidationJob;
@@ -284,6 +360,83 @@ pub fn inputParts(bytes: []const u8) ![4][]const u8 {
     if (offset != bytes.len - 32) return error.InvalidSchemaValidationJob;
     return result;
 }
+
+test "schema validation publication immutable inputs remain raw bounded and allocation atomic" {
+    const parts = [4][]const u8{ "{\"version\":1}", "{\"version\":2}", "\x00\xffcatalog", "[\"n\"]" };
+    const Check = struct {
+        fn run(a: A, values: [4][]const u8) !void {
+            const bytes = try encodeInputs(a, values);
+            defer a.free(bytes);
+            const decoded = try inputParts(bytes);
+            for (values, decoded) |expected, actual| try std.testing.expectEqualSlices(u8, expected, actual);
+            bytes[bytes.len - 1] ^= 1;
+            try std.testing.expectError(error.InvalidSchemaValidationJob, inputParts(bytes));
+        }
+    };
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Check.run, .{parts});
+    var invalid = parts;
+    invalid[3] = "";
+    try std.testing.expectError(error.InvalidSchemaValidationJob, encodeInputs(std.testing.failing_allocator, invalid));
+    invalid = parts;
+    invalid[3] = @as([*]const u8, @ptrFromInt(1))[0 .. max_names + 1];
+    try std.testing.expectError(error.InvalidSchemaValidationJob, encodeInputs(std.testing.failing_allocator, invalid));
+}
+/// Read-only pre-admission facts from one retained physical owner cut. A null
+/// position denotes an actually empty source clock, never a synthetic receipt.
+/// The provisional plan digest is deliberately excluded from intent identity:
+/// the final immutable cohort commits all preparations before it can exist.
+pub const PreparationDescriptor = struct {
+    id: [16]u8,
+    provisional_plan: Digest,
+    fence: topology.Fence,
+    authority: @import("../source_authority.zig").Kind,
+
+    pub fn validate(self: @This()) !void {
+        _ = try self.fence.encode();
+        if (std.mem.allEqual(u8, &self.id, 0) or std.mem.allEqual(u8, &self.provisional_plan, 0) or
+            self.fence.role != .schema_validation or self.fence.owner_group_id != self.fence.peer_group_id or
+            self.fence.namespace.shard_id == 0 or self.fence.namespace.range_id == 0) return error.InvalidSchemaValidationJob;
+    }
+};
+pub const Preparation = struct {
+    pub const max_wire_bytes = 16 * 1024;
+    binding: Binding,
+    physical_root_incarnation: u128,
+    position: ?positions.Position,
+    replication_pending: bool = false,
+
+    pub fn validate(self: @This()) !void {
+        try self.binding.validate();
+        if (self.physical_root_incarnation == 0) return error.SchemaValidationJobChanged;
+        if (self.position) |position| {
+            try position.requireNamespace(self.binding.fence.namespace);
+            if ((position == .native) != (self.binding.authority == .native)) return error.InvalidControlReceiptPosition;
+        }
+    }
+    pub fn requireFor(self: @This(), binding: Binding) !void {
+        try self.validate();
+        try binding.validate();
+        var provisional = self.binding;
+        provisional.plan_digest = binding.plan_digest;
+        if (!std.meta.eql(provisional, binding)) return error.SchemaValidationJobChanged;
+    }
+};
+
+/// Bounded owner-local facts, not a metadata grant or a signed readiness ACK.
+/// The receiver qualifies the directory against the complete immutable binding.
+pub const TransactionDebtObservation = struct {
+    revision: u64,
+    debt: u64,
+    ready: bool,
+    retired: bool,
+    expected: Digest,
+
+    pub fn validate(self: @This()) !void {
+        if (self.revision == 0 or std.mem.allEqual(u8, &self.expected, 0) or
+            (self.retired and (self.ready or self.debt != 0))) return error.SchemaValidationJobChanged;
+    }
+};
+
 pub const NativeObservation = struct {
     pub const max_wire_bytes = 32 * 1024;
     binding: Binding,
@@ -291,6 +444,7 @@ pub const NativeObservation = struct {
     sequence: u64,
     header: ?Header,
     replication_pending: bool,
+    transaction_debt: ?TransactionDebtObservation = null,
 
     pub fn validateFor(self: @This(), binding: Binding) !void {
         try binding.validate();
@@ -301,10 +455,74 @@ pub const NativeObservation = struct {
             if (!std.meta.eql(header.binding, binding) or header.updated != .native or
                 header.updated.native.sequence > self.sequence) return error.SchemaValidationJobChanged;
         }
+        if (self.transaction_debt) |directory| try directory.validate();
     }
 };
 
-pub const Action = enum { begin, freeze, page, cancel, install };
+/// Native effect acknowledgement, not a signed phase/publication receipt.
+/// Decoders must own or copy error_name before releasing their JSON storage.
+pub const NativeOutcome = struct {
+    header: ?Header,
+    position: positions.Native,
+    duplicate: bool,
+    replication_pending: bool = false,
+    error_name: ?[]const u8 = null,
+
+    pub fn validateFor(self: @This(), binding: Binding) !void {
+        try binding.validate();
+        try self.position.validate();
+        if (binding.authority != .native) return error.InvalidControlReceiptPosition;
+        if (!self.position.namespace.eql(binding.fence.namespace)) return error.IdentityNamespaceMismatch;
+        if (self.header) |header| {
+            try header.validate();
+            if (!std.meta.eql(header.binding, binding)) return error.SchemaValidationJobChanged;
+            try precedesOrEqual(.{ .native = self.position }, header.updated);
+        }
+    }
+};
+
+/// Read from an actual retained owner snapshot. The applied entry is supplied
+/// by the storage owner, never by the observer request or a metadata report.
+/// An empty log is represented by null, not a fabricated term/index pair.
+pub const OwnerState = struct {
+    namespace: @import("doc_identity_namespace.zig").Namespace,
+    physical_root_incarnation: u128,
+    header: ?Header,
+};
+
+pub const RaftObservation = struct {
+    pub const max_wire_bytes = 32 * 1024;
+    binding: Binding,
+    physical_root_incarnation: u128,
+    applied: ?@FieldType(positions.Position, "raft"),
+    header: ?Header,
+    transaction_debt: ?TransactionDebtObservation = null,
+
+    pub fn validateFor(self: @This(), binding: Binding) !void {
+        try binding.validate();
+        if (binding.authority != .raft or self.physical_root_incarnation == 0 or
+            !std.meta.eql(self.binding, binding)) return error.SchemaValidationJobChanged;
+        if (self.applied) |cut| try (positions.Position{ .raft = cut }).validate();
+        if (self.transaction_debt) |directory| try directory.validate();
+        if (self.header) |header| {
+            try header.validate();
+            if (!std.meta.eql(header.binding, binding) or header.updated != .raft)
+                return error.SchemaValidationJobChanged;
+            const applied = self.applied orelse return error.InvalidControlReceiptPosition;
+            try precedesOrEqual(header.updated, .{ .raft = applied });
+        }
+    }
+};
+
+pub const Action = enum { begin, reconcile_transactions, freeze, page, cancel, install, release };
+
+pub fn transactionDebtEffect(expected: Digest) Digest {
+    const domain = "schema-validation-transaction-debt/v1";
+    var bytes: [domain.len + 32]u8 = undefined;
+    @memcpy(bytes[0..domain.len], domain);
+    @memcpy(bytes[domain.len..], &expected);
+    return hash(&bytes);
+}
 pub const CommandDescriptor = struct { binding: Binding, action: Action };
 pub const raft_magic = "ASVR\x01\x00\x00\x00";
 
@@ -312,8 +530,29 @@ pub const Command = struct {
     pub const max_raft_wire_bytes = 48 + max_header + max_input_bytes;
     binding: Binding,
     action: Action,
-    /// Borrowed immutable ASVI inputs, ASVP page, or decision+ready digests.
+    /// Borrowed immutable ASVI inputs, ASVP page, install decision+ready
+    /// digests, or install decision+installed digest+publication digest.
     payload: []const u8 = "",
+
+    /// Exact canonical ASVR identity, prepared off the serialized apply lane.
+    /// Stream the immutable payload rather than allocating a second frame.
+    pub fn raftIdentity(self: @This()) !Digest {
+        try self.validateFor(.raft);
+        var buffer: [max_header]u8 = undefined;
+        var writer = std.Io.Writer.fixed(&buffer);
+        try std.json.Stringify.value(CommandDescriptor{ .binding = self.binding, .action = self.action }, .{}, &writer);
+        var prefix: [16]u8 = undefined;
+        @memcpy(prefix[0..8], raft_magic);
+        std.mem.writeInt(u32, prefix[8..12], @intCast(writer.buffered().len), .little);
+        std.mem.writeInt(u32, prefix[12..16], @intCast(self.payload.len), .little);
+        var state = std.crypto.hash.Blake3.init(.{});
+        state.update(&prefix);
+        state.update(writer.buffered());
+        state.update(self.payload);
+        var result: Digest = undefined;
+        state.final(&result);
+        return result;
+    }
 
     /// Owned transport bytes, never a committed-entry receipt. Keeping the
     /// large immutable inputs raw avoids a JSON/base64 copy at the ABI edge.
@@ -362,6 +601,7 @@ pub const Command = struct {
         try self.binding.validate();
         if (self.binding.authority != authority) return error.InvalidControlReceiptPosition;
         switch (self.action) {
+            .reconcile_transactions => if (self.payload.len != 32 or std.mem.allEqual(u8, self.payload, 0)) return error.InvalidSchemaOwnerControl,
             .begin => {
                 _ = try inputParts(self.payload);
                 if (!eq(hash(self.payload), self.binding.inputs)) return error.SchemaValidationJobChanged;
@@ -373,6 +613,8 @@ pub const Command = struct {
             .freeze, .cancel => if (self.payload.len != 0) return error.InvalidSchemaOwnerControl,
             .install => if (self.payload.len != 64 or std.mem.allEqual(u8, self.payload[0..32], 0) or
                 std.mem.allEqual(u8, self.payload[32..64], 0)) return error.InvalidSchemaOwnerControl,
+            .release => if (self.payload.len != 96 or std.mem.allEqual(u8, self.payload[0..32], 0) or
+                std.mem.allEqual(u8, self.payload[32..64], 0) or std.mem.allEqual(u8, self.payload[64..96], 0)) return error.InvalidSchemaOwnerControl,
         }
     }
 };

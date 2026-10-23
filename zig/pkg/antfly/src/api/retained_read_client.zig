@@ -28,7 +28,7 @@ fn unpublishedAdmissionBusy(operation: @FieldType(rpc.Request, "operation"), sta
         .admit, .capture, .validate, .snapshot, .open => true,
         // These operations can run after query evaluation/row delivery. A
         // negative reply never authorizes replay of an advanced cursor.
-        .open_snapshot, .next, .normalize, .range_proofs, .close, .cancel => false,
+        .open_snapshot, .next, .normalize, .range_proofs, .close, .cancel, .renew_snapshot => false,
     };
 }
 
@@ -152,6 +152,17 @@ pub const Client = struct {
         const self: *Client = @ptrCast(@alignCast(ptr));
         var response = try self.call(.{ .operation = .validate, .schema_version = self.schema_version, .token = self.token });
         defer response.deinit(self.alloc);
+    }
+
+    /// Explicit heartbeat for a transaction-owned snapshot. This never opens
+    /// a replacement cut. As with other retained operations, ambiguous delivery
+    /// poisons the client; recovery must not silently recapture newer data.
+    pub fn renewSnapshot(self: *Client, lease_ms: u32) !void {
+        if (lease_ms == 0 or lease_ms > rpc.max_lease_ms) return error.InvalidRetainedReadLease;
+        var response = try self.call(.{ .operation = .renew_snapshot, .schema_version = self.schema_version, .token = self.token, .connection = self.connection, .lease_ms = lease_ms });
+        defer response.deinit(self.alloc);
+        // Resource retention is not execution admission. Heartbeats must never
+        // extend the caller's statement deadline or bypass its cancellation.
     }
 
     fn captureSnapshot(ptr: *anyopaque, alloc: std.mem.Allocator) !@import("antfly_local_sources").storage_statement_read_fence.Snapshot {
@@ -303,6 +314,83 @@ fn consumerTests() type {
                 try std.testing.expect(!unpublishedAdmissionBusy(operation, 503, true, "RetainedReadExpired"));
                 try std.testing.expect(!unpublishedAdmissionBusy(operation, 503, true, "ReadUnavailable\n"));
             }
+        }
+
+        test "retained read client renews the exact snapshot and fails closed on lost acknowledgement" {
+            const Fixture = struct {
+                registry_owner: *registry.Registry,
+                calls: usize = 0,
+                closed: usize = 0,
+                lose_renewal: bool = false,
+                const scope = registry.Scope{ .principal = @splat(1), .authorization_revision = 1, .table_id = 2, .group_id = 3, .topology_revision = 4, .schema_version = 5 };
+                const route = metadata.CatalogRouteFence{ .metadata_group_id = 1, .catalog_revision = 1, .table_id = 2, .topology_epoch = 4, .route = .{ .group_id = 3, .range_id = 3, .identity_namespace = .{ .table_id = 2, .shard_id = 3, .range_id = 3 } } };
+                fn release(raw: *anyopaque) void {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    self.closed += 1;
+                }
+                fn execute(raw: *anyopaque, alloc: std.mem.Allocator, request: http.HttpRequest) !http.HttpResponse {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    self.calls += 1;
+                    var input = try std.json.parseFromSlice(rpc.Request, alloc, request.body, .{});
+                    defer input.deinit();
+                    const body = try rpc.execute(alloc, .{ .registry = self.registry_owner, .source = .{ .ptr = self, .vtable = &.{ .lookup = undefined, .scan = undefined, .query = undefined } } }, scope, "rows", input.value);
+                    errdefer alloc.free(body);
+                    if (self.lose_renewal and input.value.operation == .renew_snapshot) return error.ConnectionResetByPeer;
+                    const headers = try alloc.alloc(http.Header, 1);
+                    errdefer alloc.free(headers);
+                    const name = try alloc.dupe(u8, metadata.catalog_route_fence_ack_header);
+                    errdefer alloc.free(name);
+                    headers[0] = .{ .name = name, .value = try alloc.dupe(u8, metadata.catalog_route_fence_ack_value) };
+                    return .{ .status = 200, .body = body, .headers = headers };
+                }
+            };
+            const a = std.testing.allocator;
+            var lifetime = try registry.Registry.init(a, std.testing.io, 1, 8, 8, 30 * std.time.ns_per_s);
+            defer lifetime.deinit();
+            var fixture: Fixture = .{ .registry_owner = &lifetime };
+            const executor = http.RequestExecutor{ .ptr = &fixture, .clock_io = @import("antfly_runtime_abi").io_abi.Borrow.init(&std.testing.io), .vtable = &.{ .execute = Fixture.execute } };
+            const client = try Client.create(a, executor, "http://peer", "rows", Fixture.route, 5, null);
+            var client_closed = false;
+            defer if (!client_closed) Client.close(client);
+            const now = executor.monotonicNs();
+            client.deadline_ns = now + 10 * std.time.ns_per_s;
+            const request_deadline = client.deadline_ns;
+            client.token = try lifetime.insert(Fixture.scope, client.connection, now, now + std.time.ns_per_s, .{ .ptr = &fixture, .close = Fixture.release, .kind = .snapshot });
+            const original = client.token;
+            const owner: @import("retained_read_owner.zig").Owner = .{ .registry = &lifetime, .source = .{ .ptr = &fixture, .vtable = &.{ .lookup = undefined, .scan = undefined, .query = undefined } } };
+            try std.testing.expectError(error.InvalidRetainedReadToken, rpc.execute(a, owner, Fixture.scope, "rows", .{ .operation = .renew_snapshot, .schema_version = 5 }));
+            try std.testing.expectError(error.RetainedReadScopeChanged, rpc.execute(a, owner, Fixture.scope, "rows", .{ .operation = .renew_snapshot, .schema_version = 5, .token = original, .connection = 0 }));
+            // Failure to allocate the acknowledgement cannot mutate retention.
+            var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+            try std.testing.expectError(error.OutOfMemory, rpc.execute(failing.allocator(), owner, Fixture.scope, "rows", .{ .operation = .renew_snapshot, .schema_version = 5, .token = original, .connection = client.connection, .lease_ms = rpc.max_lease_ms }));
+            try std.testing.expectError(error.RetainedReadExpired, lifetime.borrow(original, Fixture.scope, .snapshot, now + std.time.ns_per_s));
+            try std.testing.expectError(error.InvalidRetainedReadLease, client.renewSnapshot(0));
+            try std.testing.expectError(error.InvalidRetainedReadLease, client.renewSnapshot(rpc.max_lease_ms + 1));
+            try std.testing.expectEqual(0, fixture.calls);
+            try client.renewSnapshot(rpc.max_lease_ms);
+            try std.testing.expectEqual(request_deadline, client.deadline_ns);
+            try std.testing.expectEqual(original, client.token);
+            try client.renewSnapshot(1000);
+            try std.testing.expectEqual(request_deadline, client.deadline_ns);
+            var pinned = try lifetime.borrow(original, Fixture.scope, .snapshot, now + 2 * std.time.ns_per_s);
+            pinned.deinit();
+            const calls_before_expiry = fixture.calls;
+            client.deadline_ns = 0;
+            try std.testing.expectError(error.DeadlineExceeded, client.renewSnapshot(rpc.max_lease_ms));
+            try std.testing.expectEqual(calls_before_expiry, fixture.calls);
+            client.deadline_ns = request_deadline;
+            fixture.lose_renewal = true;
+            try std.testing.expectError(error.ConnectionResetByPeer, client.renewSnapshot(rpc.max_lease_ms));
+            try std.testing.expect(client.poisoned);
+            const calls = fixture.calls;
+            try std.testing.expectError(error.RetainedReadRestartRequired, client.renewSnapshot(rpc.max_lease_ms));
+            try std.testing.expectEqual(calls, fixture.calls);
+            try std.testing.expectEqual(0, fixture.closed);
+            // Cleanup remains available on the poisoned client and never
+            // creates a replacement cut after ambiguous renewal delivery.
+            Client.close(client);
+            client_closed = true;
+            try std.testing.expectEqual(1, fixture.closed);
         }
 
         test "retained read client never replays an ambiguous page request" {

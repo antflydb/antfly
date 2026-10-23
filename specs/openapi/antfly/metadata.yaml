@@ -1383,6 +1383,10 @@ components:
       enum: [string, uuid, integer, number, boolean, datetime, json, array, unknown]
     SQLArrayElementType:
       $ref: "schema.yaml#/components/schemas/SQLArrayElementType"
+    SQLTemporalKind:
+      type: string
+      description: Exact temporal identity for datetime-family SQL values. Omission means timestamp_tz. Intervals preserve separate calendar months, days, and microseconds and use PostgreSQL interval text in JSON results.
+      enum: [date, time, time_tz, timestamp, timestamp_tz, interval]
     SQLArrayDimension:
       type: object
       additionalProperties: false
@@ -1437,6 +1441,8 @@ components:
           description: Display label. Labels need not be unique; rows use matching ordinal positions.
         type:
           $ref: "#/components/schemas/SQLColumnType"
+        temporal_kind:
+          $ref: "#/components/schemas/SQLTemporalKind"
         element_type:
           $ref: "#/components/schemas/SQLArrayElementType"
           description: Required for array columns and exact NUMERIC number columns. Identifies scalar widths when supplied. The descriptor applies even to NULL or empty arrays.
@@ -1535,6 +1541,8 @@ components:
       properties:
         type:
           $ref: '#/components/schemas/SQLColumnType'
+        temporal_kind:
+          $ref: '#/components/schemas/SQLTemporalKind'
         element_type:
           $ref: '#/components/schemas/SQLArrayElementType'
         nullable:
@@ -1774,6 +1782,8 @@ components:
           $ref: "#/components/schemas/SQLMutationOutcome"
         ddl_receipt:
           $ref: "#/components/schemas/SQLDDLReceipt"
+        catalog_receipt:
+          $ref: "#/components/schemas/SQLCatalogOperationReceipt"
         transaction_id:
           type: string
           pattern: '^[0-9a-fA-F]{32}$'
@@ -1792,12 +1802,14 @@ components:
       required: [database, namespace, table, table_id, schema_version, state]
       description: |
         Durable DDL operation receipt. admission_unknown means admission has
-        not been confirmed; retain the matching restore job, FK publication ID, or
-        index publication token and reconcile its status without replaying DDL.
+        not been confirmed; retain the matching restore job, FK publication ID,
+        index publication token, or schema validation token and reconcile its
+        status without replaying DDL.
         Pending means a durable operation was admitted, not necessarily that its
         successor schema is published. Invalid means declaration validation failed.
         Do not replay either. For an index build, observe the exact publication
-        token; otherwise inspect its restore job or table constraint status using
+        token. For validation-only schema changes, observe the exact schema
+        validation token; otherwise inspect its restore job or table constraint status using
         this immutable table identity and schema generation. A later generation
         may supersede the completed operation.
       properties:
@@ -1829,6 +1841,127 @@ components:
           description: Immutable FK-generation publication identity. Retain it when admission is unknown or activation remains pending; do not replay DDL.
         index_publication_token:
           $ref: "indexes.yaml#/components/schemas/IndexPublicationToken"
+        schema_validation_token:
+          $ref: "#/components/schemas/SchemaValidationToken"
+    SchemaValidationToken:
+      type: string
+      minLength: 182
+      maxLength: 182
+      pattern: "^[A-Za-z0-9_-]{182}$"
+      description: Opaque immutable validation-only schema job identity. Retain it across timeouts or lost replies and observe its exact status without replaying DDL. It grants no authorization.
+    SchemaValidationState:
+      type: string
+      enum: [admission_unknown, pending, succeeded, canceled, failed]
+    SchemaValidationPhase:
+      type: string
+      enum: [validating, validated, installing, installed, releasing, succeeded, canceling, canceled]
+    SchemaValidationFailure:
+      type: string
+      enum: [requested, not_null_violation, owner_failed]
+    SchemaValidationStatus:
+      type: object
+      additionalProperties: false
+      required: [schema_validation_token, table_id, active_schema_version, state]
+      description: Historical job completion, not an authorization or promise that a later DDL has not superseded this schema. Success requires all owner installation, metadata publication and fence release barriers. Current table ownership is checked atomically with the job observation.
+      properties:
+        schema_validation_token:
+          $ref: "#/components/schemas/SchemaValidationToken"
+        table_id:
+          type: string
+        active_schema_version:
+          type: integer
+          format: int64
+          minimum: 0
+        state:
+          $ref: "#/components/schemas/SchemaValidationState"
+        phase:
+          $ref: "#/components/schemas/SchemaValidationPhase"
+        failure:
+          $ref: "#/components/schemas/SchemaValidationFailure"
+        owner_count:
+          type: integer
+          format: int32
+          minimum: 1
+          maximum: 4096
+        ready:
+          type: integer
+          format: int32
+          minimum: 0
+        installed:
+          type: integer
+          format: int32
+          minimum: 0
+        released:
+          type: integer
+          format: int32
+          minimum: 0
+        canceled:
+          type: integer
+          format: int32
+          minimum: 0
+    SQLCatalogObjectKind:
+      type: string
+      enum: [sequence]
+      description: Native catalog resource kind; never a synthetic physical table.
+    SQLCatalogOperationKind:
+      type: string
+      enum: [create, alter, rename, drop]
+    SQLCatalogOperationState:
+      type: string
+      enum: [committed, rejected, unknown]
+      description: A retained authoritative result, or an unconfirmed outcome. Unknown is never permission to replay DDL.
+    SQLCatalogOperationReceipt:
+      type: object
+      additionalProperties: false
+      required: [kind, operation, database, namespace, name, state, recovery_token]
+      description: |
+        Recovery receipt for an atomic native catalog mutation, separate from
+        physical table/schema publication receipts. Retain recovery_token and
+        observe it with getSQLCatalogOperation; never resubmit uncertain DDL.
+        Retention is bounded by catalog activity, not a promised wall-clock
+        interval. Missing, expired, inaccessible or superseded-authority outcomes
+        cannot be inferred from a current object name and remain unknown.
+        This receipt does not make a new request idempotent or recover a token
+        lost with an entire response. All identity integers are exact decimal strings.
+      properties:
+        kind:
+          $ref: '#/components/schemas/SQLCatalogObjectKind'
+        operation:
+          $ref: '#/components/schemas/SQLCatalogOperationKind'
+        database:
+          type: string
+        namespace:
+          type: string
+        name:
+          type: string
+        state:
+          $ref: '#/components/schemas/SQLCatalogOperationState'
+        recovery_token:
+          type: string
+          minLength: 1
+          maxLength: 8192
+          description: Opaque versioned operation handle. Send it unchanged; it is not a reusable admission ticket.
+        object_id:
+          type: string
+          pattern: '^[1-9][0-9]*$'
+          description: Actual committed catalog identity, when the result carries one; never a predicted allocation.
+        generation:
+          type: string
+          pattern: '^[1-9][0-9]*$'
+        catalog_revision:
+          type: string
+          pattern: '^[0-9]+$'
+        diagnostic:
+          $ref: '#/components/schemas/SQLDiagnostic'
+    SQLCatalogRecoveryRequest:
+      type: object
+      additionalProperties: false
+      required: [recovery_token]
+      properties:
+        recovery_token:
+          type: string
+          minLength: 1
+          maxLength: 8192
     SQLDiagnostic:
       type: object
       additionalProperties: false
@@ -13642,6 +13775,42 @@ paths:
           $ref: "#/components/responses/BadRequest"
         "500":
           $ref: "#/components/responses/InternalServerError"
+  /sql/operations/status:
+    post:
+      operationId: getSQLCatalogOperation
+      summary: Observe an exact retained SQL catalog operation
+      tags: [data_operations]
+      description: |
+        Read-only, body-bound observation of the original native catalog operation.
+        Requires current administrative permission on its qualified logical resource.
+        It does not execute, rebind, retry or admit a mutation. A retained rejection
+        includes its precise SQL diagnostic. Unknown or evicted outcomes remain
+        non-retryable SQLSTATE 40003; reconcile administratively rather than replaying.
+      x-antfly-client-request-policy:
+        max_retries: 0
+        follow_redirects: false
+        cookies_enabled: false
+        max_response_size: 16777216
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/SQLCatalogRecoveryRequest'}
+      responses:
+        '200':
+          description: Exact retained operation result or explicitly unknown outcome
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/SQLCatalogOperationReceipt'}
+        default:
+          description: Authentication, current authorization, token or observation admission failed
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/SQLDiagnostic'}
+      security:
+        - BasicAuth: []
+        - ApiKeyAuth: []
+        - BearerAuth: []
   /sql/connections:
     post:
       operationId: openSQLConnection
@@ -16738,6 +16907,38 @@ paths:
         "500":
           $ref: "#/components/responses/InternalServerError"
 
+  /tables/{tableName}/schema/publication:
+    parameters:
+      - { name: tableName, in: path, required: true, schema: { type: string } }
+    get:
+      summary: Observe an exact validation-only schema publication
+      description: Requires administration of the current logical table. This read never replays DDL; absent or unavailable observations cannot prove non-admission.
+      tags: [table_management]
+      operationId: getSchemaValidationPublication
+      parameters:
+        - name: X-Antfly-Schema-Validation-Token
+          in: header
+          required: true
+          schema:
+            $ref: "#/components/schemas/SchemaValidationToken"
+      responses:
+        "200":
+          description: Exact historical job and current table observation
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SchemaValidationStatus"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "403":
+          description: Current logical table administration is required
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          description: Table ownership or metadata incarnation changed
+        "503":
+          description: Metadata observation unavailable; retain the token and retry this read
+
   /tables/{tableName}/indexes/{indexName}/publication:
     parameters:
       - name: tableName
@@ -17982,6 +18183,40 @@ paths:
           $ref: "#/components/responses/InternalServerError"
         "501":
           description: Catalog target cannot be delegated to legacy table storage unambiguously.
+
+  /databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/schema/publication:
+    parameters:
+      - { name: databaseName, in: path, required: true, schema: { type: string } }
+      - { name: namespaceName, in: path, required: true, schema: { type: string } }
+      - { name: tableName, in: path, required: true, schema: { type: string } }
+    get:
+      summary: Observe an exact namespaced validation-only schema publication
+      description: Requires administration of the current logical table. This read never replays DDL; absent or unavailable observations cannot prove non-admission.
+      tags: [table_management]
+      operationId: getNamespaceSchemaValidationPublication
+      parameters:
+        - name: X-Antfly-Schema-Validation-Token
+          in: header
+          required: true
+          schema:
+            $ref: "#/components/schemas/SchemaValidationToken"
+      responses:
+        "200":
+          description: Exact historical job and current table observation
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SchemaValidationStatus"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "403":
+          description: Current logical table administration is required
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          description: Table ownership or metadata incarnation changed
+        "503":
+          description: Metadata observation unavailable; retain the token and retry this read
 
   /databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/indexes/{indexName}/publication:
     parameters:

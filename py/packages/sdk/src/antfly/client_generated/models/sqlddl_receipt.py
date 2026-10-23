@@ -14,12 +14,14 @@ T = TypeVar("T", bound="SQLDDLReceipt")
 @_attrs_define
 class SQLDDLReceipt:
     """Durable DDL operation receipt. admission_unknown means admission has
-    not been confirmed; retain the matching restore job, FK publication ID, or
-    index publication token and reconcile its status without replaying DDL.
+    not been confirmed; retain the matching restore job, FK publication ID,
+    index publication token, or schema validation token and reconcile its
+    status without replaying DDL.
     Pending means a durable operation was admitted, not necessarily that its
     successor schema is published. Invalid means declaration validation failed.
     Do not replay either. For an index build, observe the exact publication
-    token; otherwise inspect its restore job or table constraint status using
+    token. For validation-only schema changes, observe the exact schema
+    validation token; otherwise inspect its restore job or table constraint status using
     this immutable table identity and schema generation. A later generation
     may supersede the completed operation.
 
@@ -42,6 +44,8 @@ class SQLDDLReceipt:
                 immutable table identity, publication ID and plan commitment. This is not authentication or permission to
                 execute, cancel, adopt a root or replay DDL. Retain it before admission and use current table authorization when
                 observing the publication.
+            schema_validation_token (str | Unset): Opaque immutable validation-only schema job identity. Retain it across
+                timeouts or lost replies and observe its exact status without replaying DDL. It grants no authorization.
     """
 
     database: str
@@ -55,6 +59,7 @@ class SQLDDLReceipt:
     idempotency_key: str | Unset = UNSET
     fk_generation_publication_id: str | Unset = UNSET
     index_publication_token: str | Unset = UNSET
+    schema_validation_token: str | Unset = UNSET
 
     def to_dict(self) -> dict[str, Any]:
         database = self.database
@@ -79,6 +84,8 @@ class SQLDDLReceipt:
 
         index_publication_token = self.index_publication_token
 
+        schema_validation_token = self.schema_validation_token
+
         field_dict: dict[str, Any] = {}
 
         field_dict.update(
@@ -101,6 +108,8 @@ class SQLDDLReceipt:
             field_dict["fk_generation_publication_id"] = fk_generation_publication_id
         if index_publication_token is not UNSET:
             field_dict["index_publication_token"] = index_publication_token
+        if schema_validation_token is not UNSET:
+            field_dict["schema_validation_token"] = schema_validation_token
 
         return field_dict
 
@@ -129,6 +138,8 @@ class SQLDDLReceipt:
 
         index_publication_token = d.pop("index_publication_token", UNSET)
 
+        schema_validation_token = d.pop("schema_validation_token", UNSET)
+
         sqlddl_receipt = cls(
             database=database,
             namespace=namespace,
@@ -141,6 +152,7 @@ class SQLDDLReceipt:
             idempotency_key=idempotency_key,
             fk_generation_publication_id=fk_generation_publication_id,
             index_publication_token=index_publication_token,
+            schema_validation_token=schema_validation_token,
         )
 
         return sqlddl_receipt

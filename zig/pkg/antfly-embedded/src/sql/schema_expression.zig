@@ -19,7 +19,7 @@ const std = @import("std");
 const ast = @import("ast.zig");
 const scalar = @import("scalar.zig");
 const Json = std.json.Value;
-const ImmutableContext = enum { generation, index_key, index_predicate };
+const ExpressionContext = enum { generation, index_key, index_predicate, column_default };
 
 fn nativeType(kind: ast.ColumnType, identity: ?@import("array_value.zig").ElementType) []const u8 {
     return if (kind == .array) "sql_array" else if (kind == .number and identity == .numeric) "numeric" else if (kind == .uuid) "string" else @tagName(kind);
@@ -146,7 +146,7 @@ pub fn lowerIndexKey(alloc: std.mem.Allocator, schema: Json, expression: *const 
     return lowerTypedPolicy(alloc, schema, expression, null, .index_key, limits);
 }
 
-fn lowerTypedPolicy(alloc: std.mem.Allocator, schema: Json, expression: *const ast.Scalar, expected: ?ast.ColumnType, immutable: ?ImmutableContext, limits: @import("immutable_plan.zig").Limits) !Lowered {
+fn lowerTypedPolicy(alloc: std.mem.Allocator, schema: Json, expression: *const ast.Scalar, expected: ?ast.ColumnType, immutable: ?ExpressionContext, limits: @import("immutable_plan.zig").Limits) !Lowered {
     const properties = try @import("schema_columns.zig").properties(schema);
     var columns = std.ArrayList(scalar.Column).empty;
     for (properties.object.keys(), properties.object.values()) |name, property| {
@@ -160,7 +160,7 @@ pub fn lowerColumns(alloc: std.mem.Allocator, columns: []const scalar.Column, ex
     return lowerColumnsPolicy(alloc, columns, expression, expected, null, .{});
 }
 
-fn lowerColumnsPolicy(alloc: std.mem.Allocator, columns: []const scalar.Column, expression: *const ast.Scalar, expected: ?ast.ColumnType, immutable: ?ImmutableContext, limits: @import("immutable_plan.zig").Limits) !Lowered {
+fn lowerColumnsPolicy(alloc: std.mem.Allocator, columns: []const scalar.Column, expression: *const ast.Scalar, expected: ?ast.ColumnType, immutable: ?ExpressionContext, limits: @import("immutable_plan.zig").Limits) !Lowered {
     if (limits.checkpoint) |check| try check(limits.checkpoint_context);
     var program = try scalar.bindExpected(alloc, expression, columns, &.{}, expected, .{});
     defer program.deinit();
@@ -210,11 +210,23 @@ pub fn indexInstructionIdentity(alloc: std.mem.Allocator, program: *const scalar
     return result;
 }
 
-fn lowerProgramPolicy(alloc: std.mem.Allocator, program: *const scalar.Program, columns: []const scalar.Column, immutable: ?ImmutableContext, limits: @import("immutable_plan.zig").Limits) !Lowered {
+fn defaultArgument(plan: *const @import("immutable_plan.zig"), root: u32) !scalar.Datum {
+    var index = root;
+    var remaining = plan.nodes.len;
+    while (remaining != 0) : (remaining -= 1) {
+        if (index >= plan.nodes.len) return error.InvalidSqlProgram;
+        if (plan.constants[index]) |value| return value;
+        index = plan.nodes[index].alias orelse return error.UnsupportedSqlShape;
+    }
+    return error.InvalidSqlProgram;
+}
+
+fn lowerProgramPolicy(alloc: std.mem.Allocator, program: *const scalar.Program, columns: []const scalar.Column, immutable: ?ExpressionContext, limits: @import("immutable_plan.zig").Limits) !Lowered {
     var plan: ?@import("immutable_plan.zig") = if (immutable != null) try .initWithLimits(alloc, program, limits) else null;
     defer if (plan) |*value| value.deinit();
-    if (plan) |*value| if (value.nodes[program.root].volatility != .immutable) return switch (immutable.?) {
+    if (plan) |*value| if (immutable != .column_default and value.nodes[program.root].volatility != .immutable) return switch (immutable.?) {
         .generation => error.SqlMutableGenerationExpression,
+        .column_default => unreachable,
         .index_key => error.SqlMutableIndexExpression,
         .index_predicate => error.SqlMutableIndexPredicate,
     };
@@ -225,6 +237,12 @@ fn lowerProgramPolicy(alloc: std.mem.Allocator, program: *const scalar.Program, 
         if (plan) |*value| {
             const node = value.nodes[instruction_index];
             if (!node.reachable) continue;
+            if (original.type.temporal_kind == .interval and immutable == .column_default) {
+                if (instruction_index == program.root) return error.UnsupportedSqlShape;
+                _ = try defaultArgument(value, @intCast(instruction_index));
+                out.* = .null;
+                continue;
+            }
             if (node.alias) |target| {
                 out.* = try promoteNumeric(alloc, values[target], program.instructions[target].type, instruction.type);
                 continue;
@@ -337,6 +355,17 @@ fn lowerProgramPolicy(alloc: std.mem.Allocator, program: *const scalar.Program, 
                 break :blk try json(alloc, .{ .op = op, .args = &[_]Json{ left, right } });
             },
             .call => |part| blk: {
+                if (part.function == .gen_random_uuid or part.function == .uuidv7) {
+                    if (immutable != .column_default) return error.UnsupportedSqlShape;
+                    if (part.function == .gen_random_uuid) break :blk try json(alloc, .{ .op = "uuidv4" });
+                    if (part.args.len == 0) break :blk try json(alloc, .{ .op = "uuidv7" });
+                    const argument = try defaultArgument(&plan.?, part.args[0]);
+                    if (argument.sql_null) break :blk try inputLiteral(alloc, instruction.type, .{});
+                    const interval = argument.temporal() orelse return error.SqlTypeMismatch;
+                    if (interval.kind() != .interval) return error.SqlTypeMismatch;
+                    var text: [@import("temporal_text.zig").output_capacity]u8 = undefined;
+                    break :blk try json(alloc, .{ .op = "uuidv7", .shift = try @import("temporal_text.zig").format(interval.*, &text) });
+                }
                 if (part.function == .@"$array") {
                     const identity = instruction.type.element_type orelse return error.SqlTypeMismatch;
                     const args = try alloc.alloc(Json, part.args.len);
@@ -736,10 +765,26 @@ pub fn lowerAssignmentWithLimits(alloc: std.mem.Allocator, schema: Json, express
     const lowered = (if (generated)
         lowerTypedPolicy(alloc, schema, expression, column.type, .generation, limits)
     else
-        lowerColumnsPolicy(alloc, &.{}, expression, column.type, null, limits)) catch |err| switch (err) {
+        lowerColumnsPolicy(alloc, &.{}, expression, column.type, .column_default, limits)) catch |err| switch (err) {
         error.UnknownColumn => return error.UndefinedColumn,
         else => return err,
     };
+    return finishAssignment(alloc, lowered, column);
+}
+
+/// USING reads the old value of its own column. Unlike generated columns it
+/// has no self-reference cycle, but must still be immutable for tail replay.
+pub fn lowerRewriteAssignment(alloc: std.mem.Allocator, schema: Json, expression: *const ast.Scalar, column: ast.Column, limits: @import("immutable_plan.zig").Limits) !Json {
+    const lowered = try lowerTypedPolicy(alloc, schema, expression, column.type, .generation, limits);
+    var result = try finishAssignment(alloc, lowered, column);
+    if (column.numeric_modifier) |modifier| {
+        if (column.type != .number or column.element_type != .numeric) return error.UnsupportedSqlShape;
+        try result.object.put(alloc, "numeric_modifier", try json(alloc, modifier));
+    }
+    return result;
+}
+
+fn finishAssignment(alloc: std.mem.Allocator, lowered: Lowered, column: ast.Column) !Json {
     if (column.type == .integer or column.type == .number) {
         if (lowered.type != .integer and lowered.type != .number) return error.SqlAssignmentTypeMismatch;
         // Untyped SQL decimal arithmetic requires an exact decimal value
@@ -748,6 +793,7 @@ pub fn lowerAssignmentWithLimits(alloc: std.mem.Allocator, schema: Json, express
         const target: @import("array_value.zig").ElementType = column.element_type orelse if (column.type == .integer) .int64 else .float64;
         return json(alloc, .{ .op = "cast", .type = nativeType(column.type, target), .sql_type = @tagName(target), .args = &[_]Json{lowered.expression} });
     }
+    if (column.type == .string and lowered.type == .uuid) return lowered.expression;
     if (lowered.type != column.type) return error.SqlAssignmentTypeMismatch;
     if (column.type == .array and lowered.element_type != column.element_type) return error.UnsupportedSqlShape;
     return lowered.expression;

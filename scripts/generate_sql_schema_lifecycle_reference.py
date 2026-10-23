@@ -21,7 +21,7 @@ import copy
 import json
 from pathlib import Path
 
-from generate_sql_postgres_reference import FIXTURES, postgres, cursor_result
+from generate_sql_postgres_reference import FIXTURES, cursor_result, postgres
 
 FIRST = "00000000-0000-0000-0000-000000000001"
 SECOND = "00000000-0000-0000-0000-000000000002"
@@ -30,13 +30,16 @@ IDS = [
     674,
     677,
     678,
+    679,
     680,
     681,
+    726,
     727,
     728,
     729,
     730,
     731,
+    732,
     733,
     735,
     737,
@@ -45,6 +48,11 @@ IDS = [
     740,
     744,
     745,
+    746,
+    747,
+    748,
+    749,
+    750,
     779,
     1408,
     1412,
@@ -79,6 +87,37 @@ def foreign_key_declaration(number):
             (
                 f"INSERT INTO {table}(id,tenant_id,email,amount) VALUES ('00000000-0000-0000-0000-000000000004','tenant-a','two@example.test',-1)",
                 "23514",
+            ),
+        ]
+    elif number == 726:
+        table = "usage_records"
+        setup = [
+            {"statement": "CREATE TABLE users(id TEXT PRIMARY KEY)", "table": "users"},
+            {"statement": "INSERT INTO users(id) VALUES ('parent-a')"},
+            {
+                "statement": "CREATE TABLE usage_records(id UUID PRIMARY KEY,status TEXT)",
+                "table": table,
+            },
+            {
+                "statement": f"INSERT INTO usage_records(id,status) VALUES ('{FIRST}','historical')"
+            },
+        ]
+        columns = "id::text AS id,status,user_id"
+        statements = [
+            (f"UPDATE usage_records SET user_id='parent-a' WHERE id='{FIRST}'", None),
+            (
+                "INSERT INTO usage_records(id,status,user_id) VALUES ('00000000-0000-0000-0000-000000000004','new','missing')",
+                "23503",
+            ),
+            (
+                f"INSERT INTO usage_records(id,status,user_id) VALUES ('{SECOND}','new','parent-a')",
+                None,
+            ),
+            ("DELETE FROM users WHERE id='parent-a'", "23503"),
+            (f"UPDATE usage_records SET user_id='missing' WHERE id='{FIRST}'", "23503"),
+            (
+                f"INSERT INTO usage_records(id,status) VALUES ('{PROBE}','nullable')",
+                None,
             ),
         ]
     elif number == 735:
@@ -127,10 +166,10 @@ def foreign_key_declaration(number):
 def declaration(number):
     if number not in IDS:
         raise ValueError("schema lifecycle case is outside the qualified cohort")
-    if number in {674, 735}:
+    if number in {674, 726, 735}:
         return foreign_key_declaration(number)
     identity = f"sql-{number:04}"
-    stage = number in {677, 678, 680, 681}
+    stage = number in {677, 678, 679, 680, 681}
     table = "usage_stage" if stage else "usage_records"
     columns = "tenant_id TEXT,id UUID,status TEXT"
     if number == 680:
@@ -139,11 +178,24 @@ def declaration(number):
         columns += ",CONSTRAINT usage_stage_identity UNIQUE(tenant_id,id)"
     if not stage:
         columns = "id UUID PRIMARY KEY,email TEXT,tenant_id TEXT,status TEXT,amount NUMERIC,metadata JSONB,region TEXT"
+        if number == 746:
+            columns = columns.replace(
+                "status TEXT", "status TEXT NOT NULL DEFAULT 'status'"
+            )
+            columns += ",status_upper TEXT GENERATED ALWAYS AS (upper(status)) STORED,CONSTRAINT status_allowed CHECK(status <> 'unknown')"
+        if number == 748:
+            columns += ",updated_at_ns BIGINT"
         if number in {1408, 1412}:
             columns = columns.replace("id UUID", "id TEXT")
         columns += ",user_id TEXT"
     setup = []
     setup.append({"statement": f"CREATE TABLE {table}({columns})", "table": table})
+    if number == 746:
+        setup.append(
+            {
+                "statement": "CREATE INDEX status_index ON usage_records(lower(status)) INCLUDE (email) WHERE status <> 'unknown'"
+            }
+        )
     if number == 1408:
         setup.append(
             {
@@ -166,6 +218,12 @@ def declaration(number):
         setup.append(
             {"statement": "ALTER TABLE usage_records ALTER COLUMN status SET NOT NULL"}
         )
+    if number == 747:
+        setup.append(
+            {
+                "statement": "ALTER TABLE usage_records ADD CONSTRAINT usage_records_status_check CHECK(status <> 'unknown') NOT VALID"
+            }
+        )
     seed = f"INSERT INTO {table}(tenant_id,id,status) VALUES ('tenant-a','{FIRST}','active'),('tenant-b','{SECOND}','ready')"
     if not stage:
         seed = f"INSERT INTO {table}(id,email,tenant_id,status,amount,metadata) VALUES ('{FIRST}','a@example.test','tenant-a','active',5,'{{\"source\":\"old\"}}'),('{SECOND}',NULL,'tenant-b','ready',NULL,NULL)"
@@ -173,7 +231,15 @@ def declaration(number):
         seed = seed.replace("'active',5", "'unknown',5")
     if number == 1412:
         seed = seed.replace("'active',5", "'active',-5")
+    if number == 750:
+        seed = seed.replace("'active'", "'AcTiVe'").replace("'ready'", "'READY'")
+    if number == 749:
+        seed = seed.replace("'active',5", "'active',9007199254740993.125")
     setup.append({"statement": seed})
+    if number == 748:
+        setup.append(
+            {"statement": "UPDATE usage_records SET updated_at_ns=1748781000123456000"}
+        )
     if number in {739, 1412}:
         name = (
             "positive_amount" if number == 1412 else "usage_records_status_known_check"
@@ -189,6 +255,10 @@ def declaration(number):
         if stage
         else "id::text AS id,email,tenant_id,status,amount::text AS amount"
     )
+    if number == 748:
+        fields += ",updated_at_ns"
+    if number == 746:
+        fields = fields.replace(",status,", ",state,") + ",status_upper"
     probes = []
 
     def probe(statement, code=None):
@@ -205,7 +275,7 @@ def declaration(number):
     elif number == 1412:
         probe(f"INSERT INTO usage_records(id,amount) VALUES ('{PROBE}',-2)", "23514")
         probe(f"INSERT INTO usage_records(id,amount) VALUES ('{PROBE}',42)")
-    elif number in {677, 678}:
+    elif number in {677, 678, 679}:
         probe(
             f"INSERT INTO usage_stage(tenant_id,id,status) VALUES ('tenant-a','{FIRST}','duplicate')",
             "23505",
@@ -244,12 +314,16 @@ def declaration(number):
             "23502",
         )
         probe(f"INSERT INTO usage_records(id) VALUES ('{PROBE}')")
-    elif number in {730, 731, 733}:
+    elif number in {730, 731, 732, 733}:
         probe(
             f"INSERT INTO usage_records(id,email) VALUES ('{PROBE}','a@example.test')",
             "23505",
         )
         probe(f"INSERT INTO usage_records(id,email) VALUES ('{PROBE}',NULL)")
+        if number == 732:
+            probe(
+                "UPDATE usage_records SET tenant_id='changed',status='updated' WHERE email='a@example.test'"
+            )
     elif number in {737, 738, 739}:
         probe(
             f"INSERT INTO usage_records(id,status) VALUES ('{PROBE}','unknown')",
@@ -263,6 +337,38 @@ def declaration(number):
         probe(f"INSERT INTO usage_records(id,status) VALUES ('{PROBE}','active')")
     elif number == 745:
         probe(f"INSERT INTO usage_records(id,status) VALUES ('{PROBE}',NULL)")
+    elif number == 747:
+        probe(
+            f"INSERT INTO usage_records(id,status) VALUES ('{PROBE}','unknown')",
+            "23514",
+        )
+        probe(f"INSERT INTO usage_records(id,status) VALUES ('{PROBE}','active')")
+        probe(
+            "ALTER TABLE usage_records VALIDATE CONSTRAINT usage_records_status_check",
+            "42704",
+        )
+    elif number == 746:
+        probe("SELECT status FROM usage_records", "42703")
+        probe(
+            f"INSERT INTO usage_records(id,state) VALUES ('{PROBE}','unknown')", "23514"
+        )
+        probe(f"INSERT INTO usage_records(id,state) VALUES ('{PROBE}',NULL)", "23502")
+        probe(f"INSERT INTO usage_records(id) VALUES ('{PROBE}')")
+        probe(f"UPDATE usage_records SET state='Mixed' WHERE id='{FIRST}'")
+        probe("ALTER TABLE usage_records RENAME COLUMN state TO id", "42701")
+    elif number == 748:
+        probe(
+            f"INSERT INTO usage_records(id,status,updated_at_ns) VALUES ('{PROBE}','Future',1751360400000000000)"
+        )
+        probe(f"UPDATE usage_records SET updated_at_ns=NULL WHERE id='{SECOND}'")
+    elif number == 749:
+        probe(
+            f"INSERT INTO usage_records(id,status,amount) VALUES ('{PROBE}','Future',40)"
+        )
+        probe(f"UPDATE usage_records SET amount=amount+2 WHERE id='{FIRST}'")
+    elif number == 750:
+        probe(f"INSERT INTO usage_records(id,status) VALUES ('{PROBE}','Future')")
+        probe(f"UPDATE usage_records SET status='UNCHANGED-FUTURE' WHERE id='{SECOND}'")
     elif number == 779:
         probe("SELECT metadata FROM usage_records", "42703")
         probe(f"INSERT INTO usage_records(id,status) VALUES ('{PROBE}','new')")
@@ -271,13 +377,19 @@ def declaration(number):
         "table": table,
         "setup": setup,
         "read_sql": f"SELECT {fields} FROM {table}",
-        "ddl_sqlstate": {733: "42809", 1408: "42P10", 1412: "23514"}.get(number),
+        "ddl_sqlstate": {733: "42809", 748: "42846", 1408: "42P10", 1412: "23514"}.get(
+            number
+        ),
         "probes": probes,
     }
     if number in {737, 739, 1412}:
         result["check_name"] = (
             "positive_amount" if number == 1412 else "usage_records_status_known_check"
         )
+    if number == 747:
+        result["check_name"] = "usage_records_state_check"
+    if number == 748:
+        result["unchanged_owner"] = True
     return result
 
 
@@ -364,11 +476,40 @@ def reference():
         }
     )
     declarations.append(mixed_validation)
+    unrelated_fk_rename = copy.deepcopy(declaration(746))
+    unrelated_fk_rename["scenario"] = (
+        "column rename preserves unrelated FK cohort bindings"
+    )
+    create = unrelated_fk_rename["setup"][0]
+    create["statement"] = (
+        create["statement"][:-1]
+        + ",CONSTRAINT tenant_fk FOREIGN KEY(tenant_id) REFERENCES tenants(id))"
+    )
+    unrelated_fk_rename["setup"][:0] = [
+        {"statement": "CREATE TABLE tenants(id TEXT PRIMARY KEY)", "table": "tenants"},
+        {"statement": "INSERT INTO tenants(id) VALUES ('tenant-a'),('tenant-b')"},
+    ]
+    unrelated_fk_rename["probes"] += [
+        {"statement": "DELETE FROM tenants WHERE id='tenant-a'", "sqlstate": "23503"},
+        {
+            "statement": f"UPDATE usage_records SET tenant_id='missing' WHERE id='{FIRST}'",
+            "sqlstate": "23503",
+        },
+    ]
+    declarations.append(unrelated_fk_rename)
     with postgres() as db:
         for case in declarations:
             with db.transaction(force_rollback=True):
                 for step in case["setup"]:
                     db.execute(step["statement"])
+                before_relation = (
+                    db.execute(
+                        "SELECT oid,relfilenode FROM pg_class WHERE oid=%s::regclass",
+                        (case["table"],),
+                    ).fetchone()
+                    if case.get("unchanged_owner")
+                    else None
+                )
                 try:
                     with db.transaction():
                         db.execute(originals[case["id"]]["sql"])
@@ -378,8 +519,16 @@ def reference():
                 else:
                     if case["ddl_sqlstate"] is not None:
                         raise ValueError(f"{case['id']}: DDL rejection succeeded")
+                if before_relation is not None:
+                    assert (
+                        before_relation
+                        == db.execute(
+                            "SELECT oid,relfilenode FROM pg_class WHERE oid=%s::regclass",
+                            (case["table"],),
+                        ).fetchone()
+                    )
 
-                def snapshot():
+                def snapshot(case=case):
                     with psycopg.RawCursor(db) as cursor:
                         return cursor_result(
                             cursor,
@@ -395,7 +544,7 @@ def reference():
                         (case["table"], case["retained_not_valid_check"]),
                     ).fetchone()[0]
 
-                def declaration_state():
+                def declaration_state(case=case):
                     return not db.execute(
                         "SELECT convalidated FROM pg_constraint WHERE conrelid=%s::regclass AND conname=%s",
                         (case["table"], case["check_name"]),
@@ -422,6 +571,26 @@ def reference():
                     probe["after"] = snapshot()
                     if "check_name" in case:
                         probe["declared_not_valid"] = declaration_state()
+                if case["id"] in {"sql-0679", "sql-0732"}:
+                    primary = case["id"] == "sql-0679"
+                    statement = (
+                        f"SELECT status FROM usage_stage WHERE tenant_id='tenant-a' AND id='{FIRST}'"
+                        if primary
+                        else "SELECT tenant_id,status FROM usage_records WHERE email='a@example.test'"
+                    )
+                    with psycopg.RawCursor(db) as cursor:
+                        covered = cursor_result(
+                            cursor,
+                            {"id": case["id"], "sql": statement, "params": []},
+                            read=True,
+                        )
+                    case["cover"] = {
+                        "index": "usage_stage_pk"
+                        if primary
+                        else "usage_records_email_cover_key",
+                        "statement": statement,
+                        "result": covered,
+                    }
                 result.append(case)
     return {"format": 1, "reference": "PostgreSQL exact SQL", "cases": result}
 

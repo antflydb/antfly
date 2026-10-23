@@ -1755,17 +1755,32 @@ fn deinitKeyValueBatch(alloc: Allocator, batch: *std.ArrayListUnmanaged(backup_c
     batch.deinit(alloc);
 }
 
+fn isPortableRuntimeSchemaVersionKey(key: []const u8) bool {
+    if (!std.mem.startsWith(u8, key, schema_version_prefix)) return false;
+    const version = key[schema_version_prefix.len..];
+    if (version.len == 0 or version.len > 10 or (version.len > 1 and version[0] == '0')) return false;
+    for (version) |byte| if (byte < '0' or byte > '9') return false;
+    _ = std.fmt.parseInt(u32, version, 10) catch return false;
+    return true;
+}
+
 pub fn isPortableMetadataKey(key: []const u8) bool {
     // Destination facts must be rebuilt from imported physical records, never
     // copied from a source's potentially partial maintenance certificate.
     if (@import("artifact_footprint.zig").isKey(key)) return false;
+    // `schema_v` below denotes versioned row layouts, not source-local
+    // schema_validation jobs/inputs/cursors. Never export their authority as
+    // logical table metadata (nor exact ordered outcomes/history heads).
+    if (std.mem.startsWith(u8, key, @import("db/relational_nullability_job.zig").family_prefix) or
+        std.mem.startsWith(u8, key, @import("db/relational_schema_apply_outcome.zig").family_prefix) or
+        std.mem.startsWith(u8, key, @import("db/relational_schema_apply_outcome.zig").head_family_prefix)) return false;
     return @import("db/group_source_index.zig").isRevisionClockKey(key) or (key.len == 20 and std.mem.startsWith(u8, key, @import("db/group_source_state.zig").lease_clock_prefix)) or std.mem.eql(u8, key, @import("db/group_source_mutations.zig").table_identity_key) or std.mem.eql(u8, key, cohort_proof_key) or std.mem.eql(u8, key, source_copy_proof_key) or
         std.mem.startsWith(u8, key, source_generation_admission_prefix) or
         std.mem.eql(u8, key, source_integrity_key) or std.mem.eql(u8, key, source_integrity_catalog_key) or std.mem.eql(u8, key, source_integrity_activation_key) or
         std.mem.eql(u8, key, "\x00\x00__metadata__:schema") or
         std.mem.eql(u8, key, relational_index_catalog.head_key) or
         std.mem.startsWith(u8, key, relational_index_catalog.blob_prefix) or
-        std.mem.startsWith(u8, key, "\x00\x00__metadata__:schema_v") or
+        isPortableRuntimeSchemaVersionKey(key) or
         std.mem.eql(u8, key, "\x00\x00__metadata__:schema_json") or
         std.mem.startsWith(u8, key, public_table_schema.versioned_schema_key_prefix) or
         std.mem.eql(u8, key, table_catalog.key) or

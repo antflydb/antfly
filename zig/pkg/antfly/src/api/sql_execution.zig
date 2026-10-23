@@ -237,6 +237,7 @@ pub const Adapter = struct {
     result_session_id: ?[32]u8 = null,
     transaction_status: @import("antfly_local_sources").sql_session.Status = .idle,
     active_transaction: ?[16]u8 = null,
+    active_write_version: ?u64 = null,
     accepted_lake_repeatable: bool = false,
     staged: ?*@import("transactions.zig").OwnedTransactionCommitRequest = null,
     range_reads: ?*@import("transactions.zig").OwnedTransactionCommitRequest = null,
@@ -246,6 +247,7 @@ pub const Adapter = struct {
     inserting: bool = false,
     prepared_bindings: ?[]const @import("sql_prepared.zig").Binding = null,
     setting_overlay: []const setting_catalog.OverlayEntry = &.{},
+    setting_baseline: ?[]const setting_catalog.OverlayEntry = null,
     /// Pgwire supplies its own connection-owned overlay. HTTP attached
     /// sessions always read the durable transaction overlay instead.
     setting_overlay_source: SettingOverlaySource = .durable_session,
@@ -377,6 +379,22 @@ pub const Adapter = struct {
             zig017_return_error = error.ReadSnapshotTooOld;
             break :zig017_failure error.ReadSnapshotTooOld;
         };
+        if (compiled.statement == .set_transaction) {
+            if (parameters.len != 0) return error.InvalidSqlParameters;
+            var result = try @import("antfly_local_sources").sql_runtime.Result.empty(alloc, "SET");
+            errdefer result.deinit();
+            // Like PostgreSQL, SET TRANSACTION outside a transaction has no
+            // lasting effect. It must never silently change connection defaults.
+            if (session.transaction_id) |id| {
+                const held = self.server.txn_sessions.tryAcquireCommitExecution(id) orelse return error.SqlWriteCapacityUnavailable;
+                defer held.release();
+                owner.setCharacteristics(session.scope, id, compiled.statement.set_transaction) catch |err| {
+                    zig017_return_error = err;
+                    return err;
+                };
+            }
+            return result;
+        }
         if (compiled.statement == .set_constraints) {
             if (parameters.len != 0) return zig017_failure: {
                 zig017_return_error = error.InvalidSqlParameters;
@@ -448,8 +466,9 @@ pub const Adapter = struct {
                     break :zig017_failure error.SqlTransactionOutcomeUnknown;
                 };
                 if (commit.outcome == .aborted and !already_failed) return zig017_failure: {
-                    zig017_return_error = error.SqlWriteConflict;
-                    break :zig017_failure error.SqlWriteConflict;
+                    const failure = sessions.abortError(commit);
+                    zig017_return_error = failure;
+                    break :zig017_failure failure;
                 };
                 if (commit.outcome == .aborted) result.output.command_tag = "ROLLBACK";
                 result.output.mutation_outcome = switch (commit.outcome) {
@@ -463,7 +482,8 @@ pub const Adapter = struct {
         }
         const captured_conflict = compiled.statement == .insert and compiled.statement.insert.conflict != null and compiled.statement.insert.conflict.?.capture_count != 0;
         const deferred_conflict = compiled.statement == .insert and compiled.statement.insert.conflict != null and compiled.statement.insert.conflict.?.deferred_count != 0;
-        const implicit_guarded = (compiled.statement == .merge or captured_conflict or deferred_conflict) and session.transaction_id == null;
+        const versioned_returning = ast.returningWriteVersion(compiled.statement);
+        const implicit_guarded = (compiled.statement == .merge or captured_conflict or deferred_conflict or versioned_returning) and session.transaction_id == null;
         if (implicit_guarded) {
             if (!supportsRangeGuards(self.server)) return zig017_failure: {
                 zig017_return_error = error.SqlRangeTrackingRequired;
@@ -502,6 +522,10 @@ pub const Adapter = struct {
                     break :zig017_failure error.SqlWriteCapacityUnavailable;
                 };
                 defer execution_lease.release();
+                self.server.txn_sessions.lockSqlCharacteristics(self.server.alloc, id) catch |err| {
+                    zig017_return_error = err;
+                    return err;
+                };
                 // A concurrent HTTP SET/RESET may have committed after the
                 // initial session attachment but before this statement's
                 // execution lease. Refresh the overlay while holding the
@@ -531,6 +555,7 @@ pub const Adapter = struct {
                 self.range_reads = if (transaction.isolation != .read_committed) &read_guards else null;
                 self.ranges_staged = false;
                 self.active_transaction = id;
+                self.active_write_version = transaction.write_version;
                 self.accepted_lake_repeatable = self.lake_visibility == .accepted and (transaction.isolation != .serializable or transaction.mode == .read_only);
                 self.staged = &staged;
                 self.inserting = switch (compiled.statement) {
@@ -542,6 +567,7 @@ pub const Adapter = struct {
                 };
                 defer {
                     self.active_transaction = null;
+                    self.active_write_version = null;
                     self.accepted_lake_repeatable = false;
                     self.staged = null;
                     self.range_reads = null;
@@ -586,6 +612,8 @@ pub const Adapter = struct {
                     self.dynamic_table = table.physical_name;
                 }
                 var active_backend = guarded_backend orelse self.backend();
+                active_backend.write_version = transaction.write_version;
+                active_backend.supports_write_versions = supportsRangeGuards(self.server) and self.server.txn_sessions.durable != null;
                 // Internal guarded autocommit is still one implicit SQL
                 // transaction. Explicit sessions retain their durable start.
                 active_backend.transaction_start = if (implicit_guarded) statement_instant else transaction.started_at orelse return zig017_failure: {
@@ -637,8 +665,9 @@ pub const Adapter = struct {
                     .committed_pending => .committed_pending,
                     .committed_repair_required => .committed_repair_required,
                     .aborted => return zig017_failure: {
-                        zig017_return_error = error.SqlWriteConflict;
-                        break :zig017_failure error.SqlWriteConflict;
+                        const failure = sessions.abortError(commit);
+                        zig017_return_error = failure;
+                        break :zig017_failure failure;
                     },
                     .unknown => return zig017_failure: {
                         zig017_return_error = error.SqlTransactionOutcomeUnknown;
@@ -678,11 +707,11 @@ pub const Adapter = struct {
         // Each new backend starts an execution scope; binding, cursor selection
         // and fallback execution within that scope share the receipt budget.
         self.receipt_wait_budget = .{};
-        return .{ .execution_binding_validator = if (self.read_requirements.after_write != null) .{ .ptr = self, .validate = validateReadReceiptBinding } else null, .scalar_control = .{ .ptr = self, .checkpoint = scalarCheckpoint }, .execution_io = self.server.embedding_provider_runtime.io, .ptr = self, .decision_provider = self.decision_provider, .supports_expression_access_hints = self.staged == null or self.staged.?.tables.len == 0, .predicate_only_mutations = true, .atomic_statement_read_set = self.active_transaction != null and self.range_reads != null, .coordinated_point_reads = self.active_transaction != null and self.range_reads != null, .coordinated_index_reads = self.active_transaction != null and self.range_reads != null and (self.staged == null or self.staged.?.tables.len == 0), .dynamic_statement_read_set = self.dynamic_snapshot != null, .vtable = if (self.server.source.vtable.supports_sql_views) &view_vtable else &table_vtable };
+        return .{ .write_version = self.active_write_version, .supports_write_versions = supportsRangeGuards(self.server) and self.server.txn_sessions.durable != null, .execution_binding_validator = if (self.read_requirements.after_write != null) .{ .ptr = self, .validate = validateReadReceiptBinding } else null, .scalar_control = .{ .ptr = self, .checkpoint = scalarCheckpoint }, .execution_io = self.server.embedding_provider_runtime.io, .ptr = self, .decision_provider = self.decision_provider, .supports_expression_access_hints = self.staged == null or self.staged.?.tables.len == 0, .predicate_only_mutations = true, .atomic_statement_read_set = self.active_transaction != null and self.range_reads != null, .coordinated_point_reads = self.active_transaction != null and self.range_reads != null, .coordinated_index_reads = self.active_transaction != null and self.range_reads != null and (self.staged == null or self.staged.?.tables.len == 0), .dynamic_statement_read_set = self.dynamic_snapshot != null, .vtable = if (self.server.source.vtable.supports_sql_views) &view_vtable else &table_vtable };
     }
 
     pub fn settingCapture(self: *Adapter) @FieldType(catalog.Backend, "setting_capture") {
-        return .{ .owner = .{ .ptr = self, .load = loadSettings }, .scope = .{ .principal = http_server.transactionPrincipal(self.identity.*) orelse "", .database = self.database }, .sql_user = if (self.identity.*) |identity| identity.username else null, .overlay = self.setting_overlay };
+        return .{ .owner = .{ .ptr = self, .load = loadSettings, .baseline = self.setting_baseline }, .scope = .{ .principal = http_server.transactionPrincipal(self.identity.*) orelse "", .database = self.database }, .sql_user = if (self.identity.*) |identity| identity.username else null, .overlay = self.setting_overlay };
     }
 
     fn loadSettings(ptr: *anyopaque, alloc: std.mem.Allocator, scope: setting_catalog.Scope) !setting_catalog.RawSnapshot {
@@ -694,7 +723,7 @@ pub const Adapter = struct {
         defer alloc.free(bytes);
         const snapshot = try std.json.parseFromSliceLeaky(setting_catalog.RawSnapshot, alloc, bytes, .{ .allocate = .alloc_always });
         if (self.expected_setting_epoch) |epoch| if (snapshot.epoch != epoch) return error.SettingCatalogChanged;
-        return snapshot;
+        return http_server.authorizeSqlRoleDefaults(self.server, alloc, snapshot);
     }
 
     fn generateRowId(ptr: *anyopaque, alloc: std.mem.Allocator) ![]const u8 {
@@ -949,6 +978,19 @@ pub const Adapter = struct {
         return signed;
     }
 
+    fn openSessionOverlay(self: *Adapter, alloc: std.mem.Allocator, native: catalog.Cursor, staged: *const @import("transactions.zig").OwnedTransactionCommitRequest, table: catalog.Table, request: catalog.Scan, row_filter: ?[]const u8) !catalog.Cursor {
+        const overlay = @import("sql_session_overlay.zig");
+        const proof = try self.rowPolicyProof(alloc, table);
+        defer if (self.policy_proofs == null) if (proof) |token| alloc.free(token);
+        const token = proof orelse return overlay.openAtVersion(alloc, native, staged, table, request, row_filter, null, self.active_write_version);
+        // Policy/current_user identity is the username; durable sessions are
+        // separately bound to their API-key credential principal.
+        const caller = if (self.identity.*) |identity| identity.username else return error.RowPolicyAuthenticationRequired;
+        const evaluation = try @import("sql_policy_evaluation.zig").Evaluation.init(alloc, self.server, self.context, table, caller, token, self.setting_overlay);
+        defer evaluation.deinit();
+        return overlay.openAtVersion(alloc, native, staged, table, request, row_filter, evaluation.overlayPolicy(), self.active_write_version);
+    }
+
     fn normalizationProof(self: *Adapter, alloc: std.mem.Allocator, table: catalog.Table) !?[]const u8 {
         var normalizing = table;
         normalizing.row_policy_purpose = .normalize;
@@ -964,7 +1006,7 @@ pub const Adapter = struct {
         if (table.read_authority != null) {
             try @import("sql_read_authority.zig").check(table);
         } else if (self.identity.*) |identity| {
-            if (!http_server.permissionsAllow(identity.permissions, .table, table.physical_name, .read)) return error.Forbidden;
+            if (!scanPermissionsAllow(identity.permissions, table)) return error.Forbidden;
         }
         const conditions = try alloc.alloc(db_types.RelationalRowQuery.Condition, request.conditions.len);
         for (request.conditions, conditions) |condition, *output| output.* = .{
@@ -1125,7 +1167,7 @@ pub const Adapter = struct {
             ordered.primary_order = true;
             const native_cursor = (try openNativeScan(ptr, alloc, table, ordered)) orelse return error.UnsupportedSqlExecution;
             errdefer native_cursor.close(native_cursor.ptr);
-            return try @import("sql_session_overlay.zig").open(alloc, native_cursor, staged, table, ordered, row_filter);
+            return try self.openSessionOverlay(alloc, native_cursor, staged, table, ordered, row_filter);
         }
         const native_cursor = try openNativeScan(ptr, alloc, table, request);
         // Empty overlays still need one retained statement view. A session
@@ -1880,7 +1922,7 @@ pub const Adapter = struct {
             cursor.* = .{ .ptr = wrapper, .next = ReadCursor.next, .next_columns = if (request.request.include_primary_digest) null else ReadCursor.nextColumns, .close = StatementRead.borrowedClose };
             if (if (overlay_staged) self.staged else null) |staged| {
                 const row_filter = try @import("sql_read_authority.zig").filter(temporary, request.table, self.identity.*);
-                cursor.* = try @import("sql_session_overlay.zig").open(alloc, cursor.*, staged, request.table, query, row_filter);
+                cursor.* = try self.openSessionOverlay(alloc, cursor.*, staged, request.table, query, row_filter);
             }
             retained.opened += 1;
         }
@@ -1964,7 +2006,7 @@ pub const Adapter = struct {
                 const row_filter = try @import("sql_read_authority.zig").filter(temporary, request.table, self.identity.*);
                 var ordered = request.request;
                 ordered.primary_order = true;
-                cursor.* = try @import("sql_session_overlay.zig").open(alloc, cursor.*, staged, request.table, ordered, row_filter);
+                cursor.* = try self.openSessionOverlay(alloc, cursor.*, staged, request.table, ordered, row_filter);
             }
             wrapped += 1;
         }
@@ -2130,6 +2172,40 @@ pub const Adapter = struct {
         try @import("relational_session_statement.zig").validate(self.server, alloc, previous, candidate, statement, self.context);
     }
 };
+
+fn scanPermissionsAllow(permissions: []const @import("../usermgr/mod.zig").Permission, table: catalog.Table) bool {
+    return switch (table.row_policy_purpose) {
+        .ordinary => http_server.permissionsAllow(permissions, .table, table.physical_name, .read),
+        .update, .delete => http_server.permissionsAllow(permissions, .table, table.physical_name, .write),
+        .update_select, .delete_select => http_server.permissionsAllow(permissions, .table, table.physical_name, .write) and http_server.permissionsAllow(permissions, .table, table.physical_name, .read),
+        // Private normalization and integrity observation never emit SQL rows.
+        .normalize, .normalize_select, .integrity, .sql_write => false,
+    };
+}
+
+test "SQL scan permissions preserve write-only commands without granting read authority" {
+    const usermgr = @import("../usermgr/mod.zig");
+    const a = std.testing.allocator;
+    var read = try usermgr.Permission.initOwned(a, .table, "docs", .read);
+    defer read.deinit(a);
+    var write = try usermgr.Permission.initOwned(a, .table, "docs", .write);
+    defer write.deinit(a);
+    var admin = try usermgr.Permission.initOwned(a, .table, "*", .admin);
+    defer admin.deinit(a);
+    var table: catalog.Table = .{ .id = 7, .physical_name = "docs", .schema_version = 1, .columns = &.{} };
+    const Purpose = @import("../usermgr/mod.zig").row_policy_authority.Purpose;
+    for (std.enums.values(Purpose)) |purpose| {
+        table.row_policy_purpose = purpose;
+        const selects = purpose == .ordinary;
+        const writes = purpose == .update or purpose == .delete;
+        const both = purpose == .update_select or purpose == .delete_select;
+        try std.testing.expectEqual(selects, scanPermissionsAllow(&.{read}, table));
+        try std.testing.expectEqual(writes, scanPermissionsAllow(&.{write}, table));
+        try std.testing.expectEqual(selects or writes or both, scanPermissionsAllow(&.{ read, write }, table));
+        try std.testing.expectEqual(selects or writes or both, scanPermissionsAllow(&.{admin}, table));
+        try std.testing.expect(!scanPermissionsAllow(&.{}, table));
+    }
+}
 
 pub fn sqlState(err: anyerror) []const u8 {
     return diagnostic(err).code;

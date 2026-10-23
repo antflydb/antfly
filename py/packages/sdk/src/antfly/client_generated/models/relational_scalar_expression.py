@@ -19,10 +19,15 @@ T = TypeVar("T", bound="RelationalScalarExpression")
 
 @_attrs_define
 class RelationalScalarExpression:
-    """Immutable typed scalar expression, limited to 128 nodes and 16 levels.
+    """Typed scalar expression, limited to 128 nodes and 16 levels. CHECK,
+    generated-column and index expressions must be immutable. UUIDv4 and
+    UUIDv7 generation are permitted only in column defaults and require
+    reader capability version 33. They run once during owned row
+    preparation, never during schema publication or restore verification.
+    The uuidv4 and uuidv7 operations take no args; uuidv7 may specify shift.
     A literal requires type; omitted value means typed null. A column
     requires column; other
-    operations require args. Unknown or irrelevant fields are rejected.
+    operations except uuidv4 and uuidv7 require args. Unknown or irrelevant fields are rejected.
     Arithmetic operands have the same integer or number type. Integer
     division truncates toward zero. Overflow and division by zero reject
     the write. Arithmetic and string operations propagate null. ASCII case
@@ -145,6 +150,10 @@ class RelationalScalarExpression:
             numeric_modifier (SQLNumericModifier | Unset): PostgreSQL NUMERIC precision and signed scale. For arrays this
                 describes every element, not dimensions. Absent means unconstrained NUMERIC.
             value (Any | Unset): Typed literal value, including null.
+            shift (str | Unset): Canonical PostgreSQL interval text, accepted only on a uuidv7 default operation. SQL
+                lowering resolves and binds calendar months, days, and microseconds before publication. Omission generates an
+                unshifted UUID; SQL NULL shifts lower to a NULL literal instead. Infinite intervals remain representable
+                declarations but fail when evaluated.
             json_null (bool | Unset): For a literal of type json only. True denotes present JSON null and requires value to
                 be omitted or null. False or omission leaves an omitted/null value as SQL NULL. This explicit marker survives
                 SDKs that omit optional null values. Requires reader capability version 30.
@@ -159,6 +168,7 @@ class RelationalScalarExpression:
     sql_type: SQLBuiltinType | Unset = UNSET
     numeric_modifier: SQLNumericModifier | Unset = UNSET
     value: Any | Unset = UNSET
+    shift: str | Unset = UNSET
     json_null: bool | Unset = UNSET
     column: str | Unset = UNSET
     collation: str | Unset = UNSET
@@ -180,6 +190,8 @@ class RelationalScalarExpression:
             numeric_modifier = self.numeric_modifier.to_dict()
 
         value = self.value
+
+        shift = self.shift
 
         json_null = self.json_null
 
@@ -209,6 +221,8 @@ class RelationalScalarExpression:
             field_dict["numeric_modifier"] = numeric_modifier
         if value is not UNSET:
             field_dict["value"] = value
+        if shift is not UNSET:
+            field_dict["shift"] = shift
         if json_null is not UNSET:
             field_dict["json_null"] = json_null
         if column is not UNSET:
@@ -250,6 +264,8 @@ class RelationalScalarExpression:
 
         value = d.pop("value", UNSET)
 
+        shift = d.pop("shift", UNSET)
+
         json_null = d.pop("json_null", UNSET)
 
         column = d.pop("column", UNSET)
@@ -271,6 +287,7 @@ class RelationalScalarExpression:
             sql_type=sql_type,
             numeric_modifier=numeric_modifier,
             value=value,
+            shift=shift,
             json_null=json_null,
             column=column,
             collation=collation,

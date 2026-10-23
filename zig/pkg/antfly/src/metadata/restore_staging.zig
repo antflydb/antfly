@@ -660,6 +660,7 @@ pub const Plan = struct {
                     return error.InvalidRestoreStaging;
                 const original = target.replace.?.table;
                 if (original.table_id != target.source_table_id) return error.InvalidRestoreStaging;
+                if (rewrite.column_transforms.len != 0 and !std.mem.eql(u8, rewrite.expression_schema, original.schema_json)) return error.InvalidRestoreStaging;
                 if (rewrite.preserve_document and (!std.mem.eql(u8, @import("../api/tables.zig").effectiveSchemaJson(original.schema_json), @import("../api/tables.zig").effectiveSchemaJson(table.schema_json)) or !std.mem.eql(u8, original.read_schema_json, table.read_schema_json))) return error.InvalidRestoreStaging;
                 // The authenticated live source definitions are retained, not
                 // replaced by target JSON under the old cohort identity.

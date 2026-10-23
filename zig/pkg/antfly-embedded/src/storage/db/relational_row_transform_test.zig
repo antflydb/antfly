@@ -19,6 +19,217 @@ const mapper = @import("document_mapper.zig");
 const codec = @import("algebraic/relational_row_codec.zig");
 const alloc = std.testing.allocator;
 
+fn usingRewrite(a: std.mem.Allocator) !void {
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    const compiler = @import("../../sql/compiler.zig");
+    const ddl = @import("../../sql/schema_ddl.zig");
+    var create = try compiler.compile(scratch, "CREATE TABLE changes(n bigint, label text, payload text)", .{});
+    defer create.deinit();
+    const before = try @import("../../sql/ddl_runtime.zig").createSchemaAlloc(scratch, create.statement.create_table);
+    var candidate = try std.json.parseFromSliceLeaky(std.json.Value, scratch, before, .{});
+    var alter = try compiler.compile(scratch, "ALTER TABLE changes ALTER COLUMN n TYPE numeric USING n::numeric + 1", .{});
+    defer alter.deinit();
+    const rule = (try ddl.prepareColumnTransform(scratch, candidate, alter.statement.catalog_ddl, .{})).?;
+    try std.testing.expect(try ddl.apply(scratch, &candidate, alter.statement.catalog_ddl));
+    try candidate.object.put(scratch, "version", .{ .integer = 2 });
+    const after = try std.json.Stringify.valueAlloc(scratch, candidate, .{});
+    const policies: transform.Policies = .{ .expression_schema = before, .column_transforms = &.{rule} };
+    var program = try transform.Program.init(a, before, after, policies);
+    defer program.deinit();
+    var repeated = try transform.Program.initWithTarget(a, before, &program);
+    defer repeated.deinit();
+    try std.testing.expect(program.transform_set.? == repeated.transform_set.?);
+    try std.testing.expectEqualDeep(program.identity, repeated.identity);
+    const wide: [16 * 1024]u8 = @splat('x');
+    const document = try std.json.Stringify.valueAlloc(scratch, .{ .n = @as(i64, 9007199254740993), .label = "Unchanged", .payload = &wide }, .{});
+    var input = try sourceRow(&program, a, document);
+    defer input.deinit(a);
+    try codec.setOrdinalWriteTimestampNs(input.packed_row, 123);
+    var result = try program.transform(a, input.packed_row);
+    defer result.deinit(a);
+    var again = try repeated.transform(a, input.packed_row);
+    defer again.deinit(a);
+    try std.testing.expectEqualSlices(u8, result.packed_row, again.packed_row);
+    try std.testing.expectEqual(@as(u64, 123), try codec.rowWriteTimestampNs(result.packed_row));
+    try std.testing.expectEqual(@as(usize, 1), result.expression_input_cells);
+    const view = try codec.ordinalRowView(result.packed_row, program.target.tableSchema().*, program.target.physicalLayout());
+    var logical = try view.materializeRootAlloc(a);
+    defer logical.deinit(a);
+    const n = logical.root.object.get("n").?;
+    try std.testing.expect(n == .number_string);
+    try std.testing.expectEqualStrings("9007199254740994", n.number_string);
+    try std.testing.expectEqualStrings("Unchanged", logical.root.object.get("label").?.string);
+    try std.testing.expectEqualStrings(&wide, logical.root.object.get("payload").?.string);
+    const contract = @import("relational_rewrite_contract.zig");
+    const programs = @import("relational_rewrite_program.zig");
+    var owned = try programs.ProgramSet.init(a, &.{before}, after, policies);
+    defer owned.deinit();
+    const intent: contract.Intent = .{ .version = 3, .source_schemas = &.{before}, .target_schema = after, .expression_schema = before, .column_transforms = &.{rule}, .program_digest = owned.identity };
+    const bytes = try std.json.Stringify.valueAlloc(a, intent, .{});
+    defer a.free(bytes);
+    var decoded = try std.json.parseFromSlice(contract.Intent, a, bytes, .{ .allocate = .alloc_always });
+    defer decoded.deinit();
+    var reopened = try programs.ProgramSet.initIntent(a, decoded.value);
+    defer reopened.deinit();
+    try std.testing.expectEqualDeep(owned.identity, reopened.identity);
+    var forged = intent;
+    forged.column_transforms = &.{.{ .column = "n", .expression_json = "{\"op\":\"literal\",\"type\":\"numeric\",\"sql_type\":\"numeric\",\"value\":7}" }};
+    if (programs.ProgramSet.initIntent(a, forged)) |value| {
+        var unexpected = value;
+        unexpected.deinit();
+        return error.TestUnexpectedResult;
+    } else |err| {
+        if (err == error.OutOfMemory or err == error.WriteFailed) return err;
+        try std.testing.expectEqual(error.RestoreStagingScopeChanged, err);
+    }
+}
+
+fn renameRewrite(a: std.mem.Allocator) !void {
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    const compiler = @import("../../sql/compiler.zig");
+    const ddl = @import("../../sql/schema_ddl.zig");
+    var create = try compiler.compile(scratch, "CREATE TABLE changes(label text, upper_label text GENERATED ALWAYS AS (upper(label)) STORED,payload text)", .{});
+    defer create.deinit();
+    const before = try @import("../../sql/ddl_runtime.zig").createSchemaAlloc(scratch, create.statement.create_table);
+    var candidate = try std.json.parseFromSliceLeaky(std.json.Value, scratch, before, .{});
+    var alter = try compiler.compile(scratch, "ALTER TABLE changes RENAME COLUMN label TO state", .{});
+    defer alter.deinit();
+    const rule = (try ddl.prepareColumnTransform(scratch, candidate, alter.statement.catalog_ddl, .{})).?;
+    try std.testing.expect(try ddl.apply(scratch, &candidate, alter.statement.catalog_ddl));
+    try candidate.object.put(scratch, "version", .{ .integer = 2 });
+    const after = try std.json.Stringify.valueAlloc(scratch, candidate, .{});
+    const policies: transform.Policies = .{ .dropped_columns = .allow, .expression_schema = before, .column_transforms = &.{rule} };
+    var program = try transform.Program.init(a, before, after, policies);
+    defer program.deinit();
+    const wide: [16 * 1024]u8 = @splat('x');
+    const document = try std.json.Stringify.valueAlloc(scratch, .{ .label = "MiXeD", .upper_label = "MIXED", .payload = &wide }, .{});
+    var input = try sourceRow(&program, a, document);
+    defer input.deinit(a);
+    try codec.setOrdinalWriteTimestampNs(input.packed_row, 123);
+    var output = try program.transform(a, input.packed_row);
+    defer output.deinit(a);
+    try std.testing.expectEqual(@as(usize, 1), output.expression_input_cells);
+    try std.testing.expectEqual(@as(u64, 123), try codec.rowWriteTimestampNs(output.packed_row));
+    const view = try codec.ordinalRowView(output.packed_row, program.target.tableSchema().*, program.target.physicalLayout());
+    var logical = try view.materializeRootAlloc(a);
+    defer logical.deinit(a);
+    try std.testing.expect(logical.root.object.get("label") == null);
+    try std.testing.expectEqualStrings("MiXeD", logical.root.object.get("state").?.string);
+    try std.testing.expectEqualStrings("MIXED", logical.root.object.get("upper_label").?.string);
+    try std.testing.expectEqualStrings(&wide, logical.root.object.get("payload").?.string);
+    const programs = @import("relational_rewrite_program.zig");
+    const contract = @import("relational_rewrite_contract.zig");
+    var owned = try programs.ProgramSet.init(a, &.{before}, after, policies);
+    defer owned.deinit();
+    const intent: contract.Intent = .{ .version = 3, .allow_column_drops = true, .source_schemas = &.{before}, .target_schema = after, .expression_schema = before, .column_transforms = &.{rule}, .program_digest = owned.identity };
+    var reopened = try programs.ProgramSet.initIntent(a, intent);
+    defer reopened.deinit();
+    try std.testing.expectEqualDeep(owned.identity, reopened.identity);
+    var replay = try reopened.programs[0].transform(a, input.packed_row);
+    defer replay.deinit(a);
+    try std.testing.expectEqualSlices(u8, output.packed_row, replay.packed_row);
+}
+
+test "SQL column rename resolves only its operand preserves packed payload and owns durable mapping across allocation faults" {
+    try renameRewrite(alloc);
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(alloc, renameRewrite, .{});
+}
+
+test "SQL USING rewrite binds typed operands once preserves unrelated cells and reconstructs exact durable intent" {
+    try usingRewrite(alloc);
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(alloc, usingRewrite, .{});
+}
+
+test "SQL USING rewrite shares predecessor binding across historical layouts with absent nullable operands" {
+    const programs = @import("relational_rewrite_program.zig");
+    const old = "{\"version\":1,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"n\":{\"type\":\"integer\"}},\"additionalProperties\":false}}}}";
+    const before = "{\"version\":2,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"n\":{\"type\":\"integer\"},\"label\":{\"type\":\"keyword\",\"nullable\":true}},\"additionalProperties\":false}}}}";
+    const after = try std.mem.replaceOwned(u8, alloc, before, "\"version\":2", "\"version\":3");
+    defer alloc.free(after);
+    const policies: transform.Policies = .{
+        .expression_schema = before,
+        .column_transforms = &.{.{ .column = "label", .expression_json = "{\"op\":\"coalesce\",\"args\":[{\"op\":\"lower_ascii\",\"args\":[{\"op\":\"column\",\"column\":\"label\"}]},{\"op\":\"literal\",\"type\":\"string\",\"value\":\"absent\"}]}" }},
+    };
+    var set = try programs.ProgramSet.init(alloc, &.{ before, old }, after, policies);
+    defer set.deinit();
+    var reversed = try programs.ProgramSet.init(alloc, &.{ old, before }, after, policies);
+    defer reversed.deinit();
+    try std.testing.expectEqualDeep(set.identity, reversed.identity);
+    try std.testing.expect(set.programs[0].transform_set.? == set.programs[1].transform_set.?);
+    for (set.programs, [_][]const u8{ "{\"n\":4}", "{\"n\":4,\"label\":\"MiXeD\"}" }, [_][]const u8{ "absent", "mixed" }) |*program, json, expected| {
+        var row = try sourceRow(program, alloc, json);
+        defer row.deinit(alloc);
+        var result = try program.transform(alloc, row.packed_row);
+        defer result.deinit(alloc);
+        const view = try codec.ordinalRowView(result.packed_row, program.target.tableSchema().*, program.target.physicalLayout());
+        const cell = (try view.findCell(view.ordinalForName("label").?)).?;
+        try std.testing.expect(!cell.is_null);
+        try std.testing.expectEqualStrings(expected, cell.value.bytes_val);
+    }
+}
+
+test "SQL USING rewrite text results preserve builtin identity and nullable schema union arms" {
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const compiler = @import("../../sql/compiler.zig");
+    const ddl = @import("../../sql/schema_ddl.zig");
+    var create = try compiler.compile(a, "CREATE TABLE changes(label text)", .{});
+    defer create.deinit();
+    const typed = try @import("../../sql/ddl_runtime.zig").createSchemaAlloc(a, create.statement.create_table);
+    const union_schema = "{\"version\":1,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"label\":{\"type\":[\"keyword\",\"null\"]}},\"additionalProperties\":false}}}}";
+    for ([_][]const u8{ typed, union_schema }) |before| {
+        var candidate = try std.json.parseFromSliceLeaky(std.json.Value, a, before, .{});
+        var alter = try compiler.compile(a, "ALTER TABLE changes ALTER COLUMN label TYPE text USING lower(label)", .{});
+        defer alter.deinit();
+        const rule = (try ddl.prepareColumnTransform(a, candidate, alter.statement.catalog_ddl, .{})).?;
+        try std.testing.expect(try ddl.apply(a, &candidate, alter.statement.catalog_ddl));
+        try candidate.object.put(a, "version", .{ .integer = 2 });
+        const after = try std.json.Stringify.valueAlloc(a, candidate, .{});
+        var program = try transform.Program.init(alloc, before, after, .{ .expression_schema = before, .column_transforms = &.{rule} });
+        defer program.deinit();
+        for ([_][]const u8{ "{\"label\":\"MiXeD\"}", "{\"label\":null}" }, [_]?[]const u8{ "mixed", null }) |json, expected| {
+            var row = try sourceRow(&program, alloc, json);
+            defer row.deinit(alloc);
+            var result = try program.transform(alloc, row.packed_row);
+            defer result.deinit(alloc);
+            const view = try codec.ordinalRowView(result.packed_row, program.target.tableSchema().*, program.target.physicalLayout());
+            const cell = (try view.findCell(view.ordinalForName("label").?)).?;
+            if (expected) |text| {
+                try std.testing.expect(!cell.is_null);
+                try std.testing.expectEqualStrings(text, cell.value.bytes_val);
+            } else try std.testing.expect(cell.is_null);
+        }
+    }
+}
+
+test "SQL USING rewrite mapped blob comparison uses the retained physical ordinal" {
+    const source = "{\"version\":1,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"b\":{\"type\":\"blob\",\"nullable\":true}},\"additionalProperties\":false}}}}";
+    const logical = "{\"version\":2,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"a\":{\"type\":\"integer\",\"nullable\":true},\"b\":{\"type\":\"blob\",\"nullable\":true}},\"additionalProperties\":false}}}}";
+    const target = "{\"version\":3,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"a\":{\"type\":\"integer\",\"nullable\":true},\"b\":{\"type\":\"blob\",\"nullable\":true},\"same\":{\"type\":\"boolean\",\"nullable\":true}},\"additionalProperties\":false}}}}";
+    var program = try transform.Program.init(alloc, source, target, .{
+        .expression_schema = logical,
+        .column_transforms = &.{.{ .column = "same", .expression_json = "{\"op\":\"eq\",\"args\":[{\"op\":\"column\",\"column\":\"b\"},{\"op\":\"literal\",\"type\":\"blob\",\"value\":\"AAE=\"}]}" }},
+    });
+    defer program.deinit();
+    for ([_][]const u8{ "{\"b\":\"AAE=\"}", "{\"b\":null}" }, [_]?bool{ true, null }) |json, expected| {
+        var row = try sourceRow(&program, alloc, json);
+        defer row.deinit(alloc);
+        var result = try program.transform(alloc, row.packed_row);
+        defer result.deinit(alloc);
+        const view = try codec.ordinalRowView(result.packed_row, program.target.tableSchema().*, program.target.physicalLayout());
+        const same = (try view.findCell(view.ordinalForName("same").?)).?;
+        if (expected) |value| {
+            try std.testing.expect(!same.is_null);
+            try std.testing.expectEqual(value, same.value.bool_val);
+        } else try std.testing.expect(same.is_null);
+    }
+}
+
 test "relational index system typed rewrite preserves JSON SQL null and blob operand identity" {
     const before =
         \\{"version":1,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"b":{"type":"blob","nullable":true},"payload":{"type":"json"}},"additionalProperties":false}}}}

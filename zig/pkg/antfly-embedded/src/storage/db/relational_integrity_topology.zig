@@ -253,6 +253,14 @@ pub fn requireUnfencedOrUnchanged(txn: anytype, key: []const u8, candidate: []co
 pub fn requireDrained(txn: anytype, manager: *transactions.TxnManager, expected: Fence) !void {
     const actual = (try current(txn)) orelse return error.IntegrityTopologyFenceMissing;
     if (!actual.eql(expected)) return error.IntegrityTopologyChanged;
+    if (expected.role == .schema_validation) {
+        const header = (try @import("relational_nullability_job.zig").load(txn)) orelse return error.SchemaValidationJobRequired;
+        if (try transactions.TxnManager.hasQualifiedTopologyDebt(txn, try transactions.topology_debt.Scope.fromBinding(header.binding))) return error.TransactionTopologyBusy;
+        // Admitted writers maintain this exact generation atomically. Shared
+        // snapshot import independently verifies the directory and retained
+        // cohort evidence before publication; no history scan belongs here.
+        return;
+    }
     if (try manager.hasTopologySensitiveTransactions()) return error.TransactionTopologyBusy;
 }
 
@@ -302,6 +310,26 @@ pub fn stageCanceledIndexRelease(txn: anytype, manager: *transactions.TxnManager
     try @import("relational_integrity_generation_retirement.zig").requireClear(txn);
     if (try optional(txn, receipt_key)) |bytes| if ((try Fence.decode(bytes)).admission_epoch >= canceled.binding.fence.admission_epoch) return error.IntegrityTopologyCompleted;
     try stageReceipt(txn, canceled.binding.fence);
+    try txn.delete(fence_key);
+}
+
+/// Dedicated schema publication release, joined to the exact terminal owner
+/// header. Generic topology commands remain unable to lift this fence. The
+/// outer owner authenticates metadata's decision; this checks physical truth.
+pub fn stageSchemaValidationRelease(txn: anytype, released: @import("relational_nullability_job.zig").Header) !void {
+    try released.validate();
+    if (released.phase != .released) return error.SchemaValidationPublicationRequired;
+    const stored = (try @import("relational_nullability_job.zig").load(txn)) orelse return error.SchemaValidationJobRequired;
+    if (!std.meta.eql(stored, released)) return error.SchemaValidationJobChanged;
+    // current() deliberately rejects a released job retaining a fence. Read
+    // the raw fence only in this indivisible terminal transaction.
+    const raw = (try optional(txn, fence_key)) orelse return error.IntegrityTopologyFenceMissing;
+    const fence = try Fence.decode(raw);
+    if (!fence.eql(released.binding.fence)) return error.IntegrityTopologyChanged;
+    if (try completed(txn)) |done| if (done.admission_epoch >= fence.admission_epoch) return error.IntegrityTopologyCompleted;
+    try @import("artifact_reconcile_intent.zig").requireAbsent(txn);
+    try @import("relational_integrity_generation_retirement.zig").requireClear(txn);
+    try stageReceipt(txn, fence);
     try txn.delete(fence_key);
 }
 

@@ -74,7 +74,7 @@ test "SQL physical column qualification validates pinned namespace and alias bou
         defer compiled.deinit();
         var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
         defer arena.deinit();
-        try std.testing.expectError(error.UndefinedColumn, sources.sql_describe.bind(arena.allocator(), backend, &compiled, &.{}));
+        try std.testing.expectError(error.UndefinedTable, sources.sql_describe.bind(arena.allocator(), backend, &compiled, &.{}));
     }
     for ([_][]const u8{ "SELECT a.b.c.d.e FROM items", "SELECT a.b.c.d.* FROM items" }) |sql|
         try std.testing.expectError(error.InvalidSqlSyntax, compiler.compile(std.testing.allocator, sql, .{}));
@@ -229,6 +229,18 @@ test "SQL newly admitted historical UNNEST rejections remain unqualified" {
     }
 }
 
+test "SQL historical document patch rejections require runtime qualification" {
+    var corpus = try fixtures.Corpus.init(std.testing.allocator);
+    defer corpus.deinit();
+    for ([_][]const u8{ "sql-0904", "sql-0905", "sql-0906" }) |id| {
+        const case = try corpus.get(id);
+        try std.testing.expectEqualStrings("rejection", case.source_expectation);
+        var compiled = try compiler.compile(std.testing.allocator, case.sql, .{});
+        defer compiled.deinit();
+        try std.testing.expect(compiled.statement == .update);
+    }
+}
+
 test "SQL exact original rejection contracts fail before backend access" {
     var corpus = try fixtures.Corpus.init(std.testing.allocator);
     defer corpus.deinit();
@@ -243,13 +255,10 @@ test "SQL exact original rejection contracts fail before backend access" {
         .{ .id = "sql-0703", .expected = error.InvalidSqlSyntax },
         .{ .id = "sql-0776", .expected = error.UnsupportedSqlShape },
         .{ .id = "sql-0777", .expected = error.UnsupportedSqlShape },
-        .{ .id = "sql-0780", .expected = error.InvalidSqlSyntax },
-        .{ .id = "sql-0781", .expected = error.InvalidSqlSyntax },
-        .{ .id = "sql-0782", .expected = error.InvalidSqlSyntax },
-        .{ .id = "sql-0783", .expected = error.InvalidSqlSyntax },
-        .{ .id = "sql-0784", .expected = error.InvalidSqlSyntax },
-        .{ .id = "sql-0785", .expected = error.InvalidSqlSyntax },
-        .{ .id = "sql-0786", .expected = error.InvalidSqlSyntax },
+        .{ .id = "sql-0781", .expected = error.SqlInvalidParameterValue },
+        .{ .id = "sql-0782", .expected = error.SqlInvalidParameterValue },
+        .{ .id = "sql-0785", .expected = error.SqlInvalidParameterValue },
+        .{ .id = "sql-0786", .expected = error.UnsupportedSqlShape },
         .{ .id = "sql-0787", .expected = error.UnsupportedSqlShape },
         .{ .id = "sql-0788", .expected = error.UnsupportedSqlShape },
         .{ .id = "sql-0789", .expected = error.UnsupportedSqlShape },
@@ -268,9 +277,6 @@ test "SQL exact original rejection contracts fail before backend access" {
         .{ .id = "sql-0844", .expected = error.InvalidSqlSyntax },
         .{ .id = "sql-0845", .expected = error.InvalidSqlSyntax },
         .{ .id = "sql-0892", .expected = error.InvalidSqlSyntax },
-        .{ .id = "sql-0904", .expected = error.UnsupportedSqlShape },
-        .{ .id = "sql-0905", .expected = error.UnsupportedSqlShape },
-        .{ .id = "sql-0906", .expected = error.UnsupportedSqlShape },
         .{ .id = "sql-1183", .expected = error.UnsupportedSqlShape },
         .{ .id = "sql-1184", .expected = error.UnsupportedSqlShape },
         .{ .id = "sql-1193", .expected = error.InvalidSqlSyntax },

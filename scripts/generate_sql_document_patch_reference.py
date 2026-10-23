@@ -27,7 +27,7 @@ from pathlib import Path
 
 from generate_sql_postgres_reference import FIXTURES, postgres, cursor_result
 
-IDS = list(range(895, 904))
+IDS = list(range(895, 907))
 SEEDS = [
     {
         "key": "doc:a",
@@ -90,15 +90,42 @@ def reference():
                         "INSERT INTO docs VALUES(%s,%s,42)",
                         (row["key"], Jsonb(row["value"])),
                     )
-                with psycopg.RawCursor(db) as cursor:
-                    outcome = cursor_result(cursor, original[identity], read=False)
-                if outcome["affected"] == 0:
+                before_versions = dict(db.execute("SELECT _id,xmin::text FROM docs"))
+                sqlstate = None
+                try:
+                    with db.transaction():
+                        with psycopg.RawCursor(db) as cursor:
+                            outcome = cursor_result(
+                                cursor, original[identity], read=False
+                            )
+                except psycopg.Error as error:
+                    sqlstate = error.sqlstate
+                    outcome = {"affected": 0}
+                expected_error = "22023" if number == 904 else None
+                if sqlstate != expected_error:
+                    raise ValueError(
+                        f"{identity}: expected {expected_error}, got {sqlstate}"
+                    )
+                if sqlstate is None and outcome["affected"] == 0:
                     raise ValueError("non-exercising document patch witness")
                 entries.append(
                     {
                         "id": identity,
-                        "schema": schemas[identity],
+                        # Historical compile-only rejections had no storage
+                        # profile. Execute them against the same permissive
+                        # raw-document table as the base JSON patch contract.
+                        "schema": document_schema(
+                            schemas.get(identity, schemas["sql-0895"])
+                        ),
                         "affected": outcome["affected"],
+                        "sqlstate": sqlstate,
+                        "untouched": [
+                            key
+                            for key, version in db.execute(
+                                "SELECT _id,xmin::text FROM docs ORDER BY _id"
+                            )
+                            if before_versions.get(key) == version
+                        ],
                         "final": [
                             {"key": key, "value": value}
                             for key, value in db.execute(
@@ -110,10 +137,30 @@ def reference():
     return {
         "format": 1,
         "reference": "PostgreSQL JSONB with explicit Antfly patch extension",
+        "schema_mapping": "Arbitrary JSON document fields use unrestricted JSON Schema properties, not relational-only type=json declarations.",
         "seed_version": 42,
         "seeds": SEEDS,
         "entries": entries,
     }
+
+
+def document_schema(source):
+    """Keep the JSON value domain while using the native document contract.
+
+    The extracted mega-branch profile used a relational-only raw type spelling.
+    An unrestricted JSON Schema property is the document equivalent, and SQL
+    derives the same JSONB column from it. Never enable relational physical
+    encodings or bypass the document schema validator for this campaign.
+    """
+    from copy import deepcopy
+
+    result = deepcopy(source)
+    assert result["storage_mode"] == "document"
+    props = result["document_schemas"][result["default_type"]]["schema"]["properties"]
+    for prop in props.values():
+        if prop.get("type") == "json":
+            del prop["type"]
+    return result
 
 
 def main():

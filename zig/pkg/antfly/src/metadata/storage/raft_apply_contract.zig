@@ -114,6 +114,7 @@ pub const StandaloneCatalogUpdate = struct {
     /// Signed startup-only reporter CAS for the already admitted native root.
     /// Possession cannot enroll a key or authorize a publication ACK.
     native_registration: ?@import("../standalone_native_owner.zig").Registration = null,
+    native_restart: ?@import("../standalone_native_owner.zig").Restart = null,
     import_catalog: ?@import("antfly_local_sources").system_catalog_domain.State = null,
     /// Applied in the same local transaction as the standalone revision and
     /// mirrored outbox. Mutually exclusive with an ordinary logical delta.
@@ -246,8 +247,10 @@ pub const SystemCatalogCommand = struct {
     placement_update: ?struct { expected: metadata.TableRecord, replacement: metadata.TableRecord } = null,
     constraint_name_admission: ?@import("antfly_local_sources").system_catalog_relation_names.constraint_naming.Admission = null,
     sql_view: ?@import("../../system_catalog/views.zig").Mutation = null,
+    sql_sequence: ?@import("../../system_catalog/sequence_catalog.zig").Mutation = null,
 
     pub fn jsonStringify(self: SystemCatalogCommand, writer: anytype) !void {
+        if (self.sql_sequence != null) return writer.write(.{ .version = self.version, .expected_revision = self.expected_revision, .mutation = self.mutation, .topology = self.topology, .placement_update = self.placement_update, .constraint_name_admission = self.constraint_name_admission, .sql_view = self.sql_view, .sql_sequence = self.sql_sequence });
         if (self.sql_view != null) return writer.write(.{ .version = self.version, .expected_revision = self.expected_revision, .mutation = self.mutation, .topology = self.topology, .placement_update = self.placement_update, .constraint_name_admission = self.constraint_name_admission, .sql_view = self.sql_view });
         // Keep legacy frames byte-for-byte shaped as before while capability
         // 34 is not activated. Old decoders must not see even a null new field.
@@ -261,6 +264,7 @@ pub const CatalogAdmission = struct { meta: system_catalog.Meta, placement_polic
 pub fn transitionMutatesRelationSource(command: anytype) bool {
     return switch (command) {
         .apply_system_catalog,
+        .apply_schema_validation,
         .apply_restore_staging,
         .create_restore_job_with_staging,
         .apply_fk_generation_publication,
@@ -292,10 +296,18 @@ pub const CatalogProjectionRequest = union(enum) {
     read_store_report_targets: struct { store_id: u64, group_ids: []const u64, full: bool, include_runtime: bool },
     catalog_read: system_catalog.Read,
     catalog_export: void,
+    catalog_checkpoint: []const u8,
+    catalog_checkpoint_projection: @import("../../system_catalog/projection.zig").Export.NativeCheckpoint,
     catalog_list_tables: system_catalog.TableList,
     catalog_meta: void,
     catalog_admission: system_catalog.Mutation,
     catalog_prepare: SystemCatalogCommand,
+    sql_sequence_admission_head: void,
+    sql_sequence_snapshot: @import("../../system_catalog/sequence_catalog.zig").SnapshotRequest,
+    sql_sequence_preflight: @import("../../system_catalog/sequence_catalog.zig").Mutation,
+    sql_sequence_outcome: @import("../../system_catalog/sequence_catalog.zig").Mutation,
+    sql_sequence_counter_preflight: @import("../../system_catalog/sequence_catalog.zig").CounterRequest,
+    sql_sequence_counter_outcome: @import("../../system_catalog/sequence_catalog.zig").CounterRequest,
     catalog_resolve_table: system_catalog.Target,
     catalog_resolve_identity: system_catalog.Target,
     catalog_resolve_many: system_catalog.ResolveMany,
@@ -310,6 +322,7 @@ pub const CatalogProjectionRequest = union(enum) {
     report_baseline_progress: @import("../store_report_baseline.zig").ProgressQuery,
     report_baseline_fragment_admission: @import("../store_report_baseline.zig").Request,
     catalog_snapshot: void,
+    sql_setting_mutation_cut: ?[]const u8,
     sql_setting_snapshot: @import("antfly_local_sources").system_catalog_settings.Scope,
     sql_policy_snapshot: struct { table_id: u64, principal: []const u8, database: []const u8, roles: []const []const u8 },
     sql_policy_install_snapshot: @import("antfly_local_sources").system_catalog_policies.InstallRequest,
@@ -340,6 +353,8 @@ pub const CatalogProjectionRequest = union(enum) {
     schema_reader_floor: void,
     standalone_revision_state: void,
     standalone_native_reporter_observation: @import("../standalone_native_owner.zig").Registration,
+    standalone_native_reporter_progress: u64,
+    standalone_native_owner_binding: void,
     relational_index_status: @import("../relational_index_publication.zig").StatusRequest,
     relational_index_prepare: @import("../relational_index_publication.zig").PrepareRequest,
     relational_index_admission_status: @import("../relational_index_publication.zig").AdmissionRequest,
@@ -355,4 +370,12 @@ pub const CatalogProjectionRequest = union(enum) {
     relational_index_source_complete_preflight: []const u8,
     relational_index_work: @import("../relational_index_work.zig").Query,
     validate_store_root_enrollment_protocol: void,
+    /// This private projection returns owned raw bytes rather than a JSON
+    /// envelope, preserving ASVI frames across the isolated-owner boundary.
+    schema_validation_owner_read: @import("../schema_validation_read.zig").OwnerReadRequest,
+    schema_validation_discover: @import("../schema_validation_read.zig").DiscoveryRequest,
+    schema_validation_work: @import("../schema_validation_work.zig").Query,
+    schema_validation_prepare: @import("../schema_validation_admission.zig").Request,
+    schema_validation_status: @import("../schema_validation_admission.zig").StatusRequest,
+    schema_validation_receipt_read: @import("../schema_validation_receipt.zig").Request,
 };

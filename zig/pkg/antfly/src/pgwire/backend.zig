@@ -23,6 +23,7 @@ pub const Parameter = @import("antfly_local_sources").sql_scalar.Type;
 pub const Column = struct {
     name: []const u8,
     type: Type,
+    temporal_kind: ?@import("antfly_local_sources").sql_temporal_value.Kind = null,
     element_type: ?@import("antfly_local_sources").sql_array_value.ElementType = null,
     numeric_modifier: ?@import("antfly_local_sources").sql_scalar.NumericModifier = null,
 };
@@ -69,6 +70,7 @@ pub const Request = struct {
     /// before returning so later statements can reuse the connection budget.
     read_receipt_budget: ?*@import("antfly_local_sources").sql_read_requirements.WaitBudget = null,
     setting_overlay: []const @import("antfly_local_sources").sql_setting_catalog.OverlayEntry = &.{},
+    setting_baseline: ?[]const @import("antfly_local_sources").sql_setting_catalog.OverlayEntry = null,
 
     pub fn check(self: Request) !void {
         try self.io.checkCancel();
@@ -125,6 +127,7 @@ pub const Result = struct {
     transaction_status: TransactionStatus = .idle,
     mutation_outcome: ?MutationOutcome = null,
     ddl_receipt_json: ?[]const u8 = null,
+    catalog_receipt_json: ?[]const u8 = null,
     transaction_id: ?[32]u8 = null,
     /// Optional zero-copy owner for native result arenas. Released before the
     /// enclosing caller arena; its allocations still use the caller's budget.
@@ -171,8 +174,9 @@ pub const Result = struct {
 };
 
 pub const Cell = struct {
-    /// Canonical JSONB bytes owned by the result lease. JSON null remains a
-    /// non-NULL value; ordinary scalars keep their existing representation.
+    /// Encoded JSON owned by the result lease; pgwire normalizes SQL JSONB
+    /// output rather than assuming API JSON is PostgreSQL canonical text.
+    /// JSON null remains a non-NULL value.
     json_bytes: ?[]const u8 = null,
     /// Validated immutable tokens borrow the result lease; pgwire streams them
     /// directly into DataRow frames without an intermediate JSON string.

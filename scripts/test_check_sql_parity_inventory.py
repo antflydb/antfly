@@ -13,8 +13,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import copy
 import contextlib
+import copy
 import io
 import json
 import unittest
@@ -218,12 +218,25 @@ class ParityInventoryTest(unittest.TestCase):
     def test_unresolved_partial_evidence_is_checked_and_runs_without_release_credit(
         self,
     ):
-        _, entries, gate_ids = validate(self.inventory, self.ledger)
+        # The live case may legitimately graduate. Exercise partial evidence
+        # using a controlled disposition, not a permanently unresolved case.
+        ledger = copy.deepcopy(self.ledger)
+        next(entry for entry in ledger["entries"] if entry["id"] == "sql-0008")[
+            "status"
+        ] = "unresolved"
+        _, entries, gate_ids = validate(self.inventory, ledger)
         partial = next(entry for entry in entries if entry["id"] == "sql-0008")
         self.assertEqual("unresolved", partial["status"])
+        self.assertIn(partial, release_blockers(entries))
         self.assertIn("sql-original-prepared-cte-runtime", gate_ids)
         self.assertIn("pgwire-original-prepared-cte", gate_ids)
-        ledger = copy.deepcopy(self.ledger)
+        with patch("check_sql_parity_inventory.subprocess.run") as run:
+            run_evidence(
+                sorted({proof["gate"] for proof in partial["evidence"]}),
+                ledger["gates"],
+            )
+        self.assertTrue(run.called)
+        self.assertEqual("unresolved", partial["status"])
         partial = next(
             entry for entry in ledger["entries"] if entry["id"] == "sql-0008"
         )

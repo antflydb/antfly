@@ -93,6 +93,28 @@ pub fn temporalBinaryLeaky(a: Allocator, kind: @import("temporal_value.zig").Kin
     return Datum.typedTemporal(owned);
 }
 
+test "SQL temporal cast binding rejects nonexistent PostgreSQL epoch casts before evaluation" {
+    const a = std.testing.allocator;
+    for ([_]ast.ColumnType{ .integer, .number, .boolean, .uuid, .json, .array }) |kind| {
+        var parsed = try @import("compiler.zig").compileScalar(a, "v::timestamptz", .{});
+        defer parsed.deinit();
+        try std.testing.expectError(error.SqlCannotCoerce, bind(a, parsed.expression, &.{.{ .name = "v", .type = kind, .element_type = if (kind == .array) .int64 else null }}, &.{}, .{}));
+    }
+    for ([_][]const u8{ "v::bigint", "v::numeric", "v::boolean", "v::jsonb", "v::uuid" }) |query| {
+        var parsed = try @import("compiler.zig").compileScalar(a, query, .{});
+        defer parsed.deinit();
+        try std.testing.expectError(error.SqlCannotCoerce, bind(a, parsed.expression, &.{.{ .name = "v", .type = .datetime }}, &.{}, .{}));
+    }
+    for ([_][]const u8{ "NULL::bigint::timestamptz", "CASE WHEN false THEN 1::bigint::timestamptz ELSE NULL END" }) |query| {
+        var parsed = try @import("compiler.zig").compileScalar(a, query, .{});
+        defer parsed.deinit();
+        try std.testing.expectError(error.SqlCannotCoerce, bind(a, parsed.expression, &.{}, &.{}, .{}));
+    }
+    const operand: ast.Scalar = .{ .column = "v" };
+    const function: ast.Scalar = .{ .cast = .{ .operand = &operand, .type = .number, .element_type = .float64, .coercion = .function } };
+    try std.testing.expectError(error.SqlUndefinedFunction, bind(a, &function, &.{.{ .name = "v", .type = .datetime }}, &.{}, .{}));
+}
+
 test "SQL temporal scalar dispatch preserves typed identity and exact text casts" {
     // Extension identity occupies existing tail padding, not another pointer
     // in every primitive cell. Keep this invariant on every selected target.
@@ -249,10 +271,11 @@ const arrays = @import("array_value.zig");
 const builtin_cast = @import("builtin_cast.zig");
 const regex_functions = @import("regex_functions.zig");
 pub const NumericModifier = @import("../common/sql_builtin_type.zig").NumericModifier;
-pub const Type = struct { kind: ?ast.ColumnType = null, nullable: bool = true, element_type: ?arrays.ElementType = null, numeric_modifier: ?@import("../common/sql_builtin_type.zig").NumericModifier = null };
+pub const Type = struct { kind: ?ast.ColumnType = null, temporal_kind: ?@import("temporal_value.zig").Kind = null, nullable: bool = true, element_type: ?arrays.ElementType = null, numeric_modifier: ?@import("../common/sql_builtin_type.zig").NumericModifier = null };
 pub const Column = struct {
     name: []const u8,
     type: ast.ColumnType,
+    temporal_kind: ?@import("temporal_value.zig").Kind = null,
     /// This spelling belongs to multiple visible relations. Keep it in the
     /// binding environment so unused ambiguity is harmless; reject only an
     /// actual reference, before any physical execution is admitted.
@@ -267,11 +290,23 @@ pub const Column = struct {
 /// Canonical SQL identity for both bound expressions and native materialized
 /// inputs. Legacy integer/number declarations use the same default widths.
 pub fn columnType(column: anytype) Type {
-    return .{ .kind = column.type, .nullable = column.nullable, .element_type = columnElementType(column.type, column.element_type), .numeric_modifier = column.numeric_modifier };
+    return .{ .kind = column.type, .temporal_kind = if (@hasField(@TypeOf(column), "temporal_kind")) column.temporal_kind else null, .nullable = if (@hasField(@TypeOf(column), "nullable")) column.nullable else true, .element_type = columnElementType(column.type, column.element_type), .numeric_modifier = column.numeric_modifier };
 }
 /// Resolve explicit and default scalar widths for expression and recipe identities.
 pub fn columnElementType(kind: ast.ColumnType, element: ?arrays.ElementType) ?arrays.ElementType {
     return element orelse (if (kind == .integer) arrays.ElementType.int64 else if (kind == .number) arrays.ElementType.float64 else null);
+}
+
+pub fn assignmentSourceIdentity(kind: ast.ColumnType, element: ?arrays.ElementType) ?arrays.ElementType {
+    return element orelse switch (kind) {
+        .integer => .int64,
+        .number => .float64,
+        .boolean => .boolean,
+        .string => .text,
+        .uuid => .uuid,
+        .json => .jsonb,
+        .datetime, .array => null,
+    };
 }
 pub const BindLimits = struct {
     nodes: usize = 8192,
@@ -295,6 +330,9 @@ pub const EvalLimits = struct {
     /// Invocation-owned I/O for volatile functions. Never cache this in a
     /// compiled program or synthesize entropy from clocks/process state.
     execution_io: ?std.Io = null,
+    /// Optional execution-owner clock for deterministic/native invocations.
+    /// The default producer is process-owned, never an OS-thread local.
+    uuid_clock: ?*@import("../common/uuid.zig").Version7Clock = null,
     /// Immutable stable-address typed values owned by the enclosing execution.
     clock_values: ?*const @import("statement_clock.zig").Frame = null,
     steps: usize = 65_536,
@@ -411,9 +449,12 @@ pub const Function = enum {
     @"$record_field",
     @"$json_path",
     @"$json_path_text",
+    uuid_extract_version,
+    uuid_extract_timestamp,
+    uuidv7,
     pub fn volatility(self: Function) Volatility {
         return switch (self) {
-            .ai_decide, .ai_choice, .ai_score, .ai_probability, .gen_random_uuid => .@"volatile",
+            .ai_decide, .ai_choice, .ai_score, .ai_probability, .gen_random_uuid, .uuidv7 => .@"volatile",
             .now, .transaction_timestamp, .@"$current_timestamp", .@"$current_user", .current_setting, .date_part, .extract, .date_trunc, .to_jsonb, .jsonb_build_object, .concat, .concat_ws => .stable,
             else => .immutable,
         };
@@ -438,6 +479,132 @@ pub fn timestampResult(datum: Datum, kind: ?ast.ColumnType) !@import("temporal_v
 
 pub fn formatTimestampResult(datum: Datum, kind: ?ast.ColumnType, output: *[@import("temporal_text.zig").output_capacity]u8) ![]const u8 {
     return @import("temporal_text.zig").format(.{ .timestamp_tz = try timestampResult(datum, kind) }, output);
+}
+
+test "SQL UUIDv7 generation uses owned clocks secure invocation entropy and lazy volatile evaluation" {
+    const Source = struct {
+        calls: usize = 0,
+        now_ns: i96 = 1_740_365_184_503_456_789,
+        failure: ?std.Io.RandomSecureError = null,
+        fn fill(raw: ?*anyopaque, bytes: []u8) std.Io.RandomSecureError!void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.calls += 1;
+            if (self.failure) |failure| return failure;
+            @memset(bytes, 0);
+        }
+        fn now(raw: ?*anyopaque, _: std.Io.Clock) std.Io.Timestamp {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.now_ns -= 1;
+            return .{ .nanoseconds = self.now_ns };
+        }
+    };
+    const a = std.testing.allocator;
+    const uuid = @import("../common/uuid.zig");
+    var source: Source = .{};
+    var vtable = std.testing.io.vtable.*;
+    vtable.randomSecure = Source.fill;
+    vtable.now = Source.now;
+    const io: std.Io = .{ .userdata = &source, .vtable = &vtable };
+    var clock: uuid.Version7Clock = .{};
+    var compiled = try @import("compiler.zig").compileScalar(a, "pg_catalog.uuidv7()", .{});
+    defer compiled.deinit();
+    var program = try bind(a, compiled.expression, &.{}, &.{}, .{});
+    defer program.deinit();
+    try std.testing.expectEqual(ast.ColumnType.uuid, program.output_type.kind.?);
+    try std.testing.expect(program.constant_pool == null);
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    var prior: [16]u8 = @splat(0);
+    for (0..128) |_| {
+        const datum = try program.evaluate(arena.allocator(), &.{}, &.{}, .{ .execution_io = io, .uuid_clock = &clock });
+        const bytes = try uuid.parse(datum.value.string);
+        try std.testing.expectEqual(@as(?u4, 7), uuid.version(bytes));
+        try std.testing.expect(std.mem.order(u8, &prior, &bytes) == .lt);
+        prior = bytes;
+    }
+    try std.testing.expectEqual(@as(usize, 128), source.calls);
+    for ([_][]const u8{ "uuidv7(INTERVAL '1 month 2 days 3 hours')", "uuidv7('1 day')", "uuidv7(CAST('1 day' AS interval))", "uuidv7('1 day'::interval)" }) |sql| {
+        var shifted = try @import("compiler.zig").compileScalar(a, sql, .{});
+        defer shifted.deinit();
+        var shifted_program = try bind(a, shifted.expression, &.{}, &.{}, .{});
+        defer shifted_program.deinit();
+        const result = try shifted_program.evaluate(arena.allocator(), &.{}, &.{}, .{ .execution_io = io, .uuid_clock = &clock });
+        try std.testing.expectEqual(@as(?u4, 7), uuid.version(try uuid.parse(result.value.string)));
+    }
+    for ([_][]const u8{ "uuidv7(NULL)", "uuidv7(NULL::interval)" }) |sql| {
+        var null_shift = try @import("compiler.zig").compileScalar(a, sql, .{});
+        defer null_shift.deinit();
+        var null_program = try bind(a, null_shift.expression, &.{}, &.{}, .{});
+        defer null_program.deinit();
+        try std.testing.expect((try null_program.evaluate(arena.allocator(), &.{}, &.{}, .{})).sql_null);
+    }
+    for ([_][]const u8{ "uuidv7(NULL::text)", "uuidv7(now())", "uuidv7(1)", "uuidv7(NULL, NULL)" }) |sql| {
+        var invalid = try @import("compiler.zig").compileScalar(a, sql, .{});
+        defer invalid.deinit();
+        try std.testing.expectError(error.SqlUndefinedFunction, bind(a, invalid.expression, &.{}, &.{}, .{}));
+    }
+    for ([_][]const u8{ "uuidv7(COALESCE($1, INTERVAL '0 days'))", "uuidv7(CASE WHEN true THEN $1 ELSE INTERVAL '0 days' END)" }) |sql| {
+        var composed = try @import("compiler.zig").compileScalar(a, sql, .{});
+        defer composed.deinit();
+        var composed_program = try bindTyped(a, composed.expression, &.{}, &.{.{}}, .{});
+        defer composed_program.deinit();
+        try std.testing.expectEqual(@as(?@import("temporal_value.zig").Kind, .interval), composed_program.parameter_descriptors[0].temporal_kind);
+    }
+    var parameter = try @import("compiler.zig").compileScalar(a, "uuidv7($1)", .{});
+    defer parameter.deinit();
+    var parameter_program = try bindTyped(a, parameter.expression, &.{}, &.{.{}}, .{});
+    defer parameter_program.deinit();
+    try std.testing.expectEqual(@as(?@import("temporal_value.zig").Kind, .interval), parameter_program.parameter_descriptors[0].temporal_kind);
+    var frame = try @import("parameter_frame.zig").Frame.prepare(a, parameter_program.parameter_descriptors, &.{.{ .text = "1 day" }}, .{});
+    defer frame.deinit();
+    const result = try (try parameter_program.bindParameters(&frame)).evaluate(arena.allocator(), &.{}, .{ .execution_io = io, .uuid_clock = &clock });
+    try std.testing.expectEqual(@as(?u4, 7), uuid.version(try uuid.parse(result.value.string)));
+
+    try std.testing.expectError(error.SqlEntropyUnavailable, program.evaluate(arena.allocator(), &.{}, &.{}, .{}));
+    source.failure = error.EntropyUnavailable;
+    try std.testing.expectError(error.SqlEntropyUnavailable, program.evaluate(arena.allocator(), &.{}, &.{}, .{ .execution_io = io, .uuid_clock = &clock }));
+    source.failure = error.Canceled;
+    try std.testing.expectError(error.Canceled, program.evaluate(arena.allocator(), &.{}, &.{}, .{ .execution_io = io, .uuid_clock = &clock }));
+    var lazy = try @import("compiler.zig").compileScalar(a, "CASE WHEN false THEN uuidv7() ELSE NULL::uuid END", .{});
+    defer lazy.deinit();
+    var lazy_program = try bind(a, lazy.expression, &.{}, &.{}, .{});
+    defer lazy_program.deinit();
+    try std.testing.expect((try lazy_program.evaluate(arena.allocator(), &.{}, &.{}, .{})).sql_null);
+}
+
+test "SQL PostgreSQL UUID extraction retains native result types variant nulls and strict overloads" {
+    const a = std.testing.allocator;
+    for ([_]struct { sql: []const u8, version: ?i64 }{
+        .{ .sql = "uuid_extract_version('019535d9-3df7-79fb-b466-fa907fa17f9e')", .version = 7 },
+        .{ .sql = "pg_catalog.uuid_extract_version('41db1265-8bc1-4ab3-992f-885799a4af1d'::uuid)", .version = 4 },
+        .{ .sql = "uuid_extract_version('00000000-0000-0000-8000-000000000000')", .version = 0 },
+        .{ .sql = "uuid_extract_version('00000000-0000-7000-0000-000000000000')", .version = null },
+        .{ .sql = "uuid_extract_version(NULL)", .version = null },
+    }) |entry| {
+        var compiled = try @import("compiler.zig").compileScalar(a, entry.sql, .{});
+        defer compiled.deinit();
+        var program = try bind(a, compiled.expression, &.{}, &.{}, .{});
+        defer program.deinit();
+        try std.testing.expectEqual(arrays.ElementType.int16, program.output_type.element_type.?);
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const value = try program.evaluate(arena.allocator(), &.{}, &.{}, .{});
+        if (entry.version) |expected| try std.testing.expectEqual(expected, value.value.integer) else try std.testing.expect(value.sql_null);
+    }
+    var timestamp = try @import("compiler.zig").compileScalar(a, "uuid_extract_timestamp('019535d9-3df7-79fb-b466-fa907fa17f9e')", .{});
+    defer timestamp.deinit();
+    var program = try bind(a, timestamp.expression, &.{}, &.{}, .{});
+    defer program.deinit();
+    try std.testing.expectEqual(ast.ColumnType.datetime, program.output_type.kind.?);
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const value = try program.evaluate(arena.allocator(), &.{}, &.{}, .{});
+    try std.testing.expectEqual(@as(?i128, 1_740_365_184_503_000_000), (try timestampResult(value, .datetime)).unixNanoseconds());
+    for ([_][]const u8{ "uuid_extract_version(1)", "uuid_extract_timestamp(NULL::bigint)", "uuid_extract_version(NULL::text)", "uuid_extract_timestamp('019535d9-3df7-79fb-b466-fa907fa17f9e'::text)", "uuid_extract_version()", "uuid_extract_timestamp(NULL, NULL)" }) |sql| {
+        var invalid = try @import("compiler.zig").compileScalar(a, sql, .{});
+        defer invalid.deinit();
+        try std.testing.expectError(error.SqlUndefinedFunction, bind(a, invalid.expression, &.{}, &.{}, .{}));
+    }
 }
 
 test "SQL native UUID generation is volatile demand driven and requires secure invocation entropy" {
@@ -496,6 +663,13 @@ test "SQL native UUID generation is volatile demand driven and requires secure i
     try std.testing.expectEqual(@as(usize, 4), source.calls);
     try std.testing.expect((try lazy_program.evaluate(arena.allocator(), &.{}, &.{}, .{ .execution_io = io })).sql_null);
     try std.testing.expectEqual(@as(usize, 4), source.calls);
+    var alias = try @import("compiler.zig").compileScalar(a, "pg_catalog.uuidv4()", .{});
+    defer alias.deinit();
+    var alias_program = try bind(a, alias.expression, &.{}, &.{}, .{});
+    defer alias_program.deinit();
+    try std.testing.expect(alias_program.constant_pool == null);
+    const alias_value = try alias_program.evaluate(arena.allocator(), &.{}, &.{}, .{ .execution_io = io });
+    try std.testing.expectEqual(@as(?u4, 4), @import("../common/uuid.zig").version(try @import("../common/uuid.zig").parse(alias_value.value.string)));
 }
 
 test "SQL transaction timestamp expressions borrow execution values without allocation or sampling" {
@@ -620,7 +794,7 @@ pub const Instruction = struct {
         unary: struct { op: ast.Scalar.Unary, operand: u32 },
         binary: struct { op: ast.Scalar.Binary, left: u32, right: u32 },
         call: struct { function: Function, args: []const u32, setting_identity: ?setting_catalog.Identity = null },
-        cast: struct { operand: u32, type: ast.ColumnType, element_type: ?arrays.ElementType = null, numeric_modifier: ?@import("../common/sql_builtin_type.zig").NumericModifier = null },
+        cast: struct { operand: u32, type: ast.ColumnType, temporal_kind: ?@import("temporal_value.zig").Kind = null, element_type: ?arrays.ElementType = null, numeric_modifier: ?@import("../common/sql_builtin_type.zig").NumericModifier = null },
         case_when: struct { branches: []const Branch, otherwise: ?u32 },
         in_list: struct { operand: u32, values: []const u32, negated: bool },
     },
@@ -1011,17 +1185,18 @@ pub fn inferTypedParametersExpected(alloc: Allocator, expression: *const ast.Sca
     try binder.registerColumns();
     for (parameters) |descriptor| try validateParameterType(descriptor);
     for (parameters, binder.parameters[0..parameters.len]) |descriptor, *output| output.* = try normalizeParameterType(descriptor);
-    _ = try binder.compileArrayContext(expression, if (expected) |kind| kind.kind else null, if (expected) |kind| kind.element_type else null, 0);
+    _ = try binder.compileTypedContext(expression, if (expected) |kind| kind.kind else null, if (expected) |kind| kind.element_type else null, if (expected) |kind| kind.temporal_kind else null, 0);
     if (binder.parameter_count > parameters.len) return error.InvalidSqlParameters;
     var changed = false;
     for (parameters, binder.parameters[0..parameters.len]) |*output, inferred| {
-        if (output.kind != inferred.kind or output.element_type != inferred.element_type) changed = true;
+        if (!std.meta.eql(output.*, inferred)) changed = true;
         output.* = inferred;
     }
     return changed;
 }
 
 pub fn validateParameterType(descriptor: Type) !void {
+    if (descriptor.temporal_kind != null and (descriptor.kind != .datetime or descriptor.element_type != null)) return error.InvalidSqlParameters;
     if (descriptor.numeric_modifier) |modifier| {
         if ((descriptor.kind != .number and descriptor.kind != .array) or descriptor.element_type != .numeric) return error.InvalidSqlParameters;
         modifier.validate() catch return error.InvalidSqlParameters;
@@ -1138,6 +1313,54 @@ test "SQL assignment text output retains PostgreSQL builtin identity nulls and d
 /// Shared assignment coercion for typed source cursors and mutation cells.
 /// Identity borrows the source; converted cells belong to alloc, and dimension
 /// metadata borrows the pinned source until the caller's ownership boundary.
+pub fn assignText(alloc: Allocator, datum: Datum, source_identity: ?arrays.ElementType, limits: EvalLimits) !Datum {
+    try datum.validateTemporal();
+    if (datum.patterns() != null or (datum.array != null and (datum.numeric != null or datum.value != .null)) or (datum.numeric != null and datum.value != .null)) return error.SqlAssignmentTypeMismatch;
+    if (datum.sql_null) {
+        if (datum.value != .null or datum.array != null or datum.numeric != null or datum.extension != null) return error.SqlTypeMismatch;
+        return datum;
+    }
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const program: Program = .{ .arena = &arena, .instructions = &.{}, .root = 0, .output_type = .{}, .parameter_types = &.{}, .parameter_descriptors = &.{}, .required_columns = &.{} };
+    var evaluator: Evaluator = .{ .program = &program, .alloc = alloc, .cells = &.{}, .parameters = &.{}, .limits = limits };
+    if (datum.temporal() != null) return Datum.json(.{ .string = try evaluator.temporalText(datum) });
+    if (datum.array) |array| {
+        var text: std.Io.Writer.Allocating = .init(alloc);
+        defer text.deinit();
+        try @import("array_text.zig").encode(alloc, array.*, &text.writer, .{ .wire_bytes = limits.output_bytes, .context = evaluator.workOwner() });
+        const owned = try text.toOwnedSlice();
+        errdefer alloc.free(owned);
+        try evaluator.charge(owned.len);
+        return Datum.json(.{ .string = owned });
+    }
+    // Unknown literals still use their target's ordinary input admission.
+    // Never infer JSONB semantics merely from an untyped JSON payload shape.
+    if (source_identity == null and datum.numeric == null) return datum;
+    return evaluator.castDatumBuiltin(datum, if (datum.numeric != null) .numeric else source_identity, .text);
+}
+
+test "SQL streamed text assignments reuse exact PostgreSQL builtin output domains" {
+    const a = std.testing.allocator;
+    const Golden = struct { assignment_contracts: []const struct { expression: []const u8, text: ?[]const u8, sql_null: bool } };
+    var golden = try std.json.parseFromSlice(Golden, a, @import("parity_fixtures.zig").array_mutation_reference, .{ .ignore_unknown_fields = true });
+    defer golden.deinit();
+    for (golden.value.assignment_contracts) |contract| {
+        errdefer std.debug.print("stream assignment output: {s}\n", .{contract.expression});
+        var compiled = try @import("compiler.zig").compileScalar(a, contract.expression, .{});
+        defer compiled.deinit();
+        var source = try bind(a, compiled.expression, &.{}, &.{}, .{});
+        defer source.deinit();
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const raw = try source.evaluate(arena.allocator(), &.{}, &.{}, .{});
+        const identity = assignmentSourceIdentity(source.output_type.kind orelse return error.SqlTypeMismatch, source.output_type.element_type);
+        const value = try assignText(arena.allocator(), raw, identity, .{});
+        try std.testing.expectEqual(contract.sql_null, value.sql_null);
+        if (contract.text) |text| try std.testing.expectEqualStrings(text, value.value.string);
+    }
+}
+
 pub fn assignArray(alloc: Allocator, datum: Datum, target: arrays.ElementType, limits: EvalLimits) !Datum {
     if (datum.value != .null or datum.patterns() != null) return error.SqlAssignmentTypeMismatch;
     if (datum.sql_null) {
@@ -1204,7 +1427,7 @@ fn bindDescriptors(alloc: Allocator, expression: *const ast.Scalar, columns: []c
         descriptor.* = try normalizeParameterType(descriptor.*);
     };
     binder.parameter_count = parameter_hints.len;
-    const root = try binder.compileArrayContext(expression, if (expected) |kind| kind.kind else null, if (expected) |kind| kind.element_type else null, 0);
+    const root = try binder.compileTypedContext(expression, if (expected) |kind| kind.kind else null, if (expected) |kind| kind.element_type else null, if (expected) |kind| kind.temporal_kind else null, 0);
     const output_type = binder.instructions.items[root].type;
     const instructions = try binder.instructions.toOwnedSlice(binder.alloc);
     const parameter_descriptors = try binder.alloc.dupe(Type, binder.parameters[0..binder.parameter_count]);
@@ -2132,6 +2355,7 @@ pub fn comparisonDomain(left: Type, right: Type) !Type {
 }
 
 fn common(left: Type, right: Type) !Type {
+    if (left.kind == .datetime and right.kind == .datetime and (left.temporal_kind orelse .timestamp_tz) != (right.temporal_kind orelse .timestamp_tz)) return error.SqlTypeMismatch;
     if (left.kind == .array or right.kind == .array) {
         const chosen = if (left.kind == .array) left else right;
         const other = if (left.kind == .array) right else left;
@@ -2150,7 +2374,7 @@ fn common(left: Type, right: Type) !Type {
         (if (left.element_type == .float64 or right.element_type == .float64 or (left.kind == .number and left.element_type == null) or (right.kind == .number and right.element_type == null)) .float64 else if (left.element_type == .float32 or right.element_type == .float32) .float32 else if (left.element_type == .numeric or right.element_type == .numeric) .numeric else null)
     else
         left.element_type orelse right.element_type;
-    return .{ .kind = kind, .element_type = element, .nullable = left.nullable or right.nullable };
+    return .{ .kind = kind, .element_type = element, .temporal_kind = left.temporal_kind orelse right.temporal_kind, .nullable = left.nullable or right.nullable };
 }
 
 /// Typed operator boundaries use the same array conversion and admission as
@@ -2181,6 +2405,7 @@ fn functionId(name: []const u8) !Function {
     // PostgreSQL has starts_with(text,text), not a symmetric ends_with
     // builtin. Do not accidentally promise a nonstandard overload.
     if (std.mem.eql(u8, name, "ends_with")) return error.SqlUndefinedFunction;
+    if (std.mem.eql(u8, name, "uuidv4")) return .gen_random_uuid;
     if (std.mem.eql(u8, name, "antfly\x00json_patch")) return .@"$document_patch";
     if (std.mem.startsWith(u8, name, "pg_catalog\x00")) {
         const builtin = try functionId(name[11..]);
@@ -2578,6 +2803,8 @@ fn arity(function: Function, count: usize) !void {
     }
     const valid = switch (function) {
         .now, .transaction_timestamp, .@"$current_user", .gen_random_uuid => count == 0,
+        .uuidv7 => count <= 1,
+        .uuid_extract_version, .uuid_extract_timestamp => count == 1,
         .@"$record_validate" => count == 1,
         .@"$record_field" => count == 3,
         .@"$current_timestamp" => count == 1,
@@ -2611,7 +2838,7 @@ fn arity(function: Function, count: usize) !void {
         .coalesce, .greatest, .least => count > 0,
         .concat => count > 0,
     };
-    if (!valid) return if (clockFunction(function) != null or arrayCompatibleFunction(function) or function == .starts_with or function == .md5 or function == .jsonb_exists_any or function == .jsonb_exists_all or function == .jsonb_array_length or function == .initcap or function == .jsonb_extract_path or function == .jsonb_extract_path_text) error.SqlUndefinedFunction else error.InvalidSqlParameters;
+    if (!valid) return if (clockFunction(function) != null or arrayCompatibleFunction(function) or function == .uuid_extract_version or function == .uuid_extract_timestamp or function == .gen_random_uuid or function == .uuidv7 or function == .starts_with or function == .md5 or function == .jsonb_exists_any or function == .jsonb_exists_all or function == .jsonb_array_length or function == .initcap or function == .jsonb_extract_path or function == .jsonb_extract_path_text) error.SqlUndefinedFunction else error.InvalidSqlParameters;
 }
 
 const Binder = struct {
@@ -2722,6 +2949,14 @@ const Binder = struct {
                 }
                 if (cast.type == .array) try self.typeArrayConstructors(cast.operand, cast.element_type.?, depth + 1);
                 const source = try self.infer(cast.operand, depth + 1);
+                // timestamp with time zone is not an epoch-number domain in
+                // PostgreSQL. Resolve this at binding, even for SQL NULL or
+                // dead branches; an evaluator must not invent unit conversion.
+                if (cast.type == .datetime and source.kind == .datetime and (cast.temporal_kind orelse .timestamp_tz) != (source.temporal_kind orelse .timestamp_tz)) return error.SqlCannotCoerce;
+                if (cast.type == .datetime and source.kind != null and source.kind != .datetime and source.kind != .string)
+                    return if (cast.coercion == .function) error.SqlUndefinedFunction else error.SqlCannotCoerce;
+                if (source.kind == .datetime and cast.type != .datetime and cast.type != .string)
+                    return if (cast.coercion == .function) error.SqlUndefinedFunction else error.SqlCannotCoerce;
                 if (cast.coercion == .function and cast.type == .number and source.kind != null) {
                     // An explicit text/date/boolean cast is not an implicit
                     // numeric-function overload. Only unknown string literals
@@ -2740,7 +2975,7 @@ const Binder = struct {
                 // real/double array cast supplies floating-point semantics.
                 if (cast.type == .array and source.kind == .array and builtin_cast.floating(source.element_type.?) and (builtin_cast.integral(cast.element_type.?) or cast.element_type == .text) and cast.operand.* != .cast and cast.operand.* != .column) return error.UnsupportedSqlShape;
                 if (cast.type != .array and source.kind == .array) return error.UnsupportedSqlShape;
-                break :blk .{ .kind = cast.type, .element_type = cast.element_type, .numeric_modifier = cast.numeric_modifier, .nullable = source.nullable };
+                break :blk .{ .kind = cast.type, .element_type = cast.element_type, .numeric_modifier = cast.numeric_modifier, .temporal_kind = cast.temporal_kind, .nullable = source.nullable };
             },
             .unary => |unary| blk: {
                 const input = try self.infer(unary.operand, depth + 1);
@@ -2804,6 +3039,22 @@ const Binder = struct {
                 const function = try functionId(call.name);
                 try arity(function, call.args.len);
                 if (function == .gen_random_uuid) break :blk .{ .kind = .uuid, .element_type = .uuid, .nullable = false };
+                if (function == .uuidv7) {
+                    if (call.args.len == 1) {
+                        const arg = call.args[0];
+                        const input = try self.infer(arg, depth + 1);
+                        const unknown = arg.* == .literal and arg.literal == .string;
+                        if (input.kind != null and !(input.kind == .datetime and input.temporal_kind == .interval) and !unknown) return error.SqlUndefinedFunction;
+                    }
+                    break :blk .{ .kind = .uuid, .element_type = .uuid, .nullable = call.args.len != 0 };
+                }
+                if (function == .uuid_extract_version or function == .uuid_extract_timestamp) {
+                    const arg = call.args[0];
+                    const input = try self.infer(arg, depth + 1);
+                    const unknown = arg.* == .literal and arg.literal == .string;
+                    if (input.kind != null and input.kind != .uuid and !unknown) return error.SqlUndefinedFunction;
+                    break :blk .{ .kind = if (function == .uuid_extract_version) .integer else .datetime, .element_type = if (function == .uuid_extract_version) .int16 else null, .nullable = true };
+                }
                 if (function == .@"$record_field" or function == .@"$record_validate") {
                     const input = try self.infer(call.args[0], depth + 1);
                     if (input.kind != null and input.kind != .json) return error.SqlUndefinedFunction;
@@ -3133,6 +3384,9 @@ const Binder = struct {
                     .date_trunc, .to_timestamp => .datetime,
                     .coalesce, .nullif, .greatest, .least, .abs, .ceil, .floor, .round, .trunc, .sign, .mod, .@"$single" => merged.kind,
                     else => .string,
+                }, .temporal_kind = switch (function) {
+                    .coalesce, .nullif, .greatest, .least, .@"$single" => merged.temporal_kind,
+                    else => null,
                 }, .numeric_modifier = switch (function) {
                     .coalesce, .greatest, .least => try self.commonModifier(call.args, depth),
                     .nullif, .@"$single" => if (merged.element_type == .numeric)
@@ -3213,6 +3467,10 @@ const Binder = struct {
     }
 
     fn compileArrayContext(self: *Binder, expression: *const ast.Scalar, expected: ?ast.ColumnType, array_element: ?arrays.ElementType, depth: usize) anyerror!u32 {
+        return self.compileTypedContext(expression, expected, array_element, null, depth);
+    }
+
+    fn compileTypedContext(self: *Binder, expression: *const ast.Scalar, expected: ?ast.ColumnType, array_element: ?arrays.ElementType, temporal_kind: ?@import("temporal_value.zig").Kind, depth: usize) anyerror!u32 {
         if (depth >= self.limits.depth or self.instructions.items.len >= self.limits.nodes) return error.SqlProgramLimitExceeded;
         if (expression.* == .cast and expression.cast.type == .number and expression.cast.element_type != null and builtin_cast.floating(expression.cast.element_type.?)) {
             const operand = expression.cast.operand;
@@ -3241,7 +3499,10 @@ const Binder = struct {
         if (expected == .number and array_element == .numeric and expression.* == .literal and
             (kind.kind == .integer or expression.literal == .string)) kind = .{ .kind = .number, .element_type = .numeric, .nullable = kind.nullable };
         if (expression.* == .literal and expression.literal == .parameter) kind = self.parameters[expression.literal.parameter - 1];
-        if (kind.kind == null) kind.kind = expected;
+        if (kind.kind == null) {
+            kind.kind = expected;
+            kind.temporal_kind = temporal_kind;
+        }
         if (self.typed_parameters and expression.* == .literal and expression.literal == .parameter and self.parameters[expression.literal.parameter - 1].kind == null) kind.element_type = array_element;
         if (kind.kind == .array and kind.element_type == null) kind.element_type = array_element;
         if (expected == .uuid and expression.* == .literal and expression.literal == .string) kind.kind = .uuid;
@@ -3287,7 +3548,7 @@ const Binder = struct {
                 .number => |v| .{ .float = v },
                 .numeric => |v| .{ .number_string = try self.alloc.dupe(u8, v) },
                 .string => |v| .{ .string = if (kind.kind == .uuid) @import("../common/uuid.zig").canonicalAlloc(self.alloc, v) catch |err| switch (err) {
-                    error.InvalidUuid => return error.SqlTypeMismatch,
+                    error.InvalidUuid => return error.SqlInvalidTextRepresentation,
                     else => return err,
                 } else try self.alloc.dupe(u8, v) },
                 .parameter => unreachable,
@@ -3297,7 +3558,15 @@ const Binder = struct {
                 if (std.mem.indexOfScalar(u32, self.dependencies.items, ordinal) == null) try self.dependencies.append(self.alloc, ordinal);
                 break :blk .{ .column = ordinal };
             },
-            .cast => |cast| .{ .cast = .{ .operand = if (cast.type == .array) try self.compileArrayContext(cast.operand, if (self.typed_parameters and cast.operand.* == .literal and cast.operand.literal == .parameter and self.parameters[cast.operand.literal.parameter - 1].kind == null) .array else null, cast.element_type, depth + 1) else try self.compileArrayContext(cast.operand, cast.type, if (self.typed_parameters) cast.element_type else null, depth + 1), .type = cast.type, .element_type = cast.element_type, .numeric_modifier = cast.numeric_modifier } },
+            .cast => |cast| blk: {
+                if (cast.operand.* == .literal and cast.operand.literal == .parameter) {
+                    const slot = cast.operand.literal.parameter - 1;
+                    const prior = self.parameters[slot];
+                    if (prior.kind == null) self.parameters[slot] = .{ .kind = cast.type, .element_type = cast.element_type, .temporal_kind = cast.temporal_kind };
+                    if (prior.kind == .datetime and cast.type == .datetime and (prior.temporal_kind orelse .timestamp_tz) != (cast.temporal_kind orelse .timestamp_tz)) return error.ConflictingSqlParameterTypes;
+                }
+                break :blk .{ .cast = .{ .operand = if (cast.type == .array) try self.compileArrayContext(cast.operand, if (self.typed_parameters and cast.operand.* == .literal and cast.operand.literal == .parameter and self.parameters[cast.operand.literal.parameter - 1].kind == null) .array else null, cast.element_type, depth + 1) else try self.compileTypedContext(cast.operand, cast.type, if (self.typed_parameters) cast.element_type else null, cast.temporal_kind, depth + 1), .type = cast.type, .element_type = cast.element_type, .numeric_modifier = cast.numeric_modifier, .temporal_kind = cast.temporal_kind } };
+            },
             // UNKNOWN is a boolean-only spelling of a null test. Validate its
             // operand first, then emit existing VM opcodes so persisted policy
             // DAGs do not require a new runtime capability for this syntax.
@@ -3451,6 +3720,7 @@ const Binder = struct {
                         .chr => .integer,
                         .lpad, .rpad => if (i == 1) .integer else .string,
                         .date_part, .extract, .date_trunc => if (i == 0) .string else .datetime,
+                        .uuid_extract_version, .uuid_extract_timestamp => .uuid,
                         .to_timestamp => .number,
                         .@"$current_timestamp" => .integer,
                         .concat => null,
@@ -3460,6 +3730,12 @@ const Binder = struct {
                         else => kind.kind,
                     };
                     const actual = try self.infer(arg, depth + 1);
+                    if (function == .uuidv7) {
+                        const coercion = try self.alloc.create(ast.Scalar);
+                        coercion.* = .{ .cast = .{ .operand = arg, .type = .datetime, .temporal_kind = .interval, .coercion = .function } };
+                        out.* = try self.compileArrayContext(coercion, .datetime, null, depth + 1);
+                        continue;
+                    }
                     if ((function == .jsonb_array_length or ((function == .jsonb_extract_path or function == .jsonb_extract_path_text or function == .@"$json_path" or function == .@"$json_path_text") and i == 0)) and arg.* == .literal and arg.literal == .string) {
                         const coercion = try self.alloc.create(ast.Scalar);
                         coercion.* = .{ .cast = .{ .operand = arg, .type = .json, .element_type = .jsonb } };
@@ -3496,7 +3772,9 @@ const Binder = struct {
                         continue;
                     }
                     if (desired != null and actual.kind != null and desired != actual.kind and !(desired == .datetime and actual.kind == .string) and !(desired == .uuid and actual.kind == .string and uuidTextOperand(arg)) and !(numeric(desired) and numeric(actual.kind))) return error.SqlTypeMismatch;
-                    const element_context: ?arrays.ElementType = if (function == .@"$record_field" or function == .@"$record_validate")
+                    const element_context: ?arrays.ElementType = if (function == .uuid_extract_version or function == .uuid_extract_timestamp)
+                        .uuid
+                    else if (function == .@"$record_field" or function == .@"$record_validate")
                         (if (i == 0) .jsonb else if (i == 1) .text else kind.element_type)
                     else if (!self.typed_parameters) (if (kind.kind == .array) kind.element_type else null) else switch (function) {
                         .jsonb_exists_any, .jsonb_exists_all => if (i == 1) .text else null,
@@ -3512,7 +3790,7 @@ const Binder = struct {
                         .cardinality, .array_ndims, .array_length, .array_lower, .array_upper => if (i == 0) (try self.infer(arg, depth + 1)).element_type else .int32,
                         else => if (kind.kind == .array or desired == kind.kind) kind.element_type else null,
                     };
-                    out.* = try self.compileArrayContext(arg, desired, element_context, depth + 1);
+                    out.* = try self.compileTypedContext(arg, desired, element_context, if (desired == .datetime) kind.temporal_kind else null, depth + 1);
                 }
                 if (function == .translate) {
                     const from = self.instructions.items[args[1]].operation;
@@ -3537,10 +3815,10 @@ const Binder = struct {
                 const branches = try self.alloc.alloc(Instruction.Branch, case.branches.len);
                 for (case.branches, branches) |branch, *out| {
                     if (kind.kind == .uuid and (try self.infer(branch.value, depth + 1)).kind == .string and !uuidTextOperand(branch.value)) return error.SqlTypeMismatch;
-                    out.* = .{ .condition = try self.compile(branch.condition, .boolean, depth + 1), .value = try self.compileArrayContext(branch.value, kind.kind, kind.element_type, depth + 1) };
+                    out.* = .{ .condition = try self.compile(branch.condition, .boolean, depth + 1), .value = try self.compileTypedContext(branch.value, kind.kind, kind.element_type, kind.temporal_kind, depth + 1) };
                 }
                 if (case.otherwise) |other| if (kind.kind == .uuid and (try self.infer(other, depth + 1)).kind == .string and !uuidTextOperand(other)) return error.SqlTypeMismatch;
-                break :blk .{ .case_when = .{ .branches = branches, .otherwise = if (case.otherwise) |other| try self.compileArrayContext(other, kind.kind, kind.element_type, depth + 1) else null } };
+                break :blk .{ .case_when = .{ .branches = branches, .otherwise = if (case.otherwise) |other| try self.compileTypedContext(other, kind.kind, kind.element_type, kind.temporal_kind, depth + 1) else null } };
             },
             .in_list => |list| blk: {
                 var merged = try self.infer(list.operand, depth + 1);
@@ -3880,6 +4158,14 @@ const Evaluator = struct {
                 // not PostgreSQL text-format bytes. A JSON string stays a
                 // string even when its contents happen to be valid JSON text.
                 if (instruction.type.kind == .json) break :blk Datum.json(value);
+                if (instruction.type.temporal_kind) |temporal_kind| {
+                    if (value != .string) return error.SqlTypeMismatch;
+                    const parsed = try @import("temporal_text.zig").parseInput(temporal_kind, value.string);
+                    try self.charge(@sizeOf(@import("temporal_value.zig").Value));
+                    const owned = try self.alloc.create(@import("temporal_value.zig").Value);
+                    owned.* = parsed;
+                    break :blk Datum.typedTemporal(owned);
+                }
                 break :blk Datum.json(try self.convert(value, instruction.type.kind.?));
             },
             .column => |ordinal| if (ordinal < self.cells.len) self.cells[ordinal] else return error.InvalidSqlBackendResponse,
@@ -3902,9 +4188,17 @@ const Evaluator = struct {
                 if (datum.sql_null) break :blk .{};
                 if (datum.temporal() != null) {
                     try datum.validateTemporal();
-                    if (cast.type == .datetime and datum.temporal().?.kind() == .timestamp_tz and cast.element_type == null) break :blk datum;
+                    if (cast.type == .datetime and datum.temporal().?.kind() == (cast.temporal_kind orelse .timestamp_tz) and cast.element_type == null) break :blk datum;
                     if (cast.type != .string) return error.UnsupportedSqlShape;
                     break :blk Datum.json(.{ .string = try self.temporalText(datum) });
+                }
+                if (cast.temporal_kind) |temporal_kind| {
+                    if (cast.type != .datetime or datum.value != .string) return error.SqlCannotCoerce;
+                    const value = try @import("temporal_text.zig").parseInput(temporal_kind, datum.value.string);
+                    try self.charge(@sizeOf(@import("temporal_value.zig").Value));
+                    const owned = try self.alloc.create(@import("temporal_value.zig").Value);
+                    owned.* = value;
+                    break :blk Datum.typedTemporal(owned);
                 }
                 if (cast.type == .array) {
                     if (datum.array == null and datum.value == .string) {
@@ -4070,17 +4364,43 @@ const Evaluator = struct {
                     owned.* = value.value;
                     break :blk Datum.typedNumeric(owned);
                 }
+                if (call.function == .uuid_extract_version or call.function == .uuid_extract_timestamp) {
+                    const input = try self.runDatum(call.args[0], depth + 1);
+                    if (input.sql_null) break :blk .{};
+                    if (input.value != .string) return error.SqlUndefinedFunction;
+                    const uuid = @import("../common/uuid.zig");
+                    const bytes = uuid.parse(input.value.string) catch return error.SqlInvalidTextRepresentation;
+                    if (call.function == .uuid_extract_version) break :blk if (uuid.version(bytes)) |v| Datum.json(.{ .integer = v }) else .{};
+                    const micros = uuid.timestampUnixMicros(bytes) orelse break :blk .{};
+                    const temporal = @import("temporal_value.zig");
+                    const timestamp = try temporal.Timestamp.fromUnixMicroseconds(micros);
+                    try self.charge(@sizeOf(temporal.Value));
+                    const owned = try self.alloc.create(temporal.Value);
+                    owned.* = .{ .timestamp_tz = timestamp };
+                    break :blk Datum.typedTemporal(owned);
+                }
                 if (call.function == .gen_random_uuid) {
                     const io = self.limits.execution_io orelse return error.SqlEntropyUnavailable;
-                    var bytes: [16]u8 = undefined;
-                    std.Io.randomSecure(io, &bytes) catch |err| return switch (err) {
-                        error.EntropyUnavailable => error.SqlEntropyUnavailable,
-                        else => err,
-                    };
-                    bytes[6] = (bytes[6] & 0x0f) | 0x40;
-                    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+                    const bytes = try @import("uuid_functions.zig").generate4(io);
                     try self.charge(36);
                     const text = @import("../common/uuid.zig").format(bytes);
+                    break :blk Datum.json(.{ .string = try self.alloc.dupe(u8, &text) });
+                }
+                if (call.function == .uuidv7) {
+                    var shift: ?@import("temporal_value.zig").Interval = null;
+                    if (call.args.len == 1) {
+                        const input = try self.runDatum(call.args[0], depth + 1);
+                        if (input.sql_null) break :blk .{};
+                        try input.validateTemporal();
+                        const value = input.temporal() orelse return error.SqlUndefinedFunction;
+                        if (value.kind() != .interval) return error.SqlUndefinedFunction;
+                        shift = value.interval;
+                    }
+                    if (shift) |value| if (value.infinity() != 0) return error.TemporalOutOfRange;
+                    const io = self.limits.execution_io orelse return error.SqlEntropyUnavailable;
+                    const bytes = try @import("uuid_functions.zig").generate(io, self.limits.uuid_clock orelse &@import("uuid_functions.zig").process_clock, shift);
+                    const text = @import("../common/uuid.zig").format(bytes);
+                    try self.charge(text.len);
                     break :blk Datum.json(.{ .string = try self.alloc.dupe(u8, &text) });
                 }
                 if (clockFunction(call.function)) |function| {
@@ -4109,12 +4429,7 @@ const Evaluator = struct {
                 }
                 if (call.function == .current_setting) {
                     const view = self.program.settings orelse return error.SettingCatalogUnavailable;
-                    const value = try view.resolveDependency(call.setting_identity orelse return error.InvalidSqlProgram);
-                    break :blk Datum.json(.{ .string = switch (value) {
-                        .string => |v| v,
-                        .boolean => |v| if (v) "true" else "false",
-                        .integer => |v| try std.fmt.allocPrint(self.alloc, "{d}", .{v}),
-                    } });
+                    break :blk Datum.json(.{ .string = try view.renderDependencyLeaky(self.alloc, call.setting_identity orelse return error.InvalidSqlProgram) });
                 }
                 switch (call.function) {
                     .array_append, .array_prepend, .array_cat => {
@@ -4664,7 +4979,7 @@ const Evaluator = struct {
                 // rows rather than trusting their declared UUID type.
                 const uuid = @import("../common/uuid.zig");
                 if (uuid.isCanonical(value.string)) break :blk value;
-                const canonical = uuid.format(uuid.parse(value.string) catch return error.SqlTypeMismatch);
+                const canonical = uuid.format(uuid.parse(value.string) catch return error.SqlInvalidTextRepresentation);
                 try self.charge(canonical.len);
                 break :blk .{ .string = try self.alloc.dupe(u8, &canonical) };
             } else error.SqlTypeMismatch,
@@ -6773,7 +7088,7 @@ test "SQL UUID comparison and cast canonicalize typed literals and parameters" {
     defer bound.deinit();
     try std.testing.expectEqual(ast.ColumnType.uuid, bound.parameter_types[0].?);
     try std.testing.expect((try bound.evaluate(alloc, &.{Datum.json(.{ .string = canonical })}, &.{.{ .string = "{A0EEBC999C0B4EF8BB6D6BB9BD380A11}" }}, .{})).value.bool);
-    try std.testing.expectError(error.SqlTypeMismatch, bound.evaluate(alloc, &.{Datum.json(.{ .string = canonical })}, &.{.{ .string = "bad" }}, .{}));
+    try std.testing.expectError(error.SqlInvalidTextRepresentation, bound.evaluate(alloc, &.{Datum.json(.{ .string = canonical })}, &.{.{ .string = "bad" }}, .{}));
     var mismatched = try @import("compiler.zig").compileScalar(std.testing.allocator, "id = label", .{});
     defer mismatched.deinit();
     try std.testing.expectError(error.SqlTypeMismatch, bind(std.testing.allocator, mismatched.expression, &.{ .{ .name = "id", .type = .uuid }, .{ .name = "label", .type = .string } }, &.{}, .{}));
@@ -8006,7 +8321,7 @@ test "SQL quantified generic UUID rows preserve normalization validation and quo
         try std.testing.expectError(error.SqlProgramLimitExceeded, program.evaluate(std.testing.failing_allocator, &row, &.{}, .{ .output_bytes = 35 }));
     }
     for ([_][]const u8{ "bad", "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a1z" }) |input|
-        try std.testing.expectError(error.SqlTypeMismatch, program.evaluate(std.testing.failing_allocator, &.{ .json(.{ .string = input }), .typedArray(&source) }, &.{}, .{}));
+        try std.testing.expectError(error.SqlInvalidTextRepresentation, program.evaluate(std.testing.failing_allocator, &.{ .json(.{ .string = input }), .typedArray(&source) }, &.{}, .{}));
     const Cancel = struct {
         fn check(_: ?*anyopaque) !void {
             return error.Canceled;

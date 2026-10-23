@@ -20,6 +20,29 @@ const compiler = @import("antfly_local_sources").sql_compiler;
 const wire = @import("antfly_metadata_openapi").types;
 const httpx = @import("httpx");
 const Json = std.json.Value;
+/// Real HTTP execution must preserve exact widths and temporal identities,
+/// including when generic JSON adaptation is used instead of native pgwire.
+pub fn runUuidExpressions(alloc: std.mem.Allocator, handler: anytype) !void {
+    var request = try httpx.Request.init(alloc, .POST, "http://127.0.0.1/db/v1/sql");
+    defer request.deinit();
+    request.body = try std.json.Stringify.valueAlloc(alloc, .{ .statement = "SELECT uuidv7() AS id, uuid_extract_version(uuidv7()) AS version, uuid_extract_timestamp(uuidv7(INTERVAL '1 day')) AS created, INTERVAL '1 month 2 days 3 hours' AS delta" }, .{});
+    defer alloc.free(request.body.?);
+    var ctx = httpx.Context.init(alloc, std.testing.io, &request);
+    var response = try handler.executeSQL(&ctx);
+    defer response.deinit();
+    try std.testing.expectEqual(@as(u16, 200), response.status.code);
+    var parsed = try std.json.parseFromSlice(wire.SQLResponse, alloc, response.body.?, .{});
+    defer parsed.deinit();
+    const result = parsed.value;
+    try std.testing.expectEqual(@as(usize, 1), result.rows.len);
+    const uuid = @import("antfly_local_sources").common_uuid;
+    try std.testing.expectEqual(@as(?u4, 7), uuid.version(try uuid.parse(result.rows[0][0].string)));
+    try std.testing.expectEqual(@as(?wire.SQLArrayElementType, .int16), result.columns[1].element_type);
+    try std.testing.expectEqual(@as(?wire.SQLTemporalKind, .interval), result.columns[3].temporal_kind);
+    try std.testing.expectEqualStrings("7", result.rows[0][1].string);
+    try std.testing.expectEqualStrings("1 mon 2 days 03:00:00", result.rows[0][3].string);
+}
+
 const OrderedGroup = struct { rows: []const []const Json, sql_nulls: []const []const bool };
 
 test "SQL PostgreSQL reference distinguishes JSON null and validates ordered peer prefixes" {
@@ -179,6 +202,14 @@ pub fn rowMatchesWithNulls(alloc: std.mem.Allocator, columns: []const wire.SQLCo
             .integer => if (cell == .string) {
                 value = .{ .integer = try std.fmt.parseInt(i64, cell.string, 10) };
             },
+            .datetime => {
+                if (cell != .string or want != .string) return false;
+                const datetime = @import("antfly_local_sources").datetime;
+                const left = datetime.parseDateTimeToSignedNs(cell.string) orelse return false;
+                const right = datetime.parseDateTimeToSignedNs(want.string) orelse return false;
+                if (left != right) return false;
+                continue;
+            },
             .number => {
                 if (column.element_type == .numeric and want == .string) {
                     if (cell != .string) return false;
@@ -222,6 +253,14 @@ pub fn rowMatchesWithNulls(alloc: std.mem.Allocator, columns: []const wire.SQLCo
         } else if (!equivalent(value, want)) return false;
     }
     return true;
+}
+
+test "SQL parity timestamp comparison preserves nanoseconds and timezone offsets rather than textual spelling" {
+    const columns = [_]wire.SQLColumn{.{ .name = "t", .type = .datetime }};
+    const actual = [_]Json{.{ .string = "2025-06-01T12:30:00.000000001Z" }};
+    try std.testing.expect(try rowMatchesWithNulls(std.testing.allocator, &columns, &actual, &.{false}, &.{.{ .string = "2025-06-01T13:30:00.000000001+01:00" }}, &.{false}));
+    try std.testing.expect(!try rowMatchesWithNulls(std.testing.allocator, &columns, &actual, &.{false}, &.{.{ .string = "2025-06-01T12:30:00+00:00" }}, &.{false}));
+    try std.testing.expect(!try rowMatchesWithNulls(std.testing.allocator, &columns, &actual, &.{false}, &.{.{ .string = "not a timestamp" }}, &.{false}));
 }
 
 pub fn runArrayWireContracts(alloc: std.mem.Allocator) !void {

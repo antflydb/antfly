@@ -28,6 +28,312 @@ const settings = @import("antfly_local_sources").system_catalog_settings;
 
 pub const Request = domain.Request;
 
+/// One ordinary metadata proposal. The read-only preview is never returned
+/// as the allocated identity; only its transactionally stored outcome is.
+pub fn mutateSqlSequence(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestContext, request: @import("sequence_catalog.zig").Mutation) ![]u8 {
+    if (!context.setting_admin) return error.Forbidden;
+    try context.ensureActive();
+    try request.validate();
+    try svc.ensureSqlSequenceDecoderReadyWithContext(context);
+    const readiness = try svc.ensureTableTopologyProtocolReadyWithContext(context, protocol.sql_sequence_catalog_version);
+    try svc.ensureLinearizableReadWithContext(context);
+    const store = svc.projectedStore() orelse return error.MissingMetadataStore;
+    const preview = try store.sqlSequencePreflight(alloc, svc.metadata_group_id, request);
+    if (preview == .rejected) return std.json.Stringify.valueAlloc(alloc, preview, .{});
+    const bytes = try std.json.Stringify.valueAlloc(alloc, @import("sequence_catalog.zig").command(request), .{});
+    defer alloc.free(bytes);
+    if (bytes.len > domain.max_command_bytes) return error.CatalogCommandTooLarge;
+    try context.ensureActive();
+    // Object guards and the bounded admission window are checked again by
+    // native apply. Network waits, preparation and encoding need no catalog
+    // serialization; hold its gate only for capability validation/proposal.
+    svc.lockCatalogMutation();
+    var locked = true;
+    defer if (locked) svc.unlockCatalogMutation();
+    try svc.validateTableTopologyProtocolReadinessWithContext(context, readiness);
+    try context.ensureActive();
+    const receipt = try svc.proposeTransitionCommandWithReceipt(.{ .apply_system_catalog = bytes });
+    svc.unlockCatalogMutation();
+    locked = false;
+    svc.waitForTransitionAppliedWithContext(receipt, context) catch return error.MetadataMutationOutcomeUnknown;
+    const outcome = store.sqlSequenceOutcome(alloc, svc.metadata_group_id, request) catch return error.MetadataMutationOutcomeUnknown;
+    return std.json.Stringify.valueAlloc(alloc, outcome, .{}) catch error.MetadataMutationOutcomeUnknown;
+}
+
+pub fn mutateSqlSequenceCounter(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestContext, request: @import("sequence_catalog.zig").CounterRequest) ![]u8 {
+    const sequence = @import("sequence_catalog.zig");
+    if (!context.setting_admin) return error.Forbidden;
+    try context.ensureActive();
+    try request.validate();
+    try svc.ensureSqlSequenceDecoderReadyWithContext(context);
+    const readiness = try svc.ensureTableTopologyProtocolReadyWithContext(context, protocol.sql_sequence_catalog_version);
+    try svc.ensureLinearizableReadWithContext(context);
+    const store = svc.projectedStore() orelse return error.MissingMetadataStore;
+    switch (try store.sqlSequenceCounterPreflight(alloc, svc.metadata_group_id, request)) {
+        .unknown => return error.MetadataMutationOutcomeUnknown,
+        .applied => |value| return std.json.Stringify.valueAlloc(alloc, sequence.CounterOutcome{ .success = value }, .{}) catch error.MetadataMutationOutcomeUnknown,
+        .rejected => |value| return std.json.Stringify.valueAlloc(alloc, sequence.CounterOutcome{ .rejected = value }, .{}),
+        .ready => {},
+    }
+    const bytes = try std.json.Stringify.valueAlloc(alloc, request, .{});
+    defer alloc.free(bytes);
+    if (bytes.len > domain.max_command_bytes) return error.CatalogCommandTooLarge;
+    try context.ensureActive();
+    svc.lockCatalogMutation();
+    var locked = true;
+    defer if (locked) svc.unlockCatalogMutation();
+    try svc.validateTableTopologyProtocolReadinessWithContext(context, readiness);
+    try context.ensureActive();
+    const receipt = try svc.proposeTransitionCommandWithReceipt(.{ .apply_sql_sequence_counter = bytes });
+    svc.unlockCatalogMutation();
+    locked = false;
+    svc.waitForTransitionAppliedWithContext(receipt, context) catch return error.MetadataMutationOutcomeUnknown;
+    const outcome = (store.sqlSequenceCounterOutcome(alloc, svc.metadata_group_id, request) catch return error.MetadataMutationOutcomeUnknown) orelse return error.MetadataMutationOutcomeUnknown;
+    return std.json.Stringify.valueAlloc(alloc, outcome, .{}) catch error.MetadataMutationOutcomeUnknown;
+}
+
+test "sequence catalog counter service never issues previews or replays ambiguous proposals" {
+    const t = std.testing;
+    const sequence = @import("sequence_catalog.zig");
+    const initial = try sequence.sequence.Record.create(.{ .cache = 4 });
+    const request: sequence.CounterRequest = .{ .target = .{ .table = "counter" }, .namespace_id = 2, .sequence_id = 41, .incarnation = @splat(7), .request = .{ .expected = initial.state, .request_id = @splat(1), .operation = .reserve } };
+    const actual = (try sequence.journal.prepare(.{ .group = 41, .sequence_id = 41 }, initial.definition, initial.state, request.request, null)).apply;
+    const Store = struct {
+        admission: sequence.CounterAdmission = .ready,
+        observed: ?sequence.CounterOutcome = null,
+        reads: usize = 0,
+        read_failure: bool = false,
+        pub fn sqlSequenceCounterPreflight(self: *@This(), _: std.mem.Allocator, _: u64, _: sequence.CounterRequest) !sequence.CounterAdmission {
+            return self.admission;
+        }
+        pub fn sqlSequenceCounterOutcome(self: *@This(), _: std.mem.Allocator, _: u64, _: sequence.CounterRequest) !?sequence.CounterOutcome {
+            self.reads += 1;
+            if (self.read_failure) return error.OutOfMemory;
+            return self.observed;
+        }
+    };
+    const Svc = struct {
+        const Receipt = struct { term: u64, index: u64 };
+        metadata_group_id: u64 = 41,
+        store: Store = .{},
+        locked: bool = false,
+        proposals: usize = 0,
+        waits: usize = 0,
+        wait_failure: bool = false,
+        cancel_on_validate: ?*std.atomic.Value(bool) = null,
+        fail_reply: ?*t.FailingAllocator = null,
+        pub fn ensureSqlSequenceDecoderReadyWithContext(_: *@This(), _: operation.RequestContext) !void {}
+        pub fn ensureTableTopologyProtocolReadyWithContext(_: *@This(), _: operation.RequestContext, version: u16) !bool {
+            try t.expectEqual(protocol.sql_sequence_catalog_version, version);
+            return true;
+        }
+        pub fn lockCatalogMutation(self: *@This()) void {
+            std.debug.assert(!self.locked);
+            self.locked = true;
+        }
+        pub fn unlockCatalogMutation(self: *@This()) void {
+            std.debug.assert(self.locked);
+            self.locked = false;
+        }
+        pub fn ensureLinearizableReadWithContext(self: *@This(), _: operation.RequestContext) !void {
+            try t.expect(!self.locked);
+        }
+        pub fn validateTableTopologyProtocolReadinessWithContext(self: *@This(), _: operation.RequestContext, ready: bool) !void {
+            try t.expect(ready and self.locked);
+            if (self.cancel_on_validate) |signal| signal.store(true, .release);
+        }
+        pub fn projectedStore(self: *@This()) ?*Store {
+            std.debug.assert(!self.locked);
+            return &self.store;
+        }
+        pub fn proposeTransitionCommandWithReceipt(self: *@This(), command: storage.TransitionCommand) !Receipt {
+            try t.expect(self.locked and command == .apply_sql_sequence_counter);
+            var parsed = try std.json.parseFromSlice(sequence.CounterRequest, t.allocator, command.apply_sql_sequence_counter, .{});
+            defer parsed.deinit();
+            try parsed.value.validate();
+            self.proposals += 1;
+            if (self.fail_reply) |failing| failing.fail_index = failing.alloc_index;
+            return .{ .term = 3, .index = 99 };
+        }
+        pub fn waitForTransitionAppliedWithContext(self: *@This(), _: Receipt, _: operation.RequestContext) !void {
+            try t.expect(!self.locked);
+            self.waits += 1;
+            if (self.wait_failure) return error.DeadlineExceeded;
+        }
+    };
+    const context: operation.RequestContext = .{ .setting_admin = true };
+    var svc: Svc = .{};
+    try t.expectError(error.Forbidden, mutateSqlSequenceCounter(&svc, t.allocator, .{}, request));
+    try t.expectError(error.DeadlineExceeded, mutateSqlSequenceCounter(&svc, t.allocator, .{ .setting_admin = true, .deadline_ns = 0 }, request));
+    try t.expectEqual(@as(usize, 0), svc.proposals);
+    for ([_]sequence.CounterAdmission{ .{ .applied = actual }, .{ .rejected = .SequenceCounterChanged }, .unknown }) |admission| {
+        svc = .{ .store = .{ .admission = admission } };
+        if (admission == .unknown) {
+            try t.expectError(error.MetadataMutationOutcomeUnknown, mutateSqlSequenceCounter(&svc, t.allocator, context, request));
+        } else {
+            const bytes = try mutateSqlSequenceCounter(&svc, t.allocator, context, request);
+            defer t.allocator.free(bytes);
+            var parsed = try std.json.parseFromSlice(sequence.CounterOutcome, t.allocator, bytes, .{});
+            defer parsed.deinit();
+            if (admission == .applied) try t.expectEqualDeep(actual, try parsed.value.result()) else try t.expectError(error.SequenceCounterChanged, parsed.value.result());
+        }
+        try t.expectEqual(@as(usize, 0), svc.proposals);
+        try t.expectEqual(@as(usize, 0), svc.store.reads);
+    }
+    {
+        var signal = std.atomic.Value(bool).init(false);
+        var canceled = context;
+        canceled.cancellation = operation.CancellationToken.fromAtomic(&signal);
+        svc = .{ .cancel_on_validate = &signal };
+        try t.expectError(error.Canceled, mutateSqlSequenceCounter(&svc, t.allocator, canceled, request));
+        try t.expectEqual(@as(usize, 0), svc.proposals);
+        try t.expect(!svc.locked);
+    }
+    svc = .{ .store = .{ .observed = .{ .success = actual } } };
+    {
+        const bytes = try mutateSqlSequenceCounter(&svc, t.allocator, context, request);
+        defer t.allocator.free(bytes);
+        var parsed = try std.json.parseFromSlice(sequence.CounterOutcome, t.allocator, bytes, .{});
+        defer parsed.deinit();
+        try t.expectEqualDeep(actual, try parsed.value.result());
+        try t.expectEqual(@as(usize, 1), svc.proposals);
+    }
+    for (0..3) |mode| {
+        svc = .{ .wait_failure = mode == 0, .store = .{ .read_failure = mode == 1 } };
+        try t.expectError(error.MetadataMutationOutcomeUnknown, mutateSqlSequenceCounter(&svc, t.allocator, context, request));
+        try t.expectEqual(@as(usize, 1), svc.proposals);
+        try t.expectEqual(@as(usize, 1), svc.waits);
+        try t.expect(!svc.locked);
+    }
+    var failing = t.FailingAllocator.init(t.allocator, .{ .fail_index = std.math.maxInt(usize) });
+    svc = .{ .store = .{ .observed = .{ .success = actual } }, .fail_reply = &failing };
+    try t.expectError(error.MetadataMutationOutcomeUnknown, mutateSqlSequenceCounter(&svc, failing.allocator(), context, request));
+    try t.expectEqual(@as(usize, 1), svc.proposals);
+}
+
+test "sequence catalog service uses actual outcomes and preserves proposal ambiguity without retries" {
+    const t = std.testing;
+    const sequence = @import("sequence_catalog.zig");
+    const Store = struct {
+        preview: sequence.Outcome = .{ .success = .{ .revision = 1, .identity = .{ .id = 41, .generation = 1 }, .removed = 0 } },
+        observed: sequence.Outcome = .{ .success = .{ .revision = 2, .identity = .{ .id = 42, .generation = 1 }, .removed = 0 } },
+        reads: usize = 0,
+        missing: bool = false,
+        pub fn sqlSequencePreflight(self: *@This(), _: std.mem.Allocator, _: u64, _: sequence.Mutation) !sequence.Outcome {
+            return self.preview;
+        }
+        pub fn sqlSequenceOutcome(self: *@This(), _: std.mem.Allocator, _: u64, _: sequence.Mutation) !sequence.Outcome {
+            self.reads += 1;
+            if (self.missing) return error.MetadataMutationOutcomeUnknown;
+            return self.observed;
+        }
+    };
+    const Svc = struct {
+        const Receipt = struct { term: u64, index: u64 };
+        metadata_group_id: u64 = 41,
+        store: Store = .{},
+        locked: bool = false,
+        proposals: usize = 0,
+        waits: usize = 0,
+        wait_failure: bool = false,
+        cancel_on_validate: ?*std.atomic.Value(bool) = null,
+        fail_reply: ?*t.FailingAllocator = null,
+        pub fn ensureSqlSequenceDecoderReadyWithContext(_: *@This(), _: operation.RequestContext) !void {}
+        pub fn ensureTableTopologyProtocolReadyWithContext(_: *@This(), _: operation.RequestContext, version: u16) !bool {
+            try t.expectEqual(protocol.sql_sequence_catalog_version, version);
+            return true;
+        }
+        pub fn lockCatalogMutation(self: *@This()) void {
+            std.debug.assert(!self.locked);
+            self.locked = true;
+        }
+        pub fn unlockCatalogMutation(self: *@This()) void {
+            std.debug.assert(self.locked);
+            self.locked = false;
+        }
+        pub fn ensureLinearizableReadWithContext(self: *@This(), _: operation.RequestContext) !void {
+            try t.expect(!self.locked);
+        }
+        pub fn validateTableTopologyProtocolReadinessWithContext(self: *@This(), _: operation.RequestContext, ready: bool) !void {
+            try t.expect(ready and self.locked);
+            if (self.cancel_on_validate) |signal| signal.store(true, .release);
+        }
+        pub fn projectedStore(self: *@This()) ?*Store {
+            std.debug.assert(!self.locked);
+            return &self.store;
+        }
+        pub fn proposeTransitionCommandWithReceipt(self: *@This(), command: storage.TransitionCommand) !Receipt {
+            try t.expect(self.locked and command == .apply_system_catalog);
+            var parsed = try std.json.parseFromSlice(storage.SystemCatalogCommand, t.allocator, command.apply_system_catalog, .{});
+            defer parsed.deinit();
+            try t.expect(parsed.value.sql_sequence != null);
+            self.proposals += 1;
+            if (self.fail_reply) |failing| failing.fail_index = failing.alloc_index;
+            return .{ .term = 3, .index = 99 };
+        }
+        pub fn waitForTransitionAppliedWithContext(self: *@This(), receipt: Receipt, _: operation.RequestContext) !void {
+            try t.expect(!self.locked);
+            try t.expectEqualDeep(Receipt{ .term = 3, .index = 99 }, receipt);
+            self.waits += 1;
+            if (self.wait_failure) return error.DeadlineExceeded;
+        }
+    };
+    const request: sequence.Mutation = .{ .admission = .{ .nonce = @splat(1), .head = 0 }, .target = .{ .table = "counter" }, .namespace_id = 2, .incarnation = @splat(7), .operation = .{ .create = .{ .options = .{} } } };
+    const context: operation.RequestContext = .{ .setting_admin = true };
+    var svc: Svc = .{};
+    try t.expectError(error.Forbidden, mutateSqlSequence(&svc, t.allocator, .{}, request));
+    try t.expectError(error.DeadlineExceeded, mutateSqlSequence(&svc, t.allocator, .{ .setting_admin = true, .deadline_ns = 0 }, request));
+    try t.expectEqual(@as(usize, 0), svc.proposals);
+    {
+        var signal = std.atomic.Value(bool).init(false);
+        var canceled = context;
+        canceled.cancellation = operation.CancellationToken.fromAtomic(&signal);
+        svc = .{ .cancel_on_validate = &signal };
+        try t.expectError(error.Canceled, mutateSqlSequence(&svc, t.allocator, canceled, request));
+        try t.expectEqual(@as(usize, 0), svc.proposals);
+        try t.expect(!svc.locked);
+        svc = .{};
+    }
+    {
+        const bytes = try mutateSqlSequence(&svc, t.allocator, context, request);
+        defer t.allocator.free(bytes);
+        var parsed = try std.json.parseFromSlice(sequence.Outcome, t.allocator, bytes, .{});
+        defer parsed.deinit();
+        try t.expectEqual(@as(u64, 42), (try parsed.value.result()).identity.?.id);
+        try t.expectEqual(@as(usize, 1), svc.proposals);
+    }
+    svc = .{ .store = .{ .preview = .{ .rejected = .InvalidSequenceDefinition } } };
+    {
+        const bytes = try mutateSqlSequence(&svc, t.allocator, context, request);
+        defer t.allocator.free(bytes);
+        var parsed = try std.json.parseFromSlice(sequence.Outcome, t.allocator, bytes, .{});
+        defer parsed.deinit();
+        try t.expectError(error.InvalidSequenceDefinition, parsed.value.result());
+        try t.expectEqual(@as(usize, 0), svc.proposals);
+    }
+    svc = .{ .store = .{ .observed = .{ .rejected = .CatalogGenerationChanged } } };
+    {
+        const bytes = try mutateSqlSequence(&svc, t.allocator, context, request);
+        defer t.allocator.free(bytes);
+        var parsed = try std.json.parseFromSlice(sequence.Outcome, t.allocator, bytes, .{});
+        defer parsed.deinit();
+        try t.expectError(error.CatalogGenerationChanged, parsed.value.result());
+        try t.expectEqual(@as(usize, 1), svc.proposals);
+    }
+    svc = .{ .wait_failure = true };
+    try t.expectError(error.MetadataMutationOutcomeUnknown, mutateSqlSequence(&svc, t.allocator, context, request));
+    try t.expectEqual(@as(usize, 1), svc.proposals);
+    try t.expectEqual(@as(usize, 0), svc.store.reads);
+    svc = .{ .store = .{ .missing = true } };
+    try t.expectError(error.MetadataMutationOutcomeUnknown, mutateSqlSequence(&svc, t.allocator, context, request));
+    try t.expectEqual(@as(usize, 1), svc.proposals);
+    var failing = t.FailingAllocator.init(t.allocator, .{ .fail_index = std.math.maxInt(usize) });
+    svc = .{ .fail_reply = &failing };
+    try t.expectError(error.MetadataMutationOutcomeUnknown, mutateSqlSequence(&svc, failing.allocator(), context, request));
+    try t.expectEqual(@as(usize, 1), svc.proposals);
+    try t.expect(!svc.locked);
+}
+
 pub fn mutateSqlView(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestContext, request: @import("views.zig").Request) ![]u8 {
     if (!context.setting_admin) return error.Forbidden;
     try context.ensureActive();
@@ -693,6 +999,397 @@ pub fn acknowledgeRelationalIndexOwner(svc: anytype, alloc: std.mem.Allocator, c
     return observed;
 }
 
+/// Submit once, observe exactly, never turn a lost wait/read into nonadmission.
+/// Callers retain the immutable command/receipt identity for status recovery.
+pub fn submitSchemaValidation(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestContext, command: []const u8) ![]u8 {
+    if (!context.schema_validation_authority) return error.Forbidden;
+    const ledger = @import("../metadata/schema_validation_ledger.zig");
+    const receipts = @import("../metadata/schema_validation_receipt.zig");
+    if (ledger.requiresAdmissionAuthority(command) and !context.setting_admin) return error.Forbidden;
+    try context.ensureActive();
+    if (command.len == 0 or command.len > ledger.max_command_bytes) return error.InvalidGenerationPublication;
+    const readiness = try svc.ensureTableTopologyProtocolReadyWithContext(context, protocol.schema_validation_publication_version);
+    try svc.ensureLinearizableReadWithContext(context);
+    svc.lockCatalogMutation();
+    var gate_held = true;
+    defer if (gate_held) svc.unlockCatalogMutation();
+    try svc.validateTableTopologyProtocolReadinessWithContext(context, readiness);
+    const store = svc.projectedStore() orelse return error.MissingMetadataStore;
+    const preflight = try store.schemaValidationPreflightJson(alloc, svc.metadata_group_id, command);
+    defer alloc.free(preflight);
+    var expected = try std.json.parseFromSlice(receipts.Request, alloc, preflight, .{});
+    defer expected.deinit();
+    try expected.value.validate();
+    if (expected.value.lookup.group != svc.metadata_group_id) return error.InvalidGenerationPublication;
+    // Preflight is read-only. Repeated exact acceptance needs neither a new
+    // proposal nor another durable receipt key, even after later phases.
+    const prior = try store.schemaValidationReceiptJson(alloc, svc.metadata_group_id, expected.value);
+    var prior_owned = true;
+    defer if (prior_owned) alloc.free(prior);
+    var observed = try std.json.parseFromSlice(receipts.Observation, alloc, prior, .{});
+    defer observed.deinit();
+    if (try observed.value.isAcknowledged(expected.value)) {
+        prior_owned = false;
+        return prior;
+    }
+    try context.ensureActive();
+    const receipt = try svc.proposeTransitionCommandWithReceipt(.{ .apply_schema_validation = command });
+    svc.unlockCatalogMutation();
+    gate_held = false;
+    svc.waitForTransitionAppliedWithContext(receipt, context) catch return error.MetadataMutationOutcomeUnknown;
+    const bytes = store.schemaValidationReceiptJson(alloc, svc.metadata_group_id, expected.value) catch return error.MetadataMutationOutcomeUnknown;
+    errdefer alloc.free(bytes);
+    var accepted = std.json.parseFromSlice(receipts.Observation, alloc, bytes, .{}) catch return error.MetadataMutationOutcomeUnknown;
+    defer accepted.deinit();
+    if (!(accepted.value.isAcknowledged(expected.value) catch return error.MetadataMutationOutcomeUnknown)) return error.MetadataMutationOutcomeUnknown;
+    return bytes;
+}
+
+test "system catalog schema validation submissions preflight once observe exact acceptance and never replay uncertainty" {
+    const receipts = @import("../metadata/schema_validation_receipt.zig");
+    const ledger = @import("../metadata/schema_validation_ledger.zig");
+    const barriers = @import("../metadata/schema_validation_publication.zig");
+    const Fixture = struct {
+        request: receipts.Request,
+        initial: barriers.Head,
+        terminal: barriers.Head,
+        command: []const u8,
+        readiness_error: ?anyerror = null,
+        stale: bool = false,
+        absent: bool = false,
+        preflight_error: ?anyerror = null,
+        proposal_error: ?anyerror = null,
+        wait_error: bool = false,
+        read_error: bool = false,
+        malformed: bool = false,
+        mismatched: bool = false,
+        accepted: bool = false,
+        locked: bool = false,
+        readiness: usize = 0,
+        barriers: usize = 0,
+        preflights: usize = 0,
+        reads: usize = 0,
+        proposals: usize = 0,
+        waits: usize = 0,
+        metadata_group_id: u64 = 21,
+        fn ensureTableTopologyProtocolReadyWithContext(self: *@This(), _: operation.RequestContext, version: u16) !u64 {
+            try std.testing.expectEqual(protocol.schema_validation_publication_version, version);
+            self.readiness += 1;
+            if (self.readiness_error) |err| return err;
+            return 42;
+        }
+        fn ensureLinearizableReadWithContext(self: *@This(), _: operation.RequestContext) !void {
+            try std.testing.expect(!self.locked);
+            self.barriers += 1;
+        }
+        fn lockCatalogMutation(self: *@This()) void {
+            std.debug.assert(!self.locked);
+            self.locked = true;
+        }
+        fn unlockCatalogMutation(self: *@This()) void {
+            std.debug.assert(self.locked);
+            self.locked = false;
+        }
+        fn validateTableTopologyProtocolReadinessWithContext(self: *@This(), _: operation.RequestContext, value: u64) !void {
+            try std.testing.expect(self.locked);
+            try std.testing.expectEqual(@as(u64, 42), value);
+            if (self.stale) return error.GenerationPublicationChanged;
+        }
+        fn projectedStore(self: *@This()) ?*@This() {
+            return if (self.absent) null else self;
+        }
+        fn schemaValidationPreflightJson(self: *@This(), alloc: std.mem.Allocator, group: u64, bytes: []const u8) ![]u8 {
+            try std.testing.expect(self.locked);
+            try std.testing.expectEqual(self.metadata_group_id, group);
+            try std.testing.expectEqualSlices(u8, self.command, bytes);
+            self.preflights += 1;
+            if (self.preflight_error) |err| return err;
+            return std.json.Stringify.valueAlloc(alloc, self.request, .{});
+        }
+        fn schemaValidationReceiptJson(self: *@This(), alloc: std.mem.Allocator, _: u64, request: receipts.Request) ![]u8 {
+            try std.testing.expectEqualDeep(self.request, request);
+            try std.testing.expectEqual(self.proposals == 0, self.locked);
+            self.reads += 1;
+            if (self.proposals != 0) {
+                if (self.read_error) return error.MetadataReplicationPending;
+                if (self.malformed) return alloc.dupe(u8, "{}");
+            }
+            var result: receipts.Observation = .{ .lookup = self.request.lookup, .head = if (self.accepted) self.terminal else self.initial, .observed = if (self.accepted) self.request.expected else null };
+            if (self.mismatched and self.proposals != 0) result.lookup.plan_digest[0] ^= 1;
+            return std.json.Stringify.valueAlloc(alloc, result, .{});
+        }
+        fn proposeTransitionCommandWithReceipt(self: *@This(), command: storage.TransitionCommand) !u64 {
+            try std.testing.expect(self.locked);
+            try std.testing.expect(command == .apply_schema_validation);
+            try std.testing.expectEqualSlices(u8, self.command, command.apply_schema_validation);
+            self.proposals += 1;
+            if (self.proposal_error) |err| return err;
+            self.accepted = true;
+            return 9;
+        }
+        fn waitForTransitionAppliedWithContext(self: *@This(), receipt: u64, _: operation.RequestContext) !void {
+            try std.testing.expect(!self.locked);
+            try std.testing.expectEqual(@as(u64, 9), receipt);
+            self.waits += 1;
+            if (self.wait_error) return error.DeadlineExceeded;
+        }
+    };
+    const a = std.testing.allocator;
+    const head: barriers.Head = .{ .metadata_group_id = 21, .metadata_incarnation = @splat('1'), .id = @splat(1), .plan_digest = @splat(2), .table_id = 7, .owner_count = 2 };
+    const terminal = try head.cancel(1, .requested);
+    const lookup = ledger.Lookup.fromHead(head);
+    const command = try std.json.Stringify.valueAlloc(a, ledger.Command{ .cancel = .{ .decision = .{ .lookup = lookup, .revision = 1 }, .failure = .requested } }, .{});
+    defer a.free(command);
+    const request: receipts.Request = .{ .lookup = lookup, .expected = .{ .cancellation = .{ .decision = .{ .revision = 1, .digest = try terminal.cancellationDecision() }, .failure = .requested } } };
+    const initial: Fixture = .{ .request = request, .initial = head, .terminal = terminal, .command = command };
+    const context: operation.RequestContext = .{ .schema_validation_authority = true };
+    var svc = initial;
+    for ([_]operation.RequestContext{ .{}, .{ .setting_admin = true }, .{ .index_publication_authority = true } }) |denied| {
+        try std.testing.expectError(error.Forbidden, submitSchemaValidation(&svc, a, denied, command));
+    }
+    try std.testing.expectError(error.Forbidden, submitSchemaValidation(&svc, a, context, "SVBI\x01\x00\x00\x00"));
+    try std.testing.expectEqual(@as(usize, 0), svc.readiness);
+    var expired = context;
+    expired.deadline_ns = 0;
+    try std.testing.expectError(error.DeadlineExceeded, submitSchemaValidation(&svc, a, expired, command));
+    svc.readiness_error = error.TableTopologyProtocolUpgradeRequired;
+    try std.testing.expectError(error.TableTopologyProtocolUpgradeRequired, submitSchemaValidation(&svc, a, context, command));
+    try std.testing.expectEqual(@as(usize, 0), svc.preflights);
+    svc = initial;
+    svc.stale = true;
+    try std.testing.expectError(error.GenerationPublicationChanged, submitSchemaValidation(&svc, a, context, command));
+    try std.testing.expect(!svc.locked);
+    try std.testing.expectEqual(@as(usize, 0), svc.proposals);
+    svc = initial;
+    svc.preflight_error = error.StoreRootEnrollmentChanged;
+    try std.testing.expectError(error.StoreRootEnrollmentChanged, submitSchemaValidation(&svc, a, context, command));
+    try std.testing.expect(!svc.locked);
+    try std.testing.expectEqual(@as(usize, 0), svc.proposals);
+    for (0..7) |mode| {
+        svc = initial;
+        svc.wait_error = mode == 1;
+        svc.read_error = mode == 2;
+        svc.malformed = mode == 3;
+        svc.mismatched = mode == 4;
+        svc.accepted = mode == 5;
+        svc.proposal_error = if (mode == 6) error.NotLeader else null;
+        if (mode >= 1 and mode <= 4) {
+            try std.testing.expectError(error.MetadataMutationOutcomeUnknown, submitSchemaValidation(&svc, a, context, command));
+        } else if (mode == 6) {
+            try std.testing.expectError(error.NotLeader, submitSchemaValidation(&svc, a, context, command));
+        } else {
+            const bytes = try submitSchemaValidation(&svc, a, context, command);
+            defer a.free(bytes);
+            var accepted = try std.json.parseFromSlice(receipts.Observation, a, bytes, .{});
+            defer accepted.deinit();
+            try std.testing.expect(try accepted.value.isAcknowledged(request));
+        }
+        try std.testing.expect(!svc.locked);
+        try std.testing.expectEqual(@as(usize, 1), svc.preflights);
+        try std.testing.expectEqual(@as(usize, if (mode == 5) 0 else 1), svc.proposals);
+        try std.testing.expectEqual(@as(usize, if (mode == 5 or mode == 6) 0 else 1), svc.waits);
+    }
+}
+
+pub fn schemaValidationReceiptRead(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestContext, request: @import("../metadata/schema_validation_receipt.zig").Request) ![]u8 {
+    if (!context.schema_validation_authority) return error.Forbidden;
+    try request.validate();
+    try context.ensureActive();
+    if (request.lookup.group != svc.metadata_group_id) return error.InvalidGenerationPublication;
+    try svc.ensureLinearizableReadWithContext(context);
+    const store = svc.projectedStore() orelse return error.MissingMetadataStore;
+    return store.schemaValidationReceiptJson(alloc, svc.metadata_group_id, request);
+}
+
+test "system catalog schema validation receipts require narrow authority without proposing mutations" {
+    const receipts = @import("../metadata/schema_validation_receipt.zig");
+    const Fake = struct {
+        metadata_group_id: u64 = 21,
+        barriers: usize = 0,
+        available: bool = true,
+        store: Store = .{},
+        const Store = struct {
+            reads: usize = 0,
+            pub fn schemaValidationReceiptJson(self: *@This(), a: std.mem.Allocator, _: u64, request: receipts.Request) ![]u8 {
+                self.reads += 1;
+                return std.json.Stringify.valueAlloc(a, receipts.Observation{ .lookup = request.lookup }, .{});
+            }
+        };
+        pub fn ensureLinearizableReadWithContext(self: *@This(), context: operation.RequestContext) !void {
+            try context.ensureActive();
+            self.barriers += 1;
+        }
+        pub fn projectedStore(self: *@This()) ?*Store {
+            return if (self.available) &self.store else null;
+        }
+    };
+    const a = std.testing.allocator;
+    var svc: Fake = .{};
+    const request: receipts.Request = .{ .lookup = .{ .group = 21, .table = 7, .id = @splat(1), .metadata_incarnation = @splat('1'), .plan_digest = @splat(2) }, .expected = .admission };
+    for ([_]operation.RequestContext{ .{}, .{ .setting_admin = true }, .{ .index_publication_authority = true } }) |untrusted|
+        try std.testing.expectError(error.Forbidden, schemaValidationReceiptRead(&svc, a, untrusted, request));
+    try std.testing.expectEqual(0, svc.barriers);
+    const context: operation.RequestContext = .{ .schema_validation_authority = true };
+    try std.testing.expectError(error.DeadlineExceeded, schemaValidationReceiptRead(&svc, a, .{ .schema_validation_authority = true, .deadline_ns = 0 }, request));
+    svc.metadata_group_id = 22;
+    try std.testing.expectError(error.InvalidGenerationPublication, schemaValidationReceiptRead(&svc, a, context, request));
+    svc.metadata_group_id = 21;
+    svc.available = false;
+    try std.testing.expectError(error.MissingMetadataStore, schemaValidationReceiptRead(&svc, a, context, request));
+    svc.available = true;
+    const bytes = try schemaValidationReceiptRead(&svc, a, context, request);
+    defer a.free(bytes);
+    var observed = try std.json.parseFromSlice(receipts.Observation, a, bytes, .{});
+    defer observed.deinit();
+    try std.testing.expect(!try observed.value.isAcknowledged(request));
+    try std.testing.expectEqual(1, svc.store.reads);
+    try std.testing.expectEqual(2, svc.barriers);
+}
+
+pub fn schemaValidationPrepare(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestContext, request: @import("../metadata/schema_validation_admission.zig").Request) ![]u8 {
+    if (!context.setting_admin or !context.schema_validation_authority) return error.Forbidden;
+    try request.validate();
+    try context.ensureActive();
+    // Activate only the decoder cohort, never a table/job reservation. A new
+    // cluster must not need a previous job to make its first preparation legal.
+    _ = try svc.ensureTableTopologyProtocolReadyWithContext(context, protocol.schema_validation_publication_version);
+    try svc.ensureLinearizableReadWithContext(context);
+    const store = svc.projectedStore() orelse return error.MissingMetadataStore;
+    return store.schemaValidationPrepareCut(alloc, svc.metadata_group_id, request);
+}
+
+pub fn schemaValidationWork(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestContext, request: @import("../metadata/schema_validation_work.zig").Query) ![]u8 {
+    if (!context.schema_validation_authority) return error.Forbidden;
+    try request.validate();
+    try context.ensureActive();
+    if (request.group != svc.metadata_group_id) return error.InvalidGenerationPublication;
+    try svc.ensureLinearizableReadWithContext(context);
+    const store = svc.projectedStore() orelse return error.MissingMetadataStore;
+    return store.schemaValidationWork(alloc, svc.metadata_group_id, request);
+}
+
+pub fn schemaValidationDiscover(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestContext, request: @import("../metadata/schema_validation_read.zig").DiscoveryRequest) ![]u8 {
+    if (!context.schema_validation_authority) return error.Forbidden;
+    try request.validate();
+    try context.ensureActive();
+    if (request.group != svc.metadata_group_id) return error.InvalidGenerationPublication;
+    try svc.ensureLinearizableReadWithContext(context);
+    const store = svc.projectedStore() orelse return error.MissingMetadataStore;
+    return store.schemaValidationDiscover(alloc, svc.metadata_group_id, request);
+}
+
+pub fn schemaValidationOwnerRead(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestContext, request: @import("../metadata/schema_validation_read.zig").OwnerReadRequest) ![]u8 {
+    if (!context.schema_validation_authority) return error.Forbidden;
+    try request.validate();
+    try context.ensureActive();
+    if (request.lookup.group != svc.metadata_group_id) return error.InvalidGenerationPublication;
+    try svc.ensureLinearizableReadWithContext(context);
+    const store = svc.projectedStore() orelse return error.MissingMetadataStore;
+    return store.schemaValidationOwnerRead(alloc, svc.metadata_group_id, request);
+}
+
+test "system catalog schema validation owner reads require narrow authority and preserve binary projection" {
+    const ledger = @import("../metadata/schema_validation_read.zig");
+    const Fake = struct {
+        metadata_group_id: u64 = 21,
+        barriers: usize = 0,
+        available: bool = true,
+        store: Store = .{},
+        const Store = struct {
+            control: usize = 0,
+            inputs: usize = 0,
+            pub fn schemaValidationDiscover(self: *@This(), a: std.mem.Allocator, _: u64, _: ledger.DiscoveryRequest) ![]u8 {
+                self.control += 1;
+                return a.dupe(u8, "null");
+            }
+            pub fn schemaValidationWork(self: *@This(), a: std.mem.Allocator, _: u64, _: @import("../metadata/schema_validation_work.zig").Query) ![]u8 {
+                self.control += 1;
+                return std.json.Stringify.valueAlloc(a, @import("../metadata/schema_validation_work.zig").Page{}, .{});
+            }
+            pub fn schemaValidationOwnerRead(self: *@This(), a: std.mem.Allocator, group: u64, request: ledger.OwnerReadRequest) ![]u8 {
+                return switch (request.projection) {
+                    .control => self.schemaValidationOwnerControlJson(a, group, request.lookup, request.ordinal, request.action),
+                    .inputs => self.schemaValidationOwnerInputBytes(a, group, request.lookup, request.ordinal),
+                    .parent => self.schemaValidationParentJson(a, group, request.lookup, request.source_image.?),
+                    .recovery_inputs => self.schemaValidationRecoveryInputBytes(a, group, request.lookup, request.ordinal, request.source_image.?),
+                    .replay => a.dupe(u8, "null"),
+                    .replay_inputs => self.schemaValidationOwnerInputBytes(a, group, request.lookup, request.ordinal),
+                };
+            }
+            pub fn schemaValidationOwnerControlJson(self: *@This(), a: std.mem.Allocator, _: u64, _: ledger.Lookup, _: u16, _: @import("antfly_local_sources").storage_db_relational_schema_owner_contract.Action) ![]u8 {
+                self.control += 1;
+                return a.dupe(u8, "{}");
+            }
+            pub fn schemaValidationOwnerInputBytes(self: *@This(), a: std.mem.Allocator, _: u64, _: ledger.Lookup, _: u16) ![]u8 {
+                self.inputs += 1;
+                return a.dupe(u8, "\x00\xffASVI-transport-fixture");
+            }
+            pub fn schemaValidationParentJson(_: *@This(), a: std.mem.Allocator, _: u64, _: ledger.Lookup, _: ledger.ImageIdentity) ![]u8 {
+                return a.dupe(u8, "null");
+            }
+            pub fn schemaValidationRecoveryInputBytes(self: *@This(), a: std.mem.Allocator, group: u64, lookup: ledger.Lookup, ordinal: u16, _: ledger.ImageIdentity) ![]u8 {
+                return self.schemaValidationOwnerInputBytes(a, group, lookup, ordinal);
+            }
+        };
+        pub fn ensureLinearizableReadWithContext(self: *@This(), context: operation.RequestContext) !void {
+            try context.ensureActive();
+            self.barriers += 1;
+        }
+        pub fn projectedStore(self: *@This()) ?*Store {
+            return if (self.available) &self.store else null;
+        }
+    };
+    const a = std.testing.allocator;
+    var svc: Fake = .{};
+    var request: ledger.OwnerReadRequest = .{ .lookup = .{ .group = 21, .table = 7, .id = @splat(1), .metadata_incarnation = @splat('1'), .plan_digest = @splat(2) }, .ordinal = 0 };
+    for ([_]operation.RequestContext{ .{}, .{ .setting_admin = true }, .{ .index_publication_authority = true }, .{ .fk_generation_publication_authority = true } }) |untrusted|
+        try std.testing.expectError(error.Forbidden, schemaValidationOwnerRead(&svc, a, untrusted, request));
+    try std.testing.expectEqual(0, svc.barriers);
+    const context: operation.RequestContext = .{ .schema_validation_authority = true };
+    const discovery: ledger.DiscoveryRequest = .{ .group = request.lookup.group, .table = request.lookup.table, .metadata_incarnation = request.lookup.metadata_incarnation };
+    try std.testing.expectError(error.Forbidden, schemaValidationDiscover(&svc, a, .{ .setting_admin = true }, discovery));
+    var foreign_discovery = discovery;
+    foreign_discovery.group += 1;
+    try std.testing.expectError(error.InvalidGenerationPublication, schemaValidationDiscover(&svc, a, context, foreign_discovery));
+    const no_job = try schemaValidationDiscover(&svc, a, context, discovery);
+    defer a.free(no_job);
+    try std.testing.expectEqualStrings("null", no_job);
+    const work_query: @import("../metadata/schema_validation_work.zig").Query = .{ .group = request.lookup.group, .metadata_incarnation = request.lookup.metadata_incarnation };
+    for ([_]operation.RequestContext{ .{}, .{ .setting_admin = true }, .{ .index_publication_authority = true }, .{ .fk_generation_publication_authority = true } }) |untrusted|
+        try std.testing.expectError(error.Forbidden, schemaValidationWork(&svc, a, untrusted, work_query));
+    try std.testing.expectError(error.DeadlineExceeded, schemaValidationWork(&svc, a, .{ .schema_validation_authority = true, .deadline_ns = 0 }, work_query));
+    var foreign_work = work_query;
+    foreign_work.group += 1;
+    try std.testing.expectError(error.InvalidGenerationPublication, schemaValidationWork(&svc, a, context, foreign_work));
+    const work_page = try schemaValidationWork(&svc, a, context, work_query);
+    defer a.free(work_page);
+    var parsed_work = try std.json.parseFromSlice(@import("../metadata/schema_validation_work.zig").Page, a, work_page, .{});
+    defer parsed_work.deinit();
+    try parsed_work.value.validate(work_query);
+    try std.testing.expectEqual(@as(u8, 0), parsed_work.value.len);
+    // Keep the existing owner-read operation-count assertions independent.
+    svc.barriers = 0;
+    svc.store.control = 0;
+    try std.testing.expectError(error.DeadlineExceeded, schemaValidationOwnerRead(&svc, a, .{ .schema_validation_authority = true, .deadline_ns = 0 }, request));
+    svc.metadata_group_id = 22;
+    try std.testing.expectError(error.InvalidGenerationPublication, schemaValidationOwnerRead(&svc, a, context, request));
+    svc.metadata_group_id = 21;
+    try std.testing.expectEqual(0, svc.barriers);
+    svc.available = false;
+    try std.testing.expectError(error.MissingMetadataStore, schemaValidationOwnerRead(&svc, a, context, request));
+    svc.available = true;
+    const control = try schemaValidationOwnerRead(&svc, a, context, request);
+    defer a.free(control);
+    try std.testing.expectEqualStrings("{}", control);
+    request.projection = .inputs;
+    const inputs = try schemaValidationOwnerRead(&svc, a, context, request);
+    defer a.free(inputs);
+    try std.testing.expectEqualSlices(u8, "\x00\xffASVI-transport-fixture", inputs);
+    try std.testing.expectEqual(1, svc.store.control);
+    try std.testing.expectEqual(1, svc.store.inputs);
+    try std.testing.expectEqual(3, svc.barriers);
+}
+
 pub fn relationalIndexOwnerDecisionJson(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestContext, request: @import("../metadata/relational_index_publication.zig").OwnerRequest) ![]u8 {
     if (!context.index_publication_authority) return error.Forbidden;
     try request.validate();
@@ -1045,8 +1742,9 @@ pub fn mutateFkGenerationPublication(svc: anytype, alloc: std.mem.Allocator, con
     try command.validateShape();
     try context.ensureActive();
     if (command.plan) |plan| try plan.requireAdmissionCoverage();
-    const naming = if (command.plan) |plan| plan.constraint_name_guard != null else false;
-    const required = if (command.catalog_coverage == .checks_v1) protocol.checks_catalog_identity_version else if (naming) protocol.constraint_occupancy_version else protocol.fk_generation_publication_version;
+    // The full generation lifecycle shares one decoder floor, including
+    // recovery commands which do not repeat the immutable plan.
+    const required = protocol.fk_generation_column_addition_version;
     const readiness = try svc.ensureTableTopologyProtocolReadyWithContext(context, required);
     try svc.ensureLinearizableReadWithContext(context);
     svc.lockCatalogMutation();
@@ -1139,21 +1837,26 @@ pub fn mutatePolicyDefinition(svc: anytype, alloc: std.mem.Allocator, context: o
 pub fn mutateSetting(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestContext, request: settings.Request) ![]u8 {
     if (!context.setting_admin) return error.Forbidden;
     try context.ensureActive();
-    const readiness = try svc.ensureTableTopologyProtocolReadyWithContext(context, protocol.sql_setting_catalog_version);
+    const required = if (request == .role_default or (request == .put and requiresRoleDefaultReaders(request.put.role_defaults))) protocol.sql_role_defaults_version else protocol.sql_setting_catalog_version;
+    const readiness = try svc.ensureTableTopologyProtocolReadyWithContext(context, required);
     svc.lockCatalogMutation();
     defer svc.unlockCatalogMutation();
     try svc.ensureLinearizableReadWithContext(context);
     try svc.validateTableTopologyProtocolReadinessWithContext(context, readiness);
     const store = svc.projectedStore() orelse return error.MissingMetadataStore;
-    var snapshot = try store.systemCatalogSnapshot(alloc, svc.metadata_group_id);
+    const database: ?[]const u8 = if (request == .role_default and request.role_default.database.len != 0) request.role_default.database else null;
+    var snapshot = try store.sqlSettingMutationCut(alloc, svc.metadata_group_id, database);
     defer snapshot.deinit();
-    const state = snapshot.value;
+    const state = .{ .revision = snapshot.meta.revision, .next_id = snapshot.meta.next_id, .settings = snapshot.records };
     var command: settings.Command = .{ .expected_revision = state.revision, .change = undefined };
+    var patched_defaults: ?[]settings.RoleDefault = null;
+    defer if (patched_defaults) |owned| alloc.free(owned);
     switch (request) {
         .put => |input| {
             const prior = for (state.settings) |record| {
                 if (std.ascii.eqlIgnoreCase(record.name, input.name)) break record;
             } else null;
+            if (!settings.databaseBindingsRetained(input.role_defaults, prior)) return error.InvalidSettingRecord;
             if (prior) |record| if (input.matches(record)) return std.json.Stringify.valueAlloc(alloc, snapshot.meta, .{});
             const identity: settings.Identity = if (prior) |record|
                 .{ .id = record.identity.id, .generation = try std.math.add(u64, record.identity.generation, 1) }
@@ -1170,6 +1873,31 @@ pub fn mutateSetting(svc: anytype, alloc: std.mem.Allocator, context: operation.
             } else return std.json.Stringify.valueAlloc(alloc, snapshot.meta, .{});
             command.change = .{ .drop = prior.identity };
         },
+        .role_default => |change| {
+            try change.validate();
+            if (!snapshot.database_exists) return error.DatabaseNotFound;
+            const existing = for (state.settings) |record| {
+                if (std.ascii.eqlIgnoreCase(record.name, change.name)) break record;
+            } else null;
+            const prior = existing orelse blk: {
+                const builtin = settings.builtinInput(change.name) orelse return error.UnknownSetting;
+                // RESET of an unconfigured builtin is already its base value.
+                if (change.value == null) return std.json.Stringify.valueAlloc(alloc, snapshot.meta, .{});
+                break :blk builtin.record(.{ .id = state.next_id, .generation = 1 });
+            };
+            var bound_change = change;
+            bound_change.database_id = snapshot.database_id;
+            const defaults = try bound_change.applyAlloc(alloc, prior);
+            patched_defaults = defaults;
+            const input: settings.Input = .{ .name = prior.name, .kind = prior.kind, .policy_sensitive = prior.policy_sensitive, .session_writable = prior.session_writable, .default = prior.default, .database_defaults = prior.database_defaults, .role_defaults = defaults };
+            if (input.matches(prior)) return std.json.Stringify.valueAlloc(alloc, snapshot.meta, .{});
+            const record = input.record(prior.identity);
+            try record.validate();
+            // Keep the changed slice alive through serialization below. The
+            // enclosing snapshot owns all the unchanged nested values.
+            command.change = .{ .put = record };
+            command.role_defaults_only = true;
+        },
     }
     const bytes = try std.json.Stringify.valueAlloc(alloc, command, .{});
     defer alloc.free(bytes);
@@ -1182,6 +1910,10 @@ pub fn mutateSetting(svc: anytype, alloc: std.mem.Allocator, context: operation.
     std.crypto.hash.sha2.Sha256.hash(bytes, &expected_hash, .{});
     if (observed.revision != command.expected_revision + 1 or !std.mem.eql(u8, &observed.last_command, &expected_hash)) return error.MetadataMutationOutcomeUnknown;
     return std.json.Stringify.valueAlloc(alloc, observed, .{});
+}
+
+fn requiresRoleDefaultReaders(defaults: []const settings.RoleDefault) bool {
+    return settings.roleDefaultsRequireReaders(defaults);
 }
 
 pub fn resolve(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestContext, target: domain.Target) !?table_manager.TableRecord {
@@ -1235,6 +1967,20 @@ pub fn call(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestCo
         .relational_index_begin => |request| beginRelationalIndexPublication(svc, alloc, context, request),
         .relational_index_admission_status => |request| relationalIndexAdmissionStatusJson(svc, alloc, context, request),
         .relational_index_owner_decision => |request| relationalIndexOwnerDecisionJson(svc, alloc, context, request),
+        .schema_validation_owner_read => |request| schemaValidationOwnerRead(svc, alloc, context, request),
+        .schema_validation_discover => |request| schemaValidationDiscover(svc, alloc, context, request),
+        .schema_validation_work => |request| schemaValidationWork(svc, alloc, context, request),
+        .schema_validation_status => |request| blk: {
+            if (!context.setting_admin or !context.schema_validation_authority) return error.Forbidden;
+            try request.validate();
+            try context.ensureActive();
+            try svc.ensureLinearizableReadWithContext(context);
+            const store = svc.projectedStore() orelse return error.MissingMetadataStore;
+            break :blk store.schemaValidationStatusJson(alloc, svc.metadata_group_id, request);
+        },
+        .schema_validation_prepare => |request| schemaValidationPrepare(svc, alloc, context, request),
+        .schema_validation_receipt_read => |request| schemaValidationReceiptRead(svc, alloc, context, request),
+        .schema_validation_submit => |command| submitSchemaValidation(svc, alloc, context, command),
         .relational_index_owner_ack => |request| acknowledgeRelationalIndexOwner(svc, alloc, context, request),
         .relational_index_owner_ack_status => |request| relationalIndexOwnerAckStatusJson(svc, alloc, context, request),
         .relational_index_publish_decide => |request| decideRelationalIndexPublication(svc, alloc, context, request),
@@ -1372,6 +2118,21 @@ pub fn call(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestCo
             defer table_manager.freeTable(alloc, after);
             break :blk call(svc, alloc, context, .{ .relation_replace = .{ .guard = request.guard, .expected = before, .replacement = after } });
         },
+        .relation_description_mutate => |request| blk: {
+            if (!context.setting_admin) return error.Forbidden;
+            try context.ensureActive();
+            try request.validate();
+            try svc.ensureLinearizableReadWithContext(context);
+            const store = svc.projectedStore() orelse return error.MissingMetadataStore;
+            const before = (try store.getTable(alloc, svc.metadata_group_id, request.guard.owner.table_id)) orelse return error.CatalogGenerationChanged;
+            defer table_manager.freeTable(alloc, before);
+            var after = try table_manager.cloneTable(alloc, before);
+            defer table_manager.freeTable(alloc, after);
+            const description = try alloc.dupe(u8, request.description);
+            alloc.free(after.description);
+            after.description = description;
+            break :blk call(svc, alloc, context, .{ .relation_replace = .{ .guard = request.guard, .expected = before, .replacement = after } });
+        },
         .relation_replace => |request| blk: {
             if (!context.setting_admin) return error.Forbidden;
             try context.ensureActive();
@@ -1385,6 +2146,52 @@ pub fn call(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestCo
             break :blk std.json.Stringify.valueAlloc(alloc, @import("server_call.zig").RelationReplacementResult{ .schema_version = version, .stamp = stamp }, .{}) catch return error.MetadataMutationOutcomeUnknown;
         },
         .sql_view_mutate => |request| mutateSqlView(svc, alloc, context, request),
+        .sql_sequence_prepare => blk: {
+            if (!context.setting_admin) return error.Forbidden;
+            try context.ensureActive();
+            try svc.ensureSqlSequenceDecoderReadyWithContext(context);
+            try context.ensureActive();
+            break :blk alloc.dupe(u8, "null");
+        },
+        .sql_sequence_mutate => |request| mutateSqlSequence(svc, alloc, context, request),
+        .sql_sequence_snapshot => |request| blk: {
+            if (!context.setting_admin) return error.Forbidden;
+            try context.ensureActive();
+            try request.validate();
+            try svc.ensureLinearizableReadWithContext(context);
+            const store = svc.projectedStore() orelse return error.MissingMetadataStore;
+            const bytes = try store.sqlSequenceSnapshot(alloc, svc.metadata_group_id, request, context);
+            errdefer alloc.free(bytes);
+            try context.ensureActive();
+            break :blk bytes;
+        },
+        .sql_sequence_admission_head => blk: {
+            if (!context.setting_admin) return error.Forbidden;
+            try svc.ensureLinearizableReadWithContext(context);
+            const store = svc.projectedStore() orelse return error.MissingMetadataStore;
+            const head = try store.sqlSequenceAdmissionHead(svc.metadata_group_id);
+            try context.ensureActive();
+            break :blk std.json.Stringify.valueAlloc(alloc, head, .{});
+        },
+        .sql_sequence_outcome => |request| blk: {
+            if (!context.setting_admin) return error.Forbidden;
+            try request.validate();
+            try svc.ensureLinearizableReadWithContext(context);
+            const store = svc.projectedStore() orelse return error.MissingMetadataStore;
+            const outcome = try store.sqlSequenceOutcome(alloc, svc.metadata_group_id, request);
+            try context.ensureActive();
+            break :blk std.json.Stringify.valueAlloc(alloc, outcome, .{});
+        },
+        .sql_sequence_counter_mutate => |request| mutateSqlSequenceCounter(svc, alloc, context, request),
+        .sql_sequence_counter_outcome => |request| blk: {
+            if (!context.setting_admin) return error.Forbidden;
+            try request.validate();
+            try svc.ensureLinearizableReadWithContext(context);
+            const store = svc.projectedStore() orelse return error.MissingMetadataStore;
+            const result = try store.sqlSequenceCounterOutcome(alloc, svc.metadata_group_id, request);
+            try context.ensureActive();
+            break :blk std.json.Stringify.valueAlloc(alloc, result, .{});
+        },
         .mutate => |request| mutate(svc, alloc, context, request),
     };
 }

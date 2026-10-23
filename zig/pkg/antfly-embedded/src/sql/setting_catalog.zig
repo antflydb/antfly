@@ -36,9 +36,107 @@ pub const RawSnapshot = durable.Snapshot;
 pub const Owner = struct {
     ptr: *anyopaque,
     load: *const fn (*anyopaque, std.mem.Allocator, Scope) anyerror!RawSnapshot,
+    /// Defaults captured at connection startup, separate from mutable SET
+    /// overlays. RESET returns here, not to a later ALTER ROLE publication.
+    /// null is an unpinned request; an empty slice is a real login which
+    /// predated every currently registered setting.
+    baseline: ?[]const OverlayEntry = null,
 };
 
 pub const OverlayEntry = struct { identity: Identity, value: Value };
+
+test "SQL role defaults keep existing login baselines and RESET while future logins observe publication" {
+    const Fake = struct {
+        definition: Definition = .{ .identity = .{ .id = 7, .generation = 1 }, .name = "app.mode", .kind = .string, .session_writable = true, .default = .{ .string = "base" }, .role_default = .{ .string = "old" } },
+        epoch: u64 = 1,
+        fn load(ptr: *anyopaque, _: std.mem.Allocator, scope: Scope) !RawSnapshot {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return .{ .scope = scope, .epoch = self.epoch, .definitions = @as(*const [1]Definition, @ptrCast(&self.definition)) };
+        }
+    };
+    const Check = struct {
+        fn run(a: std.mem.Allocator) !void {
+            var fake: Fake = .{};
+            const scope: Scope = .{ .principal = "alice", .database = "main" };
+            var owner: Owner = .{ .ptr = &fake, .load = Fake.load };
+            var old_login = try Baseline.init(a, try Fake.load(&fake, a, scope));
+            defer old_login.deinit();
+            fake.definition.role_default = .{ .string = "next" };
+            fake.epoch += 1;
+            var new_login = try Baseline.init(a, try Fake.load(&fake, a, scope));
+            defer new_login.deinit();
+            owner.baseline = old_login.entries;
+            var state = OverlayState.init(a);
+            defer state.deinit();
+            var old_view = try View.capture(a, owner, scope, state.values());
+            defer old_view.deinit();
+            try std.testing.expectEqualStrings("old", (try old_view.resolve("app.mode")).value.string);
+            try state.set(owner, scope, "app.mode", "explicit", false);
+            var explicit = try View.capture(a, owner, scope, state.values());
+            defer explicit.deinit();
+            try std.testing.expectEqualStrings("explicit", (try explicit.resolve("app.mode")).value.string);
+            try state.reset(owner, scope, "app.mode");
+            var reset = try View.capture(a, owner, scope, state.values());
+            defer reset.deinit();
+            try std.testing.expectEqualStrings("old", (try reset.resolve("app.mode")).value.string);
+            owner.baseline = new_login.entries;
+            var future = try View.capture(a, owner, scope, &.{});
+            defer future.deinit();
+            try std.testing.expectEqualStrings("next", (try future.resolve("app.mode")).value.string);
+            owner.baseline = &.{};
+            var predates_definition = try View.capture(a, owner, scope, &.{});
+            defer predates_definition.deinit();
+            try std.testing.expectEqualStrings("base", (try predates_definition.resolve("app.mode")).value.string);
+            owner.baseline = null;
+            var unpinned = try View.capture(a, owner, scope, &.{});
+            defer unpinned.deinit();
+            try std.testing.expectEqualStrings("next", (try unpinned.resolve("app.mode")).value.string);
+            owner.baseline = new_login.entries;
+            fake.definition.identity.generation += 1;
+            if (View.capture(a, owner, scope, &.{})) |unexpected| {
+                var owned = unexpected;
+                owned.deinit();
+                return error.ExpectedChangedSettingIdentity;
+            } else |err| {
+                if (err == error.OutOfMemory) return err;
+                try std.testing.expectEqual(error.SettingCatalogChanged, err);
+            }
+        }
+    };
+    try Check.run(std.testing.allocator);
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Check.run, .{});
+}
+
+/// Owned login-time defaults. Explicit session SET entries are separate so
+/// RESET/RESET ALL can reveal this same snapshot after ALTER ROLE commits.
+pub const Baseline = struct {
+    arena: std.heap.ArenaAllocator,
+    entries: []const OverlayEntry,
+
+    pub fn init(backing: std.mem.Allocator, raw: RawSnapshot) !Baseline {
+        if (raw.definitions.len > 1024 or raw.epoch == 0) return error.InvalidSettingCatalogSnapshot;
+        var arena = std.heap.ArenaAllocator.init(backing);
+        errdefer arena.deinit();
+        const a = arena.allocator();
+        const entries = try a.alloc(OverlayEntry, raw.definitions.len);
+        var ids: std.AutoHashMapUnmanaged(u64, void) = .empty;
+        var names: std.StringHashMapUnmanaged(void) = .empty;
+        for (raw.definitions, entries) |definition, *entry| {
+            try validateDefinition(definition);
+            const folded = try std.ascii.allocLowerString(a, definition.name);
+            if (ids.contains(definition.identity.id) or names.contains(folded)) return error.InvalidSettingCatalogSnapshot;
+            try ids.put(a, definition.identity.id, {});
+            try names.put(a, folded, {});
+            entry.* = .{ .identity = definition.identity, .value = try copyValue(a, definition.role_default orelse definition.database_default orelse definition.default) };
+        }
+        return .{ .arena = arena, .entries = entries };
+    }
+
+    pub fn deinit(self: *Baseline) void {
+        self.arena.deinit();
+        self.* = undefined;
+    }
+};
 
 const Entries = struct {
     items: std.ArrayList(OverlayEntry) = .empty,
@@ -275,8 +373,23 @@ pub const View = struct {
             definitions[i].default = try copyValue(alloc, source.default);
             definitions[i].database_default = if (source.database_default) |v| try copyValue(alloc, v) else null;
             definitions[i].role_default = if (source.role_default) |v| try copyValue(alloc, v) else null;
-            const effective = source.role_default orelse source.database_default orelse source.default;
+            // Defaults published after a pinned login are not live overlays.
+            // A newly registered setting uses its declared base until SET.
+            const effective = if (owner.baseline != null) source.default else source.role_default orelse source.database_default orelse source.default;
             values[i] = try copyValue(alloc, effective);
+        }
+        if (owner.baseline) |baseline| {
+            if (baseline.len > 1024) return error.SettingLimitExceeded;
+            const seen_baseline = try alloc.alloc(bool, definitions.len);
+            @memset(seen_baseline, false);
+            for (baseline) |entry| {
+                const index = by_id.get(entry.identity.id) orelse return error.SettingCatalogChanged;
+                if (seen_baseline[index]) return error.InvalidSettingOverlay;
+                seen_baseline[index] = true;
+                if (!std.meta.eql(definitions[index].identity, entry.identity)) return error.SettingCatalogChanged;
+                try validateValue(definitions[index].kind, entry.value);
+                values[index] = try copyValue(alloc, entry.value);
+            }
         }
         const seen_overlay = try alloc.alloc(bool, definitions.len);
         @memset(seen_overlay, false);
@@ -326,6 +439,33 @@ pub const View = struct {
         return self.values[index];
     }
 
+    /// Scratch-arena rendering for SQL current_setting. Text values remain
+    /// borrowed; numeric representations belong to the supplied allocator.
+    pub fn renderDependencyLeaky(self: View, a: std.mem.Allocator, identity: Identity) ![]const u8 {
+        const value = try self.resolveDependency(identity);
+        const index = self.by_id.get(identity.id) orelse return error.SettingCatalogChanged;
+        return switch (value) {
+            .string => |bytes| bytes,
+            .boolean => |boolean| if (boolean) "true" else "false",
+            .integer => |number| blk: {
+                if (std.ascii.eqlIgnoreCase(self.definitions[index].name, "statement_timeout")) {
+                    if (number < 0 or number > std.math.maxInt(i32)) return error.InvalidSettingValue;
+                    if (number == 0) break :blk "0";
+                    const Unit = struct { milliseconds: i64, suffix: []const u8 };
+                    for ([_]Unit{
+                        .{ .milliseconds = 86_400_000, .suffix = "d" },
+                        .{ .milliseconds = 3_600_000, .suffix = "h" },
+                        .{ .milliseconds = 60_000, .suffix = "min" },
+                        .{ .milliseconds = 1_000, .suffix = "s" },
+                        .{ .milliseconds = 1, .suffix = "ms" },
+                    }) |unit| if (@rem(number, unit.milliseconds) == 0) break :blk try std.fmt.allocPrint(a, "{d}{s}", .{ @divTrunc(number, unit.milliseconds), unit.suffix });
+                    unreachable;
+                }
+                break :blk try std.fmt.allocPrint(a, "{d}", .{number});
+            },
+        };
+    }
+
     fn nameIndex(self: View, name: []const u8) ?usize {
         if (name.len == 0 or name.len > 128) return null;
         var folded: [128]u8 = undefined;
@@ -335,6 +475,7 @@ pub const View = struct {
 };
 
 fn validateDefinition(definition: Definition) !void {
+    if (definition.role_overrides.len != 0) return error.InvalidSettingCatalogSnapshot;
     if (definition.identity.id == 0 or definition.identity.generation == 0 or
         definition.name.len == 0 or definition.name.len > 128 or
         (definition.policy_sensitive and definition.session_writable))

@@ -28,12 +28,18 @@ const Golden = struct {
 };
 
 test "httpx SQL original typed array mutations retain bounds nulls and complete cold postimages" {
+    const ids = [_][]const u8{ "sql-1436", "sql-1437", "sql-1442", "sql-1445", "sql-1447", "sql-1470", "sql-1502" };
+    var seen: [ids.len]bool = @splat(false);
     const a = std.testing.allocator;
     var golden = try std.json.parseFromSlice(Golden, a, local.sql_parity_fixtures.array_mutation_reference, .{ .ignore_unknown_fields = true });
     defer golden.deinit();
     try std.testing.expectEqual(@as(usize, 2), golden.value.campaigns.len);
     var completed: usize = 0;
     for (golden.value.campaigns) |campaign| for (campaign.reference.entries) |entry| {
+        const ordinal = for (ids, 0..) |id, i| {
+            if (std.mem.eql(u8, id, entry.id)) break i;
+        } else return error.UnexpectedArrayMutationOriginal;
+        seen[ordinal] = true;
         errdefer std.debug.print("typed-array mutation {s}/{s}\n", .{ campaign.name, entry.id });
         var arena = std.heap.ArenaAllocator.init(a);
         defer arena.deinit();
@@ -101,6 +107,7 @@ test "httpx SQL original typed array mutations retain bounds nulls and complete 
         completed += 1;
     };
     try std.testing.expectEqual(@as(usize, 11), completed);
+    for (seen) |executed| try std.testing.expect(executed);
 }
 
 test "httpx SQL original UUID mutation preserves complete typed postimages and cold identity" {
@@ -108,6 +115,7 @@ test "httpx SQL original UUID mutation preserves complete typed postimages and c
     var golden = try std.json.parseFromSlice(Golden, a, local.sql_parity_fixtures.array_mutation_reference, .{ .ignore_unknown_fields = true });
     defer golden.deinit();
     const contract = golden.value.uuid_contract;
+    try std.testing.expectEqualStrings("sql-1503", contract.id);
     const profile = golden.value.campaigns[1].reference.profile;
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();

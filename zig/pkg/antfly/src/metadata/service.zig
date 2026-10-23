@@ -3481,6 +3481,32 @@ pub fn transitionRequiredCoordinatedDecoderVersion(command: metadata_storage.Tra
     return @max(resolverRequiredCoordinatedDecoderVersion(command), baseRequiredCoordinatedDecoderVersion(command));
 }
 
+test "SQL role defaults decoder admission gates raw proposals without widening legacy scoped writes" {
+    const required = metadata_topology_protocol.sql_role_defaults_version;
+    try std.testing.expectEqual(required, transitionRequiredCoordinatedDecoderVersion(.{ .apply_sql_settings = "{\"change\":{\"put\":{\"role_defaults\":[{\"database\":\"\"}]}}}" }));
+    try std.testing.expectEqual(required, transitionRequiredCoordinatedDecoderVersion(.{ .apply_sql_settings = "{\"role_defaults_only\":true}" }));
+    try std.testing.expectEqual(@as(u16, 0), transitionRequiredCoordinatedDecoderVersion(.{ .apply_sql_settings = "{\"role_defaults\":[{\"database\":\"main\"}]}" }));
+}
+
+test "relational topology admission rejects lifecycle proposals before encoding with mixed resolver SQL decoder floors" {
+    const protocol = metadata_topology_protocol;
+    // Main's new resolver records must not be admitted by earlier SQL-only
+    // profiles that reused main's resolver numbers for unrelated catalog work.
+    try std.testing.expect(protocol.resolver_namespaces_version > protocol.sql_column_transform_version);
+    try std.testing.expect(protocol.current_version >= protocol.schema_validation_publication_version);
+    var table: metadata_table_manager.TableRecord = .{
+        .table_id = 77,
+        .name = "docs",
+        .indexes_json = "{\"_resolver_namespaces\":{\"namespaces\":[]}}",
+    };
+    try std.testing.expectEqual(protocol.resolver_namespaces_version, transitionRequiredCoordinatedDecoderVersion(.{ .upsert_table = table }));
+    table.schema_reader_requirements = .{ .semantic_version = 1, .encoding_version = 1 };
+    const combined = @max(protocol.resolver_namespaces_version, protocol.schema_reader_publication_version);
+    try std.testing.expectEqual(combined, transitionRequiredCoordinatedDecoderVersion(.{ .upsert_table = table }));
+    // An extension batch must preserve its strongest table's requirements.
+    try std.testing.expectEqual(combined, transitionRequiredCoordinatedDecoderVersion(.{ .apply_extension_lifecycle_v2 = .{ .upsert_tables = &.{table} } }));
+}
+
 fn resolverRequiredCoordinatedDecoderVersion(command: metadata_storage.TransitionCommand) u16 {
     const namespace_indexes = switch (command) {
         .apply_restore_staging, .apply_system_catalog => |bytes| bytes,
@@ -3503,6 +3529,32 @@ fn resolverRequiredCoordinatedDecoderVersion(command: metadata_storage.Transitio
 }
 
 fn baseRequiredCoordinatedDecoderVersion(command: metadata_storage.TransitionCommand) u16 {
+    if (command == .apply_sql_sequence_counter) return metadata_topology_protocol.sql_sequence_catalog_version;
+    if (command == .apply_sql_settings and @import("schema_reader_wire.zig").requiresRoleDefaults(command.apply_sql_settings)) return metadata_topology_protocol.sql_role_defaults_version;
+    if (command == .apply_schema_validation) return metadata_topology_protocol.schema_validation_publication_version;
+    const bound_text = switch (command) {
+        .upsert_table => |table| table.full_text_read_index != null,
+        .compare_and_replace_table => |cas| cas.expected.full_text_read_index != null or cas.replacement.full_text_read_index != null,
+        .apply_table_topology => |mutation| switch (mutation) {
+            .create => |create| create.table.full_text_read_index != null,
+            .drop => false,
+        },
+        .apply_extension_lifecycle, .apply_extension_lifecycle_v2 => |delta| blk: {
+            for (delta.upsert_tables) |table| if (table.full_text_read_index != null) break :blk true;
+            break :blk false;
+        },
+        .apply_system_catalog, .apply_fk_initial_create, .apply_fk_generation_publication, .apply_restore_staging, .begin_relational_index_publication => |bytes| @import("schema_reader_wire.zig").requiresTextGenerationBinding(bytes),
+        .create_restore_job_with_staging => |request| @import("schema_reader_wire.zig").requiresTextGenerationBinding(request.plan_json),
+        else => false,
+    };
+    if (bound_text) return metadata_topology_protocol.schema_validation_publication_version;
+    const transforms = switch (command) {
+        .apply_restore_staging => |bytes| @import("schema_reader_wire.zig").requiresColumnTransforms(bytes),
+        .create_restore_job_with_staging => |request| @import("schema_reader_wire.zig").requiresColumnTransforms(request.plan_json),
+        else => false,
+    };
+    if (transforms) return metadata_topology_protocol.sql_column_transform_version;
+    if (command == .apply_fk_generation_publication) return metadata_topology_protocol.fk_generation_column_addition_version;
     if (command == .apply_sql_policies) return metadata_topology_protocol.sql_row_policy_intent_version;
     // AIPH v2 also applies to unmarked plans. Classify it before the older
     // table-definition profile can return a weaker decoder requirement.
@@ -3591,7 +3643,7 @@ fn baseRequiredCoordinatedDecoderVersion(command: metadata_storage.TransitionCom
     if (has_lake_catalog) return metadata_topology_protocol.lake_index_catalog_version;
     const requires_v11 = switch (command) {
         .apply_store_root_enrollment, .ack_initial_fk_retirement => return metadata_topology_protocol.store_root_enrollment_version,
-        .apply_fk_generation_publication => return metadata_topology_protocol.fk_generation_publication_version,
+        .apply_fk_generation_publication => return metadata_topology_protocol.fk_generation_column_addition_version,
         // Initial CREATE carries the v2 reservation and retirement scope in
         // durable metadata. Its admission proof must survive through the
         // final append, not just the public workflow's earlier probe.
@@ -3650,6 +3702,30 @@ test "system catalog schema reader publication rejects invalid facts before read
     try std.testing.expectEqual(@as(usize, 1), fake.calls);
 }
 
+test "schema validation publication text binding requires its coordinated decoder on every applying member" {
+    try std.testing.expectEqual(metadata_topology_protocol.schema_validation_publication_version, transitionRequiredCoordinatedDecoderVersion(.{ .apply_schema_validation = "{}" }));
+    const plain: metadata_table_manager.TableRecord = .{ .table_id = 7, .name = "rows" };
+    var bound = plain;
+    bound.full_text_read_index = "named_text";
+    const commands = [_]metadata_storage.TransitionCommand{
+        .{ .upsert_table = bound },
+        .{ .compare_and_replace_table = .{ .expected = bound, .replacement = plain } },
+        .{ .compare_and_replace_table = .{ .expected = plain, .replacement = bound } },
+        .{ .apply_extension_lifecycle_v2 = .{ .upsert_tables = &.{bound} } },
+        .{ .apply_system_catalog = "{\"table\":{\"full_text_read_index\":\"named_text\"}}" },
+        .{ .apply_fk_generation_publication = "{\"plan\":{\"after\":{\"full_text_read_index\":\"named_text\"}}}" },
+        .{ .apply_restore_staging = "{\"targets\":[{\"table\":{\"full_text_read_index\":\"named_text\"}}]}" },
+        .{ .create_restore_job_with_staging = .{ .key = "job", .value = "{}", .plan_json = "{\"full_text_read_index\":\"named_text\"}" } },
+    };
+    for (commands) |command| try std.testing.expectEqual(metadata_topology_protocol.schema_validation_publication_version, transitionRequiredCoordinatedDecoderVersion(command));
+    try std.testing.expect(metadata_topology_protocol.current_version >= metadata_topology_protocol.schema_validation_publication_version);
+    try std.testing.expectEqual(@as(u16, 0), transitionRequiredCoordinatedDecoderVersion(.{ .upsert_table = plain }));
+    const wire = @import("schema_reader_wire.zig");
+    try std.testing.expect(!wire.requiresTextGenerationBinding("{\"full_text_read_index\":null}"));
+    try std.testing.expect(!wire.requiresTextGenerationBinding("{\"schema_json\":\"full_text_read_index\"}"));
+    try std.testing.expect(wire.requiresTextGenerationBinding("{\"table\":{\"full_text_read_\\u0069ndex\":\"named_text\"}}"));
+}
+
 test "system catalog schema reader publication requires the definition decoder across typed and nested proposals" {
     const plain: metadata_table_manager.TableRecord = .{ .table_id = 7, .name = "rows" };
     var marked = plain;
@@ -3667,7 +3743,11 @@ test "system catalog schema reader publication requires the definition decoder a
         .{ .begin_relational_index_publication = "{\"plan\":{\"table\":{\"schema_reader_requirements\":{}}}}" },
     };
     for (commands) |command| {
-        const required = if (command == .begin_relational_index_publication) metadata_topology_protocol.index_publication_head_version else metadata_topology_protocol.schema_reader_publication_version;
+        const required = switch (command) {
+            .begin_relational_index_publication => metadata_topology_protocol.index_publication_head_version,
+            .apply_fk_generation_publication => metadata_topology_protocol.fk_generation_column_addition_version,
+            else => metadata_topology_protocol.schema_reader_publication_version,
+        };
         try std.testing.expectEqual(required, transitionRequiredCoordinatedDecoderVersion(command));
     }
     try std.testing.expectEqual(@as(u16, 0), transitionRequiredCoordinatedDecoderVersion(.{ .upsert_table = plain }));
@@ -3711,16 +3791,24 @@ test "relational index publication admission requires its own coordinated decode
     try std.testing.expectEqual(metadata_topology_protocol.index_delivery_version, transitionRequiredCoordinatedDecoderVersion(completion));
 }
 
+test "system catalog USING rewrite decoder barrier precedes lower schema reader requirements" {
+    const bytes = "{\"plan\":{\"targets\":[{\"table\":{\"schema_reader_requirements\":{}},\"rewrite\":{\"column_transforms\":[{}]}}]}}";
+    try std.testing.expectEqual(metadata_topology_protocol.sql_column_transform_version, transitionRequiredCoordinatedDecoderVersion(.{ .apply_restore_staging = bytes }));
+    // A malformed envelope must retain the strongest possible requirement,
+    // not let a weaker transform projection bypass text-generation binding.
+    try std.testing.expectEqual(metadata_topology_protocol.schema_validation_publication_version, transitionRequiredCoordinatedDecoderVersion(.{ .apply_restore_staging = "{" }));
+}
+
 test "system catalog CHECK identity decoder barrier covers admission and planless owner ACKs" {
     const protocol = metadata_topology_protocol;
     const marked: metadata_storage.TransitionCommand = .{ .apply_fk_generation_publication = "{\"catalog_coverage\":\"checks_v1\",\"plan\":null}" };
-    try std.testing.expectEqual(protocol.checks_catalog_identity_version, transitionRequiredCoordinatedDecoderVersion(marked));
+    try std.testing.expectEqual(protocol.fk_generation_column_addition_version, transitionRequiredCoordinatedDecoderVersion(marked));
     const named: metadata_storage.TransitionCommand = .{ .apply_fk_generation_publication = "{\"catalog_coverage\":\"checks_v1\",\"plan\":{\"constraint_name_guard\":{\"constraint_name_admission\":{\"namespace_id\":2}}}}" };
-    try std.testing.expectEqual(protocol.checks_catalog_identity_version, transitionRequiredCoordinatedDecoderVersion(named));
+    try std.testing.expectEqual(protocol.fk_generation_column_addition_version, transitionRequiredCoordinatedDecoderVersion(named));
     const legacy: metadata_storage.TransitionCommand = .{ .apply_fk_generation_publication = "{}" };
-    try std.testing.expectEqual(protocol.fk_generation_publication_version, transitionRequiredCoordinatedDecoderVersion(legacy));
+    try std.testing.expectEqual(protocol.fk_generation_column_addition_version, transitionRequiredCoordinatedDecoderVersion(legacy));
     const unknown: metadata_storage.TransitionCommand = .{ .apply_fk_generation_publication = "{\"catalog_coverage\":\"future\"}" };
-    try std.testing.expectEqual(protocol.checks_catalog_identity_version, transitionRequiredCoordinatedDecoderVersion(unknown));
+    try std.testing.expectEqual(protocol.fk_generation_column_addition_version, transitionRequiredCoordinatedDecoderVersion(unknown));
     const initial: metadata_storage.TransitionCommand = .{ .apply_fk_initial_create = "{\"catalog_coverage\":\"checks_v1\",\"plan\":null}" };
     try std.testing.expectEqual(protocol.initial_fk_checks_catalog_version, transitionRequiredCoordinatedDecoderVersion(initial));
     const initial_plan: metadata_storage.TransitionCommand = .{ .apply_fk_initial_create = "{\"plan\":{\"catalog_coverage\":\"checks_v1\"}}" };
@@ -3808,10 +3896,12 @@ fn schemaReaderDecoderFloor(service: anytype) !u16 {
 }
 
 test "system catalog schema reader publication durable activation guards ordinary appends before native floor" {
+    const publication_version = metadata_topology_protocol.schema_reader_publication_version;
+    const head_version = metadata_topology_protocol.index_publication_head_version;
     const Fake = struct {
         metadata_group_id: u64 = 21,
         source: Source = .{},
-        members: []const u16 = &.{ 39, 38, 39 },
+        members: []const u16 = &.{ publication_version, publication_version - 1, publication_version },
         const Source = struct {
             activation: ?metadata_topology_protocol.Activation = null,
             incarnation: ?metadata_mod.MetadataClusterIncarnation = "0123456789abcdef0123456789abcdef".*,
@@ -3841,22 +3931,22 @@ test "system catalog schema reader publication durable activation guards ordinar
     const ordinary: metadata_storage.TransitionCommand = .{ .remove_node = .{ .node_id = 99 } };
     const before = try prepareCoordinatedDecoderAdmission(&service, &.{ordinary});
     try std.testing.expect(before.readiness == null);
-    service.source.activation = .{ .version = 39, .incarnation = service.source.incarnation.?, .member_count = 3, .membership_fingerprint = metadata_reallocation_request.membershipFingerprint(&.{ 1, 2, 3 }) };
+    service.source.activation = .{ .version = publication_version, .incarnation = service.source.incarnation.?, .member_count = 3, .membership_fingerprint = metadata_reallocation_request.membershipFingerprint(&.{ 1, 2, 3 }) };
     try std.testing.expect(!service.source.floor.active());
     try std.testing.expectError(error.TableTopologyProtocolUpgradeRequired, validateRelationSourceDecoderFloor(&service, before));
     try std.testing.expectError(error.TableTopologyProtocolUpgradeRequired, ensureCoordinatedDecoderWithContext(&service, ordinary, .{}));
     try std.testing.expectError(error.TableTopologyProtocolUpgradeRequired, prepareCoordinatedDecoderAdmission(&service, &.{ordinary}));
-    service.members = &.{ 39, 39, 39 };
+    service.members = &.{ publication_version, publication_version, publication_version };
     try ensureCoordinatedDecoderWithContext(&service, ordinary, .{});
     const admitted = try prepareCoordinatedDecoderAdmission(&service, &.{ ordinary, ordinary });
-    try std.testing.expectEqual(@as(u16, 39), admitted.readiness.?.required_version);
+    try std.testing.expectEqual(publication_version, admitted.readiness.?.required_version);
     try validateRelationSourceDecoderFloor(&service, admitted);
     service.source.activation.?.version = metadata_topology_protocol.index_publication_head_version;
-    service.members = &.{ 40, 39, 40 };
+    service.members = &.{ head_version, head_version - 1, head_version };
     try std.testing.expect(!service.source.floor.active());
     try std.testing.expectError(error.TableTopologyProtocolUpgradeRequired, ensureCoordinatedDecoderWithContext(&service, ordinary, .{}));
     try std.testing.expectError(error.TableTopologyProtocolUpgradeRequired, prepareCoordinatedDecoderAdmission(&service, &.{ordinary}));
-    service.members = &.{ 40, 40, 40 };
+    service.members = &.{ head_version, head_version, head_version };
     // Matching membership alone cannot upgrade an admission's decoder proof.
     try std.testing.expectError(error.TableTopologyProtocolUpgradeRequired, validateRelationSourceDecoderFloor(&service, admitted));
     const head_admitted = try prepareCoordinatedDecoderAdmission(&service, &.{ ordinary, ordinary });
@@ -3872,12 +3962,12 @@ test "system catalog schema reader publication durable activation guards ordinar
     service.source.activation.?.member_count = 3;
     service.source.activation.?.version = metadata_topology_protocol.current_version + 1;
     try std.testing.expectError(error.TableTopologyProtocolUpgradeRequired, schemaReaderDecoderFloor(&service));
-    service.source.activation.?.version = 38;
+    service.source.activation.?.version = publication_version - 1;
     try std.testing.expectEqual(@as(u16, 0), try schemaReaderDecoderFloor(&service));
     service.source.floor = .{ .semantic_version = 30, .encoding_version = 31 };
-    try std.testing.expectEqual(@as(u16, 38), try schemaReaderDecoderFloor(&service));
-    service.source.activation.?.version = 39;
-    try std.testing.expectEqual(@as(u16, 39), try schemaReaderDecoderFloor(&service));
+    try std.testing.expectEqual(metadata_topology_protocol.schema_reader_floor_version, try schemaReaderDecoderFloor(&service));
+    service.source.activation.?.version = publication_version;
+    try std.testing.expectEqual(publication_version, try schemaReaderDecoderFloor(&service));
 }
 
 fn relationSourceDecoderFloor(service: anytype) !u16 {
@@ -7151,6 +7241,10 @@ pub const MetadataService = struct {
         try ensureDurableDecoderActivation(self, context, metadata_topology_protocol.schema_reader_capability_version);
     }
 
+    pub fn ensureSqlSequenceDecoderReadyWithContext(self: *MetadataService, context: api_operation.RequestContext) !void {
+        try ensureDurableDecoderActivation(self, context, metadata_topology_protocol.sql_sequence_catalog_version);
+    }
+
     pub fn reportStoreStatus(self: *MetadataService, report: metadata_table_manager.StoreStatusReport) !void {
         if (report.runtime_reference) return reportReferencedStoreStatus(self, report);
         _ = try self.reportStoreStatuses(&.{report});
@@ -9964,6 +10058,10 @@ pub const MetadataHttpService = struct {
 
     pub fn ensureSchemaReaderDecoderReadyWithContext(self: *MetadataHttpService, context: api_operation.RequestContext) !void {
         try ensureDurableDecoderActivation(self, context, metadata_topology_protocol.schema_reader_capability_version);
+    }
+
+    pub fn ensureSqlSequenceDecoderReadyWithContext(self: *MetadataHttpService, context: api_operation.RequestContext) !void {
+        try ensureDurableDecoderActivation(self, context, metadata_topology_protocol.sql_sequence_catalog_version);
     }
 
     /// A response acknowledges the exact applied cursor. Lost responses can
@@ -13903,7 +14001,8 @@ test "relational topology admission rejects lifecycle proposals before encoding 
     const naming_rewrite: metadata_storage.TransitionCommand = .{ .create_restore_job_with_staging = .{ .key = "1", .value = "{}", .plan_json = "{\"constraint_name_guard\":{}}" } };
     const naming_restore: metadata_storage.TransitionCommand = .{ .apply_restore_staging = "{\"plan\":{\"constraint_name_guard\":{}}}" };
     for ([_]metadata_storage.TransitionCommand{ naming_catalog, naming_fk, naming_generation, naming_rewrite, naming_restore }) |named| {
-        try std.testing.expectEqual(naming_version, transitionRequiredCoordinatedDecoderVersion(named));
+        const required = if (named == .apply_fk_generation_publication) metadata_topology_protocol.fk_generation_column_addition_version else naming_version;
+        try std.testing.expectEqual(required, transitionRequiredCoordinatedDecoderVersion(named));
         try std.testing.expectError(error.TableTopologyProtocolUpgradeRequired, relation_service.propose(&.{named}));
         try std.testing.expectError(error.TableTopologyProtocolUpgradeRequired, relation_service.propose(&.{ legacy, named }));
         try std.testing.expectEqual(@as(usize, 1), relation_service.appended);
@@ -13938,11 +14037,12 @@ test "relational topology admission rejects lifecycle proposals before encoding 
     var reader_store: metadata_table_manager.StoreRecord = .{ .store_id = 18, .node_id = 1, .reporter_incarnation = 4 };
     reader_store.schema_reader = metadata_table_manager.SchemaReaderCapabilities.current;
     const reader_command: metadata_storage.TransitionCommand = .{ .register_store = reader_store };
-    var reader_service: Fake = .{ .member_versions = &.{ 37, 36, 37 } };
+    const reader_version = metadata_topology_protocol.schema_reader_capability_version;
+    var reader_service: Fake = .{ .member_versions = &.{ reader_version, reader_version - 1, reader_version } };
     try std.testing.expectError(error.TableTopologyProtocolUpgradeRequired, ensureCoordinatedDecoderWithContext(&reader_service, reader_command, .{}));
     try std.testing.expectError(error.TableTopologyProtocolUpgradeRequired, reader_service.propose(&.{ legacy, reader_command }));
     try std.testing.expectEqual(@as(usize, 0), reader_service.appended);
-    reader_service.member_versions = &.{ 37, 37, 37 };
+    reader_service.member_versions = &.{ reader_version, reader_version, reader_version };
     try ensureCoordinatedDecoderWithContext(&reader_service, reader_command, .{});
     reader_service.cache.cached.?.readiness.term += 1;
     try std.testing.expectError(error.TableTopologyProtocolUpgradeRequired, reader_service.propose(&.{reader_command}));
@@ -13959,25 +14059,27 @@ test "relational topology admission rejects lifecycle proposals before encoding 
     // Incarnation decoding is global state: even a non-relation command
     // cannot append through older metadata after the floor activates.
     const ordinary: metadata_storage.TransitionCommand = .{ .remove_node = .{ .node_id = 99 } };
-    var floor_service: Fake = .{ .member_versions = &.{ 38, 37, 38 } };
+    const floor_version = metadata_topology_protocol.schema_reader_floor_version;
+    var floor_service: Fake = .{ .member_versions = &.{ floor_version, floor_version - 1, floor_version } };
     const before_floor = try prepareCoordinatedDecoderAdmission(&floor_service, &.{ordinary});
     floor_service.source.reader_floor = .{ .semantic_version = 30, .encoding_version = 31 };
     try std.testing.expectError(error.TableTopologyProtocolUpgradeRequired, validateRelationSourceDecoderFloor(&floor_service, before_floor));
     try std.testing.expectError(error.TableTopologyProtocolUpgradeRequired, ensureCoordinatedDecoderWithContext(&floor_service, ordinary, .{}));
     try std.testing.expectError(error.TableTopologyProtocolUpgradeRequired, floor_service.propose(&.{ordinary}));
     try std.testing.expectEqual(@as(usize, 0), floor_service.appended);
-    floor_service.member_versions = &.{ 38, 38, 38 };
+    floor_service.member_versions = &.{ floor_version, floor_version, floor_version };
     try ensureCoordinatedDecoderWithContext(&floor_service, ordinary, .{});
     try floor_service.propose(&.{ordinary});
     try std.testing.expectEqual(@as(usize, 1), floor_service.appended);
     const initial_create_command: metadata_storage.TransitionCommand = .{ .apply_fk_initial_create = "{}" };
     const generation_command: metadata_storage.TransitionCommand = .{ .apply_fk_generation_publication = "{}" };
-    try std.testing.expectEqual(metadata_topology_protocol.fk_generation_publication_version, transitionRequiredCoordinatedDecoderVersion(generation_command));
+    try std.testing.expectEqual(metadata_topology_protocol.fk_generation_column_addition_version, transitionRequiredCoordinatedDecoderVersion(generation_command));
     var mixed_generation: Fake = .{ .member_versions = &.{ 19, 18, 19 } };
     try std.testing.expectError(error.TableTopologyProtocolUpgradeRequired, ensureCoordinatedDecoderWithContext(&mixed_generation, generation_command, .{}));
     try std.testing.expectError(error.TableTopologyProtocolUpgradeRequired, mixed_generation.propose(&.{generation_command}));
     try std.testing.expectEqual(@as(usize, 0), mixed_generation.appended);
-    mixed_generation.member_versions = &.{ 19, 19, 19 };
+    const fk_version = metadata_topology_protocol.fk_generation_column_addition_version;
+    mixed_generation.member_versions = &.{ fk_version, fk_version, fk_version };
     try ensureCoordinatedDecoderWithContext(&mixed_generation, generation_command, .{});
     mixed_generation.cache.cached.?.readiness.term += 1;
     try std.testing.expectError(error.TableTopologyProtocolUpgradeRequired, mixed_generation.propose(&.{generation_command}));

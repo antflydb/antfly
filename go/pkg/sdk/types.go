@@ -53,6 +53,11 @@ type (
 	SQLParameterDescriptor      = oapi.SQLParameterDescriptor
 	SQLResponse                 = oapi.SQLResponse
 	SQLDDLReceipt               = oapi.SQLDDLReceipt
+	SQLCatalogOperationReceipt  = oapi.SQLCatalogOperationReceipt
+	SQLCatalogOperationState    = oapi.SQLCatalogOperationState
+	SQLCatalogOperationKind     = oapi.SQLCatalogOperationKind
+	SQLCatalogObjectKind        = oapi.SQLCatalogObjectKind
+	SQLCatalogRecoveryRequest   = oapi.SQLCatalogRecoveryRequest
 	SQLColumn                   = oapi.SQLColumn
 	SQLNumericModifier          = oapi.SQLNumericModifier
 	SQLColumnType               = oapi.SQLColumnType
@@ -127,6 +132,11 @@ type (
 	IndexPublicationState                 = oapi.IndexPublicationState
 	IndexPublicationPhase                 = oapi.IndexPublicationPhase
 	IndexPublicationFailure               = oapi.IndexPublicationFailure
+	SchemaValidationToken                 = oapi.SchemaValidationToken
+	SchemaValidationStatus                = oapi.SchemaValidationStatus
+	SchemaValidationState                 = oapi.SchemaValidationState
+	SchemaValidationPhase                 = oapi.SchemaValidationPhase
+	SchemaValidationFailure               = oapi.SchemaValidationFailure
 	IndexMaintenanceRequest               = oapi.IndexMaintenanceRequest
 	IndexMaintenanceResponse              = oapi.IndexMaintenanceResponse
 	IndexMaintenanceOwnerProof            = oapi.IndexMaintenanceOwnerProof

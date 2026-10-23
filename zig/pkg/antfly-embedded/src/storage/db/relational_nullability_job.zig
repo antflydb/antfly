@@ -34,9 +34,11 @@ const activation = @import("relational_integrity_activation.zig");
 const physical = @import("relational_index_catalog.zig");
 const rows = @import("relational_rows.zig");
 const transactions = @import("../transactions.zig");
+const debt = transactions.topology_debt;
 const receipts = @import("apply_receipts.zig");
 const Digest = [32]u8;
-pub const key = "\x00\x00__metadata__:schema_validation_job:v1";
+pub const family_prefix = "\x00\x00__metadata__:schema_validation_job:";
+pub const key = family_prefix ++ "v1";
 pub const inputs_key = key ++ ":inputs";
 pub const cursor_key = key ++ ":cursor";
 const public_key = "\x00\x00__metadata__:schema_json";
@@ -123,24 +125,19 @@ pub const Candidate = struct {
         defer a.free(name_json);
         if (name_json.len > max_names) return error.InvalidSchemaValidationJob;
         const components = [_][]const u8{ before_json, after_json, predecessor, name_json };
-        var length: usize = 24 + 32;
-        for (components) |part| length += part.len;
-        const inputs = try a.alloc(u8, length);
+        const inputs = try contract.encodeInputs(a, components);
         errdefer a.free(inputs);
-        @memcpy(inputs[0..8], "ASVI\x01\x00\x00\x00");
-        var offset: usize = 24;
-        for (components, 0..) |part, i| {
-            std.mem.writeInt(u32, inputs[8 + 4 * i ..][0..4], @intCast(part.len), .little);
-            @memcpy(inputs[offset..][0..part.len], part);
-            offset += part.len;
-        }
-        @memcpy(inputs[offset..][0..32], &hash(inputs[0..offset]));
         try control.ensureActive();
         return .{ .alloc = a, .inputs = inputs, .native_before = native_before, .native_after = native_after, .catalog_after = catalog_after, .plan = plan, .before_version = before.runtime_schema.version, .after_version = after.runtime_schema.version };
     }
     pub const parts = contract.inputParts;
     pub fn load(a: A, txn: anytype, binding: Binding, control: projection.Control) !Candidate {
         const raw = (try optional(txn, inputs_key)) orelse return error.SchemaValidationJobRequired;
+        return fromInputs(a, raw, binding, control);
+    }
+    /// Terminal controls remove local ASVI bytes. Recovery may use the exact
+    /// immutable inputs retained by metadata, never caller-asserted columns.
+    pub fn fromInputs(a: A, raw: []const u8, binding: Binding, control: projection.Control) !Candidate {
         if (!eq(hash(raw), binding.inputs)) return error.SchemaValidationJobChanged;
         const view = try parts(raw);
         var names = try std.json.parseFromSlice([]const []const u8, a, view[3], .{});
@@ -200,6 +197,90 @@ fn requireCurrent(self: Binding, txn: anytype) !void {
         !eq(self.physical_catalog, try digestAt(txn, physical.head_key))) return error.SchemaValidationJobChanged;
 }
 
+/// Small durable guards only. A rejection is a command result, never a catch-all
+/// interpretation of preparation/scan/storage errors. Namespace, authority,
+/// corrupt records and future receipt positions remain fatal/recovery errors.
+pub fn guardRejection(txn: anytype, command: contract.Command) !?@import("relational_schema_apply_outcome.zig").Reason {
+    const binding = command.binding;
+    try requireNamespace(binding, txn);
+    const stored = try load(txn);
+    var installed_duplicate = false;
+    var active_binding = false;
+    if (stored) |header| {
+        try requireCommitted(txn, header);
+        if (!std.meta.eql(header.binding, binding)) {
+            if (header.binding.fence.admission_epoch >= binding.fence.admission_epoch or
+                (header.phase != .released and header.phase != .canceled) or
+                (command.action != .begin and command.action != .cancel)) return .job_changed;
+        } else {
+            if (header.phase == .canceled and command.action != .cancel) return .canceled;
+            installed_duplicate = header.phase == .installed or header.phase == .released;
+            active_binding = !installed_duplicate and header.phase != .canceled;
+            if (command.action == .cancel and installed_duplicate) return .publication_required;
+            if (command.action == .release and !installed_duplicate) return .job_changed;
+            if (command.action == .install and header.phase != .ready and !installed_duplicate) return .job_changed;
+            switch (command.action) {
+                .reconcile_transactions => {
+                    if (eq(header.last_effect, contract.transactionDebtEffect(command.payload[0..32].*))) return null;
+                    if (header.phase != .fencing) return .job_changed;
+                    const directory = try debt.require(txn, try debt.Scope.fromBinding(binding));
+                    if (directory.phase == .ready or directory.phase == .retired or
+                        !eq(try directory.digest(), command.payload[0..32].*)) return .predecessor_changed;
+                },
+                .begin => if (header.admitted != null) return null,
+                .freeze => if (header.frozen != null) return null,
+                .cancel => if (header.phase == .canceled) return null,
+                .install => {
+                    if (installed_duplicate) {
+                        if (!eq(header.installation.?.decision, command.payload[0..32].*) or
+                            !eq(header.installation.?.ready_digest, command.payload[32..64].*)) return .job_changed;
+                        return null;
+                    }
+                    if (!eq(try header.digest(), command.payload[32..64].*)) return .predecessor_changed;
+                },
+                .release => {
+                    if (!eq(header.installation.?.decision, command.payload[0..32].*)) return .job_changed;
+                    const expected = if (header.release) |released| released.installed_digest else try header.digest();
+                    if (!eq(expected, command.payload[32..64].*)) return .predecessor_changed;
+                    if (header.release) |released| {
+                        if (!eq(released.publication, command.payload[64..96].*)) return .job_changed;
+                        return null;
+                    }
+                },
+                .page => {},
+            }
+            if (command.action == .page) {
+                const page = try contract.PageCommand.decode(command.payload);
+                if (eq(header.last_effect, try page.effect())) return null else {
+                    if (header.phase != .scanning or !eq(try header.digest(), page.expected)) return .predecessor_changed;
+                }
+            }
+        }
+    } else if (command.action != .begin and command.action != .cancel) return .job_required;
+    if (try topology.current(txn)) |fence| {
+        if (!fence.namespace.eql(binding.fence.namespace)) return error.IdentityNamespaceMismatch;
+        if (!fence.eql(binding.fence)) return .topology_changed;
+    } else if (command.action != .begin and command.action != .cancel) return .topology_changed;
+    // Cancellation can consume an abandoned epoch before BEGIN arrives, even
+    // if the public schema has since changed. It never installs that schema.
+    if (command.action == .cancel and !active_binding) return null;
+    if (!installed_duplicate) {
+        const catalog_mod = @import("table_catalog.zig");
+        const catalog = try catalog_mod.Catalog.decode((try optional(txn, catalog_mod.key)) orelse return error.SchemaValidationRuntimeRecoveryRequired);
+        if (catalog.storage_mode != .relational or catalog.active_schema_version != binding.before_version)
+            return if (active_binding) error.SchemaValidationRuntimeRecoveryRequired else .schema_changed;
+        const physical_bytes = try optional(txn, physical.head_key);
+        if (physical_bytes) |bytes| _ = try physical.Head.decode(bytes);
+        if (!eq(binding.physical_catalog, hash(physical_bytes orelse "")))
+            return if (active_binding) error.SchemaValidationRuntimeRecoveryRequired else .physical_catalog_changed;
+        if (!eq(binding.owner, try activation.ownership(txn)))
+            return if (active_binding) error.SchemaValidationRuntimeRecoveryRequired else .owner_changed;
+    }
+    if (command.action == .install and !installed_duplicate and
+        try transactions.TxnManager.hasQualifiedTopologyDebt(txn, try debt.Scope.fromBinding(binding))) return .transactions_pending;
+    return null;
+}
+
 pub const Phase = contract.Phase;
 pub const Installation = contract.Installation;
 pub const Header = contract.Header;
@@ -209,21 +290,89 @@ const precedes = contract.precedes;
 pub fn load(txn: anytype) !?Header {
     return if (try optional(txn, key)) |bytes| try Header.decode(bytes) else null;
 }
+
+pub fn observeTransactionDebt(txn: anytype, binding: Binding) !?contract.TransactionDebtObservation {
+    const header = (try load(txn)) orelse return null;
+    if (!std.meta.eql(header.binding, binding)) return error.SchemaValidationJobChanged;
+    // A never-visited cancellation has no admitted writer generation.
+    if (header.admitted == null) return null;
+    const directory = (try debt.load(txn)) orelse return error.SchemaValidationRuntimeRecoveryRequired;
+    if (!directory.scope.eql(try debt.Scope.fromBinding(binding)) or
+        ((directory.phase == .retired) != (header.phase == .released or header.phase == .canceled))) return error.SchemaValidationJobChanged;
+    const result: contract.TransactionDebtObservation = .{
+        .revision = directory.revision,
+        .debt = directory.debt,
+        .ready = directory.phase == .ready,
+        .retired = directory.phase == .retired,
+        .expected = try directory.digest(),
+    };
+    try result.validate();
+    return result;
+}
+
+/// Verify local progress evidence in the same immutable read as the imported
+/// rows and ordered marker. This grants neither physical-root adoption nor a
+/// metadata ACK. Nonterminal foreign jobs need explicit owner adoption; old
+/// terminal history remains inert in the destination's independent clock.
+pub fn validateSnapshot(a: A, txn: anytype, namespace: @import("doc_identity_namespace.zig").Namespace, options: @import("../../spill_sort.zig").Options) !void {
+    const control = options.cancellation orelse @import("antfly_cancellation").CancellationToken.none;
+    try control.check();
+    const header = (try load(txn)) orelse {
+        if (try debt.hasPrefix(txn, debt.family_prefix) or try debt.hasPrefix(txn, family_prefix)) return error.SchemaValidationRuntimeRecoveryRequired;
+        _ = try transactions.TxnManager.validateTopologyDebtSnapshot(a, txn, null, options);
+        return;
+    };
+    if (header.binding.fence.namespace.eql(namespace)) {
+        try requireCommitted(txn, header);
+        if (header.phase == .canceled or header.phase == .released) try requireCompletion(txn, header.binding);
+    } else if (header.phase != .released and header.phase != .canceled) return error.SchemaValidationRuntimeRecoveryRequired;
+    _ = try observeTransactionDebt(txn, header.binding);
+    if (header.binding.authority == .raft) {
+        var positions_to_check: [5]?positions.Position = .{ header.admitted, header.frozen, header.updated, null, null };
+        if (header.installation) |installed| {
+            positions_to_check[3] = installed.ready_position;
+            positions_to_check[4] = installed.position;
+        }
+        const outcomes = @import("relational_schema_apply_outcome.zig");
+        for (positions_to_check) |maybe_position| if (maybe_position) |position| {
+            try control.check();
+            const stored = (try outcomes.read(txn, header.binding.fence.namespace, position.raft.index)) orelse
+                return error.SchemaValidationRuntimeRecoveryRequired;
+            if (stored.entry.term != position.raft.term or stored.reason != .accepted) return error.CorruptSchemaApplyOutcome;
+        };
+    }
+    {
+        var cursor = try txn.openCursor();
+        defer cursor.close();
+        var entry = try cursor.seekAtOrAfter(family_prefix);
+        while (entry) |row| : (entry = try cursor.next()) {
+            if (!std.mem.startsWith(u8, row.key, family_prefix)) break;
+            try control.check();
+            if (!std.mem.eql(u8, row.key, key) and !std.mem.eql(u8, row.key, inputs_key) and !std.mem.eql(u8, row.key, cursor_key)) return error.InvalidSchemaValidationJob;
+        }
+    }
+    // Namespace/cut/completion checks are fixed work. Reject those failures
+    // before spending bounded scratch/IO on a potentially large old cohort.
+    _ = try transactions.TxnManager.validateTopologyDebtSnapshot(a, txn, if (header.admitted != null) try debt.Scope.fromBinding(header.binding) else null, options);
+}
 fn save(a: A, txn: anytype, header: Header) !void {
     const bytes = try header.encode(a);
     defer a.free(bytes);
     try txn.put(key, bytes);
 }
 fn requireCommitted(txn: anytype, header: Header) !void {
-    try requireNamespace(header.binding, txn);
-    const actual: positions.Position = if (header.binding.authority == .native)
-        .{ .native = .{ .namespace = header.binding.fence.namespace, .sequence = (try authority.require(txn, .native, @import("online_source_contract.zig").namespaceBytes(header.binding.fence.namespace))).sequence } }
+    try precedesOrEqual(header.updated, try currentPosition(txn, header.binding));
+}
+fn currentPosition(txn: anytype, binding: Binding) !positions.Position {
+    try requireNamespace(binding, txn);
+    const actual: positions.Position = if (binding.authority == .native)
+        .{ .native = .{ .namespace = binding.fence.namespace, .sequence = (try authority.require(txn, .native, @import("online_source_contract.zig").namespaceBytes(binding.fence.namespace))).sequence } }
     else blk: {
         const entry = (try receipts.readOrderedApplyReceiptTxn(txn)) orelse return error.InvalidControlReceiptPosition;
         break :blk .{ .raft = .{ .term = entry.term, .index = entry.index } };
     };
     try actual.validate();
-    try precedesOrEqual(header.updated, actual);
+    return actual;
 }
 fn nextPosition(txn: anytype, binding: Binding, entry: ?receipts.OrderedApplyReceipt) !positions.Position {
     try requireNamespace(binding, txn);
@@ -240,7 +389,7 @@ fn nextPosition(txn: anytype, binding: Binding, entry: ?receipts.OrderedApplyRec
 /// structural validity is not an authenticated validation receipt.
 pub fn requireActive(txn: anytype, fence: topology.Fence) !void {
     const header = (try load(txn)) orelse return error.SchemaValidationJobRequired;
-    if (!header.binding.fence.eql(fence) or header.phase == .canceled) return error.SchemaValidationJobChanged;
+    if (!header.binding.fence.eql(fence) or header.phase == .canceled or header.phase == .released) return error.SchemaValidationJobChanged;
     try requireNamespace(header.binding, txn);
 }
 pub fn requireFencing(txn: anytype, fence: topology.Fence) !void {
@@ -253,7 +402,7 @@ pub fn requireCanceling(txn: anytype, fence: topology.Fence) !void {
 }
 fn workHeader(txn: anytype, binding: Binding) !Header {
     const header = (try load(txn)) orelse return error.SchemaValidationJobRequired;
-    if (!std.meta.eql(header.binding, binding) or header.phase == .canceling or header.phase == .canceled) return error.SchemaValidationJobChanged;
+    if (!std.meta.eql(header.binding, binding) or header.phase == .canceling or header.phase == .canceled or header.phase == .released) return error.SchemaValidationJobChanged;
     try requireCommitted(txn, header);
     const actual = (try topology.current(txn)) orelse return error.IntegrityTopologyFenceMissing;
     if (!actual.eql(binding.fence)) return error.IntegrityTopologyChanged;
@@ -272,17 +421,25 @@ pub fn requireReady(txn: anytype, binding: Binding) !Header {
     const header = try workHeader(txn, binding);
     if (header.phase != .ready) return error.SchemaValidationNotReady;
     try requireCurrent(binding, txn);
+    if (try transactions.TxnManager.hasQualifiedTopologyDebt(txn, try debt.Scope.fromBinding(binding))) return error.TransactionTopologyBusy;
     return header;
 }
 
 fn requireSuccessor(a: A, txn: anytype, binding: Binding, installed: Installation) !void {
+    try requireSuccessorDefinition(a, txn, binding);
+    if (!eq(installed.physical_catalog, try digestAt(txn, physical.head_key)) or
+        !eq(installed.activation, try digestAt(txn, activation.key))) return error.SchemaValidationJobChanged;
+}
+
+/// Released tables accept normal writes and independent coverage progress;
+/// the installation's old activation bytes are no longer a current-row cut.
+/// Immutable definitions/history still bind the candidate's typed projection.
+fn requireSuccessorDefinition(a: A, txn: anytype, binding: Binding) !void {
     try requireNamespace(binding, txn);
     if (!eq(binding.owner, try activation.ownership(txn)) or
         !eq(binding.after_schema, try digestAt(txn, schema.schema_key)) or
         !eq(binding.after_public, try digestAt(txn, public_key)) or
-        !eq(binding.after_catalog, try digestAt(txn, integrity.key)) or
-        !eq(installed.physical_catalog, try digestAt(txn, physical.head_key)) or
-        !eq(installed.activation, try digestAt(txn, activation.key))) return error.SchemaValidationJobChanged;
+        !eq(binding.after_catalog, try digestAt(txn, integrity.key))) return error.SchemaValidationJobChanged;
     const catalog = try @import("table_catalog.zig").Catalog.decode((try optional(txn, @import("table_catalog.zig").key)) orelse return error.SchemaValidationJobChanged);
     if (catalog.storage_mode != .relational or catalog.active_schema_version != binding.after_version) return error.SchemaValidationJobChanged;
     // The old frames remain encoded with their original schema. Installation
@@ -325,14 +482,76 @@ pub fn stageInstalled(a: A, txn: anytype, binding: Binding, ready_digest: Digest
 /// Read-only replay/recovery check of a committed local installation. This
 /// does not authenticate a copied root or sign a distributed owner receipt.
 pub fn requireInstalled(a: A, txn: anytype, binding: Binding, decision: Digest) !Header {
+    const header = try requireInstalledCut(txn, binding, decision);
+    try requireSuccessor(a, txn, binding, header.installation.?);
+    return header;
+}
+
+/// The installed schema/history were verified during off-lock preparation and
+/// cannot be changed through this still-active exclusive lifecycle fence.
+/// Apply checks only bounded durable facts; never hash multi-MiB definitions
+/// or allocate historical-schema keys in the serialized release transaction.
+fn requireInstalledCut(txn: anytype, binding: Binding, decision: Digest) !Header {
     const header = (try load(txn)) orelse return error.SchemaValidationJobRequired;
     if (!std.meta.eql(header.binding, binding) or header.phase != .installed or
         !eq(header.installation.?.decision, decision)) return error.SchemaValidationJobChanged;
     try requireCommitted(txn, header);
     const fence = (try topology.current(txn)) orelse return error.IntegrityTopologyFenceMissing;
     if (!fence.eql(binding.fence)) return error.IntegrityTopologyChanged;
-    try requireSuccessor(a, txn, binding, header.installation.?);
+    const catalog = try @import("table_catalog.zig").Catalog.decode((try optional(txn, @import("table_catalog.zig").key)) orelse return error.SchemaValidationJobChanged);
+    if (catalog.storage_mode != .relational or catalog.active_schema_version != binding.after_version or
+        !eq(binding.owner, try activation.ownership(txn)) or
+        !eq(header.installation.?.physical_catalog, try digestAt(txn, physical.head_key))) return error.SchemaValidationJobChanged;
     return header;
+}
+
+/// Trusted publication adapter only. A digest is not authority: the receiving
+/// owner must independently authenticate the metadata all-installed decision
+/// before invoking this effect. Replay/outbox joins the caller's SAME writer.
+pub fn stageReleased(a: A, txn: anytype, manager: *transactions.TxnManager, binding: Binding, install_decision: Digest, installed_digest: Digest, publication: Digest, entry: ?receipts.OrderedApplyReceipt) !Header {
+    if (std.mem.allEqual(u8, &publication, 0)) return error.InvalidSchemaOwnerControl;
+    var header = try requireInstalledCut(txn, binding, install_decision);
+    if (!eq(try header.digest(), installed_digest)) return error.SchemaValidationJobChanged;
+    try topology.requireDrained(txn, manager, binding.fence);
+    const position = try nextPosition(txn, binding, entry);
+    try precedes(header.updated, position);
+    header.release = .{ .publication = publication, .installed_digest = installed_digest, .installed_last_effect = header.last_effect };
+    header.phase = .released;
+    header.updated = position;
+    header.revision = try std.math.add(u64, header.revision, 1);
+    header.last_effect = hash("schema-validation-release/v1");
+    try save(a, txn, header);
+    try topology.stageSchemaValidationRelease(txn, header);
+    try debt.retire(txn, try debt.Scope.fromBinding(binding));
+    // Terminal observation needs only its immutable installed predecessor.
+    // Reclaim the potentially multi-MiB preparation/cursor in this transaction.
+    try txn.delete(inputs_key);
+    try txn.delete(cursor_key);
+    return header;
+}
+
+/// Verify terminal completion, not today's row/schema bytes. User writes and
+/// later legitimate schema epochs must not invalidate an earlier release ACK.
+pub fn requireReleased(txn: anytype, expected: Header) !Header {
+    try expected.validate();
+    if (expected.phase != .released) return error.SchemaValidationPublicationRequired;
+    const header = (try load(txn)) orelse return error.SchemaValidationJobRequired;
+    if (!std.meta.eql(header, expected)) return error.SchemaValidationJobChanged;
+    try requireCommitted(txn, header);
+    try requireCompletion(txn, header.binding);
+    return header;
+}
+
+fn requireCompletion(txn: anytype, binding: Binding) !void {
+    const done = (try topology.completed(txn)) orelse return error.SchemaValidationJobChanged;
+    if (done.admission_epoch < binding.fence.admission_epoch or
+        (done.admission_epoch == binding.fence.admission_epoch and !done.eql(binding.fence))) return error.SchemaValidationJobChanged;
+    // A copied/torn terminal header must not produce a release ACK while the
+    // old fence still exists. A later independent lifecycle fence is history.
+    if (try optional(txn, topology.fence_key)) |raw| {
+        const live = try topology.Fence.decode(raw);
+        if (live.admission_epoch <= binding.fence.admission_epoch) return error.SchemaValidationJobChanged;
+    }
 }
 
 /// Durable progress observation for trusted owner retry/replay. No signature
@@ -342,9 +561,25 @@ pub fn observe(a: A, txn: anytype, binding: Binding) !Header {
     if (!std.meta.eql(header.binding, binding)) return error.SchemaValidationJobChanged;
     try requireCommitted(txn, header);
     if (header.phase == .installed) return requireInstalled(a, txn, binding, header.installation.?.decision);
+    if (header.phase == .released) return requireReleased(txn, header);
     if (header.phase == .canceled) {
-        const done = (try topology.completed(txn)) orelse return error.SchemaValidationJobChanged;
-        if (done.admission_epoch < binding.fence.admission_epoch) return error.SchemaValidationJobChanged;
+        try requireCompletion(txn, binding);
+        return header;
+    }
+    return workHeader(txn, binding);
+}
+
+/// Transactional recheck for an independently prepared owner control. The
+/// immutable read preparation already verified full installed history. The
+/// fence, owner, epoch and physical catalog prevent it changing before apply.
+pub fn observeForApply(txn: anytype, binding: Binding) !Header {
+    const header = (try load(txn)) orelse return error.SchemaValidationJobRequired;
+    if (!std.meta.eql(header.binding, binding)) return error.SchemaValidationJobChanged;
+    if (header.phase == .installed) return requireInstalledCut(txn, binding, header.installation.?.decision);
+    if (header.phase == .released) return requireReleased(txn, header);
+    try requireCommitted(txn, header);
+    if (header.phase == .canceled) {
+        try requireCompletion(txn, binding);
         return header;
     }
     return workHeader(txn, binding);
@@ -367,11 +602,12 @@ pub fn stageBegin(a: A, txn: anytype, binding: Binding, candidate: *const Candid
     try requireCurrent(binding, txn);
     if (try load(txn)) |prior| {
         try requireCommitted(txn, prior);
+        if (prior.phase == .released or prior.phase == .canceled) try requireCompletion(txn, prior.binding);
         if (std.meta.eql(prior.binding, binding)) {
             if (prior.phase == .canceled) return error.SchemaValidationCanceled;
             return workHeader(txn, binding);
         }
-        if (prior.phase != .canceled or prior.binding.fence.admission_epoch >= binding.fence.admission_epoch) return error.SchemaValidationJobChanged;
+        if ((prior.phase != .canceled and prior.phase != .released) or prior.binding.fence.admission_epoch >= binding.fence.admission_epoch) return error.SchemaValidationJobChanged;
     }
     if (try topology.current(txn) != null) return error.IntegrityTopologyBusy;
     const position = try nextPosition(txn, binding, entry);
@@ -380,6 +616,28 @@ pub fn stageBegin(a: A, txn: anytype, binding: Binding, candidate: *const Candid
     try txn.put(cursor_key, "");
     try save(a, txn, header);
     try topology.stageSchemaValidationBegin(txn, binding.fence);
+    try transactions.TxnManager.stageTopologyDebtBegin(txn, try debt.Scope.fromBinding(binding));
+    return header;
+}
+
+/// Independent durable control, never a sub-effect of a FREEZE that may fail
+/// while later coordinator ACKs remain queued. Preparation owns bounded work;
+/// apply compares the exact directory predecessor and advances the real clock.
+pub fn stageTransactionDebtPage(a: A, txn: anytype, binding: Binding, page: *const debt.Page, entry: ?receipts.OrderedApplyReceipt) !Header {
+    var header = try workHeader(txn, binding);
+    const effect = contract.transactionDebtEffect(page.expected);
+    if (eq(header.last_effect, effect)) return header;
+    if (header.phase != .fencing) return error.SchemaValidationJobChanged;
+    try requireCurrent(binding, txn);
+    const scope = try debt.Scope.fromBinding(binding);
+    if (!page.next.scope.eql(scope)) return error.SchemaValidationJobChanged;
+    const position = try nextPosition(txn, binding, entry);
+    try precedes(header.updated, position);
+    try page.stage(txn);
+    header.updated = position;
+    header.revision = try std.math.add(u64, header.revision, 1);
+    header.last_effect = effect;
+    try save(a, txn, header);
     return header;
 }
 pub fn stageFrozen(a: A, txn: anytype, manager: *transactions.TxnManager, binding: Binding, entry: ?receipts.OrderedApplyReceipt) !Header {
@@ -393,6 +651,7 @@ pub fn stageFrozen(a: A, txn: anytype, manager: *transactions.TxnManager, bindin
     header.frozen = position;
     header.updated = position;
     header.phase = .scanning;
+    header.last_effect = hash("schema-validation-freeze/v1");
     header.revision = try std.math.add(u64, header.revision, 1);
     try save(a, txn, header);
     return header;
@@ -402,6 +661,205 @@ pub fn stageFrozen(a: A, txn: anytype, manager: *transactions.TxnManager, bindin
 /// through JSON/UTF-8. Decoding is structural only: replay must independently
 /// execute the prefix before any result is eligible for transactional apply.
 pub const PageCommand = contract.PageCommand;
+
+/// Pin schema and data under one short publication fence. Reader allocation,
+/// range decoding and planning run after unlocking, for both validation and
+/// recovery. openSnapshot consumes its transaction even when preparation fails.
+fn openPhysicalReader(a: A, core: anytype) !rows.Reader {
+    const captured = blk: {
+        core.lockApplyShared();
+        defer core.unlockApplyShared();
+        var view = core.acquireSchemaView() orelse return error.RelationalTableRequired;
+        errdefer view.release();
+        break :blk .{ .view = view, .read = try core.store.beginReadTxn(), .authenticated = core.store.valuesAreAuthenticated() };
+    };
+    var view = captured.view;
+    defer view.release();
+    return rows.Reader.openSnapshot(a, captured.read, captured.authenticated, view, null, .{}, 0);
+}
+
+/// Physical row coverage only, NOT authority to adopt a root or publish a
+/// schema. The recovery protocol must additionally qualify transaction debt,
+/// source/root provenance and the exact metadata predecessor. A retained MVCC
+/// read keeps page boundaries independent of concurrent compaction or writes.
+pub const RowAudit = struct {
+    pub const Coverage = @import("relational_schema_root_contract.zig").Coverage;
+    pub const Summary = @import("relational_schema_root_contract.zig").RowSummary;
+    /// Root-local authenticated continuation, never a remote progress claim.
+    /// Its owner must verify the checkpoint signature before resuming it.
+    pub const Progress = struct {
+        alloc: A,
+        summary: Summary,
+        after: []u8,
+        complete: bool,
+
+        pub fn deinit(self: *@This()) void {
+            self.alloc.free(self.after);
+            self.* = undefined;
+        }
+        pub fn validate(self: *const @This()) !void {
+            const value = self.summary;
+            try value.header.validate();
+            try value.snapshot_cut.requireNamespace(value.header.binding.fence.namespace);
+            try precedesOrEqual(value.header.updated, value.snapshot_cut);
+            if (value.coverage != coverageFor(value.header.phase) or value.rows > value.records or self.after.len > max_cursor or
+                !eq(hash(self.after), value.cursor_digest) or ((value.records == 0) != (self.after.len == 0)) or
+                (self.after.len != 0 and !@import("../internal_keys.zig").isRelationalRowKey(self.after))) return error.InvalidSchemaValidationJob;
+            switch (value.coverage) {
+                .none => if (!self.complete or value.records != 0 or value.rows != 0) return error.InvalidSchemaValidationJob,
+                .prefix => {
+                    if (value.records > value.header.records or value.rows > value.header.rows_scanned or
+                        self.complete != (value.records == value.header.records) or (value.header.phase == .failed and value.header.records == 0)) return error.InvalidSchemaValidationJob;
+                    if (self.complete and (value.rows != value.header.rows_scanned or !eq(value.cursor_digest, value.header.cursor_digest))) return error.InvalidSchemaValidationJob;
+                },
+                .full => if (value.header.phase != .released) {
+                    if (value.records > value.header.records or value.rows > value.header.rows_scanned or
+                        (self.complete and (value.records != value.header.records or value.rows != value.header.rows_scanned or
+                            !eq(value.cursor_digest, value.header.cursor_digest)))) return error.InvalidSchemaValidationJob;
+                },
+            }
+        }
+    };
+
+    fn coverageFor(phase: Phase) Coverage {
+        return switch (phase) {
+            .fencing, .canceling, .canceled => .none,
+            .scanning, .failed => .prefix,
+            .ready, .installed, .released => .full,
+        };
+    }
+    alloc: A,
+    reader: rows.Reader,
+    candidate: Candidate,
+    header: Header,
+    snapshot_cut: positions.Position,
+    coverage: Coverage,
+    records: u64 = 0,
+    rows_examined: u64 = 0,
+    cursor_digest: Digest,
+    done: bool = false,
+    invalid: bool = false,
+
+    pub fn deinit(self: *@This()) void {
+        self.candidate.deinit();
+        self.reader.deinit();
+        self.* = undefined;
+    }
+
+    pub fn init(a: A, core: anytype, binding: Binding, retained_inputs: []const u8, control: projection.Control) !@This() {
+        try control.ensureActive();
+        var reader = try openPhysicalReader(a, core);
+        errdefer reader.deinit();
+        const header = try observe(a, &reader.read, binding);
+        if (header.phase == .released) {
+            try requireSuccessorDefinition(a, &reader.read, binding);
+        } else if (header.installation == null) try requireCurrent(binding, &reader.read);
+        if (try optional(&reader.read, inputs_key)) |raw| {
+            if (!eq(hash(raw), binding.inputs)) return error.SchemaValidationJobChanged;
+        } else if (header.phase != .released and header.phase != .canceled) return error.SchemaValidationJobRequired;
+        var candidate = try Candidate.fromInputs(a, retained_inputs, binding, control);
+        errdefer candidate.deinit();
+        const coverage = coverageFor(header.phase);
+        // A fresh reader starts at the real beginning. Projection binding is
+        // deferred until its first page or authenticated checkpoint resume.
+        const snapshot_cut = try currentPosition(&reader.read, binding);
+        var result: @This() = .{ .alloc = a, .reader = reader, .candidate = candidate, .header = header, .snapshot_cut = snapshot_cut, .coverage = coverage, .cursor_digest = hash("") };
+        if (coverage == .none) result.done = true else if (coverage == .prefix and header.records == 0) {
+            if (header.phase == .failed or header.rows_scanned != 0 or !eq(header.cursor_digest, hash(""))) return error.SchemaValidationRuntimeRecoveryRequired;
+            result.done = true;
+        }
+        return result;
+    }
+
+    pub fn checkpoint(self: *const @This(), a: A) !Progress {
+        if (self.invalid) return error.SchemaValidationRuntimeRecoveryRequired;
+        const after = try a.dupe(u8, self.reader.after.items);
+        errdefer a.free(after);
+        const result: Progress = .{ .alloc = a, .summary = self.snapshotSummary(), .after = after, .complete = self.done };
+        try result.validate();
+        return result;
+    }
+
+    /// Caller must authenticate root-local bytes first. No transport endpoint
+    /// may accept this structure from a client as evidence of scanned rows.
+    pub fn resumeAuthenticatedCheckpoint(self: *@This(), progress: *const Progress, control: projection.Control) !void {
+        try control.ensureActive();
+        try progress.validate();
+        if (self.invalid or self.records != 0 or self.reader.after.items.len != 0 or
+            !std.meta.eql(self.header, progress.summary.header) or !std.meta.eql(self.snapshot_cut, progress.summary.snapshot_cut) or
+            self.coverage != progress.summary.coverage) return error.SchemaValidationRuntimeRecoveryRequired;
+        try self.reader.resumeNullabilityScan(&self.candidate.plan, .{ .projection_identity = self.header.binding.projection_identity, .after = progress.after }, control);
+        self.records = progress.summary.records;
+        self.rows_examined = progress.summary.rows;
+        self.cursor_digest = progress.summary.cursor_digest;
+        self.done = progress.complete;
+    }
+
+    /// One bounded page, without an apply lock or JSON reconstruction. Callers
+    /// may yield between calls; cancellation never consumes a partial page.
+    pub fn step(self: *@This(), io: ?std.Io, budget: rows.Budget, control: projection.Control) !bool {
+        try control.ensureActive();
+        try budget.validate();
+        if (self.invalid) return error.SchemaValidationRuntimeRecoveryRequired;
+        if (self.done) return true;
+        var bounded = budget;
+        if (self.coverage == .prefix) bounded.records = @intCast(@min(@as(u64, @intCast(budget.records)), self.header.records - self.records));
+        var page = try self.reader.nextNullabilityPage(self.alloc, io, bounded, &self.candidate.plan, control);
+        defer page.deinit();
+        // A rejected page has advanced the retained reader. Never retry it as
+        // an empty EOF page and accidentally qualify the previous counters.
+        errdefer self.invalid = true;
+        const records = try std.math.add(u64, self.records, page.page.records_examined);
+        const examined = try std.math.add(u64, self.rows_examined, page.rows_examined);
+        if (self.header.phase != .released and (records > self.header.records or examined > self.header.rows_scanned)) return error.SchemaValidationRuntimeRecoveryRequired;
+        const cursor = hash(page.after);
+        const violation: ?u16 = if (page.violation_column) |column| std.math.cast(u16, column) orelse return error.InvalidSchemaValidationJob else null;
+        const finished = if (self.coverage == .prefix) records == self.header.records else !page.page.more;
+        if (violation != null and (self.header.phase != .failed or !finished)) return error.SchemaValidationRuntimeRecoveryRequired;
+        if (self.coverage == .prefix and !finished and !page.page.more) return error.SchemaValidationRuntimeRecoveryRequired;
+        if (finished) {
+            if (self.coverage == .prefix or self.header.phase != .released) {
+                if (records != self.header.records or examined != self.header.rows_scanned or
+                    !eq(cursor, self.header.cursor_digest) or violation != self.header.failure_column)
+                    return error.SchemaValidationRuntimeRecoveryRequired;
+            } else if (violation != null) return error.SchemaValidationRuntimeRecoveryRequired;
+        }
+        self.records = records;
+        self.rows_examined = examined;
+        self.cursor_digest = cursor;
+        self.done = finished;
+        return finished;
+    }
+
+    pub fn summary(self: *const @This()) !Summary {
+        if (self.invalid) return error.SchemaValidationRuntimeRecoveryRequired;
+        if (!self.done) return error.SchemaValidationNotReady;
+        return self.snapshotSummary();
+    }
+
+    /// Verify the current live definition before returning cached coverage.
+    /// Normal post-release data writes may advance the actual storage clock;
+    /// a changed job, schema or backwards clock must never reuse old coverage.
+    pub fn requireCurrentMetadata(self: *const @This(), a: A, core: anytype, control: projection.Control) !void {
+        try control.ensureActive();
+        var read = blk: {
+            core.lockApplyShared();
+            defer core.unlockApplyShared();
+            break :blk try core.store.beginReadTxn();
+        };
+        defer read.abort();
+        const binding = self.header.binding;
+        const current = try observe(a, &read, binding);
+        if (!std.meta.eql(current, self.header)) return error.SchemaValidationJobChanged;
+        if (current.phase == .released) try requireSuccessorDefinition(a, &read, binding) else if (current.installation == null) try requireCurrent(binding, &read);
+        try precedesOrEqual(self.snapshot_cut, try currentPosition(&read, binding));
+        try control.ensureActive();
+    }
+
+    fn snapshotSummary(self: *const @This()) Summary {
+        return .{ .header = self.header, .snapshot_cut = self.snapshot_cut, .coverage = self.coverage, .records = self.records, .rows = self.rows_examined, .cursor_digest = self.cursor_digest };
+    }
+};
 
 /// Trusted independently executed read preparation. Encoded page claims alone
 /// are never accepted by stagePage; transport receivers must use replay.
@@ -428,13 +886,7 @@ pub const PreparedPage = struct {
     }
     fn prepareMode(a: A, core: anytype, binding: Binding, budget: rows.Budget, control: projection.Control, replay_command: ?PageCommand) !PreparedPage {
         try control.ensureActive();
-        var reader = blk: {
-            core.lockApplyShared();
-            defer core.unlockApplyShared();
-            var view = core.acquireSchemaView() orelse return error.RelationalTableRequired;
-            defer view.release();
-            break :blk try rows.Reader.open(a, core.store, view, null, .{}, 0);
-        };
+        var reader = try openPhysicalReader(a, core);
         defer reader.deinit();
         const header = try workHeader(&reader.read, binding);
         try requireCurrent(binding, &reader.read);
@@ -501,11 +953,11 @@ pub fn stageCancel(a: A, txn: anytype, manager: *transactions.TxnManager, bindin
         // Cancellation is terminal progress, not permission to repair an
         // unproven restored/future cut by overwriting it with a local clock.
         try requireCommitted(txn, prior);
-        if (prior.phase == .installed) return error.SchemaValidationPublicationRequired;
+        if (prior.phase == .installed or (prior.phase == .released and std.meta.eql(prior.binding, binding))) return error.SchemaValidationPublicationRequired;
         if (std.meta.eql(prior.binding, binding) and prior.phase == .canceled) {
             return prior;
         }
-        if (!std.meta.eql(prior.binding, binding) and (prior.phase != .canceled or prior.binding.fence.admission_epoch >= binding.fence.admission_epoch))
+        if (!std.meta.eql(prior.binding, binding) and ((prior.phase != .canceled and prior.phase != .released) or prior.binding.fence.admission_epoch >= binding.fence.admission_epoch))
             return error.SchemaValidationJobChanged;
     }
     if (try topology.current(txn)) |actual| if (!actual.eql(binding.fence)) return error.IntegrityTopologyBusy;
@@ -519,6 +971,7 @@ pub fn stageCancel(a: A, txn: anytype, manager: *transactions.TxnManager, bindin
     header.revision = try std.math.add(u64, header.revision, 1);
     try save(a, txn, header);
     try topology.stageSchemaValidationCancellation(txn, manager, binding.fence);
+    if (header.admitted != null) try debt.retire(txn, try debt.Scope.fromBinding(binding));
     header.phase = .canceled;
     header.last_effect = hash("schema-validation-cancel/v1");
     try save(a, txn, header);

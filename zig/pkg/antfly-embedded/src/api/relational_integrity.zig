@@ -104,11 +104,18 @@ pub const Plan = struct {
         for (uniques, bound_uniques) |binding, *bound| {
             const def = binding.definition;
             if (std.mem.allEqual(u8, &binding.generation, 0) or (def.columns.len == 0 and def.keys.len == 0) or (def.columns.len != 0 and def.keys.len != 0) or def.expressions.len != 0 or
-                def.include_columns.len != 0 or def.where_expressions.len != 0 or
+                def.include_columns.len > 256 or def.where_expressions.len != 0 or
                 def.without_overlaps_period != null or (def.timing == .deferred and !def.deferrable)) return error.UnsupportedIntegrityDefinition;
             var copied = def;
             copied.name = try owned.dupe(u8, def.name);
             copied.columns = try copyColumns(owned, def.columns);
+            // INCLUDE is a physical projection, never an equality-key input.
+            // Its ordered access generation is compiled from the same schema;
+            // retain owned names here without widening claims or FK identity.
+            for (def.include_columns) |column| {
+                if (view.physicalLayout().ordinalForName(view.tableSchema().relational_columns, column) == null) return error.RelationalIndexColumnNotFound;
+            }
+            copied.include_columns = try copyColumns(owned, def.include_columns);
             const keys = try owned.dupe(native.RelationalIndexKey, def.keys);
             for (keys) |*key| {
                 key.column = try owned.dupe(u8, key.column);
@@ -527,6 +534,45 @@ test "SQL UNIQUE null clauses share distributed claims and conflict arbiters" {
     for ([_]bool{ false, true }) |not_distinct| {
         try sqlUniqueNullClaims(std.testing.allocator, not_distinct);
         try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, sqlUniqueNullClaims, .{not_distinct});
+    }
+}
+
+test "SQL covering constraint integrity claims exclude payload columns" {
+    const a = std.testing.allocator;
+    var view = registry.SchemaView{ .epoch = try registry.Epoch.createCloned(a, .{
+        .version = 1,
+        .storage_mode = .relational,
+        .relational_columns = &.{
+            .{ .name = "id", .path = "id", .column_type = .integer },
+            .{ .name = "label", .path = "label", .column_type = .string },
+        },
+    }) };
+    defer view.release();
+    var payload_name = "label".*;
+    var plan = try Plan.init(a, "items", view, &.{.{ .generation = @splat(7), .definition = .{ .name = "covered", .columns = &.{"id"}, .include_columns = &.{&payload_name} } }}, &.{});
+    defer plan.deinit();
+    @memset(&payload_name, 'x');
+    try std.testing.expectEqualStrings("label", plan.uniques[0].definition.include_columns[0]);
+    const inferred = try plan.bindConflictTarget(a, &.{"id"}, &.{});
+    defer a.free(inferred);
+    try std.testing.expectEqual(@as(usize, 1), inferred.len);
+    try std.testing.expectError(error.ConflictArbiterNotFound, plan.bindConflictTarget(a, &.{ "id", "label" }, &.{}));
+    var first_tuple: ?[]u8 = null;
+    defer if (first_tuple) |bytes| a.free(bytes);
+    for ([_][]const u8{ "before", "after" }) |label| {
+        const bytes = try codec.serializeOrdinal(a, view.version(), view.tableSchema().relational_columns, &.{
+            .{ .ordinal = 0, .path = "id", .value_type = .i64_val, .value = .{ .i64_val = 1 } },
+            .{ .ordinal = 1, .path = "label", .value_type = .bytes_val, .value = .{ .bytes_val = label } },
+        }, @splat(0));
+        defer a.free(bytes);
+        const row = try codec.ordinalRowView(bytes, view.tableSchema().*, view.physicalLayout());
+        const addresses = try plan.conflictAddresses(a, inferred, row);
+        defer {
+            for (addresses) |address| a.free(address.tuple);
+            a.free(addresses);
+        }
+        try std.testing.expectEqual(@as(usize, 1), addresses.len);
+        if (first_tuple) |first| try std.testing.expectEqualSlices(u8, first, addresses[0].tuple) else first_tuple = try a.dupe(u8, addresses[0].tuple);
     }
 }
 

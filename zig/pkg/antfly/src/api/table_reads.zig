@@ -15659,7 +15659,7 @@ fn lookupRemote(
         .leader_lease => "leader_lease",
         .read_index => "read_index",
     };
-    var result = client.fetchGroupLookupWithMode(
+    var result = client.fetchGroupLookupWithOptions(
         base_uri,
         group_id,
         table_name,
@@ -15668,16 +15668,20 @@ fn lookupRemote(
         read_consistency,
         timeout_ms,
         cancellation,
-        opts.relational_integrity_catalog,
-        opts.relational_integrity_action,
-        opts.relational_integrity_jobs_json,
-        opts.relational_activation_json,
-        opts.relational_index_status_json,
-        opts.relational_topology_json,
-        opts.group_source_query_json,
-        opts.restore_staging_scope,
-        opts.restore_staging_plan_id,
-        opts.include_primary_digest,
+        .{
+            .relational_integrity_catalog = opts.relational_integrity_catalog,
+            .relational_integrity_action = opts.relational_integrity_action,
+            .relational_integrity_jobs_json = opts.relational_integrity_jobs_json,
+            .relational_activation_json = opts.relational_activation_json,
+            .relational_index_status_json = opts.relational_index_status_json,
+            .relational_topology_json = opts.relational_topology_json,
+            .group_source_query_json = opts.group_source_query_json,
+            .restore_staging_scope = opts.restore_staging_scope,
+            .restore_staging_plan_id = opts.restore_staging_plan_id,
+            .include_primary_digest = opts.include_primary_digest,
+            .row_policy_principal_proof = opts.row_policy_principal_proof,
+            .row_policy_database = opts.row_policy_database,
+        },
     ) catch |err| return if (err == error.ConcurrencyUnavailable)
         // Keep proven local scheduling pressure distinct from unavailable
         // peers/consistency failures for admission-aware primary prefetch.
@@ -17617,9 +17621,28 @@ fn consumerTests() type {
             const alloc = std.testing.allocator;
             const Capture = struct {
                 mode: enum { good, missing, invalid } = .good,
+                expect_policy: bool = false,
+                token: []const u8 = "not-a-proof",
                 fn execute(ptr: *anyopaque, allocator: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
                     const self: *@This() = @ptrCast(@alignCast(ptr));
                     try std.testing.expect(std.mem.indexOf(u8, req.uri, "_primary_digest=true") != null);
+                    const authority = @import("../usermgr/mod.zig").row_policy_authority;
+                    var has_principal = false;
+                    var has_database = false;
+                    for (req.headers) |header| {
+                        if (std.ascii.eqlIgnoreCase(header.name, authority.principal_header)) {
+                            try std.testing.expectEqualStrings(self.token, header.value);
+                            has_principal = true;
+                        }
+                        if (std.ascii.eqlIgnoreCase(header.name, authority.database_header)) {
+                            try std.testing.expectEqualStrings("tenant-db", header.value);
+                            has_database = true;
+                        }
+                    }
+                    try std.testing.expectEqual(self.expect_policy, has_principal);
+                    try std.testing.expectEqual(self.expect_policy, has_database);
+                    try std.testing.expect(std.mem.indexOf(u8, req.uri, self.token) == null);
+                    try std.testing.expect(std.mem.indexOf(u8, req.uri, "tenant-db") == null);
                     const digest = std.fmt.bytesToHex(@as([32]u8, @splat(0xab)), .lower);
                     const headers = try allocator.alloc(http_common.Header, if (self.mode == .missing) 1 else 2);
                     headers[0] = .{ .name = try allocator.dupe(u8, "X-Antfly-Version"), .value = try allocator.dupe(u8, "77") };
@@ -17636,6 +17659,15 @@ fn consumerTests() type {
             defer response.deinit(alloc);
             try std.testing.expectEqual(@as(u64, 77), response.version);
             try std.testing.expectEqualSlices(u8, &(@as([32]u8, @splat(0xab))), &response.expected_content_digest.?);
+            capture.expect_policy = true;
+            const authority = @import("../usermgr/mod.zig").row_policy_authority;
+            const signed = try authority.sign(alloc, "test-secret-at-least-32-bytes-long", "test", .{ .principal = "writer", .roles = &.{}, .auth_revision = 1 }, .{ .table_id = 7, .table = "rows", .database = "tenant-db", .policy_generation = 1, .catalog_epoch = 2, .access = .read, .purpose = .integrity }, 100);
+            defer alloc.free(signed);
+            capture.token = signed;
+            var authorized = (try lookupRemote(executor, alloc, "http://worker", 7, "rows", "row", .{ .include_primary_digest = true, .row_policy_principal_proof = signed, .row_policy_database = "tenant-db" }, .read_index)).?;
+            defer authorized.deinit(alloc);
+            try std.testing.expectEqual(@as(u64, 77), authorized.version);
+            capture.expect_policy = false;
             capture.mode = .missing;
             try std.testing.expectError(error.InvalidResponse, lookupRemote(executor, alloc, "http://worker", 7, "rows", "row", .{ .include_primary_digest = true }, .read_index));
             capture.mode = .invalid;

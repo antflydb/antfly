@@ -26,6 +26,9 @@ const max_table_bytes = 1024;
 const max_header_bytes = 8192;
 pub const max_wire_bytes = 48 + max_header_bytes + contract.Command.max_raft_wire_bytes;
 
+/// Source-local raw storage generation, not the +1 attestation epoch.
+/// A committed entry does not select a destination root: replay independently
+/// pins the receiver's visible generation and validates its persisted binding.
 const Header = struct { protocol: u16, table: []const u8, root_generation: u64 };
 
 fn hash(bytes: []const u8) [32]u8 {

@@ -26,14 +26,20 @@ pub const storage_backend_erased = @import("antfly_local_sources").storage_backe
 pub const lsm_backend = @import("antfly_local_sources").storage_lsm_backend;
 
 test {
+    _ = @import("api/transactions.zig");
     _ = sql_primary_key_rewrite_integration_test;
     _ = @import("api/sql_catalog.zig");
+    _ = @import("api/sql_catalog_campaign_test.zig");
+    _ = @import("api/sql_role_defaults_lifecycle_integration_test.zig");
     _ = @import("api/sql_nullability_lifecycle_integration_test.zig");
+    _ = @import("api/sql_schema_validation_lifecycle_integration_test.zig");
     _ = @import("api/sql_schema_lifecycle_integration_test.zig");
     _ = @import("api/sql_policy_lifecycle_integration_test.zig");
     _ = @import("api/sql_index_lifecycle_integration_test.zig");
     _ = @import("api/sql_view_lifecycle_integration_test.zig");
     _ = @import("api/sql_view_document_integration_test.zig");
+    _ = @import("api/sql_document_mutation_lifecycle_integration_test.zig");
+    _ = @import("api/sql_sequence_lifecycle_integration_test.zig");
     _ = @import("api/sql_expression_index_lifecycle_integration_test.zig");
     _ = @import("api/sql_default_lifecycle_integration_test.zig");
     _ = @import("api/sql_table_creation_integration_test.zig");

@@ -234,6 +234,8 @@ pub const public_operation_policies = [_]PublicOperationPolicy{
     .{ .operation_id = "listIndexes", .class = .none },
     .{ .operation_id = "getIndex", .class = .none },
     .{ .operation_id = "getIndexPublication", .class = .none },
+    .{ .operation_id = "getSchemaValidationPublication", .class = .none },
+    .{ .operation_id = "getNamespaceSchemaValidationPublication", .class = .none },
     .{ .operation_id = "createIndex", .class = .none },
     .{ .operation_id = "dropIndex", .class = .none },
     .{ .operation_id = "executeGraphMetricAction", .class = .none },

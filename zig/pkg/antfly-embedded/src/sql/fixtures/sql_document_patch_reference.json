@@ -1,6 +1,7 @@
 {
   "format": 1,
   "reference": "PostgreSQL JSONB with explicit Antfly patch extension",
+  "schema_mapping": "Arbitrary JSON document fields use unrestricted JSON Schema properties, not relational-only type=json declarations.",
   "seed_version": 42,
   "seeds": [
     {
@@ -55,6 +56,11 @@
         }
       },
       "affected": 1,
+      "sqlstate": null,
+      "untouched": [
+        "doc:b",
+        "doc:c"
+      ],
       "final": [
         {
           "key": "doc:a",
@@ -108,6 +114,11 @@
         }
       },
       "affected": 1,
+      "sqlstate": null,
+      "untouched": [
+        "doc:b",
+        "doc:c"
+      ],
       "final": [
         {
           "key": "doc:a",
@@ -161,6 +172,11 @@
         }
       },
       "affected": 1,
+      "sqlstate": null,
+      "untouched": [
+        "doc:b",
+        "doc:c"
+      ],
       "final": [
         {
           "key": "doc:a",
@@ -214,6 +230,10 @@
         }
       },
       "affected": 2,
+      "sqlstate": null,
+      "untouched": [
+        "doc:c"
+      ],
       "final": [
         {
           "key": "doc:a",
@@ -267,6 +287,11 @@
         }
       },
       "affected": 1,
+      "sqlstate": null,
+      "untouched": [
+        "doc:b",
+        "doc:c"
+      ],
       "final": [
         {
           "key": "doc:a",
@@ -320,6 +345,11 @@
         }
       },
       "affected": 1,
+      "sqlstate": null,
+      "untouched": [
+        "doc:b",
+        "doc:c"
+      ],
       "final": [
         {
           "key": "doc:a",
@@ -362,9 +392,7 @@
             "schema": {
               "type": "object",
               "properties": {
-                "metadata": {
-                  "type": "json"
-                }
+                "metadata": {}
               },
               "additionalProperties": true
             }
@@ -372,6 +400,11 @@
         }
       },
       "affected": 1,
+      "sqlstate": null,
+      "untouched": [
+        "doc:b",
+        "doc:c"
+      ],
       "final": [
         {
           "key": "doc:a",
@@ -416,9 +449,7 @@
             "schema": {
               "type": "object",
               "properties": {
-                "metadata": {
-                  "type": "json"
-                }
+                "metadata": {}
               },
               "additionalProperties": true
             }
@@ -426,6 +457,11 @@
         }
       },
       "affected": 1,
+      "sqlstate": null,
+      "untouched": [
+        "doc:b",
+        "doc:c"
+      ],
       "final": [
         {
           "key": "doc:a",
@@ -483,6 +519,11 @@
         }
       },
       "affected": 1,
+      "sqlstate": null,
+      "untouched": [
+        "doc:b",
+        "doc:c"
+      ],
       "final": [
         {
           "key": "doc:a",
@@ -515,6 +556,177 @@
           "value": {
             "note": "retained",
             "title": "Untouched"
+          }
+        }
+      ]
+    },
+    {
+      "id": "sql-0904",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      },
+      "affected": 0,
+      "sqlstate": "22023",
+      "untouched": [
+        "doc:a",
+        "doc:b",
+        "doc:c"
+      ],
+      "final": [
+        {
+          "key": "doc:a",
+          "value": {
+            "cold": [
+              1,
+              2,
+              3
+            ],
+            "title": "Before",
+            "metadata": {
+              "source": "api"
+            },
+            "obsolete": true
+          }
+        },
+        {
+          "key": "doc:b",
+          "value": {
+            "note": "preserved",
+            "title": "Other"
+          }
+        },
+        {
+          "key": "doc:c",
+          "value": {
+            "note": "retained",
+            "title": "Untouched"
+          }
+        }
+      ]
+    },
+    {
+      "id": "sql-0905",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      },
+      "affected": 2,
+      "sqlstate": null,
+      "untouched": [
+        "doc:c"
+      ],
+      "final": [
+        {
+          "key": "doc:a",
+          "value": {
+            "cold": [
+              1,
+              2,
+              3
+            ],
+            "title": "Launch",
+            "metadata": {
+              "source": "api"
+            },
+            "obsolete": true
+          }
+        },
+        {
+          "key": "doc:b",
+          "value": {
+            "note": "preserved",
+            "title": "Launch"
+          }
+        },
+        {
+          "key": "doc:c",
+          "value": {
+            "note": "retained",
+            "title": "Untouched"
+          }
+        }
+      ]
+    },
+    {
+      "id": "sql-0906",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      },
+      "affected": 3,
+      "sqlstate": null,
+      "untouched": [],
+      "final": [
+        {
+          "key": "doc:a",
+          "value": {
+            "cold": [
+              1,
+              2,
+              3
+            ],
+            "title": "Launch",
+            "metadata": {
+              "source": "api"
+            },
+            "obsolete": true
+          }
+        },
+        {
+          "key": "doc:b",
+          "value": {
+            "note": "preserved",
+            "title": "Launch"
+          }
+        },
+        {
+          "key": "doc:c",
+          "value": {
+            "note": "retained",
+            "title": "Launch"
           }
         }
       ]

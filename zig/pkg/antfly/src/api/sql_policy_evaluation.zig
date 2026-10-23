@@ -8,9 +8,10 @@
 //     https://www.antfly.io/licensing/ELv2-license
 //
 // Unless required by applicable law or agreed to in writing, software distributed
-// under the License is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR
-// CONDITIONS OF ANY KIND, either express or implied. See the License for the
-// specific language governing permissions and limitations.
+// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
+// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+// Elastic License 2.0 for the specific language governing permissions and
+// limitations.
 
 //! Immutable serving-policy evaluation for unpublished SQL session images.
 //! This uses the same typed policy evaluator as physical owners; it does not
@@ -30,10 +31,13 @@ pub const Evaluation = struct {
     principal: std.json.Parsed(authority.Payload),
     settings: settings.View,
     policies: policies.View,
+    context: operation.RequestContext,
+    cells: []local.sql_scalar.Datum,
     evaluators: [5]?policies.Evaluator = @splat(null),
     scratch: std.heap.ArenaAllocator,
 
-    pub fn init(alloc: std.mem.Allocator, server: *http.ApiHttpServer, context: operation.RequestContext, table: catalog.Table, caller: []const u8, token: []const u8) !*Evaluation {
+    pub fn init(alloc: std.mem.Allocator, server: *http.ApiHttpServer, context: operation.RequestContext, table: catalog.Table, caller: []const u8, token: []const u8, overlay: []const settings.OverlayEntry) !*Evaluation {
+        try context.ensureActive();
         const scope = table.scope orelse return error.InvalidSqlBackendResponse;
         var authenticated = context;
         authenticated.setting_read_principal = caller;
@@ -45,6 +49,7 @@ pub const Evaluation = struct {
         const self = try alloc.create(Evaluation);
         errdefer alloc.destroy(self);
         self.alloc = alloc;
+        self.context = context;
         self.table = table;
         self.principal = try authority.verify(alloc, server.cfg.trusted_principal_secret orelse return error.RowPolicyAuthenticationRequired, server.cfg.trusted_principal_issuer orelse return error.RowPolicyAuthenticationRequired, .{
             .table_id = table.id,
@@ -55,14 +60,18 @@ pub const Evaluation = struct {
         }, @intCast(@divFloor(@import("antfly_platform").time.realtimeNs(), std.time.ns_per_s)), token);
         errdefer self.principal.deinit();
         if (!std.mem.eql(u8, self.principal.value.principal, caller)) return error.RowPolicyAuthenticationRequired;
+        if (self.principal.value.purpose != table.row_policy_purpose) return error.RowPolicyAuthenticationRequired;
         const setting_principal = self.principal.value.setting_principal orelse caller;
         authenticated.setting_read_principal = setting_principal;
         var owner: SettingOwner = .{ .server = server, .context = authenticated };
-        self.settings = try settings.View.capture(alloc, .{ .ptr = &owner, .load = SettingOwner.load }, .{ .principal = setting_principal, .database = scope.database }, &.{});
+        self.settings = try settings.View.capture(alloc, .{ .ptr = &owner, .load = SettingOwner.load }, .{ .principal = setting_principal, .database = scope.database }, overlay);
         errdefer self.settings.deinit();
         try self.settings.pinSqlUser(caller);
         var policy_owner: PolicyOwner = .{ .bytes = bytes, .principal = setting_principal };
         self.policies = try policies.View.capture(alloc, .{ .ptr = &policy_owner, .load = PolicyOwner.load }, table, header.value.schema_digest, &self.settings);
+        errdefer self.policies.deinit();
+        self.cells = try alloc.alloc(local.sql_scalar.Datum, table.columns.len);
+        @memset(self.cells, .{});
         self.evaluators = @splat(null);
         self.scratch = .init(alloc);
         return self;
@@ -71,6 +80,7 @@ pub const Evaluation = struct {
     pub fn deinit(self: *Evaluation) void {
         for (&self.evaluators) |*value| if (value.*) |*evaluator| evaluator.deinit();
         self.scratch.deinit();
+        self.alloc.free(self.cells);
         self.policies.deinit();
         self.settings.deinit();
         self.principal.deinit();
@@ -78,14 +88,20 @@ pub const Evaluation = struct {
     }
 
     pub fn permits(self: *Evaluation, action: policies.Evaluator.Action, key: []const u8, value: std.json.Value, json_null_fields: []const []const u8) !bool {
+        try self.context.ensureActive();
         const index = @backingInt(action);
         if (self.evaluators[index] == null)
             self.evaluators[index] = try policies.Evaluator.initForAuthenticatedPrincipal(self.alloc, &self.policies, &self.settings, action, self.principal.value.policy_principal orelse self.principal.value.principal, self.principal.value.roles);
         const evaluator = &self.evaluators[index].?;
         _ = self.scratch.reset(.retain_capacity);
         const a = self.scratch.allocator();
-        const cells = try a.alloc(local.sql_scalar.Datum, self.table.columns.len);
-        @memset(cells, .{});
+        // Ordinals are schema-bound, but each command reads only its own
+        // dependency set. Reuse the directory and clear just populated slots;
+        // never zero/allocate a wide schema for every staged row.
+        const cells = self.cells;
+        defer for (evaluator.required_columns) |ordinal| {
+            cells[ordinal] = .{};
+        };
         const row: catalog.Row = .{ .id = key, .version = 0, .value = value };
         for (evaluator.required_columns) |ordinal| {
             const column = self.table.columns[ordinal];
@@ -112,6 +128,15 @@ pub const Evaluation = struct {
         if (!try self.permits(action, key, value, null_fields)) return false;
         return if (purpose.requiresSelectPermission()) self.permits(.select, key, value, null_fields) else true;
     }
+
+    pub fn overlayPolicy(self: *Evaluation) @import("sql_session_overlay.zig").Policy {
+        return .{ .ptr = self, .permits = struct {
+            fn run(ptr: *anyopaque, key: []const u8, value: std.json.Value, null_fields: []const []const u8) anyerror!bool {
+                const evaluation: *Evaluation = @ptrCast(@alignCast(ptr));
+                return evaluation.permitsScan(key, value, null_fields);
+            }
+        }.run };
+    }
 };
 
 const SettingOwner = struct {
@@ -121,7 +146,8 @@ const SettingOwner = struct {
         const self: *SettingOwner = @ptrCast(@alignCast(ptr));
         const bytes = try self.server.source.systemCatalog(alloc, self.context, .{ .setting_snapshot = scope });
         defer alloc.free(bytes);
-        return std.json.parseFromSliceLeaky(settings.RawSnapshot, alloc, bytes, .{ .allocate = .alloc_always });
+        const snapshot = try std.json.parseFromSliceLeaky(settings.RawSnapshot, alloc, bytes, .{ .allocate = .alloc_always });
+        return http.authorizeSqlRoleDefaults(self.server, alloc, snapshot);
     }
 };
 

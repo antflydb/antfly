@@ -23,13 +23,24 @@ pub const Column = struct {
     name: []const u8,
     path: []const u8,
     type: ast.ColumnType,
+    temporal_kind: ?@import("temporal_value.zig").Kind = null,
     element_type: ?@import("array_value.zig").ElementType = null,
     numeric_modifier: ?@import("../common/sql_builtin_type.zig").NumericModifier = null,
     nullable: bool = true,
+    /// Optional document properties that reject JSON null represent SQL NULL
+    /// by absence. Raw _doc values never pass through this assignment boundary.
+    document_null_is_absent: bool = false,
+
     /// Native stored generated columns are readable but never SQL assignable.
     generated: bool = false,
     /// Native row preparation fills absent DEFAULT cells after SQL evaluation.
     defaulted: bool = false,
+
+    pub fn assignStorageValue(self: Column, alloc: std.mem.Allocator, object: *std.json.ObjectMap, value: std.json.Value, sql_null: bool) !void {
+        if (sql_null and self.document_null_is_absent) {
+            _ = object.orderedRemove(self.path);
+        } else try object.put(alloc, self.path, value);
+    }
 
     /// Borrow one immutable native layout's complete SQL domain. Shared by
     /// query binding and installed RLS: unrelated array/numeric columns must
@@ -358,6 +369,9 @@ pub const Table = struct {
     physical_name: []const u8,
     schema_version: u32,
     storage_mode: enum { relational, document } = .relational,
+    /// A pinned custom TTL field owns the physical version when present.
+    /// Its absence/null falls back to the retained transaction write stamp.
+    version_field: ?[]const u8 = null,
     /// External bindings are read-only and pinned by the serving cursor.
     external_base_source: ?@import("../serverless/external_source/schema_binding.zig").OwnedExternalTableBinding = null,
     external_indexes: ?ExternalIndexes = null,
@@ -406,6 +420,14 @@ pub const Table = struct {
         if (self.storage_mode != .document) return false;
         const resolved = self.column(name) catch return false;
         return std.mem.eql(u8, resolved.name, "_version");
+    }
+
+    pub fn preparedVersion(self: Table, row: std.json.Value, fallback: u64) !u64 {
+        if (self.version_field) |field| if (row == .object) {
+            if (row.object.get(field)) |value| if (value != .null)
+                return @import("../schema/table_schema_impl.zig").parseTtlTimestampNs(value);
+        };
+        return fallback;
     }
 
     pub fn validateDocumentWriteColumns(self: Table, names: []const []const u8) !void {
@@ -619,6 +641,10 @@ pub const Scan = struct {
 pub const Row = struct {
     id: []const u8,
     version: u64,
+    /// A staged document exposes its prepared write stamp to SQL, while
+    /// version and expected_content_digest still fence the observed primary.
+    /// Never use the projected stamp as an optimistic concurrency predicate.
+    document_version: ?u64 = null,
     value: std.json.Value,
     index_cursor: ?[]const u8 = null,
     /// Digest of the exact primary bytes in this snapshot. Timestamps alone
@@ -741,7 +767,7 @@ pub const Row = struct {
     }
     pub fn cell(self: Row, name: []const u8) !Cell {
         if (std.mem.eql(u8, name, "_id")) return .{ .value = .{ .string = self.id }, .sql_null = false };
-        if (self.document_envelope and std.mem.eql(u8, name, "_version")) return Cell.json(.{ .integer = std.math.cast(i64, self.version) orelse return error.SqlNumericOutOfRange });
+        if (self.document_envelope and std.mem.eql(u8, name, "_version")) return Cell.json(.{ .integer = std.math.cast(i64, self.document_version orelse self.version) orelse return error.SqlNumericOutOfRange });
         if (std.mem.eql(u8, name, "_doc")) if (self.document) |document| {
             if (document != .object) return error.InvalidSqlBackendResponse;
             return Cell.json(document);
@@ -1172,6 +1198,58 @@ pub const DdlReceipt = struct {
     idempotency_key: ?[]const u8 = null,
     fk_generation_publication_id: ?[]const u8 = null,
     index_publication_token: ?[]const u8 = null,
+    schema_validation_token: ?[]const u8 = null,
+};
+
+/// Native catalog operations have no physical table/schema receipt. Identity
+/// integers stay native here and stringify as exact decimal strings on wire.
+pub const CatalogOperationReceipt = struct {
+    pub const Kind = enum { sequence };
+    pub const Operation = enum { create, alter, rename, drop };
+    pub const State = enum { committed, rejected, unknown };
+    pub const Diagnostic = struct { code: []const u8, message: []const u8, retryable: bool };
+    kind: Kind = .sequence,
+    operation: Operation,
+    database: []const u8,
+    namespace: []const u8,
+    name: []const u8,
+    state: State = .unknown,
+    recovery_token: []const u8,
+    object_id: ?u64 = null,
+    generation: ?u64 = null,
+    catalog_revision: ?u64 = null,
+    diagnostic: ?Diagnostic = null,
+
+    /// These four strings are owned by the result allocator. Result arenas
+    /// can reclaim them together; direct callers may release individually.
+    pub fn deinit(self: CatalogOperationReceipt, a: std.mem.Allocator) void {
+        a.free(self.database);
+        a.free(self.namespace);
+        a.free(self.name);
+        a.free(self.recovery_token);
+    }
+
+    pub fn jsonStringify(self: CatalogOperationReceipt, writer: anytype) !void {
+        // Match the generated HTTP model independently of the outer encoder's
+        // options: optional identity/diagnostic fields are absent, never null.
+        try writer.beginObject();
+        inline for (.{ "kind", "operation", "database", "namespace", "name", "state", "recovery_token" }) |field| {
+            try writer.objectField(field);
+            try writer.write(@field(self, field));
+        }
+        inline for (.{ "object_id", "generation", "catalog_revision" }) |field| {
+            if (@field(self, field)) |value| {
+                var buffer: [20]u8 = undefined;
+                try writer.objectField(field);
+                try writer.write(std.fmt.bufPrint(&buffer, "{d}", .{value}) catch unreachable);
+            }
+        }
+        if (self.diagnostic) |value| {
+            try writer.objectField("diagnostic");
+            try writer.write(value);
+        }
+        try writer.endObject();
+    }
 };
 /// Scratch must reclaim individual allocations; result may be an arena. DDL
 /// implementations reserve durable receipts in result before admission and
@@ -1185,7 +1263,7 @@ pub const DdlAllocators = struct {
     completion: Completion = .bounded,
 };
 
-pub const DdlOutcome = struct { mutation_outcome: ?MutationOutcome = .committed, receipt: ?DdlReceipt = null };
+pub const DdlOutcome = struct { mutation_outcome: ?MutationOutcome = .committed, receipt: ?DdlReceipt = null, catalog_receipt: ?CatalogOperationReceipt = null };
 
 pub const ScanQuota = @import("native_scan_quota.zig").Quota;
 
@@ -1273,6 +1351,10 @@ pub const Backend = struct {
     /// Neither is populated from SQL parameters, request JSON or cached plans.
     clock_source: ?Clock.Source = null,
     transaction_start: ?Clock.Instant = null,
+    /// Capability for planning is distinct from an execution-owned stamp.
+    /// A prepared plan must never retain another transaction's write version.
+    supports_write_versions: bool = false,
+    write_version: ?u64 = null,
     /// Value-owned by this statement/cursor. Child adapters copy it unchanged.
     statement_clock: ?Clock.View = null,
     /// Immutable typed precision slots borrowed from the result/cursor owner.

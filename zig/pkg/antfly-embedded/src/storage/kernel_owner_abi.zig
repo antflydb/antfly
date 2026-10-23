@@ -19,7 +19,7 @@
 const failure_abi = @import("runtime_failure_abi");
 
 // Storage layouts evolve independently of the shared failure envelope.
-pub const abi_version: u32 = 100;
+pub const abi_version: u32 = 105;
 pub const Status = failure_abi.Status;
 pub const FailureBoundary = failure_abi.FailureBoundary;
 pub const FailureIdentity = failure_abi.FailureIdentity;
@@ -602,6 +602,9 @@ pub const MetadataProjectionKind = enum(u32) {
     resolver_projection_valid = 71,
     /// Opaque binary AFSC bytes (empty = absent), unlike JSON projections.
     secret_collection = 42,
+    /// Raw binary schema-publication command; read-only preflight returns JSON
+    /// acceptance intent. No ASVI frame is escaped into a JSON envelope.
+    schema_validation_preflight = 72,
 };
 
 pub const MetadataHABindRequest = extern struct {
@@ -740,6 +743,7 @@ pub const DataApplyPreparedSnapshotResult = extern struct {
     _reserved0: u32 = 0,
     path: OwnedBytes = .{},
     size: u64 = 0,
+    application_manifest: OwnedBytes = .{},
 };
 
 pub const DataApplyGroupRequest = extern struct {
@@ -784,6 +788,8 @@ pub const DataApplyProjectionKind = enum(u32) {
     group_state_keys_page = 7,
     topology_rejection = 8,
     merge_membership = 9,
+    /// Raw retained normal entry; after_sequence=index, through_sequence=term.
+    committed_normal_entry = 10,
 };
 
 /// One bounded projection read. Fields unused by `kind` must remain zero.
@@ -1354,10 +1360,17 @@ pub extern fn antfly_storage_owner_apply_raft_schema_control(
 /// owner generation. Only one outstanding preparation per owner is admitted.
 /// Call destroy on the control lane BEFORE closing/releasing that owner. The
 /// prepare request's callbacks are borrowed only for the prepare invocation.
+pub const RaftSchemaOwnerPreparationResult = extern struct {
+    version: u32 = abi_version,
+    _reserved: u32 = 0,
+    prepared: ?*anyopaque = null,
+    root_generation: u64 = 0,
+    physical_root_incarnation_le: [16]u8 = @splat(0),
+};
 pub extern fn antfly_storage_owner_prepare_raft_schema_control(
     owner: ?*anyopaque,
     request: *const RaftSchemaOwnerApplyRequest,
-    out_prepared: *?*anyopaque,
+    out_prepared: *RaftSchemaOwnerPreparationResult,
     out_failure: *FailureIdentity,
 ) callconv(.c) Status;
 
@@ -1393,6 +1406,105 @@ pub extern fn antfly_storage_owner_native_schema_observation_json(
     owner: ?*anyopaque,
     request: *const NativeSchemaOwnerObservationRequest,
     out_response: *OwnedBytes,
+) callconv(.c) Status;
+
+/// Actual committed owner observation; no request watermark or root identity.
+/// ABI 98 also decodes the terminal schema-publication release control.
+pub const RaftSchemaOwnerObservationRequest = extern struct {
+    pub const operation: u32 = 8;
+    version: u32 = abi_version,
+    table_name: BorrowedBytes = .{},
+    binding_json: BorrowedBytes = .{},
+    control: ControlledJsonOperationRequest = .{},
+};
+pub extern fn antfly_storage_owner_raft_schema_observation_json(
+    owner: ?*anyopaque,
+    request: *const RaftSchemaOwnerObservationRequest,
+    out_response: *OwnedBytes,
+    out_failure: *FailureIdentity,
+) callconv(.c) Status;
+
+/// Trusted native owner control. Descriptor and raw immutable payload are
+/// separate so schema-sized inputs never become JSON/base64 byte arrays.
+/// Empty page payload asks the owner to prepare one bounded page locally.
+pub const NativeSchemaOwnerControlRequest = extern struct {
+    pub const operation: u32 = 9;
+    version: u32 = abi_version,
+    records: u32 = 1024,
+    time_ns: u64 = 5_000_000,
+    table_name: BorrowedBytes = .{},
+    descriptor_json: BorrowedBytes = .{},
+    payload: BorrowedBytes = .{},
+    control: ControlledJsonOperationRequest = .{},
+};
+/// Read-only independently compiled candidate and actual owner cut. Raw ASVI
+/// inputs are separate from the bounded descriptor, never JSON/base64 arrays.
+pub const SchemaOwnerPreparationRequest = extern struct {
+    pub const operation: u32 = 10;
+    version: u32 = abi_version,
+    table_name: BorrowedBytes = .{},
+    descriptor_json: BorrowedBytes = .{},
+    inputs: BorrowedBytes = .{},
+    control: ControlledJsonOperationRequest = .{},
+};
+/// Read-only preparation of a deterministic Raft page/debt command. No term,
+/// index, row payload or caller-selected commit position is accepted.
+pub const SchemaOwnerProposalRequest = extern struct {
+    pub const operation: u32 = 12;
+    version: u32 = abi_version,
+    records: u32 = 1024,
+    time_ns: u64 = 5_000_000,
+    table_name: BorrowedBytes = .{},
+    descriptor_json: BorrowedBytes = .{},
+    control: ControlledJsonOperationRequest = .{},
+};
+pub const SchemaOwnerProposalResult = extern struct {
+    version: u32 = abi_version,
+    _reserved: u32 = 0,
+    root_generation: u64 = 0,
+    physical_root_incarnation_le: [16]u8 = @splat(0),
+    /// Owned raw ASVR bytes, not JSON/base64. Empty means reconciliation has
+    /// no outstanding page; the caller must reobserve, never invent progress.
+    command: OwnedBytes = .{},
+};
+pub extern fn antfly_storage_owner_prepare_schema_proposal(
+    owner: ?*anyopaque,
+    request: *const SchemaOwnerProposalRequest,
+    out_response: *SchemaOwnerProposalResult,
+    out_failure: *FailureIdentity,
+) callconv(.c) Status;
+pub extern fn antfly_storage_owner_schema_preparation_json(
+    owner: ?*anyopaque,
+    request: *const SchemaOwnerPreparationRequest,
+    out_response: *OwnedBytes,
+    out_failure: *FailureIdentity,
+) callconv(.c) Status;
+/// Bounded full-image audit. Only the trusted owner adapter selects the local
+/// signing root; raw immutable inputs never become JSON/base64 byte arrays.
+pub const SchemaOwnerAuditRequest = extern struct {
+    pub const operation: u32 = 11;
+    version: u32 = abi_version,
+    records: u32 = 1024,
+    time_ns: u64 = 5_000_000,
+    table_name: BorrowedBytes = .{},
+    binding_json: BorrowedBytes = .{},
+    inputs: BorrowedBytes = .{},
+    signing_root_dir: BorrowedBytes = .{},
+    signing_root_incarnation_le: [16]u8 = @splat(0),
+    control: ControlledJsonOperationRequest = .{},
+};
+pub extern fn antfly_storage_owner_schema_audit_json(
+    owner: ?*anyopaque,
+    request: *const SchemaOwnerAuditRequest,
+    out_response: *OwnedBytes,
+    out_failure: *FailureIdentity,
+) callconv(.c) Status;
+
+pub extern fn antfly_storage_owner_native_schema_control_json(
+    owner: ?*anyopaque,
+    request: *const NativeSchemaOwnerControlRequest,
+    out_response: *OwnedBytes,
+    out_failure: *FailureIdentity,
 ) callconv(.c) Status;
 
 pub extern fn antfly_storage_owner_native_fk_generation_control_json(

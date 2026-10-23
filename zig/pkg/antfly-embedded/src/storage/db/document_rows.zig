@@ -30,6 +30,7 @@ const scalar = @import("../../sql/scalar.zig");
 const View = @import("../relational_read_view.zig").View;
 
 pub const Session = struct {
+    preparation_runtime: ?@import("../../schema/relational_expression.zig").PreparationRuntime = null,
     row_policy_lease: ?@import("row_policy_gate.zig").Gate.Lease = null,
     range_proofs: ?[]const @import("../range_protection.zig").Proof = null,
     alloc: std.mem.Allocator,
@@ -190,7 +191,8 @@ pub const Session = struct {
             };
             var authoritative_nulls: ?[]const []const u8 = null;
             if (self.schema) |view| if (view.validator()) |validator| {
-                const prepared = try validator.prepareTypedValueWithNulls(temporary, temporary, &value, write.json_null_fields, false);
+                const preparation = if (self.preparation_runtime) |runtime| validator.forPreparation(runtime) else validator;
+                const prepared = try preparation.prepareTypedValueWithNulls(temporary, temporary, &value, write.json_null_fields, false);
                 authoritative_nulls = prepared.fields;
             };
             var null_set: std.StringHashMapUnmanaged(void) = .empty;

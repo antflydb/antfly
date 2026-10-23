@@ -91,7 +91,7 @@ test "retained read admission is independent of RLS primary lookup and fails clo
 pub const max_response_bytes = 32 << 20;
 pub const max_lease_ms: u32 = 30_000;
 pub const Request = struct {
-    operation: enum { admit, capture, validate, snapshot, open, open_snapshot, next, normalize, range_proofs, close, cancel },
+    operation: enum { admit, capture, validate, snapshot, open, open_snapshot, next, normalize, range_proofs, close, cancel, renew_snapshot },
     schema_version: u32,
     token: ?registry.Token = null,
     connection: u128 = 0,
@@ -177,6 +177,15 @@ pub fn executeWithCodec(alloc: std.mem.Allocator, owner: owner_mod.Owner, scope:
             const token = try owner.captureSnapshot(scope, input.token orelse return error.InvalidRetainedReadToken, input.connection, deadline);
             errdefer owner.registry.close(token, scope) catch {};
             return encode(alloc, .{ .token = token });
+        },
+        .renew_snapshot => {
+            // Build the acknowledgement before mutation: allocation failure
+            // must not extend a lease the caller could not observe. No native
+            // work or cursor advancement is replayed by this operation.
+            const response = try encode(alloc, .{});
+            errdefer alloc.free(response);
+            try owner.registry.renewSnapshot(input.token orelse return error.InvalidRetainedReadToken, scope, input.connection, time.monotonicNs(), deadline);
+            return response;
         },
         .open => {
             const token = try owner.open(scope, input.token orelse return error.InvalidRetainedReadToken, input.connection, input.from, input.to, .{

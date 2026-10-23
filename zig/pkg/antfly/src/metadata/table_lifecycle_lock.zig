@@ -20,7 +20,7 @@
 //! before admission; supporting decoding does not enable a public operation.
 const std = @import("std");
 pub const Id = [16]u8;
-pub const Kind = enum(u8) { generation = 1, initial_support = 2, index_build = 3 };
+pub const Kind = enum(u8) { generation = 1, initial_support = 2, index_build = 3, schema_validation = 4 };
 pub const encoded_len = 17;
 const all_prefix = "\x00\x00__metadata__:fk_generation_table_lock:";
 pub fn allGroupsPrefix() []const u8 {
@@ -38,6 +38,12 @@ pub fn groupFromKey(storage_key: []const u8) !?u64 {
     if (group == 0 or table == 0 or !std.mem.eql(u8, group_bytes, try std.fmt.bufPrint(&buf, "{d}", .{group})) or
         !std.mem.eql(u8, table_bytes, try std.fmt.bufPrint(&buf, "{d}", .{table}))) return error.InvalidCatalogRecord;
     return group;
+}
+
+pub fn tableFromKey(storage_key: []const u8) !?u64 {
+    if (try groupFromKey(storage_key) == null) return null;
+    const split = std.mem.lastIndexOfScalar(u8, storage_key, ':') orelse return error.InvalidCatalogRecord;
+    return std.fmt.parseInt(u64, storage_key[split + 1 ..], 10) catch return error.InvalidCatalogRecord;
 }
 
 // Keep the original durable namespace: all schema/topology writers must see
@@ -103,7 +109,7 @@ pub fn release(txn: anytype, group_id: u64, table_id: u64, lock: Lock) !void {
 
 test "table lifecycle lock preserves legacy wire and rejects malformed future identities" {
     const id: Id = @splat(7);
-    for ([_]Kind{ .generation, .initial_support, .index_build }) |kind| {
+    for ([_]Kind{ .generation, .initial_support, .index_build, .schema_validation }) |kind| {
         const encoded = value(kind, id);
         try std.testing.expectEqual(@backingInt(kind), encoded[0]);
         try std.testing.expectEqualSlices(u8, &id, encoded[1..]);

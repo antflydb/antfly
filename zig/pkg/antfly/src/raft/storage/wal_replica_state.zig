@@ -88,7 +88,7 @@ const DeltaRecordKind = enum(u8) {
     conf_state = 2,
 };
 
-const SnapshotIdentity = struct { index: u64, term: u64 };
+const SnapshotIdentity = snapshot_payload_store.SnapshotIdentity;
 
 fn snapshotIdentity(metadata: raft_engine.core.types.SnapshotMetadata) SnapshotIdentity {
     return .{ .index = metadata.index, .term = metadata.term };
@@ -114,6 +114,9 @@ pub const WalReplicaState = struct {
     durable_completed_applied_index: raft_engine.core.types.Index = 0,
     durable_hard_state: raft_engine.core.types.HardState = .{},
     durable_last_index: raft_engine.core.types.Index = 0,
+    durable_snapshot: snapshot_payload_store.SnapshotIdentity = .{},
+    durable_snapshot_receipt: ?snapshot_payload_store.PayloadReceipt = null,
+    prepared_snapshot_receipt: ?snapshot_payload_store.PayloadReceipt = null,
     append_in_progress: bool = false,
     async_enabled: bool = false,
     cleanup_snapshot: ?SnapshotIdentity = null,
@@ -184,8 +187,37 @@ pub const WalReplicaState = struct {
         try self.load();
         try self.store.validate();
         try self.validateDurableSnapshotPayload();
+        self.durable_snapshot = snapshotIdentity(self.store.snapshot_state.metadata);
+        self.durable_snapshot_receipt = self.prepared_snapshot_receipt;
         self.cleanupOrphanSnapshotPayloads();
         return self;
+    }
+
+    pub fn retainPublishedSnapshot(self: *WalReplicaState, expected: snapshot_payload_store.SnapshotIdentity, reference: [32]u8) !snapshot_payload_store.RetainedSnapshot {
+        return self.retainPublishedSnapshotAlloc(self.alloc, expected, reference);
+    }
+
+    /// Caller serializes checkpoint publication; this is a small owned value,
+    /// never a reference into a provider that may retire after unlock.
+    pub fn publishedSnapshotReceipt(self: *WalReplicaState, expected: snapshot_payload_store.SnapshotIdentity) !snapshot_payload_store.PayloadReceipt {
+        if (self.append_in_progress) return error.ReplicaPersistenceBusy;
+        if (expected.index == 0 or expected.index != self.durable_snapshot.index or expected.term != self.durable_snapshot.term) return error.SnapshotNotPublished;
+        const receipt = self.durable_snapshot_receipt orelse return error.SnapshotNotPublished;
+        if (!std.meta.eql(receipt.identity, expected)) return error.SnapshotNotPublished;
+        return receipt;
+    }
+
+    pub fn requireSnapshotMetadata(self: *WalReplicaState, group: u64, expected: snapshot_payload_store.SnapshotIdentity, digest: ?[32]u8) !void {
+        _ = try self.publishedSnapshotReceipt(expected);
+        if (digest) |value| {
+            const metadata = self.store.snapshot_state.metadata;
+            if (metadata.index != expected.index or metadata.term != expected.term or
+                !std.mem.eql(u8, &value, &try @import("snapshot_metadata.zig").digest(group, metadata))) return error.SnapshotPayloadIdentityConflict;
+        }
+    }
+
+    pub fn retainPublishedSnapshotAlloc(self: *WalReplicaState, alloc: std.mem.Allocator, expected: snapshot_payload_store.SnapshotIdentity, reference: [32]u8) !snapshot_payload_store.RetainedSnapshot {
+        return snapshot_payload_store.retainPublished(alloc, self.io_impl.io(), self.layout.snapshot_dir, try self.publishedSnapshotReceipt(expected), reference);
     }
 
     pub fn deinit(self: *WalReplicaState) void {
@@ -334,6 +366,7 @@ pub const WalReplicaState = struct {
         truncate_ns: u64 = 0,
         watermark_ns: u64 = 0,
         published: bool = false,
+        payload_receipt: ?snapshot_payload_store.PayloadReceipt = null,
         wake: ?storage_iface.PersistenceWake,
 
         fn run(task: *@This()) void {
@@ -352,8 +385,8 @@ pub const WalReplicaState = struct {
                 const started = nowNs();
                 defer task.snapshot_ns = elapsedSince(started);
                 if (task.artifact) |artifact| {
-                    try snapshot_payload_store.writeArtifactAtomically(owner.alloc, owner.io_impl.io(), owner.layout.snapshot_dir, snapshot.metadata.index, snapshot.metadata.term, artifact);
-                } else try owner.publishSnapshotPayload(snapshot);
+                    task.payload_receipt = try snapshot_payload_store.writeArtifactWithReceipt(owner.alloc, owner.io_impl.io(), owner.layout.snapshot_dir, snapshot.metadata.index, snapshot.metadata.term, artifact);
+                } else task.payload_receipt = try snapshot_payload_store.writeWithReceipt(owner.alloc, owner.io_impl.io(), owner.layout.snapshot_dir, snapshot.metadata.index, snapshot.metadata.term, snapshot.data);
             }
             if (task.encoded.len != 0) {
                 const lsn = blk: {
@@ -423,6 +456,11 @@ pub const WalReplicaState = struct {
             }
             owner.durable_hard_state = owner.store.hard_state;
             owner.durable_last_index = try owner.store.storage().lastIndex();
+            if (task.snapshot) |snapshot| {
+                owner.durable_snapshot = snapshotIdentity(snapshot.metadata);
+                owner.prepared_snapshot_receipt = task.payload_receipt;
+                owner.durable_snapshot_receipt = task.payload_receipt;
+            }
             owner.stats.encoded_bytes += task.encoded.len;
             owner.stats.wal_append_ns += task.append_ns;
             owner.stats.wal_truncate_ns += task.truncate_ns;
@@ -560,7 +598,7 @@ pub const WalReplicaState = struct {
         if (self.append_in_progress) return error.ReplicaPersistenceBusy;
         const previous = snapshotIdentity(self.store.snapshot_state.metadata);
         const started_ns = nowNs();
-        try snapshot_payload_store.writeArtifactAtomically(
+        self.prepared_snapshot_receipt = try snapshot_payload_store.writeArtifactWithReceipt(
             self.alloc,
             self.io_impl.io(),
             self.layout.snapshot_dir,
@@ -632,6 +670,8 @@ pub const WalReplicaState = struct {
         self.durable_hard_state = self.store.hard_state;
         self.durable_last_index = try self.store.storage().lastIndex();
         if (previous_snapshot) |previous| {
+            self.durable_snapshot = snapshotIdentity(ready.snapshot.?.metadata);
+            self.durable_snapshot_receipt = self.prepared_snapshot_receipt;
             self.deleteSupersededSnapshotPayload(previous, snapshotIdentity(ready.snapshot.?.metadata));
         }
     }
@@ -688,7 +728,7 @@ pub const WalReplicaState = struct {
     }
 
     fn publishSnapshotPayload(self: *WalReplicaState, snapshot: raft_engine.core.types.Snapshot) !void {
-        try snapshot_payload_store.writeAtomically(
+        self.prepared_snapshot_receipt = try snapshot_payload_store.writeWithReceipt(
             self.alloc,
             self.io_impl.io(),
             self.layout.snapshot_dir,
@@ -728,7 +768,7 @@ pub const WalReplicaState = struct {
             return;
         }
         if (snapshot.data.len != 0) return error.InvalidReplicaState;
-        try snapshot_payload_store.validate(
+        self.prepared_snapshot_receipt = try snapshot_payload_store.validateWithReceipt(
             self.alloc,
             self.io_impl.io(),
             self.layout.snapshot_dir,
@@ -930,6 +970,10 @@ pub const WalReplicaState = struct {
 
     fn persistCheckpoint(self: *WalReplicaState) !void {
         try self.persist(.checkpoint);
+        self.durable_snapshot = snapshotIdentity(self.store.snapshot_state.metadata);
+        if (self.prepared_snapshot_receipt) |receipt| {
+            if (std.meta.eql(receipt.identity, self.durable_snapshot)) self.durable_snapshot_receipt = receipt;
+        }
         self.durable_hard_state = self.store.hard_state;
         self.durable_last_index = try self.store.storage().lastIndex();
         self.durable_applied_index = self.applied_index;
@@ -1682,6 +1726,53 @@ test "wal replica state persists snapshots across reopen" {
         try std.testing.expectEqual(@as(u64, 11), snapshot.metadata.index);
         try std.testing.expectEqualStrings("snap", snapshot.data);
     }
+}
+
+test "wal replica snapshot retention requires checkpoint publication and survives supersession" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/wal-retained", .{tmp.sub_path});
+    defer alloc.free(root);
+    var layout = try storage_mod.ReplicaPathLayout.initForReplica(alloc, root, 194, 4);
+    defer layout.deinit(alloc);
+    const old: SnapshotIdentity = .{ .index = 5, .term = 2 };
+    const next: SnapshotIdentity = .{ .index = 6, .term = 3 };
+    const reference: [32]u8 = @splat(7);
+    {
+        var state = try WalReplicaState.init(alloc, layout, .{});
+        defer state.deinit();
+        try std.testing.expectError(error.SnapshotNotPublished, state.retainPublishedSnapshot(old, reference));
+        try state.groupStorage().persistReady(194, .{ .snapshot = .{ .metadata = .{ .index = old.index, .term = old.term }, .data = @constCast("old") } });
+        state.prepared_snapshot_receipt = try snapshot_payload_store.writeWithReceipt(alloc, std.testing.io, layout.snapshot_dir, next.index, next.term, "next");
+        try state.store.applySnapshot(.{ .metadata = .{ .index = next.index, .term = next.term } });
+        {
+            var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
+            state.alloc = failing.allocator();
+            defer state.alloc = alloc;
+            try std.testing.expectError(error.OutOfMemory, state.persistCheckpoint());
+        }
+        try std.testing.expectError(error.SnapshotNotPublished, state.retainPublishedSnapshot(next, @splat(8)));
+        var retained = try state.retainPublishedSnapshot(old, reference);
+        defer retained.deinit(alloc);
+        // Maintenance publication never overlaps a pending async append.
+        state.append_in_progress = true;
+        try std.testing.expectError(error.ReplicaPersistenceBusy, state.retainPublishedSnapshot(old, reference));
+        state.append_in_progress = false;
+        try state.persistCheckpoint();
+        try std.testing.expectError(error.SnapshotNotPublished, state.retainPublishedSnapshot(old, @splat(9)));
+        try std.testing.expectError(error.SnapshotPayloadIdentityMismatch, state.retainPublishedSnapshot(next, reference));
+        snapshot_payload_store.delete(alloc, std.testing.io, layout.snapshot_dir, old.index, old.term);
+    }
+    var reopened = try WalReplicaState.init(alloc, layout, .{});
+    defer reopened.deinit();
+    var current = try reopened.retainPublishedSnapshot(next, @splat(8));
+    defer current.deinit(alloc);
+    var recovered = try snapshot_payload_store.readRetained(alloc, std.testing.io, layout.snapshot_dir, reference, old);
+    defer recovered.deinit(alloc);
+    try snapshot_payload_store.releaseRetained(alloc, std.testing.io, layout.snapshot_dir, recovered);
+    try snapshot_payload_store.releaseRetained(alloc, std.testing.io, layout.snapshot_dir, recovered);
+    try snapshot_payload_store.releaseRetained(alloc, std.testing.io, layout.snapshot_dir, current);
 }
 
 test "wal replica state persists applied watermark in sidecar and replays only unapplied suffix" {
@@ -2749,8 +2840,12 @@ test "wal replica state async incoming snapshot owns payload and gates installat
         }, null)).?;
         bytes[0] = 'X';
         try std.testing.expectEqual(@as(u64, 0), try state.storage().lastIndex());
+        try std.testing.expectError(error.ReplicaPersistenceBusy, state.retainPublishedSnapshot(.{ .index = 5, .term = 2 }, @splat(11)));
         try awaitPersistence(operation);
         operation.deinit();
+        var retained = try state.retainPublishedSnapshot(.{ .index = 5, .term = 2 }, @splat(11));
+        defer retained.deinit(std.testing.allocator);
+        try snapshot_payload_store.releaseRetained(std.testing.allocator, std.testing.io, layout.snapshot_dir, retained);
         try std.testing.expectEqual(@as(u64, 5), try state.storage().lastIndex());
         try std.testing.expectEqual(@as(u64, 0), state.completedAppliedIndex());
     }

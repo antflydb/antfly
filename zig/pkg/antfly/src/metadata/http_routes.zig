@@ -67,6 +67,7 @@ pub const Routes = struct {
     pub const internal_node_status_suffix = "/status";
     pub const internal_schema_progress_batch = "/internal/v1/schema-progress/batch";
     pub const internal_schema_progress = "/internal/v1/schema-progress";
+    pub const internal_schema_validation = "/internal/v1/schema-validation";
     pub const internal_restore_progress = "/internal/v1/restore-progress";
     pub const internal_restore_progress_sync = "/internal/v1/restore-progress/sync";
     pub const internal_restore_progress_remove = "/internal/v1/restore-progress/remove";

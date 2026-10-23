@@ -16,7 +16,7 @@
 //! Canonical failure contract shared by every internal compiled runtime ABI.
 //! Keep this module free of storage, inference, and control-runtime imports.
 
-pub const abi_version: u32 = 68;
+pub const abi_version: u32 = 71;
 
 /// Stable semantic identities used for control flow across compiled runtime
 /// boundaries. Values are append-only. Distinct expected domain failures must
@@ -840,6 +840,17 @@ pub const Status = enum(u32) {
     sql_program_limit_exceeded = 881,
     relational_check_violation = 882,
     foreign_key_match_full_violation = 883,
+    conflicting_data_apply_batch = 884,
+    invalid_data_apply_batch = 885,
+    split_source_projection_not_ready = 886,
+    apply_store_group_retired = 887,
+    apply_store_shutting_down = 888,
+    schema_validation_command_rejected = 889,
+    schema_validation_preparation_changed = 890,
+    corrupt_schema_apply_outcome = 891,
+    invalid_native_backup_origin = 892,
+    native_backup_origin_mismatch = 893,
+    sequence_catalog_state_required = 894,
 };
 
 /// Lossless failure metadata for compiled operation and per-item boundaries.
@@ -882,7 +893,9 @@ pub const FailureIdentity = extern struct {
 test "concurrent main and SQL statuses retain distinct wire identities" {
     const std_test = @import("std");
     try std_test.testing.expectEqual(@as(u32, 778), @backingInt(Status.seed_replica_policy_mismatch));
-    try std_test.testing.expectEqual(@as(u32, 779), @backingInt(Status.catalog_occupancy_not_ready));
+    try std_test.testing.expectEqual(@as(u32, 779), @backingInt(Status.document_artifact_publication_failed));
+    try std_test.testing.expectEqual(@as(u32, 834), @backingInt(Status.grouped_source_owner_changed));
+    try std_test.testing.expectEqual(@as(u32, 837), @backingInt(Status.catalog_occupancy_not_ready));
 }
 
 test "released native value search Status identifiers retain their numeric values" {
@@ -897,7 +910,7 @@ test "released main Status identifiers retain their exact names and numeric valu
     var fingerprint: u64 = 14695981039346656037;
     var count: usize = 0;
     inline for (@typeInfo(Status).@"enum".field_names, @typeInfo(Status).@"enum".field_values) |reflected_name, field_value| {
-        if (field_value <= 532) {
+        if (field_value <= 834) {
             for (reflected_name) |byte| fingerprint = (fingerprint ^ byte) *% 1099511628211;
             var encoded: [4]u8 = undefined;
             std_test.mem.writeInt(u32, &encoded, @intCast(field_value), .little);
@@ -905,6 +918,6 @@ test "released main Status identifiers retain their exact names and numeric valu
             count += 1;
         }
     }
-    try std_test.testing.expectEqual(@as(usize, 464), count);
-    try std_test.testing.expectEqual(@as(u64, 0x6c3bb5270c6956ea), fingerprint);
+    try std_test.testing.expectEqual(@as(usize, 765), count);
+    try std_test.testing.expectEqual(@as(u64, 0x1e43ab13434dd2d7), fingerprint);
 }

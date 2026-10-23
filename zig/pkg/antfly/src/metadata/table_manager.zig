@@ -70,6 +70,7 @@ pub const TableDefinition = TableRecord;
 
 pub fn tableDefinitionsEqual(lhs: TableDefinition, rhs: TableDefinition) bool {
     return std.meta.eql(lhs.schema_reader_requirements, rhs.schema_reader_requirements) and
+        (if (lhs.full_text_read_index) |name| if (rhs.full_text_read_index) |other| std.mem.eql(u8, name, other) else false else rhs.full_text_read_index == null) and
         @import("antfly_local_sources").common_vector_migration.admissionsEqual(lhs.storage_migration, rhs.storage_migration) and
         lhs.storage.engine == rhs.storage.engine and
         lhs.object_storage_generation == rhs.object_storage_generation and

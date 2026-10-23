@@ -25,6 +25,7 @@ const Budget = @import("antfly_local_sources").sql_memory_budget;
 const Layout = struct {
     version: u32 = 0,
     storage_mode: @FieldType(catalog.Table, "storage_mode") = .relational,
+    version_field: ?[]const u8 = null,
     external_base_source: ?@import("antfly_local_sources").serverless_external_source_schema_binding.OwnedExternalTableBinding = null,
     columns: []const catalog.Column = &.{},
     indexes: []const catalog.Index = &.{},
@@ -32,7 +33,7 @@ const Layout = struct {
     constraints: []const catalog.Constraint = &.{},
 
     fn table(self: Layout, id: u64, physical_name: []const u8) catalog.Table {
-        return .{ .id = id, .physical_name = physical_name, .schema_version = self.version, .storage_mode = self.storage_mode, .external_base_source = self.external_base_source, .columns = self.columns, .indexes = self.indexes, .index_definitions = self.index_definitions, .constraints = self.constraints };
+        return .{ .id = id, .physical_name = physical_name, .schema_version = self.version, .storage_mode = self.storage_mode, .version_field = self.version_field, .external_base_source = self.external_base_source, .columns = self.columns, .indexes = self.indexes, .index_definitions = self.index_definitions, .constraints = self.constraints };
     }
 };
 const Entry = struct {
@@ -115,7 +116,7 @@ pub const Cache = struct {
             out.* = constraint;
             out.name = try alloc.dupe(u8, constraint.name);
         }
-        return .{ .external_base_source = if (entry.layout.external_base_source) |source| try @import("antfly_local_sources").serverless_external_source_schema_binding.cloneAlloc(alloc, source) else null, .id = id, .physical_name = physical_name, .schema_version = entry.layout.version, .storage_mode = entry.layout.storage_mode, .columns = columns, .indexes = indexes, .index_definitions = definitions, .constraints = constraints };
+        return .{ .external_base_source = if (entry.layout.external_base_source) |source| try @import("antfly_local_sources").serverless_external_source_schema_binding.cloneAlloc(alloc, source) else null, .id = id, .physical_name = physical_name, .schema_version = entry.layout.version, .storage_mode = entry.layout.storage_mode, .version_field = if (entry.layout.version_field) |field| try alloc.dupe(u8, field) else null, .columns = columns, .indexes = indexes, .index_definitions = definitions, .constraints = constraints };
     }
     fn acquire(self: *Cache, io: std.Io, scratch: std.mem.Allocator, json: []const u8, limit: usize) !*Entry {
         var digest: [32]u8 = undefined;
@@ -186,6 +187,30 @@ pub const Cache = struct {
     }
 };
 
+test "SQL schema cache owns custom version fields through cache hits and owner release" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    var cache = Cache.init(a);
+    var live = true;
+    defer if (live) cache.deinit();
+    const json = "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"ttl\":{\"duration\":\"1s\",\"field\":\"expires\"},\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{},\"additionalProperties\":true}}}}";
+    var tables: [2]catalog.Table = undefined;
+    for (&tables) |*table| table.* = try cache.resolve(std.testing.io, arena.allocator(), json, 7, "docs");
+    for (cache.slots) |slot| if (slot.entry) |entry| for (tables) |table| {
+        try std.testing.expect(table.version_field.?.ptr != entry.layout.version_field.?.ptr);
+    };
+    cache.deinit();
+    live = false;
+    var root: std.json.ObjectMap = .empty;
+    try root.put(arena.allocator(), "expires", .{ .integer = 123 });
+    for (tables) |table| {
+        try std.testing.expectEqualStrings("expires", table.version_field.?);
+        try std.testing.expectEqual(@as(u64, 123), try table.preparedVersion(.{ .object = root }, 456));
+        try std.testing.expectEqual(@as(u64, 456), try table.preparedVersion(.{ .object = .empty }, 456));
+    }
+}
+
 fn derive(layout: *Layout, json: []const u8, temporary: std.mem.Allocator, owned: std.mem.Allocator) !void {
     // Parsing and runtime schema construction are statement work, not retained
     // cache data. Never let their geometric arena growth consume a cache slot.
@@ -193,6 +218,7 @@ fn derive(layout: *Layout, json: []const u8, temporary: std.mem.Allocator, owned
     defer scratch.deinit();
     const alloc = scratch.allocator();
     const parsed = try schema.parseValidatedTableSchema(alloc, json);
+    layout.version_field = if (parsed.ttl_duration_ns != 0) try owned.dupe(u8, parsed.ttl_field) else null;
     layout.constraints = try catalog.Constraint.derive(owned, parsed);
     if (parsed.storage_mode == .document) {
         layout.storage_mode = .document;

@@ -1711,6 +1711,7 @@ pub const ApiHttpServerConfig = struct {
     fk_initial_child: ?@import("relational_fk_generation_publication.zig").InitialChildPort = null,
     relational_index_claims: ?@import("relational_index_owner_execution.zig").ClaimPort = null,
     relational_index_control: ?@import("relational_index_owner_execution.zig").ControlPort = null,
+    schema_validation_preparation: ?@import("schema_validation_preparation.zig").Port = null,
     row_policy_install: ?@import("row_policy_install.zig").Port = null,
     online_merge_io: ?@import("online_merge_io.zig").Port = null,
     secret_store: ?*common_secrets.FileStore = null,
@@ -2013,6 +2014,9 @@ pub const StatusSource = struct {
         /// Tagged stored-view resolution, not a claim that a physical engine
         /// or older metadata peer can publish/serve view records.
         supports_sql_views: bool = false,
+        /// Requires complete native admission AND portable allocator-state
+        /// transport. Kept false by production constructors until qualified.
+        supports_sql_sequences: bool = false,
         /// Hosting requires native existence, definition CAS and policy authority.
         supports_object_tables: bool = false,
         supports_resolver_catalog_read: bool = false,
@@ -2088,10 +2092,11 @@ pub const StatusSource = struct {
     }
 
     pub fn systemCatalog(self: StatusSource, alloc: std.mem.Allocator, context: api_operation.RequestContext, input: @import("../system_catalog/server_call.zig").Call) ![]u8 {
+        if (input.isSchemaValidationCall() and !context.schema_validation_authority) return error.Forbidden;
         const callback = self.vtable.system_catalog orelse return error.UnsupportedOperation;
         return BoundaryAbi.call("system_catalog", self.boundary_dispatch, callback, .{ self.ptr, alloc, context, input }) catch |err| switch (err) {
             error.MetadataIncarnationUnavailable, error.InvalidMetadataIncarnation => error.CatalogRoutingUnavailable,
-            error.MetadataIncarnationMismatch => if (input == .relational_index_status or input == .relational_index_admission_status) err else error.CatalogRoutingUnavailable,
+            error.MetadataIncarnationMismatch => if (input == .relational_index_status or input == .relational_index_admission_status or input.isSchemaValidationCall()) err else error.CatalogRoutingUnavailable,
             else => err,
         };
     }
@@ -2740,6 +2745,7 @@ pub const StatusSource = struct {
             .system_catalog = Gen.systemCatalog,
             .supports_query_definitions = true,
             .supports_sql_views = true,
+            .supports_sql_sequences = true,
             .supports_object_tables = true,
             .supports_resolver_catalog_read = true,
             .status = Gen.status,
@@ -2826,9 +2832,13 @@ pub const StatusSource = struct {
             }
             pub fn forward(self: @This(), peer: metadata_service.ReallocationProtocolPeer, forwarding: raft_mutation_forwarding.Context) anyerror!void {
                 var client = self.svc.tableMutationForwardClient();
-                const response = try client.forwardSystemCatalog(peer.orchestration_url orelse return error.NotLeader, self.input, forwarding, self.request.setting_admin);
+                var cancellation = http_common.RequestCancellation.fromToken(self.request.cancellation);
+                const response = if (self.input == .schema_validation_submit)
+                    try client.forwardSystemCatalogControlled(peer.orchestration_url orelse return error.NotLeader, self.input, forwarding, self.request.setting_admin, &cancellation)
+                else
+                    try client.forwardSystemCatalog(peer.orchestration_url orelse return error.NotLeader, self.input, forwarding, self.request.setting_admin);
                 defer client.alloc.free(response);
-                self.result.* = try self.alloc.dupe(u8, response);
+                self.result.* = self.alloc.dupe(u8, response) catch |err| return if (self.input == .schema_validation_submit) error.MetadataMutationOutcomeUnknown else err;
             }
         };
     };
@@ -9364,6 +9374,7 @@ pub const ApiHttpServer = struct {
             .object_storage_generation = definition.object_storage_generation,
             .name = table_name,
             .schema_json = definition.schema_json,
+            .full_text_read_index = definition.full_text_read_index,
             .read_schema_json = definition.read_schema_json,
             .indexes_json = definition.indexes_json,
             .lake_index_catalog_json = definition.lake_index_catalog_json,
@@ -9379,7 +9390,7 @@ pub const ApiHttpServer = struct {
             break :blk try system_catalog.QueryDefinition.fromTable(table).clone(alloc);
         };
         if (resolver) |cache| try cache.definitions.put(alloc, try alloc.dupe(u8, table_name), definition);
-        return .{ .storage = .{ .engine = definition.storage_engine }, .table_id = definition.table_id, .object_storage_generation = definition.object_storage_generation, .name = table_name, .schema_json = definition.schema_json, .read_schema_json = definition.read_schema_json, .indexes_json = definition.indexes_json, .lake_index_catalog_json = definition.lake_index_catalog_json };
+        return .{ .full_text_read_index = definition.full_text_read_index, .storage = .{ .engine = definition.storage_engine }, .table_id = definition.table_id, .object_storage_generation = definition.object_storage_generation, .name = table_name, .schema_json = definition.schema_json, .read_schema_json = definition.read_schema_json, .indexes_json = definition.indexes_json, .lake_index_catalog_json = definition.lake_index_catalog_json };
     }
 
     pub fn maybeRouteQueryToReadSchema(self: *ApiHttpServer, table_name: []const u8, query_req: *db_mod.types.SearchRequest) !void {
@@ -9408,7 +9419,7 @@ pub const ApiHttpServer = struct {
                 std.log.warn("retained native query capability validation failed err={s}", .{@errorName(err)});
                 return err;
             };
-            query_req.native_query_cut = .{ .id = cut.id, .table_id = cut.table_id, .expires_ms = cut.expires_ms, .cover = cut.cover, .recipe = .{ .schema_json = table.schema_json, .read_schema_json = table.read_schema_json, .indexes_json = table.indexes_json }, .create = if (resolver) |cache| if (cache.native_capture_token) |minted| std.mem.eql(u8, minted, token) else false else false, .timeout_ms = if (query_req.execution_deadline_ns) |deadline| (deadline -| @import("antfly_platform").time.monotonicNs()) / std.time.ns_per_ms else null };
+            query_req.native_query_cut = .{ .id = cut.id, .table_id = cut.table_id, .expires_ms = cut.expires_ms, .cover = cut.cover, .recipe = .{ .full_text_read_index = table.full_text_read_index, .schema_json = table.schema_json, .read_schema_json = table.read_schema_json, .indexes_json = table.indexes_json }, .create = if (resolver) |cache| if (cache.native_capture_token) |minted| std.mem.eql(u8, minted, token) else false else false, .timeout_ms = if (query_req.execution_deadline_ns) |deadline| (deadline -| @import("antfly_platform").time.monotonicNs()) / std.time.ns_per_ms else null };
             const remaining = cut.expires_ms -| (@import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms);
             const cut_deadline = @import("antfly_platform").time.monotonicNs() +| remaining * std.time.ns_per_ms;
             query_req.execution_deadline_ns = if (query_req.execution_deadline_ns) |deadline| @min(deadline, cut_deadline) else cut_deadline;
@@ -9519,13 +9530,18 @@ pub const ApiHttpServer = struct {
     pub fn validateTableWritesAgainstSchemaWithContext(self: *ApiHttpServer, context: api_operation.RequestContext, table_name: []const u8, writes: anytype) !void {
         try context.ensureActive();
         if (writes.len == 0) return;
+        const owner_prepares = if (self.table_writes) |owner| owner.prepares_rows_atomically else false;
         if (self.source.vtable.system_catalog != null) {
             const bytes = try self.source.systemCatalog(self.alloc, context, .{ .write_validation = table_name });
             defer self.alloc.free(bytes);
             var parsed = try std.json.parseFromSlice(@import("../system_catalog/projection.zig").WriteValidation, self.alloc, bytes, .{});
             defer parsed.deinit();
             try context.ensureActive();
-            if (parsed.value.schema_json.len != 0) {
+            // Native preparation owns the actual values that will commit,
+            // including volatile defaults. Keep extension-shape admission here;
+            // evaluating the primary defaults in a discarded preflight copy
+            // would require unrelated I/O and could validate different values.
+            if (!owner_prepares and parsed.value.schema_json.len != 0) {
                 var schema = try tables_api.parseValidatedTableSchema(self.alloc, parsed.value.schema_json);
                 defer schema.deinit(self.alloc);
                 try tables_api.validateWritesAgainstTableSchema(self.alloc, schema, writes);
@@ -9548,7 +9564,7 @@ pub const ApiHttpServer = struct {
         var snapshot = snapshot_opt orelse return;
         defer self.source.freeAdminSnapshot(&snapshot);
         const table = tables_api.findTableByName(&snapshot, table_name) orelse return error.TableNotFound;
-        if (table.schema_json.len != 0) {
+        if (!owner_prepares and table.schema_json.len != 0) {
             var parsed_schema = try tables_api.parseValidatedTableSchema(self.alloc, table.schema_json);
             defer parsed_schema.deinit(self.alloc);
             try tables_api.validateWritesAgainstTableSchema(self.alloc, parsed_schema, writes);
@@ -9573,11 +9589,11 @@ pub const ApiHttpServer = struct {
         for (req.read_set) |item| {
             var lookup = (try source.lookup(self.alloc, req.physicalName(item.table_name), item.key, .{}, .read_index)) orelse {
                 if (readSetVersionMatches(item.expected_version, null)) continue;
-                return transactions_api.versionConflict(item.table_name, item.key, item.expected_version, 0);
+                return transactions_api.readSetConflict(req, item, 0);
             };
             defer lookup.deinit(self.alloc);
             if (!readSetVersionMatches(item.expected_version, lookup.version)) {
-                return transactions_api.versionConflict(item.table_name, item.key, item.expected_version, lookup.version);
+                return transactions_api.readSetConflict(req, item, lookup.version);
             }
         }
         return null;
@@ -13762,7 +13778,7 @@ pub const ApiHttpServer = struct {
 
     /// Ordinary public batches retain proof storage through the synchronous
     /// commit proposal; the transaction path instead seals the signed bytes.
-    fn authoritativeIntegritySnapshot(self: *ApiHttpServer, request: api_operation.RequestContext) !metadata_api.AdminSnapshot {
+    pub fn authoritativeIntegritySnapshot(self: *ApiHttpServer, request: api_operation.RequestContext) !metadata_api.AdminSnapshot {
         // A remote source must use the read-indexed catalog barrier. Local
         // sources without that capability already read their owning metadata
         // service directly through adminSnapshot().
@@ -13771,12 +13787,12 @@ pub const ApiHttpServer = struct {
         return (try self.source.adminSnapshot()) orelse error.IntegrityCatalogUnavailable;
     }
 
-    const IntegritySnapshotSelection = struct {
+    pub const IntegritySnapshotSelection = struct {
         snapshot: metadata_api.AdminSnapshot,
         coordinated: bool,
     };
 
-    fn selectIntegritySnapshot(self: *ApiHttpServer, alloc: std.mem.Allocator, tables: []const distributed_txn.TableCommitRequest, request: api_operation.RequestContext) !?IntegritySnapshotSelection {
+    pub fn selectIntegritySnapshot(self: *ApiHttpServer, alloc: std.mem.Allocator, tables: []const distributed_txn.TableCommitRequest, request: api_operation.RequestContext) !?IntegritySnapshotSelection {
         const integrity = @import("antfly_local_sources").api_relational_integrity_commit;
         var snapshot_opt = try self.source.cachedAdminSnapshot();
         if (snapshot_opt == null) snapshot_opt = try self.source.adminSnapshot();
@@ -17179,6 +17195,12 @@ pub const ApiHttpServer = struct {
         return self.requireGenerationAuthority(principal, names, false);
     }
 
+    /// User-supplied USING changes values, not merely their storage layout.
+    /// A row-scoped administrator cannot transform an entire hidden cohort.
+    pub fn requireTransformRewriteAuthority(self: *ApiHttpServer, principal: []const u8, names: []const []const u8) !void {
+        return self.requireGenerationAuthority(principal, names, true);
+    }
+
     pub fn requireEmptyGenerationAuthority(self: *ApiHttpServer, principal: []const u8, names: []const []const u8) !void {
         return self.requireGenerationAuthority(principal, names, true);
     }
@@ -17232,12 +17254,22 @@ pub const ApiHttpServer = struct {
     }
 
     pub fn handleSchemaRewriteWithConstraintNameGuard(self: *ApiHttpServer, before: metadata_table_manager.TableRecord, proposed: []const u8, idempotency_key: ?[]const u8, identity: ?AuthenticatedIdentity, context: api_operation.RequestContext, default_columns: []const []const u8, guard: ?system_catalog.RelationMutationGuard) !contextual_operations.OwnedResponse {
+        return self.handleSchemaRewriteWithPolicies(before, proposed, idempotency_key, identity, context, .{ .default_columns = default_columns }, guard);
+    }
+
+    pub fn handleSchemaRewriteWithPolicies(self: *ApiHttpServer, before: metadata_table_manager.TableRecord, proposed: []const u8, idempotency_key: ?[]const u8, identity: ?AuthenticatedIdentity, context: api_operation.RequestContext, policies: @import("antfly_local_sources").storage_db_relational_row_transform.Policies, guard: ?system_catalog.RelationMutationGuard) !contextual_operations.OwnedResponse {
         try ensureTableOperationActive(context);
+        if (policies.column_transforms.len != 0 and !std.mem.eql(u8, policies.expression_schema, before.schema_json)) return error.SchemaVersionChanged;
         if (self.cfg.auth_enabled and identity == null) return contextualJsonErrorResponse(self.alloc, 403, "schema rewrite requires table administrator authorization");
         var snapshot = (try self.source.adminSnapshot()) orelse return contextualRetryableJsonErrorResponse(self.alloc, 503, "schema rewrite metadata is unavailable");
         defer self.source.freeAdminSnapshot(&snapshot);
         const current = tables_api.findTableByName(&snapshot, before.name) orelse return contextualJsonErrorResponse(self.alloc, 404, "not found");
         if (!metadata_table_manager.tableDefinitionsEqual(before, current.*)) return contextualJsonErrorResponse(self.alloc, 409, "schema changed; refresh before rewriting");
+        @import("antfly_local_sources").sql_schema_ddl.requireTransformIndexBindings(self.alloc, before.indexes_json, policies.column_transforms) catch |err| {
+            if (err == error.UnsupportedSqlShape)
+                return contextualJsonErrorResponse(self.alloc, 409, "An artifact index depends on a renamed field; refresh the index bindings before rewriting.");
+            return err;
+        };
         var arena = std.heap.ArenaAllocator.init(self.alloc);
         defer arena.deinit();
         const alloc = arena.allocator();
@@ -17249,7 +17281,10 @@ pub const ApiHttpServer = struct {
         }
         for (try self.logicalTableNamesInArena(alloc, context, names)) |name|
             if (!try tablePermissionCurrentlyAllowed(identity, name, .admin)) return contextualJsonErrorResponse(self.alloc, 403, "schema rewrite requires admin permission on every dependency-cohort table");
-        try self.requireSchemaRewriteAuthority(storedDestinationPrincipal(identity), names);
+        if (policies.column_transforms.len != 0)
+            try self.requireTransformRewriteAuthority(storedDestinationPrincipal(identity), names)
+        else
+            try self.requireSchemaRewriteAuthority(storedDestinationPrincipal(identity), names);
         var generated_key: [37]u8 = undefined;
         const key = idempotency_key orelse key: {
             var random: [16]u8 = undefined;
@@ -17261,8 +17296,10 @@ pub const ApiHttpServer = struct {
         const namespace = try std.fmt.allocPrint(alloc, "schema-rewrite:{s}:{s}", .{ storedDestinationPrincipal(identity), before.name });
         const job_id = try restore_jobs.jobIdForIdempotency(alloc, namespace, key);
         const plan_id = try @import("../metadata/restore_staging.zig").idForAttempt(job_id, 1);
-        const encoded_request = if (default_columns.len != 0)
-            try std.json.Stringify.valueAlloc(alloc, .{ .table_id = before.table_id, .source_schema = before.schema_json, .target_schema = proposed, .default_columns = default_columns }, .{})
+        const encoded_request = if (policies.column_transforms.len != 0)
+            try std.json.Stringify.valueAlloc(alloc, .{ .table_id = before.table_id, .source_schema = before.schema_json, .target_schema = proposed, .default_columns = policies.default_columns, .column_transforms = policies.column_transforms, .expression_schema = policies.expression_schema }, .{})
+        else if (policies.default_columns.len != 0)
+            try std.json.Stringify.valueAlloc(alloc, .{ .table_id = before.table_id, .source_schema = before.schema_json, .target_schema = proposed, .default_columns = policies.default_columns }, .{})
         else
             try std.json.Stringify.valueAlloc(alloc, .{ .table_id = before.table_id, .source_schema = before.schema_json, .target_schema = proposed }, .{});
         var digest: [32]u8 = undefined;
@@ -17306,7 +17343,7 @@ pub const ApiHttpServer = struct {
             }
         };
         var observer: Observer = .{ .server = self, .context = context };
-        const plan = try admission.buildWithPoliciesAndConstraintNameGuard(alloc, plan_id, cohort, snapshot.ranges, before.name, proposed, &observer, .{ .default_columns = default_columns }, guard);
+        const plan = try admission.buildWithPoliciesAndConstraintNameGuard(alloc, plan_id, cohort, snapshot.ranges, before.name, proposed, &observer, policies, guard);
         start.rewrite_plan_json = try std.json.Stringify.valueAlloc(alloc, plan, .{});
         try ensureTableOperationActive(context);
         const accepted = self.restore_job_store.startRecoverable(self.alloc, start) catch |err| return restoreJobStartErrorResponse(self.alloc, err);
@@ -18861,6 +18898,9 @@ pub const ApiHttpServer = struct {
         };
         if (is_rewrite) rewrite_diagnostic = worker_state.value.rewrite_progress;
         const failed = worker_state.value.staging_failure.len != 0;
+        const transform_rewrite = for (job.value.plan.targets) |target| {
+            if (target.rewrite) |rewrite| if (rewrite.column_transforms.len != 0) break true;
+        } else false;
         if (!failed and !worker_state.value.cancel_requested and job.value.state != .published and job.value.state != .canceled) {
             if (worker_state.value.source_kind == .empty_generation) {
                 (self.requireEmptyGenerationAuthority(worker_state.value.destination_authorization_principal, worker_state.value.table_names orelse return zig017_failure: {
@@ -18870,10 +18910,10 @@ pub const ApiHttpServer = struct {
                     zig017_return_error = zig017_err;
                     return zig017_err;
                 });
-            } else if (is_rewrite) (self.requireSchemaRewriteAuthority(worker_state.value.destination_authorization_principal, worker_state.value.table_names orelse return zig017_failure: {
+            } else if (is_rewrite) (self.requireGenerationAuthority(worker_state.value.destination_authorization_principal, worker_state.value.table_names orelse return zig017_failure: {
                 zig017_return_error = error.CorruptRestoreJobStore;
                 break :zig017_failure error.CorruptRestoreJobStore;
-            }) catch |zig017_err| {
+            }, transform_rewrite) catch |zig017_err| {
                 zig017_return_error = zig017_err;
                 return zig017_err;
             });
@@ -19747,9 +19787,11 @@ pub const ApiHttpServer = struct {
                     zig017_return_error = error.BackupIntegrityFailure;
                     break :zig017_failure error.BackupIntegrityFailure;
                 };
-                if (@import("restore_source_errors.zig").permanent(err)) return zig017_failure: {
-                    zig017_return_error = error.BackupIntegrityFailure;
-                    break :zig017_failure error.BackupIntegrityFailure;
+                const source_errors = @import("restore_source_errors.zig");
+                const classified = source_errors.normalizeForTarget(err, if (target.rewrite != null) .schema_rewrite else .restore);
+                if (source_errors.permanent(err) or classified != err) return zig017_failure: {
+                    zig017_return_error = classified;
+                    break :zig017_failure classified;
                 };
                 zig017_return_error = err;
                 return err;
@@ -27653,7 +27695,7 @@ pub fn requiredPermissionForRequest(alloc: std.mem.Allocator, method: Authorizat
     if (try system_catalog_routes.parseAlloc(arena.allocator(), path)) |route| {
         if (route.kind == .table and route.name == null and isReadMethod(method)) return null;
         const resource_type: usermgr.ResourceType = switch (route.kind) {
-            .query_source, .view => .table,
+            .query_source, .view, .sequence => .table,
             .database => .database,
             .namespace => .namespace,
             .table => .table,
@@ -28205,6 +28247,53 @@ pub fn foreignKeyParentsAllowed(alloc: std.mem.Allocator, identity: ?Authenticat
         if (!(try tablePermissionCurrentlyAllowed(identity, foreign_key.parent_table, .admin))) return false;
     };
     return true;
+}
+
+/// Request-start and live credential scopes must both authorize durable
+/// administrative mutations. This is the same authority used by table/RLS
+/// operations, generalized to named users and other non-table resources.
+pub fn authorizeSqlRoleDefaults(server: *ApiHttpServer, alloc: std.mem.Allocator, raw: @import("antfly_local_sources").sql_setting_catalog.RawSnapshot) !@import("antfly_local_sources").sql_setting_catalog.RawSnapshot {
+    if (!raw.needsRoleAuthorization()) return raw;
+    const instance: ?[16]u8 = if (server.cfg.user_manager) |manager|
+        manager.currentUserInstance(raw.scope.principal) catch null
+    else
+        null;
+    return raw.authorizeRoleDefaultsLeaky(alloc, instance);
+}
+
+pub fn sqlPrincipalInstance(server: *ApiHttpServer, identity: ?AuthenticatedIdentity) !?[16]u8 {
+    const authenticated = identity orelse return null;
+    // Federated subjects need not be locally managed users. Basic/API-key
+    // connections are native capabilities and bind the managed incarnation.
+    if (!std.mem.startsWith(u8, authenticated.credential_principal, "basic:") and !std.mem.startsWith(u8, authenticated.credential_principal, "api-key:")) return null;
+    const manager = authenticated.live_user_manager orelse server.cfg.user_manager orelse return null;
+    return manager.currentUserInstance(authenticated.username) catch return error.Unauthorized;
+}
+
+pub fn requireSqlPrincipalInstance(server: *ApiHttpServer, identity: ?AuthenticatedIdentity, expected: ?[16]u8) !void {
+    const required = expected orelse return;
+    const actual = (try sqlPrincipalInstance(server, identity)) orelse return error.SqlConnectionNotFound;
+    if (!std.mem.eql(u8, &required, &actual)) return error.SqlConnectionNotFound;
+}
+
+pub fn resourcePermissionCurrentlyAllowed(
+    authenticated_identity: ?AuthenticatedIdentity,
+    resource_type: usermgr.ResourceType,
+    resource: []const u8,
+    permission_type: usermgr.PermissionType,
+) !bool {
+    const identity = authenticated_identity orelse return true;
+    if (!permissionsAllow(identity.permissions, resource_type, resource, permission_type)) return false;
+    const manager = identity.live_user_manager orelse return true;
+    if (std.mem.startsWith(u8, identity.credential_principal, "api-key:")) {
+        const current = manager.effectiveApiKeyPermissions(identity.credential_principal["api-key:".len..]) catch |err| switch (err) {
+            error.ApiKeyNotFound, error.ApiKeyExpired, error.UserNotFound => return false,
+            else => return err,
+        };
+        defer freePermissions(manager.alloc, current);
+        return permissionsAllow(current, resource_type, resource, permission_type);
+    }
+    return manager.permissionCurrentlyAllowed(identity.username, resource_type, resource, permission_type);
 }
 
 pub fn tablePermissionCurrentlyAllowed(
@@ -33494,27 +33583,35 @@ test "system catalog validates writes against table-specific extension data shap
     var routed_server = ApiHttpServer.init(alloc, .{}, source.iface(), null, table_source.source());
     defer routed_server.deinit();
 
-    const valid_body = try test_contract_helpers.normalizeBatchRequest(alloc, "{\"inserts\":{\"doc:c\":{\"body\":\"remember this\",\"kind\":\"note\"}}}");
-    defer alloc.free(valid_body);
-    var valid_resp = try executeHttpxTestRequest(&routed_server, .{
-        .method = .POST,
-        .uri = "/tables/memories/batch",
-        .content_type = "application/json",
-        .body = valid_body,
-    });
-    defer valid_resp.deinit(alloc);
-    try std.testing.expectEqual(@as(u16, 201), valid_resp.status);
+    // The metadata primary schema and this DB are both empty; exercise the
+    // native preparation capability without granting extension enforcement to
+    // the backend. Shape admission must still precede every mutation.
+    for ([_]bool{ false, true }) |native_preparation| {
+        var owner = table_source.source();
+        owner.prepares_rows_atomically = native_preparation;
+        routed_server.table_writes = owner;
+        const valid_body = try test_contract_helpers.normalizeBatchRequest(alloc, "{\"inserts\":{\"doc:c\":{\"body\":\"remember this\",\"kind\":\"note\"}}}");
+        defer alloc.free(valid_body);
+        var valid_resp = try executeHttpxTestRequest(&routed_server, .{
+            .method = .POST,
+            .uri = "/tables/memories/batch",
+            .content_type = "application/json",
+            .body = valid_body,
+        });
+        defer valid_resp.deinit(alloc);
+        try std.testing.expectEqual(@as(u16, 201), valid_resp.status);
 
-    const invalid_body = try test_contract_helpers.normalizeBatchRequest(alloc, "{\"inserts\":{\"doc:d\":{\"body\":\"remember this\",\"unexpected\":\"owned by no shape\"}}}");
-    defer alloc.free(invalid_body);
-    var invalid_resp = try executeHttpxTestRequest(&routed_server, .{
-        .method = .POST,
-        .uri = "/tables/memories/batch",
-        .content_type = "application/json",
-        .body = invalid_body,
-    });
-    defer invalid_resp.deinit(alloc);
-    try std.testing.expectEqual(@as(u16, 400), invalid_resp.status);
+        const invalid_body = try test_contract_helpers.normalizeBatchRequest(alloc, "{\"inserts\":{\"doc:d\":{\"body\":\"remember this\",\"unexpected\":\"owned by no shape\"}}}");
+        defer alloc.free(invalid_body);
+        var invalid_resp = try executeHttpxTestRequest(&routed_server, .{
+            .method = .POST,
+            .uri = "/tables/memories/batch",
+            .content_type = "application/json",
+            .body = invalid_body,
+        });
+        defer invalid_resp.deinit(alloc);
+        try std.testing.expectEqual(@as(u16, 400), invalid_resp.status);
+    }
 }
 
 test "api http server dispatches extension lifecycle mutations" {
@@ -41074,6 +41171,47 @@ test "api http server stale no-FK catalog cannot take uncoordinated batch path" 
     try std.testing.expectEqual(@as(usize, 2), fake.authoritative_calls);
     try std.testing.expect(fake.owner_reads > 1);
     try std.testing.expectEqual(@as(usize, 0), fake.commits);
+    // Session staging must select the same authoritative snapshot as REST.
+    // A stale negative declaration cannot bypass FK preparation, even when
+    // this source offers no unqualified admin snapshot at all.
+    const input = .{ .read_set = [_]u32{}, .tables = .{ .rows = .{ .inserts = .{ .orphan = .{ .id = 2, .parent = 1 } } } } };
+    const body = try std.json.Stringify.valueAlloc(alloc, input, .{});
+    defer alloc.free(body);
+    var statement = try transactions_api.parseCommitRequest(alloc, body);
+    defer statement.deinit(alloc);
+    var candidate = try statement.clone(alloc);
+    defer candidate.deinit(alloc);
+    const staged = @import("relational_session_statement.zig").validate(&server, alloc, null, &candidate, &statement, .{});
+    try std.testing.expectError(error.ExpectedFkPreparation, staged);
+    try std.testing.expectEqual(@as(usize, 3), fake.authoritative_calls);
+    try std.testing.expect(fake.owner_reads > 2);
+    try std.testing.expectEqual(@as(usize, 0), fake.commits);
+    defer server.txn_sessions.deinit(alloc);
+    const begun = try server.txn_sessions.begin(alloc, .{ .sql = .{
+        .database = "default",
+        .namespace = "public",
+        .isolation = .read_committed,
+        .mode = .read_write,
+    } }, server.localSessionNodeId());
+    _ = try server.txn_sessions.stageSql(alloc, begun.txn_id, &statement);
+    const timing = @import("sql_constraint_timing.zig").set(
+        &server,
+        alloc,
+        null,
+        .{},
+        .{ .principal = "" },
+        "public",
+        begun.txn_id,
+        &.{},
+        false,
+    );
+    try std.testing.expectError(error.ExpectedFkPreparation, timing);
+    try std.testing.expectEqual(@as(usize, 4), fake.authoritative_calls);
+    try std.testing.expect(fake.owner_reads > 3);
+    try std.testing.expectEqual(@as(usize, 0), fake.commits);
+    var unchanged = try server.txn_sessions.cloneSqlStaged(alloc, begun.txn_id);
+    defer unchanged.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), unchanged.constraint_timing.items.len);
 }
 
 test "api http server routes table batches through the batch commit hook" {

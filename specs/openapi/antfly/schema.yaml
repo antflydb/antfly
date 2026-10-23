@@ -340,6 +340,13 @@ components:
         primary:
           type: boolean
           description: SQL primary-key identity. At most one per relational table; all key columns must be required and nonnullable.
+        include_columns:
+          type: array
+          maxItems: 256
+          description: Non-key payload columns for this constraint's covering ordered index. They never participate in uniqueness, foreign-key target identity, or primary-key nullability. Only column-key, constraint-owned declarations support INCLUDE.
+          items:
+            type: string
+            minLength: 1
         columns:
           type: array
           minItems: 1
@@ -488,7 +495,7 @@ components:
 
     RelationalExpressionOp:
       type: string
-      enum: [literal, column, add, subtract, multiply, divide, negate, concat, coalesce, lower_ascii, upper_ascii, eq, ne, gt, gte, lt, lte, is_null, is_not_null, is_distinct, is_not_distinct, and, or, not, cast, case_when, modulo, in_list, not_in_list, array, replace, md5, abs, ceil, floor, round, trunc, sign, sqrt, jsonb_typeof, jsonb_array_length, jsonb_extract_path, jsonb_extract_path_text]
+      enum: [literal, column, add, subtract, multiply, divide, negate, concat, coalesce, lower_ascii, upper_ascii, eq, ne, gt, gte, lt, lte, is_null, is_not_null, is_distinct, is_not_distinct, and, or, not, cast, case_when, modulo, in_list, not_in_list, array, replace, md5, abs, ceil, floor, round, trunc, sign, sqrt, jsonb_typeof, jsonb_array_length, jsonb_extract_path, jsonb_extract_path_text, uuidv4, uuidv7]
 
     RelationalExpressionType:
       type: string
@@ -499,10 +506,15 @@ components:
       additionalProperties: false
       required: [op]
       description: |
-        Immutable typed scalar expression, limited to 128 nodes and 16 levels.
+        Typed scalar expression, limited to 128 nodes and 16 levels. CHECK,
+        generated-column and index expressions must be immutable. UUIDv4 and
+        UUIDv7 generation are permitted only in column defaults and require
+        reader capability version 33. They run once during owned row
+        preparation, never during schema publication or restore verification.
+        The uuidv4 and uuidv7 operations take no args; uuidv7 may specify shift.
         A literal requires type; omitted value means typed null. A column
         requires column; other
-        operations require args. Unknown or irrelevant fields are rejected.
+        operations except uuidv4 and uuidv7 require args. Unknown or irrelevant fields are rejected.
         Arithmetic operands have the same integer or number type. Integer
         division truncates toward zero. Overflow and division by zero reject
         the write. Arithmetic and string operations propagate null. ASCII case
@@ -614,6 +626,10 @@ components:
         value:
           nullable: true
           description: Typed literal value, including null.
+        shift:
+          type: string
+          maxLength: 128
+          description: Canonical PostgreSQL interval text, accepted only on a uuidv7 default operation. SQL lowering resolves and binds calendar months, days, and microseconds before publication. Omission generates an unshifted UUID; SQL NULL shifts lower to a NULL literal instead. Infinite intervals remain representable declarations but fail when evaluated.
         json_null:
           type: boolean
           description: For a literal of type json only. True denotes present JSON null and requires value to be omitted or null. False or omission leaves an omitted/null value as SQL NULL. This explicit marker survives SDKs that omit optional null values. Requires reader capability version 30.

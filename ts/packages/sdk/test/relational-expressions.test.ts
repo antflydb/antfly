@@ -8,6 +8,25 @@ describe("relational expression structural admission", () => {
   const validate = (expression: unknown) =>
     validateRelationalExpression(expression, "expression", { nodes: 0, literalBytes: 0 });
 
+  it("admits UUID default declarations without accepting irrelevant fields or arguments", () => {
+    for (const expression of [
+      { op: "uuidv4" },
+      { op: "uuidv7" },
+      { op: "uuidv7", shift: "1 mon 2 days 03:00:00" },
+    ])
+      expect(() => validate(expression)).not.toThrow();
+    for (const expression of [
+      { op: "uuidv4", shift: "1 day" },
+      { op: "uuidv7", shift: null },
+      { op: "uuidv7", shift: 1 },
+      { op: "uuidv7", shift: "" },
+      { op: "uuidv7", shift: "x".repeat(129) },
+      { op: "uuidv7", args: [] },
+      { op: "uuidv7", sql_type: "uuid" },
+    ])
+      expect(() => validate(expression)).toThrow(TypeError);
+  });
+
   it("admits bounded JSON literals and retains explicit JSON null authority", () => {
     for (const value of [null, true, 1.25, "é😀", { n: [1, null, true] }]) {
       const budget = { nodes: 0, literalBytes: 0 };

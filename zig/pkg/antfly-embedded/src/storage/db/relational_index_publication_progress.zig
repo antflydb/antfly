@@ -791,6 +791,7 @@ test "index progress codecs reject every byte corruption and invalid checksummed
 }
 
 test "index publication reader requirements survive ACKs and reject partial checksummed pairs" {
+    const readers = @import("../../common/schema_readers.zig");
     var head = testHead(1);
     head.reader_requirements = .{ .semantic_version = 30, .encoding_version = 17 };
     var owner = testOwner(0);
@@ -798,13 +799,18 @@ test "index publication reader requirements survive ACKs and reject partial chec
     try std.testing.expectEqualDeep(@as(?@import("../../common/schema_readers.zig").ReaderRequirements, .{ .semantic_version = 30, .encoding_version = 17 }), head.reader_requirements);
     const canonical = try head.encode();
     try std.testing.expectEqualDeep(head, try Head.decode(&canonical));
-    for ([_][2]u32{ .{ 0, 17 }, .{ 30, 0 }, .{ 32, 17 }, .{ 30, 32 } }) |pair| {
+    // Supported ceilings advance independently; a formerly future version
+    // must not remain hardcoded as invalid after its reader is implemented.
+    for ([_][2]u32{ .{ 0, 17 }, .{ 30, 0 }, .{ readers.minimum_semantic_version - 1, 17 }, .{ readers.current_semantic_version + 1, 17 }, .{ 30, readers.current_encoding_version + 1 } }) |pair| {
         var invalid = canonical;
         std.mem.writeInt(u32, invalid[152..156], pair[0], .little);
         std.mem.writeInt(u32, invalid[156..160], pair[1], .little);
         @memcpy(invalid[184..216], &checksum(invalid[0..184]));
         try std.testing.expectError(error.InvalidGenerationPublication, Head.decode(&invalid));
     }
+    var current = head;
+    current.reader_requirements = .{ .semantic_version = readers.current_semantic_version, .encoding_version = readers.current_encoding_version };
+    try std.testing.expectEqualDeep(current, try Head.decode(&try current.encode()));
     var old_format = canonical;
     old_format[4] = 3;
     @memcpy(old_format[184..216], &checksum(old_format[0..184]));

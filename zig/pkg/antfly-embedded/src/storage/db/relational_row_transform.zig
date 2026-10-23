@@ -32,6 +32,8 @@ pub const Digest = [32]u8;
 pub const Policies = struct {
     default_columns: []const []const u8 = &.{},
     dropped_columns: enum(u8) { reject, allow } = .reject,
+    expression_schema: []const u8 = "",
+    column_transforms: []const @import("relational_rewrite_contract.zig").ColumnTransform = &.{},
 };
 
 /// Hard per-program/row ceilings supplement the scalar evaluator's shared
@@ -39,6 +41,81 @@ pub const Policies = struct {
 pub const max_schema_bytes = 4 * 1024 * 1024;
 pub const max_row_bytes = 16 * 1024 * 1024;
 pub const max_columns = 4096;
+
+/// All historical physical layouts share one immutable expression program.
+/// A wide predecessor schema must not be cloned once per retained epoch.
+const TransformSet = struct {
+    refs: std.atomic.Value(usize) = .init(1),
+    alloc: Allocator,
+    arena: std.heap.ArenaAllocator,
+    source: registry.SchemaView,
+    bindings: []expressions.Set.Binding,
+    rules: []const @import("relational_rewrite_contract.zig").ColumnTransform,
+    source_json: []const u8,
+    digest: Digest,
+
+    fn retain(self: *@This()) *@This() {
+        _ = self.refs.fetchAdd(1, .monotonic);
+        return self;
+    }
+    fn release(self: *@This()) void {
+        if (self.refs.fetchSub(1, .acq_rel) != 1) return;
+        for (self.bindings) |*binding| binding.plan.deinit();
+        self.alloc.free(self.bindings);
+        self.source.release();
+        self.arena.deinit();
+        self.alloc.destroy(self);
+    }
+    fn init(alloc: Allocator, target: registry.SchemaView, policies: Policies) !*@This() {
+        if (policies.expression_schema.len > max_schema_bytes) return error.RelationalRewriteBudgetExceeded;
+        var region = std.heap.ArenaAllocator.init(alloc);
+        errdefer region.deinit();
+        const a = region.allocator();
+        const bytes = try a.dupe(u8, policies.expression_schema);
+        var source = try compileView(alloc, bytes);
+        errdefer source.release();
+        const bindings = try alloc.alloc(expressions.Set.Binding, policies.column_transforms.len);
+        errdefer alloc.free(bindings);
+        var initialized: usize = 0;
+        errdefer for (bindings[0..initialized]) |*binding| binding.plan.deinit();
+        const rules = try a.alloc(@import("relational_rewrite_contract.zig").ColumnTransform, bindings.len);
+        const columns = target.tableSchema().relational_columns;
+        var size = bytes.len;
+        var hash = std.crypto.hash.Blake3.init(.{});
+        hash.update("antfly-column-rewrite-expressions-v1");
+        hash.update(&try schemaDigest(alloc, bytes, source));
+        for (policies.column_transforms, bindings, rules) |rule, *binding, *owned| {
+            size +|= rule.column.len +| rule.expression_json.len;
+            if (size > max_schema_bytes) return error.RelationalRewriteBudgetExceeded;
+            const ordinal = target.physicalLayout().ordinalForName(columns, rule.column) orelse return error.InvalidRestoreStagingCommand;
+            for (bindings[0..initialized]) |prior| if (prior.ordinal == ordinal) return error.InvalidRestoreStagingCommand;
+            if (target.validator().?.execution.expressions) |set| if (set.generated_columns[ordinal]) return error.InvalidRestoreStagingCommand;
+            owned.* = .{ .column = try a.dupe(u8, rule.column), .expression_json = try a.dupe(u8, rule.expression_json) };
+            const expression = try std.json.parseFromSliceLeaky(std.json.Value, a, owned.expression_json, .{});
+            binding.* = .{ .ordinal = @intCast(ordinal), .generated = false, .plan = try expressions.Plan.init(alloc, source.tableSchema().*, expression, columns[ordinal].column_type) };
+            initialized += 1;
+            // Numeric widths and array elements affect physical semantics.
+            // Text/boolean/JSON operators may omit a redundant builtin tag;
+            // their exact result kind and target validators remain required.
+            switch (columns[ordinal].column_type) {
+                .integer, .number, .numeric, .sql_array => if (columns[ordinal].sql_element_type) |kind| {
+                    if (binding.plan.result_sql_type != kind) return error.RelationalRewriteTypeChange;
+                },
+                else => {},
+            }
+            var length: [8]u8 = undefined;
+            std.mem.writeInt(u64, &length, owned.column.len, .little);
+            hash.update(&length);
+            hash.update(owned.column);
+            hash.update(&binding.plan.fingerprint);
+        }
+        var digest: Digest = undefined;
+        hash.final(&digest);
+        const result = try alloc.create(@This());
+        result.* = .{ .alloc = alloc, .arena = region, .source = source, .bindings = bindings, .rules = rules, .source_json = bytes, .digest = digest };
+        return result;
+    }
+};
 
 pub const Result = struct {
     packed_row: []u8,
@@ -65,9 +142,13 @@ pub const Program = struct {
     source_ordinals: []?u32,
     policies: Policies,
     default_mask: ?[]bool,
+    requires_materialized_defaults: bool,
     source_schema_digest: Digest,
     target_schema_digest: Digest,
     identity: Digest,
+    transforms: []const expressions.Set.Binding,
+    transform_set: ?*TransformSet,
+    expression_ordinals: []?u32,
 
     pub fn init(alloc: Allocator, source_json: []const u8, target_json: []const u8, policies: Policies) !Program {
         return initInternal(alloc, source_json, target_json, policies, null) catch |err| return memoryError(err);
@@ -88,6 +169,16 @@ pub const Program = struct {
         const from = source.tableSchema().relational_columns;
         const to = target.tableSchema().relational_columns;
         if (from.len > max_columns or to.len > max_columns) return error.RelationalRewriteBudgetExceeded;
+        if (policies.column_transforms.len > 256 or (policies.column_transforms.len == 0) != (policies.expression_schema.len == 0)) return error.InvalidRestoreStagingCommand;
+        const transform_set: ?*TransformSet = if (policies.column_transforms.len == 0) null else if (template) |existing| existing.transform_set.?.retain() else try TransformSet.init(alloc, target, policies);
+        errdefer if (transform_set) |set| set.release();
+        const transforms: []const expressions.Set.Binding = if (transform_set) |set| set.bindings else &.{};
+        const logical_columns: []const schema.RelationalColumn = if (transform_set) |set| set.source.tableSchema().relational_columns else &.{};
+        const expression_ordinals = try alloc.alloc(?u32, logical_columns.len);
+        errdefer alloc.free(expression_ordinals);
+        for (logical_columns, expression_ordinals) |column, *ordinal| {
+            ordinal.* = if (source.physicalLayout().ordinalForName(from, column.name)) |index| @intCast(index) else null;
+        }
         // Resolve once, retaining names from our owned target view. Snapshot
         // and tail rows use the same ordinal mask without string lookups.
         if (policies.default_columns.len > to.len) return error.InvalidRestoreStagingCommand;
@@ -111,7 +202,14 @@ pub const Program = struct {
         }
         const mapping = try alloc.alloc(?u32, to.len);
         errdefer alloc.free(mapping);
-        for (to, mapping) |column, *ordinal| {
+        for (to, mapping, 0..) |column, *ordinal, target_ordinal| {
+            const replaced = for (transforms) |binding| {
+                if (binding.ordinal == target_ordinal) break true;
+            } else false;
+            if (replaced) {
+                ordinal.* = null;
+                continue;
+            }
             const old = source.physicalLayout().ordinalForName(from, column.name);
             ordinal.* = if (old) |index| @intCast(index) else null;
             if (old) |index| {
@@ -135,15 +233,31 @@ pub const Program = struct {
             hash.update("scoped-defaults-v1");
             for (value) |enabled| hash.update(&.{@intFromBool(enabled)});
         }
+        if (transforms.len != 0) {
+            hash.update("explicit-column-transforms-v1");
+            hash.update(&transform_set.?.digest);
+        }
+        var materialized_defaults = false;
+        if (mask) |enabled| if (target.validator().?.execution.expressions) |set| {
+            for (set.bindings) |binding| {
+                if (binding.generated or !enabled[binding.ordinal]) continue;
+                for (binding.plan.nodes) |node| if (node.op == .uuidv4 or node.op == .uuidv7) {
+                    materialized_defaults = true;
+                    break;
+                };
+            }
+        };
         var identity: Digest = undefined;
         hash.final(&identity);
-        return .{ .alloc = alloc, .source = source, .target = target, .source_ordinals = mapping, .policies = .{ .default_columns = names, .dropped_columns = policies.dropped_columns }, .default_mask = mask, .source_schema_digest = source_digest, .target_schema_digest = target_digest, .identity = identity };
+        return .{ .requires_materialized_defaults = materialized_defaults, .alloc = alloc, .source = source, .target = target, .source_ordinals = mapping, .policies = .{ .default_columns = names, .dropped_columns = policies.dropped_columns, .expression_schema = if (transform_set) |set| set.source_json else "", .column_transforms = if (transform_set) |set| set.rules else &.{} }, .default_mask = mask, .source_schema_digest = source_digest, .target_schema_digest = target_digest, .identity = identity, .transforms = transforms, .transform_set = transform_set, .expression_ordinals = expression_ordinals };
     }
 
     pub fn deinit(self: *Program) void {
+        if (self.transform_set) |set| set.release();
         self.source.release();
         self.target.release();
         self.alloc.free(self.source_ordinals);
+        self.alloc.free(self.expression_ordinals);
         self.alloc.free(self.policies.default_columns);
         if (self.default_mask) |mask| self.alloc.free(mask);
         self.* = undefined;
@@ -164,10 +278,18 @@ pub const Program = struct {
     /// effects and the receiver cursor must commit together at the caller.
     /// The source timestamp survives snapshot and tail replay unchanged.
     pub fn transform(self: *const Program, alloc: Allocator, source_bytes: []const u8) !Result {
-        return self.transformInternal(alloc, source_bytes) catch |err| return memoryError(err);
+        return self.transformInternal(alloc, source_bytes, null, null) catch |err| return memoryError(err);
     }
 
-    fn transformInternal(self: *const Program, alloc: Allocator, source_bytes: []const u8) !Result {
+    /// Only the staging owner supplies invocation I/O and a previously committed
+    /// target row. Newly added defaults survive source updates; generated values
+    /// still recompute from the new source afterimage. The caller atomically
+    /// commits these owned bytes with its durable replay cursor.
+    pub fn transformPrepared(self: *const Program, alloc: Allocator, source_bytes: []const u8, runtime: ?expressions.PreparationRuntime, previous_target: ?[]const u8) !Result {
+        return self.transformInternal(alloc, source_bytes, runtime, previous_target) catch |err| return memoryError(err);
+    }
+
+    fn transformInternal(self: *const Program, alloc: Allocator, source_bytes: []const u8, runtime: ?expressions.PreparationRuntime, previous_target: ?[]const u8) !Result {
         if (source_bytes.len > max_row_bytes) return error.RelationalRewriteBudgetExceeded;
         var scratch = std.heap.ArenaAllocator.init(alloc);
         defer scratch.deinit();
@@ -188,6 +310,7 @@ pub const Program = struct {
         const expression_set = self.target.validator().?.execution.expressions;
         var expression_bytes: usize = expressions.max_allocated_bytes;
         var execution = expressions.Execution.init(arena, &expression_bytes);
+        execution.preparation_runtime = runtime;
         var input: expressions.PreparedInput = undefined;
         try input.initBoundRow(&execution, row);
         defer input.deinit();
@@ -205,6 +328,36 @@ pub const Program = struct {
                 values[ordinal] = try input.valueAt(&execution, old_ordinal);
             }
         }
+        if (self.transforms.len != 0) {
+            var operands: expressions.PreparedInput = undefined;
+            // Each immutable physical layout resolves names once, before any
+            // source pin. Row execution uses direct mapped ordinals; absent
+            // old fields remain SQL NULL without a per-row name lookup.
+            try operands.initMappedRow(&execution, row, self.expression_ordinals);
+            defer operands.deinit();
+            for (self.transforms) |binding| {
+                const result = try binding.plan.evaluatePreparedWithExecution(&execution, &operands);
+                cells[binding.ordinal] = try scalarCell(&execution, to, to.relational_columns[binding.ordinal], binding.ordinal, result);
+                values[binding.ordinal] = result;
+                present[binding.ordinal] = true;
+                expression_input_cells += binding.plan.dependencies.len;
+            }
+        }
+        if (self.requires_materialized_defaults) if (previous_target) |bytes| {
+            try validateStored(alloc, bytes, self.target);
+            const previous = try codec.ordinalRowViewTrusted(bytes, to, self.target.physicalLayout());
+            var previous_input: expressions.PreparedInput = undefined;
+            try previous_input.initBoundRow(&execution, previous);
+            defer previous_input.deinit();
+            for (expression_set.?.bindings) |binding| {
+                const ordinal = binding.ordinal;
+                if (binding.generated or !self.default_mask.?[ordinal] or present[ordinal]) continue;
+                const cell = (try previous.findCell(ordinal)) orelse continue;
+                cells[ordinal] = cell;
+                values[ordinal] = try previous_input.valueAt(&execution, ordinal);
+                present[ordinal] = true;
+            }
+        };
         if (expression_set) |set| {
             try set.applyValuesWithExecution(&execution, values, present, if (self.default_mask != null) .apply_to_absent else .preserve_absence, self.default_mask);
             for (set.bindings) |binding| {

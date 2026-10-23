@@ -485,6 +485,7 @@ pub fn loadSettings(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, group
 
 pub fn applySettingCommand(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_id: u64, command: settings.Command, command_hash: [32]u8) !void {
     if (command.version != 1) return error.InvalidSettingRecord;
+    if (command.role_defaults_only and command.change != .put) return error.InvalidSettingRecord;
     const meta = try readMeta(alloc, txn, group_id);
     if (meta.revision != command.expected_revision) return;
     var arena = std.heap.ArenaAllocator.init(alloc);
@@ -516,11 +517,22 @@ pub fn applySettingCommand(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn
                 if (std.ascii.eqlIgnoreCase(prior.name, record.name) and prior.identity.id != record.identity.id) return error.InvalidSettingRecord;
             }
             if (existing) |prior| {
-                if (!std.mem.eql(u8, prior.name, record.name) or record.identity.generation != try std.math.add(u64, prior.identity.generation, 1)) return error.SettingCatalogChanged;
+                if (!std.mem.eql(u8, prior.name, record.name)) return error.SettingCatalogChanged;
+                if (command.role_defaults_only) {
+                    if (!std.meta.eql(prior.identity, record.identity) or !settings.sameDefinition(prior, record)) return error.SettingCatalogChanged;
+                } else {
+                    if (!settings.databaseBindingsRetained(record.role_defaults, prior)) return error.InvalidSettingRecord;
+                    if (record.identity.generation != try std.math.add(u64, prior.identity.generation, 1)) return error.SettingCatalogChanged;
+                }
             } else {
+                if (command.role_defaults_only) {
+                    const native_input = settings.builtinInput(record.name) orelse return error.SettingCatalogChanged;
+                    if (!settings.sameDefinition(native_input.record(record.identity), record)) return error.SettingCatalogChanged;
+                } else if (!settings.databaseBindingsRetained(record.role_defaults, null)) return error.InvalidSettingRecord;
                 if (record.identity.id != meta.next_id or record.identity.generation != 1) return error.SettingCatalogChanged;
                 next_id = try std.math.add(u64, meta.next_id, 1);
             }
+            try settings.requireDatabaseBindings(a, record, existing, SettingDatabaseReader{ .alloc = a, .txn = txn, .group = group_id });
             const key = try settingKeyAlloc(a, group_id, record.identity.id);
             const encoded = try std.json.Stringify.valueAlloc(a, record, .{});
             try txn.put(key, encoded);
@@ -537,6 +549,18 @@ pub fn applySettingCommand(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn
     try applyDelta(alloc, txn, group_id, .{ .upserts = @constCast(&[_]domain.Resource{}), .removes = @constCast(&[_]domain.Resource{}), .next_id = next_id }, meta, command_hash);
 }
 
+const SettingDatabaseReader = struct {
+    alloc: std.mem.Allocator,
+    txn: *docstore.DocStore.Txn,
+    group: u64,
+    pub fn requireDatabase(self: @This(), id: u64) !void {
+        if (id == domain.default_database_id) return;
+        var database = (try getById(self.alloc, self.txn, self.group, .database, id)) orelse return error.DatabaseNotFound;
+        defer database.deinit();
+        if (database.value.kind != .database or database.value.id != id or database.value.parent_id != 0) return error.InvalidCatalogRecord;
+    }
+};
+
 pub fn nameKeyAlloc(alloc: std.mem.Allocator, group_id: u64, kind: domain.Kind, parent: u64, name: []const u8) ![]u8 {
     try domain.validateResourceName(kind, name);
     return std.fmt.allocPrint(alloc, "\x00\x00__metadata_derived__:system_catalog_name:{d}:{s}:{d}:{s}", .{ group_id, @tagName(kind), parent, name });
@@ -551,7 +575,7 @@ pub fn readMeta(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_id:
     };
     var parsed = try std.json.parseFromSlice(Meta, alloc, bytes, .{});
     defer parsed.deinit();
-    if (parsed.value.version != 1 or parsed.value.next_id < 3) return error.InvalidCatalogRecord;
+    if (parsed.value.version != 1 or parsed.value.next_id < 3 or parsed.value.sequence_outcome_head == 0) return error.InvalidCatalogRecord;
     return parsed.value;
 }
 
@@ -697,7 +721,7 @@ pub const View = struct {
         return if (id == 0) null else (try self.byId(.tablespace, id)) orelse return error.TablespaceNotFound;
     }
     pub fn read(self: View, request: domain.Read) !domain.State {
-        if (request.kind == .table or request.kind == .view) return error.InvalidCatalogMutation;
+        if (domain.namespaceRelation(request.kind)) return error.InvalidCatalogMutation;
         const parent = if (request.kind == .namespace) ((try self.lookup(.database, 0, request.database)) orelse return error.DatabaseNotFound).id else 0;
         var out: std.ArrayListUnmanaged(domain.Resource) = .empty;
         if (request.name) |name| {
@@ -877,6 +901,21 @@ pub fn removeResource(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, gro
 }
 
 pub fn applyDelta(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_id: u64, delta: domain.Delta, previous: Meta, command_hash: [32]u8) !void {
+    {
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        const a = arena.allocator();
+        var changes = try settings.DatabaseChanges.init(a, delta.removes, delta.upserts, previous.next_id);
+        defer changes.deinit(a);
+        if (!changes.empty()) {
+            const records = try loadSettings(a, txn, group_id);
+            for (records) |record| if (try changes.applyAlloc(a, record)) |replacement| {
+                const key = try settingKeyAlloc(a, group_id, record.identity.id);
+                const bytes = try std.json.Stringify.valueAlloc(a, replacement, .{});
+                try txn.put(key, bytes);
+            };
+        }
+    }
     if (previous.revision == 0) {
         try writeResource(alloc, txn, group_id, domain.default_database);
         try writeResource(alloc, txn, group_id, domain.default_namespace);
@@ -906,7 +945,7 @@ pub fn applyDelta(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_i
     }
     for (delta.removes) |resource| try removeResource(alloc, txn, group_id, resource);
     for (delta.upserts) |resource| try writeResource(alloc, txn, group_id, resource);
-    const meta: Meta = .{ .revision = try std.math.add(u64, previous.revision, 1), .next_id = delta.next_id, .last_command = command_hash };
+    const meta: Meta = .{ .revision = try std.math.add(u64, previous.revision, 1), .next_id = delta.next_id, .last_command = command_hash, .sequence_outcome_head = previous.sequence_outcome_head };
     const key = try keyAlloc(alloc, group_id, "meta");
     defer alloc.free(key);
     const bytes = try std.json.Stringify.valueAlloc(alloc, meta, .{});
@@ -917,13 +956,19 @@ pub fn applyDelta(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_i
 /// Bootstrap a previously published standalone row journal without renumbering
 /// its logical catalog generation. Never overwrite an initialized authority.
 pub fn importState(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_id: u64, state: domain.State) !void {
-    if ((try readMeta(alloc, txn, group_id)).revision != 0) return error.CatalogGenerationChanged;
+    // The legacy logical envelope has no allocator-state lane. Never turn a
+    // portable import into a sequence reset; binary metadata snapshots carry
+    // definitions/counters together through their verified projection cut.
+    for (state.resources) |resource| if (resource.kind == .sequence) return error.SequenceCatalogStateRequired;
+    const previous = try readMeta(alloc, txn, group_id);
+    if (previous.revision != 0) return error.CatalogGenerationChanged;
     if (state.next_id < 3) return error.InvalidCatalogRecord;
     try writeResource(alloc, txn, group_id, domain.default_database);
     try writeResource(alloc, txn, group_id, domain.default_namespace);
     for (state.resources) |resource| try writeResource(alloc, txn, group_id, resource);
     for (state.settings, 0..) |record, i| {
         try record.validate();
+        try settings.requireDatabaseBindings(alloc, record, null, SettingDatabaseReader{ .alloc = alloc, .txn = txn, .group = group_id });
         if (record.identity.id >= state.next_id) return error.InvalidSettingRecord;
         for (state.settings[0..i]) |prior| if (prior.identity.id == record.identity.id or std.ascii.eqlIgnoreCase(prior.name, record.name)) return error.InvalidSettingRecord;
         const setting_key = try settingKeyAlloc(alloc, group_id, record.identity.id);
@@ -974,7 +1019,7 @@ pub fn importState(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_
     }
     const key = try keyAlloc(alloc, group_id, "meta");
     defer alloc.free(key);
-    const bytes = try std.json.Stringify.valueAlloc(alloc, Meta{ .revision = state.revision, .next_id = state.next_id }, .{});
+    const bytes = try std.json.Stringify.valueAlloc(alloc, Meta{ .revision = state.revision, .next_id = state.next_id, .sequence_outcome_head = previous.sequence_outcome_head }, .{});
     defer alloc.free(bytes);
     try txn.put(key, bytes);
 }

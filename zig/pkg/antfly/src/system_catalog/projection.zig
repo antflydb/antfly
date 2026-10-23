@@ -52,7 +52,11 @@ pub const TableListing = struct {
 /// Portable primary state, with logical identities and physical topology
 /// observed together. Derived indexes are reconstructed by the destination.
 pub const Export = struct {
+    pub const NativeCheckpoint = @import("../storage/hot_standby/metadata_effects.zig").CheckpointArtifact;
     epoch: u64,
+    /// This projection is not a definition-only restore envelope. The exact
+    /// native checkpoint owns counters, stable attributes and retry history.
+    native_checkpoint: ?NativeCheckpoint = null,
     tables: []metadata.TableRecord,
     ranges: []metadata.RangeRecord,
     system_catalog: domain.State = .{},
@@ -64,6 +68,15 @@ pub const Export = struct {
     installed_extensions: []extensions.InstalledExtension = &.{},
     extension_members: []extensions.ExtensionMember = &.{},
     extension_dependencies: []extensions.ExtensionDependency = &.{},
+};
+
+pub const CatalogCheckpoint = struct {
+    checkpoint: @import("../storage/hot_standby/metadata_effects.zig").CheckpointArtifact,
+    catalog_json: []u8,
+
+    pub fn deinit(self: CatalogCheckpoint, alloc: std.mem.Allocator) void {
+        alloc.free(self.catalog_json);
+    }
 };
 
 /// Validate the portable policy manifest before staging any owner. Draft

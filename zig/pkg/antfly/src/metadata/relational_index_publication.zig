@@ -726,14 +726,7 @@ pub const OwnerRequest = struct {
     }
 };
 
-pub const RaftReporter = struct {
-    node_id: u64,
-    store_id: u64,
-
-    pub fn validate(self: RaftReporter) !void {
-        if (self.node_id == 0 or self.store_id == 0) return error.InvalidGenerationPublication;
-    }
-};
+pub const RaftReporter = @import("store_root_attestation.zig").RaftReporter;
 
 pub const ClaimGroups = struct {
     items: []const u64,
@@ -792,17 +785,7 @@ pub const NativeSigningView = @import("store_root_attestation.zig").NativeView;
 /// Fixed-size enrolled reporter/placement facts from the permission read.
 /// Neither this view nor a status report is a current Raft leader lease.
 /// The receiver separately pins its actual leader term and physical owner root.
-pub const RaftLocalScope = struct {
-    group_id: u64,
-    namespace: local.storage_db_doc_identity.Namespace,
-    reporter: RaftReporter,
-    reporter_incarnation: u64,
-    replica_id: u64,
-    replica_catalog_revision: u64,
-    root_generation: u64,
-    leader_term: u64,
-    completed_index: u64,
-};
+pub const RaftLocalScope = @import("store_root_attestation.zig").RaftLocalScope;
 
 pub const RaftSigningView = struct {
     identity: @import("store_root_enrollment.zig").Identity,
@@ -2574,7 +2557,7 @@ fn prepareInputCandidate(alloc: Allocator, input: anytype) !candidate_mod.Candid
     std.base64.standard.Decoder.decode(predecessor, input.catalog_before_b64) catch return error.InvalidIndexPublicationCandidate;
     var candidate = try candidate_mod.Candidate.prepare(alloc, input.before.table_id, input.before.schema_json, input.after.schema_json, predecessor, input.index_name);
     errdefer candidate.deinit();
-    if (!try @import("../api/tables.zig").foreignKeyPublicationIndexesValid(s, input.before.name, input.before.indexes_json, input.after.indexes_json, input.after.schema_json, candidate.next.catalog.schema_version))
+    if (!try @import("../api/tables.zig").foreignKeyPublicationIndexesValid(s, input.before.name, input.before.indexes_json, input.after.indexes_json, input.after.schema_json, candidate.next.catalog.schema_version, input.before.full_text_read_index))
         return error.InvalidIndexPublicationCandidate;
     return candidate;
 }

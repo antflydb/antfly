@@ -3606,18 +3606,7 @@ pub fn importStoreSnapshotWithIo(
     while (offset < decoded.entries.len) {
         try cancellation.check();
         const end = @min(offset + batch_size, decoded.entries.len);
-        const writes = try alloc.alloc(docstore_mod.KVPair, end - offset);
-        defer alloc.free(writes);
-        var count: usize = 0;
-        for (decoded.entries[offset..end]) |entry| {
-            if (@import("../artifact_footprint.zig").isKey(entry.key)) continue;
-            writes[count] = .{
-                .key = entry.key,
-                .value = entry.value,
-            };
-            count += 1;
-        }
-        try store.putBatch(writes[0..count], &.{});
+        try flushStoreSnapshotBatch(store, decoded.entries[offset..end]);
         offset = end;
     }
 
@@ -3908,25 +3897,43 @@ fn importStreamingStoreSnapshot(
         batch_bytes = std.math.add(usize, batch_bytes, record_bytes) catch
             return error.InvalidTableFile;
         if (batch.items.len >= store_snapshot_batch_entries or batch_bytes >= store_snapshot_batch_bytes) {
-            try flushStoreSnapshotBatch(alloc, store, batch.items);
+            try flushStoreSnapshotBatch(store, batch.items);
             freeStoreSnapshotBatch(alloc, batch.items);
             batch.clearRetainingCapacity();
             batch_bytes = 0;
         }
     }
     if (batch.items.len > 0) {
-        try flushStoreSnapshotBatch(alloc, store, batch.items);
+        try flushStoreSnapshotBatch(store, batch.items);
         freeStoreSnapshotBatch(alloc, batch.items);
         batch.clearRetainingCapacity();
     }
     try store.sync(true);
 }
 
-fn flushStoreSnapshotBatch(alloc: Allocator, store: *docstore_mod.DocStore, entries: []const docstore_mod.OwnedKVPair) !void {
-    const writes = try alloc.alloc(docstore_mod.KVPair, entries.len);
-    defer alloc.free(writes);
-    for (entries, 0..) |entry, index| writes[index] = .{ .key = entry.key, .value = entry.value };
-    try store.putBatch(writes, &.{});
+fn flushStoreSnapshotBatch(store: *docstore_mod.DocStore, entries: anytype) !void {
+    // This is installation of a complete physical image into the restore
+    // caller's unpublished generation, not logical mutation replay. Running
+    // DocStore capture here would mint retained effects / derived mutations
+    // while source authority, namespace and replay records are only partially
+    // imported, and incorrectly rejects a valid control+namespace batch.
+    // The shared importer validates the image before publication and rebuilds
+    // the destination-local footprint certificate after the complete stream.
+    var batch = try store.runtime_store.beginBatch();
+    errdefer batch.abort();
+    for (entries) |entry| {
+        if (@import("../artifact_footprint.zig").isKey(entry.key)) continue;
+        try batch.put(entry.key, entry.value);
+    }
+    // Raw installation must invalidate owner-local hints even if the backend
+    // reports an ambiguous commit. They are not durable restore evidence.
+    store.retained_effects_cache.store(0, .release);
+    store.replay_index_state.store(0, .release);
+    store.next_replay_sequence_cached.store(0, .release);
+    store.committed_replay_next_cached.store(0, .release);
+    _ = store.query_generation_revision.fetchAdd(1, .acq_rel);
+    _ = store.columnar_revision.fetchAdd(1, .acq_rel);
+    try batch.commit();
 }
 
 fn freeStoreSnapshotBatch(alloc: Allocator, entries: []const docstore_mod.OwnedKVPair) void {

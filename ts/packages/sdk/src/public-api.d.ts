@@ -848,6 +848,30 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/db/v1/sql/operations/status": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Observe an exact retained SQL catalog operation
+         * @description Read-only, body-bound observation of the original native catalog operation.
+         *     Requires current administrative permission on its qualified logical resource.
+         *     It does not execute, rebind, retry or admit a mutation. A retained rejection
+         *     includes its precise SQL diagnostic. Unknown or evicted outcomes remain
+         *     non-retryable SQLSTATE 40003; reconcile administratively rather than replaying.
+         */
+        post: operations["getSQLCatalogOperation"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/db/v1/sql/connections": {
         parameters: {
             query?: never;
@@ -2507,6 +2531,28 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/db/v1/tables/{tableName}/schema/publication": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        /**
+         * Observe an exact validation-only schema publication
+         * @description Requires administration of the current logical table. This read never replays DDL; absent or unavailable observations cannot prove non-admission.
+         */
+        get: operations["getSchemaValidationPublication"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/db/v1/tables/{tableName}/indexes/{indexName}/publication": {
         parameters: {
             query?: never;
@@ -3050,6 +3096,30 @@ export interface paths {
         post: operations["createNamespaceTableIndex"];
         /** Drop an index from an explicit namespace table */
         delete: operations["dropNamespaceTableIndex"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/schema/publication": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                databaseName: string;
+                namespaceName: string;
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        /**
+         * Observe an exact namespaced validation-only schema publication
+         * @description Requires administration of the current logical table. This read never replays DDL; absent or unavailable observations cannot prove non-admission.
+         */
+        get: operations["getNamespaceSchemaValidationPublication"];
+        put?: never;
+        post?: never;
+        delete?: never;
         options?: never;
         head?: never;
         patch?: never;
@@ -5741,6 +5811,11 @@ export interface components {
          * @enum {string}
          */
         SQLArrayElementType: "text" | "int16" | "int32" | "int64" | "float32" | "float64" | "boolean" | "uuid" | "jsonb" | "numeric";
+        /**
+         * @description Exact temporal identity for datetime-family SQL values. Omission means timestamp_tz. Intervals preserve separate calendar months, days, and microseconds and use PostgreSQL interval text in JSON results.
+         * @enum {string}
+         */
+        SQLTemporalKind: "date" | "time" | "time_tz" | "timestamp" | "timestamp_tz" | "interval";
         SQLArrayDimension: {
             length: number;
             lower_bound: number;
@@ -5766,6 +5841,7 @@ export interface components {
             /** @description Display label. Labels need not be unique; rows use matching ordinal positions. */
             name: string;
             type: components["schemas"]["SQLColumnType"];
+            temporal_kind?: components["schemas"]["SQLTemporalKind"];
             /** @description Required for array columns and exact NUMERIC number columns. Identifies scalar widths when supplied. The descriptor applies even to NULL or empty arrays. */
             element_type?: components["schemas"]["SQLArrayElementType"];
             /** @description Present only for constrained NUMERIC scalar or array results. Prepared result metadata is stable before execution-time constant folding. */
@@ -5811,6 +5887,7 @@ export interface components {
         /** @description Immutable positional input contract. Element identity also preserves primitive widths; array inputs require it. Unknown slots have no SQL constraint. */
         SQLParameterDescriptor: {
             type: components["schemas"]["SQLColumnType"];
+            temporal_kind?: components["schemas"]["SQLTemporalKind"];
             element_type?: components["schemas"]["SQLArrayElementType"];
             nullable: boolean;
         };
@@ -5951,6 +6028,7 @@ export interface components {
             command_tag: string;
             mutation_outcome?: components["schemas"]["SQLMutationOutcome"];
             ddl_receipt?: components["schemas"]["SQLDDLReceipt"];
+            catalog_receipt?: components["schemas"]["SQLCatalogOperationReceipt"];
             /** @description Native transaction receipt for visibility or repair reconciliation; never replay a committed statement. */
             transaction_id?: string;
             /** @description Opaque SQL session identifier for subsequent requests. */
@@ -5961,12 +6039,14 @@ export interface components {
         SQLDDLReceiptState: "ready" | "pending" | "invalid" | "admission_unknown";
         /**
          * @description Durable DDL operation receipt. admission_unknown means admission has
-         *     not been confirmed; retain the matching restore job, FK publication ID, or
-         *     index publication token and reconcile its status without replaying DDL.
+         *     not been confirmed; retain the matching restore job, FK publication ID,
+         *     index publication token, or schema validation token and reconcile its
+         *     status without replaying DDL.
          *     Pending means a durable operation was admitted, not necessarily that its
          *     successor schema is published. Invalid means declaration validation failed.
          *     Do not replay either. For an index build, observe the exact publication
-         *     token; otherwise inspect its restore job or table constraint status using
+         *     token. For validation-only schema changes, observe the exact schema
+         *     validation token; otherwise inspect its restore job or table constraint status using
          *     this immutable table identity and schema generation. A later generation
          *     may supersede the completed operation.
          */
@@ -5986,6 +6066,75 @@ export interface components {
             /** @description Immutable FK-generation publication identity. Retain it when admission is unknown or activation remains pending; do not replay DDL. */
             fk_generation_publication_id?: string;
             index_publication_token?: components["schemas"]["IndexPublicationToken"];
+            schema_validation_token?: components["schemas"]["SchemaValidationToken"];
+        };
+        /** @description Opaque immutable validation-only schema job identity. Retain it across timeouts or lost replies and observe its exact status without replaying DDL. It grants no authorization. */
+        SchemaValidationToken: string;
+        /** @enum {string} */
+        SchemaValidationState: "admission_unknown" | "pending" | "succeeded" | "canceled" | "failed";
+        /** @enum {string} */
+        SchemaValidationPhase: "validating" | "validated" | "installing" | "installed" | "releasing" | "succeeded" | "canceling" | "canceled";
+        /** @enum {string} */
+        SchemaValidationFailure: "requested" | "not_null_violation" | "owner_failed";
+        /** @description Historical job completion, not an authorization or promise that a later DDL has not superseded this schema. Success requires all owner installation, metadata publication and fence release barriers. Current table ownership is checked atomically with the job observation. */
+        SchemaValidationStatus: {
+            schema_validation_token: components["schemas"]["SchemaValidationToken"];
+            table_id: string;
+            /** Format: int64 */
+            active_schema_version: number;
+            state: components["schemas"]["SchemaValidationState"];
+            phase?: components["schemas"]["SchemaValidationPhase"];
+            failure?: components["schemas"]["SchemaValidationFailure"];
+            /** Format: int32 */
+            owner_count?: number;
+            /** Format: int32 */
+            ready?: number;
+            /** Format: int32 */
+            installed?: number;
+            /** Format: int32 */
+            released?: number;
+            /** Format: int32 */
+            canceled?: number;
+        };
+        /**
+         * @description Native catalog resource kind; never a synthetic physical table.
+         * @enum {string}
+         */
+        SQLCatalogObjectKind: "sequence";
+        /** @enum {string} */
+        SQLCatalogOperationKind: "create" | "alter" | "rename" | "drop";
+        /**
+         * @description A retained authoritative result, or an unconfirmed outcome. Unknown is never permission to replay DDL.
+         * @enum {string}
+         */
+        SQLCatalogOperationState: "committed" | "rejected" | "unknown";
+        /**
+         * @description Recovery receipt for an atomic native catalog mutation, separate from
+         *     physical table/schema publication receipts. Retain recovery_token and
+         *     observe it with getSQLCatalogOperation; never resubmit uncertain DDL.
+         *     Retention is bounded by catalog activity, not a promised wall-clock
+         *     interval. Missing, expired, inaccessible or superseded-authority outcomes
+         *     cannot be inferred from a current object name and remain unknown.
+         *     This receipt does not make a new request idempotent or recover a token
+         *     lost with an entire response. All identity integers are exact decimal strings.
+         */
+        SQLCatalogOperationReceipt: {
+            kind: components["schemas"]["SQLCatalogObjectKind"];
+            operation: components["schemas"]["SQLCatalogOperationKind"];
+            database: string;
+            namespace: string;
+            name: string;
+            state: components["schemas"]["SQLCatalogOperationState"];
+            /** @description Opaque versioned operation handle. Send it unchanged; it is not a reusable admission ticket. */
+            recovery_token: string;
+            /** @description Actual committed catalog identity, when the result carries one; never a predicted allocation. */
+            object_id?: string;
+            generation?: string;
+            catalog_revision?: string;
+            diagnostic?: components["schemas"]["SQLDiagnostic"];
+        };
+        SQLCatalogRecoveryRequest: {
+            recovery_token: string;
         };
         SQLDiagnostic: {
             /** @description Five-character SQLSTATE error code. */
@@ -16005,7 +16154,7 @@ export interface components {
             aggregates?: components["schemas"]["AlgebraicAggregateConfig"][];
         };
         /** @enum {string} */
-        RelationalExpressionOp: "literal" | "column" | "add" | "subtract" | "multiply" | "divide" | "negate" | "concat" | "coalesce" | "lower_ascii" | "upper_ascii" | "eq" | "ne" | "gt" | "gte" | "lt" | "lte" | "is_null" | "is_not_null" | "is_distinct" | "is_not_distinct" | "and" | "or" | "not" | "cast" | "case_when" | "modulo" | "in_list" | "not_in_list" | "array" | "replace" | "md5" | "abs" | "ceil" | "floor" | "round" | "trunc" | "sign" | "sqrt" | "jsonb_typeof" | "jsonb_array_length" | "jsonb_extract_path" | "jsonb_extract_path_text";
+        RelationalExpressionOp: "literal" | "column" | "add" | "subtract" | "multiply" | "divide" | "negate" | "concat" | "coalesce" | "lower_ascii" | "upper_ascii" | "eq" | "ne" | "gt" | "gte" | "lt" | "lte" | "is_null" | "is_not_null" | "is_distinct" | "is_not_distinct" | "and" | "or" | "not" | "cast" | "case_when" | "modulo" | "in_list" | "not_in_list" | "array" | "replace" | "md5" | "abs" | "ceil" | "floor" | "round" | "trunc" | "sign" | "sqrt" | "jsonb_typeof" | "jsonb_array_length" | "jsonb_extract_path" | "jsonb_extract_path_text" | "uuidv4" | "uuidv7";
         /** @enum {string} */
         RelationalExpressionType: "string" | "blob" | "boolean" | "datetime" | "integer" | "number" | "numeric" | "sql_array" | "json";
         /**
@@ -16031,10 +16180,15 @@ export interface components {
          */
         SQLBuiltinType: "text" | "int16" | "int32" | "int64" | "float32" | "float64" | "boolean" | "uuid" | "jsonb" | "numeric";
         /**
-         * @description Immutable typed scalar expression, limited to 128 nodes and 16 levels.
+         * @description Typed scalar expression, limited to 128 nodes and 16 levels. CHECK,
+         *     generated-column and index expressions must be immutable. UUIDv4 and
+         *     UUIDv7 generation are permitted only in column defaults and require
+         *     reader capability version 33. They run once during owned row
+         *     preparation, never during schema publication or restore verification.
+         *     The uuidv4 and uuidv7 operations take no args; uuidv7 may specify shift.
          *     A literal requires type; omitted value means typed null. A column
          *     requires column; other
-         *     operations require args. Unknown or irrelevant fields are rejected.
+         *     operations except uuidv4 and uuidv7 require args. Unknown or irrelevant fields are rejected.
          *     Arithmetic operands have the same integer or number type. Integer
          *     division truncates toward zero. Overflow and division by zero reject
          *     the write. Arithmetic and string operations propagate null. ASCII case
@@ -16142,6 +16296,8 @@ export interface components {
             numeric_modifier?: components["schemas"]["SQLNumericModifier"];
             /** @description Typed literal value, including null. */
             value?: unknown;
+            /** @description Canonical PostgreSQL interval text, accepted only on a uuidv7 default operation. SQL lowering resolves and binds calendar months, days, and microseconds before publication. Omission generates an unshifted UUID; SQL NULL shifts lower to a NULL literal instead. Infinite intervals remain representable declarations but fail when evaluated. */
+            shift?: string;
             /** @description For a literal of type json only. True denotes present JSON null and requires value to be omitted or null. False or omission leaves an omitted/null value as SQL NULL. This explicit marker survives SDKs that omit optional null values. Requires reader capability version 30. */
             json_null?: boolean;
             column?: string;
@@ -16446,6 +16602,8 @@ export interface components {
             origin?: components["schemas"]["RelationalUniqueConstraintOrigin"];
             /** @description SQL primary-key identity. At most one per relational table; all key columns must be required and nonnullable. */
             primary?: boolean;
+            /** @description Non-key payload columns for this constraint's covering ordered index. They never participate in uniqueness, foreign-key target identity, or primary-key nullability. Only column-key, constraint-owned declarations support INCLUDE. */
+            include_columns?: string[];
             columns?: string[];
             /** @description Typed native unique keys. Specify either columns or keys. */
             keys?: components["schemas"]["RelationalIndexKey"][];
@@ -25763,6 +25921,39 @@ export interface operations {
             500: components["responses"]["InternalServerError"];
         };
     };
+    getSQLCatalogOperation: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SQLCatalogRecoveryRequest"];
+            };
+        };
+        responses: {
+            /** @description Exact retained operation result or explicitly unknown outcome */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SQLCatalogOperationReceipt"];
+                };
+            };
+            /** @description Authentication, current authorization, token or observation admission failed */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SQLDiagnostic"];
+                };
+            };
+        };
+    };
     openSQLConnection: {
         parameters: {
             query?: never;
@@ -28476,6 +28667,53 @@ export interface operations {
             500: components["responses"]["InternalServerError"];
         };
     };
+    getSchemaValidationPublication: {
+        parameters: {
+            query?: never;
+            header: {
+                "X-Antfly-Schema-Validation-Token": components["schemas"]["SchemaValidationToken"];
+            };
+            path: {
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Exact historical job and current table observation */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SchemaValidationStatus"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            /** @description Current logical table administration is required */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            404: components["responses"]["NotFound"];
+            /** @description Table ownership or metadata incarnation changed */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Metadata observation unavailable; retain the token and retry this read */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
     getIndexPublication: {
         parameters: {
             query?: never;
@@ -29721,6 +29959,55 @@ export interface operations {
             500: components["responses"]["InternalServerError"];
             /** @description Catalog target cannot be delegated to legacy table storage unambiguously. */
             501: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    getNamespaceSchemaValidationPublication: {
+        parameters: {
+            query?: never;
+            header: {
+                "X-Antfly-Schema-Validation-Token": components["schemas"]["SchemaValidationToken"];
+            };
+            path: {
+                databaseName: string;
+                namespaceName: string;
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Exact historical job and current table observation */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SchemaValidationStatus"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            /** @description Current logical table administration is required */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            404: components["responses"]["NotFound"];
+            /** @description Table ownership or metadata incarnation changed */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Metadata observation unavailable; retain the token and retry this read */
+            503: {
                 headers: {
                     [name: string]: unknown;
                 };

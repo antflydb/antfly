@@ -413,7 +413,7 @@ pub const Candidates = struct {
                     object = typed.object;
                     try json_null_fields.appendSlice(alloc, try self.target.documentRootNulls(alloc, typed));
                 } else {
-                    try object.put(alloc, field.path, typed);
+                    try field.assignStorageValue(alloc, &object, typed, datum.sql_null);
                     if (!datum.sql_null and typed == .null and field.type == .json) try json_null_fields.append(alloc, field.path);
                 }
             }

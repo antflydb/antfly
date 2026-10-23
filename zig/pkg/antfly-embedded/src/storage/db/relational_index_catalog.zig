@@ -676,8 +676,10 @@ pub const Controller = struct {
 
     pub fn isReservedMetadataKey(key: []const u8) bool {
         return std.mem.eql(u8, key, head_key) or std.mem.startsWith(u8, key, blob_prefix) or
-            std.mem.eql(u8, key, @import("relational_nullability_job.zig").key) or
-            std.mem.startsWith(u8, key, @import("relational_nullability_job.zig").key ++ ":") or
+            std.mem.startsWith(u8, key, @import("relational_nullability_job.zig").family_prefix) or
+            std.mem.startsWith(u8, key, @import("relational_schema_apply_outcome.zig").family_prefix) or
+            std.mem.startsWith(u8, key, @import("relational_schema_apply_outcome.zig").head_family_prefix) or
+            std.mem.startsWith(u8, key, @import("../transaction_debt.zig").family_prefix) or
             std.mem.eql(u8, key, @import("relational_index_owner_job.zig").key) or
             // The entire private owner family is reserved, including future
             // validation/receipt slots. An enumerated list left new protocol

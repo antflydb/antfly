@@ -75,6 +75,8 @@ pub fn add(
                         b.fmt("storage.{s}.", .{std.fs.path.stem(test_sources[index])}),
                         "compiled structural reconciliation publishes",
                         "api.kernel_owner_source.",
+                        "schema apply queue",
+                        "compiled schema apply control",
                         "compiled startup catch-up retains exact retries",
                         "compiled owner coordinated ttl admission",
                         "source owner deadlines normalize executor clock epochs",
@@ -115,7 +117,7 @@ pub fn add(
     const handoff_tests = @import("linked_tests.zig").add(b, .{
         .name = "storage-owner-handoff-reopen-tests",
         .root_module = physical_module,
-        .filters = &.{ "storage owner handoff receipt survives shared-context hidden to public reopen", "storage owner Raft schema controls cross the checked archive", "storage owner durable catalog cold open" },
+        .filters = &.{ "storage owner handoff receipt survives shared-context hidden to public reopen", "storage owner Raft schema controls cross the checked archive", "storage owner native schema controls cross the checked archive", "storage owner durable catalog cold open" },
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     handoff_tests.executable.root_module.addObject(test_metadata.object);

@@ -307,8 +307,11 @@ pub const TableSchema = struct {
     requires_json_expressions: bool = false,
     /// JSONB array elements preserve display scale independently of logical hashes.
     requires_jsonb_array_display: bool = false,
-    /// Declared CHECK validity is independent of future-write enforcement.
-    requires_deferred_check_validation: bool = false,
+    /// Deferred PRIMARY KEY uniqueness and declared CHECK validity require
+    /// the shared constraint-timing/validation reader contract.
+    requires_deferred_constraints: bool = false,
+    /// UUID generation is admitted only in owned default preparation.
+    requires_uuid_defaults: bool = false,
     exact_fields: []const ExactField = &.{},
     dynamic_templates: []const DynamicTemplate = &.{},
     declared_fields: []const DeclaredField = &.{},
@@ -444,7 +447,8 @@ pub fn requiredReaderVersion(schema: TableSchema) u32 {
         .{ "requires_jsonb_display", 29 },
         .{ "requires_json_expressions", 30 },
         .{ "requires_jsonb_array_display", 31 },
-        .{ "requires_deferred_check_validation", 32 },
+        .{ "requires_deferred_constraints", 32 },
+        .{ "requires_uuid_defaults", 33 },
     }) |requirement| {
         if (@field(schema, requirement[0])) version = @max(version, requirement[1]);
     }
@@ -462,14 +466,8 @@ test "relational index system schema reader requirements cover every durable exp
     const a = std.testing.allocator;
     // Independent expected floors: adding another requires_* field must extend
     // this contract, not silently default to a predecessor reader profile.
-    comptime {
-        var fields: usize = 0;
-        for (@typeInfo(TableSchema).@"struct".field_names) |name| {
-            if (std.mem.startsWith(u8, name, "requires_")) fields += 1;
-        }
-        if (fields != 14) @compileError("extend the independent schema reader capability contract for every requires_* field");
-    }
-    inline for (.{
+    const cases = .{
+        .{ "requires_public_schema", 13 },
         .{ "requires_typed_expressions", 18 },
         .{ "requires_predicate_expressions", 19 },
         .{ "requires_exact_numeric_expressions", 21 },
@@ -483,14 +481,27 @@ test "relational index system schema reader requirements cover every durable exp
         .{ "requires_jsonb_display", 29 },
         .{ "requires_json_expressions", 30 },
         .{ "requires_jsonb_array_display", 31 },
-        .{ "requires_deferred_check_validation", 32 },
-    }) |expected| {
+        .{ "requires_deferred_constraints", 32 },
+        .{ "requires_uuid_defaults", 33 },
+    };
+    comptime {
+        @setEvalBranchQuota(10_000);
+        for (@typeInfo(TableSchema).@"struct".field_names) |name| {
+            if (!std.mem.startsWith(u8, name, "requires_")) continue;
+            var matches: usize = 0;
+            for (cases) |expected| if (std.mem.eql(u8, name, expected[0])) {
+                matches += 1;
+            };
+            if (matches != 1) @compileError("extend the independent schema reader capability contract for " ++ name);
+        }
+    }
+    inline for (cases) |expected| {
         var schema: TableSchema = .{ .version = 1, .storage_mode = .relational, .requires_public_schema = true };
         @field(schema, expected[0]) = true;
         if (comptime std.mem.eql(u8, expected[0], "requires_array_constructors")) schema.requires_array_expressions = true;
         if (comptime std.mem.eql(u8, expected[0], "requires_exact_numeric_validation")) schema.relational_columns = &.{.{ .name = "n", .path = "n", .column_type = .numeric, .sql_element_type = .numeric }};
         try std.testing.expectEqual(@as(u32, expected[1]), requiredReaderVersion(schema));
-        try std.testing.expectError(error.UnsupportedVersion, serializeSchemaFormat(a, schema, expected[1] - 1));
+        try std.testing.expectError(if (expected[1] == 13) error.InvalidSchema else error.UnsupportedVersion, serializeSchemaFormat(a, schema, expected[1] - 1));
         const bytes = try serializeSchemaFormat(a, schema, expected[1]);
         defer a.free(bytes);
         const restored = try deserializeSchema(a, bytes);
@@ -590,7 +601,7 @@ pub fn schemasEqualForPublicBinding(alloc: Allocator, stored: TableSchema, deriv
         derived.requires_typed_expressions or derived.requires_predicate_expressions or
         derived.requires_exact_numeric_expressions or derived.requires_exact_numeric_validation or
         derived.requires_numeric_modifiers or derived.requires_array_expressions or
-        derived.requires_array_constructors or derived.requires_constant_index_predicates or derived.requires_text_expressions or derived.requires_numeric_functions or derived.requires_jsonb_display or derived.requires_json_expressions or derived.requires_jsonb_array_display or derived.requires_deferred_check_validation) return false;
+        derived.requires_array_constructors or derived.requires_constant_index_predicates or derived.requires_text_expressions or derived.requires_numeric_functions or derived.requires_jsonb_display or derived.requires_json_expressions or derived.requires_jsonb_array_display or derived.requires_deferred_constraints or derived.requires_uuid_defaults) return false;
     var projection = derived;
     projection.relational_columns = &.{};
     const documents = try alloc.dupe(FullTextDocument, derived.full_text_documents);
@@ -671,7 +682,8 @@ pub fn serializeTextProjectionSchema(alloc: Allocator, schema: TableSchema) ![]u
     projection_schema.requires_jsonb_display = false;
     projection_schema.requires_json_expressions = false;
     projection_schema.requires_jsonb_array_display = false;
-    projection_schema.requires_deferred_check_validation = false;
+    projection_schema.requires_deferred_constraints = false;
+    projection_schema.requires_uuid_defaults = false;
     const projection_documents = try alloc.dupe(FullTextDocument, schema.full_text_documents);
     defer alloc.free(projection_documents);
     for (projection_documents) |*doc| {
@@ -858,7 +870,8 @@ fn serializeSchemaFormat(alloc: Allocator, schema: TableSchema, format_version: 
     if (format_version >= 29) try buf.append(alloc, @intFromBool(schema.requires_jsonb_display));
     if (format_version >= 30) try buf.append(alloc, @intFromBool(schema.requires_json_expressions));
     if (format_version >= 31) try buf.append(alloc, @intFromBool(schema.requires_jsonb_array_display));
-    if (format_version >= 32) try buf.append(alloc, @intFromBool(schema.requires_deferred_check_validation));
+    if (format_version >= 32) try buf.append(alloc, @intFromBool(schema.requires_deferred_constraints));
+    if (format_version >= 33) try buf.append(alloc, @intFromBool(schema.requires_uuid_defaults));
     return buf.toOwnedSlice(alloc);
 }
 
@@ -1279,7 +1292,8 @@ fn deserializeSchemaOwned(alloc: Allocator, data: []const u8) !TableSchema {
         .requires_jsonb_display = if (fmt_version >= 29) data[pos + 10] == 1 else false,
         .requires_json_expressions = if (fmt_version >= 30) data[pos + 11] == 1 else false,
         .requires_jsonb_array_display = if (fmt_version >= 31) data[pos + 12] == 1 else false,
-        .requires_deferred_check_validation = if (fmt_version >= 32) data[pos + 13] == 1 else false,
+        .requires_deferred_constraints = if (fmt_version >= 32) data[pos + 13] == 1 else false,
+        .requires_uuid_defaults = if (fmt_version >= 33) data[pos + 14] == 1 else false,
         .exact_fields = exact_fields,
         .dynamic_templates = templates,
         .declared_fields = declared_fields,
@@ -1539,12 +1553,14 @@ fn validateSerializedSchema(data: []const u8) !void {
     if (format_version >= 30) try cursor.readBool();
     if (format_version >= 31) try cursor.readBool();
     if (format_version >= 32) try cursor.readBool();
+    if (format_version >= 33) try cursor.readBool();
     try cursor.finish();
 }
 
 fn validateRelationalSchema(alloc: Allocator, schema: TableSchema) !void {
     if (schema.requires_jsonb_array_display and (schema.storage_mode != .relational or !schema.requires_public_schema)) return error.InvalidSchema;
-    if (schema.requires_deferred_check_validation and (schema.storage_mode != .relational or !schema.requires_public_schema)) return error.InvalidSchema;
+    if (schema.requires_deferred_constraints and (schema.storage_mode != .relational or !schema.requires_public_schema)) return error.InvalidSchema;
+    if (schema.requires_uuid_defaults and (schema.storage_mode != .relational or !schema.requires_public_schema)) return error.InvalidSchema;
     if (schema.requires_json_expressions and (schema.storage_mode != .relational or !schema.requires_public_schema)) return error.InvalidSchema;
     if (schema.requires_jsonb_display and (schema.storage_mode != .relational or !schema.requires_public_schema)) return error.InvalidSchema;
     if (schema.requires_numeric_functions and (schema.storage_mode != .relational or !schema.requires_public_schema)) return error.InvalidSchema;

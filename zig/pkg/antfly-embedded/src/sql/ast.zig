@@ -36,6 +36,7 @@ pub const Scalar = union(enum) {
     cast: struct {
         operand: *const Scalar,
         type: ColumnType,
+        temporal_kind: ?@import("temporal_value.zig").Kind = null,
         element_type: ?@import("array_value.zig").ElementType = null,
         numeric_modifier: ?@import("../common/sql_builtin_type.zig").NumericModifier = null,
         /// Coercion origin controls binding diagnostics, not execution identity.
@@ -298,6 +299,18 @@ pub const Merge = struct {
 /// Array element identity belongs to the accompanying binding descriptor;
 /// an array is never represented as a JSON column or an unknown NULL type.
 pub const ColumnType = enum { string, uuid, integer, number, boolean, datetime, json, array };
+pub const ForeignKey = struct {
+    name: []const u8,
+    name_generated: bool = false,
+    columns: []const []const u8,
+    parent: []const u8,
+    parent_columns: []const []const u8,
+    on_delete: []const u8 = "no_action",
+    on_update: []const u8 = "no_action",
+    match: []const u8 = "simple",
+    deferrable: bool = false,
+    timing: []const u8 = "immediate",
+};
 pub const Column = struct {
     name: []const u8,
     type: ColumnType,
@@ -309,12 +322,56 @@ pub const Column = struct {
     nullable: bool = true,
     default_expression: ?*const Scalar = null,
     generated_expression: ?*const Scalar = null,
+    references: ?ForeignKey = null,
 };
-pub const CreateTable = struct { table: Name, columns: []const Column, constraints: []const SchemaChange = &.{}, if_not_exists: bool = false, tablespace: ?[]const u8 = null };
+/// Native document schema declarations are deliberately separate from SQL row
+/// columns: neither representation may silently discard the other's contract.
+pub const DocumentTable = struct {
+    default_type: ?[]const u8 = null,
+    enforce_types: bool = false,
+    schemas: []const struct { name: []const u8, schema_json: []const u8 },
+};
+pub const CreateTable = struct { table: Name, columns: []const Column, constraints: []const SchemaChange = &.{}, if_not_exists: bool = false, tablespace: ?[]const u8 = null, document: ?*const DocumentTable = null };
 pub const DropTable = struct { table: Name, if_exists: bool = false };
+/// Immutable SQL intent, not a catalog identity. OWNED BY names must bind to
+/// stable relation/attribute IDs in the authoritative catalog transaction.
+pub const SequenceOptions = struct {
+    values: @import("../system_catalog/sequences.zig").Options = .{},
+    data_type: ?Name = null,
+    /// Quoted "integer" is a type name, not the INTEGER grammar alias.
+    data_type_quoted: bool = false,
+    cache: ?i64 = null,
+    owned_by: union(enum) {
+        unchanged,
+        none,
+        column: struct { table: Name, column: []const u8 },
+    } = .unchanged,
+
+    /// Only the transaction-pinned catalog resolver may supply owner IDs.
+    /// Neither a name nor a column ordinal is an allocation credential.
+    pub fn bind(self: SequenceOptions, resolved: struct {
+        integer: ?@import("../system_catalog/sequences.zig").Integer = null,
+        owner: ?@import("../system_catalog/sequences.zig").OwnedBy = null,
+    }) !@import("../system_catalog/sequences.zig").Options {
+        if (self.values.owned_by != .unchanged or self.values.integer != null or self.values.cache != null) return error.InvalidSequenceDefinition;
+        if ((self.data_type != null) != (resolved.integer != null) or (self.data_type_quoted and self.data_type == null)) return error.InvalidSequenceDefinition;
+        var options = self.values;
+        options.integer = resolved.integer;
+        // Value validation belongs after object lookup, not in the parser:
+        // ALTER of a missing sequence must not become a CACHE-value error.
+        if (self.cache) |count| options.cache = @import("std").math.cast(u64, count) orelse return error.InvalidSequenceDefinition;
+        options.owned_by = switch (self.owned_by) {
+            .unchanged => if (resolved.owner == null) .unchanged else return error.InvalidSequenceDefinition,
+            .none => if (resolved.owner == null) .none else return error.InvalidSequenceDefinition,
+            .column => .{ .column = resolved.owner orelse return error.InvalidSequenceDefinition },
+        };
+        if (resolved.owner) |owner| try owner.validate();
+        return options;
+    }
+};
 pub const CatalogDdl = struct {
-    kind: enum { database, namespace, tablespace, table, index, view },
-    action: enum { create, drop, rename, set_tablespace, alter_schema, truncate },
+    kind: enum { database, namespace, tablespace, table, index, view, role, sequence },
+    action: enum { create, drop, rename, set_tablespace, alter_schema, truncate, role_default, comment, alter_sequence },
     name: Name,
     new_name: ?[]const u8 = null,
     tablespace: ?[]const u8 = null,
@@ -329,6 +386,10 @@ pub const CatalogDdl = struct {
     index_targets: []const Name = &.{},
     concurrently: bool = false,
     view_definition: ?ViewDefinition = null,
+    role_setting: ?struct { name: []const u8, database: ?[]const u8, value: ?Value } = null,
+    comment_value: ?[]const u8 = null,
+    sequence_options: ?SequenceOptions = null,
+    sequence_targets: []const Name = &.{},
 };
 /// Compiler-owned view intent. The parsed query is reused for semantic
 /// preparation; retained text is for durable definition/rebinding, not execution.
@@ -342,28 +403,20 @@ pub const ViewDefinition = struct {
 };
 pub const SchemaChange = union(enum) {
     drop_constraint: []const u8,
+    rename_constraint: struct { name: []const u8, new_name: []const u8 },
     validate_constraint: []const u8,
-    add_unique: struct { name: []const u8, columns: []const []const u8, name_generated: bool = false, primary: bool = false, deferrable: bool = false, timing: []const u8 = "immediate", nulls_not_distinct: bool = false },
+    add_unique: struct { name: []const u8, columns: []const []const u8, include_columns: []const []const u8 = &.{}, name_generated: bool = false, primary: bool = false, deferrable: bool = false, timing: []const u8 = "immediate", nulls_not_distinct: bool = false },
     add_check: struct { name: []const u8, expression: *const Scalar, name_generated: bool = false, not_valid: bool = false },
-    add_foreign_key: struct {
-        name: []const u8,
-        name_generated: bool = false,
-        columns: []const []const u8,
-        parent: []const u8,
-        parent_columns: []const []const u8,
-        on_delete: []const u8 = "no_action",
-        on_update: []const u8 = "no_action",
-        match: []const u8 = "simple",
-        deferrable: bool = false,
-        timing: []const u8 = "immediate",
-    },
+    add_foreign_key: ForeignKey,
     create_index: struct { name: []const u8, keys: []const Order, include_columns: []const []const u8 = &.{}, unique: bool = false, predicate: ?*const Scalar = null, nulls_not_distinct: bool = false },
     drop_index: []const u8,
     add_column: Column,
     drop_column: []const u8,
+    rename_column: struct { name: []const u8, new_name: []const u8 },
     set_default: struct { column: []const u8, expression: *const Scalar },
     drop_default: []const u8,
     set_nullability: struct { column: []const u8, nullable: bool },
+    set_type: struct { column: Column, using: *const Scalar },
 
     /// Provenance is internal compiler data, never inferred from the spelling
     /// of an identifier or persisted as an editable public-schema attribute.
@@ -372,6 +425,7 @@ pub const SchemaChange = union(enum) {
             .add_unique => |rule| if (rule.name_generated) rule.name else null,
             .add_check => |rule| if (rule.name_generated) rule.name else null,
             .add_foreign_key => |rule| if (rule.name_generated) rule.name else null,
+            .add_column => |column| if (column.references) |rule| (if (rule.name_generated) rule.name else null) else null,
             else => null,
         };
     }
@@ -441,10 +495,13 @@ pub const CopyOptions = struct {
 pub const Begin = struct {
     isolation: @import("session.zig").Isolation = .serializable,
     mode: @import("session.zig").ReadMode = .read_write,
+    isolation_specified: bool = false,
+    mode_specified: bool = false,
+    deferrable: ?bool = null,
     syntax: enum { begin, start_transaction } = .begin,
 
     pub fn options(self: Begin) @import("session.zig").Begin {
-        return .{ .isolation = self.isolation, .mode = self.mode };
+        return .{ .isolation = self.isolation, .mode = self.mode, .deferrable = self.deferrable orelse false };
     }
 
     pub fn commandTag(self: Begin) []const u8 {
@@ -476,4 +533,52 @@ pub const Statement = union(enum) {
     rollback_to_savepoint: []const u8,
     release_savepoint: []const u8,
     set_constraints: struct { names: []const []const u8, deferred: bool },
+    set_transaction: @import("session.zig").Characteristics,
 };
+
+/// Only target postimages need a reserved write stamp. DELETE retains its
+/// captured preimage; SELECT and literal strings never start a transaction.
+pub fn returningWriteVersion(statement: Statement) bool {
+    const projections = switch (statement) {
+        .insert => |v| v.returning,
+        .update => |v| v.returning,
+        .merge => |v| v.returning,
+        else => return false,
+    } orelse return false;
+    for (projections) |projection| {
+        if (projection.expression) |expression| {
+            if (versionExpression(expression)) return true;
+        } else if (!projection.wildcard and versionName(projection.field)) return true;
+    }
+    return false;
+}
+
+fn versionName(name: []const u8) bool {
+    const std = @import("std");
+    return std.mem.eql(u8, name, "_version") or std.mem.endsWith(u8, name, "\x00_version");
+}
+
+fn versionExpression(expression: *const Scalar) bool {
+    return switch (expression.*) {
+        .literal => false,
+        .column => |name| versionName(name),
+        .cast => |v| versionExpression(v.operand),
+        .unary => |v| versionExpression(v.operand),
+        .binary => |v| versionExpression(v.left) or versionExpression(v.right),
+        .call => |v| blk: {
+            for (v.args) |arg| if (versionExpression(arg)) break :blk true;
+            if (v.filter) |filter| if (versionExpression(filter)) break :blk true;
+            // Scalar subqueries own captured read versions, not target images.
+            break :blk false;
+        },
+        .case_when => |v| blk: {
+            for (v.branches) |branch| if (versionExpression(branch.condition) or versionExpression(branch.value)) break :blk true;
+            break :blk if (v.otherwise) |other| versionExpression(other) else false;
+        },
+        .in_list => |v| blk: {
+            if (versionExpression(v.operand)) break :blk true;
+            for (v.values) |item| if (versionExpression(item)) break :blk true;
+            break :blk false;
+        },
+    };
+}

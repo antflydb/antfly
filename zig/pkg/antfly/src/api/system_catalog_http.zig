@@ -57,6 +57,7 @@ pub fn execute(source: anytype, alloc: std.mem.Allocator, request: operation.Req
     if (action) |mutation_action| {
         var mutation: domain.Mutation = .{ .action = mutation_action, .kind = route.kind, .name = route.name orelse return failure(alloc, error.InvalidCatalogName), .database = route.database, .namespace = route.namespace };
         switch (mutation_action) {
+            .alter => return failure(alloc, error.InvalidCatalogMutation),
             .create => if (route.kind == .query_source) {
                 const Input = struct { source: std.json.Value };
                 const input = std.json.parseFromSliceLeaky(Input, a, body, .{}) catch return failure(alloc, error.InvalidCatalogMutation);
@@ -105,7 +106,7 @@ fn projectMutation(alloc: std.mem.Allocator, a: std.mem.Allocator, kind: domain.
         .namespace => response(alloc, status, Namespace{ .namespace_id = resource.id, .database_id = resource.parent_id, .database_name = result.database_name orelse return error.InvalidCatalogRecord, .name = resource.name, .tablespace_name = result.tablespace_name }),
         .tablespace => response(alloc, status, try tablespaceValue(a, resource)),
         .query_source => response(alloc, status, try sourceValue(a, resource)),
-        .table, .view => error.InvalidCatalogMutation,
+        .table, .view, .sequence => error.InvalidCatalogMutation,
     };
 }
 
@@ -133,7 +134,7 @@ fn projectSnapshot(alloc: std.mem.Allocator, a: std.mem.Allocator, route: routes
             .namespace => response(alloc, status, try namespaceValue(&index, resource)),
             .tablespace => response(alloc, status, try tablespaceValue(a, resource)),
             .query_source => response(alloc, status, try sourceValue(a, resource)),
-            .table, .view => failure(alloc, error.InvalidCatalogMutation),
+            .table, .view, .sequence => failure(alloc, error.InvalidCatalogMutation),
         };
     }
     switch (route.kind) {
@@ -172,7 +173,7 @@ fn projectSnapshot(alloc: std.mem.Allocator, a: std.mem.Allocator, route: routes
             for (state.resources) |r| if (r.kind == .query_source) try out.append(a, try sourceValue(a, r));
             return response(alloc, status, out.items);
         },
-        .table, .view => return failure(alloc, error.InvalidCatalogMutation),
+        .table, .view, .sequence => return failure(alloc, error.InvalidCatalogMutation),
     }
 }
 

@@ -52,9 +52,9 @@ pub const Coordinator = struct {
         const tables = try request.distributedTables(alloc);
         defer if (tables.len != 0) alloc.free(tables);
         try server.validateCommitTablesAgainstSchema(self.context, tables);
-        if (try server.validateCommitReadSet(request) != null) {
+        if (try server.validateCommitReadSet(request)) |conflict| {
             if (!server.txn_sessions.removeBeforeExecution(alloc, id)) return .{ .outcome = .unknown, .reconciliation_id = id };
-            return .{ .outcome = .aborted, .reconciliation_id = id };
+            return .{ .outcome = .aborted, .reconciliation_id = id, .constraint_failure = if (conflict.reason == .unique_constraint_violation) .unique_constraint_violation else null };
         }
         if (tables.len == 0) {
             if (!server.txn_sessions.commitBeforeExecution(alloc, id)) return .{ .outcome = .unknown, .reconciliation_id = id };
@@ -84,13 +84,20 @@ pub const Coordinator = struct {
             }, .reconciliation_id = id };
         }) orelse return .{ .outcome = .unknown, .reconciliation_id = id };
         switch (outcome) {
-            .conflict => {
+            .conflict => |conflict| {
                 // The storage coordinator has proved a definite abort, but
                 // connection detachment is a separate fallible publication.
                 // Persist the abort before responding so a lost detach can be
                 // reconciled without treating a missing txn as an abort.
-                _ = (server.txn_sessions.recordTerminalAbort(alloc, id) catch return .{ .outcome = .unknown, .reconciliation_id = id }) orelse return .{ .outcome = .unknown, .reconciliation_id = id };
-                return .{ .outcome = .aborted, .reconciliation_id = id };
+                const unknown: sql.CommitResult = .{ .outcome = .unknown, .reconciliation_id = id };
+                const persisted = server.txn_sessions.recordTerminalAbortWithReason(alloc, id, conflict.reason);
+                _ = (persisted catch return unknown) orelse return unknown;
+                const reason: ?sql.ConstraintFailure = if (conflict.reason) |value| switch (value) {
+                    .unique_constraint_violation => .unique_constraint_violation,
+                    .foreign_key_parent_missing => .foreign_key_parent_missing,
+                    .foreign_key_referenced => .foreign_key_referenced,
+                } else null;
+                return .{ .outcome = .aborted, .reconciliation_id = id, .constraint_failure = reason };
             },
             .committed => |committed| {
                 const status = transactions.terminalCommitStatusForOutcome(committed.propagation_pending, committed.visibility_pending, committed.visibility_retry_pending, committed.visibility_repair_required);
@@ -144,11 +151,19 @@ pub const Adapter = struct {
         return state;
     }
 
+    pub fn setCharacteristics(self: *Adapter, scope: sql.Scope, id: sql.Id, changes: sql.Characteristics) !void {
+        var state = try self.check(scope, id);
+        defer state.deinit(self.alloc);
+        if ((changes.isolation orelse state.metadata.isolation) != .read_committed and !self.supports_range_guards) return error.SqlRangeTrackingRequired;
+        try self.registry.setSqlCharacteristics(self.alloc, id, changes);
+    }
+
     fn begin(ptr: *anyopaque, scope: sql.Scope, options: sql.Begin) !sql.Transaction {
         const self = cast(ptr);
         // Stronger isolation requires native retained snapshots + range
         // validation, not a label on an ordinary staged transaction.
         if (options.isolation != .read_committed and !self.supports_range_guards) return error.SqlRangeTrackingRequired;
+        if (options.deferrable and options.isolation == .serializable and options.mode == .read_only) return error.UnsupportedSqlShape;
         const txn_id = transactions.newSessionTxnId(self.node_id);
         if (self.connection_id) |connection| try self.connectionMutation(scope, .{ .begin = .{
             .id = connection,
@@ -160,6 +175,7 @@ pub const Adapter = struct {
             .namespace = scope.namespace,
             .isolation = options.isolation,
             .mode = options.mode,
+            .deferrable = options.deferrable,
         } }, self.node_id, if (scope.principal.len == 0) null else scope.principal, self.connection_overlay, self.connection_id, txn_id) catch |err| {
             if (self.connection_id) |connection| self.connectionMutation(scope, .{ .abort_begin = .{ .id = connection, .txn_id = txn_id } }) catch {};
             return err;
@@ -172,21 +188,28 @@ pub const Adapter = struct {
                 self.connectionMutation(scope, .{ .abort_begin = .{ .id = connection, .txn_id = info.txn_id } }) catch {};
             return err;
         };
-        return .{ .id = info.txn_id, .state = .active, .isolation = options.isolation, .mode = options.mode, .started_at = try clock.Instant.fromUnixMicroseconds(@divFloor(@as(i128, info.begin_timestamp), 1000)) };
+        return .{ .id = info.txn_id, .state = .active, .isolation = options.isolation, .mode = options.mode, .started_at = try clock.Instant.fromUnixMicroseconds(@divFloor(@as(i128, info.begin_timestamp), 1000)), .write_version = try @import("distributed_txn.zig").commitVersion(info.begin_timestamp) };
     }
 
     fn inspect(ptr: *anyopaque, scope: sql.Scope, id: sql.Id) !sql.Transaction {
         const self = cast(ptr);
         var state = try self.check(scope, id);
         defer state.deinit(self.alloc);
-        return .{ .id = id, .isolation = state.metadata.isolation, .mode = state.metadata.mode, .savepoints = state.savepoints, .started_at = try clock.Instant.fromUnixMicroseconds(@divFloor(@as(i128, state.begin_timestamp), 1000)), .state = if (state.terminal_abort) .aborted else if (state.terminal != null) .committed else if (state.execution_started) .uncertain else if (state.metadata.failed) .failed else .active };
+        return .{ .id = id, .isolation = state.metadata.isolation, .mode = state.metadata.mode, .savepoints = state.savepoints, .started_at = try clock.Instant.fromUnixMicroseconds(@divFloor(@as(i128, state.begin_timestamp), 1000)), .write_version = try @import("distributed_txn.zig").commitVersion(state.begin_timestamp), .state = if (state.terminal_abort) .aborted else if (state.terminal != null) .committed else if (state.execution_started) .uncertain else if (state.metadata.failed) .failed else .active };
     }
 
     fn commit(ptr: *anyopaque, scope: sql.Scope, id: sql.Id) !sql.CommitResult {
         const self = cast(ptr);
         var state = try self.check(scope, id);
         defer state.deinit(self.alloc);
-        if (state.terminal_abort) return .{ .outcome = .aborted, .reconciliation_id = id };
+        if (state.terminal_abort) {
+            const reason: ?sql.ConstraintFailure = if (state.terminal_abort_reason) |value| switch (value) {
+                .unique_constraint_violation => .unique_constraint_violation,
+                .foreign_key_parent_missing => .foreign_key_parent_missing,
+                .foreign_key_referenced => .foreign_key_referenced,
+            } else null;
+            return .{ .outcome = .aborted, .reconciliation_id = id, .constraint_failure = reason };
+        }
         if (state.execution_started or state.terminal != null) return error.SqlTransactionOutcomeUnknown;
         if (state.metadata.failed) return error.SqlTransactionAborted;
         const result = try self.commit_fn(self.commit_context, scope, id);

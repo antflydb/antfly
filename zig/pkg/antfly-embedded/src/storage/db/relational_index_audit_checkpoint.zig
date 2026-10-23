@@ -23,9 +23,9 @@ const claims = @import("relational_index_private_claims.zig");
 const generation = @import("relational_index_validation.zig");
 const jobs = @import("relational_index_owner_job.zig");
 const signing = @import("root_signing_identity.zig");
-const root_identity = @import("root_identity.zig");
+const checkpoints = @import("root_audit_checkpoint_io.zig");
+const io_errors: checkpoints.Errors = .{ .invalid = error.InvalidRelationalIndexValidation, .scope_changed = error.PrivateIndexAuditScopeChanged };
 const Context = @import("../../api/operation.zig").RequestContext;
-const fs_paths = @import("antfly_runtime_fs").fs_paths;
 const Allocator = std.mem.Allocator;
 const Digest = [32]u8;
 const magic = "AFRIA\x02\x00\x00";
@@ -96,10 +96,6 @@ fn message(bytes: []const u8) Digest {
     digest.final(&result);
     return result;
 }
-fn permissions() std.Io.File.Permissions {
-    if (comptime @import("builtin").os.tag == .windows) return .default_file;
-    return @fromBackingInt(0o600);
-}
 fn encode(alloc: Allocator, root: signing.State, physical_incarnation: u128, binding: jobs.Binding, expected: claims.TargetExpectation, state: State) ![]u8 {
     try state.validate(root, physical_incarnation, binding, expected);
     const header: Header = .{ .signing_root_incarnation = root.root_incarnation, .binding_digest = hash(&try binding.encode()), .inventory = state.inventory, .generation_scope = if (state.generation) |value| .{ .canonical_digest = value.canonical_digest, .inventory_audit_digest = value.inventory_audit_digest } else null };
@@ -158,33 +154,11 @@ pub const Guard = struct {
     context: Context,
     checkpoint_digest: ?Digest = null,
     pub fn deinit(self: *@This()) void {
-        self.lock.unlock(self.io);
-        self.lock.close(self.io);
-        self.directory.close(self.io);
-        self.alloc.free(self.path);
-        self.* = undefined;
-    }
-    fn requireRoot(self: *const @This()) !void {
-        try self.context.ensureActive();
-        const current = try root_identity.load(self.alloc, self.io, self.root_dir);
-        if (current.incarnation != self.root.root_incarnation) return error.PrivateIndexAuditScopeChanged;
-        const key = try signing.load(self.alloc, self.io, self.root_dir);
-        if (!equal(key.public_key, self.root.public_key)) return error.PrivateIndexAuditScopeChanged;
+        checkpoints.close(self);
     }
     pub fn load(self: *@This()) !?State {
         self.checkpoint_digest = null;
-        try self.requireRoot();
-        const file = self.directory.openFile(self.io, std.fs.path.basename(self.path), .{ .follow_symlinks = false }) catch |err| switch (err) {
-            error.FileNotFound => return null,
-            else => return err,
-        };
-        defer file.close(self.io);
-        const stat = try file.stat(self.io);
-        if (stat.kind != .file or stat.size > max_checkpoint) return error.InvalidRelationalIndexValidation;
-        if (comptime @import("builtin").os.tag != .windows) if ((stat.permissions.toMode() & 0o077) != 0) return error.InvalidRelationalIndexValidation;
-        var buffer: [4096]u8 = undefined;
-        var reader = file.reader(self.io, &buffer);
-        const bytes = try reader.interface.allocRemaining(self.alloc, .limited(max_checkpoint + 1));
+        const bytes = (try checkpoints.read(self, max_checkpoint, io_errors)) orelse return null;
         defer self.alloc.free(bytes);
         const result = decode(self.alloc, self.root, self.physical_incarnation, self.binding, self.expected, bytes) catch |err| switch (err) {
             // The canonical native job has one slot per namespace. A newly
@@ -198,39 +172,9 @@ pub const Guard = struct {
         return result;
     }
     pub fn save(self: *@This(), state: State) !void {
-        try self.requireRoot();
         const bytes = try encode(self.alloc, self.root, self.physical_incarnation, self.binding, self.expected, state);
         defer self.alloc.free(bytes);
-        const digest = hash(bytes);
-        if (self.checkpoint_digest) |previous| if (equal(previous, digest)) return;
-        const temporary = try std.fmt.allocPrint(self.alloc, "{s}.tmp", .{std.fs.path.basename(self.path)});
-        defer self.alloc.free(temporary);
-        // Only this exact job's private temporary file, under its held lock.
-        // A crash before rename leaves the old checkpoint authoritative.
-        self.directory.deleteFile(self.io, temporary) catch |err| switch (err) {
-            error.FileNotFound => {},
-            else => return err,
-        };
-        errdefer self.directory.deleteFile(self.io, temporary) catch {};
-        {
-            var file = try self.directory.createFile(self.io, temporary, .{ .exclusive = true, .permissions = permissions() });
-            defer file.close(self.io);
-            var buffer: [4096]u8 = undefined;
-            var writer = file.writer(self.io, &buffer);
-            try writer.interface.writeAll(bytes);
-            try writer.end();
-            try file.sync(self.io);
-        }
-        try self.requireRoot();
-        try std.Io.Dir.rename(self.directory, temporary, self.directory, std.fs.path.basename(self.path), self.io);
-        // Sync the exact opened directory, not a newly resolved pathname.
-        const directory_file: std.Io.File = .{ .handle = self.directory.handle, .flags = .{ .nonblocking = false } };
-        try directory_file.sync(self.io);
-        // Also close the mkdir race: a peer may have observed the new audit
-        // directory before its creator synced the containing root. Once this
-        // job has a durable checkpoint, later turns need only sync its parent.
-        if (self.checkpoint_digest == null) try fs_paths.syncDirPortable(self.io, self.root_dir);
-        self.checkpoint_digest = digest;
+        try checkpoints.write(self, bytes, io_errors);
     }
     pub fn summary(self: *const @This(), state: State) !Summary {
         try state.validate(self.root, self.physical_incarnation, self.binding, self.expected);
@@ -244,53 +188,7 @@ pub const Guard = struct {
 pub fn open(alloc: Allocator, io: std.Io, root_dir: []const u8, root_incarnation: u128, physical_incarnation: u128, binding: jobs.Binding, expected: claims.TargetExpectation, context: Context) !Guard {
     try context.ensureActive();
     try expected.requireOwnerBinding(binding);
-    const identity = try root_identity.load(alloc, io, root_dir);
-    if (root_incarnation == 0 or physical_incarnation == 0 or identity.incarnation != root_incarnation) return error.PrivateIndexAuditScopeChanged;
-    // Provisioning owns key creation. An audit must not mint a new identity
-    // or wait on an unrelated root-key creation lock.
-    const root = try signing.load(alloc, io, root_dir);
-    if (root.root_incarnation != root_incarnation) return error.PrivateIndexAuditScopeChanged;
-    const directory = try std.fmt.allocPrint(alloc, "{s}/.relational-index-audits", .{root_dir});
-    defer alloc.free(directory);
-    if (std.Io.Dir.cwd().createDir(io, directory, .default_dir)) |_| {
-        try fs_paths.syncDirPortable(io, root_dir);
-    } else |err| switch (err) {
-        error.PathAlreadyExists => {},
-        else => return err,
-    }
-    // Existing directories need no parent sync on every bounded audit turn.
-    // Linux otherwise opens an O_PATH descriptor, which cannot be fsynced.
-    const opened_directory = try std.Io.Dir.cwd().openDir(io, directory, .{ .follow_symlinks = false, .iterate = true });
-    errdefer opened_directory.close(io);
-    // Match the single canonical native-job slot per namespace, rather than
-    // accumulating files per attempt. The signed header still binds the full
-    // owner identity. Different namespaces may share the logical job ID.
-    const id = std.fmt.bytesToHex(hash(&@import("online_source_contract.zig").namespaceBytes(binding.fence.namespace)), .lower);
-    const path = try std.fmt.allocPrint(alloc, "{s}/{s}.checkpoint", .{ directory, id });
-    errdefer alloc.free(path);
-    const lock_path = try std.fmt.allocPrint(alloc, "{s}.lock", .{std.fs.path.basename(path)});
-    defer alloc.free(lock_path);
-    if (opened_directory.createFile(io, lock_path, .{ .exclusive = true, .permissions = permissions() })) |seed| {
-        seed.close(io);
-    } else |err| switch (err) {
-        error.PathAlreadyExists => {},
-        else => return err,
-    }
-    const file = try opened_directory.openFile(io, lock_path, .{ .mode = .read_write, .follow_symlinks = false });
-    errdefer file.close(io);
-    if ((try file.stat(io)).kind != .file) return error.InvalidRelationalIndexValidation;
-    while (!try file.tryLock(io, .exclusive)) {
-        try context.ensureActive();
-        try io.sleep(.fromMilliseconds(1), .awake);
-    }
-    errdefer file.unlock(io);
-    const result: Guard = .{ .alloc = alloc, .io = io, .root_dir = root_dir, .root = root, .physical_incarnation = physical_incarnation, .binding = binding, .expected = expected, .path = path, .directory = opened_directory, .lock = file, .context = context };
-    try result.requireRoot();
-    const temporary = try std.fmt.allocPrint(alloc, "{s}.tmp", .{std.fs.path.basename(path)});
-    defer alloc.free(temporary);
-    opened_directory.deleteFile(io, temporary) catch |err| switch (err) {
-        error.FileNotFound => {},
-        else => return err,
-    };
-    return result;
+    if (physical_incarnation == 0) return error.PrivateIndexAuditScopeChanged;
+    const opened = try checkpoints.open(alloc, io, root_dir, root_incarnation, @import("online_source_contract.zig").namespaceBytes(binding.fence.namespace), ".relational-index-audits", context, io_errors);
+    return .{ .alloc = opened.alloc, .io = opened.io, .root_dir = opened.root_dir, .root = opened.root, .physical_incarnation = physical_incarnation, .binding = binding, .expected = expected, .path = opened.path, .directory = opened.directory, .lock = opened.lock, .context = opened.context };
 }

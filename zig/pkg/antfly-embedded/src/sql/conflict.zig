@@ -614,7 +614,7 @@ fn installPostimage(context: anytype, table: catalog.Table, clause: ast.Conflict
         const datum = if (assigned) |index| values[index] else cells[ordinal];
         const identity = if (assigned) |index| try assignmentIdentity(binding, clause.assignments[index], index) else column.element_type;
         if (column.type == .json and datum.value == .null and !datum.sql_null) try nulls.append(context.arena, column.path);
-        try row.put(context.arena, column.path, try context.storageDatumTyped(datum, column, identity));
+        try column.assignStorageValue(context.arena, &row, try context.storageDatumTyped(datum, column, identity), datum.sql_null);
     }
     mutation.row = .{ .object = row };
     mutation.json_null_fields = nulls.items;

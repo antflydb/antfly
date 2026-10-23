@@ -2078,6 +2078,7 @@ pub const MetadataHttpServer = struct {
         try server.post(node_path ++ routes.Routes.internal_node_status_suffix ++ "/update", httpx.Handler.bind(self, metadataReportNodeUpdate));
         try server.postWithBodyLimit(@import("../common/secret_delivery.zig").path, @import("../common/secret_delivery.zig").max_request_bytes, httpx.Handler.bind(self, metadataSecretRead));
         try server.post("/internal/v1/system-catalog", httpx.Handler.bind(self, metadataSystemCatalog));
+        try server.post(routes.Routes.internal_schema_validation, httpx.Handler.bind(self, metadataSchemaValidation));
         try server.post(routes.Routes.internal_catalog_publication_check, httpx.Handler.bind(self, metadataCatalogPublicationCheck));
         try server.post(routes.Routes.internal_catalog_table_publication_check, httpx.Handler.bind(self, metadataCatalogTablePublicationCheck));
         try server.post(routes.Routes.internal_catalog_group_retirement_check, httpx.Handler.bind(self, metadataCatalogGroupRetirementCheck));
@@ -2145,31 +2146,52 @@ pub const MetadataHttpServer = struct {
     }
 
     fn metadataSystemCatalog(self: *MetadataHttpServer, ctx: *httpx.Context) !httpx.Response {
+        return self.metadataSystemCatalogImpl(ctx, false);
+    }
+
+    fn metadataSchemaValidation(self: *MetadataHttpServer, ctx: *httpx.Context) !httpx.Response {
+        return self.metadataSystemCatalogImpl(ctx, true);
+    }
+
+    fn metadataSystemCatalogImpl(self: *MetadataHttpServer, ctx: *httpx.Context, raw_schema: bool) !httpx.Response {
         try ctx.setHeader(routes.Routes.raft_mutation_outcome_header, routes.Routes.raft_mutation_outcome_not_proposed);
         const body = (try ctx.body()) orelse return ctx.status(400).text("missing body");
-        if (body.len > system_catalog.max_command_bytes) return ctx.status(413).text("catalog request too large");
-        var parsed = std.json.parseFromSlice(@import("../system_catalog/server_call.zig").Call, ctx.allocator, body, .{}) catch return ctx.status(400).text("invalid catalog request");
-        defer parsed.deinit();
+        const Call = @import("../system_catalog/server_call.zig").Call;
+        const ledger = @import("schema_validation_ledger.zig");
+        const maximum: usize = if (raw_schema) (if (ledger.requiresAdmissionAuthority(body)) ledger.max_command_bytes else ledger.max_control_command_bytes) else system_catalog.max_command_bytes;
+        if (body.len > maximum) return ctx.status(413).text("catalog request too large");
+        var parsed: ?std.json.Parsed(Call) = null;
+        defer if (parsed) |*value| value.deinit();
+        const input: Call = if (raw_schema) blk: {
+            if (!std.mem.eql(u8, ctx.header("content-type") orelse "", "application/octet-stream"))
+                return ctx.status(415).text("schema validation requires binary transport");
+            break :blk .{ .schema_validation_submit = body };
+        } else blk: {
+            parsed = std.json.parseFromSlice(Call, ctx.allocator, body, .{}) catch return ctx.status(400).text("invalid catalog request");
+            if (parsed.?.value == .schema_validation_submit)
+                return ctx.status(415).text("schema validation requires binary transport");
+            break :blk parsed.?.value;
+        };
         // Ticket pages name a physical store. The shared service/read grant
         // authenticates a node, not that store, so admitting this call would
         // let one node enumerate another store's retirement work. Keep the
         // transport closed until store-bound principal verification exists.
-        if (parsed.value == .fk_initial_retirement_page)
+        if (input == .fk_initial_retirement_page)
             return ctx.status(501).text("store-bound initial FK retirement reads are not active");
         // This transport authenticates the calling service, not a setting
         // administrator. Never infer an admin grant from request JSON.
         const authority = @import("../system_catalog/setting_authority.zig");
-        const admin_grant = parsed.value.requiresAdministrativeGrant();
-        const fk_publication_read = parsed.value == .fk_generation_publication_status or parsed.value == .fk_generation_publication_work or parsed.value == .fk_generation_publication_decision or parsed.value == .fk_generation_publication_source_decision or parsed.value == .fk_initial_create_prepare or parsed.value == .fk_initial_child_decision or parsed.value == .fk_initial_create_status or parsed.value == .fk_generation_table_locked or parsed.value == .fk_initial_create_work or parsed.value == .fk_initial_parent_decision;
+        const admin_grant = input.requiresAdministrativeGrant();
+        const fk_publication_read = input == .fk_generation_publication_status or input == .fk_generation_publication_work or input == .fk_generation_publication_decision or input == .fk_generation_publication_source_decision or input == .fk_initial_create_prepare or input == .fk_initial_child_decision or input == .fk_initial_create_status or input == .fk_generation_table_locked or input == .fk_initial_create_work or input == .fk_initial_parent_decision;
         // The status stamp contains no principal or policy body, but it still
         // requires a real service token. In migration mode the host accepts
         // tokenless legacy internal calls; this operation must not use that
         // exception. A supplied token is verified by the host middleware even
         // during migration.
-        if (parsed.value == .policy_publication_status and
+        if (input == .policy_publication_status and
             ctx.header(@import("../api/internal_service_auth.zig").header_name) == null)
             return ctx.status(403).text("policy publication status requires an authenticated service");
-        if (admin_grant or parsed.value.requiresSettingAuthorityReadGrant()) {
+        if (admin_grant or input.requiresSettingAuthorityReadGrant()) {
             if (ctx.header(@import("../api/internal_service_auth.zig").header_name) == null) return ctx.status(403).text("setting authority requires an authenticated service");
             authority.verify(
                 self.setting_authority_secret orelse return ctx.status(403).text("setting authority unavailable"),
@@ -2188,18 +2210,19 @@ pub const MetadataHttpServer = struct {
         ) catch return ctx.status(400).text("invalid forwarding context")) orelse return ctx.status(400).text("missing forwarding context");
         var context = systemCatalogRequestContext(ctx, forwarding.remaining_ms);
         context.setting_admin = admin_grant;
-        context.row_policy_install_authority = parsed.value == .policy_install_snapshot or parsed.value == .policy_publication_status or parsed.value == .policy_publication_work or parsed.value == .policy_publication_mutate or parsed.value == .policy_publication_begin;
-        context.fk_generation_publication_authority = fk_publication_read or parsed.value == .fk_generation_publication_begin or parsed.value == .fk_generation_publication_mutate or parsed.value == .fk_initial_create_begin or parsed.value == .fk_initial_create_mutate;
-        context.index_publication_authority = parsed.value.isRelationalIndexOwnerCall();
+        context.row_policy_install_authority = input == .policy_install_snapshot or input == .policy_publication_status or input == .policy_publication_work or input == .policy_publication_mutate or input == .policy_publication_begin;
+        context.fk_generation_publication_authority = fk_publication_read or input == .fk_generation_publication_begin or input == .fk_generation_publication_mutate or input == .fk_initial_create_begin or input == .fk_initial_create_mutate;
+        context.index_publication_authority = input.isRelationalIndexOwnerCall();
+        context.schema_validation_authority = input.isSchemaValidationCall();
         const callback = self.source.vtable.system_catalog orelse return ctx.status(426).text("catalog upgrade required");
-        const identity_reader = if (!parsed.value.isMutation())
+        const identity_reader = if (!input.isMutation())
             self.source.vtable.catalog_identity orelse return ctx.status(426).text("catalog identity upgrade required")
         else
             null;
         const read_identity = if (identity_reader) |read| read(self.source.ptr) catch |err|
             return ctx.status(system_catalog.httpStatus(err)).text(@errorName(err)) else null;
         self.source.preflightTableMutationAuthority() catch |err| return metadataMutationError(ctx, err);
-        const response = callback(self.source.ptr, ctx.allocator, context, parsed.value) catch |err| {
+        const response = callback(self.source.ptr, ctx.allocator, context, input) catch |err| {
             if (err == error.MetadataMutationOutcomeUnknown) try ctx.setHeader(routes.Routes.raft_mutation_outcome_header, routes.Routes.raft_mutation_outcome_unknown);
             return ctx.status(system_catalog.httpStatus(err)).text(@errorName(err));
         };
@@ -2217,7 +2240,8 @@ pub const MetadataHttpServer = struct {
             try ctx.setHeader("x-antfly-catalog-metadata-incarnation", &incarnation);
         }
         try ctx.setHeader(routes.Routes.raft_mutation_outcome_header, routes.Routes.raft_mutation_outcome_committed);
-        try ctx.setHeader("content-type", "application/json");
+        try ctx.setHeader("content-type", input.responseContentType());
+        if (input.isSchemaValidationCall()) try ctx.setHeader("cache-control", "no-store");
         _ = ctx.response.body(response);
         return ctx.response.build();
     }
@@ -4791,6 +4815,11 @@ test "metadata status JSON preserves compact managed index admission state" {
 
 test "system catalog schema reader admission rejects incomplete unknown and unfenced capabilities" {
     const alloc = std.testing.allocator;
+    const readers = @import("antfly_local_sources").common_schema_readers;
+    const future_semantic = try std.json.Stringify.valueAlloc(alloc, .{ .store_id = 20, .node_id = 20, .reporter_incarnation = 77, .schema_reader = .{ .semantic_ceiling = readers.current_semantic_version + 1, .encoding_ceiling = readers.current_encoding_version } }, .{});
+    defer alloc.free(future_semantic);
+    const future_encoding = try std.json.Stringify.valueAlloc(alloc, .{ .store_id = 20, .node_id = 20, .reporter_incarnation = 77, .schema_reader = .{ .semantic_ceiling = readers.current_semantic_version, .encoding_ceiling = readers.current_encoding_version + 1 } }, .{});
+    defer alloc.free(future_encoding);
     const json =
         \\{"store_id":20,"node_id":20,"reporter_incarnation":77,"schema_reader":{"semantic_ceiling":30,"encoding_ceiling":31}}
     ;
@@ -4807,10 +4836,8 @@ test "system catalog schema reader admission rejects incomplete unknown and unfe
         ,
         \\{"store_id":20,"node_id":20,"reporter_incarnation":77,"schema_reader":{"semantic_ceiling":30}}
         ,
-        \\{"store_id":20,"node_id":20,"reporter_incarnation":77,"schema_reader":{"semantic_ceiling":32,"encoding_ceiling":31}}
-        ,
-        \\{"store_id":20,"node_id":20,"reporter_incarnation":77,"schema_reader":{"semantic_ceiling":30,"encoding_ceiling":32}}
-        ,
+        future_semantic,
+        future_encoding,
     };
     for (invalid) |body| {
         try std.testing.expectError(error.InvalidStoreReporterFence, parseStoreRecord(alloc, body));
@@ -5511,12 +5538,84 @@ test "metadata http server reports reallocation protocol upgrade gating" {
     try std.testing.expectEqualStrings("metadata voter upgrade required", response.body.?);
 }
 
+test "sequence catalog HTTP grants bind exact bodies and keep status reads nonmutating" {
+    const a = std.testing.allocator;
+    const Call = @import("../system_catalog/server_call.zig").Call;
+    const sequence = @import("../system_catalog/sequence_catalog.zig");
+    const authority = @import("../system_catalog/setting_authority.zig");
+    const service_auth = @import("../api/internal_service_auth.zig");
+    const Fixture = struct {
+        calls: usize = 0,
+        identity_reads: usize = 0,
+        expected: std.meta.Tag(Call) = .snapshot,
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return error.TestUnexpectedResult;
+        }
+        fn snapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return error.TestUnexpectedResult;
+        }
+        fn freeSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+        fn identity(ptr: *anyopaque) !metadata_api.CatalogIdentity {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.identity_reads += 1;
+            return .{ .metadata_group_id = 1, .metadata_incarnation = "11111111111111111111111111111111".* };
+        }
+        fn catalog(ptr: *anyopaque, alloc: std.mem.Allocator, context: operation.RequestContext, call: Call) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqual(self.expected, std.meta.activeTag(call));
+            try std.testing.expect(context.setting_admin);
+            try std.testing.expect(!context.row_policy_install_authority and !context.fk_generation_publication_authority and !context.index_publication_authority and !context.schema_validation_authority);
+            self.calls += 1;
+            return alloc.dupe(u8, "{}");
+        }
+    };
+    var fixture: Fixture = .{};
+    var server = MetadataHttpServer.init(a, .{ .setting_authority_secret = "sequence-grant-fixture", .setting_authority_issuer = "cluster-fixture" }, .{ .ptr = &fixture, .vtable = &.{ .status = Fixture.status, .admin_snapshot = Fixture.snapshot, .free_admin_snapshot = Fixture.freeSnapshot, .system_catalog = Fixture.catalog, .catalog_identity = Fixture.identity } });
+    const request: sequence.Mutation = .{ .admission = .{ .nonce = @splat(1), .head = 0 }, .target = .{ .table = "counter" }, .namespace_id = 2, .incarnation = @splat(7), .operation = .{ .create = .{ .options = .{} } } };
+    const counter: sequence.CounterRequest = .{ .target = request.target, .namespace_id = 2, .sequence_id = 41, .incarnation = request.incarnation, .request = .{ .expected = .{ .generation = 1, .revision = 1, .last_value = 1, .is_called = false }, .request_id = @splat(1), .operation = .reserve } };
+    // Authorization/framing only; this callback never admits synthetic DDL.
+    for ([_]Call{ .sql_sequence_prepare, .{ .sql_sequence_snapshot = .{ .targets = &.{request.target} } }, .{ .sql_sequence_admission_head = {} }, .{ .sql_sequence_mutate = request }, .{ .sql_sequence_outcome = request }, .{ .sql_sequence_counter_mutate = counter }, .{ .sql_sequence_counter_outcome = counter } }) |call| {
+        fixture.expected = std.meta.activeTag(call);
+        const body = try std.json.Stringify.valueAlloc(a, call, .{});
+        defer a.free(body);
+        const tampered = try std.fmt.allocPrint(a, "{s} ", .{body});
+        defer a.free(tampered);
+        const now: i64 = @intCast(@divFloor(@import("antfly_platform").time.realtimeNs(), std.time.ns_per_s));
+        const grant = try authority.sign(a, "sequence-grant-fixture", "cluster-fixture", .admin, body, now);
+        defer a.free(grant);
+        const wrong = try authority.sign(a, "sequence-grant-fixture", "cluster-fixture", .read, body, now);
+        defer a.free(wrong);
+        const before = fixture.calls;
+        const reads = fixture.identity_reads;
+        for (0..5) |mode| {
+            var req = try httpx.Request.init(a, .POST, "/internal/v1/system-catalog");
+            defer req.deinit();
+            try req.setBody(if (mode == 4) tampered else body);
+            if (mode != 0) try req.headers.append(service_auth.header_name, "host-verified-service-token");
+            if (mode != 1) try req.headers.append(authority.header_name, if (mode == 2) wrong else grant);
+            try req.headers.append(routes.Routes.raft_mutation_remaining_ms_header, "5000");
+            try req.headers.append(routes.Routes.raft_mutation_forwards_remaining_header, "0");
+            try req.headers.append(routes.Routes.raft_mutation_campaign_allowed_header, "false");
+            var ctx = httpx.Context.init(a, std.testing.io, &req);
+            defer ctx.deinit();
+            var response = try server.metadataSystemCatalog(&ctx);
+            defer response.deinit();
+            try std.testing.expectEqual(@as(u16, if (mode == 3) 200 else 403), response.status.code);
+        }
+        try std.testing.expectEqual(before + 1, fixture.calls);
+        try std.testing.expectEqual(reads + @as(usize, if (call.isMutation()) 0 else 2), fixture.identity_reads);
+    }
+}
+
 test "system catalog read identity avoids diagnostic inventories and fences replacement" {
     const Fixture = struct {
         reads: usize = 0,
         replace_identity: bool = false,
         status_reads: usize = 0,
         index_reads: usize = 0,
+        schema_reads: usize = 0,
+        schema_submits: usize = 0,
+        schema_command: ?[]const u8 = null,
         fn status(_: *anyopaque) !metadata_api.MetadataStatus {
             return error.TestUnexpectedResult;
         }
@@ -5537,6 +5636,15 @@ test "system catalog read identity avoids diagnostic inventories and fences repl
         }
         fn catalog(ptr: *anyopaque, alloc: std.mem.Allocator, context: operation.RequestContext, call: @import("../system_catalog/server_call.zig").Call) ![]u8 {
             try context.ensureActive();
+            if (call == .schema_validation_submit) {
+                const self: *@This() = @ptrCast(@alignCast(ptr));
+                self.schema_submits += 1;
+                try std.testing.expect(context.schema_validation_authority);
+                try std.testing.expect(!context.index_publication_authority);
+                try std.testing.expect(!context.fk_generation_publication_authority);
+                try std.testing.expectEqual(call.requiresAdministrativeGrant(), context.setting_admin);
+                try std.testing.expectEqualSlices(u8, self.schema_command.?, call.schema_validation_submit);
+            }
             if (call == .policy_publication_status) {
                 const self: *@This() = @ptrCast(@alignCast(ptr));
                 self.status_reads += 1;
@@ -5549,6 +5657,16 @@ test "system catalog read identity avoids diagnostic inventories and fences repl
                 try std.testing.expect(context.index_publication_authority);
                 try std.testing.expect(!context.fk_generation_publication_authority);
                 try std.testing.expect(!context.setting_admin);
+            }
+            if (call.schemaValidationLookup() != null) {
+                const self: *@This() = @ptrCast(@alignCast(ptr));
+                self.schema_reads += 1;
+                try std.testing.expect(context.schema_validation_authority);
+                try std.testing.expect(!context.index_publication_authority);
+                try std.testing.expect(!context.fk_generation_publication_authority);
+                try std.testing.expect(!context.setting_admin);
+                if (call == .schema_validation_owner_read and call.schema_validation_owner_read.projection == .inputs) return alloc.dupe(u8, "\x00\xffASVI-transport-fixture");
+                if (call == .schema_validation_receipt_read) return std.json.Stringify.valueAlloc(alloc, @import("schema_validation_receipt.zig").Observation{ .lookup = call.schema_validation_receipt_read.lookup }, .{});
             }
             return alloc.dupe(u8, "{}");
         }
@@ -5699,6 +5817,115 @@ test "system catalog read identity avoids diagnostic inventories and fences repl
         try std.testing.expectEqual(@as(u16, 200), granted.status.code);
     }
     try std.testing.expectEqual(@as(usize, 1), fixture.index_reads);
+    for ([_]@import("../metadata/schema_validation_read.zig").OwnerReadRequest{
+        .{ .lookup = .{ .group = 1, .table = 7, .id = @splat(1), .metadata_incarnation = @splat('1'), .plan_digest = @splat(2) }, .ordinal = 0 },
+        .{ .lookup = .{ .group = 1, .table = 7, .id = @splat(1), .metadata_incarnation = @splat('1'), .plan_digest = @splat(2) }, .ordinal = 0, .projection = .inputs },
+    }) |read| {
+        const call: @import("../system_catalog/server_call.zig").Call = .{ .schema_validation_owner_read = read };
+        const read_body = try std.json.Stringify.valueAlloc(alloc, call, .{});
+        defer alloc.free(read_body);
+        const good = try authority.sign(alloc, "separate-setting-authority-secret", "cluster-a", .read, read_body, @intCast(@divFloor(@import("antfly_platform").time.realtimeNs(), std.time.ns_per_s)));
+        defer alloc.free(good);
+        const wrong = try authority.sign(alloc, "separate-setting-authority-secret", "cluster-a", .admin, read_body, @intCast(@divFloor(@import("antfly_platform").time.realtimeNs(), std.time.ns_per_s)));
+        defer alloc.free(wrong);
+        for (0..4) |mode| {
+            var req = try httpx.Request.init(alloc, .POST, "/internal/v1/system-catalog");
+            defer req.deinit();
+            try req.setBody(read_body);
+            try req.headers.append(routes.Routes.raft_mutation_remaining_ms_header, "5000");
+            try req.headers.append(routes.Routes.raft_mutation_forwards_remaining_header, "0");
+            try req.headers.append(routes.Routes.raft_mutation_campaign_allowed_header, "false");
+            if (mode != 0) try req.headers.append(service_auth.header_name, service_token);
+            if (mode != 1) try req.headers.append(authority.header_name, if (mode == 2) wrong else good);
+            var ctx = httpx.Context.init(alloc, std.testing.io, &req);
+            defer ctx.deinit();
+            var response = try server.metadataSystemCatalog(&ctx);
+            defer response.deinit();
+            try std.testing.expectEqual(@as(u16, if (mode == 3) 200 else 403), response.status.code);
+            if (mode != 3) continue;
+            try std.testing.expectEqualStrings(read.contentType(), response.headers.get("content-type").?);
+            try std.testing.expectEqualStrings("no-store", response.headers.get("cache-control").?);
+            try std.testing.expectEqualSlices(u8, if (read.projection == .inputs) "\x00\xffASVI-transport-fixture" else "{}", response.body.?);
+            var changed_call = call;
+            changed_call.schema_validation_owner_read.lookup.id[0] ^= 1;
+            const changed_body = try std.json.Stringify.valueAlloc(alloc, changed_call, .{});
+            defer alloc.free(changed_body);
+            try req.setBody(changed_body);
+            var tampered_ctx = httpx.Context.init(alloc, std.testing.io, &req);
+            defer tampered_ctx.deinit();
+            var tampered = try server.metadataSystemCatalog(&tampered_ctx);
+            defer tampered.deinit();
+            try std.testing.expectEqual(@as(u16, 403), tampered.status.code);
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 2), fixture.schema_reads);
+    {
+        const receipts = @import("schema_validation_receipt.zig");
+        const lookup: @import("schema_validation_read.zig").Lookup = .{ .group = 1, .table = 7, .id = @splat(1), .metadata_incarnation = @splat('1'), .plan_digest = @splat(2) };
+        const receipt_request: receipts.Request = .{ .lookup = lookup, .expected = .admission };
+        const receipt_body = try std.json.Stringify.valueAlloc(alloc, @import("../system_catalog/server_call.zig").Call{ .schema_validation_receipt_read = receipt_request }, .{});
+        defer alloc.free(receipt_body);
+        const grant = try authority.sign(alloc, "separate-setting-authority-secret", "cluster-a", .read, receipt_body, @intCast(@divFloor(@import("antfly_platform").time.realtimeNs(), std.time.ns_per_s)));
+        defer alloc.free(grant);
+        for ([_]bool{ false, true }) |authorized| {
+            var req = try httpx.Request.init(alloc, .POST, "/internal/v1/system-catalog");
+            defer req.deinit();
+            try req.setBody(receipt_body);
+            try req.headers.append(service_auth.header_name, service_token);
+            try req.headers.append(routes.Routes.raft_mutation_remaining_ms_header, "5000");
+            try req.headers.append(routes.Routes.raft_mutation_forwards_remaining_header, "0");
+            try req.headers.append(routes.Routes.raft_mutation_campaign_allowed_header, "false");
+            if (authorized) try req.headers.append(authority.header_name, grant);
+            var ctx = httpx.Context.init(alloc, std.testing.io, &req);
+            defer ctx.deinit();
+            var response = try server.metadataSystemCatalog(&ctx);
+            defer response.deinit();
+            try std.testing.expectEqual(@as(u16, if (authorized) 200 else 403), response.status.code);
+            if (authorized) {
+                var observed = try std.json.parseFromSlice(receipts.Observation, alloc, response.body.?, .{});
+                defer observed.deinit();
+                try std.testing.expect(!try observed.value.isAcknowledged(receipt_request));
+                try std.testing.expectEqualStrings("no-store", response.headers.get("cache-control").?);
+            }
+        }
+        try std.testing.expectEqual(@as(usize, 3), fixture.schema_reads);
+    }
+    // Authorization/framing fixture only: the callback does not admit these
+    // synthetic commands. Real command validation belongs to the ledger/store.
+    for ([_][]const u8{ "SVBI\x01\x00\x00\x00\xff\x00raw-begin", "raw-owner-command\x00\xff" }) |command| {
+        fixture.schema_command = command;
+        const admission = @import("schema_validation_ledger.zig").requiresAdmissionAuthority(command);
+        const good = try authority.sign(alloc, "separate-setting-authority-secret", "cluster-a", if (admission) .admin else .read, command, @intCast(@divFloor(@import("antfly_platform").time.realtimeNs(), std.time.ns_per_s)));
+        defer alloc.free(good);
+        const wrong = try authority.sign(alloc, "separate-setting-authority-secret", "cluster-a", if (admission) .read else .admin, command, @intCast(@divFloor(@import("antfly_platform").time.realtimeNs(), std.time.ns_per_s)));
+        defer alloc.free(wrong);
+        const prior_reads = fixture.reads;
+        const prior_submits = fixture.schema_submits;
+        for (0..7) |mode| {
+            var req = try httpx.Request.init(alloc, .POST, routes.Routes.internal_schema_validation);
+            defer req.deinit();
+            const raw_body = if (mode == 4) try std.fmt.allocPrint(alloc, "{s}tampered", .{command}) else try alloc.dupe(u8, command);
+            defer alloc.free(raw_body);
+            const json = if (mode == 5) try std.json.Stringify.valueAlloc(alloc, @import("../system_catalog/server_call.zig").Call{ .schema_validation_submit = command }, .{}) else null;
+            defer if (json) |bytes| alloc.free(bytes);
+            try req.setBody(json orelse raw_body);
+            try req.headers.append("content-type", if (mode == 6) "application/json" else "application/octet-stream");
+            if (mode != 3) try req.headers.append(service_auth.header_name, service_token);
+            if (mode != 2) try req.headers.append(authority.header_name, if (mode == 1) wrong else good);
+            try req.headers.append(routes.Routes.raft_mutation_remaining_ms_header, "5000");
+            try req.headers.append(routes.Routes.raft_mutation_forwards_remaining_header, "0");
+            try req.headers.append(routes.Routes.raft_mutation_campaign_allowed_header, "false");
+            var ctx = httpx.Context.init(alloc, std.testing.io, &req);
+            defer ctx.deinit();
+            var response = if (mode == 5) try server.metadataSystemCatalog(&ctx) else try server.metadataSchemaValidation(&ctx);
+            defer response.deinit();
+            try std.testing.expectEqual(@as(u16, if (mode == 0) 200 else if (mode >= 5) 415 else 403), response.status.code);
+            try std.testing.expectEqualStrings(if (mode == 0) routes.Routes.raft_mutation_outcome_committed else routes.Routes.raft_mutation_outcome_not_proposed, response.headers.get(routes.Routes.raft_mutation_outcome_header).?);
+            if (mode == 0) try std.testing.expectEqualStrings("no-store", response.headers.get("cache-control").?);
+        }
+        try std.testing.expectEqual(prior_reads, fixture.reads);
+        try std.testing.expectEqual(prior_submits + 1, fixture.schema_submits);
+    }
     const index_ack = try @import("relational_index_publication.zig").testing.fencedAck();
     const Call = @import("../system_catalog/server_call.zig").Call;
     for ([_]Call{ .{ .relational_index_owner_ack = index_ack }, .{ .relational_index_owner_ack_status = index_ack } }) |call| {

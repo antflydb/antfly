@@ -192,6 +192,15 @@ pub const CompiledTableValidator = struct {
     /// Borrowed names from the immutable parsed schema; only the slice is owned.
     uuid_columns: []const []const u8,
     owns_schema: bool,
+    preparation_runtime: ?@import("relational_expression.zig").PreparationRuntime = null,
+
+    /// Borrow this validated epoch with request-owned preparation resources.
+    /// Do not deinit the borrowed copy or publish it into the schema registry.
+    pub fn forPreparation(self: CompiledTableValidator, runtime: @import("relational_expression.zig").PreparationRuntime) CompiledTableValidator {
+        var borrowed = self;
+        borrowed.preparation_runtime = runtime;
+        return borrowed;
+    }
 
     pub fn init(alloc: std.mem.Allocator, schema_json: []const u8) !CompiledTableValidator {
         var schema = try parseValidatedTableSchema(alloc, schema_json);
@@ -243,13 +252,22 @@ pub const CompiledTableValidator = struct {
 
     pub fn prepareValue(self: CompiledTableValidator, owned_alloc: std.mem.Allocator, scratch: std.mem.Allocator, value: *std.json.Value) !void {
         try self.canonicalizeUuid(owned_alloc, value);
-        try impl.prepareDocumentValueWithPlan(owned_alloc, scratch, self.schema, value, self.physical_fields, &self.execution);
+        try impl.prepareDocumentValueWithRuntime(owned_alloc, scratch, self.schema, value, self.physical_fields, &self.execution, self.preparation_runtime);
         if (self.execution.expressions != null) try self.canonicalizeUuid(owned_alloc, value);
+    }
+
+    /// Borrow immutable plans for a scope-authenticated historical import.
+    /// Do not deinit this borrowed value. Generated/domain validation remains
+    /// strict; only NOT VALID historical coverage differs from a new write.
+    pub fn forHistoricalImport(self: CompiledTableValidator) CompiledTableValidator {
+        var result = self;
+        result.execution.historical_checks = true;
+        return result;
     }
 
     pub fn prepareTypedValue(self: CompiledTableValidator, owned_alloc: std.mem.Allocator, scratch: std.mem.Allocator, value: *std.json.Value, json_null_fields: []const []const u8, preserve: bool) !void {
         if (preserve) try self.requireCanonicalUuid(value.*) else try self.canonicalizeUuid(owned_alloc, value);
-        try impl.prepareTypedDocumentValueWithPlan(owned_alloc, scratch, self.schema, value, self.physical_fields, &self.execution, json_null_fields, preserve);
+        try impl.prepareTypedDocumentValueWithRuntime(owned_alloc, scratch, self.schema, value, self.physical_fields, &self.execution, json_null_fields, preserve, self.preparation_runtime);
         if (self.execution.expressions != null) {
             if (preserve) try self.requireCanonicalUuid(value.*) else try self.canonicalizeUuid(owned_alloc, value);
         }
@@ -257,7 +275,7 @@ pub const CompiledTableValidator = struct {
 
     pub fn prepareTypedValueWithNulls(self: CompiledTableValidator, owned_alloc: std.mem.Allocator, scratch: std.mem.Allocator, value: *std.json.Value, json_null_fields: []const []const u8, preserve: bool) !impl.PreparedJsonNulls {
         if (preserve) try self.requireCanonicalUuid(value.*) else try self.canonicalizeUuid(owned_alloc, value);
-        const prepared = try impl.prepareTypedDocumentWithNulls(owned_alloc, scratch, self.schema, value, self.physical_fields, &self.execution, json_null_fields, preserve);
+        const prepared = try impl.prepareTypedDocumentWithRuntime(owned_alloc, scratch, self.schema, value, self.physical_fields, &self.execution, json_null_fields, preserve, self.preparation_runtime);
         errdefer prepared.deinit(owned_alloc);
         if (self.execution.expressions != null) {
             if (preserve) try self.requireCanonicalUuid(value.*) else try self.canonicalizeUuid(owned_alloc, value);
@@ -345,6 +363,26 @@ pub const CompiledTableValidator = struct {
     }
 };
 
+test "relational index system historical CHECK preparation retains strict write enforcement" {
+    const alloc = std.testing.allocator;
+    var validator = try CompiledTableValidator.init(alloc,
+        \\{"version":2,"storage_mode":"relational","default_type":"row","checks":[{"name":"deferred","column":"n","op":"gte","value":0,"not_valid":true},{"name":"required","column":"k","op":"gte","value":0}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"n":{"type":"integer"},"k":{"type":"integer"}},"additionalProperties":false}}}}
+    );
+    defer validator.deinit(alloc);
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var value = try std.json.parseFromSliceLeaky(std.json.Value, a, "{\"n\":-1,\"k\":2}", .{});
+    try std.testing.expectError(error.RelationalCheckViolation, validator.prepareTypedValue(a, a, &value, &.{}, true));
+    const historical = validator.forHistoricalImport();
+    const prepared = try historical.prepareTypedValueWithNulls(a, a, &value, &.{}, true);
+    defer prepared.deinit(a);
+    try std.testing.expectEqual(@as(i64, -1), value.object.get("n").?.integer);
+    try std.testing.expectError(error.RelationalCheckViolation, validator.prepareTypedValue(a, a, &value, &.{}, true));
+    value.object.getPtr("k").?.* = .{ .integer = -2 };
+    try std.testing.expectError(error.RelationalCheckViolation, historical.prepareTypedValueWithNulls(a, a, &value, &.{}, true));
+}
+
 test "relational UUID preparation canonicalizes before durable row and index extraction" {
     const alloc = std.testing.allocator;
     var validator = try CompiledTableValidator.init(alloc,
@@ -390,13 +428,13 @@ test "relational index system NOT VALID CHECK enforces writes without historical
     try std.testing.expectEqual(@as(?@import("relational_checks.zig").Set.Failure, null), try checks.firstFailureJson(a, row.value));
     const runtime = try deriveRuntimeTableSchema(a, validator.schema);
     defer storage_schema.freeSchema(a, runtime);
-    try std.testing.expect(runtime.requires_deferred_check_validation);
+    try std.testing.expect(runtime.requires_deferred_constraints);
     try std.testing.expectEqual(@as(u32, 32), storage_schema.requiredReaderVersion(runtime));
     const bytes = try storage_schema.serializeSchema(a, runtime);
     defer a.free(bytes);
     const restored = try storage_schema.deserializeSchema(a, bytes);
     defer storage_schema.freeSchema(a, restored);
-    try std.testing.expect(restored.requires_deferred_check_validation);
+    try std.testing.expect(restored.requires_deferred_constraints);
     try std.testing.expectEqual(@as(u32, 32), restored.decoded_format_version);
     for (0..bytes.len) |length| {
         const truncated = storage_schema.deserializeSchema(a, bytes[0..length]) catch continue;
@@ -415,9 +453,9 @@ test "relational index system NOT VALID CHECK enforces writes without historical
     const legacy = try storage_schema.deserializeSchema(a, legacy_bytes);
     defer storage_schema.freeSchema(a, legacy);
     try std.testing.expectEqual(@as(u32, 31), legacy.decoded_format_version);
-    try std.testing.expect(!legacy.requires_deferred_check_validation);
+    try std.testing.expect(!legacy.requires_deferred_constraints);
     var projection_only = runtime;
-    projection_only.requires_deferred_check_validation = false;
+    projection_only.requires_deferred_constraints = false;
     const old_projection = try storage_schema.serializeTextProjectionSchema(a, projection_only);
     defer a.free(old_projection);
     const next_projection = try storage_schema.serializeTextProjectionSchema(a, runtime);
@@ -448,6 +486,20 @@ test "relational index system NOT VALID CHECK enforces writes without historical
     const next_json = try std.json.Stringify.valueAlloc(candidate.arena.allocator(), candidate.value, .{});
     try std.testing.expectError(error.CheckConstraintValidationRequired, @import("relational_checks.zig").validateSchemaUpdate(a, deferred_json, next_json));
     try @import("relational_checks.zig").validateSchemaUpdate(a, deferred_json, deferred_json);
+}
+
+test "SQL expression NOT VALID validation requires historical proof after declaration rename" {
+    const a = std.testing.allocator;
+    const previous =
+        \\{"version":3,"storage_mode":"relational","default_type":"row","checks":[{"name":"status_known","not_valid":true,"expression":{"op":"ne","args":[{"op":"column","column":"status"},{"op":"literal","type":"string","value":"unknown"}]}}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"status":{"type":"keyword"}},"additionalProperties":false}}}}
+    ;
+    var next = try std.json.parseFromSlice(std.json.Value, a, previous, .{});
+    defer next.deinit();
+    const rule = &next.value.object.getPtr("checks").?.array.items[0];
+    try rule.object.put(next.arena.allocator(), "not_valid", .{ .bool = false });
+    try rule.object.put(next.arena.allocator(), "name", .{ .string = "renamed" });
+    const bytes = try std.json.Stringify.valueAlloc(next.arena.allocator(), next.value, .{});
+    try std.testing.expectError(error.CheckConstraintValidationRequired, @import("relational_checks.zig").validateSchemaUpdate(a, previous, bytes));
 }
 
 const precise_sql_fixture =
@@ -1789,7 +1841,7 @@ pub fn deriveRuntimeTableSchema(alloc: std.mem.Allocator, schema: ParsedTableSch
 
     // Reject unsupported key types/collations before the metadata API accepts
     // a schema, using the same compiler as physical index publication.
-    if (schema.relational_indexes != null) {
+    if (schema.relational_indexes != null or schema.coveringConstraintCount() != 0) {
         var arena = std.heap.ArenaAllocator.init(alloc);
         defer arena.deinit();
         const index_schema = expression_schema;
@@ -1801,6 +1853,13 @@ pub fn deriveRuntimeTableSchema(alloc: std.mem.Allocator, schema: ParsedTableSch
                 else => return error.InvalidSchemaUpdateRequest,
             };
             tuple.deinit();
+            if (definition.include_columns.len != 0) {
+                var cover = @import("../storage/db/relational_index_cover.zig").Plan.init(alloc, index_schema, &layout, definition.keys, definition.include_columns) catch |err| switch (err) {
+                    error.OutOfMemory => return err,
+                    else => return error.InvalidSchemaUpdateRequest,
+                };
+                cover.deinit();
+            }
             if (definition.where.len != 0) {
                 var condition = @import("../storage/db/relational_index_predicate.zig").Plan.init(alloc, index_schema, &layout, definition.where) catch |err| switch (err) {
                     error.OutOfMemory => return err,
@@ -1869,11 +1928,36 @@ fn expressionCapabilitySchema(schema: ParsedTableSchema) storage_schema.TableSch
         .requires_jsonb_display = requiresJsonbDisplay(schema),
         .requires_json_expressions = requiresJsonExpressions(schema),
         .requires_jsonb_array_display = requiresJsonbArrayDisplay(schema),
-        .requires_deferred_check_validation = deferredCheckValidation(schema),
+        .requires_deferred_constraints = deferredConstraints(schema),
+        .requires_uuid_defaults = requiresUuidDefaults(schema),
     };
 }
 
-fn deferredCheckValidation(schema: ParsedTableSchema) bool {
+fn requiresUuidDefaults(schema: ParsedTableSchema) bool {
+    const definitions = schema.column_defaults orelse return false;
+    if (definitions.value != .array) return false;
+    for (definitions.value.array.items) |entry| {
+        if (entry != .object) continue;
+        if (entry.object.get("expression")) |expression| if (uuidDefaultExpression(expression, 0)) return true;
+    }
+    return false;
+}
+
+fn uuidDefaultExpression(expression: std.json.Value, depth: usize) bool {
+    if (depth >= @import("relational_expression.zig").max_depth or expression != .object) return false;
+    if (expression.object.get("op")) |op| if (op == .string and (std.mem.eql(u8, op.string, "uuidv4") or std.mem.eql(u8, op.string, "uuidv7"))) return true;
+    if (expression.object.get("args")) |args| if (args == .array) {
+        for (args.array.items) |arg| if (uuidDefaultExpression(arg, depth + 1)) return true;
+    };
+    return false;
+}
+
+fn deferredConstraints(schema: ParsedTableSchema) bool {
+    if (schema.unique_constraints) |definitions| {
+        for (definitions.value) |rule| {
+            if ((rule.primary orelse false) and (rule.deferrable orelse false)) return true;
+        }
+    }
     const declarations = schema.checks orelse return false;
     for (declarations.value) |check| if (check.not_valid orelse false) return true;
     return false;

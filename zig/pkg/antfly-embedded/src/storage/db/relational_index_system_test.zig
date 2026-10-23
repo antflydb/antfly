@@ -49,6 +49,9 @@ const NullabilityJobFixture = struct {
         return bindingFor(db, prepared, id, .native);
     }
     fn bindingFor(db: *db_mod.DB, prepared: *const job.Candidate, id: u8, kind: source.Kind) !job.Binding {
+        return bindingForGroup(db, prepared, id, kind, namespace.shard_id);
+    }
+    fn bindingForGroup(db: *db_mod.DB, prepared: *const job.Candidate, id: u8, kind: source.Kind, group: u64) !job.Binding {
         const identity = try db.relationalTopologyIdentity();
         var read = try db.core.store.beginReadTxn();
         defer read.abort();
@@ -56,8 +59,8 @@ const NullabilityJobFixture = struct {
             .admission_epoch = identity.next_epoch,
             .transition_id = id,
             .attempt = 1,
-            .owner_group_id = namespace.shard_id,
-            .peer_group_id = namespace.shard_id,
+            .owner_group_id = group,
+            .peer_group_id = group,
             .namespace = namespace,
             .catalog_digest = identity.catalog_digest,
             .role = .schema_validation,
@@ -103,7 +106,864 @@ const NullabilityJobFixture = struct {
     fn configure(db: *db_mod.DB, schema_json: []const u8, indexes_json: []const u8, historical: bool) !bool {
         return @import("../write.zig").configureStorageKernelOwnerDbAtOpen(alloc, db, "rows", schema_json, indexes_json, null, null, null, null, null, historical);
     }
+    fn completeAudit(db: *db_mod.DB, expected: job.Binding, inputs: []const u8, budget: rows.Budget, path: []const u8, signing_root: u128) !@import("relational_schema_audit_checkpoint.zig").Result {
+        for (0..128) |_| {
+            const result = try db.stepSchemaOwnerRowAudit(expected.fence.owner_group_id, expected, inputs, budget, path, signing_root, .{});
+            if (result == .complete) return result;
+        }
+        return error.ValidationJobDidNotComplete;
+    }
 };
+
+test "relational index system nullability job retained history audit yields and binds one immutable cut" {
+    const F = NullabilityJobFixture;
+    const outcomes = @import("relational_schema_apply_outcome.zig");
+    const receipts = @import("apply_receipts.zig");
+    const Control = struct {
+        calls: usize = 0,
+        cancel_after: usize = std.math.maxInt(usize),
+        pub fn check(self: *@This()) !void {
+            if (self.calls == self.cancel_after) return error.Canceled;
+            self.calls += 1;
+        }
+    };
+    var directory = try @import("../../common/test_directory.zig").TestDirectory.init("schema-retained-history");
+    defer directory.cleanup();
+    var options = F.options;
+    options.online_source_authority = .raft;
+    var database = try db_mod.DB.open(alloc, directory.path(), options);
+    defer database.close();
+    const count = 257;
+    var source_head: ?outcomes.Head = null;
+    var foreign = F.namespace;
+    foreign.range_id += 1;
+    const copied: outcomes.Receipt = .{ .namespace = foreign, .entry = .{ .term = 90, .index = 900 }, .command = @splat(55), .reason = .canceled };
+    {
+        var txn = try database.core.store.beginWriteTxn();
+        errdefer txn.abort();
+        for (1..count + 1) |i| {
+            try outcomes.stage(&txn, .{ .namespace = F.namespace, .entry = .{ .term = 1, .index = i }, .command = @splat(7), .reason = .accepted });
+            if (i == 100) source_head = try outcomes.readHead(&txn, F.namespace);
+        }
+        var marker: [receipts.ordered_apply_receipt_value_len]u8 = undefined;
+        const marker_write = receipts.orderedApplyReceiptWrite(.{ .term = 1, .index = count }, &marker);
+        try txn.put(marker_write.key, marker_write.value);
+        // Foreign history has its own clock, never local cut authority.
+        try txn.put(&outcomes.key(foreign, copied.entry.index), &try copied.encode());
+        try txn.commit();
+    }
+    var read = try database.core.store.beginReadTxn();
+    defer read.abort();
+    var control: Control = .{};
+    var audit = try outcomes.SnapshotAudit(@TypeOf(&read)).init(&read, F.namespace, &control);
+    defer audit.deinit();
+    try std.testing.expectError(error.SchemaValidationRuntimeRecoveryRequired, audit.result());
+    var canceled: Control = .{ .cancel_after = 0 };
+    try std.testing.expectError(error.Canceled, audit.step(.{ .records = 1 }, &canceled));
+    try std.testing.expect(!audit.invalid);
+    try std.testing.expect(!audit.started);
+    try std.testing.expectError(error.InvalidSchemaValidationJob, audit.step(.{ .records = 0 }, &control));
+    try std.testing.expect(!audit.invalid);
+    try std.testing.expect(!try audit.step(.{ .records = 1 }, &control));
+    try std.testing.expectEqual(@as(usize, 1), audit.last_units);
+    // The live database changes after pinning; the old image must still
+    // qualify only its original history, not silently mix point/cursor cuts.
+    try database.core.store.delete(&outcomes.key(F.namespace, 100));
+    var turns: usize = 1;
+    while (true) {
+        const complete = try audit.step(.{ .records = 1 }, &control);
+        try std.testing.expectEqual(@as(usize, 1), audit.last_units);
+        turns += 1;
+        if (complete) break;
+        if (turns > count + 10) return error.TestUnexpectedResult;
+        try std.testing.expectError(error.SchemaValidationRuntimeRecoveryRequired, audit.result());
+    }
+    try std.testing.expectEqual(@as(usize, count + 4), turns);
+    try std.testing.expectEqualDeep(outcomes.SnapshotStats{ .records = count + 1, .foreign_records = 1 }, try audit.result());
+    try std.testing.expect(try audit.step(.{ .records = 1 }, &control));
+    try std.testing.expectEqual(@as(usize, 0), audit.last_units);
+    const anchor: outcomes.Anchor = .{ .cut = .{ .term = 1, .index = 100 }, .head = F.job.hash(&try source_head.?.encode()) };
+    {
+        var anchored = try outcomes.SnapshotAudit(@TypeOf(&read)).initAnchored(&read, F.namespace, anchor, &control);
+        defer anchored.deinit();
+        try std.testing.expectError(error.SchemaValidationRuntimeRecoveryRequired, anchored.anchoredHead());
+        var anchored_turns: usize = 0;
+        while (true) {
+            const done = try anchored.step(.{ .records = 1 }, &control);
+            anchored_turns += 1;
+            try std.testing.expectEqual(@as(usize, 1), anchored.last_units);
+            if (done) break;
+            if (anchored_turns > count + 10) return error.TestUnexpectedResult;
+        }
+        try std.testing.expectEqual(turns, anchored_turns);
+        try std.testing.expectEqualDeep(source_head, try anchored.anchoredHead());
+        try std.testing.expectEqualDeep(try audit.result(), try anchored.result());
+    }
+    {
+        var empty = try outcomes.SnapshotAudit(@TypeOf(&read)).initAnchored(&read, F.namespace, .{ .cut = null, .head = null }, &control);
+        defer empty.deinit();
+        while (!try empty.step(.{}, &control)) {}
+        try std.testing.expect(try empty.anchoredHead() == null);
+        try std.testing.expectError(error.CorruptSchemaApplyOutcome, outcomes.SnapshotAudit(@TypeOf(&read)).initAnchored(&read, F.namespace, .{ .cut = null, .head = @splat(3) }, &control));
+        try std.testing.expectError(error.CorruptSchemaApplyOutcome, outcomes.SnapshotAudit(@TypeOf(&read)).initAnchored(&read, F.namespace, .{ .cut = .{ .term = 1, .index = count + 1 }, .head = null }, &control));
+    }
+    {
+        var fresh = try database.core.store.beginReadTxn();
+        defer fresh.abort();
+        var missing = try outcomes.SnapshotAudit(@TypeOf(&fresh)).init(&fresh, F.namespace, &control);
+        defer missing.deinit();
+        while (missing.step(.{ .records = 1 }, &control)) |done| {
+            if (done) return error.TestUnexpectedResult;
+        } else |err| try std.testing.expectEqual(error.SchemaValidationRuntimeRecoveryRequired, err);
+        try std.testing.expect(missing.invalid);
+        try std.testing.expectError(error.SchemaValidationRuntimeRecoveryRequired, missing.result());
+        try std.testing.expectError(error.SchemaValidationRuntimeRecoveryRequired, missing.step(.{}, &control));
+    }
+    const original: outcomes.Receipt = .{ .namespace = F.namespace, .entry = .{ .term = 1, .index = 100 }, .command = @splat(7), .reason = .accepted };
+    var changed = original;
+    changed.reason = .canceled;
+    try database.core.store.put(&outcomes.key(F.namespace, 100), &try changed.encode());
+    {
+        var fresh = try database.core.store.beginReadTxn();
+        defer fresh.abort();
+        try std.testing.expectError(error.CorruptSchemaApplyOutcome, outcomes.validateSnapshot(&fresh, F.namespace, &control));
+    }
+    {
+        // Deliberately rewrite a self-consistent full history. Its new head
+        // passes ordinary snapshot validation, but not the imported prefix.
+        var txn = try database.core.store.beginWriteTxn();
+        errdefer txn.abort();
+        try txn.delete(&outcomes.headKey(F.namespace));
+        for (1..count + 1) |i| try txn.delete(&outcomes.key(F.namespace, i));
+        for (1..count + 1) |i| try outcomes.stage(&txn, .{ .namespace = F.namespace, .entry = .{ .term = 1, .index = i }, .command = @splat(7), .reason = if (i == 50) .canceled else .accepted });
+        try txn.commit();
+        var fresh = try database.core.store.beginReadTxn();
+        defer fresh.abort();
+        _ = try outcomes.validateSnapshot(&fresh, F.namespace, &control);
+        var spliced = try outcomes.SnapshotAudit(@TypeOf(&fresh)).initAnchored(&fresh, F.namespace, anchor, &control);
+        defer spliced.deinit();
+        while (spliced.step(.{}, &control)) |done| {
+            if (done) return error.TestUnexpectedResult;
+        } else |err| try std.testing.expectEqual(error.SchemaValidationRuntimeRecoveryRequired, err);
+        try std.testing.expect(spliced.invalid);
+        try std.testing.expectError(error.SchemaValidationRuntimeRecoveryRequired, spliced.anchoredHead());
+    }
+    var interrupted = try outcomes.SnapshotAudit(@TypeOf(&read)).init(&read, F.namespace, &control);
+    defer interrupted.deinit();
+    var midturn: Control = .{ .cancel_after = 4 };
+    try std.testing.expectError(error.Canceled, interrupted.step(.{}, &midturn));
+    try std.testing.expect(interrupted.last_units > 0);
+    try std.testing.expect(interrupted.invalid);
+    try std.testing.expectError(error.SchemaValidationRuntimeRecoveryRequired, interrupted.result());
+    try std.testing.expectError(error.SchemaValidationRuntimeRecoveryRequired, interrupted.step(.{}, &control));
+}
+
+test "relational index system nullability job seals source prefix and preserves receiver lineage across restart" {
+    const F = NullabilityJobFixture;
+    const Origin = @import("native_backup_origin.zig");
+    const RootEvidence = @import("relational_schema_root_evidence.zig");
+    const io = std.testing.io;
+    const Write = struct {
+        fn at(path: []const u8, bytes: []const u8) !void {
+            var file = try std.Io.Dir.cwd().createFile(std.testing.io, path, .{ .truncate = true });
+            defer file.close(std.testing.io);
+            var buffer: [512]u8 = undefined;
+            var writer = file.writer(std.testing.io, &buffer);
+            try writer.interface.writeAll(bytes);
+            try writer.end();
+            try file.sync(std.testing.io);
+        }
+    };
+    var directory = try @import("../../common/test_directory.zig").TestDirectory.init("schema-source-prefix");
+    defer directory.cleanup();
+    var options = F.options;
+    options.online_source_authority = .raft;
+    var database = try db_mod.DB.open(alloc, directory.path(), options);
+    var live = true;
+    defer if (live) database.close();
+    _ = try F.configure(&database, F.before, "{}", false);
+    var candidate = try F.candidate(&database);
+    defer candidate.deinit();
+    const owner_group = F.namespace.shard_id + 100;
+    const binding = try F.bindingForGroup(&database, &candidate, 78, .raft, owner_group);
+    try database.applyRaftSchemaOwnerCommand(.{ .binding = binding, .action = .begin, .payload = candidate.inputs }, owner_group, .{ .term = 1, .index = 1 }, .{});
+    try database.applyRaftSchemaOwnerCommand(.{ .binding = binding, .action = .freeze }, owner_group, .{ .term = 1, .index = 2 }, .{});
+    const source_image = blk: {
+        var read = try database.core.store.beginReadTxn();
+        defer read.abort();
+        break :blk try Origin.Origin.capture(&read, database.root_incarnation, F.namespace);
+    };
+    try database.applyRaftSchemaOwnerCommand(.{ .binding = binding, .action = .cancel }, owner_group, .{ .term = 1, .index = 3 }, .{});
+    const namespace = @import("online_source_contract.zig").namespaceBytes(F.namespace);
+    // Host-only fixture seeds a canonical receiver record. Actual NRSP2
+    // extraction/verification is tested by native_snapshot, not inferred here.
+    const installed: Origin.Installation = .{ .group_id = owner_group, .through_index = 2, .destination_root_incarnation = database.root_incarnation, .namespace = namespace, .source = source_image, .stream_digest = @splat(37) };
+    const raw = try installed.encode();
+    const path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ directory.path(), Origin.Installation.file_name });
+    defer alloc.free(path);
+    try Write.at(path, &raw);
+    try std.testing.expectEqualDeep(installed, (try Origin.loadInstallation(alloc, io, directory.path(), owner_group, namespace, database.root_incarnation, .{})).?);
+    try std.testing.expectError(error.NativeBackupOriginMismatch, Origin.loadInstallation(alloc, io, directory.path(), F.namespace.shard_id, namespace, database.root_incarnation, .{}));
+    try std.testing.expectError(error.NativeBackupOriginMismatch, Origin.loadInstallation(alloc, io, directory.path(), owner_group, namespace, database.root_incarnation + 1, .{}));
+    {
+        try Write.at(path, raw[0 .. raw.len - 1]);
+        var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
+        try std.testing.expectError(error.InvalidNativeBackupOrigin, Origin.loadInstallation(failing.allocator(), io, directory.path(), owner_group, namespace, database.root_incarnation, .{}));
+        var oversized: [raw.len + 1]u8 = undefined;
+        @memcpy(oversized[0..raw.len], &raw);
+        oversized[raw.len] = 0;
+        try Write.at(path, &oversized);
+        try std.testing.expectError(error.InvalidNativeBackupOrigin, Origin.loadInstallation(alloc, io, directory.path(), owner_group, namespace, database.root_incarnation, .{}));
+        try std.Io.Dir.cwd().deleteFile(io, path);
+        try std.Io.Dir.cwd().createDir(io, path, .default_dir);
+        try std.testing.expectError(error.InvalidNativeBackupOrigin, Origin.loadInstallation(alloc, io, directory.path(), owner_group, namespace, database.root_incarnation, .{}));
+        try std.Io.Dir.cwd().deleteDir(io, path);
+        if (comptime builtin.os.tag != .windows) {
+            const target = try std.fmt.allocPrint(alloc, "{s}.target", .{path});
+            defer alloc.free(target);
+            try Write.at(target, &raw);
+            try std.Io.Dir.cwd().symLink(io, target, path, .{});
+            try std.testing.expectError(error.InvalidNativeBackupOrigin, Origin.loadInstallation(alloc, io, directory.path(), owner_group, namespace, database.root_incarnation, .{}));
+            try std.Io.Dir.cwd().deleteFile(io, path);
+        }
+        try Write.at(path, &raw);
+    }
+    const identity = try @import("root_signing_identity.zig").loadOrCreate(alloc, io, directory.path());
+    const budget: rows.Budget = .{ .records = 1, .time_ns = std.time.ns_per_s };
+    const proof = try F.completeAudit(&database, binding, candidate.inputs, budget, directory.path(), identity.root_incarnation);
+    try std.testing.expect(proof == .complete);
+    try proof.complete.verify(identity.public_key);
+    try std.testing.expectEqualDeep(installed, proof.complete.value.qualification.installation.?);
+    try std.testing.expectEqual(@as(u64, 2), proof.complete.value.qualification.source_history_head.?.count);
+    try std.testing.expectEqual(@as(u64, 2), proof.complete.value.qualification.source_history_head.?.last.index);
+    try std.testing.expectEqual(@as(u64, 3), proof.complete.value.qualification.history_head.?.count);
+    try std.testing.expectEqual(@as(u64, 3), proof.complete.value.rows.snapshot_cut.raft.index);
+    var corrupt = raw;
+    corrupt[corrupt.len - 1] ^= 1;
+    try Write.at(path, &corrupt);
+    try std.testing.expectError(error.InvalidNativeBackupOrigin, database.stepSchemaOwnerRowAudit(owner_group, binding, candidate.inputs, budget, directory.path(), identity.root_incarnation, .{}));
+    try Write.at(path, &raw);
+    _ = try F.completeAudit(&database, binding, candidate.inputs, budget, directory.path(), identity.root_incarnation);
+    var changed = installed;
+    changed.stream_digest[0] ^= 1;
+    try Write.at(path, &try changed.encode());
+    // Same source cut/head cannot re-label a traversal with another receiver
+    // record. A fresh traversal cannot replace immutable persisted lineage.
+    try std.testing.expectError(error.SchemaValidationRuntimeRecoveryRequired, database.stepSchemaOwnerRowAudit(owner_group, binding, candidate.inputs, budget, directory.path(), identity.root_incarnation, .{}));
+    database.close();
+    live = false;
+    database = try db_mod.DB.open(alloc, directory.path(), options);
+    live = true;
+    _ = try F.configure(&database, F.before, "{}", true);
+    try std.testing.expectError(error.SchemaValidationRuntimeRecoveryRequired, F.completeAudit(&database, binding, candidate.inputs, budget, directory.path(), identity.root_incarnation));
+    try std.Io.Dir.cwd().deleteFile(io, path);
+    try std.testing.expectError(error.SchemaValidationRuntimeRecoveryRequired, F.completeAudit(&database, binding, candidate.inputs, budget, directory.path(), identity.root_incarnation));
+    try std.testing.expectEqualDeep(proof.complete, (try RootEvidence.load(alloc, io, directory.path(), identity.root_incarnation, namespace, .{})).?);
+    try Write.at(path, &raw);
+    try std.testing.expectEqualDeep(proof, try F.completeAudit(&database, binding, candidate.inputs, budget, directory.path(), identity.root_incarnation));
+}
+
+test "relational index system nullability job Raft stale commands retain exact durable outcomes" {
+    const F = NullabilityJobFixture;
+    const controls = db_mod.DB.SchemaOwnerControl;
+    const outcomes = @import("relational_schema_apply_outcome.zig");
+    var directory = try @import("../../common/test_directory.zig").TestDirectory.init("raft-schema-outcomes");
+    defer directory.cleanup();
+    var options = F.options;
+    options.online_source_authority = .raft;
+    var database = try db_mod.DB.open(alloc, directory.path(), options);
+    var database_live = true;
+    defer if (database_live) database.close();
+    _ = try F.configure(&database, F.before, "{}", false);
+    var candidate = try F.candidate(&database);
+    defer candidate.deinit();
+    const binding = try F.bindingFor(&database, &candidate, 41, .raft);
+    const begin: controls.Command = .{ .binding = binding, .action = .begin, .payload = candidate.inputs };
+    const freeze: controls.Command = .{ .binding = binding, .action = .freeze };
+    const cancel: controls.Command = .{ .binding = binding, .action = .cancel };
+    const wire = try begin.encodeRaft(alloc);
+    defer alloc.free(wire);
+    try std.testing.expectEqualSlices(u8, wire[wire.len - 32 ..], &try begin.raftIdentity());
+    // Codec-valid copied history is not an adoption grant. Its old namespace
+    // must neither satisfy nor collide with the current owner's entry 1.
+    var copied_namespace = F.namespace;
+    copied_namespace.range_id += 1;
+    const copied: outcomes.Receipt = .{ .namespace = copied_namespace, .entry = .{ .term = 1, .index = 1 }, .command = @splat(55), .reason = .accepted };
+    try database.core.store.put(&outcomes.key(copied_namespace, 1), &try copied.encode());
+    {
+        // An orphaned outcome ahead of the native marker cannot authorize
+        // replay/repair, even with an otherwise valid canonical command.
+        const orphan: outcomes.Receipt = .{ .namespace = F.namespace, .entry = .{ .term = 1, .index = 1 }, .command = try begin.raftIdentity(), .reason = .accepted };
+        try database.core.store.put(&outcomes.key(F.namespace, 1), &try orphan.encode());
+        try std.testing.expectError(error.CorruptSchemaApplyOutcome, database.applyRaftSchemaOwnerCommand(begin, F.namespace.shard_id, .{ .term = 1, .index = 1 }, .{}));
+        try std.testing.expect(try database.orderedApplyReceipt() == null);
+        try database.core.store.delete(&outcomes.key(F.namespace, 1));
+    }
+    try database.applyRaftSchemaOwnerCommand(begin, F.namespace.shard_id, .{ .term = 1, .index = 1 }, .{});
+    {
+        var read = try database.core.store.beginReadTxn();
+        defer read.abort();
+        try std.testing.expectEqualDeep(copied, (try outcomes.read(&read, copied_namespace, 1)).?);
+        const current = (try outcomes.read(&read, F.namespace, 1)).?;
+        try std.testing.expectEqualDeep(F.namespace, current.namespace);
+        try std.testing.expectEqualSlices(u8, &try begin.raftIdentity(), &current.command);
+    }
+    var old_freeze = try database.prepareRaftSchemaOwnerControl(freeze, .{});
+    defer old_freeze.deinit();
+    {
+        // A version mismatch inside an admitted, fenced job is not an ordinary
+        // stale request. Model an incomplete/corrupt restored catalog and
+        // require recovery without consuming this entry or minting rejection.
+        const catalog_mod = @import("table_catalog.zig");
+        const original = try database.core.store.get(alloc, catalog_mod.key);
+        defer alloc.free(original);
+        var invalid = try catalog_mod.Catalog.decode(original);
+        invalid.active_schema_version += 1;
+        try database.core.store.put(catalog_mod.key, &invalid.encode());
+        try std.testing.expectError(error.SchemaValidationRuntimeRecoveryRequired, database.applyCommittedRaftSchemaOwnerControl(&old_freeze, F.namespace.shard_id, .{ .term = 1, .index = 2 }));
+        try std.testing.expectError(error.SchemaValidationRuntimeRecoveryRequired, database.applyRaftSchemaOwnerCommand(cancel, F.namespace.shard_id, .{ .term = 1, .index = 2 }, .{}));
+        try std.testing.expectEqual(@as(u64, 1), (try database.orderedApplyReceipt()).?.index);
+        {
+            var read = try database.core.store.beginReadTxn();
+            defer read.abort();
+            try std.testing.expect(try outcomes.read(&read, F.namespace, 2) == null);
+        }
+        try database.core.store.put(catalog_mod.key, original);
+    }
+    try database.applyRaftSchemaOwnerCommand(cancel, F.namespace.shard_id, .{ .term = 1, .index = 2 }, .{});
+    const canceled = try F.current(&database);
+    // A once-valid preparation loses its guard before apply. The rejection
+    // and actual entry marker commit without executing the prepared FREEZE.
+    try std.testing.expectError(error.SchemaValidationCommandRejected, database.applyCommittedRaftSchemaOwnerControl(&old_freeze, F.namespace.shard_id, .{ .term = 1, .index = 3 }));
+    try std.testing.expectEqualDeep(canceled, try F.current(&database));
+    try std.testing.expectEqualDeep(@as(?@import("apply_receipts.zig").OrderedApplyReceipt, .{ .term = 1, .index = 3 }), try database.orderedApplyReceipt());
+    {
+        var read = try database.core.store.beginReadTxn();
+        defer read.abort();
+        const receipt = (try outcomes.read(&read, F.namespace, 3)).?;
+        try std.testing.expectEqual(outcomes.Reason.canceled, receipt.reason);
+        try std.testing.expectEqualSlices(u8, &try freeze.raftIdentity(), &receipt.command);
+    }
+    // A command first prepared after cancellation must become a rejection
+    // candidate, not commit on control or forget its original payload.
+    var rejected = (try database.prepareCommittedRaftSchemaOwnerCommand(freeze, F.namespace.shard_id, .{ .term = 1, .index = 4 }, .{})).?;
+    defer rejected.deinit();
+    try std.testing.expectEqual(outcomes.Reason.canceled, rejected.guard_rejection.?);
+    try std.testing.expectError(error.SchemaValidationCommandRejected, database.applyCommittedRaftSchemaOwnerControl(&rejected, F.namespace.shard_id, .{ .term = 1, .index = 4 }));
+    try std.testing.expectEqualDeep(canceled, try F.current(&database));
+    // Retrying success and rejection must remain distinct after a later cut.
+    try database.applyRaftSchemaOwnerCommand(begin, F.namespace.shard_id, .{ .term = 1, .index = 1 }, .{});
+    try std.testing.expectError(error.SchemaValidationCommandRejected, database.applyRaftSchemaOwnerCommand(freeze, F.namespace.shard_id, .{ .term = 1, .index = 3 }, .{}));
+    try std.testing.expectError(error.ConflictingOrderedApplyReceipt, database.applyRaftSchemaOwnerCommand(cancel, F.namespace.shard_id, .{ .term = 1, .index = 3 }, .{}));
+    try std.testing.expectError(error.ConflictingOrderedApplyReceipt, database.applyRaftSchemaOwnerCommand(freeze, F.namespace.shard_id, .{ .term = 2, .index = 3 }, .{}));
+    database.close();
+    database_live = false;
+    database = try db_mod.DB.open(alloc, directory.path(), options);
+    database_live = true;
+    _ = try F.configure(&database, F.before, "{}", true);
+    try std.testing.expectEqualDeep(canceled, try F.current(&database));
+    try database.applyRaftSchemaOwnerCommand(begin, F.namespace.shard_id, .{ .term = 1, .index = 1 }, .{});
+    try std.testing.expectError(error.SchemaValidationCommandRejected, database.applyRaftSchemaOwnerCommand(freeze, F.namespace.shard_id, .{ .term = 1, .index = 4 }, .{}));
+    // A watermark with missing exact outcome evidence is not success.
+    const missing = outcomes.key(F.namespace, 3);
+    {
+        var txn = try database.core.store.beginWriteTxn();
+        errdefer txn.abort();
+        try txn.delete(&missing);
+        try txn.commit();
+    }
+    try std.testing.expectError(error.SchemaValidationRuntimeRecoveryRequired, database.applyRaftSchemaOwnerCommand(freeze, F.namespace.shard_id, .{ .term = 1, .index = 3 }, .{}));
+    try database.core.store.put(&outcomes.key(F.namespace, 4), "truncated-fault-fixture");
+    try std.testing.expectError(error.CorruptSchemaApplyOutcome, database.applyRaftSchemaOwnerCommand(freeze, F.namespace.shard_id, .{ .term = 1, .index = 4 }, .{}));
+    try std.testing.expectEqualDeep(canceled, try F.current(&database));
+}
+
+test "relational index system nullability job snapshot outcomes bind canonical keys namespace and cut" {
+    const F = NullabilityJobFixture;
+    const outcomes = @import("relational_schema_apply_outcome.zig");
+    const receipts = @import("apply_receipts.zig");
+    var directory = try @import("../../common/test_directory.zig").TestDirectory.init("schema-snapshot-outcomes");
+    defer directory.cleanup();
+    var options = F.options;
+    options.online_source_authority = .raft;
+    var database = try db_mod.DB.open(alloc, directory.path(), options);
+    defer database.close();
+    _ = try F.configure(&database, F.before, "{}", false);
+    var candidate = try F.candidate(&database);
+    defer candidate.deinit();
+    const binding = try F.bindingFor(&database, &candidate, 71, .raft);
+    const begin: db_mod.DB.SchemaOwnerControl.Command = .{ .binding = binding, .action = .begin, .payload = candidate.inputs };
+    const cancel: db_mod.DB.SchemaOwnerControl.Command = .{ .binding = binding, .action = .cancel };
+    const freeze: db_mod.DB.SchemaOwnerControl.Command = .{ .binding = binding, .action = .freeze };
+    var namespace: [24]u8 = undefined;
+    @import("doc_identity.zig").encodeNamespace(&namespace, F.namespace);
+    try database.applyRaftSchemaOwnerCommand(begin, F.namespace.shard_id, .{ .term = 1, .index = 1 }, .{});
+    try database.verifyTransferablePrimarySnapshot(namespace, .{ .term = 1, .index = 1 });
+    try database.applyRaftSchemaOwnerCommand(cancel, F.namespace.shard_id, .{ .term = 1, .index = 2 }, .{});
+    try std.testing.expectError(error.SchemaValidationCommandRejected, database.applyRaftSchemaOwnerCommand(freeze, F.namespace.shard_id, .{ .term = 1, .index = 3 }, .{}));
+    const cut: receipts.OrderedApplyReceipt = .{ .term = 1, .index = 3 };
+    try database.verifyTransferablePrimarySnapshot(namespace, cut);
+    try database.core.store.put(F.topo.fence_key, &try binding.fence.encode());
+    try std.testing.expectError(error.SchemaValidationJobChanged, database.verifyTransferablePrimarySnapshot(namespace, cut));
+    try database.core.store.delete(F.topo.fence_key);
+
+    var foreign = F.namespace;
+    foreign.range_id += 1;
+    var historical: outcomes.Receipt = .{ .namespace = foreign, .entry = .{ .term = 90, .index = 900 }, .command = @splat(17), .reason = .canceled };
+    const historical_key = outcomes.key(foreign, 900);
+    try database.core.store.put(&historical_key, &try historical.encode());
+    // A different namespace's larger clock is inert, not a future local cut.
+    try database.verifyTransferablePrimarySnapshot(namespace, cut);
+    const future_head = outcomes.head_family_prefix ++ "v2:future";
+    const head_bytes = try database.core.store.get(alloc, &outcomes.headKey(F.namespace));
+    defer alloc.free(head_bytes);
+    try database.core.store.put(future_head, head_bytes);
+    try std.testing.expectError(error.CorruptSchemaApplyOutcome, database.verifyTransferablePrimarySnapshot(namespace, cut));
+    try database.core.store.delete(future_head);
+    const future_outcome = outcomes.family_prefix ++ "v2:future";
+    try database.core.store.put(future_outcome, &try historical.encode());
+    try std.testing.expectError(error.CorruptSchemaApplyOutcome, database.verifyTransferablePrimarySnapshot(namespace, cut));
+    try database.core.store.delete(future_outcome);
+    {
+        var read = try database.core.store.beginReadTxn();
+        defer read.abort();
+        const stats = try outcomes.validateSnapshot(&read, F.namespace, db_mod.types.CancellationToken.none);
+        try std.testing.expectEqual(@as(u64, 4), stats.records);
+        try std.testing.expectEqual(@as(u64, 1), stats.foreign_records);
+        var canceled = std.atomic.Value(bool).init(true);
+        try std.testing.expectError(error.Canceled, outcomes.validateSnapshot(&read, F.namespace, db_mod.types.CancellationToken.fromAtomic(&canceled)));
+    }
+    const orphan: outcomes.Receipt = .{ .namespace = F.namespace, .entry = .{ .term = 1, .index = 4 }, .command = @splat(19), .reason = .accepted };
+    try database.core.store.put(&outcomes.key(F.namespace, 4), &try orphan.encode());
+    try std.testing.expectError(error.CorruptSchemaApplyOutcome, database.verifyTransferablePrimarySnapshot(namespace, cut));
+    try database.core.store.delete(&outcomes.key(F.namespace, 4));
+
+    const accepted_key = outcomes.key(F.namespace, 2);
+    const accepted_bytes = try database.core.store.get(alloc, &accepted_key);
+    defer alloc.free(accepted_bytes);
+    try database.core.store.delete(&accepted_key);
+    // A valid high watermark and the other exact outcomes do not replace the
+    // accepted cut explicitly referenced by the canceled job header.
+    try std.testing.expectError(error.SchemaValidationRuntimeRecoveryRequired, database.verifyTransferablePrimarySnapshot(namespace, cut));
+    var rejected_reference = try outcomes.Receipt.decode(accepted_bytes);
+    rejected_reference.reason = .canceled;
+    try database.core.store.put(&accepted_key, &try rejected_reference.encode());
+    try std.testing.expectError(error.CorruptSchemaApplyOutcome, database.verifyTransferablePrimarySnapshot(namespace, cut));
+    try database.core.store.put(&accepted_key, accepted_bytes);
+
+    var marker_bytes: [receipts.ordered_apply_receipt_value_len]u8 = undefined;
+    const conflicting_marker = receipts.orderedApplyReceiptWrite(.{ .term = 2, .index = 3 }, &marker_bytes);
+    try database.core.store.put(conflicting_marker.key, conflicting_marker.value);
+    try std.testing.expectError(error.CorruptSchemaApplyOutcome, database.verifyTransferablePrimarySnapshot(namespace, .{ .term = 2, .index = 3 }));
+    const original_marker = receipts.orderedApplyReceiptWrite(cut, &marker_bytes);
+    try database.core.store.put(original_marker.key, original_marker.value);
+
+    // Canonical foreign bytes cannot be relabeled under a current-owner key.
+    try database.core.store.put(&accepted_key, &try historical.encode());
+    try std.testing.expectError(error.CorruptSchemaApplyOutcome, database.verifyTransferablePrimarySnapshot(namespace, cut));
+    try database.core.store.put(&accepted_key, accepted_bytes);
+    historical.entry = .{ .term = 89, .index = 901 };
+    try database.core.store.put(&outcomes.key(foreign, 901), &try historical.encode());
+    try std.testing.expectError(error.CorruptSchemaApplyOutcome, database.verifyTransferablePrimarySnapshot(namespace, cut));
+    try database.core.store.delete(&outcomes.key(foreign, 901));
+    try database.verifyTransferablePrimarySnapshot(namespace, cut);
+    try std.testing.expectEqualDeep(cut, (try database.orderedApplyReceipt()).?);
+    try std.testing.expectError(error.SchemaValidationCommandRejected, database.applyRaftSchemaOwnerCommand(freeze, F.namespace.shard_id, cut, .{}));
+    try std.testing.expect(!@import("../portable_backup.zig").isPortableMetadataKey(&historical_key));
+    try std.testing.expect(!@import("../portable_backup.zig").isPortableMetadataKey(F.job.key));
+    try std.testing.expect(!@import("../portable_backup.zig").isPortableMetadataKey(F.job.inputs_key));
+    try std.testing.expect(!@import("../portable_backup.zig").isPortableMetadataKey(F.job.cursor_key));
+    for ([_][]const u8{ "validation_job:v2", "validation_future", "01", "+1", "4294967296", "1:extra" }) |suffix| {
+        const invalid = try std.mem.concat(alloc, u8, &.{ "\x00\x00__metadata__:schema_v", suffix });
+        defer alloc.free(invalid);
+        try std.testing.expect(!@import("../portable_backup.zig").isPortableMetadataKey(invalid));
+    }
+    try std.testing.expect(@import("../portable_backup.zig").isPortableMetadataKey("\x00\x00__metadata__:schema_v1"));
+    try std.testing.expect(@import("../portable_backup.zig").isPortableMetadataKey("\x00\x00__metadata__:schema_v4294967295"));
+}
+
+test "relational index system nullability job native restore validates outcomes before generation publication" {
+    const F = NullabilityJobFixture;
+    const outcomes = @import("relational_schema_apply_outcome.zig");
+    const lifecycle = @import("generation_lifecycle.zig");
+    var directory = try @import("../../common/test_directory.zig").TestDirectory.init("schema-outcome-native-restore");
+    defer directory.cleanup();
+    const source_path = try std.fs.path.join(alloc, &.{ directory.path(), "source" });
+    defer alloc.free(source_path);
+    var options = F.options;
+    options.online_source_authority = .raft;
+    var source = try db_mod.DB.open(alloc, source_path, options);
+    defer source.close();
+    _ = try F.configure(&source, F.before, "{}", false);
+    var candidate = try F.candidate(&source);
+    defer candidate.deinit();
+    const binding = try F.bindingFor(&source, &candidate, 72, .raft);
+    try source.applyRaftSchemaOwnerCommand(.{ .binding = binding, .action = .begin, .payload = candidate.inputs }, F.namespace.shard_id, .{ .term = 1, .index = 1 }, .{});
+    try source.applyRaftSchemaOwnerCommand(.{ .binding = binding, .action = .cancel }, F.namespace.shard_id, .{ .term = 1, .index = 2 }, .{});
+    const freeze: db_mod.DB.SchemaOwnerControl.Command = .{ .binding = binding, .action = .freeze };
+    const cut: @import("apply_receipts.zig").OrderedApplyReceipt = .{ .term = 1, .index = 3 };
+    try std.testing.expectError(error.SchemaValidationCommandRejected, source.applyRaftSchemaOwnerCommand(freeze, F.namespace.shard_id, cut, .{}));
+    const valid_outcome = try source.core.store.get(alloc, &outcomes.key(F.namespace, 3));
+    defer alloc.free(valid_outcome);
+    const valid_head = try source.core.store.get(alloc, &outcomes.headKey(F.namespace));
+    defer alloc.free(valid_head);
+    const debt = @import("../transaction_debt.zig");
+    const valid_debt = try source.core.store.get(alloc, debt.head_key);
+    defer alloc.free(valid_debt);
+    const debt_scope = try debt.Scope.fromBinding(binding);
+    const ghost_member = debt.memberKey(debt_scope.generation, @splat(101));
+    const future_key = debt.family_prefix ++ "v2:head";
+    const future_job = F.job.family_prefix ++ "v2:header";
+    const Fault = enum { valid, torn, missing_rejection, missing_head, corrupt_head, missing_debt, corrupt_debt, foreign_debt, reopened_debt, ghost_debt, future_debt, future_job };
+    for (std.enums.values(Fault)) |fault| {
+        const corrupt = fault != .valid;
+        const name = @tagName(fault);
+        try source.core.store.put(&outcomes.key(F.namespace, 3), valid_outcome);
+        try source.core.store.put(&outcomes.headKey(F.namespace), valid_head);
+        try source.core.store.put(debt.head_key, valid_debt);
+        source.core.store.delete(&ghost_member) catch |err| if (err != error.NotFound) return err;
+        source.core.store.delete(future_key) catch |err| if (err != error.NotFound) return err;
+        source.core.store.delete(future_job) catch |err| if (err != error.NotFound) return err;
+        switch (fault) {
+            .valid => {},
+            .torn => try source.core.store.put(&outcomes.key(F.namespace, 3), "torn-schema-outcome"),
+            .missing_rejection => try source.core.store.delete(&outcomes.key(F.namespace, 3)),
+            .missing_head => try source.core.store.delete(&outcomes.headKey(F.namespace)),
+            .corrupt_head => try source.core.store.put(&outcomes.headKey(F.namespace), "torn-schema-history"),
+            .missing_debt => try source.core.store.delete(debt.head_key),
+            .corrupt_debt => try source.core.store.put(debt.head_key, "torn-transaction-debt"),
+            .foreign_debt => {
+                var foreign = try debt.Header.decode(valid_debt);
+                foreign.scope.epoch += 1;
+                try source.core.store.put(debt.head_key, &try foreign.encode());
+            },
+            .reopened_debt => {
+                var reopened = try debt.Header.decode(valid_debt);
+                reopened.phase = .ready;
+                try source.core.store.put(debt.head_key, &try reopened.encode());
+            },
+            .ghost_debt => try source.core.store.put(&ghost_member, &.{1}),
+            .future_debt => try source.core.store.put(future_key, "unsupported-private-format"),
+            .future_job => try source.core.store.put(future_job, "unsupported-private-job"),
+        }
+        _ = try source.snapshot(name);
+        const snapshot = try std.fmt.allocPrint(alloc, "{s}.snapshots/{s}", .{ source_path, name });
+        defer alloc.free(snapshot);
+        const target_path = try std.fs.path.join(alloc, &.{ directory.path(), name });
+        defer alloc.free(target_path);
+        const sentinel = "\x00\x00__metadata__:restore_live_sentinel";
+        {
+            var live = try db_mod.DB.open(alloc, target_path, options);
+            defer live.close();
+            try live.core.store.put(sentinel, "original-generation");
+        }
+        {
+            var transition = try lifecycle.beginProcessExclusive(target_path);
+            defer transition.deinit();
+            var staged = try transition.beginStaging();
+            defer staged.deinit();
+            if (corrupt) {
+                const expected = switch (fault) {
+                    .missing_rejection, .missing_head, .missing_debt => error.SchemaValidationRuntimeRecoveryRequired,
+                    .foreign_debt, .reopened_debt => error.SchemaValidationJobChanged,
+                    .corrupt_debt, .ghost_debt, .future_debt => error.InvalidTxnRecord,
+                    .future_job => error.InvalidSchemaValidationJob,
+                    else => error.CorruptSchemaApplyOutcome,
+                };
+                try std.testing.expectError(expected, db_mod.DB.restoreSnapshotToStagedGeneration(&staged, alloc, snapshot, staged.path(), options));
+            } else {
+                try db_mod.DB.restoreSnapshotToStagedGeneration(&staged, alloc, snapshot, staged.path(), options);
+                {
+                    var staged_options = options;
+                    staged_options.staged_generation = &staged;
+                    var restored = try db_mod.DB.open(alloc, staged.path(), staged_options);
+                    defer restored.close();
+                    var namespace: [24]u8 = undefined;
+                    @import("doc_identity.zig").encodeNamespace(&namespace, F.namespace);
+                    try restored.verifyTransferablePrimarySnapshot(namespace, cut);
+                    try std.testing.expectError(error.SchemaValidationCommandRejected, restored.applyRaftSchemaOwnerCommand(freeze, F.namespace.shard_id, cut, .{}));
+                    const retained = try restored.core.store.get(alloc, &outcomes.key(F.namespace, 3));
+                    defer alloc.free(retained);
+                    try std.testing.expectEqualSlices(u8, valid_outcome, retained);
+                }
+                _ = try staged.publish();
+            }
+        }
+        var live = try db_mod.DB.open(alloc, target_path, options);
+        defer live.close();
+        if (corrupt) {
+            const untouched = try live.core.store.get(alloc, sentinel);
+            defer alloc.free(untouched);
+            try std.testing.expectEqualStrings("original-generation", untouched);
+            try std.testing.expect(try live.orderedApplyReceipt() == null);
+        } else {
+            try std.testing.expectError(error.NotFound, live.core.store.get(alloc, sentinel));
+            try std.testing.expectEqualDeep(cut, (try live.orderedApplyReceipt()).?);
+            try std.testing.expectError(error.SchemaValidationCommandRejected, live.applyRaftSchemaOwnerCommand(freeze, F.namespace.shard_id, cut, .{}));
+        }
+    }
+}
+
+test "relational index system nullability job shared native restore preserves document Raft clocks without replay" {
+    const F = NullabilityJobFixture;
+    const lifecycle = @import("generation_lifecycle.zig");
+    var directory = try @import("../../common/test_directory.zig").TestDirectory.init("document-owner-native-restore");
+    defer directory.cleanup();
+    const source_path = try std.fs.path.join(alloc, &.{ directory.path(), "document-source" });
+    defer alloc.free(source_path);
+    const target_path = try std.fs.path.join(alloc, &.{ directory.path(), "document-target" });
+    defer alloc.free(target_path);
+    var options = F.options;
+    options.online_source_authority = .raft;
+    var source = try db_mod.DB.open(alloc, source_path, options);
+    defer source.close();
+    const request: db_mod.types.BatchRequest = .{ .writes = &.{.{ .key = "document", .value = "{\"n\":42}" }} };
+    const cut: @import("apply_receipts.zig").OrderedApplyReceipt = .{ .term = 3, .index = 7 };
+    try source.applyOrderedCommittedMutation(request, cut, false);
+    const transaction = try source.beginTransactionWithParticipants(time.realtimeNs(), &.{ "local", "remote" });
+    _ = try source.snapshot("document");
+    const snapshot = try std.fmt.allocPrint(alloc, "{s}.snapshots/document", .{source_path});
+    defer alloc.free(snapshot);
+    {
+        var transition = try lifecycle.beginProcessExclusive(target_path);
+        defer transition.deinit();
+        var staged = try transition.beginStaging();
+        defer staged.deinit();
+        try db_mod.DB.restoreSnapshotToStagedGeneration(&staged, alloc, snapshot, staged.path(), options);
+        _ = try staged.publish();
+    }
+    var restored = try db_mod.DB.open(alloc, target_path, options);
+    defer restored.close();
+    var namespace: [24]u8 = undefined;
+    @import("doc_identity.zig").encodeNamespace(&namespace, F.namespace);
+    try restored.verifyTransferablePrimarySnapshot(namespace, cut);
+    try std.testing.expectEqual(.pending, try restored.getTransactionStatus(transaction));
+    try std.testing.expect(try restored.hasTopologySensitiveTransactions());
+    const document = (try restored.get(alloc, "document")) orelse return error.TestExpectedEqual;
+    defer alloc.free(document);
+    try std.testing.expectEqualStrings("{\"n\":42}", document);
+    try restored.applyOrderedCommittedMutation(request, cut, false);
+    try std.testing.expectEqualDeep(cut, (try restored.orderedApplyReceipt()).?);
+    var read = try restored.core.store.beginReadTxn();
+    defer read.abort();
+    const authority = try @import("../source_authority.zig").require(&read, .raft, namespace);
+    try std.testing.expectEqual(@as(u64, 0), authority.sequence);
+    try std.testing.expect((try @import("relational_schema_apply_outcome.zig").readHead(&read, F.namespace)) == null);
+}
+
+test "relational index system nullability job history verification streams ten thousand outcomes with bounded cancellation" {
+    const F = NullabilityJobFixture;
+    const outcomes = @import("relational_schema_apply_outcome.zig");
+    const receipts = @import("apply_receipts.zig");
+    var directory = try @import("../../common/test_directory.zig").TestDirectory.init("schema-history-stream");
+    defer directory.cleanup();
+    var options = F.options;
+    options.online_source_authority = .raft;
+    var database = try db_mod.DB.open(alloc, directory.path(), options);
+    defer database.close();
+    const count = 10_000;
+    {
+        var txn = try database.core.store.beginWriteTxn();
+        errdefer txn.abort();
+        for (1..count + 1) |index| {
+            var command: [32]u8 = @splat(7);
+            std.mem.writeInt(u64, command[0..8], index, .little);
+            try outcomes.stage(&txn, .{ .namespace = F.namespace, .entry = .{ .term = 1, .index = index }, .command = command, .reason = if (index % 2 == 0) .accepted else .canceled });
+        }
+        var marker_bytes: [receipts.ordered_apply_receipt_value_len]u8 = undefined;
+        const marker = receipts.orderedApplyReceiptWrite(.{ .term = 1, .index = count }, &marker_bytes);
+        try txn.put(marker.key, marker.value);
+        try txn.commit();
+    }
+    var read = try database.core.store.beginReadTxn();
+    defer read.abort();
+    const head = (try outcomes.readHead(&read, F.namespace)).?;
+    try std.testing.expectEqual(@as(u64, count), head.count);
+    const CancelAfter = struct {
+        calls: usize = 0,
+        fn check(ptr: *const anyopaque) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(ptr)));
+            self.calls += 1;
+            if (self.calls == 257) return error.Canceled;
+        }
+    };
+    var cancel: CancelAfter = .{};
+    try std.testing.expectError(error.Canceled, outcomes.validateSnapshot(&read, F.namespace, db_mod.types.CancellationToken{ .ptr = &cancel, .check_fn = CancelAfter.check }));
+    try std.testing.expectEqual(@as(usize, 257), cancel.calls);
+    const stats = try outcomes.validateSnapshot(&read, F.namespace, db_mod.types.CancellationToken.none);
+    try std.testing.expectEqual(@as(u64, count), stats.records);
+    try std.testing.expectEqual(@as(u64, 0), stats.foreign_records);
+    try std.testing.expectEqualDeep(head, (try outcomes.readHead(&read, F.namespace)).?);
+}
+
+test "relational index system nullability job obsolete rejection candidate requires fresh preparation" {
+    const F = NullabilityJobFixture;
+    const controls = db_mod.DB.SchemaOwnerControl;
+    var directory = try @import("../../common/test_directory.zig").TestDirectory.init("raft-schema-reprepare");
+    defer directory.cleanup();
+    var options = F.options;
+    options.online_source_authority = .raft;
+    var database = try db_mod.DB.open(alloc, directory.path(), options);
+    defer database.close();
+    _ = try F.configure(&database, F.before, "{}", false);
+    var candidate = try F.candidate(&database);
+    defer candidate.deinit();
+    const first = try F.bindingFor(&database, &candidate, 51, .raft);
+    try database.applyRaftSchemaOwnerCommand(.{ .binding = first, .action = .begin, .payload = candidate.inputs }, F.namespace.shard_id, .{ .term = 1, .index = 1 }, .{});
+    var second = first;
+    second.id = @splat(52);
+    second.fence.transition_id += 1;
+    second.fence.admission_epoch += 1;
+    const begin_second: controls.Command = .{ .binding = second, .action = .begin, .payload = candidate.inputs };
+    var obsolete = (try database.prepareCommittedRaftSchemaOwnerCommand(begin_second, F.namespace.shard_id, .{ .term = 1, .index = 3 }, .{})).?;
+    defer obsolete.deinit();
+    try std.testing.expect(obsolete.guard_rejection != null);
+    try database.applyRaftSchemaOwnerCommand(.{ .binding = first, .action = .cancel }, F.namespace.shard_id, .{ .term = 1, .index = 2 }, .{});
+    // The old rejection candidate never prepared a candidate schema. Once
+    // the older job cancels it must neither commit that absent preparation
+    // nor persist its now-false guard result.
+    try std.testing.expectError(error.SchemaValidationPreparationChanged, database.applyCommittedRaftSchemaOwnerControl(&obsolete, F.namespace.shard_id, .{ .term = 1, .index = 3 }));
+    try std.testing.expectEqual(@as(u64, 2), (try database.orderedApplyReceipt()).?.index);
+    {
+        var read = try database.core.store.beginReadTxn();
+        defer read.abort();
+        try std.testing.expect(try @import("relational_schema_apply_outcome.zig").read(&read, F.namespace, 3) == null);
+    }
+    try database.applyRaftSchemaOwnerCommand(begin_second, F.namespace.shard_id, .{ .term = 1, .index = 3 }, .{});
+    const current = try F.current(&database);
+    try std.testing.expectEqualDeep(second, current.binding);
+    try std.testing.expectEqual(.fencing, current.phase);
+    try std.testing.expectEqual(@as(u64, 3), current.admitted.?.raft.index);
+}
+
+test "relational index system nullability job committed freeze rejection permits transaction drain" {
+    const F = NullabilityJobFixture;
+    var directory = try @import("../../common/test_directory.zig").TestDirectory.init("raft-schema-txn-drain");
+    defer directory.cleanup();
+    var options = F.options;
+    options.online_source_authority = .raft;
+    var database = try db_mod.DB.open(alloc, directory.path(), options);
+    defer database.close();
+    _ = try F.configure(&database, F.before, "{}", false);
+    const participant = try @import("../../api/transaction_contract.zig").participantIdForGroup(alloc, "rows", F.namespace.shard_id);
+    defer alloc.free(participant);
+    const transaction = try database.beginTransactionWithParticipants(100, &.{participant});
+    var candidate = try F.candidate(&database);
+    defer candidate.deinit();
+    const binding = try F.bindingFor(&database, &candidate, 61, .raft);
+    try database.applyRaftSchemaOwnerCommand(.{ .binding = binding, .action = .begin, .payload = candidate.inputs }, F.namespace.shard_id, .{ .term = 1, .index = 1 }, .{});
+    const freeze: db_mod.DB.SchemaOwnerControl.Command = .{ .binding = binding, .action = .freeze };
+    try std.testing.expectError(error.SchemaValidationCommandRejected, database.applyRaftSchemaOwnerCommand(freeze, F.namespace.shard_id, .{ .term = 1, .index = 2 }, .{}));
+    try std.testing.expectEqual(.fencing, (try F.current(&database)).phase);
+    try std.testing.expectEqual(@as(u64, 2), (try database.orderedApplyReceipt()).?.index);
+    {
+        var read = try database.core.store.beginReadTxn();
+        defer read.abort();
+        const outcomes = @import("relational_schema_apply_outcome.zig");
+        try std.testing.expectEqual(outcomes.Reason.transactions_pending, (try outcomes.read(&read, F.namespace, 2)).?.reason);
+    }
+    const abort: db_mod.types.BatchRequest = .{ .transaction = .{ .resolve = .{ .txn_id = transaction, .status = .aborted, .commit_version = 200 } } };
+    try std.testing.expectError(error.InvalidBatchRequest, database.applyOrderedCommittedMutation(abort, .{ .term = 1, .index = 3 }, false));
+    try std.testing.expectEqual(@as(u64, 2), (try database.orderedApplyReceipt()).?.index);
+    try std.testing.expectEqual(.pending, try database.getTransactionStatus(transaction));
+    try server_test_adapter.applyStorageKernelReplicatedBatchAtRaftEntry(alloc, &database, "rows", F.namespace.shard_id, abort, .{ .term = 1, .index = 3 });
+    try std.testing.expectEqual(@as(u64, 3), (try database.orderedApplyReceipt()).?.index);
+    try std.testing.expectEqual(.aborted, try database.getTransactionStatus(transaction));
+    try std.testing.expect(!try database.hasTopologySensitiveTransactions());
+    try database.applyRaftSchemaOwnerCommand(freeze, F.namespace.shard_id, .{ .term = 1, .index = 4 }, .{});
+    try std.testing.expectEqual(.scanning, (try F.current(&database)).phase);
+    try std.testing.expectError(error.SchemaValidationCommandRejected, database.applyRaftSchemaOwnerCommand(freeze, F.namespace.shard_id, .{ .term = 1, .index = 2 }, .{}));
+}
+
+test "relational index system nullability job transaction reconciliation commits independently and rejects stale pages" {
+    const F = NullabilityJobFixture;
+    const debt = @import("../transaction_debt.zig");
+    var directory = try @import("../../common/test_directory.zig").TestDirectory.init("raft-schema-debt-pages");
+    defer directory.cleanup();
+    var options = F.options;
+    options.online_source_authority = .raft;
+    var database = try db_mod.DB.open(alloc, directory.path(), options);
+    defer database.close();
+    _ = try F.configure(&database, F.before, "{}", false);
+    {
+        var manager = try database.core.initTxnManager();
+        defer manager.deinit();
+        for (0..140) |i| {
+            var id: [16]u8 = @splat(0);
+            id[0] = @intCast(i + 1);
+            try manager.initTransaction(id, 10);
+            try manager.resolveIntents(id, .committed, 20);
+        }
+    }
+    const participant = try @import("../../api/transaction_contract.zig").participantIdForGroup(alloc, "rows", F.namespace.shard_id);
+    defer alloc.free(participant);
+    const transaction = try database.beginTransactionWithParticipants(100, &.{participant});
+    var candidate = try F.candidate(&database);
+    defer candidate.deinit();
+    const binding = try F.bindingFor(&database, &candidate, 62, .raft);
+    try database.applyRaftSchemaOwnerCommand(.{ .binding = binding, .action = .begin, .payload = candidate.inputs }, F.namespace.shard_id, .{ .term = 1, .index = 1 }, .{});
+    try std.testing.expect(!(try database.observeRaftSchemaOwner(binding, F.namespace.shard_id, .{})).transaction_debt.?.ready);
+    const freeze: db_mod.DB.SchemaOwnerControl.Command = .{ .binding = binding, .action = .freeze };
+    try std.testing.expectError(error.SchemaValidationCommandRejected, database.applyRaftSchemaOwnerCommand(freeze, F.namespace.shard_id, .{ .term = 1, .index = 2 }, .{}));
+    var stale = (try database.prepareSchemaOwnerTransactionDebtPage(binding, .{})).?;
+    defer stale.deinit();
+    try std.testing.expect(stale.debt_page.?.units <= debt.max_page_units);
+    const abort: db_mod.types.BatchRequest = .{ .transaction = .{ .resolve = .{ .txn_id = transaction, .status = .aborted, .commit_version = 200 } } };
+    try server_test_adapter.applyStorageKernelReplicatedBatchAtRaftEntry(alloc, &database, "rows", F.namespace.shard_id, abort, .{ .term = 1, .index = 3 });
+    try std.testing.expectError(error.SchemaValidationCommandRejected, database.applyRaftSchemaOwnerCommand(stale.command, F.namespace.shard_id, .{ .term = 1, .index = 4 }, .{}));
+    {
+        var read = try database.core.store.beginReadTxn();
+        defer read.abort();
+        const outcomes = @import("relational_schema_apply_outcome.zig");
+        try std.testing.expectEqual(outcomes.Reason.predecessor_changed, (try outcomes.read(&read, F.namespace, 4)).?.reason);
+    }
+    var index: u64 = 5;
+    var pages: usize = 0;
+    var last_page: [32]u8 = undefined;
+    while (try database.prepareSchemaOwnerTransactionDebtPage(binding, .{})) |value| {
+        var prepared = value;
+        defer prepared.deinit();
+        try std.testing.expect(prepared.debt_page.?.units <= debt.max_page_units);
+        if (pages == 0) {
+            const before_header = try F.current(&database);
+            const before_debt = (try database.observeRaftSchemaOwner(binding, F.namespace.shard_id, .{})).transaction_debt;
+            const before_cut = try database.orderedApplyReceipt();
+            var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
+            prepared.alloc = failing.allocator();
+            const attempted = database.applyCommittedRaftSchemaOwnerControl(&prepared, F.namespace.shard_id, .{ .term = 1, .index = index });
+            prepared.alloc = alloc;
+            try std.testing.expectError(error.OutOfMemory, attempted);
+            try std.testing.expectEqualDeep(before_header, try F.current(&database));
+            try std.testing.expectEqualDeep(before_debt, (try database.observeRaftSchemaOwner(binding, F.namespace.shard_id, .{})).transaction_debt);
+            try std.testing.expectEqualDeep(before_cut, try database.orderedApplyReceipt());
+        }
+        if (pages % 2 == 0) {
+            // The receiving owner independently executes the bounded page
+            // from the original committed bytes; no prepared result is sent.
+            try database.applyRaftSchemaOwnerCommand(prepared.command, F.namespace.shard_id, .{ .term = 1, .index = index }, .{});
+        } else {
+            try database.applyCommittedRaftSchemaOwnerControl(&prepared, F.namespace.shard_id, .{ .term = 1, .index = index });
+        }
+        try std.testing.expectEqual(.fencing, (try F.current(&database)).phase);
+        // Exact retained bytes replay without preparing or applying a new page.
+        try database.applyRaftSchemaOwnerCommand(prepared.command, F.namespace.shard_id, .{ .term = 1, .index = index }, .{});
+        last_page = prepared.command.payload[0..32].*;
+        pages += 1;
+        index += 1;
+        if (pages > 8) return error.TestUnexpectedResult;
+    }
+    try std.testing.expect(pages >= 2);
+    const observed = (try database.observeRaftSchemaOwner(binding, F.namespace.shard_id, .{})).transaction_debt.?;
+    try std.testing.expect(observed.ready);
+    try std.testing.expectEqual(@as(u64, 0), observed.debt);
+    try database.applyRaftSchemaOwnerCommand(freeze, F.namespace.shard_id, .{ .term = 1, .index = index }, .{});
+    try std.testing.expectEqual(.scanning, (try F.current(&database)).phase);
+    // A later freeze has its own effect identity. Reproposing the final debt
+    // page must not masquerade as an accepted duplicate at the freeze cut.
+    try std.testing.expectError(error.SchemaValidationCommandRejected, database.applyRaftSchemaOwnerCommand(.{ .binding = binding, .action = .reconcile_transactions, .payload = &last_page }, F.namespace.shard_id, .{ .term = 1, .index = index + 1 }, .{}));
+    try database.applyRaftSchemaOwnerCommand(.{ .binding = binding, .action = .cancel }, F.namespace.shard_id, .{ .term = 1, .index = index + 2 }, .{});
+    try std.testing.expect((try database.observeRaftSchemaOwner(binding, F.namespace.shard_id, .{})).transaction_debt.?.retired);
+}
 
 test "relational index system nullability job Raft committed controls preserve cuts installation and cold replay" {
     const F = NullabilityJobFixture;
@@ -122,6 +982,9 @@ test "relational index system nullability job Raft committed controls preserve c
             };
             defer prepared.deinit();
             try database.applyCommittedRaftSchemaOwnerControl(&prepared, F.namespace.shard_id, entry);
+            var namespace: [24]u8 = undefined;
+            @import("doc_identity.zig").encodeNamespace(&namespace, F.namespace);
+            try database.verifyTransferablePrimarySnapshot(namespace, entry);
         }
     };
     for ([_]bool{ true, false }) |cancel_only| {
@@ -150,6 +1013,18 @@ test "relational index system nullability job Raft committed controls preserve c
         const predecessor_row = try primary.core.store.get(alloc, row_key);
         defer alloc.free(predecessor_row);
         const binding = try F.bindingFor(&primary, &candidate, 63, .raft);
+        const initial_observation = try primary.observeRaftSchemaOwner(binding, F.namespace.shard_id, .{});
+        try std.testing.expect(initial_observation.header == null);
+        try std.testing.expectEqualDeep(@as(?@FieldType(@import("receipt_position.zig").Position, "raft"), .{ .term = 1, .index = 1 }), initial_observation.applied);
+        try std.testing.expectEqual(primary.root_incarnation, initial_observation.physical_root_incarnation);
+        const preparation = try primary.prepareSchemaOwnerObservation(&candidate, binding.id, binding.plan_digest, binding.fence, .raft, .{});
+        try std.testing.expectEqualDeep(binding, preparation.binding);
+        try std.testing.expectEqualDeep(initial_observation.applied.?, preparation.position.?.raft);
+        try std.testing.expectEqual(primary.root_incarnation, preparation.physical_root_incarnation);
+        try std.testing.expectError(error.SchemaValidationJobChanged, primary.observeRaftSchemaOwner(binding, F.namespace.shard_id + 1, .{}));
+        try std.testing.expectError(error.DeadlineExceeded, primary.observeRaftSchemaOwner(binding, F.namespace.shard_id, .{ .deadline_ns = 0 }));
+        var canceled_observer = std.atomic.Value(bool).init(true);
+        try std.testing.expectError(error.Canceled, primary.observeRaftSchemaOwner(binding, F.namespace.shard_id, .{ .cancellation = @import("../../api/operation.zig").CancellationToken.fromAtomic(&canceled_observer) }));
         const begin: controls.Command = .{ .binding = binding, .action = .begin, .payload = candidate.inputs };
         {
             const bytes = try begin.encodeRaft(alloc);
@@ -205,6 +1080,18 @@ test "relational index system nullability job Raft committed controls preserve c
             const state = try F.current(database);
             try std.testing.expectEqual(@as(u64, 10), state.admitted.?.raft.index);
             try std.testing.expectEqual(@as(u64, 11), state.updated.raft.index);
+            const observation = try database.observeRaftSchemaOwner(binding, F.namespace.shard_id, .{});
+            try std.testing.expectEqualDeep(state, observation.header.?);
+            try std.testing.expectEqual(@as(u64, 12), observation.applied.?.index);
+            var impossible = observation;
+            impossible.applied = null;
+            try std.testing.expectError(error.InvalidControlReceiptPosition, impossible.validateFor(binding));
+            impossible = observation;
+            impossible.applied.?.index = 10;
+            try std.testing.expectError(error.InvalidControlReceiptPosition, impossible.validateFor(binding));
+            var wrong_domain = binding;
+            wrong_domain.authority = .native;
+            try std.testing.expectError(error.InvalidControlReceiptPosition, database.observeRaftSchemaOwner(wrong_domain, F.namespace.shard_id, .{}));
             try std.testing.expect(!try F.configure(database, F.before, "{\"old\":{\"type\":\"full_text\"}}", false));
         }
         var applied_index: u64 = 13;
@@ -250,6 +1137,10 @@ test "relational index system nullability job Raft committed controls preserve c
         peer_live = true;
         try Driver.apply(&peer, terminal, .{ .term = 3, .index = applied_index + 2 });
         try std.testing.expectEqualDeep(try F.current(&primary), try F.current(&peer));
+        const reopened = try peer.observeRaftSchemaOwner(binding, F.namespace.shard_id, .{});
+        try std.testing.expectEqualDeep(try F.current(&peer), reopened.header.?);
+        try std.testing.expectEqual(@as(u64, applied_index + 2), reopened.applied.?.index);
+        try std.testing.expectEqual(@as(u64, applied_index), reopened.header.?.updated.raft.index);
         try std.testing.expectEqual(@as(u32, if (cancel_only) 1 else 2), peer.core.schema.?.version);
         const preserved_row = try peer.core.store.get(alloc, row_key);
         defer alloc.free(preserved_row);
@@ -257,12 +1148,210 @@ test "relational index system nullability job Raft committed controls preserve c
         const decoded_row = (try peer.get(alloc, "a")).?;
         defer alloc.free(decoded_row);
         try std.testing.expectEqualStrings("{\"n\":1}", decoded_row);
-        var read = try peer.core.store.beginReadTxn();
-        defer read.abort();
-        const state = (try F.source.load(&read)).?;
-        try std.testing.expectEqual(F.source.Kind.raft, state.kind);
-        try std.testing.expectEqual(@as(u64, 0), state.sequence);
+        {
+            var read = try peer.core.store.beginReadTxn();
+            defer read.abort();
+            const state = (try F.source.load(&read)).?;
+            try std.testing.expectEqual(F.source.Kind.raft, state.kind);
+            try std.testing.expectEqual(@as(u64, 0), state.sequence);
+        }
         try std.testing.expectError(error.InvalidControlReceiptPosition, controls.Payload.init(alloc, terminal));
+        if (!cancel_only) {
+            // Host-authority fixture: the metadata all-owner publication
+            // grant is an independent obligation, never inferred from this
+            // digest. Exercise its exact physical terminal transaction here.
+            const installed = try F.current(&peer);
+            var release_payload: [96]u8 = undefined;
+            @memcpy(release_payload[0..32], &installed.installation.?.decision);
+            @memcpy(release_payload[32..64], &try installed.digest());
+            @memset(release_payload[64..96], 94);
+            const release_command: controls.Command = .{ .binding = binding, .action = .release, .payload = &release_payload };
+            var bad_payload = release_payload;
+            bad_payload[32] ^= 1;
+            try std.testing.expectError(error.SchemaValidationJobChanged, peer.prepareRaftSchemaOwnerControl(.{ .binding = binding, .action = .release, .payload = &bad_payload }, .{}));
+            const ReleaseWrites = struct {
+                txn: *docstore.DocStore.Txn,
+                fail_at: ?usize,
+                fail_after: bool,
+                writes: usize = 0,
+                pub fn openCursor(self: *@This()) !docstore.DocStore.Txn.CursorAdapter {
+                    return self.txn.openCursor();
+                }
+                pub fn get(self: *@This(), key: []const u8) ![]const u8 {
+                    const version_prefix = "\x00\x00__metadata__:schema_v";
+                    if (std.mem.eql(u8, key, @import("../schema.zig").schema_key) or
+                        std.mem.startsWith(u8, key, "\x00\x00__metadata__:schema_json") or
+                        (std.mem.startsWith(u8, key, version_prefix) and key.len > version_prefix.len and std.ascii.isDigit(key[version_prefix.len])) or
+                        std.mem.eql(u8, key, @import("relational_integrity_catalog.zig").key)) return error.TestSchemaSizedReadUnderApply;
+                    return self.txn.get(key);
+                }
+                fn before(self: *@This()) !void {
+                    if (!self.fail_after and self.fail_at == self.writes + 1) return error.TestReleaseWriteFailed;
+                }
+                fn after(self: *@This()) !void {
+                    self.writes += 1;
+                    if (self.fail_after and self.fail_at == self.writes) return error.TestReleaseWriteFailed;
+                }
+                pub fn put(self: *@This(), key: []const u8, value: []const u8) !void {
+                    try self.before();
+                    try self.txn.put(key, value);
+                    try self.after();
+                }
+                pub fn delete(self: *@This(), key: []const u8) !void {
+                    try self.before();
+                    try self.txn.delete(key);
+                    try self.after();
+                }
+            };
+            // Six bounded writes, including debt-generation retirement. Abort at
+            // either side of EVERY write; none may expose a release, retire
+            // preparation inputs or advance the ordered marker independently.
+            for (0..13) |fault| {
+                {
+                    peer.core.lockApply();
+                    defer peer.core.unlockApply();
+                    var txn = try peer.core.store.beginWriteTxn();
+                    defer txn.abort();
+                    var manager = try peer.core.initTxnManager();
+                    defer manager.deinit();
+                    var guarded: ReleaseWrites = .{ .txn = &txn, .fail_at = if (fault == 0) null else (fault + 1) / 2, .fail_after = fault % 2 == 0 };
+                    const effect = F.job.stageReleased(alloc, &guarded, &manager, binding, release_payload[0..32].*, release_payload[32..64].*, release_payload[64..96].*, .{ .term = 4, .index = applied_index + 3 });
+                    if (fault == 0) {
+                        try std.testing.expectEqual(F.job.Phase.released, (try effect).phase);
+                        try std.testing.expectEqual(@as(usize, 6), guarded.writes);
+                    } else try std.testing.expectError(error.TestReleaseWriteFailed, effect);
+                }
+                try std.testing.expectEqualDeep(installed, try F.current(&peer));
+                try std.testing.expectEqualDeep(@as(?Entry, .{ .term = 3, .index = applied_index + 2 }), try peer.orderedApplyReceipt());
+            }
+            {
+                var releasing = try peer.prepareRaftSchemaOwnerControl(release_command, .{});
+                defer releasing.deinit();
+                var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
+                releasing.alloc = failing.allocator();
+                try std.testing.expectError(error.OutOfMemory, peer.applyCommittedRaftSchemaOwnerControl(&releasing, F.namespace.shard_id, .{ .term = 4, .index = applied_index + 3 }));
+                releasing.alloc = alloc;
+                try std.testing.expectEqualDeep(installed, try F.current(&peer));
+                try std.testing.expectEqualDeep(@as(?Entry, .{ .term = 3, .index = applied_index + 2 }), try peer.orderedApplyReceipt());
+            }
+            for ([_]*db_mod.DB{ &primary, &peer }) |database| {
+                try Driver.apply(database, release_command, .{ .term = 4, .index = applied_index + 3 });
+                const released = try F.current(database);
+                try std.testing.expectEqual(F.job.Phase.released, released.phase);
+                try std.testing.expectEqualDeep(installed.installation, released.installation);
+                for (0..4) |corruption| {
+                    database.core.lockApply();
+                    defer database.core.unlockApply();
+                    var txn = try database.core.store.beginWriteTxn();
+                    defer txn.abort();
+                    switch (corruption) {
+                        0 => {
+                            var other = binding.fence;
+                            other.transition_id += 1;
+                            try txn.put(F.topo.receipt_key, &try other.encode());
+                        },
+                        1 => try txn.delete(F.topo.receipt_key),
+                        2 => try txn.put(F.topo.fence_key, &try binding.fence.encode()),
+                        3 => {
+                            var future = released;
+                            future.updated.raft.index += 100;
+                            const encoded = try future.encode(alloc);
+                            defer alloc.free(encoded);
+                            try txn.put(F.job.key, encoded);
+                        },
+                        else => unreachable,
+                    }
+                    const expected_error = if (corruption == 3) error.InvalidControlReceiptPosition else error.SchemaValidationJobChanged;
+                    try std.testing.expectError(expected_error, F.job.observe(alloc, &txn, binding));
+                    try std.testing.expectError(expected_error, F.job.observeForApply(&txn, binding));
+                }
+                var forged = released;
+                forged.records += 1;
+                try std.testing.expectError(error.InvalidSchemaValidationJob, forged.validate());
+                try std.testing.expectEqual(db_mod.DB.SchemaOwnerCatalogPolicy.unprotected, try database.schemaOwnerCatalogPolicy(F.after, false));
+                try std.testing.expectError(error.NotFound, database.core.store.get(alloc, F.job.inputs_key));
+                try std.testing.expectError(error.NotFound, database.core.store.get(alloc, F.job.cursor_key));
+                try Driver.apply(database, release_command, .{ .term = 4, .index = applied_index + 4 });
+                try std.testing.expectEqualDeep(released, try F.current(database));
+                // Terminal recovery cannot recheck the old row/catalog cut:
+                // these normal writes are allowed AFTER coordinated release.
+                try database.applyOrderedCommittedMutation(.{ .timestamp_ns = 200, .writes = &.{.{ .key = "c", .value = "{\"n\":3}" }} }, .{ .term = 4, .index = applied_index + 5 }, false);
+                try Driver.apply(database, terminal, .{ .term = 4, .index = applied_index + 6 });
+                try Driver.apply(database, release_command, .{ .term = 4, .index = applied_index + 7 });
+                try std.testing.expectEqualDeep(released, try F.current(database));
+                const observed = try database.observeRaftSchemaOwner(binding, F.namespace.shard_id, .{});
+                try std.testing.expectEqualDeep(released, observed.header.?);
+                try std.testing.expectEqual(@as(u64, applied_index + 7), observed.applied.?.index);
+                var audit = try F.job.RowAudit.init(alloc, database.core, binding, candidate.inputs, .{});
+                defer audit.deinit();
+                for (0..8) |_| {
+                    if (try audit.step(null, .{ .records = 1, .time_ns = std.time.ns_per_s }, .{})) break;
+                } else return error.ValidationJobDidNotComplete;
+                const audited = try audit.summary();
+                try std.testing.expectEqual(F.job.RowAudit.Coverage.full, audited.coverage);
+                try std.testing.expect(audited.rows > released.rows_scanned);
+                try std.testing.expectEqualDeep(released, audited.header);
+                try std.testing.expectEqual(@as(u64, applied_index + 7), audited.snapshot_cut.raft.index);
+                try std.testing.expect(audited.snapshot_cut.raft.index > released.updated.raft.index);
+            }
+            peer.close();
+            peer_live = false;
+            peer = try db_mod.DB.open(alloc, peer_path, options);
+            peer_live = true;
+            try Driver.apply(&peer, release_command, .{ .term = 4, .index = applied_index + 8 });
+            try std.testing.expectEqualDeep(try F.current(&primary), try F.current(&peer));
+            bad_payload = release_payload;
+            bad_payload[95] ^= 1;
+            try std.testing.expectError(error.SchemaValidationJobChanged, peer.prepareRaftSchemaOwnerControl(.{ .binding = binding, .action = .release, .payload = &bad_payload }, .{}));
+            // The actual DB-owned row-audit cache must keep one immutable
+            // snapshot while released tables continue accepting normal writes.
+            for ([_]*db_mod.DB{ &primary, &peer }) |database| {
+                const path = if (database == &primary) primary_path else peer_path;
+                const key = try @import("root_signing_identity.zig").loadOrCreate(alloc, std.testing.io, path);
+                const captured_cut = (try database.orderedApplyReceipt()).?;
+                var writes_after_capture: u64 = 0;
+                // One-record turns include independent history coverage;
+                // ongoing writes must not restart any retained component.
+                for (0..128) |turn| {
+                    const result = try database.stepSchemaOwnerRowAudit(F.namespace.shard_id, binding, candidate.inputs, .{ .records = 1, .time_ns = std.time.ns_per_s }, path, key.root_incarnation, .{});
+                    switch (result) {
+                        .needs_inputs => return error.TestUnexpectedMissingAuditInputs,
+                        .pending => |progress| {
+                            try std.testing.expectEqual(captured_cut.index, progress.snapshot_cut.raft.index);
+                            const audit_write_key = try std.fmt.allocPrint(alloc, "new-after-audit-{d}", .{turn});
+                            defer alloc.free(audit_write_key);
+                            try database.applyOrderedCommittedMutation(.{ .timestamp_ns = 300 + turn, .writes = &.{.{ .key = audit_write_key, .value = "{\"n\":4}" }} }, .{ .term = 4, .index = applied_index + 100 + turn }, false);
+                            writes_after_capture += 1;
+                        },
+                        .complete => |proof| {
+                            try std.testing.expectEqual(@as(u64, 3), proof.value.rows.rows);
+                            try std.testing.expectEqual(captured_cut.index, proof.value.rows.snapshot_cut.raft.index);
+                            try std.testing.expect(writes_after_capture != 0);
+                            try std.testing.expect((try database.orderedApplyReceipt()).?.index > proof.value.rows.snapshot_cut.raft.index);
+                            break;
+                        },
+                    }
+                } else return error.ValidationJobDidNotComplete;
+                try std.testing.expectEqual(@as(u64, 1), database.schema_audit_cache.preparations);
+                try std.testing.expect(database.schema_audit_cache.hits != 0);
+                database.schema_audit_cache.evict(std.testing.io);
+                const current_cut = (try database.orderedApplyReceipt()).?;
+                for (0..128) |_| {
+                    const result = try database.stepSchemaOwnerRowAudit(F.namespace.shard_id, binding, candidate.inputs, .{ .records = 1, .time_ns = std.time.ns_per_s }, path, key.root_incarnation, .{});
+                    switch (result) {
+                        .needs_inputs => return error.TestUnexpectedMissingAuditInputs,
+                        .pending => |progress| try std.testing.expectEqual(current_cut.index, progress.snapshot_cut.raft.index),
+                        .complete => |proof| {
+                            try std.testing.expectEqual(3 + writes_after_capture, proof.value.rows.rows);
+                            try std.testing.expectEqual(current_cut.index, proof.value.rows.snapshot_cut.raft.index);
+                            break;
+                        },
+                    }
+                } else return error.ValidationJobDidNotComplete;
+                try std.testing.expectEqual(@as(u64, 2), database.schema_audit_cache.preparations);
+                database.schema_audit_cache.evict(std.testing.io);
+            }
+        }
     }
 }
 
@@ -360,6 +1449,557 @@ test "relational index system nullability job drains persists resumes and cancel
     try std.testing.expectError(error.SchemaValidationJobChanged, F.apply(&database, &prepared, expected, .begin));
 }
 
+test "relational index system nullability job row audit reexecutes prefix and full coverage on one physical snapshot" {
+    const F = NullabilityJobFixture;
+    var directory = try @import("../../common/test_directory.zig").TestDirectory.init("nullability-row-audit");
+    defer directory.cleanup();
+    var database = try db_mod.DB.open(alloc, directory.path(), F.options);
+    defer database.close();
+    try database.setSchemaJson(alloc, F.before);
+    try database.batch(.{ .writes = &.{ .{ .key = "a", .value = "{\"n\":1}" }, .{ .key = "b", .value = "{\"n\":2}" } } });
+    var candidate = try F.candidate(&database);
+    defer candidate.deinit();
+    const binding = try F.binding(&database, &candidate, 67);
+    _ = try F.apply(&database, &candidate, binding, .begin);
+    _ = try F.apply(&database, &candidate, binding, .freeze);
+    const budget: rows.Budget = .{ .records = 1, .time_ns = std.time.ns_per_s };
+    {
+        var page = try F.job.PreparedPage.prepare(alloc, database.core, binding, budget, .{});
+        defer page.deinit();
+        const partial = try F.page(&database, &page);
+        try std.testing.expectEqual(F.job.Phase.scanning, partial.phase);
+        var audit = try F.job.RowAudit.init(alloc, database.core, binding, candidate.inputs, .{});
+        defer audit.deinit();
+        try std.testing.expectError(error.SchemaValidationNotReady, audit.summary());
+        const Cancel = struct {
+            fn check(_: ?*anyopaque) !void {
+                return error.Canceled;
+            }
+        };
+        try std.testing.expectError(error.Canceled, audit.step(null, budget, .{ .checkpoint = Cancel.check }));
+        try std.testing.expectEqual(@as(u64, 0), audit.records);
+        try std.testing.expect(try audit.step(null, budget, .{}));
+        const result = try audit.summary();
+        try std.testing.expectEqual(F.job.RowAudit.Coverage.prefix, result.coverage);
+        try std.testing.expectEqual(partial.records, result.records);
+        try std.testing.expectEqual(partial.rows_scanned, result.rows);
+        try std.testing.expectEqual(try F.clock(&database), result.snapshot_cut.native.sequence);
+        try std.testing.expectEqualSlices(u8, &partial.cursor_digest, &result.cursor_digest);
+    }
+    for (0..8) |_| {
+        var page = try F.job.PreparedPage.prepare(alloc, database.core, binding, budget, .{});
+        defer page.deinit();
+        if ((try F.page(&database, &page)).phase == .ready) break;
+    } else return error.ValidationJobDidNotComplete;
+    const validated_header = try F.current(&database);
+    var pinned = try F.job.RowAudit.init(alloc, database.core, binding, candidate.inputs, .{});
+    defer pinned.deinit();
+    const physical_key = try internal.relationalRowKeyAlloc(alloc, "b");
+    defer alloc.free(physical_key);
+    const saved = try database.core.store.get(alloc, physical_key);
+    defer alloc.free(saved);
+    // Fault injection bypasses normal frozen-table mutation admission. A
+    // copied ready header cannot qualify a primary with a missing physical row.
+    try database.core.store.delete(physical_key);
+    {
+        var corrupt = try F.job.RowAudit.init(alloc, database.core, binding, candidate.inputs, .{});
+        defer corrupt.deinit();
+        try std.testing.expectError(error.SchemaValidationRuntimeRecoveryRequired, corrupt.step(null, .{ .time_ns = std.time.ns_per_s }, .{}));
+        try std.testing.expectError(error.SchemaValidationRuntimeRecoveryRequired, corrupt.summary());
+        try std.testing.expectError(error.SchemaValidationRuntimeRecoveryRequired, corrupt.step(null, budget, .{}));
+    }
+    for (0..8) |_| {
+        if (try pinned.step(null, budget, .{})) break;
+    } else return error.ValidationJobDidNotComplete;
+    const complete = try pinned.summary();
+    try std.testing.expectEqual(F.job.RowAudit.Coverage.full, complete.coverage);
+    try std.testing.expectEqual(validated_header.records, complete.records);
+    try std.testing.expectEqual(validated_header.rows_scanned, complete.rows);
+    try std.testing.expectEqualDeep(validated_header, complete.header);
+    try database.core.store.put(physical_key, saved);
+    {
+        var forged = validated_header;
+        forged.records = 1;
+        forged.rows_scanned = 1;
+        const forged_bytes = try forged.encode(alloc);
+        defer alloc.free(forged_bytes);
+        const ready_bytes = try validated_header.encode(alloc);
+        defer alloc.free(ready_bytes);
+        try database.core.store.put(F.job.key, forged_bytes);
+        defer database.core.store.put(F.job.key, ready_bytes) catch unreachable;
+        var corrupt = try F.job.RowAudit.init(alloc, database.core, binding, candidate.inputs, .{});
+        defer corrupt.deinit();
+        try std.testing.expect(!try corrupt.step(null, budget, .{}));
+        try std.testing.expectError(error.SchemaValidationRuntimeRecoveryRequired, corrupt.step(null, .{ .time_ns = std.time.ns_per_s }, .{}));
+        // A failed final page must not be retried as empty EOF with the old
+        // counters and the newly advanced cursor (which matches this forgery).
+        try std.testing.expectError(error.SchemaValidationRuntimeRecoveryRequired, corrupt.step(null, budget, .{}));
+        try std.testing.expectError(error.SchemaValidationRuntimeRecoveryRequired, corrupt.summary());
+    }
+    _ = try F.apply(&database, &candidate, binding, .cancel);
+    // Canceled jobs intentionally allow NULL again and remove local ASVI.
+    // Retained metadata inputs support a facts-only audit, never a ready grant.
+    try database.batch(.{ .writes = &.{.{ .key = "z", .value = "{\"n\":null}" }} });
+    var canceled = try F.job.RowAudit.init(alloc, database.core, binding, candidate.inputs, .{});
+    defer canceled.deinit();
+    try std.testing.expectEqual(F.job.RowAudit.Coverage.none, (try canceled.summary()).coverage);
+    const changed = try alloc.dupe(u8, candidate.inputs);
+    defer alloc.free(changed);
+    changed[changed.len - 1] ^= 1;
+    try std.testing.expectError(error.SchemaValidationJobChanged, F.job.RowAudit.init(alloc, database.core, binding, changed, .{}));
+}
+
+test "relational index system nullability job row audit checkpoints survive reopen and reject foreign or corrupt progress" {
+    const F = NullabilityJobFixture;
+    const Checkpoint = @import("relational_schema_audit_checkpoint.zig");
+    const io = std.testing.io;
+    const Write = struct {
+        fn at(path: []const u8, bytes: []const u8) !void {
+            const permissions: std.Io.File.Permissions = if (comptime @import("builtin").os.tag == .windows) .default_file else @fromBackingInt(0o600);
+            var file = try std.Io.Dir.cwd().createFile(std.testing.io, path, .{ .truncate = true, .permissions = permissions });
+            defer file.close(std.testing.io);
+            var buffer: [4096]u8 = undefined;
+            var writer = file.writer(std.testing.io, &buffer);
+            try writer.interface.writeAll(bytes);
+            try writer.end();
+            try file.sync(std.testing.io);
+        }
+    };
+    var directory = try @import("../../common/test_directory.zig").TestDirectory.init("schema-audit-checkpoint");
+    defer directory.cleanup();
+    var database = try db_mod.DB.open(alloc, directory.path(), F.options);
+    var live = true;
+    defer if (live) database.close();
+    try database.setSchemaJson(alloc, F.before);
+    try database.batch(.{ .writes = &.{ .{ .key = "a-\xff", .value = "{\"n\":1}" }, .{ .key = "b", .value = "{\"n\":2}" } } });
+    var candidate = try F.candidate(&database);
+    defer candidate.deinit();
+    const binding = try F.binding(&database, &candidate, 68);
+    _ = try F.apply(&database, &candidate, binding, .begin);
+    _ = try F.apply(&database, &candidate, binding, .freeze);
+    {
+        var page = try F.job.PreparedPage.prepare(alloc, database.core, binding, .{ .time_ns = std.time.ns_per_s }, .{});
+        defer page.deinit();
+        try std.testing.expectEqual(F.job.Phase.ready, (try F.page(&database, &page)).phase);
+    }
+    const signing_identity = try @import("root_signing_identity.zig").loadOrCreate(alloc, io, directory.path());
+    const physical_root = database.root_incarnation;
+    {
+        var unsigned = try @import("../../common/test_directory.zig").TestDirectory.init("schema-audit-unprovisioned-key");
+        defer unsigned.cleanup();
+        const identity = try @import("root_identity.zig").loadOrCreate(alloc, io, unsigned.path());
+        var audit = try F.job.RowAudit.init(alloc, database.core, binding, candidate.inputs, .{});
+        defer audit.deinit();
+        try std.testing.expectError(error.FileNotFound, Checkpoint.open(alloc, io, unsigned.path(), identity.incarnation, physical_root, &audit, .{}));
+        try std.testing.expectError(error.FileNotFound, @import("root_signing_identity.zig").load(alloc, io, unsigned.path()));
+    }
+    const budget: rows.Budget = .{ .records = 1, .time_ns = std.time.ns_per_s };
+    {
+        var audit = try F.job.RowAudit.init(alloc, database.core, binding, candidate.inputs, .{});
+        defer audit.deinit();
+        try std.testing.expect(!try audit.step(null, budget, .{}));
+        var guard = try Checkpoint.open(alloc, io, directory.path(), signing_identity.root_incarnation, physical_root, &audit, .{});
+        defer guard.deinit();
+        try std.testing.expect(try guard.load() == null);
+        try guard.save(&audit);
+        try std.testing.expectError(error.SchemaValidationNotReady, guard.evidence(&audit));
+    }
+    database.close();
+    live = false;
+    database = try db_mod.DB.open(alloc, directory.path(), F.options);
+    live = true;
+    try std.testing.expectEqual(physical_root, database.root_incarnation);
+    var old_progress: ?F.job.RowAudit.Progress = null;
+    defer if (old_progress) |*value| value.deinit();
+    {
+        var audit = try F.job.RowAudit.init(alloc, database.core, binding, candidate.inputs, .{});
+        defer audit.deinit();
+        var guard = try Checkpoint.open(alloc, io, directory.path(), signing_identity.root_incarnation, physical_root, &audit, .{});
+        defer guard.deinit();
+        {
+            var loaded = (try guard.load()).?;
+            defer loaded.deinit();
+            try std.testing.expect(!loaded.complete);
+            try std.testing.expectEqual(@as(u64, 1), loaded.summary.rows);
+            try std.testing.expect(std.mem.indexOfScalar(u8, loaded.after, 255) != null);
+            try audit.resumeAuthenticatedCheckpoint(&loaded, .{});
+        }
+        try std.testing.expect(!try audit.step(null, budget, .{}));
+        try guard.save(&audit);
+        try std.testing.expectError(error.SchemaValidationNotReady, guard.evidence(&audit));
+        // Matching row counts alone cannot certify EOF. A restarted reader
+        // must perform the final probe before a complete checkpoint can exist.
+        var eof_audit = try F.job.RowAudit.init(alloc, database.core, binding, candidate.inputs, .{});
+        defer eof_audit.deinit();
+        {
+            var loaded = (try guard.load()).?;
+            defer loaded.deinit();
+            try std.testing.expect(!loaded.complete);
+            try eof_audit.resumeAuthenticatedCheckpoint(&loaded, .{});
+        }
+        try std.testing.expect(try eof_audit.step(null, budget, .{}));
+        try std.testing.expectError(error.SchemaValidationRuntimeRecoveryRequired, guard.evidence(&eof_audit));
+        try guard.save(&eof_audit);
+        const evidence = try guard.evidence(&eof_audit);
+        try std.testing.expectEqual(@as(u64, 2), evidence.rows.rows);
+        try std.testing.expectEqual(physical_root, evidence.physical_root);
+        try guard.save(&eof_audit);
+        try std.testing.expectEqualDeep(evidence, try guard.evidence(&eof_audit));
+        old_progress = try eof_audit.checkpoint(alloc);
+        const raw = try std.Io.Dir.cwd().readFileAlloc(io, guard.path, alloc, .limited(256 * 1024));
+        defer alloc.free(raw);
+        for ([_]usize{ 0, 8, 12, 16, raw.len - 65, raw.len - 1 }) |offset| {
+            raw[offset] ^= 1;
+            try Write.at(guard.path, raw);
+            try std.testing.expectError(error.InvalidSchemaValidationJob, guard.load());
+            raw[offset] ^= 1;
+        }
+        for ([_]usize{ 0, 7, 15, 16, raw.len - 64, raw.len - 1 }) |len| {
+            try Write.at(guard.path, raw[0..len]);
+            try std.testing.expectError(error.InvalidSchemaValidationJob, guard.load());
+        }
+        {
+            // A valid signature does not authorize alternate physical bytes.
+            // JSON permits this whitespace; the checkpoint canonical form does not.
+            const json_len = std.mem.readInt(u32, raw[8..12], .little);
+            const noncanonical = try alloc.alloc(u8, raw.len + 1);
+            defer alloc.free(noncanonical);
+            @memcpy(noncanonical[0..16], raw[0..16]);
+            std.mem.writeInt(u32, noncanonical[8..12], json_len + 1, .little);
+            @memcpy(noncanonical[16..][0..json_len], raw[16..][0..json_len]);
+            noncanonical[16 + json_len] = ' ';
+            @memcpy(noncanonical[17 + json_len .. noncanonical.len - 64], raw[16 + json_len .. raw.len - 64]);
+            var hash_state = std.crypto.hash.Blake3.init(.{});
+            hash_state.update("antfly/schema-validation-root-row-checkpoint/v1");
+            hash_state.update(noncanonical[0 .. noncanonical.len - 64]);
+            var digest: [32]u8 = undefined;
+            hash_state.final(&digest);
+            @memcpy(noncanonical[noncanonical.len - 64 ..], &try signing_identity.sign(&digest));
+            try Write.at(guard.path, noncanonical);
+            try std.testing.expectError(error.InvalidSchemaValidationJob, guard.load());
+        }
+        // Controlled fault restoration, not a production checkpoint repair.
+        try Write.at(guard.path, raw);
+        {
+            var loaded = (try guard.load()).?;
+            defer loaded.deinit();
+            try std.testing.expect(loaded.complete);
+            try std.testing.expectEqualDeep(evidence, try guard.evidence(&eof_audit));
+        }
+        var peer = try @import("../../common/test_directory.zig").TestDirectory.init("schema-audit-foreign-key");
+        defer peer.cleanup();
+        const peer_key = try @import("root_signing_identity.zig").loadOrCreate(alloc, io, peer.path());
+        var foreign = try Checkpoint.open(alloc, io, peer.path(), peer_key.root_incarnation, physical_root, &eof_audit, .{});
+        defer foreign.deinit();
+        try Write.at(foreign.path, raw);
+        try std.testing.expectError(error.InvalidSchemaValidationJob, foreign.load());
+        const temporary = try std.fmt.allocPrint(alloc, "{s}.tmp", .{guard.path});
+        defer alloc.free(temporary);
+        try Write.at(temporary, "incomplete unpublished checkpoint");
+    }
+    {
+        var audit = try F.job.RowAudit.init(alloc, database.core, binding, candidate.inputs, .{});
+        defer audit.deinit();
+        const other_root: u128 = if (physical_root == 1) 2 else 1;
+        var guard = try Checkpoint.open(alloc, io, directory.path(), signing_identity.root_incarnation, other_root, &audit, .{});
+        defer guard.deinit();
+        try std.testing.expect(try guard.load() == null);
+        const temporary = try std.fmt.allocPrint(alloc, "{s}.tmp", .{guard.path});
+        defer alloc.free(temporary);
+        try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().openFile(io, temporary, .{}));
+    }
+    var latest_cut: ?@import("receipt_position.zig").Position = null;
+    // A genuine change of the storage cut invalidates a persisted cursor,
+    // even if the job header and the physical-root incarnation stayed equal.
+    {
+        var txn = try database.core.store.beginWriteTxn();
+        errdefer txn.abort();
+        _ = try F.source.advance(&txn, @import("online_source_contract.zig").namespaceBytes(F.namespace), null);
+        try txn.commit();
+    }
+    {
+        var audit = try F.job.RowAudit.init(alloc, database.core, binding, candidate.inputs, .{});
+        defer audit.deinit();
+        var guard = try Checkpoint.open(alloc, io, directory.path(), signing_identity.root_incarnation, physical_root, &audit, .{});
+        defer guard.deinit();
+        try std.testing.expect(try guard.load() == null);
+        try std.testing.expectError(error.SchemaValidationRuntimeRecoveryRequired, audit.resumeAuthenticatedCheckpoint(&old_progress.?, .{}));
+        try std.testing.expectError(error.SchemaValidationNotReady, audit.summary());
+        for (0..8) |_| {
+            if (try audit.step(null, budget, .{})) break;
+        } else return error.ValidationJobDidNotComplete;
+        try guard.save(&audit);
+        latest_cut = audit.snapshot_cut;
+    }
+    {
+        // A torn/copied header with an unchanged apply marker must also
+        // invalidate progress. This is deliberate raw primary fault injection.
+        const previous = try F.current(&database);
+        var changed = previous;
+        changed.revision += 1;
+        const original_bytes = try previous.encode(alloc);
+        defer alloc.free(original_bytes);
+        const changed_bytes = try changed.encode(alloc);
+        defer alloc.free(changed_bytes);
+        try database.core.store.put(F.job.key, changed_bytes);
+        defer database.core.store.put(F.job.key, original_bytes) catch unreachable;
+        var audit = try F.job.RowAudit.init(alloc, database.core, binding, candidate.inputs, .{});
+        defer audit.deinit();
+        try std.testing.expectEqualDeep(latest_cut.?, audit.snapshot_cut);
+        var guard = try Checkpoint.open(alloc, io, directory.path(), signing_identity.root_incarnation, physical_root, &audit, .{});
+        defer guard.deinit();
+        try std.testing.expect(try guard.load() == null);
+    }
+    {
+        // Authenticated row EOF is not transaction coverage. Independent
+        // directory, record and family EOF probes remain on the same image.
+        const waiting = try database.stepSchemaOwnerRowAudit(F.namespace.shard_id, binding, candidate.inputs, budget, directory.path(), signing_identity.root_incarnation, .{});
+        try std.testing.expect(waiting == .pending);
+        const result = try F.completeAudit(&database, binding, candidate.inputs, budget, directory.path(), signing_identity.root_incarnation);
+        try std.testing.expect(result == .complete);
+        try std.testing.expectEqual(@as(u64, 2), result.complete.value.rows.rows);
+        const RootEvidence = @import("relational_schema_root_evidence.zig");
+        try result.complete.verify(signing_identity.public_key);
+        const namespace_bytes = @import("online_source_contract.zig").namespaceBytes(F.namespace);
+        try std.testing.expectEqualDeep(result.complete, (try RootEvidence.load(alloc, io, directory.path(), signing_identity.root_incarnation, namespace_bytes, .{})).?);
+        const proof_bytes = try result.complete.encode(alloc);
+        defer alloc.free(proof_bytes);
+        try std.testing.expectEqualDeep(result.complete, try RootEvidence.Evidence.decode(alloc, proof_bytes, signing_identity.public_key));
+        {
+            const Decode = struct {
+                fn run(a: std.mem.Allocator, bytes: []const u8, public_key: [32]u8) !void {
+                    const decoded = try @import("relational_schema_root_evidence.zig").Evidence.decode(a, bytes, public_key);
+                    try decoded.verify(public_key);
+                    const encoded = try decoded.encode(a);
+                    defer a.free(encoded);
+                    try std.testing.expectEqualSlices(u8, bytes, encoded);
+                }
+            };
+            var non_resizing = std.testing.FailingAllocator.init(alloc, .{ .resize_fail_index = 0 });
+            try std.testing.checkAllAllocationFailures(non_resizing.allocator(), Decode.run, .{ proof_bytes, signing_identity.public_key });
+        }
+        {
+            var changed = result.complete;
+            changed.value.qualification.transactions.records += 1;
+            try std.testing.expectError(error.InvalidSchemaValidationJob, changed.verify(signing_identity.public_key));
+            changed = result.complete;
+            changed.value.qualification.origin.physical_root_incarnation += 1;
+            try std.testing.expectError(error.InvalidSchemaValidationJob, changed.verify(signing_identity.public_key));
+            changed = result.complete;
+            changed.value.checkpoint_digest[0] ^= 1;
+            try std.testing.expectError(error.InvalidSchemaValidationJob, changed.verify(signing_identity.public_key));
+            var peer = try @import("../../common/test_directory.zig").TestDirectory.init("schema-proof-peer-key");
+            defer peer.cleanup();
+            const peer_identity = try @import("root_signing_identity.zig").loadOrCreate(alloc, io, peer.path());
+            try std.testing.expectError(error.InvalidSchemaValidationJob, result.complete.verify(peer_identity.public_key));
+            for ([_]usize{ 0, 7, 8, 11, 12, proof_bytes.len / 2, proof_bytes.len - 64, proof_bytes.len - 1 }) |offset| {
+                const corrupted = try alloc.dupe(u8, proof_bytes);
+                defer alloc.free(corrupted);
+                corrupted[offset] ^= 1;
+                var fail = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
+                try std.testing.expectError(error.InvalidSchemaValidationJob, RootEvidence.Evidence.decode(fail.allocator(), corrupted, signing_identity.public_key));
+            }
+            var fail = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
+            try std.testing.expectError(error.OutOfMemory, RootEvidence.Evidence.decode(fail.allocator(), proof_bytes, signing_identity.public_key));
+            // A trusted signature still does not permit alternate JSON bytes.
+            const noncanonical = try alloc.alloc(u8, proof_bytes.len + 1);
+            defer alloc.free(noncanonical);
+            @memcpy(noncanonical[0 .. proof_bytes.len - 64], proof_bytes[0 .. proof_bytes.len - 64]);
+            noncanonical[proof_bytes.len - 64] = ' ';
+            std.mem.writeInt(u32, noncanonical[8..12], @intCast(noncanonical.len - 76), .little);
+            var state = std.crypto.hash.Blake3.init(.{});
+            state.update("antfly/schema-validation-qualified-root-image/v1");
+            state.update(noncanonical[12 .. noncanonical.len - 64]);
+            var signed_digest: [32]u8 = undefined;
+            state.final(&signed_digest);
+            @memcpy(noncanonical[noncanonical.len - 64 ..], &try signing_identity.sign(&signed_digest));
+            try std.testing.expectError(error.InvalidSchemaValidationJob, RootEvidence.Evidence.decode(alloc, noncanonical, signing_identity.public_key));
+        }
+        {
+            var lease = try database.schema_audit_cache.acquire(io, alloc, database.core.index_manager.resource_manager, database.backend_runtime, false, database.core, physical_root, try F.current(&database), candidate.inputs, .{});
+            defer lease.deinit();
+            var row_guard = try Checkpoint.open(alloc, io, directory.path(), signing_identity.root_incarnation, physical_root, lease.audit(), .{});
+            defer row_guard.deinit();
+            try lease.restoreCheckpoint(&row_guard, .{});
+            try std.testing.expectEqualDeep(result.complete.value, try RootEvidence.capture(&row_guard, directory.path(), lease.audit(), &lease.entry.directory.?, &lease.entry.transactions.?, &lease.entry.history.?));
+            var other_read = try database.core.store.beginReadTxn();
+            defer other_read.abort();
+            var points = try other_read.openReadScope(alloc);
+            defer points.close();
+            const Control = struct {
+                pub fn check(_: @This()) !void {}
+            };
+            const control: Control = .{};
+            const Debt = @import("../transaction_debt.zig");
+            var mixed = try Debt.SnapshotAudit(@TypeOf(&other_read)).init(&other_read, &points, try Debt.Scope.fromBinding(binding), control);
+            defer mixed.deinit();
+            while (!try mixed.step(&points, .{}, control)) {}
+            // Even identical clocks, headers and completed directory counters
+            // cannot substitute another read for the owned audit's image.
+            try std.testing.expectEqualDeep(try lease.entry.directory.?.result(), try mixed.result());
+            try std.testing.expectError(error.SchemaValidationRuntimeRecoveryRequired, RootEvidence.capture(&row_guard, directory.path(), lease.audit(), &mixed, &lease.entry.transactions.?, &lease.entry.history.?));
+        }
+        const repeated = try database.stepSchemaOwnerRowAudit(F.namespace.shard_id, binding, candidate.inputs, budget, directory.path(), signing_identity.root_incarnation, .{});
+        try std.testing.expectEqualDeep(result, repeated);
+        try std.testing.expectEqual(@as(u64, 1), database.schema_audit_cache.preparations);
+        const CancelAtLease = struct {
+            checks: usize = 0,
+            fn cancelled(raw: *const anyopaque) bool {
+                const self: *@This() = @ptrCast(@alignCast(@constCast(raw)));
+                self.checks += 1;
+                return self.checks >= 3;
+            }
+        };
+        var cancellation: CancelAtLease = .{};
+        try std.testing.expectError(error.Canceled, database.schema_audit_cache.acquire(io, alloc, database.core.index_manager.resource_manager, database.backend_runtime, false, database.core, physical_root, try F.current(&database), candidate.inputs, .{ .cancellation = .{ .ptr = &cancellation, .is_cancelled_fn = CancelAtLease.cancelled } }));
+        try std.testing.expectEqual(@as(usize, 3), cancellation.checks);
+        try std.testing.expectEqual(@as(usize, 0), database.schema_audit_cache.leases.load(.acquire));
+        try std.testing.expect(database.schema_audit_cache.mutex.tryLock());
+        database.schema_audit_cache.mutex.unlock(io);
+        try std.testing.expectEqualDeep(result, try database.stepSchemaOwnerRowAudit(F.namespace.shard_id, binding, candidate.inputs, budget, directory.path(), signing_identity.root_incarnation, .{}));
+        database.schema_audit_cache.evict(io);
+        const Cache = @import("relational_schema_audit_cache.zig");
+        const residents = Cache.residentSnapshotCount();
+        const InvalidateDuringPreparation = struct {
+            cache: *Cache.Cache,
+            invalidated: bool = false,
+            fn cancelled(raw: *const anyopaque) bool {
+                const self: *@This() = @ptrCast(@alignCast(@constCast(raw)));
+                if (self.cache.building and !self.invalidated) {
+                    self.invalidated = true;
+                    self.cache.evict(std.testing.io);
+                }
+                return false;
+            }
+        };
+        var invalidation: InvalidateDuringPreparation = .{ .cache = &database.schema_audit_cache };
+        try std.testing.expectError(error.SchemaValidationJobChanged, database.schema_audit_cache.acquire(io, alloc, database.core.index_manager.resource_manager, database.backend_runtime, false, database.core, physical_root, try F.current(&database), candidate.inputs, .{ .cancellation = .{ .ptr = &invalidation, .is_cancelled_fn = InvalidateDuringPreparation.cancelled } }));
+        try std.testing.expect(invalidation.invalidated);
+        try std.testing.expect(!database.schema_audit_cache.building);
+        try std.testing.expect(database.schema_audit_cache.entry == null);
+        try std.testing.expectEqual(residents, Cache.residentSnapshotCount());
+        try std.testing.expect((try database.stepSchemaOwnerRowAudit(F.namespace.shard_id, binding, candidate.inputs, budget, directory.path(), signing_identity.root_incarnation, .{})) == .pending);
+        try std.testing.expectEqualDeep(result, try F.completeAudit(&database, binding, candidate.inputs, budget, directory.path(), signing_identity.root_incarnation));
+        database.schema_audit_cache.evict(io);
+        const ack_prefix = "\x00\x00__txn_resolved_index_v1__:";
+        var orphan_ack: [ack_prefix.len + 48]u8 = undefined;
+        @memcpy(orphan_ack[0..ack_prefix.len], ack_prefix);
+        @memset(orphan_ack[ack_prefix.len..][0..16], 99);
+        std.crypto.hash.sha2.Sha256.hash("ghost", orphan_ack[ack_prefix.len + 16 ..][0..32], .{});
+        const unknown_history = @import("relational_schema_apply_outcome.zig").family_prefix ++ "v2:unknown";
+        for ([_][]const u8{ @import("../transaction_debt.zig").family_prefix ++ "v1:unknown", &orphan_ack, unknown_history }) |unknown| {
+            // Fault injection preserves the authenticated row bytes, header
+            // and clock. Unknown directory state, an orphan ACK, or malformed
+            // history cannot bypass independent same-image qualification.
+            try database.core.store.put(unknown, &.{1});
+            defer database.core.store.delete(unknown) catch unreachable;
+            var rejected = false;
+            for (0..32) |_| {
+                const outcome = database.stepSchemaOwnerRowAudit(F.namespace.shard_id, binding, candidate.inputs, budget, directory.path(), signing_identity.root_incarnation, .{}) catch |err| {
+                    const expected_error: anyerror = if (std.mem.eql(u8, unknown, unknown_history)) error.CorruptSchemaApplyOutcome else error.InvalidTxnRecord;
+                    try std.testing.expectEqual(expected_error, err);
+                    rejected = true;
+                    break;
+                };
+                try std.testing.expect(outcome == .pending);
+            }
+            try std.testing.expect(rejected);
+            try std.testing.expect(database.schema_audit_cache.entry == null);
+        }
+        {
+            const Files = @import("root_audit_checkpoint_io.zig");
+            const file_errors: Files.Errors = .{ .invalid = error.InvalidSchemaValidationJob, .scope_changed = error.SchemaValidationRuntimeRecoveryRequired };
+            const proof_path = blk: {
+                var slot = try Files.open(alloc, io, directory.path(), signing_identity.root_incarnation, namespace_bytes, ".schema-validation-proofs", .{}, file_errors);
+                defer Files.close(&slot);
+                break :blk try alloc.dupe(u8, slot.path);
+            };
+            defer alloc.free(proof_path);
+            const corrupt = try alloc.dupe(u8, proof_bytes);
+            defer alloc.free(corrupt);
+            corrupt[corrupt.len - 1] ^= 1;
+            try Write.at(proof_path, corrupt);
+            defer Write.at(proof_path, proof_bytes) catch unreachable;
+            try std.testing.expectError(error.InvalidSchemaValidationJob, RootEvidence.load(alloc, io, directory.path(), signing_identity.root_incarnation, namespace_bytes, .{}));
+            var rejected = false;
+            for (0..128) |_| {
+                const outcome = database.stepSchemaOwnerRowAudit(F.namespace.shard_id, binding, candidate.inputs, budget, directory.path(), signing_identity.root_incarnation, .{}) catch |err| {
+                    try std.testing.expectEqual(error.InvalidSchemaValidationJob, err);
+                    rejected = true;
+                    break;
+                };
+                try std.testing.expect(outcome == .pending);
+            }
+            try std.testing.expect(rejected);
+            try std.testing.expect(database.schema_audit_cache.entry == null);
+            var slot = try Files.open(alloc, io, directory.path(), signing_identity.root_incarnation, namespace_bytes, ".schema-validation-proofs", .{}, file_errors);
+            defer Files.close(&slot);
+            const retained = (try Files.read(&slot, RootEvidence.max_encoded, file_errors)).?;
+            defer alloc.free(retained);
+            // Independently requalifying rows/cohorts does not silently
+            // overwrite an unauthenticated prior proof during recovery.
+            try std.testing.expectEqualSlices(u8, corrupt, retained);
+        }
+        try std.testing.expect((try database.stepSchemaOwnerRowAudit(F.namespace.shard_id, binding, candidate.inputs, budget, directory.path(), signing_identity.root_incarnation, .{})) == .pending);
+        try std.testing.expectEqualDeep(result, try F.completeAudit(&database, binding, candidate.inputs, budget, directory.path(), signing_identity.root_incarnation));
+        database.schema_audit_cache.evict(io);
+    }
+}
+
+test "relational index system nullability job owned cache joins maintenance and releases pinned resources on close" {
+    const F = NullabilityJobFixture;
+    const Cache = @import("relational_schema_audit_cache.zig");
+    const Resources = @import("../resource_manager.zig");
+    const baseline = Cache.residentSnapshotCount();
+    var manager = Resources.ResourceManager.init(.{});
+    defer manager.deinit(alloc);
+    for (0..2) |_| {
+        var directory = try @import("../../common/test_directory.zig").TestDirectory.init("schema-audit-owned-cache");
+        defer directory.cleanup();
+        var options = F.options;
+        options.resource_manager = &manager;
+        const database = try db_mod.DB.openOwned(alloc, directory.path(), options);
+        var live = true;
+        defer if (live) database.closeOwned();
+        try database.setSchemaJson(alloc, F.before);
+        try database.batch(.{ .writes = &.{ .{ .key = "a", .value = "{\"n\":1}" }, .{ .key = "b", .value = "{\"n\":2}" } } });
+        var candidate = try F.candidate(database);
+        defer candidate.deinit();
+        const binding = try F.binding(database, &candidate, 74);
+        _ = try F.apply(database, &candidate, binding, .begin);
+        _ = try F.apply(database, &candidate, binding, .freeze);
+        {
+            var page = try F.job.PreparedPage.prepare(alloc, database.core, binding, .{ .time_ns = std.time.ns_per_s }, .{});
+            defer page.deinit();
+            try std.testing.expectEqual(F.job.Phase.ready, (try F.page(database, &page)).phase);
+        }
+        const key = try @import("root_signing_identity.zig").loadOrCreate(alloc, std.testing.io, directory.path());
+        const budget: rows.Budget = .{ .records = 1, .time_ns = std.time.ns_per_s };
+        const first = try database.stepSchemaOwnerRowAudit(F.namespace.shard_id, binding, candidate.inputs, budget, directory.path(), key.root_incarnation, .{});
+        try std.testing.expect(first == .pending);
+        try std.testing.expect(database.schema_audit_cache.idle_handle != null);
+        try std.testing.expect(database.schema_audit_cache.reclaimer != 0);
+        try std.testing.expectEqual(baseline + 1, Cache.residentSnapshotCount());
+        // Restore's metadata reload is a lifecycle barrier, even when the
+        // durable header and clock happen to remain byte-identical.
+        try database.reloadSchemaForInternalRestore();
+        try std.testing.expect(database.schema_audit_cache.entry == null);
+        try std.testing.expectEqual(baseline, Cache.residentSnapshotCount());
+        for (0..16) |_| {
+            const result = try database.stepSchemaOwnerRowAudit(F.namespace.shard_id, binding, candidate.inputs, budget, directory.path(), key.root_incarnation, .{});
+            if (result == .complete) {
+                try std.testing.expectEqual(@as(u64, 2), result.complete.value.rows.rows);
+                break;
+            }
+        } else return error.ValidationJobDidNotComplete;
+        try std.testing.expectEqual(@as(u64, 2), database.schema_audit_cache.preparations);
+        database.closeOwned();
+        live = false;
+        try std.testing.expectEqual(baseline, Cache.residentSnapshotCount());
+        try std.testing.expectEqual(@as(u64, 0), manager.sliceStats(.relational_preparation_working_set).used_bytes);
+    }
+}
+
 test "relational index system nullability job failure scope corruption and transaction rollback stay fenced" {
     const F = NullabilityJobFixture;
     var directory = try @import("../../common/test_directory.zig").TestDirectory.init("nullability-job-faults");
@@ -412,6 +2052,15 @@ test "relational index system nullability job failure scope corruption and trans
     const result = try F.page(&database, &failed);
     try std.testing.expectEqual(F.job.Phase.failed, result.phase);
     try std.testing.expectEqual(@as(?u16, 0), result.failure_column);
+    {
+        var audit = try F.job.RowAudit.init(alloc, database.core, expected, prepared.inputs, .{});
+        defer audit.deinit();
+        try std.testing.expect(try audit.step(null, .{ .records = 1, .time_ns = std.time.ns_per_s }, .{}));
+        const audited = try audit.summary();
+        try std.testing.expectEqual(F.job.RowAudit.Coverage.prefix, audited.coverage);
+        try std.testing.expectEqualDeep(result, audited.header);
+        try std.testing.expectEqual(result.rows_scanned, audited.rows);
+    }
     const failed_clock = try F.clock(&database);
     try std.testing.expectEqualDeep(result, try F.page(&database, &replayed_failure));
     try std.testing.expectEqual(failed_clock, try F.clock(&database));
@@ -462,7 +2111,9 @@ test "relational index system nullability job reserves its entire metadata famil
     var database = try db_mod.DB.open(alloc, directory.path(), F.options);
     defer database.close();
     try database.setSchemaJson(alloc, F.before);
-    for ([_][]const u8{ F.job.key, F.job.inputs_key, F.job.cursor_key, F.job.key ++ ":future-receipt" }) |reserved_key| {
+    const outcome_key = @import("relational_schema_apply_outcome.zig").key(F.namespace, 1);
+    const outcome_head_key = @import("relational_schema_apply_outcome.zig").headKey(F.namespace);
+    for ([_][]const u8{ F.job.key, F.job.inputs_key, F.job.cursor_key, F.job.key ++ ":future-receipt", F.job.family_prefix ++ "v2:future", &outcome_key, @import("relational_schema_apply_outcome.zig").prefix ++ "future", &outcome_head_key, @import("relational_schema_apply_outcome.zig").head_prefix ++ "future", @import("relational_schema_apply_outcome.zig").family_prefix ++ "v2:future", @import("relational_schema_apply_outcome.zig").head_family_prefix ++ "v2:future" }) |reserved_key| {
         const before_rejected_mutations = try F.clock(&database);
         try std.testing.expectError(error.ReservedRelationalIndexMetadataKey, controller.validateExtraMetadata(&.{.{ .key = reserved_key, .value = "forged" }}, &.{}));
         try std.testing.expectError(error.ReservedRelationalIndexMetadataKey, controller.validateExtraMetadata(&.{}, &.{reserved_key}));
@@ -622,6 +2273,22 @@ test "relational index system nullability job installation joins schema catalog 
         const versioned = try api.versionedSchemaKeyAlloc(alloc, binding.after_version);
         defer alloc.free(versioned);
         const writes = [_]docstore.KVPair{ .{ .key = "\x00\x00__metadata__:schema_json", .value = checked_after }, .{ .key = versioned, .value = checked_after } };
+        {
+            var prepared = try database.core.prepareSchemaMetadataValidatedNullability(definition.runtime_schema, &writes, binding, &candidate);
+            defer prepared.deinit();
+            var manager = try database.core.initTxnManager();
+            defer manager.deinit();
+            const late: [16]u8 = @splat(212);
+            try manager.initTransactionWithParticipants(late, 100, &.{"local"});
+            try std.testing.expectError(error.TransactionTopologyBusy, database.core.prepareSchemaMetadataValidatedNullability(definition.runtime_schema, &writes, binding, &candidate));
+            {
+                database.core.lockApply();
+                defer database.core.unlockApply();
+                try std.testing.expectError(error.TransactionTopologyBusy, database.core.commitPreparedSchemaMetadataValidatedNullability(&prepared, &writes, @splat(91), null, Participant{ .fail = false }));
+            }
+            _ = try manager.resolveIntentsWithExtraBatch(late, .aborted, 200, .{ .resolved_participant = "local" });
+            try std.testing.expectEqualDeep(validated, try F.current(&database));
+        }
         const clock_before = try F.clock(&database);
         const index_state = database.core.table_catalog.index_state;
         const physical_before = if (database.core.relational_indexes.acquire()) |snapshot| blk: {
@@ -649,6 +2316,17 @@ test "relational index system nullability job installation joins schema catalog 
             break :blk try database.core.commitPreparedSchemaMetadataValidatedNullability(&prepared, &writes, @splat(91), null, Participant{ .fail = false });
         };
         try std.testing.expectEqual(F.job.Phase.installed, installed.phase);
+        {
+            var audit = try F.job.RowAudit.init(alloc, database.core, binding, candidate.inputs, .{});
+            defer audit.deinit();
+            for (0..8) |_| {
+                if (try audit.step(null, .{ .records = 1, .time_ns = std.time.ns_per_s }, .{})) break;
+            } else return error.ValidationJobDidNotComplete;
+            const audited = try audit.summary();
+            try std.testing.expectEqual(F.job.RowAudit.Coverage.full, audited.coverage);
+            try std.testing.expectEqual(installed.rows_scanned, audited.rows);
+            try std.testing.expectEqualDeep(installed, audited.header);
+        }
         try std.testing.expectEqualDeep(validated.updated, installed.installation.?.ready_position);
         var damaged_predecessor = installed;
         damaged_predecessor.records += 1;
@@ -1172,6 +2850,64 @@ test "relational index system nullability job native metadata journal preserves 
             try std.testing.expect(try F.configure(&peer_db, F.after, "{}", false));
             try std.testing.expect(peer_db.hasIndex("old"));
             try std.testing.expectEqual(@as(u32, 2), peer_db.core.schema.?.version);
+            const installed = try F.current(&primary_db);
+            var release_body: [96]u8 = undefined;
+            @memcpy(release_body[0..32], &installed.installation.?.decision);
+            @memcpy(release_body[32..64], &try installed.digest());
+            @memset(release_body[64..96], 95);
+            const release_command: owner.Command = .{ .binding = binding, .action = .release, .payload = &release_body };
+            publisher.fail_before = true;
+            const before_release_lsn = journal.lastLsn();
+            const released = try Driver.command(&primary_db, release_command);
+            try std.testing.expectEqual(F.job.Phase.released, released.header.?.phase);
+            try std.testing.expect(released.replication_pending and !released.duplicate);
+            const pending = try primary_db.observeNativeSchemaOwner(binding, .{});
+            try std.testing.expect(pending.replication_pending);
+            try std.testing.expectEqualDeep(released.header, pending.header);
+            var row_blocked = false;
+            primary_db.batch(.{ .timestamp_ns = 300, .writes = &.{.{ .key = "z", .value = "{\"n\":4}" }} }) catch |err| {
+                try std.testing.expect(err == error.InjectedSchemaJournalUnavailable or err == error.ReplicationPublisherUnavailable);
+                row_blocked = true;
+            };
+            try std.testing.expect(row_blocked);
+            try std.testing.expectEqual(before_release_lsn, journal.lastLsn());
+            primary_db.close();
+            primary_live = false;
+            primary_db = try db_mod.DB.open(alloc, source_path, mirrored);
+            primary_live = true;
+            publisher.fail_before = false;
+            publisher.fail_after = true;
+            try std.testing.expectError(error.InjectedSchemaJournalAcknowledgement, primary_db.flushDurableReplicationOutboxes());
+            try std.testing.expectEqual(before_release_lsn + 1, journal.lastLsn());
+            try primary_db.flushDurableReplicationOutboxes();
+            try std.testing.expectEqual(before_release_lsn + 1, journal.lastLsn());
+            try Driver.replayTo(&journal, &peer_db, &next_lsn);
+            try std.testing.expectEqualDeep(released.header.?, try F.current(&peer_db));
+            // Only now may a new row overtake the terminal control. Its
+            // journal LSN is independent of the retained native phase cut.
+            try primary_db.batch(.{ .timestamp_ns = 300, .writes = &.{.{ .key = "z", .value = "{\"n\":4}" }} });
+            try Driver.replayTo(&journal, &peer_db, &next_lsn);
+            const normal_write_lsn = journal.lastLsn();
+            try std.testing.expect(normal_write_lsn > before_release_lsn + 1);
+            const repeated = try Driver.command(&primary_db, release_command);
+            try std.testing.expect(repeated.duplicate and !repeated.replication_pending);
+            try std.testing.expectEqualDeep(released.position, repeated.position);
+            try std.testing.expectEqual(normal_write_lsn, journal.lastLsn());
+            try std.testing.expectEqualDeep(released.header.?, try F.current(&primary_db));
+            try std.testing.expectEqualDeep(released.header.?, try F.current(&peer_db));
+            const terminal_observation = try primary_db.observeNativeSchemaOwner(binding, .{});
+            try std.testing.expect(!terminal_observation.replication_pending);
+            try std.testing.expectEqual(try F.clock(&primary_db), terminal_observation.sequence);
+            try std.testing.expect(terminal_observation.sequence >= released.position.sequence);
+            try std.testing.expectEqualDeep(released.header, terminal_observation.header);
+            try std.testing.expectEqual(db_mod.DB.SchemaOwnerCatalogPolicy.unprotected, try primary_db.schemaOwnerCatalogPolicy(F.after, false));
+            peer_db.close();
+            peer_live = false;
+            peer_db = try db_mod.DB.open(alloc, peer_path, F.options);
+            peer_live = true;
+            const recovered = try peer_db.observeNativeSchemaOwner(binding, .{});
+            try std.testing.expectEqualDeep(terminal_observation.header, recovered.header);
+            try std.testing.expectEqual(terminal_observation.sequence, recovered.sequence);
         }
         try std.testing.expect(publisher.completions > 0);
     }
@@ -1230,6 +2966,85 @@ test "relational index system nullability job publisher admission uses the actua
     try std.testing.expectError(error.WalRecordTooLarge, journal.log.wal.admitAppendBytes(std.math.maxInt(usize)));
 }
 
+test "relational index system nullability job preserves full text snapshots and storage identity through publication" {
+    const F = NullabilityJobFixture;
+    const controls = db_mod.DB.NativeSchemaOwnerControl;
+    const Check = struct {
+        fn apply(database: *db_mod.DB, command: controls.Command) !controls.Outcome {
+            var prepared = try database.prepareNativeSchemaOwnerControl(command, .{});
+            defer prepared.deinit();
+            return database.applyPreparedNativeSchemaOwnerControl(&prepared, null);
+        }
+        fn hits(database: *db_mod.DB, expected: usize) !void {
+            try database.catchUpPendingDerivedReplay();
+            var result = try database.search(alloc, .{ .index_name = "text", .full_text = .{ .match = .{ .field = "text", .text = "keyword" } }, .limit = 16 });
+            defer result.deinit();
+            try std.testing.expectEqual(expected, result.hits.len);
+            try std.testing.expectEqual(@as(u32, @intCast(expected)), result.total_hits);
+        }
+    };
+    const before = try std.mem.replaceOwned(u8, alloc, F.before, "\"properties\":{", "\"properties\":{\"text\":{\"type\":\"text\",\"nullable\":true},");
+    defer alloc.free(before);
+    const after = try std.mem.replaceOwned(u8, alloc, F.after, "\"properties\":{", "\"properties\":{\"text\":{\"type\":\"text\",\"nullable\":true},");
+    defer alloc.free(after);
+    var directory = try @import("../../common/test_directory.zig").TestDirectory.init("schema-validation-text-identity");
+    defer directory.cleanup();
+    var options = F.options;
+    options.primary_backend = .{ .lsm = .{ .flush_threshold = 1024 * 1024 * 1024 } };
+    var database = try db_mod.DB.open(alloc, directory.path(), options);
+    var live = true;
+    defer if (live) database.close();
+    try database.setSchemaJson(alloc, before);
+    try database.addIndex(.{ .name = "text", .kind = .full_text, .config_json = "{}" });
+    try database.batch(.{ .timestamp_ns = 100, .writes = &.{ .{ .key = "a", .value = "{\"n\":1,\"text\":\"keyword old\"}" }, .{ .key = "b", .value = "{\"n\":2,\"text\":\"keyword stable\"}" } } });
+    try Check.hits(&database, 2);
+    const coverage = database.core.index_manager.coverageIdentityForIndex("text").?;
+    const writes = database.core.index_manager.snapshotLsmWriteStats();
+    {
+        // Retain the old query snapshot throughout schema publication. This
+        // proves index reuse rather than merely another index with equal hits.
+        var old = (try database.core.index_manager.acquireTextQueryLease(alloc, "text", &.{"text"})).?;
+        defer old.deinit();
+        const predecessor = try database.core.store.get(alloc, @import("relational_integrity_catalog.zig").key);
+        defer alloc.free(predecessor);
+        var candidate = try F.job.Candidate.init(alloc, F.namespace.table_id, before, after, predecessor, &.{"n"}, .{});
+        defer candidate.deinit();
+        const binding = try F.binding(&database, &candidate, 64);
+        _ = try Check.apply(&database, .{ .binding = binding, .action = .begin, .payload = candidate.inputs });
+        _ = try Check.apply(&database, .{ .binding = binding, .action = .freeze });
+        for (0..8) |_| {
+            var page = try database.prepareNativeSchemaOwnerPage(binding, .{ .records = 1, .time_ns = std.time.ns_per_s }, .{});
+            defer page.deinit();
+            const outcome = try database.applyPreparedNativeSchemaOwnerControl(&page, null);
+            if (outcome.header.?.phase == .ready) break;
+        } else return error.NativeSchemaValidationDidNotFinish;
+        const validated_header = try F.current(&database);
+        var install_body: [64]u8 = undefined;
+        @memset(install_body[0..32], 91);
+        @memcpy(install_body[32..64], &try validated_header.digest());
+        const installed = try Check.apply(&database, .{ .binding = binding, .action = .install, .payload = &install_body });
+        var release_body: [96]u8 = undefined;
+        @memcpy(release_body[0..32], &installed.header.?.installation.?.decision);
+        @memcpy(release_body[32..64], &try installed.header.?.digest());
+        @memset(release_body[64..96], 95);
+        _ = try Check.apply(&database, .{ .binding = binding, .action = .release, .payload = &release_body });
+        var next = (try database.core.index_manager.acquireTextQueryLease(alloc, "text", &.{"text"})).?;
+        defer next.deinit();
+        try std.testing.expectEqual(old.snapshot, next.snapshot);
+        try std.testing.expectEqualDeep(coverage, database.core.index_manager.coverageIdentityForIndex("text").?);
+        try std.testing.expectEqualDeep(writes, database.core.index_manager.snapshotLsmWriteStats());
+        try Check.hits(&database, 2);
+    }
+    database.close();
+    live = false;
+    database = try db_mod.DB.open(alloc, directory.path(), options);
+    live = true;
+    try Check.hits(&database, 2);
+    try std.testing.expectEqualDeep(coverage, database.core.index_manager.coverageIdentityForIndex("text").?);
+    try database.batch(.{ .timestamp_ns = 200, .writes = &.{.{ .key = "c", .value = "{\"n\":3,\"text\":\"keyword fresh\"}" }} });
+    try Check.hits(&database, 3);
+}
+
 test "relational index system nullability job observation binds physical root debt and native authority without mutation" {
     const F = NullabilityJobFixture;
     var directory = try @import("../../common/test_directory.zig").TestDirectory.init("schema-owner-observation");
@@ -1245,7 +3060,12 @@ test "relational index system nullability job observation binds physical root de
     try std.testing.expect(before.header == null and !before.replication_pending);
     try std.testing.expectEqual(@as(u64, 0), before.sequence);
     try std.testing.expectEqual(database.root_incarnation, before.physical_root_incarnation);
+    const preparation = try database.prepareSchemaOwnerObservation(&candidate, binding.id, binding.plan_digest, binding.fence, .native, .{});
+    try std.testing.expectEqualDeep(binding, preparation.binding);
+    try std.testing.expectEqual(database.root_incarnation, preparation.physical_root_incarnation);
+    try std.testing.expect(preparation.position == null and !preparation.replication_pending);
     _ = try F.apply(&database, &candidate, binding, .begin);
+    try std.testing.expectError(error.IntegrityTopologyBusy, database.prepareSchemaOwnerObservation(&candidate, binding.id, binding.plan_digest, binding.fence, .native, .{}));
     const admitted = try database.observeNativeSchemaOwner(binding, .{});
     try std.testing.expectEqual(F.job.Phase.fencing, admitted.header.?.phase);
     try std.testing.expectEqual(try F.clock(&database), admitted.sequence);
@@ -1282,6 +3102,12 @@ test "relational index system nullability job observation binds physical root de
     // domain; do not bypass that earlier authority guard to set up a fixture.
     try std.testing.expectError(error.OnlineSourceScopeChanged, database.core.store.put(&marker, ""));
     try std.testing.expectEqualDeep(admitted, try database.observeNativeSchemaOwner(binding, .{}));
+    _ = try F.apply(&database, &candidate, binding, .cancel);
+    const successor = try F.binding(&database, &candidate, 64);
+    const next_preparation = try database.prepareSchemaOwnerObservation(&candidate, successor.id, successor.plan_digest, successor.fence, .native, .{});
+    try std.testing.expectEqualDeep(successor, next_preparation.binding);
+    try std.testing.expectEqual(try F.clock(&database), next_preparation.position.?.native.sequence);
+    try std.testing.expectError(error.SchemaValidationJobChanged, database.prepareSchemaOwnerObservation(&candidate, binding.id, binding.plan_digest, binding.fence, .native, .{}));
 }
 
 const NullabilityScanFixture = struct {

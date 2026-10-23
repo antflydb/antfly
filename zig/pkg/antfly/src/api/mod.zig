@@ -29,6 +29,7 @@ pub const restore_owner = @import("restore_owner.zig");
 pub const restore_parent_activation = @import("restore_parent_activation.zig");
 pub const relational_fk_generation_publication = @import("relational_fk_generation_publication.zig");
 pub const relational_index_owner_execution = @import("relational_index_owner_execution.zig");
+pub const schema_validation_preparation = @import("schema_validation_preparation.zig");
 pub const row_policy_install = @import("row_policy_install.zig");
 pub const row_policy_publication_coordinator = @import("row_policy_publication_coordinator.zig");
 pub const fk_generation_publication_coordinator = @import("fk_generation_publication_coordinator.zig");
@@ -243,6 +244,8 @@ test "join inequality: incomparable types return 0" {
 }
 
 test "api module compiles" {
+    _ = @import("sql_session_overlay.zig");
+    _ = @import("relational_integrity_errors.zig");
     _ = @import("sql_catalog_campaign_test.zig");
     _ = @import("sql_name_resolution_test.zig");
     _ = @import("sql_document_root_test.zig");

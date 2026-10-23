@@ -381,6 +381,13 @@ fn timeoutValue(p: *Parser) !u32 {
     return std.math.mul(u32, @intCast(value), multiplier) catch error.InvalidParameter;
 }
 
+pub fn parseTimeoutText(alloc: std.mem.Allocator, input: []const u8) !u32 {
+    var parser: Parser = .{ .alloc = alloc, .input = input };
+    const value = try timeoutValue(&parser);
+    try parser.finish();
+    return value;
+}
+
 test "pgwire timeout syntax is bounded and does not consume native constraint settings" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();

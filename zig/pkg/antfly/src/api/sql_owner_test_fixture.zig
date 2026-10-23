@@ -268,7 +268,7 @@ pub fn waitServingSchema(ctx: *Context, name: []const u8, minimum: u32) !Serving
                     .relational_topology_json = "{\"mode\":\"public_schema\"}",
                     .execution_deadline_ns = deadline,
                 }, .read_index) catch |err| switch (err) {
-                    error.GroupLeaderUnavailable, error.LeaderUnavailable, error.NotLeader, error.UnknownGroup, error.ReadIndexTimeout, error.Timeout, error.ReadUnavailable, error.StorageReadTemporarilyUnavailable, error.TableNotFound, error.IntegrityCatalogChanged, error.CatalogRoutingUnavailable => null,
+                    error.GroupLeaderUnavailable, error.LeaderUnavailable, error.NotLeader, error.UnknownGroup, error.ReadIndexTimeout, error.Timeout, error.ReadUnavailable, error.StorageReadTemporarilyUnavailable, error.StorageBusy, error.TableNotFound, error.IntegrityCatalogChanged, error.CatalogRoutingUnavailable => null,
                     else => return err,
                 };
                 if (observed) |value| {
@@ -341,6 +341,8 @@ pub fn runWithState(comptime Campaign: type, initial: Campaign) !void {
     // Session campaigns opt in to the same native durable registry used by
     // production, not a mock or the legacy filesystem DocStore fallback.
     const native_sessions = if (@hasDecl(Campaign, "native_sessions")) Campaign.native_sessions else false;
+    const native_auth = if (@hasDecl(Campaign, "native_auth")) Campaign.native_auth else false;
+    const cold_catalog = if (@hasDecl(Campaign, "cold_catalog")) Campaign.cold_catalog else false;
     const session_path = try std.fmt.allocPrint(alloc, "{s}/sql-sessions", .{root});
     defer alloc.free(session_path);
     const local = @import("antfly_local_sources");
@@ -349,7 +351,7 @@ pub fn runWithState(comptime Campaign: type, initial: Campaign) !void {
     var session_store: ?local.storage_backend_erased.Store = if (session_backend) |*backend| try backend.backend.runtimeStore(alloc, .{ .name = "system/api-transaction-sessions" }) else null;
     defer if (session_store) |*store| store.deinit();
     var sessions = if (session_store) |*store| @import("transactions.zig").DurableSessionStore.initRuntime(alloc, store) else null;
-    var metadata = try metadata_runtime.Server.init(process_alloc, .{
+    const metadata_cfg: metadata_runtime.ServerConfig = .{
         .local_node_id = 1,
         .metadata_group_id = 2188,
         .replica_root_dir = meta_root,
@@ -357,27 +359,31 @@ pub fn runWithState(comptime Campaign: type, initial: Campaign) !void {
         .snapshot_root_dir = snapshots,
         .observe_local_replica_root = true,
         .api_server_cfg = .{ .auth_enabled = true, .user_manager = &auth_manager, .trusted_principal_secret = trusted_secret, .trusted_principal_issuer = issuer, .internal_service_secret = internal_secret, .internal_service_issuer = issuer, .internal_service_auth_capability = "v1; mode=enforce" },
-    });
-    defer metadata.deinit();
+    };
+    var metadata = try metadata_runtime.Server.init(process_alloc, metadata_cfg);
+    var metadata_live = true;
+    defer if (metadata_live) metadata.deinit();
     try metadata.start();
     try metadata.bootstrapLocal(2188, 1);
     var meta_raft = raft.ManagedProgressDriver.init(io_impl.io(), .{ .ptr = &metadata, .run_once = metadataRaft }, std.time.ns_per_ms);
-    defer meta_raft.deinit();
+    var meta_raft_live = true;
+    defer if (meta_raft_live) meta_raft.deinit();
     try meta_raft.start();
     var meta_control = raft.ManagedProgressDriver.init(io_impl.io(), .{ .ptr = &metadata, .run_once = metadataControl }, std.time.ns_per_ms);
-    defer meta_control.deinit();
+    var meta_control_live = true;
+    defer if (meta_control_live) meta_control.deinit();
     try meta_control.start();
     for (0..600) |_| {
         if (try metadata.server.svc.metadataIncarnation() != null) break;
         try io_impl.io().sleep(.fromMilliseconds(10), .awake);
     } else return error.MetadataIncarnationUnavailable;
-    const metadata_uri = try metadata.adminBaseUri(alloc);
+    var metadata_uri = try metadata.adminBaseUri(alloc);
     defer alloc.free(metadata_uri);
     var data = try data_runtime.DataServer.initFromMetadataApiUrl(process_alloc, .{
         .replica_root_dir = data_root,
         .replica_catalog_path = data_catalog,
         .store_registration = .{ .node_id = 9, .store_id = 9, .role = "data" },
-        .api_server_cfg = .{ .deployment_mode = .distributed, .trusted_principal_secret = trusted_secret, .trusted_principal_issuer = issuer, .internal_service_secret = internal_secret, .internal_service_issuer = issuer, .internal_service_auth_capability = "v1; mode=enforce", .session_store = if (sessions) |*store| store else null },
+        .api_server_cfg = .{ .deployment_mode = .distributed, .auth_enabled = native_auth, .user_manager = if (native_auth) &auth_manager else null, .trusted_principal_secret = trusted_secret, .trusted_principal_issuer = issuer, .internal_service_secret = internal_secret, .internal_service_issuer = issuer, .internal_service_auth_capability = "v1; mode=enforce", .session_store = if (sessions) |*store| store else null },
     }, metadata_uri);
     var data_live = true;
     defer if (data_live) data.deinit();
@@ -430,18 +436,56 @@ pub fn runWithState(comptime Campaign: type, initial: Campaign) !void {
     try enrollOwnedTestRoot(&context, data_root);
     try campaign.beforeRestart(&context);
     try context.checkDrivers();
-    // Recover the same durable owner storage while metadata keeps serving.
+    // All borrowers drain before any durable owner closes. Ordinary data
+    // campaigns keep metadata live; catalog campaigns reopen all three stores
+    // independently. Authentication remains deliberately outside this fixture.
     data_control.deinit();
     data_control_live = false;
     data_raft.deinit();
     data_raft_live = false;
     data.deinit();
     data_live = false;
+    if (cold_catalog) {
+        meta_control.deinit();
+        meta_control_live = false;
+        meta_raft.deinit();
+        meta_raft_live = false;
+        metadata.deinit();
+        metadata_live = false;
+        if (session_store) |*store| store.deinit();
+        session_store = null;
+        if (session_backend) |*backend| backend.close();
+        session_backend = null;
+        sessions = null;
+        if (native_sessions) {
+            session_backend = try local.storage_lsm_backend.BackendHandle.open(alloc, session_path, .{});
+            session_store = try session_backend.?.backend.runtimeStore(alloc, .{ .name = "system/api-transaction-sessions" });
+            sessions = @import("transactions.zig").DurableSessionStore.initRuntime(alloc, &session_store.?);
+        }
+        metadata = try metadata_runtime.Server.init(process_alloc, metadata_cfg);
+        metadata_live = true;
+        try metadata.start();
+        try metadata.bootstrapLocal(2188, 1);
+        meta_raft = raft.ManagedProgressDriver.init(io_impl.io(), .{ .ptr = &metadata, .run_once = metadataRaft }, std.time.ns_per_ms);
+        meta_raft_live = true;
+        try meta_raft.start();
+        meta_control = raft.ManagedProgressDriver.init(io_impl.io(), .{ .ptr = &metadata, .run_once = metadataControl }, std.time.ns_per_ms);
+        meta_control_live = true;
+        try meta_control.start();
+        for (0..600) |_| {
+            if (try metadata.server.svc.metadataIncarnation() != null) break;
+            try io_impl.io().sleep(.fromMilliseconds(10), .awake);
+        } else return error.MetadataIncarnationUnavailable;
+        const next_uri = try metadata.adminBaseUri(alloc);
+        alloc.free(metadata_uri);
+        metadata_uri = next_uri;
+        context.metadata_uri = metadata_uri;
+    }
     data = try data_runtime.DataServer.initFromMetadataApiUrl(process_alloc, .{
         .replica_root_dir = data_root,
         .replica_catalog_path = data_catalog,
         .store_registration = .{ .node_id = 9, .store_id = 9, .role = "data" },
-        .api_server_cfg = .{ .deployment_mode = .distributed, .trusted_principal_secret = trusted_secret, .trusted_principal_issuer = issuer, .internal_service_secret = internal_secret, .internal_service_issuer = issuer, .internal_service_auth_capability = "v1; mode=enforce", .session_store = if (sessions) |*store| store else null },
+        .api_server_cfg = .{ .deployment_mode = .distributed, .auth_enabled = native_auth, .user_manager = if (native_auth) &auth_manager else null, .trusted_principal_secret = trusted_secret, .trusted_principal_issuer = issuer, .internal_service_secret = internal_secret, .internal_service_issuer = issuer, .internal_service_auth_capability = "v1; mode=enforce", .session_store = if (sessions) |*store| store else null },
     }, metadata_uri);
     data_live = true;
     try data.start();

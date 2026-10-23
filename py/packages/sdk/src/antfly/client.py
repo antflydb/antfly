@@ -49,6 +49,8 @@ from antfly.client_generated.models import (
     IndexPublicationState,
     IndexPublicationStatus,
     IndexPublicationStatusIndexType,
+    SchemaValidationState,
+    SchemaValidationStatus,
     InferenceDecideRequest,
     InferenceDecideResponse,
     InferenceGenerateChunk,
@@ -57,6 +59,7 @@ from antfly.client_generated.models import (
     OllamaEmbedderConfig,
     OpenAIEmbedderConfig,
     QueryResponses,
+    SQLCatalogOperationReceipt,
     SQLDiagnostic,
     SQLPreparedExecutionRequest,
     SQLPreparedResponse,
@@ -760,12 +763,38 @@ class IndexOperations:
         self._client._request("DELETE", f"/db/v1/tables/{quote(table, safe='')}/indexes/{quote(name, safe='')}")
 
 
+def _sql_catalog_receipt(body: dict[str, Any]) -> SQLCatalogOperationReceipt:
+    if not isinstance(body, dict):
+        raise ValueError("Invalid SQL catalog receipt")
+    for key in ("database", "namespace", "name", "recovery_token"):
+        if not isinstance(body.get(key), str) or not body[key]:
+            raise ValueError("Invalid SQL catalog receipt identity")
+    if len(body["recovery_token"].encode("utf-8")) > 8192:
+        raise ValueError("Invalid SQL catalog recovery token")
+    for key in ("object_id", "generation", "catalog_revision"):
+        if key in body:
+            value = body[key]
+            if (
+                not isinstance(value, str)
+                or not value.isascii()
+                or not value.isdecimal()
+                or len(value) > 20
+                or str(int(value)) != value
+                or int(value) > (1 << 64) - 1
+            ):
+                raise ValueError("Invalid SQL catalog receipt integer")
+    return SQLCatalogOperationReceipt.from_dict(body)
+
+
 class SQLExecutionError(AntflyException):
     """SQLSTATE diagnostic and optional native transaction reconciliation receipt."""
 
-    def __init__(self, status_code: int, diagnostic: SQLDiagnostic) -> None:
+    def __init__(
+        self, status_code: int, diagnostic: SQLDiagnostic, catalog_receipt: SQLCatalogOperationReceipt | None = None
+    ) -> None:
         self.status_code = status_code
         self.diagnostic = diagnostic
+        self.catalog_receipt = catalog_receipt
         super().__init__(f"SQL execution failed ({diagnostic.code}): {diagnostic.message}")
 
 
@@ -890,8 +919,31 @@ class AntflyClient:
                         msg = text
                     if not msg:
                         msg = response.reason_phrase or f"HTTP {response.status_code}"
+                    if (path == "/db/v1/sql" or path.startswith("/db/v1/sql/")) and error_body is not None:
+                        receipt_body = error_body.get("catalog_receipt")
+                        if isinstance(receipt_body, dict):
+                            try:
+                                receipt = _sql_catalog_receipt(receipt_body)
+                            except (KeyError, TypeError, ValueError):
+                                receipt = None
+                            if receipt is not None:
+                                diagnostic_body = receipt_body.get("diagnostic")
+                                if (
+                                    not isinstance(diagnostic_body, dict)
+                                    or not isinstance(diagnostic_body.get("code"), str)
+                                    or len(diagnostic_body["code"]) != 5
+                                    or not isinstance(diagnostic_body.get("message"), str)
+                                ):
+                                    diagnostic_body = {
+                                        "code": "40003",
+                                        "message": "SQL catalog outcome is unknown; observe the recovery token without replaying DDL",
+                                    }
+                                diagnostic_body = {**diagnostic_body, "retryable": False}
+                                raise SQLExecutionError(
+                                    response.status_code, SQLDiagnostic.from_dict(diagnostic_body), receipt
+                                )
                     if (
-                        (path == "/db/v1/sql" or path.startswith("/db/v1/sql/prepared"))
+                        (path == "/db/v1/sql" or path.startswith("/db/v1/sql/"))
                         and error_body is not None
                         and isinstance(error_body.get("code"), str)
                         and len(error_body["code"]) == 5
@@ -1208,6 +1260,49 @@ class AntflyClient:
         """
         self._request("DELETE", f"/db/v1/tables/{quote(name, safe='')}")
 
+    def get_schema_validation_publication(
+        self, table: str, token: str, *, database: str | None = None, namespace: str | None = None
+    ) -> SchemaValidationStatus:
+        """Observe an exact schema job without replaying DDL; a token grants no authorization."""
+        if len(token) != 182 or any(not (c.isascii() and (c.isalnum() or c in "-_")) for c in token):
+            raise ValueError("invalid schema validation token")
+        if (database is None) != (namespace is None):
+            raise ValueError("database and namespace must be supplied together")
+        prefix = "/db/v1"
+        if database is not None and namespace is not None:
+            prefix += f"/databases/{quote(database, safe='')}/namespaces/{quote(namespace, safe='')}"
+        result = self._request(
+            "GET",
+            f"{prefix}/tables/{quote(table, safe='')}/schema/publication",
+            headers={"X-Antfly-Schema-Validation-Token": token},
+            _max_response_bytes=16 << 10,
+            _expected_status=200,
+        )
+        try:
+            status = SchemaValidationStatus.from_dict(result)
+        except (KeyError, TypeError, ValueError) as exc:
+            raise AntflyException("invalid schema validation response") from exc
+        if (
+            status.schema_validation_token != token
+            or not isinstance(status.state, SchemaValidationState)
+            or type(status.active_schema_version) is not int
+            or status.active_schema_version < 0
+            or status.active_schema_version > 0xFFFFFFFF
+            or (
+                status.state is SchemaValidationState.SUCCEEDED
+                and (
+                    status.phase != "succeeded"
+                    or type(status.owner_count) is not int
+                    or not 1 <= status.owner_count <= 4096
+                    or status.owner_count != status.ready
+                    or status.owner_count != status.installed
+                    or status.owner_count != status.released
+                )
+            )
+        ):
+            raise AntflyException("schema validation response identity or completion mismatch")
+        return status
+
     def execute_sql(self, request: SQLRequest) -> SQLResponse:
         """Execute one bound SQL statement without retrying ambiguous mutations.
 
@@ -1219,6 +1314,19 @@ class AntflyClient:
     def prepare_sql(self, request: SQLPrepareRequest) -> SQLPreparedResponse:
         """Create an owner-bound durable resource independent of transactions."""
         return SQLPreparedResponse.from_dict(self._sql_request("POST", "/db/v1/sql/prepared", request.to_dict()))
+
+    def get_sql_catalog_operation(self, recovery_token: str) -> SQLCatalogOperationReceipt:
+        """Observe a retained catalog outcome without resubmitting uncertain DDL."""
+        if not isinstance(recovery_token, str) or not 1 <= len(recovery_token.encode("utf-8")) <= 8192:
+            raise AntflyException("SQL recovery token must contain 1..8192 bytes")
+        body = self._sql_request("POST", "/db/v1/sql/operations/status", {"recovery_token": recovery_token})
+        try:
+            receipt = _sql_catalog_receipt(body)
+        except (KeyError, TypeError, ValueError) as error:
+            raise AntflyException("Invalid SQL catalog receipt") from error
+        if receipt.recovery_token != recovery_token:
+            raise AntflyException("SQL catalog receipt does not match recovery token")
+        return receipt
 
     def execute_prepared_sql(self, prepared_id: str, request: SQLPreparedExecutionRequest) -> SQLResponse:
         """Execute with fresh authorization, without replaying ambiguous mutations."""

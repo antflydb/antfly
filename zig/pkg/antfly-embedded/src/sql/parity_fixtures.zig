@@ -14,6 +14,7 @@
 // limitations under the License.
 
 pub const inventory = @embedFile("fixtures/sql_parity_inventory.json");
+pub const role_defaults_reference = @embedFile("fixtures/sql_role_defaults_reference.json");
 pub const generated_original_reference = @embedFile("fixtures/sql_generated_original_reference.json");
 pub const catalog_campaign = @embedFile("fixtures/sql_catalog_campaign.json");
 pub const dispositions = @embedFile("fixtures/sql_parity_dispositions.json");
@@ -35,6 +36,11 @@ pub const conditional_subquery_reference = @embedFile("fixtures/sql_conditional_
 pub const document_campaign = @embedFile("fixtures/sql_document_campaign.json");
 pub const document_patch_reference = @embedFile("fixtures/sql_document_patch_reference.json");
 pub const document_envelope_reference = @embedFile("fixtures/sql_document_envelope_reference.json");
+pub const document_identity_reference = @embedFile("fixtures/sql_document_identity_reference.json");
+pub const source_mutation_reference = @embedFile("fixtures/sql_source_mutation_reference.json");
+pub const prepared_source_reference = @embedFile("fixtures/sql_prepared_source_reference.json");
+pub const table_comment_reference = @embedFile("fixtures/sql_table_comment_reference.json");
+pub const sequence_declaration_reference = @embedFile("fixtures/sql_sequence_declaration_reference.json");
 pub const document_boundary_reference = @embedFile("fixtures/sql_document_boundary_reference.json");
 pub const document_root_extension_reference = @embedFile("fixtures/sql_document_root_extension_reference.json");
 pub const document_reference = @embedFile("fixtures/sql_document_reference.json");
@@ -47,6 +53,7 @@ pub const session_control_reference = @embedFile("fixtures/sql_session_control_r
 pub const binding_rejection_reference = @embedFile("fixtures/sql_binding_rejection_reference.json");
 pub const document_numeric_rejection_reference = @embedFile("fixtures/sql_document_numeric_rejection_reference.json");
 pub const indexed_mutation_lifecycle_reference = @embedFile("fixtures/sql_indexed_mutation_lifecycle_reference.json");
+pub const named_conflict_reference = @embedFile("fixtures/sql_named_conflict_reference.json");
 pub const users_read_reference = @embedFile("fixtures/sql_users_read_reference.json");
 pub const document_projection_reference = @embedFile("fixtures/sql_document_projection_reference.json");
 pub const read_campaign_reference = @embedFile("fixtures/sql_read_campaign_reference.json");
@@ -67,6 +74,10 @@ pub const scalar_kernel_reference = @embedFile("fixtures/sql_scalar_kernel_refer
 pub const json_exists_reference = @embedFile("fixtures/sql_json_exists_reference.json");
 pub const set_spill_reference = @embedFile("fixtures/sql_set_spill_reference.json");
 pub const set_read_reference = @embedFile("fixtures/sql_set_read_campaign_reference.json");
+
+pub const constraint_timing_reference = @embedFile("fixtures/sql_constraint_timing_reference.json");
+pub const transaction_characteristics_reference = @embedFile("fixtures/sql_transaction_characteristics_reference.json");
+pub const tablespace_lifecycle_reference = @embedFile("fixtures/sql_tablespace_lifecycle_reference.json");
 
 const std = @import("std");
 

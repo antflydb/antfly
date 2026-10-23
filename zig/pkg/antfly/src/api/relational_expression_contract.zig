@@ -102,6 +102,11 @@ fn visit(value: std.json.Value, depth: usize, nodes: *usize) bool {
     }
     if (op == .array and value.object.get("sql_type") == null) return false;
     switch (op) {
+        .uuidv4, .uuidv7 => {
+            if (value.object.get("shift")) |shift| {
+                if (shift != .string or shift.string.len == 0 or shift.string.len > 128) return false;
+            }
+        },
         .literal => {
             const kind = value.object.get("type") orelse return false;
             if (!validType(kind)) return false;
@@ -366,6 +371,29 @@ test "system catalog canonical schema preserves columnless constant index predic
     try std.testing.expectEqual(@as(?bool, false), predicates[1].constant);
     try std.testing.expect(predicates[0].column == null and predicates[0].value == null);
     try std.testing.expectEqualStrings("9007199254740993", predicates[2].value.?.number_string);
+}
+
+test "relational declarations public UUID defaults retain closed argument and shift shapes" {
+    for ([_][]const u8{
+        "{\"op\":\"uuidv4\"}",
+        "{\"op\":\"uuidv7\"}",
+        "{\"op\":\"uuidv7\",\"shift\":\"1 mon 2 days 03:00:00\"}",
+    }) |json| {
+        var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, json, .{});
+        defer parsed.deinit();
+        try std.testing.expect(valid(parsed.value));
+    }
+    for ([_][]const u8{
+        "{\"op\":\"uuidv4\",\"shift\":\"1 day\"}",
+        "{\"op\":\"uuidv7\",\"shift\":null}",
+        "{\"op\":\"uuidv7\",\"shift\":\"\"}",
+        "{\"op\":\"uuidv7\",\"args\":[]}",
+        "{\"op\":\"uuidv7\",\"sql_type\":\"uuid\"}",
+    }) |json| {
+        var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, json, .{});
+        defer parsed.deinit();
+        try std.testing.expect(!valid(parsed.value));
+    }
 }
 
 test "relational declarations canonical public expression copy preserves borrowed epoch nodes" {

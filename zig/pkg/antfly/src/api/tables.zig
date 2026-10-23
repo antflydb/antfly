@@ -1225,7 +1225,11 @@ fn parseCreateTableRequestWithOptions(alloc: std.mem.Allocator, body: []const u8
         if (value != .null) {
             const encoded_schema = try stringifyJsonValue(alloc, value);
             defer alloc.free(encoded_schema);
-            const validated_schema = @import("antfly_local_sources").schema_table_schema_impl.parseCreateSchemaRequest(alloc, encoded_schema) catch |err| switch (err) {
+            const schema_parser = if (allow_private_index_fields)
+                @import("antfly_local_sources").schema_table_schema_impl.parseStoredCreateSchemaRequest
+            else
+                @import("antfly_local_sources").schema_table_schema_impl.parseCreateSchemaRequest;
+            const validated_schema = schema_parser(alloc, encoded_schema) catch |err| switch (err) {
                 error.InvalidSchemaUpdateRequest => return error.InvalidCreateTableRequest,
                 else => return err,
             };
@@ -1694,11 +1698,55 @@ pub fn prepareForeignKeyPublicationRecord(alloc: std.mem.Allocator, table: *cons
     return applySchemaRecord(alloc, table, schema_json, false, true, null);
 }
 
+/// Prepare, but never publish, the exact validation-only NOT NULL successor.
+/// Physical rows, index declarations/incarnations and read projections remain
+/// unchanged. The metadata owner must authenticate the complete owner cohort,
+/// durably decide installation, and collect installed ACKs before publishing.
+pub fn prepareNullabilityPublicationRecord(alloc: std.mem.Allocator, table: *const metadata_table_manager.TableRecord, columns: []const []const u8) !metadata_table_manager.TableRecord {
+    const contract = @import("antfly_local_sources").storage_db_relational_schema_owner_contract;
+    const nullability = @import("antfly_local_sources").schema_column_nullability;
+    if (columns.len == 0 or columns.len > contract.max_columns or table.table_id == 0 or
+        table.schema_json.len == 0 or table.schema_json.len > contract.max_schema or
+        table.storage.engine != .local or table.storage_migration != null or
+        table.read_schema_json.len != 0 or table.restore_backup_id.len != 0 or
+        table.relational_retirement_json.len != 0) return error.InvalidSchemaValidationJob;
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    const before = try std.json.parseFromSliceLeaky(std.json.Value, scratch, table.schema_json, .{ .parse_numbers = false });
+    const changes = try scratch.alloc(nullability.Change, columns.len);
+    for (columns, changes) |name, *change| change.* = .{ .column = name, .nullable = false };
+    var candidate = try nullability.prepareBorrowed(&arena, before, changes, .{});
+    if (candidate.summary.changed != columns.len or candidate.summary.tightened != columns.len) return error.InvalidSchemaValidationJob;
+    const next_version = std.math.add(u32, try schemaVersion(table.schema_json), 1) catch return error.SchemaVersionExhausted;
+    try candidate.schema.object.put(scratch, "version", .{ .integer = next_version });
+    const schema_json = try std.json.Stringify.valueAlloc(alloc, candidate.schema, .{});
+    var schema_owned = true;
+    defer if (schema_owned) alloc.free(schema_json);
+    var compiled = try schema_mod.PreparedSchemaDefinition.init(alloc, schema_json);
+    defer compiled.deinit(alloc);
+    if (compiled.runtime_schema.storage_mode != .relational or compiled.runtime_schema.external_base_source != null)
+        return error.InvalidSchemaValidationJob;
+    const read_index = try selectActiveFullTextIndexName(alloc, table);
+    var read_index_owned = true;
+    defer if (read_index_owned) if (read_index) |name| alloc.free(name);
+    var updated = try metadata_table_manager.cloneTable(alloc, table.*);
+    errdefer metadata_table_manager.freeTable(alloc, updated);
+    alloc.free(updated.schema_json);
+    updated.schema_json = schema_json;
+    schema_owned = false;
+    if (updated.full_text_read_index) |name| alloc.free(name);
+    updated.full_text_read_index = read_index;
+    read_index_owned = false;
+    updated.schema_reader_requirements = compiled.readerRequirements();
+    return updated;
+}
+
 /// Recompute the only index-catalog delta a generation publication may carry.
 /// The next full-text index has a freshly allocated private incarnation, so
 /// take that one value from the candidate; every other byte must be derived
 /// from the old catalog and accepted successor schema by the normal DDL path.
-pub fn foreignKeyPublicationIndexesValid(alloc: std.mem.Allocator, table_name: []const u8, before_indexes_json: []const u8, after_indexes_json: []const u8, after_schema_json: []const u8, next_version: u32) !bool {
+pub fn foreignKeyPublicationIndexesValid(alloc: std.mem.Allocator, table_name: []const u8, before_indexes_json: []const u8, after_indexes_json: []const u8, after_schema_json: []const u8, next_version: u32, read_index: ?[]const u8) !bool {
     if (next_version == 0) return false;
     var candidate = try std.json.parseFromSlice(std.json.Value, alloc, after_indexes_json, .{});
     defer candidate.deinit();
@@ -1721,7 +1769,7 @@ pub fn foreignKeyPublicationIndexesValid(alloc: std.mem.Allocator, table_name: [
     }
     const regenerated = try regenerateAlgebraicIndexesFromSchemaAlloc(alloc, table_name, before_indexes_json, after_schema_json);
     defer alloc.free(regenerated);
-    const expected = try upsertVersionedFullTextIndex(alloc, regenerated, next_version - 1, next_version, incarnation);
+    const expected = try upsertVersionedFullTextIndexFromReadIndex(alloc, regenerated, next_version - 1, next_version, incarnation, read_index);
     defer alloc.free(expected);
     return std.mem.eql(u8, expected, after_indexes_json);
 }
@@ -1732,6 +1780,7 @@ fn applySchemaRecord(alloc: std.mem.Allocator, table: *const metadata_table_mana
     const comparison = try compareSchemaDefinitions(alloc, table.schema_json, schema_json);
     const schema_changed = !comparison.equal;
     if (schema_changed and !rewrite) {
+        try @import("antfly_local_sources").schema_column_nullability.validateSchemaUpdate(alloc, table.schema_json, schema_json);
         try @import("antfly_local_sources").schema_relational_expression.validateSchemaUpdate(alloc, table.schema_json, schema_json);
         try @import("antfly_local_sources").schema_relational_checks.validateSchemaUpdate(alloc, table.schema_json, schema_json);
         if (!fk_publication and !try foreignKeyDefinitionsUnchanged(alloc, table.schema_json, schema_json))
@@ -1778,7 +1827,7 @@ fn applySchemaRecord(alloc: std.mem.Allocator, table: *const metadata_table_mana
         updated.read_schema_json = normalized_read_schema_json;
     }
 
-    const next_indexes_json = try upsertVersionedFullTextIndex(alloc, updated.indexes_json, current_version, next_version, pinned_incarnation);
+    const next_indexes_json = try upsertVersionedFullTextIndexFromReadIndex(alloc, updated.indexes_json, current_version, next_version, pinned_incarnation, table.full_text_read_index);
     alloc.free(updated.indexes_json);
     updated.indexes_json = next_indexes_json;
     try refreshSchemaReaderRequirements(alloc, &updated, comparison.next_requirements, if (table.read_schema_json.len == 0) comparison.previous_requirements else null);
@@ -1815,7 +1864,7 @@ test "system catalog schema reader table updates derive active and retained requ
     const next = try applySchemaUpdateRecord(a, &table, arrays);
     defer metadata_table_manager.freeTable(a, next);
     try std.testing.expectEqual(@as(u32, 31), next.schema_reader_requirements.?.semantic_version);
-    try std.testing.expectEqual(@as(u32, 31), next.schema_reader_requirements.?.encoding_version);
+    try std.testing.expectEqual(@import("antfly_local_sources").common_schema_readers.current_encoding_version, next.schema_reader_requirements.?.encoding_version);
     try std.testing.expectEqual(@as(u32, 2), try schemaVersion(next.schema_json));
     try std.testing.expectEqual(@as(u32, 1), try schemaVersion(next.read_schema_json));
     // Even a semantically unchanged active definition must retain the older
@@ -1849,7 +1898,7 @@ test "system catalog schema reader table finalization derives only the acknowled
     // The active full-text layout retains declared paths (reader v14), even
     // though the relational columns alone would only require reader v13.
     try std.testing.expectEqual(@as(u32, 14), table.schema_reader_requirements.?.semantic_version);
-    try std.testing.expectEqual(@as(u32, 31), table.schema_reader_requirements.?.encoding_version);
+    try std.testing.expectEqual(@import("antfly_local_sources").common_schema_readers.current_encoding_version, table.schema_reader_requirements.?.encoding_version);
     var indexes = try std.json.parseFromSlice(std.json.Value, a, table.indexes_json, .{});
     defer indexes.deinit();
     try std.testing.expect(indexes.value.object.get("full_text_index_v1") == null);
@@ -1975,6 +2024,86 @@ pub fn routeQueryRequestToActiveReadIndex(
     } else {
         alloc.free(active_name);
     }
+}
+
+test "schema validation publication preparation preserves every index across consecutive logical epochs" {
+    const a = std.testing.allocator;
+    const schema = "{\"version\":7,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"integer\",\"nullable\":true},\"n\":{\"type\":\"integer\",\"nullable\":true}},\"additionalProperties\":false}}}}";
+    const variants = [_][]const u8{
+        "{}",
+        "{\"named\":{\"type\":\"full_text\",\"field\":\"body\"}}",
+        "{\"full_text_index_v7\":{\"type\":\"full_text\",\"field\":\"body\"},\"title\":{\"type\":\"full_text\",\"field\":\"title\"}}",
+    };
+    for (variants) |indexes| {
+        const before: metadata_table_manager.TableRecord = .{ .table_id = 7, .name = "rows", .schema_json = schema, .indexes_json = indexes };
+        const first = try prepareNullabilityPublicationRecord(a, &before, &.{"id"});
+        defer metadata_table_manager.freeTable(a, first);
+        try std.testing.expectError(error.SchemaValidationPublicationRequired, applySchemaUpdateRecord(a, &before, first.schema_json));
+        try std.testing.expectError(error.SchemaValidationPublicationRequired, prepareForeignKeyPublicationRecord(a, &before, first.schema_json));
+        const rewritten = try prepareSchemaRewriteRecord(a, &before, first.schema_json);
+        defer metadata_table_manager.freeTable(a, rewritten);
+        try std.testing.expect(rewritten.read_schema_json.len != 0);
+        try std.testing.expectEqual(@as(u32, 8), try schemaVersion(first.schema_json));
+        try std.testing.expectEqualStrings(indexes, first.indexes_json);
+        try std.testing.expectEqualStrings("", first.read_schema_json);
+        try std.testing.expect(first.schema_reader_requirements.?.valid());
+        const next = try prepareNullabilityPublicationRecord(a, &first, &.{"n"});
+        defer metadata_table_manager.freeTable(a, next);
+        try std.testing.expectEqual(@as(u32, 9), try schemaVersion(next.schema_json));
+        try std.testing.expectEqualStrings(indexes, next.indexes_json);
+        try std.testing.expectEqualStrings("", next.read_schema_json);
+        const old_selection = try selectActiveFullTextIndexName(a, &before);
+        defer if (old_selection) |name| a.free(name);
+        const selected = try selectActiveFullTextIndexName(a, &next);
+        defer if (selected) |name| a.free(name);
+        if (old_selection) |name| {
+            try std.testing.expectEqualStrings(name, first.full_text_read_index.?);
+            try std.testing.expectEqualStrings(name, next.full_text_read_index.?);
+            try std.testing.expectEqualStrings(name, selected.?);
+        } else try std.testing.expect(selected == null and next.full_text_read_index == null);
+        try std.testing.expectError(error.InvalidSchemaValidationJob, prepareNullabilityPublicationRecord(a, &first, &.{"id"}));
+        const Faults = struct {
+            fn run(backing: std.mem.Allocator, table: metadata_table_manager.TableRecord) !void {
+                var vtable = backing.vtable.*;
+                vtable.resize = std.mem.Allocator.noResize;
+                vtable.remap = std.mem.Allocator.noRemap;
+                const stable: std.mem.Allocator = .{ .ptr = backing.ptr, .vtable = &vtable };
+                const value = try prepareNullabilityPublicationRecord(stable, &table, &.{"id"});
+                defer metadata_table_manager.freeTable(stable, value);
+            }
+        };
+        try std.testing.checkAllAllocationFailures(a, Faults.run, .{before});
+    }
+    var blocked: metadata_table_manager.TableRecord = .{ .table_id = 7, .name = "rows", .schema_json = schema, .read_schema_json = schema };
+    try std.testing.expectError(error.InvalidSchemaValidationJob, prepareNullabilityPublicationRecord(a, &blocked, &.{"id"}));
+    blocked.read_schema_json = "";
+    blocked.storage.engine = .object;
+    try std.testing.expectError(error.InvalidSchemaValidationJob, prepareNullabilityPublicationRecord(a, &blocked, &.{"id"}));
+}
+
+test "schema validation publication routes exact retained text generation with named indexes" {
+    const a = std.testing.allocator;
+    const configs = "{\"full_text_index_v1\":{\"type\":\"full_text\",\"field\":\"body\"},\"title\":{\"type\":\"full_text\",\"field\":\"title\"}}";
+    const table: metadata_table_manager.TableRecord = .{ .table_id = 7, .name = "rows", .schema_json = "{\"version\":3}", .indexes_json = configs, .full_text_read_index = "full_text_index_v1" };
+    const selected = (try selectActiveFullTextIndexName(a, &table)).?;
+    defer a.free(selected);
+    try std.testing.expectEqualStrings("full_text_index_v1", selected);
+    const seeded = try upsertVersionedFullTextIndexFromReadIndex(a, configs, 3, 4, 37, table.full_text_read_index);
+    defer a.free(seeded);
+    const parsed = try std.json.parseFromSlice(std.json.Value, a, seeded, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("body", parsed.value.object.get("full_text_index_v4").?.object.get("field").?.string);
+    try std.testing.expect(try foreignKeyPublicationIndexesValid(a, table.name, configs, seeded, "{}", 4, table.full_text_read_index));
+    try std.testing.expect(!try foreignKeyPublicationIndexesValid(a, table.name, configs, seeded, "{}", 4, null));
+    var missing = table;
+    missing.full_text_read_index = "full_text_index_v2";
+    try std.testing.expectError(error.InvalidTableIndexMetadata, selectActiveFullTextIndexName(a, &missing));
+    missing.indexes_json = "{\"title\":{\"type\":\"full_text\"}}";
+    try std.testing.expectError(error.InvalidTableIndexMetadata, selectActiveFullTextIndexName(a, &missing));
+    missing.full_text_read_index = "title";
+    const named = (try selectActiveFullTextIndexName(a, &missing)).?;
+    defer a.free(named);
+    try std.testing.expectEqualStrings("title", named);
 }
 
 fn validateNamedFullTextQueryIndexes(
@@ -3455,11 +3584,12 @@ fn fullTextSchemaVersionForIndex(
         return std.fmt.parseInt(u32, index_name[prefix.len..], 10) catch null;
     }
 
-    const active_name = full_text_indexes.selectActiveFullTextIndexNameAlloc(
+    const active_name = full_text_indexes.selectPublishedFullTextIndexNameAlloc(
         alloc,
         table.schema_json,
         table.read_schema_json,
         table.indexes_json,
+        table.full_text_read_index,
     ) catch return null;
     defer if (active_name) |value| alloc.free(value);
     if (active_name == null or !std.mem.eql(u8, active_name.?, index_name)) return null;
@@ -4146,6 +4276,17 @@ fn upsertVersionedFullTextIndex(
     next_version: u32,
     pinned_incarnation: ?u64,
 ) ![]u8 {
+    return upsertVersionedFullTextIndexFromReadIndex(alloc, current_indexes_json, current_version, next_version, pinned_incarnation, null);
+}
+
+fn upsertVersionedFullTextIndexFromReadIndex(
+    alloc: std.mem.Allocator,
+    current_indexes_json: []const u8,
+    current_version: u32,
+    next_version: u32,
+    pinned_incarnation: ?u64,
+    read_index: ?[]const u8,
+) ![]u8 {
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, current_indexes_json, .{});
     defer parsed.deinit();
 
@@ -4162,7 +4303,10 @@ fn upsertVersionedFullTextIndex(
     // schema is the primary document index and may seed the next schema
     // version. Picking the first full-text config silently promotes an
     // unrelated named index when catalog insertion order changes.
-    const active_name = try selectFullTextIndexNameForVersion(alloc, current_indexes_json, current_version);
+    const active_name = if (read_index != null)
+        try full_text_indexes.selectPublishedFullTextIndexNameAlloc(alloc, "{}", "", current_indexes_json, read_index)
+    else
+        try selectFullTextIndexNameForVersion(alloc, current_indexes_json, current_version);
     defer if (active_name) |name| alloc.free(name);
     const active_config = if (active_name) |name| root.get(name) else null;
 
@@ -4224,11 +4368,12 @@ fn selectActiveFullTextIndexName(
     alloc: std.mem.Allocator,
     table: *const metadata_table_manager.TableRecord,
 ) !?[]u8 {
-    return try full_text_indexes.selectActiveFullTextIndexNameAlloc(
+    return try full_text_indexes.selectPublishedFullTextIndexNameAlloc(
         alloc,
         table.schema_json,
         table.read_schema_json,
         table.indexes_json,
+        table.full_text_read_index,
     );
 }
 
@@ -6035,10 +6180,10 @@ test "metadata.schema update preserves read schema and adds versioned full-text 
     );
     defer metadata_table_manager.freeTable(std.testing.allocator, updated);
 
-    try std.testing.expect(try foreignKeyPublicationIndexesValid(std.testing.allocator, table.name, table.indexes_json, updated.indexes_json, updated.schema_json, 1));
+    try std.testing.expect(try foreignKeyPublicationIndexesValid(std.testing.allocator, table.name, table.indexes_json, updated.indexes_json, updated.schema_json, 1, table.full_text_read_index));
     const forged = try std.fmt.allocPrint(std.testing.allocator, "{s},\"rogue\":{{\"type\":\"full_text\"}}}}", .{updated.indexes_json[0 .. updated.indexes_json.len - 1]});
     defer std.testing.allocator.free(forged);
-    try std.testing.expect(!try foreignKeyPublicationIndexesValid(std.testing.allocator, table.name, table.indexes_json, forged, updated.schema_json, 1));
+    try std.testing.expect(!try foreignKeyPublicationIndexesValid(std.testing.allocator, table.name, table.indexes_json, forged, updated.schema_json, 1, table.full_text_read_index));
 
     try std.testing.expect(std.mem.indexOf(u8, updated.schema_json, "\"version\":1") != null);
     try std.testing.expect(std.mem.indexOf(u8, updated.read_schema_json, "\"version\":0") != null);

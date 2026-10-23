@@ -20,6 +20,14 @@ pub const TableCommitRequest = contract.TableCommitRequest;
 pub const CommitConflict = contract.CommitConflict;
 pub const CommitOutcome = contract.CommitOutcome;
 pub const PreDecisionContext = contract.PreDecisionContext;
+
+/// All durable SQL/native transaction owners use this exact retained version.
+/// It is chosen before result preparation, persisted with the transaction and
+/// reused by normal commit and recovery; never reconstructed from wall time.
+pub fn commitVersion(begin_timestamp: u64) error{InvalidTxnRequest}!u64 {
+    return std.math.add(u64, begin_timestamp, 1) catch error.InvalidTxnRequest;
+}
+
 pub fn participantIdForGroup(alloc: std.mem.Allocator, table_name: []const u8, group_id: u64) ![]u8 {
     if (table_name.len > std.math.maxInt(u32)) return error.TableNameTooLong;
     return try std.fmt.allocPrint(alloc, "{s}{x:0>8}:{s}:{d}", .{ table_participant_v2_prefix, table_name.len, table_name, group_id });

@@ -22,6 +22,13 @@ pub const Digest = [32]u8;
 pub const max_source_schemas = 256;
 pub const max_schema_bytes = 4 * 1024 * 1024;
 
+/// Bound immutable scalar IR, not SQL text. Snapshot and retained-tail rows
+/// execute the same expression against the declared predecessor layout.
+pub const ColumnTransform = struct {
+    column: []const u8,
+    expression_json: []const u8,
+};
+
 pub const Intent = struct {
     version: u8 = 2,
     /// Unchanged document tables in the dependency cohort retain their exact
@@ -34,13 +41,23 @@ pub const Intent = struct {
     /// An empty list preserves every absent historical value.
     default_columns: []const []const u8 = &.{},
     allow_column_drops: bool = false,
+    expression_schema: []const u8 = "",
+    column_transforms: []const ColumnTransform = &.{},
     /// Digest of compiled semantic programs, NOT numeric schema versions.
     program_digest: Digest,
 
     pub fn validate(self: Intent) !void {
-        if (self.version != 2 or self.source_schemas.len == 0 or self.source_schemas.len > max_source_schemas or
+        if ((self.version != 2 and self.version != 3) or (self.version == 2) != (self.column_transforms.len == 0) or
+            self.source_schemas.len == 0 or self.source_schemas.len > max_source_schemas or
             self.target_schema.len == 0 or std.mem.allEqual(u8, &self.program_digest, 0)) return error.InvalidRestoreStagingCommand;
-        var bytes = self.target_schema.len +| self.target_read_schema.len;
+        var bytes = self.target_schema.len +| self.target_read_schema.len +| self.expression_schema.len;
+        if (self.column_transforms.len > 256 or (self.column_transforms.len == 0) != (self.expression_schema.len == 0)) return error.InvalidRestoreStagingCommand;
+        for (self.column_transforms, 0..) |transform, i| {
+            if (transform.column.len == 0 or transform.expression_json.len == 0) return error.InvalidRestoreStagingCommand;
+            bytes +|= transform.column.len +| transform.expression_json.len;
+            if (bytes > max_schema_bytes) return error.InvalidRestoreStagingCommand;
+            for (self.column_transforms[0..i]) |prior| if (std.mem.eql(u8, prior.column, transform.column)) return error.InvalidRestoreStagingCommand;
+        }
         for (self.source_schemas) |source| {
             if (source.len == 0) return error.InvalidRestoreStagingCommand;
             bytes = std.math.add(usize, bytes, source.len) catch return error.InvalidRestoreStagingCommand;
@@ -54,7 +71,7 @@ pub const Intent = struct {
             for (self.default_columns[0..i]) |previous| if (std.mem.eql(u8, name, previous)) return error.InvalidRestoreStagingCommand;
         }
         if (self.preserve_document) {
-            if (self.default_columns.len != 0 or self.allow_column_drops or self.source_schemas.len != @as(usize, if (self.target_read_schema.len == 0) 1 else 2)) return error.InvalidRestoreStagingCommand;
+            if (self.column_transforms.len != 0 or self.default_columns.len != 0 or self.allow_column_drops or self.source_schemas.len != @as(usize, if (self.target_read_schema.len == 0) 1 else 2)) return error.InvalidRestoreStagingCommand;
             var active = false;
             var previous = self.target_read_schema.len == 0;
             for (self.source_schemas) |definition| {
@@ -62,6 +79,18 @@ pub const Intent = struct {
             }
             if (!active or !previous) return error.InvalidRestoreStagingCommand;
         } else if (self.target_read_schema.len != 0) return error.InvalidRestoreStagingCommand;
+    }
+
+    pub fn jsonStringify(self: Intent, writer: anytype) !void {
+        try writer.beginObject();
+        inline for (@typeInfo(Intent).@"struct".field_names) |field| {
+            const include = if (comptime std.mem.eql(u8, field, "column_transforms") or std.mem.eql(u8, field, "expression_schema")) self.column_transforms.len != 0 else true;
+            if (include) {
+                try writer.objectField(field);
+                try writer.write(@field(self, field));
+            }
+        }
+        try writer.endObject();
     }
 };
 

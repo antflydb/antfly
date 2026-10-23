@@ -559,7 +559,7 @@ test "relational index system NOT VALID history survives LSM reopen and portable
             if ((try db.constraintValidationStatus()).state == .enforced) break;
             _ = try db.validateConstraintsStep(.{});
         } else return error.ConstraintValidationDidNotConverge;
-        try std.testing.expect(db.core.schema.?.requires_deferred_check_validation);
+        try std.testing.expect(db.core.schema.?.requires_deferred_constraints);
         const bytes = (try db.get(alloc, "historical")) orelse return error.MissingHistoricalRow;
         defer alloc.free(bytes);
         var row = try std.json.parseFromSlice(std.json.Value, alloc, bytes, .{});
@@ -740,6 +740,69 @@ test "relational index system expression CHECK activation records arithmetic fai
 const schema_json =
     \\{"version":1,"storage_mode":"relational","default_type":"row","column_defaults":[{"column":"b","expression":{"op":"literal","type":"integer","value":"2"}}],"generated_columns":[{"column":"doubled","expression":{"op":"multiply","args":[{"op":"column","column":"total"},{"op":"literal","type":"integer","value":"2"}]}},{"column":"total","expression":{"op":"add","args":[{"op":"column","column":"a"},{"op":"column","column":"b"}]}}],"relational_indexes":[{"name":"by_total","keys":[{"column":"total"}],"include_columns":["doubled"]}],"checks":[{"name":"positive","column":"total","op":"gt","value":"0"}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"a":{"type":"integer"},"b":{"type":["integer","null"]},"total":{"type":["integer","null"]},"doubled":{"type":["integer","null"]}},"required":["a","b","total","doubled"],"additionalProperties":false}}}}
 ;
+
+test "relational index system UUID defaults survive cold reopen and both portable restore paths without replacing historical IDs" {
+    const compiler = @import("../../sql/compiler.zig");
+    const uuid = @import("../../common/uuid.zig");
+    const portable = @import("../portable_backup.zig");
+    const identity = @import("doc_identity.zig");
+    var runtime = try @import("../background_runtime.zig").BackendRuntimeHandle.initManualWithOwnedIo(alloc);
+    defer runtime.deinit();
+    var source_directory = try @import("../../common/test_directory.zig").TestDirectory.init("uuid-default-portable-source");
+    defer source_directory.cleanup();
+    var statement = try compiler.compile(alloc, "CREATE TABLE events (id UUID NOT NULL DEFAULT uuidv7(), payload TEXT)", .{});
+    defer statement.deinit();
+    const schema_bytes = try @import("../../sql/ddl_runtime.zig").createSchemaAlloc(alloc, statement.statement.create_table);
+    defer alloc.free(schema_bytes);
+    var archive: std.ArrayListUnmanaged(u8) = .empty;
+    defer archive.deinit(alloc);
+    var expected: []u8 = &.{};
+    defer alloc.free(expected);
+    {
+        var source = try db_mod.DB.open(alloc, source_directory.path(), .{ .start_optional_runtimes = false, .backend_runtime = runtime.runtime });
+        defer source.close();
+        try source.setSchemaJson(alloc, schema_bytes);
+        try source.batch(.{ .writes = &.{.{ .key = "historical", .value = "{\"payload\":\"old\"}" }} });
+        const row = (try source.get(alloc, "historical")).?;
+        defer alloc.free(row);
+        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, row, .{});
+        defer parsed.deinit();
+        expected = try alloc.dupe(u8, parsed.value.object.get("id").?.string);
+        try std.testing.expectEqual(@as(?u4, 7), uuid.version(try uuid.parse(expected)));
+        try portable.exportPortable(alloc, source.core.store, &archive);
+    }
+    {
+        var reopened = try db_mod.DB.open(alloc, source_directory.path(), .{ .start_optional_runtimes = false, .backend_runtime = runtime.runtime });
+        defer reopened.close();
+        const row = (try reopened.get(alloc, "historical")).?;
+        defer alloc.free(row);
+        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, row, .{});
+        defer parsed.deinit();
+        try std.testing.expectEqualStrings(expected, parsed.value.object.get("id").?.string);
+    }
+    inline for (.{ false, true }) |unpublished| {
+        var directory = try @import("../../common/test_directory.zig").TestDirectory.init(if (unpublished) "uuid-default-portable-staged" else "uuid-default-portable-live");
+        defer directory.cleanup();
+        var restored = try db_mod.DB.open(alloc, directory.path(), .{ .start_optional_runtimes = false, .backend_runtime = runtime.runtime });
+        defer restored.close();
+        if (unpublished) {
+            try restored.importPortableIntoUnpublishedEmpty(alloc, archive.items, identity.default_namespace);
+        } else try restored.importPortableIntoEmpty(alloc, archive.items, identity.default_namespace);
+        const historical = (try restored.get(alloc, "historical")).?;
+        defer alloc.free(historical);
+        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, historical, .{});
+        defer parsed.deinit();
+        try std.testing.expectEqualStrings(expected, parsed.value.object.get("id").?.string);
+        try restored.batch(.{ .writes = &.{.{ .key = "resumed", .value = "{\"payload\":\"new\"}" }} });
+        const resumed = (try restored.get(alloc, "resumed")).?;
+        defer alloc.free(resumed);
+        var fresh = try std.json.parseFromSlice(std.json.Value, alloc, resumed, .{});
+        defer fresh.deinit();
+        const value = fresh.value.object.get("id").?.string;
+        try std.testing.expectEqual(@as(?u4, 7), uuid.version(try uuid.parse(value)));
+        try std.testing.expect(!std.mem.eql(u8, expected, value));
+    }
+}
 
 test "relational index system portable restore preserves generated historical rows and resumed writes" {
     const portable = @import("../portable_backup.zig");

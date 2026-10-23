@@ -143,6 +143,44 @@ fn clip(bytes: []const u8, limit: usize) []const u8 {
     return bytes[0..end];
 }
 
+/// PostgreSQL names anonymous UNIQUE constraints after all index attributes,
+/// including INCLUDE payloads. Repeated source columns get distinct physical
+/// attribute labels before the final constraint name is bounded. This is
+/// naming only: it never changes the schema's source column references.
+fn coveringNames(a: std.mem.Allocator, keys: []const []const u8, includes: std.json.Value) ![]const []const u8 {
+    if (includes == .null) return keys;
+    if (includes != .array or includes.array.items.len > 256) return error.InvalidCatalogRecord;
+    if (includes.array.items.len == 0) return keys;
+    const output = try a.alloc([]const u8, keys.len + includes.array.items.len);
+    var names: std.StringHashMapUnmanaged(void) = .empty;
+    defer names.deinit(a);
+    try names.ensureTotalCapacity(a, @intCast(output.len));
+    for (output, 0..) |*out, index| {
+        const source = if (index < keys.len) keys[index] else blk: {
+            const value = includes.array.items[index - keys.len];
+            if (value != .string) return error.InvalidCatalogRecord;
+            break :blk value.string;
+        };
+        try validate(source);
+        var buffer: [max_name_bytes]u8 = undefined;
+        var candidate = clip(source, max_name_bytes);
+        var attempt: usize = 0;
+        while (names.contains(candidate)) {
+            attempt += 1;
+            if (attempt > output.len) return error.ProgramLimitExceeded;
+            var suffix_buffer: [20]u8 = undefined;
+            const suffix = try std.fmt.bufPrint(&suffix_buffer, "{d}", .{attempt});
+            const prefix = clip(source, max_name_bytes - suffix.len);
+            @memcpy(buffer[0..prefix.len], prefix);
+            @memcpy(buffer[prefix.len..][0..suffix.len], suffix);
+            candidate = buffer[0 .. prefix.len + suffix.len];
+        }
+        out.* = try a.dupe(u8, candidate);
+        names.putAssumeCapacity(out.*, {});
+    }
+    return output;
+}
+
 /// The occupancy callback receives the naming kind: PRIMARY/UNIQUE check
 /// relation and constraint names; CHECK/FK check constraint memberships only.
 /// It must include names already visible at this statement's PostgreSQL DDL
@@ -398,6 +436,9 @@ pub const Plan = struct {
                             value.* = key.string;
                         }
                         columns = values;
+                        if (kind == .unique) if (rule.object.get("include_columns")) |includes| {
+                            columns = try coveringNames(self.a, columns, includes);
+                        };
                     }
                     const candidate = try Candidate.initKind(self.table, columns, kind);
                     const chosen = try choose(self.a, &candidate, self, self.max_attempts);
@@ -546,6 +587,27 @@ test "prepared ALTER distinguishes standalone index and existing constraint occu
         try std.testing.expectEqualStrings(case.expected, plan.admission.names[0].name);
         try plan.admission.validateSchema(a, plan.schema_json);
     }
+}
+
+fn coveringNameAllocationCase(a: std.mem.Allocator) !void {
+    for ([_]struct { includes: []const u8, expected: []const u8 }{
+        .{ .includes = "[\"label\"]", .expected = "t_id_label_key" },
+        .{ .includes = "[\"id\"]", .expected = "t_id_id1_key" },
+        .{ .includes = "[\"id\",\"id\",\"label\",\"label\"]", .expected = "t_id_id1_id2_label_label1_key" },
+    }) |case| {
+        const fragment = try std.fmt.allocPrint(a, "{{\"unique_constraints\":[{{\"name\":\"anonymous\",\"columns\":[\"id\"],\"include_columns\":{s}}}]}}", .{case.includes});
+        defer a.free(fragment);
+        var namespace: EmptyNamespace = .{};
+        var plan = try Plan.prepareAddition(a, "t", 5, "{}", fragment, &.{"anonymous"}, &namespace, 16);
+        defer plan.deinit();
+        try std.testing.expectEqualStrings(case.expected, plan.admission.names[0].name);
+        try plan.admission.validateSchema(a, plan.schema_json);
+    }
+}
+
+test "prepared covering UNIQUE names include payload attributes and disambiguate repeated columns" {
+    try coveringNameAllocationCase(std.testing.allocator);
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, coveringNameAllocationCase, .{});
 }
 
 test "prepared ALTER addition rejects replacement and multi-rule fragments" {

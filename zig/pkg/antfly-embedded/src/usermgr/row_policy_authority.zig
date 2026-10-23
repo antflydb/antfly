@@ -22,9 +22,32 @@ const std = @import("std");
 pub const ttl_seconds: i64 = 30;
 pub const maximum_token_bytes: usize = 16 * 1024;
 pub const maximum_roles: usize = 128;
+/// Private service transport only; never put principal capabilities in URLs.
+pub const principal_header = "X-Antfly-Row-Policy-Principal";
+pub const database_header = "X-Antfly-Row-Policy-Database";
 pub const maximum_name_bytes: usize = 256;
 
 pub const Access = enum { read, write };
+
+/// Deterministic, atomic mutation nonadmission. These must cross participant
+/// HTTP and replicated apply unchanged so denial cannot stall the Raft log.
+/// Missing owner keys, corruption and active-reader pressure are not denials.
+pub const MutationRejection = error{
+    Forbidden,
+    RowPolicyAuthenticationRequired,
+    RowPolicyCatalogChanged,
+    RowPolicyDenied,
+    RowPolicyMutationUnsupported,
+    RowPolicyUnsupported,
+};
+
+pub fn mutationRejection(err: anyerror) ?MutationRejection {
+    inline for (@typeInfo(MutationRejection).error_set.error_names.?) |name| {
+        const candidate = @field(MutationRejection, name);
+        if (err == candidate) return candidate;
+    }
+    return null;
+}
 
 /// Per-row command provenance carried by the private native predicate/intent
 /// envelope, covered by durable sealing and authenticated native transport.

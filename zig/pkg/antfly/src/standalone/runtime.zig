@@ -759,12 +759,15 @@ const LocalStandaloneMetadata = struct {
     initial_fk_round_mutex: std.atomic.Mutex = .unlocked,
     relation_reconciliation: @import("../metadata/standalone_relation_reconciliation.zig").Coordinator = .{},
     index_reconciliation: @import("../metadata/relational_index_worker.zig").Coordinator = .{},
+    schema_reconciliation: @import("../metadata/schema_validation_coordinator.zig").Coordinator = .{},
     /// Only private owners actually primed in this process need resident
     /// retirement. Durable terminal metadata remains the authority.
     initial_fk_primed: std.AutoHashMapUnmanaged(u64, TrackedInitialOwner) = .empty,
     metadata_incarnation: ?@import("antfly_local_sources").metadata_incarnation.MetadataClusterIncarnation = null,
     native_owner_binding: ?@import("../metadata/standalone_native_owner.zig").Binding = null,
     native_owner_lease: ?native_root_lease.Lease = null,
+    native_activation_mutex: std.Io.Mutex = .init,
+    native_reporter_ready: std.atomic.Value(bool) = .init(false),
     coordinated_lifecycle_allowed: bool = true,
     hot_standby_gate: ?antfly.db.ReplicationWriteGate = null,
     hot_standby_mirror: ?antfly.db.ReplicationAsyncEffectMirror = null,
@@ -806,6 +809,7 @@ const LocalStandaloneMetadata = struct {
         } = null,
     };
     const PersistedCatalog = struct {
+        native_checkpoint: ?@import("../storage/hot_standby/metadata_effects.zig").CheckpointArtifact = null,
         // Current HA logical seeds carry this state. Checkpoints written by
         // main omit it. This is an active restore contract, not a migration
         // promise for catalog layouts from earlier revisions of this PR.
@@ -873,7 +877,30 @@ const LocalStandaloneMetadata = struct {
         fn applyCatalog(self: *CatalogMutation, metadata: *LocalStandaloneMetadata, delta: system_catalog.Delta) !void {
             std.debug.assert(self.catalog_change == null);
             if (metadata.system_catalog_state == null) metadata.system_catalog_state = try system_catalog.MutableState.clone(metadata.alloc, .{});
+            const catalog = &metadata.system_catalog_state.?;
+            var arena = std.heap.ArenaAllocator.init(metadata.alloc);
+            defer arena.deinit();
+            const a = arena.allocator();
+            var changes = try @import("antfly_local_sources").system_catalog_settings.DatabaseChanges.init(a, delta.removes, delta.upserts, catalog.value.next_id);
+            defer changes.deinit(a);
+            var replacement: ?system_catalog.MutableState.OwnedSettings = null;
+            errdefer if (replacement) |*owned| owned.deinit();
+            if (!changes.empty()) {
+                const records = try a.dupe(@import("antfly_local_sources").system_catalog_settings.Record, catalog.value.settings);
+                var changed = false;
+                for (records) |*record| if (try changes.applyAlloc(a, record.*)) |next| {
+                    record.* = next;
+                    changed = true;
+                };
+                if (changed) replacement = try system_catalog.MutableState.cloneSettings(metadata.alloc, records);
+            }
             self.catalog_change = try metadata.system_catalog_state.?.apply(delta);
+            if (replacement) |owned| {
+                self.previous_settings = catalog.owned_settings;
+                catalog.owned_settings = owned;
+                catalog.value.settings = owned.value;
+                self.changed_settings = true;
+            }
         }
         fn applySettings(self: *CatalogMutation, metadata: *LocalStandaloneMetadata, records: []const @import("antfly_local_sources").system_catalog_settings.Record, command: @import("antfly_local_sources").system_catalog_settings.Command) !void {
             std.debug.assert(!self.changed_settings and self.catalog_change == null);
@@ -1063,6 +1090,7 @@ const LocalStandaloneMetadata = struct {
             .ptr = self,
             .vtable = &.{
                 .admin_snapshot = catalogAdminSnapshot,
+                .catalog_identity = catalogIdentity,
                 .export_catalog = exportCatalog,
                 .free_admin_snapshot = catalogFreeAdminSnapshot,
                 .acquire_routing_generation = acquireRoutingGeneration,
@@ -1076,6 +1104,20 @@ const LocalStandaloneMetadata = struct {
         };
     }
 
+    /// Read the durable identity independently of the in-memory table projection.
+    /// Recovery admission must never infer a metadata incarnation from a root,
+    /// cached table, or caller-supplied preparation request.
+    fn catalogIdentity(ptr: *anyopaque) !antfly.metadata_api.CatalogIdentity {
+        const self: *LocalStandaloneMetadata = @ptrCast(@alignCast(ptr));
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+        const store = self.lifecycle_store orelse return error.MetadataIncarnationUnavailable;
+        return .{
+            .metadata_group_id = group_ids.main_metadata_group_id,
+            .metadata_incarnation = (try store.getMetadataIncarnation(group_ids.main_metadata_group_id)) orelse return error.MetadataIncarnationUnavailable,
+        };
+    }
+
     fn statusSource(self: *LocalStandaloneMetadata) antfly.public_api.http_server.StatusSource {
         return if (self.lifecycle_store != null) self.statusSourceForLifecycle(true) else self.statusSourceForLifecycle(false);
     }
@@ -1083,13 +1125,14 @@ const LocalStandaloneMetadata = struct {
     fn statusSourceForLifecycle(self: *LocalStandaloneMetadata, comptime durable: bool) antfly.public_api.http_server.StatusSource {
         return .{
             .ptr = self,
-            .standalone_hot_standby = if (self.lifecycle_store != null) .{ .ptr = self, .vtable = &.{ .bind_mirror = bindHotStandbyMetadata, .apply_record = applyHotStandbyMetadata, .prepare_checkpoint = prepareHotStandbyMetadataCheckpoint, .capture_checkpoint = captureHotStandbyMetadataCheckpoint, .capture_private = captureHotStandbyPrivateMetadata } } else null,
+            .standalone_hot_standby = if (self.lifecycle_store != null) .{ .ptr = self, .vtable = &.{ .bind_mirror = bindHotStandbyMetadata, .apply_record = applyHotStandbyMetadata, .prepare_checkpoint = prepareHotStandbyMetadataCheckpoint, .capture_checkpoint = captureHotStandbyMetadataCheckpoint, .capture_catalog_checkpoint = captureHotStandbyCatalogCheckpoint, .capture_private = captureHotStandbyPrivateMetadata } } else null,
             .routing = self.catalogSource().routingSource() catch unreachable,
             .vtable = &.{
                 .status = status,
                 .system_catalog = systemCatalog,
                 .supports_query_definitions = true,
                 .supports_sql_views = durable,
+                .supports_sql_sequences = durable,
                 .supports_resolver_catalog_read = true,
                 .supports_object_tables = true,
                 .acquire_join_planning = acquireJoinPlanning,
@@ -1209,6 +1252,18 @@ const LocalStandaloneMetadata = struct {
         const artifact = try (self.lifecycle_store orelse return error.UnsupportedOperation).exportHotStandbyCheckpoint(io, path);
         return .{ .size_bytes = artifact.size_bytes, .sha256 = artifact.sha256 };
     }
+    fn captureHotStandbyCatalogCheckpoint(ptr: *anyopaque, alloc: std.mem.Allocator, _: std.Io, path: []const u8) !@import("../api/standalone_hot_standby.zig").CatalogCheckpoint {
+        const self: *LocalStandaloneMetadata = @ptrCast(@alignCast(ptr));
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+        // Private-owner capture checks the local projected epoch next. A
+        // durable control write may have invalidated that cache; never pair
+        // a current native cut with a stale in-memory authority head.
+        try self.refreshLifecycleProjectionLocked();
+        const io = self.backend_runtime.filesystemIo() orelse return error.UnsupportedOperation;
+        return (self.lifecycle_store orelse return error.UnsupportedOperation).captureHotStandbyCatalogCheckpoint(alloc, io, group_ids.main_metadata_group_id, path);
+    }
+
     fn captureHotStandbyPrivateMetadata(ptr: *anyopaque, alloc: std.mem.Allocator, expected_epoch: u64) !?std.json.Parsed(Staging.ProvisioningProjection) {
         const self: *LocalStandaloneMetadata = @ptrCast(@alignCast(ptr));
         lockAtomic(&self.mutex);
@@ -2144,6 +2199,13 @@ const LocalStandaloneMetadata = struct {
         return if (self.system_catalog_state) |state| state.value else .{};
     }
 
+    fn settingDatabaseId(self: *const LocalStandaloneMetadata, name: []const u8) ?u64 {
+        if (self.system_catalog_state) |*catalog| {
+            return if (catalog.index.find(.database, 0, name)) |database| database.id else null;
+        }
+        return if (std.mem.eql(u8, name, system_catalog.default_database_name)) system_catalog.default_database_id else null;
+    }
+
     /// The metadata journal and owner LSM must use the same whole-instance HA
     /// log. An unbound or read-only standby must never acknowledge a phase.
     fn localPolicyPublicationSupported(self: *const LocalStandaloneMetadata) bool {
@@ -2181,7 +2243,11 @@ const LocalStandaloneMetadata = struct {
     fn physicalNativeOwnerBinding(self: *LocalStandaloneMetadata) !@import("../metadata/standalone_native_owner.zig").Binding {
         const identity = @import("antfly_local_sources").storage_db_root_identity;
         const io = self.backend_runtime.filesystemIo() orelse return error.MissingBackendRuntimeIo;
-        const root = if (self.native_owner_binding == null)
+        const admitted = self.native_owner_binding orelse if (self.lifecycle_store) |store|
+            try store.standaloneNativeOwnerBinding(group_ids.main_metadata_group_id)
+        else
+            null;
+        const root = if (admitted == null)
             try identity.loadOrCreate(self.alloc, io, self.replica_root_dir)
         else
             try identity.load(self.alloc, io, self.replica_root_dir);
@@ -2192,24 +2258,16 @@ const LocalStandaloneMetadata = struct {
             .root_incarnation = root.incarnation,
         };
         try binding.validate();
-        if (self.native_owner_binding) |admitted| if (!admitted.eql(binding)) return error.StoreRootEnrollmentChanged;
+        if (admitted) |retained| if (!retained.eql(binding)) return error.StoreRootEnrollmentChanged;
         return binding;
     }
 
     fn nativeOwnerBindingRequiredOnOpen(self: *LocalStandaloneMetadata) !bool {
         if (self.storage_engine != .lite) return true;
-        // Plain Lite files must remain self-contained. Bind directory-owned
-        // FK authority only when a publication actually requests it. Existing
-        // bindings still require the original physical root on every reopen.
-        const store = self.catalog_store orelse return error.MissingCatalogStore;
-        var txn = try store.beginRead();
-        defer txn.abort();
-        var key_buf: [160]u8 = undefined;
-        _ = txn.get(try @import("../metadata/standalone_native_owner.zig").key(&key_buf, group_ids.main_metadata_group_id)) catch |err| switch (err) {
-            error.NotFound => return false,
-            else => return err,
-        };
-        return true;
+        // A plain Lite file remains self-contained until native ownership is
+        // explicitly admitted. Reopens must honor an existing durable binding.
+        const store = self.lifecycle_store orelse return error.MissingCatalogStore;
+        return try store.standaloneNativeOwnerBinding(group_ids.main_metadata_group_id) != null;
     }
 
     /// Schema cleanup may use FK publication authority already acquired by
@@ -2233,10 +2291,14 @@ const LocalStandaloneMetadata = struct {
         const binding = try self.physicalNativeOwnerBinding();
         if (self.native_owner_binding == null) {
             const store = self.lifecycle_store orelse return error.UnsupportedOperation;
-            try store.updateStandaloneCatalog(group_ids.main_metadata_group_id, self.durable_revision, .{ .native_owner = binding });
+            if (try store.standaloneNativeOwnerBinding(group_ids.main_metadata_group_id)) |retained| {
+                if (!retained.eql(binding)) return error.StoreRootEnrollmentChanged;
+            } else {
+                try store.updateStandaloneCatalog(group_ids.main_metadata_group_id, self.durable_revision, .{ .native_owner = binding });
+                self.durable_revision += 1;
+                self.epoch = self.durable_revision;
+            }
             self.native_owner_binding = binding;
-            self.durable_revision += 1;
-            self.epoch = self.durable_revision;
         }
         return binding;
     }
@@ -2256,6 +2318,142 @@ const LocalStandaloneMetadata = struct {
             error.StandaloneRootLeaseChanged => return error.StoreRootEnrollmentChanged,
             else => return err,
         };
+    }
+
+    /// A root is activated once per process under its exclusive physical lease.
+    /// Each durable retirement turn releases the catalog lock before yielding.
+    /// A new process finishes a predecessor's frozen cursor before signing its
+    /// own reporter preimage; it never adopts the predecessor's process ID.
+    fn activateNativeReporter(self: *LocalStandaloneMetadata, context: antfly.public_api.operation.RequestContext, cancellation: ?antfly.common.runtime_lifecycle.CancellationToken) !void {
+        if (self.native_reporter_ready.load(.acquire)) return;
+        const io = self.backend_runtime.apiIo() orelse return error.MissingBackendRuntimeIo;
+        if (cancellation == null) {
+            // Internal API workers retry pending native activation rather than
+            // occupying a request lane behind another startup/recovery turn.
+            if (!self.native_activation_mutex.tryLock()) return error.IndexBuildPending;
+        } else try self.native_activation_mutex.lock(io);
+        defer self.native_activation_mutex.unlock(io);
+        if (self.native_reporter_ready.load(.acquire)) return;
+        if (!self.localFkPublicationSupported()) return error.UnsupportedNativeIndexOwner;
+        try self.requireNativeIndexLease();
+        const store = self.lifecycle_store.?;
+        while (try store.nativeReporterRestartProgress(group_ids.main_metadata_group_id, self.store_id)) |progress| {
+            if (!progress.request.binding().eql(try self.physicalNativeOwnerBinding())) return error.StoreRootEnrollmentChanged;
+            try self.applyNativeRestartStep(.{ .request = progress.request, .progress = progress.digest }, context, cancellation);
+            try io.sleep(.fromNanoseconds(1), .awake);
+        }
+        try context.ensureActive();
+        if (cancellation) |token| try token.check();
+        try store.flushHotStandbyOutbox();
+        const prepared = try self.prepareNativeReporterRestart();
+        try self.applyNativeRestartStep(.{ .request = prepared.request, .expected = prepared.observation }, context, cancellation);
+        while (try store.nativeReporterRestartProgress(group_ids.main_metadata_group_id, self.store_id)) |progress| {
+            try self.applyNativeRestartStep(.{ .request = progress.request, .progress = progress.digest }, context, cancellation);
+            try io.sleep(.fromNanoseconds(1), .awake);
+        }
+        try self.requireNativeIndexLease();
+        const enrollment = try self.data_server.?.prepareNativeRootEnrollment(prepared.request);
+        const enrollment_bytes = try std.json.Stringify.valueAlloc(self.alloc, enrollment, .{});
+        defer self.alloc.free(enrollment_bytes);
+        {
+            var locked = try self.lockMutation();
+            defer locked.deinit();
+            try context.ensureActive();
+            if (cancellation) |token| try token.check();
+            const checked = try store.storeRootControlJson(self.alloc, group_ids.main_metadata_group_id, .{ .preflight_enrollment = enrollment });
+            self.alloc.free(checked);
+            store.applyStandaloneCommand(group_ids.main_metadata_group_id, .{ .apply_store_root_enrollment = enrollment_bytes }) catch |err| {
+                try self.refreshLifecycleProjectionLocked();
+                return err;
+            };
+            try self.refreshLifecycleProjectionLocked();
+        }
+        const observed = try store.observeStandaloneNativeReporter(group_ids.main_metadata_group_id, prepared.request);
+        if (!observed.reporter_matches or !observed.root_enrolled) return error.StoreRootEnrollmentChanged;
+        const header = (try store.readStore(self.alloc, group_ids.main_metadata_group_id, self.store_id, false)) orelse return error.StoreRegistrationRequired;
+        defer antfly.metadata.table_manager.freeStore(self.alloc, header);
+        if (!header.live or !std.meta.eql(header.schema_reader, prepared.request.schema_reader)) return error.StoreRootEnrollmentChanged;
+        try self.requireNativeIndexLease();
+        self.native_reporter_ready.store(true, .release);
+    }
+
+    fn nativeOwnerReportPort(self: *LocalStandaloneMetadata) antfly.data.runtime.NativeOwnerReportPort {
+        return .{ .ptr = self, .publish_fn = publishNativeOwnerReport };
+    }
+
+    fn publishNativeOwnerReport(ptr: *anyopaque, registration: @import("../metadata/standalone_native_owner.zig").Registration, runtime: antfly.metadata.RuntimeGroupStatusReport, context: antfly.public_api.operation.RequestContext) !void {
+        const self: *LocalStandaloneMetadata = @ptrCast(@alignCast(ptr));
+        try context.ensureActive();
+        if (!self.standaloneRelationPublicationSupported() or !self.native_reporter_ready.load(.acquire)) return error.CatalogPublicationProofPending;
+        try self.requireNativeIndexLease();
+        var locked = try self.lockMutation();
+        defer locked.deinit();
+        const store = self.lifecycle_store orelse return error.UnsupportedNativeIndexOwner;
+        const observed = try store.observeStandaloneNativeReporter(group_ids.main_metadata_group_id, registration);
+        if (!observed.reporter_matches or !observed.root_enrolled) return error.StoreRootEnrollmentChanged;
+        if (runtime.store_id != registration.identity.store_id or runtime.node_id != registration.identity.node_id or runtime.group_id == 0 or runtime.table_id == 0) return error.IndexOwnerReceiptChanged;
+        const authority = runtime.source_authority orelse return error.IndexOwnerReceiptChanged;
+        if (authority.kind != .native or std.mem.readInt(u64, authority.namespace[0..8], .big) != runtime.table_id) return error.IndexOwnerReceiptChanged;
+        const range = self.manager.ranges.get(runtime.group_id) orelse return error.IndexOwnerReceiptChanged;
+        const table = self.manager.tables.get(runtime.table_id) orelse return error.IndexOwnerReceiptChanged;
+        const namespace: @import("antfly_local_sources").storage_db_doc_identity_namespace.Namespace = .{
+            .table_id = range.table_id,
+            .shard_id = antfly.metadata.table_manager.rangeDocIdentityShardId(range),
+            .range_id = antfly.metadata.table_manager.rangeDocIdentityRangeId(range),
+        };
+        if (range.table_id != runtime.table_id or !std.mem.eql(u8, table.name, runtime.table_name) or
+            !std.mem.eql(u8, &authority.namespace, &@import("antfly_local_sources").storage_db_online_source_contract.namespaceBytes(namespace))) return error.IndexOwnerReceiptChanged;
+        const reports = @import("../metadata/store_report_update.zig");
+        const physical = @import("../metadata/storage/raft_apply_store.zig");
+        const header = (try store.readStore(self.alloc, group_ids.main_metadata_group_id, registration.identity.store_id, false)) orelse return error.StoreRootEnrollmentChanged;
+        defer antfly.metadata.table_manager.freeStore(self.alloc, header);
+        const base = try store.reportCursor(group_ids.main_metadata_group_id, header.store_id);
+        const sequence = try std.math.add(u64, if (base) |value| value.sequence else 0, 1);
+        var report = reports.asReport(header);
+        report.status_generation = try std.math.add(u64, header.status_generation, 1);
+        report.embedding_activity_protocol_version = antfly.metadata.table_manager.embedding_activity_protocol_version;
+        report.embedding_activity_sequence = sequence;
+        report.group_statuses = &.{};
+        report.runtime_statuses = @constCast(&[_]antfly.metadata.RuntimeGroupStatusReport{runtime});
+        const update: reports.Update = .{ .sequence = sequence, .base = base, .report = report };
+        if (base != null) {
+            // Existing sparse-report lookup reads only this group's directory
+            // slot. Idle recovery turns must not append identical observations
+            // or invalidate catalog projections under sustained owner churn.
+            const previous = (try store.readStoreReportTargets(self.alloc, group_ids.main_metadata_group_id, update)) orelse return error.StoreRootEnrollmentChanged;
+            defer antfly.metadata.table_manager.freeStore(self.alloc, previous);
+            if (previous.runtime_statuses.len == 1 and @import("../metadata/store_observer.zig").runtimeStatusEqual(previous.runtime_statuses[0], runtime, true)) return;
+        }
+        try update.validate(self.alloc);
+        const wire = try std.json.Stringify.valueAlloc(self.alloc, update, .{});
+        defer self.alloc.free(wire);
+        var digest: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(wire, &digest, .{});
+        const command = try physical.encodeStoreReportUpdate(self.alloc, .{ .update = update, .request_digest = digest, .expected_header = try physical.RaftApplyStore.reportHeaderDigest(self.alloc, header), .admission_cursor = base });
+        defer self.alloc.free(command);
+        store.applyStandaloneCommand(group_ids.main_metadata_group_id, .{ .apply_store_report_update = command }) catch |err| {
+            try self.refreshLifecycleProjectionLocked();
+            return err;
+        };
+        try self.refreshLifecycleProjectionLocked();
+        const accepted = (try store.reportCursor(group_ids.main_metadata_group_id, header.store_id)) orelse return error.StoreReportBaseMismatch;
+        if (accepted.reporter_incarnation != registration.reporter_incarnation or accepted.sequence != sequence or !std.mem.eql(u8, &accepted.digest, &digest)) return error.StoreReportBaseMismatch;
+    }
+
+    fn applyNativeRestartStep(self: *LocalStandaloneMetadata, command: @import("../metadata/standalone_native_owner.zig").Restart, context: antfly.public_api.operation.RequestContext, cancellation: ?antfly.common.runtime_lifecycle.CancellationToken) !void {
+        try context.ensureActive();
+        if (cancellation) |token| try token.check();
+        try self.requireNativeIndexLease();
+        var locked = try self.lockMutation();
+        defer locked.deinit();
+        const store = self.lifecycle_store orelse return error.UnsupportedNativeIndexOwner;
+        store.updateStandaloneCatalog(group_ids.main_metadata_group_id, self.durable_revision, .{ .native_restart = command }) catch |err| {
+            // The projection revision distinguishes committed control progress
+            // from a visible catalog edit, including an unknown append outcome.
+            try self.refreshLifecycleProjectionLocked();
+            return err;
+        };
+        try self.refreshLifecycleProjectionLocked();
     }
 
     const NativeReporterRestartPlan = struct {
@@ -2677,7 +2875,14 @@ const LocalStandaloneMetadata = struct {
         const self: *LocalStandaloneMetadata = @ptrCast(@alignCast(ptr));
         try context.ensureActive();
         if (call.isRelationalIndexOwnerCall() and !context.index_publication_authority) return error.Forbidden;
-        if (call == .relational_index_owner_decision) try self.requireNativeIndexLease();
+        if (call.isSchemaValidationCall() and !context.schema_validation_authority) return error.Forbidden;
+        if (call.isSchemaValidationCall() and call.requiresAdministrativeGrant() and !context.setting_admin) return error.Forbidden;
+        // Both protocols authorize physical work under the same native root
+        // writer lease, independently of their distinct body-bound grants.
+        if (call == .relational_index_owner_decision or call == .schema_validation_prepare or call == .schema_validation_owner_read or call == .schema_validation_submit) {
+            try self.requireNativeIndexLease();
+            if (self.data_server != null) try self.activateNativeReporter(context, null);
+        }
         if (call == .relational_index_begin) return self.beginRelationalIndexPublication(alloc, context, call.relational_index_begin);
         if ((call == .relational_index_status or call == .relational_index_prepare) and !context.setting_admin) return error.Forbidden;
         if ((call == .store_root_enroll or call == .store_root_enrollment_status) and !context.setting_admin) return error.Forbidden;
@@ -2694,9 +2899,9 @@ const LocalStandaloneMetadata = struct {
             try mutateLakeIndexLifecycle(ptr, write.table_id, write.expected_revision, write.mutation, context);
             return alloc.dupe(u8, "{}");
         }
-        const shared_catalog_mutation = call == .sql_view_mutate or call == .mutate or call == .setting_mutate or call == .policy_definition_mutate or
+        const shared_catalog_mutation = call == .sql_view_mutate or call == .sql_sequence_mutate or call == .mutate or call == .setting_mutate or call == .policy_definition_mutate or
             call == .policy_publication_begin or call == .policy_publication_mutate or
-            call == .fk_initial_create_begin or call == .fk_initial_create_mutate or call == .relational_index_owner_ack or call == .relational_index_publish_decide or call == .relational_index_cancel or call == .store_root_enroll;
+            call == .schema_validation_submit or call == .fk_initial_create_begin or call == .fk_initial_create_mutate or call == .relational_index_owner_ack or call == .relational_index_publish_decide or call == .relational_index_cancel or call == .store_root_enroll;
         if (shared_catalog_mutation) if (self.hot_standby_catalog_server) |server| {
             try server.hot_standby_public_gate_state.checkWrite(server.hot_standby_public_gate_state.currentGeneration());
         };
@@ -2732,6 +2937,71 @@ const LocalStandaloneMetadata = struct {
             .relational_index_owner_decision => |request| {
                 const store = self.lifecycle_store orelse return error.UnsupportedOperation;
                 return store.relationalIndexOwnerDecisionJson(alloc, group_ids.main_metadata_group_id, request);
+            },
+            .schema_validation_work => |request| {
+                const store = self.lifecycle_store orelse return error.UnsupportedOperation;
+                return store.schemaValidationWork(alloc, group_ids.main_metadata_group_id, request);
+            },
+            .schema_validation_status => |request| {
+                const store = self.lifecycle_store orelse return error.UnsupportedOperation;
+                return store.schemaValidationStatusJson(alloc, group_ids.main_metadata_group_id, request);
+            },
+            .schema_validation_prepare => |request| {
+                const store = self.lifecycle_store orelse return error.UnsupportedOperation;
+                return store.schemaValidationPrepareCut(alloc, group_ids.main_metadata_group_id, request);
+            },
+            .schema_validation_discover => |request| {
+                const store = self.lifecycle_store orelse return error.UnsupportedOperation;
+                return store.schemaValidationDiscover(alloc, group_ids.main_metadata_group_id, request);
+            },
+            .schema_validation_owner_read => |request| {
+                try request.validate();
+                const store = self.lifecycle_store orelse return error.UnsupportedOperation;
+                return store.schemaValidationOwnerRead(alloc, group_ids.main_metadata_group_id, request);
+            },
+            .schema_validation_submit => |command| {
+                const receipts = @import("../metadata/schema_validation_receipt.zig");
+                const store = self.lifecycle_store orelse return error.UnsupportedOperation;
+                const checked = try store.schemaValidationPreflightJson(alloc, group_ids.main_metadata_group_id, command);
+                defer alloc.free(checked);
+                var expected = try std.json.parseFromSlice(receipts.Request, alloc, checked, .{});
+                defer expected.deinit();
+                try expected.value.validate();
+                const prior = try store.schemaValidationReceiptJson(alloc, group_ids.main_metadata_group_id, expected.value);
+                var prior_owned = true;
+                defer if (prior_owned) alloc.free(prior);
+                var old = try std.json.parseFromSlice(receipts.Observation, alloc, prior, .{});
+                defer old.deinit();
+                if (try old.value.isAcknowledged(expected.value)) {
+                    prior_owned = false;
+                    return prior;
+                }
+                try context.ensureActive();
+                const previous = self.durable_revision;
+                store.applyStandaloneCommand(group_ids.main_metadata_group_id, .{ .apply_schema_validation = command }) catch return error.MetadataMutationOutcomeUnknown;
+                const revision = store.standaloneRevision() catch return error.MetadataMutationOutcomeUnknown;
+                if (previous != 0 and previous != std.math.maxInt(u64) and revision == previous + 1) {
+                    // ACKs and barriers do not change catalog descriptors. Only
+                    // publication fetches the one changed table; never scan all
+                    // tables for each owner ACK in a large cohort.
+                    if (expected.value.expected == .publication) {
+                        const table = (store.getTable(alloc, group_ids.main_metadata_group_id, expected.value.lookup.table) catch return error.MetadataMutationOutcomeUnknown) orelse return error.MetadataMutationOutcomeUnknown;
+                        defer antfly.metadata.table_manager.freeTable(alloc, table);
+                        self.manager.upsertTable(table) catch return error.MetadataMutationOutcomeUnknown;
+                    }
+                    self.epoch = revision;
+                    self.durable_revision = revision;
+                } else self.reloadLifecycleProjectionLocked() catch return error.MetadataMutationOutcomeUnknown;
+                const accepted = store.schemaValidationReceiptJson(alloc, group_ids.main_metadata_group_id, expected.value) catch return error.MetadataMutationOutcomeUnknown;
+                errdefer alloc.free(accepted);
+                var observed = std.json.parseFromSlice(receipts.Observation, alloc, accepted, .{}) catch return error.MetadataMutationOutcomeUnknown;
+                defer observed.deinit();
+                if (!(observed.value.isAcknowledged(expected.value) catch return error.MetadataMutationOutcomeUnknown)) return error.MetadataMutationOutcomeUnknown;
+                return accepted;
+            },
+            .schema_validation_receipt_read => |request| {
+                const store = self.lifecycle_store orelse return error.UnsupportedOperation;
+                return store.schemaValidationReceiptJson(alloc, group_ids.main_metadata_group_id, request);
             },
             .relational_index_owner_ack_status => |request| {
                 const store = self.lifecycle_store orelse return error.UnsupportedOperation;
@@ -3128,10 +3398,13 @@ const LocalStandaloneMetadata = struct {
                 if (scope.principal.len == 0 or scope.database.len == 0) return error.InvalidSettingRecord;
                 if (context.principal != null) if (!std.mem.eql(u8, context.setting_read_principal orelse return error.Forbidden, scope.principal)) return error.Forbidden;
                 const state = self.systemCatalogState();
-                const definitions = try alloc.alloc(settings.Definition, state.settings.len);
-                defer alloc.free(definitions);
-                for (state.settings, definitions) |record, *definition| definition.* = record.effective(scope.principal, scope.database);
-                return std.json.Stringify.valueAlloc(alloc, settings.Snapshot{ .scope = scope, .epoch = @max(1, state.revision), .definitions = definitions }, .{});
+                var setting_arena = std.heap.ArenaAllocator.init(alloc);
+                defer setting_arena.deinit();
+                const definitions = try setting_arena.allocator().alloc(settings.Definition, state.settings.len);
+                var bound = scope;
+                bound.database_id = self.settingDatabaseId(scope.database);
+                for (state.settings, definitions) |record, *definition| definition.* = try record.effectiveAlloc(setting_arena.allocator(), bound);
+                return std.json.Stringify.valueAlloc(alloc, settings.Snapshot.init(bound, @max(1, state.revision), definitions), .{});
             },
             .policy_snapshot => |request| {
                 if (request.table_id == 0 or request.principal.len == 0 or request.database.len == 0) return error.InvalidRowPolicyRecord;
@@ -3157,6 +3430,7 @@ const LocalStandaloneMetadata = struct {
                             prior_index = i;
                             break;
                         };
+                        if (!settings.databaseBindingsRetained(input.role_defaults, if (prior_index) |i| records.items[i] else null)) return error.InvalidSettingRecord;
                         if (prior_index) |i| if (input.matches(records.items[i])) return std.json.Stringify.valueAlloc(alloc, system_catalog.Meta{ .revision = state.revision, .next_id = state.next_id }, .{});
                         const identity: settings.Identity = if (prior_index) |i| .{ .id = records.items[i].identity.id, .generation = try std.math.add(u64, records.items[i].identity.generation, 1) } else .{ .id = state.next_id, .generation = 1 };
                         const record = input.record(identity);
@@ -3172,6 +3446,30 @@ const LocalStandaloneMetadata = struct {
                         command.change = .{ .drop = records.items[prior_index].identity };
                         _ = records.orderedRemove(prior_index);
                     },
+                    .role_default => |change| {
+                        try change.validate();
+                        var bound_change = change;
+                        bound_change.database_id = null;
+                        if (change.database.len != 0) {
+                            bound_change.database_id = self.settingDatabaseId(change.database) orelse return error.DatabaseNotFound;
+                        }
+                        const index: ?usize = for (records.items, 0..) |record, i| {
+                            if (std.ascii.eqlIgnoreCase(record.name, change.name)) break i;
+                        } else null;
+                        const prior = if (index) |i| records.items[i] else blk: {
+                            const native_input = settings.builtinInput(change.name) orelse return error.UnknownSetting;
+                            if (change.value == null) return std.json.Stringify.valueAlloc(alloc, system_catalog.Meta{ .revision = state.revision, .next_id = state.next_id }, .{});
+                            break :blk native_input.record(.{ .id = state.next_id, .generation = 1 });
+                        };
+                        var next = prior;
+                        next.role_defaults = try bound_change.applyAlloc(a, prior);
+                        const input: settings.Input = .{ .name = prior.name, .kind = prior.kind, .policy_sensitive = prior.policy_sensitive, .session_writable = prior.session_writable, .default = prior.default, .database_defaults = prior.database_defaults, .role_defaults = next.role_defaults };
+                        if (input.matches(prior)) return std.json.Stringify.valueAlloc(alloc, system_catalog.Meta{ .revision = state.revision, .next_id = state.next_id }, .{});
+                        try next.validate();
+                        if (index) |i| records.items[i] = next else try records.append(a, next);
+                        command.change = .{ .put = next };
+                        command.role_defaults_only = true;
+                    },
                 }
                 const encoded = try std.json.Stringify.valueAlloc(a, command, .{});
                 if (encoded.len > system_catalog.max_command_bytes) return error.CatalogCommandTooLarge;
@@ -3186,6 +3484,17 @@ const LocalStandaloneMetadata = struct {
             },
             .table_status, .list_tables => unreachable,
             .export_snapshot => {
+                // Admission history survives DROP of the last sequence, and
+                // is not part of the in-memory logical resource projection.
+                // Do not bypass the native portable-state guard just because
+                // there are no policy publications (or no live sequences).
+                if (self.lifecycle_store) |store| {
+                    const native = try store.systemCatalogMeta(alloc, group_ids.main_metadata_group_id);
+                    if (native.sequence_outcome_head != null)
+                        return store.exportSystemCatalog(alloc, group_ids.main_metadata_group_id);
+                }
+                for (self.systemCatalogState().resources) |resource|
+                    if (resource.kind == .sequence) return error.SequenceCatalogStateRequired;
                 if (self.systemCatalogState().policy_publications.len != 0) {
                     if (self.lifecycle_store) |store|
                         return store.exportSystemCatalog(alloc, group_ids.main_metadata_group_id);
@@ -3270,6 +3579,74 @@ const LocalStandaloneMetadata = struct {
                 }
                 return std.json.Stringify.valueAlloc(alloc, system_catalog.ResolvedMany{ .revision = revision, .tables = tables, .logical_names = names }, .{});
             },
+            .sql_sequence_prepare => {
+                if (!context.setting_admin) return error.Forbidden;
+                if (!self.standaloneRelationPublicationSupported()) return error.UnsupportedSqlExecution;
+                const store = self.lifecycle_store orelse return error.UnsupportedSqlExecution;
+                const activation = (try store.topologyActivation(group_ids.main_metadata_group_id)) orelse return error.TableTopologyProtocolUpgradeRequired;
+                if (activation.version < @import("../metadata/topology_protocol.zig").sql_sequence_catalog_version) return error.TableTopologyProtocolUpgradeRequired;
+                return alloc.dupe(u8, "null");
+            },
+            .sql_sequence_admission_head => {
+                if (!context.setting_admin) return error.Forbidden;
+                const store = self.lifecycle_store orelse return error.UnsupportedSqlExecution;
+                return std.json.Stringify.valueAlloc(alloc, try store.sqlSequenceAdmissionHead(group_ids.main_metadata_group_id), .{});
+            },
+            .sql_sequence_snapshot => |request| {
+                if (!context.setting_admin) return error.Forbidden;
+                const store = self.lifecycle_store orelse return error.UnsupportedSqlExecution;
+                return store.sqlSequenceSnapshot(alloc, group_ids.main_metadata_group_id, request, context);
+            },
+            .sql_sequence_counter_outcome => |request| {
+                if (!context.setting_admin) return error.Forbidden;
+                try request.validate();
+                const store = self.lifecycle_store orelse return error.UnsupportedSqlExecution;
+                return std.json.Stringify.valueAlloc(alloc, try store.sqlSequenceCounterOutcome(alloc, group_ids.main_metadata_group_id, request), .{});
+            },
+            .sql_sequence_counter_mutate => |request| {
+                const sequence = @import("../system_catalog/sequence_catalog.zig");
+                if (!context.setting_admin) return error.Forbidden;
+                try request.validate();
+                const store = self.lifecycle_store orelse return error.UnsupportedSqlExecution;
+                switch (try store.sqlSequenceCounterPreflight(alloc, group_ids.main_metadata_group_id, request)) {
+                    .unknown => return error.MetadataMutationOutcomeUnknown,
+                    .applied => |value| return std.json.Stringify.valueAlloc(alloc, sequence.CounterOutcome{ .success = value }, .{}) catch error.MetadataMutationOutcomeUnknown,
+                    .rejected => |value| return std.json.Stringify.valueAlloc(alloc, sequence.CounterOutcome{ .rejected = value }, .{}),
+                    .ready => {},
+                }
+                const bytes = try std.json.Stringify.valueAlloc(alloc, request, .{});
+                defer alloc.free(bytes);
+                try context.ensureActive();
+                const prior_revision = self.durable_revision;
+                store.applyStandaloneCommand(group_ids.main_metadata_group_id, .{ .apply_sql_sequence_counter = bytes }) catch return error.MetadataMutationOutcomeUnknown;
+                // Counter-only commits must not invalidate routing/schema views.
+                const revision = store.standaloneRevisionState() catch return error.MetadataMutationOutcomeUnknown;
+                if (revision.projection_revision <= prior_revision) self.durable_revision = revision.revision else self.refreshLifecycleProjectionLocked() catch return error.MetadataMutationOutcomeUnknown;
+                const outcome = (store.sqlSequenceCounterOutcome(alloc, group_ids.main_metadata_group_id, request) catch return error.MetadataMutationOutcomeUnknown) orelse return error.MetadataMutationOutcomeUnknown;
+                return std.json.Stringify.valueAlloc(alloc, outcome, .{}) catch error.MetadataMutationOutcomeUnknown;
+            },
+            .sql_sequence_outcome => |request| {
+                if (!context.setting_admin) return error.Forbidden;
+                try request.validate();
+                const store = self.lifecycle_store orelse return error.UnsupportedSqlExecution;
+                return std.json.Stringify.valueAlloc(alloc, try store.sqlSequenceOutcome(alloc, group_ids.main_metadata_group_id, request), .{});
+            },
+            .sql_sequence_mutate => |request| {
+                if (!context.setting_admin) return error.Forbidden;
+                try request.validate();
+                const store = self.lifecycle_store orelse return error.UnsupportedSqlExecution;
+                if (!self.standaloneRelationPublicationSupported()) return error.UnsupportedSqlExecution;
+                const preview = try store.sqlSequencePreflight(alloc, group_ids.main_metadata_group_id, request);
+                if (preview == .rejected) return std.json.Stringify.valueAlloc(alloc, preview, .{});
+                const bytes = try std.json.Stringify.valueAlloc(alloc, @import("../system_catalog/sequence_catalog.zig").command(request), .{});
+                defer alloc.free(bytes);
+                if (bytes.len > system_catalog.max_command_bytes) return error.CatalogCommandTooLarge;
+                try context.ensureActive();
+                store.applyStandaloneCommand(group_ids.main_metadata_group_id, .{ .apply_system_catalog = bytes }) catch return error.MetadataMutationOutcomeUnknown;
+                self.reloadLifecycleProjectionLocked() catch return error.MetadataMutationOutcomeUnknown;
+                const outcome = store.sqlSequenceOutcome(alloc, group_ids.main_metadata_group_id, request) catch return error.MetadataMutationOutcomeUnknown;
+                return std.json.Stringify.valueAlloc(alloc, outcome, .{}) catch error.MetadataMutationOutcomeUnknown;
+            },
             .sql_view_mutate => |request| {
                 if (!context.setting_admin) return error.Forbidden;
                 try request.mutation.validate();
@@ -3303,6 +3680,20 @@ const LocalStandaloneMetadata = struct {
                 if (try antfly.public_api.tables.schemaVersion(before.schema_json) != request.guard.owner.schema_version) return error.CatalogGenerationChanged;
                 const after = try antfly.public_api.tables.applySchemaMutationRecord(alloc, &before, .replace, request.schema_json);
                 defer antfly.metadata.table_manager.freeTable(alloc, after);
+                return self.replaceRelationLocked(alloc, context, .{ .guard = request.guard, .expected = before, .replacement = after });
+            },
+            .relation_description_mutate => |request| {
+                if (!context.setting_admin) return error.Forbidden;
+                try context.ensureActive();
+                try request.validate();
+                const store = self.lifecycle_store orelse return error.UnsupportedOperation;
+                const before = (try store.getTable(alloc, group_ids.main_metadata_group_id, request.guard.owner.table_id)) orelse return error.CatalogGenerationChanged;
+                defer antfly.metadata.table_manager.freeTable(alloc, before);
+                var after = try antfly.metadata.table_manager.cloneTable(alloc, before);
+                defer antfly.metadata.table_manager.freeTable(alloc, after);
+                const description = try alloc.dupe(u8, request.description);
+                alloc.free(after.description);
+                after.description = description;
                 return self.replaceRelationLocked(alloc, context, .{ .guard = request.guard, .expected = before, .replacement = after });
             },
             .relation_replace => |request| return self.replaceRelationLocked(alloc, context, request),
@@ -3903,7 +4294,7 @@ const LocalStandaloneMetadata = struct {
             try self.reconcileRelations();
             const work = try store.relationReconciliationWork(group_ids.main_metadata_group_id);
             if (work.published_epoch) |published| {
-                if (work.root != null and work.epoch != null and published.eql(work.epoch.?)) return;
+                if (work.root != null and work.epoch != null and published.eql(work.epoch.?) and work.published_coverage == .constraint_names) return;
             }
             // Bounded pages and the control cadence make total publication
             // time proportional to catalog size. Keep waiting through healthy
@@ -3951,11 +4342,17 @@ const LocalStandaloneMetadata = struct {
         const claims = server.relationalIndexClaimPort();
         const io = self.backend_runtime.filesystemIo() orelse return error.MissingBackendRuntimeIo;
         var host: IndexWorkHost = .{ .metadata = self };
+        var schema_error: ?anyerror = null;
+        _ = self.schema_reconciliation.step(self.alloc, group_ids.main_metadata_group_id, &host, platform_time.monotonicNs()) catch |err| blk: {
+            schema_error = err;
+            break :blk false;
+        };
         var transport: @import("../api/relational_index_local_delivery.zig").Transport = .{ .control_port = control, .claim_port = claims };
         _ = self.index_reconciliation.step(io, self.alloc, &server.provisioned_storage.resource_manager, &host, &transport, platform_time.monotonicNs()) catch |err| switch (err) {
             error.Canceled, error.DeadlineExceeded, error.Timeout, error.NotLeader, error.GenerationPublicationChanged, error.GenerationAdmissionPending, error.IndexOwnerReceiptChanged, error.MetadataMutationOutcomeUnknown, error.MetadataReplicationPending, error.ResourceBudgetExceeded, error.OutOfMemory, error.ResourceTemporarilyUnavailable, error.WriterLocked, error.LsmRootWriterAlreadyOpen, error.UnsupportedNativeIndexOwner, error.PrivateIndexRootRecoveryRequired, error.PrivateIndexBuildFailed, error.PrivateIndexTargetInventoryMismatch, error.PrivateIndexGenerationValidationFailed, error.UniqueConstraintViolation, error.TableTopologyProtocolUpgradeRequired => false,
             else => return err,
         };
+        if (schema_error) |err| if (!@import("../metadata/schema_validation_coordinator.zig").isDeferred(err)) return err;
     }
 
     fn reconcileResolverNamespaces(self: *LocalStandaloneMetadata) !void {
@@ -4617,6 +5014,11 @@ const LocalStandaloneMetadata = struct {
             .ignore_unknown_fields = true,
         });
         defer parsed.deinit();
+
+        // A paired seed is only a projection of its native authority. Native
+        // recovery loads catalog rows first; a logical fallback cannot erase
+        // counters or history by treating this projection as a fresh catalog.
+        if (parsed.value.native_checkpoint != null) return error.SequenceCatalogStateRequired;
 
         // Drop derived catalog caches before replacing the projection, including
         // partial replacement failures. Existing readers retain their immutable
@@ -5852,6 +6254,7 @@ pub fn runFromIterator(
         .replica_root_dir = resolved.replica_root_dir,
         .replica_catalog_path = resolved.replica_catalog_path,
         .snapshot_root_dir = resolved.snapshot_root_dir,
+        .native_owner_report = local_metadata.nativeOwnerReportPort(),
         .storage_kernel_context_handle = if (control_only_storage_sources) storage_kernel_context.handle else null,
         .process_memory_limit_bytes = process_memory_limit_bytes,
         .process_memory_limit_source = storageMemoryLimitSource(process_memory_resolution.effective_source),
@@ -6070,6 +6473,8 @@ pub fn runFromIterator(
         defer binding_lock.deinit();
         _ = try local_metadata.ensureNativeOwnerBindingLocked();
     }
+    if (local_metadata.localFkPublicationSupported() and local_metadata.native_owner_binding != null)
+        try local_metadata.activateNativeReporter(.{}, termination_signals.token());
     local_metadata.attachRestoreRetirementOwnership();
     local_metadata.local_schema_progress_provider = localSchemaProgressProvider(&data_server);
     const api_server = &data_server.http_server.?;
@@ -12160,6 +12565,94 @@ test "standalone shared restore worker imports a mixed dependency cohort without
     try @import("../api/restore_worker_fixture.zig").runWithPersistence(antfly.public_api.http_server.RestoreWorkerTestDriver, false, metadata.statusSource(), metadata.restorePersistence());
 }
 
+test "standalone native startup activates actual root and fresh reporter after interrupted predecessor without adopting it" {
+    const a = std.testing.allocator;
+    var directory = std.testing.tmpDir(.{});
+    defer directory.cleanup();
+    var region = std.heap.ArenaAllocator.init(a);
+    defer region.deinit();
+    const scratch = region.allocator();
+    const root = try std.fmt.allocPrint(scratch, ".zig-cache/tmp/{s}/owner", .{directory.sub_path});
+    const catalog = try std.fmt.allocPrint(scratch, ".zig-cache/tmp/{s}/metadata/catalog.json", .{directory.sub_path});
+    var runtime = try antfly.db.background_runtime.BackendRuntimeHandle.init(a, .{});
+    defer runtime.deinit();
+    var previous: ?@import("../metadata/standalone_native_owner.zig").Registration = null;
+    var interrupted_reporter: u64 = 0;
+    for (0..3) |attempt| {
+        if (attempt == 2) {
+            const checkpoint = try @import("antfly_local_sources").storage_db_root_identity.checkpointPathAlloc(scratch, root);
+            try std.Io.Dir.cwd().deleteFile(std.testing.io, checkpoint);
+        }
+        var metadata = try LocalStandaloneMetadata.init(a, 1, 1, "http://localhost", root, catalog, runtime.ptr(), null, .local);
+        defer metadata.deinit();
+        var server = antfly.data.runtime.DataServer.initFromLocalMetadataSources(a, .{
+            .replica_root_dir = root,
+            .replica_catalog_path = catalog,
+            .backend_runtime = runtime.ptr(),
+            .store_registration = .{ .node_id = 1, .store_id = 1, .api_url = "http://localhost", .role = "data" },
+            .api_server_cfg = .{ .deployment_mode = .standalone },
+        }, metadata.catalogSource(), metadata.statusSource());
+        defer server.deinit();
+        metadata.data_server = &server;
+        const catalog_identity = try server.write_source.catalog.catalogIdentity();
+        try std.testing.expectEqual(group_ids.main_metadata_group_id, catalog_identity.metadata_group_id);
+        try std.testing.expectEqual(metadata.metadata_incarnation.?, catalog_identity.metadata_incarnation);
+        try std.testing.expect(metadata.localFkPublicationSupported());
+        var cancellation: antfly.common.runtime_lifecycle.CancellationSource = .{};
+        try metadata.awaitInitialRelationPublication(std.testing.io, cancellation.token());
+        {
+            var locked = try metadata.lockMutation();
+            defer locked.deinit();
+            if (attempt == 2) {
+                try std.testing.expectError(error.FileNotFound, metadata.ensureNativeOwnerBindingLocked());
+                try std.testing.expectError(error.FileNotFound, @import("antfly_local_sources").storage_db_root_identity.load(a, std.testing.io, root));
+                try std.testing.expect(!metadata.native_reporter_ready.load(.acquire));
+                continue;
+            }
+            _ = try metadata.ensureNativeOwnerBindingLocked();
+        }
+        if (attempt == 0) {
+            try metadata.native_activation_mutex.lock(std.testing.io);
+            const busy = metadata.activateNativeReporter(.{}, null);
+            metadata.native_activation_mutex.unlock(std.testing.io);
+            try std.testing.expectError(error.IndexBuildPending, busy);
+            const revision = try metadata.lifecycle_store.?.standaloneRevision();
+            cancellation.cancelled.store(true, .release);
+            try std.testing.expectError(error.Cancelled, metadata.activateNativeReporter(.{}, cancellation.token()));
+            try std.testing.expectEqual(revision, try metadata.lifecycle_store.?.standaloneRevision());
+            try std.testing.expect(server.native_reporter_registration == null);
+            cancellation.cancelled.store(false, .release);
+        }
+        try metadata.activateNativeReporter(.{}, cancellation.token());
+        const current = try metadata.prepareNativeReporterRestart();
+        try std.testing.expect(current.observation.reporter_matches and current.observation.root_enrolled);
+        try std.testing.expect(metadata.native_reporter_ready.load(.acquire));
+        try std.testing.expectEqualDeep(antfly.metadata.table_manager.SchemaReaderCapabilities.current, current.request.schema_reader);
+        const revision = try metadata.lifecycle_store.?.standaloneRevision();
+        try metadata.activateNativeReporter(.{}, cancellation.token());
+        try std.testing.expectEqual(revision, try metadata.lifecycle_store.?.standaloneRevision());
+        if (previous) |prior| {
+            try std.testing.expectEqualDeep(prior.identity, current.request.identity);
+            try std.testing.expect(current.request.reporter_incarnation != prior.reporter_incarnation);
+            try std.testing.expect(current.request.reporter_incarnation != interrupted_reporter);
+            try std.testing.expectEqual(interrupted_reporter, current.request.expected_reporter_incarnation.?);
+            try std.testing.expect((try metadata.lifecycle_store.?.nativeReporterRestartProgress(group_ids.main_metadata_group_id, 1)) == null);
+        } else {
+            previous = current.request;
+            var interrupted = current.request;
+            interrupted.expected_reporter_incarnation = current.request.reporter_incarnation;
+            interrupted.reporter_incarnation +%= 1;
+            if (interrupted.reporter_incarnation == 0) interrupted.reporter_incarnation = 1;
+            interrupted_reporter = interrupted.reporter_incarnation;
+            const signing = try @import("antfly_local_sources").storage_db_root_signing_identity.load(a, std.testing.io, root);
+            interrupted = try interrupted.sign(signing);
+            const observed = try metadata.lifecycle_store.?.observeStandaloneNativeReporter(group_ids.main_metadata_group_id, interrupted);
+            try metadata.lifecycle_store.?.updateStandaloneCatalog(group_ids.main_metadata_group_id, observed.revision, .{ .native_restart = .{ .request = interrupted, .expected = observed } });
+            try std.testing.expect((try metadata.lifecycle_store.?.nativeReporterRestartProgress(group_ids.main_metadata_group_id, 1)) != null);
+        }
+    }
+}
+
 test "standalone native root ownership excludes independent catalogs until shutdown" {
     const a = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -13610,7 +14103,12 @@ test "standalone native index owner catalog calls preserve authority and capabil
     const Call = @import("../system_catalog/server_call.zig").Call;
     const ack = try publication.testing.fencedAck();
     const enrollment = try @import("../metadata/store_root_enrollment.zig").Request.sign(ack.signed.proof.identity, @splat(9));
+    const schema_lookup: @import("../metadata/schema_validation_read.zig").Lookup = .{ .group = group_ids.main_metadata_group_id, .table = 7, .id = @splat(1), .plan_digest = @splat(2), .metadata_incarnation = ack.signed.proof.identity.metadata_incarnation };
     const calls = [_]Call{
+        .{ .schema_validation_submit = "{}" },
+        .{ .schema_validation_submit = "SVBI\x01\x00\x00\x00" },
+        .{ .schema_validation_owner_read = .{ .lookup = schema_lookup, .ordinal = 0 } },
+        .{ .schema_validation_receipt_read = .{ .lookup = schema_lookup, .expected = .admission } },
         .{ .relational_index_owner_decision = .{ .table_id = ack.table_id, .group_id = ack.signed.receipt.owner.group_id, .id = ack.signed.receipt.owner.plan_id, .operation = .fence } },
         .{ .relational_index_owner_ack = ack },
         .{ .relational_index_owner_ack_status = ack },
@@ -13640,7 +14138,7 @@ test "standalone native index owner catalog calls preserve authority and capabil
     try std.testing.expect(try index_host.currentAuthority() == null);
     try std.testing.expectError(error.TableTopologyProtocolUpgradeRequired, index_host.workJson(alloc, .{ .discover = 0 }));
     const revision = metadata.durable_revision;
-    const context: antfly.public_api.operation.RequestContext = .{ .index_publication_authority = true, .setting_admin = true };
+    const context: antfly.public_api.operation.RequestContext = .{ .index_publication_authority = true, .schema_validation_authority = true, .setting_admin = true };
     for (calls) |call| {
         // A valid signature and an internal caller do not activate a protocol
         // or enroll an owner. These are real durable-store preflight failures.
@@ -14909,6 +15407,266 @@ test "system catalog standalone checkpoint preserves bindings and rolls back und
     try std.testing.expectError(error.CatalogStorageUnavailable, source.systemCatalog(alloc, .{}, .{ .mutate = .{ .mutation = .{ .action = .rename, .kind = .database, .name = "warehouse", .new_name = "undurable" } } }));
     try std.testing.expect((try metadata.resolveSystemCatalogLocked(.{ .database = "warehouse", .table = "events" })) != null);
     try std.testing.expect((try metadata.resolveSystemCatalogLocked(.{ .database = "undurable", .table = "events" })) == null);
+}
+
+test "system catalog standalone paired sequence seed materializes live counters and history only authorities" {
+    const alloc = std.testing.allocator;
+    const seq = @import("../system_catalog/sequence_catalog.zig");
+    const seed = @import("../storage/hot_standby/seed_materialization.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", alloc);
+    defer alloc.free(root);
+    var backend = try antfly.db.background_runtime.BackendRuntimeHandle.init(alloc, .{});
+    defer backend.deinit();
+    for ([_]bool{ false, true }) |history_only| {
+        const raw = try std.fs.path.join(alloc, &.{ root, if (history_only) "raw-history" else "raw-live" });
+        defer alloc.free(raw);
+        try fs_paths.createDirPathPortable(std.testing.io, raw);
+        const source_path = try std.fs.path.join(alloc, &.{ raw, "source-catalog.json" });
+        defer alloc.free(source_path);
+        var metadata = try LocalStandaloneMetadata.init(alloc, 1, 1, "http://localhost", ".", source_path, backend.ptr(), null, .local);
+        defer metadata.deinit();
+        var cancellation: antfly.common.runtime_lifecycle.CancellationSource = .{};
+        try metadata.awaitInitialRelationPublication(std.testing.io, cancellation.token());
+        const store = metadata.lifecycle_store.?;
+        const group = group_ids.main_metadata_group_id;
+        const work = try store.relationReconciliationWork(group);
+        const request: seq.Mutation = .{ .admission = .{ .nonce = @splat(1), .head = try store.sqlSequenceAdmissionHead(group) }, .target = .{ .table = "counter" }, .namespace_id = 2, .incarnation = work.epoch.?.incarnation, .operation = .{ .create = .{ .options = .{ .start = 100, .restart = .{ .value = 7 }, .cache = 4 } } } };
+        const source = metadata.statusSource();
+        const created_bytes = try source.systemCatalog(alloc, .{ .setting_admin = true }, .{ .sql_sequence_mutate = request });
+        defer alloc.free(created_bytes);
+        var created = try std.json.parseFromSlice(seq.Outcome, alloc, created_bytes, .{});
+        defer created.deinit();
+        const identity = (try created.value.result()).identity.?;
+        // Exercise a real cached allocation, not only an uncalled initial
+        // counter. Counter transactions do not advance schema/admission heads.
+        const initial = try seq.sequence.Record.create(request.operation.create.options);
+        const definition = initial.definition;
+        const allocation: seq.journal.Request = .{ .expected = initial.state, .request_id = @splat(17), .operation = .reserve };
+        const before_allocation = try store.systemCatalogMeta(alloc, group);
+        const allocated = blk: {
+            const counter_request: seq.CounterRequest = .{ .target = request.target, .namespace_id = request.namespace_id, .sequence_id = identity.id, .incarnation = request.incarnation, .request = allocation };
+            const reloads = metadata.lifecycle_projection_reloads;
+            const epoch_before = metadata.epoch;
+            const bytes = try source.systemCatalog(alloc, .{ .setting_admin = true }, .{ .sql_sequence_counter_mutate = counter_request });
+            defer alloc.free(bytes);
+            var outcome = try std.json.parseFromSlice(seq.CounterOutcome, alloc, bytes, .{});
+            defer outcome.deinit();
+            const result = try outcome.value.result();
+            try std.testing.expectEqual(@as(i64, 7), result.lease.?.first);
+            try std.testing.expectEqual(@as(i64, 10), result.state.last_value);
+            try std.testing.expect(result.state.is_called);
+            try std.testing.expectEqual(reloads, metadata.lifecycle_projection_reloads);
+            try std.testing.expectEqual(epoch_before, metadata.epoch);
+            const replay = try source.systemCatalog(alloc, .{ .setting_admin = true }, .{ .sql_sequence_counter_outcome = counter_request });
+            defer alloc.free(replay);
+            var observed = try std.json.parseFromSlice(?seq.CounterOutcome, alloc, replay, .{});
+            defer observed.deinit();
+            try std.testing.expectEqualDeep(result, try observed.value.?.result());
+            break :blk result;
+        };
+        try std.testing.expectEqualDeep(before_allocation, try store.systemCatalogMeta(alloc, group));
+        if (history_only) {
+            var drop = request;
+            drop.admission = .{ .nonce = @splat(2), .head = try store.sqlSequenceAdmissionHead(group) };
+            drop.operation = .{ .drop = .{ .expected = identity } };
+            const dropped = try source.systemCatalog(alloc, .{ .setting_admin = true }, .{ .sql_sequence_mutate = drop });
+            defer alloc.free(dropped);
+            var result = try std.json.parseFromSlice(seq.Outcome, alloc, dropped, .{});
+            defer result.deinit();
+            try std.testing.expectEqual(@as(usize, 1), (try result.value.result()).removed);
+        }
+        try std.testing.expectError(error.SequenceCatalogStateRequired, metadata.catalogSource().exportCatalog(alloc));
+        // An independent native catalog mutation advances durable authority
+        // without refreshing the LocalStandaloneMetadata projection cache.
+        // Paired capture must refresh it before private-owner capture follows.
+        const independent = try std.json.Stringify.valueAlloc(alloc, @import("../metadata/storage/raft_apply_contract.zig").SystemCatalogCommand{
+            .expected_revision = (try store.systemCatalogMeta(alloc, group)).revision,
+            .mutation = .{ .action = .create, .kind = .database, .name = "analytics" },
+        }, .{});
+        defer alloc.free(independent);
+        try store.applyStandaloneCommand(group, .{ .apply_system_catalog = independent });
+        const checkpoint_path = try std.fs.path.join(alloc, &.{ raw, seed.standalone_metadata_name });
+        defer alloc.free(checkpoint_path);
+        const captured = (try source.standalone_hot_standby.?.captureCatalogCheckpoint(alloc, std.testing.io, checkpoint_path)).?;
+        defer captured.deinit(alloc);
+        var logical = try std.json.parseFromSlice(@import("../system_catalog/projection.zig").Export, alloc, captured.catalog_json, .{});
+        defer logical.deinit();
+        var private = (try source.standalone_hot_standby.?.capturePrivate(alloc, logical.value.epoch)).?;
+        defer private.deinit();
+        try std.testing.expectEqual(@as(usize, 0), private.value.tables.len);
+        const digest = std.fmt.bytesToHex(captured.checkpoint.sha256, .lower);
+        const topology: seed.Topology = .{
+            .generation = "sequence_seed",
+            .catalog = seed.LogicalCatalog.fromExport(logical.value),
+            .replicas = &.{},
+            .standalone_metadata = .{ .path = seed.standalone_metadata_name, .size_bytes = captured.checkpoint.size_bytes, .sha256 = &digest },
+        };
+        const topology_bytes = try std.json.Stringify.valueAlloc(alloc, topology, .{});
+        defer alloc.free(topology_bytes);
+        const topology_path = try std.fs.path.join(alloc, &.{ raw, seed.topology_name });
+        defer alloc.free(topology_path);
+        try writeFileAtomically(alloc, std.testing.io, topology_path, topology_bytes);
+        // Losing the native artifact must never turn a paired projection into
+        // a fresh logical import, even when the sequence itself was dropped.
+        try std.testing.expectError(error.SequenceCatalogStateRequired, metadata.loadCatalogBytes(captured.catalog_json));
+        const stage = try std.fs.path.join(alloc, &.{ root, if (history_only) "stage-history" else "stage-live" });
+        defer alloc.free(stage);
+        const receipt_digest = "1111111111111111111111111111111111111111111111111111111111111111";
+        var materialized = try seed.materialize(alloc, .{
+            .io = std.testing.io,
+            .raw_generation_root = raw,
+            .live_installing_root = stage,
+            .generation = topology.generation,
+            .target_local_node_id = 2,
+            .seed_receipt_sha256 = receipt_digest,
+            .capture_receipt_sha256 = receipt_digest,
+            .raw_manifest_sha256 = receipt_digest,
+            .raw_aggregate_sha256 = receipt_digest,
+        });
+        defer materialized.deinit(alloc);
+        const restored_path = try std.fs.path.join(alloc, &.{ stage, "metadata/local-metadata.json" });
+        defer alloc.free(restored_path);
+        var restored = try LocalStandaloneMetadata.init(alloc, 2, 2, "http://localhost", ".", restored_path, backend.ptr(), null, .local);
+        defer restored.deinit();
+        try restored.awaitInitialRelationPublication(std.testing.io, cancellation.token());
+        const recovered = restored.lifecycle_store.?;
+        try std.testing.expectEqualDeep(created.value, try recovered.sqlSequenceOutcome(alloc, group, request));
+        try std.testing.expectEqual(try store.sqlSequenceAdmissionHead(group), try recovered.sqlSequenceAdmissionHead(group));
+        // Public recovery is observation of the original bound request even
+        // after cold seed installation or DROP. New sequence ingress remains
+        // disabled; the token must neither rebind a name nor allocate again.
+        const recovery = @import("../api/sql_catalog_recovery.zig");
+        var recovery_arena = std.heap.ArenaAllocator.init(alloc);
+        defer recovery_arena.deinit();
+        const receipt = try recovery.newReceipt(alloc, recovery_arena.allocator(), request, 0);
+        defer receipt.deinit(alloc);
+        var api = ApiHttpServer.init(alloc, .{}, restored.statusSource(), null, null);
+        defer api.deinit();
+        const head_before_observation = try recovered.sqlSequenceAdmissionHead(group);
+        const observed = try recovery.recover(&api, null, .{}, alloc, receipt.recovery_token);
+        defer observed.deinit(alloc);
+        try std.testing.expectEqual(.committed, observed.state);
+        try std.testing.expectEqual(@as(?u64, identity.id), observed.object_id);
+        try std.testing.expectEqual(@as(?u64, identity.generation), observed.generation);
+        var forged = request;
+        forged.operation.create.options.cache = 8;
+        const forged_receipt = try recovery.newReceipt(alloc, recovery_arena.allocator(), forged, 0);
+        defer forged_receipt.deinit(alloc);
+        const unknown = try recovery.recover(&api, null, .{}, alloc, forged_receipt.recovery_token);
+        defer unknown.deinit(alloc);
+        try std.testing.expectEqual(.unknown, unknown.state);
+        try std.testing.expectEqualStrings("40003", unknown.diagnostic.?.code);
+        try std.testing.expectEqual(head_before_observation, try recovered.sqlSequenceAdmissionHead(group));
+        const lookup: seq.SnapshotRequest = .{ .targets = &.{request.target}, .include_counters = true };
+        const bytes = try recovered.sqlSequenceSnapshot(alloc, group, lookup, .{});
+        defer alloc.free(bytes);
+        var snapshot = try std.json.parseFromSlice(seq.Snapshot, alloc, bytes, .{});
+        defer snapshot.deinit();
+        try snapshot.value.validate(lookup);
+        if (history_only) try std.testing.expect(snapshot.value.entries[0].value == .absent) else {
+            try std.testing.expectEqual(@as(i64, 100), snapshot.value.entries[0].value.sequence.start);
+            try std.testing.expectEqual(@as(i64, 10), snapshot.value.entries[0].counter.?.last_value);
+            try std.testing.expect(snapshot.value.entries[0].counter.?.is_called);
+            var txn = try recovered.store.beginReadTxn();
+            defer txn.abort();
+            const counter: seq.journal.Store(@TypeOf(txn)) = .{ .txn = &txn, .key = .{ .group = group, .sequence_id = identity.id } };
+            try std.testing.expectEqualDeep(allocated, (try counter.observe(alloc, definition, allocation)).?);
+            try std.testing.expectEqualDeep(allocated.state, (try counter.load(alloc, definition)).?);
+        }
+    }
+}
+
+test "system catalog standalone startup migrates old relation seals before reporting SQL readiness" {
+    const alloc = std.testing.allocator;
+    const protocol = @import("../metadata/topology_protocol.zig");
+    const control = @import("../metadata/relation_reconciliation_command.zig");
+    const worker = @import("../metadata/relation_reconciliation_worker.zig");
+    const T = struct {
+        fn apply(store: *antfly.metadata.RaftApplyStore, command: control.Command) !void {
+            const bytes = try command.encodeAlloc(alloc);
+            defer alloc.free(bytes);
+            try store.applyStandaloneCommand(group_ids.main_metadata_group_id, .{ .apply_relation_reconciliation = bytes });
+        }
+    };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/catalog.json", .{tmp.sub_path});
+    defer alloc.free(path);
+    var backend = try antfly.db.background_runtime.BackendRuntimeHandle.init(alloc, .{});
+    defer backend.deinit();
+    var metadata = try LocalStandaloneMetadata.init(alloc, 1, 1, "http://localhost", ".", path, backend.ptr(), null, .local);
+    defer metadata.deinit();
+    const store = metadata.lifecycle_store.?;
+    const group = group_ids.main_metadata_group_id;
+    var activation: protocol.Activation = .{ .version = protocol.relation_mutation_version, .incarnation = metadata.metadata_incarnation.?, .member_count = 1, .membership_fingerprint = @import("../metadata/reallocation_request.zig").membershipFingerprint(&.{@as(u64, 1)}) };
+    const bytes = try std.json.Stringify.valueAlloc(alloc, activation, .{});
+    defer alloc.free(bytes);
+    try store.applyStandaloneCommand(group, .{ .activate_topology_protocol = bytes });
+    activation.version = protocol.relation_reconciliation_version;
+    try T.apply(store, .{ .adopt = activation });
+    for (0..32) |_| {
+        const work = try store.relationReconciliationWork(group);
+        if (work.current) |state| if (state.phase == .ready) {
+            if (try store.stepRelationPublicationProof(state, platform_time.monotonicNs())) |proof| {
+                activation.version = protocol.relation_publication_version;
+                try T.apply(store, .{ .publish = .{ .state = proof.state, .prior = proof.root, .activation = activation } });
+                break;
+            }
+            continue;
+        };
+        try T.apply(store, (try worker.nextIntent(work, group, false)) orelse return error.TestUnexpectedResult);
+    }
+    const old = try store.relationReconciliationWork(group);
+    try std.testing.expectEqual(.relations, old.published_coverage.?);
+    var cancellation: antfly.common.runtime_lifecycle.CancellationSource = .{};
+    try metadata.awaitInitialRelationPublication(std.testing.io, cancellation.token());
+    const ready = try store.relationReconciliationWork(group);
+    try std.testing.expectEqual(.constraint_names, ready.published_coverage.?);
+    try std.testing.expect(!old.root.?.eql(ready.root.?));
+    try std.testing.expectEqual(protocol.current_version, (try store.topologyActivation(group)).?.version);
+}
+
+test "system catalog standalone export cannot omit native sequence admission history" {
+    if (comptime control_only_storage_sources) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/catalog.json", .{tmp.sub_path});
+    defer alloc.free(path);
+    var backend = try antfly.db.background_runtime.BackendRuntimeHandle.init(alloc, .{});
+    defer backend.deinit();
+    {
+        var metadata = try LocalStandaloneMetadata.init(alloc, 1, 1, "http://localhost", ".", path, backend.ptr(), null, .local);
+        defer metadata.deinit();
+        const before = try metadata.catalogSource().exportCatalog(alloc);
+        alloc.free(before);
+        const store = metadata.lifecycle_store.?;
+        var head = try store.systemCatalogMeta(alloc, group_ids.main_metadata_group_id);
+        // An empty logical projection is not proof that no admission took place:
+        // conditional DDL and retirement retain this catalog-owned head. This
+        // deliberately minimal cut tests export rejection, not restore validity.
+        try std.testing.expectEqual(@as(usize, 0), metadata.systemCatalogState().policy_publications.len);
+        for (metadata.systemCatalogState().resources) |resource| try std.testing.expect(resource.kind != .sequence);
+        head.sequence_outcome_head = 1;
+        {
+            var txn = try store.store.beginWriteTxn();
+            var committed = false;
+            defer if (!committed) txn.abort();
+            const key = try std.fmt.allocPrint(alloc, "\x00\x00__metadata__:system_catalog:{d}:meta", .{group_ids.main_metadata_group_id});
+            defer alloc.free(key);
+            const bytes = try std.json.Stringify.valueAlloc(alloc, head, .{});
+            defer alloc.free(bytes);
+            try txn.put(key, bytes);
+            try txn.commit();
+            committed = true;
+        }
+        try std.testing.expectError(error.SequenceCatalogStateRequired, metadata.catalogSource().exportCatalog(alloc));
+    }
+    var reopened = try LocalStandaloneMetadata.init(alloc, 1, 1, "http://localhost", ".", path, backend.ptr(), null, .local);
+    defer reopened.deinit();
+    try std.testing.expectError(error.SequenceCatalogStateRequired, reopened.catalogSource().exportCatalog(alloc));
 }
 
 test "system catalog native authority writes bounded deltas and recovers logical bindings" {

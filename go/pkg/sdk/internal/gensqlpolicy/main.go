@@ -33,6 +33,10 @@ func main() {
 		panic(err)
 	}
 	for _, change := range []struct{ function, from, to string }{
+		{`func \(c \*Client\) GetSQLCatalogOperationWithBody\(`, "return c.Client.Do(req)", "return executeSQLRequest(c.Client, req)"},
+		{`func \(c \*Client\) GetSQLCatalogOperation\(`, "return c.Client.Do(req)", "return executeSQLRequest(c.Client, req)"},
+		{`func NewGetSQLCatalogOperationRequest\(`, "json.Marshal(body)", "marshalSQLRequest(body)"},
+		{`func ParseGetSQLCatalogOperationResponse\(`, "io.ReadAll(rsp.Body)", "readSQLResponseBody(rsp.Body)"},
 		{`func \(c \*Client\) ExecuteSQLWithBody\(`, "return c.Client.Do(req)", "return executeSQLRequest(c.Client, req)"},
 		{`func \(c \*Client\) ExecuteSQL\(`, "return c.Client.Do(req)", "return executeSQLRequest(c.Client, req)"},
 		{`func NewExecuteSQLRequest\(`, "json.Marshal(body)", "marshalSQLRequest(body)"},

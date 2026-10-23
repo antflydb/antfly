@@ -30,6 +30,14 @@ const Mapping = struct {
 };
 
 const mappings = [_]Mapping{
+    .{ .status = .conflicting_data_apply_batch, .err = error.ConflictingDataApplyBatch },
+    .{ .status = .invalid_data_apply_batch, .err = error.InvalidDataApplyBatch },
+    .{ .status = .split_source_projection_not_ready, .err = error.SplitSourceProjectionNotReady },
+    .{ .status = .apply_store_group_retired, .err = error.ApplyStoreGroupRetired },
+    .{ .status = .apply_store_shutting_down, .err = error.ApplyStoreShuttingDown },
+    .{ .status = .schema_validation_command_rejected, .err = error.SchemaValidationCommandRejected },
+    .{ .status = .schema_validation_preparation_changed, .err = error.SchemaValidationPreparationChanged },
+    .{ .status = .corrupt_schema_apply_outcome, .err = error.CorruptSchemaApplyOutcome },
     .{ .status = .relational_check_violation, .err = error.RelationalCheckViolation },
     .{ .status = .foreign_key_match_full_violation, .err = error.ForeignKeyMatchFullViolation },
     .{ .status = .invalid_sql_view_record, .err = error.InvalidSqlViewRecord },
@@ -76,6 +84,7 @@ const mappings = [_]Mapping{
     .{ .status = .private_index_publication_required, .err = error.PrivateIndexPublicationRequired },
     .{ .status = .relational_index_catalog_schema_mismatch, .err = error.RelationalIndexCatalogSchemaMismatch },
     .{ .status = .catalog_occupancy_not_ready, .err = error.CatalogOccupancyNotReady },
+    .{ .status = .sequence_catalog_state_required, .err = error.SequenceCatalogStateRequired },
     .{ .status = .grouped_source_owner_changed, .err = error.GroupedSourceOwnerChanged },
     .{ .status = .grouped_source_topology_unavailable, .err = error.GroupedSourceTopologyUnavailable },
     .{ .status = .apple_intelligence_provider_unavailable, .err = error.AppleIntelligenceProviderUnavailable },
@@ -285,6 +294,8 @@ const mappings = [_]Mapping{
     .{ .status = .integrity_checksum_mismatch, .err = error.IntegrityChecksumMismatch },
     .{ .status = .integrity_missing_companion, .err = error.IntegrityMissingCompanion },
     .{ .status = .backup_integrity_failure, .err = error.BackupIntegrityFailure },
+    .{ .status = .invalid_native_backup_origin, .err = error.InvalidNativeBackupOrigin },
+    .{ .status = .native_backup_origin_mismatch, .err = error.NativeBackupOriginMismatch },
     .{ .status = .coordinated_constraint_portable_backup_unsupported, .err = error.CoordinatedConstraintPortableBackupUnsupported },
     .{ .status = .coordinated_constraint_restore_required, .err = error.CoordinatedConstraintRestoreRequired },
     .{ .status = .coordinated_constraint_topology_unsupported, .err = error.CoordinatedConstraintTopologyUnsupported },
@@ -1128,6 +1139,14 @@ test "index publication unsupported owner stays definite across compiled runtime
     try std.testing.expectEqualStrings("UnsupportedNativeIndexOwner", failure.errorName());
 }
 
+test "sequence catalog native checkpoint requirement is not an opaque provider failure" {
+    const failure = failureFromError(error.SequenceCatalogStateRequired, .storage_owner, abi.abi_version, 23);
+    try std.testing.expectEqual(abi.Status.sequence_catalog_state_required, failure.status);
+    try validateFailureEnvelope(failure.status, &failure, abi.abi_version);
+    try std.testing.expectError(error.SequenceCatalogStateRequired, statusToError(failure.status));
+    try std.testing.expectEqualStrings("SequenceCatalogStateRequired", failure.errorName());
+}
+
 test "seed replica policy mismatch survives compiled runtime boundaries" {
     try std.testing.expectEqual(abi.Status.seed_replica_policy_mismatch, statusFromError(error.SeedReplicaPolicyMismatch));
     try std.testing.expectError(error.SeedReplicaPolicyMismatch, statusToError(.seed_replica_policy_mismatch));
@@ -1211,6 +1230,8 @@ test "schema owner observation preserves exact conflict and runtime recovery fai
         error.SchemaValidationJobChanged,
         error.SchemaValidationJobRequired,
         error.SchemaValidationRuntimeRecoveryRequired,
+        error.InvalidNativeBackupOrigin,
+        error.NativeBackupOriginMismatch,
     }) |err| {
         const failure = failureFromError(err, .storage_owner, abi.abi_version, 1);
         try std.testing.expect(failure.status != .internal);

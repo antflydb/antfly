@@ -6346,6 +6346,283 @@ test "graph endpoint cleanup bulk retirement mask releases ownership on decoding
     try std.testing.expectError(error.InvalidGraphRetirement, DocStore.graphBulkRetirementMask(alloc, batch.asTxn(), &.{.{ .key = edge, .value = "edge" }}));
 }
 
+test "sequence catalog journal persists creation RESTART independently of declared START through cold retry" {
+    const sequence = @import("../system_catalog/sequences.zig");
+    const journal = @import("../system_catalog/sequence_journal.zig");
+    const Counter = journal.Store(DocStore.Txn);
+    const a = std.testing.allocator;
+    const record = try sequence.Record.create(.{ .start = 100, .restart = .{ .value = 7 }, .cache = 4 });
+    const key: journal.Key = .{ .group = 31, .sequence_id = 29 };
+    const request: journal.Request = .{ .expected = record.state, .request_id = @splat(9), .operation = .reserve };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buffer, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    for (0..2) |pass| {
+        var backend = try lsm_backend.Backend.open(a, path, .{});
+        defer backend.close();
+        var store = try DocStore.openRuntime(a, try backend.runtimeStore(a, .{}));
+        defer store.close();
+        if (pass == 0) {
+            var txn = try store.beginWriteTxn();
+            errdefer txn.abort();
+            const counter: Counter = .{ .txn = &txn, .key = key };
+            var invalid = record;
+            invalid.state.is_called = true;
+            try std.testing.expectError(error.InvalidSequenceDefinition, counter.initialize(a, invalid));
+            try counter.initialize(a, record);
+            try txn.commit();
+        }
+        var pinned = try store.beginReadTxn();
+        defer pinned.abort();
+        const reader: Counter = .{ .txn = &pinned, .key = key };
+        const prior = (try reader.load(a, record.definition)).?;
+        try std.testing.expectEqual(@as(i64, if (pass == 0) 7 else 10), prior.last_value);
+        {
+            var txn = try store.beginWriteTxn();
+            errdefer txn.abort();
+            const counter: Counter = .{ .txn = &txn, .key = key };
+            const receipt = try counter.execute(a, record.definition, request);
+            try std.testing.expectEqual(@as(i64, 7), receipt.lease.?.first);
+            try std.testing.expectEqual(@as(u64, 4), receipt.lease.?.count);
+            try std.testing.expectEqual(@as(i64, 10), receipt.state.last_value);
+            try std.testing.expectEqual(@as(u64, 2), receipt.state.revision);
+            try txn.commit();
+        }
+        try std.testing.expectEqualDeep(prior, (try reader.load(a, record.definition)).?);
+        try std.testing.expectEqual(@as(i64, 100), record.definition.start);
+    }
+}
+
+test "sequence catalog journal native LSM rollback cold retry and bounded retirement" {
+    const sequence = @import("../system_catalog/sequences.zig");
+    const journal = @import("../system_catalog/sequence_journal.zig");
+    const Counter = journal.Store(DocStore.Txn);
+    const ReadOnlyTxn = struct {
+        inner: *DocStore.Txn,
+        reads: usize = 0,
+        pub fn get(self: *@This(), name: []const u8) ![]const u8 {
+            self.reads += 1;
+            return self.inner.get(name);
+        }
+    };
+    const FailingTxn = struct {
+        inner: *DocStore.Txn,
+        fail_at: usize,
+        writes: usize = 0,
+        pub fn get(self: *@This(), name: []const u8) ![]const u8 {
+            return self.inner.get(name);
+        }
+        pub fn put(self: *@This(), name: []const u8, value: []const u8) !void {
+            self.writes += 1;
+            if (self.writes == self.fail_at) return error.TestInjectedSequenceWriteFailure;
+            try self.inner.put(name, value);
+        }
+        pub fn delete(self: *@This(), name: []const u8) !void {
+            self.writes += 1;
+            if (self.writes == self.fail_at) return error.TestInjectedSequenceWriteFailure;
+            try self.inner.delete(name);
+        }
+    };
+    const a = std.testing.allocator;
+    const t = std.testing;
+    const key: journal.Key = .{ .group = 31, .sequence_id = 17 };
+    const initial_sequence = try sequence.Record.create(.{ .cache = 32 });
+    const definition = initial_sequence.definition;
+    const request: journal.Request = .{ .expected = initial_sequence.state, .request_id = @splat(1), .operation = .reserve };
+    // This test exercises a real atomic storage transaction, not Raft or public
+    // SQL activation. The catalog revision sentinel must never be rewritten by
+    // allocation, and a restart opens an independent durable LSM owner.
+    const catalog_key = "test.sequence.catalog-revision";
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    for (0..2) |pass| {
+        var backend = try lsm_backend.Backend.open(a, path, .{});
+        defer backend.close();
+        var store = try DocStore.openRuntime(a, try backend.runtimeStore(a, .{}));
+        defer store.close();
+        if (pass == 0) {
+            {
+                var txn = try store.beginWriteTxn();
+                errdefer txn.abort();
+                const counter: Counter = .{ .txn = &txn, .key = key };
+                try counter.initialize(a, initial_sequence);
+                try t.expectError(error.SequenceCounterChanged, counter.initialize(a, initial_sequence));
+                try txn.put(catalog_key, "7");
+                try txn.commit();
+            }
+            var pinned = try store.beginReadTxn();
+            defer pinned.abort();
+            const reader: Counter = .{ .txn = &pinned, .key = key };
+            try t.expectEqual(@as(u64, 1), (try reader.load(a, definition)).?.revision);
+            try t.expect((try reader.observe(a, definition, request)) == null);
+            try t.expectEqual(.ready, try reader.admission(a, definition, request));
+            try t.expectEqual(@as(u64, 1), (try reader.load(a, definition)).?.revision);
+            for ([_]usize{ 1, 2 }) |fail_at| {
+                var txn = try store.beginWriteTxn();
+                defer txn.abort();
+                var failing: FailingTxn = .{ .inner = &txn, .fail_at = fail_at };
+                const counter: journal.Store(FailingTxn) = .{ .txn = &failing, .key = key };
+                try t.expectError(error.TestInjectedSequenceWriteFailure, counter.execute(a, definition, request));
+            }
+            {
+                var txn = try store.beginWriteTxn();
+                defer txn.abort();
+                const entries = try DocStore.scanPrefixTxn(a, &txn, "\x00\x00__metadata__:sql_sequence_counters:v1:");
+                defer {
+                    for (entries) |entry| {
+                        a.free(entry.key);
+                        a.free(entry.value);
+                    }
+                    a.free(entries);
+                }
+                try t.expectEqual(@as(usize, 1), entries.len);
+                try txn.put(entries[0].key, "{\"format\":1,\"identity\":{\"group\":32,\"sequence_id\":17},\"state\":{\"generation\":1,\"revision\":1,\"last_value\":1,\"is_called\":false}}");
+                const counter: Counter = .{ .txn = &txn, .key = key };
+                try t.expectError(error.InvalidSequenceState, counter.load(a, definition));
+                // Missing call/revision fields cannot acquire defaults that
+                // rewind an allocated counter during recovery.
+                for ([_][]const u8{
+                    "{\"format\":1,\"identity\":{\"group\":31,\"sequence_id\":17},\"state\":{\"generation\":1,\"revision\":1,\"last_value\":1}}",
+                    "{\"format\":1,\"identity\":{\"group\":31,\"sequence_id\":17},\"state\":{\"generation\":1,\"last_value\":1,\"is_called\":false}}",
+                    "{\"identity\":{\"group\":31,\"sequence_id\":17},\"state\":{\"generation\":1,\"revision\":1,\"last_value\":1,\"is_called\":false}}",
+                }) |malformed| {
+                    try txn.put(entries[0].key, malformed);
+                    try t.expectError(error.InvalidSequenceState, counter.load(a, definition));
+                }
+            }
+            {
+                var txn = try store.beginWriteTxn();
+                defer txn.abort();
+                const counter: Counter = .{ .txn = &txn, .key = key };
+                try t.expectEqual(@as(i64, 32), (try counter.execute(a, definition, request)).state.last_value);
+                // Abort after staging both the state and receipt.
+            }
+            {
+                var txn = try store.beginWriteTxn();
+                errdefer txn.abort();
+                const counter: Counter = .{ .txn = &txn, .key = key };
+                try t.expectEqual(@as(u64, 1), (try counter.load(a, definition)).?.revision);
+                const result = try counter.execute(a, definition, request);
+                try t.expectEqual(@as(i64, 1), result.lease.?.first);
+                try txn.commit();
+            }
+            try t.expectEqual(@as(u64, 1), (try reader.load(a, definition)).?.revision);
+            // A pinned pre-allocation reader cannot observe the new receipt.
+            try t.expect((try reader.observe(a, definition, request)) == null);
+        } else {
+            {
+                var read_txn = try store.beginReadTxn();
+                defer read_txn.abort();
+                var readonly: ReadOnlyTxn = .{ .inner = &read_txn };
+                const reader: journal.Store(ReadOnlyTxn) = .{ .txn = &readonly, .key = key };
+                const observed = (try reader.observe(a, definition, request)).?;
+                try t.expectEqual(@as(i64, 1), observed.lease.?.first);
+                try t.expectEqual(@as(i64, 32), observed.state.last_value);
+                try t.expectEqual(@as(usize, 2), readonly.reads);
+                const Probe = struct {
+                    fn run(allocator: std.mem.Allocator, source: journal.Store(ReadOnlyTxn), def: sequence.Definition, original: journal.Request) !void {
+                        const result = (try source.observe(allocator, def, original)).?;
+                        try std.testing.expectEqual(@as(i64, 1), result.lease.?.first);
+                        try std.testing.expectEqual(@as(u64, 2), result.state.revision);
+                    }
+                };
+                try std.testing.checkAllAllocationFailures(a, Probe.run, .{ reader, definition, request });
+                var mismatch = request;
+                mismatch.request_id = @splat(2);
+                try t.expectError(error.SequenceCounterChanged, reader.observe(a, definition, mismatch));
+                try t.expectEqualDeep(observed.state, (try reader.load(a, definition)).?);
+            }
+            {
+                var damaged_txn = try store.beginWriteTxn();
+                defer damaged_txn.abort();
+                const entries = try DocStore.scanPrefixTxn(a, &damaged_txn, journal.allGroupsPrefix());
+                defer {
+                    for (entries) |entry| {
+                        a.free(entry.key);
+                        a.free(entry.value);
+                    }
+                    a.free(entries);
+                }
+                var checked = false;
+                for (entries) |entry| {
+                    if ((try journal.storedKey(entry.key)).?.revision != 2) continue;
+                    var receipt = try journal.receiptBytes(a, entry.value, definition);
+                    receipt.lease.?.first += 1;
+                    receipt.lease.?.count -= 1;
+                    const corrupted = try std.json.Stringify.valueAlloc(a, receipt, .{});
+                    defer a.free(corrupted);
+                    try damaged_txn.put(entry.key, corrupted);
+                    const damaged: Counter = .{ .txn = &damaged_txn, .key = key };
+                    try t.expectError(error.InvalidSequenceReceipt, damaged.observe(a, definition, request));
+                    try t.expectEqualDeep(receipt.state, (try damaged.load(a, definition)).?);
+                    checked = true;
+                }
+                try t.expect(checked);
+            }
+            var txn = try store.beginWriteTxn();
+            errdefer txn.abort();
+            const counter: Counter = .{ .txn = &txn, .key = key };
+            const replay = try counter.execute(a, definition, request);
+            try t.expectEqual(@as(i64, 1), replay.lease.?.first);
+            try t.expectEqual(@as(u64, 2), (try counter.load(a, definition)).?.revision);
+            const wrong_group: Counter = .{ .txn = &txn, .key = .{ .group = 32, .sequence_id = 17 } };
+            try t.expect((try wrong_group.load(a, definition)) == null);
+            var state = replay.state;
+            for (0..130) |_| {
+                var next = request;
+                next.expected = state;
+                state = (try counter.execute(a, definition, next)).state;
+            }
+            // Missing old receipt is a conflict, never another allocation.
+            try t.expectError(error.SequenceCounterChanged, counter.execute(a, definition, request));
+            try t.expect((try counter.observe(a, definition, request)) == null);
+            try t.expectEqualDeep(state, (try counter.load(a, definition)).?);
+            const prefix = "\x00\x00__metadata__:sql_sequence_counters:v1:";
+            const entries = try DocStore.scanPrefixTxn(a, &txn, prefix);
+            defer {
+                for (entries) |entry| {
+                    a.free(entry.key);
+                    a.free(entry.value);
+                }
+                a.free(entries);
+            }
+            try t.expectEqual(@as(usize, journal.retained_receipts + 1), entries.len);
+            // Admission using an earlier counter must not overwrite a lease.
+            const stale: sequence.Record = .{ .definition = definition, .state = replay.state };
+            try t.expectError(error.SequenceCounterChanged, counter.alter(a, stale, .{ .restart = .{ .value = 1000 } }));
+            const prior: sequence.Record = .{ .definition = definition, .state = state };
+            try t.expectEqualDeep(prior, try counter.alter(a, prior, .{}));
+            const restarted = try counter.alter(a, prior, .{ .restart = .{ .value = 1000 } });
+            try t.expectError(error.SequenceCatalogChanged, counter.alter(a, prior, .{ .restart = .{ .value = 1000 } }));
+            try t.expectError(error.SequenceCatalogChanged, counter.execute(a, restarted.definition, request));
+            var fresh = request;
+            fresh.expected = restarted.state;
+            const first = try counter.execute(a, restarted.definition, fresh);
+            try t.expectEqual(@as(i64, 1000), first.lease.?.first);
+            fresh.expected = first.state;
+            fresh.operation = .{ .set = .{ .value = 77, .called = false } };
+            const reset = try counter.execute(a, restarted.definition, fresh);
+            try t.expect(reset.lease == null);
+            try t.expectEqualDeep(reset, try counter.execute(a, restarted.definition, fresh));
+            fresh.expected = reset.state;
+            fresh.operation = .reserve;
+            try t.expectEqual(@as(i64, 77), (try counter.execute(a, restarted.definition, fresh)).lease.?.first);
+            try counter.remove(a, restarted.definition);
+            try t.expect((try counter.load(a, restarted.definition)) == null);
+            const retired = try DocStore.scanPrefixTxn(a, &txn, prefix);
+            defer a.free(retired);
+            try t.expectEqual(@as(usize, 0), retired.len);
+            try txn.commit();
+        }
+        const revision = try store.get(a, catalog_key);
+        defer a.free(revision);
+        try t.expectEqualStrings("7", revision);
+    }
+}
+
 test "public graph metric borrowed wire content authority shares txn batch append abort and reopen boundaries" {
     const a = std.testing.allocator;
     const revision = @import("document_mutation_revision.zig");

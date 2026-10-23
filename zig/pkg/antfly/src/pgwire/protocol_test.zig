@@ -39,6 +39,7 @@ const Mock = struct {
     native_parameters: bool = false,
     native_parameter_checks: usize = 0,
     result_override: ?backend.Result = null,
+    result_override_executions: usize = 0,
     result_cells: bool = false,
     ddl_pending: bool = false,
     ddl_unknown: bool = false,
@@ -88,6 +89,7 @@ const Mock = struct {
     observed_setting_epoch: ?u64 = null,
     setting_epoch_changes_on_describe: bool = false,
     setting_changes_before_admission: bool = false,
+    role_timeout_default: ?i64 = null,
 
     fn settingEpoch(self: *const Mock) ?u64 {
         return if (self.describe_setting_epoch) |epoch| epoch + (if (self.setting_epoch_changes_on_describe) self.describes - 1 else 0) else null;
@@ -111,10 +113,11 @@ const Mock = struct {
     fn loadSettings(raw: *anyopaque, alloc: std.mem.Allocator, _: backend.Identity, request: backend.Request) !@import("antfly_local_sources").sql_setting_catalog.RawSnapshot {
         const self: *Mock = @ptrCast(@alignCast(raw));
         self.setting_snapshots += 1;
-        const definitions = try alloc.alloc(@import("antfly_local_sources").sql_setting_catalog.Definition, 3);
+        const definitions = try alloc.alloc(@import("antfly_local_sources").sql_setting_catalog.Definition, if (self.role_timeout_default != null) 4 else 3);
         definitions[0] = .{ .identity = .{ .id = 1, .generation = self.setting_generation }, .name = "app.limit", .kind = .integer, .session_writable = true, .default = .{ .integer = 3 } };
         definitions[1] = .{ .identity = .{ .id = 2, .generation = 1 }, .name = "app.tenant", .kind = .string, .policy_sensitive = true, .default = .{ .string = "owner" } };
         definitions[2] = .{ .identity = .{ .id = 3, .generation = 1 }, .name = "app.tenant_id", .kind = .string, .session_writable = true, .default = .{ .string = "unassigned" } };
+        if (self.role_timeout_default) |value| definitions[3] = .{ .identity = .{ .id = 4, .generation = 1 }, .name = "statement_timeout", .kind = .integer, .session_writable = true, .default = .{ .integer = 0 }, .role_default = .{ .integer = value } };
         return .{ .scope = .{ .principal = "tester", .database = request.database orelse "db" }, .epoch = self.setting_generation, .definitions = definitions };
     }
     fn validateNamespace(raw: *anyopaque, _: std.mem.Allocator, _: backend.Identity, request: backend.Request) !void {
@@ -245,10 +248,17 @@ const Mock = struct {
     fn execute(raw: *anyopaque, alloc: std.mem.Allocator, _: backend.Identity, request: backend.Request) !backend.Result {
         const self: *Mock = @ptrCast(@alignCast(raw));
         if (self.array_parameters) for (request.parameters) |parameter| try retainedAllocator(parameter, alloc);
-        if (self.result_override) |result| return result;
+        if (self.result_override) |result| {
+            self.result_override_executions += 1;
+            return result;
+        }
         self.observed_setting = if (request.setting_overlay.len == 0) null else request.setting_overlay[0].value.integer;
         try self.checkSettingEpoch(request);
         self.executions += 1;
+        if (std.mem.eql(u8, request.statement, "ALTER ROLE tester SET statement_timeout='1ms'")) {
+            self.role_timeout_default = 1;
+            return .{ .command_tag = "ALTER ROLE" };
+        }
         if (std.mem.startsWith(u8, request.statement, "SELECT")) {
             if (self.receipt_budget_fallback) {
                 const budget = request.read_receipt_budget orelse return error.InvalidSqlBackendResponse;
@@ -473,6 +483,56 @@ fn run(mock: *Mock, input: []const u8, limits: protocol.Limits) !std.Io.Writer.A
     defer session.deinit();
     try session.run();
     return output;
+}
+
+test "pgwire role default publication affects only future logins and RESET retains login timeout" {
+    const Check = struct {
+        fn rows(bytes: []const u8, expected: []const []const u8) !void {
+            var messages: protocol.Cursor = .{ .bytes = bytes };
+            var count: usize = 0;
+            while (messages.offset < messages.bytes.len) {
+                const tag = try messages.int(u8);
+                const length = try messages.int(u32);
+                var body: protocol.Cursor = .{ .bytes = try messages.take(length - 4) };
+                if (tag == 'E') return error.UnexpectedRoleDefaultProtocolError;
+                if (tag == 'D') {
+                    try std.testing.expect(count < expected.len);
+                    try std.testing.expectEqual(@as(u16, 1), try body.int(u16));
+                    const len = try body.int(i32);
+                    try std.testing.expect(len >= 0);
+                    try std.testing.expectEqualStrings(expected[count], try body.take(@intCast(len)));
+                    try body.finish();
+                    count += 1;
+                }
+            }
+            try std.testing.expectEqual(expected.len, count);
+        }
+    };
+    var input = std.Io.Writer.Allocating.init(std.testing.allocator);
+    defer input.deinit();
+    try startup(&input.writer);
+    for ([_][]const u8{
+        "SHOW statement_timeout\x00",
+        "ALTER ROLE tester SET statement_timeout='1ms'\x00",
+        "SHOW statement_timeout\x00",
+        "SET statement_timeout='5ms'\x00",
+        "RESET statement_timeout\x00",
+        "SHOW statement_timeout\x00",
+        "RESET ALL\x00",
+        "SHOW statement_timeout\x00",
+    }) |sql| try frame(&input.writer, 'Q', sql);
+    try frame(&input.writer, 'X', "");
+    var mock: Mock = .{ .role_timeout_default = 42 };
+    var old = try run(&mock, input.written(), .{});
+    defer old.deinit();
+    try Check.rows(old.written(), &.{ "42ms", "42ms", "42ms", "42ms" });
+    input.clearRetainingCapacity();
+    try startup(&input.writer);
+    try frame(&input.writer, 'Q', "SHOW statement_timeout\x00");
+    try frame(&input.writer, 'X', "");
+    var future = try run(&mock, input.written(), .{});
+    defer future.deinit();
+    try Check.rows(future.written(), &.{"1ms"});
 }
 
 fn tags(alloc: std.mem.Allocator, bytes: []const u8) ![]u8 {
@@ -1940,6 +2000,56 @@ test "pgwire unknown DDL admission never claims a committed declaration" {
     try std.testing.expect(std.mem.indexOf(u8, output.written(), "40003") != null);
     try std.testing.expect(std.mem.indexOf(u8, output.written(), "committed") == null);
     try std.testing.expect(std.mem.indexOf(u8, output.written(), "job-1") != null);
+}
+
+test "pgwire catalog recovery receipt preserves exact identity and never completes uncertain DDL" {
+    for ([_]bool{ false, true }) |unknown| {
+        var input = std.Io.Writer.Allocating.init(std.testing.allocator);
+        defer input.deinit();
+        try startup(&input.writer);
+        try frame(&input.writer, 'Q', "CREATE SEQUENCE counter\x00");
+        try frame(&input.writer, 'X', "");
+        var mock: Mock = .{ .result_override = .{
+            .command_tag = if (unknown) "DDL PENDING" else "CREATE SEQUENCE",
+            .mutation_outcome = if (unknown) null else .committed,
+            .catalog_receipt_json = if (unknown)
+                "{\"state\":\"unknown\",\"recovery_token\":\"retained-operation\"}"
+            else
+                "{\"state\":\"committed\",\"recovery_token\":\"retained-operation\",\"object_id\":\"18446744073709551615\"}",
+        } };
+        var output = try run(&mock, input.written(), .{});
+        defer output.deinit();
+        const observed = try tags(std.testing.allocator, output.written());
+        defer std.testing.allocator.free(observed);
+        try std.testing.expect(std.mem.indexOf(u8, output.written(), "retained-operation") != null);
+        try std.testing.expectEqual(@as(usize, if (unknown) 0 else 1), std.mem.count(u8, observed, "C"));
+        try std.testing.expectEqual(@as(usize, if (unknown) 1 else 0), std.mem.count(u8, observed, "E"));
+        if (unknown) {
+            try std.testing.expect(std.mem.indexOf(u8, output.written(), "40003") != null);
+            try std.testing.expect(std.mem.indexOf(u8, output.written(), "committed") == null);
+        } else try std.testing.expect(std.mem.indexOf(u8, output.written(), "18446744073709551615") != null);
+    }
+}
+
+test "pgwire catalog recovery receipt drains extended execution until Sync without replay" {
+    var input = std.Io.Writer.Allocating.init(std.testing.allocator);
+    defer input.deinit();
+    try startup(&input.writer);
+    try parse(&input.writer, "ddl", "CREATE SEQUENCE counter", false);
+    try bind(&input.writer, "ddl_portal", "ddl", null);
+    try execute(&input.writer, "ddl_portal", 0);
+    try execute(&input.writer, "ddl_portal", 0);
+    try frame(&input.writer, 'S', "");
+    try frame(&input.writer, 'X', "");
+    var mock: Mock = .{ .result_override = .{ .command_tag = "DDL PENDING", .catalog_receipt_json = "{\"state\":\"unknown\",\"recovery_token\":\"retained-operation\"}" } };
+    var output = try run(&mock, input.written(), .{});
+    defer output.deinit();
+    const observed = try tags(std.testing.allocator, output.written());
+    defer std.testing.allocator.free(observed);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, observed, "E"));
+    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, observed, "C"));
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "40003") != null);
+    try std.testing.expectEqual(@as(usize, 1), mock.result_override_executions);
 }
 
 test "pgwire unknown DDL admission drains extended execution until Sync without replay" {

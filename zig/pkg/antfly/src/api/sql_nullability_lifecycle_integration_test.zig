@@ -13,13 +13,14 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
-//! Original nullability DDL through real schema-rewrite publication and restart.
+//! Original nullability DDL through validation-only publication and restart.
 const std = @import("std");
 const platform = @import("antfly_platform");
 const local = @import("antfly_local_sources");
 const fixture = @import("sql_owner_test_fixture.zig");
 const execute = @import("sql_owner_test_client.zig").execute;
 const wire = @import("antfly_metadata_openapi").types;
+const http = @import("../raft/transport/http_common.zig");
 
 const Expected = struct { id: i64, status: ?[]const u8, upper: ?[]const u8 };
 const initial = [_]Expected{ .{ .id = 1, .status = null, .upper = null }, .{ .id = 2, .status = "open", .upper = "OPEN" } };
@@ -65,28 +66,36 @@ fn expectOwner(ctx: *fixture.Context, expected: fixture.ServingSchema) !void {
 }
 
 const Job = struct {
-    bytes: [128]u8 = undefined,
+    bytes: [@import("schema_validation_recovery.zig").Token.encoded_len]u8 = undefined,
     len: usize = 0,
+    terminal_failure: bool = false,
     fn id(self: *const Job) []const u8 {
         return self.bytes[0..self.len];
     }
 };
 
 fn awaitJob(ctx: *fixture.Context, handle: *const Job, succeeds: bool) !void {
+    if (!succeeds and handle.terminal_failure) return;
+    const uri = try std.fmt.allocPrint(ctx.alloc, "{s}/db/v1/tables/usage_records/schema/publication", .{ctx.metadata_uri});
+    defer ctx.alloc.free(uri);
+    const headers = try ctx.alloc.alloc(http.RequestHeader, ctx.admin_headers.len + 1);
+    defer ctx.alloc.free(headers);
+    @memcpy(headers[0..ctx.admin_headers.len], ctx.admin_headers);
+    headers[headers.len - 1] = .{ .name = "X-Antfly-Schema-Validation-Token", .value = handle.id() };
     const deadline = platform.time.monotonicNs() +| 30 * std.time.ns_per_s;
     while (platform.time.monotonicNs() < deadline) {
         try ctx.checkDrivers();
-        var response = try fixture.job(ctx.alloc, ctx.transport, ctx.admin_headers, ctx.metadata_uri, handle.id());
+        var response = try ctx.transport.execute(ctx.alloc, .{ .method = .GET, .uri = uri, .authorization = headers[0].value, .headers = headers[1..], .timeout_ms = 5000, .max_response_bytes = 16 * 1024 });
         defer response.deinit(ctx.alloc);
         try std.testing.expectEqual(@as(u16, 200), response.status);
-        var parsed = try std.json.parseFromSlice(std.json.Value, ctx.alloc, response.body, .{});
+        var parsed = try std.json.parseFromSlice(wire.SchemaValidationStatus, ctx.alloc, response.body, .{});
         defer parsed.deinit();
-        const phase = (try fixture.field(parsed.value, "phase")).string;
-        if (std.mem.eql(u8, phase, if (succeeds) "succeeded" else "failed")) {
-            if (!succeeds) try std.testing.expectEqualStrings("BackupIntegrityFailure", (try fixture.field(parsed.value, "error")).string);
+        const state = parsed.value.state;
+        if (state == if (succeeds) wire.SchemaValidationState.succeeded else .failed) {
+            if (!succeeds) try std.testing.expectEqual(wire.SchemaValidationFailure.not_null_violation, parsed.value.failure.?);
             return;
         }
-        if (std.mem.eql(u8, phase, if (succeeds) "failed" else "succeeded")) {
+        if (state == if (succeeds) wire.SchemaValidationState.failed else .succeeded) {
             std.debug.print("unexpected nullability job: {s}\n", .{response.body});
             return error.UnexpectedNullabilityPublication;
         }
@@ -100,16 +109,26 @@ fn rewrite(ctx: *fixture.Context, statement: []const u8, handle: *Job, succeeds:
     // never by repeating ALTER and possibly creating another physical target.
     var response = try fixture.sql(ctx.alloc, ctx.transport, ctx.admin_headers, ctx.metadata_uri, statement);
     defer response.deinit(ctx.alloc);
-    if (response.status != 202 and response.status != 409) {
+    if (!succeeds and response.status >= 400) {
+        var diagnostic = try std.json.parseFromSlice(struct { code: ?[]const u8 = null }, ctx.alloc, response.body, .{ .ignore_unknown_fields = true });
+        defer diagnostic.deinit();
+        if (diagnostic.value.code) |code| {
+            try std.testing.expectEqualStrings("23502", code);
+            handle.terminal_failure = true;
+            return;
+        }
+    }
+    if (response.status != 200 and response.status != 202 and response.status != 409) {
         std.debug.print("nullability admission status={d} body={s}\n", .{ response.status, response.body });
         return error.UnexpectedNullabilityAdmission;
     }
     var parsed = try std.json.parseFromSlice(wire.SQLResponse, ctx.alloc, response.body, .{});
     defer parsed.deinit();
     const receipt = parsed.value.ddl_receipt orelse return error.MissingNullabilityReceipt;
-    const expected_state: @TypeOf(receipt.state) = if (response.status == 202) .pending else .admission_unknown;
+    const expected_state: @TypeOf(receipt.state) = if (response.status == 200) .ready else if (response.status == 202) .pending else .admission_unknown;
     try std.testing.expectEqual(expected_state, receipt.state);
-    const id = receipt.restore_job_id orelse return error.MissingNullabilityJob;
+    try std.testing.expect(receipt.restore_job_id == null);
+    const id = receipt.schema_validation_token orelse return error.MissingNullabilityJob;
     if (id.len == 0 or id.len > handle.bytes.len) return error.InvalidNullabilityJob;
     @memcpy(handle.bytes[0..id.len], id);
     handle.len = id.len;

@@ -1105,6 +1105,54 @@ pub const GroupResult = struct {
     aggregate_slots: ?[]const u16 = null,
 };
 
+test "SQL hash batch admission charges cold column directories before retention" {
+    var parent: MemoryBudget = .{ .backing = std.testing.allocator, .limit = 1024 * 1024 };
+    defer std.debug.assert(parent.live == 0);
+    const join = try HashJoin.create(parent.allocator(), .{ .bytes = parent.limit });
+    defer join.deinit();
+    const row: [64]Datum = @splat(.{});
+    const key = [_]Datum{Datum.json(.{ .integer = 1 })};
+    const rows = [_][]const Datum{&row};
+    const keys = [_][]const Datum{&key};
+    parent.limit = parent.live + 16 * 1024;
+    try std.testing.expectEqual(@as(usize, 0), try join.addBatchUntilFull(std.testing.allocator, .{ .rows = &rows }, &keys));
+    try std.testing.expectEqual(@as(usize, 0), join.row_count);
+    try std.testing.expect(!parent.isLocallyExhausted());
+}
+
+test "SQL hash batch admission reserves geometric entry replacement before growth" {
+    var parent: MemoryBudget = .{ .backing = std.testing.allocator, .limit = 1024 * 1024 };
+    defer std.debug.assert(parent.live == 0);
+    const join = try HashJoin.create(parent.allocator(), .{ .bytes = parent.limit });
+    defer join.deinit();
+    const row = [_]Datum{Datum.json(.{ .integer = 1 })};
+    while (join.entries.items.len < 256 or join.entries.items.len != join.entries.capacity) try join.add(&row, &row);
+    const rows = [_][]const Datum{&row};
+    const before = join.row_count;
+    parent.limit = parent.live + 6144;
+    try std.testing.expectEqual(@as(usize, 0), try join.addBatchUntilFull(std.testing.allocator, .{ .rows = &rows }, &rows));
+    try std.testing.expectEqual(before, join.row_count);
+    try std.testing.expect(!parent.isLocallyExhausted());
+}
+
+test "SQL hash batch admission respects enclosing quota before retained mutation" {
+    var parent: MemoryBudget = .{ .backing = std.testing.allocator, .limit = 128 * 1024 };
+    defer std.debug.assert(parent.live == 0);
+    const join = try HashJoin.create(parent.allocator(), .{ .bytes = parent.limit });
+    defer join.deinit();
+    // A sibling retains most of the statement budget while this hash still
+    // has its entire local allowance. Declining must not poison either quota.
+    const sibling = try parent.allocator().alloc(u8, parent.limit - parent.live - 2048);
+    defer parent.allocator().free(sibling);
+    const row = [_]Datum{Datum.json(.{ .integer = 1 })};
+    const rows = [_][]const Datum{&row};
+    try std.testing.expectEqual(@as(usize, 0), try join.addBatchUntilFull(std.testing.allocator, .{ .rows = &rows }, &rows));
+    try std.testing.expectEqual(@as(usize, 0), join.row_count);
+    try std.testing.expectEqual(@as(usize, 0), join.entries.items.len);
+    try std.testing.expect(!parent.isLocallyExhausted());
+    try std.testing.expect(!join.budget.isLocallyExhausted());
+}
+
 /// Build-side ownership for a streaming hash join. Probe rows remain borrowed
 /// from one native page; only the build relation occupies retained memory.
 pub const HashJoin = struct {
@@ -1597,18 +1645,28 @@ pub const HashJoin = struct {
             if (row.len > 256 or (self.key_count != null and row.len != self.key_count.?)) return error.InvalidSqlBackendResponse;
             for (row) |value| needed +|= (try datumBytes(value)) *| 4;
         }
-        needed +|= self.value_columns.dictionaryGrowthBytes(batch.len()) *| 2;
-        needed +|= self.key_columns.dictionaryGrowthBytes(keys.len) *| 2;
+        needed +|= MemoryBudget.arrayListGrowthBytes(self.entries, keys.len);
+        needed +|= MemoryBudget.hashTableGrowthBytes(self.heads, keys.len);
+        if (!self.value_columns.initialized) needed +|= @import("typed_store.zig").columnMetadataBytes(batch.width());
+        if (!self.key_columns.initialized and keys.len != 0) needed +|= @import("typed_store.zig").columnMetadataBytes(keys[0].len);
+        needed +|= self.value_columns.appendGrowthBytes(batch.len()) *| 2;
+        needed +|= self.key_columns.appendGrowthBytes(keys.len) *| 2;
         // A final single row may cross the soft halfway mark, as scalar
         // admission historically did. The allocator retains the hard ceiling.
         const ceiling = if (keys.len == 1 and self.budget.live <= self.budget.limit / 2) self.budget.limit else self.budget.limit / 2;
-        const available = ceiling -| self.budget.live;
+        const retained = self.budget.allocator();
+        // Input decoding and sibling operators share the statement quota.
+        // Local hash headroom is not a reservation in that enclosing budget.
+        const available = @min(ceiling -| self.budget.live, @import("memory_budget.zig").headroom(retained) orelse std.math.maxInt(usize));
         if (needed > available) return false;
         needed +|= (try self.value_columns.batchAppendBytesLeased(a, batch, (available - needed) / 4, payloads)) *| 4;
         if (needed > available) return false;
         const hashes = try @import("batch_hash.zig").rows(a, keys, false);
         defer a.free(hashes);
-        const retained = self.budget.allocator();
+        // Key hashing/JSON leases may have consumed parent scratch capacity
+        // since the first estimate. Decline atomically before retained writes
+        // so the caller can partition/spill without poisoning quota admission.
+        if (needed > (@import("memory_budget.zig").headroom(retained) orelse available)) return false;
         try self.entries.ensureUnusedCapacity(retained, keys.len);
         try self.heads.ensureUnusedCapacity(retained, @intCast(keys.len));
         try self.value_columns.appendBatchLeased(batch, payloads);

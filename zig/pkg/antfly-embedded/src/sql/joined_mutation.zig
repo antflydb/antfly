@@ -224,7 +224,7 @@ pub fn bind(alloc: Allocator, backend: catalog.Backend, table: catalog.Table, co
     const input = try alloc.create(describe.BoundStatement);
     input.* = try describe.bind(alloc, adapter.iface(), &selected, parameters);
     for (input.columns, expected.items) |actual, required| {
-        if (!actual.untyped_null and actual.type != required.kind and !@import("builtin_cast.zig").numericAssignmentAllowed(actual.type, required.kind orelse return error.InvalidSqlBackendResponse)) return if (required.kind == .array) error.SqlAssignmentTypeMismatch else error.SqlTypeMismatch;
+        if (!actual.untyped_null and actual.type != required.kind and required.kind != .string and !@import("builtin_cast.zig").numericAssignmentAllowed(actual.type, required.kind orelse return error.InvalidSqlBackendResponse)) return if (required.kind == .array) error.SqlAssignmentTypeMismatch else error.SqlTypeMismatch;
         if (actual.type == .array and required.kind == .array and !@import("builtin_cast.zig").assignmentAllowed(actual.element_type orelse return error.SqlAssignmentTypeMismatch, required.element_type orelse return error.SqlAssignmentTypeMismatch)) return error.SqlAssignmentTypeMismatch;
     }
     // FROM/USING columns also participate in RETURNING name resolution.
@@ -483,13 +483,13 @@ pub fn execute(execution: anytype, definition_: Bound) !runtime.Output {
             } else null;
             if (!bound.deleting) for (bound.fields, bound.preserve, values[5..][0..bound.fields.len], bound.input.columns[5..][0..bound.fields.len]) |field, preserve, datum, source_column| {
                 if (preserve and !present.contains(field.name)) continue;
-                const stored = try context.storageDatumTyped(datum, field, source_column.element_type);
+                const stored = try context.storageDatumTyped(datum, field, scalar.assignmentSourceIdentity(source_column.type, source_column.element_type));
                 if (table.isDocumentRoot(field.name)) {
                     if (datum.sql_null) return error.SqlNotNullViolation;
                     if (stored != .object) return error.SqlTypeMismatch;
                     object = stored.object;
                     try json_null_fields.appendSlice(context.arena, try table.documentRootNulls(context.arena, stored));
-                } else try object.put(context.arena, field.path, stored);
+                } else try field.assignStorageValue(context.arena, &object, stored, datum.sql_null);
                 if (field.type == .json and !datum.sql_null and datum.value == .null) try json_null_fields.append(context.arena, field.path);
             };
             try mutations.append(context.alloc, .{ .key = key, .expected_version = version, .expected_content_digest = digest, .row = if (bound.deleting) null else .{ .object = object }, .json_null_fields = json_null_fields.items, .previous = previous });
@@ -540,7 +540,7 @@ fn relationalReturningOutput(context: runtime.Context, bound: Bound, input: []co
         name.* = field.internal;
         if (std.mem.eql(u8, field.qualifier, bound.target_qualifier)) try fields.append(context.arena, field.name);
     }
-    const images = try runtime.Context.ReturningImages.init(context.arena, context.binding.table.?, fields.items);
+    const images = try runtime.Context.ReturningImages.initAtVersion(context.arena, context.binding.table.?, fields.items, context.backend.write_version);
     const layout = try catalog.Row.TypedLayout.init(context.arena, names);
     const Cursor = @import("result_cursor.zig").Cursor;
     const rows = if (context.spill) |manager| try Cursor.create(context.alloc, manager, names.len) else try Cursor.createMemory(context.alloc, names.len, context.limits.retained_bytes / 2);
@@ -590,7 +590,7 @@ fn returningOutput(context: runtime.Context, bound: Bound, plan: @import("mutati
     for (bound.returning_scope, required) |field, needed| if (needed and std.mem.eql(u8, field.qualifier, bound.target_qualifier)) {
         try fields.append(context.arena, field.name);
     };
-    const images = try runtime.Context.ReturningImages.init(context.arena, context.binding.table.?, fields.items);
+    const images = try runtime.Context.ReturningImages.initAtVersion(context.arena, context.binding.table.?, fields.items, context.backend.write_version);
     const rows = try context.arena.alloc([]const std.json.Value, input.len);
     const nulls = try context.arena.alloc([]const bool, input.len);
     const native_rows = if (context.limits.native_result) try context.arena.alloc([]const scalar.Datum, input.len) else null;

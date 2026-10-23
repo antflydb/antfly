@@ -776,6 +776,20 @@ fn decodeInput(a: A, descriptor: scalar.Type, input: Input, limits: Limits, work
         if (input == .datum and (input.datum.array != null or input.datum.numeric != null or input.datum.patterns() != null or input.datum.value != .null)) return error.SqlTypeMismatch;
         return .{};
     }
+    if (descriptor.temporal_kind) |temporal_kind| {
+        if (input == .array_envelope) return error.SqlTypeMismatch;
+        const temporal = @import("temporal_value.zig");
+        const owned = try a.create(temporal.Value);
+        if (input == .datum and input.datum.temporal() != null) {
+            if (input.datum.temporal().?.kind() != temporal_kind) return error.ConflictingSqlParameterTypes;
+            owned.* = input.datum.temporal().?.*;
+        } else {
+            const raw = if (input == .text) input.text else if (input == .binary) input.binary else if (input.datum.array == null and input.datum.value == .string) input.datum.value.string else return error.SqlTypeMismatch;
+            try work.consume(raw.len);
+            owned.* = if (input == .binary) try temporal.decode(temporal_kind, raw) else try @import("temporal_text.zig").parseInput(temporal_kind, raw);
+        }
+        return scalar.Datum.typedTemporal(owned);
+    }
     if (descriptor.kind == .datetime) {
         if (input == .array_envelope) return error.SqlTypeMismatch;
         if (input == .binary) return error.UnsupportedSqlShape;

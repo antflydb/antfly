@@ -22,6 +22,15 @@
 //! duplicate, stale, or multiply-owned entries before any shard is compiled.
 
 comptime {
+    _ = @import("antfly_local_sources").storage_db_native_backup_origin;
+    _ = @import("antfly_local_sources").storage_db_relational_schema_apply_outcome;
+    _ = @import("antfly_local_sources").storage_db_relational_schema_audit_cache;
+    _ = @import("antfly_local_sources").storage_db_relational_schema_owner_contract;
+    _ = @import("antfly_local_sources").storage_document_projection;
+    _ = @import("antfly_local_sources").storage_engine;
+    _ = @import("antfly_local_sources").storage_logical_source;
+    _ = @import("antfly_local_sources").storage_transaction_cohort_proof;
+    _ = @import("antfly_local_sources").storage_transaction_debt;
     _ = @import("antfly_local_sources").storage_db_artifact_graph_completion;
     _ = @import("antfly_local_sources").storage_db_artifact_input_test;
     _ = @import("antfly_local_sources").storage_db_entity_alias_curation;

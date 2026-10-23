@@ -461,12 +461,16 @@ test "pgwire cursor spool owns frozen JSON leases and unwinds allocation failure
             try std.testing.expect(cell.frozen_json.?.bytes.ptr == (try store.cell(63, 0)).frozen_json.?.bytes.ptr);
             try std.testing.expect(budget.used < 64 * 1024);
             if (measure) std.debug.print("PGWIRE_SHARED_FROZEN rows=64 payload_bytes={d} retained={d} shared=true\n", .{ cell.frozen_json.?.bytes.len, budget.used });
-            var output: [12008]u8 = undefined;
+            // PostgreSQL JSONB emits the space after the object colon; the
+            // compact API-JSON payload length is not the pgwire frame length.
+            var output: [12009]u8 = undefined;
             var writer: std.Io.Writer = .fixed(&output);
             var scratch = std.heap.FixedBufferAllocator.init(&.{});
             try @import("values.zig").encodeCellInto(scratch.allocator(), &writer, .{ .name = "j", .type = .json }, 0, cell, output.len);
-            try std.testing.expectEqual(@as(usize, 12008), writer.buffered().len);
-            try std.testing.expectEqual(@as(u8, 'x'), writer.buffered()[12005]);
+            try std.testing.expectEqual(@as(usize, 12009), writer.buffered().len);
+            try std.testing.expect(std.mem.startsWith(u8, writer.buffered(), "{\"x\": \""));
+            try std.testing.expect(std.mem.endsWith(u8, writer.buffered(), "\"}"));
+            try std.testing.expectEqual(@as(u8, 'x'), writer.buffered()[12006]);
         }
     };
     try Fixture.run(std.testing.allocator, true);

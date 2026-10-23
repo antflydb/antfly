@@ -19,7 +19,14 @@ const platform = @import("antfly_platform");
 const fixture = @import("sql_owner_test_fixture.zig");
 const http = @import("../raft/transport/http_common.zig");
 
-pub const Retry = enum { never, read, write_admission };
+pub const Retry = enum {
+    never,
+    read,
+    write_admission,
+    /// Only pure fixture observations, never arbitrary SELECT expressions or
+    /// mutations. An active session's read may contend with maintenance.
+    session_observation,
+};
 /// Real scoped credentials for long Debug HTTP campaigns. Keep password
 /// hashing unchanged and reserve Basic verification for authentication tests.
 pub const ApiKeyHeaders = struct {
@@ -54,26 +61,64 @@ const Diagnostic = struct {
     admission_outcome: ?[]const u8 = null,
     status: ?[]const u8 = null,
     ddl_receipt: ?std.json.Value = null,
+    catalog_receipt: ?std.json.Value = null,
 };
 
 fn definiteReadAdmission(diagnostic: Diagnostic) bool {
     return diagnostic.retryable and std.mem.eql(u8, diagnostic.code, "53300") and
         std.mem.startsWith(u8, diagnostic.message, "A consistent SQL statement read is temporarily unavailable.") and
         std.mem.eql(u8, diagnostic.transaction_status, "idle") and diagnostic.transaction_id == null and
-        diagnostic.mutation_outcome == null and diagnostic.admission_outcome == null and diagnostic.status == null and diagnostic.ddl_receipt == null;
+        diagnostic.mutation_outcome == null and diagnostic.admission_outcome == null and diagnostic.status == null and diagnostic.ddl_receipt == null and diagnostic.catalog_receipt == null;
 }
 
 fn definiteDdlNonadmission(diagnostic: Diagnostic) bool {
     return diagnostic.retryable and std.mem.eql(u8, diagnostic.code, "53300") and
         std.mem.startsWith(u8, diagnostic.message, "The relation catalog publication is not ready to authorize this DDL. No schema change was admitted.") and
         std.mem.eql(u8, diagnostic.transaction_status, "idle") and diagnostic.transaction_id == null and
-        diagnostic.mutation_outcome == null and diagnostic.admission_outcome == null and diagnostic.status == null and diagnostic.ddl_receipt == null;
+        diagnostic.mutation_outcome == null and diagnostic.admission_outcome == null and diagnostic.status == null and diagnostic.ddl_receipt == null and diagnostic.catalog_receipt == null;
+}
+
+fn sessionObservationCapacity(diagnostic: Diagnostic) bool {
+    return diagnostic.retryable and std.mem.eql(u8, diagnostic.code, "53300") and
+        std.mem.startsWith(u8, diagnostic.message, "SQL execution capacity is temporarily exhausted.") and
+        std.mem.eql(u8, diagnostic.transaction_status, "in_transaction") and diagnostic.transaction_id == null and
+        diagnostic.mutation_outcome == null and diagnostic.admission_outcome == null and diagnostic.status == null and diagnostic.ddl_receipt == null and diagnostic.catalog_receipt == null;
+}
+
+test "SQL session observations retry only pure active reads without mutation outcomes" {
+    const safe: Diagnostic = .{ .code = "53300", .message = "SQL execution capacity is temporarily exhausted.", .retryable = true, .transaction_status = "in_transaction" };
+    try std.testing.expect(sessionObservationCapacity(safe));
+    try std.testing.expect(!definiteReadAdmission(safe));
+    var changed = safe;
+    changed.catalog_receipt = .null;
+    try std.testing.expect(!sessionObservationCapacity(changed));
+    changed = safe;
+    changed.transaction_status = "failed";
+    try std.testing.expect(!sessionObservationCapacity(changed));
+    changed = safe;
+    changed.transaction_id = "reconciliation";
+    try std.testing.expect(!sessionObservationCapacity(changed));
+    changed = safe;
+    changed.mutation_outcome = "committed_pending";
+    try std.testing.expect(!sessionObservationCapacity(changed));
+    changed = safe;
+    changed.admission_outcome = "unknown";
+    try std.testing.expect(!sessionObservationCapacity(changed));
+    changed = safe;
+    changed.message = "The requested write is not yet visible within the readiness budget.";
+    try std.testing.expect(!sessionObservationCapacity(changed));
+    changed = safe;
+    changed.ddl_receipt = .null;
+    try std.testing.expect(!sessionObservationCapacity(changed));
 }
 
 test "SQL catalog lifecycle retries only explicit definite DDL nonadmission" {
     const safe: Diagnostic = .{ .code = "53300", .message = "The relation catalog publication is not ready to authorize this DDL. No schema change was admitted.", .retryable = true, .transaction_status = "idle" };
     try std.testing.expect(definiteDdlNonadmission(safe));
     var changed = safe;
+    changed.catalog_receipt = .null;
+    try std.testing.expect(!definiteDdlNonadmission(changed));
+    changed = safe;
     changed.ddl_receipt = .null;
     try std.testing.expect(!definiteDdlNonadmission(changed));
     changed = safe;
@@ -91,6 +136,9 @@ test "SQL default lifecycle retries only definite read admission" {
     const safe: Diagnostic = .{ .code = "53300", .message = "A consistent SQL statement read is temporarily unavailable. Retry the complete statement after a bounded delay.", .retryable = true, .transaction_status = "idle" };
     try std.testing.expect(definiteReadAdmission(safe));
     var changed = safe;
+    changed.catalog_receipt = .null;
+    try std.testing.expect(!definiteReadAdmission(changed));
+    changed = safe;
     changed.message = "The requested write is not yet visible within the readiness budget.";
     try std.testing.expect(!definiteReadAdmission(changed));
     changed = safe;
@@ -118,7 +166,18 @@ pub fn execute(ctx: *fixture.Context, statement: []const u8, retry: Retry) !http
 }
 
 pub fn executeIn(ctx: *fixture.Context, namespace: ?[]const u8, statement: []const u8, retry: Retry) !http.HttpResponse {
-    const body = try std.json.Stringify.valueAlloc(ctx.alloc, .{ .statement = statement, .namespace = namespace }, .{ .emit_null_optional_fields = false });
+    return executeConnected(ctx, namespace, null, statement, retry);
+}
+
+pub fn executeConnected(
+    ctx: *fixture.Context,
+    namespace: ?[]const u8,
+    connection: ?[]const u8,
+    statement: []const u8,
+    retry: Retry,
+) !http.HttpResponse {
+    const request = .{ .statement = statement, .namespace = namespace, .connection_id = connection };
+    const body = try std.json.Stringify.valueAlloc(ctx.alloc, request, .{ .emit_null_optional_fields = false });
     defer ctx.alloc.free(body);
     const deadline = platform.time.monotonicNs() +| 15 * std.time.ns_per_s;
     while (true) {
@@ -134,7 +193,10 @@ pub fn executeIn(ctx: *fixture.Context, namespace: ?[]const u8, statement: []con
                 return err;
             };
             defer diagnostic.deinit();
-            if (definiteReadAdmission(diagnostic.value) or (retry == .write_admission and definiteDdlNonadmission(diagnostic.value))) {
+            if (definiteReadAdmission(diagnostic.value) or
+                (retry == .write_admission and definiteDdlNonadmission(diagnostic.value)) or
+                (retry == .session_observation and connection != null and sessionObservationCapacity(diagnostic.value)))
+            {
                 response.deinit(ctx.alloc);
                 try ctx.io.sleep(.fromMilliseconds(20), .awake);
                 continue;

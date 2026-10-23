@@ -1,6 +1,18 @@
 #!/usr/bin/env python3
 # Copyright 2026 Antfly, Inc.
 # SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 """Qualify original tablespace name lifecycles, not physical location moves."""
 
@@ -15,6 +27,7 @@ IDS = ("sql-0111", "sql-0112", "sql-0113")
 
 
 def reference():
+    import psycopg
     from psycopg import sql
 
     originals = {
@@ -51,6 +64,39 @@ def reference():
                     setup.append(
                         f"CREATE TABLESPACE {before_name} LOCATION '/var/lib/antfly/fastspace'"
                     )
+                    db.execute(
+                        sql.SQL(
+                            "CREATE TABLE usage_records(id UUID,status TEXT) TABLESPACE {}"
+                        ).format(sql.Identifier(before_name))
+                    )
+                    db.execute(
+                        "INSERT INTO usage_records(id,status) VALUES ('00000000-0000-0000-0000-000000000001','retained')"
+                    )
+                witness = None
+                if identity == "sql-0112":
+                    try:
+                        db.execute("DROP TABLESPACE fastspace_archive;")
+                        raise AssertionError("in-use tablespace was dropped")
+                    except psycopg.Error as error:
+                        assert error.sqlstate == "55000"
+                    witness = {
+                        "in_use_sqlstate": "55000",
+                        "preserved_binding": True,
+                        "rows": [["00000000-0000-0000-0000-000000000001", "retained"]],
+                    }
+                    assert (
+                        db.execute(
+                            "SELECT reltablespace FROM pg_class WHERE oid='usage_records'::regclass"
+                        ).fetchone()[0]
+                        == prior[0]
+                    )
+                    assert [
+                        list(row)
+                        for row in db.execute(
+                            "SELECT id::text,status FROM usage_records"
+                        ).fetchall()
+                    ] == witness["rows"]
+                    db.execute("DROP TABLE usage_records")
                 original = originals[identity]
                 assert not original["params"]
                 command_tag = db.execute(original["sql"]).statusmessage
@@ -63,6 +109,28 @@ def reference():
                     assert (
                         after[0][1] == "fastspace_archive" and after[0][2] == prior[1]
                     )
+                    try:
+                        db.execute("DROP TABLESPACE fastspace_archive;")
+                        raise AssertionError("renamed in-use tablespace was dropped")
+                    except psycopg.Error as error:
+                        assert error.sqlstate == "55000"
+                    witness = {
+                        "in_use_sqlstate": "55000",
+                        "preserved_binding": True,
+                        "rows": [["00000000-0000-0000-0000-000000000001", "retained"]],
+                    }
+                    assert (
+                        db.execute(
+                            "SELECT reltablespace FROM pg_class WHERE oid='usage_records'::regclass"
+                        ).fetchone()[0]
+                        == prior[0]
+                    )
+                    assert [
+                        list(row)
+                        for row in db.execute(
+                            "SELECT id::text,status FROM usage_records"
+                        ).fetchall()
+                    ] == witness["rows"]
                 else:
                     assert not after
                 case = {
@@ -72,6 +140,7 @@ def reference():
                     "name": "fastspace_archive",
                     "present": rename,
                     "command_tag": command_tag,
+                    "witness": witness,
                 }
                 if rename:
                     case["prior_name"] = before_name
@@ -81,6 +150,7 @@ def reference():
                     assert db.execute(original["sql"]).statusmessage == command_tag
                 cases.append(case)
                 if rename:
+                    db.execute("DROP TABLE usage_records")
                     db.execute("DROP TABLESPACE fastspace_archive")
     return {"format": 1, "entries": cases}
 

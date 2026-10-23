@@ -214,11 +214,16 @@ pub fn captureSnapshot(owner: anytype, group_id: u64, through_index: u64) !snaps
         .through_index = through_index,
         .native_term = if (pin.receipt) |value| value.term else 0,
         .native_index = if (pin.receipt) |value| value.index else 0,
+        .origin = pin.origin,
+        .schema_header = pin.schema_header,
     } };
 }
 
 pub fn verifySnapshot(owner: anytype, expected: snapshots.Identity) !void {
-    try physicalOwner(owner).verifyTransferablePrimarySnapshot(expected.namespace, if (expected.native_index == 0 and expected.native_term == 0) null else .{ .term = expected.native_term, .index = expected.native_index });
+    const cut: ?types.OrderedApplyReceipt = if (expected.native_index == 0 and expected.native_term == 0) null else .{ .term = expected.native_term, .index = expected.native_index };
+    if (expected.origin) |origin| {
+        try physicalOwner(owner).verifyTransferablePrimarySnapshotWithOrigin(expected.namespace, cut, origin);
+    } else try physicalOwner(owner).verifyTransferablePrimarySnapshot(expected.namespace, cut);
 }
 
 pub fn applyStorageKernelReplicatedBatchAtRaftEntry(

@@ -1234,8 +1234,15 @@ pub const MetadataHttpClient = struct {
     /// Read-only retries are safe. The response proves the metadata identity;
     /// callers need no preceding status/discovery round trip on the happy path.
     pub fn readSystemCatalog(self: *MetadataHttpClient, base_uri: []const u8, input: @import("../system_catalog/server_call.zig").Call, remaining_ms: u32, cancellation: ?*const http_common.RequestCancellation) !CatalogRead {
+        if (input == .schema_validation_submit) return error.InvalidGenerationPublication;
         if (input == .fk_initial_retirement_page) return error.InitialFkRetirementNotActivated;
         if (input.isMutation()) return error.InvalidCatalogMutation;
+        if (input == .schema_validation_owner_read) try input.schema_validation_owner_read.validate();
+        if (input == .schema_validation_discover) try input.schema_validation_discover.validate();
+        if (input == .schema_validation_work) try input.schema_validation_work.validate();
+        if (input == .schema_validation_prepare) try input.schema_validation_prepare.validate();
+        if (input == .schema_validation_status) try input.schema_validation_status.validate();
+        if (input == .schema_validation_receipt_read) try input.schema_validation_receipt_read.validate();
         if (remaining_ms == 0) return error.Timeout;
         if (cancellation) |value| if (value.isCancelled()) return error.Cancelled;
         const body = try std.json.Stringify.valueAlloc(self.alloc, input, .{});
@@ -1258,6 +1265,12 @@ pub const MetadataHttpClient = struct {
         };
         var response = try internal_service_auth.executeRequest(self.alloc, self.executor, .{ .method = .POST, .uri = uri, .headers = &headers, .body = body, .content_type = "application/json", .timeout_ms = @min(default_request_timeout_ms, remaining_ms), .cancellation = cancellation, .max_response_bytes = catalogResponseLimit(input) }, self.internal_service);
         defer response.deinit(self.alloc);
+        if (input.isSchemaValidationCall()) {
+            if (response.status != 200) return @import("schema_validation_read.zig").ownerReadHttpFailure(response.status, response.body) orelse error.RemoteUnavailable;
+            const media = responseHeader(response, "content-type") orelse return error.InvalidGenerationPublication;
+            const token = std.mem.trim(u8, media[0 .. std.mem.indexOfScalar(u8, media, ';') orelse media.len], " \t");
+            if (!std.ascii.eqlIgnoreCase(token, input.responseContentType())) return error.InvalidGenerationPublication;
+        }
         if ((input == .fk_initial_create_prepare or input == .constraint_name_prepare or input == .constraint_name_check) and response.status != 200) {
             if (system_catalog.definiteNamingError(response.status, response.body)) |err| return err;
             if (response.status == 405 and std.mem.eql(u8, response.body, "ExtensionOwnedObject")) return error.ExtensionOwnedObject;
@@ -1302,17 +1315,207 @@ pub const MetadataHttpClient = struct {
         if (raw_incarnation.len != 32) return error.InvalidMetadataIncarnation;
         const incarnation: metadata_api.MetadataClusterIncarnation = raw_incarnation[0..32].*;
         if (!@import("antfly_local_sources").metadata_incarnation.isValid(incarnation)) return error.InvalidMetadataIncarnation;
+        const group_id = std.fmt.parseInt(u64, group, 10) catch return error.MetadataGroupMismatch;
+        if (input.schemaValidationLookup()) |lookup| {
+            if (group_id != lookup.group) return error.MetadataGroupMismatch;
+            if (!std.mem.eql(u8, &incarnation, &lookup.metadata_incarnation)) return error.MetadataIncarnationMismatch;
+        }
+        if (input == .schema_validation_discover) {
+            if (group_id != input.schema_validation_discover.group) return error.MetadataGroupMismatch;
+            if (!std.mem.eql(u8, &incarnation, &input.schema_validation_discover.metadata_incarnation)) return error.MetadataIncarnationMismatch;
+        }
+        if (input == .schema_validation_work) {
+            if (group_id != input.schema_validation_work.group) return error.MetadataGroupMismatch;
+            if (!std.mem.eql(u8, &incarnation, &input.schema_validation_work.metadata_incarnation)) return error.MetadataIncarnationMismatch;
+        }
+        if (input == .schema_validation_prepare) {
+            const expected = std.fmt.bytesToHex(input.schema_validation_prepare.guard.incarnation, .lower);
+            if (!std.mem.eql(u8, &incarnation, &expected)) return error.MetadataIncarnationMismatch;
+        }
         return .{
-            .metadata_group_id = std.fmt.parseInt(u64, group, 10) catch return error.MetadataGroupMismatch,
+            .metadata_group_id = group_id,
             .metadata_incarnation = incarnation,
             .body = try self.alloc.dupe(u8, response.body),
         };
+    }
+
+    pub fn readSchemaValidationOwnerControl(self: *MetadataHttpClient, base_uri: []const u8, request: @import("schema_validation_read.zig").OwnerReadRequest, remaining_ms: u32, cancellation: ?*const http_common.RequestCancellation) !std.json.Parsed(@import("schema_validation_read.zig").OwnerControlRead) {
+        if (request.projection != .control) return error.InvalidGenerationPublication;
+        const read = try self.readSystemCatalog(base_uri, .{ .schema_validation_owner_read = request }, remaining_ms, cancellation);
+        defer read.deinit(self.alloc);
+        var parsed = std.json.parseFromSlice(@import("schema_validation_read.zig").OwnerControlRead, self.alloc, read.body, .{ .allocate = .alloc_always }) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return error.InvalidGenerationPublication,
+        };
+        errdefer parsed.deinit();
+        try parsed.value.requireFor(request);
+        return parsed;
+    }
+
+    pub fn readSchemaValidationOwnerInputs(self: *MetadataHttpClient, base_uri: []const u8, request: @import("schema_validation_read.zig").OwnerReadRequest, expected_digest: [32]u8, remaining_ms: u32, cancellation: ?*const http_common.RequestCancellation) ![]u8 {
+        if (request.projection != .inputs or std.mem.allEqual(u8, &expected_digest, 0)) return error.InvalidGenerationPublication;
+        const read = try self.readSystemCatalog(base_uri, .{ .schema_validation_owner_read = request }, remaining_ms, cancellation);
+        errdefer read.deinit(self.alloc);
+        const contract = @import("antfly_local_sources").storage_db_relational_schema_owner_contract;
+        _ = try contract.inputParts(read.body);
+        if (!std.mem.eql(u8, &contract.hash(read.body), &expected_digest)) return error.SchemaValidationJobChanged;
+        return read.body;
+    }
+
+    pub fn readSchemaValidationReceipt(self: *MetadataHttpClient, base_uri: []const u8, request: @import("schema_validation_receipt.zig").Request, remaining_ms: u32, cancellation: ?*const http_common.RequestCancellation) !std.json.Parsed(@import("schema_validation_receipt.zig").Observation) {
+        const read = try self.readSystemCatalog(base_uri, .{ .schema_validation_receipt_read = request }, remaining_ms, cancellation);
+        defer read.deinit(self.alloc);
+        var parsed = std.json.parseFromSlice(@import("schema_validation_receipt.zig").Observation, self.alloc, read.body, .{ .allocate = .alloc_always }) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return error.InvalidGenerationPublication,
+        };
+        errdefer parsed.deinit();
+        _ = try parsed.value.isAcknowledged(request);
+        return parsed;
+    }
+
+    pub fn readSchemaValidationRestoration(self: *MetadataHttpClient, base_uri: []const u8, lookup: @import("schema_validation_read.zig").Lookup, image: @import("schema_validation_read.zig").ImageIdentity, remaining_ms: u32, cancellation: ?*const http_common.RequestCancellation) !std.json.Parsed(?@import("schema_validation_read.zig").RestorationControl) {
+        const response = try self.readSystemCatalog(base_uri, .{ .schema_validation_owner_read = .{ .lookup = lookup, .ordinal = 0, .projection = .parent, .source_image = image } }, remaining_ms, cancellation);
+        defer response.deinit(self.alloc);
+        var parsed = std.json.parseFromSlice(?@import("schema_validation_read.zig").RestorationControl, self.alloc, response.body, .{ .allocate = .alloc_always, .ignore_unknown_fields = false }) catch |err| return if (err == error.OutOfMemory) err else error.InvalidGenerationPublication;
+        errdefer parsed.deinit();
+        if (parsed.value) |value| try value.requireFor(lookup, image);
+        return parsed;
+    }
+
+    pub fn readSchemaValidationRecoveryInputs(self: *MetadataHttpClient, base_uri: []const u8, parent: @import("schema_validation_parent.zig").Request, remaining_ms: u32, cancellation: ?*const http_common.RequestCancellation) ![]u8 {
+        try parent.validate();
+        const response = try self.readSystemCatalog(base_uri, .{ .schema_validation_owner_read = .{ .lookup = parent.lookup, .ordinal = parent.ordinal, .projection = .recovery_inputs, .source_image = try parent.image() } }, remaining_ms, cancellation);
+        errdefer response.deinit(self.alloc);
+        const contract = @import("antfly_local_sources").storage_db_relational_schema_owner_contract;
+        _ = try contract.inputParts(response.body);
+        if (!std.mem.eql(u8, &contract.hash(response.body), &parent.signed.value.binding.inputs)) return error.SchemaValidationJobChanged;
+        return response.body;
+    }
+
+    pub fn readSchemaValidationReplay(self: *MetadataHttpClient, base_uri: []const u8, lookup: @import("schema_validation_read.zig").Lookup, address: @import("schema_validation_read.zig").OwnerAddress, remaining_ms: u32, cancellation: ?*const http_common.RequestCancellation) !std.json.Parsed(?@import("schema_validation_read.zig").ReplayControl) {
+        const response = try self.readSystemCatalog(base_uri, .{ .schema_validation_owner_read = .{ .lookup = lookup, .ordinal = 0, .projection = .replay, .source_owner = address } }, remaining_ms, cancellation);
+        defer response.deinit(self.alloc);
+        var parsed = std.json.parseFromSlice(?@import("schema_validation_read.zig").ReplayControl, self.alloc, response.body, .{ .allocate = .alloc_always, .ignore_unknown_fields = false }) catch |err| return if (err == error.OutOfMemory) err else error.InvalidGenerationPublication;
+        errdefer parsed.deinit();
+        if (parsed.value) |value| try value.requireFor(lookup, address);
+        return parsed;
+    }
+
+    pub fn readSchemaValidationReplayInputs(self: *MetadataHttpClient, base_uri: []const u8, control: @import("schema_validation_read.zig").ReplayControl, remaining_ms: u32, cancellation: ?*const http_common.RequestCancellation) ![]u8 {
+        const lookup = @import("schema_validation_read.zig").Lookup.fromHead(control.head);
+        const address = @import("schema_validation_read.zig").OwnerAddress.fromBinding(control.owner.binding);
+        try control.requireFor(lookup, address);
+        const response = try self.readSystemCatalog(base_uri, .{ .schema_validation_owner_read = .{ .lookup = lookup, .ordinal = control.owner.ordinal, .projection = .replay_inputs, .source_owner = address } }, remaining_ms, cancellation);
+        errdefer response.deinit(self.alloc);
+        const contract = @import("antfly_local_sources").storage_db_relational_schema_owner_contract;
+        _ = try contract.inputParts(response.body);
+        if (!std.mem.eql(u8, &contract.hash(response.body), &control.owner.binding.inputs)) return error.SchemaValidationJobChanged;
+        return response.body;
+    }
+
+    /// One raw binary command, one attempt. A successful HTTP response is not
+    /// acceptance until its durable observation matches the retained command.
+    pub fn submitSchemaValidationControlled(self: *MetadataHttpClient, base_uri: []const u8, command: []const u8, remaining_ms: u32, setting_admin: bool, cancellation: ?*const http_common.RequestCancellation) ![]u8 {
+        if (cancellation) |value| if (value.isCancelled()) return error.Cancelled;
+        if (remaining_ms == 0) return error.Timeout;
+        const grant = try self.prepareSchemaValidationGrant(command, setting_admin);
+        defer self.alloc.free(grant);
+        var delivery: http_common.RequestDeliveryTracker = .{};
+        // This call just minted the grant. Do not hash a potentially large
+        // binary admission again merely to verify our own fresh signature.
+        return self.submitSchemaValidationGranted(base_uri, command, grant, remaining_ms, setting_admin, cancellation, &delivery, false);
+    }
+
+    /// Preparation has no external side effects. A durable producer must save
+    /// this EXACT body-bound grant before submitting; recovery must never mint
+    /// a new one for an uncertain operation. Full command decoding remains on
+    /// submission so large binary admission inputs are parsed only once.
+    pub fn prepareSchemaValidationGrant(self: *MetadataHttpClient, command: []const u8, setting_admin: bool) ![]u8 {
+        const ledger = @import("schema_validation_ledger.zig");
+        if (command.len == 0 or command.len > ledger.max_command_bytes) return error.InvalidGenerationPublication;
+        if (setting_admin != ledger.requiresAdmissionAuthority(command)) return error.Forbidden;
+        const authority = @import("../system_catalog/setting_authority.zig");
+        return authority.sign(self.alloc, self.setting_authority_secret orelse return error.SettingAuthorityUnavailable, self.setting_authority_issuer orelse return error.SettingAuthorityUnavailable, if (setting_admin) .admin else .read, command, @intCast(@divFloor(@import("antfly_platform").time.realtimeNs(), std.time.ns_per_s)));
+    }
+
+    /// Uses a previously persisted grant without refreshing or rebinding it.
+    /// `delivery` records transport provenance, not metadata acceptance. Only
+    /// an exact durable receipt proves acceptance; absence is still unknown.
+    pub fn submitSchemaValidationWithGrantControlled(self: *MetadataHttpClient, base_uri: []const u8, command: []const u8, grant: []const u8, remaining_ms: u32, setting_admin: bool, cancellation: ?*const http_common.RequestCancellation, delivery: *http_common.RequestDeliveryTracker) ![]u8 {
+        return self.submitSchemaValidationGranted(base_uri, command, grant, remaining_ms, setting_admin, cancellation, delivery, true);
+    }
+
+    fn submitSchemaValidationGranted(self: *MetadataHttpClient, base_uri: []const u8, command: []const u8, grant: []const u8, remaining_ms: u32, setting_admin: bool, cancellation: ?*const http_common.RequestCancellation, delivery: *http_common.RequestDeliveryTracker, verify_grant: bool) ![]u8 {
+        delivery.markNotSent();
+        const ledger = @import("schema_validation_ledger.zig");
+        const receipts = @import("schema_validation_receipt.zig");
+        if (cancellation) |value| if (value.isCancelled()) return error.Cancelled;
+        if (remaining_ms == 0) return error.Timeout;
+        if (command.len == 0 or command.len > ledger.max_command_bytes) return error.InvalidGenerationPublication;
+        if (setting_admin != ledger.requiresAdmissionAuthority(command)) return error.Forbidden;
+        const authority = @import("../system_catalog/setting_authority.zig");
+        if (verify_grant) {
+            if (grant.len > 256) return error.Forbidden;
+            // Authenticate recovered bytes before allocating/parsing them.
+            try authority.verify(self.setting_authority_secret orelse return error.SettingAuthorityUnavailable, self.setting_authority_issuer orelse return error.SettingAuthorityUnavailable, if (setting_admin) .admin else .read, command, @intCast(@divFloor(@import("antfly_platform").time.realtimeNs(), std.time.ns_per_s)), grant);
+        }
+        var parsed = ledger.parseCommand(self.alloc, command) catch |err| return if (err == error.OutOfMemory) err else error.InvalidGenerationPublication;
+        defer parsed.deinit();
+        _ = try ledger.commandLookup(parsed.value);
+        const uri = try join(self.alloc, base_uri, routes.Routes.internal_schema_validation);
+        defer self.alloc.free(uri);
+        var remaining_buf: [10]u8 = undefined;
+        const headers = [_]http_common.RequestHeader{
+            .{ .name = routes.Routes.raft_mutation_remaining_ms_header, .value = try std.fmt.bufPrint(&remaining_buf, "{d}", .{remaining_ms}) },
+            .{ .name = routes.Routes.raft_mutation_forwards_remaining_header, .value = "0" },
+            .{ .name = routes.Routes.raft_mutation_campaign_allowed_header, .value = "false" },
+            .{ .name = authority.header_name, .value = grant },
+        };
+        delivery.markUnknown();
+        var response = internal_service_auth.executeRequest(self.alloc, self.executor, .{
+            .method = .POST,
+            .uri = uri,
+            .headers = &headers,
+            .body = command,
+            .content_type = "application/octet-stream",
+            .timeout_ms = @min(default_request_timeout_ms, remaining_ms),
+            .delivery_tracker = delivery,
+            .cancellation = cancellation,
+            .max_response_bytes = 16 * 1024,
+        }, self.internal_service) catch |err| {
+            if (delivery.load() == .not_sent or (delivery.load() == .unknown and err == error.ConnectionRefused)) {
+                delivery.markNotSent();
+                return error.RaftMutationRequestNotSent;
+            }
+            return error.MetadataMutationOutcomeUnknown;
+        };
+        defer response.deinit(self.alloc);
+        const outcome = responseHeader(response, routes.Routes.raft_mutation_outcome_header) orelse {
+            if (response.status == 404 or response.status == 405 or response.status == 426) return error.TableTopologyProtocolUpgradeRequired;
+            return error.MetadataMutationOutcomeUnknown;
+        };
+        if (std.mem.eql(u8, outcome, routes.Routes.raft_mutation_outcome_not_proposed)) {
+            if (@import("schema_validation_read.zig").ownerReadHttpFailure(response.status, response.body)) |err| return err;
+            return error.MetadataMutationOutcomeUnknown;
+        }
+        if (response.status < 200 or response.status >= 300 or !std.mem.eql(u8, outcome, routes.Routes.raft_mutation_outcome_committed)) return error.MetadataMutationOutcomeUnknown;
+        const content_type = responseHeader(response, "content-type") orelse return error.MetadataMutationOutcomeUnknown;
+        if (!std.ascii.eqlIgnoreCase(std.mem.trim(u8, std.mem.sliceTo(content_type, ';'), " \t"), "application/json")) return error.MetadataMutationOutcomeUnknown;
+        if (response.body.len == 0 or response.body.len > 16 * 1024) return error.MetadataMutationOutcomeUnknown;
+        var observed = std.json.parseFromSlice(receipts.Observation, self.alloc, response.body, .{}) catch return error.MetadataMutationOutcomeUnknown;
+        defer observed.deinit();
+        const expected = ledger.commandReceipt(parsed.value, observed.value.head orelse return error.MetadataMutationOutcomeUnknown) catch return error.MetadataMutationOutcomeUnknown;
+        if (!(observed.value.isAcknowledged(expected) catch return error.MetadataMutationOutcomeUnknown)) return error.MetadataMutationOutcomeUnknown;
+        return self.alloc.dupe(u8, response.body) catch return error.MetadataMutationOutcomeUnknown;
     }
 
     pub fn forwardSystemCatalog(self: *MetadataHttpClient, base_uri: []const u8, input: @import("../system_catalog/server_call.zig").Call, forwarding: raft_mutation_forwarding.Context, setting_admin: bool) ![]u8 {
         return self.forwardSystemCatalogControlled(base_uri, input, forwarding, setting_admin, null);
     }
     pub fn forwardSystemCatalogControlled(self: *MetadataHttpClient, base_uri: []const u8, input: @import("../system_catalog/server_call.zig").Call, forwarding: raft_mutation_forwarding.Context, setting_admin: bool, cancellation: ?*const http_common.RequestCancellation) ![]u8 {
+        if (input == .schema_validation_submit) return self.submitSchemaValidationControlled(base_uri, input.schema_validation_submit, forwarding.remaining_ms, setting_admin, cancellation);
+        if (input.isSchemaValidationCall()) return (try self.readSystemCatalog(base_uri, input, forwarding.remaining_ms, cancellation)).body;
         if (cancellation) |value| if (value.isCancelled()) return error.Cancelled;
         if (input.requiresAdministrativeGrant() != setting_admin) return error.Forbidden;
         const body = try std.json.Stringify.valueAlloc(self.alloc, input, .{});
@@ -1353,7 +1556,7 @@ pub const MetadataHttpClient = struct {
                 error.InvalidCatalogMutation,
             403 => error.Forbidden,
             404 => error.CatalogNotFound,
-            405 => if ((input == .relation_replace or input == .relation_schema_mutate) and std.mem.eql(u8, response.body, "ExtensionOwnedObject"))
+            405 => if ((input == .relation_replace or input == .relation_schema_mutate or input == .relation_description_mutate) and std.mem.eql(u8, response.body, "ExtensionOwnedObject"))
                 error.ExtensionOwnedObject
             else
                 error.TableTopologyProtocolUpgradeRequired,
@@ -2091,6 +2294,11 @@ pub const MetadataHttpClient = struct {
     }
 
     fn responseHeader(resp: http_common.HttpResponse, name: []const u8) ?[]const u8 {
+        // Real executors lift standard media into its dedicated response
+        // field; custom executors may retain it in headers instead. Authority
+        // reads must validate either representation, never reject live work
+        // because the test double used a different transport layout.
+        if (std.ascii.eqlIgnoreCase(name, "content-type")) if (resp.content_type) |value| return std.mem.trim(u8, value, " \t\r\n");
         for (resp.headers) |header| {
             if (std.ascii.eqlIgnoreCase(header.name, name))
                 return std.mem.trim(u8, header.value, " \t\r\n");
@@ -2722,13 +2930,13 @@ fn consumerTests() type {
                 }
             };
             const cases = [_]struct { status: u16, body: []const u8, result: ?bool = null, err: ?anyerror = null }{
-                .{ .status = 200, .body = "{\"activated_version\":37}", .result = true },
-                .{ .status = 200, .body = "{\"activated_version\":38}", .result = true },
+                .{ .status = 200, .body = std.fmt.comptimePrint("{{\"activated_version\":{d}}}", .{topology_protocol.schema_reader_capability_version}), .result = true },
+                .{ .status = 200, .body = std.fmt.comptimePrint("{{\"activated_version\":{d}}}", .{topology_protocol.schema_reader_capability_version + 1}), .result = true },
                 .{ .status = 404, .body = "", .result = false },
                 .{ .status = 405, .body = "", .result = false },
                 .{ .status = 426, .body = "", .result = false },
                 .{ .status = 503, .body = "", .err = error.SchemaReaderReadinessUnavailable },
-                .{ .status = 200, .body = "{\"activated_version\":36}", .err = error.InvalidSchemaReaderReadinessResponse },
+                .{ .status = 200, .body = std.fmt.comptimePrint("{{\"activated_version\":{d}}}", .{topology_protocol.schema_reader_capability_version - 1}), .err = error.InvalidSchemaReaderReadinessResponse },
                 .{ .status = 200, .body = "not json", .err = error.InvalidSchemaReaderReadinessResponse },
                 .{ .status = 200, .body = z17RepeatString("x", 1025), .err = error.InvalidSchemaReaderReadinessResponse },
             };
@@ -4731,6 +4939,448 @@ test "system catalog index prepare unsupported owner returns after one request" 
     try std.testing.expectEqual(@as(usize, 4), executor.calls);
 }
 
+test "system catalog schema validation binary submissions bind raw grants exact receipts and single attempt delivery" {
+    const a = std.testing.allocator;
+    const ledger = @import("schema_validation_ledger.zig");
+    const barriers = @import("schema_validation_publication.zig");
+    const receipts = @import("schema_validation_receipt.zig");
+    const authority = @import("../system_catalog/setting_authority.zig");
+    const Executor = struct {
+        command: []const u8,
+        body: []const u8,
+        status: u16 = 200,
+        outcome: []const u8 = routes.Routes.raft_mutation_outcome_committed,
+        media: []const u8 = "application/json",
+        failure: ?anyerror = null,
+        not_sent: bool = false,
+        expected_grant: ?[]const u8 = null,
+        calls: usize = 0,
+        fn execute(raw: *anyopaque, alloc: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            try std.testing.expect(std.mem.endsWith(u8, req.uri, routes.Routes.internal_schema_validation));
+            try std.testing.expectEqualStrings("application/octet-stream", req.content_type.?);
+            try std.testing.expectEqualSlices(u8, self.command, req.body);
+            try std.testing.expect(req.header(internal_service_auth.header_name) != null);
+            try std.testing.expectEqualStrings("0", req.header(routes.Routes.raft_mutation_forwards_remaining_header).?);
+            try std.testing.expectEqualStrings("false", req.header(routes.Routes.raft_mutation_campaign_allowed_header).?);
+            try std.testing.expectEqual(@as(?usize, 16 * 1024), req.max_response_bytes);
+            if (self.expected_grant) |grant| try std.testing.expectEqualStrings(grant, req.header(authority.header_name).?);
+            try authority.verify("schema-grant-secret", "schema-test", if (ledger.requiresAdmissionAuthority(self.command)) .admin else .read, req.body, @intCast(@divFloor(platform_time.realtimeNs(), std.time.ns_per_s)), req.header(authority.header_name).?);
+            if (self.failure) |err| {
+                if (self.not_sent) req.delivery_tracker.?.markNotSent();
+                return err;
+            }
+            const body = try alloc.dupe(u8, self.body);
+            errdefer alloc.free(body);
+            const headers = try alloc.alloc(http_common.Header, 2);
+            var initialized: usize = 0;
+            errdefer {
+                for (headers[0..initialized]) |header| {
+                    alloc.free(header.name);
+                    alloc.free(header.value);
+                }
+                alloc.free(headers);
+            }
+            for (headers, [_][]const u8{ routes.Routes.raft_mutation_outcome_header, "content-type" }, [_][]const u8{ self.outcome, self.media }) |*header, name, header_value| {
+                const owned_name = try alloc.dupe(u8, name);
+                errdefer alloc.free(owned_name);
+                header.* = .{ .name = owned_name, .value = try alloc.dupe(u8, header_value) };
+                initialized += 1;
+            }
+            return .{ .status = self.status, .body = body, .headers = headers };
+        }
+    };
+    const head: barriers.Head = .{ .metadata_group_id = 21, .metadata_incarnation = @splat('1'), .table_id = 7, .id = @splat(1), .plan_digest = @splat(2), .owner_count = 2 };
+    const terminal = try head.cancel(1, .requested);
+    const lookup = ledger.Lookup.fromHead(head);
+    const value: ledger.Command = .{ .cancel = .{ .decision = .{ .lookup = lookup, .revision = 1 }, .failure = .requested } };
+    const command = try std.json.Stringify.valueAlloc(a, value, .{});
+    defer a.free(command);
+    const expected = try ledger.commandReceipt(value, terminal);
+    const accepted = try std.json.Stringify.valueAlloc(a, receipts.Observation{ .lookup = lookup, .head = terminal, .observed = expected.expected }, .{});
+    defer a.free(accepted);
+    var executor: Executor = .{ .command = command, .body = accepted };
+    var client = MetadataHttpClient.init(a, .{ .ptr = &executor, .vtable = &.{ .execute = Executor.execute } });
+    _ = client.withInternalServiceAuth("0123456789abcdef0123456789abcdef", "schema-test");
+    _ = client.withSettingAuthority("schema-grant-secret", "schema-test");
+    const good = try client.forwardSystemCatalogControlled("http://metadata.invalid", .{ .schema_validation_submit = command }, .{ .remaining_ms = 25, .forwards_remaining = 2, .campaign_allowed = true }, false, null);
+    defer a.free(good);
+    try std.testing.expectEqualStrings(accepted, good);
+    try std.testing.expectEqual(@as(usize, 1), executor.calls);
+    try std.testing.expectError(error.Forbidden, client.submitSchemaValidationControlled("http://metadata.invalid", command, 25, true, null));
+    try std.testing.expectError(error.Timeout, client.submitSchemaValidationControlled("http://metadata.invalid", command, 0, false, null));
+    try std.testing.expectError(error.InvalidGenerationPublication, client.submitSchemaValidationControlled("http://metadata.invalid", "{}", 25, false, null));
+    var canceled: http_common.RequestCancellation = .{};
+    canceled.cancel();
+    try std.testing.expectError(error.Cancelled, client.submitSchemaValidationControlled("http://metadata.invalid", command, 25, false, &canceled));
+    try std.testing.expectEqual(@as(usize, 1), executor.calls);
+    {
+        const persisted_grant = try client.prepareSchemaValidationGrant(command, false);
+        defer a.free(persisted_grant);
+        executor.expected_grant = persisted_grant;
+        defer executor.expected_grant = null;
+        try std.testing.expectEqual(@as(usize, 1), executor.calls);
+        var delivery: http_common.RequestDeliveryTracker = .{};
+        const exact = try client.submitSchemaValidationWithGrantControlled("http://metadata.invalid", command, persisted_grant, 25, false, null, &delivery);
+        defer a.free(exact);
+        try std.testing.expectEqualStrings(accepted, exact);
+        const sent = executor.calls;
+        const expired_grant = try authority.sign(a, "schema-grant-secret", "schema-test", .read, command, 0);
+        defer a.free(expired_grant);
+        try std.testing.expectError(error.Forbidden, client.submitSchemaValidationWithGrantControlled("http://metadata.invalid", command, expired_grant, 25, false, null, &delivery));
+        try std.testing.expectEqual(http_common.RequestDeliveryTracker.State.not_sent, delivery.load());
+        var different = value;
+        different.cancel.decision.revision += 1;
+        const changed_command = try std.json.Stringify.valueAlloc(a, different, .{});
+        defer a.free(changed_command);
+        try std.testing.expectError(error.Forbidden, client.submitSchemaValidationWithGrantControlled("http://metadata.invalid", changed_command, persisted_grant, 25, false, null, &delivery));
+        try std.testing.expectEqual(http_common.RequestDeliveryTracker.State.not_sent, delivery.load());
+        try std.testing.expectError(error.Forbidden, client.submitSchemaValidationWithGrantControlled("http://metadata.invalid", "{}", persisted_grant, 25, false, null, &delivery));
+        try std.testing.expectEqual(sent, executor.calls); // No renewal/rebind sends.
+        executor.failure = error.ConnectionResetByPeer;
+        try std.testing.expectError(error.MetadataMutationOutcomeUnknown, client.submitSchemaValidationWithGrantControlled("http://metadata.invalid", command, persisted_grant, 25, false, null, &delivery));
+        try std.testing.expectEqual(http_common.RequestDeliveryTracker.State.unknown, delivery.load());
+        try std.testing.expectEqual(sent + 1, executor.calls); // No hidden replay.
+        executor.not_sent = true;
+        try std.testing.expectError(error.RaftMutationRequestNotSent, client.submitSchemaValidationWithGrantControlled("http://metadata.invalid", command, persisted_grant, 25, false, null, &delivery));
+        try std.testing.expectEqual(http_common.RequestDeliveryTracker.State.not_sent, delivery.load());
+        executor.not_sent = false;
+        executor.failure = null;
+    }
+    for (0..5) |mode| {
+        executor.body = if (mode == 0) "{}" else if (mode == 1) "InvalidGenerationPublication" else accepted;
+        executor.status = if (mode == 1) 400 else 200;
+        executor.outcome = if (mode == 2) routes.Routes.raft_mutation_outcome_unknown else if (mode == 3) routes.Routes.raft_mutation_outcome_not_proposed else routes.Routes.raft_mutation_outcome_committed;
+        executor.media = if (mode == 4) "application/octet-stream" else "application/json";
+        try std.testing.expectError(error.MetadataMutationOutcomeUnknown, client.submitSchemaValidationControlled("http://metadata.invalid", command, 25, false, null));
+    }
+    executor.status = 400;
+    executor.outcome = routes.Routes.raft_mutation_outcome_not_proposed;
+    executor.body = "InvalidGenerationPublication";
+    try std.testing.expectError(error.InvalidGenerationPublication, client.submitSchemaValidationControlled("http://metadata.invalid", command, 25, false, null));
+    executor.body = "InvalidGenerationPublication suffix";
+    try std.testing.expectError(error.MetadataMutationOutcomeUnknown, client.submitSchemaValidationControlled("http://metadata.invalid", command, 25, false, null));
+    executor.failure = error.ConnectionResetByPeer;
+    const before = executor.calls;
+    try std.testing.expectError(error.MetadataMutationOutcomeUnknown, client.submitSchemaValidationControlled("http://metadata.invalid", command, 25, false, null));
+    try std.testing.expectEqual(before + 1, executor.calls);
+    executor.not_sent = true;
+    try std.testing.expectError(error.RaftMutationRequestNotSent, client.submitSchemaValidationControlled("http://metadata.invalid", command, 25, false, null));
+    executor.failure = null;
+    executor.not_sent = false;
+    // Framing contract only: deliberately unsigned preparation fixtures are
+    // not physical admission evidence. ASVI includes non-UTF-8 catalog bytes.
+    var fixture = try @import("schema_validation_plan.zig").test_support.PlanFixture.init(a);
+    defer fixture.deinit();
+    const native = @import("antfly_local_sources").storage_db_relational_schema_owner_contract;
+    const input = try native.encodeInputs(a, .{ fixture.plan().before.schema_json, fixture.plan().after.schema_json, "\x00\xffcatalog", "[\"id\"]" });
+    defer a.free(input);
+    for (&fixture.intents) |*intent| {
+        intent.binding.inputs = native.hash(input);
+        intent.binding.fence.catalog_digest = native.hash("\x00\xffcatalog");
+    }
+    var prepared = try @import("schema_validation_plan.zig").Prepared.init(a, fixture.plan());
+    defer prepared.deinit();
+    const unsigned: @import("schema_validation_attestation.zig").SignedPreparation = .{
+        .value = .{ .binding = prepared.owners[0].binding, .physical_root_incarnation = prepared.owners[0].physical_root_incarnation, .position = null },
+        .proof = .{
+            .identity = .{ .metadata_incarnation = prepared.head.metadata_incarnation, .node_id = 2, .store_id = 3, .root_incarnation = 7, .public_key = @splat(0) },
+            .reporter_incarnation = 1,
+            .authority = if (prepared.owners[0].binding.authority == .native) .{ .native = @splat(1) } else .{ .raft = 42 },
+            .root_generation = 1,
+            .signature = @splat(0),
+        },
+    };
+    const begin = try ledger.encodeBegin(a, .{ .plan = fixture.plan(), .preparations = &.{ unsigned, unsigned }, .inputs = &.{input} });
+    defer a.free(begin);
+    const admitted = try std.json.Stringify.valueAlloc(a, receipts.Observation{ .lookup = .fromHead(prepared.head), .head = prepared.head, .observed = .admission }, .{});
+    defer a.free(admitted);
+    executor.command = begin;
+    executor.body = admitted;
+    executor.status = 200;
+    executor.outcome = routes.Routes.raft_mutation_outcome_committed;
+    executor.media = "application/json";
+    const result = try client.submitSchemaValidationControlled("http://metadata.invalid", begin, 25, true, null);
+    defer a.free(result);
+    try std.testing.expectEqualStrings(admitted, result);
+}
+
+test "system catalog schema validation client binds exact identity projection frames and negative replies" {
+    const a = std.testing.allocator;
+    const read_contract = @import("schema_validation_read.zig");
+    const plan = @import("schema_validation_plan.zig");
+    const native = @import("antfly_local_sources").storage_db_relational_schema_owner_contract;
+    var fixture = try plan.test_support.PlanFixture.init(a);
+    defer fixture.deinit();
+    const frame = try native.encodeInputs(a, .{ fixture.plan().before.schema_json, fixture.plan().after.schema_json, "fixture-catalog", "[\"id\"]" });
+    defer a.free(frame);
+    for (&fixture.intents) |*intent| {
+        intent.binding.inputs = native.hash(frame);
+        intent.binding.fence.catalog_digest = native.hash("fixture-catalog");
+    }
+    var prepared = try plan.Prepared.init(a, fixture.plan());
+    defer prepared.deinit();
+    const control: read_contract.OwnerControlRead = .{ .head = prepared.head, .owner = prepared.owners[0], .action = .begin, .disposition = .execute };
+    const control_bytes = try std.json.Stringify.valueAlloc(a, control, .{});
+    defer a.free(control_bytes);
+    var request: read_contract.OwnerReadRequest = .{ .lookup = .fromHead(prepared.head), .ordinal = 0 };
+    const Executor = struct {
+        expected: read_contract.OwnerReadRequest,
+        receipt_expected: ?@import("schema_validation_receipt.zig").Request = null,
+        work_expected: ?@import("schema_validation_work.zig").Query = null,
+        body: []const u8,
+        media: ?[]const u8 = null,
+        media_field: bool = false,
+        group: []const u8 = "21",
+        incarnation: []const u8 = "0123456789abcdef0123456789abcdef",
+        status: u16 = 200,
+        calls: usize = 0,
+        lose_reply: bool = false,
+        fn execute(raw: *anyopaque, alloc: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            try std.testing.expect(req.header(internal_service_auth.header_name) != null);
+            try std.testing.expectEqual(@as(?usize, if (self.work_expected != null) @import("schema_validation_work.zig").max_wire_bytes else if (self.receipt_expected != null) 16 * 1024 else self.expected.responseLimit()), req.max_response_bytes);
+            try std.testing.expectEqualStrings("0", req.header(routes.Routes.raft_mutation_forwards_remaining_header).?);
+            try std.testing.expectEqualStrings("false", req.header(routes.Routes.raft_mutation_campaign_allowed_header).?);
+            const authority = @import("../system_catalog/setting_authority.zig");
+            try authority.verify("schema-grant-secret", "schema-test", .read, req.body, @intCast(@divFloor(platform_time.realtimeNs(), std.time.ns_per_s)), req.header(authority.header_name) orelse return error.TestUnexpectedResult);
+            var parsed = try std.json.parseFromSlice(@import("../system_catalog/server_call.zig").Call, alloc, req.body, .{});
+            defer parsed.deinit();
+            if (self.work_expected) |expected| {
+                try std.testing.expect(parsed.value == .schema_validation_work);
+                try std.testing.expectEqualDeep(expected, parsed.value.schema_validation_work);
+            } else if (self.receipt_expected) |expected| {
+                try std.testing.expect(parsed.value == .schema_validation_receipt_read);
+                try std.testing.expectEqualDeep(expected, parsed.value.schema_validation_receipt_read);
+            } else {
+                try std.testing.expect(parsed.value == .schema_validation_owner_read);
+                try std.testing.expectEqualDeep(self.expected, parsed.value.schema_validation_owner_read);
+            }
+            if (self.lose_reply) return error.ConnectionResetByPeer;
+            const body = try alloc.dupe(u8, self.body);
+            errdefer alloc.free(body);
+            const headers = try alloc.alloc(http_common.Header, if (self.media_field) 2 else 3);
+            var initialized: usize = 0;
+            errdefer {
+                for (headers[0..initialized]) |header| {
+                    alloc.free(header.name);
+                    alloc.free(header.value);
+                }
+                alloc.free(headers);
+            }
+            const names = [_][]const u8{ "x-antfly-catalog-metadata-group", "x-antfly-catalog-metadata-incarnation", "content-type" };
+            const values = [_][]const u8{ self.group, self.incarnation, self.media orelse if (self.receipt_expected != null or self.work_expected != null) "application/json" else self.expected.contentType() };
+            for (headers, names[0..headers.len], values[0..headers.len]) |*header, name, value| {
+                const owned_name = try alloc.dupe(u8, name);
+                errdefer alloc.free(owned_name);
+                header.* = .{ .name = owned_name, .value = try alloc.dupe(u8, value) };
+                initialized += 1;
+            }
+            const content_type = if (self.media_field) try alloc.dupe(u8, values[2]) else null;
+            return .{ .status = self.status, .body = body, .headers = headers, .content_type = content_type };
+        }
+    };
+    var executor: Executor = .{ .expected = request, .body = control_bytes };
+    var client = MetadataHttpClient.init(a, .{ .ptr = &executor, .vtable = &.{ .execute = Executor.execute } });
+    _ = client.withInternalServiceAuth("0123456789abcdef0123456789abcdef", "schema-test");
+    _ = client.withSettingAuthority("schema-grant-secret", "schema-test");
+    var result = try client.readSchemaValidationOwnerControl("http://metadata.invalid", request, 25, null);
+    defer result.deinit();
+    try std.testing.expectEqualDeep(control, result.value);
+    executor.media_field = true;
+    var field_result = try client.readSchemaValidationOwnerControl("http://metadata.invalid", request, 25, null);
+    defer field_result.deinit();
+    try std.testing.expectEqualDeep(control, field_result.value);
+    executor.group = "22";
+    try std.testing.expectError(error.MetadataGroupMismatch, client.readSchemaValidationOwnerControl("http://metadata.invalid", request, 25, null));
+    executor.group = "21";
+    executor.incarnation = "11111111111111111111111111111111";
+    try std.testing.expectError(error.MetadataIncarnationMismatch, client.readSchemaValidationOwnerControl("http://metadata.invalid", request, 25, null));
+    executor.incarnation = "0123456789abcdef0123456789abcdef";
+    executor.media = "application/octet-stream";
+    try std.testing.expectError(error.InvalidGenerationPublication, client.readSchemaValidationOwnerControl("http://metadata.invalid", request, 25, null));
+    executor.media = null;
+    var foreign = control;
+    foreign.head.id[0] ^= 1;
+    const foreign_bytes = try std.json.Stringify.valueAlloc(a, foreign, .{});
+    defer a.free(foreign_bytes);
+    executor.body = foreign_bytes;
+    try std.testing.expectError(error.GenerationPublicationChanged, client.readSchemaValidationOwnerControl("http://metadata.invalid", request, 25, null));
+    executor.body = control_bytes;
+    foreign = control;
+    foreign.owner.ordinal = 1;
+    const foreign_owner_bytes = try std.json.Stringify.valueAlloc(a, foreign, .{});
+    defer a.free(foreign_owner_bytes);
+    executor.body = foreign_owner_bytes;
+    try std.testing.expectError(error.InvalidGenerationPublication, client.readSchemaValidationOwnerControl("http://metadata.invalid", request, 25, null));
+    executor.body = "{}";
+    try std.testing.expectError(error.InvalidGenerationPublication, client.readSchemaValidationOwnerControl("http://metadata.invalid", request, 25, null));
+    executor.body = control_bytes;
+    request.action = .freeze;
+    executor.expected = request;
+    try std.testing.expectError(error.InvalidGenerationPublication, client.readSchemaValidationOwnerControl("http://metadata.invalid", request, 25, null));
+    request.action = .begin;
+    request.projection = .inputs;
+    executor.expected = request;
+    executor.body = frame;
+    const raw = try client.readSchemaValidationOwnerInputs("http://metadata.invalid", request, native.hash(frame), 25, null);
+    defer a.free(raw);
+    try std.testing.expectEqualSlices(u8, frame, raw);
+    try std.testing.expectError(error.SchemaValidationJobChanged, client.readSchemaValidationOwnerInputs("http://metadata.invalid", request, @splat(1), 25, null));
+    const corrupt = try a.dupe(u8, frame);
+    defer a.free(corrupt);
+    corrupt[corrupt.len - 1] ^= 1;
+    executor.body = corrupt;
+    try std.testing.expectError(error.InvalidSchemaValidationJob, client.readSchemaValidationOwnerInputs("http://metadata.invalid", request, native.hash(frame), 25, null));
+    executor.body = frame;
+    const forwarded = try client.forwardSystemCatalog("http://metadata.invalid", .{ .schema_validation_owner_read = request }, .{ .remaining_ms = 25, .forwards_remaining = 2, .campaign_allowed = true }, true);
+    defer a.free(forwarded);
+    try std.testing.expectEqualSlices(u8, frame, forwarded);
+    const before_invalid = executor.calls;
+    try std.testing.expectError(error.InvalidGenerationPublication, client.readSchemaValidationOwnerInputs("http://metadata.invalid", request, @splat(0), 25, null));
+    try std.testing.expectError(error.Timeout, client.readSchemaValidationOwnerInputs("http://metadata.invalid", request, native.hash(frame), 0, null));
+    try std.testing.expectEqual(before_invalid, executor.calls);
+    inline for (.{ error.SchemaValidationJobChanged, error.SchemaValidationPublicationRequired, error.InvalidSchemaValidationJob, error.MetadataReplicationPending, error.MetadataIncarnationMismatch, error.TableTopologyProtocolUpgradeRequired }) |err| {
+        executor.body = @errorName(err);
+        executor.status = system_catalog.httpStatus(err);
+        const calls = executor.calls;
+        try std.testing.expectError(err, client.readSchemaValidationOwnerInputs("http://metadata.invalid", request, native.hash(frame), 25, null));
+        try std.testing.expectEqual(calls + 1, executor.calls);
+        executor.status = 418;
+        try std.testing.expectError(error.RemoteUnavailable, client.readSchemaValidationOwnerInputs("http://metadata.invalid", request, native.hash(frame), 25, null));
+    }
+    executor.status = 200;
+    executor.body = frame;
+    executor.lose_reply = true;
+    const before_loss = executor.calls;
+    try std.testing.expectError(error.ConnectionResetByPeer, client.readSchemaValidationOwnerInputs("http://metadata.invalid", request, native.hash(frame), 25, null));
+    try std.testing.expectEqual(before_loss + 1, executor.calls);
+    const receipts = @import("schema_validation_receipt.zig");
+    const receipt_request: receipts.Request = .{ .lookup = request.lookup, .expected = .admission };
+    executor.lose_reply = false;
+    executor.receipt_expected = receipt_request;
+    const accepted = try std.json.Stringify.valueAlloc(a, receipts.Observation{ .lookup = request.lookup, .head = prepared.head, .observed = .admission }, .{});
+    defer a.free(accepted);
+    executor.body = accepted;
+    var receipt = try client.readSchemaValidationReceipt("http://metadata.invalid", receipt_request, 25, null);
+    defer receipt.deinit();
+    try std.testing.expect(try receipt.value.isAcknowledged(receipt_request));
+    const absent = try std.json.Stringify.valueAlloc(a, receipts.Observation{ .lookup = request.lookup }, .{});
+    defer a.free(absent);
+    executor.body = absent;
+    var unknown = try client.readSchemaValidationReceipt("http://metadata.invalid", receipt_request, 25, null);
+    defer unknown.deinit();
+    try std.testing.expect(!try unknown.value.isAcknowledged(receipt_request));
+    executor.group = "22";
+    try std.testing.expectError(error.MetadataGroupMismatch, client.readSchemaValidationReceipt("http://metadata.invalid", receipt_request, 25, null));
+    executor.group = "21";
+    executor.body = "{}";
+    try std.testing.expectError(error.InvalidGenerationPublication, client.readSchemaValidationReceipt("http://metadata.invalid", receipt_request, 25, null));
+    executor.body = accepted;
+    executor.lose_reply = true;
+    const before_receipt_loss = executor.calls;
+    try std.testing.expectError(error.ConnectionResetByPeer, client.readSchemaValidationReceipt("http://metadata.invalid", receipt_request, 25, null));
+    try std.testing.expectEqual(before_receipt_loss + 1, executor.calls);
+
+    // Restoration must not first ask the departed source for ordinary owner
+    // permission. The historical image lookup returns one coherent current
+    // predecessor, while its raw immutable input stays on the binary path.
+    const attestation = @import("schema_validation_attestation.zig");
+    const root_seed: [32]u8 = @splat(9);
+    const root: @import("antfly_local_sources").storage_db_root_signing_identity.State = .{ .seed = root_seed, .root_incarnation = 7, .public_key = (try std.crypto.sign.Ed25519.KeyPair.generateDeterministic(root_seed)).public_key.toBytes() };
+    const owner = prepared.owners[1];
+    const parent: @import("schema_validation_parent.zig").Request = .{
+        .lookup = request.lookup,
+        .ordinal = owner.ordinal,
+        .revision = prepared.head.revision,
+        .owner_digest = try @import("schema_validation_parent.zig").ownerDigest(owner, prepared.head),
+        .signed = try attestation.SignedSnapshotParent.sign(.{
+            .binding = owner.binding,
+            .origin = .{ .physical_root_incarnation = owner.physical_root_incarnation, .namespace = owner.binding.fence.namespace, .authority = null, .applied = .{ .term = 2, .index = 1 }, .schema_header = null, .transaction_directory = null, .schema_outcomes = null },
+            .stream_digest = @splat(23),
+            .through_index = 3,
+            .completed = .{ .incarnation = 77, .term = 2, .applied_index = 3 },
+        }, .{ .metadata_incarnation = prepared.head.metadata_incarnation, .node_id = 2, .store_id = 3, .root_incarnation = root.root_incarnation, .public_key = root.public_key }, 4, 42, 6, root),
+    };
+    const image = try parent.image();
+    var restoration: read_contract.RestorationControl = .{ .head = prepared.head, .owner = owner, .parent = parent };
+    const restoration_bytes = try std.json.Stringify.valueAlloc(a, restoration, .{});
+    defer a.free(restoration_bytes);
+    executor.lose_reply = false;
+    executor.receipt_expected = null;
+    executor.expected = .{ .lookup = request.lookup, .ordinal = 0, .projection = .parent, .source_image = image };
+    executor.body = restoration_bytes;
+    var restored = try client.readSchemaValidationRestoration("http://metadata.invalid", request.lookup, image, 25, null);
+    defer restored.deinit();
+    try std.testing.expectEqualDeep(restoration, restored.value.?);
+    restoration.owner = prepared.owners[0];
+    const wrong_restoration = try std.json.Stringify.valueAlloc(a, restoration, .{});
+    defer a.free(wrong_restoration);
+    executor.body = wrong_restoration;
+    try std.testing.expectError(error.GenerationPublicationChanged, client.readSchemaValidationRestoration("http://metadata.invalid", request.lookup, image, 25, null));
+    executor.body = "null";
+    var missing_image = try client.readSchemaValidationRestoration("http://metadata.invalid", request.lookup, image, 25, null);
+    defer missing_image.deinit();
+    try std.testing.expect(missing_image.value == null);
+    executor.expected = .{ .lookup = request.lookup, .ordinal = parent.ordinal, .projection = .recovery_inputs, .source_image = image };
+    executor.body = frame;
+    const recovery_input = try client.readSchemaValidationRecoveryInputs("http://metadata.invalid", parent, 25, null);
+    defer a.free(recovery_input);
+    try std.testing.expectEqualSlices(u8, frame, recovery_input);
+    executor.body = corrupt;
+    try std.testing.expectError(error.InvalidSchemaValidationJob, client.readSchemaValidationRecoveryInputs("http://metadata.invalid", parent, 25, null));
+    const fresh = try attestation.SignedPreparation.sign(.{ .binding = owner.binding, .physical_root_incarnation = owner.physical_root_incarnation, .position = .{ .raft = .{ .term = 2, .index = 1 } } }, parent.signed.proof.identity, 5, .{ .raft = 42 }, 6, root);
+    executor.expected = .{ .lookup = request.lookup, .ordinal = owner.ordinal, .projection = .inputs, .witness = .{ .preparation = fresh } };
+    executor.body = frame;
+    const resumed_input = try client.readSchemaValidationOwnerInputs("http://metadata.invalid", executor.expected, native.hash(frame), 25, null);
+    defer a.free(resumed_input);
+    try std.testing.expectEqualSlices(u8, frame, resumed_input);
+    var invalid_projection = executor.expected;
+    invalid_projection.projection = .recovery_inputs;
+    invalid_projection.source_image = image;
+    try std.testing.expectError(error.InvalidGenerationPublication, invalid_projection.validate());
+    const address = read_contract.OwnerAddress.fromBinding(owner.binding);
+    const replay_control: read_contract.ReplayControl = .{ .head = prepared.head, .owner = owner };
+    const replay_bytes = try std.json.Stringify.valueAlloc(a, replay_control, .{});
+    defer a.free(replay_bytes);
+    executor.expected = .{ .lookup = request.lookup, .ordinal = 0, .projection = .replay, .source_owner = address };
+    executor.body = replay_bytes;
+    var replay = try client.readSchemaValidationReplay("http://metadata.invalid", request.lookup, address, 25, null);
+    defer replay.deinit();
+    try std.testing.expectEqualDeep(replay_control, replay.value.?);
+    executor.expected = .{ .lookup = request.lookup, .ordinal = owner.ordinal, .projection = .replay_inputs, .source_owner = address };
+    executor.body = frame;
+    const replay_input = try client.readSchemaValidationReplayInputs("http://metadata.invalid", replay_control, 25, null);
+    defer a.free(replay_input);
+    try std.testing.expectEqualSlices(u8, frame, replay_input);
+    executor.body = corrupt;
+    try std.testing.expectError(error.InvalidSchemaValidationJob, client.readSchemaValidationReplayInputs("http://metadata.invalid", replay_control, 25, null));
+    const work = @import("schema_validation_work.zig");
+    const work_query: work.Query = .{ .group = request.lookup.group, .metadata_incarnation = request.lookup.metadata_incarnation };
+    const work_bytes = try std.json.Stringify.valueAlloc(a, work.Page{}, .{});
+    defer a.free(work_bytes);
+    executor.work_expected = work_query;
+    executor.body = work_bytes;
+    var discovered = try client.readSystemCatalog("http://metadata.invalid", .{ .schema_validation_work = work_query }, 25, null);
+    defer discovered.deinit(a);
+    try std.testing.expectEqualSlices(u8, work_bytes, discovered.body);
+    executor.group = "22";
+    try std.testing.expectError(error.MetadataGroupMismatch, client.readSystemCatalog("http://metadata.invalid", .{ .schema_validation_work = work_query }, 25, null));
+    executor.group = "21";
+    executor.incarnation = "11111111111111111111111111111111";
+    try std.testing.expectError(error.MetadataIncarnationMismatch, client.readSystemCatalog("http://metadata.invalid", .{ .schema_validation_work = work_query }, 25, null));
+    executor.incarnation = "0123456789abcdef0123456789abcdef";
+    executor.media = "application/octet-stream";
+    try std.testing.expectError(error.InvalidGenerationPublication, client.readSystemCatalog("http://metadata.invalid", .{ .schema_validation_work = work_query }, 25, null));
+    executor.media = null;
+    executor.lose_reply = true;
+    const before_work_loss = executor.calls;
+    try std.testing.expectError(error.ConnectionResetByPeer, client.readSystemCatalog("http://metadata.invalid", .{ .schema_validation_work = work_query }, 25, null));
+    try std.testing.expectEqual(before_work_loss + 1, executor.calls);
+}
+
 fn catalogResponseLimit(input: @import("../system_catalog/server_call.zig").Call) ?usize {
     const publication = @import("relational_index_publication.zig");
     return switch (input) {
@@ -4739,6 +5389,12 @@ fn catalogResponseLimit(input: @import("../system_catalog/server_call.zig").Call
         .relational_index_publish_decide, .relational_index_publish_status => publication.DecisionStatus.max_wire_bytes,
         .relational_index_cancel, .relational_index_cancel_status => publication.CancellationStatus.max_wire_bytes,
         .relational_index_source_accept, .relational_index_source_accept_status, .relational_index_source_complete => 16 * 1024,
+        .schema_validation_owner_read => |request| request.responseLimit(),
+        .schema_validation_receipt_read => 16 * 1024,
+        .schema_validation_discover => 1024,
+        .schema_validation_work => @import("schema_validation_work.zig").max_wire_bytes,
+        .schema_validation_prepare => @import("schema_validation_admission.zig").max_wire_bytes,
+        .schema_validation_status => @import("schema_validation_admission.zig").Status.max_wire_bytes,
         else => null,
     };
 }
