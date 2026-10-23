@@ -527,6 +527,11 @@ export {
 import { Client } from "./sdk.js";
 export default Client;
 
+export type {
+  InferenceGatewayCatalog,
+  InferenceGatewayModel,
+  InferenceGatewayOperation,
+} from "./client.js";
 export { ChatGPTConnectionError } from "./client.js";
 export * from "./models.js";
 export type {

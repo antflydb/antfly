@@ -4857,6 +4857,7 @@ pub const ProvisionedTableReadSource = struct {
         consistency: raft_mod.ReadConsistency,
     ) !?query_api.QueryResponse {
         try checkQueryDeadline(req);
+        try distributed_graph.validateIncomingStartIdentities(alloc, self.catalog, table_name, req);
         var routing_session = if (requiresAuthoritativeRoutingSession(req))
             try table_catalog.RoutingSession.init(alloc, self.catalog, queryRoutingDeadline(self.catalog, req))
         else
@@ -7341,6 +7342,7 @@ pub const HostedProvisionedTableReadSource = struct {
     ) !?query_api.QueryResponse {
         var req = requested;
         try checkQueryDeadline(req);
+        try distributed_graph.validateIncomingStartIdentities(alloc, hosted.catalog, table_name, req);
         var routing_session = if (requiresAuthoritativeRoutingSession(req))
             try table_catalog.RoutingSession.init(alloc, hosted.catalog, queryRoutingDeadline(hosted.catalog, req))
         else
@@ -8611,7 +8613,7 @@ fn validateDecisionRequest(alloc: std.mem.Allocator, req: db_mod.types.SearchReq
     }
 
     const Validate = struct {
-        fn call(ptr: *anyopaque, name: []const u8, questions: std.json.Value) !void {
+        fn call(ptr: *anyopaque, name: []const u8, questions: std.json.Value, _: []const u8) !void {
             const cfgs: *const @import("antfly_local_sources").common_provider_registry.Registry = @ptrCast(@alignCast(ptr));
             const cfg = try cfgs.getDeciderConfig(name);
             try @import("antfly_local_sources").functions_decisions.validateQuestions(questions, @import("antfly_local_sources").functions_decisions.capabilities(cfg.provider));

@@ -20,12 +20,23 @@ const contract = @import("antfly_decisions");
 const generating = @import("antfly_generating");
 const constrained = @import("antfly_structured");
 pub const Json = std.json.Value;
+pub const Input = @import("decision_input.zig").Input;
+/// Request-arena-owned wire payload; adapters supply transport metadata along
+/// with their body so the shared executor is independent of vendor formats.
+pub const WirePayload = struct {
+    body: []const u8,
+    /// Encoded/binary image bytes in the body; visual tokens are reserved
+    /// separately instead of charging compressed images as UTF-8 text.
+    image_bytes: usize = 0,
+    content_type: []const u8 = "application/json",
+    headers: []const [2][]const u8 = &.{},
+};
 pub const Provider = enum { antfly, jev, openai };
 pub const Kind = enum { choice, multi_choice, score, noul };
 pub const Function = enum { ai_decide, ai_choice, ai_score, ai_probability };
-pub const Capabilities = struct { max_questions: usize = 64, max_choices: usize = 64, max_levels: usize, max_input_bytes: usize = 1024 * 1024, full_distribution: bool = true, embedding_similarity: bool = false, generated: bool = false };
+pub const Capabilities = struct { max_questions: usize = 64, max_choices: usize = 64, max_levels: usize, max_input_bytes: usize = 1024 * 1024, images: bool = false, messages: bool = false, full_distribution: bool = true, embedding_similarity: bool = false, generated: bool = false };
 pub fn capabilities(provider: Provider) Capabilities {
-    return .{ .max_levels = if (provider == .antfly) 64 else 10 };
+    return .{ .max_levels = if (provider == .antfly) 64 else 10, .images = provider != .antfly, .messages = provider != .antfly };
 }
 pub const RateLimit = struct {
     pacing: ?enum { token_bucket, completion } = null,
@@ -68,6 +79,9 @@ pub const DeciderConfig = struct {
     api_key: ?[]const u8 = null,
     max_rows: u32 = 10000,
     max_input_tokens: u64 = 1000000,
+    /// Operator-supplied upper bound for one image's token contribution for
+    /// this provider/model. Required for image calls, including remote URLs.
+    max_image_input_tokens: ?u64 = null,
     batch_size: u16 = 32,
     rate_limit: ?RateLimit = null,
     pub fn validate(self: @This()) !void {
@@ -87,6 +101,9 @@ pub const DeciderConfig = struct {
                 for (identity) |c| if (!std.ascii.isDigit(c) and (c < 'a' or c > 'f')) return error.InvalidDeciderConfig;
             }
         }
+        if (self.max_image_input_tokens) |bound| {
+            if (bound == 0 or (self.decision_method != .generated and (self.provider == .antfly or self.decision_method != .typed))) return error.InvalidDeciderConfig;
+        }
         if (self.max_rows == 0 or self.max_input_tokens == 0 or self.batch_size == 0 or self.batch_size > 256) return error.InvalidDeciderConfig;
         if (self.decision_method != .generated and self.provider != .jev and std.mem.trim(u8, self.model, " \r\n\t").len == 0) return error.InvalidDeciderConfig;
         if (std.mem.indexOfAny(u8, self.url, "\r\n") != null) return error.InvalidDeciderConfig;
@@ -98,7 +115,12 @@ pub const DeciderConfig = struct {
     pub fn resolvedCapabilities(self: @This()) Capabilities {
         var caps = capabilities(self.provider);
         caps.generated = self.decision_method == .generated;
-        if (caps.generated) caps.max_levels = 64;
+        if (caps.generated) {
+            caps.max_levels = 64;
+            const generator = self.generator orelse return caps;
+            caps.images = generator.provider == .antfly or constrained.hostedCapabilities(generator).images;
+            caps.messages = true;
+        }
         if (self.decision_method == .embedding_similarity) {
             caps.embedding_similarity = true;
             caps.full_distribution = false;
@@ -623,10 +645,10 @@ test "decision provider embeddinggemma2 provider wrapper retains the trusted sim
     const a = arena.allocator();
     const Mock = struct {
         response: Json,
-        fn validate(_: *anyopaque, _: []const u8, questions: Json) !void {
+        fn validate(_: *anyopaque, _: []const u8, questions: Json, _: []const u8) !void {
             try validateQuestions(questions, (DeciderConfig{ .provider = .antfly, .decision_method = .embedding_similarity }).resolvedCapabilities());
         }
-        fn caps(_: *anyopaque, _: []const u8) !Capabilities {
+        fn caps(_: *anyopaque, _: []const u8, _: []const u8) !Capabilities {
             return (DeciderConfig{ .provider = .antfly, .decision_method = .embedding_similarity }).resolvedCapabilities();
         }
         fn evaluate(raw: *anyopaque, alloc: std.mem.Allocator, _: []const Request) ![]const Json {
@@ -637,17 +659,18 @@ test "decision provider embeddinggemma2 provider wrapper retains the trusted sim
     const questions = try std.json.parseFromSliceLeaky(Json, a, "{\"answer\":{\"type\":\"choice\",\"instructions\":\"Route\",\"criteria\":{\"a\":\"Account\",\"b\":\"Billing\"}}}", .{});
     var mock = Mock{ .response = try std.json.parseFromSliceLeaky(Json, a, "{\"model\":\"embeddinggemma2\",\"answers\":{\"answer\":{\"type\":\"choice\",\"decision_method\":\"embedding_similarity\",\"similarity_metric\":\"cosine\",\"prototype_set_hash\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"choice\":null,\"status\":\"abstained\",\"abstention_reason\":\"tie\",\"similarities\":{\"a\":0.3,\"b\":0.3},\"margin\":0}},\"usage\":{\"input_tokens\":1,\"output_tokens\":0}}", .{}) };
     const provider = DecisionProvider{ .ptr = &mock, .validate_fn = Mock.validate, .evaluate_batch_fn = Mock.evaluate, .capabilities_fn = Mock.caps };
-    const rows = try provider.evaluateBatch(a, &.{.{ .decider = "routing", .questions = questions, .input = "Reset password" }});
+    const rows = try provider.evaluateBatch(a, &.{.{ .decider = "routing", .questions = questions, .input = .{ .text = "Reset password" } }});
     try std.testing.expect((try selectResult(.ai_choice, rows[0])) == .null);
 }
-pub const Request = struct { decider: []const u8, questions: Json, input: []const u8, source_table: []const u8 = "" };
+pub const Request = struct { decider: []const u8, questions: Json, input: Input, source_table: []const u8 = "" };
 pub const DecisionProvider = struct {
     /// Trusted routing scope borrowed from the bound statement, never public JSON.
     source_table: []const u8 = "",
     ptr: *anyopaque,
-    validate_fn: *const fn (*anyopaque, []const u8, Json) anyerror!void,
+    /// Both callbacks use the same trusted table scope as execution.
+    validate_fn: *const fn (*anyopaque, []const u8, Json, []const u8) anyerror!void,
     evaluate_batch_fn: *const fn (*anyopaque, std.mem.Allocator, []const Request) anyerror![]const Json,
-    capabilities_fn: ?*const fn (*anyopaque, []const u8) anyerror!Capabilities = null,
+    capabilities_fn: ?*const fn (*anyopaque, []const u8, []const u8) anyerror!Capabilities = null,
     checkpoint_fn: ?*const fn (*anyopaque) anyerror!void = null,
     pub fn withSourceTable(self: @This(), table: []const u8) @This() {
         var scoped = self;
@@ -658,14 +681,25 @@ pub const DecisionProvider = struct {
         if (self.checkpoint_fn) |f| try f(self.ptr);
     }
     pub fn validate(self: @This(), decider: []const u8, questions: Json) !void {
-        try self.validate_fn(self.ptr, decider, questions);
+        try self.validate_fn(self.ptr, decider, questions, self.source_table);
     }
-    pub fn evaluateBatch(self: @This(), a: std.mem.Allocator, requests: []const Request) ![]const Json {
+    fn requestSourceTable(self: @This(), request: Request) []const u8 {
+        return if (self.source_table.len > 0) self.source_table else request.source_table;
+    }
+    pub fn validateRequests(self: @This(), a: std.mem.Allocator, requests: []const Request) !void {
         try self.checkpoint();
         for (requests) |request| {
-            try self.validate(request.decider, request.questions);
-            _ = try text(.{ .string = request.input });
+            const table = self.requestSourceTable(request);
+            try self.validate_fn(self.ptr, request.decider, request.questions, table);
+            try request.input.validate();
+            const caps = if (self.capabilities_fn) |f| try f(self.ptr, request.decider, self.requestSourceTable(request)) else Capabilities{ .max_levels = 64 };
+            if (!caps.messages) _ = try request.input.requireText();
+            if (!caps.images and request.input.imageCount() != 0) return error.UnsupportedInferenceFeature;
+            try request.input.checkLimit(a, caps.max_input_bytes);
         }
+    }
+    pub fn evaluateBatch(self: @This(), a: std.mem.Allocator, requests: []const Request) ![]const Json {
+        try self.validateRequests(a, requests);
         const scoped = if (self.source_table.len > 0) try a.dupe(Request, requests) else null;
         defer if (scoped) |owned| a.free(owned);
         if (scoped) |owned| for (owned) |*request| {
@@ -675,7 +709,7 @@ pub const DecisionProvider = struct {
         if (results.len != requests.len) return error.InvalidDecisionOutput;
         const out = try a.alloc(Json, results.len);
         for (requests, results, out) |request, result, *value| {
-            const caps = if (self.capabilities_fn) |f| try f(self.ptr, request.decider) else Capabilities{ .max_levels = 64 };
+            const caps = if (self.capabilities_fn) |f| try f(self.ptr, request.decider, self.requestSourceTable(request)) else Capabilities{ .max_levels = 64 };
             value.* = try normalizeResponseWithCapabilities(a, request.questions, result, caps);
         }
         try self.checkpoint();

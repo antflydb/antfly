@@ -135,7 +135,7 @@ pub const Shared = struct {
 pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
     const api_bench_standalone = b.option(bool, "api-bench-standalone", "Build only the API benchmark for an existing server process") orelse false;
     const conformance_fetch = b.option(bool, "conformance-fetch", "Fetch missing external conformance fixtures") orelse true;
-    const conformance_fixtures = b.option([]const u8, "conformance-fixtures", "Cache directory for external conformance fixtures") orelse "/tmp";
+    const conformance_fixtures = b.option([]const u8, "conformance-fixtures", "Cache directory for external conformance fixtures (default: $XDG_CACHE_HOME/antfly/conformance-fixtures)") orelse defaultConformanceFixturesDir(b);
     // On Linux, an implicit native target can cause Zig 0.16.0 to discover and
     // link against the host distro's crt startup objects. Newer glibc/binutils
     // builds may include .sframe sections with relocation types that Zig's
@@ -653,6 +653,12 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
         .target = target,
         .optimize = optimize,
     });
+    const source_reference_mod = b.createModule(.{
+        .root_source_file = b.path("lib/scraping/src/source_reference.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    scraping_mod.addImport("antfly_source_reference", source_reference_mod);
     scraping_mod.addImport("objectstore", objectstore_mod);
     scraping_mod.addImport("httpx", httpx_mod);
     const reranking_mod = b.createModule(.{
@@ -675,6 +681,7 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
     structured_mod.addImport("antfly_extracting", extracting_mod);
 
     const image_mod = image_build.createModule(b, b.path("lib/image"), target, optimize, hash_mod);
+    structured_mod.addImport("antfly_image", image_mod);
     const pdf_standard_fonts_mod = @import("fonts.zig").create(b, target, optimize);
     const font_mod = b.createModule(.{
         .root_source_file = b.path("lib/font/src/mod.zig"),
@@ -752,6 +759,7 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
             .shared_lib_root = "",
         },
         .backend = .{
+            .allow_downloads = b.option(bool, "allow-downloads", "Advertise support for model acquisition") orelse true,
             .enable_metal = inference_enable_metal,
             .enable_cuda = inference_enable_cuda,
             .cuda_artifacts = inference_cuda_artifacts,
@@ -824,6 +832,7 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
         sentencepiece_proto_mod,
     );
     hf_tokenizer_tests.root_module.addImport("antfly_platform", platform_mod);
+    hf_tokenizer_tests.root_module.addImport("antfly_grapheme", regex_mod.import_table.get("antfly_grapheme").?);
     const run_hf_tokenizer_tests = b.addRunArtifact(hf_tokenizer_tests);
     const hf_tokenizer_test_step = b.step(
         "lib-tokenizer-test",
@@ -854,6 +863,7 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
     });
     synthesizing_mod.addImport("antfly_audio_openapi", audio_openapi_mod);
     synthesizing_mod.addImport("httpx", httpx_mod);
+    synthesizing_mod.addImport("antfly_google", google_mod);
 
     const inference_workflow = @import("../../pkg/inference/build/context.zig").Context{
         .b = b,
@@ -1243,6 +1253,7 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
         .middleware_openapi = middleware_openapi_mod,
         .scraping_openapi = scraping_openapi_mod,
         .scraping = scraping_mod,
+        .source_reference = source_reference_mod,
         .s3_openapi = s3_openapi_mod,
         .inference_config_openapi = inference_config_openapi_mod,
         .chunking_api_openapi = chunking_api_openapi_mod,
@@ -1429,6 +1440,20 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
         .antfly_imports = antfly_imports,
         .production_antfly_imports = production_antfly_imports,
     };
+}
+
+/// External conformance fixtures are immutable downloads shared by every
+/// worktree, so they live in one per-user cache rather than in each checkout
+/// or in /tmp (which agents and `make gc` treat as scratch space).
+fn defaultConformanceFixturesDir(b: *std.Build) []const u8 {
+    const env = &b.graph.environ_map;
+    if (env.get("XDG_CACHE_HOME")) |cache| {
+        if (cache.len != 0) return b.pathJoin(&.{ cache, "antfly", "conformance-fixtures" });
+    }
+    if (env.get("HOME")) |home| {
+        if (home.len != 0) return b.pathJoin(&.{ home, ".cache", "antfly", "conformance-fixtures" });
+    }
+    return "/tmp";
 }
 
 fn buildArguments(b: *std.Build) ?[]const []const u8 {

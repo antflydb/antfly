@@ -59,13 +59,19 @@ with the required receipt. Normal SQL transaction failure rules still apply.
 An unmet readiness requirement returns `53300`; malformed or mismatched receipts
 return `22023`, and unsupported visibility returns `0A000`.
 
+These helpers are part of the development source API. Use the
+[pinned SDK installation](reference/sdks.mdx#installation); the npm `0.0.14`,
+PyPI `0.0.2.dev2`, and TestPyPI `0.0.1` packages inspected on 2026-10-22 do not
+contain the TypeScript/Python helpers described here.
+
 The TypeScript `readAfterWrite`, Python `read_after_write`, and Go `ReadAfterWrite`
 helpers accept an ingestion receipt and produce accepted read requirements.
 They preserve an explicit zero wait budget.
 
-`lake_read` (search), `lake_visibility` (HTTP SQL), and
-`antfly.lake_visibility` (PostgreSQL) remain compatibility aliases. The canonical
-HTTP object cannot be combined with its legacy alias in one request. MCP exposes
+HTTP search `lake_read` and HTTP SQL `lake_visibility` are rejected fields; use
+`read_requirements.visibility`. PostgreSQL `antfly.lake_visibility` remains a
+compatibility setting. External-I/O `lake_read`/`lake_write` capabilities are
+separate permissions and are unchanged. MCP exposes
 `read_requirements` in its compact query schema. Composed query lookups and graph
 reads forward the requirements to their leaf reads; existing snapshot tokens
 continue to pin those reads.

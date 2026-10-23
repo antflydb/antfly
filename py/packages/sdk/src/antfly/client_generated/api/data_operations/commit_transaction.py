@@ -105,6 +105,10 @@ def sync_detailed(
     response containing details about which key conflicted.
 
     If all versions match, writes are executed atomically via 2PC.
+    A 409 with diagnostic code `transaction_outcome_unknown` is different
+    from an aborted optimistic conflict: it may already have committed and
+    MUST NOT be replayed. A committed 202 result requires observation or
+    repair, not replay. See https://antfly.io/docs/reference/transaction-outcomes.
 
     Stateless clients manage their own read set. For server-managed
     read-modify-write workflows, use the transaction session endpoints.
@@ -161,6 +165,10 @@ def sync(
     response containing details about which key conflicted.
 
     If all versions match, writes are executed atomically via 2PC.
+    A 409 with diagnostic code `transaction_outcome_unknown` is different
+    from an aborted optimistic conflict: it may already have committed and
+    MUST NOT be replayed. A committed 202 result requires observation or
+    repair, not replay. See https://antfly.io/docs/reference/transaction-outcomes.
 
     Stateless clients manage their own read set. For server-managed
     read-modify-write workflows, use the transaction session endpoints.
@@ -212,6 +220,10 @@ async def asyncio_detailed(
     response containing details about which key conflicted.
 
     If all versions match, writes are executed atomically via 2PC.
+    A 409 with diagnostic code `transaction_outcome_unknown` is different
+    from an aborted optimistic conflict: it may already have committed and
+    MUST NOT be replayed. A committed 202 result requires observation or
+    repair, not replay. See https://antfly.io/docs/reference/transaction-outcomes.
 
     Stateless clients manage their own read set. For server-managed
     read-modify-write workflows, use the transaction session endpoints.
@@ -266,6 +278,10 @@ async def asyncio(
     response containing details about which key conflicted.
 
     If all versions match, writes are executed atomically via 2PC.
+    A 409 with diagnostic code `transaction_outcome_unknown` is different
+    from an aborted optimistic conflict: it may already have committed and
+    MUST NOT be replayed. A committed 202 result requires observation or
+    repair, not replay. See https://antfly.io/docs/reference/transaction-outcomes.
 
     Stateless clients manage their own read set. For server-managed
     read-modify-write workflows, use the transaction session endpoints.

@@ -22,8 +22,13 @@ import json
 import os
 import subprocess
 
+import pytest
 import requests
 from conftest import DEFAULT_ANTFLY_BIN, StandaloneAntflyServer, resolve_binary_path
+
+
+# Server ownership is dynamic/direct, outside static fixture inference.
+pytestmark = pytest.mark.e2e_resource("antfly_process")
 
 
 def test_inspect_standalone_lite_tables_and_dependencies(tmp_path):

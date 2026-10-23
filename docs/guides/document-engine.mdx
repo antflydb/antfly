@@ -114,7 +114,7 @@ need to select companion suffixes.
 ```json
 {
   "query": {"contains": "connection-refused", "field": "content"},
-  "value_search_execution": {"allow_scan": true},
+  "execution": {"value_verification": {"allow_scan": true}},
   "profile": true
 }
 ```
@@ -129,9 +129,9 @@ matching with alternatives for completed terms and the final prefix. Existing `m
 full text; `term`, `prefix` and `regexp` retain indexed-term semantics.
 
 Index candidates are verified before counts, ordering and pagination. Unindexed
-fallback requires `value_search_execution.allow_scan`; defaults cap verification
+fallback requires `execution.value_verification.allow_scan`; defaults cap verification
 at 100,000 documents and 64 MiB per shard request. Exhaustion is an error, never
-a successful partial answer. `profile.value_search` explains selected candidate
+a successful partial answer. `profile.value_verification` explains selected candidate
 fields, fallback reasons and actual verification work. Source capability entries
 name one public `field` and its `value_operations`. Concrete types, analyzers,
 index-relative query modes, and coverage live in nested `representations`.
@@ -352,7 +352,22 @@ All graph expansion work is budgeted across the whole request, including every n
 
 `order_by` produces exact sorted pages over `_id` or mapped scalar fields whose capability is `queryable` or `accelerated`. Antfly appends `_id` ascending as a deterministic tie-breaker when it is omitted.
 
-Each hit carries `_sort` values. Pass them back unchanged as `search_after` for the next page or `search_before` for the previous one:
+First issue an ordered query without a cursor. The response returns a retained
+`remote_snapshot` token and each hit's `_sort` tuple:
+
+```json
+{
+  "table": "articles",
+  "filter_query": {"query": "published:true"},
+  "order_by": [{"field": "created_at", "desc": true}],
+  "limit": 20
+}
+```
+
+For the next request, copy the returned `remote_snapshot` unchanged and the last
+hit's complete `_sort` tuple as `search_after`. For the previous page, use the
+first hit's tuple as `search_before`. The continuation below illustrates the
+shape; replace the token and tuple with the actual response values:
 
 ```json
 {
@@ -363,10 +378,18 @@ Each hit carries `_sort` values. Pass them back unchanged as `search_after` for 
   "order_by": [
     {"field": "created_at", "desc": true}
   ],
+  "remote_snapshot": "<remote_snapshot from the first response>",
   "search_after": ["2026-07-01T00:00:00Z", "doc:article:1842"],
   "limit": 20
 }
 ```
+
+A native-table HTTP continuation without `remote_snapshot` is invalid; `_sort`
+alone does not provide a live-seek mode. If the retained snapshot expires or a
+catalog/incarnation conflict invalidates it, restart with a new first request
+and discard the old cursor. Keep the query and effective ordering unchanged.
+`read_requirements.after_write` sets minimum freshness; it does not identify or
+replace a retained snapshot.
 
 Cursor values preserve JSON scalar types: strings stay strings, numbers stay numbers, booleans stay booleans. Nulls, arrays, objects, and non-finite numbers are rejected because they cannot form replayable typed cursor tuples.
 

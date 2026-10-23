@@ -763,6 +763,11 @@ pub fn create(b: *std.Build) ?Artifacts {
         .root_module = antfly_test_mod.import_table.get("antfly_inference_remote_capabilities").?,
         .filters = &.{"model aware media remote capability"},
     });
+    const remote_capability_tests = b.addTest(.{
+        .root_module = antfly_test_mod.import_table.get("antfly_inference_remote_capabilities").?,
+    });
+    b.step("antfly-remote-capabilities-test", "Verify remote capability discovery, caching and execution lease revocation")
+        .dependOn(&b.addRunArtifact(remote_capability_tests).step);
     model_chunk_step.dependOn(&b.addRunArtifact(chunk_capability_tests).step);
     const chunk_error_tests = b.addTest(.{
         .root_module = antfly_test_mod.import_table.get("storage_engine_errors").?,
@@ -950,6 +955,8 @@ pub fn create(b: *std.Build) ?Artifacts {
         .antfly_test_mod = antfly_test_mod,
         .run_lib_ha_compat_tests = run_lib_ha_compat_tests,
         .compiled_recall_tests = compiled_recall_tests,
+        .conformance_fetch = conformance_fetch,
+        .conformance_fixtures = conformance_fixtures,
     });
     const recall_ci_test_step = benchmarks.recall_ci_test_step;
 

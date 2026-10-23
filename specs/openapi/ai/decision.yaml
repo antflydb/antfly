@@ -199,14 +199,12 @@ components:
       properties:
         id: *id001
         input:
-          type: string
-          minLength: 1
-          maxLength: 1048576
+          $ref: '#/components/schemas/DecisionEvidence'
         context_index:
           x-go-type-skip-optional-pointer: false
           type: integer
           minimum: 0
-          description: Index into request contexts. Requires context_version 1. Effective input is context, newline, then input; the 1 MiB input limit applies after expansion.
+          description: Index into request contexts. Requires context_version 1. Text expands to context, newline, then input. Message evidence gets a leading user message containing the context. The 1 MiB per-item and 16 MiB aggregate evidence limits apply after expansion. Native trained and embedding deciders require text. Generated deciders accept image evidence when the selected generator supports images and constrained output.
     DecideLongDocument:
       type: object
       additionalProperties: false
@@ -309,7 +307,7 @@ components:
       properties:
         decision_method: { type: string, enum: [generated] }
         generator: { $ref: '../shared/generating.yaml#/components/schemas/GeneratorConfig' }
-        input: { type: string, minLength: 1, maxLength: 1048576 }
+        input: { $ref: '#/components/schemas/DecisionEvidence' }
         inputs:
           type: array
           minItems: 1
@@ -324,6 +322,52 @@ components:
         output: { $ref: '../shared/generating.yaml#/components/schemas/ConstrainedOutput' }
         probabilities: { $ref: '../shared/generating.yaml#/components/schemas/ConstrainedProbabilities' }
         batch: { $ref: '../shared/generating.yaml#/components/schemas/ConstrainedGenerationBatch' }
+    DecisionEvidence:
+      description: Text or ordered user messages containing text and images. Named OpenAI and Jev deciders and constrained generators accept messages. Generated image decisions require a model that supports both images and constrained output; native, Gemini, and Vertex generators require inline images and automatic detail. Native trained and embedding deciders require text. At most 128 images and 1 MiB of serialized evidence per call. Jev requires inline PNG/JPEG data URLs and detail auto; OpenAI also accepts public HTTP(S) image URLs and WebP/GIF. Audio, files, tools, and non-user roles are unsupported.
+      oneOf:
+        - type: string
+          minLength: 1
+          maxLength: 1048576
+        - type: array
+          minItems: 1
+          maxItems: 128
+          items: { $ref: '#/components/schemas/DecisionEvidenceMessage' }
+    DecisionEvidenceMessage:
+      type: object
+      additionalProperties: false
+      required: [role, content]
+      properties:
+        type: { type: string, enum: [message] }
+        role: { type: string, enum: [user] }
+        content:
+          oneOf:
+            - type: string
+              minLength: 1
+            - type: array
+              minItems: 1
+              maxItems: 256
+              items:
+                oneOf:
+                  - $ref: '#/components/schemas/DecisionEvidenceText'
+                  - $ref: '#/components/schemas/DecisionEvidenceImage'
+    DecisionEvidenceText:
+      type: object
+      additionalProperties: false
+      required: [type, text]
+      properties:
+        type: { type: string, enum: [input_text] }
+        text: { type: string, minLength: 1 }
+    DecisionEvidenceImage:
+      type: object
+      additionalProperties: false
+      required: [type, image_url]
+      properties:
+        type: { type: string, enum: [input_image] }
+        image_url:
+          type: string
+          minLength: 1
+          description: Base64 data URL (image/png, image/jpeg, image/webp, image/gif), or a public HTTP(S) URL for OpenAI. Antfly never fetches image URLs for decision adapters.
+        detail: { type: string, enum: [auto, low, high], default: auto }
     DecideRequest:
       type: object
       additionalProperties: false
@@ -349,9 +393,7 @@ components:
           pattern: ^[0-9a-f]{64}$
           description: Pin the exact EmbeddingGemma 2 assets and embedding recipe.
         input:
-          type: string
-          minLength: 1
-          maxLength: 1048576
+          $ref: '#/components/schemas/DecisionEvidence'
         inputs:
           type: array
           items:
@@ -368,7 +410,7 @@ components:
           maxItems: 64
         embedding_options:
           $ref: '#/components/schemas/EmbeddingDecisionOptions'
-      description: Supply exactly one of input (single text) or inputs (Antfly batch extension). Question
+      description: Supply exactly one of input (single evidence item) or inputs (ordered Antfly batch extension; hosted typed deciders also accept multimodal evidence per item). Question
         names must be unique. Single text and named question arrays follow OpenAI Decisions conventions;
         local models support text input and string choice values. Request bodies are bounded at 16 MiB.
     DecisionUsage:
@@ -755,7 +797,10 @@ components:
         id: *id001
         error:
           type: string
-          description: Generated batches preserve valid siblings; a failed item has an empty answers array and this error code.
+          description: Named gateway and generated batches preserve valid siblings; a failed item has an empty answers array and this error code. Invalid input or request budgets fail validation before dispatch.
+        model:
+          type: string
+          description: Resolved model reported for a successful named gateway batch item.
         answers:
           type: array
           items:
@@ -784,4 +829,4 @@ components:
         usage:
           $ref: '#/components/schemas/DecisionUsage'
       description: Single-input responses have answers. Batch responses have data in input order, with
-        one named answer array per input and aggregate usage.
+        one named answer array per input and aggregate usage including reported usage from failed items. Named gateway batches identify the configured model at the top level and resolved models per successful item.

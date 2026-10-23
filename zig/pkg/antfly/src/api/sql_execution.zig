@@ -177,6 +177,7 @@ pub const Adapter = struct {
                     .secret_store = self.server.cfg.secret_store,
                     .antfly_provider = self.server.antfly_provider,
                     .antfly_url = config.inference.api_url,
+                    .antfly_api_key = config.inference.api_key,
                 };
             }
         }
@@ -198,6 +199,7 @@ pub const Adapter = struct {
         const previous_provider = self.decision_provider;
         defer self.decision_provider = previous_provider;
         decision_runtime = try self.decisionRuntime();
+        defer if (decision_runtime) |*active| active.deinit();
         if (decision_runtime) |*active| self.decision_provider = active.provider();
         if (self.policy_proofs != null) return zig017_failure: {
             zig017_return_error = error.InvalidSqlBackendResponse;

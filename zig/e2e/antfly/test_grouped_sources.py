@@ -30,6 +30,10 @@ import requests
 from helpers import start_http_server, wait_until
 
 
+# Server ownership is dynamic/direct, outside static fixture inference.
+pytestmark = pytest.mark.e2e_resource("antfly_process")
+
+
 def _write_grouped_fixture(
     api, table_name, *, inserts=None, deletes=None, sync_level=None, timeout_s=120.0
 ):
@@ -381,7 +385,10 @@ def test_grouped_generation_orders_prior_context_and_bounds_replay(
             row("bad", "bad", "invalid"),
         ):
             with pytest.raises(requests.HTTPError) as rejected:
-                api.batch_write(table, inserts={"invalid": invalid}, sync_level="write")
+                # The owner may still be opening after DDL. Retry only that
+                # pre-admission unavailability; the first admitted attempt must
+                # reject malformed membership without a durable Raft entry.
+                write(table, inserts={"invalid": invalid}, sync_level="write")
             assert rejected.value.response.status_code == 400, rejected.value
 
         write(

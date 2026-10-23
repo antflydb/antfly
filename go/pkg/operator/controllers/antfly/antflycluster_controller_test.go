@@ -14819,6 +14819,28 @@ func TestGenerateCompleteConfig_StandaloneLite(t *testing.T) {
 	g.Expect(lite["fsync"]).To(BeTrue())
 }
 
+func TestGenerateCompleteConfig_StandaloneLiteOmitsMetadataPeers(t *testing.T) {
+	for _, raw := range []string{
+		`{}`,
+		`{"metadata":{"orchestration_urls":{"1":"http://old-peer:8080"},"raft_urls":{"1":"http://old-peer:9017"}}}`,
+	} {
+		t.Run(raw, func(t *testing.T) {
+			g := NewWithT(t)
+			cluster := baseStandaloneControllerCluster()
+			cluster.Spec.Storage.Engine = "lite"
+			cluster.Spec.Config = raw
+			reconciler := &AntflyClusterReconciler{}
+			configJSON, err := reconciler.generateCompleteConfig(cluster)
+			g.Expect(err).NotTo(HaveOccurred())
+			var config map[string]any
+			g.Expect(json.Unmarshal([]byte(configJSON), &config)).To(Succeed())
+			metadata := config["metadata"].(map[string]any)
+			g.Expect(metadata["orchestration_urls"]).To(BeEmpty(), "Lite rejects metadata peers")
+			g.Expect(metadata).NotTo(HaveKey("raft_urls"))
+		})
+	}
+}
+
 func TestGenerateCompleteConfig_ManagedInferenceAPIURL(t *testing.T) {
 	g := NewWithT(t)
 

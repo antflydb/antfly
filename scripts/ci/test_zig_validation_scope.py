@@ -43,6 +43,16 @@ class ZigValidationScopeTests(unittest.TestCase):
         self.assertIn("vopr-test", workflow)
         self.assertIn("vopr-build", workflow)
 
+    def test_e2e_archives_include_native_grep(self):
+        workflow = (ROOT / ".github/workflows/zig-tests.yml").read_text()
+        packages = re.findall(
+            r'run: tar -C zig -czf .*antfly-e2e-(?:base|full)\.tar\.gz" (.*)', workflow
+        )
+        self.assertEqual(len(packages), 2)
+        for members in packages:
+            self.assertIn("zig-out/bin/antfly-grep", members.split())
+            self.assertIn("zig-out/bin/antfly", members.split())
+
     def test_full_validation_job_admission_and_build_reuse(self):
         workflow = (ROOT / ".github/workflows/zig-tests.yml").read_text()
         blocks = dict(
@@ -275,8 +285,10 @@ class ZigValidationScopeTests(unittest.TestCase):
         self.assertIn("build capi \\", libraries)
         self.assertIn("python3 scripts/ci/prepare_lite_previous_reader.py", libraries)
         self.assertIn("timeout-minutes: 25", evaluation)
-        self.assertIn("build capi-test", evaluation)
-        self.assertIn('--cache-dir "$ZIG_LOCAL_CACHE_DIR"', evaluation)
+        self.assertIn("Compile and run Lite model unit contracts", libraries)
+        self.assertIn("build capi-test", libraries)
+        self.assertIn('--cache-dir "$ZIG_LOCAL_CACHE_DIR"', libraries)
+        self.assertNotIn("run_bounded_zig_build.py", evaluation)
         self.assertNotIn("--cache-dir ../../.zig-cache", models)
         self.assertNotIn("--cache-dir ../../.zig-cache", blocks["zig-full-tests"])
         self.assertIn("tests/test_graph_edge_readiness.py", evaluation)
@@ -297,6 +309,7 @@ class ZigValidationScopeTests(unittest.TestCase):
             "CHANGES_RESULT": "success",
             "X86_64_RESULT": "success",
             "ARM64_CODEC_RESULT": "success",
+            "GREP_RESULT": "success",
             "WASM_RESULT": "success",
             "LITE_MODEL_RESULT": "success",
             "REQUIRE_LITE_MODELS": "true",
@@ -306,6 +319,7 @@ class ZigValidationScopeTests(unittest.TestCase):
             "CHANGES_RESULT",
             "X86_64_RESULT",
             "ARM64_CODEC_RESULT",
+            "GREP_RESULT",
             "WASM_RESULT",
             "LITE_MODEL_RESULT",
         ):

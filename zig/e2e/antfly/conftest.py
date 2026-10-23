@@ -905,6 +905,7 @@ def _write_remote_content_e2e_config(
         json.dumps(
             {
                 "remote_content": {"security": {"block_private_ips": False}},
+                "public_inference": {"enabled": True},
                 **(
                     {
                         "pgwire": {

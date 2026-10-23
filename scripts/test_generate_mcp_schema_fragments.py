@@ -34,17 +34,19 @@ class McpSchemaFragmentTests(unittest.TestCase):
         )
         query = {
             "query": {"contains": "needle", "field": "grep.content"},
-            "value_search_execution": {
-                "allow_scan": True,
-                "max_documents": 32,
-                "max_bytes": 4096,
+            "execution": {
+                "value_verification": {
+                    "allow_scan": True,
+                    "max_documents": 32,
+                    "max_bytes": 4096,
+                }
             },
             "order_by": [{"field": "_id"}],
             "search_after": ["doc-a"],
             "remote_snapshot": "a" * 64,
         }
         self.assertEqual([], list(validator.iter_errors(query)))
-        query["value_search_execution"]["max_documents"] = 0
+        query["execution"]["value_verification"]["max_documents"] = 0
         self.assertTrue(list(validator.iter_errors(query)))
 
     def test_mcp_result_budget_schema_matches_runtime_zero_or_minimum(self) -> None:
@@ -150,6 +152,22 @@ class McpSchemaFragmentTests(unittest.TestCase):
             generated["allOf"],
         )
 
+    def test_logical_dsl_union_and_canonical_bool_are_unambiguous(self) -> None:
+        source = generator.SPEC.with_name("query.yaml")
+        with source.open(encoding="utf-8") as handle:
+            schema = yaml.safe_load(handle)
+        schema["$ref"] = "#/components/schemas/Query"
+        validator = Draft202012Validator(schema)
+        for operator in ("equals", "contains", "matches", "autocomplete"):
+            leaf = {operator: "needle", "field": "content"}
+            self.assertEqual([], list(validator.iter_errors(leaf)), leaf)
+            invalid = {**leaf, "normalizer": "unknown"}
+            self.assertTrue(list(validator.iter_errors(invalid)), invalid)
+            boolean = {
+                "bool": {"must": [leaf], "filter": {"equals": "code", "field": "kind"}}
+            }
+            self.assertEqual([], list(validator.iter_errors(boolean)), boolean)
+
     def test_child_navigation_schema_matches_the_dedicated_runtime_mode(self) -> None:
         with generator.SPEC.open(encoding="utf-8") as handle:
             schemas = yaml.safe_load(handle)["components"]["schemas"]
@@ -174,7 +192,6 @@ class McpSchemaFragmentTests(unittest.TestCase):
             "timeout_ms",
             "order_by",
             "search_after",
-            "lake_read",
             "read_requirements",
             "remote_snapshot",
         }
@@ -228,7 +245,7 @@ class McpSchemaFragmentTests(unittest.TestCase):
             ("analyses", {"pca": True}),
             ("highlight", {}),
             ("evaluate", {"compute": {"x": {"literal": 1}}}),
-            ("value_search_execution", {"allow_scan": True}),
+            ("execution", {"value_verification": {"allow_scan": True}}),
             ("limit", 101),
             ("search_after", ["position-only"]),
             ("order_by", [{"field": "_hierarchy.position", "desc": True}]),

@@ -32534,7 +32534,7 @@ fn encodeRemoteBatchRequest(alloc: std.mem.Allocator, req: db_mod.types.BatchReq
 /// Encodes the canonical internal batch wire contract for the compiled storage
 /// owner, including sync level and split-replication metadata.
 pub fn encodeStorageKernelBatchRequest(alloc: std.mem.Allocator, req: db_mod.types.BatchRequest) ![]u8 {
-    return try batch_api.encodeBatchRequest(alloc, req);
+    return try batch_api.encodeOwnerBatchRequest(alloc, req);
 }
 
 fn encodeRemoteDocumentArtifactChildRangeApplyBatch(

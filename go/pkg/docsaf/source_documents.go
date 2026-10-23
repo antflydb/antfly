@@ -42,6 +42,9 @@ const (
 // original file identity and stable metadata; Antfly derives units, chunks,
 // embeddings, full-text entries, and graph artifacts from this row.
 type SourceDocument struct {
+	// SourceURI and SourceID retain provider identity independently of private materialization URLs.
+	SourceURI  string
+	SourceID   string
 	ID         string
 	URL        string
 	Filename   string
@@ -68,6 +71,12 @@ func (d SourceDocument) ToDocument() map[string]any {
 		"source_path": d.SourcePath,
 		"source_kind": d.SourceKind,
 		"doc_type":    "source_document",
+	}
+	if d.SourceURI != "" {
+		doc["source_uri"] = d.SourceURI
+	}
+	if d.SourceID != "" {
+		doc["source_id"] = d.SourceID
 	}
 	if d.ETag != "" {
 		doc["etag"] = d.ETag
@@ -107,6 +116,8 @@ type SourceDocumentOptions struct {
 
 	// IDPrefix optionally namespaces source document IDs.
 	IDPrefix string
+	// PreferProviderID keeps Drive identity stable across moves and renames.
+	PreferProviderID bool
 }
 
 // BuildSourceDocuments traverses a ContentSource and returns source rows without
@@ -137,7 +148,14 @@ func BuildSourceDocuments(ctx context.Context, source ContentSource, opts Source
 // source row for document_extraction.
 func SourceDocumentFromContentItem(item ContentItem, opts SourceDocumentOptions) (SourceDocument, error) {
 	sourcePath := filepath.ToSlash(item.Path)
+	sourceID := metadataString(item.Metadata, "source_id")
+	if sourceID == "" {
+		sourceID = metadataString(item.Metadata, "drive_file_id")
+	}
 	id := sourcePath
+	if opts.PreferProviderID && sourceID != "" {
+		id = sourceID
+	}
 	if opts.IDPrefix != "" {
 		id = strings.TrimSuffix(opts.IDPrefix, "/") + "/" + strings.TrimPrefix(id, "/")
 	}
@@ -156,6 +174,7 @@ func SourceDocumentFromContentItem(item ContentItem, opts SourceDocumentOptions)
 	if sourceURL == "" && opts.BaseURL != "" {
 		sourceURL = strings.TrimRight(opts.BaseURL, "/") + "/" + strings.TrimLeft(sourcePath, "/")
 	}
+	originalURI := sourceURL
 	if opts.InlineContent {
 		if opts.MaxInlineBytes > 0 && int64(len(item.Content)) > opts.MaxInlineBytes {
 			return SourceDocument{}, fmt.Errorf("source document %q is %d bytes, exceeding inline content limit %d bytes; use BaseURL for large files", item.Path, len(item.Content), opts.MaxInlineBytes)
@@ -167,6 +186,8 @@ func SourceDocumentFromContentItem(item ContentItem, opts SourceDocumentOptions)
 	}
 
 	doc := SourceDocument{
+		SourceURI:  originalURI,
+		SourceID:   sourceID,
 		ID:         id,
 		URL:        sourceURL,
 		Filename:   filepath.Base(item.Path),

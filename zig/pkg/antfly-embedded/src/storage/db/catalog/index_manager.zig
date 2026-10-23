@@ -19197,6 +19197,9 @@ pub const IndexManager = struct {
                     projection_batch,
                     entry.text_analysis,
                     .{
+                        .scratch_allocator = introducer_mod.textBuildScratchAllocator(),
+                        .postings_run_io = if (textBuildSpoolDirectory(entry) != null) entry.io else null,
+                        .postings_run_directory = textBuildSpoolDirectory(entry) orelse ".",
                         .target_segment_bytes = @max(@as(usize, 1), textSegmentBuildTargetBytes()),
                         .target_build_memory_bytes = @max(@as(usize, 1), textBuildMemoryTargetBytes()),
                         .doc_scratch_retained_bytes = textDocScratchRetainedBytes(),
@@ -49365,4 +49368,60 @@ test "logical query analyzer revision covers configuration and dynamic schema al
         const plain_cfg: types.IndexConfig = .{ .name = "ft", .kind = .full_text, .config_json = "{}", .coverage_generation = 11 };
         try std.testing.expectEqual(changed, !(try TextProjectionProvenance.fromRuntimeSchemaRevision(a, plain_cfg, schema, 0)).eql(try TextProjectionProvenance.fromRuntimeSchema(a, plain_cfg, schema)));
     }
+}
+
+test "index_manager bounded native prepared text publication spills before admission exhaustion" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer a.free(path);
+    const path_z = try a.dupeSentinel(u8, path, 0);
+    defer a.free(path_z);
+    var store = try docstore_mod.DocStore.open(a, path_z, .{});
+    defer store.close();
+    const fields = [_]schema_mod.FullTextField{
+        .{ .path = "content", .emitted_name = "content", .analyzer = "standard" },
+        .{ .path = "content", .emitted_name = "content._substring", .analyzer = "substring" },
+    };
+    const schema: schema_mod.TableSchema = .{ .version = 0, .default_type = "doc", .full_text_documents = &.{.{ .name = "doc", .fields = &fields }} };
+    _ = try schema_mod.saveSchema(&store, a, schema);
+    var budgets = resource_manager_mod.Options.defaultBudgets();
+    budgets[@backingInt(resource_manager_mod.Slice.full_text_build_working_set)] = .{ .soft_limit_bytes = 96 * 1024 * 1024, .hard_limit_bytes = 128 * 1024 * 1024 };
+    var resources = resource_manager_mod.ResourceManager.init(.{ .budgets = budgets, .disk_safety_floor_bytes = 1024 * 1024, .disk_safety_floor_divisor = 0 });
+    defer resources.deinit(a);
+    var manager = try IndexManager.initWithOptions(a, path, .{ .resource_manager = &resources });
+    defer manager.deinit();
+    manager.setIo(std.testing.io);
+    manager.updateRange(.{ .start = "", .end = "" });
+    try manager.addAllNoBackfill(&store, &.{.{ .name = "ft_v1", .kind = .full_text, .config_json = "{}" }});
+    const text = try a.alloc(u8, 180 * 1024);
+    defer a.free(text);
+    var random = std.Random.DefaultPrng.init(0x51ff1c);
+    for (text) |*byte| byte.* = 'a' + random.random().uintLessThan(u8, 26);
+    const json = try std.fmt.allocPrint(a, "{{\"content\":\"{s}\"}}", .{text});
+    defer a.free(json);
+    const docs = [_]mapper.MapperDoc{ .{ .key = "a", .value = json }, .{ .key = "b", .value = json } };
+    var context = try manager.acquireTextPublicationContext(a, "ft_v1");
+    defer context.deinit();
+    var prepared = try manager.prepareTextMapperDocsPublication(a, &store, "ft_v1", &context, &docs);
+    defer prepared.deinit();
+    const stats = resources.sliceStats(.full_text_build_working_set);
+    try std.testing.expectEqual(@as(u64, 0), stats.used_bytes);
+    try std.testing.expect(stats.peak_bytes <= 128 * 1024 * 1024);
+    var documents: u32 = 0;
+    for (prepared.segments) |segment| {
+        var reader = try segment_mod.SegmentReader.init(a, segment);
+        defer reader.deinit();
+        documents += reader.doc_count;
+        var field = (try reader.invertedIndexScoped(a, "content._substring")).?;
+        defer field.deinit();
+        const found = (try field.lookup(text[0..32])).?;
+        var iterator = try found.iterator(a);
+        defer iterator.deinit();
+        for (0..reader.doc_count) |_| try std.testing.expect((try iterator.next()) != null);
+        try std.testing.expect((try iterator.next()) == null);
+    }
+    try std.testing.expectEqual(@as(u32, 2), documents);
+    std.debug.print("PREPARED_TEXT_SPILL documents={d} peak_bytes={d}\n", .{ documents, stats.peak_bytes });
 }

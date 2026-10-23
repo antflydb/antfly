@@ -221,7 +221,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .optimize = optimize,
     });
     test_imports.configure(b, functions_test_mod, true, true);
-    const functions_tests = b.addTest(.{ .root_module = functions_test_mod, .filters = &.{ "decision functions", "function bindings", "decision provider" } });
+    const functions_tests = b.addTest(.{ .root_module = functions_test_mod, .filters = &.{ "decision functions", "function bindings", "decision provider", "provider quotas" } });
     b.step("functions-test", "Run provider and expression decision function contracts").dependOn(&b.addRunArtifact(functions_tests).step);
 
     // Parser/worker projection contracts need no HTTP server or linked kernel.
@@ -1303,6 +1303,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "media part item embedding",
         "PDF render budget reserves the complete invocation peak",
         "semantic query planning reuses equivalent embeddings",
+        "local owner conditional batch wire retains predicates without exposing remote authority",
+        "system catalog cached capabilities retain shorthand scalar source names",
         "batch parser preserves oversized value errors",
         "batch parser accepts raw payload value under public request cap",
         "public batch parser rejects non-object documents while internal replay remains opaque",
@@ -1949,6 +1951,10 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "httpx retrieval read failures preserve retryable JSON and conflict status",
         "retrieval agent sse",
         "retrieval agent streaming emits go-shaped tree",
+        "httpx inference gateway",
+        "linked API route manifest",
+        "api kernel includes inference gateway",
+        "provider registry gateway",
         "inference connection invocation forwards streaming and deadline through stable target ABI",
         "inference invocation remaining deadline rounds up and expires",
         "inference connection ABI reclaims partial responses on target failure",
@@ -2055,6 +2061,13 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     b.step("antfly-api-relational-index-http-test", "Run unified relational index CRUD and document index compatibility").dependOn(&addFilteredTestRunArtifactWithRuntimeFilters(b, relational_index_http_tests, &.{ "api http server unified relational index CRUD", "api http server serves table index metadata routes", "index maintenance actions require table admin permission" }).step);
+    const gateway_filters = &.{ "httpx inference gateway", "linked API route manifest", "api kernel includes inference gateway", "provider registry gateway", "httpx inference connection", "local inference connection admission", "internal service credentials cannot authorize public inference routes" };
+    const gateway_tests = b.addTest(.{
+        .root_module = api_http_runtime_test_mod,
+        .filters = gateway_filters,
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("antfly-inference-gateway-test", "Run named inference gateway contract tests").dependOn(&addFilteredTestRunArtifactWithRuntimeFilters(b, gateway_tests, gateway_filters).step);
     const artifact_http_filters = &.{ "artifact repair body", "artifact repair query params", "document artifact routes declare", "artifact operations apply source document" };
     const artifact_http_tests = b.addTest(.{
         .name = "artifact-http-tests",
@@ -4855,6 +4868,12 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const run_lib_audio_tests = b.addRunArtifact(lib_audio_tests);
     const lib_audio_test_step = b.step("antfly-audio-test", "Run audio transcribing and synthesizing runtime tests");
     lib_audio_test_step.dependOn(&run_lib_audio_tests.step);
+    // Library tests must run at their own module boundary; imports in the
+    // integration root alone do not discover their provider contracts.
+    inline for (.{ antfly_imports.transcribing, antfly_imports.synthesizing }) |module| {
+        const provider_tests = b.addTest(.{ .root_module = module });
+        lib_audio_test_step.dependOn(&b.addRunArtifact(provider_tests).step);
+    }
     const standalone_runtime_test_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/standalone_runtime_test_root.zig"),
         .target = target,
@@ -5850,6 +5869,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     integration_test_step.dependOn(&run_maintenance_worker_tests.step);
 
     const graph_metric_fan_in_filters = [_][]const u8{
+        "graph capability diagnostic forwards into its owning request across bindings",
+        "incoming resolver qualification recognizes the owning logical table",
         "local graph metric reads reject invalid freshness without leaking",
         "query parser accepts direct graph metric reads",
         "query parser accepts graph metric rerank",
@@ -6681,6 +6702,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "storage.db.status_projection.",
             "storage.db.document_collectors.",
             "storage.db.graph_endpoint_resolutions.",
+            "storage.db.graph_mention_projection.",
             "storage.db.graph_field_plan.",
             "storage.db.owned_keys.",
             "storage.db.read_projection.",
@@ -6903,6 +6925,9 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "storage.derived_log_test_root.",
             "storage.docstore.",
             "storage.enrichment.",
+            "storage.engine.",
+            "storage.logical_source.",
+            "storage.document_projection.",
             "storage.filesystem_capacity.",
             "storage.generation_publication.",
             "storage.hbc_adapter.",

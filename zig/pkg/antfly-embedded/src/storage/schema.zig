@@ -2244,7 +2244,7 @@ pub fn declaredFieldCapability(schema: TableSchema, field: DeclaredField) FieldC
     const doc_value_coverage = if (mapping.doc_values) "schema_declared" else "not_declared";
     return .{
         .field = field.field,
-        .logical_field = declaredLogicalSource(schema, field.field),
+        .logical_field = declaredLogicalSource(schema, field.field) orelse field.field,
         .field_type = mapping.field_type,
         .searchable = mapping.do_index,
         .filterable = mappingIsFilterable(mapping),
@@ -4364,4 +4364,16 @@ test "logical query named autocomplete supports detailed mappings without genera
     var ambiguous = schema;
     ambiguous.exact_fields = &.{ schema.exact_fields[1], .{ .source_field = "title", .field = "title.other", .mapping = .{ .field_type = .search_as_you_type } } };
     try std.testing.expect(resolveLogicalAutocompleteRoot(ambiguous, "title") == null);
+}
+
+test "declared scalar shorthand capabilities retain their logical source" {
+    const schema: TableSchema = .{ .declared_fields = &.{
+        .{ .field = "size", .mapping = .{ .field_type = .numeric } },
+        .{ .field = "modified_at", .mapping = .{ .field_type = .datetime } },
+    } };
+    for (schema.declared_fields) |field| {
+        const capability = declaredFieldCapability(schema, field);
+        try std.testing.expectEqualStrings(field.field, capability.logical_field.?);
+        try std.testing.expect(!capability.sortable);
+    }
 }

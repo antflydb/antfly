@@ -438,6 +438,7 @@ const OwnedRead = struct {
             if (state.metadata.isolation != .read_committed) self.native_adapter.range_reads = &self.range_guards;
         }
         self.decision_runtime = try self.native_adapter.decisionRuntime();
+        errdefer if (self.decision_runtime) |*active| active.deinit();
         if (self.decision_runtime) |*active| self.native_adapter.decision_provider = active.provider();
         self.guarded = .{ .native = self.native_adapter.backend(), .authority = &self.authority, .revision = &self.native_adapter.revision, .expected_guard = self.authority.request.binding_guard };
         const parameters = if (request.parameter_cells != null) request.parameters else try normalizeParameters(arena, request.parameters, request.parameter_types);
@@ -448,6 +449,7 @@ const OwnedRead = struct {
         // prepared epoch on that same snapshot before binding or reading rows.
         const opened = try Pull.Stream.open(alloc, stream_backend, plan.compiled(), parameters, .{ .result_rows = request.limit, .page_rows = 256, .parameter_cells = request.parameter_cells, .parameter_owner = request.parameter_owner });
         if (opened == null) {
+            if (self.decision_runtime) |*active| active.deinit();
             self.identity.?.deinit(server.alloc);
             self.arena.deinit();
             self.staged.deinit(alloc);
@@ -612,6 +614,7 @@ const OwnedRead = struct {
         if (self.detached) return;
         self.detached = true;
         self.stream.close();
+        if (self.decision_runtime) |*active| active.deinit();
         self.plan.release(self.adapter.server.sqlPlanCacheIo());
         self.admission.release();
         self.staged.deinit(self.alloc);

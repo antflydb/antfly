@@ -37,7 +37,11 @@ from conftest import (
     resolve_binary_path,
 )
 
-pytestmark = [pytest.mark.iceberg_integration, pytest.mark.fresh_antfly_process]
+pytestmark = [
+    pytest.mark.iceberg_integration,
+    pytest.mark.fresh_antfly_process,
+    pytest.mark.e2e_resource("antfly_process"),
+]
 
 
 def _export_table(table, root):
@@ -1340,9 +1344,9 @@ def test_native_iceberg_accepted_text_windows_and_retained_cut_restart(
             "fields": ["id", "body"],
             "limit": row_count,
             "profile": True,
-            "lake_read": {
+            "read_requirements": {
                 "visibility": "accepted",
-                "through": accepted["read_receipt"],
+                "after_write": accepted["read_receipt"],
             },
             "highlight": {"fields": ["body"]},
         }
@@ -1473,9 +1477,9 @@ def test_native_iceberg_accepted_text_windows_and_retained_cut_restart(
                 },
             )
             latest_request = dict(query, embeddings=embeddings)
-            latest_request["lake_read"] = {
+            latest_request["read_requirements"] = {
                 "visibility": "accepted",
-                "through": newer["read_receipt"],
+                "after_write": newer["read_receipt"],
             }
             deadline = time.monotonic() + 120
             while True:

@@ -374,7 +374,7 @@ fn maskBatch(base: *Stream, changes: *const Stream, keys: []const []const u8, ki
         }
         try clauses.append(pa, try std.json.parseFromSliceLeaky(V, pa, try std.json.Stringify.valueAlloc(pa, .{ .conjuncts = terms.items }, .{}), .{}));
     }
-    const lookup = try std.json.Stringify.valueAlloc(pa, .{ .full_text_search = .{ .match_all = .{} }, .filter_query = .{ .disjuncts = clauses.items }, .fields = keys, .limit = batch_size + 1, .remote_snapshot = changes.position.remote_snapshot, .read_requirements = root.object.get("read_requirements"), .lake_read = root.object.get("lake_read") }, .{ .emit_null_optional_fields = false });
+    const lookup = try std.json.Stringify.valueAlloc(pa, .{ .full_text_search = .{ .match_all = .{} }, .filter_query = .{ .disjuncts = clauses.items }, .fields = keys, .limit = batch_size + 1, .remote_snapshot = changes.position.remote_snapshot, .read_requirements = root.object.get("read_requirements"), .execution = root.object.get("execution") }, .{ .emit_null_optional_fields = false });
     try executor.checkpoint(executor.ptr);
     var response = try executor.execute(executor.ptr, response_a, changes.position.table, lookup);
     if (response.status != 200) {

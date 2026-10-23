@@ -156,15 +156,26 @@
     "semantic": true
   },
   {
-    "id": "tool-rewrite-text",
+    "id": "tool-knowledge-graph",
     "type": "navigation",
     "group": "tools",
-    "label": "Rewrite Text",
-    "description": "Rewrite text with a model",
-    "href": "/inference/playground/rewrite",
-    "icon": "Repeat2",
+    "label": "Knowledge Graph",
+    "description": "Extract entities and relationships as a graph",
+    "href": "/inference/playground/kg",
+    "icon": "Network",
     "product": "inference",
-    "semantic": true
+    "semantic": false
+  },
+  {
+    "id": "tool-rag-playground",
+    "type": "navigation",
+    "group": "tools",
+    "label": "RAG Playground",
+    "description": "Inspect retrieval-augmented generation over a selected table",
+    "href": "/data/playground/rag",
+    "icon": "Bot",
+    "product": "antfly",
+    "semantic": false
   },
   {
     "id": "tool-rerank-text",

@@ -36,17 +36,16 @@ export function BackendInfoBar() {
 
   if (status === "checking") {
     return (
-      <div className="flex items-center gap-2 mb-4 p-3 rounded-none border bg-muted/30">
+      <div className="af-ai-backend-info flex min-h-8 items-center gap-2" aria-live="polite">
         <Skeleton className="h-4 w-4 rounded-full" />
-        <Skeleton className="h-4 w-32" />
-        <Skeleton className="h-4 w-24" />
+        <Skeleton className="h-4 w-28" />
       </div>
     );
   }
 
   if (status === "disconnected") {
     return (
-      <div className="flex items-center justify-between mb-4 p-3 rounded-none border border-destructive/30 bg-destructive/5">
+      <div className="af-ai-backend-info flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
         <div className="flex items-center gap-2 text-sm text-destructive">
           <WifiOff className="h-4 w-4" />
           <span>
@@ -74,14 +73,17 @@ export function BackendInfoBar() {
   }
 
   return (
-    <div className="flex items-center gap-2 mb-4 p-3 rounded-none border bg-muted/30 flex-wrap">
+    <div className="af-ai-backend-info flex flex-wrap items-center gap-3">
       {/* Connection status */}
       <div className="flex items-center gap-1.5">
-        <span className="relative flex h-2.5 w-2.5">
-          <span className="animate-ping absolute inline-flex h-full w-full rounded-full af-status-bar-success opacity-75" />
-          <span className="relative inline-flex rounded-full h-2.5 w-2.5 af-status-bar-success" />
-        </span>
+        <span
+          className="inline-flex size-2.5 rounded-full af-status-bar-success"
+          aria-hidden="true"
+        />
         <Wifi className="h-3.5 w-3.5 text-muted-foreground" />
+        <span className="font-mono text-[11px] font-medium uppercase tracking-[0.08em] af-status-text-success">
+          Connected
+        </span>
       </div>
 
       <label className="flex items-center gap-2 text-xs">

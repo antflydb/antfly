@@ -47,7 +47,7 @@ For example, `distributed sy` can match both `Distributed Systems` and
 `distributed storage`; it is not an all-words constraint. Absence of a compatible mapping
 is an error, not an implicit raw prefix query.
 
-An independent `value_search_execution` request policy controls permission to
+An independent `execution.value_verification` request policy controls permission to
 scan and maximum documents/bytes verified. Defaults forbid unindexed fallback;
 limits are per shard request, count repeated source loads, and fail explicitly
 rather than returning successful partial results. Existing timeout and
@@ -241,7 +241,7 @@ For example, a logical text source with one sortable keyword view is exposed as:
 }
 ```
 
-MCP raw-query discovery exposes the same `value_search_execution` budgets and
+MCP raw-query discovery exposes the same `execution.value_verification` budgets and
 `remote_snapshot` cursor control as REST. Sequential `hierarchy.children`
 traversal accepts its retained snapshot token and rejects value-search policy,
 because that mode performs no relevance/filter verification phase.
@@ -292,7 +292,7 @@ logical query contract, and generated Go, TypeScript, Python and native models
 include the public types. Logical keyword sorting resolves the same source
 associations at both HTTP admission and database execution.
 
-The [qualification report](../../zig/pkg/antfly-grep/bench/results/logical-field-validation.json)
+The [qualification report](../../zig/pkg/antfly-grep/bench/results/README.md)
 pins source and binary hashes and records local CLI, native-contract, SDK and
 real-server HTTP checks. Qualification covers macOS and native one/three-shard
 HTTP execution, including retained remote storage views. It does not establish
@@ -300,7 +300,7 @@ new throughput guarantees, every external provider's original-value support,
 or Linux/Windows runtime qualification of these new server paths.
 
 
-[Verification reuse qualification](../../zig/pkg/antfly-grep/bench/results/logical-reuse-validation.json)
+[Verification reuse qualification](../../zig/pkg/antfly-grep/bench/results/README.md)
 pins the follow-up implementation and merged-main revision, final artifact hashes,
 all workload records, and native/HTTP/SDK checks. It covers named autocomplete
 mappings, unknown observed source associations, deleted-slot budgets, cache
@@ -313,7 +313,7 @@ analyzer, not the prefix-expanding index analyzer. A query for `distributed` mus
 not match `Dinosaur Bones` through the generated `di` token. Existing generated
 shingle/root analyzers retain their configured semantics.
 
-[Mixed streaming qualification](../../zig/pkg/antfly-grep/bench/results/logical-stream-validation.json)
+[Mixed streaming qualification](../../zig/pkg/antfly-grep/bench/results/README.md)
 pins the merged source and artifacts, every trial, the initial slower literal
 control and the final optimized comparison. It covers the one-pass 4,096-document
 policy, both named autocomplete aliases, immutable pins across eviction/expiry,
@@ -373,7 +373,7 @@ make the merged metric version zero rather than suggesting complete coverage.
 These counters make batching and projection observable through actual HTTP
 requests, rather than relying only on callback fixtures.
 
-[Scalable verification qualification](../../zig/pkg/antfly-grep/bench/results/logical-scalable-validation.json)
+[Scalable verification qualification](../../zig/pkg/antfly-grep/bench/results/README.md)
 records native/HTTP checks, the reproducible optimized baseline, per-run CPU,
 first-result latency, throughput, memory and batching/projection/window controls.
 It retains the initial observations and benchmark-settling correction. Linux uses
@@ -418,7 +418,7 @@ server. Earlier variable trials and the rejected absolute-threshold observation
 remain separate from qualified comparisons.
 
 
-[Verification-cost qualification](../../zig/pkg/antfly-grep/bench/results/logical-cost-validation.json)
+[Verification-cost qualification](../../zig/pkg/antfly-grep/bench/results/README.md)
 pins the final artifacts and source, both real process-upgrade/public-repair
 checks, native contracts and 14 CLI/server HTTP integrations per platform. It
 retains 16 primary benchmark configurations, a paired Linux comparison and all
@@ -442,7 +442,7 @@ Run the same driver on native hosts or inside CPU/memory constrained containers.
 
 On Linux, `--advise-file-cache` adds `fsync` and `POSIX_FADV_DONTNEED` advice only for regular files in the isolated fixture's own temporary root while its server is stopped. Symlinks and caller-supplied directories are ineligible. Each restart records advised file counts/bytes and process I/O counters before/after the first query and each warm group, including startup I/O. The advice is not a guarantee of device-cache eviction, and startup can reload pages. This supplies reproducible cache controls without a global cache-drop operation or a claim of physical cold-storage qualification.
 
-The [source-reader qualification](../../zig/pkg/antfly-grep/bench/results/logical-source-validation.json)
+The [source-reader qualification](../../zig/pkg/antfly-grep/bench/results/README.md)
 records 60 final configurations over pinned `cf71262234` artifacts: two reversed
 rounds of default, full-original, scalar and fixed-16/32/64 controls on macOS and
 a one-CPU/1 GiB native ARM64 Linux VM, followed by a two-CPU concurrency repeat.
@@ -516,7 +516,7 @@ movement as eliminated work. Server qualification uses the existing scalable and
 concurrent HTTP fixtures. Neither a process restart nor fixture-file cache advice establishes
 device-cold behavior or performance on independent Linux hardware.
 
-The [substring/startup qualification](../../zig/pkg/antfly-grep/bench/results/substring-bootstrap-validation.json)
+The [substring/startup qualification](../../zig/pkg/antfly-grep/bench/results/README.md)
 pins the production implementation at `34091b088b` after merging main
 `dd49f55102`, with a baseline built after that same merge. Both optimized servers
 pass all 18 HTTP integration/upgrade cases; the Linux server now passes within
@@ -535,3 +535,340 @@ verification changes from 9.15 to 8.27 ms and its largest observed window from
 The report retains those regressions, all raw trials, ingestion CPU and sampled
 process memory. Necessary postings, verification, and provider I/O remain real
 costs. The bounded design does not promise zero work or uniform throughput gains.
+
+### Canonical execution controls and read identity
+
+Logical intent stays in `query`: `equals`, `contains` and `matches` verify
+original values, while `autocomplete` performs analyzed bool-prefix matching.
+The execution envelope governs admitted work without changing those meanings:
+
+```json
+{
+  "query": {"contains": "needle", "field": "content"},
+  "execution": {
+    "value_verification": {
+      "allow_scan": true,
+      "max_documents": 100000,
+      "max_bytes": 67108864,
+      "max_regex_work": 100000000
+    }
+  },
+  "profile": true
+}
+```
+
+`profile.value_verification` describes measured work, selected representations,
+source reads/parsing and allocation admission. The typed OpenAPI profile includes
+these counters; aggregate window bytes are a maximum, not summed process memory.
+Limits remain per shard and exhaustion fails explicitly. Omitting the envelope
+retains conservative defaults; it never grants scan permission implicitly.
+The CLI's explicit scan policy and connection configuration use the same envelope.
+
+`read_requirements` governs minimum freshness, with `after_write` carrying a
+write receipt. `remote_snapshot` instead identifies the exact retained read for
+pagination. Both concepts remain distinct. Sequential `hierarchy.children`
+accepts a retained snapshot token alongside its revision-bound position cursor;
+it rejects value-verification execution controls because it has no matching phase.
+The removed public `lake_read`, SQL `lake_visibility` and
+`value_search_execution` options are rejected rather than silently ignored.
+Internal lake read capabilities and storage visibility types remain implementation
+contracts, not alternative public request spellings.
+
+Keep `autocomplete` as the public intent-level name: it selects documents, not
+suggested query strings. [MongoDB Search](https://www.mongodb.com/docs/search/query/operators-collectors/autocomplete/)
+uses the same intent name. Elasticsearch exposes
+[`match_bool_prefix`](https://www.elastic.co/docs/reference/query-languages/query-dsl/query-dsl-match-bool-prefix-query)
+and recommends querying root/shingle representations for
+[`search_as_you_type`](https://www.elastic.co/docs/reference/elasticsearch/mapping-reference/search-as-you-type).
+Antfly resolves those representations from the logical field; callers do not
+need to reproduce that physical query construction.
+
+### Bounded exploration and immutable membership views
+
+Source-reader calibration explores coarse windows before finer classes. Each
+batch class needs one required-read sample, while scalar reads use three;
+clipped and previously sampled classes are skipped. With stable row caps and completed reads, calibration finishes
+within ten provider calls, including the two-row bootstrap. Refused or truncated
+reads do not complete untested timing arms. The bootstrap seeds
+payload size but contributes no steady-state timing. Later bounded probes still
+adapt to changing costs, and allocation refusal continues to shrink admission.
+This avoids sixteen scalar calls per exploration class on every new execution.
+Fixed-window and scalar qualification controls remain independent.
+
+Borrowed substring terms are packed into document-owned key slabs. Hash-table
+entries retain stable slices, while dictionary/vector scratch remains reclaimable
+and quota-bound. Single-word sources skip the otherwise useless shingle pass.
+Postings digests and allocation-failure tests apply to the packed path as well.
+
+A complete predicate-cache entry can lend an immutable bitmap through an explicit
+reference-counted lease. Direct count-only producer filters consume cardinality directly and
+subtract current deletions through a compressed intersection count. They allocate
+no result bitmap, read no original source and release the pin even when the cache
+entry expires. Mutable and partial results keep the owned-bitmap path. Tests use
+an allocator that admits zero bytes, positive deletions and propagated errors.
+
+Cross-snapshot reuse requires a validated physical owner's source/publication
+proof, covering its lifetime nonce, primary revision, schema/index publication,
+replay progress and namespace. The cut manifest is validated before using that
+proof. Missing or legacy proofs and lazy remote readers retain snapshot-scoped
+keys. A segment ID alone is insufficient: unindexed source values can change
+without the term representation proving that change. Any source/publication
+change invalidates this whole-generation proof. Reusing unrelated segments across
+such a change requires separate, maintained per-segment source-binding
+certificates; this change does not infer those certificates from segment IDs.
+
+
+The [incremental execution qualification](../../zig/pkg/antfly-grep/bench/results/README.md)
+retains the corresponding native/VM artifacts and alternating before/after
+measurements. Direct-count tests establish zero result-bitmap allocation;
+complete HTTP requests retain parsing, authorization and snapshot-validation
+costs. Timing improvements vary by input and platform. The full ingestion stress
+case also reaches the default per-index build allowance on small nodes despite
+lower token-construction allocation, so component memory measurements must not
+be presented as end-to-end ingestion admission guarantees.
+
+### Query-union preservation and bounded repeated execution
+
+Python query deserialization must reject unknown keys for closed query variants
+before trying another union member. An all-optional range model must not accept
+and erase a Boolean filter. The generator template enforces this only for query
+models and the Boolean body; response models and opaque receipts keep their
+existing forward-compatible decoding behavior. Round-trip coverage includes all
+query variants in scoring, filter and exclusion positions, and singleton/array
+clauses nested under each Boolean operator. This is dispatch validation, not a
+replacement for server-side semantic validation.
+
+Complete retained predicate facts cache their matched cardinality once at
+publication, outside the cache lock. A borrowed direct count with no current
+deletions consumes that number without rescanning bitmap words. Cardinality is
+part of the immutable lease and remains valid across expiry while pinned.
+
+These facts also support bounded Boolean count execution. A stack-resident postfix program holds at most 64 immutable bitmap leases and
+128 instructions, with a nesting limit of 32. It merges nonzero word streams,
+uses bit-sliced counters for minimum-should-match, and applies current deletions
+before counting. Binary intersections, unions and differences use compressed
+container kernels directly. Cache misses, unsupported leaves and oversized
+expressions release all acquired leases and fall back to the existing executor.
+No successful result is approximated. Controls apply during compilation and
+execution; deletion masks remain protected during the synchronous count.
+
+Source-reader timing hints are separate from predicate facts. A fixed 64-entry
+memory-only table retains sufficiently sampled provider costs for at most one
+minute, partitioned by source namespace, provider and original/projected reader.
+A new request still measures its own bounded bootstrap payload, inherits no work
+counters, obeys allocator-imposed caps, and keeps periodic adaptation. Hints
+contain no documents, result IDs, authorization or snapshot capabilities. They
+influence batching only; stale or colliding hints cannot establish membership.
+
+Large physical text fields may spill postings before the surrounding document
+finishes. Unique field contributions release their temporary term keys between
+representations. Repeated physical fields (including multiple `_all`
+contributions) use reusable sorted indices, ordered by field name and original
+contribution position. Discovery costs O(fields log fields); each group retains
+its original token offsets and combined norm, releases its analysis scratch, and
+can spill before the next physical field. Splitting a repeated field into
+independent document postings would corrupt its positions and is forbidden.
+Field maps and position vectors receive the build's reclaiming allocator
+explicitly; only packed copied term bytes use the document region. Opaque
+allocator wrappers do not change scratch ownership. Both native publication
+preparation and direct sink builds enable the same private postings spool.
+Publication preparation keeps its encoded result allocator separate from
+transient construction, releases scratch before publication, and retains the
+existing producer-credit ownership of finished segment bytes. Failure paths
+release unadopted encoded results as well as private runs. A native preparation
+regression exercises the path used by ordinary derived writes under a 128 MiB
+build allowance; testing only direct sink construction does not cover it.
+Fresh large dictionaries reserve capacity once, and terms with
+a single occurrence and at most one position stay inline in a tagged posting
+accumulator. Promotion allocates owned arrays only when another occurrence
+arrives; accessors derive slices after hash-table movement. General mergers keep
+owned arrays and their bounded capacity policy. Serialization and allocation
+failure tests cover both representations. Private posting runs remain temporary
+disk scratch; this adds no persistent query-result cache.
+
+Two distinct ownership changes remain necessary for the broader cost target:
+
+- **Request-wide verification budgets:** coordinator-owned, non-duplicable work
+  grants must cover every participating shard, retry, graph expansion and query
+  phase. A timed-out or ambiguously completed attempt cannot have its grant
+  refunded as though it did no work. Reallocation needs explicit attempt
+  ownership, cancellation and exhaustion tests. Dividing a limit by shard count
+  alone is not an elastic global budget, and rejecting an oversized aggregate
+  after execution does not bound work already performed. Current public limits
+  remain per shard request; no request-wide guarantee is advertised.
+- **Reuse across unrelated writes:** publication must maintain segment/source
+  binding certificates that cover every original value a predicate may inspect,
+  including unindexed field updates. Schema/analyzer changes, source replacement,
+  owner restart, compaction, repair and deletion handling need explicit fences.
+  A stable segment ID or unchanged analyzed terms alone is insufficient. Current
+  whole-generation proofs remain authoritative until these certificates exist.
+
+The cost target is absence of redundant reads and result allocation on proven
+warm paths. Initial indexing, changed input, authorization, snapshot validation,
+network transfer and requested output retain physical costs. Component allocation
+bounds and isolated timing improvements are not complete-request guarantees.
+
+
+### Bounded membership maintenance and qualification artifacts
+
+A retained-membership lookup removes at most eight expired heap entries and, if
+necessary, the requested expired key. It never treats an uncollected expired
+entry as a hit. Directory ownership moves to an intrusive retired list while the
+mutex is held; releasing blocks, reader ownership, and empty directory storage
+happens after unlocking. Outstanding leases remain charged to the same byte
+budget until their last release. Shutdown drains all remaining ownership.
+Optional cache admission examines at most 64 LRU nodes per preflight or
+eviction and limits eviction attempts to 64; pressure can refuse acceleration
+without changing query results.
+Regressions exercise an expiry burst with a live key and a pinned expired key,
+check heap work bounds, and instrument reclamation outside the mutex.
+
+Raw benchmark trials, profiler samples and exploratory reports belong in ignored
+`output/` directories or downloadable CI artifacts. Tracked qualification
+summaries retain versions, artifact and corpus hashes, commands, measurements and
+limitations. The grep benchmark archive manifest names every removed historical
+report with its original Git blob and SHA-256 digest. Its restoration command
+checks original bytes. This removes checkout clutter without rewriting history
+or removing the differential, parser and dictionary fixtures used by tests.
+
+
+Public canonical Boolean lowering preserves an explicit
+`minimum_should_match`, including zero and thresholds greater than one. Required
+non-scoring filters affect omission defaults, but cannot erase an explicit
+positive threshold. Public request parsing and internal worker serialization
+must preserve the same requirement; exercising only a nested DSL parser is
+insufficient coverage. Real-server retained-count tests use one and three shards
+and combine conjunction, disjunction, exclusion, nesting and threshold queries.
+
+
+The borrowed Boolean word executor evaluates the expression with all inputs
+empty to determine its default value outside the input union. A false default
+counts matching bits; a true default starts from the live-document cardinality
+and subtracts only exceptions within that union. Neither conjunctions nor
+complements walk absent document-number words. One-input expressions reduce to
+constants, the input, or its complement and reuse the publication-time
+cardinality, with compressed deletion intersections when needed. General nested
+negations retain sparse word execution. Regressions cover the maximum u32
+document domain, clipped final words and deletion IDs outside the domain.
+
+### Spill and page ownership follow-up
+
+Postings spill uses the configured fixed target for non-default targets. The
+native default retains an 8 MiB trigger on nodes whose full-text/aggregate hard
+limit is at most 128 MiB. Larger envelopes may grow the trigger to at most
+64 MiB, using one quarter of current pending bytes plus advisory admission
+headroom. Allocations still use the resource manager; this estimate grants no
+memory and concurrent pressure can cause normal admission refusal. When spilling
+is required, the queued fields are ordered by retained size and the largest
+fields spill until pending payload falls below half the target. Small companion
+fields remain queued. A spill never splits a repeated physical field's document
+posting. The private run's lazy 512 KiB, four-way page cache accommodates sixteen
+interleaved dictionary/postings cursors with constant lookup work. Compaction and
+in-place patches invalidate cached physical pages.
+
+Read-only result consumers use `SegmentMembership`: either an independently
+owned bitmap or a complete immutable producer lease. Mutating filter APIs retain
+their ownership contract. Constant-score collection counts a leased segment and
+seeks only the requested prefix; ranked producer gates retain include/exclude
+pins for one segment. Native sorted candidates retain a directory of local
+memberships and captured tombstone masks, with global containment and iteration
+without rebasing into a copied corpus bitmap. Enumeration subtracts captured
+tombstones word by word, seeks across unrelated sparse mask ranges, and checks
+cancellation while skipping fully deleted words. Dense deletion runs therefore
+do not require visiting every deleted document. Each failure path releases pins,
+captured masks and initialized directory entries. General Boolean/scoring shapes
+continue to use owned execution when no complete borrowed view is available.
+A single exact doc-number query has a constant score; native page selection can
+recover that score without evaluating the producer a second time.
+
+Source windows already hold their segment lease. Identity reads use that leased
+reader directly, instead of resolving and leasing the same segment per row.
+`ANTFLY_BENCH_LOGICAL_SOURCE_PHASES=1` enables diagnostic source-phase probes:
+key lookup, provider work, revision lookup, directory reads/planning, selected
+ranges, reconstruction and full-body fallback. They log aggregate timings and
+membership borrow/copy counts without document identifiers, bytes or capabilities.
+Ordinary profiled requests collect the top-level lookup/ownership counters.
+Extra physical-source phase clocks and diagnostic log capture are opt-in; those
+trials remain separate from normal latency qualification. Public
+query semantics, verification controls and freshness options are unchanged.
+
+### Remaining source-certificate ownership
+
+Segment predicate reuse across writes still requires implementation of the
+segment/source binding certificates described above. A maintained implementation must register complete
+source identities at a publication fence, invalidate affected registrations from
+both transaction and batch source-mutation paths (including unindexed updates),
+and capture immutable certificates with the retained cut. The existing
+`document_mutation_revision` staging boundary is a candidate for mutation
+notification; global `query_generation_revision` remains the conservative fence.
+Registration from an old retained cut cannot attest current source state unless
+the live owner revalidates the captured source revision under the same fences.
+
+Certificate ownership must have bounded admission, owner-lifetime nonces and
+explicit retirement. Exhausted registration capacity, excessive invalidation
+fan-out, missing source coverage, repair, schema changes and unsupported storage
+modes fall back to the whole-generation proof. Restart and compaction cannot
+inherit a certificate merely because segment IDs or analyzed terms match.
+Validation needs concurrent unindexed updates, registration/publication races,
+failed and ambiguous commits, deletion/recreation, repair, compaction, restart,
+expiry and allocation-failure cases. The scalar source registry below does not establish these segment membership
+certificates or make complete requests zero cost.
+
+
+### Bounded original-value certificate registry
+
+Original-value metadata now has an owner-local proof registry, distinct from
+segment predicate membership reuse. Each native DocStore admits at most 4,096
+scalar facts keyed by the complete document mutation identity: content revision,
+length, kind, digest and stored timestamp. No JSON bodies, selected values, ACLs
+or predicate answers are cached here. The registry is lazy, ephemeral and uses
+the store allocator; pressure, allocation failure and missing coverage are misses.
+It is retired on store close and never restored from segment IDs or disk files.
+
+Read admission captures an owner-lifetime nonce and stable mutation epoch around
+primary snapshot creation. Proof hits and new registrations require that exact
+owner/epoch with no active mutation attempts. A retained old cut may continue
+reading its pinned storage snapshot after writes, but cannot certify facts in a
+new live epoch. Transaction and batch commits invalidate the actual document
+mutation set immediately before backend commit, including unindexed-field/TTL
+changes and delete/reinsert. Fences remain active until the backend attempt
+returns, including ambiguous failure. Unrelated mutations preserve registered
+facts for fresh readers. Large invalidation sets clear the registry instead of
+creating unbounded fan-out. Imports and bulk publication fence/clear all facts;
+bulk sessions remain fenced until finish or abort. Epoch/nonce exhaustion fails
+closed.
+
+The shared logical source reader consults these facts before reading revision,
+content-authority and timestamp keys, then continues directory and selected-range
+verification against the same primary snapshot. Every selected range still
+checks its digest. Original-byte budgets and authenticated row policy remain
+unchanged. Optional `ANTFLY_BENCH_LOGICAL_SOURCE_PHASES=1` output includes
+`proof_cache_hits` and `proof_cache_misses`, permitting qualification of eliminated
+metadata reads separately from range I/O and end-to-end latency.
+
+This implements bounded original-value proof reuse across unrelated writes.
+It does not make whole predicate/segment membership reusable across writes:
+complete segment-to-source coverage certificates and coordinator-owned work
+grants described above remain separate ownership work. Current conservative
+whole-generation predicate proofs remain authoritative. Registry tests cover old
+cuts, unrelated writes, rejected registration, overlapping writers, ambiguous
+attempt retirement, allocation failure, capacity and epoch exhaustion; native
+DocStore/DB tests cover transaction/batch invalidation, delete/recreate, pinned
+readers and the actual original-value loading path.
+
+
+### Proof-cache admission under pressure (2026-10-22)
+
+The original-value registry uses lazy bounded CLOCK admission instead of clearing
+all facts on the first cold insertion at capacity. One insertion into a full
+4,096-entry registry evicts one entry; unrelated warm proofs remain available.
+Reads mark their slot referenced, mutation invalidation frees its slot, and
+subsequent admission reuses holes without evicting an unrelated fact. Whole-owner
+replacement and excessive mutation fan-out still clear all entries deliberately.
+Ring and directory storage are lazy and bounded; allocation failure remains a
+miss and cannot discard unrelated entries before admission capacity is available.
+A logical-source window checks up to 64 proof identities under one lock and
+registers fetched proofs under one lock, with epoch validity rechecked after I/O.
+Owner/nonce/epoch/publication rules are unchanged. This cache stores scalar source
+facts; it does not establish complete cross-write predicate membership or bypass
+current authorization, selected-range digests or original-byte work budgets.

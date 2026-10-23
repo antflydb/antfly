@@ -532,9 +532,9 @@ fn upsertBatch(ptr: *anyopaque, allocator: std.mem.Allocator, entries: []const c
     defer if (admission) |guard| guard.leave(guard.ptr);
     // Source-table workers share one destination coordinator. Serialize only
     // canonical read/merge/commit, never extraction, embedding or candidate work.
-    handle.promotion_commit_mutex.lockUncancelable(h.handleLockIo());
-    defer handle.promotion_commit_mutex.unlock(h.handleLockIo());
-    try @import("sql_commit.zig").recover(handle);
+    const coordinator = @import("sql_commit.zig").acquire(handle);
+    defer coordinator.release();
+    try coordinator.recover();
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -568,7 +568,7 @@ fn upsertBatch(ptr: *anyopaque, allocator: std.mem.Allocator, entries: []const c
         request.* = .{ .table_name = participant.name, .writes = writes.items, .deletes = deletes.items, .predicates = predicates.items };
     }
     var transaction: ?types.TxnId = null;
-    const outcome = try @import("sql_commit.zig").commit(handle, requests, &transaction);
+    const outcome = try coordinator.commit(requests, &transaction);
     if (outcome != .committed) return error.EntityPromotionUnavailable;
 }
 
@@ -581,15 +581,21 @@ pub fn runUntilIdle(handle: *h.Handle) !void {
     try tables.loadAvailable(root);
     for (0..1024) |_| {
         const before = replaySequence(root);
-        try root.db.runUntilIdle();
+        try drainDatabase(root, &root.db);
         var iterator = root.embedded_tables.valueIterator();
-        while (iterator.next()) |table| try table.*.db.runUntilIdle();
+        while (iterator.next()) |table| try drainDatabase(root, &table.*.db);
         if (before == replaySequence(root)) {
             collectEmbeddingCache(root, false) catch {};
             return;
         }
     }
     return error.RunUntilIdleDidNotConverge;
+}
+
+fn drainDatabase(root: *h.Handle, database: *h.db_mod.DB) !void {
+    if (root.lite_connection_context) |connection|
+        return database.runUntilIdleWithGroupSourceState(try connection.owner.groupSourceState(database));
+    return database.runUntilIdle();
 }
 
 fn replaySequence(handle: *h.Handle) u128 {

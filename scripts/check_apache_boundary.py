@@ -151,6 +151,9 @@ SOURCE_MODULES = {
     "antfly_embedded_api": ("zig/pkg/antfly-embedded/src/engine/api.zig",),
     "antfly_embedded_db": ("zig/pkg/antfly-embedded/src/engine/db.zig",),
     "antfly_embeddings": ("zig/lib/embeddings/src/mod.zig",),
+    "antfly_predicate_client": ("zig/lib/decisions/predicate_client.zig",),
+    "antfly_decision_evidence": ("zig/lib/decisions/evidence.zig",),
+    "antfly_source_evidence": ("zig/lib/source_evidence/root.zig",),
     "antfly_decisions": ("zig/lib/decisions/root.zig",),
     "antfly_structured": ("zig/lib/structured/root.zig",),
     "antfly_decision_openapi": (
@@ -258,6 +261,7 @@ SOURCE_MODULES = {
         "zig/pkg/antfly-embedded/src/openapi/generated/antfly_schema_openapi/root.zig",
     ),
     "antfly_scraping": ("zig/lib/scraping/src/mod.zig",),
+    "antfly_source_reference": ("zig/lib/scraping/src/source_reference.zig",),
     "antfly_scraping_openapi": (
         "zig/pkg/antfly-embedded/src/openapi/generated/antfly_scraping_openapi/root.zig",
     ),
