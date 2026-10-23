@@ -87,8 +87,18 @@ pub const InferenceBoundary = struct {
         try self.complete_fn(self.ptr);
     }
 };
+pub const EmbeddingRole = enum { document, query };
 pub const Neighbor = struct { key: []const u8, similarity: f64 };
 pub const NeighborRequest = struct { index: []const u8, vector: []const f32, limit: u16 };
+pub const RecallSearchRequest = struct {
+    text_indexes: []const []const u8,
+    vector_indexes: []const []const u8 = &.{},
+    query: []const u8,
+    embedding: ?[]const f32 = null,
+    offset: u32 = 0,
+    limit: u16 = 128,
+};
+pub const RecallSearchPage = struct { keys: []const []const u8, more: bool };
 pub const Backend = struct {
     ptr: *anyopaque,
     get: *const fn (*anyopaque, A, []const u8) anyerror!?Row,
@@ -102,7 +112,10 @@ pub const Backend = struct {
     generate: ?*const fn (*anyopaque, A, t.Config, []const t.StoredEvidence, InferenceBoundary) anyerror!t.Generated = null,
     decide: ?*const fn (*anyopaque, A, t.Config, t.Assertion, []const t.StoredAssertion) anyerror!t.ReconciliationDecision = null,
     embed: ?*const fn (*anyopaque, A, t.Model, []const u8) anyerror![]const f32 = null,
+    embed_batch: ?*const fn (*anyopaque, A, t.Model, []const []const u8, EmbeddingRole) anyerror![]const []const f32 = null,
     embed_document: ?*const fn (*anyopaque, A, t.Model, []const u8) anyerror![]const f32 = null,
+    ensure_text_index: ?*const fn (*anyopaque, A, []const u8) anyerror!void = null,
+    search_assertions: ?*const fn (*anyopaque, A, RecallSearchRequest) anyerror!RecallSearchPage = null,
     ensure_vector_index: ?*const fn (*anyopaque, A, []const u8, u32) anyerror!void = null,
     neighbors: ?*const fn (*anyopaque, A, NeighborRequest) anyerror![]const Neighbor = null,
     validate_models: ?*const fn (*anyopaque, t.Config) anyerror!void = null,
@@ -240,6 +253,7 @@ pub const Service = struct {
             .create => {
                 try run.put(try configKey(a, run.state.config.generation), run.state.config);
                 try run.put("entity-candidate-index", Run.CandidateIndex{ .complete = true });
+                if (self.backend.search_assertions != null) try run.put("assertion-recall-index", t.RecallIndex{ .generation = run.state.config.generation, .backfill_complete = true, .complete = true });
             },
             .explain => output = try run.explain(id, try parse(prov.ExplainRequest, a, body)),
             .configuration => {
@@ -265,9 +279,7 @@ pub const Service = struct {
                     run.state.execution_owner = self.context.principal;
                 }
                 if (config.retention_ms != run.state.config.retention_ms) run.state.next_expiry_at = self.context.now_ms;
-                const previous_model = try run.encode(run.state.config.models.embedder);
-                const replacement_model = try run.encode(config.models.embedder);
-                const embedding_changed = (config.features.semantic_recall or config.semantic_discovery.enabled) and (!(run.state.config.features.semantic_recall or run.state.config.semantic_discovery.enabled) or !eql(u8, previous_model, replacement_model));
+                const embedding_changed = (config.features.semantic_recall or config.semantic_discovery.enabled) and (!(run.state.config.features.semantic_recall or run.state.config.semantic_discovery.enabled) or !valueEqual(?t.Model, run.state.config.models.embedder, config.models.embedder));
                 const rebuild = config.features.semantic_recall and (!run.state.config.features.semantic_recall or embedding_changed);
                 config.embedding_generation = if (embedding_changed) config.generation else run.state.config.embedding_generation;
                 try run.configurationTransition(config, false);
@@ -341,6 +353,7 @@ pub const Service = struct {
             try run.validateJudgedViews();
             try self.backend.commit(self.backend.ptr, a, state_row, run.changes.items);
             try run.finishSemanticPublication();
+            try run.finishRecallPublication();
             output = try run.encode(publicOperation(op));
         } else {
             // Reads spanning pages must not report a mixture of revisions.
@@ -365,6 +378,8 @@ pub const Service = struct {
         }
     }
 };
+
+const valueEqual = @import("value_equal.zig").equal;
 
 const Run = struct {
     const ChangeTree = std.Treap([]const u8, struct {
@@ -401,6 +416,7 @@ const Run = struct {
     judged_views: std.ArrayList(t.EntityViewInput) = .empty,
     inferred: bool = false,
     semantic_ready_after_commit: bool = false,
+    recall_ready_after_commit: bool = false,
     temporal_tracking: bool = false,
     semantic_assertions: ResourceSet = .empty,
     temporal_boundary: ?i64 = null,
@@ -440,6 +456,9 @@ const Run = struct {
             }
         }
         try self.stageChange(path, json);
+        if (comptime @TypeOf(value) == t.StoredAssertion) {
+            if (self.service.backend.search_assertions != null and std.mem.startsWith(u8, path, "assertion/")) try self.updateRecallProjection(self.state.config, value);
+        }
     }
     fn remove(self: *Run, path: []const u8) !void {
         self.views.clearRetainingCapacity();
@@ -1315,7 +1334,7 @@ const Run = struct {
             if (!self.state.config.features.semantic_recall) return error.MemoryCapabilityUnavailable;
             const model = self.state.config.models.embedder orelse return error.MemoryModelRequired;
             if (vector.len != model.dimensions.?) return error.MemoryEmbeddingMismatch;
-            if (claim.embedding_model == null or !eql(u8, try self.encode(claim.embedding_model.?), try self.encode(model))) return error.MemoryEmbeddingMismatch;
+            if (claim.embedding_model == null or !valueEqual(t.Model, claim.embedding_model.?, model)) return error.MemoryEmbeddingMismatch;
             for (vector) |value| if (!std.math.isFinite(value)) return error.MemoryEmbeddingMismatch;
         }
     }
@@ -1645,6 +1664,7 @@ const Run = struct {
         try self.configurationTransition(replacement, true);
         if (replacement.retention_ms != self.state.config.retention_ms) self.state.next_expiry_at = self.service.context.now_ms;
         self.state.config = replacement;
+        if (self.service.backend.search_assertions != null) try self.put("assertion-recall-index", t.RecallIndex{ .generation = replacement.generation });
     }
     fn canonical(self: *Run, id: []const u8) !?[]const u8 {
         if (try self.read(bool, try key(self.a, "forgotten-entity", id)) != null) return null;
@@ -2590,10 +2610,19 @@ const Run = struct {
         return text.items;
     }
     fn semanticCurrent(self: *Run, projection: t.EntityProjection, record: t.EntityRecord, view: t.EntityView) !bool {
-        if (projection.entity_revision != record.revision or projection.generation != self.state.config.embedding_generation or projection.config_generation != self.state.config.generation or !eql(u8, projection.entity_id, record.entity.id) or !eql(u8, projection.owner, record.owner) or projection.visibility != record.entity.visibility or !eql(u8, try self.encode(projection.model), try self.encode(self.state.config.models.embedder.?))) return false;
-        if (!eql(u8, projection.fingerprint, view.fingerprint) or !eql(u8, try self.encode(projection.dependencies), try self.encode(view.dependencies))) return false;
-        const text = if (projection.kind == .names) try self.semanticNames(record.entity) else view.description;
-        return eql(u8, projection.text, text);
+        if (projection.embedding.len != self.state.config.models.embedder.?.dimensions.? or projection.entity_revision != record.revision or projection.generation != self.state.config.embedding_generation or projection.config_generation != self.state.config.generation or !eql(u8, projection.entity_id, record.entity.id) or !eql(u8, projection.owner, record.owner) or projection.visibility != record.entity.visibility or !valueEqual(t.Model, projection.model, self.state.config.models.embedder.?)) return false;
+        if (!eql(u8, projection.fingerprint, view.fingerprint) or !valueEqual([]const t.DerivedDependency, projection.dependencies, view.dependencies)) return false;
+        if (projection.kind == .view) return eql(u8, projection.text, view.description);
+        var remaining = projection.text;
+        if (!std.mem.startsWith(u8, remaining, record.entity.name)) return false;
+        remaining = remaining[record.entity.name.len..];
+        for (record.entity.aliases) |alias| {
+            if (remaining.len == 0 or remaining[0] != '\n') return false;
+            remaining = remaining[1..];
+            if (!std.mem.startsWith(u8, remaining, alias)) return false;
+            remaining = remaining[alias.len..];
+        }
+        return remaining.len == 0;
     }
     // A per-entity manifest makes serving retirement and source fanout point
     // operations. Resource identities include every evaluated support branch,
@@ -2723,6 +2752,87 @@ const Run = struct {
         };
         return computed;
     }
+    fn semanticBatch(self: *Run, record: t.EntityRecord, model: t.Model, texts: []const []const u8, role: EmbeddingRole, inputs: ResourceSet, progressed: bool) ![]const []const f32 {
+        const vectors = self.service.backend.embed_batch.?(self.service.backend.ptr, self.a, model, texts, role) catch |err| {
+            if (isProcessingTimeout(err) and progressed) return err;
+            try self.deferSemanticFailure(record, err, inputs);
+            unreachable;
+        };
+        try self.inferenceCompleted(inputs);
+        var valid = vectors.len == texts.len;
+        for (vectors) |vector| {
+            if (vector.len != model.dimensions.?) valid = false;
+            for (vector) |value| if (!std.math.isFinite(value)) {
+                valid = false;
+            };
+        }
+        if (!valid) {
+            try self.deferSemanticFailure(record, error.MemoryEmbeddingMismatch, inputs);
+            unreachable;
+        }
+        return vectors;
+    }
+    // An entity is one authorization/dependency partition. Batch its names and
+    // rendered view by role, then checkpoint documents before building queries.
+    // Both provider roles stay outside writer leases and share publication fences.
+    fn semanticEntityBatched(self: *Run, record: t.EntityRecord, view: t.EntityView, inputs: ResourceSet, progressed: *bool) !void {
+        const model = self.state.config.models.embedder.?;
+        var documents: [2]t.EntityProjection = undefined;
+        var old_documents: [2]?t.EntityProjection = undefined;
+        var old_queries: [2]?t.EntityProjection = undefined;
+        var queries: [2]?[]const f32 = .{ null, null };
+        var paths: [2][]const u8 = undefined;
+        var query_paths: [2][]const u8 = undefined;
+        var missing_texts: std.ArrayList([]const u8) = .empty;
+        var missing_slots: std.ArrayList(usize) = .empty;
+        inline for (.{ t.ProjectionKind.names, t.ProjectionKind.view }, 0..) |kind, slot| {
+            paths[slot] = try self.semanticProjectionKey(record, kind);
+            query_paths[slot] = try self.semanticQueryKey(record, kind);
+            const old = try self.read(t.EntityProjection, paths[slot]);
+            const old_query = try self.read(t.EntityProjection, query_paths[slot]);
+            old_documents[slot] = old;
+            old_queries[slot] = old_query;
+            const text = if (kind == .names) try self.semanticNames(record.entity) else view.description;
+            const reusable = if (old) |prior| prior.generation == self.state.config.embedding_generation and prior.embedding.len == model.dimensions.? and valueEqual(t.Model, prior.model, model) and eql(u8, prior.text, text) else false;
+            documents[slot] = .{ .entity_id = record.entity.id, .entity_revision = record.revision, .model = model, .generation = self.state.config.embedding_generation, .config_generation = self.state.config.generation, .owner = record.owner, .visibility = record.entity.visibility, .kind = kind, .fingerprint = view.fingerprint, .dependencies = view.dependencies, .text = text, .embedding = if (reusable) old.?.embedding else &.{} };
+            if (!reusable) {
+                try missing_slots.append(self.a, slot);
+                try missing_texts.append(self.a, text);
+            }
+            if (reusable and old.?.query_embedding != null and old.?.query_embedding.?.len == model.dimensions.?) queries[slot] = old.?.query_embedding else if (old_query) |prior| {
+                if (prior.generation == self.state.config.embedding_generation and prior.embedding.len == model.dimensions.? and valueEqual(t.Model, prior.model, model) and eql(u8, prior.text, text)) queries[slot] = prior.embedding;
+            }
+        }
+        if (missing_texts.items.len != 0) {
+            const vectors = try self.semanticBatch(record, model, missing_texts.items, .document, inputs, progressed.*);
+            for (missing_slots.items, vectors) |slot, vector| documents[slot].embedding = vector;
+        }
+        inline for (.{ t.ProjectionKind.names, t.ProjectionKind.view }, 0..) |kind, slot| {
+            if (old_documents[slot] == null or old_documents[slot].?.query_embedding != null or !try self.semanticCurrent(old_documents[slot].?, record, view)) {
+                try self.service.backend.ensure_vector_index.?(self.service.backend.ptr, self.a, try self.semanticIndexName(record, kind), model.dimensions.?);
+                try self.put(paths[slot], documents[slot]);
+                progressed.* = true;
+            }
+        }
+        missing_texts = .empty;
+        missing_slots = .empty;
+        for (queries, 0..) |query, slot| if (query == null) {
+            try missing_slots.append(self.a, slot);
+            try missing_texts.append(self.a, documents[slot].text);
+        };
+        if (missing_texts.items.len != 0) {
+            const vectors = try self.semanticBatch(record, model, missing_texts.items, .query, inputs, progressed.*);
+            for (missing_slots.items, vectors) |slot, vector| queries[slot] = vector;
+        }
+        for (queries, 0..) |query, slot| {
+            if (old_queries[slot] == null or !try self.semanticCurrent(old_queries[slot].?, record, view)) {
+                var projection = documents[slot];
+                projection.embedding = query.?;
+                try self.put(query_paths[slot], projection);
+                progressed.* = true;
+            }
+        }
+    }
     fn semanticMaintenance(self: *Run) !void {
         if (!self.state.config.semantic_discovery.enabled) return;
         try self.requireAdmin();
@@ -2799,40 +2909,44 @@ const Run = struct {
             // A partially materialized entity retains its dependency and
             // temporal fences, but cannot certify generation readiness.
             try self.scheduleSemanticTimer(record.entity.id, self.temporal_boundary);
-            inline for (.{ t.ProjectionKind.names, t.ProjectionKind.view }) |kind| {
-                const path = try self.semanticProjectionKey(record, kind);
-                const existing = try self.read(t.EntityProjection, path);
-                const query_path = try self.semanticQueryKey(record, kind);
-                const query_prior = try self.read(t.EntityProjection, query_path);
-                if (existing == null or existing.?.query_embedding != null or !try self.semanticCurrent(existing.?, record, view) or query_prior == null or !try self.semanticCurrent(query_prior.?, record, view)) {
-                    const text = if (kind == .names) try self.semanticNames(record.entity) else view.description;
-                    const model = self.state.config.models.embedder.?;
-                    const index_name = try self.semanticIndexName(record, kind);
-                    try self.service.backend.ensure_vector_index.?(self.service.backend.ptr, self.a, index_name, model.dimensions.?);
-                    const reusable = if (existing) |prior| prior.generation == self.state.config.embedding_generation and prior.embedding.len == model.dimensions.? and eql(u8, prior.text, text) and eql(u8, try self.encode(prior.model), try self.encode(model)) else false;
-                    const embedding = if (reusable) existing.?.embedding else blk: {
-                        break :blk try self.semanticEmbedding(record, model, text, captured.resources, progressed.*, false);
-                    };
-                    if (embedding.len != model.dimensions.?) return error.MemoryEmbeddingMismatch;
-                    for (embedding) |value| if (!std.math.isFinite(value)) return error.MemoryEmbeddingMismatch;
-                    const projection: t.EntityProjection = .{ .entity_id = record.entity.id, .entity_revision = record.revision, .model = model, .generation = self.state.config.embedding_generation, .config_generation = self.state.config.generation, .owner = record.owner, .visibility = record.entity.visibility, .kind = kind, .fingerprint = view.fingerprint, .dependencies = view.dependencies, .text = text, .embedding = embedding };
-                    // Checkpoint the document role before another provider call.
-                    // Legacy backfills and retries never recompute that vector.
-                    if (existing == null or existing.?.query_embedding != null or !try self.semanticCurrent(existing.?, record, view)) {
-                        try self.put(path, projection);
+            if (self.service.backend.embed_batch != null) {
+                try self.semanticEntityBatched(record, view, captured.resources, progressed);
+            } else {
+                inline for (.{ t.ProjectionKind.names, t.ProjectionKind.view }) |kind| {
+                    const path = try self.semanticProjectionKey(record, kind);
+                    const existing = try self.read(t.EntityProjection, path);
+                    const query_path = try self.semanticQueryKey(record, kind);
+                    const query_prior = try self.read(t.EntityProjection, query_path);
+                    if (existing == null or existing.?.query_embedding != null or !try self.semanticCurrent(existing.?, record, view) or query_prior == null or !try self.semanticCurrent(query_prior.?, record, view)) {
+                        const text = if (kind == .names) try self.semanticNames(record.entity) else view.description;
+                        const model = self.state.config.models.embedder.?;
+                        const index_name = try self.semanticIndexName(record, kind);
+                        try self.service.backend.ensure_vector_index.?(self.service.backend.ptr, self.a, index_name, model.dimensions.?);
+                        const reusable = if (existing) |prior| prior.generation == self.state.config.embedding_generation and prior.embedding.len == model.dimensions.? and eql(u8, prior.text, text) and valueEqual(t.Model, prior.model, model) else false;
+                        const embedding = if (reusable) existing.?.embedding else blk: {
+                            break :blk try self.semanticEmbedding(record, model, text, captured.resources, progressed.*, false);
+                        };
+                        if (embedding.len != model.dimensions.?) return error.MemoryEmbeddingMismatch;
+                        for (embedding) |value| if (!std.math.isFinite(value)) return error.MemoryEmbeddingMismatch;
+                        const projection: t.EntityProjection = .{ .entity_id = record.entity.id, .entity_revision = record.revision, .model = model, .generation = self.state.config.embedding_generation, .config_generation = self.state.config.generation, .owner = record.owner, .visibility = record.entity.visibility, .kind = kind, .fingerprint = view.fingerprint, .dependencies = view.dependencies, .text = text, .embedding = embedding };
+                        // Checkpoint the document role before another provider call.
+                        // Legacy backfills and retries never recompute that vector.
+                        if (existing == null or existing.?.query_embedding != null or !try self.semanticCurrent(existing.?, record, view)) {
+                            try self.put(path, projection);
+                            progressed.* = true;
+                        }
+                        var query_projection = projection;
+                        query_projection.embedding = if (reusable and existing.?.query_embedding != null and existing.?.query_embedding.?.len == model.dimensions.?)
+                            existing.?.query_embedding.?
+                        else if (query_prior != null and query_prior.?.embedding.len == model.dimensions.? and query_prior.?.generation == projection.generation and eql(u8, query_prior.?.text, text) and valueEqual(t.Model, query_prior.?.model, model))
+                            query_prior.?.embedding
+                        else
+                            try self.semanticEmbedding(record, model, text, captured.resources, progressed.*, true);
+                        if (query_projection.embedding.len != model.dimensions.?) return error.MemoryEmbeddingMismatch;
+                        for (query_projection.embedding) |value| if (!std.math.isFinite(value)) return error.MemoryEmbeddingMismatch;
+                        try self.put(query_path, query_projection);
                         progressed.* = true;
                     }
-                    var query_projection = projection;
-                    query_projection.embedding = if (reusable and existing.?.query_embedding != null)
-                        existing.?.query_embedding.?
-                    else if (query_prior != null and query_prior.?.generation == projection.generation and eql(u8, query_prior.?.text, text) and eql(u8, try self.encode(query_prior.?.model), try self.encode(model)))
-                        query_prior.?.embedding
-                    else
-                        try self.semanticEmbedding(record, model, text, captured.resources, progressed.*, true);
-                    if (query_projection.embedding.len != model.dimensions.?) return error.MemoryEmbeddingMismatch;
-                    for (query_projection.embedding) |value| if (!std.math.isFinite(value)) return error.MemoryEmbeddingMismatch;
-                    try self.put(query_path, query_projection);
-                    progressed.* = true;
                 }
             }
         } else {
@@ -2893,7 +3007,32 @@ const Run = struct {
         try rendered.put(self.a, try self.a.dupe(u8, id), view);
         return view;
     }
-    fn semanticCandidates(self: *Run, input_seed: t.EntityRecord, request: t.EntityCandidateRequest, pending: []const CandidateRef, rendered: *std.StringHashMapUnmanaged(t.EntityView)) !SemanticMatches {
+    fn candidateCurrent(self: *Run, verified: *std.StringHashMapUnmanaged(bool), path: []const u8, projection: t.EntityProjection, record: t.EntityRecord, view: t.EntityView) !bool {
+        if (verified.get(path)) |current| return current;
+        const current = try self.semanticCurrent(projection, record, view);
+        try verified.put(self.a, path, current);
+        return current;
+    }
+    fn candidateMetadataEligible(self: *Run, seed: t.EntityRecord, candidate: t.EntityRecord, kind: @FieldType(t.EntityCandidateRequest, "kind")) bool {
+        if (eql(u8, seed.entity.id, candidate.entity.id)) return false;
+        if (candidate.entity.visibility != seed.entity.visibility or (candidate.entity.visibility == .private and !eql(u8, candidate.owner, seed.owner))) return false;
+        if (kind == .identity) {
+            if (!eql(u8, candidate.entity.type, seed.entity.type) or !sameNameNumbers(seed.entity.name, candidate.entity.name)) return false;
+            for (seed.entity.distinct_from) |id| if (eql(u8, id, candidate.entity.id)) return false;
+            for (candidate.entity.distinct_from) |id| if (eql(u8, id, seed.entity.id)) return false;
+        }
+        if (kind == .relationship) {
+            if (self.state.config.ontology_pack == .software_team_v1 and eql(u8, seed.entity.type, "concept") and eql(u8, candidate.entity.type, "concept")) return true;
+            for (self.state.config.predicates) |predicate| {
+                if (predicate.object_type == null) continue;
+                if (predicate.subject_type != null and !eql(u8, predicate.subject_type.?, seed.entity.type)) continue;
+                if (eql(u8, predicate.object_type.?, candidate.entity.type)) return true;
+            }
+            return false;
+        }
+        return true;
+    }
+    fn semanticCandidates(self: *Run, input_seed: t.EntityRecord, request: t.EntityCandidateRequest, pending: []const CandidateRef, rendered: *std.StringHashMapUnmanaged(t.EntityView), verified: *std.StringHashMapUnmanaged(bool)) !SemanticMatches {
         if (!self.state.config.semantic_discovery.enabled) return .{};
         var result: SemanticMatches = .{ .state = .not_ready };
         const selected = (try self.canonical(input_seed.entity.id)) orelse return result;
@@ -2905,11 +3044,11 @@ const Run = struct {
         var matches: std.StringHashMapUnmanaged(SemanticMatch) = .empty;
         inline for (.{ t.ProjectionKind.names, t.ProjectionKind.view }) |kind| {
             const projection = (try self.read(t.EntityProjection, try self.semanticProjectionKey(seed, kind))) orelse return result;
-            if (!try self.semanticCurrent(projection, seed, view)) return result;
+            if (!try self.candidateCurrent(verified, try self.semanticProjectionKey(seed, kind), projection, seed, view)) return result;
             // Both roles were built under the same source/model fences. Ready
             // pages never call a provider, including lexical continuations.
             const query_projection = (try self.read(t.EntityProjection, try self.semanticQueryKey(seed, kind))) orelse return result;
-            if (query_projection.kind != kind or !try self.semanticCurrent(query_projection, seed, view)) return result;
+            if (query_projection.kind != kind or !try self.candidateCurrent(verified, try self.semanticQueryKey(seed, kind), query_projection, seed, view)) return result;
             const query = query_projection.embedding;
             if (query.len != projection.embedding.len) return error.MemoryCorruptState;
             const self_score = try cosine(query, projection.embedding);
@@ -2948,6 +3087,7 @@ const Run = struct {
                 try self.prefetch(paths.items);
                 var supports: std.ArrayList([]const u8) = .empty;
                 for (paths.items) |path| if (try self.read(t.EntityRecord, path)) |record| {
+                    if (!self.candidateMetadataEligible(input_seed, record, request.kind)) continue;
                     for (record.entity.evidence) |ref| try supports.append(self.a, try key(self.a, "evidence", ref.id));
                 };
                 try self.prefetch(supports.items);
@@ -2959,12 +3099,13 @@ const Run = struct {
                     const other = (try self.read(t.EntityProjection, neighbor.key)) orelse continue;
                     if (other.kind != kind) continue;
                     const record = (try self.read(t.EntityRecord, try key(self.a, "entity", other.entity_id))) orelse continue;
+                    if (!self.candidateMetadataEligible(input_seed, record, request.kind)) continue;
                     self.authorize(record.owner, record.entity.visibility) catch continue;
                     if (record.entity.visibility != seed.entity.visibility or (record.entity.visibility == .private and !eql(u8, seed.owner, record.owner)) or !try self.entityVisible(record)) continue;
                     const canonical_id = (try self.canonical(record.entity.id)) orelse continue;
                     if (!eql(u8, canonical_id, record.entity.id)) continue;
                     const candidate_view = try self.candidateView(rendered, record.entity.id);
-                    if (!try self.semanticCurrent(other, record, candidate_view)) continue;
+                    if (!try self.candidateCurrent(verified, neighbor.key, other, record, candidate_view)) continue;
                     const entry = try matches.getOrPut(self.a, record.entity.id);
                     if (!entry.found_existing) entry.value_ptr.* = .{ .id = record.entity.id };
                     if (kind == .names) entry.value_ptr.names = similarity else entry.value_ptr.view = similarity;
@@ -3025,7 +3166,8 @@ const Run = struct {
             break :blk Page{ .rows = try self.cachedRows(paths.items), .next = continuation.lexical };
         } else try self.candidatePage(seed, lexical_request);
         var rendered: std.StringHashMapUnmanaged(t.EntityView) = .empty;
-        const semantic = try self.semanticCandidates(seed, request, continuation.pending, &rendered);
+        var verified: std.StringHashMapUnmanaged(bool) = .empty;
+        const semantic = try self.semanticCandidates(seed, request, continuation.pending, &rendered, &verified);
         var candidate_records: std.ArrayList(t.EntityRecord) = .empty;
         var candidate_ids: ResourceSet = .empty;
         for (page.rows) |row| {
@@ -3066,6 +3208,7 @@ const Run = struct {
                 };
                 if (emitted) continue;
             }
+            if (!self.candidateMetadataEligible(seed, candidate, request.kind)) continue;
             self.authorize(candidate.owner, candidate.entity.visibility) catch continue;
             if (!try self.entityVisible(candidate)) continue;
             const canonical_id = (try self.canonical(candidate.entity.id)) orelse continue;
@@ -3086,7 +3229,7 @@ const Run = struct {
                 const candidate_distinctions = try self.declaredDistinct(candidate.entity.id);
                 if (candidate_distinctions.contains(canonical_seed)) continue;
             }
-            if (request.kind == .identity and !eql(u8, try nameNumbers(self.a, seed.entity.name), try nameNumbers(self.a, candidate.entity.name))) continue;
+            if (request.kind == .identity and !sameNameNumbers(seed.entity.name, candidate.entity.name)) continue;
             const score = candidateNameScore(seed_terms, try self.candidateTerms(candidate.entity));
             var name_similarity: ?f64 = null;
             var view_similarity: ?f64 = null;
@@ -3102,7 +3245,7 @@ const Run = struct {
             views_complete = views_complete and candidate_view.complete;
             if (semantic.state == .indexed) inline for (.{ t.ProjectionKind.names, t.ProjectionKind.view }) |kind| {
                 if (try self.read(t.EntityProjection, try self.semanticProjectionKey(candidate, kind))) |projection| {
-                    if (try self.semanticCurrent(projection, candidate, candidate_view)) {
+                    if (try self.candidateCurrent(&verified, try self.semanticProjectionKey(candidate, kind), projection, candidate, candidate_view)) {
                         const similarity = (try cosine(semantic.queries[@backingInt(kind)].?, projection.embedding)) / semantic.self_scores[@backingInt(kind)];
                         if (kind == .names) name_similarity = similarity else view_similarity = similarity;
                     }
@@ -3842,6 +3985,129 @@ const Run = struct {
         try self.assertions(generated.assertions, true);
     }
     const VectorProjection = struct { assertion_id: []const u8, generation: u64, model: t.Model, statement_hash: []const u8, embedding: []const f32 };
+    fn recallScope(self: *Run, config: t.Config, audience: []const u8) ![]const u8 {
+        return hash(self.a, .{ config.generation, config.embedding_generation, config.models.embedder, audience });
+    }
+    fn recallProjectionKey(self: *Run, config: t.Config, id: []const u8) ![]const u8 {
+        return std.fmt.allocPrint(self.a, "assertion-recall/{d:0>20}/{s}", .{ config.generation, try hash(self.a, id) });
+    }
+    fn recallAudience(self: *Run, record: t.StoredAssertion) ![]const u8 {
+        return if (record.assertion.visibility == .team) "team" else try std.fmt.allocPrint(self.a, "private/{s}", .{record.owner});
+    }
+    fn recallIndexName(self: *Run, config: t.Config, audience: []const u8, vector: bool) ![]const u8 {
+        return std.fmt.allocPrint(self.a, "memory_recall_{s}_{s}", .{ if (vector) "vector" else "text", try self.recallScope(config, audience) });
+    }
+    fn recallAudienceKey(self: *Run, config: t.Config, audience: []const u8) ![]const u8 {
+        return std.fmt.allocPrint(self.a, "assertion-recall-audience/{s}", .{try self.recallScope(config, audience)});
+    }
+    fn ensureRecallAudience(self: *Run, config: t.Config, audience: []const u8) !void {
+        const path = try self.recallAudienceKey(config, audience);
+        if (try self.read(bool, path) != null) return;
+        try self.requireAdmin();
+        try self.service.backend.ensure_text_index.?(self.service.backend.ptr, self.a, try self.recallIndexName(config, audience, false));
+        if (config.features.semantic_recall) try self.service.backend.ensure_vector_index.?(self.service.backend.ptr, self.a, try self.recallIndexName(config, audience, true), config.models.embedder.?.dimensions.?);
+        try self.put(path, true);
+    }
+    fn updateRecallProjection(self: *Run, config: t.Config, record: t.StoredAssertion) anyerror!void {
+        const audience = try self.recallAudience(record);
+        if (try self.read(bool, try self.recallAudienceKey(config, audience)) == null or try self.read(bool, try self.recallAudienceKey(config, "all")) == null) {
+            try self.put(try key(self.a, "assertion-recall-work", record.assertion.id), .{ .id = record.assertion.id });
+            return;
+        }
+        const path = try self.recallProjectionKey(config, record.assertion.id);
+        const embedding = if (config.features.semantic_recall) try self.vectorFor(config, record.assertion) else null;
+        const statement_hash = try hash(self.a, record.assertion.statement);
+        if (try self.read(t.RecallProjection, path)) |prior| {
+            if (prior.generation == config.generation and eql(u8, prior.owner, record.owner) and prior.visibility == record.assertion.visibility and eql(u8, prior.statement_hash, statement_hash) and valueEqual(?[]const f32, prior.embedding, embedding)) {
+                try self.remove(try key(self.a, "assertion-recall-work", record.assertion.id));
+                try self.remove(try key(self.a, "assertion-recall-blocked", record.assertion.id));
+                return;
+            }
+        }
+        const captured = try self.captureResources(publicationCandidate, .{record});
+        if (!captured.result) {
+            try self.remove(try self.recallProjectionKey(config, record.assertion.id));
+            try self.remove(try key(self.a, "assertion-recall-work", record.assertion.id));
+            try self.remove(try key(self.a, "assertion-recall-blocked", record.assertion.id));
+            return;
+        }
+        self.inferred = true;
+        var text_indexes: [2][]const u8 = undefined;
+        var vector_indexes: [2][]const u8 = undefined;
+        for ([_][]const u8{ "all", audience }, 0..) |scope, i| {
+            text_indexes[i] = try self.recallIndexName(config, scope, false);
+            vector_indexes[i] = try self.recallIndexName(config, scope, true);
+        }
+        try self.put(path, t.RecallProjection{ .assertion_id = record.assertion.id, .assertion_key = try key(self.a, "assertion", record.assertion.id), .generation = config.generation, .statement_hash = statement_hash, .owner = record.owner, .visibility = record.assertion.visibility, .text = record.assertion.statement, .text_indexes = &text_indexes, .vector_indexes = if (embedding != null) &vector_indexes else &.{}, .embedding = embedding });
+        const binding_key = try key(self.a, "assertion-recall-binding", record.assertion.id);
+        const Binding = struct { paths: []const []const u8 = &.{} };
+        const old = (try self.read(Binding, binding_key)) orelse Binding{};
+        var paths: std.ArrayList([]const u8) = .empty;
+        for (old.paths) |prior| {
+            if (eql(u8, prior, path)) continue;
+            // During cutover retain the active generation until the new model serves.
+            if (config.generation != self.state.config.generation or (self.state.pending_config != null and std.mem.startsWith(u8, prior, try std.fmt.allocPrint(self.a, "assertion-recall/{d:0>20}/", .{self.state.pending_config.?.generation})))) try paths.append(self.a, prior) else try self.remove(prior);
+        }
+        try paths.append(self.a, path);
+        try self.put(binding_key, .{ .paths = paths.items });
+        try self.remove(try key(self.a, "assertion-recall-work", record.assertion.id));
+        try self.remove(try key(self.a, "assertion-recall-blocked", record.assertion.id));
+    }
+    fn recallMaintenance(self: *Run) !void {
+        const previous = self.retention_maintenance;
+        self.retention_maintenance = false;
+        defer self.retention_maintenance = previous;
+        if (self.service.backend.search_assertions == null) return;
+        try self.requireAdmin();
+        var index = (try self.read(t.RecallIndex, "assertion-recall-index")) orelse t.RecallIndex{};
+        if (index.generation != self.state.config.generation) index = .{ .generation = self.state.config.generation };
+        index.complete = false;
+        const initial = !index.backfill_complete;
+        const blocked = !initial and (try self.service.backend.scan(self.service.backend.ptr, self.a, "assertion-recall-work/", null, 1)).rows.len == 0;
+        if (blocked and index.next_retry_at > self.service.context.now_ms) return;
+        const page = try self.service.backend.scan(self.service.backend.ptr, self.a, if (initial) "assertion/" else if (blocked) "assertion-recall-blocked/" else "assertion-recall-work/", if (initial or blocked) index.cursor else null, 8);
+        for (page.rows) |row| {
+            const record = if (initial) try parse(t.StoredAssertion, self.a, row.json) else blk: {
+                const work = try parse(struct { id: []const u8 }, self.a, row.json);
+                break :blk (try self.assertion(work.id)) orelse {
+                    try self.remove(row.key);
+                    continue;
+                };
+            };
+            try self.ensureRecallAudience(self.state.config, "all");
+            try self.ensureRecallAudience(self.state.config, try self.recallAudience(record));
+            self.updateRecallProjection(self.state.config, record) catch |err| {
+                if (err != error.MemorySourceAccessDenied) return err;
+                try self.put(try key(self.a, "assertion-recall-blocked", record.assertion.id), .{ .id = record.assertion.id });
+                try self.remove(try key(self.a, "assertion-recall-work", record.assertion.id));
+            };
+            if (initial) index.cursor = row.key;
+        }
+        if (initial and page.next == null) {
+            index.backfill_complete = true;
+            index.cursor = null;
+        }
+        if (blocked) index.cursor = page.next;
+        index.next_retry_at = self.service.context.now_ms +| (if (blocked and page.next != null) @as(i64, 0) else resource_check_interval_ms);
+        index.yield_to_semantic = true;
+        self.recall_ready_after_commit = index.backfill_complete;
+        try self.put("assertion-recall-index", index);
+    }
+    fn finishRecallPublication(self: *Run) !void {
+        if (!self.recall_ready_after_commit) return;
+        const backend = self.service.backend;
+        const control = (try backend.get(backend.ptr, self.a, "control")) orelse return error.MemorySpaceNotFound;
+        if (!eql(u8, control.json, try self.encode(self.state))) return;
+        if ((try backend.scan(backend.ptr, self.a, "assertion-recall-work/", null, 1)).rows.len != 0 or (try backend.scan(backend.ptr, self.a, "assertion-recall-blocked/", null, 1)).rows.len != 0) return;
+        const row = (try backend.get(backend.ptr, self.a, "assertion-recall-index")) orelse return;
+        var index = try parse(t.RecallIndex, self.a, row.json);
+        if (!index.backfill_complete or index.generation != self.state.config.generation) return;
+        index.complete = true;
+        try self.requireAdmin();
+        try self.service.context.finish();
+        if (self.inferred) try self.validateResources();
+        try backend.commit(backend.ptr, self.a, control, &.{ .{ .key = "assertion-recall-index", .json = try self.encode(index) }, .{ .key = "control", .json = control.json } });
+    }
     fn vectorKey(self: *Run, generation: u64, id: []const u8) ![]const u8 {
         return std.fmt.allocPrint(self.a, "vector/{d:0>20}/{s}", .{ generation, try hash(self.a, id) });
     }
@@ -3850,16 +4116,20 @@ const Run = struct {
         if (embedding.len != model.dimensions.?) return error.MemoryEmbeddingMismatch;
         for (embedding) |value| if (!std.math.isFinite(value)) return error.MemoryEmbeddingMismatch;
         try self.put(try self.vectorKey(config.embedding_generation, claim.id), VectorProjection{ .assertion_id = claim.id, .generation = config.embedding_generation, .model = model, .statement_hash = try hash(self.a, claim.statement), .embedding = embedding });
+        // Pending vectors are already durable reindex progress. Their serving
+        // projection backfill starts at cutover; they must not dirty the active
+        // generation's recall queue while uploads or inference are in progress.
+        if (self.service.backend.search_assertions != null and config.generation == self.state.config.generation) if (try self.assertion(claim.id)) |record| try self.updateRecallProjection(config, record);
     }
     fn vectorFor(self: *Run, config: t.Config, claim: t.Assertion) !?[]const f32 {
         const projection = (try self.read(VectorProjection, try self.vectorKey(config.embedding_generation, claim.id))) orelse return null;
-        if (projection.generation != config.embedding_generation or !eql(u8, projection.assertion_id, claim.id) or !eql(u8, projection.statement_hash, try hash(self.a, claim.statement)) or !eql(u8, try self.encode(projection.model), try self.encode(config.models.embedder))) return error.MemoryEmbeddingMismatch;
+        if (projection.generation != config.embedding_generation or !eql(u8, projection.assertion_id, claim.id) or !eql(u8, projection.statement_hash, try hash(self.a, claim.statement)) or !valueEqual(?t.Model, projection.model, config.models.embedder)) return error.MemoryEmbeddingMismatch;
         return projection.embedding;
     }
     fn stageEmbeddings(self: *Run, request: t.EmbeddingBatch) !void {
         try self.requireAdmin();
         const config = self.state.pending_config orelse return error.MemoryConfigurationChanged;
-        if (request.generation != config.embedding_generation or config.models.embedder == null or !eql(u8, try self.encode(request.model), try self.encode(config.models.embedder.?))) return error.MemoryEmbeddingMismatch;
+        if (request.generation != config.embedding_generation or config.models.embedder == null or !valueEqual(t.Model, request.model, config.models.embedder.?)) return error.MemoryEmbeddingMismatch;
         if (request.items.len == 0 or request.items.len > 64) return error.InvalidMemoryRequest;
         for (request.items) |item| {
             const record = (try self.assertion(item.id)) orelse return error.MemoryNotFound;
@@ -3913,6 +4183,10 @@ const Run = struct {
     }
     fn retireAssertion(self: *Run, id: []const u8) !void {
         try self.semanticInvalidateAssertion(id);
+        if (try self.read(struct { paths: []const []const u8 }, try key(self.a, "assertion-recall-binding", id))) |binding| for (binding.paths) |path| try self.remove(path);
+        try self.remove(try key(self.a, "assertion-recall-binding", id));
+        try self.remove(try key(self.a, "assertion-recall-work", id));
+        try self.remove(try key(self.a, "assertion-recall-blocked", id));
         // Retirement is irreversible physical cleanup, not a belief revision.
         // Fence identity reuse before dropping payload and generation metadata.
         try self.put(try key(self.a, "forgotten-assertion", id), true);
@@ -3964,7 +4238,16 @@ const Run = struct {
         // retirement. Foreground authorization still hides it immediately.
         self.retention_maintenance = true;
         defer self.retention_maintenance = false;
-        if (try @import("scheduling.zig").maintenanceKind(self.service.backend, self.a, self.service.context.now_ms, self.state) != .retention) return self.semanticMaintenance();
+        const kind = try @import("scheduling.zig").maintenanceKind(self.service.backend, self.a, self.service.context.now_ms, self.state);
+        if (kind == .recall) return self.recallMaintenance();
+        if (kind != .retention) {
+            if (self.service.backend.search_assertions != null) if (try self.read(t.RecallIndex, "assertion-recall-index")) |prior| {
+                var index = prior;
+                index.yield_to_semantic = false;
+                try self.put("assertion-recall-index", index);
+            };
+            return self.semanticMaintenance();
+        }
         try self.pollResources();
         try self.semanticTimers();
         var candidate_index = (try self.read(CandidateIndex, "entity-candidate-index")) orelse CandidateIndex{};
@@ -4141,6 +4424,9 @@ const Run = struct {
         } else if (std.mem.startsWith(u8, row.key, "generation-input/")) {
             const owner_key = row.key["generation-input/".len..];
             if (try self.read(std.json.Value, owner_key) == null) try self.remove(row.key);
+        } else if (std.mem.startsWith(u8, row.key, "assertion-recall/")) {
+            const projection = try parse(t.RecallProjection, self.a, row.json);
+            if ((projection.generation != self.state.config.generation and (self.state.pending_config == null or projection.generation != self.state.pending_config.?.generation)) or try self.assertion(projection.assertion_id) == null) try self.remove(row.key);
         } else if (std.mem.startsWith(u8, row.key, "entity-semantic/") or std.mem.startsWith(u8, row.key, "entity-semantic-query/")) {
             const query_role = std.mem.startsWith(u8, row.key, "entity-semantic-query/");
             const projection = try parse(t.EntityProjection, self.a, row.json);
@@ -4981,22 +5267,22 @@ const Run = struct {
         self.authorize(record.owner, record.assertion.visibility) catch return null;
         if (request.known_at) |known| record = (try self.asOf(record.assertion.id, known)) orelse return null;
         const valid = request.valid_at orelse if (!request.include_history) self.service.context.now_ms else null;
-        if (!try self.evidenceVisibleTime(record, request.known_at, valid, 0)) return null;
         const claim = record.assertion;
         const historical = record.lifecycle == .superseded or record.lifecycle == .retracted or (claim.valid_to != null and claim.valid_to.? <= self.service.context.now_ms);
         if (!matchesTime(request, record, self.service.context.now_ms)) return null;
         if (!request.include_provisional and claim.stability == .provisional) return null;
+        if (request.predicate) |value| if (!eql(u8, value, claim.predicate)) return null;
+        if (request.scope) |value| if (!eql(u8, value, claim.scope)) return null;
+        if (request.environment) |value| if (claim.environment != null and !eql(u8, value, claim.environment.?)) return null;
+        if (request.task) |value| if (claim.task != null and !eql(u8, value, claim.task.?)) return null;
+        if (request.kind) |value| if (value != claim.kind) return null;
+        if (!try self.evidenceVisibleTime(record, request.known_at, valid, 0)) return null;
         const canonical_subject = (try self.canonical(claim.subject)) orelse return null;
         if (self.objectTyped(claim.predicate) and try self.canonical(claim.value) == null) return null;
         if (request.subject) |value| {
             const wanted = (try self.canonical(value)) orelse return null;
             if (!eql(u8, wanted, canonical_subject)) return null;
         }
-        if (request.predicate) |value| if (!eql(u8, value, claim.predicate)) return null;
-        if (request.scope) |value| if (!eql(u8, value, claim.scope)) return null;
-        if (request.environment) |value| if (claim.environment != null and !eql(u8, value, claim.environment.?)) return null;
-        if (request.task) |value| if (claim.task != null and !eql(u8, value, claim.task.?)) return null;
-        if (request.kind) |value| if (value != claim.kind) return null;
         if (request.query.len > 0 and (self.lexical_query == null or !eql(u8, self.lexical_query.?.input, request.query))) {
             if (self.lexical_query) |*query| query.deinit();
             self.lexical_query = null;
@@ -5018,18 +5304,55 @@ const Run = struct {
         if (!relationsMatch(request, record.assertion)) return null;
         return .{ .memory = record, .score = score, .historical = historical, .citations = support.evidence };
     }
+    fn indexedRecallPage(self: *Run, request: t.Recall, vector: ?[]const f32, offset: u32) !struct { records: []const t.StoredAssertion, more: bool } {
+        var text: std.ArrayList([]const u8) = .empty;
+        var dense: std.ArrayList([]const u8) = .empty;
+        const scopes: []const []const u8 = if (self.service.context.admin) &.{"all"} else &.{ "team", try std.fmt.allocPrint(self.a, "private/{s}", .{self.service.context.principal}) };
+        for (scopes) |scope| {
+            if (try self.read(bool, try self.recallAudienceKey(self.state.config, scope)) == null) continue;
+            try text.append(self.a, try self.recallIndexName(self.state.config, scope, false));
+            if (vector != null) try dense.append(self.a, try self.recallIndexName(self.state.config, scope, true));
+        }
+        if (text.items.len == 0) return .{ .records = &.{}, .more = false };
+        const page = self.service.backend.search_assertions.?(self.service.backend.ptr, self.a, .{ .text_indexes = text.items, .vector_indexes = dense.items, .query = request.query, .embedding = vector, .offset = offset }) catch |err| switch (err) {
+            error.IndexNotFound, error.IndexRebuilding => return error.MemoryCapabilityUnavailable,
+            else => return err,
+        };
+        if (page.keys.len > 128) return error.MemoryCorruptState;
+        try self.prefetch(page.keys);
+        var projections: std.ArrayList(t.RecallProjection) = .empty;
+        var paths: std.ArrayList([]const u8) = .empty;
+        for (page.keys) |path| {
+            if (!std.mem.startsWith(u8, path, "assertion-recall/")) return error.MemoryCorruptState;
+            const projection = (try self.read(t.RecallProjection, path)) orelse continue;
+            if (projection.generation != self.state.config.generation) continue;
+            if (!eql(u8, projection.assertion_key, try key(self.a, "assertion", projection.assertion_id))) return error.MemoryCorruptState;
+            try projections.append(self.a, projection);
+            try paths.append(self.a, projection.assertion_key);
+        }
+        try self.prefetch(paths.items);
+        var records: std.ArrayList(t.StoredAssertion) = .empty;
+        var seen: ResourceSet = .empty;
+        for (projections.items) |projection| {
+            const record = (try self.assertion(projection.assertion_id)) orelse continue;
+            if (seen.contains(record.assertion.id) or !eql(u8, record.owner, projection.owner) or record.assertion.visibility != projection.visibility or !eql(u8, projection.statement_hash, try hash(self.a, record.assertion.statement))) continue;
+            try seen.put(self.a, record.assertion.id, {});
+            try records.append(self.a, record);
+        }
+        return .{ .records = records.items, .more = page.more };
+    }
     fn recall(self: *Run, request: t.Recall) ![]const u8 {
         self.historical_resource_reads = request.known_at != null;
         if (request.limit == 0 or request.limit > t.max_items or request.token_budget == 0 or request.token_budget > self.state.config.max_recall_tokens) return error.InvalidMemoryRequest;
         const Hit = t.RecallHit;
         var hits: std.ArrayList(Hit) = .empty;
-        var after = try self.decodeCursor("assertion/", request.cursor);
+        var after: ?[]const u8 = null;
         var scanned: usize = 0;
         var vector = request.embedding;
         if (vector) |supplied| {
             if (!self.state.config.features.semantic_recall) return error.MemoryCapabilityUnavailable;
             const model = self.state.config.models.embedder orelse return error.MemoryModelRequired;
-            if (request.embedding_model == null or !eql(u8, try self.encode(request.embedding_model.?), try self.encode(model)) or supplied.len != model.dimensions.?) return error.MemoryEmbeddingMismatch;
+            if (request.embedding_model == null or !valueEqual(t.Model, request.embedding_model.?, model) or supplied.len != model.dimensions.?) return error.MemoryEmbeddingMismatch;
             for (supplied) |value| if (!std.math.isFinite(value)) return error.MemoryEmbeddingMismatch;
         }
         if (self.state.config.features.semantic_recall and vector == null and request.query.len > 0) vector = try self.embed(self.state.config.models.embedder.?, request.query, .empty);
@@ -5037,19 +5360,40 @@ const Run = struct {
         if (request.graph) |options| try graph_recall.validate(options);
         const explicit_seeds = if (request.graph) |options| options.entity_seeds.len > 0 else false;
         if (explicit_seeds and request.cursor != null) return error.InvalidMemoryRequest;
-        while (!explicit_seeds) {
-            try self.service.context.check();
-            const page = try self.service.backend.scan(self.service.backend.ptr, self.a, "assertion/", after, 128);
-            for (page.rows) |row| {
-                scanned += 1;
-                const record = try parse(t.StoredAssertion, self.a, row.json);
-                if (try self.recallHit(record, request, vector, true)) |hit| try hits.append(self.a, hit);
-            }
-            after = page.next;
-            if (after == null) break;
-            if (scanned >= 4096) {
-                more = true;
-                break;
+        var scoped_request = request;
+        scoped_request.cursor = null;
+        const indexed_scope = try std.fmt.allocPrint(self.a, "recall/v1/{s}/", .{try hash(self.a, scoped_request)});
+        const legacy_cursor = if (request.cursor) |cursor| blk: {
+            const colon = std.mem.lastIndexOfScalar(u8, cursor, ':') orelse return error.InvalidMemoryCursor;
+            break :blk std.mem.startsWith(u8, cursor[colon + 1 ..], "assertion/");
+        } else false;
+        const index = if (self.service.backend.search_assertions != null) try self.read(t.RecallIndex, "assertion-recall-index") else null;
+        const indexed = !explicit_seeds and !legacy_cursor and (request.query.len > 0 or vector != null) and index != null and index.?.version == 1 and index.?.complete and index.?.generation == self.state.config.generation and (try self.service.backend.scan(self.service.backend.ptr, self.a, "assertion-recall-work/", null, 1)).rows.len == 0;
+        if (indexed) {
+            const position = try self.decodeCursor(indexed_scope, request.cursor);
+            const offset = if (position) |value| std.fmt.parseInt(u32, value[indexed_scope.len..], 10) catch return error.InvalidMemoryCursor else 0;
+            if (offset >= 4096 or offset % 128 != 0) return error.InvalidMemoryCursor;
+            const page = try self.indexedRecallPage(request, vector, offset);
+            scanned = page.records.len;
+            for (page.records) |record| if (try self.recallHit(record, request, vector, true)) |hit| try hits.append(self.a, hit);
+            more = page.more;
+            after = if (page.more and offset + 128 < 4096) try std.fmt.allocPrint(self.a, "{s}{d}", .{ indexed_scope, offset + 128 }) else null;
+        } else if (!explicit_seeds) {
+            after = try self.decodeCursor("assertion/", request.cursor);
+            while (!explicit_seeds) {
+                try self.service.context.check();
+                const page = try self.service.backend.scan(self.service.backend.ptr, self.a, "assertion/", after, 128);
+                for (page.rows) |row| {
+                    scanned += 1;
+                    const record = try parse(t.StoredAssertion, self.a, row.json);
+                    if (try self.recallHit(record, request, vector, true)) |hit| try hits.append(self.a, hit);
+                }
+                after = page.next;
+                if (after == null) break;
+                if (scanned >= 4096) {
+                    more = true;
+                    break;
+                }
             }
         }
         std.mem.sort(Hit, hits.items, {}, struct {
@@ -5085,7 +5429,7 @@ const Run = struct {
             bytes += size;
             try selected.append(self.a, hit);
         }
-        var result: t.RecallResult = .{ .items = selected.items, .next_cursor = try self.encodeCursor("assertion/", after), .complete = !more and omitted == 0, .truncated = more or omitted > 0, .scanned = scanned, .omitted = omitted, .token_upper_bound = 0, .revision = self.state.revision, .config_generation = self.state.config.generation, .retrieval = if (vector != null) .lexical_vector else .lexical };
+        var result: t.RecallResult = .{ .items = selected.items, .next_cursor = try self.encodeCursor(if (indexed) indexed_scope else "assertion/", after), .complete = !more and omitted == 0, .truncated = more or omitted > 0, .scanned = scanned, .omitted = omitted, .token_upper_bound = 0, .revision = self.state.revision, .config_generation = self.state.config.generation, .retrieval = if (vector != null) .lexical_vector else .lexical };
         if (graph_result) |result_graph| {
             result.retrieval = .graph;
             result.graph = result_graph.status;
@@ -5253,6 +5597,20 @@ fn compactName(a: A, value: []const u8) ![]const u8 {
     };
     return result.items;
 }
+fn sameNameNumbers(left: []const u8, right: []const u8) bool {
+    var l: usize = 0;
+    var r: usize = 0;
+    while (true) {
+        while (l < left.len and !std.ascii.isDigit(left[l])) : (l += 1) {}
+        while (r < right.len and !std.ascii.isDigit(right[r])) : (r += 1) {}
+        if (l == left.len or r == right.len) return l == left.len and r == right.len;
+        const lb = l;
+        const rb = r;
+        while (l < left.len and std.ascii.isDigit(left[l])) : (l += 1) {}
+        while (r < right.len and std.ascii.isDigit(right[r])) : (r += 1) {}
+        if (!eql(u8, left[lb..l], right[rb..r])) return false;
+    }
+}
 fn nameNumbers(a: A, value: []const u8) ![]const u8 {
     var result: std.ArrayList(u8) = .empty;
     var in_number = false;
@@ -5270,7 +5628,7 @@ fn nameNumbers(a: A, value: []const u8) ![]const u8 {
 }
 
 fn performanceTestRun(a: A) Run {
-    return .{ .a = a, .lexical_allocator = a, .service = .{ .backend = undefined, .context = .{ .principal = "alice", .admin = true, .now_ms = 10 } }, .state = .{ .config = .{}, .owner = "alice", .created_at = 1 }, .explanation_snapshot_scratch = .init(a) };
+    return .{ .a = a, .lexical_allocator = a, .service = .{ .backend = .{ .ptr = undefined, .get = undefined, .scan = undefined, .commit = undefined }, .context = .{ .principal = "alice", .admin = true, .now_ms = 10 } }, .state = .{ .config = .{}, .owner = "alice", .created_at = 1 }, .explanation_snapshot_scratch = .init(a) };
 }
 
 test "memory performance decoded records allocate once and replay temporal dependency tracking" {
@@ -5397,4 +5755,32 @@ test "memory performance overlay range pages merge replacements and tombstones a
         if (cursor == null) break;
     }
     try std.testing.expectEqual(@as(usize, 100), count);
+}
+
+test "memory projection provenance equality validates all values without allocating" {
+    var storage: [1024]u8 = undefined;
+    var fixed = std.heap.FixedBufferAllocator.init(&storage);
+    var run = performanceTestRun(fixed.allocator());
+    const model: t.Model = .{ .provider = "test", .model = "dense", .revision = "1", .dimensions = 2 };
+    run.state.config.models.embedder = model;
+    const record: t.EntityRecord = .{ .entity = .{ .id = "e", .name = "Name", .aliases = &.{"Alias"} }, .owner = "alice", .revision = 2 };
+    const dependencies: []const t.DerivedDependency = &.{.{ .resource = .{ .table = "memory", .table_id = 1, .kind = .entity, .id = "e", .revision = 2 }, .evidence = &.{.{ .id = "source" }} }};
+    var view: t.EntityView = undefined;
+    view.fingerprint = "fingerprint";
+    view.dependencies = dependencies;
+    view.description = "Description";
+    var projection: t.EntityProjection = .{ .entity_id = "e", .entity_revision = 2, .model = model, .generation = run.state.config.embedding_generation, .config_generation = run.state.config.generation, .owner = "alice", .visibility = record.entity.visibility, .kind = .names, .fingerprint = view.fingerprint, .dependencies = dependencies, .text = "Name\nAlias", .embedding = &.{ 1, 0 } };
+    for (0..1024) |_| try std.testing.expect(try run.semanticCurrent(projection, record, view));
+    try std.testing.expectEqual(@as(usize, 0), fixed.end_index);
+    projection.model.revision = "2";
+    try std.testing.expect(!try run.semanticCurrent(projection, record, view));
+    projection.model = model;
+    projection.dependencies = &.{.{ .resource = .{ .table = "memory", .table_id = 1, .kind = .entity, .id = "e", .revision = 3 }, .evidence = &.{.{ .id = "source" }} }};
+    try std.testing.expect(!try run.semanticCurrent(projection, record, view));
+    projection.dependencies = dependencies;
+    projection.text = "Name\nAlias\n";
+    try std.testing.expect(!try run.semanticCurrent(projection, record, view));
+    projection.text = "Name\nAlias";
+    projection.embedding = &.{1};
+    try std.testing.expect(!try run.semanticCurrent(projection, record, view));
 }

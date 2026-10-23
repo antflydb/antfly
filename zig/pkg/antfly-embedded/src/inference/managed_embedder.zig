@@ -1397,6 +1397,13 @@ pub const ManagedEmbedder = struct {
         return try embedWithEntryForTask(alloc, entry, text, entry.dimensions, .retrieval_query);
     }
 
+    /// Role-aware query batching uses the same provider limits, instructions,
+    /// retry policy and admission as scalar query embeddings.
+    pub fn embedQueries(self: *const ManagedEmbedder, alloc: std.mem.Allocator, index_name: []const u8, texts: []const []const u8) ![]const []const f32 {
+        const entry = self.findQueryEntry(index_name) orelse return error.EmbeddingIndexNotFound;
+        return embedBatchWithEntryForTask(alloc, entry, texts, entry.dimensions, .retrieval_query);
+    }
+
     pub fn embedQueryWithCancellation(
         self: *const ManagedEmbedder,
         alloc: std.mem.Allocator,

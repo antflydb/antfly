@@ -52,6 +52,15 @@ pub fn retentionDue(backend: m.Backend, a: A, now: i64, state: m.types.State) !b
     const due = try backend.scan(backend.ptr, a, "entity-semantic-due/", null, 1);
     return due.rows.len != 0 and (try std.json.parseFromSliceLeaky(struct { id: []const u8, at: i64 }, a, due.rows[0].json, .{})).at <= now;
 }
+pub fn recallDue(backend: m.Backend, a: A, now: i64, state: m.types.State) !bool {
+    if (backend.search_assertions != null) {
+        const row = try backend.get(backend.ptr, a, "assertion-recall-index");
+        if (row == null) return true;
+        const index = try std.json.parseFromSliceLeaky(m.types.RecallIndex, a, row.?.json, .{});
+        if (index.generation != state.config.generation or !index.backfill_complete or (try backend.scan(backend.ptr, a, "assertion-recall-work/", null, 1)).rows.len != 0 or (!index.complete and index.next_retry_at <= now)) return true;
+    }
+    return false;
+}
 pub fn semanticDue(backend: m.Backend, a: A, state: m.types.State) !bool {
     if (!state.config.semantic_discovery.enabled) return false;
     const row = (try backend.get(backend.ptr, a, "entity-semantic-index")) orelse return true;
@@ -62,12 +71,19 @@ pub fn semanticDue(backend: m.Backend, a: A, state: m.types.State) !bool {
     // spinning or committing a new maintenance receipt on every worker round.
     return !index.complete and (try backend.scan(backend.ptr, a, "entity-semantic-blocked/", null, 1)).rows.len == 0;
 }
-pub const MaintenanceKind = enum { idle, retention, semantic };
+pub const MaintenanceKind = enum { idle, retention, recall, semantic };
 /// Selection, execution budgets and policy dispatch share the same priority.
 /// Retention never invokes inference, even when semantic work is also due.
 pub fn maintenanceKind(backend: m.Backend, a: A, now: i64, state: m.types.State) !MaintenanceKind {
     if (try retentionDue(backend, a, now, state)) return .retention;
-    return if (try semanticDue(backend, a, state)) .semantic else .idle;
+    const semantic = try semanticDue(backend, a, state);
+    if (try recallDue(backend, a, now, state)) {
+        if (semantic) if (try backend.get(backend.ptr, a, "assertion-recall-index")) |row| {
+            if ((try std.json.parseFromSliceLeaky(m.types.RecallIndex, a, row.json, .{})).yield_to_semantic) return .semantic;
+        };
+        return .recall;
+    }
+    return if (semantic) .semantic else .idle;
 }
 fn cleanup(backend: m.Backend, a: A, now: i64, state: m.types.State, executor: Executor) !bool {
     if (try maintenanceKind(backend, a, now, state) == .idle) return false;

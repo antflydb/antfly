@@ -37,7 +37,15 @@ pub const Bridge = struct {
     }
 
     pub fn backend(self: *Bridge) service.Backend {
-        return .{ .ptr = self, .get = get, .get_many = if (self.base.get_many != null) getMany else null, .scan = scan, .commit = commit, .resource = if (self.base.resource != null) resource else null, .generate = if (self.producer != null) generate else null, .embed = embed, .decide = if (self.producer != null) decide else null, .embed_document = embedDocument, .neighbors = if (self.base.neighbors != null) neighbors else null, .ensure_vector_index = if (self.base.ensure_vector_index != null) ensureVectorIndex else null, .validate_models = validate };
+        return .{ .ptr = self, .get = get, .get_many = if (self.base.get_many != null) getMany else null, .ensure_text_index = if (self.base.ensure_text_index != null) ensureTextIndex else null, .search_assertions = if (self.base.search_assertions != null) searchAssertions else null, .scan = scan, .commit = commit, .resource = if (self.base.resource != null) resource else null, .generate = if (self.producer != null) generate else null, .embed = embed, .decide = if (self.producer != null) decide else null, .embed_document = embedDocument, .embed_batch = embedBatch, .neighbors = if (self.base.neighbors != null) neighbors else null, .ensure_vector_index = if (self.base.ensure_vector_index != null) ensureVectorIndex else null, .validate_models = validate };
+    }
+    fn ensureTextIndex(ptr: *anyopaque, a: A, name: []const u8) anyerror!void {
+        const self: *Bridge = @ptrCast(@alignCast(ptr));
+        return self.base.ensure_text_index.?(self.base.ptr, a, name);
+    }
+    fn searchAssertions(ptr: *anyopaque, a: A, input: service.RecallSearchRequest) anyerror!service.RecallSearchPage {
+        const self: *Bridge = @ptrCast(@alignCast(ptr));
+        return self.base.search_assertions.?(self.base.ptr, a, input);
     }
     fn neighbors(ptr: *anyopaque, a: A, request: service.NeighborRequest) ![]const service.Neighbor {
         const self: *Bridge = @ptrCast(@alignCast(ptr));
@@ -165,6 +173,26 @@ pub const Bridge = struct {
     fn embedder(self: *Bridge, a: A, model: t.Model) !managed.ManagedEmbedder {
         const indexes = try std.json.Stringify.valueAlloc(a, .{ .memory = .{ .type = "embeddings", .field = "statement", .dimension = model.dimensions, .embedder = .{ .provider = model.provider, .model = model.model } } }, .{});
         return managed.ManagedEmbedder.initFromIndexesJsonWithOptions(a, indexes, self.embedding_options);
+    }
+    fn embedBatch(ptr: *anyopaque, a: A, model: t.Model, texts: []const []const u8, role: service.EmbeddingRole) ![]const []const f32 {
+        const self: *Bridge = @ptrCast(@alignCast(ptr));
+        if (texts.len == 0 or texts.len > 64) return error.InvalidMemoryRequest;
+        try self.before();
+        const computed = self.embeddingBatch(a, model, texts, role);
+        try self.after();
+        return computed;
+    }
+    fn embeddingBatch(self: *Bridge, a: A, model: t.Model, texts: []const []const u8, role: service.EmbeddingRole) ![]const []const f32 {
+        if (std.mem.eql(u8, model.provider, "external")) return error.MemoryExternalVectorRequired;
+        var provider = try self.embedder(a, model);
+        defer provider.deinit();
+        const interface = provider.denseInterface();
+        const capabilities = try interface.capabilities(a, "memory");
+        try checkRevision(model, capabilities.model_revision);
+        const vectors = if (role == .query) try provider.embedQueries(a, "memory", texts) else try interface.embedDenseBatch(a, "memory", texts, model.dimensions.?);
+        if (vectors.len != texts.len) return error.MemoryEmbeddingMismatch;
+        for (vectors) |vector| if (vector.len != model.dimensions.?) return error.MemoryEmbeddingMismatch;
+        return vectors;
     }
     fn embedDocument(ptr: *anyopaque, a: A, model: t.Model, text: []const u8) ![]const f32 {
         const self: *Bridge = @ptrCast(@alignCast(ptr));

@@ -38,6 +38,29 @@ pub fn decodeRow(a: A, json: []const u8) ![]const u8 {
 }
 
 fn encodeChange(a: A, path: []const u8, json: []const u8) ![]const u8 {
+    if (std.mem.startsWith(u8, path, "assertion-recall/")) {
+        const projection = try std.json.parseFromSliceLeaky(service.types.RecallProjection, a, json, .{});
+        var output: std.Io.Writer.Allocating = .init(a);
+        try output.writer.print("{{\"memory_record_version\":1,\"value\":{s}", .{json});
+        for (projection.text_indexes) |name| {
+            try output.writer.writeByte(',');
+            try std.json.Stringify.value(name, .{}, &output.writer);
+            try output.writer.writeByte(':');
+            try std.json.Stringify.value(projection.text, .{}, &output.writer);
+        }
+        if (projection.embedding) |vector| {
+            try output.writer.writeAll(",\"_embeddings\":{");
+            for (projection.vector_indexes, 0..) |name, i| {
+                if (i != 0) try output.writer.writeByte(',');
+                try std.json.Stringify.value(name, .{}, &output.writer);
+                try output.writer.writeByte(':');
+                try std.json.Stringify.value(vector, .{}, &output.writer);
+            }
+            try output.writer.writeByte('}');
+        }
+        try output.writer.writeByte('}');
+        return output.toOwnedSlice();
+    }
     if (!std.mem.startsWith(u8, path, "entity-semantic/")) return encodeRow(a, json);
     const projection = try std.json.parseFromSliceLeaky(service.types.EntityProjection, a, json, .{});
     const rest = path["entity-semantic/".len..];
@@ -58,6 +81,22 @@ fn neighborRequest(input: service.NeighborRequest) !db_types.SearchRequest {
     return .{ .index_name = input.index, .query = .{ .dense_knn = .{ .vector = input.vector, .k = input.limit } }, .limit = input.limit, .include_stored = false };
 }
 
+fn assertionSearchRequest(a: A, input: service.RecallSearchRequest) !db_types.SearchRequest {
+    if (input.limit == 0 or input.limit > 128 or input.offset >= 4096 or input.text_indexes.len > 2 or input.vector_indexes.len > 2) return error.InvalidMemoryRequest;
+    var text: std.ArrayList(db_types.NamedFullTextQuery) = .empty;
+    var dense: std.ArrayList(db_types.NamedDenseQuery) = .empty;
+    for (input.text_indexes) |name| {
+        if (!std.mem.startsWith(u8, name, "memory_recall_text_")) return error.InvalidMemoryRequest;
+        if (input.query.len != 0) try text.append(a, .{ .name = name, .index_name = name, .query = .{ .match = .{ .field = name, .text = input.query } } });
+    }
+    if (input.embedding) |vector| for (input.vector_indexes) |name| {
+        if (!std.mem.startsWith(u8, name, "memory_recall_vector_")) return error.InvalidMemoryRequest;
+        try dense.append(a, .{ .name = name, .index_name = name, .query = .{ .vector = vector, .k = input.offset + input.limit } });
+    };
+    if (text.items.len + dense.items.len == 0) return error.InvalidMemoryRequest;
+    return .{ .full_text_queries = text.items, .dense_queries = dense.items, .merge_config = .{ .window_size = input.offset + input.limit }, .offset = input.offset, .limit = input.limit, .include_stored = false };
+}
+
 pub const Routed = struct {
     table: []const u8,
     reads: reads_mod.TableReadSource,
@@ -68,7 +107,31 @@ pub const Routed = struct {
     request: @import("../api/operation.zig").RequestContext = .{},
 
     pub fn backend(self: *Routed) service.Backend {
-        return .{ .ptr = self, .get = get, .get_many = getMany, .scan = scan, .commit = commit, .resource = if (self.resource_fn != null) resource else null, .neighbors = neighbors, .ensure_vector_index = ensureVectorIndex };
+        return .{ .ptr = self, .get = get, .get_many = getMany, .scan = scan, .commit = commit, .resource = if (self.resource_fn != null) resource else null, .neighbors = neighbors, .ensure_vector_index = ensureVectorIndex, .ensure_text_index = ensureTextIndex, .search_assertions = searchAssertions };
+    }
+    fn ensureTextIndex(ptr: *anyopaque, a: A, name: []const u8) !void {
+        const self: *Routed = @ptrCast(@alignCast(ptr));
+        try self.context.requireGrant(.admin);
+        self.writes.createIndex(a, self.table, name, try std.json.Stringify.valueAlloc(a, .{ .type = "full_text", .field = name }, .{})) catch |err| switch (err) {
+            error.IndexAlreadyExists => return,
+            else => return err,
+        } orelse return error.MemoryCapabilityUnavailable;
+    }
+    fn searchAssertions(ptr: *anyopaque, a: A, input: service.RecallSearchRequest) !service.RecallSearchPage {
+        const self: *Routed = @ptrCast(@alignCast(ptr));
+        try self.context.check();
+        var request = try assertionSearchRequest(a, input);
+        request.execution_deadline_ns = self.request.deadline_ns;
+        request.cancellation = self.request.cancellation;
+        var response = (try self.reads.query(a, self.table, request, .read_index)) orelse return error.MemorySpaceNotFound;
+        defer response.deinit(a);
+        const Wire = struct { responses: []const struct { hits: struct { hits: []const struct { _id: []const u8 } } } };
+        const value = try std.json.parseFromSliceLeaky(Wire, a, response.json, .{ .ignore_unknown_fields = true });
+        if (value.responses.len != 1 or value.responses[0].hits.hits.len > input.limit) return error.MemoryCorruptState;
+        const hits = value.responses[0].hits.hits;
+        const keys = try a.alloc([]const u8, hits.len);
+        for (hits, keys) |hit, *key| key.* = try a.dupe(u8, hit._id);
+        return .{ .keys = keys, .more = hits.len == input.limit };
     }
     fn ensureVectorIndex(ptr: *anyopaque, a: A, name: []const u8, dims: u32) !void {
         const self: *Routed = @ptrCast(@alignCast(ptr));
@@ -160,7 +223,25 @@ pub fn Native(comptime DB: type) type {
         resource_fn: ?*const fn (*anyopaque, A, service.types.provenance.Resource) anyerror!service.types.provenance.Snapshot = null,
         const Self = @This();
         pub fn backend(self: *Self) service.Backend {
-            return .{ .ptr = self, .get = get, .get_many = getMany, .scan = scan, .commit = commit, .resource = if (self.resource_fn != null) resource else null, .neighbors = neighbors, .ensure_vector_index = ensureVectorIndex };
+            return .{ .ptr = self, .get = get, .get_many = getMany, .scan = scan, .commit = commit, .resource = if (self.resource_fn != null) resource else null, .neighbors = neighbors, .ensure_vector_index = ensureVectorIndex, .ensure_text_index = ensureTextIndex, .search_assertions = searchAssertions };
+        }
+        fn ensureTextIndex(ptr: *anyopaque, a: A, name: []const u8) !void {
+            const self: *Self = @ptrCast(@alignCast(ptr));
+            try self.context.requireGrant(.admin);
+            self.db.addIndex(.{ .name = name, .kind = .full_text, .config_json = try std.json.Stringify.valueAlloc(a, .{ .field = name }, .{}) }) catch |err| switch (err) {
+                error.IndexAlreadyExists => return,
+                else => return err,
+            };
+        }
+        fn searchAssertions(ptr: *anyopaque, a: A, input: service.RecallSearchRequest) !service.RecallSearchPage {
+            const self: *Self = @ptrCast(@alignCast(ptr));
+            try self.context.check();
+            var response = try self.db.search(a, try assertionSearchRequest(a, input));
+            defer response.deinit();
+            if (response.hits.len > input.limit) return error.MemoryCorruptState;
+            const keys = try a.alloc([]const u8, response.hits.len);
+            for (response.hits, keys) |hit, *key| key.* = try a.dupe(u8, hit.id);
+            return .{ .keys = keys, .more = response.hits.len == input.limit };
         }
         fn ensureVectorIndex(ptr: *anyopaque, a: A, name: []const u8, dims: u32) !void {
             const self: *Self = @ptrCast(@alignCast(ptr));
@@ -235,7 +316,7 @@ pub fn Native(comptime DB: type) type {
 }
 
 fn hasProjection(changes: []const service.Change) bool {
-    for (changes) |change| if (std.mem.startsWith(u8, change.key, "entity-semantic/") or std.mem.eql(u8, change.key, "entity-semantic-index")) return true;
+    for (changes) |change| if (std.mem.startsWith(u8, change.key, "entity-semantic/") or std.mem.startsWith(u8, change.key, "assertion-recall/") or std.mem.eql(u8, change.key, "entity-semantic-index") or std.mem.eql(u8, change.key, "assertion-recall-index")) return true;
     return false;
 }
 fn validateCursor(prefix: []const u8, cursor: ?[]const u8) !void {

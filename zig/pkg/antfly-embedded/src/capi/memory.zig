@@ -211,6 +211,12 @@ test "capi native memory ANN projections use shared native indexes and routed ne
             const remote = routed.backend();
             return remote.neighbors.?(remote.ptr, allocator, request);
         }
+        fn remoteSearch(ptr: *anyopaque, allocator: std.mem.Allocator, request: memory.RecallSearchRequest) !memory.RecallSearchPage {
+            const owner: *engine.Native(h.db_mod.DB) = @ptrCast(@alignCast(ptr));
+            var routed: engine.Routed = .{ .table = "memory_ann", .reads = .{ .ptr = owner.db, .vtable = &.{ .lookup = lookup, .scan = scan, .query = query } }, .writes = undefined, .context = owner.context };
+            const remote = routed.backend();
+            return remote.search_assertions.?(remote.ptr, allocator, request);
+        }
         fn remoteGetMany(ptr: *anyopaque, allocator: std.mem.Allocator, keys: []const []const u8) ![]const ?memory.Row {
             const owner: *engine.Native(h.db_mod.DB) = @ptrCast(@alignCast(ptr));
             var routed: engine.Routed = .{ .table = "memory_ann", .reads = .{ .ptr = owner.db, .vtable = &.{ .lookup = lookup, .scan = scan, .query = query } }, .writes = undefined, .context = owner.context };
@@ -272,6 +278,46 @@ test "capi native memory ANN projections use shared native indexes and routed ne
     const remote_page = try std.json.parseFromSliceLeaky(memory.types.EntityCandidatePage, alloc, try remote_service.execute(alloc, .entity_candidates, "graph", "{}", ""), .{});
     try std.testing.expectEqualDeep(page, remote_page);
     try qualifyAnnScale(alloc, &native, service, projection_rows.rows);
+    // Recall uses bounded postings/ANN on the shared native indexes, then the
+    // same live policy hydration through the routed and embedded adapters.
+    _ = try service.execute(alloc, .assertions, "", "{\"assertions\":[{\"id\":\"rare\",\"subject\":\"graph\",\"predicate\":\"fact\",\"value\":\"rare\",\"statement\":\"pelagic retrieval target\",\"evidence\":[{\"id\":\"e\"}]},{\"id\":\"other\",\"subject\":\"graph\",\"predicate\":\"fact\",\"value\":\"other\",\"statement\":\"copper hardware target\",\"evidence\":[{\"id\":\"e\"}]}]}", "recall-claims");
+    for (0..32) |i| {
+        const state = try std.json.parseFromSliceLeaky(memory.types.State, alloc, (try backend.get(backend.ptr, alloc, "control")).?.json, .{});
+        if (try @import("../memory/scheduling.zig").maintenanceKind(backend, alloc, 1, state) == .idle) break;
+        _ = try service.execute(alloc, .advance, "", "{}", try std.fmt.allocPrint(alloc, "recall-index-{d}", .{i}));
+    } else return error.TestUnexpectedResult;
+    const recall_index = try std.json.parseFromSliceLeaky(memory.types.RecallIndex, alloc, (try backend.get(backend.ptr, alloc, "assertion-recall-index")).?.json, .{});
+    try std.testing.expect(recall_index.complete);
+    const recalled = try std.json.parseFromSliceLeaky(memory.types.RecallResult, alloc, try service.execute(alloc, .recall, "", "{\"query\":\"pelagic\",\"token_budget\":8192}", ""), .{});
+    try std.testing.expectEqual(@as(usize, 1), recalled.scanned);
+    try std.testing.expectEqual(@as(usize, 1), recalled.items.len);
+    try std.testing.expectEqualStrings("rare", recalled.items[0].memory.assertion.id);
+    remote_service.backend.search_assertions = Fixture.remoteSearch;
+    const routed_recall = try std.json.parseFromSliceLeaky(memory.types.RecallResult, alloc, try remote_service.execute(alloc, .recall, "", "{\"query\":\"pelagic\",\"token_budget\":8192}", ""), .{});
+    try std.testing.expectEqualDeep(recalled, routed_recall);
+    const recall_projections = try backend.scan(backend.ptr, alloc, "assertion-recall/", null, 8);
+    const projection = try std.json.parseFromSliceLeaky(memory.types.RecallProjection, alloc, recall_projections.rows[0].json, .{});
+    const request: memory.RecallSearchRequest = .{ .text_indexes = projection.text_indexes[0..1], .query = "pelagic" };
+    const local_search = try backend.search_assertions.?(backend.ptr, alloc, request);
+    const routed_search = try remote.search_assertions.?(remote.ptr, alloc, request);
+    try std.testing.expectEqualDeep(local_search, routed_search);
+    const dense_index = "memory_recall_vector_contract";
+    try backend.ensure_vector_index.?(backend.ptr, alloc, dense_index, dimensions);
+    var dense_projection = projection;
+    const dense_vector = try Fixture.embed(backend.ptr, alloc, config.models.embedder.?, "target");
+    dense_projection.embedding = dense_vector;
+    dense_projection.vector_indexes = &.{dense_index};
+    const control = (try backend.get(backend.ptr, alloc, "control")).?;
+    try backend.commit(backend.ptr, alloc, control, &.{ .{ .key = recall_projections.rows[0].key, .json = try std.json.Stringify.valueAlloc(alloc, dense_projection, .{}) }, .{ .key = "control", .json = control.json } });
+    const hybrid_request: memory.RecallSearchRequest = .{ .text_indexes = projection.text_indexes[0..1], .vector_indexes = &.{dense_index}, .query = "pelagic", .embedding = dense_vector };
+    const hybrid_local = try backend.search_assertions.?(backend.ptr, alloc, hybrid_request);
+    const hybrid_remote = try remote.search_assertions.?(remote.ptr, alloc, hybrid_request);
+    try std.testing.expect(hybrid_local.keys.len > 0 and hybrid_local.keys.len <= 2);
+    try std.testing.expectEqualDeep(hybrid_local, hybrid_remote);
+    try qualifyRecallScale(alloc, &native, service, projection);
+    _ = try service.execute(alloc, .forget, "", "{\"assertion_ids\":[\"rare\"]}", "recall-forget");
+    const forgotten = try std.json.parseFromSliceLeaky(memory.types.RecallResult, alloc, try service.execute(alloc, .recall, "", "{\"query\":\"pelagic\",\"token_budget\":8192}", ""), .{});
+    try std.testing.expectEqual(@as(usize, 0), forgotten.items.len);
 }
 
 test "capi native memory semantic deadlines survive reopen and refresh both validity boundaries" {
@@ -576,6 +622,63 @@ fn qualifyAnnScale(allocator: std.mem.Allocator, native: *engine.Native(h.db_mod
     try std.testing.expectEqual(@as(usize, 2 * count), Helpers.neighbor_calls);
     try std.testing.expectEqual(@as(usize, 0), Helpers.primary_scans);
     std.debug.print("memory ANN scale: {d} seeds, {d} bounded neighbor calls, {d} primary scans, {d} ms\n", .{ count, Helpers.neighbor_calls, Helpers.primary_scans, elapsed / std.time.ns_per_ms });
+}
+
+fn qualifyRecallScale(a: std.mem.Allocator, native: *engine.Native(h.db_mod.DB), service: memory.Service, prototype: memory.types.RecallProjection) !void {
+    const count = if (std.c.getenv("ANTFLY_MEMORY_QUALIFY_RECALL_SCALE")) |raw| try std.fmt.parseInt(usize, std.mem.span(raw), 10) else @as(usize, 128);
+    if (count == 0 or count > 10000) return error.InvalidMemoryRequest;
+    const Helpers = struct {
+        var primary_scans: usize = 0;
+        var searches: usize = 0;
+        fn digest(alloc: std.mem.Allocator, value: []const u8) ![]const u8 {
+            var bytes: [32]u8 = undefined;
+            std.crypto.hash.sha2.Sha256.hash(try std.json.Stringify.valueAlloc(alloc, value, .{}), &bytes, .{});
+            return alloc.dupe(u8, &std.fmt.bytesToHex(bytes, .lower));
+        }
+        fn scan(ptr: *anyopaque, alloc: std.mem.Allocator, prefix: []const u8, cursor: ?[]const u8, limit: u32) !memory.Page {
+            if (std.mem.eql(u8, prefix, "assertion/")) primary_scans += 1;
+            const owner: *engine.Native(h.db_mod.DB) = @ptrCast(@alignCast(ptr));
+            return owner.backend().scan(ptr, alloc, prefix, cursor, limit);
+        }
+        fn search(ptr: *anyopaque, alloc: std.mem.Allocator, input: memory.RecallSearchRequest) !memory.RecallSearchPage {
+            searches += 1;
+            const owner: *engine.Native(h.db_mod.DB) = @ptrCast(@alignCast(ptr));
+            return owner.backend().search_assertions.?(ptr, alloc, input);
+        }
+    };
+    const backend = native.backend();
+    var changes: std.ArrayList(memory.Change) = .empty;
+    for (0..count) |i| {
+        const id = try std.fmt.allocPrint(a, "recall-scale-{d}", .{i});
+        const digest = try Helpers.digest(a, id);
+        const record: memory.types.StoredAssertion = .{ .assertion = .{ .id = id, .subject = "graph", .predicate = "fact", .value = id, .statement = "unrelated copper hardware", .evidence = &.{.{ .id = "e" }} }, .owner = service.context.principal, .recorded_from = 1, .revision = 1, .config_generation = prototype.generation };
+        const path = try std.fmt.allocPrint(a, "assertion/{s}", .{digest});
+        var projection = prototype;
+        projection.assertion_id = id;
+        projection.assertion_key = path;
+        projection.statement_hash = try Helpers.digest(a, record.assertion.statement);
+        projection.text = record.assertion.statement;
+        projection.embedding = null;
+        projection.vector_indexes = &.{};
+        try changes.append(a, .{ .key = path, .json = try std.json.Stringify.valueAlloc(a, record, .{}) });
+        try changes.append(a, .{ .key = try std.fmt.allocPrint(a, "assertion-recall/{d:0>20}/{s}", .{ projection.generation, digest }), .json = try std.json.Stringify.valueAlloc(a, projection, .{}) });
+    }
+    const control = (try backend.get(backend.ptr, a, "control")).?;
+    try changes.append(a, .{ .key = "control", .json = control.json });
+    try backend.commit(backend.ptr, a, control, changes.items);
+    var measured = service;
+    measured.backend.scan = Helpers.scan;
+    measured.backend.search_assertions = Helpers.search;
+    Helpers.primary_scans = 0;
+    Helpers.searches = 0;
+    const start = @import("antfly_platform").time.monotonicNs();
+    const result = try std.json.parseFromSliceLeaky(memory.types.RecallResult, a, try measured.execute(a, .recall, "", "{\"query\":\"pelagic\",\"token_budget\":8192}", ""), .{});
+    const elapsed = @import("antfly_platform").time.monotonicNs() - start;
+    try std.testing.expectEqual(@as(usize, 1), result.items.len);
+    try std.testing.expectEqual(@as(usize, 1), result.scanned);
+    try std.testing.expectEqual(@as(usize, 1), Helpers.searches);
+    try std.testing.expectEqual(@as(usize, 0), Helpers.primary_scans);
+    std.debug.print("memory recall scale: {d} assertions, {d} indexed searches, {d} hydrated candidates, {d} primary scans, {d} us\n", .{ count + 2, Helpers.searches, result.scanned, Helpers.primary_scans, elapsed / std.time.ns_per_us });
 }
 
 test "capi native memory Codex semantic quality with a qualified managed embedder" {

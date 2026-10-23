@@ -31,6 +31,9 @@ const Store = struct {
     reads: usize = 0,
     scans: usize = 0,
     entity_scans: usize = 0,
+    assertion_scans: usize = 0,
+    document_batches: usize = 0,
+    query_batches: usize = 0,
     neighbor_calls: usize = 0,
     query_calls: usize = 0,
     view_scans: usize = 0,
@@ -67,6 +70,7 @@ const Store = struct {
     fn scan(ptr: *anyopaque, a: A, prefix: []const u8, cursor: ?[]const u8, limit: u32) !m.Page {
         const self: *Store = @ptrCast(@alignCast(ptr));
         self.scans += 1;
+        if (std.mem.eql(u8, prefix, "assertion/")) self.assertion_scans += 1;
         if (std.mem.startsWith(u8, prefix, "dependency/identity/")) self.view_scans += 1;
         if (std.mem.eql(u8, prefix, "entity/")) self.entity_scans += 1;
         var rows: std.ArrayList(m.Row) = .empty;
@@ -6819,4 +6823,262 @@ test "memory performance version four inline query migration needs no provider c
     try std.testing.expectEqual(@as(usize, 4), (try Store.scan(&store, a, "entity-semantic-query/", null, 32)).rows.len);
     const page = try std.json.parseFromSliceLeaky(m.types.EntityCandidatePage, a, try svc.execute(a, .entity_candidates, "a", "{}", ""), .{});
     try std.testing.expectEqual(.indexed, page.semantic_discovery);
+}
+
+const IndexedRecallFixture = struct {
+    fn service(store: *Store, now: i64) m.Service {
+        var result = store.service("alice", true, now);
+        result.backend.search_assertions = search;
+        result.backend.ensure_text_index = ensure;
+        result.backend.ensure_vector_index = SemanticFixture.ensure;
+        return result;
+    }
+    fn ensure(_: *anyopaque, _: A, _: []const u8) !void {}
+    // Contract double only: native postings and ANN are exercised by C ABI tests.
+    fn search(ptr: *anyopaque, a: A, request: m.RecallSearchRequest) !m.RecallSearchPage {
+        const store: *Store = @ptrCast(@alignCast(ptr));
+        store.query_calls += 1;
+        var keys: std.ArrayList([]const u8) = .empty;
+        var entries = store.values.iterator();
+        while (entries.next()) |entry| {
+            if (!std.mem.startsWith(u8, entry.key_ptr.*, "assertion-recall/")) continue;
+            const projection = try std.json.parseFromSliceLeaky(m.types.RecallProjection, a, entry.value_ptr.*, .{});
+            var audience = false;
+            for (projection.text_indexes) |index| for (request.text_indexes) |selected| {
+                if (std.mem.eql(u8, index, selected)) audience = true;
+            };
+            if (!audience or (request.embedding == null and std.mem.indexOf(u8, projection.text, request.query) == null)) continue;
+            try keys.append(a, entry.key_ptr.*);
+        }
+        std.mem.sort([]const u8, keys.items, {}, struct {
+            fn less(_: void, l: []const u8, r: []const u8) bool {
+                return std.mem.lessThan(u8, l, r);
+            }
+        }.less);
+        const start = @min(request.offset, keys.items.len);
+        const end = @min(start + request.limit, keys.items.len);
+        return .{ .keys = keys.items[start..end], .more = end < keys.items.len };
+    }
+    fn drain(svc: m.Service, a: A, token: []const u8) !void {
+        for (0..64) |i| {
+            const state = try std.json.parseFromSliceLeaky(m.types.State, a, (try svc.backend.get(svc.backend.ptr, a, "control")).?.json, .{});
+            if (try @import("scheduling.zig").maintenanceKind(svc.backend, a, svc.context.now_ms, state) == .idle) return;
+            _ = try svc.execute(a, .advance, "", "{}", try std.fmt.allocPrint(a, "{s}-{d}", .{ token, i }));
+        }
+        return error.TestUnexpectedResult;
+    }
+};
+
+test "memory indexed assertion recall has bounded hydration scoped cursors and immediate forgetting" {
+    var store = Store.init();
+    defer store.deinit();
+    const a = store.arena.allocator();
+    const svc = IndexedRecallFixture.service(&store, 10);
+    _ = try svc.execute(a, .create, "", "{\"max_output_items\":256}", "create");
+    var claims: [130]m.types.Assertion = undefined;
+    for (&claims, 0..) |*claim, i| claim.* = .{ .id = try std.fmt.allocPrint(a, "fact-{d}", .{i}), .subject = "s", .predicate = "fact", .value = try std.fmt.allocPrint(a, "{d}", .{i}), .statement = if (i == 129) "common unicorn" else "common fact", .evidence = &.{.{ .id = "e" }} };
+    _ = try svc.execute(a, .observe, "", try std.json.Stringify.valueAlloc(a, .{ .evidence = &[_]m.types.Evidence{.{ .id = "e", .source_id = "s", .source_version = "1", .text = "Facts" }}, .assertions = claims }, .{}), "observe");
+    try IndexedRecallFixture.drain(svc, a, "index");
+    const scans = store.assertion_scans;
+    const result = try std.json.parseFromSliceLeaky(m.types.RecallResult, a, try svc.execute(a, .recall, "", "{\"query\":\"unicorn\",\"token_budget\":8192}", ""), .{});
+    try std.testing.expectEqual(@as(usize, 1), result.items.len);
+    try std.testing.expectEqualStrings("fact-129", result.items[0].memory.assertion.id);
+    try std.testing.expectEqual(@as(usize, 1), result.scanned);
+    const page = try std.json.parseFromSliceLeaky(m.types.RecallResult, a, try svc.execute(a, .recall, "", "{\"query\":\"common\",\"token_budget\":8192}", ""), .{});
+    try std.testing.expect(page.truncated and page.next_cursor != null);
+    try std.testing.expectEqual(@as(usize, 128), page.scanned);
+    const next = try std.json.parseFromSliceLeaky(m.types.RecallResult, a, try svc.execute(a, .recall, "", try std.json.Stringify.valueAlloc(a, .{ .query = "common", .cursor = page.next_cursor, .token_budget = @as(u32, 8192) }, .{}), ""), .{});
+    try std.testing.expectEqual(@as(usize, 2), next.scanned);
+    try std.testing.expectError(error.InvalidMemoryCursor, svc.execute(a, .recall, "", try std.json.Stringify.valueAlloc(a, .{ .query = "unicorn", .cursor = page.next_cursor, .token_budget = @as(u32, 8192) }, .{}), ""));
+    try std.testing.expectEqual(scans, store.assertion_scans);
+    _ = try svc.execute(a, .forget, "", "{\"assertion_ids\":[\"fact-129\"]}", "forget");
+    const forgotten = try std.json.parseFromSliceLeaky(m.types.RecallResult, a, try svc.execute(a, .recall, "", "{\"query\":\"unicorn\",\"token_budget\":8192}", ""), .{});
+    try std.testing.expectEqual(@as(usize, 0), forgotten.items.len);
+    try std.testing.expectEqual(scans, store.assertion_scans);
+}
+
+test "memory indexed assertion backfill keeps denied sources as fair readiness debt" {
+    var store = Store.init();
+    defer store.deinit();
+    const a = store.arena.allocator();
+    var svc = IndexedRecallFixture.service(&store, 10);
+    _ = try svc.execute(a, .create, "", "{}", "create");
+    _ = try svc.execute(a, .observe, "", "{\"evidence\":[{\"id\":\"e\",\"resource_selector\":{\"table\":\"business\",\"id\":\"approval\"}}],\"assertions\":[{\"id\":\"a\",\"subject\":\"s\",\"predicate\":\"fact\",\"value\":\"v\",\"statement\":\"approved deployment\",\"evidence\":[{\"id\":\"e\"}]}]}", "observe");
+    store.resource_state = .denied;
+    _ = try svc.execute(a, .advance, "", "{}", "denied");
+    var index = try std.json.parseFromSliceLeaky(m.types.RecallIndex, a, store.values.get("assertion-recall-index").?, .{});
+    try std.testing.expect(!index.complete);
+    try std.testing.expectEqual(@as(usize, 1), (try Store.scan(&store, a, "assertion-recall-blocked/", null, 8)).rows.len);
+    store.resource_state = .current;
+    svc.context.now_ms = 40000;
+    try IndexedRecallFixture.drain(svc, a, "restore");
+    index = try std.json.parseFromSliceLeaky(m.types.RecallIndex, a, store.values.get("assertion-recall-index").?, .{});
+    try std.testing.expect(index.complete);
+    const scans = store.assertion_scans;
+    _ = try svc.execute(a, .recall, "", "{\"query\":\"approved\",\"token_budget\":8192}", "");
+    try std.testing.expectEqual(scans, store.assertion_scans);
+}
+
+const RoleBatchFixture = struct {
+    fn batch(ptr: *anyopaque, a: A, _: m.types.Model, texts: []const []const u8, role: m.EmbeddingRole) ![]const []const f32 {
+        const store: *Store = @ptrCast(@alignCast(ptr));
+        if (role == .document) store.document_batches += 1 else store.query_batches += 1;
+        if (role == .query and store.failures > 0) {
+            store.failures -= 1;
+            return error.DeadlineExceeded;
+        }
+        const result = try a.alloc([]const f32, if (store.reject_decision) 0 else texts.len);
+        for (result) |*out| out.* = try a.dupe(f32, if (role == .document) &.{ 1, 0 } else &.{ 0.8, 0.6 });
+        return result;
+    }
+};
+test "memory role batches checkpoint document work and resume without duplicate provider calls" {
+    var store = Store.init();
+    defer store.deinit();
+    const a = store.arena.allocator();
+    var svc = SemanticFixture.service(&store, 1);
+    svc.backend.embed_batch = RoleBatchFixture.batch;
+    const config: m.types.Config = .{ .models = .{ .embedder = fake_model }, .semantic_discovery = .{ .enabled = true } };
+    _ = try svc.execute(a, .create, "", try std.json.Stringify.valueAlloc(a, config, .{}), "create");
+    _ = try svc.execute(a, .observe, "", "{\"evidence\":[{\"id\":\"e\",\"source_id\":\"s\",\"source_version\":\"1\",\"text\":\"KG\"}],\"entities\":[{\"id\":\"kg\",\"name\":\"Knowledge graph\",\"evidence\":[{\"id\":\"e\"}]}]}", "observe");
+    store.failures = 1;
+    _ = try svc.execute(a, .advance, "", "{}", "partial");
+    try std.testing.expectEqual(@as(usize, 2), (try Store.scan(&store, a, "entity-semantic/", null, 8)).rows.len);
+    try std.testing.expectEqual(@as(usize, 0), (try Store.scan(&store, a, "entity-semantic-query/", null, 8)).rows.len);
+    try drainSemantic(svc, a, "resume");
+    try std.testing.expectEqual(@as(usize, 1), store.document_batches);
+    try std.testing.expectEqual(@as(usize, 2), store.query_batches);
+    const calls = store.document_batches + store.query_batches;
+    _ = try svc.execute(a, .entity_candidates, "kg", "{}", "");
+    try std.testing.expectEqual(calls, store.document_batches + store.query_batches);
+}
+test "memory malformed embedding batches defer readiness with durable retry debt" {
+    var store = Store.init();
+    defer store.deinit();
+    const a = store.arena.allocator();
+    var svc = SemanticFixture.service(&store, 1);
+    svc.backend.embed_batch = RoleBatchFixture.batch;
+    const config: m.types.Config = .{ .models = .{ .embedder = fake_model }, .semantic_discovery = .{ .enabled = true } };
+    _ = try svc.execute(a, .create, "", try std.json.Stringify.valueAlloc(a, config, .{}), "create");
+    _ = try svc.execute(a, .observe, "", "{\"evidence\":[{\"id\":\"e\",\"source_id\":\"s\",\"source_version\":\"1\",\"text\":\"KG\"}],\"entities\":[{\"id\":\"kg\",\"name\":\"Knowledge graph\",\"evidence\":[{\"id\":\"e\"}]}]}", "observe");
+    store.reject_decision = true;
+    _ = try svc.execute(a, .advance, "", "{}", "invalid");
+    const index = try std.json.parseFromSliceLeaky(m.types.SemanticIndex, a, store.values.get("entity-semantic-index").?, .{});
+    try std.testing.expect(!index.complete);
+    try std.testing.expectEqual(@as(usize, 1), (try Store.scan(&store, a, "entity-semantic-failure/", null, 8)).rows.len);
+}
+
+test "memory candidate metadata gates avoid reading ineligible source support" {
+    var store = Store.init();
+    defer store.deinit();
+    const a = store.arena.allocator();
+    const svc = store.service("alice", true, 10);
+    _ = try svc.execute(a, .create, "", "{}", "create");
+    _ = try svc.execute(a, .observe, "", "{\"evidence\":[{\"id\":\"base\",\"source_id\":\"s\",\"source_version\":\"1\",\"text\":\"Antfly\"},{\"id\":\"remote\",\"resource_selector\":{\"table\":\"business\",\"id\":\"approval\"}}],\"entities\":[{\"id\":\"seed\",\"name\":\"Antfly 1\",\"evidence\":[{\"id\":\"base\"}]},{\"id\":\"wrong-type\",\"name\":\"Antfly 1\",\"type\":\"service\",\"evidence\":[{\"id\":\"remote\"}]},{\"id\":\"wrong-version\",\"name\":\"Antfly 2\",\"evidence\":[{\"id\":\"remote\"}]},{\"id\":\"distinct\",\"name\":\"Antfly 1\",\"distinct_from\":[\"seed\"],\"evidence\":[{\"id\":\"remote\"}]}]}", "observe");
+    store.resource_reads = 0;
+    const page = try std.json.parseFromSliceLeaky(m.types.EntityCandidatePage, a, try svc.execute(a, .entity_candidates, "seed", "{}", ""), .{});
+    try std.testing.expectEqual(@as(usize, 0), page.items.len);
+    try std.testing.expectEqual(@as(usize, 0), store.resource_reads);
+}
+
+test "memory assertion index readiness waits for publication acknowledgement and live admin grant" {
+    const Fault = struct {
+        fn commit(ptr: *anyopaque, a: A, expected: ?m.Row, changes: []const m.Change) !void {
+            const store: *Store = @ptrCast(@alignCast(ptr));
+            try Store.commit(ptr, a, expected, changes);
+            if (store.failures > 0) {
+                store.failures -= 1;
+                return error.MemoryCommitPending;
+            }
+        }
+        fn finish(ptr: *anyopaque) !void {
+            const store: *Store = @ptrCast(@alignCast(ptr));
+            if (store.reject_decision) {
+                const index = try std.json.parseFromSliceLeaky(m.types.RecallIndex, store.arena.allocator(), store.values.get("assertion-recall-index").?, .{});
+                if (!index.complete) return error.Forbidden;
+            }
+        }
+    };
+    for ([_]bool{ false, true }) |revoke| {
+        var store = Store.init();
+        defer store.deinit();
+        const a = store.arena.allocator();
+        var svc = IndexedRecallFixture.service(&store, 10);
+        _ = try svc.execute(a, .create, "", "{}", "create");
+        _ = try svc.execute(a, .observe, "", source, "source");
+        _ = try svc.execute(a, .assertions, "", helm, "helm");
+        if (revoke) {
+            store.reject_decision = true;
+            svc.context.final_check_ptr = &store;
+            svc.context.final_check_fn = Fault.finish;
+        } else {
+            store.failures = 1;
+            svc.backend.commit = Fault.commit;
+        }
+        try std.testing.expectError(if (revoke) error.Forbidden else error.MemoryCommitPending, svc.execute(a, .advance, "", "{}", "publication"));
+        const index = try std.json.parseFromSliceLeaky(m.types.RecallIndex, a, store.values.get("assertion-recall-index").?, .{});
+        try std.testing.expect(!index.complete and index.backfill_complete);
+        store.reject_decision = false;
+        svc.context.now_ms = 40000;
+        try IndexedRecallFixture.drain(svc, a, "acknowledge");
+        try std.testing.expect((try std.json.parseFromSliceLeaky(m.types.RecallIndex, a, store.values.get("assertion-recall-index").?, .{})).complete);
+    }
+}
+
+test "memory assertion recall cutover backfills vectors and preserves historical discovery" {
+    var store = Store.init();
+    defer store.deinit();
+    const a = store.arena.allocator();
+    var svc = IndexedRecallFixture.service(&store, 10);
+    svc.backend.embed = fakeEmbed;
+    _ = try svc.execute(a, .create, "", "{}", "create");
+    _ = try svc.execute(a, .observe, "", source, "source");
+    _ = try svc.execute(a, .assertions, "", helm, "helm");
+    try IndexedRecallFixture.drain(svc, a, "lexical");
+    const state = try std.json.parseFromSliceLeaky(m.types.State, a, store.values.get("control").?, .{});
+    const configured = try std.json.parseFromSliceLeaky(m.types.OperationStatus, a, try svc.execute(a, .configure, "", try std.json.Stringify.valueAlloc(a, .{ .expected_revision = state.revision, .config = m.types.Config{ .features = .{ .semantic_recall = true }, .models = .{ .embedder = fake_model } } }, .{}), "configure"), .{});
+    // Pending model work keeps the active lexical index serving. Cutover alone
+    // invalidates readiness for the replacement generation.
+    const pending = (try std.json.parseFromSliceLeaky(m.types.State, a, store.values.get("control").?, .{})).pending_config.?;
+    _ = try svc.execute(a, .stage_embeddings, "", try std.json.Stringify.valueAlloc(a, .{ .generation = pending.embedding_generation, .model = fake_model, .items = &.{.{ .id = "helm", .embedding = &[_]f32{ 1, 0 } }} }, .{}), "staged-vector");
+    const active_scans = store.assertion_scans;
+    const active = try std.json.parseFromSliceLeaky(m.types.RecallResult, a, try svc.execute(a, .recall, "", "{\"query\":\"Production\",\"valid_at\":200,\"token_budget\":8192}", ""), .{});
+    try std.testing.expectEqual(@as(usize, 1), active.items.len);
+    try std.testing.expectEqual(active_scans, store.assertion_scans);
+    _ = try svc.execute(a, .advance, configured.id, "{}", "vectors");
+    try IndexedRecallFixture.drain(svc, a, "vector-index");
+    const projections = try Store.scan(&store, a, "assertion-recall/", null, 32);
+    var indexed_vectors: usize = 0;
+    for (projections.rows) |row| {
+        const projection = try std.json.parseFromSliceLeaky(m.types.RecallProjection, a, row.json, .{});
+        if (projection.embedding != null) indexed_vectors += 1;
+    }
+    try std.testing.expect(indexed_vectors > 0);
+    const scans = store.assertion_scans;
+    const recalled = try std.json.parseFromSliceLeaky(m.types.RecallResult, a, try svc.execute(a, .recall, "", "{\"query\":\"unrelated\",\"known_at\":10,\"valid_at\":200,\"token_budget\":8192}", ""), .{});
+    try std.testing.expectEqual(@as(usize, 1), recalled.items.len);
+    try std.testing.expectEqual(.lexical_vector, recalled.retrieval);
+    try std.testing.expectEqual(scans, store.assertion_scans);
+}
+
+test "memory indexed assertion lanes isolate private owners without primary scans" {
+    var store = Store.init();
+    defer store.deinit();
+    const a = store.arena.allocator();
+    const owner = IndexedRecallFixture.service(&store, 10);
+    _ = try owner.execute(a, .create, "", "{}", "create");
+    _ = try owner.execute(a, .observe, "", "{\"evidence\":[{\"id\":\"shared\",\"source_id\":\"s\",\"source_version\":\"1\",\"text\":\"shared facts\",\"visibility\":\"team\"}],\"assertions\":[{\"id\":\"team\",\"subject\":\"s\",\"predicate\":\"fact\",\"value\":\"team\",\"statement\":\"common team\",\"visibility\":\"team\",\"evidence\":[{\"id\":\"shared\"}]},{\"id\":\"alice\",\"subject\":\"s\",\"predicate\":\"fact\",\"value\":\"alice\",\"statement\":\"common alice\",\"evidence\":[{\"id\":\"shared\"}]}]}", "observe");
+    var reader = owner;
+    reader.context.admin = false;
+    reader.context.principal = "bob";
+    _ = try reader.execute(a, .assertions, "", "{\"assertions\":[{\"id\":\"bob\",\"subject\":\"s\",\"predicate\":\"fact\",\"value\":\"bob\",\"statement\":\"common bob\",\"evidence\":[{\"id\":\"shared\"}]}]}", "bob");
+    try IndexedRecallFixture.drain(owner, a, "index");
+    const scans = store.assertion_scans;
+    for ([_][]const u8{ "alice", "bob", "charlie" }) |principal| {
+        reader.context.principal = principal;
+        const result = try std.json.parseFromSliceLeaky(m.types.RecallResult, a, try reader.execute(a, .recall, "", "{\"query\":\"common\",\"token_budget\":8192}", ""), .{});
+        try std.testing.expectEqual(@as(usize, if (std.mem.eql(u8, principal, "charlie")) 1 else 2), result.items.len);
+        for (result.items) |hit| try std.testing.expect(hit.memory.assertion.visibility == .team or std.mem.eql(u8, principal, hit.memory.owner));
+    }
+    try std.testing.expectEqual(scans, store.assertion_scans);
 }

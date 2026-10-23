@@ -59731,15 +59731,19 @@ test "native memory worker budgets slow semantic publication independently from 
     // and cannot invoke the slow provider or roll back its own progress.
     _ = try service.execute(alloc, .assertions, "", "{\"assertions\":[{\"id\":\"description\",\"subject\":\"graph\",\"predicate\":\"p\",\"value\":\"graph\",\"statement\":\"Derived graph description\",\"evidence\":[{\"id\":\"e\"}]}]}", "description");
     _ = try service.execute(alloc, .forget, "", "{\"evidence_ids\":[\"obsolete\"]}", "forget");
+    var saw_recall_maintenance = false;
     for (0..32) |i| {
         state = try Fixture.state(backend, alloc);
-        if (try scheduling.maintenanceKind(backend, alloc, 1, state) != .retention) break;
+        const kind = try scheduling.maintenanceKind(backend, alloc, 1, state);
+        if (kind != .retention and kind != .recall) break;
+        saw_recall_maintenance = saw_recall_maintenance or kind == .recall;
         budget.end = fixture.now + 5 * std.time.ns_per_s;
         const cleanup_end = try budget.beginExecution(backend, alloc, fixture.now, 1, state, null);
         try std.testing.expectEqual(fixture.now + 5 * std.time.ns_per_s, cleanup_end);
         _ = try service.advanceAtRevision(alloc, "", try std.fmt.allocPrint(alloc, "cleanup-{d}", .{i}), state.revision);
         try std.testing.expectEqual(completed_embeddings, fixture.embeddings);
     }
+    try std.testing.expect(saw_recall_maintenance);
     state = try Fixture.state(backend, alloc);
     try std.testing.expectEqual(.semantic, try scheduling.maintenanceKind(backend, alloc, 1, state));
     // The longer budget never extends leadership authority. A lost owner

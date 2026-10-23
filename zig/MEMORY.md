@@ -412,9 +412,16 @@ Bindings are retired with their entity or when discovery is disabled.
 Scheduler version five splits query-role artifacts from names/view ANN documents.
 The owner builds both document and query roles for the same exact text and
 qualified model, outside writer leases and under the existing dependency and
-publication fences. The document role is checkpointed before invoking the query
-role, so a timeout or upgrade never forces a successful document embedding to be
-recomputed. Earlier projections remain unready during a resumable backfill;
+publication fences. Names and the exact rendered view are submitted together in
+a bounded, role-specific provider batch (two document texts, followed by two query texts).
+The shared managed-embedder providers retain their own batch limits, revision
+checks, role instructions and retry behavior. Each entity remains an independent
+authorization/dependency and failure partition; a bad entity cannot pin the other
+entities in the owner quantum. This reduces fresh memory-layer embedding
+submissions from four to two per entity without coalescing unrelated source
+grants; provider limits may split these batches further. The document role
+is checkpointed before invoking the query role, so a timeout or upgrade never
+forces a successful document embedding to be recomputed. Earlier projections remain unready during a resumable backfill;
 valid document vectors and version-four inline query vectors are reused. New ANN documents
 carry only their document-role vector; query-role vectors live in companion
 `entity-semantic-query/` records with the same complete entity, model, generation,
@@ -430,8 +437,14 @@ Self-normalization continues to compare the query role against the document role
 Candidate discovery keeps a request-local rendering map shared by both ANN
 projections and response assembly. A requested entity is rendered at most once
 within that read operation. Lexical/ANN union assembly uses an ID set and typed
-records, avoiding nested JSON decoding and serialize/parse round trips. This
-cache is deliberately separate from inference
+records, avoiding nested JSON decoding and serialize/parse round trips.
+Projection provenance compares typed model, dependency, resource and evidence
+values directly, including nested slices and optional fields. Validation allocates
+no serialized metadata or reconstructed names text; a request-local validation
+map checks each projection once across both discovery and output assembly.
+Identity type, numeric name signatures, visibility and owner partitions, and
+relationship type eligibility run before source-support traversal or rendering.
+This cache is deliberately separate from inference
 capture, maintenance, and final-publication rendering: those paths must replay
 their actual dependency capture and live fences. Policy-row reads memoize decoded
 assertions, evidence, entities, and projections within an operation, replaying
@@ -464,7 +477,7 @@ The fixture exercises real native vector indexes, routed encoding and primary
 hydration with a deterministic provider; it measures bounded retrieval work and
 payload cost separately from model quality.
 
-Debug retrieval qualification for this implementation:
+Previous Debug retrieval qualification, before typed provenance comparisons:
 
 | Seeds | Dimensions | Bounded ANN calls | Full entity scans | Retrieval time |
 | ---: | ---: | ---: | ---: | ---: |
@@ -818,10 +831,55 @@ individual requests at the admitted space budget (at most 4 MiB), dependency
 recursion at 32, and a recall scan at 4096 records. Large structural results must
 be paginated; cursors bind space, principal, resource and space revision and
 reject stale continuation after mutations. Ranked recall reports scan limits
-and budget omissions explicitly. Its native baseline reads primary rows and
-computes lexical/cosine scores under these bounds. It does not claim an indexed
-ANN/BM25 performance result. Antfly index-backed candidate production can replace
-this execution detail without changing policy, history or completeness contracts.
+and budget omissions explicitly.
+
+Ranked assertion recall uses the same native full-text and vector indexes through
+both embedded and routed adapters. A private derived assertion document supplies
+one immutable statement to lexical and vector retrieval, so native fusion deduplicates
+both sources before hydration. Index lanes partition team and private-owner data;
+an administrator selects the all-audience lane, while another principal selects
+only team and its own private lane. The full-text fields belong to their lane,
+so search never builds a partition by scanning primary documents. Vector lanes
+reuse the existing qualified assertion embeddings. They require neither a second
+vector store nor client provider credentials.
+
+The owner builds missing lane indexes and backfills eight assertions per quantum.
+Durable work keys cover new writes before a lane exists; subsequent writes and
+vector publication update projections atomically with their source. A phase-two
+readiness acknowledgement follows the native full-index publication barrier,
+current control/configuration checks, source dependency checks and live admin
+grant revalidation. Denied sources remain timed, fairly paginated readiness debt.
+Recall and entity-semantic maintenance alternate when both are due. Configuration
+cutover retains the active projection generation while preparing the replacement;
+forgetting immediately excludes candidates, independently of physical cleanup.
+
+Ready searches fetch at most 128 ranked identities per page from a bounded
+4,096-candidate window. Only these projections and assertion records are hydrated;
+live policy still checks source authority, retention, lifecycle, temporal filters,
+canonical identities and history before recomputing lexical/cosine scores. Since
+assertion statements are immutable, current search projections also discover
+historical revisions; mutable lifecycle or verdict metadata is never used as
+indexed truth. Continuations bind the query and filters as well as principal,
+space and revision. The final window reports truncation without a continuation
+when the ranked bound is exhausted. Full enumeration and spaces whose initial
+or replacement index is not yet ready retain the bounded primary scan, including
+existing scan continuations. Explicit graph seeds retain indexed adjacency.
+
+The C ABI qualification accepts `ANTFLY_MEMORY_QUALIFY_RECALL_SCALE` (up to
+10,000 additional assertions; routine runs use 128). Its deterministic sparse
+query measures native index searches, hydrated candidates and primary scans
+separately from model quality. It also checks embedded/routed lexical and hybrid
+search parity, immediate forgetting and the native full-index readiness barrier.
+
+Debug qualification of the first sparse lexical query after bulk publication:
+
+| Assertions | Indexed searches | Hydrated candidates | Primary assertion scans | Query time |
+| ---: | ---: | ---: | ---: | ---: |
+| 10,002 | 1 | 1 | 0 | 408.643 ms |
+
+This fixture measures bounded retrieval and hydration on native storage, rather
+than semantic model quality or a production latency percentile.
+
 Lexical recall prepares the query's case-insensitive whole-word vocabulary once
 per request. Per-assertion coverage uses reusable occurrence epochs without
 allocating token copies or another hash set for each hit. Candidate description
