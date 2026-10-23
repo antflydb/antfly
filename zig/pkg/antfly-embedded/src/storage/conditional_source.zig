@@ -22,6 +22,7 @@ const protocol = @import("../api/source_projection.zig");
 const projection = @import("document_projection.zig");
 const revision = @import("document_mutation_revision.zig");
 const identities_mod = @import("source_value_identity.zig");
+const query = @import("db/document_query.zig");
 pub const Result = struct { source: []u8, identities: []u8 };
 pub fn load(a: A, scratch: A, scope: anytype, physical: []const u8, id: []const u8, fields: []const []const u8, prepared: protocol.Prepared) !?Result {
     var repair = false;
@@ -174,37 +175,29 @@ fn selectedFields(scratch: A, fields: []const []const u8, prepared: protocol.Pre
     }
     return selected.items;
 }
-fn finishSource(a: A, scratch: A, fields: []const []const u8, selected: []const []const u8, prepared: protocol.Prepared, plan: Plan, bytes: ?[]const u8) !Result {
-    // Even full-layout fallbacks obey the ordinary exact public mask.
-    var source = if (bytes) |value| (try @import("db/document_query.zig").lookupJson(a, value, .{ .fields = selected, .include_all_fields = false })).json else try a.dupe(u8, "{}");
-    errdefer a.free(source);
-    // Ordinary projection creates proven ancestor objects even when a leaf is
-    // absent or subsequently omitted. Preserve that shape without loading it.
-    const nested_omission = for (prepared.request.fields, plan.omitted[0..prepared.request.fields.len]) |entry, absent| {
-        if (absent and std.mem.indexOfScalar(u8, entry.field, '.') != null) break true;
-    } else false;
-    if (nested_omission) {
-        var value = try std.json.parseFromSliceLeaky(std.json.Value, scratch, source, .{});
-        for (prepared.request.fields, plan.omitted[0..prepared.request.fields.len]) |entry, absent| {
-            if (!absent) continue;
-            var parent = &value;
-            var start: usize = 0;
-            while (std.mem.indexOfScalarPos(u8, entry.field, start, '.')) |dot| {
-                const ancestor = plan.directory.resolve(entry.field[0..dot]) orelse break;
-                if (ancestor.kind != .object) break;
-                const name = entry.field[start..dot];
-                if (parent.* != .object) return error.InvalidDocumentContentAuthority;
-                const slot = try parent.object.getOrPut(scratch, name);
-                if (!slot.found_existing) slot.value_ptr.* = .{ .object = .empty };
-                parent = slot.value_ptr;
-                start = dot + 1;
-            }
+fn finishSource(a: A, scratch: A, projection_plan: *const query.SpanProjectionPlan, prepared: protocol.Prepared, plan: Plan, bytes: ?[]const u8) !Result {
+    var omissions: [64]query.Omission = undefined;
+    var count: usize = 0;
+    for (prepared.request.fields, plan.omitted[0..prepared.request.fields.len]) |entry, absent| {
+        if (!absent) continue;
+        var parts: std.ArrayList([]const u8) = .empty;
+        var tokens = std.mem.splitScalar(u8, entry.field, '.');
+        while (tokens.next()) |part| try parts.append(scratch, part);
+        var objects: usize = 0;
+        var offset: usize = 0;
+        while (std.mem.indexOfScalarPos(u8, entry.field, offset, '.')) |dot| {
+            const ancestor = plan.directory.resolve(entry.field[0..dot]) orelse break;
+            if (ancestor.kind != .object) break;
+            objects += 1;
+            offset = dot + 1;
         }
-        const projected = try @import("db/document_query.zig").projectLookupValue(scratch, value, .{ .fields = fields, .include_all_fields = false });
-        const encoded = try std.json.Stringify.valueAlloc(a, projected, .{});
-        a.free(source);
-        source = encoded;
+        omissions[count] = .{ .parts = parts.items, .objects = objects };
+        count += 1;
     }
+    // One span projection restores proven ancestor shape in selection order.
+    // Large retained leaves stay borrowed through omission reconstruction.
+    const source = (try query.lookupJsonWithPlanOmissions(scratch, a, bytes orelse "{}", projection_plan, omissions[0..count])).json;
+    errdefer a.free(source);
     return .{ .source = source, .identities = try std.json.Stringify.valueAlloc(a, plan.identities, .{ .emit_null_optional_fields = false }) };
 }
 
@@ -213,14 +206,16 @@ pub fn loadPrepared(a: A, scratch: A, scope: anytype, physical: []const u8, id: 
     repair.* = authority.repair;
     const plan = (try planSource(scratch, id, prepared, authority)) orelse return null;
     const selected = try selectedFields(scratch, fields, prepared, plan);
-    if (selected.len == 0) return try finishSource(a, scratch, fields, selected, prepared, plan, null);
-    const rows = try logical.loadPrepared(a, scratch, scope, &.{physical}, &.{id}, selected, &.{authority.source});
+    var projection_plan = (try query.SpanProjectionPlan.init(scratch, .{ .fields = fields, .include_all_fields = false })).?;
+    defer projection_plan.deinit();
+    if (selected.len == 0) return try finishSource(a, scratch, &projection_plan, prepared, plan, null);
+    const rows = try logical.loadPreparedBorrowed(scratch, scratch, scope, &.{physical}, &.{id}, selected, &.{authority.source});
     defer {
-        for (rows) |row| if (row.bytes) |bytes| a.free(bytes);
-        a.free(rows);
+        for (rows) |row| row.deinit(scratch);
+        scratch.free(rows);
     }
     const bytes = rows[0].bytes orelse return null;
-    return try finishSource(a, scratch, fields, selected, prepared, plan, bytes);
+    return try finishSource(a, scratch, &projection_plan, prepared, plan, bytes);
 }
 /// Bound additional materialized input independently of document count. Large
 /// full-value rows progress alone; small projected metadata can share a batch.
@@ -273,6 +268,8 @@ pub fn loadPreparedWindow(a: A, scratch: A, txn: anytype, physical: []const []co
         if (check) |guard| try guard.run(guard.ctx);
         return result;
     }
+    var projection_plan = (try query.SpanProjectionPlan.init(scratch, .{ .fields = fields, .include_all_fields = false })).?;
+    defer projection_plan.deinit();
     var plans: [64]?Plan = @splat(null);
     var order: [64]usize = undefined;
     var count: usize = 0;
@@ -320,16 +317,16 @@ pub fn loadPreparedWindow(a: A, scratch: A, txn: anytype, physical: []const []co
             names[i] = ids[index];
             known[i] = authorities[index].source;
         }
-        const rows = if (selected.len != 0) try logical.loadPrepared(a, temp, &scope, keys[0 .. end - start], names[0 .. end - start], selected, known[0 .. end - start]) else null;
+        const rows = if (selected.len != 0) try logical.loadPreparedBorrowed(temp, temp, &scope, keys[0 .. end - start], names[0 .. end - start], selected, known[0 .. end - start]) else null;
         defer if (rows) |loaded| {
-            for (loaded) |row| if (row.bytes) |bytes| a.free(bytes);
-            a.free(loaded);
+            for (loaded) |row| row.deinit(temp);
+            temp.free(loaded);
         };
         for (order[start..end], 0..) |index, i| {
             if (check) |guard| try guard.run(guard.ctx);
             if (!row_arena.reset(.{ .retain_with_limit = 256 * 1024 })) _ = row_arena.reset(.free_all);
             const bytes = if (rows) |loaded| loaded[i].bytes orelse continue else null;
-            result[index] = try finishSource(a, row_arena.allocator(), fields, selected, prepared, plans[index].?, bytes);
+            result[index] = try finishSource(a, row_arena.allocator(), &projection_plan, prepared, plans[index].?, bytes);
         }
         start = end;
     }
@@ -731,4 +728,11 @@ test "logical value conditional unique row window coalesces real metadata reads"
     };
     for (conservative) |entry| try std.testing.expect(std.mem.indexOf(u8, entry.?.identities, "unchanged") != null);
     try std.testing.expectEqual(if (native_ranges) @as(usize, 6) else 10, counted.range_calls);
+    // Output arenas cannot reclaim an earlier temporary row after subsequent
+    // result allocations. Even full-primary adapters must retain output only.
+    var result_arena = std.heap.ArenaAllocator.init(a);
+    defer result_arena.deinit();
+    const bounded = try loadPreparedWindow(result_arena.allocator(), temp, &factory, &keys, &ids, &.{ "image", "revision" }, prepared, window.rows[0..keys.len], &repairs, null);
+    for (bounded) |entry| try std.testing.expect(std.mem.indexOf(u8, entry.?.identities, "unchanged") != null);
+    try std.testing.expect(result_arena.queryCapacity() < 128 * 1024);
 }

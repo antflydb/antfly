@@ -115,10 +115,31 @@ pub fn lookupJsonWithSources(alloc: Allocator, output: Allocator, raw: []const u
     return lookupJsonWithSourcesPolicy(alloc, output, raw, plan, sources, false);
 }
 pub fn lookupJsonWithSourcesPolicy(alloc: Allocator, output: Allocator, raw: []const u8, plan: *const SpanProjectionPlan, sources: []const ProjectionSource, exact: bool) !types.LookupResult {
-    return lookupJsonDestination(alloc, output, raw, plan, sources, exact, null);
+    return lookupJsonDestination(alloc, output, raw, plan, sources, exact, null, false, &.{});
 }
 pub fn writeLookupFields(alloc: Allocator, writer: *std.Io.Writer, raw: []const u8, plan: *const SpanProjectionPlan) !void {
-    _ = try lookupJsonDestination(alloc, alloc, raw, plan, &.{}, false, writer);
+    _ = try lookupJsonDestination(alloc, alloc, raw, plan, &.{}, false, writer, false, &.{});
+}
+pub const Omission = struct {
+    parts: []const []const u8,
+    // Number of leading path components proven to be stored object ancestors.
+    objects: usize,
+};
+pub fn lookupJsonWithOmissions(scratch: Allocator, output: Allocator, raw: []const u8, fields: []const []const u8, omissions: []const Omission) !types.LookupResult {
+    var plan = (try SpanProjectionPlan.init(scratch, .{ .fields = fields, .include_all_fields = false })).?;
+    defer plan.deinit();
+    return lookupJsonWithPlanOmissions(scratch, output, raw, &plan, omissions);
+}
+pub fn lookupJsonWithPlanOmissions(scratch: Allocator, output: Allocator, raw: []const u8, plan: *const SpanProjectionPlan, omissions: []const Omission) !types.LookupResult {
+    if (omissions.len != 0 and (plan.passthrough or plan.include_all)) return error.InvalidProjectedDocumentJson;
+    for (omissions) |omission| if (omission.parts.len == 0 or omission.objects >= omission.parts.len) return error.InvalidProjectedDocumentJson;
+    return lookupJsonDestination(scratch, output, raw, plan, &.{}, false, null, false, omissions);
+}
+/// Strictly validate and stream a complete projected object. No encoded
+/// intermediate or value-sized DOM survives the call; number normalization,
+/// duplicate-key rejection and projection semantics match ordinary lookup.
+pub fn writeLookupObject(alloc: Allocator, writer: *std.Io.Writer, raw: []const u8, plan: *const SpanProjectionPlan) !void {
+    _ = try lookupJsonDestination(alloc, alloc, raw, plan, &.{}, false, writer, true, &.{});
 }
 /// Stream an admitted stored/projected object without retaining a second body.
 /// Keep the legacy number-normalization boundary when a literal _id forced a
@@ -166,9 +187,9 @@ fn writePassthroughFields(alloc: Allocator, writer: *std.Io.Writer, raw: []const
     if (try scanner.next() != .end_of_document) return error.SyntaxError;
     return true;
 }
-fn lookupJsonDestination(alloc: Allocator, output: Allocator, raw: []const u8, plan: *const SpanProjectionPlan, sources: []const ProjectionSource, exact: bool, writer: ?*std.Io.Writer) !types.LookupResult {
+fn lookupJsonDestination(alloc: Allocator, output: Allocator, raw: []const u8, plan: *const SpanProjectionPlan, sources: []const ProjectionSource, exact: bool, writer: ?*std.Io.Writer, complete_object: bool, omissions: []const Omission) !types.LookupResult {
     if (writer == null and plan.passthrough and sources.len == 0) return .{ .json = try output.dupe(u8, raw) };
-    if (writer != null and plan.passthrough and sources.len == 0 and try writePassthroughFields(alloc, writer.?, raw)) return .{ .json = @constCast("") };
+    if (!complete_object and writer != null and plan.passthrough and sources.len == 0 and try writePassthroughFields(alloc, writer.?, raw)) return .{ .json = @constCast("") };
     var arena = std.heap.ArenaAllocator.init(@import("antfly_platform").allocator.reclaimingScratch(alloc));
     defer arena.deinit();
     const a = arena.allocator();
@@ -187,9 +208,21 @@ fn lookupJsonDestination(alloc: Allocator, output: Allocator, raw: []const u8, p
     var projected: Projection.Object = .empty;
     if (plan.include_all or plan.passthrough) {
         try Projection.includePreparedRootExcept(&projection_owner, &projected, &view, plan.excluded);
-    } else for (plan.paths) |path| try Projection.includeRoot(&projection_owner, &projected, &view, path);
+    } else for (plan.paths) |path| {
+        const omitted: ?Omission = for (omissions) |omission| {
+            if (omission.parts.len != path.parts.len) continue;
+            for (omission.parts, path.parts) |left, right| {
+                if (!std.mem.eql(u8, left, right)) break;
+            } else break omission;
+        } else null;
+        if (omitted) |omission| {
+            var root: Projection = .{ .object = projected };
+            try root.ensureObjectPath(a, omission.parts[0..omission.objects]);
+            projected = root.object;
+        } else try Projection.includeRoot(&projection_owner, &projected, &view, path);
+    }
     if (writer) |sink| {
-        try (Projection{ .object = projected }).writeFieldsTo(a, sink);
+        if (complete_object) try (Projection{ .object = projected }).writeTo(a, sink) else try (Projection{ .object = projected }).writeFieldsTo(a, sink);
         return .{ .json = @constCast("") };
     }
     return .{ .json = try (Projection{ .object = projected }).serializeWithPolicy(a, output, exact) };

@@ -502,6 +502,56 @@ is still recycled independently. This is request-local work reuse, not an author
 or cross-request snapshot cache. Unsupported parent masks bypass preparation;
 small/opaque/stale cases retain ordinary source delivery.
 
+Temporary reconstructed rows belong to each subwindow's reclaimable arena,
+including when the caller uses an arena for retained results. Full-layout rows
+borrow their final pinned read scope until projection finishes; reconstructed
+range results remain owned scratch. The ordinary owned-read API is unchanged.
+Only final source
+and identity bytes belong to the result allocator. The selector is compiled once
+per window; omission reconstruction uses small object overlays over borrowed
+spans, preserving proven ancestor objects and public field order without decoding
+retained payloads. The public wire encoder streams these sources through the same
+strict projection engine, removing private fields and rejecting duplicate keys.
+It does not construct an intermediate source DOM or encoded source copy.
+Strict preparation publishes a syntax receipt bounded to the immutable source
+extent. Emission can copy strings already spelled exactly as the default JSON
+encoder would produce, including canonical control escapes. Noncanonical Unicode,
+slash and control escapes retain decoding/normalization, as do numbers. This
+receipt never skips object-key checks or authorizes bytes from another source;
+foreign extents and unqualified input use the ordinary scanner. Source-derived
+hierarchy/mention metadata still receives the complete hit when main `_source`
+conversion is deferred to the span writer.
+
+Primary rewrites may reuse canonical leaf certificates from the same writer
+snapshot. The previous content proof must match the current mutation revision;
+its directory and certificate must pass length, kind, digest and canonical ABI
+checks. Layouts without a qualified scalar leaf of at least 4 KiB retain the
+fused reference writer. Reuse requires matching decoded ancestry/name, leaf kind, raw length and
+raw SHA-256 digest. Packed indices and offsets are never sufficient. Added,
+reordered, renamed or moved siblings cannot misassociate records. Repeated writes
+in one transaction use its latest publication. Missing/stale/incompatible proofs
+rebuild through the reference canonicalizer; unordered bulk imports keep the
+reference writer path. The new body, directory, certificate and revision are
+published atomically. No previous primary body is loaded to qualify reuse.
+
+This optimization avoids re-decoding and canonical hashing of unchanged leaves;
+it still validates/hashes the incoming JSON and rewrites the primary row. Removing
+that write amplification requires a separate versioned storage representation:
+immutable content-addressed large values, small mutable row manifests, atomic
+manifest/authority publication, snapshot-aware blob ownership and reclamation,
+replication/backup/export support, and logical full/range reads that reconstruct
+the existing public JSON. A digest must never act as a read grant: current row
+membership, revision and authorization remain mandatory. Such a representation
+must be gated by mixed-version/rollback tests and metadata-update WAL/compaction
+measurements before activation. A new content-authority version must bind the
+manifest and its leaf digests; a manifest/Merkle digest cannot be interpreted as
+the legacy SHA-256 of reconstructed primary JSON. Public `sv1` identities remain
+canonical-value identities across either representation. Blob ownership belongs
+to the table and pinned storage cut, with publication and reclamation fenced by
+the same writer transaction and retained snapshots. Failed commits, leader
+changes, export/import and crash recovery must preserve those ownership facts. The current format remains full primary JSON;
+certificate reuse alone makes no claim about avoiding its disk writes.
+
 A current certificate permits unchanged leaves to be omitted without loading or
 hashing those payloads. Current permissions, revision, query membership and
 publication fences still apply. Missing, stale, unsupported or ABI-incompatible
@@ -525,6 +575,16 @@ round trips. This probe is only a planning hint; actual score use rechecks expir
 after fresh authorization and identity verification. The request retains the
 exact verified descriptors it sends, so later cache eviction does not require
 reopening them. Expired/evicted scores still force ordinary materialization.
+Image constructors retain an immutable URL extent proven to contain only the
+supported data-URL prefix and validated base64 alphabet. Exact evidence sizing
+counts escaped text/framing and adds the known URL length without rescanning the
+payload. Request encoders emit owned framing plus borrowed qualified URL segments
+through HTTPx's existing H1/H2 transport. URLs below 4 KiB remain in contiguous
+framing to avoid extra frames/syscalls for tiny inputs. Replacing a URL invalidates its extent
+proof; unqualified strings retain ordinary escaping. Inputs stay pinned through
+completion/cancellation/retries, and the original request-size, concurrency and
+response limits still apply. The local inference ABI receives a contiguous body.
+
 Descriptors never enter provider requests: an explicit materialization guard
 runs before coalescing and dispatch. Conditional fallback retains ordinary
 source/request budgets and avoids charging the same logical image twice.

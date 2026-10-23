@@ -361,6 +361,29 @@ pub const Output = union(enum) {
         return .{ .map = &self.object };
     }
 
+    /// Restore proven object ancestors without copying their retained leaves.
+    /// A borrowed object acquires only a small overlay of missing children.
+    pub fn ensureObjectPath(self: *Output, a: Allocator, parts: []const []const u8) !void {
+        var current = self;
+        for (parts) |name| {
+            try current.requireObject();
+            const target = try current.objectTarget(a);
+            if (!target.map.contains(name)) {
+                const inherited = if (target.base) |base| try base.field(a, name) else null;
+                try put(a, target.map, name, if (inherited) |value| .{ .borrowed = value } else .{ .object = .empty });
+            }
+            current = target.map.getPtr(name).?;
+        }
+        try current.requireObject();
+    }
+    fn requireObject(self: Output) !void {
+        switch (self) {
+            .object, .overlay => {},
+            .borrowed => |source| if (source.kind() != '{') return error.InvalidProjectedDocumentJson,
+            else => return error.InvalidProjectedDocumentJson,
+        }
+    }
+
     fn put(a: Allocator, object: *Object, name: []const u8, value: Output) !void {
         if (object.getPtr(name)) |previous| {
             previous.retire();
@@ -618,7 +641,7 @@ pub const Output = union(enum) {
                 .sql_array => |source_array| try source_array.cell.writeArray(context.work, writer, source_array.part, context.measuring),
                 .native => |cell| try cell.writeMode(context.work, writer, context.measuring),
                 .embedding_stream => |stream| try stream.write(writer),
-                .span => |s| if (s.view.canCopyCanonical(s.node.raw)) try writer.writeAll(s.node.raw) else try context.writeSpan(writer, s.node.raw, s.view.parse_numbers),
+                .span => |s| if (s.view.canCopyCanonical(s.node.raw)) try writer.writeAll(s.node.raw) else try context.writeSpanValidated(writer, s.node.raw, s.view.parse_numbers, s.view.validated_ranges),
                 .logical => |v| try std.json.Stringify.value(v.*, .{}, writer),
                 .component => |v| try std.json.Stringify.value(@as(f64, v), .{}, writer),
                 .vector => |v| try writeVector(writer, v),
@@ -761,7 +784,7 @@ pub const Output = union(enum) {
                         if (count != 0) try writer.writeByte(',');
                         try std.json.Stringify.value(name, .{}, writer);
                         try writer.writeByte(':');
-                        try context.writeValue(writer, &scanner, span.node.raw.len, span.view.parse_numbers);
+                        try context.writeValue(writer, &scanner, span.node.raw.len, span.view.parse_numbers, span.view.validated_ranges);
                         count += 1;
                     }
                 }
@@ -803,11 +826,14 @@ const StreamContext = struct {
         self.scanners.deinit();
     }
     fn writeSpan(self: *StreamContext, writer: *std.Io.Writer, raw: []const u8, parse_numbers: bool) !void {
+        return self.writeSpanValidated(writer, raw, parse_numbers, null);
+    }
+    fn writeSpanValidated(self: *StreamContext, writer: *std.Io.Writer, raw: []const u8, parse_numbers: bool, proof: ?*const View.ValidatedRanges.Ref) !void {
         try resetScratch(&self.scanners);
         var scanner = std.json.Scanner.initCompleteInput(self.scanners.allocator(), raw);
         defer scanner.deinit();
         errdefer self.keys.deinit();
-        try self.writeValue(writer, &scanner, raw.len, parse_numbers);
+        try self.writeValue(writer, &scanner, raw.len, parse_numbers, proof);
         if (try scanner.next() != .end_of_document) return error.SyntaxError;
     }
     /// The scanner owns escape and surrogate validation. Coalesce its decoded
@@ -844,7 +870,7 @@ const StreamContext = struct {
         @memcpy(buffer[used.*..][0..chunk.len], chunk);
         used.* += chunk.len;
     }
-    fn writeValue(self: *StreamContext, writer: *std.Io.Writer, scanner: *std.json.Scanner, max_len: usize, parse_numbers: bool) !void {
+    fn writeValue(self: *StreamContext, writer: *std.Io.Writer, scanner: *std.json.Scanner, max_len: usize, parse_numbers: bool, proof: ?*const View.ValidatedRanges.Ref) !void {
         errdefer self.keys.deinit();
         var root_seen = false;
         // Reuse arenas across siblings, but keep each live ancestor's duplicate
@@ -904,7 +930,10 @@ const StreamContext = struct {
                     try self.keys.enter(depth, .{ .object = token == .object_begin });
                     depth += 1;
                 },
-                .string, .allocated_string => |s| if (string_value) try writeString(writer, scanner) else try std.json.Stringify.value(s, .{}, writer),
+                .string, .allocated_string => |s| if (string_value) {
+                    const copied = if (proof) |validated| try validated.copyCanonicalString(scanner, writer) else false;
+                    if (!copied) try writeString(writer, scanner);
+                } else try std.json.Stringify.value(s, .{}, writer),
                 .number, .allocated_number => |s| try std.json.Stringify.value(if (parse_numbers) Value.parseFromNumberSlice(s) else Value{ .number_string = s }, .{}, writer),
                 .true => try writer.writeAll("true"),
                 .false => try writer.writeAll("false"),
@@ -1946,4 +1975,87 @@ test "public graph metric borrowed wire canonical span reuse respects source bou
     var foreign: View.Node = .{ .raw = "[0,}" };
     try std.testing.expect(!view.canCopyCanonical(foreign.raw));
     try std.testing.expectError(error.SyntaxError, (Output{ .borrowed = .{ .span = .{ .view = &view, .node = &foreign } } }).serializeWithPolicy(a, a, true));
+}
+
+test "logical value conditional validated canonical strings preserve normalization and scope" {
+    const a = std.testing.allocator;
+    const query = @import("../document_query.zig");
+    const Ranges = View.ValidatedRanges;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const temp = arena.allocator();
+    const plain = try temp.alloc(u8, 4096);
+    @memset(plain, 'x');
+    var controls: std.Io.Writer.Allocating = .init(temp);
+    defer controls.deinit();
+    for (0..32) |_| {
+        for (0..128) |c| try controls.writer.writeByte(@intCast(c));
+        try controls.writer.writeAll("café λ 🚀 \u{2028}");
+    }
+    const canonical_plain = try std.json.Stringify.valueAlloc(temp, plain, .{});
+    const canonical_controls = try std.json.Stringify.valueAlloc(temp, controls.written(), .{});
+    const noncanonical = try std.fmt.allocPrint(temp, "\"{s}\\u0061\\u000A\\/\\uD834\\uDD1E\"", .{plain});
+    for ([_][]const u8{ canonical_plain, canonical_controls, noncanonical }, 0..) |encoded, index| {
+        // Publish only after actual strict JSON validation, just like View.
+        var parsed = try std.json.parseFromSlice(Value, a, encoded, .{});
+        defer parsed.deinit();
+        var ranges = Ranges.init(a);
+        defer ranges.deinit();
+        try ranges.remember(encoded);
+        const proof = ranges.validated(encoded, true).?;
+        var scanner = std.json.Scanner.initCompleteInput(a, encoded);
+        defer scanner.deinit();
+        try std.testing.expectEqual(.string, try scanner.peekNextTokenType());
+        var output: std.Io.Writer.Allocating = .init(a);
+        defer output.deinit();
+        const start = scanner.cursor;
+        const copied = try proof.copyCanonicalString(&scanner, &output.writer);
+        try std.testing.expectEqual(index < 2, copied);
+        if (copied) {
+            try std.testing.expectEqualStrings(encoded, output.written());
+            try std.testing.expectEqual(.end_of_document, try scanner.next());
+        } else {
+            try std.testing.expectEqual(start, scanner.cursor);
+            try std.testing.expectEqual(@as(usize, 0), output.written().len);
+        }
+        const foreign = try temp.dupe(u8, encoded);
+        var other = std.json.Scanner.initCompleteInput(a, foreign);
+        defer other.deinit();
+        _ = try other.peekNextTokenType();
+        try std.testing.expect(!try proof.copyCanonicalString(&other, &output.writer));
+
+        const raw = try std.fmt.allocPrint(temp, "{{\"payload\":{{\"s\":{s}}},\"number\":1.0000}}", .{encoded});
+        const options: @import("../types.zig").LookupOptions = .{ .fields = &.{"*"}, .include_all_fields = false };
+        // Ordinary object projection has no fanout extents. Its complete-input
+        // receipt must still be published, or the large-string path stays idle.
+        var object_ranges = Ranges.init(a);
+        defer object_ranges.deinit();
+        var view = View.init(temp, raw);
+        var selector: plan_mod.Selector = .{};
+        try view.prepareProjectionWithOptions(&selector, .all, .object_only, .{ .retain_root_fields = true, .ranges = &object_ranges });
+        try std.testing.expectEqual(@as(usize, 0), object_ranges.entries.len);
+        const receipt = view.validated_ranges orelse return error.MissingSyntaxReceipt;
+        const payload = (try view.field(&view.root, "payload")).?;
+        const node = (try view.field(payload, "s")).?;
+        var nested = std.json.Scanner.initCompleteInput(a, node.raw);
+        defer nested.deinit();
+        _ = try nested.peekNextTokenType();
+        var nested_output: std.Io.Writer.Allocating = .init(a);
+        defer nested_output.deinit();
+        try std.testing.expectEqual(index < 2, try receipt.copyCanonicalString(&nested, &nested_output.writer));
+        const expected = try query.lookupJson(a, raw, options);
+        defer a.free(expected.json);
+        const actual = try query.lookupJsonWithOutput(a, a, raw, options);
+        defer a.free(actual.json);
+        try std.testing.expectEqualStrings(expected.json, actual.json);
+        var plan = (try query.SpanProjectionPlan.init(a, options)).?;
+        defer plan.deinit();
+        var wire: std.Io.Writer.Allocating = .init(a);
+        defer wire.deinit();
+        try query.writeLookupObject(a, &wire.writer, raw, &plan);
+        try std.testing.expectEqualStrings(expected.json, wire.written());
+    }
+    // A canonical payload cannot hide a later duplicate key from validation.
+    const duplicate = try std.fmt.allocPrint(temp, "{{\"s\":{s},\"s\":0}}", .{canonical_plain});
+    try std.testing.expectError(error.DuplicateField, query.lookupJsonWithOutput(a, a, duplicate, .{ .fields = &.{"*"}, .include_all_fields = false }));
 }

@@ -17,6 +17,7 @@ const std = @import("std");
 const httpx = @import("httpx");
 const Options = @import("options.zig").Options;
 const Allocator = std.mem.Allocator;
+const minimum_borrowed_url_bytes = 4096;
 
 /// Context is borrowed once per region, rather than copied for each target.
 /// Common Decisions inputs and Antfly batch inputs share the same text encoding.
@@ -65,6 +66,9 @@ pub const Input = struct {
         try json.endObject();
     }
     pub fn writeEvidence(self: Input, json: *std.json.Stringify) !void {
+        return self.writeEvidenceSized(json, false);
+    }
+    fn writeEvidenceSized(self: Input, json: *std.json.Stringify, omit_safe_url: bool) !void {
         const image = self.image orelse return self.writeText(json);
         try json.beginArray();
         try json.beginObject();
@@ -78,7 +82,17 @@ pub const Input = struct {
         try json.objectField("text");
         try self.writeText(json);
         try json.endObject();
-        try json.write(.{ .type = "input_image", .image_url = image.data_url, .detail = "auto" });
+        if (image.data_url.len >= minimum_borrowed_url_bytes and image.hasJsonSafeUrl()) {
+            const Url = struct {
+                image: @import("antfly_source_evidence").Image,
+                omit: bool,
+                pub fn jsonStringify(url: @This(), stream: *std.json.Stringify) !void {
+                    if (url.omit) return stream.write("");
+                    return url.image.writeDataUrl(stream);
+                }
+            };
+            try json.write(.{ .type = "input_image", .image_url = Url{ .image = image, .omit = omit_safe_url }, .detail = "auto" });
+        } else try json.write(.{ .type = "input_image", .image_url = image.data_url, .detail = "auto" });
         try json.endArray();
         try json.endObject();
         try json.endArray();
@@ -88,8 +102,12 @@ pub const Input = struct {
         var buffer: [512]u8 = undefined;
         var counter: std.Io.Writer.Discarding = .init(&buffer);
         var json: std.json.Stringify = .{ .writer = &counter.writer };
-        try self.writeEvidence(&json);
-        return std.math.cast(usize, counter.fullCount()) orelse error.DecisionLimitExceeded;
+        // Count framing and escaped text exactly, but never walk a validated
+        // base64 payload merely to count bytes we already know are JSON-safe.
+        try self.writeEvidenceSized(&json, true);
+        const framing = std.math.cast(usize, counter.fullCount()) orelse return error.DecisionLimitExceeded;
+        const payload = if (self.image) |image| if (image.data_url.len >= minimum_borrowed_url_bytes and image.hasJsonSafeUrl()) image.data_url.len else 0 else 0;
+        return std.math.add(usize, framing, payload) catch error.DecisionLimitExceeded;
     }
     fn writeText(self: Input, json: *std.json.Stringify) !void {
         try json.beginWriteRaw();
@@ -854,11 +872,35 @@ pub const Client = struct {
         // entire expanded request (including JSON escaping and shared state).
         var body_budget = @import("antfly_regex").Budget{ .backing = self.a, .limit = 32 * 1024 * 1024 };
         const body_a = body_budget.allocator();
-        const body = (if (self.options.backend != .local and self.options.decision_transport == .single) singleBody(body_a, inputs, questions, self.options.model.?) else if (self.options.decision_context == .shared_v1) sharedBody(body_a, inputs, questions, self.options.model.?) else std.json.Stringify.valueAlloc(body_a, .{ .model = self.options.model.?, .inputs = inputs, .questions = questions }, .{})) catch |err| {
-            return if (body_budget.denied) error.DecisionRequestTooLarge else err;
+        var plain: std.Io.Writer.Allocating = .init(body_a);
+        defer plain.deinit();
+        var segmented: ?*SegmentedBody = null;
+        defer if (segmented) |value| {
+            value.deinit();
+            body_a.destroy(value);
         };
-        defer body_a.free(body);
-        if (body.len > 16 * 1024 * 1024) return error.DecisionRequestTooLarge;
+        var body: ?[]u8 = null;
+        defer if (body) |bytes| body_a.free(bytes);
+        if (self.options.backend != .local and SegmentedBody.borrowable(inputs)) {
+            const value = body_a.create(SegmentedBody) catch |err| return if (body_budget.denied) error.DecisionRequestTooLarge else err;
+            value.* = SegmentedBody.init(body_a, inputs);
+            segmented = value;
+        }
+        const writer = if (segmented) |value| value.jsonWriter() else &plain.writer;
+        (if (self.options.backend != .local and self.options.decision_transport == .single)
+            singleBody(inputs, questions, self.options.model.?, writer)
+        else if (self.options.decision_context == .shared_v1)
+            sharedBody(body_a, inputs, questions, self.options.model.?, writer)
+        else
+            std.json.Stringify.value(.{ .model = self.options.model.?, .inputs = inputs, .questions = questions }, .{}, writer)) catch |err| {
+            const failure = if (segmented) |value| value.failure else null;
+            return if (body_budget.denied) error.DecisionRequestTooLarge else failure orelse (if (err == error.WriteFailed) error.OutOfMemory else err);
+        };
+        if (segmented) |value| {
+            value.finish() catch |err| return if (body_budget.denied) error.DecisionRequestTooLarge else err;
+        } else body = plain.toOwnedSlice() catch |err| return if (body_budget.denied) error.DecisionRequestTooLarge else err;
+        const body_length = if (segmented) |value| value.length else body.?.len;
+        if (body_length > 16 * 1024 * 1024) return error.DecisionRequestTooLarge;
 
         const auth = if (self.options.token) |token| try std.fmt.allocPrint(self.a, "Bearer {s}", .{token}) else null;
         defer if (auth) |h| self.a.free(h);
@@ -870,8 +912,8 @@ pub const Client = struct {
         if (self.options.backend == .local) {
             try self.ensureLocal();
             const provider = self.shared_local orelse self.local.?;
-            self.recordRequest(body.len, inputs.len);
-            const response = try provider.decide(self.a, body);
+            self.recordRequest(body_length, inputs.len);
+            const response = try provider.decide(self.a, body.?);
             defer self.a.free(response);
             const parsed = try std.json.parseFromSlice(std.json.Value, self.a, response, .{ .duplicate_field_behavior = .@"error" });
             defer parsed.deinit();
@@ -879,9 +921,10 @@ pub const Client = struct {
             try parseQuestions(parsed.value, inputs, probabilities, names);
             return;
         }
-        self.recordRequest(body.len, inputs.len);
+        self.recordRequest(body_length, inputs.len);
         var response = try (self.shared_http orelse &self.http).post(self.options.endpoint, .{
             .borrowed_body = body,
+            .borrowed_body_segments = if (segmented) |value| value.segments.items else null,
             .headers = headers,
             .timeout_ms = self.options.timeout_ms,
             .max_response_size = 4 * 1024 * 1024,
@@ -1042,9 +1085,113 @@ pub const Coalescer = struct {
         }
     }
 };
+/// One bounded framing buffer per borrowed image span. HTTPx preserves these
+/// slices through H1/H2 retries; the caller pins immutable inputs until return.
+/// Unqualified strings use ordinary JSON escaping and owned framing bytes.
+const SegmentedBody = struct {
+    a: Allocator,
+    inputs: []const Input,
+    borrow_payloads: bool,
+    metadata: std.Io.Writer.Allocating,
+    segments: std.ArrayList([]const u8) = .empty,
+    owned: std.ArrayList([]u8) = .empty,
+    length: usize = 0,
+    failure: ?anyerror = null,
+    buffer: [4096]u8 = undefined,
+    writer: std.Io.Writer = .{ .vtable = &.{ .drain = drain }, .buffer = &.{} },
+    fn borrowable(inputs: []const Input) bool {
+        return for (inputs) |input| {
+            if (input.image) |image| if (image.data_url.len >= minimum_borrowed_url_bytes and image.hasJsonSafeUrl()) break true;
+        } else false;
+    }
+    fn init(a: Allocator, inputs: []const Input) SegmentedBody {
+        return .{ .a = a, .inputs = inputs, .metadata = .init(a), .borrow_payloads = borrowable(inputs) };
+    }
+    fn jsonWriter(self: *SegmentedBody) *std.Io.Writer {
+        // Preserve the ordinary allocating encoder and HTTP body for small
+        // images/text: no custom drains, segmentation or payload-size walks.
+        if (!self.borrow_payloads) return &self.metadata.writer;
+        // Attach only after the returned body has reached its final address.
+        // Tiny framing writes amortize one drain, while large URL writes bypass
+        // the fixed buffer intact and preserve their borrowable extent.
+        if (self.writer.buffer.len == 0) self.writer.buffer = &self.buffer;
+        return &self.writer;
+    }
+    fn deinit(self: *SegmentedBody) void {
+        self.metadata.deinit();
+        for (self.owned.items) |bytes| self.a.free(bytes);
+        self.owned.deinit(self.a);
+        self.segments.deinit(self.a);
+    }
+    fn flushMetadata(self: *SegmentedBody) !void {
+        if (self.metadata.written().len == 0) return;
+        const bytes = try self.metadata.toOwnedSlice();
+        errdefer self.a.free(bytes);
+        try self.segments.ensureUnusedCapacity(self.a, 1);
+        try self.owned.append(self.a, bytes);
+        self.segments.appendAssumeCapacity(bytes);
+    }
+    fn append(self: *SegmentedBody, bytes: []const u8) !void {
+        const length = std.math.add(usize, self.length, bytes.len) catch return error.DecisionRequestTooLarge;
+        if (length > 16 * 1024 * 1024) return error.DecisionRequestTooLarge;
+        // Pointer/extent qualification is constant-time; never rescan payloads.
+        const borrowed = bytes.len >= minimum_borrowed_url_bytes and for (self.inputs) |input| {
+            if (input.image) |image| if (image.hasJsonSafeUrl() and image.data_url.ptr == bytes.ptr and image.data_url.len == bytes.len) break true;
+        } else false;
+        if (borrowed) {
+            try self.flushMetadata();
+            try self.segments.append(self.a, bytes);
+        } else self.metadata.writer.writeAll(bytes) catch return error.OutOfMemory;
+        self.length = length;
+    }
+    fn finish(self: *SegmentedBody) !void {
+        if (self.borrow_payloads) {
+            self.writer.flush() catch |err| return self.failure orelse err;
+        } else {
+            self.length = self.metadata.written().len;
+            if (self.length > 16 * 1024 * 1024) return error.DecisionRequestTooLarge;
+        }
+        try self.flushMetadata();
+    }
+    fn flatten(self: *const SegmentedBody, a: Allocator) ![]u8 {
+        const body = try a.alloc(u8, self.length);
+        var offset: usize = 0;
+        for (self.segments.items) |segment| {
+            @memcpy(body[offset..][0..segment.len], segment);
+            offset += segment.len;
+        }
+        return body;
+    }
+    fn drain(writer: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
+        const self: *SegmentedBody = @alignCast(@fieldParentPtr("writer", writer));
+        self.append(writer.buffered()) catch |err| {
+            self.failure = err;
+            return error.WriteFailed;
+        };
+        writer.end = 0;
+        var count: usize = 0;
+        for (data[0 .. data.len - 1]) |bytes| {
+            self.append(bytes) catch |err| {
+                self.failure = err;
+                return error.WriteFailed;
+            };
+            count += bytes.len;
+        }
+        for (0..splat) |_| {
+            const bytes = data[data.len - 1];
+            self.append(bytes) catch |err| {
+                self.failure = err;
+                return error.WriteFailed;
+            };
+            count += bytes.len;
+        }
+        return count;
+    }
+};
+
 /// Versioned opt-in transport; IDs/answer indexes and effective input bytes
 /// are identical to legacy requests. Intern immutable borrowed slices once.
-fn sharedBody(a: Allocator, inputs: []const Input, questions: anytype, model: []const u8) ![]u8 {
+fn sharedBody(a: Allocator, inputs: []const Input, questions: anytype, model: []const u8, writer: *std.Io.Writer) !void {
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
     const scratch = arena.allocator();
@@ -1080,9 +1227,9 @@ fn sharedBody(a: Allocator, inputs: []const Input, questions: anytype, model: []
         }
         out.context_index = entry.value_ptr.*;
     }
-    return std.json.Stringify.valueAlloc(a, .{ .model = model, .context_version = 1, .contexts = contexts.items, .inputs = wire, .questions = questions }, .{ .emit_null_optional_fields = false });
+    return std.json.Stringify.value(.{ .model = model, .context_version = 1, .contexts = contexts.items, .inputs = wire, .questions = questions }, .{ .emit_null_optional_fields = false }, writer);
 }
-fn singleBody(a: Allocator, inputs: []const Input, questions: anytype, model: []const u8) ![]u8 {
+fn singleBody(inputs: []const Input, questions: anytype, model: []const u8, writer: *std.Io.Writer) !void {
     if (inputs.len != 1) return error.InvalidDecisionBatch;
     // Reuse Input's streaming JSON string encoder, avoiding a copy of context.
     const Wire = struct {
@@ -1100,7 +1247,7 @@ fn singleBody(a: Allocator, inputs: []const Input, questions: anytype, model: []
             try json.endObject();
         }
     };
-    return std.json.Stringify.valueAlloc(a, Wire{ .model = model, .input = inputs[0], .questions = questions }, .{});
+    return std.json.Stringify.value(Wire{ .model = model, .input = inputs[0], .questions = questions }, .{}, writer);
 }
 
 fn integer(value: ?std.json.Value) usize {
@@ -1223,4 +1370,107 @@ test "prefix reuse preserves the v6 key transcript across stages and scopes" {
     try std.testing.expect(!std.mem.eql(u8, &before, &c.key(input)));
     o.model_revision = "next revision";
     try std.testing.expect(!std.mem.eql(u8, &before, &c.key(input)));
+}
+
+test "validated image evidence sizing and encoding preserve exact wire and reject replaced URL proofs" {
+    const a = std.testing.allocator;
+    const encoded = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+a7S8AAAAASUVORK5CYII=";
+    var bytes: [68]u8 = undefined;
+    try std.base64.standard.Decoder.decode(&bytes, encoded);
+    const image = try @import("antfly_source_evidence").Image.fromBytes(a, &bytes, 1024, 16);
+    defer a.free(image.data_url);
+    const validated = try @import("antfly_source_evidence").Image.fromDataUrl(a, image.data_url, null, 1024, 16);
+    for ([_]@TypeOf(image){ image, validated }) |value| {
+        var input: Input = .{ .id = "id", .input = "quote\"\n", .context = "context\t", .image = value };
+        const wire = try std.json.Stringify.valueAlloc(a, input, .{});
+        defer a.free(wire);
+        const measured = try input.evidenceBytes();
+        input.image.?.json_safe_url = null;
+        const reference = try std.json.Stringify.valueAlloc(a, input, .{});
+        defer a.free(reference);
+        try std.testing.expectEqualStrings(reference, wire);
+        try std.testing.expectEqual(try input.evidenceBytes(), measured);
+        input.image.?.json_safe_url = value.json_safe_url;
+        var small_body = SegmentedBody.init(a, &.{input});
+        defer small_body.deinit();
+        try std.json.Stringify.value(input, .{}, small_body.jsonWriter());
+        try small_body.finish();
+        try std.testing.expectEqual(@as(usize, 1), small_body.segments.items.len);
+        input.image.?.data_url = "unvalidated\"\n\\url";
+        input.image.?.json_safe_url = value.json_safe_url;
+        try std.testing.expect(!input.image.?.hasJsonSafeUrl());
+        var output: std.Io.Writer.Allocating = .init(a);
+        defer output.deinit();
+        var json: std.json.Stringify = .{ .writer = &output.writer };
+        try input.writeEvidence(&json);
+        try std.testing.expectEqual(output.written().len, try input.evidenceBytes());
+        var parsed = try std.json.parseFromSlice(std.json.Value, a, output.written(), .{});
+        defer parsed.deinit();
+        try std.testing.expectEqualStrings(input.image.?.data_url, parsed.value.array.items[0].object.get("content").?.array.items[1].object.get("image_url").?.string);
+    }
+}
+
+test "segmented decision bodies borrow qualified URLs and preserve every transport under allocation failure" {
+    const Case = struct {
+        fn run(a: Allocator) !void {
+            return runInner(a) catch |err| switch (err) {
+                // Both test sinks are allocator-only writers. The JSON hook's
+                // restricted error set wraps their simulated OOM as WriteFailed.
+                error.WriteFailed => error.OutOfMemory,
+                else => err,
+            };
+        }
+        fn runInner(a: Allocator) !void {
+            const encoded = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+a7S8AAAAASUVORK5CYII=";
+            var png: [68]u8 = undefined;
+            try std.base64.standard.Decoder.decode(&png, encoded);
+            const large_png = try a.alloc(u8, png.len + 4096 + 12);
+            defer a.free(large_png);
+            const end = png.len - 12;
+            @memcpy(large_png[0..end], png[0..end]);
+            std.mem.writeInt(u32, large_png[end..][0..4], 4096, .big);
+            @memcpy(large_png[end + 4 ..][0..4], "paDd");
+            @memset(large_png[end + 8 ..][0..4096], 'x');
+            std.mem.writeInt(u32, large_png[end + 8 + 4096 ..][0..4], std.hash.Crc32.hash(large_png[end + 4 ..][0 .. 4096 + 4]), .big);
+            @memcpy(large_png[end + 12 + 4096 ..], png[end..]);
+            const image = try @import("antfly_source_evidence").Image.fromBytes(a, large_png, 8192, 16);
+            defer a.free(image.data_url);
+            const inputs = [_]Input{.{ .id = "id", .input = "quote\"\n", .context = "shared context", .image = image }};
+            const questions = &.{.{ .name = "relevant", .type = "predicate", .instructions = "question" }};
+            for (0..3) |transport| {
+                var body = SegmentedBody.init(a, &inputs);
+                defer body.deinit();
+                var reference: std.Io.Writer.Allocating = .init(a);
+                defer reference.deinit();
+                switch (transport) {
+                    0 => {
+                        try std.json.Stringify.value(.{ .model = "model", .inputs = inputs, .questions = questions }, .{}, body.jsonWriter());
+                        try std.json.Stringify.value(.{ .model = "model", .inputs = inputs, .questions = questions }, .{}, &reference.writer);
+                    },
+                    1 => {
+                        try singleBody(&inputs, questions, "model", body.jsonWriter());
+                        try singleBody(&inputs, questions, "model", &reference.writer);
+                    },
+                    2 => {
+                        try sharedBody(a, &inputs, questions, "model", body.jsonWriter());
+                        try sharedBody(a, &inputs, questions, "model", &reference.writer);
+                    },
+                    else => unreachable,
+                }
+                try body.finish();
+                const flattened = try body.flatten(a);
+                defer a.free(flattened);
+                try std.testing.expectEqualStrings(reference.written(), flattened);
+                try std.testing.expectEqual(reference.written().len, body.length);
+                try std.testing.expectEqual(@as(usize, 3), body.segments.items.len);
+                try std.testing.expect(body.segments.items[1].ptr == image.data_url.ptr);
+                var owned_bytes: usize = 0;
+                for (body.owned.items) |bytes| owned_bytes += bytes.len;
+                try std.testing.expectEqual(body.length - image.data_url.len, owned_bytes);
+            }
+        }
+    };
+    try Case.run(std.testing.allocator);
+    var stable = std.testing.FailingAllocator.init(std.testing.allocator, .{ .resize_fail_index = 0 });
+    try std.testing.checkAllAllocationFailures(stable.allocator(), Case.run, .{});
 }

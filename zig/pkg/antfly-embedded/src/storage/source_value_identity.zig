@@ -152,6 +152,65 @@ pub fn buildAuthority(a: std.mem.Allocator, body: []const u8, kind: u8, digest: 
         null else null;
     return .{ .directory = directory, .identities = identities };
 }
+/// Qualified prior publication from the same writer snapshot. No document body
+/// is retained or read: directories certify raw leaf digests and exact ancestry.
+pub const Prior = struct { bytes: u64, kind: u8, digest: [32]u8, directory: []const u8, identities: []const u8 };
+pub const ReuseStats = struct { reused_bytes: usize = 0, canonical_bytes: usize = 0, reused_leaves: usize = 0 };
+pub fn buildAuthorityReusing(a: std.mem.Allocator, body: []const u8, kind: u8, digest: [32]u8, prior: Prior, stats: *ReuseStats) !Publication {
+    var arena = std.heap.ArenaAllocator.init(@import("antfly_platform").allocator.reclaimingScratch(a));
+    defer arena.deinit();
+    const temp = arena.allocator();
+    if (kind != prior.kind) return buildAuthority(a, body, kind, digest);
+    const old = (try projection.Directory.open(temp, prior.directory, prior)) orelse return buildAuthority(a, body, kind, digest);
+    const certificate = Certificate.open(prior.identities, prior.directory, prior) orelse return buildAuthority(a, body, kind, digest);
+    if (old.version != 2) return buildAuthority(a, body, kind, digest);
+    // Keep the fused reference writer for layouts with no worthwhile leaf.
+    // Metadata-only/opaque rows should not pay for a second directory decode.
+    const worthwhile = for (old.fields) |field| {
+        if (field.kind == .leaf and field.length >= 4096 and certificate.find(field.index) != null) break true;
+    } else false;
+    if (!worthwhile) return buildAuthority(a, body, kind, digest);
+    const directory = (try projection.buildAuthority(a, body, kind, digest)) orelse return .{ .directory = null, .identities = null };
+    errdefer a.free(directory);
+    const next = (try projection.Directory.open(temp, directory, .{ .bytes = @as(u64, body.len), .kind = kind, .digest = digest })) orelse return .{ .directory = directory, .identities = null };
+    var collector: Collector = .{ .a = temp };
+    var mapped: [projection.maximum_fields]?u16 = @splat(null);
+    for (next.fields) |field| {
+        const siblings = if (field.parent == projection.no_parent) old.fields[0..old.root_count] else if (mapped[field.parent]) |parent| old.fields[old.fields[parent].first_child..][0..old.fields[parent].child_count] else &.{};
+        // Packed children are sorted by decoded name. Paths, rather than indices
+        // or payload digests alone, bind reuse even when siblings move or grow.
+        var low: usize = 0;
+        var high: usize = siblings.len;
+        while (low < high) {
+            const mid = low + (high - low) / 2;
+            switch (std.mem.order(u8, siblings[mid].name, field.name)) {
+                .lt => low = mid + 1,
+                .gt => high = mid,
+                .eq => {
+                    if (siblings[mid].kind == field.kind) mapped[field.index] = siblings[mid].index;
+                    break;
+                },
+            }
+        }
+        if (field.kind != .leaf) continue;
+        if (mapped[field.index]) |index| {
+            const previous = old.fields[index];
+            if (previous.length == field.length and std.mem.eql(u8, &previous.digest, &field.digest)) {
+                if (certificate.find(index)) |canonical| {
+                    collector.records[collector.count] = .{ .index = field.index, .digest = canonical };
+                    collector.count += 1;
+                    stats.reused_bytes += @intCast(field.length);
+                    stats.reused_leaves += 1;
+                    continue;
+                }
+            }
+        }
+        stats.canonical_bytes += @intCast(field.length);
+        try Collector.visit(&collector, field.index, body[@intCast(field.offset)..][0..@intCast(field.length)]);
+    }
+    return .{ .directory = directory, .identities = try collector.encode(a, body.len, kind, digest, directory) };
+}
+
 pub const Certificate = struct {
     records: []const u8,
     pub fn open(raw: []const u8, directory: []const u8, proof: anytype) ?Certificate {

@@ -180,3 +180,7 @@ test "decision functions graph evaluation preserves vector hit offset restrictio
 test "api query contract conditional source projection preserves authorization-stage ownership" {
     try @import("antfly_local_sources").api_query_contract.testing.expectConditionalSourceProjection();
 }
+
+test "api query contract conditional source spans preserve strict public wire semantics" {
+    try @import("antfly_local_sources").api_query_contract.testing.expectConditionalSourceWireSpans();
+}

@@ -129,6 +129,33 @@ pub const testing = if (builtin.is_test) struct {
         try std.testing.expectEqualStrings("payload", unchanged_page.object.get("body").?.object.get("image").?.string);
     }
 
+    pub fn expectConditionalSourceWireSpans() !void {
+        const a = std.testing.allocator;
+        var request = try parseQueryRequest(a, null, "docs", "{\"fields\":[\"body\"],\"source_projection\":{\"fields\":[{\"field\":\"body.image\"}]}}");
+        defer request.deinit(a);
+        const states = "{\"body.image\":{\"state\":\"value\",\"identity\":\"sv1-0000000000000000000000000000000000000000000000000000000000000000\"}}";
+        const body = "{\"body\":{\"image\":\"quoted\\\" image\",\"number\":1e0},\"_artifact_unit_fingerprint\":\"private\",\"_hierarchy_unit_revision_token\":\"private\",\"_resolution_work\":1}";
+        var hits = [_]db_mod.types.SearchHit{.{ .id = @constCast("doc"), .stored_data = @constCast(body), .source_projection_json = @constCast(states), .artifact_ref = .{ .document_id = @constCast("doc"), .name = @constCast("fixture"), .kind = .embedding } }};
+        var response = try encodeQueryResponses(a, "docs", request.req, .{}, .{ .alloc = a, .hits = &hits, .total_hits = 1 });
+        defer response.deinit(a);
+        // Reference conversion remains the ordinary DOM path for callers that
+        // explicitly need typed results; wire output must be equivalent.
+        var reference_arena = std.heap.ArenaAllocator.init(a);
+        defer reference_arena.deinit();
+        const reference = try toOpenApiHit(reference_arena.allocator(), request.req, hits[0]);
+        const expected = try std.json.Stringify.valueAlloc(a, reference, .{ .emit_null_optional_fields = false });
+        defer a.free(expected);
+        var parsed = try std.json.parseFromSlice(std.json.Value, a, response.json, .{});
+        defer parsed.deinit();
+        const hit = parsed.value.object.get("responses").?.array.items[0].object.get("hits").?.object.get("hits").?.array.items[0];
+        const actual = try std.json.Stringify.valueAlloc(a, hit, .{});
+        defer a.free(actual);
+        try std.testing.expectEqualStrings(expected, actual);
+        hits[0].artifact_ref = null;
+        hits[0].stored_data = @constCast("{\"body\":{\"image\":1,\"image\":2}}");
+        try std.testing.expectError(error.DuplicateField, encodeQueryResponses(a, "docs", request.req, .{}, .{ .alloc = a, .hits = &hits, .total_hits = 1 }));
+    }
+
     pub fn bodyHasInternalShardFields(alloc: std.mem.Allocator, body: []const u8) !bool {
         return queryBodyHasInternalShardFields(alloc, body);
     }
@@ -3878,6 +3905,28 @@ fn hasColumnSources(hits: []const db_mod.types.SearchHit) bool {
     return false;
 }
 
+// Storage-finalized conditional sources are already publicly projected. Keep
+// them as spans through the wire boundary, stripping private transport fields
+// with the same strict selector engine instead of materializing another DOM.
+fn canStreamConditionalSource(req: db_mod.types.SearchRequest, hit: db_mod.types.SearchHit, projection: ?source_projection.Prepared) bool {
+    return projection != null and source_projection.storageEligible(req) and hit.source_projection_json != null and hit.stored_data != null and hit.source_value == null and hit.column_source == null;
+}
+fn toOpenApiHitForWire(a: std.mem.Allocator, req: db_mod.types.SearchRequest, hit: db_mod.types.SearchHit, projection: ?source_projection.Prepared) !metadata_openapi.QueryHit {
+    // Skip only source conversion. Hierarchy/mention metadata can also depend
+    // on stored_data, so every other converter must receive the complete hit.
+    return toOpenApiHitPreparedSource(a, req, hit, projection, canStreamConditionalSource(req, hit, projection));
+}
+fn hasConditionalWireSources(req: db_mod.types.SearchRequest, hits: []const db_mod.types.SearchHit, projection: ?source_projection.Prepared) bool {
+    for (hits) |hit| if (canStreamConditionalSource(req, hit, projection)) return true;
+    return false;
+}
+fn writeConditionalWireSource(a: std.mem.Allocator, writer: *std.Io.Writer, raw: []const u8) !void {
+    const query = @import("../storage/db/document_query.zig");
+    var plan = (try query.SpanProjectionPlan.init(a, .{ .fields = &.{ "*", "-" ++ hierarchy_navigation.unit_fingerprint_field, "-" ++ hierarchy_navigation.grouped_unit_revision_envelope_field, "-_resolution_work" }, .include_all_fields = false })).?;
+    defer plan.deinit();
+    try query.writeLookupObject(a, writer, raw, &plan);
+}
+
 // Metadata is encoded once into small owned spans. Source segments retain
 // projected typed descriptors, borrowing scalar bytes from the hit's page.
 // The complete exact length is known before transport starts, without replaying
@@ -4054,7 +4103,7 @@ fn ColumnWireResult(comptime T: type) type {
                     try w.objectField("hits");
                     try w.beginArray();
                     var released: usize = 0;
-                    var hit_arena = std.heap.ArenaAllocator.init(self.alloc);
+                    var hit_arena = std.heap.ArenaAllocator.init(@import("antfly_platform").allocator.reclaimingScratch(self.alloc));
                     defer hit_arena.deinit();
                     for (self.base.hits.?.hits.?, self.hits, 0..) |base_hit, _, hit_index| {
                         const hydrator = if (self.plan) |plan| plan.sink.hydrator else null;
@@ -4066,7 +4115,7 @@ fn ColumnWireResult(comptime T: type) type {
                         };
                         const hit = self.hits[hit_index];
                         _ = hit_arena.reset(.retain_capacity);
-                        var api_hit = if (hydrator != null) toOpenApiHitPrepared(hit_arena.allocator(), self.req, hit, self.projection) catch |err| {
+                        var api_hit = if (hydrator != null) toOpenApiHitForWire(hit_arena.allocator(), self.req, hit, self.projection) catch |err| {
                             self.failure.* = err;
                             return error.WriteFailed;
                         } else base_hit;
@@ -4094,7 +4143,15 @@ fn ColumnWireResult(comptime T: type) type {
                         try w.beginObject();
                         inline for (@typeInfo(@TypeOf(api_hit)).@"struct".field_names) |field| {
                             if (comptime std.mem.eql(u8, field, "_source")) {
-                                if (self.projection != null) {
+                                if (canStreamConditionalSource(self.req, hit, self.projection)) {
+                                    try w.objectField(field);
+                                    try w.beginWriteRaw();
+                                    writeConditionalWireSource(hit_arena.allocator(), w.writer, hit.stored_data.?) catch |err| {
+                                        self.failure.* = err;
+                                        return error.WriteFailed;
+                                    };
+                                    w.endWriteRaw();
+                                } else if (self.projection != null) {
                                     try writeWireField(w, field, api_hit._source);
                                 } else if (hit.column_source) |source| {
                                     if (self.req.include_stored) {
@@ -4235,7 +4292,7 @@ pub fn encodeQueryResponsesWithDelivery(
     const projection = try prepareSourceProjection(arena, req);
     const hits = try arena.alloc(metadata_openapi.QueryHit, emitted_hits.len);
     for (emitted_hits, 0..) |hit, i| {
-        hits[i] = try toOpenApiHitPrepared(arena, req, hit, projection);
+        hits[i] = try toOpenApiHitForWire(arena, req, hit, projection);
     }
 
     const graph_dialect = if (req.graph_queries.len > 0)
@@ -4275,7 +4332,7 @@ pub fn encodeQueryResponsesWithDelivery(
                 .table = req.response_table_name orelse table_name,
                 .remote_snapshot = meta.remote_snapshot orelse if (req.native_query_cut != null) req.remote_snapshot else null,
             };
-            break :blk if (graph_results != null or hasColumnSources(emitted_hits) or (if (delivery) |sink| sink.hydrator != null else false)) encodeColumnWire(alloc, graph_results, req, query_results[0], emitted_hits, delivery, &delivered, projection) catch |err| return graph_wire_failure orelse err else try std.json.Stringify.valueAlloc(
+            break :blk if (graph_results != null or hasColumnSources(emitted_hits) or hasConditionalWireSources(req, emitted_hits, projection) or (if (delivery) |sink| sink.hydrator != null else false)) encodeColumnWire(alloc, graph_results, req, query_results[0], emitted_hits, delivery, &delivered, projection) catch |err| return graph_wire_failure orelse err else try std.json.Stringify.valueAlloc(
                 alloc,
                 metadata_openapi.QueryResponses{ .responses = query_results },
                 .{ .emit_null_optional_fields = false },
@@ -4307,7 +4364,7 @@ pub fn encodeQueryResponsesWithDelivery(
                 .table = req.response_table_name orelse table_name,
                 .remote_snapshot = meta.remote_snapshot orelse if (req.native_query_cut != null) req.remote_snapshot else null,
             };
-            break :blk if (hasColumnSources(emitted_hits) or (if (delivery) |sink| sink.hydrator != null else false)) try encodeColumnWire(alloc, null, req, query_results[0], emitted_hits, delivery, &delivered, projection) else try std.json.Stringify.valueAlloc(
+            break :blk if (hasColumnSources(emitted_hits) or hasConditionalWireSources(req, emitted_hits, projection) or (if (delivery) |sink| sink.hydrator != null else false)) try encodeColumnWire(alloc, null, req, query_results[0], emitted_hits, delivery, &delivered, projection) else try std.json.Stringify.valueAlloc(
                 alloc,
                 metadata_openapi.StatefulQueryResponses{ .responses = query_results },
                 .{ .emit_null_optional_fields = false },
@@ -4335,6 +4392,9 @@ fn toOpenApiHit(alloc: std.mem.Allocator, req: db_mod.types.SearchRequest, hit: 
     return toOpenApiHitPrepared(alloc, req, hit, try prepareSourceProjection(alloc, req));
 }
 fn toOpenApiHitPrepared(alloc: std.mem.Allocator, req: db_mod.types.SearchRequest, hit: db_mod.types.SearchHit, projection: ?source_projection.Prepared) !metadata_openapi.QueryHit {
+    return toOpenApiHitPreparedSource(alloc, req, hit, projection, false);
+}
+fn toOpenApiHitPreparedSource(alloc: std.mem.Allocator, req: db_mod.types.SearchRequest, hit: db_mod.types.SearchHit, projection: ?source_projection.Prepared, skip_source: bool) !metadata_openapi.QueryHit {
     try validateOpenApiHitSortTuple(req, hit);
 
     var api_hit: metadata_openapi.QueryHit = .{
@@ -4345,7 +4405,7 @@ fn toOpenApiHitPrepared(alloc: std.mem.Allocator, req: db_mod.types.SearchReques
         ._distance = if (hit.distance) |distance| finiteScoreOrZero(distance) else null,
         ._index_scores = try indexScoresJsonValue(alloc, hit.index_scores),
         ._sort = if (hit.sort_values.len > 0) hit.sort_values else null,
-        ._source = if (req.document_authority_mode != .none and hit.document_authority != null) private: {
+        ._source = if (skip_source) null else if (req.document_authority_mode != .none and hit.document_authority != null) private: {
             const envelope = try db_mod.types.document_authority.encode(alloc, hit.document_authority.?.*, hit.stored_data);
             defer alloc.free(envelope);
             break :private try takeOpenApiObjectMap(alloc, try parseStoredSourceValue(alloc, envelope));

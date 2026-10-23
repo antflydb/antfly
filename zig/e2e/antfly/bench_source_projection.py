@@ -16,6 +16,7 @@
 """Paired native-server source delivery qualification; no model or live data."""
 
 import argparse
+import copy
 import hashlib
 import json
 import os
@@ -90,6 +91,12 @@ def main():
     parser.add_argument("--value-bytes", type=int, default=262144)
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument(
+        "--metadata-updates",
+        type=int,
+        default=0,
+        help="measure primary rewrites with unchanged large payloads and verify conditional identities",
+    )
+    parser.add_argument(
         "--mask", choices=("exact", "parent", "wildcard", "exclude"), default="exact"
     )
     parser.add_argument(
@@ -110,6 +117,7 @@ def main():
     if (
         not 1 <= args.documents <= 64
         or not 16384 <= args.value_bytes <= 1048576
+        or not 0 <= args.metadata_updates <= 100
         or args.rounds < 1
         or not 1 <= args.queries_per_phase <= 100
     ):
@@ -275,6 +283,61 @@ def main():
                             }
                             for h in hits
                         ]
+                    # Keep metadata edits separate from the cold/ordinary/full
+                    # controls. Reuse the same payload and vary only metadata;
+                    # validate new revision delivery plus unchanged identities.
+                    for update in range(args.metadata_updates):
+                        updated = copy.deepcopy(documents)
+                        for doc in updated.values():
+                            doc["metadata"] = {
+                                "revision": f"r{update + 2}",
+                                "allowed": update % 2 == 0,
+                            }
+                        _, usage = measure(
+                            read,
+                            lambda: session.post(
+                                base + "/batch",
+                                json={"inserts": updated, "sync_level": "full_index"},
+                                timeout=60,
+                            ),
+                        )
+                        samples.append(
+                            {
+                                "variant": variant,
+                                "round": round_id,
+                                "phase": "metadata_update",
+                                "update": update,
+                                **usage,
+                            }
+                        )
+                        verified = session.post(
+                            base + "/query", json=request, timeout=60
+                        )
+                        verified.raise_for_status()
+                        changed_hits = verified.json()["responses"][0]["hits"]["hits"]
+                        assert {h["_id"] for h in changed_hits} == set(documents)
+                        for hit in changed_hits:
+                            assert (
+                                hit["_source"]["metadata"]
+                                == updated[hit["_id"]]["metadata"]
+                            ), hit
+                            assert (
+                                hit["_source_projection"]["payload.large"]["state"]
+                                == "unchanged"
+                            ), hit
+                        digest = hashlib.sha256(
+                            json.dumps(
+                                sorted(
+                                    (h["_id"], h["_source"], h["_source_projection"])
+                                    for h in changed_hits
+                                ),
+                                sort_keys=True,
+                            ).encode()
+                        ).hexdigest()
+                        key = f"metadata_update_{update}"
+                        assert output_hashes.setdefault(key, digest) == digest, (
+                            "metadata update delivery differs"
+                        )
                     logs = server.log_path.read_text(errors="replace")
                     counts = [
                         (int(a), int(b))
@@ -329,7 +392,13 @@ def main():
             os.environ["ANTFLY_BENCH_QUERY_PROFILE"] = previous_profile
     medians = []
     for variant in binaries:
-        for phase in ("ingest", "ordinary", "full", "conditional"):
+        for phase in (
+            "ingest",
+            "ordinary",
+            "full",
+            "conditional",
+            *(("metadata_update",) if args.metadata_updates else ()),
+        ):
             selected = [
                 s for s in samples if s["variant"] == variant and s["phase"] == phase
             ]
@@ -358,6 +427,7 @@ def main():
         "cpu_count": os.cpu_count(),
         "rounds": args.rounds,
         "queries_per_phase": args.queries_per_phase,
+        "metadata_updates": args.metadata_updates,
         "documents": args.documents,
         "value_bytes": args.value_bytes,
         "corpus_sha256": corpus,

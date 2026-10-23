@@ -4757,3 +4757,72 @@ from `zig/`. All 28 real-server indexed tests pass (seven opt-in benchmark skips
 including persisted certificate upgrade from the previous server. Windows CLI
 cross-compilation, compatibility/storage discovery and the Apache boundary pass.
 The final source rebuild produces the same qualified native binary hash.
+
+### Bounded materialization and decision request bodies
+
+Conditional materialization keeps reconstructed rows in reclaimable subwindow
+scratch. Complete primary values borrow their pinned read scope until projection
+finishes; the existing owned logical-read API retains its ownership contract.
+One selector serves each window, and small overlays restore omitted ancestors
+without decoding retained payloads into a second JSON tree. The public encoder
+streams finalized sources while preserving source-dependent hierarchy metadata,
+private-field removal, duplicate-key rejection and number normalization.
+
+Strict preparation produces a receipt bounded to immutable source bytes. The
+span writer copies strings whose spellings already match the default JSON
+encoder, including canonical control escapes. Noncanonical escapes, numbers and
+unqualified input retain normalization. This receipt is temporary syntax evidence;
+it grants no document access or cross-source reuse.
+
+Remote decision requests borrow qualified image URLs of at least 4 KiB through
+HTTPx body segments. Smaller image, text-only and local-runtime requests use the
+ordinary contiguous encoder, allocating no segment plan. Exact admission counts
+known large URL lengths without serializing those payloads into a counting sink.
+Inputs stay pinned through transport completion, cancellation and retries. The
+wire schema, request/response limits and inference budgets are unchanged.
+
+Metadata rewrites can reuse canonical leaf certificates from the writer's current
+snapshot when decoded ancestry, leaf kind, raw length/digest and canonical ABI
+match. Unsupported layouts retain the fused reference writer. The incoming body
+still needs validation and its content digest, and the primary JSON row is still
+written. The [design](../../../docs/design/antfly-grep.md#conditional-source-projection-and-future-storage-authorities)
+specifies the separate immutable-value/manifest migration needed to remove that
+write amplification, including retained ownership and rollback requirements.
+
+The [materialization qualification](bench/results/grep-materialization-summary.json)
+compares these changes with PR head `0f28b974b9` using five alternating client
+trials on tiny and 256 KiB images. For 128 large-image decisions, median client
+CPU falls 195.0 → 133.2 ms on macOS and 276.5 → 193.9 ms in the constrained
+Linux VM. Median peak RSS falls 58.5 → 33.6 MiB and 88.5 → 45.0 MiB,
+respectively. Tiny cold-image CPU is 47.5 → 48.2 ms on macOS, retaining the
+ordinary encoder. Warm score hits make no provider calls. These are fixture
+measurements; request counts, transfer bytes and model billing are not reduced
+by borrowing the body. The VM shares the same physical host; elapsed-time
+measurements are sensitive to concurrent host work.
+
+Raw trials and logs remain local under ignored `output/`; the compact report
+preserves binary/source hashes, controls, medians and reproduction commands.
+
+Focused validation passes 24 identity/storage, 151 API contract and 96 logical-field
+tests (one skip), with zero leaks. The CLI suites pass 287 macOS cases (two
+skips) and 286 cases in the constrained Linux VM (three skips). The storage suite
+covers arena retention, borrowed/owned read lifetimes, current-snapshot identity
+reuse, changed ancestry, incompatible certificates and allocation failures.
+Request-body tests cover all decision transports, exact wire bytes, URL-proof
+invalidation, sizing and cancellation-compatible borrowed lifetimes.
+
+The thirteen native cases use three alternating trials, five individually timed
+reads per phase and two verified metadata rewrites per trial. Eight-row full-source
+latency is 10.74 → 9.54 ms for ASCII, 25.41 → 19.76 ms for escaped strings,
+and 24.24 → 19.13 ms for Unicode. Escaped-value metadata-update CPU falls
+152.44 → 137.20 ms; primary JSON is still physically rewritten. Controls remain
+mixed: numeric full-source delivery is 0.92 → 1.07 ms, while the single-row
+metadata-update CPU control is 17.49 → 18.03 ms. Ordinary reads, conditional
+hits, opaque/small values, 1/8/64 rows and parent/wildcard/exclusion masks all
+remain in the report. These warm-cache, shared-host results establish measured
+tradeoffs, not universal latency or zero-cost guarantees.
+
+All 28 real-server indexed integration cases pass against the final native binary
+(seven opt-in benchmark skips). The 24 identity/storage regressions also pass in
+the constrained Linux VM, including canonical-string receipt activation and scope
+boundaries.

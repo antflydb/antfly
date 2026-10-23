@@ -2730,6 +2730,15 @@ def test_conditional_source_projection_binds_current_values_and_query_selection(
         assert selected["_source_projection"] == warm["_source_projection"]
     # Expected identities cannot cause an excluded document to become a hit.
     assert query({**request, "query": {"bool": {"filter": {"ids": ["other"]}}}}) == []
+    # Metadata rewrites must publish a new document revision without changing
+    # canonical identities for untouched leaves, even when packed indices move.
+    item["revision"] = "metadata-only-update"
+    item["body"]["before_image"] = "new sibling"
+    stateful_api.batch_write(table, inserts={"a": item}, sync_level="full_index")
+    for projection in projections:
+        selected = query({**request, "fields": projection})[0]
+        assert "image" not in selected["_source"]["body"]
+        assert selected["_source_projection"] == warm["_source_projection"]
     # Caller revision metadata is not authority for the image identity.
     item["body"]["image"] = "changed-payload"
     stateful_api.batch_write(table, inserts={"a": item}, sync_level="full_index")
