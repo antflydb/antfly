@@ -2659,4 +2659,7 @@ def test_unreachable_pdf_error_identity_and_successful_repair_clear_debt(statefu
         result = stateful_api.post(issues_path, {"kind": "asset", "limit": 100})
         return result if not result["issues"] else None
 
-    assert wait_until(cleared, timeout_s=60, interval_s=0.5) is not None
+    assert wait_until(cleared, timeout_s=60, interval_s=0.5) is not None, {
+        "manifest": recovered,
+        "issues": stateful_api.post(issues_path, {"kind": "asset", "limit": 100}),
+    }

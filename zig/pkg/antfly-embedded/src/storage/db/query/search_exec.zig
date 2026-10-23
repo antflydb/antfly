@@ -12043,7 +12043,10 @@ const TextLiveVisibilityProducer = struct {
         };
         const bitmap = try self.alloc.create(roaring.RoaringBitmap);
         errdefer self.alloc.destroy(bitmap);
-        bitmap.* = try self.snapshot.docNumBitmapForOrdinalMembershipAlloc(self.alloc, Membership{ .set = &live, .resolved = self.resolved_filter }, self.control);
+        bitmap.* = (try self.snapshot.tryDocNumBitmapForOrdinalMembershipAlloc(self.alloc, Membership{ .set = &live, .resolved = self.resolved_filter }, self.control)) orelse {
+            self.alloc.destroy(bitmap);
+            return null;
+        };
         errdefer bitmap.deinit();
         try bitmap.prepareRead();
         try self.control.check();

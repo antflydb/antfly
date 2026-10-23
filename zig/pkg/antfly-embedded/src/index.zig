@@ -1768,7 +1768,7 @@ pub const IndexSnapshot = struct {
 
     /// Stream directly into compact membership without a corpus-sized u32
     /// result array. Check request control even across deleted/sparse rows.
-    pub fn docNumBitmapForOrdinalMembershipAlloc(self: *const IndexSnapshot, alloc: Allocator, membership: anytype, control: query_mod.ExecutionControl) !roaring.RoaringBitmap {
+    pub fn tryDocNumBitmapForOrdinalMembershipAlloc(self: *const IndexSnapshot, alloc: Allocator, membership: anytype, control: query_mod.ExecutionControl) !?roaring.RoaringBitmap {
         var out = roaring.RoaringBitmap.init(alloc);
         errdefer out.deinit();
         var offset: u32 = 0;
@@ -1780,7 +1780,14 @@ pub const IndexSnapshot = struct {
             defer lease.deinit();
             const seg = lease.entry;
             var cursor: ?segment_mod.DocOrdinalCursor = null;
-            seg.shared.lockDeletionShared();
+            // Scorers can already hold this segment's shared deletion guard.
+            // A queued writer forbids another shared admission; waiting here
+            // would deadlock that writer against our outer scoring guard.
+            // Adaptation is optional: keep candidate refinement when busy.
+            if (!seg.shared.tryLockDeletionShared()) {
+                out.deinit();
+                return null;
+            }
             defer seg.shared.unlockDeletionShared();
             for (0..seg.reader.doc_count) |local| {
                 if (local % 256 == 0) try control.check();
@@ -5159,13 +5166,33 @@ test "ordinal bitmap streaming projection cancels during traversal" {
         }
     };
     var harness: Harness = .{};
-    try std.testing.expectError(error.Canceled, snapshot_.docNumBitmapForOrdinalMembershipAlloc(a, &harness, .{
+    try std.testing.expectError(error.Canceled, snapshot_.tryDocNumBitmapForOrdinalMembershipAlloc(a, &harness, .{
         .cancellation = .{ .ptr = &harness, .check_fn = Harness.check },
     }));
     try std.testing.expect(harness.visited > 0 and harness.visited < ordinals.len);
     try std.testing.expectEqual(@as(usize, 0), harness.visited % 256);
-    try std.testing.expectError(error.Timeout, snapshot_.docNumBitmapForOrdinalMembershipAlloc(a, &harness, .{ .deadline_ns = 0 }));
-    var complete = try snapshot_.docNumBitmapForOrdinalMembershipAlloc(a, &harness, .{});
+    try std.testing.expectError(error.Timeout, snapshot_.tryDocNumBitmapForOrdinalMembershipAlloc(a, &harness, .{ .deadline_ns = 0 }));
+    var complete = (try snapshot_.tryDocNumBitmapForOrdinalMembershipAlloc(a, &harness, .{})).?;
     defer complete.deinit();
     try std.testing.expectEqual(@as(usize, ordinals.len), complete.cardinality());
+    // Reproduce scoring's retained reader with a deletion writer queued.
+    // The opportunistic population projection must return to the scorer,
+    // allowing its outer reader to leave and the writer to make progress.
+    const shared = (try snapshot_.readSegment(0)).shared;
+    shared.lockDeletionShared();
+    const Writer = struct {
+        shared: *SegmentShared,
+        fn run(self: @This()) void {
+            self.shared.lockDeletionExclusive();
+            self.shared.unlockDeletionExclusive();
+        }
+    };
+    const deletion = std.Thread.spawn(.{}, Writer.run, .{Writer{ .shared = shared }}) catch |err| {
+        shared.unlockDeletionShared();
+        return err;
+    };
+    defer deletion.join();
+    defer shared.unlockDeletionShared();
+    while ((shared.deletion_lock.load(.acquire) & SegmentShared.deletion_writer_bit) == 0) spinOrYield();
+    try std.testing.expect((try snapshot_.tryDocNumBitmapForOrdinalMembershipAlloc(a, &harness, .{})) == null);
 }

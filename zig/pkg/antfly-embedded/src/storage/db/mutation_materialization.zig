@@ -3378,7 +3378,8 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             defer updates.deinit(ctx.alloc);
             for (managed_indexes) |index_ref| {
                 if (index_names.len != 0 and !indexNameInSlice(index_ref.name, index_names)) continue;
-                if (try batchAdvancesManagedIndexApplyState(ctx.index_manager, batch, index_ref)) {
+                const advances = try batchAdvancesManagedIndexApplyState(ctx.index_manager, batch, index_ref);
+                {
                     const async_ctx = AsyncContext{
                         .alloc = ctx.alloc,
                         .io = ctx.io,
@@ -3390,6 +3391,10 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                         .dense_bulk_session_scope = ctx.dense_bulk_session_scope,
                         .text_merge_runtime = if (ctx.async_context) |active| active.text_merge_runtime else null,
                     };
+                    if (!advances) {
+                        try clearPublishedAssetArtifactRepairIssuesContext(ctx.async_context orelse &async_ctx, index_ref.name, batch.changed_artifact_keys, batch.sequence);
+                        continue;
+                    }
                     try applyDerivedBatchToIndexContextProfiled(&async_ctx, batch, index_ref, profile, false, null);
                     const index_sync_start_ns = monotonicTimeNs();
                     try ctx.index_manager.syncReplayStateByName(ctx.store, index_ref.name);
@@ -4850,7 +4855,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 if (manifest.value.object.get("ocr_failed_page_numbers")) |pages| {
                     if (pages != .array or pages.array.items.len != 0) return;
                 }
-                if (manifest.value.object.get("merge")) |merge| {
+                if (manifest.value.object.get("merge_plan") orelse manifest.value.object.get("merge")) |merge| {
                     if (merge != .object) return;
                     const state = merge.object.get("status") orelse return;
                     if (state != .string or !std.mem.eql(u8, state.string, "converged")) return;

@@ -58622,7 +58622,20 @@ fn resetPath(path: []const u8) !void {
 pub fn applyDerivedBatchToIndexAsync(ctx_ptr: *anyopaque, batch: derived_types.DerivedBatch, index_ref: index_manager_mod.ManagedIndexRef, token: derived_executor_mod.CatchUpSessionToken) !bool {
     const ctx: *AsyncContext = @ptrCast(@alignCast(ctx_ptr));
     if (comptime storage_engine.enabled) return storage_engine.call("applyDerivedBatchToIndexAsync", .{ ctx, batch, index_ref, token });
-    if (!try batchAffectsManagedIndexForReplay(ctx.index_manager, batch, index_ref)) return false;
+    if (!try batchAffectsManagedIndexForReplay(ctx.index_manager, batch, index_ref)) {
+        // A successful extraction manifest is not a graph source row. Settle
+        // its repair metadata before advancing this otherwise empty window;
+        // journal replay retries cleanup after a crash or transient failure.
+        const has_asset_root = for (batch.changed_artifact_keys) |key| {
+            if (internal_keys.isAssetArtifactKey(key)) break true;
+        } else false;
+        if (has_asset_root) {
+            var replay = try acquireSnapshotReplayAsyncContext(ctx);
+            defer if (replay) |*lease| lease.release();
+            try local_mutation.clearPublishedAssetArtifactRepairIssuesContext(ctx, index_ref.name, batch.changed_artifact_keys, batch.sequence);
+        }
+        return false;
+    }
     if (index_ref.kind == .dense_vector and ctx.dense_admission.external_sessions.load(.acquire) != 0) {
         return error.ReplayDocumentNotVisible;
     }
@@ -142753,6 +142766,24 @@ test "source vector sealed backup retains exact payloads across writes and porta
     try source.batch(.{ .writes = &.{.{ .key = "doc", .value = "{\"text\":\"before\",\"_embeddings\":{\"model\":[1,0,0]}}" }}, .sync_level = .full_index });
     const key = try expectedDocumentEmbeddingArtifactKeyAlloc(a, "doc", "model");
     defer a.free(key);
+    // Retention must not depend on fitting a still-active vector WAL into
+    // the remaining primary/generated copy budget. Immutable WAL rotation
+    // can retain the exact authority without copying the payload bytes.
+    const payload_mod = @import("../artifact_payload.zig");
+    const source_vectors = source.local_execution.source_vectors.load(.acquire).?;
+    const prepared = try enrichment_artifact_codec.encodeDenseEmbeddingAlloc(a, 9, &.{ 0, 0, 1 });
+    defer a.free(prepared);
+    {
+        const session = try payload_mod.Session.create(a, source_vectors.interface());
+        defer session.release();
+        _ = try session.put(key, prepared);
+        try session.prepareCommit();
+    }
+    const zero_budget_root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/zero-budget-vectors", .{tmp.sub_path});
+    defer a.free(zero_budget_root);
+    var remaining_wal: u64 = 0;
+    try std.testing.expect(try source_vectors.sealQuerySnapshot(std.testing.io, zero_budget_root, &remaining_wal, .none) > 0);
+    try std.testing.expectEqual(@as(u64, 0), remaining_wal);
     const identity = try source.relationalTopologyIdentity();
     try std.testing.expect(identity.backup_seal_supported);
     const fence: @import("relational_integrity_topology.zig").Fence = .{ .role = .backup_snapshot, .transition_id = 900, .attempt = 1, .peer_group_id = 1, .owner_group_id = 1, .admission_epoch = identity.next_epoch, .namespace = identity.namespace, .catalog_digest = identity.catalog_digest };
@@ -142811,7 +142842,7 @@ test "db successful asset publication clears terminal debt but stale and failed 
     const key = try internal_keys.artifactNamedPrefixAlloc(a, "doc", "asset", "units");
     defer a.free(key);
     try recordArtifactRepairIssueContextDetailed(db.async_context, .asset, "text", "doc", "", "", "units", "", "units", key, null, 5, .enrichment_failed, 1, "RemoteDocumentFetchFailed");
-    try db.core.store.put(key, "{\"route_type\":\"error\",\"merge_status\":\"failed\",\"chunk_count\":0}");
+    try db.core.store.put(key, "{\"route_type\":\"error\",\"merge_plan\":{\"status\":\"failed\"},\"chunk_count\":0}");
     const batch: derived_types.DerivedBatch = .{ .sequence = 6, .changed_artifact_keys = &.{key} };
     try local_mutation.applyDerivedBatchToIndexContext(db.async_context, batch, .{ .name = "text", .kind = .full_text });
     {
@@ -142819,14 +142850,21 @@ test "db successful asset publication clears terminal debt but stale and failed 
         defer types.freeArtifactRepairIssues(a, issues);
         try std.testing.expectEqual(@as(usize, 1), issues.len);
     }
-    try db.core.store.put(key, "{\"route_type\":\"pdf\",\"merge\":{\"status\":\"converged\"},\"unit_count\":1,\"chunk_count\":1,\"ocr_failed_count\":1}");
+    try db.core.store.put(key, "{\"route_type\":\"text\",\"merge_plan\":{\"status\":\"in_progress\"},\"unit_count\":1}");
     try local_mutation.applyDerivedBatchToIndexContext(db.async_context, batch, .{ .name = "text", .kind = .full_text });
     {
         const issues = try db.listArtifactRepairIssues(a, .asset, "text", 0);
         defer types.freeArtifactRepairIssues(a, issues);
         try std.testing.expectEqual(@as(usize, 1), issues.len);
     }
-    try db.core.store.put(key, "{\"route_type\":\"text\",\"merge_status\":\"complete\",\"unit_count\":1,\"chunk_count\":1}");
+    try db.core.store.put(key, "{\"route_type\":\"pdf\",\"merge_plan\":{\"status\":\"converged\"},\"unit_count\":1,\"chunk_count\":1,\"ocr_failed_count\":1}");
+    try local_mutation.applyDerivedBatchToIndexContext(db.async_context, batch, .{ .name = "text", .kind = .full_text });
+    {
+        const issues = try db.listArtifactRepairIssues(a, .asset, "text", 0);
+        defer types.freeArtifactRepairIssues(a, issues);
+        try std.testing.expectEqual(@as(usize, 1), issues.len);
+    }
+    try db.core.store.put(key, "{\"route_type\":\"text\",\"merge_plan\":{\"status\":\"converged\"},\"unit_count\":1,\"chunk_count\":1}");
     var stale = batch;
     stale.sequence = 4;
     try local_mutation.applyDerivedBatchToIndexContext(db.async_context, stale, .{ .name = "text", .kind = .full_text });
@@ -142840,4 +142878,12 @@ test "db successful asset publication clears terminal debt but stale and failed 
     const issues = try db.listArtifactRepairIssues(a, .asset, "text", 0);
     defer types.freeArtifactRepairIssues(a, issues);
     try std.testing.expectEqual(@as(usize, 0), issues.len);
+    try db.addIndex(.{ .name = "graph", .kind = .graph, .config_json = "{}" });
+    try recordArtifactRepairIssueContextDetailed(db.async_context, .asset, "graph", "doc", "", "", "units", "", "units", key, null, 5, .enrichment_failed, 1, "ConnectionRefused");
+    // Root manifests are metadata, not extraction-relation rows. Replay must
+    // settle their debt even when no graph projection work is applicable.
+    try std.testing.expect(!try applyDerivedBatchToIndexAsync(db.async_context, batch, .{ .name = "graph", .kind = .graph }, .{}));
+    const graph_issues = try db.listArtifactRepairIssues(a, .asset, "graph", 0);
+    defer types.freeArtifactRepairIssues(a, graph_issues);
+    try std.testing.expectEqual(@as(usize, 0), graph_issues.len);
 }
