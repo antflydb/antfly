@@ -2595,6 +2595,13 @@ pub const IndexWriter = struct {
         return snap;
     }
 
+    /// Metadata-only status pin. It must not initiate mapped-residency work.
+    pub fn acquireStatusSnapshotWithAdmission(self: *IndexWriter, io: std.Io, original: @import("common/read_admission.zig").Port) !*IndexSnapshot {
+        try @import("common/cleanup_wait.zig").lockAtomic(&self.snapshot_mu, io, original);
+        defer self.snapshot_mu.unlock();
+        return @atomicLoad(*IndexSnapshot, &self.current, .acquire).retain();
+    }
+
     fn acquireSnapshotRaw(self: *IndexWriter) *IndexSnapshot {
         self.lockSnapshotMutex();
         defer self.snapshot_mu.unlock();

@@ -1160,6 +1160,7 @@ pub const ShadowState = struct {
 };
 
 pub const LocalExecutionState = struct {
+    close_index_status: @import("close_index_status.zig").Program = .{},
     retained_preparation_owner: ?*@import("prepared_lifetime.zig").Owner = null,
     /// Optional generation hint, accessed only under the physical query-pin guard.
     native_query_reuse: ?@import("native_query_reuse.zig").State = null,

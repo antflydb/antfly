@@ -375,7 +375,7 @@ pub const IndexStatusSnapshot = struct {
     updated_at_ns: u64 = 0,
 };
 
-const index_status_prefix = "\x00\x00__metadata__:index_status:";
+pub const index_status_prefix = "\x00\x00__metadata__:index_status:";
 pub const index_status_magic_v1: u64 = 0x3153544154584449; // "IDXTATS1" little-endian
 pub const index_status_magic: u64 = 0x3253544154584449; // "IDXTATS2" little-endian
 pub const index_status_encoded_len = 9 * 8;

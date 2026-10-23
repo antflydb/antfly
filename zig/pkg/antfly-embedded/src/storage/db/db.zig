@@ -6327,6 +6327,10 @@ pub const DB = struct {
         // until their callbacks and payload retirement have completed. Retain
         // all three generations for physical close and interrupted retry.
         try self.backend_runtime.durable_jobs.quiesceOwnersWithAdmission(&.{ self.algebraic_hll_owner_id, self.repair_cleanup_owner_id, self.backend_owner_id }, original);
+        // Capture final human-facing status while cleanup owns CPU. The
+        // stable program survives interruption; physical persistence consumes
+        // it before index/allocator destruction without recollecting live state.
+        if (self.open_mode.allowsIndexWorkers()) try self.captureCloseIndexStatusWithAdmission(original);
     }
 
     fn stopRetainedPreparations(self: *DB) void {
@@ -6432,13 +6436,14 @@ pub const DB = struct {
             // human-facing lifecycle/status view once at graceful shutdown;
             // a failure cannot invalidate the authoritative posting WAL and
             // will be repaired from it on the next open.
-            self.saveAllLiveIndexStatusSnapshots(self.alloc) catch |err| {
+            self.persistCloseIndexStatus() catch |err| {
                 std.log.warn("index status snapshot persistence deferred during close err={s}", .{@errorName(err)});
             };
             self.core.syncStore(true) catch |err| {
                 std.log.warn("index status snapshot sync deferred during close err={s}", .{@errorName(err)});
             };
         }
+        self.local_execution.close_index_status.deinit(self.alloc);
         // Async capture leases are capabilities owned by the live index
         // manager. The executor is stopped above, so no worker can install a
         // new lease; cancel and release any interrupted catch-up capture while
@@ -37459,6 +37464,68 @@ pub const DB = struct {
         var status_batch = try store.beginWriteBatch();
         errdefer status_batch.abort();
         for (pending.items) |item| try status_batch.put(item.key, &item.value);
+        try status_batch.commit();
+    }
+
+    fn captureCloseIndexStatusWithAdmission(self: *DB, original: @import("../../common/read_admission.zig").Port) !void {
+        const program = &self.local_execution.close_index_status;
+        const manager = self.core.index_manager;
+        const io = self.backend_runtime.io() orelse self.backend_runtime.filesystemIo() orelse std.Options.debug_io;
+        try program.acquire(io, original);
+        defer program.release();
+        if (program.complete) return;
+        // Serving, producer and catalog mutation admission is already fenced.
+        // Borrow one stable name/entry at a time, never a cloned config array.
+        capture: while (program.group < 4) {
+            try original.checkpoint();
+            inline for (.{ "text_indexes", "dense_indexes", "sparse_indexes", "graph_indexes" }, 0..) |field, group| {
+                if (program.group == group) {
+                    const items = @field(manager, field).items;
+                    if (program.index == items.len) {
+                        program.group += 1;
+                        program.index = 0;
+                        continue :capture;
+                    }
+                    const entry = &items[program.index];
+                    if (program.pending_value == null) {
+                        try program.ensureRow(self.alloc);
+                        const now = platform_time.awakeNs(manager.checkpointIo());
+                        if (comptime group == 0) {
+                            if (program.text_snapshot == null) program.text_snapshot = try entry.persistent.acquireStatusSnapshotWithAdmission(io, original);
+                            const status_snapshot = program.text_snapshot.?;
+                            while (program.text_segment < status_snapshot.segments.len) {
+                                try original.checkpoint();
+                                program.text_count +|= status_snapshot.segments[program.text_segment].liveDocCount();
+                                program.text_segment += 1;
+                            }
+                            program.pending_value = .{ .kind = .full_text, .doc_count = program.text_count, .updated_at_ns = now };
+                        } else if (comptime group == 1) {
+                            const counts = try entry.index.servingStatusWithAdmission(io, original);
+                            program.pending_value = .{ .kind = .dense_vector, .doc_count = counts.active_count, .node_count = counts.node_count, .root_node = counts.root_node, .updated_at_ns = now };
+                        } else if (comptime group == 2) {
+                            const counts = try entry.index.statsWithAdmission(original);
+                            program.pending_value = .{ .kind = .sparse_vector, .doc_count = counts.doc_count, .term_count = counts.term_count, .updated_at_ns = now };
+                        } else {
+                            const counts = try entry.index.operationalStatsWithAdmission(io, original);
+                            program.pending_value = .{ .kind = .graph, .doc_count = counts.node_count, .node_count = counts.node_count, .edge_count = counts.edge_count, .graph_counts_pending = counts.counts_pending, .updated_at_ns = now };
+                        }
+                    }
+                    try program.appendPending(self.alloc, entry.config.name, original);
+                    continue :capture;
+                }
+            }
+        }
+        try original.checkpoint();
+        program.complete = true;
+    }
+
+    fn persistCloseIndexStatus(self: *DB) !void {
+        const program = &self.local_execution.close_index_status;
+        if (!program.complete) return self.saveAllLiveIndexStatusSnapshots(self.alloc);
+        if (program.row_count == 0) return;
+        var status_batch = try self.core.store.beginWriteBatch();
+        errdefer status_batch.abort();
+        try program.stage(&status_batch);
         try status_batch.commit();
     }
 
@@ -151209,4 +151276,79 @@ test "db successful asset publication clears terminal debt but stale and failed 
     const graph_issues = try db.listArtifactRepairIssues(a, .asset, "graph", 0);
     defer types.freeArtifactRepairIssues(a, graph_issues);
     try std.testing.expectEqual(@as(usize, 0), graph_issues.len);
+}
+
+test "controlled close status capture retains earlier rows on held graph metadata and persists captured values" {
+    const admission = @import("../../common/read_admission.zig");
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("close-status");
+    defer directory.cleanup();
+    var db = try DB.open(a, directory.path(), .{
+        .primary_backend = .{ .mem = .{} },
+        .executor = .{ .backend = .manual },
+        .start_index_workers = false,
+        .start_optional_runtimes = false,
+        .start_optional_runtime_workers = false,
+        .start_independent_maintenance = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+    try db.addIndex(.{ .name = "dense", .kind = .dense_vector, .config_json = "{\"field\":\"embedding\",\"dims\":2,\"external\":true}" });
+    try db.addIndex(.{ .name = "sparse", .kind = .sparse_vector, .config_json = "{\"field\":\"terms\"}" });
+    try db.addIndex(.{ .name = "graph", .kind = .graph, .config_json = "{}" });
+    const graph = &db.core.index_manager.graphIndex("graph").?.index;
+    const program = &db.local_execution.close_index_status;
+    const Control = struct {
+        graph: *graph_mod.GraphIndex,
+        program: *@import("close_index_status.zig").Program,
+        held: bool = false,
+        reject: bool = true,
+        begins: usize = 0,
+        fn check(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.reject and self.program.group == 3 and !self.held) {
+                if (!self.graph.ownership_mutex.tryLock()) return error.TestUnexpectedResult;
+                self.held = true;
+            }
+        }
+        fn deadline(_: *anyopaque) !?u64 {
+            return std.math.maxInt(u64);
+        }
+        fn begin(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.begins += 1;
+            if (self.reject and self.program.group == 3) return error.FileNotFound;
+        }
+        fn end(_: *anyopaque) !void {}
+    };
+    var control: Control = .{ .graph = graph, .program = program };
+    const payload: admission.Payload = .{ .ptr = &control, .vtable = &.{ .checkpoint = Control.check, .check_lifetime = Control.check, .deadline_ns = Control.deadline }, .execution_wait = .{ .ptr = &control, .begin = Control.begin, .end = Control.end } };
+    const original = admission.Port.init(&payload);
+    // Exercise the actual close preflight: it fences every producer before
+    // reaching status preparation. No callback may park with the graph guard.
+    defer if (control.held) graph.ownership_mutex.unlock();
+    try std.testing.expectError(error.FileNotFound, db.drainCloseDependenciesWithAdmission(original));
+    try std.testing.expect(program.group == 3 and !program.complete);
+    try std.testing.expect(!program.busy.load(.acquire));
+    const prefix_rows = program.row_count;
+    try std.testing.expect(prefix_rows != 0);
+    const first_key = program.head.?.rows[0].key.ptr;
+    graph.ownership_mutex.unlock();
+    control.held = false;
+    control.reject = false;
+    try db.drainCloseDependenciesWithAdmission(original);
+    try std.testing.expect(program.complete);
+    try std.testing.expectEqual(prefix_rows + 1, program.row_count);
+    try std.testing.expect(program.head.?.rows[0].key.ptr == first_key);
+    const rows = program.row_count;
+    try db.drainCloseDependenciesWithAdmission(original);
+    try std.testing.expectEqual(rows, program.row_count);
+    try std.testing.expect(control.begins != 0);
+    const captured = graph.node_count;
+    graph.node_count = captured + 123;
+    defer graph.node_count = captured;
+    try db.persistCloseIndexStatus();
+    const persisted = (try db.loadIndexStatusSnapshot(a, "graph")) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(captured, persisted.doc_count);
+    try std.testing.expectEqual(captured, persisted.node_count);
 }

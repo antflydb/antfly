@@ -2421,6 +2421,10 @@ pub const PersistentIndex = struct {
         return self.writer.acquireSnapshot();
     }
 
+    pub fn acquireStatusSnapshotWithAdmission(self: *PersistentIndex, io: std.Io, original: @import("../common/read_admission.zig").Port) !*index_mod.IndexSnapshot {
+        return self.writer.acquireStatusSnapshotWithAdmission(io, original);
+    }
+
     pub fn walStatsSnapshot(self: *PersistentIndex) wal_mod.WalStats {
         return self.wal.statsSnapshot();
     }

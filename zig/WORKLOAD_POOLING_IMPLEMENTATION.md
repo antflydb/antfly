@@ -24535,3 +24535,54 @@ durability barrier, nor should successful controlled finalization be followed by
 a duplicate legacy full sync. Equivalent provider adoption remains open. The full
 goal remains active. Full GNU/Linux qualification remains waived, and Linux builds
 require the pinned Nix/glibc toolchain.
+
+### Resumable default close status preparation
+
+The actual controlled DB close preflight now captures final text, dense, sparse
+and graph status after its producer and maintenance drains. The DB retains a
+single status program with fixed-size row chunks, owned keys, a partial key-copy
+cursor and an optional text snapshot pin. Original admission rejection preserves
+completed rows and partial progress; a retry resumes the same capture. One
+logical finisher owns progress while competing finishers wait through their own
+finite original execution authority. No admission callback borrow is retained.
+
+Text capture pins serving metadata without triggering residency maintenance and
+checkpoints between segments. Dense and graph counters use admitted metadata
+guards. Sparse counter fallback reads use an admitted probe rather than the
+legacy raw stats read. Keys copy in bounded CPU quanta. Final physical close
+consumes the captured bytes and releases their storage and snapshot pins before
+index/runtime teardown. Legacy close without completed controlled capture still
+uses its previous collection path. Native ABI 101 and storage-owner ABI 161
+account for the new DB-owned state.
+
+This completes status preparation only. Status batch commit, backend flush,
+ordered final durability and physical retirement still need owning admitted
+phases. No extra preflight fsync has been inserted; the existing final store sync
+remains in place until that complete coordinator can replace it safely.
+
+The main merge includes origin/main `afd21fc353` (pgwire ownership and CI fixes).
+Resolution retains main's owned table-view API and iterative schema child
+traversal, together with this branch's participant-plan requirement and original
+admission checkpoints. A branch-only cohort recovery test also needs the owned
+view API; its compatibility update is checked with the transaction contracts.
+
+Receipt `close-status-main-v3` runs the actual default preflight and all three new
+status tests: its local close companion passes 24/24 cases with no skips or leaks.
+Maintenance shutdown, execution services and schema contracts also pass; the
+native build summary reports 102 successful tests. Error/status/failure identity
+suites pass 45/1/8. The combined build exits nonzero solely at the SQL protocol
+socket test, whose initial sandboxed run cannot bind and hits its watchdog.
+The same built executable retried with loopback access reports QueryCanceled and
+remains in teardown until explicitly terminated; its separate log is retained.
+This protocol check is unresolved and is not claimed as a passing qualification.
+The runner confirms all captured source inputs were unchanged during the run.
+The CI recovery JavaScript suite passes all six tests.
+
+Final transaction receipt `close-status-transaction-main-v5` passes all 60 build
+steps, all 111 coordinator/participant cases and 46 local cases, plus 45/1/8
+identity cases, with no skips, failures or leaks. It covers the owned table-view
+fix, atomic budget observations and original-cohort recovery. The v4 receipt
+preserves the intermediate test compilation corrections. Final verification
+confirms every v5 input and both immutable log hashes; the only source difference
+from v3 is the transaction test compatibility update. Full GNU qualification
+remains waived. The broader goal and the socket-test failure remain open.
