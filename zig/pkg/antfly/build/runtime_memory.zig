@@ -212,7 +212,7 @@ test "native GNU ARM64 ReleaseSafe claims cover pinned Nix compiler peaks" {
     }
     var other = profile;
     other.optimize = .fast;
-    try std.testing.expectEqual(@as(usize, 3) << 30, runtimeCompileMaxRss(.cli, other));
+    try std.testing.expectEqual(@as(usize, 4) << 30, runtimeCompileMaxRss(.cli, other));
     try std.testing.expectEqual(@as(usize, 12) << 30, runtimeCompileMaxRss(.api_kernel, other));
     try std.testing.expectEqual(@as(usize, 11) << 30, runtimeCompileMaxRss(.distributed, other));
     try std.testing.expectEqual(@as(usize, 20) << 30, runtimeCompileMaxRss(.storage_kernel, other));
@@ -233,6 +233,8 @@ pub fn testCompileMaxRss(name: []const u8, host: std.Target, target: std.Target,
     // Hosted truncate recovery/data implementation peaked at
     // 12,111,249,408/13,980,401,664 bytes.
     // Enrichment close-preflight integration peaked at 13,262,782,464 bytes.
+    // Cold retained-dense-close preflight reached 17,806,262,272 bytes.
+    // Its 22 GiB floor includes >25% headroom.
     // Reserve >25% headroom
     // without changing cross-host, release or other test-object reservations.
     if (host.os.tag == .macos and host.cpu.arch == .aarch64 and
@@ -245,7 +247,7 @@ pub fn testCompileMaxRss(name: []const u8, host: std.Target, target: std.Target,
             .{ .name = "api-derived-coverage-tests", .gib = 17 },
             .{ .name = "raft-unit-tests", .gib = 17 },
             .{ .name = "api-table-write-implementation-tests", .gib = 16 },
-            .{ .name = "owner-close-preflight-tests", .gib = 16 },
+            .{ .name = "owner-close-preflight-tests", .gib = 22 },
             .{ .name = "secret-backends-tests", .gib = 19 },
             .{ .name = "antfly-hosted-truncate-fk-recovery", .gib = 15 },
             .{ .name = "data-runtime-implementation-tests", .gib = 17 },
@@ -513,7 +515,7 @@ test "native Darwin Debug test reservations cover measured peaks without unsafe 
     try std.testing.expectEqual(12 * gib, testCompileMaxRss("api-docid-tests", linux, macos, .debug, 12 * gib));
     try std.testing.expectEqual(7 * gib, testCompileMaxRss("api-docid-tests", linux, linux, .debug, 7 * gib));
     const names = [_][]const u8{ "api-auth-tests", "api-derived-coverage-tests", "raft-unit-tests", "api-table-write-implementation-tests", "secret-backends-tests", "antfly-hosted-truncate-fk-recovery", "data-runtime-implementation-tests", "antfly-hosted-self-fk-recovery", "antfly-hosted-initial-fk-recovery", "owner-close-preflight-tests" };
-    const peaks = [_]usize{ 13_895_155_712, 14_097_039_360, 14_420_606_976, 13_252_476_928, 15_418_605_568, 12_111_249_408, 13_980_401_664, 11_942_445_056, 11_940_200_448, 13_262_782_464 };
+    const peaks = [_]usize{ 13_895_155_712, 14_097_039_360, 14_420_606_976, 13_252_476_928, 15_418_605_568, 12_111_249_408, 13_980_401_664, 11_942_445_056, 11_940_200_448, 17_806_262_272 };
     for (names, peaks) |name, measured| {
         const floor = testCompileMaxRss(name, macos, macos, .debug, 12 * gib);
         try std.testing.expect(floor >= measured + measured / 4);

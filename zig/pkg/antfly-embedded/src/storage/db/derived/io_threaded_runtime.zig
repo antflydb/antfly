@@ -69,6 +69,9 @@ const Worker = struct {
         durable: bool = false,
         done: bool = false,
     } = .{},
+    // A prepared replay window survives cleanup admission and persistence
+    // rejection. Never collect/apply it again while its exact finish is pending.
+    pending_publication: ?struct { sequence: u64, finished: ?CatchUpFinishResult = null } = null,
     next_delay_ms: ?u64 = 0,
     idle_since_ns: ?u64 = null,
     catch_up_open: bool = false,
@@ -532,6 +535,7 @@ pub const DerivedRuntime = if (builtin.os.tag == .freestanding) struct {
         const final = &worker.finalization;
         if (final.done) return;
         const io = self.ioContext();
+        const finish_sequence = if (worker.pending_publication) |pending| pending.sequence else worker.applied_sequence;
         if (!final.started) {
             try self.lockFinalizationMetadata(original);
             if (worker.catch_up_close_failed) {
@@ -543,6 +547,10 @@ pub const DerivedRuntime = if (builtin.os.tag == .freestanding) struct {
             final.cursor = worker.replay_cursor;
             final.had_session = worker.catch_up_open;
             final.token = worker.catch_up_token;
+            if (worker.pending_publication) |pending| if (pending.finished) |receipt| {
+                final.finish_done = true;
+                final.durable = receipt.applied_sequence_persisted;
+            };
             final.started = true;
             worker.replay_cursor = null;
             worker.replay_cursor_open_sequence = 0;
@@ -564,10 +572,10 @@ pub const DerivedRuntime = if (builtin.os.tag == .freestanding) struct {
                 if (self.finish_catch_up_fn) |finish| {
                     var attempt: runtime_types.FinishAttempt = .{};
                     const call = if (original != null and self.finish_with_admission != null)
-                        self.finish_with_admission.?(self.ctx, worker.kind, final.token, worker.applied_sequence, original.?, &attempt)
+                        self.finish_with_admission.?(self.ctx, worker.kind, final.token, finish_sequence, original, &attempt)
                     else legacy: {
                         attempt.consumed = true;
-                        break :legacy finish(self.ctx, worker.kind, final.token, worker.applied_sequence, true);
+                        break :legacy finish(self.ctx, worker.kind, final.token, finish_sequence, true);
                     };
                     const result = call catch |cause| failed: {
                         if (attempt.completed) |receipt| {
@@ -601,14 +609,18 @@ pub const DerivedRuntime = if (builtin.os.tag == .freestanding) struct {
         self.cond.broadcast(io);
         self.mutex.unlock(io);
         if (final.finish_failure) |cause| return cause;
-        if (worker.applied_sequence > worker.persisted_sequence and !final.durable) {
+        if (finish_sequence > worker.persisted_sequence and !final.durable) {
             try finalizationCheckpoint(original);
-            if (!try self.persist_fn(self.ctx, worker.name, worker.applied_sequence, true))
+            if (!try self.persist_fn(self.ctx, worker.name, finish_sequence, true))
                 return RuntimeError.AsyncWorkerFailed;
             final.durable = true;
         }
         try self.lockFinalizationMetadata(original);
-        if (final.durable) worker.persisted_sequence = @max(worker.persisted_sequence, worker.applied_sequence);
+        if (final.durable) {
+            worker.applied_sequence = @max(worker.applied_sequence, finish_sequence);
+            worker.persisted_sequence = @max(worker.persisted_sequence, finish_sequence);
+        }
+        worker.pending_publication = null;
         final.done = true;
         self.mutex.unlock(io);
     }
@@ -734,6 +746,7 @@ pub const DerivedRuntime = if (builtin.os.tag == .freestanding) struct {
             self.recordError(io, worker, "pause_close_session", err);
             return err;
         };
+        try settlePendingPublication(self, worker);
         return true;
     }
 
@@ -773,6 +786,9 @@ pub const DerivedRuntime = if (builtin.os.tag == .freestanding) struct {
         if (worker.future) |*future| _ = future.await(io);
         _ = closeWorkerCatchUpState(self, worker, worker.applied_sequence, true) catch |err| {
             std.log.warn("derived worker final catch-up close failed worker={s}: {s}", .{ worker.name, @errorName(err) });
+        };
+        settlePendingPublication(self, worker) catch |cause| {
+            std.log.warn("derived worker pending publication retirement failed worker={s}: {s}", .{ worker.name, @errorName(cause) });
         };
         self.alloc.free(worker.name);
         self.alloc.destroy(worker);
@@ -1297,8 +1313,20 @@ fn workerMain(worker: *Worker) void {
                 return;
             }
             _ = closeWorkerCatchUpState(runtime, worker, worker.applied_sequence, true) catch |err| {
+                if (worker.catch_up_open and !worker.catch_up_close_failed and catch_up_policy.isRecoverableAdmissionError(err)) {
+                    scheduleRecoverableCatchUpRetry(worker, err);
+                    return;
+                }
                 close_success = false;
                 runtime.recordError(io, worker, "idle_close", err);
+                return;
+            };
+            settlePendingPublication(runtime, worker) catch |cause| {
+                if (catch_up_policy.isRecoverableAdmissionError(cause)) {
+                    scheduleRecoverableCatchUpRetry(worker, cause);
+                    return;
+                }
+                runtime.recordError(io, worker, "idle_publication", cause);
                 return;
             };
             worker.idle_since_ns = null;
@@ -1314,145 +1342,148 @@ fn workerMain(worker: *Worker) void {
         const target_sequence = worker.target_sequence;
         const replay_tail_records = target_sequence -| from_sequence;
         if (replay_tail_records > 0) worker.last_replay_tail_records = replay_tail_records;
-        worker.catch_up_active = true;
+        worker.catch_up_active = worker.pending_publication == null;
         runtime.mutex.unlock(io);
 
-        // Do not pin the primary replay generation until the coalescing wait
-        // has collected its batch. Otherwise a stable cursor can only observe
-        // the pre-wait tail and every newly arrived record forces another
-        // publication cycle.
-        waitForReplayWindow(runtime, worker, from_sequence, io);
-        ensureWorkerCatchUpState(runtime, worker, from_sequence) catch |err| {
-            runtime.mutex.lockUncancelable(io);
-            worker.catch_up_active = false;
-            runtime.cond.broadcast(io);
-            runtime.mutex.unlock(io);
-            if (workerIsStopping(runtime, worker, io)) return;
-            if (isRecoverableCatchUpError(worker, err)) {
-                _ = closeWorkerCatchUpState(runtime, worker, worker.applied_sequence, false) catch |close_err| {
-                    close_success = false;
-                    runtime.recordError(io, worker, "recoverable_begin_catch_up_close", close_err);
-                    return;
-                };
-                scheduleRecoverableCatchUpRetry(worker, err);
-                continue;
-            }
-            close_success = false;
-            runtime.recordError(io, worker, "begin_catch_up_session", err);
-            return;
-        };
-        var stats = catchUpWorker(runtime, worker) catch |err| {
-            runtime.mutex.lockUncancelable(io);
-            worker.catch_up_active = false;
-            runtime.cond.broadcast(io);
-            runtime.mutex.unlock(io);
-            if (workerIsStopping(runtime, worker, io)) return;
-            if (isRecoverableCatchUpError(worker, err)) {
-                _ = closeWorkerCatchUpState(runtime, worker, worker.applied_sequence, false) catch |close_err| {
-                    close_success = false;
-                    runtime.recordError(io, worker, "recoverable_catch_up_close", close_err);
-                    return;
-                };
-                scheduleRecoverableCatchUpRetry(worker, err);
-                continue;
-            }
-            close_success = false;
-            runtime.recordError(io, worker, "catch_up", err);
-            return;
-        };
-        if (stats.last_sequence == 0 and target_sequence > from_sequence) {
-            if (worker.replay_cursor != null) {
-                if (worker.replay_cursor.?.canFollowTail()) {
-                    const target_visible = runtime.replay_source.isSequenceVisible(target_sequence) catch |err| {
-                        runtime.mutex.lockUncancelable(io);
-                        worker.catch_up_active = false;
-                        runtime.cond.broadcast(io);
-                        runtime.mutex.unlock(io);
+        const caught_up_sequence = if (worker.pending_publication) |pending| pending.sequence else collected: {
+            // Do not pin the primary replay generation until the coalescing wait
+            // has collected its batch. Otherwise a stable cursor can only observe
+            // the pre-wait tail and every newly arrived record forces another
+            // publication cycle.
+            waitForReplayWindow(runtime, worker, from_sequence, io);
+            ensureWorkerCatchUpState(runtime, worker, from_sequence) catch |err| {
+                runtime.mutex.lockUncancelable(io);
+                worker.catch_up_active = false;
+                runtime.cond.broadcast(io);
+                runtime.mutex.unlock(io);
+                if (workerIsStopping(runtime, worker, io)) return;
+                if (isRecoverableCatchUpError(worker, err)) {
+                    _ = closeWorkerCatchUpState(runtime, worker, worker.applied_sequence, false) catch |close_err| {
                         close_success = false;
-                        runtime.recordError(io, worker, "target_visibility", err);
+                        runtime.recordError(io, worker, "recoverable_begin_catch_up_close", close_err);
                         return;
                     };
-                    if (!target_visible) {
+                    scheduleRecoverableCatchUpRetry(worker, err);
+                    continue;
+                }
+                close_success = false;
+                runtime.recordError(io, worker, "begin_catch_up_session", err);
+                return;
+            };
+            var stats = catchUpWorker(runtime, worker) catch |err| {
+                runtime.mutex.lockUncancelable(io);
+                worker.catch_up_active = false;
+                runtime.cond.broadcast(io);
+                runtime.mutex.unlock(io);
+                if (workerIsStopping(runtime, worker, io)) return;
+                if (isRecoverableCatchUpError(worker, err)) {
+                    _ = closeWorkerCatchUpState(runtime, worker, worker.applied_sequence, false) catch |close_err| {
+                        close_success = false;
+                        runtime.recordError(io, worker, "recoverable_catch_up_close", close_err);
+                        return;
+                    };
+                    scheduleRecoverableCatchUpRetry(worker, err);
+                    continue;
+                }
+                close_success = false;
+                runtime.recordError(io, worker, "catch_up", err);
+                return;
+            };
+            if (stats.last_sequence == 0 and target_sequence > from_sequence) {
+                if (worker.replay_cursor != null) {
+                    if (worker.replay_cursor.?.canFollowTail()) {
+                        const target_visible = runtime.replay_source.isSequenceVisible(target_sequence) catch |err| {
+                            runtime.mutex.lockUncancelable(io);
+                            worker.catch_up_active = false;
+                            runtime.cond.broadcast(io);
+                            runtime.mutex.unlock(io);
+                            close_success = false;
+                            runtime.recordError(io, worker, "target_visibility", err);
+                            return;
+                        };
+                        if (!target_visible) {
+                            runtime.mutex.lockUncancelable(io);
+                            worker.catch_up_active = false;
+                            runtime.cond.broadcast(io);
+                            runtime.mutex.unlock(io);
+                            io.sleep(Io.Duration.zero, .awake) catch {};
+                            continue;
+                        }
+                    }
+                    closeWorkerReplayCursor(runtime, worker);
+                    ensureWorkerCatchUpState(runtime, worker, from_sequence) catch |err| {
                         runtime.mutex.lockUncancelable(io);
                         worker.catch_up_active = false;
                         runtime.cond.broadcast(io);
                         runtime.mutex.unlock(io);
-                        io.sleep(Io.Duration.zero, .awake) catch {};
-                        continue;
-                    }
+                        if (workerIsStopping(runtime, worker, io)) return;
+                        if (isRecoverableCatchUpError(worker, err)) {
+                            _ = closeWorkerCatchUpState(runtime, worker, worker.applied_sequence, false) catch |close_err| {
+                                close_success = false;
+                                runtime.recordError(io, worker, "recoverable_refresh_replay_cursor_close", close_err);
+                                return;
+                            };
+                            scheduleRecoverableCatchUpRetry(worker, err);
+                            continue;
+                        }
+                        close_success = false;
+                        runtime.recordError(io, worker, "refresh_replay_cursor", err);
+                        return;
+                    };
+                    stats = catchUpWorker(runtime, worker) catch |err| {
+                        runtime.mutex.lockUncancelable(io);
+                        worker.catch_up_active = false;
+                        runtime.cond.broadcast(io);
+                        runtime.mutex.unlock(io);
+                        if (workerIsStopping(runtime, worker, io)) return;
+                        if (isRecoverableCatchUpError(worker, err)) {
+                            _ = closeWorkerCatchUpState(runtime, worker, worker.applied_sequence, false) catch |close_err| {
+                                close_success = false;
+                                runtime.recordError(io, worker, "recoverable_refreshed_catch_up_close", close_err);
+                                return;
+                            };
+                            scheduleRecoverableCatchUpRetry(worker, err);
+                            continue;
+                        }
+                        close_success = false;
+                        runtime.recordError(io, worker, "catch_up_refreshed", err);
+                        return;
+                    };
                 }
+            }
+            runtime.mutex.lockUncancelable(io);
+            worker.catch_up_active = false;
+            runtime.cond.broadcast(io);
+            runtime.mutex.unlock(io);
+            if (stats.last_sequence == 0 and worker.replay_cursor != null and !worker.replay_cursor.?.canFollowTail()) {
                 closeWorkerReplayCursor(runtime, worker);
-                ensureWorkerCatchUpState(runtime, worker, from_sequence) catch |err| {
-                    runtime.mutex.lockUncancelable(io);
-                    worker.catch_up_active = false;
-                    runtime.cond.broadcast(io);
-                    runtime.mutex.unlock(io);
-                    if (workerIsStopping(runtime, worker, io)) return;
-                    if (isRecoverableCatchUpError(worker, err)) {
-                        _ = closeWorkerCatchUpState(runtime, worker, worker.applied_sequence, false) catch |close_err| {
-                            close_success = false;
-                            runtime.recordError(io, worker, "recoverable_refresh_replay_cursor_close", close_err);
-                            return;
-                        };
-                        scheduleRecoverableCatchUpRetry(worker, err);
-                        continue;
-                    }
-                    close_success = false;
-                    runtime.recordError(io, worker, "refresh_replay_cursor", err);
-                    return;
-                };
-                stats = catchUpWorker(runtime, worker) catch |err| {
-                    runtime.mutex.lockUncancelable(io);
-                    worker.catch_up_active = false;
-                    runtime.cond.broadcast(io);
-                    runtime.mutex.unlock(io);
-                    if (workerIsStopping(runtime, worker, io)) return;
-                    if (isRecoverableCatchUpError(worker, err)) {
-                        _ = closeWorkerCatchUpState(runtime, worker, worker.applied_sequence, false) catch |close_err| {
-                            close_success = false;
-                            runtime.recordError(io, worker, "recoverable_refreshed_catch_up_close", close_err);
-                            return;
-                        };
-                        scheduleRecoverableCatchUpRetry(worker, err);
-                        continue;
-                    }
-                    close_success = false;
-                    runtime.recordError(io, worker, "catch_up_refreshed", err);
-                    return;
-                };
             }
-        }
-        runtime.mutex.lockUncancelable(io);
-        worker.catch_up_active = false;
-        runtime.cond.broadcast(io);
-        runtime.mutex.unlock(io);
-        if (stats.last_sequence == 0 and worker.replay_cursor != null and !worker.replay_cursor.?.canFollowTail()) {
-            closeWorkerReplayCursor(runtime, worker);
-        }
 
-        const target_advance_allowed = if (stats.shouldTryTargetAdvance(from_sequence, target_sequence))
-            canAdvanceToTarget(runtime, worker, from_sequence, target_sequence) catch |err| {
-                close_success = false;
-                runtime.recordError(io, worker, "target_advance", err);
-                return;
+            const target_advance_allowed = if (stats.shouldTryTargetAdvance(from_sequence, target_sequence))
+                canAdvanceToTarget(runtime, worker, from_sequence, target_sequence) catch |err| {
+                    close_success = false;
+                    runtime.recordError(io, worker, "target_advance", err);
+                    return;
+                }
+            else
+                false;
+            const collected_sequence = if (stats.appliedSequenceAdvance(from_sequence)) |sequence|
+                sequence
+            else if (target_advance_allowed)
+                target_sequence
+            else
+                from_sequence;
+            if (collected_sequence == from_sequence and stats.shouldTryTargetAdvance(from_sequence, target_sequence)) {
+                _ = closeWorkerCatchUpState(runtime, worker, worker.applied_sequence, false) catch |err| {
+                    close_success = false;
+                    runtime.recordError(io, worker, "coverage_gap_close", err);
+                    return;
+                };
+                io.sleep(Io.Duration.fromNanoseconds(50 * std.time.ns_per_ms), .awake) catch {};
+                continue;
             }
-        else
-            false;
-        const caught_up_sequence = if (stats.appliedSequenceAdvance(from_sequence)) |sequence|
-            sequence
-        else if (target_advance_allowed)
-            target_sequence
-        else
-            from_sequence;
-        if (caught_up_sequence == from_sequence and stats.shouldTryTargetAdvance(from_sequence, target_sequence)) {
-            _ = closeWorkerCatchUpState(runtime, worker, worker.applied_sequence, false) catch |err| {
-                close_success = false;
-                runtime.recordError(io, worker, "coverage_gap_close", err);
-                return;
-            };
-            io.sleep(Io.Duration.fromNanoseconds(50 * std.time.ns_per_ms), .awake) catch {};
-            continue;
-        }
+            break :collected collected_sequence;
+        };
 
         var persisted = false;
         if (caught_up_sequence > from_sequence) {
@@ -1481,6 +1512,7 @@ fn workerMain(worker: *Worker) void {
 
         var truncate_sequence: u64 = 0;
         runtime.mutex.lockUncancelable(io);
+        worker.pending_publication = null;
         const applied_sequence_advanced = caught_up_sequence > worker.applied_sequence;
         if (applied_sequence_advanced) {
             worker.applied_sequence = caught_up_sequence;
@@ -1677,6 +1709,12 @@ fn closeWorkerCatchUpState(
     var replay_cursor = worker.replay_cursor;
     const catch_up_open = worker.catch_up_open;
     const token = worker.catch_up_token;
+    const finish_sequence = if (success and worker.pending_publication != null) worker.pending_publication.?.sequence else applied_sequence;
+    if (!success and worker.pending_publication != null and worker.pending_publication.?.finished == null) worker.pending_publication = null;
+    // Only the ordinary raw maintenance dispatch has no foreground execution
+    // to lend. Structural pause/removal and physical teardown retain their
+    // existing callback until their caller authority is explicitly supplied.
+    const owning_finish = success and worker.dispatch_active and runtime.finish_with_admission != null;
     worker.replay_cursor = null;
     worker.replay_cursor_open_sequence = 0;
     worker.catch_up_open = false;
@@ -1690,23 +1728,57 @@ fn closeWorkerCatchUpState(
     runtime.mutex.unlock(io);
 
     if (replay_cursor) |*cursor| cursor.deinit(runtime.alloc);
-    if (!catch_up_open) return .{};
+    if (!catch_up_open) {
+        if (success) if (worker.pending_publication) |pending| if (pending.finished) |result| return result;
+        return .{};
+    }
 
     var finish_result: CatchUpFinishResult = .{};
-    if (runtime.finish_catch_up_fn) |finish_catch_up| {
-        finish_result = finish_catch_up(runtime.ctx, worker.kind, token, applied_sequence, success) catch |err| {
-            runtime.mutex.lockUncancelable(io);
-            worker.catch_up_close_active = false;
-            worker.catch_up_close_failed = true;
-            runtime.cond.broadcast(io);
-            runtime.mutex.unlock(io);
-            return err;
-        };
-    }
+    const outcome = if (owning_finish) owned: {
+        var attempt: runtime_types.FinishAttempt = .{};
+        const call = runtime.finish_with_admission.?(runtime.ctx, worker.kind, token, finish_sequence, null, &attempt);
+        if (call) |result| {
+            if (!attempt.consumed or (attempt.completed != null and !std.meta.eql(attempt.completed.?, result)))
+                break :owned @as(anyerror!CatchUpFinishResult, RuntimeError.AsyncWorkerFailed);
+            break :owned @as(anyerror!CatchUpFinishResult, result);
+        } else |cause| {
+            if (attempt.completed) |receipt| {
+                if (!attempt.consumed) break :owned @as(anyerror!CatchUpFinishResult, RuntimeError.AsyncWorkerFailed);
+                // There is no foreground return error to deliver here. The
+                // authoritative receipt prevents replay or duplicate fsync.
+                break :owned @as(anyerror!CatchUpFinishResult, receipt);
+            }
+            if (!attempt.consumed) {
+                runtime.mutex.lockUncancelable(io);
+                worker.pending_publication = .{ .sequence = finish_sequence };
+                worker.catch_up_open = true;
+                worker.catch_up_token = token;
+                worker.catch_up_close_requested = true;
+                worker.catch_up_close_active = false;
+                runtime.cond.broadcast(io);
+                runtime.mutex.unlock(io);
+                return cause;
+            }
+            break :owned @as(anyerror!CatchUpFinishResult, cause);
+        }
+    } else if (runtime.finish_catch_up_fn) |finish|
+        finish(runtime.ctx, worker.kind, token, finish_sequence, success)
+    else
+        @as(anyerror!CatchUpFinishResult, .{});
+    finish_result = outcome catch |cause| {
+        runtime.mutex.lockUncancelable(io);
+        worker.catch_up_close_active = false;
+        worker.catch_up_close_failed = true;
+        worker.pending_publication = null;
+        runtime.cond.broadcast(io);
+        runtime.mutex.unlock(io);
+        return cause;
+    };
     {
         runtime.mutex.lockUncancelable(io);
         worker.catch_up_close_active = false;
         worker.catch_up_close_failed = false;
+        if (worker.pending_publication) |*pending| pending.finished = finish_result;
         runtime.cond.broadcast(io);
         runtime.mutex.unlock(io);
     }
@@ -1715,6 +1787,25 @@ fn closeWorkerCatchUpState(
             token.value, applied_sequence, success, finish_result.applied_sequence_persisted,
         });
     return finish_result;
+}
+
+// The caller has joined the dispatch and owns this worker structurally. A
+// persistence refusal leaves the receipt intact for a later pause/finalizer.
+fn settlePendingPublication(runtime: *DerivedRuntime, worker: *Worker) !void {
+    const pending = worker.pending_publication orelse return;
+    const result = pending.finished orelse return error.ResourceTemporarilyUnavailable;
+    if (!result.applied_sequence_persisted and pending.sequence > worker.persisted_sequence) {
+        if (!try runtime.persist_fn(runtime.ctx, worker.name, pending.sequence, true)) return error.ResourceTemporarilyUnavailable;
+    }
+    const io = runtime.ioContext();
+    runtime.mutex.lockUncancelable(io);
+    const advanced = pending.sequence > worker.applied_sequence;
+    worker.applied_sequence = @max(worker.applied_sequence, pending.sequence);
+    worker.persisted_sequence = @max(worker.persisted_sequence, pending.sequence);
+    worker.pending_publication = null;
+    runtime.cond.broadcast(io);
+    runtime.mutex.unlock(io);
+    if (advanced) if (runtime.applied_sequence_advanced_fn) |callback| callback(runtime.ctx, worker.name, pending.sequence);
 }
 
 fn isRecoverablePublishError(worker: *const Worker, err: anyerror) bool {
@@ -3602,15 +3693,15 @@ const FinalizationProbe = struct {
         if (self.fail_finish) return error.OutOfMemory;
         return .{ .applied_sequence_persisted = self.durable_finish };
     }
-    fn controlledFinish(raw: *anyopaque, _: index_manager_mod.ManagedIndexRef, token: CatchUpSessionToken, _: u64, original: @import("../../../common/read_admission.zig").Port, attempt: *runtime_types.FinishAttempt) !CatchUpFinishResult {
+    fn controlledFinish(raw: *anyopaque, _: index_manager_mod.ManagedIndexRef, token: CatchUpSessionToken, _: u64, original: ?@import("../../../common/read_admission.zig").Port, attempt: *runtime_types.FinishAttempt) !CatchUpFinishResult {
         const self: *@This() = @ptrCast(@alignCast(raw));
         std.debug.assert(token.value == 7);
         self.controlled_calls += 1;
-        try original.checkpoint();
+        if (original) |control| try control.checkpoint();
         if (self.controlled_mode == .reject_before) return error.NotFound;
         var return_boundary: ?@import("../../../common/execution_wait.zig").Boundary = null;
         if (self.receipt_reentry) {
-            return_boundary = (try original.executionWaitAfterLifetime()) orelse return error.ExecutionWaitUnsupported;
+            return_boundary = (try original.?.executionWaitAfterLifetime()) orelse return error.ExecutionWaitUnsupported;
             try return_boundary.?.beginWait();
         }
         if (self.controlled_mode != .invalid_success) attempt.consumed = true;
@@ -3986,5 +4077,140 @@ test "controlled dense finalization completion receipt rejects contradictory pro
         try std.testing.expectEqual(@as(usize, 0), probe.finishes);
         try std.testing.expectEqual(@as(usize, 0), probe.persists);
         try std.testing.expectEqual(@as(u64, 0), worker.persisted_sequence);
+    }
+}
+
+test "controlled dense finalization ordinary dispatch retains rejected capture and accepts only consumed receipts" {
+    const Mode = enum { success, reject_once, failed_after, invalid_success, completed_error };
+    const Probe = struct {
+        mode: Mode,
+        calls: usize = 0,
+        legacy_calls: usize = 0,
+        fn apply(_: *anyopaque, _: derived_types.DerivedBatch, _: index_manager_mod.ManagedIndexRef, _: CatchUpSessionToken) !bool {
+            return true;
+        }
+        fn persist(_: *anyopaque, _: []const u8, _: u64, _: bool) !bool {
+            return true;
+        }
+        fn truncate(_: *anyopaque, _: u64) !void {}
+        fn legacy(raw: *anyopaque, _: index_manager_mod.ManagedIndexRef, _: CatchUpSessionToken, _: u64, _: bool) !CatchUpFinishResult {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.legacy_calls += 1;
+            return .{};
+        }
+        fn finish(raw: *anyopaque, _: index_manager_mod.ManagedIndexRef, token: CatchUpSessionToken, sequence: u64, original: ?@import("../../../common/read_admission.zig").Port, attempt: *runtime_types.FinishAttempt) !CatchUpFinishResult {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expect(original == null);
+            try std.testing.expectEqual(@as(u64, 7), token.value);
+            try std.testing.expectEqual(@as(u64, 1), sequence);
+            self.calls += 1;
+            if (self.mode == .reject_once and self.calls == 1) return error.SchedulerFull;
+            if (self.mode == .invalid_success) return .{};
+            attempt.consumed = true;
+            if (self.mode == .failed_after) return error.OutOfMemory;
+            attempt.completed = .{ .applied_sequence_persisted = true };
+            if (self.mode == .completed_error) return error.NotFound;
+            return attempt.completed.?;
+        }
+    };
+    for (std.enums.values(Mode)) |mode| {
+        var probe: Probe = .{ .mode = mode };
+        var runtime = try DerivedRuntime.init(std.testing.allocator, undefined, &probe, Probe.apply, Probe.persist, Probe.truncate, null, Probe.legacy, null, null, null);
+        defer runtime.deinit();
+        runtime.finish_with_admission = Probe.finish;
+        const name = try std.testing.allocator.dupe(u8, "ordinary-finish");
+        const worker = try std.testing.allocator.create(Worker);
+        worker.* = .{ .runtime = &runtime, .name = name, .kind = .{ .name = name, .kind = .dense_vector }, .applied_sequence = 1, .persisted_sequence = 1, .target_sequence = 1, .catch_up_open = true, .catch_up_token = .{ .value = 7 }, .catch_up_close_requested = true };
+        try runtime.workers.append(std.testing.allocator, worker);
+        runtime.last_claimed_truncate_sequence = 1;
+        runtime.last_truncated_sequence = 1;
+        const failed = mode == .failed_after or mode == .invalid_success;
+        var delay: ?u64 = null;
+        if (failed) {
+            worker.dispatch_active = true;
+            try std.testing.expectError(if (mode == .failed_after) error.OutOfMemory else RuntimeError.AsyncWorkerFailed, closeWorkerCatchUpState(&runtime, worker, 1, true));
+            worker.dispatch_active = false;
+        } else delay = workerStep(worker);
+        if (mode == .reject_once) {
+            try std.testing.expect((delay orelse 0) >= 10);
+            try std.testing.expect(worker.catch_up_open and worker.catch_up_token.value == 7);
+            try std.testing.expect(worker.catch_up_close_requested and !worker.catch_up_close_active and !worker.catch_up_close_failed);
+            try std.testing.expect(worker.last_error_name == null and runtime.last_error_name == null);
+            worker.retry_not_before_ns = 0;
+            try std.testing.expect(workerStep(worker) == null);
+        }
+        if (mode == .failed_after or mode == .invalid_success) {
+            try std.testing.expect(worker.catch_up_close_failed);
+            try std.testing.expect(worker.last_error_name == null);
+        } else {
+            try std.testing.expect(!worker.catch_up_close_failed);
+            try std.testing.expect(worker.last_error_name == null);
+        }
+        try std.testing.expect(!worker.catch_up_open and worker.catch_up_token.isNone());
+        try std.testing.expectEqual(@as(usize, if (mode == .reject_once) 2 else 1), probe.calls);
+        try std.testing.expectEqual(@as(usize, 0), probe.legacy_calls);
+    }
+}
+
+test "controlled dense finalization ordinary publication retries finish and persistence without replaying the applied window" {
+    const alloc = std.testing.allocator;
+    const Hooks = struct {
+        fn finish(raw: *anyopaque, ref: index_manager_mod.ManagedIndexRef, token: CatchUpSessionToken, sequence: u64, original: ?@import("../../../common/read_admission.zig").Port, attempt: *runtime_types.FinishAttempt) !CatchUpFinishResult {
+            const capture: *TestThreadedRuntimeCapture = @ptrCast(@alignCast(raw));
+            try std.testing.expect(original == null);
+            if (capture.fail_next_publish.swap(false, .monotonic)) return error.SchedulerFull;
+            attempt.consumed = true;
+            const result = try testThreadedRuntimeFinishCatchUp(raw, ref, token, sequence, true);
+            attempt.completed = result;
+            return result;
+        }
+        fn persist(raw: *anyopaque, name: []const u8, sequence: u64, force: bool) !bool {
+            const capture: *TestThreadedRuntimeCapture = @ptrCast(@alignCast(raw));
+            if (capture.fail_next_forced_persist.swap(false, .monotonic)) return error.ResourceTemporarilyUnavailable;
+            return testThreadedRuntimePersist(raw, name, sequence, force);
+        }
+    };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrintSentinel(alloc, ".zig-cache/tmp/{s}/retained-publication", .{tmp.sub_path}, 0);
+    defer alloc.free(path);
+    var journal = try change_journal_mod.Journal.open(path, testThreadedRuntimeJournalOpenOptions());
+    defer journal.close();
+    try appendTestThreadedRuntimeRecord(&journal, alloc, .{ .sequence = 1, .changed_doc_keys = &.{"doc:a"}, .target_hints = &.{.dense_vector} });
+    var capture: TestThreadedRuntimeCapture = .{ .fail_next_publish = .init(true), .fail_next_forced_persist = .init(true) };
+    var runtime = try DerivedRuntime.init(alloc, replay_source_mod.Source.fromJournal(&journal), &capture, testThreadedRuntimeApply, Hooks.persist, testThreadedRuntimeTruncate, testThreadedRuntimeBeginCatchUp, testThreadedRuntimeFinishCatchUp, null, testThreadedRuntimeAppliedSequenceAdvanced, null);
+    defer runtime.deinit();
+    capture.runtime = &runtime;
+    runtime.finish_with_admission = Hooks.finish;
+    try runtime.addWorker("idx", .{ .name = "idx", .kind = .dense_vector }, 0);
+    runtime.notifySequence(1);
+    try runtime.waitForAll(1);
+    try runtime.failIfUnhealthy();
+    try std.testing.expectEqual(@as(u64, 1), capture.apply_calls.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 1), capture.begin_calls.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 1), capture.finish_calls.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 1), capture.persisted_sequence.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 1), capture.callback_observed_applied_sequence.load(.acquire));
+    try std.testing.expectEqual(@as(u64, 2), runtime.recoverable_retry_counters.snapshot().resource_budget);
+}
+
+test "controlled dense finalization shutdown retains the prepared target and completed durability receipt" {
+    for ([_]bool{ false, true }) |finished| {
+        var probe: FinalizationProbe = .{ .durable_finish = true };
+        var runtime = try DerivedRuntime.init(std.testing.allocator, undefined, &probe, FinalizationProbe.apply, FinalizationProbe.persist, FinalizationProbe.truncate, null, FinalizationProbe.finish, null, null, null);
+        defer runtime.deinit();
+        const worker = try probe.install(&runtime);
+        worker.applied_sequence = 0;
+        worker.pending_publication = .{ .sequence = 1, .finished = if (finished) .{ .applied_sequence_persisted = true } else null };
+        if (finished) {
+            worker.catch_up_open = false;
+            worker.catch_up_token = .{};
+        }
+        try runtime.finalizeWorker(worker, null);
+        try std.testing.expectEqual(@as(u64, 1), worker.applied_sequence);
+        try std.testing.expectEqual(@as(u64, 1), worker.persisted_sequence);
+        try std.testing.expect(worker.pending_publication == null);
+        try std.testing.expectEqual(@as(usize, if (finished) 0 else 1), probe.finishes);
+        try std.testing.expectEqual(@as(usize, 0), probe.persists);
     }
 }

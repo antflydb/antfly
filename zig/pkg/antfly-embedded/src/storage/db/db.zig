@@ -59742,13 +59742,22 @@ fn finishDerivedCatchUpSessionAsyncWithAdmission(
     index_ref: index_manager_mod.ManagedIndexRef,
     token: derived_executor_mod.CatchUpSessionToken,
     applied_sequence: u64,
-    original: @import("../../common/read_admission.zig").Port,
+    original: ?@import("../../common/read_admission.zig").Port,
     attempt: *@import("derived/runtime_types.zig").FinishAttempt,
 ) !derived_executor_mod.CatchUpFinishResult {
     const ctx: *AsyncContext = @ptrCast(@alignCast(ctx_ptr));
     if (index_ref.kind == .dense_vector and ctx.capture_cleanup_owner != null) {
-        if (try original.executionDelegation()) |delegation| {
-            if (try finishDenseWithReservedExecution(ctx, index_ref, token, applied_sequence, original, attempt, delegation)) |result| return result;
+        if (original) |control| {
+            if (try control.executionDelegation()) |delegation| {
+                if (try finishDenseWithReservedExecution(ctx, index_ref, token, applied_sequence, control, attempt, delegation)) |result| return result;
+            }
+        } else {
+            // An ordinary dispatch owns no foreground capsule. Claim without
+            // waiting before activating the capture's already funded cleanup.
+            var claim = (try ctx.dense_admission.sessions.tryClaimFinish(index_ref.name, token)) orelse return error.ResourceTemporarilyUnavailable;
+            defer claim.deinit();
+            if (try claim.reservation()) |reserved|
+                return finishDenseOnReservedExecution(ctx, index_ref, applied_sequence, null, attempt, &claim, reserved);
         }
     }
     return finishDerivedCatchUpSessionAsyncImpl(ctx_ptr, index_ref, token, applied_sequence, true, original, attempt, null);
@@ -59774,15 +59783,15 @@ fn finishDenseWithReservedExecution(ctx: *AsyncContext, index_ref: index_manager
     }
 }
 
-fn finishDenseOnReservedExecution(ctx: *AsyncContext, index_ref: index_manager_mod.ManagedIndexRef, applied_sequence: u64, original: @import("../../common/read_admission.zig").Port, attempt: *@import("derived/runtime_types.zig").FinishAttempt, claim: *@import("dense_catch_up_session_owner.zig").FinishClaim, reserved: *@import("antfly_runtime_abi").runnable_abi.ReservedCleanup) !derived_executor_mod.CatchUpFinishResult {
+fn finishDenseOnReservedExecution(ctx: *AsyncContext, index_ref: index_manager_mod.ManagedIndexRef, applied_sequence: u64, original: ?@import("../../common/read_admission.zig").Port, attempt: *@import("derived/runtime_types.zig").FinishAttempt, claim: *@import("dense_catch_up_session_owner.zig").FinishClaim, reserved: *@import("antfly_runtime_abi").runnable_abi.ReservedCleanup) !derived_executor_mod.CatchUpFinishResult {
     const Restriction = struct {
         fn check(raw: *anyopaque) callconv(.c) @import("antfly_runtime_abi").error_abi.Status {
-            const control: *const @import("../../common/read_admission.zig").Port = @ptrCast(@alignCast(raw));
-            control.checkLifetime() catch |cause| return @import("antfly_runtime_abi").error_abi.statusFromError(cause);
+            const control: *const ?@import("../../common/read_admission.zig").Port = @ptrCast(@alignCast(raw));
+            control.*.?.checkLifetime() catch |cause| return @import("antfly_runtime_abi").error_abi.statusFromError(cause);
             return .ok;
         }
     };
-    const grant = try reserved.enterChecked(&.{ .context = @ptrCast(@constCast(&original)), .check = Restriction.check });
+    const grant = try reserved.enterChecked(if (original != null) &.{ .context = @ptrCast(@constCast(&original)), .check = Restriction.check } else null);
     var registry_owns_execution = true;
     defer if (registry_owns_execution) {
         _ = grant.borrow.park(grant.borrow.context, @backingInt(@import("antfly_runtime_abi").runnable_abi.Wait.resource));
@@ -150096,7 +150105,7 @@ test "controlled dense finalization DB callback retains real capture through rej
             .begin_failure => error.NotFound,
             .end_failure => error.Canceled,
             .lifetime_in_wait => error.DeadlineExceeded,
-        }, finishDerivedCatchUpSessionAsyncWithAdmission(ctx, ref, token, sequence, .init(&payload), &attempt));
+        }, finishDerivedCatchUpSessionAsyncWithAdmission(ctx, ref, token, sequence, @import("../../common/read_admission.zig").Port.init(&payload), &attempt));
         try std.testing.expect(!attempt.consumed);
         try std.testing.expect(attempt.completed == null);
         try std.testing.expectEqual(funded_bytes, owner.owner.scheduler.stats().retained_bytes);
@@ -150108,7 +150117,7 @@ test "controlled dense finalization DB callback retains real capture through rej
         control.case = .begin_failure;
         // The retry needs no waits: all guards are free and the original
         // exact capture is still owned. No newly minted session is accepted.
-        const finish_result = try finishDerivedCatchUpSessionAsyncWithAdmission(ctx, ref, token, sequence, .init(&payload), &attempt);
+        const finish_result = try finishDerivedCatchUpSessionAsyncWithAdmission(ctx, ref, token, sequence, @import("../../common/read_admission.zig").Port.init(&payload), &attempt);
         try std.testing.expect(attempt.consumed);
         try std.testing.expectEqualDeep(finish_result, attempt.completed.?);
         try std.testing.expectEqual(@as(usize, 0), owner.owner.scheduler.stats().operations);
@@ -150131,7 +150140,7 @@ test "controlled dense finalization DB callback delegates the sole cleanup CPU a
             return now_ns;
         }
     };
-    const Case = enum { success, begin_rejection, preparation_rejection, reentry_rejection, apply_contention, wait_rejection };
+    const Case = enum { success, begin_rejection, preparation_rejection, reentry_rejection, apply_contention, wait_rejection, owning_success, owning_claim_rejection };
     for (std.enums.values(Case)) |case| {
         Clock.now_ns = 0;
         defer Clock.now_ns = 0;
@@ -150245,9 +150254,26 @@ test "controlled dense finalization DB callback delegates the sole cleanup CPU a
         defer if (control.held_apply) |mutex| mutex.unlock();
         var payload: admission.Payload = .{ .ptr = &control, .vtable = &.{ .checkpoint = Control.checkpoint, .check_lifetime = Control.lifetime, .deadline_ns = Control.deadlineNs }, .execution_wait = .{ .ptr = &control, .begin = Control.begin, .end = Control.end }, .delegation = .{ .suspension = .{ .ptr = &control, .begin = Control.begin, .end = Control.end } } };
         var attempt: @import("derived/runtime_types.zig").FinishAttempt = .{};
-        const outcome = finishDerivedCatchUpSessionAsyncWithAdmission(ctx, ref, token, sequence, .init(&payload), &attempt);
+        const owning = case == .owning_success or case == .owning_claim_rejection;
+        if (owning) try Control.checked(control.execution.park(control.execution.context, @backingInt(runtime.runnable_abi.Wait.resource)));
+        var registry_held = false;
+        defer if (registry_held) ctx.dense_admission.sessions.mutex.unlock();
+        if (case == .owning_claim_rejection) {
+            try std.testing.expect(ctx.dense_admission.sessions.mutex.tryLock());
+            registry_held = true;
+        }
+        const outcome = finishDerivedCatchUpSessionAsyncWithAdmission(ctx, ref, token, sequence, if (owning) null else admission.Port.init(&payload), &attempt);
         switch (case) {
-            .success, .apply_contention => _ = try outcome,
+            .success, .apply_contention, .owning_success => _ = try outcome,
+            .owning_claim_rejection => {
+                try std.testing.expectError(error.ResourceTemporarilyUnavailable, outcome);
+                try std.testing.expect(!attempt.consumed and attempt.completed == null);
+                try std.testing.expect(ctx.dense_admission.sessions.sessions.contains(token.value));
+                try std.testing.expectEqual(charged, owner.owner.scheduler.stats().retained_bytes);
+                ctx.dense_admission.sessions.mutex.unlock();
+                registry_held = false;
+                _ = try finishDerivedCatchUpSessionAsyncWithAdmission(ctx, ref, token, sequence, null, &attempt);
+            },
             .reentry_rejection => {
                 try std.testing.expectError(error.DeadlineExceeded, outcome);
                 try std.testing.expect(attempt.consumed and attempt.completed != null);
@@ -150260,7 +150286,7 @@ test "controlled dense finalization DB callback delegates the sole cleanup CPU a
                 try std.testing.expectEqual(charged, owner.owner.scheduler.stats().retained_bytes);
                 try std.testing.expectEqual(@as(usize, 2), owner.owner.scheduler.stats().operations);
                 control.case = .success;
-                _ = try finishDerivedCatchUpSessionAsyncWithAdmission(ctx, ref, token, sequence, .init(&payload), &attempt);
+                _ = try finishDerivedCatchUpSessionAsyncWithAdmission(ctx, ref, token, sequence, admission.Port.init(&payload), &attempt);
             },
         }
         try std.testing.expect(attempt.consumed and attempt.completed != null);

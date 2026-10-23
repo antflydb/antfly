@@ -23801,3 +23801,46 @@ accepted request can still retire; the full 46-case worker RPC suite and 30
 focused repetitions pass. Qualification receipts retain the intermediate
 failures and final evidence. Full GNU/Linux qualification remains waived, and
 the full scheduling design remains unfinished.
+
+### Retain execution for ordinary dense finish
+
+The Io-derived dispatch now uses the consumption-reporting finish callback with
+no foreground control. A funded dense capture claims its exact session without
+waiting, enters its existing cleanup reservation, and prepares under that
+reservation's original lifetime. Metadata waits lend that execution; physical
+finish and mandatory retirement retain it. Controlled foreground close continues
+to suspend and rejoin its original caller. Native ABI 91 and storage-owner ABI
+149 fence the expanded callback and runtime state.
+
+A rejected preparation restores the exact worker token and a pending publication
+frame. The next dispatch retries that finish before collecting or applying more
+replay. The frame retains its completed receipt through persistence rejection,
+and disappears only when the worker publishes progress. Shutdown and structural
+pause/removal use the retained target and receipt, rather than a stale applied
+sequence. Capacity rejection keeps bounded backoff and does not poison the
+worker. The inline frame adds no separate allocation or escaping control borrow.
+
+Manual execution, structural callback CPU handoff and uncontrolled physical
+teardown/abort remain unqualified. Physical callback I/O and cooperative CPU cost
+bounds, other backend teardown, parent metadata charging and the broader
+cross-engine/fault/default-policy gates remain open. Strong required providers
+remain disabled; this is not completion of the full design. Full GNU/Linux
+qualification remains waived; Linux requires the pinned Nix/glibc compiler.
+
+Pinned Darwin Debug validation passes all 76 build steps and 148 reported tests
+in `dense-ordinary-owning-finish-final`: 70 derived visibility/finalization,
+56 maintenance shutdown, 20 execution-service and two linked close tests.
+The simple runners additionally pass 25 DB/session and 21 local-close cases.
+Error ABI (45), released status ABI (1), failure identity (8), and compiler-memory
+policy (13) pass. The journal-backed publication fixture rejects cleanup
+admission and then persistence, while observing exactly one capture, one apply
+and one physical finish. The real DB matrix covers owning cleanup and exact-token
+retry after registry rejection; shutdown tests cover the retained target and
+completed durability receipt.
+
+Cold Darwin close preflight reached 17,806,262,272 compiler bytes. Its test-object
+reservation is now 22 GiB, retaining more than 25% headroom; other host/profile
+reservations and server runtime budgets are unchanged. The compiler-policy tests
+also retain main's four-GiB CLI default alongside the measured GNU ReleaseSafe
+specialization. Intermediate failures and final source hashes remain in the
+qualification receipts. Full GNU/Linux qualification remains waived.

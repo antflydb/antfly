@@ -20,7 +20,7 @@ const admission = @import("../../common/read_admission.zig");
 /// retained execution without reviving the original caller's expired authority.
 pub const Control = struct {
     grant: runtime.runnable_abi.ReservedCleanup.Grant,
-    original: admission.Port,
+    original: ?admission.Port,
     payload: admission.Payload = undefined,
     pub fn port(self: *Control) admission.Port {
         self.payload = .{ .ptr = self, .vtable = &.{ .checkpoint = checkpoint, .check_lifetime = lifetime, .deadline_ns = deadline }, .execution_wait = .{ .ptr = self, .begin = begin, .end = end } };
@@ -31,7 +31,7 @@ pub const Control = struct {
     }
     fn lifetime(raw: *anyopaque) !void {
         const self: *Control = @ptrCast(@alignCast(raw));
-        try self.original.checkLifetime();
+        if (self.original) |original| try original.checkLifetime();
         try self.grant.borrow.checkLifetime();
     }
     fn checkpoint(raw: *anyopaque) !void {
