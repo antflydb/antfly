@@ -6286,6 +6286,13 @@ pub const DB = struct {
         try self.executor.finalizeWithAdmission(original);
         try self.local_execution.source_publication.stopWithAdmission(self.backend_runtime, original);
         try self.local_execution.online_merge_reader.closeWithAdmission(self.backend_runtime.io() orelse self.backend_runtime.filesystemIo() orelse std.Options.debug_io, original);
+        // Foreground users and preparation/maintenance producers are fenced.
+        // Join cache callbacks while cleanup execution can still be lent;
+        // physical close must not spin behind their CPU work.
+        const cache_io = self.backend_runtime.io() orelse self.backend_runtime.filesystemIo() orelse std.Options.debug_io;
+        try self.restore_decoder_cache.drainCallbacksWithAdmission(cache_io, original);
+        try self.rewrite_program_cache.drainCallbacksWithAdmission(cache_io, original);
+        try self.rewrite_tail_cache.drainCallbacksWithAdmission(cache_io, original);
     }
 
     fn stopRetainedPreparations(self: *DB) void {

@@ -23892,3 +23892,44 @@ the corrected fixture and guard-ordering checks are included in the final
 receipt. Source hashes and intermediate/final logs remain in the qualification
 receipts. Full GNU/Linux qualification remains waived; the full design remains
 unfinished.
+
+### Controlled restore/rewrite cache callback retirement
+
+Serving-owner close preflight now drains callbacks owned by the restore decoder,
+rewrite program and rewrite tail caches after foreground and preparation producers
+have drained. ResourceManager fences new reclamation leases before waiting for
+existing invocations. Registry contention and callback retirement lend the original
+cleanup execution through finite, checked waits; no registry or cache guard crosses
+a handoff. Each retry looks up the original identity again, so a concurrently
+retired and reused registry cell cannot become a stale borrowed pointer. Registry
+scans check the original lifetime without lending CPU under their guard.
+
+A rejected wait retains the fenced registration and cache context for retry.
+The decoder cache drains reclamation first, updates its registration metadata under
+its mutex, then cancels and joins the idle timer without that mutex. It also waits
+for pinned restore pages with execution handoff before physical decoder teardown.
+Partial preflight success remains safe to retry. Physical cache deinitialization
+keeps responsibility for destroying the cached objects and releasing their memory;
+this preflight introduces no new execution root or renewed cleanup budget.
+Storage-owner ABI 151 fences this expanded close contract; native payload layouts
+are unchanged.
+
+This covers callback retirement on the serving-owner controlled close path.
+Direct/uncontrolled physical close, decoder/backend I/O and CPU cooperation,
+remaining backend teardown, parent metadata charging, and broader cross-engine,
+fault and default-policy gates remain open. The full goal remains active; full
+GNU/Linux qualification remains waived and Linux requires pinned Nix/glibc Zig.
+
+Pinned Darwin Debug qualification `cache-close-callbacks-v2` passes all 64 build
+steps and 58 reported tests (56 maintenance shutdown and two linked C-entry close
+cases). The simple runners pass 27 DB/finalization/cache cases and 21 local close
+cases, with no skips, failures or leaks. The cache tests exercise five modes for
+each of the three real cache drain methods: live reclamation, rejected handoff,
+rejected original reentry, lifetime expiry and registry contention. They fence
+new callbacks after rejection and retry the retained registration. Four restore
+page cases verify balanced handoff, exact unpin and retry before physical close.
+Error ABI (45), released status ABI (1) and failure identity (8) also pass. All
+5,537 recorded native/schema inputs match the final source. The first run's
+maintenance-only test root lacked the decoder's physical DB binding; the final
+run puts these cases in the existing DB qualification root. Both receipts remain
+available; no full GNU/Linux qualification was run.

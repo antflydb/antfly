@@ -2149,6 +2149,36 @@ pub const ResourceManager = struct {
         return @sizeOf(ReclaimerChunk);
     }
 
+    /// Fence new callback leases, then lend the caller's CPU while existing
+    /// invocations retire. A rejected wait retains the fenced slot and callback
+    /// context; the owner must retry before destroying either. No slot pointer
+    /// escapes the registry lock: another unregister may retire and reuse it.
+    pub fn unregisterReclaimerWithAdmission(self: *ResourceManager, identity: u64, io: std.Io, original: read_admission.Port) !void {
+        if (identity == 0) return;
+        const wait = @import("../common/cleanup_wait.zig");
+        var trace: read_admission.RejectionTrace = .{};
+        const control = trace.bind(original).?;
+        while (true) {
+            const pending = blk: {
+                try wait.lockAtomic(&self.reclaimer_mutex, io, control);
+                defer self.reclaimer_mutex.unlock();
+                for (self.reclaimers.items) |slot| {
+                    // Lifetime checks cannot lend execution under this guard.
+                    // A large registry still respects the original deadline.
+                    try control.checkLifetime();
+                    if (slot.identity != identity) continue;
+                    slot.retiring = true;
+                    const busy = slot.in_flight.load(.acquire) != 0;
+                    if (!busy) slot.* = .{};
+                    break :blk busy;
+                }
+                break :blk false;
+            };
+            if (!pending) return;
+            try wait.waitForRetry(io, control);
+        }
+    }
+
     pub fn unregisterReclaimer(self: *ResourceManager, identity: u64) void {
         if (identity == 0) return;
         while (true) {
