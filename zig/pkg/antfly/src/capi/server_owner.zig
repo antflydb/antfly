@@ -7067,6 +7067,14 @@ test "controlled owner close preflight C entry drains a real DB with the origina
         const resolution_context = handle.db.resolution_append_context.?;
         try handle.db.initOptionalTextMergeRuntime(.{ .enabled = true });
         const text_merge = handle.db.text_merge_runtime.?;
+        try handle.db.initOptionalTtlRuntime(.{ .enabled = true, .lease_owned = true });
+        const ttl = handle.db.ttl_runtime.?;
+        try ttl.runOnce();
+        try std.testing.expect(ttl.stats().has_lease);
+        try ttl.start();
+        try handle.db.initOptionalSparseCompactionRuntime(.{ .enabled = true });
+        const sparse = handle.db.sparse_compaction_runtime.?;
+        try sparse.start();
         try text_merge.start();
         try std.testing.expect(text_merge.future != null);
         try enrichment.start();
@@ -7132,6 +7140,12 @@ test "controlled owner close preflight C entry drains a real DB with the origina
         try std.testing.expect(!handle.db.isClosed());
         try std.testing.expect(text_merge.producer_closing.load(.acquire));
         try std.testing.expect(text_merge.joined.isSet() and text_merge.future == null);
+        try std.testing.expect(ttl.joined.isSet() and ttl.future == null);
+        try std.testing.expect(sparse.joined.isSet() and sparse.future == null);
+        try std.testing.expect(ttl.stats().has_lease);
+        try std.testing.expect(handle.db.ttl_cleanup_context != null);
+        try std.testing.expectError(error.Canceled, ttl.start());
+        try std.testing.expectError(error.Canceled, sparse.start());
         try std.testing.expectError(error.TextMergeRuntimeShutdown, text_merge.acquireProducerPermit("late", 1, 1));
         try std.testing.expectError(error.Canceled, text_merge.start());
         try std.testing.expectError(error.WorkerStopping, handle.db.executor.addWorker("late", .{ .name = "late", .kind = .full_text }, 0));

@@ -24097,3 +24097,50 @@ updates: the ordinary-slot test observes the new completion event rather than
 the old registry condition, and the scope-pin test retries acquisition against a
 concurrently closing thread. Full GNU/Linux qualification remains waived; the
 full design remains unfinished.
+
+### Controlled TTL and sparse-compaction producer retirement
+
+DB close preflight now permanently fences and joins TTL cleanup and sparse
+compaction before native projection, enrichment and derived finalization. TTL
+can still submit document/derived mutations; its dependencies and primary backend
+must retain admission until the accepted callback retires. Sparse tasks keep
+mandatory publication/retirement behavior while their registration drains.
+
+Both runtimes retain the exact shared maintenance registration after rejected
+handoff, lifetime or reentry. Retry joins the same registration. New start,
+resume, ensure-running and manual passes fail once permanent close begins;
+sparse notifications cannot revive it. Ordinary stop/pause remains restartable
+until then. A concurrent compatibility stop participates in the same exclusive
+finisher rather than joining a copied registration. Preflight retains TTL's
+lease, context and backing store until physical destruction.
+
+The common retirement helper supports both atomic lifecycle mutexes and Io
+mutexes. Controlled acquisitions use the original finite cleanup control and
+release guards before parking. Native ABI 95 and storage-owner ABI 155 fence the
+expanded runtime layout and producer-close contract.
+
+Graph-metric supervision still needs conversion from its per-runtime sleeping
+future to the shared maintenance scheduler, followed by controlled close before
+derived finalization. Physical backend teardown, callback I/O/CPU cooperation,
+remaining resource charging and broader original design gates remain open. The
+full goal remains active. Full GNU/Linux qualification remains waived; Linux
+builds require pinned Nix/glibc Zig.
+
+Pinned Darwin Debug receipt `producer-close-v2` passes all 73 native build steps
+and 88 build-runner tests (63 maintenance, 23 execution-service and two linked
+C-entry tests). The simple runners pass 31 DB/finalization/cache/dependency and
+21 local-owner-close cases without skips, failures or leaks. Error ABI (45),
+released status ABI (1) and failure identity (8) also pass. The real DB matrix
+exercises both producers with one ordinary CPU, accepted callback retirement,
+rejected handoff/lifetime/reentry, exact retry, retained TTL ownership, denied
+late start/manual work and restartable ordinary stops. A separate TTL regression
+rejects cleanup before mutex publication and proves the permanent fence prevents
+a scheduled pass from acquiring a lease. The Io-mutex helper joins also cover
+an abandoned finisher racing a compatibility stop.
+
+The linked close regression enables both runtimes and proves their joins finish
+while TTL's lease/context remain alive, before physical DB destruction. The
+receipt records unchanged native/schema inputs and the immutable log hash.
+`producer-close-v1` contains the initial passing foundation run, before the
+additional early-fence regression and Io-mutex concurrency coverage. Full GNU/Linux
+qualification remains waived and the full design is unfinished.

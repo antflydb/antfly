@@ -42,7 +42,8 @@ const failure_abi = @import("runtime_failure_abi");
 // Projection supervision uses shared maintenance dispatch and controlled close.
 // Close preflight drains accepted HLL/repair/backend work in dependency order.
 // Controlled close requires admitted metadata fencing and owning drain leases.
-pub const abi_version: u32 = 154;
+// Close preflight fences TTL and sparse producers before derived finalization.
+pub const abi_version: u32 = 155;
 pub const Status = failure_abi.Status;
 pub const FailureBoundary = failure_abi.FailureBoundary;
 pub const FailureIdentity = failure_abi.FailureIdentity;

@@ -100,7 +100,8 @@ const builtin = @import("builtin");
 // Owned assemblies retain checked memory state; native retries observe commits.
 // Projection supervisors own shared recurring registrations and join state.
 // Durable drain leases own completion signals and pin their producing scope.
-pub const abi_version: u32 = 94;
+// TTL and sparse maintenance retain exclusive controlled close state.
+pub const abi_version: u32 = 95;
 
 pub const zig_compiler_id: u64 = stableId(builtin.zig_version_string);
 
