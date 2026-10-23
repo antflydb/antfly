@@ -5109,6 +5109,8 @@ pub fn renderCudaRuntimeAttentionRegion(allocator: std.mem.Allocator) ![]u8 {
     var out = std.ArrayListUnmanaged(u8).empty;
     errdefer out.deinit(allocator);
     var emitted: usize = 0;
+    var flash_common_emitted = false;
+    var splitk_common_emitted = false;
     for (first_generated_attention_artifacts) |artifact| {
         if (!cudaAttentionArtifactRuntimeWired(artifact)) continue;
         if (emitted != 0) try out.append(allocator, '\n');
@@ -5119,14 +5121,22 @@ pub fn renderCudaRuntimeAttentionRegion(allocator: std.mem.Allocator) ![]u8 {
         if (cudaFlashPrefillRenderPlanForArtifact(artifact)) |plan| {
             const plan_id = try cuda_renderer.flashPrefillPlanId(plan, allocator);
             defer allocator.free(plan_id);
-            const body = try cuda_renderer.renderFlashPrefillBodyAlloc(allocator, plan);
+            if (!flash_common_emitted) {
+                try out.appendSlice(allocator, cuda_renderer.flashPrefillCommonSource());
+                flash_common_emitted = true;
+            }
+            const body = try cuda_renderer.renderFlashPrefillInstantiationAlloc(allocator, plan);
             defer allocator.free(body);
             try appendFmt(allocator, &out, "// kernel_id={s} plan_id={s}\n", .{ plan.kernel_id, plan_id });
             try out.appendSlice(allocator, body);
         } else if (cudaSplitkOnlineDecodeRenderPlanForArtifact(artifact)) |plan| {
             const plan_id = try cuda_renderer.splitkOnlineDecodePlanId(plan, allocator);
             defer allocator.free(plan_id);
-            const body = try cuda_renderer.renderSplitkOnlineDecodeBodyAlloc(allocator, plan);
+            if (!splitk_common_emitted) {
+                try out.appendSlice(allocator, cuda_renderer.splitkOnlineCommonSource());
+                splitk_common_emitted = true;
+            }
+            const body = try cuda_renderer.renderSplitkOnlineDecodeInstantiationAlloc(allocator, plan);
             defer allocator.free(body);
             try appendFmt(allocator, &out, "// kernel_id={s} plan_id={s}\n", .{ plan.kernel_id, plan_id });
             try out.appendSlice(allocator, body);
@@ -5298,6 +5308,16 @@ pub fn renderMetalRuntimeQuantRegion(allocator: std.mem.Allocator) ![]u8 {
     }
     const body = try metal_renderer.renderRuntimeRegion(arena, kernels.items);
 
+    return encodeMetalRuntimeSource(allocator, body);
+}
+
+pub fn renderMetalRuntimeCompatibilityAttentionRegion(allocator: std.mem.Allocator) ![]u8 {
+    const body = try metal_renderer.renderCompatibilityRuntimeAttention(allocator);
+    defer allocator.free(body);
+    return encodeMetalRuntimeSource(allocator, body);
+}
+
+fn encodeMetalRuntimeSource(allocator: std.mem.Allocator, body: []const u8) ![]u8 {
     var out = std.ArrayListUnmanaged(u8).empty;
     errdefer out.deinit(allocator);
     var lines = std.mem.splitScalar(u8, body, '\n');
@@ -7993,6 +8013,8 @@ test "quant kernel compiler renders the runtime-wired CUDA attention region dete
     try std.testing.expectEqualStrings(first, second);
     try std.testing.expectEqual(@as(usize, 15), first_generated_attention_artifacts.len);
 
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, first, cuda_renderer.flashPrefillCommonSource()));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, first, cuda_renderer.splitkOnlineCommonSource()));
     var runtime_wired_count: usize = 0;
     for (first_generated_attention_artifacts) |artifact| {
         if (!cudaAttentionArtifactRuntimeWired(artifact)) continue;
@@ -8008,7 +8030,7 @@ test "quant kernel compiler renders the runtime-wired CUDA attention region dete
             try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, first, exported_symbol));
             try std.testing.expect(artifact.production_enabled);
             try std.testing.expect(artifact.runtime_default_enabled);
-            const body = try cuda_renderer.renderFlashPrefillBodyAlloc(std.testing.allocator, plan);
+            const body = try cuda_renderer.renderFlashPrefillInstantiationAlloc(std.testing.allocator, plan);
             defer std.testing.allocator.free(body);
             try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, first, body));
         } else if (cudaSplitkOnlineDecodeRenderPlanForArtifact(artifact)) |plan| {
@@ -8022,7 +8044,7 @@ test "quant kernel compiler renders the runtime-wired CUDA attention region dete
             try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, first, exported_symbol));
             try std.testing.expect(!artifact.production_enabled);
             try std.testing.expect(!artifact.runtime_default_enabled);
-            const body = try cuda_renderer.renderSplitkOnlineDecodeBodyAlloc(std.testing.allocator, plan);
+            const body = try cuda_renderer.renderSplitkOnlineDecodeInstantiationAlloc(std.testing.allocator, plan);
             defer std.testing.allocator.free(body);
             try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, first, body));
         } else {
@@ -8103,7 +8125,7 @@ test "quant kernel compiler CUDA attention candidate stays in sync with the runt
             const bundle_metadata = try std.fmt.allocPrint(std.testing.allocator, "kernel_id={s} plan_id={s}", .{ plan.kernel_id, route_id });
             defer std.testing.allocator.free(bundle_metadata);
             try std.testing.expect(std.mem.containsAtLeast(u8, bundle, 1, bundle_metadata));
-            const body = try cuda_renderer.renderFlashPrefillBodyAlloc(std.testing.allocator, plan);
+            const body = try cuda_renderer.renderFlashPrefillInstantiationAlloc(std.testing.allocator, plan);
             defer std.testing.allocator.free(body);
             try std.testing.expect(std.mem.containsAtLeast(u8, bundle, 1, body));
         } else if (cudaSplitkOnlineDecodeRenderPlanForArtifact(artifact)) |plan| {
@@ -8112,7 +8134,7 @@ test "quant kernel compiler CUDA attention candidate stays in sync with the runt
             const bundle_metadata = try std.fmt.allocPrint(std.testing.allocator, "kernel_id={s} plan_id={s}", .{ plan.kernel_id, route_id });
             defer std.testing.allocator.free(bundle_metadata);
             try std.testing.expect(std.mem.containsAtLeast(u8, bundle, 1, bundle_metadata));
-            const body = try cuda_renderer.renderSplitkOnlineDecodeBodyAlloc(std.testing.allocator, plan);
+            const body = try cuda_renderer.renderSplitkOnlineDecodeInstantiationAlloc(std.testing.allocator, plan);
             defer std.testing.allocator.free(body);
             try std.testing.expect(std.mem.containsAtLeast(u8, bundle, 1, body));
         } else {

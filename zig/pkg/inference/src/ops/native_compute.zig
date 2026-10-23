@@ -8491,6 +8491,75 @@ fn makeLinearNoBiasResult(self: *NativeCompute, output: []f32, rows: usize, out_
     return self.withLogicalShape(result, &shape);
 }
 
+/// Raw grouped outputs transfer individually into shaped tensor handles.
+/// Untransferred buffers and already-built handles have separate cleanup owners.
+fn GroupedLinearOutputs(comptime count: usize) type {
+    return struct {
+        raw: [count]?[]f32 = @splat(null),
+
+        fn init(self: *NativeCompute, elements: usize) !@This() {
+            var outputs: @This() = .{};
+            errdefer outputs.deinit(self);
+            for (&outputs.raw) |*raw| raw.* = try self.allocator.alloc(f32, elements);
+            return outputs;
+        }
+
+        fn deinit(outputs: *@This(), self: *NativeCompute) void {
+            var i: usize = count;
+            while (i != 0) {
+                i -= 1;
+                if (outputs.raw[i]) |raw| self.allocator.free(raw);
+                outputs.raw[i] = null;
+            }
+        }
+
+        fn intoResults(outputs: *@This(), self: *NativeCompute, rows: usize, out_dim: usize) ![count]CT {
+            var results: [count]CT = undefined;
+            var transferred: usize = 0;
+            errdefer {
+                while (transferred != 0) {
+                    transferred -= 1;
+                    freeTensor(self, results[transferred]);
+                }
+            }
+            inline for (0..count) |i| {
+                results[i] = try makeLinearNoBiasResult(self, outputs.raw[i].?, rows, out_dim);
+                outputs.raw[i] = null;
+                transferred += 1;
+            }
+            return results;
+        }
+    };
+}
+
+test "native grouped projection outputs release every partial allocation and handle" {
+    const Check = struct {
+        fn run(a: std.mem.Allocator, comptime count: usize) !void {
+            var store = WeightStore{ .allocator = a, .resident_weights = .{}, .lazy_weights = .{} };
+            defer store.deinitOwned();
+            var compute = NativeCompute.init(a, &store, null);
+            defer compute.deinit();
+            var outputs = try GroupedLinearOutputs(count).init(&compute, 6);
+            defer outputs.deinit(&compute);
+            for (outputs.raw, 0..) |raw, i| @memset(raw.?, @as(f32, @floatFromInt(i + 1)));
+            const results = try outputs.intoResults(&compute, 2, 3);
+            defer for (results) |result| freeTensor(&compute, result);
+            for (results, 0..) |result, i| {
+                try std.testing.expectEqualSlices(i64, &.{ 2, 3 }, tensorStoredShape(result).?);
+                for (try getDataChecked(result)) |value| try std.testing.expectEqual(@as(f32, @floatFromInt(i + 1)), value);
+            }
+        }
+        fn pair(a: std.mem.Allocator) !void {
+            return run(a, 2);
+        }
+        fn triple(a: std.mem.Allocator) !void {
+            return run(a, 3);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Check.pair, .{});
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Check.triple, .{});
+}
+
 fn linearNoBiasPairOp(
     ctx: *anyopaque,
     input: CT,
@@ -8507,10 +8576,8 @@ fn linearNoBiasPairOp(
         if (weight_buf_b.quantized_storage) |storage_b| {
             defer maybeDiscardMappedWeightAfterUse(self, weight_a);
             defer maybeDiscardMappedWeightAfterUse(self, weight_b);
-            var first_output: ?[]f32 = try self.allocator.alloc(f32, rows * out_dim);
-            errdefer if (first_output) |output| self.allocator.free(output);
-            var second_output: ?[]f32 = try self.allocator.alloc(f32, rows * out_dim);
-            errdefer if (second_output) |output| self.allocator.free(output);
+            var outputs = try GroupedLinearOutputs(2).init(self, rows * out_dim);
+            defer outputs.deinit(self);
             if (try dispatchQuantizedLinear(.{
                 .compute = self,
                 .kind = .pair_no_bias,
@@ -8522,20 +8589,12 @@ fn linearNoBiasPairOp(
                 .storage_b = storage_b,
                 .name_a = weight_buf_a.name,
                 .name_b = weight_buf_b.name,
-                .output_a = first_output.?,
-                .output_b = second_output.?,
+                .output_a = outputs.raw[0].?,
+                .output_b = outputs.raw[1].?,
             })) {
-                const first = try makeLinearNoBiasResult(self, first_output.?, rows, out_dim);
-                first_output = null;
-                errdefer freeTensor(ctx, first);
-                const second = try makeLinearNoBiasResult(self, second_output.?, rows, out_dim);
-                second_output = null;
-                return .{ .first = first, .second = second };
+                const results = try outputs.intoResults(self, rows, out_dim);
+                return .{ .first = results[0], .second = results[1] };
             }
-            self.allocator.free(first_output.?);
-            first_output = null;
-            self.allocator.free(second_output.?);
-            second_output = null;
         }
     }
 
@@ -8768,10 +8827,8 @@ fn linearPairOp(
         if (weight_buf_b.quantized_storage) |storage_b| {
             defer maybeDiscardMappedWeightAfterUse(self, weight_a);
             defer maybeDiscardMappedWeightAfterUse(self, weight_b);
-            var first_raw: ?[]f32 = try self.allocator.alloc(f32, rows * out_dim);
-            errdefer if (first_raw) |raw| self.allocator.free(raw);
-            var second_raw: ?[]f32 = try self.allocator.alloc(f32, rows * out_dim);
-            errdefer if (second_raw) |raw| self.allocator.free(raw);
+            var outputs = try GroupedLinearOutputs(2).init(self, rows * out_dim);
+            defer outputs.deinit(self);
 
             const used_quant_pair = try dispatchQuantizedLinear(.{
                 .compute = self,
@@ -8786,23 +8843,14 @@ fn linearPairOp(
                 .name_b = weight_buf_b.name,
                 .bias_a = getData(bias_a),
                 .bias_b = getData(bias_b),
-                .output_a = first_raw.?,
-                .output_b = second_raw.?,
+                .output_a = outputs.raw[0].?,
+                .output_b = outputs.raw[1].?,
             });
 
             if (used_quant_pair) {
-                const first = try makeLinearNoBiasResult(self, first_raw.?, rows, out_dim);
-                first_raw = null;
-                errdefer freeTensor(ctx, first);
-                const second = try makeLinearNoBiasResult(self, second_raw.?, rows, out_dim);
-                second_raw = null;
-                return .{ .first = first, .second = second };
+                const results = try outputs.intoResults(self, rows, out_dim);
+                return .{ .first = results[0], .second = results[1] };
             }
-
-            self.allocator.free(first_raw.?);
-            first_raw = null;
-            self.allocator.free(second_raw.?);
-            second_raw = null;
         }
     }
 
@@ -9024,12 +9072,8 @@ fn linearTripleOp(
                 defer maybeDiscardMappedWeightAfterUse(self, weight_a);
                 defer maybeDiscardMappedWeightAfterUse(self, weight_b);
                 defer maybeDiscardMappedWeightAfterUse(self, weight_c);
-                var first_raw: ?[]f32 = try self.allocator.alloc(f32, rows * out_dim);
-                errdefer if (first_raw) |raw| self.allocator.free(raw);
-                var second_raw: ?[]f32 = try self.allocator.alloc(f32, rows * out_dim);
-                errdefer if (second_raw) |raw| self.allocator.free(raw);
-                var third_raw: ?[]f32 = try self.allocator.alloc(f32, rows * out_dim);
-                errdefer if (third_raw) |raw| self.allocator.free(raw);
+                var outputs = try GroupedLinearOutputs(3).init(self, rows * out_dim);
+                defer outputs.deinit(self);
 
                 const used_quant_triple = try dispatchQuantizedLinear(.{
                     .compute = self,
@@ -9047,32 +9091,18 @@ fn linearTripleOp(
                     .bias_a = getData(bias_a),
                     .bias_b = getData(bias_b),
                     .bias_c = getData(bias_c),
-                    .output_a = first_raw.?,
-                    .output_b = second_raw.?,
-                    .output_c = third_raw.?,
+                    .output_a = outputs.raw[0].?,
+                    .output_b = outputs.raw[1].?,
+                    .output_c = outputs.raw[2].?,
                     .weight_buf_a = weight_buf_a,
                     .weight_buf_b = weight_buf_b,
                     .weight_buf_c = weight_buf_c,
                 });
 
                 if (used_quant_triple) {
-                    const first = try makeLinearNoBiasResult(self, first_raw.?, rows, out_dim);
-                    first_raw = null;
-                    errdefer freeTensor(ctx, first);
-                    const second = try makeLinearNoBiasResult(self, second_raw.?, rows, out_dim);
-                    second_raw = null;
-                    errdefer freeTensor(ctx, second);
-                    const third = try makeLinearNoBiasResult(self, third_raw.?, rows, out_dim);
-                    third_raw = null;
-                    return .{ .first = first, .second = second, .third = third };
+                    const results = try outputs.intoResults(self, rows, out_dim);
+                    return .{ .first = results[0], .second = results[1], .third = results[2] };
                 }
-
-                self.allocator.free(first_raw.?);
-                first_raw = null;
-                self.allocator.free(second_raw.?);
-                second_raw = null;
-                self.allocator.free(third_raw.?);
-                third_raw = null;
             }
         }
     }
@@ -12903,7 +12933,8 @@ fn linearNoBiasQ4KPreparedTiled(
     try linearQ4KPreparedTiledRange(input, prepared_blocks, output, rows, in_dim, out_dim, 0, out_dim);
 }
 
-fn linearQ4KPreparedTiledRange(
+fn linearKPreparedTiledRange(
+    comptime kind: gguf_tensor_types.KnownTensorType,
     input: []const f32,
     prepared_blocks: []const u8,
     output: []f32,
@@ -12913,11 +12944,14 @@ fn linearQ4KPreparedTiledRange(
     out_start: usize,
     out_end: usize,
 ) !void {
-    const tensor_type: gguf_tensor_types.TensorType = .{ .known = .Q4_K };
+    comptime if (kind != .Q4_K and kind != .Q6_K) {
+        @compileError("unsupported prepared K tile format");
+    };
+    const tensor_type: gguf_tensor_types.TensorType = .{ .known = kind };
     const values_per_block = gguf_tensor_types.valuesPerBlock(tensor_type).?;
-    const prepared_row_stride = (in_dim / values_per_block) * prepared_q4_k_block_bytes;
     if (in_dim % values_per_block != 0) return error.InvalidQuantizedLinearShape;
     const row_blocks = in_dim / values_per_block;
+    const prepared_row_stride = row_blocks * prepared_q4_k_block_bytes;
     if (prepared_blocks.len != out_dim * prepared_row_stride) return error.InvalidQuantizedDataSize;
     if (out_start > out_end or out_end > out_dim) return error.InvalidQuantizedLinearShape;
 
@@ -12926,7 +12960,8 @@ fn linearQ4KPreparedTiledRange(
     // work).  Last row handled by the MR=1 path below if `rows` is odd.
     var r: usize = 0;
     while (r + 2 <= rows) : (r += 2) {
-        processQ4KRowPair(
+        processKPreparedRowPair(
+            kind,
             input,
             prepared_blocks,
             output,
@@ -12941,7 +12976,8 @@ fn linearQ4KPreparedTiledRange(
         );
     }
     if (r < rows) {
-        processQ4KRowSingle(
+        processKPreparedRowSingle(
+            kind,
             input,
             prepared_blocks,
             output,
@@ -12955,6 +12991,19 @@ fn linearQ4KPreparedTiledRange(
             values_per_block,
         );
     }
+}
+
+fn linearQ4KPreparedTiledRange(
+    input: []const f32,
+    prepared_blocks: []const u8,
+    output: []f32,
+    rows: usize,
+    in_dim: usize,
+    out_dim: usize,
+    out_start: usize,
+    out_end: usize,
+) !void {
+    return linearKPreparedTiledRange(.Q4_K, input, prepared_blocks, output, rows, in_dim, out_dim, out_start, out_end);
 }
 
 fn linearNoBiasQ6KPrepared(
@@ -12982,218 +13031,7 @@ fn linearQ6KPreparedTiledRange(
     out_start: usize,
     out_end: usize,
 ) !void {
-    const tensor_type: gguf_tensor_types.TensorType = .{ .known = .Q6_K };
-    const values_per_block = gguf_tensor_types.valuesPerBlock(tensor_type).?;
-    if (in_dim % values_per_block != 0) return error.InvalidQuantizedLinearShape;
-    const row_blocks = in_dim / values_per_block;
-    const prepared_row_stride = row_blocks * prepared_q4_k_block_bytes;
-    if (prepared_blocks.len != out_dim * prepared_row_stride) return error.InvalidQuantizedDataSize;
-    if (out_start > out_end or out_end > out_dim) return error.InvalidQuantizedLinearShape;
-
-    var r: usize = 0;
-    while (r + 2 <= rows) : (r += 2) {
-        processQ6KRowPair(
-            input,
-            prepared_blocks,
-            output,
-            r,
-            in_dim,
-            out_dim,
-            out_start,
-            out_end,
-            prepared_row_stride,
-            row_blocks,
-            values_per_block,
-        );
-    }
-    if (r < rows) {
-        processQ6KRowSingle(
-            input,
-            prepared_blocks,
-            output,
-            r,
-            in_dim,
-            out_dim,
-            out_start,
-            out_end,
-            prepared_row_stride,
-            row_blocks,
-            values_per_block,
-        );
-    }
-}
-
-fn processQ6KRowSingle(
-    input: []const f32,
-    prepared_blocks: []const u8,
-    output: []f32,
-    r: usize,
-    in_dim: usize,
-    out_dim: usize,
-    out_start: usize,
-    out_end: usize,
-    prepared_row_stride: usize,
-    row_blocks: usize,
-    values_per_block: usize,
-) void {
-    const input_row = input[r * in_dim ..][0..in_dim];
-    const out_row = output[r * out_dim ..][0..out_dim];
-
-    var o: usize = out_start;
-    while (o < out_end and (o % 4) != 0) : (o += 1) {
-        const prepared_row_offset = o * prepared_row_stride;
-        var acc: f32 = 0.0;
-        for (0..row_blocks) |block_idx| {
-            const prepared_block = prepared_blocks[prepared_row_offset + block_idx * prepared_q4_k_block_bytes ..][0..prepared_q4_k_block_bytes];
-            const input_block = input_row[block_idx * values_per_block ..][0..values_per_block];
-            acc += dotQ6KPreparedBlock(input_block, prepared_block);
-        }
-        out_row[o] = acc;
-    }
-
-    while (o + 4 <= out_dim) : (o += 4) {
-        if (o + 4 > out_end) break;
-        var acc0: F32xN = @splat(0.0);
-        var acc1: F32xN = @splat(0.0);
-        var acc2: F32xN = @splat(0.0);
-        var acc3: F32xN = @splat(0.0);
-        const prepared_row_offset0 = o * prepared_row_stride;
-        const prepared_row_offset1 = (o + 1) * prepared_row_stride;
-        const prepared_row_offset2 = (o + 2) * prepared_row_stride;
-        const prepared_row_offset3 = (o + 3) * prepared_row_stride;
-        for (0..row_blocks) |block_idx| {
-            const prepared_off = block_idx * prepared_q4_k_block_bytes;
-            const input_block = input_row[block_idx * values_per_block ..][0..values_per_block];
-            accumulateQ6KPreparedBlock4MR1(
-                input_block,
-                prepared_blocks[prepared_row_offset0 + prepared_off ..][0..prepared_q4_k_block_bytes],
-                prepared_blocks[prepared_row_offset1 + prepared_off ..][0..prepared_q4_k_block_bytes],
-                prepared_blocks[prepared_row_offset2 + prepared_off ..][0..prepared_q4_k_block_bytes],
-                prepared_blocks[prepared_row_offset3 + prepared_off ..][0..prepared_q4_k_block_bytes],
-                &acc0,
-                &acc1,
-                &acc2,
-                &acc3,
-            );
-        }
-        out_row[o] = @reduce(.Add, acc0);
-        out_row[o + 1] = @reduce(.Add, acc1);
-        out_row[o + 2] = @reduce(.Add, acc2);
-        out_row[o + 3] = @reduce(.Add, acc3);
-    }
-
-    while (o < out_end) : (o += 1) {
-        const prepared_row_offset = o * prepared_row_stride;
-        var acc: f32 = 0.0;
-        for (0..row_blocks) |block_idx| {
-            const prepared_block = prepared_blocks[prepared_row_offset + block_idx * prepared_q4_k_block_bytes ..][0..prepared_q4_k_block_bytes];
-            const input_block = input_row[block_idx * values_per_block ..][0..values_per_block];
-            acc += dotQ6KPreparedBlock(input_block, prepared_block);
-        }
-        out_row[o] = acc;
-    }
-}
-
-fn processQ6KRowPair(
-    input: []const f32,
-    prepared_blocks: []const u8,
-    output: []f32,
-    r: usize,
-    in_dim: usize,
-    out_dim: usize,
-    out_start: usize,
-    out_end: usize,
-    prepared_row_stride: usize,
-    row_blocks: usize,
-    values_per_block: usize,
-) void {
-    const input_r0 = input[r * in_dim ..][0..in_dim];
-    const input_r1 = input[(r + 1) * in_dim ..][0..in_dim];
-    const out_r0 = output[r * out_dim ..][0..out_dim];
-    const out_r1 = output[(r + 1) * out_dim ..][0..out_dim];
-
-    var o: usize = out_start;
-    while (o < out_end and (o % 4) != 0) : (o += 1) {
-        const prepared_row_offset = o * prepared_row_stride;
-        var acc_r0: f32 = 0.0;
-        var acc_r1: f32 = 0.0;
-        for (0..row_blocks) |block_idx| {
-            const prepared_block = prepared_blocks[prepared_row_offset + block_idx * prepared_q4_k_block_bytes ..][0..prepared_q4_k_block_bytes];
-            const block_off = block_idx * values_per_block;
-            const sums = dotQ6KPreparedBlockMR2NR1(
-                input_r0[block_off..][0..values_per_block],
-                input_r1[block_off..][0..values_per_block],
-                prepared_block,
-            );
-            acc_r0 += sums[0];
-            acc_r1 += sums[1];
-        }
-        out_r0[o] = acc_r0;
-        out_r1[o] = acc_r1;
-    }
-
-    while (o + 4 <= out_dim) : (o += 4) {
-        if (o + 4 > out_end) break;
-        var acc_r0_0: F32xN = @splat(0.0);
-        var acc_r0_1: F32xN = @splat(0.0);
-        var acc_r0_2: F32xN = @splat(0.0);
-        var acc_r0_3: F32xN = @splat(0.0);
-        var acc_r1_0: F32xN = @splat(0.0);
-        var acc_r1_1: F32xN = @splat(0.0);
-        var acc_r1_2: F32xN = @splat(0.0);
-        var acc_r1_3: F32xN = @splat(0.0);
-        const prepared_row_offset0 = o * prepared_row_stride;
-        const prepared_row_offset1 = (o + 1) * prepared_row_stride;
-        const prepared_row_offset2 = (o + 2) * prepared_row_stride;
-        const prepared_row_offset3 = (o + 3) * prepared_row_stride;
-        for (0..row_blocks) |block_idx| {
-            const prepared_off = block_idx * prepared_q4_k_block_bytes;
-            const block_input_off = block_idx * values_per_block;
-            accumulateQ6KPreparedBlock4MR2(
-                input_r0[block_input_off..][0..values_per_block],
-                input_r1[block_input_off..][0..values_per_block],
-                prepared_blocks[prepared_row_offset0 + prepared_off ..][0..prepared_q4_k_block_bytes],
-                prepared_blocks[prepared_row_offset1 + prepared_off ..][0..prepared_q4_k_block_bytes],
-                prepared_blocks[prepared_row_offset2 + prepared_off ..][0..prepared_q4_k_block_bytes],
-                prepared_blocks[prepared_row_offset3 + prepared_off ..][0..prepared_q4_k_block_bytes],
-                &acc_r0_0,
-                &acc_r0_1,
-                &acc_r0_2,
-                &acc_r0_3,
-                &acc_r1_0,
-                &acc_r1_1,
-                &acc_r1_2,
-                &acc_r1_3,
-            );
-        }
-        out_r0[o] = @reduce(.Add, acc_r0_0);
-        out_r0[o + 1] = @reduce(.Add, acc_r0_1);
-        out_r0[o + 2] = @reduce(.Add, acc_r0_2);
-        out_r0[o + 3] = @reduce(.Add, acc_r0_3);
-        out_r1[o] = @reduce(.Add, acc_r1_0);
-        out_r1[o + 1] = @reduce(.Add, acc_r1_1);
-        out_r1[o + 2] = @reduce(.Add, acc_r1_2);
-        out_r1[o + 3] = @reduce(.Add, acc_r1_3);
-    }
-
-    while (o < out_end) : (o += 1) {
-        const prepared_row_offset = o * prepared_row_stride;
-        var acc_r0: f32 = 0.0;
-        var acc_r1: f32 = 0.0;
-        for (0..row_blocks) |block_idx| {
-            const prepared_block = prepared_blocks[prepared_row_offset + block_idx * prepared_q4_k_block_bytes ..][0..prepared_q4_k_block_bytes];
-            const block_off = block_idx * values_per_block;
-            const sums = dotQ6KPreparedBlockMR2NR1(
-                input_r0[block_off..][0..values_per_block],
-                input_r1[block_off..][0..values_per_block],
-                prepared_block,
-            );
-            acc_r0 += sums[0];
-            acc_r1 += sums[1];
-        }
-        out_r0[o] = acc_r0;
-        out_r1[o] = acc_r1;
-    }
+    return linearKPreparedTiledRange(.Q6_K, input, prepared_blocks, output, rows, in_dim, out_dim, out_start, out_end);
 }
 
 fn linearQ4KPreparedTripleFusedRange(
@@ -13270,7 +13108,8 @@ fn linearQ4KPreparedTripleFusedRange(
     }
 }
 
-fn processQ4KRowSingle(
+fn processKPreparedRowSingle(
+    comptime kind: gguf_tensor_types.KnownTensorType,
     input: []const f32,
     prepared_blocks: []const u8,
     output: []f32,
@@ -13283,6 +13122,16 @@ fn processQ4KRowSingle(
     row_blocks: usize,
     values_per_block: usize,
 ) void {
+    const dot_block = comptime switch (kind) {
+        .Q4_K => dotQ4KPreparedBlock,
+        .Q6_K => dotQ6KPreparedBlock,
+        else => @compileError("unsupported prepared K tile format"),
+    };
+    const accumulate4 = comptime switch (kind) {
+        .Q4_K => accumulateQ4KPreparedBlock4MR1,
+        .Q6_K => accumulateQ6KPreparedBlock4MR1,
+        else => @compileError("unsupported prepared K tile format"),
+    };
     const input_row = input[r * in_dim ..][0..in_dim];
     const out_row = output[r * out_dim ..][0..out_dim];
     var o: usize = out_start;
@@ -13293,7 +13142,7 @@ fn processQ4KRowSingle(
         for (0..row_blocks) |block_idx| {
             const prepared_block = prepared_blocks[prepared_row_offset + block_idx * prepared_q4_k_block_bytes ..][0..prepared_q4_k_block_bytes];
             const input_block = input_row[block_idx * values_per_block ..][0..values_per_block];
-            acc += dotQ4KPreparedBlock(input_block, prepared_block);
+            acc += dot_block(input_block, prepared_block);
         }
         out_row[o] = acc;
     }
@@ -13311,7 +13160,7 @@ fn processQ4KRowSingle(
         for (0..row_blocks) |block_idx| {
             const prepared_off = block_idx * prepared_q4_k_block_bytes;
             const input_block = input_row[block_idx * values_per_block ..][0..values_per_block];
-            accumulateQ4KPreparedBlock4MR1(
+            accumulate4(
                 input_block,
                 prepared_blocks[prepared_row_offset0 + prepared_off ..][0..prepared_q4_k_block_bytes],
                 prepared_blocks[prepared_row_offset1 + prepared_off ..][0..prepared_q4_k_block_bytes],
@@ -13335,13 +13184,14 @@ fn processQ4KRowSingle(
         for (0..row_blocks) |block_idx| {
             const prepared_block = prepared_blocks[prepared_row_offset + block_idx * prepared_q4_k_block_bytes ..][0..prepared_q4_k_block_bytes];
             const input_block = input_row[block_idx * values_per_block ..][0..values_per_block];
-            acc += dotQ4KPreparedBlock(input_block, prepared_block);
+            acc += dot_block(input_block, prepared_block);
         }
         out_row[o] = acc;
     }
 }
 
-fn processQ4KRowPair(
+fn processKPreparedRowPair(
+    comptime kind: gguf_tensor_types.KnownTensorType,
     input: []const f32,
     prepared_blocks: []const u8,
     output: []f32,
@@ -13354,6 +13204,16 @@ fn processQ4KRowPair(
     row_blocks: usize,
     values_per_block: usize,
 ) void {
+    const dot_block = comptime switch (kind) {
+        .Q4_K => dotQ4KPreparedBlockMR2NR1,
+        .Q6_K => dotQ6KPreparedBlockMR2NR1,
+        else => @compileError("unsupported prepared K tile format"),
+    };
+    const accumulate4 = comptime switch (kind) {
+        .Q4_K => accumulateQ4KPreparedBlock4MR2,
+        .Q6_K => accumulateQ6KPreparedBlock4MR2,
+        else => @compileError("unsupported prepared K tile format"),
+    };
     const input_r0 = input[r * in_dim ..][0..in_dim];
     const input_r1 = input[(r + 1) * in_dim ..][0..in_dim];
     const out_r0 = output[r * out_dim ..][0..out_dim];
@@ -13371,7 +13231,7 @@ fn processQ4KRowPair(
         for (0..row_blocks) |block_idx| {
             const prepared_block = prepared_blocks[prepared_row_offset + block_idx * prepared_q4_k_block_bytes ..][0..prepared_q4_k_block_bytes];
             const block_off = block_idx * values_per_block;
-            const sums = dotQ4KPreparedBlockMR2NR1(
+            const sums = dot_block(
                 input_r0[block_off..][0..values_per_block],
                 input_r1[block_off..][0..values_per_block],
                 prepared_block,
@@ -13401,7 +13261,7 @@ fn processQ4KRowPair(
         for (0..row_blocks) |block_idx| {
             const prepared_off = block_idx * prepared_q4_k_block_bytes;
             const block_input_off = block_idx * values_per_block;
-            accumulateQ4KPreparedBlock4MR2(
+            accumulate4(
                 input_r0[block_input_off..][0..values_per_block],
                 input_r1[block_input_off..][0..values_per_block],
                 prepared_blocks[prepared_row_offset0 + prepared_off ..][0..prepared_q4_k_block_bytes],
@@ -13435,7 +13295,7 @@ fn processQ4KRowPair(
         for (0..row_blocks) |block_idx| {
             const prepared_block = prepared_blocks[prepared_row_offset + block_idx * prepared_q4_k_block_bytes ..][0..prepared_q4_k_block_bytes];
             const block_off = block_idx * values_per_block;
-            const sums = dotQ4KPreparedBlockMR2NR1(
+            const sums = dot_block(
                 input_r0[block_off..][0..values_per_block],
                 input_r1[block_off..][0..values_per_block],
                 prepared_block,

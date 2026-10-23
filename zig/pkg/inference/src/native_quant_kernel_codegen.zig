@@ -83,6 +83,7 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
     switch (mode) {
         .check, .check_metal => {
             try checkMetalRuntimeRegion(allocator, io);
+            try processMetalCompatibilityAttention(allocator, io, false);
             try checkMetalLaunchShapeRegion(allocator, io);
             try processCudaSharedHelpers(allocator, io, false);
             try processCudaProductionMatmul(allocator, io, false);
@@ -91,6 +92,7 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
         },
         .write => {
             try writeMetalRuntimeRegion(allocator, io);
+            try processMetalCompatibilityAttention(allocator, io, true);
             try writeMetalLaunchShapeRegion(allocator, io);
             try processCudaSharedHelpers(allocator, io, true);
             try processCudaProductionMatmul(allocator, io, true);
@@ -206,20 +208,28 @@ fn processCudaProductionMatmul(allocator: std.mem.Allocator, io: std.Io, write: 
     return processCudaRegion(allocator, io, write, cuda_production_matmul_begin, cuda_production_matmul_end, quant_kernel_compiler.renderCudaRuntimeProductionMatmulRegion);
 }
 fn processCudaRegion(allocator: std.mem.Allocator, io: std.Io, write: bool, comptime begin: []const u8, comptime end: []const u8, comptime render: anytype) !void {
-    const contents = try readCudaRuntimeSource(allocator, io);
+    return processOwnedSourceRegion(allocator, io, write, cuda_runtime_source_path, begin, end, render);
+}
+
+fn processMetalCompatibilityAttention(allocator: std.mem.Allocator, io: std.Io, write: bool) !void {
+    return processOwnedSourceRegion(allocator, io, write, metal_runtime_source_path, "           // quant-kernel-codegen:begin compatibility Metal attention (do not edit; run: zig build quant-kernel-codegen -- --write)", "           // quant-kernel-codegen:end compatibility Metal attention", quant_kernel_compiler.renderMetalRuntimeCompatibilityAttentionRegion);
+}
+
+fn processOwnedSourceRegion(allocator: std.mem.Allocator, io: std.Io, write: bool, source_path: []const u8, comptime begin: []const u8, comptime end: []const u8, comptime render: anytype) !void {
+    const path = try existingSourcePath(allocator, io, source_path);
+    defer if (path.owned) allocator.free(path.value);
+    const contents = try std.Io.Dir.cwd().readFileAlloc(io, path.value, allocator, .limited(8 * 1024 * 1024));
     defer allocator.free(contents);
     const split = try splitSourceRegion(contents, begin, end);
     const expected = try render(allocator);
     defer allocator.free(expected);
     if (std.mem.eql(u8, split.region, expected)) return;
     if (!write) {
-        print("CUDA source region stale: {s} ({s}); run `zig build quant-kernel-codegen -- --write`\n", .{ cuda_runtime_source_path, begin });
+        print("Generated source region stale: {s} ({s}); run `zig build quant-kernel-codegen -- --write`\n", .{ source_path, begin });
         return error.GeneratedQuantKernelSourceStale;
     }
     const updated = try std.mem.concat(allocator, u8, &.{ split.prefix, expected, split.suffix });
     defer allocator.free(updated);
-    const path = try existingSourcePath(allocator, io, cuda_runtime_source_path);
-    defer if (path.owned) allocator.free(path.value);
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path.value, .data = updated });
 }
 

@@ -13276,7 +13276,9 @@ test "metal Q6_K high-row matrix route is shape-gated, rollback-gated, and count
     try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "kernel void termite_q6_k_high_row_mm_matrix_m64_n64"));
     try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "TERMITE_METAL_ENABLE_Q6_K_HIGH_ROW_MM"));
     try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "TERMITE_METAL_DISABLE_Q6_K_HIGH_ROW_MM"));
-    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "simdgroup_float8x8 mw[8]; simdgroup_float8x8 mx"));
+    // Q6 retains F32 staging/MMA while Q4 instantiates the shared tile in F16.
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "termite_k_mm_matrix_m64_n64<float, float, true>"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "simdgroup_matrix<Tile, 8, 8> mw[8]; simdgroup_matrix<Tile, 8, 8> mx"));
     try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "runtime->q6_k_high_row_mm_matrix_dispatches += 1"));
 }
 

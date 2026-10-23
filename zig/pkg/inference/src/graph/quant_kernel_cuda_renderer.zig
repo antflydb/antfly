@@ -2088,6 +2088,42 @@ pub fn renderFlashPrefillBodyAlloc(
     allocator: std.mem.Allocator,
     plan: FlashPrefillRenderPlan,
 ) ![]u8 {
+    return renderFlashPrefillPartsAlloc(allocator, plan, true);
+}
+
+/// Runtime bundles emit the policy-independent WMMA templates once, followed
+/// by each ABI wrapper. Standalone kernels retain the complete template.
+fn appendAttentionTemplate(
+    allocator: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    template: []const u8,
+    common: []const u8,
+    include_common: bool,
+) !void {
+    if (include_common) return out.appendSlice(allocator, template);
+    const begin = std.mem.indexOf(u8, template, common).?;
+    try out.appendSlice(allocator, template[0..begin]);
+    try out.appendSlice(allocator, template[begin + common.len ..]);
+}
+
+pub fn flashPrefillCommonSource() []const u8 {
+    const begin = std.mem.indexOf(u8, flash_prefill_f16_sm89_template, "// antfly-flash:begin common\n").?;
+    const end = std.mem.indexOf(u8, flash_prefill_f16_sm89_template, "// antfly-flash:end common\n").? + "// antfly-flash:end common\n".len;
+    return flash_prefill_f16_sm89_template[begin..end];
+}
+
+pub fn renderFlashPrefillInstantiationAlloc(
+    allocator: std.mem.Allocator,
+    plan: FlashPrefillRenderPlan,
+) ![]u8 {
+    return renderFlashPrefillPartsAlloc(allocator, plan, false);
+}
+
+fn renderFlashPrefillPartsAlloc(
+    allocator: std.mem.Allocator,
+    plan: FlashPrefillRenderPlan,
+    include_common: bool,
+) ![]u8 {
     try plan.validate();
     var out = std.ArrayListUnmanaged(u8).empty;
     errdefer out.deinit(allocator);
@@ -2103,7 +2139,7 @@ pub fn renderFlashPrefillBodyAlloc(
         plan.lowering.head_dim,
         plan.lowering.sliding_window,
     });
-    try out.appendSlice(allocator, flash_prefill_f16_sm89_template);
+    try appendAttentionTemplate(allocator, &out, flash_prefill_f16_sm89_template, flashPrefillCommonSource(), include_common);
     if (out.items.len == 0 or out.items[out.items.len - 1] != '\n') try out.append(allocator, '\n');
     try out.appendSlice(allocator,
         \\#undef ANTFLY_FLASH_SLIDING_WINDOW
@@ -2174,6 +2210,27 @@ pub fn renderSplitkOnlineDecodeBodyAlloc(
     allocator: std.mem.Allocator,
     plan: SplitkOnlineDecodeRenderPlan,
 ) ![]u8 {
+    return renderSplitkOnlineDecodePartsAlloc(allocator, plan, true);
+}
+
+pub fn splitkOnlineCommonSource() []const u8 {
+    const begin = std.mem.indexOf(u8, splitk_online_decode_sm89_template, "// antfly-splitk:begin common\n").?;
+    const end = std.mem.indexOf(u8, splitk_online_decode_sm89_template, "// antfly-splitk:end common\n").? + "// antfly-splitk:end common\n".len;
+    return splitk_online_decode_sm89_template[begin..end];
+}
+
+pub fn renderSplitkOnlineDecodeInstantiationAlloc(
+    allocator: std.mem.Allocator,
+    plan: SplitkOnlineDecodeRenderPlan,
+) ![]u8 {
+    return renderSplitkOnlineDecodePartsAlloc(allocator, plan, false);
+}
+
+fn renderSplitkOnlineDecodePartsAlloc(
+    allocator: std.mem.Allocator,
+    plan: SplitkOnlineDecodeRenderPlan,
+    include_common: bool,
+) ![]u8 {
     try plan.validate();
     var out = std.ArrayListUnmanaged(u8).empty;
     errdefer out.deinit(allocator);
@@ -2191,7 +2248,7 @@ pub fn renderSplitkOnlineDecodeBodyAlloc(
         plan.lowering.sliding_window,
         plan.lowering.max_visible_tokens,
     });
-    try out.appendSlice(allocator, splitk_online_decode_sm89_template);
+    try appendAttentionTemplate(allocator, &out, splitk_online_decode_sm89_template, splitkOnlineCommonSource(), include_common);
     if (out.items.len == 0 or out.items[out.items.len - 1] != '\n') try out.append(allocator, '\n');
     try out.appendSlice(allocator,
         \\#undef ANTFLY_SPLITK_ONLINE_MAX_VISIBLE_TOKENS

@@ -399,7 +399,7 @@ fn renderAttentionBody(
 ) !void {
     try validateAttentionSchedule(kind, schedule);
     switch (kind) {
-        .decode_1x => try renderPagedAttention1xBody(allocator, out, kernel_id, schedule),
+        .decode_1x => try renderPagedAttention1xBody(allocator, out, kernel_id, schedule, .standalone, false),
         .prefill_flash => if (schedule.threads_per_threadgroup == 256)
             try renderPrefillFlashHd512Body(allocator, out, kernel_id)
         else
@@ -415,27 +415,68 @@ fn renderAttentionBody(
 /// f16 paged KV (`format==3`), GQA via `heads_per_group`, causal + sliding
 /// masking; no sinks, no softcap (the dispatch gates those to the scalar path).
 ///
-/// This is a verbatim transcription of the hand-written kernel body with NT/NSG
-/// parametrized and the params struct / paging helper renamed to the generated
-/// self-contained copies — so the generated route is behaviourally byte-for-byte
-/// the hand-written one, which is what the model-token acceptance gate checks.
+/// One owner for standalone and compatibility-runtime decode. The legacy
+/// runtime retains its extra max-read barrier and masked-mass policy; generated
+/// schedules keep their explicitly guarded zero-mass policy.
 fn renderPagedAttention1xBody(
     allocator: std.mem.Allocator,
     out: *std.ArrayListUnmanaged(u8),
     kernel_id: []const u8,
     schedule: KernelSchedule,
+    abi: AttentionSourceAbi,
+    legacy_masked_mass: bool,
 ) !void {
+    const params_name = if (abi == .runtime) "termite_metal_paged_attention_params" else "antfly_paged_attention_1x_params";
+    const page_token = if (abi == .runtime) "termite_attention_page_token" else "antfly_paged_attention_1x_page_token";
     const nt = schedule.threads_per_threadgroup;
     const nsg = nt / 32;
-    try appendFmt(allocator, out, "kernel void {s}(device const float *q [[buffer(0)]], device const uchar *encoded_key [[buffer(1)]], device const uchar *v_bytes [[buffer(2)]], device const uint *block_table [[buffer(3)]], device const float *sinks [[buffer(4)]], device float *output [[buffer(5)]], constant antfly_paged_attention_1x_params &p [[buffer(6)]], threadgroup float *shmem [[threadgroup(0)]], ushort tid [[thread_index_in_threadgroup]], ushort lane [[thread_index_in_simdgroup]], ushort sgitg [[simdgroup_index_in_threadgroup]], uint2 tg [[threadgroup_position_in_grid]]) {{\n", .{kernel_id});
+    try appendFmt(allocator, out, "kernel void {s}(device const float *q [[buffer(0)]], device const uchar *encoded_key [[buffer(1)]], device const uchar *v_bytes [[buffer(2)]], device const uint *block_table [[buffer(3)]], device const float *sinks [[buffer(4)]], device float *output [[buffer(5)]], constant {s} &p [[buffer(6)]], threadgroup float *shmem [[threadgroup(0)]], ushort tid [[thread_index_in_threadgroup]], ushort lane [[thread_index_in_simdgroup]], ushort sgitg [[simdgroup_index_in_threadgroup]], uint2 tg [[threadgroup_position_in_grid]]) {{\n", .{ kernel_id, params_name });
     try appendFmt(allocator, out, "    uint qi = tg.x; uint h = tg.y; if (qi >= p.q_len || h >= p.num_heads || p.format != 3u || p.page_size == 0u || p.num_kv_heads == 0u) return;\n", .{});
     try appendFmt(allocator, out, "    const uint NT = {d}u; const uint NW = 32u; const uint NSG = {d}u; const float scale = rsqrt(float(p.head_dim)); uint heads_per_group = p.num_heads / p.num_kv_heads; uint kv_h = h / heads_per_group; uint q_stride = p.num_heads * p.head_dim; uint q_base = qi * q_stride + h * p.head_dim; uint out_base = qi * q_stride + h * p.head_dim; uint kv_head_base = kv_h * p.head_dim; uint query_pos = p.query_position_offset + qi; uint kv_end_pos = p.kv_position_offset + p.kv_tokens; bool all_tokens_allowed = query_pos + 1u >= kv_end_pos && (p.sliding_window == 0u || p.sliding_window >= p.kv_tokens); threadgroup float *scores = shmem; threadgroup float *partials = shmem + p.kv_tokens; threadgroup float *phys_tokens = shmem + p.kv_tokens + {d}u; const device half *v_half = reinterpret_cast<const device half *>(v_bytes);\n", .{ nt, nsg, nt });
-    try appendFmt(allocator, out, "    for (uint base = 0u; base < p.kv_tokens; base += NSG) {{ uint ki = base + uint(sgitg); bool allowed = ki < p.kv_tokens && all_tokens_allowed; if (ki < p.kv_tokens && !allowed) {{ uint key_pos = p.kv_position_offset + ki; allowed = key_pos <= query_pos; if (p.sliding_window != 0u && allowed) allowed = (query_pos - key_pos) < p.sliding_window; }} uint physical_token = allowed ? antfly_paged_attention_1x_page_token(block_table, p, ki) : 0xffffffffu; if (physical_token == 0xffffffffu) allowed = false; float acc = 0.0f; if (allowed) {{ const device half *k_half = reinterpret_cast<const device half *>(encoded_key + physical_token * p.key_row_bytes); for (uint d = uint(lane); d < p.head_dim; d += NW) acc += q[q_base + d] * float(k_half[kv_head_base + d]); }} float score = allowed ? simd_sum(acc) * scale : -3.402823466e+38f; if (!isfinite(score)) score = -3.402823466e+38f; if (lane == 0u && ki < p.kv_tokens) {{ scores[ki] = score; phys_tokens[ki] = as_type<float>(allowed ? physical_token : 0u); }} }}\n", .{});
+    try appendFmt(allocator, out, "    for (uint base = 0u; base < p.kv_tokens; base += NSG) {{ uint ki = base + uint(sgitg); bool allowed = ki < p.kv_tokens && all_tokens_allowed; if (ki < p.kv_tokens && !allowed) {{ uint key_pos = p.kv_position_offset + ki; allowed = key_pos <= query_pos; if (p.sliding_window != 0u && allowed) allowed = (query_pos - key_pos) < p.sliding_window; }} uint physical_token = allowed ? {s}(block_table, p, ki) : 0xffffffffu; if (physical_token == 0xffffffffu) allowed = false; float acc = 0.0f; if (allowed) {{ const device half *k_half = reinterpret_cast<const device half *>(encoded_key + physical_token * p.key_row_bytes); for (uint d = uint(lane); d < p.head_dim; d += NW) acc += q[q_base + d] * float(k_half[kv_head_base + d]); }} float score = allowed ? simd_sum(acc) * scale : -3.402823466e+38f; if (!isfinite(score)) score = -3.402823466e+38f; if (lane == 0u && ki < p.kv_tokens) {{ scores[ki] = score; phys_tokens[ki] = as_type<float>(allowed ? physical_token : 0u); }} }}\n", .{page_token});
     try appendFmt(allocator, out, "    threadgroup_barrier(mem_flags::mem_threadgroup); float local_best = -3.402823466e+38f; for (uint ki = uint(tid); ki < p.kv_tokens; ki += NT) {{ float score = scores[ki]; local_best = score > local_best ? score : local_best; }} partials[tid] = local_best; threadgroup_barrier(mem_flags::mem_threadgroup); for (uint stride = NT >> 1u; stride > 0u; stride >>= 1u) {{ if (uint(tid) < stride) {{ float rhs = partials[tid + stride]; partials[tid] = rhs > partials[tid] ? rhs : partials[tid]; }} threadgroup_barrier(mem_flags::mem_threadgroup); }} float best = partials[0];\n", .{});
-    try appendFmt(allocator, out, "    float local_sum = 0.0f; for (uint ki = uint(tid); ki < p.kv_tokens; ki += NT) {{ float score = scores[ki]; float e = (best > -3.0e+38f && score > -3.0e+38f) ? exp(score - best) : 0.0f; e = isfinite(e) ? e : 0.0f; scores[ki] = e; local_sum += e; }} partials[tid] = local_sum; threadgroup_barrier(mem_flags::mem_threadgroup); for (uint stride = NT >> 1u; stride > 0u; stride >>= 1u) {{ if (uint(tid) < stride) partials[tid] += partials[tid + stride]; threadgroup_barrier(mem_flags::mem_threadgroup); }} const float inv_sum = partials[0] > 0.0f ? 1.0f / partials[0] : 0.0f;\n", .{});
+    if (legacy_masked_mass) try out.appendSlice(allocator, "    threadgroup_barrier(mem_flags::mem_threadgroup);\n");
+    const exponent = if (legacy_masked_mass) "exp(scores[ki] - best)" else "(best > -3.0e+38f && score > -3.0e+38f) ? exp(score - best) : 0.0f";
+    const score_load = if (legacy_masked_mass) "" else "float score = scores[ki]; ";
+    try appendFmt(allocator, out, "    float local_sum = 0.0f; for (uint ki = uint(tid); ki < p.kv_tokens; ki += NT) {{ {s}float e = {s}; e = isfinite(e) ? e : 0.0f; scores[ki] = e; local_sum += e; }} partials[tid] = local_sum; threadgroup_barrier(mem_flags::mem_threadgroup); for (uint stride = NT >> 1u; stride > 0u; stride >>= 1u) {{ if (uint(tid) < stride) partials[tid] += partials[tid + stride]; threadgroup_barrier(mem_flags::mem_threadgroup); }} const float inv_sum = partials[0] > 0.0f ? 1.0f / partials[0] : 0.0f;\n", .{ score_load, exponent });
     try appendFmt(allocator, out, "    for (uint ki = uint(tid); ki < p.kv_tokens; ki += NT) scores[ki] *= inv_sum; threadgroup_barrier(mem_flags::mem_threadgroup);\n", .{});
     try appendFmt(allocator, out, "    for (uint d = uint(tid); d < p.head_dim; d += NT) {{ const device half *v_col = v_half + kv_head_base + d; float value = 0.0f; for (uint ki = 0u; ki < p.kv_tokens; ++ki) {{ float weight = scores[ki]; value += weight * select(float(v_col[as_type<uint>(phys_tokens[ki]) * p.v_row_stride]), 0.0f, weight == 0.0f); }} output[out_base + d] = value; }}\n", .{});
     try out.appendSlice(allocator, "}\n");
+}
+
+const AttentionSourceAbi = enum { standalone, runtime };
+const compatibility_prefill_source = @embedFile("templates/metal_paged_prefill_compat.metal");
+
+fn renderCompatibilityPrefillBody(allocator: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), kernel_id: []const u8, abi: AttentionSourceAbi) !void {
+    try appendFmt(allocator, out, "#define ANTFLY_COMPAT_PREFILL_KERNEL {s}\n#define ANTFLY_COMPAT_PREFILL_PARAMS {s}\n#define ANTFLY_COMPAT_PAGE_TOKEN {s}\n", .{
+        kernel_id,
+        if (abi == .runtime) "termite_metal_paged_attention_params" else "antfly_paged_attention_1x_params",
+        if (abi == .runtime) "termite_attention_page_token" else "antfly_paged_attention_1x_page_token",
+    });
+    try out.appendSlice(allocator, compatibility_prefill_source);
+    try out.appendSlice(allocator, "#undef ANTFLY_COMPAT_PAGE_TOKEN\n#undef ANTFLY_COMPAT_PREFILL_PARAMS\n#undef ANTFLY_COMPAT_PREFILL_KERNEL\n");
+}
+
+/// Exact legacy schedules with standalone params/helpers for direct qualification.
+/// This does not admit a new runtime route or alter generated plan identities.
+pub fn renderCompatibilityAttention(allocator: std.mem.Allocator, kernel_id: []const u8, kind: AttentionKind) ![]u8 {
+    var out = std.ArrayListUnmanaged(u8).empty;
+    errdefer out.deinit(allocator);
+    var names = EmittedNames{};
+    for (attentionHelpers(kind)) |helper| try emitHelper(allocator, &out, &names, helper);
+    switch (kind) {
+        .decode_1x => try renderPagedAttention1xBody(allocator, &out, kernel_id, .{ .threads_per_threadgroup = 256, .cols_per_threadgroup = 1, .reduction = .threadgroup_tree }, .standalone, true),
+        .prefill_flash => try renderCompatibilityPrefillBody(allocator, &out, kernel_id, .standalone),
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+pub fn renderCompatibilityRuntimeAttention(allocator: std.mem.Allocator) ![]u8 {
+    var out = std.ArrayListUnmanaged(u8).empty;
+    errdefer out.deinit(allocator);
+    try renderPagedAttention1xBody(allocator, &out, "termite_paged_attention_kv_1x", .{ .threads_per_threadgroup = 256, .cols_per_threadgroup = 1, .reduction = .threadgroup_tree }, .runtime, true);
+    try renderCompatibilityPrefillBody(allocator, &out, "termite_paged_attention_kv_prefill_sg", .runtime);
+    return out.toOwnedSlice(allocator);
 }
 
 /// Flash-style paged prefill attention (`termite_paged_attention_kv_prefill_sg`):
@@ -1543,4 +1584,28 @@ fn emitDecoder(allocator: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), n
     const source = try quant_recipe.render(allocator, decoder.recipe, .metal, decoder.lane_decode_fn);
     defer allocator.free(source);
     try emitHelper(allocator, out, names, .{ .name = decoder.lane_decode_fn, .msl = source });
+}
+
+test "metal renderer compatibility attention retains standalone ABI and legacy precision policies" {
+    const a = std.testing.allocator;
+    for ([_]AttentionKind{ .decode_1x, .prefill_flash }) |kind| {
+        const source = try renderCompatibilityAttention(a, "compatibility_attention", kind);
+        defer a.free(source);
+        try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, source, "struct antfly_paged_attention_1x_params {"));
+        try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, source, "inline uint antfly_paged_attention_1x_page_token("));
+        try std.testing.expect(!std.mem.containsAtLeast(u8, source, 1, "termite_metal_paged_attention_params"));
+        switch (kind) {
+            .decode_1x => {
+                try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "const uint NT = 256u"));
+                try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "float e = exp(scores[ki] - best)"));
+                try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "float best = partials[0];\n    threadgroup_barrier"));
+            },
+            .prefill_flash => {
+                try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "#define ANTFLY_COMPAT_PREFILL_KERNEL compatibility_attention"));
+                try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "#define ANTFLY_COMPAT_PREFILL_PARAMS antfly_paged_attention_1x_params"));
+                try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "hd % 32u != 0u"));
+                try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "half(e)"));
+            },
+        }
+    }
 }

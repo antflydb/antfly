@@ -56,7 +56,15 @@
 #error "ANTFLY_FLASH_SLIDING_WINDOW must be 512 for HD256 or 0 for HD512"
 #endif
 
-namespace ANTFLY_FLASH_NAMESPACE {
+// antfly-flash:begin common
+#include <cuda_fp16.h>
+#include <mma.h>
+#include <stdint.h>
+#include <stddef.h>
+#include <math.h>
+#ifndef ANTFLY_FLASH_COMMON_DEFINED
+#define ANTFLY_FLASH_COMMON_DEFINED
+namespace antfly_flash_common {
 
 using namespace nvcuda;
 
@@ -748,7 +756,11 @@ __device__ void reference_prefill_body(
         : 0.0f;
 }
 
-} // namespace ANTFLY_FLASH_NAMESPACE
+} // namespace antfly_flash_common
+#endif
+// antfly-flash:end common
+
+namespace ANTFLY_FLASH_NAMESPACE = antfly_flash_common;
 
 #define ANTFLY_FLASH_ARGUMENTS \
     float* dst, \
