@@ -12116,3 +12116,117 @@ test "relational index system query lease typed point hydration retains nulls nu
         delivered += result.consumed;
     }
 }
+
+test "relational index system foreign key validation scan retains cold LSM cuts and independently replays witnesses" {
+    const validation = @import("foreign_key_validation.zig");
+    var directory = try @import("../../common/test_directory.zig").TestDirectory.init("fk-validation-pages");
+    defer directory.cleanup();
+    const options: db_mod.OpenOptions = .{ .start_optional_runtimes = false, .start_index_workers = false, .primary_backend = .{ .lsm = .{ .flush_threshold = 2 } } };
+    {
+        var database = try db_mod.DB.open(alloc, directory.path(), options);
+        defer database.close();
+        try database.setSchemaJson(alloc,
+            \\{"version":1,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer","nullable":true},"tenant":{"type":"string","nullable":true},"body":{"type":"string"}},"additionalProperties":false}}}}
+        );
+        const payload = try alloc.alloc(u8, 128 * 1024);
+        defer alloc.free(payload);
+        @memset(payload, 'x');
+        const large = try std.fmt.allocPrint(alloc, "{{\"id\":1,\"tenant\":\"Acme\",\"body\":\"{s}\"}}", .{payload});
+        defer alloc.free(large);
+        try database.batch(.{ .writes = &.{
+            .{ .key = "a", .value = large },
+            .{ .key = "b", .value = "{\"id\":2,\"tenant\":\"Acme\"}" },
+            .{ .key = "c", .value = "{\"id\":3,\"tenant\":null}" },
+        } });
+        const orphan = try internal.ttlKeyAlloc(alloc, "0-orphan");
+        defer alloc.free(orphan);
+        try database.core.store.put(orphan, &@as([8]u8, @splat(0)));
+        try database.setSchemaJson(alloc,
+            \\{"version":2,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"ahead":{"type":"string","nullable":true},"id":{"type":"integer","nullable":true},"tenant":{"type":"string","nullable":true},"body":{"type":"string"}},"additionalProperties":false}}}}
+        );
+    }
+    var database = try db_mod.DB.open(alloc, directory.path(), options);
+    defer database.close();
+    var reader = try NullabilityScanFixture.open(&database, alloc, .{}, 0);
+    defer reader.deinit();
+    var peer = try rows.Reader.openSnapshot(alloc, try reader.read.forkRead(), reader.authenticated, reader.active, null, .{}, 0);
+    defer peer.deinit();
+    var full_reader = try rows.Reader.openSnapshot(alloc, try reader.read.forkRead(), reader.authenticated, reader.active, null, .{}, 0);
+    defer full_reader.deinit();
+    var plan = try validation.ChildPlan.init(alloc, "child", reader.active.tableSchema().*, &.{.{ .name = "fk", .columns = &.{ "tenant", "id" }, .generation = @splat(2), .parent_generation = @splat(1) }});
+    defer plan.deinit();
+    try database.batch(.{ .writes = &.{.{ .key = "b", .value = "{\"id\":9,\"tenant\":\"changed\"}" }} });
+    var resumed: ?rows.Reader = null;
+    defer if (resumed) |*value| value.deinit();
+    var combined: validation.Witness = .{};
+    var pages: usize = 0;
+    var empty_pages: usize = 0;
+    while (pages < 32) : (pages += 1) {
+        var page = try reader.nextForeignKeyValidationPage(alloc, null, .{ .records = 1, .time_ns = std.time.ns_per_s }, &plan, .{});
+        defer page.deinit();
+        if (page.scan.rows_examined == 0) empty_pages += 1;
+        try std.testing.expectEqual(@as(usize, 0), page.scan.page.rows.len);
+        try std.testing.expectEqual(@as(usize, 0), page.scan.page.output_bytes);
+        try std.testing.expect(page.scan.page.records_examined <= 1);
+        try std.testing.expect(page.scan.violation_column == null);
+        const boundary: rows.ForeignKeyReplayBoundary = .{ .scan = .{ .records_examined = page.scan.page.records_examined, .rows_examined = page.scan.rows_examined, .violation_column = null, .after = page.scan.after, .more = page.scan.page.more }, .witness = page.witness };
+        var forged = boundary;
+        forged.witness.count += 1;
+        forged.witness.sum[0] +%= 1;
+        try std.testing.expectError(error.InvalidNullabilityReplay, peer.nextForeignKeyValidationReplayPage(alloc, null, forged, &plan, .{}));
+        var replayed = try peer.nextForeignKeyValidationReplayPage(alloc, null, boundary, &plan, .{});
+        defer replayed.deinit();
+        try std.testing.expect(page.witness.eql(replayed.witness));
+        try combined.combine(page.witness);
+        if (resumed) |*value| {
+            var continued = try value.nextForeignKeyValidationPage(alloc, null, .{ .records = 1, .time_ns = std.time.ns_per_s }, &plan, .{});
+            defer continued.deinit();
+            try std.testing.expect(continued.witness.eql(page.witness));
+            try std.testing.expectEqualSlices(u8, page.scan.after, continued.scan.after);
+            try std.testing.expectEqual(page.scan.page.more, continued.scan.page.more);
+        } else {
+            resumed = try rows.Reader.openSnapshot(alloc, try reader.read.forkRead(), reader.authenticated, reader.active, null, .{}, 0);
+            var wrong_identity = plan.identity;
+            wrong_identity[0] ^= 1;
+            try std.testing.expectError(error.InvalidNullabilityProjection, resumed.?.resumeForeignKeyValidationScan(&plan, .{ .projection_identity = wrong_identity, .after = page.scan.after }, .{}));
+            try resumed.?.resumeForeignKeyValidationScan(&plan, .{ .projection_identity = plan.identity, .after = page.scan.after }, .{});
+        }
+        if (!page.scan.page.more) break;
+    }
+    try std.testing.expect(pages < 32 and empty_pages > 0);
+    try std.testing.expectEqual(@as(u64, 2), combined.count);
+    var whole = try full_reader.nextForeignKeyValidationPage(alloc, null, .{ .records = 1024, .time_ns = std.time.ns_per_s }, &plan, .{});
+    defer whole.deinit();
+    try std.testing.expect(!whole.scan.page.more and combined.eql(whole.witness));
+}
+
+test "relational index system foreign key validation scan rejects filtered coverage and preserves cursor after cancellation" {
+    const validation = @import("foreign_key_validation.zig");
+    var directory = try @import("../../common/test_directory.zig").TestDirectory.init("fk-validation-cancel");
+    defer directory.cleanup();
+    var database = try db_mod.DB.open(alloc, directory.path(), .{ .start_optional_runtimes = false, .start_index_workers = false });
+    defer database.close();
+    try database.setSchemaJson(alloc,
+        \\{"version":1,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"a":{"type":"integer","nullable":true},"b":{"type":"integer","nullable":true}},"additionalProperties":false}}}}
+    );
+    try database.batch(.{ .writes = &.{.{ .key = "bad", .value = "{\"a\":1}" }} });
+    var reader = try NullabilityScanFixture.open(&database, alloc, .{}, 0);
+    defer reader.deinit();
+    var plan = try validation.ChildPlan.init(alloc, "child", reader.active.tableSchema().*, &.{.{ .name = "fk", .columns = &.{ "a", "b" }, .generation = @splat(2), .parent_generation = @splat(1), .match = .full }});
+    defer plan.deinit();
+    const Cancel = struct {
+        fn check(_: ?*anyopaque) !void {
+            return error.Canceled;
+        }
+    };
+    try std.testing.expectError(error.Canceled, reader.nextForeignKeyValidationPage(alloc, null, .{}, &plan, .{ .checkpoint = Cancel.check }));
+    try std.testing.expectEqual(@as(usize, 0), reader.after.items.len);
+    var failure = try reader.nextForeignKeyValidationPage(alloc, null, .{}, &plan, .{});
+    defer failure.deinit();
+    try std.testing.expectEqual(@as(?usize, 0), failure.scan.violation_column);
+    try std.testing.expectEqual(@as(u64, 0), failure.witness.count);
+    try std.testing.expectEqualStrings("bad", failure.scan.page.rows[0].key);
+    var restricted = try NullabilityScanFixture.open(&database, alloc, .{ .fields = &.{"a"} }, 0);
+    defer restricted.deinit();
+    try std.testing.expectError(error.InvalidNullabilityProjection, restricted.nextForeignKeyValidationPage(alloc, null, .{}, &plan, .{}));
+}

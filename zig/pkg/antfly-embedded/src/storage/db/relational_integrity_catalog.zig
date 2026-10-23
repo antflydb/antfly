@@ -665,3 +665,166 @@ test "relational integrity catalog releases ownership on every allocation failur
     };
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Harness.run, .{});
 }
+
+/// Prepare a validity-only successor while retaining every claim/reference
+/// generation and allocation. This constructs immutable bytes, not validation
+/// or publication authority. The accepting owner must independently prove the
+/// exact schema delta, frozen child cover, parent coverage and install decision.
+/// Ordinary prepareWithChecks intentionally continues to allocate a new
+/// generation when a declaration fingerprint changes.
+pub fn prepareForeignKeyValidation(alloc: Allocator, previous: []const u8, incarnation: integrity.Generation, schema_version: u32, schema_digest: integrity.Digest, definitions: []const Definition, names: []const []const u8, checks_digest: integrity.Digest) !Update {
+    if (names.len == 0 or names.len > 256 or definitions.len > max_definitions or std.mem.allEqual(u8, &schema_digest, 0)) return error.InvalidIntegrityDefinition;
+    for (names, 0..) |name, i| {
+        if (name.len == 0 or name.len > 256) return error.InvalidIntegrityDefinition;
+        for (names[0..i]) |prior| if (std.mem.eql(u8, name, prior)) return error.InvalidIntegrityDefinition;
+    }
+    var before = try decode(alloc, previous);
+    errdefer before.deinit();
+    if (!std.mem.eql(u8, &before.incarnation, &incarnation) or
+        schema_version != (std.math.add(u32, before.schema_version, 1) catch return error.InvalidIntegrityDefinition) or
+        !std.mem.eql(u8, &before.checks_digest, &checks_digest)) return error.InvalidIntegrityDefinition;
+    var active: usize = 0;
+    for (before.bindings) |binding| if (!binding.retired) {
+        active += 1;
+    };
+    if (active != definitions.len) return error.InvalidIntegrityDefinition;
+    const owned = before.arena.allocator();
+    const bindings = try owned.dupe(Binding, before.bindings);
+    var promoted: usize = 0;
+    var encoded_length: usize = header_len + 32;
+    for (definitions, 0..) |definition, i| {
+        encoded_length = try accountDefinition(encoded_length, definition);
+        for (definitions[0..i]) |prior| if (prior.kind == definition.kind and std.mem.eql(u8, prior.name, definition.name)) return error.InvalidIntegrityDefinition;
+        const old = before.find(definition.kind, definition.name) orelse return error.InvalidIntegrityDefinition;
+        const selected = definition.kind == .foreign_key and for (names) |name| {
+            if (std.mem.eql(u8, name, definition.name)) break true;
+        } else false;
+        if (!selected) {
+            if (!std.mem.eql(u8, &old.definition.fingerprint, &definition.fingerprint) or
+                !std.mem.eql(u8, old.definition.payload, definition.payload)) return error.InvalidIntegrityDefinition;
+            continue;
+        }
+        // These payloads come from the shared canonical declaration compiler.
+        // Its only NOT VALID extension is a trailing field. Compare the exact
+        // remaining bytes: a parent, action, type or MATCH change cannot reuse
+        // a generation through this privileged candidate constructor.
+        const suffix = ",\"not_valid\":true}";
+        if (!std.mem.endsWith(u8, old.definition.payload, suffix) or !std.mem.endsWith(u8, definition.payload, "}") or
+            !std.mem.eql(u8, old.definition.payload[0 .. old.definition.payload.len - suffix.len], definition.payload[0 .. definition.payload.len - 1]) or
+            !std.mem.eql(u8, &old.definition.fingerprint, &digest(old.definition.payload)) or
+            !std.mem.eql(u8, &definition.fingerprint, &digest(definition.payload))) return error.InvalidIntegrityDefinition;
+        for (bindings) |*binding| if (binding.allocation == old.allocation) {
+            binding.definition = .{ .kind = .foreign_key, .name = try owned.dupe(u8, definition.name), .fingerprint = definition.fingerprint, .payload = try owned.dupe(u8, definition.payload) };
+            break;
+        };
+        promoted += 1;
+    }
+    if (promoted != names.len) return error.InvalidIntegrityDefinition;
+    before.bindings = bindings;
+    before.schema_version = schema_version;
+    before.schema_digest = schema_digest;
+    const expected = try owned.dupe(u8, previous);
+    const value = try encode(owned, before);
+    return .{ .catalog = before, .expected = expected, .value = value, .changed = true };
+}
+
+test "foreign key validation catalog successor retains generations and cannot redefine declaration semantics" {
+    const a = std.testing.allocator;
+    const fk_before = "{\"domain\":\"antfly foreign key declaration v1\",\"name\":\"fk\",\"parent_table\":\"parent\",\"not_valid\":true}";
+    const fk_after = "{\"domain\":\"antfly foreign key declaration v1\",\"name\":\"fk\",\"parent_table\":\"parent\"}";
+    const unique: Definition = .{ .kind = .unique, .name = "pk", .fingerprint = @splat(7) };
+    const old_fk: Definition = .{ .kind = .foreign_key, .name = "fk", .fingerprint = digest(fk_before), .payload = fk_before };
+    const new_fk: Definition = .{ .kind = .foreign_key, .name = "fk", .fingerprint = digest(fk_after), .payload = fk_after };
+    var old = try prepare(a, null, @splat(1), 1, @splat(2), &.{ unique, old_fk });
+    defer old.deinit();
+    var next = try prepareForeignKeyValidation(a, old.value, @splat(1), 2, @splat(3), &.{ unique, new_fk }, &.{"fk"}, @splat(0));
+    defer next.deinit();
+    try std.testing.expectEqual(old.catalog.next_generation, next.catalog.next_generation);
+    try std.testing.expectEqualSlices(u8, &old.catalog.find(.foreign_key, "fk").?.generation, &next.catalog.find(.foreign_key, "fk").?.generation);
+    try std.testing.expectEqualSlices(u8, &old.catalog.find(.unique, "pk").?.generation, &next.catalog.find(.unique, "pk").?.generation);
+    try std.testing.expectEqual(old.catalog.bindings.len, next.catalog.bindings.len);
+    var subsequent = try prepare(a, next.value, @splat(1), 3, @splat(4), &.{ unique, new_fk });
+    defer subsequent.deinit();
+    try std.testing.expectEqual(next.catalog.next_generation, subsequent.catalog.next_generation);
+    try std.testing.expectEqualSlices(u8, &next.catalog.find(.foreign_key, "fk").?.generation, &subsequent.catalog.find(.foreign_key, "fk").?.generation);
+    var ordinary = try prepare(a, old.value, @splat(1), 2, @splat(3), &.{ unique, new_fk });
+    defer ordinary.deinit();
+    try std.testing.expect(!std.mem.eql(u8, &old.catalog.find(.foreign_key, "fk").?.generation, &ordinary.catalog.find(.foreign_key, "fk").?.generation));
+    const wrong = "{\"domain\":\"antfly foreign key declaration v1\",\"name\":\"fk\",\"parent_table\":\"other\"}";
+    try std.testing.expectError(error.InvalidIntegrityDefinition, prepareForeignKeyValidation(a, old.value, @splat(1), 2, @splat(3), &.{ unique, .{ .kind = .foreign_key, .name = "fk", .fingerprint = digest(wrong), .payload = wrong } }, &.{"fk"}, @splat(0)));
+    try std.testing.expectError(error.InvalidIntegrityDefinition, prepareForeignKeyValidation(a, old.value, @splat(1), 2, @splat(3), &.{ unique, new_fk }, &.{ "fk", "fk" }, @splat(0)));
+    try std.testing.expectError(error.InvalidIntegrityDefinition, prepareForeignKeyValidation(a, old.value, @splat(1), 2, @splat(3), &.{ unique, new_fk }, &.{"missing"}, @splat(0)));
+    try std.testing.expectError(error.InvalidIntegrityDefinition, prepareForeignKeyValidation(a, old.value, @splat(1), 2, @splat(3), &.{ unique, new_fk }, &.{"fk"}, @splat(1)));
+}
+
+fn foreignValidationAllocationCase(a: Allocator) !void {
+    const before_payload = "{\"name\":\"fk\",\"not_valid\":true}";
+    const after_payload = "{\"name\":\"fk\"}";
+    const active: Definition = .{ .kind = .foreign_key, .name = "fk", .fingerprint = digest(before_payload), .payload = before_payload };
+    const next: Definition = .{ .kind = .foreign_key, .name = "fk", .fingerprint = digest(after_payload), .payload = after_payload };
+    var original = try prepare(std.testing.allocator, null, @splat(1), 1, @splat(2), &.{ active, .{ .kind = .unique, .name = "retired", .fingerprint = @splat(3) } });
+    defer original.deinit();
+    const retired = original.catalog.find(.unique, "retired").?.generation;
+    var before = try prepare(std.testing.allocator, original.value, @splat(1), 2, @splat(4), &.{active});
+    defer before.deinit();
+    var result = try prepareForeignKeyValidation(a, before.value, @splat(1), 3, @splat(5), &.{next}, &.{"fk"}, @splat(0));
+    defer result.deinit();
+    try std.testing.expect(result.catalog.findGeneration(retired).?.retired);
+    try std.testing.expectEqual(before.catalog.next_generation, result.catalog.next_generation);
+    try std.testing.expectEqual(before.catalog.bindings.len, result.catalog.bindings.len);
+}
+
+test "foreign key validation catalog preserves retired generations through every allocation failure" {
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, foreignValidationAllocationCase, .{});
+}
+
+test "foreign key validation catalog shares atomic LSM rollback commit and cold reopen" {
+    const a = std.testing.allocator;
+    const before_payload = "{\"name\":\"fk\",\"not_valid\":true}";
+    const after_payload = "{\"name\":\"fk\"}";
+    const active: Definition = .{ .kind = .foreign_key, .name = "fk", .fingerprint = digest(before_payload), .payload = before_payload };
+    const next: Definition = .{ .kind = .foreign_key, .name = "fk", .fingerprint = digest(after_payload), .payload = after_payload };
+    var before = try prepare(a, null, @splat(1), 1, @splat(2), &.{active});
+    defer before.deinit();
+    var after = try prepareForeignKeyValidation(a, before.value, @splat(1), 2, @splat(3), &.{next}, &.{"fk"}, @splat(0));
+    defer after.deinit();
+    var directory = try @import("../../common/test_directory.zig").TestDirectory.init("fk-validation-catalog");
+    defer directory.cleanup();
+    const lsm = @import("../lsm_backend.zig");
+    const DocStore = @import("../docstore.zig").DocStore;
+    const companion = "\x00\x00__metadata__:fk_validation_test:companion";
+    for (0..2) |epoch| {
+        var backend = try lsm.Backend.open(a, directory.path(), .{});
+        defer backend.close();
+        var store = try DocStore.openRuntime(a, try backend.runtimeStore(a, .{}));
+        defer store.close();
+        if (epoch == 0) {
+            try store.put(key, before.value);
+            {
+                var txn = try store.beginWriteTxn();
+                defer txn.abort();
+                try after.stage(&txn);
+                try txn.put(companion, "rollback");
+            }
+            const unchanged = try store.get(a, key);
+            defer a.free(unchanged);
+            try std.testing.expectEqualSlices(u8, before.value, unchanged);
+            try std.testing.expectError(error.NotFound, store.get(a, companion));
+            var txn = try store.beginWriteTxn();
+            errdefer txn.abort();
+            try after.stage(&txn);
+            try txn.put(companion, "committed");
+            try txn.commit();
+        } else {
+            const persisted = try store.get(a, key);
+            defer a.free(persisted);
+            try std.testing.expectEqualSlices(u8, after.value, persisted);
+            const marker = try store.get(a, companion);
+            defer a.free(marker);
+            try std.testing.expectEqualStrings("committed", marker);
+            var txn = try store.beginWriteTxn();
+            defer txn.abort();
+            try std.testing.expectError(error.IntegrityCatalogChanged, after.stage(&txn));
+        }
+    }
+}

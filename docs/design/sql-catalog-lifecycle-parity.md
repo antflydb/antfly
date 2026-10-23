@@ -62,6 +62,52 @@ This closes one original case and advances the requested batch to **36/100**.
 `sql-0736` VALIDATE remains unresolved: clearing the declaration without a
 coordinated historical proof returns `0A000`; MATCH PARTIAL NOT VALID is guarded.
 
+### FK VALIDATE: native preparation and read execution in progress
+
+`sql-0736` remains unresolved. Native read-side support now prepares exact
+validity-only schema candidates and projected child/reference witnesses. Child
+scans share the existing physical reader's snapshot, historical layouts,
+visibility-independent coverage, cancellation and exact replay machinery. They
+encode only the selected FK columns through the write-side tuple codec; full
+JSON documents are not reconstructed. Count plus modular 256-bit addition of
+domain-separated reference-key hashes permits disjoint owner aggregation
+without the duplicate-pair cancellation of XOR.
+
+Parent reads validate checksummed reference identities and their parent claims.
+Probe identities and continuations are copied before point reads can invalidate
+borrowed cursor buffers. Parent pages have fixed-size output and bounded record
+and preparation-time budgets. Their current implementation streams the private
+reference namespace: bounded pages do not imply work proportional only to the
+selected constraint. A generation directory or equivalent scoped contribution
+stream is still needed to avoid scanning unrelated references at large scale.
+
+A separate catalog candidate constructor retains active and retired generations,
+physical allocations and the allocation counter. It permits only the canonical
+NOT VALID fingerprint extension to disappear; parent/action/type changes cannot
+reuse a generation through this path. The real declaration compiler independently
+checks both schema inputs and the exact predecessor catalog, and recompiles the
+successor byte-identically. Ordinary catalog preparation and publication retain
+their existing behavior and cannot acquire validation authority through this
+constructor. No schema publication, source fence or parent proof is granted by
+these native helpers.
+
+The remaining case closure is the integrated durable lifecycle: admit the exact
+child/parent cohort through existing schema-validation machinery; authenticate
+all child freeze acknowledgements before parent coverage; persist/recover the
+root-bound reference proofs and AFR2 promotion effects; publish only after complete
+matching coverage; and qualify cancellation, lost ACKs, cold root adoption and
+restore through authenticated SQL owners and the PostgreSQL oracle. Existing
+SQL VALIDATE guards remain in place until that lifecycle is implemented. The
+original-case counts and next-100 progress above are unchanged.
+
+The strict Debug qualification currently covers fourteen native FK projection,
+parent-page, declaration/catalog and allocation-failure tests; two cold LSM
+source scan/replay/resume tests; and both existing NOT NULL scan regressions.
+After warm-up, ten thousand additional historical-row projections perform no
+heap allocations. Catalog rollback, commit, stale CAS and cold reopen retain
+all active/retired generation identities. These are native implementation
+checks, not the missing distributed SQL lifecycle evidence.
+
 ### Column comments: stable attributes and bounded catalog admission
 
 The unchanged `sql-0143` COMMENT ON COLUMN now binds the authorized table

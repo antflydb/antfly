@@ -33,6 +33,7 @@ const range_state = @import("range_state.zig");
 const ttl = @import("../ttl.zig");
 const predicates = @import("relational_predicate.zig");
 const row_cursor_codec = @import("relational_row_cursor.zig");
+const foreign_validation = @import("foreign_key_validation.zig");
 const nullability = @import("relational_nullability.zig");
 const Allocator = std.mem.Allocator;
 
@@ -154,6 +155,20 @@ pub const NullabilityPage = struct {
 
 pub const NullabilityResume = struct { projection_identity: [32]u8, after: []const u8 };
 
+pub const ForeignKeyValidationPage = struct {
+    scan: NullabilityPage,
+    witness: foreign_validation.Witness,
+
+    pub fn deinit(self: *@This()) void {
+        self.scan.deinit();
+        self.* = undefined;
+    }
+};
+pub const ForeignKeyReplayBoundary = struct {
+    scan: NullabilityReplayBoundary,
+    witness: foreign_validation.Witness,
+};
+
 /// A bounded replay assertion, never proof of coverage by itself. The reader
 /// independently visits the prefix and compares every field before advancing.
 pub const NullabilityReplayBoundary = @import("relational_schema_owner_contract.zig").NullabilityReplayBoundary;
@@ -219,8 +234,11 @@ pub const Reader = struct {
     nullability_projection: ?[32]u8 = null,
     nullability_failed: bool = false,
 
-    const NullabilityVisit = struct {
-        plan: *const nullability.Plan,
+    const ValidationVisit = struct {
+        plan: ?*const nullability.Plan = null,
+        foreign_keys: ?*foreign_validation.ChildPlan = null,
+        witness: foreign_validation.Witness = .{},
+        expected_witness: ?foreign_validation.Witness = null,
         control: nullability.Control,
         rows_examined: usize = 0,
         violation_column: ?usize = null,
@@ -228,6 +246,7 @@ pub const Reader = struct {
         replay: ?NullabilityReplayBoundary = null,
 
         fn verify(self: *const @This(), record_count: usize, more: bool) !void {
+            if (self.expected_witness) |expected| if (!self.witness.eql(expected)) return error.InvalidNullabilityReplay;
             if (self.replay) |expected| {
                 if (record_count != expected.records_examined or self.rows_examined != expected.rows_examined or
                     self.violation_column != expected.violation_column or more != expected.more or
@@ -972,6 +991,38 @@ pub const Reader = struct {
         return self.nextNullabilityPageMode(alloc, io, .{ .records = record_limit, .output_bytes = 2 * row_cursor_codec.max_key_bytes, .time_ns = 1 }, plan, control, expected);
     }
 
+    /// Physical FK coverage shares snapshot, bounds, cancellation and replay
+    /// with NOT NULL validation. Query RLS, TTL and predicates cannot hide rows.
+    pub fn nextForeignKeyValidationPage(self: *Reader, alloc: Allocator, io: ?std.Io, budget: Budget, plan: *foreign_validation.ChildPlan, control: nullability.Control) !ForeignKeyValidationPage {
+        return self.nextForeignKeyValidationPageMode(alloc, io, budget, plan, control, null);
+    }
+    pub fn nextForeignKeyValidationReplayPage(self: *Reader, alloc: Allocator, io: ?std.Io, expected: ForeignKeyReplayBoundary, plan: *foreign_validation.ChildPlan, control: nullability.Control) !ForeignKeyValidationPage {
+        try expected.scan.validate();
+        try expected.witness.validate();
+        if (expected.scan.violation_column) |rule| if (rule >= plan.rules.len) return error.InvalidNullabilityReplay;
+        return self.nextForeignKeyValidationPageMode(alloc, io, .{ .records = expected.scan.records_examined + @intFromBool(!expected.scan.more), .output_bytes = 2 * row_cursor_codec.max_key_bytes, .time_ns = 1 }, plan, control, expected);
+    }
+    fn nextForeignKeyValidationPageMode(self: *Reader, alloc: Allocator, io: ?std.Io, budget: Budget, plan: *foreign_validation.ChildPlan, control: nullability.Control, replay: ?ForeignKeyReplayBoundary) !ForeignKeyValidationPage {
+        try control.ensureActive();
+        try budget.validate();
+        try self.requirePhysicalValidationProjection(plan.names, control);
+        if (self.nullability_failed) return error.NullabilityValidationFailed;
+        if (self.nullability_projection) |identity| {
+            if (!std.mem.eql(u8, &identity, &plan.identity)) return error.InvalidNullabilityProjection;
+        } else if (self.after.items.len != 0 or self.done) return error.InvalidNullabilityProjection;
+        var visit: ValidationVisit = .{ .foreign_keys = plan, .control = control, .replay = if (replay) |expected| expected.scan else null, .expected_witness = if (replay) |expected| expected.witness else null };
+        var bounded = budget;
+        bounded.rows = 1;
+        const page = try self.nextPageFormat(alloc, io, bounded, true, &visit);
+        self.nullability_projection = plan.identity;
+        self.nullability_failed = visit.violation_column != null;
+        return .{ .scan = .{ .page = page, .rows_examined = visit.rows_examined, .violation_column = visit.violation_column, .after = visit.after }, .witness = visit.witness };
+    }
+    pub fn resumeForeignKeyValidationScan(self: *Reader, plan: *const foreign_validation.ChildPlan, continuation: NullabilityResume, control: nullability.Control) !void {
+        try self.requirePhysicalValidationProjection(plan.names, control);
+        try self.resumePhysicalValidationScan(plan.identity, continuation, control);
+    }
+
     fn nextNullabilityPageMode(self: *Reader, alloc: Allocator, io: ?std.Io, budget: Budget, plan: *const nullability.Plan, control: nullability.Control, replay: ?NullabilityReplayBoundary) !NullabilityPage {
         try control.ensureActive();
         try budget.validate();
@@ -980,7 +1031,7 @@ pub const Reader = struct {
         if (self.nullability_projection) |identity| {
             if (!std.mem.eql(u8, &identity, &plan.identity)) return error.InvalidNullabilityProjection;
         } else if (self.after.items.len != 0 or self.done) return error.InvalidNullabilityProjection;
-        var visit: NullabilityVisit = .{ .plan = plan, .control = control, .replay = replay };
+        var visit: ValidationVisit = .{ .plan = plan, .control = control, .replay = replay };
         var bounded = budget;
         bounded.rows = 1;
         const page = try self.nextPageFormat(alloc, io, bounded, true, &visit);
@@ -990,11 +1041,15 @@ pub const Reader = struct {
     }
 
     fn requireNullabilityProjection(self: *const Reader, plan: *const nullability.Plan, control: nullability.Control) !void {
+        try self.requirePhysicalValidationProjection(plan.names, control);
+    }
+
+    fn requirePhysicalValidationProjection(self: *const Reader, names: []const []const u8, control: nullability.Control) !void {
         if (self.index != null or self.row_policy_lease != null or self.row_filter != null or
             self.conditions.len != 0 or self.fields.len != 0 or self.include_cursor or self.include_primary_digest or
             !std.mem.eql(u8, self.lower, self.owned_lower) or !std.mem.eql(u8, self.upper, self.owned_upper))
             return error.InvalidNullabilityProjection;
-        for (plan.names) |name| {
+        for (names) |name| {
             try control.ensureActive();
             if (self.active.physicalLayout().ordinalForName(self.active.tableSchema().relational_columns, name) == null)
                 return error.RelationalIndexColumnNotFound;
@@ -1007,8 +1062,12 @@ pub const Reader = struct {
     pub fn resumeNullabilityScan(self: *Reader, plan: *const nullability.Plan, continuation: NullabilityResume, control: nullability.Control) !void {
         try control.ensureActive();
         try self.requireNullabilityProjection(plan, control);
+        try self.resumePhysicalValidationScan(plan.identity, continuation, control);
+    }
+    fn resumePhysicalValidationScan(self: *Reader, identity: [32]u8, continuation: NullabilityResume, control: nullability.Control) !void {
+        try control.ensureActive();
         if (self.nullability_projection != null or self.after.items.len != 0 or self.done or
-            !std.mem.eql(u8, &continuation.projection_identity, &plan.identity) or continuation.after.len > row_cursor_codec.max_key_bytes)
+            !std.mem.eql(u8, &continuation.projection_identity, &identity) or continuation.after.len > row_cursor_codec.max_key_bytes)
             return error.InvalidNullabilityProjection;
         if (continuation.after.len != 0) {
             if (!internal.isRelationalRowKey(continuation.after) or std.mem.order(u8, continuation.after, self.owned_lower) == .lt or
@@ -1018,10 +1077,10 @@ pub const Reader = struct {
         try control.ensureActive();
         @memcpy(self.after.items.ptr[0..continuation.after.len], continuation.after);
         self.after.items.len = continuation.after.len;
-        self.nullability_projection = plan.identity;
+        self.nullability_projection = identity;
     }
 
-    fn nextPageFormat(self: *Reader, alloc: Allocator, io: ?std.Io, budget: Budget, typed_output: bool, validation: ?*NullabilityVisit) !Page {
+    fn nextPageFormat(self: *Reader, alloc: Allocator, io: ?std.Io, budget: Budget, typed_output: bool, validation: ?*ValidationVisit) !Page {
         try budget.validate();
         var arena = std.heap.ArenaAllocator.init(alloc);
         errdefer arena.deinit();
@@ -1122,7 +1181,10 @@ pub const Reader = struct {
                 var decoded_key: ?[]const u8 = null;
                 const matches = check: {
                     if (validation) |visit| {
-                        visit.violation_column = try visit.plan.firstNullInRow(row, visit.control);
+                        visit.violation_column = if (visit.foreign_keys) |fk| blk: {
+                            const document = (try internal.decodeStoredDocumentRowKeyAlloc(temporary, key)).?;
+                            break :blk try fk.inspectRow(document, row, &visit.witness, visit.control);
+                        } else try visit.plan.?.firstNullInRow(row, visit.control);
                         visit.rows_examined += 1;
                         break :check visit.violation_column != null;
                     }

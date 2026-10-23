@@ -870,6 +870,14 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     deferred_check_storage_run.addArg("--require-no-skips");
     b.step("antfly-relational-deferred-check-storage-test", "Verify historical CHECK import, rewrite, restore and new-write enforcement")
         .dependOn(&deferred_check_storage_run.step);
+    const fk_validation_scan_tests = b.addTest(.{
+        .root_module = relational_index_system_mod,
+        .filters = &.{"relational index system foreign key validation scan"},
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    const fk_validation_scan_run = addFilteredTestRunArtifact(b, fk_validation_scan_tests);
+    fk_validation_scan_run.addArg("--require-no-skips");
+    b.step("antfly-relational-fk-validation-scan-test", "Verify bounded FK source witnesses, cold LSM scans, replay and cancellation").dependOn(&fk_validation_scan_run.step);
     const nullability_scan_tests = b.addTest(.{
         .root_module = relational_index_system_mod,
         .filters = &.{"relational index system nullability scan"},
@@ -6665,6 +6673,17 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     private_claim_transfer_step.dependOn(&addFilteredTestRunArtifact(b, private_claim_transfer_tests).step);
     db_test_step.dependOn(&native_index_candidate_run.step);
     unit_test_step.dependOn(&native_index_candidate_run.step);
+    const fk_validation_projection_tests = b.addTest(.{
+        .root_module = native_index_candidate_mod,
+        .filters = &.{"foreign key validation"},
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    const fk_validation_projection_run = addFilteredTestRunArtifact(b, fk_validation_projection_tests);
+    fk_validation_projection_run.addArg("--require-no-skips");
+    db_test_step.dependOn(&fk_validation_projection_run.step);
+    unit_test_step.dependOn(&fk_validation_projection_run.step);
+    b.step("relational-fk-validation-test", "Verify exact FK validity candidates and typed source reference-set witnesses")
+        .dependOn(&fk_validation_projection_run.step);
     const historical_fk_tests = b.addTest(.{
         .root_module = native_index_candidate_mod,
         .filters = &.{"NOT VALID"},
