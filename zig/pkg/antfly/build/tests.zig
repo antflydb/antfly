@@ -2104,6 +2104,21 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const root_test_step = b.step("root-test", "Run fast root-module compile smoke tests");
     root_test_step.dependOn(&run_lib_unit_tests.step);
 
+    const graph_capability_filters = selectTestFilters(b, &.{
+        "unsupported graph diagnostics identify the rejected operation feature",
+        "graph capability diagnostic",
+        "authenticated single-group graph queries require distributed coordination",
+    });
+    const graph_capability_tests = b.addTest(.{
+        .name = "graph-capability-tests",
+        .root_module = antfly_test_mod,
+        .filters = compileFiltersWithAnchors(b, &.{ "api module compiles", "metadata module compiles" }, graph_capability_filters),
+        .max_rss = 7 * 1024 * 1024 * 1024,
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("antfly-graph-capability-test", "Run graph capability admission and request-owned diagnostic contracts")
+        .dependOn(&addFilteredTestRunArtifactWithRuntimeFilters(b, graph_capability_tests, graph_capability_filters).step);
+
     const lib_bedrock_tests = b.addTest(.{
         .root_module = antfly_test_mod,
         .filters = &.{"bedrock provider request helpers"},
