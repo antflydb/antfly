@@ -1,0 +1,7 @@
+{
+  "provider": "openai",
+  "model": "gpt-4.1-mini",
+  "url": "https://api.openai.com/v1",
+  "max_tokens": 256,
+  "api_key": "${secret:openai.api_key}"
+}
