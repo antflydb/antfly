@@ -6318,3 +6318,148 @@ test "memory relationship verdict context survives temporary denial and fails cl
     const operation: m.types.provenance.Resource = try std.json.parseFromSliceLeaky(m.types.provenance.Resource, a, bound, .{});
     try std.testing.expectEqualStrings(accepted.id, operation.id);
 }
+
+test "memory relationship verdicts forget candidate evidence outside rendered views" {
+    for ([_]?bool{ false, null }) |accept| {
+        var store = Store.init();
+        defer store.deinit();
+        const a = store.arena.allocator();
+        const svc = store.service("alice", true, 10);
+        _ = try svc.execute(a, .create, "", "{\"ontology_pack\":\"software_team_v1\"}", "create");
+        const observation: m.types.ObservationRequest = .{
+            .evidence = &.{ .{ .id = "base", .source_id = "s", .source_version = "1", .text = "Names" }, .{ .id = "candidate-evidence", .source_id = "c", .source_version = "1", .text = "SECRET_CANDIDATE_CONTEXT" } },
+            .entities = &.{ .{ .id = "a", .name = "Antfly", .evidence = &.{.{ .id = "base" }} }, .{ .id = "b", .name = "Database", .evidence = &.{.{ .id = "base" }} } },
+        };
+        _ = try svc.execute(a, .observe, "", try std.json.Stringify.valueAlloc(a, observation, .{}), "observe");
+        const state = try std.json.parseFromSliceLeaky(m.types.State, a, store.values.get("control").?, .{});
+        const proposed = try std.json.parseFromSliceLeaky(m.types.OperationStatus, a, try svc.execute(a, .propose_relationship, "", try std.json.Stringify.valueAlloc(a, m.types.RelationshipProposalRequest{ .id = "proposal", .expected_revision = state.revision, .assertion = .{ .id = "link", .subject = "a", .predicate = "is_a", .value = "b", .statement = "SECRET_CANDIDATE_CONTEXT", .evidence = &.{.{ .id = "candidate-evidence" }} } }, .{}), "propose"), .{});
+        const verdict = try std.json.parseFromSliceLeaky(m.types.OperationStatus, a, try svc.execute(a, .review_relationship, "proposal", try std.json.Stringify.valueAlloc(a, m.types.EntityVerdict{ .expected_revision = proposed.revision, .accept = accept, .reason = "SECRET_CANDIDATE_RATIONALE" }, .{}), "verdict"), .{});
+        const artifact = try std.json.parseFromSliceLeaky(std.json.Value, a, store.values.get(try fixtureKey(a, "judgment", verdict.id)).?, .{});
+        var body: std.json.ObjectMap = .empty;
+        try body.put(a, "resource", artifact.object.get("operation").?);
+        const explain_request = try std.json.Stringify.valueAlloc(a, std.json.Value{ .object = body }, .{});
+        try std.testing.expect(std.mem.indexOf(u8, try svc.execute(a, .explain, "", explain_request, ""), "SECRET_CANDIDATE_RATIONALE") != null);
+        // A restored legacy artifact cannot attest to complete candidate input.
+        const judgment_path = try fixtureKey(a, "judgment", verdict.id);
+        const complete = store.values.get(judgment_path).?;
+        var legacy = artifact;
+        _ = legacy.object.swapRemove("input_version");
+        try store.values.put(a, judgment_path, try std.json.Stringify.valueAlloc(a, legacy, .{}));
+        try std.testing.expect(std.mem.indexOf(u8, try svc.execute(a, .explain, "", explain_request, ""), "SECRET_CANDIDATE_RATIONALE") == null);
+        try store.values.put(a, judgment_path, complete);
+        _ = try svc.execute(a, .forget, "", "{\"evidence_ids\":[\"candidate-evidence\"]}", "forget");
+        try std.testing.expectError(error.MemoryNotFound, svc.execute(a, .relationship_proposal, "proposal", "{}", ""));
+        // Candidate evidence is independent of the surviving entity views.
+        try std.testing.expect(std.mem.indexOf(u8, try svc.execute(a, .explain, "", explain_request, ""), "SECRET_CANDIDATE_RATIONALE") == null);
+        for (0..32) |i| _ = try svc.execute(a, .advance, "", "{}", try std.fmt.allocPrint(a, "cleanup-{d}", .{i}));
+        var rows = store.values.valueIterator();
+        while (rows.next()) |json| try std.testing.expect(std.mem.indexOf(u8, json.*, "SECRET_CANDIDATE_RATIONALE") == null);
+        try std.testing.expect(std.mem.indexOf(u8, try svc.execute(a, .explain, "", explain_request, ""), "SECRET_CANDIDATE_RATIONALE") == null);
+    }
+}
+
+test "memory native reconciliation freezes all supplied prior support branches" {
+    var store = Store.init();
+    defer store.deinit();
+    const a = store.arena.allocator();
+    var svc = modelService(&store, 10);
+    const Judge = struct {
+        fn decide(_: *anyopaque, alloc: A, _: m.types.Config, _: m.types.Assertion, candidates: []const m.types.StoredAssertion) !m.types.ReconciliationDecision {
+            return .{ .supersedes = &.{}, .reason = try std.fmt.allocPrint(alloc, "Read original support {s}", .{candidates[0].assertion.evidence[0].id}) };
+        }
+    };
+    svc.backend.decide = Judge.decide;
+    const config: m.types.Config = .{ .features = .{ .reconciliation = .model }, .models = .{ .decider = fake_model }, .predicates = &.{.{ .name = "p", .cardinality = .one }} };
+    _ = try svc.execute(a, .create, "", try std.json.Stringify.valueAlloc(a, config, .{}), "create");
+    _ = try svc.execute(a, .observe, "", "{\"evidence\":[{\"id\":\"FORGOTTEN_PRIOR_SUPPORT\",\"source_id\":\"s\",\"source_version\":\"1\",\"text\":\"Original\"},{\"id\":\"fallback\",\"source_id\":\"s\",\"source_version\":\"2\",\"text\":\"Independent\"},{\"id\":\"new-source\",\"source_id\":\"s\",\"source_version\":\"3\",\"text\":\"New\"}]}", "sources");
+    _ = try svc.execute(a, .assertions, "", "{\"assertions\":[{\"id\":\"old\",\"subject\":\"s\",\"predicate\":\"p\",\"value\":\"old\",\"statement\":\"Old claim\",\"evidence\":[{\"id\":\"FORGOTTEN_PRIOR_SUPPORT\"}],\"support_sets\":[{\"evidence\":[{\"id\":\"fallback\"}]}]}]}", "old");
+    _ = try svc.execute(a, .assertions, "", "{\"assertions\":[{\"id\":\"new\",\"subject\":\"s\",\"predicate\":\"p\",\"value\":\"new\",\"statement\":\"New claim\",\"evidence\":[{\"id\":\"new-source\"}]}]}", "new");
+    const decisions = try Store.scan(&store, a, "decision/", null, 8);
+    try std.testing.expectEqual(@as(usize, 1), decisions.rows.len);
+    const decision_row = decisions.rows[0];
+    var legacy = try std.json.parseFromSliceLeaky(std.json.Value, a, decision_row.json, .{});
+    _ = legacy.object.swapRemove("context");
+    try store.values.put(a, decision_row.key, try std.json.Stringify.valueAlloc(a, legacy, .{}));
+    const legacy_result = try std.json.parseFromSliceLeaky(m.types.StoredAssertion, a, try svc.execute(a, .get, "new", "{}", ""), .{});
+    try std.testing.expect(legacy_result.assertion.reconciliation_reason == null);
+    try store.values.put(a, decision_row.key, decision_row.json);
+    _ = try svc.execute(a, .forget, "", "{\"evidence_ids\":[\"FORGOTTEN_PRIOR_SUPPORT\"]}", "forget");
+    const old = try svc.execute(a, .get, "old", "{}", "");
+    try std.testing.expect(std.mem.indexOf(u8, old, "FORGOTTEN_PRIOR_SUPPORT") == null);
+    const result = try svc.execute(a, .get, "new", "{}", "");
+    try std.testing.expect(std.mem.indexOf(u8, result, "FORGOTTEN_PRIOR_SUPPORT") == null);
+    for (0..32) |i| _ = try svc.execute(a, .advance, "", "{}", try std.fmt.allocPrint(a, "cleanup-{d}", .{i}));
+    try std.testing.expect(std.mem.indexOf(u8, try svc.execute(a, .get, "new", "{}", ""), "FORGOTTEN_PRIOR_SUPPORT") == null);
+    var rows = store.values.valueIterator();
+    while (rows.next()) |json| try std.testing.expect(std.mem.indexOf(u8, json.*, "Read original support FORGOTTEN_PRIOR_SUPPORT") == null);
+}
+
+test "memory relationship judgment freezes candidate parents outside entity views" {
+    for ([_]?bool{ true, false, null }) |accept| {
+        var store = Store.init();
+        defer store.deinit();
+        const a = store.arena.allocator();
+        const svc = store.service("alice", true, 10);
+        _ = try svc.execute(a, .create, "", "{\"ontology_pack\":\"software_team_v1\"}", "create");
+        const observation: m.types.ObservationRequest = .{
+            .evidence = &.{ .{ .id = "base", .source_id = "s", .source_version = "1", .text = "Concepts" }, .{ .id = "original", .source_id = "s", .source_version = "2", .text = "Original premise" } },
+            .entities = &.{ .{ .id = "a", .name = "Antfly", .evidence = &.{.{ .id = "base" }} }, .{ .id = "b", .name = "Database", .evidence = &.{.{ .id = "base" }} } },
+            .assertions = &.{.{ .id = "premise", .subject = "other", .predicate = "p", .value = "context", .statement = "Independent premise outside both views", .evidence = &.{.{ .id = "original" }}, .support_sets = &.{.{ .evidence = &.{.{ .id = "base" }} }} }},
+        };
+        _ = try svc.execute(a, .observe, "", try std.json.Stringify.valueAlloc(a, observation, .{}), "observe");
+        const state = try std.json.parseFromSliceLeaky(m.types.State, a, store.values.get("control").?, .{});
+        const proposed = try std.json.parseFromSliceLeaky(m.types.OperationStatus, a, try svc.execute(a, .propose_relationship, "", try std.json.Stringify.valueAlloc(a, m.types.RelationshipProposalRequest{ .id = "proposal", .expected_revision = state.revision, .assertion = .{ .id = "link", .subject = "a", .predicate = "is_a", .value = "b", .statement = "Candidate relation", .evidence = &.{.{ .id = "base" }}, .depends_on = &.{"premise"} } }, .{}), "propose"), .{});
+        const reviewed = try std.json.parseFromSliceLeaky(m.types.OperationStatus, a, try svc.execute(a, .review_relationship, "proposal", try std.json.Stringify.valueAlloc(a, m.types.EntityVerdict{ .expected_revision = proposed.revision, .accept = accept, .reason = "CANDIDATE_PARENT_RATIONALE" }, .{}), "review"), .{});
+        const artifact = try std.json.parseFromSliceLeaky(std.json.Value, a, store.values.get(try fixtureKey(a, "judgment", reviewed.id)).?, .{});
+        var body: std.json.ObjectMap = .empty;
+        try body.put(a, "resource", artifact.object.get("operation").?);
+        try body.put(a, "max_nodes", .{ .integer = 256 });
+        try body.put(a, "max_depth", .{ .integer = 16 });
+        const request = try std.json.Stringify.valueAlloc(a, std.json.Value{ .object = body }, .{});
+        const before = try svc.execute(a, .explain, "", request, "");
+        try std.testing.expect(std.mem.indexOf(u8, before, "CANDIDATE_PARENT_RATIONALE") != null);
+        try std.testing.expect(std.mem.indexOf(u8, before, "Original premise") != null);
+        _ = try svc.execute(a, .forget, "", "{\"evidence_ids\":[\"original\"]}", "forget");
+        _ = try svc.execute(a, .get, "premise", "{}", "");
+        try std.testing.expect(std.mem.indexOf(u8, try svc.execute(a, .explain, "", request, ""), "CANDIDATE_PARENT_RATIONALE") == null);
+        if (accept == @as(?bool, true)) try std.testing.expectError(error.MemoryNotFound, svc.execute(a, .get, "link", "{}", ""));
+        for (0..32) |i| _ = try svc.execute(a, .advance, "", "{}", try std.fmt.allocPrint(a, "cleanup-{d}", .{i}));
+        var rows = store.values.valueIterator();
+        while (rows.next()) |json| try std.testing.expect(std.mem.indexOf(u8, json.*, "CANDIDATE_PARENT_RATIONALE") == null);
+    }
+}
+
+test "memory native reconciliation keeps denied causal context recoverable and freezes alternative branches" {
+    var store = Store.init();
+    defer store.deinit();
+    const a = store.arena.allocator();
+    var svc = modelService(&store, 10);
+    const Judge = struct {
+        fn decide(_: *anyopaque, alloc: A, _: m.types.Config, _: m.types.Assertion, candidates: []const m.types.StoredAssertion) !m.types.ReconciliationDecision {
+            return .{ .supersedes = &.{}, .reason = try std.fmt.allocPrint(alloc, "ALTERNATIVE_REASON {s}", .{candidates[0].assertion.support_sets[0].evidence[0].id}) };
+        }
+    };
+    svc.backend.decide = Judge.decide;
+    const config: m.types.Config = .{ .features = .{ .reconciliation = .model }, .models = .{ .decider = fake_model }, .predicates = &.{.{ .name = "p", .cardinality = .one }} };
+    _ = try svc.execute(a, .create, "", try std.json.Stringify.valueAlloc(a, config, .{}), "create");
+    _ = try svc.execute(a, .observe, "", "{\"evidence\":[{\"id\":\"public\",\"source_id\":\"s\",\"source_version\":\"1\",\"text\":\"Public\"},{\"id\":\"protected\",\"resource_selector\":{\"table\":\"business\",\"id\":\"approval\"}}]}", "sources");
+    _ = try svc.execute(a, .assertions, "", "{\"assertions\":[{\"id\":\"old\",\"subject\":\"s\",\"predicate\":\"p\",\"value\":\"old\",\"statement\":\"Old fact\",\"evidence\":[{\"id\":\"public\"}],\"support_sets\":[{\"evidence\":[{\"id\":\"protected\"}]}]}]}", "old");
+    _ = try svc.execute(a, .assertions, "", "{\"assertions\":[{\"id\":\"new\",\"subject\":\"s\",\"predicate\":\"p\",\"value\":\"new\",\"statement\":\"New fact\",\"evidence\":[{\"id\":\"public\"}]}]}", "new");
+    try std.testing.expect(std.mem.indexOf(u8, try svc.execute(a, .get, "new", "{}", ""), "ALTERNATIVE_REASON protected") != null);
+    store.resource_state = .denied;
+    try std.testing.expect(std.mem.indexOf(u8, try svc.execute(a, .get, "new", "{}", ""), "ALTERNATIVE_REASON") == null);
+    const current = try std.json.parseFromSliceLeaky(m.types.State, a, store.values.get("control").?, .{});
+    // Schedule a complete retention pass while the credential is denied.
+    var explicit = current.config;
+    explicit.features.reconciliation = .explicit;
+    _ = try svc.execute(a, .configure, "", try std.json.Stringify.valueAlloc(a, .{ .expected_revision = current.revision, .config = explicit }, .{}), "configure");
+    for (0..32) |i| _ = try svc.execute(a, .advance, "", "{}", try std.fmt.allocPrint(a, "denied-cleanup-{d}", .{i}));
+    store.resource_state = .current;
+    try std.testing.expect(std.mem.indexOf(u8, try svc.execute(a, .get, "new", "{}", ""), "ALTERNATIVE_REASON protected") != null);
+    _ = try svc.execute(a, .forget, "", "{\"evidence_ids\":[\"protected\"]}", "forget");
+    _ = try svc.execute(a, .get, "old", "{}", "");
+    try std.testing.expect(std.mem.indexOf(u8, try svc.execute(a, .get, "new", "{}", ""), "ALTERNATIVE_REASON") == null);
+    for (0..32) |i| _ = try svc.execute(a, .advance, "", "{}", try std.fmt.allocPrint(a, "forgotten-cleanup-{d}", .{i}));
+    var rows = store.values.valueIterator();
+    while (rows.next()) |json| try std.testing.expect(std.mem.indexOf(u8, json.*, "ALTERNATIVE_REASON") == null);
+}

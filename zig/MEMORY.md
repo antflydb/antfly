@@ -539,6 +539,14 @@ assertion. Every accept, reject and defer verdict also writes an immutable,
 operation-bound judgment artifact with that same selected support closure and
 rationale. The latest relationship verdict references its artifact, independently
 of accepted-assertion retention. Entity verdict rationales share this gate.
+Relationship artifacts include the proposed assertion's own evidence and frozen
+transitive dependency closure, even when those inputs do not appear in either
+entity view. Reject and defer have the same causal retention contract as accept.
+Native reconciliation snapshots every support branch actually supplied in the
+incoming claim and public prior records; an independent factual alternative
+cannot replace forgotten inference context. Historical support references stay
+bound to their captured assertion revisions. Legacy rationale records lacking a
+complete causal snapshot fail closed.
 Rationales are redacted immediately when their exact context becomes unavailable;
 relationship verdict detail follows the same gate. Irreversible loss scrubs the
 artifact and duplicate
