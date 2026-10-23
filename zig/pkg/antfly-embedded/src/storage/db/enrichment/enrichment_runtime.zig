@@ -32627,7 +32627,10 @@ test "invalid OCR boxes cannot shift grounding onto earlier repeated text" {
 
 test "OCR text selection retains only exactly mapped region spans" {
     const alloc = std.testing.allocator;
-    const embedded_text = "Quarter Revenue Cost Margin\nQ1 101 81 20\nQ2 115 90 25\nQ3 124 94 30\nQ4 140 100 40";
+    // The prose needs OCR, while the decoded table values remain reliable
+    // (a clean table alone no longer falls back to OCR; see #1247).
+    const embedded_text = "T h e s e r v i c e n e t t e d 1 2 0 t i c k e t s a t $ 5 0 e a c h\n" ++
+        "Quarter Revenue Cost Margin\nQ1 101 81 20\nQ2 115 90 25\nQ3 124 94 30\nQ4 140 100 40";
     const ocr_text = "Quarterly revenue and margins improved throughout the year. This transcription contains fluent explanatory prose but omits the individual table cells.";
     const regions_json =
         "[{\"text\":\"Quarterly revenue and margins improved throughout the year. This transcription contains fluent explanatory prose but omits the individual table cells.\",\"bbox\":[5,5,95,35],\"coordinate_space\":\"image_pixels_top_left\"}," ++
