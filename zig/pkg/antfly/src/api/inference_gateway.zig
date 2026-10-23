@@ -290,7 +290,7 @@ pub fn prepare(server: anytype, ctx: *httpx.Context) !void {
         timeout_ms = @min(timeout_ms, std.fmt.parseInt(u64, raw, 10) catch return error.InvalidInferenceRequest);
     }
     const deadline = now +| timeout_ms *| std.time.ns_per_ms;
-    ctx.application_deadline_ns = @min(ctx.application_deadline_ns orelse deadline, deadline);
+    @import("../request_deadline.zig").tightenPlatform(ctx, deadline);
     if (timeout_ms == 0) return error.Timeout;
 }
 
@@ -773,7 +773,7 @@ fn executorFor(server: anytype, ctx: *httpx.Context, client: *httpx.Client, name
             return context.isCancellationRequested();
         }
     }.cancelled);
-    const deadline = @min(@import("connections.zig").inferenceInvocationDeadlineNs(), ctx.application_deadline_ns orelse std.math.maxInt(u64));
+    const deadline = @min(@import("connections.zig").inferenceInvocationDeadlineNs(), @import("../request_deadline.zig").platformDeadline(ctx) orelse std.math.maxInt(u64));
     return .{
         .view = named,
         .generator_override = generator_override,
@@ -1039,9 +1039,14 @@ fn executeChain(server: anytype, ctx: *httpx.Context, a: std.mem.Allocator, requ
         if (cfg.provider != .openai and cfg.provider != .openrouter and cfg.provider != .ollama and cfg.provider != .antfly) return error.UnsupportedInferenceFeature;
     }
     const previous_deadline = ctx.application_deadline_ns;
-    defer ctx.application_deadline_ns = previous_deadline;
-    const deadline = @min(@import("connections.zig").inferenceInvocationDeadlineNs(), previous_deadline orelse std.math.maxInt(u64));
+    const previous_clock = ctx.application_deadline_io;
+    defer {
+        ctx.application_deadline_ns = previous_deadline;
+        ctx.application_deadline_io = previous_clock;
+    }
+    const deadline = @min(@import("connections.zig").inferenceInvocationDeadlineNs(), @import("../request_deadline.zig").platformDeadline(ctx) orelse std.math.maxInt(u64));
     ctx.application_deadline_ns = deadline;
+    ctx.application_deadline_io = null;
     const budget = options.attempt_limit;
     var attempts = gateway.Attempts{ .deadline_ns = deadline, .remaining = budget };
     var failure: anyerror = error.InferenceUpstreamUnavailable;
@@ -1108,7 +1113,7 @@ pub fn batch(server: anytype, ctx: *httpx.Context) !httpx.Response {
     const Result = struct { custom_id: []const u8, index: usize, response: ?Json = null, @"error": ?struct { code: []const u8, message: []const u8, retryable: bool } = null };
     const results = try a.alloc(Result, items.array.items.len);
     var succeeded: usize = 0;
-    const deadline = @min(@import("connections.zig").inferenceInvocationDeadlineNs(), ctx.application_deadline_ns orelse std.math.maxInt(u64));
+    const deadline = @min(@import("connections.zig").inferenceInvocationDeadlineNs(), @import("../request_deadline.zig").platformDeadline(ctx) orelse std.math.maxInt(u64));
     const options = ExecutionOptions{ .response_delivery = .buffered, .attempt_limit = try attemptBudget(ctx) };
     for (items.array.items, results, 0..) |item, *result, index| {
         result.* = .{ .custom_id = item.object.get("custom_id").?.string, .index = index };
@@ -1454,7 +1459,7 @@ fn forwardEndpoint(server: anytype, ctx: *httpx.Context, endpoint: []const u8, a
             return context.isCancellationRequested();
         }
     }.cancelled);
-    const timeout_ms = @max(@as(u64, 1), (@min(@import("connections.zig").inferenceInvocationDeadlineNs(), ctx.application_deadline_ns orelse std.math.maxInt(u64)) -| @import("antfly_platform").time.monotonicNs()) / std.time.ns_per_ms);
+    const timeout_ms = @max(@as(u64, 1), (@min(@import("connections.zig").inferenceInvocationDeadlineNs(), @import("../request_deadline.zig").platformDeadline(ctx) orelse std.math.maxInt(u64)) -| @import("antfly_platform").time.monotonicNs()) / std.time.ns_per_ms);
     const timeout_header = try std.fmt.allocPrint(a, "{d}", .{timeout_ms});
     defer a.free(timeout_header);
     var headers = std.ArrayList([2][]const u8).empty;
@@ -1759,4 +1764,30 @@ test "httpx inference gateway physical decision catalogs apply connection image 
     try std.testing.expectEqual(gateway.Support.supported, connectionCatalogCapabilities(named, "generators", "vendor", "vision").images);
     config.connections.getPtr("vendor").?.inference.?.max_image_input_tokens = 8192;
     try std.testing.expectEqual(gateway.Support.supported, connectionCatalogCapabilities(named, "deciders", "vendor", "vision").images);
+}
+
+test "httpx inference gateway admission translates the ingress executor clock" {
+    const Server = struct {
+        fn publicInferenceEnabled(_: *@This()) bool {
+            return true;
+        }
+        fn inferenceIo(_: *@This()) std.Io {
+            return std.testing.io;
+        }
+    };
+    var server: Server = .{};
+    var clock = try @import("vopr").vopr_io.VoprIo.init(.{ .monotonic_ns = 7 * std.time.ns_per_s });
+    defer clock.deinit();
+    var request = try httpx.Request.init(std.testing.allocator, .POST, "/ai/v1/generate");
+    defer request.deinit();
+    var ctx = httpx.Context.init(std.testing.allocator, clock.io(), &request);
+    defer ctx.deinit();
+    try ctx.setHeader("x-request-id", "test");
+    @import("../request_deadline.zig").tighten(&ctx, 100);
+    const before = @import("antfly_platform").time.monotonicNs();
+    try prepare(&server, &ctx);
+    const after = @import("antfly_platform").time.monotonicNs();
+    try std.testing.expect(ctx.application_deadline_io == null);
+    try std.testing.expect(ctx.application_deadline_ns.? >= before + 100 * std.time.ns_per_ms);
+    try std.testing.expect(ctx.application_deadline_ns.? <= after + 100 * std.time.ns_per_ms);
 }

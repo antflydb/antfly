@@ -76,10 +76,10 @@ fn parseMutationOptions(iterator: std.process.Args.Iterator, allow_document: boo
 
 fn fatalMutationParseIssue(issue: MutationParseIssue) noreturn {
     switch (issue) {
-        .missing_value => |flag| cli.fatal("{s} requires a value", .{flag}),
-        .duplicate => |flag| cli.fatal("{s} may only be provided once", .{flag}),
-        .unknown => |flag| cli.fatal("unknown mutation option: {s}", .{flag}),
-        .invalid_sync_level => |value| cli.fatal("invalid --sync-level value: {s}", .{value}),
+        .missing_value => |flag| cli.argumentError("{s} requires a value", .{flag}),
+        .duplicate => |flag| cli.argumentError("{s} may only be provided once", .{flag}),
+        .unknown => |flag| cli.argumentError("unknown mutation option: {s}", .{flag}),
+        .invalid_sync_level => |value| cli.argumentError("invalid --sync-level value: {s}", .{value}),
     }
 }
 
@@ -88,9 +88,9 @@ pub fn insert(allocator: std.mem.Allocator, _: std.Io, client: *antfly_client.An
         .value => |value| value,
         .issue => |issue| fatalMutationParseIssue(issue),
     };
-    const tbl = options.table_name orelse cli.fatal("--table is required", .{});
-    const k = options.key orelse cli.fatal("--key is required", .{});
-    const v = options.value_json orelse cli.fatal("--document is required", .{});
+    const tbl = options.table_name orelse cli.argumentError("--table is required", .{});
+    const k = options.key orelse cli.argumentError("--key is required", .{});
+    const v = options.value_json orelse cli.argumentError("--document is required", .{});
 
     var parsed = try std.json.parseFromSlice(std.json.ArrayHashMap(std.json.Value), allocator, v, .{});
     defer parsed.deinit();
@@ -107,7 +107,8 @@ pub fn insert(allocator: std.mem.Allocator, _: std.Io, client: *antfly_client.An
         .sync_level = options.sync_level orelse .write,
     });
     defer resp.deinit();
-    std.debug.print("Insert successful.\n", .{});
+    try cli.output.mutationResponse(resp);
+    if (!cli.isAgent()) cli.output.notice("Insert successful.\n", .{});
 }
 
 pub fn delete(_: std.mem.Allocator, _: std.Io, client: *antfly_client.AntflyClient, args: *std.process.Args.Iterator) !void {
@@ -115,8 +116,8 @@ pub fn delete(_: std.mem.Allocator, _: std.Io, client: *antfly_client.AntflyClie
         .value => |value| value,
         .issue => |issue| fatalMutationParseIssue(issue),
     };
-    const tbl = options.table_name orelse cli.fatal("--table is required", .{});
-    const k = options.key orelse cli.fatal("--key is required", .{});
+    const tbl = options.table_name orelse cli.argumentError("--table is required", .{});
+    const k = options.key orelse cli.argumentError("--key is required", .{});
 
     const deletes = [_][]const u8{k};
     var resp = try client.batch(tbl, .{
@@ -124,11 +125,13 @@ pub fn delete(_: std.mem.Allocator, _: std.Io, client: *antfly_client.AntflyClie
         .sync_level = options.sync_level orelse .write,
     });
     defer resp.deinit();
+    try cli.output.mutationResponse(resp);
+    if (cli.isAgent()) return;
     if (resp.data) |data| {
         if (data.value.deleted) |deleted| {
-            std.debug.print("Delete successful. Deleted: {d}\n", .{deleted});
+            cli.output.notice("Delete successful. Deleted: {d}\n", .{deleted});
         } else {
-            std.debug.print("Delete successful.\n", .{});
+            cli.output.notice("Delete successful.\n", .{});
         }
     }
 }
@@ -592,6 +595,7 @@ const LoadProcessor = struct {
                 .sync_level = effectiveLoadSyncLevel(self.opts.sync_level),
             });
             defer resp.deinit();
+            if (cli.isAgent()) try cli.output.mutationResponse(resp);
             self.stats.committed += @intCast(self.batch.docs);
             if (self.opts.checkpoint_enabled) {
                 if (self.checkpoint_path) |path| try self.writeCheckpoint(path);
@@ -600,7 +604,7 @@ const LoadProcessor = struct {
 
         self.stats.sent += @intCast(self.batch.docs);
         self.stats.batch_count += 1;
-        std.debug.print("Batch {d}: loaded {d} items (total loaded: {d}, rejected: {d})\n", .{
+        cli.output.notice("Batch {d}: loaded {d} items (total loaded: {d}, rejected: {d})\n", .{
             self.stats.batch_count,
             self.batch.docs,
             self.stats.loaded,
@@ -827,18 +831,18 @@ fn parseLoadOptionsIterator(iterator: std.process.Args.Iterator) LoadParseResult
 
 fn fatalLoadParseIssue(issue: LoadParseIssue) noreturn {
     switch (issue) {
-        .missing_value => |flag| cli.fatal("{s} requires a value", .{flag}),
-        .duplicate => |flag| cli.fatal("{s} may only be provided once", .{flag}),
-        .unknown => |flag| cli.fatal("unknown load flag: {s}", .{flag}),
-        .invalid_integer => |value| cli.fatal("invalid {s} value: {s}", .{ value.flag, value.value }),
-        .non_positive => |value| cli.fatal("{s} must be greater than zero", .{value.flag}),
-        .invalid_sync_level => |value| cli.fatal("invalid --sync-level value: {s}", .{value}),
-        .missing_required => |flag| cli.fatal("{s} is required", .{flag}),
+        .missing_value => |flag| cli.argumentError("{s} requires a value", .{flag}),
+        .duplicate => |flag| cli.argumentError("{s} may only be provided once", .{flag}),
+        .unknown => |flag| cli.argumentError("unknown load flag: {s}", .{flag}),
+        .invalid_integer => |value| cli.argumentError("invalid {s} value: {s}", .{ value.flag, value.value }),
+        .non_positive => |value| cli.argumentError("{s} must be greater than zero", .{value.flag}),
+        .invalid_sync_level => |value| cli.argumentError("invalid --sync-level value: {s}", .{value}),
+        .missing_required => |flag| cli.argumentError("{s} is required", .{flag}),
         .conflict => |conflict| switch (conflict) {
-            .id_selector => cli.fatal("--id-field and --id-template are mutually exclusive", .{}),
-            .checkpoint_disabled => cli.fatal("--checkpoint cannot be used with --no-checkpoint", .{}),
-            .resume_without_checkpoint => cli.fatal("--resume cannot be used with --no-checkpoint", .{}),
-            .error_policy => cli.fatal("use only one of --strict or --max-errors", .{}),
+            .id_selector => cli.argumentError("--id-field and --id-template are mutually exclusive", .{}),
+            .checkpoint_disabled => cli.argumentError("--checkpoint cannot be used with --no-checkpoint", .{}),
+            .resume_without_checkpoint => cli.argumentError("--resume cannot be used with --no-checkpoint", .{}),
+            .error_policy => cli.argumentError("use only one of --strict or --max-errors", .{}),
         },
     }
 }
@@ -936,7 +940,7 @@ fn runLoad(
     if (!processor.stopForBatchLimit()) try scanner.finish(&processor);
     try processor.flushBatch();
 
-    std.debug.print(
+    cli.output.notice(
         "Bulk load command successful. loaded={d} committed={d} sent={d} rejected={d} invalid_json={d} bad_id={d} too_long={d} empty={d} duplicate_in_batch={d}\n",
         .{
             processor.stats.loaded,
@@ -950,6 +954,7 @@ fn runLoad(
             processor.stats.duplicate_in_batch,
         },
     );
+    if (cli.isAgent()) try cli.writeJson(allocator, io, .{ .load = processor.stats });
     return processor.stats;
 }
 
