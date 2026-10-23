@@ -321,7 +321,7 @@ pub const Owner = struct {
                 return std.json.Stringify.valueAlloc(a, .{ .work = meter.units, .estimate = upper }, .{});
             },
             .scan_ordered => {
-                if (!self.permitsTable(request.table) or request.order.len == 0 or request.order.len > 32) return error.Forbidden;
+                if (!self.permitsTable(request.table) or request.order.len > 32) return error.Forbidden;
                 const filters = try scratch.alloc(b.PropertyFilter, request.filters.len);
                 for (request.filters, filters) |input, *filter| filter.* = .{ .property = input.property, .value = try v.Value.fromJson(scratch, input.value), .op = input.op };
                 const page = if (self.backend.vtable.scan_ordered) |read| try read(self.backend.ptr, scratch, request.table, filters, request.order, request.after, request.limit, request.max_examined) else null;

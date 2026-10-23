@@ -281,7 +281,7 @@ pub fn Adapter(comptime DB: type, comptime GraphIndex: type, comptime EdgeScanCu
         fn scanOrdered(ptr: *anyopaque, a: A, table: []const u8, filters: []const b.PropertyFilter, order: []const b.PropertyOrder, encoded: ?[]const u8, limit: usize, max_examined: usize) !?b.Page(*const v.Node) {
             if (comptime !@hasDecl(DB, "openRelationalReadSession") or !@hasDecl(DB, "cypherDocumentScanOptions")) return null;
             const self = cast(ptr);
-            if (!self.authority.ordered_projection or order.len == 0 or order.len > 32) return null;
+            if (!self.authority.ordered_projection or (order.len == 0 and filters.len == 0) or order.len > 32) return null;
             try checkpoint(ptr);
             const chosen = for (filters, 0..) |filter, index| {
                 if (filter.op == .in) break index;
@@ -358,7 +358,7 @@ pub fn Adapter(comptime DB: type, comptime GraphIndex: type, comptime EdgeScanCu
         fn scanOrderedScalar(ptr: *anyopaque, a: A, table: []const u8, filters: []const b.PropertyFilter, order: []const b.PropertyOrder, encoded: ?[]const u8, limit: usize, max_examined: usize, partition: bool) !?b.Page(*const v.Node) {
             if (comptime !@hasDecl(DB, "openRelationalReadSession") or !@hasDecl(DB, "cypherDocumentScanOptions")) return null;
             const self = cast(ptr);
-            if (!self.authority.ordered_projection or order.len == 0 or order.len > 32) return null;
+            if (!self.authority.ordered_projection or (order.len == 0 and filters.len == 0) or order.len > 32) return null;
             // Sparse unions already have bounded equality seeks. A single
             // ordered scan must not replace them with their broad hull.
             for (filters) |filter| if (filter.op == .in) return null;
@@ -376,7 +376,7 @@ pub fn Adapter(comptime DB: type, comptime GraphIndex: type, comptime EdgeScanCu
             const cursor = if (encoded) |bytes| try std.json.parseFromSliceLeaky(OrderedCursor, temporary, bytes, .{}) else null;
             candidates: for (indexes.plan.boundIndexes()) |index| {
                 if (cursor) |position| if (!std.mem.eql(u8, position.index, index.name)) continue;
-                if (index.predicate != null or index.tuple.keys.len < order.len) continue;
+                if (index.predicate != null or index.tuple.keys.len == 0 or index.tuple.keys.len < order.len) continue;
                 const prefix = index.tuple.keys.len - order.len;
                 for (index.tuple.keys[0..prefix]) |key| {
                     switch (key.column_type) {

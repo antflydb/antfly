@@ -7752,6 +7752,9 @@ test "ordered node certificates bound scans preserve residuals and decline falli
     };
     for ([_]struct { text: []const u8, expected: i64, reads: usize, denied: bool = false }{
         .{ .text = "MATCH (n:Document) RETURN n.rank ORDER BY n.rank DESC LIMIT 1", .expected = 3, .reads = 1 },
+        .{ .text = "MATCH (n:Document) RETURN DISTINCT n.rank ORDER BY n.rank DESC LIMIT 1", .expected = 3, .reads = 1 },
+        .{ .text = "MATCH (n:Document) RETURN DISTINCT n.rank AS r ORDER BY r DESC SKIP 1 LIMIT 1", .expected = 2, .reads = 2 },
+        .{ .text = "MATCH (n:Document) RETURN n.rank ORDER BY 1,n.rank DESC,n.rank LIMIT 1", .expected = 3, .reads = 1 },
         .{ .text = "MATCH (n:Document) WITH n RETURN n.rank ORDER BY n.rank DESC LIMIT 1", .expected = 3, .reads = 1 },
         .{ .text = "MATCH (n:Document) WITH n AS m WITH m.rank AS s RETURN s AS r ORDER BY r DESC LIMIT 1", .expected = 3, .reads = 1 },
         .{ .text = "MATCH (n:Document) WITH * WHERE n.rank>1 RETURN n.rank ORDER BY n.rank DESC LIMIT 1", .expected = 3, .reads = 1 },
@@ -7792,6 +7795,10 @@ test "ordered node certificates bound scans preserve residuals and decline falli
     try std.testing.expectEqual(@as(i64, 1), result.rows[0][0].integer);
     try std.testing.expectEqual(@as(usize, 0), fixture.calls);
     fixture.calls = 0;
+    var representatives = try c.compile(std.testing.allocator, "MATCH (n:Document) RETURN DISTINCT n.rank=2 AS k ORDER BY n.rank DESC LIMIT 2", .{}, &diagnostic);
+    defer representatives.deinit();
+    try std.testing.expectError(error.UnboundCypherVariable, runtime.execute(std.testing.allocator, .{ .ptr = &fixture, .vtable = &callbacks }, graph, &representatives, &.{}, .{}));
+    try std.testing.expectEqual(@as(usize, 0), fixture.calls);
     var plain = try c.compile(std.testing.allocator, "MATCH (n:Document) RETURN n.rank AS r", .{}, &diagnostic);
     defer plain.deinit();
     const stream = (try runtime.NodeCursor.open(std.testing.allocator, .{ .ptr = &fixture, .vtable = &callbacks }, graph, plain.query, &.{}, .{ .scanned_anchors = 1 })).?;
@@ -7802,4 +7809,61 @@ test "ordered node certificates bound scans preserve residuals and decline falli
     const rows = try stream.next(arena.allocator(), 1);
     try std.testing.expectEqual(@as(i64, 3), rows[0][0].value.integer);
     try std.testing.expectEqual(@as(usize, 2), fixture.calls);
+}
+
+test "constant order streams DISTINCT through authenticated primary-order RPC owners" {
+    const root = @import("root.zig");
+    const test_graph: catalog.Graph = .{ .name = "single", .incarnation = 1, .revision = 1, .labels = &.{.{ .name = "Document", .table = "docs" }}, .relationships = &.{} };
+    const Owner = struct {
+        index: usize,
+        records: usize = 0,
+        fn bind(_: *anyopaque, _: std.mem.Allocator, _: catalog.Graph) !void {}
+        fn checkpoint(_: *anyopaque) !void {}
+        fn close(_: *anyopaque) void {}
+        fn scan(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: ?[]const u8, _: usize) !b.Page(*const v.Node) {
+            return error.CypherInvalidBackendPage;
+        }
+        fn get(_: *anyopaque, _: std.mem.Allocator, _: v.Identity) !?*const v.Node {
+            return null;
+        }
+        fn expand(_: *anyopaque, _: std.mem.Allocator, _: catalog.Relationship, _: v.Identity, _: @import("ast.zig").Direction, _: ?[]const u8, _: usize) !b.Page(*const v.Relationship) {
+            return .{ .items = &.{} };
+        }
+        fn ordered(ptr: *anyopaque, a: std.mem.Allocator, _: []const u8, filters: []const b.PropertyFilter, order: []const b.PropertyOrder, after: ?[]const u8, limit: usize, maximum: usize) !?b.Page(*const v.Node) {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (order.len != 0 or filters.len != 1 or filters[0].op != .in) return null;
+            if (limit == 0) return .{ .items = &.{}, .cursors = &.{}, .examined = 0, .next = "0" };
+            const count: usize = if (self.index == 0) 2 else 1;
+            const start = if (after) |bytes| try std.fmt.parseInt(usize, bytes, 10) else 0;
+            const end = @min(count, start + @min(limit, maximum));
+            const nodes = try a.alloc(*const v.Node, end - start);
+            const cursors = try a.alloc(?[]const u8, nodes.len);
+            for (nodes, cursors, start..) |*node, *cursor, ordinal| {
+                node.* = &Fixture.nodes[(if (self.index == 0) @as(usize, 0) else 2) + ordinal];
+                cursor.* = if (ordinal + 1 < count) try std.fmt.allocPrint(a, "{d}", .{ordinal + 1}) else null;
+            }
+            self.records += nodes.len;
+            return .{ .items = nodes, .cursors = cursors, .examined = nodes.len, .next = if (end < count) try std.fmt.allocPrint(a, "{d}", .{end}) else null };
+        }
+        fn backend(self: *@This()) b.Backend {
+            return .{ .ptr = self, .vtable = &.{ .bind = bind, .checkpoint = checkpoint, .scan = scan, .get = get, .expand = expand, .scan_ordered = ordered } };
+        }
+        fn invoke(ptr: *anyopaque, a: std.mem.Allocator, body: []const u8) ![]u8 {
+            const endpoint: *root.rpc.Owner = @ptrCast(@alignCast(ptr));
+            return endpoint.execute(a, body);
+        }
+    };
+    var owners = [_]Owner{ .{ .index = 0 }, .{ .index = 1 } };
+    var endpoints = [_]root.rpc.Owner{ .{ .backend = owners[0].backend(), .graph = test_graph, .table = "docs" }, .{ .backend = owners[1].backend(), .graph = test_graph, .table = "docs" } };
+    var clients = [_]root.rpc.Client{ .{ .channel = .{ .ptr = &endpoints[0], .call = Owner.invoke }, .incarnation = test_graph.incarnation, .revision = test_graph.revision }, .{ .channel = .{ .ptr = &endpoints[1], .call = Owner.invoke }, .incarnation = test_graph.incarnation, .revision = test_graph.revision } };
+    const targets = [_]root.distributed.Target{ .{ .table = "docs", .table_id = 1, .group_id = 1 }, .{ .table = "docs", .table_id = 1, .group_id = 2 } };
+    const snapshots = [_]root.distributed.Snapshot{ .{ .backend = clients[0].backend(), .ptr = &owners[0], .validate = Owner.checkpoint, .close = Owner.close }, .{ .backend = clients[1].backend(), .ptr = &owners[1], .validate = Owner.checkpoint, .close = Owner.close } };
+    var set: root.distributed.ReadSet = .{ .a = std.testing.allocator, .targets = &targets, .snapshots = &snapshots, .independent_validations = &.{}, .source = .{ .ptr = &owners, .checkpoint = Owner.checkpoint, .admit = undefined, .capture = undefined } };
+    var diagnostic: c.Diagnostic = .{};
+    var compiled = try c.compile(std.testing.allocator, "MATCH (n:Document) WHERE n.rank IN [1,2,3] RETURN DISTINCT n ORDER BY 1 SKIP 1 LIMIT 1", .{}, &diagnostic);
+    defer compiled.deinit();
+    var result = try runtime.execute(std.testing.allocator, set.backend(), test_graph, &compiled, &.{}, .{ .scanned_anchors = 4 });
+    defer result.deinit();
+    try std.testing.expectEqualStrings("b", result.rows[0][0].node.identity.key);
+    try std.testing.expectEqual(owners[0].records + owners[1].records, result.stats.scanned_anchors);
 }

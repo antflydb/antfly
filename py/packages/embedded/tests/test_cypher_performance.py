@@ -7681,7 +7681,7 @@ def test_order_lineage_survives_total_cypher_with_stages(graph_db):
     rejected_prefix = graph_db.cypher_json(
         "g",
         {
-            "query": "MATCH (n:D) WITH n WHERE n.score<12950 RETURN n.score ORDER BY n.score DESC LIMIT 5",
+            "query": "MATCH (n:D) WITH n WHERE n.score<12950 OR n.score<12949 RETURN n.score ORDER BY n.score DESC LIMIT 5",
             "limits": {"scanned_anchors": 55},
         },
     )
@@ -7790,3 +7790,135 @@ def test_wide_ordered_in_domains_keep_bounded_planning_cost(graph_db):
     assert [int(row[0]["value"]) for row in result["rows"]] == list(range(12999, 11999, -1))
     assert result["stats"]["scanned_anchors"] == 13000
     assert result["stats"]["intermediate_states"] < 1_000_000
+
+
+def test_transparent_with_predicates_reach_native_seeks(graph_db):
+    populate(graph_db, 13000)
+    graph_db.sql("CREATE INDEX docs_id ON docs(id)")
+    graph_db.sql("CREATE INDEX ranked ON docs(score DESC)")
+    for query in (
+        "MATCH (n:D) WITH n WHERE n.id=$key RETURN n.score ORDER BY n.score DESC LIMIT 1",
+        "MATCH (n:D) WITH n.id AS k,n.score AS s WHERE k=$key RETURN s ORDER BY s DESC LIMIT 1",
+        "MATCH (n:D) WITH n,$key AS k WITH n,k WHERE n.id=k RETURN n.score ORDER BY n.score DESC LIMIT 1",
+        "MATCH (n:D) WITH n.score AS id,n WHERE id=0 RETURN n.score ORDER BY n.score DESC LIMIT 1",
+        "MATCH (n:D) WITH n WHERE n.id=$key RETURN n.score LIMIT 1",
+        "MATCH (n:D) WITH n WHERE n.id=$key RETURN n.score",
+    ):
+        result = graph_db.cypher_json(
+            "g",
+            {
+                "query": query,
+                "parameters": {"key": "n0"},
+                "limits": {"scanned_anchors": 1, "intermediate_states": 3000, "memory_bytes": 1 << 20},
+            },
+        )
+        assert result["rows"] == [[{"type": "integer", "value": "0"}]]
+        assert result["stats"]["scanned_anchors"] == 1
+    ranged = graph_db.cypher_json(
+        "g",
+        {
+            "query": "MATCH (n:D) WITH n.score AS s WHERE s<10 RETURN s ORDER BY s DESC LIMIT 5",
+            "limits": {"scanned_anchors": 5},
+        },
+    )
+    assert [int(row[0]["value"]) for row in ranged["rows"]] == [9, 8, 7, 6, 5]
+    counted = graph_db.cypher_json(
+        "g",
+        {
+            "query": "MATCH (n:D) WITH n WHERE n.id=$key RETURN count(*)",
+            "parameters": {"key": "n0"},
+            "limits": {"scanned_anchors": 1},
+        },
+    )
+    assert counted["rows"] == [[{"type": "integer", "value": "1"}]]
+    for predicate in ("k IN ['n0','n1','n0',null]", "k='n0' OR k='n1'"):
+        result = graph_db.cypher_json(
+            "g",
+            {
+                "query": f"MATCH (n:D) WITH n.id AS k,n.score AS s WHERE {predicate} RETURN s ORDER BY s DESC LIMIT 2",
+                "limits": {"scanned_anchors": 4},
+            },
+        )
+        assert [int(row[0]["value"]) for row in result["rows"]] == [1, 0]
+    with pytest.raises(af.AntflyError, match="CypherDivisionByZero"):
+        graph_db.cypher_json(
+            "g",
+            {
+                "query": "MATCH (n:D) WITH n,1/n.score AS inv WHERE n.id='n12999' RETURN n.score ORDER BY n.score DESC LIMIT 1"
+            },
+        )
+
+
+def test_ordered_distinct_streams_entities_and_adjacent_scalar_keys(graph_db):
+    populate(graph_db, 13000)
+    graph_db.sql("CREATE INDEX ranked ON docs(score DESC)")
+    graph_db.sql("CREATE INDEX ranked_asc ON docs(score)")
+    plain = graph_db.cypher_json("g", {"query": "MATCH (n:D) RETURN n ORDER BY n.score DESC LIMIT 5"})
+    distinct = graph_db.cypher_json(
+        "g",
+        {
+            "query": "MATCH (n:D) RETURN DISTINCT n ORDER BY n.score DESC LIMIT 5",
+            "limits": {"scanned_anchors": 5, "intermediate_states": 3000, "memory_bytes": 1 << 20},
+        },
+    )
+    assert distinct["rows"] == plain["rows"]
+    assert distinct["stats"]["scanned_anchors"] == 5
+    # The first distinct run spans a native page; SKIP counts values, not rows.
+    graph_db.sql("UPDATE docs SET score=20000 WHERE score<128")
+    graph_db.sql("UPDATE docs SET score=NULL WHERE score>=12998 AND score<20000")
+    for direction, skip in ((direction, skip) for direction in ("ASC", "DESC") for skip in (0, 1, 2)):
+        result = graph_db.cypher_json(
+            "g",
+            {
+                "query": f"MATCH (n:D) WITH n.score AS s RETURN DISTINCT s ORDER BY s {direction} SKIP {skip} LIMIT 5",
+                "limits": {"scanned_anchors": 150, "intermediate_states": 30000, "memory_bytes": 1 << 20},
+            },
+        )
+        expected = [{"type": "null", "value": None}] + [
+            {"type": "integer", "value": str(i)} for i in (20000, 12997, 12996, 12995, 12994, 12993)
+        ]
+        if direction == "ASC":
+            expected = [{"type": "integer", "value": str(i)} for i in range(128, 135)]
+        assert result["rows"] == [[cell] for cell in expected[skip : skip + 5]]
+        assert result["stats"]["scanned_anchors"] <= 150
+    # A varying DISTINCT key is not ordered; keep the grouped fallback.
+    graph_db.sql("UPDATE docs SET id='same' WHERE score=12997 OR score=12996")
+    actual = graph_db.cypher_json(
+        "g", {"query": "MATCH (n:D) RETURN DISTINCT n.id,n.score AS s ORDER BY s DESC LIMIT 5"}
+    )
+    control = graph_db.cypher_json(
+        "g", {"query": "MATCH (n:D) RETURN DISTINCT n.id,n.score AS s ORDER BY s+0 DESC LIMIT 5"}
+    )
+    assert actual["rows"] == control["rows"]
+
+
+def test_constant_sort_keys_preserve_bounded_reads_and_primary_ties(graph_db):
+    populate(graph_db, 13000)
+    graph_db.sql("CREATE INDEX ranked ON docs(score DESC)")
+    for order in ("1,n.score DESC", "$constant,n.score DESC,n.score", "n.id,n.score DESC"):
+        predicate = "WHERE n.id='n12999'" if order.startswith("n.id") else ""
+        result = graph_db.cypher_json(
+            "g",
+            {
+                "query": f"MATCH (n:D) {predicate} RETURN n.score ORDER BY {order} LIMIT 1",
+                "parameters": {"constant": "fixed"},
+                "limits": {"scanned_anchors": 1, "intermediate_states": 3000},
+            },
+        )
+        assert result["rows"] == [[{"type": "integer", "value": "12999"}]]
+    for direction in ("ASC", "DESC"):
+        fixed = graph_db.cypher_json(
+            "g",
+            {
+                "query": f"MATCH (n:D) WHERE n.score=12999 RETURN n.score ORDER BY n.score {direction} LIMIT 1",
+                "limits": {"scanned_anchors": 1},
+            },
+        )
+        assert fixed["rows"] == [[{"type": "integer", "value": "12999"}]]
+    primary = graph_db.cypher_json("g", {"query": "MATCH (n:D) RETURN n.id LIMIT 5"})
+    tied = graph_db.cypher_json(
+        "g", {"query": "MATCH (n:D) RETURN n.id ORDER BY 1 LIMIT 5", "limits": {"scanned_anchors": 5}}
+    )
+    assert tied["rows"] == primary["rows"]
+    with pytest.raises(af.AntflyError, match="CypherDivisionByZero"):
+        graph_db.cypher_json("g", {"query": "MATCH (n:D) RETURN n.score ORDER BY 1/0,n.score DESC LIMIT 1"})

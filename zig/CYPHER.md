@@ -2760,3 +2760,44 @@ read five anchors with 139–164 states; SQL derived wrappers inherit the same
 five-row physical source certificate as direct GRAPH_TABLE queries. Tie-order
 checks compare complete node rows against ordinary execution across merge-page
 boundaries, and coercion failures retain authoritative predicates.
+
+### Predicate lineage, constant keys, and ordered DISTINCT
+
+The single-node source plan carries physical predicate hints independently of
+its final order certificate. Total transparent WITH stages forward entity and
+property aliases, invocation constants, equality/range predicates, and bounded
+IN or same-property OR domains. Every original predicate remains in its lexical
+stage. Unbounded reads and aggregate consumers can use these restrictions too;
+fallible final projections still execute over all surviving rows. An unsafe
+crossed stage, shadowed receiver, or cardinality barrier declines the proof.
+
+Order negotiation removes invocation constants, equality-fixed scalar keys,
+and repeated property keys before matching an index. If no effective sort key
+remains, the required order is the ordinary primary encounter order. The native
+adapter can attest that order with an empty physical order request when every
+key of a ready relational index has an enforced typed equality. This preserves
+selective seeks even when the constant key's declared direction differs from
+the index direction. Otherwise execution retains the ordinary primary scan.
+The existing authenticated RPC and owner merge carry the same capability;
+continuations never switch between primary and index cursor formats.
+
+Ordered DISTINCT has two streaming proofs. Projecting the source entity retains
+its unique identity in a one-row-per-node pipeline, so no membership set is
+needed. Scalar projections can deduplicate adjacent rows when every varying
+projected key is ordered and every varying order key is projected. Only the
+previous distinct row is retained, in a recyclable arena; SKIP and LIMIT count
+distinct rows. Both proofs require the physical provider's attestation before
+selecting the streaming executor. An unavailable certificate, fallible expression,
+or unprojected varying sort key retains ordinary grouping and its original
+representatives. NULLs and ties use the shared Cypher equality/order rules.
+
+On the 13,000-document public comparison, a selective WITH predicate uses one
+anchor and 58–60 states instead of 13,000 anchors and 312,030–390,022 states.
+Top-five DISTINCT entity/scalar reads use five anchors and 166–186 states;
+previously they read every node. Literal and equality-fixed sort-key cases use
+five anchors and 189–333 states, including the query that previously exhausted
+the default state budget. A top-five scalar DISTINCT with 128 repeated leading
+values reads 132 anchors and uses 4,262 states, retaining only one adjacent key.
+The regression suite also exercises NULL runs, both index directions, aliases,
+unbounded and aggregate consumers, residual predicates, and authenticated
+multi-owner primary-order reads.

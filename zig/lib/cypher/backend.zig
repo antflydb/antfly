@@ -140,6 +140,8 @@ pub const Backend = struct {
         scan_where: ?*const fn (*anyopaque, std.mem.Allocator, []const u8, []const PropertyFilter, ?[]const u8, usize) anyerror!Page(*const v.Node) = null,
         /// A non-null page certifies this exact Cypher order, with primary
         /// scan encounter order for ties. Null declines before emitting rows.
+        /// Empty order requests primary encounter order under the filters;
+        /// indexes can attest when every physical key is equality-fixed.
         /// Examined includes hidden/rejected/speculative records across owners.
         /// limit=0 probes the pinned ready index without reading documents:
         /// certify with empty items, examined=0 and a resumable proof cursor.

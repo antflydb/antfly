@@ -579,12 +579,13 @@ pub const NodeCursor = struct {
         }
         projection.order = orders;
         const operation = self.query.clauses[0].operation.match;
-        var planned = (try e.planNodeOrder(&.{&.{}}, operation, projection, &.{})) orelse return false;
-        const filters = try e.nodeFilters(operation.paths[0].nodes[0], operation.predicate, &.{});
-        const proof = (try read(backend.ptr, e.a, planned.table, filters, planned.fields, null, 0, 0)) orelse return false;
-        if (proof.items.len != 0 or (proof.examined orelse 0) != 0 or proof.next == null) return error.CypherInvalidBackendPage;
+        var planned = (try e.planNodeOrder(&.{&.{}}, operation, projection, &.{}, true)) orelse return false;
+        if (!planned.primary) {
+            const proof = (try read(backend.ptr, e.a, planned.table, planned.filters, planned.fields, null, 0, 0)) orelse return false;
+            if (proof.items.len != 0 or (proof.examined orelse 0) != 0 or proof.next == null) return error.CypherInvalidBackendPage;
+            planned.initial_cursor = proof.next;
+        }
         planned.active = true;
-        planned.initial_cursor = proof.next;
         const retained = try e.a.create(NodeOrder);
         retained.* = planned;
         e.node_order = retained;
@@ -1162,7 +1163,19 @@ pub fn queryHasWrites(query: ast.Query) bool {
 }
 const aggregateName = @import("expressions.zig").aggregateName;
 const aggregates = @import("expressions.zig").aggregates;
-const NodeOrder = struct { table: []const u8, alias: []const u8, fields: []const backend_mod.PropertyOrder, active: bool = false, declined: bool = false, initial_cursor: ?[]const u8 = null };
+const NodeOrder = struct {
+    table: []const u8,
+    alias: []const u8,
+    fields: []const backend_mod.PropertyOrder,
+    filters: []const backend_mod.PropertyFilter = &.{},
+    distinct: enum { none, unique, adjacent } = .none,
+    primary: bool = false,
+    primary_fallback: bool = false,
+    primary_index: bool = false,
+    active: bool = false,
+    declined: bool = false,
+    initial_cursor: ?[]const u8 = null,
+};
 const Engine = struct {
     const Invariants = struct {
         const MappingKey = struct { expression: *const ast.Expr, source: Identity };
@@ -7513,10 +7526,25 @@ const Engine = struct {
             self.cache_reads = previous_cache;
             if (!previous_cache) self.read_nodes = previous_reads;
         }
-        var node_order = if (projection.limit != null and input.len == 1 and continuation == null and consumer == null and (input_weights == null or input_weights.?[0].isOne())) try self.planNodeOrder(input, operation, projection, middle) else null;
+        var node_order = if ((projection.limit != null or middle.len != 0) and input.len == 1 and continuation == null and consumer == null and (input_weights == null or input_weights.?[0].isOne())) try self.planNodeOrder(input, operation, projection, middle, false) else null;
         const previous_node_order = self.node_order;
         self.node_order = if (node_order) |*order| order else null;
         defer self.node_order = previous_node_order;
+        // DISTINCT may stream only after the complete physical order has
+        // attested. A declined provider retains the ordinary grouped executor.
+        if (projection.distinct and !reducers) if (self.node_order) |order| if (!order.declined and order.distinct != .none) {
+            if (order.primary) {
+                order.active = true;
+            } else {
+                const read = self.backend.vtable.scan_ordered.?;
+                if (try read(self.backend.ptr, self.a, order.table, order.filters, order.fields, null, 0, 0)) |proof| {
+                    if (proof.items.len != 0 or (proof.examined orelse 0) != 0 or proof.next == null) return error.CypherInvalidBackendPage;
+                    order.active = true;
+                    order.initial_cursor = proof.next;
+                } else order.declined = true;
+            }
+            if (order.active) grouped = false;
+        };
         var calls: reduction_plan.Calls = .{};
         if (grouped) {
             if (projection.wildcard) return null;
@@ -9796,33 +9824,96 @@ const Engine = struct {
     /// Only entity identity and direct property reads carry physical lineage.
     /// Total computed expressions may flow alongside them without gaining an
     /// order proof, and projection shadowing replaces the previous binding.
-    const NodeOrigin = struct { node: bool = false, property: ?[]const u8 = null };
-    fn nodeOrigin(expression: *const ast.Expr, lineage: std.StringHashMapUnmanaged(NodeOrigin)) ?NodeOrigin {
+    const NodeOrigin = struct { node: bool = false, property: ?[]const u8 = null, constant: ?v.Value = null };
+    fn nodeOrigin(self: *Engine, expression: *const ast.Expr, lineage: std.StringHashMapUnmanaged(NodeOrigin)) ?NodeOrigin {
         return switch (expression.value) {
             .variable => |name| lineage.get(name),
             .property => |property| if (property.base.value == .variable and (lineage.get(property.base.value.variable) orelse return null).node) .{ .property = property.name } else null,
-            else => null,
+            else => if (self.constant(expression, &.{})) |value| .{ .constant = value } else null,
         };
     }
-    fn planNodeOrder(self: *Engine, input: []const Row, operation: ast.Match, projection: ast.Projection, middle: []const ast.Clause) !?NodeOrder {
+    /// Source hints use physical lineage, while the original predicates remain
+    /// in their lexical stages. Unknown conjuncts never imply an OR restriction.
+    fn lineageFilters(self: *Engine, expression: *const ast.Expr, lineage: std.StringHashMapUnmanaged(NodeOrigin), filters: *std.ArrayList(backend_mod.PropertyFilter)) anyerror!void {
+        try self.state();
+        if (expression.value == .binary and expression.value.binary.op == .@"and") {
+            try self.lineageFilters(expression.value.binary.left, lineage, filters);
+            return self.lineageFilters(expression.value.binary.right, lineage, filters);
+        }
+        if (expression.value == .binary and expression.value.binary.op == .@"or") {
+            var arms: std.ArrayList(backend_mod.PropertyFilter) = .empty;
+            try self.lineageFilters(expression.value.binary.left, lineage, &arms);
+            if (arms.items.len != 1) return;
+            try self.lineageFilters(expression.value.binary.right, lineage, &arms);
+            if (arms.items.len != 2) return;
+            const left = arms.items[0];
+            const right = arms.items[1];
+            if (!std.mem.eql(u8, left.property, right.property)) return;
+            const ls = if (left.op == .eq) &.{left.value} else if (left.op == .in and left.value == .list) left.value.list else return;
+            const rs = if (right.op == .eq) &.{right.value} else if (right.op == .in and right.value == .list) right.value.list else return;
+            if (ls.len +| rs.len > 256) return;
+            const values = try self.a.alloc(v.Value, ls.len + rs.len);
+            @memcpy(values[0..ls.len], ls);
+            @memcpy(values[ls.len..], rs);
+            return filters.append(self.a, .{ .property = left.property, .op = .in, .value = .{ .list = values } });
+        }
+        if (expression.value == .comparison) {
+            const chain = expression.value.comparison;
+            for (chain.operators, 0..) |op, index| {
+                const pair: ast.Expr = .{ .span = expression.span, .value = .{ .binary = .{ .left = chain.operands[index], .right = chain.operands[index + 1], .op = op } } };
+                try self.lineageFilters(&pair, lineage, filters);
+            }
+            return;
+        }
+        if (expression.value != .binary) return;
+        const pair = expression.value.binary;
+        const op: backend_mod.FilterOp = switch (pair.op) {
+            .eq => .eq,
+            .lt => .lt,
+            .lte => .lte,
+            .gt => .gt,
+            .gte => .gte,
+            .in => .in,
+            else => return,
+        };
+        const operands = [_]*const ast.Expr{ pair.left, pair.right };
+        for (0..2) |index| {
+            if (index == 1 and op == .in) continue;
+            const property = (self.nodeOrigin(operands[index], lineage) orelse continue).property orelse continue;
+            const operand = operands[1 - index];
+            const value = if (operand.value == .list) list: {
+                const values = try self.a.alloc(v.Value, operand.value.list.len);
+                for (operand.value.list, values) |item, *value| value.* = (self.nodeOrigin(item, lineage) orelse return).constant orelse return;
+                break :list v.Value{ .list = values };
+            } else (self.nodeOrigin(operand, lineage) orelse continue).constant orelse continue;
+            try filters.append(self.a, .{ .property = property, .value = value, .op = if (index == 0) op else switch (op) {
+                .lt => .gt,
+                .lte => .gte,
+                .gt => .lt,
+                .gte => .lte,
+                else => op,
+            } });
+        }
+    }
+    fn planNodeOrder(self: *Engine, input: []const Row, operation: ast.Match, projection: ast.Projection, middle: []const ast.Clause, external_order: bool) !?NodeOrder {
         // An ordinary empty scan may finish without spending an anchor. A
         // certificate cannot assume a zero-budget source is nonempty.
         if (self.stats.scanned_anchors >= self.limits.scanned_anchors) return null;
-        if (!self.read_only or self.backend.vtable.scan_ordered == null or input.len != 1 or operation.optional or operation.paths.len != 1 or projection.distinct or projection.wildcard or projection.predicate != null or projection.order.len == 0 or projection.order.len > 32) return null;
+        if (!self.read_only or input.len != 1 or operation.optional or operation.paths.len != 1 or (projection.order.len == 0 and middle.len == 0)) return null;
         const path = operation.paths[0];
         if (path.edges.len != 0 or path.alias != null or path.selector != .all) return null;
         const node = path.nodes[0];
         const alias = node.alias orelse return null;
         if (lookup(input[0], alias) != null) return null;
-        // ORDER BY evaluates in the projected scope. A result alias may
-        // replace the source node with a scalar or map, invalidating a native
-        // certificate for properties of that node.
-        for (projection.items) |item| if (item.alias) |name| if (std.mem.eql(u8, name, alias)) return null;
         var shape = try self.pathShape(path, input[0]);
         if (operation.predicate) |predicate| if (!self.totalPredicate(predicate, shape)) return null;
         for (node.properties) |entry| if (self.constant(entry.value, input[0]) == null) return null;
         var lineage: std.StringHashMapUnmanaged(NodeOrigin) = .empty;
+        for (input[0]) |entry| try lineage.put(self.a, entry.name, .{ .constant = entry.value });
         try lineage.put(self.a, alias, .{ .node = true });
+        var filters: std.ArrayList(backend_mod.PropertyFilter) = .empty;
+        try filters.appendSlice(self.a, try self.nodeFilters(node, operation.predicate, input[0]));
+        const original_filters = filters.items.len;
         for (middle) |clause| {
             try self.state();
             if (clause.operation != .project) return null;
@@ -9838,21 +9929,21 @@ const Engine = struct {
                 try self.state();
                 if (!self.totalExpression(item.expression, shape)) return null;
                 const name = item.alias orelse try self.expressionName(item.expression);
-                const origin = nodeOrigin(item.expression, lineage);
-                if (origin) |known| try next.put(self.a, name, known) else _ = next.remove(name);
+                const origin = self.nodeOrigin(item.expression, lineage);
+                try next.put(self.a, name, origin orelse .{});
                 next_shape = try self.replace(next_shape, name, .{ .boolean = if (origin) |known| known.node else false });
             }
             var scope = shape;
             for (next_shape) |entry| scope = try self.replace(scope, entry.name, entry.value);
-            if (step.predicate) |predicate| if (!self.totalPredicate(predicate, scope)) return null;
+            if (step.predicate) |predicate| {
+                if (!self.totalPredicate(predicate, scope)) return null;
+                var bindings = try lineage.clone(self.a);
+                var bindings_iterator = next.iterator();
+                while (bindings_iterator.next()) |entry| try bindings.put(self.a, entry.key_ptr.*, entry.value_ptr.*);
+                try self.lineageFilters(predicate, bindings, &filters);
+            }
             shape = next_shape;
             lineage = next;
-        }
-        var projected = try lineage.clone(self.a);
-        for (projection.items) |item| {
-            if (!self.totalExpression(item.expression, shape)) return null;
-            const name = item.alias orelse try self.expressionName(item.expression);
-            if (nodeOrigin(item.expression, lineage)) |origin| try projected.put(self.a, name, origin) else _ = projected.remove(name);
         }
         var table: ?[]const u8 = null;
         for (self.graph.labels, 0..) |label, index| if (self.firstTableLabel(index, node)) {
@@ -9860,12 +9951,77 @@ const Engine = struct {
                 if (!std.mem.eql(u8, known, label.table)) return null;
             } else table = label.table;
         };
-        const fields = try self.a.alloc(backend_mod.PropertyOrder, projection.order.len);
-        for (projection.order, fields) |order, *field| {
-            const origin = nodeOrigin(order.expression, projected) orelse return null;
-            field.* = .{ .property = origin.property orelse return null, .descending = order.descending };
+        // Earlier total filters can restrict the source independently of its
+        // consumer. Aggregates, unbounded reads and fallible final projections
+        // still evaluate normally over the surviving rows. DISTINCT keeps its
+        // original representative encounter order unless proved below.
+        const hinted: ?NodeOrder = if (filters.items.len > original_filters and !projection.distinct)
+            .{ .table = table orelse return null, .alias = alias, .fields = &.{}, .filters = filters.items, .declined = true }
+        else
+            null;
+        if ((!external_order and projection.limit == null) or projection.wildcard or projection.predicate != null or projection.order.len == 0 or projection.order.len > 32) return hinted;
+        // ORDER BY evaluates in the projected scope; a shadow may replace the
+        // source receiver. Preserve the conservative certificate boundary.
+        for (projection.items) |item| if (item.alias) |name| if (std.mem.eql(u8, name, alias)) return hinted;
+        var projected = try lineage.clone(self.a);
+        for (projection.items) |item| {
+            if (!self.totalExpression(item.expression, shape)) return hinted;
+            const name = item.alias orelse try self.expressionName(item.expression);
+            try projected.put(self.a, name, self.nodeOrigin(item.expression, lineage) orelse .{});
         }
-        return .{ .table = table orelse return null, .alias = alias, .fields = fields };
+        var fixed: std.StringHashMapUnmanaged(void) = .empty;
+        for (filters.items) |filter| {
+            try self.state();
+            if (filter.op == .eq) switch (filter.value) {
+                .integer, .string, .boolean => try fixed.put(self.a, filter.property, {}),
+                else => {},
+            };
+        }
+        var fields: std.ArrayList(backend_mod.PropertyOrder) = .empty;
+        for (projection.order) |order| {
+            const origin = self.nodeOrigin(order.expression, projected) orelse return hinted;
+            if (origin.constant != null) continue;
+            const name = origin.property orelse return hinted;
+            if (fixed.contains(name)) continue;
+            const repeated = for (fields.items) |field| {
+                if (std.mem.eql(u8, field.property, name)) break true;
+            } else false;
+            if (!repeated) try fields.append(self.a, .{ .property = name, .descending = order.descending });
+        }
+        var result: NodeOrder = .{ .table = table orelse return null, .alias = alias, .fields = fields.items, .filters = filters.items, .primary = projection.order.len != 0 and fields.items.len == 0, .declined = projection.order.len == 0 or (fields.items.len != 0 and self.backend.vtable.scan_ordered == null) };
+        if (projection.distinct and projection.order.len != 0) distinct: {
+            var properties: std.StringHashMapUnmanaged(void) = .empty;
+            var unique = false;
+            var adjacent = true;
+            for (projection.items) |item| {
+                const origin = self.nodeOrigin(item.expression, lineage) orelse {
+                    adjacent = false;
+                    continue;
+                };
+                unique = unique or origin.node;
+                if (origin.node or origin.constant != null) continue;
+                const name = origin.property orelse {
+                    adjacent = false;
+                    continue;
+                };
+                try properties.put(self.a, name, {});
+                if (fixed.contains(name)) continue;
+                const ordered = for (fields.items) |field| {
+                    if (std.mem.eql(u8, field.property, name)) break true;
+                } else false;
+                adjacent = adjacent and ordered;
+            }
+            if (unique) {
+                result.distinct = .unique;
+                break :distinct;
+            }
+            for (fields.items) |field| adjacent = adjacent and properties.contains(field.property);
+            if (adjacent) result.distinct = .adjacent;
+        }
+        // Without a DISTINCT proof, source order must remain unchanged: a
+        // nonprojected sort key belongs to the first encountered representative.
+        if (projection.distinct and result.distinct == .none) return null;
+        return result;
     }
     fn nodeFilters(self: *Engine, first: ast.Node, predicate: ?*const ast.Expr, row: Row) ![]const backend_mod.PropertyFilter {
         var filters: std.ArrayList(backend_mod.PropertyFilter) = .empty;
@@ -9878,9 +10034,23 @@ const Engine = struct {
         const bounded_demand = @min(demand, @max(@as(usize, 1), self.limits.scanned_anchors -| self.stats.scanned_anchors));
         if (self.lookup) |lookup_plan| if (lookup_plan.complete and std.mem.eql(u8, lookup_plan.table, table)) return lookup_plan.cachedPage(self, cursor, bounded_demand);
         if (self.node_order) |order| if (!order.declined and std.mem.eql(u8, order.table, table) and first.alias != null and std.mem.eql(u8, order.alias, first.alias.?)) {
-            const read = self.backend.vtable.scan_ordered orelse return error.CypherInvalidBackendPage;
-            const filters = try self.nodeFilters(first, predicate, row);
             const wanted = if (self.stream_fold) |fold| if (fold.top.*) |top| @min(bounded_demand, top.capacity -| top.total) else bounded_demand else bounded_demand;
+            if (order.primary) {
+                order.active = true;
+                if (!order.primary_fallback and order.filters.len != 0) {
+                    if (self.backend.vtable.scan_ordered) |read| {
+                        if (try read(self.backend.ptr, self.a, table, order.filters, &.{}, cursor, @max(1, wanted), self.limits.scanned_anchors -| self.stats.scanned_anchors)) |page| {
+                            order.primary_index = true;
+                            return page;
+                        }
+                        if (order.primary_index) return error.CypherInvalidBackendPage;
+                    }
+                    order.primary_fallback = true;
+                }
+                return self.backend.vtable.scan(self.backend.ptr, self.a, table, cursor, @max(1, wanted));
+            }
+            const read = self.backend.vtable.scan_ordered orelse return error.CypherInvalidBackendPage;
+            const filters = order.filters;
             if (try read(self.backend.ptr, self.a, table, filters, order.fields, cursor orelse order.initial_cursor, @max(1, wanted), self.limits.scanned_anchors -| self.stats.scanned_anchors)) |page| {
                 order.active = true;
                 order.initial_cursor = null;
@@ -9890,6 +10060,8 @@ const Engine = struct {
             order.declined = true;
         };
         if (self.backend.vtable.scan_where) |scan_where| {
+            if (self.node_order) |order| if (std.mem.eql(u8, order.table, table) and first.alias != null and std.mem.eql(u8, order.alias, first.alias.?) and order.filters.len != 0)
+                return scan_where(self.backend.ptr, self.a, table, order.filters, cursor, bounded_demand);
             var filters: std.ArrayList(backend_mod.PropertyFilter) = .empty;
             try self.labelFilters(first, &filters);
             for (first.properties) |property| if (self.constant(property.value, row)) |value| try filters.append(self.a, .{ .property = property.name, .value = value });
@@ -15277,17 +15449,23 @@ const Engine = struct {
         total: usize = 0,
         picks: std.ArrayList(Pick) = .empty,
         columns: std.ArrayList([]const u8) = .empty,
+        distinct_arena: ?std.heap.ArenaAllocator = null,
+        distinct_previous: ?Row = null,
         fn init(engine: *Engine, projection: ast.Projection, first: Row) !TopK {
             const skip = if (projection.skip) |expression| try engine.count(expression) else 0;
             // Without a limit this is a result collector. Its storage grows
             // with emitted rows; it never builds the bounded selection heap.
             const limit = if (projection.limit) |expression| try engine.count(expression) else std.math.maxInt(usize) - skip;
             var result: TopK = .{ .engine = engine, .projection = projection, .retained = engine.a, .skip = skip, .capacity = if (limit == 0) 0 else std.math.add(usize, skip, limit) catch return error.CypherLimitExceeded };
+            if (projection.distinct) if (engine.node_order) |order| if (order.active and order.distinct == .adjacent) {
+                result.distinct_arena = std.heap.ArenaAllocator.init(engine.scratch_allocator);
+            };
             if (projection.wildcard) for (first) |entry| try result.columns.append(engine.a, entry.name);
             for (projection.items) |item| try result.columns.append(engine.a, item.alias orelse try engine.expressionName(item.expression));
             return result;
         }
         fn deinit(self: *TopK) void {
+            if (self.distinct_arena) |*arena| arena.deinit();
             for (self.picks.items) |*pick| pick.arena.deinit();
         }
         fn add(self: *TopK, source: Row) !void {
@@ -15309,6 +15487,11 @@ const Engine = struct {
             if (self.projection.predicate) |predicate| if ((try (try engine.eval(predicate, context, null)).truth()) != true) return;
             const keys = try engine.a.alloc(v.Value, self.projection.order.len);
             for (self.projection.order, keys) |order, *key| key.* = try engine.eval(order.expression, context, null);
+            if (self.distinct_arena) |*arena| {
+                if (self.distinct_previous) |previous| if (try engine.rowEqual(previous, row.items)) return;
+                _ = arena.reset(.free_all);
+                self.distinct_previous = try cloneRow(arena.allocator(), row.items);
+            }
             const candidate: Projected = .{ .row = row.items, .source = &.{}, .group = null, .keys = keys, .sequence = self.sequence, .weight = @intCast(weight.cap(self.capacity)), .multiplicity = if (self.projection.limit == null) weight else null };
             return self.acceptProjected(candidate);
         }
