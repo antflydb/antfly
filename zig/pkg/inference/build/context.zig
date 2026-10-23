@@ -20,7 +20,7 @@ pub const Context = struct {
     b: *std.Build,
     target: std.Build.ResolvedTarget,
     optimize: std.lang.Optimize,
-    strip: bool = false,
+    strip: bool,
     paths: runtime.Paths,
     backend: runtime.BackendOptions,
     graph: runtime.Graph,
