@@ -60,6 +60,13 @@ class Upstream(BaseHTTPRequestHandler):
     def log_message(self, *_args):
         pass
 
+    def handle(self):
+        try:
+            super().handle()
+        except (BrokenPipeError, ConnectionResetError):
+            # Deliberate stream failures/cancellation close pooled connections.
+            pass
+
     def reply(self, value, status=200, content_type="application/json"):
         encoded = value if isinstance(value, bytes) else json.dumps(value).encode()
         self.send_response(status)
