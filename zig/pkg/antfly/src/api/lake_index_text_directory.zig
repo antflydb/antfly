@@ -482,6 +482,7 @@ fn validatePhysical(record: SegmentRecord, domain: Id, upper: u32) !void {
     }
     if (record.sources.len != 0) {
         if (record.rows.len != 0 or record.physical != null) return error.InvalidNativeLakeTextCorpus;
+        if (record.route.live.len == 0 and (record.ordinal != 0 or record.interval.lower != 0)) return error.InvalidNativeLakeTextCorpus;
         if (record.route.live.len != 0) {
             if (record.route.live.len != record.sources.len) return error.InvalidNativeLakeTextCorpus;
             for (record.route.live, record.sources) |live, span| if (live.lower != span.pack_lower or live.count != span.count) return error.InvalidNativeLakeTextCorpus;
