@@ -9499,7 +9499,7 @@ pub const DB = struct {
 
     pub const selectIndexRepairSchedulerQuantumForIndex = db_repair.selectIndexRepairSchedulerQuantumForIndex;
 
-    fn selectIndexRepairSchedulerQuantumScoped(self: *DB, alloc: Allocator, execution_limit: usize, target_index_name: ?[]const u8, source_replay_only: bool) !IndexRepairSchedulerSelection {
+    pub fn selectIndexRepairSchedulerQuantumScoped(self: *DB, alloc: Allocator, execution_limit: usize, target_index_name: ?[]const u8, source_replay_only: bool) !IndexRepairSchedulerSelection {
         try self.ensureIndexRepairSchedulerDirectory(alloc);
         var selection: IndexRepairSchedulerSelection = .{};
         errdefer selection.deinit(alloc);
@@ -17212,7 +17212,7 @@ pub const DB = struct {
         self.enforcePortableRuntimeGate() catch return false;
         return true;
     }
-    fn independentMaintenanceRun(ptr: *anyopaque, work: independent_maintenance.Owner.Work) !bool {
+    pub fn independentMaintenanceRun(ptr: *anyopaque, work: independent_maintenance.Owner.Work) !bool {
         const self: *DB = @ptrCast(@alignCast(ptr));
         switch (work) {
             .upload => return self.advanceArtifactUploadRecoveryWithTrigger(.maintenance),
@@ -17657,7 +17657,7 @@ pub const DB = struct {
         return self.flushAppliedSequences(true);
     }
 
-    fn flushAppliedSequences(self: *DB, force: bool) !void {
+    pub fn flushAppliedSequences(self: *DB, force: bool) !void {
         var lifecycle_completed = false;
         const published = blk: {
             var seq_lock = lockAtomicWithBackoffProfiled(
