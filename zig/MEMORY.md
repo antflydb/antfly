@@ -1581,7 +1581,7 @@ The proposed assertion model adds structured subject/predicate/value, explicit s
 
 ### Main integration and constrained-output follow-up (#1223)
 
-The native memory branch incorporates main through `d3d044e1c9`, including
+The native memory branch incorporates main through `2aed23bb0e`, including
 [#1262](https://github.com/antflydb/antfly/pull/1262)'s unified Apache CLI and
 `libantfly` packaging, [#1264](https://github.com/antflydb/antfly/pull/1264)'s CI
 and inference updates, and the earlier #1246 inference gateway. Native memory
