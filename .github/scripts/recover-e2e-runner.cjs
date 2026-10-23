@@ -3,15 +3,39 @@ const WORKFLOW = '.github/workflows/zig-tests.yml';
 const SHUTDOWN = 'The runner has received a shutdown signal.';
 
 function interruptedE2e(job, log) {
-  if (job.conclusion !== 'failure' ||
-      !/^e2e-full \/ (inference-(generation|speech|embedding)|antfly)$/.test(job.name)) return false;
-  // Runner loss marks the executing step cancelled even when the enclosing
-  // job fails. A deliberately cancelled job is excluded above.
+  if (job.conclusion !== 'failure') return false;
+  const build = job.name === 'e2e-full / build';
+  if (!build && !/^e2e-full \/ (inference-(generation|speech|embedding)|antfly)$/.test(job.name)) return false;
+  // Runner loss can cancel the executing step or interrupt its shell with
+  // SIGINT/SIGTERM. A deliberately cancelled job is excluded above.
   const failed = (job.steps || []).filter(step => ['failure', 'cancelled'].includes(step.conclusion));
-  if (failed.length !== 1 || !/^Run Antfly (inference )?full E2E$/.test(failed[0].name)) return false;
+  const executing = failed.filter(step => build
+    ? /^Build (E2E executable once|optimized model E2E executable)$/.test(step.name)
+    : /^Run Antfly (inference )?full E2E$/.test(step.name));
+  if (executing.length !== 1) return false;
+  const active = executing[0];
+  // Cleanup may start under always() before the runner finishes shutting down.
+  // Only cancelled teardown after the interrupted build is incidental; failed
+  // setup, independent failures and failed cleanup must remain failures.
+  if (failed.some(step => step !== active && !(build && step.conclusion === 'cancelled' &&
+      Number.isInteger(active.number) && step.number > active.number &&
+      (step.name === 'Release completed E2E build scratch' || step.name.startsWith('Post '))))) return false;
   const shutdown = log.indexOf(SHUTDOWN);
   if (shutdown < 0 || /exceeded the maximum execution time/.test(log)) return false;
   const before = log.slice(0, shutdown);
+  if (build) {
+    // A failed shell needs an explicit interruption status. Ordinary nonzero
+    // exits (including OOM/137) remain failures even when GitHub marks the
+    // active step cancelled as it subsequently shuts the runner down.
+    const exits = [...before.matchAll(/##\[error\]Process completed with exit code (\d+)\./g)];
+    if (exits.some(exit => !['130', '143'].includes(exit[1]))) return false;
+    if (active.conclusion === 'failure' && exits.length === 0) return false;
+  }
+  // Rebuild only externally interrupted compilers. A compiler/smoke failure
+  // already present before shutdown must remain visible. The job-specific
+  // rerun also schedules its dependent artifact consumers, preserving the
+  // completed unit and SDK work instead of repeating the entire workflow.
+  if (build) return !/(?:^|\n)[^\n]*\berror:|\bFAIL(?:ED)?\b|failed command:/.test(before);
   // These lanes use verbose pytest progress. Do not erase an assertion failure
   // that happened before the runner was lost or retry explicit test deadlines.
   return !/\b(?:FAILED|ERROR)\s+\[\s*\d+%\]|\b(?:FAILED|ERROR)\s+(?:zig\/)?e2e\//.test(before);

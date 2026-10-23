@@ -108,7 +108,7 @@ pub const StdHttpExecutor = struct {
             .reuse_mutex = .init,
             .requests_on_current_connection = 0,
         };
-        const safe_io = threaded_connect_io.io(io_impl, io_vtable);
+        const safe_io = threaded_connect_io.ioWithOwnedVTable(io_impl, io_vtable);
         self.client = .{
             .allocator = alloc,
             .io = safe_io,
@@ -137,7 +137,7 @@ pub const StdHttpExecutor = struct {
             .reuse_mutex = .init,
             .requests_on_current_connection = 0,
         };
-        const safe_io = threaded_connect_io.io(io_impl, io_vtable);
+        const safe_io = threaded_connect_io.ioWithOwnedVTable(io_impl, io_vtable);
         self.client = .{
             .allocator = alloc,
             .io = safe_io,
@@ -324,7 +324,7 @@ pub const StdHttpExecutor = struct {
         req: common.HttpRequest,
         downstream: common.StreamWriter,
     ) !void {
-        const io = threaded_connect_io.io(self.io_impl, self.io_vtable);
+        const io = threaded_connect_io.ioWithOwnedVTable(self.io_impl, self.io_vtable);
         if (self.cfg.keep_alive) try self.client_mutex.lock(io);
         defer if (self.cfg.keep_alive) self.client_mutex.unlock(io);
 
@@ -688,7 +688,7 @@ pub const StdHttpExecutor = struct {
     }
 
     fn executeDirect(self: *StdHttpExecutor, alloc: std.mem.Allocator, req: common.HttpRequest) !common.HttpResponse {
-        const io = threaded_connect_io.io(self.io_impl, self.io_vtable);
+        const io = threaded_connect_io.ioWithOwnedVTable(self.io_impl, self.io_vtable);
         // A controlled request queued behind the serialized keep-alive client
         // must remain interruptible before it acquires a socket of its own.
         if (self.cfg.keep_alive) try self.client_mutex.lock(io);
@@ -1564,7 +1564,7 @@ test "std http executor cancellation interrupts a request queued for the pooled 
 
     var executor = StdHttpExecutor.init(std.testing.allocator, .{ .keep_alive = true });
     defer executor.deinit();
-    const io = threaded_connect_io.io(executor.io_impl, executor.io_vtable);
+    const io = threaded_connect_io.ioWithOwnedVTable(executor.io_impl, executor.io_vtable);
     executor.client_mutex.lockUncancelable(io);
     var client_locked = true;
     defer if (client_locked) executor.client_mutex.unlock(io);

@@ -17311,7 +17311,9 @@ components:
             - target_selector_not_supported
             - target_required
             - k_must_equal_one
+            - k_must_be_positive
             - pattern_required
+            - qualified_start_identity_required
             - external_alias_document_filter_not_supported
             - external_alias_source_not_supported
             - reverse_variable_path_not_supported
@@ -38554,7 +38556,13 @@ components:
           $ref: '#/components/schemas/Boost'
     TermQuery:
       type: object
+      description: Match an indexed post-analysis term exactly. Use match for analyzed natural-language
+        input.
       properties:
+        case_insensitive:
+          type: boolean
+          default: false
+          description: Fold ASCII letter case when matching indexed terms, without stemming the pattern.
         term:
           type: string
         field:
@@ -38709,6 +38717,10 @@ components:
 
         substring, exactly like `match` on that field.
       properties:
+        case_insensitive:
+          type: boolean
+          default: false
+          description: Fold ASCII letter case when matching indexed terms, without stemming the pattern.
         prefix:
           type: string
         field:
@@ -38719,7 +38731,13 @@ components:
         - prefix
     RegexpQuery:
       type: object
+      description: Match post-analysis indexed terms. Patterns are not stemmed; use match for analyzed
+        natural-language input.
       properties:
+        case_insensitive:
+          type: boolean
+          default: false
+          description: Fold ASCII letter case when matching indexed terms, without stemming the pattern.
         regexp:
           type: string
         field:
@@ -38730,7 +38748,13 @@ components:
         - regexp
     WildcardQuery:
       type: object
+      description: Match post-analysis indexed terms. Patterns are not stemmed; use match for analyzed
+        natural-language input.
       properties:
+        case_insensitive:
+          type: boolean
+          default: false
+          description: Fold ASCII letter case when matching indexed terms, without stemming the pattern.
         wildcard:
           type: string
         field:

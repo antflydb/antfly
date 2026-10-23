@@ -196,7 +196,10 @@ fn runConfigured(init: std.process.Init, command: []const u8, args: *std.process
     });
     defer http.deinit();
 
-    const config = cli.parseGlobalFlags();
+    var config = cli.parseGlobalFlags();
+    var client_arguments = extractUrlOption(init.gpa, args.*, &config) catch |err| return cli.output.argumentFailure(err);
+    defer client_arguments.deinit(init.gpa);
+    args.* = std.process.Args.Iterator.init(.{ .vector = client_arguments.items });
     var client = cli.initClient(init.gpa, &http, config) catch |err| return cli.output.argumentFailure(err);
     defer client.deinit();
 
@@ -257,3 +260,46 @@ test "client runtime recognizes help without consuming arguments" {
 
 /// Server fixtures retain this compilation root's source and type identity.
 pub const local_test_sources = if (@import("builtin").is_test) @import("local_test_sources.zig") else struct {};
+
+/// Apply connection selection before command parsing so every remote command,
+/// including nested maintenance commands, shares the same URL precedence.
+fn extractUrlOption(alloc: std.mem.Allocator, input: std.process.Args.Iterator, config: *cli.GlobalConfig) !std.ArrayList([*:0]const u8) {
+    var args = input;
+    var result: std.ArrayList([*:0]const u8) = .empty;
+    errdefer result.deinit(alloc);
+    var seen = false;
+    var positional = false;
+    while (args.next()) |arg| {
+        if (std.mem.eql(u8, arg, "--")) positional = true;
+        if (!positional and (std.mem.eql(u8, arg, "--url") or std.mem.startsWith(u8, arg, "--url="))) {
+            if (seen) return error.DuplicateOption;
+            seen = true;
+            const value = if (std.mem.eql(u8, arg, "--url")) args.next() orelse return error.MissingOptionValue else arg[6..];
+            if (value.len == 0 or std.mem.startsWith(u8, value, "--")) return error.MissingOptionValue;
+            const uri = std.Uri.parse(value) catch return error.InvalidServerUrl;
+            if ((!std.ascii.eqlIgnoreCase(uri.scheme, "http") and !std.ascii.eqlIgnoreCase(uri.scheme, "https")) or uri.host == null) return error.InvalidServerUrl;
+            config.url = value;
+        } else try result.append(alloc, arg.ptr);
+    }
+    return result;
+}
+
+test "client URL option applies to nested index maintenance and preserves command options" {
+    const a = std.testing.allocator;
+    const argv = [_][*:0]const u8{ "maintenance", "rebuild", "--table", "docs", "--url", "http://localhost:8194", "--index", "text" };
+    var config: cli.GlobalConfig = .{ .url = "http://environment:8080" };
+    var result = try extractUrlOption(a, std.process.Args.Iterator.init(.{ .vector = &argv }), &config);
+    defer result.deinit(a);
+    try std.testing.expectEqualStrings("http://localhost:8194", config.url);
+    try std.testing.expectEqual(@as(usize, 6), result.items.len);
+    try std.testing.expectEqualStrings("rebuild", std.mem.span(result.items[1]));
+    const positional = [_][*:0]const u8{ "--", "--url", "literal-key" };
+    var literals = try extractUrlOption(a, std.process.Args.Iterator.init(.{ .vector = &positional }), &config);
+    defer literals.deinit(a);
+    try std.testing.expectEqual(@as(usize, 3), literals.items.len);
+    try std.testing.expectEqualStrings("http://localhost:8194", config.url);
+    const missing = [_][*:0]const u8{"--url"};
+    try std.testing.expectError(error.MissingOptionValue, extractUrlOption(a, std.process.Args.Iterator.init(.{ .vector = &missing }), &config));
+    const duplicate = [_][*:0]const u8{ "--url=http://localhost:8194", "--url=http://localhost:8195" };
+    try std.testing.expectError(error.DuplicateOption, extractUrlOption(a, std.process.Args.Iterator.init(.{ .vector = &duplicate }), &config));
+}
