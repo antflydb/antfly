@@ -12189,7 +12189,6 @@ pub const Reader = struct {
             }
         }
 
-
         const first_char: usize = if (font_obj.get("FirstChar")) |obj| blk: {
             const value = (try self.resolvedIntegerObjectValue(obj)) orelse return error.InvalidPdf;
             if (value < 0 or value > 255) return error.InvalidPdf;
@@ -14189,14 +14188,11 @@ fn parseType1BuiltinEncodingAlloc(alloc: Allocator, bytes: []const u8) !Type1Bui
                 defer syntax.Scanner.freeLexeme(alloc, &name_tok);
                 var put_tok = try scanner.readLexeme();
                 defer syntax.Scanner.freeLexeme(alloc, &put_tok);
-                if (code_tok != .integer or
-                    code_tok.integer < 0 or
-                    code_tok.integer > 255 or
-                    name_tok != .name or
+                const code = type1EncodingCode(code_tok) orelse continue;
+                if (name_tok != .name or
                     put_tok != .keyword or
                     !std.mem.eql(u8, put_tok.keyword, "put")) continue;
 
-                const code: usize = @intCast(code_tok.integer);
                 if (result.names[code]) |old| alloc.free(old);
                 result.names[code] = name_tok.name;
                 name_tok = .eof;
@@ -14204,6 +14200,52 @@ fn parseType1BuiltinEncodingAlloc(alloc: Allocator, bytes: []const u8) !Type1Bui
             },
             else => {},
         }
+    }
+}
+
+// The PDF lexer returns PostScript radix integers as keywords. Decode them
+// locally rather than extending PDF numeric syntax to accept PostScript tokens.
+fn type1EncodingCode(tok: syntax.Lexeme) ?u8 {
+    if (tok == .integer) return std.math.cast(u8, tok.integer);
+    if (tok != .keyword) return null;
+    const text = tok.keyword;
+    const separator = std.mem.indexOfScalar(u8, text, '#') orelse return null;
+    if (separator == 0 or separator + 1 == text.len) return null;
+    for (text[0..separator]) |digit| if (digit < '0' or digit > '9') return null;
+    const base = std.fmt.parseInt(u8, text[0..separator], 10) catch return null;
+    if (base < 2 or base > 36) return null;
+    var code: u16 = 0;
+    for (text[separator + 1 ..]) |digit| {
+        code = code * base + (std.fmt.charToDigit(digit, base) catch return null);
+        if (code > 255) return null;
+    }
+    return @intCast(code);
+}
+
+test "Type1 built-in encoding accepts decimal and PostScript radix codes" {
+    const alloc = std.testing.allocator;
+    const cases = [_]struct { token: []const u8, code: ?u8 }{
+        .{ .token = "8", .code = 8 },
+        .{ .token = "2#1000", .code = 8 },
+        .{ .token = "8#10", .code = 8 },
+        .{ .token = "16#FF", .code = 255 },
+        .{ .token = "36#z", .code = 35 },
+        .{ .token = "-1", .code = null },
+        .{ .token = "256", .code = null },
+        .{ .token = "16#100", .code = null },
+        .{ .token = "1#0", .code = null },
+        .{ .token = "37#0", .code = null },
+        .{ .token = "8#8", .code = null },
+        .{ .token = "16#", .code = null },
+        .{ .token = "16#1#0", .code = null },
+    };
+    for (cases) |case| {
+        const program = try std.fmt.allocPrint(alloc, "/Encoding 256 array dup {s} /braceleftbig put readonly def", .{case.token});
+        defer alloc.free(program);
+        var encoding = try parseType1BuiltinEncodingAlloc(alloc, program);
+        defer encoding.deinit(alloc);
+        try std.testing.expectEqual(case.code != null, encoding.has_entries);
+        if (case.code) |code| try std.testing.expectEqualStrings("braceleftbig", encoding.names[code].?);
     }
 }
 
@@ -21566,7 +21608,7 @@ test "reader uses ToUnicode cmap for text extraction" {
     try std.testing.expectEqualStrings("A\n", text);
 }
 
-test "reader uses symbolic Type1 built-in encoding for partial ToUnicode gaps" {
+test "reader uses symbolic Type1 built-in encoding for partial ToUnicode gaps and radix codes" {
     const alloc = std.testing.allocator;
     const content = "BT\n/F1 12 Tf\n<084109> Tj\nET\n";
     const cmap =
@@ -21584,8 +21626,8 @@ test "reader uses symbolic Type1 built-in encoding for partial ToUnicode gaps" {
         "/FontMatrix [0.001 0 0 0.001 0 0] readonly def\n" ++
         "/Encoding 256 array\n" ++
         "0 1 255 {1 index exch /.notdef put} for\n" ++
-        "dup 8 /braceleftbig put\n" ++
-        "dup 9 /bracerightbig put\n" ++
+        "dup 8#10 /braceleftbig put\n" ++
+        "dup 16#09 /bracerightbig put\n" ++
         "readonly def\n" ++
         "/Private 1 dict dup begin\n" ++
         "/lenIV -1 def\n" ++
