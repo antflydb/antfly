@@ -80,6 +80,12 @@ def main():
     parser.add_argument("binary", type=Path)
     parser.add_argument("--baseline", required=True, type=Path)
     parser.add_argument("--rounds", type=int, default=5)
+    parser.add_argument(
+        "--queries-per-phase",
+        type=int,
+        default=1,
+        help="repeat reads on each fresh server; keep parsing outside timings",
+    )
     parser.add_argument("--documents", type=int, default=8)
     parser.add_argument("--value-bytes", type=int, default=262144)
     parser.add_argument("--output", required=True, type=Path)
@@ -102,6 +108,7 @@ def main():
         not 1 <= args.documents <= 64
         or not 16384 <= args.value_bytes <= 1048576
         or args.rounds < 1
+        or not 1 <= args.queries_per_phase <= 100
     ):
         parser.error(
             "1..64 documents, 16 KiB..1 MiB values and positive rounds required"
@@ -206,47 +213,49 @@ def main():
                             }
                         else:
                             phase_request = request
-                        response, usage = measure(
-                            read,
-                            lambda: session.post(
-                                base + "/query", json=phase_request, timeout=60
-                            ),
-                        )
-                        result = response.json()["responses"][0]
-                        assert result["status"] == 200, result
-                        hits = result["hits"]["hits"]
-                        assert {h["_id"] for h in hits} == set(documents), result
-                        evidence = sorted(
-                            (h["_id"], h["_source"], h.get("_source_projection"))
-                            for h in hits
-                        )
-                        digest = hashlib.sha256(
-                            json.dumps(evidence, sort_keys=True).encode()
-                        ).hexdigest()
-                        assert output_hashes.setdefault(phase, digest) == digest, (
-                            "baseline/candidate source delivery differs"
-                        )
-                        for hit in hits:
-                            if phase != "ordinary":
-                                state = hit["_source_projection"]["payload.large"]
-                                assert state["state"] == (
-                                    "value" if phase == "full" else "unchanged"
-                                ), hit
-                            assert hit["_source"]["metadata"] == {
-                                "revision": "r1",
-                                "allowed": True,
-                            }
-                            assert ("large" in hit["_source"].get("payload", {})) == (
-                                phase != "conditional"
+                        for query_id in range(args.queries_per_phase):
+                            response, usage = measure(
+                                read,
+                                lambda: session.post(
+                                    base + "/query", json=phase_request, timeout=60
+                                ),
                             )
-                        samples.append(
-                            {
-                                "variant": variant,
-                                "round": round_id,
-                                "phase": phase,
-                                **usage,
-                            }
-                        )
+                            result = response.json()["responses"][0]
+                            assert result["status"] == 200, result
+                            hits = result["hits"]["hits"]
+                            assert {h["_id"] for h in hits} == set(documents), result
+                            evidence = sorted(
+                                (h["_id"], h["_source"], h.get("_source_projection"))
+                                for h in hits
+                            )
+                            digest = hashlib.sha256(
+                                json.dumps(evidence, sort_keys=True).encode()
+                            ).hexdigest()
+                            assert output_hashes.setdefault(phase, digest) == digest, (
+                                "baseline/candidate source delivery differs"
+                            )
+                            for hit in hits:
+                                if phase != "ordinary":
+                                    state = hit["_source_projection"]["payload.large"]
+                                    assert state["state"] == (
+                                        "value" if phase == "full" else "unchanged"
+                                    ), hit
+                                assert hit["_source"]["metadata"] == {
+                                    "revision": "r1",
+                                    "allowed": True,
+                                }
+                                assert (
+                                    "large" in hit["_source"].get("payload", {})
+                                ) == (phase != "conditional")
+                            samples.append(
+                                {
+                                    "variant": variant,
+                                    "round": round_id,
+                                    "phase": phase,
+                                    "query_id": query_id,
+                                    **usage,
+                                }
+                            )
                         if phase != "full":
                             continue
                         request["source_projection"]["fields"][0]["if_match"] = [
@@ -269,7 +278,8 @@ def main():
                     if (
                         variant == "candidate"
                         and args.workload in ("ascii", "escaped", "unicode", "numeric")
-                        and sum(a for a, _ in counts) < 2 * args.documents
+                        and sum(a for a, _ in counts)
+                        < 2 * args.documents * args.queries_per_phase
                     ):
                         failure = args.output.with_suffix(".server-failure.log")
                         failure.parent.mkdir(parents=True, exist_ok=True)
@@ -279,7 +289,10 @@ def main():
                         )
                     if variant == "candidate" and args.workload in ("small", "opaque"):
                         assert sum(a for a, _ in counts) == 0, counts
-                        assert sum(b for _, b in counts) >= 2 * args.documents, counts
+                        assert (
+                            sum(b for _, b in counts)
+                            >= 2 * args.documents * args.queries_per_phase
+                        ), counts
                     certificate_counts.append(
                         {
                             "variant": variant,
@@ -330,6 +343,7 @@ def main():
         "machine": platform.machine(),
         "cpu_count": os.cpu_count(),
         "rounds": args.rounds,
+        "queries_per_phase": args.queries_per_phase,
         "documents": args.documents,
         "value_bytes": args.value_bytes,
         "corpus_sha256": corpus,

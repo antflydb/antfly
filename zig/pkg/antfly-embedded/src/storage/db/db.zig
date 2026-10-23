@@ -41389,44 +41389,52 @@ pub const DB = struct {
             const end = @min(result.hits.len, start + 64);
             var window = std.heap.ArenaAllocator.init(@import("antfly_platform").allocator.reclaimingScratch(alloc));
             defer window.deinit();
-            var row_scratch = std.heap.ArenaAllocator.init(@import("antfly_platform").allocator.reclaimingScratch(alloc));
-            defer row_scratch.deinit();
             var txn = try self.core.store.beginReadTxn();
             defer txn.abort();
             const conditional_mod = @import("../conditional_source.zig");
-            var authorities: conditional_mod.Window = .{};
             var physical_keys: [64][]const u8 = undefined;
             var ids: [64][]const u8 = undefined;
+            var repairs: [64]bool = @splat(false);
+            var conditional_rows: ?[]?conditional_mod.Result = null;
+            defer if (conditional_rows) |rows| {
+                for (rows) |row| if (row) |value| {
+                    alloc.free(value.source);
+                    alloc.free(value.identities);
+                };
+                alloc.free(rows);
+            };
             const authenticated = self.core.store.valuesAreAuthenticated() and conditional_mod.exactSelectedValues(req.fields, parsed);
             if (authenticated) {
+                try db_query_search.checkSearchRequestDeadline(req);
                 for (result.hits[start..end], 0..) |hit, i| {
                     physical_keys[i] = try encodeStoreLookupKeyWithPinnedSchemaAlloc(self, window.allocator(), hit.id, schema);
                     ids[i] = hit.id;
                 }
                 var scope = try txn.openReadScope(window.allocator());
                 defer scope.close();
-                authorities = try conditional_mod.Window.prepare(window.allocator(), &scope, physical_keys[0 .. end - start], ids[0 .. end - start]);
+                const authorities = try conditional_mod.Window.prepare(window.allocator(), &scope, physical_keys[0 .. end - start], ids[0 .. end - start]);
+                const Guard = struct {
+                    fn check(raw: *const anyopaque) !void {
+                        const request: *const types.SearchRequest = @ptrCast(@alignCast(raw));
+                        try db_query_search.checkSearchRequestDeadline(request.*);
+                    }
+                };
+                conditional_rows = try conditional_mod.loadPreparedWindow(alloc, window.allocator(), &scope, physical_keys[0 .. end - start], ids[0 .. end - start], req.fields, prepared, authorities.rows[0 .. end - start], repairs[0 .. end - start], .{ .ctx = &req, .run = Guard.check });
             }
             var fallback_keys: [64][]const u8 = undefined;
             var fallback_slots: [64]usize = undefined;
             var count: usize = 0;
             for (result.hits[start..end], start..) |*hit, i| {
                 try db_query_search.checkSearchRequestDeadline(req);
-                if (authenticated) {
-                    if (!row_scratch.reset(.{ .retain_with_limit = 256 * 1024 })) _ = row_scratch.reset(.free_all);
-                    var scope = try txn.openReadScope(row_scratch.allocator());
-                    defer scope.close();
-                    var repair = false;
-                    const conditional = try conditional_mod.loadPrepared(alloc, row_scratch.allocator(), &scope, physical_keys[i - start], hit.id, req.fields, prepared, authorities.rows[i - start], &repair);
-                    if (repair) self.document_authority_backfill_requested.store(true, .release);
-                    if (conditional) |value| {
-                        hit.clearSource(alloc);
-                        hit.stored_data = value.source;
-                        hit.source_projection_json = value.identities;
-                        certificate_hits += 1;
-                        continue;
-                    }
-                }
+                if (repairs[i - start]) self.document_authority_backfill_requested.store(true, .release);
+                if (conditional_rows) |rows| if (rows[i - start]) |value| {
+                    hit.clearSource(alloc);
+                    hit.stored_data = value.source;
+                    hit.source_projection_json = value.identities;
+                    rows[i - start] = null;
+                    certificate_hits += 1;
+                    continue;
+                };
                 fallback_keys[count] = hit.id;
                 fallback_slots[count] = i;
                 full_fallbacks += 1;

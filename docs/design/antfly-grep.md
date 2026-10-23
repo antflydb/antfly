@@ -487,8 +487,13 @@ Eligible reads prepare at most 64 rows from one pinned transaction. One sorted,
 deduplicated batch loads content/revision/TTL metadata; a second loads required
 directories and certificates. Each directory is decoded once. Bounded owned
 metadata survives backend-buffer retirement; remaining field reads reuse the
-same proof/directory rather than fetching them again. Row scratch is still
-recycled independently. This is request-local work reuse, not an authorization
+same proof/directory rather than fetching them again. Equal omission masks share
+one logical range/full-value batch; no unrelated values are unioned. Additional
+materialized input is bounded to a conservative 1 MiB subwindow, with one large
+row allowed to make progress. Deadline checks run during planning, before each
+subwindow and before each output row. Results return to their original slots,
+and partial failures release untransferred sources. Row reconstruction scratch
+is still recycled independently. This is request-local work reuse, not an authorization
 or cross-request snapshot cache. Unsupported parent masks bypass preparation;
 small/opaque/stale cases retain ordinary source delivery.
 

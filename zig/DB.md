@@ -1631,9 +1631,13 @@ reference canonicalizer; raw directory digests remain separate binding hashes.
 Window preparation uses two sorted/deduplicated metadata batches for up to 64
 rows: proofs/revisions/TTL, then directories/certificates. Decoded directories and
 owned certificate records remain local to the pinned transaction and are reused
-for the remaining projected field reads. Retained metadata is bounded by 64
-format-limited authorities; row reconstruction scratch remains independently
-recyclable. Parent masks that cannot use these facts bypass preparation entirely.
+for the remaining projected field reads. Equal omission masks share logical
+range/full-value batches, bounded to a conservative 1 MiB materialization
+subwindow with one-large-row progress. This bounds additional input residency
+rather than accumulating a whole window of large primary values. Request
+deadlines are checked during planning, per subwindow and per output row.
+Retained metadata is bounded by 64 format-limited authorities; row reconstruction
+scratch remains independently recyclable. Parent masks that cannot use these facts bypass preparation entirely.
 
 `conditional_source.zig` checks these bindings under the ordinary publication
 lease and read scope. Each bounded window uses an ordinary read transaction;

@@ -134,12 +134,17 @@ pub fn exactSelectedValues(fields: []const []const u8, request: protocol.Request
     }
     return true;
 }
-pub fn loadPrepared(a: A, scratch: A, scope: anytype, physical: []const u8, id: []const u8, fields: []const []const u8, prepared: protocol.Prepared, authority: Authority, repair: *bool) !?Result {
-    if (!exactSelectedValues(fields, prepared.request)) return null;
-    repair.* = authority.repair;
+const Plan = struct {
+    directory: projection.Directory,
+    omitted: [64]bool,
+    identities: std.json.ArrayHashMap(protocol.Identity),
+    omission_mask: u64,
+};
+fn planSource(scratch: A, id: []const u8, prepared: protocol.Prepared, authority: Authority) !?Plan {
     const directory = authority.source.directory orelse return null;
     const certificate = authority.certificate orelse return null;
     var omitted: [64]bool = @splat(false);
+    var omission_mask: u64 = 0;
     var identities: std.json.ArrayHashMap(protocol.Identity) = .{};
     for (prepared.request.fields, prepared.conditions, 0..) |entry, conditions, i| {
         var state: protocol.State = .missing;
@@ -154,40 +159,38 @@ pub fn loadPrepared(a: A, scratch: A, scope: anytype, physical: []const u8, id: 
             };
         }
         omitted[i] = state != .value;
+        if (omitted[i]) omission_mask |= @as(u64, 1) << @as(u6, @intCast(i));
         try identities.map.put(scratch, entry.field, .{ .state = state, .identity = token });
     }
+    return .{ .directory = directory, .omitted = omitted, .identities = identities, .omission_mask = omission_mask };
+}
+fn selectedFields(scratch: A, fields: []const []const u8, prepared: protocol.Prepared, plan: Plan) ![]const []const u8 {
     var selected: std.ArrayList([]const u8) = .empty;
     for (fields) |field| {
-        const omit = for (prepared.request.fields, omitted[0..prepared.request.fields.len]) |entry, absent| {
+        const omit = for (prepared.request.fields, plan.omitted[0..prepared.request.fields.len]) |entry, absent| {
             if (absent and std.mem.eql(u8, entry.field, field)) break true;
         } else false;
         if (!omit) try selected.append(scratch, field);
     }
-    var source = if (selected.items.len == 0) try a.dupe(u8, "{}") else source: {
-        const rows = try logical.loadPrepared(a, scratch, scope, &.{physical}, &.{id}, selected.items, &.{authority.source});
-        defer {
-            for (rows) |row| if (row.bytes) |bytes| a.free(bytes);
-            a.free(rows);
-        }
-        const bytes = rows[0].bytes orelse return null;
-        // Opaque-directory fallback may return a larger subtree or full row.
-        // Apply the exact ordinary mask before returning any caller source.
-        break :source (try @import("db/document_query.zig").lookupJson(a, bytes, .{ .fields = selected.items, .include_all_fields = false })).json;
-    };
+    return selected.items;
+}
+fn finishSource(a: A, scratch: A, fields: []const []const u8, selected: []const []const u8, prepared: protocol.Prepared, plan: Plan, bytes: ?[]const u8) !Result {
+    // Even full-layout fallbacks obey the ordinary exact public mask.
+    var source = if (bytes) |value| (try @import("db/document_query.zig").lookupJson(a, value, .{ .fields = selected, .include_all_fields = false })).json else try a.dupe(u8, "{}");
     errdefer a.free(source);
     // Ordinary projection creates proven ancestor objects even when a leaf is
     // absent or subsequently omitted. Preserve that shape without loading it.
-    const nested_omission = for (prepared.request.fields, omitted[0..prepared.request.fields.len]) |entry, absent| {
+    const nested_omission = for (prepared.request.fields, plan.omitted[0..prepared.request.fields.len]) |entry, absent| {
         if (absent and std.mem.indexOfScalar(u8, entry.field, '.') != null) break true;
     } else false;
     if (nested_omission) {
         var value = try std.json.parseFromSliceLeaky(std.json.Value, scratch, source, .{});
-        for (prepared.request.fields, omitted[0..prepared.request.fields.len]) |entry, absent| {
+        for (prepared.request.fields, plan.omitted[0..prepared.request.fields.len]) |entry, absent| {
             if (!absent) continue;
             var parent = &value;
             var start: usize = 0;
             while (std.mem.indexOfScalarPos(u8, entry.field, start, '.')) |dot| {
-                const ancestor = directory.resolve(entry.field[0..dot]) orelse break;
+                const ancestor = plan.directory.resolve(entry.field[0..dot]) orelse break;
                 if (ancestor.kind != .object) break;
                 const name = entry.field[start..dot];
                 if (parent.* != .object) return error.InvalidDocumentContentAuthority;
@@ -202,7 +205,114 @@ pub fn loadPrepared(a: A, scratch: A, scope: anytype, physical: []const u8, id: 
         a.free(source);
         source = encoded;
     }
-    return .{ .source = source, .identities = try std.json.Stringify.valueAlloc(a, identities, .{ .emit_null_optional_fields = false }) };
+    return .{ .source = source, .identities = try std.json.Stringify.valueAlloc(a, plan.identities, .{ .emit_null_optional_fields = false }) };
+}
+
+pub fn loadPrepared(a: A, scratch: A, scope: anytype, physical: []const u8, id: []const u8, fields: []const []const u8, prepared: protocol.Prepared, authority: Authority, repair: *bool) !?Result {
+    if (!exactSelectedValues(fields, prepared.request)) return null;
+    repair.* = authority.repair;
+    const plan = (try planSource(scratch, id, prepared, authority)) orelse return null;
+    const selected = try selectedFields(scratch, fields, prepared, plan);
+    if (selected.len == 0) return try finishSource(a, scratch, fields, selected, prepared, plan, null);
+    const rows = try logical.loadPrepared(a, scratch, scope, &.{physical}, &.{id}, selected, &.{authority.source});
+    defer {
+        for (rows) |row| if (row.bytes) |bytes| a.free(bytes);
+        a.free(rows);
+    }
+    const bytes = rows[0].bytes orelse return null;
+    return try finishSource(a, scratch, fields, selected, prepared, plan, bytes);
+}
+/// Bound additional materialized input independently of document count. Large
+/// full-value rows progress alone; small projected metadata can share a batch.
+const materialization_bytes = 1024 * 1024;
+fn selectionCost(selected: []const []const u8, authority: Authority) usize {
+    if (selected.len == 0) return 0;
+    const proof = authority.source.proof orelse return std.math.maxInt(usize);
+    const directory = authority.source.directory orelse return std.math.maxInt(usize);
+    var bytes: u64 = 0;
+    var overhead: usize = 0;
+    for (selected) |path| {
+        if (directory.resolve(path)) |field| bytes +|= field.length;
+        overhead +|= path.len *| 8 +| 256;
+    }
+    const original = std.math.cast(usize, proof.bytes) orelse std.math.maxInt(usize);
+    const payload = if (bytes >= proof.bytes / 2) original else std.math.cast(usize, bytes) orelse std.math.maxInt(usize);
+    return payload +| overhead;
+}
+pub const Check = struct { ctx: *const anyopaque, run: *const fn (*const anyopaque) anyerror!void };
+/// Group only identical remaining masks, so reads never union unrelated values.
+/// The scope and authorities must belong to the same pinned read transaction.
+/// Output slots retain discovery order; unsupported rows remain null for the
+/// caller's ordinary loader. Scratch/range pins are bounded to this 64-row window.
+pub fn loadPreparedWindow(a: A, scratch: A, scope: anytype, physical: []const []const u8, ids: []const []const u8, fields: []const []const u8, prepared: protocol.Prepared, authorities: []const Authority, repairs: []bool, check: ?Check) ![]?Result {
+    if (ids.len > 64 or physical.len != ids.len or authorities.len != ids.len or repairs.len != ids.len) return error.InvalidBatch;
+    const result = try a.alloc(?Result, ids.len);
+    @memset(result, null);
+    @memset(repairs, false);
+    errdefer {
+        for (result) |entry| if (entry) |value| {
+            a.free(value.source);
+            a.free(value.identities);
+        };
+        a.free(result);
+    }
+    if (!exactSelectedValues(fields, prepared.request)) return result;
+    var plans: [64]?Plan = @splat(null);
+    var order: [64]usize = undefined;
+    var count: usize = 0;
+    for (ids, authorities, 0..) |id, authority, i| {
+        if (check) |guard| try guard.run(guard.ctx);
+        repairs[i] = authority.repair;
+        plans[i] = try planSource(scratch, id, prepared, authority);
+        if (plans[i] != null) {
+            order[count] = i;
+            count += 1;
+        }
+    }
+    std.mem.sort(usize, order[0..count], &plans, struct {
+        fn less(values: *const [64]?Plan, left: usize, right: usize) bool {
+            return values[left].?.omission_mask < values[right].?.omission_mask;
+        }
+    }.less);
+    var row_arena = std.heap.ArenaAllocator.init(@import("antfly_platform").allocator.reclaimingScratch(a));
+    defer row_arena.deinit();
+    var start: usize = 0;
+    while (start < count) {
+        if (check) |guard| try guard.run(guard.ctx);
+        var group_arena = std.heap.ArenaAllocator.init(@import("antfly_platform").allocator.reclaimingScratch(a));
+        defer group_arena.deinit();
+        const temp = group_arena.allocator();
+        const selected = try selectedFields(temp, fields, prepared, plans[order[start]].?);
+        var end = start + 1;
+        const mask = plans[order[start]].?.omission_mask;
+        var cost = selectionCost(selected, authorities[order[start]]);
+        while (end < count and plans[order[end]].?.omission_mask == mask) : (end += 1) {
+            const next = selectionCost(selected, authorities[order[end]]);
+            if (next > materialization_bytes -| cost) break;
+            cost +|= next;
+        }
+        var keys: [64][]const u8 = undefined;
+        var names: [64][]const u8 = undefined;
+        var known: [64]logical.Authority = undefined;
+        for (order[start..end], 0..) |index, i| {
+            keys[i] = physical[index];
+            names[i] = ids[index];
+            known[i] = authorities[index].source;
+        }
+        const rows = if (selected.len != 0) try logical.loadPrepared(a, temp, scope, keys[0 .. end - start], names[0 .. end - start], selected, known[0 .. end - start]) else null;
+        defer if (rows) |loaded| {
+            for (loaded) |row| if (row.bytes) |bytes| a.free(bytes);
+            a.free(loaded);
+        };
+        for (order[start..end], 0..) |index, i| {
+            if (check) |guard| try guard.run(guard.ctx);
+            if (!row_arena.reset(.{ .retain_with_limit = 256 * 1024 })) _ = row_arena.reset(.free_all);
+            const bytes = if (rows) |loaded| loaded[i].bytes orelse continue else null;
+            result[index] = try finishSource(a, row_arena.allocator(), fields, selected, prepared, plans[index].?, bytes);
+        }
+        start = end;
+    }
+    return result;
 }
 
 test "logical value conditional identities avoid payload reads and reject stale revision proofs" {
@@ -275,13 +385,40 @@ test "logical value conditional identities avoid payload reads and reject stale 
             mock.metadata_reads = 0;
             const window = try Window.prepare(temp, &mock, (@as([64][]const u8, @splat(physical)))[0..width], (@as([64][]const u8, @splat("doc")))[0..width]);
             try std.testing.expectEqual(@as(usize, 2), mock.metadata_reads);
-            for (window.rows[0..width]) |authority| {
-                var repair = false;
-                const reused = (try loadPrepared(a, temp, &mock, physical, "doc", &.{ "payload.image", "revision" }, prepared, authority, &repair)).?;
-                defer a.free(reused.source);
-                defer a.free(reused.identities);
+            const physicals = @as([64][]const u8, @splat(physical));
+            const names = @as([64][]const u8, @splat("doc"));
+            var repairs: [64]bool = undefined;
+            const batch = try loadPreparedWindow(a, temp, &mock, physicals[0..width], names[0..width], &.{ "payload.image", "revision" }, prepared, window.rows[0..width], repairs[0..width], null);
+            defer a.free(batch);
+            defer for (batch) |entry| if (entry) |value| {
+                a.free(value.source);
+                a.free(value.identities);
+            };
+            for (batch) |entry| {
+                const reused = entry.?;
                 try std.testing.expectEqualStrings(warm.source, reused.source);
                 try std.testing.expectEqualStrings(warm.identities, reused.identities);
+            }
+            const Cancel = struct {
+                calls: usize = 0,
+                after: usize,
+                fn check(raw: *const anyopaque) !void {
+                    const self: *@This() = @ptrCast(@alignCast(@constCast(raw)));
+                    self.calls += 1;
+                    if (self.calls > self.after) return error.Canceled;
+                }
+            };
+            var cancel: Cancel = .{ .after = width + (if (width > 1) @as(usize, 2) else 1) };
+            if (loadPreparedWindow(a, temp, &mock, physicals[0..width], names[0..width], &.{ "payload.image", "revision" }, prepared, window.rows[0..width], repairs[0..width], .{ .ctx = &cancel, .run = Cancel.check })) |unexpected| {
+                for (unexpected) |entry| if (entry) |value| {
+                    a.free(value.source);
+                    a.free(value.identities);
+                };
+                a.free(unexpected);
+                return error.ExpectedCancellation;
+            } else |err| {
+                if (err == error.OutOfMemory) return err;
+                try std.testing.expectEqual(error.Canceled, err);
             }
             try std.testing.expectEqual(@as(usize, 2), mock.metadata_reads);
             try std.testing.expectEqual(@as(usize, 0), mock.full_reads);
@@ -427,7 +564,7 @@ test "logical value conditional unique row window coalesces real metadata reads"
     for (&keys, &ids, &conditions, 0..) |*key, *id, *condition, i| {
         id.* = try std.fmt.allocPrint(temp, "doc-{d}", .{i});
         key.* = try @import("internal_keys.zig").documentKeyAlloc(temp, id.*);
-        const payload = try temp.alloc(u8, 32 * 1024);
+        const payload = try temp.alloc(u8, if (i == 7) 2 * 1024 * 1024 else 256 * 1024);
         @memset(payload, @intCast('a' + i));
         const body = try std.fmt.allocPrint(temp, "{{\"image\":\"{s}\",\"revision\":{d}}}", .{ payload, i });
         try store.put(key.*, body);
@@ -441,6 +578,7 @@ test "logical value conditional unique row window coalesces real metadata reads"
     const Counting = struct {
         inner: *@TypeOf(scope),
         calls: usize = 0,
+        range_calls: usize = 0,
         pub fn getManySorted(self: *@This(), input: []const []const u8, output: []?[]const u8) !void {
             self.calls += 1;
             // Real sorted/deduplicated metadata batches, not a response fixture.
@@ -449,21 +587,46 @@ test "logical value conditional unique row window coalesces real metadata reads"
             return self.inner.getManySorted(input, output);
         }
         pub fn getRangesMany(self: *@This(), input: []const @import("value_ranges.zig").Request) !void {
+            self.range_calls += 1;
             return self.inner.getRangesMany(input);
         }
     };
     var counted: Counting = .{ .inner = &scope };
     const window = try Window.prepare(temp, &counted, &keys, &ids);
     const prepared = try protocol.Prepared.init(temp, .{ .fields = &.{.{ .field = "image", .if_match = &conditions }} });
-    for (keys, ids, window.rows[0..keys.len], 0..) |key, id, authority, i| {
-        var repair = false;
-        const result = (try loadPrepared(a, temp, &counted, key, id, &.{ "image", "revision" }, prepared, authority, &repair)).?;
-        defer a.free(result.source);
-        defer a.free(result.identities);
+    var repairs: [8]bool = undefined;
+    const batch = try loadPreparedWindow(a, temp, &counted, &keys, &ids, &.{ "image", "revision" }, prepared, window.rows[0..keys.len], &repairs, null);
+    defer a.free(batch);
+    defer for (batch) |entry| if (entry) |value| {
+        a.free(value.source);
+        a.free(value.identities);
+    };
+    for (batch, repairs, 0..) |entry, repair, i| {
+        const result = entry.?;
         try std.testing.expect(!repair);
         const expected = try std.fmt.allocPrint(temp, "{{\"revision\":{d}}}", .{i});
         try std.testing.expectEqualStrings(expected, result.source);
         try std.testing.expect(std.mem.indexOf(u8, result.identities, "unchanged") != null);
     }
     try std.testing.expectEqual(@as(usize, 2), counted.calls);
+    try std.testing.expectEqual(@as(usize, 1), counted.range_calls);
+    // Mixed hits/misses require two exact masks, never their union. The
+    // unchanged group batches ranges; the value group batches full-row fallback.
+    const mixed = try protocol.Prepared.init(temp, .{ .fields = &.{.{ .field = "image", .if_match = conditions[0..4] }} });
+    const values = try loadPreparedWindow(a, temp, &counted, &keys, &ids, &.{ "image", "revision" }, mixed, window.rows[0..keys.len], &repairs, null);
+    defer a.free(values);
+    defer for (values) |entry| if (entry) |value| {
+        a.free(value.source);
+        a.free(value.identities);
+    };
+    for (values, 0..) |entry, i| {
+        const value = try std.json.parseFromSlice(std.json.Value, temp, entry.?.source, .{});
+        defer value.deinit();
+        try std.testing.expectEqual(i >= 4, value.value.object.get("image") != null);
+        if (i == 7) try std.testing.expectEqual(@as(usize, 2 * 1024 * 1024), value.value.object.get("image").?.string.len);
+        const expected_state = if (i < 4) "unchanged" else "value";
+        try std.testing.expect(std.mem.indexOf(u8, entry.?.identities, expected_state) != null);
+    }
+    try std.testing.expectEqual(@as(usize, 4), counted.calls);
+    try std.testing.expectEqual(@as(usize, 2), counted.range_calls);
 }
