@@ -167,6 +167,10 @@ pub const Prepared = struct {
             break :blk @splat(0);
         };
         if (!command.binding.fence.namespace.eql(core.identity_namespace)) return error.IdentityNamespaceMismatch;
+        // Read-only parent preparation is available, but no parent/dual job may
+        // enter the native journal before cohort admission/recovery is wired.
+        // Already committed Raft commands take the durable rejection path below.
+        if (!committed and (command.binding.purpose == .foreign_key_parent or command.binding.purpose == .foreign_key_dual)) return error.ForeignKeyValidationRequired;
         var self: @This() = .{ .alloc = a, .command = command, .context = context, .command_identity = command_identity };
         errdefer self.deinit();
         if (committed) {

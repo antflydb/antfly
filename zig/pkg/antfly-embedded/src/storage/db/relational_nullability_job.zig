@@ -76,12 +76,21 @@ pub const Candidate = struct {
     after_version: u32,
     purpose: contract.Purpose = .not_null,
     foreign_source: ?foreign_validation.ChildPlan = null,
+    foreign_parent: ?foreign_validation.ParentPlan = null,
 
     pub fn projectionCount(self: *const Candidate) usize {
-        return if (self.foreign_source) |source| source.rules.len else self.plan.names.len;
+        if (self.foreign_source) |source| return source.rules.len;
+        if (self.foreign_parent) |parent| return parent.rules.len;
+        return self.plan.names.len;
+    }
+    pub fn tableName(self: *const Candidate) ?[]const u8 {
+        if (self.foreign_source) |source| return source.table_name;
+        if (self.foreign_parent) |parent| return parent.rules[0].parent_table;
+        return null;
     }
     pub fn deinit(self: *Candidate) void {
         if (self.foreign_source) |*source| source.deinit();
+        if (self.foreign_parent) |*parent| parent.deinit();
         self.alloc.free(self.inputs);
         self.alloc.free(self.native_before);
         self.alloc.free(self.native_after);
@@ -194,6 +203,65 @@ pub const Candidate = struct {
         try control.ensureActive();
         return .{ .alloc = a, .inputs = inputs, .native_before = native_before, .native_after = native_after, .catalog_after = catalog_after, .plan = plan, .before_version = before.runtime_schema.version, .after_version = after.runtime_schema.version, .purpose = .foreign_key_source, .foreign_source = source };
     }
+    /// Parent preparation is schema-neutral. Every selected UNIQUE is resolved
+    /// from this owner's actual declaration and exact predecessor catalog. Child
+    /// cuts are bound into the immutable input, but grant no source-freeze proof.
+    pub fn initForeignKeyParent(a: A, table_id: u64, public_json: []const u8, predecessor: []const u8, config: foreign_validation.ParentConfig, control: projection.Control) !Candidate {
+        try control.ensureActive();
+        try config.validate();
+        if (table_id == 0 or public_json.len == 0 or public_json.len > max_schema or predecessor.len == 0 or predecessor.len > integrity.max_catalog_bytes) return error.InvalidSchemaValidationJob;
+        var counter = std.Io.Writer.Discarding.init(&.{});
+        try std.json.Stringify.value(config, .{}, &counter.writer);
+        if (counter.fullCount() > max_names) return error.InvalidSchemaValidationJob;
+        const raw_config = try std.json.Stringify.valueAlloc(a, config, .{});
+        defer a.free(raw_config);
+        var prepared = try api.PreparedSchemaDefinition.init(a, public_json);
+        defer prepared.deinit(a);
+        if (prepared.runtime_schema.storage_mode != .relational or prepared.runtime_schema.external_base_source != null) return error.InvalidSchemaValidationJob;
+        var installed_catalog = try integrity.decode(a, predecessor);
+        defer installed_catalog.deinit();
+        const coverage: compiler.CatalogCoverage = if (std.mem.allEqual(u8, &installed_catalog.checks_digest, 0)) .legacy else .checks_v1;
+        var previous = try compiler.compileCatalogWithCoverage(a, prepared.public_schema, table_id, predecessor, coverage);
+        defer previous.deinit();
+        if (!std.mem.eql(u8, previous.value, predecessor)) return error.IntegrityCatalogChanged;
+        var temporary = std.heap.ArenaAllocator.init(a);
+        defer temporary.deinit();
+        const scratch = temporary.allocator();
+        const uniques = try prepared.public_schema.relationalUniqueDefinitions(scratch);
+        const rules = try scratch.alloc(foreign_validation.ParentRule, config.children.len);
+        var fields: std.StringArrayHashMapUnmanaged(void) = .empty;
+        for (config.children, rules) |scope, *rule| {
+            try control.ensureActive();
+            // Self references require the dual source/parent job. A passive
+            // parent job alone cannot supply the missing frozen child cut.
+            if (scope.child_table_id == table_id or std.mem.eql(u8, scope.child_table, config.table_name)) return error.InvalidSchemaValidationJob;
+            const target = try @import("../../schema/relational_foreign_key_target.zig").resolveUnique(uniques, scope.parent_columns);
+            const binding = previous.catalog.find(.unique, target.name) orelse return error.IntegrityCatalogChanged;
+            if (!std.mem.eql(u8, target.name, scope.parent_unique) or !std.mem.eql(u8, &binding.generation, &scope.parent_generation)) return error.SchemaValidationJobChanged;
+            rule.* = .{ .child_table = scope.child_table, .constraint_name = scope.constraint_name, .constraint_generation = scope.constraint_generation, .parent_table = config.table_name, .parent_generation = binding.generation };
+            for (scope.parent_columns) |name| try fields.put(scratch, name, {});
+        }
+        var parent = try foreign_validation.ParentPlan.init(a, rules);
+        errdefer parent.deinit();
+        var layout = try codec.PhysicalLayout.init(a, prepared.runtime_schema);
+        defer layout.deinit();
+        var plan = try projection.Plan.init(a, prepared.runtime_schema, &layout, fields.keys(), control);
+        errdefer plan.deinit();
+        var state = std.crypto.hash.Blake3.init(.{});
+        state.update("antfly/fk-validation-parent-projection/v1");
+        state.update(raw_config);
+        state.final(&plan.identity);
+        const native_before = try schema.serializeSchema(a, prepared.runtime_schema);
+        errdefer a.free(native_before);
+        const native_after = try a.dupe(u8, native_before);
+        errdefer a.free(native_after);
+        const catalog_after = try a.dupe(u8, predecessor);
+        errdefer a.free(catalog_after);
+        const inputs = try contract.encodeInputs(a, .{ public_json, public_json, predecessor, raw_config });
+        errdefer a.free(inputs);
+        try control.ensureActive();
+        return .{ .alloc = a, .inputs = inputs, .native_before = native_before, .native_after = native_after, .catalog_after = catalog_after, .plan = plan, .before_version = prepared.runtime_schema.version, .after_version = prepared.runtime_schema.version, .purpose = .foreign_key_parent, .foreign_parent = parent };
+    }
     pub const parts = contract.inputParts;
     pub fn load(a: A, txn: anytype, binding: Binding, control: projection.Control) !Candidate {
         const raw = (try optional(txn, inputs_key)) orelse return error.SchemaValidationJobRequired;
@@ -216,6 +284,11 @@ pub const Candidate = struct {
             var config = try std.json.parseFromSlice(foreign_validation.SourceConfig, a, view[3], .{ .ignore_unknown_fields = false });
             defer config.deinit();
             break :block try initForeignKeySource(a, table_id, view[0], view[1], view[2], config.value, control);
+        } else if (purpose == .foreign_key_parent) block: {
+            if (!std.mem.eql(u8, view[0], view[1])) return error.InvalidSchemaValidationJob;
+            var config = try std.json.parseFromSlice(foreign_validation.ParentConfig, a, view[3], .{ .ignore_unknown_fields = false });
+            defer config.deinit();
+            break :block try initForeignKeyParent(a, table_id, view[0], view[2], config.value, control);
         } else if (purpose == .not_null) block: {
             var names = try std.json.parseFromSlice([]const []const u8, a, view[3], .{});
             defer names.deinit();
@@ -283,6 +356,7 @@ fn requireCurrent(self: Binding, txn: anytype) !void {
 pub fn guardRejection(txn: anytype, command: contract.Command) !?@import("relational_schema_apply_outcome.zig").Reason {
     const binding = command.binding;
     try requireNamespace(binding, txn);
+    if (binding.purpose == .foreign_key_parent or binding.purpose == .foreign_key_dual) return .publication_required;
     const stored = try load(txn);
     var installed_duplicate = false;
     var active_binding = false;
@@ -678,6 +752,9 @@ pub fn protectedOwnerCatalog(a: A, txn: anytype, namespace: @import("doc_identit
 }
 
 pub fn stageBegin(a: A, txn: anytype, binding: Binding, candidate: *const Candidate, entry: ?receipts.OrderedApplyReceipt) !Header {
+    // Parent preparation must never fall through to the source's write fence
+    // and row scanner. Admission requires the complete frozen-source cohort.
+    if (binding.purpose == .foreign_key_parent or binding.purpose == .foreign_key_dual) return error.ForeignKeyValidationRequired;
     try binding.validate();
     try requireCandidate(binding, candidate);
     try requireCurrent(binding, txn);
@@ -829,6 +906,7 @@ pub const RowAudit = struct {
     }
 
     pub fn init(a: A, core: anytype, binding: Binding, retained_inputs: []const u8, control: projection.Control) !@This() {
+        if (binding.purpose == .foreign_key_parent or binding.purpose == .foreign_key_dual) return error.ForeignKeyValidationRequired;
         try control.ensureActive();
         var reader = try openPhysicalReader(a, core);
         errdefer reader.deinit();
@@ -983,6 +1061,7 @@ pub const PreparedPage = struct {
         return .{ .binding = self.expected.binding, .expected = try self.expected.digest(), .boundary = .{ .records_examined = self.page.page.records_examined, .rows_examined = self.page.rows_examined, .violation_column = self.page.violation_column, .after = self.page.after, .more = self.page.page.more }, .reference_coverage = self.reference_coverage };
     }
     fn prepareMode(a: A, core: anytype, binding: Binding, budget: rows.Budget, control: projection.Control, replay_command: ?PageCommand) !PreparedPage {
+        if (binding.purpose == .foreign_key_parent or binding.purpose == .foreign_key_dual) return error.ForeignKeyValidationRequired;
         try control.ensureActive();
         var reader = try openPhysicalReader(a, core);
         defer reader.deinit();
@@ -1057,6 +1136,7 @@ pub fn stagePage(a: A, txn: anytype, manager: *transactions.TxnManager, prepared
 /// rows, indexes and claims are unchanged. A dedicated terminal intent gates
 /// release; generic topology cancellation stays unavailable.
 pub fn stageCancel(a: A, txn: anytype, manager: *transactions.TxnManager, binding: Binding, entry: ?receipts.OrderedApplyReceipt) !Header {
+    if (binding.purpose == .foreign_key_parent or binding.purpose == .foreign_key_dual) return error.ForeignKeyValidationRequired;
     try binding.validate();
     try requireNamespace(binding, txn);
     const previous = try load(txn);

@@ -167,6 +167,7 @@ pub const ParentRule = struct {
 pub const ParentPlan = struct {
     arena: std.heap.ArenaAllocator,
     rules: []const ParentRule,
+    by_generation: std.StringHashMapUnmanaged(usize),
 
     /// Owns only fixed key identities and a rule ordinal, so subsequent point
     /// reads may invalidate all cursor buffers without corrupting the witness.
@@ -182,10 +183,12 @@ pub const ParentPlan = struct {
         errdefer arena.deinit();
         const owned = arena.allocator();
         const copy = try owned.alloc(ParentRule, rules.len);
+        var by_generation: std.StringHashMapUnmanaged(usize) = .empty;
+        try by_generation.ensureTotalCapacity(owned, @intCast(rules.len));
         var name_bytes: usize = 0;
         for (rules, copy, 0..) |rule, *out, i| {
             if (std.mem.allEqual(u8, &rule.constraint_generation, 0) or std.mem.allEqual(u8, &rule.parent_generation, 0)) return error.InvalidSchemaValidationJob;
-            for (rules[0..i]) |prior| if (std.mem.eql(u8, &rule.constraint_generation, &prior.constraint_generation)) return error.InvalidSchemaValidationJob;
+            if (by_generation.contains(&rule.constraint_generation)) return error.InvalidSchemaValidationJob;
             out.* = rule;
             inline for (.{ "child_table", "constraint_name", "parent_table" }) |field| {
                 const name = @field(rule, field);
@@ -193,8 +196,9 @@ pub const ParentPlan = struct {
                 if (name.len == 0 or name_bytes > 1024 * 1024 or std.mem.indexOfScalar(u8, name, 0) != null) return error.InvalidSchemaValidationJob;
                 @field(out, field) = try owned.dupe(u8, name);
             }
+            by_generation.putAssumeCapacityNoClobber(&out.constraint_generation, i);
         }
-        return .{ .arena = arena, .rules = copy };
+        return .{ .arena = arena, .rules = copy, .by_generation = by_generation };
     }
     pub fn deinit(self: *ParentPlan) void {
         self.arena.deinit();
@@ -204,8 +208,8 @@ pub const ParentPlan = struct {
         const parsed = try contract.parseKey(key);
         if (parsed.kind != .reference) return error.InvalidSchemaValidationJob;
         const reference = try contract.Reference.decode(key, value);
-        for (self.rules, 0..) |rule, i| {
-            if (!std.mem.eql(u8, &reference.constraint_generation, &rule.constraint_generation)) continue;
+        if (self.by_generation.get(&reference.constraint_generation)) |i| {
+            const rule = self.rules[i];
             // A generation match with different semantics is corruption, not
             // an unrelated reference that can safely be omitted from coverage.
             if (!std.mem.eql(u8, reference.child_table, rule.child_table) or
@@ -452,6 +456,10 @@ fn readParentPageMode(plan: *const ParentPlan, read: anytype, after: []const u8,
         entry = try cursor.next();
     };
     const started = if (expected == null) @import("antfly_platform").time.monotonicNs() else 0;
+    // References are ordered by parent address. A page probes a popular parent
+    // once rather than once per referencing child. Retain only owned identities,
+    // never point-read buffers; the caller pins one immutable read cut.
+    var checked_parent: ?ParentPlan.Probe = null;
     while (entry) |kv| : (entry = try cursor.next()) {
         try control.ensureActive();
         if (!std.mem.startsWith(u8, kv.key, contract.namespace ++ "\x02")) break;
@@ -462,16 +470,23 @@ fn readParentPageMode(plan: *const ParentPlan, read: anytype, after: []const u8,
         result.has_cursor = true;
         result.records_examined += 1;
         if (try plan.probe(&result.last_key, kv.value)) |selected| {
-            const parent: ?[]const u8 = read.get(&selected.address.claimKey()) catch |err| switch (err) {
-                error.NotFound => null,
-                else => return err,
-            };
-            plan.inspectParent(selected, parent, &result.witness) catch |err| switch (err) {
-                error.ForeignKeyViolation => {
-                    result.failure_rule = @intCast(selected.rule);
-                },
-                else => return err,
-            };
+            const reusable = if (checked_parent) |prior| std.meta.eql(prior.address, selected.address) and
+                std.mem.eql(u8, plan.rules[prior.rule].parent_table, plan.rules[selected.rule].parent_table) else false;
+            if (reusable) {
+                try result.witness.addIdentity(selected.identity);
+            } else {
+                const parent: ?[]const u8 = read.get(&selected.address.claimKey()) catch |err| switch (err) {
+                    error.NotFound => null,
+                    else => return err,
+                };
+                plan.inspectParent(selected, parent, &result.witness) catch |err| switch (err) {
+                    error.ForeignKeyViolation => {
+                        result.failure_rule = @intCast(selected.rule);
+                    },
+                    else => return err,
+                };
+                if (result.failure_rule == null) checked_parent = selected;
+            }
         }
         const stop = if (expected) |boundary| result.failure_rule != null or
             (boundary.more and result.records_examined >= boundary.records_examined) else result.failure_rule != null or result.records_examined >= budget.records or
@@ -550,6 +565,84 @@ test "foreign key validation parent pages bound cold LSM work and reject forged 
     }
 }
 
+test "foreign key validation cold fan-in probes each parent once and never caches across snapshots" {
+    const a = std.testing.allocator;
+    const DocStore = @import("../docstore.zig").DocStore;
+    const Counting = struct {
+        txn: *DocStore.Txn,
+        probes: usize = 0,
+        pub fn openCursor(self: *@This()) !DocStore.Txn.CursorAdapter {
+            return self.txn.openCursor();
+        }
+        pub fn get(self: *@This(), key: []const u8) ![]const u8 {
+            self.probes += 1;
+            return self.txn.get(key);
+        }
+    };
+    const lsm = @import("../lsm_backend.zig");
+    var directory = try @import("../../common/test_directory.zig").TestDirectory.init("fk-validation-fan-in");
+    defer directory.cleanup();
+    var plan = try ParentPlan.init(a, &.{
+        .{ .child_table = "child", .constraint_name = "fk_a", .constraint_generation = @splat(2), .parent_table = "parent", .parent_generation = @splat(1) },
+        .{ .child_table = "child", .constraint_name = "fk_b", .constraint_generation = @splat(3), .parent_table = "parent", .parent_generation = @splat(1) },
+    });
+    defer plan.deinit();
+    const addresses = [_]contract.Address{ try contract.Address.init(@splat(1), "tuple-a"), try contract.Address.init(@splat(1), "tuple-b") };
+    var expected: Witness = .{};
+    for (0..2) |epoch| {
+        var backend = try lsm.Backend.open(a, directory.path(), .{});
+        defer backend.close();
+        var store = try DocStore.openRuntime(a, try backend.runtimeStore(a, .{}));
+        defer store.close();
+        if (epoch == 0) {
+            var txn = try store.beginWriteTxn();
+            errdefer txn.abort();
+            for (addresses, [_][]const u8{ "tuple-a", "tuple-b" }) |address, tuple| {
+                const parent = try (contract.Claim{ .tuple = tuple, .parent_table = "parent", .parent_key = tuple, .schema_version = 1 }).encode(a, address);
+                defer a.free(parent);
+                try txn.put(&address.claimKey(), parent);
+                for (0..1024) |i| {
+                    var key_bytes: [8]u8 = undefined;
+                    std.mem.writeInt(u64, &key_bytes, i, .little);
+                    const reference: contract.Reference = .{ .child_table = "child", .child_key = &key_bytes, .constraint_name = if (i % 2 == 0) "fk_a" else "fk_b", .constraint_generation = @splat(if (i % 2 == 0) @as(u8, 2) else 3), .historical_unvalidated = true };
+                    const value = try reference.encode(a, address);
+                    defer a.free(value);
+                    const key_bytes_owned = try reference.key(address);
+                    try txn.put(&key_bytes_owned, value);
+                    try expected.addReference(&key_bytes_owned);
+                }
+            }
+            try txn.commit();
+            continue;
+        }
+        var read = try store.beginReadTxn();
+        defer read.abort();
+        var counting: Counting = .{ .txn = &read };
+        const page = try readParentPage(&plan, &counting, "", .{ .records = 4096, .time_ns = std.time.ns_per_s }, .{});
+        try std.testing.expect(!page.more and page.failure_rule == null);
+        try std.testing.expectEqual(@as(u32, 2048), page.records_examined);
+        try std.testing.expect(page.witness.eql(expected));
+        try std.testing.expectEqual(@as(usize, 2), counting.probes);
+        counting.probes = 0;
+        _ = try replayParentPage(&plan, &counting, "", &page, .{});
+        try std.testing.expectEqual(@as(usize, 2), counting.probes);
+        // The cache is page-local. A fresh snapshot cannot inherit a positive
+        // claim from either the earlier page or its retained read transaction.
+        try store.delete(&addresses[0].claimKey());
+        var fresh = try store.beginReadTxn();
+        defer fresh.abort();
+        var fresh_counting: Counting = .{ .txn = &fresh };
+        const failed = try readParentPage(&plan, &fresh_counting, "", .{ .records = 4096, .time_ns = std.time.ns_per_s }, .{});
+        try std.testing.expect(failed.failure_rule != null);
+        try std.testing.expect(fresh_counting.probes >= 1 and fresh_counting.probes <= 2);
+        // A different expected table is still checked, even for the same
+        // address; generation aliases must not reuse a positive claim.
+        var corrupt = try ParentPlan.init(a, &.{ plan.rules[0], .{ .child_table = "child", .constraint_name = "fk_b", .constraint_generation = @splat(3), .parent_table = "wrong", .parent_generation = @splat(1) } });
+        defer corrupt.deinit();
+        try std.testing.expectError(error.InvalidSchemaValidationJob, readParentPage(&corrupt, &counting, "", .{ .records = 4096, .time_ns = std.time.ns_per_s }, .{}));
+    }
+}
+
 test "foreign key validation repeated historical rows retain scratch without heap allocation" {
     const a = std.testing.allocator;
     const columns = [_]schema.RelationalColumn{.{ .name = "id", .path = "id", .column_type = .integer }};
@@ -606,6 +699,135 @@ pub const SourceConfig = struct {
         }
     }
 };
+
+/// Child identities are hints until metadata joins independently signed source
+/// and parent preparations. The parent verifies its own UNIQUE declaration and
+/// generation; it never compiles or trusts a supplied child schema as authority.
+pub const ChildScope = struct {
+    child_table: []const u8,
+    child_table_id: u64,
+    child_schema_version: u32,
+    child_schema: [32]u8,
+    child_public: [32]u8,
+    child_catalog: [32]u8,
+    constraint_name: []const u8,
+    constraint_generation: contract.Generation,
+    parent_unique: []const u8,
+    parent_generation: contract.Generation,
+    parent_columns: []const []const u8,
+};
+
+pub const ParentConfig = struct {
+    purpose: @import("relational_schema_owner_contract.zig").Purpose = .foreign_key_parent,
+    table_name: []const u8,
+    children: []const ChildScope,
+
+    pub fn validate(self: @This()) !void {
+        if (self.purpose != .foreign_key_parent or self.children.len == 0 or self.children.len > 256) return error.InvalidSchemaValidationJob;
+        var name_bytes: usize = 0;
+        try addNameBytes(&name_bytes, self.table_name);
+        var column_count: usize = 0;
+        for (self.children, 0..) |scope, i| {
+            if (scope.child_table_id == 0 or scope.child_schema_version == 0 or scope.parent_columns.len == 0 or
+                std.mem.allEqual(u8, &scope.constraint_generation, 0) or std.mem.allEqual(u8, &scope.parent_generation, 0)) return error.InvalidSchemaValidationJob;
+            inline for (.{ "child_schema", "child_public", "child_catalog" }) |field| if (std.mem.allEqual(u8, &@field(scope, field), 0)) return error.InvalidSchemaValidationJob;
+            inline for (.{ "child_table", "constraint_name", "parent_unique" }) |field| try addNameBytes(&name_bytes, @field(scope, field));
+            column_count = std.math.add(usize, column_count, scope.parent_columns.len) catch return error.InvalidSchemaValidationJob;
+            if (column_count > 4096) return error.InvalidSchemaValidationJob;
+            for (scope.parent_columns, 0..) |name, column| {
+                try addNameBytes(&name_bytes, name);
+                for (scope.parent_columns[0..column]) |prior| if (std.mem.eql(u8, prior, name)) return error.InvalidSchemaValidationJob;
+            }
+            for (self.children[0..i]) |prior| {
+                if (std.mem.eql(u8, &prior.constraint_generation, &scope.constraint_generation) or
+                    (prior.child_table_id == scope.child_table_id and std.mem.eql(u8, prior.constraint_name, scope.constraint_name))) return error.InvalidSchemaValidationJob;
+                // One table cannot have two schema cuts or aliases in a cohort.
+                if (prior.child_table_id == scope.child_table_id and (!std.mem.eql(u8, prior.child_table, scope.child_table) or
+                    prior.child_schema_version != scope.child_schema_version or !std.mem.eql(u8, &prior.child_schema, &scope.child_schema) or
+                    !std.mem.eql(u8, &prior.child_public, &scope.child_public) or !std.mem.eql(u8, &prior.child_catalog, &scope.child_catalog))) return error.InvalidSchemaValidationJob;
+                if (prior.child_table_id != scope.child_table_id and std.mem.eql(u8, prior.child_table, scope.child_table)) return error.InvalidSchemaValidationJob;
+            }
+        }
+    }
+};
+
+fn addNameBytes(total: *usize, name: []const u8) !void {
+    total.* = std.math.add(usize, total.*, name.len) catch return error.InvalidSchemaValidationJob;
+    if (name.len == 0 or name.len > 4096 or total.* > 1024 * 1024 or std.mem.indexOfScalar(u8, name, 0) != null) return error.InvalidSchemaValidationJob;
+}
+
+test "foreign key validation parent candidate verifies its own catalog and owns every scope" {
+    const a = std.testing.allocator;
+    const job = @import("relational_nullability_job.zig");
+    const api = @import("../../schema/mod.zig");
+    const declarations = @import("../../schema/relational_declarations.zig");
+    const F = struct {
+        const public =
+            \\{"version":3,"storage_mode":"relational","default_type":"row","unique_constraints":[{"name":"pk","columns":["id"]},{"name":"redundant","columns":["id"]}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"}},"additionalProperties":false}}}}
+        ;
+        fn scope(generation: contract.Generation, name: []const u8, child_generation: u8) ChildScope {
+            return .{ .child_table = "children", .child_table_id = 71, .child_schema_version = 2, .child_schema = @splat(1), .child_public = @splat(2), .child_catalog = @splat(3), .constraint_name = name, .constraint_generation = @splat(child_generation), .parent_unique = "pk", .parent_generation = generation, .parent_columns = &.{"id"} };
+        }
+        fn run(backing: A, previous: []const u8, generation: contract.Generation) !void {
+            var candidate = try job.Candidate.initForeignKeyParent(backing, 88, public, previous, .{ .table_name = "parents", .children = &.{ scope(generation, "fk_a", 4), scope(generation, "fk_b", 5) } }, .{});
+            defer candidate.deinit();
+            try std.testing.expectEqual(@as(u32, 3), candidate.before_version);
+            try std.testing.expectEqual(candidate.before_version, candidate.after_version);
+            try std.testing.expectEqual(@as(usize, 2), candidate.projectionCount());
+            try std.testing.expectEqual(@as(usize, 1), candidate.plan.names.len);
+            try std.testing.expectEqualStrings("parents", candidate.tableName().?);
+            try std.testing.expectEqualStrings(candidate.native_before, candidate.native_after);
+            try std.testing.expectEqualStrings(previous, candidate.catalog_after);
+            try std.testing.expectEqual(@as(usize, 1), candidate.foreign_parent.?.by_generation.get(&@as(contract.Generation, @splat(5))).?);
+        }
+    };
+    var prepared = try api.PreparedSchemaDefinition.init(a, F.public);
+    defer prepared.deinit(a);
+    var previous = try declarations.compileCatalog(a, prepared.public_schema, 88, null);
+    defer previous.deinit();
+    const generation = previous.catalog.find(.unique, "pk").?.generation;
+    try F.run(a, previous.value, generation);
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, F.run, .{ previous.value, generation });
+    const config: ParentConfig = .{ .table_name = "parents", .children = &.{F.scope(generation, "fk_a", 4)} };
+    var candidate = try job.Candidate.initForeignKeyParent(a, 88, F.public, previous.value, config, .{});
+    defer candidate.deinit();
+    var replayed = try job.Candidate.fromPreparationInputs(a, candidate.inputs, 88, .foreign_key_parent, .{});
+    defer replayed.deinit();
+    try std.testing.expectEqualStrings(candidate.inputs, replayed.inputs);
+    try std.testing.expectEqualDeep(candidate.plan.identity, replayed.plan.identity);
+    try std.testing.expectError(error.IntegrityCatalogIncarnationMismatch, job.Candidate.initForeignKeyParent(a, 89, F.public, previous.value, config, .{}));
+    var wrong_scope = config.children[0];
+    wrong_scope.parent_generation[0] ^= 1;
+    try std.testing.expectError(error.SchemaValidationJobChanged, job.Candidate.initForeignKeyParent(a, 88, F.public, previous.value, .{ .table_name = "parents", .children = &.{wrong_scope} }, .{}));
+    wrong_scope = config.children[0];
+    wrong_scope.parent_unique = "redundant";
+    wrong_scope.parent_generation = previous.catalog.find(.unique, "redundant").?.generation;
+    try std.testing.expectError(error.SchemaValidationJobChanged, job.Candidate.initForeignKeyParent(a, 88, F.public, previous.value, .{ .table_name = "parents", .children = &.{wrong_scope} }, .{}));
+    wrong_scope = config.children[0];
+    wrong_scope.child_table_id = 88;
+    try std.testing.expectError(error.InvalidSchemaValidationJob, job.Candidate.initForeignKeyParent(a, 88, F.public, previous.value, .{ .table_name = "parents", .children = &.{wrong_scope} }, .{}));
+    try std.testing.expectError(error.UnknownField, job.Candidate.fromPreparationInputs(a, candidate.inputs, 88, .foreign_key_source, .{}));
+}
+
+test "foreign key validation parent scopes reject conflicting child epochs aliases and duplicate generations" {
+    const first: ChildScope = .{ .child_table = "children", .child_table_id = 71, .child_schema_version = 2, .child_schema = @splat(1), .child_public = @splat(2), .child_catalog = @splat(3), .constraint_name = "fk_a", .constraint_generation = @splat(4), .parent_unique = "pk", .parent_generation = @splat(5), .parent_columns = &.{"id"} };
+    var second = first;
+    second.constraint_name = "fk_b";
+    second.constraint_generation = @splat(6);
+    try (ParentConfig{ .table_name = "parents", .children = &.{ first, second } }).validate();
+    second.child_schema_version += 1;
+    try std.testing.expectError(error.InvalidSchemaValidationJob, (ParentConfig{ .table_name = "parents", .children = &.{ first, second } }).validate());
+    second = first;
+    second.child_table_id += 1;
+    second.constraint_generation = @splat(6);
+    try std.testing.expectError(error.InvalidSchemaValidationJob, (ParentConfig{ .table_name = "parents", .children = &.{ first, second } }).validate());
+    second.child_table = "other";
+    second.constraint_generation = first.constraint_generation;
+    try std.testing.expectError(error.InvalidSchemaValidationJob, (ParentConfig{ .table_name = "parents", .children = &.{ first, second } }).validate());
+    second = first;
+    second.parent_columns = &.{ "id", "id" };
+    try std.testing.expectError(error.InvalidSchemaValidationJob, (ParentConfig{ .table_name = "parents", .children = &.{second} }).validate());
+}
 
 test "foreign key validation source candidate owns compact scopes through every allocation failure" {
     const a = std.testing.allocator;

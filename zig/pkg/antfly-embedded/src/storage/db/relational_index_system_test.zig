@@ -12231,6 +12231,57 @@ test "relational index system foreign key validation scan rejects filtered cover
     try std.testing.expectError(error.InvalidNullabilityProjection, restricted.nextForeignKeyValidationPage(alloc, null, .{}, &plan, .{}));
 }
 
+test "relational index system foreign key validation parent preparation cannot acquire admission or leave cancellation history" {
+    const F = NullabilityJobFixture;
+    const job = F.job;
+    const validation = @import("foreign_key_validation.zig");
+    const cat = @import("relational_integrity_catalog.zig");
+    const public =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","unique_constraints":[{"name":"pk","columns":["id"]}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"}},"additionalProperties":false}}}}
+    ;
+    var directory = try @import("../../common/test_directory.zig").TestDirectory.init("fk-parent-preparation");
+    defer directory.cleanup();
+    var database = try db_mod.DB.open(alloc, directory.path(), F.options);
+    var live = true;
+    defer if (live) database.close();
+    try database.setSchemaJson(alloc, public);
+    const predecessor = try database.core.store.get(alloc, cat.key);
+    defer alloc.free(predecessor);
+    var catalog = try cat.decode(alloc, predecessor);
+    defer catalog.deinit();
+    const clock = try F.clock(&database);
+    const epoch = (try database.relationalTopologyIdentity()).next_epoch;
+    var candidate = try job.Candidate.initForeignKeyParent(alloc, F.namespace.table_id, public, predecessor, validation.ParentConfig{ .table_name = "parents", .children = &.{.{ .child_table = "children", .child_table_id = 71, .child_schema_version = 1, .child_schema = @splat(1), .child_public = @splat(2), .child_catalog = @splat(3), .constraint_name = "fk", .constraint_generation = @splat(4), .parent_unique = "pk", .parent_generation = catalog.find(.unique, "pk").?.generation, .parent_columns = &.{"id"} }} }, .{});
+    defer candidate.deinit();
+    const binding = try F.binding(&database, &candidate, 97);
+    const preparation = try database.prepareSchemaOwnerObservation(&candidate, binding.id, binding.plan_digest, binding.fence, .native, .{});
+    try std.testing.expectEqualDeep(binding, preparation.binding);
+    try std.testing.expectEqual(@import("relational_schema_owner_contract.zig").Purpose.foreign_key_parent, binding.purpose);
+    try std.testing.expect(preparation.position == null);
+    try std.testing.expectEqual(binding.before_version, binding.after_version);
+    for ([_]F.Action{ .begin, .cancel }) |action| {
+        try std.testing.expectError(error.ForeignKeyValidationRequired, F.apply(&database, &candidate, binding, action));
+        try std.testing.expectError(error.ForeignKeyValidationRequired, database.prepareNativeSchemaOwnerControl(.{ .binding = binding, .action = if (action == .begin) .begin else .cancel, .payload = if (action == .begin) candidate.inputs else "" }, .{}));
+    }
+    {
+        var read = try database.core.store.beginReadTxn();
+        defer read.abort();
+        try std.testing.expectEqual(@import("relational_schema_apply_outcome.zig").Reason.publication_required, (try job.guardRejection(&read, .{ .binding = binding, .action = .cancel })).?);
+    }
+    database.close();
+    live = false;
+    database = try db_mod.DB.open(alloc, directory.path(), F.options);
+    live = true;
+    try std.testing.expectEqual(clock, try F.clock(&database));
+    try std.testing.expectEqual(epoch, (try database.relationalTopologyIdentity()).next_epoch);
+    var read = try database.core.store.beginReadTxn();
+    defer read.abort();
+    try std.testing.expectEqual(null, try job.load(&read));
+    const retained = try read.get("\x00\x00__metadata__:schema_json");
+    try std.testing.expectEqualStrings(public, retained);
+    try std.testing.expectEqualStrings(predecessor, try read.get(cat.key));
+}
+
 test "relational index system foreign key validation source job persists witnesses replays pages and cancels after cold reopen" {
     const F = NullabilityJobFixture;
     const job = F.job;

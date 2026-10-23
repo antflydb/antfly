@@ -5045,7 +5045,7 @@ pub fn storageOwnerSchemaPreparationJson(owner: ?*anyopaque, request: *const ker
     };
     defer candidate.deinit();
     if (!std.mem.eql(u8, candidate.inputs, request.inputs.slice())) return Failure.result(error.InvalidSchemaValidationJob, out_failure);
-    if (candidate.foreign_source) |source| if (!std.mem.eql(u8, source.table_name, request.table_name.slice())) return Failure.result(error.SchemaValidationJobChanged, out_failure);
+    if (candidate.tableName()) |name| if (!std.mem.eql(u8, name, request.table_name.slice())) return Failure.result(error.SchemaValidationJobChanged, out_failure);
     const observed = handle.db.prepareSchemaOwnerObservation(&candidate, descriptor.id, descriptor.provisional_plan, descriptor.fence, descriptor.authority, context) catch |err| {
         if (budget) |value| if (value.denied()) return Failure.result(error.ResourceBudgetExceeded, out_failure);
         return Failure.result(err, out_failure);

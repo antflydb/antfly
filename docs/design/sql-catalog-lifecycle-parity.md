@@ -108,17 +108,51 @@ not claim an authenticated distributed parent proof. Native installation and
 metadata admission explicitly refuse FK roles until the whole cohort protocol
 is implemented, so a successful child scan cannot clear the validity flag.
 
-The remaining case closure is the integrated durable lifecycle: admit the exact
-child/parent cohort through existing schema-validation machinery; authenticate
-all child freeze acknowledgements before parent coverage; persist/recover the
-root-bound reference proofs and AFR2 promotion effects; publish only after complete
-matching coverage; and qualify cancellation, lost ACKs, cold root adoption and
-restore through authenticated SQL owners and the PostgreSQL oracle. Existing
-SQL VALIDATE guards remain in place until that lifecycle is implemented. The
-original-case counts and next-100 progress above are unchanged.
+Parent preparations now verify the owner's exact installed catalog, selected
+UNIQUE declaration and native generation. Their before/after schema and catalog
+bytes are identical. Compact child descriptors commit schema cuts and FK
+generations without copying complete child schemas into every parent input.
+Conflicting child epochs, aliases, duplicate generations, alternate equivalent
+UNIQUE declarations and self-reference substitution are rejected. Owned ASVI
+inputs reconstruct canonically after transport; the private C boundary checks
+the physical owner's table name for both source and parent preparations.
+Parent preparation does not admit a parent job: source row execution and root
+audits explicitly reject parent/dual bindings until their lifecycle is supported.
+Native begin/cancel preparation is rejected before journaling; committed Raft
+controls use a durable rejection. A cold-reopen boundary test verifies that
+read-only preparation and rejected controls leave no job, epoch or clock changes.
 
-Strict Debug qualification currently covers eighteen native FK/owner-contract,
-preparation and allocation-failure tests; three cold LSM scan/source-job tests;
+Parent scan dispatch uses a retained generation lookup rather than checking
+every selected FK for every reference. A page also retains a positive claim's
+owned address and expected table, avoiding repeated point lookups for children
+sharing one parent. A cold LSM fixture verifies **2 claim lookups for 2,048
+references to 2 parents**, identical replay coverage, fresh-snapshot rejection
+after parent removal, and rejection of a different table at the same address.
+This is a measured operation-count reduction, not an elapsed-time benchmark.
+The cache is page-local; it cannot qualify a later snapshot or unrelated table.
+The full-namespace traversal remains unfinished: unrelated live reference writes
+can change recovery boundaries. Parent admission needs scoped stable coverage
+and the authenticated all-child-frozen barrier before it can safely allow writes
+while validating. None of these native preparations changes original-case counts.
+
+The remaining case closure is the integrated durable lifecycle, not another
+read-side helper. The read-proof design requires the exact child/parent cohort,
+authenticated child freeze acknowledgements, recoverable root-bound reference
+proofs and AFR2 promotion before publication. Before adding parent leases, also
+qualify reuse of the existing 2PC activation machinery: ordinary attachments
+already guard the parent claim and atomically upgrade AFR2 to AFR1, and activation
+pages already join exact child observations and durable progress in that same
+transaction. This may permit online validation without a separate parent scan
+cohort. It requires proof that concurrent child changes cannot escape coverage,
+validated references cannot be downgraded, and foreign-root restoration cannot
+reuse an unproven cursor. It must preserve current enforced coverage and batch
+work through the existing coordinator, rather than issue a transaction per row.
+Neither approach is qualified yet. Cancellation, lost ACKs, cold adoption,
+restore, mounted SQL and the PostgreSQL oracle remain required before removing
+the SQL VALIDATE guard or changing the original-case counts above.
+
+Strict Debug qualification currently covers twenty-one native FK/owner-contract,
+preparation and allocation-failure tests; four cold LSM scan/owner-boundary tests;
 the existing 35-test NOT NULL recovery selection; 37 metadata publication tests;
 and five SQL presentation checks. The production Debug server builds and its
 CLI smoke check passes. After warm-up, ten thousand additional historical-row
