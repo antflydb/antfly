@@ -406,6 +406,20 @@ def run_clipclap_contract_tests() -> bool:
     )
 
 
+def inference_server_command() -> list[str]:
+    # Optimize the resident HTTP server without compiling offline CLI commands.
+    # Model pulls and CLI checks continue using the product executable below.
+    standalone = os.environ.get("ANTFLY_INFERENCE_SERVER_BIN")
+    if standalone:
+        binary = Path(standalone).expanduser().resolve()
+        if not binary.is_file():
+            raise FileNotFoundError(
+                f"ANTFLY_INFERENCE_SERVER_BIN does not exist: {binary}"
+            )
+        return [str(binary)]
+    return inference_command()
+
+
 def inference_command() -> list[str]:
     explicit = os.environ.get("ANTFLY_BIN")
     if explicit:
