@@ -92,10 +92,17 @@ def run(args, model, label, mode, concurrency, output):
     if args.vision_batch:
         env["ANTFLY_LIGHTONOCR3_VISION_BATCH"] = "1"
     env["ANTFLY_LIGHTONOCR3_CONTINUOUS"] = "1" if args.continuous else "0"
-    if args.require_small_tail_fusion:
+    if (
+        args.require_small_tail_fusion
+        or args.require_prefill_gates
+        or args.require_decode_projections
+    ):
         env["TERMITE_METAL_TRACE_DENSE_LINEAR_SHAPES"] = "1"
+    if args.require_vision_mpp:
+        env["TERMITE_METAL_TRACE_VISION_ATTENTION"] = "1"
     if args.profile_reader:
         env["ANTFLY_INFERENCE_READ_PROFILE"] = "1"
+        env["TERMITE_METAL_TRACE_VISION_ATTENTION"] = "1"
     env["ANTFLY_FLORENCE2_BATCH_WAIT_US"] = str(args.florence_batch_wait_us)
     if args.deferred_attention == "on":
         env["TERMITE_METAL_ENABLE_ACTIVE_PAGED_SLOT_ATTENTION_DEFERRED"] = "1"
@@ -127,6 +134,12 @@ def run(args, model, label, mode, concurrency, output):
         env["TERMITE_METAL_DISABLE_LIGHTONOCR3_PREFILL_NORM"] = "1"
     if args.disable_prefill_conv_vec4:
         env["TERMITE_METAL_DISABLE_QWEN35_PREFILL_CONV_VEC4"] = "1"
+    if args.disable_prefill_projections:
+        env["TERMITE_METAL_DISABLE_LIGHTONOCR3_PREFILL_PROJECTIONS"] = "1"
+    if args.disable_vision_mpp:
+        env["TERMITE_METAL_DISABLE_LIGHTONOCR3_VISION_MPP"] = "1"
+    if args.disable_local_kernels:
+        env["TERMITE_METAL_DISABLE_LIGHTONOCR3_LOCAL_KERNELS"] = "1"
     if args.weight_residency:
         env["TERMITE_METAL_ENABLE_LIGHTONOCR3_WEIGHT_RESIDENCY"] = "1"
     if args.disable_f16_encoder_mpp:
@@ -248,12 +261,39 @@ def run(args, model, label, mode, concurrency, output):
         result.update(status="ok", serial_reference_parity=True)
         if args.require_small_tail_fusion:
             dispatches = re.findall(
-                r"site=bf16_gate_up_device[^\n]*rows=([234])[^\n]*variant=lightonocr3_gate_up_split(?:\s|$)",
+                r"site=bf16_gate_up_device[^\n]*rows=([234])[^\n]*variant=lightonocr3_gate_up_(?:split|local_vector|local_tg)(?:\s|$)",
                 text,
             )
             result["small_tail_fusion_dispatches_including_warmup"] = len(dispatches)
             if not dispatches:
                 result["status"] = "missing_small_tail_fusion"
+
+        if args.require_vision_mpp:
+            dispatches = re.findall(
+                r"metal_vision_attention_trace: [^\n]*variant=lightonocr3_vision_mpp",
+                text,
+            )
+            result["vision_mpp_dispatches_including_warmup"] = len(dispatches)
+            if not dispatches:
+                result["status"] = "missing_vision_mpp"
+        if args.require_decode_projections:
+            for variant_name in ["recurrent_gate_tg", "decode_projection_chunk"]:
+                dispatches = re.findall(
+                    r"metal_dense_linear_trace: [^\n]*variant=lightonocr3_"
+                    + variant_name,
+                    text,
+                )
+                result[variant_name + "_dispatches_including_warmup"] = len(dispatches)
+                if not dispatches:
+                    result["status"] = "missing_" + variant_name
+        if args.require_prefill_gates:
+            dispatches = re.findall(
+                r"site=linear_multi_row_device[^\n]*variant=lightonocr3_prefill_gate_tg",
+                text,
+            )
+            result["prefill_gate_dispatches_including_warmup"] = len(dispatches)
+            if not dispatches:
+                result["status"] = "missing_prefill_gates"
 
         result["references"] = [
             json.loads(row) for row in re.findall(r"OCR_REFERENCE (.+)", text)
@@ -323,7 +363,7 @@ def main():
     parser.add_argument(
         "--require-small-tail-fusion",
         action="store_true",
-        help="Require an actual two-/three-/four-row split FFN dispatch (includes warmup)",
+        help="Require an actual two-/three-/four-row fused FFN dispatch (includes warmup)",
     )
     parser.add_argument("--prefill-sg-attention", action="store_true")
     parser.add_argument("--bf16-prefill-inputs", action="store_true")
@@ -346,6 +386,12 @@ def main():
     parser.add_argument("--disable-four-row-tile", action="store_true")
     parser.add_argument("--disable-f16-encoder-mpp", action="store_true")
     parser.add_argument("--weight-residency", action="store_true")
+    parser.add_argument("--disable-local-kernels", action="store_true")
+    parser.add_argument("--disable-vision-mpp", action="store_true")
+    parser.add_argument("--disable-prefill-projections", action="store_true")
+    parser.add_argument("--require-vision-mpp", action="store_true")
+    parser.add_argument("--require-prefill-gates", action="store_true")
+    parser.add_argument("--require-decode-projections", action="store_true")
     parser.add_argument("--disable-prefill-conv-vec4", action="store_true")
     parser.add_argument(
         "--continuous",

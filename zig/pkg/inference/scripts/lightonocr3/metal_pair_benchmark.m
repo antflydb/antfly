@@ -54,7 +54,7 @@ void *ocr_pair_create(size_t kind, size_t rows, size_t in_dim, size_t out_dim, c
             termite_metal_decode_runtime_set_qwen35_ocr_vector_loads(pair_runtime, 1);
         }
         termite_metal_decode_runtime *r = pair_runtime;
-        if (rows == 0 || rows > 2048 || in_dim == 0 || in_dim > 32768 || out_dim == 0 || out_dim > 248320 ||
+        if (rows == 0 || rows > 16384 || in_dim == 0 || in_dim > 32768 || out_dim == 0 || out_dim > 248320 ||
             kind > 3)
             return NULL;
         OCRPairCase *c = [OCRPairCase new];
@@ -291,6 +291,170 @@ static NSString *ocr_pair_split_source(void) {
            @"j=0;j<p.pad;j++){g+=s[j*count+i];u+=s[(p.pad+j)*count+i];}g+=gb[i%p.out_dim];u+=ub[i%p.out_dim];"
            @"y[i]=(g/(1.0f+exp(-g)))*u;}\n";
 }
+static NSString *ocr_pair_tg_gate_source(void) {
+    return [ocr_pair_split_source()
+        stringByAppendingString:
+            @""
+             "\n"
+             "template<uint S,uint N> inline void tg_gate_body(device float*x,device bfloat*gw,device "
+             "bfloat*uw,device float*gb,device float*ub,device float*y,constant P&p,threadgroup "
+             "float*tmp,uint group,uint sg,uint tid){\n"
+             " uint chunk=p.in_dim/S;\n"
+             " tensor<device "
+             "float,dextents<int,2>,tensor_inline>a(x+sg*chunk,dextents<int,2>(chunk,p.rows),array<int,2>{1,"
+             "int(p.in_dim)});\n"
+             " tensor<device "
+             "bfloat,dextents<int,2>,tensor_inline>gmat(gw+sg*chunk,dextents<int,2>(chunk,p.out_dim),array<"
+             "int,2>{1,int(p.in_dim)}),umat(uw+sg*chunk,dextents<int,2>(chunk,p.out_dim),array<int,2>{1,int("
+             "p.in_dim)});\n"
+             " tensor<threadgroup "
+             "float,dextents<int,2>,tensor_inline>dest(tmp+sg*8*N,dextents<int,2>(N,p.rows),array<int,2>{1,"
+             "int(N)}),destU(tmp+(S+sg)*8*N,dextents<int,2>(N,p.rows),array<int,2>{1,int(N)});\n"
+             " auto left=a.slice(0,0);auto rightG=gmat.slice(0,int(group)*N);auto "
+             "rightU=umat.slice(0,int(group)*N);\n"
+             " constexpr auto "
+             "desc=matmul2d_descriptor(8,N,dynamic_length_v<int>,false,true,false);matmul2d<desc,execution_"
+             "simdgroups<1>>op;\n"
+             " auto g=op.template "
+             "get_destination_cooperative_tensor<decltype(left),decltype(rightG),float>();auto u=op.template "
+             "get_destination_cooperative_tensor<decltype(left),decltype(rightU),float>();\n"
+             " op.run(left,rightG,g);op.run(left,rightU,u);g.store(dest);u.store(destU);\n"
+             " threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+             " for(uint i=tid;i<p.rows*N;i+=S*32){float gs=0,us=0;\n"
+             "  #pragma unroll\n"
+             "  for(uint j=0;j<S;j++){gs+=tmp[j*8*N+i];us+=tmp[(S+j)*8*N+i];}\n"
+             "  uint "
+             "col=group*N+i%N;gs+=gb[col];us+=ub[col];y[(i/N)*p.out_dim+col]=(gs/(1.0f+exp(-gs)))*us;\n"
+             " }\n"
+             "}\n"
+             "#define TG(S,N) kernel void tg_gate##S##_##N(device float*x[[buffer(0)]],device "
+             "bfloat*g[[buffer(1)]],device bfloat*u[[buffer(2)]],device float*gb[[buffer(3)]],device "
+             "float*ub[[buffer(4)]],device float*y[[buffer(5)]],constant P&p[[buffer(6)]],threadgroup "
+             "float*tmp[[threadgroup(0)]],uint group[[threadgroup_position_in_grid]],uint "
+             "sg[[simdgroup_index_in_threadgroup]],uint "
+             "tid[[thread_index_in_threadgroup]]){tg_gate_body<S,N>(x,g,u,gb,ub,y,p,tmp,group,sg,tid);}\n"
+             "TG(4,16) TG(2,16) TG(4,32)\n"
+             "\n"
+             "template<uint S,uint N> inline void tg_proj_body(device float*x,device bfloat*w,device "
+             "float*bias,device float*y,constant P&p,threadgroup float*tmp,uint group,uint sg,uint tid){\n"
+             " uint chunk=p.in_dim/S;\n"
+             " tensor<device "
+             "float,dextents<int,2>,tensor_inline>a(x+sg*chunk,dextents<int,2>(chunk,p.rows),array<int,2>{1,"
+             "int(p.in_dim)});\n"
+             " tensor<device "
+             "bfloat,dextents<int,2>,tensor_inline>wm(w+sg*chunk,dextents<int,2>(chunk,p.out_dim),array<int,"
+             "2>{1,int(p.in_dim)});\n"
+             " tensor<threadgroup "
+             "float,dextents<int,2>,tensor_inline>dest(tmp+sg*8*N,dextents<int,2>(N,p.rows),array<int,2>{1,"
+             "int(N)});\n"
+             " auto left=a.slice(0,0);auto right=wm.slice(0,int(group)*N);\n"
+             " constexpr auto "
+             "desc=matmul2d_descriptor(8,N,dynamic_length_v<int>,false,true,false);matmul2d<desc,execution_"
+             "simdgroups<1>>op;\n"
+             " auto result=op.template "
+             "get_destination_cooperative_tensor<decltype(left),decltype(right),float>();op.run(left,right,"
+             "result);result.store(dest);\n"
+             " threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+             " for(uint i=tid;i<p.rows*N;i+=S*32){float sum=0;\n"
+             "  #pragma unroll\n"
+             "  for(uint j=0;j<S;j++)sum+=tmp[j*8*N+i];\n"
+             "  uint col=group*N+i%N;y[(i/N)*p.out_dim+col]=sum+bias[col];\n"
+             " }\n"
+             "}\n"
+             "#define TP(S,N) kernel void tg_proj##S##_##N(device float*x[[buffer(0)]],device "
+             "bfloat*w[[buffer(1)]],device float*bias[[buffer(2)]],device float*y[[buffer(3)]],constant "
+             "P&p[[buffer(4)]],threadgroup float*tmp[[threadgroup(0)]],uint "
+             "group[[threadgroup_position_in_grid]],uint sg[[simdgroup_index_in_threadgroup]],uint "
+             "tid[[thread_index_in_threadgroup]]){tg_proj_body<S,N>(x,w,bias,y,p,tmp,group,sg,tid);}\n"
+             "TP(8,16) TP(8,32) TP(16,16)\n"];
+}
+static NSString *ocr_pair_vector_tile_source(void) {
+    return @""
+            "#include <metal_stdlib>\n"
+            "using namespace metal;\n"
+            "struct P{uint rows,in_dim,out_dim,pad;};\n"
+            "template<uint B,uint SN,uint TM,bool GATE> inline void tile_body(device const float*x,device "
+            "const ushort*gw,device const ushort*uw,device const float*gb,device const float*ub,device "
+            "float*y,constant P&p,uint group,uint sg,uint lane){\n"
+            " uint col=((group*4+sg)*(32/SN)+lane/SN)*TM;\n"
+            " float gs[B][TM],us[B][TM];\n"
+            " #pragma unroll\n"
+            " for(uint b=0;b<B;b++){\n"
+            "  #pragma unroll\n"
+            "  for(uint t=0;t<TM;t++){gs[b][t]=0;us[b][t]=0;}\n"
+            " }\n"
+            " for(uint k=(lane%SN)*4;k<p.in_dim;k+=SN*4){\n"
+            "  float4 a[B];\n"
+            "  #pragma unroll\n"
+            "  for(uint b=0;b<B;b++)a[b]=*((device const float4*)(x+b*p.in_dim+k));\n"
+            "  #pragma unroll\n"
+            "  for(uint t=0;t<TM;t++){\n"
+            "   float4 wg=as_type<float4>(uint4(*((device const ushort4*)(gw+(col+t)*p.in_dim+k)))<<16);\n"
+            "   float4 wu=GATE?as_type<float4>(uint4(*((device const "
+            "ushort4*)(uw+(col+t)*p.in_dim+k)))<<16):float4(0);\n"
+            "   #pragma unroll\n"
+            "   for(uint b=0;b<B;b++){gs[b][t]+=dot(a[b],wg);if(GATE)us[b][t]+=dot(a[b],wu);}\n"
+            "  }\n"
+            " }\n"
+            " #pragma unroll\n"
+            " for(uint b=0;b<B;b++){\n"
+            "  #pragma unroll\n"
+            "  for(uint t=0;t<TM;t++){\n"
+            "   float g=gs[b][t],u=us[b][t];\n"
+            "   #pragma unroll\n"
+            "   for(uint "
+            "step=SN/2;step>0;step/=2){g+=simd_shuffle_xor(g,step);if(GATE)u+=simd_shuffle_xor(u,step);}\n"
+            "   "
+            "if(lane%SN==0){g+=gb[col+t];if(GATE){u+=ub[col+t];g=(g/"
+            "(1.0f+exp(-g)))*u;}y[b*p.out_dim+col+t]=g;}\n"
+            "  }\n"
+            " }\n"
+            "}\n"
+            "#define T(B,SN,TM) kernel void tile##B##_##SN##_##TM(device const float*x[[buffer(0)]],device "
+            "const ushort*g[[buffer(1)]],device const ushort*u[[buffer(2)]],device const "
+            "float*gb[[buffer(3)]],device const float*ub[[buffer(4)]],device float*y[[buffer(5)]],constant "
+            "P&p[[buffer(6)]],uint group[[threadgroup_position_in_grid]],uint "
+            "sg[[simdgroup_index_in_threadgroup]],uint "
+            "lane[[thread_index_in_simdgroup]]){tile_body<B,SN,TM,true>(x,g,u,gb,ub,y,p,group,sg,lane);}\n"
+            "#define V(B,SN,TM) kernel void proj##B##_##SN##_##TM(device const float*x[[buffer(0)]],device "
+            "const ushort*g[[buffer(1)]],device const float*gb[[buffer(2)]],device "
+            "float*y[[buffer(3)]],constant P&p[[buffer(4)]],uint group[[threadgroup_position_in_grid]],uint "
+            "sg[[simdgroup_index_in_threadgroup]],uint "
+            "lane[[thread_index_in_simdgroup]]){tile_body<B,SN,TM,false>(x,g,g,gb,gb,y,p,group,sg,lane);}\n"
+            "T(2,8,2) T(3,8,2) T(2,8,4) T(3,8,4) T(2,16,2) T(3,16,2)\n"
+            "V(2,8,2) V(3,8,2) V(2,8,4) V(3,8,4)\n"
+            "\n"
+            "V(2,16,2)\n"
+            "V(2,32,1)\n"
+            "V(2,32,2)\n"
+            "V(2,32,4)\n"
+            "V(3,16,2)\n"
+            "V(3,32,1)\n"
+            "V(3,32,2)\n"
+            "V(3,32,4)\n"
+            "V(4,16,2)\n"
+            "V(4,32,1)\n"
+            "V(4,32,2)\n"
+            "V(4,32,4)\n"
+            "V(5,16,2)\n"
+            "V(5,32,1)\n"
+            "V(5,32,2)\n"
+            "V(5,32,4)\n"
+            "V(6,16,2)\n"
+            "V(6,32,1)\n"
+            "V(6,32,2)\n"
+            "V(6,32,4)\n"
+            "V(7,16,2)\n"
+            "V(7,32,1)\n"
+            "V(7,32,2)\n"
+            "V(7,32,4)\n"
+            "V(8,16,2)\n"
+            "V(8,32,1)\n"
+            "V(8,32,2)\n"
+            "V(8,32,4)\n"
+            "T(2,16,4) T(3,16,4)\n"
+            "V(2,16,4) V(3,16,4) V(4,16,4)\n";
+}
 static NSString *ocr_pair_stream_gate_source(void) {
     return @"#include <metal_stdlib>\nusing namespace metal;\nstruct P { uint rows, in_dim, out_dim, pad; "
            @"};\nkernel void gate4(device const float4*x[[buffer(0)]],device const "
@@ -325,6 +489,11 @@ static NSString *ocr_pair_stream_gate_source(void) {
 }
 static id<MTLLibrary> pair_stream_gate_library;
 static id<MTLComputePipelineState> pair_stream_gate, pair_vec2, pair_vec3;
+static id<MTLLibrary> pair_tg_library;
+static id<MTLComputePipelineState> pair_tg4, pair_tg2, pair_tg32;
+static id<MTLLibrary> pair_vector_library;
+static id<MTLComputePipelineState> pair_vector_tiles[11][7];
+static id<MTLComputePipelineState> pair_tg_projections[3];
 static size_t pair_variant;
 static id<MTLLibrary> pair_variant_library, pair_split_library, pair_gate_library;
 static id<MTLComputePipelineState> pair_gate8, pair_gate64;
@@ -332,11 +501,31 @@ static id<MTLComputePipelineState> pair_cached1024, pair_cached2560, pair_exact,
     pair_packed;
 static id<MTLComputePipelineState> pair_norm, pair_segment8, pair_segment16, pair_gate_split,
     pair_gate_reduce;
-void ocr_pair_set_variant(size_t variant) { pair_variant = variant; }
+void ocr_pair_set_variant(size_t variant) {
+    pair_variant = variant;
+    if (variant == 50) setenv("TERMITE_METAL_DISABLE_LIGHTONOCR3_LOCAL_KERNELS", "1", 1);
+    else unsetenv("TERMITE_METAL_DISABLE_LIGHTONOCR3_LOCAL_KERNELS");
+    if (variant == 51) setenv("TERMITE_METAL_DISABLE_LIGHTONOCR3_MERGER_MPP", "1", 1);
+    else unsetenv("TERMITE_METAL_DISABLE_LIGHTONOCR3_MERGER_MPP");
+    if (variant == 63) setenv("TERMITE_METAL_DISABLE_LIGHTONOCR3_PREFILL_PROJECTIONS", "1", 1);
+    else unsetenv("TERMITE_METAL_DISABLE_LIGHTONOCR3_PREFILL_PROJECTIONS");
+}
 size_t ocr_pair_candidate_applies(void *handle) {
     OCRPairCase *c = (__bridge OCRPairCase *)handle;
     if (!c)
         return 0;
+    if(pair_variant>=64&&pair_variant<=106){
+        const bool tiny=(c->in_dim==1024&&c->out_dim==16)||(c->in_dim==2560&&c->out_dim==32);
+        const bool missing=tiny||(c->in_dim==2048&&c->out_dim==1024)||(c->in_dim==1024&&(c->out_dim==2048||c->out_dim==512||c->out_dim==4096))||(c->in_dim==4096&&c->out_dim==2560)||(c->in_dim==2560&&(c->out_dim==4096||c->out_dim==1024));
+        if(pair_variant>=101)return c->kind==0&&missing&&c->rows>=5&&c->rows<=7&&!tiny;
+        if(pair_variant>=95)return c->kind==0&&missing&&c->rows>=2&&c->rows<=8&&!tiny;
+        return c->kind==0&&missing&&c->rows>=((pair_variant==64||pair_variant==65||pair_variant==70)?2:1)&&c->rows<=8&&
+            (pair_variant<68||pair_variant>=70||(tiny&&(pair_variant!=68||c->rows==1)));
+    }
+    if(pair_variant>=56&&pair_variant<=62)return c->kind==0&&c->rows>=32&&c->rows<=2048&&
+        ((c->in_dim==1024&&c->out_dim==16)||(c->in_dim==2560&&c->out_dim==32));
+    if(pair_variant>=52&&pair_variant<=55)return c->kind==0&&c->rows>=32&&c->rows<=2048&&
+        ((c->in_dim==1024&&c->out_dim==16)||(c->in_dim==2560&&c->out_dim==32)||(c->in_dim==2048&&c->out_dim==1024));
     switch (pair_variant) {
     case 1:
         return c->kind == 0 && ((c->rows >= 2 && c->rows <= 3 && c->out_dim <= 9216) ||
@@ -356,6 +545,34 @@ size_t ocr_pair_candidate_applies(void *handle) {
     case 7:
         return c->kind == 3 && ((c->in_dim == 1024 && c->rows >= 2 && c->rows <= 8) ||
                                 (c->in_dim == 2560 && c->rows >= 2 && c->rows <= 7));
+    case 48:
+        return c->kind == 3 && (c->rows == 2 || c->rows == 3);
+    case 49:
+        return c->kind == 0 && c->rows >= 2 && c->rows <= 4 && c->out_dim <= 9216;
+    case 45:
+    case 46:
+    case 47:
+        return c->kind == 0 && c->rows >= 2 && c->rows <= 8 && (c->in_dim == 3584 || c->in_dim == 9216);
+    case 41:
+    case 42:
+    case 43:
+    case 44:
+        return c->kind == 0 && c->rows >= 2 && c->rows <= 8 && c->out_dim <= 9216 &&
+               (c->rows <= 4 || c->in_dim == 3584 || c->in_dim == 9216);
+    case 36:
+    case 37:
+    case 38:
+        return c->kind == 3 && (c->rows == 2 || c->rows == 3);
+    case 39:
+    case 40:
+        return c->kind == 0 && (c->rows == 2 || c->rows == 3) && c->out_dim <= 9216;
+    case 33:
+    case 34:
+    case 35:
+    case 30:
+        return c->kind == 3 && c->rows >= 2 && c->rows <= 8;
+    case 31:
+    case 32:
     case 29:
         return c->kind == 0 && c->rows >= 2 && c->rows <= 7 && c->out_dim <= 9216;
     case 8:
@@ -399,8 +616,535 @@ size_t ocr_pair_candidate_applies(void *handle) {
         return 0;
     }
 }
+static NSString *pair_prefill_source(void){return @""
+ "template<uint S,uint N,uint M> inline void pair_prefill_gate_body(device float*x,device bfloat*w,device float*bias,device float*y,constant Params&p,threadgroup float*tmp,uint2 group,uint sg,uint tid){\n"
+ " const uint chunk=p.in_dim/S,row=group.y*M,col=group.x*N;\n"
+ " tensor<device float,dextents<int,2>,tensor_inline>a(x+sg*chunk,dextents<int,2>(chunk,p.rows),array<int,2>{1,int(p.in_dim)});\n"
+ " tensor<device bfloat,dextents<int,2>,tensor_inline>b(w+sg*chunk,dextents<int,2>(chunk,p.out_dim),array<int,2>{1,int(p.in_dim)});\n"
+ " tensor<threadgroup float,dextents<int,2>,tensor_inline>dest(tmp+sg*M*N,dextents<int,2>(N,M),array<int,2>{1,int(N)});\n"
+ " auto left=a.slice(0,int(row));auto right=b.slice(0,int(col));\n"
+ " constexpr auto desc=matmul2d_descriptor(M,N,dynamic_length_v<int>,false,true,false);matmul2d<desc,execution_simdgroups<1>>op;\n"
+ " auto result=op.template get_destination_cooperative_tensor<decltype(left),decltype(right),float>();op.run(left,right,result);result.store(dest);\n"
+ " threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+ " for(uint i=tid;i<min(M,p.rows-row)*N;i+=S*32){float sum=0;\n"
+ "  #pragma unroll\n"
+ "  for(uint j=0;j<S;j++)sum+=tmp[j*M*N+i];\n"
+ "  uint c=col+i%N;if(c<p.out_dim)y[(row+i/N)*p.out_dim+c]=sum+bias[c];\n"
+ " }\n"
+ "}\n"
+ "#define PN(S,N,M) kernel void pair_prefill_gate##S##_##N##_##M(device float*x[[buffer(0)]],device bfloat*w[[buffer(1)]],device float*b[[buffer(2)]],device float*y[[buffer(3)]],constant Params&p[[buffer(4)]],threadgroup float*tmp[[threadgroup(0)]],uint2 group[[threadgroup_position_in_grid]],uint sg[[simdgroup_index_in_threadgroup]],uint tid[[thread_index_in_threadgroup]]){pair_prefill_gate_body<S,N,M>(x,w,b,y,p,tmp,group,sg,tid);}\n"
+ "PN(4,16,8) PN(8,16,8) PN(16,16,8) PN(8,32,8) PN(16,32,8) PN(8,32,16) PN(16,32,16)\n"
+ "#undef PN\n"
+;}
+static NSString *pair_decode_mma_source(void){return @""
+ "#include <metal_stdlib>\n"
+ "#include <metal_simdgroup_matrix>\n"
+ "using namespace metal;\n"
+ "struct DecodeParams{uint rows,in_dim,out_dim,pad;};\n"
+ "template<uint SG> inline void decode_f32_mma_body(device const float*x,device const ushort*w,device const float*b,device float*y,constant DecodeParams&p,uint group,uint sg,uint tid,threadgroup float*scratch){\n"
+ " const uint N=SG*8,columns=group*N,basecol=columns+sg*8;\n"
+ " for(uint i=tid;i<64;i+=SG*32)scratch[i]=float(i);\n"
+ " threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+ " // Discover the opaque SIMD matrix element coordinates once. All operand\n"
+ " // loads below keep the original F32 activation and BF16 weight values.\n"
+ " simdgroup_float8x8 coord;simdgroup_load(coord,scratch,8u);\n"
+ " uint z0=uint(coord.thread_elements()[0]),z1=uint(coord.thread_elements()[1]);\n"
+ " const uint r0=z0>>3,c0=z0&7,r1=z1>>3,c1=z1&7;\n"
+ " simdgroup_float8x8 acc=make_filled_simdgroup_matrix<float,8>(0.0f);\n"
+ " for(uint k=0;k<p.in_dim;k+=8){\n"
+ "  simdgroup_float8x8 a,v;\n"
+ "  a.thread_elements()[0]=r0<p.rows?x[r0*p.in_dim+k+c0]:0.0f;\n"
+ "  a.thread_elements()[1]=r1<p.rows?x[r1*p.in_dim+k+c1]:0.0f;\n"
+ "  v.thread_elements()[0]=basecol+c0<p.out_dim?as_type<float>(uint(w[(basecol+c0)*p.in_dim+k+r0])<<16):0.0f;\n"
+ "  v.thread_elements()[1]=basecol+c1<p.out_dim?as_type<float>(uint(w[(basecol+c1)*p.in_dim+k+r1])<<16):0.0f;\n"
+ "  simdgroup_multiply_accumulate(acc,a,v,acc);\n"
+ " }\n"
+ " threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+ " simdgroup_store(acc,scratch+sg*8,N);\n"
+ " threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+ " for(uint i=tid;i<p.rows*N;i+=SG*32){uint col=columns+i%N;if(col<p.out_dim)y[(i/N)*p.out_dim+col]=scratch[i]+b[col];}\n"
+ "}\n"
+ "#define DM(SG) kernel void pair_decode_mma##SG(device const float*x[[buffer(0)]],device const ushort*w[[buffer(1)]],device const float*b[[buffer(2)]],device float*y[[buffer(3)]],constant DecodeParams&p[[buffer(4)]],uint group[[threadgroup_position_in_grid]],uint sg[[simdgroup_index_in_threadgroup]],uint tid[[thread_index_in_threadgroup]]){threadgroup float scratch[64*SG];decode_f32_mma_body<SG>(x,w,b,y,p,group,sg,tid,scratch);}\n"
+ "DM(2) DM(4) DM(8)\n"
+ "#undef DM\n"
+;}
+static NSString *pair_decode_nax_source(void){return @""
+ "#include <metal_stdlib>\n"
+ "#include <metal_tensor>\n"
+ "#include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>\n"
+ "using namespace metal;using namespace mpp::tensor_ops;\n"
+ "struct DecodeNaxParams{uint rows,in_dim,out_dim,pad;};\n"
+ "template<uint M,uint N,uint SG> inline void decode_nax_body(device float*x,device bfloat*w,device float*b,device float*y,constant DecodeNaxParams&p,uint2 group){\n"
+ " tensor<device float,dextents<int,2>,tensor_inline>a(x,dextents<int,2>(p.in_dim,p.rows),array<int,2>{1,int(p.in_dim)});\n"
+ " tensor<device bfloat,dextents<int,2>,tensor_inline>wm(w,dextents<int,2>(p.in_dim,p.out_dim),array<int,2>{1,int(p.in_dim)});\n"
+ " tensor<device float,dextents<int,2>,tensor_inline>dest(y,dextents<int,2>(p.out_dim,p.rows),array<int,2>{1,int(p.out_dim)});\n"
+ " auto left=a.slice(0,int(group.y)*M);auto right=wm.slice(0,int(group.x)*N);auto output=dest.slice(int(group.x)*N,int(group.y)*M);\n"
+ " constexpr auto desc=matmul2d_descriptor(M,N,dynamic_length_v<int>,false,true,false);matmul2d<desc,execution_simdgroups<SG>>op;\n"
+ " auto result=op.template get_destination_cooperative_tensor<decltype(left),decltype(right),float>();op.run(left,right,result);\n"
+ " for(ushort i=0;i<result.get_capacity();i++){auto c=result.get_multidimensional_index(i);int col=int(group.x)*N+c[0],row=int(group.y)*M+c[1];if(c[0]>=0&&c[0]<int(N)&&c[1]>=0&&c[1]<int(M)&&col<int(p.out_dim)&&row<int(p.rows))result[i]+=b[col];}\n"
+ " result.store(output);\n"
+ "}\n"
+ "#define DN(N,SG) kernel void pair_decode_nax16_##N##_##SG(device float*x[[buffer(0)]],device bfloat*w[[buffer(1)]],device float*b[[buffer(2)]],device float*y[[buffer(3)]],constant DecodeNaxParams&p[[buffer(4)]],uint2 group[[threadgroup_position_in_grid]]){decode_nax_body<16,N,SG>(x,w,b,y,p,group);}\n"
+ "DN(16,1) DN(32,1) DN(64,1) DN(32,2) DN(64,4)\n"
+ "#undef DN\n"
+;}
+static NSString *pair_decode_split_source(void){return @""
+ "#include <metal_stdlib>\n"
+ "using namespace metal;\n"
+ "struct PairDecodeSplitParams {uint rows,in_dim,out_dim,pad;};\n"
+ "template<uint B,uint S,uint SN,uint TM> inline void pair_decode_split_body(device const float*x,device const ushort*w,device const float*b,device float*y,constant PairDecodeSplitParams&p,uint group,uint sg,uint lane,uint tid,threadgroup float*scratch){\n"
+ " const uint N=(32/SN)*TM,localcol=(lane/SN)*TM,col=group*N+localcol,chunk=p.in_dim/S;\n"
+ " float acc[B][TM];for(uint r=0;r<B;r++)for(uint t=0;t<TM;t++)acc[r][t]=0.0f;\n"
+ " for(uint k=sg*chunk+(lane%SN)*4;k<(sg+1)*chunk;k+=SN*4){\n"
+ "  float4 a[B];for(uint r=0;r<B;r++)a[r]=*((device const float4*)(x+r*p.in_dim+k));\n"
+ "  for(uint t=0;t<TM;t++) {float4 v=float4(0.0f);if(col+t<p.out_dim){ushort4 z=*((device const ushort4*)(w+(col+t)*p.in_dim+k));v=as_type<float4>(uint4(z)<<16);}for(uint r=0;r<B;r++)acc[r][t]+=dot(a[r],v);}\n"
+ " }\n"
+ " for(uint r=0;r<B;r++)for(uint t=0;t<TM;t++){\n"
+ "  float v=acc[r][t];for(uint d=SN/2;d>0;d/=2)v+=simd_shuffle_xor(v,d);\n"
+ "  if(lane%SN==0)scratch[sg*8*N+r*N+localcol+t]=v;\n"
+ " }\n"
+ " threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+ " for(uint i=tid;i<B*N;i+=S*32){uint c=group*N+i%N;if(c<p.out_dim){float v=0.0f;for(uint s=0;s<S;s++)v+=scratch[s*8*N+i];y[(i/N)*p.out_dim+c]=v+b[c];}}\n"
+ "}\n"
+ "#define DS(B,S,SN,TM) kernel void pair_decode_split_##B##_##S##_##SN##_##TM(device const float*x[[buffer(0)]],device const ushort*w[[buffer(1)]],device const float*b[[buffer(2)]],device float*y[[buffer(3)]],constant PairDecodeSplitParams&p[[buffer(4)]],uint group[[threadgroup_position_in_grid]],uint sg[[simdgroup_index_in_threadgroup]],uint lane[[thread_index_in_simdgroup]],uint tid[[thread_index_in_threadgroup]],threadgroup float*scratch[[threadgroup(0)]]){pair_decode_split_body<B,S,SN,TM>(x,w,b,y,p,group,sg,lane,tid,scratch);}\n"
+ "#define DB(B) DS(B,4,4,4) DS(B,8,4,4) DS(B,4,8,4) DS(B,8,8,4)\n"
+ "DB(1) DB(2) DB(3) DB(4) DB(5) DB(6) DB(7) DB(8)\n"
+ "#undef DB\n"
+ "#undef DS\n"
+;}
+static NSString *pair_decode_unroll_source(void){return @""
+ "#include <metal_stdlib>\n"
+ "using namespace metal;\n"
+ "struct PairDecodeSplitParams {uint rows,in_dim,out_dim,pad;};\n"
+ "template<uint B,uint S,uint SN,uint TM> inline void pair_decode_unroll_body(device const float*x,device const ushort*w,device const float*b,device float*y,constant PairDecodeSplitParams&p,uint group,uint sg,uint lane,uint tid,threadgroup float*scratch){\n"
+ " const uint N=(32/SN)*TM,localcol=(lane/SN)*TM,col=group*N+localcol,chunk=p.in_dim/S;\n"
+ " float acc[B][TM];\n"
+ " #pragma unroll\n"
+ " for(uint r=0;r<B;r++){\n"
+ "  #pragma unroll\n"
+ "  for(uint t=0;t<TM;t++)acc[r][t]=0.0f;\n"
+ " }\n"
+ " for(uint k=sg*chunk+(lane%SN)*4;k<(sg+1)*chunk;k+=SN*4){\n"
+ "  float4 a[B];\n"
+ "  #pragma unroll\n"
+ "  for(uint r=0;r<B;r++)a[r]=*((device const float4*)(x+r*p.in_dim+k));\n"
+ "  \n"
+ "  #pragma unroll\n"
+ "  for(uint t=0;t<TM;t++) {float4 v=float4(0.0f);if(col+t<p.out_dim){ushort4 z=*((device const ushort4*)(w+(col+t)*p.in_dim+k));v=as_type<float4>(uint4(z)<<16);}\n"
+ "   #pragma unroll\n"
+ "   for(uint r=0;r<B;r++)acc[r][t]+=dot(a[r],v);}\n"
+ " }\n"
+ " #pragma unroll\n"
+ " for(uint r=0;r<B;r++){\n"
+ "  #pragma unroll\n"
+ "  for(uint t=0;t<TM;t++){\n"
+ "  float v=acc[r][t];\n"
+ "  #pragma unroll\n"
+ "  for(uint d=SN/2;d>0;d/=2)v+=simd_shuffle_xor(v,d);\n"
+ "  if(lane%SN==0)scratch[sg*8*N+r*N+localcol+t]=v;\n"
+ " }\n"
+ " }\n"
+ " threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+ " for(uint i=tid;i<B*N;i+=S*32){uint c=group*N+i%N;if(c<p.out_dim){float v=0.0f;\n"
+ " #pragma unroll\n"
+ " for(uint s=0;s<S;s++)v+=scratch[s*8*N+i];y[(i/N)*p.out_dim+c]=v+b[c];}}\n"
+ "}\n"
+ "#define DS(B,S,SN,TM) kernel void pair_decode_unroll_##B##_##S##_##SN##_##TM(device const float*x[[buffer(0)]],device const ushort*w[[buffer(1)]],device const float*b[[buffer(2)]],device float*y[[buffer(3)]],constant PairDecodeSplitParams&p[[buffer(4)]],uint group[[threadgroup_position_in_grid]],uint sg[[simdgroup_index_in_threadgroup]],uint lane[[thread_index_in_simdgroup]],uint tid[[thread_index_in_threadgroup]],threadgroup float*scratch[[threadgroup(0)]]){pair_decode_unroll_body<B,S,SN,TM>(x,w,b,y,p,group,sg,lane,tid,scratch);}\n"
+ "#define DB(B) DS(B,4,4,4) DS(B,8,4,4) DS(B,8,32,1) DS(B,16,32,1) DS(B,32,32,1) DS(B,16,16,2)\n"
+ "DB(1) DB(2) DB(3) DB(4) DB(5) DB(6) DB(7) DB(8)\n"
+ "#undef DB\n"
+ "#undef DS\n"
+;}
+static NSString *pair_decode_stream_source(void){return @""
+ "#include <metal_stdlib>\n"
+ "using namespace metal;\n"
+ "struct PairStreamParams{uint rows,in_dim,out_dim,pad;};\n"
+ "template<uint B,uint SN,uint U> inline void pair_stream_body(device const float*x,device const ushort*w,device const float*b,device float*y,constant PairStreamParams&p,uint group,uint sg,uint lane){\n"
+ " const uint col=group*4+sg*(32/SN)+lane/SN,kLane=lane%SN;\n"
+ " float acc[B];\n"
+ " #pragma unroll\n"
+ " for(uint r=0;r<B;r++)acc[r]=0.0f;\n"
+ " const uint step=SN*4,block=step*U,full=p.in_dim/block*block;\n"
+ " for(uint base=0;base<full;base+=block){\n"
+ "  float4 weights[U];\n"
+ "  #pragma unroll\n"
+ "  for(uint u=0;u<U;u++)weights[u]=as_type<float4>(uint4(*((device const ushort4*)(w+col*p.in_dim+base+u*step+kLane*4)))<<16);\n"
+ "  #pragma unroll\n"
+ "  for(uint r=0;r<B;r++){\n"
+ "   float partial=0.0f;\n"
+ "   #pragma unroll\n"
+ "   for(uint u=0;u<U;u++)partial+=dot(weights[u],*((device const float4*)(x+r*p.in_dim+base+u*step+kLane*4)));\n"
+ "   acc[r]+=partial;\n"
+ "  }\n"
+ " }\n"
+ " for(uint k=full+kLane*4;k<p.in_dim;k+=step){\n"
+ "  float4 weight=as_type<float4>(uint4(*((device const ushort4*)(w+col*p.in_dim+k)))<<16);\n"
+ "  #pragma unroll\n"
+ "  for(uint r=0;r<B;r++)acc[r]+=dot(weight,*((device const float4*)(x+r*p.in_dim+k)));\n"
+ " }\n"
+ " #pragma unroll\n"
+ " for(uint r=0;r<B;r++){\n"
+ "  float v=acc[r];\n"
+ "  #pragma unroll\n"
+ "  for(uint d=SN/2;d>0;d/=2)v+=simd_shuffle_xor(v,d);\n"
+ "  if(kLane==0)y[r*p.out_dim+col]=v+b[col];\n"
+ " }\n"
+ "}\n"
+ "#define ST(B,SN,U) kernel void pair_stream_##B##_##SN##_##U(device const float*x[[buffer(0)]],device const ushort*w[[buffer(1)]],device const float*b[[buffer(2)]],device float*y[[buffer(3)]],constant PairStreamParams&p[[buffer(4)]],uint group[[threadgroup_position_in_grid]],uint sg[[simdgroup_index_in_threadgroup]],uint lane[[thread_index_in_simdgroup]]){pair_stream_body<B,SN,U>(x,w,b,y,p,group,sg,lane);}\n"
+ "#define SB(B) ST(B,8,4) ST(B,16,4) ST(B,32,4) ST(B,8,8) ST(B,16,8) ST(B,32,8)\n"
+ "SB(1) SB(2) SB(3) SB(4) SB(5) SB(6) SB(7) SB(8)\n"
+ "#undef SB\n"
+ "#undef ST\n"
+;}
+static NSString *pair_decode_chunk_source(void){return @""
+ "#include <metal_stdlib>\n"
+ "using namespace metal;\n"
+ "struct PairChunkParams{uint rows,in_dim,out_dim,pad;};\n"
+ "template<uint B,uint SN,uint TM> inline void pair_chunk_body(device const float*x,device const ushort*w,device const float*b,device float*y,constant PairChunkParams&p,uint2 group,uint sg,uint lane){\n"
+ " const uint start=group.y*B,col=((group.x*4+sg)*(32/SN)+lane/SN)*TM;\n"
+ " float acc[B][TM];\n"
+ " #pragma unroll\n"
+ " for(uint r=0;r<B;r++){\n"
+ "  #pragma unroll\n"
+ "  for(uint t=0;t<TM;t++)acc[r][t]=0.0f;\n"
+ " }\n"
+ " for(uint k=(lane%SN)*4;k<p.in_dim;k+=SN*4){\n"
+ "  float4 a[B];\n"
+ "  #pragma unroll\n"
+ "  for(uint r=0;r<B;r++)a[r]=*((device const float4*)(x+min(start+r,p.rows-1)*p.in_dim+k));\n"
+ "  #pragma unroll\n"
+ "  for(uint t=0;t<TM;t++){\n"
+ "   float4 v=as_type<float4>(uint4(*((device const ushort4*)(w+(col+t)*p.in_dim+k)))<<16);\n"
+ "   #pragma unroll\n"
+ "   for(uint r=0;r<B;r++)acc[r][t]+=dot(a[r],v);\n"
+ "  }\n"
+ " }\n"
+ " #pragma unroll\n"
+ " for(uint r=0;r<B;r++){\n"
+ "  #pragma unroll\n"
+ "  for(uint t=0;t<TM;t++){\n"
+ "   float v=acc[r][t];\n"
+ "   #pragma unroll\n"
+ "   for(uint d=SN/2;d>0;d/=2)v+=simd_shuffle_xor(v,d);\n"
+ "   if(lane%SN==0&&start+r<p.rows)y[(start+r)*p.out_dim+col+t]=v+b[col+t];\n"
+ "  }\n"
+ " }\n"
+ "}\n"
+ "#define CH(B,SN,TM) kernel void pair_chunk_##B##_##SN##_##TM(device const float*x[[buffer(0)]],device const ushort*w[[buffer(1)]],device const float*b[[buffer(2)]],device float*y[[buffer(3)]],constant PairChunkParams&p[[buffer(4)]],uint2 group[[threadgroup_position_in_grid]],uint sg[[simdgroup_index_in_threadgroup]],uint lane[[thread_index_in_simdgroup]]){pair_chunk_body<B,SN,TM>(x,w,b,y,p,group,sg,lane);}\n"
+ "#define CB(B) CH(B,16,2) CH(B,16,4) CH(B,32,4) CH(B,32,8)\n"
+ "CB(1) CB(2) CB(3) CB(4)\n"
+ "#undef CB\n"
+ "#undef CH\n"
+;}
+static NSString *pair_decode_exact_source(void){return @""
+ "#include <metal_stdlib>\n"
+ "using namespace metal;\n"
+ "struct PairChunkParams{uint rows,in_dim,out_dim,pad;};\n"
+ "template<uint B,uint SN,uint TM> inline void pair_exact_body(device const float*x,device const ushort*w,device const float*b,device float*y,constant PairChunkParams&p,uint2 group,uint sg,uint lane){\n"
+ " const uint start=group.y*B,col=((group.x*4+sg)*(32/SN)+lane/SN)*TM;\n"
+ " float acc[B][TM];\n"
+ " #pragma unroll\n"
+ " for(uint r=0;r<B;r++){\n"
+ "  #pragma unroll\n"
+ "  for(uint t=0;t<TM;t++)acc[r][t]=0.0f;\n"
+ " }\n"
+ " for(uint k=(lane%SN)*4;k<p.in_dim;k+=SN*4){\n"
+ "  float4 a[B];\n"
+ "  #pragma unroll\n"
+ "  for(uint r=0;r<B;r++)a[r]=*((device const float4*)(x+min(start+r,p.rows-1)*p.in_dim+k));\n"
+ "  #pragma unroll\n"
+ "  for(uint t=0;t<TM;t++){\n"
+ "   float4 v=as_type<float4>(uint4(*((device const ushort4*)(w+(col+t)*p.in_dim+k)))<<16);\n"
+ "   #pragma unroll\n"
+ "   for(uint r=0;r<B;r++)acc[r][t]+=dot(a[r],v);\n"
+ "  }\n"
+ " }\n"
+ " #pragma unroll\n"
+ " for(uint r=0;r<B;r++){\n"
+ "  #pragma unroll\n"
+ "  for(uint t=0;t<TM;t++){\n"
+ "   float v=acc[r][t];\n"
+ "   #pragma unroll\n"
+ "   for(uint d=SN/2;d>0;d/=2)v+=simd_shuffle_xor(v,d);\n"
+ "   if(lane%SN==0&&start+r<p.rows)y[(start+r)*p.out_dim+col+t]=v+b[col+t];\n"
+ "  }\n"
+ " }\n"
+ "}\n"
+ "\n"
+ "template<uint R,uint CAP,uint SN,uint TM> inline void pair_exact_dispatch(device const float*x,device const ushort*w,device const float*b,device float*y,constant PairChunkParams&p,uint2 group,uint sg,uint lane){\n"
+ " if constexpr(R>CAP && R%CAP!=0){\n"
+ "  if(group.y==R/CAP){const uint start=R/CAP*CAP;pair_exact_body<R%CAP,SN,TM>(x+start*p.in_dim,w,b,y+start*p.out_dim,p,uint2(group.x,0),sg,lane);return;}\n"
+ " }\n"
+ " pair_exact_body<(R<CAP?R:CAP),SN,TM>(x,w,b,y,p,group,sg,lane);\n"
+ "}\n"
+ "#define EX(R,CAP,SN,TM) kernel void pair_exact_##R##_##CAP##_##SN##_##TM(device const float*x[[buffer(0)]],device const ushort*w[[buffer(1)]],device const float*b[[buffer(2)]],device float*y[[buffer(3)]],constant PairChunkParams&p[[buffer(4)]],uint2 group[[threadgroup_position_in_grid]],uint sg[[simdgroup_index_in_threadgroup]],uint lane[[thread_index_in_simdgroup]]){pair_exact_dispatch<R,CAP,SN,TM>(x,w,b,y,p,group,sg,lane);}\n"
+ "#define EB(R) EX(R,4,16,2) EX(R,4,16,4) EX(R,4,32,4) EX(R,4,32,8) EX(R,2,16,4) EX(R,2,32,8)\n"
+ "EB(5) EB(6) EB(7)\n"
+ "#undef EB\n"
+ "#undef EX\n"
+;}
 static int ocr_pair_encode_candidate(OCRPairCase *c) {
+    if(pair_variant>=101&&pair_variant<=106){
+        static id<MTLComputePipelineState>pipelines[6][3];termite_metal_decode_runtime*r=pair_runtime;
+        const size_t caps[6]={4,4,4,4,2,2},lanes[6]={16,16,32,32,16,32},tiles[6]={2,4,4,8,4,8};
+        if(!pipelines[0][0]){MTLCompileOptions*o=[MTLCompileOptions new];o.languageVersion=MTLLanguageVersion4_0;o.mathMode=MTLMathModeFast;NSError*err=nil;
+          id<MTLLibrary>lib=[r->device newLibraryWithSource:pair_decode_exact_source() options:o error:&err];if(!lib){fprintf(stderr,"decode exact: %s\n",err.localizedDescription.UTF8String);return -1;}
+          for(size_t j=0;j<6;j++)for(size_t i=0;i<3;i++)pipelines[j][i]=termite_metal_make_pipeline(r->device,lib,[NSString stringWithFormat:@"pair_exact_%zu_%zu_%zu_%zu",i+5,caps[j],lanes[j],tiles[j]]);
+        }
+        size_t index=pair_variant-101,B=caps[index],N=4*(32/lanes[index])*tiles[index];id<MTLComputePipelineState>pipe=pipelines[index][c->rows-5];
+        if(!pipe||pipe.maxTotalThreadsPerThreadgroup<128)return -1;
+        termite_metal_decode_runtime_close_planned_compute_encoder_for_transition(r);
+        id<MTLComputeCommandEncoder>e=termite_metal_tracked_compute_command_encoder_for(r->active_frame_cb,TERMITE_METAL_COMPUTE_SOURCE_DENSE_LINEAR);if(!e)return -1;
+        termite_metal_linear_params p={(uint32_t)c->rows,(uint32_t)c->in_dim,(uint32_t)c->out_dim,0};[e setComputePipelineState:pipe];[e setBuffer:c->input offset:0 atIndex:0];[e setBuffer:r->linear_weight_buffers[0] offset:0 atIndex:1];[e setBuffer:r->linear_bias_buffers[0] offset:0 atIndex:2];[e setBuffer:c->output offset:0 atIndex:3];[e setBytes:&p length:sizeof(p) atIndex:4];[e dispatchThreadgroups:MTLSizeMake(c->out_dim/N,(c->rows+B-1)/B,1) threadsPerThreadgroup:MTLSizeMake(128,1,1)];[e endEncoding];return 0;
+    }
+    if(pair_variant>=95&&pair_variant<=100){
+        static id<MTLComputePipelineState>pipelines[4][4];termite_metal_decode_runtime*r=pair_runtime;
+        const size_t lanes[4]={16,16,32,32},tiles[4]={2,4,4,8};
+        if(!pipelines[0][0]){MTLCompileOptions*o=[MTLCompileOptions new];o.languageVersion=MTLLanguageVersion4_0;o.mathMode=MTLMathModeFast;NSError*err=nil;
+          id<MTLLibrary>lib=[r->device newLibraryWithSource:pair_decode_chunk_source() options:o error:&err];if(!lib){fprintf(stderr,"decode chunk: %s\n",err.localizedDescription.UTF8String);return -1;}
+          for(size_t j=0;j<4;j++)for(size_t i=0;i<4;i++)pipelines[j][i]=termite_metal_make_pipeline(r->device,lib,[NSString stringWithFormat:@"pair_chunk_%zu_%zu_%zu",i+1,lanes[j],tiles[j]]);
+        }
+        size_t variant=pair_variant-95,index=variant<4?variant:variant==4?1:3,B=MIN(c->rows,variant<4?(size_t)4:(size_t)2),N=4*(32/lanes[index])*tiles[index];id<MTLComputePipelineState>pipe=pipelines[index][B-1];
+        if(!pipe||pipe.maxTotalThreadsPerThreadgroup<128)return -1;
+        termite_metal_decode_runtime_close_planned_compute_encoder_for_transition(r);
+        id<MTLComputeCommandEncoder>e=termite_metal_tracked_compute_command_encoder_for(r->active_frame_cb,TERMITE_METAL_COMPUTE_SOURCE_DENSE_LINEAR);if(!e)return -1;
+        termite_metal_linear_params p={(uint32_t)c->rows,(uint32_t)c->in_dim,(uint32_t)c->out_dim,0};[e setComputePipelineState:pipe];[e setBuffer:c->input offset:0 atIndex:0];[e setBuffer:r->linear_weight_buffers[0] offset:0 atIndex:1];[e setBuffer:r->linear_bias_buffers[0] offset:0 atIndex:2];[e setBuffer:c->output offset:0 atIndex:3];[e setBytes:&p length:sizeof(p) atIndex:4];[e dispatchThreadgroups:MTLSizeMake(c->out_dim/N,(c->rows+B-1)/B,1) threadsPerThreadgroup:MTLSizeMake(128,1,1)];[e endEncoding];return 0;
+    }
+    if(pair_variant>=89&&pair_variant<=94){
+        static id<MTLComputePipelineState>pipelines[6][8];termite_metal_decode_runtime*r=pair_runtime;
+        if(!pipelines[0][0]){MTLCompileOptions*o=[MTLCompileOptions new];o.languageVersion=MTLLanguageVersion4_0;o.mathMode=MTLMathModeFast;NSError*err=nil;
+          id<MTLLibrary>lib=[r->device newLibraryWithSource:pair_decode_stream_source() options:o error:&err];if(!lib){fprintf(stderr,"decode stream: %s\n",err.localizedDescription.UTF8String);return -1;}
+          for(size_t j=0;j<6;j++)for(size_t i=0;i<8;i++)pipelines[j][i]=termite_metal_make_pipeline(r->device,lib,[NSString stringWithFormat:@"pair_stream_%zu_%zu_%zu",i+1,(size_t)8<<(j%3),j<3?(size_t)4:(size_t)8]);
+        }
+        size_t index=pair_variant-89,SN=8<<(index%3),threads=SN*4;id<MTLComputePipelineState>pipe=pipelines[index][c->rows-1];
+        if(!pipe||pipe.maxTotalThreadsPerThreadgroup<threads)return -1;
+        termite_metal_decode_runtime_close_planned_compute_encoder_for_transition(r);
+        id<MTLComputeCommandEncoder>e=termite_metal_tracked_compute_command_encoder_for(r->active_frame_cb,TERMITE_METAL_COMPUTE_SOURCE_DENSE_LINEAR);if(!e)return -1;
+        termite_metal_linear_params p={(uint32_t)c->rows,(uint32_t)c->in_dim,(uint32_t)c->out_dim,0};[e setComputePipelineState:pipe];[e setBuffer:c->input offset:0 atIndex:0];[e setBuffer:r->linear_weight_buffers[0] offset:0 atIndex:1];[e setBuffer:r->linear_bias_buffers[0] offset:0 atIndex:2];[e setBuffer:c->output offset:0 atIndex:3];[e setBytes:&p length:sizeof(p) atIndex:4];[e dispatchThreadgroups:MTLSizeMake(c->out_dim/4,1,1) threadsPerThreadgroup:MTLSizeMake(threads,1,1)];[e endEncoding];return 0;
+    }
+    if(pair_variant>=83&&pair_variant<=88){
+        static id<MTLComputePipelineState>pipelines[6][8];termite_metal_decode_runtime*r=pair_runtime;
+        const size_t splits[6]={4,8,8,16,32,16},lanes[6]={4,4,32,32,32,16},tiles[6]={4,4,1,1,1,2};
+        if(!pipelines[0][0]){MTLCompileOptions*o=[MTLCompileOptions new];o.languageVersion=MTLLanguageVersion4_0;o.mathMode=MTLMathModeFast;NSError*err=nil;
+          id<MTLLibrary>lib=[r->device newLibraryWithSource:pair_decode_unroll_source() options:o error:&err];if(!lib){fprintf(stderr,"decode unroll: %s\n",err.localizedDescription.UTF8String);return -1;}
+          for(size_t j=0;j<6;j++)for(size_t i=0;i<8;i++)pipelines[j][i]=termite_metal_make_pipeline(r->device,lib,[NSString stringWithFormat:@"pair_decode_unroll_%zu_%zu_%zu_%zu",i+1,splits[j],lanes[j],tiles[j]]);
+        }
+        size_t index=pair_variant-83,S=splits[index],N=(32/lanes[index])*tiles[index];id<MTLComputePipelineState>pipe=pipelines[index][c->rows-1];
+        if(!pipe||pipe.maxTotalThreadsPerThreadgroup<S*32)return -1;
+        termite_metal_decode_runtime_close_planned_compute_encoder_for_transition(r);
+        id<MTLComputeCommandEncoder>e=termite_metal_tracked_compute_command_encoder_for(r->active_frame_cb,TERMITE_METAL_COMPUTE_SOURCE_DENSE_LINEAR);if(!e)return -1;
+        termite_metal_linear_params p={(uint32_t)c->rows,(uint32_t)c->in_dim,(uint32_t)c->out_dim,0};[e setComputePipelineState:pipe];[e setBuffer:c->input offset:0 atIndex:0];[e setBuffer:r->linear_weight_buffers[0] offset:0 atIndex:1];[e setBuffer:r->linear_bias_buffers[0] offset:0 atIndex:2];[e setBuffer:c->output offset:0 atIndex:3];[e setBytes:&p length:sizeof(p) atIndex:4];[e setThreadgroupMemoryLength:S*8*N*sizeof(float) atIndex:0];[e dispatchThreadgroups:MTLSizeMake((c->out_dim+N-1)/N,1,1) threadsPerThreadgroup:MTLSizeMake(S*32,1,1)];[e endEncoding];return 0;
+    }
+    if(pair_variant>=79&&pair_variant<=82){
+        static id<MTLComputePipelineState>pipelines[4][8];termite_metal_decode_runtime*r=pair_runtime;
+        if(!pipelines[0][0]){MTLCompileOptions*o=[MTLCompileOptions new];o.languageVersion=MTLLanguageVersion4_0;o.mathMode=MTLMathModeFast;NSError*err=nil;
+          id<MTLLibrary>lib=[r->device newLibraryWithSource:pair_decode_split_source() options:o error:&err];if(!lib){fprintf(stderr,"decode split: %s\n",err.localizedDescription.UTF8String);return -1;}
+          for(size_t j=0;j<4;j++)for(size_t i=0;i<8;i++)pipelines[j][i]=termite_metal_make_pipeline(r->device,lib,[NSString stringWithFormat:@"pair_decode_split_%zu_%zu_%zu_4",i+1,j%2?(size_t)8:(size_t)4,j<2?(size_t)4:(size_t)8]);
+        }
+        size_t index=pair_variant-79,S=index%2?8:4,N=index<2?32:16;id<MTLComputePipelineState>pipe=pipelines[index][c->rows-1];
+        if(!pipe||pipe.maxTotalThreadsPerThreadgroup<S*32)return -1;
+        termite_metal_decode_runtime_close_planned_compute_encoder_for_transition(r);
+        id<MTLComputeCommandEncoder>e=termite_metal_tracked_compute_command_encoder_for(r->active_frame_cb,TERMITE_METAL_COMPUTE_SOURCE_DENSE_LINEAR);if(!e)return -1;
+        termite_metal_linear_params p={(uint32_t)c->rows,(uint32_t)c->in_dim,(uint32_t)c->out_dim,0};[e setComputePipelineState:pipe];[e setBuffer:c->input offset:0 atIndex:0];[e setBuffer:r->linear_weight_buffers[0] offset:0 atIndex:1];[e setBuffer:r->linear_bias_buffers[0] offset:0 atIndex:2];[e setBuffer:c->output offset:0 atIndex:3];[e setBytes:&p length:sizeof(p) atIndex:4];[e setThreadgroupMemoryLength:S*8*N*sizeof(float) atIndex:0];[e dispatchThreadgroups:MTLSizeMake((c->out_dim+N-1)/N,1,1) threadsPerThreadgroup:MTLSizeMake(S*32,1,1)];[e endEncoding];return 0;
+    }
+    if(pair_variant==76){size_t saved=pair_variant;pair_variant=52;int rc=ocr_pair_encode_candidate(c);pair_variant=saved;return rc;}
+    if(pair_variant>=73&&pair_variant<=78){
+        static id<MTLComputePipelineState>pipelines[5];termite_metal_decode_runtime*r=pair_runtime;
+        if(!pipelines[0]){MTLCompileOptions*o=[MTLCompileOptions new];o.languageVersion=MTLLanguageVersion4_0;o.mathMode=MTLMathModeSafe;NSError*err=nil;
+          id<MTLLibrary>lib=[r->device newLibraryWithSource:pair_decode_nax_source() options:o error:&err];if(!lib){fprintf(stderr,"decode NAX: %s\n",err.localizedDescription.UTF8String);return -1;}
+          const size_t ns[5]={16,32,64,32,64},sgs[5]={1,1,1,2,4};for(size_t i=0;i<5;i++)pipelines[i]=termite_metal_make_pipeline(r->device,lib,[NSString stringWithFormat:@"pair_decode_nax16_%zu_%zu",ns[i],sgs[i]]);
+        }
+        size_t index=pair_variant<=75?pair_variant-73:pair_variant-74,N=index==0?16:index==1||index==3?32:64,SG=index<3?1:index==3?2:4;id<MTLComputePipelineState>pipe=pipelines[index];
+        if(!pipe||pipe.maxTotalThreadsPerThreadgroup<SG*32)return -1;
+        termite_metal_decode_runtime_close_planned_compute_encoder_for_transition(r);
+        id<MTLComputeCommandEncoder>e=termite_metal_tracked_compute_command_encoder_for(r->active_frame_cb,TERMITE_METAL_COMPUTE_SOURCE_DENSE_LINEAR);if(!e)return -1;
+        termite_metal_linear_params p={(uint32_t)c->rows,(uint32_t)c->in_dim,(uint32_t)c->out_dim,0};[e setComputePipelineState:pipe];[e setBuffer:c->input offset:0 atIndex:0];[e setBuffer:r->linear_weight_buffers[0] offset:0 atIndex:1];[e setBuffer:r->linear_bias_buffers[0] offset:0 atIndex:2];[e setBuffer:c->output offset:0 atIndex:3];[e setBytes:&p length:sizeof(p) atIndex:4];[e dispatchThreadgroups:MTLSizeMake((c->out_dim+N-1)/N,1,1) threadsPerThreadgroup:MTLSizeMake(SG*32,1,1)];[e endEncoding];return 0;
+    }
+    if(pair_variant>=70&&pair_variant<=72){
+        termite_metal_decode_runtime*r=pair_runtime;size_t columns=pair_variant==70?(c->rows<=4?2:4):c->out_dim==16?16:c->out_dim==32?32:pair_variant==71?32:64,threads=pair_variant==70?32:columns/8*32;
+        id<MTLComputePipelineState>pipe=nil;
+        if(pair_variant==70)pipe=r->lightonocr3_tiled_pipelines[c->rows];
+        else{static id<MTLComputePipelineState>pipelines[3];if(!pipelines[0]){MTLCompileOptions*o=[MTLCompileOptions new];o.languageVersion=MTLLanguageVersion4_0;o.mathMode=MTLMathModeFast;NSError*err=nil;
+            id<MTLLibrary>lib=[r->device newLibraryWithSource:pair_decode_mma_source() options:o error:&err];if(!lib){fprintf(stderr,"decode MMA: %s\n",err.localizedDescription.UTF8String);return -1;}
+            for(size_t i=0;i<3;i++)pipelines[i]=termite_metal_make_pipeline(r->device,lib,[NSString stringWithFormat:@"pair_decode_mma%zu",2ul<<i]);}
+            pipe=pipelines[columns==16?0:columns==32?1:2];}
+        if(!pipe||pipe.maxTotalThreadsPerThreadgroup<threads)return -1;
+        termite_metal_decode_runtime_close_planned_compute_encoder_for_transition(r);
+        id<MTLComputeCommandEncoder>e=termite_metal_tracked_compute_command_encoder_for(r->active_frame_cb,TERMITE_METAL_COMPUTE_SOURCE_DENSE_LINEAR);if(!e)return -1;
+        termite_metal_linear_params p={(uint32_t)c->rows,(uint32_t)c->in_dim,(uint32_t)c->out_dim,0};[e setComputePipelineState:pipe];[e setBuffer:c->input offset:0 atIndex:0];[e setBuffer:r->linear_weight_buffers[0] offset:0 atIndex:1];[e setBuffer:r->linear_bias_buffers[0] offset:0 atIndex:2];[e setBuffer:c->output offset:0 atIndex:3];[e setBytes:&p length:sizeof(p) atIndex:4];[e dispatchThreadgroups:MTLSizeMake((c->out_dim+columns-1)/columns,1,1) threadsPerThreadgroup:MTLSizeMake(threads,1,1)];[e endEncoding];return 0;
+    }
+    if(pair_variant>=64&&pair_variant<=68){
+        const size_t saved=pair_variant;pair_variant=saved==64?41:saved==65?44:saved==66?55:saved==67?54:6;
+        int rc=ocr_pair_encode_candidate(c);pair_variant=saved;return rc;
+    }
+    if(pair_variant==69){
+        termite_metal_decode_runtime*r=pair_runtime;size_t S=c->out_dim==16?8:16,N=c->out_dim==16?16:32;
+        id<MTLComputePipelineState>pipe=N==16?r->lightonocr3_prefill_gate8_16:r->lightonocr3_prefill_gate16_32;
+        if(!pipe||pipe.maxTotalThreadsPerThreadgroup<S*32)return -1;
+        termite_metal_decode_runtime_close_planned_compute_encoder_for_transition(r);
+        id<MTLComputeCommandEncoder>e=termite_metal_tracked_compute_command_encoder_for(r->active_frame_cb,TERMITE_METAL_COMPUTE_SOURCE_DENSE_LINEAR);if(!e)return -1;
+        termite_metal_linear_params p={(uint32_t)c->rows,(uint32_t)c->in_dim,(uint32_t)c->out_dim,0};
+        [e setComputePipelineState:pipe];[e setBuffer:c->input offset:0 atIndex:0];[e setBuffer:r->linear_weight_buffers[0] offset:0 atIndex:1];[e setBuffer:r->linear_bias_buffers[0] offset:0 atIndex:2];[e setBuffer:c->output offset:0 atIndex:3];[e setBytes:&p length:sizeof(p) atIndex:4];[e setThreadgroupMemoryLength:S*8*N*4 atIndex:0];[e dispatchThreadgroups:MTLSizeMake(1,1,1) threadsPerThreadgroup:MTLSizeMake(S*32,1,1)];[e endEncoding];return 0;
+    }
+    if(pair_variant>=56&&pair_variant<=62){
+        static id<MTLComputePipelineState>pipelines[7];termite_metal_decode_runtime*r=pair_runtime;
+        if(!pipelines[0]){MTLCompileOptions*o=[MTLCompileOptions new];o.languageVersion=MTLLanguageVersion4_0;o.mathMode=MTLMathModeSafe;NSError*err=nil;
+            id<MTLLibrary>lib=[r->device newLibraryWithSource:[termite_metal_lightonocr3_tensor_source() stringByAppendingString:pair_prefill_source()] options:o error:&err];
+            if(!lib){fprintf(stderr,"prefill TG: %s\n",err.localizedDescription.UTF8String);return -1;}
+            for(size_t i=0;i<7;i++)pipelines[i]=termite_metal_make_pipeline(r->device,lib,[NSString stringWithFormat:@"pair_prefill_gate%zu_%zu_%zu",i<3?4ul<<i:8ul<<((i-3)%2),i<3?16ul:32ul,i<5?8ul:16ul]);
+        }
+        size_t index=pair_variant-56,S=index<3?4ul<<index:8ul<<((index-3)%2),N=index<3?16:32,M=index<5?8:16;id<MTLComputePipelineState>pipe=pipelines[index];
+        if(!pipe||pipe.maxTotalThreadsPerThreadgroup<S*32||S*M*N*4>r->device.maxThreadgroupMemoryLength)return -1;
+        termite_metal_decode_runtime_close_planned_compute_encoder_for_transition(r);
+        id<MTLComputeCommandEncoder>e=termite_metal_tracked_compute_command_encoder_for(r->active_frame_cb,TERMITE_METAL_COMPUTE_SOURCE_DENSE_LINEAR);if(!e)return -1;
+        termite_metal_linear_params p={(uint32_t)c->rows,(uint32_t)c->in_dim,(uint32_t)c->out_dim,0};
+        [e setComputePipelineState:pipe];[e setBuffer:c->input offset:0 atIndex:0];[e setBuffer:r->linear_weight_buffers[0] offset:0 atIndex:1];[e setBuffer:r->linear_bias_buffers[0] offset:0 atIndex:2];[e setBuffer:c->output offset:0 atIndex:3];[e setBytes:&p length:sizeof(p) atIndex:4];[e setThreadgroupMemoryLength:S*M*N*4 atIndex:0];
+        [e dispatchThreadgroups:MTLSizeMake((c->out_dim+N-1)/N,(c->rows+M-1)/M,1) threadsPerThreadgroup:MTLSizeMake(S*32,1,1)];[e endEncoding];return 0;
+    }
+    if(pair_variant>=52&&pair_variant<=55){
+        termite_metal_decode_runtime*r=pair_runtime;
+        id<MTLComputePipelineState>pipe=pair_variant==52?r->lightonocr3_mpp_f32_pipeline:pair_variant==53?r->lightonocr3_mpp_f32_n32_pipeline:pair_variant==54?r->lightonocr3_mpp_small_tile_pipeline:r->lightonocr3_mpp_four_row_pipeline;
+        size_t tm=pair_variant==52?32:pair_variant==53?64:8,tn=pair_variant==52?64:pair_variant==55?16:32,threads=pair_variant>=54?32:128;
+        if(!pipe||pipe.maxTotalThreadsPerThreadgroup<threads)return -1;
+        termite_metal_decode_runtime_close_planned_compute_encoder_for_transition(r);
+        id<MTLComputeCommandEncoder>e=termite_metal_tracked_compute_command_encoder_for(r->active_frame_cb,TERMITE_METAL_COMPUTE_SOURCE_DENSE_LINEAR);if(!e)return -1;
+        termite_metal_linear_params p={(uint32_t)c->rows,(uint32_t)c->in_dim,(uint32_t)c->out_dim,0};
+        [e setComputePipelineState:pipe];[e setBuffer:c->input offset:0 atIndex:0];[e setBuffer:r->linear_weight_buffers[0] offset:0 atIndex:1];[e setBuffer:r->linear_bias_buffers[0] offset:0 atIndex:2];[e setBuffer:c->output offset:0 atIndex:3];[e setBytes:&p length:sizeof(p) atIndex:4];
+        [e dispatchThreadgroups:MTLSizeMake((c->out_dim+tn-1)/tn,(c->rows+tm-1)/tm,1) threadsPerThreadgroup:MTLSizeMake(threads,1,1)];[e endEncoding];return 0;
+    }
     termite_metal_decode_runtime *r = pair_runtime;
+    if (pair_variant >= 45 && pair_variant <= 47) {
+        if (!pair_tg_library) {
+            MTLCompileOptions *opt = [MTLCompileOptions new];
+            opt.languageVersion = MTLLanguageVersion4_0;
+            opt.mathMode = MTLMathModeSafe;
+            NSError *err = nil;
+            pair_tg_library = [r->device newLibraryWithSource:ocr_pair_tg_gate_source()
+                                                      options:opt
+                                                        error:&err];
+            if (!pair_tg_library) {
+                fprintf(stderr, "TG projection: %s\n", err.localizedDescription.UTF8String);
+                return -1;
+            }
+        }
+        const size_t index = pair_variant - 45, splits = index == 2 ? 16 : 8, columns = index == 1 ? 32 : 16;
+        id<MTLComputePipelineState> pipe = pair_tg_projections[index];
+        if (!pipe) {
+            pipe = termite_metal_make_pipeline(
+                r->device, pair_tg_library, [NSString stringWithFormat:@"tg_proj%zu_%zu", splits, columns]);
+            pair_tg_projections[index] = pipe;
+        }
+        if (!pipe || pipe.maxTotalThreadsPerThreadgroup < splits * 32)
+            return -1;
+        id<MTLComputeCommandEncoder> e = termite_metal_tracked_compute_command_encoder_for(
+            r->active_frame_cb, TERMITE_METAL_COMPUTE_SOURCE_OTHER);
+        if (!e)
+            return -1;
+        termite_metal_linear_params p = {(uint32_t)c->rows, (uint32_t)c->in_dim, (uint32_t)c->out_dim, 0};
+        [e setComputePipelineState:pipe];
+        [e setBuffer:c->input offset:0 atIndex:0];
+        [e setBuffer:r->linear_weight_buffers[0] offset:0 atIndex:1];
+        [e setBuffer:r->linear_bias_buffers[0] offset:0 atIndex:2];
+        [e setBuffer:c->output offset:0 atIndex:3];
+        [e setBytes:&p length:sizeof(p) atIndex:4];
+        [e setThreadgroupMemoryLength:splits * 8 * columns * 4 atIndex:0];
+        [e dispatchThreadgroups:MTLSizeMake(c->out_dim / columns, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(splits * 32, 1, 1)];
+        [e endEncoding];
+        return 0;
+    }
+    if ((pair_variant >= 36 && pair_variant <= 44) || pair_variant == 48 || pair_variant == 49) {
+        if (!pair_vector_library) {
+            MTLCompileOptions *opt = [MTLCompileOptions new];
+            opt.languageVersion = MTLLanguageVersion4_0;
+            opt.mathMode = MTLMathModeFast;
+            NSError *err = nil;
+            pair_vector_library = [r->device newLibraryWithSource:ocr_pair_vector_tile_source()
+                                                          options:opt
+                                                            error:&err];
+            if (!pair_vector_library) {
+                fprintf(stderr, "vector tile: %s\n", err.localizedDescription.UTF8String);
+                return -1;
+            }
+        }
+        const size_t v = pair_variant == 48 ? 9 : pair_variant == 49 ? 10 : pair_variant - 36;
+        const size_t sn = v == 2 || v == 5 || v >= 9 ? 16 : v >= 6 ? 32 : 8;
+        const size_t tm = v == 1 || v == 4 || v == 8 || v >= 9 ? 4 : v == 6 ? 1 : 2;
+        id<MTLComputePipelineState> pipe = pair_vector_tiles[v][c->rows - 2];
+        if (!pipe) {
+            NSString *name = [NSString
+                stringWithFormat:@"%s%zu_%zu_%zu", (v < 3 || v == 9) ? "tile" : "proj", c->rows, sn, tm];
+            pipe = termite_metal_make_pipeline(r->device, pair_vector_library, name);
+            pair_vector_tiles[v][c->rows - 2] = pipe;
+        }
+        if (!pipe || pipe.maxTotalThreadsPerThreadgroup < 128)
+            return -1;
+        id<MTLComputeCommandEncoder> e = termite_metal_tracked_compute_command_encoder_for(
+            r->active_frame_cb, TERMITE_METAL_COMPUTE_SOURCE_OTHER);
+        if (!e)
+            return -1;
+        termite_metal_linear_params p = {(uint32_t)c->rows, (uint32_t)c->in_dim, (uint32_t)c->out_dim, 0};
+        [e setComputePipelineState:pipe];
+        [e setBuffer:c->input offset:0 atIndex:0];
+        [e setBuffer:r->linear_weight_buffers[0] offset:0 atIndex:1];
+        if (v < 3 || v == 9) {
+            [e setBuffer:r->linear_weight_buffers[1] offset:0 atIndex:2];
+            [e setBuffer:r->linear_bias_buffers[0] offset:0 atIndex:3];
+            [e setBuffer:r->linear_bias_buffers[1] offset:0 atIndex:4];
+            [e setBuffer:c->output offset:0 atIndex:5];
+            [e setBytes:&p length:sizeof(p) atIndex:6];
+        } else {
+            [e setBuffer:r->linear_bias_buffers[0] offset:0 atIndex:2];
+            [e setBuffer:c->output offset:0 atIndex:3];
+            [e setBytes:&p length:sizeof(p) atIndex:4];
+        }
+        [e dispatchThreadgroups:MTLSizeMake(c->out_dim / (4 * (32 / sn) * tm), 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+        [e endEncoding];
+        return 0;
+    }
+    if (pair_variant >= 33 && pair_variant <= 35) {
+        if (!pair_tg_library) {
+            MTLCompileOptions *opt = [MTLCompileOptions new];
+            opt.languageVersion = MTLLanguageVersion4_0;
+            opt.mathMode = MTLMathModeSafe;
+            NSError *err = nil;
+            pair_tg_library = [r->device newLibraryWithSource:ocr_pair_tg_gate_source()
+                                                      options:opt
+                                                        error:&err];
+            if (!pair_tg_library) {
+                fprintf(stderr, "TG gate: %s\n", err.localizedDescription.UTF8String);
+                return -1;
+            }
+            pair_tg4 = termite_metal_make_pipeline(r->device, pair_tg_library, @"tg_gate4_16");
+            pair_tg2 = termite_metal_make_pipeline(r->device, pair_tg_library, @"tg_gate2_16");
+            pair_tg32 = termite_metal_make_pipeline(r->device, pair_tg_library, @"tg_gate4_32");
+        }
+        id<MTLComputePipelineState> pipe = pair_variant == 33   ? pair_tg4
+                                           : pair_variant == 34 ? pair_tg2
+                                                                : pair_tg32;
+        const size_t splits = pair_variant == 34 ? 2 : 4, columns = pair_variant == 35 ? 32 : 16;
+        if (!pipe || pipe.maxTotalThreadsPerThreadgroup < splits * 32)
+            return -1;
+        id<MTLComputeCommandEncoder> e = termite_metal_tracked_compute_command_encoder_for(
+            r->active_frame_cb, TERMITE_METAL_COMPUTE_SOURCE_OTHER);
+        if (!e)
+            return -1;
+        termite_metal_linear_params p = {(uint32_t)c->rows, (uint32_t)c->in_dim, (uint32_t)c->out_dim, 0};
+        [e setComputePipelineState:pipe];
+        [e setBuffer:c->input offset:0 atIndex:0];
+        [e setBuffer:r->linear_weight_buffers[0] offset:0 atIndex:1];
+        [e setBuffer:r->linear_weight_buffers[1] offset:0 atIndex:2];
+        [e setBuffer:r->linear_bias_buffers[0] offset:0 atIndex:3];
+        [e setBuffer:r->linear_bias_buffers[1] offset:0 atIndex:4];
+        [e setBuffer:c->output offset:0 atIndex:5];
+        [e setBytes:&p length:sizeof(p) atIndex:6];
+        [e setThreadgroupMemoryLength:2 * splits * 8 * columns * 4 atIndex:0];
+        [e dispatchThreadgroups:MTLSizeMake(c->out_dim / columns, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(splits * 32, 1, 1)];
+        [e endEncoding];
+        return 0;
+    }
     if ((pair_variant == 22 || pair_variant == 26 || pair_variant == 27) && !pair_stream_gate_library) {
         MTLCompileOptions *options = [MTLCompileOptions new];
         options.mathMode = MTLMathModeFast;
@@ -477,7 +1221,7 @@ static int ocr_pair_encode_candidate(OCRPairCase *c) {
     if (pair_variant == 15 && !pair_stream_bfloat)
         pair_stream_bfloat =
             termite_metal_make_pipeline(r->device, pair_variant_library, @"pair_stream_bfloat");
-    if ((pair_variant == 7 || pair_variant == 28) && !pair_split_library) {
+    if ((pair_variant == 7 || pair_variant == 28 || pair_variant == 30) && !pair_split_library) {
         MTLCompileOptions *opt = [MTLCompileOptions new];
         opt.languageVersion = MTLLanguageVersion4_0;
         opt.mathMode = MTLMathModeSafe;
@@ -495,34 +1239,36 @@ static int ocr_pair_encode_candidate(OCRPairCase *c) {
     if ((pair_variant == 15 && !pair_stream_bfloat) ||
         (pair_variant == 12 && (!pair_cached1024 || !pair_cached2560)) ||
         (pair_variant == 13 && !pair_exact) ||
-        ((pair_variant == 7 || pair_variant == 28) && (!pair_gate_split || !pair_gate_reduce)))
+        ((pair_variant == 7 || pair_variant == 28 || pair_variant == 30) &&
+         (!pair_gate_split || !pair_gate_reduce)))
         return -1;
     // Experimental launches also fail before opening an encoder if a PSO is unavailable.
-    id<MTLComputePipelineState> selected = pair_variant == 26   ? pair_vec2
-                                           : pair_variant == 27 ? pair_vec3
-                                           : pair_variant == 23 ? r->lightonocr3_gate_up_small16_pipeline
-                                           : pair_variant == 22 ? pair_stream_gate
-                                           : pair_variant == 20 ? r->lightonocr3_mpp_four_row_pipeline
-                                           : pair_variant == 21 ? r->lightonocr3_mpp_small_tile_pipeline
-                                           : pair_variant == 17 ? pair_gate8
-                                           : pair_variant == 18 ? r->lightonocr3_gate_up_small32_pipeline
-                                           : pair_variant == 19 ? pair_gate64
-                                           : pair_variant == 16 ? pair_packed
-                                           : pair_variant == 1  ? r->lightonocr3_mpp_four_row_pipeline
-                                           : (pair_variant == 2 || pair_variant == 8 || pair_variant == 29 ||
-                                              pair_variant == 24 || pair_variant == 25)
-                                               ? r->lightonocr3_down_split32_pipeline
-                                           : pair_variant == 3 ? pair_norm
-                                           : pair_variant == 4 ? pair_segment8
-                                           : pair_variant == 5 ? pair_segment16
-                                           : pair_variant == 6 ? r->lightonocr3_gemv_pipeline
-                                           : (pair_variant == 7 || pair_variant == 28) ? pair_gate_split
-                                           : pair_variant == 12
-                                               ? (c->in_dim == 1024 ? pair_cached1024 : pair_cached2560)
-                                           : pair_variant == 13 ? pair_exact
-                                           : pair_variant == 14 ? r->lightonocr3_batch4_pipeline
-                                           : pair_variant == 15 ? pair_stream_bfloat
-                                                                : r->rms_norm_rows_simd4_reduce_pipeline;
+    id<MTLComputePipelineState> selected =
+        pair_variant == 26   ? pair_vec2
+        : pair_variant == 27 ? pair_vec3
+        : pair_variant == 23 ? r->lightonocr3_gate_up_small16_pipeline
+        : pair_variant == 22 ? pair_stream_gate
+        : pair_variant == 20 ? r->lightonocr3_mpp_four_row_pipeline
+        : pair_variant == 21 ? r->lightonocr3_mpp_small_tile_pipeline
+        : pair_variant == 17 ? pair_gate8
+        : pair_variant == 18 ? r->lightonocr3_gate_up_small32_pipeline
+        : pair_variant == 19 ? pair_gate64
+        : pair_variant == 16 ? pair_packed
+        : pair_variant == 1  ? r->lightonocr3_mpp_four_row_pipeline
+        : (pair_variant == 2 || pair_variant == 8 ||
+           (pair_variant == 29 || pair_variant == 31 || pair_variant == 32) || pair_variant == 24 ||
+           pair_variant == 25)
+            ? r->lightonocr3_down_split32_pipeline
+        : pair_variant == 3                                               ? pair_norm
+        : pair_variant == 4                                               ? pair_segment8
+        : pair_variant == 5                                               ? pair_segment16
+        : pair_variant == 6                                               ? r->lightonocr3_gemv_pipeline
+        : (pair_variant == 7 || pair_variant == 28 || pair_variant == 30) ? pair_gate_split
+        : pair_variant == 12 ? (c->in_dim == 1024 ? pair_cached1024 : pair_cached2560)
+        : pair_variant == 13 ? pair_exact
+        : pair_variant == 14 ? r->lightonocr3_batch4_pipeline
+        : pair_variant == 15 ? pair_stream_bfloat
+                             : r->rms_norm_rows_simd4_reduce_pipeline;
     const size_t required_threads = pair_variant == 11 ? 256
                                     : (pair_variant == 3 || pair_variant == 10 || pair_variant == 12 ||
                                        pair_variant == 13 || pair_variant == 15 || pair_variant == 16)
@@ -531,25 +1277,34 @@ static int ocr_pair_encode_candidate(OCRPairCase *c) {
                                                         : 32;
     if (!selected || selected.threadExecutionWidth != 32 ||
         selected.maxTotalThreadsPerThreadgroup < required_threads ||
-        ((pair_variant == 2 || pair_variant == 8 || pair_variant == 29 || pair_variant == 24 ||
+        ((pair_variant == 2 || pair_variant == 8 ||
+          (pair_variant == 29 || pair_variant == 31 || pair_variant == 32) || pair_variant == 24 ||
           pair_variant == 25) &&
          !r->lightonocr3_down_split_reduce_pipeline))
         return -1;
-    id<MTLBuffer> scratch = ((pair_variant == 2 || pair_variant == 8 || pair_variant == 29 ||
+    id<MTLBuffer> scratch = ((pair_variant == 2 || pair_variant == 8 ||
+                              (pair_variant == 29 || pair_variant == 31 || pair_variant == 32) ||
                               pair_variant == 24 || pair_variant == 25) ||
-                             (pair_variant == 7 || pair_variant == 28))
+                             (pair_variant == 7 || pair_variant == 28 || pair_variant == 30))
                                 ? termite_metal_decode_gqa_split_scratch_for_encoding(r)
                                 : nil;
-    size_t splits = pair_variant == 28                                               ? 8
-                    : pair_variant == 24                                             ? 16
-                    : pair_variant == 25                                             ? 32
-                    : (pair_variant == 2 || pair_variant == 8 || pair_variant == 29) ? 8
-                                                                                     : 4;
-    if (((pair_variant == 2 || pair_variant == 8 || pair_variant == 29 || pair_variant == 24 ||
+    size_t splits = pair_variant == 30   ? 2
+                    : pair_variant == 31 ? 4
+                    : pair_variant == 32 ? 2
+                    : pair_variant == 28 ? 8
+                    : pair_variant == 24 ? 16
+                    : pair_variant == 25 ? 32
+                    : (pair_variant == 2 || pair_variant == 8 ||
+                       (pair_variant == 29 || pair_variant == 31 || pair_variant == 32))
+                        ? 8
+                        : 4;
+    if (((pair_variant == 2 || pair_variant == 8 ||
+          (pair_variant == 29 || pair_variant == 31 || pair_variant == 32) || pair_variant == 24 ||
           pair_variant == 25) ||
-         (pair_variant == 7 || pair_variant == 28)) &&
-        (!scratch || scratch.length < splits * c->rows * c->out_dim * 4 *
-                                          ((pair_variant == 7 || pair_variant == 28) ? 2 : 1)))
+         (pair_variant == 7 || pair_variant == 28 || pair_variant == 30)) &&
+        (!scratch ||
+         scratch.length < splits * c->rows * c->out_dim * 4 *
+                              ((pair_variant == 7 || pair_variant == 28 || pair_variant == 30) ? 2 : 1)))
         return -1;
     id<MTLComputeCommandEncoder> e = termite_metal_tracked_compute_command_encoder_for(
         r->active_frame_cb, TERMITE_METAL_COMPUTE_SOURCE_OTHER);
@@ -635,7 +1390,7 @@ static int ocr_pair_encode_candidate(OCRPairCase *c) {
         [e setBytes:&p length:sizeof(p) atIndex:4];
         [e dispatchThreadgroups:MTLSizeMake(c->out_dim / (pair_variant == 14 ? 1 : 4), 1, 1)
             threadsPerThreadgroup:MTLSizeMake(pair_variant == 14 ? 32 : 128, 1, 1)];
-    } else if ((pair_variant == 7 || pair_variant == 28)) {
+    } else if ((pair_variant == 7 || pair_variant == 28 || pair_variant == 30)) {
         [e setComputePipelineState:pair_gate_split];
         [e setBuffer:c->input offset:0 atIndex:0];
         [e setBuffer:r->linear_weight_buffers[0] offset:0 atIndex:1];
@@ -658,7 +1413,8 @@ static int ocr_pair_encode_candidate(OCRPairCase *c) {
     } else {
         id<MTLComputePipelineState> pipeline =
             pair_variant == 1 ? r->lightonocr3_mpp_four_row_pipeline
-            : (pair_variant == 2 || pair_variant == 8 || pair_variant == 29 || pair_variant == 24 ||
+            : (pair_variant == 2 || pair_variant == 8 ||
+               (pair_variant == 29 || pair_variant == 31 || pair_variant == 32) || pair_variant == 24 ||
                pair_variant == 25)
                 ? r->lightonocr3_down_split32_pipeline
             : pair_variant == 4 ? pair_segment8
@@ -667,8 +1423,9 @@ static int ocr_pair_encode_candidate(OCRPairCase *c) {
         [e setComputePipelineState:pipeline];
         [e setBuffer:c->input offset:0 atIndex:0];
         [e setBuffer:r->linear_weight_buffers[0] offset:0 atIndex:1];
-        [e setBuffer:(pair_variant == 2 || pair_variant == 8 || pair_variant == 29 || pair_variant == 24 ||
-                      pair_variant == 25)
+        [e setBuffer:(pair_variant == 2 || pair_variant == 8 ||
+                      (pair_variant == 29 || pair_variant == 31 || pair_variant == 32) ||
+                      pair_variant == 24 || pair_variant == 25)
                          ? scratch
                          : r->linear_bias_buffers[0]
               offset:0
@@ -677,26 +1434,31 @@ static int ocr_pair_encode_candidate(OCRPairCase *c) {
         if (pair_variant == 6) {
             termite_metal_apply_linear_params sp = {(uint32_t)c->in_dim, (uint32_t)c->out_dim};
             [e setBytes:&sp length:sizeof(sp) atIndex:4];
-        } else if ((pair_variant == 2 || pair_variant == 8 || pair_variant == 29 || pair_variant == 24 ||
+        } else if ((pair_variant == 2 || pair_variant == 8 ||
+                    (pair_variant == 29 || pair_variant == 31 || pair_variant == 32) || pair_variant == 24 ||
                     pair_variant == 25))
             [e setBytes:&p length:sizeof(p) atIndex:3];
         else
             [e setBytes:&p length:sizeof(p) atIndex:4];
         size_t columns = pair_variant == 1 ? 16
-                         : (pair_variant == 2 || pair_variant == 8 || pair_variant == 29 ||
+                         : (pair_variant == 2 || pair_variant == 8 ||
+                            (pair_variant == 29 || pair_variant == 31 || pair_variant == 32) ||
                             pair_variant == 24 || pair_variant == 25)
                              ? 32
                          : pair_variant == 4 ? 4
                          : pair_variant == 5 ? 2
                                              : 1;
-        [e dispatchThreadgroups:MTLSizeMake(c->out_dim / columns,
-                                            (pair_variant == 2 || pair_variant == 8 || pair_variant == 29 ||
-                                             pair_variant == 24 || pair_variant == 25)
-                                                ? splits
-                                                : 1,
-                                            1)
+        [e dispatchThreadgroups:MTLSizeMake(
+                                    c->out_dim / columns,
+                                    (pair_variant == 2 || pair_variant == 8 ||
+                                     (pair_variant == 29 || pair_variant == 31 || pair_variant == 32) ||
+                                     pair_variant == 24 || pair_variant == 25)
+                                        ? splits
+                                        : 1,
+                                    1)
             threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
-        if ((pair_variant == 2 || pair_variant == 8 || pair_variant == 29 || pair_variant == 24 ||
+        if ((pair_variant == 2 || pair_variant == 8 ||
+             (pair_variant == 29 || pair_variant == 31 || pair_variant == 32) || pair_variant == 24 ||
              pair_variant == 25)) {
             [e memoryBarrierWithScope:MTLBarrierScopeBuffers];
             [e setComputePipelineState:r->lightonocr3_down_split_reduce_pipeline];

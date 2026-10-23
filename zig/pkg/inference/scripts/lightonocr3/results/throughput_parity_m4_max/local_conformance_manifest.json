@@ -1,0 +1,10 @@
+{
+  "files_sha256": {
+    "zig/pkg/inference/src/backends/metal_kernels.m": "f8552283711a22a0fd53bc863ff17a19615f59501194774aa42fcfb53395f4f3",
+    "zig/pkg/inference/scripts/lightonocr3/check_metal_projections.m": "7ec3c7282009f4391b9c278dafa8cd6a3f19856c88dc6cafdd9186ee3f88ab8e",
+    ".venv-lighton-vllm-metal/bin/check-local-kernels": "eda6965198f4aaa96408a85d5ead6194a13b575a85d99733eb97c46d3ab4572e"
+  },
+  "log_original_sha256": "43a8009d965892a8f5c05ccb19271c28673129e41c17c831482070044d9b4dd8",
+  "log": "/private/tmp/ocr-parity-local-conformance.txt",
+  "scope": "Production local vector/threadgroup projection and fused gate/up checks, including planned producers, rollback, CPU samples and canaries."
+}

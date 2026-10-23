@@ -200,6 +200,18 @@ fn estimateAdmissionForImageDimensions(
     var backend_scratch = try admissionAdd(qkv_rows, rope_and_outputs);
     backend_scratch = try admissionAdd(backend_scratch, @max(attention_scores, ffn_intermediates));
     backend_scratch = try admissionAdd(backend_scratch, merge_intermediates);
+    // Packed vision SDPA keeps two half Q/K/V workspaces for overlapping
+    // command buffers. They remain live through FFN and epoch reuse, so charge
+    // them in addition to the earlier score/FFN maximum, even on older devices.
+    // Larger fallback geometries may follow a supported image in the same
+    // epoch, so retain the bounded 4096-row packing charge for those too.
+    if (((vision_hidden == 768 and head_count == 12) or (vision_hidden == 1024 and head_count == 16)) and
+        max_patch_tokens > 256)
+    {
+        const padded_rows = try admissionMul(try admissionAdd(@min(max_patch_tokens, 4096), 127) / 128, 128);
+        const packed_vision_pair = try admissionMul(try admissionF32Bytes(padded_rows, vision_hidden), 3);
+        backend_scratch = try admissionAdd(backend_scratch, packed_vision_pair);
+    }
 
     return .{
         .visual_tokens = total_visual_tokens,
@@ -2210,6 +2222,33 @@ test "Qwen3-VL admission uses exact projector geometry and reserves transient pe
     try std.testing.expectEqual(first.tokenCount() + second.tokenCount(), estimate.visual_tokens);
     try std.testing.expect(estimate.host_scratch_bytes > 0);
     try std.testing.expect(estimate.backend_scratch_bytes > estimate.host_scratch_bytes / 4);
+}
+
+test "LightOnOCR3 admission charges packed vision storage beyond FFN and score peaks" {
+    for ([_]usize{ 768, 1024 }) |vision_hidden| {
+        const text_hidden: usize = if (vision_hidden == 768) 1024 else 2560;
+        const config = gpt_config.Config{
+            .family = .qwen3_5,
+            .hidden_size = @intCast(text_hidden),
+            .vision_hidden_size = @intCast(vision_hidden),
+            .vision_intermediate_size = @intCast(vision_hidden * 4),
+            .vision_num_attention_heads = @intCast(vision_hidden / 64),
+            .vision_patch_size = 16,
+            .vision_spatial_merge_size = 2,
+        };
+        const limits = Limits{ .max_merged_tokens = 4096, .hard_max_merged_tokens = 4096 };
+        for ([_]image.EncodedImageInfo{ .{ .width = 1000, .height = 768 }, .{ .width = 2048, .height = 2048 } }) |image_dimensions| {
+            const geometry = try targetGeometryForLayout(16, 2, image_dimensions.width, image_dimensions.height, limits);
+            const patches = geometry.patchCount();
+            const estimate = try estimateAdmissionForImageDimensions(&.{image_dimensions}, config, limits);
+            const hidden = patches * vision_hidden * @sizeOf(f32);
+            const scores = patches * patches * (vision_hidden / 64) * @sizeOf(f32);
+            const ffn = patches * (vision_hidden * 4) * @sizeOf(f32) * 2;
+            const merge = geometry.tokenCount() * (vision_hidden * 4 * 3 + text_hidden) * @sizeOf(f32);
+            const packed_pair = std.mem.alignForward(usize, @min(patches, 4096), 128) * vision_hidden * 3 * 2 * @sizeOf(u16);
+            try std.testing.expectEqual(7 * hidden + @max(scores, ffn) + merge + packed_pair, estimate.backend_scratch_bytes);
+        }
+    }
 }
 
 test "Qwen3-VL admission rejects oversized decoded images before projector execution" {

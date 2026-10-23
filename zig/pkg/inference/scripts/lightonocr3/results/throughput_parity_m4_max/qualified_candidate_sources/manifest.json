@@ -1,0 +1,140 @@
+{
+  "scope": "Exact benchmark source versions; restore original paths for the report fingerprints.",
+  "files": [
+    {
+      "original_path": "benchmark_metal_pair.py",
+      "archive_path": "benchmark_metal_pair.py.050af4caae6fa4de87265a79e2dfe2ebe1e897526832daea208b3092f4384085.gz",
+      "sha256": "050af4caae6fa4de87265a79e2dfe2ebe1e897526832daea208b3092f4384085"
+    },
+    {
+      "original_path": "metal_pair_benchmark.m",
+      "archive_path": "metal_pair_benchmark.m.3221afba6e12c0c818a7aea6d997c0543656f3b152e965c225d732f3b76d44cc.gz",
+      "sha256": "3221afba6e12c0c818a7aea6d997c0543656f3b152e965c225d732f3b76d44cc"
+    },
+    {
+      "original_path": "benchmark_metal_pair.py",
+      "archive_path": "benchmark_metal_pair.py.05fd8bfcd73fa01a52edae3448995146b558da6e2cb26f726ed41d5a0a14f062.gz",
+      "sha256": "05fd8bfcd73fa01a52edae3448995146b558da6e2cb26f726ed41d5a0a14f062"
+    },
+    {
+      "original_path": "metal_pair_benchmark.m",
+      "archive_path": "metal_pair_benchmark.m.9dd2d0d04e4079060416674d2d5c4efdff3eb1b0ebfe9bf97be765ae86b96151.gz",
+      "sha256": "9dd2d0d04e4079060416674d2d5c4efdff3eb1b0ebfe9bf97be765ae86b96151"
+    },
+    {
+      "original_path": "benchmark_metal_pair.py",
+      "archive_path": "benchmark_metal_pair.py.629733ed87ee4e19eaafc963c4e2d86292418dc5b4e1f4e9b4124292e1f984ce.gz",
+      "sha256": "629733ed87ee4e19eaafc963c4e2d86292418dc5b4e1f4e9b4124292e1f984ce"
+    },
+    {
+      "original_path": "metal_pair_benchmark.m",
+      "archive_path": "metal_pair_benchmark.m.6477e716ac3a54596be68e26836fcfbe7b1ab302914b1e0dd03e14163ff9ade6.gz",
+      "sha256": "6477e716ac3a54596be68e26836fcfbe7b1ab302914b1e0dd03e14163ff9ade6"
+    },
+    {
+      "original_path": "benchmark_metal_pair.py",
+      "archive_path": "benchmark_metal_pair.py.d6fc5ebbd325943e517c53f420fbd43423f844dbb529439cefe7874a2411f076.gz",
+      "sha256": "d6fc5ebbd325943e517c53f420fbd43423f844dbb529439cefe7874a2411f076"
+    },
+    {
+      "original_path": "metal_pair_benchmark.m",
+      "archive_path": "metal_pair_benchmark.m.ba73b15a337495c470b7b05b7b4f4d472db3d7fdebead25a52aca48d4ec91d56.gz",
+      "sha256": "ba73b15a337495c470b7b05b7b4f4d472db3d7fdebead25a52aca48d4ec91d56"
+    },
+    {
+      "original_path": "benchmark_metal_pair.py",
+      "archive_path": "benchmark_metal_pair.py.a0496241161650f31923da339c31e9578da5462f99243bb8e610091cff09741e.gz",
+      "sha256": "a0496241161650f31923da339c31e9578da5462f99243bb8e610091cff09741e"
+    },
+    {
+      "original_path": "benchmark_metal_pair.py",
+      "archive_path": "benchmark_metal_pair.py.c1805f868e3b3287c015f737c59b8b632f0a0280922193545cf65e9c6ad7bc84.gz",
+      "sha256": "c1805f868e3b3287c015f737c59b8b632f0a0280922193545cf65e9c6ad7bc84"
+    },
+    {
+      "original_path": "metal_pair_benchmark.m",
+      "archive_path": "metal_pair_benchmark.m.9f10e8e102bb608a59731f962cd67cbb4dc938634b9f9a74e0774ca7c5efb284.gz",
+      "sha256": "9f10e8e102bb608a59731f962cd67cbb4dc938634b9f9a74e0774ca7c5efb284"
+    },
+    {
+      "original_path": "benchmark_metal_pair.py",
+      "archive_path": "benchmark_metal_pair.py.fdf89414f9a029f6fa81ef8f8cc9d496be0fefb58c8a8779b6e8149486461b7d.gz",
+      "sha256": "fdf89414f9a029f6fa81ef8f8cc9d496be0fefb58c8a8779b6e8149486461b7d"
+    },
+    {
+      "original_path": "metal_pair_benchmark.m",
+      "archive_path": "metal_pair_benchmark.m.9b2cf1dd7b09bd387758d17f2999f11534373a89194bc4bb4f335aead1fa2e09.gz",
+      "sha256": "9b2cf1dd7b09bd387758d17f2999f11534373a89194bc4bb4f335aead1fa2e09"
+    },
+    {
+      "original_path": "benchmark_metal_pair.py",
+      "archive_path": "benchmark_metal_pair.py.cecb71726c382040aee0afb74c0e6d413addd5006b66f9b6d01051b48da20ab1.gz",
+      "sha256": "cecb71726c382040aee0afb74c0e6d413addd5006b66f9b6d01051b48da20ab1"
+    },
+    {
+      "original_path": "metal_pair_benchmark.m",
+      "archive_path": "metal_pair_benchmark.m.0e3c8312405b17ac548d6c30d21399e1f4309e5058330c9018fb6589a22c21c3.gz",
+      "sha256": "0e3c8312405b17ac548d6c30d21399e1f4309e5058330c9018fb6589a22c21c3"
+    },
+    {
+      "original_path": "benchmark_metal_pair.py",
+      "archive_path": "benchmark_metal_pair.py.4f83b0ec74b4ef79caeec418434164807cc95b43f0c5b56c06a91c307d2e9c37.gz",
+      "sha256": "4f83b0ec74b4ef79caeec418434164807cc95b43f0c5b56c06a91c307d2e9c37"
+    },
+    {
+      "original_path": "metal_pair_benchmark.m",
+      "archive_path": "metal_pair_benchmark.m.c5d35abc0c8e19b1450365ed4c5e66494154e15f93cf6194821acaf7cb6c6d68.gz",
+      "sha256": "c5d35abc0c8e19b1450365ed4c5e66494154e15f93cf6194821acaf7cb6c6d68"
+    },
+    {
+      "original_path": "benchmark_metal_pair.py",
+      "archive_path": "benchmark_metal_pair.py.fe0d0ba6a92510f9d4f580587f60ec0afa53509e6a714ffdf75efb4384bf4124.gz",
+      "sha256": "fe0d0ba6a92510f9d4f580587f60ec0afa53509e6a714ffdf75efb4384bf4124"
+    },
+    {
+      "original_path": "metal_pair_benchmark.m",
+      "archive_path": "metal_pair_benchmark.m.57ebaeb446deeafdcb78c561232918464fa56ec0b4c434874f29dba7ed81a41f.gz",
+      "sha256": "57ebaeb446deeafdcb78c561232918464fa56ec0b4c434874f29dba7ed81a41f"
+    },
+    {
+      "original_path": "benchmark_metal_pair.py",
+      "archive_path": "benchmark_metal_pair.py.014c0d4934b87b1156ad31228e42c03329bb2b275c34cb2b9c8ba600a6cb7e3d.gz",
+      "sha256": "014c0d4934b87b1156ad31228e42c03329bb2b275c34cb2b9c8ba600a6cb7e3d"
+    },
+    {
+      "original_path": "metal_pair_benchmark.m",
+      "archive_path": "metal_pair_benchmark.m.3e2a46de70109c2f40e51ff5e837f5649a0eb1000c70da87c65f038aea7dbc6f.gz",
+      "sha256": "3e2a46de70109c2f40e51ff5e837f5649a0eb1000c70da87c65f038aea7dbc6f"
+    },
+    {
+      "original_path": "benchmark_metal_pair.py",
+      "archive_path": "benchmark_metal_pair.py.a3fd1d2b6fe2349ff16a7a9accf5ce952b54ba81e31a085fc8aa5f62093f9113.gz",
+      "sha256": "a3fd1d2b6fe2349ff16a7a9accf5ce952b54ba81e31a085fc8aa5f62093f9113"
+    },
+    {
+      "original_path": "metal_pair_benchmark.m",
+      "archive_path": "metal_pair_benchmark.m.da04347c6d6c5bc95c7ad6433e6b7765a39c80fe2958777f47f848736650946f.gz",
+      "sha256": "da04347c6d6c5bc95c7ad6433e6b7765a39c80fe2958777f47f848736650946f"
+    },
+    {
+      "original_path": "benchmark_metal_pair.py",
+      "archive_path": "benchmark_metal_pair.py.8c2aed125dbdd30ca11a0dad65b6e25f4b86e623d9f464bc1e9268cfb8b33bc0.gz",
+      "sha256": "8c2aed125dbdd30ca11a0dad65b6e25f4b86e623d9f464bc1e9268cfb8b33bc0"
+    },
+    {
+      "original_path": "metal_pair_benchmark.m",
+      "archive_path": "metal_pair_benchmark.m.078a0916702898cb3657e64c4196a85ed7ff5a2c5fe89a1a5ce38b59719ea5d1.gz",
+      "sha256": "078a0916702898cb3657e64c4196a85ed7ff5a2c5fe89a1a5ce38b59719ea5d1"
+    },
+    {
+      "original_path": "benchmark_metal_pair.py",
+      "archive_path": "benchmark_metal_pair.py.8c2aed125dbdd30ca11a0dad65b6e25f4b86e623d9f464bc1e9268cfb8b33bc0.gz",
+      "sha256": "8c2aed125dbdd30ca11a0dad65b6e25f4b86e623d9f464bc1e9268cfb8b33bc0"
+    },
+    {
+      "original_path": "benchmark_metal_pair.py",
+      "archive_path": "benchmark_metal_pair.py.bf0c003d0a7bf8977c46677dc1df243292f9936ded21f971dca21deadc1fb56f.gz",
+      "sha256": "bf0c003d0a7bf8977c46677dc1df243292f9936ded21f971dca21deadc1fb56f"
+    }
+  ]
+}

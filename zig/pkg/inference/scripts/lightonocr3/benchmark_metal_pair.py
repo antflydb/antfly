@@ -82,7 +82,17 @@ def main():
     parser.add_argument("--timing-library", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument(
-        "--suite", choices=["quick", "full", "all-rows"], default="full"
+        "--suite",
+        choices=[
+            "quick",
+            "full",
+            "all-rows",
+            "page-shapes",
+            "prefill-gates",
+            "decode-shapes",
+            "decode-missing",
+        ],
+        default="full",
     )
     parser.add_argument(
         "--variant",
@@ -117,6 +127,83 @@ def main():
             "vec3",
             "splitgate8",
             "splittails",
+            "splitgate2",
+            "splitprojections4",
+            "splitprojections2",
+            "tggate4",
+            "tggate2",
+            "tggate32",
+            "vecgate8x2",
+            "vecgate8x4",
+            "vecgate16x2",
+            "vecproj8x2",
+            "vecproj8x4",
+            "vecproj16x2",
+            "vecproj32x1",
+            "vecproj32x2",
+            "vecproj32x4",
+            "tgproj8x16",
+            "tgproj8x32",
+            "tgproj16x16",
+            "vecgate16x4",
+            "vecproj16x4",
+            "previousproduction",
+            "previousmerger",
+            "prefill32x64",
+            "prefill64x32",
+            "prefill8x32",
+            "prefill8x16",
+            "prefilltg4",
+            "prefilltg8",
+            "prefilltg16",
+            "prefilltg8n32",
+            "prefilltg16n32",
+            "prefilltg8m16n32",
+            "prefilltg16m16n32",
+            "previousprefill",
+            "decodevec16x2",
+            "decodevec32x4",
+            "decodempp16",
+            "decodempp32",
+            "decodegemv1",
+            "decodetg",
+            "decodetiled",
+            "decodef32mma32",
+            "decodef32mma64",
+            "decodenax16",
+            "decodenax32",
+            "decodenax64",
+            "decodebigmpp",
+            "decodenax32sg2",
+            "decodenax64sg4",
+            "decodesplit4n32",
+            "decodesplit8n32",
+            "decodesplit4n16",
+            "decodesplit8n16",
+            "decodeunroll4n32",
+            "decodeunroll8n32",
+            "decodeunroll8n1",
+            "decodeunroll16n1",
+            "decodeunroll32n1",
+            "decodeunroll16n4",
+            "decodestream8u4",
+            "decodestream16u4",
+            "decodestream32u4",
+            "decodestream8u8",
+            "decodestream16u8",
+            "decodestream32u8",
+            "decodechunk4s16t2",
+            "decodechunk4s16t4",
+            "decodechunk4s32t4",
+            "decodechunk4s32t8",
+            "decodechunk2s16t4",
+            "decodechunk2s32t8",
+            "decodeexact4s16t2",
+            "decodeexact4s16t4",
+            "decodeexact4s32t4",
+            "decodeexact4s32t8",
+            "decodeexact2s16t4",
+            "decodeexact2s32t8",
         ],
         default="production",
     )
@@ -193,6 +280,83 @@ def main():
         "vec3",
         "splitgate8",
         "splittails",
+        "splitgate2",
+        "splitprojections4",
+        "splitprojections2",
+        "tggate4",
+        "tggate2",
+        "tggate32",
+        "vecgate8x2",
+        "vecgate8x4",
+        "vecgate16x2",
+        "vecproj8x2",
+        "vecproj8x4",
+        "vecproj16x2",
+        "vecproj32x1",
+        "vecproj32x2",
+        "vecproj32x4",
+        "tgproj8x16",
+        "tgproj8x32",
+        "tgproj16x16",
+        "vecgate16x4",
+        "vecproj16x4",
+        "previousproduction",
+        "previousmerger",
+        "prefill32x64",
+        "prefill64x32",
+        "prefill8x32",
+        "prefill8x16",
+        "prefilltg4",
+        "prefilltg8",
+        "prefilltg16",
+        "prefilltg8n32",
+        "prefilltg16n32",
+        "prefilltg8m16n32",
+        "prefilltg16m16n32",
+        "previousprefill",
+        "decodevec16x2",
+        "decodevec32x4",
+        "decodempp16",
+        "decodempp32",
+        "decodegemv1",
+        "decodetg",
+        "decodetiled",
+        "decodef32mma32",
+        "decodef32mma64",
+        "decodenax16",
+        "decodenax32",
+        "decodenax64",
+        "decodebigmpp",
+        "decodenax32sg2",
+        "decodenax64sg4",
+        "decodesplit4n32",
+        "decodesplit8n32",
+        "decodesplit4n16",
+        "decodesplit8n16",
+        "decodeunroll4n32",
+        "decodeunroll8n32",
+        "decodeunroll8n1",
+        "decodeunroll16n1",
+        "decodeunroll32n1",
+        "decodeunroll16n4",
+        "decodestream8u4",
+        "decodestream16u4",
+        "decodestream32u4",
+        "decodestream8u8",
+        "decodestream16u8",
+        "decodestream32u8",
+        "decodechunk4s16t2",
+        "decodechunk4s16t4",
+        "decodechunk4s32t4",
+        "decodechunk4s32t8",
+        "decodechunk2s16t4",
+        "decodechunk2s32t8",
+        "decodeexact4s16t2",
+        "decodeexact4s16t4",
+        "decodeexact4s32t4",
+        "decodeexact4s32t8",
+        "decodeexact2s16t4",
+        "decodeexact2s32t8",
     ].index(args.variant)
     native.ocr_pair_set_variant(variant_id)
     native.ocr_pair_candidate_applies.argtypes = [ctypes.c_void_p]
@@ -301,10 +465,126 @@ def main():
             for hidden, intermediate in [(1024, 3584), (2560, 9216)]
             for rows in range(1, 9)
         ]
+    if args.suite == "page-shapes":
+        # Both checkpoint configs and all dense prefill shapes observed in the
+        # three-fixture native profiles: 0.8B has a 768-wide/12-head encoder;
+        # 4B has a 1024-wide/16-head encoder. Merger widths follow each config.
+        vision_shapes = [
+            (768, 768),
+            (768, 2304),
+            (768, 3072),
+            (3072, 768),
+            (1024, 3072),
+            (1024, 1024),
+            (1024, 4096),
+            (4096, 1024),
+        ]
+        merger_shapes = [(3072, 3072), (3072, 1024), (4096, 4096), (4096, 2560)]
+        language_shapes = [
+            (1024, 3584),
+            (1024, 16),
+            (2048, 1024),
+            (3584, 1024),
+            (1024, 6144),
+            (1024, 2048),
+            (1024, 512),
+            (1024, 4096),
+            (2560, 9216),
+            (2560, 32),
+            (4096, 2560),
+            (2560, 8192),
+            (9216, 2560),
+            (2560, 4096),
+            (2560, 1024),
+        ]
+        cases = [
+            (0, rows, k, n) for rows in [1672, 2160, 2592] for k, n in vision_shapes
+        ]
+        cases += [
+            (0, rows // 4, k, n)
+            for rows in [1672, 2160, 2592]
+            for k, n in merger_shapes
+        ]
+        cases += [
+            (0, rows, k, n) for rows in [432, 554, 662] for k, n in language_shapes
+        ]
+    if args.suite == "decode-shapes":
+        language_shapes = [
+            (1024, 3584),
+            (1024, 16),
+            (2048, 1024),
+            (3584, 1024),
+            (1024, 6144),
+            (1024, 2048),
+            (1024, 512),
+            (1024, 4096),
+            (2560, 9216),
+            (2560, 32),
+            (4096, 2560),
+            (2560, 8192),
+            (9216, 2560),
+            (2560, 4096),
+            (2560, 1024),
+        ]
+        cases = [(0, rows, k, n) for rows in range(1, 9) for k, n in language_shapes]
+        cases += [(0, rows, k, 248320) for k in [1024, 2560] for rows in [1, 4, 8]]
+        cases += [
+            (3, rows, k, n)
+            for k, n in [(1024, 3584), (2560, 9216)]
+            for rows in range(1, 9)
+        ]
+        cases += [(1, 554, k, k) for k in [1024, 2560]] + [
+            (2, 554, (32 + h) * 128, h) for h in [16, 32]
+        ]
+    if args.suite == "decode-missing":
+        missing = [
+            (1024, 16),
+            (2048, 1024),
+            (1024, 2048),
+            (1024, 512),
+            (1024, 4096),
+            (2560, 32),
+            (4096, 2560),
+            (2560, 4096),
+            (2560, 1024),
+        ]
+        cases = [(0, rows, k, n) for rows in range(1, 9) for k, n in missing]
+    if args.suite == "prefill-gates":
+        cases = [
+            (0, rows, k, n)
+            for rows in [432, 554, 662]
+            for k, n in [(1024, 16), (2560, 32), (2048, 1024)]
+        ]
     if args.only_candidates:
 
         def applies(case):
             kind, rows, k, n = case
+            if args.variant.startswith("decode"):
+                missing = (k, n) in [
+                    (1024, 16),
+                    (2048, 1024),
+                    (1024, 2048),
+                    (1024, 512),
+                    (1024, 4096),
+                    (2560, 32),
+                    (4096, 2560),
+                    (2560, 4096),
+                    (2560, 1024),
+                ]
+                if args.variant.startswith("decodeexact"):
+                    return kind == 0 and 5 <= rows <= 7 and n > 32 and missing
+                if args.variant.startswith("decodechunk"):
+                    return kind == 0 and 2 <= rows <= 8 and n > 32 and missing
+                if args.variant == "decodegemv1":
+                    return kind == 0 and rows == 1 and n in (16, 32)
+                if args.variant == "decodetg":
+                    return kind == 0 and 1 <= rows <= 8 and n in (16, 32)
+                if (
+                    args.variant.startswith("decodevec")
+                    or args.variant == "decodetiled"
+                ):
+                    return kind == 0 and 2 <= rows <= 8 and missing
+                return kind == 0 and 1 <= rows <= 8 and missing
             return {
                 "qkv16": kind == 0
                 and (
@@ -349,6 +629,38 @@ def main():
                 and ((k == 1024 and 2 <= rows <= 8) or (k == 2560 and 2 <= rows <= 7)),
                 "splitgate8": kind == 3
                 and ((k == 1024 and 2 <= rows <= 8) or (k == 2560 and 2 <= rows <= 3)),
+                "tgproj8x16": kind == 0 and 2 <= rows <= 8 and k in (3584, 9216),
+                "tgproj8x32": kind == 0 and 2 <= rows <= 8 and k in (3584, 9216),
+                "tgproj16x16": kind == 0 and 2 <= rows <= 8 and k in (3584, 9216),
+                "vecproj16x2": kind == 0
+                and 2 <= rows <= 8
+                and n <= 9216
+                and (rows <= 4 or k in (3584, 9216)),
+                "vecproj32x1": kind == 0
+                and 2 <= rows <= 8
+                and n <= 9216
+                and (rows <= 4 or k in (3584, 9216)),
+                "vecproj32x2": kind == 0
+                and 2 <= rows <= 8
+                and n <= 9216
+                and (rows <= 4 or k in (3584, 9216)),
+                "vecproj32x4": kind == 0
+                and 2 <= rows <= 8
+                and n <= 9216
+                and (rows <= 4 or k in (3584, 9216)),
+                "vecgate16x4": kind == 3 and rows in (2, 3),
+                "vecproj16x4": kind == 0 and 2 <= rows <= 4 and n <= 9216,
+                "vecgate8x2": kind == 3 and rows in (2, 3),
+                "vecgate8x4": kind == 3 and rows in (2, 3),
+                "vecgate16x2": kind == 3 and rows in (2, 3),
+                "vecproj8x2": kind == 0 and rows in (2, 3) and n <= 9216,
+                "vecproj8x4": kind == 0 and rows in (2, 3) and n <= 9216,
+                "tggate4": kind == 3 and 2 <= rows <= 8,
+                "tggate2": kind == 3 and 2 <= rows <= 8,
+                "tggate32": kind == 3 and 2 <= rows <= 8,
+                "splitgate2": kind == 3 and 2 <= rows <= 8,
+                "splitprojections4": kind == 0 and 2 <= rows <= 7 and n <= 9216,
+                "splitprojections2": kind == 0 and 2 <= rows <= 7 and n <= 9216,
                 "splittails": kind == 0 and 2 <= rows <= 7 and n <= 9216,
                 "vec2": kind == 0 and rows == 2 and n <= 9216,
                 "vec3": kind == 0 and rows == 3 and n <= 9216,

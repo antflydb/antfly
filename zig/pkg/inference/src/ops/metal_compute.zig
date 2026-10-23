@@ -4970,6 +4970,11 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const runtime = self.provider_impl.raw_decode_runtime;
         if (metal_runtime.hasActiveFrame(runtime)) metal_runtime.cancelFrame(runtime) catch {};
         if (metal_runtime.hasSubmittedFrame(runtime)) metal_runtime.waitFrame(runtime) catch {};
+        // The admitted request/epoch still owns the vision workspace lease.
+        if (runtime != null) {
+            const vision_workspace_rc = metal_runtime.termite_metal_decode_runtime_clear_lightonocr3_vision_workspace(runtime);
+            std.debug.assert(vision_workspace_rc == 0);
+        }
         if (self.require_f32_linears) {
             const rc = metal_runtime.termite_metal_decode_runtime_release_linear_views(runtime, metal_runtime.decoder_runtime_linear_slot_capacity);
             std.debug.assert(rc == 0);

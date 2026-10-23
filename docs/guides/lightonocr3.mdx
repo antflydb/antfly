@@ -421,7 +421,9 @@ Batched vision keeps attention lanes separate and splits projected embeddings
 back to their page owners. Prepared-prompt batching carries complete axis-major
 M-RoPE positions and independent KV/recurrent states; it does not pad queries.
 The short default waits often formed singleton batches. Longer experimental
-waits have separate measurements and remain explicit options.
+waits have separate measurements and remain explicit options. Final
+default/combined/default controls did not show a reproducible throughput gain
+from longer waits; 4B was slower with the combined setting.
 
 ### Measurement
 
@@ -454,7 +456,8 @@ exactly. Reports contain pages/s, p50/p95 latency, batching counters, checkpoint
 image and executable fingerprints, hardware and raw logs. Native timing covers
 preprocessing, queueing, inference and text decoding; it excludes HTTP, PDF
 rendering and indexing. vLLM reference timing also includes loopback HTTP.
-Reference prefix and processor caches are disabled.
+Reference prefix and processor caches are disabled. Each request has a unique
+media UUID, preventing reuse of cached image embeddings.
 
 Measurements use a shared M4 Max with 36 GiB unified memory, sixteen repeated
 pages and greedy generation with a 256-token ceiling. Machine load changes
@@ -473,20 +476,31 @@ and register-cached F32 normalization. Qualified partial QKV/down projections
 use finer K splits while retaining the earlier split if scratch is smaller.
 Unsupported dimensions, offsets and missing pipelines retain working fallbacks.
 Eligible split dispatches close a planned encoder only after validating its
-resources, preserving producer ordering and the outer scope lifetime. The optimizations allocate no additional persistent scratch.
+resources, preserving producer ordering and the outer scope lifetime. Decoder
+threadgroup reductions add no persistent scratch. Qualified vision attention
+packs the existing half Q/K/V values once and uses TensorOps; its bounded pair
+of workspaces is admission-charged and released when its command-buffer owner
+retires. Backend teardown also clears any remaining workspace before releasing
+the request lease. The 0.8B and 4B vision paths qualify their actual 12- and
+16-head architectures separately.
 
 The paired benchmark alternates native and MLX in one process, synchronizes
 every sample and checks full outputs plus independent CPU samples. Candidate
 comparisons balance all six candidate/production/MLX trial orders. The
-`--suite all-rows` sweep covers decoder row counts one through eight for
-projections and gate/up, vocabulary heads at one/four/eight rows, and the two
-normalization/recurrent-prefill geometries. This broader coverage exposes gaps
-missed by the earlier one/four/eight-row suite. Primitive results do not prove
+`--suite decode-shapes` sweep covers 146 cases: fifteen observed decoder
+projection widths at rows one through eight, fused gate/up, vocabulary heads
+and normalization/recurrent prefill. The separate 81-case
+`--suite page-shapes` sweep covers actual vision, merger and language-prefill
+dimensions. The historical 86-case `all-rows` suite omitted several frequently
+used decoder widths and cannot establish parity on its own. Primitive results do not prove
 whole-reader parity.
 
 Useful rollback switches, set to `1`, include:
 
 - `TERMITE_METAL_DISABLE_LIGHTONOCR3_PROJECTIONS`
+- `TERMITE_METAL_DISABLE_LIGHTONOCR3_LOCAL_KERNELS`
+- `TERMITE_METAL_DISABLE_LIGHTONOCR3_VISION_MPP`
+- `TERMITE_METAL_DISABLE_LIGHTONOCR3_PREFILL_PROJECTIONS`
 - `TERMITE_METAL_DISABLE_LIGHTONOCR3_GATE_UP_SPLIT`
 - `TERMITE_METAL_DISABLE_LIGHTONOCR3_TAIL_SPLIT`
 - `TERMITE_METAL_DISABLE_LIGHTONOCR3_PARTIAL_QKV_SPLIT`
@@ -504,7 +518,13 @@ milliseconds; `ANTFLY_FLORENCE2_BATCH_WAIT_US=0` restores the generic wait.
 
 Current measurements, source/binary manifests, numerical checks, failed
 admission attempts and rejected candidates are retained in
-`zig/pkg/inference/scripts/lightonocr3/results/throughput_refill_m4_max/README.md`.
+`zig/pkg/inference/scripts/lightonocr3/results/throughput_parity_m4_max/README.md`.
+Final production sweeps, rollback controls and nearby reference runs are
+identified separately from candidate experiments. New narrow recurrent gates
+and additional decoder projection widths preserve F32 activations, accumulation
+and outputs. Use `--require-decode-projections`, `--require-prefill-gates` and
+`--require-vision-mpp` on a diagnostic run to verify that those routes execute;
+tracing affects timing. Previous refill measurements remain in `throughput_refill_m4_max`.
 Earlier rounds remain archived under `kernel_saturation_m4_max`,
 `projection_parity_m4_max` and `concurrent_readers_m4_max` in the same results
 folder. Installed vLLM Metal lacks a Florence adapter, so the Florence reference
