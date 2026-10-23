@@ -28,7 +28,7 @@ const A = std.mem.Allocator;
 const Token = @import("antfly_cancellation").CancellationToken;
 const max_rows = 8192;
 const max_fragments = 16384;
-const Fragment = struct { prefix: [32]u8, bits: u16, name: []const u8, count: u64, digest: [32]u8, dirty: bool = false };
+const Fragment = struct { prefix: [32]u8, bits: u16, name: []const u8, count: u64, digest: [32]u8, dirty: bool = false, membership_dirty: bool = true, incremental: bool = false };
 
 pub const Build = struct {
     a: A,
@@ -79,6 +79,19 @@ pub const Build = struct {
     fn open(raw: *anyopaque, a: A, binding: local.serverless_segment_source_binding.Binding, file: ?usize, token: Token, phase: ?*const stores.IoPhase) !rows.Source {
         const self: *Build = @ptrCast(@alignCast(raw));
         if (self.spool) |spool| return spool.open(a, binding, file, token, phase);
+        return openGather(raw, a, binding, file, token, phase);
+    }
+    fn openSelected(raw: *anyopaque, a: A, binding: local.serverless_segment_source_binding.Binding, file: usize, ordinals: []const u64, token: Token, phase: ?*const stores.IoPhase) !rows.Source {
+        const self: *Build = @ptrCast(@alignCast(raw));
+        if (file >= self.fragments.len) return error.InvalidLogicalRowIdentity;
+        for (ordinals, 0..) |row, i| if (row >= self.fragments[file].count or (i != 0 and row <= ordinals[i - 1])) return error.InvalidLogicalRowIdentity;
+        const source = try openGather(raw, a, binding, file, token, phase);
+        const cursor: *Gather = @ptrCast(@alignCast(source.ctx));
+        cursor.selected_rows = ordinals;
+        return source;
+    }
+    fn openGather(raw: *anyopaque, a: A, binding: local.serverless_segment_source_binding.Binding, file: ?usize, token: Token, phase: ?*const stores.IoPhase) !rows.Source {
+        const self: *Build = @ptrCast(@alignCast(raw));
         const columns = try a.dupe([]const u8, binding.column_bindings);
         errdefer a.free(columns);
         var physical = try self.physical.parallelView(a);
@@ -203,13 +216,19 @@ fn prepareInner(self: *Build, a: A, table: local.common_topology_records.TableRe
                 const after = if (right) |row| try identity.decodeState(self_.owner.root.current, row.key, row.value) else null;
                 if (before != null and after != null and before.?.state.unchanged(after.?.state)) return;
                 const id = (right orelse left.?).key;
-                self_.fragments[try fragmentFor(self_.fragments, id)].dirty = true;
+                const fragment = &self_.fragments[try fragmentFor(self_.fragments, id)];
+                fragment.dirty = true;
+                if (before == null or after == null) fragment.membership_dirty = true;
             }
         };
         var changed: Changes = .{ .owner = self, .fragments = old_fragments };
         try tree.visitDifferences(a, pages.store(), previous.?.current.by_id, self.root.current.by_id, &changed);
         for (old_fragments) |fragment| {
-            if (fragment.dirty) try planRange(self, a, &pages, fragment.prefix, fragment.bits, &fragments) else try fragments.append(out, fragment);
+            if (fragment.dirty) {
+                const first = fragments.items.len;
+                try planRange(self, a, &pages, fragment.prefix, fragment.bits, &fragments);
+                if (fragments.items.len == first + 1 and std.mem.eql(u8, fragments.items[first].name, fragment.name)) fragments.items[first].membership_dirty = fragment.membership_dirty;
+            } else try fragments.append(out, fragment);
         }
     } else for (0..16) |i| {
         var prefix: [32]u8 = @splat(0);
@@ -250,7 +269,7 @@ fn prepareInner(self: *Build, a: A, table: local.common_topology_records.TableRe
     self.provider.statistics = null;
     self.provider.skip_indexes = &.{};
     self.provider.expected_delete_objects = null;
-    self.provider.fragment_rows = .{ .ptr = self, .open = Build.open, .replayable = Build.replayable };
+    self.provider.fragment_rows = .{ .ptr = self, .open = Build.open, .replayable = Build.replayable, .open_selected = Build.openSelected };
     const nav = try navigation.build(a, out, &self.store, &self.provider, prior_navigation, self.token);
     self.provider.native_delta = nav.delta;
     self.provider.replay_recommended = true;
@@ -281,7 +300,7 @@ fn prepareInner(self: *Build, a: A, table: local.common_topology_records.TableRe
     self.space = (try builder.finish(self.root.namespace, self.root.values_recipe, self.root.cut)).current;
     self.space.navigation = nav.ref;
     if (self.space.rows != self.root.current.rows) return error.InvalidLogicalRowIdentity;
-    try prepareInputs(self, a, &pages, previous);
+    try prepareInputs(self, a, &pages, previous, table.indexes_json);
     // Admit the complete fresh binding set before reading source payloads or
     // building native artifacts. A later mixed-space overflow still takes the
     // explicit physical fallback at the publication owner.
@@ -319,11 +338,11 @@ fn readFragments(a: A, out: A, pages: *Pages, nav: navigation.Root) ![]Fragment 
         defer arena.deinit();
         const file = (try std.json.parseFromSliceLeaky(navigation.Record, arena.allocator(), record.value, .{})).file;
         const prefix = try parseName(file.file_id);
-        const version = if (std.mem.startsWith(u8, file.version_id, "iv1-")) file.version_id[4..] else file.version_id;
+        const version = if (std.mem.startsWith(u8, file.version_id, "iv1-") or std.mem.startsWith(u8, file.version_id, "iv2-") or std.mem.startsWith(u8, file.version_id, "iv3-")) file.version_id[4..] else file.version_id;
         if (version.len != 64) return error.InvalidLogicalRowIdentity;
         var digest: [32]u8 = undefined;
         _ = std.fmt.hexToBytes(&digest, version) catch return error.InvalidLogicalRowIdentity;
-        try fragments.append(out, .{ .name = try out.dupe(u8, file.file_id), .prefix = prefix.prefix, .bits = prefix.bits, .count = file.row_count, .digest = digest });
+        try fragments.append(out, .{ .name = try out.dupe(u8, file.file_id), .prefix = prefix.prefix, .bits = prefix.bits, .count = file.row_count, .digest = digest, .membership_dirty = false });
     }
     std.mem.sort(Fragment, fragments.items, {}, struct {
         fn less(_: void, left: Fragment, right: Fragment) bool {
@@ -339,7 +358,9 @@ fn sameColumns(left: []const []const u8, right: []const []const u8) bool {
 }
 /// Input-version trees have no physical coordinates. COW differences identify
 /// exactly the input cohorts and radix leaves whose payload fingerprints changed.
-fn prepareInputs(self: *Build, a: A, pages: *Pages, previous: ?identity.Root) !void {
+fn prepareInputs(self: *Build, a: A, pages: *Pages, previous: ?identity.Root, indexes_json: []const u8) !void {
+    var configs = try std.json.parseFromSlice(std.json.Value, a, indexes_json, .{});
+    defer configs.deinit();
     const out = self.arena.allocator();
     const recipes = self.root.current.input_recipes;
     const views = try out.alloc(Provider.FragmentView, recipes.len);
@@ -349,9 +370,16 @@ fn prepareInputs(self: *Build, a: A, pages: *Pages, previous: ?identity.Root) !v
     defer a.free(dirty);
     var initialized: usize = 0;
     defer for (dirty[0..initialized]) |mask| a.free(mask);
+    const changed_ids = try a.alloc(std.ArrayList([32]u8), recipes.len);
+    defer a.free(changed_ids);
+    for (changed_ids) |*ids| ids.* = .empty;
+    defer for (changed_ids) |*ids| ids.deinit(a);
+    const overflow = try a.alloc(bool, recipes.len);
+    defer a.free(overflow);
+    @memset(overflow, false);
     for (recipes, 0..) |recipe, i| {
         owners[i] = i;
-        for (recipes[0..i], 0..) |candidate, j| if (sameColumns(recipe.columns, candidate.columns)) {
+        for (recipes[0..i], 0..) |candidate, j| if (sameColumns(recipe.columns, candidate.columns) and vectorRecipe(configs.value, recipe.name) == vectorRecipe(configs.value, candidate.name)) {
             owners[i] = owners[j];
             break;
         };
@@ -365,18 +393,27 @@ fn prepareInputs(self: *Build, a: A, pages: *Pages, previous: ?identity.Root) !v
             recipes: []const @import("lake_row_input_recipes.zig").Recipe,
             owners: []const usize,
             dirty: [][]bool,
+            changed_ids: []std.ArrayList([32]u8),
+            overflow: []bool,
+            a: A,
             pub fn change(self_: *@This(), left: ?tree.Cursor.Record, right: ?tree.Cursor.Record) !void {
                 try Build.check(self_.owner);
                 if (left != null and right != null and std.mem.eql(u8, left.?.value, right.?.value)) return;
                 const row = right orelse left.?;
                 if (row.key.len != 64 or row.value.len != 32) return error.InvalidLogicalRowIdentity;
-                for (self_.recipes, 0..) |recipe, i| if (std.mem.eql(u8, &recipe.digest, row.key[0..32])) {
-                    self_.dirty[self_.owners[i]][try fragmentFor(self_.owner.fragments, row.key[32..64])] = true;
-                    break;
+                for (self_.recipes, 0..) |recipe, i| if (self_.owners[i] == i and std.mem.eql(u8, &recipe.digest, row.key[0..32])) {
+                    const owner = self_.owners[i];
+                    self_.dirty[owner][try fragmentFor(self_.owner.fragments, row.key[32..64])] = true;
+                    if (!self_.overflow[owner]) {
+                        if (self_.changed_ids[owner].items.len == 32768) {
+                            self_.overflow[owner] = true;
+                            self_.changed_ids[owner].clearAndFree(self_.a);
+                        } else try self_.changed_ids[owner].append(self_.a, row.key[32..64].*);
+                    }
                 };
             }
         };
-        var changed: Changes = .{ .owner = self, .recipes = recipes, .owners = owners, .dirty = dirty };
+        var changed: Changes = .{ .owner = self, .recipes = recipes, .owners = owners, .dirty = dirty, .changed_ids = changed_ids, .overflow = overflow, .a = a };
         try tree.visitDifferences(a, pages.store(), previous.?.current.input_versions, self.root.current.input_versions, &changed);
     }
     for (recipes, views, 0..) |recipe, *view, i| {
@@ -390,7 +427,7 @@ fn prepareInputs(self: *Build, a: A, pages: *Pages, previous: ?identity.Root) !v
         defer versions.deinit(a);
         if (previous) |prior| if (self.prior_navigation != null) {
             const prior_name = for (prior.current.input_recipes) |candidate| {
-                if (std.mem.eql(u8, &candidate.digest, &recipe.digest)) break candidate.name;
+                if (std.mem.eql(u8, &candidate.digest, &recipe.digest) and vectorRecipe(configs.value, candidate.name) == vectorRecipe(configs.value, recipe.name)) break candidate.name;
             } else recipe.name;
             const space = prior.spaceForIndex(prior_name);
             if (space.navigation) |ref| {
@@ -402,22 +439,56 @@ fn prepareInputs(self: *Build, a: A, pages: *Pages, previous: ?identity.Root) !v
                     var arena = std.heap.ArenaAllocator.init(a);
                     defer arena.deinit();
                     const file = (try std.json.parseFromSliceLeaky(navigation.Record, arena.allocator(), record.value, .{})).file;
-                    if (!std.mem.startsWith(u8, file.version_id, "iv1-")) continue;
+                    if (!std.mem.startsWith(u8, file.version_id, "iv1-") and !std.mem.startsWith(u8, file.version_id, "iv2-") and !std.mem.startsWith(u8, file.version_id, "iv3-")) continue;
                     const prefix = try parseName(file.file_id);
                     var digest: [32]u8 = undefined;
                     _ = std.fmt.hexToBytes(&digest, file.version_id[4..]) catch return error.InvalidLogicalRowIdentity;
-                    try versions.put(a, try out.dupe(u8, file.file_id), .{ .prefix = prefix.prefix, .bits = prefix.bits, .name = "", .count = file.row_count, .digest = digest });
+                    try versions.put(a, try out.dupe(u8, file.file_id), .{ .prefix = prefix.prefix, .bits = prefix.bits, .name = "", .count = file.row_count, .digest = digest, .incremental = !std.mem.startsWith(u8, file.version_id, "iv1-") });
                 }
             }
         };
+        const row_changes = try changedRows(self, a, pages, previous, recipe, if (overflow[i]) null else changed_ids[i].items);
+        const deltas = try a.alloc([32]u8, self.fragments.len);
+        defer a.free(deltas);
+        @memset(deltas, @as([32]u8, @splat(0)));
+        if (previous != null and !overflow[i]) for (changed_ids[i].items) |id| {
+            const file = try fragmentFor(self.fragments, &id);
+            if (row_changes[file] == null) continue;
+            const cached = versions.get(self.fragments[file].name) orelse continue;
+            if (!cached.incremental) continue;
+            const before = try inputFingerprint(a, pages.store(), previous.?.current.input_versions, recipe.digest, id);
+            const after = try inputFingerprint(a, pages.store(), self.root.current.input_versions, recipe.digest, id);
+            xorInput(&deltas[file], id, before orelse return error.InvalidLogicalRowIdentity);
+            xorInput(&deltas[file], id, after orelse return error.InvalidLogicalRowIdentity);
+            self.input_rows_hashed += 2;
+        };
+        const key_digests = try out.alloc([32]u8, if (vectorRecipe(configs.value, recipe.name)) self.fragments.len else 0);
+        for (self.fragments[0..key_digests.len], key_digests) |fragment, *digest| {
+            var hash = std.crypto.hash.Blake3.init(.{});
+            hash.update("native-lake-logical-coordinate-file-v1");
+            hash.update(&self.root.namespace);
+            hash.update(fragment.name);
+            hash.final(digest);
+        }
         const files = try out.dupe(local.serverless_external_source_types.FileEntry, self.source.inventory.files);
-        for (self.fragments, files, dirty[i]) |fragment, *file, changed| {
+        for (self.fragments, files, dirty[i], 0..) |fragment, *file, changed, file_ordinal| {
             const cached = versions.get(fragment.name);
-            const digest = if (!changed and cached != null and cached.?.count == fragment.count) cached.?.digest else hash: {
+            const incremental = if (row_changes[file_ordinal]) |_| cached != null and cached.?.incremental and previous != null else false;
+            const digest = if (!changed and cached != null and cached.?.count == fragment.count and cached.?.incremental) cached.?.digest else if (incremental) delta_hash: {
+                var digest = cached.?.digest;
+                for (&digest, deltas[file_ordinal]) |*byte, delta| byte.* ^= delta;
+                break :delta_hash digest;
+            } else hash: {
                 var hash = std.crypto.hash.Blake3.init(.{});
-                hash.update("native-lake-logical-input-fragment-v1");
+                hash.update("native-lake-logical-input-fragment-v2");
                 hash.update(&self.root.namespace);
                 hash.update(&recipe.digest);
+                hash.update(&fragment.prefix);
+                var bits: [2]u8 = undefined;
+                std.mem.writeInt(u16, &bits, fragment.bits, .big);
+                hash.update(&bits);
+                var digest: [32]u8 = undefined;
+                hash.final(&digest);
                 var lower: [64]u8 = undefined;
                 lower[0..32].* = recipe.digest;
                 lower[32..64].* = fragment.prefix;
@@ -433,17 +504,14 @@ fn prepareInputs(self: *Build, a: A, pages: *Pages, previous: ?identity.Root) !v
                 while (try cursor.next()) |record| {
                     if (record.key.len != 64 or record.value.len != 32) return error.InvalidLogicalRowIdentity;
                     if (!std.mem.eql(u8, record.key[0..32], &recipe.digest)) break;
-                    hash.update(record.key[32..64]);
-                    hash.update(record.value);
+                    xorInput(&digest, record.key[32..64].*, record.value[0..32].*);
                     count += 1;
                     self.input_rows_hashed += 1;
                 }
                 if (count != fragment.count) return error.InvalidLogicalRowIdentity;
-                var value: [32]u8 = undefined;
-                hash.final(&value);
-                break :hash value;
+                break :hash digest;
             };
-            file.version_id = try std.fmt.allocPrint(out, "iv1-{s}", .{std.fmt.bytesToHex(&digest, .lower)});
+            file.version_id = try std.fmt.allocPrint(out, "{s}-{s}", .{ if (key_digests.len == 0) "iv2" else "iv3", std.fmt.bytesToHex(&digest, .lower) });
         }
         var source = self.source;
         source.inventory.files = files;
@@ -452,10 +520,73 @@ fn prepareInputs(self: *Build, a: A, pages: *Pages, previous: ?identity.Root) !v
         // The parent census describes the union of inputs. Recompute native
         // identities from this cohort's version descriptors.
         provider.native_delta = null;
+        provider.key_digests = key_digests;
         const nav = try navigation.build(a, out, &self.store, &provider, old, self.token);
-        view.* = .{ .name = recipe.name, .files = files, .delta = nav.delta, .navigation = nav.ref };
+        view.* = .{ .name = recipe.name, .files = files, .delta = nav.delta, .navigation = nav.ref, .changed_rows = row_changes, .key_digests = key_digests };
     }
     self.provider.fragment_views = views;
+}
+fn vectorRecipe(configs: std.json.Value, name: []const u8) bool {
+    if (configs != .object) return false;
+    const config = configs.object.get(name) orelse return false;
+    if (config != .object) return false;
+    const kind = config.object.get("type") orelse return false;
+    return kind == .string and std.mem.eql(u8, kind.string, "embeddings");
+}
+fn xorInput(digest: *[32]u8, id: [32]u8, input: [32]u8) void {
+    var hash = std.crypto.hash.Blake3.init(.{});
+    hash.update("native-lake-logical-input-row-v2");
+    hash.update(&id);
+    hash.update(&input);
+    var row: [32]u8 = undefined;
+    hash.final(&row);
+    for (digest, row) |*byte, other| byte.* ^= other;
+}
+fn inputFingerprint(a: A, storage: tree.Store, root: ?tree.Ref, cohort: [32]u8, id: [32]u8) !?[32]u8 {
+    const key = cohort ++ id;
+    var cursor = try tree.Cursor.init(a, storage, root, &key, null);
+    defer cursor.deinit();
+    const found = (try cursor.next()) orelse return null;
+    if (!std.mem.eql(u8, found.key, &key)) return null;
+    if (found.value.len != 32) return error.InvalidLogicalRowIdentity;
+    return found.value[0..32].*;
+}
+/// Optional bounded row deltas. A null file entry means rebuild that fragment.
+/// Membership changes, incompatible retained coordinates and new input cohorts
+/// cannot reuse row addresses and deliberately keep the fragment path.
+fn changedRows(self: *Build, a: A, pages: *Pages, previous: ?identity.Root, recipe: @import("lake_row_input_recipes.zig").Recipe, ids: ?[]const [32]u8) ![]const ?[]const u64 {
+    const out = self.arena.allocator();
+    const result = try out.alloc(?[]const u64, self.fragments.len);
+    @memset(result, null);
+    const prior = previous orelse return result;
+    const changes = ids orelse return result;
+    const old_native = prior.native_space orelse return result;
+    const old = prior.spaceForIndex(recipe.name);
+    if (!std.meta.eql(old.files, old_native.files) or !std.meta.eql(old.by_id, old_native.by_id)) return result;
+    if (for (prior.current.input_recipes) |candidate| {
+        if (std.mem.eql(u8, &candidate.digest, &recipe.digest)) break false;
+    } else true) return result;
+    const positions = try a.alloc(std.ArrayList(u64), self.fragments.len);
+    defer a.free(positions);
+    for (positions) |*list| list.* = .empty;
+    defer for (positions) |*list| list.deinit(a);
+    var scratch = std.heap.ArenaAllocator.init(a);
+    defer scratch.deinit();
+    var reader: identity.Reader = .{ .root = self.root, .pages = pages };
+    for (changes) |id| {
+        const file = try fragmentFor(self.fragments, &id);
+        if (self.fragments[file].membership_dirty) continue;
+        _ = scratch.reset(.retain_capacity);
+        const before = (try reader.byId(scratch.allocator(), old, id)) orelse return error.InvalidLogicalRowIdentity;
+        const after = (try reader.byId(scratch.allocator(), self.space, id)) orelse return error.InvalidLogicalRowIdentity;
+        if (!std.meta.eql(before.coordinate, after.coordinate) or after.coordinate.file != self.slots[file] or after.coordinate.group != 0) return error.InvalidLogicalRowIdentity;
+        try positions[file].append(a, after.coordinate.row);
+    }
+    for (positions, 0..) |*list, file| if (list.items.len != 0) {
+        std.mem.sort(u64, list.items, {}, std.sort.asc(u64));
+        result[file] = try out.dupe(u64, list.items);
+    };
+    return result;
 }
 pub fn indexSpace(self: *const Build, name: []const u8) identity.Space {
     var space = self.space;
@@ -948,6 +1079,7 @@ const Gather = struct {
     position: usize = 0,
     row: u64 = 0,
     tile_rows: usize = 256,
+    selected_rows: ?[]const u64 = null,
     active: ?local.sql_catalog.Cursor = null,
     page: ?*local.storage_db_types.ColumnSourcePage = null,
     refs: []const rows.RowRef = &.{},
@@ -1043,16 +1175,17 @@ const Gather = struct {
             const index = self.file orelse self.position;
             if (index >= self.owner.fragments.len) return null;
             const fragment = self.owner.fragments[index];
-            if (self.row == fragment.count) {
+            const total = if (self.selected_rows) |selected| selected.len else fragment.count;
+            if (self.row == total) {
                 if (self.file != null) return null;
                 self.position += 1;
                 self.row = 0;
                 continue;
             }
-            const count: usize = @intCast(@min(self.tile_rows, fragment.count - self.row));
+            const count: usize = @intCast(@min(self.tile_rows, total - self.row));
             const sa = self.arena.allocator();
             const refs = try sa.alloc(rows.RowRef, count);
-            for (refs, self.row..) |*ref, row| ref.* = .{ .external = .{ .identity_version = self.owner.source.inventory.row_identity_version, .source_id = self.binding.source_id, .snapshot_id = self.binding.snapshot_id, .file_id = fragment.name, .row_group_ordinal = 0, .row_ordinal = row } };
+            for (refs, self.row..) |*ref, row| ref.* = .{ .external = .{ .identity_version = self.owner.source.inventory.row_identity_version, .source_id = self.binding.source_id, .snapshot_id = self.binding.snapshot_id, .file_id = fragment.name, .row_group_ordinal = 0, .row_ordinal = if (self.selected_rows) |selected| selected[@intCast(row)] else row } };
             var reads: u64 = 0;
             var writes: u64 = 0;
             var pages = self.owner.pageStore(&reads, &writes);
@@ -1603,6 +1736,14 @@ test "external lake logical fragments skip unchanged input cohorts and hash only
             };
             try std.testing.expectEqual(@as(usize, if (step == 0) 16 else if (step == 1 and index == 1) 1 else 0), count);
         }
+        if (step == 1) {
+            var changed_count: usize = 0;
+            for (views[1].changed_rows) |selected| if (selected) |ordinals| {
+                changed_count += ordinals.len;
+                try std.testing.expectEqualSlices(u64, &.{0}, ordinals);
+            };
+            try std.testing.expectEqual(@as(usize, 1), changed_count);
+        }
         // Selecting a cohort must preserve a file-major reached frontier.
         var partial_source = next.source;
         partial_source.inventory.files = partial_source.inventory.files[0..3];
@@ -1615,7 +1756,7 @@ test "external lake logical fragments skip unchanged input cohorts and hash only
         for (0..3) |ordinal| try std.testing.expectEqual(@as(?usize, ordinal), try order.next());
         try std.testing.expectEqual(@as(?usize, null), try order.next());
         try std.testing.expectEqualSlices(u8, &(try views[0].delta.file(0)).digest, &try @import("lake_index_native_state.zig").identity(a, &selected, partial_source.inventory.files[0]));
-        try std.testing.expectEqual(@as(u64, if (step == 0) 256 else if (step == 1) 8 else 0), next.input_rows_hashed);
+        try std.testing.expectEqual(@as(u64, if (step == 0) 256 else if (step == 1) 2 else 0), next.input_rows_hashed);
         try std.testing.expectEqual(@as(u64, if (step == 0) 128 else if (step == 1) 8 else 0), next.census_rows_hashed);
         root.native_space = next.space;
         const bindings = try metadata.allocator().alloc(identity.ReusedIndex, 2);

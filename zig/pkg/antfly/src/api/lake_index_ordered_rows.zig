@@ -148,6 +148,10 @@ pub const Delta = struct {
     keep: []const bool = &.{},
     /// Explicit retirements avoid walking the complete slot mask per checkpoint.
     retired_slots: ?[]const u32 = null,
+    /// Exact physical coordinates in retained slots, sorted and unique. Old
+    /// keys come from the authenticated reverse tree, including key changes
+    /// and rows that cease to satisfy a partial index predicate.
+    retired_rows: []const [16]u8 = &.{},
     files: []const []const u8 = &.{},
     fingerprints: []const [32]u8 = &.{},
     reverse_built: bool = false,
@@ -159,6 +163,29 @@ const Retirements = struct {
     count: ?usize = null,
     position: usize = 0,
     previous: ?u32 = null,
+    rows: []const [16]u8 = &.{},
+    row_position: usize = 0,
+    const Range = struct { lower: [16]u8, upper: [16]u8, width: usize };
+    fn nextRange(self: *@This()) !?Range {
+        if (try self.next()) |slot| {
+            var range: Range = .{ .lower = @splat(0), .upper = @splat(0), .width = 4 };
+            std.mem.writeInt(u32, range.lower[0..4], @intCast(slot), .big);
+            std.mem.writeInt(u32, range.upper[0..4], @intCast(slot + 1), .big);
+            return range;
+        }
+        if (self.row_position == self.rows.len) return null;
+        const row = self.rows[self.row_position];
+        if (std.mem.readInt(u32, row[0..4], .big) >= (self.count orelse self.keep.len) or (self.row_position != 0 and std.mem.order(u8, &self.rows[self.row_position - 1], &row) != .lt)) return error.InvalidNativeLakeRowIndex;
+        self.row_position += 1;
+        var upper = row;
+        var i: usize = upper.len;
+        while (i != 0) {
+            i -= 1;
+            upper[i] +%= 1;
+            if (upper[i] != 0) return .{ .lower = row, .upper = upper, .width = 16 };
+        }
+        return error.InvalidNativeLakeRowIndex;
+    }
     fn next(self: *@This()) !?u32 {
         if (self.slots) |slots| {
             if (self.position == slots.len) return null;
@@ -217,7 +244,7 @@ pub fn publishIncremental(a: A, result_alloc: A, store: *stores.ArtifactStore, s
     var write_bytes: u64 = 512 * 1024 * 1024;
     var pages: page_store.PageStore = .{ .domain = scope.domain, .attempt = scope.attempt, .artifacts = store, .cancellation = cancellation, .remaining_read_bytes = &read_bytes, .remaining_write_bytes = &write_bytes, .streaming = true, .io = sort.manager.io };
     pages.admitPublication();
-    if (delta.sparse_slots and delta.dictionary_edits != null and delta.retired_slots != null and delta.retired_slots.?.len == 0 and sort.total == 0) {
+    if (delta.sparse_slots and delta.dictionary_edits != null and delta.retired_slots != null and delta.retired_slots.?.len == 0 and delta.retired_rows.len == 0 and sort.total == 0) {
         const previous = delta.previous orelse return error.InvalidNativeLakeRowIndex;
         const shared = delta.public_navigation orelse return error.InvalidNativeLakeRowIndex;
         if (!std.mem.eql(u8, &previous.domain, &scope.domain) or !std.mem.eql(u8, &previous.fingerprint, &fingerprint) or !std.mem.eql(u8, shared.source, inventory.source_id) or !std.mem.eql(u8, shared.snapshot, inventory.snapshot_id)) return error.InvalidNativeLakeRowIndex;
@@ -308,6 +335,7 @@ pub fn publishIncremental(a: A, result_alloc: A, store: *stores.ArtifactStore, s
         cursor: ?RunSource = null,
         keep: []const bool,
         retired: ?[]const u32 = null,
+        retired_rows: []const [16]u8 = &.{},
         file_count: usize = 0,
         old: ?tree.Cursor.Record = null,
         fresh: ?tree.Cursor.Record = null,
@@ -322,6 +350,11 @@ pub fn publishIncremental(a: A, result_alloc: A, store: *stores.ArtifactStore, s
                 }
                 const row = record.?;
                 if ((row.value.len != 16 and row.value.len != 70) or row.key.len < 16 or !std.mem.eql(u8, row.value[0..16], row.key[row.key.len - 16 ..])) return error.InvalidNativeLakeRowIndex;
+                if (std.sort.binarySearch([16]u8, self.retired_rows, row.value[0..16].*, struct {
+                    fn order(left: [16]u8, right: [16]u8) std.math.Order {
+                        return std.mem.order(u8, &left, &right);
+                    }
+                }.order) != null) continue;
                 const ordinal = std.mem.readInt(u32, row.value[0..4], .big);
                 if (self.retired) |retired| {
                     if (ordinal >= self.file_count) return error.InvalidNativeLakeRowIndex;
@@ -352,7 +385,7 @@ pub fn publishIncremental(a: A, result_alloc: A, store: *stores.ArtifactStore, s
             return fresh;
         }
     };
-    var merge: Merge = .{ .sorted = &sorted, .keep = delta.keep, .retired = if (delta.sparse_slots) delta.retired_slots orelse return error.InvalidNativeLakeRowIndex else null, .file_count = if (delta.previous) |previous| previous.fileCount() else 0 };
+    var merge: Merge = .{ .sorted = &sorted, .keep = delta.keep, .retired_rows = delta.retired_rows, .retired = if (delta.sparse_slots) delta.retired_slots orelse return error.InvalidNativeLakeRowIndex else null, .file_count = if (delta.previous) |previous| previous.fileCount() else 0 };
     if (delta.previous) |previous| {
         if (!std.mem.eql(u8, &previous.domain, &scope.domain) or !std.mem.eql(u8, &previous.fingerprint, &fingerprint) or (!delta.sparse_slots and delta.keep.len != previous.fileCount())) return error.InvalidNativeLakeRowIndex;
         merge.cursor = try RunSource.init(a, pages.store(), previous, sort.manager);
@@ -366,13 +399,9 @@ pub fn publishIncremental(a: A, result_alloc: A, store: *stores.ArtifactStore, s
     const has_delta = if (delta.previous) |previous| blk: {
         if (previous.building or delta.run_only or previous.tie_version != 1 or previous.reverse == null or (previous.page != null and previous.predicates == null)) break :blk false;
         var removed: u64 = 0;
-        var retirements: Retirements = .{ .keep = delta.keep, .slots = delta.retired_slots, .count = if (delta.sparse_slots) previous.fileCount() else null };
-        while (try retirements.next()) |slot| {
-            var lower: [4]u8 = undefined;
-            var upper: [4]u8 = undefined;
-            std.mem.writeInt(u32, &lower, @intCast(slot), .big);
-            std.mem.writeInt(u32, &upper, @intCast(slot + 1), .big);
-            removed +|= try tree.countRange(a, pages.store(), previous.reverse, &lower, &upper);
+        var retirements: Retirements = .{ .keep = delta.keep, .slots = delta.retired_slots, .rows = delta.retired_rows, .count = if (delta.sparse_slots) previous.fileCount() else null };
+        while (try retirements.nextRange()) |range| {
+            removed +|= try tree.countRange(a, pages.store(), previous.reverse, range.lower[0..range.width], range.upper[0..range.width]);
         }
         break :blk try preferPageCopyOnWrite(a, pages.store(), previous.page, sort, removed);
     } else false;
@@ -384,13 +413,9 @@ pub fn publishIncremental(a: A, result_alloc: A, store: *stores.ArtifactStore, s
         // Walk only the reverse ranges belonging to replaced/removed files.
         // Every cursor stays on the retained prior root while copy-on-write
         // mutations publish a new candidate, never a partially visible index.
-        var retirements: Retirements = .{ .keep = delta.keep, .slots = delta.retired_slots, .count = if (delta.sparse_slots) previous.fileCount() else null };
-        while (try retirements.next()) |slot| {
-            var prefix: [4]u8 = undefined;
-            std.mem.writeInt(u32, &prefix, @intCast(slot), .big);
-            var upper: [4]u8 = undefined;
-            std.mem.writeInt(u32, &upper, @intCast(slot + 1), .big);
-            var cursor = try tree.Cursor.init(a, pages.store(), previous.reverse, &prefix, &upper);
+        var retirements: Retirements = .{ .keep = delta.keep, .slots = delta.retired_slots, .rows = delta.retired_rows, .count = if (delta.sparse_slots) previous.fileCount() else null };
+        while (try retirements.nextRange()) |range| {
+            var cursor = try tree.Cursor.init(a, pages.store(), previous.reverse, range.lower[0..range.width], range.upper[0..range.width]);
             defer cursor.deinit();
             var batch_arena = std.heap.ArenaAllocator.init(a);
             defer batch_arena.deinit();
@@ -1496,6 +1521,28 @@ test "external lake ordered deltas retain untouched pages and delete only one fi
     var iterator = after.refs.keyIterator();
     while (iterator.next()) |key| retained += @intFromBool(before.refs.contains(key.*));
     try std.testing.expect(retained > 2);
+    // An input-only update changes the key of row zero and removes row 17
+    // (as a partial-index predicate could do). Every other row stays retained.
+    var row_patch = local.sql_spill.Sort.init(a, &manager, &.{.{}}, 64 * 1024);
+    defer row_patch.deinit();
+    try Make.add(&row_patch, 40000, 0, 0);
+    const row0 = coordinate(0, .{ .source_id = "lake", .snapshot_id = "snapshot", .file_id = "a", .row_group_ordinal = 0, .row_ordinal = 0 });
+    const row17 = coordinate(0, .{ .source_id = "lake", .snapshot_id = "snapshot", .file_id = "a", .row_group_ordinal = 0, .row_ordinal = 17 });
+    const patched_ref = try publishIncremental(a, ca, &store, &row_patch, "ordered", @splat(3), inventory, &.{}, .none, .{ .previous = next, .keep = &.{ true, true }, .retired_rows = &.{ row0, row17 }, .files = &.{ "a", "b" }, .fingerprints = &.{ @splat(3), @splat(2) } });
+    const patched = try loadRoot(ca, store, patched_ref, .none, null);
+    try std.testing.expectEqual(@as(u64, 16384), patched.page.?.records);
+    try std.testing.expectEqual(patched.page.?.records, patched.reverse.?.records);
+    var patched_reader: Reader = undefined;
+    try patched_reader.init(a, &store, patched, @splat(3), "", null, .none);
+    defer patched_reader.deinit();
+    const points = try patched_reader.entriesAtPhysical(ca, &.{
+        .{ .external = .{ .source_id = "lake", .snapshot_id = "snapshot", .file_id = "a", .row_group_ordinal = 0, .row_ordinal = 0 } },
+        .{ .external = .{ .source_id = "lake", .snapshot_id = "snapshot", .file_id = "a", .row_group_ordinal = 0, .row_ordinal = 17 } },
+        .{ .external = .{ .source_id = "lake", .snapshot_id = "snapshot", .file_id = "a", .row_group_ordinal = 0, .row_ordinal = 128 } },
+    });
+    try std.testing.expectEqual(@as(u32, 40000), std.mem.readInt(u32, points[0].?.key[0..4], .big));
+    try std.testing.expect(points[1] == null);
+    try std.testing.expectEqual(@as(u32, 128), std.mem.readInt(u32, points[2].?.key[0..4], .big));
     store.upload_scope.?.attempt = @splat(3);
     var replacement = local.sql_spill.Sort.init(a, &manager, &.{.{}}, 64 * 1024);
     defer replacement.deinit();

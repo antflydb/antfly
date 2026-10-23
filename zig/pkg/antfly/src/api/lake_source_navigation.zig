@@ -245,7 +245,7 @@ fn proofLower(proofs: []const Proof, id: [32]u8, inclusive: bool) usize {
     }
     return lo;
 }
-pub const Record = struct { file: local.serverless_external_source_types.FileEntry, digest: [32]u8, deletes: [32]u8 };
+pub const Record = struct { file: local.serverless_external_source_types.FileEntry, digest: [32]u8, deletes: [32]u8, key_digest: ?[32]u8 = null };
 /// Logical census commitment stays stable across attempt-scoped page rewrites.
 /// Include the predecessor separately when authorizing a partial checkpoint.
 pub fn cutIdentity(a: A, root: Root) ![32]u8 {
@@ -523,9 +523,9 @@ pub fn buildProven(a: A, out: A, store: *stores.ArtifactStore, provider: *Provid
         // unchanged compatible subtree. Only mutations need full records.
         if (!compatible) {
             const deletes = if (provider.source.prepared_deletes) |prepared| try prepared.fileFingerprint(file.file_id) else local.serverless_query_lake_prepared_deletes.Prepared.emptyFileFingerprint();
-            const bytes = try std.json.Stringify.valueAlloc(sa, Record{ .file = qualified(provider, file), .digest = digest, .deletes = deletes }, .{});
+            const bytes = try std.json.Stringify.valueAlloc(sa, Record{ .file = qualified(provider, file), .digest = digest, .deletes = deletes, .key_digest = if (i < provider.key_digests.len) provider.key_digests[i] else null }, .{});
             try files.add(&key(file.file_id), bytes);
-            try private.add(&digest, file.file_id);
+            try private.add(if (i < provider.key_digests.len) &provider.key_digests[i] else &digest, file.file_id);
             if (files.changes.items.len >= 64) {
                 try files.flush(file_storage, &root.files);
                 try private.flush(pages.store(), &root.private);
@@ -615,9 +615,9 @@ pub fn buildProven(a: A, out: A, store: *stores.ArtifactStore, provider: *Provid
                     self.changed[i] = !std.mem.eql(u8, &old.digest, &self.current[i].digest);
                     if (!self.changed[i]) return;
                 }
-                try self.prior_changed.append(self.out, .{ .id = try self.out.dupe(u8, old.file.file_id), .digest = old.digest, .aggregate_digest = @import("lake_index_native_aggregates.zig").inventoryFileIdentity(self.provider.source.inventory, old.file) });
+                try self.prior_changed.append(self.out, .{ .id = try self.out.dupe(u8, old.file.file_id), .digest = old.digest, .key_digest = old.key_digest, .aggregate_digest = @import("lake_index_native_aggregates.zig").inventoryFileIdentity(self.provider.source.inventory, old.file) });
                 try self.files.add(id, null);
-                try self.private.add(&old.digest, null);
+                try self.private.add(if (old.key_digest) |*digest| digest else &old.digest, null);
                 if (self.files.changes.items.len >= 64) {
                     try self.files.flush(self.file_storage, &self.root.files);
                     try self.private.flush(self.storage, &self.root.private);
@@ -642,9 +642,9 @@ pub fn buildProven(a: A, out: A, store: *stores.ArtifactStore, provider: *Provid
             _ = scratch.reset(.retain_capacity);
             const sa = scratch.allocator();
             const deletes = if (provider.source.prepared_deletes) |prepared| try prepared.fileFingerprint(file.file_id) else local.serverless_query_lake_prepared_deletes.Prepared.emptyFileFingerprint();
-            const bytes = try std.json.Stringify.valueAlloc(sa, Record{ .file = qualified(provider, file), .digest = state.digest, .deletes = deletes }, .{});
+            const bytes = try std.json.Stringify.valueAlloc(sa, Record{ .file = qualified(provider, file), .digest = state.digest, .deletes = deletes, .key_digest = if (item.ordinal < provider.key_digests.len) provider.key_digests[item.ordinal] else null }, .{});
             try files.add(&key(file.file_id), bytes);
-            try private.add(&state.digest, file.file_id);
+            try private.add(if (item.ordinal < provider.key_digests.len) &provider.key_digests[item.ordinal] else &state.digest, file.file_id);
             if (files.changes.items.len >= 64) {
                 try files.flush(file_storage, &root.files);
                 try private.flush(pages.store(), &root.private);
@@ -1149,7 +1149,7 @@ pub const Resolver = struct {
         const bytes = (try self.point(sa, self.root.files, &key(file_id))) orelse return error.ExternalLakeSnapshotMismatch;
         const record = try std.json.parseFromSliceLeaky(Record, sa, bytes, .{});
         if (!std.mem.eql(u8, record.file.file_id, file_id)) return error.ExternalLakeSnapshotMismatch;
-        const hex = std.fmt.bytesToHex(record.digest, .lower);
+        const hex = std.fmt.bytesToHex(record.key_digest orelse record.digest, .lower);
         return self.remember(&self.digest_memo, file_id, &hex) orelse try a.dupe(u8, &hex);
     }
 };

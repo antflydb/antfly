@@ -63,6 +63,15 @@ pub const Column = struct {
         bytes: std.ArrayList(Bytes),
         dynamic: std.ArrayList(operators.Aggregate),
     };
+    const paging = @import("execution_pager.zig");
+    const Paged = union(enum) {
+        counts: paging.Array(u64),
+        integers: paging.Array(Integer),
+        numbers: paging.Array(Number),
+        booleans: paging.Array(Boolean),
+    };
+    page_manager: ?*@import("spill.zig").Manager = null,
+    paged: ?Paged = null,
     spec: operators.AggregateSpec,
     values: Values,
     pub fn init(spec: operators.AggregateSpec) Column {
@@ -81,7 +90,37 @@ pub const Column = struct {
             .pattern_set => unreachable,
         } };
     }
+    const PageView = struct { column: Column, lease: paging.Pager.Lease };
+    fn pageView(self: *const Column, index: usize, write: bool) !PageView {
+        switch (self.paged.?) {
+            inline else => |array, tag| {
+                const pinned = try array.pin(index, write);
+                return .{ .lease = pinned.lease, .column = .{ .spec = self.spec, .values = @unionInit(Values, @tagName(tag), .{ .items = @as([*]@TypeOf(pinned.value.*), @ptrCast(pinned.value))[0..1], .capacity = 1, .pointer_stability = .{} }) } };
+            },
+        }
+    }
+    fn startPaging(self: *Column, a: A) !void {
+        if (self.page_manager == null or self.paged != null) return;
+        const manager = self.page_manager.?;
+        if (manager.page_residency_bytes < paging.page_bytes) return;
+        if (self.spec.kind == .min or self.spec.kind == .max) return;
+        switch (self.values) {
+            inline .counts, .integers, .numbers, .booleans => |*values, tag| {
+                if (values.items.len < 2048) return;
+                var array: @FieldType(Paged, @tagName(tag)) = .{ .pager = try manager.pager() };
+                errdefer array.deinit();
+                for (values.items) |value| try array.append(value);
+                values.clearAndFree(a);
+                self.paged = @unionInit(Paged, @tagName(tag), array);
+            },
+            else => {},
+        }
+    }
     pub fn clear(self: *Column, a: A) void {
+        if (self.paged) |*paged| switch (paged.*) {
+            inline else => |*array| array.deinit(),
+        };
+        self.paged = null;
         switch (self.values) {
             .fixed => |values| for (values.items) |*value| value.clear(),
             .bytes => |values| for (values.items) |value| if (value.value) |bytes| a.free(bytes),
@@ -94,6 +133,16 @@ pub const Column = struct {
         }
     }
     pub fn append(self: *Column, a: A) !void {
+        try self.startPaging(a);
+        if (self.paged) |*paged| {
+            switch (paged.*) {
+                .counts => |*array| try array.append(0),
+                .integers => |*array| try array.append(.{}),
+                .numbers => |*array| try array.append(.{}),
+                .booleans => |*array| try array.append(.{ .value = self.spec.kind == .bool_and }),
+            }
+            return;
+        }
         try operators.Aggregate.validate(self.spec.kind, self.spec.input_type);
         switch (self.values) {
             .fixed => |*values| try values.append(a, .{ .alloc = a }),
@@ -112,6 +161,11 @@ pub const Column = struct {
         }
     }
     pub fn snapshot(self: *const Column, a: A, index: usize) !operators.Aggregate {
+        if (self.paged != null) {
+            const view = try self.pageView(index, false);
+            defer view.lease.release();
+            return view.column.snapshot(a, 0);
+        }
         var state: operators.Aggregate = .{ .alloc = a, .kind = self.spec.kind, .input_type = self.spec.input_type, .input_element = self.spec.input_element, .boolean = self.spec.kind == .bool_and };
         var selected: ?Datum = null;
         var fixed_digits: @import("numeric_value.zig").ScaledInteger = undefined;
@@ -162,7 +216,12 @@ pub const Column = struct {
         }
         return state;
     }
-    pub fn set(self: *Column, index: usize, state: operators.Aggregate) void {
+    pub fn set(self: *Column, index: usize, state: operators.Aggregate) !void {
+        if (self.paged != null) {
+            var view = try self.pageView(index, true);
+            defer view.lease.release();
+            return view.column.set(0, state);
+        }
         switch (self.values) {
             .counts => |*v| v.items[index] = state.count,
             .integers => |*v| {
@@ -194,6 +253,8 @@ pub const Column = struct {
         self.values = .{ .dynamic = states };
     }
     pub fn appendGrowth(self: *const Column, additional: usize) usize {
+        if (self.paged != null) return additional *| @sizeOf(usize);
+
         return switch (self.values) {
             inline else => |values| blk: {
                 const required = values.items.len +| additional;
@@ -259,6 +320,11 @@ pub const Column = struct {
         return .{ .coefficient = coefficient, .scale = number.scale };
     }
     pub fn update(self: *Column, a: A, index: usize, value: Datum) !void {
+        if (self.paged != null) {
+            var view = try self.pageView(index, true);
+            defer view.lease.release();
+            return view.column.update(a, 0, value);
+        }
         if (self.values == .dynamic) return self.values.dynamic.items[index].update(value);
         if (value.sql_null) return;
         if (self.values == .fixed) {
@@ -333,11 +399,16 @@ pub const Column = struct {
         }
         var state = try self.snapshot(a, index);
         try state.update(value);
-        self.set(index, state);
+        try self.set(index, state);
     }
     /// Dispatch once per aggregate vector. Each group's lane order remains
     /// stable, including compensated floating reductions in the fallback.
     pub fn updateBatch(self: *Column, a: A, ids: []const usize, values: []const Datum) !void {
+        if (self.paged != null) {
+            if (ids.len != values.len) return error.InvalidSqlBackendResponse;
+            for (ids, values) |id, value| try self.update(a, id, value);
+            return;
+        }
         if (ids.len != values.len) return error.InvalidSqlBackendResponse;
         switch (self.values) {
             .counts => |*counts| for (ids, values) |id, value| {
@@ -383,6 +454,15 @@ pub const Column = struct {
     /// Iterate source lanes in order so floating and dynamic reductions retain
     /// exactly the same update order as the scalar path.
     pub fn updateEncoded(self: *Column, a: A, ids: []const usize, batch: @import("execution_batch.zig").Batch) !void {
+        if (self.paged != null) {
+            if (batch.width() != 1 or batch.len() != ids.len) return error.InvalidSqlBackendResponse;
+            if (batch == .reader) if (batch.reader.cohort) |cohort| return self.updateCohort(a, ids, cohort.source.*, cohort.positions);
+            var scratch = std.heap.ArenaAllocator.init(@import("memory_budget.zig").reclaimingAllocator(a));
+            defer scratch.deinit();
+            if (try batch.physicalColumn(scratch.allocator(), 0)) |physical| if (try self.updatePhysical(a, ids, physical)) return;
+            for (ids, 0..) |id, row| try self.update(a, id, try batch.cell(scratch.allocator(), row, 0));
+            return;
+        }
         if (batch.width() != 1 or batch.len() != ids.len) return error.InvalidSqlBackendResponse;
         if (batch == .reader) if (batch.reader.cohort) |cohort| {
             return self.updateCohort(a, ids, cohort.source.*, cohort.positions);
@@ -475,6 +555,16 @@ pub const Column = struct {
     /// Dispatch once per state/vector pair. Nulls and selections stay physical;
     /// dictionary IDs are gathered directly without creating Datum arrays.
     pub fn updatePhysical(self: *Column, a: A, ids: []const usize, physical: @import("execution_batch.zig").PhysicalColumn) !bool {
+        if (self.paged != null) {
+            if (physical.len() != ids.len) return error.InvalidSqlBackendResponse;
+            try physical.validate();
+            for (ids, 0..) |id, row| {
+                if (self.values == .counts) {
+                    if (!physical.vector.nulls.isNull(physical.rowAt(row))) try self.update(a, id, Datum.json(.{ .integer = 0 }));
+                } else try self.update(a, id, try physical.cell(row));
+            }
+            return true;
+        }
         if (physical.len() != ids.len) return error.InvalidSqlBackendResponse;
         const compatible = switch (self.values) {
             .counts => true,
@@ -570,6 +660,15 @@ pub const Column = struct {
     }
     /// Merge one validated AGS column after a shared destination-key census.
     pub fn mergeFixedBatch(self: *Column, a: A, ids: []const usize, states: []const @import("aggregate_partial.zig").Fixed) !void {
+        if (self.paged != null) {
+            if (ids.len != states.len) return error.InvalidSqlBackendResponse;
+            for (ids, states) |id, state| {
+                var view = try self.pageView(id, true);
+                defer view.lease.release();
+                try view.column.mergeFixedBatch(a, &.{0}, &.{state});
+            }
+            return;
+        }
         if (ids.len != states.len) return error.InvalidSqlBackendResponse;
         switch (self.values) {
             .counts => |*target| for (ids, states) |id, from| {
@@ -628,6 +727,12 @@ pub const Column = struct {
     }
     /// Selection vectors keep partial states typed across hash-owner exchanges.
     pub fn mergeSelectedBatch(self: *Column, a: A, ids: []const usize, source: *const Column, begin: usize, indices: ?[]const usize) !void {
+        if (self.paged != null or source.paged != null) {
+            if (indices) |selected| if (selected.len != ids.len) return error.InvalidSqlBackendResponse;
+            if (!std.meta.eql(self.spec, source.spec)) return error.InvalidSqlBackendResponse;
+            for (ids, 0..) |id, lane| try self.mergeExact(a, id, try source.snapshot(a, if (indices) |selected| selected[lane] else begin + lane));
+            return;
+        }
         if (indices) |selected| if (selected.len != ids.len) return error.InvalidSqlBackendResponse;
         if (!std.meta.eql(self.spec, source.spec)) return error.InvalidSqlBackendResponse;
         if (std.meta.activeTag(self.values) != std.meta.activeTag(source.values)) {
@@ -723,6 +828,11 @@ pub const Column = struct {
         return 0;
     }
     pub fn mergeExact(self: *Column, a: A, index: usize, state: operators.Aggregate) !void {
+        if (self.paged != null) {
+            var view = try self.pageView(index, true);
+            defer view.lease.release();
+            return view.column.mergeExact(a, 0, state);
+        }
         if (state.kind != self.spec.kind or state.input_type != self.spec.input_type or state.input_element != self.spec.input_element or state.distinct != self.spec.distinct) return error.InvalidSqlBackendResponse;
         if (self.values == .exact) {
             const reducer = state.numeric orelse return error.InvalidSqlBackendResponse;
@@ -750,7 +860,7 @@ pub const Column = struct {
         if (self.values == .numbers) {
             var target = try self.snapshot(a, index);
             try @import("aggregate_partial.zig").merge(&target, state);
-            self.set(index, target);
+            try self.set(index, target);
             return;
         }
         switch (self.values) {
@@ -776,6 +886,7 @@ pub const Column = struct {
         }
     }
     pub fn finish(self: *const Column, index: usize) !Datum {
+        if (self.paged != null) return (try self.snapshot(std.heap.page_allocator, index)).finish();
         if (self.values == .fixed) return self.values.fixed.items[index].finish();
         if (self.values == .exact) return if (try self.values.exact.items[index].finish(self.spec.kind == .avg)) |value| Datum.typedNumeric(value) else .{};
         if (self.values == .dynamic) return self.values.dynamic.items[index].finish();
@@ -1055,4 +1166,26 @@ fn nativeExtremaScenario(a: A) !void {
 test "lake SQL native decimal COUNT and extrema retain scales merge typed state and promote wide values" {
     try nativeExtremaScenario(std.testing.allocator);
     try std.testing.checkAllAllocationFailures(std.testing.allocator, nativeExtremaScenario, .{});
+}
+
+test "SQL execution pager grouping preserves compact cohort lane identities" {
+    const a = std.testing.allocator;
+    const Check = struct {
+        fn check(_: *anyopaque) !void {}
+    };
+    var marker: u8 = 0;
+    var manager: @import("spill.zig").Manager = .{ .alloc = a, .io = std.testing.io, .context = &marker, .checkpoint = Check.check };
+    defer manager.deinit();
+    var column = Column.init(.{ .kind = .count });
+    column.page_manager = &manager;
+    defer column.clear(a);
+    for (0..3000) |_| try column.append(a);
+    try std.testing.expect(column.paged != null);
+    var ids: [32]usize = undefined;
+    for (&ids, 0..) |*id, lane| id.* = 2999 - lane;
+    const source: @import("execution_batch.zig").Batch = .{ .rows = &.{ &.{Datum.json(.{ .integer = 1 })}, &.{Datum.json(.{ .integer = 1 })} } };
+    try column.updateCohort(a, &ids, source, &.{ 4, 7 });
+    try std.testing.expectEqual(@as(i64, 1), (try column.finish(2995)).value.integer);
+    try std.testing.expectEqual(@as(i64, 1), (try column.finish(2992)).value.integer);
+    try std.testing.expectEqual(@as(i64, 0), (try column.finish(2999)).value.integer);
 }

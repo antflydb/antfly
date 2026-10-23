@@ -1647,6 +1647,12 @@ pub fn extractDenseVectorFieldFromParsed(
 ) !?[]f32 {
     if (root != .object) return null;
     const field = root.object.get(field_name) orelse return null;
+    return extractDenseVectorFromValue(alloc, field, dims);
+}
+
+/// Field-oriented producers share document vector validation without building
+/// a synthetic object around an already selected value.
+pub fn extractDenseVectorFromValue(alloc: Allocator, field: std.json.Value, dims: u32) !?[]f32 {
     if (field != .array) return null;
     if (field.array.items.len != dims) return error.InvalidVectorDimensions;
     const values = try alloc.alloc(f32, dims);

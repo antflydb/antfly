@@ -42,6 +42,7 @@ const Entry = struct {
     slots: std.AutoHashMapUnmanaged(usize, dictionaries.Edit) = .empty,
     edits: []dictionaries.Edit = &.{},
     retired: []const u32 = &.{},
+    retired_rows: []const [16]u8 = &.{},
     published: ?local.serverless_manifest_artifact_ref.ArtifactRef = null,
     arena: std.heap.ArenaAllocator,
     fn deinit(self: *Entry, a: A) void {
@@ -138,6 +139,8 @@ fn planSlots(a: A, out: A, entry: *Entry, provider: *Provider, store: *stores.Ar
         try edits.put(a, slot, .{ .slot = slot, .file = try out.dupe(u8, old.id), .fingerprint = @splat(0) });
         if (!delta.by_id.contains(old.id)) try vacant.append(a, slot);
     }
+    var row_edits: std.ArrayList([16]u8) = .empty;
+    defer row_edits.deinit(a);
     var count = roots.count;
     var plan = try state.Plan.fromDelta(a, out, delta);
     defer plan.deinit();
@@ -165,7 +168,17 @@ fn planSlots(a: A, out: A, entry: *Entry, provider: *Provider, store: *stores.Ar
             count = std.math.add(u32, count, 1) catch return error.LakeSidecarBuildLimitExceeded;
             break :allocate next;
         };
-        if (!entry.resuming and slot < roots.count) try retired.put(a, slot, {});
+        if (!entry.resuming and slot < roots.count) {
+            if (if (entry.root.reverse != null) provider.rowsForFile(item.ordinal) else null) |rows| {
+                _ = retired.remove(slot);
+                for (rows) |row| {
+                    var coordinate: [16]u8 = @splat(0);
+                    std.mem.writeInt(u32, coordinate[0..4], slot, .big);
+                    std.mem.writeInt(u64, coordinate[8..16], row, .big);
+                    try row_edits.append(a, coordinate);
+                }
+            } else try retired.put(a, slot, {});
+        }
         const edit: dictionaries.Edit = .{ .slot = slot, .file = try out.dupe(u8, item.file.id), .fingerprint = item.file.digest };
         try entry.slots.put(a, item.ordinal, edit);
         var pending = edit;
@@ -185,6 +198,12 @@ fn planSlots(a: A, out: A, entry: *Entry, provider: *Provider, store: *stores.Ar
     for (selected) |*slot| slot.* = slots.next().?.*;
     std.mem.sort(u32, selected, {}, std.sort.asc(u32));
     entry.retired = selected;
+    std.mem.sort([16]u8, row_edits.items, {}, struct {
+        fn less(_: void, left: [16]u8, right: [16]u8) bool {
+            return std.mem.order(u8, &left, &right) == .lt;
+        }
+    }.less);
+    entry.retired_rows = try out.dupe([16]u8, row_edits.items);
 }
 /// Private append checkpoints already own their exact immutable predecessor.
 /// Extend the slot/name/public trees and ordered pages for one reached file,
@@ -289,6 +308,7 @@ pub fn build(a: A, out: A, provider: *Provider, store: *stores.ArtifactStore, sc
         }
         const selected = (try seed(ca, a, store, binding, name, parent.fingerprint(tuple, predicate, cover), candidates, provider, token)) orelse return null;
         const root = selected.root;
+        if (provider.changed_rows.len != 0 and root.reverse == null) return null;
         var entry: Entry = .{ .tuple = tuple, .predicate = predicate, .binding = binding, .name = name, .cover = cover, .root = root, .resuming = selected.resuming, .sort = spill.Sort.init(a, manager, &.{.{}}, 512 * 1024), .arena = .init(a) };
         transferred = true;
         errdefer entry.deinit(a);
@@ -301,7 +321,7 @@ pub fn build(a: A, out: A, provider: *Provider, store: *stores.ArtifactStore, sc
         var changed_files = entry.slots.keyIterator();
         while (changed_files.next()) |ordinal| {
             const file = provider.source.inventory.files[ordinal.*];
-            changed_rows +|= file.row_count;
+            changed_rows +|= if (provider.rowsForFile(ordinal.*)) |rows| rows.len else file.row_count;
             if (file.row_count == 0) unknown_files += 1;
         }
         const prior_rows = if (root.page) |page| page.records else 0;
@@ -338,6 +358,12 @@ pub fn build(a: A, out: A, provider: *Provider, store: *stores.ArtifactStore, sc
             var input = provider.*;
             input.only_files = null;
             input.only_file = item.ordinal;
+            // Every cohort uses the same proven input cut. Legacy roots without
+            // a reverse tree retain whole-fragment invalidation and scanning.
+            const row_delta = for (cohort) |entry| {
+                if (entry.slots.contains(item.ordinal) and entry.root.reverse == null) break false;
+            } else true;
+            if (row_delta) input.only_ordinals = provider.rowsForFile(item.ordinal);
             const rows = try input.provider().open_with_cancellation_fn.?(input.provider().ptr, a, binding, token);
             defer rows.deinit(a);
             while (try rows.next(a)) |batch| for (cohort) |*entry| {
@@ -355,6 +381,7 @@ pub fn build(a: A, out: A, provider: *Provider, store: *stores.ArtifactStore, sc
                     .previous = entry.root,
                     .sparse_slots = true,
                     .retired_slots = if (first_checkpoint) entry.retired else &.{},
+                    .retired_rows = if (first_checkpoint) entry.retired_rows else &.{},
                     .dictionary_edits = edits,
                     .public_navigation = delta.public_navigation,
                     .source_cut = delta.source_cut,
@@ -377,6 +404,7 @@ pub fn build(a: A, out: A, provider: *Provider, store: *stores.ArtifactStore, sc
                 .previous = entry.root,
                 .sparse_slots = true,
                 .retired_slots = entry.retired,
+                .retired_rows = entry.retired_rows,
                 .dictionary_edits = entry.edits,
                 .public_navigation = delta.public_navigation,
                 .source_cut = delta.source_cut,

@@ -25,6 +25,7 @@ const Cancellation = @import("antfly_cancellation").CancellationToken;
 pub const File = struct {
     id: []const u8,
     digest: [32]u8,
+    key_digest: ?[32]u8 = null,
     aggregate_digest: ?[32]u8 = null,
     docs: []const artifacts.ChunkRef = &.{},
     count: u64 = 0,
@@ -110,6 +111,7 @@ pub fn validate(files: []const File, domain: [32]u8) !void {
     var names: std.StringHashMapUnmanaged(void) = .empty;
     defer names.deinit(std.heap.page_allocator);
     for (files) |file| {
+        if (file.key_digest) |digest| if (std.mem.allEqual(u8, &digest, 0)) return error.InvalidNativeLakeFileState;
         if (file.key_width != 96 and file.key_width != 108) return error.InvalidNativeLakeFileState;
         if (file.id.len == 0 or std.mem.allEqual(u8, &file.digest, 0) or (try names.getOrPut(std.heap.page_allocator, file.id)).found_existing) return error.InvalidNativeLakeFileState;
         var count: u64 = 0;
@@ -247,6 +249,9 @@ pub const Plan = struct {
     append_provider: ?*Provider = null,
     force_all: bool = false,
     borrowed_positions: bool = false,
+    key_digests: []const [32]u8 = &.{},
+    row_changes: []const ?[]const u64 = &.{},
+    partial_files: std.AutoHashMapUnmanaged(usize, void) = .empty,
     updates: std.AutoHashMapUnmanaged(usize, File) = .empty,
     prior_directory: ?@import("../serverless/graph_segment/page_tree.zig").Ref = null,
     prior_files: []const File = &.{},
@@ -260,7 +265,7 @@ pub const Plan = struct {
             const end = work.end orelse ordinal + 1;
             if (end <= ordinal or end != provider.source.inventory.files.len or previous.len != 0 or (if (directory) |root| root.records else 0) != ordinal) return error.InvalidNativeLakeFileState;
             const input = provider.source.inventory.files[ordinal];
-            var self: Plan = .{ .a = a, .append_provider = provider, .by_id = work.positions orelse return error.InvalidNativeLakeFileState, .borrowed_positions = true, .append_file = .{ .ordinal = ordinal, .file = .{ .id = input.file_id, .digest = try identity(a, provider, input) } }, .append_count = end, .prior_directory = directory };
+            var self: Plan = .{ .a = a, .key_digests = provider.key_digests, .append_provider = provider, .by_id = work.positions orelse return error.InvalidNativeLakeFileState, .borrowed_positions = true, .append_file = .{ .ordinal = ordinal, .file = .{ .id = input.file_id, .digest = try identity(a, provider, input) } }, .append_count = end, .prior_directory = directory };
             errdefer self.deinit();
             if (self.by_id.get(input.file_id) != ordinal) return error.InvalidNativeLakeFileState;
             for (provider.source.inventory.files[ordinal..end], ordinal..) |entry, index| {
@@ -271,15 +276,15 @@ pub const Plan = struct {
         if (!has_seed or delta_compatible or previous.len == 0 and directory == null) if (provider.native_delta) |delta| if (delta.selection) |selection| {
             const inventory = provider.source.inventory;
             if (!std.mem.eql(u8, delta.source, inventory.source_id) or !std.mem.eql(u8, delta.schema, inventory.schema_fingerprint) or delta.count() != inventory.files.len) return error.ExternalLakeSnapshotMismatch;
-            return .{ .a = a, .selection = selection, .borrowed_positions = true, .force_all = !has_seed or directory == null and previous.len == 0, .by_id = delta.by_id, .prior_directory = directory, .prior_files = previous, .source_delta = delta };
+            return .{ .a = a, .key_digests = provider.key_digests, .row_changes = if (has_seed and delta_compatible) provider.changed_rows else &.{}, .selection = selection, .borrowed_positions = true, .force_all = !has_seed or directory == null and previous.len == 0, .by_id = delta.by_id, .prior_directory = directory, .prior_files = previous, .source_delta = delta };
         };
-        var self: Plan = .{ .a = a, .by_id = .{ .catalog = provider.source.catalog() }, .files = try out.alloc(File, provider.source.inventory.files.len), .changed = try a.alloc(bool, provider.source.inventory.files.len) };
+        var self: Plan = .{ .a = a, .key_digests = provider.key_digests, .row_changes = if (has_seed and delta_compatible) provider.changed_rows else &.{}, .by_id = .{ .catalog = provider.source.catalog() }, .files = try out.alloc(File, provider.source.inventory.files.len), .changed = try a.alloc(bool, provider.source.inventory.files.len) };
         errdefer self.deinit();
         var old: std.StringHashMapUnmanaged(*const File) = .empty;
         defer old.deinit(a);
         for (previous) |*file| try old.put(a, file.id, file);
         for (provider.source.inventory.files, self.files, self.changed, 0..) |file, *state, *changed, index| {
-            state.* = .{ .id = file.file_id, .digest = try identity(a, provider, file) };
+            state.* = .{ .id = file.file_id, .digest = try identity(a, provider, file), .key_digest = if (index < provider.key_digests.len) provider.key_digests[index] else null };
             changed.* = true;
             if (old.get(file.file_id)) |prior| if (std.mem.eql(u8, &prior.digest, &state.digest)) {
                 state.docs = prior.docs;
@@ -315,15 +320,15 @@ pub const Plan = struct {
         return if (self.selection) |selection| selection.files.len else self.files.len;
     }
     pub fn stateAt(self: *const Plan, index: usize) !File {
-        if (self.updates.get(index)) |value| return value;
-        if (self.append_file) |item| {
+        var file: File = if (self.updates.get(index)) |value| value else if (self.append_file) |item| append: {
             if (index >= self.append_count) return error.InvalidNativeLakeFileState;
-            if (index == item.ordinal) return item.file;
+            if (index == item.ordinal) break :append item.file;
             const provider = self.append_provider.?;
             const input = provider.source.inventory.files[index];
-            return .{ .id = input.file_id, .digest = try identity(self.a, provider, input) };
-        }
-        return if (self.selection) |selection| selection.file(index) else self.files[index];
+            break :append .{ .id = input.file_id, .digest = try identity(self.a, provider, input) };
+        } else if (self.selection) |selection| try selection.file(index) else self.files[index];
+        if (index < self.key_digests.len) file.key_digest = self.key_digests[index];
+        return file;
     }
     pub fn mutable(self: *Plan, index: usize) !*File {
         if (!self.isPaged()) return &self.files[index];
@@ -350,7 +355,7 @@ pub const Plan = struct {
             }
             if (self.sparse) |*iterator_| {
                 const item = (try iterator_.next()) orelse return null;
-                return .{ .ordinal = item.ordinal, .file = self.plan.updates.get(item.ordinal) orelse item.file };
+                return .{ .ordinal = item.ordinal, .file = try self.plan.stateAt(item.ordinal) };
             }
             while (self.position < self.plan.count()) {
                 const index = self.position;
@@ -423,6 +428,7 @@ pub const Plan = struct {
     pub fn deinit(self: *Plan) void {
         self.a.free(self.changed);
         self.updates.deinit(self.a);
+        self.partial_files.deinit(self.a);
         if (!self.borrowed_positions) self.by_id.deinit(self.a);
     }
     pub fn privateKey(self: *const Plan, a: A, ref: local.storage_rowsource_types.RowRef) ![]u8 {
@@ -431,7 +437,24 @@ pub const Plan = struct {
             else => return error.SidecarSourceBindingMismatch,
         };
         const file = self.by_id.get(row.file_id) orelse return error.SidecarSourceBindingMismatch;
-        return std.fmt.allocPrint(a, "lake2:{s}:{x:0>8}:{x:0>16}", .{ std.fmt.bytesToHex(&(try self.stateAt(file)).digest, .lower), row.row_group_ordinal, row.row_ordinal });
+        const state = try self.stateAt(file);
+        return std.fmt.allocPrint(a, "lake2:{s}:{x:0>8}:{x:0>16}", .{ std.fmt.bytesToHex(&(state.key_digest orelse state.digest), .lower), row.row_group_ordinal, row.row_ordinal });
+    }
+    pub fn enableRowDeltas(self: *Plan, provider: *Provider, snapshot: []const u8) void {
+        if (provider.resume_work != null or provider.key_digests.len != self.count()) return;
+        const delta = provider.native_delta orelse return;
+        const prior = delta.prior_snapshot orelse return;
+        if (std.mem.eql(u8, prior, snapshot)) self.row_changes = provider.changed_rows;
+    }
+    pub fn patchRows(self: *const Plan, index: usize) ?[]const u64 {
+        if (!self.partial_files.contains(index) or index >= self.row_changes.len) return null;
+        return self.row_changes[index];
+    }
+    fn canPatch(self: *const Plan, file: File) bool {
+        const index = self.by_id.get(file.id) orelse return false;
+        if (self.force_all or index >= self.row_changes.len or self.row_changes[index] == null or index >= self.key_digests.len) return false;
+        const prior_key = file.key_digest orelse return false;
+        return std.mem.eql(u8, &prior_key, &self.key_digests[index]);
     }
     pub fn unchanged(self: *const Plan, file: File) bool {
         if (self.append_file) |item| return (self.by_id.get(file.id) orelse return false) < item.ordinal;
@@ -460,8 +483,12 @@ pub const Tracker = struct {
         self.pending.deinit(self.a);
     }
     pub fn append(self: *Tracker, ref: local.storage_rowsource_types.RowRef, key: []const u8) !void {
-        if ((key.len != 96 and key.len != 108) or !std.mem.startsWith(u8, key, "lake2:")) return error.InvalidNativeLakeFileState;
+        if (ref != .external) return error.SidecarSourceBindingMismatch;
         const file = self.plan.by_id.get(ref.external.file_id) orelse return error.SidecarSourceBindingMismatch;
+        return self.appendFile(file, key);
+    }
+    fn appendFile(self: *Tracker, file: usize, key: []const u8) !void {
+        if ((key.len != 96 and key.len != 108) or !std.mem.startsWith(u8, key, "lake2:")) return error.InvalidNativeLakeFileState;
         const state = try self.plan.mutable(file);
         if (state.count == 0) state.key_width = @intCast(key.len);
         if (state.key_width != key.len) return error.InvalidNativeLakeFileState;
@@ -470,6 +497,19 @@ pub const Tracker = struct {
         try self.pending.appendSlice(self.a, key);
         state.count += 1;
         if (self.pending.items.len >= 96 * 2048) try self.flush();
+    }
+    fn keepChunk(self: *Tracker, file_index: usize, reference: artifacts.ChunkRef, width: u16) !void {
+        try self.flush();
+        const file = try self.plan.mutable(file_index);
+        if (file.count != 0 and file.key_width != width) return error.InvalidNativeLakeFileState;
+        file.key_width = width;
+        const slot = try self.refs.getOrPut(self.a, file_index);
+        if (!slot.found_existing) slot.value_ptr.* = .empty;
+        try slot.value_ptr.append(self.a, .{ .artifact_id = try self.out.dupe(u8, reference.artifact_id), .checksum = try self.out.dupe(u8, reference.checksum), .byte_len = reference.byte_len });
+        file.count += reference.byte_len / width;
+    }
+    fn keepKey(self: *Tracker, file: File, key: []const u8) !void {
+        try self.appendFile(self.plan.by_id.get(file.id) orelse return error.SidecarSourceBindingMismatch, key);
     }
     fn flush(self: *Tracker) !void {
         if (self.pending.items.len == 0) return;
@@ -499,7 +539,8 @@ pub const Deletes = struct {
     domain: [32]u8 = @splat(0),
     record_arena: ?std.heap.ArenaAllocator = null,
     loaded: ?File = null,
-    current: *const Plan,
+    current: *Plan,
+    tracker: ?*Tracker = null,
     file: usize = 0,
     chunk: usize = 0,
     budget: u64 = 256 * 1024 * 1024,
@@ -525,6 +566,9 @@ pub const Deletes = struct {
                 self.loaded = try decodeDirectoryFile(owned, entry.key, entry.value, self.domain);
             };
             const file = self.loaded orelse self.files[self.file];
+            // A previously all-null vector fragment has no key chunks. Its
+            // proven delta can still gather just the rows becoming non-null.
+            if (self.tracker != null and !self.current.unchanged(file) and self.current.canPatch(file)) try self.current.partial_files.put(self.current.a, self.current.by_id.get(file.id).?, {});
             if (self.current.unchanged(file) or self.chunk == file.docs.len) {
                 self.file += 1;
                 self.chunk = 0;
@@ -540,15 +584,113 @@ pub const Deletes = struct {
             if (bytes.len % self.key_width != 0) return error.InvalidNativeLakeFileState;
             for (0..bytes.len / self.key_width) |row| {
                 const key = bytes[row * self.key_width ..][0..self.key_width];
-                const expected = std.fmt.bytesToHex(&file.digest, .lower);
+                const expected = std.fmt.bytesToHex(&(file.key_digest orelse file.digest), .lower);
                 if (!std.mem.startsWith(u8, key, "lake2:") or !std.mem.eql(u8, key[6..70], &expected)) return error.InvalidNativeLakeFileState;
                 _ = try coordinates(key);
+            }
+            if (self.tracker != null and self.current.canPatch(file)) {
+                const file_index = self.current.by_id.get(file.id).?;
+                try self.current.partial_files.put(self.current.a, file_index, {});
+                const selected = self.current.row_changes[file_index].?;
+                var retained: usize = 0;
+                for (0..bytes.len / self.key_width) |row| {
+                    const key = bytes[row * self.key_width ..][0..self.key_width];
+                    const coordinate = try coordinates(key);
+                    if (coordinate.group != 0) return error.InvalidNativeLakeFileState;
+                    if (std.sort.binarySearch(u64, selected, coordinate.row, struct {
+                        fn order(left: u64, right: u64) std.math.Order {
+                            return std.math.order(left, right);
+                        }
+                    }.order) != null) continue;
+                    retained += 1;
+                }
+                if (retained == bytes.len / self.key_width) {
+                    try self.tracker.?.keepChunk(file_index, ref, file.key_width);
+                    a.free(bytes);
+                    continue;
+                }
+                var count: usize = 0;
+                for (0..bytes.len / self.key_width) |row| {
+                    const key = bytes[row * self.key_width ..][0..self.key_width];
+                    const coordinate = try coordinates(key);
+                    if (coordinate.group != 0) return error.InvalidNativeLakeFileState;
+                    if (std.sort.binarySearch(u64, selected, coordinate.row, struct {
+                        fn order(left: u64, right: u64) std.math.Order {
+                            return std.math.order(left, right);
+                        }
+                    }.order) != null) {
+                        std.mem.copyForwards(u8, bytes[count * self.key_width ..][0..self.key_width], key);
+                        count += 1;
+                    } else try self.tracker.?.keepKey(file, key);
+                }
+                return try a.realloc(bytes, count * self.key_width);
             }
             return bytes;
         }
         return null;
     }
 };
+
+test "external lake native row deltas retain untouched vector keys and immutable chunks" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const ca = arena.allocator();
+    var directory = try local.common_test_directory.TestDirectory.init("native-row-delta");
+    defer directory.cleanup();
+    var fs = try @import("../serverless/artifacts/fs_store.zig").FsStore.init(a, directory.path());
+    defer fs.deinit();
+    var store = fs.artifactStore();
+    store.upload_scope = try stores.UploadScope.forPublication(@splat(7), 1, std.testing.io);
+    var current = [_]File{.{ .id = "fragment", .digest = @splat(2), .key_digest = @splat(9) }};
+    var changed = [_]bool{true};
+    var plan: Plan = .{ .a = a, .files = &current, .changed = &changed, .key_digests = &.{@splat(9)}, .row_changes = &.{&.{3}} };
+    defer plan.deinit();
+    // changed is borrowed for this scenario, unlike a normal initialized plan.
+    defer plan.changed = &.{};
+    try plan.by_id.put(a, "fragment", 0);
+    var docs: [8][]const u8 = undefined;
+    for (&docs, 0..) |*key, row| key.* = try plan.privateKey(ca, .{ .external = .{ .source_id = "lake", .snapshot_id = "snapshot", .file_id = "fragment", .row_group_ordinal = 0, .row_ordinal = row } });
+    const first_bytes = try std.mem.concat(ca, u8, docs[0..4]);
+    const last_bytes = try std.mem.concat(ca, u8, docs[4..8]);
+    const first = try store.putWithCancellation(first_bytes, .none);
+    defer {
+        a.free(first.artifact_id);
+        a.free(first.checksum);
+        if (first.provider_version) |value| a.free(value);
+    }
+    const last = try store.putWithCancellation(last_bytes, .none);
+    defer {
+        a.free(last.artifact_id);
+        a.free(last.checksum);
+        if (last.provider_version) |value| a.free(value);
+    }
+    const prior: File = .{ .id = "fragment", .digest = @splat(1), .key_digest = @splat(9), .count = 8, .docs = &.{
+        .{ .artifact_id = first.artifact_id, .checksum = first.checksum, .byte_len = first.byte_len },
+        .{ .artifact_id = last.artifact_id, .checksum = last.checksum, .byte_len = last.byte_len },
+    } };
+    var tracker = try Tracker.init(a, ca, &plan, &store, .none);
+    defer tracker.deinit();
+    var deletes: Deletes = .{ .files = &.{prior}, .current = &plan, .tracker = &tracker };
+    defer deletes.deinit();
+    const removed = (try deletes.next(a, store, .none)).?;
+    defer a.free(removed);
+    try std.testing.expectEqualStrings(docs[3], removed);
+    try std.testing.expect((try deletes.next(a, store, .none)) == null);
+    try std.testing.expectEqualSlices(u64, &.{3}, plan.patchRows(0).?);
+    try tracker.append(.{ .external = .{ .source_id = "lake", .snapshot_id = "snapshot", .file_id = "fragment", .row_group_ordinal = 0, .row_ordinal = 3 } }, docs[3]);
+    try tracker.finish();
+    try std.testing.expectEqual(@as(u64, 8), current[0].count);
+    try validate(&current, store.upload_scope.?.domain);
+    var retained = false;
+    for (current[0].docs) |reference| if (std.mem.eql(u8, reference.artifact_id, last.artifact_id)) {
+        retained = true;
+    };
+    try std.testing.expect(retained);
+    var incompatible = prior;
+    incompatible.key_digest = @splat(8);
+    try std.testing.expect(!plan.canPatch(incompatible));
+}
 
 test "external lake incremental native file identity ignores snapshot labels and binds deletion evidence" {
     const a = std.testing.allocator;

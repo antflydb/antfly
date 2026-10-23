@@ -27,6 +27,8 @@ const frame_bytes = 25;
 const snappy = @import("../encoding/snappy.zig");
 
 pub const Manager = struct {
+    execution_pages: ?*@import("execution_pager.zig").Pager = null,
+    page_residency_bytes: usize = 4 * 1024 * 1024,
     patterns: std.ArrayList(*scalar.PatternSet) = .empty,
     pattern_file: ?*File = null,
     alloc: Allocator,
@@ -72,6 +74,15 @@ pub const Manager = struct {
     }
     pub fn allocator(self: *Manager) Allocator {
         return .{ .ptr = self, .vtable = &.{ .alloc = allocate, .resize = resizeAllocation, .remap = remapAllocation, .free = freeAllocation } };
+    }
+    pub fn pager(self: *Manager) !*@import("execution_pager.zig").Pager {
+        self.lock();
+        defer self.mutex.unlock();
+        if (self.execution_pages) |owner| return owner;
+        const owner = try self.allocator().create(@import("execution_pager.zig").Pager);
+        owner.* = .{ .manager = self, .limit = self.page_residency_bytes };
+        self.execution_pages = owner;
+        return owner;
     }
     fn allocate(raw: *anyopaque, len: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
         const self: *Manager = @ptrCast(@alignCast(raw));
@@ -186,6 +197,11 @@ pub const Manager = struct {
         return .{ .manager = self, .file = file, .id = self.sequence };
     }
     pub fn deinit(self: *Manager) void {
+        if (self.execution_pages) |owner| {
+            owner.deinit();
+            self.allocator().destroy(owner);
+            self.execution_pages = null;
+        }
         // Memory-only callers need no cancellation-capable Io. No resources
         // below this boundary can exist without a directory or pattern owner.
         if (self.dir == null and self.pattern_file == null and self.patterns.items.len == 0) {

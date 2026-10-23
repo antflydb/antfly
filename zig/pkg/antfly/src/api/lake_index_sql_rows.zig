@@ -774,7 +774,7 @@ fn gatherCoveringInner(a: A, out: A, server: *server_api.ApiHttpServer, table: c
         if (definition.where.len != 0) continue;
         const cover = try native_rows.coverColumns(scratch.allocator(), definition);
         const sufficient = for (fields) |field| {
-            if (!std.mem.eql(u8, field, "_id") and !std.mem.eql(u8, field, "_type") and !covers(cover, field)) break false;
+            if (!generatedCoveringField(table, field) and !covers(cover, field)) break false;
         } else true;
         if (!sufficient) continue;
         const cursor = (try openWithContext(a, server, table, .{ .fields = fields, .index_range = .{ .name = definition.name }, .limit = 1 }, context, source, .automatic, null, false, pinned)) orelse continue;
@@ -854,7 +854,12 @@ fn coveringSource(a: A, scratch: A, table: catalog.Table, root: ordered.Root, bl
     if (row >= block.count() or block.values.len != root.cover.len) return error.InvalidNativeLakeRowIndex;
     var columns: std.ArrayList(rows_.ColumnVector) = .empty;
     for (fields) |field| {
-        if (std.mem.eql(u8, field, "_id") or std.mem.eql(u8, field, "_type")) continue;
+        if (generatedCoveringField(table, field)) continue;
+        // Projection and hidden highlight dependencies can request the same
+        // field. Preserve one physical column, including a declared _type.
+        if (for (columns.items) |column| {
+            if (std.mem.eql(u8, column.name, field)) break true;
+        } else false) continue;
         const index = for (root.cover, 0..) |name, i| {
             if (std.mem.eql(u8, name, field)) break i;
         } else return error.InvalidNativeLakeRowIndex;
@@ -897,10 +902,17 @@ fn coveringSource(a: A, scratch: A, table: catalog.Table, root: ordered.Root, bl
     }
     const identity = try local.storage_rowsource_identity.allocId(scratch, ref);
     try columns.append(scratch, .{ .name = "_id", .values = .{ .bytes = try scratch.dupe([]const u8, &.{identity}) } });
-    try columns.append(scratch, .{ .name = "_type", .values = .{ .bytes = try scratch.dupe([]const u8, &.{"row"}) } });
+    if (generatedCoveringField(table, "_type")) try columns.append(scratch, .{ .name = "_type", .values = .{ .bytes = try scratch.dupe([]const u8, &.{"row"}) } });
     const page = try local.storage_db_types.ColumnSourcePage.copy(a, .{ .snapshot = .{ .table_id = root.source, .snapshot_id = root.snapshot }, .row_refs = &.{ref}, .columns = columns.items }, &.{0});
     defer page.release();
     return page.row(0);
+}
+
+fn generatedCoveringField(table: catalog.Table, field: []const u8) bool {
+    if (std.mem.eql(u8, field, "_id")) return true;
+    if (!std.mem.eql(u8, field, "_type")) return false;
+    for (table.columns) |column| if (std.mem.eql(u8, column.name, field)) return false;
+    return true;
 }
 
 /// Relative work for vectorized projected decoding/evaluation. Inventory bytes
@@ -2235,6 +2247,28 @@ test "external lake covering result gathers retain typed values independently of
     };
     try Run.run(a, table, root, block, ref);
     try std.testing.checkAllAllocationFailures(a, Run.run, .{ table, root, block, ref });
+}
+
+test "external lake covering results preserve declared type values and nulls without duplicate fields" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const ca = arena.allocator();
+    const table: catalog.Table = .{ .id = 7, .physical_name = "lake", .schema_version = 1, .columns = &.{.{ .name = "_type", .path = "_type", .type = .string }} };
+    const root: ordered.Root = .{ .fingerprint = @splat(1), .domain = @splat(7), .source = "lake", .snapshot = "snapshot", .page = null, .cover = &.{"_type"} };
+    const ref: local.storage_rowsource_types.RowRef = .{ .external = .{ .source_id = "lake", .snapshot_id = "snapshot", .file_id = "file", .row_group_ordinal = 0, .row_ordinal = 0 } };
+    try std.testing.expect(!generatedCoveringField(table, "_type"));
+    for ([_]local.sql_scalar.Datum{ .fromJson(.{ .string = "story" }), .{} }) |value| {
+        const records = [_]local.sql_operators.Row{.{ .values = &.{value}, .keys = &.{}, .ordinal = 0 }};
+        const encoded = try local.sql_spill.encodeColumnarBlockAlloc(ca, &records, 1024 * 1024);
+        const block = try local.sql_spill.decodeColumnarBlockInArena(ca, encoded, 1024 * 1024);
+        const source = try coveringSource(a, ca, table, root, block, 0, ref, &.{ "_type", "_type" });
+        defer source.deinit();
+        const json = try source.value(&arena);
+        const actual = json.object.get("_type").?;
+        if (value.sql_null) try std.testing.expect(actual == .null) else try std.testing.expectEqualStrings("story", actual.string);
+        try std.testing.expectEqual(@as(usize, 2), source.page.columns.len);
+    }
 }
 
 test "external lake compressed predicates require the exact authenticated coordinate space" {

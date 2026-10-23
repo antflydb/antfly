@@ -92,8 +92,12 @@ def test_logical_identity_reuses_reordered_native_indexes(tmp_path, file_format)
                     "changed word" if step in (3, 6) and i == 17 else "needle same text"
                 ),
                 "label": f"updated-{i}" if step == 5 else f"row-{i}",
-                "dense_native": json.dumps([1, i / count]),
-                "sparse_native": json.dumps({"1": (i + 1) ** 2}),
+                "dense_native": json.dumps(
+                    [0, 1] if step == 6 and i == 17 else [1, i / count]
+                ),
+                "sparse_native": json.dumps(
+                    {"1": (count - 20) ** 2 if step == 6 and i == 17 else (i + 1) ** 2}
+                ),
                 "extra": f"source-extra-{i}",
             }
             for i in order
@@ -564,9 +568,9 @@ def test_logical_identity_reuses_reordered_native_indexes(tmp_path, file_format)
             "/sql",
             {"statement": "SELECT id, extra FROM logical ORDER BY id LIMIT 1"},
         )["rows"] == [[str(base), "source-extra-0"]]
-        assert normalize(call("POST", "/tables/logical/query", label_query)) == normalize(
-            expected
-        )
+        assert normalize(
+            call("POST", "/tables/logical/query", label_query)
+        ) == normalize(expected)
         failed = False
     finally:
         server.stop(test_failed=failed)
@@ -709,6 +713,122 @@ def test_logical_identity_mixed_parquet_decimal_precision(tmp_path):
             assert len(hits) == 1, result
             assert hits[0]["_source"]["id"] == 66
             assert Decimal(str(hits[0]["_source"]["price"])) == expected[66]
+        failed = False
+    finally:
+        server.stop(test_failed=failed)
+
+
+def test_parquet_covering_search_preserves_declared_type(tmp_path):
+    """Adding a covering index cannot change physical _type values or nulls."""
+    if not os.environ.get("ANTFLY_E2E_FULL_LAKE"):
+        pytest.importorskip("pyarrow")
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    root = tmp_path / "lake"
+    objects = root / "buckets" / "antfly" / "objects"
+    objects.mkdir(parents=True)
+    path = tmp_path / "types.parquet"
+    pq.write_table(
+        pa.Table.from_pylist(
+            [
+                {"id": 1, "body": "needle story", "_type": "story"},
+                {"id": 2, "body": "needle comment", "_type": "comment"},
+                {"id": 3, "body": "needle missing", "_type": None},
+            ]
+        ),
+        path,
+        row_group_size=2,
+        write_page_index=True,
+    )
+    payload = path.read_bytes()
+    (objects / path.name).write_bytes(
+        b"AFOBJ001"
+        + struct.pack("<QI", len(payload), 0)
+        + hashlib.sha256(payload).hexdigest().encode()
+        + payload
+    )
+    server = StandaloneAntflyServer(
+        resolve_binary_path(os.environ.get("ANTFLY_BIN", str(DEFAULT_ANTFLY_BIN))),
+        "127.0.0.1",
+        0,
+    )
+    failed = True
+    try:
+        expected = {1: "story", 2: "comment", 3: None}
+        for name, include in (
+            ("physical", None),
+            ("covered", ["body", "_type"]),
+            ("fallback", ["body"]),
+        ):
+            schema = {
+                "storage_mode": "relational",
+                "base_source": {
+                    "kind": "external",
+                    "table_id": "type-source",
+                    "format": "parquet",
+                    "uri": root.as_uri(),
+                },
+                "default_type": "story",
+                "document_schemas": {
+                    "story": {
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": False,
+                            "properties": {
+                                "id": {"type": "integer"},
+                                "body": {"type": "string"},
+                                "_type": {"type": "string"},
+                            },
+                        }
+                    }
+                },
+            }
+            if include is not None:
+                schema["relational_indexes"] = [
+                    {
+                        "name": f"{name}_id_idx",
+                        "keys": [{"column": "id"}],
+                        "include_columns": include,
+                    }
+                ]
+            response = requests.post(
+                server.api_url + f"/tables/{name}",
+                json={
+                    "schema": schema,
+                    "indexes": {"text": {"type": "full_text", "field": "body"}},
+                },
+                auth=("admin", AUTH_BOOTSTRAP_PASSWORD),
+                timeout=60,
+            )
+            assert response.ok, response.text + server.debug_logs()
+            deadline = time.monotonic() + 90
+            while True:
+                response = requests.post(
+                    server.api_url + f"/tables/{name}/query",
+                    json={
+                        "full_text_search": {"match": "needle", "field": "body"},
+                        "full_text_index": "text",
+                        "fields": ["id", "_type"],
+                        "limit": 10,
+                    },
+                    auth=("admin", AUTH_BOOTSTRAP_PASSWORD),
+                    timeout=60,
+                )
+                if (
+                    response.ok
+                    or response.status_code not in (409, 503)
+                    or time.monotonic() >= deadline
+                ):
+                    break
+                time.sleep(0.1)
+            assert response.ok, response.text + server.debug_logs()
+            value = response.json()
+            value = value.get("responses", [value])[0]
+            hits = value["hits"]["hits"]
+            assert {
+                hit["_source"]["id"]: hit["_source"]["_type"] for hit in hits
+            } == expected, response.text
         failed = False
     finally:
         server.stop(test_failed=failed)

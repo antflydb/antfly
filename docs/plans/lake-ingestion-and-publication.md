@@ -3660,11 +3660,19 @@ or claiming arena frees refund capacity. Stream decline, errors,
 allocation failures and independent concurrent-owner release have regression
 coverage.
 
-This shares host admission and cache reclamation. It does not yet make arbitrary
-hash/group state automatically evictable through a common dirty-page pager.
-That requires pin-aware relocatable execution pages, explicit spill ownership,
-restore scheduling and cancellation-safe page leases across every operator.
-Existing typed spill codecs remain the execution spill mechanism.
+Statement spill managers now also own a shared dirty-page execution pager.
+Join spill hash buckets and fixed COUNT/SUM/AVG/boolean group transitions use
+relocatable handles with 16 KiB pages. An explicit lease pins a page until its
+consumer finishes; unpinned pages share an LRU residency allowance (4 MiB by
+default), including across independent operators. Dirty eviction and restore
+use one private spill file and the statement disk quota. Request cancellation,
+I/O failures and allocation failures unwind leases and private files. Known
+parent headroom can reclaim idle pages without bypassing the parent allocator.
+Small states retain their contiguous vector kernels. Pointer-owning keys,
+NUMERIC reducers, DISTINCT, extrema and pattern state retain their typed spill
+codecs rather than writing process pointers into execution pages. The pager
+therefore supports mutable join/group state while preserving explicit typed
+fallbacks for state that is not yet relocatable.
 
 ### Identity boundary for external file rewrites
 
@@ -3709,3 +3717,43 @@ separates stable row IDs from row commit versions. Elasticsearch exposes stable
 while [Lucene document numbers](https://lucene.apache.org/core/10_3_1/core/org/apache/lucene/index/IndexReader.html)
 remain ephemeral. These are useful identity patterns; none justifies assuming
 unchanged logical rows after an unverified external rewrite.
+
+
+### Row-level native mutation and typed vector input (protocol 76)
+
+Input-only changes inside a logical fragment now produce a bounded, verified
+row delta. Fragment membership changes invalidate that optimization. The
+persisted input fingerprint is a domain-separated composition of row hashes;
+an update removes the old row hash and adds the new one. Legacy fragment
+versions migrate through one full hash. Metadata work for an admitted single
+row update hashes two inputs rather than all 8,192 possible fragment rows.
+The row-delta planner caps each cohort at 32,768 changed identities and retains
+whole-fragment rebuilding when that allowance or coordinate proof is absent.
+
+Ordered and covering indexes invalidate old keys through exact coordinate
+ranges in the retained reverse tree. This handles changed ordering keys and
+rows that cease to satisfy a partial-index predicate. Native dense and sparse
+indexes use stable private coordinate keys, separately authenticated from input
+versions. Their per-file mutation directories preserve untouched key chunks;
+only changed rows are deleted, gathered and inserted. A reader's original
+coordinate space and publication-bound navigation remain authoritative. A
+membership change, legacy private-key generation or incompatible predecessor
+uses the existing full-fragment mutation path. Protocol 76 gates readers on the
+new optional coordinate-key digests in native file state and navigation.
+Immutable text segments and aggregate contributions still use fragment-level
+replacement; sharing the row plan does not make those representations mutable.
+
+Dense/sparse publication binds the selected input column once per batch. Native
+f32 vectors remain borrowed until the native write completes, dictionary strings
+stay dictionary-backed, and JSON parsing is confined to selected cells. Plain
+materialized inputs use a stack-resident enrichment unit. Managed field inputs
+share media/chunker semantics without constructing a row object; templates retain
+the complete-row renderer. Dimension, finite-value and sparse validation remain
+shared with the document path.
+
+Covering search hydration treats a declared `_type` as a source column, including
+SQL null. An index that omits it declines coverage and uses physical hydration.
+Generated `_type` metadata is synthesized only when the schema does not declare
+that column. Real Parquet coverage compares covered, omitted-cover and physical
+search paths, and the Parquet/Iceberg row-identity flow changes native vector
+inputs after reuse to exercise retained and mutated rows together.

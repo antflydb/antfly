@@ -129,6 +129,7 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
         const previous_states = if (appending) &.{} else if (seed) |root| if (root.file_directory != null and !state.canUseDelta(provider, root.binding.snapshot_id)) try state.directoryFiles(ca, store.*, root.file_directory.?, root.generation.domain, cancellation) else root.file_states else &.{};
         var plan = try state.Plan.initPaged(a, ca, provider, previous_states, if (seed) |root| root.file_directory else null, seed != null, if (seed) |root| state.canUseDelta(provider, root.binding.snapshot_id) else false);
         defer plan.deinit();
+        if (seed) |root| plan.enableRowDeltas(provider, root.binding.snapshot_id);
         var tracker = try state.Tracker.init(a, ca, &plan, store, cancellation);
         defer tracker.deinit();
         tracker.cumulative_bytes = if (provider.resume_work) |work| &work.native_keys_left else null;
@@ -151,7 +152,7 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
         var finished = false;
         defer if (!finished and seed == null) index.abortBulkIngestSession();
         if (seed) |root| {
-            var deletes: state.Deletes = .{ .files = if (appending) &.{} else if (root.file_directory != null and provider.native_delta != null and state.canUseDelta(provider, root.binding.snapshot_id)) provider.native_delta.?.prior_changed else previous_states, .directory = root.file_directory, .domain = root.generation.domain, .current = &plan };
+            var deletes: state.Deletes = .{ .files = if (appending) &.{} else if (root.file_directory != null and provider.native_delta != null and state.canUseDelta(provider, root.binding.snapshot_id)) provider.native_delta.?.prior_changed else previous_states, .directory = root.file_directory, .domain = root.generation.domain, .current = &plan, .tracker = &tracker };
             defer deletes.deinit();
             while (try deletes.next(a, store.*, cancellation)) |keys| {
                 defer a.free(keys);
@@ -202,14 +203,14 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
             const pa = page_arena.allocator();
             var writes: std.ArrayList(local.sparse_sparse.SparseWrite) = .empty;
             var unit_records: std.StringHashMapUnmanaged([]const u8) = .empty;
+            const vector_input = producer.bind(batch);
             for (0..batch.rowCount()) |ordinal| {
                 const ref = batch.rowRef(ordinal);
                 try cancellation.check();
                 try provider.context.ensureActive();
-                const page: local.sql_catalog.ColumnPage = .{ .batch = batch, .selection = &.{ordinal} };
-                const row = try @import("lake_enrichment_units.zig").rowValue(pa, page);
                 const parent_key = try plan.privateKey(pa, ref);
-                for (try producer.units(pa, row)) |unit| {
+                const prepared_input = try vector_input.prepare(pa, ordinal);
+                for (prepared_input.units()) |unit| {
                     const vector = (try producer.sparseUnit(pa, unit)) orelse continue;
                     try stores.chargeReadBudget(input, @as(u64, @intCast(vector.indices.len)) * 8 + 128);
                     const key = try @import("lake_enrichment_units.zig").identity(pa, parent_key, unit);

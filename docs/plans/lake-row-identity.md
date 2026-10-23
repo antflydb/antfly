@@ -697,3 +697,24 @@ Private native segment reads park CPU admission before waiting on a blocking
 admission resumes, including read failures. Independent prefetch reads use the
 same lock without borrowing the serial builder's scheduling callback. No file
 lock spans a CPU/I/O admission transition.
+
+
+### Exact mutations inside stable fragments
+
+The input-version COW difference now also identifies changed logical rows.
+Admitted deltas prove unchanged fragment membership and the same old/current
+native coordinates. They are bounded to 32,768 identities per cohort; a missing
+proof keeps the existing whole-fragment path. Input fragment versions compose
+independent domain-separated row hashes, so a payload change applies the old
+and new fingerprint without scanning the other input fingerprints.
+
+Ordered/covering indexes retire exact coordinate ranges in their reverse tree
+before inserting fresh tuples. Vector fragments bind a stable private-key digest
+separately from the changing input-version digest. The native dense/sparse
+mutation path retains untouched key chunks and vectors and gathers changed rows
+only. Additions, removals and radix splits still invalidate affected fragments;
+reusing their shifted row offsets would be incorrect. Each retained reader pins
+its own coordinate space, navigation, native files and cloud certificate. Reader
+protocol 76 covers the optional coordinate-key digest; legacy native generations
+upgrade by rebuilding the affected fragments. Text segments and aggregate
+contributions retain their bounded fragment-level replacement path.

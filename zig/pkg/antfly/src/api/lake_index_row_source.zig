@@ -37,6 +37,7 @@ pub const Provider = struct {
         /// Immutable independently seekable typed pages can serve replay cursors
         /// directly, with their operation-owned quota and complete coordinate cut.
         replayable: ?*const fn (*anyopaque, bindings.Binding) bool = null,
+        open_selected: ?*const fn (*anyopaque, A, bindings.Binding, usize, []const u64, Cancellation, ?*const stores.IoPhase) anyerror!rows.Source = null,
     } = null,
 
     fragment_views: []const FragmentView = &.{},
@@ -56,6 +57,9 @@ pub const Provider = struct {
     limits: stream_api.Limits = .{},
     expected_delete_objects: ?[32]u8 = null,
     only_file: ?usize = null,
+    only_ordinals: ?[]const u64 = null,
+    changed_rows: []const ?[]const u64 = &.{},
+    key_digests: []const [32]u8 = &.{},
     only_files: ?[]const bool = null,
     only_plan: ?*const @import("lake_index_native_state.zig").Plan = null,
     replay: ?*@import("lake_index_build_replay.zig").Replay = null,
@@ -63,7 +67,11 @@ pub const Provider = struct {
     replay_consumer: ?usize = null,
     schema_contract: []const local.serverless_query_lake_schema.Column = &.{},
     statistics: ?Statistics = null,
-    pub const FragmentView = struct { name: []const u8, files: []const local.serverless_external_source_types.FileEntry, delta: @import("lake_source_navigation.zig").Delta, navigation: local.serverless_manifest_artifact_ref.ArtifactRef };
+    pub const FragmentView = struct { name: []const u8, files: []const local.serverless_external_source_types.FileEntry, delta: @import("lake_source_navigation.zig").Delta, navigation: local.serverless_manifest_artifact_ref.ArtifactRef, changed_rows: []const ?[]const u64 = &.{}, key_digests: []const [32]u8 = &.{} };
+    pub fn rowsForFile(self: *const Provider, ordinal: usize) ?[]const u64 {
+        if (self.resume_work != null or ordinal >= self.changed_rows.len) return null;
+        return self.changed_rows[ordinal];
+    }
     /// Borrow a per-input census while preserving this worker's private scanner
     /// and any file-major append frontier. Payload replay shares coordinates.
     pub fn forIndex(self: *Provider, source: *serving.ServingSource, name: []const u8) Provider {
@@ -75,6 +83,8 @@ pub const Provider = struct {
             // its reached prefix and append plan are the only scan authority.
             selected.native_delta = if (self.resume_work != null) null else view.delta;
             selected.previous_inventory = null;
+            selected.changed_rows = view.changed_rows;
+            selected.key_digests = view.key_digests;
             break;
         };
         return selected;
@@ -199,6 +209,13 @@ pub const Provider = struct {
             for (schema) |column| try names.append(a, column.name);
             if (names.items.len == 0) return error.InvalidLakeEnrichmentSchema;
         } else try names.appendSlice(a, binding.column_bindings);
+        if (self.only_ordinals) |ordinals| {
+            const fragments = self.fragment_rows orelse return error.InvalidNativeLakeFileState;
+            const selected = fragments.open_selected orelse return error.InvalidNativeLakeFileState;
+            var projected = binding;
+            projected.column_bindings = names.items;
+            return selected(fragments.ptr, a, projected, self.only_file orelse return error.InvalidNativeLakeFileState, ordinals, cancellation, self.io_phase);
+        }
         // Replay has already applied deletes. Its output projection contains
         // logical/enrichment fields; equality keys are private scan inputs.
         if (self.replay) |replay| {
@@ -285,6 +302,7 @@ const FileCursor = struct {
             input.only_files = null;
             input.only_plan = null;
             input.only_file = ordinal;
+            if (self.provider.only_plan) |plan| input.only_ordinals = plan.patchRows(ordinal);
             self.active = try Provider.openCanceled(&input, a, self.binding, self.cancellation);
         }
     }
