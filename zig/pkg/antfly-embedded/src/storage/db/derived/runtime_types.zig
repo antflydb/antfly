@@ -38,7 +38,13 @@ pub const BeginCatchUpFn = *const fn (ctx: *anyopaque, index_ref: index_manager_
 pub const FinishCatchUpFn = *const fn (ctx: *anyopaque, index_ref: index_manager_mod.ManagedIndexRef, token: CatchUpSessionToken, applied_sequence: u64, success: bool) anyerror!CatchUpFinishResult;
 /// Set immediately after the provider consumes its exact session. Rejections
 /// before consumption are retryable; failures afterward must not replay it.
-pub const FinishAttempt = struct { consumed: bool = false };
+pub const FinishAttempt = struct {
+    consumed: bool = false,
+    /// Publish only after physical finish and durable publication succeed,
+    /// before any fallible caller reentry. No further fallible publication may follow
+    /// this receipt; mandatory retirement may still run. A later callback error cannot erase the completed result.
+    completed: ?CatchUpFinishResult = null,
+};
 pub const FinishWithAdmissionFn = *const fn (ctx: *anyopaque, index_ref: index_manager_mod.ManagedIndexRef, token: CatchUpSessionToken, applied_sequence: u64, original: @import("../../../common/read_admission.zig").Port, attempt: *FinishAttempt) anyerror!CatchUpFinishResult;
 pub const CanAdvanceToTargetFn = *const fn (ctx: *anyopaque, index_ref: index_manager_mod.ManagedIndexRef, from_sequence: u64, target_sequence: u64) anyerror!bool;
 pub const AppliedSequenceAdvancedFn = *const fn (ctx: *anyopaque, index_name: []const u8, applied_sequence: u64) void;

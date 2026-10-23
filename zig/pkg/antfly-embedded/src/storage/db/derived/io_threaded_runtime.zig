@@ -570,11 +570,24 @@ pub const DerivedRuntime = if (builtin.os.tag == .freestanding) struct {
                         break :legacy finish(self.ctx, worker.kind, final.token, worker.applied_sequence, true);
                     };
                     const result = call catch |cause| failed: {
+                        if (attempt.completed) |receipt| {
+                            final.finish_done = true;
+                            if (!attempt.consumed) {
+                                final.finish_failure = RuntimeError.AsyncWorkerFailed;
+                                return RuntimeError.AsyncWorkerFailed;
+                            }
+                            // Persist the outcome before returning the caller's
+                            // rejection. Retry/deinit must not repeat finish or
+                            // discard an authoritative durability receipt.
+                            final.durable = receipt.applied_sequence_persisted;
+                            return cause;
+                        }
                         if (!attempt.consumed) return cause;
                         final.finish_failure = cause;
                         break :failed CatchUpFinishResult{};
                     };
-                    if (!attempt.consumed) final.finish_failure = RuntimeError.AsyncWorkerFailed;
+                    if (!attempt.consumed or (attempt.completed != null and !std.meta.eql(attempt.completed.?, result)))
+                        final.finish_failure = RuntimeError.AsyncWorkerFailed;
                     // Record authoritative publication before any fallible
                     // reentry/guard step. Retrying cannot repeat the callback.
                     final.durable = result.applied_sequence_persisted;
@@ -3553,6 +3566,11 @@ const FinalizationProbe = struct {
     fail_finish: bool = false,
     defer_persist_once: bool = false,
     controlled_mode: enum { success, reject_before, fail_after, invalid_success } = .success,
+    finish_receipt: ?CatchUpFinishResult = null,
+    after_receipt: ?anyerror = null,
+    omit_receipt_consumption: bool = false,
+    contradict_receipt: bool = false,
+    receipt_reentry: bool = false,
     controlled_calls: usize = 0,
     block_finish: bool = false,
     finish_entered: Io.Event = .unset,
@@ -3590,8 +3608,21 @@ const FinalizationProbe = struct {
         self.controlled_calls += 1;
         try original.checkpoint();
         if (self.controlled_mode == .reject_before) return error.NotFound;
+        var return_boundary: ?@import("../../../common/execution_wait.zig").Boundary = null;
+        if (self.receipt_reentry) {
+            return_boundary = (try original.executionWaitAfterLifetime()) orelse return error.ExecutionWaitUnsupported;
+            try return_boundary.?.beginWait();
+        }
         if (self.controlled_mode != .invalid_success) attempt.consumed = true;
         if (self.controlled_mode == .fail_after) return error.OutOfMemory;
+        if (self.finish_receipt) |receipt| {
+            attempt.completed = receipt;
+            if (self.omit_receipt_consumption) attempt.consumed = false;
+            if (return_boundary) |boundary| try boundary.endWait();
+            if (self.after_receipt) |cause| return cause;
+            if (self.contradict_receipt) return .{ .applied_sequence_persisted = !receipt.applied_sequence_persisted };
+            return receipt;
+        }
         return .{ .applied_sequence_persisted = true };
     }
     fn persist(raw: *anyopaque, _: []const u8, _: u64, force: bool) !bool {
@@ -3866,5 +3897,94 @@ test "controlled dense finalization capacity rejection retries replay without po
             try std.testing.expectEqual(@as(u64, 1), runtime.recoverable_retry_counters.snapshot().resource_budget);
             try std.testing.expectEqual(@as(u64, 1), manager.derivedRecoverableRetryStats().resource_budget);
         }
+    }
+}
+
+test "controlled dense finalization completion receipt survives original reentry rejection" {
+    const admission = @import("../../../common/read_admission.zig");
+    const Control = struct {
+        cause: anyerror,
+        begins: usize = 0,
+        ends: usize = 0,
+        fn check(_: *anyopaque) !void {}
+        fn deadline(_: *anyopaque) !?u64 {
+            return 1000;
+        }
+        fn begin(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.begins += 1;
+        }
+        fn end(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.ends += 1;
+            return self.cause;
+        }
+    };
+    for ([_]bool{ false, true }) |durable| {
+        for ([_]anyerror{ error.Canceled, error.DeadlineExceeded, error.NotFound, error.OutOfMemory }) |cause| {
+            for ([_]bool{ false, true }) |physical_close| {
+                var probe: FinalizationProbe = .{ .finish_receipt = .{ .applied_sequence_persisted = durable }, .receipt_reentry = true };
+                var runtime = try DerivedRuntime.init(std.testing.allocator, undefined, &probe, FinalizationProbe.apply, FinalizationProbe.persist, FinalizationProbe.truncate, null, FinalizationProbe.finish, null, null, null);
+                var live = true;
+                defer if (live) runtime.deinit();
+                const worker = try probe.install(&runtime);
+                runtime.finish_with_admission = FinalizationProbe.controlledFinish;
+                var control: Control = .{ .cause = cause };
+                var payload: admission.Payload = .{ .ptr = &control, .vtable = &.{ .checkpoint = Control.check, .check_lifetime = Control.check, .deadline_ns = Control.deadline }, .execution_wait = .{ .ptr = &control, .begin = Control.begin, .end = Control.end } };
+                try std.testing.expectError(cause, runtime.finalizeWithAdmission(.init(&payload)));
+                try std.testing.expect(worker.finalization.finish_done);
+                try std.testing.expect(!worker.finalization.done);
+                try std.testing.expect(worker.finalization.finish_failure == null);
+                try std.testing.expectEqual(durable, worker.finalization.durable);
+                try std.testing.expectEqual(@as(u64, 0), worker.persisted_sequence);
+                try std.testing.expectEqual(@as(usize, 0), probe.persists);
+                if (!physical_close) {
+                    // Even if the provider would reject again, retry must use
+                    // the stored receipt and never call that provider again.
+                    try runtime.finalizeWithAdmission(.init(&payload));
+                    try std.testing.expect(worker.finalization.done);
+                    try std.testing.expectEqual(@as(u64, 1), worker.persisted_sequence);
+                }
+                runtime.deinit();
+                live = false;
+                try std.testing.expectEqual(@as(usize, 1), control.begins);
+                try std.testing.expectEqual(@as(usize, 1), control.ends);
+                try std.testing.expectEqual(@as(usize, 1), probe.controlled_calls);
+                try std.testing.expectEqual(@as(usize, 0), probe.finishes);
+                try std.testing.expectEqual(@as(usize, @intFromBool(!durable)), probe.persists);
+            }
+        }
+    }
+}
+
+test "controlled dense finalization completion receipt rejects contradictory provider outcomes" {
+    const admission = @import("../../../common/read_admission.zig");
+    const Control = struct {
+        fn check(_: *anyopaque) !void {}
+        fn deadline(_: *anyopaque) !?u64 {
+            return 1000;
+        }
+    };
+    const Case = enum { unconsumed_success, unconsumed_error, contradictory_success };
+    for (std.enums.values(Case)) |case| {
+        var probe: FinalizationProbe = .{
+            .finish_receipt = .{ .applied_sequence_persisted = true },
+            .omit_receipt_consumption = case != .contradictory_success,
+            .contradict_receipt = case == .contradictory_success,
+            .after_receipt = if (case == .unconsumed_error) error.Canceled else null,
+        };
+        var runtime = try DerivedRuntime.init(std.testing.allocator, undefined, &probe, FinalizationProbe.apply, FinalizationProbe.persist, FinalizationProbe.truncate, null, FinalizationProbe.finish, null, null, null);
+        defer runtime.deinit();
+        const worker = try probe.install(&runtime);
+        runtime.finish_with_admission = FinalizationProbe.controlledFinish;
+        var payload: admission.Payload = .{ .ptr = &probe, .vtable = &.{ .checkpoint = Control.check, .check_lifetime = Control.check, .deadline_ns = Control.deadline }, .execution_wait = .{ .ptr = &probe, .begin = Control.check, .end = Control.check } };
+        try std.testing.expectError(RuntimeError.AsyncWorkerFailed, runtime.finalizeWithAdmission(.init(&payload)));
+        try std.testing.expect(worker.finalization.finish_done);
+        try std.testing.expect(worker.finalization.finish_failure != null);
+        try std.testing.expectError(RuntimeError.AsyncWorkerFailed, runtime.finalizeWithAdmission(.init(&payload)));
+        try std.testing.expectEqual(@as(usize, 1), probe.controlled_calls);
+        try std.testing.expectEqual(@as(usize, 0), probe.finishes);
+        try std.testing.expectEqual(@as(usize, 0), probe.persists);
+        try std.testing.expectEqual(@as(u64, 0), worker.persisted_sequence);
     }
 }

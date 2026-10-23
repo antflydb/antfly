@@ -23658,3 +23658,47 @@ identity (7) also pass. All 5,508 native/schema hashes match the
 `dense-finish-claim-final` receipt and `dense-finish-claim-verified.json` snapshots.
 Strong required providers remain disabled; full GNU/Linux qualification remains
 waived and Linux requires pinned Nix/glibc Zig. The full design is unfinished.
+
+### Preserve completed finish results across caller reentry rejection
+
+Controlled finish callbacks can now publish a completion receipt after physical
+finish and durable publication succeed, before any fallible caller reentry.
+Session consumption and completion are separate facts: an error before
+consumption remains retryable, an unfinished consumed failure stays terminal,
+and an error after a valid completion receipt preserves the completed result.
+No further fallible publication may follow the receipt; mandatory retirement
+may still run.
+
+The derived runtime records that receipt and finish completion before returning
+the caller's rejection. A subsequent controlled close or physical deinit skips
+the finished callback. An authoritative persisted-sequence receipt suppresses
+generic watermark persistence; otherwise the existing persistence stage remains
+pending until continuation can proceed. A receipt without consumption, or a
+successful return contradicting its receipt, fails closed without repeating
+finish. The production DB callback publishes its receipt after lifecycle
+finalization and visibility notification. Native ABI 88 and storage-owner ABI
+146 fence the expanded callback output layout.
+
+The failure matrix injects cancellation, deadline, not-found and allocation
+errors through the original port's reentry callback, with and without an
+authoritative durability receipt, followed by controlled retry or physical
+close. Malformed-provider tests cover unconsumed success/error receipts and
+contradictory return values. The real DB fixture checks that rejected preparation
+has no receipt and successful exact-session completion returns its matching one.
+
+This adds the result handoff needed by reserved execution; it does not yet
+suspend the original caller or activate the reserved capsule during physical
+finish. The existing runnable Transfer changes phase on the same capsule; a
+separate reservation needs an explicit handoff with its own retained authority
+and cancellation/lifetime qualification. Execution transfer, callback I/O/CPU
+bounds and the broader design gates remain open. Strong required providers remain disabled.
+
+Pinned Darwin Debug final validation passes all 79 build steps, with 106
+build-reported tests plus the cached current-source 66-case derived suite. The
+simple runners pass 24 DB/session cases and 20 local-close cases without skips
+or leaks. Linked C-entry close, maintenance shutdown, execution-service and
+runnable owner targets succeed. Error ABI (43), released status ABI (1), and
+failure identity (7) pass. All 5,508 native/schema hashes match the
+`dense-finish-receipt-final` receipt and `dense-finish-receipt-verified.json`
+snapshots. Full GNU/Linux qualification remains waived; Linux requires pinned
+Nix/glibc Zig. The complete design remains unfinished.

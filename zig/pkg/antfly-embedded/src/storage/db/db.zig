@@ -59627,7 +59627,10 @@ fn finishDerivedCatchUpSessionAsyncImpl(
 ) !derived_executor_mod.CatchUpFinishResult {
     if (index_ref.kind != .dense_vector) {
         if (original) |control| try control.checkpoint();
-        if (attempt) |state| state.consumed = true;
+        if (attempt) |state| {
+            state.consumed = true;
+            state.completed = .{};
+        }
         return .{};
     }
     const ctx: *AsyncContext = @ptrCast(@alignCast(ctx_ptr));
@@ -59800,9 +59803,11 @@ fn finishDerivedCatchUpSessionAsyncImpl(
     // the idle observation and durable lifecycle completion.
     lifecycle_completed = try finishDenseCatchUpSessionTrackedAndFinalize(ctx, index_ref.name) or lifecycle_completed;
     if (lifecycle_completed) DB.notifyQueryVisibilityHook(ctx, .publish_blocking);
-    return .{
+    const result: derived_executor_mod.CatchUpFinishResult = .{
         .applied_sequence_persisted = posting_applied_sequence_persisted and lifecycle_handoff_persisted,
     };
+    if (attempt) |state| state.completed = result;
+    return result;
 }
 
 fn storeHasReplayRecordForHintAfter(
@@ -149676,6 +149681,7 @@ test "controlled dense finalization DB callback retains real capture through rej
             .lifetime_in_wait => error.DeadlineExceeded,
         }, finishDerivedCatchUpSessionAsyncWithAdmission(ctx, ref, token, sequence, .init(&payload), &attempt));
         try std.testing.expect(!attempt.consumed);
+        try std.testing.expect(attempt.completed == null);
         try std.testing.expectEqual(funded_bytes, owner.owner.scheduler.stats().retained_bytes);
         try std.testing.expectEqual(@as(usize, 1), owner.owner.borrowers);
         try std.testing.expectEqual(@as(usize, 0), owner.owner.scheduler.stats().runnable_slots);
@@ -149685,8 +149691,9 @@ test "controlled dense finalization DB callback retains real capture through rej
         control.case = .begin_failure;
         // The retry needs no waits: all guards are free and the original
         // exact capture is still owned. No newly minted session is accepted.
-        _ = try finishDerivedCatchUpSessionAsyncWithAdmission(ctx, ref, token, sequence, .init(&payload), &attempt);
+        const finish_result = try finishDerivedCatchUpSessionAsyncWithAdmission(ctx, ref, token, sequence, .init(&payload), &attempt);
         try std.testing.expect(attempt.consumed);
+        try std.testing.expectEqualDeep(finish_result, attempt.completed.?);
         try std.testing.expectEqual(@as(usize, 0), owner.owner.scheduler.stats().operations);
         try std.testing.expectEqual(@as(u64, 0), owner.owner.scheduler.stats().retained_bytes);
         try std.testing.expectEqual(@as(usize, 0), owner.owner.borrowers);
