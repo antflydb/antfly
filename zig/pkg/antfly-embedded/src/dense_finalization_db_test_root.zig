@@ -14,6 +14,8 @@
 // limitations under the License.
 
 pub const antfly_sources = @import("source_owner_storage.zig");
+pub const common_bounded_admission = @import("common/bounded_admission.zig");
+pub const common_request_admission = @import("common/request_admission.zig");
 pub const consumer_tests_only = true;
 test {
     _ = @import("storage/db/db.zig");

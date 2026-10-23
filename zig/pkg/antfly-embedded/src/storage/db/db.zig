@@ -59523,19 +59523,11 @@ fn takeAsyncDenseCatchUpSession(ctx: *AsyncContext, index_name: []const u8, toke
 fn beginDensePostingCaptureAndStreamingReplaySessionForAsyncCatchUp(
     ctx: *AsyncContext,
     index_ref: index_manager_mod.ManagedIndexRef,
+    cleanup: *?@import("antfly_runtime_abi").runnable_abi.ReservedCleanup,
 ) !derived_executor_mod.CatchUpSessionToken {
     // Acquire before any derived mutation and transfer the lease into the
     // opaque catch-up token. Each batch explicitly retains that token's lease,
     // closing the apply/finish gap without ambient thread ownership.
-    // Fund dormant cleanup before any snapshot/apply holder or native capture.
-    // Rejection cannot leave an accepted capture requiring fresh admission.
-    var cleanup: ?@import("antfly_runtime_abi").runnable_abi.ReservedCleanup = if (ctx.capture_cleanup_owner) |owner| blk: {
-        const io = ctx.io orelse return error.BackendRuntimeIoUnavailable;
-        const borrow = @import("antfly_runtime_abi").native_abi.IoBorrow.init(&io);
-        const bytes = std.math.add(u64, @sizeOf(AsyncDenseCatchUpSession), index_ref.name.len) catch return error.InvalidRunnableDemand;
-        break :blk try @import("antfly_runtime_abi").runnable_abi.ReservedCleanup.reserve(owner, &borrow, ctx.capture_cleanup_budget_ns, bytes);
-    } else null;
-    defer if (cleanup) |*reserved| reserved.deinit();
     var snapshot_replay = try acquireSnapshotReplayAsyncContext(ctx);
     defer if (snapshot_replay) |*lease| lease.release();
     var index_apply_guard = try ctx.index_manager.lockManagedIndexApply(index_ref);
@@ -59556,7 +59548,7 @@ fn beginDensePostingCaptureAndStreamingReplaySessionForAsyncCatchUp(
         index_incarnation,
         capture,
         &snapshot_replay,
-        &cleanup,
+        cleanup,
     );
     capture_transferred = true;
     return token;
@@ -59580,6 +59572,15 @@ fn beginDerivedCatchUpSessionAsync(
     if (index_ref.kind != .dense_vector) return .{};
     const ctx: *AsyncContext = @ptrCast(@alignCast(ctx_ptr));
 
+    // Fund cleanup before registering lifecycle work or acquiring any holder.
+    // Rejection cannot leave an accepted capture requiring fresh admission.
+    var cleanup: ?@import("antfly_runtime_abi").runnable_abi.ReservedCleanup = if (ctx.capture_cleanup_owner) |owner| blk: {
+        const io = ctx.io orelse return error.BackendRuntimeIoUnavailable;
+        const borrow = @import("antfly_runtime_abi").native_abi.IoBorrow.init(&io);
+        const bytes = std.math.add(u64, @sizeOf(AsyncDenseCatchUpSession), index_ref.name.len) catch return error.InvalidRunnableDemand;
+        break :blk try @import("antfly_runtime_abi").runnable_abi.ReservedCleanup.reserve(owner, &borrow, ctx.capture_cleanup_budget_ns, bytes);
+    } else null;
+    defer if (cleanup) |*reserved| reserved.deinit();
     // Register the process-local lease under a stable catalog generation. Once
     // visible, portable publication's final emptiness check rejects the swap;
     // the lock is not held across index startup or any blocking replay work.
@@ -59589,7 +59590,7 @@ fn beginDerivedCatchUpSessionAsync(
         try beginDenseCatchUpSessionTracked(ctx, index_ref.name);
     }
     errdefer finishDenseCatchUpSessionTrackedBestEffort(ctx, index_ref.name);
-    const token = try beginDensePostingCaptureAndStreamingReplaySessionForAsyncCatchUp(ctx, index_ref);
+    const token = try beginDensePostingCaptureAndStreamingReplaySessionForAsyncCatchUp(ctx, index_ref, &cleanup);
     _ = ctx.stats.dense_catch_up.begin_calls.fetchAdd(1, .monotonic);
     return token;
 }
@@ -149580,7 +149581,46 @@ test "controlled dense finalization DB callback retains real capture through rej
         try db.runUntilIdle();
         const ctx = db.async_context;
         const ref: index_manager_mod.ManagedIndexRef = .{ .name = "dv_v1", .kind = .dense_vector };
+        const OwnerState = @import("runnable_test_owner").State;
+        const Clock = struct {
+            fn now() u64 {
+                return 0;
+            }
+        };
+        var owner: OwnerState = .{ .owner_alloc = std.testing.allocator, .owner = try @FieldType(OwnerState, "owner").init(.{ .slots = 3, .control_slots = 1, .cleanup_slots = 1, .max_operations = 2 }), .native_now_ns = Clock.now };
+        defer owner.owner.deinit();
+        ctx.capture_cleanup_owner = owner.port();
+        // Drain sessions before releasing the injected node owner, including
+        // assertion failures after native capture creation.
+        defer {
+            ctx.dense_admission.sessions.deinit(ctx.alloc, ctx.index_manager);
+            ctx.capture_cleanup_owner = null;
+        }
+        const runtime = @import("antfly_runtime_abi");
+        const io = ctx.io.?;
+        const io_borrow = runtime.native_abi.IoBorrow.init(&io);
+        var blocker = try runtime.runnable_abi.ReservedCleanup.reserve(owner.port(), &io_borrow, std.time.ns_per_s, 64);
+        defer blocker.deinit();
+        // max_operations=2 keeps one operation for control. The ordinary
+        // operation is occupied before capture creation reaches any holder.
+        const tracked_before = ctx.dense_admission.sessions.active.load(.acquire);
+        const lifecycle_locks = ctx.stats.dense_finish_mutex.lock_calls.load(.monotonic);
+        const lifecycle_phase = ctx.stats.dense_catch_up.phase.load(.monotonic);
+        const merge_deferred = ctx.text_merge_deferred.load(.acquire);
+        try std.testing.expectError(error.SchedulerFull, beginDerivedCatchUpSessionAsync(ctx, ref));
+        try std.testing.expectEqual(lifecycle_locks, ctx.stats.dense_finish_mutex.lock_calls.load(.monotonic));
+        try std.testing.expectEqual(lifecycle_phase, ctx.stats.dense_catch_up.phase.load(.monotonic));
+        try std.testing.expectEqual(merge_deferred, ctx.text_merge_deferred.load(.acquire));
+        try std.testing.expectEqual(tracked_before, ctx.dense_admission.sessions.active.load(.acquire));
+        try std.testing.expectEqual(@as(u32, 0), ctx.dense_admission.sessions.sessions.count());
+        try std.testing.expectEqual(@as(usize, 1), owner.owner.scheduler.stats().operations);
+        blocker.deinit();
         const token = try beginDerivedCatchUpSessionAsync(ctx, ref);
+        const funded_bytes = owner.owner.scheduler.stats().retained_bytes;
+        try std.testing.expect(funded_bytes > @sizeOf(AsyncDenseCatchUpSession));
+        try std.testing.expectEqual(@as(usize, 1), owner.owner.scheduler.stats().operations);
+        try std.testing.expectEqual(@as(usize, 0), owner.owner.scheduler.stats().runnable_slots);
+        try std.testing.expectEqual(@as(usize, 1), owner.owner.borrowers);
         const sequence = ctx.store.lastReplaySequence(0);
         const before = ctx.index_manager.denseIndex(ref.name).?.index.experimentalPostingDurableAppliedSequence();
         const Control = struct {
@@ -149627,6 +149667,9 @@ test "controlled dense finalization DB callback retains real capture through rej
             .lifetime_in_wait => error.DeadlineExceeded,
         }, finishDerivedCatchUpSessionAsyncWithAdmission(ctx, ref, token, sequence, .init(&payload), &attempt));
         try std.testing.expect(!attempt.consumed);
+        try std.testing.expectEqual(funded_bytes, owner.owner.scheduler.stats().retained_bytes);
+        try std.testing.expectEqual(@as(usize, 1), owner.owner.borrowers);
+        try std.testing.expectEqual(@as(usize, 0), owner.owner.scheduler.stats().runnable_slots);
         control.release();
         try std.testing.expect(ctx.dense_admission.sessions.sessions.contains(token.value));
         try std.testing.expectEqual(before, ctx.index_manager.denseIndex(ref.name).?.index.experimentalPostingDurableAppliedSequence());
@@ -149635,6 +149678,9 @@ test "controlled dense finalization DB callback retains real capture through rej
         // exact capture is still owned. No newly minted session is accepted.
         _ = try finishDerivedCatchUpSessionAsyncWithAdmission(ctx, ref, token, sequence, .init(&payload), &attempt);
         try std.testing.expect(attempt.consumed);
+        try std.testing.expectEqual(@as(usize, 0), owner.owner.scheduler.stats().operations);
+        try std.testing.expectEqual(@as(u64, 0), owner.owner.scheduler.stats().retained_bytes);
+        try std.testing.expectEqual(@as(usize, 0), owner.owner.borrowers);
         try std.testing.expect(!ctx.dense_admission.sessions.sessions.contains(token.value));
         try std.testing.expectEqual(@as(u32, 0), ctx.dense_admission.sessions.active.load(.acquire));
         try std.testing.expectEqual(before, ctx.index_manager.denseIndex(ref.name).?.index.experimentalPostingDurableAppliedSequence());

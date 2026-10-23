@@ -23586,3 +23586,32 @@ Pinned Darwin Debug validation passes 59 build steps and 88 build-reported tests
 plus the real DB runner's 17 selected/imported cases. Error ABI (43), released
 status ABI (1), and failure identity (7) checks pass. The
 `dormant-cleanup-commit` receipt records unchanged native/schema inputs.
+
+### Reject dense capture overload before lifecycle registration
+
+Capture cleanup funding now precedes process-local replay tracking, portable
+catalog admission and resource-manager latency-sensitive replay registration.
+Previously a scheduler-full rejection unwound an already registered replay and
+could invoke dense projection finalization or wake deferred maintenance despite
+having accepted no capture. The reservation stays owned by the outer begin call
+through all rollback, then transfers into the installed exact session.
+
+The real DB finalization fixture now uses the API-owned runnable scheduler with
+one ordinary operation slot. It checks that saturated admission leaves lifecycle
+mutex counts, phase, merge deferral, tracking and session registry unchanged.
+After capacity returns it creates a native capture, verifies retained bytes and
+node ownership without CPU, preserves them across original begin/end/lifetime
+rejection, and releases them after retrying the exact session successfully.
+The test owner and DB share one source namespace through checked ABI callbacks.
+
+Reserved execution handoff during physical finish remains open: acquiring CPU
+while retaining the prepared index apply guard could deadlock other workers.
+The durable stages need an explicit ownership/guard handoff before activation,
+with retryable pre-consumption failure and bounded post-consumption I/O/cost.
+
+Pinned Darwin Debug validation passes all 59 build steps, 88 build-reported tests
+and 18 selected/imported real DB cases without skips or leaks. Error ABI (43),
+released status ABI (1), and failure identity (7) pass. The
+`funded-dense-capture-db-v3` receipt verifies all 5,508 native/schema input hashes.
+Full GNU/Linux qualification remains waived; pinned Nix/glibc Zig is required on
+Linux. The complete design remains unfinished.

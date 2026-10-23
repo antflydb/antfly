@@ -3881,6 +3881,15 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     });
     test_imports.configure(b, dense_finalization_db_root, true, true);
     dense_finalization_db_root.addImport("antfly_source_root", dense_finalization_db_root);
+    const dense_finalization_owner = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/api/runnable_owner_execution.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    dense_finalization_owner.addImport("antfly_runtime_abi", antfly_imports.runtime_abi);
+    dense_finalization_owner.addImport("antfly_local_sources", dense_finalization_db_root);
+    dense_finalization_db_root.addImport("runnable_test_owner", dense_finalization_owner);
     const dense_finalization_db_tests = b.addTest(.{
         .name = "dense-finalization-db-tests",
         .root_module = dense_finalization_db_root,
