@@ -27,7 +27,7 @@ pub const State = struct {
     cleanup_in_use: std.atomic.Value(bool) = .init(false),
 
     pub fn port(self: *State) abi.Owner {
-        return .{ .context = &self.owner, .retain = retain, .release = release, .start = start, .checkpoint = checkpoint, .park = park, .enter = enter, .enter_checked = enterChecked, .finish = finish, .resize_team = resizeTeam, .reserve_completion = reserveCompletion, .activate_completion = activateCompletion, .reserve_cleanup = reserveCleanup, .activate_cleanup = activateCleanup, .completion_remaining_ns = completionRemaining, .reserve_child = reserveChild, .activate_child = activateChild, .activate_child_checked = activateChildChecked, .check_lifetime = checkLifetime, .current_class = currentClass, .cpu_borrow = cpuBorrow, .request_resources = requestResources, .enter_resources = enterResources };
+        return .{ .context = &self.owner, .retain = retain, .release = release, .start = start, .reserve_cleanup_root = reserveCleanupRoot, .checkpoint = checkpoint, .park = park, .enter = enter, .enter_checked = enterChecked, .finish = finish, .resize_team = resizeTeam, .reserve_completion = reserveCompletion, .activate_completion = activateCompletion, .reserve_cleanup = reserveCleanup, .activate_cleanup = activateCleanup, .completion_remaining_ns = completionRemaining, .reserve_child = reserveChild, .activate_child = activateChild, .activate_child_checked = activateChildChecked, .check_lifetime = checkLifetime, .current_class = currentClass, .cpu_borrow = cpuBorrow, .request_resources = requestResources, .enter_resources = enterResources };
     }
 };
 
@@ -117,6 +117,30 @@ fn startChecked(raw: *anyopaque, options: *const abi.Start) !void {
     } else try value.execution.startWithSlots(&owner.owner.scheduler, execution_options, std.enums.fromInt(runnable.Class, options.class) orelse return error.InvalidArgument, options.slots);
     options.out_handle.* = value;
 }
+fn reserveCleanupRoot(raw: *anyopaque, options: *const abi.CleanupReservation) callconv(.c) runtime.error_abi.Status {
+    reserveCleanupRootChecked(raw, options) catch |cause| return runtime.error_abi.statusFromError(cause);
+    return .ok;
+}
+fn reserveCleanupRootChecked(raw: *anyopaque, options: *const abi.CleanupReservation) !void {
+    try options.validate();
+    const owner = state(raw);
+    try owner.owner.retain();
+    errdefer owner.owner.release();
+    const value = try owner.owner_alloc.create(Capsule);
+    errdefer owner.owner_alloc.destroy(value);
+    value.* = .{ .state = owner, .io = try options.io.receive(), .clock_io = if (options.clock_io) |clock| try clock.receive() else null, .cancellation = .{} };
+    errdefer value.execution.finish();
+    const bytes = std.math.add(u64, options.retained_bytes, @sizeOf(Capsule)) catch return error.InvalidRunnableDemand;
+    try value.execution.reserveCleanupRoot(&owner.owner.scheduler, .{
+        .io = value.io.io(),
+        .clock_io = if (value.clock_io) |*clock| clock.io() else null,
+        .native_now_ns = if (options.native_clock != 0) owner.native_now_ns else null,
+        .retained_bytes = bytes,
+        .allow_wait = true,
+    }, options.budget_ns);
+    options.out_handle.* = value;
+}
+
 fn requestResources(raw: *anyopaque, resources: *const abi.ResourceBundle) callconv(.c) runtime.error_abi.Status {
     const participant = @import("runnable_resource_bridge.zig").receive(resources) catch |err| return runtime.error_abi.statusFromError(err);
     capsule(raw).execution.requestResources(participant) catch |err| return runtime.error_abi.statusFromError(err);
@@ -1154,4 +1178,55 @@ test "runnable execution checked child activation preserves refusal before queue
         child.deinit();
         try std.testing.expectEqual(@as(usize, if (reject_at == .queued) 2 else 1), owner_state.owner.scheduler.stats().operations);
     }
+}
+
+test "runnable execution dormant cleanup retains funding without CPU through close" {
+    TestClock.now_ns = 0;
+    defer TestClock.now_ns = 0;
+    var owner: State = .{ .owner_alloc = std.testing.allocator, .owner = try runnable.NodeOwner.init(.{ .slots = 3, .control_slots = 1, .cleanup_slots = 1, .max_operations = 8 }), .native_now_ns = TestClock.now };
+    defer owner.owner.deinit();
+    const port = owner.port();
+    const io = std.testing.io;
+    const borrow = runtime.native_abi.IoBorrow.init(&io);
+    var handle: ?*anyopaque = null;
+    try port.reserveCleanupRoot(&.{ .io = &borrow, .native_clock = 1, .budget_ns = 100, .retained_bytes = 64, .out_handle = &handle });
+    var reserved: abi.ReservedCleanup = .{ .owner = port, .handle = handle };
+    defer reserved.deinit();
+    const charged = owner.owner.scheduler.stats().retained_bytes;
+    try std.testing.expect(charged >= 64);
+    try std.testing.expectEqual(@as(usize, 1), owner.owner.scheduler.stats().operations);
+    try std.testing.expectEqual(@as(usize, 0), owner.owner.scheduler.stats().runnable_slots);
+    try std.testing.expectEqual(error.InvalidRunnableTransition, runtime.error_abi.errorFromStatus(port.checkpoint(handle.?)));
+    try std.testing.expectEqual(error.InvalidRunnableTransition, runtime.error_abi.errorFromStatus(port.enter(handle.?, @backingInt(abi.Class.write))));
+    TestClock.now_ns = 1000;
+    owner.owner.close();
+    _ = try reserved.activate();
+    try std.testing.expect(port.checkpoint(handle.?).isOk());
+    try std.testing.expectError(error.InvalidRunnableTransition, reserved.activate());
+    try std.testing.expectEqual(charged, owner.owner.scheduler.stats().retained_bytes);
+    try std.testing.expect(port.park(handle.?, @backingInt(abi.Wait.resource)).isOk());
+    TestClock.now_ns = 1101;
+    try std.testing.expectEqual(error.DeadlineExceeded, runtime.error_abi.errorFromStatus(port.enter(handle.?, @backingInt(abi.Class.control))));
+    try std.testing.expectEqual(charged, owner.owner.scheduler.stats().retained_bytes);
+    reserved.deinit();
+    reserved.deinit();
+    try std.testing.expectEqual(@as(usize, 0), owner.owner.scheduler.stats().operations);
+    try std.testing.expectEqual(@as(u64, 0), owner.owner.scheduler.stats().retained_bytes);
+    try std.testing.expectEqual(@as(usize, 0), owner.owner.borrowers);
+}
+
+test "runnable execution dormant cleanup allocation failures release admission and owner leases" {
+    const Check = struct {
+        fn run(alloc: std.mem.Allocator) !void {
+            var owner: State = .{ .owner_alloc = alloc, .owner = try runnable.NodeOwner.init(.{ .slots = 3 }), .native_now_ns = TestClock.now };
+            defer owner.owner.deinit();
+            defer std.debug.assert(owner.owner.borrowers == 0);
+            const io = std.testing.io;
+            const borrow = runtime.native_abi.IoBorrow.init(&io);
+            var reserved = try abi.ReservedCleanup.reserve(owner.port(), &borrow, 100, 32);
+            reserved.deinit();
+            try std.testing.expectEqual(@as(usize, 0), owner.owner.scheduler.stats().operations);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Check.run, .{});
 }

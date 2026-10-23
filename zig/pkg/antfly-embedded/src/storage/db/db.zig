@@ -5425,6 +5425,7 @@ pub const DB = struct {
     ) !void {
         const async_resources = self.core.asyncResources();
         self.async_context.* = .{
+            .capture_cleanup_owner = self.backend_runtime.runnableOwner(),
             .alloc = self.runtime_alloc,
             .resource_manager = resource_manager,
             .store = async_resources.store,
@@ -59526,6 +59527,15 @@ fn beginDensePostingCaptureAndStreamingReplaySessionForAsyncCatchUp(
     // Acquire before any derived mutation and transfer the lease into the
     // opaque catch-up token. Each batch explicitly retains that token's lease,
     // closing the apply/finish gap without ambient thread ownership.
+    // Fund dormant cleanup before any snapshot/apply holder or native capture.
+    // Rejection cannot leave an accepted capture requiring fresh admission.
+    var cleanup: ?@import("antfly_runtime_abi").runnable_abi.ReservedCleanup = if (ctx.capture_cleanup_owner) |owner| blk: {
+        const io = ctx.io orelse return error.BackendRuntimeIoUnavailable;
+        const borrow = @import("antfly_runtime_abi").native_abi.IoBorrow.init(&io);
+        const bytes = std.math.add(u64, @sizeOf(AsyncDenseCatchUpSession), index_ref.name.len) catch return error.InvalidRunnableDemand;
+        break :blk try @import("antfly_runtime_abi").runnable_abi.ReservedCleanup.reserve(owner, &borrow, ctx.capture_cleanup_budget_ns, bytes);
+    } else null;
+    defer if (cleanup) |*reserved| reserved.deinit();
     var snapshot_replay = try acquireSnapshotReplayAsyncContext(ctx);
     defer if (snapshot_replay) |*lease| lease.release();
     var index_apply_guard = try ctx.index_manager.lockManagedIndexApply(index_ref);
@@ -59540,12 +59550,13 @@ fn beginDensePostingCaptureAndStreamingReplaySessionForAsyncCatchUp(
         ctx.index_manager.cancelDensePostingSidecarCaptureLeaseByName(index_ref.name, lease) catch {};
     try ctx.index_manager.beginDenseStreamingReplaySessionByName(index_ref.name);
     errdefer ctx.index_manager.abortDenseStreamingReplaySessionByName(index_ref.name);
-    const token = try installAsyncDenseCatchUpSession(
-        ctx,
+    const token = try ctx.dense_admission.sessions.installWithCleanup(
+        ctx.alloc,
         index_ref.name,
         index_incarnation,
         capture,
         &snapshot_replay,
+        &cleanup,
     );
     capture_transferred = true;
     return token;
@@ -59625,6 +59636,7 @@ fn finishDerivedCatchUpSessionAsyncImpl(
         // already been retired, so even coalescer cleanup must happen only
         // after this callback proves ownership of the exact session.
         var session = takeAsyncDenseCatchUpSession(ctx, index_ref.name, token) catch return .{};
+        defer if (session.cleanup) |*cleanup| cleanup.deinit();
         defer ctx.alloc.free(session.index_name);
         defer if (session.snapshot_replay) |*lease| lease.release();
         defer if (session.lease) |lease| if (lease.ownsLifecycle())
@@ -59664,6 +59676,7 @@ fn finishDerivedCatchUpSessionAsyncImpl(
     } else try takeAsyncDenseCatchUpSession(ctx, index_ref.name, token);
     // No fallible operation may precede this acceptance receipt after take.
     if (attempt) |state| state.consumed = true;
+    defer if (session.cleanup) |*cleanup| cleanup.deinit();
     defer if (admitted_guard) |*guard| guard.unlock();
     defer ctx.alloc.free(session.index_name);
     defer if (session.snapshot_replay) |*lease| lease.release();

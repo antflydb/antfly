@@ -23557,3 +23557,32 @@ logs. Separate error ABI (43), released status ABI (1), and failure identity (7)
 checks pass. All 5,508 native/schema inputs match the receipts under
 `controlled-dense-finish-final`, `controlled-dense-finish-db-v2` and
 `controlled-dense-finish-regressions` in the cumulative qualification directory.
+
+### Dormant dense capture cleanup reservations
+
+Dense capture creation now reserves an owning runnable operation and retained
+metadata bytes before acquiring snapshot/apply holders or creating the native
+capture. The reservation holds no CPU while dormant and cannot execute
+foreground work. Successful session installation transfers ownership; failed
+installation, abort, finish and session-owner teardown release it after physical
+users and snapshot leases are retired. Compatibility contexts without a runnable
+owner retain their existing behavior.
+
+The runnable owner retains stable IO receivers and the node lease. Activation
+starts a one-shot finite cleanup budget using the original reservation, including
+after scheduler closure; it does not admit another operation or renew the budget.
+Dormant reservations charge ordinary write capacity, preserving health metadata
+headroom. Native ABI 86, storage-owner ABI 144 and runnable ABI 19 fence these
+layout changes.
+
+This change establishes retained capacity and lifetime ownership. Dense finish
+callbacks still execute under their existing caller authority; moving their
+physical stages under the reserved capsule and qualifying callback I/O/CPU cost
+remain open. The five-second activation duration is a provisional internal bound,
+not a demonstrated callback cost guarantee. Other design completion and
+qualification gates above remain open; strong required providers remain disabled.
+
+Pinned Darwin Debug validation passes 59 build steps and 88 build-reported tests,
+plus the real DB runner's 17 selected/imported cases. Error ABI (43), released
+status ABI (1), and failure identity (7) checks pass. The
+`dormant-cleanup-commit` receipt records unchanged native/schema inputs.

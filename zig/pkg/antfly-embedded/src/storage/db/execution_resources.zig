@@ -175,6 +175,9 @@ pub const ReplayPublication = struct {
 };
 
 pub const AsyncContext = struct {
+    /// Borrowed from the DB backend through session/physical callback drain.
+    capture_cleanup_owner: ?@import("antfly_runtime_abi").runnable_abi.Owner = null,
+    capture_cleanup_budget_ns: u64 = 5 * std.time.ns_per_s,
     replay_publication: ?ReplayPublication = null,
     alloc: Allocator,
     io: ?std.Io = null,

@@ -286,6 +286,7 @@ pub const Entry = struct {
     cleanup_duration_ns: ?u64 = null,
     cleanup_active: bool = false,
     protected_cleanup_root: bool = false,
+    dormant_cleanup_root: bool = false,
 
     fn retainedPhase(self: *const Entry) bool {
         return self.completion_active or self.cleanup_active or self.protected_cleanup_root;
@@ -1021,6 +1022,23 @@ pub const Scheduler = struct {
         try self.submitLocked(e, now, false, false);
     }
 
+    /// Charge an owned future cleanup before publication without acquiring
+    /// CPU. It consumes ordinary operation/byte capacity, preserving health's
+    /// control reserve. Only its preauthorized cleanup may activate later.
+    pub fn reserveCleanupRoot(self: *Scheduler, e: *Entry, budget_ns: u64) !void {
+        if (budget_ns == 0 or e.options.deadline_ns != null or e.options.cancellation != null or !e.options.allow_wait or e.parent != null or e.class != .write or e.slots != 1)
+            return error.InvalidArgument;
+        const now = e.options.now();
+        _ = std.math.add(u64, now, budget_ns) catch return error.InvalidArgument;
+        try e.options.check();
+        self.lock();
+        defer self.mutex.unlock();
+        try self.submitLocked(e, now, false, true);
+        e.dormant_cleanup_root = true;
+        e.cleanup_options = e.options;
+        e.cleanup_duration_ns = budget_ns;
+    }
+
     /// Reserve a child before publishing its task. Each child uses the same
     /// finite operation/byte registry and fair CPU queue, with independent
     /// park/yield state. Its IO must be an independently owned worker lane;
@@ -1149,6 +1167,7 @@ pub const Scheduler = struct {
     }
 
     fn checkAuthority(self: *Scheduler, e: *const Entry) !void {
+        if (e.dormant_cleanup_root and !e.cleanup_active) return error.InvalidRunnableTransition;
         e.options.check() catch |err| {
             // A parent worker's IO cancellation may be independent of the
             // explicit token copied into children. Publish its observed cause
@@ -2111,6 +2130,16 @@ pub const Execution = struct {
 
     /// Independent finite cleanup authority, never a refreshed read scope.
     /// Admission is fail-fast and preserves global health/control headroom.
+    /// A stable owning Execution and its IO/clock parents must outlive this
+    /// reservation through physical completion. No CPU/query authority exists
+    /// until activateCleanup consumes the one-shot activation budget.
+    pub fn reserveCleanupRoot(self: *Execution, scheduler: *Scheduler, options: admission.Options, budget_ns: u64) !void {
+        if (self.entry != null or self.borrowed != null) return error.InvalidRunnableTransition;
+        self.entry = .{ .options = options, .class = .write, .slots = 1, .bytes = options.retained_bytes };
+        errdefer self.finish();
+        try scheduler.reserveCleanupRoot(&self.entry.?, budget_ns);
+    }
+
     pub fn startCleanupRoot(self: *Execution, scheduler: *Scheduler, options: admission.Options) !void {
         if (options.deadline_ns == null or options.allow_wait) return error.InvalidArgument;
         if (options.deadline_ns.? > options.now() +| (250 * std.time.ns_per_ms)) return error.InvalidArgument;
@@ -2201,6 +2230,7 @@ pub const Execution = struct {
         defer owner.mutex.unlock();
         // A denied resume is terminal until owning finish. Later phase or
         // cleanup checks must preserve that cause, not attempt to resurrect it.
+        if (e.dormant_cleanup_root and !e.cleanup_active) return error.InvalidRunnableTransition;
         if (e.state == .stopped) return e.failure orelse error.InvalidRunnableTransition;
         if (needs_running and e.state != .running) return error.InvalidRunnableTransition;
         return owner;
@@ -2216,6 +2246,7 @@ pub const Execution = struct {
             owner.lock();
             defer owner.mutex.unlock();
             if (e.scheduler != owner) return error.InvalidRunnableTransition;
+            if (e.dormant_cleanup_root and !e.cleanup_active) return error.InvalidRunnableTransition;
             if (e.state == .stopped) return e.failure orelse error.InvalidRunnableTransition;
             try owner.checkAncestorsLocked(e);
             if (owner.closed and !e.retainedPhase()) return error.SchedulerClosed;

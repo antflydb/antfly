@@ -19,7 +19,10 @@ const snapshot_admission_mod = @import("snapshot_admission.zig");
 const derived_executor_mod = @import("derived/derived_executor.zig");
 const AtomicU64 = @import("antfly_platform").atomic.Value(u64);
 
+const ReservedCleanup = @import("antfly_runtime_abi").runnable_abi.ReservedCleanup;
+
 pub const Session = struct {
+    cleanup: ?ReservedCleanup = null,
     index_name: []u8,
     index_incarnation: u64,
     lease: ?index_manager_mod.IndexManager.DensePostingCaptureLease,
@@ -60,6 +63,7 @@ pub const Owner = struct {
             };
             if (session.snapshot_replay) |*lease| lease.release();
             alloc.free(session.index_name);
+            if (session.cleanup) |*cleanup| cleanup.deinit();
         }
         self.sessions.deinit(alloc);
         self.* = .{};
@@ -71,6 +75,19 @@ pub const Owner = struct {
         index_incarnation: u64,
         lease: ?index_manager_mod.IndexManager.DensePostingCaptureLease,
         snapshot_replay: *?snapshot_admission_mod.SnapshotAdmission.MutationLease,
+    ) !derived_executor_mod.CatchUpSessionToken {
+        var cleanup: ?ReservedCleanup = null;
+        return self.installWithCleanup(alloc, index_name, index_incarnation, lease, snapshot_replay, &cleanup);
+    }
+
+    pub fn installWithCleanup(
+        self: *Owner,
+        alloc: std.mem.Allocator,
+        index_name: []const u8,
+        index_incarnation: u64,
+        lease: ?index_manager_mod.IndexManager.DensePostingCaptureLease,
+        snapshot_replay: *?snapshot_admission_mod.SnapshotAdmission.MutationLease,
+        cleanup: *?ReservedCleanup,
     ) !derived_executor_mod.CatchUpSessionToken {
         if (lease) |value| if (!value.ownsLifecycle()) return error.PostingWalCaptureOwnershipConflict;
         const owned_name = try alloc.dupe(u8, index_name);
@@ -94,8 +111,10 @@ pub const Owner = struct {
             .index_incarnation = index_incarnation,
             .lease = lease,
             .snapshot_replay = snapshot_replay.*,
+            .cleanup = cleanup.*,
         };
         snapshot_replay.* = null;
+        cleanup.* = null;
         return .{ .value = session_id };
     }
 

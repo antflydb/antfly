@@ -21,7 +21,7 @@ const native = @import("runtime_native_abi.zig");
 const errors = @import("runtime_error_abi.zig");
 const http = @import("runtime_http_abi.zig");
 
-pub const abi_version: u32 = 18;
+pub const abi_version: u32 = 19;
 /// Synchronous, non-yielding restriction on the original CPU-return wait.
 /// Borrowed only until enterChecked returns; never retained by the owner.
 /// Rejection stops that execution and does not retire physical ownership.
@@ -143,6 +143,26 @@ pub const Cleanup = extern struct {
     }
 };
 
+/// Owning cleanup capacity reserved before resource publication. The producer
+/// charges the operation and complete metadata bytes now, without CPU. IO and
+/// clock parents remain borrowed through physical finish; no cancellation or
+/// foreground authority may be installed in this reservation.
+pub const CleanupReservation = extern struct {
+    version: u32 = abi_version,
+    struct_size: u32 = @sizeOf(@This()),
+    io: *const native.IoBorrow,
+    clock_io: ?*const native.IoBorrow = null,
+    budget_ns: u64,
+    retained_bytes: u64 = 0,
+    native_clock: u8 = 0,
+    reserved: [7]u8 = @splat(0),
+    out_handle: *?*anyopaque,
+    pub fn validate(self: *const CleanupReservation) !void {
+        if (self.version != abi_version or self.struct_size != @sizeOf(@This())) return error.UnsupportedVersion;
+        if (self.budget_ns == 0 or self.native_clock > 1 or !std.mem.allEqual(u8, &self.reserved, 0) or (self.native_clock != 0 and self.clock_io != null)) return error.InvalidArgument;
+    }
+};
+
 /// Prepublication child ownership. The independent worker IO is retained
 /// through physical join and finish. Root clock/cancellation inputs remain
 /// borrowed through every child finish; no new query authority is accepted.
@@ -184,6 +204,7 @@ pub const Owner = extern struct {
     park: *const fn (*anyopaque, c_int) callconv(.c) errors.Status,
     enter: *const fn (*anyopaque, c_int) callconv(.c) errors.Status,
     finish: *const fn (*anyopaque) callconv(.c) void,
+    reserve_cleanup_root: ?*const fn (*anyopaque, *const CleanupReservation) callconv(.c) errors.Status = null,
     /// Optional dynamic CPU team capability. All prior children must join
     /// before resizing. Absent support fails explicitly without new admission.
     resize_team: ?*const fn (*anyopaque, usize) callconv(.c) errors.Status = null,
@@ -212,9 +233,15 @@ pub const Owner = extern struct {
     /// Original call-scoped restriction, borrowed synchronously until activation returns.
     activate_child_checked: ?*const fn (*anyopaque, *const Reentry) callconv(.c) errors.Status = null,
 
-    /// Resource-capable owners advertise both initial and parked grants through
-    /// request_resources. Require that capability before invoking start, so an
-    /// owner that only supports CPU cannot silently ignore the resource field.
+    pub fn reserveCleanupRoot(self: Owner, options: *const CleanupReservation) !void {
+        if (!self.valid()) return error.UnsupportedVersion;
+        try options.validate();
+        const reserve = self.reserve_cleanup_root orelse return error.ExecutionWaitUnsupported;
+        const status = reserve(self.context, options);
+        if (!status.isOk()) return errors.errorFromStatus(status);
+    }
+
+    /// Require resource support before invoking start.
     pub fn startWithResources(self: Owner, options: *const Start) !void {
         if (!self.valid()) return error.UnsupportedVersion;
         try options.validate();
@@ -342,8 +369,31 @@ pub const Owner = extern struct {
     }
 };
 
-/// Stored consumer capability. The caller joins every consumer task before
-/// releasing this lease; independently started capsules hold their own leases.
+/// Move-only owning cleanup reservation. The provider retains the node and
+/// clock receivers; the caller retains the complete IO/resource parent chain.
+/// Finish only after publication was abandoned or every physical user joined.
+pub const ReservedCleanup = struct {
+    owner: Owner,
+    handle: ?*anyopaque,
+    pub fn reserve(owner: Owner, io: *const native.IoBorrow, budget_ns: u64, retained_bytes: u64) !ReservedCleanup {
+        var handle: ?*anyopaque = null;
+        try owner.reserveCleanupRoot(&.{ .io = io, .budget_ns = budget_ns, .retained_bytes = retained_bytes, .out_handle = &handle });
+        if (handle == null) return error.InvalidRunnableTransition;
+        return .{ .owner = owner, .handle = handle };
+    }
+    pub fn activate(self: *ReservedCleanup) !Borrowed {
+        const handle = self.handle orelse return error.InvalidRunnableTransition;
+        const slots = try self.owner.activateCleanup(handle);
+        return Borrowed.fromOwner(self.owner, handle, slots, .control);
+    }
+    pub fn deinit(self: *ReservedCleanup) void {
+        const handle = self.handle orelse return;
+        self.handle = null;
+        self.owner.finish(handle);
+    }
+};
+
+/// Stored consumer capability. Join every consumer task before releasing it.
 pub const Lease = struct {
     owner: Owner,
 
