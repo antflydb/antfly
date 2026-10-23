@@ -1074,6 +1074,213 @@ unqualified implementation as achieved savings.
   with committed source, refreshed images, retained receipts, actual net
   deletion figures and a clean worktree. There is no push/deployment step.
 
+## Proposed next bulk campaign: kernel bodies and typed launch ownership
+
+Status: proposed implementation plan, following the completed 24-package
+campaign. Freeze production baseline `0f10101b97825ecd9cb0cbf682ac426dec08f6da`
+and preserve the existing work in `.worktrees/inference-unified-execution`.
+Treat the following **36 packages as one campaign**, with six implementation
+waves and integrated acceptance. Package boundaries are review/qualification
+units; they are not requests for another user instruction per helper.
+
+### Outcome and accounting targets
+
+Remove repeated native implementation and launch preparation while keeping
+backend schedules explicit. The planning envelope is **2,000–4,500 net authored
+production lines / 100–200 KB removed**, with two separate working budgets:
+
+- **60–110 KB of shader/device-body consolidation**, including all replacement
+  loaders, helpers, policies, renderer code and format metadata.
+- **40–90 KB of host dispatch, argument packing and result-adapter consolidation**,
+  including the complete new ABI/symbol metadata and generation machinery.
+
+These are estimates to verify during inventory, not achieved savings. Revise
+them after the first ownership audit if the compatible schedules do not support
+the range. Do not force a measured regression to meet a deletion target. Report
+actual device-body savings, host plumbing, declarations, generated text, binary
+images, tests/tooling and the whole repository delta separately. The preceding
+campaign's 1,558 authored lines / 74,764 bytes are outside this new ledger.
+Moving MSL out of Objective-C strings or generating wrappers earns no savings
+unless the complete new authored owner is smaller. Generated copies that
+already have one owner are not new implementation duplication.
+
+The fresh ignored inventory is under
+`.benchmark-assets/1166/next-consolidation-plan/`. It parses 533 Metal entry
+definitions occupying 786,273 decoded body bytes, including generated regions,
+macro-named entries and thin wrappers. It identifies 105 handwritten CUDA
+bodies of at least 1,400 bytes in the main translation unit, and **275 CUDA
+launch methods / 240 explicit argument-pointer arrays** in `kernels.zig`.
+These are candidate pools, not counts of independent duplicate algorithms.
+Token similarity supplies triage; actual loads, barriers, arithmetic and ownership
+must establish each sharing boundary.
+
+Concrete remaining examples include Metal Q4_0 scalar-reduce variants (11
+entries / 23,161 body bytes), full Q6_K NSG variants, the Q8_0 matrix
+F32/F16-input pair, paired-Q8 matrix F32/F16-output bodies, and within-format
+quantize-copy/set-row encoders. CUDA examples include three MTP masked-selection
+bodies (13,700 bytes), quantized projection/argmax tiles, scalar attention decode
+with ordinary/device-scalar positions, and packed QKV/E4B FFN variants. Some
+prefix groups contain previously shared wrappers: count their existing owners
+once and exclude their wrappers from projected deletion.
+
+### Long-term ownership boundaries
+
+Use five small, connected ownership layers:
+
+1. **Mathematics and geometry:** extend `kernel_descriptor.zig`,
+   `kernel_math.zig`, `kernel_reduction.zig` and `kernel_geometry.zig` only when
+   an actual migrated consumer needs the information. Keep mathematical
+   identity separate from backend scheduling and launch representation.
+2. **Storage/codec leaves:** reuse `quant_recipe.zig`, existing CUDA packed-dot
+   helpers and format conversion owners. Decode, encode, scale and narrowing
+   remain explicit. CUDA GGML Q8_1 raw-sum headers and the legacy/CPU activation
+   contracts remain different types/policies even when their byte widths match.
+3. **Native schedules:** Metal/CUDA templates and Zig comptime helpers own each
+   genuinely shared traversal. Tile dimensions, subgroup counts, accumulator
+   extents, staging precision and tail policies are compile-time choices.
+4. **Typed launch ABI:** maintain backend-specific mappings from named operands
+   to CUDA parameter order or Metal buffer/constant slots. Use ordinary native
+   argument records and straight-line/comptime-expanded bindings. ABI metadata
+   does not become a runtime operation interpreter or a second math language.
+5. **Ownership adapters:** allocation, donation, output construction and error
+   cleanup consume the common contracts. Physical frames, request epochs,
+   prepared caches and device resources retain their existing lifetime owners.
+
+Keep explicit exported symbols and recognizable native bodies. Hot dispatch
+continues through typed fields/direct calls, with no string lookup, heap
+allocation, reflection, virtual policy dispatch or maximum-sized temporary
+arrays added per launch. Reuse existing pipeline constructors and already-shared
+loops; do not create a parallel registry/descriptor vocabulary beside them.
+
+### Work packages
+
+Source aliases below refer to existing files under `zig/pkg/inference/src`:
+`MSL` = `backends/metal_kernels.m`; `CU` =
+`ops/cuda/artifacts/inference_cuda_kernels.cu`; `Launch` =
+`ops/cuda/kernels.zig`; `CPU` = `ops/native_compute.zig`; renderers =
+`graph/quant_kernel_{metal,cuda}_renderer.zig`. Changes to compiler-managed
+regions flow through their existing generators.
+
+| ID | Package and concrete starting point | Intended shared owner and protected distinctions |
+| --- | --- | --- |
+| N01 | Freeze baseline, owner inventory and source ledger | Record each full body, existing helper, generated copy, exported ABI and caller. Assign overlapping candidates one owner; budget net deletion after all new metadata/helpers. Keep the preceding completed campaign immutable. |
+| N02 | Precision/schedule contracts for selected families | Inventory reduction trees, FMA boundaries, staged rounding, signed-zero/NaN/tie behavior, codec headers and exact array extents. Reuse existing policies; add fields only with consumers in this campaign. |
+| N03 | ABI and descriptor ownership map | Map semantic operands to existing CUDA signatures and Metal slots/parameter layouts, distinguishing required/optional exports, mirrors, scratch and persistent state. Prototype against a small representative family before expanding the schema. |
+| N04 | Qualification and dispatch-coverage matrix | Bind every proposed family to direct fixtures, an independent reference, applicable model/training graph and expected route counters. Establish host-launch/preparation measurements as well as GPU timings before editing hot launch plumbing. |
+| N05 | MSL Q4_0 scalar MMV geometry | Share matching `termite_q4_0_linear_1x_reduce*` traversal across NR/NSG/NQ choices, with exact compile-time accumulator dimensions. Retain distinct lane packing/reduction trees and the separate unrolled MMA schedules. |
+| N06 | MSL Q4_0 scalar storage/epilogue variants | Extend the N05 owner for the matching F32/F16 input/output and sum-of-squares variants. Preserve the precise narrowing point and sumsq tree; do not compute unused auxiliary outputs in ordinary variants. N05/N06 earn one combined deletion figure. |
+| N07 | MSL Q6_K NSG scalar variants | Consolidate the full base/NSG4/NSG8 bodies of `termite_q6_k_linear_1x_reduce*` through subgroup policy. Reuse the already-shared odd-block owner; do not count or replace its thin wrappers again. |
+| N08 | MSL ordinary Q8_0 matrix input types | Share `termite_q8_0_linear_mm` / `_in_f16` through typed input acquisition. These are distinct from the already-shared m32/m64 simdgroup-MMA families. Preserve traversal, vector widths and reduction order. |
+| N09 | MSL paired Q8_0 matrix output types | Share `termite_q8_0_pair_activation_multiply_mm` / `_out_f16` with a typed store/epilogue. Keep all four exact eight-row accumulator arrays and gate/up reuse; retain the activation expression's rounding boundaries. |
+| N10 | MSL RMS-scaled paired Q8 projections | Consolidate matching `*_rms_scale_1r_ext` F32/F16-output bodies and common acquisition with `*_1r_ext` only where dataflow matches. Scale placement remains an explicit policy, not an algebraic reassociation. |
+| N11 | MSL Q4_K pair/activation reductions | Compare the `termite_q4_k_pair_*_1x_reduce*` bodies for a shared two-projection traversal and typed activation store. Preserve the distinct non-1x schedule and format-specific scale/min accumulation. |
+| N12 | MSL quantize-copy/set-row encoders | Give each format's `*_set_rows` / `*_cpy_f32_to_q` pair one block-encoder owner, then share matching traversal/address scaffolds. Keep each format's packing, rounding, header bytes and invalid-index behavior. This does not merge different formats' quantizers or legalize duplicate-index scatter races. |
+| N13 | MSL indexed/MoE Q4 projection scaffolds | Audit `termite_q4_0_linear_id_a4b_{gate_up,down}*` and slot projections. Share identical expert-address and dot components; retain grouped routing, atomic/segmented reduction, gate placement and separately tuned NQ variants. |
+| N14 | MSL attention renderer common components | Compare the HD256/HD512 prefill renderers for identical page-address, mask and epilogue components with explicit geometry policies. Retain differing MMA/staging/barrier loops. This is an audit-dependent opportunity, not a promise to merge the dense-eight-query and generic paged schedules already kept separate. |
+| N15 | CU MTP masked select/hidden/argmax | Share the matching ranking/selection core of `termite_gemma4_mtp_masked_*` with compile-time output policy. Preserve masked eligibility, index ties, selected hidden-vector publication and all nonfinite behavior. |
+| N16 | CU quantized projection argmax tiles | Share matching `termite_linear_{q4_0,q8_0,q4_k,q6_k}_argmax_rows_stage1_tile*` scaffolds through format-dot and tile policies. Preserve packed-dot arithmetic and exact tile4/8/16 accumulator sizes; different reductions stay separate. |
+| N17 | CU argmax partial merge widths | Consolidate matching `termite_argmax_reduce_rows_pairs_f32*` addressing/store logic with explicit warp-width reduction policies. Preserve the current tree, lowest-index ties, sentinels and publication order. Reuse the common value/index contract from N15/N16 without forcing one tree. |
+| N18 | CU scalar attention decode positions | Share `termite_gqa_attention_decode_f32` / `_decode_scalars_f32` with compile-time scalar acquisition. Keep device-scalar reads inside the captured invocation at their original load points; retain masks, scaling, cache addressing and accumulation order. |
+| N19 | CU TurboQuant attention staging | Compare decode/prefill and split-stage key/value acquisition, especially polar4/int8-identity variants. Share proven identical scaffolds with codec-specific leaves. Preserve staging widths, page mapping and split publication/counter behavior; incompatible loops remain specialized. |
+| N20 | CU packed QKV projection tiles | Share matching `*_qkv_nobias_q8_1_f32_tile{4,8}*` and ordinary-QKV width variants via exact compile-time tile/warp policy. Preserve three-projection reuse, output offsets and separate-product rounding. Do not pull in the protected packed rows2 specialization. |
+| N21 | CU E4B FFN warp/shape variants | Consolidate matching `*_pair_activation_q8_1_f32_tile4_w{5,8}_e4b_ffn` and fixed-width attention cases. Keep each width/warp schedule and Q8 header contract explicit; reuse existing helpers before adding another packed-dot abstraction. |
+| N22 | CU quantized-output multirow FFN | Compare the `*_tile32_w5_e4b_ffn_rows4` / `_rows8_c2` schedules. Share identical dot/quantize pieces with exact row/channel extents; preserve distinct cross-warp staging and epilogue contexts where resource reports differ. |
+| N23 | CU small warp attention siblings | Compare `termite_laya_attention_warp_f32` / `termite_gliner_encoder_attention_f32` for identical warp math and an addressing/masking policy. Keep local-window/block algorithms separate. No new architecture/model admission is part of this refactor. |
+| N24 | Launch symbol registration and lifecycle | Reuse one consumed symbol/field specification for required/optional loading, initialization and clearing. Preserve ordinary typed `CUfunction` fields, fallback precedence, JIT replacement and capability predicates. Reuse existing Metal pipeline constructors rather than rebuilding an already-shared constructor layer. |
+| N25 | Launch typed argument packing | Replace repeated local pointer/scalar conversions and parameter arrays with named, compile-time ABI records/helpers. Preserve exact CUDA wire types/order and per-launch stack lifetimes; no host heap or dynamic reflection. Connect to the existing CUDA parameter-list owner instead of adding another signature truth. |
+| N26 | Metal typed binding scaffolds | Share repeated buffer/constant/scratch binding setup for selected matching families. Emit/inline the existing straight-line bindings; preserve slot numbers, buffer offsets, dynamic scratch, scoped/concurrent encoders, resource retention and command counts. Count metadata and generated glue fully. |
+| N27 | Common geometry and launch preflight | Reuse `kernel_geometry.zig` and the descriptor's concrete consumers for repeated dimensions, minimum byte extents, overflow checks and output geometry. Preserve each entry's empty-input/error/decline semantics and validate before writes or submission. Backend-specific alignment and scratch remain schedule policy. |
+| N28 | CPU and backend result-ownership adapters | Consolidate repeated allocating/into/consume result setup where the existing contracts match. Start with native RoPE/GEGLU/clamp adapters and analogous typed CUDA output construction. Audit overlapping `errdefer`/`makeOwnedBuf` cleanup contracts; prove every partial allocation failure and donation branch before migration. Existing grouped-result helpers remain their owner. |
+| N29 | CPU packed normalization backward output | Add/reuse an into-style arithmetic leaf for the packed layer-norm backward result so the backend can fill its final allocation directly. Keep public/reference interfaces compatible, independent oracle coverage, summation order and zero initialization. Qualify eliminated temporary arrays/copies as a separate memory-traffic improvement. |
+| N30 | Consume shared operation descriptors | Connect N03/N25/N27/N28 to the existing `Descriptor`, invocation, workspace and auxiliary contracts. Extend semantics only for actual existing consumers; keep target ABI, tile and precision schedules separate. Do not expand graph lowering/admission, change plan IDs or leave speculative descriptor fields unused. |
+| N31 | Remaining Metal rotary scalar math | Share identical pair rotation/index fragments across ordinary, per-item, paired and vision rotary bodies where precision matches. Keep position-source/section mapping, table lookup, transcendental mode and head-RMS reduction distinct. CUDA scalar RoPE and CPU table leaves already have owners and earn no new math savings here. |
+| N32 | Optimizer arithmetic versus storage policy | Compare Metal AdamW in-place / into kernels for one exact arithmetic leaf with compile-time storage policy. Preserve gradient mutation, moment update order, epsilon/decay placement, flags and transaction publication. Audit CPU/CUDA reuse of existing optimizer owners rather than forcing a common floating-point profile. |
+| N33 | Remaining attention emission multiplicity | Audit serial/split-count/score-prework CUDA emission for common definitions still rendered more than once. Reuse existing renderers; keep standalone sources self-contained. Previously compacted flash-prefill and split-K common definitions are already done and excluded. Report authored renderer and generated-bundle changes separately. |
+| N34 | Retire superseded owners and duplicate metadata | Remove replaced private bodies/helpers and stale per-family declarations; retain exported ABI wrappers and required compatibility symbols. Include header/metadata dependency closure in source/JIT/artifact identities and freshness checks. File splitting alone is not deletion. |
+| N35 | Complete reusable fixture and ownership coverage | Extend existing runners for typed-ABI probes, auxiliary outputs, stateful replay and allocation failures as each package starts; finish the coverage audit here. Retain manifests/source hashes and actual dispatch evidence. Independent references must not silently become calls to the new production helper. |
+| N36 | Qualify the full composition and publish the ledger | Freeze the final candidate, compare all changes to N01's original baseline, regenerate/check artifacts, run model/training/lifetime/soak gates, collect caches and commit coherent waves with a clean worktree. Report retained specializations and hardware/toolchain limits explicitly. No push/deployment step. |
+
+### Six implementation waves
+
+1. **Ownership and contracts — N01–N04.** Freeze the source/images/executables;
+   identify actual source owners and high-confidence versus audit-dependent
+   candidates. Start N35's fixture/ABI work before any affected implementation.
+2. **Quantized compute and selection — N05–N13, N15–N17, N20–N22.** Process
+   Metal scalar/typed/encoder families and CUDA projection/selection families
+   together. Prefer high-confidence paired bodies first. Qualify each schedule
+   cohort before combining it with another cohort.
+3. **Decoder, attention and optimizer math — N14, N18–N19, N23, N31–N32.**
+   Use the same precision/codec owners, with independent per-schedule evidence.
+   Audit-dependent attention sharing has a lower confidence than typed twins;
+   retain separate loops whenever the common schedule is not established.
+4. **Launch and result ownership — N24–N30.** Start from already-qualified
+   family ABIs and migrate in bounded groups. Measure host-side overhead,
+   allocation/cleanup and graph capture, not just device event timings.
+5. **Emission and retirement — N33–N34.** Compact remaining generated repetition
+   after actual ownership is clear. Regenerate the canonical sources/images
+   together and remove the old owners after caller and ABI audits.
+6. **Integrated acceptance — N35–N36.** Complete the coverage audit and run the
+   final frozen composition against the original baseline. No final handoff
+   with unqualified new bodies or a dirty production worktree.
+
+Use approximately six to ten reviewable commits, grouped by compatible source
+owners and qualification boundaries. Run source/codegen checks per completed
+cohort and seven-architecture compiler/resource comparison per CUDA compute
+wave, including unrelated functions that NVCC may change. Avoid full artifact
+regeneration per tiny helper, competing timing jobs on one device, or a user
+handoff between individual packages.
+
+### Qualification and performance protections
+
+Retain the established ceilings: **5% direct-kernel/model median and 10% model
+p95**, aiming for neutral or better throughput. Investigate a reproducible
+hot-path loss even inside the ceiling. Predeclare balanced timing protocols;
+retain every failed arm/series and use longer whole-cohort controls for unstable
+results. Never switch baselines between waves or select favorable runs.
+
+For numerical coverage, test exact complete baseline outputs, guards, tails,
+empty/admitted boundary cases, integer bits, packed headers, narrowing ties,
+signed zeros, NaNs/Infs and deterministic index ties where contracts admit
+them. Keep independent F64/integer/finite-difference or pinned framework
+references. Check Metal safe/fast modes, static/dynamic scratch and thread
+limits; check CUDA instructions and register/shared/local/stack usage on every
+packaged architecture, then execute directly on Glowworm GB10.
+
+For launch/descriptor changes, validate argument names/types/order and Metal
+slots against the native ABI, with independent sentinel-filled device probes.
+Test optional-symbol absence, illegal shapes declining before writes, donation
+and every partial allocation failure. Measure CPU argument preparation,
+end-to-end small launches, cold initialization, allocation counts and actual
+command/encoder/submission counts. A GPU-event-only benchmark cannot qualify
+N24–N30. Preserve capture-time parameter copying, replay-time device scalars,
+persistent counters and request-owned buffer/auxiliary lifetimes.
+
+Retain the existing 17-case admitted CPU/Metal/CUDA model matrix and independent
+CPU/Metal decoder oracle, then add bounded graph/model workloads that actually
+exercise the newly changed MTP, argmax, codec and training families. Record
+which cases dispatch each family: the existing encoder/reranker matrix alone
+does not cover those decoder paths. Where GB10 cannot admit a particular model,
+use independent direct references and captured replay, document the hardware
+limit and retain any specialization whose performance cannot be qualified.
+Do not broaden CUDA decoder admission to manufacture coverage.
+
+Repeat retained-frame/pool-pressure, runtime/executable eviction, strict
+resident, graph reset, mirror/auxiliary lifetime and representative soaks for
+ownership changes. Train selected tiny resident graphs through backward and
+optimizer updates, including exact durable resume and rejected-update recovery.
+Keep the existing CUDA rows2 tile, F32 activation-slice contexts, dense/paged
+attention schedule distinctions and differing Q8_1 headers protected unless a
+new approach independently clears their original resource and numerical gates.
+Already-shared CUDA RMSNorm/RoPE, Metal m32/m64 MMA, CPU prepared workers and
+grouped SGEMM/result ownership are not counted as fresh opportunities.
+
+Finish with canonical generated-source freshness, all three pinned-toolchain
+CUDA images, product and browser WASM builds, appropriate reference suites,
+whitespace/format checks, cache collection and committed source. Record offline
+Metal toolchain availability separately from real GPU runtime compilation;
+compile the full generated/rendered shader set through the available path and
+do not report an unavailable AIR compiler as a passing offline check.
+
 ## Original checkpoint qualification
 
 Use repository-pinned Zig 0.17.0. Real Metal tests need access to the host GPU;
