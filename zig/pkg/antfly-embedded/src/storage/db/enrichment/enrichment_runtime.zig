@@ -16486,6 +16486,7 @@ const PdfWindowCompositeLease = struct {
     scratch_bytes: usize,
     output_bytes: usize,
     window_slots: usize,
+    scratch_admission_contended: bool = false,
     manager: ?*resource_manager_mod.ResourceManager,
     rendering_finished: bool = false,
     consumer_count: usize = 0,
@@ -16537,6 +16538,7 @@ const PdfWindowCompositeLease = struct {
                 return error.DocumentExtractionWorkingSetTooLarge;
             if (self.scratch_bytes < window_slots or self.output_bytes != required_output)
                 return error.DocumentExtractionWorkingSetTooLarge;
+            self.noteScratchGrant(requested_scratch);
             self.output_budgeted = resource_manager_mod.BudgetedAllocator.init(
                 resource_manager,
                 .document_extraction_working_set,
@@ -16592,7 +16594,28 @@ const PdfWindowCompositeLease = struct {
             growth = @intCast(self.scratch_retry_reservation.?.bytes);
         }
         self.scratch_bytes += growth;
+        self.noteScratchGrant(requested);
         return true;
+    }
+
+    /// A partial grant proves neither page oversize nor that this window has
+    /// reached its standalone limit. Preserve that distinction until rendering
+    /// joins: a failed page must yield if other admitted owners constrained it.
+    /// The growth callback is serialized by the renderer; readers join it first.
+    fn noteScratchGrant(self: *@This(), requested: usize) void {
+        const manager = self.manager orelse return;
+        self.scratch_admission_contended = requested > self.scratch_bytes and
+            manager.classifyRequestDenial(.document_extraction_working_set, self.reservedBytes() +| 1) == error.ResourceTemporarilyUnavailable;
+    }
+
+    fn checkScratchFailures(self: *const @This(), batch: RuntimePdfRenderBatch) !void {
+        if (!self.scratch_admission_contended) return;
+        switch (batch) {
+            inline else => |value| for (value.results) |result| {
+                if (result.failure) |err| if (isPdfScratchPressure(err))
+                    return error.ResourceTemporarilyUnavailable;
+            },
+        }
     }
 
     /// Called only after the synchronous renderer has joined every wave and
@@ -16607,6 +16630,7 @@ const PdfWindowCompositeLease = struct {
             reservation.primary_bytes = 0;
         }
         self.scratch_bytes = 0;
+        self.scratch_admission_contended = false;
         self.rendering_finished = true;
     }
 
@@ -17578,13 +17602,19 @@ fn renderPdfWindowWithScratchRetry(renderer: anytype, lease: *PdfWindowComposite
     const admitted = try lease.admitScratchRetry(max_scratch_bytes);
     // Parallel lanes may exhaust a shared grant that is sufficient for one
     // page. Retry only failed identities serially even when growth is denied.
-    if (!admitted and !already_grown and options.max_parallel_pages <= 1) return batch;
+    if (!admitted and !already_grown and options.max_parallel_pages <= 1) {
+        try lease.checkScratchFailures(batch);
+        return batch;
+    }
     // A single page that already consumed its admitted growth cannot benefit
     // from replaying with the same grant. Multi-page windows can shed other
     // lanes' caches by retrying only the failed pages serially.
     if (already_grown and switch (batch) {
         inline else => |value| value.results.len == 1,
-    }) return batch;
+    }) {
+        try lease.checkScratchFailures(batch);
+        return batch;
+    }
     var retry_options = options;
     retry_options.max_inflight_bytes = lease.scratchBytesPerWindow();
     retry_options.max_parallel_pages = 1;
@@ -17612,6 +17642,7 @@ fn renderPdfWindowWithScratchRetry(renderer: anytype, lease: *PdfWindowComposite
             value.thread_spawn_fallbacks +|= replacement.thread_spawn_fallbacks;
         },
     }
+    try lease.checkScratchFailures(batch);
     return batch;
 }
 
@@ -36242,4 +36273,63 @@ test "backup preflight reader media parts match execution" {
     defer a.free(json);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"kind\":\"source_local\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"compatibility\":{\"verdict\":\"blocked\"") != null);
+}
+
+test "PDF partial scratch grants yield contention and recover after release" {
+    const Fake = struct {
+        lease: *PdfWindowCompositeLease,
+        pages: usize,
+        calls: usize = 0,
+
+        fn run(self: *@This(), alloc: Allocator, options: document_extraction_mod.PdfPageRenderBatchOptions, indices: ?[]const usize) !RuntimePdfRenderBatch {
+            if (self.calls == 0) _ = try self.lease.admitScratchRetry(600);
+            self.calls += 1;
+            if (indices) |items| try std.testing.expectEqualSlices(usize, &.{0}, items);
+            const Batch = @FieldType(RuntimePdfRenderBatch, "encoded");
+            const Result = std.meta.Child(@FieldType(Batch, "results"));
+            const results = try alloc.alloc(Result, if (indices) |items| items.len else self.pages);
+            @memset(results, .{ .page_number = 1 });
+            errdefer {
+                for (results) |*result| result.deinit(alloc);
+                alloc.free(results);
+            }
+            for (results, 0..) |*result, i| {
+                result.page_number = @intCast(i + 1);
+                if (i == 0 and self.lease.scratch_bytes < 300) {
+                    result.failure = error.RenderWorkerMemoryLimitExceeded;
+                } else {
+                    result.rendered = .{ .png = try alloc.dupe(u8, "keep"), .width = 1, .height = 1, .requested_dpi = 150, .effective_dpi = 150 };
+                }
+            }
+            return .{ .encoded = .{ .results = results, .requested_parallelism = options.max_parallel_pages, .peak_launched_workers = 1, .peak_parallelism = 1, .peak_admitted_pixels = 1, .peak_admitted_bytes = self.lease.scratch_bytes, .thread_spawn_fallbacks = 0 } };
+        }
+    };
+    const a = std.testing.allocator;
+    // Cover both the single-page early exit and the failed-only serial replay
+    // beside an already-completed sibling. Neither may publish failed OCR
+    // merely because another owner constrained the scratch grant.
+    for ([_]usize{ 1, 2 }) |pages| {
+        var budgets = resource_manager_mod.Options.defaultBudgets();
+        budgets[@backingInt(resource_manager_mod.Slice.document_extraction_working_set)] = .{ .hard_limit_bytes = 4696, .soft_limit_bytes = 0 };
+        var manager = resource_manager_mod.ResourceManager.init(.{ .budgets = budgets });
+        defer manager.deinit(a);
+        var competing = try manager.reserveWithoutReclaim(.document_extraction_working_set, 400);
+        defer competing.release();
+        const lease = try PdfWindowCompositeLease.create(a, a, &manager, 100, 4096, 1);
+        defer lease.destroy();
+        var fake = Fake{ .lease = lease, .pages = pages };
+        try std.testing.expectError(error.ResourceTemporarilyUnavailable, renderPdfWindowWithScratchRetry(&fake, lease, .{ .max_inflight_bytes = 100, .max_parallel_pages = pages }, 600));
+        try std.testing.expectEqual(pages, fake.calls);
+        try std.testing.expectEqual(@as(usize, 200), lease.scratch_bytes);
+        try std.testing.expectEqual(@as(usize, 0), lease.output_limit.liveBytes());
+        lease.finishRendering();
+        try std.testing.expect(!lease.scratch_admission_contended);
+        competing.release();
+        lease.rendering_finished = false;
+        try std.testing.expect(try lease.admitScratchRetry(600));
+        var alone = try renderPdfWindowWithScratchRetry(&fake, lease, .{ .max_inflight_bytes = 600, .max_parallel_pages = pages }, 600);
+        defer alone.deinit(lease.allocator());
+        try std.testing.expect(alone.encoded.results[0].failure == null);
+        try std.testing.expectEqualStrings("keep", alone.encoded.results[0].rendered.?.png);
+    }
 }
