@@ -26,7 +26,7 @@ ANTFLY_INFERENCE_FLORENCE_DISABLE_KV_CACHE=1, then requires exact output parity.
 Writes cached.json, full_sequence.json, stderr logs, and summary.json to OUT_DIR.
 
 Environment overrides:
-  ANTFLY_BIN                         prebuilt antfly-inference binary (skips build)
+  ANTFLY_BIN                         prebuilt antfly-inference-dev binary (skips build)
   ANTFLY_FLORENCE2_MODEL_DIR         Florence-2 GGUF model directory
   ANTFLY_FLORENCE2_IMAGE             input image
   ANTFLY_FLORENCE2_PROMPT            reader prompt (default: <MORE_DETAILED_CAPTION>)
@@ -145,10 +145,10 @@ else
   zig_bin="$(resolve_zig)"
   env ZIG_LOCAL_CACHE_DIR="$zig_local_cache_dir" ZIG_GLOBAL_CACHE_DIR="$zig_global_cache_dir" \
     "$zig_bin" build -Dmetal=true -Doptimize="$optimize"
-  antfly_bin="$pkg_root/zig-out/bin/antfly-inference"
+  antfly_bin="$pkg_root/zig-out/bin/antfly-inference-dev"
 fi
 if [[ ! -x "$antfly_bin" ]]; then
-  echo "missing antfly-inference binary: $antfly_bin" >&2
+  echo "missing antfly-inference-dev binary: $antfly_bin" >&2
   exit 1
 fi
 

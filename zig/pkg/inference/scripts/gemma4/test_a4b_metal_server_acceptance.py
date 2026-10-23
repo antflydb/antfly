@@ -196,7 +196,7 @@ class ContractTests(unittest.TestCase):
     ) -> None:
         with tempfile.TemporaryDirectory() as raw_tmp:
             tmp = Path(raw_tmp)
-            binary = tmp / "antfly-inference"
+            binary = tmp / "antfly-inference-dev"
             binary.touch()
             model_dir = tmp / "model"
             model_dir.mkdir()
@@ -218,7 +218,7 @@ class ContractTests(unittest.TestCase):
     def test_cautious_gate_accepts_100_output_tokens(self) -> None:
         with tempfile.TemporaryDirectory() as raw_tmp:
             tmp = Path(raw_tmp)
-            binary = tmp / "antfly-inference"
+            binary = tmp / "antfly-inference-dev"
             binary.touch()
             model_dir = tmp / "model"
             model_dir.mkdir()

@@ -24,7 +24,7 @@ Runs the CUDA Gemma4 TurboQuant production-readiness gate.
 
 Environment overrides:
   ZIG_BIN                 path to Zig 0.16 binary
-  ANTFLY_BIN              path to antfly-inference binary
+  ANTFLY_BIN              path to antfly-inference-dev binary
   OUT_DIR                 output directory for logs/json timing
   E2B_MODEL               Gemma4 E2B model directory
   GEMMA12B_Q4_MODEL       Gemma4 12B Q4 model path/directory
@@ -63,7 +63,7 @@ done
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../../../.." && pwd)"
 inference_dir="$repo_root/zig/pkg/inference"
 zig_bin="${ZIG_BIN:-$repo_root/.tools/zig-x86_64-linux-0.17.0/zig}"
-antfly_bin="${ANTFLY_BIN:-${ANTFY_BIN:-$inference_dir/zig-out/bin/antfly-inference}}"
+antfly_bin="${ANTFLY_BIN:-${ANTFY_BIN:-$inference_dir/zig-out/bin/antfly-inference-dev}}"
 out_dir="${OUT_DIR:-/tmp/antfly-cuda-turboquant-gate-$(date -u +%Y%m%dT%H%M%SZ)}"
 mkdir -p "$out_dir"
 
@@ -171,7 +171,7 @@ PY
 }
 
 require_path "zig binary" "$zig_bin"
-require_path "antfly-inference binary" "$antfly_bin"
+require_path "antfly-inference-dev binary" "$antfly_bin"
 
 if [ "$mode" != "bench-only" ]; then
   (cd "$inference_dir" && run_logged build_cuda "$zig_bin" build -Dcuda=true)

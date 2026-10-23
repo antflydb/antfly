@@ -1,5 +1,10 @@
 # Local storage and server replication boundary
 
+> Licensing and distribution update: all first-party Antfly code is Apache-2.0.
+> Public commands use `antfly lite` and `antfly inference`; the embedded archive
+> contains `libantfly` and supporting files only. Earlier split-license and CLI
+> packaging decisions below are historical. See [licensing](../../LICENSING.md).
+
 The contract refactor (#958) is merged. The physical local-engine move (#953)
 places the DB and its dependency closure under `antfly-embedded/src`;
 the Apache/ELv2 licensing and release changes follow in #893. Existing licenses

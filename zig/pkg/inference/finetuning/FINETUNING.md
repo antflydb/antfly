@@ -176,7 +176,7 @@ cd zig/pkg/inference
 python3 scripts/gemma4/run_gemma4_cuda_preference_smoke.py \
   --model e2b=/models/gemma-4-E2B-it-bf16 \
   --grpo-target e2b=qualification-sequence-hash-v1 \
-  --antfly-bin zig-out/bin/antfly-inference \
+  --antfly-bin zig-out/bin/antfly-inference-dev \
   --out /runs/gemma4-cuda-preference-smoke
 ```
 

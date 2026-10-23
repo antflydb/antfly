@@ -322,6 +322,7 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
     addMacosSdkPaths(b, libantfly_link_mod, target);
     const libantfly = @import("shared_library.zig").addWithStorageOwner(b, libantfly_link_mod, &.{ native_inference, native_enrichment }, native_storage);
     const install_libantfly = libantfly.install;
+    b.addNamedLazyPath("libantfly", libantfly.binary);
     if (native_storage) |owner| {
         const client_mod = b.createModule(.{ .root_source_file = b.path("pkg/antfly-embedded/src/public_capi_root.zig"), .target = target, .optimize = optimize });
         antfly_imports.configureEmbedded(b, client_mod, link_libc);
@@ -366,7 +367,7 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
     const package_boundary = @import("embedded_boundary.zig").add(b, antfly_embedded_pkg_mod);
     b.top_level_steps.get("embedded-native-module-boundary-check").?.step.dependOn(&package_boundary.step);
 
-    const install_licenses = @import("../../lib/product_licenses/build.zig").installApache(b, b.path(".."), "antfly-lite", "share/licenses/antfly-lite");
+    const install_licenses = @import("../../lib/product_licenses/build.zig").installApache(b, b.path(".."), "libantfly", "share/licenses/libantfly");
     b.getInstallStep().dependOn(install_licenses);
     const capi_step = b.step("capi", "Build the public libantfly C ABI shared library");
     capi_step.dependOn(install_licenses);

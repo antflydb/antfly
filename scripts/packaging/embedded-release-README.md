@@ -1,19 +1,19 @@
-# Antfly Embedded
+# Antfly embedding library
 
-This Apache-2.0 archive contains the embedded database and inference runtime:
+This Apache-2.0 archive contains the in-process database and inference runtime:
 
-- `antfly-lite`: file-oriented database CLI; run `./antfly-lite help`.
-- `antfly-inference`: public inference CLI; run `./antfly-inference --help`
-  for commands including `run`, `embed`, `generate`, `chat`, `list`, and `pull`.
-- `lib/libantfly` and `include/antfly.h`: the combined database and inference C API.
-- `antfly-inference-worker`: private executable for isolated inference work.
+- `lib/libantfly`: native shared library (`.so` or `.dylib`; Windows uses `bin/antfly.dll`).
+- `include/antfly.h`: public C API.
+- `lib/pkgconfig/libantfly.pc`: relocatable native build metadata.
+- Runtime assets and applicable license notices.
 
-Keep `lib/` and `include/` together when installing. Add `lib/pkgconfig` to
-`PKG_CONFIG_PATH` so Go, Rust, and C build tools can find `libantfly.pc`.
-The private worker supports CLI hosts that enable process isolation;
-`libantfly` always runs inference in-process. Python and npm packages bundle the library without
-installing public CLI commands. Go and Rust consumers link the same library.
-Database HTTP serving belongs to the separate ELv2 Antfly server.
+Keep the archive layout together. Add `lib/pkgconfig` to `PKG_CONFIG_PATH` for
+C, Go, and Rust consumers. Python and npm embedded packages bundle the same
+library. `libantfly` runs inference in-process and needs no CLI or worker.
 
-The product license is in `LICENSE`. Third-party licenses and notices are in
-`LICENSES/third-party/` and `THIRD_PARTY_NOTICES.md`.
+Install the separate `antfly` CLI for local file commands (`antfly lite`),
+inference commands (`antfly inference`), or database serving (`antfly standalone`).
+The embedded archive installs no public executables.
+
+First-party Antfly code is Apache-2.0. Third-party components retain the terms
+recorded in `LICENSES/third-party/` and `THIRD_PARTY_NOTICES.md`.

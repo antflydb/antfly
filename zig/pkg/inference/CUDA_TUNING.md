@@ -68,7 +68,7 @@ Run the tuned server with:
 
 ```sh
 zig/pkg/inference/scripts/gemma4/with_gemma4_qat_cuda_tuning.sh \
-  zig/pkg/inference/zig-out/bin/antfly-inference run \
+  zig/pkg/inference/zig-out/bin/antfly-inference-dev run \
   --host 127.0.0.1 --port 8080 --models-dir .models --config server.json
 ```
 
@@ -81,7 +81,7 @@ and output tokens, rounded up to a KV page:
 ```sh
 ANTFLY_CAPTURE_FORCE_KV_CAPACITY=1056 \
   zig/pkg/inference/scripts/gemma4/with_gemma4_qat_cuda_tuning.sh \
-  zig/pkg/inference/zig-out/bin/antfly-inference run \
+  zig/pkg/inference/zig-out/bin/antfly-inference-dev run \
   --host 127.0.0.1 --port 8080 --models-dir .models --config server.json
 ```
 
@@ -175,7 +175,7 @@ Set both server controls explicitly when running the batching profile:
 ANTFLY_SERVER_DISABLE_CONTINUOUS_BATCHING=0 \
 ANTFLY_SERVER_DECODE_GRAPH_REPLAY=off \
   zig/pkg/inference/scripts/gemma4/with_gemma4_qat_cuda_tuning.sh \
-  zig/pkg/inference/zig-out/bin/antfly-inference run \
+  zig/pkg/inference/zig-out/bin/antfly-inference-dev run \
   --host 127.0.0.1 --port 8080 --models-dir .models --config server.json
 ```
 
@@ -879,7 +879,7 @@ For an equivalent local evidence run after a ReleaseFast CUDA build:
 
 ```sh
 python3 zig/pkg/inference/scripts/gemma4/gemma4_cuda_l4_release_gate.py \
-  --binary zig/pkg/inference/zig-out/bin/antfly-inference \
+  --binary zig/pkg/inference/zig-out/bin/antfly-inference-dev \
   --llama-cpp-bin /path/to/llama-completion \
   --e2b-model /path/to/gemma-4-E2B-it-qat-UD-Q4_K_XL.gguf \
   --gemma12b-q4-model /path/to/gemma-4-12B-it-Q4_K_M.gguf \

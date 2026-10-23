@@ -367,7 +367,7 @@ def main() -> int:
     parser.add_argument(
         "--binary",
         type=Path,
-        default=repo_root / "zig/pkg/inference/zig-out/bin/antfly-inference",
+        default=repo_root / "zig/pkg/inference/zig-out/bin/antfly-inference-dev",
     )
     parser.add_argument(
         "--model",

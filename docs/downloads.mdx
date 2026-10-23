@@ -42,23 +42,19 @@ installs:
 
 <DownloadLink version={ANTFLY_VERSION} baseUrl={RELEASES_BASE_URL} />
 
-The separate Apache-2.0 Embedded archive layout applies to **v0.3.0+**, including
-the verified [v0.3.0-rc.2 assets](https://github.com/antflydb/antfly/releases/tag/v0.3.0-rc.2).
-Older releases such as v0.2.4 do not publish a matching Embedded archive. Select
-only filenames listed in that release's assets or `artifacts.json`; do not
-construct an Embedded download from the stable version selector above.
-Before stable promotion, use a listed RC asset such as
-`antfly-embedded_0.3.0-rc.2_Darwin_arm64.tar.gz` or
-`antfly-embedded_0.3.0-rc.2_Linux_x86_64_gnu.tar.gz`, or build from a pinned source
-revision using the [repository instructions](https://github.com/antflydb/antfly/tree/main/zig/pkg/antfly-embedded).
-The Embedded archive contains
-`antfly-lite`, `antfly-inference`, `libantfly`, `include/antfly.h`, the private
-inference worker, runtime files, and license notices.
+The `antfly` runtime archive provides the CLI and native embedding library.
+Use `antfly lite` for local database files and `antfly inference` for models or
+the inference service.
 
-Run `./antfly-lite help` for database commands or `./antfly-inference --help`
-for inference commands. Python and npm bindings use the same native library and
-private worker without installing public CLI commands; Go and Rust consumers
-link the library from this archive or a local build.
+The separate `antfly-embedded` archive contains only `libantfly`,
+`include/antfly.h`, pkg-config metadata, runtime assets, and notices. It installs
+no executable. Python/npm embedded packages bundle the library; Go/Rust/C
+consumers can link it directly. See the [Lite guide](/docs/guides/lite) for source
+builds and bindings.
+
+Always select filenames listed in the chosen release's assets or
+`artifacts.json`. Earlier releases retain their immutable archive layouts;
+the library-only Embedded layout is identified by source build contract 6.
 
 <PlatformTabs defaultValue="macos-manual" macos="macos-manual" linux="linux" windows="windows">
   <TabsList>

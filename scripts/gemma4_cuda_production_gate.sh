@@ -25,7 +25,7 @@ Runs the Gemma4 CUDA production-readiness gate against local models.
 Environment:
   ROOT_DIR=/path/to/antfly
   ZIG=.tools/zig-x86_64-linux-0.17.0/zig
-  BIN=zig/pkg/inference/zig-out/bin/antfly-inference
+  BIN=zig/pkg/inference/zig-out/bin/antfly-inference-dev
   OUT_DIR=/tmp/gemma4-cuda-production-gate-<timestamp>
 
   RUN_BUILD=1
@@ -66,7 +66,12 @@ fi
 
 ROOT_DIR="${ROOT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 ZIG="${ZIG:-$ROOT_DIR/.tools/zig-x86_64-linux-0.17.0/zig}"
-BIN="${BIN:-$ROOT_DIR/zig/pkg/inference/zig-out/bin/antfly-inference}"
+source "$ROOT_DIR/zig/pkg/inference/scripts/inference_cli.sh"
+BIN="${BIN:-$(resolve_antfly_inference_bin)}"
+INFERENCE_COMMAND=("$BIN")
+if [[ "$(basename "$BIN")" == "antfly" ]]; then
+  INFERENCE_COMMAND+=(inference)
+fi
 OUT_DIR="${OUT_DIR:-/tmp/gemma4-cuda-production-gate-$(date +%Y%m%d-%H%M%S)}"
 
 RUN_BUILD="${RUN_BUILD:-1}"
@@ -170,7 +175,7 @@ run_target_generate() {
     return
   fi
   run_logged "$label" "$log_path" \
-    timeout "$RUN_TIMEOUT" "$BIN" generate "$model" "Write one sentence about ants." \
+    timeout "$RUN_TIMEOUT" "${INFERENCE_COMMAND[@]}" generate "$model" "Write one sentence about ants." \
       --backend cuda \
       --max-tokens "$MAX_TOKENS" \
       --temperature 0 \
@@ -195,7 +200,7 @@ run_default_policy_check() {
     return
   fi
   run_logged "default_auto_uncalibrated" "$log_path" \
-    timeout "$RUN_TIMEOUT" "$BIN" generate "$target" "Ants" \
+    timeout "$RUN_TIMEOUT" "${INFERENCE_COMMAND[@]}" generate "$target" "Ants" \
       --backend cuda \
       --draft-model "$assistant" \
       --speculative-k 1 \
@@ -264,14 +269,14 @@ else
 fi
 
 if [[ "$RUN_SMOKE" == "1" ]]; then
-  run_logged "cuda_smoke" "$OUT_DIR/cuda_smoke.log" "$BIN" cuda-info --smoke
+  run_logged "cuda_smoke" "$OUT_DIR/cuda_smoke.log" "${INFERENCE_COMMAND[@]}" cuda-info --smoke
 else
   record "cuda_smoke" "skip" "RUN_SMOKE=0"
 fi
 
 if [[ "$RUN_MICROBENCH" == "1" ]]; then
   run_logged "bench_cuda_gemma4_shapes" "$OUT_DIR/bench_cuda_gemma4_shapes.log" \
-    "$BIN" bench-cuda \
+    "${INFERENCE_COMMAND[@]}" bench-cuda \
     --warmup-iters "$MICROBENCH_WARMUP_ITERS" \
     --measure-iters "$MICROBENCH_MEASURE_ITERS" \
     --gemma4-shapes \

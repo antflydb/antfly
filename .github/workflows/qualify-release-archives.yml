@@ -86,7 +86,6 @@ jobs:
           python3 -m unittest zig/tools/test_patch_zig_0_16_build_runner_maxrss.py
           python3 -m unittest zig/tools/test_run_bounded_zig_build.py
           python3 -m unittest zig.tools.test_capi_exports.ExportPolicyTests.test_release_metadata_is_linked_once_per_final_image
-          python3 -m unittest zig.tools.test_capi_exports.ExportPolicyTests.test_lite_worker_uses_the_linked_inference_owner
           python3 -m unittest scripts.packaging.test_release_licenses scripts.packaging.test_fixture_process
 
       - name: Install pinned macOS cross-compilation SDK

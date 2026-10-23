@@ -26,7 +26,7 @@ heads and neck are dropped (the decision head reads raw trunk states, ANTENNA.md
 decision 9). The decision head (``type_emb``, ``scorer``, ``act_head`` and
 ``head.layers``) is initialized as upstream Laya's PyTorch modules initialize
 it, at the trunk's width. Train it with the trunk frozen
-(``antfly-inference finetune train laya`` with ``freeze_layers`` set to
+(``antfly-inference-dev finetune train laya`` with ``freeze_layers`` set to
 ``num_hidden_layers + 1``), so the trunk stays shared with the GLiNER heads.
 
 The decision settings (``head_layers``, ``max_len``, ``head_max_len``, action

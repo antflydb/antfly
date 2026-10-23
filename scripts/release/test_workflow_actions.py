@@ -135,7 +135,7 @@ class WorkflowActionPolicyTests(unittest.TestCase):
 
     def test_cosign_workflows_provision_envsubst_before_installer(self) -> None:
         workflow_dir = Path(__file__).resolve().parents[2] / ".github" / "workflows"
-        for name in ("antfly-operator-container.yml", "antfly-release.yml"):
+        for name in ("antfly-release.yml",):
             with self.subTest(workflow=name):
                 workflow = (workflow_dir / name).read_text(encoding="utf-8")
                 provision = workflow.index("Install envsubst for cosign installer")

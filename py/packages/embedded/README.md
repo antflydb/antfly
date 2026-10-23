@@ -27,7 +27,7 @@ or newer, and macOS ARM64. Windows, Intel macOS, and Alpine/musl do not
 have prebuilt language packages. The native release archive matrix is
 separate; a source build or native archive does not imply wheel/npm support.
  Installing this binding does not add
-`antfly-lite` or `antfly-inference` commands. Source checkouts and the
+public CLI commands. Source checkouts and the
 pure-Python development wheel need a built copy of the shared library. At
 import time, `antfly_embedded`
 locates it using this order (first match wins):

@@ -2,8 +2,7 @@
 
 The local DB and its dependency closure live in `zig/pkg/antfly-embedded/src`.
 The server consumes this implementation through the internal `antfly_local_sources`
-module. The embedded and shared owners are Apache-2.0; the server coordination owner
-remains ELv2. See [LICENSING.md](../../LICENSING.md) for authoritative package
+module. All first-party owners, including server coordination, are Apache-2.0. See [LICENSING.md](../../LICENSING.md) for authoritative package
 classification and third-party exceptions.
 
 ## Physical owners
@@ -82,7 +81,7 @@ Bedrock retains type aliases for compatibility. Cache leases keep credentials
 alive across refresh and cache shutdown; absolute deadline/cancellation context
 continues across credential discovery and provider dispatch. Browser identity
 contracts do not expose native AWS discovery. The extracted implementation is Apache-2.0, along with its shared credentials
-owner; server secret resolution and managed-connection policy remain ELv2.
+owner; server secret resolution and managed-connection policy remain server-owned under Apache-2.0.
 
 Google authentication already follows this split: `lib/google/src/auth.zig`
 owns ADC/service-account discovery, token minting, refresh and caching. Vertex
@@ -138,15 +137,14 @@ and enrichment compute archives. It does not reuse the server storage archive or
 link server runtime entry points. The server compiles the same authored sources
 under its storage profile and keeps its own private adapters.
 
-The independent CLI supports file-oriented Lite commands. `lite serve` is
-removed from both CLIs; use `antfly standalone --storage-engine lite
---storage-path app.aflite` for HTTP serving through the ELv2 server. The independent executable retains the hidden inference worker
-entry point for process isolation. The Apache `antfly-embedded` archive contains both public CLIs, `libantfly`,
-`antfly.h`, the private worker, runtime files and notices. It is the embedded
-release product alongside the separate ELv2 server archive. Embedded language packages ship their native library without a worker; public command installation belongs to the CLI distributions.
+`antfly lite` provides file operations; `antfly inference` runs models and the
+inference service. `antfly standalone --storage-engine lite --storage-path
+app.aflite` serves a file over HTTP. The `antfly-embedded` native archive is
+library-only: `libantfly`, the C header, pkg-config metadata, assets, and notices.
+Library inference runs in-process. Server process isolation re-executes `antfly`.
 
 The staged-build check removes the entire server package before compiling the
-CLI, public C API, public Zig package, AWS credentials, native lake and WASM products.
+public C API, public Zig package, AWS credentials, native lake and WASM products.
 The C ABI conformance runner translates the canonical public header at build
 time and executes the shared cases from the embedded package. Both C smoke and
 conformance run without any server sources:
@@ -194,7 +192,7 @@ actual local/server fixture graph.
 
 The entire first-party local engine and native lake dependency closure is
 Apache-2.0. Server credential adapters, provisioning, Raft, hot standby and cluster
-publication remain ELv2. Third-party sources and assets retain their upstream
+publication remain server-owned under Apache-2.0. Third-party sources and assets retain their upstream
 licenses; package ownership does not replace those notices. The header policy,
 source dependency audit and asset manifest enforce this classification.
 

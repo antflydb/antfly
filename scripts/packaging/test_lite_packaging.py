@@ -81,9 +81,6 @@ class LitePackagingTests(unittest.TestCase):
                 for name in package.SOURCE_LICENSE_FILES:
                     shutil.copy2(ROOT / "scripts" / name, stage / "scripts" / name)
                 (stage / "LICENSES/third-party").mkdir(parents=True)
-                (stage / "antfly-lite").write_text("lite executable")
-                (stage / "antfly-inference").write_text("inference executable")
-                (stage / "antfly-inference-worker").write_text("worker executable")
                 (stage / "lib" / package.lite_library_name(platform)).write_text(
                     "apache native library"
                 )
@@ -272,6 +269,12 @@ class LitePackagingTests(unittest.TestCase):
                         archives / package.archive_name("1.2.3", platform, 2), "w:gz"
                     ) as legacy,
                 ):
+                    import io
+
+                    for name in ("antfly-lite", "antfly-inference-worker"):
+                        member = tarfile.TarInfo(name)
+                        member.size = len(b"legacy executable")
+                        legacy.addfile(member, io.BytesIO(b"legacy executable"))
                     for member in combined.getmembers():
                         if member.name.removeprefix("./") == "antfly-inference":
                             continue
@@ -342,23 +345,18 @@ class LitePackagingTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "digest differs"):
                 snapshot.verify(sealed, "1.2.3", commit)
 
-    def test_missing_public_inference_command_is_rejected(self):
+    def test_missing_header_is_rejected(self):
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)
             platform = package.PACKAGE_PLATFORMS[0]
             stage = root / "stage"
-            stage.mkdir()
-            (stage / "antfly-lite").write_text("lite")
-            (stage / "lib").mkdir()
+            (stage / "lib").mkdir(parents=True)
             (stage / "lib" / package.lite_library_name(platform)).write_text("library")
             path = root / package.archive_name("1.2.3", platform)
             with tarfile.open(path, "w:gz") as archive:
-                archive.add(stage / "antfly-lite", arcname="antfly-lite")
                 archive.add(stage / "lib", arcname="lib")
-            with self.assertRaisesRegex(ValueError, "antfly-inference"):
+            with self.assertRaisesRegex(ValueError, "antfly.h"):
                 package.extract_lite_archive(root, "1.2.3", platform, root / "unpacked")
-            with self.assertRaisesRegex(ValueError, "antfly-inference"):
-                verifier.verify("1.2.3", root, root / "wheels", root / "npm")
 
     def test_server_executable_is_rejected(self):
         with tempfile.TemporaryDirectory() as raw:
@@ -391,7 +389,7 @@ class LitePackagingTests(unittest.TestCase):
             with tarfile.open(archive_path, "w:gz") as archive:
                 for item in stage.iterdir():
                     archive.add(item, arcname=item.name)
-            with self.assertRaisesRegex(ValueError, "server artifacts"):
+            with self.assertRaisesRegex(ValueError, "CLI artifacts"):
                 package.extract_lite_archive(root, "1.2.3", platform, root / "extract")
 
 

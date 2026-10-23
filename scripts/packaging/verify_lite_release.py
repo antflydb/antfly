@@ -43,7 +43,7 @@ def verify(
     archive_dir: Path,
     wheel_dir: Path,
     npm_dir: Path,
-    build_contract_schema: int = 5,
+    build_contract_schema: int = 6,
 ) -> None:
     version = normalize_release_version(version)
     python_version = python_version_from_release(version)
@@ -69,10 +69,21 @@ def verify(
 
             lib_name = lite_library_name(platform)
             library = source_bytes(f"./lib/{lib_name}")
-            source_bytes("./antfly-lite")
-            if build_contract_schema >= 3:
-                source_bytes("./antfly-inference")
-            worker = source_bytes("./antfly-inference-worker")
+            worker = None
+            if build_contract_schema < 6:
+                source_bytes("./antfly-lite")
+                if build_contract_schema >= 3:
+                    source_bytes("./antfly-inference")
+                worker = source_bytes("./antfly-inference-worker")
+            else:
+                for name in (
+                    "antfly",
+                    "antfly-lite",
+                    "antfly-inference",
+                    "antfly-inference-worker",
+                    "antfly-inference-dev",
+                ):
+                    require(name not in names, f"CLI in library archive: {name}")
             pkgconfig = (
                 source_bytes("./lib/pkgconfig/libantfly.pc")
                 if build_contract_schema >= 4
@@ -243,7 +254,7 @@ def main() -> int:
     parser.add_argument("--wheel-dir", type=Path, required=True)
     parser.add_argument("--npm-dir", type=Path, required=True)
     parser.add_argument(
-        "--build-contract-schema", type=int, choices=(2, 3, 4, 5), default=5
+        "--build-contract-schema", type=int, choices=(2, 3, 4, 5, 6), default=6
     )
     args = parser.parse_args()
     verify(

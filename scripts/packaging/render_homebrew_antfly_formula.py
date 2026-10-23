@@ -86,7 +86,7 @@ class Antfly < Formula
   version "{args.version}"
   # Recover from older formulae that inferred version 64 from arm64 archives.
   version_scheme 1
-  license all_of: ["Elastic-2.0", "Apache-2.0"]
+  license "Apache-2.0"
 
   if OS.mac?
     if Hardware::CPU.arm?

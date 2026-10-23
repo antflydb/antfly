@@ -6,7 +6,7 @@ should target this API once and expose storage-specific conveniences on top.
 
 The public header, `include/antfly.h`, is Apache-2.0 so bindings can vendor
 or transcribe it; the Lite bindings built on it are Apache-2.0 too. The
-`libantfly` library itself is ELv2 like the rest of the core.
+`libantfly` library and the rest of first-party Antfly are Apache-2.0.
 
 ## Naming
 

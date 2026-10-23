@@ -22,10 +22,9 @@ The network clients retain their `sdk` names.
 
 The native library remains `libantfly` and its header remains `antfly.h`.
 Existing `antfly_lite_*` C symbols are ABI entry points and keep their names.
-The `antfly-lite` executable, `.aflite` extension, and Lite CLI commands keep
-their names. The Apache distribution is named `antfly-embedded` because it
-contains database and inference tools together. Renaming a language package does not
-change those native artifacts or split the runtime into separate libraries.
+The `.aflite` extension and native library names remain unchanged. Public
+commands use `antfly lite` and `antfly inference`; `antfly-embedded` names the
+library distribution and its language packages, with no separate executable.
 
 Release packaging produces platform wheels for `antfly-embedded` and an npm
 `@antfly/embedded` selector with platform packages from the Apache Embedded
@@ -35,8 +34,7 @@ same C ABI from a release archive or local build. A separate Lite or inference
 convenience package should be introduced only when it offers a distinct API or
 distribution benefit; the current combined bindings cover both use cases.
 
-Installing an embedded binding does not register `antfly-lite` or
-`antfly-inference` as a command. Python/npm packages include the native
+Installing an embedded binding does not register CLI commands. Python/npm packages include the native
 library without a private worker. Bindings call the C API, which runs
 inference in-process on every backend, including Metal, CUDA, ONNX, and
 PJRT. `libantfly` disables process isolation and does not use
@@ -50,19 +48,17 @@ platform matrix is independent, with relocatable `lib/pkgconfig/libantfly.pc`
 metadata. Go uses pkg-config; Rust also retains explicit directory overrides
 and a source-checkout fallback. Keep the discovered library installed at runtime.
 
-Server hosts that enable process isolation can use a replaceable inference
-worker. The single Apache Embedded archive distributes both public CLIs
-(`antfly-lite` and `antfly-inference`), `libantfly`, `antfly.h`, and the private
-worker, with runtime files and license notices.
-There are two primary release products: the ELv2 server and the Apache embedded
-runtime. Source ownership remains separated between the embedded integration
-and inference engine packages.
+Server hosts that enable process isolation re-execute `antfly` for inference
+work. The embedded archive is library-only: `libantfly`, `antfly.h`, pkg-config
+metadata, runtime assets, and notices. Both the CLI/server and embedded products
+are Apache-2.0. Source ownership remains separated between the local engine,
+inference, and server packages.
 
 Zig consumers fetch the versioned `antfly-embedded-source_<version>.tar.gz`
 archive directly with `zig fetch --save=antfly_embedded`. It exposes the
 `antfly-embedded` and `antfly-inference` modules, native Lite/C API artifacts,
 and the browser artifact, with its complete Apache composition and pinned
-third-party dependencies. The archive contains no ELv2 server or server test
+third-party dependencies. The archive contains no server implementations or server test
 sources. Its Zig hash and commit-bound source manifest travel with the
 release checksum ledger. The full Zig suite builds an external native and
 WASM consumer from this fetched package. See

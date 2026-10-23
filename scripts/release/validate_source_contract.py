@@ -25,7 +25,7 @@ import subprocess
 from pathlib import Path, PurePosixPath
 
 CONTRACT_PATH = "scripts/release/build-contract.json"
-SUPPORTED_SCHEMAS = (1, 2, 3, 4, 5)
+SUPPORTED_SCHEMAS = (1, 2, 3, 4, 5, 6)
 LEGACY_REQUIRED_PATHS = {
     "zig/build.zig",
     "scripts/install.sh",
@@ -88,6 +88,7 @@ def runtime_products(schema: int) -> tuple[str, ...]:
         3: ("server", "embedded"),
         4: ("server", "embedded"),
         5: ("server", "embedded"),
+        6: ("server", "embedded"),
     }[schema]
 
 
@@ -125,6 +126,7 @@ def validate(repo_root: Path, commit: str) -> int:
         3: COMBINED_REQUIRED_PATHS,
         4: PKGCONFIG_REQUIRED_PATHS,
         5: REQUIRED_PATHS,
+        6: REQUIRED_PATHS,
     }[schema]
     paths = contract.get("required_source_paths")
     if not isinstance(paths, list) or not paths:

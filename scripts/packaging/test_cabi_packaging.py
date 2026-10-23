@@ -864,10 +864,8 @@ class CAbiPackagingTests(unittest.TestCase):
                     )
                     self.assertIn("antfly_cli/share/antfly/asset.txt", names)
                     self.assertIn("Requires-Python: >=3.11", metadata)
-                    self.assertIn(
-                        "License-Expression: Elastic-2.0 AND Apache-2.0", metadata
-                    )
-                    for license_name in ("Elastic-2.0.txt", "Apache-2.0.txt"):
+                    self.assertIn("License-Expression: Apache-2.0", metadata)
+                    for license_name in ("Apache-2.0.txt",):
                         self.assertIn(
                             f"antfly_cli-1.2.3.dist-info/licenses/LICENSES/{license_name}",
                             names,
@@ -903,7 +901,7 @@ class CAbiPackagingTests(unittest.TestCase):
             rendered = formula.read_text()
             self.assertIn('version "1.2.3"', rendered)
             self.assertIn("version_scheme 1", rendered)
-            self.assertIn('license all_of: ["Elastic-2.0", "Apache-2.0"]', rendered)
+            self.assertIn('license "Apache-2.0"', rendered)
             self.assertIn('system "./smoke"', rendered)
             # Execute the exact C program emitted into the formula. A hardcoded
             # ABI 1/2 allowlist used to reject the current library silently.

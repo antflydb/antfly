@@ -1155,7 +1155,7 @@ def main(argv: list[str] | None = None) -> int:
         validate_grpo_targets(models, targets, objectives, args.benchmark)
         package_root = pathlib.Path(__file__).resolve().parents[2]
         antfly_bin = (
-            args.antfly_bin or package_root / "zig-out/bin/antfly-inference"
+            args.antfly_bin or package_root / "zig-out/bin/antfly-inference-dev"
         ).resolve()
         if not antfly_bin.is_file() or not os.access(antfly_bin, os.X_OK):
             raise QualificationError(

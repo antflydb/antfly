@@ -78,7 +78,7 @@ probabilities and give identical entity spans; MPS is the default.
 
 `laya_baselines.py` scores a Laya checkpoint on the same classification
 subsamples through the native serving evaluation
-(`antfly-inference finetune eval laya`, models/laya/LAYA.md). Datasets with
+(`antfly inference finetune eval laya`, models/laya/LAYA.md). Datasets with
 more labels than the model admits (20, or 255 candidate-packed) are marked not
 applicable. Typed-decisions states over 316 Laya tokens are dropped, as in
 LAYA.md's step-0 evaluation. `baselines_tables.py` renders reports as
@@ -120,7 +120,7 @@ the pinned commit.
 python init_student.py --upstream <GLiNER2> --output <student>
 ANTFLY_ANTENNA_DATA=<cache> python teacher_targets.py --upstream <GLiNER2> \
   --classifier <GLiNER2.5-Decide dir> --output <data>
-antfly-inference finetune train gliner25 <job.json>
+antfly inference finetune train gliner25 <job.json>
 ```
 
 ### Feature distillation
@@ -173,7 +173,7 @@ ANTFLY_ANTENNA_DATA=<cache> python distill_pool.py --upstream <GLiNER2> --output
 
 `init_decision_head.py` builds a Laya-format checkpoint from an Antenna
 student (its encoder, a fresh decision head) for
-`antfly-inference finetune train laya` with `"freeze_layers":
+`antfly inference finetune train laya` with `"freeze_layers":
 <num_hidden_layers + 1>`, which trains the head on the frozen trunk:
 
 ```sh

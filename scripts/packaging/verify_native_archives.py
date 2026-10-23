@@ -50,15 +50,24 @@ def verify(directory: Path, platform: dict, products: list[str]) -> None:
                 for member in archive.getmembers()
             }
             library = "lib/libantfly.dylib" if darwin else "lib/libantfly.so"
-            binaries = (
-                ["antfly"]
-                if product == "server"
-                else ["antfly-lite", "antfly-inference", "antfly-inference-worker"]
-            )
+            binaries = ["antfly"] if product == "server" else []
+            if product == "embedded":
+                for name in (
+                    "antfly",
+                    "antfly-lite",
+                    "antfly-inference",
+                    "antfly-inference-worker",
+                    "antfly-inference-dev",
+                ):
+                    if name in members:
+                        raise ValueError(
+                            f"{path.name}: CLI executable in library archive: {name}"
+                        )
             for name in [
                 *binaries,
                 library,
                 "include/antfly.h",
+                "lib/pkgconfig/libantfly.pc",
                 "README.md",
                 "LICENSE",
                 "THIRD_PARTY_NOTICES.md",

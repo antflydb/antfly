@@ -153,7 +153,7 @@ class ManagedBundleTests(unittest.TestCase):
 class ParserAndMetricTests(unittest.TestCase):
     def test_metal_command_preserves_multi_image_order(self) -> None:
         args = SimpleNamespace(
-            antfly_bin=Path("/bin/antfly-inference"),
+            antfly_bin=Path("/bin/antfly-inference-dev"),
             model_dir=Path("/models/qwen"),
             prompt="Read the text.",
             image=Path("/images/fallback.jpg"),

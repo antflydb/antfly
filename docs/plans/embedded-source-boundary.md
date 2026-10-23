@@ -1,5 +1,10 @@
 # Physical source boundary for embedded Antfly
 
+> Licensing and distribution update: all first-party Antfly code is Apache-2.0.
+> Public commands use `antfly lite` and `antfly inference`; the embedded archive
+> contains `libantfly` and supporting files only. Earlier split-license and CLI
+> packaging decisions below are historical. See [licensing](../../LICENSING.md).
+
 Status: the structural extraction PRs, including #953, are merged. The local
 DB, native lake readers, file CLI and public C API live in `antfly-embedded`;
 model execution lives in `inference`; reusable credentials live in `lib/credentials`.

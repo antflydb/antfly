@@ -159,7 +159,7 @@ The script needs torch, torchvision, `transformers==4.38.2`, timm, einops,
 safetensors, and pillow.
 
 The `/read` e2e runs against a server started with
-`antfly inference run` (or the standalone `antfly-inference run`):
+`antfly inference run` (or the standalone `antfly inference run`):
 
 ```bash
 ANTFLY_INFERENCE_URL=http://127.0.0.1:8090 ANTFLY_INFERENCE_MOONDREAM_EXPECT_TEXT_ANY=hello \

@@ -109,7 +109,7 @@ class ManagedBundleTests(unittest.TestCase):
 class ParserAndMetricTests(unittest.TestCase):
     def test_cuda_command_preserves_multi_image_order(self) -> None:
         args = SimpleNamespace(
-            antfly_bin=Path("/bin/antfly-inference"),
+            antfly_bin=Path("/bin/antfly-inference-dev"),
             model_dir=Path("/models/qwen"),
             prompt="Read the text.",
             image=Path("/images/fallback.jpg"),
@@ -261,7 +261,7 @@ class ArgumentDefaultTests(unittest.TestCase):
                 "--image",
                 "/tmp/image.png",
                 "--antfly-bin",
-                "/tmp/antfly-inference",
+                "/tmp/antfly-inference-dev",
                 "--output",
                 "/tmp/report.json",
             ]

@@ -85,7 +85,7 @@ HARD_BOUNDED_POLICY = {
 LOGIT_CAPABILITY = {
     "available": False,
     "audited_interfaces": [
-        "antfly-inference generate CLI",
+        "antfly-inference-dev generate CLI",
         "Antfly generation server response",
     ],
     "available_observables": [
@@ -1511,7 +1511,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--binary",
         type=pathlib.Path,
-        default=inference / "zig-out/bin/antfly-inference",
+        default=inference / "zig-out/bin/antfly-inference-dev",
     )
     parser.add_argument(
         "--wrapper",

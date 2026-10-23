@@ -201,7 +201,7 @@ env UV_CACHE_DIR=/private/tmp/antfly-uv-cache \
   --model-dir /path/to/managed/qwen3-vl-2b \
   --weights-dir /path/to/pinned/qwen3-vl-2b-bf16-oracle \
   --image /path/to/fixture.jpg \
-  --antfly-bin zig-out/bin/antfly-inference \
+  --antfly-bin zig-out/bin/antfly-inference-dev \
   --output /private/tmp/qwen3vl-qualification.json
 ```
 
@@ -360,7 +360,7 @@ env UV_CACHE_DIR=/private/tmp/antfly-uv-cache \
   --weights-dir /path/to/pinned/qwen3-vl-2b-bf16-oracle \
   --processor-dir /path/to/pinned/qwen3-vl-2b-bf16-oracle \
   --image /path/to/fixture.jpg \
-  --antfly-bin zig-out/bin/antfly-inference \
+  --antfly-bin zig-out/bin/antfly-inference-dev \
   --output /private/tmp/qwen3vl-native-precision.json
 ```
 
@@ -432,7 +432,7 @@ env TERMITE_METAL_ENABLE_Q4_K_HIGH_ROW_MM=1 \
   TERMITE_METAL_ENABLE_QWEN3VL_PREPARED_FFN=1 \
   python scripts/qwen3vl/benchmark_qwen3vl_native_image_batch.py \
   --model-dir /path/to/managed/qwen3-vl-2b-q4-q8 \
-  --antfly-bin zig-out/bin/antfly-inference \
+  --antfly-bin zig-out/bin/antfly-inference-dev \
   --image /path/to/fixture.jpg \
   --batch-size 2 --runs 3 \
   --output /private/tmp/qwen3vl-image-batch.json \
@@ -481,7 +481,7 @@ env UV_CACHE_DIR=/private/tmp/antfly-uv-cache \
   --oracle-model-dir /path/to/managed/qwen3-vl-reranker-2b-bf16 \
   --image /path/to/fixture.jpg \
   --document 'A document describing the image.' \
-  --antfly-bin zig-out/bin/antfly-inference \
+  --antfly-bin zig-out/bin/antfly-inference-dev \
   --output /private/tmp/qwen3vl-reranker-qualification.json
 ```
 

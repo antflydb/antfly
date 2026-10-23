@@ -194,7 +194,7 @@ class ReleasePromotionTests(unittest.TestCase):
             )
 
         with mock.patch.object(contract, "git_object", side_effect=read_object):
-            self.assertEqual(contract.validate(RELEASE_DIR, COMMIT), 5)
+            self.assertEqual(contract.validate(RELEASE_DIR, COMMIT), 6)
             document["runtime_products"] = ["server", "lite", "inference"]
             with self.assertRaisesRegex(SystemExit, "invalid runtime products"):
                 contract.validate(RELEASE_DIR, COMMIT)
@@ -295,6 +295,8 @@ class ReleasePromotionTests(unittest.TestCase):
             (4, "2"),
             (5, ""),
             (5, "2"),
+            (6, ""),
+            (6, "2"),
         ):
             with (
                 self.subTest(schema=schema, jobs=jobs),
@@ -340,7 +342,7 @@ class ReleasePromotionTests(unittest.TestCase):
         payload = load_module(
             "apache_release_spec_payload_test", "build_release_payload.py"
         )
-        for schema in (1, 2, 3, 4, 5):
+        for schema in (1, 2, 3, 4, 5, 6):
             with (
                 self.subTest(schema=schema),
                 tempfile.TemporaryDirectory() as directory,

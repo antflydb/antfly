@@ -371,7 +371,8 @@ class RuntimeCacheTest(unittest.TestCase):
                     if standalone:
                         status = "success" if rebuilt else "cached"
                         self.assertRegex(
-                            output, rf"compile exe antfly-inference debug \S+ {status}"
+                            output,
+                            rf"compile exe antfly-inference-dev debug \S+ {status}",
                         )
                     else:
                         self.assert_archives(
@@ -527,7 +528,7 @@ class RuntimeCacheTest(unittest.TestCase):
                     self.use_standalone()
                 target = "cache-inference" if standalone else "runtime-unit-inference"
                 artifact = (
-                    "exe antfly-inference"
+                    "exe antfly-inference-dev"
                     if standalone
                     else "lib antfly-runtime-inference"
                 )

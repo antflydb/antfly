@@ -834,7 +834,7 @@ class CandidateParityTest(unittest.TestCase):
             args = argparse.Namespace(
                 output_dir=root,
                 timeout_sec=123,
-                binary=root / "antfly-inference",
+                binary=root / "antfly-inference-dev",
                 artifact_check_script=SCRIPTS.parent / "regen-cuda-artifacts.sh",
             )
             artifact_identity = "\n".join(
@@ -1050,7 +1050,7 @@ class CandidateParityTest(unittest.TestCase):
     def test_controlled_release_build_pins_binary_and_build_flags(self):
         with tempfile.TemporaryDirectory() as temporary:
             canonical_binary = (
-                SCRIPTS.parents[1] / "zig-out/bin/antfly-inference"
+                SCRIPTS.parents[1] / "zig-out/bin/antfly-inference-dev"
             ).resolve()
             args = argparse.Namespace(
                 binary=canonical_binary,
@@ -1094,7 +1094,7 @@ class CandidateParityTest(unittest.TestCase):
     def test_controlled_release_build_rejects_missing_output_binary(self):
         with tempfile.TemporaryDirectory() as temporary:
             canonical_binary = (
-                SCRIPTS.parents[1] / "zig-out/bin/antfly-inference"
+                SCRIPTS.parents[1] / "zig-out/bin/antfly-inference-dev"
             ).resolve()
             args = argparse.Namespace(
                 binary=canonical_binary,
@@ -1129,7 +1129,7 @@ class CandidateParityTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root = pathlib.Path(temporary)
             args = argparse.Namespace(
-                binary=SCRIPTS.parents[1] / "zig-out/bin/antfly-inference",
+                binary=SCRIPTS.parents[1] / "zig-out/bin/antfly-inference-dev",
                 output_dir=root,
                 timeout_sec=123,
                 build_timeout_sec=1801,
@@ -2862,7 +2862,7 @@ class CandidateParityTest(unittest.TestCase):
                     [
                         "validate_gemma4_cuda_candidate.py",
                         "--binary",
-                        "zig-out/bin/antfly-inference",
+                        "zig-out/bin/antfly-inference-dev",
                         "--wrapper",
                         "scripts/gemma4/with_gemma4_qat_cuda_tuning.sh",
                         "--model",
@@ -2876,7 +2876,8 @@ class CandidateParityTest(unittest.TestCase):
                 os.chdir(old_cwd)
 
             self.assertEqual(
-                (invocation_dir / "zig-out/bin/antfly-inference").resolve(), args.binary
+                (invocation_dir / "zig-out/bin/antfly-inference-dev").resolve(),
+                args.binary,
             )
             self.assertEqual(
                 (

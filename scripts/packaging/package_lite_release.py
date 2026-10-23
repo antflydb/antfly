@@ -58,10 +58,10 @@ SOURCE_LICENSE_FILES = (
 
 
 def archive_name(
-    version: str, platform: Platform, build_contract_schema: int = 5
+    version: str, platform: Platform, build_contract_schema: int = 6
 ) -> str:
     variant = f"_{platform.release_variant}" if platform.release_variant else ""
-    if build_contract_schema not in {2, 3, 4, 5}:
+    if build_contract_schema not in {2, 3, 4, 5, 6}:
         raise ValueError("unsupported embedded release build contract")
     product = "lite" if build_contract_schema == 2 else "embedded"
     return f"antfly-{product}_{version}_{platform.release_os}_{platform.release_arch}{variant}.tar.gz"
@@ -76,9 +76,6 @@ def extract_lite_archive(
     with tarfile.open(path, "r:gz") as archive:
         safe_extract(archive, dest)
     required = (
-        dest / "antfly-lite",
-        dest / "antfly-inference",
-        dest / "antfly-inference-worker",
         dest / "lib" / lite_library_name(platform),
         dest / "include" / "antfly.h",
         dest / "LICENSE",
@@ -91,9 +88,21 @@ def extract_lite_archive(
             raise ValueError(
                 f"Embedded archive missing {item.relative_to(dest)}: {path}"
             )
-    if (dest / "antfly").exists() or (dest / "LICENSES" / "Elastic-2.0.txt").exists():
+    if (
+        any(
+            (dest / name).exists()
+            for name in (
+                "antfly",
+                "antfly-lite",
+                "antfly-inference",
+                "antfly-inference-worker",
+                "antfly-inference-dev",
+            )
+        )
+        or (dest / "LICENSES" / "Elastic-2.0.txt").exists()
+    ):
         raise ValueError(
-            f"Embedded archive contains server artifacts or ELv2 license: {path}"
+            f"Embedded archive contains CLI artifacts or ELv2 license: {path}"
         )
     if (dest / "LICENSE").read_bytes() != (
         ROOT / "LICENSES" / "Apache-2.0.txt"

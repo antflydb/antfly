@@ -20,8 +20,8 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../../.." && pwd)"
 PKG_DIR="$ROOT_DIR/pkg/inference"
 
 if [[ -z "${ANTFLY_BIN:-}" ]]; then
-  if [[ -x "$PKG_DIR/zig-out/bin/antfly-inference" ]]; then
-    ANTFLY_BIN="$PKG_DIR/zig-out/bin/antfly-inference"
+  if [[ -x "$PKG_DIR/zig-out/bin/antfly-inference-dev" ]]; then
+    ANTFLY_BIN="$PKG_DIR/zig-out/bin/antfly-inference-dev"
   else
     ANTFLY_BIN="$PKG_DIR/zig-out/bin/antfly"
   fi

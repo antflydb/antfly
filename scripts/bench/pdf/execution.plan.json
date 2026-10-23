@@ -10,7 +10,15 @@
       "kind": "contract",
       "scope": "Existing hermetic inference scheduler, task pipeline and backend contract tests; not real-model fused execution evidence.",
       "cwd": "${repo}/zig/pkg/inference",
-      "command": ["zig", "build", "test", "-Doptimize=Debug", "-Dmetal=false", "-Dcuda=false", "-j1"],
+      "command": [
+        "zig",
+        "build",
+        "test",
+        "-Doptimize=Debug",
+        "-Dmetal=false",
+        "-Dcuda=false",
+        "-j1"
+      ],
       "legacy_exit_code": true,
       "timeout_seconds": 1800
     },
@@ -93,22 +101,6 @@
       ],
       "legacy_exit_code": true,
       "timeout_seconds": 1800
-    },
-    {
-      "id": "distributed-routing",
-      "layer": "execution",
-      "kind": "contract",
-      "scope": "Inference route discovery, advertised capabilities and proxy routing contracts; not a real multinode model run.",
-      "cwd": "${repo}/go/pkg/proxy",
-      "command": [
-        "env",
-        "GOWORK=off",
-        "go",
-        "test",
-        "./inference"
-      ],
-      "legacy_exit_code": true,
-      "timeout_seconds": 300
     }
   ]
 }

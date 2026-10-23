@@ -373,7 +373,7 @@ class A4BProfileParserTest(unittest.TestCase):
                 (),
                 {
                     "out_dir": out_dir,
-                    "antfly_bin": Path("/tmp/antfly-inference"),
+                    "antfly_bin": Path("/tmp/antfly-inference-dev"),
                     "output_tokens": 3,
                     "control_output_tokens": 3,
                     "budget_mb": 16_384,

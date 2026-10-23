@@ -1059,7 +1059,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--binary",
         type=pathlib.Path,
-        default=inference / "zig-out/bin/antfly-inference",
+        default=inference / "zig-out/bin/antfly-inference-dev",
     )
     parser.add_argument(
         "--wrapper",
@@ -1849,7 +1849,7 @@ def run_controlled_release_build(args: argparse.Namespace) -> dict:
 
     inference = pathlib.Path(__file__).resolve().parents[2]
     repo = pathlib.Path(__file__).resolve().parents[5]
-    canonical_binary = (inference / "zig-out/bin/antfly-inference").resolve()
+    canonical_binary = (inference / "zig-out/bin/antfly-inference-dev").resolve()
     configured_binary = pathlib.Path(args.binary).resolve()
     pinned_zig = repo / ".tools/zig-x86_64-linux-0.17.0/zig"
     zig = pinned_zig if pinned_zig.is_file() else pathlib.Path("zig")

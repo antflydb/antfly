@@ -66,14 +66,14 @@ jobs:
       - name: Qualify all model-aware media chunks and streaming provenance
         run: |
           python zig/pkg/inference/scripts/qualify_media_chunks.py \
-            --binary .benchmark-results/video-linux/install/bin/antfly-inference \
+            --binary .benchmark-results/video-linux/install/bin/antfly-inference-dev \
             --model-dir .benchmark-assets/video-linux/model --model model \
             --backend native --repeat 2 --stream \
             --output .benchmark-results/video-linux/media-chunks.json
       - name: Qualify pretrained cases and capacity retry
         run: |
           python zig/pkg/inference/scripts/embeddinggemma2/video_http_oracle.py \
-            --binary .benchmark-results/video-linux/install/bin/antfly-inference \
+            --binary .benchmark-results/video-linux/install/bin/antfly-inference-dev \
             --backend native --model-dir .benchmark-assets/video-linux/model \
             --verify-capacity-retry --verify-decode-retry --output .benchmark-results/video-linux/pretrained.json
       - name: Qualify pretrained WebM codecs and request recovery
@@ -86,14 +86,14 @@ jobs:
           python zig/pkg/inference/scripts/embeddinggemma2/video_compare.py --backend native \
             --corpus zig/pkg/inference/scripts/embeddinggemma2/testdata/retrieval/webm-corpus.json \
             --model-dir .benchmark-assets/video-linux/model \
-            --binary .benchmark-results/video-linux/install/bin/antfly-inference \
+            --binary .benchmark-results/video-linux/install/bin/antfly-inference-dev \
             --reference .benchmark-results/video-linux/webm-pytorch-cpu.json \
             --warmups 0 --iterations 1 \
             --output .benchmark-results/video-linux/webm-native-cpu.json
           python zig/pkg/inference/scripts/embeddinggemma2/video_webm_errors.py --backend native \
             --corpus zig/pkg/inference/scripts/embeddinggemma2/testdata/retrieval/webm-corpus.json \
             --model-dir .benchmark-assets/video-linux/model \
-            --binary .benchmark-results/video-linux/install/bin/antfly-inference \
+            --binary .benchmark-results/video-linux/install/bin/antfly-inference-dev \
             --reference .benchmark-results/video-linux/webm-pytorch-cpu.json \
             --output .benchmark-results/video-linux/webm-request-recovery.json
       - name: Qualify logical pictures, explicit windows and requested dimensions
@@ -106,20 +106,20 @@ jobs:
           python zig/pkg/inference/scripts/embeddinggemma2/video_compare.py --backend native \
             --corpus zig/pkg/inference/scripts/embeddinggemma2/testdata/sampling/corpus.json \
             --model-dir .benchmark-assets/video-linux/model \
-            --binary .benchmark-results/video-linux/install/bin/antfly-inference \
+            --binary .benchmark-results/video-linux/install/bin/antfly-inference-dev \
             --reference .benchmark-results/video-linux/sampling-pytorch-cpu.json \
             --warmups 0 --iterations 1 --sustained-rounds 1 \
             --output .benchmark-results/video-linux/sampling-native.json
           python zig/pkg/inference/scripts/embeddinggemma2/video_sampling_errors.py --backend native \
             --corpus zig/pkg/inference/scripts/embeddinggemma2/testdata/sampling/corpus.json \
             --model-dir .benchmark-assets/video-linux/model \
-            --binary .benchmark-results/video-linux/install/bin/antfly-inference \
+            --binary .benchmark-results/video-linux/install/bin/antfly-inference-dev \
             --reference .benchmark-results/video-linux/sampling-pytorch-cpu.json \
             --output .benchmark-results/video-linux/sampling-errors.json
           python zig/pkg/inference/scripts/embeddinggemma2/video_resident_qualification.py --backend native \
             --corpus zig/pkg/inference/scripts/embeddinggemma2/testdata/sampling/corpus.json \
             --model-dir .benchmark-assets/video-linux/model \
-            --binary .benchmark-results/video-linux/install/bin/antfly-inference \
+            --binary .benchmark-results/video-linux/install/bin/antfly-inference-dev \
             --reference .benchmark-results/video-linux/sampling-pytorch-cpu.json \
             --output .benchmark-results/video-linux/dimensions-native.json
       - name: Qualify positive pretrained display and HDR rendering
@@ -128,14 +128,14 @@ jobs:
             --backend cpu --model-dir .benchmark-assets/video-linux/model \
             --output .benchmark-results/video-linux/render-pytorch-cpu.json
           python zig/pkg/inference/scripts/embeddinggemma2/video_render_qualification.py \
-            --binary .benchmark-results/video-linux/install/bin/antfly-inference \
+            --binary .benchmark-results/video-linux/install/bin/antfly-inference-dev \
             --backend native --model-dir .benchmark-assets/video-linux/model \
             --reference .benchmark-results/video-linux/render-pytorch-cpu.json \
             --output .benchmark-results/video-linux/render-native.json
       - name: Qualify model VFR sampling and display policy
         run: |
           python zig/pkg/inference/scripts/embeddinggemma2/video_policy_qualification.py \
-            --binary .benchmark-results/video-linux/install/bin/antfly-inference \
+            --binary .benchmark-results/video-linux/install/bin/antfly-inference-dev \
             --backend native --model-dir .benchmark-assets/video-linux/model \
             --render-oracle .benchmark-results/video-linux/render-pytorch-cpu.json \
             --output .benchmark-results/video-linux/model-video-policy.json
@@ -148,7 +148,7 @@ jobs:
           python zig/pkg/inference/scripts/embeddinggemma2/video_compare.py --backend native \
             --corpus zig/pkg/inference/scripts/embeddinggemma2/testdata/retrieval/corpus.json \
             --model-dir .benchmark-assets/video-linux/model \
-            --binary .benchmark-results/video-linux/install/bin/antfly-inference \
+            --binary .benchmark-results/video-linux/install/bin/antfly-inference-dev \
             --reference .benchmark-results/video-linux/pytorch-cpu.json \
             --output .benchmark-results/video-linux/native-cpu.json
       - name: Measure matched long-clip PyTorch and native retrieval
@@ -161,7 +161,7 @@ jobs:
           python zig/pkg/inference/scripts/embeddinggemma2/video_compare.py --backend native \
             --corpus zig/pkg/inference/scripts/embeddinggemma2/testdata/retrieval-long/corpus.json \
             --model-dir .benchmark-assets/video-linux/model --warmups 1 --iterations 3 \
-            --binary .benchmark-results/video-linux/install/bin/antfly-inference \
+            --binary .benchmark-results/video-linux/install/bin/antfly-inference-dev \
             --reference .benchmark-results/video-linux/long-pytorch-cpu.json \
             --output .benchmark-results/video-linux/long-native-cpu.json
       - name: Retain qualification reports

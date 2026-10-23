@@ -344,3 +344,16 @@ semantics. Repair commands use the shared table repair API and job store.
 The former `graph-metric-maintenance` and hidden worker commands are removed
 from the product binary. Worker launch, injected time, and lease/crash controls
 live in the process integration fixture; they are not operator commands.
+
+## CLI and library builds
+
+`zig build antfly` installs the public `antfly` executable and dashboard assets.
+Use `antfly lite` for local files and `antfly inference` for model operations.
+`zig build libantfly` installs the in-process database/inference library, header,
+and pkg-config metadata; `zig build release` builds both surfaces. The independent
+`zig build --build-file embedded.build.zig libantfly` composition needs no server
+implementations. All first-party code uses Apache-2.0.
+
+The inference package can still compile `antfly-inference-dev` for backend
+qualification and benchmark scripts. This direct-command development tool is
+not a public CLI or a release archive product. End-user instructions use `antfly`.

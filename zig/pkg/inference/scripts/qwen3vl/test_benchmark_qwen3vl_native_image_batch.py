@@ -103,7 +103,7 @@ class ComparisonTests(unittest.TestCase):
             args.min_free_percent = 10
             args.max_swap_growth_mib = 0.0
             args.timeout_seconds = 1.0
-            args.antfly_bin = Path("antfly-inference")
+            args.antfly_bin = Path("antfly-inference-dev")
             parse_args.return_value = args
             self.assertEqual(0, benchmark.main([]))
             provenance.assert_called_once_with(args.antfly_bin)

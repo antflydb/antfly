@@ -9,7 +9,7 @@ The Go module includes the matching `antfly.h` header. Install `pkg-config`
 and extract the Apache **`antfly-embedded`** release archive for your platform.
 Keep its `lib/` and `include/` directories together; `lib/pkgconfig/libantfly.pc`
 is relocatable and supplies the library, header, and runtime search paths.
-No ELv2 server or CLI package is required.
+No database server or CLI package is required.
 
 ```sh
 export PKG_CONFIG_PATH="/path/to/antfly-embedded/lib/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
@@ -237,7 +237,7 @@ database.
 Use `CopyStableSnapshot` or `CopyStableSnapshotFile` when you want a physical
 `.aflite` database snapshot rather than a portable `.afb` backup archive.
 
-From the repository’s `zig` directory, `zig build lite` builds the Lite CLI
+From the repository’s `zig` directory, `zig build libantfly` builds the Lite CLI
 and `libantfly`. Run `zig build lite-test` for the Lite checks, including the
 Go binding tests against the built library.
 
