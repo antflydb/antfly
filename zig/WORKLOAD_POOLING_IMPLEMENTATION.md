@@ -24936,3 +24936,36 @@ remain unfinished. The existing resource-manager payload-retirement scan also
 needs an audit of cooperative checkpoints under its registry guard before broad
 scheduler adoption. Lite/object adoption and the full default pooling gate remain
 open. Full GNU qualification remains waived; the full design is incomplete.
+
+
+### Main integration: CLI output and public execution budgets
+
+Merged origin/main `f406609e22` into the existing workload-scheduling branch.
+SQL scan profiling wraps admitted cursor pulls, counts and column reads; shared
+spill and CPU execution ownership remain intact. HTTP SQL execution receives
+public scan/memory/spill limits through its existing owned allocator. New ingress
+budget composition includes public and internal policies, while internal budget
+tightening preserves an existing deadline's clock and absolute bound. First
+internal ingress uses the transport clock, including transaction status and
+backup requests. Both the original-clock and public-budget regressions run in
+the focused budget target. Metadata routing converts remaining ingress duration
+before applying its native-clock ceiling.
+
+New SQL fixtures instantiate ordinary void-returning scheduler tasks, which do
+not have a scoped error-returning join. Compile-time result dispatch preserves
+that ordinary join while retaining scoped rejection/cleanup behavior for error
+unions. The new shared-JSON reference fixture explicitly supplies its absent
+CPU control to the admitted append API.
+
+
+Qualification receipt `merge-main-f406-cli-v2` preserves unchanged inputs and
+passed the public/original deadline checks, all 35 physical/WAL cases, 28
+embedded close cases, host/archive checks and 45/1/8 identity cases. Its broader
+SQL suite is not green: 1,128 passed, 3 skipped and 6 failed. Failures cover the
+constrained partition join under shared allocation denial, ordered-producer IO
+workspace, final hash reducer allocation nondeterminism, partition row-reference
+disk fallback, the array NUL error identity and an outdated-looking float4
+capability assertion. These have not been attributed to a baseline run and are
+not claimed as pre-existing. Receipt `merge-main-f406-cli-focused-v3` separately
+records the focused merge checks without hiding the broader failure receipt.
+Full GNU qualification remains waived; the full pooling design remains incomplete.

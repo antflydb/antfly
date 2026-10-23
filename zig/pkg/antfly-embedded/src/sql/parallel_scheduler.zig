@@ -617,12 +617,16 @@ pub fn Task(comptime Result: type) type {
             return if (self.transient) |admission| admission.completed.load(.acquire) else self.future == null;
         }
         pub fn await(self: *@This(), io: std.Io) Result {
-            if (self.scope != null) return self.joinScoped(io, false);
+            if (comptime @typeInfo(Result) == .error_union) {
+                if (self.scope != null) return self.joinScoped(io, false);
+            } else std.debug.assert(self.scope == null);
             defer self.release();
             return self.future.?.await(io);
         }
         pub fn cancel(self: *@This(), io: std.Io) Result {
-            if (self.scope != null) return self.joinScoped(io, true);
+            if (comptime @typeInfo(Result) == .error_union) {
+                if (self.scope != null) return self.joinScoped(io, true);
+            } else std.debug.assert(self.scope == null);
             defer self.release();
             return self.future.?.cancel(io);
         }

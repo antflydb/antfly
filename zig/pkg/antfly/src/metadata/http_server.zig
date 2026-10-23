@@ -2488,7 +2488,7 @@ pub const MetadataHttpServer = struct {
     fn applyRoutingBudget(ctx: *httpx.Context) !void {
         const now_ns = platform_time.monotonicNs();
         var deadline_ns = now_ns +| max_routing_request_budget_ms * std.time.ns_per_ms;
-        if (ctx.application_deadline_ns) |ingress_deadline_ns| {
+        if (@import("../request_deadline.zig").platformDeadline(ctx)) |ingress_deadline_ns| {
             deadline_ns = @min(deadline_ns, ingress_deadline_ns);
         }
         if (ctx.header(routes.routing_remaining_ms_header)) |raw| {
@@ -2500,8 +2500,9 @@ pub const MetadataHttpServer = struct {
                 now_ns +| bounded_remaining_ms * std.time.ns_per_ms,
             );
         }
-        if (now_ns >= deadline_ns) return error.CatalogRoutingSnapshotTimeout;
+        if (platform_time.monotonicNs() >= deadline_ns) return error.CatalogRoutingSnapshotTimeout;
         ctx.application_deadline_ns = deadline_ns;
+        ctx.application_deadline_io = null;
     }
 
     fn metadataLinearizableRoutingSnapshot(self: *MetadataHttpServer, ctx: *httpx.Context) !httpx.Response {
@@ -8440,4 +8441,23 @@ test "remote initialization HTTP handler requires service authentication and pre
         }
         try std.testing.expectEqual(before + 4, fixture.calls);
     }
+}
+
+test "public execution routing budgets translate the ingress executor clock" {
+    var clock = try @import("vopr").vopr_io.VoprIo.init(.{ .monotonic_ns = 7 * std.time.ns_per_s });
+    defer clock.deinit();
+    var request = try httpx.Request.init(std.testing.allocator, .POST, "/internal/v1/routing-snapshot");
+    defer request.deinit();
+    var ctx = httpx.Context.init(std.testing.allocator, clock.io(), &request);
+    defer ctx.deinit();
+    @import("../request_deadline.zig").tighten(&ctx, 100);
+    const before = platform_time.monotonicNs();
+    try MetadataHttpServer.applyRoutingBudget(&ctx);
+    const after = platform_time.monotonicNs();
+    try std.testing.expect(ctx.application_deadline_io == null);
+    try std.testing.expect(ctx.application_deadline_ns.? >= before + 100 * std.time.ns_per_ms);
+    try std.testing.expect(ctx.application_deadline_ns.? <= after + 100 * std.time.ns_per_ms);
+    @import("../request_deadline.zig").tighten(&ctx, 50);
+    try clock.advance(50 * std.time.ns_per_ms);
+    try std.testing.expectError(error.CatalogRoutingSnapshotTimeout, MetadataHttpServer.applyRoutingBudget(&ctx));
 }

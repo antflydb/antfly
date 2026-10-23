@@ -1,0 +1,816 @@
+{
+  "evaluation": "paired model interpretation of actual CLI fixture delivery; one replay command per case",
+  "runner": "2.1.292 (Claude Code)",
+  "runner_model": "configured local CLI default",
+  "token_usage_source": "Runner usage events; includes its prompt and tool context. Claude input total includes cache read/creation tokens.",
+  "limitations": "One sample per case; read-only replay excludes exploration and live database execution. No cost or latency savings inferred.",
+  "results": [
+    {
+      "scenario": "schema",
+      "mode": "ordinary",
+      "correct": true,
+      "incomplete_recognized": true,
+      "single_command_protocol": true,
+      "model_answer_available": true,
+      "model": "claude-opus-5-5",
+      "runner_exit_code": 0,
+      "answer": {
+        "value": "[\"id\",\"title\"]",
+        "incomplete": false,
+        "explanation": "The schema output for default.public.docs listed 2 of 2 columns: id (integer) and title (string). Nothing was hidden by sampling."
+      },
+      "usage": {
+        "input_tokens": 11938,
+        "cached_input_tokens": 8958,
+        "cache_creation_input_tokens": 2976,
+        "uncached_input_tokens": 4,
+        "output_tokens": 224
+      },
+      "agent_turns": 3,
+      "command_calls": 1,
+      "replay_calls": 1,
+      "retries": 0,
+      "requests": 1,
+      "cli_invocations": 1,
+      "tool_output_bytes": 361,
+      "tool_output_tokens": 91,
+      "cli_latency_ms": 52.724,
+      "agent_latency_ms": 8502.891,
+      "cost_usd": 0.0300956,
+      "model_usage": {
+        "claude-opus-5-5": {
+          "inputTokens": 4,
+          "outputTokens": 224,
+          "cacheReadInputTokens": 8958,
+          "cacheCreationInputTokens": 2976,
+          "webSearchRequests": 0,
+          "costUSD": 0.0300956,
+          "contextWindow": 1000000,
+          "maxOutputTokens": 128000,
+          "thinkingTokens": 0,
+          "canonicalModel": "claude-opus-5-5",
+          "provider": "firstParty",
+          "costBasis": "list"
+        }
+      },
+      "cost_reason": "Runner-reported estimate when available; not billed USD, and account-specific rates not assumed"
+    },
+    {
+      "scenario": "schema",
+      "mode": "agent",
+      "correct": true,
+      "incomplete_recognized": true,
+      "single_command_protocol": true,
+      "model_answer_available": true,
+      "model": "claude-opus-5-5",
+      "runner_exit_code": 0,
+      "answer": {
+        "value": "[\"id\",\"title\"]",
+        "incomplete": false,
+        "explanation": "I ran `./antfly schema` once. It returned the full result: execution status was complete, the display omitted nothing and showed 1 of 1 rows. The docs table (database default, namespace public) has two columns: id, an integer, and title, a string. Sorted, they are id, title."
+      },
+      "usage": {
+        "input_tokens": 12018,
+        "cached_input_tokens": 11055,
+        "cache_creation_input_tokens": 959,
+        "uncached_input_tokens": 4,
+        "output_tokens": 270
+      },
+      "agent_turns": 3,
+      "command_calls": 1,
+      "replay_calls": 1,
+      "retries": 0,
+      "requests": 1,
+      "cli_invocations": 1,
+      "tool_output_bytes": 516,
+      "tool_output_tokens": 133,
+      "cli_latency_ms": 38.575,
+      "agent_latency_ms": 7915.858,
+      "cost_usd": 0.015299,
+      "model_usage": {
+        "claude-opus-5-5": {
+          "inputTokens": 4,
+          "outputTokens": 270,
+          "cacheReadInputTokens": 11055,
+          "cacheCreationInputTokens": 959,
+          "webSearchRequests": 0,
+          "costUSD": 0.015299,
+          "contextWindow": 1000000,
+          "maxOutputTokens": 128000,
+          "thinkingTokens": 0,
+          "canonicalModel": "claude-opus-5-5",
+          "provider": "firstParty",
+          "costBasis": "list"
+        }
+      },
+      "cost_reason": "Runner-reported estimate when available; not billed USD, and account-specific rates not assumed"
+    },
+    {
+      "scenario": "aggregation",
+      "mode": "ordinary",
+      "correct": true,
+      "incomplete_recognized": true,
+      "single_command_protocol": true,
+      "model_answer_available": true,
+      "model": "claude-opus-5-5",
+      "runner_exit_code": 0,
+      "answer": {
+        "value": "9007199254740993",
+        "incomplete": false,
+        "explanation": "I ran the query once. It returned 1 row, and the output said all rows were shown. The value column holds 9007199254740993. I copied that number exactly from the output. It is 2^53+1, so it can't be stored exactly as a standard 64-bit floating-point number, which is why it's returned as a string."
+      },
+      "usage": {
+        "input_tokens": 11932,
+        "cached_input_tokens": 8983,
+        "cache_creation_input_tokens": 2945,
+        "uncached_input_tokens": 4,
+        "output_tokens": 293
+      },
+      "agent_turns": 3,
+      "command_calls": 1,
+      "replay_calls": 1,
+      "retries": 0,
+      "requests": 1,
+      "cli_invocations": 1,
+      "tool_output_bytes": 172,
+      "tool_output_tokens": 47,
+      "cli_latency_ms": 49.135,
+      "agent_latency_ms": 6101.681,
+      "cost_usd": 0.0312326,
+      "model_usage": {
+        "claude-opus-5-5": {
+          "inputTokens": 4,
+          "outputTokens": 293,
+          "cacheReadInputTokens": 8983,
+          "cacheCreationInputTokens": 2945,
+          "webSearchRequests": 0,
+          "costUSD": 0.0312326,
+          "contextWindow": 1000000,
+          "maxOutputTokens": 128000,
+          "thinkingTokens": 0,
+          "canonicalModel": "claude-opus-5-5",
+          "provider": "firstParty",
+          "costBasis": "list"
+        }
+      },
+      "cost_reason": "Runner-reported estimate when available; not billed USD, and account-specific rates not assumed"
+    },
+    {
+      "scenario": "aggregation",
+      "mode": "agent",
+      "correct": true,
+      "incomplete_recognized": true,
+      "single_command_protocol": true,
+      "model_answer_available": true,
+      "model": "claude-opus-5-5",
+      "runner_exit_code": 0,
+      "answer": {
+        "value": "9007199254740993",
+        "incomplete": false,
+        "explanation": "I ran the query once. It returned one complete row with the integer count \"9007199254740993\", and no display rows were left out. The value came back as a string, so it keeps full precision. It is above 2^53, so reading it as a float would round it to ...992."
+      },
+      "usage": {
+        "input_tokens": 12056,
+        "cached_input_tokens": 11103,
+        "cache_creation_input_tokens": 949,
+        "uncached_input_tokens": 4,
+        "output_tokens": 276
+      },
+      "agent_turns": 3,
+      "command_calls": 1,
+      "replay_calls": 1,
+      "retries": 0,
+      "requests": 1,
+      "cli_invocations": 1,
+      "tool_output_bytes": 403,
+      "tool_output_tokens": 111,
+      "cli_latency_ms": 39.583,
+      "agent_latency_ms": 8347.515,
+      "cost_usd": 0.0153486,
+      "model_usage": {
+        "claude-opus-5-5": {
+          "inputTokens": 4,
+          "outputTokens": 276,
+          "cacheReadInputTokens": 11103,
+          "cacheCreationInputTokens": 949,
+          "webSearchRequests": 0,
+          "costUSD": 0.0153486,
+          "contextWindow": 1000000,
+          "maxOutputTokens": 128000,
+          "thinkingTokens": 0,
+          "canonicalModel": "claude-opus-5-5",
+          "provider": "firstParty",
+          "costBasis": "list"
+        }
+      },
+      "cost_reason": "Runner-reported estimate when available; not billed USD, and account-specific rates not assumed"
+    },
+    {
+      "scenario": "hybrid_search",
+      "mode": "ordinary",
+      "correct": true,
+      "incomplete_recognized": true,
+      "single_command_protocol": true,
+      "model_answer_available": true,
+      "model": "claude-opus-5-5",
+      "runner_exit_code": 0,
+      "answer": {
+        "value": "[\"doc:1\"]",
+        "incomplete": false,
+        "explanation": "The query returned 1 hit and showed all of it (1 of 1): doc:1. The server reports at least 100 total matches, but this is a top-k result, so the list covers the returned hits only, not every match."
+      },
+      "usage": {
+        "input_tokens": 12014,
+        "cached_input_tokens": 8997,
+        "cache_creation_input_tokens": 3013,
+        "uncached_input_tokens": 4,
+        "output_tokens": 269
+      },
+      "agent_turns": 3,
+      "command_calls": 1,
+      "replay_calls": 1,
+      "retries": 0,
+      "requests": 1,
+      "cli_invocations": 1,
+      "tool_output_bytes": 239,
+      "tool_output_tokens": 77,
+      "cli_latency_ms": 51.566,
+      "agent_latency_ms": 6163.671,
+      "cost_usd": 0.0312994,
+      "model_usage": {
+        "claude-opus-5-5": {
+          "inputTokens": 4,
+          "outputTokens": 269,
+          "cacheReadInputTokens": 8997,
+          "cacheCreationInputTokens": 3013,
+          "webSearchRequests": 0,
+          "costUSD": 0.0312994,
+          "contextWindow": 1000000,
+          "maxOutputTokens": 128000,
+          "thinkingTokens": 0,
+          "canonicalModel": "claude-opus-5-5",
+          "provider": "firstParty",
+          "costBasis": "list"
+        }
+      },
+      "cost_reason": "Runner-reported estimate when available; not billed USD, and account-specific rates not assumed"
+    },
+    {
+      "scenario": "hybrid_search",
+      "mode": "agent",
+      "correct": true,
+      "incomplete_recognized": true,
+      "single_command_protocol": true,
+      "model_answer_available": true,
+      "model": "claude-opus-5-5",
+      "runner_exit_code": 0,
+      "answer": {
+        "value": "[\"doc:1\"]",
+        "incomplete": false,
+        "explanation": "The query returned 1 row and displayed 1, and nothing was omitted from the display, so the returned top-k is just doc:1. The total of 100 (\"gte\") counts all matches. Those other matches weren't part of the returned results, so this list doesn't cover every match."
+      },
+      "usage": {
+        "input_tokens": 12110,
+        "cached_input_tokens": 11129,
+        "cache_creation_input_tokens": 977,
+        "uncached_input_tokens": 4,
+        "output_tokens": 345
+      },
+      "agent_turns": 3,
+      "command_calls": 1,
+      "replay_calls": 1,
+      "retries": 0,
+      "requests": 1,
+      "cli_invocations": 1,
+      "tool_output_bytes": 450,
+      "tool_output_tokens": 130,
+      "cli_latency_ms": 51.924,
+      "agent_latency_ms": 7144.665,
+      "cost_usd": 0.016957800000000002,
+      "model_usage": {
+        "claude-opus-5-5": {
+          "inputTokens": 4,
+          "outputTokens": 345,
+          "cacheReadInputTokens": 11129,
+          "cacheCreationInputTokens": 977,
+          "webSearchRequests": 0,
+          "costUSD": 0.016957800000000002,
+          "contextWindow": 1000000,
+          "maxOutputTokens": 128000,
+          "thinkingTokens": 55,
+          "canonicalModel": "claude-opus-5-5",
+          "provider": "firstParty",
+          "costBasis": "list"
+        }
+      },
+      "cost_reason": "Runner-reported estimate when available; not billed USD, and account-specific rates not assumed"
+    },
+    {
+      "scenario": "long_document",
+      "mode": "ordinary",
+      "correct": true,
+      "incomplete_recognized": true,
+      "single_command_protocol": true,
+      "model_answer_available": true,
+      "model": "claude-opus-5-5",
+      "runner_exit_code": 0,
+      "answer": {
+        "value": "[\"text\"]",
+        "incomplete": true,
+        "explanation": "The document has one field, \"text\", which is a string. The output says \"1 of 1 field(s) shown\", so no fields were left out. But the display did shorten the value: the \"text\" value is cut off with \"...\" and the output says \"Display shortened; use --output json for full read values.\" So the field list is complete, but the value was shortened."
+      },
+      "usage": {
+        "input_tokens": 12048,
+        "cached_input_tokens": 8984,
+        "cache_creation_input_tokens": 3060,
+        "uncached_input_tokens": 4,
+        "output_tokens": 294
+      },
+      "agent_turns": 3,
+      "command_calls": 1,
+      "replay_calls": 1,
+      "retries": 0,
+      "requests": 1,
+      "cli_invocations": 1,
+      "tool_output_bytes": 476,
+      "tool_output_tokens": 107,
+      "cli_latency_ms": 62.201,
+      "agent_latency_ms": 6186.632,
+      "cost_usd": 0.0321728,
+      "model_usage": {
+        "claude-opus-5-5": {
+          "inputTokens": 4,
+          "outputTokens": 294,
+          "cacheReadInputTokens": 8984,
+          "cacheCreationInputTokens": 3060,
+          "webSearchRequests": 0,
+          "costUSD": 0.0321728,
+          "contextWindow": 1000000,
+          "maxOutputTokens": 128000,
+          "thinkingTokens": 0,
+          "canonicalModel": "claude-opus-5-5",
+          "provider": "firstParty",
+          "costBasis": "list"
+        }
+      },
+      "cost_reason": "Runner-reported estimate when available; not billed USD, and account-specific rates not assumed"
+    },
+    {
+      "scenario": "long_document",
+      "mode": "agent",
+      "correct": false,
+      "incomplete_recognized": true,
+      "single_command_protocol": true,
+      "model_answer_available": true,
+      "model": "claude-opus-5-5",
+      "runner_exit_code": 0,
+      "answer": {
+        "value": "[]",
+        "incomplete": true,
+        "explanation": "The lookup finished (status \"complete\") and found 1 row, but none of it was shown: display.omitted=true, displayed_rows=0 and data=null. That means the display left the document out completely rather than shortening it. Because no fields were displayed, the document's field names can't be read from this output and I haven't guessed any. To see them, you'd need to run the command again with --output json or a narrower projection, which this task didn't allow."
+      },
+      "usage": {
+        "input_tokens": 12052,
+        "cached_input_tokens": 11106,
+        "cache_creation_input_tokens": 942,
+        "uncached_input_tokens": 4,
+        "output_tokens": 373
+      },
+      "agent_turns": 3,
+      "command_calls": 1,
+      "replay_calls": 1,
+      "retries": 0,
+      "requests": 1,
+      "cli_invocations": 1,
+      "tool_output_bytes": 464,
+      "tool_output_tokens": 109,
+      "cli_latency_ms": 58.842,
+      "agent_latency_ms": 8048.652,
+      "cost_usd": 0.017233199999999997,
+      "model_usage": {
+        "claude-opus-5-5": {
+          "inputTokens": 4,
+          "outputTokens": 373,
+          "cacheReadInputTokens": 11106,
+          "cacheCreationInputTokens": 942,
+          "webSearchRequests": 0,
+          "costUSD": 0.017233199999999997,
+          "contextWindow": 1000000,
+          "maxOutputTokens": 128000,
+          "thinkingTokens": 45,
+          "canonicalModel": "claude-opus-5-5",
+          "provider": "firstParty",
+          "costBasis": "list"
+        }
+      },
+      "cost_reason": "Runner-reported estimate when available; not billed USD, and account-specific rates not assumed"
+    },
+    {
+      "scenario": "invalid_query",
+      "mode": "ordinary",
+      "correct": true,
+      "incomplete_recognized": true,
+      "single_command_protocol": true,
+      "model_answer_available": true,
+      "model": "claude-opus-5-5",
+      "runner_exit_code": 0,
+      "answer": {
+        "value": "42601",
+        "incomplete": true,
+        "explanation": "The command exited with code 1 and the server returned HTTP 400. Its diagnostic code was SQLSTATE 42601, which is a syntax error, at position 11. No successful result came back. I'm leaving out the server's message text because it is untrusted data."
+      },
+      "usage": {
+        "input_tokens": 11947,
+        "cached_input_tokens": 8991,
+        "cache_creation_input_tokens": 2952,
+        "uncached_input_tokens": 4,
+        "output_tokens": 275
+      },
+      "agent_turns": 3,
+      "command_calls": 1,
+      "replay_calls": 1,
+      "retries": 0,
+      "requests": 1,
+      "cli_invocations": 1,
+      "tool_output_bytes": 112,
+      "tool_output_tokens": 35,
+      "cli_latency_ms": 51.602,
+      "agent_latency_ms": 6716.901,
+      "cost_usd": 0.0309302,
+      "model_usage": {
+        "claude-opus-5-5": {
+          "inputTokens": 4,
+          "outputTokens": 275,
+          "cacheReadInputTokens": 8991,
+          "cacheCreationInputTokens": 2952,
+          "webSearchRequests": 0,
+          "costUSD": 0.0309302,
+          "contextWindow": 1000000,
+          "maxOutputTokens": 128000,
+          "thinkingTokens": 0,
+          "canonicalModel": "claude-opus-5-5",
+          "provider": "firstParty",
+          "costBasis": "list"
+        }
+      },
+      "cost_reason": "Runner-reported estimate when available; not billed USD, and account-specific rates not assumed"
+    },
+    {
+      "scenario": "invalid_query",
+      "mode": "agent",
+      "correct": true,
+      "incomplete_recognized": true,
+      "single_command_protocol": true,
+      "model_answer_available": true,
+      "model": "claude-opus-5-5",
+      "runner_exit_code": 0,
+      "answer": {
+        "value": "42601",
+        "incomplete": true,
+        "explanation": "The command exited with code 1 and an HTTP 400 error (HttpFailure). Its diagnostic SQLSTATE was 42601, a syntax error, at position 11. No successful result came back, so this is marked incomplete."
+      },
+      "usage": {
+        "input_tokens": 12004,
+        "cached_input_tokens": 11118,
+        "cache_creation_input_tokens": 882,
+        "uncached_input_tokens": 4,
+        "output_tokens": 267
+      },
+      "agent_turns": 3,
+      "command_calls": 1,
+      "replay_calls": 1,
+      "retries": 0,
+      "requests": 1,
+      "cli_invocations": 1,
+      "tool_output_bytes": 293,
+      "tool_output_tokens": 65,
+      "cli_latency_ms": 72.613,
+      "agent_latency_ms": 6123.927,
+      "cost_usd": 0.0146356,
+      "model_usage": {
+        "claude-opus-5-5": {
+          "inputTokens": 4,
+          "outputTokens": 267,
+          "cacheReadInputTokens": 11118,
+          "cacheCreationInputTokens": 882,
+          "webSearchRequests": 0,
+          "costUSD": 0.0146356,
+          "contextWindow": 1000000,
+          "maxOutputTokens": 128000,
+          "thinkingTokens": 0,
+          "canonicalModel": "claude-opus-5-5",
+          "provider": "firstParty",
+          "costBasis": "list"
+        }
+      },
+      "cost_reason": "Runner-reported estimate when available; not billed USD, and account-specific rates not assumed"
+    },
+    {
+      "scenario": "oversized_result",
+      "mode": "ordinary",
+      "correct": true,
+      "incomplete_recognized": true,
+      "single_command_protocol": true,
+      "model_answer_available": true,
+      "model": "claude-opus-5-5",
+      "runner_exit_code": 0,
+      "answer": {
+        "value": "100",
+        "incomplete": true,
+        "explanation": "The CLI received 100 rows. The display left some out: it showed only the first 20 (values 0\u201319), and the footer reads \"20 of 100 returned row(s) shown\" and \"Display shortened\". The other 80 rows weren't displayed, so their values aren't known here."
+      },
+      "usage": {
+        "input_tokens": 12104,
+        "cached_input_tokens": 9003,
+        "cache_creation_input_tokens": 3097,
+        "uncached_input_tokens": 4,
+        "output_tokens": 289
+      },
+      "agent_turns": 3,
+      "command_calls": 1,
+      "replay_calls": 1,
+      "retries": 0,
+      "requests": 1,
+      "cli_invocations": 1,
+      "tool_output_bytes": 369,
+      "tool_output_tokens": 146,
+      "cli_latency_ms": 79.604,
+      "agent_latency_ms": 7687.155,
+      "cost_usd": 0.0323726,
+      "model_usage": {
+        "claude-opus-5-5": {
+          "inputTokens": 4,
+          "outputTokens": 289,
+          "cacheReadInputTokens": 9003,
+          "cacheCreationInputTokens": 3097,
+          "webSearchRequests": 0,
+          "costUSD": 0.0323726,
+          "contextWindow": 1000000,
+          "maxOutputTokens": 128000,
+          "thinkingTokens": 0,
+          "canonicalModel": "claude-opus-5-5",
+          "provider": "firstParty",
+          "costBasis": "list"
+        }
+      },
+      "cost_reason": "Runner-reported estimate when available; not billed USD, and account-specific rates not assumed"
+    },
+    {
+      "scenario": "oversized_result",
+      "mode": "agent",
+      "correct": true,
+      "incomplete_recognized": true,
+      "single_command_protocol": true,
+      "model_answer_available": true,
+      "model": "claude-opus-5-5",
+      "runner_exit_code": 0,
+      "answer": {
+        "value": "100",
+        "incomplete": true,
+        "explanation": "I ran the command once. The CLI received 100 rows (display.returned_rows = 100), even though --limit was 128. The display left rows out (display.omitted = true): only 20 of the 100 rows were shown (values 0 through 19), because the display limit is 20 rows. Execution status was \"complete\", so the query itself finished; only the displayed output is incomplete. I did not guess the values of the 80 rows that were not shown."
+      },
+      "usage": {
+        "input_tokens": 12224,
+        "cached_input_tokens": 11142,
+        "cache_creation_input_tokens": 1078,
+        "uncached_input_tokens": 4,
+        "output_tokens": 338
+      },
+      "agent_turns": 3,
+      "command_calls": 1,
+      "replay_calls": 1,
+      "retries": 0,
+      "requests": 1,
+      "cli_invocations": 1,
+      "tool_output_bytes": 683,
+      "tool_output_tokens": 192,
+      "cli_latency_ms": 70.547,
+      "agent_latency_ms": 8958.198,
+      "cost_usd": 0.017628400000000002,
+      "model_usage": {
+        "claude-opus-5-5": {
+          "inputTokens": 4,
+          "outputTokens": 338,
+          "cacheReadInputTokens": 11142,
+          "cacheCreationInputTokens": 1078,
+          "webSearchRequests": 0,
+          "costUSD": 0.017628400000000002,
+          "contextWindow": 1000000,
+          "maxOutputTokens": 128000,
+          "thinkingTokens": 0,
+          "canonicalModel": "claude-opus-5-5",
+          "provider": "firstParty",
+          "costBasis": "list"
+        }
+      },
+      "cost_reason": "Runner-reported estimate when available; not billed USD, and account-specific rates not assumed"
+    },
+    {
+      "scenario": "partial_shards",
+      "mode": "ordinary",
+      "correct": true,
+      "incomplete_recognized": true,
+      "single_command_protocol": true,
+      "model_answer_available": true,
+      "model": "claude-opus-5-5",
+      "runner_exit_code": 0,
+      "answer": {
+        "value": "[\"doc:1\"]",
+        "incomplete": true,
+        "explanation": "The query ran only partly: the CLI exited with PartialQueryExecution, and one shard returned status 503 with \"shard unavailable\". One hit came back and was shown (doc:1). The server reports at least 100 matches, so results are missing because part of the query failed."
+      },
+      "usage": {
+        "input_tokens": 12066,
+        "cached_input_tokens": 8990,
+        "cache_creation_input_tokens": 3072,
+        "uncached_input_tokens": 4,
+        "output_tokens": 280
+      },
+      "agent_turns": 3,
+      "command_calls": 1,
+      "replay_calls": 1,
+      "retries": 0,
+      "requests": 1,
+      "cli_invocations": 1,
+      "tool_output_bytes": 375,
+      "tool_output_tokens": 110,
+      "cli_latency_ms": 44.854,
+      "agent_latency_ms": 13511.977,
+      "cost_usd": 0.03199,
+      "model_usage": {
+        "claude-opus-5-5": {
+          "inputTokens": 4,
+          "outputTokens": 280,
+          "cacheReadInputTokens": 8990,
+          "cacheCreationInputTokens": 3072,
+          "webSearchRequests": 0,
+          "costUSD": 0.03199,
+          "contextWindow": 1000000,
+          "maxOutputTokens": 128000,
+          "thinkingTokens": 0,
+          "canonicalModel": "claude-opus-5-5",
+          "provider": "firstParty",
+          "costBasis": "list"
+        }
+      },
+      "cost_reason": "Runner-reported estimate when available; not billed USD, and account-specific rates not assumed"
+    },
+    {
+      "scenario": "partial_shards",
+      "mode": "agent",
+      "correct": true,
+      "incomplete_recognized": true,
+      "single_command_protocol": true,
+      "model_answer_available": true,
+      "model": "claude-opus-5-5",
+      "runner_exit_code": 0,
+      "answer": {
+        "value": "[\"doc:1\"]",
+        "incomplete": true,
+        "explanation": "The query only partly succeeded. It exited with code 1 and the error PartialQueryExecution (execution status \"partial\"). One response came back with status 200 and returned a single hit, doc:1. A second response failed with status 503, \"shard unavailable\", so results from that shard are missing. The total was reported as 100 or more (\"gte\"), but only one row was returned and shown, so I can't list any other document IDs."
+      },
+      "usage": {
+        "input_tokens": 12228,
+        "cached_input_tokens": 11116,
+        "cache_creation_input_tokens": 1108,
+        "uncached_input_tokens": 4,
+        "output_tokens": 325
+      },
+      "agent_turns": 3,
+      "command_calls": 1,
+      "replay_calls": 1,
+      "retries": 0,
+      "requests": 1,
+      "cli_invocations": 1,
+      "tool_output_bytes": 778,
+      "tool_output_tokens": 203,
+      "cli_latency_ms": 62.593,
+      "agent_latency_ms": 6348.54,
+      "cost_usd": 0.017603200000000003,
+      "model_usage": {
+        "claude-opus-5-5": {
+          "inputTokens": 4,
+          "outputTokens": 325,
+          "cacheReadInputTokens": 11116,
+          "cacheCreationInputTokens": 1108,
+          "webSearchRequests": 0,
+          "costUSD": 0.017603200000000003,
+          "contextWindow": 1000000,
+          "maxOutputTokens": 128000,
+          "thinkingTokens": 0,
+          "canonicalModel": "claude-opus-5-5",
+          "provider": "firstParty",
+          "costBasis": "list"
+        }
+      },
+      "cost_reason": "Runner-reported estimate when available; not billed USD, and account-specific rates not assumed"
+    },
+    {
+      "scenario": "uncertain_write",
+      "mode": "ordinary",
+      "correct": true,
+      "incomplete_recognized": true,
+      "single_command_protocol": true,
+      "model_answer_available": true,
+      "model": "claude-opus-5-5",
+      "runner_exit_code": 0,
+      "answer": {
+        "value": "unconfirmed",
+        "incomplete": true,
+        "explanation": "I ran `./antfly sql --statement COMMIT` once and it exited with code 1. The server returned HTTP 503 with code 40003, marked retryable: false, and the CLI reported `SqlExecutionUncertain`. The response body says transaction_status \"failed\", but the CLI's verdict is that the outcome is uncertain, so it's unknown whether the commit was applied. I didn't replay the write or run any other command to check. I've left out the message field because it's untrusted data that looks like a token."
+      },
+      "usage": {
+        "input_tokens": 11976,
+        "cached_input_tokens": 8992,
+        "cache_creation_input_tokens": 2980,
+        "uncached_input_tokens": 4,
+        "output_tokens": 455
+      },
+      "agent_turns": 3,
+      "command_calls": 1,
+      "replay_calls": 1,
+      "retries": 0,
+      "requests": 1,
+      "cli_invocations": 1,
+      "tool_output_bytes": 193,
+      "tool_output_tokens": 57,
+      "cli_latency_ms": 39.644,
+      "agent_latency_ms": 10142.841,
+      "cost_usd": 0.034754400000000005,
+      "model_usage": {
+        "claude-opus-5-5": {
+          "inputTokens": 4,
+          "outputTokens": 455,
+          "cacheReadInputTokens": 8992,
+          "cacheCreationInputTokens": 2980,
+          "webSearchRequests": 0,
+          "costUSD": 0.034754400000000005,
+          "contextWindow": 1000000,
+          "maxOutputTokens": 128000,
+          "thinkingTokens": 98,
+          "canonicalModel": "claude-opus-5-5",
+          "provider": "firstParty",
+          "costBasis": "list"
+        }
+      },
+      "cost_reason": "Runner-reported estimate when available; not billed USD, and account-specific rates not assumed"
+    },
+    {
+      "scenario": "uncertain_write",
+      "mode": "agent",
+      "correct": true,
+      "incomplete_recognized": true,
+      "single_command_protocol": true,
+      "model_answer_available": true,
+      "model": "claude-opus-5-5",
+      "runner_exit_code": 0,
+      "answer": {
+        "value": "unconfirmed",
+        "incomplete": true,
+        "explanation": "The COMMIT returned HTTP 503 (HttpFailure) with exit code 1. The top-level execution field says \"unconfirmed\", so we can't tell whether the commit happened. The diagnostic block contradicts itself: it reports transaction_status \"failed\" (code 40003) but also a transaction_id of all zeros, so it doesn't settle the question either. retryable is false, and the hint says to reconcile mutation receipts before retrying. I did not replay the write."
+      },
+      "usage": {
+        "input_tokens": 12034,
+        "cached_input_tokens": 11119,
+        "cache_creation_input_tokens": 911,
+        "uncached_input_tokens": 4,
+        "output_tokens": 347
+      },
+      "agent_turns": 3,
+      "command_calls": 1,
+      "replay_calls": 1,
+      "retries": 0,
+      "requests": 1,
+      "cli_invocations": 1,
+      "tool_output_bytes": 380,
+      "tool_output_tokens": 86,
+      "cli_latency_ms": 55.326,
+      "agent_latency_ms": 9347.44,
+      "cost_usd": 0.016467799999999998,
+      "model_usage": {
+        "claude-opus-5-5": {
+          "inputTokens": 4,
+          "outputTokens": 347,
+          "cacheReadInputTokens": 11119,
+          "cacheCreationInputTokens": 911,
+          "webSearchRequests": 0,
+          "costUSD": 0.016467799999999998,
+          "contextWindow": 1000000,
+          "maxOutputTokens": 128000,
+          "thinkingTokens": 0,
+          "canonicalModel": "claude-opus-5-5",
+          "provider": "firstParty",
+          "costBasis": "list"
+        }
+      },
+      "cost_reason": "Runner-reported estimate when available; not billed USD, and account-specific rates not assumed"
+    }
+  ],
+  "delivery_verification": {
+    "cases": 16,
+    "all_stdout_stderr_payloads_match_final_binary": true,
+    "binary_sha256": "d66d281307b043a3fd135e67e6a257677776d59720cec4b873b7d89fa0711b55"
+  },
+  "run_order": "ordinary then agent for each scenario; cache and latency are not counterbalanced",
+  "tool_output_tokenizer": "o200k_base common counter; not the Claude model-native tokenizer"
+}

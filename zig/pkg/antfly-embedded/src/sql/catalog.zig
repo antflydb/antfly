@@ -745,6 +745,13 @@ pub const Cursor = struct {
     }
 };
 
+/// Planning-only metadata. Estimates may be stale and never establish an
+/// execution snapshot, exact count, visibility proof or row-admission bound.
+pub const ScanEstimate = struct {
+    estimated_rows: ?u64 = null,
+    estimated_filtered_rows: ?u64 = null,
+    estimated_bytes: ?u64 = null,
+};
 pub const StatementScan = struct { table: Table, request: Scan };
 /// Every physical scan instance is pinned to one coordinated visibility cut.
 /// Cursor handles and their storage belong to this owner; callers invoke only
@@ -987,6 +994,10 @@ pub const Backend = struct {
         /// ordering, limits and exact native reducer semantics.
         aggregate_partials: ?*const fn (*anyopaque, std.mem.Allocator, Table, @import("aggregate_materialization.zig").Recipe) anyerror!?AggregatePartialCursor = null,
         open_statement: ?*const fn (*anyopaque, std.mem.Allocator, []const StatementScan) anyerror!StatementRead = null,
+        /// Metadata-only planning port: never open/pull cursors, execute search,
+        /// activate tracking, publish state or sample rows to obtain estimates.
+        /// Return one entry per input; absent metadata stays null.
+        estimate_scans: ?*const fn (*anyopaque, std.mem.Allocator, []const StatementScan) anyerror![]const ScanEstimate = null,
         // The mutation allocator is a call-scoped arena. Providers must copy
         // any data retained after return into their own durable/session owner.
         // Exactly one atomic commit, retaining all schema/row-version fences.

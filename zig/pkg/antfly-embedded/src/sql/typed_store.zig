@@ -1715,7 +1715,7 @@ const SharedJsonFixture = struct {
         for (0..count) |row| {
             const value = try owned.create(JsonPayload);
             value.* = if (self.frozen) |frozen| .{ .frozen = .{ .bytes = try owned.dupe(u8, frozen.bytes), .lossless_text = frozen.lossless_text } } else .{ .text = try owned.dupe(u8, self.text) };
-            try store.columns[0].appendJson(store.a, owned, owned, row, value);
+            try store.columns[0].appendJson(store.a, owned, owned, row, value, null);
             store.len += 1;
         }
     }

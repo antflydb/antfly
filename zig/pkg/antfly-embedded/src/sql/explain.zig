@@ -13,8 +13,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Dry-run plan description from the same authorized, immutable binding used
-//! by execution. No storage cursor or mutation is opened here.
+//! Logical plans share authorized binding with execution. Ordinary EXPLAIN
+//! opens no cursor; COSTS uses a dedicated metadata-only provider.
+//! ANALYZE measurements come from one completed read-only execution.
 const std = @import("std");
 const ast = @import("ast.zig");
 const describe = @import("describe.zig");
@@ -27,7 +28,10 @@ fn displayName(alloc: Allocator, table: catalog.Table) ![]const u8 {
     return table.physical_name;
 }
 
+const cost = @import("cost_model.zig");
 const Plan = struct {
+    source_ordinal: ?usize = null,
+    estimates: ?cost.Estimate = null,
     node_type: []const u8,
     relation: ?[]const u8 = null,
     join_kind: ?[]const u8 = null,
@@ -38,7 +42,7 @@ const Plan = struct {
     schema_version: ?u32 = null,
     fields: ?[]const []const u8 = null,
     functions: ?[]const []const u8 = null,
-    plans: []const Plan = &.{},
+    plans: []Plan = &.{},
 };
 
 fn wrap(alloc: Allocator, name: []const u8, child: Plan) !Plan {
@@ -141,6 +145,7 @@ fn relationPlan(alloc: Allocator, bound: *const relation.Bound, node: *const rel
             if (scan.index >= bound.scans.len) return error.InvalidSqlBackendResponse;
             const source = bound.scans[scan.index];
             break :blk .{
+                .source_ordinal = scan.index,
                 .node_type = if (source.table.external_base_source != null) "Lake Scan" else if (source.request.index_equality != null) "Index Scan" else "Table Scan",
                 .source_format = if (verbose) if (source.table.external_base_source) |lake| @tagName(lake.binding.format) else null else null,
                 .snapshot_mode = if (verbose) if (source.table.external_base_source) |lake| @tagName(lake.binding.snapshot_mode) else null else null,
@@ -186,10 +191,11 @@ fn statementPlan(alloc: Allocator, statement: ast.Statement, bound: describe.Bou
     };
     const relation_bound = if (bound.merge_mutation) |merge| merge.input.relation else if (bound.joined_mutation) |joined| joined.input.relation else if (bound.insert_source) |source| source.relation else bound.relation;
     var remaining: usize = 8192;
-    var child: []const Plan = if (relation_bound) |source|
+    var child: []Plan = if (relation_bound) |source|
         try alloc.dupe(Plan, &.{try relationPlan(alloc, source, source.root, verbose, 0, &remaining)})
     else if (if (statement == .insert) null else bound.table) |table|
         try alloc.dupe(Plan, &.{.{
+            .source_ordinal = 0,
             .node_type = if (table.external_base_source != null) "Lake Scan" else "Native Table Access",
             .source_format = if (verbose) if (table.external_base_source) |lake| @tagName(lake.binding.format) else null else null,
             .snapshot_mode = if (verbose) if (table.external_base_source) |lake| @tagName(lake.binding.snapshot_mode) else null else null,
@@ -248,14 +254,50 @@ fn appendText(alloc: Allocator, out: *std.ArrayList(u8), plan: Plan, depth: usiz
     if (plan.schema_version) |version| try out.appendSlice(alloc, try std.fmt.allocPrint(alloc, " [schema {d}]", .{version}));
     if (plan.source_format) |format| try out.appendSlice(alloc, try std.fmt.allocPrint(alloc, " [format {s}]", .{format}));
     if (plan.snapshot_mode) |mode| try out.appendSlice(alloc, try std.fmt.allocPrint(alloc, " [snapshot {s}]", .{mode}));
+    if (plan.estimates) |estimate| try out.appendSlice(alloc, try std.fmt.allocPrint(alloc, " [estimated rows={?d}; local work={?d}]", .{ estimate.rows, estimate.local_work_units }));
     try out.append(alloc, '\n');
     for (plan.plans) |child| try appendText(alloc, out, child, depth + 1);
 }
 
-pub fn render(alloc: Allocator, explanation: @FieldType(ast.Statement, "explain"), bound: describe.BoundStatement) ![]const u8 {
-    const plan = try statementPlan(alloc, explanation.statement.*, bound, explanation.verbose);
-    if (explanation.format == .json) return std.json.Stringify.valueAlloc(alloc, .{ .plan_version = 1, .Plan = plan }, .{});
+fn estimatePlan(plan: *Plan, cursors: []const catalog.ScanEstimate, scans: []const catalog.StatementScan) void {
+    for (plan.plans) |*child| estimatePlan(child, cursors, scans);
+    if (plan.source_ordinal) |index| {
+        const stat = if (index < cursors.len) cursors[index] else null;
+        const request: ?catalog.Scan = if (index < scans.len) scans[index].request else null;
+        const filtered = request != null and request.?.conditions.len != 0 and (stat == null or stat.?.estimated_filtered_rows == null);
+        plan.estimates = cost.source(if (stat) |c| c.estimated_filtered_rows orelse c.estimated_rows else null, if (stat) |c| c.estimated_bytes else null, filtered, request != null and request.?.primary_key != null);
+    } else if (plan.plans.len == 2 and (std.mem.eql(u8, plan.node_type, "Hash Join") or std.mem.eql(u8, plan.node_type, "Join"))) {
+        plan.estimates = cost.join(plan.plans[0].estimates orelse .{}, plan.plans[1].estimates orelse .{}, std.mem.eql(u8, plan.node_type, "Hash Join"));
+    } else if (plan.plans.len == 1) {
+        plan.estimates = cost.unary(plan.node_type, plan.plans[0].estimates orelse .{});
+    } else plan.estimates = .{};
+}
+fn captureEstimates(a: Allocator, backend: catalog.Backend, bound: describe.BoundStatement, parameters: []const std.json.Value, plan: *Plan) !void {
+    const scans_input: []const catalog.StatementScan = if (bound.relation) |source| source.scans else if (bound.table) |table| blk: {
+        const fields = try a.alloc([]const u8, table.columns.len);
+        for (fields, table.columns) |*field, column| field.* = column.path;
+        break :blk try a.dupe(catalog.StatementScan, &.{.{ .table = table, .request = .{ .fields = fields, .limit = 1 } }});
+    } else &.{};
+    if (scans_input.len == 0) {
+        estimatePlan(plan, &.{}, &.{});
+        return;
+    }
+    // Ordinary capture can activate tracking or prepare search work. Only
+    // the dedicated metadata capability may serve a planning-only request.
+    if (backend.vtable.estimate_scans) |estimate| {
+        const scans = try @import("relation_runtime.zig").bindSearchScans(a, scans_input, parameters);
+        const metadata = try estimate(backend.ptr, a, scans);
+        if (metadata.len != scans.len) return error.InvalidSqlBackendResponse;
+        estimatePlan(plan, metadata, scans);
+    } else estimatePlan(plan, &.{}, scans_input);
+}
+pub fn renderMeasured(alloc: Allocator, explanation: @FieldType(ast.Statement, "explain"), bound: describe.BoundStatement, profile: ?*const @import("execution_profile.zig").Profile, backend: catalog.Backend, parameters: []const std.json.Value) ![]const u8 {
+    var plan = try statementPlan(alloc, explanation.statement.*, bound, explanation.verbose);
+    if (explanation.costs) try captureEstimates(alloc, backend, bound, parameters, &plan);
+    if (explanation.format == .json) return std.json.Stringify.valueAlloc(alloc, .{ .plan_version = 1, .plan_kind = "logical", .planning_only = !explanation.analyze, .Plan = plan, .cost_model = if (explanation.costs) cost.model else null, .runtime = profile }, .{});
     var out: std.ArrayList(u8) = .empty;
     try appendText(alloc, &out, plan, 0);
+    if (explanation.costs) try out.appendSlice(alloc, "Cost units are logical work, not predicted time. Unknown statistics remain null.\n");
+    if (profile) |measured| try out.appendSlice(alloc, try std.fmt.allocPrint(alloc, "Runtime: {d} result rows; elapsed_ns={?d}; retained_peak_bytes={?d}\n", .{ measured.result_rows, measured.elapsed_ns, measured.retained_peak_bytes }));
     return out.toOwnedSlice(alloc);
 }

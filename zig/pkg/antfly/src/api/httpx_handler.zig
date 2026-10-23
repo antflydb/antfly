@@ -1014,12 +1014,7 @@ pub const AntflyApiHandler = struct {
     fn recordRequest(self: *AntflyApiHandler, ctx: *httpx.Context, next: *httpx.Next) !httpx.Response {
         self.api_server.recordHandledRequest();
         try self.api_server.reachRequestLifecycle(.ingress, null);
-        establishInternalRoutedBatchDeadline(ctx);
-        establishInternalTxnPreDecisionDeadline(ctx);
-        establishInternalTxnStatusDeadline(ctx);
-        establishInternalBackupDeadline(ctx);
-        establishInternalOnlineMergeDeadline(ctx);
-        establishCatalogRouteFenceDeadline(ctx);
+        try establishExecutionDeadlines(ctx);
         const response = next.call(ctx) catch |err| try mapIngressError(ctx, err);
         try self.api_server.reachRequestLifecycle(.response_ready, null);
         return response;
@@ -1049,20 +1044,48 @@ pub const AntflyApiHandler = struct {
         return next.call(ctx);
     }
 
-    /// Intersect forwarded duration with the original lifetime in its own
-    /// clock. Choosing a new clock for an existing timestamp can either extend
-    /// authority or expire unrelated work. The preferred clock applies only
-    /// when this ingress establishes the first deadline.
-    fn tightenApplicationDeadline(ctx: *httpx.Context, budget_ms: u32, preferred: enum { transport, native }) void {
-        if (ctx.application_deadline_ns == null) {
-            ctx.application_deadline_io = if (preferred == .transport) ctx.io else null;
-        }
+    /// Tighten an internal budget in the original clock without changing its
+    /// epoch or renewing its authority. First ingress uses the transport clock.
+    fn tightenApplicationDeadline(ctx: *httpx.Context, budget_ms: u64) void {
+        if (ctx.application_deadline_ns == null) ctx.application_deadline_io = ctx.io;
         const now = if (ctx.application_deadline_io) |io|
             @as(u64, @intCast(@max(0, std.Io.Clock.now(.awake, io).nanoseconds)))
         else
             platform_time.monotonicNs();
         const candidate = now +| @as(u64, budget_ms) *| std.time.ns_per_ms;
         ctx.application_deadline_ns = @min(ctx.application_deadline_ns orelse candidate, candidate);
+    }
+
+    /// Every ingress path applies the same policies. A public budget cannot
+    /// suppress validation or extend an internal service's admission bound.
+    fn establishExecutionDeadlines(ctx: *httpx.Context) !void {
+        try establishPublicExecutionDeadline(ctx);
+        establishInternalRoutedBatchDeadline(ctx);
+        establishInternalTxnPreDecisionDeadline(ctx);
+        establishInternalTxnStatusDeadline(ctx);
+        establishInternalBackupDeadline(ctx);
+        establishInternalOnlineMergeDeadline(ctx);
+        establishCatalogRouteFenceDeadline(ctx);
+    }
+
+    fn establishPublicExecutionDeadline(ctx: *httpx.Context) !void {
+        const limits = @import("antfly_public_limits").Execution;
+        const raw = ctx.header(limits.timeout_header) orelse return;
+        const milliseconds = limits.positive(raw, limits.max_timeout_ms) catch {
+            ctx.application_deadline_invalid = true;
+            return;
+        };
+        @import("../request_deadline.zig").tighten(ctx, milliseconds);
+        try ctx.setHeader("X-Antfly-Execution-Limits", "1");
+    }
+
+    fn sqlExecutionLimits(ctx: *httpx.Context) !sql_runtime.Limits {
+        const controls = @import("antfly_public_limits").Execution;
+        var result: sql_runtime.Limits = .{};
+        if (ctx.header(controls.scan_rows_header)) |raw| result.scan_rows = @min(result.scan_rows, try controls.positive(raw, std.math.maxInt(usize)));
+        if (ctx.header(controls.memory_header)) |raw| result.retained_bytes = @min(result.retained_bytes, try controls.positive(raw, std.math.maxInt(usize)));
+        if (ctx.header(controls.spill_header)) |raw| result.spill_bytes = @min(result.spill_bytes, try controls.positive(raw, std.math.maxInt(u64)));
+        return result;
     }
 
     fn establishInternalRoutedBatchDeadline(ctx: *httpx.Context) void {
@@ -1076,18 +1099,20 @@ pub const AntflyApiHandler = struct {
             ctx.application_deadline_invalid = true;
             return;
         }
-        tightenApplicationDeadline(ctx, budget_ms, .transport);
+        tightenApplicationDeadline(ctx, budget_ms);
     }
 
     fn establishCatalogRouteFenceDeadline(ctx: *httpx.Context) void {
         if (ctx.application_deadline_invalid) return;
         if (ctx.header(metadata_api.catalog_route_fence_header) == null) return;
         const budget_ms = if (ctx.header(metadata_api.catalog_route_deadline_ms_header)) |raw|
-            std.fmt.parseUnsigned(u32, raw, 10) catch metadata_api.catalog_route_default_deadline_ms
+            @import("antfly_public_limits").Execution.positive(raw, metadata_api.catalog_route_max_deadline_ms) catch {
+                ctx.application_deadline_invalid = true;
+                return;
+            }
         else
             metadata_api.catalog_route_default_deadline_ms;
-        const bounded_ms = @max(@as(u32, 1), @min(budget_ms, metadata_api.catalog_route_max_deadline_ms));
-        tightenApplicationDeadline(ctx, bounded_ms, .transport);
+        tightenApplicationDeadline(ctx, budget_ms);
     }
 
     fn establishInternalTxnPreDecisionDeadline(ctx: *httpx.Context) void {
@@ -1103,7 +1128,7 @@ pub const AntflyApiHandler = struct {
             ctx.application_deadline_invalid = true;
             return;
         }
-        tightenApplicationDeadline(ctx, budget_ms, .transport);
+        tightenApplicationDeadline(ctx, budget_ms);
     }
 
     fn establishInternalTxnStatusDeadline(ctx: *httpx.Context) void {
@@ -1118,7 +1143,7 @@ pub const AntflyApiHandler = struct {
             ctx.application_deadline_invalid = true;
             return;
         }
-        tightenApplicationDeadline(ctx, budget_ms, .native);
+        tightenApplicationDeadline(ctx, budget_ms);
     }
 
     fn establishInternalOnlineMergeDeadline(ctx: *httpx.Context) void {
@@ -1136,7 +1161,7 @@ pub const AntflyApiHandler = struct {
             ctx.application_deadline_invalid = true;
             return;
         }
-        tightenApplicationDeadline(ctx, budget_ms, .transport);
+        tightenApplicationDeadline(ctx, budget_ms);
     }
 
     fn establishInternalBackupDeadline(ctx: *httpx.Context) void {
@@ -1153,7 +1178,7 @@ pub const AntflyApiHandler = struct {
             ctx.application_deadline_invalid = true;
             return;
         }
-        tightenApplicationDeadline(ctx, budget_ms, .native);
+        tightenApplicationDeadline(ctx, budget_ms);
     }
 
     /// Continuous-HA mutation safety belongs to ingress policy, not to a
@@ -1222,11 +1247,7 @@ pub const AntflyApiHandler = struct {
     pub fn dispatchLinkedRoute(self: *AntflyApiHandler, ctx: *httpx.Context, route_handler: httpx.Handler) !httpx.Response {
         self.api_server.recordHandledRequest();
         try self.api_server.reachRequestLifecycle(.ingress, null);
-        establishInternalRoutedBatchDeadline(ctx);
-        establishInternalTxnPreDecisionDeadline(ctx);
-        establishInternalTxnStatusDeadline(ctx);
-        establishInternalBackupDeadline(ctx);
-        establishCatalogRouteFenceDeadline(ctx);
+        try establishExecutionDeadlines(ctx);
         if (try self.hotStandbyMutationRejection(ctx)) |response| {
             try self.api_server.reachRequestLifecycle(.response_ready, null);
             return response;
@@ -6456,6 +6477,7 @@ pub const AntflyApiHandler = struct {
         namespace: []const u8,
         parameters: []const std.json.Value,
         limit: usize,
+        execution_limits: sql_runtime.Limits = .{},
         completion_io: std.Io,
         cache_io: std.Io,
         cache: *sql_plan_cache.Cache,
@@ -7032,7 +7054,9 @@ pub const AntflyApiHandler = struct {
             self.adapter.read_delivery = .{ .ptr = self, .deliver = deliverRead };
             var execution_backend = self.adapter.backend();
             if (resource) |owned| execution_backend.parameter_descriptor_hints = owned.value.parameter_descriptors;
-            self.result = self.adapter.execute(self.executionAllocator(), compiled, self.parameters, .{ .result_rows = self.limit }, if (resource != null) execution_backend else null) catch |err| {
+            var execution_limits = self.execution_limits;
+            execution_limits.result_rows = self.limit;
+            self.result = self.adapter.execute(self.executionAllocator(), compiled, self.parameters, execution_limits, if (resource != null) execution_backend else null) catch |err| {
                 self.failure = err;
                 return;
             };
@@ -7215,6 +7239,7 @@ pub const AntflyApiHandler = struct {
             break :legacy legacy_parsed.?.value;
         };
         if (request.read_requirements != null and request.lake_visibility != null) return ctx.status(400).json(sql_wire.SQLDiagnostic{ .code = "22023", .message = "read_requirements and lake_visibility are mutually exclusive" });
+        const execution_limits = sqlExecutionLimits(ctx) catch return ctx.status(400).json(sql_wire.SQLDiagnostic{ .code = "22023", .message = "invalid SQL execution budget" });
         const read_requirements = request.read_requirements orelse @import("antfly_local_sources").sql_read_requirements.Requirements{};
         read_requirements.validate(.sql) catch |err| return ctx.status(if (err == error.UnsupportedReadVisibility) @as(u16, 501) else @as(u16, 400)).json(sql_wire.SQLDiagnostic{ .code = if (err == error.UnsupportedReadVisibility) "0A000" else "22023", .message = "invalid or unsupported SQL read requirements" });
         if (mode == .prepare and request.read_requirements != null) return ctx.status(400).json(sql_wire.SQLDiagnostic{ .code = "22023", .message = "read requirements belong to execution, not preparation" });
@@ -7228,6 +7253,11 @@ pub const AntflyApiHandler = struct {
         if (prepared_id) |id| _ = distributed_txn.parseTxnIdHex(id) catch return ctx.status(400).json(sql_wire.SQLDiagnostic{ .code = "22023", .message = "invalid prepared_id" });
         if (request.parameters) |parameters| if (parameters.len > 1024) return ctx.status(400).json(sql_wire.SQLDiagnostic{ .code = "54000", .message = "SQL parameter count exceeds 1024" });
         if (request.session_id) |encoded| {
+            if (ctx.header(@import("antfly_public_limits").Execution.timeout_header) != null or
+                ctx.header(@import("antfly_public_limits").Execution.scan_rows_header) != null or
+                ctx.header(@import("antfly_public_limits").Execution.memory_header) != null or
+                ctx.header(@import("antfly_public_limits").Execution.spill_header) != null)
+                return ctx.status(400).json(sql_wire.SQLDiagnostic{ .code = "0A000", .message = "per-request execution budgets require a one-shot SQL statement" });
             const id = distributed_txn.parseTxnIdHex(encoded) catch return ctx.status(400).json(sql_wire.SQLDiagnostic{ .code = "22023", .message = "SQL session_id must be a 32-character transaction id" });
             if (try self.forwardTransactionSession(ctx, id, body)) |response| return response;
         }
@@ -7273,6 +7303,7 @@ pub const AntflyApiHandler = struct {
             .namespace = request.namespace orelse "public",
             .parameters = request.parameters orelse &.{},
             .limit = @intCast(limit),
+            .execution_limits = execution_limits,
             .completion_io = ctx.io,
             .transport_allocator = ctx.allocator,
             .cache_io = self.api_server.sqlPlanCacheIo(),
@@ -12324,7 +12355,7 @@ test "online merge ingress bounds owner work using the transport clock" {
 
 test "internal transaction ingress establishes and validates pre-decision deadline" {
     // Routed reads use the transport's clock even when the host epoch is
-    // unrelated. Transaction-only ingress retains its native contract.
+    // unrelated. Transaction-only ingress uses that same clock contract.
     {
         var sim = try @import("vopr").vopr_io.VoprIo.init(.{});
         defer sim.deinit();
@@ -12384,9 +12415,9 @@ test "internal transaction ingress establishes and validates pre-decision deadli
     try status_request.setHeader(distributed_txn_contract.status_remaining_ms_header, "250");
     var status_ctx = httpx.Context.init(std.testing.allocator, std.testing.io, &status_request);
     defer status_ctx.deinit();
-    const status_before_ns = platform_time.monotonicNs();
+    const status_before_ns = @as(u64, @intCast(std.Io.Clock.now(.awake, status_ctx.io).nanoseconds));
     AntflyApiHandler.establishInternalTxnStatusDeadline(&status_ctx);
-    const status_after_ns = platform_time.monotonicNs();
+    const status_after_ns = @as(u64, @intCast(std.Io.Clock.now(.awake, status_ctx.io).nanoseconds));
     const status_deadline_ns = status_ctx.application_deadline_ns.?;
     try std.testing.expect(status_deadline_ns >= status_before_ns + budget_ms * std.time.ns_per_ms);
     try std.testing.expect(status_deadline_ns <= status_after_ns + budget_ms * std.time.ns_per_ms);
@@ -12413,9 +12444,9 @@ test "internal transaction ingress establishes and validates pre-decision deadli
     try backup_request.setHeader(backups_api.backup_remaining_ms_header, "250");
     var backup_ctx = httpx.Context.init(std.testing.allocator, std.testing.io, &backup_request);
     defer backup_ctx.deinit();
-    const backup_before_ns = platform_time.monotonicNs();
+    const backup_before_ns = @as(u64, @intCast(std.Io.Clock.now(.awake, backup_ctx.io).nanoseconds));
     AntflyApiHandler.establishInternalBackupDeadline(&backup_ctx);
-    const backup_after_ns = platform_time.monotonicNs();
+    const backup_after_ns = @as(u64, @intCast(std.Io.Clock.now(.awake, backup_ctx.io).nanoseconds));
     const backup_deadline_ns = backup_ctx.application_deadline_ns.?;
     try std.testing.expect(backup_deadline_ns >= backup_before_ns + budget_ms * std.time.ns_per_ms);
     try std.testing.expect(backup_deadline_ns <= backup_after_ns + budget_ms * std.time.ns_per_ms);
@@ -23455,4 +23486,94 @@ test "httpx inference gateway generated image preflight reports client errors an
         try std.testing.expect(response.header("retry-after") == null);
         try std.testing.expectEqual(@as(usize, 0), server.inferenceAdmissionStats().in_flight);
     }
+}
+
+test "public execution deadlines use the ingress clock and preserve earlier bounds" {
+    const limits = @import("antfly_public_limits").Execution;
+    var sim = try @import("vopr").vopr_io.VoprIo.init(.{});
+    defer sim.deinit();
+    var request = try httpx.Request.init(std.testing.allocator, .POST, "http://node/db/v1/sql");
+    defer request.deinit();
+    try request.setHeader(limits.timeout_header, "250");
+    var ctx = httpx.Context.init(std.testing.allocator, sim.io(), &request);
+    defer ctx.deinit();
+    try AntflyApiHandler.establishPublicExecutionDeadline(&ctx);
+    const deadline = ctx.application_deadline_ns.?;
+    const control = AntflyApiHandler.operationContext(&ctx, null);
+    try std.testing.expectEqual(deadline, control.deadline_ns.?);
+    try control.ensureActive();
+    try std.testing.expect(ctx.application_deadline_io != null);
+    try std.testing.expectEqual(@as(u64, 250 * std.time.ns_per_ms), deadline);
+    ctx.application_deadline_ns = 100 * std.time.ns_per_ms;
+    try AntflyApiHandler.establishPublicExecutionDeadline(&ctx);
+    try std.testing.expectEqual(@as(?u64, 100 * std.time.ns_per_ms), ctx.application_deadline_ns);
+    try request.setHeader(limits.timeout_header, "0");
+    try AntflyApiHandler.establishPublicExecutionDeadline(&ctx);
+    try std.testing.expect(ctx.application_deadline_invalid);
+}
+
+test "public execution SQL budgets can only tighten engine limits" {
+    const limits = @import("antfly_public_limits").Execution;
+    var request = try httpx.Request.init(std.testing.allocator, .POST, "http://node/db/v1/sql");
+    defer request.deinit();
+    try request.setHeader(limits.scan_rows_header, "12");
+    try request.setHeader(limits.memory_header, "1048576");
+    try request.setHeader(limits.spill_header, "2048");
+    var ctx = httpx.Context.init(std.testing.allocator, std.testing.io, &request);
+    defer ctx.deinit();
+    const bounded = try AntflyApiHandler.sqlExecutionLimits(&ctx);
+    try std.testing.expectEqual(@as(usize, 12), bounded.scan_rows);
+    try std.testing.expectEqual(@as(usize, 1048576), bounded.retained_bytes);
+    try std.testing.expectEqual(@as(u64, 2048), bounded.spill_bytes);
+    try request.setHeader(limits.scan_rows_header, "18446744073709551615");
+    const default: sql_runtime.Limits = .{};
+    try std.testing.expectEqual(default.scan_rows, (try AntflyApiHandler.sqlExecutionLimits(&ctx)).scan_rows);
+    try request.setHeader(limits.memory_header, "invalid");
+    try std.testing.expectError(error.InvalidExecutionBudget, AntflyApiHandler.sqlExecutionLimits(&ctx));
+}
+
+test "public execution composes every internal budget and validates combined headers" {
+    const Case = struct { path: []const u8, header: []const u8, fence: bool = false };
+    const cases = [_]Case{
+        .{ .path = "/internal/v1/groups/7/tables/docs/txn-begin", .header = distributed_txn_contract.pre_decision_remaining_ms_header },
+        .{ .path = "/internal/v1/groups/7/tables/docs/txn-prepare", .header = distributed_txn_contract.pre_decision_remaining_ms_header },
+        .{ .path = "/internal/v1/groups/7/tables/docs/txn-status", .header = distributed_txn_contract.status_remaining_ms_header },
+        .{ .path = "/internal/v1/groups/7/tables/docs/backup-shard", .header = backups_api.backup_remaining_ms_header },
+        .{ .path = "/internal/v1/groups/7/tables/docs/online-merge-io", .header = @import("online_merge_io.zig").contract.remaining_ms_header },
+        .{ .path = "/internal/v1/groups/7/tables/docs/batch", .header = internal_batch_forwarding.remaining_ms_header },
+        .{ .path = "/internal/v1/groups/7/tables/docs/lookup/doc", .header = metadata_api.catalog_route_deadline_ms_header, .fence = true },
+    };
+    var sim = try @import("vopr").vopr_io.VoprIo.init(.{});
+    defer sim.deinit();
+    for (cases) |case| {
+        for ([_][]const u8{ "50", "250", "0", "invalid", "4294967295" }) |budget| {
+            var request = try httpx.Request.init(std.testing.allocator, .POST, case.path);
+            defer request.deinit();
+            try request.setHeader(@import("antfly_public_limits").Execution.timeout_header, "100");
+            try request.setHeader(case.header, budget);
+            if (case.fence) try request.setHeader(metadata_api.catalog_route_fence_header, "{}");
+            var ctx = httpx.Context.init(std.testing.allocator, sim.io(), &request);
+            defer ctx.deinit();
+            try AntflyApiHandler.establishExecutionDeadlines(&ctx);
+            if (std.mem.eql(u8, budget, "50") or std.mem.eql(u8, budget, "250")) {
+                try std.testing.expect(!ctx.application_deadline_invalid);
+                const expected: u64 = if (std.mem.eql(u8, budget, "50")) 50 else 100;
+                try std.testing.expectEqual(expected * std.time.ns_per_ms, ctx.application_deadline_ns.?);
+            } else try std.testing.expect(ctx.application_deadline_invalid);
+        }
+    }
+    // An existing host-clock deadline must not be compared with the simulated
+    // ingress epoch directly, including a deadline that has already expired.
+    var request = try httpx.Request.init(std.testing.allocator, .POST, "/db/v1/sql");
+    defer request.deinit();
+    try request.setHeader(@import("antfly_public_limits").Execution.timeout_header, "250");
+    var ctx = httpx.Context.init(std.testing.allocator, sim.io(), &request);
+    defer ctx.deinit();
+    ctx.application_deadline_ns = platform_time.monotonicNs() + 10 * std.time.ns_per_ms;
+    try AntflyApiHandler.establishExecutionDeadlines(&ctx);
+    try std.testing.expect(ctx.application_deadline_ns.? <= 10 * std.time.ns_per_ms);
+    ctx.application_deadline_ns = 0;
+    ctx.application_deadline_io = null;
+    try AntflyApiHandler.establishExecutionDeadlines(&ctx);
+    try std.testing.expectEqual(@as(u64, 0), ctx.application_deadline_ns.?);
 }

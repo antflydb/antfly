@@ -41,10 +41,10 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.Antf
     if (route.subcommand) |command| {
         if (std.mem.eql(u8, command, "maintenance")) return maintenance.run(allocator, io, client, .index, args);
     }
-    if (route.missing_value_arg) |arg| cli.fatal("{s} requires a value", .{arg});
-    if (route.duplicate_arg) |arg| cli.fatal("{s} may only be provided once", .{arg});
-    if (route.unknown_arg) |arg| cli.fatal("unknown index option or subcommand: {s}", .{arg});
-    const tbl = route.table_name orelse cli.fatal("--table is required for index commands", .{});
+    if (route.missing_value_arg) |arg| cli.argumentError("{s} requires a value", .{arg});
+    if (route.duplicate_arg) |arg| cli.argumentError("{s} may only be provided once", .{arg});
+    if (route.unknown_arg) |arg| cli.argumentError("unknown index option or subcommand: {s}", .{arg});
+    const tbl = route.table_name orelse cli.argumentError("--table is required for index commands", .{});
 
     if (route.subcommand) |cmd| {
         if (std.mem.eql(u8, cmd, "create")) return createIndex(allocator, client, tbl, &command_args);
@@ -52,7 +52,7 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.Antf
         if (std.mem.eql(u8, cmd, "list")) return listIndexes(allocator, io, client, tbl, &command_args);
         if (std.mem.eql(u8, cmd, "get")) return getIndex(allocator, io, client, tbl, null, &command_args);
         if (std.mem.eql(u8, cmd, "wait")) return waitForIndex(allocator, io, client, tbl, null, &command_args);
-        cli.fatal("unknown index subcommand: {s}", .{cmd});
+        cli.argumentError("unknown index subcommand: {s}", .{cmd});
     }
 
     if (route.index_name) |idx| {
@@ -320,80 +320,80 @@ pub fn createIndex(allocator: std.mem.Allocator, client: *antfly_client.AntflyCl
     while (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "create")) continue;
         if (std.mem.eql(u8, arg, "--index") or std.mem.eql(u8, arg, "-i")) {
-            if (idx_name != null) cli.fatal("--index may only be provided once", .{});
-            idx_name = args.next() orelse cli.fatal("{s} requires a value", .{arg});
+            if (idx_name != null) cli.argumentError("--index may only be provided once", .{});
+            idx_name = args.next() orelse cli.argumentError("{s} requires a value", .{arg});
         } else if (std.mem.eql(u8, arg, "--type")) {
-            if (idx_type != null) cli.fatal("--type may only be provided once", .{});
-            idx_type = args.next() orelse cli.fatal("--type requires a value", .{});
+            if (idx_type != null) cli.argumentError("--type may only be provided once", .{});
+            idx_type = args.next() orelse cli.argumentError("--type requires a value", .{});
         } else if (std.mem.eql(u8, arg, "--field")) {
-            if (field != null) cli.fatal("--field may only be provided once", .{});
-            field = args.next() orelse cli.fatal("--field requires a value", .{});
+            if (field != null) cli.argumentError("--field may only be provided once", .{});
+            field = args.next() orelse cli.argumentError("--field requires a value", .{});
         } else if (std.mem.eql(u8, arg, "--template")) {
-            if (template != null) cli.fatal("--template may only be provided once", .{});
-            template = args.next() orelse cli.fatal("--template requires a value", .{});
+            if (template != null) cli.argumentError("--template may only be provided once", .{});
+            template = args.next() orelse cli.argumentError("--template requires a value", .{});
         } else if (std.mem.eql(u8, arg, "--embedder")) {
-            if (embedder_json != null) cli.fatal("--embedder may only be provided once", .{});
-            embedder_json = args.next() orelse cli.fatal("--embedder requires a JSON value", .{});
+            if (embedder_json != null) cli.argumentError("--embedder may only be provided once", .{});
+            embedder_json = args.next() orelse cli.argumentError("--embedder requires a JSON value", .{});
         } else if (std.mem.eql(u8, arg, "--chunker")) {
-            if (chunker_json != null) cli.fatal("--chunker may only be provided once", .{});
-            chunker_json = args.next() orelse cli.fatal("--chunker requires a JSON value", .{});
+            if (chunker_json != null) cli.argumentError("--chunker may only be provided once", .{});
+            chunker_json = args.next() orelse cli.argumentError("--chunker requires a JSON value", .{});
         } else if (std.mem.eql(u8, arg, "--dimension")) {
-            if (dimension != null) cli.fatal("--dimension may only be provided once", .{});
-            const raw = args.next() orelse cli.fatal("--dimension requires a value", .{});
-            dimension = std.fmt.parseInt(i64, raw, 10) catch cli.fatal("invalid --dimension value: {s}", .{raw});
-            if (dimension.? <= 0) cli.fatal("--dimension must be greater than zero", .{});
+            if (dimension != null) cli.argumentError("--dimension may only be provided once", .{});
+            const raw = args.next() orelse cli.argumentError("--dimension requires a value", .{});
+            dimension = std.fmt.parseInt(i64, raw, 10) catch cli.argumentError("invalid --dimension value: {s}", .{raw});
+            if (dimension.? <= 0) cli.argumentError("--dimension must be greater than zero", .{});
         } else if (std.mem.eql(u8, arg, "--coverage-policy")) {
-            if (coverage_policy != null) cli.fatal("--coverage-policy may only be provided once", .{});
-            const raw = args.next() orelse cli.fatal("--coverage-policy requires a value", .{});
+            if (coverage_policy != null) cli.argumentError("--coverage-policy may only be provided once", .{});
+            const raw = args.next() orelse cli.argumentError("--coverage-policy requires a value", .{});
             if (!std.mem.eql(u8, raw, "strict") and
                 !std.mem.eql(u8, raw, "partial") and
                 !std.mem.eql(u8, raw, "best_effort"))
             {
-                cli.fatal("invalid --coverage-policy value: {s}; expected strict, partial, or best_effort", .{raw});
+                cli.argumentError("invalid --coverage-policy value: {s}; expected strict, partial, or best_effort", .{raw});
             }
             coverage_policy = raw;
         } else if (std.mem.eql(u8, arg, "--publication-policy")) {
-            if (publication_policy != null) cli.fatal("--publication-policy may only be provided once", .{});
-            const raw = args.next() orelse cli.fatal("--publication-policy requires a value", .{});
+            if (publication_policy != null) cli.argumentError("--publication-policy may only be provided once", .{});
+            const raw = args.next() orelse cli.argumentError("--publication-policy requires a value", .{});
             if (!std.mem.eql(u8, raw, "progressive") and !std.mem.eql(u8, raw, "atomic")) {
-                cli.fatal("invalid --publication-policy value: {s}; expected progressive or atomic", .{raw});
+                cli.argumentError("invalid --publication-policy value: {s}; expected progressive or atomic", .{raw});
             }
             publication_policy = raw;
         } else if (std.mem.eql(u8, arg, "--distance-metric")) {
-            if (distance_metric != null) cli.fatal("--distance-metric may only be provided once", .{});
-            const raw = args.next() orelse cli.fatal("--distance-metric requires a value", .{});
+            if (distance_metric != null) cli.argumentError("--distance-metric may only be provided once", .{});
+            const raw = args.next() orelse cli.argumentError("--distance-metric requires a value", .{});
             if (!std.mem.eql(u8, raw, "l2_squared") and
                 !std.mem.eql(u8, raw, "inner_product") and
                 !std.mem.eql(u8, raw, "cosine"))
             {
-                cli.fatal("invalid --distance-metric value: {s}; expected l2_squared, inner_product, or cosine", .{raw});
+                cli.argumentError("invalid --distance-metric value: {s}; expected l2_squared, inner_product, or cosine", .{raw});
             }
             distance_metric = raw;
         } else if (std.mem.eql(u8, arg, "--external")) {
-            if (external_set) cli.fatal("--external may only be provided once", .{});
+            if (external_set) cli.argumentError("--external may only be provided once", .{});
             external = true;
             external_set = true;
         } else if (std.mem.eql(u8, arg, "--table") or std.mem.eql(u8, arg, "-t")) {
-            _ = args.next() orelse cli.fatal("{s} requires a value", .{arg}); // already parsed
+            _ = args.next() orelse cli.argumentError("{s} requires a value", .{arg}); // already parsed
         } else {
-            cli.fatal("unknown index create option: {s}", .{arg});
+            cli.argumentError("unknown index create option: {s}", .{arg});
         }
     }
 
-    const name = idx_name orelse cli.fatal("--index is required", .{});
-    const index_type = idx_type orelse cli.fatal("--type is required", .{});
+    const name = idx_name orelse cli.argumentError("--index is required", .{});
+    const index_type = idx_type orelse cli.argumentError("--type is required", .{});
     if (coverage_policy != null and !std.mem.eql(u8, index_type, "embeddings")) {
-        cli.fatal("--coverage-policy is only valid for embeddings indexes", .{});
+        cli.argumentError("--coverage-policy is only valid for embeddings indexes", .{});
     }
     if (publication_policy != null and !std.mem.eql(u8, index_type, "embeddings")) {
-        cli.fatal("--publication-policy is only valid for embeddings indexes", .{});
+        cli.argumentError("--publication-policy is only valid for embeddings indexes", .{});
     }
     if ((distance_metric != null or external) and !std.mem.eql(u8, index_type, "embeddings")) {
-        cli.fatal("--distance-metric and --external are only valid for embeddings indexes", .{});
+        cli.argumentError("--distance-metric and --external are only valid for embeddings indexes", .{});
     }
-    if (external and dimension == null) cli.fatal("--external requires --dimension", .{});
+    if (external and dimension == null) cli.argumentError("--external requires --dimension", .{});
     if (external and (field != null or template != null or embedder_json != null or chunker_json != null)) {
-        cli.fatal("--external cannot be combined with --field, --template, --embedder, or --chunker", .{});
+        cli.argumentError("--external cannot be combined with --field, --template, --embedder, or --chunker", .{});
     }
 
     var parsed = buildIndexCreateConfig(allocator, .{
@@ -408,16 +408,17 @@ pub fn createIndex(allocator: std.mem.Allocator, client: *antfly_client.AntflyCl
         .distance_metric = distance_metric,
         .external = external,
     }) catch |err| switch (err) {
-        error.InvalidIndexType => cli.fatal("unsupported --type: {s}; expected full_text, embeddings, graph, or algebraic", .{index_type}),
-        error.InvalidEmbedderJson => cli.fatal("--embedder must be a valid JSON object", .{}),
-        error.InvalidChunkerJson => cli.fatal("--chunker must be a valid JSON object", .{}),
+        error.InvalidIndexType => cli.argumentError("unsupported --type: {s}; expected full_text, embeddings, graph, or algebraic", .{index_type}),
+        error.InvalidEmbedderJson => cli.argumentError("--embedder must be a valid JSON object", .{}),
+        error.InvalidChunkerJson => cli.argumentError("--chunker must be a valid JSON object", .{}),
         else => cli.fatal("failed to build index config: {}", .{err}),
     };
     defer parsed.deinit();
 
     var response = try client.createIndex(table_name, name, parsed.value);
     defer response.deinit();
-    std.debug.print("Create index command successful.\n", .{});
+    try cli.output.mutationResponse(response);
+    if (!cli.isAgent()) cli.output.notice("Create index command successful.\n", .{});
 }
 
 pub fn dropIndex(client: *antfly_client.AntflyClient, table_name: []const u8, pre_index: ?[]const u8, args: *std.process.Args.Iterator) !void {
@@ -425,18 +426,19 @@ pub fn dropIndex(client: *antfly_client.AntflyClient, table_name: []const u8, pr
     while (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "drop")) continue;
         if (std.mem.eql(u8, arg, "--index") or std.mem.eql(u8, arg, "-i")) {
-            const value = args.next() orelse cli.fatal("{s} requires a value", .{arg});
-            if (idx_name != null) cli.fatal("--index may only be provided once", .{});
+            const value = args.next() orelse cli.argumentError("{s} requires a value", .{arg});
+            if (idx_name != null) cli.argumentError("--index may only be provided once", .{});
             idx_name = value;
         } else if (std.mem.eql(u8, arg, "--table") or std.mem.eql(u8, arg, "-t")) {
-            _ = args.next() orelse cli.fatal("{s} requires a value", .{arg});
+            _ = args.next() orelse cli.argumentError("{s} requires a value", .{arg});
         } else {
-            cli.fatal("unknown index drop option: {s}", .{arg});
+            cli.argumentError("unknown index drop option: {s}", .{arg});
         }
     }
-    const name = idx_name orelse cli.fatal("--index is required", .{});
+    const name = idx_name orelse cli.argumentError("--index is required", .{});
     try client.dropIndex(table_name, name);
-    std.debug.print("Drop index command successful.\n", .{});
+    try cli.output.acknowledge("index");
+    if (!cli.isAgent()) cli.output.notice("Drop index command successful.\n", .{});
 }
 
 const ListOutput = enum { summary, json };
@@ -453,50 +455,60 @@ pub fn listIndexes(
     while (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "list")) continue;
         if (std.mem.eql(u8, arg, "--table") or std.mem.eql(u8, arg, "-t")) {
-            _ = args.next() orelse cli.fatal("{s} requires a value", .{arg});
+            _ = args.next() orelse cli.argumentError("{s} requires a value", .{arg});
         } else if (std.mem.eql(u8, arg, "--verbose")) {
-            if (explicitly_selected) cli.fatal("use only one of --verbose or --output json", .{});
+            if (explicitly_selected) cli.argumentError("use only one of --verbose or --output json", .{});
             output = .json;
+            try cli.output.selectFormat(.json);
             explicitly_selected = true;
         } else if (std.mem.eql(u8, arg, "--output") or std.mem.eql(u8, arg, "-o")) {
-            if (explicitly_selected) cli.fatal("use only one of --verbose or --output json", .{});
-            const value = args.next() orelse cli.fatal("--output requires json", .{});
-            if (!std.mem.eql(u8, value, "json")) cli.fatal("only JSON output is supported for index list", .{});
+            if (explicitly_selected) cli.argumentError("use only one of --verbose or --output json", .{});
+            const value = args.next() orelse cli.argumentError("--output requires json", .{});
+            if (!std.mem.eql(u8, value, "json")) cli.argumentError("only JSON output is supported for index list", .{});
             output = .json;
+            try cli.output.selectFormat(.json);
             explicitly_selected = true;
         } else {
-            cli.fatal("unknown index list option: {s}", .{arg});
+            cli.argumentError("unknown index list option: {s}", .{arg});
         }
     }
     return listIndexesMode(allocator, io, client, table_name, output);
 }
 
 fn listIndexesMode(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.AntflyClient, table_name: []const u8, output: ListOutput) !void {
+    cli.output.context = .{ .scope = .discovery, .execution = .complete };
     var resp = try client.listIndexes(table_name);
     defer resp.deinit();
     cli.expectHttpSuccess(resp);
     if (resp.data) |parsed| {
-        if (output == .json) return cli.writeJson(allocator, io, parsed.value);
-        cli.writeStdout(io, "NAME\tTYPE\tSTATE\tSOURCE_PROGRESS\tSOURCE_COVERAGE\tINDEXED\tSEARCHABLE\n");
-        for (parsed.value) |index| try writeIndexSummary(allocator, io, index);
+        if (output == .json or cli.useJson()) return cli.writeJson(allocator, io, parsed.value);
+        const Summary = struct { name: []const u8, type: []const u8, state: []const u8, covered: ?u64, total: ?u64, searchable: ?u64, queryable: bool };
+        const summaries = try allocator.alloc(Summary, parsed.value.len);
+        defer allocator.free(summaries);
+        for (parsed.value, summaries) |index, *result| {
+            const summary = summarizeIndex(index);
+            result.* = .{ .name = index_readiness.createdIndexName(index.config), .type = summary.index_type, .state = summary.state, .covered = summary.source_covered, .total = summary.source_total, .searchable = summary.visible, .queryable = summary.queryable };
+        }
+        try cli.writeJson(allocator, io, summaries);
     }
 }
 
 pub fn getIndex(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.AntflyClient, table_name: []const u8, pre_index: ?[]const u8, args: *std.process.Args.Iterator) !void {
+    cli.output.context = .{ .scope = .discovery, .execution = .complete };
     var idx_name = pre_index;
     while (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "get")) continue;
         if (std.mem.eql(u8, arg, "--index") or std.mem.eql(u8, arg, "-i")) {
-            const value = args.next() orelse cli.fatal("{s} requires a value", .{arg});
-            if (idx_name != null) cli.fatal("--index may only be provided once", .{});
+            const value = args.next() orelse cli.argumentError("{s} requires a value", .{arg});
+            if (idx_name != null) cli.argumentError("--index may only be provided once", .{});
             idx_name = value;
         } else if (std.mem.eql(u8, arg, "--table") or std.mem.eql(u8, arg, "-t")) {
-            _ = args.next() orelse cli.fatal("{s} requires a value", .{arg});
+            _ = args.next() orelse cli.argumentError("{s} requires a value", .{arg});
         } else {
-            cli.fatal("unknown index get option: {s}", .{arg});
+            cli.argumentError("unknown index get option: {s}", .{arg});
         }
     }
-    const name = idx_name orelse cli.fatal("--index is required", .{});
+    const name = idx_name orelse cli.argumentError("--index is required", .{});
     return getIndexByName(allocator, io, client, table_name, name);
 }
 
@@ -896,7 +908,7 @@ fn printWaitProgress(index_name: []const u8, target: WaitTarget, summary: IndexS
     writePendingReasons(&writer, summary.pending_reasons) catch return;
     writeBlockers(&writer, waitTargetBlockerLabel(target), blockersForTarget(summary, target)) catch return;
     writer.writeByte('\n') catch return;
-    std.debug.print("{s}", .{writer.buffered()});
+    cli.output.notice("{s}", .{writer.buffered()});
 }
 
 const WaitThreshold = union(enum) {
@@ -1030,6 +1042,7 @@ fn writeWaitTarget(writer: anytype, target: WaitTarget) !void {
 }
 
 fn writeIndexSummary(allocator: std.mem.Allocator, io: std.Io, index: antfly_client.types.IndexStatus) !void {
+    if (cli.useJson()) return cli.writeJson(allocator, io, index);
     const summary = summarizeIndex(index);
     const index_name = index_readiness.createdIndexName(index.config);
     const index_type = index_readiness.createdIndexType(index.config);
@@ -1067,6 +1080,10 @@ fn writeWaitSuccess(
     target: WaitTarget,
     embeddings_per_second: ?f64,
 ) !void {
+    if (cli.useJson()) {
+        cli.output.context = .{ .scope = .discovery, .execution = .complete };
+        return cli.writeJson(allocator, io, .{ .target = target, .index = index, .embeddings_per_second = embeddings_per_second });
+    }
     const summary = summarizeIndex(index);
     var out: std.Io.Writer.Allocating = .init(allocator);
     defer out.deinit();
@@ -1306,33 +1323,33 @@ fn waitForIndex(
     while (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "wait")) continue;
         if (std.mem.eql(u8, arg, "--table") or std.mem.eql(u8, arg, "-t")) {
-            _ = args.next() orelse cli.fatal("{s} requires a value", .{arg});
+            _ = args.next() orelse cli.argumentError("{s} requires a value", .{arg});
         } else if (std.mem.eql(u8, arg, "--index") or std.mem.eql(u8, arg, "-i")) {
-            const value = args.next() orelse cli.fatal("{s} requires a value", .{arg});
-            if (index_name != null) cli.fatal("--index may only be provided once", .{});
+            const value = args.next() orelse cli.argumentError("{s} requires a value", .{arg});
+            if (index_name != null) cli.argumentError("--index may only be provided once", .{});
             index_name = value;
         } else if (std.mem.eql(u8, arg, "--timeout")) {
-            if (timeout_set) cli.fatal("--timeout may only be provided once", .{});
-            const raw = args.next() orelse cli.fatal("--timeout requires a duration", .{});
-            timeout_ms = parseDurationMs(raw) catch cli.fatal("invalid --timeout duration: {s}", .{raw});
+            if (timeout_set) cli.argumentError("--timeout may only be provided once", .{});
+            const raw = args.next() orelse cli.argumentError("--timeout requires a duration", .{});
+            timeout_ms = parseDurationMs(raw) catch cli.argumentError("invalid --timeout duration: {s}", .{raw});
             timeout_set = true;
         } else if (std.mem.eql(u8, arg, "--poll-interval")) {
-            if (poll_set) cli.fatal("--poll-interval may only be provided once", .{});
-            const raw = args.next() orelse cli.fatal("--poll-interval requires a duration", .{});
-            poll_ms = parseDurationMs(raw) catch cli.fatal("invalid --poll-interval duration: {s}", .{raw});
+            if (poll_set) cli.argumentError("--poll-interval may only be provided once", .{});
+            const raw = args.next() orelse cli.argumentError("--poll-interval requires a duration", .{});
+            poll_ms = parseDurationMs(raw) catch cli.argumentError("invalid --poll-interval duration: {s}", .{raw});
             poll_set = true;
         } else if (std.mem.eql(u8, arg, "--until")) {
-            if (target != null) cli.fatal("--until may only be provided once", .{});
-            const value = args.next() orelse cli.fatal("--until requires complete, source-covered=<count|percent>, or searchable-artifacts=<count>", .{});
+            if (target != null) cli.argumentError("--until may only be provided once", .{});
+            const value = args.next() orelse cli.argumentError("--until requires complete, source-covered=<count|percent>, or searchable-artifacts=<count>", .{});
             target = parseWaitTarget(value) catch
-                cli.fatal("invalid --until condition: {s}; expected complete, source-covered=<count|percent>, or searchable-artifacts=<count>", .{value});
+                cli.argumentError("invalid --until condition: {s}; expected complete, source-covered=<count|percent>, or searchable-artifacts=<count>", .{value});
         } else {
-            cli.fatal("unknown index wait option: {s}", .{arg});
+            cli.argumentError("unknown index wait option: {s}", .{arg});
         }
     }
 
-    const name = index_name orelse cli.fatal("--index is required", .{});
-    const wait_target = target orelse cli.fatal("--until is required; expected complete, source-covered=<count|percent>, or searchable-artifacts=<count>", .{});
+    const name = index_name orelse cli.argumentError("--index is required", .{});
+    const wait_target = target orelse cli.argumentError("--until is required; expected complete, source-covered=<count|percent>, or searchable-artifacts=<count>", .{});
     const outcome = try waitForIndexWithFetcher(
         allocator,
         io,
@@ -1430,7 +1447,7 @@ fn waitForIndexWithFetcher(
             unreachable_incarnation_hash = null;
             consecutive_failures +|= 1;
             if (progress_reporter.shouldReport("unavailable", now_ns)) {
-                std.debug.print("Waiting for index {s}: unavailable ({s}); retrying\n", .{ name, @errorName(err) });
+                cli.output.notice("Waiting for index {s}: unavailable ({s}); retrying\n", .{ name, @errorName(err) });
             }
             sleepForNextWaitAttempt(io, clock, started_ns, timeout_ns, retryDelayMs(poll_ms, consecutive_failures, now_ns), name);
             continue;
@@ -1451,7 +1468,7 @@ fn waitForIndexWithFetcher(
             unreachable_incarnation_hash = null;
             consecutive_failures +|= 1;
             if (progress_reporter.shouldReport("unavailable", response_ns)) {
-                std.debug.print("Waiting for index {s}: unavailable (HTTP {d}); retrying\n", .{ name, resp.status_code });
+                cli.output.notice("Waiting for index {s}: unavailable (HTTP {d}); retrying\n", .{ name, resp.status_code });
             }
             resp.deinit();
             sleepForNextWaitAttempt(io, clock, started_ns, timeout_ns, retryDelayMs(poll_ms, consecutive_failures, response_ns), name);
@@ -1464,8 +1481,8 @@ fn waitForIndexWithFetcher(
             if (!waitTargetSupportsIndex(target, summary)) {
                 var target_buffer: [128]u8 = undefined;
                 var target_writer = std.Io.Writer.fixed(&target_buffer);
-                writeWaitTarget(&target_writer, target) catch cli.fatal("invalid wait condition for {s} index", .{summary.index_type});
-                cli.fatal("wait condition {s} is not supported for {s} indexes", .{ target_writer.buffered(), summary.index_type });
+                writeWaitTarget(&target_writer, target) catch cli.argumentError("invalid wait condition for {s} index", .{summary.index_type});
+                cli.argumentError("wait condition {s} is not supported for {s} indexes", .{ target_writer.buffered(), summary.index_type });
             }
             const embeddings_per_second = progress_reporter.observeEmbeddingRate(summary, response_ns);
             if (summary.incarnation != null and waitTargetUnreachable(summary, target)) {

@@ -30,6 +30,9 @@ pub const resource_limits = @import("resource_limits.zig");
 pub const Limits = struct {
     /// Internal transports opt into complete Datums; HTTP retains public JSON.
     native_result: bool = false,
+    /// Optional execution-owned measurement sink, inherited by lowered plans.
+    profile: ?*@import("execution_profile.zig").Profile = null,
+    memory_accounting: ?*MemoryBudget = null,
     /// Prepared transport cells; execution takes one owned typed copy.
     parameter_cells: ?[]const Datum = null,
     parameter_owner: ?@import("parameter_frame.zig").PayloadLease = null,
@@ -161,7 +164,9 @@ pub fn execute(alloc: std.mem.Allocator, backend: catalog.Backend, compiled: *co
     errdefer result.deinit();
     const arena = state.arena.allocator();
     statement_backend.parameter_fallback_types = try parameterFallbackTypesNative(arena, parameters, limits.parameter_cells);
-    result.output = runBound(state.budget.allocator(), arena, statement_backend, compiled, parameters, limits, null) catch |err| {
+    var execution_limits = limits;
+    execution_limits.memory_accounting = &state.budget;
+    result.output = runBound(state.budget.allocator(), arena, statement_backend, compiled, parameters, execution_limits, null) catch |err| {
         if (err == error.OutOfMemory and state.budget.isExhausted()) return error.SqlWorkingMemoryLimitExceeded;
         return err;
     };
@@ -204,8 +209,28 @@ fn runBound(alloc: std.mem.Allocator, arena: std.mem.Allocator, backend: catalog
     if (compiled.statement == .explain) {
         const explanation = compiled.statement.explain;
         const inner: compiler.Compiled = .{ .arena = undefined, .statement = explanation.statement.*, .parameter_count = compiled.parameter_count };
+        // Analyze is explicitly read-only: reject mutation plans before binding,
+        // cursor capture, parameter preparation, or native admission.
+        if (explanation.analyze and inner.statement != .select) return error.SqlAnalyzeRequiresReadOnly;
+        if (explanation.costs and inner.statement != .select) return error.SqlEstimateRequiresReadOnly;
         const binding = try describe.bind(arena, backend, &inner, &.{});
-        const rendered = try @import("explain.zig").render(arena, explanation, binding);
+        var profile: @import("execution_profile.zig").Profile = .{ .allocator = arena, .io = backend.execution_io };
+        if (explanation.analyze) {
+            const started = profile.now();
+            var measured_limits = limits;
+            measured_limits.profile = &profile;
+            // Execute once, with the original result-admission and work limits.
+            const measured = try runWithBinding(alloc, arena, backend, &inner, binding, parameters, measured_limits, null);
+            profile.elapsed_ns = profile.duration(started);
+            profile.result_rows = measured.rowCount();
+            if (limits.memory_accounting) |budget| profile.retained_peak_bytes = budget.peak;
+        }
+        const estimate_frame = if (explanation.costs) binding.parameter_invocation else null;
+        if (explanation.costs) if (backend.execution_binding_validator) |validator| try validator.validate(validator.ptr, alloc, binding);
+        if (estimate_frame) |invocation| try invocation.prepareNativeOrJson(alloc, parameters, limits.parameter_cells, .{ .bytes = limits.retained_bytes, .wire_bytes = limits.retained_bytes, .error_context = backend.error_context, .payload_owner = limits.parameter_owner });
+        defer if (estimate_frame) |invocation| invocation.deinitFrame();
+        const estimate_parameters = if (estimate_frame) |invocation| try invocation.compatibilityValues(arena) else parameters;
+        const rendered = try @import("explain.zig").renderMeasured(arena, explanation, binding, if (explanation.analyze) &profile else null, backend, estimate_parameters);
         const row = try arena.dupe(Json, &.{.{ .string = rendered }});
         return .{ .columns = try arena.dupe(Column, &.{.{ .name = "QUERY PLAN", .type = .string }}), .rows = try arena.dupe([]const Json, &.{row}), .command_tag = "EXPLAIN" };
     }
@@ -218,6 +243,10 @@ fn runBound(alloc: std.mem.Allocator, arena: std.mem.Allocator, backend: catalog
     // Resolve exactly once so validation and execution cannot pin different
     // catalog identities within one statement.
     const binding = try describe.bind(arena, backend, compiled, &.{});
+    return runWithBinding(alloc, arena, backend, compiled, binding, parameters, limits, sink);
+}
+
+fn runWithBinding(alloc: std.mem.Allocator, arena: std.mem.Allocator, backend: catalog.Backend, compiled: *const compiler.Compiled, binding: describe.BoundStatement, parameters: []const Json, limits: Limits, sink: ?RowSink) !Output {
     if (compiled.statement == .select) if (backend.execution_binding_validator) |validator| try validator.validate(validator.ptr, alloc, binding);
     var statement_backend = backend;
     statement_backend.execution_binding_validator = null;
@@ -231,7 +260,17 @@ fn runBound(alloc: std.mem.Allocator, arena: std.mem.Allocator, backend: catalog
         manager = .{ .alloc = alloc, .io = io, .parallel_work = backend.execution_io != null and backend.spill_wait == null, .cpu_scope = backend.cpu_scope, .async_writes = backend.execution_io != null and backend.spill_wait == null, .wait = backend.spill_wait, .context = backend.ptr, .checkpoint = backend.vtable.checkpoint, .root = limits.spill_root, .max_bytes = limits.spill_bytes, .buffer_bytes = @min(4096, @max(128, limits.retained_bytes / 512)), .max_record_bytes = limits.retained_bytes };
     };
     const context = Context{ .alloc = alloc, .arena = arena, .backend = statement_backend, .binding = binding, .parameters = prepared_parameters, .limits = limits, .spill = backend.spill_manager orelse if (manager) |*owned| owned else null, .sink = sink };
-    return context.run(compiled.statement);
+    const stage = if (limits.profile) |profile| try profile.registerStage(@tagName(compiled.statement), if (binding.table) |table| table.physical_name else null) else null;
+    const started = if (limits.profile) |profile| profile.now() else null;
+    const output = context.run(compiled.statement) catch |err| {
+        if (limits.profile) |profile| profile.record(stage, started, 0, false, true);
+        return err;
+    };
+    if (limits.profile) |profile| profile.record(stage, started, output.rowCount(), true, false);
+    if (limits.profile) |profile| {
+        if (context.spill) |spill| profile.spill_written_bytes = spill.written_bytes;
+    }
+    return output;
 }
 
 pub const RowSink = struct {
@@ -310,6 +349,7 @@ pub const Context = struct {
     }
 
     pub const ScanState = struct {
+        profile_id: ?usize = null,
         opened: bool = false,
         cursor: ?catalog.Cursor = null,
 
@@ -321,23 +361,45 @@ pub const Context = struct {
         fn open(self: *ScanState, context: Context, table: catalog.Table, request: catalog.Scan) !void {
             if (!self.opened) {
                 self.opened = true;
+                if (context.limits.profile) |profile| self.profile_id = try profile.registerScan(table);
                 if (context.backend.vtable.open_scan) |capture|
                     self.cursor = try capture(context.backend.ptr, context.alloc, table, request);
             }
         }
         pub fn page(self: *ScanState, context: Context, alloc: std.mem.Allocator, table: catalog.Table, request: catalog.Scan) !catalog.Page {
             try self.open(context, table, request);
-            if (self.cursor) |cursor| return cursor.nextFor(if (context.backend.cpu_scope) |scope| scope.execution else null, alloc, request.limit);
-            return context.backend.vtable.scan(context.backend.ptr, alloc, table, request);
+            const profile = context.limits.profile;
+            const started = if (profile) |p| p.now() else null;
+            const result = (if (self.cursor) |cursor| cursor.nextFor(if (context.backend.cpu_scope) |scope| scope.execution else null, alloc, request.limit) else context.backend.vtable.scan(context.backend.ptr, alloc, table, request)) catch |err| {
+                if (profile) |p| p.record(self.profile_id, started, 0, false, true);
+                return err;
+            };
+            if (profile) |p| p.record(self.profile_id, started, result.rows.len, result.after == null, false);
+            return result;
         }
         pub fn count(self: *ScanState, context: Context, table: catalog.Table, request: catalog.Scan) !?u64 {
             try self.open(context, table, request);
-            if (self.cursor) |cursor| if (cursor.count_rows != null) return try cursor.countFor(if (context.backend.cpu_scope) |scope| scope.execution else null);
+            if (self.cursor) |cursor| if (cursor.count_rows != null) {
+                const count_rows_result = try cursor.countFor(if (context.backend.cpu_scope) |scope| scope.execution else null);
+                if (context.limits.profile) |p| if (self.profile_id) |id| {
+                    p.nodes.items[id].metadata_rows = count_rows_result;
+                };
+                return count_rows_result;
+            };
             return null;
         }
         pub fn columns(self: *ScanState, context: Context, alloc: std.mem.Allocator, table: catalog.Table, request: catalog.Scan) !?catalog.ColumnPage {
             try self.open(context, table, request);
-            if (self.cursor) |cursor| if (cursor.next_columns != null) return try cursor.columnsFor(if (context.backend.cpu_scope) |scope| scope.execution else null, alloc, request.limit);
+            if (self.cursor) |cursor| if (cursor.next_columns != null) {
+                const profile = context.limits.profile;
+                const started = if (profile) |p| p.now() else null;
+                const result = cursor.columnsFor(if (context.backend.cpu_scope) |scope| scope.execution else null, alloc, request.limit) catch |err| {
+                    if (profile) |p| p.record(self.profile_id, started, 0, false, true);
+                    return err;
+                };
+                if (profile) |p| p.record(self.profile_id, started, result.selection.len, result.after == null, false);
+                return result;
+            };
             return null;
         }
 
@@ -2719,6 +2781,8 @@ test "SQL result boundary preserves array ownership descriptors and NULL provena
 }
 
 const TestBackend = struct {
+    estimate_calls: usize = 0,
+    estimated_search: bool = false,
     estimate_scans: bool = false,
     enable_dynamic_filters: bool = false,
     dynamic_filters: usize = 0,
@@ -2742,7 +2806,20 @@ const TestBackend = struct {
         return .{ .ptr = self, .pinned_statement_snapshot = true, .vtable = &.{ .resolve = resolve, .scan = scan, .mutate = mutate, .checkpoint = checkpoint } };
     }
     fn coordinated(self: *TestBackend) catalog.Backend {
-        return .{ .ptr = self, .vtable = &.{ .resolve = resolve, .scan = scan, .mutate = mutate, .checkpoint = checkpoint, .open_statement = openStatement } };
+        return .{ .ptr = self, .vtable = &.{ .resolve = resolve, .scan = scan, .mutate = mutate, .checkpoint = checkpoint, .open_statement = openStatement, .estimate_scans = estimates } };
+    }
+    fn estimates(ptr: *anyopaque, alloc: std.mem.Allocator, scans: []const catalog.StatementScan) ![]const catalog.ScanEstimate {
+        const self: *TestBackend = @ptrCast(@alignCast(ptr));
+        self.estimate_calls += 1;
+        const output = try alloc.alloc(catalog.ScanEstimate, scans.len);
+        for (scans, output) |scan_request, *estimate| {
+            if (scan_request.request.search) |search| {
+                try std.testing.expectEqualStrings("{}", search.request_text.?);
+                self.estimated_search = true;
+            }
+            estimate.* = .{ .estimated_rows = if (self.estimate_scans) self.row_count else null };
+        }
+        return output;
     }
     const Statement = struct {
         backend: *TestBackend,
@@ -2943,7 +3020,7 @@ test "SQL EXPLAIN binds authorized plans without reading or writing rows" {
     defer denied.deinit();
     try std.testing.expectError(error.Forbidden, execute(std.testing.allocator, backend.iface(), &denied, &.{}, .{}));
     try std.testing.expectEqual(@as(usize, 0), backend.writes);
-    for ([_][]const u8{ "EXPLAIN ANALYZE SELECT id FROM things", "EXPLAIN (COSTS ON) SELECT id FROM things", "EXPLAIN DROP TABLE things" }) |sql| {
+    for ([_][]const u8{"EXPLAIN DROP TABLE things"}) |sql| {
         try std.testing.expectError(error.UnsupportedSqlShape, compiler.compile(std.testing.allocator, sql, .{}));
     }
 }
@@ -6329,4 +6406,114 @@ test "SQL finalized materialization page quota stays independent of decision out
         try std.testing.expectEqual(@as(usize, if (std.mem.indexOf(u8, query, "LIMIT") == null) 10 else if (std.mem.indexOf(u8, query, "LIMIT 9") != null) 9 else 3), result.output.rows.len);
         try std.testing.expectEqual(@as(usize, 1), driver.closes);
     }
+}
+
+test "SQL EXPLAIN roadmap measures one read and retains admission and cancellation" {
+    const a = std.testing.allocator;
+    var backend: TestBackend = .{ .row_count = 7, .estimate_scans = true };
+    var iface = backend.coordinated();
+    iface.execution_io = std.testing.io;
+    var compiled = try compiler.compile(a, "EXPLAIN (FORMAT JSON, ANALYZE ON) SELECT id FROM things LIMIT 3", .{});
+    defer compiled.deinit();
+    var result = try execute(a, iface, &compiled, &.{}, .{});
+    defer result.deinit();
+    var plan = try std.json.parseFromSlice(Json, a, result.output.rows[0][0].string, .{});
+    defer plan.deinit();
+    const measured = plan.value.object.get("runtime").?.object;
+    try std.testing.expectEqual(@as(usize, 1), backend.pages);
+    try std.testing.expectEqual(@as(i64, 3), measured.get("result_rows").?.integer);
+    try std.testing.expect(measured.get("elapsed_ns").? == .integer);
+    try std.testing.expect(measured.get("retained_peak_bytes").?.integer > 0);
+    try std.testing.expect(measured.get("nodes").?.array.items.len > 0);
+    try std.testing.expect(measured.get("storage_read_bytes").? == .null);
+    try std.testing.expectEqual(@as(usize, 0), backend.statement_opens);
+    try std.testing.expectEqual(@as(usize, 0), backend.statement_closes);
+    try std.testing.expectEqual(@as(usize, 0), backend.writes);
+    try std.testing.expect(!plan.value.object.get("planning_only").?.bool);
+    var no_limit = try compiler.compile(a, "EXPLAIN ANALYZE SELECT id FROM things", .{});
+    defer no_limit.deinit();
+    try std.testing.expectError(error.SqlResultTooLarge, execute(a, iface, &no_limit, &.{}, .{ .result_rows = 2 }));
+    backend.cancelled = true;
+    try std.testing.expectError(error.Cancelled, execute(a, iface, &compiled, &.{}, .{}));
+    backend.cancelled = false;
+    const opens = backend.statement_opens;
+    var mutation = try compiler.compile(a, "EXPLAIN ANALYZE DELETE FROM things", .{});
+    defer mutation.deinit();
+    try std.testing.expectError(error.SqlAnalyzeRequiresReadOnly, execute(a, iface, &mutation, &.{}, .{}));
+    try std.testing.expectEqual(opens, backend.statement_opens);
+    try std.testing.expectEqual(@as(usize, 0), backend.writes);
+}
+
+test "SQL EXPLAIN roadmap costs capture metadata without pulling rows" {
+    const a = std.testing.allocator;
+    var backend: TestBackend = .{ .row_count = 100, .estimate_scans = true };
+    var compiled = try compiler.compile(a, "EXPLAIN (FORMAT JSON, COSTS ON) SELECT id FROM things", .{});
+    defer compiled.deinit();
+    var result = try execute(a, backend.coordinated(), &compiled, &.{}, .{});
+    defer result.deinit();
+    try std.testing.expectEqual(@as(usize, 0), backend.pages);
+    try std.testing.expectEqual(@as(usize, 0), backend.writes);
+    try std.testing.expectEqual(@as(usize, 0), backend.statement_opens);
+    try std.testing.expectEqual(@as(usize, 0), backend.statement_closes);
+    try std.testing.expect(std.mem.indexOf(u8, result.output.rows[0][0].string, "\"local_work_units\":100") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output.rows[0][0].string, "\"calibrated_time_model\":false") != null);
+    try std.testing.expectEqual(@as(usize, 1), backend.estimate_calls);
+    var unknown = try execute(a, backend.iface(), &compiled, &.{}, .{});
+    defer unknown.deinit();
+    try std.testing.expect(std.mem.indexOf(u8, unknown.output.rows[0][0].string, "source statistics unavailable") != null);
+    try std.testing.expectEqual(@as(usize, 0), backend.pages);
+}
+
+test "SQL EXPLAIN roadmap profiles physical joins groups sorts and recursion" {
+    const a = std.testing.allocator;
+    for ([_][]const u8{
+        "SELECT a.id FROM things a JOIN things b ON a.id=b.id LIMIT 3",
+        "SELECT id,COUNT(*) FROM things GROUP BY id",
+        "SELECT id FROM things ORDER BY id LIMIT 3",
+        "SELECT id FROM things UNION SELECT id FROM things",
+        "WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM c WHERE n<3) SELECT n FROM c",
+    }) |query| {
+        var backend: TestBackend = .{ .row_count = 4, .estimate_scans = true };
+        var iface = backend.coordinated();
+        iface.execution_io = std.testing.io;
+        var reference_plan = try compiler.compile(a, query, .{});
+        defer reference_plan.deinit();
+        var reference = try execute(a, iface, &reference_plan, &.{}, .{});
+        defer reference.deinit();
+        const sql = try std.fmt.allocPrint(a, "EXPLAIN (FORMAT JSON, ANALYZE ON) {s}", .{query});
+        defer a.free(sql);
+        var compiled = try compiler.compile(a, sql, .{});
+        defer compiled.deinit();
+        var result = try execute(a, iface, &compiled, &.{}, .{});
+        defer result.deinit();
+        var parsed = try std.json.parseFromSlice(Json, a, result.output.rows[0][0].string, .{});
+        defer parsed.deinit();
+        const profile = parsed.value.object.get("runtime").?.object;
+        try std.testing.expectEqual(reference.output.rowCount(), @as(usize, @intCast(profile.get("result_rows").?.integer)));
+        try std.testing.expect(profile.get("nodes").?.array.items.len > 0);
+        try std.testing.expectEqual(backend.statement_opens, backend.statement_closes);
+        try std.testing.expectEqual(@as(usize, 0), backend.writes);
+    }
+}
+
+test "SQL EXPLAIN roadmap estimates use native parameter frames without reading search rows" {
+    const a = std.testing.allocator;
+    var backend: TestBackend = .{ .row_count = 100, .estimate_scans = true };
+    var iface = backend.coordinated();
+    iface.supports_search_relations = true;
+    var compiled = try compiler.compile(a, "EXPLAIN (FORMAT JSON, COSTS ON) SELECT _id FROM antfly_search('things',$1,5)", .{});
+    defer compiled.deinit();
+    const cells = [_]Datum{Datum.json(.{ .string = "{}" })};
+    var result = try execute(a, iface, &compiled, &.{.null}, .{ .parameter_cells = &cells });
+    defer result.deinit();
+    try std.testing.expectEqual(@as(usize, 0), backend.pages);
+    try std.testing.expectEqual(@as(usize, 0), backend.statement_opens);
+    try std.testing.expectEqual(@as(usize, 0), backend.statement_closes);
+    try std.testing.expect(std.mem.indexOf(u8, result.output.rows[0][0].string, "\"local_work_units\":100") != null);
+    try std.testing.expect(backend.estimated_search);
+    try std.testing.expectEqual(@as(usize, 1), backend.estimate_calls);
+    var mutation = try compiler.compile(a, "EXPLAIN (COSTS ON) DELETE FROM things", .{});
+    defer mutation.deinit();
+    try std.testing.expectError(error.SqlEstimateRequiresReadOnly, execute(a, iface, &mutation, &.{}, .{}));
+    try std.testing.expectEqual(@as(usize, 0), backend.writes);
 }
