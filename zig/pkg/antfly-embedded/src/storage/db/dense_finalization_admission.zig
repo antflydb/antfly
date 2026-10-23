@@ -27,9 +27,15 @@ pub const Prepared = struct {
 /// catalog/apply and session-registry admission have all succeeded. A failed
 /// attempt owns no guards and leaves the exact token and replay lease intact.
 pub fn prepare(manager: *manager_mod.IndexManager, sessions: *sessions_mod.Owner, index_ref: manager_mod.ManagedIndexRef, token: runtime_types.CatchUpSessionToken, original: admission.Port) !Prepared {
+    var claim = while (true) {
+        try original.checkpoint();
+        if (try sessions.tryClaimFinish(index_ref.name, token)) |claim| break claim;
+        try @import("../../common/cleanup_wait.zig").waitForRetry(manager.checkpointIo(), original);
+    };
+    defer claim.deinit();
     while (true) {
         var guard = try manager.lockManagedIndexApplyWithAdmission(index_ref, original);
-        const maybe_session = sessions.tryTake(index_ref.name, token) catch |cause| {
+        const maybe_session = claim.tryTake() catch |cause| {
             guard.unlock();
             return cause;
         };

@@ -23615,3 +23615,46 @@ released status ABI (1), and failure identity (7) pass. The
 `funded-dense-capture-db-v3` receipt verifies all 5,508 native/schema input hashes.
 Full GNU/Linux qualification remains waived; pinned Nix/glibc Zig is required on
 Linux. The complete design remains unfinished.
+
+### Exclusive dense finalization preparation
+
+Controlled finish preparation now claims the exact session before acquiring
+catalog/apply guards. Competing finalizers wait with their original finite
+control; competing token transfers and new batch-admission borrows cannot take
+ownership from the preparing callback. Existing independently retained snapshot
+leases remain valid. A competing abort reports a retryable rejection instead of
+silently reporting that it removed a session still owned by preparation.
+
+Session registry entries now have stable allocated metadata, so map growth
+cannot invalidate a preparation claim. Releasing an unconsumed claim uses one
+atomic store, requires no registry lock, and leaves its original token, native
+capture, snapshot lease and cleanup reservation in the registry. Taking through
+a claim uses a nonblocking registry attempt; a busy registry causes apply guards
+to be dropped before another bounded wait. Transfer releases the stable metadata
+and moves the existing physical ownership without allocating. Capture funding
+includes the stable metadata allocation. Native ABI 87 and storage-owner ABI 145
+fence the registry layout change.
+
+This establishes exclusive lifetime protection needed for the execution handoff;
+it does not activate reserved CPU or move durable callback work onto it yet.
+That handoff still needs explicit caller suspension and completion receipts so
+original reentry failure cannot erase a completed durable result. Callback I/O
+and CPU bounds, other retirement paths, and the wider design gates remain open.
+
+Dense reservation saturation is also now retryable replay control flow.
+`SchedulerFull` and `ResourceTemporarilyUnavailable` use the existing bounded
+recoverable backoff and resource-budget counters in both the runtime and resource
+manager. Invalid demand and scheduler closure retain their existing handling.
+A threaded integration test injects each capacity rejection during ordinary and
+deferred dense capture startup, then verifies healthy replay, one record apply,
+durable sequence advancement and exactly one recorded resource retry.
+
+Pinned Darwin Debug final validation passes all 79 build steps. It reports 106
+passing tests plus the cached current-source 64-case derived suite; the simple
+runners pass 24 DB/session cases and 20 local-close cases without skips/leaks.
+The linked C-entry close, maintenance shutdown, execution-service and runnable
+owner targets succeed. Error ABI (43), released status ABI (1), and failure
+identity (7) also pass. All 5,508 native/schema hashes match the
+`dense-finish-claim-final` receipt and `dense-finish-claim-verified.json` snapshots.
+Strong required providers remain disabled; full GNU/Linux qualification remains
+waived and Linux requires pinned Nix/glibc Zig. The full design is unfinished.

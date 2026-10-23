@@ -1857,6 +1857,7 @@ fn stopAndJoinWorker(runtime: *DerivedRuntime, worker: *Worker, io: Io) void {
 const TestThreadedRuntimeCapture = struct {
     require_capture_worker: ?*Worker = null,
     fail_next_begin: bool = false,
+    next_begin_failure: ?anyerror = null,
     empty_coverage_checks: @import("antfly_platform").atomic.Value(u64) = .init(0),
     runtime: ?*DerivedRuntime = null,
     apply_calls: @import("antfly_platform").atomic.Value(u64) = .init(0),
@@ -1932,6 +1933,10 @@ fn testThreadedRuntimeTruncate(ctx: *anyopaque, sequence: u64) !void {
 fn testThreadedRuntimeBeginCatchUp(ctx: *anyopaque, index_ref: index_manager_mod.ManagedIndexRef) !CatchUpSessionToken {
     _ = index_ref;
     const capture: *TestThreadedRuntimeCapture = @ptrCast(@alignCast(ctx));
+    if (capture.next_begin_failure) |failure| {
+        capture.next_begin_failure = null;
+        return failure;
+    }
     if (capture.fail_next_begin) {
         capture.fail_next_begin = false;
         return error.ResourceBudgetExceeded;
@@ -3828,5 +3833,38 @@ test "controlled dense finalization callback consumption separates retry from co
         live = false;
         try std.testing.expectEqual(@as(usize, 0), probe.finishes);
         try std.testing.expectEqual(@as(usize, 0), probe.persists);
+    }
+}
+
+test "controlled dense finalization capacity rejection retries replay without poisoning the worker" {
+    const alloc = std.testing.allocator;
+    for ([_]anyerror{ error.SchedulerFull, error.ResourceTemporarilyUnavailable }) |failure| {
+        for ([_]bool{ false, true }) |deferred| {
+            var tmp = std.testing.tmpDir(.{});
+            defer tmp.cleanup();
+            const path = try std.fmt.allocPrintSentinel(alloc, ".zig-cache/tmp/{s}/capacity-retry-journal", .{tmp.sub_path}, 0);
+            defer alloc.free(path);
+            var journal = try change_journal_mod.Journal.open(path, testThreadedRuntimeJournalOpenOptions());
+            defer journal.close();
+            try appendTestThreadedRuntimeRecord(&journal, alloc, .{
+                .sequence = 1,
+                .changed_doc_keys = &.{"doc:a"},
+                .target_hints = &.{.dense_vector},
+            });
+            var manager = resource_manager_mod.ResourceManager.init(.{});
+            defer manager.deinit(alloc);
+            manager.dense_deferred_source_capture = deferred;
+            var capture: TestThreadedRuntimeCapture = .{ .next_begin_failure = failure };
+            var runtime = try DerivedRuntime.init(alloc, replay_source_mod.Source.fromJournal(&journal), &capture, testThreadedRuntimeApply, testThreadedRuntimePersist, testThreadedRuntimeTruncate, testThreadedRuntimeBeginCatchUp, testThreadedRuntimeFinishCatchUp, null, null, &manager);
+            defer runtime.deinit();
+            try runtime.addWorker("idx", .{ .name = "idx", .kind = .dense_vector }, 0);
+            runtime.notifySequence(1);
+            try runtime.waitForAll(1);
+            try runtime.failIfUnhealthy();
+            try std.testing.expectEqual(@as(u64, 1), capture.apply_calls.load(.monotonic));
+            try std.testing.expectEqual(@as(u64, 1), capture.persisted_sequence.load(.monotonic));
+            try std.testing.expectEqual(@as(u64, 1), runtime.recoverable_retry_counters.snapshot().resource_budget);
+            try std.testing.expectEqual(@as(u64, 1), manager.derivedRecoverableRetryStats().resource_budget);
+        }
     }
 }

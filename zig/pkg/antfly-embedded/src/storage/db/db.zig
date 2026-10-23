@@ -59577,7 +59577,7 @@ fn beginDerivedCatchUpSessionAsync(
     var cleanup: ?@import("antfly_runtime_abi").runnable_abi.ReservedCleanup = if (ctx.capture_cleanup_owner) |owner| blk: {
         const io = ctx.io orelse return error.BackendRuntimeIoUnavailable;
         const borrow = @import("antfly_runtime_abi").native_abi.IoBorrow.init(&io);
-        const bytes = std.math.add(u64, @sizeOf(AsyncDenseCatchUpSession), index_ref.name.len) catch return error.InvalidRunnableDemand;
+        const bytes = std.math.add(u64, @import("dense_catch_up_session_owner.zig").session_metadata_bytes, index_ref.name.len) catch return error.InvalidRunnableDemand;
         break :blk try @import("antfly_runtime_abi").runnable_abi.ReservedCleanup.reserve(owner, &borrow, ctx.capture_cleanup_budget_ns, bytes);
     } else null;
     defer if (cleanup) |*reserved| reserved.deinit();
@@ -59636,7 +59636,10 @@ fn finishDerivedCatchUpSessionAsyncImpl(
         // A delayed close cannot act on a newer session. Its exact token has
         // already been retired, so even coalescer cleanup must happen only
         // after this callback proves ownership of the exact session.
-        var session = takeAsyncDenseCatchUpSession(ctx, index_ref.name, token) catch return .{};
+        var session = takeAsyncDenseCatchUpSession(ctx, index_ref.name, token) catch |cause| switch (cause) {
+            error.DenseCatchUpSessionSuperseded => return .{},
+            else => return cause,
+        };
         defer if (session.cleanup) |*cleanup| cleanup.deinit();
         defer ctx.alloc.free(session.index_name);
         defer if (session.snapshot_replay) |*lease| lease.release();
@@ -149621,6 +149624,12 @@ test "controlled dense finalization DB callback retains real capture through rej
         try std.testing.expectEqual(@as(usize, 1), owner.owner.scheduler.stats().operations);
         try std.testing.expectEqual(@as(usize, 0), owner.owner.scheduler.stats().runnable_slots);
         try std.testing.expectEqual(@as(usize, 1), owner.owner.borrowers);
+        var preparation = (try ctx.dense_admission.sessions.tryClaimFinish(ref.name, token)).?;
+        defer preparation.deinit();
+        try std.testing.expectError(error.ResourceTemporarilyUnavailable, finishDerivedCatchUpSessionAsync(ctx, ref, token, 0, false));
+        try std.testing.expectEqual(funded_bytes, owner.owner.scheduler.stats().retained_bytes);
+        try std.testing.expect(ctx.dense_admission.sessions.sessions.contains(token.value));
+        preparation.deinit();
         const sequence = ctx.store.lastReplaySequence(0);
         const before = ctx.index_manager.denseIndex(ref.name).?.index.experimentalPostingDurableAppliedSequence();
         const Control = struct {
