@@ -1,17 +1,17 @@
 // Copyright 2026 Antfly, Inc.
-// SPDX-License-Identifier: Elastic-2.0
+// SPDX-License-Identifier: Apache-2.0
 //
-// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
-// except in compliance with the Elastic License 2.0. You may obtain a copy of
-// the Elastic License 2.0 at
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-//     https://www.antfly.io/licensing/ELv2-license
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// Unless required by applicable law or agreed to in writing, software distributed
-// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
-// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
-// Elastic License 2.0 for the specific language governing permissions and
-// limitations.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 //! Read-only graph view over a retained cohort and staged SQL postimages.
 //! Only staged rows and affected adjacency are retained in the execution
@@ -46,7 +46,7 @@ pub const View = struct {
         };
     };
     pub fn backend(self: *View) cypher.backend.Backend {
-        return .{ .ptr = self, .vtable = &.{ .bind = bind, .checkpoint = checkpoint, .scan = scan, .scan_where = scanWhere, .estimate_where = estimateWhere, .get = get, .expand = expand, .expand_between = expandBetween, .search = search, .startup_work = startupWork, .set_work = setWork, .set_read_fields = setReadFields } };
+        return .{ .ptr = self, .vtable = &.{ .bind = bind, .checkpoint = checkpoint, .scan = scan, .scan_where = scanWhere, .scan_ordered = scanOrdered, .estimate_where = estimateWhere, .get = get, .expand = expand, .expand_between = expandBetween, .search = search, .startup_work = startupWork, .set_work = setWork, .set_read_fields = setReadFields } };
     }
     fn cast(ptr: *anyopaque) *View {
         return @ptrCast(@alignCast(ptr));
@@ -245,6 +245,11 @@ pub const View = struct {
     fn estimateWhere(ptr: *anyopaque, a: A, table: []const u8, filters: []const cypher.backend.PropertyFilter, limit: usize) !?usize {
         const inner = cast(ptr).inner.backend();
         return if (inner.vtable.estimate_where) |estimate| try estimate(inner.ptr, a, table, filters, limit) else null;
+    }
+    fn scanOrdered(ptr: *anyopaque, a: A, table: []const u8, filters: []const cypher.backend.PropertyFilter, order: []const cypher.backend.PropertyOrder, after: ?[]const u8, limit: usize, max_examined: usize) !?cypher.backend.Page(*const cypher.value.Node) {
+        const inner = cast(ptr).inner.backend();
+        const read = inner.vtable.scan_ordered orelse return null;
+        return read(inner.ptr, a, table, filters, order, after, limit, max_examined);
     }
     fn scanWhere(ptr: *anyopaque, a: A, table: []const u8, filters: []const cypher.backend.PropertyFilter, after: ?[]const u8, limit: usize) !cypher.backend.Page(*const cypher.value.Node) {
         const backend_inner = cast(ptr).inner.backend();

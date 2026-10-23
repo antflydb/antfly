@@ -40,6 +40,7 @@ pub fn Page(comptime T: type) type {
 }
 pub const FilterOp = enum { eq, lt, lte, gt, gte, in };
 pub const PropertyFilter = struct { property: []const u8, value: v.Value, op: FilterOp = .eq };
+pub const PropertyOrder = struct { property: []const u8, descending: bool = false };
 pub const Seed = struct { node: *const v.Node, score: f64 };
 pub const SearchInput = struct { parameters: v.Value, prepared_json: []const u8 = "", max_examined: usize = 1_000_000 };
 pub const SearchPage = struct { seeds: []const Seed, examined: usize = 0, approximate: bool = false };
@@ -129,6 +130,12 @@ pub const Backend = struct {
         /// Typed comparisons are candidate restrictions; the runtime always
         /// rechecks Cypher semantics after authorization and projection.
         scan_where: ?*const fn (*anyopaque, std.mem.Allocator, []const u8, []const PropertyFilter, ?[]const u8, usize) anyerror!Page(*const v.Node) = null,
+        /// A non-null page certifies this exact Cypher order, with primary
+        /// scan encounter order for ties. Null declines before emitting rows.
+        /// Examined includes hidden/rejected/speculative records across owners.
+        /// limit=0 probes the pinned ready index without reading documents:
+        /// certify with empty items, examined=0 and a resumable proof cursor.
+        scan_ordered: ?*const fn (*anyopaque, std.mem.Allocator, []const u8, []const PropertyFilter, []const PropertyOrder, ?[]const u8, usize, usize) anyerror!?Page(*const v.Node) = null,
         /// Optional snapshot-bound index cardinality evidence, capped by limit.
         /// Unknown/broad/unindexed populations return null; planning consumes
         /// work quota without binding query anchors or advancing a scan cursor.

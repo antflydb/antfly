@@ -139,7 +139,7 @@ pub const Context = struct {
     fn subrange(part: Range, start: u128, count: u128) Range {
         return .{ .start = if (count == 0) part.start else part.at(start).integer, .step = part.step, .length = count };
     }
-    fn countBelow(part: Range, bound: i128) u128 {
+    pub fn countBelow(part: Range, bound: i128) u128 {
         if (part.length == 0) return 0;
         const end = part.at(part.length - 1).integer;
         const low = @min(part.start, end);
@@ -213,7 +213,7 @@ pub const Context = struct {
     pub const RankedRun = struct { source: usize, sequence: Range };
     /// Count a stable sorted prefix in each source run. Equal raw values keep
     /// source-run order. No retained row is enumerated during rank selection.
-    fn rankPrefix(self: *Context, ascending: bool, amount: u128) ![]u128 {
+    pub fn rankPrefix(self: *Context, ascending: bool, amount: u128) ![]u128 {
         const counts = try self.a.alloc(u128, self.ranges().len);
         @memset(counts, 0);
         const length = self.domainLength();

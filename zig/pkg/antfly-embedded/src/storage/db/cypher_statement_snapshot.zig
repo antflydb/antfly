@@ -78,7 +78,7 @@ pub fn Snapshot(comptime DB: type) type {
             errdefer readonly.close();
             self.* = .{ .a = a, .arena = arena, .source = db, .db = readonly, .input = copied, .graph = graph, .graphs = graphs, .policy = authority, .tables = undefined, .adapter = undefined };
             self.tables = .{.{ .name = self.input.table, .db = &self.db }};
-            self.adapter = .{ .tables = &self.tables, .ttl_now_ns = copied.ttl_now_ns, .partitioned = true, .authority = .{ .ptr = self, .bind = bind, .checkpoint = checkpoint, .project = project, .project_relationship = projectRelationship, .read_authorization = readAuthorization, .search = search, .storage_projection = true } };
+            self.adapter = .{ .tables = &self.tables, .ttl_now_ns = copied.ttl_now_ns, .partitioned = true, .authority = .{ .ptr = self, .bind = bind, .checkpoint = checkpoint, .project = project, .project_relationship = projectRelationship, .read_authorization = readAuthorization, .search = search, .storage_projection = true, .ordered_projection = true } };
             const backend = self.adapter.backend();
             stage = "bind";
             try backend.vtable.bind(backend.ptr, owned, graph);

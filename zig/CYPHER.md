@@ -2593,6 +2593,69 @@ stable, charged merge sort, then select affine ranks within each prefix bucket.
 Global SKIP/LIMIT applies once across these buckets. Packet ordinals include
 stable ties from earlier source runs. A packet's first and last stable ranks
 certify whether its contributions are contiguous; bounded collection endpoints
-may consume constant weighted packets only when their merge preserves encounter
-order. Failed proofs retain ordinary execution, including eager errors and
+may consume constant or checked affine weighted packets only when their merge
+preserves encounter order. Failed proofs retain ordinary execution, including eager errors and
 floating-point recurrence semantics.
+
+### Qualified identities, certified index order, and affine rank selection
+
+`elementId(n)` equality and finite `IN` predicates share point-domain planning
+with document keys. The planner decodes node identities into table-qualified
+candidates, intersects them with graph label tables, and deduplicates keys per
+table before authorized reads. Invalid identities cannot match. The original
+string predicate remains authoritative: alternate JSON formatting does not make
+an otherwise unequal element ID compare equal. Writes use the same lookup path.
+
+A readonly single-node match with a finite ordered projection can request a
+backend certificate for property order. The native adapter uses a ready index
+from the statement's pinned schema generation only when all index keys match
+the requested properties, directions, null placement, and stable primary-key
+ordering. Supported key types are integer, string with binary collation, and
+boolean. Partial indexes, expression keys, extra keys, incompatible collations,
+and types whose storage order differs from Cypher decline the certificate.
+Authorization hooks must explicitly certify that visible scalar values remain
+unchanged. Active write overlays decline ordered reads because staged values
+may move between index positions.
+
+Residual predicates and label membership run on every authorized candidate;
+scanning stops only after SKIP+LIMIT qualifying rows. Fallible projections and
+predicates retain eager execution so a window cannot hide an error. Candidate
+reads, including rejected rows, consume the anchor budget. This path currently
+uses the index for order; residual property predicates do not establish seek
+bounds on that ordered scan.
+
+Distributed reads negotiate the same capability over authenticated RPC. For
+multiple owners, a metadata-only probe establishes that every owner can provide
+the requested order before any records are read. A heap merges one authorized
+head per owner, preserving ordinary owner encounter order on equal keys. Opaque
+continuations retain owner cursors rather than documents. Speculative heads and
+heads reread across page boundaries count against the global anchor budget;
+comparison work is charged. Single-owner requests forward bounded pages without
+per-record RPC overhead. Catalog changes, revocation, and malformed continuation
+responses fail rather than silently switching ordering after results begin.
+
+Periodic range ordering can select ranks across cohorts with different checked
+affine keys. Constant prefixes partition the sort; arithmetic rank counts select
+source runs without walking skipped rows. Boundary ties compare the complete
+ORDER BY tuple and original source position, including repeated source ranges.
+Small windows render only their selected points, preserving AVG recurrence.
+Larger packets carry stable rank and contiguity proofs for compatible reducers.
+Immutable rank provenance survives subsequent filters and small windows, so
+interleaved members retain their exact encounter positions;
+unsupported or overflowing proofs retain ordinary execution.
+
+Bounded collection endpoints can consume checked affine packets directly when
+their encounter order is certified. The accumulator advances the full logical
+count while retaining only the requested prefix and suffix. This supports
+`head`, `last`, and finite collection slices over large ordered windows without
+materializing the collection. DISTINCT, fallible extraction, and interleaved
+packets still require their existing stronger proofs or ordinary execution.
+
+Public boundary regressions run on Lite and Directory storage. On a
+13,000-document table, qualified identity equality examines one anchor (26
+states), a two-identity domain examines two anchors (60 states), and indexed
+`ORDER BY n.score DESC LIMIT 5` examines five anchors (144 states). The
+1,300,000-value ordered affine collection endpoint and heterogeneous affine
+rank cases consume 388 and 722 states respectively, with less than 150 KiB
+reported statement memory. Tests enforce a 2,000-state, 1 MiB ceiling for
+these range cases rather than relying on elapsed-time thresholds.

@@ -7447,6 +7447,9 @@ test "ordered lineage programs release allocations after proof and packet failur
         }
     };
     for ([_][]const u8{
+        "MATCH (n:Document) WHERE elementId(n) IN ['{\"kind\":\"node\",\"table\":\"docs\",\"key\":\"a\"}',null,'invalid'] RETURN n.id",
+        "UNWIND range(1,150) AS x WITH x,x%3 AS g ORDER BY g%2,x+g LIMIT 5 RETURN avg(x)",
+        "UNWIND range(1,150) AS x WITH x,x%3 AS g ORDER BY g,x LIMIT 90 RETURN head(collect(x)),last(collect(x)),collect(x)[..3],collect(x)[-3..]",
         "MATCH (n:Document) WHERE antfly.documentKey(n) IN ['a','b','a',null] RETURN n.id ORDER BY n.id",
         "UNWIND range(1,150) AS x WITH x,x%3 AS g ORDER BY g,x SKIP 45 LIMIT 10 RETURN avg(x)",
         "UNWIND range(1,150) AS x WITH x%3 AS g ORDER BY g LIMIT 120 RETURN head(collect(g)),last(collect(g))",
@@ -7623,6 +7626,8 @@ test "retained ordered domains stay compressed through reducers and ranking" {
         .{ .text = "UNWIND range(1,1300000) AS x WITH x,x%10 AS g ORDER BY g,x LIMIT 5 RETURN avg(x)", .control = "UNWIND [10,20,30,40,50] AS x RETURN avg(x)" },
         .{ .text = "UNWIND range(1,1300000) AS x WITH x%10 AS g ORDER BY g LIMIT 650000 RETURN head(collect(g)),last(collect(g))", .control = "UNWIND [0,4] AS g RETURN head(collect(g)),last(collect(g))" },
         .{ .text = "UNWIND range(1,1300000)+range(1,1300000) AS x WITH x ORDER BY x LIMIT 1300000 RETURN count(*),sum(x)", .control = "UNWIND range(1,650000) AS x RETURN 1300000,sum(x)*2" },
+        .{ .text = "UNWIND range(1,1300000) AS x WITH x,x%10 AS g ORDER BY g,x LIMIT 650000 RETURN head(collect(x)),last(collect(x))", .control = "UNWIND [10,1299994] AS x RETURN head(collect(x)),last(collect(x))" },
+        .{ .text = "UNWIND range(1,1300000) AS x WITH x,x%10 AS g ORDER BY g%2,x+g LIMIT 5 RETURN avg(x)", .control = "UNWIND [2,4,10,6,12] AS x RETURN avg(x)" },
     }) |item| {
         var diagnostic: c.Diagnostic = .{};
         var compiled = try c.compile(a, item.text, .{}, &diagnostic);
@@ -7648,12 +7653,13 @@ test "terminal rank packets preserve lexicographic ties multiplicity endpoints a
         for (&values, 0..) |*value, index| value.* = if (step > 0) @as(i64, @intCast(index)) - 90 else 90 - @as(i64, @intCast(index));
         const literal = try std.json.Stringify.valueAlloc(a, values, .{});
         defer a.free(literal);
-        for ([_][]const u8{ "g,x", "g DESC,x DESC", "g,-x", "g%2,g,x DESC", "x,g", "0" }) |order| {
+        for ([_][]const u8{ "g,x", "g DESC,x DESC", "g,-x", "g%2,g,x DESC", "g%2,x+g", "g%2,x-g DESC,g DESC", "g%3,2*x+g DESC,-g,x", "g%2,-x+g,x DESC", "x,g", "0" }) |order| {
             for ([_][]const u8{ "LIMIT 5", "SKIP 65 LIMIT 125", "SKIP 400 LIMIT 5", "LIMIT 0" }) |page| {
                 for ([_][]const u8{
                     "RETURN count(*),sum(x),min(x),max(x)",
                     "RETURN avg(x),collect(x)",
                     "RETURN head(collect(g)),last(collect(g)),collect(g)[..3],collect(g)[-3..]",
+                    "RETURN head(collect(x)),last(collect(x)),collect(x)[..3],collect(x)[-3..]",
                     "RETURN g,head(collect(x)),last(collect(x)),count(*) ORDER BY g",
                 }) |tail| {
                     const query = try std.fmt.allocPrint(a, "UNWIND range({d},{d},{d})+range({d},{d},{d}) AS x WITH x,x%3 AS g ORDER BY {s} {s} {s}", .{ values[0], values[179], step, values[0], values[179], step, order, page, tail });
@@ -7664,6 +7670,21 @@ test "terminal rank packets preserve lexicographic ties multiplicity endpoints a
                 }
             }
         }
+    }
+    for ([_][]const u8{
+        "WITH x,x%3 AS g ORDER BY g%2,x+g SKIP 65 LIMIT 150 WITH x,g SKIP 4 LIMIT 130 RETURN head(collect(x)),last(collect(x)),collect(x)[..3],collect(x)[-3..]",
+        "WITH x,x%3 AS g ORDER BY g%2,x+g LIMIT 160 WITH x,g WHERE x%2=0 RETURN head(collect(x)),last(collect(x)),collect(x)[..3],collect(x)[-3..]",
+        "WITH x,x%3 AS g ORDER BY g,x SKIP 7 LIMIT 150 WITH x,g ORDER BY x DESC SKIP 2 LIMIT 129 RETURN avg(x),collect(x)",
+    }) |tail| {
+        var values: [180]i64 = undefined;
+        for (&values, 1..) |*value, index| value.* = @intCast(index);
+        const literal = try std.json.Stringify.valueAlloc(a, values, .{});
+        defer a.free(literal);
+        const query = try std.fmt.allocPrint(a, "UNWIND range(1,180) AS x {s}", .{tail});
+        defer a.free(query);
+        const control = try std.fmt.allocPrint(a, "UNWIND {s} AS x {s}", .{ literal, tail });
+        defer a.free(control);
+        try compareReductionPlans(query, control);
     }
     for ([_][]const u8{
         "WITH x ORDER BY x LIMIT 5 RETURN sum(x)",
@@ -7678,4 +7699,90 @@ test "terminal rank packets preserve lexicographic ties multiplicity endpoints a
         defer a.free(control);
         try compareReductionPlans(query, control);
     }
+}
+
+test "qualified element identities use authorized point domains with exact residuals" {
+    for ([_]struct { text: []const u8, count: i64, reads: usize }{
+        .{ .text = "MATCH (n) WHERE elementId(n)=$id RETURN count(*)", .count = 1, .reads = 1 },
+        .{ .text = "MATCH (n:Document) WHERE elementId(n) IN [$id,$id,null,42,'invalid'] RETURN count(*)", .count = 1, .reads = 1 },
+        .{ .text = "MATCH (n:Person) WHERE elementId(n)=$id RETURN count(*)", .count = 0, .reads = 0 },
+        .{ .text = "MATCH (n:Document) WHERE elementId(n)=$id OR antfly.documentKey(n)='c' RETURN count(*)", .count = 2, .reads = 2 },
+        .{ .text = "MATCH (n:Document) WHERE elementId(n)='invalid' RETURN count(*)", .count = 0, .reads = 0 },
+    }) |item| {
+        var diagnostic: c.Diagnostic = .{};
+        var compiled = try c.compile(std.testing.allocator, item.text, .{}, &diagnostic);
+        defer compiled.deinit();
+        var fixture: Fixture = .{};
+        var result = try runtime.execute(std.testing.allocator, fixture.backend(), graph, &compiled, &.{.{ .name = "id", .value = .{ .string = "{\"kind\":\"node\",\"table\":\"docs\",\"key\":\"b\"}" } }}, .{ .scanned_anchors = item.reads });
+        defer result.deinit();
+        try std.testing.expectEqual(item.count, result.rows[0][0].integer);
+        try std.testing.expectEqual(item.reads, result.stats.scanned_anchors);
+    }
+    try check("MATCH (n) WHERE elementId(n)='{ \"kind\":\"node\",\"table\":\"docs\",\"key\":\"a\"}' RETURN count(*)", "[[0]]");
+    try check("MATCH (n) WHERE elementId(n)='{\"kind\":\"relationship\",\"table\":\"docs\",\"key\":\"a\"}' RETURN count(*)", "[[0]]");
+}
+
+test "ordered node certificates bound scans preserve residuals and decline fallible projections" {
+    const Indexed = struct {
+        fixture: Fixture = .{},
+        calls: usize = 0,
+        fn read(ptr: *anyopaque, a: std.mem.Allocator, _: []const u8, _: []const b.PropertyFilter, order: []const b.PropertyOrder, after: ?[]const u8, limit: usize, max_examined: usize) !?b.Page(*const v.Node) {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            if (order.len != 1 or !std.mem.eql(u8, order[0].property, "rank")) return null;
+            if (limit == 0) return .{ .items = &.{}, .next = "0", .examined = 0 };
+            const start = if (after) |bytes| try std.fmt.parseInt(usize, bytes, 10) else 0;
+            const end = @min(3, start + @min(limit, max_examined));
+            var nodes: std.ArrayList(*const v.Node) = .empty;
+            for (start..end) |index| {
+                const node = &Fixture.nodes[if (order[0].descending) 2 - index else index];
+                if (self.fixture.deny_b and std.mem.eql(u8, node.identity.key, "b")) continue;
+                try nodes.append(a, node);
+            }
+            return .{ .items = nodes.items, .examined = end - start, .next = if (end < 3) try std.fmt.allocPrint(a, "{d}", .{end}) else null };
+        }
+        fn bind(_: *anyopaque, _: std.mem.Allocator, _: catalog.Graph) !void {}
+        fn checkpoint(_: *anyopaque) !void {}
+        fn scan(ptr: *anyopaque, a: std.mem.Allocator, table: []const u8, cursor: ?[]const u8, limit: usize) !b.Page(*const v.Node) {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return Fixture.scan(&self.fixture, a, table, cursor, limit);
+        }
+    };
+    for ([_]struct { text: []const u8, expected: i64, reads: usize, denied: bool = false }{
+        .{ .text = "MATCH (n:Document) RETURN n.rank ORDER BY n.rank DESC LIMIT 1", .expected = 3, .reads = 1 },
+        .{ .text = "MATCH (n:Document) RETURN n.rank AS r ORDER BY r DESC SKIP 1 LIMIT 1", .expected = 2, .reads = 2 },
+        .{ .text = "MATCH (n:Document) WHERE n.rank<3 RETURN n.rank ORDER BY n.rank DESC LIMIT 1", .expected = 1, .reads = 3, .denied = true },
+    }) |item| {
+        var fixture: Indexed = .{ .fixture = .{ .deny_b = item.denied } };
+        var callbacks = fixture.fixture.backend().vtable.*;
+        callbacks.bind = Indexed.bind;
+        callbacks.checkpoint = Indexed.checkpoint;
+        callbacks.scan = Indexed.scan;
+        callbacks.scan_ordered = Indexed.read;
+        var diagnostic: c.Diagnostic = .{};
+        var compiled = try c.compile(std.testing.allocator, item.text, .{}, &diagnostic);
+        defer compiled.deinit();
+        var result = try runtime.execute(std.testing.allocator, .{ .ptr = &fixture, .vtable = &callbacks }, graph, &compiled, &.{}, .{ .scanned_anchors = item.reads });
+        defer result.deinit();
+        try std.testing.expectEqual(item.expected, result.rows[0][0].integer);
+        try std.testing.expectEqual(item.reads, result.stats.scanned_anchors);
+        try std.testing.expect(fixture.calls != 0);
+    }
+    var fixture: Indexed = .{};
+    var callbacks = fixture.fixture.backend().vtable.*;
+    callbacks.bind = Indexed.bind;
+    callbacks.checkpoint = Indexed.checkpoint;
+    callbacks.scan = Indexed.scan;
+    callbacks.scan_ordered = Indexed.read;
+    var diagnostic: c.Diagnostic = .{};
+    var compiled = try c.compile(std.testing.allocator, "MATCH (n:Document) RETURN 1/(n.rank-1) ORDER BY n.rank DESC LIMIT 1", .{}, &diagnostic);
+    defer compiled.deinit();
+    try std.testing.expectError(error.CypherDivisionByZero, runtime.execute(std.testing.allocator, .{ .ptr = &fixture, .vtable = &callbacks }, graph, &compiled, &.{}, .{}));
+    try std.testing.expectEqual(@as(usize, 0), fixture.calls);
+    var shadowed = try c.compile(std.testing.allocator, "MATCH (n:Document) RETURN n.rank AS r,null AS n ORDER BY n.rank DESC LIMIT 1", .{}, &diagnostic);
+    defer shadowed.deinit();
+    var result = try runtime.execute(std.testing.allocator, .{ .ptr = &fixture, .vtable = &callbacks }, graph, &shadowed, &.{}, .{});
+    defer result.deinit();
+    try std.testing.expectEqual(@as(i64, 1), result.rows[0][0].integer);
+    try std.testing.expectEqual(@as(usize, 0), fixture.calls);
 }

@@ -23,7 +23,7 @@ const ast = @import("ast.zig");
 const catalog = @import("catalog.zig");
 const A = std.mem.Allocator;
 pub const Request = struct {
-    operation: enum { validate, scan, estimate, get, get_many, expand, search, observe, observe_ranges, normalize, project },
+    operation: enum { validate, scan, scan_ordered, estimate, get, get_many, expand, search, observe, observe_ranges, normalize, project },
     graph_incarnation: u64,
     graph_revision: u64,
     table: []const u8 = "",
@@ -33,6 +33,7 @@ pub const Request = struct {
     relationship: []const u8 = "",
     direction: ast.Direction = .out,
     filters: []const struct { property: []const u8, value: std.json.Value, op: b.FilterOp = .eq } = &.{},
+    order: []const b.PropertyOrder = &.{},
     after: ?[]const u8 = null,
     limit: usize = 128,
     search: ?std.json.Value = null,
@@ -46,7 +47,7 @@ pub const Request = struct {
     include_relationships: bool = false,
 };
 pub const Projection = struct { node: ?*const v.Node, relationships: []const *const v.Relationship = &.{} };
-const Reply = struct { estimate: ?usize = null, unfiltered: bool = false, work: usize = 0, relationships: []const std.json.Value = &.{}, values: []const std.json.Value = &.{}, next: ?[]const u8 = null, examined: ?usize = null, scores: []const f64 = &.{}, approximate: bool = false };
+const Reply = struct { ordered: bool = false, estimate: ?usize = null, unfiltered: bool = false, work: usize = 0, relationships: []const std.json.Value = &.{}, values: []const std.json.Value = &.{}, next: ?[]const u8 = null, examined: ?usize = null, scores: []const f64 = &.{}, approximate: bool = false };
 pub const Channel = struct { ptr: *anyopaque, call: *const fn (*anyopaque, A, []const u8) anyerror![]u8, checkpoint: ?*const fn (*anyopaque) anyerror!void = null };
 pub const Version = struct { incarnation: u64, revision: u64 };
 pub const Client = struct {
@@ -57,7 +58,7 @@ pub const Client = struct {
     work: ?b.Work = null,
     read_fields: ?[]const []const u8 = null,
     pub fn backend(self: *Client) b.Backend {
-        return .{ .ptr = self, .vtable = &.{ .bind = bind, .checkpoint = checkpoint, .scan = scan, .scan_where = scanWhere, .estimate_where = estimateWhere, .get = get, .get_many = getMany, .expand = expand, .expand_between = expandBetween, .search = search, .normalize_node = normalizeNode, .project_postimage = projectPostimage, .document_relationships = documentRelationships, .set_work = setWork, .set_read_fields = setReadFields } };
+        return .{ .ptr = self, .vtable = &.{ .bind = bind, .checkpoint = checkpoint, .scan = scan, .scan_where = scanWhere, .scan_ordered = scanOrdered, .estimate_where = estimateWhere, .get = get, .get_many = getMany, .expand = expand, .expand_between = expandBetween, .search = search, .normalize_node = normalizeNode, .project_postimage = projectPostimage, .document_relationships = documentRelationships, .set_work = setWork, .set_read_fields = setReadFields } };
     }
     fn setReadFields(ptr: *anyopaque, fields: ?[]const []const u8) void {
         cast(ptr).read_fields = fields;
@@ -157,6 +158,25 @@ pub const Client = struct {
         const reply = try self.invoke(temporary, .{ .filters = encoded, .operation = .estimate, .graph_incarnation = self.incarnation, .graph_revision = self.revision, .table = table, .limit = limit });
         if (reply.estimate) |upper| if (upper > limit) return error.CypherInvalidBackendPage;
         return reply.estimate;
+    }
+    fn scanOrdered(ptr: *anyopaque, a: A, table: []const u8, filters: []const b.PropertyFilter, order: []const b.PropertyOrder, after: ?[]const u8, limit: usize, max_examined: usize) !?b.Page(*const v.Node) {
+        const self = cast(ptr);
+        var scratch = std.heap.ArenaAllocator.init(b.reclaimingAllocator(a));
+        defer scratch.deinit();
+        const temporary = scratch.allocator();
+        const encoded_filters = try std.json.parseFromSliceLeaky(@FieldType(Request, "filters"), temporary, try std.json.Stringify.valueAlloc(temporary, filters, .{}), .{ .parse_numbers = false });
+        const reply = try self.invoke(temporary, .{ .filters = encoded_filters, .order = order, .operation = .scan_ordered, .graph_incarnation = self.incarnation, .graph_revision = self.revision, .table = table, .after = after, .limit = limit, .max_examined = max_examined });
+        if (!reply.ordered) {
+            if (reply.values.len != 0 or reply.next != null or after != null) return error.CypherInvalidBackendPage;
+            return null;
+        }
+        const nodes = try a.alloc(*const v.Node, reply.values.len);
+        for (reply.values, nodes) |input, *out| {
+            const value = try wire.transport(a, input);
+            if (value != .node or !std.mem.eql(u8, value.node.identity.table, table)) return error.CypherInvalidBackendPage;
+            out.* = value.node;
+        }
+        return .{ .items = nodes, .next = if (reply.next) |next| try a.dupe(u8, next) else null, .examined = reply.examined };
     }
     fn scanWhere(ptr: *anyopaque, a: A, table: []const u8, filters: []const b.PropertyFilter, after: ?[]const u8, limit: usize) !b.Page(*const v.Node) {
         const self = cast(ptr);
@@ -262,7 +282,7 @@ pub const Owner = struct {
         if (self.backend.vtable.set_read_fields) |configure| configure(self.backend.ptr, request.read_fields);
         defer if (self.backend.vtable.set_read_fields) |configure| configure(self.backend.ptr, null);
         if (request.graph_incarnation != self.graph.incarnation or request.graph_revision != self.graph.revision) return error.CatalogGenerationChanged;
-        if (request.limit == 0 or request.limit > 1024) return error.CypherOwnerBudgetExceeded;
+        if ((request.limit == 0 and request.operation != .scan_ordered) or request.limit > 1024) return error.CypherOwnerBudgetExceeded;
         try self.backend.vtable.checkpoint(self.backend.ptr);
         var meter: b.Meter = .{ .a = scratch, .backend = self.backend, .limit = request.max_work };
         if (self.backend.vtable.set_work) |configure| configure(self.backend.ptr, meter.work());
@@ -293,6 +313,17 @@ pub const Owner = struct {
                 const upper = if (self.backend.vtable.estimate_where) |estimate| try estimate(self.backend.ptr, scratch, request.table, filters, request.limit) else null;
                 try self.backend.vtable.checkpoint(self.backend.ptr);
                 return std.json.Stringify.valueAlloc(a, .{ .work = meter.units, .estimate = upper }, .{});
+            },
+            .scan_ordered => {
+                if (!self.permitsTable(request.table) or request.order.len == 0 or request.order.len > 32) return error.Forbidden;
+                const filters = try scratch.alloc(b.PropertyFilter, request.filters.len);
+                for (request.filters, filters) |input, *filter| filter.* = .{ .property = input.property, .value = try v.Value.fromJson(scratch, input.value), .op = input.op };
+                const page = if (self.backend.vtable.scan_ordered) |read| try read(self.backend.ptr, scratch, request.table, filters, request.order, request.after, request.limit, request.max_examined) else null;
+                if (page) |ordered| {
+                    for (ordered.items) |node| try values.append(scratch, .{ .value = .{ .node = node } });
+                    return std.json.Stringify.valueAlloc(a, .{ .ordered = true, .values = values.items, .next = ordered.next, .examined = ordered.examined, .work = meter.units }, .{});
+                }
+                return std.json.Stringify.valueAlloc(a, .{ .ordered = false, .work = meter.units }, .{});
             },
             .scan => {
                 if (!self.permitsTable(request.table)) return error.Forbidden;

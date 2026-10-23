@@ -15,6 +15,7 @@
 
 """Physical-work regressions through the real public embedded boundary."""
 
+import json
 from contextlib import closing
 from math import comb
 
@@ -7393,3 +7394,157 @@ def test_document_key_membership_seeks_only_distinct_keys(graph_db):
     assert written["rows"] == [[{"type": "string", "value": "n0"}], [{"type": "string", "value": "n1"}]]
     assert written["stats"]["mutations"] == 2
     assert graph_db.sql("SELECT score FROM docs WHERE _id IN ('n0','n1') ORDER BY _id")["rows"] == [["42"], ["42"]]
+
+
+def test_qualified_element_ids_seek_only_their_table_and_keep_exact_residuals(graph_db):
+    populate(graph_db, 1000)
+    ids = [json.dumps({"kind": "node", "table": "docs", "key": f"n{i}"}, separators=(",", ":")) for i in range(2)]
+    for predicate, parameters, reads, expected in (
+        ("elementId(n)=$id", {"id": ids[0]}, 1, ["n0"]),
+        ("elementId(n) IN $ids", {"ids": [*ids, ids[0], None, 42, "invalid"]}, 2, ["n0", "n1"]),
+        ("elementId(n)=$id", {"id": ids[0].replace('"docs"', '"elsewhere"')}, 0, []),
+        ("elementId(n)=$id", {"id": ids[0].replace("{", "{ ")}, 1, []),
+    ):
+        result = graph_db.cypher_json(
+            "g",
+            {
+                "query": f"MATCH (n:D) WHERE {predicate} RETURN n.id ORDER BY n.id",
+                "parameters": parameters,
+                "limits": {"scanned_anchors": reads, "intermediate_states": 2000, "memory_bytes": 1 << 20},
+            },
+        )
+        assert [row[0]["value"] for row in result["rows"]] == expected
+        assert result["stats"]["scanned_anchors"] == reads
+    written = graph_db.cypher_json(
+        "g",
+        {
+            "query": "MATCH (n:D) WHERE elementId(n) IN $ids SET n.score=42 RETURN n.id ORDER BY n.id",
+            "parameters": {"ids": [*ids, ids[0]]},
+            "limits": {"scanned_anchors": 2},
+        },
+    )
+    assert written["stats"]["mutations"] == 2
+    assert graph_db.sql("SELECT score FROM docs WHERE _id IN ('n0','n1') ORDER BY _id")["rows"] == [["42"], ["42"]]
+
+
+def test_indexed_node_order_reads_only_the_requested_window(graph_db):
+    populate(graph_db, 13000)
+    graph_db.sql("CREATE INDEX ranked ON docs(score DESC)")
+    for order, page, expected, reads in (
+        ("n.score DESC", "LIMIT 5", list(range(12999, 12994, -1)), 5),
+        ("s DESC", "SKIP 2 LIMIT 3", list(range(12997, 12994, -1)), 5),
+    ):
+        result = graph_db.cypher_json(
+            "g",
+            {
+                "query": f"MATCH (n:D) RETURN n.score AS s ORDER BY {order} {page}",
+                "limits": {"scanned_anchors": reads, "intermediate_states": 2000, "memory_bytes": 1 << 20},
+            },
+        )
+        assert [int(row[0]["value"]) for row in result["rows"]] == expected
+        assert result["stats"]["scanned_anchors"] == reads
+    residual = graph_db.cypher_json(
+        "g",
+        {
+            "query": "MATCH (n:D) WHERE n.score<12997 RETURN n.score ORDER BY n.score DESC LIMIT 2",
+            "limits": {"scanned_anchors": 5},
+        },
+    )
+    assert [row[0]["value"] for row in residual["rows"]] == ["12996", "12995"]
+    assert residual["stats"]["scanned_anchors"] == 5
+    shadowed = graph_db.cypher_json(
+        "g",
+        {"query": "MATCH (n:D) RETURN n.score AS s,null AS n ORDER BY n.score DESC LIMIT 1"},
+    )
+    assert shadowed["rows"][0][0] == {"type": "integer", "value": "0"}
+    assert shadowed["stats"]["scanned_anchors"] == 13000
+    # Eager projection failures beyond the requested prefix must remain visible.
+    with pytest.raises(af.AntflyError):
+        graph_db.cypher_json("g", {"query": "MATCH (n:D) RETURN 1/n.score ORDER BY n.score DESC LIMIT 1"})
+
+
+def test_indexed_node_order_preserves_nulls_ties_and_declines_opposite_direction(graph_db):
+    graph_db.sql("INSERT INTO docs (_id,id,score) VALUES ('a','a',5),('b','b',NULL),('c','c',5),('d','d',2)")
+    graph_db.sql("CREATE INDEX ranked ON docs(score DESC)")
+    for direction, expected in (("DESC", ["b", "a", "c", "d"]), ("ASC", ["d", "a", "c", "b"])):
+        result = graph_db.cypher_json(
+            "g",
+            {"query": f"MATCH (n:D) RETURN n.id ORDER BY n.score {direction} LIMIT 4"},
+        )
+        assert [row[0]["value"] for row in result["rows"]] == expected
+    fallback = graph_db.cypher_json("g", {"query": "MATCH (n:D) RETURN n.id ORDER BY n.score ASC LIMIT 1"})
+    assert fallback["rows"] == [[{"type": "string", "value": "d"}]]
+    assert fallback["stats"]["scanned_anchors"] == 4
+
+
+@pytest.mark.parametrize(
+    "query,control",
+    [
+        (
+            "UNWIND range(1,1300000) AS x WITH x,x%10 AS g ORDER BY g,x LIMIT 650000 RETURN head(collect(x)),last(collect(x))",
+            "RETURN 10,1299994",
+        ),
+        (
+            "UNWIND range(1,1300000) AS x WITH x,x%10 AS g ORDER BY g%2,x+g LIMIT 5 RETURN avg(x)",
+            "UNWIND [2,4,10,6,12] AS x RETURN avg(x)",
+        ),
+    ],
+)
+def test_affine_packet_endpoints_and_heterogeneous_ranks_stay_bounded(graph_db, query, control):
+    result = graph_db.cypher_json(
+        "g",
+        {"query": query, "limits": {"intermediate_states": 2000, "memory_bytes": 1 << 20}},
+    )
+    assert result["rows"] == graph_db.cypher_json("g", {"query": control})["rows"]
+    assert result["stats"]["intermediate_states"] < 2000
+    assert result["stats"]["memory_bytes"] < 1 << 20
+
+
+@pytest.mark.parametrize(
+    "tail",
+    [
+        "WITH x,x%3 AS g ORDER BY g%2,x+g SKIP 65 LIMIT 150 WITH x,g SKIP 4 LIMIT 130 RETURN head(collect(x)),last(collect(x)),collect(x)[..3],collect(x)[-3..]",
+        "WITH x,x%3 AS g ORDER BY g%2,x+g LIMIT 160 WITH x,g WHERE x%2=0 RETURN head(collect(x)),last(collect(x)),collect(x)[..3],collect(x)[-3..]",
+    ],
+)
+def test_affine_rank_provenance_survives_later_windows_and_filters(graph_db, tail):
+    result = graph_db.cypher_json("g", {"query": f"UNWIND range(1,180) AS x {tail}"})
+    control = graph_db.cypher_json("g", {"query": f"UNWIND {list(range(1, 181))} AS x {tail}"})
+    assert result["rows"] == control["rows"]
+
+
+@pytest.mark.parametrize(
+    "definition",
+    [
+        "CREATE INDEX ranked ON docs(score DESC NULLS LAST)",
+        "CREATE INDEX ranked ON docs(score DESC,id)",
+        "CREATE INDEX ranked ON docs(score DESC) WHERE score>1",
+    ],
+)
+def test_node_order_declines_indexes_with_different_complete_order(graph_db, definition):
+    graph_db.sql("INSERT INTO docs (_id,id,score) VALUES ('a','z',5),('b','b',NULL),('c','a',5),('d','d',2)")
+    graph_db.sql(definition)
+    result = graph_db.cypher_json("g", {"query": "MATCH (n:D) RETURN n.id ORDER BY n.score DESC LIMIT 2"})
+    assert [row[0]["value"] for row in result["rows"]] == ["b", "z"]
+    assert result["stats"]["scanned_anchors"] == 4
+
+
+def test_composite_node_order_certifies_the_entire_requested_tuple(graph_db):
+    graph_db.sql("INSERT INTO docs (_id,id,score) VALUES ('a','z',5),('b','b',NULL),('c','a',5),('d','d',2)")
+    graph_db.sql("CREATE INDEX ranked ON docs(score DESC,id)")
+    result = graph_db.cypher_json(
+        "g",
+        {"query": "MATCH (n:D) RETURN n.id ORDER BY n.score DESC,n.id LIMIT 2", "limits": {"scanned_anchors": 2}},
+    )
+    assert [row[0]["value"] for row in result["rows"]] == ["b", "a"]
+    assert result["stats"]["scanned_anchors"] == 2
+
+
+def test_empty_indexed_order_preserves_a_zero_anchor_budget(graph_db):
+    graph_db.sql("CREATE INDEX ranked ON docs(score DESC)")
+    result = graph_db.cypher_json(
+        "g",
+        {"query": "MATCH (n:D) RETURN n.score ORDER BY n.score DESC LIMIT 5", "limits": {"scanned_anchors": 0}},
+    )
+    assert result["rows"] == []
+    assert result["stats"]["scanned_anchors"] == 0

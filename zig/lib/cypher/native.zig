@@ -49,6 +49,8 @@ pub fn Adapter(comptime DB: type, comptime GraphIndex: type, comptime EdgeScanCu
             /// independently checks authority by identity rather than requiring
             /// unrequested node properties. Label predicates are still retained.
             storage_projection: bool = false,
+            /// Projection may reject rows but preserves visible scalar values.
+            ordered_projection: bool = false,
         };
         tables: []const Table,
         authority: Authority,
@@ -62,7 +64,7 @@ pub fn Adapter(comptime DB: type, comptime GraphIndex: type, comptime EdgeScanCu
         read_fields: ?[]const []const u8 = null,
 
         pub fn backend(self: *Self) b.Backend {
-            return .{ .ptr = self, .vtable = &.{ .bind = bind, .checkpoint = checkpoint, .scan = scan, .scan_where = scanWhere, .estimate_where = estimateWhere, .get = get, .expand = expand, .expand_between = expandBetween, .search = search, .set_work = setWork, .set_read_fields = setReadFields } };
+            return .{ .ptr = self, .vtable = &.{ .bind = bind, .checkpoint = checkpoint, .scan = scan, .scan_where = scanWhere, .scan_ordered = scanOrdered, .estimate_where = estimateWhere, .get = get, .expand = expand, .expand_between = expandBetween, .search = search, .set_work = setWork, .set_read_fields = setReadFields } };
         }
         fn setReadFields(ptr: *anyopaque, fields: ?[]const []const u8) void {
             cast(ptr).read_fields = fields;
@@ -239,6 +241,61 @@ pub fn Adapter(comptime DB: type, comptime GraphIndex: type, comptime EdgeScanCu
         }
         fn scanWhere(ptr: *anyopaque, a: A, table: []const u8, filters: []const b.PropertyFilter, encoded: ?[]const u8, limit: usize) !b.Page(*const v.Node) {
             return (try scanWhereImpl(ptr, a, table, filters, encoded, limit, false)).?;
+        }
+        const OrderedCursor = struct { index: []const u8, after: ?[]const u8 = null, schema_version: u32 };
+        fn scanOrdered(ptr: *anyopaque, a: A, table: []const u8, _: []const b.PropertyFilter, order: []const b.PropertyOrder, encoded: ?[]const u8, limit: usize, max_examined: usize) !?b.Page(*const v.Node) {
+            if (comptime !@hasDecl(DB, "openRelationalReadSession") or !@hasDecl(DB, "cypherDocumentScanOptions")) return null;
+            const self = cast(ptr);
+            if (!self.authority.ordered_projection or order.len == 0 or order.len > 32) return null;
+            if (limit != 0 and max_examined == 0) return error.CypherAnchorBudgetExceeded;
+            var scratch = std.heap.ArenaAllocator.init(b.reclaimingAllocator(a));
+            defer scratch.deinit();
+            const temporary = scratch.allocator();
+            try checkpoint(ptr);
+            const db = try self.selected(table);
+            var schema = db.core.acquireSchemaView() orelse return null;
+            defer schema.release();
+            var indexes = db.core.relational_indexes.acquire() orelse return null;
+            defer indexes.deinit();
+            if (indexes.plan.schemaView().epoch != schema.epoch) return error.CatalogGenerationChanged;
+            const cursor = if (encoded) |bytes| try std.json.parseFromSliceLeaky(OrderedCursor, temporary, bytes, .{}) else null;
+            candidates: for (indexes.plan.boundIndexes()) |index| {
+                if (cursor) |position| if (!std.mem.eql(u8, position.index, index.name)) continue;
+                if (index.predicate != null or index.tuple.keys.len != order.len) continue;
+                for (index.tuple.keys, order) |key, requested| {
+                    if (self.work) |work| try work.charge(work.ptr, 1);
+                    if (key.expression != null or key.fold_ascii or key.descending != requested.descending or key.nulls_first != requested.descending) continue :candidates;
+                    if (!std.mem.eql(u8, schema.tableSchema().relational_columns[key.ordinal].name, requested.property)) continue :candidates;
+                    switch (key.column_type) {
+                        .integer, .string, .boolean => {},
+                        else => continue :candidates, // Exact NUMERIC/JSON projection has different ordering semantics.
+                    }
+                }
+                const authorization = try self.readAuthorization(temporary, table);
+                var opts = try self.scanOptions(temporary, db, .{ .execution_deadline_ns = authorization.deadline_ns, .row_policy_principal_proof = authorization.proof, .row_policy_database = authorization.database, .include_documents = true, .limit = @intCast(@min(limit, 1024)) });
+                if (opts.relational_query == null) return null;
+                opts.relational_query.?.index = index.name;
+                opts.relational_query.?.auto_index = false;
+                opts.relational_query.?.after = if (cursor) |position| position.after else null;
+                opts.relational_query.?.schema_version = if (cursor) |position| position.schema_version else schema.version();
+                const session = db.openRelationalReadSession(temporary, "", "", opts) catch |err| switch (err) {
+                    error.RelationalIndexNotReady, error.IndexNotFound => if (cursor == null) continue :candidates else return error.CatalogGenerationChanged,
+                    else => return err,
+                };
+                defer session.deinit();
+                session.reader.now_ns = self.ttl_now_ns;
+                try session.checkpoint();
+                if (limit == 0) return .{ .items = &.{}, .examined = 0, .next = try std.json.Stringify.valueAlloc(a, OrderedCursor{ .index = index.name, .schema_version = session.reader.active.version(), .after = if (cursor) |position| position.after else null }, .{}) };
+                var page = try session.reader.nextPage(temporary, null, .{ .rows = @min(limit, 1024), .records = @min(@min(@max(limit, 128), max_examined), 1024), .output_bytes = 16 << 20 });
+                defer page.deinit();
+                var nodes: std.ArrayList(*const v.Node) = .empty;
+                for (page.rows) |row| if (try self.node(a, table, row.key, row.json)) |node_value| if (node_value.labels.len != 0) try nodes.append(a, node_value);
+                const next = if (page.more) try std.json.Stringify.valueAlloc(a, OrderedCursor{ .index = index.name, .schema_version = session.reader.active.version(), .after = page.next_cursor orelse return error.CypherInvalidBackendCursor }, .{}) else null;
+                try checkpoint(ptr);
+                return .{ .items = try nodes.toOwnedSlice(a), .examined = page.records_examined, .next = next };
+            }
+            if (cursor != null) return error.CatalogGenerationChanged;
+            return null;
         }
         fn estimateWhere(ptr: *anyopaque, a: A, table: []const u8, filters: []const b.PropertyFilter, limit: usize) !?usize {
             if (limit == 0) return null;

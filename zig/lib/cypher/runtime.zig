@@ -1130,6 +1130,7 @@ pub fn queryHasWrites(query: ast.Query) bool {
 }
 const aggregateName = @import("expressions.zig").aggregateName;
 const aggregates = @import("expressions.zig").aggregates;
+const NodeOrder = struct { table: []const u8, alias: []const u8, fields: []const backend_mod.PropertyOrder, active: bool = false, declined: bool = false };
 const Engine = struct {
     const Invariants = struct {
         const MappingKey = struct { expression: *const ast.Expr, source: Identity };
@@ -1173,6 +1174,7 @@ const Engine = struct {
     match_aliases: []const []const u8 = &.{},
     collect_match_paths: bool = false,
     shortest_fast: bool = false,
+    node_order: ?*NodeOrder = null,
     stream_fold: ?*StreamFold = null,
     expression_memo: ?CallMemo = null,
     expression_memo_scoped: bool = false,
@@ -2332,6 +2334,27 @@ const Engine = struct {
             if (self.count == 1 or (order == .lt and std.ascii.eqlIgnoreCase(self.function.name, "min")) or (order == .gt and std.ascii.eqlIgnoreCase(self.function.name, "max"))) {
                 _ = self.arena.reset(.retain_capacity);
                 self.best = try engine.cloneAggregateScoped(value, self.arena.allocator());
+            }
+        }
+        /// Bounded consumers observe only the proved prefix/suffix of this
+        /// ordered integer packet. All source expressions were certified first.
+        fn addRangeCollection(self: *@This(), engine: *Engine, sequence: @import("range.zig").Range) !void {
+            const length: u64 = @intCast(sequence.length);
+            self.count +|= length;
+            if (self.function.collect_summary and !self.collection_overflow) self.collection_count = addPathCount(self.collection_count, length) catch blk: {
+                self.collection_overflow = true;
+                break :blk 0;
+            };
+            const prefix = @min(sequence.length, self.function.collect_limit.? - self.collected.items.len);
+            try Engine.chargeWork(engine, @intCast(prefix));
+            try self.collected.ensureUnusedCapacity(self.arena.allocator(), @intCast(prefix));
+            var index: u128 = 0;
+            while (index < prefix) : (index += 1) self.collected.appendAssumeCapacity(sequence.at(index));
+            if (self.function.collect_suffix != 0) {
+                self.collection_seen +|= @intCast(@min(sequence.length, std.math.maxInt(usize)));
+                const suffix = @min(sequence.length, self.function.collect_suffix);
+                index = sequence.length - suffix;
+                while (index < sequence.length) : (index += 1) try self.tail.append(engine, self.distinct_arena.allocator(), sequence.at(index), Count.one, self.function.collect_suffix);
             }
         }
         fn retainCollection(self: *@This(), engine: *Engine, value: v.Value, weight: Count, distinct_owned: ?v.Value) !void {
@@ -4035,6 +4058,7 @@ const Engine = struct {
     /// Every intermediate interval is checked before any observer is replaced.
     /// Prefix sums retain producer order, including reversed/concatenated DAGs.
     const RangeObserver = struct {
+        collection: ?@import("range.zig").Range = null,
         support: ?*const @import("range_set.zig").Node = null,
         extrema: ?RangeExtrema = null,
         average: ?@import("arithmetic_average.zig").Sequence = null,
@@ -4700,7 +4724,30 @@ const Engine = struct {
             ordinal: u128,
             order_scope: ?Pipeline.Context = null,
             ordered_packet: bool = false,
+            encounter: ?EncounterRank = null,
             proof: ?RangeReduction = null,
+        };
+        /// Immutable rank provenance survives filters and later small windows.
+        /// A packet's first rank alone cannot order its interleaved members.
+        const EncounterRank = struct {
+            base: u128 = 0,
+            order: union(enum) {
+                common: struct { context: Pipeline.Context, source: usize, ascending: bool },
+                mapped: struct { order: *MappedOrder, segment: usize, skip: u128 },
+            },
+            fn ordinal(self: @This(), raw: i64) !u128 {
+                return self.base + switch (self.order) {
+                    .common => |known| blk: {
+                        var context = known.context;
+                        break :blk try context.rankOrdinal(raw, known.source, known.ascending);
+                    },
+                    .mapped => |known| blk: {
+                        const part = known.order.runs[known.segment].raw;
+                        const offset = @divExact(@as(i128, raw) - part.start, part.step);
+                        break :blk (try known.order.rank(try known.order.point(known.segment, @intCast(offset)))) - known.skip;
+                    },
+                };
+            }
         };
         fn cohortValues(engine: *Engine, context: *const Pipeline.Context) ![]const v.Value {
             const row = try context.render(context.firstValue().?.integer);
@@ -4856,7 +4903,8 @@ const Engine = struct {
                         const part = try engine.a.alloc(@import("range.zig").Range, 1);
                         part[0] = selection.sequence;
                         packet.context.setRanges(part);
-                        packet.ordinal = retained + try selected.rankOrdinal(selection.sequence.start, selection_index, source.step > 0);
+                        packet.encounter = .{ .base = retained, .order = .{ .common = .{ .context = selected, .source = selection_index, .ascending = source.step > 0 } } };
+                        packet.ordinal = try packet.encounter.?.ordinal(selection.sequence.start);
                         packet.ordered_packet = try selected.rankOrdinal(selection.sequence.at(selection.sequence.length - 1).integer, selection_index, source.step > 0) + 1 == packet.ordinal - retained + selection.sequence.length;
                         packet.order_scope = null;
                         try output.append(engine.a, packet);
@@ -4896,7 +4944,7 @@ const Engine = struct {
         /// Constant lexicographic prefixes partition independent affine ranks.
         /// Pagination is global, while rank selection stays proportional to the
         /// number of runs, including when an entire prefix bucket is skipped.
-        fn cohortAffineWindow(fold: *@This(), engine: *Engine, cohorts: []const RangeCohort, p: ast.Projection) !?[]RangeCohort {
+        fn cohortAffineWindow(fold: *@This(), engine: *Engine, cohorts: []const RangeCohort, p: ast.Projection, original: []const @import("range.zig").Range, ordered: bool) !?[]RangeCohort {
             const bounds = (try engine.provedPage(p)) orelse return null;
             const page: Pipeline.Context.Page = .{ .skip = bounds.skip, .limit = if (bounds.limit) |limit| limit else null };
             var prefix: usize = 0;
@@ -4909,7 +4957,7 @@ const Engine = struct {
                 }
                 prefix += 1;
             }
-            if (prefix == 0 or prefix == p.order.len) return fold.cohortAffinePage(engine, cohorts, p, page);
+            if (prefix == 0 or prefix == p.order.len) return fold.cohortAffinePage(engine, cohorts, p, page, original, ordered);
             var ranked: std.ArrayList(KeyedCohort) = .empty;
             for (cohorts) |cohort| {
                 if (cohort.context.domainLength() == 0) continue;
@@ -4942,11 +4990,12 @@ const Engine = struct {
                 }
                 var local = p;
                 local.order = p.order[prefix..];
-                const selected = (try fold.cohortAffinePage(engine, bucket, local, .{ .skip = skip, .limit = if (page.limit) |limit| limit - retained else null })) orelse return null;
+                const selected = (try fold.cohortAffinePage(engine, bucket, local, .{ .skip = skip, .limit = if (page.limit) |limit| limit - retained else null }, original, ordered)) orelse return null;
                 skip = 0;
                 var size: u128 = 0;
                 for (selected) |*cohort| {
                     cohort.ordinal += retained;
+                    if (cohort.encounter) |*encounter| encounter.base += retained;
                     size += cohort.context.domainLength();
                     try output.append(engine.a, cohort.*);
                 }
@@ -4955,7 +5004,165 @@ const Engine = struct {
             }
             return output.items;
         }
-        fn cohortAffinePage(fold: *@This(), engine: *Engine, cohorts: []const RangeCohort, p: ast.Projection, page: Pipeline.Context.Page) !?[]RangeCohort {
+        fn cohortAffinePage(fold: *@This(), engine: *Engine, cohorts: []const RangeCohort, p: ast.Projection, page: Pipeline.Context.Page, original: []const @import("range.zig").Range, ordered: bool) !?[]RangeCohort {
+            if (try fold.cohortCommonPage(engine, cohorts, p, page)) |selected| return selected;
+            if (ordered or p.order.len == 0) return null;
+            return fold.cohortMappedPage(engine, cohorts, p, page, original);
+        }
+        const MappedRun = struct { cohort: RangeCohort, raw: @import("range.zig").Range, key: @import("range.zig").Range, source_after: u128 };
+        const MappedPoint = struct { segment: usize, offset: u128, keys: []const v.Value, source: u128 };
+        const MappedOrder = struct {
+            engine: *Engine,
+            runs: []const MappedRun,
+            original: []const @import("range.zig").Range,
+            projection: ast.Projection,
+            direction: bool,
+            keys: Pipeline.Context,
+            fn point(self: *@This(), segment: usize, offset: u128) !MappedPoint {
+                const item = self.runs[segment];
+                const raw = item.raw.at(offset).integer;
+                var scope = item.cohort.order_scope orelse item.cohort.context;
+                const keys = try self.engine.a.alloc(v.Value, self.projection.order.len);
+                for (self.projection.order, keys) |order, *key| {
+                    const known = (try scope.expression(order.expression)) orelse return error.CypherInvalidBackendPage;
+                    key.* = if (known == .scalar) known.scalar else .{ .integer = std.math.cast(i64, @as(i128, known.integer.scale) * raw + known.integer.offset) orelse return error.CypherInvalidBackendPage };
+                }
+                return .{ .segment = segment, .offset = offset, .keys = keys, .source = (try sourceOrdinal(self.engine, self.original, raw, item.source_after)) orelse return error.CypherInvalidBackendPage };
+            }
+            fn less(self: *@This(), left: MappedPoint, right: MappedPoint) !bool {
+                const comparison = try self.engine.compareProjected(.{ .row = &.{}, .source = &.{}, .group = null, .keys = left.keys, .sequence = 0 }, .{ .row = &.{}, .source = &.{}, .group = null, .keys = right.keys, .sequence = 0 }, self.projection.order);
+                return if (comparison == .eq) left.source < right.source else comparison == .lt;
+            }
+            fn sort(self: *@This(), points: []MappedPoint) !void {
+                const scratch = try self.engine.a.alloc(MappedPoint, points.len);
+                var width: usize = 1;
+                while (width < points.len) : (width *= 2) {
+                    var start: usize = 0;
+                    while (start < points.len) : (start += width * 2) {
+                        const middle = @min(start + width, points.len);
+                        const end = @min(middle + width, points.len);
+                        try Engine.chargeWork(self.engine, end - start);
+                        var left = start;
+                        var right = middle;
+                        for (scratch[start..end]) |*target| {
+                            const before = right == end or (left < middle and !try self.less(points[right], points[left]));
+                            target.* = points[if (before) left else right];
+                            if (before) left += 1 else right += 1;
+                        }
+                    }
+                    @memcpy(points, scratch);
+                }
+            }
+            fn keyOffset(segment: MappedRun, key: i64) ?u128 {
+                const distance = @as(i128, key) - segment.key.start;
+                if (@rem(distance, segment.key.step) != 0) return null;
+                const result = @divTrunc(distance, segment.key.step);
+                return if (result >= 0 and result < segment.key.length) @intCast(result) else null;
+            }
+            fn prefix(self: *@This(), amount: u128) ![]u128 {
+                const counts = try self.keys.rankPrefix(self.direction, amount);
+                if (amount == 0 or amount >= self.keys.domainLength()) return counts;
+                var boundary: ?i64 = null;
+                for (self.runs, counts) |segment, size| if (size != 0) {
+                    const key = segment.key.at(size - 1).integer;
+                    if (boundary == null or (if (self.direction) key > boundary.? else key < boundary.?)) boundary = key;
+                };
+                var ties: std.ArrayList(MappedPoint) = .empty;
+                var included: usize = 0;
+                for (self.runs, counts, 0..) |segment, *size, index| if (keyOffset(segment, boundary.?)) |position| {
+                    if (size.* > position) {
+                        size.* -= 1;
+                        included += 1;
+                    }
+                    try ties.append(self.engine.a, try self.point(index, position));
+                };
+                try self.sort(ties.items);
+                for (ties.items[0..included]) |tie| counts[tie.segment] += 1;
+                return counts;
+            }
+            fn rank(self: *@This(), target: MappedPoint) !u128 {
+                const key = self.runs[target.segment].key.at(target.offset).integer;
+                var result = try self.keys.rankBefore(key, self.direction);
+                for (self.runs, 0..) |segment, index| if (keyOffset(segment, key)) |position| {
+                    if (try self.less(try self.point(index, position), target)) result += 1;
+                };
+                return result;
+            }
+        };
+        /// Rank monotone transformed keys rather than requiring equal affine
+        /// coefficients. Boundary ties use the entire ORDER BY tuple and exact
+        /// source ordinals; SKIP never enumerates the skipped prefix.
+        fn cohortMappedPage(fold: *@This(), engine: *Engine, cohorts: []const RangeCohort, p: ast.Projection, page: Pipeline.Context.Page, original: []const @import("range.zig").Range) !?[]RangeCohort {
+            _ = fold;
+            var runs: std.ArrayList(MappedRun) = .empty;
+            var keys: std.ArrayList(@import("range.zig").Range) = .empty;
+            const direction = !p.order[0].descending;
+            for (cohorts) |cohort| {
+                var scope = cohort.order_scope orelse cohort.context;
+                const known = (try scope.expression(p.order[0].expression)) orelse return null;
+                if (known != .integer or known.integer.scale == 0) return null;
+                var after: u128 = 0;
+                for (cohort.context.ranges()) |part| {
+                    if (part.length == 0) continue;
+                    const source = (try sourceOrdinal(engine, original, part.start, after)) orelse return null;
+                    after = ((try sourceOrdinal(engine, original, part.at(part.length - 1).integer, source)) orelse return null) + 1;
+                    var raw = part;
+                    const observation = (try engine.observeRangeForm(part, known.integer)) orelse return null;
+                    var key = observation.support.?.leaf.sequence;
+                    if (key.length > 1 and (key.step > 0) != direction) {
+                        key.start = key.at(key.length - 1).integer;
+                        key.step = std.math.negate(key.step) catch return null;
+                        raw.start = raw.at(raw.length - 1).integer;
+                        raw.step = std.math.negate(raw.step) catch return null;
+                    }
+                    try runs.append(engine.a, .{ .cohort = cohort, .raw = raw, .key = key, .source_after = source });
+                    try keys.append(engine.a, key);
+                }
+            }
+            if (runs.items.len == 0) return try engine.a.alloc(RangeCohort, 0);
+            var context = runs.items[0].cohort.context;
+            context.setRanges(keys.items);
+            const order = try engine.a.create(MappedOrder);
+            order.* = .{ .engine = engine, .runs = runs.items, .original = original, .projection = p, .direction = direction, .keys = context };
+            const length = context.domainLength();
+            const skip = @min(page.skip, length);
+            const keep = @min(page.limit orelse length, length - skip);
+            const first = try order.prefix(skip);
+            const last = try order.prefix(skip + keep);
+            var output: std.ArrayList(RangeCohort) = .empty;
+            if (keep <= 128) {
+                var points: std.ArrayList(MappedPoint) = .empty;
+                for (first, last, 0..) |start, end, index| {
+                    var position = start;
+                    while (position < end) : (position += 1) try points.append(engine.a, try order.point(index, position));
+                }
+                try order.sort(points.items);
+                for (points.items, 0..) |point, ordinal| {
+                    var packet = runs.items[point.segment].cohort;
+                    const part = try engine.a.alloc(@import("range.zig").Range, 1);
+                    part[0] = .{ .start = runs.items[point.segment].raw.at(point.offset).integer, .step = 1, .length = 1 };
+                    packet.context.setRanges(part);
+                    packet.ordinal = ordinal;
+                    packet.encounter = null;
+                    packet.ordered_packet = true;
+                    packet.order_scope = null;
+                    try output.append(engine.a, packet);
+                }
+            } else for (runs.items, first, last, 0..) |segment, start, end, index| {
+                if (start == end) continue;
+                var packet = segment.cohort;
+                const part = try engine.a.alloc(@import("range.zig").Range, 1);
+                part[0] = .{ .start = segment.raw.at(start).integer, .step = segment.raw.step, .length = end - start };
+                packet.context.setRanges(part);
+                packet.encounter = .{ .order = .{ .mapped = .{ .order = order, .segment = index, .skip = skip } } };
+                packet.ordinal = try packet.encounter.?.ordinal(part[0].start);
+                packet.ordered_packet = try order.rank(try order.point(index, end - 1)) + 1 == packet.ordinal + skip + part[0].length;
+                packet.order_scope = null;
+                try output.append(engine.a, packet);
+            }
+            return output.items;
+        }
+        fn cohortCommonPage(fold: *@This(), engine: *Engine, cohorts: []const RangeCohort, p: ast.Projection, page: Pipeline.Context.Page) !?[]RangeCohort {
             _ = fold;
             var ascending: ?bool = null;
             for (p.order) |order| {
@@ -5000,7 +5207,8 @@ const Engine = struct {
                 const part = try engine.a.alloc(@import("range.zig").Range, 1);
                 part[0] = selection.sequence;
                 cohort.context.setRanges(part);
-                cohort.ordinal = try context.rankOrdinal(selection.sequence.start, selection_index, direction);
+                cohort.encounter = .{ .order = .{ .common = .{ .context = context, .source = selection_index, .ascending = direction } } };
+                cohort.ordinal = try cohort.encounter.?.ordinal(selection.sequence.start);
                 cohort.ordered_packet = try context.rankOrdinal(selection.sequence.at(selection.sequence.length - 1).integer, selection_index, direction) + 1 == cohort.ordinal + selection.sequence.length;
                 cohort.order_scope = null;
             }
@@ -5010,7 +5218,7 @@ const Engine = struct {
             var length: u128 = 0;
             for (cohorts) |cohort| length += cohort.context.domainLength();
             if (length > 128) {
-                if (try fold.cohortAffineWindow(engine, cohorts, p)) |ranked| return ranked;
+                if (try fold.cohortAffineWindow(engine, cohorts, p, ranges, ordered)) |ranked| return ranked;
                 return fold.cohortBagWindow(engine, cohorts, p, ranges, ordered);
             }
             const page = (try engine.provedPage(p)) orelse return null;
@@ -5026,7 +5234,7 @@ const Engine = struct {
                         selected[0] = .{ .start = raw, .step = 1, .length = 1 };
                         var point = cohort;
                         point.context.setRanges(selected);
-                        point.ordinal = if (ordered) cohort.ordinal else (try sourceOrdinal(engine, ranges, raw, after)) orelse return null;
+                        point.ordinal = if (ordered) (if (cohort.encounter) |encounter| try encounter.ordinal(raw) else cohort.ordinal) else (try sourceOrdinal(engine, ranges, raw, after)) orelse return null;
                         after = point.ordinal + 1;
                         try points.append(engine.a, point);
                     }
@@ -5059,6 +5267,8 @@ const Engine = struct {
             for (ranked.items[start..end], output, 0..) |item, *cohort, sequence| {
                 cohort.* = item.cohort;
                 cohort.ordinal = sequence;
+                cohort.encounter = null;
+                cohort.ordered_packet = true;
                 cohort.order_scope = null;
             }
             return output;
@@ -5166,7 +5376,7 @@ const Engine = struct {
                     if (program.end != stage + 1) return false;
                     cohort.context = program.context;
                     if (cohort.context.domainLength() == 0) continue;
-                    if (!ordered) cohort.ordinal = (try sourceOrdinal(engine, ranges, cohort.context.firstValue().?.integer, 0)) orelse return false;
+                    if (!ordered) cohort.ordinal = (try sourceOrdinal(engine, ranges, cohort.context.firstValue().?.integer, 0)) orelse return false else if (cohort.encounter) |encounter| cohort.ordinal = try encounter.ordinal(cohort.context.firstValue().?.integer);
                     if (clause.operation == .project and clause.operation.project.value.order.len != 0) {
                         var key_scope = if (clause.operation.project.value.distinct) cohort.context else try before.overlay(cohort.context.bindings);
                         key_scope.setRanges(cohort.context.ranges());
@@ -5265,7 +5475,12 @@ const Engine = struct {
                 if (specification.args.len != 1 or specification.star) return null;
                 if (std.ascii.eqlIgnoreCase(specification.name, "collect") and (specification.distinct or context.domainLength() == 1 or boundedCollection(specification))) {
                     const known = (try context.expression(specification.args[0])) orelse return null;
-                    if (known == .integer and known.integer.scale != 0) return null;
+                    if (known == .integer and known.integer.scale != 0) {
+                        if (specification.distinct or !boundedCollection(specification) or !fold.weight.isOne()) return null;
+                        form.* = known.integer;
+                        slot.* = true;
+                        continue;
+                    }
                     if (known == .scalar and (!primitive(known.scalar) or (known.scalar == .number and !std.math.isFinite(known.scalar.number)))) return null;
                     continue;
                 }
@@ -5289,8 +5504,9 @@ const Engine = struct {
             for (context.ranges(), packets) |part, *packet| {
                 const observations = try engine.a.alloc(?RangeObserver, fold.calls.len);
                 @memset(observations, null);
-                for (forms, observations) |form, *observation| if (form) |known| {
+                for (forms, observations, fold.calls) |form, *observation, call_value| if (form) |known| {
                     observation.* = (try engine.observeRangeForm(part, known)) orelse return null;
+                    if (part.length != 0 and std.ascii.eqlIgnoreCase(call_value.value.call.name, "collect")) observation.*.?.collection = observation.*.?.support.?.leaf.sequence;
                 };
                 packet.* = observations;
             }
@@ -5810,7 +6026,8 @@ const Engine = struct {
             if (fold.record_rows) fold.matched.* +|= @as(usize, @intCast(fold.weight.cap(std.math.maxInt(usize))));
             if (fold.top.*) |*top| {
                 try top.addWeighted(row, fold.weight);
-                if (fold.projection.limit != null and fold.projection.order.len == 0 and top.capacity != 0 and top.total == top.capacity) return error.CypherStreamComplete;
+                const ordered_input = if (engine.node_order) |order| order.active and engine.stream_fold == fold else false;
+                if (fold.projection.limit != null and (fold.projection.order.len == 0 or ordered_input) and top.capacity != 0 and top.total == top.capacity) return error.CypherStreamComplete;
                 return;
             }
             if (fold.group_window != null and fold.calls.len != 0) {
@@ -5952,6 +6169,13 @@ const Engine = struct {
                     continue;
                 };
                 if (fold.range_counts) |slots| if (slots[i]) {
+                    if (std.ascii.eqlIgnoreCase(accumulator.function.name, "collect")) {
+                        accumulator.addRangeCollection(engine, fold.range_observers.?[i].?.collection.?) catch |err| {
+                            if (!fold.defer_aggregates or !StreamingAggregate.consumerFailure(err)) return err;
+                            accumulator.failure = err;
+                        };
+                        continue;
+                    }
                     if (std.ascii.eqlIgnoreCase(accumulator.function.name, "avg") and !accumulator.function.distinct) {
                         accumulator.addAverageSequence(engine, fold.range_observers.?[i].?.average.?) catch |err| {
                             if (!fold.defer_aggregates or !StreamingAggregate.consumerFailure(err)) return err;
@@ -6362,6 +6586,10 @@ const Engine = struct {
                 else => false,
             },
             .comparison => |c| blk: {
+                for (c.operators) |operator| switch (operator) {
+                    .eq, .neq, .lt, .lte, .gt, .gte, .starts_with, .ends_with, .contains => {},
+                    else => break :blk false,
+                };
                 for (c.operands) |operand| if (!self.totalExpression(operand, shape)) break :blk false;
                 break :blk true;
             },
@@ -7154,6 +7382,10 @@ const Engine = struct {
             self.cache_reads = previous_cache;
             if (!previous_cache) self.read_nodes = previous_reads;
         }
+        var node_order = if (input.len == 1 and continuation == null and consumer == null and (input_weights == null or input_weights.?[0].isOne())) try self.planNodeOrder(input, operation, projection, middle) else null;
+        const previous_node_order = self.node_order;
+        self.node_order = if (node_order) |*order| order else null;
+        defer self.node_order = previous_node_order;
         var calls: reduction_plan.Calls = .{};
         if (grouped) {
             if (projection.wildcard) return null;
@@ -9430,9 +9662,61 @@ const Engine = struct {
         }
     }
 
+    fn planNodeOrder(self: *Engine, input: []const Row, operation: ast.Match, projection: ast.Projection, middle: []const ast.Clause) !?NodeOrder {
+        // An ordinary empty scan may finish without spending an anchor. A
+        // certificate cannot assume a zero-budget source is nonempty.
+        if (self.stats.scanned_anchors >= self.limits.scanned_anchors) return null;
+        if (!self.read_only or self.backend.vtable.scan_ordered == null or input.len != 1 or middle.len != 0 or operation.optional or operation.paths.len != 1 or projection.distinct or projection.wildcard or projection.predicate != null or projection.order.len == 0 or projection.order.len > 32 or projection.limit == null) return null;
+        const path = operation.paths[0];
+        if (path.edges.len != 0 or path.alias != null or path.selector != .all) return null;
+        const node = path.nodes[0];
+        const alias = node.alias orelse return null;
+        if (lookup(input[0], alias) != null) return null;
+        // ORDER BY evaluates in the projected scope. A result alias may
+        // replace the source node with a scalar or map, invalidating a native
+        // certificate for properties of that node.
+        for (projection.items) |item| if (item.alias) |name| if (std.mem.eql(u8, name, alias)) return null;
+        const shape = try self.pathShape(path, input[0]);
+        if (operation.predicate) |predicate| if (!self.totalPredicate(predicate, shape)) return null;
+        for (node.properties) |entry| if (self.constant(entry.value, input[0]) == null) return null;
+        for (projection.items) |item| if (!self.totalExpression(item.expression, shape)) return null;
+        var table: ?[]const u8 = null;
+        for (self.graph.labels, 0..) |label, index| if (self.firstTableLabel(index, node)) {
+            if (table) |known| {
+                if (!std.mem.eql(u8, known, label.table)) return null;
+            } else table = label.table;
+        };
+        const fields = try self.a.alloc(backend_mod.PropertyOrder, projection.order.len);
+        for (projection.order, fields) |order, *field| {
+            var expression = order.expression;
+            if (expression.value == .variable) for (projection.items) |item| {
+                if (item.alias) |name| if (std.mem.eql(u8, name, expression.value.variable)) {
+                    expression = item.expression;
+                    break;
+                };
+            };
+            if (expression.value != .property or expression.value.property.base.value != .variable or !std.mem.eql(u8, expression.value.property.base.value.variable, alias)) return null;
+            field.* = .{ .property = expression.value.property.name, .descending = order.descending };
+        }
+        return .{ .table = table orelse return null, .alias = alias, .fields = fields };
+    }
     fn scanNodes(self: *Engine, table: []const u8, first: ast.Node, predicate: ?*const ast.Expr, row: Row, cursor: ?[]const u8, demand: usize) !backend_mod.Page(*const v.Node) {
         const bounded_demand = @min(demand, @max(@as(usize, 1), self.limits.scanned_anchors -| self.stats.scanned_anchors));
         if (self.lookup) |lookup_plan| if (lookup_plan.complete and std.mem.eql(u8, lookup_plan.table, table)) return lookup_plan.cachedPage(self, cursor, bounded_demand);
+        if (self.node_order) |order| if (!order.declined and std.mem.eql(u8, order.table, table) and first.alias != null and std.mem.eql(u8, order.alias, first.alias.?)) {
+            const read = self.backend.vtable.scan_ordered orelse return error.CypherInvalidBackendPage;
+            var filters: std.ArrayList(backend_mod.PropertyFilter) = .empty;
+            try self.labelFilters(first, &filters);
+            for (first.properties) |property| if (self.constant(property.value, row)) |value| try filters.append(self.a, .{ .property = property.name, .value = value });
+            if (predicate) |expression| try self.predicateFilters(expression, order.alias, row, &filters);
+            const wanted = if (self.stream_fold) |fold| if (fold.top.*) |top| @min(bounded_demand, top.capacity -| top.total) else bounded_demand else bounded_demand;
+            if (try read(self.backend.ptr, self.a, table, filters.items, order.fields, cursor, @max(1, wanted), self.limits.scanned_anchors -| self.stats.scanned_anchors)) |page| {
+                order.active = true;
+                return page;
+            }
+            if (order.active or cursor != null) return error.CypherInvalidBackendPage;
+            order.declined = true;
+        };
         if (self.backend.vtable.scan_where) |scan_where| {
             var filters: std.ArrayList(backend_mod.PropertyFilter) = .empty;
             try self.labelFilters(first, &filters);
@@ -9461,14 +9745,32 @@ const Engine = struct {
         if (keyCall(operands[1], name)) return self.constant(operands[0], row);
         return null;
     }
+    const AnchorKey = struct { table: ?[]const u8 = null, key: []const u8 };
+    fn identityCall(expression: *const ast.Expr, alias: []const u8) bool {
+        if (expression.value != .call) return false;
+        const call_value = expression.value.call;
+        return std.ascii.eqlIgnoreCase(call_value.name, "elementId") and call_value.args.len == 1 and call_value.args[0].value == .variable and std.mem.eql(u8, call_value.args[0].value.variable, alias);
+    }
+    fn appendAnchorKey(self: *Engine, keys: *std.ArrayList(AnchorKey), value: v.Value, qualified: bool) !void {
+        if (value != .string) return;
+        if (!qualified) return keys.append(self.a, .{ .key = value.string });
+        try Engine.chargeWork(self, 1 + value.string.len / 64);
+        const Identity = struct { kind: []const u8, table: []const u8, key: []const u8 };
+        const identity = std.json.parseFromSliceLeaky(Identity, self.a, value.string, .{ .allocate = .alloc_always }) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return, // No node can emit an invalid element identity.
+        };
+        if (!std.mem.eql(u8, identity.kind, "node")) return;
+        try keys.append(self.a, .{ .table = identity.table, .key = identity.key });
+    }
     /// A finite necessary key domain. Residual predicates still run on every
     /// authorized point read. An OR is finite only when both arms are finite.
-    fn anchorKeys(self: *Engine, predicate: ?*const ast.Expr, alias: ?[]const u8, row: Row) anyerror!?[]const v.Value {
-        var keys: std.ArrayList(v.Value) = .empty;
+    fn anchorKeys(self: *Engine, predicate: ?*const ast.Expr, alias: ?[]const u8, row: Row) anyerror!?[]const AnchorKey {
+        var keys: std.ArrayList(AnchorKey) = .empty;
         if (!try self.collectAnchorKeys(predicate orelse return null, alias orelse return null, row, &keys, 0)) return null;
         return keys.items;
     }
-    fn collectAnchorKeys(self: *Engine, expression: *const ast.Expr, alias: []const u8, row: Row, keys: *std.ArrayList(v.Value), depth: usize) anyerror!bool {
+    fn collectAnchorKeys(self: *Engine, expression: *const ast.Expr, alias: []const u8, row: Row, keys: *std.ArrayList(AnchorKey), depth: usize) anyerror!bool {
         if (depth >= @min(64, self.limits.recursion_depth)) return false;
         try self.state();
         const start = keys.items.len;
@@ -9486,7 +9788,7 @@ const Engine = struct {
             }
         }
         if (self.anchorKey(expression, alias, row)) |key| {
-            try keys.append(self.a, key);
+            try self.appendAnchorKey(keys, key, false);
             finite = true;
             return true;
         }
@@ -9495,11 +9797,21 @@ const Engine = struct {
             .comparison => |chain| if (chain.operands.len == 2 and chain.operators.len == 1) .{ .left = chain.operands[0], .right = chain.operands[1], .op = chain.operators[0] } else return false,
             else => return false,
         };
-        if (pair.op != .in or !keyCall(pair.left, alias)) return false;
+        const qualified = identityCall(pair.left, alias);
+        if (pair.op == .eq) {
+            const left = identityCall(pair.left, alias);
+            const right = identityCall(pair.right, alias);
+            if (!left and !right) return false;
+            const value = self.constant(if (left) pair.right else pair.left, row) orelse return false;
+            try self.appendAnchorKey(keys, value, true);
+            finite = true;
+            return true;
+        }
+        if (pair.op != .in or (!keyCall(pair.left, alias) and !qualified)) return false;
         if (pair.right.value == .list) {
             for (pair.right.value.list) |item| {
                 try self.state();
-                try keys.append(self.a, self.constant(item, row) orelse return false);
+                try self.appendAnchorKey(keys, self.constant(item, row) orelse return false, qualified);
             }
             finite = true;
             return true;
@@ -9508,7 +9820,7 @@ const Engine = struct {
         switch (source) {
             .list => {
                 try Engine.chargeWork(self, source.list.len);
-                try keys.appendSlice(self.a, source.list);
+                for (source.list) |item| try self.appendAnchorKey(keys, item, qualified);
             },
             .null => {},
             else => return false, // Preserve the ordinary non-list type error.
@@ -9567,24 +9879,24 @@ const Engine = struct {
             return;
         };
         if (try self.anchorKeys(predicate, first.alias, input.row)) |candidates| {
-            var unique: std.StringHashMapUnmanaged(void) = .empty;
-            var keys: std.ArrayList([]const u8) = .empty;
-            for (candidates) |key| {
-                try self.state();
-                if (key != .string) continue;
-                if ((try unique.getOrPut(self.a, key.string)).found_existing) continue;
-                try keys.append(self.a, key.string);
-            }
-            std.mem.sort([]const u8, keys.items, {}, struct {
-                fn less(_: void, left: []const u8, right: []const u8) bool {
-                    return std.mem.lessThan(u8, left, right);
-                }
-            }.less);
             var tables: std.StringHashMapUnmanaged(void) = .empty;
             for (self.graph.labels) |label| {
                 if (first.labels.len > 0 and !std.mem.eql(u8, first.labels[0], label.name)) continue;
                 const entry = try tables.getOrPut(self.a, label.table);
                 if (entry.found_existing) continue;
+                var unique: std.StringHashMapUnmanaged(void) = .empty;
+                var keys: std.ArrayList([]const u8) = .empty;
+                for (candidates) |key| {
+                    try self.state();
+                    if (key.table) |table| if (!std.mem.eql(u8, table, label.table)) continue;
+                    if ((try unique.getOrPut(self.a, key.key)).found_existing) continue;
+                    try keys.append(self.a, key.key);
+                }
+                std.mem.sort([]const u8, keys.items, {}, struct {
+                    fn less(_: void, left: []const u8, right: []const u8) bool {
+                        return std.mem.lessThan(u8, left, right);
+                    }
+                }.less);
                 var offset: usize = 0;
                 while (offset < keys.items.len) {
                     try self.checkpoint();

@@ -57,7 +57,7 @@ pub fn Host(comptime DB: type) type {
             proofs: []const tracking.Proof = &.{},
             next_entity: u64 = 0,
             pub fn pinnedBackend(self: *Statement) cypher.backend.Backend {
-                return .{ .ptr = self, .vtable = &.{ .bind = pinnedBind, .checkpoint = checkpoint, .scan = pinnedScan, .scan_where = pinnedScanWhere, .estimate_where = pinnedEstimateWhere, .get = pinnedGet, .expand = pinnedExpand, .expand_between = pinnedExpandBetween, .set_work = pinnedWork, .set_read_fields = pinnedReadFields, .normalize_node = normalize, .document_relationships = documentRelationships } };
+                return .{ .ptr = self, .vtable = &.{ .bind = pinnedBind, .checkpoint = checkpoint, .scan = pinnedScan, .scan_where = pinnedScanWhere, .scan_ordered = pinnedScanOrdered, .estimate_where = pinnedEstimateWhere, .get = pinnedGet, .expand = pinnedExpand, .expand_between = pinnedExpandBetween, .set_work = pinnedWork, .set_read_fields = pinnedReadFields, .normalize_node = normalize, .document_relationships = documentRelationships } };
             }
             fn pinnedBind(ptr: *anyopaque, a: A, graph: cypher.catalog.Graph) !void {
                 const backend = cast(ptr).adapter.backend();
@@ -74,6 +74,10 @@ pub fn Host(comptime DB: type) type {
             fn pinnedScan(ptr: *anyopaque, a: A, table: []const u8, after: ?[]const u8, limit: usize) !cypher.backend.Page(*const cypher.value.Node) {
                 const backend = cast(ptr).adapter.backend();
                 return backend.vtable.scan(backend.ptr, a, table, after, limit);
+            }
+            fn pinnedScanOrdered(ptr: *anyopaque, a: A, table: []const u8, filters: []const cypher.backend.PropertyFilter, order: []const cypher.backend.PropertyOrder, after: ?[]const u8, limit: usize, max_examined: usize) !?cypher.backend.Page(*const cypher.value.Node) {
+                const backend = cast(ptr).adapter.backend();
+                return backend.vtable.scan_ordered.?(backend.ptr, a, table, filters, order, after, limit, max_examined);
             }
             fn pinnedScanWhere(ptr: *anyopaque, a: std.mem.Allocator, table: []const u8, filters: []const cypher.backend.PropertyFilter, after: ?[]const u8, limit: usize) !cypher.backend.Page(*const cypher.value.Node) {
                 const backend = cast(ptr).adapter.backend();
@@ -229,7 +233,7 @@ pub fn Host(comptime DB: type) type {
             statement.pinned = .{ .source = self.root, .core = self.root.core, .cut = try self.root.captureCypherPinnedSnapshot(owned, &fence, graph, self.table) };
             defer statement.pinned.cut.deinit();
             for (graph.labels, statement.tables) |label, *table| table.* = .{ .name = label.table, .db = &statement.pinned };
-            statement.adapter = .{ .tables = statement.tables, .ttl_now_ns = statement.pinned.cut.now, .authority = .{ .ptr = &statement, .bind = Statement.bind, .checkpoint = Statement.checkpoint, .project = Statement.project, .project_relationship = Statement.projectRelationship } };
+            statement.adapter = .{ .tables = statement.tables, .ttl_now_ns = statement.pinned.cut.now, .authority = .{ .ptr = &statement, .bind = Statement.bind, .checkpoint = Statement.checkpoint, .project = Statement.project, .project_relationship = Statement.projectRelationship, .ordered_projection = true } };
             if (writes) {
                 var txn = try self.root.core.store.beginReadTxn();
                 defer txn.abort();

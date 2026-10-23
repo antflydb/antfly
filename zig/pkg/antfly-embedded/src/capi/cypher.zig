@@ -137,7 +137,7 @@ pub const Read = struct {
             } else return error.CatalogGenerationChanged;
             table.* = .{ .name = label.table, .storage_name = try @import("tables.zig").storageName(self.handle, label.table), .db = owner };
         }
-        self.pinned_adapter = .{ .tables = tables, .ttl_now_ns = now, .authority = .{ .ptr = self, .bind = bind, .checkpoint = checkpoint, .project = project, .project_relationship = projectRelationship } };
+        self.pinned_adapter = .{ .tables = tables, .ttl_now_ns = now, .authority = .{ .ptr = self, .bind = bind, .checkpoint = checkpoint, .project = project, .project_relationship = projectRelationship, .ordered_projection = true } };
         self.pinned = pinned[0..initialized];
     }
     pub fn unpin(self: *Read) void {
@@ -147,7 +147,7 @@ pub const Read = struct {
         self.pin_arena = null;
     }
     pub fn pinnedBackend(self: *Read) cypher.backend.Backend {
-        return .{ .ptr = self, .vtable = &.{ .bind = pinnedBind, .checkpoint = checkpoint, .scan = pinnedScan, .scan_where = pinnedScanWhere, .estimate_where = pinnedEstimateWhere, .get = pinnedGet, .expand = pinnedExpand, .expand_between = pinnedExpandBetween, .set_work = pinnedWork, .set_read_fields = pinnedReadFields, .normalize_node = normalize, .document_relationships = documentRelationships } };
+        return .{ .ptr = self, .vtable = &.{ .bind = pinnedBind, .checkpoint = checkpoint, .scan = pinnedScan, .scan_where = pinnedScanWhere, .scan_ordered = pinnedScanOrdered, .estimate_where = pinnedEstimateWhere, .get = pinnedGet, .expand = pinnedExpand, .expand_between = pinnedExpandBetween, .set_work = pinnedWork, .set_read_fields = pinnedReadFields, .normalize_node = normalize, .document_relationships = documentRelationships } };
     }
     fn pinnedBind(ptr: *anyopaque, a: A, graph: cypher.catalog.Graph) !void {
         const backend = cast(ptr).pinned_adapter.backend();
@@ -164,6 +164,10 @@ pub const Read = struct {
     fn pinnedScan(ptr: *anyopaque, a: A, table: []const u8, after: ?[]const u8, limit: usize) !cypher.backend.Page(*const cypher.value.Node) {
         const backend = cast(ptr).pinned_adapter.backend();
         return backend.vtable.scan(backend.ptr, a, table, after, limit);
+    }
+    fn pinnedScanOrdered(ptr: *anyopaque, a: A, table: []const u8, filters: []const cypher.backend.PropertyFilter, order: []const cypher.backend.PropertyOrder, after: ?[]const u8, limit: usize, max_examined: usize) !?cypher.backend.Page(*const cypher.value.Node) {
+        const backend = cast(ptr).pinned_adapter.backend();
+        return backend.vtable.scan_ordered.?(backend.ptr, a, table, filters, order, after, limit, max_examined);
     }
     fn pinnedScanWhere(ptr: *anyopaque, a: A, table: []const u8, filters: []const cypher.backend.PropertyFilter, after: ?[]const u8, limit: usize) !cypher.backend.Page(*const cypher.value.Node) {
         const backend = cast(ptr).pinned_adapter.backend();
