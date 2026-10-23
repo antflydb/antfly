@@ -4718,3 +4718,42 @@ Windows CLI cross-compilation and the Apache boundary pass. Relevant query/stora
 source hashes and macOS/Linux CLI bytes match the qualified build. Native server
 integration and timings remain pinned to the recorded `9ca2e6e28f` build; the
 compact report distinguishes this final targeted validation.
+
+
+The generic conditional-source follow-up (`611a4ce4ca`, main merged through
+`c1bc94b174`) uses an explicit canonicalization ABI with fixed compatibility
+vectors, collects identities during directory publication, and batches owned
+metadata within one pinned transaction. Equal omission masks share byte-bounded
+source reads. Admission accounts for coalesced range retention or full primary
+sizes according to backend capabilities; each subwindow closes its scope before
+the next opens. One large row can progress, and point reads reuse their metadata
+scope. CLI shape buckets fetch concurrently through the existing worker pool,
+with proportional reservations under one page-memory budget.
+
+The [generic qualification](bench/results/grep-generic-conditional-summary.json)
+records six client controls and thirteen native cases: ASCII, escaped/Unicode,
+numeric, wide, opaque, small and mixed values; 1/8/64 rows; and exact, parent,
+wildcard and exclusion masks. Native cases use five alternating trials and ten
+individually timed reads per phase, with parsing outside timings and every
+response checked. Ordinary reads and fallback layouts are controls, not omitted
+from the results. Raw reports/logs are local and unpublished under `output/`.
+
+Mixed-shape client requests fall from 10 to 4; dense warm-image requests fall
+from 18 to 12. Warm client CPU/latency improve in these fixtures, while tiny cold
+client CPU can increase. Native gains are modest and uneven: eight-row ASCII
+conditional delivery is 1.086 → 0.983 ms; the single-row control is 0.662 →
+0.738 ms and mixed exact delivery is 1.350 → 1.490 ms. These are workload and
+host-dependent tradeoffs, not a universal throughput, memory or zero-cost claim.
+Native caches are warm; the Linux VM shares the Mac host and has two CPUs/1 GiB.
+The report preserves all medians, binary/corpus hashes and reproduction commands.
+
+Final checks pass: 287 macOS CLI cases plus two skips; 286 Linux VM CLI cases
+plus three skips; 149 query, 18 identity/storage and 94 logical-field contracts
+(one skip, zero leaks). The eighteen focused storage tests also pass in the
+Linux VM, including full-value range adapters, scope retirement, mixed masks,
+large-row progress and cancellation/allocation failures. Build them portably
+with `zig build source-value-identity-test-build -Dtarget=aarch64-linux-gnu`
+from `zig/`. All 28 real-server indexed tests pass (seven opt-in benchmark skips),
+including persisted certificate upgrade from the previous server. Windows CLI
+cross-compilation, compatibility/storage discovery and the Apache boundary pass.
+The final source rebuild produces the same qualified native binary hash.
