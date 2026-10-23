@@ -1280,6 +1280,47 @@ class RuntimeCacheTest(unittest.TestCase):
                 finally:
                     tests.write_text(contents)
 
+    def test_inference_stripped_memory_admission(self):
+        settings = (
+            "-Dtarget=x86_64-linux-gnu",
+            "-Dcpu=baseline",
+            "-Doptimize=fast",
+            "-Dstrip=true",
+        )
+        for standalone in (False, True):
+            with self.subTest(standalone=standalone):
+                if standalone:
+                    self.use_standalone()
+                shutil.copyfile(
+                    ZIG_ROOT / "tools/fixtures/inference_memory.zig",
+                    self.build_directory / "build.zig",
+                )
+                shutil.copyfile(
+                    ZIG_ROOT / "tools/fixtures/build_profiles.zig",
+                    self.build_directory / "cache_profiles.zig",
+                )
+                self.build("cache-inference-memory", settings=settings)
+                if not standalone:
+                    source = self.own("zig/build_support/antfly/dependencies.zig")
+                    original = source.read_text()
+                    anchor = ".strip = strip,\n        .paths = inference_config.paths,"
+                    self.assertIn(anchor, original)
+                    source.write_text(
+                        original.replace(anchor, anchor.replace("= strip,", "= false,"))
+                    )
+                    try:
+                        failure = self.build(
+                            "cache-inference-memory", settings=settings, succeeds=False
+                        )
+                        # Unordered graph traversal can encounter either inflated
+                        # claim first on native Linux; both diagnose this handoff.
+                        self.assertRegex(
+                            failure,
+                            r"(?:stripped inference CLI|native stripped HTTP server) over-reserved",
+                        )
+                    finally:
+                        source.write_text(original)
+
     def test_vopr_workflow_memory_admission(self):
         shutil.copyfile(
             ZIG_ROOT / "tools/fixtures/vopr_memory.zig", self.root / "zig/build.zig"

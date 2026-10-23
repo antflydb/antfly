@@ -299,11 +299,23 @@ native full CLI leaves 9.5 GiB for concurrent steps inside the existing
 22 GiB aggregate build budget. Model CI uses the HTTP target's independent
 reservation rather than inheriting this development-CLI claim.
 
-The root build forwards `strip` into its inference workflow context; the
-field is required so another wrapper cannot silently retain debug information
-against the requested profile. Native HTTP admission is qualified separately
-with baseline CPU, ReleaseFast and explicit stripping. Its measured claim
-must fit beside two 8 GiB steps within the existing 22 GiB aggregate budget.
+The root build forwards `strip` into its inference workflow context. The
+field is required so memory-profile selection stays consistent with the
+final graph's stripping policy. Regression probes audit both root and
+standalone declarations and reject a deliberately broken handoff.
+
+At `62475010b7`, the native x86_64 GNU HTTP-only compiler step succeeded in
+30 minutes (30:51.51 for the build, including helper steps) with a peak of
+3,100,064 KiB / 3,174,465,536 bytes / 2.96 GiB. It used the same pinned
+Nix/glibc Zig, baseline CPU, CPU-only ReleaseFast, and explicit stripping.
+The product compiler ran cold; generated assets were reused. GNU time
+reported 100% CPU and no swaps. Its 3,840 MiB / 3.75 GiB reservation is the
+peak plus 25%, rounded up to 64 MiB. Two 8 GiB steps plus this claim consume
+19.75 GiB of the existing 22 GiB budget, leaving 2.25 GiB for smaller steps.
+A subsequent real build admits under a 4 GiB budget and reuses the measured
+artifact after the context fix. The reduction applies only to the measured
+native Linux, baseline CPU, stripped ReleaseFast profile; other HTTP
+profiles keep their existing claims.
 
 The stripped HTTP executable also passes all 25 speech E2E cases locally;
 public CLI configuration contracts continue testing the Debug product.
