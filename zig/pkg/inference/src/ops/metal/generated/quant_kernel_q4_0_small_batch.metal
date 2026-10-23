@@ -34,18 +34,17 @@ inline float antfly_q4_0_dequant_lane_v2(device const uchar *block, int lane) {
     int v5 = int(block[v4]);
     int v6 = 16;
     int v7 = v0 < v6;
-    int v8 = 15;
-    int v9 = v5 & v8;
-    int v10 = 4;
-    int v11 = int(uint(v5) >> v10);
-    int v12 = v7 ? v9 : v11;
-    int v13 = 8;
-    int v14 = v12 - v13;
-    int v15 = 0;
-    float v16 = antfly_qk_half_le_to_float(block + v15);
-    float v17 = float(v14);
-    float v18 = v16 * v17;
-    return v18;
+    int v8 = v5 & v2;
+    int v9 = 4;
+    int v10 = int(uint(v5) >> v9);
+    int v11 = v7 ? v8 : v10;
+    int v12 = 8;
+    int v13 = v11 - v12;
+    int v14 = 0;
+    float v15 = antfly_qk_half_le_to_float(block + v14);
+    float v16 = float(v13);
+    float v17 = v15 * v16;
+    return v17;
 }
 kernel void antfly_q4_0_small_batch_msl_v1(device const float *input [[buffer(0)]], device const uchar *weight_q4_0 [[buffer(1)]], device float *output [[buffer(2)]], constant int &rows [[buffer(3)]], constant int &in_dim [[buffer(4)]], constant int &out_dim [[buffer(5)]], uint3 thread_pos [[thread_position_in_threadgroup]], uint3 group_pos [[threadgroup_position_in_grid]]) {
     uint tid = thread_pos.x; int col = int(group_pos.x); int row = int(group_pos.y); if (row >= rows || rows < 2 || rows > 8 || col >= out_dim || (in_dim & 31) != 0) return; float acc = 0.0f; int block_count = in_dim >> 5;

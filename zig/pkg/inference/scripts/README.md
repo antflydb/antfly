@@ -51,3 +51,48 @@ intentionally require local model artifacts or a specific accelerator. Shared
 CUDA artifact generation, paired benchmarking, Metal debugging, and OpenAPI or
 descriptor regeneration remain in this directory because multiple model
 families consume them.
+
+## Shared kernel recipes
+
+Run from `zig/pkg/inference` with the repository-pinned Zig:
+
+```sh
+zig build quant-recipe-cuda-host-conformance
+zig build quant-kernel-metal-runtime-conformance -Dmetal=true
+zig build kernel-recipe-cuda-source
+```
+
+The host check compiles the generated expressions as C++ and checks packed
+values, Q6 integer/scale components, activation policies and shuffle trees.
+The Metal check runs the existing 50 device cases. The CUDA source target only
+generates a model-free device test; it can run on a machine without CUDA.
+
+On an NVIDIA host with `nvcc` in `PATH`:
+
+```sh
+zig build kernel-recipe-cuda-conformance
+```
+
+That target compiles for the installed GPU (`-arch=native`) and runs real
+packed-value, activation and full-warp reduction kernels. Its scalar arithmetic
+conformance disables contraction and flushing subnormals. This is a numerical
+check; it does not qualify production matmul scheduling, CUDA capture or model
+latency. The target always recompiles for the current GPU and reruns the device
+checks, even if earlier build outputs are cached.
+
+The shared descriptor fixture also runs through each target's existing tensor
+setup and checks strict transfer admission, legality queries, output reuse and
+input preservation. For example, on a CUDA host:
+
+```sh
+zig build test-inference-unit -Dcuda=true -Dcuda-artifacts=fatbin \
+  -Dtest-filter='CUDA shared descriptors'
+```
+
+The matching CPU and Metal filters are `CPU shared descriptors` and
+`Metal shared descriptors`; enable Metal with `-Dmetal=true` on a Mac.
+
+After changing production CUDA source, rebuild its artifacts with the pinned
+CUDA toolkit contract in `regen-cuda-artifacts.sh`, then run the affected device,
+capture and model performance gates on the same host for baseline and candidate.
+Host conformance and portable product compilation do not replace those gates.

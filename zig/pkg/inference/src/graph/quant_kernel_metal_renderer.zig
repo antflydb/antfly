@@ -36,6 +36,7 @@ const Epilogue = compiler.Epilogue;
 const KernelSchedule = compiler.KernelSchedule;
 const ReductionKind = compiler.ReductionKind;
 const OpKind = quant_kernel_op.OpKind;
+const kernel_math = @import("../ops/kernel_math.zig");
 const quant_recipe = @import("quant_recipe.zig");
 
 pub const MicrokernelKind = quant_kernel_op.MicrokernelKind;
@@ -76,7 +77,7 @@ pub const helper_qk_u32_le = HelperFragment{
 
 pub const helper_qk_gelu = HelperFragment{
     .name = "antfly_qk_gelu",
-    .msl = "inline float antfly_qk_gelu(float x) { if (!isfinite(x)) return 0.0f; float inner = 0.7978845608028654f * (x + 0.044715f * x * x * x); if (inner > 10.0f) return x; if (inner < -10.0f) return 0.0f; float y = 0.5f * x * (1.0f + tanh(inner)); return isfinite(y) ? y : 0.0f; }",
+    .msl = kernel_math.guardedGeluSource(kernel_math.metal, "inline", "antfly_qk_gelu", true),
 };
 
 // ---- Attention helper fragments ------------------------------------------
@@ -869,8 +870,7 @@ fn renderMatmulComputation(
     } else if (schedule.reduction == .simdgroup_tiled) {
         switch (decoder.format) {
             .q4_0 => try renderPackedQ4_0TiledBody(allocator, out, decoder, schedule),
-            .q4_k => try renderQ4KTiledBody(allocator, out, decoder, schedule, epilogue),
-            .q6_k => try renderQ6KTiledBody(allocator, out, decoder, schedule, epilogue),
+            .q4_k, .q6_k => try renderKFamilyTiledBody(allocator, out, decoder, schedule, epilogue),
             else => return error.TiledRequiresSupportedFormat,
         }
     } else if (two_col) {
@@ -1013,10 +1013,10 @@ fn renderPackedQ4_0TiledBody(
     try out.appendSlice(allocator, "    for (uint c = 0u; c < NR0; ++c) for (uint rr = 0u; rr < 2u; ++rr) { float total = simd_sum(acc[c][rr]); uint col = first_o + c; uint row = first_r + rr; if (lane_id == 0u && col < uint(out_dim) && row < uint(rows)) output[row * uint(out_dim) + col] = total; }\n");
 }
 
-/// Q4_K register tile. Each simdgroup owns several output columns, reusing one
-/// activation slice across columns and one dequantized weight slice across the
-/// scheduled row tile.
-fn renderQ4KTiledBody(
+/// One register-tile schedule for K-family projections. Format-specific
+/// decoding keeps Q4_K's scale/min hoisting and Q6_K's eight-value scale reuse;
+/// grid mapping, row tails, activation loads, accumulation and writes are shared.
+fn renderKFamilyTiledBody(
     allocator: std.mem.Allocator,
     out: *std.ArrayListUnmanaged(u8),
     decoder: FormatDecoder,
@@ -1027,30 +1027,14 @@ fn renderQ4KTiledBody(
     const cols_per_simdgroup = schedule.cols_per_threadgroup / @as(u8, @intCast(simdgroups));
 
     try appendFmt(allocator, out, "    const uint NSG = {d}u; const uint NC = {d}u; const uint NR = {d}u; const uint first_o = (group_pos.x * NSG + uint(simdgroup_id)) * NC; const uint first_r = group_pos.y * NR;\n", .{ simdgroups, cols_per_simdgroup, schedule.rows_per_threadgroup });
-    try appendFmt(allocator, out, "    if (rows < 2 || in_dim <= 0 || (uint(in_dim) & 255u) != 0u || out_dim <= 0 || first_r >= uint(rows) || first_o >= uint(out_dim)) return; const uint block_count = uint(in_dim) >> 8; const uint sub = uint(lane_id) >> 2; const uint j0 = (uint(lane_id) & 3u) << 3; const uint chunk = sub >> 1; const bool high = (sub & 1u) != 0u; float acc[{d}][{d}]; for (uint c = 0u; c < NC; ++c) for (uint rr = 0u; rr < NR; ++rr) acc[c][rr] = 0.0f;\n", .{ cols_per_simdgroup, schedule.rows_per_threadgroup });
-    try appendFmt(allocator, out, "    for (uint b = 0u; b < block_count; ++b) {{ uint input_off = first_r * uint(in_dim) + b * 256u + sub * 32u + j0; float x[{d}][8]; for (uint rr = 0u; rr < NR; ++rr) for (uint i = 0u; i < 8u; ++i) x[rr][i] = first_r + rr < uint(rows) ? input[input_off + rr * uint(in_dim) + i] : 0.0f;\n", .{schedule.rows_per_threadgroup});
-    try appendFmt(allocator, out, "        for (uint c = 0u; c < NC; ++c) {{ uint col = first_o + c; if (col >= uint(out_dim)) continue; device const uchar *block = {s} + (col * block_count + b) * 144u; float raw_scale = 0.0f; float raw_min = 0.0f; antfly_qk_unpack_scale_min_6bit(block + 4u, int(sub), raw_scale, raw_min); float dsc = antfly_qk_half_le_to_float(block) * raw_scale; float dmn = antfly_qk_half_le_to_float(block + 2u) * raw_min; device const uchar *qs = block + 16u + chunk * 32u + j0; for (uint i = 0u; i < 8u; ++i) {{ uchar packed = qs[i]; float w = dsc * float(high ? packed >> 4 : packed & 0x0fu) - dmn; for (uint rr = 0u; rr < NR; ++rr) acc[c][rr] += x[rr][i] * w; }} }} }}\n", .{decoder.weight_param});
-    const write = try writeExpr(allocator, "total", "col", epilogue);
-    defer allocator.free(write);
-    try appendFmt(allocator, out, "    for (uint c = 0u; c < NC; ++c) for (uint rr = 0u; rr < NR; ++rr) {{ float total = simd_sum(acc[c][rr]); uint col = first_o + c; uint row = first_r + rr; if (lane_id == 0u && col < uint(out_dim) && row < uint(rows)) output[row * uint(out_dim) + col] = {s}; }}\n", .{write});
-}
-
-/// Q6_K register tile. Two lanes cover each 16-value scale subblock; every lane
-/// decodes eight weights and reuses them across the scheduled row tile.
-fn renderQ6KTiledBody(
-    allocator: std.mem.Allocator,
-    out: *std.ArrayListUnmanaged(u8),
-    decoder: FormatDecoder,
-    schedule: KernelSchedule,
-    epilogue: Epilogue,
-) !void {
-    const simdgroups = schedule.threads_per_threadgroup / 32;
-    const cols_per_simdgroup = schedule.cols_per_threadgroup / @as(u8, @intCast(simdgroups));
-
-    try appendFmt(allocator, out, "    const uint NSG = {d}u; const uint NC = {d}u; const uint NR = {d}u; const uint first_o = (group_pos.x * NSG + uint(simdgroup_id)) * NC; const uint first_r = group_pos.y * NR;\n", .{ simdgroups, cols_per_simdgroup, schedule.rows_per_threadgroup });
-    try appendFmt(allocator, out, "    if (rows < 2 || in_dim <= 0 || (uint(in_dim) & 255u) != 0u || out_dim <= 0 || first_r >= uint(rows) || first_o >= uint(out_dim)) return; const uint block_count = uint(in_dim) >> 8; const uint sub = uint(lane_id) >> 1; const uint j0 = (uint(lane_id) & 1u) << 3; float acc[{d}][{d}]; for (uint c = 0u; c < NC; ++c) for (uint rr = 0u; rr < NR; ++rr) acc[c][rr] = 0.0f;\n", .{ cols_per_simdgroup, schedule.rows_per_threadgroup });
-    try appendFmt(allocator, out, "    for (uint b = 0u; b < block_count; ++b) {{ uint input_off = first_r * uint(in_dim) + b * 256u + sub * 16u + j0; float x[{d}][8]; for (uint rr = 0u; rr < NR; ++rr) for (uint i = 0u; i < 8u; ++i) x[rr][i] = first_r + rr < uint(rows) ? input[input_off + rr * uint(in_dim) + i] : 0.0f;\n", .{schedule.rows_per_threadgroup});
-    try appendFmt(allocator, out, "        for (uint c = 0u; c < NC; ++c) {{ uint col = first_o + c; if (col >= uint(out_dim)) continue; device const uchar *block = {s} + (col * block_count + b) * 210u; float dscale = antfly_qk_q6_k_scale(block, int(sub * 16u)); for (uint i = 0u; i < 8u; ++i) {{ float w = dscale * antfly_qk_q6_k_value(block, int(sub * 16u + j0 + i)); for (uint rr = 0u; rr < NR; ++rr) acc[c][rr] += x[rr][i] * w; }} }} }}\n", .{decoder.weight_param});
+    const q4 = decoder.format == .q4_k;
+    try appendFmt(allocator, out, "    if (rows < 2 || in_dim <= 0 || (uint(in_dim) & 255u) != 0u || out_dim <= 0 || first_r >= uint(rows) || first_o >= uint(out_dim)) return; const uint block_count = uint(in_dim) >> 8; const uint sub = uint(lane_id) >> {d}; const uint j0 = (uint(lane_id) & {d}u) << 3;{s} float acc[{d}][{d}]; for (uint c = 0u; c < NC; ++c) for (uint rr = 0u; rr < NR; ++rr) acc[c][rr] = 0.0f;\n", .{ @as(u8, if (q4) 2 else 1), @as(u8, if (q4) 3 else 1), if (q4) " const uint chunk = sub >> 1; const bool high = (sub & 1u) != 0u;" else "", cols_per_simdgroup, schedule.rows_per_threadgroup });
+    try appendFmt(allocator, out, "    for (uint b = 0u; b < block_count; ++b) {{ uint input_off = first_r * uint(in_dim) + b * 256u + sub * {d}u + j0; float x[{d}][8]; for (uint rr = 0u; rr < NR; ++rr) for (uint i = 0u; i < 8u; ++i) x[rr][i] = first_r + rr < uint(rows) ? input[input_off + rr * uint(in_dim) + i] : 0.0f;\n", .{ @as(u8, if (q4) 32 else 16), schedule.rows_per_threadgroup });
+    if (q4) {
+        try appendFmt(allocator, out, "        for (uint c = 0u; c < NC; ++c) {{ uint col = first_o + c; if (col >= uint(out_dim)) continue; device const uchar *block = {s} + (col * block_count + b) * 144u; float raw_scale = 0.0f; float raw_min = 0.0f; antfly_qk_unpack_scale_min_6bit(block + 4u, int(sub), raw_scale, raw_min); float dsc = antfly_qk_half_le_to_float(block) * raw_scale; float dmn = antfly_qk_half_le_to_float(block + 2u) * raw_min; device const uchar *qs = block + 16u + chunk * 32u + j0; for (uint i = 0u; i < 8u; ++i) {{ uchar packed = qs[i]; float w = dsc * float(high ? packed >> 4 : packed & 0x0fu) - dmn; for (uint rr = 0u; rr < NR; ++rr) acc[c][rr] += x[rr][i] * w; }} }} }}\n", .{decoder.weight_param});
+    } else {
+        try appendFmt(allocator, out, "        for (uint c = 0u; c < NC; ++c) {{ uint col = first_o + c; if (col >= uint(out_dim)) continue; device const uchar *block = {s} + (col * block_count + b) * 210u; float dscale = antfly_qk_q6_k_scale(block, int(sub * 16u)); for (uint i = 0u; i < 8u; ++i) {{ float w = dscale * antfly_qk_q6_k_value(block, int(sub * 16u + j0 + i)); for (uint rr = 0u; rr < NR; ++rr) acc[c][rr] += x[rr][i] * w; }} }} }}\n", .{decoder.weight_param});
+    }
     const write = try writeExpr(allocator, "total", "col", epilogue);
     defer allocator.free(write);
     try appendFmt(allocator, out, "    for (uint c = 0u; c < NC; ++c) for (uint rr = 0u; rr < NR; ++rr) {{ float total = simd_sum(acc[c][rr]); uint col = first_o + c; uint row = first_r + rr; if (lane_id == 0u && col < uint(out_dim) && row < uint(rows)) output[row * uint(out_dim) + col] = {s}; }}\n", .{write});

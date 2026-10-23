@@ -7,10 +7,10 @@ owners. It adds no required external inference runtime.
 
 The implementation branch is based on `origin/main` revision
 `ae0b8856fdc62c7c164125ade966d3ed0cd2dc8e`, refreshed through `origin/main`
-`f95a5a5820` before the shared-recipe follow-on. Hardware qualification uses CPU and
-Metal. CUDA construction, planning, descriptor execution and capture ownership
-are implemented and compile, with host-side regression coverage; CUDA numerical
-and performance qualification still require a CUDA host.
+`f95a5a5820` before the shared-recipe follow-on. Hardware qualification now covers
+CPU/Metal on the M4 Max and CUDA on Glowworm's NVIDIA GB10. The kernel-consolidation
+section records actual device, capture, lifetime and model performance checks,
+including their model-admission limits and retained timing misses.
 
 ## Ownership and preparation
 
@@ -286,6 +286,167 @@ steady Metal device and host-mirror allocations remain bounded.
 | encoder-metal | 45,193 | — |
 | decoder-native | 949,906 | 3710 |
 | decoder-metal | 16,257 | 63 |
+
+## Kernel source consolidation after the shared-descriptor checkpoint
+
+The next checkpoint builds on `3ee86b871d`. Common semantics now cover activation
+expressions, packed-format components and explicit warp reduction trees as well
+as physical descriptors. Target code retains vector widths, tile geometry,
+register reuse, packed integer dot products and contraction policies. These are
+compile-time templates or generated source; requests do not interpret recipes.
+
+- `ops/kernel_math.zig` owns GELU, sigmoid, SiLU, QuickGELU, ReLU and ReLU-squared
+  expressions. CPU scalar/SIMD adapters retain their selected exp/tanh routines
+  and distinct GELU cubic multiplication order. GPU lowering retains precise
+  versus fast CUDA exponential choice and the guarded packed-epilogue policy.
+- `ops/kernel_reduction.zig` owns the explicit full-warp shuffle-down schedule
+  `16,8,4,2,1`, sum/max choice and lane-zero/broadcast result contract. Five CUDA
+  helper definitions share it without changing their reduction order.
+- Packed recipes intern identical expressions without reassociation. Signed-byte
+  loads, Q4_K integer headers and Q6_K integer/scale components serve both scalar
+  decoding and optimized schedules, including CUDA DP4A packing. Metal Q4_K and
+  Q6_K share their register-tile scaffold and retain format-specific scale/load
+  hoisting.
+- Native pair/triple Q8 and Q4/Q5_K panel kernels specialize a compile-time arity.
+  Grouped raw/prepared/mixed dispatch also shares one resolver. The native compute
+  file is 410 lines smaller including its new regression tests, which exercise
+  both arities, mixed caches, bias, row tails, column prefixes/suffixes and
+  untouched outputs. Existing production dispatch defaults remain in force.
+- CUDA code generation owns one runtime region of 24 shared helpers and another
+  of five promoted matmul bodies. Standalone qualification and runtime embedding
+  now consume the same definitions. The five previously promoted standalone
+  sources remain byte-identical to `3ee86b871d`; historical performance evidence
+  and source fingerprints are not rewritten. Specialized attention, DP4A and
+  tensor-core schedules remain target implementations.
+
+The new `kernel-recipe-cuda-source` target generates a model-free NVIDIA test on
+any development host. `kernel-recipe-cuda-conformance` compiles it with NVCC for
+the installed GPU and runs packed formats, activation policies and full-warp
+reductions. It always recompiles/runs because GPU identity is an input. Scalar
+conformance disables contraction and subnormal flushing; production performance
+qualification retains its normal flags. See `zig/pkg/inference/scripts/README.md`
+for commands and the artifact regeneration contract.
+
+### Consolidation qualification
+
+On the M4 Max, the broad affected suite passes 208 tests with six explicit
+CUDA/fixture skips; a final CUDA-host/recipe suite passes 122 tests with zero
+skips. All 21 standalone code-generation tests pass. Generated host C++ checks
+315,421 values against independent packed/activation references and the explicit
+shuffle oracle. Actual Metal conformance passes all 50 cases, with worst absolute
+error `0.0000011`. Product compilation with CPU/Metal/CUDA enabled and the WASM
+artifact both pass.
+
+The native packed-kernel gate covers ten geometries and three routes each,
+using A/B/B/A/A/B/B/A arms, 25 warmups and 201 measured iterations. All 30 checksums
+match and all cases meet the 5% budget; the worst candidate/baseline ratio is
+`1.02411`. The candidate SHA256 is
+`a0498ebeca7d301b4c3b6023212ea6cd39a01ab917f9a791b3ea9cbd39f77707`.
+The baseline is the native compute source from `3ee86b871d`.
+
+The promoted Metal production gate passes 14 routes with five repeats and 500
+iterations per case, all providers ready and no slow fallback. Its worst repeat
+speedup is `1.634x` over the existing handwritten comparison kernels; this is
+separate from a comparison against the preceding checkpoint.
+
+The final model executable SHA256 is
+`ec34b775ae7efc7d392f5ea0ebeddbc11cdb2ddde38be17b68f96dbb6e12e2dd`.
+Every complete output in the thirteen-case CPU/Metal matrix is byte-identical to
+the original baseline. Ordinary cases use eight balanced A/B/B/A/A/B/B/A arms,
+25 warmups and 201 requests; CPU Q4_K retains twelve arms and 1,001 requests.
+Twelve cases pass immediately. Metal ONNX initially exceeds the p50 budget at
+`1.05129` while passing p95. A preselected longer sixteen-arm balanced protocol
+with 1,001 requests passes at p50 `1.02934`, p95 `1.02923` versus the original
+baseline. The same longer protocol versus the preceding validated checkpoint
+passes at `0.99796` / `0.97148`. All thirteen workloads therefore meet the 5%
+p50 / 10% p95 limits under the documented protocols; neither short failed receipt
+is discarded. The earlier four-arm series also had a Metal batch-2 timing spike,
+resolved by the uniform eight-arm matrix.
+
+Receipts, frozen binaries, source hashes and full outputs are under the ignored
+`.benchmark-assets/1166/acceptance-kernel-consolidation/` directory:
+`cpu-kernels/`, `models/`, `models-final/`, `onnx-prior-checkpoint/` and
+`onnx-original-extended/`. Source-only CUDA changes after CPU qualification do
+not change the qualified native arithmetic or packed-kernel schedules.
+
+The final independent decoder oracle passes all 160,000 logits per backend at
+`tolerance=0.002`. Four concurrent 120-second regression soaks also pass: native
+encoder 41,969 iterations, Metal ONNX encoder 9,252, native decoder 187,694
+(733 runtime evictions), and Metal decoder 3,391 (13 evictions). Every run checks
+output stability and reports zero tracked live bytes at teardown, zero live host
+mirrors, and no denied allocations. Decoder reset/chunked-prefill parity is exact.
+These shorter kernel-consolidation regressions supplement the earlier prolonged
+ownership qualification; they do not replace its receipts.
+
+CUDA validation now uses Glowworm's NVIDIA GB10 (SM121), driver `580.178.04`.
+The model-free test passes all 217,100 values with both the installed CUDA 13.0
+and an isolated CUDA 13.2.86 toolchain. The pinned Zig 0.17.0 archive is verified
+against the repository's SHA256 before use. System toolkit/driver configuration
+is unchanged. Both baseline and candidate production PTX, seven-architecture
+fatbin and SM89 cubin are regenerated with CUDA 13.2.86; candidate images are
+copied back with SHA256 verification.
+
+A single descriptor fixture now exercises admitted operations on CPU, Metal and
+CUDA, with target-owned tensor setup. The device adapters verify strict transfer
+admission, repeated assigned output reuse, null-output queries and unchanged
+inputs; CPU and CUDA use physical leases and CUDA declares transpose workspace.
+The two local CPU/Metal fixture tests pass. Fifteen selected CUDA tests pass with
+zero skips, including actual retained graph replay with fresh request inputs,
+cached BF16 GEMM replay, activation forward/backward parity, physical ownership,
+auxiliary planes, and OOM reservation recovery. These are hardware checks;
+NVIDIA model performance qualification uses the exact `3ee86b871d` source
+snapshot as baseline, with both CUDA images rebuilt by the same compiler. All
+four admitted cases (MiniLM batch 1 / sequence 16, batch 1 / sequence 128, batch 2 /
+sequence 16, and Q4_K DeBERTa reranking) produce byte-identical complete outputs.
+The initial eight-arm, 25-warmup, 201-request series passes three cases, with
+sequence 128 missing p95 at `1.13005` despite p50 `0.99859`.
+
+The retained longer series uses sixteen `ABBABAABABBAABBA` arms, 250 warmups and
+1,001 requests per arm for every case. Both executables use the same 3.9-GHz CPU
+core pool (`5–9,15–19`) on the hybrid-core Spark; GPU clocks and system scheduling
+settings are unchanged. All four cases meet the original 5% p50 / 10% p95 limits.
+Worst ratios are `1.00206` and `1.00025`. This controls host scheduling during GPU
+wall-clock timing and does not establish default-scheduler tail latency for every
+load. Baseline/candidate executable SHA256 values are
+`ade00d651f8d916603c2fa10f83516b0ebb0730d649610b7a65ef5160c29db52` and
+`ee30ab719c3838ee0d3e29d7f832a21f76f272af695eb1de594e8dd65dc19769`.
+
+Cross-device full-output checks also pass: maximum absolute CPU/CUDA error is
+`0.000003577` across the three MiniLM shapes and `0.000156284` for Q4_K DeBERTa,
+within the declared `0.0001` and `0.005` tolerances for those encodings. These
+comparisons supplement the exact baseline/candidate comparisons on each backend.
+
+The tiny-Llama fixture is rejected by the existing CUDA architecture-admission
+policy on both checkpoints before device execution. Its decoder oracle and
+prolonged runtime qualification remain CPU/Metal evidence; this change does not
+expand CUDA model admission. CUDA captures are exercised by the actual retained
+replay and BF16 GEMM device tests above. GB10 measurements do not establish
+runtime performance on SM89 or other GPU architectures.
+
+The five promoted CUDA matmul bodies also retain identical generated machine
+instructions and resource usage versus the same-compiler baseline on all seven
+fatbin architectures (SM75, SM80, SM89, SM90, SM100, SM110 and SM120). This is
+35 static comparisons, separate from actual GB10 runtime qualification.
+
+The final CUDA descriptor and prepared-frame regressions pass on hardware,
+including six retained outputs against the four-frame pool, reuse after a held
+output is released, and exact output survival after executable eviction, under
+strict device-host transfer auditing. Two concurrent 120-second strict-resident
+model soaks also pass: MiniLM completes 41,086 iterations and Q4_K DeBERTa 10,184,
+with alternating inputs, held outputs and zero tracked host bytes at teardown.
+Process RSS is constant throughout the sampled final minute: 300,544 KiB and
+710,924 KiB respectively. The benchmark's legacy device/mirror counters describe
+Metal providers; CUDA zeroes there are not device-allocation plateau evidence.
+Actual CUDA allocation/capture ownership is covered by the device tests.
+
+Only test fixtures and CUDA-only images changed after the CPU/Metal frozen model
+binary was qualified. Retained prefix-hash checks establish that CPU/Metal
+production code is unchanged by those later additions. Detailed hardware logs,
+source/artifact hashes and both short and longer CUDA series are retained in
+`.benchmark-assets/1166/acceptance-kernel-consolidation-cuda/`, beside the CPU/Metal
+receipts. Frozen executables and the 35 machine-code/resource comparisons are
+included. The CPU/Metal directory also retains the exact protocol scripts and
+post-qualification production-prefix checks.
 
 ## Original checkpoint qualification
 

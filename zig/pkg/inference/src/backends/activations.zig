@@ -17,6 +17,7 @@
 // Uses Zig's @Vector for vectorized operations on supported platforms.
 
 const std = @import("std");
+const kernel_math = @import("../ops/kernel_math.zig");
 const linalg_primitives = @import("inference_linalg").primitives;
 
 // Comptime-selected SIMD width and vectorized exp helper, sourced from
@@ -42,23 +43,30 @@ inline fn tanhVec(x: F32xN) F32xN {
 
 /// GELU activation: x * 0.5 * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
 pub fn gelu(data: []f32) void {
-    const sqrt_2_over_pi_s: f32 = 0.7978845608028654;
-    const sqrt_2_over_pi: F32xN = @splat(sqrt_2_over_pi_s);
-    const c044715: F32xN = @splat(0.044715);
-    const half: F32xN = @splat(0.5);
-    const one: F32xN = @splat(1.0);
+    applyActivation(.gelu, data);
+}
+
+const VectorMath = struct {
+    pub inline fn exp(x: F32xN) F32xN {
+        return expVec(x);
+    }
+    pub inline fn tanh(x: F32xN) F32xN {
+        return tanhVec(x);
+    }
+};
+
+/// Scheduling and transcendental approximations stay native-owned; the scalar
+/// expression is shared with generated GPU kernels. Preserve the existing
+/// cube-first SIMD GELU and left-associated scalar tail independently.
+fn applyActivation(comptime kind: kernel_math.Activation, data: []f32) void {
+    const vector_recipe = comptime kernel_math.activation(kind, .cube_first);
+    const scalar_recipe = comptime kernel_math.activation(kind, .left_associated);
     var i: usize = 0;
     while (i + VEC_LEN <= data.len) : (i += VEC_LEN) {
         const v: F32xN = data[i..][0..VEC_LEN].*;
-        const v3 = v * v * v;
-        const inner = sqrt_2_over_pi * (v + c044715 * v3);
-        data[i..][0..VEC_LEN].* = half * v * (one + tanhVec(inner));
+        data[i..][0..VEC_LEN].* = kernel_math.evaluate(vector_recipe, VectorMath, v);
     }
-    while (i < data.len) : (i += 1) {
-        const val = data[i];
-        const inner = sqrt_2_over_pi_s * (val + 0.044715 * val * val * val);
-        data[i] = 0.5 * val * (1.0 + std.math.tanh(inner));
-    }
+    while (i < data.len) : (i += 1) data[i] = kernel_math.evaluate(scalar_recipe, kernel_math.ScalarMath, data[i]);
 }
 
 /// GELU and gate multiplication stream through cache-sized tiles. Workers
@@ -296,29 +304,12 @@ pub fn relu(data: []f32) void {
 
 /// Sigmoid activation: 1 / (1 + exp(-x))
 pub fn sigmoid(data: []f32) void {
-    const one: F32xN = @splat(1.0);
-    var i: usize = 0;
-    while (i + VEC_LEN <= data.len) : (i += VEC_LEN) {
-        const v: F32xN = data[i..][0..VEC_LEN].*;
-        data[i..][0..VEC_LEN].* = one / (one + expVec(-v));
-    }
-    while (i < data.len) : (i += 1) {
-        data[i] = 1.0 / (1.0 + @exp(-data[i]));
-    }
+    applyActivation(.sigmoid, data);
 }
 
 /// SiLU/Swish activation: x * sigmoid(x) = x / (1 + exp(-x))
 pub fn silu(data: []f32) void {
-    const one: F32xN = @splat(1.0);
-    var i: usize = 0;
-    while (i + VEC_LEN <= data.len) : (i += VEC_LEN) {
-        const v: F32xN = data[i..][0..VEC_LEN].*;
-        data[i..][0..VEC_LEN].* = v / (one + expVec(-v));
-    }
-    while (i < data.len) : (i += 1) {
-        const val = data[i];
-        data[i] = val / (1.0 + @exp(-val));
-    }
+    applyActivation(.silu, data);
 }
 
 pub fn clampSilu(output: []f32, input: []const f32, min_value: ?f32, max_value: ?f32) void {
@@ -342,17 +333,7 @@ pub fn clampSilu(output: []f32, input: []const f32, min_value: ?f32, max_value: 
 /// Quick GELU activation: x * sigmoid(1.702 * x)
 /// Faster approximation used by CLIP and some other models.
 pub fn quickGelu(data: []f32) void {
-    const neg1702: F32xN = @splat(-1.702);
-    const one: F32xN = @splat(1.0);
-    var i: usize = 0;
-    while (i + VEC_LEN <= data.len) : (i += VEC_LEN) {
-        const v: F32xN = data[i..][0..VEC_LEN].*;
-        data[i..][0..VEC_LEN].* = v / (one + expVec(neg1702 * v));
-    }
-    while (i < data.len) : (i += 1) {
-        const val = data[i];
-        data[i] = val / (1.0 + @exp(-1.702 * val));
-    }
+    applyActivation(.quick_gelu, data);
 }
 
 /// RMS normalization: x * rsqrt(mean(x^2) + eps) * weight. No bias, no mean subtraction.

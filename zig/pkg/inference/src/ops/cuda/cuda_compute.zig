@@ -27899,3 +27899,12 @@ test "CUDA planned auxiliary representations retain storage through publication 
     slice_live = false;
     try std.testing.expect(lease.unique());
 }
+
+test "CUDA shared descriptors execute resident operations with strict transfer admission" {
+    if (comptime !@import("build_options").enable_cuda) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var context = try @import("../../backends/compute_context.zig").BackendContext.init(a, .cuda, null);
+    defer context.deinit(a);
+    var cb = context.computeBackend();
+    try @import("../testing/assigned_kernel_conformance.zig").run(&cb, true);
+}

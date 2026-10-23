@@ -5793,7 +5793,7 @@
       "metal_production_kernel_id": "metal_handwritten_quant_matmul",
       "metal_candidate_kernel_id": "antfly_q4_0_small_batch_msl_v1",
       "metal_candidate_source_path": "src/ops/metal/generated/quant_kernel_q4_0_small_batch.metal",
-      "metal_candidate_source_fingerprint": 5353686256820936210,
+      "metal_candidate_source_fingerprint": 6097075411824753241,
       "metal_fallback_reason": "generated_artifact_missing"
     },
     {
@@ -7553,7 +7553,7 @@
       "metal_production_kernel_id": "metal_handwritten_quant_matmul",
       "metal_candidate_kernel_id": "antfly_q4_1_small_batch_msl_v1",
       "metal_candidate_source_path": "src/ops/metal/generated/quant_kernel_q4_1_small_batch.metal",
-      "metal_candidate_source_fingerprint": 16591375506181499667,
+      "metal_candidate_source_fingerprint": 13349336593927855832,
       "metal_fallback_reason": "generated_artifact_missing"
     },
     {
@@ -9313,7 +9313,7 @@
       "metal_production_kernel_id": "metal_handwritten_quant_matmul",
       "metal_candidate_kernel_id": "antfly_q5_0_small_batch_msl_v1",
       "metal_candidate_source_path": "src/ops/metal/generated/quant_kernel_q5_0_small_batch.metal",
-      "metal_candidate_source_fingerprint": 5442154001939109870,
+      "metal_candidate_source_fingerprint": 15075166831565786038,
       "metal_fallback_reason": "generated_artifact_missing"
     },
     {
@@ -11073,7 +11073,7 @@
       "metal_production_kernel_id": "metal_handwritten_quant_matmul",
       "metal_candidate_kernel_id": "antfly_q5_1_small_batch_msl_v1",
       "metal_candidate_source_path": "src/ops/metal/generated/quant_kernel_q5_1_small_batch.metal",
-      "metal_candidate_source_fingerprint": 15333601813570524862,
+      "metal_candidate_source_fingerprint": 15737785608102280743,
       "metal_fallback_reason": "generated_artifact_missing"
     },
     {
@@ -12873,7 +12873,7 @@
       "metal_production_kernel_id": "metal_handwritten_quant_matmul",
       "metal_candidate_kernel_id": "antfly_q8_0_small_batch_bias_msl_v1",
       "metal_candidate_source_path": "src/ops/metal/generated/quant_kernel_q8_0_small_batch_bias.metal",
-      "metal_candidate_source_fingerprint": 8238872902265309968,
+      "metal_candidate_source_fingerprint": 10090264855601797819,
       "metal_fallback_reason": "generated_artifact_missing"
     },
     {
@@ -12913,7 +12913,7 @@
       "metal_production_kernel_id": "metal_handwritten_quant_matmul",
       "metal_candidate_kernel_id": "antfly_q8_0_small_batch_bias_gelu_msl_v1",
       "metal_candidate_source_path": "src/ops/metal/generated/quant_kernel_q8_0_small_batch_bias_gelu.metal",
-      "metal_candidate_source_fingerprint": 6610183816642400964,
+      "metal_candidate_source_fingerprint": 12881460751874502835,
       "metal_fallback_reason": "generated_artifact_missing"
     },
     {
@@ -13033,7 +13033,7 @@
       "metal_production_kernel_id": "metal_handwritten_quant_matmul",
       "metal_candidate_kernel_id": "antfly_q8_0_small_batch_relu_msl_v1",
       "metal_candidate_source_path": "src/ops/metal/generated/quant_kernel_q8_0_small_batch_relu.metal",
-      "metal_candidate_source_fingerprint": 16534935863135477658,
+      "metal_candidate_source_fingerprint": 7004524509379442697,
       "metal_fallback_reason": "generated_artifact_missing"
     },
     {
@@ -14593,7 +14593,7 @@
       "metal_production_kernel_id": "metal_handwritten_quant_matmul",
       "metal_candidate_kernel_id": "antfly_q8_1_small_batch_msl_v1",
       "metal_candidate_source_path": "src/ops/metal/generated/quant_kernel_q8_1_small_batch.metal",
-      "metal_candidate_source_fingerprint": 8553231538137172718,
+      "metal_candidate_source_fingerprint": 14536387039362617331,
       "metal_fallback_reason": "generated_artifact_missing"
     },
     {
@@ -16393,7 +16393,7 @@
       "metal_production_kernel_id": "metal_handwritten_quant_matmul",
       "metal_candidate_kernel_id": "antfly_q2_k_small_batch_bias_msl_v1",
       "metal_candidate_source_path": "src/ops/metal/generated/quant_kernel_q2_k_small_batch_bias.metal",
-      "metal_candidate_source_fingerprint": 16668636188942501570,
+      "metal_candidate_source_fingerprint": 18067447231686074012,
       "metal_fallback_reason": "generated_artifact_missing"
     },
     {
@@ -16433,7 +16433,7 @@
       "metal_production_kernel_id": "metal_handwritten_quant_matmul",
       "metal_candidate_kernel_id": "antfly_q2_k_small_batch_bias_gelu_msl_v1",
       "metal_candidate_source_path": "src/ops/metal/generated/quant_kernel_q2_k_small_batch_bias_gelu.metal",
-      "metal_candidate_source_fingerprint": 6686118453612916877,
+      "metal_candidate_source_fingerprint": 8467673370038764488,
       "metal_fallback_reason": "generated_artifact_missing"
     },
     {
@@ -18153,7 +18153,7 @@
       "metal_production_kernel_id": "metal_handwritten_quant_matmul",
       "metal_candidate_kernel_id": "antfly_q3_k_small_batch_bias_msl_v1",
       "metal_candidate_source_path": "src/ops/metal/generated/quant_kernel_q3_k_small_batch_bias.metal",
-      "metal_candidate_source_fingerprint": 12365809092339391971,
+      "metal_candidate_source_fingerprint": 18012907655656033282,
       "metal_fallback_reason": "generated_artifact_missing"
     },
     {
@@ -18193,7 +18193,7 @@
       "metal_production_kernel_id": "metal_handwritten_quant_matmul",
       "metal_candidate_kernel_id": "antfly_q3_k_small_batch_bias_gelu_msl_v1",
       "metal_candidate_source_path": "src/ops/metal/generated/quant_kernel_q3_k_small_batch_bias_gelu.metal",
-      "metal_candidate_source_fingerprint": 8839392382198091658,
+      "metal_candidate_source_fingerprint": 4397166052960211075,
       "metal_fallback_reason": "generated_artifact_missing"
     },
     {
@@ -19426,7 +19426,7 @@
       "cuda_production_kernel_id": "termite_linear_q4_k_f32_tile4",
       "cuda_candidate_kernel_id": "antfly_q4_k_mmv_f32_v1",
       "cuda_candidate_source_path": "src/ops/cuda/generated/quant_kernel_q4_k_mmv.cu",
-      "cuda_candidate_source_fingerprint": 4618316323331264281,
+      "cuda_candidate_source_fingerprint": 13590110892727828708,
       "cuda_fallback_reason": "generated_artifact_missing",
       "metal_route": "handwritten_production",
       "metal_candidate_route": "unsupported",
@@ -19913,7 +19913,7 @@
       "metal_production_kernel_id": "metal_handwritten_quant_matmul",
       "metal_candidate_kernel_id": "antfly_q4_k_small_batch_bias_msl_v1",
       "metal_candidate_source_path": "src/ops/metal/generated/quant_kernel_q4_k_small_batch_bias.metal",
-      "metal_candidate_source_fingerprint": 13784634528356737611,
+      "metal_candidate_source_fingerprint": 9174552148805600271,
       "metal_fallback_reason": "generated_artifact_missing"
     },
     {
@@ -19946,14 +19946,14 @@
       "cuda_production_kernel_id": "termite_linear_q4_k_bias_gelu_f32_tile4_r2",
       "cuda_candidate_kernel_id": "antfly_q4_k_small_batch_bias_gelu_f32_v1",
       "cuda_candidate_source_path": "src/ops/cuda/generated/quant_kernel_q4_k_small_batch_bias_gelu.cu",
-      "cuda_candidate_source_fingerprint": 17523258165008030516,
+      "cuda_candidate_source_fingerprint": 16327476556059485133,
       "cuda_fallback_reason": "generated_artifact_missing",
       "metal_route": "handwritten_production",
       "metal_candidate_route": "generated_dev_candidate",
       "metal_production_kernel_id": "metal_handwritten_quant_matmul",
       "metal_candidate_kernel_id": "antfly_q4_k_small_batch_bias_gelu_msl_v1",
       "metal_candidate_source_path": "src/ops/metal/generated/quant_kernel_q4_k_small_batch_bias_gelu.metal",
-      "metal_candidate_source_fingerprint": 7382238020243758909,
+      "metal_candidate_source_fingerprint": 6021200818155175788,
       "metal_fallback_reason": "generated_artifact_missing"
     },
     {
@@ -21673,7 +21673,7 @@
       "metal_production_kernel_id": "metal_handwritten_quant_matmul",
       "metal_candidate_kernel_id": "antfly_q5_k_small_batch_bias_msl_v1",
       "metal_candidate_source_path": "src/ops/metal/generated/quant_kernel_q5_k_small_batch_bias.metal",
-      "metal_candidate_source_fingerprint": 16773142682783987479,
+      "metal_candidate_source_fingerprint": 11480949387733967508,
       "metal_fallback_reason": "generated_artifact_missing"
     },
     {
@@ -21713,7 +21713,7 @@
       "metal_production_kernel_id": "metal_handwritten_quant_matmul",
       "metal_candidate_kernel_id": "antfly_q5_k_small_batch_bias_gelu_msl_v1",
       "metal_candidate_source_path": "src/ops/metal/generated/quant_kernel_q5_k_small_batch_bias_gelu.metal",
-      "metal_candidate_source_fingerprint": 7154806025335939833,
+      "metal_candidate_source_fingerprint": 16760308085148793005,
       "metal_fallback_reason": "generated_artifact_missing"
     },
     {
@@ -23266,7 +23266,7 @@
       "cuda_production_kernel_id": "termite_linear_q6_k_q8_1_argmax_rows_stage1_tile8_e4b+termite_argmax_reduce_rows_pairs_f32_w16",
       "cuda_candidate_kernel_id": "antfly_q6_k_q8_1_argmax_rows1_k2560_tile8_v1",
       "cuda_candidate_source_path": "src/ops/cuda/generated/quant_kernel_q6_k_q8_1_argmax_k2560_tile8.cu",
-      "cuda_candidate_source_fingerprint": 5014577000026211658,
+      "cuda_candidate_source_fingerprint": 10744004912810808257,
       "cuda_fallback_reason": "generated_runtime_not_wired",
       "metal_route": "unsupported",
       "metal_candidate_route": "unsupported",
@@ -23433,7 +23433,7 @@
       "metal_production_kernel_id": "metal_handwritten_quant_matmul",
       "metal_candidate_kernel_id": "antfly_q6_k_small_batch_bias_msl_v1",
       "metal_candidate_source_path": "src/ops/metal/generated/quant_kernel_q6_k_small_batch_bias.metal",
-      "metal_candidate_source_fingerprint": 9377387993349476563,
+      "metal_candidate_source_fingerprint": 9852685635647754222,
       "metal_fallback_reason": "generated_artifact_missing"
     },
     {
@@ -23473,7 +23473,7 @@
       "metal_production_kernel_id": "metal_handwritten_quant_matmul",
       "metal_candidate_kernel_id": "antfly_q6_k_small_batch_bias_gelu_msl_v1",
       "metal_candidate_source_path": "src/ops/metal/generated/quant_kernel_q6_k_small_batch_bias_gelu.metal",
-      "metal_candidate_source_fingerprint": 6123961530038843285,
+      "metal_candidate_source_fingerprint": 2726829709665673861,
       "metal_fallback_reason": "generated_artifact_missing"
     },
     {

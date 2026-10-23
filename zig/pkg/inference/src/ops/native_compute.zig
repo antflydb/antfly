@@ -18541,14 +18541,14 @@ fn linearQ4Q5KPreparedQ8KActivationRange(
     }
 }
 
-fn linearQ4Q5KPreparedQ8KActivationPairPanel8Range(
+/// Compile-time projection arity shares one panel schedule without a runtime
+/// projection loop. The same Q8 input block feeds each independent accumulator.
+fn linearQ4Q5KPreparedQ8KActivationGroupedPanel8Range(
+    comptime projection_count: usize,
     q_input: []const u8,
-    prepared_blocks_a: []const u8,
-    panel8_blocks_a: []const u8,
-    output_a: []f32,
-    prepared_blocks_b: []const u8,
-    panel8_blocks_b: []const u8,
-    output_b: []f32,
+    prepared_blocks: [projection_count][]const u8,
+    panel8_blocks: [projection_count][]const u8,
+    outputs: [projection_count][]f32,
     rows: usize,
     in_dim: usize,
     out_dim: usize,
@@ -18561,154 +18561,40 @@ fn linearQ4Q5KPreparedQ8KActivationPairPanel8Range(
     const row_blocks = in_dim / values_per_block;
     const input_row_stride = row_blocks * q8_block_size;
     const prepared_row_stride = row_blocks * prepared_q4_k_block_bytes;
-
+    var body_start = out_start;
+    while (body_start < out_end and body_start % prepared_k_panel8_nr != 0) : (body_start += 1) {}
+    const body_end = body_start + (out_end - body_start) / prepared_k_panel8_nr * prepared_k_panel8_nr;
     for (0..rows) |r| {
         const q_input_row = q_input[r * input_row_stride ..][0..input_row_stride];
-        const out_a = output_a[r * out_dim ..][0..out_dim];
-        const out_b = output_b[r * out_dim ..][0..out_dim];
-        var o: usize = out_start;
-        while (o < out_end and (o % prepared_k_panel8_nr) != 0) : (o += 1) {
-            const prepared_row_a = prepared_blocks_a[o * prepared_row_stride ..][0..prepared_row_stride];
-            const prepared_row_b = prepared_blocks_b[o * prepared_row_stride ..][0..prepared_row_stride];
-            var acc_a: f32 = 0.0;
-            var acc_b: f32 = 0.0;
-            for (0..row_blocks) |block_idx| {
-                const q8_off = block_idx * q8_block_size;
-                const prepared_off = block_idx * prepared_q4_k_block_bytes;
-                const q8_block = q_input_row[q8_off..][0..q8_block_size];
-                acc_a += dotQ4Q5KPreparedQ8KBlock(q8_block, prepared_row_a[prepared_off..][0..prepared_q4_k_block_bytes]);
-                acc_b += dotQ4Q5KPreparedQ8KBlock(q8_block, prepared_row_b[prepared_off..][0..prepared_q4_k_block_bytes]);
-            }
-            out_a[o] = acc_a;
-            out_b[o] = acc_b;
-        }
-        while (o + prepared_k_panel8_nr <= out_end) : (o += prepared_k_panel8_nr) {
-            var acc_a: [prepared_k_panel8_nr]f32 = @as([prepared_k_panel8_nr]f32, @splat(0.0));
-            var acc_b: [prepared_k_panel8_nr]f32 = @as([prepared_k_panel8_nr]f32, @splat(0.0));
-            for (0..row_blocks) |block_idx| {
-                const q8_off = block_idx * q8_block_size;
-                const panel_off = ((o / prepared_k_panel8_nr) * row_blocks + block_idx) * prepared_k_panel8_block_bytes;
-                const q8_block = q_input_row[q8_off..][0..q8_block_size];
-                const sums_a = dotQ4Q5KPreparedQ8KPanel8(q8_block, panel8_blocks_a[panel_off..][0..prepared_k_panel8_block_bytes]);
-                const sums_b = dotQ4Q5KPreparedQ8KPanel8(q8_block, panel8_blocks_b[panel_off..][0..prepared_k_panel8_block_bytes]);
-                inline for (0..prepared_k_panel8_nr) |idx| {
-                    acc_a[idx] += sums_a[idx];
-                    acc_b[idx] += sums_b[idx];
+        var o = out_start;
+        // Prefix and suffix share the scalar schedule; the panel body retains
+        // its original eight independent accumulators and block traversal.
+        while (o < out_end) {
+            if (o >= body_start and o < body_end) {
+                var acc: [projection_count][prepared_k_panel8_nr]f32 = @splat(@splat(0));
+                for (0..row_blocks) |block_idx| {
+                    const q8_block = q_input_row[block_idx * q8_block_size ..][0..q8_block_size];
+                    const panel_off = ((o / prepared_k_panel8_nr) * row_blocks + block_idx) * prepared_k_panel8_block_bytes;
+                    var sums: [projection_count][prepared_k_panel8_nr]f32 = undefined;
+                    inline for (0..projection_count) |pidx| sums[pidx] = dotQ4Q5KPreparedQ8KPanel8(q8_block, panel8_blocks[pidx][panel_off..][0..prepared_k_panel8_block_bytes]);
+                    inline for (0..prepared_k_panel8_nr) |lane| inline for (0..projection_count) |pidx| {
+                        acc[pidx][lane] += sums[pidx][lane];
+                    };
                 }
-            }
-            inline for (0..prepared_k_panel8_nr) |idx| {
-                out_a[o + idx] = acc_a[idx];
-                out_b[o + idx] = acc_b[idx];
-            }
-        }
-        while (o < out_end) : (o += 1) {
-            const prepared_row_a = prepared_blocks_a[o * prepared_row_stride ..][0..prepared_row_stride];
-            const prepared_row_b = prepared_blocks_b[o * prepared_row_stride ..][0..prepared_row_stride];
-            var acc_a: f32 = 0.0;
-            var acc_b: f32 = 0.0;
-            for (0..row_blocks) |block_idx| {
-                const q8_off = block_idx * q8_block_size;
-                const prepared_off = block_idx * prepared_q4_k_block_bytes;
-                const q8_block = q_input_row[q8_off..][0..q8_block_size];
-                acc_a += dotQ4Q5KPreparedQ8KBlock(q8_block, prepared_row_a[prepared_off..][0..prepared_q4_k_block_bytes]);
-                acc_b += dotQ4Q5KPreparedQ8KBlock(q8_block, prepared_row_b[prepared_off..][0..prepared_q4_k_block_bytes]);
-            }
-            out_a[o] = acc_a;
-            out_b[o] = acc_b;
-        }
-    }
-}
-
-fn linearQ4Q5KPreparedQ8KActivationTriplePanel8Range(
-    q_input: []const u8,
-    prepared_blocks_a: []const u8,
-    panel8_blocks_a: []const u8,
-    output_a: []f32,
-    prepared_blocks_b: []const u8,
-    panel8_blocks_b: []const u8,
-    output_b: []f32,
-    prepared_blocks_c: []const u8,
-    panel8_blocks_c: []const u8,
-    output_c: []f32,
-    rows: usize,
-    in_dim: usize,
-    out_dim: usize,
-    out_start: usize,
-    out_end: usize,
-) void {
-    const values_per_block: usize = 256;
-    const q8_block_size: usize = 292;
-    std.debug.assert(in_dim % values_per_block == 0);
-    const row_blocks = in_dim / values_per_block;
-    const input_row_stride = row_blocks * q8_block_size;
-    const prepared_row_stride = row_blocks * prepared_q4_k_block_bytes;
-
-    for (0..rows) |r| {
-        const q_input_row = q_input[r * input_row_stride ..][0..input_row_stride];
-        const out_a = output_a[r * out_dim ..][0..out_dim];
-        const out_b = output_b[r * out_dim ..][0..out_dim];
-        const out_c = output_c[r * out_dim ..][0..out_dim];
-        var o: usize = out_start;
-        while (o < out_end and (o % prepared_k_panel8_nr) != 0) : (o += 1) {
-            const prepared_row_a = prepared_blocks_a[o * prepared_row_stride ..][0..prepared_row_stride];
-            const prepared_row_b = prepared_blocks_b[o * prepared_row_stride ..][0..prepared_row_stride];
-            const prepared_row_c = prepared_blocks_c[o * prepared_row_stride ..][0..prepared_row_stride];
-            var acc_a: f32 = 0.0;
-            var acc_b: f32 = 0.0;
-            var acc_c: f32 = 0.0;
-            for (0..row_blocks) |block_idx| {
-                const q8_off = block_idx * q8_block_size;
-                const prepared_off = block_idx * prepared_q4_k_block_bytes;
-                const q8_block = q_input_row[q8_off..][0..q8_block_size];
-                acc_a += dotQ4Q5KPreparedQ8KBlock(q8_block, prepared_row_a[prepared_off..][0..prepared_q4_k_block_bytes]);
-                acc_b += dotQ4Q5KPreparedQ8KBlock(q8_block, prepared_row_b[prepared_off..][0..prepared_q4_k_block_bytes]);
-                acc_c += dotQ4Q5KPreparedQ8KBlock(q8_block, prepared_row_c[prepared_off..][0..prepared_q4_k_block_bytes]);
-            }
-            out_a[o] = acc_a;
-            out_b[o] = acc_b;
-            out_c[o] = acc_c;
-        }
-        while (o + prepared_k_panel8_nr <= out_end) : (o += prepared_k_panel8_nr) {
-            var acc_a: [prepared_k_panel8_nr]f32 = @as([prepared_k_panel8_nr]f32, @splat(0.0));
-            var acc_b: [prepared_k_panel8_nr]f32 = @as([prepared_k_panel8_nr]f32, @splat(0.0));
-            var acc_c: [prepared_k_panel8_nr]f32 = @as([prepared_k_panel8_nr]f32, @splat(0.0));
-            for (0..row_blocks) |block_idx| {
-                const q8_off = block_idx * q8_block_size;
-                const panel_off = ((o / prepared_k_panel8_nr) * row_blocks + block_idx) * prepared_k_panel8_block_bytes;
-                const q8_block = q_input_row[q8_off..][0..q8_block_size];
-                const sums_a = dotQ4Q5KPreparedQ8KPanel8(q8_block, panel8_blocks_a[panel_off..][0..prepared_k_panel8_block_bytes]);
-                const sums_b = dotQ4Q5KPreparedQ8KPanel8(q8_block, panel8_blocks_b[panel_off..][0..prepared_k_panel8_block_bytes]);
-                const sums_c = dotQ4Q5KPreparedQ8KPanel8(q8_block, panel8_blocks_c[panel_off..][0..prepared_k_panel8_block_bytes]);
-                inline for (0..prepared_k_panel8_nr) |idx| {
-                    acc_a[idx] += sums_a[idx];
-                    acc_b[idx] += sums_b[idx];
-                    acc_c[idx] += sums_c[idx];
+                inline for (0..prepared_k_panel8_nr) |lane| inline for (0..projection_count) |pidx| {
+                    outputs[pidx][r * out_dim + o + lane] = acc[pidx][lane];
+                };
+                o += prepared_k_panel8_nr;
+            } else {
+                var acc: [projection_count]f32 = @splat(0);
+                for (0..row_blocks) |block_idx| {
+                    const q8_block = q_input_row[block_idx * q8_block_size ..][0..q8_block_size];
+                    const prepared_off = o * prepared_row_stride + block_idx * prepared_q4_k_block_bytes;
+                    inline for (0..projection_count) |pidx| acc[pidx] += dotQ4Q5KPreparedQ8KBlock(q8_block, prepared_blocks[pidx][prepared_off..][0..prepared_q4_k_block_bytes]);
                 }
+                inline for (0..projection_count) |pidx| outputs[pidx][r * out_dim + o] = acc[pidx];
+                o += 1;
             }
-            inline for (0..prepared_k_panel8_nr) |idx| {
-                out_a[o + idx] = acc_a[idx];
-                out_b[o + idx] = acc_b[idx];
-                out_c[o + idx] = acc_c[idx];
-            }
-        }
-        while (o < out_end) : (o += 1) {
-            const prepared_row_a = prepared_blocks_a[o * prepared_row_stride ..][0..prepared_row_stride];
-            const prepared_row_b = prepared_blocks_b[o * prepared_row_stride ..][0..prepared_row_stride];
-            const prepared_row_c = prepared_blocks_c[o * prepared_row_stride ..][0..prepared_row_stride];
-            var acc_a: f32 = 0.0;
-            var acc_b: f32 = 0.0;
-            var acc_c: f32 = 0.0;
-            for (0..row_blocks) |block_idx| {
-                const q8_off = block_idx * q8_block_size;
-                const prepared_off = block_idx * prepared_q4_k_block_bytes;
-                const q8_block = q_input_row[q8_off..][0..q8_block_size];
-                acc_a += dotQ4Q5KPreparedQ8KBlock(q8_block, prepared_row_a[prepared_off..][0..prepared_q4_k_block_bytes]);
-                acc_b += dotQ4Q5KPreparedQ8KBlock(q8_block, prepared_row_b[prepared_off..][0..prepared_q4_k_block_bytes]);
-                acc_c += dotQ4Q5KPreparedQ8KBlock(q8_block, prepared_row_c[prepared_off..][0..prepared_q4_k_block_bytes]);
-            }
-            out_a[o] = acc_a;
-            out_b[o] = acc_b;
-            out_c[o] = acc_c;
         }
     }
 }
@@ -21637,46 +21523,37 @@ fn linearQ8_0QuantizedInputGroupedPanel8Range(
     }
 }
 
-fn linearQ8_0QuantizedInputPairRange(
+/// The tuned four-column, two-row schedule is specialized at compilation for
+/// each projection arity. Keep weight loads ahead of arithmetic and retain the
+/// exact per-projection MR2/MR1 helpers and accumulation order.
+fn linearQ8_0QuantizedInputSpecializedRange(
     comptime prepared: bool,
+    comptime projection_count: usize,
     q_input: []const u8,
     input_scales: []const f32,
-    weight_a: []const u8,
-    weight_b: []const u8,
-    panel_a: ?[]const u8,
-    panel_b: ?[]const u8,
-    bias_a: ?[]const f32,
-    bias_b: ?[]const f32,
-    output_a: []f32,
-    output_b: []f32,
+    weight_blocks: [projection_count][]const u8,
+    panel_blocks: [projection_count]?[]const u8,
+    biases: [projection_count]?[]const f32,
+    outputs: [projection_count][]f32,
     rows: usize,
     in_dim: usize,
     out_dim: usize,
     out_start: usize,
     out_end: usize,
 ) void {
-    const block_size: usize = q8_0BlockSize(prepared);
     const values_per_block: usize = 32;
     std.debug.assert(in_dim % values_per_block == 0);
     const row_blocks = in_dim / values_per_block;
-    const row_stride = row_blocks * block_size;
-
+    const row_stride = row_blocks * q8_0BlockSize(prepared);
     var body_start = out_start;
     while (body_start < out_end and (body_start % prepared_q8_0_panel_nr) != 0) : (body_start += 1) {}
     const body_end = if (body_start < out_end)
         body_start + ((out_end - body_start) / prepared_q8_0_panel_nr) * prepared_q8_0_panel_nr
     else
         body_start;
-
-    if (out_start < body_start) {
-        linearQ8_0QuantizedInputGroupedRange(prepared, 2, q_input, input_scales, .{ weight_a, weight_b }, .{ panel_a, panel_b }, .{ bias_a, bias_b }, .{ output_a, output_b }, rows, in_dim, out_dim, out_start, body_start);
-    }
-    if (body_start == body_end) {
-        if (body_end < out_end) {
-            linearQ8_0QuantizedInputGroupedRange(prepared, 2, q_input, input_scales, .{ weight_a, weight_b }, .{ panel_a, panel_b }, .{ bias_a, bias_b }, .{ output_a, output_b }, rows, in_dim, out_dim, body_end, out_end);
-        }
-        return;
-    }
+    if (out_start < body_start) linearQ8_0QuantizedInputGroupedRange(prepared, projection_count, q_input, input_scales, weight_blocks, panel_blocks, biases, outputs, rows, in_dim, out_dim, out_start, body_start);
+    if (body_end < out_end) linearQ8_0QuantizedInputGroupedRange(prepared, projection_count, q_input, input_scales, weight_blocks, panel_blocks, biases, outputs, rows, in_dim, out_dim, body_end, out_end);
+    if (body_start == body_end) return;
 
     var r: usize = 0;
     while (r + 2 <= rows) : (r += 2) {
@@ -21684,475 +21561,102 @@ fn linearQ8_0QuantizedInputPairRange(
         const input_q_row1 = q_input[(r + 1) * row_blocks * values_per_block ..][0 .. row_blocks * values_per_block];
         const input_scale_row0 = input_scales[r * row_blocks ..][0..row_blocks];
         const input_scale_row1 = input_scales[(r + 1) * row_blocks ..][0..row_blocks];
-        const output_a_row0 = output_a[r * out_dim ..][0..out_dim];
-        const output_a_row1 = output_a[(r + 1) * out_dim ..][0..out_dim];
-        const output_b_row0 = output_b[r * out_dim ..][0..out_dim];
-        const output_b_row1 = output_b[(r + 1) * out_dim ..][0..out_dim];
         var o = body_start;
         while (o < body_end) : (o += prepared_q8_0_panel_nr) {
-            var acc_a0 = [_]f32{
-                optionalLinearBiasAt(bias_a, o),
-                optionalLinearBiasAt(bias_a, o + 1),
-                optionalLinearBiasAt(bias_a, o + 2),
-                optionalLinearBiasAt(bias_a, o + 3),
+            var acc0: [projection_count][prepared_q8_0_panel_nr]f32 = undefined;
+            inline for (0..projection_count) |pidx| inline for (0..prepared_q8_0_panel_nr) |lane| {
+                acc0[pidx][lane] = optionalLinearBiasAt(biases[pidx], o + lane);
             };
-            var acc_a1 = acc_a0;
-            var acc_b0 = [_]f32{
-                optionalLinearBiasAt(bias_b, o),
-                optionalLinearBiasAt(bias_b, o + 1),
-                optionalLinearBiasAt(bias_b, o + 2),
-                optionalLinearBiasAt(bias_b, o + 3),
-            };
-            var acc_b1 = acc_b0;
+            var acc1 = acc0;
             for (0..row_blocks) |block_idx| {
                 const qx0: *const [32]u8 = input_q_row0[block_idx * values_per_block ..][0..32];
                 const qx1: *const [32]u8 = input_q_row1[block_idx * values_per_block ..][0..32];
-                const input_scale0 = input_scale_row0[block_idx];
-                const input_scale1 = input_scale_row1[block_idx];
-                const weights_a = q8_0QuantizedWeightBlock4(prepared, weight_a, panel_a, row_blocks, row_stride, o, block_idx, true);
-                const weights_b = q8_0QuantizedWeightBlock4(prepared, weight_b, panel_b, row_blocks, row_stride, o, block_idx, true);
-                q8_0AddDot4MR2(prepared, qx0, qx1, input_scale0, input_scale1, weights_a[0], weights_a[1], weights_a[2], weights_a[3], &acc_a0, &acc_a1);
-                q8_0AddDot4MR2(prepared, qx0, qx1, input_scale0, input_scale1, weights_b[0], weights_b[1], weights_b[2], weights_b[3], &acc_b0, &acc_b1);
+                var weights: [projection_count][4][]const u8 = undefined;
+                inline for (0..projection_count) |pidx| weights[pidx] = q8_0QuantizedWeightBlock4(prepared, weight_blocks[pidx], panel_blocks[pidx], row_blocks, row_stride, o, block_idx, true);
+                inline for (0..projection_count) |pidx| q8_0AddDot4MR2(prepared, qx0, qx1, input_scale_row0[block_idx], input_scale_row1[block_idx], weights[pidx][0], weights[pidx][1], weights[pidx][2], weights[pidx][3], &acc0[pidx], &acc1[pidx]);
             }
-            inline for (0..prepared_q8_0_panel_nr) |lane| {
-                output_a_row0[o + lane] = acc_a0[lane];
-                output_a_row1[o + lane] = acc_a1[lane];
-                output_b_row0[o + lane] = acc_b0[lane];
-                output_b_row1[o + lane] = acc_b1[lane];
-            }
+            inline for (0..prepared_q8_0_panel_nr) |lane| inline for (0..projection_count) |pidx| {
+                outputs[pidx][r * out_dim + o + lane] = acc0[pidx][lane];
+                outputs[pidx][(r + 1) * out_dim + o + lane] = acc1[pidx][lane];
+            };
         }
     }
-
     while (r < rows) : (r += 1) {
         const input_q_row = q_input[r * row_blocks * values_per_block ..][0 .. row_blocks * values_per_block];
         const input_scale_row = input_scales[r * row_blocks ..][0..row_blocks];
-        const output_a_row = output_a[r * out_dim ..][0..out_dim];
-        const output_b_row = output_b[r * out_dim ..][0..out_dim];
         var o = body_start;
         while (o < body_end) : (o += prepared_q8_0_panel_nr) {
-            var acc_a = [_]f32{
-                optionalLinearBiasAt(bias_a, o),
-                optionalLinearBiasAt(bias_a, o + 1),
-                optionalLinearBiasAt(bias_a, o + 2),
-                optionalLinearBiasAt(bias_a, o + 3),
-            };
-            var acc_b = [_]f32{
-                optionalLinearBiasAt(bias_b, o),
-                optionalLinearBiasAt(bias_b, o + 1),
-                optionalLinearBiasAt(bias_b, o + 2),
-                optionalLinearBiasAt(bias_b, o + 3),
+            var acc: [projection_count][prepared_q8_0_panel_nr]f32 = undefined;
+            inline for (0..projection_count) |pidx| inline for (0..prepared_q8_0_panel_nr) |lane| {
+                acc[pidx][lane] = optionalLinearBiasAt(biases[pidx], o + lane);
             };
             for (0..row_blocks) |block_idx| {
                 const qx: *const [32]u8 = input_q_row[block_idx * values_per_block ..][0..32];
-                const input_scale = input_scale_row[block_idx];
-                const weights_a = q8_0QuantizedWeightBlock4(prepared, weight_a, panel_a, row_blocks, row_stride, o, block_idx, true);
-                const weights_b = q8_0QuantizedWeightBlock4(prepared, weight_b, panel_b, row_blocks, row_stride, o, block_idx, true);
-                q8_0AddDot4MR1(prepared, qx, input_scale, weights_a[0], weights_a[1], weights_a[2], weights_a[3], &acc_a);
-                q8_0AddDot4MR1(prepared, qx, input_scale, weights_b[0], weights_b[1], weights_b[2], weights_b[3], &acc_b);
+                var weights: [projection_count][4][]const u8 = undefined;
+                inline for (0..projection_count) |pidx| weights[pidx] = q8_0QuantizedWeightBlock4(prepared, weight_blocks[pidx], panel_blocks[pidx], row_blocks, row_stride, o, block_idx, true);
+                inline for (0..projection_count) |pidx| q8_0AddDot4MR1(prepared, qx, input_scale_row[block_idx], weights[pidx][0], weights[pidx][1], weights[pidx][2], weights[pidx][3], &acc[pidx]);
             }
-            inline for (0..prepared_q8_0_panel_nr) |lane| {
-                output_a_row[o + lane] = acc_a[lane];
-                output_b_row[o + lane] = acc_b[lane];
-            }
+            inline for (0..prepared_q8_0_panel_nr) |lane| inline for (0..projection_count) |pidx| {
+                outputs[pidx][r * out_dim + o + lane] = acc[pidx][lane];
+            };
         }
-    }
-
-    if (body_end < out_end) {
-        linearQ8_0QuantizedInputGroupedRange(prepared, 2, q_input, input_scales, .{ weight_a, weight_b }, .{ panel_a, panel_b }, .{ bias_a, bias_b }, .{ output_a, output_b }, rows, in_dim, out_dim, body_end, out_end);
     }
 }
 
-fn linearQ8_0QuantizedInputTripleRange(
-    comptime prepared: bool,
+/// Resolve grouped storage and schedule once for every projection arity.
+/// Mixed prepared/raw groups retain their per-projection fallback.
+inline fn q8_0ActivationGroupedApply(
+    comptime projection_count: usize,
     q_input: []const u8,
     input_scales: []const f32,
-    weight_a: []const u8,
-    weight_b: []const u8,
-    weight_c: []const u8,
-    panel_a: ?[]const u8,
-    panel_b: ?[]const u8,
-    panel_c: ?[]const u8,
-    bias_a: ?[]const f32,
-    bias_b: ?[]const f32,
-    bias_c: ?[]const f32,
-    output_a: []f32,
-    output_b: []f32,
-    output_c: []f32,
+    raw: [projection_count][]const u8,
+    prepared: [projection_count]?[]const u8,
+    panels: [projection_count]?[]const u8,
+    panels8: [projection_count]?[]const u8,
+    biases: [projection_count]?[]const f32,
+    outputs: [projection_count][]f32,
     rows: usize,
     in_dim: usize,
     out_dim: usize,
     out_start: usize,
     out_end: usize,
 ) void {
-    const block_size: usize = q8_0BlockSize(prepared);
-    const values_per_block: usize = 32;
-    std.debug.assert(in_dim % values_per_block == 0);
-    const row_blocks = in_dim / values_per_block;
-    const row_stride = row_blocks * block_size;
-
-    var r: usize = 0;
-    while (r + 2 <= rows) : (r += 2) {
-        const input_q_row0 = q_input[r * row_blocks * values_per_block ..][0 .. row_blocks * values_per_block];
-        const input_q_row1 = q_input[(r + 1) * row_blocks * values_per_block ..][0 .. row_blocks * values_per_block];
-        const input_scale_row0 = input_scales[r * row_blocks ..][0..row_blocks];
-        const input_scale_row1 = input_scales[(r + 1) * row_blocks ..][0..row_blocks];
-        const output_a_row0 = output_a[r * out_dim ..][0..out_dim];
-        const output_a_row1 = output_a[(r + 1) * out_dim ..][0..out_dim];
-        const output_b_row0 = output_b[r * out_dim ..][0..out_dim];
-        const output_b_row1 = output_b[(r + 1) * out_dim ..][0..out_dim];
-        const output_c_row0 = output_c[r * out_dim ..][0..out_dim];
-        const output_c_row1 = output_c[(r + 1) * out_dim ..][0..out_dim];
-        var o: usize = out_start;
-        while (o < out_end and (o % prepared_q8_0_panel_nr) != 0) : (o += 1) {
-            var acc_a0 = optionalLinearBiasAt(bias_a, o);
-            var acc_a1 = acc_a0;
-            var acc_b0 = optionalLinearBiasAt(bias_b, o);
-            var acc_b1 = acc_b0;
-            var acc_c0 = optionalLinearBiasAt(bias_c, o);
-            var acc_c1 = acc_c0;
-            for (0..row_blocks) |block_idx| {
-                const qx0: *const [32]u8 = input_q_row0[block_idx * values_per_block ..][0..32];
-                const qx1: *const [32]u8 = input_q_row1[block_idx * values_per_block ..][0..32];
-                const input_scale0 = input_scale_row0[block_idx];
-                const input_scale1 = input_scale_row1[block_idx];
-                q8_0AddDotMR2(prepared, qx0, qx1, input_scale0, input_scale1, q8_0QuantizedWeightBlock(prepared, weight_a, panel_a, row_blocks, row_stride, o, block_idx, false), &acc_a0, &acc_a1);
-                q8_0AddDotMR2(prepared, qx0, qx1, input_scale0, input_scale1, q8_0QuantizedWeightBlock(prepared, weight_b, panel_b, row_blocks, row_stride, o, block_idx, false), &acc_b0, &acc_b1);
-                q8_0AddDotMR2(prepared, qx0, qx1, input_scale0, input_scale1, q8_0QuantizedWeightBlock(prepared, weight_c, panel_c, row_blocks, row_stride, o, block_idx, false), &acc_c0, &acc_c1);
-            }
-            output_a_row0[o] = acc_a0;
-            output_a_row1[o] = acc_a1;
-            output_b_row0[o] = acc_b0;
-            output_b_row1[o] = acc_b1;
-            output_c_row0[o] = acc_c0;
-            output_c_row1[o] = acc_c1;
-        }
-        while (o + prepared_q8_0_panel_nr <= out_end) : (o += prepared_q8_0_panel_nr) {
-            var acc_a0 = [_]f32{
-                optionalLinearBiasAt(bias_a, o),
-                optionalLinearBiasAt(bias_a, o + 1),
-                optionalLinearBiasAt(bias_a, o + 2),
-                optionalLinearBiasAt(bias_a, o + 3),
-            };
-            var acc_a1 = acc_a0;
-            var acc_b0 = [_]f32{
-                optionalLinearBiasAt(bias_b, o),
-                optionalLinearBiasAt(bias_b, o + 1),
-                optionalLinearBiasAt(bias_b, o + 2),
-                optionalLinearBiasAt(bias_b, o + 3),
-            };
-            var acc_b1 = acc_b0;
-            var acc_c0 = [_]f32{
-                optionalLinearBiasAt(bias_c, o),
-                optionalLinearBiasAt(bias_c, o + 1),
-                optionalLinearBiasAt(bias_c, o + 2),
-                optionalLinearBiasAt(bias_c, o + 3),
-            };
-            var acc_c1 = acc_c0;
-            for (0..row_blocks) |block_idx| {
-                const qx0: *const [32]u8 = input_q_row0[block_idx * values_per_block ..][0..32];
-                const qx1: *const [32]u8 = input_q_row1[block_idx * values_per_block ..][0..32];
-                const input_scale0 = input_scale_row0[block_idx];
-                const input_scale1 = input_scale_row1[block_idx];
-                const weights_a = q8_0QuantizedWeightBlock4(prepared, weight_a, panel_a, row_blocks, row_stride, o, block_idx, true);
-                const weights_b = q8_0QuantizedWeightBlock4(prepared, weight_b, panel_b, row_blocks, row_stride, o, block_idx, true);
-                const weights_c = q8_0QuantizedWeightBlock4(prepared, weight_c, panel_c, row_blocks, row_stride, o, block_idx, true);
-                q8_0AddDot4MR2(
-                    prepared,
-                    qx0,
-                    qx1,
-                    input_scale0,
-                    input_scale1,
-                    weights_a[0],
-                    weights_a[1],
-                    weights_a[2],
-                    weights_a[3],
-                    &acc_a0,
-                    &acc_a1,
-                );
-                q8_0AddDot4MR2(
-                    prepared,
-                    qx0,
-                    qx1,
-                    input_scale0,
-                    input_scale1,
-                    weights_b[0],
-                    weights_b[1],
-                    weights_b[2],
-                    weights_b[3],
-                    &acc_b0,
-                    &acc_b1,
-                );
-                q8_0AddDot4MR2(
-                    prepared,
-                    qx0,
-                    qx1,
-                    input_scale0,
-                    input_scale1,
-                    weights_c[0],
-                    weights_c[1],
-                    weights_c[2],
-                    weights_c[3],
-                    &acc_c0,
-                    &acc_c1,
-                );
-            }
-            inline for (0..prepared_q8_0_panel_nr) |lane| {
-                output_a_row0[o + lane] = acc_a0[lane];
-                output_a_row1[o + lane] = acc_a1[lane];
-                output_b_row0[o + lane] = acc_b0[lane];
-                output_b_row1[o + lane] = acc_b1[lane];
-                output_c_row0[o + lane] = acc_c0[lane];
-                output_c_row1[o + lane] = acc_c1[lane];
-            }
-        }
-        while (o < out_end) : (o += 1) {
-            var acc_a0 = optionalLinearBiasAt(bias_a, o);
-            var acc_a1 = acc_a0;
-            var acc_b0 = optionalLinearBiasAt(bias_b, o);
-            var acc_b1 = acc_b0;
-            var acc_c0 = optionalLinearBiasAt(bias_c, o);
-            var acc_c1 = acc_c0;
-            for (0..row_blocks) |block_idx| {
-                const qx0: *const [32]u8 = input_q_row0[block_idx * values_per_block ..][0..32];
-                const qx1: *const [32]u8 = input_q_row1[block_idx * values_per_block ..][0..32];
-                const input_scale0 = input_scale_row0[block_idx];
-                const input_scale1 = input_scale_row1[block_idx];
-                q8_0AddDotMR2(prepared, qx0, qx1, input_scale0, input_scale1, q8_0QuantizedWeightBlock(prepared, weight_a, panel_a, row_blocks, row_stride, o, block_idx, false), &acc_a0, &acc_a1);
-                q8_0AddDotMR2(prepared, qx0, qx1, input_scale0, input_scale1, q8_0QuantizedWeightBlock(prepared, weight_b, panel_b, row_blocks, row_stride, o, block_idx, false), &acc_b0, &acc_b1);
-                q8_0AddDotMR2(prepared, qx0, qx1, input_scale0, input_scale1, q8_0QuantizedWeightBlock(prepared, weight_c, panel_c, row_blocks, row_stride, o, block_idx, false), &acc_c0, &acc_c1);
-            }
-            output_a_row0[o] = acc_a0;
-            output_a_row1[o] = acc_a1;
-            output_b_row0[o] = acc_b0;
-            output_b_row1[o] = acc_b1;
-            output_c_row0[o] = acc_c0;
-            output_c_row1[o] = acc_c1;
-        }
+    const interleaved = q8_0GroupedInterleavedEnabledForShape(rows, out_dim, in_dim / 32, projection_count);
+    var all_prepared = true;
+    var none_prepared = true;
+    var all_panel8 = true;
+    var blocks: [projection_count][]const u8 = undefined;
+    var panel8_blocks: [projection_count][]const u8 = undefined;
+    inline for (0..projection_count) |pidx| {
+        if (prepared[pidx]) |bytes| {
+            blocks[pidx] = bytes;
+            none_prepared = false;
+        } else all_prepared = false;
+        if (panels8[pidx]) |bytes| {
+            panel8_blocks[pidx] = bytes;
+        } else all_panel8 = false;
     }
-
-    while (r < rows) : (r += 1) {
-        const input_q_row = q_input[r * row_blocks * values_per_block ..][0 .. row_blocks * values_per_block];
-        const input_scale_row = input_scales[r * row_blocks ..][0..row_blocks];
-        const output_a_row = output_a[r * out_dim ..][0..out_dim];
-        const output_b_row = output_b[r * out_dim ..][0..out_dim];
-        const output_c_row = output_c[r * out_dim ..][0..out_dim];
-        var o: usize = out_start;
-        while (o < out_end and (o % prepared_q8_0_panel_nr) != 0) : (o += 1) {
-            var acc_a = optionalLinearBiasAt(bias_a, o);
-            var acc_b = optionalLinearBiasAt(bias_b, o);
-            var acc_c = optionalLinearBiasAt(bias_c, o);
-            for (0..row_blocks) |block_idx| {
-                const qx: *const [32]u8 = input_q_row[block_idx * values_per_block ..][0..32];
-                const input_scale = input_scale_row[block_idx];
-                q8_0AddDotMR1(prepared, qx, input_scale, q8_0QuantizedWeightBlock(prepared, weight_a, panel_a, row_blocks, row_stride, o, block_idx, false), &acc_a);
-                q8_0AddDotMR1(prepared, qx, input_scale, q8_0QuantizedWeightBlock(prepared, weight_b, panel_b, row_blocks, row_stride, o, block_idx, false), &acc_b);
-                q8_0AddDotMR1(prepared, qx, input_scale, q8_0QuantizedWeightBlock(prepared, weight_c, panel_c, row_blocks, row_stride, o, block_idx, false), &acc_c);
-            }
-            output_a_row[o] = acc_a;
-            output_b_row[o] = acc_b;
-            output_c_row[o] = acc_c;
-        }
-        while (o + prepared_q8_0_panel_nr <= out_end) : (o += prepared_q8_0_panel_nr) {
-            var acc_a = [_]f32{
-                optionalLinearBiasAt(bias_a, o),
-                optionalLinearBiasAt(bias_a, o + 1),
-                optionalLinearBiasAt(bias_a, o + 2),
-                optionalLinearBiasAt(bias_a, o + 3),
-            };
-            var acc_b = [_]f32{
-                optionalLinearBiasAt(bias_b, o),
-                optionalLinearBiasAt(bias_b, o + 1),
-                optionalLinearBiasAt(bias_b, o + 2),
-                optionalLinearBiasAt(bias_b, o + 3),
-            };
-            var acc_c = [_]f32{
-                optionalLinearBiasAt(bias_c, o),
-                optionalLinearBiasAt(bias_c, o + 1),
-                optionalLinearBiasAt(bias_c, o + 2),
-                optionalLinearBiasAt(bias_c, o + 3),
-            };
-            for (0..row_blocks) |block_idx| {
-                const qx: *const [32]u8 = input_q_row[block_idx * values_per_block ..][0..32];
-                const input_scale = input_scale_row[block_idx];
-                const weights_a = q8_0QuantizedWeightBlock4(prepared, weight_a, panel_a, row_blocks, row_stride, o, block_idx, true);
-                const weights_b = q8_0QuantizedWeightBlock4(prepared, weight_b, panel_b, row_blocks, row_stride, o, block_idx, true);
-                const weights_c = q8_0QuantizedWeightBlock4(prepared, weight_c, panel_c, row_blocks, row_stride, o, block_idx, true);
-                q8_0AddDot4MR1(
-                    prepared,
-                    qx,
-                    input_scale,
-                    weights_a[0],
-                    weights_a[1],
-                    weights_a[2],
-                    weights_a[3],
-                    &acc_a,
-                );
-                q8_0AddDot4MR1(
-                    prepared,
-                    qx,
-                    input_scale,
-                    weights_b[0],
-                    weights_b[1],
-                    weights_b[2],
-                    weights_b[3],
-                    &acc_b,
-                );
-                q8_0AddDot4MR1(
-                    prepared,
-                    qx,
-                    input_scale,
-                    weights_c[0],
-                    weights_c[1],
-                    weights_c[2],
-                    weights_c[3],
-                    &acc_c,
-                );
-            }
-            inline for (0..prepared_q8_0_panel_nr) |lane| {
-                output_a_row[o + lane] = acc_a[lane];
-                output_b_row[o + lane] = acc_b[lane];
-                output_c_row[o + lane] = acc_c[lane];
-            }
-        }
-        while (o < out_end) : (o += 1) {
-            var acc_a = optionalLinearBiasAt(bias_a, o);
-            var acc_b = optionalLinearBiasAt(bias_b, o);
-            var acc_c = optionalLinearBiasAt(bias_c, o);
-            for (0..row_blocks) |block_idx| {
-                const qx: *const [32]u8 = input_q_row[block_idx * values_per_block ..][0..32];
-                const input_scale = input_scale_row[block_idx];
-                q8_0AddDotMR1(prepared, qx, input_scale, q8_0QuantizedWeightBlock(prepared, weight_a, panel_a, row_blocks, row_stride, o, block_idx, false), &acc_a);
-                q8_0AddDotMR1(prepared, qx, input_scale, q8_0QuantizedWeightBlock(prepared, weight_b, panel_b, row_blocks, row_stride, o, block_idx, false), &acc_b);
-                q8_0AddDotMR1(prepared, qx, input_scale, q8_0QuantizedWeightBlock(prepared, weight_c, panel_c, row_blocks, row_stride, o, block_idx, false), &acc_c);
-            }
-            output_a_row[o] = acc_a;
-            output_b_row[o] = acc_b;
-            output_c_row[o] = acc_c;
-        }
-    }
-}
-
-fn q8_0ActivationPairApply(
-    q_input: []const u8,
-    input_scales: []const f32,
-    weight_raw_a: []const u8,
-    prepared_blocks_a: ?[]const u8,
-    prepared_panel_blocks_a: ?[]const u8,
-    prepared_panel8_blocks_a: ?[]const u8,
-    bias_a: ?[]const f32,
-    output_a: []f32,
-    weight_raw_b: []const u8,
-    prepared_blocks_b: ?[]const u8,
-    prepared_panel_blocks_b: ?[]const u8,
-    prepared_panel8_blocks_b: ?[]const u8,
-    bias_b: ?[]const f32,
-    output_b: []f32,
-    rows: usize,
-    in_dim: usize,
-    out_dim: usize,
-    out_start: usize,
-    out_end: usize,
-) void {
-    const row_blocks = in_dim / 32;
-    const use_interleaved = q8_0GroupedInterleavedEnabledForShape(rows, out_dim, row_blocks, 2);
-    if (prepared_blocks_a) |blocks_a| {
-        if (prepared_blocks_b) |blocks_b| {
-            if (use_interleaved) {
-                if (q8_0Panel8PairDirectEnabled() and prepared_panel8_blocks_a != null and prepared_panel8_blocks_b != null) {
-                    linearQ8_0QuantizedInputGroupedPanel8Range(2, q_input, input_scales, .{ blocks_a, blocks_b }, .{ prepared_panel_blocks_a, prepared_panel_blocks_b }, .{ prepared_panel8_blocks_a.?, prepared_panel8_blocks_b.? }, .{ bias_a, bias_b }, .{ output_a, output_b }, rows, in_dim, out_dim, out_start, out_end);
-                } else if (q8_0PairSpecializedEnabled()) {
-                    linearQ8_0QuantizedInputPairRange(true, q_input, input_scales, blocks_a, blocks_b, prepared_panel_blocks_a, prepared_panel_blocks_b, bias_a, bias_b, output_a, output_b, rows, in_dim, out_dim, out_start, out_end);
-                } else {
-                    linearQ8_0QuantizedInputGroupedRange(true, 2, q_input, input_scales, .{ blocks_a, blocks_b }, .{ prepared_panel_blocks_a, prepared_panel_blocks_b }, .{ bias_a, bias_b }, .{ output_a, output_b }, rows, in_dim, out_dim, out_start, out_end);
-                }
-            } else {
-                q8_0ActivationApply(q_input, input_scales, weight_raw_a, prepared_blocks_a, prepared_panel_blocks_a, prepared_panel8_blocks_a, bias_a, output_a, rows, in_dim, out_dim, out_start, out_end);
-                q8_0ActivationApply(q_input, input_scales, weight_raw_b, prepared_blocks_b, prepared_panel_blocks_b, prepared_panel8_blocks_b, bias_b, output_b, rows, in_dim, out_dim, out_start, out_end);
-            }
-            return;
-        }
-    } else if (prepared_blocks_b == null) {
-        if (use_interleaved) {
-            if (q8_0PairSpecializedEnabled()) {
-                linearQ8_0QuantizedInputPairRange(false, q_input, input_scales, weight_raw_a, weight_raw_b, null, null, bias_a, bias_b, output_a, output_b, rows, in_dim, out_dim, out_start, out_end);
-            } else {
-                linearQ8_0QuantizedInputGroupedRange(false, 2, q_input, input_scales, .{ weight_raw_a, weight_raw_b }, .{ null, null }, .{ bias_a, bias_b }, .{ output_a, output_b }, rows, in_dim, out_dim, out_start, out_end);
-            }
+    const specialized = if (projection_count == 2) q8_0PairSpecializedEnabled() else q8_0TripleSpecializedEnabled();
+    const panel8_enabled = if (projection_count == 2) q8_0Panel8PairDirectEnabled() else q8_0Panel8TripleDirectEnabled();
+    if (interleaved and all_prepared) {
+        if (panel8_enabled and all_panel8) {
+            linearQ8_0QuantizedInputGroupedPanel8Range(projection_count, q_input, input_scales, blocks, panels, panel8_blocks, biases, outputs, rows, in_dim, out_dim, out_start, out_end);
+        } else if (specialized) {
+            linearQ8_0QuantizedInputSpecializedRange(true, projection_count, q_input, input_scales, blocks, panels, biases, outputs, rows, in_dim, out_dim, out_start, out_end);
         } else {
-            q8_0ActivationApply(q_input, input_scales, weight_raw_a, prepared_blocks_a, prepared_panel_blocks_a, prepared_panel8_blocks_a, bias_a, output_a, rows, in_dim, out_dim, out_start, out_end);
-            q8_0ActivationApply(q_input, input_scales, weight_raw_b, prepared_blocks_b, prepared_panel_blocks_b, prepared_panel8_blocks_b, bias_b, output_b, rows, in_dim, out_dim, out_start, out_end);
+            linearQ8_0QuantizedInputGroupedRange(true, projection_count, q_input, input_scales, blocks, panels, biases, outputs, rows, in_dim, out_dim, out_start, out_end);
         }
         return;
     }
-    q8_0ActivationApply(q_input, input_scales, weight_raw_a, prepared_blocks_a, prepared_panel_blocks_a, prepared_panel8_blocks_a, bias_a, output_a, rows, in_dim, out_dim, out_start, out_end);
-    q8_0ActivationApply(q_input, input_scales, weight_raw_b, prepared_blocks_b, prepared_panel_blocks_b, prepared_panel8_blocks_b, bias_b, output_b, rows, in_dim, out_dim, out_start, out_end);
-}
-
-fn q8_0ActivationTripleApply(
-    q_input: []const u8,
-    input_scales: []const f32,
-    weight_raw_a: []const u8,
-    prepared_blocks_a: ?[]const u8,
-    prepared_panel_blocks_a: ?[]const u8,
-    prepared_panel8_blocks_a: ?[]const u8,
-    bias_a: ?[]const f32,
-    output_a: []f32,
-    weight_raw_b: []const u8,
-    prepared_blocks_b: ?[]const u8,
-    prepared_panel_blocks_b: ?[]const u8,
-    prepared_panel8_blocks_b: ?[]const u8,
-    bias_b: ?[]const f32,
-    output_b: []f32,
-    weight_raw_c: []const u8,
-    prepared_blocks_c: ?[]const u8,
-    prepared_panel_blocks_c: ?[]const u8,
-    prepared_panel8_blocks_c: ?[]const u8,
-    bias_c: ?[]const f32,
-    output_c: []f32,
-    rows: usize,
-    in_dim: usize,
-    out_dim: usize,
-    out_start: usize,
-    out_end: usize,
-) void {
-    const row_blocks = in_dim / 32;
-    const use_interleaved = q8_0GroupedInterleavedEnabledForShape(rows, out_dim, row_blocks, 3);
-    if (prepared_blocks_a) |blocks_a| {
-        if (prepared_blocks_b) |blocks_b| {
-            if (prepared_blocks_c) |blocks_c| {
-                if (use_interleaved) {
-                    if (q8_0Panel8TripleDirectEnabled() and prepared_panel8_blocks_a != null and prepared_panel8_blocks_b != null and prepared_panel8_blocks_c != null) {
-                        linearQ8_0QuantizedInputGroupedPanel8Range(3, q_input, input_scales, .{ blocks_a, blocks_b, blocks_c }, .{ prepared_panel_blocks_a, prepared_panel_blocks_b, prepared_panel_blocks_c }, .{ prepared_panel8_blocks_a.?, prepared_panel8_blocks_b.?, prepared_panel8_blocks_c.? }, .{ bias_a, bias_b, bias_c }, .{ output_a, output_b, output_c }, rows, in_dim, out_dim, out_start, out_end);
-                    } else if (q8_0TripleSpecializedEnabled()) {
-                        linearQ8_0QuantizedInputTripleRange(true, q_input, input_scales, blocks_a, blocks_b, blocks_c, prepared_panel_blocks_a, prepared_panel_blocks_b, prepared_panel_blocks_c, bias_a, bias_b, bias_c, output_a, output_b, output_c, rows, in_dim, out_dim, out_start, out_end);
-                    } else {
-                        linearQ8_0QuantizedInputGroupedRange(true, 3, q_input, input_scales, .{ blocks_a, blocks_b, blocks_c }, .{ prepared_panel_blocks_a, prepared_panel_blocks_b, prepared_panel_blocks_c }, .{ bias_a, bias_b, bias_c }, .{ output_a, output_b, output_c }, rows, in_dim, out_dim, out_start, out_end);
-                    }
-                } else {
-                    q8_0ActivationApply(q_input, input_scales, weight_raw_a, prepared_blocks_a, prepared_panel_blocks_a, prepared_panel8_blocks_a, bias_a, output_a, rows, in_dim, out_dim, out_start, out_end);
-                    q8_0ActivationApply(q_input, input_scales, weight_raw_b, prepared_blocks_b, prepared_panel_blocks_b, prepared_panel8_blocks_b, bias_b, output_b, rows, in_dim, out_dim, out_start, out_end);
-                    q8_0ActivationApply(q_input, input_scales, weight_raw_c, prepared_blocks_c, prepared_panel_blocks_c, prepared_panel8_blocks_c, bias_c, output_c, rows, in_dim, out_dim, out_start, out_end);
-                }
-                return;
-            }
-        }
-    } else if (prepared_blocks_b == null and prepared_blocks_c == null) {
-        if (use_interleaved) {
-            if (q8_0TripleSpecializedEnabled()) {
-                linearQ8_0QuantizedInputTripleRange(false, q_input, input_scales, weight_raw_a, weight_raw_b, weight_raw_c, null, null, null, bias_a, bias_b, bias_c, output_a, output_b, output_c, rows, in_dim, out_dim, out_start, out_end);
-            } else {
-                linearQ8_0QuantizedInputGroupedRange(false, 3, q_input, input_scales, .{ weight_raw_a, weight_raw_b, weight_raw_c }, .{ null, null, null }, .{ bias_a, bias_b, bias_c }, .{ output_a, output_b, output_c }, rows, in_dim, out_dim, out_start, out_end);
-            }
+    if (interleaved and none_prepared) {
+        if (specialized) {
+            linearQ8_0QuantizedInputSpecializedRange(false, projection_count, q_input, input_scales, raw, @splat(null), biases, outputs, rows, in_dim, out_dim, out_start, out_end);
         } else {
-            q8_0ActivationApply(q_input, input_scales, weight_raw_a, prepared_blocks_a, prepared_panel_blocks_a, prepared_panel8_blocks_a, bias_a, output_a, rows, in_dim, out_dim, out_start, out_end);
-            q8_0ActivationApply(q_input, input_scales, weight_raw_b, prepared_blocks_b, prepared_panel_blocks_b, prepared_panel8_blocks_b, bias_b, output_b, rows, in_dim, out_dim, out_start, out_end);
-            q8_0ActivationApply(q_input, input_scales, weight_raw_c, prepared_blocks_c, prepared_panel_blocks_c, prepared_panel8_blocks_c, bias_c, output_c, rows, in_dim, out_dim, out_start, out_end);
+            linearQ8_0QuantizedInputGroupedRange(false, projection_count, q_input, input_scales, raw, @splat(null), biases, outputs, rows, in_dim, out_dim, out_start, out_end);
         }
         return;
     }
-    q8_0ActivationApply(q_input, input_scales, weight_raw_a, prepared_blocks_a, prepared_panel_blocks_a, prepared_panel8_blocks_a, bias_a, output_a, rows, in_dim, out_dim, out_start, out_end);
-    q8_0ActivationApply(q_input, input_scales, weight_raw_b, prepared_blocks_b, prepared_panel_blocks_b, prepared_panel8_blocks_b, bias_b, output_b, rows, in_dim, out_dim, out_start, out_end);
-    q8_0ActivationApply(q_input, input_scales, weight_raw_c, prepared_blocks_c, prepared_panel_blocks_c, prepared_panel8_blocks_c, bias_c, output_c, rows, in_dim, out_dim, out_start, out_end);
+    inline for (0..projection_count) |pidx| q8_0ActivationApply(q_input, input_scales, raw[pidx], prepared[pidx], panels[pidx], panels8[pidx], biases[pidx], outputs[pidx], rows, in_dim, out_dim, out_start, out_end);
 }
 
 fn q8_0ActivationWorker(ctx: *Q8_0ActivationWorkerCtx) void {
@@ -22174,11 +21678,11 @@ fn q8_0ActivationWorker(ctx: *Q8_0ActivationWorkerCtx) void {
 }
 
 fn q8_0ActivationPairWorker(ctx: *Q8_0ActivationPairWorkerCtx) void {
-    q8_0ActivationPairApply(ctx.q_input, ctx.input_scales, ctx.weight_raw_a, ctx.prepared_blocks_a, ctx.prepared_panel_blocks_a, ctx.prepared_panel8_blocks_a, ctx.bias_a, ctx.output_a, ctx.weight_raw_b, ctx.prepared_blocks_b, ctx.prepared_panel_blocks_b, ctx.prepared_panel8_blocks_b, ctx.bias_b, ctx.output_b, ctx.rows, ctx.in_dim, ctx.out_dim, ctx.out_start, ctx.out_end);
+    q8_0ActivationGroupedApply(2, ctx.q_input, ctx.input_scales, .{ ctx.weight_raw_a, ctx.weight_raw_b }, .{ ctx.prepared_blocks_a, ctx.prepared_blocks_b }, .{ ctx.prepared_panel_blocks_a, ctx.prepared_panel_blocks_b }, .{ ctx.prepared_panel8_blocks_a, ctx.prepared_panel8_blocks_b }, .{ ctx.bias_a, ctx.bias_b }, .{ ctx.output_a, ctx.output_b }, ctx.rows, ctx.in_dim, ctx.out_dim, ctx.out_start, ctx.out_end);
 }
 
 fn q8_0ActivationTripleWorker(ctx: *Q8_0ActivationTripleWorkerCtx) void {
-    q8_0ActivationTripleApply(ctx.q_input, ctx.input_scales, ctx.weight_raw_a, ctx.prepared_blocks_a, ctx.prepared_panel_blocks_a, ctx.prepared_panel8_blocks_a, ctx.bias_a, ctx.output_a, ctx.weight_raw_b, ctx.prepared_blocks_b, ctx.prepared_panel_blocks_b, ctx.prepared_panel8_blocks_b, ctx.bias_b, ctx.output_b, ctx.weight_raw_c, ctx.prepared_blocks_c, ctx.prepared_panel_blocks_c, ctx.prepared_panel8_blocks_c, ctx.bias_c, ctx.output_c, ctx.rows, ctx.in_dim, ctx.out_dim, ctx.out_start, ctx.out_end);
+    q8_0ActivationGroupedApply(3, ctx.q_input, ctx.input_scales, .{ ctx.weight_raw_a, ctx.weight_raw_b, ctx.weight_raw_c }, .{ ctx.prepared_blocks_a, ctx.prepared_blocks_b, ctx.prepared_blocks_c }, .{ ctx.prepared_panel_blocks_a, ctx.prepared_panel_blocks_b, ctx.prepared_panel_blocks_c }, .{ ctx.prepared_panel8_blocks_a, ctx.prepared_panel8_blocks_b, ctx.prepared_panel8_blocks_c }, .{ ctx.bias_a, ctx.bias_b, ctx.bias_c }, .{ ctx.output_a, ctx.output_b, ctx.output_c }, ctx.rows, ctx.in_dim, ctx.out_dim, ctx.out_start, ctx.out_end);
 }
 
 fn q8_0ActivationWorkerJob(raw: *anyopaque) void {
@@ -22968,7 +22472,7 @@ fn kPreparedQ8KActivationPairWorker(ctx: *KPreparedQ8KActivationPairWorkerCtx) v
         }
         if (ctx.panel8_blocks_a) |panel8_a| {
             if (ctx.panel8_blocks_b) |panel8_b| {
-                linearQ4Q5KPreparedQ8KActivationPairPanel8Range(ctx.q_input, ctx.prepared_blocks_a, panel8_a, ctx.output_a, ctx.prepared_blocks_b, panel8_b, ctx.output_b, ctx.rows, ctx.in_dim, ctx.out_dim, ctx.out_start, ctx.out_end);
+                linearQ4Q5KPreparedQ8KActivationGroupedPanel8Range(2, ctx.q_input, .{ ctx.prepared_blocks_a, ctx.prepared_blocks_b }, .{ panel8_a, panel8_b }, .{ ctx.output_a, ctx.output_b }, ctx.rows, ctx.in_dim, ctx.out_dim, ctx.out_start, ctx.out_end);
                 return;
             }
         }
@@ -23002,7 +22506,7 @@ fn kPreparedQ8KActivationTripleWorker(ctx: *KPreparedQ8KActivationTripleWorkerCt
         if (ctx.panel8_blocks_a) |panel8_a| {
             if (ctx.panel8_blocks_b) |panel8_b| {
                 if (ctx.panel8_blocks_c) |panel8_c| {
-                    linearQ4Q5KPreparedQ8KActivationTriplePanel8Range(ctx.q_input, ctx.prepared_blocks_a, panel8_a, ctx.output_a, ctx.prepared_blocks_b, panel8_b, ctx.output_b, ctx.prepared_blocks_c, panel8_c, ctx.output_c, ctx.rows, ctx.in_dim, ctx.out_dim, ctx.out_start, ctx.out_end);
+                    linearQ4Q5KPreparedQ8KActivationGroupedPanel8Range(3, ctx.q_input, .{ ctx.prepared_blocks_a, ctx.prepared_blocks_b, ctx.prepared_blocks_c }, .{ panel8_a, panel8_b, panel8_c }, .{ ctx.output_a, ctx.output_b, ctx.output_c }, ctx.rows, ctx.in_dim, ctx.out_dim, ctx.out_start, ctx.out_end);
                     return;
                 }
             }
@@ -23676,7 +23180,7 @@ fn linearQ8_0QuantizedInputPairDispatch(
     out_dim: usize,
 ) !void {
     if (try linearQ8_0QuantizedInputPairParallel(io, q_values, input_scales, weight_raw_a, prepared_blocks_a, prepared_panel_blocks_a, prepared_panel8_blocks_a, bias_a, output_a, weight_raw_b, prepared_blocks_b, prepared_panel_blocks_b, prepared_panel8_blocks_b, bias_b, output_b, rows, in_dim, out_dim)) return;
-    q8_0ActivationPairApply(q_values, input_scales, weight_raw_a, prepared_blocks_a, prepared_panel_blocks_a, prepared_panel8_blocks_a, bias_a, output_a, weight_raw_b, prepared_blocks_b, prepared_panel_blocks_b, prepared_panel8_blocks_b, bias_b, output_b, rows, in_dim, out_dim, 0, out_dim);
+    q8_0ActivationGroupedApply(2, q_values, input_scales, .{ weight_raw_a, weight_raw_b }, .{ prepared_blocks_a, prepared_blocks_b }, .{ prepared_panel_blocks_a, prepared_panel_blocks_b }, .{ prepared_panel8_blocks_a, prepared_panel8_blocks_b }, .{ bias_a, bias_b }, .{ output_a, output_b }, rows, in_dim, out_dim, 0, out_dim);
 }
 
 fn linearQ8_0QuantizedInputTripleParallel(
@@ -23824,7 +23328,7 @@ fn linearQ8_0QuantizedInputTripleDispatch(
     out_dim: usize,
 ) !void {
     if (try linearQ8_0QuantizedInputTripleParallel(io, q_values, input_scales, weight_raw_a, prepared_blocks_a, prepared_panel_blocks_a, prepared_panel8_blocks_a, bias_a, output_a, weight_raw_b, prepared_blocks_b, prepared_panel_blocks_b, prepared_panel8_blocks_b, bias_b, output_b, weight_raw_c, prepared_blocks_c, prepared_panel_blocks_c, prepared_panel8_blocks_c, bias_c, output_c, rows, in_dim, out_dim)) return;
-    q8_0ActivationTripleApply(q_values, input_scales, weight_raw_a, prepared_blocks_a, prepared_panel_blocks_a, prepared_panel8_blocks_a, bias_a, output_a, weight_raw_b, prepared_blocks_b, prepared_panel_blocks_b, prepared_panel8_blocks_b, bias_b, output_b, weight_raw_c, prepared_blocks_c, prepared_panel_blocks_c, prepared_panel8_blocks_c, bias_c, output_c, rows, in_dim, out_dim, 0, out_dim);
+    q8_0ActivationGroupedApply(3, q_values, input_scales, .{ weight_raw_a, weight_raw_b, weight_raw_c }, .{ prepared_blocks_a, prepared_blocks_b, prepared_blocks_c }, .{ prepared_panel_blocks_a, prepared_panel_blocks_b, prepared_panel_blocks_c }, .{ prepared_panel8_blocks_a, prepared_panel8_blocks_b, prepared_panel8_blocks_c }, .{ bias_a, bias_b, bias_c }, .{ output_a, output_b, output_c }, rows, in_dim, out_dim, 0, out_dim);
 }
 
 fn linearNoBiasQ6KQ8KActivationParallel(
@@ -25209,7 +24713,7 @@ fn linearKPreparedQ8KActivationPairDispatch(
     if (!q6) {
         if (panel8_blocks_a) |panel8_a| {
             if (panel8_blocks_b) |panel8_b| {
-                linearQ4Q5KPreparedQ8KActivationPairPanel8Range(q_input, prepared_blocks_a, panel8_a, output_a, prepared_blocks_b, panel8_b, output_b, rows, in_dim, out_dim, 0, out_dim);
+                linearQ4Q5KPreparedQ8KActivationGroupedPanel8Range(2, q_input, .{ prepared_blocks_a, prepared_blocks_b }, .{ panel8_a, panel8_b }, .{ output_a, output_b }, rows, in_dim, out_dim, 0, out_dim);
                 return;
             }
         }
@@ -25421,7 +24925,7 @@ fn linearKPreparedQ8KActivationTripleDispatch(
         if (panel8_blocks_a) |panel8_a| {
             if (panel8_blocks_b) |panel8_b| {
                 if (panel8_blocks_c) |panel8_c| {
-                    linearQ4Q5KPreparedQ8KActivationTriplePanel8Range(q_input, prepared_blocks_a, panel8_a, output_a, prepared_blocks_b, panel8_b, output_b, prepared_blocks_c, panel8_c, output_c, rows, in_dim, out_dim, 0, out_dim);
+                    linearQ4Q5KPreparedQ8KActivationGroupedPanel8Range(3, q_input, .{ prepared_blocks_a, prepared_blocks_b, prepared_blocks_c }, .{ panel8_a, panel8_b, panel8_c }, .{ output_a, output_b, output_c }, rows, in_dim, out_dim, 0, out_dim);
                     return;
                 }
             }
@@ -54538,4 +54042,90 @@ fn allocateLinearOutputWithPlan(ctx: *anyopaque, input: CT, weight: CT, bias: ?C
     owned = null;
     errdefer freeTensor(ctx, result);
     return self.withLogicalShape(result, &.{ @intCast(rows), @intCast(out_dim) });
+}
+
+test "shared packed projection schedules cover arities raw prepared bias and column tails" {
+    const a = std.testing.allocator;
+    const rows = 5;
+    const in_dim = 512;
+    const out_dim = 19;
+    const first = 1;
+    const last = 18;
+    const shape = [_]i64{ out_dim, in_dim };
+    var input: [rows * in_dim]f32 = undefined;
+    fillNativeQuantDispatchValues(&input, 31, 0.03);
+    inline for (.{ gguf_tensor_types.KnownTensorType.Q8_0, .Q4_K, .Q5_K }) |kind| {
+        var storage: [3]QuantizedStorage = undefined;
+        var initialized: usize = 0;
+        defer for (storage[0..initialized]) |*item| item.deinit();
+        var raw_weights: [3][]const u8 = undefined;
+        var prepared: [3][]const u8 = undefined;
+        var panels: [3][]const u8 = undefined;
+        var bias: [3][out_dim]f32 = undefined;
+        var bias_views: [3]?[]const f32 = undefined;
+        var expected: [3][rows * out_dim]f32 = @splat(@splat(-12345));
+        var actual = expected;
+        var outputs: [3][]f32 = undefined;
+        for (0..3) |pidx| {
+            var values: [out_dim * in_dim]f32 = undefined;
+            fillNativeQuantDispatchValues(&values, pidx + 7, 0.005);
+            const raw = try quantizeNativeDispatchWeight(a, kind, &values);
+            errdefer if (initialized <= pidx) a.free(raw);
+            const owned_shape = try a.dupe(i64, &shape);
+            storage[pidx] = .{ .allocator = a, .tensor_type = .{ .known = kind }, .raw_bytes = raw, .shape = owned_shape, .raw_owned = true };
+            initialized += 1;
+            try prepareNativeQuantizedStorage(&storage[pidx]);
+            raw_weights[pidx] = raw;
+            prepared[pidx] = storage[pidx].preparedBytes(.row_major_blocks).?;
+            if (kind != .Q8_0) panels[pidx] = storage[pidx].preparedBytes(.panel8).?;
+            fillNativeQuantDispatchValues(&bias[pidx], pidx + 19, 0.01);
+            bias_views[pidx] = if (pidx == 1) null else &bias[pidx];
+            outputs[pidx] = &actual[pidx];
+        }
+        if (kind == .Q8_0) {
+            var quantized: [rows * in_dim]u8 = undefined;
+            var scales: [rows * (in_dim / 32)]f32 = undefined;
+            quantizeQ8_0ActivationRows(&input, &quantized, &scales, rows, in_dim, in_dim / 32);
+            inline for (.{ false, true }) |use_prepared| {
+                const weights = if (use_prepared) prepared else raw_weights;
+                for (0..3) |pidx| linearQ8_0QuantizedInputGroupedRange(use_prepared, 1, &quantized, &scales, .{weights[pidx]}, .{null}, .{bias_views[pidx]}, .{&expected[pidx]}, rows, in_dim, out_dim, first, last);
+                inline for (.{ 2, 3 }) |arity| {
+                    actual = @splat(@splat(-12345));
+                    linearQ8_0QuantizedInputSpecializedRange(use_prepared, arity, &quantized, &scales, weights[0..arity].*, @splat(null), bias_views[0..arity].*, outputs[0..arity].*, rows, in_dim, out_dim, first, last);
+                    inline for (0..arity) |pidx| try std.testing.expectEqualSlices(f32, &expected[pidx], &actual[pidx]);
+                    if (arity == 2) for (actual[2]) |value| try std.testing.expectEqual(@as(f32, -12345), value);
+                }
+            }
+            for (0..4) |mode| {
+                var optional_blocks: [3]?[]const u8 = undefined;
+                for (0..3) |pidx| optional_blocks[pidx] = if (mode == 1 or (mode >= 2 and pidx == mode - 2)) prepared[pidx] else null;
+                expected = @splat(@splat(-12345));
+                for (0..3) |pidx| q8_0ActivationApply(&quantized, &scales, raw_weights[pidx], optional_blocks[pidx], null, null, bias_views[pidx], &expected[pidx], rows, in_dim, out_dim, first, last);
+                inline for (.{ 2, 3 }) |arity| {
+                    actual = @splat(@splat(-12345));
+                    q8_0ActivationGroupedApply(arity, &quantized, &scales, raw_weights[0..arity].*, optional_blocks[0..arity].*, @splat(null), @splat(null), bias_views[0..arity].*, outputs[0..arity].*, rows, in_dim, out_dim, first, last);
+                    inline for (0..arity) |pidx| try std.testing.expectEqualSlices(f32, &expected[pidx], &actual[pidx]);
+                }
+            }
+        } else {
+            var quantized: [rows * (in_dim / 256) * 292]u8 = undefined;
+            quantizeQ8_KActivationRows(&input, &quantized, rows, in_dim, in_dim / 256);
+            for (0..3) |pidx| linearQ4Q5KPreparedQ8KActivationRange(&quantized, prepared[pidx], null, null, null, null, &expected[pidx], rows, in_dim, out_dim, first, last, kind);
+            inline for (.{ 2, 3 }) |arity| {
+                actual = @splat(@splat(-12345));
+                linearQ4Q5KPreparedQ8KActivationGroupedPanel8Range(arity, &quantized, prepared[0..arity].*, panels[0..arity].*, outputs[0..arity].*, rows, in_dim, out_dim, first, last);
+                inline for (0..arity) |pidx| try std.testing.expectEqualSlices(f32, &expected[pidx], &actual[pidx]);
+                if (arity == 2) for (actual[2]) |value| try std.testing.expectEqual(@as(f32, -12345), value);
+            }
+        }
+    }
+}
+
+test "CPU shared descriptors execute resident operations with strict transfer admission" {
+    if (comptime @import("build_options").enable_wasm) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var context = try @import("../backends/compute_context.zig").BackendContext.init(a, .native, null);
+    defer context.deinit(a);
+    var cb = context.computeBackend();
+    try @import("testing/assigned_kernel_conformance.zig").run(&cb, false);
 }

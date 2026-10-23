@@ -22,6 +22,8 @@
 //! silently diverge in support code.
 
 const std = @import("std");
+const kernel_reduction = @import("../ops/kernel_reduction.zig");
+const kernel_math = @import("../ops/kernel_math.zig");
 const quant_recipe = @import("quant_recipe.zig");
 const quant_matmul = @import("quant_matmul.zig");
 const quant_kernel_op = @import("quant_kernel_op.zig");
@@ -1004,7 +1006,22 @@ pub const SourceFragment = struct {
     source: []const u8 = "",
     recipe: ?quant_recipe.Recipe = null,
 
-    fn append(self: SourceFragment, allocator: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8)) !void {
+    pub fn renderAlloc(self: SourceFragment, allocator: std.mem.Allocator) ![]u8 {
+        if (self.recipe) |recipe| return quant_recipe.render(allocator, recipe, .cuda, self.name);
+        return allocator.dupe(u8, self.source);
+    }
+
+    /// The bundle uses the existing byte type spelling; standalone CUDA keeps
+    /// uint8_t/uint16_t so previously qualified sources remain byte-identical.
+    pub fn renderRuntimeAlloc(self: SourceFragment, allocator: std.mem.Allocator) ![]u8 {
+        const original = try self.renderAlloc(allocator);
+        defer allocator.free(original);
+        const bytes = try std.mem.replaceOwned(u8, allocator, original, "uint8_t", "unsigned char");
+        defer allocator.free(bytes);
+        return std.mem.replaceOwned(u8, allocator, bytes, "uint16_t", "unsigned short");
+    }
+
+    pub fn append(self: SourceFragment, allocator: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8)) !void {
         if (self.recipe) |recipe| {
             const generated = try quant_recipe.render(allocator, recipe, .cuda, self.name);
             defer allocator.free(generated);
@@ -2225,30 +2242,12 @@ const helper_half_le_to_float = SourceFragment{
 
 const helper_warp_reduce_sum = SourceFragment{
     .name = "antfly_warp_reduce_sum",
-    .source =
-    \\static __device__ __forceinline__ float antfly_warp_reduce_sum(float value) {
-    \\    value += __shfl_down_sync(0xffffffffu, value, 16);
-    \\    value += __shfl_down_sync(0xffffffffu, value, 8);
-    \\    value += __shfl_down_sync(0xffffffffu, value, 4);
-    \\    value += __shfl_down_sync(0xffffffffu, value, 2);
-    \\    value += __shfl_down_sync(0xffffffffu, value, 1);
-    \\    return value;
-    \\}
-    ,
+    .source = kernel_reduction.cudaWarpSource("antfly_warp_reduce_sum", .sum, .lane_zero, .static_device, "value"),
 };
 
 const helper_gelu = SourceFragment{
     .name = "antfly_gelu",
-    .source =
-    \\static __device__ __forceinline__ float antfly_gelu(float x) {
-    \\    if (!isfinite(x)) return 0.0f;
-    \\    const float inner = 0.7978845608028654f * (x + 0.044715f * x * x * x);
-    \\    if (inner > 10.0f) return x;
-    \\    if (inner < -10.0f) return 0.0f;
-    \\    const float y = 0.5f * x * (1.0f + tanhf(inner));
-    \\    return isfinite(y) ? y : 0.0f;
-    \\}
-    ,
+    .source = kernel_math.guardedGeluSource(kernel_math.cuda, "static __device__ __forceinline__", "antfly_gelu", false),
 };
 
 const helper_q4_k_dequant_lane = SourceFragment{
@@ -2261,9 +2260,8 @@ const q4_k_projection_helpers = [_]SourceFragment{ helper_half_le_to_float, help
 
 const q4_0_helpers = [_]SourceFragment{ helper_half_le_to_float, helper_warp_reduce_sum };
 
-// These fragments intentionally retain the handwritten helper names and
-// arithmetic. The standalone sources duplicate them; the runtime-owned region
-// reuses the single copies that already precede its marker in the CUDA bundle.
+// Preserve stable helper names and arithmetic in standalone artifacts and
+// in the shared runtime helper region. Both copies are generated here.
 const helper_termite_half_to_float = SourceFragment{
     .name = "termite_half_to_float",
     .source =
@@ -2275,16 +2273,7 @@ const helper_termite_half_to_float = SourceFragment{
 
 const helper_termite_warp_reduce_sum = SourceFragment{
     .name = "termite_warp_reduce_sum",
-    .source =
-    \\__device__ __forceinline__ float termite_warp_reduce_sum(float v) {
-    \\    v += __shfl_down_sync(0xffffffffu, v, 16);
-    \\    v += __shfl_down_sync(0xffffffffu, v, 8);
-    \\    v += __shfl_down_sync(0xffffffffu, v, 4);
-    \\    v += __shfl_down_sync(0xffffffffu, v, 2);
-    \\    v += __shfl_down_sync(0xffffffffu, v, 1);
-    \\    return v;
-    \\}
-    ,
+    .source = kernel_reduction.cudaWarpSource("termite_warp_reduce_sum", .sum, .lane_zero, .device, "v"),
 };
 
 const helper_termite_q4_0_value_nibble = SourceFragment{
@@ -2306,23 +2295,7 @@ const helper_termite_q4_0_value_nibble = SourceFragment{
 
 const helper_termite_decoder_activation_f32 = SourceFragment{
     .name = "termite_decoder_activation_f32",
-    .source =
-    \\__device__ __forceinline__ float termite_decoder_activation_f32(float x, unsigned int activation) {
-    \\    if (activation == 0u) {
-    \\        return 0.5f * x * (1.0f + tanhf(0.7978845608028654f * (x + 0.044715f * x * x * x)));
-    \\    } else if (activation == 1u) {
-    \\        return 0.5f * x * (1.0f + tanhf(0.7978845608028654f * (x + 0.044715f * x * x * x)));
-    \\    } else if (activation == 2u) {
-    \\        return x / (1.0f + expf(-x));
-    \\    } else if (activation == 3u) {
-    \\        return fmaxf(x, 0.0f);
-    \\    } else if (activation == 4u) {
-    \\        return x / (1.0f + expf(-1.702f * x));
-    \\    }
-    \\    float r = fmaxf(x, 0.0f);
-    \\    return r * r;
-    \\}
-    ,
+    .source = kernel_math.decoderActivationSource(kernel_math.cuda, "__device__ __forceinline__", "termite_decoder_activation_f32"),
 };
 
 const q4_0_exact_ffn_f32_helpers = [_]SourceFragment{
@@ -2343,34 +2316,14 @@ const helper_half_bits_to_float = SourceFragment{
 
 const helper_warp_reduce_sum_f32 = SourceFragment{
     .name = "antfly_warp_reduce_sum_f32",
-    .source =
-    \\static __device__ __forceinline__ float antfly_warp_reduce_sum_f32(float value) {
-    \\    value += __shfl_down_sync(0xffffffffu, value, 16);
-    \\    value += __shfl_down_sync(0xffffffffu, value, 8);
-    \\    value += __shfl_down_sync(0xffffffffu, value, 4);
-    \\    value += __shfl_down_sync(0xffffffffu, value, 2);
-    \\    value += __shfl_down_sync(0xffffffffu, value, 1);
-    \\    return value;
-    \\}
-    ,
+    .source = kernel_reduction.cudaWarpSource("antfly_warp_reduce_sum_f32", .sum, .lane_zero, .static_device, "value"),
 };
 
-// The runtime bundle already owns byte-for-byte compatible helpers under the
-// `termite_` names. Standalone generated attention artifacts duplicate them so
-// they compile independently; `renderAttentionBodyAlloc` intentionally emits
-// only the bodies and therefore reuses the bundle definitions.
+// Standalone attention artifacts and the shared runtime helper region emit
+// these exact definitions. Attention bodies reuse the runtime definitions.
 const helper_termite_warp_reduce_sum_f32 = SourceFragment{
     .name = "termite_warp_reduce_sum_f32",
-    .source =
-    \\__device__ __forceinline__ float termite_warp_reduce_sum_f32(float value) {
-    \\    value += __shfl_down_sync(0xffffffffu, value, 16);
-    \\    value += __shfl_down_sync(0xffffffffu, value, 8);
-    \\    value += __shfl_down_sync(0xffffffffu, value, 4);
-    \\    value += __shfl_down_sync(0xffffffffu, value, 2);
-    \\    value += __shfl_down_sync(0xffffffffu, value, 1);
-    \\    return value;
-    \\}
-    ,
+    .source = kernel_reduction.cudaWarpSource("termite_warp_reduce_sum_f32", .sum, .lane_zero, .device, "value"),
 };
 
 const helper_termite_block_reduce_sum_f32 = SourceFragment{
@@ -2493,33 +2446,12 @@ pub const attention_score_prework_runtime_external_declarations = [_]SourceFragm
 
 const helper_warp_reduce_max_f32 = SourceFragment{
     .name = "antfly_warp_reduce_max_f32",
-    .source =
-    \\static __device__ __forceinline__ float antfly_warp_reduce_max_f32(float value) {
-    \\    value = fmaxf(value, __shfl_down_sync(0xffffffffu, value, 16));
-    \\    value = fmaxf(value, __shfl_down_sync(0xffffffffu, value, 8));
-    \\    value = fmaxf(value, __shfl_down_sync(0xffffffffu, value, 4));
-    \\    value = fmaxf(value, __shfl_down_sync(0xffffffffu, value, 2));
-    \\    value = fmaxf(value, __shfl_down_sync(0xffffffffu, value, 1));
-    \\    return __shfl_sync(0xffffffffu, value, 0);
-    \\}
-    ,
+    .source = kernel_reduction.cudaWarpSource("antfly_warp_reduce_max_f32", .maximum, .broadcast, .static_device, "value"),
 };
 
 const helper_decoder_activation_f32 = SourceFragment{
     .name = "antfly_decoder_activation_f32",
-    .source =
-    \\static __device__ __forceinline__ float antfly_decoder_activation_f32(float x, unsigned int activation) {
-    \\    if (activation <= 1u) {
-    \\        const float inner = 0.7978845608028654f * (x + 0.044715f * x * x * x);
-    \\        return 0.5f * x * (1.0f + tanhf(inner));
-    \\    }
-    \\    if (activation == 2u) return x / (1.0f + __expf(-x));
-    \\    if (activation == 3u) return fmaxf(x, 0.0f);
-    \\    if (activation == 4u) return x / (1.0f + __expf(-1.702f * x));
-    \\    const float r = fmaxf(x, 0.0f);
-    \\    return r * r;
-    \\}
-    ,
+    .source = kernel_math.decoderActivationSource(kernel_math.cuda_fast, "static __device__ __forceinline__", "antfly_decoder_activation_f32"),
 };
 
 const helper_q4_0_word_u16 = SourceFragment{
@@ -2642,25 +2574,95 @@ const q4_0_down_ggml_q8_1_helpers = [_]SourceFragment{
     helper_q4_0_ggml_q8_1_dot16,
 };
 
+const q6_recipe = quant_recipe.forFormat(.q6_k);
 const helper_q6_k_sub_scale_f32 = SourceFragment{
     .name = "antfly_q6_k_sub_scale_f32",
-    .source =
-    \\static __device__ __forceinline__ float antfly_q6_k_sub_scale_f32(
-    \\    const unsigned char *block,
-    \\    unsigned int sub
-    \\) {
-    \\    const signed char *scales = (const signed char *)(block + 192u);
-    \\    const unsigned short d_bits = (unsigned short)block[208] | ((unsigned short)block[209] << 8);
-    \\    return antfly_half_bits_to_float(d_bits) * (float)scales[sub];
-    \\}
-    ,
+    .recipe = quant_recipe.q6SubblockScale(),
+};
+const helper_termite_q8_0_value = SourceFragment{
+    .name = "termite_q8_0_value",
+    .recipe = quant_recipe.forFormat(.q8_0),
+};
+const helper_termite_q4k_value = SourceFragment{
+    .name = "termite_q4k_value",
+    .recipe = quant_recipe.forFormat(.q4_k),
+};
+const helper_termite_q4k_scale = SourceFragment{
+    .name = "termite_q4k_scale",
+    .recipe = quant_recipe.scaleMinHeaderInteger(false),
+};
+const helper_termite_q4k_min = SourceFragment{
+    .name = "termite_q4k_min",
+    .recipe = quant_recipe.scaleMinHeaderInteger(true),
+};
+const helper_termite_q4_0_value = SourceFragment{
+    .name = "termite_q4_0_value",
+    .recipe = quant_recipe.forFormat(.q4_0),
+};
+const helper_termite_q6k_value = SourceFragment{
+    .name = "termite_q6k_value",
+    .recipe = q6_recipe,
+};
+const helper_termite_q6k_quant_i32 = SourceFragment{
+    .name = "termite_q6k_quant_i32",
+    .recipe = q6_recipe.component(q6_recipe.integer_component.?),
+};
+const helper_termite_q6k_scale_f32 = SourceFragment{
+    .name = "termite_q6k_scale_f32",
+    .recipe = q6_recipe.component(q6_recipe.scale_component.?),
+};
+const helper_termite_q6k_sub_scale_f32 = SourceFragment{
+    .name = "termite_q6k_sub_scale_f32",
+    .recipe = quant_recipe.q6SubblockScale(),
 };
 
 const q6_k_q8_helpers = [_]SourceFragment{
+    helper_half_le_to_float,
     helper_half_bits_to_float,
     helper_warp_reduce_sum_f32,
     helper_q6_k_sub_scale_f32,
 };
+
+/// One definition per helper in the runtime bundle. Standalone artifacts use
+/// these same fragments; the code generator owns the runtime copies as well.
+pub const runtime_shared_helpers = [_]SourceFragment{
+    helper_half_le_to_float,
+    helper_warp_reduce_sum,
+    helper_termite_half_to_float,
+    helper_termite_warp_reduce_sum,
+    helper_termite_q4_0_value_nibble,
+    helper_termite_q4_0_value,
+    helper_termite_q8_0_value,
+    helper_termite_q4k_value,
+    helper_termite_q4k_scale,
+    helper_termite_q4k_min,
+    helper_termite_q6k_value,
+    helper_termite_q6k_quant_i32,
+    helper_termite_q6k_scale_f32,
+    helper_termite_q6k_sub_scale_f32,
+    helper_termite_decoder_activation_f32,
+    helper_half_bits_to_float,
+    helper_warp_reduce_sum_f32,
+    helper_termite_warp_reduce_sum_f32,
+    helper_termite_block_reduce_sum_f32,
+    helper_warp_reduce_max_f32,
+    helper_decoder_activation_f32,
+    helper_q4_0_word_u16,
+    helper_q4_0_q8_dot16,
+    helper_q6_k_sub_scale_f32,
+};
+
+pub fn renderRuntimeSharedHelpers(allocator: std.mem.Allocator) ![]u8 {
+    var out = std.ArrayListUnmanaged(u8).empty;
+    errdefer out.deinit(allocator);
+    for (runtime_shared_helpers) |helper| {
+        const source = try helper.renderRuntimeAlloc(allocator);
+        defer allocator.free(source);
+        try out.appendSlice(allocator, source);
+        try out.appendSlice(allocator, "\n\n");
+    }
+    return out.toOwnedSlice(allocator);
+}
 
 pub fn renderAttentionBodyAlloc(allocator: std.mem.Allocator, plan: AttentionRenderPlan) ![]u8 {
     try plan.validate();
@@ -4961,8 +4963,8 @@ test "cuda renderer owns the K2560 Q6_K Q8_1 argmax candidate contract" {
     const source = try renderKernel(std.testing.allocator, plan);
     defer std.testing.allocator.free(source);
     try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "void antfly_q6_k_q8_1_argmax_rows1_k2560_tile8_v1("));
-    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "block + 192u"));
-    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "block[208]"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "float antfly_q6_k_sub_scale_f32("));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "const signed char *"));
     try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "q8_bp + 4u"));
     try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "antfly_q6_k_q8_1_argmax_rows1_k2560_tile8_v1_q6_k_pack4"));
     try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "antfly_q6_k_q8_1_argmax_rows1_k2560_tile8_v1_q6_k_q8_1_dot16_sub"));

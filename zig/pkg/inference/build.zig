@@ -1418,6 +1418,7 @@ pub fn build(b: *std.Build) void {
         }),
     });
     clipclap_bench_exe.root_module.addImport("build_options", build_options_mod);
+    clipclap_bench_exe.root_module.addImport("antfly_platform", configured_platform_mod);
     clipclap_bench_exe.root_module.addImport("inference_linalg", inference_linalg_mod);
     if (enable_system_blas) {
         configureSystemBlas(b, clipclap_bench_exe.root_module, target, blas_root);
@@ -1644,6 +1645,31 @@ pub fn build(b: *std.Build) void {
     });
     quant_recipe_host_check.root_module.addCSourceFile(.{ .file = quant_recipe_cpp, .flags = &.{ "-std=c++17", "-ffp-contract=off" } });
     b.step("quant-recipe-cuda-host-conformance", "Compile CUDA recipe syntax and compare all formats with the independent GGUF oracle on the host").dependOn(&b.addRunArtifact(quant_recipe_host_check).step);
+
+    const recipe_cuda_fixtures = b.addExecutable(.{
+        .name = "antfly-kernel-recipe-cuda-fixtures",
+        .root_module = b.createModule(.{ .root_source_file = b.path("src/kernel_recipe_cuda_conformance.zig"), .target = b.graph.host, .optimize = .ReleaseFast }),
+    });
+    const emit_recipe_cuda = b.addRunArtifact(recipe_cuda_fixtures);
+    const recipe_cuda_source = emit_recipe_cuda.addOutputFileArg("kernel_recipes.cu");
+    const recipe_cuda_source_step = b.step("kernel-recipe-cuda-source", "Generate model-free NVIDIA device conformance source");
+    recipe_cuda_source_step.dependOn(&emit_recipe_cuda.step);
+    const recipe_cuda_device_step = b.step("kernel-recipe-cuda-conformance", "Compile with nvcc and validate recipes and warp reductions on an NVIDIA device");
+    // Resolve nvcc only when this developer target runs, preserving configure
+    // caching and allowing source generation on machines without the toolkit.
+    const compile_recipe_cuda = std.Build.Step.Run.create(b, "compile CUDA recipe conformance");
+    compile_recipe_cuda.has_side_effects = true; // -arch=native observes the installed GPU.
+    compile_recipe_cuda.addFileArg(b.findProgramLazy(.{ .names = &.{"nvcc"} }));
+    // Scalar operation-tree conformance deliberately disables contraction;
+    // production kernel timing retains its normal flags.
+    compile_recipe_cuda.addArgs(&.{ "-x", "cu", "-std=c++17", "-arch=native", "--fmad=false", "-ftz=false" });
+    compile_recipe_cuda.addFileArg(recipe_cuda_source);
+    compile_recipe_cuda.addArg("-o");
+    const recipe_cuda_binary = compile_recipe_cuda.addOutputFileArg("kernel-recipe-cuda-conformance");
+    const run_recipe_cuda = std.Build.Step.Run.create(b, "run CUDA recipe conformance");
+    run_recipe_cuda.addFileArg(recipe_cuda_binary);
+    run_recipe_cuda.has_side_effects = true;
+    recipe_cuda_device_step.dependOn(&run_recipe_cuda.step);
 
     const unified_fixtures_bench_exe = b.addExecutable(.{
         .name = "antfly-inference-unified-fixtures-bench",

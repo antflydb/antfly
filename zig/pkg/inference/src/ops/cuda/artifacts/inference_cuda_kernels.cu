@@ -16,9 +16,420 @@
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <mma.h>
+#include <stdint.h>
 #include "../kernels/embedding_gemma2.cuh"
 
 using namespace nvcuda;
+
+// quant-kernel-codegen:begin shared CUDA helpers (do not edit; run: zig build quant-kernel-codegen -- --write)
+static __device__ __forceinline__ float antfly_half_le_to_float(const unsigned char *p) {
+    const unsigned short bits = (unsigned short)p[0] | ((unsigned short)p[1] << 8);
+    return __half2float(__ushort_as_half(bits));
+}
+
+static __device__ __forceinline__ float antfly_warp_reduce_sum(float value) {
+    value += __shfl_down_sync(0xffffffffu, value, 16);
+    value += __shfl_down_sync(0xffffffffu, value, 8);
+    value += __shfl_down_sync(0xffffffffu, value, 4);
+    value += __shfl_down_sync(0xffffffffu, value, 2);
+    value += __shfl_down_sync(0xffffffffu, value, 1);
+    return value;
+}
+
+__device__ __forceinline__ float termite_half_to_float(unsigned short h) {
+    return __half2float(__ushort_as_half(h));
+}
+
+__device__ __forceinline__ float termite_warp_reduce_sum(float v) {
+    v += __shfl_down_sync(0xffffffffu, v, 16);
+    v += __shfl_down_sync(0xffffffffu, v, 8);
+    v += __shfl_down_sync(0xffffffffu, v, 4);
+    v += __shfl_down_sync(0xffffffffu, v, 2);
+    v += __shfl_down_sync(0xffffffffu, v, 1);
+    return v;
+}
+
+__device__ __forceinline__ float termite_q4_0_value_nibble(
+    const unsigned char* bp,
+    unsigned int q_offset,
+    unsigned int high_nibble
+) {
+    unsigned short h = (unsigned short)bp[0] | ((unsigned short)bp[1] << 8);
+    float d = termite_half_to_float(h);
+    unsigned char packed = bp[q_offset];
+    int q = high_nibble != 0u ? (int)(packed >> 4) : (int)(packed & 0x0fu);
+    return (float)(q - 8) * d;
+}
+
+__device__ __forceinline__ float termite_q4_0_value(const unsigned char *block, int lane) {
+    int v0 = lane;
+    int v1 = 2;
+    int v2 = 15;
+    int v3 = v0 & v2;
+    int v4 = v1 + v3;
+    int v5 = int(block[v4]);
+    int v6 = 16;
+    int v7 = v0 < v6;
+    int v8 = v5 & v2;
+    int v9 = 4;
+    int v10 = int(unsigned(v5) >> v9);
+    int v11 = v7 ? v8 : v10;
+    int v12 = 8;
+    int v13 = v11 - v12;
+    int v14 = 0;
+    float v15 = antfly_half_le_to_float(block + v14);
+    float v16 = float(v13);
+    float v17 = v15 * v16;
+    return v17;
+}
+
+__device__ __forceinline__ float termite_q8_0_value(const unsigned char *block, int lane) {
+    int v0 = lane;
+    int v1 = 0;
+    float v2 = antfly_half_le_to_float(block + v1);
+    int v3 = 2;
+    int v4 = v0 + v3;
+    int v5 = int(((const signed char *)block)[v4]);
+    float v6 = float(v5);
+    float v7 = v2 * v6;
+    return v7;
+}
+
+__device__ __forceinline__ float termite_q4k_value(const unsigned char *block, int lane) {
+    int v0 = lane;
+    int v1 = 5;
+    int v2 = int(unsigned(v0) >> v1);
+    int v3 = 31;
+    int v4 = v0 & v3;
+    int v5 = 1;
+    int v6 = int(unsigned(v2) >> v5);
+    int v7 = 32;
+    int v8 = v6 * v7;
+    int v9 = v8 + v4;
+    int v10 = 16;
+    int v11 = v10 + v9;
+    int v12 = int(block[v11]);
+    int v13 = v2 & v5;
+    int v14 = 4;
+    int v15 = int(unsigned(v12) >> v14);
+    int v16 = 15;
+    int v17 = v12 & v16;
+    int v18 = v13 ? v15 : v17;
+    int v19 = 0;
+    float v20 = antfly_half_le_to_float(block + v19);
+    int v21 = v2 < v14;
+    int v22 = v2 + v14;
+    int v23 = 8;
+    int v24 = v2 + v23;
+    int v25 = v21 ? v22 : v24;
+    int v26 = int(block[v25]);
+    int v27 = v26 & v16;
+    int v28 = v2 + v19;
+    int v29 = v21 ? v14 : v28;
+    int v30 = int(block[v29]);
+    int v31 = 6;
+    int v32 = int(unsigned(v30) >> v31);
+    int v33 = int(unsigned(v32) << v14);
+    int v34 = v27 | v33;
+    int v35 = 63;
+    int v36 = v26 & v35;
+    int v37 = v21 ? v36 : v34;
+    float v38 = float(v37);
+    float v39 = v20 * v38;
+    float v40 = float(v18);
+    float v41 = v39 * v40;
+    int v42 = 2;
+    float v43 = antfly_half_le_to_float(block + v42);
+    int v44 = v21 ? v24 : v24;
+    int v45 = int(block[v44]);
+    int v46 = int(unsigned(v45) >> v14);
+    int v47 = v21 ? v14 : v22;
+    int v48 = int(block[v47]);
+    int v49 = int(unsigned(v48) >> v31);
+    int v50 = int(unsigned(v49) << v14);
+    int v51 = v46 | v50;
+    int v52 = v45 & v35;
+    int v53 = v21 ? v52 : v51;
+    float v54 = float(v53);
+    float v55 = v43 * v54;
+    float v56 = v41 - v55;
+    return v56;
+}
+
+__device__ __forceinline__ int termite_q4k_scale(const unsigned char *block, int lane) {
+    int v0 = lane;
+    int v1 = 4;
+    int v2 = v0 < v1;
+    int v3 = 0;
+    int v4 = v0 + v3;
+    int v5 = v0 + v1;
+    int v6 = v2 ? v4 : v5;
+    int v7 = int(block[v6]);
+    int v8 = 15;
+    int v9 = v7 & v8;
+    int v10 = -4;
+    int v11 = v0 + v10;
+    int v12 = v2 ? v3 : v11;
+    int v13 = int(block[v12]);
+    int v14 = 6;
+    int v15 = int(unsigned(v13) >> v14);
+    int v16 = int(unsigned(v15) << v1);
+    int v17 = v9 | v16;
+    int v18 = 63;
+    int v19 = v7 & v18;
+    int v20 = v2 ? v19 : v17;
+    return v20;
+}
+
+__device__ __forceinline__ int termite_q4k_min(const unsigned char *block, int lane) {
+    int v0 = lane;
+    int v1 = 4;
+    int v2 = v0 < v1;
+    int v3 = v0 + v1;
+    int v4 = v2 ? v3 : v3;
+    int v5 = int(block[v4]);
+    int v6 = int(unsigned(v5) >> v1);
+    int v7 = 0;
+    int v8 = v0 + v7;
+    int v9 = v2 ? v7 : v8;
+    int v10 = int(block[v9]);
+    int v11 = 6;
+    int v12 = int(unsigned(v10) >> v11);
+    int v13 = int(unsigned(v12) << v1);
+    int v14 = v6 | v13;
+    int v15 = 63;
+    int v16 = v5 & v15;
+    int v17 = v2 ? v16 : v14;
+    return v17;
+}
+
+__device__ __forceinline__ float termite_q6k_value(const unsigned char *block, int lane) {
+    int v0 = lane;
+    int v1 = 4;
+    int v2 = int(unsigned(v0) >> v1);
+    int v3 = 3;
+    int v4 = int(unsigned(v2) >> v3);
+    int v5 = 7;
+    int v6 = v2 & v5;
+    int v7 = 1;
+    int v8 = int(unsigned(v6) >> v7);
+    int v9 = v2 & v7;
+    int v10 = int(unsigned(v9) << v1);
+    int v11 = 15;
+    int v12 = v0 & v11;
+    int v13 = v10 + v12;
+    int v14 = 64;
+    int v15 = v4 * v14;
+    int v16 = v8 & v7;
+    int v17 = 32;
+    int v18 = v16 * v17;
+    int v19 = v15 + v18;
+    int v20 = v19 + v13;
+    int v21 = 128;
+    int v22 = v4 * v17;
+    int v23 = v21 + v22;
+    int v24 = v23 + v13;
+    int v25 = int(block[v20]);
+    int v26 = int(unsigned(v8) >> v7);
+    int v27 = v26 * v1;
+    int v28 = int(unsigned(v25) >> v27);
+    int v29 = v28 & v11;
+    int v30 = int(block[v24]);
+    int v31 = 2;
+    int v32 = v8 * v31;
+    int v33 = int(unsigned(v30) >> v32);
+    int v34 = v33 & v3;
+    int v35 = int(unsigned(v34) << v1);
+    int v36 = v29 | v35;
+    int v37 = v36 - v17;
+    int v38 = 208;
+    float v39 = antfly_half_le_to_float(block + v38);
+    int v40 = 192;
+    int v41 = v40 + v2;
+    int v42 = int(((const signed char *)block)[v41]);
+    float v43 = float(v42);
+    float v44 = v39 * v43;
+    float v45 = float(v37);
+    float v46 = v44 * v45;
+    return v46;
+}
+
+__device__ __forceinline__ int termite_q6k_quant_i32(const unsigned char *block, int lane) {
+    int v0 = lane;
+    int v1 = 4;
+    int v2 = int(unsigned(v0) >> v1);
+    int v3 = 3;
+    int v4 = int(unsigned(v2) >> v3);
+    int v5 = 7;
+    int v6 = v2 & v5;
+    int v7 = 1;
+    int v8 = int(unsigned(v6) >> v7);
+    int v9 = v2 & v7;
+    int v10 = int(unsigned(v9) << v1);
+    int v11 = 15;
+    int v12 = v0 & v11;
+    int v13 = v10 + v12;
+    int v14 = 64;
+    int v15 = v4 * v14;
+    int v16 = v8 & v7;
+    int v17 = 32;
+    int v18 = v16 * v17;
+    int v19 = v15 + v18;
+    int v20 = v19 + v13;
+    int v21 = 128;
+    int v22 = v4 * v17;
+    int v23 = v21 + v22;
+    int v24 = v23 + v13;
+    int v25 = int(block[v20]);
+    int v26 = int(unsigned(v8) >> v7);
+    int v27 = v26 * v1;
+    int v28 = int(unsigned(v25) >> v27);
+    int v29 = v28 & v11;
+    int v30 = int(block[v24]);
+    int v31 = 2;
+    int v32 = v8 * v31;
+    int v33 = int(unsigned(v30) >> v32);
+    int v34 = v33 & v3;
+    int v35 = int(unsigned(v34) << v1);
+    int v36 = v29 | v35;
+    int v37 = v36 - v17;
+    return v37;
+}
+
+__device__ __forceinline__ float termite_q6k_scale_f32(const unsigned char *block, int lane) {
+    int v0 = lane;
+    int v1 = 4;
+    int v2 = int(unsigned(v0) >> v1);
+    int v3 = 208;
+    float v4 = antfly_half_le_to_float(block + v3);
+    int v5 = 192;
+    int v6 = v5 + v2;
+    int v7 = int(((const signed char *)block)[v6]);
+    float v8 = float(v7);
+    float v9 = v4 * v8;
+    return v9;
+}
+
+__device__ __forceinline__ float termite_q6k_sub_scale_f32(const unsigned char *block, int lane) {
+    int v0 = lane;
+    int v1 = 208;
+    float v2 = antfly_half_le_to_float(block + v1);
+    int v3 = 192;
+    int v4 = v3 + v0;
+    int v5 = int(((const signed char *)block)[v4]);
+    float v6 = float(v5);
+    float v7 = v2 * v6;
+    return v7;
+}
+
+__device__ __forceinline__ float termite_decoder_activation_f32(float x, unsigned int activation) {
+    if (activation <= 1u) return 0.5f * x * (1.0f + tanhf(0.7978845608028654f * (x + 0.044715f * x * x * x)));
+    if (activation == 2u) return x / (1.0f + expf(-x));
+    if (activation == 3u) return fmaxf(x, 0.0f);
+    if (activation == 4u) return x / (1.0f + expf(-1.702f * x));
+    const float r = fmaxf(x, 0.0f);
+    return r * r;
+}
+
+static __device__ __forceinline__ float antfly_half_bits_to_float(unsigned short bits) {
+    return __half2float(__ushort_as_half(bits));
+}
+
+static __device__ __forceinline__ float antfly_warp_reduce_sum_f32(float value) {
+    value += __shfl_down_sync(0xffffffffu, value, 16);
+    value += __shfl_down_sync(0xffffffffu, value, 8);
+    value += __shfl_down_sync(0xffffffffu, value, 4);
+    value += __shfl_down_sync(0xffffffffu, value, 2);
+    value += __shfl_down_sync(0xffffffffu, value, 1);
+    return value;
+}
+
+__device__ __forceinline__ float termite_warp_reduce_sum_f32(float value) {
+    value += __shfl_down_sync(0xffffffffu, value, 16);
+    value += __shfl_down_sync(0xffffffffu, value, 8);
+    value += __shfl_down_sync(0xffffffffu, value, 4);
+    value += __shfl_down_sync(0xffffffffu, value, 2);
+    value += __shfl_down_sync(0xffffffffu, value, 1);
+    return value;
+}
+
+__device__ __forceinline__ float termite_block_reduce_sum_f32(float value, float* warp_sums) {
+    unsigned int lane = threadIdx.x & 31u;
+    unsigned int warp = threadIdx.x >> 5;
+    unsigned int warp_count = (blockDim.x + 31u) >> 5;
+    value = termite_warp_reduce_sum_f32(value);
+    if (lane == 0u) warp_sums[warp] = value;
+    __syncthreads();
+    value = (warp == 0u && lane < warp_count) ? warp_sums[lane] : 0.0f;
+    if (warp == 0u) value = termite_warp_reduce_sum_f32(value);
+    return value;
+}
+
+static __device__ __forceinline__ float antfly_warp_reduce_max_f32(float value) {
+    value = fmaxf(value, __shfl_down_sync(0xffffffffu, value, 16));
+    value = fmaxf(value, __shfl_down_sync(0xffffffffu, value, 8));
+    value = fmaxf(value, __shfl_down_sync(0xffffffffu, value, 4));
+    value = fmaxf(value, __shfl_down_sync(0xffffffffu, value, 2));
+    value = fmaxf(value, __shfl_down_sync(0xffffffffu, value, 1));
+    return __shfl_sync(0xffffffffu, value, 0);
+}
+
+static __device__ __forceinline__ float antfly_decoder_activation_f32(float x, unsigned int activation) {
+    if (activation <= 1u) {
+        const float inner = 0.7978845608028654f * (x + 0.044715f * x * x * x);
+        return 0.5f * x * (1.0f + tanhf(inner));
+    }
+    if (activation == 2u) return x / (1.0f + __expf(-x));
+    if (activation == 3u) return fmaxf(x, 0.0f);
+    if (activation == 4u) return x / (1.0f + __expf(-1.702f * x));
+    const float r = fmaxf(x, 0.0f);
+    return r * r;
+}
+
+// q4_0 payload bytes live at bp+2; bp is always 2-byte aligned (18-byte
+// blocks), so every 4-byte word can be assembled from two aligned u16 loads.
+static __device__ __forceinline__ unsigned int antfly_q4_0_word_u16(const unsigned char *payload) {
+    const unsigned short *halves = (const unsigned short *)payload;
+    return (unsigned int)halves[0] | ((unsigned int)halves[1] << 16);
+}
+
+static __device__ __forceinline__ float antfly_q4_0_q8_dot16(
+    const unsigned char *q4_bp,
+    float q8_d,
+    unsigned int iqs,
+    int q8_low0,
+    int q8_high0,
+    int q8_low1,
+    int q8_high1
+) {
+    const float q4_d = antfly_half_bits_to_float(((const unsigned short *)q4_bp)[0]);
+    const unsigned int base0 = iqs * 4u;
+    const unsigned int word0 = antfly_q4_0_word_u16(q4_bp + 2u + base0);
+    const unsigned int word1 = antfly_q4_0_word_u16(q4_bp + 2u + base0 + 4u);
+    const unsigned int low0 = __vadd4(word0 & 0x0f0f0f0fu, 0xf8f8f8f8u);
+    const unsigned int high0 = __vadd4((word0 >> 4) & 0x0f0f0f0fu, 0xf8f8f8f8u);
+    const unsigned int low1 = __vadd4(word1 & 0x0f0f0f0fu, 0xf8f8f8f8u);
+    const unsigned int high1 = __vadd4((word1 >> 4) & 0x0f0f0f0fu, 0xf8f8f8f8u);
+    int sumi = __dp4a((int)low0, q8_low0, 0);
+    sumi = __dp4a((int)high0, q8_high0, sumi);
+    sumi = __dp4a((int)low1, q8_low1, sumi);
+    sumi = __dp4a((int)high1, q8_high1, sumi);
+    return q4_d * q8_d * (float)sumi;
+}
+
+__device__ __forceinline__ float antfly_q6_k_sub_scale_f32(const unsigned char *block, int lane) {
+    int v0 = lane;
+    int v1 = 208;
+    float v2 = antfly_half_le_to_float(block + v1);
+    int v3 = 192;
+    int v4 = v3 + v0;
+    int v5 = int(((const signed char *)block)[v4]);
+    float v6 = float(v5);
+    float v7 = v2 * v6;
+    return v7;
+}
+
+// quant-kernel-codegen:end shared CUDA helpers
 
 __device__ __forceinline__ void termite_store_half_bytes(unsigned char* dst, float value);
 __device__ __forceinline__ float termite_warp_reduce_max_f32(float v);
@@ -2118,22 +2529,6 @@ extern "C" __global__ void termite_activation_multiply_f32(
         act = r * r;
     }
     dst[i] = act * up[i];
-}
-
-__device__ __forceinline__ float termite_decoder_activation_f32(float x, unsigned int activation) {
-    if (activation == 0u) {
-        return 0.5f * x * (1.0f + tanhf(0.7978845608028654f * (x + 0.044715f * x * x * x)));
-    } else if (activation == 1u) {
-        return 0.5f * x * (1.0f + tanhf(0.7978845608028654f * (x + 0.044715f * x * x * x)));
-    } else if (activation == 2u) {
-        return x / (1.0f + expf(-x));
-    } else if (activation == 3u) {
-        return fmaxf(x, 0.0f);
-    } else if (activation == 4u) {
-        return x / (1.0f + expf(-1.702f * x));
-    }
-    float r = fmaxf(x, 0.0f);
-    return r * r;
 }
 
 extern "C" __global__ void termite_activation_multiply_slice_last_dim_f32(
@@ -4263,27 +4658,6 @@ extern "C" __global__ void termite_gqa_attention_f32(
     }
 
     dst[idx] = denom > 0.0f ? acc / denom : 0.0f;
-}
-
-__device__ __forceinline__ float termite_warp_reduce_sum_f32(float value) {
-    value += __shfl_down_sync(0xffffffffu, value, 16);
-    value += __shfl_down_sync(0xffffffffu, value, 8);
-    value += __shfl_down_sync(0xffffffffu, value, 4);
-    value += __shfl_down_sync(0xffffffffu, value, 2);
-    value += __shfl_down_sync(0xffffffffu, value, 1);
-    return value;
-}
-
-__device__ __forceinline__ float termite_block_reduce_sum_f32(float value, float* warp_sums) {
-    unsigned int lane = threadIdx.x & 31u;
-    unsigned int warp = threadIdx.x >> 5;
-    unsigned int warp_count = (blockDim.x + 31u) >> 5;
-    value = termite_warp_reduce_sum_f32(value);
-    if (lane == 0u) warp_sums[warp] = value;
-    __syncthreads();
-    value = (warp == 0u && lane < warp_count) ? warp_sums[lane] : 0.0f;
-    if (warp == 0u) value = termite_warp_reduce_sum_f32(value);
-    return value;
 }
 
 extern "C" __global__ void termite_gqa_attention_decode_scalars_fast_f32(
@@ -12102,28 +12476,6 @@ extern "C" __global__ void termite_gqa_attention_decode_turboquant_f32(
     }
 }
 
-__device__ __forceinline__ float termite_half_to_float(unsigned short h) {
-    return __half2float(__ushort_as_half(h));
-}
-
-__device__ float termite_q8_0_value(const unsigned char* bp, unsigned int lane) {
-    // GGUF Q8_0 is scaled int8, not CUDA FP8; keep scale decode on CUDA's
-    // native half path and reserve FP8 intrinsics for real FP8 storage.
-    unsigned short h = (unsigned short)bp[0] | ((unsigned short)bp[1] << 8);
-    float d = termite_half_to_float(h);
-    signed char q = (signed char)bp[2u + lane];
-    return (float)q * d;
-}
-
-__device__ __forceinline__ float termite_warp_reduce_sum(float v) {
-    v += __shfl_down_sync(0xffffffffu, v, 16);
-    v += __shfl_down_sync(0xffffffffu, v, 8);
-    v += __shfl_down_sync(0xffffffffu, v, 4);
-    v += __shfl_down_sync(0xffffffffu, v, 2);
-    v += __shfl_down_sync(0xffffffffu, v, 1);
-    return v;
-}
-
 __device__ float termite_q8_0_value_broadcast_scale(const unsigned char* bp, unsigned int lane) {
     float d = 0.0f;
     if (lane == 0u) {
@@ -12446,21 +12798,6 @@ extern "C" __global__ void termite_linear_q8_0_bias_add_f32_fast_r4c4(
     termite_q8_0_tile_rows_cols_fast<4u, 4u, 3u>(dst, input, weight, bias, residual, rows, in_dim, out_dim);
 }
 
-__device__ __forceinline__ float termite_q4_0_value(const unsigned char* bp, unsigned int lane) {
-    unsigned short h = (unsigned short)bp[0] | ((unsigned short)bp[1] << 8);
-    float d = termite_half_to_float(h);
-    unsigned char packed;
-    int q;
-    if (lane < 16u) {
-        packed = bp[2u + lane];
-        q = (int)(packed & 0x0fu);
-    } else {
-        packed = bp[2u + lane - 16u];
-        q = (int)(packed >> 4);
-    }
-    return (float)(q - 8) * d;
-}
-
 // Dequantizes Q4_0 blocks (18 bytes: f16 scale + 32 packed nibbles) straight
 // to BF16 on device, one thread per block. Bit-identical to the host path
 // (dequantizeToFloat32 + round-to-nearest-even): both compute (q-8)*d in f32
@@ -12514,18 +12851,6 @@ extern "C" __global__ void termite_pack_q8_0_tensor_core(
             dst[idx] = src[block * 34u + 2u + lane];
         }
     }
-}
-
-__device__ __forceinline__ float termite_q4_0_value_nibble(
-    const unsigned char* bp,
-    unsigned int q_offset,
-    unsigned int high_nibble
-) {
-    unsigned short h = (unsigned short)bp[0] | ((unsigned short)bp[1] << 8);
-    float d = termite_half_to_float(h);
-    unsigned char packed = bp[q_offset];
-    int q = high_nibble != 0u ? (int)(packed >> 4) : (int)(packed & 0x0fu);
-    return (float)(q - 8) * d;
 }
 
 __device__ __forceinline__ void termite_store_half_bytes(unsigned char* dst, float value) {
@@ -14181,93 +14506,6 @@ extern "C" __global__ void termite_linear_q4_0_gated_down_f32_tile16(
         }
     }
     termite_store_q4_0_cols_warp_sum<16u>(dst, row, out_dim, col_tile, acc, &warp_partial[0][0], tid, lane, warp);
-}
-
-__device__ unsigned int termite_q4k_scale(const unsigned char* scales, unsigned int sub) {
-    if (sub < 4u) return (unsigned int)(scales[sub] & 63u);
-    return (unsigned int)((scales[sub + 4u] & 0x0fu) | ((scales[sub - 4u] >> 6u) << 4u));
-}
-
-__device__ unsigned int termite_q4k_min(const unsigned char* scales, unsigned int sub) {
-    if (sub < 4u) return (unsigned int)(scales[sub + 4u] & 63u);
-    return (unsigned int)((scales[sub + 4u] >> 4u) | ((scales[sub] >> 6u) << 4u));
-}
-
-__device__ float termite_q4k_value(const unsigned char* bp, unsigned int value_index) {
-    unsigned short dh = (unsigned short)bp[0] | ((unsigned short)bp[1] << 8);
-    unsigned short dminh = (unsigned short)bp[2] | ((unsigned short)bp[3] << 8);
-    float d = termite_half_to_float(dh);
-    float dmin = termite_half_to_float(dminh);
-    const unsigned char* scales = bp + 4u;
-    const unsigned char* qs = bp + 16u;
-    unsigned int sub = value_index / 32u;
-    unsigned int chunk = value_index / 64u;
-    unsigned int lane = value_index & 31u;
-    unsigned char packed = qs[chunk * 32u + lane];
-    unsigned int q = (sub & 1u) == 0u ? (unsigned int)(packed & 0x0fu) : (unsigned int)(packed >> 4u);
-    float scale = d * (float)termite_q4k_scale(scales, sub);
-    float minv = dmin * (float)termite_q4k_min(scales, sub);
-    return scale * (float)q - minv;
-}
-
-__device__ __forceinline__ float termite_q6k_value(const unsigned char* bp, unsigned int value_index) {
-    const unsigned char* ql = bp;
-    const unsigned char* qh = bp + 128u;
-    const unsigned char* scales = bp + 192u;
-    unsigned short dh = (unsigned short)bp[208] | ((unsigned short)bp[209] << 8);
-    float d = termite_half_to_float(dh);
-
-    unsigned int sub = value_index / 16u;
-    unsigned int i = value_index & 15u;
-    unsigned int half = sub / 8u;
-    unsigned int group = (sub % 8u) / 2u;
-    unsigned int l_base = (sub & 1u) * 16u;
-    unsigned int ql_off = half * 64u + (group & 1u) * 32u;
-    unsigned int qh_off = half * 32u;
-    unsigned int qh_shift = group * 2u;
-    unsigned int nibble_shift = (group / 2u) * 4u;
-    unsigned int l = l_base + i;
-
-    unsigned int low4 = (unsigned int)((ql[ql_off + l] >> nibble_shift) & 0x0fu);
-    unsigned int high2 = (unsigned int)((qh[qh_off + l] >> qh_shift) & 0x03u);
-    int q = (int)(low4 | (high2 << 4u)) - 32;
-    float scale = d * (float)((signed char)scales[sub]);
-    return scale * (float)q;
-}
-
-__device__ __forceinline__ int termite_q6k_quant_i32(const unsigned char* bp, unsigned int value_index) {
-    const unsigned char* ql = bp;
-    const unsigned char* qh = bp + 128u;
-
-    unsigned int sub = value_index / 16u;
-    unsigned int i = value_index & 15u;
-    unsigned int half = sub / 8u;
-    unsigned int group = (sub % 8u) / 2u;
-    unsigned int l_base = (sub & 1u) * 16u;
-    unsigned int ql_off = half * 64u + (group & 1u) * 32u;
-    unsigned int qh_off = half * 32u;
-    unsigned int qh_shift = group * 2u;
-    unsigned int nibble_shift = (group / 2u) * 4u;
-    unsigned int l = l_base + i;
-
-    unsigned int low4 = (unsigned int)((ql[ql_off + l] >> nibble_shift) & 0x0fu);
-    unsigned int high2 = (unsigned int)((qh[qh_off + l] >> qh_shift) & 0x03u);
-    return (int)(low4 | (high2 << 4u)) - 32;
-}
-
-__device__ __forceinline__ float termite_q6k_scale_f32(const unsigned char* bp, unsigned int value_index) {
-    const unsigned char* scales = bp + 192u;
-    unsigned short dh = (unsigned short)bp[208] | ((unsigned short)bp[209] << 8);
-    float d = termite_half_to_float(dh);
-    unsigned int sub = value_index / 16u;
-    return d * (float)((signed char)scales[sub]);
-}
-
-__device__ __forceinline__ float termite_q6k_sub_scale_f32(const unsigned char* bp, unsigned int sub) {
-    const unsigned char* scales = bp + 192u;
-    unsigned short dh = (unsigned short)bp[208] | ((unsigned short)bp[209] << 8);
-    float d = termite_half_to_float(dh);
-    return d * (float)((signed char)scales[sub]);
 }
 
 __device__ __forceinline__ int termite_pack_q6k_i8x4(const unsigned char* bp, unsigned int base_value_index) {
@@ -21943,29 +22181,9 @@ extern "C" __global__ void termite_split_last_dim3_f32(
     third[idx] = input[src + dim * 2u];
 }
 
-// Runtime-wired generated quant kernels from graph/quant_kernel_compiler.zig.
-// Kernel bodies must match src/ops/cuda/generated/quant_kernel_q4_0_mmv.cu and
-// src/ops/cuda/generated/quant_kernel_q4_0_mm.cu byte-for-byte modulo the
-// uint8_t/uint16_t -> unsigned char/unsigned short spellings; the compiler test
-// "promoted CUDA kernel bodies stay in sync with the production bundle"
-// enforces this, so update this copy whenever the generated source changes.
+// quant-kernel-codegen:begin generated CUDA promoted matmul kernels (do not edit; run: zig build quant-kernel-codegen -- --write)
+// Production generated CUDA matmul route from graph/quant_kernel_compiler.zig.
 // kernel_id=antfly_q4_0_mmv_f32_v1 plan_id=cuda/q4_0/rows_1/none/mmv
-// kernel_id=antfly_q4_0_mm_f32_v1 plan_id=cuda/q4_0/rows_9_64/none/mm
-
-static __device__ __forceinline__ float antfly_half_le_to_float(const unsigned char *p) {
-    const unsigned short bits = (unsigned short)p[0] | ((unsigned short)p[1] << 8);
-    return __half2float(__ushort_as_half(bits));
-}
-
-static __device__ __forceinline__ float antfly_warp_reduce_sum(float value) {
-    value += __shfl_down_sync(0xffffffffu, value, 16);
-    value += __shfl_down_sync(0xffffffffu, value, 8);
-    value += __shfl_down_sync(0xffffffffu, value, 4);
-    value += __shfl_down_sync(0xffffffffu, value, 2);
-    value += __shfl_down_sync(0xffffffffu, value, 1);
-    return value;
-}
-
 extern "C" __global__ void antfly_q4_0_mmv_f32_v1(
     const float *input,
     const unsigned char *weight_q4_0,
@@ -22015,6 +22233,8 @@ extern "C" __global__ void antfly_q4_0_mmv_f32_v1(
     }
 }
 
+// Production generated CUDA matmul route from graph/quant_kernel_compiler.zig.
+// kernel_id=antfly_q4_0_mm_f32_v1 plan_id=cuda/q4_0/rows_9_64/none/mm
 extern "C" __global__ void antfly_q4_0_mm_f32_v1(
     const float *input,
     const unsigned char *weight_q4_0,
@@ -22088,12 +22308,8 @@ extern "C" __global__ void antfly_q4_0_mm_f32_v1(
     }
 }
 
-// Runtime-wired generated quant kernel from graph/quant_kernel_compiler.zig.
-// Kernel body must match src/ops/cuda/generated/quant_kernel_q4_0_pair_mmv.cu
-// byte-for-byte modulo the uint8_t -> unsigned char spelling; enforced by the
-// compiler sync test, so update this copy whenever the generated source changes.
+// Production generated CUDA matmul route from graph/quant_kernel_compiler.zig.
 // kernel_id=antfly_q4_0_pair_mmv_f32_v1 plan_id=cuda/q4_0/rows_1/pair/mmv
-
 extern "C" __global__ void antfly_q4_0_pair_mmv_f32_v1(
     const float *input,
     const unsigned char *weight_a_q4_0,
@@ -22163,76 +22379,8 @@ extern "C" __global__ void antfly_q4_0_pair_mmv_f32_v1(
     }
 }
 
-// Runtime-wired generated quant kernel from graph/quant_kernel_compiler.zig.
-// Kernel body must match src/ops/cuda/generated/quant_kernel_q4_0_pair_activation_q8_1.cu
-// byte-for-byte; update this copy whenever the candidate source changes.
+// Production generated CUDA matmul route from graph/quant_kernel_compiler.zig.
 // kernel_id=antfly_q4_0_pair_activation_q8_1_mmv_v1 plan_id=cuda/q4_0/rows_1/pair_activation/mmv
-
-static __device__ __forceinline__ float antfly_half_bits_to_float(unsigned short bits) {
-    return __half2float(__ushort_as_half(bits));
-}
-
-static __device__ __forceinline__ float antfly_warp_reduce_sum_f32(float value) {
-    value += __shfl_down_sync(0xffffffffu, value, 16);
-    value += __shfl_down_sync(0xffffffffu, value, 8);
-    value += __shfl_down_sync(0xffffffffu, value, 4);
-    value += __shfl_down_sync(0xffffffffu, value, 2);
-    value += __shfl_down_sync(0xffffffffu, value, 1);
-    return value;
-}
-
-static __device__ __forceinline__ float antfly_warp_reduce_max_f32(float value) {
-    value = fmaxf(value, __shfl_down_sync(0xffffffffu, value, 16));
-    value = fmaxf(value, __shfl_down_sync(0xffffffffu, value, 8));
-    value = fmaxf(value, __shfl_down_sync(0xffffffffu, value, 4));
-    value = fmaxf(value, __shfl_down_sync(0xffffffffu, value, 2));
-    value = fmaxf(value, __shfl_down_sync(0xffffffffu, value, 1));
-    return __shfl_sync(0xffffffffu, value, 0);
-}
-
-static __device__ __forceinline__ float antfly_decoder_activation_f32(float x, unsigned int activation) {
-    if (activation <= 1u) {
-        const float inner = 0.7978845608028654f * (x + 0.044715f * x * x * x);
-        return 0.5f * x * (1.0f + tanhf(inner));
-    }
-    if (activation == 2u) return x / (1.0f + __expf(-x));
-    if (activation == 3u) return fmaxf(x, 0.0f);
-    if (activation == 4u) return x / (1.0f + __expf(-1.702f * x));
-    const float r = fmaxf(x, 0.0f);
-    return r * r;
-}
-
-// q4_0 payload bytes live at bp+2; bp is always 2-byte aligned (18-byte
-// blocks), so every 4-byte word can be assembled from two aligned u16 loads.
-static __device__ __forceinline__ unsigned int antfly_q4_0_word_u16(const unsigned char *payload) {
-    const unsigned short *halves = (const unsigned short *)payload;
-    return (unsigned int)halves[0] | ((unsigned int)halves[1] << 16);
-}
-
-static __device__ __forceinline__ float antfly_q4_0_q8_dot16(
-    const unsigned char *q4_bp,
-    float q8_d,
-    unsigned int iqs,
-    int q8_low0,
-    int q8_high0,
-    int q8_low1,
-    int q8_high1
-) {
-    const float q4_d = antfly_half_bits_to_float(((const unsigned short *)q4_bp)[0]);
-    const unsigned int base0 = iqs * 4u;
-    const unsigned int word0 = antfly_q4_0_word_u16(q4_bp + 2u + base0);
-    const unsigned int word1 = antfly_q4_0_word_u16(q4_bp + 2u + base0 + 4u);
-    const unsigned int low0 = __vadd4(word0 & 0x0f0f0f0fu, 0xf8f8f8f8u);
-    const unsigned int high0 = __vadd4((word0 >> 4) & 0x0f0f0f0fu, 0xf8f8f8f8u);
-    const unsigned int low1 = __vadd4(word1 & 0x0f0f0f0fu, 0xf8f8f8f8u);
-    const unsigned int high1 = __vadd4((word1 >> 4) & 0x0f0f0f0fu, 0xf8f8f8f8u);
-    int sumi = __dp4a((int)low0, q8_low0, 0);
-    sumi = __dp4a((int)high0, q8_high0, sumi);
-    sumi = __dp4a((int)low1, q8_low1, sumi);
-    sumi = __dp4a((int)high1, q8_high1, sumi);
-    return q4_d * q8_d * (float)sumi;
-}
-
 extern "C" __global__ void antfly_q4_0_pair_activation_q8_1_mmv_v1(
     unsigned char *dst_q8,
     const unsigned char *q8_input,
@@ -22345,12 +22493,8 @@ extern "C" __global__ void antfly_q4_0_pair_activation_q8_1_mmv_v1(
         }
     }
 }
-
-// Runtime-wired generated quant kernel from graph/quant_kernel_compiler.zig.
-// Kernel body must match src/ops/cuda/generated/quant_kernel_q4_0_down_q8_1.cu
-// byte-for-byte; update this copy whenever the candidate source changes.
+// Production generated CUDA matmul route from graph/quant_kernel_compiler.zig.
 // kernel_id=antfly_q4_0_down_q8_1_mmv_v1 plan_id=cuda/q4_0/rows_1/gated_down/mmv
-
 extern "C" __global__ void antfly_q4_0_down_q8_1_mmv_v1(
     float *dst,
     const unsigned char *q8_input,
@@ -22411,15 +22555,7 @@ extern "C" __global__ void antfly_q4_0_down_q8_1_mmv_v1(
         if (col < out_dim) dst[(size_t)row * out_dim + col] = y;
     }
 }
-
-static __device__ __forceinline__ float antfly_q6_k_sub_scale_f32(
-    const unsigned char *block,
-    unsigned int sub
-) {
-    const signed char *scales = (const signed char *)(block + 192u);
-    const unsigned short d_bits = (unsigned short)block[208] | ((unsigned short)block[209] << 8);
-    return antfly_half_bits_to_float(d_bits) * (float)scales[sub];
-}
+// quant-kernel-codegen:end generated CUDA promoted matmul kernels
 
 // quant-kernel-codegen:begin generated CUDA runtime-wired dev matmul candidates (do not edit; run: zig build quant-kernel-codegen -- --write)
 // Runtime-owned llama.cpp CUDA block_q8_1 support; generated, never hand-edited.

@@ -32,15 +32,10 @@ inline float antfly_q8_0_dequant_lane_v2(device const uchar *block, int lane) {
     float v2 = antfly_qk_half_le_to_float(block + v1);
     int v3 = 2;
     int v4 = v0 + v3;
-    int v5 = int(block[v4]);
-    int v6 = 128;
-    int v7 = v5 < v6;
-    int v8 = 256;
-    int v9 = v5 - v8;
-    int v10 = v7 ? v5 : v9;
-    float v11 = float(v10);
-    float v12 = v2 * v11;
-    return v12;
+    int v5 = int(((device const char *)block)[v4]);
+    float v6 = float(v5);
+    float v7 = v2 * v6;
+    return v7;
 }
 kernel void antfly_q8_0_small_batch_bias_gelu_msl_v1(device const float *input [[buffer(0)]], device const uchar *weight_q8_0 [[buffer(1)]], device const float *bias [[buffer(2)]], device float *output [[buffer(3)]], constant int &rows [[buffer(4)]], constant int &in_dim [[buffer(5)]], constant int &out_dim [[buffer(6)]], uint3 thread_pos [[thread_position_in_threadgroup]], uint3 group_pos [[threadgroup_position_in_grid]]) {
     uint tid = thread_pos.x; int col0 = int(group_pos.x << 1); int col1 = col0 + 1; int row = int(group_pos.y); if (row >= rows || rows < 2 || rows > 8 || col0 >= out_dim || (in_dim & 31) != 0) return; float acc0 = 0.0f; float acc1 = 0.0f; int block_count = in_dim >> 5;

@@ -5161,6 +5161,30 @@ pub fn validateCudaRuntimeAttentionExternalHelpers(prefix: []const u8) !void {
     }
 }
 
+/// Promoted matmul bodies use the same renderer as their byte-qualified
+/// standalone artifacts. Only the runtime ABI's byte type aliases differ.
+pub fn renderCudaRuntimeProductionMatmulRegion(allocator: std.mem.Allocator) ![]u8 {
+    var out = std.ArrayListUnmanaged(u8).empty;
+    errdefer out.deinit(allocator);
+    var emitted: usize = 0;
+    for (first_generated_matmul_artifacts) |artifact| {
+        if (artifact.backend != .cuda or !artifact.production_enabled) continue;
+        const plan = cudaRenderPlanForArtifact(artifact) orelse return error.MissingCudaRenderPlan;
+        const plan_id = try cuda_renderer.planId(plan, allocator);
+        defer allocator.free(plan_id);
+        const body = try cuda_renderer.renderBodyAlloc(allocator, plan);
+        defer allocator.free(body);
+        const normalized = try normalizeCudaBundleTypes(allocator, body);
+        defer allocator.free(normalized);
+        try appendFmt(allocator, &out, "// Production generated CUDA matmul route from graph/quant_kernel_compiler.zig.\n// kernel_id={s} plan_id={s}\n", .{ plan.kernel_id, plan_id });
+        try out.appendSlice(allocator, normalized);
+        try out.append(allocator, '\n');
+        emitted += 1;
+    }
+    if (emitted == 0) return error.MissingCudaRenderPlan;
+    return out.toOwnedSlice(allocator);
+}
+
 /// Renders runtime-wired CUDA matmul candidates that remain dev-only. These
 /// bodies live in their own bundle region after the shared Antfly Q4/Q8 helper
 /// definitions, so renderer output can reference those helpers directly.
@@ -5207,7 +5231,10 @@ pub fn validateCudaRuntimeDevMatmulExternalHelpers(prefix: []const u8) !void {
         const plan = cudaRenderPlanForArtifact(artifact) orelse return error.MissingCudaRenderPlan;
         for (cuda_renderer.supportFor(plan.lowering).helpers) |helper| {
             if (std.mem.eql(u8, helper.name, cuda_renderer.helper_q4_0_ggml_q8_1_dot16.name)) continue;
-            if (std.mem.count(u8, prefix, helper.source) != 1) return error.CudaRuntimeDevMatmulExternalHelperDrift;
+            var storage: [32768]u8 = undefined;
+            var fixed = std.heap.FixedBufferAllocator.init(&storage);
+            const rendered = try helper.renderRuntimeAlloc(fixed.allocator());
+            if (std.mem.count(u8, prefix, rendered) != 1) return error.CudaRuntimeDevMatmulExternalHelperDrift;
         }
         checked_candidates += 1;
     }
@@ -7935,7 +7962,9 @@ test "quant kernel compiler promoted CUDA renderer fragments stay in sync with t
 
         const support = cuda_renderer.supportFor(plan.lowering);
         for (support.helpers) |helper| {
-            const normalized = try normalizeCudaBundleTypes(std.testing.allocator, helper.source);
+            const rendered = try helper.renderAlloc(std.testing.allocator);
+            defer std.testing.allocator.free(rendered);
+            const normalized = try normalizeCudaBundleTypes(std.testing.allocator, rendered);
             defer std.testing.allocator.free(normalized);
             try std.testing.expect(std.mem.containsAtLeast(u8, bundle, 1, normalized));
         }

@@ -15,6 +15,7 @@ pub const Expression = union(enum) {
     lane,
     integer: i32,
     byte: Id,
+    signed_byte: Id,
     half: Id,
     float: Id,
     word: Id,
@@ -36,6 +37,7 @@ pub const Recipe = struct {
     result: Id = 0,
     scale_component: ?Id = null,
     value_component: ?Id = null,
+    integer_component: ?Id = null,
 
     /// Prune a component before lowering it. Target schedules can hoist a
     /// block/subblock scale without maintaining another packed-format decoder.
@@ -47,7 +49,7 @@ pub const Recipe = struct {
             i -= 1;
             if (!live[i]) continue;
             switch (self.nodes[i]) {
-                .byte, .half, .float, .word, .to_float => |p| live[p] = true,
+                .byte, .signed_byte, .half, .float, .word, .to_float => |p| live[p] = true,
                 .add, .subtract, .multiply, .bit_and, .bit_or, .shift_left, .shift_right, .less => |p| {
                     live[p.a] = true;
                     live[p.b] = true;
@@ -65,16 +67,50 @@ pub const Recipe = struct {
         for (self.nodes[0..self.count], 0..) |node, index| {
             if (!live[index]) continue;
             ids[index] = reduced.count;
-            reduced.nodes[reduced.count] = switch (node) {
-                inline .byte, .half, .float, .word, .to_float => |p, tag| @unionInit(Expression, @tagName(tag), ids[p]),
-                inline .add, .subtract, .multiply, .bit_and, .bit_or, .shift_left, .shift_right, .less => |p, tag| @unionInit(Expression, @tagName(tag), Pair{ .a = ids[p.a], .b = ids[p.b] }),
-                .choose => |c| .{ .choose = .{ .condition = ids[c.condition], .yes = ids[c.yes], .no = ids[c.no] } },
-                else => node,
-            };
+            reduced.nodes[reduced.count] = remap(node, &ids);
             reduced.count += 1;
         }
         reduced.result = ids[result];
         return reduced;
+    }
+
+    /// Intern identical expressions without reassociating floating arithmetic.
+    /// GPU compilers previously had to rediscover these duplicate constants,
+    /// loads and address expressions in every generated kernel. Components keep
+    /// their own roots so schedules can still hoist scales independently.
+    pub fn compact(self: Recipe) Recipe {
+        var reduced = Recipe{ .format = self.format };
+        var ids: [128]Id = undefined;
+        for (self.nodes[0..self.count], 0..) |node, index| {
+            const mapped = remap(node, &ids);
+            var found: ?Id = null;
+            for (reduced.nodes[0..reduced.count], 0..) |existing, candidate| {
+                if (std.meta.eql(existing, mapped)) {
+                    found = @intCast(candidate);
+                    break;
+                }
+            }
+            ids[index] = found orelse blk: {
+                const id = reduced.count;
+                reduced.nodes[id] = mapped;
+                reduced.count += 1;
+                break :blk id;
+            };
+        }
+        reduced.result = ids[self.result];
+        if (self.scale_component) |id| reduced.scale_component = ids[id];
+        if (self.value_component) |id| reduced.value_component = ids[id];
+        if (self.integer_component) |id| reduced.integer_component = ids[id];
+        return reduced;
+    }
+
+    fn remap(node: Expression, ids: *const [128]Id) Expression {
+        return switch (node) {
+            inline .byte, .signed_byte, .half, .float, .word, .to_float => |p, tag| @unionInit(Expression, @tagName(tag), ids[p]),
+            inline .add, .subtract, .multiply, .bit_and, .bit_or, .shift_left, .shift_right, .less => |p, tag| @unionInit(Expression, @tagName(tag), Pair{ .a = ids[p.a], .b = ids[p.b] }),
+            .choose => |c| .{ .choose = .{ .condition = ids[c.condition], .yes = ids[c.yes], .no = ids[c.no] } },
+            else => node,
+        };
     }
 
     pub fn tensorType(self: Recipe) tensor_types.TensorType {
@@ -158,9 +194,12 @@ const Builder = struct {
         return b.put(.{ .to_float = value });
     }
     fn signedByte(b: *Builder, offset: Id) Id {
-        const v = b.byte(offset);
-        return b.select(b.lt(v, 128), v, b.sub(v, b.i(256)));
+        return b.put(.{ .signed_byte = offset });
     }
+    fn q6Scale(b: *Builder, sub_index: Id) Id {
+        return b.scaled(b.half(208), b.signedByte(b.add(b.i(192), sub_index)));
+    }
+
     fn scaled(b: *Builder, scale: Id, value: Id) Id {
         return b.mul(scale, b.f(value));
     }
@@ -246,10 +285,11 @@ pub fn forFormat(comptime format: quant.Format) Recipe {
             const low = b.mask(b.pair(.shift_right, b.byte(low_offset), b.mul(b.shr(group, 1), b.i(4))), 15);
             const high = b.mask(b.pair(.shift_right, b.byte(high_offset), b.mul(group, b.i(2))), 3);
             const q = b.sub(b.pair(.bit_or, low, b.shl(high, 4)), b.i(32));
-            const scale = b.scaled(b.half(208), b.signedByte(b.add(b.i(192), sub)));
+            const scale = b.q6Scale(sub);
             const value = b.f(q);
             b.recipe.scale_component = scale;
             b.recipe.value_component = value;
+            b.recipe.integer_component = q;
             break :blk b.mul(scale, value);
         },
         else => @compileError("No packed block recipe for " ++ @tagName(format)),
@@ -266,7 +306,7 @@ fn varying(comptime recipe: Recipe) [recipe.count]bool {
         result[index] = switch (node) {
             .lane => true,
             .integer => false,
-            .byte, .half, .float, .word, .to_float => |p| result[p],
+            .byte, .signed_byte, .half, .float, .word, .to_float => |p| result[p],
             .add, .subtract, .multiply, .bit_and, .bit_or, .shift_left, .shift_right, .less => |p| result[p.a] or result[p.b],
             .choose => |c| result[c.condition] or result[c.yes] or result[c.no],
         };
@@ -284,6 +324,7 @@ inline fn load(comptime tag: std.meta.Tag(Expression), block: []const u8, offset
     const bytes = block[@intCast(offset)..];
     return switch (tag) {
         .byte => bytes[0],
+        .signed_byte => @as(i8, @bitCast(bytes[0])),
         .half => @as(f32, @as(f16, @bitCast(std.mem.readInt(u16, bytes[0..2], .little)))),
         .float => @bitCast(std.mem.readInt(u32, bytes[0..4], .little)),
         .word => @bitCast(std.mem.readInt(u32, bytes[0..4], .little)),
@@ -314,7 +355,7 @@ pub inline fn evaluateLanes(comptime recipe: Recipe, comptime width: usize, bloc
                 break :blk lanes;
             },
             .integer => |v| v,
-            .byte, .half, .float, .word => |p| blk: {
+            .byte, .signed_byte, .half, .float, .word => |p| blk: {
                 if (!vector) break :blk load(node, block, values[p]);
                 var loaded: T = undefined;
                 inline for (0..width) |i| loaded[i] = load(node, block, values[p][i]);
@@ -337,7 +378,7 @@ pub inline fn evaluateLanes(comptime recipe: Recipe, comptime width: usize, bloc
             .choose => |c| if (vector) @select(if (recipe.isFloat(@intCast(index))) f32 else i32, widen(@Vector(width, i32), values[c.condition]) != @as(@Vector(width, i32), @splat(0)), widen(T, values[c.yes]), widen(T, values[c.no])) else if (values[c.condition] != 0) values[c.yes] else values[c.no],
         };
     }
-    return widen(if (width == 1) f32 else @Vector(width, f32), values[recipe.result]);
+    return if (comptime recipe.isFloat(recipe.result)) widen(if (width == 1) f32 else @Vector(width, f32), values[recipe.result]) else @floatFromInt(widen(if (width == 1) i32 else @Vector(width, i32), values[recipe.result]));
 }
 /// The CPU schedule is independent of format semantics. Eight lanes match the
 /// native quantized matmul width; partial tails preserve the public codec API.
@@ -381,17 +422,19 @@ pub const cuda_float_source =
 pub const Target = enum { metal, cuda };
 /// Emit the same expression graph into each target's existing source vocabulary.
 /// The caller owns headers and schedule selection. No runtime interpreter is used.
-pub fn render(allocator: std.mem.Allocator, recipe: Recipe, target: Target, name: []const u8) ![]u8 {
+pub fn render(allocator: std.mem.Allocator, raw_recipe: Recipe, target: Target, name: []const u8) ![]u8 {
+    const recipe = raw_recipe.compact();
     var out: std.Io.Writer.Allocating = .init(allocator);
     errdefer out.deinit();
     const w = &out.writer;
-    try w.print("{s} float {s}({s}const {s} *block, int lane) {{\n", .{ if (target == .metal) "inline" else "__device__ __forceinline__", name, if (target == .metal) "device " else "", if (target == .metal) "uchar" else "unsigned char" });
+    try w.print("{s} {s} {s}({s}const {s} *block, int lane) {{\n", .{ if (target == .metal) "inline" else "__device__ __forceinline__", if (recipe.isFloat(recipe.result)) "float" else "int", name, if (target == .metal) "device " else "", if (target == .metal) "uchar" else "unsigned char" });
     for (recipe.nodes[0..recipe.count], 0..) |node, index| {
         try w.print("    {s} v{d} = ", .{ if (recipe.isFloat(@intCast(index))) "float" else "int", index });
         switch (node) {
             .lane => try w.writeAll("lane"),
             .integer => |v| try w.print("{d}", .{v}),
             .byte => |p| try w.print("int(block[v{d}])", .{p}),
+            .signed_byte => |p| try w.print("int((({s}const {s} *)block)[v{d}])", .{ if (target == .metal) "device " else "", if (target == .metal) "char" else "signed char", p }),
             .half => |p| try w.print("{s}(block + v{d})", .{ if (target == .metal) "antfly_qk_half_le_to_float" else "antfly_half_le_to_float", p }),
             .float => |p| try w.print("{s}(block + v{d})", .{ if (target == .metal) "antfly_qk_f32_le_to_float" else "antfly_recipe_float_le", p }),
             .word => |p| try w.print("int({s}(block + v{d}))", .{ if (target == .metal) "antfly_qk_u32_le" else "antfly_recipe_u32_le", p }),
@@ -448,5 +491,47 @@ pub fn scaleMinHeader(comptime minimum: bool) Recipe {
     var b = Builder{ .recipe = .{ .format = .q4_k } };
     const sub_index = b.put(.lane);
     b.recipe.result = b.f(b.scaleMin(sub_index, minimum, 0));
+    return b.recipe;
+}
+
+/// Integer counterpart consumed by CUDA's tuned packed-dot schedules.
+pub fn scaleMinHeaderInteger(comptime minimum: bool) Recipe {
+    var b = Builder{ .recipe = .{ .format = .q4_k } };
+    const sub_index = b.put(.lane);
+    b.recipe.result = b.scaleMin(sub_index, minimum, 0);
+    return b.recipe;
+}
+
+test "shared quant recipe compaction preserves every packed lane and hoistable component" {
+    @setEvalBranchQuota(1000000);
+    var original_nodes: usize = 0;
+    var compact_nodes: usize = 0;
+    inline for (formats) |format| {
+        const original = comptime forFormat(format);
+        const compacted = comptime original.compact();
+        original_nodes += original.count;
+        compact_nodes += compacted.count;
+        try std.testing.expectEqual(compacted.count, compacted.compact().count);
+        for (0..64) |trial| {
+            var block: [original.blockBytes()]u8 = undefined;
+            @import("testing/quant_blocks.zig").fill(format, trial, &block);
+            for (0..original.blockValues()) |lane| {
+                try std.testing.expectEqual(evaluate(original, &block, lane), evaluate(compacted, &block, lane));
+                if (comptime original.scale_component != null) {
+                    try std.testing.expectEqual(evaluate(comptime original.component(original.scale_component.?), &block, lane), evaluate(comptime compacted.component(compacted.scale_component.?), &block, lane));
+                    try std.testing.expectEqual(evaluate(comptime original.component(original.value_component.?), &block, lane), evaluate(comptime compacted.component(compacted.value_component.?), &block, lane));
+                }
+            }
+        }
+    }
+    try std.testing.expect(compact_nodes < original_nodes);
+}
+
+/// Q6_K schedules address this scale by subblock rather than by value lane.
+/// Share the same builder as the full decode; no bit-layout copy is required.
+pub fn q6SubblockScale() Recipe {
+    var b = Builder{ .recipe = .{ .format = .q6_k } };
+    const sub = b.put(.lane);
+    b.recipe.result = b.q6Scale(sub);
     return b.recipe;
 }

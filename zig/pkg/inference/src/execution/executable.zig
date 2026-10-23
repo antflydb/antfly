@@ -277,11 +277,20 @@ test "prepared BERT program matches CPU reference on CPU and Metal" {
 }
 
 test "prepared physical frames pin published outputs survive eviction and bound retained storage" {
+    try testPhysicalFrameLifetime(.native);
+}
+
+test "CUDA prepared physical frames pin outputs across pool pressure and executable eviction" {
+    if (comptime !@import("build_options").enable_cuda) return error.SkipZigTest;
+    try testPhysicalFrameLifetime(.cuda);
+}
+
+fn testPhysicalFrameLifetime(comptime backend_kind: @import("../backends/backends.zig").BackendType) !void {
     if (comptime @import("build_options").enable_wasm) return error.SkipZigTest;
     const ml = @import("ml");
     const ResidentOutputs = @import("../backends/session.zig").ResidentOutputs;
     const a = std.testing.allocator;
-    var context = try @import("../backends/compute_context.zig").BackendContext.init(a, .native, null);
+    var context = try @import("../backends/compute_context.zig").BackendContext.init(a, backend_kind, null);
     defer context.deinit(a);
     const cb = context.computeBackend();
     var graph = ml.graph.Graph.init(a);
@@ -302,7 +311,11 @@ test "prepared physical frames pin published outputs survive eviction and bound 
         const input = try cb.fromFloat32Shape(&.{ -v, v, v + 1, -v - 1 }, &.{4});
         defer cb.free(input);
         const inputs = [_]interpreter.RuntimeInput{.{ .node_id = program.id_map[input_node], .value = input }};
-        var result = try executable.run(a, .{ .runtime_inputs = &inputs, .collect_partition_stats = true });
+        var audit = @import("transfer_audit.zig").Audit{ .forbid_device_host_access = true };
+        try @import("transfer_audit.zig").begin(&audit);
+        const executed = executable.run(a, .{ .runtime_inputs = &inputs, .collect_partition_stats = true });
+        @import("transfer_audit.zig").end();
+        var result = try executed;
         defer result.deinit(&executable.runtime);
         if (iteration < 4) {
             try std.testing.expect(result.stats.assigned_kernel_dispatches > 0);
@@ -320,7 +333,11 @@ test "prepared physical frames pin published outputs survive eviction and bound 
     defer cb.free(input);
     const inputs = [_]interpreter.RuntimeInput{.{ .node_id = program.id_map[input_node], .value = input }};
     {
-        var result = try executable.run(a, .{ .runtime_inputs = &inputs, .collect_partition_stats = true });
+        var audit = @import("transfer_audit.zig").Audit{ .forbid_device_host_access = true };
+        try @import("transfer_audit.zig").begin(&audit);
+        const executed = executable.run(a, .{ .runtime_inputs = &inputs, .collect_partition_stats = true });
+        @import("transfer_audit.zig").end();
+        var result = try executed;
         defer result.deinit(&executable.runtime);
         try std.testing.expect(result.stats.assigned_kernel_dispatches > 0);
         try std.testing.expectEqual(@as(u64, 0), result.stats.physical_storage_allocations);
