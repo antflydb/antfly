@@ -41410,16 +41410,24 @@ pub const DB = struct {
                     physical_keys[i] = try encodeStoreLookupKeyWithPinnedSchemaAlloc(self, window.allocator(), hit.id, schema);
                     ids[i] = hit.id;
                 }
-                var scope = try txn.openReadScope(window.allocator());
-                defer scope.close();
-                const authorities = try conditional_mod.Window.prepare(window.allocator(), &scope, physical_keys[0 .. end - start], ids[0 .. end - start]);
+                var authorities: conditional_mod.Window = .{};
+                {
+                    var scope = try txn.openReadScope(window.allocator());
+                    defer scope.close();
+                    authorities = try conditional_mod.Window.prepare(window.allocator(), &scope, physical_keys[0 .. end - start], ids[0 .. end - start]);
+                    if (end - start == 1) {
+                        conditional_rows = try alloc.alloc(?conditional_mod.Result, 1);
+                        conditional_rows.?[0] = null;
+                        conditional_rows.?[0] = try conditional_mod.loadPrepared(alloc, window.allocator(), &scope, physical_keys[0], ids[0], req.fields, prepared, authorities.rows[0], &repairs[0]);
+                    }
+                }
                 const Guard = struct {
                     fn check(raw: *const anyopaque) !void {
                         const request: *const types.SearchRequest = @ptrCast(@alignCast(raw));
                         try db_query_search.checkSearchRequestDeadline(request.*);
                     }
                 };
-                conditional_rows = try conditional_mod.loadPreparedWindow(alloc, window.allocator(), &scope, physical_keys[0 .. end - start], ids[0 .. end - start], req.fields, prepared, authorities.rows[0 .. end - start], repairs[0 .. end - start], .{ .ctx = &req, .run = Guard.check });
+                if (end - start != 1) conditional_rows = try conditional_mod.loadPreparedWindow(alloc, window.allocator(), &txn, physical_keys[0 .. end - start], ids[0 .. end - start], req.fields, prepared, authorities.rows[0 .. end - start], repairs[0 .. end - start], .{ .ctx = &req, .run = Guard.check });
             }
             var fallback_keys: [64][]const u8 = undefined;
             var fallback_slots: [64]usize = undefined;

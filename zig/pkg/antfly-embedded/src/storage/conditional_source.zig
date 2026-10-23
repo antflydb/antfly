@@ -225,26 +225,33 @@ pub fn loadPrepared(a: A, scratch: A, scope: anytype, physical: []const u8, id: 
 /// Bound additional materialized input independently of document count. Large
 /// full-value rows progress alone; small projected metadata can share a batch.
 const materialization_bytes = 1024 * 1024;
-fn selectionCost(selected: []const []const u8, authority: Authority) usize {
+fn selectionCost(selected: []const []const u8, authority: Authority, range_supported: bool) !usize {
     if (selected.len == 0) return 0;
     const proof = authority.source.proof orelse return std.math.maxInt(usize);
     const directory = authority.source.directory orelse return std.math.maxInt(usize);
     var bytes: u64 = 0;
     var overhead: usize = 0;
+    var ranges: [64]@import("value_ranges.zig").Range = undefined;
+    var count: usize = 0;
     for (selected) |path| {
-        if (directory.resolve(path)) |field| bytes +|= field.length;
+        if (directory.resolve(path)) |field| {
+            bytes +|= field.length;
+            ranges[count] = .{ .offset = field.offset, .length = std.math.cast(usize, field.length) orelse return std.math.maxInt(usize) };
+            count += 1;
+        }
         overhead +|= path.len *| 8 +| 256;
     }
     const original = std.math.cast(usize, proof.bytes) orelse std.math.maxInt(usize);
-    const payload = if (bytes >= proof.bytes / 2) original else std.math.cast(usize, bytes) orelse std.math.maxInt(usize);
+    const payload = if (!range_supported or bytes >= proof.bytes / 2) original else try @import("value_ranges.zig").retainedBytes(original, ranges[0..count]);
     return payload +| overhead;
 }
 pub const Check = struct { ctx: *const anyopaque, run: *const fn (*const anyopaque) anyerror!void };
 /// Group only identical remaining masks, so reads never union unrelated values.
-/// The scope and authorities must belong to the same pinned read transaction.
+/// Authorities and each opened scope belong to the same pinned transaction.
+/// Scope lifetimes end per subwindow, including non-range/full-value adapters.
 /// Output slots retain discovery order; unsupported rows remain null for the
 /// caller's ordinary loader. Scratch/range pins are bounded to this 64-row window.
-pub fn loadPreparedWindow(a: A, scratch: A, scope: anytype, physical: []const []const u8, ids: []const []const u8, fields: []const []const u8, prepared: protocol.Prepared, authorities: []const Authority, repairs: []bool, check: ?Check) ![]?Result {
+pub fn loadPreparedWindow(a: A, scratch: A, txn: anytype, physical: []const []const u8, ids: []const []const u8, fields: []const []const u8, prepared: protocol.Prepared, authorities: []const Authority, repairs: []bool, check: ?Check) ![]?Result {
     if (ids.len > 64 or physical.len != ids.len or authorities.len != ids.len or repairs.len != ids.len) return error.InvalidBatch;
     const result = try a.alloc(?Result, ids.len);
     @memset(result, null);
@@ -260,7 +267,9 @@ pub fn loadPreparedWindow(a: A, scratch: A, scope: anytype, physical: []const []
     if (ids.len == 1) {
         // Point reads need no sorting, grouping or additional group arena.
         if (check) |guard| try guard.run(guard.ctx);
-        result[0] = try loadPrepared(a, scratch, scope, physical[0], ids[0], fields, prepared, authorities[0], &repairs[0]);
+        var scope = try txn.openReadScope(scratch);
+        defer scope.close();
+        result[0] = try loadPrepared(a, scratch, &scope, physical[0], ids[0], fields, prepared, authorities[0], &repairs[0]);
         if (check) |guard| try guard.run(guard.ctx);
         return result;
     }
@@ -289,12 +298,17 @@ pub fn loadPreparedWindow(a: A, scratch: A, scope: anytype, physical: []const []
         var group_arena = std.heap.ArenaAllocator.init(@import("antfly_platform").allocator.reclaimingScratch(a));
         defer group_arena.deinit();
         const temp = group_arena.allocator();
+        // Scope-local buffers/pins must die with this byte-bounded subwindow,
+        // even on backends whose range adapter copies a complete primary row.
+        var scope = try txn.openReadScope(temp);
+        defer scope.close();
+        const range_supported = if (comptime @hasDecl(@typeInfo(@TypeOf(&scope)).pointer.child, "supportsRange")) scope.supportsRange() else false;
         const selected = try selectedFields(temp, fields, prepared, plans[order[start]].?);
         var end = start + 1;
         const mask = plans[order[start]].?.omission_mask;
-        var cost = selectionCost(selected, authorities[order[start]]);
+        var cost = try selectionCost(selected, authorities[order[start]], range_supported);
         while (end < count and plans[order[end]].?.omission_mask == mask) : (end += 1) {
-            const next = selectionCost(selected, authorities[order[end]]);
+            const next = try selectionCost(selected, authorities[order[end]], range_supported);
             if (next > materialization_bytes -| cost) break;
             cost +|= next;
         }
@@ -306,7 +320,7 @@ pub fn loadPreparedWindow(a: A, scratch: A, scope: anytype, physical: []const []
             names[i] = ids[index];
             known[i] = authorities[index].source;
         }
-        const rows = if (selected.len != 0) try logical.loadPrepared(a, temp, scope, keys[0 .. end - start], names[0 .. end - start], selected, known[0 .. end - start]) else null;
+        const rows = if (selected.len != 0) try logical.loadPrepared(a, temp, &scope, keys[0 .. end - start], names[0 .. end - start], selected, known[0 .. end - start]) else null;
         defer if (rows) |loaded| {
             for (loaded) |row| if (row.bytes) |bytes| a.free(bytes);
             a.free(loaded);
@@ -349,6 +363,7 @@ test "logical value conditional identities avoid payload reads and reject stale 
             var mutation: [8]u8 = undefined;
             std.mem.writeInt(u64, &mutation, 7, .little);
             const Mock = struct {
+                const Self = @This();
                 physical: []const u8,
                 body: []const u8,
                 mutation_key: []const u8,
@@ -362,6 +377,34 @@ test "logical value conditional identities avoid payload reads and reject stale 
                 range_bytes: usize = 0,
                 full_reads: usize = 0,
                 metadata_reads: usize = 0,
+                range_supported: bool = true,
+                opened: usize = 0,
+                closed: usize = 0,
+                const Scope = struct {
+                    inner: *Self,
+                    pub fn supportsRange(self: *const @This()) bool {
+                        return self.inner.range_supported;
+                    }
+                    pub fn getManySorted(self: *@This(), keys: []const []const u8, output: []?[]const u8) !void {
+                        return self.inner.getManySorted(keys, output);
+                    }
+                    pub fn getRangesMany(self: *@This(), requests: []const @import("value_ranges.zig").Request) !void {
+                        if (self.inner.range_supported) return self.inner.getRangesMany(requests);
+                        for (requests) |request| {
+                            var rows: [1]?[]const u8 = .{null};
+                            try self.inner.getManySorted(&.{request.key}, &rows);
+                            const complete_value = rows[0] orelse return error.NotFound;
+                            for (request.ranges, request.output) |range, *value| value.* = complete_value[@intCast(range.offset)..][0..range.length];
+                        }
+                    }
+                    pub fn close(self: *@This()) void {
+                        self.inner.closed += 1;
+                    }
+                };
+                pub fn openReadScope(self: *@This(), _: A) !Scope {
+                    self.opened += 1;
+                    return .{ .inner = self };
+                }
                 pub fn getManySorted(self: *@This(), keys: []const []const u8, output: []?[]const u8) !void {
                     self.metadata_reads += 1;
                     for (keys, output) |key, *out| {
@@ -429,6 +472,17 @@ test "logical value conditional identities avoid payload reads and reject stale 
             }
             try std.testing.expectEqual(@as(usize, 2), mock.metadata_reads);
             try std.testing.expectEqual(@as(usize, 0), mock.full_reads);
+            // A full-value range adapter must use original sizes for admission.
+            mock.range_supported = false;
+            const fallback = try loadPreparedWindow(a, temp, &mock, physicals[0..width], names[0..width], &.{ "payload.image", "revision" }, prepared, window.rows[0..width], repairs[0..width], null);
+            defer a.free(fallback);
+            defer for (fallback) |entry| if (entry) |value| {
+                a.free(value.source);
+                a.free(value.identities);
+            };
+            for (fallback) |entry| try std.testing.expectEqualStrings(warm.source, entry.?.source);
+            try std.testing.expect(mock.full_reads >= (if (width > 16) @as(usize, 2) else 1));
+            try std.testing.expectEqual(mock.opened, mock.closed);
             std.mem.writeInt(u64, &mutation, 8, .little);
             try std.testing.expect(try load(a, temp, &mock, physical, "doc", &.{ "payload.image", "revision" }, prepared) == null);
             std.mem.writeInt(u64, &mutation, 7, .little);
@@ -581,11 +635,26 @@ test "logical value conditional unique row window coalesces real metadata reads"
     var txn = try store.beginReadTxn();
     defer txn.abort();
     var scope = try txn.openReadScope(temp);
-    defer scope.close();
+    var metadata_closed = false;
+    defer if (!metadata_closed) scope.close();
     const Counting = struct {
         inner: *@TypeOf(scope),
         calls: usize = 0,
         range_calls: usize = 0,
+        owner: ?*@This() = null,
+        alloc: ?A = null,
+        force_full: bool = false,
+        pub fn supportsRange(self: *const @This()) bool {
+            return !self.force_full and self.inner.supportsRange();
+        }
+        pub fn close(self: *@This()) void {
+            self.inner.close();
+            if (self.owner) |owner| {
+                owner.calls += self.calls;
+                owner.range_calls += self.range_calls;
+            }
+            if (self.alloc) |alloc| alloc.destroy(self.inner);
+        }
         pub fn getManySorted(self: *@This(), input: []const []const u8, output: []?[]const u8) !void {
             self.calls += 1;
             // Real sorted/deduplicated metadata batches, not a response fixture.
@@ -599,10 +668,27 @@ test "logical value conditional unique row window coalesces real metadata reads"
         }
     };
     var counted: Counting = .{ .inner = &scope };
+    const TxnHandle = @TypeOf(txn);
+    const ScopeHandle = @TypeOf(scope);
+    const Factory = struct {
+        txn: *TxnHandle,
+        owner: *Counting,
+        force_full: bool = false,
+        pub fn openReadScope(self: *@This(), alloc: A) !Counting {
+            const inner = try alloc.create(ScopeHandle);
+            errdefer alloc.destroy(inner);
+            inner.* = try self.txn.openReadScope(alloc);
+            return .{ .inner = inner, .owner = self.owner, .alloc = alloc, .force_full = self.force_full };
+        }
+    };
+    var factory: Factory = .{ .txn = &txn, .owner = &counted };
     const window = try Window.prepare(temp, &counted, &keys, &ids);
+    const native_ranges = scope.supportsRange();
+    scope.close();
+    metadata_closed = true;
     const prepared = try protocol.Prepared.init(temp, .{ .fields = &.{.{ .field = "image", .if_match = &conditions }} });
     var repairs: [8]bool = undefined;
-    const batch = try loadPreparedWindow(a, temp, &counted, &keys, &ids, &.{ "image", "revision" }, prepared, window.rows[0..keys.len], &repairs, null);
+    const batch = try loadPreparedWindow(a, temp, &factory, &keys, &ids, &.{ "image", "revision" }, prepared, window.rows[0..keys.len], &repairs, null);
     defer a.free(batch);
     defer for (batch) |entry| if (entry) |value| {
         a.free(value.source);
@@ -616,11 +702,11 @@ test "logical value conditional unique row window coalesces real metadata reads"
         try std.testing.expect(std.mem.indexOf(u8, result.identities, "unchanged") != null);
     }
     try std.testing.expectEqual(@as(usize, 2), counted.calls);
-    try std.testing.expectEqual(@as(usize, 1), counted.range_calls);
+    try std.testing.expectEqual(if (native_ranges) @as(usize, 1) else 4, counted.range_calls);
     // Mixed hits/misses require two exact masks, never their union. The
     // unchanged group batches ranges; the value group batches full-row fallback.
     const mixed = try protocol.Prepared.init(temp, .{ .fields = &.{.{ .field = "image", .if_match = conditions[0..4] }} });
-    const values = try loadPreparedWindow(a, temp, &counted, &keys, &ids, &.{ "image", "revision" }, mixed, window.rows[0..keys.len], &repairs, null);
+    const values = try loadPreparedWindow(a, temp, &factory, &keys, &ids, &.{ "image", "revision" }, mixed, window.rows[0..keys.len], &repairs, null);
     defer a.free(values);
     defer for (values) |entry| if (entry) |value| {
         a.free(value.source);
@@ -635,5 +721,14 @@ test "logical value conditional unique row window coalesces real metadata reads"
         try std.testing.expect(std.mem.indexOf(u8, entry.?.identities, expected_state) != null);
     }
     try std.testing.expectEqual(@as(usize, 4), counted.calls);
-    try std.testing.expectEqual(@as(usize, 2), counted.range_calls);
+    try std.testing.expectEqual(if (native_ranges) @as(usize, 2) else 6, counted.range_calls);
+    factory.force_full = true;
+    const conservative = try loadPreparedWindow(a, temp, &factory, &keys, &ids, &.{ "image", "revision" }, prepared, window.rows[0..keys.len], &repairs, null);
+    defer a.free(conservative);
+    defer for (conservative) |entry| if (entry) |value| {
+        a.free(value.source);
+        a.free(value.identities);
+    };
+    for (conservative) |entry| try std.testing.expect(std.mem.indexOf(u8, entry.?.identities, "unchanged") != null);
+    try std.testing.expectEqual(if (native_ranges) @as(usize, 6) else 10, counted.range_calls);
 }

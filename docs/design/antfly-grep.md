@@ -349,10 +349,11 @@ a fixed 16-slot reorder buffer also bounds zero-byte result metadata. When that
 buffer approaches capacity, admission waits for the oldest outstanding parent.
 A slow parent therefore cannot grow a corpus-sized queue. Error paths cancel,
 join and release all borrowers without waiting for a missing sequence forever.
-A page-scope deferred drain must also join on its own failure; deferring that
-join to the outer scheduler destructor would let the manifest arena retire first.
-Failed drains discard remaining staged output while preserving already emitted
-records and completed accounting.
+Each job independently retains its manifest and asset pages. Advancing discovery
+releases the coordinator's reference; worker references persist until the jobs
+are joined. Failure paths join every launched job before releasing its final
+page references, including partial launch. Failed drains discard remaining staged
+output while preserving already emitted records and completed accounting.
 Compatible model work coalesces across parents with unique wire IDs. A
 single-parent window retains intra-document provider parallelism.
 
@@ -488,9 +489,13 @@ deduplicated batch loads content/revision/TTL metadata; a second loads required
 directories and certificates. Each directory is decoded once. Bounded owned
 metadata survives backend-buffer retirement; remaining field reads reuse the
 same proof/directory rather than fetching them again. Equal omission masks share
-one logical range/full-value batch; no unrelated values are unioned. Additional
+logical range/full-value batches; no unrelated values are unioned. Additional
 materialized input is bounded to a conservative 1 MiB subwindow, with one large
-row allowed to make progress. Deadline checks run during planning, before each
+row allowed to make progress. Admission uses coalesced retained range bytes on
+range-capable backends and original row sizes on full-value adapters. Each
+subwindow owns a fresh read scope from the same transaction, releasing backend
+buffers and pins before the next subwindow. Singleton reads reuse their metadata
+scope directly. Deadline checks run during planning, before each
 subwindow and before each output row. Results return to their original slots,
 and partial failures release untransferred sources. Row reconstruction scratch
 is still recycled independently. This is request-local work reuse, not an authorization

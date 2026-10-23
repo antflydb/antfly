@@ -1634,8 +1634,11 @@ owned certificate records remain local to the pinned transaction and are reused
 for the remaining projected field reads. Equal omission masks share logical
 range/full-value batches, bounded to a conservative 1 MiB materialization
 subwindow with one-large-row progress. This bounds additional input residency
-rather than accumulating a whole window of large primary values. Request
-deadlines are checked during planning, per subwindow and per output row.
+rather than accumulating a whole window of large primary values. Admission uses
+coalesced retained spans for range-capable scopes and original row sizes for
+full-value adapters. A fresh scope per subwindow releases backend input buffers
+and pins before the next chunk; all scopes retain the same transaction cut.
+Singleton reads reuse the metadata scope directly. Request deadlines are checked during planning, per subwindow and per output row.
 Retained metadata is bounded by 64 format-limited authorities; row reconstruction
 scratch remains independently recyclable. Parent masks that cannot use these facts bypass preparation entirely.
 

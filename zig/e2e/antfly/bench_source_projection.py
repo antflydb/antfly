@@ -90,6 +90,9 @@ def main():
     parser.add_argument("--value-bytes", type=int, default=262144)
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument(
+        "--mask", choices=("exact", "parent", "wildcard", "exclude"), default="exact"
+    )
+    parser.add_argument(
         "--workload",
         choices=(
             "ascii",
@@ -196,11 +199,16 @@ def main():
                     )
                     request = {
                         "query": {"bool": {"filter": {"ids": list(documents)}}},
-                        "fields": [
-                            "metadata.revision",
-                            "metadata.allowed",
-                            "payload.large",
-                        ],
+                        "fields": {
+                            "exact": [
+                                "metadata.revision",
+                                "metadata.allowed",
+                                "payload.large",
+                            ],
+                            "parent": ["metadata", "payload"],
+                            "wildcard": ["metadata.*", "payload.*"],
+                            "exclude": ["-padding"],
+                        }[args.mask],
                         "limit": args.documents,
                         "source_projection": {"fields": [{"field": "payload.large"}]},
                     }
@@ -277,6 +285,7 @@ def main():
                     ]
                     if (
                         variant == "candidate"
+                        and args.mask == "exact"
                         and args.workload in ("ascii", "escaped", "unicode", "numeric")
                         and sum(a for a, _ in counts)
                         < 2 * args.documents * args.queries_per_phase
@@ -287,7 +296,11 @@ def main():
                         raise AssertionError(
                             f"Missing certificate-hit evidence: {counts}; see {failure}"
                         )
-                    if variant == "candidate" and args.workload in ("small", "opaque"):
+                    if (
+                        variant == "candidate"
+                        and args.mask == "exact"
+                        and args.workload in ("small", "opaque")
+                    ):
                         assert sum(a for a, _ in counts) == 0, counts
                         assert (
                             sum(b for _, b in counts)
@@ -338,6 +351,7 @@ def main():
     report = {
         "schema_version": 1,
         "workload": args.workload,
+        "mask": args.mask,
         "scope": "Native single-shard JSON tables, synthetic varied source values, warm filesystem/storage caches after ingestion; whole server process CPU includes background work; RSS sampled every 5 ms and is not an allocation bound; shared host; no inference",
         "platform": platform.platform(),
         "machine": platform.machine(),
