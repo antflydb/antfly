@@ -1,17 +1,17 @@
 // Copyright 2026 Antfly, Inc.
-// SPDX-License-Identifier: Elastic-2.0
+// SPDX-License-Identifier: Apache-2.0
 //
-// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
-// except in compliance with the Elastic License 2.0. You may obtain a copy of
-// the Elastic License 2.0 at
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-//     https://www.antfly.io/licensing/ELv2-license
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// Unless required by applicable law or agreed to in writing, software distributed
-// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
-// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
-// Elastic License 2.0 for the specific language governing permissions and
-// limitations.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 //! Private typed payload capture during stable-key verification. Payloads have
 //! IDs until complete key/value verification authorizes their adoption.
@@ -168,13 +168,6 @@ pub const Cluster = struct {
         self.count += selected.len;
     }
     pub fn finish(self: *Cluster, payloads: *spill.JoinPayloads, edits: *Mutations) !void {
-        const View = struct {
-            leases: []const spill.Sort.RowLease,
-            fn cell(raw: *anyopaque, _: A, row: usize, column: usize) !local.sql_scalar.Datum {
-                const self_: *@This() = @ptrCast(@alignCast(raw));
-                return self_.leases[row].cell(column);
-            }
-        };
         var pending: ?spill.Sort.RowLease = null;
         defer if (pending) |lease| lease.release();
         var previous: [32]u8 = undefined;
@@ -200,9 +193,10 @@ pub const Cluster = struct {
                 bytes +|= cost;
             }
             if (count == 0) break;
-            var view: View = .{ .leases = leases[0..count] };
-            const batch: local.sql_execution_batch.Batch = .{ .reader = .{ .ptr = &view, .read = View.cell, .count = count, .width = self.width } };
-            const offset = try payloads.appendBatch(batch);
+            var scratch = std.heap.ArenaAllocator.init(payloads.file.manager.allocator());
+            defer scratch.deinit();
+            var view = try spill.Sort.LeaseView.init(scratch.allocator(), leases[0..count], self.width);
+            const offset = try payloads.appendBatch(view.batch());
             for (leases[0..count], 0..) |lease, row| {
                 const key = try lease.keyCell(0);
                 if (key.sql_null or key.value != .string or key.value.string.len > previous.len) return error.InvalidLogicalRowIdentity;

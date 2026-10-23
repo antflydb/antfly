@@ -861,6 +861,10 @@ pub const Reader = struct {
     range_pages: page_store.PageStore = undefined,
     range_cache: ?tree.Cache = null,
     dictionary_cache: ?tree.Cache = null,
+    // Account immutable dictionary pages once per reader. Repeated point
+    // probes retain independent work limits without charging a warm ancestor
+    // as another physical page. Cap the ledger; overflow charges normally.
+    dictionary_seen: std.AutoHashMapUnmanaged(tree.Ref, void) = .empty,
     // A small decoded-name memo avoids reparsing the same slot for every row.
     // Output strings are copied into the caller, independently of eviction.
     file_names: [32]?struct { slot: u32, name: []u8, age: u64 } = @splat(null),
@@ -942,6 +946,8 @@ pub const Reader = struct {
         };
         if (self.dictionary_cache) |*cache| cache.deinit();
         self.dictionary_cache = null;
+        if (self.cursor) |cursor| self.dictionary_seen.deinit(cursor.alloc);
+        self.dictionary_seen = .empty;
         if (self.range_cache) |*cache| cache.deinit();
         self.range_cache = null;
         if (self.membership_arena) |*arena| arena.deinit();
@@ -954,8 +960,79 @@ pub const Reader = struct {
         self.predicate_cursor = null;
     }
     pub fn dictionaryStore(self: *Reader) tree.Store {
-        if (self.dictionary_cache == null) self.dictionary_cache = .{ .alloc = self.cursor.?.alloc, .underlying = self.pages.store(), .max_bytes = 1024 * 1024 };
+        if (self.dictionary_cache == null) {
+            var backing = self.pages.store();
+            if (self.cached != null) {
+                backing.decoded_page = .{ .ptr = self, .read = readDictionaryDecoded };
+                backing.read_many = .{ .ptr = self, .read = readDictionaryMany };
+            }
+            self.dictionary_cache = .{ .alloc = self.cursor.?.alloc, .underlying = backing, .max_bytes = 1024 * 1024 };
+        }
         return self.dictionary_cache.?.store();
+    }
+    fn rememberDictionary(self: *Reader, ref: tree.Ref) !void {
+        if (self.dictionary_seen.count() < 512) try self.dictionary_seen.put(self.cursor.?.alloc, ref, {});
+    }
+    fn chargeWarmDictionary(self: *Reader, ref: tree.Ref) !void {
+        if (self.dictionary_seen.contains(ref)) return;
+        try stores.chargeReadBudget(&self.remaining_reads, ref.bytes);
+        try self.rememberDictionary(ref);
+    }
+    fn readDictionaryDecoded(raw: *anyopaque, a: A, ref: tree.Ref) !tree.Page {
+        const self: *Reader = @ptrCast(@alignCast(raw));
+        const reader: @import("lake_index_navigation_pages.zig").Reader = .{ .store = self.pages.artifacts.*, .domain = self.pages.domain, .token = self.pages.cancellation, .cached = self.cached.? };
+        if (try reader.lookup(ref)) |held| {
+            errdefer {
+                var value = held;
+                value.deinit(a);
+            }
+            try self.chargeWarmDictionary(ref);
+            return held;
+        }
+        // An evicted page must pay for a new cold read even if it appeared in
+        // an earlier wave. The bounded ledger only credits warm reuse.
+        try stores.chargeReadBudget(&self.remaining_reads, ref.bytes);
+        var value = try reader.read(a, ref, null);
+        errdefer value.deinit(a);
+        try self.rememberDictionary(ref);
+        return value;
+    }
+    fn readDictionaryMany(raw: *anyopaque, a: A, refs_: []const tree.Ref, output: []tree.Page) !void {
+        const self: *Reader = @ptrCast(@alignCast(raw));
+        if (refs_.len != output.len or refs_.len > tree.max_read_batch) return error.InvalidGraphPage;
+        const reader: @import("lake_index_navigation_pages.zig").Reader = .{ .store = self.pages.artifacts.*, .domain = self.pages.domain, .token = self.pages.cancellation, .cached = self.cached.? };
+        var ready: [tree.max_read_batch]?tree.Page = @splat(null);
+        defer for (&ready) |*page_| if (page_.*) |*held| held.deinit(a);
+        var missing: [tree.max_read_batch]tree.Ref = undefined;
+        var positions: [tree.max_read_batch]usize = undefined;
+        var count: usize = 0;
+        for (refs_, 0..) |ref, i| {
+            if (try reader.lookup(ref)) |held| {
+                ready[i] = held;
+                try self.chargeWarmDictionary(ref);
+            } else {
+                missing[count] = ref;
+                positions[count] = i;
+                count += 1;
+            }
+        }
+        const Charge = struct {
+            fn charge(ptr: *anyopaque, bytes: u64) !void {
+                try stores.chargeReadBudget(@ptrCast(@alignCast(ptr)), bytes);
+            }
+        };
+        var cold: [tree.max_read_batch]tree.Page = undefined;
+        if (count != 0) {
+            try reader.many(a, missing[0..count], cold[0..count], .{ .ptr = &self.remaining_reads, .charge = Charge.charge });
+            for (cold[0..count], positions[0..count]) |page_, position| ready[position] = page_;
+            for (missing[0..count]) |ref| try self.rememberDictionary(ref);
+        }
+        try self.pages.cancellation.check();
+        try self.cached.?.context.ensureActive();
+        for (output, ready[0..refs_.len]) |*out, *page_| {
+            out.* = page_.*.?;
+            page_.* = null;
+        }
     }
     pub fn fileAtAlloc(self: *Reader, a: A, slot: u32) ![]const u8 {
         if (slot >= self.root.fileCount()) return error.InvalidNativeLakeRowIndex;
@@ -1030,6 +1107,18 @@ pub const Reader = struct {
         }
         const file = try self.fileAtAlloc(a, slot);
         return local.storage_rowsource_identity.navigationDigest(self.identityVersion(), self.root.source, self.root.snapshot, file);
+    }
+    pub fn publicDigestsMany(self: *Reader, a: A, slots: []const u32, output: [][32]u8) !void {
+        if (slots.len != output.len or slots.len > tree.max_lookup_batch) return error.InvalidNativeLakeRowIndex;
+        if (self.root.public_digests.len != 0 or self.root.files.len != 0) {
+            for (slots, output) |slot, *digest| digest.* = try self.publicDigest(a, slot);
+            return;
+        }
+        const dictionary = self.root.file_dictionary orelse return error.InvalidNativeLakeRowIndex;
+        var scratch = std.heap.ArenaAllocator.init(a);
+        defer scratch.deinit();
+        const names = try file_dictionary.filesMany(scratch.allocator(), self.dictionaryStore(), dictionary, slots);
+        for (names, output) |name, *digest| digest.* = local.storage_rowsource_identity.navigationDigest(self.identityVersion(), self.root.source, self.root.snapshot, name.file);
     }
     pub fn nextPredicateBlocks(self: *Reader, a: A, lower: []const u8, upper: ?[]const u8) ![]const predicate_blocks.Block {
         if (self.exhausted) return &.{};

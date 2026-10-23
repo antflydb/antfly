@@ -5006,6 +5006,114 @@ pub const Sort = struct {
             if (self.block) |block| block.release();
         }
     };
+    /// Borrow a bounded leased scatter through the same physical-column and
+    /// frozen-value capabilities as ordinary execution batches. The caller
+    /// owns descriptor scratch and keeps every lease until consumption ends.
+    pub const LeaseView = struct {
+        const Batch = @import("execution_batch.zig").Batch;
+        const Physical = @import("execution_batch.zig").PhysicalColumn;
+        const Position = struct { source: usize, row: usize };
+        sources: []const Batch,
+        positions: []const Position,
+        width: usize,
+        pub fn init(a: Allocator, leases: []const RowLease, width: usize) !LeaseView {
+            if (leases.len > 256) return error.InvalidSqlSpill;
+            const Key = struct { ptr: *const anyopaque, block: bool };
+            var known: std.AutoHashMapUnmanaged(Key, usize) = .empty;
+            defer known.deinit(a);
+            var sources: std.ArrayList(Batch) = .empty;
+            const positions = try a.alloc(Position, leases.len);
+            for (leases, positions) |lease, *position| {
+                const key: ?Key = if (lease.block) |block| .{ .ptr = block, .block = true } else if (lease.values) |values| .{ .ptr = values, .block = false } else null;
+                const entry = if (key) |value| try known.getOrPut(a, value) else null;
+                const index = if (entry != null and entry.?.found_existing) entry.?.value_ptr.* else append: {
+                    const source: Batch = if (lease.block) |block| try block.batch(a, false) else if (lease.values) |values| .{ .retained = .{ .store = values, .count = values.len } } else scalar: {
+                        const row = try a.alloc([]const Datum, 1);
+                        row[0] = lease.row.values;
+                        break :scalar .{ .rows = row };
+                    };
+                    if (source.width() < width) return error.InvalidSqlSpill;
+                    const index = sources.items.len;
+                    try sources.append(a, source);
+                    if (entry) |slot| slot.value_ptr.* = index;
+                    break :append index;
+                };
+                position.* = .{ .source = index, .row = if (key != null) lease.index else 0 };
+            }
+            return .{ .sources = try sources.toOwnedSlice(a), .positions = positions, .width = width };
+        }
+        fn from(raw: *anyopaque) *LeaseView {
+            return @ptrCast(@alignCast(raw));
+        }
+        fn cell(raw: *anyopaque, a: Allocator, row: usize, column: usize) !Datum {
+            const self = from(raw);
+            const position = self.positions[row];
+            return self.sources[position.source].cell(a, position.row, column);
+        }
+        fn frozen(raw: *anyopaque, row: usize, column: usize) !?@import("execution_batch.zig").FrozenJson {
+            const self = from(raw);
+            const position = self.positions[row];
+            return self.sources[position.source].frozenJson(position.row, column);
+        }
+        fn json(raw: *anyopaque, row: usize, column: usize) !?[]const u8 {
+            const self = from(raw);
+            const position = self.positions[row];
+            return self.sources[position.source].encodedJson(position.row, column);
+        }
+        fn physical(raw: *anyopaque, a: Allocator, column: usize) !?Physical {
+            const self = from(raw);
+            if (self.positions.len == 0) return null;
+            const views = try a.alloc(Physical, self.sources.len);
+            for (self.sources, views) |source, *view| view.* = (try source.physicalColumn(a, column)) orelse return null;
+            const first = views[0];
+            const kind = first.vector.kind().logical();
+            for (views) |view| if (view.vector.kind().logical() != kind or view.kind != first.kind or view.element != first.element) return null;
+            const nulls = try a.alloc(u8, self.positions.len);
+            for (self.positions, nulls) |position, *flag| {
+                const view = views[position.source];
+                if (position.row >= view.len()) return error.InvalidSqlSpill;
+                flag.* = @intFromBool(view.vector.nulls.isNull(view.rowAt(position.row)));
+            }
+            const types = @import("../storage/rowsource/types.zig");
+            const values: types.ColumnValues = switch (kind) {
+                inline .i64, .f64, .bytes, .bool => |tag| gather: {
+                    const T = switch (tag) {
+                        .i64 => i64,
+                        .f64 => f64,
+                        .bytes => []const u8,
+                        .bool => bool,
+                        else => unreachable,
+                    };
+                    const output = try a.alloc(T, self.positions.len);
+                    for (self.positions, output, nulls) |position, *value, flag| {
+                        const view = views[position.source];
+                        const row = view.rowAt(position.row);
+                        value.* = if (flag != 0) switch (tag) {
+                            .bytes => "",
+                            .bool => false,
+                            else => 0,
+                        } else switch (tag) {
+                            .i64 => try view.vector.integerAt(row),
+                            .bytes => try view.vector.bytesAt(row),
+                            .bool => view.vector.values.bool[row],
+                            .f64 => switch (view.vector.values) {
+                                .f64 => |v| v[row],
+                                .dictionary_f64 => |v| v.at(row),
+                                else => return error.InvalidSqlSpill,
+                            },
+                            else => unreachable,
+                        };
+                    }
+                    break :gather @unionInit(types.ColumnValues, @tagName(tag), output);
+                },
+                else => return null,
+            };
+            return .{ .vector = .{ .name = "", .values = values, .nulls = .{ .bytes = nulls } }, .range = .{ .count = self.positions.len }, .kind = first.kind, .element = first.element };
+        }
+        pub fn batch(self: *LeaseView) Batch {
+            return .{ .reader = .{ .ptr = self, .read = cell, .read_physical = physical, .read_frozen = frozen, .read_json = json, .count = self.positions.len, .width = self.width } };
+        }
+    };
     /// Sorted delivery holds decoded run blocks through the transport page.
     /// Only row descriptors are gathered; wide payload bytes remain in place.
     pub fn skip(self: *Sort) anyerror!bool {
@@ -9090,4 +9198,38 @@ test "SQL shared radix partitions unwind allocation faults and disk admission" {
         try std.testing.expectError(error.SqlProgramLimitExceeded, partitions.appendBatch(1, .{ .rows = &.{&.{Datum.json(.{ .integer = 2 })}} }, .{ .rows = &.{&.{}} }, &.{1}));
     }
     try std.testing.expectEqual(@as(u64, 0), manager.live_bytes);
+}
+
+test "external lake leased sort payloads retain physical columns across spill and resident pulls" {
+    const a = std.testing.allocator;
+    var context: u8 = 0;
+    var manager: Manager = .{ .alloc = a, .io = std.testing.io, .context = &context, .checkpoint = struct {
+        fn check(_: *anyopaque) !void {}
+    }.check, .async_writes = false };
+    defer manager.deinit();
+    for ([_]usize{ 1024, 1024 * 1024 }) |quota| {
+        var sort = Sort.init(a, &manager, &.{.{}}, quota);
+        defer sort.deinit();
+        sort.parallel_runs = false;
+        for (0..257) |i| {
+            const key = Datum.json(.{ .integer = @intCast(256 - i) });
+            try sort.add(.{ .values = &.{Datum.json(.{ .integer = 9007199254740993 + key.value.integer })}, .keys = &.{key}, .ordinal = i });
+        }
+        var leases: [17]Sort.RowLease = undefined;
+        var count: usize = 0;
+        defer for (leases[0..count]) |lease| lease.release();
+        for (&leases) |*lease| {
+            lease.* = (try sort.nextLeased()).?;
+            count += 1;
+        }
+        var scratch = std.heap.ArenaAllocator.init(a);
+        defer scratch.deinit();
+        var view = try Sort.LeaseView.init(scratch.allocator(), &leases, 1);
+        const batch = view.batch();
+        const physical = (try batch.physicalColumn(scratch.allocator(), 0)) orelse return error.TestExpectedPhysicalColumn;
+        for (0..leases.len) |i| {
+            try std.testing.expectEqual(@as(i64, 9007199254740993 + @as(i64, @intCast(i))), try physical.vector.integerAt(physical.rowAt(i)));
+            try std.testing.expectEqual((try leases[i].cell(0)).value.integer, (try batch.cell(a, i, 0)).value.integer);
+        }
+    }
 }

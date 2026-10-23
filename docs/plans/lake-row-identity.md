@@ -436,6 +436,62 @@ certificates audit that same closure. Reader leases keep old packs reachable unt
 their last retained publication retires. Graph topology/document-fact writers
 continue using their standalone-page publication path.
 
+## Dependency contracts and bounded serving navigation
+
+Reader protocol 75 and the v3 input-cohort/v4 producer recipes use a shared
+canonical schema projection. A field index binds the declared input paths and
+their interpretation: types, nullability, ancestor metadata, analysis, and
+remaining global table semantics. Object declaration order is immaterial.
+Unrelated properties and their `required` entries do not invalidate that cohort.
+Table schema version, base-source descriptors, and ordered-index declarations
+remain separately bound by publication, source, identity and declaration proofs.
+They are not copied into every row-input contract.
+
+Whole-row text/source retention and templates bind the complete row contract.
+Uncaptured enrichments remain ineligible for row-input reuse. Unknown paths,
+references, schema composition and conditional dependencies conservatively retain
+the full schema. Adding an unrelated nullable table column therefore preserves
+selected text/vector/sparse cohorts; changing a selected field's type or analysis
+requires new evidence. This does not remove the physical inventory schema
+fingerprint from file identity, or permit reuse across an unverified source
+rewrite. Older protocol publications reconcile before serving the new contracts.
+
+Compact row translation batches both dictionary proofs (file digest to slot,
+then slot to exact filename), translation keys, canonical rank keys, and output
+filenames. Ordered public tie participants likewise resolve file dictionaries in
+bounded waves before entering the spill sort. Duplicate and shuffled coordinates
+retain caller order. Single-row callers keep the small slot memo; a broad tile
+does not depend on that memo fitting every file.
+
+An ordered reader credits at most 512 distinct warm dictionary page identities.
+Every lookup still checks live authority and cancellation. Its first encounter
+consumes the logical read allowance, and cold rereads after eviction always pay
+again, including extra bytes in coalesced ranges. Overflow receives ordinary
+charging. This avoids repeatedly charging a warm ancestor during a wide tie,
+without removing operation read limits or growing an archive-sized ledger.
+
+Sort leases expose a reusable execution-batch view with typed physical columns,
+frozen values and raw JSON capabilities. Payload clustering uses that view for
+both resident and spilled rows. Descriptors and fixed-width gathers belong to
+bounded batch scratch; underlying payload/dictionary bytes remain leased until
+append completes. Supported primitive columns bypass scalar `Datum` decoding;
+other logical types retain the scalar fallback and exact null/decimal semantics.
+
+Ranked collectors retain 128 exact score tags across candidate tiles. A recurring
+competitive score class can batch its rank requests even when each tile contains
+only one candidate in that class. A tag collision drops this optional hint and
+uses the exact heap path. Distinct scores still perform no rank lookup until a
+comparison needs one or final winners are delivered. Heap/cursor order and error
+propagation remain authoritative; hints never decide row ordering. The deterministic
+4,096-candidate/512-winner regression reduces rank-resolution callbacks from 898
+to 124 with identical results. These are callback counts, not cloud latency
+measurements.
+
+Inline aggregate navigation owns every write callback when rebinding its store
+context, including packed writes. Larger external trees retain ordinary packed
+publication. Concurrency qualification measures independent physical uploads;
+a complete navigation tree fitting one pack legitimately has one upload.
+
 ## Staged extensions
 
 - Connect native Iceberg v3 manifest/row lineage to the shared identity contract.

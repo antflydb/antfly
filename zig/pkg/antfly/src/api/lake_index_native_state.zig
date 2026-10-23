@@ -36,10 +36,12 @@ fn part(hash: *std.crypto.hash.Blake3, bytes: []const u8) void {
     hash.update(&length);
     hash.update(bytes);
 }
-pub fn recipe(table: local.common_topology_records.TableRecord, config: []const u8) [32]u8 {
+pub fn recipe(a: A, table: local.common_topology_records.TableRecord, config: []const u8, columns: ?[]const []const u8) ![32]u8 {
+    const contract = try @import("lake_index_dependencies.zig").project(a, table.schema_json, columns);
+    defer a.free(contract);
     var hash = std.crypto.hash.Blake3.init(.{});
-    part(&hash, "native-lake-producer-schema-v3-signed-datetime");
-    part(&hash, table.schema_json);
+    part(&hash, "native-lake-producer-schema-v4-dependencies-signed-datetime");
+    part(&hash, contract);
     part(&hash, config);
     var digest: [32]u8 = undefined;
     hash.final(&digest);

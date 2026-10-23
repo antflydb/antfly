@@ -1,17 +1,17 @@
 // Copyright 2026 Antfly, Inc.
-// SPDX-License-Identifier: Elastic-2.0
+// SPDX-License-Identifier: Apache-2.0
 //
-// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
-// except in compliance with the Elastic License 2.0. You may obtain a copy of
-// the Elastic License 2.0 at
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-//     https://www.antfly.io/licensing/ELv2-license
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// Unless required by applicable law or agreed to in writing, software distributed
-// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
-// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
-// Elastic License 2.0 for the specific language governing permissions and
-// limitations.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 //! Index input recipes are shared by construction and relocation proof. Raw
 //! row hashes never certify an uncaptured external enrichment dependency.
@@ -66,9 +66,8 @@ pub fn valuesRecipe(a: A, schema_json: []const u8, columns: []const []const u8) 
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
     const ca = arena.allocator();
-    var schema = try std.json.parseFromSliceLeaky(std.json.Value, ca, schema_json, .{});
-    if (schema == .object) _ = schema.object.swapRemove("relational_indexes");
-    const encoded = try std.json.Stringify.valueAlloc(ca, .{ .format = "native-lake-value-projection-v1", .schema = schema, .columns = columns }, .{});
+    const schema = try @import("lake_index_dependencies.zig").project(ca, schema_json, columns);
+    const encoded = try std.json.Stringify.valueAlloc(ca, .{ .format = "native-lake-value-projection-v2", .schema = schema, .columns = columns }, .{});
     var digest: [32]u8 = undefined;
     std.crypto.hash.Blake3.hash(encoded, &digest, .{});
     return digest;
@@ -119,10 +118,7 @@ pub fn plan(a: A, out: A, table: local.common_topology_records.TableRecord, sour
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
     const ca = arena.allocator();
-    var semantic = try std.json.parseFromSliceLeaky(std.json.Value, ca, table.schema_json, .{});
-    // Ordered declaration changes bind at the declaration, not every row proof.
-    if (semantic == .object) _ = semantic.object.swapRemove("relational_indexes");
-    const input_schema = try std.json.Stringify.valueAlloc(ca, semantic, .{});
+    const input_schema = table.schema_json;
     const configs = try std.json.parseFromSliceLeaky(std.json.Value, ca, table.indexes_json, .{});
     var result: std.ArrayList(Recipe) = .empty;
     for (desired.artifacts) |artifact| {
@@ -221,7 +217,9 @@ fn make(a: A, schema: []const u8, name: []const u8, configuration: []const u8, i
         try columns.append(a, try a.dupe(u8, path));
     }
     const paths = try columns.toOwnedSlice(a);
-    const encoded = try std.json.Stringify.valueAlloc(a, .{ .format = "native-lake-input-cohort-v2", .schema = schema, .columns = paths }, .{});
+    const contract = try @import("lake_index_dependencies.zig").project(a, schema, if (reusable) paths else null);
+    defer a.free(contract);
+    const encoded = try std.json.Stringify.valueAlloc(a, .{ .format = "native-lake-input-cohort-v3", .schema = contract, .columns = paths }, .{});
     defer a.free(encoded);
     var digest: [32]u8 = undefined;
     std.crypto.hash.Blake3.hash(encoded, &digest, .{});
@@ -262,15 +260,15 @@ test "external lake input recipes share cohort evidence but independently bind d
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    const left = try make(a, "schema", "first", "config-one", &.{ "body", "id", "body" }, true);
-    const right = try make(a, "schema", "second", "config-two", &.{ "id", "body" }, true);
-    const changed = try make(a, "schema", "first", "config-three", &.{ "id", "body" }, true);
+    const left = try make(a, "{}", "first", "config-one", &.{ "body", "id", "body" }, true);
+    const right = try make(a, "{}", "second", "config-two", &.{ "id", "body" }, true);
+    const changed = try make(a, "{}", "first", "config-three", &.{ "id", "body" }, true);
     try std.testing.expectEqualSlices(u8, &left.digest, &right.digest);
     try std.testing.expectEqualSlices(u8, &left.digest, &changed.digest);
     try std.testing.expect(!std.meta.eql(left.binding, right.binding));
     try std.testing.expect(!std.meta.eql(left.binding, changed.binding));
     try std.testing.expectEqual(@as(usize, 1), count(&.{ left, right, changed }));
-    const different = try make(a, "schema", "third", "config-one", &.{"body"}, true);
+    const different = try make(a, "{}", "third", "config-one", &.{"body"}, true);
     try std.testing.expectEqual(@as(usize, 2), count(&.{ left, right, different }));
     const legacy: Recipe = .{ .name = "first", .digest = left.digest, .columns = left.columns };
     const wire = try std.json.Stringify.valueAlloc(a, legacy, .{});

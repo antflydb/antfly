@@ -94,7 +94,9 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
         var binding = wanted.binding;
         binding.index_config_hash = try std.fmt.allocPrint(ca, "native-sparse-checkpoint-v9:{s}", .{binding.index_config_hash});
         const public_config = try std.json.Stringify.valueAlloc(ca, configs.object.get(wanted.name) orelse return error.InvalidTableIndexMetadata, .{});
-        const recipe = state.recipe(table, public_config);
+        const configuration = configs.object.get(wanted.name).?;
+        const whole_row = @import("lake_enrichment_units.zig").configured(configuration, "template") != null or !@import("lake_row_input_recipes.zig").configurationReusable(configuration);
+        const recipe = try state.recipe(ca, table, public_config, if (whole_row) null else wanted.binding.column_bindings);
         var producer = try @import("lake_vector_enrichment.zig").Producer.init(a, wanted.name, wanted.build_spec.?.sparse.sparse_column, configs.object.get(wanted.name).?, provider.embedding_options);
         defer producer.deinit();
         producer.memo = provider.vector_memo;

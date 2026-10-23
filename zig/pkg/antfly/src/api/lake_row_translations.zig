@@ -1,17 +1,17 @@
 // Copyright 2026 Antfly, Inc.
-// SPDX-License-Identifier: Elastic-2.0
+// SPDX-License-Identifier: Apache-2.0
 //
-// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
-// except in compliance with the Elastic License 2.0. You may obtain a copy of
-// the Elastic License 2.0 at
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-//     https://www.antfly.io/licensing/ELv2-license
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// Unless required by applicable law or agreed to in writing, software distributed
-// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
-// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
-// Elastic License 2.0 for the specific language governing permissions and
-// limitations.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 //! Compact original-coordinate -> current-coordinate/rank maps. Sorted joins
 //! use private bounded scratch; readers need one short-key seek per candidate.
@@ -260,7 +260,7 @@ test "external lake compact translations preserve shuffled coordinates ranks and
             _ = try build(alloc, backing, from, to, request, 1024 * 1024);
         }
     };
-    try std.testing.checkAllAllocationFailures(a, Sweep.run, .{ &pages, old.current, current.current, context });
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, Sweep.run, .{ &pages, old.current, current.current, context });
 
     // A second original coordinate space shares the current rank staging root.
     // Removing the order root after the first build proves it is not reread or

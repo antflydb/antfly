@@ -1882,6 +1882,9 @@ const ProducerConstraints = struct {
 };
 
 const FastTopK = struct {
+    // Exact bounded score tags extend batching across tile boundaries.
+    // Collisions discard a hint; they never authorize a rank comparison.
+    recent_scores: [128]?u32 = @splat(null),
     tie_rank: ?scorer_mod.TieRank = null,
     alloc: Allocator,
     k: u32,
@@ -1999,6 +2002,10 @@ const FastTopK = struct {
         for (competitive[0..count], 0..) |hit, i| {
             const bits: u32 = if (hit.score == 0) 0 else @bitCast(hit.score);
             var slot: usize = (bits *% 0x9e3779b1) >> 25;
+            if (self.recent_scores[slot]) |prior| {
+                if (prior == bits) repeated[i] = true;
+            }
+            self.recent_scores[slot] = bits;
             while (score_slots[slot]) |prior| {
                 if (competitive[prior].score == hit.score) {
                     repeated[prior] = true;
@@ -11274,5 +11281,67 @@ test "producer top k resolves only final winners for distinct scores and unequal
         }
         try std.testing.expectEqual(@as(usize, 3), state.rows);
         try std.testing.expectEqual(@as(usize, 1), state.calls);
+    }
+}
+
+test "producer top k batches score ties spanning distinct candidate tiles" {
+    const State = struct {
+        batches: usize = 0,
+        scalar_calls: usize = 0,
+        fn rank(_: *const anyopaque, doc: u32) u64 {
+            return 1048576 - @as(u64, doc);
+        }
+        fn resolve(raw: *const anyopaque, _: Allocator, doc: u32) !u64 {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(raw)));
+            self.scalar_calls += 1;
+            return rank(raw, doc);
+        }
+        fn many(raw: *const anyopaque, _: Allocator, docs: []const u32, output: []u64) !void {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(raw)));
+            self.batches += 1;
+            for (docs, output) |doc, *value| value.* = rank(raw, doc);
+        }
+    };
+    const a = std.testing.allocator;
+    // One candidate for each score per tile; each score recurs only after the
+    // collector flushes. Pick exact score tags in distinct history buckets.
+    var scores: [64]f32 = undefined;
+    var occupied: [128]bool = @splat(false);
+    var used: usize = 0;
+    var next: u32 = 1;
+    while (used < scores.len) : (next += 1) {
+        const score: f32 = @floatFromInt(next);
+        const bits: u32 = @bitCast(score);
+        const bucket = (bits *% 0x9e3779b1) >> 25;
+        if (occupied[bucket]) continue;
+        occupied[bucket] = true;
+        scores[used] = score;
+        used += 1;
+    }
+    var baseline_batches: usize = 0;
+    var baseline: [512]u32 = undefined;
+    for ([_]bool{ false, true }) |reuse_history| {
+        var state: State = .{};
+        var collector: FastTopK = .{ .alloc = a, .k = 512, .tie_rank = .{ .ptr = &state, .rank = State.rank, .resolve = State.resolve, .resolve_many = State.many } };
+        defer collector.deinit();
+        for (0..4096) |doc| {
+            if (!reuse_history and doc % 64 == 0) collector.recent_scores = @splat(null);
+            try collector.collect(@intCast(doc), scores[doc % scores.len]);
+        }
+        const hits = try collector.finish();
+        defer a.free(hits);
+        if (reuse_history) {
+            std.debug.print("cross-tile tie ranks: pairwise_batches={d} history_batches={d}\n", .{ baseline_batches, state.batches });
+            try std.testing.expect(state.batches * 2 < baseline_batches);
+            for (hits, baseline) |hit, expected| try std.testing.expectEqual(expected, hit.doc_id);
+        } else {
+            baseline_batches = state.batches;
+            for (hits, &baseline) |hit, *expected| expected.* = hit.doc_id;
+        }
+        for (hits[1..], hits[0 .. hits.len - 1]) |right, left| {
+            try std.testing.expect(left.score >= right.score);
+            if (left.score == right.score) try std.testing.expect(left.doc_id > right.doc_id);
+        }
+        try std.testing.expectEqual(@as(usize, 0), state.scalar_calls);
     }
 }

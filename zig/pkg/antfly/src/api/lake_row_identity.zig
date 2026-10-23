@@ -1,17 +1,17 @@
 // Copyright 2026 Antfly, Inc.
-// SPDX-License-Identifier: Elastic-2.0
+// SPDX-License-Identifier: Apache-2.0
 //
-// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
-// except in compliance with the Elastic License 2.0. You may obtain a copy of
-// the Elastic License 2.0 at
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-//     https://www.antfly.io/licensing/ELv2-license
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// Unless required by applicable law or agreed to in writing, software distributed
-// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
-// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
-// Elastic License 2.0 for the specific language governing permissions and
-// limitations.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 //! Authenticated, bounded logical-row state and flattened relocation proofs.
 //! The current and index coordinate spaces are explicit and share one resolver.
@@ -721,6 +721,52 @@ pub const Reader = struct {
         if (!std.mem.eql(u8, name, file_id)) return error.InvalidLogicalRowIdentity;
         return slot;
     }
+    /// Batch both halves of the dictionary proof: digest -> slot -> exact name.
+    /// Shared ancestor pages are read once per bounded multi-seek wave.
+    pub fn fileSlotsMany(self: *Reader, a: A, space: Space, names: []const []const u8, output: []u32) !void {
+        if (names.len != output.len or names.len > tree.max_lookup_batch) return error.InvalidLogicalRowIdentity;
+        var scratch = std.heap.ArenaAllocator.init(a);
+        defer scratch.deinit();
+        const sa = scratch.allocator();
+        const keys = try sa.alloc([32]u8, names.len);
+        const pointers = try sa.alloc([]const u8, names.len);
+        for (names, keys, pointers) |name, *key, *pointer| {
+            key.* = @import("lake_row_identity_delta.zig").fileKey(name);
+            pointer.* = key;
+        }
+        const values = try self.lookupMany(sa, space.file_slots, pointers, 4);
+        for (values, output) |value, *slot| slot.* = std.mem.readInt(u32, value[0..4], .big);
+        const verified = try self.filesMany(sa, space, output);
+        for (names, verified) |name, found| if (!std.mem.eql(u8, name, found)) return error.InvalidLogicalRowIdentity;
+    }
+    /// Caller owns each returned filename and the result slice.
+    pub fn filesMany(self: *Reader, a: A, space: Space, slots: []const u32) ![][]const u8 {
+        if (slots.len > tree.max_lookup_batch) return error.InvalidLogicalRowIdentity;
+        var scratch = std.heap.ArenaAllocator.init(a);
+        defer scratch.deinit();
+        const sa = scratch.allocator();
+        const keys = try sa.alloc([4]u8, slots.len);
+        const pointers = try sa.alloc([]const u8, slots.len);
+        for (slots, keys, pointers) |slot, *key, *pointer| {
+            if (slot >= space.file_count) return error.InvalidLogicalRowIdentity;
+            std.mem.writeInt(u32, key, slot, .big);
+            pointer.* = key;
+        }
+        const values = tree.lookupMany(sa, self.storage(), space.files, pointers) catch |err| return derivedReadFailure(err);
+        const result = try a.alloc([]const u8, slots.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (result[0..initialized]) |name| a.free(name);
+            a.free(result);
+        }
+        for (values, result) |value, *name| {
+            const record = value orelse return error.InvalidLogicalRowIdentity;
+            if (record.value.len == 0 or record.value.len > 4096) return error.InvalidLogicalRowIdentity;
+            name.* = try a.dupe(u8, record.value);
+            initialized += 1;
+        }
+        return result;
+    }
     pub const Translated = struct { coordinate: Coordinate, rank: u64 };
     pub fn translateAt(self: *Reader, a: A, translation: Translation, coordinate: Coordinate, forward: bool) !Translated {
         const key = coordinate.encode();
@@ -773,13 +819,16 @@ pub const Reader = struct {
         const to = if (forward) self.root.current else self.root.indexSpace();
         const keys = try a.alloc([44]u8, refs.len);
         const pointers = try a.alloc([]const u8, refs.len);
-        var slots: std.StringHashMapUnmanaged(u32) = .empty;
-        for (refs, keys, pointers) |ref, *key, *pointer| {
+        const file_names = try a.alloc([]const u8, refs.len);
+        for (refs, file_names) |ref, *name| {
             if (ref != .external or !std.mem.eql(u8, ref.external.source_id, from.source) or !std.mem.eql(u8, ref.external.snapshot_id, from.snapshot)) return error.ExternalLakeSnapshotMismatch;
+            name.* = ref.external.file_id;
+        }
+        const slots = try a.alloc(u32, refs.len);
+        if (from.compact) try self.fileSlotsMany(a, from, file_names, slots);
+        for (refs, keys, pointers, 0..) |ref, *key, *pointer, i| {
             if (from.compact) {
-                const slot = try slots.getOrPut(a, ref.external.file_id);
-                if (!slot.found_existing) slot.value_ptr.* = try self.fileSlot(a, from, ref.external.file_id);
-                key[0..16].* = (Coordinate{ .file = slot.value_ptr.*, .group = ref.external.row_group_ordinal, .row = ref.external.row_ordinal }).encode();
+                key[0..16].* = (Coordinate{ .file = slots[i], .group = ref.external.row_group_ordinal, .row = ref.external.row_ordinal }).encode();
                 pointer.* = key[0..16];
             } else {
                 key.* = locationKey(ref.external.file_id, ref.external.row_group_ordinal, ref.external.row_ordinal);
@@ -1051,4 +1100,76 @@ test "external lake shared identity spaces keep thousands of declarations inside
     try std.testing.expect(historical.len > max_root_bytes);
     const old = try decode(out, historical);
     try old.validate(a);
+}
+
+test "external lake batched file dictionaries share navigation beyond the scalar cache" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const sa = arena.allocator();
+    var directory = try local.common_test_directory.TestDirectory.init("lake-batch-dictionary");
+    defer directory.cleanup();
+    var fs = try @import("../serverless/artifacts/fs_store.zig").FsStore.init(a, directory.path());
+    defer fs.deinit();
+    var store = fs.artifactStore();
+    store.upload_scope = .{ .domain = @splat(7), .attempt = @splat(1) };
+    var reads: u64 = 16 * 1024 * 1024;
+    var writes = reads;
+    var pages: pages_api.PageStore = .{ .domain = @splat(7), .attempt = @splat(1), .artifacts = &store, .remaining_read_bytes = &reads, .remaining_write_bytes = &writes };
+    const Item = struct { digest: [32]u8, slot: u32 };
+    var items: [257]Item = undefined;
+    var names: [257][]const u8 = undefined;
+    var slots: [257]u32 = undefined;
+    var files: tree.SortedBuilder = .{ .alloc = a, .store = pages.store() };
+    defer files.deinit();
+    for (&names, &items, &slots, 0..) |*name, *item, *slot, i| {
+        name.* = try std.fmt.allocPrint(sa, "archive-file-{d:0>6}", .{i});
+        item.* = .{ .digest = @import("lake_row_identity_delta.zig").fileKey(name.*), .slot = @intCast(i) };
+        slot.* = @intCast(i);
+        var key: [4]u8 = undefined;
+        std.mem.writeInt(u32, &key, @intCast(i), .big);
+        try files.add(&key, name.*);
+    }
+    std.mem.sort(Item, &items, {}, struct {
+        fn less(_: void, l: Item, r: Item) bool {
+            return std.mem.lessThan(u8, &l.digest, &r.digest);
+        }
+    }.less);
+    var by_name: tree.SortedBuilder = .{ .alloc = a, .store = pages.store() };
+    defer by_name.deinit();
+    for (items) |item| {
+        var value: [4]u8 = undefined;
+        std.mem.writeInt(u32, &value, item.slot, .big);
+        try by_name.add(&item.digest, &value);
+    }
+    const space: Space = .{ .source = "lake", .snapshot = "cut", .rows = names.len, .file_count = names.len, .files = try files.finish(), .file_slots = try by_name.finish(), .by_id = null, .by_location = null };
+    var reader: Reader = .{ .root = undefined, .pages = &pages };
+    var shuffled: [256][]const u8 = undefined;
+    for (&shuffled, 0..) |*name, i| name.* = names[(i * 73) % names.len];
+    var output: [256]u32 = undefined;
+    const before = reads;
+    try reader.fileSlotsMany(a, space, &shuffled, &output);
+    // Each dictionary fits one page. A scalar loop would charge 512 pages.
+    try std.testing.expectEqual(before - space.files.?.bytes - space.file_slots.?.bytes, reads);
+    for (output, shuffled) |slot, name| try std.testing.expectEqualStrings(names[slot], name);
+    const roundtrip = try reader.filesMany(a, space, &output);
+    defer {
+        for (roundtrip) |name| a.free(name);
+        a.free(roundtrip);
+    }
+    for (roundtrip, shuffled) |actual, expected| try std.testing.expectEqualStrings(expected, actual);
+    try std.testing.expectError(error.InvalidLogicalRowIdentity, reader.fileSlotsMany(a, space, &.{"foreign"}, output[0..1]));
+    const Fault = struct {
+        fn run(out: A, resolver: *Reader, from: Space, input: []const []const u8) !void {
+            var values: [3]u32 = undefined;
+            try resolver.fileSlotsMany(out, from, input, &values);
+            const result = try resolver.filesMany(out, from, &values);
+            defer {
+                for (result) |name| out.free(name);
+                out.free(result);
+            }
+        }
+    };
+    pages.streaming = true;
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, Fault.run, .{ &reader, space, shuffled[0..3] });
 }

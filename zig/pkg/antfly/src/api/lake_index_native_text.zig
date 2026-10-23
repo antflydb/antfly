@@ -50,9 +50,13 @@ pub fn storesSource(config: std.json.Value) !bool {
 }
 /// Older builders may have accepted unknown config fields while still
 /// omitting source. A distinct authenticated recipe attests actual production,
-/// without changing the native format or invalidating source-free artifacts.
-pub fn sourceRecipe(table: local.common_topology_records.TableRecord, config: []const u8, store_source: bool) [32]u8 {
-    const original = state.recipe(table, config);
+/// independently of the source-free producer contract.
+pub fn sourceRecipe(a: A, table: local.common_topology_records.TableRecord, config: []const u8, store_source: bool) ![32]u8 {
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, config, .{});
+    defer parsed.deinit();
+    const field = if (parsed.value == .object) parsed.value.object.get("field") else null;
+    const selected: ?[]const u8 = if (!store_source and @import("lake_row_input_recipes.zig").configurationReusable(parsed.value) and field != null and field.? == .string) field.?.string else null;
+    const original = try state.recipe(a, table, config, if (selected) |path| &.{path} else null);
     if (!store_source) return original;
     var hash = std.crypto.hash.Blake3.init(.{});
     // v2 stores the complete declared relational row even when `field`
@@ -65,11 +69,11 @@ pub fn sourceRecipe(table: local.common_topology_records.TableRecord, config: []
 }
 
 test "external lake stored source recipe attests production without changing source free identity" {
-    const table: local.common_topology_records.TableRecord = .{ .table_id = 7, .name = "lake", .schema_json = "schema" };
+    const table: local.common_topology_records.TableRecord = .{ .table_id = 7, .name = "lake", .schema_json = "{}" };
     const config = "{\"store_source\":true}";
-    const old = state.recipe(table, config);
-    try std.testing.expectEqual(old, sourceRecipe(table, config, false));
-    try std.testing.expect(!std.mem.eql(u8, &old, &sourceRecipe(table, config, true)));
+    const old = try state.recipe(std.testing.allocator, table, config, null);
+    try std.testing.expectEqual(old, try sourceRecipe(std.testing.allocator, table, config, false));
+    try std.testing.expect(!std.mem.eql(u8, &old, &try sourceRecipe(std.testing.allocator, table, config, true)));
 }
 pub const source_spans = @import("lake_index_text_spans.zig");
 pub const physical = @import("lake_index_physical_ordinals.zig");
@@ -1062,7 +1066,7 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
             binding.column_bindings = paths;
         }
         binding.index_config_hash = try std.fmt.allocPrint(ca, "native-text-corpus-v11:{s}", .{want.binding.index_config_hash});
-        const recipe = sourceRecipe(table, spec.config_json, store_source);
+        const recipe = try sourceRecipe(ca, table, spec.config_json, store_source);
         const prior = for (reusable) |declaration| {
             if (declaration.artifact.kind == .text_segment and declaration.artifact.metadata_version == metadata_version and std.mem.eql(u8, declaration.name, want.name) and rebuild.bindingsEqual(declaration.binding, binding)) break declaration;
         } else null;

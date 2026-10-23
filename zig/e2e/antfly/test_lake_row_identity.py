@@ -1,17 +1,17 @@
 # Copyright 2026 Antfly, Inc.
-# SPDX-License-Identifier: Elastic-2.0
+# SPDX-License-Identifier: Apache-2.0
 #
-# Licensed under the Elastic License 2.0 (ELv2); you may not use this file
-# except in compliance with the Elastic License 2.0. You may obtain a copy of
-# the Elastic License 2.0 at
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
 #
-#     https://www.antfly.io/licensing/ELv2-license
+#     http://www.apache.org/licenses/LICENSE-2.0
 #
-# Unless required by applicable law or agreed to in writing, software distributed
-# under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
-# WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
-# Elastic License 2.0 for the specific language governing permissions and
-# limitations.
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 """Verified native index relocation against independent Parquet/Iceberg writers."""
 
@@ -536,6 +536,24 @@ def test_logical_identity_reuses_reordered_native_indexes(tmp_path, file_format)
         assert normalize(
             call("POST", "/tables/logical/query", label_query)
         ) == normalize(expected)
+        # Adding an unrelated nullable field keeps selected input cohorts and
+        # their native coordinate spaces, while whole-row consumers reverify.
+        revision = ready("logical")
+        before = states()[-1]
+        reused_before = {item["name"]: item["space"] for item in before["reused"]}
+        schema = call("GET", "/tables/logical")["schema"]
+        schema["document_schemas"]["row"]["schema"]["properties"]["extra"] = {
+            "type": "string"
+        }
+        call("PUT", "/tables/logical/schema", schema)
+        ready("logical", revision)
+        after = states()[-1]
+        reused_after = {item["name"]: item["space"] for item in after["reused"]}
+        for name in ("text", "label_text", "dense_native", "sparse_native"):
+            assert reused_after[name] == reused_before[name], name
+        assert normalize(call("POST", "/tables/logical/query", label_query)) == normalize(
+            expected
+        )
         failed = False
     finally:
         server.stop(test_failed=failed)

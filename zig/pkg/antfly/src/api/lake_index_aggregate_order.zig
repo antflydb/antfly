@@ -89,6 +89,9 @@ pub const Builder = struct {
             backing.get = Capture.get;
             backing.put = Capture.put;
             backing.put_many = null;
+            // Batched writers share Store.ptr. Inline capture must own every
+            // write until it decides whether this leaf remains embedded.
+            backing.pack_many = null;
             backing.check = Capture.check;
             self.page = try tree.apply(a, backing, null, edits);
             if (capture.pending) |page| {
@@ -157,6 +160,7 @@ pub fn Plan(comptime Reader: type) type {
                     store.get = get;
                     store.check = check;
                     store.put_many = null;
+                    store.pack_many = null;
                 }
                 return store;
             }

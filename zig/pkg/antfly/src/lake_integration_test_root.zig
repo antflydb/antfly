@@ -73,6 +73,7 @@ test {
     _ = @import("api/lake_index_metadata_ownership.zig");
     _ = @import("api/lake_index_native_rows.zig");
     _ = @import("api/lake_index_native_state.zig");
+    _ = @import("api/lake_index_dependencies.zig");
     _ = @import("api/lake_index_incremental_test.zig");
     _ = @import("api/lake_index_refinements_test.zig");
     _ = @import("api/lake_index_sql_rows.zig");

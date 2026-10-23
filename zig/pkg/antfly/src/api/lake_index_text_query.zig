@@ -985,8 +985,8 @@ const Execution = struct {
         defer schema_.deinit(self.arena);
         const runtime = try local.schema_mod.deriveRuntimeTableSchema(self.arena, schema_);
         const field: ?[]const u8 = if (config == .object) if (config.object.get("field")) |value| if (value == .string) value.string else null else null else null;
-        const recipe = corpus.sourceRecipe(.{ .table_id = self.table.id, .name = self.table.physical_name, .schema_json = self.schema_json }, root.config_json, true);
-        return .{ .name = selected.name, .stores_source = try corpus.storesSource(config) and std.mem.eql(u8, &recipe, &root.recipe), .query = .{ .query = text, .text_analysis = try local.storage_db_catalog_index_manager.parseTextAnalysisForIndexConfig(self.arena, root.config_json, runtime), .runtime_schema = runtime, .selected_field = field } };
+        const stores_source = try corpus.storesSource(config) and std.mem.eql(u8, &try corpus.sourceRecipe(self.arena, .{ .table_id = self.table.id, .name = self.table.physical_name, .schema_json = self.schema_json }, root.config_json, true), &root.recipe);
+        return .{ .name = selected.name, .stores_source = stores_source, .query = .{ .query = text, .text_analysis = try local.storage_db_catalog_index_manager.parseTextAnalysisForIndexConfig(self.arena, root.config_json, runtime), .runtime_schema = runtime, .selected_field = field } };
     }
     fn planHighlights(self: *Execution, req: types.SearchRequest) !void {
         if (self.highlight_queries != null or req.highlight == null) return;
@@ -1027,8 +1027,7 @@ const Execution = struct {
         if (!std.mem.eql(u8, &root.domain, &self.domain)) return error.InvalidNativeLakeTextCorpus;
         if (!@import("../serverless/build/lake_rebuild.zig").bindingsEqual(root.binding, selected.binding)) return error.InvalidNativeLakeTextCorpus;
         const config = try std.json.parseFromSliceLeaky(std.json.Value, self.arena, root.config_json, .{});
-        const source_recipe = corpus.sourceRecipe(.{ .table_id = self.table.id, .name = self.table.physical_name, .schema_json = self.schema_json }, root.config_json, true);
-        const stores_source = try corpus.storesSource(config) and std.mem.eql(u8, &source_recipe, &root.recipe);
+        const stores_source = try corpus.storesSource(config) and std.mem.eql(u8, &try corpus.sourceRecipe(self.arena, .{ .table_id = self.table.id, .name = self.table.physical_name, .schema_json = self.schema_json }, root.config_json, true), &root.recipe);
         try self.text_stores_source.put(self.arena, selected.name, stores_source);
         var selection = self.forced_selection;
         if (selection == null and self.overlay == null) if (self.active_text) |text| {

@@ -336,6 +336,8 @@ test "external lake native coordinator fences ambiguous admission and reuses dur
         commits: usize = 0,
         lose_reply: bool = true,
         cancel_checkpoint: bool = false,
+        checkpoint_kind: ?local.serverless_manifest_artifact_ref.ArtifactKind = null,
+        checkpoint_artifacts: ?@import("../serverless/artifacts/store.zig").ArtifactStore = null,
         lose_discard_reply: bool = false,
         discards: usize = 0,
         remove_source_on_admission: ?*local.storage_object_storage.ObjectStorage = null,
@@ -370,9 +372,17 @@ test "external lake native coordinator fences ambiguous admission and reuses dur
             if (self.cancel_checkpoint and before.value.generation == after.value.generation) {
                 var saved = try catalog.parse(std.testing.allocator, bytes);
                 defer saved.deinit();
-                if (saved.value.checkpoint != null) {
-                    self.cancel_checkpoint = false;
-                    return error.MetadataMutationOutcomeUnknown;
+                if (saved.value.checkpoint) |*checkpoint| {
+                    const selected = if (self.checkpoint_kind) |kind| matches: {
+                        try @import("lake_index_directory.zig").hydrateLazy(saved.arena.allocator(), self.checkpoint_artifacts.?, checkpoint, .none, null);
+                        break :matches for (checkpoint.declarations) |decl| {
+                            if (decl.artifact.kind == kind) break true;
+                        } else false;
+                    } else true;
+                    if (selected) {
+                        self.cancel_checkpoint = false;
+                        return error.MetadataMutationOutcomeUnknown;
+                    }
                 }
             }
             if (self.lose_reply) {
@@ -661,6 +671,10 @@ test "external lake native coordinator fences ambiguous admission and reuses dur
     // Ordered checkpoints must validate covering blocks and all retained trees,
     // including those a copy-on-write update would otherwise never read.
     const original_schema = mock.table.schema_json;
+    // Schema-scoped reuse can checkpoint unchanged text before ordered work.
+    // Interrupt the family under test, independent of declaration order.
+    mock.checkpoint_kind = .ordered_row_index;
+    mock.checkpoint_artifacts = artifacts;
     for ([_]enum { cover, forward, reverse, ties, predicates }{ .cover, .forward, .reverse, .ties, .predicates }) |mode| {
         var ordered_arena = std.heap.ArenaAllocator.init(a);
         defer ordered_arena.deinit();
@@ -674,7 +688,10 @@ test "external lake native coordinator fences ambiguous admission and reuses dur
         defer ordered_partial.deinit();
         try @import("lake_index_directory.zig").hydrateLazy(oa, artifacts, &ordered_partial.value.checkpoint.?, .none, null);
         const ordered = @import("lake_index_ordered_rows.zig");
-        const ordered_root = try ordered.loadRoot(oa, artifacts, ordered_partial.value.checkpoint.?.declarations[0].artifact, .none, null);
+        const ordered_decl = for (ordered_partial.value.checkpoint.?.declarations) |decl| {
+            if (decl.artifact.kind == .ordered_row_index) break decl;
+        } else return error.TestUnexpectedResult;
+        const ordered_root = try ordered.loadRoot(oa, artifacts, ordered_decl.artifact, .none, null);
         var ordered_reader: ordered.Reader = undefined;
         try ordered_reader.init(a, &artifacts, ordered_root, ordered_root.fingerprint, "", null, .none);
         defer ordered_reader.deinit();

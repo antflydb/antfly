@@ -1,17 +1,17 @@
 // Copyright 2026 Antfly, Inc.
-// SPDX-License-Identifier: Elastic-2.0
+// SPDX-License-Identifier: Apache-2.0
 //
-// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
-// except in compliance with the Elastic License 2.0. You may obtain a copy of
-// the Elastic License 2.0 at
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-//     https://www.antfly.io/licensing/ELv2-license
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// Unless required by applicable law or agreed to in writing, software distributed
-// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
-// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
-// Elastic License 2.0 for the specific language governing permissions and
-// limitations.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 //! Index-scoped resolver views share one pinned, immutable publication owner.
 //! Each view carries its exact original space, including same-label rewrites.
@@ -45,6 +45,40 @@ const Binding = struct {
         cache[bucket] = .{ .file = digest_, .slot = number };
         self.owner.mutex.unlock();
         return number;
+    }
+    fn slotsMany(self: *Binding, a: A, reader_: *identity.Reader, space: identity.Space, refs: []const RowRef, original: bool, output: []u32) !void {
+        if (refs.len != output.len or refs.len > 256) return error.InvalidLogicalRowIdentity;
+        const cache = if (original) &self.original_slots else &self.current_slots;
+        var names: [256][]const u8 = undefined;
+        var positions: [256]usize = undefined;
+        var numbers: [256]u32 = undefined;
+        var count: usize = 0;
+        try self.owner.lock();
+        for (refs, output, 0..) |ref, *number, i| {
+            if (!sameCut(space, ref)) {
+                self.owner.mutex.unlock();
+                return error.ExternalLakeSnapshotMismatch;
+            }
+            const digest_ = @import("lake_row_identity_delta.zig").fileKey(ref.external.file_id);
+            const cached = cache[digest_[0] % cache.len];
+            if (cached) |value| if (std.mem.eql(u8, &value.file, &digest_)) {
+                number.* = value.slot;
+                continue;
+            };
+            names[count] = ref.external.file_id;
+            positions[count] = i;
+            count += 1;
+        }
+        self.owner.mutex.unlock();
+        if (count == 0) return;
+        try reader_.fileSlotsMany(a, space, names[0..count], numbers[0..count]);
+        try self.owner.lock();
+        defer self.owner.mutex.unlock();
+        for (names[0..count], positions[0..count], numbers[0..count]) |name, position, number| {
+            output[position] = number;
+            const digest_ = @import("lake_row_identity_delta.zig").fileKey(name);
+            cache[digest_[0] % cache.len] = .{ .file = digest_, .slot = number };
+        }
     }
     fn from(raw: *anyopaque) *Binding {
         return @ptrCast(@alignCast(raw));
@@ -135,7 +169,9 @@ const Binding = struct {
             var reader_ = self.reader(&lane);
             if (self.translation) |translation| {
                 const coordinates = try scratch.allocator().alloc(identity.logical.Coordinate, end - begin);
-                for (refs[begin..end], coordinates) |ref, *coordinate| coordinate.* = .{ .file = try self.slot(scratch.allocator(), &reader_, source, ref.external.file_id, forward), .group = ref.external.row_group_ordinal, .row = ref.external.row_ordinal };
+                var slots: [256]u32 = undefined;
+                try self.slotsMany(scratch.allocator(), &reader_, source, refs[begin..end], forward, slots[0 .. end - begin]);
+                for (refs[begin..end], coordinates, slots[0 .. end - begin]) |ref, *coordinate, number| coordinate.* = .{ .file = number, .group = ref.external.row_group_ordinal, .row = ref.external.row_ordinal };
                 const mapped = reader_.translateDenseMany(scratch.allocator(), translation, coordinates, forward) catch |err| return owner.failed(err);
                 try self.materialize(a, scratch.allocator(), &reader_, mapped, result[begin..end], forward, &initialized);
             } else {
@@ -149,14 +185,15 @@ const Binding = struct {
     fn materialize(self: *Binding, a: A, scratch: A, reader_: *identity.Reader, rows: anytype, targets: []RowRef, forward: bool, initialized: *usize) !void {
         const target_space = if (forward) reader_.root.current else self.space;
         const version = if (forward) self.owner.identity_version else (try self.nav(scratch)).root.public_identity_version;
-        var files: std.AutoHashMapUnmanaged(u32, []const u8) = .empty;
-        for (rows, targets) |row, *target| {
-            const slot_ = try files.getOrPut(scratch, row.coordinate.file);
-            if (!slot_.found_existing) slot_.value_ptr.* = try reader_.file(scratch, target_space, row.coordinate.file);
-            target.* = try ownRef(a, .{ .external = .{ .identity_version = version, .source_id = target_space.source, .snapshot_id = target_space.snapshot, .file_id = slot_.value_ptr.*, .row_group_ordinal = row.coordinate.group, .row_ordinal = row.coordinate.row } });
+        const slots = try scratch.alloc(u32, rows.len);
+        for (rows, slots) |row, *number| number.* = row.coordinate.file;
+        const names = try reader_.filesMany(scratch, target_space, slots);
+        for (rows, targets, names) |row, *target, name| {
+            target.* = try ownRef(a, .{ .external = .{ .identity_version = version, .source_id = target_space.source, .snapshot_id = target_space.snapshot, .file_id = name, .row_group_ordinal = row.coordinate.group, .row_ordinal = row.coordinate.row } });
             initialized.* += 1;
         }
     }
+
     fn tieRank(raw: *anyopaque, a: A, ref: RowRef) !u64 {
         const self = from(raw);
         return self.tieRankInner(a, ref) catch |err| return self.owner.failed(err);
@@ -205,10 +242,9 @@ const Binding = struct {
         }
         const coordinates = try sa.alloc(identity.logical.Coordinate, refs.len);
         if (self.translation) |translation| {
-            for (refs, coordinates) |ref, *coordinate| {
-                if (!sameCut(self.space, ref)) return error.ExternalLakeSnapshotMismatch;
-                coordinate.* = .{ .file = try self.slot(sa, &reader_, self.space, ref.external.file_id, true), .group = ref.external.row_group_ordinal, .row = ref.external.row_ordinal };
-            }
+            var slots: [256]u32 = undefined;
+            try self.slotsMany(sa, &reader_, self.space, refs, true, slots[0..refs.len]);
+            for (refs, coordinates, slots[0..refs.len]) |ref, *coordinate, number| coordinate.* = .{ .file = number, .group = ref.external.row_group_ordinal, .row = ref.external.row_ordinal };
             const mapped = try reader_.translateDenseMany(sa, translation, coordinates, true);
             if (translation.ranked) {
                 for (mapped, ranks) |value, *rank| {
@@ -224,11 +260,11 @@ const Binding = struct {
         }
         var keys: [256][44]u8 = undefined;
         var pointers: [256][]const u8 = undefined;
-        var names: std.AutoHashMapUnmanaged(u32, []const u8) = .empty;
-        for (coordinates, keys[0..refs.len], pointers[0..refs.len]) |coordinate, *key, *pointer| {
-            const name = try names.getOrPut(sa, coordinate.file);
-            if (!name.found_existing) name.value_ptr.* = try reader_.file(sa, current, coordinate.file);
-            key.* = identity.orderKey(name.value_ptr.*, coordinate.group, coordinate.row);
+        const slots = try sa.alloc(u32, refs.len);
+        for (coordinates, slots) |coordinate, *number| number.* = coordinate.file;
+        const names = try reader_.filesMany(sa, current, slots);
+        for (coordinates, keys[0..refs.len], pointers[0..refs.len], names) |coordinate, *key, *pointer, name| {
+            key.* = identity.orderKey(name, coordinate.group, coordinate.row);
             pointer.* = key;
         }
         try @import("../serverless/graph_segment/page_tree.zig").ranksOf(sa, lane.cache.store(), current.by_order orelse return error.InvalidLogicalRowIdentity, pointers[0..refs.len], ranks);

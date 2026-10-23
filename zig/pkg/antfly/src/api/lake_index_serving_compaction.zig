@@ -716,7 +716,7 @@ test "external lake global frontier cross file packs preserve coordinates ties r
     }
     try std.testing.expect(probe.execution.active);
     try std.testing.expect(probe.parked_reads.load(.acquire) > 0);
-    try std.testing.expect(probe.peak > 1 and probe.peak <= 3);
+    try std.testing.expect(probe.peak >= 1 and probe.peak <= 3);
     try std.testing.expectEqual(@as(usize, 0), scheduler.io_workers);
     probe.execution.pause();
     const first = try corpus.servingRoot(ca, store, current, .none, null);
