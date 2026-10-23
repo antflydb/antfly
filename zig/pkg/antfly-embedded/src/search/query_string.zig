@@ -68,8 +68,10 @@ pub const QueryStringParser = struct {
             .default_operator = self.default_operator,
         };
         const result = try parser.parseQuery();
-
-        // If nothing was parsed, return match_all
+        errdefer if (result) |filter| freeParsedFilter(alloc, filter);
+        parser.skipWhitespace();
+        if (parser.pos != input.len) return error.InvalidSyntax;
+        // Only genuinely empty input denotes an unconstrained query.
         return result orelse .match_all;
     }
 };
@@ -80,12 +82,17 @@ const Parser = struct {
     pos: usize,
     default_field: []const u8,
     default_operator: QueryStringParser.DefaultOperator,
+    depth: usize = 0,
 
     fn parseQuery(self: *Parser) ParseError!?Filter {
         self.skipWhitespace();
         if (self.pos >= self.input.len) return null;
+        if (self.depth >= 128) return error.InvalidSyntax;
+        self.depth += 1;
+        defer self.depth -= 1;
 
         var left = (try self.parseClause()) orelse return null;
+        errdefer freeParsedFilter(self.alloc, left);
 
         while (self.pos < self.input.len) {
             self.skipWhitespace();
@@ -94,17 +101,17 @@ const Parser = struct {
             // Check for explicit AND/OR
             if (self.matchKeyword("AND")) {
                 self.skipWhitespace();
-                const right = (try self.parseClause()) orelse break;
+                const right = (try self.parseClause()) orelse return error.InvalidSyntax;
                 left = try self.makeBool(.must, left, right);
             } else if (self.matchKeyword("OR")) {
                 self.skipWhitespace();
-                const right = (try self.parseClause()) orelse break;
+                const right = (try self.parseClause()) orelse return error.InvalidSyntax;
                 left = try self.makeBool(.should, left, right);
             } else if (self.input[self.pos] == ')') {
                 break; // end of group
             } else {
                 // Implicit default operator
-                const right = (try self.parseClause()) orelse break;
+                const right = (try self.parseClause()) orelse return error.InvalidSyntax;
                 left = try self.makeBool(switch (self.default_operator) {
                     .and_ => .must,
                     .or_ => .should,
@@ -118,6 +125,7 @@ const Parser = struct {
     const BoolKind = enum { must, should };
 
     fn makeBool(self: *Parser, kind: BoolKind, a: Filter, b: Filter) ParseError!Filter {
+        errdefer freeParsedFilter(self.alloc, b);
         // If a is already a bool of the same kind, extend it
         switch (a) {
             .bool_filter => |bf| {
@@ -158,14 +166,16 @@ const Parser = struct {
         // +required
         if (self.input[self.pos] == '+') {
             self.pos += 1;
-            return try self.parseAtom();
+            return (try self.parseAtom()) orelse error.InvalidSyntax;
         }
 
         // -excluded → must_not
         if (self.input[self.pos] == '-') {
             self.pos += 1;
-            const inner = (try self.parseAtom()) orelse return null;
+            const inner = (try self.parseAtom()) orelse return error.InvalidSyntax;
+            errdefer freeParsedFilter(self.alloc, inner);
             const must_not = try self.alloc.alloc(Filter, 1);
+            errdefer self.alloc.free(must_not);
             must_not[0] = inner;
             const must = try self.alloc.alloc(Filter, 1);
             must[0] = .match_all;
@@ -175,8 +185,10 @@ const Parser = struct {
         // NOT
         if (self.matchKeyword("NOT")) {
             self.skipWhitespace();
-            const inner = (try self.parseAtom()) orelse return null;
+            const inner = (try self.parseAtom()) orelse return error.InvalidSyntax;
+            errdefer freeParsedFilter(self.alloc, inner);
             const must_not = try self.alloc.alloc(Filter, 1);
+            errdefer self.alloc.free(must_not);
             must_not[0] = inner;
             const must = try self.alloc.alloc(Filter, 1);
             must[0] = .match_all;
@@ -193,22 +205,24 @@ const Parser = struct {
         // Parenthesized group
         if (self.input[self.pos] == '(') {
             self.pos += 1;
-            const inner = try self.parseQuery();
+            const inner = (try self.parseQuery()) orelse return error.InvalidSyntax;
+            errdefer freeParsedFilter(self.alloc, inner);
             self.skipWhitespace();
-            if (self.pos < self.input.len and self.input[self.pos] == ')') {
-                self.pos += 1;
-            }
-            return try self.applyOptionalBoost(inner orelse return null);
+            if (self.pos >= self.input.len or self.input[self.pos] != ')') return error.InvalidSyntax;
+            self.pos += 1;
+            return try self.applyOptionalBoost(inner);
         }
 
         // Quoted phrase at top level (no field prefix)
         if (self.input[self.pos] == '"') {
-            return try self.applyOptionalBoost(try self.parsePhrase(self.default_field));
+            const phrase = try self.parsePhrase(self.default_field);
+            errdefer freeParsedFilter(self.alloc, phrase);
+            return try self.applyOptionalBoost(phrase);
         }
 
         // Read a word (potential field name or term)
         const word = self.readWord();
-        if (word.len == 0) return null;
+        if (word.len == 0 or std.mem.eql(u8, word, "AND") or std.mem.eql(u8, word, "OR")) return error.InvalidSyntax;
 
         self.skipWhitespace();
 
@@ -217,17 +231,19 @@ const Parser = struct {
             self.pos += 1; // skip ':'
             self.skipWhitespace();
 
-            if (self.pos >= self.input.len) {
-                return try self.applyOptionalBoost(.{ .term = .{ .field = word, .term = "" } });
-            }
+            if (self.pos >= self.input.len) return error.InvalidSyntax;
 
             if (self.input[self.pos] == '(') {
-                return try self.applyOptionalBoost(try self.parseFieldGroup(word));
+                const group = try self.parseFieldGroup(word);
+                errdefer freeParsedFilter(self.alloc, group);
+                return try self.applyOptionalBoost(group);
             }
 
             // field:"phrase"
             if (self.input[self.pos] == '"') {
-                return try self.applyOptionalBoost(try self.parsePhrase(word));
+                const phrase = try self.parsePhrase(word);
+                errdefer freeParsedFilter(self.alloc, phrase);
+                return try self.applyOptionalBoost(phrase);
             }
 
             // field:/regex/
@@ -246,47 +262,41 @@ const Parser = struct {
                 return try self.applyOptionalBoost(try self.parseRange(word));
             }
 
-            // field:value or field:prefix*
             const val = self.readWord();
-            if (val.len > 0 and self.pos < self.input.len and self.input[self.pos] == '*') {
-                self.pos += 1;
-                return try self.applyOptionalBoost(.{ .prefix = .{ .field = word, .prefix = val } });
-            }
-
-            return try self.applyOptionalBoost(.{ .term = .{ .field = word, .term = val } });
+            if (val.len == 0) return error.InvalidSyntax;
+            return try self.applyOptionalBoost(termOrPattern(word, val));
         }
+        return try self.applyOptionalBoost(termOrPattern(self.default_field, word));
+    }
 
-        // Bare word: prefix* syntax
-        if (self.pos < self.input.len and self.input[self.pos] == '*') {
-            self.pos += 1;
-            return try self.applyOptionalBoost(.{ .prefix = .{ .field = self.default_field, .prefix = word } });
+    fn termOrPattern(field: []const u8, word: []const u8) Filter {
+        if (std.mem.eql(u8, word, "*")) return .match_all;
+        if (std.mem.indexOfAny(u8, word, "*?")) |first| {
+            if (first == word.len - 1 and word[first] == '*') return .{ .prefix = .{ .field = field, .prefix = word[0..first] } };
+            return .{ .wildcard = .{ .field = field, .pattern = word } };
         }
-
-        // Plain term
-        return try self.applyOptionalBoost(.{ .term = .{ .field = self.default_field, .term = word } });
+        return .{ .term = .{ .field = field, .term = word } };
     }
 
     fn parsePhrase(self: *Parser, field: []const u8) ParseError!Filter {
         self.pos += 1; // skip opening '"'
         var terms = std.ArrayListUnmanaged([]const u8).empty;
+        errdefer terms.deinit(self.alloc);
 
         while (self.pos < self.input.len and self.input[self.pos] != '"') {
             self.skipWhitespace();
             if (self.pos >= self.input.len or self.input[self.pos] == '"') break;
-            const word = self.readWord();
-            if (word.len > 0) {
-                terms.append(self.alloc, word) catch return ParseError.OutOfMemory;
-            }
+            const start = self.pos;
+            while (self.pos < self.input.len and self.input[self.pos] != '"' and !std.ascii.isWhitespace(self.input[self.pos])) self.pos += 1;
+            const word = self.input[start..self.pos];
+            if (word.len == 0) return error.InvalidSyntax;
+            try terms.append(self.alloc, word);
         }
 
-        if (self.pos < self.input.len and self.input[self.pos] == '"') {
-            self.pos += 1; // skip closing '"'
-        }
+        if (self.pos >= self.input.len or self.input[self.pos] != '"') return error.InvalidSyntax;
+        self.pos += 1; // skip closing '"'
 
-        if (terms.items.len == 0) {
-            terms.deinit(self.alloc);
-            return .match_all;
-        }
+        if (terms.items.len == 0) return error.InvalidSyntax;
         if (terms.items.len == 1) {
             const term = terms.items[0];
             terms.deinit(self.alloc);
@@ -315,9 +325,8 @@ const Parser = struct {
             }
         }
         const pattern = self.input[start..self.pos];
-        if (self.pos < self.input.len and self.input[self.pos] == '/') {
-            self.pos += 1; // skip closing '/'
-        }
+        if (self.pos >= self.input.len or self.input[self.pos] != '/') return error.InvalidSyntax;
+        self.pos += 1; // skip closing '/'
         return .{ .regexp = .{ .field = field, .pattern = pattern } };
     }
 
@@ -328,11 +337,12 @@ const Parser = struct {
         self.default_field = field;
         defer self.default_field = saved_field;
 
-        const inner = try self.parseQuery();
+        const inner = (try self.parseQuery()) orelse return error.InvalidSyntax;
+        errdefer freeParsedFilter(self.alloc, inner);
         self.skipWhitespace();
         if (self.pos >= self.input.len or self.input[self.pos] != ')') return ParseError.InvalidSyntax;
         self.pos += 1;
-        return inner orelse .match_all;
+        return inner;
     }
 
     fn parseRange(self: *Parser, field: []const u8) ParseError!Filter {
@@ -417,14 +427,16 @@ const Parser = struct {
             self.pos += 1;
         }
         if (start == self.pos) return ParseError.InvalidSyntax;
-        return std.fmt.parseFloat(f32, self.input[start..self.pos]) catch ParseError.InvalidSyntax;
+        const value = std.fmt.parseFloat(f32, self.input[start..self.pos]) catch return error.InvalidSyntax;
+        if (!std.math.isFinite(value) or value < 0) return error.InvalidSyntax;
+        return value;
     }
 
     fn readWord(self: *Parser) []const u8 {
         const start = self.pos;
         while (self.pos < self.input.len) {
             const c = self.input[self.pos];
-            if (c == ' ' or c == '\t' or c == '\n' or c == ':' or c == '(' or c == ')' or c == '"' or c == '*' or c == '^') break;
+            if (c == ' ' or c == '\t' or c == '\n' or c == ':' or c == '(' or c == ')' or c == '"' or c == '^') break;
             self.pos += 1;
         }
         return self.input[start..self.pos];
@@ -448,6 +460,20 @@ const Parser = struct {
         return true;
     }
 };
+
+/// Parser strings borrow the input. Only AST arrays are owned here.
+pub fn freeParsedFilter(alloc: Allocator, filter: Filter) void {
+    switch (filter) {
+        .phrase => |phrase| alloc.free(phrase.terms),
+        .bool_filter => |boolean| {
+            for ([_][]const Filter{ boolean.must, boolean.should, boolean.must_not }) |children| {
+                for (children) |child| freeParsedFilter(alloc, child);
+                alloc.free(children);
+            }
+        },
+        else => {},
+    }
+}
 
 fn applyBoost(filter: Filter, boost: f32) ParseError!Filter {
     return switch (filter) {
@@ -767,4 +793,29 @@ test "query string: term range" {
     try testing.expectEqualStrings("title", filter.term_range.field);
     try testing.expectEqualStrings("alpha", filter.term_range.min.?);
     try testing.expectEqualStrings("omega", filter.term_range.max.?);
+}
+
+test "query string: malformed syntax never becomes an unconstrained query" {
+    const parser = QueryStringParser{};
+    for ([_][]const u8{ "+(", "(foo", "foo)", "\"unterminated", "title:/unterminated", "foo AND", "foo OR", "AND", "OR", "NOT", "+", "-", "title:", "title:()", "()", "foo ^", "(foo OR bar)^" }) |input| {
+        try testing.expectError(error.InvalidSyntax, parser.parse(testing.allocator, input));
+    }
+}
+
+test "query string: allocation failures release partially built syntax trees" {
+    const Harness = struct {
+        fn run(alloc: Allocator) !void {
+            const filter = try (QueryStringParser{}).parse(alloc, "(foo OR bar) AND NOT title:\"some phrase\"");
+            defer freeParsedFilter(alloc, filter);
+        }
+    };
+    try testing.checkAllAllocationFailures(testing.allocator, Harness.run, .{});
+}
+
+test "query string: wildcard patterns retain all wildcard positions" {
+    const parser = QueryStringParser{};
+    for ([_][]const u8{ "maxwe?", "*well", "max*well" }) |input| {
+        const filter = try parser.parse(testing.allocator, input);
+        try testing.expectEqualStrings(input, filter.wildcard.pattern);
+    }
 }

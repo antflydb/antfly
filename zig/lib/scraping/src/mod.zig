@@ -193,12 +193,22 @@ pub const RemoteContentConfig = struct {
     };
 
     pub const RemoteContentRuntime = struct {
+        // These callbacks cross server/kernel archives with independent Zig
+        // error tables. Return a stable code and write the snapshot on success.
+        pub const AcquireStatus = enum(u8) { ok, out_of_memory, timeout, canceled, unavailable };
         context: *anyopaque,
-        acquire_fn: *const fn (*anyopaque) anyerror!Snapshot,
+        acquire_fn: *const fn (*anyopaque, *Snapshot) callconv(.c) AcquireStatus,
         health_fn: ?*const fn (*anyopaque) RuntimeHealth = null,
 
         pub fn acquire(self: RemoteContentRuntime) !Snapshot {
-            return self.acquire_fn(self.context);
+            var snapshot: Snapshot = undefined;
+            switch (self.acquire_fn(self.context, &snapshot)) {
+                .ok => return snapshot,
+                .out_of_memory => return error.OutOfMemory,
+                .timeout => return error.Timeout,
+                .canceled => return error.Canceled,
+                .unavailable => return error.ResourceTemporarilyUnavailable,
+            }
         }
 
         pub fn health(self: RemoteContentRuntime) ?RuntimeHealth {

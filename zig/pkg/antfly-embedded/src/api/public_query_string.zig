@@ -50,9 +50,28 @@ pub fn parseFilterAllocWithOptions(alloc: std.mem.Allocator, input: []const u8, 
         error.OutOfMemory => return error.OutOfMemory,
     };
 
-    return .{
-        .filter = try cloneFilterAlloc(alloc, filter),
-    };
+    var owned: OwnedFilter = .{ .filter = try cloneFilterAlloc(alloc, filter) };
+    normalizeExpandedTerms(&owned.filter);
+    return owned;
+}
+
+// Query-string expansions target the lowercased term dictionary. Structured
+// term/pattern queries retain their explicit exact-term semantics.
+fn normalizeExpandedTerms(filter: *search_filter_mod.Filter) void {
+    switch (filter.*) {
+        .prefix => |value| for (@constCast(value.prefix)) |*byte| {
+            byte.* = std.ascii.toLower(byte.*);
+        },
+        .wildcard => |value| for (@constCast(value.pattern)) |*byte| {
+            byte.* = std.ascii.toLower(byte.*);
+        },
+        .bool_filter => |value| {
+            for ([_][]const search_filter_mod.Filter{ value.must, value.should, value.must_not }) |children| {
+                for (@constCast(children)) |*child| normalizeExpandedTerms(child);
+            }
+        },
+        else => {},
+    }
 }
 
 pub fn filterToStatefulTextQueryAlloc(
@@ -381,4 +400,20 @@ test "public query string parser supports default operator override" {
 
     try std.testing.expect(owned.filter == .bool_filter);
     try std.testing.expectEqual(@as(usize, 2), owned.filter.bool_filter.should.len);
+}
+
+test "api query contract rejects malformed query strings and normalizes expansions" {
+    const a = std.testing.allocator;
+    for ([_][]const u8{ "+(", "\"unterminated", "(foo", "foo)", "foo AND", "AND", "title:/oops" }) |input| {
+        try std.testing.expectError(error.InvalidQueryRequest, parseFilterAlloc(a, input));
+    }
+    var prefix = try parseFilterAlloc(a, "Ghisl*");
+    defer prefix.deinit(a);
+    try std.testing.expectEqualStrings("ghisl", prefix.filter.prefix.prefix);
+    var scoped = try parseFilterAlloc(a, "text:Ghisl*");
+    defer scoped.deinit(a);
+    try std.testing.expectEqualStrings("ghisl", scoped.filter.prefix.prefix);
+    var wildcard = try parseFilterAlloc(a, "Max*Wel?");
+    defer wildcard.deinit(a);
+    try std.testing.expectEqualStrings("max*wel?", wildcard.filter.wildcard.pattern);
 }

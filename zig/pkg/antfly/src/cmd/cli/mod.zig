@@ -177,8 +177,8 @@ pub fn commandUsage(command: []const u8) ?[]const u8 {
     \\                       [--execute] [--streaming|--no-streaming] (delegate to the retrieval workflow)
     \\
     ;
-    if (std.mem.eql(u8, command, "backup")) return "usage: antfly backup --table <table> --location <uri> [options]\n       antfly backup inspect --input FILE [--destination-capabilities FILE] [--max-input-bytes N] [--max-expanded-bytes N]\n";
-    if (std.mem.eql(u8, command, "restore")) return "usage: antfly restore --location <uri> [options]\n";
+    if (std.mem.eql(u8, command, "backup")) return backup.usage;
+    if (std.mem.eql(u8, command, "restore")) return backup.restore_usage;
     if (std.mem.eql(u8, command, "auth")) return "usage: antfly auth <me|users|permissions|roles|row-filters|subjects|api-keys> [options]\n";
     if (std.mem.eql(u8, command, "internal")) return
     \\usage: antfly internal metadata status
@@ -221,6 +221,11 @@ test "client commands expose help without a server" {
     try std.testing.expect(commandUsage("load") != null);
     try std.testing.expect(commandUsage("auth") != null);
     try std.testing.expect(commandUsage("unknown") == null);
+    const backup_help = commandUsage("backup").?;
+    try std.testing.expect(std.mem.indexOf(u8, backup_help, "--connection") != null);
+    try std.testing.expect(std.mem.indexOf(u8, backup_help, "\"connections\":") != null);
+    try std.testing.expect(std.mem.indexOf(u8, backup_help, "backup inspect") != null);
+    try std.testing.expect(std.mem.indexOf(u8, commandUsage("restore").?, "--input") != null);
 }
 
 /// Build global CLI config from environment variables.

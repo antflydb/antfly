@@ -25,21 +25,37 @@ const builtin = @import("builtin");
 const native_os = builtin.os.tag;
 const posix = std.posix;
 
-/// Installs Antfly's cancellation-safe POSIX connector over a Threaded I/O
-/// runtime. The vtable is separately allocated so the returned I/O remains
-/// stable when its owning runtime moves and can be shared by runtime lanes.
-pub fn createVTable(alloc: std.mem.Allocator, threaded: *std.Io.Threaded) !*std.Io.VTable {
-    const vtable = try alloc.create(std.Io.VTable);
-    vtable.* = threaded.io().vtable.*;
-    vtable.netConnectIp = netConnectIp;
-    return vtable;
+// Every compilation unit owns its Zig error table. Construct the outbound
+// vtable in the calling unit rather than retaining the table of the archive
+// that allocated Threaded. Runtime data can be shared; raw error-returning
+// function pointers cannot be shared without a boundary adapter.
+const local_network_vtable: std.Io.VTable = blk: {
+    var table = std.Io.Threaded.global_single_threaded.io().vtable.*;
+    table.netConnectIp = netConnectIp;
+    break :blk table;
+};
+
+pub fn networkVTable() *const std.Io.VTable {
+    return &local_network_vtable;
 }
 
-pub fn io(threaded: *std.Io.Threaded, vtable: *const std.Io.VTable) std.Io {
-    return .{
-        .userdata = threaded,
-        .vtable = vtable,
-    };
+/// Allocation-free outbound view in the caller's error domain. The Threaded
+/// owner must outlive every borrower and its submitted operations.
+pub fn io(threaded: *std.Io.Threaded) std.Io {
+    return .{ .userdata = threaded, .vtable = networkVTable() };
+}
+
+/// Mutable, same-archive override for transports that retain their complete
+/// client and callback implementation locally (including fault injection).
+/// Shared BackendRuntime lanes use `io`, never this retained table.
+pub fn createVTable(alloc: std.mem.Allocator, _: *std.Io.Threaded) !*std.Io.VTable {
+    const table = try alloc.create(std.Io.VTable);
+    table.* = local_network_vtable;
+    return table;
+}
+
+pub fn ioWithOwnedVTable(threaded: *std.Io.Threaded, table: *const std.Io.VTable) std.Io {
+    return .{ .userdata = threaded, .vtable = table };
 }
 
 const ConnectDisposition = enum {

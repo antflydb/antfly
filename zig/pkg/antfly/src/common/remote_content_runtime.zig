@@ -326,9 +326,10 @@ pub const Runtime = struct {
         self.last_reload_failed = true;
     }
 
-    fn acquireAdapter(context: *anyopaque) anyerror!scraping.RemoteContentConfig.Snapshot {
+    fn acquireAdapter(context: *anyopaque, output: *scraping.RemoteContentConfig.Snapshot) callconv(.c) scraping.RemoteContentConfig.RemoteContentRuntime.AcquireStatus {
         const self: *Runtime = @ptrCast(@alignCast(context));
-        return self.acquire();
+        output.* = self.acquire();
+        return .ok;
     }
 
     fn healthAdapter(context: *anyopaque) scraping.RemoteContentConfig.RuntimeHealth {
