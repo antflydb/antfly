@@ -24,6 +24,8 @@ const resource_manager_mod = @import("../resource_manager.zig");
 const state_mod = @import("state.zig");
 const storage_io = @import("storage_io.zig");
 pub const manifest_set = @import("manifest_set.zig");
+pub const OwnedStreamingRunFileWriter = @import("owned_run_writer.zig").Writer;
+pub const OwnedStreamingRunOutput = @import("owned_run_writer.zig").Output;
 pub const ObsoleteLedger = @import("obsolete_ledger.zig").Ledger;
 
 const max_run_file_read_bytes = 512 * 1024 * 1024;

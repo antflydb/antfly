@@ -18,6 +18,7 @@ pub const consumer_tests_only = true;
 test {
     _ = @import("storage/lsm_backend/storage_io.zig");
     _ = @import("storage/lsm_backend/owned_atomic_file.zig");
+    _ = @import("storage/lsm_backend/owned_run_writer.zig");
     _ = @import("storage/lsm_backend/wal.zig");
     _ = @import("storage/lsm_backend.zig");
 }

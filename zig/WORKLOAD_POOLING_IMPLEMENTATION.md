@@ -25774,3 +25774,72 @@ rejects an accepted header without replay and uses admitted metadata/encoder
 retirement, preserving published rows, sole-FD completion and control progress.
 Full GNU qualification remains waived; production run-writer prepayment and
 adoption, plus the other default-gate requirements above, remain incomplete.
+
+
+## Prepaid retained run writer and output ownership
+
+`repository.OwnedStreamingRunFileWriter` composes the retained initializer,
+entry/block/metadata producers, complete encoder retirement and owning private
+file into one stable caller-owned operation. The caller prepays its fixed
+header, output header and durability grant and retains their allocator, manager,
+storage and executor authority. The writer requires an existing directory and
+never creates a fresh application budget or performs synchronous sink IO.
+
+Each construction phase reserves its conservative additional peak before any
+heap allocation. Original resident credit and private construction credit remain
+owned together through producer adoption, physical observation and bounded CPU
+retirement. Surviving resident allocations adopt prepaid credit; unused credit
+retires only after the corresponding physical memory is gone. Rejected row
+cleanup/accounting retains the exact input identity and adopted-row receipt,
+preventing duplicate ingestion on retry. File observation and producer command
+acknowledgment remain coupled. Abort joins accepted IO before retiring borrowed
+producers and preserves the caller's possibly-published-output obligation.
+
+`transferPreparedUsageWithAdmission()` transfers an unchanged same-slice charge
+between two pre-registered stable observers using bounded ledger/pressure lock
+admission. It neither allocates nor calls the parent nor changes quota/peak
+usage. Both observer identities remain registered until explicit retirement.
+`OwnedStreamingRunOutput` uses this handoff to take the final filter and its
+charge together without a fallible gap. Its filter retires in at most 16 KiB
+chunks; ledger rejection retains the charge after physical release. The final
+path ticket survives filter retirement. Neither owner deletes a final file.
+
+The durability grant can move directly into the next output after successful
+publication/result transfer, retaining sole-FD completion headroom. Legacy
+`StreamingRunFileWriter` and its current production callers still need adoption
+through the retained backend/manifest completion owner; exporting the aggregate
+does not enable it by default. Existing native ABI layouts are unchanged.
+Remaining provider/legacy adoption, completion/history relief and default-gate
+evidence remain required. Full GNU qualification remains waived; the full design
+is incomplete.
+
+The physical qualification includes an independent backing allocator witness:
+every allocation requires live construction credit and the manager's builder
+slice must cover all old/new physical bytes before allocation and through free.
+The writer rejection matrix covers Canceled/DeadlineExceeded/FileNotFound at
+open/header observation, entry preparation/adoption, block and metadata IO and
+retirement, encoder retirement, output transfer and output retirement. It
+checks immutable retry identity, exactly 192 decoded rows across multiple
+blocks, sole-FD grant reuse, and reserved control progress with query capacity
+occupied. Separate abandonment cases stop at an adopted row, accepted block or
+metadata write, and encoder retirement; abort may itself reject while preserving
+funding. Prepayment denial leaves the constructor unallocated and the header
+unwritten. Prepared-charge transfer checks partial/full/reverse handoff,
+unprepared/aliased/overdrawn owners, rejected ledger waiting, unchanged usage and
+peak, and success while the exact-full parent ledger is locked.
+
+Qualification `prepaid-run-writer-v3-fast` passes 63/63 optimized build steps,
+62 physical-IO cases, 170 table/codec cases and 74 WAL/recovery cases. Its four
+standalone Bloom and 45/1/8 error-identity companion cases also pass. The
+receipt/log digest and all 5,582 native/schema input hashes were checked against
+the unchanged source; separate immutable gzip snapshots preserve every changed
+native source, including the new aggregate. Earlier v1 records the corrected
+private test-helper compile reference and sandbox loopback refusal; v2 passes
+the initial complete writer suite after the narrow fix and loopback grant.
+
+Final `prepaid-run-writer-v3-integrated` passes 83/83 build steps, all 62
+physical-IO, 32 embedded close, 170 table/codec, 74 WAL/recovery and 18 host/ABI
+checks, plus the same four Bloom and 45/1/8 error companions. The final receipt
+and log digest and all 5,582 inputs match the unchanged source and preserved
+native snapshots. Formatting and whitespace checks pass. Full GNU qualification
+remains waived and the complete default-adoption design remains incomplete.

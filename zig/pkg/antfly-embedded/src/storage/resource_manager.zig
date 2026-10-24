@@ -4792,6 +4792,42 @@ pub const ResourceManager = struct {
         return granted;
     }
 
+    /// Transfer an unchanged charge between stable, already prepared owners.
+    /// No allocation, parent callback, quota change or raw waiting occurs here.
+    /// Publish the matching physical ownership receipt before another fallible
+    /// operation. Both zero identities remain registered for explicit retirement.
+    pub fn transferPreparedUsageWithAdmission(self: *ResourceManager, slice: Slice, source: *u64, destination: *u64, amount: u64, control: read_admission.Port) !void {
+        if (source == destination) return error.InvalidArgument;
+        while (true) {
+            self.transferPreparedUsageOnce(slice, source, destination, amount, control) catch |cause| {
+                if (cause != error.ParentMemoryBusy) return cause;
+                try control.waitForProgress();
+                continue;
+            };
+            return;
+        }
+    }
+
+    fn transferPreparedUsageOnce(self: *ResourceManager, slice: Slice, source: *u64, destination: *u64, amount: u64, control: read_admission.Port) !void {
+        try @import("../common/bounded_mutex.zig").lockAtomic(&self.mutex, control);
+        defer self.mutex.unlock();
+        if (!self.pressure_change.tryLock()) return error.ParentMemoryBusy;
+        defer self.pressure_change.unlock();
+        const from = self.observer_identities.getPtr(.{ .slice = slice, .identity = @intFromPtr(source) }) orelse return error.ResourceAccountingMismatch;
+        const to = self.observer_identities.getPtr(.{ .slice = slice, .identity = @intFromPtr(destination) }) orelse return error.ResourceAccountingMismatch;
+        if (from.current != source.* or from.host_current != source.* or
+            to.current != destination.* or to.host_current != destination.* or amount > source.*)
+            return error.ResourceAccountingMismatch;
+        const next = std.math.add(u64, destination.*, amount) catch return error.ResourceBudgetExceeded;
+        from.current -= amount;
+        from.host_current -= amount;
+        to.current = next;
+        to.host_current = next;
+        source.* = from.current;
+        destination.* = next;
+        self.pressure_change.advanceLocked();
+    }
+
     /// Atomically moves accounting between two observer-owned contributions in
     /// the same slice. This is the ownership handoff used when a pre-admitted
     /// retained reservation becomes a live cache object: the allocation is
