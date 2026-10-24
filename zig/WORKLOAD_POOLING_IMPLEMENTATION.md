@@ -26928,3 +26928,66 @@ digests match current source. Formatting and whitespace checks pass. The v1
 receipt preserves a corrected test-fixture error: an empty directory's tree
 account must be prepared before payload construction. The full default design
 and production pin/coordinator integration remain incomplete.
+
+### Stable production directory file pins
+
+Directory payload registration now receives an owned `EntryPin` capability.
+The production backend returns a stable atomic counter record as its opaque
+owner, with a direct release callback, instead of using the backend as the
+release context and looking up the path again. Ordinary directory destruction
+uses the direct callback by default. `Backend.beginDirectorySnapshotRetirement`
+validates the stored release callback before consuming a lease or interpreting
+its opaque owner, so foreign/legacy capabilities fail closed. The current
+original is checked before validation, and the internal retirement callback
+checks it again before dropping the pin. Its context is global and it never
+dereferences a backend, acquires the registry mutex, hashes a path, allocates,
+or scans the map. It is valid only for directory capabilities issued by the
+production registration method; generic fixture capabilities retain their own
+callback contract.
+
+The path registry stores stable counter pointers, so table growth cannot move
+live pin owners. Registration and path-only compatibility owners serialize map
+access under the existing mutex, with atomic counter updates to coexist with
+direct drops. Overflow is rejected before incrementing. `forget` removes only
+zero-count records under that same mutex; an admitted drop performs one atomic
+decrement and, for the final count, one global release-epoch increment. It
+never dereferences its record after decrementing, because a concurrent forget
+may already have freed it. Cached zero-count records remain reusable until the
+path's owner forgets the generation. There is one fixed record per cached path,
+with no per-connection record or separate handle registry. The counter header
+and path share one raw allocation, avoiding an additional page-allocator
+allocation per cached run. Allocation failures unwind that allocation before
+ownership escapes; map keys borrow its immutable path suffix.
+
+Path registration, map growth, path-only retain/release/lookup/forget and the
+registry's global memory accounting still require retained/prepaid integration.
+Generic directory destruction still needs final-lease anchors and registered
+physical retirement under admission. Payload preparation, coupled backend
+publication, durable cleanup/relief and full default overload/fairness evidence
+remain open. This change removes the production final-directory-pin release
+blocker; it does not certify those other operations. Existing Run, Payload,
+backend and native/public layouts and durable formats are unchanged. Full GNU
+qualification remains waived; the full design remains incomplete.
+
+Final-source `stable-directory-pins-v4`, `-regressions` and `-fast` receipts
+pass all five native commands each. Debug physical-sync passes 53/53 steps and
+114 cases. The production tests sweep every constructor/retirement rejection
+while the registry mutex is held and the originating backend is closed,
+preserving payload charge until physical completion and notifying the release
+epoch exactly once. They reject a legacy capability before ownership transfer,
+verify header/path coallocation and exact allocator cleanup, exhaust actual
+allocation failures including the empty path, grow the table across rehash,
+and exercise concurrent final drops/forget with path-only compatibility pins.
+
+Regressions pass 60/60 steps and 55 directory/state/OOM, immutable-pin,
+merge/arena/overlay, ledger/dependency/GC, cross-handle reader, close,
+checkpoint and obsolete-file cases. ReleaseFast passes 63/63 steps and all
+114 physical, 170 table/codec and 74 WAL recovery cases. Each receipt also
+passes four Bloom and 45/1/8 error-identity companions (companions use Debug).
+All 5,594 native/schema input hashes and log digests match final source.
+Formatting and whitespace checks pass. The v1/v2 receipts preserve successful
+pre-coallocation implementations; v2 adds issuer validation. V3 preserves the
+corrected parameter-shadowing compiler error; v4 includes coallocation and
+joined test cleanup. Full GNU qualification remains waived. Registry
+registration/accounting and the remaining coordinated/default design are
+incomplete.

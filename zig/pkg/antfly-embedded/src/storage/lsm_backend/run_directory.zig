@@ -446,6 +446,12 @@ pub const Directory = struct {
         }
     };
 
+    /// One owned registration, represented independently of backend lifetime.
+    pub const EntryPin = struct {
+        owner: *anyopaque,
+        release: *const fn (*anyopaque, *Run) void,
+    };
+
     /// Owns one immutable payload, pin and accounting reference. Its allocator,
     /// backend and domain authority outlive it. Last-reference release still
     /// needs physical retirement; deinit is an explicit quiesced fallback.
@@ -500,6 +506,14 @@ pub const Directory = struct {
                 self.retire(allocator, null) catch unreachable;
             }
         };
+
+        /// Validate an opaque pin's issuer before a specialized release
+        /// operation interprets its owner. Rejection leaves this lease intact.
+        pub fn beginRetirementForPinWithAdmission(self: *@This(), expected: *const fn (*anyopaque, *Run) void, pin: PinRelease, original: @import("../../common/read_admission.zig").Port) !Retirement {
+            try original.checkpoint();
+            if (self.entry.payload.?.release_pin != expected) return error.ExecutionWaitUnsupported;
+            return self.beginRetirementWithAdmission(pin, original);
+        }
 
         /// Consumes this lease only after admission and ownership validation.
         /// Other directory/handle owners may still exist; their non-final drop
@@ -1007,24 +1021,26 @@ pub const Directory = struct {
         var owned = try repository.cloneRunCompactionSnapshot(allocator, run);
         errdefer owned.deinit(allocator);
         try owned.ensureReadIdentity();
-        try backend.retainRunSnapshotRef(&owned);
-        const release = struct {
-            fn call(ctx: *anyopaque, value: *Run) void {
-                if (comptime @hasDecl(@TypeOf(backend.*), "releaseDirectoryRunSnapshotRef")) {
-                    @TypeOf(backend.*).releaseDirectoryRunSnapshotRef(value);
-                    return;
+        const pin: EntryPin = if (comptime @hasDecl(@TypeOf(backend.*), "retainDirectoryRunSnapshotPin")) try backend.retainDirectoryRunSnapshotPin(&owned) else blk: {
+            try backend.retainRunSnapshotRef(&owned);
+            break :blk .{ .owner = @ptrCast(backend), .release = struct {
+                fn call(ctx: *anyopaque, value: *Run) void {
+                    if (comptime @hasDecl(@TypeOf(backend.*), "releaseDirectoryRunSnapshotRef")) {
+                        @TypeOf(backend.*).releaseDirectoryRunSnapshotRef(value);
+                        return;
+                    }
+                    const owner: @TypeOf(backend) = @ptrCast(@alignCast(ctx));
+                    owner.releaseRunSnapshotRef(value);
                 }
-                const owner: @TypeOf(backend) = @ptrCast(@alignCast(ctx));
-                owner.releaseRunSnapshotRef(value);
-            }
-        }.call;
+            }.call };
+        };
         var bytes: usize = @sizeOf(Payload) + owned.smallest_key.len + owned.largest_key.len;
         if (owned.path) |path| bytes += path.len;
         if (owned.smallest_namespace_name) |name| bytes += name.len;
         if (owned.largest_namespace_name) |name| bytes += name.len;
         if (owned.state) |*present| bytes += @intCast(present.estimatedMemoryBytes());
         account.charge(bytes);
-        payload.* = .{ .run = owned, .owner = @ptrCast(backend), .release_pin = release, .account = account, .bytes = bytes };
+        payload.* = .{ .run = owned, .owner = pin.owner, .release_pin = pin.release, .account = account, .bytes = bytes };
         const domain = if (comptime @hasField(@TypeOf(backend.*), "options")) blk: {
             if (comptime @hasField(@TypeOf(backend.options), "run_partition_key")) {
                 if (backend.options.run_partition_key) |partition| break :blk partition(payload.run.smallest_key);

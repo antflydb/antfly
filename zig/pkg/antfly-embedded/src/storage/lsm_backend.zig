@@ -173,46 +173,89 @@ var obsolete_path_refs = ObsoletePathRefRegistry{};
 // each generation as soon as its own last reader exits, without waiting for a
 // backend-wide reader-free instant.
 const RunSnapshotRefRegistry = struct {
+    // A live pin owns one count. Rehash moves only pointers; zero-count records
+    // stay cached until the path owner explicitly forgets the generation.
+    const Pin = struct {
+        refs: platform.atomic.Value(u64) = .init(1),
+        path_len: usize,
+        fn create(allocator: Allocator, source_path: []const u8) !*Pin {
+            const bytes = try std.math.add(usize, @sizeOf(Pin), source_path.len);
+            const raw = allocator.rawAlloc(bytes, .of(Pin), @returnAddress()) orelse return error.OutOfMemory;
+            const pin: *Pin = @ptrCast(@alignCast(raw));
+            pin.* = .{ .path_len = source_path.len };
+            @memcpy(pin.path(), source_path);
+            return pin;
+        }
+        fn path(self: *Pin) []u8 {
+            return @as([*]u8, @ptrCast(self))[@sizeOf(Pin)..][0..self.path_len];
+        }
+        fn destroy(self: *Pin, allocator: Allocator) void {
+            const bytes = @as([*]u8, @ptrCast(self))[0 .. @sizeOf(Pin) + self.path_len];
+            allocator.rawFree(bytes, .of(Pin), @returnAddress());
+        }
+        fn release(self: *Pin) void {
+            const previous = self.refs.fetchSub(1, .acq_rel);
+            std.debug.assert(previous != 0);
+            // Nothing below may access self: concurrent forget may already
+            // have freed this zero-count record after the atomic decrement.
+            if (previous == 1) _ = file_pin_release_epoch.fetchAdd(1, .release);
+        }
+    };
     mutex: std.atomic.Mutex = .unlocked,
-    refs: std.StringHashMapUnmanaged(u64) = .empty,
+    allocator: Allocator = std.heap.page_allocator,
+    refs: std.StringHashMapUnmanaged(*Pin) = .empty,
 
-    fn retain(self: *RunSnapshotRefRegistry, path: []const u8) !void {
+    /// Legacy registration driver: path hashing, allocation and rehash still
+    /// require separate retained preparation before admitted callers use it.
+    fn retainPin(self: *RunSnapshotRefRegistry, path: []const u8) !*Pin {
         lockWorkerMutex(&self.mutex);
         defer self.mutex.unlock();
-        if (self.refs.getPtr(path)) |count| {
-            count.* +|= 1;
-            return;
+        if (self.refs.get(path)) |pin| {
+            var count = pin.refs.load(.acquire);
+            while (true) {
+                if (count == std.math.maxInt(u64)) return error.Overflow;
+                count = pin.refs.cmpxchgWeak(count, count + 1, .acq_rel, .acquire) orelse return pin;
+            }
         }
-        // Cache one stable path allocation for the run generation rather than
-        // allocating a path for every read transaction.
-        const owned = try std.heap.page_allocator.dupe(u8, path);
-        errdefer std.heap.page_allocator.free(owned);
-        try self.refs.put(std.heap.page_allocator, owned, 1);
+        // Keep the header in the existing path allocation; a second page
+        // allocation per cached run would erase much of the pooling benefit.
+        const pin = try Pin.create(self.allocator, path);
+        errdefer pin.destroy(self.allocator);
+        try self.refs.put(self.allocator, pin.path(), pin);
+        return pin;
+    }
+    fn retain(self: *RunSnapshotRefRegistry, path: []const u8) !void {
+        _ = try self.retainPin(path);
     }
 
+    /// Compatibility for path-only owners. Stable-handle owners bypass both
+    /// this lookup and the registry mutex when releasing their own pin.
     fn release(self: *RunSnapshotRefRegistry, path: []const u8) void {
         lockWorkerMutex(&self.mutex);
         defer self.mutex.unlock();
-        const count = self.refs.getPtr(path) orelse return;
-        if (count.* > 0) {
-            count.* -= 1;
-            if (count.* == 0) _ = file_pin_release_epoch.fetchAdd(1, .release);
+        const pin = self.refs.get(path) orelse return;
+        var count = pin.refs.load(.acquire);
+        while (count != 0) {
+            count = pin.refs.cmpxchgWeak(count, count - 1, .acq_rel, .acquire) orelse {
+                if (count == 1) _ = file_pin_release_epoch.fetchAdd(1, .release);
+                return;
+            };
         }
     }
 
     fn isRetained(self: *RunSnapshotRefRegistry, path: []const u8) bool {
         lockWorkerMutex(&self.mutex);
         defer self.mutex.unlock();
-        return if (self.refs.get(path)) |count| count > 0 else false;
+        return if (self.refs.get(path)) |pin| pin.refs.load(.acquire) > 0 else false;
     }
 
     fn forget(self: *RunSnapshotRefRegistry, path: []const u8) void {
         lockWorkerMutex(&self.mutex);
         defer self.mutex.unlock();
-        const count = self.refs.get(path) orelse return;
-        if (count != 0) return;
+        const pin = self.refs.get(path) orelse return;
+        if (pin.refs.load(.acquire) != 0) return;
         const removed = self.refs.fetchRemove(path) orelse return;
-        std.heap.page_allocator.free(removed.key);
+        removed.value.destroy(self.allocator);
     }
 };
 
@@ -7332,6 +7375,36 @@ pub const Backend = struct {
     pub fn planningDirectory(self: *Backend) !*const RunDirectory {
         try self.ensureRunDirectory();
         return self.run_directory.?;
+    }
+
+    /// Directory payloads keep this stable pin capability until their final
+    /// release. No backend pointer or borrowed map slot escapes registration.
+    pub fn retainDirectoryRunSnapshotPin(_: *Backend, run: *Run) !RunDirectory.EntryPin {
+        if (run.version_ref_pinned) return error.InvalidArgument;
+        const path = run.path orelse return .{ .owner = &run_snapshot_refs, .release = releaseDirectorySnapshotPin };
+        const pin = try run_snapshot_refs.retainPin(path);
+        run.version_ref_pinned = true;
+        return .{ .owner = pin, .release = releaseDirectorySnapshotPin };
+    }
+    fn releaseDirectorySnapshotPin(owner: *anyopaque, run: *Run) void {
+        if (!run.version_ref_pinned) return;
+        const pin: *RunSnapshotRefRegistry.Pin = @ptrCast(@alignCast(owner));
+        pin.release();
+        run.version_ref_pinned = false;
+    }
+    /// Fail closed before interpreting a foreign/legacy opaque pin owner.
+    pub fn beginDirectorySnapshotRetirement(lease: *RunDirectory.EntryLease, original: @import("../common/read_admission.zig").Port) !RunDirectory.EntryLease.Retirement {
+        return lease.beginRetirementForPinWithAdmission(releaseDirectorySnapshotPin, directorySnapshotPinRetirement(), original);
+    }
+    /// Only for directory EntryPins issued above. The context is global and
+    /// release never dereferences a backend, hashes a path, allocates or locks.
+    fn directorySnapshotPinRetirement() RunDirectory.EntryLease.PinRelease {
+        return .{ .context = &run_snapshot_refs, .resume_fn = struct {
+            fn call(_: *anyopaque, owner: *anyopaque, run: *Run, original: ?@import("../common/read_admission.zig").Port) !void {
+                if (original) |port| try port.checkpoint();
+                releaseDirectorySnapshotPin(owner, run);
+            }
+        }.call };
     }
 
     pub fn retainRunSnapshotRef(_: *Backend, run: *Run) !void {
@@ -31406,4 +31479,245 @@ test "controlled physical sync checkpoint preparation keeps new accounts private
         try std.testing.expectEqual(@as(u64, 0), fixture.manager.sliceStats(.lsm_table_builder_working_set).used_bytes);
         try std.testing.expectEqual(@as(u64, 0), b.manifest_reserved_mutation_bytes);
     }
+}
+
+test "controlled physical sync stable directory pin release retires under held registry mutex after backend close" {
+    const a = std.testing.allocator;
+    const admission = @import("../common/read_admission.zig");
+    const Fault = struct {
+        checks: usize = 0,
+        at: usize = std.math.maxInt(usize),
+        failure: anyerror = error.Canceled,
+        fn check(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const at = self.checks;
+            self.checks += 1;
+            if (at == self.at) return self.failure;
+        }
+    };
+    const path = try a.alloc(u8, 3 * 16 * 1024 + 3);
+    defer a.free(path);
+    @memset(path, 'p');
+    const source = Run{ .id = 931, .level = 0, .size_bytes = 1, .path = path, .smallest_namespace_name = null, .smallest_key = @constCast("a"), .largest_namespace_name = null, .largest_key = @constCast("z"), .entry_count = 1, .bloom_filter = null, .state = null, .owns_metadata = false };
+    var total: usize = 0;
+    var target: usize = 0;
+    while (target <= total) : (target += 1) {
+        for ([_]bool{ false, true }) |quiesced| {
+            if (target == 0 and quiesced) continue;
+            var backend = Backend.init(a, .{});
+            var backend_alive = true;
+            defer if (backend_alive) backend.close();
+            const directory = try RunDirectory.create(a);
+            defer directory.destroy(a);
+            try directory.tree.prepare(a);
+            const account = directory.tree.account.?;
+            const baseline = account.bytes.load(.acquire);
+            defer run_snapshot_refs.forget(path);
+            var lease: ?RunDirectory.EntryLease = try directory.prepareEntryLegacy(&backend, source);
+            defer if (lease) |*value| value.deinit(a);
+            const charge = account.bytes.load(.acquire);
+            try std.testing.expect(charge > baseline);
+            backend.close();
+            backend_alive = false;
+            var retirement: ?RunDirectory.EntryLease.Retirement = null;
+            defer if (retirement) |*value| value.deinit(a);
+            var fault: Fault = .{ .at = if (target == 0) std.math.maxInt(usize) else target - 1, .failure = switch (target % 3) {
+                0 => error.Canceled,
+                1 => error.DeadlineExceeded,
+                else => error.FileNotFound,
+            } };
+            const payload: admission.Payload = .{ .ptr = &fault, .vtable = &.{ .checkpoint = Fault.check } };
+            const original = admission.Port.init(&payload);
+            const epoch = file_pin_release_epoch.load(.acquire);
+            {
+                try std.testing.expect(run_snapshot_refs.mutex.tryLock());
+                defer run_snapshot_refs.mutex.unlock();
+                const result: anyerror!void = blk: {
+                    retirement = Backend.beginDirectorySnapshotRetirement(&lease.?, original) catch |err| break :blk err;
+                    lease = null;
+                    retirement.?.retireWithAdmission(a, original) catch |err| break :blk err;
+                    break :blk {};
+                };
+                if (target == 0) {
+                    try result;
+                    total = fault.checks;
+                    try std.testing.expect(total > 10);
+                } else {
+                    try std.testing.expectError(fault.failure, result);
+                    try std.testing.expectEqual(charge, account.bytes.load(.acquire));
+                }
+                if (lease) |*value| {
+                    retirement = try Backend.beginDirectorySnapshotRetirement(value, original);
+                    lease = null;
+                }
+                if (quiesced) retirement.?.deinit(a) else try retirement.?.retireWithAdmission(a, original);
+                try std.testing.expectEqual(baseline, account.bytes.load(.acquire));
+                try std.testing.expectEqual(epoch + 1, file_pin_release_epoch.load(.acquire));
+                try std.testing.expectEqual(@as(u64, 0), run_snapshot_refs.refs.get(path).?.refs.load(.acquire));
+                fault.at = fault.checks;
+                try std.testing.expectError(fault.failure, retirement.?.retireWithAdmission(a, original));
+                try retirement.?.retireWithAdmission(a, original);
+                try std.testing.expectEqual(epoch + 1, file_pin_release_epoch.load(.acquire));
+            }
+            try std.testing.expect(!run_snapshot_refs.isRetained(path));
+        }
+    }
+    // Ordinary directory destruction also uses the same direct pin capability.
+    var backend = Backend.init(a, .{});
+    defer backend.close();
+    const directory = try RunDirectory.create(a);
+    var directory_alive = true;
+    defer if (directory_alive) directory.destroy(a);
+    defer run_snapshot_refs.forget(path);
+    try run_snapshot_refs.retain(path); // Independent path-only checkpoint pin.
+    defer run_snapshot_refs.release(path);
+    try directory.put(&backend, source);
+    {
+        try std.testing.expect(run_snapshot_refs.mutex.tryLock());
+        defer run_snapshot_refs.mutex.unlock();
+        directory.destroy(a);
+        directory_alive = false;
+        try std.testing.expectEqual(@as(u64, 1), run_snapshot_refs.refs.get(path).?.refs.load(.acquire));
+    }
+    run_snapshot_refs.forget(path);
+    try std.testing.expect(run_snapshot_refs.isRetained(path));
+    run_snapshot_refs.release(path);
+    try std.testing.expect(!run_snapshot_refs.isRetained(path));
+}
+
+test "controlled physical sync production pin retirement rejects legacy capability before ownership transfer" {
+    const a = std.testing.allocator;
+    const admission = @import("../common/read_admission.zig");
+    const Fixture = struct {
+        allocator: Allocator,
+        pins: usize = 0,
+        pub fn retainRunSnapshotRef(self: *@This(), _: *Run) !void {
+            self.pins += 1;
+        }
+        pub fn releaseRunSnapshotRef(self: *@This(), _: *Run) void {
+            self.pins -= 1;
+        }
+    };
+    const Control = struct {
+        rejected: bool = false,
+        fn check(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (!self.rejected) {
+                self.rejected = true;
+                return error.DeadlineExceeded;
+            }
+        }
+    };
+    var fixture: Fixture = .{ .allocator = a };
+    const directory = try RunDirectory.create(a);
+    defer directory.destroy(a);
+    try directory.tree.prepare(a);
+    var lease = try directory.prepareEntryLegacy(&fixture, .{ .id = 932, .level = 0, .size_bytes = 1, .path = @constCast("/stable/legacy.sst"), .smallest_namespace_name = null, .smallest_key = @constCast("a"), .largest_namespace_name = null, .largest_key = @constCast("z"), .entry_count = 1, .bloom_filter = null, .state = null });
+    var alive = true;
+    defer if (alive) lease.deinit(a);
+    const run = lease.run();
+    var control: Control = .{};
+    const payload: admission.Payload = .{ .ptr = &control, .vtable = &.{ .checkpoint = Control.check } };
+    const original = admission.Port.init(&payload);
+    try std.testing.expectError(error.DeadlineExceeded, Backend.beginDirectorySnapshotRetirement(&lease, original));
+    try std.testing.expectError(error.ExecutionWaitUnsupported, Backend.beginDirectorySnapshotRetirement(&lease, original));
+    try std.testing.expect(lease.run() == run);
+    try std.testing.expectEqual(@as(usize, 1), fixture.pins);
+    lease.deinit(a);
+    alive = false;
+    try std.testing.expectEqual(@as(usize, 0), fixture.pins);
+}
+
+test "controlled physical sync stable snapshot pins survive rehash concurrent release forget and allocation failure" {
+    const Fixture = struct {
+        fn close(registry: *RunSnapshotRefRegistry) void {
+            // Test-only joined cleanup: no pin consumer survives this fixture.
+            var iterator = registry.refs.iterator();
+            while (iterator.next()) |entry| {
+                entry.value_ptr.*.destroy(registry.allocator);
+            }
+            registry.refs.deinit(registry.allocator);
+            registry.refs = .empty;
+        }
+        fn allocationFailures(a: Allocator) !void {
+            var registry: RunSnapshotRefRegistry = .{ .allocator = a };
+            defer close(&registry);
+            const pin = try registry.retainPin("/stable/oom.sst");
+            pin.release();
+            const same = try registry.retainPin("/stable/oom.sst");
+            try std.testing.expect(pin == same);
+            registry.forget("/stable/oom.sst");
+            try std.testing.expect(registry.isRetained("/stable/oom.sst"));
+            same.release();
+            registry.forget("/stable/oom.sst");
+            try std.testing.expectEqual(@as(usize, 0), registry.refs.count());
+            const empty = try registry.retainPin("");
+            empty.release();
+            registry.forget("");
+            try std.testing.expectEqual(@as(usize, 0), registry.refs.count());
+        }
+        fn drop(pin: *RunSnapshotRefRegistry.Pin, count: usize) void {
+            for (0..count) |_| pin.release();
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Fixture.allocationFailures, .{});
+    {
+        var measured = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+        var packed_registry: RunSnapshotRefRegistry = .{ .allocator = measured.allocator() };
+        defer Fixture.close(&packed_registry);
+        const path = "/stable/one-allocation.sst";
+        const pin = try packed_registry.retainPin(path);
+        // One allocation for header+path, one for the initial hash table.
+        try std.testing.expectEqual(@as(usize, 2), measured.allocations);
+        try std.testing.expectEqual(@intFromPtr(pin) + @sizeOf(RunSnapshotRefRegistry.Pin), @intFromPtr(pin.path().ptr));
+        try std.testing.expectEqualStrings(path, pin.path());
+        pin.release();
+        packed_registry.forget(path);
+        Fixture.close(&packed_registry);
+        try std.testing.expectEqual(measured.allocated_bytes, measured.freed_bytes);
+    }
+    var registry: RunSnapshotRefRegistry = .{ .allocator = std.testing.allocator };
+    defer Fixture.close(&registry);
+    const anchor = try registry.retainPin("/stable/anchor.sst");
+    defer anchor.release();
+    const capacity = registry.refs.capacity();
+    for (0..512) |i| {
+        var buffer: [64]u8 = undefined;
+        const path = try std.fmt.bufPrint(&buffer, "/stable/rehash/{d}.sst", .{i});
+        const pin = try registry.retainPin(path);
+        pin.release();
+    }
+    try std.testing.expect(registry.refs.capacity() > capacity);
+    try std.testing.expect(anchor == registry.refs.get("/stable/anchor.sst").?);
+    const same = try registry.retainPin("/stable/anchor.sst");
+    try std.testing.expect(anchor == same);
+    {
+        try std.testing.expect(registry.mutex.tryLock());
+        defer registry.mutex.unlock();
+        same.release();
+        try std.testing.expectEqual(@as(u64, 1), anchor.refs.load(.acquire));
+    }
+    anchor.refs.store(std.math.maxInt(u64), .release);
+    try std.testing.expectError(error.Overflow, registry.retainPin("/stable/anchor.sst"));
+    try std.testing.expectEqual(std.math.maxInt(u64), anchor.refs.load(.acquire));
+    anchor.refs.store(1, .release);
+    const concurrent_path = "/stable/concurrent.sst";
+    var concurrent: *RunSnapshotRefRegistry.Pin = undefined;
+    for (0..256) |_| concurrent = try registry.retainPin(concurrent_path);
+    var threads: [4]?std.Thread = @splat(null);
+    defer for (&threads) |*thread| if (thread.*) |handle| handle.join();
+    for (&threads) |*thread| thread.* = try std.Thread.spawn(.{}, Fixture.drop, .{ concurrent, @as(usize, 64) });
+    // The last atomic drop may race physical deletion of the record. The drop
+    // must not read its record again after making the count zero.
+    for (0..128) |_| registry.forget(concurrent_path);
+    for (&threads) |*thread| {
+        thread.*.?.join();
+        thread.* = null;
+    }
+    registry.forget(concurrent_path);
+    try std.testing.expect(!registry.refs.contains(concurrent_path));
+    // Path-only releases coexist with direct handles and tolerate cached zero.
+    try registry.retain("/stable/anchor.sst");
+    registry.release("/stable/anchor.sst");
+    try std.testing.expectEqual(@as(u64, 1), anchor.refs.load(.acquire));
 }
