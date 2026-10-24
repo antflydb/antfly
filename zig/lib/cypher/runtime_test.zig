@@ -7802,6 +7802,29 @@ test "ordered node certificates bound scans preserve residuals and decline falli
         try std.testing.expectEqual(@as(usize, 5), result.stats.scanned_anchors);
         try std.testing.expectEqual(@as(usize, 3), fixture.certifications);
     }
+    for ([_]struct { text: []const u8, expected: []const i128, reads: usize }{
+        .{ .text = "MATCH(n:Document) RETURN count(DISTINCT n.rank)+0,coalesce(min(n.rank),0),max(n.rank)-min(n.rank) LIMIT 1", .expected = &.{ 3, 1, 2 }, .reads = 5 },
+        .{ .text = "MATCH(n:Document) RETURN min(n.rank) AS lo ORDER BY lo", .expected = &.{1}, .reads = 1 },
+        .{ .text = "MATCH(n:Document) RETURN CASE WHEN false THEN max(n.rank) ELSE min(n.rank) END", .expected = &.{1}, .reads = 1 },
+        .{ .text = "MATCH(n:Document) RETURN coalesce(min(n.rank),max(n.rank))", .expected = &.{1}, .reads = 1 },
+        .{ .text = "MATCH(n:Document) RETURN min(n.rank) LIMIT 0", .expected = &.{}, .reads = 1 },
+        .{ .text = "MATCH(n:Document) RETURN min(n.rank) SKIP 1", .expected = &.{}, .reads = 1 },
+    }) |item| {
+        var indexed: Indexed = .{};
+        var provider_callbacks = indexed.fixture.backend().vtable.*;
+        provider_callbacks.bind = Indexed.bind;
+        provider_callbacks.checkpoint = Indexed.checkpoint;
+        provider_callbacks.scan = Indexed.scan;
+        provider_callbacks.scan_ordered = Indexed.read;
+        var case_diagnostic: c.Diagnostic = .{};
+        var case_compiled = try c.compile(std.testing.allocator, item.text, .{}, &case_diagnostic);
+        defer case_compiled.deinit();
+        var case_result = try runtime.execute(std.testing.allocator, .{ .ptr = &indexed, .vtable = &provider_callbacks }, graph, &case_compiled, &.{}, .{ .scanned_anchors = item.reads });
+        defer case_result.deinit();
+        try std.testing.expectEqual(@as(usize, @intFromBool(item.expected.len != 0)), case_result.rows.len);
+        if (item.expected.len != 0) for (case_result.rows[0], item.expected) |actual, expected| try std.testing.expectEqual(expected, actual.integer);
+        try std.testing.expectEqual(item.reads, case_result.stats.scanned_anchors);
+    }
     var fixture: Indexed = .{};
     var callbacks = fixture.fixture.backend().vtable.*;
     callbacks.bind = Indexed.bind;
@@ -7999,6 +8022,10 @@ test "coarse RPC prefixes refine owner ties and bound partial DISTINCT across wi
         "MATCH (n:Document) RETURN count(DISTINCT n.id)",
         "MATCH (n:Document) WHERE false RETURN count(DISTINCT 7)",
         "MATCH (n:Document) RETURN count(DISTINCT 7),count(null)",
+        "MATCH (n:Document) RETURN count(DISTINCT n.rank)+0,coalesce(min(n.rank),0),max(n.rank)-min(n.rank) LIMIT 1",
+        "MATCH (n:Document) RETURN min(n.rank) AS lo ORDER BY lo",
+        "MATCH (n:Document) WITH DISTINCT n.rank AS r ORDER BY r DESC RETURN r",
+        "MATCH (n:Document) WITH DISTINCT n.rank AS r ORDER BY r DESC RETURN count(r)",
     }) |query| for ([_]bool{ true, false }) |exact_keys| {
         for (&owners) |*owner| owner.exact_keys = exact_keys;
         var arena = std.heap.ArenaAllocator.init(std.testing.allocator);

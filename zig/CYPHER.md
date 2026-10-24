@@ -3106,3 +3106,64 @@ NULL-test certificates are covered by five-row licensed windows over a
 13,000-row source, plus nullable AND/OR, derived fallback, and parameterized
 public result comparisons. Mixed observers also retain empty-input, all-NULL,
 duplicate-alias and fallible-expression behavior.
+
+#### Observer expressions and intermediate domain boundaries
+
+Indexed observer planning follows the scope-local aggregate slots inside scalar
+output expressions, rather than requiring a bare aggregate in every output
+column. All observer certificates are negotiated before reads. Each aggregate
+leaf executes lazily on first demand and shares its result across equivalent
+calls. CASE and coalesce retain their original evaluation sites, aliases retain
+their ORDER BY scope, and output expressions and sort keys still evaluate before
+SKIP/LIMIT discards the single global result. Nonaggregate grouping items,
+source-dependent scalar wrappers and unsupported observer arguments retain the
+ordinary executor, including its empty-input cardinality and error behavior.
+
+An intermediate DISTINCT can now consume a certified native key domain at that
+stage boundary. Its small result feeds the following projection or reduction;
+the runtime need not materialize all duplicate source documents first. Only an
+adjacent key-domain proof licenses this boundary. Redundant entity DISTINCT,
+ordinary row stages and symbolic path/range cohorts retain their existing fused
+continuation and multiplicity planning.
+
+Grouped DISTINCT counts can use the same per-domain observer plans as extrema,
+including unbounded output. A bounded density sample selects between domain
+seeks and one-pass ordered folding. Sampled records remain charged and are
+replayed locally. Any ordinary COUNT observer keeps the required full-domain
+fold; mixed COUNT/DISTINCT queries must not discard row multiplicity. Per-group
+cardinality still observes the global authorized union of keys, never the sum
+of owner-local counts. NULL grouping keys, all-NULL arguments and finite/offset
+windows use the ordinary grouping and observer semantics.
+
+The Go and TypeScript SDKs refuse automatic graph-query and catalog-write
+redirects. The Go generated typed/raw operations apply the same policy as the
+wrappers, clear replayable bodies after request editors, and bound request and
+response bytes. A borrowed http.Client keeps its original redirect policy;
+custom transports must implement GraphNoReplayDoer. Graph query requests retain
+the 1 MiB ceiling, catalog commands have a separate 3 MiB ceiling, and graph
+responses have a 32 MiB ceiling. TypeScript protects both wrappers and the typed
+API through graph-route middleware. Receipt inspection remains a separate read;
+uncertain delivery never licenses statement replay.
+
+Measured with ready indexes, eight grouping keys and three score values on both
+Lite and Directory. The figures below use 8,000 documents; repeating with 32,000
+documents gives the same bounded anchor/state counts after these changes.
+
+| Query shape | Prior anchors / states | Current anchors / states |
+| --- | ---: | ---: |
+| Wrapped COUNT(DISTINCT), coalesced MIN and MAX−MIN | 8,000 / 311,982 | 7 / 253 |
+| Mixed observers followed by LIMIT 1 | 8,000 / 311,981 | 7 / 249 |
+| MIN followed by ORDER BY its alias | 8,000 / 104,003 | 1 / 43 |
+| Intermediate ordered DISTINCT followed by RETURN | 8,000 / 224,009 | 5 / 125 |
+| Intermediate ordered DISTINCT followed by COUNT | 8,000 / 200,164 | 5 / 120 |
+| Unbounded grouped COUNT(DISTINCT score) | 8,000 / 359,772 | 85 / 4,071 |
+| Bounded grouped COUNT(DISTINCT score), LIMIT 8 | 8,000 / 359,824 | 61 / 3,075 |
+| Intermediate tuple DISTINCT followed by grouped COUNT | 8,000 / 344,645 | 47 / 2,332 |
+
+Intermediate ordered DISTINCT retains 49,490 bytes instead of 16,728,822 bytes.
+At 32,000 documents the previous wrapped/limited observers and grouped DISTINCT
+counts exceed the default state ceiling, and intermediate DISTINCT can exceed
+the default memory ceiling. The new public regression exercises these shapes
+with a 256-anchor, 2 MiB allowance and checks their exact expected results. A
+separate nullable-group fixture compares seeks and full folds across unbounded,
+bounded and beyond-end windows, including mixed ordinary/distinct counts.

@@ -8546,3 +8546,104 @@ def test_sql_graph_null_filters_preserve_three_valued_windows(graph_db):
         actual = graph_db.sql(query, [value])
         control = graph_db.sql(query.replace("ORDER BY q.score", "ORDER BY q.score+0"), [value])
         assert actual["rows"] == control["rows"]
+
+
+def test_indexed_domains_compose_through_observers_and_distinct_stages(graph_db):
+    # The full source exceeds the public state/memory ceilings for the old
+    # fallback, while its authorized key domains have only 24 distinct tuples.
+    with graph_db.open_table("docs") as table:
+        table.batch(
+            [
+                af.WriteIntent(
+                    key=f"k{i:06}",
+                    value=json.dumps({"id": f"g{i % 8}", "score": (i // 8) % 3}).encode(),
+                )
+                for i in range(32000)
+            ],
+            timestamp=1,
+        )
+    graph_db.sql("CREATE INDEX grouping ON docs(id,score DESC)")
+    graph_db.sql("CREATE INDEX ranked ON docs(score DESC)")
+    graph_db.run_until_idle()
+    aggregate = [["3", "0", "2"]]
+    groups = [[f"g{i}", "3"] for i in range(8)]
+    for query, expected in (
+        ("MATCH(n:D) RETURN count(DISTINCT n.score)+0,coalesce(min(n.score),0),max(n.score)-min(n.score)", aggregate),
+        ("MATCH(n:D) RETURN count(DISTINCT n.score),min(n.score),max(n.score) LIMIT 1", aggregate),
+        ("MATCH(n:D) RETURN min(n.score) AS lo ORDER BY lo", [["0"]]),
+        ("MATCH(n:D) RETURN coalesce(min(n.score),max(n.score)) LIMIT 0", []),
+        ("MATCH(n:D) RETURN count(DISTINCT n.score) SKIP 1", []),
+        ("MATCH(n:D) WITH DISTINCT n.score AS s ORDER BY s DESC RETURN s", [["2"], ["1"], ["0"]]),
+        ("MATCH(n:D) WITH DISTINCT n.score AS s ORDER BY s DESC RETURN count(s)", [["3"]]),
+        ("MATCH(n:D) WITH DISTINCT n.id AS g,n.score AS s ORDER BY g,s DESC RETURN g,count(s) ORDER BY g", groups),
+        ("MATCH(n:D) RETURN n.id,count(DISTINCT n.score) ORDER BY n.id", groups),
+        ("MATCH(n:D) RETURN n.id,count(DISTINCT n.score) ORDER BY n.id LIMIT 8", groups),
+        (
+            "MATCH(n:D) RETURN n.id,count(DISTINCT n.score),min(n.score),max(n.score) ORDER BY n.id",
+            [[f"g{i}", "3", "0", "2"] for i in range(8)],
+        ),
+        ("MATCH(n:D) RETURN n.id,count(DISTINCT n.score) ORDER BY n.id SKIP 6 LIMIT 1", [["g6", "3"]]),
+    ):
+        result = graph_db.cypher_json(
+            "g", {"query": query, "limits": {"scanned_anchors": 256, "memory_bytes": 2 << 20}}
+        )
+        assert [[cell["value"] for cell in row] for row in result["rows"]] == expected, query
+        assert result["stats"]["scanned_anchors"] <= 256
+
+
+def test_indexed_observer_output_preserves_lazy_errors_and_empty_input(graph_db):
+    populate(graph_db, 300)
+    graph_db.sql("CREATE INDEX ranked ON docs(score DESC)")
+    graph_db.run_until_idle()
+    for predicate, expected in (("", [["0", "0"]]), ("WHERE false", [["7", "0"]])):
+        result = graph_db.cypher_json(
+            "g",
+            {
+                "query": f"MATCH(n:D) {predicate} RETURN coalesce(min(n.score),7),count(DISTINCT n.score)*0 LIMIT 1",
+            },
+        )
+        assert [[cell["value"] for cell in row] for row in result["rows"]] == expected
+    for suffix in ("", " LIMIT 0", " SKIP 1", " ORDER BY 1/0"):
+        with pytest.raises(af.GraphError, match="CypherDivisionByZero"):
+            graph_db.cypher_json("g", {"query": "MATCH(n:D) RETURN min(n.score)/0" + suffix})
+    for query in (
+        "MATCH(n:D) RETURN CASE WHEN true THEN min(n.score) ELSE max(n.score)/0 END",
+        "MATCH(n:D) RETURN coalesce(min(n.score),max(n.score)/0)",
+    ):
+        result = graph_db.cypher_json("g", {"query": query, "limits": {"scanned_anchors": 1}})
+        assert result["rows"] == [[{"type": "integer", "value": "0"}]]
+
+
+def test_grouped_domain_seeks_preserve_null_keys_and_non_distinct_counts(graph_db):
+    with graph_db.open_table("docs") as table:
+        table.batch(
+            [
+                af.WriteIntent(
+                    key=f"k{i:06}",
+                    value=json.dumps(
+                        {"id": None if i % 3 == 0 else f"g{i % 3}", "score": None if i % 3 == 1 else (i // 3) % 4}
+                    ).encode(),
+                )
+                for i in range(3000)
+            ],
+            timestamp=1,
+        )
+    graph_db.sql("CREATE INDEX grouping ON docs(id,score DESC)")
+    graph_db.run_until_idle()
+    for observer in (
+        "count(DISTINCT n.score)",
+        "count(DISTINCT n.score),min(n.score),max(n.score)",
+        "count(*),count(DISTINCT n.score)",
+        "count(n.score),count(DISTINCT n.score)",
+    ):
+        for window in ("", " LIMIT 3", " SKIP 1 LIMIT 1", " SKIP 9 LIMIT 1"):
+            query = f"MATCH(n:D) RETURN n.id,{observer} ORDER BY n.id{window}"
+            result = graph_db.cypher_json("g", {"query": query})
+            control = graph_db.cypher_json(
+                "g", {"query": query.replace("ORDER BY n.id", "ORDER BY CASE WHEN true THEN n.id END")}
+            )
+            assert result["rows"] == control["rows"], query
+            if observer.startswith("count(*)") or observer.startswith("count(n.score)"):
+                assert result["stats"]["scanned_anchors"] >= 1000
+            else:
+                assert result["stats"]["scanned_anchors"] < 256
