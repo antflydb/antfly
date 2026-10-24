@@ -91,6 +91,55 @@ pub const ChatMessage = struct {
     responses_output_json: ?[]const u8 = null,
 };
 
+/// A text-only view over string or multipart content. Replay validators compare
+/// arbitrary native block boundaries without allocating a flattened copy. All
+/// parts are checked up front so trailing media cannot bypass admission.
+pub const TextContentCursor = struct {
+    content: ?ChatMessageContent,
+    part_index: usize = 0,
+    offset: usize = 0,
+
+    pub fn init(content: ?ChatMessageContent) !TextContentCursor {
+        if (content) |value| if (value == .parts) {
+            for (value.parts) |part| if (part != .text) return error.InvalidInferenceRequest;
+        };
+        return .{ .content = content };
+    }
+
+    fn remaining(self: *TextContentCursor) []const u8 {
+        const content = self.content orelse return "";
+        return switch (content) {
+            .text => |value| value[self.offset..],
+            .parts => |parts| blk: {
+                while (self.part_index < parts.len) {
+                    const value = parts[self.part_index].text;
+                    if (self.offset < value.len) break :blk value[self.offset..];
+                    self.part_index += 1;
+                    self.offset = 0;
+                }
+                break :blk "";
+            },
+        };
+    }
+
+    pub fn consume(self: *TextContentCursor, text: []const u8) bool {
+        var pending = text;
+        while (pending.len > 0) {
+            const available = self.remaining();
+            if (available.len == 0) return false;
+            const count = @min(pending.len, available.len);
+            if (!std.mem.eql(u8, pending[0..count], available[0..count])) return false;
+            self.offset += count;
+            pending = pending[count..];
+        }
+        return true;
+    }
+
+    pub fn done(self: *TextContentCursor) bool {
+        return self.remaining().len == 0;
+    }
+};
+
 /// Provider-reported token counts. Absence is distinct from a measured zero.
 pub const GenerationUsage = struct {
     input_tokens: u64,

@@ -27,6 +27,7 @@ pub const ToolCall = generating.ToolCall;
 pub const GenerationUsage = generating.GenerationUsage;
 pub const GenerationFinishReason = generating.GenerationFinishReason;
 pub const ChatMessage = generating.ChatMessage;
+pub const TextContentCursor = generating.TextContentCursor;
 pub const jsonValuesEqual = generating.jsonValuesEqual;
 pub const emptyToolParameters = generating.emptyToolParameters;
 pub const ChatStream = generating.ChatStream;

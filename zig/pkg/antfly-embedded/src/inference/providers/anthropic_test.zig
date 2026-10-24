@@ -50,6 +50,20 @@ pub fn run() !void {
     changed.anthropic_content_json = "[{\"type\":\"image\",\"source\":{\"type\":\"url\",\"url\":\"https://image\"}}]";
     try std.testing.expectError(error.InvalidInferenceRequest, wire.requestJsonAlloc(a, cfg, cfg.model, &.{changed}, false));
 
+    var text_cursor = try lib.TextContentCursor.init(.{ .parts = &.{ .{ .text = "a" }, .{ .text = "" }, .{ .text = "bc" }, .{ .text = "d" } } });
+    try std.testing.expect(text_cursor.consume("ab"));
+    try std.testing.expect(!text_cursor.done());
+    try std.testing.expect(text_cursor.consume("c"));
+    try std.testing.expect(text_cursor.consume("d"));
+    try std.testing.expect(text_cursor.done());
+    try std.testing.expect(!text_cursor.consume("extra"));
+    var visible = messages[2];
+    visible.content = .{ .parts = &.{.{ .text = "" }} };
+    const multipart_replay = try wire.requestJsonAlloc(a, cfg, cfg.model, &.{visible}, false);
+    defer a.free(multipart_replay);
+    visible.content = .{ .parts = &.{ .{ .text = "" }, .{ .image_url = .{ .url = "https://hidden.invalid" } } } };
+    try std.testing.expectError(error.InvalidInferenceRequest, wire.requestJsonAlloc(a, cfg, cfg.model, &.{visible}, false));
+
     var sink: Sink = .{};
     defer sink.output.deinit(a);
     var decoder = Decoder{ .alloc = a, .sink = sink.view(), .model = cfg.model, .id = "stream-test", .include_usage = true };

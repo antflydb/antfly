@@ -26,6 +26,7 @@ import argparse
 import base64
 import random
 import http.client
+import io
 import struct
 import json
 import socket
@@ -36,6 +37,7 @@ import time
 import urllib.error
 import urllib.request
 import zlib
+import wave
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import ClassVar
@@ -564,6 +566,9 @@ class Upstream(BaseHTTPRequestHandler):
             },
             {"reasoningContent": {"redactedContent": "cmVkYWN0ZWQ="}},
         ]
+        unsigned = "/unsigned/" in self.path
+        if unsigned:
+            del reasoning[0]["reasoningContent"]["reasoningText"]["signature"]
         if any(
             "toolResult" in block
             for turn in request["messages"]
@@ -621,7 +626,10 @@ class Upstream(BaseHTTPRequestHandler):
                 )
             ]
         else:
-            for delta in ({"text": "private"}, {"signature": "native-signature"}):
+            deltas = [{"text": "private"}]
+            if not unsigned:
+                deltas.append({"signature": "native-signature"})
+            for delta in deltas:
                 packets.append(
                     bedrock_frame(
                         "contentBlockDelta",
@@ -1043,6 +1051,9 @@ class Upstream(BaseHTTPRequestHandler):
             "Bearer speech-bearer-key",
         )
         if self.extra(request):
+            return
+        if request["model"].startswith("openai-audio-"):
+            self.google_chat(request)
             return
         expected = {
             "/ai/v1/chat/completions": "mock-chat",
@@ -1757,12 +1768,12 @@ def verify_hosted_image_streams(base_url):
         client.close()
 
 
-def verify_bedrock_stream_replay(client, messages):
+def verify_bedrock_stream_replay(client, messages, model="generators/bedrock-known"):
     blocks = {}
     calls = []
     stops = set()
     with client.chat.completions.create(
-        model="generators/bedrock-known",
+        model=model,
         messages=messages,
         tools=[{"type": "function", "function": {"name": "lookup"}}],
         stream=True,
@@ -1812,6 +1823,8 @@ def verify_bedrock_stream_replay(client, messages):
                         "function"
                     ].get("arguments", "")
     assert stops == {0, 1}, stops
+    if model.endswith("unsigned"):
+        assert "signature" not in blocks[0]["reasoningContent"]["reasoningText"]
     for call in calls:
         block = next(
             block["toolUse"]
@@ -1828,7 +1841,7 @@ def verify_bedrock_stream_replay(client, messages):
         },
     }
     answer = client.chat.completions.create(
-        model="generators/bedrock-known",
+        model=model,
         messages=[
             *messages,
             assistant,
@@ -1858,12 +1871,137 @@ def quota_image_data_uri():
     return "data:image/png;base64," + base64.b64encode(png).decode()
 
 
+def verify_native_replay_contracts(client, messages):
+    verify_bedrock_stream_replay(client, messages, "generators/bedrock-unsigned")
+    for provider, alias in (
+        ("anthropic", "anthropic-known"),
+        ("bedrock", "bedrock-known"),
+        ("bedrock", "bedrock-unsigned"),
+    ):
+        model = "generators/" + alias
+        result = client.chat.completions.create(model=model, messages=messages)
+        reply = result.choices[0].message.model_dump(exclude_none=True)
+        native = reply["extra_content"][provider]["content"]
+        if alias.endswith("unsigned"):
+            assert "signature" not in native[0]["reasoningContent"]["reasoningText"]
+        text = reply["content"]
+        for parts in (
+            [{"type": "text", "text": text}],
+            [
+                {"type": "text", "text": ""},
+                {"type": "text", "text": text[:2]},
+                {"type": "text", "text": text[2:]},
+                {"type": "text", "text": ""},
+            ],
+        ):
+            multipart = {**reply, "content": parts}
+            client.chat.completions.create(
+                model=model,
+                messages=[
+                    *messages,
+                    multipart,
+                    {"role": "user", "content": "continue"},
+                ],
+            )
+        for parts in (
+            [{"type": "text", "text": text + "tampered"}],
+            [
+                {"type": "text", "text": text},
+                {
+                    "type": "image_url",
+                    "image_url": {"url": "https://hidden.invalid/image.png"},
+                },
+            ],
+        ):
+            before = len(Upstream.requests)
+            try:
+                client.chat.completions.create(
+                    model=model,
+                    messages=[
+                        *messages,
+                        {**reply, "content": parts},
+                        {"role": "user", "content": "continue"},
+                    ],
+                )
+                raise AssertionError(
+                    "multipart replay bypassed native projection validation"
+                )
+            except openai.APIStatusError as error:
+                assert error.status_code == 400, error
+            assert len(Upstream.requests) == before
+
+
+def verify_audio_admission(client):
+    output = io.BytesIO()
+    with wave.open(output, "wb") as wav:
+        wav.setnchannels(1)
+        wav.setsampwidth(2)
+        wav.setframerate(16000)
+        wav.writeframes(b"\0\0" * 160)
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "media",
+                    "mime_type": "audio/wav",
+                    "data": base64.b64encode(output.getvalue()).decode(),
+                }
+            ],
+        }
+    ]
+    for case in ("control", "image-bound", "rpm", "metered"):
+        for streaming in (False, True):
+            before = len(Upstream.requests)
+            if case == "metered":
+                try:
+                    client.chat.completions.create(
+                        model="generators/openai-audio-" + case,
+                        messages=messages,
+                        stream=streaming,
+                    )
+                    raise AssertionError(
+                        "audio was admitted to a token quota without an audio estimate"
+                    )
+                except openai.APIStatusError as error:
+                    assert (
+                        error.status_code == 400
+                        and "UnsupportedMediaTokenBudget" in str(error)
+                    ), error
+                assert len(Upstream.requests) == before
+                continue
+            result = client.chat.completions.create(
+                model="generators/openai-audio-" + case,
+                messages=messages,
+                stream=streaming,
+            )
+            if streaming:
+                with result as chunks:
+                    assert (
+                        "".join(
+                            choice.delta.content or ""
+                            for chunk in chunks
+                            for choice in chunk.choices
+                        )
+                        == "google hello"
+                    )
+            else:
+                assert result.choices[0].message.content == "google hello"
+            assert len(Upstream.requests) == before + 1
+            assert (
+                Upstream.requests[-1][1]["messages"][0]["content"][0]["type"]
+                == "input_audio"
+            )
+
+
 def verify_hosted_generation_contracts(base_url):
     with openai.OpenAI(
         api_key="unused", base_url=base_url + "/ai/v1", max_retries=0, timeout=30
     ) as client:
         messages = [{"role": "user", "content": "continue"}]
         verify_bedrock_stream_replay(client, messages)
+        verify_native_replay_contracts(client, messages)
+        verify_audio_admission(client)
         for provider in ("anthropic", "bedrock"):
             for streaming in (False, True):
                 for tool in (
@@ -2342,6 +2480,29 @@ def main() -> None:
                 }
                 config["inference_capabilities"]["generators/" + name] = {
                     "images": "supported"
+                }
+            config["generators"]["bedrock-unsigned"] = {
+                **config["generators"]["bedrock-known"],
+                "model": "unsigned",
+            }
+            config["inference_capabilities"]["generators/bedrock-unsigned"] = {
+                "tools": "supported",
+                "streaming": "supported",
+                "images": "supported",
+            }
+            for case in ("control", "image-bound", "rpm", "metered"):
+                name = "openai-audio-" + case
+                generator = {**config["generators"]["openai-known"], "model": name}
+                if case != "control":
+                    generator["max_image_input_tokens"] = 2000
+                if case == "rpm":
+                    generator["rate_limit"] = {"requests_per_minute": 600, "burst": 10}
+                elif case == "metered":
+                    generator["rate_limit"] = {"tokens_per_minute": 10000}
+                config["generators"][name] = generator
+                config["inference_capabilities"]["generators/" + name] = {
+                    "audio": "supported",
+                    "streaming": "supported",
                 }
             credentials = root / "mock-adc.json"
             credentials.write_text(

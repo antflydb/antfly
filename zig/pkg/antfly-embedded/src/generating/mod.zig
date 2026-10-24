@@ -1376,19 +1376,25 @@ pub fn validateGenerationOutputTokenBudget(cfg: GeneratorConfig, count: usize) !
 
 const MediaReservation = struct { tokens: u64 = 0, inline_bytes: usize = 0 };
 fn generationMediaReservation(cfg: GeneratorConfig, messages: []const ChatMessage) !MediaReservation {
+    const token_quota = (try provider_limits.Policy.fromConfig(cfg.rate_limit)).tokens_per_minute != 0;
     var result: MediaReservation = .{};
     for (messages) |message| if (message.content) |content| {
         if (content == .parts) for (content.parts) |part| {
             if (part == .text) continue;
+            // Image reservations never estimate audio/video tokens. Preserve
+            // ordinary media transport when no token quota needs that estimate.
+            if (part == .media and !std.mem.startsWith(u8, part.media.mime_type, "image/")) {
+                if (token_quota) return error.UnsupportedMediaTokenBudget;
+                continue;
+            }
             const bound = cfg.image_input_token_bound orelse {
-                if ((try provider_limits.Policy.fromConfig(cfg.rate_limit)).tokens_per_minute != 0) return error.UnsupportedMediaTokenBudget;
+                if (token_quota) return error.UnsupportedMediaTokenBudget;
                 continue;
             };
             result.tokens = std.math.add(u64, result.tokens, bound) catch return error.ProviderTokenBudgetExceeded;
             switch (part) {
                 .text => unreachable,
                 .media => |media| {
-                    if (!std.mem.startsWith(u8, media.mime_type, "image/")) return error.UnsupportedMediaTokenBudget;
                     if (media.url == null) result.inline_bytes += media.data.len;
                 },
                 .image_url => |image| if (std.mem.startsWith(u8, image.url, "data:")) {
@@ -1406,6 +1412,24 @@ pub fn validateGenerationMessagesTokenBudget(cfg: GeneratorConfig, messages: []c
     const policy = try provider_limits.Policy.fromConfig(cfg.rate_limit);
     if (policy.tokens_per_minute == 0) return;
     _ = try generationMediaReservation(cfg, messages);
+}
+
+test "generating backend image reservations leave unmetered audio transport intact" {
+    var cfg = GeneratorConfig{ .provider = .openai, .model = "multimodal", .url = "https://fixture", .image_input_token_bound = 2000 };
+    const audio = ChatMessage{ .role = .user, .content = .{ .parts = &.{.{ .media = .{ .mime_type = "audio/wav", .data = "cGNt" } }} } };
+    const mixed = [_]ChatMessage{ audio, .{ .role = .user, .content = .{ .parts = &.{.{ .media = .{ .mime_type = "image/png", .data = "aW1hZ2U=" } }} } } };
+    cfg.rate_limit = .{ .requests_per_minute = 60 };
+    const unmetered = try generationMediaReservation(cfg, &mixed);
+    try std.testing.expectEqual(@as(u64, 2000), unmetered.tokens);
+    try std.testing.expectEqual(@as(usize, 8), unmetered.inline_bytes);
+    cfg.rate_limit = .{ .tokens_per_minute = 10000 };
+    try std.testing.expectError(error.UnsupportedMediaTokenBudget, generationMediaReservation(cfg, &.{audio}));
+    cfg.image_input_token_bound = null;
+    try std.testing.expectError(error.UnsupportedMediaTokenBudget, generationMediaReservation(cfg, &.{audio}));
+    cfg.rate_limit = null;
+    const no_quota = try generationMediaReservation(cfg, &.{audio});
+    try std.testing.expectEqual(@as(u64, 0), no_quota.tokens);
+    try std.testing.expectEqual(@as(usize, 0), no_quota.inline_bytes);
 }
 
 test "generating backend batch preserves cancellation alongside quota policy" {

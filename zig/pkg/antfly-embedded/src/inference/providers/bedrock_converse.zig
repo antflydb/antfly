@@ -203,18 +203,13 @@ fn imagePart(a: Allocator, mime: []const u8, bytes: []const u8) !Value {
 // assistant turn. No image, document or additional tool bypasses admission.
 fn validateNativeProjection(a: Allocator, message: inference.ChatMessage, blocks: Value) !void {
     if (blocks != .array) return error.InvalidInferenceRequest;
-    const visible = if (message.content) |content| switch (content) {
-        .text => |value| value,
-        else => return error.InvalidInferenceRequest,
-    } else "";
+    var visible = try inference.TextContentCursor.init(message.content);
     const calls = message.tool_calls orelse &.{};
-    var text_offset: usize = 0;
     var call_offset: usize = 0;
     for (blocks.array.items) |block| {
         if (block != .object or block.object.count() != 1) return error.InvalidInferenceRequest;
         if (block.object.get("text")) |value| {
-            if (value != .string or !std.mem.startsWith(u8, visible[text_offset..], value.string)) return error.InvalidInferenceRequest;
-            text_offset += value.string.len;
+            if (value != .string or !visible.consume(value.string)) return error.InvalidInferenceRequest;
         } else if (block.object.get("toolUse")) |use| {
             if (call_offset >= calls.len) return error.InvalidInferenceRequest;
             const call = calls[call_offset];
@@ -229,13 +224,13 @@ fn validateNativeProjection(a: Allocator, message: inference.ChatMessage, blocks
             validateReasoning(reasoning) catch return error.InvalidInferenceRequest;
         } else return error.InvalidInferenceRequest;
     }
-    if (text_offset != visible.len or call_offset != calls.len) return error.InvalidInferenceRequest;
+    if (!visible.done() or call_offset != calls.len) return error.InvalidInferenceRequest;
 }
 fn validateReasoning(reasoning: Value) !void {
     if (reasoning != .object or reasoning.object.count() != 1) return error.InvalidBedrockResponse;
     if (reasoning.object.get("reasoningText")) |text_| {
         _ = try string(try field(text_, "text"));
-        _ = try string(try field(text_, "signature"));
+        if (text_.object.get("signature")) |signature| _ = try string(signature);
     } else if (reasoning.object.get("redactedContent")) |redacted| {
         _ = try string(redacted);
     } else return error.InvalidBedrockResponse;
@@ -331,10 +326,26 @@ pub fn testConverseWire() !void {
     try std.testing.expectEqual(@as(usize, 4), replay_parts.len);
     try std.testing.expectEqualStrings("signed", replay_parts[0].object.get("reasoningContent").?.object.get("reasoningText").?.object.get("signature").?.string);
     try std.testing.expectEqualStrings("cmVkYWN0ZWQ=", replay_parts[1].object.get("reasoningContent").?.object.get("redactedContent").?.string);
+    replay.content = .{ .parts = &.{ .{ .text = "" }, .{ .text = "Com" }, .{ .text = "pa" }, .{ .text = "red" } } };
+    const multipart = try requestJsonAlloc(a, &.{replay}, .{});
+    defer a.free(multipart);
+    replay.content = .{ .parts = &.{ .{ .text = "Compared" }, .{ .image_url = .{ .url = "https://hidden.invalid" } } } };
+    try std.testing.expectError(error.InvalidInferenceRequest, requestJsonAlloc(a, &.{replay}, .{}));
     replay.content = .{ .text = "tampered" };
     try std.testing.expectError(error.InvalidInferenceRequest, requestJsonAlloc(a, &.{replay}, .{}));
     replay.bedrock_content_json = "[{\"image\":{\"format\":\"png\"}}]";
     try std.testing.expectError(error.InvalidInferenceRequest, requestJsonAlloc(a, &.{replay}, .{}));
+    // AWS signatures are optional, and a present signature must still be a string.
+    var unsigned = try responseAlloc(a,
+        \\{"output":{"message":{"role":"assistant","content":[{"reasoningContent":{"reasoningText":{"text":"private"}}},{"text":"ok"}]}},"stopReason":"end_turn"}
+    );
+    defer unsigned.deinit();
+    const unsigned_replay = try requestJsonAlloc(a, &.{.{ .role = .assistant, .content = .{ .parts = &.{ .{ .text = "o" }, .{ .text = "k" } } }, .bedrock_content_json = unsigned.bedrock_content_json }}, .{});
+    defer a.free(unsigned_replay);
+    try std.testing.expect(std.mem.indexOf(u8, unsigned_replay, "signature") == null);
+    try std.testing.expectError(error.InvalidBedrockResponse, responseAlloc(a,
+        \\{"output":{"message":{"role":"assistant","content":[{"reasoningContent":{"reasoningText":{"text":"private","signature":7}}}]}},"stopReason":"end_turn"}
+    ));
     // Completed and streaming adapters share the same stop-reason mapping.
     const cases = .{
         .{ "max_tokens", inference.GenerationFinishReason.length },

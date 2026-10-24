@@ -125,10 +125,12 @@ override unknown model facts; they cannot implement a missing wire format or
 make a text-only model accept images. Unknown or unsupported image capabilities
 fail admission before contacting the provider.
 
-Bedrock responses retain signed reasoning blocks in
+Bedrock responses retain signed and unsigned reasoning blocks in
 `extra_content.bedrock.content`; preserve that array unchanged alongside the
 visible assistant text and tool calls. The adapter validates the visible projection
-before replay. Streaming reasoning deltas and stops retain their native event
+before replay, accepting equivalent string or multipart text without copying it.
+Signatures remain unchanged when present; Bedrock models that omit signatures
+can still return and replay reasoning. Streaming reasoning deltas and stops retain their native event
 shape in `delta.extra_content.bedrock.event`, including block indices; visible
 text and tool starts identify their native position with `content_block_index`.
 Clients assembling histories must preserve signatures and concatenate decoded
@@ -179,7 +181,10 @@ For image calls with `rate_limit.tokens_per_minute`, configure
 `max_image_input_tokens` on the generator or physical inference connection. It
 sets a conservative token reservation per image independently of base64 size;
 choose a ceiling valid for the selected model and image policy. Requests that
-cannot fit the token bucket fail before contacting a provider.
+cannot fit the token bucket fail before contacting a provider. Image token bounds
+apply only to images. Audio requests retain normal admission without a token
+quota, including with RPM-only limits; audio under a token quota requires its
+own supported token estimate and otherwise fails before contacting a provider.
 
 Generation has an explicit response ceiling independent of the pooled embedding
 client's 4 MiB default. Native stream decoders keep bounded event/frame buffers;

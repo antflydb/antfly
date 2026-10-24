@@ -324,19 +324,14 @@ pub fn requestJsonAlloc(alloc: Allocator, cfg: lib.GeneratorConfig, model: []con
 // retain signed native blocks verbatim only when it matches the public turn.
 fn validateNativeProjection(a: Allocator, message: lib.ChatMessage, blocks: Json) !void {
     if (blocks != .array) return error.InvalidInferenceRequest;
-    const visible = if (message.content) |content| switch (content) {
-        .text => |value| value,
-        else => return error.InvalidInferenceRequest,
-    } else "";
+    var visible = try lib.TextContentCursor.init(message.content);
     const calls = message.tool_calls orelse &.{};
-    var text_offset: usize = 0;
     var call_offset: usize = 0;
     for (blocks.array.items) |block| {
         const kind = string(try requestGet(block, "type")) catch return error.InvalidInferenceRequest;
         if (std.mem.eql(u8, kind, "text")) {
             const value = string(try requestGet(block, "text")) catch return error.InvalidInferenceRequest;
-            if (!std.mem.startsWith(u8, visible[text_offset..], value)) return error.InvalidInferenceRequest;
-            text_offset += value.len;
+            if (!visible.consume(value)) return error.InvalidInferenceRequest;
         } else if (std.mem.eql(u8, kind, "tool_use")) {
             if (call_offset >= calls.len) return error.InvalidInferenceRequest;
             const call = calls[call_offset];
@@ -351,7 +346,7 @@ fn validateNativeProjection(a: Allocator, message: lib.ChatMessage, blocks: Json
             _ = string(try requestGet(block, "data")) catch return error.InvalidInferenceRequest;
         } else return error.InvalidInferenceRequest;
     }
-    if (text_offset != visible.len or call_offset != calls.len) return error.InvalidInferenceRequest;
+    if (!visible.done() or call_offset != calls.len) return error.InvalidInferenceRequest;
 }
 pub fn finishReason(reason: []const u8) !lib.GenerationFinishReason {
     if (std.mem.eql(u8, reason, "end_turn") or std.mem.eql(u8, reason, "stop_sequence")) return .stop;
