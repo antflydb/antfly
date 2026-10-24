@@ -119,7 +119,8 @@ const builtin = @import("builtin");
 // Path pins retain radix-group, cursor and detached-allocation ownership.
 // Reject earlier opaque pin owners before interpreting their native headers.
 // Registry allocations retain their quota owner and physical release debt.
-pub const abi_version: u32 = 117;
+// Host quota guards retain inline manager, allocator and ancestor lifetimes.
+pub const abi_version: u32 = 118;
 
 pub const zig_compiler_id: u64 = stableId(builtin.zig_version_string);
 

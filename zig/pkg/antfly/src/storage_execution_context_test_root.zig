@@ -1,17 +1,17 @@
 // Copyright 2026 Antfly, Inc.
-// SPDX-License-Identifier: Elastic-2.0
+// SPDX-License-Identifier: Apache-2.0
 //
-// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
-// except in compliance with the Elastic License 2.0. You may obtain a copy of
-// the Elastic License 2.0 at
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-//     https://www.antfly.io/licensing/ELv2-license
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// Unless required by applicable law or agreed to in writing, software distributed
-// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
-// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
-// Elastic License 2.0 for the specific language governing permissions and
-// limitations.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 //! Analyze the actual exported storage context constructor and destructor.
 pub const antfly_sources = @import("source_owner_physical.zig");
@@ -298,4 +298,62 @@ test "shared execution storage context Raft attempt accounts live physical tasks
     try std.testing.expectEqual(@as(usize, 1), node.ptr().laneStats().raft_outbound_active_leases);
     done.set(io);
     try group.await(io);
+}
+
+test "shared execution storage context quota retains actual host allocator and process parent across busy typed destruction" {
+    const a = std.testing.allocator;
+    var root = local.storage_resource_manager.ResourceManager.init(.{ .identity_allocator = a, .memory_budget = .{ .hard_limit_bytes = 16 << 20 } });
+    defer root.deinit(a);
+    var node = try background.BackendRuntimeHandle.init(a, .{ .backend = .manual, .borrowed_io = .{ .general = std.testing.io }, .memory_parent = root.memoryParentPort() });
+    defer node.deinit();
+    var allocator = a;
+    const before = root.snapshot().memory.used_bytes;
+    var context: @import("storage/kernel_owner_client.zig").Context = .{};
+    defer context.deinit();
+    try context.ensureWithBackendRuntime(node.ptr(), .{ .allocator = services.memory.Allocator.fromStd(&allocator), .memory_limit_bytes = 8 << 20 });
+    const original_handle = context.handle;
+    const actual = provider.asStorageOwnerContext(context.handle).?;
+    const backend = local.storage_lsm_backend_mod;
+    var close: backend.PinQuota.Close = .{};
+    defer close.deinitJoined();
+    var creator = try actual.resources.beginPinQuotaCreation(&close);
+    defer creator.deinitJoined();
+    const Control = struct {
+        fn check(_: *anyopaque) !void {}
+        fn wait(_: *anyopaque) !void {
+            return error.ParentMemoryBusy;
+        }
+    };
+    var tag: u8 = 0;
+    const payload: local.common_read_admission.Payload = .{ .ptr = &tag, .vtable = &.{ .checkpoint = Control.check, .check_lifetime = Control.check, .wait_for_progress = Control.wait } };
+    const control = local.common_read_admission.Port.init(&payload);
+    try creator.resumeWithAdmission(control);
+    const owner = try creator.takeWithAdmission(control);
+    var operation = backend.Backend.prepareRunSnapshotRefOperation("host-context-quota-file", .retain);
+    defer operation.deinit();
+    try operation.resumeFundedWithAdmission(owner, control);
+    try operation.publishFundedWithAdmission(control);
+    const pin = try operation.takePinWithAdmission(control);
+    var pin_live = true;
+    defer if (pin_live) pin.release();
+    try operation.retireWithAdmission(control);
+    const held = root.snapshot().memory.used_bytes;
+    try std.testing.expectError(error.StorageBusy, context.tryDeinit());
+    try std.testing.expectEqual(original_handle, context.handle);
+    try std.testing.expectEqual(held, root.snapshot().memory.used_bytes);
+    try std.testing.expectError(error.ParentMemoryBusy, close.resumeWithAdmission(control));
+    pin.release();
+    pin_live = false;
+    var forget = backend.Backend.prepareRunSnapshotRefOperation("host-context-quota-file", .forget);
+    defer forget.deinit();
+    _ = try forget.planWithAdmission(control);
+    try forget.resumeWithAdmission(control);
+    try forget.publishWithAdmission(control);
+    try forget.retireWithAdmission(control);
+    try close.resumeWithAdmission(control);
+    try std.testing.expectError(error.StorageBusy, context.tryDeinit());
+    close.deinitJoined();
+    try context.tryDeinit();
+    try std.testing.expect(context.handle == null);
+    try std.testing.expectEqual(before, root.snapshot().memory.used_bytes);
 }

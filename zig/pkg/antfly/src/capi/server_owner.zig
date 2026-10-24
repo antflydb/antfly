@@ -173,15 +173,18 @@ pub const StorageOwnerContext = struct {
     auth_casbin_store: ?antfly.storage_backend_erased.Store = null,
     mutex: std.atomic.Mutex = .unlocked,
     active_owners: usize = 0,
+    closing: bool = false,
 
     pub fn lock(self: *StorageOwnerContext) void {
         antfly.platform_sync.lockYielding(&self.mutex);
     }
 
-    pub fn acquire(self: *StorageOwnerContext) void {
+    pub fn acquire(self: *StorageOwnerContext) bool {
         self.lock();
         defer self.mutex.unlock();
+        if (self.closing or self.active_owners == std.math.maxInt(usize)) return false;
         self.active_owners += 1;
+        return true;
     }
 
     pub fn release(self: *StorageOwnerContext) void {
@@ -202,10 +205,11 @@ pub const StorageOwnerContext = struct {
 
     pub fn deinitIfIdle(self: *StorageOwnerContext) bool {
         self.lock();
-        if (self.active_owners != 0) {
+        if (self.closing or self.active_owners != 0 or !self.resources.tryBeginDeinit()) {
             self.mutex.unlock();
             return false;
         }
+        self.closing = true;
         self.mutex.unlock();
         if (self.inference_lifetime) |*lifetime| lifetime.quiesce();
         if (self.auth_casbin_store) |*store| store.deinit();
@@ -896,7 +900,7 @@ pub fn storageContextAttachInferenceProvider(
     const handle = inference_handle orelse return .invalid_argument;
     owner_context.lock();
     defer owner_context.mutex.unlock();
-    if (owner_context.active_owners != 0) return .busy;
+    if (owner_context.closing or owner_context.active_owners != 0) return .busy;
     if (owner_context.inference_lifetime) |*lifetime| lifetime.quiesce();
     owner_context.inference_lifetime = .{ .handle = handle };
     return .ok;
@@ -907,7 +911,7 @@ pub fn storageOwnerContextConfigureSecrets(context: ?*anyopaque, store: ?*anyopa
     const owner_context = asStorageOwnerContext(context) orelse return .invalid_argument;
     owner_context.lock();
     defer owner_context.mutex.unlock();
-    if (owner_context.active_owners != 0) return .busy;
+    if (owner_context.closing or owner_context.active_owners != 0) return .busy;
     owner_context.secret_store = if (store) |ptr| @ptrCast(@alignCast(ptr)) else null;
     return .ok;
 }
@@ -916,7 +920,7 @@ pub fn storageOwnerContextConfigureNativeQueries(context: ?*anyopaque, setup: ke
     const owner = asStorageOwnerContext(context) orelse return .invalid_argument;
     owner.lock();
     defer owner.mutex.unlock();
-    if (owner.active_owners != 0) return .busy;
+    if (owner.closing or owner.active_owners != 0) return .busy;
     const Repository = @import("../api/native_query_repository.zig").Repository;
     const next = owner.alloc.create(Repository) catch |err| return storageOwnerStatusFromError(err);
     next.* = Repository.initFromSetup(owner.alloc, setup.slice(), owner.secret_store) catch |err| {
@@ -942,7 +946,7 @@ pub fn storageOwnerContextConfigureRemoteContentSource(
     if (source.version != 1 or source._reserved != 0) return .invalid_argument;
     owner.lock();
     defer owner.mutex.unlock();
-    if (owner.active_owners != 0) return .busy;
+    if (owner.closing or owner.active_owners != 0) return .busy;
     if (owner.remote_content_security) |*previous| previous.deinit();
     owner.remote_content_security = null;
     owner.remote_content.security = .{ .allowed_hosts = &.{}, .allowed_paths = &.{} };
@@ -1008,7 +1012,7 @@ pub fn storageOwnerContextConfigureRemoteContentSecurity(
         }) catch return .invalid_argument;
 
     owner_context.lock();
-    if (owner_context.active_owners != 0) {
+    if (owner_context.closing or owner_context.active_owners != 0) {
         owner_context.mutex.unlock();
         if (parsed) |*value| value.deinit();
         return .busy;
@@ -1124,6 +1128,9 @@ pub fn storageContextSystemStoreOpen(
     const context = asStorageOwnerContext(context_ptr) orelse return .invalid_argument;
     const namespace = request.namespace.slice();
     if (namespace.len == 0) return .invalid_argument;
+    if (!context.acquire()) return .busy;
+    var transferred = false;
+    defer if (!transferred) context.release();
     const store = if (std.mem.eql(u8, namespace, "system/auth-users"))
         if (context.auth_users_store) |*value| value else return .invalid_argument
     else if (std.mem.eql(u8, namespace, "system/auth-casbin"))
@@ -1134,8 +1141,8 @@ pub fn storageContextSystemStoreOpen(
             return storageOwnerStatusFromError(err);
     };
     const handle = context.alloc.create(SystemStoreHandle) catch return .out_of_memory;
-    context.acquire();
     handle.* = .{ .store = store, .context = context };
+    transferred = true;
     out_store.* = handle;
     return .ok;
 }
@@ -1541,7 +1548,7 @@ pub fn metadataApplyStoreOpen(
     if (root_dir.len == 0) return .invalid_argument;
     const alloc = std.heap.c_allocator;
     const context = asStorageOwnerContext(request.context);
-    if (context) |value| value.acquire();
+    if (context) |value| if (!value.acquire()) return .busy;
     var context_borrowed = context != null;
     defer if (context_borrowed) context.?.release();
     var store = metadata_raft_apply.RaftApplyStore.init(alloc, .{
@@ -2528,7 +2535,7 @@ pub fn metadataReconcileReplicaRoot(
     const replica_root_dir = request.replica_root_dir.slice();
     if (replica_root_dir.len == 0 or request.request_json.len == 0) return .invalid_argument;
     const context = if (request.context) |_| asStorageOwnerContext(request.context) orelse return .invalid_argument else null;
-    if (context) |value| value.acquire();
+    if (context) |value| if (!value.acquire()) return .busy;
     defer if (context) |value| value.release();
 
     const Payload = struct {
@@ -2581,7 +2588,7 @@ pub fn dataApplyStoreOpen(
     if (root_dir.len == 0) return .invalid_argument;
     const alloc = std.heap.c_allocator;
     const context = asStorageOwnerContext(request.context);
-    if (context) |value| value.acquire();
+    if (context) |value| if (!value.acquire()) return .busy;
     var context_borrowed = context != null;
     defer if (context_borrowed) context.?.release();
     var store = data_raft_apply.RaftApplyStore.init(alloc, .{
@@ -3433,6 +3440,9 @@ pub fn storageOwnerOpen(
     else
         null;
     const owner_context = asStorageOwnerContext(request.context);
+    if (owner_context) |context| if (!context.acquire()) return .busy;
+    var context_borrowed = owner_context != null;
+    defer if (context_borrowed) owner_context.?.release();
     const alloc = if (owner_context) |context| context.alloc else std.heap.c_allocator;
     // A metadata restore intent can become visible before Raft bootstrap has
     // imported this replica. Do not create an empty DB and retain its reader
@@ -3514,9 +3524,6 @@ pub fn storageOwnerOpen(
         runtime_hooks.?.* = .{ .config = runtime_hooks_config, .group_id = request.group_id };
     }
     defer if (!success) if (runtime_hooks) |value| alloc.destroy(value);
-    if (owner_context) |context| context.acquire();
-    var context_borrowed = owner_context != null;
-    defer if (context_borrowed) owner_context.?.release();
     const prepared_schema = local_write.prepareOwnerSchemaBeforeIndexLoad(alloc, request.schema_json.slice()) catch |err| return storageOwnerStatusFromError(err);
     defer local_write.freeOwnerSchemaBeforeIndexLoad(alloc, prepared_schema);
     if (request.restore_cancel_recovery > 1 or request.restore_ha_replay > 1 or

@@ -27165,3 +27165,75 @@ Apache header pass. Source snapshots include both design documents. Process/host
 binding, allocator/close registration in the complete retirement graph, funded
 payload assembly, coupled publication and full default qualification remain
 required; the full design is incomplete and full GNU qualification remains waived.
+
+
+### Hosted quota lifetime binding
+
+`PhysicalStorageResources.beginPinQuotaCreation` now produces a supported quota
+construction cursor for the actual inline host manager. Its `HostLifetime`
+retains the enclosing physical host, whose existing obligation includes the
+allocator callback bridge and borrowed ancestor. Parents are installed before
+publication, as required by `ResourceManager.installMemoryParent`; callers hold
+a valid host handle while acquiring a lease. A manager/parent mismatch rejects
+construction without consuming the offered lifetime. The shared-manager entry
+remains available; no inline manager is treated as independently heap-owned.
+
+The host installs its stable address at cache attachment. Acquisition before
+that bind is rejected; moving an already bound host is invalid. A zero-count
+atomic transition fences destruction against quota acquisition without an
+allocator, manager lock or blocking callback. Contention returns busy to the
+caller. Joined release drops only the acquired host reference and never reads
+the receiver after its final decrement.
+
+The actual storage context checks this gate before changing caches, executors,
+allocator bridges or execution-service guards. A retained quota returns busy
+with the host untouched. Successful destruction also fences later context
+owner acquisitions and configuration changes. System-store opens acquire their
+context before touching a context-owned store; ordinary owner opens retain it
+before restore I/O or allocator use, and release it after local rollback work.
+The typed `Context.tryDeinit` preserves its exact handle on refusal. It remains
+a joined operation when idle, including the existing physical executor/cache
+joins; this is not a new admitted nonblocking destruction API. The existing
+void `deinit` now fails consistently on an outstanding physical owner rather
+than discarding the handle in builds where debug assertions are absent.
+
+Quota close keeps the host reference after the header's physical destruction
+until explicit joined lifetime release. It detaches every lifetime field before
+calling release callbacks: the last host release may destroy the containing
+retirement frame. An actual provider/client test creates a funded global file
+pin through the host factory, verifies busy typed destruction leaves the handle
+and process charge intact, retires the pin, and verifies the context still
+refuses destruction until joined quota release returns the allocator/ancestor
+edge. Additional tests cover foreign manager/parent refusal, all quota
+construction allocations failing after cache birth, teardown with that allocator
+still exhausted, the close/acquire race, and release of a containing frame.
+
+Private native ABI 118 and kernel-owner ABI 178 fence the new host/quota/context
+contracts. Public C layouts and durable wire formats remain unchanged. This
+host binding does not register the complete controller retirement graph or
+install quota funding in every normal publication path. Registered input,
+construction and close frames, funded payload assembly, coupled backend
+publication, relief integration and broad default qualification remain required.
+The full design remains incomplete; full GNU qualification remains waived.
+
+
+Hosted quota qualification (`hosted-pin-quota-v3`) passes the actual physical
+metadata and storage-context suites in Debug. Boundary qualification covers
+all 127 physical-sync cases, owner-close preflight, runtime ABI and actual
+storage-parent ingress analysis. ReleaseFast repeats the metadata/context,
+physical-sync and ABI checks. Every receipt passes all five native commands,
+including four Bloom and 45/1/8 original-error companions, with no test skips,
+failures or leaks. The verification record preserves exact result counts and
+step summaries for each root, including cached source-identical executions.
+
+All 5,633 recorded native/schema input hashes and log digests match the
+qualified source. After those runs completed, the repository license tool
+normalized the two pre-existing test-root notices to their configured Apache
+headers. Immutable pre-normalization sources, header-only diffs and identical
+non-header body hashes preserve that qualification boundary. No production
+code or test body changed after qualification; all other native input hashes
+remain exact. Final source snapshots include the normalized notices and both
+design documents. Formatting, whitespace and license checks pass. This supplies
+a verified host lifetime edge, while normal publication/retirement registration,
+funded assembly, coupled commit, relief and broader defaults remain open. Full
+GNU qualification remains waived; the full design is incomplete.

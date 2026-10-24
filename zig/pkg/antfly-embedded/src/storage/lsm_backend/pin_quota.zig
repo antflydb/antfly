@@ -32,6 +32,17 @@ pub const ParentLifetime = struct {
     release_joined: *const fn (*anyopaque) void,
 };
 
+/// Already acquired host retention. The host keeps the exact manager, allocator
+/// callbacks and borrowed ancestor context alive until release_joined. Init
+/// transfers this capability only on success; the producer fences destruction
+/// against acquisition and retains its parent obligation through final release.
+pub const HostLifetime = struct {
+    manager: *resources.ResourceManager,
+    parent: ?resources.ResourceManager.MemoryParent,
+    context: *anyopaque,
+    release_joined: *const fn (*anyopaque) void,
+};
+
 pub const Owner = struct {
     allocator: std.mem.Allocator,
     manager: *resources.ResourceManager,
@@ -144,6 +155,18 @@ pub const Creation = struct {
         retirement.* = .{ .manager = manager, .lifetime = lifetime, .parent_lifetime = parent };
         return .{ .allocator = allocator, .manager = manager, .retirement = retirement };
     }
+    /// Bind an inline host manager without pretending it is independently
+    /// heap-owned. The caller has already acquired its complete host lifetime.
+    pub fn initHosted(allocator: std.mem.Allocator, manager: *resources.ResourceManager, retirement: *Close, host: HostLifetime) !@This() {
+        if (retirement.manager != null) return error.InvalidArgument;
+        if (host.manager != manager) return error.ResourceAccountingMismatch;
+        if (manager.memory_parent) |port| {
+            const parent = host.parent orelse return error.ExecutionWaitUnsupported;
+            if (!parent.valid() or parent.ptr != port.ptr or parent.reserve_fn != port.reserve_fn) return error.InvalidMemoryParent;
+        } else if (host.parent != null) return error.InvalidMemoryParent;
+        retirement.* = .{ .manager = manager, .host_lifetime = host };
+        return .{ .allocator = allocator, .manager = manager, .retirement = retirement };
+    }
     pub fn resumeWithAdmission(self: *@This(), original: admission.Port) !void {
         try original.checkpoint();
         if (self.taken or self.retiring or self.retired) return error.InvalidArgument;
@@ -210,6 +233,7 @@ pub const Close = struct {
     manager: ?*resources.ResourceManager = null,
     lifetime: ?*resources.SharedResourceManager = null,
     parent_lifetime: ?ParentLifetime = null,
+    host_lifetime: ?HostLifetime = null,
     usage: u64 = 0,
     debt: u64 = 0,
     activated: bool = false,
@@ -276,15 +300,23 @@ pub const Close = struct {
                 unreachable;
             };
         }
-        releaseLifetimes(&self.lifetime, &self.parent_lifetime);
+        releaseLifetimes(&self.lifetime, &self.parent_lifetime, &self.host_lifetime);
     }
 };
-fn releaseLifetimes(lifetime: *?*resources.SharedResourceManager, parent: *?ParentLifetime) void {
-    if (lifetime.*) |owned| owned.release();
+fn releaseLifetimes(lifetime: *?*resources.SharedResourceManager, parent: *?ParentLifetime, host: *?HostLifetime) void {
+    // Detach before releasing: the final host reference may permit destruction
+    // of the containing retirement frame on another thread.
+    const shared = lifetime.*;
+    const ancestor = parent.*;
+    const hosted = host.*;
     lifetime.* = null;
-    if (parent.*) |owned| owned.release_joined(owned.context);
     parent.* = null;
+    host.* = null;
+    if (shared) |owned| owned.release();
+    if (ancestor) |owned| owned.release_joined(owned.context);
+    if (hosted) |owned| owned.release_joined(owned.context);
 }
+
 var joined_tag: u8 = 0;
 fn joinedCheck(_: *anyopaque) !void {}
 fn joinedWait(_: *anyopaque) !void {

@@ -74,10 +74,14 @@ pub const Context = struct {
         self.handle = handle orelse return error.StorageKernelFailure;
     }
 
-    pub fn deinit(self: *Context) void {
-        const status = abi.antfly_storage_context_destroy(self.handle);
-        std.debug.assert(status == .ok);
+    /// Joined destruction. A busy physical owner keeps its exact handle for
+    /// retry; an idle owner performs the existing executor/cache joins.
+    pub fn tryDeinit(self: *Context) !void {
+        try statusToError(abi.antfly_storage_context_destroy(self.handle));
         self.* = .{};
+    }
+    pub fn deinit(self: *Context) void {
+        self.tryDeinit() catch @panic("storage context still retained");
     }
 
     pub fn attachInferenceProvider(self: *Context, inference_handle: *anyopaque) !void {

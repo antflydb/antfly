@@ -1,17 +1,17 @@
 // Copyright 2026 Antfly, Inc.
-// SPDX-License-Identifier: Elastic-2.0
+// SPDX-License-Identifier: Apache-2.0
 //
-// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
-// except in compliance with the Elastic License 2.0. You may obtain a copy of
-// the Elastic License 2.0 at
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-//     https://www.antfly.io/licensing/ELv2-license
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// Unless required by applicable law or agreed to in writing, software distributed
-// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
-// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
-// Elastic License 2.0 for the specific language governing permissions and
-// limitations.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 const std = @import("std");
 const Resources = @import("storage/physical_resources.zig").PhysicalStorageResources;
@@ -335,4 +335,196 @@ test "physical cache metadata process totals include host siblings once and reta
     try std.testing.expectEqual(@as(u64, 4096), reported.memory.peak_bytes);
     try std.testing.expectEqual(@as(u64, 1 << 20), reported.memory.hard_limit_bytes);
     try std.testing.expectEqualDeep(before.slices, reported.slices);
+}
+
+const PinQuota = @import("antfly_local_sources").storage_lsm_backend_mod.PinQuota;
+const read_admission = @import("antfly_local_sources").common_read_admission;
+var quota_test_tag: u8 = 0;
+fn quotaCheck(_: *anyopaque) !void {}
+fn quotaWait(_: *anyopaque) !void {
+    return error.ParentMemoryBusy;
+}
+fn quotaControl() read_admission.Port {
+    const Holder = struct {
+        const payload: read_admission.Payload = .{ .ptr = &quota_test_tag, .vtable = &.{ .checkpoint = quotaCheck, .check_lifetime = quotaCheck, .wait_for_progress = quotaWait } };
+    };
+    return .init(&Holder.payload);
+}
+
+test "physical cache metadata hosted quota keeps manager allocator and parent alive until joined release" {
+    const a = std.testing.allocator;
+    var root = ResourceManager.init(.{ .identity_allocator = a, .memory_budget = .{ .hard_limit_bytes = 64 << 20 } });
+    defer root.deinit(a);
+    var resources = try Resources.initWithBudgetsAndParent(a, budgets_mod.smartResourceBudgetsForTotal(64 << 20), root.memoryParentPort());
+    defer resources.deinit();
+    var close: PinQuota.Close = .{};
+    defer close.deinitJoined();
+    try std.testing.expectError(error.InvalidArgument, resources.beginPinQuotaCreation(&close));
+    resources.attachResourceManager();
+    var creator = try resources.beginPinQuotaCreation(&close);
+    defer creator.deinitJoined();
+    try std.testing.expect(!resources.tryBeginDeinit());
+    try creator.resumeWithAdmission(quotaControl());
+    const owner = try creator.takeWithAdmission(quotaControl());
+    _ = try owner.acquireWithAdmission(quotaControl());
+    try std.testing.expectError(error.ParentMemoryBusy, close.resumeWithAdmission(quotaControl()));
+    try std.testing.expectError(error.BackendRuntimeShuttingDown, owner.acquireWithAdmission(quotaControl()));
+    try std.testing.expect(!resources.tryBeginDeinit());
+    owner.releaseBorrow();
+    try close.resumeWithAdmission(quotaControl());
+    try std.testing.expectEqual(@as(u64, 0), resources.resource_manager.sliceStats(.lsm_registry_metadata).used_bytes);
+    // Physical destruction does not discard the enclosing allocator/ancestor.
+    try std.testing.expect(!resources.tryBeginDeinit());
+    close.deinitJoined();
+    close.deinitJoined();
+    try std.testing.expect(resources.tryBeginDeinit());
+    try std.testing.expectError(error.BackendRuntimeShuttingDown, resources.beginPinQuotaCreation(&close));
+}
+
+test "physical cache metadata hosted quota rejects foreign manager and parent without consuming its lifetime" {
+    const a = std.testing.allocator;
+    var resources = try Resources.initFallible(a);
+    defer resources.deinit();
+    resources.attachResourceManager();
+    const lifetime = try resources.retainPinQuotaLifetime();
+    var wrong = lifetime;
+    var other = ResourceManager.init(.{ .identity_allocator = a });
+    defer other.deinit(a);
+    var close: PinQuota.Close = .{};
+    wrong.manager = &other;
+    try std.testing.expectError(error.ResourceAccountingMismatch, PinQuota.Creation.initHosted(a, &resources.resource_manager, &close, wrong));
+    wrong = lifetime;
+    wrong.parent = other.memoryParentPort();
+    try std.testing.expectError(error.InvalidMemoryParent, PinQuota.Creation.initHosted(a, &resources.resource_manager, &close, wrong));
+    try std.testing.expect(close.manager == null);
+    try std.testing.expect(!resources.tryBeginDeinit());
+    lifetime.release_joined(lifetime.context);
+    try std.testing.expect(resources.tryBeginDeinit());
+}
+
+test "physical cache metadata hosted quota constructor OOM returns host and every ancestor charge" {
+    const Fixture = struct {
+        fn run(at: ?usize) !usize {
+            const a = std.testing.allocator;
+            var parent = ResourceManager.init(.{ .identity_allocator = a, .memory_budget = .{ .hard_limit_bytes = 64 << 20 } });
+            defer parent.deinit(a);
+            var backing = std.testing.FailingAllocator.init(a, .{});
+            var budgets = budgets_mod.smartResourceBudgetsForTotal(64 << 20);
+            budgets.options.identity_allocator = backing.allocator();
+            var resources = try Resources.initWithBudgetsAndParent(backing.allocator(), budgets, parent.memoryParentPort());
+            var resources_live = true;
+            defer if (resources_live) resources.deinit();
+            resources.attachResourceManager();
+            // Cache/reclaimer birth has separate failure coverage. Exhaust
+            // quota header/observer allocation with the actual host bound.
+            const begin = backing.alloc_index;
+            if (at) |index| backing.fail_index = begin + index;
+            var close: PinQuota.Close = .{};
+            defer close.deinitJoined();
+            var creator = try resources.beginPinQuotaCreation(&close);
+            defer creator.deinitJoined();
+            const result: anyerror!void = blk: {
+                creator.resumeWithAdmission(quotaControl()) catch |cause| break :blk cause;
+                _ = creator.takeWithAdmission(quotaControl()) catch |cause| break :blk cause;
+                break :blk close.resumeWithAdmission(quotaControl());
+            };
+            const allocations = backing.alloc_index - begin;
+            // Teardown runs while the failed allocator remains exhausted.
+            creator.deinitJoined();
+            close.deinitJoined();
+            try std.testing.expect(resources.tryBeginDeinit());
+            if (at != null) {
+                try std.testing.expect(backing.has_induced_failure);
+                try std.testing.expectError(error.OutOfMemory, result);
+            } else try result;
+            backing.fail_index = std.math.maxInt(usize);
+            resources.deinit();
+            resources_live = false;
+            try std.testing.expectEqual(@as(u64, 0), parent.snapshot().memory.used_bytes);
+            return allocations;
+        }
+    };
+    const allocations = try Fixture.run(null);
+    try std.testing.expect(allocations > 0);
+    for (0..allocations) |at| _ = try Fixture.run(at);
+}
+
+test "physical cache metadata host lifetime acquisition and destruction have one atomic winner" {
+    const Worker = struct {
+        resources: *Resources,
+        start: std.atomic.Value(bool) = .init(false),
+        done: std.atomic.Value(bool) = .init(false),
+        stop: std.atomic.Value(bool) = .init(false),
+        held: ?PinQuota.HostLifetime = null,
+        failure: ?anyerror = null,
+        fn run(self: *@This()) void {
+            while (!self.start.load(.acquire)) std.Thread.yield() catch {};
+            self.held = self.resources.retainPinQuotaLifetime() catch |cause| blk: {
+                self.failure = cause;
+                break :blk null;
+            };
+            self.done.store(true, .release);
+            while (!self.stop.load(.acquire)) std.Thread.yield() catch {};
+            if (self.held) |held| held.release_joined(held.context);
+        }
+    };
+    for (0..24) |_| {
+        var resources = try Resources.initFallible(std.testing.allocator);
+        defer resources.deinit();
+        resources.attachResourceManager();
+        var worker: Worker = .{ .resources = &resources };
+        const thread = try std.Thread.spawn(.{}, Worker.run, .{&worker});
+        var joined = false;
+        defer if (!joined) {
+            worker.stop.store(true, .release);
+            thread.join();
+        };
+        worker.start.store(true, .release);
+        const closed = resources.tryBeginDeinit();
+        while (!worker.done.load(.acquire)) std.Thread.yield() catch {};
+        if (closed) {
+            try std.testing.expect(worker.held == null);
+            const failure = worker.failure orelse return error.TestUnexpectedResult;
+            try std.testing.expect(failure == error.BackendRuntimeShuttingDown or failure == error.ParentMemoryBusy);
+        } else {
+            try std.testing.expect(worker.held != null);
+            try std.testing.expect(!resources.tryBeginDeinit());
+        }
+        worker.stop.store(true, .release);
+        thread.join();
+        joined = true;
+        if (!closed) try std.testing.expect(resources.tryBeginDeinit());
+    }
+}
+
+test "physical cache metadata final hosted release may destroy its containing retirement frame" {
+    const Frame = struct {
+        manager: ResourceManager,
+        close: PinQuota.Close = .{},
+        destroyed: *bool,
+        fn release(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            std.debug.assert(self.close.host_lifetime == null and self.close.lifetime == null and self.close.parent_lifetime == null);
+            std.debug.assert(self.close.complete and self.close.usage == 0);
+            self.manager.deinit(std.testing.allocator);
+            self.destroyed.* = true;
+            std.testing.allocator.destroy(self);
+        }
+    };
+    const a = std.testing.allocator;
+    var destroyed = false;
+    const frame = try a.create(Frame);
+    frame.* = .{ .manager = ResourceManager.init(.{ .identity_allocator = a }), .destroyed = &destroyed };
+    var creator = PinQuota.Creation.initHosted(a, &frame.manager, &frame.close, .{ .manager = &frame.manager, .parent = null, .context = frame, .release_joined = Frame.release }) catch |cause| {
+        frame.manager.deinit(a);
+        a.destroy(frame);
+        return cause;
+    };
+    defer creator.deinitJoined();
+    try creator.resumeWithAdmission(quotaControl());
+    _ = try creator.takeWithAdmission(quotaControl());
+    try frame.close.resumeWithAdmission(quotaControl());
+    try std.testing.expect(!destroyed);
+    frame.close.deinitJoined();
+    try std.testing.expect(destroyed);
 }
