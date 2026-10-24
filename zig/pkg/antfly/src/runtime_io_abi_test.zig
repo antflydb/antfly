@@ -235,3 +235,50 @@ test "executor archive boundary composes inference checkpoints in both error dom
         try std.testing.expectEqual(@as(usize, 2), combined.calls);
     }
 }
+
+const RemoteConfig = @import("antfly_scraping").RemoteContentConfig;
+extern fn runtime_io_abi_test_remote_snapshot(output: *RemoteConfig.RemoteContentRuntime, failure: u8) callconv(.c) void;
+test "executor archive boundary remote snapshot failures retain stable identities" {
+    var runtime: RemoteConfig.RemoteContentRuntime = undefined;
+    runtime_io_abi_test_remote_snapshot(&runtime, 0);
+    var snapshot = try runtime.acquire();
+    snapshot.deinit();
+    for ([_]anyerror{ error.OutOfMemory, error.Timeout, error.Canceled, error.ResourceTemporarilyUnavailable }, 1..) |expected, code| {
+        runtime_io_abi_test_remote_snapshot(&runtime, @intCast(code));
+        try std.testing.expectError(expected, runtime.acquire());
+    }
+}
+
+extern fn runtime_io_abi_test_remote_fetch(borrow: *const bridge.Borrow, url: [*]const u8, url_len: usize) callconv(.c) @import("antfly_runtime_abi").error_abi.Status;
+test "executor archive boundary remote PDF connection refusal retains its error identity" {
+    const io = std.testing.io;
+    var listener = try (try std.Io.net.IpAddress.parse("127.0.0.1", 0)).listen(io, .{});
+    const url = try std.fmt.allocPrint(std.testing.allocator, "http://{f}/sources/unreachable.pdf", .{listener.socket.address});
+    defer std.testing.allocator.free(url);
+    listener.deinit(io);
+    const borrow = bridge.Borrow.init(&io);
+    const result = runtime_io_abi_test_remote_fetch(&borrow, url.ptr, url.len);
+    try std.testing.expect(!result.isOk());
+    try std.testing.expectEqual(error.ConnectionRefused, @import("antfly_runtime_abi").error_abi.errorFromStatus(result));
+}
+
+extern fn runtime_io_abi_test_threaded_create(output: *?*std.Io.Threaded, output_table: *?*std.Io.VTable) callconv(.c) @import("antfly_runtime_abi").error_abi.Status;
+extern fn runtime_io_abi_test_threaded_destroy(runtime: *std.Io.Threaded, table: *std.Io.VTable) callconv(.c) void;
+test "executor archive boundary outbound view uses the calling archive error domain" {
+    var runtime: ?*std.Io.Threaded = null;
+    var table: ?*std.Io.VTable = null;
+    const status = runtime_io_abi_test_threaded_create(&runtime, &table);
+    if (!status.isOk()) return @import("antfly_runtime_abi").error_abi.errorFromStatus(status);
+    defer runtime_io_abi_test_threaded_destroy(runtime.?, table.?);
+    const io = @import("antfly_local_sources").common_threaded_connect_io.io(runtime.?);
+    try std.testing.expect(io.vtable != table.?);
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().openFile(io, "/antfly-network-domain-test-missing-file", .{}));
+    var listener = try (try std.Io.net.IpAddress.parse("127.0.0.1", 0)).listen(std.testing.io, .{});
+    const url = try std.fmt.allocPrint(std.testing.allocator, "http://{f}/unreachable.pdf", .{listener.socket.address});
+    defer std.testing.allocator.free(url);
+    listener.deinit(std.testing.io);
+    const scraping = @import("antfly_scraping");
+    var hosts = [_][]u8{@constCast("127.0.0.1")};
+    const security: scraping.ContentSecurityConfig = .{ .block_private_ips = false, .allowed_hosts = &hosts, .max_download_size_bytes = 1024 };
+    try std.testing.expectError(error.ConnectionRefused, scraping.downloadContentOutcomeAllocWithHeadersAndContext(std.testing.allocator, .{ .io = io, .timeout_ms = 1000 }, url, &security, null, null));
+}

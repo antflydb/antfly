@@ -1153,7 +1153,8 @@ fn validLsmCheckpointArtifactPath(path: []const u8) bool {
 }
 
 fn isGeneratedArtifact(path: []const u8) bool {
-    return std.mem.startsWith(u8, path, indexes_directory_name ++ "/") or
+    return std.mem.startsWith(u8, path, "source-vectors/") or
+        std.mem.startsWith(u8, path, indexes_directory_name ++ "/") or
         std.mem.startsWith(u8, path, primary_lsm_directory_name ++ "/") or
         std.mem.eql(u8, path, applied_checkpoint_file_name) or
         std.mem.eql(u8, path, repair_checkpoint_file_name);
@@ -1251,6 +1252,7 @@ fn artifactInstallPath(snapshot_path: []const u8, role: ArtifactRole) ![]const u
 fn artifactOwnership(path: []const u8, projections: []const Projection) !ArtifactOwnership {
     if (std.mem.eql(u8, path, "store.bin") or
         std.mem.eql(u8, path, "change-journal.bin") or
+        std.mem.startsWith(u8, path, "source-vectors/") or
         std.mem.startsWith(u8, path, primary_lsm_directory_name ++ "/"))
     {
         return .{ .role = .primary };

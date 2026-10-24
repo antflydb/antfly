@@ -1185,6 +1185,7 @@ fn discoveryResponseError(response: httpx.Response) anyerror {
 }
 
 fn discoveryStatusError(status: u16, capability_stale: bool) anyerror {
+    if (status == 401 or status == 403) return error.InferenceEndpointAccessDenied;
     if (status == 409 and capability_stale) return error.InferenceCapabilitiesStale;
     if (status == 404 or status == 405 or status == 501)
         return error.RemoteCapabilityDiscoveryUnsupported;

@@ -58,6 +58,28 @@ def test_entity_curation_namespace_wait_and_resolver_routes(stateful_api):
     }
     for source in sources:
         api.create_table(source, indexes={"knowledge": graph})
+    # Generated query adapters must reach the shared pagination/filter parser
+    # through both table aliases, without changing resolver policy revisions.
+    proposals = f"/tables/{destination}/curation/proposals"
+    proposed = {
+        api.post(proposals, {"action": "suppress", "key": key})["id"]
+        for key in ("concept/proposed-one", "concept/proposed-two")
+    }
+    for path in (proposals, f"/databases/default/namespaces/public{proposals}"):
+        query = "?state=open&action=suppress&limit=1"
+        first = api.get(path + query)
+        assert len(first["proposals"]) == 1, first
+        assert first.get("next_cursor"), first
+        second = api.get(path + query + "&cursor=" + first["next_cursor"])
+        assert len(second["proposals"]) == 1, second
+        assert not second.get("next_cursor"), second
+        assert {first["proposals"][0]["id"], second["proposals"][0]["id"]} == proposed
+        assert api.get(path + "?state=rejected&limit=1")["proposals"] == []
+        assert api.get(path + "?state=open&action=merge&limit=1")["proposals"] == []
+    # Main also checks a single open proposal later in this flow. Close these
+    # pagination fixtures so both checks own their expected proposal set.
+    for proposal_id in proposed:
+        api.post(f"{proposals}/{proposal_id}:reject", {})
     key = quote("concept/alpha", safe="")
     entity = f"/tables/{destination}/entities/{key}"
     wait = {"timeout_ms": 5000}
@@ -565,31 +587,48 @@ def test_runtime_entity_curation_preserves_future_promotion(
         assert bare.status_code == 422, bare.text
         assert bare.json()["reason"] == "qualified_start_identity_required", bare.text
     qualified = {"identities": [{"table": destination, "key": seed}]}
-    # A valid incoming query must not be blamed for a later query's missing
-    # qualification when the error crosses an independently compiled archive.
-    mixed = api._request(
-        "POST",
-        f"/tables/{source}/query",
-        {
-            "graph_queries": {
-                "valid": {
-                    "index": "knowledge",
-                    "traverse": {"start": qualified, "direction": "in", "max_depth": 1},
-                },
-                "invalid": {
-                    "index": "knowledge",
-                    "traverse": {
-                        "start": {"keys": [seed]},
-                        "direction": "in",
-                        "max_depth": 1,
+    # A valid incoming query must not be blamed for a later query's rejection
+    # when the error crosses an independently compiled archive.
+    for invalid_params, reason in (
+        ({"start": {"keys": [seed]}}, "qualified_start_identity_required"),
+        (
+            {"start": qualified, "deduplicate_nodes": False},
+            "deduplicate_nodes_must_be_true",
+        ),
+    ):
+        mixed = api._request(
+            "POST",
+            f"/tables/{source}/query",
+            {
+                "graph_queries": {
+                    "valid": {
+                        "index": "knowledge",
+                        "traverse": {
+                            "start": qualified,
+                            "direction": "in",
+                            "max_depth": 1,
+                        },
                     },
-                },
-            }
-        },
-    )
-    assert mixed.status_code == 422, mixed.text
-    assert mixed.json()["operation"] == "invalid", mixed.text
-    assert mixed.json()["reason"] == "qualified_start_identity_required", mixed.text
+                    "invalid": {
+                        "index": "knowledge",
+                        "traverse": {
+                            "direction": "in",
+                            "max_depth": 1,
+                            **invalid_params,
+                        },
+                    },
+                }
+            },
+        )
+        if mixed.ok and reason == "deduplicate_nodes_must_be_true":
+            # An unauthenticated complete single-group snapshot can retain
+            # per-seed paths locally. Only coordinator admission rejects it.
+            results = mixed.json()["responses"][0]["graph_results"]
+            assert "valid" in results and "invalid" in results, mixed.text
+            continue
+        assert mixed.status_code == 422, mixed.text
+        assert mixed.json()["operation"] == "invalid", mixed.text
+        assert mixed.json()["reason"] == reason, mixed.text
 
     expected_nodes = {"note-0", "note-1"} if action == "merge" else {"note-0"}
 

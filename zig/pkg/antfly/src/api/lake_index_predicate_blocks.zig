@@ -58,6 +58,7 @@ pub const Builder = struct {
         // Reserve capacity for sibling ordered sorts, reverse/tie builders
         // and their merges in the shared 64-file manager.
         var sort = local.sql_spill.Sort.init(a, manager, &.{ .{}, .{} }, 512 * 1024);
+        sort.shared_runs = true;
         sort.run_limit = 4;
         return .{ .a = a, .sort = sort, .bitmap = Bitmap.init(a) };
     }

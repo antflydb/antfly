@@ -2229,6 +2229,7 @@ fn enrichmentErrorDisposition(err: anyerror) EnrichmentErrorDisposition {
         error.InvalidEmbeddingIdentity,
         error.EmbeddingIdentityMismatch,
         error.EmbedRequestFailed,
+        error.InferenceEndpointAccessDenied,
         error.ReadRequestFailed,
         error.ExtractionInvalidRequest,
         error.ExtractionUnauthorized,
@@ -3742,8 +3743,12 @@ fn embedDenseWithRetry(provider: embedder_mod.DenseEmbedder, runtime: *Enrichmen
 }
 
 fn embedDenseBatchWithRetry(provider: embedder_mod.DenseEmbedder, runtime: *EnrichmentRuntime, name: []const u8, texts: []const []const u8, dims: u32, reuse_computation: anytype) ![]const []const f32 {
-    const cache = runtime.dense_result_cache orelse return embedDenseBatchWithRetryUncached(provider, runtime, name, texts, dims);
-    if (provider.computation_key_fn == null) return embedDenseBatchWithRetryUncached(provider, runtime, name, texts, dims);
+    return embedDenseBatchWithRetryLimits(provider, runtime, name, texts, dims, reuse_computation, null);
+}
+
+fn embedDenseBatchWithRetryLimits(provider: embedder_mod.DenseEmbedder, runtime: *EnrichmentRuntime, name: []const u8, texts: []const []const u8, dims: u32, reuse_computation: anytype, limits: ?DenseBatchLimits) ![]const []const f32 {
+    const cache = runtime.dense_result_cache orelse return embedDenseBatchWithRetryUncached(provider, runtime, name, texts, dims, limits);
+    if (provider.computation_key_fn == null) return embedDenseBatchWithRetryUncached(provider, runtime, name, texts, dims, limits);
     try runtime.active_provider_guard.check();
     const keys = try runtime.alloc.alloc(?[32]u8, texts.len);
     defer runtime.alloc.free(keys);
@@ -3764,7 +3769,7 @@ fn embedDenseBatchWithRetry(provider: embedder_mod.DenseEmbedder, runtime: *Enri
         try missing_texts.append(runtime.alloc, text);
     }
     if (misses.items.len != 0) {
-        const computed = try embedDenseBatchWithRetryUncached(provider, runtime, name, missing_texts.items, dims);
+        const computed = try embedDenseBatchWithRetryUncached(provider, runtime, name, missing_texts.items, dims, limits);
         defer runtime.alloc.free(computed);
         if (computed.len != misses.items.len) {
             for (computed) |vector| runtime.alloc.free(vector);
@@ -3906,12 +3911,13 @@ fn embedDenseBatchWithRetryUncached(
     embedding_name: []const u8,
     texts: []const []const u8,
     dims: u32,
+    limits: ?DenseBatchLimits,
 ) ![]const []const f32 {
     const recovery_key = denseInferenceRecoveryKey(dense_embedder, embedding_name);
     var attempt: u32 = 0;
     while (true) : (attempt += 1) {
         try checkProviderInvocation(runtime, recovery_key, dense_embedder.foreground_bounded);
-        const vectors = embedDenseBatchAttempt(dense_embedder, runtime, embedding_name, texts, dims) catch |err| {
+        const vectors = embedDenseBatchAttemptLimits(dense_embedder, runtime, embedding_name, texts, dims, limits) catch |err| {
             try checkProviderFailureGuardRecording(runtime, recovery_key, texts.len);
             if (inferenceControlFailure(err)) {
                 noteInferenceControlFailure(runtime, recovery_key, err, texts.len);
@@ -3937,6 +3943,11 @@ fn embedDenseBatchWithRetryUncached(
 }
 
 fn embedDenseBatchAttempt(dense_embedder: embedder_mod.DenseEmbedder, runtime: *EnrichmentRuntime, name: []const u8, texts: []const []const u8, dims: u32) ![]const []const f32 {
+    return embedDenseBatchAttemptLimits(dense_embedder, runtime, name, texts, dims, null);
+}
+
+fn embedDenseBatchAttemptLimits(dense_embedder: embedder_mod.DenseEmbedder, runtime: *EnrichmentRuntime, name: []const u8, texts: []const []const u8, dims: u32, limits: ?DenseBatchLimits) ![]const []const f32 {
+    if (limits) |bounded| return plannedDenseBatches(runtime.alloc, concurrencyIo(runtime), dense_embedder, name, texts, dims, assetProviderRequestContext(runtime), bounded);
     // Context-aware callbacks still require an explicit reentrancy guarantee.
     // Custom and legacy providers retain their serial path by default.
     const parallelism = @min(@min(generatedEmbedParallelBatches(), @max(@as(usize, 1), dense_embedder.dense_batch_concurrency)), texts.len);
@@ -3977,7 +3988,48 @@ fn denseBatchFailurePriority(err: anyerror) u8 {
 }
 
 fn parallelDenseBatch(alloc: Allocator, io: Io, provider: embedder_mod.DenseEmbedder, name: []const u8, texts: []const []const u8, dims: u32, context: inference_request_context.RequestContext, parallelism: usize, allow_capacity_fallback: bool) ![]const []const f32 {
-    std.debug.assert(parallelism >= 1 and parallelism <= 4 and parallelism <= texts.len);
+    var boundaries: [5]usize = undefined;
+    for (0..parallelism + 1) |i| boundaries[i] = texts.len * i / parallelism;
+    return parallelDenseBatchPlanned(alloc, io, provider, name, texts, dims, context, boundaries[0 .. parallelism + 1], allow_capacity_fallback);
+}
+
+const DenseBatchLimits = struct { items: usize, bytes: usize };
+
+fn denseBatchParallelism(provider: embedder_mod.DenseEmbedder) usize {
+    if (provider.dense_embed_batch_with_context_fn == null) return 1;
+    return @min(generatedEmbedParallelBatches(), @max(@as(usize, 1), provider.dense_batch_concurrency));
+}
+
+// A publication window may hold several full provider batches. Each call still
+// obeys the original item and byte limits, including after cache-hit removal.
+fn plannedDenseBatches(alloc: Allocator, io: Io, provider: embedder_mod.DenseEmbedder, name: []const u8, texts: []const []const u8, dims: u32, context: inference_request_context.RequestContext, limits: DenseBatchLimits) ![]const []const f32 {
+    if (limits.items == 0) return error.InferenceBatchTooLarge;
+    for (texts) |text| if (text.len > limits.bytes) return error.InferenceEncodedBytesExceeded;
+    const vectors = try alloc.alloc([]const f32, texts.len);
+    var completed: usize = 0;
+    errdefer {
+        for (vectors[0..completed]) |vector| alloc.free(vector);
+        alloc.free(vectors);
+    }
+    while (completed < texts.len) {
+        var boundaries: [5]usize = undefined;
+        boundaries[0] = 0;
+        var count: usize = 0;
+        while (count < denseBatchParallelism(provider) and completed + boundaries[count] < texts.len) {
+            boundaries[count + 1] = boundedTextBatchEnd(texts, completed + boundaries[count], limits.items, limits.bytes) - completed;
+            count += 1;
+        }
+        const batch = try parallelDenseBatchPlanned(alloc, io, provider, name, texts[completed..][0..boundaries[count]], dims, context, boundaries[0 .. count + 1], true);
+        defer alloc.free(batch);
+        @memcpy(vectors[completed..][0..batch.len], batch);
+        completed += batch.len;
+    }
+    return vectors;
+}
+
+fn parallelDenseBatchPlanned(alloc: Allocator, io: Io, provider: embedder_mod.DenseEmbedder, name: []const u8, texts: []const []const u8, dims: u32, context: inference_request_context.RequestContext, boundaries: []const usize, allow_capacity_fallback: bool) ![]const []const f32 {
+    const parallelism = boundaries.len - 1;
+    std.debug.assert(parallelism >= 1 and parallelism <= 4 and boundaries[parallelism] == texts.len);
     try context.check();
     const Task = struct {
         provider: embedder_mod.DenseEmbedder,
@@ -3995,7 +4047,7 @@ fn parallelDenseBatch(alloc: Allocator, io: Io, provider: embedder_mod.DenseEmbe
     errdefer {
         for (0..parallelism) |index| {
             if (ready[index]) {
-                for (vectors[texts.len * index / parallelism .. texts.len * (index + 1) / parallelism]) |vector| alloc.free(vector);
+                for (vectors[boundaries[index]..boundaries[index + 1]]) |vector| alloc.free(vector);
             }
         }
         alloc.free(vectors);
@@ -4004,8 +4056,8 @@ fn parallelDenseBatch(alloc: Allocator, io: Io, provider: embedder_mod.DenseEmbe
     var futures: [4]?std.Io.Future(anyerror![]const []const f32) = @splat(null);
     var inline_results: [4]anyerror![]const []const f32 = undefined;
     for (0..parallelism) |index| {
-        tasks[index] = .{ .provider = provider, .alloc = alloc, .name = name, .texts = texts[texts.len * index / parallelism .. texts.len * (index + 1) / parallelism], .dims = dims, .context = context };
-        futures[index] = io.concurrent(Task.run, .{&tasks[index]}) catch null;
+        tasks[index] = .{ .provider = provider, .alloc = alloc, .name = name, .texts = texts[boundaries[index]..boundaries[index + 1]], .dims = dims, .context = context };
+        futures[index] = if (parallelism == 1) null else io.concurrent(Task.run, .{&tasks[index]}) catch null;
         if (futures[index] == null) inline_results[index] = Task.run(&tasks[index]);
     }
     // Drain every submitted call before retry, cancellation, or publication.
@@ -4023,7 +4075,7 @@ fn parallelDenseBatch(alloc: Allocator, io: Io, provider: embedder_mod.DenseEmbe
             noteDenseBatchFailure(&failure, error.InvalidEmbeddingResponse);
             continue;
         }
-        @memcpy(vectors[texts.len * index / parallelism ..][0..batch.len], batch);
+        @memcpy(vectors[boundaries[index]..][0..batch.len], batch);
         ready[index] = true;
     }
     if (failure) |err| {
@@ -4040,7 +4092,7 @@ fn parallelDenseBatch(alloc: Allocator, io: Io, provider: embedder_mod.DenseEmbe
                 for (batch) |vector| alloc.free(vector);
                 return error.InvalidEmbeddingResponse;
             }
-            @memcpy(vectors[texts.len * index / parallelism ..][0..batch.len], batch);
+            @memcpy(vectors[boundaries[index]..][0..batch.len], batch);
             ready[index] = true;
         }
     }
@@ -4054,6 +4106,8 @@ test "parallel dense inference preserves order drains failures and bounds provid
         peak: std.atomic.Value(usize) = .init(0),
         completed: std.atomic.Value(usize) = .init(0),
         successful_items: std.atomic.Value(usize) = .init(0),
+        largest_batch: std.atomic.Value(usize) = .init(0),
+        largest_bytes: std.atomic.Value(usize) = .init(0),
         fail: bool = false,
         busy_when_parallel: bool = false,
         mixed_failure: ?anyerror = null,
@@ -4062,6 +4116,8 @@ test "parallel dense inference preserves order drains failures and bounds provid
         }
         fn batch(ptr: *anyopaque, alloc: Allocator, _: []const u8, texts: []const []const u8, _: u32, context: inference_request_context.RequestContext) ![]const []const f32 {
             const self: *@This() = @ptrCast(@alignCast(ptr));
+            _ = self.largest_batch.fetchMax(texts.len, .acq_rel);
+            _ = self.largest_bytes.fetchMax(textBatchByteStats(texts).total_bytes, .acq_rel);
             const active = self.active.fetchAdd(1, .acq_rel) + 1;
             _ = self.peak.fetchMax(active, .acq_rel);
             defer {
@@ -4138,6 +4194,30 @@ test "parallel dense inference preserves order drains failures and bounds provid
         try std.testing.expectEqual(@as(usize, 0), harness.active.load(.acquire));
         try std.testing.expectEqual(8 + 2 * (index + 1), harness.completed.load(.acquire));
     }
+    harness.mixed_failure = null;
+    harness.peak.store(0, .release);
+    harness.completed.store(0, .release);
+    harness.largest_batch.store(0, .release);
+    harness.largest_bytes.store(0, .release);
+    const full_texts: [64][]const u8 = @splat("7");
+    const full = try plannedDenseBatches(alloc, io, provider, "model", &full_texts, 1, context, .{ .items = 32, .bytes = 32 });
+    defer embedder_mod.freeDenseEmbeddingBatch(alloc, full);
+    try std.testing.expectEqual(@as(usize, 2), harness.peak.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 2), harness.completed.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 32), harness.largest_batch.load(.acquire));
+    for (full) |vector| try std.testing.expectEqual(@as(f32, 7), vector[0]);
+    harness.completed.store(0, .release);
+    harness.largest_batch.store(0, .release);
+    harness.largest_bytes.store(0, .release);
+    const completed_before_oversize = harness.completed.load(.acquire);
+    try std.testing.expectError(error.InferenceEncodedBytesExceeded, plannedDenseBatches(alloc, io, provider, "model", &.{ "1000", "2" }, 1, context, .{ .items = 32, .bytes = 2 }));
+    try std.testing.expectEqual(completed_before_oversize, harness.completed.load(.acquire));
+    const byte_limited = try plannedDenseBatches(alloc, io, provider, "model", &texts, 1, context, .{ .items = 32, .bytes = 2 });
+    defer embedder_mod.freeDenseEmbeddingBatch(alloc, byte_limited);
+    try std.testing.expectEqual(@as(usize, 4), harness.completed.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 2), harness.largest_batch.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 2), harness.largest_bytes.load(.acquire));
+    for (byte_limited, 0..) |vector, index| try std.testing.expectEqual(@as(f32, @floatFromInt(index)), vector[0]);
 }
 
 fn embedDensePartsWithRetry(
@@ -9389,7 +9469,7 @@ const SharedPdfWindowScheduler = struct {
                 if (!consumer.enabled) return error.DocumentExtractionWorkingSetTooLarge;
                 if (consumer.err) |err| return err;
                 return PdfWindowConsumerLease.initIndependent(@import("antfly_platform").allocator.concurrentFallback(), runtime.config.resource_manager orelse runtime.index_manager.resource_manager, required) catch |err| {
-                    if (err != error.DocumentExtractionWorkingSetTooLarge or self.count == 0) return err;
+                    if (err != error.ResourceTemporarilyUnavailable or self.count == 0) return err;
                     try self.retireOne();
                     continue;
                 };
@@ -9402,7 +9482,7 @@ const SharedPdfWindowScheduler = struct {
                     // Only ledger contention is retryable. Codec/OOM failures
                     // and hard representation ceilings retain normal fallback.
                     if (err != error.PdfPngAdmissionDenied or self.count == 0)
-                        return if (err == error.PdfPngAdmissionDenied) error.DocumentExtractionWorkingSetTooLarge else err;
+                        return if (err == error.PdfPngAdmissionDenied) error.ResourceTemporarilyUnavailable else err;
                     try self.retireOne();
                     continue;
                 };
@@ -12423,7 +12503,7 @@ test "shared PDF render admission reclaims idle sources without invalidating liv
         @memset(bytes, 'p');
         var source = try cache.adoptOwned("source", null, .{ .data = bytes, .content_type = try backing.dupe(u8, "application/pdf") });
         defer source.deinit();
-        try std.testing.expectError(error.DocumentExtractionWorkingSetTooLarge, PdfWindowCompositeLease.create(alloc, alloc, &manager, 1, 48 * 1024, 1));
+        try std.testing.expectError(error.ResourceTemporarilyUnavailable, PdfWindowCompositeLease.create(alloc, alloc, &manager, 1, 48 * 1024, 1));
         try std.testing.expectEqual(@as(usize, 0), cache.evictions);
         source.deinit();
         const window = try PdfWindowCompositeLease.create(alloc, alloc, &manager, 1, 48 * 1024, 1);
@@ -12450,7 +12530,7 @@ test "shared PDF coordinator state is admitted separately from render windows" {
     const state = try coordinator.reservation.allocator().alloc(u8, 48 * 1024);
     defer coordinator.reservation.allocator().free(state);
     try std.testing.expect(manager.sliceStats(.document_extraction_working_set).used_bytes >= state.len);
-    try std.testing.expectError(error.DocumentExtractionWorkingSetTooLarge, PdfWindowCompositeLease.create(alloc, alloc, &manager, 1, 32 * 1024, 1));
+    try std.testing.expectError(error.ResourceTemporarilyUnavailable, PdfWindowCompositeLease.create(alloc, alloc, &manager, 1, 32 * 1024, 1));
     try std.testing.expectError(error.OutOfMemory, coordinator.reservation.allocator().alloc(u8, 32 * 1024));
     try std.testing.expect(coordinator.allocationDeniedError() != null);
 }
@@ -16721,7 +16801,7 @@ const SharedPdfPngPage = struct {
         // even for incompressible inputs or encoder implementation changes.
         const required = @min(ceiling, addUsizeSaturating(retained, addUsizeSaturating(largest *| 4, 1024 * 1024)));
         self.lease = PdfWindowConsumerLease.init(runtime.alloc, runtime.config.resource_manager orelse runtime.index_manager.resource_manager, parent, required) catch |err|
-            return if (err == error.DocumentExtractionWorkingSetTooLarge) error.PdfPngAdmissionDenied else err;
+            return if (err == error.ResourceTemporarilyUnavailable) error.PdfPngAdmissionDenied else err;
         self.attempted = true;
         errdefer {
             self.lease.?.deinit();
@@ -16889,7 +16969,7 @@ const SharedPdfPngWindow = struct {
 
     fn get(self: *@This(), runtime: *EnrichmentRuntime, raster: document_extraction_mod.RenderedPdfPageRasterBatch, parent: ?*PdfWindowCompositeLease, ceiling: usize) !?document_extraction_mod.RenderedPdfPageBatch {
         return self.getDemand(runtime, raster, parent, ceiling, null) catch |err|
-            return if (err == error.PdfPngAdmissionDenied) error.DocumentExtractionWorkingSetTooLarge else err;
+            return if (err == error.PdfPngAdmissionDenied) error.ResourceTemporarilyUnavailable else err;
     }
 
     fn getDemand(self: *@This(), runtime: *EnrichmentRuntime, raster: document_extraction_mod.RenderedPdfPageRasterBatch, parent: ?*PdfWindowCompositeLease, ceiling: usize, demand: ?[]const bool) !?document_extraction_mod.RenderedPdfPageBatch {
@@ -16904,7 +16984,7 @@ const SharedPdfPngWindow = struct {
             const bytes = std.math.mul(usize, raster.results.len, @sizeOf(Page) + @sizeOf(SharedPdfPngPage)) catch return error.OutOfMemory;
             if (bytes > ceiling) return error.OutOfMemory;
             self.metadata = PdfWindowConsumerLease.init(runtime.alloc, runtime.config.resource_manager orelse runtime.index_manager.resource_manager, parent, bytes) catch |err| {
-                if (err == error.DocumentExtractionWorkingSetTooLarge) {
+                if (err == error.ResourceTemporarilyUnavailable) {
                     self.disabled = false;
                     return error.PdfPngAdmissionDenied;
                 }
@@ -17427,6 +17507,7 @@ const PdfWindowCompositeLease = struct {
     scratch_bytes: usize,
     output_bytes: usize,
     window_slots: usize,
+    scratch_admission_contended: bool = false,
     manager: ?*resource_manager_mod.ResourceManager,
     rendering_finished: bool = false,
     consumer_count: usize = 0,
@@ -17458,14 +17539,14 @@ const PdfWindowCompositeLease = struct {
             .manager = manager,
         };
         if (manager) |resource_manager| {
-            self.reservation = resource_manager.reserveOwnedSplitAtMost(
+            self.reservation = resource_manager.reserveOwnedSplitAtMostClassified(
                 .document_extraction_working_set,
                 std.math.cast(u64, requested_scratch) orelse
                     return error.DocumentExtractionWorkingSetTooLarge,
                 std.math.cast(u64, required_output) orelse
                     return error.DocumentExtractionWorkingSetTooLarge,
             ) catch |err| switch (err) {
-                error.ResourceBudgetExceeded => return error.DocumentExtractionWorkingSetTooLarge,
+                error.ResourceRequestTooLarge => return error.DocumentExtractionWorkingSetTooLarge,
                 else => return err,
             };
             errdefer {
@@ -17478,6 +17559,7 @@ const PdfWindowCompositeLease = struct {
                 return error.DocumentExtractionWorkingSetTooLarge;
             if (self.scratch_bytes < window_slots or self.output_bytes != required_output)
                 return error.DocumentExtractionWorkingSetTooLarge;
+            self.noteScratchGrant(requested_scratch);
             self.output_budgeted = resource_manager_mod.BudgetedAllocator.init(
                 resource_manager,
                 .document_extraction_working_set,
@@ -17516,13 +17598,45 @@ const PdfWindowCompositeLease = struct {
                 .document_extraction_working_set,
                 std.math.cast(u64, growth) orelse return false,
             ) catch |err| switch (err) {
-                error.ResourceBudgetExceeded => return false,
+                error.ResourceBudgetExceeded => {
+                    // Growth is an upper bound, not a measured allocation.
+                    // This at-most reservation needs only one additional byte
+                    // to succeed. Reject permanently only if even that minimum
+                    // cannot fit beside this window's retained output. The
+                    // renderer remains responsible for its actual scratch cap.
+                    const minimum_demand = self.reservedBytes() +| 1;
+                    return switch (manager.classifyRequestDenial(.document_extraction_working_set, minimum_demand)) {
+                        error.ResourceRequestTooLarge => false,
+                        error.ResourceTemporarilyUnavailable => error.ResourceTemporarilyUnavailable,
+                    };
+                },
                 else => return err,
             };
             growth = @intCast(self.scratch_retry_reservation.?.bytes);
         }
         self.scratch_bytes += growth;
+        self.noteScratchGrant(requested);
         return true;
+    }
+
+    /// A partial grant proves neither page oversize nor that this window has
+    /// reached its standalone limit. Preserve that distinction until rendering
+    /// joins: a failed page must yield if other admitted owners constrained it.
+    /// The growth callback is serialized by the renderer; readers join it first.
+    fn noteScratchGrant(self: *@This(), requested: usize) void {
+        const manager = self.manager orelse return;
+        self.scratch_admission_contended = requested > self.scratch_bytes and
+            manager.classifyRequestDenial(.document_extraction_working_set, self.reservedBytes() +| 1) == error.ResourceTemporarilyUnavailable;
+    }
+
+    fn checkScratchFailures(self: *const @This(), batch: RuntimePdfRenderBatch) !void {
+        if (!self.scratch_admission_contended) return;
+        switch (batch) {
+            inline else => |value| for (value.results) |result| {
+                if (result.failure) |err| if (isPdfScratchPressure(err))
+                    return error.ResourceTemporarilyUnavailable;
+            },
+        }
     }
 
     /// Called only after the synchronous renderer has joined every wave and
@@ -17537,6 +17651,7 @@ const PdfWindowCompositeLease = struct {
             reservation.primary_bytes = 0;
         }
         self.scratch_bytes = 0;
+        self.scratch_admission_contended = false;
         self.rendering_finished = true;
     }
 
@@ -17598,7 +17713,13 @@ const PdfWindowConsumerLease = struct {
         };
         if (required > credit) if (manager) |m| {
             result.reservation = m.reserveWithoutReclaim(.document_extraction_working_set, required - credit) catch |err| switch (err) {
-                error.ResourceBudgetExceeded => return error.DocumentExtractionWorkingSetTooLarge,
+                error.ResourceBudgetExceeded => {
+                    const own_demand = @as(u64, @intCast(required - credit)) +| (if (parent) |window| window.reservedBytes() else 0);
+                    return switch (m.classifyRequestDenial(.document_extraction_working_set, own_demand)) {
+                        error.ResourceRequestTooLarge => error.DocumentExtractionWorkingSetTooLarge,
+                        error.ResourceTemporarilyUnavailable => error.ResourceTemporarilyUnavailable,
+                    };
+                },
                 else => return err,
             };
         };
@@ -18133,7 +18254,7 @@ test "shared PDF phase leases reuse idle credit and admit only nested consumer e
         try std.testing.expectError(error.OutOfMemory, consumer.allocator().alloc(u8, 1));
         try std.testing.expectEqual(error.DocumentExtractionWorkingSetTooLarge, consumer.mapError(error.OutOfMemory));
         try std.testing.expectError(error.OutOfMemory, lease.allocator().alloc(u8, 1));
-        try std.testing.expectError(error.DocumentExtractionWorkingSetTooLarge, PdfWindowConsumerLease.init(alloc, &manager, lease, 1));
+        try std.testing.expectError(error.ResourceTemporarilyUnavailable, PdfWindowConsumerLease.init(alloc, &manager, lease, 1));
         try std.testing.expectEqual(@as(usize, 1), lease.consumer_count);
         try std.testing.expectEqualStrings("0123456789", media);
     }
@@ -18187,9 +18308,88 @@ test "shared PDF independent grants never freeze the owner allocator" {
         const owner_output = try owner.allocator().alloc(u8, 30);
         defer owner.allocator().free(owner_output);
         try std.testing.expectEqual(@as(u64, 100), manager.sliceStats(.document_extraction_working_set).used_bytes);
-        try std.testing.expectError(error.DocumentExtractionWorkingSetTooLarge, PdfWindowConsumerLease.initIndependent(alloc, &manager, 1));
+        try std.testing.expectError(error.ResourceTemporarilyUnavailable, PdfWindowConsumerLease.initIndependent(alloc, &manager, 1));
     }
     try std.testing.expectEqual(@as(u64, 40), manager.sliceStats(.document_extraction_working_set).used_bytes);
+}
+
+test "PDF composite admission retries contention and rejects only standalone oversize" {
+    const alloc = std.testing.allocator;
+    var budgets = resource_manager_mod.Options.defaultBudgets();
+    budgets[@backingInt(resource_manager_mod.Slice.document_extraction_working_set)] = .{ .hard_limit_bytes = 100, .soft_limit_bytes = 0 };
+    var manager = resource_manager_mod.ResourceManager.init(.{ .budgets = budgets });
+    defer manager.deinit(alloc);
+    var competing = try manager.reserveWithoutReclaim(.document_extraction_working_set, 80);
+    try std.testing.expectError(error.ResourceTemporarilyUnavailable, PdfWindowCompositeLease.create(alloc, alloc, &manager, 40, 30, 1));
+    try std.testing.expectEqual(@as(u64, 80), manager.sliceStats(.document_extraction_working_set).used_bytes);
+    competing.release();
+    const lease = try PdfWindowCompositeLease.create(alloc, alloc, &manager, 40, 30, 1);
+    lease.destroy();
+    try std.testing.expectEqual(@as(u64, 0), manager.sliceStats(.document_extraction_working_set).used_bytes);
+    try std.testing.expectError(error.DocumentExtractionWorkingSetTooLarge, PdfWindowCompositeLease.create(alloc, alloc, &manager, 1, 101, 1));
+}
+
+test "PDF prefetch admission falls back after the preceding window releases" {
+    const alloc = std.testing.allocator;
+    var budgets = resource_manager_mod.Options.defaultBudgets();
+    budgets[@backingInt(resource_manager_mod.Slice.document_extraction_working_set)] = .{ .hard_limit_bytes = 100, .soft_limit_bytes = 0 };
+    var manager = resource_manager_mod.ResourceManager.init(.{ .budgets = budgets });
+    defer manager.deinit(alloc);
+    const current = try PdfWindowCompositeLease.create(alloc, alloc, &manager, 40, 60, 1);
+    var current_owned = true;
+    defer if (current_owned) current.destroy();
+    // The next window cannot overlap, but is a legal standalone operation.
+    const speculative = PdfWindowCompositeLease.create(alloc, alloc, &manager, 40, 60, 1);
+    if (speculative) |unexpected| {
+        unexpected.destroy();
+        return error.TestUnexpectedResult;
+    } else |err| {
+        try std.testing.expectEqual(error.ResourceTemporarilyUnavailable, err);
+        try checkPdfPrefetchRetry(err);
+    }
+    current.destroy();
+    current_owned = false;
+    const serial = try PdfWindowCompositeLease.create(alloc, alloc, &manager, 40, 60, 1);
+    serial.destroy();
+    try std.testing.expectEqual(@as(u64, 0), manager.sliceStats(.document_extraction_working_set).used_bytes);
+    // Preserve non-admission failures instead of retrying a broken source.
+    try std.testing.expectError(error.RemoteDocumentFetchFailed, checkPdfPrefetchRetry(error.RemoteDocumentFetchFailed));
+}
+
+test "PDF scratch growth distinguishes a ceiling from mandatory demand" {
+    const alloc = std.testing.allocator;
+    var budgets = resource_manager_mod.Options.defaultBudgets();
+    budgets[@backingInt(resource_manager_mod.Slice.document_extraction_working_set)] = .{ .hard_limit_bytes = 100, .soft_limit_bytes = 0 };
+    var manager = resource_manager_mod.ResourceManager.init(.{ .budgets = budgets });
+    defer manager.deinit(alloc);
+    {
+        var competing = try manager.reserveWithoutReclaim(.document_extraction_working_set, 80);
+        defer competing.release();
+        const lease = try PdfWindowCompositeLease.create(alloc, alloc, &manager, 10, 10, 1);
+        defer lease.destroy();
+        // Both an envelope-sized ceiling and a larger user-configured ceiling
+        // permit a partial grant. Neither proves permanent document oversize.
+        try std.testing.expectError(error.ResourceTemporarilyUnavailable, lease.admitScratchRetry(100));
+        try std.testing.expectError(error.ResourceTemporarilyUnavailable, lease.admitScratchRetry(200));
+        // Exercise deferred retry: scratch is released, another owner takes
+        // that headroom, and completed outputs remain pinned to this window.
+        lease.finishRendering();
+        var peer = try manager.reserveWithoutReclaim(.document_extraction_working_set, 10);
+        defer peer.release();
+        lease.rendering_finished = false;
+        try std.testing.expectError(error.ResourceTemporarilyUnavailable, lease.admitScratchRetry(200));
+        peer.release();
+        competing.release();
+        try std.testing.expect(try lease.admitScratchRetry(200));
+        try std.testing.expectEqual(@as(usize, 90), lease.scratch_bytes);
+        lease.finishRendering();
+    }
+    // A window already holding the standalone hard limit cannot grow even
+    // after every competing owner exits; preserve that actual hard boundary.
+    const full = try PdfWindowCompositeLease.create(alloc, alloc, &manager, 10, 90, 1);
+    defer full.destroy();
+    try std.testing.expect(!try full.admitScratchRetry(200));
+    full.finishRendering();
 }
 
 test "PDF composite lease admits two future overlap windows atomically" {
@@ -18423,13 +18623,19 @@ fn renderPdfWindowWithScratchRetry(renderer: anytype, lease: *PdfWindowComposite
     const admitted = try lease.admitScratchRetry(max_scratch_bytes);
     // Parallel lanes may exhaust a shared grant that is sufficient for one
     // page. Retry only failed identities serially even when growth is denied.
-    if (!admitted and !already_grown and options.max_parallel_pages <= 1) return batch;
+    if (!admitted and !already_grown and options.max_parallel_pages <= 1) {
+        try lease.checkScratchFailures(batch);
+        return batch;
+    }
     // A single page that already consumed its admitted growth cannot benefit
     // from replaying with the same grant. Multi-page windows can shed other
     // lanes' caches by retrying only the failed pages serially.
     if (already_grown and switch (batch) {
         inline else => |value| value.results.len == 1,
-    }) return batch;
+    }) {
+        try lease.checkScratchFailures(batch);
+        return batch;
+    }
     var retry_options = options;
     retry_options.max_inflight_bytes = lease.scratchBytesPerWindow();
     retry_options.max_parallel_pages = 1;
@@ -18457,6 +18663,7 @@ fn renderPdfWindowWithScratchRetry(renderer: anytype, lease: *PdfWindowComposite
             value.thread_spawn_fallbacks +|= replacement.thread_spawn_fallbacks;
         },
     }
+    try lease.checkScratchFailures(batch);
     return batch;
 }
 
@@ -19039,6 +19246,20 @@ const PdfWindowPrefetchStart = struct {
     }
 };
 
+/// Speculation may exhaust shared admission or its operation-local deadline.
+/// Once the preceding window is released, retry through ordinary preparation,
+/// which rechecks the owning request's cancellation and deadline. Other errors
+/// must retain their identity rather than being retried as memory pressure.
+fn checkPdfPrefetchRetry(err: anyerror) !void {
+    return switch (err) {
+        error.ResourceTemporarilyUnavailable,
+        error.DocumentExtractionWorkingSetTooLarge,
+        error.Canceled,
+        => {},
+        else => err,
+    };
+}
+
 const RuntimePdfRenderWindowPrefetch = struct {
     preparer: *const RuntimePdfRenderWindowPreparer,
     start_index: usize,
@@ -19282,8 +19503,7 @@ fn completeRuntimeDocumentExtractionGeneratedTextBatchWithAllocator(
                             // the active one, or may expire behind slow model
                             // inference. Retry after releasing that window so
                             // bounded backpressure preserves serial behavior.
-                            if (err != error.DocumentExtractionWorkingSetTooLarge and err != error.Canceled)
-                                return err;
+                            try checkPdfPrefetchRetry(err);
                             window_started_ns = runtime.clock.nowRealtimeNs();
                             pdf_render_window = preparer.prepare(idx) catch |sync_err| {
                                 logRuntimePdfRenderWindowProfile(runtime, source_fingerprint, units, &.{}, null, @errorName(sync_err), window_started_ns);
@@ -25085,8 +25305,10 @@ fn processOrderedChunkVectorWithAllocator(runtime: *EnrichmentRuntime, alloc: Al
     defer if (scan_after) |key| alloc.free(key);
     var logical_after: ?[]u8 = null;
     defer if (logical_after) |key| alloc.free(key);
-    const max_items = @min(@as(usize, 128), effectiveRequestEmbedBatchItems(runtime, request));
-    const max_bytes = requestEmbedBatchBytes(runtime.alloc, request);
+    const batch_limits: DenseBatchLimits = .{ .items = @min(@as(usize, 128), effectiveRequestEmbedBatchItems(runtime, request)), .bytes = requestEmbedBatchBytes(runtime.alloc, request) };
+    const parallelism = if (dense) |provider| denseBatchParallelism(provider) else 1;
+    const max_items = @min(@as(usize, 128), batch_limits.items * parallelism);
+    const max_bytes = std.math.mul(usize, batch_limits.bytes, parallelism) catch std.math.maxInt(usize);
     while (true) {
         var items: std.ArrayList(Item) = .empty;
         defer {
@@ -25274,7 +25496,7 @@ fn processOrderedChunkVectorWithAllocator(runtime: *EnrichmentRuntime, alloc: Al
             var succeeded = false;
             defer noteEmbedBatchFinished(runtime, consumers, texts.items.len, stats.total_bytes, stats.max_bytes, elapsedNsSince(runtime, started), succeeded);
             if (dense) |provider| {
-                dense_vectors = try embedDenseBatchWithRetry(provider, runtime, requestEmbeddingName(request), texts.items, request.expected_dims, request.reprocess_generation == 0);
+                dense_vectors = try embedDenseBatchWithRetryLimits(provider, runtime, requestEmbeddingName(request), texts.items, request.expected_dims, request.reprocess_generation == 0, batch_limits);
                 if (dense_vectors.?.len != texts.items.len) return error.InvalidEmbeddingResponse;
             } else if (sparse) |provider| {
                 sparse_vectors = try embedSparseBatchWithRetry(provider, runtime, requestEmbeddingName(request), texts.items);
@@ -27832,8 +28054,7 @@ fn processPdfPageImageEmbeddingWithAllocator(
                 // expire behind slow inference. Once the current lease is
                 // released, retry synchronously instead of turning safe
                 // backpressure into durable enrichment failure.
-                if (err != error.DocumentExtractionWorkingSetTooLarge and err != error.Canceled)
-                    return err;
+                try checkPdfPrefetchRetry(err);
                 try embedding_lease_guard.check();
                 try checkProviderFailureGuard(runtime);
                 current_window = try window_preparer.prepare(next_first_item);
@@ -33497,10 +33718,8 @@ fn freeJsonValue(alloc: Allocator, value: *std.json.Value) void {
     }
 }
 
-// ============================================================================
-// Tests
-// ============================================================================
-
+// =====================================================================// Tests
+// =====================================================================
 fn testInvocationMemoryForRequests(
     _: *anyopaque,
     _: Allocator,
@@ -37658,4 +37877,63 @@ test "model aware media checkpoint rejects an old tenure and resumes under its s
     const resumed = (try storeGetOptionalAllocWithRetry(&runtime, key)).?;
     defer a.free(resumed);
     try std.testing.expectEqualSlices(u8, second, resumed);
+}
+
+test "PDF partial scratch grants yield contention and recover after release" {
+    const Fake = struct {
+        lease: *PdfWindowCompositeLease,
+        pages: usize,
+        calls: usize = 0,
+
+        fn run(self: *@This(), alloc: Allocator, options: document_extraction_mod.PdfPageRenderBatchOptions, indices: ?[]const usize) !RuntimePdfRenderBatch {
+            if (self.calls == 0) _ = try self.lease.admitScratchRetry(600);
+            self.calls += 1;
+            if (indices) |items| try std.testing.expectEqualSlices(usize, &.{0}, items);
+            const Batch = @FieldType(RuntimePdfRenderBatch, "encoded");
+            const Result = std.meta.Child(@FieldType(Batch, "results"));
+            const results = try alloc.alloc(Result, if (indices) |items| items.len else self.pages);
+            @memset(results, .{ .page_number = 1 });
+            errdefer {
+                for (results) |*result| result.deinit(alloc);
+                alloc.free(results);
+            }
+            for (results, 0..) |*result, i| {
+                result.page_number = @intCast(i + 1);
+                if (i == 0 and self.lease.scratch_bytes < 300) {
+                    result.failure = error.RenderWorkerMemoryLimitExceeded;
+                } else {
+                    result.rendered = .{ .png = try alloc.dupe(u8, "keep"), .width = 1, .height = 1, .requested_dpi = 150, .effective_dpi = 150 };
+                }
+            }
+            return .{ .encoded = .{ .results = results, .requested_parallelism = options.max_parallel_pages, .peak_launched_workers = 1, .peak_parallelism = 1, .peak_admitted_pixels = 1, .peak_admitted_bytes = self.lease.scratch_bytes, .thread_spawn_fallbacks = 0 } };
+        }
+    };
+    const a = std.testing.allocator;
+    // Cover both the single-page early exit and the failed-only serial replay
+    // beside an already-completed sibling. Neither may publish failed OCR
+    // merely because another owner constrained the scratch grant.
+    for ([_]usize{ 1, 2 }) |pages| {
+        var budgets = resource_manager_mod.Options.defaultBudgets();
+        budgets[@backingInt(resource_manager_mod.Slice.document_extraction_working_set)] = .{ .hard_limit_bytes = 4696, .soft_limit_bytes = 0 };
+        var manager = resource_manager_mod.ResourceManager.init(.{ .budgets = budgets });
+        defer manager.deinit(a);
+        var competing = try manager.reserveWithoutReclaim(.document_extraction_working_set, 400);
+        defer competing.release();
+        const lease = try PdfWindowCompositeLease.create(a, a, &manager, 100, 4096, 1);
+        defer lease.destroy();
+        var fake = Fake{ .lease = lease, .pages = pages };
+        try std.testing.expectError(error.ResourceTemporarilyUnavailable, renderPdfWindowWithScratchRetry(&fake, lease, .{ .max_inflight_bytes = 100, .max_parallel_pages = pages }, 600));
+        try std.testing.expectEqual(pages, fake.calls);
+        try std.testing.expectEqual(@as(usize, 200), lease.scratch_bytes);
+        try std.testing.expectEqual(@as(usize, 0), lease.output_limit.liveBytes());
+        lease.finishRendering();
+        try std.testing.expect(!lease.scratch_admission_contended);
+        competing.release();
+        lease.rendering_finished = false;
+        try std.testing.expect(try lease.admitScratchRetry(600));
+        var alone = try renderPdfWindowWithScratchRetry(&fake, lease, .{ .max_inflight_bytes = 600, .max_parallel_pages = pages }, 600);
+        defer alone.deinit(lease.allocator());
+        try std.testing.expect(alone.encoded.results[0].failure == null);
+        try std.testing.expectEqualStrings("keep", alone.encoded.results[0].rendered.?.png);
+    }
 }

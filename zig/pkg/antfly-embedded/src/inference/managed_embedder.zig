@@ -7225,6 +7225,7 @@ fn optionalBearerAuthHeaderOwned(
 
 fn mapEmbedStatus(status: u16) anyerror {
     return switch (status) {
+        401, 403 => error.InferenceEndpointAccessDenied,
         429 => error.EmbedRateLimited,
         408,
         502,
@@ -10552,4 +10553,28 @@ pub fn testSparseCacheRevision() !void {
     try std.testing.expectEqual(@as([32]u8, @splat(7)), revision);
     const dense = managed.denseInterface();
     try std.testing.expect((try dense.cache_revision_fn.?(dense.ptr, std.testing.allocator, "semantic_idx")) == null);
+}
+
+test "managed embedder endpoint access denial survives HTTP probing and runtime transport" {
+    const a = std.testing.allocator;
+    const Denied = struct {
+        fn execute(_: *anyopaque, alloc: std.mem.Allocator, _: http_common.HttpRequest) !http_common.HttpResponse {
+            return .{ .status = 403, .content_type = try alloc.dupe(u8, "application/json"), .body = try alloc.dupe(u8, "{\"error\":\"forbidden\"}") };
+        }
+    };
+    var marker: u8 = 0;
+    var listener = std_http_listener.StdHttpListener.init(a, .{}, .{ .ptr = &marker, .vtable = &.{ .execute = Denied.execute } });
+    defer listener.deinit();
+    try listener.start();
+    const base_uri = try listener.baseUri(a);
+    defer a.free(base_uri);
+    for ([_][]const u8{ "openai", "antfly" }) |provider| {
+        const raw = try std.fmt.allocPrint(a, "{{\"type\":\"embeddings\",\"field\":\"body\",\"dimension\":3,\"embedder\":{{\"provider\":\"{s}\",\"model\":\"model\",\"api_url\":\"{s}\"}}}}", .{ provider, base_uri });
+        defer a.free(raw);
+        var parsed = try std.json.parseFromSlice(std.json.Value, a, raw, .{});
+        defer parsed.deinit();
+        try std.testing.expectError(error.InferenceEndpointAccessDenied, normalizeEmbeddingsIndexDimensionJsonWithOptions(a, "semantic", parsed.value, .{}));
+    }
+    const abi = @import("antfly_runtime_abi").error_abi;
+    try std.testing.expectEqual(error.InferenceEndpointAccessDenied, abi.errorFromStatus(abi.statusFromError(error.InferenceEndpointAccessDenied)));
 }
