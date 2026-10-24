@@ -208,6 +208,9 @@ const RemoteInferenceConnection = struct {
     url: []const u8,
     api_key: ?[]const u8,
     preserve_api_path: bool = false,
+    credential_env: ?[:0]const u8 = null,
+    capability_token: ?[]const u8 = null,
+    capability_revision: ?[]const u8 = null,
 };
 
 const ResolvedInferenceConnection = union(enum) {
@@ -348,19 +351,35 @@ pub fn invokeInferenceConnectionWithRequest(
     const url = if (request.query) |query| try std.fmt.allocPrint(alloc, "{s}?{s}", .{ operation_url, query }) else try alloc.dupe(u8, operation_url);
     defer alloc.free(url);
 
-    const resolved_key = try resolveInferenceApiKey(alloc, secret_store, remote.api_key);
+    const resolved_key = if (remote.credential_env) |name| key: {
+        var source = try common_secrets.SecretValue.initConfigOrEnv(alloc, remote.api_key, name);
+        defer source.deinit(alloc);
+        break :key try source.resolveOwned(alloc, secret_store);
+    } else try resolveInferenceApiKey(alloc, secret_store, remote.api_key);
     defer if (resolved_key) |key| alloc.free(key);
     const auth = if (resolved_key) |key| try std.fmt.allocPrint(alloc, "Bearer {s}", .{key}) else null;
     defer if (auth) |value| alloc.free(value);
     const timeout_ms = try remainingInferenceInvocationMs(deadline_ns, platform_time.monotonicNs());
     const timeout_header = try std.fmt.allocPrint(alloc, "{d}", .{timeout_ms});
     defer alloc.free(timeout_header);
-    const headers = if (auth) |value| &[_][2][]const u8{
-        .{ "Authorization", value },
-        .{ "Content-Type", request.content_type },
-        .{ "X-Antfly-Inference-Attempts-Remaining", "1" },
-        .{ "X-Antfly-Inference-Timeout-Ms", timeout_header },
-    } else &[_][2][]const u8{ .{ "Content-Type", request.content_type }, .{ "X-Antfly-Inference-Attempts-Remaining", "1" }, .{ "X-Antfly-Inference-Timeout-Ms", timeout_header } };
+    var header_buffer: [6][2][]const u8 = undefined;
+    header_buffer[0] = .{ "Content-Type", request.content_type };
+    header_buffer[1] = .{ "X-Antfly-Inference-Attempts-Remaining", "1" };
+    header_buffer[2] = .{ "X-Antfly-Inference-Timeout-Ms", timeout_header };
+    var header_count: usize = 3;
+    if (auth) |value| {
+        header_buffer[header_count] = .{ "Authorization", value };
+        header_count += 1;
+    }
+    if (remote.capability_token) |value| {
+        header_buffer[header_count] = .{ "X-Antfly-Capability-Token", value };
+        header_count += 1;
+    }
+    if (remote.capability_revision) |value| {
+        header_buffer[header_count] = .{ "X-Antfly-Capability-Revision", value };
+        header_count += 1;
+    }
+    const headers = header_buffer[0..header_count];
     if (stream.start != null and stream.write != null and stream.close != null) {
         var writer = @import("antfly_local_sources").common_provider_registry.tasks.StreamWriter{ .sink = stream };
         var response = try (http orelse return error.InferenceTransportUnavailable).requestToWriter(switch (method) {
@@ -461,16 +480,29 @@ fn resolveInferenceConnection(
     }
 
     const config = node_config orelse return error.ConnectionNotFound;
-    if (std.mem.startsWith(u8, connection_id, "transcribers/")) {
-        const cfg = config.transcribers.getConfig(connection_id["transcribers/".len..]) catch return error.ConnectionNotFound;
-        if (cfg.provider != .antfly) return error.ProviderNotAntflyCompatible;
-        // Preserve the alias identity even when it inherits the runtime URL.
-        // Only the actual process-local target delegates admission locally.
-        const uses_default = cfg.resolvedUrl() == null;
-        if (uses_default) if (local_target) |target| return .{ .local = target };
-        const url = cfg.resolvedUrl() orelse config.inference.api_url orelse return error.ConnectionURLMissing;
-        if (!validInferenceURL(url)) return error.InvalidConnectionURL;
-        return .{ .remote = .{ .url = url, .api_key = cfg.bearer_token orelse cfg.api_key orelse (if (uses_default) config.inference.api_key else null), .preserve_api_path = !uses_default } };
+    inline for (.{ "readers", "transcribers" }) |family| {
+        const prefix = family ++ "/";
+        if (std.mem.startsWith(u8, connection_id, prefix)) {
+            if (comptime std.mem.eql(u8, family, "readers")) {
+                if (!std.mem.eql(u8, operation, "read")) return error.UnsupportedInferenceOperation;
+            }
+            const cfg = @field(config, family).getConfig(connection_id[prefix.len..]) catch return error.ConnectionNotFound;
+            if (cfg.provider != .antfly) return error.ProviderNotAntflyCompatible;
+            // Only the process-local target delegates admission. Explicit
+            // provider endpoints retain their own credential and mount scope.
+            const uses_default = cfg.resolvedUrl() == null;
+            if (uses_default) if (local_target) |target| return .{ .local = target };
+            const url = cfg.resolvedUrl() orelse config.inference.api_url orelse return error.ConnectionURLMissing;
+            if (!validInferenceURL(url)) return error.InvalidConnectionURL;
+            return .{ .remote = .{
+                .url = url,
+                .api_key = cfg.bearer_token orelse cfg.api_key orelse (if (uses_default) config.inference.api_key else null),
+                .preserve_api_path = !uses_default,
+                .credential_env = if (comptime std.mem.eql(u8, family, "readers")) "ANTFLY_INFERENCE_API_KEY" else null,
+                .capability_token = if (comptime std.mem.eql(u8, family, "readers")) cfg.capability_token else null,
+                .capability_revision = if (comptime std.mem.eql(u8, family, "readers")) cfg.capability_revision else null,
+            } };
+        }
     }
     if (std.mem.eql(u8, connection_id, common_config.default_inference_connection_id)) {
         const url = config.inference.api_url orelse return error.ConnectionNotFound;
@@ -2617,4 +2649,21 @@ test "httpx inference gateway discovers remote chains synthesis and data only ta
     try std.testing.expectEqualStrings("synthesizers", result.models[1].kind.groupKey());
     try std.testing.expectEqualStrings("generators", result.models[2].kind.groupKey());
     try std.testing.expectEqualStrings("embedders", result.models[3].kind.groupKey());
+}
+
+test "httpx inference gateway reader aliases scope remote credentials and admission" {
+    const a = std.testing.allocator;
+    var cfg = try common_config.Config.parseFromSlice(a, "{\"inference\":{\"api_url\":\"https://runtime\",\"api_key\":\"default-token\"}}");
+    defer cfg.deinit();
+    try cfg.readers.registerConfig("inherited", .{ .provider = .antfly, .model = "agent" });
+    try cfg.readers.registerConfig("remote", .{ .provider = .antfly, .model = "agent", .api_url = "https://remote/custom/api", .api_key = "reader-token", .capability_token = "lease", .capability_revision = "revision" });
+    const inherited = try resolveInferenceConnection(&cfg, null, "readers/inherited", "read");
+    try std.testing.expectEqualStrings("default-token", inherited.remote.api_key.?);
+    const explicit = try resolveInferenceConnection(&cfg, null, "readers/remote", "read");
+    try std.testing.expectEqualStrings("reader-token", explicit.remote.api_key.?);
+    try std.testing.expect(explicit.remote.preserve_api_path);
+    try std.testing.expectEqualStrings("lease", explicit.remote.capability_token.?);
+    try std.testing.expectEqualStrings("revision", explicit.remote.capability_revision.?);
+    try std.testing.expectEqual(InferenceAdmissionOwner.caller, try inferenceConnectionAdmissionOwner(&cfg, null, "readers/remote", "read"));
+    try std.testing.expectError(error.UnsupportedInferenceOperation, resolveInferenceConnection(&cfg, null, "readers/remote", "generate"));
 }

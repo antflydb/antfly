@@ -23,15 +23,36 @@ const ooxml = @import("ooxml.zig");
 const slide_parts = @import("slides.zig");
 const A = std.mem.Allocator;
 pub const Input = @import("antfly_readers").DocumentSource;
+// Structural parsing is bounded independently of the selected-page work budget.
+pub const max_source_pages = 10000;
+fn selectedPage(selection: ?[]const usize, number: usize) bool {
+    const pages = selection orelse return true;
+    return std.sort.binarySearch(usize, pages, number, struct {
+        fn order(key: usize, value: usize) std.math.Order {
+            return std.math.order(key, value);
+        }
+    }.order) != null;
+}
 pub const Slide = struct { path: []const u8, hidden: bool = false, notes: ?[]const u8 = null, inherited: []const c.InheritedPart = &.{} };
 pub const Source = struct {
     input: Input,
     fingerprint: [64]u8,
     bytes: []const u8,
+    page_selection: ?[]const usize = null,
     parsed: union(enum) { pdf: pdf.reader.Reader, image: void, slides: struct { archive: ooxml.Archive, slides: []const Slide } },
     pub fn init(a: A, input: Input, bytes: []const u8, limits: c.Limits, control: c.Control) !Source {
         try control.check();
         if (input.id.len == 0 or input.id.len > 256 or bytes.len > limits.max_source_bytes) return error.InvalidDocumentSource;
+        const selection: ?[]const usize = if (input.pages) |pages| blk: {
+            if (pages.len == 0) return error.InvalidDocumentSelection;
+            if (pages.len > limits.max_pages) return error.DocumentPageLimitExceeded;
+            const sorted = try a.dupe(usize, pages);
+            std.mem.sort(usize, sorted, {}, std.sort.asc(usize));
+            for (sorted, 0..) |number, i| {
+                if (number == 0 or (i > 0 and sorted[i - 1] == number)) return error.InvalidDocumentSelection;
+            }
+            break :blk sorted;
+        } else null;
         var hash: [32]u8 = undefined;
         std.crypto.hash.sha2.Sha256.hash(bytes, &hash, .{});
         const fingerprint = std.fmt.bytesToHex(hash, .lower);
@@ -60,17 +81,24 @@ pub const Source = struct {
                 if (token != .tag or token.tag.closing or !std.mem.eql(u8, token.tag.local(), "sldId")) continue;
                 const id = token.tag.attr("r:id") orelse return error.InvalidDocumentXml;
                 const path = try relationship(a, relationships, id, "ppt/");
-                const xml = try archive.get(a, path);
-                var slide_iter = ooxml.Xml{ .bytes = xml };
-                var hidden = false;
-                while (try slide_iter.next()) |part| {
-                    if (part == .tag and !part.tag.closing and std.mem.eql(u8, part.tag.local(), "sld")) {
-                        if (part.tag.attr("show")) |show| hidden = std.mem.eql(u8, show, "0") or std.mem.eql(u8, show, "false");
-                        break;
+                if (slides.items.len >= max_source_pages) return error.DocumentPageLimitExceeded;
+                const number = slides.items.len + 1;
+                if (selection == null and number > limits.max_pages) return error.DocumentPageLimitExceeded;
+                var slide = Slide{ .path = path };
+                // Unselected slides keep their original indexes but do not
+                // decompress XML, walk inheritance, or populate part caches.
+                if (selectedPage(selection, number)) {
+                    const xml = try archive.get(a, path);
+                    var slide_iter = ooxml.Xml{ .bytes = xml };
+                    while (try slide_iter.next()) |part| {
+                        if (part == .tag and !part.tag.closing and std.mem.eql(u8, part.tag.local(), "sld")) {
+                            if (part.tag.attr("show")) |show| slide.hidden = std.mem.eql(u8, show, "0") or std.mem.eql(u8, show, "false");
+                            break;
+                        }
                     }
+                    slide.inherited = try inheritance.inherited(a, archive, path, xml);
                 }
-                if (slides.items.len >= limits.max_pages) return error.DocumentPageLimitExceeded;
-                try slides.append(a, .{ .path = path, .hidden = hidden, .inherited = try inheritance.inherited(a, archive, path, xml) });
+                try slides.append(a, slide);
             }
             if (slides.items.len == 0) return error.InvalidDocumentSource;
             result = .{ .input = input, .bytes = bytes, .fingerprint = fingerprint, .parsed = .{ .slides = .{ .archive = archive, .slides = try slides.toOwnedSlice(a) } } };
@@ -81,15 +109,13 @@ pub const Source = struct {
             if (info.width > limits.max_dimension or info.height > limits.max_dimension or try info.pixels() > limits.max_pixels) return error.DocumentPixelLimitExceeded;
             result = .{ .input = input, .bytes = bytes, .fingerprint = fingerprint, .parsed = .image };
         } else return error.UnsupportedDocumentFormat;
+        errdefer result.deinit();
+        result.page_selection = selection;
         const count = try result.pageCount();
-        if (count > limits.max_pages) return error.DocumentPageLimitExceeded;
-        if (input.pages) |selection| {
-            if (selection.len == 0 or selection.len > limits.max_pages) return error.InvalidDocumentSelection;
-            for (selection, 0..) |number, i| {
-                if (number == 0 or number > count) return error.InvalidDocumentSelection;
-                for (selection[0..i]) |prior| if (prior == number) return error.InvalidDocumentSelection;
-            }
-        }
+        if (count > max_source_pages) return error.DocumentPageLimitExceeded;
+        if (selection) |pages| {
+            if (pages[pages.len - 1] > count) return error.InvalidDocumentSelection;
+        } else if (count > limits.max_pages) return error.DocumentPageLimitExceeded;
         return result;
     }
     pub fn deinit(self: *Source) void {
@@ -103,12 +129,9 @@ pub const Source = struct {
         };
     }
     pub fn selected(self: Source, number: usize) bool {
-        if (self.input.pages) |selection| {
-            for (selection) |n| if (n == number) return true;
-            return false;
-        }
-        return true;
+        return selectedPage(self.page_selection, number);
     }
+
     pub fn analyze(self: *Source, a: A, number: usize, control: c.Control) !c.Page {
         try control.check();
         var page = c.Page{ .source_id = self.input.id, .number = number, .kind = .image };
@@ -213,3 +236,23 @@ fn relationship(a: A, xml: []const u8, id: []const u8, base: []const u8) ![]cons
     return error.MissingDocumentPart;
 }
 const normalizedPart = slide_parts.normalizedPart;
+
+test "document selections spend page budget only on selected PDF pages and slides" {
+    inline for (.{ .{ @embedFile("testdata/two-pages.pdf"), "application/pdf" }, .{ @embedFile("testdata/ordered-slides.pptx"), "application/vnd.openxmlformats-officedocument.presentationml.presentation" }, .{ @embedFile("testdata/inherited-slides.pptx"), "application/vnd.openxmlformats-officedocument.presentationml.presentation" } }) |fixture| {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        var source = try Source.init(a, .{ .id = "source", .url = "", .media_type = fixture[1], .pages = &.{2} }, fixture[0], .{ .max_pages = 1 }, .{});
+        defer source.deinit();
+        try std.testing.expectEqual(@as(usize, 2), try source.pageCount());
+        try std.testing.expect(!source.selected(1));
+        try std.testing.expect(source.selected(2));
+        const page = try source.analyze(a, 2, .{});
+        try std.testing.expectEqual(@as(usize, 2), page.number);
+        if (source.parsed == .slides) try std.testing.expectEqual(@as(usize, 0), source.parsed.slides.slides[0].inherited.len);
+        try std.testing.expectError(error.DocumentPageLimitExceeded, Source.init(a, .{ .id = "source", .url = "", .media_type = fixture[1] }, fixture[0], .{ .max_pages = 1 }, .{}));
+        try std.testing.expectError(error.DocumentPageLimitExceeded, Source.init(a, .{ .id = "source", .url = "", .media_type = fixture[1], .pages = &.{ 1, 2 } }, fixture[0], .{ .max_pages = 1 }, .{}));
+        try std.testing.expectError(error.InvalidDocumentSelection, Source.init(a, .{ .id = "source", .url = "", .media_type = fixture[1], .pages = &.{3} }, fixture[0], .{ .max_pages = 1 }, .{}));
+        try std.testing.expectError(error.InvalidDocumentSelection, Source.init(a, .{ .id = "source", .url = "", .media_type = fixture[1], .pages = &.{ 1, 1 } }, fixture[0], .{}, .{}));
+    }
+}

@@ -563,6 +563,17 @@ fn executeResolvedImpl(server: anytype, ctx: *httpx.Context, task: gateway.Task,
         if (cfg.api_url.len > 0) return forwardEndpoint(server, ctx, cfg.api_url, null, "chunk", encoded, false, observation, execution_options);
         return forward(server, ctx, if (server.cfg.local_inference_connection_target != null) sources.common_config.local_inference_connection_id else sources.common_config.default_inference_connection_id, "chunk", encoded, false, observation, execution_options);
     }
+    if (task == .read) {
+        const cfg = try named.readers.?.getConfig(target.configured.name);
+        if (cfg.provider == .antfly) {
+            const encoded = try tasks.readingBody(a, cfg, request);
+            // Reads are completed JSON results. Keep the full document envelope
+            // available to ordinary and batch callers, including artifact handles.
+            var read_options = execution_options;
+            read_options.response_delivery = .buffered;
+            return forward(server, ctx, try std.fmt.allocPrint(a, "readers/{s}", .{target.configured.name}), "read", encoded, fallback, observation, read_options);
+        }
+    }
     if (task == .transcribe) {
         const cfg = try named.transcribers.?.getConfig(target.configured.name);
         if (cfg.provider == .antfly) {
@@ -1549,9 +1560,15 @@ fn forward(server: anytype, ctx: *httpx.Context, connection: []const u8, operati
     var guard = tasks.FallbackSink{ .downstream = observed };
     const encoded = try payloads.encodeMetadata(ctx.allocator, body, options.attachments);
     defer if (options.attachments != null) ctx.allocator.free(encoded);
-    var client = httpx.Client.initWithConfig(ctx.allocator, server.inferenceIo(), .{ .keep_alive = false });
-    defer client.deinit();
-    var result = connections.invokeInferenceConnectionWithRequest(ctx.allocator, &client, server.cfg.node_config, server.cfg.local_inference_connection_target, server.cfg.secret_store, connection, operation, encoded, cancellation, ctx.application_deadline_ns orelse connections.inferenceInvocationDeadlineNs(), if (options.response_delivery == .buffered) .{} else if (fallback) guard.sink() else observed, .post, .{ .content_type = if (options.attachments != null) httpx.attachment_envelope.content_type else "application/json", .attempt_observer = observeAttempt(ctx, options.attempt_observer) }) catch |err| {
+    var owned_client: ?httpx.Client = null;
+    defer if (owned_client) |*client| client.deinit();
+    const client: ?*httpx.Client = if (owner == .target) null else if (std.mem.eql(u8, operation, "read"))
+        try server.embedding_provider_runtime.assetHttpClient()
+    else blk: {
+        owned_client = httpx.Client.initWithConfig(ctx.allocator, server.inferenceIo(), .{ .keep_alive = false });
+        break :blk &owned_client.?;
+    };
+    var result = connections.invokeInferenceConnectionWithRequest(ctx.allocator, client, server.cfg.node_config, server.cfg.local_inference_connection_target, server.cfg.secret_store, connection, operation, encoded, cancellation, ctx.application_deadline_ns orelse connections.inferenceInvocationDeadlineNs(), if (options.response_delivery == .buffered) .{} else if (fallback) guard.sink() else observed, .post, .{ .content_type = if (options.attachments != null) httpx.attachment_envelope.content_type else "application/json", .attempt_observer = observeAttempt(ctx, options.attempt_observer) }) catch |err| {
         if (transport.started or guard.committed) return error.InferenceResponseCommitted;
         return guard.failure orelse err;
     };

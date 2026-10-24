@@ -5026,6 +5026,7 @@ fn parseReaderSource(alloc: Allocator, source_text: []const u8, source_parts_jso
 }
 
 fn encodeReaderResults(alloc: Allocator, content_type: []const u8, results: []readers.Result) ![]u8 {
+    try readers.requireComplete(results);
     if (isJsonContentType(content_type)) {
         return try std.json.Stringify.valueAlloc(alloc, results, .{});
     }
@@ -8161,4 +8162,15 @@ test "asset producer runtime provider ownership unwinds every allocation failure
         }
     };
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Check.run, .{});
+}
+
+test "decision provider plain reader materialization rejects incomplete text before transfer" {
+    const a = std.testing.allocator;
+    var results = [_]readers.Result{.{ .text = try a.dupe(u8, "partial receipt"), .completion = .length }};
+    const result = &results[0];
+    defer readers.deinitResult(a, result);
+    try std.testing.expectError(error.ReadOutputTruncated, encodeReaderResults(a, "text/plain", &results));
+    try std.testing.expectEqualStrings("partial receipt", result.text);
+    result.completion = .unresolved;
+    try std.testing.expectError(error.DocumentUnresolved, encodeReaderResults(a, "application/json", &results));
 }

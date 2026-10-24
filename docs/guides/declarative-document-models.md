@@ -21,7 +21,9 @@ processing does not introduce another `/agents` resource.
 Supply exactly one input form. `/read` accepts `images` or `documents`;
 `/extract` accepts `inputs`, `documents`, or `read_artifact`. Existing image
 requests retain their image behavior. Document results carry `source_id` and the
-one-based original page/slide `number`. Selection never renumbers source pages;
+one-based original page/slide `number`. `max_pages` bounds selected pages across
+the run. Structural source inspection has a separate 10,000-page ceiling;
+unselected slides are not decompressed or composed. Selection never renumbers source pages;
 results follow original source order, regardless of selection order. Independent
 sources remain independent extraction contexts. URLs inherit the deployment's
 existing content security restrictions.

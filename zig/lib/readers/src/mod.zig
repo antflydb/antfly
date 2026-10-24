@@ -686,49 +686,7 @@ const AntflyReaderState = struct {
         defer resp.deinit();
         if (!resp.ok()) return readHttpStatusError(resp.status.code, responseCapabilityStale(resp));
 
-        const payload = resp.body orelse return error.EmptyResponse;
-        var parsed = try std.json.parseFromSlice(inference_api.ReadResponse, alloc, payload, .{
-            .ignore_unknown_fields = true,
-        });
-        defer parsed.deinit();
-        if (parsed.value.data.len != req.images.len) return error.InvalidReadResultCount;
-
-        const out = try alloc.alloc(Result, req.images.len);
-        const assigned = alloc.alloc(bool, req.images.len) catch |err| {
-            alloc.free(out);
-            return err;
-        };
-        defer alloc.free(assigned);
-        @memset(assigned, false);
-        errdefer {
-            for (out, assigned) |*item, was_assigned| {
-                if (was_assigned) deinitResult(alloc, item);
-            }
-            alloc.free(out);
-        }
-        var initialized: usize = 0;
-        for (parsed.value.data) |item| {
-            if (item.index < 0) return error.InvalidReadResultCount;
-            const result_index = std.math.cast(usize, item.index) orelse return error.InvalidReadResultCount;
-            if (result_index >= req.images.len or assigned[result_index]) return error.InvalidReadResultCount;
-            var result = Result{
-                .text = try alloc.dupe(u8, item.text),
-                .fields_json = null,
-                .regions_json = null,
-            };
-            errdefer deinitResult(alloc, &result);
-            if (item.fields == .value) result.fields_json = try std.json.Stringify.valueAlloc(alloc, item.fields.value, .{});
-            if (item.regions) |regions| result.regions_json = try std.json.Stringify.valueAlloc(alloc, regions, .{});
-            out[result_index] = result;
-            assigned[result_index] = true;
-            initialized += 1;
-        }
-        if (initialized != req.images.len) return error.InvalidReadResultCount;
-        return .{
-            .items = out,
-            .execution = try batchExecutionFromWire(parsed.value.execution, out.len),
-            .usage = parsed.value.usage,
-        };
+        return decodeReadBatch(alloc, resp.body orelse return error.EmptyResponse, req.images.len);
     }
 
     fn readEncodedReported(self: *AntflyReaderState, alloc: Allocator, req: EncodedRequest) !BatchResult {
@@ -792,68 +750,17 @@ const AntflyReaderState = struct {
         defer resp.deinit();
         if (!resp.ok()) return readHttpStatusError(resp.status.code, responseCapabilityStale(resp));
 
-        const payload = resp.body orelse return error.EmptyResponse;
-        var parsed = try std.json.parseFromSlice(inference_api.ReadResponse, alloc, payload, .{
-            .ignore_unknown_fields = true,
-        });
-        defer parsed.deinit();
-        if (parsed.value.data.len != req.images.len) return error.InvalidReadResultCount;
-
-        const out = try alloc.alloc(Result, req.images.len);
-        const assigned = alloc.alloc(bool, req.images.len) catch |err| {
-            alloc.free(out);
-            return err;
-        };
-        defer alloc.free(assigned);
-        @memset(assigned, false);
-        errdefer {
-            for (out, assigned) |*item, was_assigned| if (was_assigned) deinitResult(alloc, item);
-            alloc.free(out);
+        var batch = try decodeReadBatch(alloc, resp.body orelse return error.EmptyResponse, req.images.len);
+        errdefer batch.deinit(alloc);
+        for (batch.items, req.images) |*item, original| {
+            if (item.item_id.len > 0) alloc.free(@constCast(item.item_id));
+            item.item_id = "";
+            if (original.item_id.len > 0) item.item_id = try alloc.dupe(u8, original.item_id);
+            item.page_number = original.page_number;
+            if (original.source_fingerprint) |value| item.source_fingerprint = try alloc.dupe(u8, value);
         }
-        var initialized: usize = 0;
-        for (parsed.value.data) |wire_item| {
-            if (wire_item.index < 0) return error.InvalidReadResultCount;
-            const result_index = std.math.cast(usize, wire_item.index) orelse return error.InvalidReadResultCount;
-            if (result_index >= req.images.len or assigned[result_index]) return error.InvalidReadResultCount;
-            const text = try alloc.dupe(u8, wire_item.text);
-            var owns_text = true;
-            errdefer if (owns_text) alloc.free(text);
-            const item_id = if (req.images[result_index].item_id.len > 0)
-                try alloc.dupe(u8, req.images[result_index].item_id)
-            else
-                "";
-            var owns_item_id = item_id.len > 0;
-            errdefer if (owns_item_id) alloc.free(@constCast(item_id));
-            const source_fingerprint = if (req.images[result_index].source_fingerprint) |value|
-                try alloc.dupe(u8, value)
-            else
-                null;
-            var owns_source_fingerprint = source_fingerprint != null;
-            errdefer if (owns_source_fingerprint) alloc.free(source_fingerprint.?);
-            var result = Result{
-                .text = text,
-                .fields_json = null,
-                .regions_json = null,
-                .item_id = item_id,
-                .source_fingerprint = source_fingerprint,
-                .page_number = req.images[result_index].page_number,
-            };
-            owns_text = false;
-            owns_item_id = false;
-            owns_source_fingerprint = false;
-            errdefer deinitResult(alloc, &result);
-            if (wire_item.fields == .value) result.fields_json = try std.json.Stringify.valueAlloc(alloc, wire_item.fields.value, .{});
-            if (wire_item.regions) |regions| result.regions_json = try std.json.Stringify.valueAlloc(alloc, regions, .{});
-            out[result_index] = result;
-            assigned[result_index] = true;
-            initialized += 1;
-        }
-        if (initialized != req.images.len) return error.InvalidReadResultCount;
-        return .{
-            .items = out,
-            .execution = try batchExecutionFromWire(parsed.value.execution, out.len),
-            .usage = parsed.value.usage,
-        };
+        if (!req.allow_incomplete) try requireComplete(batch.items);
+        return batch;
     }
 };
 
@@ -1670,40 +1577,71 @@ pub fn documentResults(a: Allocator, json: []const u8) ![]Result {
 
 /// Parse the document envelope once, preserving completion and aggregate usage.
 pub fn documentBatchResult(a: Allocator, json: []const u8) !BatchResult {
-    var parsed = try std.json.parseFromSlice(std.json.Value, a, json, .{});
+    return decodeReadBatch(a, json, null);
+}
+
+/// Lossless, shared URI/attachment/document decoder. Image requests enforce
+/// their exact indexed cardinality; document requests retain page order.
+fn decodeReadBatch(a: Allocator, json: []const u8, expected_images: ?usize) !BatchResult {
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, json, .{ .parse_numbers = false });
     defer parsed.deinit();
     if (parsed.value != .object) return error.InvalidReadResultCount;
     const data = parsed.value.object.get("data") orelse return error.InvalidReadResultCount;
     if (data != .array or data.array.items.len > 10000) return error.InvalidReadResultCount;
+    if (expected_images) |count| {
+        if (data.array.items.len != count) return error.InvalidReadResultCount;
+        const object = parsed.value.object.get("object") orelse return error.InvalidReadResultCount;
+        const model = parsed.value.object.get("model") orelse return error.InvalidReadResultCount;
+        const counts = parsed.value.object.get("usage") orelse return error.InvalidReadExecutionReport;
+        if (object != .string or model != .string or counts != .object) return error.InvalidReadResultCount;
+    }
     const out = try a.alloc(Result, data.array.items.len);
-    var initialized: usize = 0;
+    const assigned = a.alloc(bool, out.len) catch |err| {
+        a.free(out);
+        return err;
+    };
+    defer a.free(assigned);
+    @memset(assigned, false);
     errdefer {
-        for (out[0..initialized]) |*item| deinitResult(a, item);
+        for (out, assigned) |*item, ready| if (ready) deinitResult(a, item);
         a.free(out);
     }
-    for (data.array.items, out) |row, *item| {
+    for (data.array.items, 0..) |row, position| {
         if (row != .object) return error.InvalidReadResultCount;
+        if (expected_images != null) {
+            const object = row.object.get("object") orelse return error.InvalidReadResultCount;
+            if (object != .string) return error.InvalidReadResultCount;
+        }
+        const index = if (expected_images != null)
+            try readUnsigned(usize, a, row.object.get("index") orelse return error.InvalidReadResultCount)
+        else
+            position;
+        if (index >= out.len or assigned[index]) return error.InvalidReadResultCount;
+        const item = &out[index];
         const text = row.object.get("text") orelse return error.InvalidReadResultCount;
         if (text != .string) return error.InvalidReadResultCount;
         item.* = .{ .text = try a.dupe(u8, text.string) };
-        initialized += 1;
-        if (row.object.get("status")) |status| {
+        assigned[index] = true;
+        if (row.object.get("status")) |status| if (status != .null) {
             if (status != .string) return error.InvalidReadResultCount;
             item.completion = if (std.mem.eql(u8, status.string, "complete")) .complete else if (std.mem.eql(u8, status.string, "truncated")) .length else if (std.mem.eql(u8, status.string, "unresolved")) .unresolved else return error.InvalidReadResultCount;
-        }
-        item.document_json = try std.json.Stringify.valueAlloc(a, row, .{});
-        if (row.object.get("source_id")) |id| {
+        };
+        if (expected_images == null or row.object.contains("status") or row.object.contains("source_id"))
+            item.document_json = try std.json.Stringify.valueAlloc(a, row, .{});
+        if (row.object.get("source_id")) |id| if (id != .null) {
             if (id != .string) return error.InvalidReadResultCount;
             item.item_id = try a.dupe(u8, id.string);
-        }
-        if (row.object.get("number")) |number| {
-            if (number != .integer or number.integer < 1) return error.InvalidReadResultCount;
-            item.page_number = std.math.cast(u32, number.integer) orelse return error.InvalidReadResultCount;
-        }
+        };
+        if (row.object.get("number")) |number| if (number != .null) {
+            const n = try readUnsigned(u32, a, number);
+            if (n == 0) return error.InvalidReadResultCount;
+            item.page_number = n;
+        };
         if (row.object.get("fields")) |value| if (value != .null) {
             item.fields_json = try std.json.Stringify.valueAlloc(a, value, .{});
         };
         if (row.object.get("regions")) |value| if (value != .null) {
+            if (value != .array) return error.InvalidReadResultCount;
             item.regions_json = try std.json.Stringify.valueAlloc(a, value, .{});
         };
     }
@@ -1715,7 +1653,101 @@ pub fn documentBatchResult(a: Allocator, json: []const u8) !BatchResult {
         if (counts.prompt_tokens < 0 or counts.completion_tokens < 0 or counts.total_tokens < 0) return error.InvalidReadExecutionReport;
         usage = counts;
     }
-    return .{ .items = out, .usage = usage, .execution = .{ .requested_items = out.len, .serial_items = out.len } };
+    var execution = try batchExecutionFromWire(null, out.len);
+    if (parsed.value.object.get("execution")) |value| if (value != .null) {
+        var decoded = try std.json.parseFromValue(inference_api.BatchExecutionReport, a, value, .{ .ignore_unknown_fields = true });
+        defer decoded.deinit();
+        execution = try batchExecutionFromWire(decoded.value, out.len);
+    };
+    return .{ .items = out, .usage = usage, .execution = execution };
+}
+
+fn readUnsigned(comptime T: type, a: Allocator, value: std.json.Value) !T {
+    if (value != .integer and value != .number_string) return error.InvalidReadResultCount;
+    // Typed conversion keeps integer metadata (including exponent notation)
+    // separate from the lossless structured payload. Primitive parsing allocates nothing.
+    return std.json.parseFromValueLeaky(T, a, value, .{}) catch error.InvalidReadResultCount;
+}
+
+/// Plain-text materialization cannot carry completion metadata. Refuse partial
+/// readings before ownership transfer or indexing; compositions opt in explicitly.
+pub fn requireComplete(items: []const Result) !void {
+    for (items) |item| switch (item.completion) {
+        .complete => {},
+        .length => return error.ReadOutputTruncated,
+        .unresolved => return error.DocumentUnresolved,
+    };
+}
+
+test "antfly reader canonical decoding preserves exact fields and indexed completion" {
+    const Case = struct {
+        fn run(a: Allocator) !void {
+            const bytes =
+                \\{"object":"list","model":"reader","data":[{"object":"read","index":1e0,"text":"Second","status":"unresolved","source_id":"receipt","number":2,"fields":{"amount":9007199254740993.01}},{"object":"read","index":0,"text":"First","status":"truncated","source_id":"receipt","number":1}],"usage":{"prompt_tokens":2,"completion_tokens":3,"total_tokens":5},"execution":{"requested_items":2,"native_batches":0,"native_items":0,"serial_items":2,"fallback_items":0,"rejected_items":0}}
+            ;
+            var batch = try decodeReadBatch(a, bytes, 2);
+            defer batch.deinit(a);
+            try std.testing.expectEqualStrings("First", batch.items[0].text);
+            try std.testing.expectEqual(Completion.length, batch.items[0].completion);
+            try std.testing.expectEqual(Completion.unresolved, batch.items[1].completion);
+            try std.testing.expectEqual(@as(?u32, 2), batch.items[1].page_number);
+            try std.testing.expectEqualStrings("{\"amount\":9007199254740993.01}", batch.items[1].fields_json.?);
+            try std.testing.expect(std.mem.indexOf(u8, batch.items[1].document_json.?, "9007199254740993.01") != null);
+            try std.testing.expectEqual(@as(i64, 5), batch.usage.?.total_tokens);
+            try std.testing.expectError(error.ReadOutputTruncated, requireComplete(batch.items));
+            try std.testing.expectError(error.DocumentUnresolved, requireComplete(batch.items[1..]));
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
+    const a = std.testing.allocator;
+    for ([_][]const u8{
+        "[{\"object\":\"read\",\"index\":0,\"text\":\"a\"},{\"object\":\"read\",\"index\":0,\"text\":\"b\"}]",
+        "[{\"object\":\"read\",\"index\":2,\"text\":\"a\"},{\"object\":\"read\",\"index\":1,\"text\":\"b\"}]",
+        "[{\"object\":\"read\",\"index\":0.5,\"text\":\"a\"},{\"object\":\"read\",\"index\":1,\"text\":\"b\"}]",
+    }) |data| {
+        const bytes = try std.fmt.allocPrint(a, "{{\"object\":\"list\",\"model\":\"reader\",\"usage\":{{\"prompt_tokens\":0,\"completion_tokens\":0,\"total_tokens\":0}},\"data\":{s}}}", .{data});
+        defer a.free(bytes);
+        try std.testing.expectError(error.InvalidReadResultCount, decodeReadBatch(a, bytes, 2));
+    }
+}
+
+test "antfly reader URI and encoded transports retain composite completion and exact fields" {
+    const a = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const Serve = struct {
+        fn run(server: *httpx.TestServer) void {
+            server.handleOne() catch {};
+        }
+    };
+    for (0..3) |mode| {
+        var server = try httpx.TestServer.start(a, io, &.{.{ .method = .POST, .path = "/read", .respond = .{ .body = "{\"object\":\"list\",\"model\":\"agent\",\"data\":[{\"object\":\"read\",\"index\":0,\"text\":\"Partial receipt\",\"status\":\"truncated\",\"source_id\":\"image-0\",\"number\":1,\"fields\":{\"amount\":9007199254740993.01}}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":2,\"total_tokens\":3}}" } }});
+        defer server.deinit();
+        var group = std.Io.Group.init;
+        defer group.cancel(io);
+        try group.concurrent(io, Serve.run, .{&server});
+        var client = httpx.Client.init(a, io);
+        defer client.deinit();
+        const cfg = Config{ .provider = .antfly, .model = "agent", .api_url = server.baseUrl() };
+        const encoded = EncodedRequest{ .allow_incomplete = mode == 1, .images = &.{.{ .bytes = &.{1}, .mime_type = "image/png", .item_id = "original", .page_number = 8 }} };
+        if (mode == 2) {
+            try std.testing.expectError(error.ReadOutputTruncated, readEncodedWithConfigReported(a, &client, cfg, encoded, .{}));
+        } else {
+            var batch = if (mode == 0)
+                try readWithConfigReported(a, &client, cfg, .{ .images = &.{"https://example.invalid/receipt.png"} }, .{})
+            else
+                try readEncodedWithConfigReported(a, &client, cfg, encoded, .{});
+            defer batch.deinit(a);
+            try std.testing.expectEqual(Completion.length, batch.items[0].completion);
+            try std.testing.expectEqualStrings("{\"amount\":9007199254740993.01}", batch.items[0].fields_json.?);
+            if (mode == 1) {
+                try std.testing.expectEqualStrings("original", batch.items[0].item_id);
+                try std.testing.expectEqual(@as(?u32, 8), batch.items[0].page_number);
+            }
+        }
+        try group.await(io);
+    }
 }
 
 test "document reader decoding preserves completion and usage with allocation rollback" {

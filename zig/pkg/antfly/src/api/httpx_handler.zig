@@ -20173,3 +20173,51 @@ test "public execution composes every internal budget and validates combined hea
     try AntflyApiHandler.establishExecutionDeadlines(&ctx);
     try std.testing.expectEqual(@as(u64, 0), ctx.application_deadline_ns.?);
 }
+
+test "httpx inference gateway configured readers preserve documents artifacts status and exact values" {
+    const Target = struct {
+        calls: usize = 0,
+        const reply = "{\"object\":\"list\",\"model\":\"backend\",\"data\":[{\"object\":\"read\",\"index\":0,\"text\":\"receipt\",\"status\":\"unresolved\",\"fields\":{\"amount\":9007199254740993.01}}],\"document\":{\"artifact_id\":\"opaque\"},\"events\":[],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":2,\"total_tokens\":3}}";
+        fn invoke(context: *const inference_connection_abi.InvokeContext) callconv(.c) inference_connection_abi.Status {
+            const self: *@This() = @ptrCast(@alignCast(context.target_context));
+            const a = context.allocator.asStd();
+            const parsed = std.json.parseFromSlice(std.json.Value, a, context.body.slice(), .{}) catch return inference_connection_abi.statusFromError(error.InvalidArgument);
+            defer parsed.deinit();
+            const root = parsed.value.object;
+            if (!std.mem.eql(u8, context.operation.slice(), "read") or !std.mem.eql(u8, root.get("model").?.string, "backend") or !std.mem.eql(u8, root.get("prompt").?.string, "defaults") or root.get("max_tokens").?.integer != 99) return inference_connection_abi.statusFromError(error.InvalidArgument);
+            if (root.get("documents")) |documents| {
+                const doc = documents.array.items[0].object;
+                if (!std.mem.eql(u8, doc.get("id").?.string, "receipt") or doc.get("pages").?.array.items[0].integer != 2 or !root.get("retain_artifact").?.bool) return inference_connection_abi.statusFromError(error.InvalidArgument);
+            }
+            self.calls += 1;
+            const body = a.dupe(u8, reply) catch return inference_connection_abi.statusFromError(error.OutOfMemory);
+            context.out_response.* = .{ .status = 200, .body = .{ .ptr = body.ptr, .len = body.len } };
+            return .ok;
+        }
+    };
+    const a = std.testing.allocator;
+    var config = try common_config.Config.parseFromSlice(a, "{\"public_inference\":{\"enabled\":true}}");
+    defer config.deinit();
+    try config.readers.registerConfig("agent", .{ .provider = .antfly, .model = "backend", .prompt = "defaults", .max_tokens = 99 });
+    var source = AuthStatusSource{};
+    var target = Target{};
+    var server = ApiHttpServer.init(a, .{ .node_config = &config, .local_inference_connection_target = .{ .capabilities = inference_connection_abi.Capability.streaming_response, .context = &target, .invoke = Target.invoke } }, source.iface(), null, null);
+    defer server.deinit();
+    var handler = AntflyApiHandler{ .api_server = &server };
+    for ([_][]const u8{
+        "{\"model\":\"readers/agent\",\"documents\":[{\"id\":\"receipt\",\"url\":\"https://example.invalid/r.pdf\",\"media_type\":\"application/pdf\",\"pages\":[2]}],\"retain_artifact\":true}",
+        "{\"model\":\"readers/agent\",\"images\":[\"data:image/png;base64,AQ==\"]}",
+    }) |body| {
+        var request = try httpx.Request.init(a, .POST, "http://localhost/ai/v1/read");
+        defer request.deinit();
+        request.body = body;
+        var ctx = httpx.Context.init(a, std.testing.io, &request);
+        defer ctx.deinit();
+        var response = try handler.gatewayRead(&ctx);
+        defer response.deinit();
+        try std.testing.expectEqual(@as(u16, 200), response.status.code);
+        try std.testing.expectEqualStrings(Target.reply, response.body.?);
+    }
+    try std.testing.expectEqual(@as(usize, 2), target.calls);
+    try std.testing.expectEqual(@as(usize, 0), server.inferenceAdmissionStats().in_flight);
+}

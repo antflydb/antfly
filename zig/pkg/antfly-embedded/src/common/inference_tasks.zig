@@ -479,6 +479,36 @@ pub fn generatedGenerator(a: std.mem.Allocator, cfg: generating.GeneratorConfig,
     return forwarded;
 }
 
+/// Preserve the complete read surface (including documents and retained
+/// artifacts) through configured aliases. Only deployment defaults are projected.
+pub fn readingBody(a: std.mem.Allocator, cfg: readers.Config, request: Json) ![]u8 {
+    if (cfg.provider != .antfly or request != .object) return error.UnsupportedInferenceFeature;
+    var forwarded = request;
+    try forwarded.object.put(a, "model", .{ .string = cfg.model orelse return error.ModelRequired });
+    if (forwarded.object.getPtr("images")) |images| {
+        if (images.* != .array) return error.InvalidInferenceRequest;
+        for (images.array.items) |*image| if (image.* == .string) {
+            var normalized: Json = .{ .object = .empty };
+            try normalized.object.put(a, "url", image.*);
+            image.* = normalized;
+        };
+    }
+    inline for (.{ "prompt", "max_tokens" }) |name| {
+        const value = forwarded.object.get(name);
+        if (value == null or value.? == .null) if (@field(cfg, name)) |fallback| {
+            try forwarded.object.put(a, name, try std.json.parseFromSliceLeaky(Json, a, try std.json.Stringify.valueAlloc(a, fallback, .{}), .{}));
+        };
+    }
+    const decoded = std.json.parseFromValue(@import("inference_api").ReadRequest, a, forwarded, .{}) catch return error.InvalidInferenceRequest;
+    defer decoded.deinit();
+    const body = decoded.value;
+    if ((body.images != null) == (body.documents != null)) return error.InvalidInferenceRequest;
+    const count = if (body.images) |images| images.len else body.documents.?.len;
+    if (count == 0 or count > 64) return error.InvalidInferenceRequest;
+    if (body.max_tokens) |tokens| if (tokens < 1 or tokens > 1024) return error.InvalidInferenceRequest;
+    return std.json.Stringify.valueAlloc(a, forwarded, .{});
+}
+
 /// Keep native dictation options intact while applying named transcription
 /// defaults with the same precedence as the typed executor.
 pub fn transcriptionBody(a: std.mem.Allocator, cfg: transcribing.Config, request: Json) ![]u8 {
@@ -747,4 +777,30 @@ pub fn embeddingParts(a: std.mem.Allocator, input: Json) ![]@import("antfly_temp
         } else return error.UnsupportedInferenceFeature;
     }
     return parts;
+}
+
+test "provider registry gateway read aliases preserve documents retention and caller defaults" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const request = try std.json.parseFromSliceLeaky(Json, a,
+        \\{"model":"readers/alias","documents":[{"id":"receipt","url":"https://example.invalid/r.pdf","media_type":"application/pdf","pages":[2]}],"retain_artifact":true}
+    , .{});
+    const encoded = try readingBody(a, .{ .provider = .antfly, .model = "backend", .prompt = "Read totals", .max_tokens = 99 }, request);
+    const value = try std.json.parseFromSliceLeaky(Json, a, encoded, .{});
+    try std.testing.expectEqualStrings("backend", value.object.get("model").?.string);
+    try std.testing.expectEqualStrings("Read totals", value.object.get("prompt").?.string);
+    try std.testing.expectEqual(@as(i64, 99), value.object.get("max_tokens").?.integer);
+    try std.testing.expect(value.object.get("retain_artifact").?.bool);
+    try std.testing.expectEqual(@as(i64, 2), value.object.get("documents").?.array.items[0].object.get("pages").?.array.items[0].integer);
+    for ([_][]const u8{
+        "{\"documents\":[],\"images\":[{\"url\":\"x\"}]}",
+        "{\"documents\":[]}",
+        "{\"images\":[{\"url\":\"x\"}],\"retain_artifact\":\"yes\"}",
+        "{\"images\":[{\"url\":\"x\"}],\"hidden_override\":true}",
+    }) |invalid| try std.testing.expectError(error.InvalidInferenceRequest, readingBody(a, .{ .provider = .antfly, .model = "backend" }, try std.json.parseFromSliceLeaky(Json, a, invalid, .{})));
+    const legacy = try readingBody(a, .{ .provider = .antfly, .model = "backend", .prompt = "default" }, try std.json.parseFromSliceLeaky(Json, a, "{\"images\":[\"url\"],\"prompt\":\"caller\"}", .{}));
+    const image = try std.json.parseFromSliceLeaky(Json, a, legacy, .{});
+    try std.testing.expectEqualStrings("url", image.object.get("images").?.array.items[0].object.get("url").?.string);
+    try std.testing.expectEqualStrings("caller", image.object.get("prompt").?.string);
 }

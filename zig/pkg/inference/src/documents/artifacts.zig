@@ -18,6 +18,18 @@
 //! store does not execute models, retain source credentials, or resume jobs.
 const std = @import("std");
 const A = std.mem.Allocator;
+/// Retention adds only the handle to the response. Keep structured numeric
+/// tokens exact and leave the immutable stored reading untouched.
+pub fn responseWithHandle(work: A, output: A, result: []const u8, handle: []const u8, ttl_ms: u64) ![]u8 {
+    const envelope = try std.json.parseFromSliceLeaky(std.json.Value, work, result, .{ .parse_numbers = false });
+    if (envelope != .object) return error.InvalidDocumentArtifact;
+    const document = envelope.object.getPtr("document") orelse return error.InvalidDocumentArtifact;
+    if (document.* != .object) return error.InvalidDocumentArtifact;
+    try document.object.put(work, "artifact_id", .{ .string = handle });
+    try document.object.put(work, "artifact_ttl_ms", .{ .integer = @intCast(ttl_ms) });
+    return std.json.Stringify.valueAlloc(output, envelope, .{});
+}
+
 pub const Charge = struct {
     ptr: ?*anyopaque = null,
     release_fn: ?*const fn (?*anyopaque) void = null,
@@ -314,4 +326,16 @@ test "document artifact snapshots survive eviction and allocation callbacks can 
     try std.testing.expectEqualStrings("immutable", copy);
     try std.testing.expectEqualStrings("immutable", pinned.bytes());
     try std.testing.expectError(error.DocumentArtifactNotFound, store.acquire(a, &@as([64]u8, @splat('a')), 0));
+}
+
+test "document retained responses preserve exact structured numeric tokens" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const original = "{\"data\":[{\"fields\":{\"amount\":9007199254740993.01}}],\"document\":{\"status\":\"complete\"}}";
+    const response = try responseWithHandle(arena.allocator(), a, original, "handle", 300000);
+    defer a.free(response);
+    try std.testing.expect(std.mem.indexOf(u8, response, "9007199254740993.01") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "\"artifact_id\":\"handle\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, original, "artifact_id") == null);
 }

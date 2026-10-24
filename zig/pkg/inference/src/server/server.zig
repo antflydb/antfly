@@ -7950,6 +7950,7 @@ pub const Node = struct {
                     item.page_number = original.page_number;
                     if (original.source_fingerprint) |fingerprint| item.source_fingerprint = try allocator.dupe(u8, fingerprint);
                 }
+                if (!request.allow_incomplete) try readers_api.requireComplete(items);
                 return batch;
             }
         }
@@ -18074,11 +18075,7 @@ pub const Node = struct {
                     Lease.release(charge);
                     return output.dupe(u8, result);
                 }
-                var envelope = try std.json.parseFromSliceLeaky(std.json.Value, a, result, .{});
-                const document = envelope.object.getPtr("document").?;
-                try document.object.put(a, "artifact_id", .{ .string = &key });
-                try document.object.put(a, "artifact_ttl_ms", .{ .integer = 300000 });
-                return std.json.Stringify.valueAlloc(output, envelope, .{});
+                return @import("../documents/artifacts.zig").responseWithHandle(a, output, result, &key, 300000);
             }
         }
         return output.dupe(u8, result);
