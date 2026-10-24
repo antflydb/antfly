@@ -512,13 +512,6 @@ pub fn SummarizedIndex(comptime Entry: type, comptime compare: fn (Entry, Entry)
             }
         };
 
-        fn rebalance(self: *Self, allocator: std.mem.Allocator, root: *Node) *Node {
-            var slot: ?*Node = root;
-            var cursor = Rebalance.init(self, &slot);
-            cursor.resumeWithAdmission(allocator, null) catch unreachable;
-            return slot.?;
-        }
-
         /// Legacy comparison and retirement driver. Structural insertion and
         /// balancing share the retained engine used by admitted private edits.
         pub fn putPrepared(self: *Self, allocator: std.mem.Allocator, entry: Entry) void {
@@ -535,33 +528,117 @@ pub fn SummarizedIndex(comptime Entry: type, comptime compare: fn (Entry, Entry)
             }
         }
 
-        fn remove(self: *Self, allocator: std.mem.Allocator, old: ?*Node, entry: Entry) ?*Node {
-            const root = self.unique(allocator, old orelse return null);
-            switch (compare(entry, root.entry)) {
-                .lt => root.left = self.remove(allocator, root.left, entry),
-                .gt => root.right = self.remove(allocator, root.right, entry),
-                .eq => {
-                    if (root.left == null or root.right == null) {
-                        const child = root.left orelse root.right;
-                        root.left = null;
-                        root.right = null;
-                        root.release(allocator);
-                        return child;
-                    }
-                    var successor = root.right.?;
-                    while (successor.left) |left| successor = left;
-                    const replacement = successor.entry.retainShared();
-                    root.entry.deinit(allocator);
-                    root.entry = replacement;
-                    root.right = self.remove(allocator, root.right, replacement);
-                },
-            }
-            return self.rebalance(allocator, root);
-        }
+        /// Borrows a private tree and its prepaid node pool, like RankInsertion.
+        /// The rank belongs to the exact initial root. Every path copy stays
+        /// reachable during rejection; no entry destructor runs during resume.
+        /// A detached node owns the removed entry until every stale ancestor
+        /// summary has been replaced, or the entire aborted tree is retired.
+        pub const RankRemoval = struct {
+            tree: *Self,
+            rank: usize,
+            slot: *?*Node,
+            path: [2 * @bitSizeOf(usize)]*?*Node = undefined,
+            len: usize = 0,
+            target: ?*Node = null,
+            detached: ?*Node = null,
+            balancing: ?Rebalance = null,
+            stage: enum { descend, successor, unwind, done } = .descend,
 
-        /// Like insertion, removal consumes only the nodes reserved by prepare.
+            pub fn init(tree: *Self, rank: usize) !@This() {
+                if (rank >= size(tree.root)) return error.InvalidArgument;
+                return .{ .tree = tree, .rank = rank, .slot = &tree.root };
+            }
+            /// Returned node is retirement-only, never a readable index root.
+            /// Its entry may require separately admitted physical retirement.
+            /// Caller may wrap it in Reclaimer with an otherwise empty tree.
+            pub fn takeRetired(self: *@This()) !?*Node {
+                if (self.stage != .done and self.tree.root != null) return error.ResourceBudgetExceeded;
+                const out = self.detached;
+                self.detached = null;
+                return out;
+            }
+            fn detach(self: *@This(), node: *Node, child: ?*Node) void {
+                self.slot.* = child;
+                node.left = null;
+                node.right = null;
+                node.count = 1;
+                node.height = 1;
+                node.bytes = @sizeOf(Node) + node.entry.retainedBytes();
+                self.detached = node;
+                self.stage = .unwind;
+            }
+            pub fn resumeWithAdmission(self: *@This(), allocator: std.mem.Allocator, original: ?@import("../../common/read_admission.zig").Port) !void {
+                if (original) |port| try port.checkpoint();
+                while (self.stage != .done) {
+                    if (original) |port| try port.checkpoint();
+                    switch (self.stage) {
+                        .descend, .successor => {
+                            if (self.len == self.path.len) return error.ResourceBudgetExceeded;
+                            const old = self.slot.* orelse return error.CompactionPlanningStale;
+                            if (old.refs.load(.acquire) != 1 and self.tree.spare.items.len == 0) return error.ResourceBudgetExceeded;
+                            const node = self.tree.unique(allocator, old);
+                            self.slot.* = node;
+                            if (self.stage == .successor) {
+                                if (node.left != null) {
+                                    self.path[self.len] = self.slot;
+                                    self.len += 1;
+                                    self.slot = &node.left;
+                                } else {
+                                    // Transfer both entry owners without a retain/drop
+                                    // or rejection gap. The target keeps the successor;
+                                    // the quarantined node keeps the removed entry.
+                                    const entry = self.target.?.entry;
+                                    self.target.?.entry = node.entry;
+                                    node.entry = entry;
+                                    self.detach(node, node.right);
+                                }
+                            } else {
+                                const left_count = size(node.left);
+                                if (self.rank == left_count and (node.left == null or node.right == null)) {
+                                    self.detach(node, node.left orelse node.right);
+                                    continue;
+                                }
+                                self.path[self.len] = self.slot;
+                                self.len += 1;
+                                if (self.rank < left_count) {
+                                    self.slot = &node.left;
+                                } else if (self.rank > left_count) {
+                                    self.rank -= left_count + 1;
+                                    self.slot = &node.right;
+                                } else {
+                                    self.target = node;
+                                    self.slot = &node.right;
+                                    self.stage = .successor;
+                                }
+                            }
+                        },
+                        .unwind => {
+                            if (self.len == 0) {
+                                self.stage = .done;
+                                continue;
+                            }
+                            if (self.balancing == null) self.balancing = Rebalance.init(self.tree, self.path[self.len - 1]);
+                            try self.balancing.?.resumeWithAdmission(allocator, original);
+                            self.balancing = null;
+                            self.len -= 1;
+                        },
+                        .done => unreachable,
+                    }
+                }
+            }
+        };
+
+        /// Legacy lookup and retirement drive the same retained removal engine.
         pub fn removePrepared(self: *Self, allocator: std.mem.Allocator, entry: Entry) void {
-            self.root = self.remove(allocator, self.root, entry);
+            const root = self.root orelse return;
+            const rank = Node.lowerBound(root, entry);
+            if (rank == root.count or compare(Node.at(root, rank), entry) != .eq) return;
+            self.removePreparedAtRank(allocator, rank);
+        }
+        pub fn removePreparedAtRank(self: *Self, allocator: std.mem.Allocator, rank: usize) void {
+            var cursor = RankRemoval.init(self, rank) catch unreachable;
+            cursor.resumeWithAdmission(allocator, null) catch unreachable;
+            if (cursor.takeRetired() catch unreachable) |node| node.release(allocator);
         }
 
         /// Borrowed immutable-root search. Comparison supplies init(Entry,
@@ -746,4 +823,144 @@ test "controlled physical sync rank replacement retains retirement ownership acr
     try empty.prepare(a);
     try edit.resumeWithAdmission(a, null);
     try std.testing.expectEqual(@as(usize, 1), empty.root.?.count);
+}
+
+test "controlled physical sync retained rank removal preserves AVL ordering ownership and every original rejection" {
+    const a = std.testing.allocator;
+    const Stats = struct { refs: usize = 0, drops: usize = 0 };
+    const E = struct {
+        key: usize,
+        stats: *Stats,
+        pub fn retainShared(self: @This()) @This() {
+            self.stats.refs += 1;
+            return self;
+        }
+        pub fn deinit(self: @This(), _: std.mem.Allocator) void {
+            self.stats.refs -= 1;
+            self.stats.drops += 1;
+        }
+        pub fn retainedBytes(_: @This()) usize {
+            return 0;
+        }
+        fn compare(x: @This(), y: @This()) std.math.Order {
+            return std.math.order(x.key, y.key);
+        }
+    };
+    const Tree = SummarizedIndex(E, E.compare, void);
+    const Fault = struct {
+        checks: usize = 0,
+        at: usize = std.math.maxInt(usize),
+        failure: anyerror = error.Canceled,
+        fn check(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const at = self.checks;
+            self.checks += 1;
+            if (at == self.at) return self.failure;
+        }
+    };
+    const Check = struct {
+        fn shape(node: ?*const Tree.Node) !struct { count: usize, height: u8, bytes: u64 } {
+            const n = node orelse return .{ .count = 0, .height = 0, .bytes = 0 };
+            const left = try shape(n.left);
+            const right = try shape(n.right);
+            const count = 1 + left.count + right.count;
+            const height = 1 + @max(left.height, right.height);
+            const bytes = @sizeOf(Tree.Node) + left.bytes + right.bytes;
+            try std.testing.expectEqual(count, n.count);
+            try std.testing.expectEqual(height, n.height);
+            try std.testing.expectEqual(bytes, n.bytes);
+            try std.testing.expect(@abs(@as(i16, left.height) - @as(i16, right.height)) <= 1);
+            return .{ .count = count, .height = height, .bytes = bytes };
+        }
+        fn run(keys: []const usize, rank: usize) !void {
+            var stats: Stats = .{};
+            {
+                var base: Tree = .{};
+                defer base.deinit(a);
+                for (keys) |key| {
+                    try base.prepare(a);
+                    base.putPrepared(a, .{ .key = key, .stats = &stats });
+                }
+                const root = base.root.?;
+                const removed = root.at(rank).key;
+                var checkpoints: usize = 1;
+                var target: usize = 0;
+                var used: usize = 0;
+                while (target <= checkpoints) : (target += 1) {
+                    for ([_]bool{ false, true }) |abort| {
+                        if (target == 0 and abort) continue;
+                        var tree = base.fork();
+                        try tree.prepare(a);
+                        const spare = tree.spare.items.len;
+                        var edit = try Tree.RankRemoval.init(&tree, rank);
+                        var fault: Fault = .{ .at = if (target == 0) std.math.maxInt(usize) else target - 1, .failure = switch (target % 3) {
+                            0 => error.Canceled,
+                            1 => error.DeadlineExceeded,
+                            else => error.FileNotFound,
+                        } };
+                        const payload: @import("../../common/read_admission.zig").Payload = .{ .ptr = &fault, .vtable = &.{ .checkpoint = Fault.check } };
+                        const port = @import("../../common/read_admission.zig").Port.init(&payload);
+                        var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+                        const drops = stats.drops;
+                        const result = edit.resumeWithAdmission(failing.allocator(), port);
+                        if (target == 0) {
+                            try result;
+                            checkpoints = fault.checks;
+                            used = spare - tree.spare.items.len;
+                        } else try std.testing.expectError(fault.failure, result);
+                        try std.testing.expectEqual(drops, stats.drops);
+                        if (abort) {
+                            if (tree.root != null) try std.testing.expectError(error.ResourceBudgetExceeded, edit.takeRetired());
+                            tree.deinit(a);
+                            if (try edit.takeRetired()) |node| node.release(a);
+                        } else {
+                            try edit.resumeWithAdmission(failing.allocator(), port);
+                            try std.testing.expectEqual(drops, stats.drops);
+                            try std.testing.expectEqual(used, spare - tree.spare.items.len);
+                            const shape_result = try shape(tree.root);
+                            try std.testing.expectEqual(keys.len - 1, shape_result.count);
+                            for (0..keys.len - 1) |i| try std.testing.expectEqual(root.at(if (i < rank) i else i + 1).key, tree.root.?.at(i).key);
+                            const retired = (try edit.takeRetired()).?;
+                            try std.testing.expectEqual(removed, retired.entry.key);
+                            try std.testing.expect(retired.left == null and retired.right == null and retired.refs.load(.acquire) == 1);
+                            retired.release(a);
+                            try std.testing.expect((try edit.takeRetired()) == null);
+                            const saved = tree.root;
+                            fault.at = fault.checks;
+                            try std.testing.expectError(fault.failure, edit.resumeWithAdmission(failing.allocator(), port));
+                            try std.testing.expect(tree.root == saved);
+                            tree.deinit(a);
+                        }
+                        try std.testing.expect(base.root == root);
+                        try std.testing.expectEqual(keys.len, root.count);
+                        try std.testing.expectEqual(keys.len, stats.refs);
+                        _ = try shape(base.root);
+                    }
+                }
+                var unprepared = base.fork();
+                defer unprepared.deinit(a);
+                var refused = try Tree.RankRemoval.init(&unprepared, rank);
+                try std.testing.expectError(error.ResourceBudgetExceeded, refused.resumeWithAdmission(a, null));
+                try std.testing.expect(unprepared.root == root and refused.detached == null);
+                try std.testing.expectError(error.InvalidArgument, Tree.RankRemoval.init(&base, keys.len));
+            }
+            try std.testing.expectEqual(@as(usize, 0), stats.refs);
+        }
+    };
+    // Single and double deletion rotations in both directions.
+    try Check.run(&.{ 3, 2, 4, 1 }, 3);
+    try Check.run(&.{ 2, 1, 3, 4 }, 0);
+    try Check.run(&.{ 3, 1, 4, 2 }, 3);
+    try Check.run(&.{ 2, 1, 4, 3 }, 0);
+    // Root/leaf, one child, and direct/deep in-order successor ownership.
+    try Check.run(&.{1}, 0);
+    try Check.run(&.{ 1, 2 }, 0);
+    try Check.run(&.{ 2, 1 }, 1);
+    try Check.run(&.{ 2, 1, 3 }, 1);
+    try Check.run(&.{ 3, 1, 5, 0, 2, 4, 6 }, 3);
+    var keys: [31]usize = undefined;
+    for (&keys, 0..) |*key, i| key.* = (i * 13) % keys.len;
+    for (0..keys.len) |rank| try Check.run(&keys, rank);
+    var empty: Tree = .{};
+    try std.testing.expectError(error.InvalidArgument, Tree.RankRemoval.init(&empty, 0));
 }

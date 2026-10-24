@@ -26526,3 +26526,90 @@ The v2 integrated receipt preserves two sandbox-denied localhost binds; the
 unchanged v3 rerun with socket permission passes. Formatting and whitespace
 checks pass. Full GNU qualification remains waived, and the full design remains
 incomplete.
+
+
+### Retained removal and private directory publication
+
+`ordered_index.RankRemoval` now retains rank descent, copy-on-write paths,
+in-order successor descent, and bottom-up balancing. For a two-child removal,
+it transfers entry ownership between the target and detached successor without
+retaining or destroying a payload. One-child and leaf removal transfer the
+surviving child link in the same fixed step. The quarantined node owns the
+removed entry until ancestor summaries finish or the aborted private tree is
+fully retired. Taking that node is exactly once; it is retirement-only and must
+never be treated as a readable tree. No entry destructor runs during resume.
+Legacy `removePrepared` computes its rank before editing and drives this same
+engine with a null original, then performs synchronous retirement.
+
+`Directory.Removal` owns an already-prepaid private fork for one run removal.
+Its caller prepays the fixed job header and every index pool, pins the query run
+while lookup is pending, permanently freezes the source roots and accounting,
+and excludes candidate readers, mutation and accounting. Retained searches and
+rank removals update read order, IDs, lower endpoints and upper endpoints;
+level/generation aggregates use the same retained scalar index edits. All
+counters settle only after all six indexes are ready. A missing run is a no-op.
+Scalar level/generation lookup walks at most the fixed AVL height bound and
+never compares arbitrary key bytes.
+
+Publication checks the original lifetime, source root/counter identity and
+exact predecessor pointer, then swaps the one live directory pointer under the
+caller's publication lock. It returns the predecessor exactly once for the
+caller's prearranged retirement, with no destruction or fallible gap after the
+swap. The owning backend coordinator must also prepare generation, durability,
+inventory, accounting and retirement-registration receipts before invoking
+this pointer receipt; this API does not replace those backend obligations.
+The general backend directory removal path still uses legacy composition.
+
+Abort first returns any detached node while the independently pinned source
+keeps its payload alive, then drains the private directory reclaimer one credit
+per checkpoint. Rejection retains the job and all remaining retirement work.
+No source file pin or run metadata is destroyed during this private cleanup.
+The explicit joined/quiesced deinit fallback drives that same retirement with
+no original. Successful publication transfers the candidate to its live owner;
+abort and subsequent deinit cannot destroy a published candidate.
+
+Still required: the equivalent private multi-index put/replacement job,
+payload/file-pin/state preparation and last-reference retirement, owning
+resource/retirement registration and backend generation/durable publication
+integration, complete directory rebuilds, the broader default coordinator,
+remaining durable cleanup and completion/history relief, and default overload
+and fairness evidence. The full design remains incomplete; full GNU
+qualification remains waived.
+
+
+Qualification exercises deletion rotations in both directions, leaf/root and
+one-child deletion, direct/deep successors, and removal of every rank from a
+31-key permuted tree. It rejects every checkpoint, resumes without allocation,
+checks sorted contents plus AVL count/height/byte/balance invariants, proves
+prepared-node consumption does not replay, and verifies no entry destructor
+runs during resume. Abort at every rejection retains the detached entry until
+the private tree is retired and returns all references to the pinned baseline.
+
+The private-directory test rejects every computation/publication checkpoint
+for every run in a mixed L0/L1/L2 fixture, including a valid in-memory tombstone.
+It covers both level and generation replacement/removal, all four run indexes,
+counters, summaries, missing-run no-op, premature/duplicate publication,
+source-counter changes and a competing live predecessor. Every failed original
+leaves the live pointer on the complete predecessor. Partial-work aborts reject
+before and after detached-node handoff; a separate sweep rejects every private
+reclaimer checkpoint. Candidate construction is prepaid outside these tests'
+allocation-denying resume/retirement allocator. Source pins stay unchanged
+through computation, publication and abort; caller-owned source retirement is
+separate.
+
+Final-source receipts `retained-directory-removal-v3`, `-regressions`,
+`-integrated` and `-fast` pass all five native commands each. Standalone Debug
+passes 53/53 steps and all 101 physical-sync cases. Regressions pass 60/60 steps
+and 23 existing directory, mutable-state/OOM, obsolete-ledger, dependency and GC
+cases. Integrated Debug passes 83/83 steps, 101 physical-sync, 32 owner-close,
+170 table/codec, 74 WAL recovery and 18 runtime ABI checks. ReleaseFast passes
+63/63 steps and the same 101/170/74 physical/table/recovery cases. Each receipt
+also passes four Bloom and 45/1/8 error-identity companions (companions use
+Debug). All 5,592 recorded native/schema input hashes and final log digests
+match the final source, and two immutable snapshots preserve both changed
+native files. The v1 receipt preserves the corrected generated abort-switch
+error; v2 passes 100 cases and identifies the invalid memory-run fixture,
+corrected to an owned in-memory tombstone in v3. Formatting and whitespace
+checks pass. Full GNU qualification remains waived. Private put/replacement,
+backend ownership/publication integration and the other remaining work above
+are still required for the full design.
