@@ -645,6 +645,7 @@ components:
           type: integer
           minimum: 0
           maximum: 6
+          x-go-type-skip-optional-pointer: false
           description: Fractional-second precision (omission means 6), accepted only on a transaction_timestamp column default. Rounding uses the shared PostgreSQL timestamp semantics. Requires reader capability version 34.
         json_null:
           type: boolean

@@ -402,3 +402,31 @@ func TestRelationalRecoveryRoutesAndOutcomes(t *testing.T) {
 		t.Fatalf("retirement=%#v err=%v calls=%d", retirement, err, calls)
 	}
 }
+
+func TestRelationalClockPrecisionPreservesExplicitZero(t *testing.T) {
+	for _, precision := range []*int{nil, new(int)} {
+		source := RelationalScalarExpression{Op: oapi.RelationalExpressionOpTransactionTimestamp, Precision: precision}
+		encoded, err := json.Marshal(source)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var fields map[string]json.RawMessage
+		if err := json.Unmarshal(encoded, &fields); err != nil {
+			t.Fatal(err)
+		}
+		value, present := fields["precision"]
+		if present != (precision != nil) {
+			t.Fatalf("precision presence changed: %s", encoded)
+		}
+		if present && string(value) != "0" {
+			t.Fatalf("explicit zero precision changed: %s", encoded)
+		}
+		var restored RelationalScalarExpression
+		if err := json.Unmarshal(encoded, &restored); err != nil {
+			t.Fatal(err)
+		}
+		if (restored.Precision != nil) != present || (present && *restored.Precision != 0) {
+			t.Fatalf("precision round trip changed: %s", encoded)
+		}
+	}
+}

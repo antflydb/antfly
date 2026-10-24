@@ -1,7 +1,7 @@
 # SQL catalog lifecycle and original-case qualification
 
 Status: draft follow-up PR #1061 to merged PR #1048, merged with `origin/main`
-at `ff45ab6107` (verified 2026-10-23). Earlier implementation and
+at `fd329daaf9` (verified 2026-10-23). Earlier implementation and
 qualification checkpoints are retained below with their exact scope.
 This is an implementation and qualification backlog, not
 a completion claim. PostgreSQL is the SQL standard and independent test oracle.
@@ -47,10 +47,10 @@ Stable ADD COLUMN backfill clocks are captured after idempotent request lookup
 and persisted as typed inputs in the shared rewrite intent. Snapshot pages,
 retained tails and cold reconstruction reuse the timestamp while future writes
 retain the active clock default. Existing values and explicit SQL NULLs remain
-unchanged; a changed clock fails the saved program digest. Allocation-failure tests cover this boundary and temporal
-projection. Schema reader capability 34 and metadata protocol 67 use the existing
+unchanged; a changed clock fails the saved program digest. Allocation-failure
+tests cover this boundary and temporal projection. Schema reader capability 34 and metadata protocol 67 use the existing
 cluster activation fence. Public expression models are generated from OpenAPI.
-The full Debug SQL suite passes 1,347 local and 236 dependent tests, with four
+The full Debug SQL suite passes 1,348 local and 236 dependent tests, with four
 existing opt-in skips; strict mounted, native cascade, rewrite and reader gates
 have no skips or leaks. The independent PostgreSQL oracle and inventory checker
 also pass. This qualification closes one original case; `sql-0736` remains open.

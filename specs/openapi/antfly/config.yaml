@@ -778,6 +778,9 @@ components:
         location:
           type: string
           description: Google Cloud location when applicable. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials.
+        workspace_id:
+          type: string
+          description: Anthropic workspace for an API key that is not workspace-scoped.
         credentials_path:
           type: string
           description: Filesystem path to provider credentials when applicable. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials.
