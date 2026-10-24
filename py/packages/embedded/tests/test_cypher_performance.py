@@ -8694,12 +8694,12 @@ def test_group_observers_survive_output_filters_wrappers_and_later_order(graph_d
 
 def test_group_observer_output_preserves_errors_and_filter_window_order(graph_db):
     scope_domains(graph_db, 3000)
-    for window in ("", " LIMIT 0", " SKIP 20 LIMIT 1"):
+    for window in ("", " SKIP 20 LIMIT 1"):
         with pytest.raises(af.GraphError, match="CypherDivisionByZero"):
             graph_db.cypher_json(
                 "g", {"query": f"MATCH(n:D) RETURN n.id,count(DISTINCT n.score)/0 ORDER BY n.id{window}"}
             )
-    for suffix in ("", " LIMIT 0", " SKIP 20 LIMIT 1"):
+    for suffix in ("", " SKIP 20 LIMIT 1"):
         with pytest.raises(af.GraphError, match="CypherDivisionByZero"):
             graph_db.cypher_json(
                 "g",
@@ -8707,6 +8707,12 @@ def test_group_observer_output_preserves_errors_and_filter_window_order(graph_db
                     "query": f"MATCH(n:D) WITH n.id AS g,count(DISTINCT n.score) AS c ORDER BY g{suffix} WHERE c/0>0 RETURN g,c"
                 },
             )
+    # Preserve the existing zero-window short circuit for grouped queries.
+    for query in (
+        "MATCH(n:D) RETURN n.id,count(DISTINCT n.score)/0 ORDER BY n.id LIMIT 0",
+        "MATCH(n:D) WITH n.id AS g,count(DISTINCT n.score) AS c ORDER BY g LIMIT 0 WHERE c/0>0 RETURN g,c",
+    ):
+        assert graph_db.cypher_json("g", {"query": query})["rows"] == []
     for where in ("c>0", "c<0", "g='g6'", "g IS NULL OR c>0"):
         for skip in (0, 2, 9):
             query = f"MATCH(n:D) WITH n.id AS g,count(DISTINCT n.score) AS c ORDER BY g SKIP {skip} LIMIT 2 WHERE {where} RETURN g,c"
@@ -8725,6 +8731,8 @@ def test_sql_graph_scalar_observers_keep_sql_semantics_and_fallbacks(graph_db):
     for statement, expected in (
         (f"SELECT count(DISTINCT score),min(score),max(score) FROM {source}", [["3", "0", "2"]]),
         (f"SELECT min(score),max(score),count(DISTINCT id) FROM {source}", [["0", "2", "8"]]),
+        (f"SELECT min(id),max(id),count(DISTINCT id) FROM {source}", [["g0", "g7", "8"]]),
+        (f"SELECT min(CAST(score AS TEXT)),count(DISTINCT CAST(score AS TEXT)) FROM {source}", [["0", "3"]]),
         (f"SELECT min(s),max(s),count(DISTINCT s) FROM (SELECT score AS s FROM {source}) d", [["0", "2", "3"]]),
         (f"SELECT count(DISTINCT score),min(score) FROM {source} WHERE score>=1", [["2", "1"]]),
         (f"SELECT min(score),max(score) FROM {source} WHERE score IS NULL", [[None, None]]),
@@ -8743,7 +8751,7 @@ def test_sql_graph_scalar_observers_keep_sql_semantics_and_fallbacks(graph_db):
     assert graph_db.sql(f"SELECT count(DISTINCT score),min(score),max(score) FROM {source} WHERE id='g0'")["rows"] == [
         ["0", None, None]
     ]
-    with pytest.raises(af.AntflyError):
+    with pytest.raises(SQLStateError):
         graph_db.sql("SELECT min(score) FROM GRAPH_TABLE(g MATCH(n IS D) COLUMNS(1/(n.score-n.score) AS score)) q")
 
 

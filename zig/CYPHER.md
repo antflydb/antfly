@@ -3176,9 +3176,14 @@ window are separate phases. A certified adjacent key stream sends each key to
 its observer consumer without materializing the full key relation. The consumer
 recycles its invocation arena, evaluates output expressions and predicates, and
 owns only rows surviving the final SKIP/LIMIT. Ordered folds apply the same
-filter-before-window behavior. Bare total observers retain the existing cheap
-retirement of skipped groups; wrappers and predicates still evaluate losing
-groups so a finite window cannot hide their errors.
+filter-before-window behavior. Certified total observers retain cheap retirement of skipped groups. A scalar
+wrapper can keep a bounded group window only when its post-reduction evaluation
+is proved total: checked i64 interval arithmetic covers COUNT with safe integer
+operators, and COALESCE composes total leaves. Fallible or unknown wrappers and
+predicates still evaluate losing groups so a nonzero finite window cannot hide
+errors. The existing grouped LIMIT 0 short circuit is preserved.
+The count interval uses the full i64 domain rather than a physical-anchor
+estimate, preserving safety for compressed and multi-path counts.
 
 A following sort can supply the earlier aggregate's group-key order through
 transparent alias projections. Computations, filters, DISTINCT, intervening windows and

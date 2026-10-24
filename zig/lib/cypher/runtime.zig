@@ -2790,7 +2790,7 @@ const Engine = struct {
             var uses_extended = false;
             for (projection.items) |item| {
                 if (aggregates(item.expression)) {
-                    if (ordered_source and item.expression.value != .call) {
+                    if (ordered_source and (item.expression.value != .call or !aggregateName(item.expression.value.call.name))) {
                         complete_output = complete_output or !groupOutputTotal(item.expression);
                         var leaves: reduction_plan.Calls = .{};
                         if (!try engine.collectStreamingAggregates(item.expression, &leaves)) return null;
@@ -7852,7 +7852,7 @@ const Engine = struct {
                 @memcpy(orders[0..projection.order.len], projection.order);
                 if (needs_order) orders[orders.len - 1] = .{ .expression = argument, .descending = descending };
                 domain.order = orders;
-                const certificate = (try self.planNodeOrder(input, operation, domain, middle, projection.limit == null)) orelse continue;
+                const certificate = (try self.planNodeOrder(input, operation, domain, middle, domain.limit == null)) orelse continue;
                 if (certificate.declined) continue;
                 if (needs_order and certificate.fields.len == proof.fields.len) {
                     const grouped = for (keys.items) |key| {

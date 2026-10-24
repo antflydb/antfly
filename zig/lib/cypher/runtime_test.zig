@@ -7783,6 +7783,26 @@ test "ordered node certificates bound scans preserve residuals and decline falli
         try std.testing.expectEqual(item.reads, result.stats.scanned_anchors);
         try std.testing.expect(fixture.calls != 0);
     }
+    {
+        var indexed: Indexed = .{};
+        var callbacks = indexed.fixture.backend().vtable.*;
+        callbacks.bind = Indexed.bind;
+        callbacks.checkpoint = Indexed.checkpoint;
+        callbacks.scan = Indexed.scan;
+        callbacks.scan_ordered = Indexed.read;
+        var diagnostic: c.Diagnostic = .{};
+        var compiled = try c.compile(std.testing.allocator, "PROFILE MATCH(n:Document) WITH n.rank AS r,count(DISTINCT n.rank) AS c ORDER BY r SKIP 1 LIMIT 1 WHERE c>0 RETURN r,c", .{}, &diagnostic);
+        defer compiled.deinit();
+        var result = try runtime.execute(std.testing.allocator, .{ .ptr = &indexed, .vtable = &callbacks }, graph, &compiled, &.{}, .{ .scanned_anchors = 3 });
+        defer result.deinit();
+        try std.testing.expectEqual(@as(usize, 1), result.rows.len);
+        try std.testing.expectEqual(@as(i128, 2), result.rows[0][0].integer);
+        try std.testing.expectEqual(@as(i128, 1), result.rows[0][1].integer);
+        const ordered = for (result.stages) |stage| {
+            if (std.mem.eql(u8, stage.operation, "ordered_groups")) break true;
+        } else false;
+        try std.testing.expect(ordered);
+    }
     // Every observer is negotiated before any reads. Equivalent COUNT
     // expressions share one domain traversal, including through aliases.
     {
@@ -8283,6 +8303,19 @@ test "ordered groups retire reducers across a broad exact-budget prefix" {
         defer result.deinit();
         try std.testing.expectEqual(@as(i64, 63), result.rows[0][1].integer);
         try std.testing.expectEqual(@as(usize, 1), fixture.ordered_requests);
+    }
+    for ([_][]const u8{ "count(DISTINCT n.rank)+0", "coalesce(count(DISTINCT n.rank),0)", "-(-count(DISTINCT n.rank))" }) |observer| {
+        fixture.reads = 0;
+        var diagnostic: c.Diagnostic = .{};
+        const query = try std.fmt.allocPrint(a, "MATCH(n:Document) RETURN n.id,{s} AS c ORDER BY n.id SKIP 2 LIMIT 5", .{observer});
+        var compiled = try c.compile(std.testing.allocator, query, .{}, &diagnostic);
+        defer compiled.deinit();
+        var result = try runtime.execute(std.testing.allocator, backend, graph, &compiled, &.{}, .{ .scanned_anchors = 256, .memory_bytes = 2 << 20 });
+        defer result.deinit();
+        try std.testing.expectEqual(@as(usize, 5), result.rows.len);
+        try std.testing.expectEqualStrings("000002", result.rows[0][0].string);
+        for (result.rows) |row| try std.testing.expectEqual(@as(i128, 1), row[1].integer);
+        try std.testing.expect(fixture.reads <= 256);
     }
     for ([_][]const u8{ "", " LIMIT 5000" }) |suffix| {
         fixture.reads = 0;
