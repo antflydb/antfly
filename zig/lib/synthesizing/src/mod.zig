@@ -277,10 +277,10 @@ const CloudflareSynthesizerState = struct {
         defer response.deinit();
         const bytes = response.body orelse return error.InvalidCloudflareResponse;
         const audio_bytes = if (std.mem.startsWith(u8, response.headers.get("content-type") orelse "", "application/json")) decoded: {
-            const result = try std.json.parseFromSliceLeaky(std.json.Value, work, bytes, .{});
-            if (cf.field(result, "success")) |success| if (success != .bool or !success.bool) return error.CloudflareInferenceFailed;
-            const value = cf.field(result, "result") orelse return error.InvalidCloudflareResponse;
-            const encoded = try cf.text(cf.field(value, "audio") orelse return error.InvalidCloudflareResponse);
+            const value = try cf.decodeNative(work, bytes);
+            const audio_value = cf.field(value, "audio") orelse return error.InvalidCloudflareResponse;
+            if (audio_value != .string) return error.InvalidCloudflareResponse;
+            const encoded = audio_value.string;
             const decoded = try a.alloc(u8, std.base64.standard.Decoder.calcSizeForSlice(encoded) catch return error.InvalidCloudflareResponse);
             errdefer a.free(decoded);
             std.base64.standard.Decoder.decode(decoded, encoded) catch return error.InvalidCloudflareResponse;
@@ -620,9 +620,14 @@ pub fn testCloudflareSynthesis() !void {
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
-    var server = try httpx.TestServer.start(a, io, &.{.{ .method = .POST, .path = "/", .respond = .{ .body = "ID3fixture", .content_type = "audio/mpeg" } }});
+    var server = try httpx.TestServer.start(a, io, &.{
+        .{ .method = .POST, .path = "/", .max_uses = 1, .respond = .{ .body = "ID3fixture", .content_type = "audio/mpeg" } },
+        .{ .method = .POST, .path = "/", .max_uses = 1, .respond = .{ .body = "{\"success\":true,\"result\":{\"audio\":\"SUQzZml4dHVyZQ==\"}}", .content_type = "application/json" } },
+        .{ .method = .POST, .path = "/", .max_uses = 1, .respond = .{ .body = "{broken", .content_type = "application/json" } },
+        .{ .method = .POST, .path = "/", .max_uses = 1, .respond = .{ .body = "{\"result\":{\"audio\":123}}", .content_type = "application/json" } },
+    });
     defer server.deinit();
-    var client = httpx.Client.init(a, io);
+    var client = server.client();
     defer client.deinit();
     var failure: ?anyerror = null;
     var group = std.Io.Group.init;
@@ -635,11 +640,25 @@ pub fn testCloudflareSynthesis() !void {
             defer deinitResult(alloc, &result);
             std.testing.expectEqualStrings("ID3fixture", result.audio.?) catch |err| {
                 out.* = err;
+                return;
+            };
+            var json_result = synthesizeWithConfig(alloc, http, .{ .provider = .cloudflare, .model = "@cf/deepgram/aura-2-en", .account_id = "account", .api_key = "fixture", .base_url = url }, .{ .text = "hello" }, .{}) catch |err| {
+                out.* = err;
+                return;
+            };
+            defer deinitResult(alloc, &json_result);
+            std.testing.expectEqualStrings("ID3fixture", json_result.audio.?) catch |err| {
+                out.* = err;
+                return;
+            };
+            for (0..2) |_| std.testing.expectError(error.InvalidCloudflareResponse, synthesizeWithConfig(alloc, http, .{ .provider = .cloudflare, .model = "@cf/deepgram/aura-2-en", .account_id = "account", .api_key = "fixture", .base_url = url }, .{ .text = "hello" }, .{})) catch |err| {
+                out.* = err;
+                return;
             };
         }
     };
     group.concurrent(io, Fiber.run, .{ a, &client, server.baseUrl(), &failure }) catch return;
-    try server.handleOne();
+    for (0..4) |_| try server.handleOne();
     group.await(io) catch {};
     if (failure) |err| return err;
 }

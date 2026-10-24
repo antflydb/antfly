@@ -13,7 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Native System One wire adapter. No chat completion or prompt JSON parsing.
+//! Shared Workers AI transport and typed System One contracts.
 const std = @import("std");
 const A = std.mem.Allocator;
 const V = std.json.Value;
@@ -38,7 +38,12 @@ pub fn invoke(client: anytype, a: A, config: Config, payload: V, options: anytyp
 pub fn invokeNative(client: anytype, a: A, config: Config, payload: V, options: anytype) !V {
     var response = try postNative(client, a, config, payload, options);
     defer response.deinit();
-    const body = response.body orelse return error.InvalidCloudflareResponse;
+    return decodeNative(a, response.body orelse return error.InvalidCloudflareResponse);
+}
+
+/// Binary adapters use the same bounded JSON decoder when Workers AI returns
+/// a JSON envelope instead of the native byte stream.
+pub fn decodeNative(a: A, body: []const u8) !V {
     try responseDepth(body);
     const parsed = std.json.parseFromSliceLeaky(V, a, body, .{ .allocate = .alloc_always, .duplicate_field_behavior = .@"error", .parse_numbers = false }) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,

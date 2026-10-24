@@ -871,6 +871,7 @@ pub const Provider = struct {
         const Response = struct {
             usage: std.json.Value = .null,
             choices: []const struct {
+                finish_reason: @FieldType(inference.GenerateResult, "finish_reason") = null,
                 logprobs: ?std.json.Value = null,
                 message: struct {
                     content: ?[]const u8 = null,
@@ -900,6 +901,7 @@ pub const Provider = struct {
             .content = try alloc.dupe(u8, content),
             .tool_calls = tool_calls,
             .tool_calls_synthesized = synthesized,
+            .finish_reason = choices[0].finish_reason,
             .token_logprobs_json = proof,
             .usage = inference.GenerationUsage.fromValue(parsed.value.usage, "prompt_tokens", "completion_tokens", "total_tokens"),
             .allocator = alloc,
