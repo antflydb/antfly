@@ -252,10 +252,11 @@ pub fn entity(root: *h.Handle, a: A, table: []const u8, key: []const u8, input: 
     if (reading and selected.len == 0) {
         txn.abort();
         txn_live = false;
-        try tables.load(root);
+        // Consumer discovery may bootstrap its physical reverse index and
+        // open matching sources. Do that before pinning the destination read.
+        selected = try consumers(root, a, table, key);
         txn = try db.core.store.beginReadTxn();
         txn_live = true;
-        selected = try consumers(root, a, table, key);
     }
     if (selected.len == 0) return error.ResolverNotFound;
     var seen: std.StringHashMapUnmanaged(void) = .empty;

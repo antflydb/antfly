@@ -1912,8 +1912,14 @@ unprojected source. Raw source records remain unchanged
 for DDL CAS; portable export materializes the policy and removes physical bindings.
 Lite pulls a namespace once per turn and publishes all of its serving/retired
 consumers in one catalog transaction. Reader-13 catalogs store shared projection
-payloads once in a content-addressed dictionary, with per-resolver references;
-legacy merge sidecars retain only source-owned policy.
+payloads once in a content-addressed dictionary, with per-resolver references.
+The serving catalog and reopened catalogs retain immutable projection owners:
+policy allocation and digest computation happen once per shared projection,
+while consumer slots hold lightweight references. Detached config clones retain
+ordinary allocator ownership, including arena readers. Runtime ownership never
+crosses JSON boundaries. Legacy merge sidecars retain only source-owned policy;
+private compact consumer wires explicitly retain those unadopted merges until
+the namespace's first native adoption.
 
 The source execution clock (`resolution_generation`) advances independently of
 the destination curation revision. Projection/readiness stamps include the physical
@@ -1934,7 +1940,14 @@ source IDs fence dropped/recreated tables. Queue-only rejections and their recei
 replays use point admission and no consumer discovery. Their effect classification
 is a durable native receipt witness, independent of caller-supplied retry flags or
 actor revision; rejected distinct pins still observe their policy consumers.
-Unclassified legacy receipts conservatively observe the scoped consumers. Manual maintenance uses the same pull operation. `complete` describes
+Unclassified legacy receipts conservatively observe the scoped consumers.
+Entity inspection of an unadopted native namespace uses the same reverse lookup
+without opening unrelated tables. C ABI waits capture immutable source and
+namespace requirements before releasing admission, then batch lightweight
+identity and replay observations per source. Physical source/destination IDs,
+namespace template/generation, missing authority and accepted revision fences
+all participate; a moved or recreated namespace cannot satisfy an old wait.
+Manual maintenance uses the same pull operation. `complete` describes
 atomic authority admission; `applied` observes asynchronous consumer replay.
 
 HTTP initial decisions and terminal retries return the same decision envelope,

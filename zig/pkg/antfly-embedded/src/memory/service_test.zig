@@ -5549,7 +5549,7 @@ test "memory semantic timeout checkpoints projections and resumes the unfinished
         Slow.deadline = 125;
         _ = try service.execute(a, .advance, "", "{}", "dirty-first");
         const dirty = try std.json.parseFromSliceLeaky(m.types.SemanticIndex, a, (try service.backend.get(service.backend.ptr, a, "entity-semantic-index")).?.json, .{});
-        try std.testing.expect(dirty.backfill_complete and !dirty.complete);
+        try std.testing.expect(dirty.backfill_complete and dirty.complete);
         try std.testing.expectEqual(seconds == 10, dirty.work_cursor != null);
         try std.testing.expectEqual(@as(usize, if (seconds == 10) 11 else 1), (try service.backend.scan(service.backend.ptr, a, "entity-semantic/", null, 32)).rows.len);
         Slow.elapsed = 0;
@@ -5707,7 +5707,8 @@ test "memory semantic provider failures defer without blocking healthy entities"
             try std.testing.expectEqualStrings(second.entity.id, projection.entity_id);
         }
         const index = try std.json.parseFromSliceLeaky(m.types.SemanticIndex, a, (try svc.backend.get(svc.backend.ptr, a, "entity-semantic-index")).?.json, .{});
-        try std.testing.expect(index.backfill_complete and !index.complete);
+        try std.testing.expect(index.backfill_complete);
+        try std.testing.expectEqual(dirty, index.complete);
         reopened.context.now_ms = 3000;
         for (0..3) |i| _ = try reopened.execute(a, .advance, "", "{}", try std.fmt.allocPrint(a, "retry-{d}", .{i}));
         try std.testing.expectEqual(@as(usize, 2), Failure.calls);
@@ -6056,7 +6057,8 @@ test "memory semantic rendering failures defer durably and healthy entities prog
             try std.testing.expectEqualStrings(second.entity.id, projection.entity_id);
         }
         const unready = try std.json.parseFromSliceLeaky(m.types.SemanticIndex, a, store.values.get("entity-semantic-index").?, .{});
-        try std.testing.expect(unready.backfill_complete and !unready.complete);
+        try std.testing.expect(unready.backfill_complete);
+        try std.testing.expectEqual(dirty, unready.complete);
         store.failures = 0;
         reopened.context.now_ms = 3000;
         for (0..5) |i| _ = try reopened.execute(a, .advance, "", "{}", try std.fmt.allocPrint(a, "recover-{d}", .{i}));
@@ -7738,4 +7740,48 @@ test "memory lineage batches publish only final roots and list without global pr
     const page = try std.json.parseFromSliceLeaky(m.types.RecordPage, a, try svc.execute(a, .list, "", "{\"limit\":256}", ""), .{});
     try std.testing.expectEqual(@as(usize, 128), page.items.len);
     try std.testing.expectEqual(scans, store.assertion_scans);
+}
+
+test "memory semantic qualified generation serves healthy entities through incremental backlog" {
+    var store = Store.init();
+    defer store.deinit();
+    const a = store.arena.allocator();
+    const service = SemanticFixture.service(&store, 1);
+    const config: m.types.Config = .{ .models = .{ .embedder = fake_model }, .semantic_discovery = .{ .enabled = true } };
+    _ = try service.execute(a, .create, "", try std.json.Stringify.valueAlloc(a, config, .{}), "create");
+    _ = try service.execute(a, .observe, "", "{\"evidence\":[{\"id\":\"e\",\"source_id\":\"s\",\"source_version\":\"1\",\"text\":\"A knowledge graph stores linked facts.\"}],\"entities\":[{\"id\":\"graph\",\"name\":\"knowledge graph\",\"evidence\":[{\"id\":\"e\"}]},{\"id\":\"kg\",\"name\":\"KG\",\"evidence\":[{\"id\":\"e\"}]}]}", "seed");
+    for (0..9) |i| {
+        const id = try std.fmt.allocPrint(a, "noise-{d}", .{i});
+        _ = try service.execute(a, .observe, "", try std.json.Stringify.valueAlloc(a, .{ .evidence = &[_]m.types.Evidence{.{ .id = try std.fmt.allocPrint(a, "e-{d}", .{i}), .source_id = try std.fmt.allocPrint(a, "s-{d}", .{i}), .source_version = "1", .text = "An unrelated entity" }}, .context_evidence_ids = &[_][]const u8{"e"}, .entities = .{.{ .id = id, .name = "unrelated", .evidence = .{.{ .id = "e" }} }} }, .{}), id);
+    }
+    try drainSemantic(service, a, "initial");
+    var page = try std.json.parseFromSliceLeaky(m.types.EntityCandidatePage, a, try service.execute(a, .entity_candidates, "graph", "{}", ""), .{});
+    try std.testing.expectEqual(.indexed, page.semantic_discovery);
+    for (0..9) |i| {
+        const id = try std.fmt.allocPrint(a, "description-{d}", .{i});
+        const subject = try std.fmt.allocPrint(a, "noise-{d}", .{i});
+        _ = try service.execute(a, .assertions, "", try std.json.Stringify.valueAlloc(a, .{ .assertions = .{.{ .id = id, .subject = subject, .predicate = "description", .value = subject, .statement = "The description changed", .evidence = .{.{ .id = "e" }} }} }, .{}), id);
+    }
+    // Unrelated work cannot suppress the pure-semantic graph/KG pair. Dirty
+    // projections themselves remain excluded before physical cleanup.
+    page = try std.json.parseFromSliceLeaky(m.types.EntityCandidatePage, a, try service.execute(a, .entity_candidates, "graph", "{}", ""), .{});
+    try std.testing.expectEqual(.indexed, page.semantic_discovery);
+    try std.testing.expectEqual(@as(usize, 1), page.items.len);
+    try std.testing.expectEqualStrings("kg", page.items[0].entity.entity.id);
+    _ = try service.execute(a, .advance, "", "{}", "partial-refresh");
+    const index = try std.json.parseFromSliceLeaky(m.types.SemanticIndex, a, store.values.get("entity-semantic-index").?, .{});
+    try std.testing.expect(index.complete);
+    var work: usize = 0;
+    var entries = store.values.iterator();
+    while (entries.next()) |entry| if (std.mem.startsWith(u8, entry.key_ptr.*, "entity-semantic-work/")) {
+        work += 1;
+    };
+    try std.testing.expect(work > 0);
+    page = try std.json.parseFromSliceLeaky(m.types.EntityCandidatePage, a, try service.execute(a, .entity_candidates, "graph", "{}", ""), .{});
+    try std.testing.expectEqual(.indexed, page.semantic_discovery);
+    var found = false;
+    for (page.items) |item| if (std.mem.eql(u8, item.entity.entity.id, "kg")) {
+        found = true;
+    };
+    try std.testing.expect(found);
 }

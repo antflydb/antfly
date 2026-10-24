@@ -60,8 +60,10 @@ pub const Page = struct {
                         // Durable definition serialization excludes merges;
                         // this private execution view must carry them.
                         inline for (@typeInfo(@TypeOf(cfg)).@"struct".field_names) |name| {
-                            try writer.objectField(name);
-                            try writer.write(@field(cfg, name));
+                            if (comptime !std.mem.eql(u8, name, "shared_projection")) {
+                                try writer.objectField(name);
+                                try writer.write(@field(cfg, name));
+                            }
                         }
                         try writer.endObject();
                     }
@@ -97,14 +99,46 @@ pub const Consumer = struct {
         try writer.write(self.names);
         if (self.configs) |values| {
             try writer.objectField("configs");
-            try writer.write(values);
+            try writeExecutionConfigs(writer, values);
         }
         try writer.endObject();
     }
 };
+fn writeExecutionConfigs(writer: anytype, values: anytype) !void {
+    try writer.beginArray();
+    for (values) |cfg| try cfg.jsonExecution(writer);
+    try writer.endArray();
+}
+
 pub const ConsumerReference = struct {
     version: u8 = 1,
     source_id: u64,
     source_name: []const u8,
     configs: []const @import("antfly_local_sources").storage_db_catalog_resolver_catalog.ResolverConfig,
+    pub fn jsonStringify(self: @This(), writer: anytype) !void {
+        try writer.beginObject();
+        inline for (.{ "version", "source_id", "source_name" }) |field| {
+            try writer.objectField(field);
+            try writer.write(@field(self, field));
+        }
+        try writer.objectField("configs");
+        try writeExecutionConfigs(writer, self.configs);
+        try writer.endObject();
+    }
 };
+
+test "resolver curation namespace propagation compact consumers retain unadopted merges" {
+    const a = std.testing.allocator;
+    const Config = @import("antfly_local_sources").storage_db_catalog_resolver_catalog.ResolverConfig;
+    const cfg: Config = .{ .name = "legacy", .table = "entities", .key_template = "other/{{_entity.text}}", .source_artifact = "source", .resolution_artifact = "resolved", .merges = &.{.{ .key = "other/a", .target = "other/b" }}, .merge_generation = 7, .merge_state_version = 1 };
+    const bytes = try std.json.Stringify.valueAlloc(a, ConsumerReference{ .source_id = 2, .source_name = "source", .configs = &.{cfg} }, .{});
+    defer a.free(bytes);
+    const reference = try std.json.parseFromSlice(ConsumerReference, a, bytes, .{});
+    defer reference.deinit();
+    try std.testing.expect(Config.aliasesEqual(cfg.merges, reference.value.configs[0].merges));
+    const page_bytes = try std.json.Stringify.valueAlloc(a, Consumer{ .table = .{ .table_id = 2, .name = "source" }, .names = &.{"legacy"}, .configs = reference.value.configs }, .{});
+    defer a.free(page_bytes);
+    const page = try std.json.parseFromSlice(Consumer, a, page_bytes, .{});
+    defer page.deinit();
+    try std.testing.expect(Config.aliasesEqual(cfg.merges, page.value.configs.?[0].merges));
+}

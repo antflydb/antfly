@@ -13089,6 +13089,9 @@ pub const IndexManager = struct {
         var arena = std.heap.ArenaAllocator.init(self.alloc);
         defer arena.deinit();
         const state = try std.json.Stringify.valueAlloc(arena.allocator(), namespace.state, .{});
+        const projection = try resolver_catalog.SharedProjection.create(self.alloc, namespace.merges, state);
+        defer projection.release();
+        var validated_profiles: std.StringHashMapUnmanaged(void) = .empty;
         const Change = struct { slot: *ResolverConfig, before: ResolverConfig, after: ResolverConfig };
         var changes: std.ArrayList(Change) = .empty;
         defer changes.deinit(self.alloc);
@@ -13116,9 +13119,12 @@ pub const IndexManager = struct {
             next.resolution_generation = try std.math.add(u64, entry.effectiveGeneration(), 1);
             next.merge_generation = if (next.merges.len == 0) 0 else next.resolution_generation;
             next.merge_state_version = if (next.merges.len == 0) 2 else 1;
-            try next.validate();
+            // Execution fields are unchanged from an admitted config. Validate
+            // a shared policy once per distinct static policy profile.
+            const profile = try std.json.Stringify.valueAlloc(arena.allocator(), .{ next.aliases, next.suppress_json }, .{});
+            if (!(try validated_profiles.getOrPut(arena.allocator(), profile)).found_existing) try next.validate();
             try changes.ensureUnusedCapacity(self.alloc, 1);
-            const owned = try ResolverConfig.clone(self.alloc, next);
+            const owned = try ResolverConfig.cloneWithProjection(self.alloc, next, projection);
             changes.appendAssumeCapacity(.{ .slot = entry, .before = entry.*, .after = owned });
         };
         if (changes.items.len == 0) return false;
@@ -13165,6 +13171,31 @@ pub const IndexManager = struct {
             cfg.curation_json = "{}";
             try result.append(alloc, try ResolverConfig.clone(alloc, cfg));
         }
+        return result.toOwnedSlice(alloc);
+    }
+
+    /// One catalog pass for a batch of replay observations. Policy, providers,
+    /// aliases and extraction config never enter a wait-loop snapshot.
+    pub fn resolverObservationDescriptors(self: *IndexManager, alloc: Allocator, names: []const []const u8) ![]resolver_catalog.ResolverObservation {
+        self.catalog_mutex.lockShared();
+        defer self.catalog_mutex.unlockShared();
+        var wanted: std.StringHashMapUnmanaged(void) = .empty;
+        defer wanted.deinit(alloc);
+        for (names) |name| try wanted.put(alloc, name, {});
+        var result: std.ArrayList(resolver_catalog.ResolverObservation) = .empty;
+        errdefer {
+            for (result.items) |*cfg| cfg.deinit(alloc);
+            result.deinit(alloc);
+        }
+        for ([_][]const ResolverConfig{ self.resolvers.items, self.retired_resolvers.items }) |definitions| for (definitions) |definition| {
+            if (!wanted.contains(definition.name)) continue;
+            const owned = try resolver_catalog.ResolverObservation.fromConfig(alloc, definition);
+            errdefer {
+                var cleanup = owned;
+                cleanup.deinit(alloc);
+            }
+            try result.append(alloc, owned);
+        };
         return result.toOwnedSlice(alloc);
     }
 
@@ -23679,7 +23710,15 @@ pub const IndexManager = struct {
         }
         for (configs) |cfg| {
             const definitions = if (cfg.retired) &self.retired_resolvers else &self.resolvers;
-            try definitions.append(self.alloc, try resolver_catalog.ResolverConfig.clone(self.alloc, cfg));
+            const owned = if (cfg.shared_projection) |projection|
+                try ResolverConfig.cloneWithProjection(self.alloc, cfg, projection)
+            else
+                try ResolverConfig.clone(self.alloc, cfg);
+            errdefer {
+                var cleanup = owned;
+                cleanup.deinit(self.alloc);
+            }
+            try definitions.append(self.alloc, owned);
         }
     }
 

@@ -7657,19 +7657,103 @@ fn executeResolverCurationWithWait(handle_ptr: ?*anyopaque, name: []const u8, bo
     const input = std.json.parseFromSliceLeaky(std.json.Value, a, body, .{}) catch |err| return capi.mapError(err);
     const wait = if (input == .object) input.object.get("wait") else null;
     const timeout: u64 = if (wait) |w| if (w == .object) if (w.object.get("timeout_ms")) |v| if (v == .integer and v.integer > 0 and v.integer <= 300000) @intCast(v.integer) else return capi.mapError(error.InvalidArgument) else 1000 else return capi.mapError(error.InvalidArgument) else 0;
+    var targets: []const ?CurationWaitTarget = &.{};
     {
         const guard = enterHandle(handle_ptr, .exclusive) orelse return capi.mapError(error.InvalidArgument);
         defer guard.leave();
         if (guard.entry_error) |code| return capi.ensureError(code, @src().fn_name);
         const code = executeResolverCuration(guard.handle, name, body, action, out);
         if (code != .ok or timeout == 0) return code;
+        targets = captureCurationWait(guard.handle, a, timeout, out) catch &.{};
     }
-    return waitResolverCurationResponse(handle_ptr, timeout, out);
+    return waitResolverCurationResponse(handle_ptr, timeout, out, targets);
 }
 
+const ResolverObservation = @import("../storage/db/catalog/resolver_catalog.zig").ResolverObservation;
+const CurationWaitTarget = struct {
+    source_id: u64,
+    cfg: ResolverObservation,
+    authority_id: ?u64,
+};
+const CurationObserved = struct { db: *db_mod.DB, cfg: ResolverObservation, applied: bool, authority_id: ?u64 };
+fn curationRows(result: *std.json.Value) []std.json.Value {
+    if (result.* != .object) return &.{};
+    if (result.object.getPtr("results")) |items| return if (items.* == .array) items.array.items else &.{};
+    return @as([*]std.json.Value, @ptrCast(result))[0..1];
+}
+/// Batch each source once per cut. No table opens, full policy copies or
+/// repeated replay-status probes per consumer occur while polling.
+fn curationObservationCut(root: *Handle, fallback: *db_mod.DB, a: std.mem.Allocator, rows: []std.json.Value, sample: bool) ![]?CurationObserved {
+    const Group = struct { db: *db_mod.DB, rows: std.ArrayList(usize) = .empty, names: std.ArrayList([]const u8) = .empty };
+    var groups: std.AutoArrayHashMapUnmanaged(*db_mod.DB, Group) = .empty;
+    const output = try a.alloc(?CurationObserved, rows.len);
+    @memset(output, null);
+    for (rows, 0..) |row, i| {
+        if (row != .object) continue;
+        const name = row.object.get("resolver") orelse continue;
+        if (name != .string) continue;
+        var database = fallback;
+        if (row.object.get("source_table")) |source| if (source == .string) {
+            database = if (std.mem.eql(u8, source.string, "default")) &root.db else if (root.embedded_tables.get(source.string)) |table| &table.db else continue;
+        };
+        const slot = try groups.getOrPut(a, database);
+        if (!slot.found_existing) slot.value_ptr.* = .{ .db = database };
+        try slot.value_ptr.rows.append(a, i);
+        try slot.value_ptr.names.append(a, name.string);
+    }
+    var authorities: std.StringHashMapUnmanaged(?u64) = .empty;
+    for (groups.values()) |group| {
+        const descriptors = try group.db.core.index_manager.resolverObservationDescriptors(a, group.names.items);
+        var by_name: std.StringHashMapUnmanaged(ResolverObservation) = .empty;
+        for (descriptors) |cfg| try by_name.put(a, cfg.name, cfg);
+        var stages: [2]?bool = .{ null, null };
+        for (group.rows.items, group.names.items) |row, name| {
+            const cfg = by_name.get(name) orelse continue;
+            var applied = false;
+            if (sample) {
+                if (cfg.retired) {
+                    applied = true;
+                } else {
+                    const stage: usize = @intFromBool(cfg.promote);
+                    if (stages[stage] == null) stages[stage] = @import("../storage/db/resolver_curation.zig").applied(group.db, cfg) catch false;
+                    applied = stages[stage].?;
+                }
+            }
+            const scope = try std.json.Stringify.valueAlloc(a, .{ cfg.table, cfg.key_template }, .{});
+            const authority = try authorities.getOrPut(a, scope);
+            if (!authority.found_existing) {
+                const destination = if (std.mem.eql(u8, cfg.table, "default")) &root.db else if (root.embedded_tables.get(cfg.table)) |table| &table.db else null;
+                const native = if (destination) |db| try @import("resolver_authority.zig").owns(db, a, cfg.key_template) else false;
+                authority.value_ptr.* = if (native) destination.?.core.identity_namespace.table_id else null;
+            }
+            output[row] = .{ .db = group.db, .cfg = cfg, .applied = applied, .authority_id = authority.value_ptr.* };
+        }
+    }
+    return output;
+}
+/// Capture before releasing mutation admission. These are private, immutable
+/// wait requirements; public response bytes never carry runtime ownership.
+fn captureCurationWait(handle: *Handle, a: std.mem.Allocator, timeout: u64, out: *capi.Buffer) ![]const ?CurationWaitTarget {
+    if (timeout == 0) return &.{};
+    var result = try std.json.parseFromSliceLeaky(std.json.Value, a, out.ptr.?[0..out.len], .{});
+    const root = handle.parent_handle orelse handle;
+    const observed = try curationObservationCut(root, handle.database(), a, curationRows(&result), false);
+    const targets = try a.alloc(?CurationWaitTarget, observed.len);
+    @memset(targets, null);
+    for (observed, targets) |value, *target| if (value) |current| {
+        target.* = .{ .source_id = current.db.core.identity_namespace.table_id, .cfg = current.cfg, .authority_id = current.authority_id };
+    };
+    return targets;
+}
+fn curationScopeMatches(target: CurationWaitTarget, observed: CurationObserved) bool {
+    const cfg = observed.cfg;
+    if (target.source_id != observed.db.core.identity_namespace.table_id or !std.mem.eql(u8, target.cfg.table, cfg.table) or !std.mem.eql(u8, target.cfg.key_template, cfg.key_template) or target.cfg.namespace_generation != cfg.namespace_generation or cfg.config_generation < target.cfg.config_generation) return false;
+    if (target.authority_id) |id| return observed.authority_id == id and !cfg.namespace_curation_missing and cfg.namespace_curation_table_id == id;
+    return cfg.namespace_curation_table_id == target.cfg.namespace_curation_table_id and cfg.namespace_curation_missing == target.cfg.namespace_curation_missing;
+}
 /// Observe accepted policy/review revisions without retaining writer admission.
 /// Each poll owns bounded scratch memory, even for a five-minute wait.
-fn waitResolverCurationResponse(handle_ptr: ?*anyopaque, timeout_ms: u64, out: *capi.Buffer) capi.ErrorCode {
+fn waitResolverCurationResponse(handle_ptr: ?*anyopaque, timeout_ms: u64, out: *capi.Buffer, targets: []const ?CurationWaitTarget) capi.ErrorCode {
     if (timeout_ms == 0) return .ok;
     var arena = std.heap.ArenaAllocator.init(std.heap.c_allocator);
     defer arena.deinit();
@@ -7685,51 +7769,43 @@ fn waitResolverCurationResponse(handle_ptr: ?*anyopaque, timeout_ms: u64, out: *
             var iteration = std.heap.ArenaAllocator.init(std.heap.c_allocator);
             defer iteration.deinit();
             const scratch = iteration.allocator();
+            const rows = curationRows(&result);
+            if (rows.len != targets.len) return .ok;
             const root = guard.handle.parent_handle orelse guard.handle;
-            var singleton = [_]std.json.Value{result};
-            const rows = if (result.object.getPtr("results")) |items| if (items.* == .array) items.array.items else singleton[0..] else singleton[0..];
-            for (rows) |*row| {
+            const cut = curationObservationCut(root, guard.handle.database(), scratch, rows, true) catch return .ok;
+            for (rows, cut, targets) |*row, observed, expected| {
                 if (row.* != .object) continue;
                 if (row.object.get("accepted")) |accepted| if (accepted == .bool and !accepted.bool) {
                     caught_up = false;
                     continue;
                 };
-                if (row.object.get("applied")) |observed| if (observed == .bool and observed.bool) continue;
-                const resolver_name = row.object.get("resolver") orelse continue;
-                if (resolver_name != .string) continue;
-                var database = guard.handle.database();
-                if (row.object.get("source_table")) |source| if (source == .string) {
-                    database = if (std.mem.eql(u8, source.string, "default")) &root.db else if (root.embedded_tables.get(source.string)) |table| &table.db else {
-                        caught_up = false;
-                        continue;
-                    };
-                };
-                const identities = database.listResolverIdentities(scratch) catch {
+                if (row.object.get("applied")) |applied| if (applied == .bool and applied.bool) continue;
+                const current = observed orelse {
                     caught_up = false;
                     continue;
                 };
-                var done = false;
-                for (identities) |cfg| if (std.mem.eql(u8, cfg.name, resolver_name.string)) {
-                    done = @import("../storage/db/resolver_curation.zig").applied(database, cfg) catch false;
-                    if (row.object.get("revision")) |revision| if (revision == .integer and revision.integer >= 0) {
-                        done = done and cfg.curation_revision >= @as(u64, @intCast(revision.integer));
+                const target = expected orelse {
+                    caught_up = false;
+                    continue;
+                };
+                var done = current.applied and curationScopeMatches(target, current);
+                if (row.object.get("revision")) |revision| if (revision == .integer and revision.integer >= 0) {
+                    const floor: u64 = @intCast(revision.integer);
+                    done = done and (if (target.authority_id != null) current.cfg.namespace_curation_generation >= floor else current.cfg.curation_revision >= floor);
+                };
+                if (row.object.get("replay_sequence_kind")) |kind| if (kind == .string and std.mem.eql(u8, kind.string, "source_journal")) {
+                    if (row.object.get("replay_sequence")) |sequence| if (sequence == .integer and sequence.integer >= 0) {
+                        const stats = current.db.pendingWorkStats();
+                        const floor: u64 = @intCast(sequence.integer);
+                        done = done and stats.resolution.applied_sequence >= floor and (!current.cfg.promote or stats.promotion.applied_sequence >= floor);
                     };
-                    if (row.object.get("replay_sequence_kind")) |kind| if (kind == .string and std.mem.eql(u8, kind.string, "source_journal")) {
-                        if (row.object.get("replay_sequence")) |sequence| if (sequence == .integer and sequence.integer >= 0) {
-                            const stats = database.pendingWorkStats();
-                            const floor: u64 = @intCast(sequence.integer);
-                            done = done and stats.resolution.applied_sequence >= floor and (!cfg.promote or stats.promotion.applied_sequence >= floor);
-                        };
-                    };
-                    break;
                 };
                 caught_up = caught_up and done;
                 if (!done) continue;
                 row.object.put(a, "applied", .{ .bool = true }) catch return .ok;
-                const progress = std.json.Stringify.valueAlloc(a, database.pendingWorkStats(), .{}) catch return .ok;
+                const progress = std.json.Stringify.valueAlloc(a, current.db.pendingWorkStats(), .{}) catch return .ok;
                 row.object.put(a, "progress", std.json.parseFromSliceLeaky(std.json.Value, a, progress, .{}) catch return .ok) catch return .ok;
             }
-            if (!result.object.contains("results")) result = singleton[0];
         }
         if (caught_up) {
             result.object.put(a, "applied", .{ .bool = true }) catch return .ok;
@@ -7741,6 +7817,66 @@ fn waitResolverCurationResponse(handle_ptr: ?*anyopaque, timeout_ms: u64, out: *
         handleLockIo().sleep(.fromMilliseconds(25), .awake) catch return .ok;
     }
     return .ok;
+}
+
+test "capi resolver curation observation batches policy-free descriptors and fences namespace moves" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    var tmp = try TestDirectory.init("resolver-observation-scope");
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, "{s}.aflite", .{tmp.path()});
+    defer a.free(path);
+    var root = try openLiteHandleAllocWithRuntime(std.heap.c_allocator, path, .{ .profile = .native, .externally_locked = true }, true, null, null);
+    var handle = try publishHandle(root);
+    defer antfly_db_close(handle);
+    const tables = @import("tables.zig");
+    try tables.create(root, "entities", "{}", false);
+    try tables.create(root, "other", "{}", false);
+    for (0..3) |i| {
+        try root.db.addResolver(.{ .name = try std.fmt.allocPrint(scratch, "r-{d}", .{i}), .table = "entities", .source_artifact = try std.fmt.allocPrint(scratch, "source-{d}", .{i}), .resolution_artifact = try std.fmt.allocPrint(scratch, "resolved-{d}", .{i}), .key_template = "entity/{{_entity.text}}", .promote = false });
+    }
+    var out: capi.Buffer = .{};
+    defer antfly_buffer_free(&out);
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_entity_suppress_json(handle, .fromSlice("entities"), .fromSlice("entity/noise"), .fromSlice("{}"), &out));
+    const targets = try captureCurationWait(root, scratch, 100, &out);
+    try std.testing.expectEqual(@as(usize, 3), targets.len);
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_run_until_idle(handle));
+    var result = try std.json.parseFromSliceLeaky(std.json.Value, scratch, out.ptr.?[0..out.len], .{});
+    var cut = try curationObservationCut(root, &root.db, scratch, curationRows(&result), true);
+    for (cut, targets) |value, target| {
+        try std.testing.expect(curationScopeMatches(target.?, value.?));
+        // Physical authority replacement is rejected even before its source
+        // projection is asynchronously invalidated.
+        var replaced = value.?;
+        replaced.authority_id = replaced.authority_id.? + 1;
+        try std.testing.expect(!curationScopeMatches(target.?, replaced));
+        replaced = value.?;
+        replaced.cfg.namespace_curation_missing = true;
+        try std.testing.expect(!curationScopeMatches(target.?, replaced));
+    }
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_set_resolver_namespace_json(handle, .fromSlice("r-0"), .fromSlice("{\"table\":\"other\",\"key_template\":\"entity/{{_entity.text}}\",\"reset_merges\":true,\"reset_curation\":true}")));
+    cut = try curationObservationCut(root, &root.db, scratch, curationRows(&result), true);
+    var moved = false;
+    for (cut, targets) |value, target| if (std.mem.eql(u8, value.?.cfg.name, "r-0")) {
+        // A larger numeric revision must not satisfy the old namespace wait.
+        var current = value.?;
+        current.cfg.curation_revision = 1000;
+        current.cfg.namespace_curation_generation = 1000;
+        try std.testing.expect(!curationScopeMatches(target.?, current));
+        moved = true;
+    };
+    try std.testing.expect(moved);
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_run_until_idle(handle));
+    antfly_db_close(handle);
+    root = try openLiteHandleAllocWithRuntime(std.heap.c_allocator, path, .{ .profile = .native, .externally_locked = true }, false, null, null);
+    handle = try publishHandle(root);
+    const first = root.db.core.index_manager.getResolver("r-1").?;
+    const second = root.db.core.index_manager.getResolver("r-2").?;
+    try std.testing.expect(first.shared_projection != null);
+    try std.testing.expect(first.shared_projection == second.shared_projection);
+    try std.testing.expect(first.curation_json.ptr == second.curation_json.ptr);
 }
 
 pub fn antfly_db_unmerge_resolver_key_json(handle_ptr: ?*anyopaque, resolver_name: capi.Slice, request_json: capi.Slice, out_buf: ?*capi.Buffer) callconv(.c) capi.ErrorCode {
@@ -7846,9 +7982,11 @@ pub fn antfly_db_curate_entity_json(handle_ptr: ?*anyopaque, entity_table: capi.
     if (authority.enabled(entity_db, a) catch |err| return capi.mapError(err)) {
         const response = authority.entity(handle, a, entity_table.bytes(), entity_key.bytes(), input, .{}) catch |err| return capi.mapError(err);
         out.* = copyJsonBuffer(response) catch |err| return capi.mapError(err);
+        const wait_timeout = if (input.wait) |wait| wait.timeout_ms else 0;
+        const wait_targets = captureCurationWait(guard.handle, a, wait_timeout, out) catch &.{};
         admitted = false;
         guard.leave();
-        return waitResolverCurationResponse(handle_ptr, if (input.wait) |wait| wait.timeout_ms else 0, out);
+        return waitResolverCurationResponse(handle_ptr, wait_timeout, out, wait_targets);
     }
     var manifest = proposalManifest(a, entity_db) catch |err| return capi.mapError(err);
     const was_dirty = manifest.refresh_required;
@@ -7857,9 +7995,11 @@ pub fn antfly_db_curate_entity_json(handle_ptr: ?*anyopaque, entity_table: capi.
     if (input.action != .redirects and manifest.pending_id == null and liteOpenModeCanWrite(handle.open_mode)) {
         const response = authority.entity(handle, a, entity_table.bytes(), entity_key.bytes(), input, manifest.queue) catch |err| return capi.mapError(err);
         out.* = copyJsonBuffer(response) catch |err| return capi.mapError(err);
+        const wait_timeout = if (input.wait) |wait| wait.timeout_ms else 0;
+        const wait_targets = captureCurationWait(guard.handle, a, wait_timeout, out) catch &.{};
         admitted = false;
         guard.leave();
-        return waitResolverCurationResponse(handle_ptr, if (input.wait) |wait| wait.timeout_ms else 0, out);
+        return waitResolverCurationResponse(handle_ptr, wait_timeout, out, wait_targets);
     }
     tables.load(handle) catch |err| return capi.mapError(err);
     const Pending = struct { db: *db_mod.DB, source: []const u8, cfg: db_mod.ResolverConfig, request: pure.curation.Request, edit: pure.curation.Plan };
@@ -7945,9 +8085,11 @@ pub fn antfly_db_curate_entity_json(handle_ptr: ?*anyopaque, entity_table: capi.
     }
     const response = std.json.Stringify.valueAlloc(a, .{ .entity_table = entity_table.bytes(), .key = entity_key.bytes(), .atomicity = "resolver", .complete = complete, .results = std.json.Value{ .array = results } }, .{}) catch |err| return capi.mapError(err);
     out.* = copyJsonBuffer(response) catch |err| return capi.mapError(err);
+    const wait_timeout = if (input.wait) |wait| wait.timeout_ms else 0;
+    const wait_targets = captureCurationWait(guard.handle, a, wait_timeout, out) catch &.{};
     admitted = false;
     guard.leave();
-    return waitResolverCurationResponse(handle_ptr, if (input.wait) |wait| wait.timeout_ms else 0, out);
+    return waitResolverCurationResponse(handle_ptr, wait_timeout, out, wait_targets);
 }
 
 /// Admission owns the handle's exclusive writer fence. Read only the two
@@ -8104,9 +8246,11 @@ fn proposalOperation(handle_ptr: ?*anyopaque, table: capi.Slice, id: capi.Slice,
         out.* = copyJsonBuffer(response) catch |err| return capi.mapError(err);
         if (operation_name != .decide) return .ok;
         const decision = std.json.parseFromSliceLeaky(pure.ProposalDecision, a, request.bytes(), .{}) catch |err| return capi.mapError(err);
+        const wait_timeout = if (decision.wait) |wait| wait.timeout_ms else 0;
+        const wait_targets = captureCurationWait(guard.handle, a, wait_timeout, out) catch &.{};
         admitted = false;
         guard.leave();
-        return waitResolverCurationResponse(handle_ptr, if (decision.wait) |wait| wait.timeout_ms else 0, out);
+        return waitResolverCurationResponse(handle_ptr, wait_timeout, out, wait_targets);
     }
     var policy_lease = (if (operation_name == .list or operation_name == .get) db.local_execution.row_policy_gate.enterRawRead() else db.local_execution.row_policy_gate.enterRaw()) catch |err| return capi.mapError(err);
     defer policy_lease.release();
@@ -8162,9 +8306,11 @@ fn proposalOperation(handle_ptr: ?*anyopaque, table: capi.Slice, id: capi.Slice,
         const observation = observeProposal(handle, a, table.bytes(), proposal.id, manifest.queue.receipt_scope) catch |err| return capi.mapError(err);
         out.* = stringifyJson(.{ .proposal = proposal, .atomicity = "resolver", .changed = false, .complete = true, .applied = observation.applied, .results = observation.rows }) catch |err| return capi.mapError(err);
         policy_lease.release();
+        const wait_timeout = if (input_decision.wait) |wait| wait.timeout_ms else 0;
+        const wait_targets = captureCurationWait(guard.handle, a, wait_timeout, out) catch &.{};
         admitted = false;
         guard.leave();
-        return waitResolverCurationResponse(handle_ptr, if (input_decision.wait) |wait| wait.timeout_ms else 0, out);
+        return waitResolverCurationResponse(handle_ptr, wait_timeout, out, wait_targets);
     }
     if (!input_decision.accept and (input_decision.options != null or (input_decision.pin_distinct and proposal.action != .merge))) return capi.mapError(error.InvalidResolverCurationRequest);
     if (input_decision.wait) |wait| if (wait.timeout_ms == 0 or wait.timeout_ms > 300000) return capi.mapError(error.InvalidResolverCurationRequest);
@@ -8300,9 +8446,11 @@ fn proposalOperation(handle_ptr: ?*anyopaque, table: capi.Slice, id: capi.Slice,
     out.* = if (operation_name == .create) stringifyJson(manifest.queue.proposals[selected.?]) catch |err| return capi.mapError(err) else stringifyJson(.{ .proposal = manifest.queue.proposals[selected.?], .atomicity = "resolver", .complete = complete, .applied = applied, .results = std.json.Value{ .array = results } }) catch |err| return capi.mapError(err);
     if (operation_name == .decide) {
         policy_lease.release();
+        const wait_timeout = if (input_decision.wait) |wait| wait.timeout_ms else 0;
+        const wait_targets = captureCurationWait(guard.handle, a, wait_timeout, out) catch &.{};
         admitted = false;
         guard.leave();
-        return waitResolverCurationResponse(handle_ptr, if (input_decision.wait) |wait| wait.timeout_ms else 0, out);
+        return waitResolverCurationResponse(handle_ptr, wait_timeout, out, wait_targets);
     }
     return .ok;
 }
@@ -8341,9 +8489,13 @@ pub fn antfly_db_resolver_reviews_json(handle_ptr: ?*anyopaque, request_json: ca
     defer guard.handle.alloc.free(bytes);
     out.* = copyJsonBuffer(bytes) catch |err| return capi.mapError(err);
     if (input.value.operation != .review) return .ok;
+    const wait_timeout = if (input.value.wait) |wait| wait.timeout_ms else 0;
+    var wait_arena = std.heap.ArenaAllocator.init(std.heap.c_allocator);
+    defer wait_arena.deinit();
+    const wait_targets = captureCurationWait(guard.handle, wait_arena.allocator(), wait_timeout, out) catch &.{};
     admitted = false;
     guard.leave();
-    return waitResolverCurationResponse(handle_ptr, if (input.value.wait) |wait| wait.timeout_ms else 0, out);
+    return waitResolverCurationResponse(handle_ptr, wait_timeout, out, wait_targets);
 }
 
 pub fn antfly_db_list_resolver_identities_json(handle_ptr: ?*anyopaque, out_buf: ?*capi.Buffer) callconv(.c) capi.ErrorCode {

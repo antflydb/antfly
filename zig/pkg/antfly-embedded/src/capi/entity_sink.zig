@@ -2551,6 +2551,15 @@ test "capi resolver curation native migration and consumer seeks isolate unrelat
     defer api.antfly_buffer_free(&out);
     try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_entity_suppress_json(handle, .fromSlice("old"), .fromSlice("entity/noise"), .fromSlice("{}"), &out));
     api.antfly_buffer_free(&out);
+    // An unadopted namespace on an already-native destination must use the
+    // reverse bindings without opening every unrelated table.
+    try root.db.addResolver(.{ .name = "unadopted", .table = "old", .source_artifact = "other-kg", .resolution_artifact = "other-resolved", .key_template = "other/{{_entity.text}}", .promote = false });
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_run_until_idle(handle));
+    table_ops.closeAll(root);
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_entity_redirects_json(handle, .fromSlice("old"), .fromSlice("other/a"), .fromSlice("{}"), &out));
+    try std.testing.expectEqual(@as(usize, 1), root.embedded_tables.count());
+    try std.testing.expect(root.embedded_tables.contains("old"));
+    api.antfly_buffer_free(&out);
     try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_propose_curation_json(handle, .fromSlice("new"), .fromSlice("{\"action\":\"suppress\",\"key\":\"entity/other\"}"), &out));
     const proposal = try std.json.parseFromSliceLeaky(@import("antfly_resolver").curation.Proposal, scratch, out.ptr.?[0..out.len], .{ .allocate = .alloc_always });
     api.antfly_buffer_free(&out);
@@ -2562,6 +2571,7 @@ test "capi resolver curation native migration and consumer seeks isolate unrelat
     const configs = try root.db.core.index_manager.listResolverIdentities(scratch);
     const destination = try table_ops.get(root, "new");
     for (configs) |cfg| {
+        if (!std.mem.eql(u8, cfg.table, "new")) continue;
         try std.testing.expectEqual(@as(u64, 1), cfg.namespace_curation_generation);
         try std.testing.expectEqual(destination.core.identity_namespace.table_id, cfg.namespace_curation_table_id);
     }
@@ -2598,6 +2608,7 @@ test "capi resolver curation native migration and consumer seeks isolate unrelat
     try table_ops.drop(root, "new", false);
     try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_run_until_idle(handle));
     for (try root.db.core.index_manager.listResolverIdentities(scratch)) |cfg| {
+        if (!std.mem.eql(u8, cfg.table, "new")) continue;
         try std.testing.expect(cfg.namespace_curation_missing);
         try std.testing.expectEqual(@as(usize, 0), cfg.merges.len);
         try std.testing.expect(std.mem.indexOf(u8, cfg.curation_json, "preexisting") == null);
@@ -2606,6 +2617,7 @@ test "capi resolver curation native migration and consumer seeks isolate unrelat
     const fresh_id = (try table_ops.get(root, "new")).core.identity_namespace.table_id;
     try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_run_until_idle(handle));
     for (try root.db.core.index_manager.listResolverIdentities(scratch)) |cfg| {
+        if (!std.mem.eql(u8, cfg.table, "new")) continue;
         try std.testing.expect(cfg.namespace_curation_missing);
         try std.testing.expectEqual(fresh_id, cfg.namespace_curation_table_id);
         try std.testing.expectEqual(@as(u64, 0), cfg.namespace_curation_generation);
@@ -2614,6 +2626,7 @@ test "capi resolver curation native migration and consumer seeks isolate unrelat
     api.antfly_buffer_free(&out);
     try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_run_until_idle(handle));
     for (try root.db.core.index_manager.listResolverIdentities(scratch)) |cfg| {
+        if (!std.mem.eql(u8, cfg.table, "new")) continue;
         try std.testing.expect(!cfg.namespace_curation_missing);
         try std.testing.expectEqual(@as(u64, 0), cfg.namespace_curation_generation);
     }

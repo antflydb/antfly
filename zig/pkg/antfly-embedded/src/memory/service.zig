@@ -4230,7 +4230,9 @@ const Run = struct {
         var index = (try self.read(t.SemanticIndex, try self.semanticPath("entity-semantic-index"))) orelse t.SemanticIndex{};
         if (index.version != t.semantic_index_version or index.generation != self.state.config.generation) index = .{ .version = t.semantic_index_version, .generation = self.state.config.generation };
         const initial = !index.backfill_complete;
-        index.complete = false;
+        // A qualified generation stays serving during incremental refresh.
+        // Every returned projection is independently dependency-fenced below.
+        if (initial) index.complete = false;
         const page = try self.semanticEntityPage(initial, if (initial) index.cursor else index.work_cursor);
         var position = if (initial) index.cursor else index.work_cursor;
         var progressed = false;
@@ -4435,7 +4437,6 @@ const Run = struct {
         const seed = (try self.read(t.EntityRecord, try key(self.a, "entity", selected))) orelse return result;
         const index = (try self.read(t.SemanticIndex, try self.semanticPath("entity-semantic-index"))) orelse return result;
         if (index.version != t.semantic_index_version or !index.complete or !index.backfill_complete or index.generation != self.state.config.generation) return result;
-        if ((try self.service.backend.scan(self.service.backend.ptr, self.a, try self.semanticPath("entity-semantic-work/"), null, 1)).rows.len != 0) return result;
         const view = try self.candidateView(rendered, seed.entity.id);
         var matches: std.StringHashMapUnmanaged(SemanticMatch) = .empty;
         inline for (.{ t.ProjectionKind.names, t.ProjectionKind.view }) |kind| {

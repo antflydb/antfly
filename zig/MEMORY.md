@@ -547,7 +547,13 @@ free-text prompts into the engine queue. The [shared resolver authority](RESOLUT
 uses bounded static/native component closure, physical namespace projection fences,
 and durable reverse consumer indexes. Source metadata stores compact bindings;
 execution/provisioning reads share immutable snapshots, while Lite coalesces a
-namespace's consumers into one catalog publication. Continuous curation preserves
+namespace's consumers into one catalog publication with shared immutable policy
+ownership. A semantic generation advertises readiness only after its initial
+backfill/publication barrier. Incremental refresh debt does not revoke that
+qualification: candidate serving independently validates each seed and neighbor
+against its current rendered view, revision, model and dependencies. Unrelated
+dirty entities cannot disable healthy semantic discovery, and stale projections
+remain excluded before physical cleanup. Continuous curation preserves
 replay progress and schedules a new pass after its tail instead of restarting it.
 
 `curator` is a shared table permission, alongside read, write and admin. It

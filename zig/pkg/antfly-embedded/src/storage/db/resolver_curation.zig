@@ -891,7 +891,7 @@ fn emptyReplayOwner(db: anytype, a: std.mem.Allocator, stats: anytype) !bool {
     return count != null and count.? == 0;
 }
 
-pub fn applied(db: anytype, cfg: catalog.ResolverConfig) !bool {
+pub fn applied(db: anytype, cfg: anytype) !bool {
     if (cfg.retired) return true;
     if (try @import("resolution_runtime.zig").hasDurableReresolveBacklog(db.core.store)) return false;
     const stats = db.pendingWorkStats();
