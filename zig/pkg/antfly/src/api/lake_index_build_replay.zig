@@ -131,7 +131,7 @@ fn deltaMatches(provider: *Provider, source: []const u8, schema: []const u8, sna
 pub fn changedFiles(a: A, out: A, provider: *Provider, store: @import("../serverless/artifacts/store.zig").ArtifactStore, declarations: []const local.serverless_segment_sidecar_manifest.DeclaredArtifact, contributions: []const local.metadata_lake_index_catalog.FileContribution, cancellation: Cancellation) !?Needed {
     return changedFilesIndexed(a, out, provider, store, declarations, contributions, cancellation, null);
 }
-pub fn changedFilesIndexed(a: A, out: A, provider: *Provider, store: @import("../serverless/artifacts/store.zig").ArtifactStore, declarations: []const local.serverless_segment_sidecar_manifest.DeclaredArtifact, contributions: []const local.metadata_lake_index_catalog.FileContribution, cancellation: Cancellation, index: ?*@import("lake_index_contributions.zig").Index) !?Needed {
+pub fn changedFilesIndexed(a: A, out: A, parent_provider: *Provider, store: @import("../serverless/artifacts/store.zig").ArtifactStore, declarations: []const local.serverless_segment_sidecar_manifest.DeclaredArtifact, contributions: []const local.metadata_lake_index_catalog.FileContribution, cancellation: Cancellation, index: ?*@import("lake_index_contributions.zig").Index) !?Needed {
     const state = @import("lake_index_native_state.zig");
     var needed: Needed = .{ .files = .init(out) };
     var returned = false;
@@ -141,6 +141,10 @@ pub fn changedFilesIndexed(a: A, out: A, provider: *Provider, store: @import("..
     defer old.deinit(a);
     for (contributions) |contribution| try old.put(a, aggregate.contributionKey(contribution.file, contribution.recipe, contribution.name), {});
     for (declarations) |declaration| {
+        if (!parent_provider.wantsIndex(declaration.name)) continue;
+        var source = parent_provider.source.*;
+        var selected = parent_provider.forIndex(&source, declaration.name);
+        const provider = &selected;
         var arena = std.heap.ArenaAllocator.init(a);
         defer arena.deinit();
         const ca = arena.allocator();
@@ -267,10 +271,23 @@ pub const Replay = struct {
     primed_ready: bool = false,
     captured_file: ?usize = null,
     readers: usize = 0,
+    direct: bool = false,
+    decoded: [8]?CachedPage = @splat(null),
+    decoded_bytes: usize = 0,
+    /// Frozen sibling runs share their enclosing window quota. Reclaim idle
+    /// residency from peers without waiting while holding this replay's lock.
+    cache_peers: ?[]Replay = null,
+    decoded_clock: u64 = 0,
+    decoded_hits: usize = 0,
+    decoded_loads: usize = 0,
+    direct_replays: usize = 0,
     mutex: std.Io.Mutex = .init,
     max_spill_bytes: u64 = 1024 * 1024 * 1024,
     only_files: ?Needed = null,
     const Range = struct { begin: spill.Sequential.Position, end: u64 };
+    const Page = local.storage_db_types.ColumnSourcePage;
+    const CachedPage = struct { row: u64, following: spill.Sequential.Position, page: *Page, refs: []const rows.RowRef, used: u64 };
+
     pub fn init(a: A, provider: *Provider, columns: []const []const u8) Replay {
         return .{ .provider = provider, .columns = columns, .arena = .init(a), .budget = .{ .backing = a, .limit = 256 * 1024 * 1024 } };
     }
@@ -287,11 +304,13 @@ pub const Replay = struct {
         self.live = null;
         self.primed = null;
         self.primed_ready = false;
+        while (self.evictDecoded()) {}
         if (self.run) |*run| {
             run.close();
             self.manager.deinit();
             self.run = null;
-        }
+        } else if (self.direct) self.manager.deinit();
+        self.direct = false;
         _ = self.arena.reset(.free_all);
         self.ready = false;
         self.captured_file = null;
@@ -336,19 +355,20 @@ pub const Replay = struct {
     }
     fn capture(self: *Replay, a: A, original: Binding, file_index: usize, cancellation: Cancellation) !void {
         if (self.ready and self.captured_file == file_index) return;
-        if (self.readers != 0) return error.LakeReplayBusy;
-        if (self.run) |*run| {
-            run.close();
-            self.manager.deinit();
-            self.run = null;
-        }
-        _ = self.arena.reset(.free_all);
-        self.ready = false;
+        try self.reset();
         self.budget.exhausted = false;
         self.captured_file = file_index;
         const io = self.provider.context.io orelse return error.UnsupportedSqlExecution;
-        if (self.run != null) return error.InvalidSqlSpill;
         self.manager = .{ .alloc = self.budget.allocator(), .io = io, .context = self, .checkpoint = check, .max_bytes = self.max_spill_bytes };
+        var shared_binding = original;
+        shared_binding.column_bindings = self.columns;
+        if (self.provider.fragment_rows) |fragments| if (fragments.replayable) |replayable| if (replayable(fragments.ptr, shared_binding)) {
+            self.direct = true;
+            self.ready = true;
+            self.captures += 1;
+            self.direct_replays += 1;
+            return;
+        };
         self.run = spill.Sequential.init(&self.manager, 512 * 1024) catch |err| {
             self.manager.deinit();
             return err;
@@ -440,9 +460,9 @@ pub const Replay = struct {
         self.ready = true;
         self.captures += 1;
     }
-    const CaptureBatch = struct {
+    pub const CaptureBatch = struct {
         vectors: []const rows.ColumnVector,
-        fn physical(raw: *anyopaque, _: A, ordinal: usize) !?local.sql_execution_batch.PhysicalColumn {
+        pub fn physical(raw: *anyopaque, _: A, ordinal: usize) !?local.sql_execution_batch.PhysicalColumn {
             const self: *CaptureBatch = @ptrCast(@alignCast(raw));
             const column = self.vectors[ordinal];
             const kind: local.sql_ast.ColumnType = switch (column.values) {
@@ -457,7 +477,7 @@ pub const Replay = struct {
             if (vector.values == .json) vector.values = .{ .bytes = vector.values.json };
             return .{ .vector = vector, .range = .{ .count = column.rowCount() }, .kind = kind, .element = if (kind == .number) .float64 else null };
         }
-        fn identity(raw: *anyopaque, row: usize, ordinal: usize) !?u64 {
+        pub fn identity(raw: *anyopaque, row: usize, ordinal: usize) !?u64 {
             const self: *@This() = @ptrCast(@alignCast(raw));
             const column = self.vectors[ordinal];
             const ids = switch (column.values) {
@@ -468,7 +488,7 @@ pub const Replay = struct {
             };
             return if (column.nulls.isNull(row)) 0 else @as(u64, ids[row]) + 2;
         }
-        fn cell(raw: *anyopaque, a: A, row: usize, ordinal: usize) !local.sql_scalar.Datum {
+        pub fn cell(raw: *anyopaque, a: A, row: usize, ordinal: usize) !local.sql_scalar.Datum {
             const self: *@This() = @ptrCast(@alignCast(raw));
             const column = self.vectors[ordinal];
             if (column.nulls.isNull(row)) return .{};
@@ -485,6 +505,97 @@ pub const Replay = struct {
             } };
         }
     };
+    fn evictDecoded(self: *Replay) bool {
+        var victim: ?usize = null;
+        for (self.decoded, 0..) |entry, i| if (entry) |value| {
+            if (victim == null or value.used < self.decoded[victim.?].?.used) victim = i;
+        };
+        const i = victim orelse return false;
+        const value = self.decoded[i].?;
+        self.decoded_bytes -= value.page.retainedBytes();
+        self.decoded[i] = null;
+        value.page.release();
+        return true;
+    }
+    fn releaseBlock(raw: *anyopaque) void {
+        @as(*spill.Sequential.OwnedBlock, @ptrCast(@alignCast(raw))).release();
+    }
+    fn decode(self: *Replay, reader: *spill.Sequential.Reader) !?CachedPage {
+        const row = reader.offset;
+        const block = try reader.nextOwned() orelse return null;
+        var owns = true;
+        defer if (owns) block.release();
+        const a = self.budget.allocator();
+        const page = try a.create(Page);
+        page.* = .{ .a = a, .arena = .init(a), .columns = &.{}, .len = block.count(), .owner = .{ .ptr = block, .release_fn = releaseBlock, .retained_bytes = block.retainedBytes() } };
+        owns = false;
+        errdefer page.release();
+        const pa = page.arena.allocator();
+        const refs = try pa.alloc(rows.RowRef, block.count());
+        const inventory = self.provider.source.inventory;
+        for (refs, 0..) |*ref, index| {
+            if (block.keyWidth() != 3) return error.InvalidSqlSpill;
+            const file = std.math.cast(usize, (try block.keyCell(index, 0)).value.integer) orelse return error.InvalidSqlSpill;
+            if (file >= inventory.files.len) return error.InvalidSqlSpill;
+            ref.* = .{ .external = .{ .source_id = inventory.source_id, .snapshot_id = inventory.snapshot_id, .identity_version = inventory.row_identity_version, .file_id = try pa.dupe(u8, inventory.files[file].file_id), .row_group_ordinal = std.math.cast(u32, (try block.keyCell(index, 1)).value.integer) orelse return error.InvalidSqlSpill, .row_ordinal = @bitCast((try block.keyCell(index, 2)).value.integer) } };
+        }
+        const columns = try pa.alloc(rows.ColumnVector, self.columns.len);
+        for (columns, self.columns, self.kinds, 0..) |*column, name, kind, ordinal| {
+            column.* = try block.columnVector(pa, ordinal, kind);
+            column.name = try pa.dupe(u8, name);
+        }
+        page.columns = columns;
+        self.decoded_loads += 1;
+        return .{ .row = row, .following = reader.position(), .page = page, .refs = refs, .used = self.decoded_clock };
+    }
+    fn reclaimPeers(self: *Replay) !void {
+        const peers = self.cache_peers orelse return;
+        // Independent cursors retain the sealed run. Drop this cache lock before
+        // waiting for another one, and restore it on every success/error path.
+        self.mutex.unlock(self.manager.io);
+        defer self.mutex.lockUncancelable(self.manager.io);
+        for (peers) |*peer| {
+            try self.provider.context.ensureActive();
+            try peer.mutex.lock(self.manager.io);
+            while (peer.evictDecoded()) {}
+            peer.mutex.unlock(self.manager.io);
+        }
+    }
+    fn readDecoded(self: *Replay, reader: *spill.Sequential.Reader) !?CachedPage {
+        try self.mutex.lock(self.manager.io);
+        defer self.mutex.unlock(self.manager.io);
+        self.decoded_clock +|= 1;
+        for (&self.decoded) |*entry| if (entry.*) |*value| if (value.row == reader.offset) {
+            try reader.seekPosition(value.following);
+            value.used = self.decoded_clock;
+            value.page.retain();
+            self.decoded_hits += 1;
+            return value.*;
+        };
+        const before = reader.position();
+        const value = (self.decode(reader) catch |err| retry: {
+            if (err != error.OutOfMemory or !self.budget.isExhausted()) return err;
+            while (self.evictDecoded()) {}
+            try self.reclaimPeers();
+            try reader.seekPosition(before);
+            break :retry try self.decode(reader);
+        }) orelse return null;
+        const cost = value.page.retainedBytes();
+        const limit = @min(8 * 1024 * 1024, self.budget.limit / 4);
+        if (cost <= limit) {
+            while (self.decoded_bytes + cost > limit) if (!self.evictDecoded()) break;
+            while (true) {
+                for (&self.decoded) |*entry| if (entry.* == null) {
+                    value.page.retain();
+                    entry.* = value;
+                    self.decoded_bytes += cost;
+                    return value;
+                };
+                if (!self.evictDecoded()) break;
+            }
+        }
+        return value;
+    }
     pub fn prepare(self: *Replay, a: A, binding: Binding, file_index: usize, cancellation: Cancellation) !bool {
         const io = self.provider.context.io orelse return false;
         try self.mutex.lock(io);
@@ -513,6 +624,14 @@ pub const Replay = struct {
         return self.openFor(a, binding, only_file, cancellation, null);
     }
     pub fn openFor(self: *Replay, a: A, binding: Binding, only_file: ?usize, cancellation: Cancellation, consumer: ?usize) !?rows.Source {
+        return self.openForUsingIo(a, binding, only_file, cancellation, consumer, null);
+    }
+    pub fn openForUsingIo(self: *Replay, a: A, binding: Binding, only_file: ?usize, cancellation: Cancellation, consumer: ?usize, phase: ?*const @import("../serverless/artifacts/store.zig").IoPhase) !?rows.Source {
+        try cancellation.check();
+        try self.provider.context.ensureActive();
+        try binding.validate();
+        const inventory = self.provider.source.inventory;
+        if (!std.mem.eql(u8, binding.source_id, inventory.source_id) or !std.mem.eql(u8, binding.snapshot_id, inventory.snapshot_id) or !std.mem.eql(u8, binding.schema_fingerprint, inventory.schema_fingerprint) or binding.row_ref_kind != .external) return error.SidecarSourceBindingMismatch;
         for (binding.column_bindings) |name| {
             const present = for (self.columns) |column| {
                 if (std.mem.eql(u8, name, column)) break true;
@@ -524,12 +643,12 @@ pub const Replay = struct {
         if (consumer == null and self.captured_file != file_index) {
             var sibling = self.sibling;
             while (sibling) |candidate| : (sibling = candidate.sibling) {
-                if (candidate.ready and candidate.captured_file == file_index) return candidate.openFor(a, binding, only_file, cancellation, null);
+                if (candidate.ready and candidate.captured_file == file_index) return candidate.openForUsingIo(a, binding, only_file, cancellation, null, phase);
             }
         }
         if (consumer) |slot| if (self.pipeline) |pipeline| {
             const chosen = (try pipeline.request(slot, file_index, cancellation)) orelse return null;
-            return try chosen.openPrepared(a, binding, file_index, cancellation, slot);
+            return try chosen.openPrepared(a, binding, file_index, cancellation, slot, phase);
         };
         const io = self.provider.context.io orelse return null;
         try self.mutex.lock(io);
@@ -540,32 +659,38 @@ pub const Replay = struct {
             if (!needed.contains(file_index)) return null;
         };
         if (!try self.captureAdmitted(a, binding, file_index, cancellation)) return null;
-        return try self.openCursor(a, binding, cancellation);
+        return try self.openCursorFor(a, binding, cancellation, null, phase);
     }
     /// Producer has already captured and granted this file. Never re-enter the
     /// rendezvous or apply the serial planner's advisory changed-file mask.
-    fn openPrepared(self: *Replay, a: A, binding: Binding, file_index: usize, cancellation: Cancellation, slot: usize) !rows.Source {
+    fn openPrepared(self: *Replay, a: A, binding: Binding, file_index: usize, cancellation: Cancellation, slot: usize, phase: ?*const @import("../serverless/artifacts/store.zig").IoPhase) !rows.Source {
         const io = self.provider.context.io.?;
         try self.mutex.lock(io);
         defer self.mutex.unlock(io);
         if (!self.ready or self.captured_file != file_index) return error.SidecarSourceBindingMismatch;
-        return try self.openCursorFor(a, binding, cancellation, slot);
+        return try self.openCursorFor(a, binding, cancellation, slot, phase);
     }
     fn openCursor(self: *Replay, a: A, binding: Binding, cancellation: Cancellation) !rows.Source {
-        return self.openCursorFor(a, binding, cancellation, null);
+        return self.openCursorFor(a, binding, cancellation, null, null);
     }
-    fn openCursorFor(self: *Replay, a: A, binding: Binding, cancellation: Cancellation, slot: ?usize) !rows.Source {
+    fn openCursorFor(self: *Replay, a: A, binding: Binding, cancellation: Cancellation, slot: ?usize, phase: ?*const @import("../serverless/artifacts/store.zig").IoPhase) !rows.Source {
         const range = self.range;
         const columns = try a.dupe([]const u8, binding.column_bindings);
         errdefer a.free(columns);
         const cursor = try a.create(Cursor);
         errdefer a.destroy(cursor);
-        cursor.* = .{ .owner = self, .slot = slot, .reader = if (self.live != null) null else try self.run.?.readerSealed(a, range.begin, range.end), .arena = .init(a), .columns = columns, .cancellation = cancellation };
+        var direct: ?rows.Source = null;
+        if (self.direct) {
+            const fragments = self.provider.fragment_rows.?;
+            direct = try fragments.open(fragments.ptr, a, binding, self.captured_file, cancellation, phase);
+        }
+        cursor.* = .{ .owner = self, .slot = slot, .direct = direct, .reader = if (self.live != null or direct != null) null else try self.run.?.readerSealed(a, range.begin, range.end), .arena = .init(a), .columns = columns, .cancellation = cancellation };
         self.readers += 1;
-        return .{ .kind = binding.source_kind, .ctx = cursor, .next_batch = Cursor.next, .deinit_fn = Cursor.deinit };
+        return .{ .kind = binding.source_kind, .ctx = cursor, .next_batch = Cursor.next, .deinit_fn = Cursor.deinit, .retain_columns = Cursor.retain };
     }
     const Cursor = struct {
-        block: ?*spill.Sequential.OwnedBlock = null,
+        page: ?*Page = null,
+        direct: ?rows.Source = null,
         owner: *Replay,
         reader: ?spill.Sequential.Reader,
         slot: ?usize = null,
@@ -575,8 +700,8 @@ pub const Replay = struct {
         cancellation: Cancellation,
         fn deinit(raw: *anyopaque, a: A) void {
             const self: *Cursor = @ptrCast(@alignCast(raw));
-            if (self.block) |block| block.release();
-            if (self.reader) |*reader| reader.deinit() else self.owner.pipeline.?.leaveStream(self.slot.?);
+            if (self.page) |page| page.release();
+            if (self.direct) |source| source.deinit(a) else if (self.reader) |*reader| reader.deinit() else self.owner.pipeline.?.leaveStream(self.slot.?);
             const io = self.owner.provider.context.io.?;
             self.owner.mutex.lockUncancelable(io);
             self.owner.readers -= 1;
@@ -585,12 +710,45 @@ pub const Replay = struct {
             a.free(self.columns);
             a.destroy(self);
         }
-        fn next(raw: *anyopaque, _: A) !?rows.ColumnBatch {
+        fn releasePage(raw: *anyopaque) void {
+            @as(*Page, @ptrCast(@alignCast(raw))).release();
+        }
+        const Retained = struct {
+            a: A,
+            owner: *Replay,
+            inner: rows.ColumnOwner,
+            fn release(raw: *anyopaque) void {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                const replay = self.owner;
+                self.inner.release();
+                self.a.destroy(self);
+                replay.mutex.lockUncancelable(replay.provider.context.io.?);
+                replay.readers -= 1;
+                replay.mutex.unlock(replay.provider.context.io.?);
+            }
+        };
+        fn retain(raw: *anyopaque, a: A) !?rows.ColumnOwner {
+            const self: *Cursor = @ptrCast(@alignCast(raw));
+            const inner = if (self.direct) |source| (try source.retainColumns(a)) orelse return null else block: {
+                const page = self.page orelse return null;
+                page.retain();
+                break :block rows.ColumnOwner{ .ptr = page, .release_fn = releasePage, .retained_bytes = page.retainedBytes() };
+            };
+            errdefer inner.release();
+            const held = try a.create(Retained);
+            held.* = .{ .a = a, .owner = self.owner, .inner = inner };
+            self.owner.mutex.lockUncancelable(self.owner.provider.context.io.?);
+            self.owner.readers += 1;
+            self.owner.mutex.unlock(self.owner.provider.context.io.?);
+            return .{ .ptr = held, .release_fn = Retained.release, .retained_bytes = inner.retained_bytes +| @sizeOf(Retained) };
+        }
+        fn next(raw: *anyopaque, caller: A) !?rows.ColumnBatch {
             const self: *Cursor = @ptrCast(@alignCast(raw));
             try self.cancellation.check();
             try self.owner.provider.context.ensureActive();
-            if (self.block) |block| block.release();
-            self.block = null;
+            if (self.page) |page| page.release();
+            self.page = null;
+            if (self.direct) |source| return source.next(caller);
             _ = self.arena.reset(.retain_capacity);
             const a = self.arena.allocator();
             if (self.reader == null) {
@@ -601,25 +759,17 @@ pub const Replay = struct {
                 result.columns = columns;
                 return result;
             }
-            const block = try self.reader.?.nextOwned() orelse return null;
-            self.block = block;
-            const refs = try a.alloc(rows.RowRef, block.count());
-            const inventory = self.owner.provider.source.inventory;
-            for (refs, 0..) |*ref, index| {
-                if (block.keyWidth() != 3) return error.InvalidSqlSpill;
-                const file = std.math.cast(usize, (try block.keyCell(index, 0)).value.integer) orelse return error.InvalidSqlSpill;
-                if (file >= inventory.files.len) return error.InvalidSqlSpill;
-                ref.* = .{ .external = .{ .source_id = inventory.source_id, .snapshot_id = inventory.snapshot_id, .identity_version = inventory.row_identity_version, .file_id = inventory.files[file].file_id, .row_group_ordinal = std.math.cast(u32, (try block.keyCell(index, 1)).value.integer) orelse return error.InvalidSqlSpill, .row_ordinal = @bitCast((try block.keyCell(index, 2)).value.integer) } };
-            }
+            const decoded = try self.owner.readDecoded(&self.reader.?) orelse return null;
+            self.page = decoded.page;
             const columns = try a.alloc(rows.ColumnVector, self.columns.len);
             for (self.columns, columns) |name, *column| {
                 const ordinal = for (self.owner.columns, 0..) |candidate, index| {
                     if (std.mem.eql(u8, candidate, name)) break index;
                 } else return error.RowSourceColumnKindMismatch;
-                column.* = try block.columnVector(a, ordinal, self.owner.kinds[ordinal]);
-                column.name = name;
+                column.* = decoded.page.columns[ordinal];
             }
-            return .{ .snapshot = .{ .table_id = inventory.source_id, .snapshot_id = inventory.snapshot_id }, .row_refs = refs, .columns = columns };
+            const inventory = self.owner.provider.source.inventory;
+            return .{ .snapshot = .{ .table_id = inventory.source_id, .snapshot_id = inventory.snapshot_id }, .row_refs = decoded.refs, .columns = columns };
         }
     };
 };
@@ -675,6 +825,27 @@ test "external lake bounded replay releases files and falls back for oversized s
             count += batch.rowCount();
         }
         try std.testing.expectEqual(values.len, count);
+        const decoded_before = replay.decoded_loads;
+        const reused = (try replay.open(a, binding, file, .none)).?;
+        var repeated: usize = 0;
+        while (try reused.next(a)) |batch| {
+            for (0..batch.rowCount()) |index| try std.testing.expectEqualStrings(values[repeated + index], try batch.columns[0].bytesAt(index));
+            repeated += batch.rowCount();
+        }
+        reused.deinit(a);
+        try std.testing.expectEqual(values.len, repeated);
+        try std.testing.expectEqual(decoded_before, replay.decoded_loads);
+        try std.testing.expect(replay.decoded_hits != 0);
+        // Required decoding reclaims optional cached pages before retrying a
+        // known quota denial, and restores the exact sealed block boundary.
+        try std.testing.expect(replay.evictDecoded());
+        const previous_limit = replay.budget.limit;
+        replay.budget.limit = replay.budget.live;
+        const pressure = (try replay.open(a, binding, file, .none)).?;
+        const first_batch = (try pressure.next(a)).?;
+        try std.testing.expectEqualStrings(values[0], try first_batch.columns[0].bytesAt(0));
+        pressure.deinit(a);
+        replay.budget.limit = previous_limit;
         try std.testing.expect(replay.manager.peak_bytes <= replay.max_spill_bytes);
         total_spill += replay.manager.peak_bytes;
     }
@@ -691,8 +862,37 @@ test "external lake bounded replay releases files and falls back for oversized s
     try std.testing.expectEqual(@as(usize, 0), replay.manager.files);
     replay.budget.limit = 2 * 1024 * 1024;
     const recovered = (try replay.open(a, binding, 0, .none)).?;
+    _ = (try recovered.next(a)).?;
+    const held = (try recovered.retainColumns(a)).?;
     recovered.deinit(a);
+    try std.testing.expectError(error.LakeReplayBusy, replay.reset());
+    try std.testing.expect(held.retained_bytes > 0);
+    held.release();
     try replay.reset();
+    // An earlier file's optional decoded pages must not consume all of a
+    // later file's shared window quota. Only cache-owned leases are reclaimed.
+    {
+        var window_budget: local.sql_memory_budget = .{ .backing = a, .limit = 4 * 1024 * 1024 };
+        defer std.debug.assert(window_budget.live == 0);
+        var peers = [_]Replay{ Replay.init(a, &provider, &.{"body"}), Replay.init(a, &provider, &.{"body"}) };
+        defer for (&peers) |*peer| peer.deinit();
+        for (&peers) |*peer| {
+            peer.budget.backing = window_budget.allocator();
+            peer.cache_peers = &peers;
+        }
+        const current = (try peers[0].open(a, binding, 0, .none)).?;
+        defer current.deinit(a);
+        const pa = peers[1].budget.allocator();
+        const page = try pa.create(Replay.Page);
+        page.* = .{ .a = pa, .arena = .init(pa), .columns = &.{}, .len = 0 };
+        _ = try page.arena.allocator().alloc(u8, 1024 * 1024);
+        peers[1].decoded[0] = .{ .row = 0, .following = .{ .row = 0, .byte = 0 }, .page = page, .refs = &.{}, .used = 0 };
+        peers[1].decoded_bytes = page.retainedBytes();
+        window_budget.limit = window_budget.live;
+        const batch = (try current.next(a)).?;
+        try std.testing.expectEqualStrings(values[0], try batch.columns[0].bytesAt(0));
+        try std.testing.expect(peers[1].decoded[0] == null);
+    }
     var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
     var failed = Replay.init(failing.allocator(), &provider, &.{"body"});
     defer failed.deinit();

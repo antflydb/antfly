@@ -95,14 +95,21 @@ pub fn prepare(a: A, store: *stores.ArtifactStore, group: *corpus.FileGroup, tok
         group.source_pages = try corpus.source_spans.publish(a, store, group.sources, token);
         group.source_count = @intCast(group.sources.len);
     }
+    if (group.sources.len == 0) {
+        group.physical_manifest = try put(a, store, corpus.FileGroup{ .file = fileState(group.file), .segments = &.{}, .rows = group.rows, .opening_packs = group.opening_packs }, token);
+        if (group.parts.len != 0) {
+            for (group.parts) |part| for (@constCast(part)) |*span| {
+                span.physical = group.physical_manifest.?;
+            };
+        }
+    }
     const descriptors = try a.alloc(Chunk, group.segments.len);
-    for (descriptors, group.segments, group.admissions, group.summaries) |*ref, segment, admission, summary| {
+    for (descriptors, group.segments, group.admissions, group.summaries, 0..) |*ref, segment, admission, summary, ordinal| {
         try token.check();
-        ref.* = try put(a, store, corpus.FileGroup{ .file = fileState(group.file), .sources = if (group.source_pages.len == 0) group.sources else &.{}, .source_pages = group.source_pages, .source_count = group.source_count, .segments = &.{segment}, .admissions = &.{admission}, .summaries = &.{summary} }, token);
+        const sources = if (group.parts.len != 0) group.parts[ordinal] else if (group.source_pages.len == 0) group.sources else &.{};
+        ref.* = try put(a, store, corpus.FileGroup{ .file = fileState(group.file), .sources = sources, .masked = group.masked or group.parts.len != 0, .source_pages = group.source_pages, .source_count = group.source_count, .segments = &.{segment}, .admissions = &.{admission}, .summaries = &.{summary} }, token);
     }
     group.descriptors = descriptors;
-    if (group.sources.len != 0) return;
-    group.physical_manifest = try put(a, store, corpus.FileGroup{ .file = fileState(group.file), .segments = &.{}, .rows = group.rows, .opening_packs = group.opening_packs }, token);
 }
 const Reader = struct {
     store: stores.ArtifactStore,
@@ -111,20 +118,21 @@ const Reader = struct {
     reads: u64 = 128 * 1024 * 1024,
     writes: u64 = 0,
     external_budget: ?*u64 = null,
+    publication: bool = false,
     pages: pages_mod.PageStore = undefined,
     fn init(self: *@This(), domain: Id) void {
         self.pages = .{ .domain = domain, .artifacts = &self.store, .cancellation = self.token, .remaining_read_bytes = self.external_budget orelse &self.reads, .remaining_write_bytes = &self.writes, .read_cache = if (self.cached != null) .{ .ptr = self, .read = readPage } else null };
+        if (self.publication) self.pages.admitPublication();
     }
     fn check(self: *@This()) !void {
         try self.token.check();
         if (self.cached) |cached| try cached.context.ensureActive();
     }
-    fn readPage(raw: *anyopaque, a: A, store: *stores.ArtifactStore, ref: local.serverless_manifest_artifact_ref.ArtifactRef, offset: u64, length: usize, _: Id, token: Cancellation, budget: *u64) ![]u8 {
+    fn readPage(raw: *anyopaque, a: A, store: *stores.ArtifactStore, ref: local.serverless_manifest_artifact_ref.ArtifactRef, offset: u64, length: usize, digest: Id, token: Cancellation, budget: *u64) ![]u8 {
         const self: *@This() = @ptrCast(@alignCast(raw));
         try self.check();
-        if (offset != 0 or length != ref.byte_len) return error.InvalidNativeLakeTextCorpus;
         try stores.chargeReadBudget(budget, length);
-        return artifacts.readArtifact(a, store.*, .{ .artifact_id = ref.artifact_id, .checksum = ref.checksum, .byte_len = ref.byte_len }, token, self.cached);
+        return artifacts.readPageRange(a, store.*, .{ .artifact_id = ref.artifact_id, .checksum = ref.checksum, .byte_len = ref.byte_len }, offset, length, digest, token, self.cached);
     }
 };
 fn key(id: Id, offset: usize) [36]u8 {
@@ -147,7 +155,7 @@ const Segments = struct {
     }
     fn next(self: *Segments) !?SegmentRecord {
         if (self.ordinal == self.routes.len) {
-            if (self.group.sources.len == 0 and self.lower != try corpus.physical.validate(self.group.rows)) return error.InvalidNativeLakeTextCorpus;
+            if (self.group.sources.len == 0 and self.group.parts.len == 0 and self.lower != try corpus.physical.validate(self.group.rows)) return error.InvalidNativeLakeTextCorpus;
             return null;
         }
         const route = self.routes[self.ordinal];
@@ -160,153 +168,80 @@ const Segments = struct {
         }
         var end = self.first_block;
         while (end < self.group.rows.len and self.group.rows[end].base < upper) : (end += 1) self.blocks_examined += 1;
-        const result: SegmentRecord = .{ .sources = if (self.group.source_pages.len == 0) self.group.sources else &.{}, .source_pages = self.group.source_pages, .source_count = self.group.source_count, .file = fileState(self.group.file), .manifest = self.manifest, .physical = self.group.physical_manifest, .ordinal = @intCast(self.ordinal), .interval = .{ .lower = self.lower, .count = route.doc_count }, .route = route, .rows = self.group.rows[self.first_block..end] };
+        const has_parts = self.group.parts.len != 0;
+        const sources = if (has_parts) self.group.parts[self.ordinal] else if (self.group.source_pages.len == 0) self.group.sources else &.{};
+        const result: SegmentRecord = .{ .sources = sources, .source_pages = self.group.source_pages, .source_count = self.group.source_count, .file = fileState(self.group.file), .manifest = self.manifest, .physical = if (has_parts) null else self.group.physical_manifest, .ordinal = @intCast(self.ordinal), .interval = .{ .lower = self.lower, .count = route.doc_count }, .route = route, .rows = if (has_parts) &.{} else self.group.rows[self.first_block..end] };
         self.lower = upper;
         self.ordinal += 1;
         return result;
     }
 };
 /// Metadata construction streams one record at a time into bounded sorts and
-/// durable runs. Replacement tails and last-write ordering remain explicit.
-pub const Mutations = struct {
-    a: A,
-    sort: local.sql_spill.Sort,
-    forest: @import("lake_index_delta_runs.zig").Forest,
-    reduction: @FieldType(tree.Store, "reduce") = null,
-    ordinal: u64 = 0,
-    pub fn init(a: A, manager: *local.sql_spill.Manager, storage: tree.Store) Mutations {
-        var sort = local.sql_spill.Sort.init(a, manager, &.{.{}}, 1024 * 1024);
-        sort.shared_runs = true;
-        sort.encoded_bytes = true;
-        return .{ .a = a, .sort = sort, .forest = .{ .a = a, .store = storage, .policy = .latest } };
+/// private local runs. Only the final tree is durable; replacement tails and
+/// last-write ordering remain explicit.
+pub const Mutations = @import("lake_index_page_mutations.zig").Mutations;
+/// Address-stable, operation-owned streaming directory publication. Each decoded
+/// group is copied into bounded sorts before the caller reuses its read arena.
+/// Statistics and directory consumers can therefore share one manifest read.
+pub const Publisher = struct {
+    token: Cancellation,
+    reads: u64 = 0,
+    writes: u64 = 0,
+    pages: pages_mod.PageStore = undefined,
+    manager: local.sql_spill.Manager = undefined,
+    files: Mutations = undefined,
+    segments: Mutations = undefined,
+    routing: Mutations = undefined,
+    metadata: MetadataBuilder = undefined,
+    pub fn init(self: *Publisher, a: A, store: *stores.ArtifactStore, token: Cancellation, io: std.Io) !void {
+        const scope = store.upload_scope orelse return error.InvalidArtifactUploadScope;
+        self.* = .{ .token = token };
+        self.pages = .{ .domain = scope.domain, .attempt = scope.attempt, .artifacts = store, .cancellation = token, .remaining_read_bytes = &self.reads, .remaining_write_bytes = &self.writes, .streaming = true };
+        self.pages.admitPublication();
+        self.initReducers(a, self.pages.store(), io);
+        inline for (.{ "files", "segments", "routing" }) |name| @field(self, name).private_pages.phase = store.io_phase;
     }
-    pub fn deinit(self: *Mutations) void {
-        self.sort.deinit();
+    fn initReducers(self: *Publisher, a: A, storage: tree.Store, io: std.Io) void {
+        self.manager = .{ .alloc = a, .io = io, .context = self, .checkpoint = check };
+        self.files = Mutations.init(a, &self.manager, storage);
+        self.segments = Mutations.init(a, &self.manager, storage);
+        self.routing = Mutations.init(a, &self.manager, storage);
+        self.metadata = .{ .files = &self.files, .segments = &self.segments, .routing = &self.routing, .token = self.token, .group_arena = .init(a), .record_arena = .init(a) };
     }
-    fn add(self: *Mutations, id: Id, value: ?[]const u8, previous_length: usize) !void {
-        return self.addPrefix(&id, value, previous_length);
+    fn check(raw: *anyopaque) !void {
+        try @as(*Publisher, @ptrCast(@alignCast(raw))).token.check();
     }
-    pub fn addPrefix(self: *Mutations, prefix: []const u8, value: ?[]const u8, previous_length: usize) !void {
-        const length = if (value) |bytes| bytes.len else previous_length;
-        if (length == 0 or length > corpus.max_root_bytes) return error.InvalidNativeLakeTextCorpus;
-        var offset: usize = 0;
-        while (offset < length) : (offset += chunk_bytes) {
-            var buffer: [68]u8 = undefined;
-            if (prefix.len > 64) return error.InvalidNativeLakeTextCorpus;
-            @memcpy(buffer[0..prefix.len], prefix);
-            std.mem.writeInt(u32, buffer[prefix.len..][0..4], @intCast(offset), .big);
-            const k = buffer[0 .. prefix.len + 4];
-            try self.sort.add(.{ .keys = &.{local.sql_scalar.Datum.json(.{ .string = k })}, .values = &.{local.sql_scalar.Datum.json(if (value) |bytes| .{ .string = bytes[offset..@min(length, offset + chunk_bytes)] } else .null)}, .ordinal = self.ordinal });
-            self.ordinal += 1;
-            if (self.sort.total >= 1024) try self.flush();
+    pub fn add(self: *Publisher, group: corpus.FileGroup, ref: Chunk, deleting: bool) !void {
+        try self.metadata.add(group, ref, deleting);
+    }
+    /// Final additions supersede removals regardless of lazy discovery order.
+    /// This affects private mutation runs only; persisted directory values keep
+    /// their existing format and the prior roots are updated exactly once.
+    pub fn preferAdditions(self: *Publisher) void {
+        inline for (.{ "files", "segments", "routing" }) |name| {
+            @field(self, name).addition_first = true;
+            @field(self, name).forest.policy = .addition_first;
         }
     }
-    fn flush(self: *Mutations) !void {
-        if (self.sort.total == 0) return;
-        try self.sort.finish();
-        const Source = struct {
-            sort: *local.sql_spill.Sort,
-            scratch: std.heap.ArenaAllocator,
-            owned: std.heap.ArenaAllocator,
-            pending: ?local.sql_operators.Row = null,
-            pub fn next(self_: *@This()) !?tree.Cursor.Record {
-                _ = self_.owned.reset(.retain_capacity);
-                const a = self_.owned.allocator();
-                if (self_.pending == null) self_.pending = try self_.sort.next(self_.scratch.allocator());
-                const row = self_.pending orelse return null;
-                const k = try a.dupe(u8, row.keys[0].value.string);
-                var encoded: []const u8 = "";
-                while (self_.pending) |next_| {
-                    if (!std.mem.eql(u8, k, next_.keys[0].value.string)) break;
-                    const value = next_.values[0];
-                    encoded = if (value.sql_null or value.value == .null) &.{0} else try std.mem.concat(a, u8, &.{ &.{1}, value.value.string });
-                    _ = self_.scratch.reset(.retain_capacity);
-                    self_.pending = try self_.sort.next(self_.scratch.allocator());
-                }
-                return .{ .key = k, .value = encoded };
-            }
-        };
-        var source: Source = .{ .sort = &self.sort, .scratch = .init(self.a), .owned = .init(self.a) };
-        defer source.scratch.deinit();
-        defer source.owned.deinit();
-        try self.forest.add(&source);
-        const manager = self.sort.manager;
-        self.sort.deinit();
-        self.sort = local.sql_spill.Sort.init(self.a, manager, &.{.{}}, 1024 * 1024);
-        self.sort.shared_runs = true;
-        self.sort.encoded_bytes = true;
+    pub fn finish(self: *Publisher, old: Roots) !Roots {
+        return .{ .files = try self.files.finish(old.files), .segments = try self.segments.finish(old.segments), .routing = try self.routing.finish(old.routing) };
     }
-    pub fn finish(self: *Mutations, prior: ?tree.Ref) !?tree.Ref {
-        try self.flush();
-        const changes = try self.forest.finish() orelse return prior;
-        var storage = self.forest.store;
-        if (self.reduction) |reduction| storage.reduce = reduction;
-        var delta = try tree.Cursor.init(self.a, storage, changes, "", null);
-        defer delta.deinit();
-        if (prior != null and changes.records < @max(4096, prior.?.records / 4)) {
-            var cache: tree.Cache = .{ .alloc = self.a, .underlying = storage };
-            defer cache.deinit();
-            var arena = std.heap.ArenaAllocator.init(self.a);
-            defer arena.deinit();
-            var root = prior;
-            var done = false;
-            while (!done) {
-                _ = arena.reset(.retain_capacity);
-                const a = arena.allocator();
-                var batch: std.ArrayList(tree.Mutation) = .empty;
-                var bytes: usize = 0;
-                while (batch.items.len < 256 and bytes < 512 * 1024) {
-                    const record = try delta.next() orelse {
-                        done = true;
-                        break;
-                    };
-                    const mutation_ = try decode(record);
-                    try batch.append(a, .{ .key = try a.dupe(u8, mutation_.key), .value = if (mutation_.value) |value| try a.dupe(u8, value) else null });
-                    bytes += record.key.len + record.value.len;
-                }
-                if (batch.items.len != 0) root = try tree.apply(self.a, cache.store(), root, batch.items);
-            }
-            return root;
-        }
-        var old = try tree.Cursor.init(self.a, storage, prior, "", null);
-        defer old.deinit();
-        const Merge = struct {
-            old: *tree.Cursor,
-            delta: *tree.Cursor,
-            left: ?tree.Cursor.Record = null,
-            right: ?tree.Cursor.Record = null,
-            advance_left: bool = true,
-            advance_right: bool = true,
-            pub fn next(self_: *@This()) !?tree.Cursor.Record {
-                while (true) {
-                    if (self_.advance_left) self_.left = try self_.old.next();
-                    if (self_.advance_right) self_.right = try self_.delta.next();
-                    self_.advance_left = false;
-                    self_.advance_right = false;
-                    if (self_.left == null and self_.right == null) return null;
-                    const order: std.math.Order = if (self_.left == null) .gt else if (self_.right == null) .lt else std.mem.order(u8, self_.left.?.key, self_.right.?.key);
-                    self_.advance_left = order != .gt;
-                    self_.advance_right = order != .lt;
-                    if (order == .lt) return self_.left;
-                    const mutation_ = try decode(self_.right.?);
-                    if (mutation_.value) |value| return .{ .key = mutation_.key, .value = value };
-                }
-            }
-        };
-        var source: Merge = .{ .old = &old, .delta = &delta };
-        return tree.buildSorted(self.a, storage, &source);
-    }
-    fn decode(record: tree.Cursor.Record) !tree.Mutation {
-        if (record.value.len == 0 or record.value[0] > 1 or (record.value[0] == 0 and record.value.len != 1)) return error.InvalidNativeLakeTextCorpus;
-        return .{ .key = record.key, .value = if (record.value[0] == 0) null else record.value[1..] };
+    pub fn deinit(self: *Publisher) void {
+        self.metadata.deinit();
+        self.files.deinit();
+        self.segments.deinit();
+        self.routing.deinit();
+        self.manager.deinit();
     }
 };
 pub fn publish(a: A, store: *stores.ArtifactStore, groups: []const corpus.FileGroup, refs: []const Chunk, removed: []const corpus.FileGroup, removed_refs: []const Chunk, old: Roots, token: Cancellation, io: std.Io) !Roots {
-    const scope = store.upload_scope orelse return error.InvalidArtifactUploadScope;
-    var reads: u64 = 0;
-    var writes: u64 = 0;
-    var pages: pages_mod.PageStore = .{ .domain = scope.domain, .attempt = scope.attempt, .artifacts = store, .cancellation = token, .remaining_read_bytes = &reads, .remaining_write_bytes = &writes, .streaming = true };
-    return update(a, pages.store(), groups, refs, removed, removed_refs, old, token, io);
+    var publisher: Publisher = undefined;
+    try publisher.init(a, store, token, io);
+    defer publisher.deinit();
+    for ([_]bool{ true, false }) |deleting| {
+        for (if (deleting) removed else groups, if (deleting) removed_refs else refs) |group, ref| try publisher.add(group, ref, deleting);
+    }
+    return publisher.finish(old);
 }
 /// Checkpoints need only compact file identities, never segment/routing trees.
 /// Changes are paged and applied to the previous immutable delta inventory.
@@ -315,6 +250,7 @@ pub fn publishFileRecords(a: A, store: *stores.ArtifactStore, records: []const F
     var reads: u64 = 0;
     var writes: u64 = 0;
     var pages: pages_mod.PageStore = .{ .domain = scope.domain, .attempt = scope.attempt, .artifacts = store, .cancellation = token, .remaining_read_bytes = &reads, .remaining_write_bytes = &writes, .streaming = true };
+    pages.admitPublication();
     var check = token;
     const Check = struct {
         fn call(raw: *anyopaque) !void {
@@ -324,6 +260,7 @@ pub fn publishFileRecords(a: A, store: *stores.ArtifactStore, records: []const F
     var manager: local.sql_spill.Manager = .{ .alloc = a, .io = io, .context = &check, .checkpoint = Check.call };
     defer manager.deinit();
     var mutations = Mutations.init(a, &manager, pages.store());
+    mutations.private_pages.phase = store.io_phase;
     defer mutations.deinit();
     for ([_]bool{ true, false }) |deleting| for (if (deleting) removed else records) |record| {
         try token.check();
@@ -336,27 +273,13 @@ pub fn publishFileRecords(a: A, store: *stores.ArtifactStore, records: []const F
     return mutations.finish(prior);
 }
 fn update(a: A, storage: tree.Store, groups: []const corpus.FileGroup, refs: []const Chunk, removed: []const corpus.FileGroup, removed_refs: []const Chunk, old: Roots, token: Cancellation, io: std.Io) !Roots {
-    var check = token;
-    const Check = struct {
-        fn call(raw: *anyopaque) !void {
-            const cancellation: *Cancellation = @ptrCast(@alignCast(raw));
-            try cancellation.check();
-        }
-    };
-    var manager: local.sql_spill.Manager = .{ .alloc = a, .io = io, .context = &check, .checkpoint = Check.call };
-    defer manager.deinit();
-    var files = Mutations.init(a, &manager, storage);
-    defer files.deinit();
-    var segments = Mutations.init(a, &manager, storage);
-    defer segments.deinit();
-    var routing = Mutations.init(a, &manager, storage);
-    defer routing.deinit();
-    var builder: MetadataBuilder = .{ .files = &files, .segments = &segments, .routing = &routing, .token = token, .group_arena = .init(a), .record_arena = .init(a) };
-    defer builder.deinit();
+    var publisher: Publisher = .{ .token = token };
+    publisher.initReducers(a, storage, io);
+    defer publisher.deinit();
     for ([_]bool{ true, false }) |deleting| {
-        for (if (deleting) removed else groups, if (deleting) removed_refs else refs) |group, ref| try builder.add(group, ref, deleting);
+        for (if (deleting) removed else groups, if (deleting) removed_refs else refs) |group, ref| try publisher.add(group, ref, deleting);
     }
-    return .{ .files = try files.finish(old.files), .segments = try segments.finish(old.segments), .routing = try routing.finish(old.routing) };
+    return publisher.finish(old);
 }
 const MetadataBuilder = struct {
     files: *Mutations,
@@ -402,38 +325,26 @@ const MetadataBuilder = struct {
 /// Maintenance consumes one durable file manifest at a time. No decoded
 /// admissions or physical directories survive the next file.
 pub fn publishManifests(a: A, store: *stores.ArtifactStore, refs: []const Chunk, removed: []const Chunk, old: Roots, domain: Id, token: Cancellation, io: std.Io) !Roots {
-    const scope = store.upload_scope orelse return error.InvalidArtifactUploadScope;
-    var reads: u64 = 0;
-    var writes: u64 = 0;
-    var pages: pages_mod.PageStore = .{ .domain = scope.domain, .attempt = scope.attempt, .artifacts = store, .cancellation = token, .remaining_read_bytes = &reads, .remaining_write_bytes = &writes, .streaming = true };
-    var check = token;
-    const Check = struct {
-        fn call(raw: *anyopaque) !void {
-            try @as(*Cancellation, @ptrCast(@alignCast(raw))).check();
-        }
-    };
-    var manager: local.sql_spill.Manager = .{ .alloc = a, .io = io, .context = &check, .checkpoint = Check.call };
-    defer manager.deinit();
-    var files = Mutations.init(a, &manager, pages.store());
-    defer files.deinit();
-    var segments = Mutations.init(a, &manager, pages.store());
-    defer segments.deinit();
-    var routing = Mutations.init(a, &manager, pages.store());
-    defer routing.deinit();
-    var builder: MetadataBuilder = .{ .files = &files, .segments = &segments, .routing = &routing, .token = token, .group_arena = .init(a), .record_arena = .init(a) };
-    defer builder.deinit();
+    var publisher: Publisher = undefined;
+    try publisher.init(a, store, token, io);
+    defer publisher.deinit();
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
+    var manifests: corpus.ManifestReader = .{ .a = a, .store = store.*, .domain = domain, .token = token };
+    defer manifests.deinit();
     for ([_]bool{ true, false }) |deleting| {
-        for (if (deleting) removed else refs) |ref| {
+        const inputs = if (deleting) removed else refs;
+        for (inputs, 0..) |ref, index| {
             try token.check();
             _ = arena.reset(.free_all);
-            const group = try corpus.loadFileManifest(arena.allocator(), store.*, ref, domain, token, null);
-            try builder.add(group, ref, deleting);
+            const group = try manifests.load(arena.allocator(), ref);
+            if (index + 1 < inputs.len) manifests.prefetch(inputs[index + 1]) else if (deleting and refs.len != 0) manifests.prefetch(refs[0]);
+            try publisher.add(group, ref, deleting);
         }
     }
-    return .{ .files = try files.finish(old.files), .segments = try segments.finish(old.segments), .routing = try routing.finish(old.routing) };
+    return publisher.finish(old);
 }
+
 fn get(a: A, storage: tree.Store, root: ?tree.Ref, id: Id) ![]const u8 {
     const start = key(id, 0);
     var upper = id;
@@ -487,8 +398,15 @@ pub fn fileRecords(a: A, root: corpus.Root, store: stores.ArtifactStore, cached:
     var budget: u64 = 128 * 1024 * 1024;
     return fileRecordsBudget(a, root, store, cached, token, &budget);
 }
+pub fn fileRecordsPublication(a: A, root: corpus.Root, store: stores.ArtifactStore, token: Cancellation) ![]const FileRecord {
+    var budget: u64 = 128 * 1024 * 1024;
+    return fileRecordsInner(a, root, store, null, token, &budget, true);
+}
 pub fn fileRecordsBudget(a: A, root: corpus.Root, store: stores.ArtifactStore, cached: ?artifacts.CachedRead, token: Cancellation, budget: *u64) ![]const FileRecord {
-    var read: Reader = .{ .store = store, .cached = cached, .token = token, .external_budget = budget };
+    return fileRecordsInner(a, root, store, cached, token, budget, false);
+}
+fn fileRecordsInner(a: A, root: corpus.Root, store: stores.ArtifactStore, cached: ?artifacts.CachedRead, token: Cancellation, budget: *u64, publication: bool) ![]const FileRecord {
+    var read: Reader = .{ .store = store, .cached = cached, .token = token, .external_budget = budget, .publication = publication };
     read.init(root.domain);
     try read.check();
     var cursor = try tree.Cursor.init(a, read.pages.store(), root.directories.files, "", null);
@@ -563,8 +481,13 @@ fn validatePhysical(record: SegmentRecord, domain: Id, upper: u32) !void {
         if (record.sources.len != record.source_count) return error.InvalidNativeLakeTextCorpus;
     }
     if (record.sources.len != 0) {
-        if (record.ordinal != 0 or record.interval.lower != 0 or record.rows.len != 0 or record.physical != null) return error.InvalidNativeLakeTextCorpus;
-        return corpus.source_spans.validate(record.sources, record.interval.count, domain);
+        if (record.rows.len != 0 or record.physical != null) return error.InvalidNativeLakeTextCorpus;
+        if (record.route.live.len == 0 and (record.ordinal != 0 or record.interval.lower != 0)) return error.InvalidNativeLakeTextCorpus;
+        if (record.route.live.len != 0) {
+            if (record.route.live.len != record.sources.len) return error.InvalidNativeLakeTextCorpus;
+            for (record.route.live, record.sources) |live, span| if (live.lower != span.pack_lower or live.count != span.count) return error.InvalidNativeLakeTextCorpus;
+        }
+        return corpus.source_spans.validateMode(record.sources, record.interval.count, domain, record.route.live.len != 0);
     }
     var covered = record.interval.lower;
     for (record.rows, 0..) |block, i| {
@@ -581,6 +504,21 @@ fn validatePhysical(record: SegmentRecord, domain: Id, upper: u32) !void {
         covered = end;
     }
     if (covered < upper) return error.InvalidNativeLakeTextCorpus;
+}
+/// Load one authenticated serving descriptor under publication I/O admission.
+/// Source routing already selected this pack; no file inventory is materialized.
+pub fn loadSegmentPublication(a: A, root: corpus.Root, store: stores.ArtifactStore, token: Cancellation, id: Id, remaining: *u64) !corpus.FileGroup {
+    var read: Reader = .{ .store = store, .cached = null, .token = token, .publication = true, .external_budget = remaining };
+    read.init(root.domain);
+    try read.check();
+    const bytes = try get(a, read.pages.store(), root.directories.segments, id);
+    defer a.free(bytes);
+    const record = try parseSegment(a, bytes, .{ .allocate = .alloc_always });
+    if (!std.mem.eql(u8, &id, &corpus.term_directory.identity(record.route.ref.artifact_id))) return error.InvalidNativeLakeTextCorpus;
+    try validateSegment(record, root.domain);
+    const group = try corpus.loadFileManifestPublicationBudget(a, store, record.route.descriptor.?, root.domain, token, remaining);
+    if (group.segments.len != 1 or group.admissions.len != 1 or !std.mem.eql(u8, group.segments[0].artifact_id, record.route.ref.artifact_id) or !std.mem.eql(u8, group.segments[0].checksum, record.route.ref.checksum) or group.segments[0].byte_len != record.route.ref.byte_len or group.admissions[0].bytes != record.route.bytes or group.admissions[0].doc_count != record.route.doc_count) return error.InvalidNativeLakeTextCorpus;
+    return group;
 }
 pub fn loadSelected(a: A, scratch: A, root: corpus.Root, store: stores.ArtifactStore, cached: artifacts.CachedRead, token: Cancellation, selection: []const Id) !corpus.Root {
     var read: Reader = .{ .store = store, .cached = cached, .token = token };
@@ -680,7 +618,13 @@ pub fn loadAll(a: A, scratch: A, root: corpus.Root, store: stores.ArtifactStore,
 /// Stream the authenticated retained serving closure with one record decoded.
 /// Maintenance manifests are deliberately not required by the serving audit.
 pub fn walkSegments(a: A, root: corpus.Root, store: stores.ArtifactStore, token: Cancellation, visitor: anytype) !void {
-    var read: Reader = .{ .store = store, .cached = null, .token = token };
+    return walkSegmentsInner(a, root, store, token, visitor, false);
+}
+pub fn walkSegmentsPublication(a: A, root: corpus.Root, store: stores.ArtifactStore, token: Cancellation, visitor: anytype) !void {
+    return walkSegmentsInner(a, root, store, token, visitor, true);
+}
+fn walkSegmentsInner(a: A, root: corpus.Root, store: stores.ArtifactStore, token: Cancellation, visitor: anytype, publication: bool) !void {
+    var read: Reader = .{ .store = store, .cached = null, .token = token, .publication = publication };
     read.init(root.domain);
     var cursor = try tree.Cursor.init(a, read.pages.store(), root.directories.segments, "", null);
     defer cursor.deinit();
@@ -763,7 +707,7 @@ fn assembleOrdered(a: A, root: corpus.Root, records: []const SegmentRecord, part
                 try blocks.append(a, block);
             }
         }
-        try groups.append(a, .{ .sources = selected[0].sources, .source_pages = selected[0].source_pages, .source_count = selected[0].source_count, .file = selected[0].file, .segments = refs, .summaries = summaries, .rows = blocks.items, .physical_manifest = selected[0].physical, .selected = if (partial or blocks.items.len != 0) intervals else &.{} });
+        try groups.append(a, .{ .masked = selected[0].route.live.len != 0, .sources = selected[0].sources, .source_pages = selected[0].source_pages, .source_count = selected[0].source_count, .file = selected[0].file, .segments = refs, .summaries = summaries, .rows = blocks.items, .physical_manifest = selected[0].physical, .selected = if (partial or blocks.items.len != 0) intervals else &.{} });
         try manifests.append(a, selected[0].manifest);
         try routes.append(a, routing);
         try segments.appendSlice(a, refs);
@@ -1211,3 +1155,75 @@ pub const SelectedCursor = struct {
         return if (count == 0) null else .{ .identities = output[0..count], .doc_offset = 0 };
     }
 };
+
+test "external lake serving metadata additions override late deletions within and across durable runs" {
+    const a = std.testing.allocator;
+    var temporary = try local.common_test_directory.TestDirectory.init("serving-directory-addition-priority");
+    defer temporary.cleanup();
+    var fs = try @import("../serverless/artifacts/fs_store.zig").FsStore.init(a, temporary.path());
+    defer fs.deinit();
+    var store = fs.artifactStore();
+    store.upload_scope = try stores.UploadScope.forPublication(@splat(7), 1, std.testing.io);
+    var publisher: Publisher = undefined;
+    try publisher.init(a, &store, .none, std.testing.io);
+    defer publisher.deinit();
+    publisher.preferAdditions();
+    const id = corpus.term_directory.identity("replacement");
+    const removed = corpus.term_directory.identity("removed");
+    try publisher.files.add(id, "replacement", 11);
+    try publisher.files.add(id, null, 11);
+    try publisher.files.flush();
+    try publisher.files.add(id, null, 11);
+    try publisher.files.add(removed, null, 3);
+    try publisher.files.flush();
+    try std.testing.expectEqual(@as(u64, 0), publisher.writes);
+    try std.testing.expectEqual(@as(u64, 0), publisher.reads);
+    try std.testing.expect(publisher.files.private_pages.pool != null);
+    try publisher.files.add(id, "newest", 6);
+    try publisher.files.add(id, null, 6);
+    const root = (try publisher.files.finish(null)).?;
+    try std.testing.expectEqual(@as(u64, 1), root.records);
+    var cursor = try tree.Cursor.init(a, publisher.pages.store(), root, "", null);
+    defer cursor.deinit();
+    try std.testing.expectEqualStrings("newest", (try cursor.next()).?.value);
+    try std.testing.expect(try cursor.next() == null);
+}
+
+test "external lake private metadata recycles consumed runs under a live spill quota" {
+    const a = std.testing.allocator;
+    const Check = struct {
+        fn call(_: *anyopaque) !void {}
+    };
+    var context: u8 = 0;
+    var manager: local.sql_spill.Manager = .{ .alloc = a, .io = std.testing.io, .context = &context, .checkpoint = Check.call, .max_bytes = 4 * 1024 * 1024, .async_writes = false };
+    defer manager.deinit();
+    var memory = tree.testing.MemoryStore{ .alloc = a };
+    defer memory.deinit();
+    {
+        var mutations = Mutations.init(a, &manager, memory.store());
+        defer mutations.deinit();
+        const value: [128]u8 = @splat(42);
+        for (0..4096) |i| {
+            var id: Id = @splat(0);
+            std.mem.writeInt(u64, id[24..32], i, .big);
+            try mutations.add(id, &value, 0);
+            if ((i + 1) % 16 == 0) try mutations.flush();
+        }
+        const root = (try mutations.finish(null)).?;
+        var cursor = try tree.Cursor.init(a, memory.store(), root, "", null);
+        defer cursor.deinit();
+        var count: usize = 0;
+        while (try cursor.next()) |record| : (count += 1) {
+            try std.testing.expectEqual(count, std.mem.readInt(u64, record.key[24..32], .big));
+            try std.testing.expectEqualSlices(u8, &value, record.value);
+        }
+        try std.testing.expectEqual(@as(usize, 4096), count);
+        // Logical history exceeds the quota. Only live
+        // inputs and uncommitted output survive, with one physical run file.
+        try std.testing.expect(manager.written_bytes > manager.max_bytes);
+        try std.testing.expect(manager.peak_bytes <= manager.max_bytes);
+        try std.testing.expect(manager.peak_files < 8);
+    }
+    try std.testing.expectEqual(@as(u64, 0), manager.live_bytes);
+    try std.testing.expectEqual(@as(usize, 0), manager.files);
+}

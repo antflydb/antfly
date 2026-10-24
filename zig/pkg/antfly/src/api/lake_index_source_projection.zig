@@ -108,7 +108,10 @@ test "external lake sidecar hydration binds identities and preserves typed field
         }
     };
     try Run.run(a, writer.snapshot());
-    try std.testing.checkAllAllocationFailures(a, Run.run, .{writer.snapshot()});
+    // Heap remaps depend on surrounding allocation addresses. Disable them
+    // so each exhaustive fault-injection run has the same allocation count.
+    var stable = std.testing.FailingAllocator.init(a, .{ .resize_fail_index = 0 });
+    try std.testing.checkAllAllocationFailures(stable.allocator(), Run.run, .{writer.snapshot()});
     var row: std.json.Value = .{ .object = .empty };
     defer local.storage_db_types.deinitJsonValue(a, &row);
     try std.testing.expectError(error.ExternalLakeSnapshotMismatch, appendStored(a, writer.snapshot(), 0, "different-generation-row", &.{"body"}, &row));

@@ -4318,15 +4318,33 @@ fn scoreLeafMemberIds(
                 profile.filter_rejected += 1;
                 continue;
             }
-            if (req.key_predicate) |predicate| if (!try predicate.allows(predicate.ptr, metadata)) {
-                profile.filter_rejected += 1;
-                continue;
-            };
+            scratch.key_views[prefix_count] = metadata;
             scratch.member_ids[prefix_count] = member_id;
             scratch.positions[prefix_count] = original_index;
             prefix_count += 1;
         }
         filtered_count = prefix_count;
+        if (req.key_predicate) |predicate| {
+            var selected: usize = 0;
+            var begin: usize = 0;
+            while (begin < prefix_count) {
+                if (req.cancellation) |token| if (token.is_cancelled_fn(token.ptr)) return error.Cancelled;
+                const end = @min(prefix_count, begin + 128);
+                var allowed: [128]bool = undefined;
+                try predicate.allowsMany(scratch.key_views[begin..end], allowed[0 .. end - begin]);
+                for (allowed[0 .. end - begin], begin..) |keep, index| {
+                    if (!keep) {
+                        profile.filter_rejected += 1;
+                        continue;
+                    }
+                    scratch.member_ids[selected] = scratch.member_ids[index];
+                    scratch.positions[selected] = scratch.positions[index];
+                    selected += 1;
+                }
+                begin = end;
+            }
+            filtered_count = selected;
+        }
     }
     if (filtered_count == 0) return;
     profile.traversal_eligible_vectors += @intCast(filtered_count);

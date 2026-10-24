@@ -50,9 +50,13 @@ pub fn storesSource(config: std.json.Value) !bool {
 }
 /// Older builders may have accepted unknown config fields while still
 /// omitting source. A distinct authenticated recipe attests actual production,
-/// without changing the native format or invalidating source-free artifacts.
-pub fn sourceRecipe(table: local.common_topology_records.TableRecord, config: []const u8, store_source: bool) [32]u8 {
-    const original = state.recipe(table, config);
+/// independently of the source-free producer contract.
+pub fn sourceRecipe(a: A, table: local.common_topology_records.TableRecord, config: []const u8, store_source: bool) ![32]u8 {
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, config, .{});
+    defer parsed.deinit();
+    const field = if (parsed.value == .object) parsed.value.object.get("field") else null;
+    const selected: ?[]const u8 = if (!store_source and @import("lake_row_input_recipes.zig").configurationReusable(parsed.value) and field != null and field.? == .string) field.?.string else null;
+    const original = try state.recipe(a, table, config, if (selected) |path| &.{path} else null);
     if (!store_source) return original;
     var hash = std.crypto.hash.Blake3.init(.{});
     // v2 stores the complete declared relational row even when `field`
@@ -65,11 +69,11 @@ pub fn sourceRecipe(table: local.common_topology_records.TableRecord, config: []
 }
 
 test "external lake stored source recipe attests production without changing source free identity" {
-    const table: local.common_topology_records.TableRecord = .{ .table_id = 7, .name = "lake", .schema_json = "schema" };
+    const table: local.common_topology_records.TableRecord = .{ .table_id = 7, .name = "lake", .schema_json = "{}" };
     const config = "{\"store_source\":true}";
-    const old = state.recipe(table, config);
-    try std.testing.expectEqual(old, sourceRecipe(table, config, false));
-    try std.testing.expect(!std.mem.eql(u8, &old, &sourceRecipe(table, config, true)));
+    const old = try state.recipe(std.testing.allocator, table, config, null);
+    try std.testing.expectEqual(old, try sourceRecipe(std.testing.allocator, table, config, false));
+    try std.testing.expect(!std.mem.eql(u8, &old, &try sourceRecipe(std.testing.allocator, table, config, true)));
 }
 pub const source_spans = @import("lake_index_text_spans.zig");
 pub const physical = @import("lake_index_physical_ordinals.zig");
@@ -82,6 +86,8 @@ pub const SegmentRouting = struct {
     doc_count: u32,
     fields: []const Field,
     descriptor: ?artifacts.ChunkRef = null,
+    /// Authenticated live native ordinal ranges; empty means unmasked.
+    live: []const text_directory.Interval = &.{},
 };
 pub const Member = struct {
     file: state.File,
@@ -117,6 +123,11 @@ pub const FileGroup = struct {
     physical_manifest: ?artifacts.ChunkRef = null,
     /// Query-only intervals map selected segment ordinals to original file ranks.
     selected: []const text_directory.Interval = &.{},
+    /// Bounded, flattened posting delta over an immutable base. Maintenance
+    /// parts map each physical segment's live rows into this file's ranks.
+    parts: []const []const source_spans.Span = &.{},
+    masked: bool = false,
+    live_collection: ?Collection = null,
     pub fn validate(self: FileGroup, domain: [32]u8) !void {
         if (self.source_pages.len != 0) {
             if (self.source_count == 0 or self.source_count > source_spans.max_spans or self.sources.len != self.source_count) return error.InvalidNativeLakeTextCorpus;
@@ -125,8 +136,21 @@ pub const FileGroup = struct {
         if (self.sources.len != 0) {
             if (self.segments.len != 1) return error.InvalidNativeLakeTextCorpus;
             const last = self.sources[self.sources.len - 1];
-            try source_spans.validate(self.sources, if (self.admissions.len != 0) self.admissions[0].doc_count else try std.math.add(u32, last.pack_lower, last.count), domain);
+            try source_spans.validateMode(self.sources, if (self.admissions.len != 0) self.admissions[0].doc_count else try std.math.add(u32, last.pack_lower, last.count), domain, self.masked);
         }
+        if (self.parts.len != 0) {
+            if (self.sources.len != 0 or self.parts.len != self.segments.len or self.parts.len != self.admissions.len or self.live_collection == null or self.physical_manifest == null) return error.InvalidNativeLakeTextCorpus;
+            var live: u64 = 0;
+            for (self.parts, self.admissions) |part, admission| {
+                try source_spans.validateMode(part, admission.doc_count, domain, true);
+                for (part) |span| {
+                    if (!std.mem.eql(u8, span.file.id, self.file.id) or span.file_rows != self.live_collection.?.documents or !std.mem.eql(u8, span.physical.artifact_id, self.physical_manifest.?.artifact_id) or !std.mem.eql(u8, span.physical.checksum, self.physical_manifest.?.checksum) or span.physical.byte_len != self.physical_manifest.?.byte_len) return error.InvalidNativeLakeTextCorpus;
+                    live += span.count;
+                }
+            }
+            if (live != self.live_collection.?.documents or live != try physical.validate(self.rows)) return error.InvalidNativeLakeTextCorpus;
+        }
+        if (self.live_collection) |collection| try collection.validate();
         if (self.segments.len > max_segments) return error.InvalidNativeLakeTextCorpus;
         if (self.opening_packs.len > 65536) return error.InvalidNativeLakeTextCorpus;
         for (self.opening_packs) |pack| try pack.validate(domain);
@@ -187,6 +211,11 @@ const CollectionBuilder = struct {
         const count: u32 = @intCast(group.segments.len);
         self.segments = if (subtract) try std.math.sub(u32, self.segments, count) else try std.math.add(u32, self.segments, count);
         if (self.segments > max_segments) return error.NativeLakeTextCorpusTooLarge;
+        if (group.live_collection) |collection| {
+            self.documents = if (subtract) try std.math.sub(u32, self.documents, collection.documents) else try std.math.add(u32, self.documents, collection.documents);
+            for (collection.fields) |field_| try self.field(field_.name, field_.total_length, subtract);
+            return;
+        }
         for (group.admissions) |segment| {
             self.documents = if (subtract) try std.math.sub(u32, self.documents, segment.doc_count) else try std.math.add(u32, self.documents, segment.doc_count);
             for (segment.fields) |f| if (f.stats) |stats| try self.field(f.name, stats.total_field_len, subtract);
@@ -252,6 +281,8 @@ pub const Root = struct {
     serving_routes: ?statistics.Ref = null,
     segment_files: ?statistics.Ref = null,
     collection: ?Collection = null,
+    /// Physical native ordinals include masked historical documents.
+    physical_documents: ?u32 = null,
     /// Query-selected serving view only; never persisted.
     partial_inventory: bool = false,
     /// Expanded serving view only; never accepted in a persisted directory.
@@ -263,6 +294,9 @@ pub const Root = struct {
     /// Final publication folds these once and never exposes pending deltas.
     statistics_deltas: []const @import("lake_index_delta_runs.zig").Run = &.{},
     term_directory: term_directory.Roots = .{},
+    pub fn ordinalDocuments(self: Root) u32 {
+        return self.physical_documents orelse self.collection.?.documents;
+    }
     pub fn jsonStringify(self: Root, stream: anytype) @TypeOf(stream.*).Error!void {
         try stream.beginObject();
         inline for (@typeInfo(Root).@"struct".field_names) |field| {
@@ -322,7 +356,10 @@ pub const Root = struct {
         if (self.serving_inventory) |ref| try ref.validate();
         if (self.serving_routes) |ref| try ref.validate();
         if (self.segment_files) |ref| try ref.validate();
-        if (self.collection) |collection| try collection.validate();
+        if (self.collection) |collection| {
+            try collection.validate();
+            if (self.physical_documents) |count| if (count < collection.documents) return error.InvalidNativeLakeTextCorpus;
+        } else if (self.physical_documents != null) return error.InvalidNativeLakeTextCorpus;
         try self.directories.validate();
         if (self.file_count > max_segments or self.segment_count > max_segments) return error.InvalidNativeLakeTextCorpus;
         if (self.inventory_version < 1 or self.inventory_version > 3) return error.InvalidNativeLakeTextCorpus;
@@ -372,16 +409,24 @@ pub const Root = struct {
 };
 /// Read only the authenticated root directory; callers own child admission.
 pub fn loadRootDirectory(a: A, store: stores.ArtifactStore, ref: Ref, cancellation: Cancellation, cache: ?artifacts.CachedRead) !Root {
+    return loadRootDirectoryInner(a, store, ref, cancellation, cache, false);
+}
+fn loadRootDirectoryInner(a: A, store: stores.ArtifactStore, ref: Ref, cancellation: Cancellation, cache: ?artifacts.CachedRead, publication: bool) !Root {
     if (ref.kind != .text_segment or !supportsBuildMetadata(ref.metadata_version) or ref.byte_len > max_root_bytes) return error.InvalidNativeLakeTextCorpus;
-    const bytes = try artifacts.readArtifact(a, store, .{ .artifact_id = ref.artifact_id, .checksum = ref.checksum, .byte_len = ref.byte_len }, cancellation, cache);
+    const chunk: artifacts.ChunkRef = .{ .artifact_id = ref.artifact_id, .checksum = ref.checksum, .byte_len = ref.byte_len };
+    const bytes = if (publication) try artifacts.readPublicationArtifact(a, store, chunk, cancellation) else try artifacts.readArtifact(a, store, chunk, cancellation, cache);
     defer a.free(bytes);
     return decodeRootDirectory(a, ref, bytes);
 }
 /// Legacy compacted pointers did not carry a version. Authenticate their body
 /// before selecting a supported decoder; advertised root versions stay strict.
-pub fn loadRootDirectoryAuto(a: A, store: stores.ArtifactStore, ref: artifacts.ChunkRef, cancellation: Cancellation, cache: ?artifacts.CachedRead) !struct { root: Root, metadata_version: u16 } {
+const VersionedRoot = struct { root: Root, metadata_version: u16 };
+pub fn loadRootDirectoryAuto(a: A, store: stores.ArtifactStore, ref: artifacts.ChunkRef, cancellation: Cancellation, cache: ?artifacts.CachedRead) !VersionedRoot {
+    return loadRootDirectoryAutoInner(a, store, ref, cancellation, cache, false);
+}
+fn loadRootDirectoryAutoInner(a: A, store: stores.ArtifactStore, ref: artifacts.ChunkRef, cancellation: Cancellation, cache: ?artifacts.CachedRead, publication: bool) !VersionedRoot {
     if (ref.byte_len == 0 or ref.byte_len > max_root_bytes) return error.InvalidNativeLakeTextCorpus;
-    const bytes = try artifacts.readArtifact(a, store, ref, cancellation, cache);
+    const bytes = if (publication) try artifacts.readPublicationArtifact(a, store, ref, cancellation) else try artifacts.readArtifact(a, store, ref, cancellation, cache);
     defer a.free(bytes);
     const header = try std.json.parseFromSliceLeaky(struct { version: u16 }, a, bytes, .{ .ignore_unknown_fields = true });
     if (!supportsBuildMetadata(header.version)) return error.InvalidNativeLakeTextCorpus;
@@ -414,23 +459,289 @@ pub fn loadDirectory(a: A, store: stores.ArtifactStore, ref: Ref, cancellation: 
     return .{ .root = try servingRoot(a, store, try loadRootDirectory(a, store, ref, cancellation, cache), cancellation, cache) };
 }
 pub fn servingRoot(a: A, store: stores.ArtifactStore, outer: Root, token: Cancellation, cache: ?artifacts.CachedRead) !Root {
+    return servingRootInner(a, store, outer, token, cache, false);
+}
+pub fn servingRootPublication(a: A, store: stores.ArtifactStore, outer: Root, token: Cancellation) !Root {
+    return servingRootInner(a, store, outer, token, null, true);
+}
+fn servingRootInner(a: A, store: stores.ArtifactStore, outer: Root, token: Cancellation, cache: ?artifacts.CachedRead, publication: bool) !Root {
     const ref = outer.serving orelse outer.compacted orelse return outer;
-    const root = if (outer.serving != null) try loadRootDirectory(a, store, .{ .kind = .text_segment, .metadata_version = metadata_version, .artifact_id = ref.artifact_id, .checksum = ref.checksum, .byte_len = ref.byte_len }, token, cache) else (try loadRootDirectoryAuto(a, store, ref, token, cache)).root;
+    const root = if (outer.serving != null) try loadRootDirectoryInner(a, store, .{ .kind = .text_segment, .metadata_version = metadata_version, .artifact_id = ref.artifact_id, .checksum = ref.checksum, .byte_len = ref.byte_len }, token, cache, publication) else (try loadRootDirectoryAutoInner(a, store, ref, token, cache, publication)).root;
     if (root.serving != null or root.compacted != null or !rebuild.bindingsEqual(root.binding, outer.binding) or !std.mem.eql(u8, &root.recipe, &outer.recipe) or !std.mem.eql(u8, &root.domain, &outer.domain) or root.collection == null or outer.collection == null or root.collection.?.documents != outer.collection.?.documents or root.collection.?.fields.len != outer.collection.?.fields.len or root.stored_projection != outer.stored_projection or !std.mem.eql(u8, root.config_json, outer.config_json)) return error.InvalidNativeLakeTextCorpus;
     return root;
 }
-/// One independently admitted immutable file manifest. Share validation with
-/// serving while allowing GC to checkpoint between file jobs.
+/// One optional verified manifest ahead, with independent I/O admission. The
+/// caller keeps immutable reference strings alive until deinit. Only wire bytes
+/// cross the task boundary; parsing and reducers run on the publication owner.
+pub const ManifestReader = struct {
+    a: A,
+    store: stores.ArtifactStore,
+    domain: [32]u8,
+    token: Cancellation,
+    speculative: local.sql_memory_budget = undefined,
+    pending: ?struct { ref: artifacts.ChunkRef, task: local.sql_parallel_scheduler.Task(anyerror![]u8), scheduler: *local.sql_parallel_scheduler.Scheduler, reservation: usize } = null,
+    pub fn deinit(self: *ManifestReader) void {
+        if (self.pending) |*pending| {
+            const bytes = pending.task.cancel(self.store.io_phase.?.io) catch null;
+            if (bytes) |value| self.speculative.allocator().free(value);
+            pending.scheduler.releasePull(0, pending.reservation);
+        }
+        self.pending = null;
+    }
+    fn fetch(self: *ManifestReader, ref: artifacts.ChunkRef) anyerror![]u8 {
+        var backend = self.store;
+        backend.io_phase = null;
+        return artifacts.readArtifact(self.speculative.allocator(), backend, ref, self.token, null);
+    }
+    pub fn prefetch(self: *ManifestReader, ref: artifacts.ChunkRef) void {
+        if (self.pending != null) return;
+        const phase = self.store.io_phase orelse return;
+        const scheduler = phase.scheduler orelse return;
+        // No speculation through opaque quotas. The payload is at most one
+        // manifest; leave headroom for provider verification/staging as well.
+        if (ref.byte_len == 0 or ref.byte_len > max_root_bytes) return;
+        text_directory.validateRef(ref, self.domain) catch return;
+        const available = @import("../serverless/build/lake_build_limits.zig").WorkingSetAllocator.headroom(self.a) orelse return;
+        const bytes: usize = @intCast(ref.byte_len);
+        if (available < bytes * 3 + 64 * 1024) return;
+        // Scheduler admission and the allocator chain enforce different limits.
+        // Keep every enclosing build/host quota while reclaiming arena storage.
+        const reservation = bytes * 2 + 64 * 1024;
+        if (!scheduler.reservePull(0, reservation)) return;
+        self.speculative = .{ .backing = local.sql_memory_budget.reclaimingAllocator(self.a), .limit = reservation };
+        const task = scheduler.submitIoTransient(phase.io, 0, fetch, .{ self, ref }) orelse {
+            scheduler.releasePull(0, reservation);
+            return;
+        };
+        self.pending = .{ .ref = ref, .task = task, .scheduler = scheduler, .reservation = reservation };
+    }
+    pub fn load(self: *ManifestReader, a: A, ref: artifacts.ChunkRef) !FileGroup {
+        try self.token.check();
+        if (self.pending) |*pending| {
+            if (!std.mem.eql(u8, pending.ref.artifact_id, ref.artifact_id) or pending.ref.byte_len != ref.byte_len or !std.mem.eql(u8, pending.ref.checksum, ref.checksum)) {
+                self.deinit();
+            } else {
+                // The child owns its I/O permit and drops it at completion.
+                // Parking here cannot deadlock a one-slot scheduler: required
+                // admission waits for the child, without holding a CPU lane.
+                var phase = try self.store.beginIo(1);
+                defer phase.abort();
+                const scheduler = pending.scheduler;
+                const reservation = pending.reservation;
+                const result = pending.task.await(self.store.io_phase.?.io);
+                defer scheduler.releasePull(0, reservation);
+                self.pending = null;
+                const bytes = result catch |err| {
+                    // Optional provider staging may exceed its isolated quota.
+                    // Drain it and retry as a required read after
+                    // restoring CPU admission; integrity/provider failures stay
+                    // fatal and cancellation is checked before the retry.
+                    try phase.finish();
+                    try self.token.check();
+                    if (err == error.OutOfMemory) return loadFileManifestPublication(a, self.store, ref, self.domain, self.token);
+                    return err;
+                };
+                defer self.speculative.allocator().free(bytes);
+                try phase.finish();
+                try self.token.check();
+                return decodeFileManifest(a, self.store, ref, self.domain, self.token, null, null, true, bytes);
+            }
+        }
+        return loadFileManifestPublication(a, self.store, ref, self.domain, self.token);
+    }
+};
+
+/// Operation-private metadata handoff with a fixed hash directory on top of
+/// quota-accounted spill. Multiple consumers can read in any order without
+/// retaining decoded groups or a per-file heap map. Misses use artifact reads.
+pub const ManifestReplay = struct {
+    token: Cancellation,
+    manager: local.sql_spill.Manager = undefined,
+    file: ?local.sql_spill.File = null,
+    count: usize = 0,
+    consumed: usize = 0,
+    hits: usize = 0,
+    offset: u64 = 0,
+    full: bool = false,
+    heads: [4096]u64 = @splat(0),
+    phase: ?*const stores.IoPhase = null,
+    const header_bytes = 80;
+    pub fn init(self: *ManifestReplay, a: A, io: std.Io, token: Cancellation) void {
+        self.* = .{ .token = token };
+        self.manager = .{ .alloc = a, .io = io, .context = self, .checkpoint = check, .max_bytes = 128 * 1024 * 1024, .async_writes = false };
+    }
+    fn check(raw: *anyopaque) !void {
+        try @as(*ManifestReplay, @ptrCast(@alignCast(raw))).token.check();
+    }
+    pub fn deinit(self: *ManifestReplay) void {
+        if (self.file) |*file| file.close();
+        self.file = null;
+        self.manager.deinit();
+    }
+    pub fn discard(self: *ManifestReplay) void {
+        if (self.file) |*file| file.close();
+        self.file = null;
+        self.count = 0;
+        self.consumed = 0;
+        self.offset = 0;
+        self.full = true;
+        self.heads = @splat(0);
+    }
+    pub fn append(self: *ManifestReplay, a: A, ref: artifacts.ChunkRef, group: FileGroup) !void {
+        try self.token.check();
+        if (self.full) return;
+        self.appendInner(a, ref, group) catch |err| {
+            // This cache is optional, including after a partial frame write.
+            // Drop the whole prefix rather than exposing a truncated record.
+            self.discard();
+            try self.token.check();
+            if (err == error.Canceled) return err;
+        };
+    }
+    fn appendInner(self: *ManifestReplay, a: A, ref: artifacts.ChunkRef, group: FileGroup) !void {
+        const bytes = std.json.Stringify.valueAlloc(a, group, .{}) catch {
+            self.full = true;
+            return;
+        };
+        defer a.free(bytes);
+        try self.appendEncodedInner(ref, bytes);
+    }
+    /// Reuse the canonical producer's JSON bytes when no normalization is
+    /// needed. Both later consumers use a bounded disk hash index, independent
+    /// of scan order, resume holes, and consumer order.
+    fn appendEncoded(self: *ManifestReplay, ref: artifacts.ChunkRef, bytes: []const u8) !void {
+        try self.token.check();
+        if (self.full) return;
+        self.appendEncodedInner(ref, bytes) catch |err| {
+            self.discard();
+            try self.token.check();
+            if (err == error.Canceled) return err;
+        };
+    }
+    fn begin(self: *ManifestReplay) !stores.IoGuard {
+        if (self.phase) |phase| try phase.begin(phase.ptr, 1);
+        return .{ .phase = self.phase };
+    }
+    fn bucket(id: [32]u8) usize {
+        return std.mem.readInt(u16, id[0..2], .little) % 4096;
+    }
+    fn appendEncodedInner(self: *ManifestReplay, ref: artifacts.ChunkRef, bytes: []const u8) !void {
+        if (bytes.len > 2 * max_root_bytes or bytes.len + header_bytes > self.manager.max_bytes -| self.manager.live_bytes) {
+            self.full = true;
+            return;
+        }
+        if (self.file == null) self.file = try self.manager.create();
+        var header: [header_bytes]u8 = undefined;
+        std.mem.writeInt(u64, header[0..8], bytes.len, .little);
+        const id = term_directory.identity(ref.artifact_id);
+        header[8..40].* = id;
+        std.crypto.hash.sha2.Sha256.hash(bytes, header[40..72], .{});
+        std.mem.writeInt(u64, header[72..80], self.heads[bucket(id)], .little);
+        const offset = self.file.?.size;
+        var guard = try self.begin();
+        defer guard.abort();
+        self.file.?.writeRaw(offset, &header) catch |err| return guard.failed(err);
+        self.file.?.writeRaw(offset + header.len, bytes) catch |err| return guard.failed(err);
+        try guard.finish();
+        self.heads[bucket(id)] = offset + 1;
+        self.count += 1;
+    }
+    fn find(self: *ManifestReplay, ref: artifacts.ChunkRef) !?u64 {
+        const id = term_directory.identity(ref.artifact_id);
+        var following = self.heads[bucket(id)];
+        if (following == 0) return null;
+        var guard = try self.begin();
+        defer guard.abort();
+        while (following != 0) {
+            const offset = following - 1;
+            var header: [header_bytes]u8 = undefined;
+            self.file.?.readRaw(offset, &header) catch |err| return guard.failed(err);
+            if (std.mem.eql(u8, header[8..40], &id)) {
+                try guard.finish();
+                return offset;
+            }
+            following = std.mem.readInt(u64, header[72..80], .little);
+            if (following != 0 and following - 1 >= offset) return error.InvalidNativeLakeTextCorpus;
+        }
+        try guard.finish();
+        return null;
+    }
+    pub fn contains(self: *ManifestReplay, ref: artifacts.ChunkRef) !bool {
+        const found = self.find(ref) catch |err| {
+            if (err != error.OutOfMemory) return err;
+            self.discard();
+            return false;
+        };
+        return found != null;
+    }
+    pub fn lookup(self: *ManifestReplay, a: A, ref: artifacts.ChunkRef, domain: [32]u8) !?FileGroup {
+        const offset = (try self.find(ref)) orelse return null;
+        const group = (try self.readAt(a, ref, domain, offset)).group;
+        self.hits += 1;
+        return group;
+    }
+    pub fn next(self: *ManifestReplay, a: A, ref: artifacts.ChunkRef, domain: [32]u8) !?FileGroup {
+        if (self.consumed == self.count) return null;
+        const frame = try self.readAt(a, ref, domain, self.offset);
+        self.offset += header_bytes + frame.bytes;
+        self.consumed += 1;
+        return frame.group;
+    }
+    fn readAt(self: *ManifestReplay, a: A, ref: artifacts.ChunkRef, domain: [32]u8, offset: u64) !struct { group: FileGroup, bytes: u64 } {
+        try text_directory.validateRef(ref, domain);
+        var guard = try self.begin();
+        defer guard.abort();
+        var header: [header_bytes]u8 = undefined;
+        self.file.?.readRaw(offset, &header) catch |err| return guard.failed(err);
+        if (!std.mem.eql(u8, header[8..40], &term_directory.identity(ref.artifact_id))) return error.InvalidNativeLakeTextCorpus;
+        const length = std.mem.readInt(u64, header[0..8], .little);
+        if (length == 0 or length > 2 * max_root_bytes) return error.InvalidNativeLakeTextCorpus;
+        const bytes = try a.alloc(u8, @intCast(length));
+        defer a.free(bytes);
+        self.file.?.readRaw(offset + header.len, bytes) catch |err| return guard.failed(err);
+        try guard.finish();
+        var digest: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
+        if (!std.mem.eql(u8, &digest, header[40..72])) return error.InvalidNativeLakeTextCorpus;
+        const group = try std.json.parseFromSliceLeaky(FileGroup, a, bytes, .{ .allocate = .alloc_always });
+        try group.validate(domain);
+        return .{ .group = group, .bytes = length };
+    }
+    pub fn load(self: *ManifestReplay, arena: *std.heap.ArenaAllocator, reader: *ManifestReader, ref: artifacts.ChunkRef, domain: [32]u8) !FileGroup {
+        const cached = self.lookup(arena.allocator(), ref, domain) catch |err| fallback: {
+            if (err != error.OutOfMemory) return err;
+            _ = arena.reset(.free_all);
+            self.discard();
+            break :fallback null;
+        };
+        return cached orelse try reader.load(arena.allocator(), ref);
+    }
+};
+
 pub fn loadFileManifest(a: A, store: stores.ArtifactStore, ref: artifacts.ChunkRef, domain: [32]u8, cancellation: Cancellation, cache: ?artifacts.CachedRead) !FileGroup {
     if (ref.byte_len == 0 or ref.byte_len > max_root_bytes) return error.InvalidNativeLakeTextCorpus;
     return loadFileManifestBudget(a, store, ref, domain, cancellation, cache, null);
 }
 pub fn loadFileManifestBudget(a: A, store: stores.ArtifactStore, ref: artifacts.ChunkRef, domain: [32]u8, cancellation: Cancellation, cache: ?artifacts.CachedRead, remaining: ?*u64) !FileGroup {
+    return loadFileManifestInner(a, store, ref, domain, cancellation, cache, remaining, false);
+}
+pub fn loadFileManifestPublication(a: A, store: stores.ArtifactStore, ref: artifacts.ChunkRef, domain: [32]u8, cancellation: Cancellation) !FileGroup {
+    return loadFileManifestPublicationBudget(a, store, ref, domain, cancellation, null);
+}
+pub fn loadFileManifestPublicationBudget(a: A, store: stores.ArtifactStore, ref: artifacts.ChunkRef, domain: [32]u8, cancellation: Cancellation, remaining: ?*u64) !FileGroup {
+    if (remaining) |budget| try stores.chargeReadBudget(budget, ref.byte_len);
+    return loadFileManifestInner(a, store, ref, domain, cancellation, null, remaining, true);
+}
+fn loadFileManifestInner(a: A, store: stores.ArtifactStore, ref: artifacts.ChunkRef, domain: [32]u8, cancellation: Cancellation, cache: ?artifacts.CachedRead, remaining: ?*u64, publication: bool) !FileGroup {
     if (ref.byte_len == 0 or ref.byte_len > max_root_bytes) return error.InvalidNativeLakeTextCorpus;
     const scope = (try stores.uploadScopeFromArtifactId(ref.artifact_id)) orelse return error.InvalidNativeLakeTextCorpus;
     if (!std.mem.eql(u8, &scope.domain, &domain)) return error.InvalidNativeLakeTextCorpus;
-    const bytes = try artifacts.readArtifact(a, store, ref, cancellation, cache);
+    const bytes = if (publication) try artifacts.readPublicationArtifact(a, store, ref, cancellation) else try artifacts.readArtifact(a, store, ref, cancellation, cache);
     defer a.free(bytes);
+    return decodeFileManifest(a, store, ref, domain, cancellation, cache, remaining, publication, bytes);
+}
+fn decodeFileManifest(a: A, store: stores.ArtifactStore, ref: artifacts.ChunkRef, domain: [32]u8, cancellation: Cancellation, cache: ?artifacts.CachedRead, remaining: ?*u64, publication: bool, bytes: []const u8) !FileGroup {
+    _ = ref;
     var group = try std.json.parseFromSliceLeaky(FileGroup, a, bytes, .{ .allocate = .alloc_always });
     if (group.selected.len != 0) return error.InvalidNativeLakeTextCorpus;
     if (group.members.len != 0) {
@@ -440,7 +751,7 @@ pub fn loadFileManifestBudget(a: A, store: stores.ArtifactStore, ref: artifacts.
     }
     if (group.source_pages.len != 0) {
         if (group.sources.len != 0) return error.InvalidNativeLakeTextCorpus;
-        group.sources = try source_spans.load(a, store, group.source_pages, group.source_count, domain, cancellation, cache, remaining);
+        group.sources = if (publication) try source_spans.loadPublication(a, store, group.source_pages, group.source_count, domain, cancellation, remaining) else try source_spans.load(a, store, group.source_pages, group.source_count, domain, cancellation, cache, remaining);
     }
     try group.validate(domain);
     return group;
@@ -568,12 +879,11 @@ const inventory_pages = @import("../serverless/graph_segment/page_store.zig");
 fn readServingInventory(a: A, scratch_backing: A, directory: Root, store_value: stores.ArtifactStore, cached: artifacts.CachedRead, cancellation: Cancellation) !Root {
     const Read = struct {
         cached: artifacts.CachedRead,
-        fn page(raw: *anyopaque, alloc: A, store: *stores.ArtifactStore, ref: Ref, offset: u64, length: usize, _: [32]u8, token: Cancellation, budget: *u64) ![]u8 {
+        fn page(raw: *anyopaque, alloc: A, store: *stores.ArtifactStore, ref: Ref, offset: u64, length: usize, digest: [32]u8, token: Cancellation, budget: *u64) ![]u8 {
             const self: *@This() = @ptrCast(@alignCast(raw));
             try self.cached.context.ensureActive();
-            if (offset != 0 or length != ref.byte_len) return error.InvalidNativeLakeTextCorpus;
             try stores.chargeReadBudget(budget, length);
-            return artifacts.readArtifact(alloc, store.*, .{ .artifact_id = ref.artifact_id, .checksum = ref.checksum, .byte_len = ref.byte_len }, token, self.cached);
+            return artifacts.readPageRange(alloc, store.*, .{ .artifact_id = ref.artifact_id, .checksum = ref.checksum, .byte_len = ref.byte_len }, offset, length, digest, token, self.cached);
         }
     };
     var reader: Read = .{ .cached = cached };
@@ -763,8 +1073,8 @@ pub fn loadWriter(a: A, store: stores.ArtifactStore, root: Root, cancellation: C
 pub fn build(a: A, out: A, table: local.common_topology_records.TableRecord, source: *local.serverless_query_lake_serving.ServingSource, base: local.serverless_manifest_base_source.BaseSourceDescriptor, store: *stores.ArtifactStore, provider: *@import("lake_index_row_source.zig").Provider, cancellation: Cancellation, reusable: []const Declared) ![]const Declared {
     return buildIncremental(a, out, table, source, base, store, provider, cancellation, reusable, &.{});
 }
-pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.TableRecord, source: *local.serverless_query_lake_serving.ServingSource, base: local.serverless_manifest_base_source.BaseSourceDescriptor, store: *stores.ArtifactStore, provider: *@import("lake_index_row_source.zig").Provider, cancellation: Cancellation, reusable: []const Declared, candidates: []const Declared) ![]const Declared {
-    var desired = try rebuild.desiredArtifactsFromResolvedExternalSourceAlloc(a, base, source.inventory, .{ .table_name = table.name, .schema_json = table.schema_json, .indexes_json = table.indexes_json });
+pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.TableRecord, parent_source: *local.serverless_query_lake_serving.ServingSource, base: local.serverless_manifest_base_source.BaseSourceDescriptor, store: *stores.ArtifactStore, parent_provider: *@import("lake_index_row_source.zig").Provider, cancellation: Cancellation, reusable: []const Declared, candidates: []const Declared) ![]const Declared {
+    var desired = try rebuild.desiredArtifactsFromResolvedExternalSourceAlloc(a, base, parent_source.inventory, .{ .table_name = table.name, .schema_json = table.schema_json, .indexes_json = table.indexes_json });
     defer desired.deinit(a);
     var schema = try local.schema_mod.parseValidatedTableSchema(a, table.schema_json);
     defer schema.deinit(a);
@@ -773,6 +1083,11 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
     var declarations: std.ArrayList(Declared) = .empty;
     errdefer declarations.deinit(out);
     for (desired.artifacts) |want| {
+        var source_view = parent_source.*;
+        var selected_provider = parent_provider.forIndex(&source_view, want.name);
+        const provider = &selected_provider;
+        const source = provider.source;
+        if (!provider.wantsIndex(want.name)) continue;
         if (want.kind != .text_segment) continue;
         const spec = want.build_spec.?.text;
         var arena = std.heap.ArenaAllocator.init(a);
@@ -787,8 +1102,8 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
             for (paths, runtime.relational_columns) |*path, column| path.* = column.name;
             binding.column_bindings = paths;
         }
-        binding.index_config_hash = try std.fmt.allocPrint(ca, "native-text-corpus-v11:{s}", .{want.binding.index_config_hash});
-        const recipe = sourceRecipe(table, spec.config_json, store_source);
+        binding.index_config_hash = try std.fmt.allocPrint(ca, "native-text-corpus-v12:{s}", .{want.binding.index_config_hash});
+        const recipe = try sourceRecipe(ca, table, spec.config_json, store_source);
         const prior = for (reusable) |declaration| {
             if (declaration.artifact.kind == .text_segment and declaration.artifact.metadata_version == metadata_version and std.mem.eql(u8, declaration.name, want.name) and rebuild.bindingsEqual(declaration.binding, binding)) break declaration;
         } else null;
@@ -864,6 +1179,7 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
         };
         var plan = prepared_plan orelse try state.Plan.init(a, ca, provider, previous);
         prepared_plan = null;
+        plan.key_digests = provider.key_digests;
         defer plan.deinit();
         for (baseline_records) |record| if (!plan.by_id.contains(record.file.id)) try checkpoint_removed.append(ca, record.file.id);
         if (paged_seed) {
@@ -881,7 +1197,12 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
         var builder = mapper.TextProjectionBatchBuilder.initWithSelectedField(batch_arena.allocator(), analysis, runtime, null, selected_field);
         var file_arena = std.heap.ArenaAllocator.init(a);
         defer file_arena.deinit();
+        var patch_serving: ?Root = null;
         var input_bytes: usize = 0;
+        var manifest_replay: ManifestReplay = undefined;
+        manifest_replay.init(a, provider.context.io orelse return error.UnsupportedSqlExecution, cancellation);
+        defer manifest_replay.deinit();
+        manifest_replay.phase = store.io_phase;
         var file_manifests: std.AutoHashMapUnmanaged(usize, artifacts.ChunkRef) = .empty;
         defer file_manifests.deinit(a);
         var checkpoint_files: ?statistics.Ref = if (seed) |old| old.checkpoint_files else null;
@@ -921,6 +1242,7 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
         var df_writes: u64 = 0;
         const df_scope = store.upload_scope.?;
         var df_pages: @import("../serverless/graph_segment/page_store.zig").PageStore = .{ .domain = df_scope.domain, .attempt = df_scope.attempt, .artifacts = store, .cancellation = cancellation, .remaining_read_bytes = &df_reads, .remaining_write_bytes = &df_writes, .streaming = true };
+        df_pages.admitPublication();
         var df = statistics.Builder.init(a, &df_manager);
         defer df.deinit();
         df.enableDurable(df_pages.store());
@@ -930,7 +1252,7 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
         // global DF only once, including when recovering a partial refresh.
         if (seed) |old| for (old.file_groups) |group| {
             if (plan.by_id.get(group.file.id)) |index| {
-                try file_manifests.put(a, index, try publishFileManifest(a, ca, store, group, cancellation));
+                try file_manifests.put(a, index, try publishFileManifestCached(a, ca, store, group, cancellation, &manifest_replay));
             } else {
                 for (group.summaries) |ref| try df.add(df_pages.store(), ref, -1);
             }
@@ -941,6 +1263,19 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
             const old = try loadRecordedFile(file_arena.allocator(), store.*, record, seed.?.domain, cancellation);
             for (old.summaries) |ref| try df.add(df_pages.store(), ref, -1);
         };
+        var checkpoint: StatisticsCheckpoint = .{ .provider = provider, .cancellation = cancellation };
+        var spill_manager: local.sql_spill.Manager = .{ .alloc = a, .io = provider.context.io orelse return error.UnsupportedSqlExecution, .context = &checkpoint, .checkpoint = StatisticsCheckpoint.check };
+        defer spill_manager.deinit();
+        var directory_builder = term_directory.Builder.init(a, &spill_manager);
+        defer directory_builder.deinit();
+        var stats_reads: u64 = 512 * 1024 * 1024;
+        var stats_writes: u64 = 512 * 1024 * 1024;
+        const scope = store.upload_scope.?;
+        var stats_pages: @import("../serverless/graph_segment/page_store.zig").PageStore = .{ .domain = scope.domain, .attempt = scope.attempt, .artifacts = store, .cancellation = cancellation, .remaining_read_bytes = &stats_reads, .remaining_write_bytes = &stats_writes, .streaming = true };
+        stats_pages.admitPublication();
+        directory_builder.enableDurable(stats_pages.store());
+        var fresh_contributions = try std.DynamicBitSetUnmanaged.initEmpty(a, plan.count());
+        defer fresh_contributions.deinit(a);
         var planned_files = plan.scanIterator(paged_seed or (baseline != null and reference_seed));
         // Paged seeds need only changed files; legacy imports stream their full state once.
         while (try planned_files.next()) |planned| {
@@ -964,6 +1299,9 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
                 group.admissions = previous_group.admissions;
                 group.descriptors = previous_group.descriptors;
                 group.physical_manifest = previous_group.physical_manifest;
+                group.parts = previous_group.parts;
+                group.live_collection = previous_group.live_collection;
+                group.masked = previous_group.masked;
                 if (group.admissions.len == 0 and group.segments.len != 0) {
                     const upgraded = try fa.alloc(local.segment.SegmentReader.Admission, group.segments.len);
                     for (group.segments, upgraded) |ref, *metadata| {
@@ -977,59 +1315,156 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
                 }
                 if (group.physical_manifest == null or group.descriptors.len != group.segments.len) try text_directory.prepare(fa, store, group, cancellation);
                 if (group.summaries.len != group.segments.len) return error.InvalidNativeLakeTextCorpus;
-                try file_manifests.put(a, file_ordinal, publishFileManifest(a, ca, store, group.*, cancellation) catch |err| return buildFailure(err, "file_manifest", file_ordinal, segments.items.len));
+                try file_manifests.put(a, file_ordinal, publishFileManifestCached(a, ca, store, group.*, cancellation, &manifest_replay) catch |err| return buildFailure(err, "file_manifest", file_ordinal, segments.items.len));
                 continue;
             }
             var opening: @import("lake_index_text_opening_pack.zig").Collector = .{ .a = a, .out = fa, .store = store, .cancellation = cancellation };
             defer opening.deinit();
-            var compactor: Compactor = .{ .a = a, .out = fa, .store = store, .segments = &segments, .summaries = &summaries, .admissions = &admissions, .cancellation = cancellation, .file_ordinal = file_ordinal, .opening = &opening, .io = provider.context.io };
+            var capture_check = cancellation;
+            var capture_manager: local.sql_spill.Manager = .{ .alloc = a, .io = provider.context.io orelse return error.UnsupportedSqlExecution, .context = &capture_check, .checkpoint = struct {
+                fn check(raw: *anyopaque) !void {
+                    try @as(*Cancellation, @ptrCast(@alignCast(raw))).check();
+                }
+            }.check, .max_bytes = 256 * 1024 * 1024, .async_writes = false };
+            defer capture_manager.deinit();
+            var output_manager: local.sql_spill.Manager = .{ .alloc = a, .io = capture_manager.io, .context = &capture_check, .checkpoint = capture_manager.checkpoint, .max_bytes = 768 * 1024 * 1024, .async_writes = false };
+            defer output_manager.deinit();
+            var compactor: Compactor = .{ .context = provider.context, .output_manager = &output_manager, .global = &df, .directory = &directory_builder, .capture_manager = &capture_manager, .a = a, .out = fa, .store = store, .segments = &segments, .summaries = &summaries, .admissions = &admissions, .cancellation = cancellation, .file_ordinal = file_ordinal, .opening = &opening, .io = provider.context.io };
             defer compactor.deinit();
+            if (provider.rowsForFile(file_ordinal)) |selected| if (selected.len != 0 and selected.len < source.inventory.files[file_ordinal].row_count / 2 and file.key_digest != null) {
+                const old = if (previous_refs.get(file.id)) |record| try loadRecordedFile(fa, store.*, record, seed.?.domain, cancellation) else previous_groups.get(file.id);
+                if (old) |previous_group| if (previous_group.file.key_digest != null and std.mem.eql(u8, &previous_group.file.key_digest.?, &file.key_digest.?)) {
+                    var bytes: u64 = 0;
+                    for (previous_group.admissions) |admission| bytes +|= admission.bytes;
+                    if (bytes <= 16 * 1024 * 1024) {
+                        // A checkpoint's fresh delta still owns its canonical
+                        // payload. Baseline files are maintained from compacted
+                        // serving packs, whose source routes survive collection.
+                        const baseline_record = baseline_by_id.get(file.id);
+                        const current_record = previous_refs.get(file.id);
+                        const in_baseline = baseline_record != null and current_record != null and std.mem.eql(u8, baseline_record.?.manifest.artifact_id, current_record.?.manifest.artifact_id);
+                        if (baseline != null and baseline.?.serving != null and in_baseline) {
+                            if (patch_serving == null) patch_serving = try servingRootPublication(ca, store.*, baseline.?, cancellation);
+                            try compactor.prepareServingPatch(patch_serving.?, previous_group, selected);
+                        } else compactor.row_patch = .{ .base = previous_group, .rows = selected };
+                    }
+                };
+            };
             var ordinals = physical.Builder.init(a, fa, store, cancellation);
             defer ordinals.deinit();
+            var leases: ProjectionLeases = .{};
+            defer leases.clear();
             var previous_id: ?[96]u8 = null;
             var input = provider.*;
             input.only_file = file_ordinal;
             input.only_files = null;
-            const rows = input.provider().open_with_cancellation_fn.?(input.provider().ptr, a, binding, cancellation) catch |err| return buildFailure(err, "open_rows", file_ordinal, segments.items.len);
-            defer rows.deinit(a);
-            while (rows.next(a) catch |err| return buildFailure(err, "read_rows", file_ordinal, segments.items.len)) |batch| {
-                for (0..batch.rowCount()) |row| {
-                    const ref = batch.rowRef(row);
-                    try provider.context.ensureActive();
-                    try cancellation.check();
-                    const page: local.sql_catalog.ColumnPage = .{ .batch = batch, .selection = &.{row} };
-                    const ba = batch_arena.allocator();
-                    var root: std.json.Value = .{ .object = .empty };
-                    // Projection owns every source byte before the row source
-                    // releases its page; no JSON serialization of source rows.
-                    for (binding.column_bindings) |path| {
-                        const cell = try page.cell(ba, 0, path);
-                        const value = try local.api_json_helpers.cloneJsonValue(ba, cell.value);
-                        try putPath(ba, &root, path, value);
-                        if (value == .string) input_bytes +|= value.string.len;
-                    }
-                    const id = try plan.privateKey(ba, ref);
-                    if (previous_id) |last_id| if (std.mem.order(u8, &last_id, id) != .lt) return error.InvalidNativeLakeTextCorpus;
-                    previous_id = id[0..96].*;
-                    input_bytes +|= id.len + 128;
-                    const before = builder.batch().docs.len;
-                    const stored = if (store_source) try std.json.Stringify.valueAlloc(ba, root, .{}) else "";
-                    input_bytes +|= stored.len;
-                    try builder.appendSourceDoc(.{ .key = id, .root = root, .stored_data = stored, .typed_source = if (store_source) root else null });
-                    if (builder.batch().docs.len != before) {
-                        if (ref != .external) return error.InvalidNativeLakeTextCorpus;
-                        ordinals.add(ref.external.row_group_ordinal, ref.external.row_ordinal) catch |err| return buildFailure(err, "ordinal_pages", file_ordinal, segments.items.len);
-                    }
-                    if (builder.batch().docs.len >= 65536 or input_bytes >= 8 * 1024 * 1024 or batch_arena.queryCapacity() >= 24 * 1024 * 1024) {
-                        try flush(&compactor, builder.batch(), analysis, store_source);
+            while (true) {
+                input.only_ordinals = if (compactor.row_patch) |patch| patch.rows else null;
+                const rows = input.provider().open_with_cancellation_fn.?(input.provider().ptr, a, binding, cancellation) catch |err| return buildFailure(err, "open_rows", file_ordinal, segments.items.len);
+                defer rows.deinit(a);
+                while (true) {
+                    if (leases.full()) {
+                        try flushRetained(&compactor, &batch_arena, &leases, builder.batch(), analysis, store_source);
+                        leases.clear();
                         _ = batch_arena.reset(.free_all);
                         builder = mapper.TextProjectionBatchBuilder.initWithSelectedField(batch_arena.allocator(), analysis, runtime, null, selected_field);
                         input_bytes = 0;
                     }
+                    const batch = (rows.next(a) catch |err| return buildFailure(err, "read_rows", file_ordinal, segments.items.len)) orelse break;
+                    var column_arena = std.heap.ArenaAllocator.init(a);
+                    defer column_arena.deinit();
+                    const projection = try mapper.TextColumnProjection.bind(column_arena.allocator(), batch, binding.column_bindings);
+                    const encoded = for (batch.columns) |column| {
+                        if (column.values == .encoded) break true;
+                    } else false;
+                    var owner = if (store_source or encoded) null else try rows.retainColumns(a);
+                    defer if (owner) |held| held.release();
+                    if (owner) |held| if (held.retained_bytes > ProjectionLeases.max_bytes) {
+                        held.release();
+                        owner = null;
+                    };
+                    if (owner) |held| if (held.retained_bytes > ProjectionLeases.max_bytes -| leases.bytes) {
+                        try flushRetained(&compactor, &batch_arena, &leases, builder.batch(), analysis, store_source);
+                        leases.clear();
+                        _ = batch_arena.reset(.free_all);
+                        builder = mapper.TextProjectionBatchBuilder.initWithSelectedField(batch_arena.allocator(), analysis, runtime, null, selected_field);
+                        input_bytes = 0;
+                    };
+                    for (0..batch.rowCount()) |row| {
+                        const ref = batch.rowRef(row);
+                        try provider.context.ensureActive();
+                        try cancellation.check();
+                        const ba = batch_arena.allocator();
+                        const id = try plan.privateKey(ba, ref);
+                        if (previous_id) |last_id| if (std.mem.order(u8, &last_id, id) != .lt) return error.InvalidNativeLakeTextCorpus;
+                        previous_id = id[0..96].*;
+                        const before = builder.batch().docs.len;
+                        input_bytes +|= try builder.appendColumnRow(projection, row, id, store_source, owner != null);
+                        if (builder.batch().docs.len != before) {
+                            if (ref != .external) return error.InvalidNativeLakeTextCorpus;
+                            ordinals.add(ref.external.row_group_ordinal, ref.external.row_ordinal) catch |err| return buildFailure(err, "ordinal_pages", file_ordinal, segments.items.len);
+                        }
+                        if (builder.batch().docs.len >= 65536 or input_bytes >= 8 * 1024 * 1024 or batch_arena.queryCapacity() >= 24 * 1024 * 1024) {
+                            var retained = true;
+                            if (owner != null) {
+                                if (rows.retainColumns(a) catch null) |held| leases.add(held) else retained = false;
+                            }
+                            if (retained) try flushRetained(&compactor, &batch_arena, &leases, builder.batch(), analysis, store_source) else try flush(&compactor, builder.batch(), analysis, store_source);
+                            leases.clear();
+                            _ = batch_arena.reset(.free_all);
+                            builder = mapper.TextProjectionBatchBuilder.initWithSelectedField(batch_arena.allocator(), analysis, runtime, null, selected_field);
+                            input_bytes = 0;
+                        }
+                    }
+                    if (owner) |held| {
+                        if (builder.batch().docs.len != 0) {
+                            leases.add(held);
+                            owner = null;
+                        }
+                    }
                 }
+                try flushRetained(&compactor, &batch_arena, &leases, builder.batch(), analysis, store_source);
+                leases.clear();
+                try compactor.finishEncoding();
+                if (compactor.row_patch != null) {
+                    if (try compactor.publishRowOverlay(file)) |overlay| {
+                        ordinals.deinit();
+                        ordinals = physical.Builder.init(a, fa, store, cancellation);
+                        for (overlay.rows) |row| try ordinals.add(0, row);
+                        group.parts = overlay.parts;
+                        group.live_collection = overlay.collection;
+                        break;
+                    }
+                    const merged = try compactor.mergeRows();
+                    if (merged == .empty) break;
+                    if (merged == .declined) {
+                        // Optional merge admission failed before any publication.
+                        // Reopen the complete fragment with the ordinary encoder.
+                        compactor.discardPatch();
+                        ordinals.deinit();
+                        ordinals = physical.Builder.init(a, fa, store, cancellation);
+                        leases.clear();
+                        _ = batch_arena.reset(.free_all);
+                        builder = mapper.TextProjectionBatchBuilder.initWithSelectedField(batch_arena.allocator(), analysis, runtime, null, selected_field);
+                        input_bytes = 0;
+                        previous_id = null;
+                        continue;
+                    }
+                    const staged = merged.segment;
+                    defer staged.release();
+                    var reader = try local.segment.SegmentReader.initSource(a, staged.source());
+                    defer reader.deinit();
+                    ordinals.deinit();
+                    ordinals = physical.Builder.init(a, fa, store, cancellation);
+                    for (0..reader.doc_count) |doc| {
+                        const stored = (try reader.storedDoc(@intCast(doc))) orelse return error.InvalidNativeLakeTextCorpus;
+                        const coordinate = try state.coordinates(stored.id);
+                        try ordinals.add(coordinate.group, coordinate.row);
+                    }
+                    if (reader.doc_count != 0) try compactor.publishSource(staged.source(), staged.statistics);
+                } else try compactor.finish();
+                break;
             }
-            try flush(&compactor, builder.batch(), analysis, store_source);
-            try compactor.finish();
             try opening.flush();
             group.opening_packs = opening.refs.items;
             ordinals.flush() catch |err| return buildFailure(err, "ordinal_pages", file_ordinal, segments.items.len);
@@ -1042,13 +1477,14 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
             input_bytes = 0;
             if (group.physical_manifest == null or group.descriptors.len != group.segments.len) try text_directory.prepare(fa, store, group, cancellation);
             try group.validate(store.upload_scope.?.domain);
-            try file_manifests.put(a, file_ordinal, publishFileManifest(a, ca, store, group.*, cancellation) catch |err| return buildFailure(err, "file_manifest", file_ordinal, segments.items.len));
+            try file_manifests.put(a, file_ordinal, publishFileManifestCached(a, ca, store, group.*, cancellation, &manifest_replay) catch |err| return buildFailure(err, "file_manifest", file_ordinal, segments.items.len));
             if (previous_refs.get(file.id)) |record| {
                 const old = try loadRecordedFile(fa, store.*, record, seed.?.domain, cancellation);
                 for (old.summaries) |summary| try df.add(df_pages.store(), summary, -1);
             } else if (previous_groups.get(file.id)) |old| for (old.summaries) |ref| try df.add(df_pages.store(), ref, -1);
-            for (group.summaries) |ref| try df.add(df_pages.store(), ref, 1);
-            try df.flush();
+            // Fresh summaries fed both reducers during publication. Only
+            // recovered file manifests need the authenticated remote cursor.
+            fresh_contributions.set(file_ordinal);
             // Atomically checkpoint the completed file inventory and its DF
             // state. Save the first file, then at most 64 files or five seconds
             // of completed work; metadata traffic grows with the delta batch.
@@ -1056,6 +1492,7 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
                 try pending_files.append(a, .{ .file = .{ .id = file.id, .digest = file.digest, .key_width = file.key_width }, .manifest = file_manifests.get(file_ordinal).? });
                 const now = @import("antfly_platform").time.monotonicNs();
                 if (checkpoints_saved == 0 or pending_files.items.len >= 64 or now -| checkpoint_time >= 5 * std.time.ns_per_s) {
+                    try df.flush();
                     var checkpoint_arena = std.heap.ArenaAllocator.init(a);
                     defer checkpoint_arena.deinit();
                     checkpoint_files = try text_directory.publishFileRecords(a, store, pending_files.items, &.{}, checkpoint_files, cancellation, provider.context.io.?);
@@ -1071,11 +1508,6 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
         global_statistics = try df.finish(df_pages.store(), global_statistics);
         // Global DF touches only changed file contributions. The spill manager
         // bounds disk independently of the sort's 4 MiB resident working set.
-        var checkpoint: StatisticsCheckpoint = .{ .provider = provider, .cancellation = cancellation };
-        var spill_manager: local.sql_spill.Manager = .{ .alloc = a, .io = provider.context.io orelse return error.UnsupportedSqlExecution, .context = &checkpoint, .checkpoint = StatisticsCheckpoint.check };
-        defer spill_manager.deinit();
-        var directory_builder = term_directory.Builder.init(a, &spill_manager);
-        defer directory_builder.deinit();
         var removed_files: std.ArrayList(text_directory.FileRecord) = .empty;
         var added_files: std.ArrayList(text_directory.FileRecord) = .empty;
         for (baseline_records) |record| {
@@ -1092,11 +1524,6 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
         }
         const prior_directory: term_directory.Roots = if (baseline) |old| (if (old.term_directory.version == 2) old.term_directory else .{}) else .{};
         const incremental_directory = prior_directory.leaves != null;
-        var stats_reads: u64 = 512 * 1024 * 1024;
-        var stats_writes: u64 = 512 * 1024 * 1024;
-        const scope = store.upload_scope.?;
-        var stats_pages: @import("../serverless/graph_segment/page_store.zig").PageStore = .{ .domain = scope.domain, .attempt = scope.attempt, .artifacts = store, .cancellation = cancellation, .remaining_read_bytes = &stats_reads, .remaining_write_bytes = &stats_writes, .streaming = true };
-        directory_builder.enableDurable(stats_pages.store());
         // A disabled optional directory has no complete base to update. Paged
         // seeds hold only changed maintenance groups, so stream unchanged
         // contributions from the canonical serving directory when bootstrapping.
@@ -1122,38 +1549,50 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
         }
         var totals: CollectionBuilder = .{ .a = a };
         defer totals.deinit();
-        var removed_refs: std.ArrayList(artifacts.ChunkRef) = .empty;
-        if (baseline) |old| {
-            totals.documents = old.collection.?.documents;
-            totals.segments = old.segment_count;
-            for (old.collection.?.fields) |field| try totals.field(field.name, field.total_length, false);
-            for (removed_files.items) |record| {
-                try removed_refs.append(ca, record.manifest);
+        const publication = directory_publication: {
+            var metadata_publisher: text_directory.Publisher = undefined;
+            try metadata_publisher.init(a, store, cancellation, provider.context.io orelse return error.UnsupportedSqlExecution);
+            defer metadata_publisher.deinit();
+            var manifests: ManifestReader = .{ .a = a, .store = store.*, .domain = store.upload_scope.?.domain, .token = cancellation };
+            defer manifests.deinit();
+            if (baseline) |old| {
+                totals.documents = old.collection.?.documents;
+                totals.segments = old.segment_count;
+                for (old.collection.?.fields) |field| try totals.field(field.name, field.total_length, false);
+                for (removed_files.items, 0..) |record, index| {
+                    _ = file_arena.reset(.free_all);
+                    const group = try manifests.load(file_arena.allocator(), record.manifest);
+                    if (index + 1 < removed_files.items.len) manifests.prefetch(removed_files.items[index + 1].manifest) else if (added_files.items.len != 0 and !try manifest_replay.contains(added_files.items[0].manifest)) manifests.prefetch(added_files.items[0].manifest);
+                    try metadata_publisher.add(group, record.manifest, true);
+                    try totals.add(group, true);
+                    if (incremental_directory) for (group.summaries, group.segments) |summary, segment| {
+                        try addStatisticsContribution(a, stats_pages.store(), summary, term_directory.identity(segment.artifact_id), -1, null, &directory_builder);
+                    };
+                }
+            }
+            for (added_files.items, 0..) |record, index| {
                 _ = file_arena.reset(.free_all);
-                const group = try loadFileManifest(file_arena.allocator(), store.*, record.manifest, old.domain, cancellation, null);
-                try totals.add(group, true);
-                if (incremental_directory) for (group.summaries, group.segments) |summary, segment| {
-                    try addStatisticsContribution(a, stats_pages.store(), summary, term_directory.identity(segment.artifact_id), -1, null, &directory_builder);
-                };
+                const group = try manifest_replay.load(&file_arena, &manifests, record.manifest, scope.domain);
+                if (index + 1 < added_files.items.len and !try manifest_replay.contains(added_files.items[index + 1].manifest)) manifests.prefetch(added_files.items[index + 1].manifest);
+                try metadata_publisher.add(group, record.manifest, false);
+                if (!fresh_contributions.isSet(plan.by_id.get(record.file.id) orelse return error.InvalidNativeLakeTextCorpus)) {
+                    for (group.summaries, group.segments) |summary, segment| {
+                        try addStatisticsContribution(a, stats_pages.store(), summary, term_directory.identity(segment.artifact_id), 1, null, &directory_builder);
+                    }
+                }
+                try totals.add(group, false);
             }
-        }
-        var current_refs: std.ArrayList(artifacts.ChunkRef) = .empty;
-        for (added_files.items) |record| {
-            try current_refs.append(ca, record.manifest);
-            _ = file_arena.reset(.free_all);
-            const group = try loadFileManifest(file_arena.allocator(), store.*, record.manifest, store.upload_scope.?.domain, cancellation, null);
-            for (group.summaries, group.segments) |summary, segment| {
-                try addStatisticsContribution(a, stats_pages.store(), summary, term_directory.identity(segment.artifact_id), 1, null, &directory_builder);
-            }
-            try totals.add(group, false);
-        }
-        const directory = try directory_builder.finish(stats_pages.store(), prior_directory);
-        const directories = try text_directory.publishManifests(a, store, current_refs.items, removed_refs.items, if (baseline) |old| old.directories else .{}, store.upload_scope.?.domain, cancellation, provider.context.io orelse return error.UnsupportedSqlExecution);
+            const directory = try directory_builder.finish(stats_pages.store(), prior_directory);
+            const directories = try metadata_publisher.finish(if (baseline) |old| old.directories else .{});
+            break :directory_publication .{ .terms = directory, .metadata = directories };
+        };
+        const directory = publication.terms;
+        const directories = publication.metadata;
         var root: Root = .{ .admission_version = 1, .statistics_version = 2, .term_statistics = global_statistics, .term_directory = directory, .seekable = true, .stored_projection = store_source, .domain = store.upload_scope.?.domain, .binding = binding, .config_json = spec.config_json, .recipe = recipe, .directories = directories, .inventory_version = 3, .file_count = @intCast(plan.count()), .segment_count = totals.segments, .collection = try totals.finish(ca) };
         root.source_layout_version = 1;
         root.source_routes_version = 1;
         root.inventory_delta_version = if (provider.native_delta != null) 2 else if (source.inventory.deleted_row_groups.len == 0 and (if (source.scanner.iceberg_delete_plan) |deletes| deletes.files.len == 0 else true)) 1 else 0;
-        root.serving = try @import("lake_index_serving_compaction.zig").publishDelta(a, ca, store, root, baseline, .{ .removed = removed_files.items, .added = added_files.items }, &plan, provider.context, cancellation);
+        root.serving = try @import("lake_index_serving_compaction.zig").publishDelta(a, ca, store, root, baseline, .{ .removed = removed_files.items, .added = added_files.items, .replay = &manifest_replay }, &plan, provider.context, cancellation);
         try root.validate();
         const bytes = try std.json.Stringify.valueAlloc(ca, root, .{});
         if (bytes.len > max_root_bytes) return error.NativeLakeTextCorpusTooLarge;
@@ -1476,8 +1915,14 @@ fn loadRecordedFile(a: A, store: stores.ArtifactStore, record: text_directory.Fi
 }
 
 pub fn checkpointBase(a: A, store: stores.ArtifactStore, root: Root, cancellation: Cancellation) !Root {
+    return checkpointBaseInner(a, store, root, cancellation, false);
+}
+pub fn checkpointBasePublication(a: A, store: stores.ArtifactStore, root: Root, cancellation: Cancellation) !Root {
+    return checkpointBaseInner(a, store, root, cancellation, true);
+}
+fn checkpointBaseInner(a: A, store: stores.ArtifactStore, root: Root, cancellation: Cancellation, publication: bool) !Root {
     const ref = root.checkpoint_base orelse return error.InvalidNativeLakeTextCorpus;
-    const base = try loadRootDirectory(a, store, .{ .kind = .text_segment, .metadata_version = metadata_version, .artifact_id = ref.artifact_id, .checksum = ref.checksum, .byte_len = ref.byte_len }, cancellation, null);
+    const base = try loadRootDirectoryInner(a, store, .{ .kind = .text_segment, .metadata_version = metadata_version, .artifact_id = ref.artifact_id, .checksum = ref.checksum, .byte_len = ref.byte_len }, cancellation, null, publication);
     if (base.checkpoint_base != null or base.serving == null or !std.mem.eql(u8, &base.domain, &root.domain) or !std.mem.eql(u8, &base.recipe, &root.recipe)) return error.InvalidNativeLakeTextCorpus;
     return base;
 }
@@ -1525,6 +1970,9 @@ fn presentManifests(a: A, slots: []const ?artifacts.ChunkRef) ![]const artifacts
     return refs.toOwnedSlice(a);
 }
 pub fn publishFileManifest(a: A, out: A, store: *stores.ArtifactStore, group: FileGroup, cancellation: Cancellation) !artifacts.ChunkRef {
+    return publishFileManifestCached(a, out, store, group, cancellation, null);
+}
+fn publishFileManifestCached(a: A, out: A, store: *stores.ArtifactStore, group: FileGroup, cancellation: Cancellation, replay: ?*ManifestReplay) !artifacts.ChunkRef {
     var wire = group;
     if (wire.source_pages.len != 0) wire.sources = &.{};
     const bytes = try std.json.Stringify.valueAlloc(a, wire, .{});
@@ -1534,7 +1982,11 @@ pub fn publishFileManifest(a: A, out: A, store: *stores.ArtifactStore, group: Fi
     upload.allocator = out;
     const ref = try upload.putWithCancellation(bytes, cancellation);
     defer if (ref.provider_version) |version| upload.allocator.free(version);
-    return .{ .artifact_id = ref.artifact_id, .checksum = ref.checksum, .byte_len = ref.byte_len };
+    const result: artifacts.ChunkRef = .{ .artifact_id = ref.artifact_id, .checksum = ref.checksum, .byte_len = ref.byte_len };
+    if (replay) |handoff| {
+        if (group.source_pages.len == 0 and group.members.len == 0) try handoff.appendEncoded(result, bytes) else if (group.members.len == 0 and group.sources.len == group.source_count) try handoff.append(a, result, group);
+    }
+    return result;
 }
 fn publishRoot(a: A, out: A, store: *stores.ArtifactStore, name: []const u8, root: Root, cancellation: Cancellation) !Declared {
     try root.validate();
@@ -1557,7 +2009,36 @@ fn publishRoot(a: A, out: A, store: *stores.ArtifactStore, name: []const u8, roo
 const Compactor = struct {
     const fan_in = 8;
     const target_bytes = 16 * 1024 * 1024;
+    const Owned = struct {
+        payload: union(enum) {
+            memory: []u8,
+            spill: *@import("lake_index_segment_spill.zig").LocalSegment,
+        },
+        captured: ?*statistics.Captured = null,
+        fn source(self: Owned) local.index.SegmentSource {
+            return switch (self.payload) {
+                .memory => |bytes| .{ .contiguous = bytes },
+                .spill => |staged| staged.source(),
+            };
+        }
+        fn len(self: Owned) usize {
+            return self.source().len();
+        }
+        fn deinit(self: Owned, a: A) void {
+            switch (self.payload) {
+                .memory => |bytes| a.free(bytes),
+                .spill => |staged| staged.release(),
+            }
+            if (self.captured) |captured| captured.deinit();
+        }
+    };
     a: A,
+    encoder: ?*EncoderPipeline = null,
+    context: local.serverless_query_lake_read_context.Context = .{},
+    row_patch: ?struct { base: FileGroup, rows: []const u64, intervals: []const []const text_directory.Interval = &.{} } = null,
+    patch_arena: ?std.heap.ArenaAllocator = null,
+    reusable_blocks: ?*@import("lake_index_seekable_text.zig").Reuse = null,
+    patch_inputs: std.ArrayList(Owned) = .empty,
     out: A,
     store: *stores.ArtifactStore,
     segments: *std.ArrayList(artifacts.ChunkRef),
@@ -1568,98 +2049,599 @@ const Compactor = struct {
     opening: ?*@import("lake_index_text_opening_pack.zig").Collector = null,
     io: ?std.Io = null,
     workspace_bytes: usize = 64 * 1024 * 1024,
-    pending: [fan_in]?[]u8 = @splat(null),
+    capture_manager: ?*local.sql_spill.Manager = null,
+    output_manager: ?*local.sql_spill.Manager = null,
+    encoding_memory_bytes: usize = 512 * 1024,
+    test_ahead_count: if (@import("builtin").is_test) usize else void = if (@import("builtin").is_test) 0 else {},
+    global: ?*statistics.Builder = null,
+    directory: ?*term_directory.Builder = null,
+    pending: [fan_in]?Owned = @splat(null),
     count: usize = 0,
     bytes: usize = 0,
+    fn finishEncoding(self: *Compactor) !void {
+        if (self.encoder) |encoder| try encoder.finish();
+    }
     fn deinit(self: *Compactor) void {
-        for (self.pending[0..self.count]) |value| self.a.free(value.?);
+        if (self.reusable_blocks) |reuse| reuse.deinit();
+        if (self.encoder) |encoder| {
+            encoder.deinit();
+            self.a.destroy(encoder);
+            self.encoder = null;
+        }
+        self.clearRuns();
+        self.discardPatch();
+        self.patch_inputs.deinit(self.a);
+        self.patch_inputs = .empty;
+    }
+    fn prepareServingPatch(self: *Compactor, root: Root, previous: FileGroup, rows: []const u64) !void {
+        self.patch_arena = .init(self.a);
+        defer if (self.row_patch == null) {
+            self.patch_arena.?.deinit();
+            self.patch_arena = null;
+        };
+        var budget: local.sql_memory_budget = .{ .backing = self.patch_arena.?.allocator(), .limit = 8 * 1024 * 1024, .monotonic = true };
+        const base = self.servingPatchBase(budget.allocator(), root, previous) catch |err| {
+            if (err == error.ArtifactReadBudgetExceeded or (err == error.OutOfMemory and budget.isLocallyExhausted())) return;
+            return err;
+        };
+        if (base) |value| self.row_patch = .{ .base = value.base, .rows = rows, .intervals = value.intervals };
+    }
+    fn servingPatchBase(self: *Compactor, a: A, root: Root, previous: FileGroup) !?struct { base: FileGroup, intervals: []const []const text_directory.Interval } {
+        var reads: u64 = 16 * 1024 * 1024;
+        var writes: u64 = 0;
+        var pages: @import("../serverless/graph_segment/page_store.zig").PageStore = .{ .domain = root.domain, .artifacts = self.store, .cancellation = self.cancellation, .remaining_read_bytes = &reads, .remaining_write_bytes = &writes };
+        pages.admitPublication();
+        var rows: u32 = 0;
+        if (previous.live_collection) |collection| rows = collection.documents else {
+            for (previous.admissions) |admission| rows = try std.math.add(u32, rows, admission.doc_count);
+        }
+        const ids = (try @import("lake_index_source_routes.zig").fileSegments(a, pages.store(), root, previous.file.id, previous.physical_manifest orelse return error.InvalidNativeLakeTextCorpus, rows, self.cancellation)) orelse return null;
+        var segments: std.ArrayList(artifacts.ChunkRef) = .empty;
+        var admissions: std.ArrayList(local.segment.SegmentReader.Admission) = .empty;
+        var intervals: std.ArrayList([]const text_directory.Interval) = .empty;
+        var retained_rows: u32 = 0;
+        var bytes: u64 = 0;
+        for (ids) |id| {
+            try self.context.ensureActive();
+            const group = try text_directory.loadSegmentPublication(a, root, self.store.*, self.cancellation, id, &reads);
+            bytes +|= group.admissions[0].bytes;
+            if (bytes > 16 * 1024 * 1024) return null;
+            var selected: std.ArrayList(text_directory.Interval) = .empty;
+            for (group.sources) |span| if (std.mem.eql(u8, span.file.id, previous.file.id)) {
+                if (span.file.key_digest == null or !std.mem.eql(u8, &span.file.key_digest.?, &previous.file.key_digest.?) or !std.mem.eql(u8, span.physical.artifact_id, previous.physical_manifest.?.artifact_id) or span.file_rows != rows) return error.InvalidNativeLakeTextCorpus;
+                retained_rows = try std.math.add(u32, retained_rows, span.count);
+                try selected.append(a, .{ .lower = span.pack_lower, .count = span.count });
+            };
+            if (selected.items.len == 0) return error.InvalidNativeLakeTextCorpus;
+            try intervals.append(a, selected.items);
+            try segments.appendSlice(a, group.segments);
+            try admissions.appendSlice(a, group.admissions);
+        }
+        if (retained_rows != rows) return error.InvalidNativeLakeTextCorpus;
+        return .{ .base = .{ .file = previous.file, .segments = segments.items, .admissions = admissions.items }, .intervals = intervals.items };
+    }
+    fn discardPatch(self: *Compactor) void {
+        for (self.patch_inputs.items) |owned| owned.deinit(self.a);
+        self.patch_inputs.clearRetainingCapacity();
+        self.row_patch = null;
+        if (self.patch_arena) |*arena| arena.deinit();
+        self.patch_arena = null;
+    }
+    const RowOverlay = struct { rows: []const u64, parts: []const []const source_spans.Span, collection: Collection };
+    /// One flattened base and one bounded delta. Shared/mixed historical packs
+    /// and a second patch compact through the existing exact merge instead.
+    fn publishRowOverlay(self: *Compactor, file: state.File) !?RowOverlay {
+        var workspace: local.sql_memory_budget = .{ .backing = self.a, .limit = self.workspace_bytes };
+        var committed = false;
+        return self.publishRowOverlayInner(workspace.allocator(), file, &committed) catch |err| {
+            if (!committed and (err == error.NativeLakeTextCorpusTooLarge or err == error.SqlProgramLimitExceeded or (err == error.OutOfMemory and workspace.isLocallyExhausted()))) return null;
+            return err;
+        };
+    }
+    fn publishRowOverlayInner(self: *Compactor, backing: A, file: state.File, committed: *bool) !?RowOverlay {
+        const patch = self.row_patch.?;
+        if (patch.base.segments.len != 1 or patch.base.admissions.len != 1 or patch.rows.len > 16 or self.patch_inputs.items.len > 1) return null;
+        const base_count = patch.base.admissions[0].doc_count;
+        if (base_count == 0 or base_count > 8192) return null;
+        if (patch.intervals.len != 0 and (patch.intervals.len != 1 or patch.intervals[0].len != 1 or patch.intervals[0][0].lower != 0 or patch.intervals[0][0].count != base_count)) return null;
+        var arena = std.heap.ArenaAllocator.init(backing);
+        defer arena.deinit();
+        const a = arena.allocator();
+        var data = try @import("lake_index_seekable_text.zig").loadPublication(a, .{ .store = self.store.*, .cache = null, .context = self.context, .cancellation = self.cancellation }, patch.base.segments[0]);
+        defer data.deinit(a);
+        var base = try local.segment.SegmentReader.initAuthenticated(a, data.source(), patch.base.admissions[0]);
+        defer base.deinit();
+        var delta = if (self.patch_inputs.items.len != 0) try local.segment.SegmentReader.initSource(a, self.patch_inputs.items[0].source()) else null;
+        defer if (delta) |*reader| reader.deinit();
+        const Coordinate = struct { row: u64, part: usize, doc: u32 };
+        var coordinates: std.ArrayList(Coordinate) = .empty;
+        var deleted: local.encoding_roaring.RoaringBitmap = .init(a);
+        defer deleted.deinit();
+        const expected = std.fmt.bytesToHex(&file.key_digest.?, .lower);
+        for (0..1 + self.patch_inputs.items.len) |part| {
+            const reader = if (part == 0) &base else &delta.?;
+            for (0..reader.doc_count) |doc| {
+                try self.context.ensureActive();
+                try self.cancellation.check();
+                const stored = (try reader.storedDoc(@intCast(doc))) orelse return error.InvalidNativeLakeTextCorpus;
+                if (stored.id.len != 96 or !std.mem.eql(u8, stored.id[6..70], &expected)) return error.InvalidNativeLakeTextCorpus;
+                const position = try state.coordinates(stored.id);
+                if (position.group != 0) return error.InvalidNativeLakeTextCorpus;
+                const replaced = std.sort.binarySearch(u64, patch.rows, position.row, struct {
+                    fn order(l: u64, r: u64) std.math.Order {
+                        return std.math.order(l, r);
+                    }
+                }.order) != null;
+                if (part == 0 and replaced) {
+                    try deleted.add(@intCast(doc));
+                } else {
+                    if (part != 0 and !replaced) return error.InvalidNativeLakeTextCorpus;
+                    try coordinates.append(a, .{ .row = position.row, .part = part, .doc = @intCast(doc) });
+                }
+            }
+        }
+        if (coordinates.items.len == 0) return null;
+        std.mem.sort(Coordinate, coordinates.items, {}, struct {
+            fn less(_: void, l: Coordinate, r: Coordinate) bool {
+                return l.row < r.row;
+            }
+        }.less);
+        const count = 1 + self.patch_inputs.items.len;
+        const parts = try self.out.alloc([]const source_spans.Span, count);
+        var spans: [2]std.ArrayList(source_spans.Span) = @splat(.empty);
+        const rows = try self.out.alloc(u64, coordinates.items.len);
+        for (coordinates.items, rows, 0..) |coordinate, *row, rank| {
+            if (rank != 0 and coordinates.items[rank - 1].row >= coordinate.row) return error.InvalidNativeLakeTextCorpus;
+            row.* = coordinate.row;
+            const list = &spans[coordinate.part];
+            if (list.items.len != 0) {
+                const last = &list.items[list.items.len - 1];
+                if (last.pack_lower + last.count == coordinate.doc and last.file_lower + last.count == rank) {
+                    last.count += 1;
+                    continue;
+                }
+            }
+            // prepare() replaces this local placeholder with the current
+            // physical map before any descriptor acquires durable authority.
+            try list.append(self.out, .{ .file = file, .physical = .{ .artifact_id = "", .checksum = "", .byte_len = 0 }, .file_rows = @intCast(rows.len), .file_lower = @intCast(rank), .pack_lower = coordinate.doc, .count = 1 });
+        }
+        for (parts, spans[0..count]) |*part, list| part.* = list.items;
+        var removed: std.StringHashMapUnmanaged(u64) = .empty;
+        defer removed.deinit(a);
+        const summary = try statistics.publishReaderFiltered(a, self.store, &base, self.cancellation, self.io, statistics.NoContributions{}, &deleted, &removed);
+        var totals: CollectionBuilder = .{ .a = a };
+        defer totals.deinit();
+        totals.documents = @intCast(rows.len);
+        for (patch.base.admissions[0].fields) |field| if (field.stats) |stats| try totals.field(field.name, try std.math.sub(u64, stats.total_field_len, removed.get(field.name) orelse 0), false);
+        if (delta) |*reader| {
+            const admission = try reader.admission(a);
+            for (admission.fields) |field| if (field.stats) |stats| try totals.field(field.name, stats.total_field_len, false);
+        }
+        const collection = try totals.finish(self.out);
+        // Optional planning has finished without mutating shared reducers.
+        // Adopting immutable summary roots begins the required publication.
+        committed.* = true;
+        var reads: u64 = 128 * 1024 * 1024;
+        var writes: u64 = 0;
+        const scope = self.store.upload_scope.?;
+        var pages: @import("../serverless/graph_segment/page_store.zig").PageStore = .{ .domain = scope.domain, .attempt = scope.attempt, .artifacts = self.store, .cancellation = self.cancellation, .remaining_read_bytes = &reads, .remaining_write_bytes = &writes };
+        pages.admitPublication();
+        if (self.global) |global| try global.add(pages.store(), summary, 1);
+        if (self.directory) |directory| try directory.add(pages.store(), summary, term_directory.identity(patch.base.segments[0].artifact_id), 1);
+        try self.segments.append(self.out, patch.base.segments[0]);
+        try self.admissions.append(self.out, patch.base.admissions[0]);
+        try self.summaries.append(self.out, summary);
+        if (delta != null) try self.publishSource(self.patch_inputs.items[0].source(), self.patch_inputs.items[0].captured);
+        return .{ .rows = rows, .parts = parts, .collection = collection };
+    }
+    const RowMerge = union(enum) { declined, empty, segment: *@import("lake_index_segment_spill.zig").LocalSegment };
+    fn mergeRows(self: *Compactor) !RowMerge {
+        // An admitted patch can legitimately contain no text documents in
+        // either cut. Preserve an empty publication without rescanning rows.
+        if (self.row_patch.?.base.segments.len == 0 and self.patch_inputs.items.len == 0) return .empty;
+        var budget: local.sql_memory_budget = .{ .backing = self.a, .limit = self.workspace_bytes };
+        return .{ .segment = self.mergeRowsInner(budget.allocator()) catch |err| {
+            if (err == error.NativeLakeTextCorpusTooLarge or err == error.SqlProgramLimitExceeded or (err == error.OutOfMemory and budget.isLocallyExhausted())) return .declined;
+            return err;
+        } };
+    }
+    fn mergeRowsInner(self: *Compactor, a: A) !*@import("lake_index_segment_spill.zig").LocalSegment {
+        const patch = self.row_patch.?;
+        const count = patch.base.segments.len + self.patch_inputs.items.len;
+        if (count == 0) return error.InvalidNativeLakeTextCorpus;
+        const data = try a.alloc(local.index.SegmentData, patch.base.segments.len);
+        defer a.free(data);
+        const readers = try a.alloc(local.segment.SegmentReader, count);
+        defer a.free(readers);
+        const inputs = try a.alloc(local.segment.MergeInput, count);
+        defer a.free(inputs);
+        const deletes = try a.alloc(local.encoding_roaring.RoaringBitmap, patch.base.segments.len);
+        defer a.free(deletes);
+        var opened_data: usize = 0;
+        var opened_readers: usize = 0;
+        var opened_deletes: usize = 0;
+        defer {
+            for (deletes[0..opened_deletes]) |*bitmap| bitmap.deinit();
+            for (readers[0..opened_readers]) |*reader| reader.deinit();
+            for (data[0..opened_data]) |*source_| source_.deinit(a);
+        }
+        const expected = std.fmt.bytesToHex(&patch.base.file.key_digest.?, .lower);
+        for (patch.base.segments, 0..) |ref, i| {
+            data[i] = try @import("lake_index_seekable_text.zig").loadPublication(a, .{ .store = self.store.*, .cache = null, .context = self.context, .cancellation = self.cancellation }, ref);
+            opened_data += 1;
+            readers[i] = try local.segment.SegmentReader.initAuthenticated(a, data[i].source(), patch.base.admissions[i]);
+            opened_readers += 1;
+            deletes[i] = .init(a);
+            opened_deletes += 1;
+            const full = [_]text_directory.Interval{.{ .lower = 0, .count = readers[i].doc_count }};
+            const intervals = if (patch.intervals.len == 0) &full else patch.intervals[i];
+            var covered: u32 = 0;
+            for (intervals) |interval| {
+                const end = try std.math.add(u32, interval.lower, interval.count);
+                if (interval.lower < covered or end > readers[i].doc_count) return error.InvalidNativeLakeTextCorpus;
+                // Authenticated spans mask unrelated fragments by ordinal,
+                // without decoding their stored IDs or source documents.
+                try deletes[i].addRange(covered, interval.lower);
+                covered = end;
+                for (interval.lower..end) |doc| {
+                    try self.cancellation.check();
+                    try self.context.ensureActive();
+                    const stored = (try readers[i].storedDoc(@intCast(doc))) orelse return error.InvalidNativeLakeTextCorpus;
+                    if (stored.id.len != 96 or !std.mem.eql(u8, stored.id[6..70], &expected)) return error.InvalidNativeLakeTextCorpus;
+                    const coordinate = try state.coordinates(stored.id);
+                    if (coordinate.group != 0) return error.InvalidNativeLakeTextCorpus;
+                    if (std.sort.binarySearch(u64, patch.rows, coordinate.row, struct {
+                        fn order(left: u64, right: u64) std.math.Order {
+                            return std.math.order(left, right);
+                        }
+                    }.order) != null) try deletes[i].add(@intCast(doc));
+                }
+            }
+            try deletes[i].addRange(covered, readers[i].doc_count);
+            inputs[i] = .{ .reader = &readers[i], .deleted = deletes[i] };
+        }
+        for (self.patch_inputs.items, patch.base.segments.len..) |owned, i| {
+            readers[i] = try local.segment.SegmentReader.initSource(a, owned.source());
+            opened_readers += 1;
+            inputs[i] = .{ .reader = &readers[i] };
+        }
+        const staged = try @import("lake_index_segment_spill.zig").LocalSegment.empty(self.a, self.output_manager.?, self.store);
+        errdefer staged.release();
+        staged.captureStatistics(self.capture_manager.?);
+        var sink = staged.sink();
+        try local.segment.writeMergedSegmentToSinkWithOptions(a, &sink, inputs, .{ .input_order = .arbitrary, .index_sort = &.{.{ .field = "_id", .desc = false }} });
+        try staged.seal();
+        return staged;
+    }
+    fn clearRuns(self: *Compactor) void {
+        for (self.pending[0..self.count]) |value| value.?.deinit(self.a);
         self.count = 0;
         self.bytes = 0;
     }
-    fn add(self: *Compactor, bytes: []const u8) !void {
+    fn addOwned(self: *Compactor, owned: Owned) !void {
+        var adopted = false;
+        defer if (!adopted) owned.deinit(self.a);
         try self.cancellation.check();
-        if (self.count != 0 and bytes.len > target_bytes -| self.bytes) try self.finish();
-        if (bytes.len > target_bytes) return self.publish(bytes);
-        self.pending[self.count] = try self.a.dupe(u8, bytes);
+        if (self.row_patch != null) {
+            if (owned.payload == .memory) {
+                const staged = try @import("lake_index_segment_spill.zig").LocalSegment.create(self.a, self.output_manager.?, self.store, owned.payload.memory);
+                errdefer staged.release();
+                try self.patch_inputs.append(self.a, .{ .payload = .{ .spill = staged } });
+                owned.deinit(self.a);
+            } else try self.patch_inputs.append(self.a, owned);
+            adopted = true;
+            return;
+        }
+        if (self.count != 0 and owned.len() > target_bytes -| self.bytes) try self.finish();
+        if (owned.len() > target_bytes) return self.publishSource(owned.source(), owned.captured);
+        self.pending[self.count] = owned;
+        adopted = true;
         self.count += 1;
-        self.bytes += bytes.len;
+        self.bytes += owned.len();
         if (self.count == fan_in) try self.finish();
     }
     fn finish(self: *Compactor) !void {
         if (self.count == 0) return;
-        defer self.deinit();
+        defer self.clearRuns();
         try self.cancellation.check();
-        if (self.count == fan_in) {
+        if (self.count == fan_in and self.io != null) {
             // Optional acceleration cannot exhaust the publication allocator.
             // A pathological dictionary/source shape falls back to the exact
             // original runs, rather than failing ingestion or raising limits.
             var budget: local.sql_memory_budget = .{ .backing = self.a, .limit = @min(self.workspace_bytes, local.sql_memory_budget.headroom(self.a) orelse self.workspace_bytes) };
             const a = budget.allocator();
-            const merged = self.merge(a) catch |err| switch (err) {
-                error.OutOfMemory => null,
+            var manager: local.sql_spill.Manager = .{ .alloc = self.a, .io = self.io.?, .context = self, .checkpoint = check, .max_bytes = 32 * 1024 * 1024, .async_writes = false };
+            defer manager.deinit();
+            const merged = self.merge(a, &manager) catch |err| switch (err) {
+                error.OutOfMemory, error.NativeLakeTextCorpusTooLarge, error.SqlProgramLimitExceeded => null,
                 else => return err,
             };
-            if (merged) |bytes| {
-                defer a.free(bytes);
+            if (merged) |staged| {
+                defer staged.release();
                 // A merge must save an artifact and respect the serving cap.
-                if (bytes.len <= 32 * 1024 * 1024 and bytes.len <= self.bytes + 64 * 1024) {
+                if (staged.file.size <= self.bytes + 64 * 1024) {
                     try self.cancellation.check();
-                    try self.publish(bytes);
+                    try self.publishSource(staged.source(), staged.statistics);
                     return;
                 }
             }
         }
-        for (self.pending[0..self.count]) |bytes| try self.publish(bytes.?);
+        for (self.pending[0..self.count]) |owned| try self.publishSource(owned.?.source(), owned.?.captured);
     }
-    fn merge(self: *Compactor, a: A) ![]u8 {
+    fn check(raw: *anyopaque) !void {
+        try @as(*Compactor, @ptrCast(@alignCast(raw))).cancellation.check();
+    }
+    fn merge(self: *Compactor, a: A, manager: *local.sql_spill.Manager) !*@import("lake_index_segment_spill.zig").LocalSegment {
         var readers: [fan_in]local.segment.SegmentReader = undefined;
         var opened: usize = 0;
         defer for (readers[0..opened]) |*reader| reader.deinit();
         var inputs: [fan_in]local.segment.MergeInput = undefined;
         for (self.pending[0..self.count], &readers, &inputs) |bytes, *reader, *input| {
-            reader.* = try local.segment.SegmentReader.init(a, bytes.?);
+            reader.* = try local.segment.SegmentReader.initSource(a, bytes.?.source());
             opened += 1;
             input.* = .{ .reader = reader };
         }
-        return local.segment.mergeSegmentInputs(a, &inputs);
+        const staged = try @import("lake_index_segment_spill.zig").LocalSegment.empty(self.a, manager, self.store);
+        errdefer staged.release();
+        staged.captureStatistics(self.capture_manager orelse manager);
+        var sink = staged.sink();
+        try local.segment.writeMergedSegmentToSink(a, &sink, &inputs);
+        try staged.seal();
+        return staged;
     }
-    fn publish(self: *Compactor, bytes: []const u8) !void {
+    fn publishSource(self: *Compactor, source: local.index.SegmentSource, captured: ?*statistics.Captured) !void {
         const a = self.a;
         const out = self.out;
         const cancellation = self.cancellation;
         const store = self.store;
         const segments = self.segments;
         try cancellation.check();
-        if (segments.items.len == max_segments or bytes.len > 32 * 1024 * 1024) return error.NativeLakeTextCorpusTooLarge;
-        var upload = store.*;
-        upload.allocator = out;
-        const ref = @import("lake_index_seekable_text.zig").publishWithOpeningCollector(a, out, &upload, bytes, cancellation, self.opening) catch |err| return buildFailure(err, "segment_packs", self.file_ordinal, segments.items.len);
-        var reader = try local.segment.SegmentReader.init(a, bytes);
+        if (segments.items.len == max_segments or source.len() > 32 * 1024 * 1024) return error.NativeLakeTextCorpusTooLarge;
+        // Pack workers allocate concurrently. Keep their synchronized transport
+        // allocator; the seekable publisher copies final refs into out serially.
+        if (self.row_patch) |patch| {
+            if (self.reusable_blocks == null) self.reusable_blocks = try @import("lake_index_seekable_text.zig").Reuse.create(a, store.*, patch.base.segments, cancellation);
+        }
+        const ref = @import("lake_index_seekable_text.zig").publishSourceReusing(a, out, store, source, cancellation, self.opening, self.reusable_blocks) catch |err| return buildFailure(err, "segment_packs", self.file_ordinal, segments.items.len);
+        var reader = try local.segment.SegmentReader.initSource(a, source);
         defer reader.deinit();
         try self.admissions.append(out, try reader.admission(out));
-        const summary = statistics.publishSegmentWithIo(a, store, bytes, cancellation, self.io) catch |err| return buildFailure(err, "segment_statistics", self.file_ordinal, segments.items.len);
+        const contributions: statistics.Contributions = .{ .global = self.global, .directory = self.directory, .segment = term_directory.identity(ref.artifact_id) };
+        const summary = (if (captured != null and !captured.?.disabled) captured.?.publishConsuming(store, cancellation, self.io, contributions) else statistics.publishReaderConsuming(a, store, &reader, cancellation, self.io, contributions)) catch |err| return buildFailure(err, "segment_statistics", self.file_ordinal, segments.items.len);
         try self.summaries.append(out, summary);
         try segments.append(out, .{ .artifact_id = ref.artifact_id, .checksum = ref.checksum, .byte_len = ref.byte_len });
     }
 };
 fn flush(compactor: *Compactor, batch: mapper.TextProjectionBatch, analysis: local.introducer.TextAnalysisConfig, store_source: bool) !void {
+    return flushWithOptions(compactor, batch, analysis, .{ .target_segment_bytes = 8 * 1024 * 1024, .target_build_memory_bytes = 32 * 1024 * 1024, .store_document_source = store_source });
+}
+fn flushWithOptions(compactor: *Compactor, batch: mapper.TextProjectionBatch, analysis: local.introducer.TextAnalysisConfig, build_options: mapper.BuildTextSegmentsOptions) !void {
+    try compactor.finishEncoding();
     try compactor.cancellation.check();
     for (batch.docs, 0..) |doc, i| {
         if (i != 0 and std.mem.order(u8, batch.docs[i - 1].id, doc.id) != .lt) return error.InvalidNativeLakeTextCorpus;
     }
-    const encoded = mapper.buildTextSegmentsFromProjectionBatch(compactor.a, batch, analysis, .{ .target_segment_bytes = 8 * 1024 * 1024, .target_build_memory_bytes = 32 * 1024 * 1024, .store_document_source = store_source }) catch |err| return buildFailure(err, "encode_segments", compactor.file_ordinal, compactor.segments.items.len);
-    defer mapper.freeTextSegments(compactor.a, encoded);
-    for (encoded) |bytes| try compactor.add(bytes);
+    var consumer: EncoderPipeline = .{ .compactor = compactor, .analysis = analysis };
+    defer consumer.deinit();
+    mapper.consumeTextProjectionChunks(batch, build_options, &consumer) catch |err| return buildFailure(err, "encode_segments", compactor.file_ordinal, compactor.segments.items.len);
+    try consumer.finish();
 }
-fn putPath(a: A, root: *std.json.Value, path: []const u8, value: std.json.Value) !void {
-    if (std.mem.indexOfScalar(u8, path, '.')) |dot| {
-        const key = path[0..dot];
-        if (!root.object.contains(key)) try root.object.put(a, key, .{ .object = .empty });
-        const child = root.object.getPtr(key).?;
-        if (child.* != .object) return error.InvalidNativeLakeTextCorpus;
-        try putPath(a, child, path[dot + 1 ..], value);
-    } else try root.object.put(a, path, value);
+const EncoderPipeline = struct {
+    const reservation = 48 * 1024 * 1024;
+    const Job = struct {
+        a: A,
+        manager: *local.sql_spill.Manager,
+        output_manager: *local.sql_spill.Manager,
+        store: stores.ArtifactStore,
+        chunk: mapper.TextProjectionBatch,
+        analysis: local.introducer.TextAnalysisConfig,
+        options: local.introducer.BuildTextOptions,
+        execution: local.sql_parallel_scheduler.Execution,
+        future: ?std.Io.Future(anyerror!Compactor.Owned) = null,
+        token: Cancellation,
+        threshold: usize,
+        fn check(raw: *anyopaque) !void {
+            try @as(*Job, @ptrCast(@alignCast(raw))).token.check();
+        }
+        fn run(self: *Job, io: std.Io) anyerror!Compactor.Owned {
+            defer self.execution.pause();
+            self.execution.checkpoint = .{ .ptr = self, .check = check };
+            try self.token.check();
+            var phase: stores.ExecutionIo = .{ .execution = &self.execution, .io = io };
+            self.store.io_phase = phase.capability();
+            var budget: local.sql_memory_budget = .{ .backing = self.a, .limit = 32 * 1024 * 1024 };
+            return encode(self.a, budget.allocator(), self.manager, self.output_manager, &self.store, self.chunk, self.analysis, self.options, self.threshold);
+        }
+    };
+    compactor: *Compactor,
+    input: ?OwnedProjection = null,
+    analysis: local.introducer.TextAnalysisConfig,
+    job: ?*Job = null,
+    ready: ?Compactor.Owned = null,
+    fn releaseInput(self: *@This()) void {
+        if (self.input) |value| {
+            var owned = value;
+            self.input = null;
+            owned.deinit();
+        }
+    }
+    fn enqueue(self: *@This(), batch: mapper.TextProjectionBatch, input: OwnedProjection, options: mapper.BuildTextSegmentsOptions) !void {
+        var transferred = false;
+        defer if (!transferred) {
+            var owned = input;
+            owned.deinit();
+        };
+        // Join only after the producer has prepared the next batch. Its first
+        // encoder then overlaps publication of the preceding batch's last chunk.
+        const previous = try self.take();
+        self.releaseInput();
+        self.ready = previous;
+        self.input = input;
+        transferred = true;
+        try mapper.consumeTextProjectionChunks(batch, options, self);
+        if (self.job == null) self.releaseInput();
+    }
+    fn encode(a: A, workspace: A, manager: *local.sql_spill.Manager, output_manager: *local.sql_spill.Manager, store: *stores.ArtifactStore, chunk: mapper.TextProjectionBatch, analysis_: local.introducer.TextAnalysisConfig, options: local.introducer.BuildTextOptions, threshold: usize) !Compactor.Owned {
+        const captured = statistics.Captured.create(a, manager) catch null;
+        if (captured) |value| value.phase = store.io_phase;
+        errdefer if (captured) |value| value.deinit();
+        var adaptive = @import("lake_index_segment_spill.zig").AdaptiveSink.init(a, output_manager, store);
+        defer adaptive.deinit();
+        adaptive.threshold = threshold;
+        var sink = adaptive.sink();
+        sink.term_observer = if (captured) |value| value.observer() else null;
+        try mapper.writeTextSegmentFromProjectionBatchToSink(workspace, chunk, analysis_, options, &sink);
+        if (captured) |value| try value.seal();
+        return if (adaptive.staged) |staged| blk: {
+            try staged.seal();
+            adaptive.staged = null;
+            break :blk .{ .payload = .{ .spill = staged }, .captured = captured };
+        } else .{ .payload = .{ .memory = try adaptive.memory.finishOwned() }, .captured = captured };
+    }
+    fn inlineEncode(self: *@This(), chunk: mapper.TextProjectionBatch, options: local.introducer.BuildTextOptions) !Compactor.Owned {
+        return encode(self.compactor.a, self.compactor.a, self.compactor.capture_manager.?, self.compactor.output_manager.?, self.compactor.store, chunk, self.analysis, options, self.compactor.encoding_memory_bytes);
+    }
+    fn take(self: *@This()) !?Compactor.Owned {
+        const job = self.job orelse {
+            const ready = self.ready;
+            self.ready = null;
+            return ready;
+        };
+        self.job = null;
+        defer job.a.destroy(job);
+        defer job.execution.scheduler.releasePull(1, reservation);
+        const phase = self.compactor.store.io_phase.?;
+        phase.park.?(phase.ptr);
+        const result = job.future.?.await(phase.io);
+        job.execution.pause(); // Also covers cancellation before start.
+        var owned = result catch |err| {
+            try phase.resume_cpu.?(phase.ptr);
+            if (err == error.OutOfMemory) return try self.inlineEncode(job.chunk, job.options);
+            return err;
+        };
+        // Worker-local capabilities cannot escape into the serial owner.
+        if (owned.payload == .spill) owned.payload.spill.store = self.compactor.store;
+        if (owned.captured) |captured| captured.phase = self.compactor.store.io_phase;
+        errdefer owned.deinit(self.compactor.a);
+        try phase.resume_cpu.?(phase.ptr);
+        return owned;
+    }
+    fn start(self: *@This(), chunk: mapper.TextProjectionBatch, options: local.introducer.BuildTextOptions) !void {
+        const phase = self.compactor.store.io_phase;
+        if (phase != null and phase.?.park != null and phase.?.resume_cpu != null and phase.?.scheduler != null and
+            (@import("../serverless/build/lake_build_limits.zig").WorkingSetAllocator.headroom(self.compactor.a) orelse 0) >= reservation * 2)
+        {
+            const scheduler = phase.?.scheduler.?;
+            if (scheduler.max_workers > 1 and scheduler.reservePull(1, reservation)) {
+                var transferred = false;
+                defer if (!transferred) scheduler.releasePull(1, reservation);
+                if (self.compactor.a.create(Job)) |job| {
+                    job.* = .{ .a = self.compactor.a, .manager = self.compactor.capture_manager.?, .output_manager = self.compactor.output_manager.?, .store = self.compactor.store.*, .chunk = chunk, .analysis = self.analysis, .options = options, .execution = .{ .scheduler = scheduler, .bytes = 8 * 1024 * 1024 }, .token = self.compactor.cancellation, .threshold = self.compactor.encoding_memory_bytes };
+                    job.store.io_phase = null;
+                    if (!job.execution.tryEnter()) {
+                        job.a.destroy(job);
+                    } else if (phase.?.io.concurrent(Job.run, .{ job, phase.?.io })) |future| {
+                        job.future = future;
+                        self.job = job;
+                        if (@import("builtin").is_test) self.compactor.test_ahead_count += 1;
+                        transferred = true;
+                        return;
+                    } else |_| {
+                        job.execution.pause();
+                        self.compactor.a.destroy(job);
+                    }
+                } else |_| {}
+            }
+        }
+        self.ready = try self.inlineEncode(chunk, options);
+    }
+    pub fn consume(self: *@This(), chunk: mapper.TextProjectionBatch, options: local.introducer.BuildTextOptions) !void {
+        const previous = try self.take();
+        var adopted = false;
+        defer if (!adopted) if (previous) |value| value.deinit(self.compactor.a);
+        // Encode the next chunk while the owner merges/uploads this one.
+        // At most one child and one unadopted payload exist.
+        try self.start(chunk, options);
+        adopted = true;
+        if (previous) |value| try self.compactor.addOwned(value);
+    }
+    fn finish(self: *@This()) !void {
+        defer self.releaseInput();
+        if (try self.take()) |value| try self.compactor.addOwned(value);
+    }
+    fn deinit(self: *@This()) void {
+        defer self.releaseInput();
+        if (self.ready) |value| value.deinit(self.compactor.a);
+        if (self.job) |job| {
+            // Cancellation drains the child before borrowed projection data
+            // or its spill manager can be released. It never resumes CPU.
+            const result = job.future.?.cancel(self.compactor.io.?);
+            job.execution.pause(); // Also covers cancellation before start.
+            if (result) |value| value.deinit(self.compactor.a) else |_| {}
+            job.execution.scheduler.releasePull(1, reservation);
+            job.a.destroy(job);
+        }
+    }
+};
+
+const OwnedProjection = struct {
+    arena: std.heap.ArenaAllocator,
+    leases: ProjectionLeases,
+    scheduler: *local.sql_parallel_scheduler.Scheduler,
+    reservation: usize,
+    fn deinit(self: *@This()) void {
+        self.leases.clear();
+        self.arena.deinit();
+        self.scheduler.releasePull(0, self.reservation);
+    }
+};
+fn flushRetained(compactor: *Compactor, arena: *std.heap.ArenaAllocator, leases: *ProjectionLeases, batch: mapper.TextProjectionBatch, analysis: local.introducer.TextAnalysisConfig, store_source: bool) !void {
+    const phase = compactor.store.io_phase;
+    const bytes = arena.queryCapacity() +| leases.bytes;
+    if (batch.docs.len != 0 and phase != null and phase.?.scheduler != null and phase.?.park != null and phase.?.resume_cpu != null and
+        (@import("../serverless/build/lake_build_limits.zig").WorkingSetAllocator.headroom(compactor.a) orelse 0) >= bytes +| 96 * 1024 * 1024)
+    {
+        const scheduler = phase.?.scheduler.?;
+        if (scheduler.max_workers > 1 and scheduler.reservePull(0, bytes)) {
+            var transferred = false;
+            defer if (!transferred) scheduler.releasePull(0, bytes);
+            if (compactor.encoder == null) {
+                const created = compactor.a.create(EncoderPipeline) catch return flush(compactor, batch, analysis, store_source);
+                created.* = .{ .compactor = compactor, .analysis = analysis };
+                compactor.encoder = created;
+            }
+            const encoder = compactor.encoder.?;
+            if (encoder.compactor != compactor) unreachable;
+            const owned: OwnedProjection = .{ .arena = arena.*, .leases = leases.*, .scheduler = scheduler, .reservation = bytes };
+            arena.* = .init(compactor.a);
+            leases.* = .{};
+            transferred = true;
+            try encoder.enqueue(batch, owned, .{ .target_segment_bytes = 8 * 1024 * 1024, .target_build_memory_bytes = 32 * 1024 * 1024, .store_document_source = store_source });
+            return;
+        }
+    }
+    try flush(compactor, batch, analysis, store_source);
 }
+const ProjectionLeases = struct {
+    const max_bytes = 8 * 1024 * 1024;
+    owners: [8]local.storage_rowsource_types.ColumnOwner = undefined,
+    count: usize = 0,
+    bytes: usize = 0,
+    fn full(self: *const @This()) bool {
+        return self.count == self.owners.len or self.bytes >= max_bytes;
+    }
+    fn add(self: *@This(), owner: local.storage_rowsource_types.ColumnOwner) void {
+        std.debug.assert(self.count < self.owners.len);
+        self.owners[self.count] = owner;
+        self.count += 1;
+        self.bytes +|= owner.retained_bytes;
+    }
+    fn clear(self: *@This()) void {
+        for (self.owners[0..self.count]) |owner| owner.release();
+        self.count = 0;
+        self.bytes = 0;
+    }
+};
 
 const StatisticsCheckpoint = struct {
     provider: *@import("lake_index_row_source.zig").Provider,
@@ -1733,15 +2715,14 @@ test "external lake text compaction preserves all physical keys in input order" 
         var segments: std.ArrayList(artifacts.ChunkRef) = .empty;
         var summaries: std.ArrayList(?statistics.Ref) = .empty;
         var admissions: std.ArrayList(local.segment.SegmentReader.Admission) = .empty;
-        var compactor: Compactor = .{ .a = a, .out = ca, .store = &store, .segments = &segments, .summaries = &summaries, .admissions = &admissions, .cancellation = .none, .file_ordinal = 0, .workspace_bytes = workspace };
+        var compactor: Compactor = .{ .a = a, .out = ca, .store = &store, .segments = &segments, .summaries = &summaries, .admissions = &admissions, .cancellation = .none, .file_ordinal = 0, .workspace_bytes = workspace, .io = std.testing.io };
         defer compactor.deinit();
         // Eight tiny runs become one; the next current-data run remains separate.
         const file_id: [64]u8 = @splat('0');
         for (0..9) |i| {
             const key = try std.fmt.allocPrint(ca, "lake1:{s}:00000000:{x:0>16}", .{ file_id, i + 10 });
             const bytes = (try mapper.buildTextSegmentFromDocuments(a, &.{.{ .key = key, .value = "{\"body\":\"quasar\"}" }}, .{}, null)).?;
-            defer a.free(bytes);
-            try compactor.add(bytes);
+            try compactor.addOwned(.{ .payload = .{ .memory = bytes } });
         }
         try compactor.finish();
         try std.testing.expectEqual(@as(usize, if (workspace == 1) 9 else 2), segments.items.len);
@@ -1877,4 +2858,679 @@ test "external lake bounded WAL inventory deltas seek changed records within a b
     var expected_file = current.files[1];
     expected_file.etag = verified_file.etag;
     try std.testing.expectEqual(try state.inventoryIdentity(a, current, expected_file, local.serverless_query_lake_prepared_deletes.Prepared.emptyFileFingerprint()), try state.identity(a, &provider, current.files[1]));
+}
+
+test "external lake publication manifest prefetch overlaps CPU bounds ownership and drains failures" {
+    const Scheduler = local.sql_parallel_scheduler;
+    const Probe = struct {
+        var active: *@This() = undefined;
+        backend: stores.ArtifactStore,
+        execution: Scheduler.Execution,
+        pending: ?Scheduler.Execution.Io = null,
+        entered: std.Io.Event = .unset,
+        gate: std.Io.Event = .unset,
+        blocked: bool = true,
+        failure: ?anyerror = null,
+        oom_once: std.atomic.Value(bool) = .init(false),
+        cancel_resume: bool = false,
+        canceled: bool = false,
+        reads: std.atomic.Value(usize) = .init(0),
+        fn read(_: *anyopaque, a: A, id: []const u8, maximum: usize, token: Cancellation) ![]u8 {
+            const self = active;
+            _ = self.reads.fetchAdd(1, .monotonic);
+            self.entered.set(std.testing.io);
+            if (self.blocked) try self.gate.wait(std.testing.io);
+            if (self.failure) |err| return err;
+            if (self.oom_once.swap(false, .acq_rel)) return error.OutOfMemory;
+            const bytes = try self.backend.getAllocWithCancellationUsingAllocator(a, id, token);
+            errdefer a.free(bytes);
+            if (bytes.len > maximum) return error.ArtifactTooLarge;
+            return bytes;
+        }
+        fn check(raw: *anyopaque) !void {
+            if (@as(*@This(), @ptrCast(@alignCast(raw))).canceled) return error.Canceled;
+        }
+        fn begin(raw: *anyopaque, count: usize) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.pending = try self.execution.beginIo(std.testing.io, count);
+        }
+        fn finish(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            var pending = self.pending.?;
+            self.pending = null;
+            self.canceled = self.cancel_resume;
+            try pending.finish();
+        }
+        fn abort(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.pending) |*pending| pending.abort();
+            self.pending = null;
+        }
+    };
+    const a = std.testing.allocator;
+    var temporary = try local.common_test_directory.TestDirectory.init("manifest-read-ahead");
+    defer temporary.cleanup();
+    var fs = try @import("../serverless/artifacts/fs_store.zig").FsStore.init(a, temporary.path());
+    defer fs.deinit();
+    var backend = fs.artifactStore();
+    backend.upload_scope = try stores.UploadScope.forPublication(@splat(7), 1, std.testing.io);
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const ref = try publishFileManifest(a, arena.allocator(), &backend, .{ .file = .{ .id = "one", .digest = @splat(1) }, .segments = &.{} }, .none);
+    var scheduler: Scheduler.Scheduler = .{ .max_workers = 1, .max_io_workers = 2 };
+    var probe: Probe = .{ .backend = backend, .execution = .{ .scheduler = &scheduler, .bytes = 1024 } };
+    Probe.active = &probe;
+    probe.execution.checkpoint = .{ .ptr = &probe, .check = Probe.check };
+    try probe.execution.enter(std.testing.io);
+    defer probe.execution.pause();
+    const capability: stores.IoPhase = .{ .io = std.testing.io, .ptr = &probe, .scheduler = &scheduler, .max_parallel = 2, .begin = Probe.begin, .finish = Probe.finish, .abort = Probe.abort };
+    var vtable = backend.vtable.*;
+    vtable.get_bounded_alloc_with_cancellation = Probe.read;
+    var store = backend;
+    store.vtable = &vtable;
+    store.io_phase = &capability;
+    var manifests: ManifestReader = .{ .a = a, .store = store, .domain = backend.upload_scope.?.domain, .token = .none };
+    defer manifests.deinit();
+    manifests.prefetch(ref);
+    try std.testing.expect(manifests.pending != null);
+    try probe.entered.wait(std.testing.io);
+    try std.testing.expect(probe.execution.active);
+    try std.testing.expectEqual(@as(usize, 1), scheduler.io_workers);
+    // A second prefetch cannot allocate or start another request.
+    manifests.prefetch(ref);
+    try std.testing.expectEqual(@as(usize, 1), probe.reads.load(.acquire));
+    probe.gate.set(std.testing.io);
+    const group = try manifests.load(arena.allocator(), ref);
+    try std.testing.expectEqualStrings("one", group.file.id);
+    try std.testing.expect(manifests.pending == null and probe.execution.active);
+    try std.testing.expectEqual(@as(usize, 0), scheduler.io_workers);
+    probe.blocked = false;
+    scheduler.max_io_workers = 1;
+    manifests.prefetch(ref);
+    const single = try manifests.load(arena.allocator(), ref);
+    try std.testing.expectEqualStrings("one", single.file.id);
+    try std.testing.expect(probe.execution.active);
+    try std.testing.expectEqual(@as(usize, 0), scheduler.io_workers);
+    scheduler.max_io_workers = 2;
+    probe.failure = error.InjectedReadFailure;
+    manifests.prefetch(ref);
+    try std.testing.expectError(error.InjectedReadFailure, manifests.load(arena.allocator(), ref));
+    try std.testing.expect(probe.execution.active);
+    probe.failure = error.ArtifactIntegrityMismatch;
+    manifests.prefetch(ref);
+    try std.testing.expectError(error.ArtifactIntegrityMismatch, manifests.load(arena.allocator(), ref));
+    try std.testing.expect(probe.execution.active);
+    probe.failure = null;
+    probe.oom_once.store(true, .release);
+    manifests.prefetch(ref);
+    const retried = try manifests.load(arena.allocator(), ref);
+    try std.testing.expectEqualStrings("one", retried.file.id);
+    try std.testing.expectEqual(@as(usize, 0), scheduler.pull_bytes);
+    try std.testing.expectEqual(@as(usize, 0), manifests.speculative.live);
+    probe.cancel_resume = true;
+    manifests.prefetch(ref);
+    try std.testing.expectError(error.Canceled, manifests.load(arena.allocator(), ref));
+    try std.testing.expect(!probe.execution.active);
+    try std.testing.expectEqual(@as(usize, 0), scheduler.io_workers);
+    probe.canceled = false;
+    probe.cancel_resume = false;
+    try probe.execution.enter(std.testing.io);
+    // Cancellation joins a live child before its borrowed references disappear.
+    probe.blocked = true;
+    probe.gate = .unset;
+    probe.entered = .unset;
+    manifests.prefetch(ref);
+    try probe.entered.wait(std.testing.io);
+    manifests.deinit();
+    try std.testing.expectEqual(@as(usize, 0), scheduler.io_workers);
+    // Concurrent required allocations can exhaust the enclosing quota. Drain
+    // declined speculation and retry after that capacity becomes available.
+    {
+        const Limits = @import("../serverless/build/lake_build_limits.zig");
+        var budget = try Limits.WorkingSetAllocator.init(a, .{ .max_working_set_bytes = 1024 * 1024 });
+        const bounded = budget.allocator();
+        manifests.a = bounded;
+        defer {
+            manifests.deinit();
+            manifests.a = a;
+        }
+        probe.gate = .unset;
+        probe.entered = .unset;
+        manifests.prefetch(ref);
+        try std.testing.expect(manifests.pending != null);
+        try probe.entered.wait(std.testing.io);
+        const held = try bounded.alloc(u8, budget.max_live_bytes - budget.live_bytes);
+        probe.gate.set(std.testing.io);
+        while (!manifests.pending.?.task.isComplete()) try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+        bounded.free(held);
+        try std.testing.expectEqual(@as(usize, 0), budget.live_bytes);
+        // A completed successful read retains only its independently admitted
+        // bytes: required reducer allocations may still use their entire quota.
+        const required_work = try bounded.alloc(u8, budget.max_live_bytes);
+        bounded.free(required_work);
+        try std.testing.expect(scheduler.pull_bytes != 0);
+        const before = probe.reads.load(.acquire);
+        var required = std.heap.ArenaAllocator.init(bounded);
+        const recovered = try manifests.load(required.allocator(), ref);
+        try std.testing.expectEqualStrings("one", recovered.file.id);
+        try std.testing.expectEqual(before + 1, probe.reads.load(.acquire));
+        try std.testing.expectEqual(@as(usize, 0), scheduler.pull_bytes);
+        try std.testing.expect(manifests.pending == null and probe.execution.active);
+        try std.testing.expectEqual(@as(usize, 0), scheduler.io_workers);
+        required.deinit();
+        try std.testing.expectEqual(@as(usize, 0), budget.live_bytes);
+        manifests.prefetch(ref);
+        try std.testing.expect(manifests.pending != null);
+        while (!manifests.pending.?.task.isComplete()) try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+        try std.testing.expect(budget.live_bytes >= ref.byte_len);
+        try std.testing.expectError(error.OutOfMemory, bounded.alloc(u8, budget.max_live_bytes));
+        const cached_reads = probe.reads.load(.acquire);
+        _ = try manifests.load(arena.allocator(), ref);
+        try std.testing.expectEqual(cached_reads, probe.reads.load(.acquire));
+        try std.testing.expectEqual(@as(usize, 0), budget.live_bytes);
+    }
+    // A completed result retains its independent node reservation until join.
+    scheduler.max_pull_bytes = 1;
+    manifests.prefetch(ref);
+    try std.testing.expect(manifests.pending == null);
+    scheduler.max_pull_bytes = 2 * 1024 * 1024 * 1024;
+    // Saturation and opaque allocator wrappers decline optional work.
+    {
+        probe.gate = .unset;
+        var occupied = scheduler.submitIoTransient(std.testing.io, 1, struct {
+            fn wait(gate: *std.Io.Event) anyerror!void {
+                try gate.wait(std.testing.io);
+            }
+        }.wait, .{&probe.gate}).?;
+        defer _ = occupied.cancel(std.testing.io) catch {};
+        scheduler.max_io_workers = 1;
+        manifests.prefetch(ref);
+        try std.testing.expect(manifests.pending == null);
+    }
+    scheduler.max_io_workers = 2;
+    var buffer: [1024]u8 = undefined;
+    var unknown = std.heap.FixedBufferAllocator.init(&buffer);
+    manifests.a = unknown.allocator();
+    manifests.prefetch(ref);
+    try std.testing.expect(manifests.pending == null);
+}
+
+test "external lake publication metadata replay bounds disk preserves groups and checks identity integrity" {
+    const a = std.testing.allocator;
+    var temporary = try local.common_test_directory.TestDirectory.init("publication-metadata-replay");
+    defer temporary.cleanup();
+    var fs = try @import("../serverless/artifacts/fs_store.zig").FsStore.init(a, temporary.path());
+    defer fs.deinit();
+    var store = fs.artifactStore();
+    store.upload_scope = try stores.UploadScope.forPublication(@splat(7), 1, std.testing.io);
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const group: FileGroup = .{ .file = .{ .id = "one", .digest = @splat(1) }, .segments = &.{} };
+    const ref = try publishFileManifest(a, arena.allocator(), &store, group, .none);
+    const other = try publishFileManifest(a, arena.allocator(), &store, .{ .file = .{ .id = "two", .digest = @splat(2) }, .segments = &.{} }, .none);
+    var replay: ManifestReplay = undefined;
+    replay.init(a, std.testing.io, .none);
+    defer replay.deinit();
+    try replay.append(a, ref, group);
+    try std.testing.expectEqual(@as(usize, 1), replay.count);
+    replay.manager.max_bytes = replay.manager.live_bytes;
+    try replay.append(a, other, group);
+    try std.testing.expect(replay.full);
+    try std.testing.expectEqual(@as(usize, 1), replay.count);
+    var invalid = ref;
+    invalid.byte_len = 0;
+    try std.testing.expectError(error.InvalidNativeLakeTextCorpus, replay.next(arena.allocator(), invalid, store.upload_scope.?.domain));
+    try std.testing.expectError(error.InvalidNativeLakeTextCorpus, replay.next(arena.allocator(), ref, @splat(8)));
+    try std.testing.expectError(error.InvalidNativeLakeTextCorpus, replay.next(arena.allocator(), other, store.upload_scope.?.domain));
+    const decoded = (try replay.next(arena.allocator(), ref, store.upload_scope.?.domain)).?;
+    try std.testing.expectEqualStrings(group.file.id, decoded.file.id);
+    try std.testing.expect(try replay.next(arena.allocator(), other, store.upload_scope.?.domain) == null);
+    replay.offset = 0;
+    replay.consumed = 0;
+    try replay.file.?.writeRaw(ManifestReplay.header_bytes, "!");
+    try std.testing.expectError(error.InvalidNativeLakeTextCorpus, replay.next(arena.allocator(), ref, store.upload_scope.?.domain));
+    replay.file.?.close();
+    replay.file = null;
+    try std.testing.expectEqual(@as(u64, 0), replay.manager.live_bytes);
+    try std.testing.expectEqual(@as(usize, 0), replay.manager.files);
+}
+
+test "external lake publication metadata replay declines allocation failures after opening spill storage" {
+    const a = std.testing.allocator;
+    const group: FileGroup = .{ .file = .{ .id = "one", .digest = @splat(1) }, .segments = &.{} };
+    var saw_open_failure = false;
+    for (0..8) |fail_index| {
+        var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = fail_index });
+        var replay: ManifestReplay = undefined;
+        replay.init(failing.allocator(), std.testing.io, .none);
+        defer replay.deinit();
+        try replay.append(failing.allocator(), .{ .artifact_id = "cache-only-test", .checksum = "", .byte_len = 1 }, group);
+        if (replay.full) {
+            try std.testing.expectEqual(@as(usize, 0), replay.count);
+            try std.testing.expectEqual(@as(usize, 0), replay.manager.files);
+            try std.testing.expectEqual(@as(u64, 0), replay.manager.live_bytes);
+            if (replay.manager.dir != null) saw_open_failure = true;
+        } else try std.testing.expectEqual(@as(usize, 1), replay.count);
+    }
+    try std.testing.expect(saw_open_failure);
+}
+
+test "external lake publication metadata replay captures producer bytes for repeated unordered consumers" {
+    const Denied = struct {
+        fn read(_: *anyopaque, _: A, _: []const u8, _: usize, _: Cancellation) ![]u8 {
+            return error.InjectedReadFailure;
+        }
+    };
+    const a = std.testing.allocator;
+    var temporary = try local.common_test_directory.TestDirectory.init("producer-manifest-handoff");
+    defer temporary.cleanup();
+    var fs = try @import("../serverless/artifacts/fs_store.zig").FsStore.init(a, temporary.path());
+    defer fs.deinit();
+    var store = fs.artifactStore();
+    store.upload_scope = .{ .domain = @splat(7), .attempt = @splat(1) };
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    var replay: ManifestReplay = undefined;
+    replay.init(a, std.testing.io, .none);
+    defer replay.deinit();
+    const first: FileGroup = .{ .file = .{ .id = "first", .digest = @splat(1) }, .segments = &.{} };
+    const second: FileGroup = .{ .file = .{ .id = "second", .digest = @splat(2) }, .segments = &.{} };
+    const one = try publishFileManifestCached(a, arena.allocator(), &store, first, .none, &replay);
+    const two = try publishFileManifestCached(a, arena.allocator(), &store, second, .none, &replay);
+    const missing = try publishFileManifest(a, arena.allocator(), &store, .{ .file = .{ .id = "resumed", .digest = @splat(3) }, .segments = &.{} }, .none);
+    var denied = store;
+    var vtable = store.vtable.*;
+    vtable.get_bounded_alloc_with_cancellation = Denied.read;
+    denied.vtable = &vtable;
+    var reader: ManifestReader = .{ .a = a, .store = denied, .domain = store.upload_scope.?.domain, .token = .none };
+    defer reader.deinit();
+    var scratch = std.heap.ArenaAllocator.init(a);
+    defer scratch.deinit();
+    for (0..2) |_| {
+        _ = scratch.reset(.free_all);
+        try std.testing.expectEqualStrings("second", (try replay.load(&scratch, &reader, two, store.upload_scope.?.domain)).file.id);
+        try std.testing.expect(!try replay.contains(missing));
+        try std.testing.expect(try replay.lookup(scratch.allocator(), missing, store.upload_scope.?.domain) == null);
+        _ = scratch.reset(.free_all);
+        try std.testing.expectEqualStrings("first", (try replay.load(&scratch, &reader, one, store.upload_scope.?.domain)).file.id);
+    }
+    try std.testing.expectEqual(@as(usize, 4), replay.hits);
+    // A resumed/cache-missing group still follows the required provider path.
+    try std.testing.expectError(error.InjectedReadFailure, replay.load(&scratch, &reader, missing, store.upload_scope.?.domain));
+}
+
+test "external lake publication encoding lookahead spill and direct contributions preserve roots" {
+    const Check = struct {
+        fn call(_: *anyopaque) !void {}
+        fn rejectRead(_: *anyopaque, _: A, _: []const u8, _: u64, _: usize, _: Cancellation) ![]u8 {
+            return error.UnexpectedFreshSummaryRead;
+        }
+        fn failPut(_: *anyopaque, _: A, _: stores.UploadScope, _: []const u8, _: Cancellation) !stores.ArtifactMetadata {
+            return error.InjectedLakePublicationFailure;
+        }
+    };
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const out = arena.allocator();
+    var directory = try local.common_test_directory.TestDirectory.init("encoding-lookahead-contributions");
+    defer directory.cleanup();
+    var fs = try @import("../serverless/artifacts/fs_store.zig").FsStore.init(a, directory.path());
+    defer fs.deinit();
+    var store = fs.artifactStore();
+    store.upload_scope = try stores.UploadScope.forPublication(@splat(71), 1, std.testing.io);
+    const original_vtable = store.vtable;
+    var no_reads = original_vtable.*;
+    no_reads.get_range_alloc_with_cancellation = Check.rejectRead;
+    const docs = try out.alloc(local.introducer.TextDocument, 9);
+    const file_id: [64]u8 = @splat('0');
+    for (docs, 0..) |*doc, i| doc.* = .{
+        .id = try std.fmt.allocPrint(out, "lake1:{s}:00000000:{x:0>16}", .{ file_id, i }),
+        .stored_data = "{}",
+        .text_fields = &.{.{ .field_name = "body", .text = "quasar common common" }},
+    };
+    var expected_segments: []const artifacts.ChunkRef = &.{};
+    var expected_summaries: []const ?statistics.Ref = &.{};
+    var expected_global: ?statistics.Ref = null;
+    var expected_directory: term_directory.Roots = .{};
+    for (0..8) |mode| {
+        var memory: local.sql_memory_budget = .{ .backing = a, .limit = 128 * 1024 * 1024 };
+        const ma = memory.allocator();
+        var context: u8 = 0;
+        var scratch: local.sql_spill.Manager = .{ .alloc = ma, .io = std.testing.io, .context = &context, .checkpoint = Check.call, .max_bytes = if (mode == 3) 0 else 64 * 1024 * 1024, .async_writes = false };
+        defer scratch.deinit();
+        var output_scratch: local.sql_spill.Manager = .{ .alloc = ma, .io = std.testing.io, .context = &context, .checkpoint = Check.call, .max_bytes = 64 * 1024 * 1024, .async_writes = false };
+        defer output_scratch.deinit();
+        var reducer_scratch: local.sql_spill.Manager = .{ .alloc = ma, .io = std.testing.io, .context = &context, .checkpoint = Check.call };
+        defer reducer_scratch.deinit();
+        var global = statistics.Builder.init(ma, &reducer_scratch);
+        defer global.deinit();
+        var terms = term_directory.Builder.init(ma, &reducer_scratch);
+        defer terms.deinit();
+        var scheduler: local.sql_parallel_scheduler.Scheduler = .{ .max_workers = if (mode == 5) 3 else 2, .max_io_workers = 1, .max_bytes = if (mode >= 5) 64 * 1024 * 1024 else 128 * 1024 * 1024, .max_pull_bytes = 128 * 1024 * 1024 };
+        // A related producer retains its CPU lane while waiting for this
+        // consumer. Lookahead must fit beside it or decline immediately.
+        var producer: local.sql_parallel_scheduler.Execution = .{ .scheduler = &scheduler, .bytes = 8 * 1024 * 1024 };
+        defer producer.pause();
+        if (mode >= 5 and mode < 7) try producer.enter(std.testing.io);
+        var execution: local.sql_parallel_scheduler.Execution = .{ .scheduler = &scheduler, .bytes = if (mode >= 5) 8 * 1024 * 1024 else 32 * 1024 * 1024 };
+        defer execution.pause();
+        var phase: stores.ExecutionIo = .{ .execution = &execution, .io = std.testing.io };
+        if (mode == 2 or mode >= 4) {
+            try execution.enter(std.testing.io);
+            store.io_phase = phase.capability();
+        }
+        defer store.io_phase = null;
+        var segments: std.ArrayList(artifacts.ChunkRef) = .empty;
+        var summaries: std.ArrayList(?statistics.Ref) = .empty;
+        var admissions: std.ArrayList(local.segment.SegmentReader.Admission) = .empty;
+        var compactor: Compactor = .{ .a = ma, .out = out, .store = &store, .segments = &segments, .summaries = &summaries, .admissions = &admissions, .cancellation = .none, .file_ordinal = 0, .io = std.testing.io, .capture_manager = &scratch, .output_manager = &output_scratch, .global = &global, .directory = &terms, .encoding_memory_bytes = if (mode != 0) 1 else 512 * 1024 };
+        defer compactor.deinit();
+        // Neither captured nor reader fallback publication may GET a summary
+        // it just wrote. Both reducers consume synchronous borrowed records.
+        store.vtable = &no_reads;
+        defer store.vtable = original_vtable;
+        if (mode == 4) {
+            no_reads.put_scoped = Check.failPut;
+            defer no_reads.put_scoped = original_vtable.put_scoped;
+            try std.testing.expectError(error.InjectedLakePublicationFailure, flushWithOptions(&compactor, .{ .docs = docs }, .{}, .{ .target_segment_bytes = 1, .target_build_memory_bytes = 32 * 1024 * 1024 }));
+            compactor.deinit();
+            try std.testing.expect(compactor.test_ahead_count > 0);
+            try std.testing.expectEqual(@as(u64, 0), scratch.live_bytes);
+            try std.testing.expectEqual(@as(usize, 0), scratch.files);
+            try std.testing.expectEqual(@as(u64, 0), output_scratch.live_bytes);
+            try std.testing.expectEqual(@as(usize, 0), output_scratch.files);
+            try std.testing.expectEqual(@as(usize, 0), scheduler.pull_workers);
+            try std.testing.expectEqual(@as(usize, 0), scheduler.pull_bytes);
+            try std.testing.expectEqual(@as(usize, 0), scheduler.io_workers);
+            continue;
+        }
+        if (mode == 7) {
+            const encoder = try ma.create(EncoderPipeline);
+            encoder.* = .{ .compactor = &compactor, .analysis = .{} };
+            compactor.encoder = encoder;
+            for (0..3) |batch_index| {
+                var input_arena = std.heap.ArenaAllocator.init(ma);
+                const ia = input_arena.allocator();
+                const copied = try ia.dupe(local.introducer.TextDocument, docs[batch_index * 3 ..][0..3]);
+                for (copied) |*doc| {
+                    doc.id = try ia.dupe(u8, doc.id);
+                    doc.stored_data = try ia.dupe(u8, doc.stored_data);
+                    const fields = try ia.dupe(local.introducer.TextField, doc.text_fields);
+                    for (fields) |*field| {
+                        field.field_name = try ia.dupe(u8, field.field_name);
+                        field.text = try ia.dupe(u8, field.text);
+                    }
+                    doc.text_fields = fields;
+                }
+                const bytes = input_arena.queryCapacity();
+                try std.testing.expect(scheduler.reservePull(0, bytes));
+                try encoder.enqueue(.{ .docs = copied }, .{ .arena = input_arena, .leases = .{}, .scheduler = &scheduler, .reservation = bytes }, .{ .target_segment_bytes = 1, .target_build_memory_bytes = 32 * 1024 * 1024 });
+            }
+            try compactor.finishEncoding();
+        } else try flushWithOptions(&compactor, .{ .docs = docs }, .{}, .{ .target_segment_bytes = 1, .target_build_memory_bytes = 32 * 1024 * 1024 });
+        try compactor.finish();
+        store.vtable = original_vtable;
+        try std.testing.expectEqual(@as(usize, 2), segments.items.len);
+        try std.testing.expectEqual(@as(usize, if (mode == 2 or mode == 5 or mode == 7) 9 else 0), compactor.test_ahead_count);
+        try std.testing.expectEqual(@as(u64, 0), scratch.live_bytes);
+        try std.testing.expectEqual(@as(usize, 0), scratch.files);
+        try std.testing.expectEqual(@as(u64, 0), output_scratch.live_bytes);
+        try std.testing.expectEqual(@as(usize, 0), output_scratch.files);
+        try std.testing.expectEqual(@as(usize, 0), scheduler.pull_bytes);
+        try std.testing.expectEqual(@as(usize, 0), scheduler.io_workers);
+        var reads: u64 = 64 * 1024 * 1024;
+        var writes: u64 = 64 * 1024 * 1024;
+        const scope = store.upload_scope.?;
+        var pages: @import("../serverless/graph_segment/page_store.zig").PageStore = .{ .domain = scope.domain, .attempt = scope.attempt, .artifacts = &store, .remaining_read_bytes = &reads, .remaining_write_bytes = &writes };
+        const df = try global.finish(pages.store(), null);
+        const term_roots = try terms.finish(pages.store(), .{});
+        if (mode == 0) {
+            expected_segments = segments.items;
+            expected_summaries = summaries.items;
+            expected_global = df;
+            expected_directory = term_roots;
+        } else {
+            try std.testing.expectEqualStrings(try std.json.Stringify.valueAlloc(out, expected_segments, .{}), try std.json.Stringify.valueAlloc(out, segments.items, .{}));
+            try std.testing.expect(std.meta.eql(expected_global, df));
+            try std.testing.expect(std.meta.eql(expected_directory, term_roots));
+            try std.testing.expectEqualSlices(?statistics.Ref, expected_summaries, summaries.items);
+        }
+    }
+}
+
+test "external lake canonical multi-pack publication keeps worker allocations outside result arena" {
+    const Probe = struct {
+        var active: *@This() = undefined;
+        backend: stores.ArtifactStore,
+        result_arena: *anyopaque,
+        current: std.atomic.Value(usize) = .init(0),
+        peak: std.atomic.Value(usize) = .init(0),
+        fn put(_: *anyopaque, a: A, scope: stores.UploadScope, bytes: []const u8, token: Cancellation) !stores.ArtifactMetadata {
+            const self = active;
+            if (bytes.len > 512 * 1024 and a.ptr == self.result_arena) return error.UnsafeConcurrentResultArena;
+            const count = self.current.fetchAdd(1, .acq_rel) + 1;
+            defer _ = self.current.fetchSub(1, .acq_rel);
+            _ = self.peak.fetchMax(count, .acq_rel);
+            try std.testing.io.sleep(.fromMilliseconds(3), .awake);
+            var backend = self.backend;
+            backend.allocator = a;
+            return backend.putScoped(scope, bytes, token);
+        }
+    };
+    const a = std.testing.allocator;
+    var temporary = try local.common_test_directory.TestDirectory.init("canonical-pack-allocator");
+    defer temporary.cleanup();
+    var fs = try @import("../serverless/artifacts/fs_store.zig").FsStore.init(a, temporary.path());
+    defer fs.deinit();
+    var store = fs.artifactStore();
+    store.upload_scope = try stores.UploadScope.forPublication(@splat(74), 1, std.testing.io);
+    var output = std.heap.ArenaAllocator.init(a);
+    defer output.deinit();
+    var probe: Probe = .{ .backend = store, .result_arena = output.allocator().ptr };
+    Probe.active = &probe;
+    var vtable = store.vtable.*;
+    vtable.put_scoped = Probe.put;
+    store.vtable = &vtable;
+    var scheduler: local.sql_parallel_scheduler.Scheduler = .{ .max_workers = 1, .max_io_workers = 3 };
+    var execution: local.sql_parallel_scheduler.Execution = .{ .scheduler = &scheduler, .bytes = 1024 };
+    try execution.enter(std.testing.io);
+    defer execution.pause();
+    var phase: stores.ExecutionIo = .{ .execution = &execution, .io = std.testing.io };
+    store.io_phase = phase.capability();
+    var budget = try @import("../serverless/build/lake_build_limits.zig").WorkingSetAllocator.init(a, .{ .max_working_set_bytes = 64 * 1024 * 1024 });
+    var locked: local.sql_parallel_scheduler.LockedAllocator = .{ .backing = budget.allocator() };
+    store.allocator = locked.allocator();
+    var writer = local.segment.SegmentWriter.init(a);
+    defer writer.deinit();
+    const payload = try a.alloc(u8, 3 * 1024 * 1024);
+    defer a.free(payload);
+    var random = std.Random.DefaultPrng.init(71);
+    random.random().bytes(payload);
+    try writer.addStoredDoc("row", payload);
+    const bytes = try writer.build();
+    defer a.free(bytes);
+    try std.testing.expect(bytes.len > 2 * 1024 * 1024);
+    var segments: std.ArrayList(artifacts.ChunkRef) = .empty;
+    var summaries: std.ArrayList(?statistics.Ref) = .empty;
+    var admissions: std.ArrayList(local.segment.SegmentReader.Admission) = .empty;
+    var compactor: Compactor = .{ .a = locked.allocator(), .out = output.allocator(), .store = &store, .segments = &segments, .summaries = &summaries, .admissions = &admissions, .cancellation = .none, .file_ordinal = 0, .io = std.testing.io };
+    defer compactor.deinit();
+    try compactor.publishSource(.{ .contiguous = bytes }, null);
+    try std.testing.expect(probe.peak.load(.acquire) > 1);
+    try std.testing.expectEqual(@as(usize, 1), segments.items.len);
+    try std.testing.expectEqual(@as(usize, 0), scheduler.io_workers);
+    try std.testing.expectEqual(@as(usize, 0), budget.live_bytes);
+}
+
+test "external lake text row deltas merge retained postings without reanalyzing old rows" {
+    for ([_]bool{ false, true }) |mixed| try rowDeltaMergeScenario(mixed, false, false);
+}
+test "external lake bounded posting overlays preserve exact scores mappings restart and closure" {
+    for ([_]bool{ false, true }) |remove| try rowDeltaMergeScenario(false, true, remove);
+}
+fn rowDeltaMergeScenario(mixed: bool, overlay_mode: bool, remove: bool) !void {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const out = arena.allocator();
+    var directory = try local.common_test_directory.TestDirectory.init("text-row-transition");
+    defer directory.cleanup();
+    var fs = try @import("../serverless/artifacts/fs_store.zig").FsStore.init(a, directory.path());
+    defer fs.deinit();
+    var store = fs.artifactStore();
+    store.upload_scope = try stores.UploadScope.forPublication(@import("lake_index_publication.zig").uploadDomain(4, @splat(7)), 1, std.testing.io);
+    var docs: [10]mapper.MapperDoc = undefined;
+    for (&docs, 0..) |*doc, row| doc.* = .{ .key = try std.fmt.allocPrint(out, "lake2:{s}:00000000:{x:0>16}", .{ std.fmt.bytesToHex(&@as([32]u8, @splat(9)), .lower), row }), .value = if (row == 3) "{\"body\":\"obsolete shared\"}" else "{\"body\":\"retained shared\"}" };
+    var mixed_docs: [12]mapper.MapperDoc = undefined;
+    @memcpy(mixed_docs[1..11], &docs);
+    for ([_]usize{ 0, 11 }, [_]u8{ 8, 10 }) |slot, digest| mixed_docs[slot] = .{ .key = try std.fmt.allocPrint(out, "lake2:{s}:00000000:0000000000000000", .{std.fmt.bytesToHex(&@as([32]u8, @splat(digest)), .lower)}), .value = "{\"body\":\"unrelated shared\"}" };
+    const bytes = (try mapper.buildTextSegmentFromDocuments(a, if (mixed) &mixed_docs else &docs, .{}, null)).?;
+    defer a.free(bytes);
+    var reader = try local.segment.SegmentReader.init(a, bytes);
+    defer reader.deinit();
+    const metadata = try reader.admission(out);
+    const saved = try @import("lake_index_seekable_text.zig").publish(a, out, &store, bytes, .none);
+    const group: FileGroup = .{ .file = .{ .id = "fragment", .digest = @splat(1), .key_digest = @splat(9) }, .segments = &.{.{ .artifact_id = saved.artifact_id, .checksum = saved.checksum, .byte_len = saved.byte_len }}, .admissions = &.{metadata}, .summaries = &.{null} };
+    const Check = struct {
+        fn check(_: *anyopaque) !void {}
+    };
+    var marker: u8 = 0;
+    var manager: local.sql_spill.Manager = .{ .alloc = a, .io = std.testing.io, .context = &marker, .checkpoint = Check.check, .async_writes = false };
+    defer manager.deinit();
+    var segments: std.ArrayList(artifacts.ChunkRef) = .empty;
+    var summaries: std.ArrayList(?statistics.Ref) = .empty;
+    var admissions: std.ArrayList(local.segment.SegmentReader.Admission) = .empty;
+    var compactor: Compactor = .{ .a = a, .out = out, .store = &store, .segments = &segments, .summaries = &summaries, .admissions = &admissions, .cancellation = .none, .file_ordinal = 0, .output_manager = &manager, .capture_manager = &manager, .io = std.testing.io, .row_patch = .{ .base = group, .rows = if (overlay_mode) &.{ 2, 3 } else &.{3}, .intervals = if (mixed) &.{&.{.{ .lower = 1, .count = 10 }}} else &.{} } };
+    defer compactor.deinit();
+    if (!remove or overlay_mode) {
+        const fresh = [_]mapper.MapperDoc{ docs[2], .{ .key = docs[3].key, .value = "{\"body\":\"replacement shared\"}" } };
+        const changed = (try mapper.buildTextSegmentFromDocuments(a, if (overlay_mode) fresh[0..(if (remove) @as(usize, 1) else 2)] else fresh[1..], .{}, null)).?;
+        try compactor.addOwned(.{ .payload = .{ .memory = changed } });
+    }
+    try std.testing.expectEqual(@as(usize, 0), segments.items.len);
+    const staged = (try compactor.mergeRows()).segment;
+    defer staged.release();
+    var merged = try local.segment.SegmentReader.initSource(a, staged.source());
+    defer merged.deinit();
+    try std.testing.expectEqual(@as(u32, if (remove) 9 else 10), merged.doc_count);
+    var position: u32 = 0;
+    for (docs, 0..) |doc, row| {
+        if (remove and row == 3) continue;
+        try std.testing.expectEqualStrings(doc.key, (try merged.storedDoc(position)).?.id);
+        position += 1;
+    }
+    var inverted = try local.section_inverted.ScopedInvertedIndexReader.initRanges(a, (try merged.sectionView("body", .inverted_text)).?, .{});
+    defer inverted.deinit();
+    try std.testing.expect((try inverted.lookup("obsolet")) == null);
+    try std.testing.expect((try inverted.lookup("unrel")) == null);
+    if (remove) try std.testing.expect((try inverted.lookup("replac")) == null) else try std.testing.expectEqual(@as(u32, 1), (try inverted.lookup("replac")).?.docFreq());
+    try std.testing.expectEqual(@as(u32, 9), (try inverted.lookup("retain")).?.docFreq());
+    try std.testing.expectEqual(@as(u32, if (remove) 9 else 10), (try inverted.lookup("shar")).?.docFreq());
+    if (overlay_mode) {
+        compactor.workspace_bytes = 1;
+        try std.testing.expect((try compactor.publishRowOverlay(group.file)) == null);
+        try std.testing.expectEqual(@as(usize, 0), segments.items.len);
+        compactor.workspace_bytes = 64 * 1024 * 1024;
+        store.upload_scope = try stores.UploadScope.forPublication(store.upload_scope.?.domain, 2, std.testing.io);
+        const overlay = (try compactor.publishRowOverlay(group.file)).?;
+        try std.testing.expectEqual(@as(usize, 2), segments.items.len);
+        try std.testing.expectEqualStrings(saved.artifact_id, segments.items[0].artifact_id);
+        try std.testing.expectEqual(@as(u32, if (remove) 9 else 10), overlay.collection.documents);
+        var positions = physical.Builder.init(a, out, &store, .none);
+        defer positions.deinit();
+        for (overlay.rows) |row| try positions.add(0, row);
+        try positions.flush();
+        var canonical: FileGroup = .{ .file = group.file, .segments = segments.items, .admissions = admissions.items, .summaries = summaries.items, .rows = positions.blocks.items, .parts = overlay.parts, .live_collection = overlay.collection };
+        try text_directory.prepare(out, &store, &canonical, .none);
+        try canonical.validate(store.upload_scope.?.domain);
+        var reads: u64 = 16 * 1024 * 1024;
+        var writes: u64 = reads;
+        var pages: @import("../serverless/graph_segment/page_store.zig").PageStore = .{ .domain = store.upload_scope.?.domain, .attempt = store.upload_scope.?.attempt, .artifacts = &store, .remaining_read_bytes = &reads, .remaining_write_bytes = &writes };
+        var df = statistics.Builder.init(a, &manager);
+        defer df.deinit();
+        for (summaries.items) |ref_| try df.add(pages.store(), ref_, 1);
+        const template: Root = .{ .domain = store.upload_scope.?.domain, .config_json = "{\"type\":\"full_text\",\"field\":\"body\"}", .binding = .{ .sidecar_kind = .text, .source_kind = .external_parquet, .row_ref_kind = .external, .source_id = "source", .snapshot_id = "snapshot", .schema_fingerprint = "schema", .index_config_hash = "text", .column_bindings = &.{"body"} }, .collection = overlay.collection, .seekable = true, .inventory_version = 3, .admission_version = 1, .statistics_version = 2, .term_statistics = try df.finish(pages.store(), null) };
+        const canonical_ref = try publishFileManifest(a, out, &store, canonical, .none);
+        var plan: state.Plan = .{ .a = a };
+        defer plan.deinit();
+        const serving = try @import("lake_index_serving_compaction.zig").publishDelta(a, out, &store, template, null, .{ .removed = &.{}, .added = &.{.{ .file = canonical.file, .manifest = canonical_ref }} }, &plan, .{ .io = std.testing.io }, .none);
+        const ref_: Ref = .{ .kind = .text_segment, .name = "text", .metadata_version = metadata_version, .artifact_id = serving.artifact_id, .checksum = serving.checksum, .byte_len = serving.byte_len };
+        const root = try loadRootDirectory(out, store, ref_, .none, null);
+        try std.testing.expectEqual(@as(u32, if (remove) 11 else 12), root.physical_documents.?);
+        try std.testing.expectEqual(@as(u32, 2), root.segment_count);
+        var expected = try local.index.IndexWriter.init(a);
+        defer expected.deinit();
+        const merged_bytes = try a.alloc(u8, staged.source().len());
+        try staged.source().readInto(0, merged_bytes);
+        try expected.addSegmentWithIdOwned(1, merged_bytes);
+        for (0..2) |pass| {
+            if (pass != 0) {
+                fs.deinit();
+                fs = try @import("../serverless/artifacts/fs_store.zig").FsStore.initExisting(a, directory.path());
+                store = fs.artifactStore();
+            }
+            var cache: @import("lake_index_native_text_cache.zig").Cache = .{};
+            defer cache.deinit();
+            var ranges = local.serverless_query_lake_serving_cache.Cache.init(a);
+            defer ranges.deinit();
+            var pin = try cache.acquire(std.testing.io, store, ref_, root, "{\"version\":1}", .{ .cache = &ranges, .scope = @splat(7), .context = .{ .io = std.testing.io } }, .{ .io = std.testing.io }, .none);
+            defer pin.deinit();
+            try std.testing.expectEqual(@as(u32, 0), try pin.snapshot.termDocFreq(a, "body", "obsolet"));
+            const predicates = @import("lake_index_text_predicate.zig");
+            const identities: *const predicates.Identities = @ptrCast(@alignCast(pin.provider_metadata.?));
+            var live: predicates.LiveRowsCache = .{};
+            defer live.deinit(a);
+            for ([_][]const u8{ "obsolet", "retain", "replac", "shar" }) |term| {
+                const result = try pin.snapshot.search(a, "body", &.{term}, 20);
+                defer a.free(result.hits);
+                const oracle = try expected.snapshot().search(a, "body", &.{term}, 20);
+                defer a.free(oracle.hits);
+                try std.testing.expectEqual(oracle.total_count, result.total_count);
+                try std.testing.expectEqual(oracle.hits.len, result.hits.len);
+                for (result.hits) |hit| {
+                    const id = (try pin.snapshot.storedDoc(hit.doc_id)).?.id;
+                    const physical_row = try identities.physicalRow(a, &live, store, .{ .cache = &ranges, .scope = @splat(7), .context = .{ .io = std.testing.io } }, hit.doc_id, "source", "snapshot");
+                    try std.testing.expectEqual((try state.coordinates(id)).row, physical_row.external.row_ordinal);
+                    var found = false;
+                    for (oracle.hits) |original| {
+                        if (!std.mem.eql(u8, id, (try expected.snapshot().storedDoc(original.doc_id)).?.id)) continue;
+                        try std.testing.expectApproxEqAbs(original.score, hit.score, 0.00001);
+                        found = true;
+                        break;
+                    }
+                    try std.testing.expect(found);
+                }
+            }
+        }
+        var collector: @import("lake_index_gc.zig").Collector = .{ .a = out, .table = 4, .authority = undefined, .store = store, .identity = @splat(7), .context = .{}, .token = @splat(1), .audit_only = true, .remaining_reads = 64 * 1024 * 1024 };
+        try collector.markArtifact(out, ref_);
+        try std.testing.expect(collector.marked.contains(saved.artifact_id));
+        store.upload_scope = try stores.UploadScope.forPublication(root.domain, 3, std.testing.io);
+        var next_segments: std.ArrayList(artifacts.ChunkRef) = .empty;
+        var next_summaries: std.ArrayList(?statistics.Ref) = .empty;
+        var next_admissions: std.ArrayList(local.segment.SegmentReader.Admission) = .empty;
+        var next: Compactor = .{ .a = a, .out = out, .store = &store, .segments = &next_segments, .summaries = &next_summaries, .admissions = &next_admissions, .cancellation = .none, .file_ordinal = 0, .output_manager = &manager, .capture_manager = &manager, .io = std.testing.io };
+        defer next.deinit();
+        try next.prepareServingPatch(root, canonical, &.{5});
+        try std.testing.expect(next.row_patch != null);
+        try std.testing.expect((try next.publishRowOverlay(canonical.file)) == null);
+        const updated = (try mapper.buildTextSegmentFromDocuments(a, &.{.{ .key = docs[5].key, .value = "{\"body\":\"later shared\"}" }}, .{}, null)).?;
+        try next.addOwned(.{ .payload = .{ .memory = updated } });
+        const compacted = (try next.mergeRows()).segment;
+        defer compacted.release();
+        var compacted_reader = try local.segment.SegmentReader.initSource(a, compacted.source());
+        defer compacted_reader.deinit();
+        try std.testing.expectEqual(merged.doc_count, compacted_reader.doc_count);
+        var compacted_terms = try local.section_inverted.ScopedInvertedIndexReader.initRanges(a, (try compacted_reader.sectionView("body", .inverted_text)).?, .{});
+        defer compacted_terms.deinit();
+        try std.testing.expectEqual(@as(u32, 1), (try compacted_terms.lookup("later")).?.docFreq());
+        try std.testing.expectEqual(@as(u32, 8), (try compacted_terms.lookup("retain")).?.docFreq());
+        return;
+    }
+    // Required fallback can still rebuild the whole fragment after a bounded
+    // optional merge decline, without publishing partial statistics/postings.
+    compactor.workspace_bytes = 1;
+    try std.testing.expect((try compactor.mergeRows()) == .declined);
+    try std.testing.expectEqual(@as(usize, 0), segments.items.len);
 }

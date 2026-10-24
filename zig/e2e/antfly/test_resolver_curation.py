@@ -58,6 +58,28 @@ def test_entity_curation_namespace_wait_and_resolver_routes(stateful_api):
     }
     for source in sources:
         api.create_table(source, indexes={"knowledge": graph})
+    # Generated query adapters must reach the shared pagination/filter parser
+    # through both table aliases, without changing resolver policy revisions.
+    proposals = f"/tables/{destination}/curation/proposals"
+    proposed = {
+        api.post(proposals, {"action": "suppress", "key": key})["id"]
+        for key in ("concept/proposed-one", "concept/proposed-two")
+    }
+    for path in (proposals, f"/databases/default/namespaces/public{proposals}"):
+        query = "?state=open&action=suppress&limit=1"
+        first = api.get(path + query)
+        assert len(first["proposals"]) == 1, first
+        assert first.get("next_cursor"), first
+        second = api.get(path + query + "&cursor=" + first["next_cursor"])
+        assert len(second["proposals"]) == 1, second
+        assert not second.get("next_cursor"), second
+        assert {first["proposals"][0]["id"], second["proposals"][0]["id"]} == proposed
+        assert api.get(path + "?state=rejected&limit=1")["proposals"] == []
+        assert api.get(path + "?state=open&action=merge&limit=1")["proposals"] == []
+    # Main also checks a single open proposal later in this flow. Close these
+    # pagination fixtures so both checks own their expected proposal set.
+    for proposal_id in proposed:
+        api.post(f"{proposals}/{proposal_id}:reject", {})
     key = quote("concept/alpha", safe="")
     entity = f"/tables/{destination}/entities/{key}"
     wait = {"timeout_ms": 5000}

@@ -110,7 +110,53 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
     const ca = arena.allocator();
-    const definitions = (try parsed.relationalIndexDefinitions(ca)).?;
+    const all_definitions = (try parsed.relationalIndexDefinitions(ca)).?;
+    var selected_definitions: std.ArrayList(local.storage_relational_index.RelationalIndexDefinition) = .empty;
+    for (all_definitions) |definition| if (provider.wantsIndex(try logicalName(ca, definition.name))) try selected_definitions.append(ca, definition);
+    const definitions = selected_definitions.items;
+    if (definitions.len == 0) return &.{};
+    // Input cohorts share coordinates and replay, but own distinct authenticated
+    // file versions. Keep the ordered fast paths within one such census.
+    if (provider.fragment_views.len != 0) {
+        var built: std.ArrayList(Declared) = .empty;
+        errdefer built.deinit(out);
+        var handled: std.StringHashMapUnmanaged(void) = .empty;
+        defer handled.deinit(a);
+        for (definitions) |definition| {
+            const name = try logicalName(ca, definition.name);
+            if (handled.contains(name)) continue;
+            var selected_source = source.*;
+            var selected = provider.forIndex(&selected_source, name);
+            const selected_files = selected_source.inventory.files.ptr;
+            var skips: std.ArrayList([]const u8) = .empty;
+            try skips.appendSlice(ca, provider.skip_indexes);
+            for (definitions) |candidate| {
+                const candidate_name = try logicalName(ca, candidate.name);
+                var candidate_source = source.*;
+                _ = provider.forIndex(&candidate_source, candidate_name);
+                if (candidate_source.inventory.files.ptr == selected_files) {
+                    try handled.put(a, candidate_name, {});
+                } else try skips.append(ca, candidate_name);
+            }
+            selected.skip_indexes = skips.items;
+            selected.fragment_views = &.{};
+            const original_cut = if (selected.resume_work) |work| work.source_cut else null;
+            defer if (selected.resume_work) |work| {
+                work.source_cut = original_cut;
+            };
+            if (original_cut != null) if (selected.resume_work) |work| for (provider.fragment_views) |view| {
+                if (std.mem.eql(u8, view.name, name)) {
+                    work.source_cut = view.delta.source_cut;
+                    break;
+                }
+            };
+            const cohort = try buildIncremental(a, out, table, &selected_source, store, &selected, cancellation, reusable, candidates);
+            defer out.free(cohort);
+            try built.appendSlice(out, cohort);
+            provider.ordered_delta_plans = selected.ordered_delta_plans;
+        }
+        return built.toOwnedSlice(out);
+    }
     const schema = try local.schema_mod.deriveRuntimeTableSchema(a, parsed);
     defer local.storage_schema.freeSchema(a, schema);
     var layout = try local.storage_db_algebraic_relational_row_codec.PhysicalLayout.init(a, schema);

@@ -3212,3 +3212,626 @@ the 65,536-row statless repeated-predicate case. The stripped Debug server build
 with Zig 0.17.0; formatting, license/boundary and generated-catalogue checks pass.
 The final full lake run passes 231 shared and 381 native cases with zero leaks,
 including the unchanged 16 KiB compact-reader retention test.
+
+### Bounded native publication transport
+
+Native chunk capture and immutable tree publication share one ordered upload
+primitive. The owner lends at most eight payloads until the group drains; the
+publication capability supplies the executor and caps each wave by shared I/O
+admission. Children borrow a store copy without the serial execution callback.
+Results transfer in input order only after every child finishes, cancellation is
+checked, and CPU admission resumes. Failure at any of these boundaries releases
+all returned metadata, including provider version strings. An unsuccessful wave
+leaves only attempt-private objects, covered by the existing publication fencing
+and reader-safe GC. It cannot publish a partially completed generation.
+
+Physical native files read at most eight 256 KiB chunks per wave, limited by
+known allocator headroom with space for arena capacity overhead. Inline and
+opaque-allocator paths retain a single captured chunk. Byte-backed control files
+borrow their existing immutable buffers. Retained full prefixes
+and equal content keep their original object identities and consume no new
+upload budget. Logical generation size and new physical work retain their
+independent limits. The serial fallback uses the same writer and result order.
+
+Construction opts into page transport through `Access.initPublication` or
+`PageStore.admitPublication`. Aggregate state trees, key indexes, native file
+and chunk maps, and ordered-index dictionaries use this explicit capability.
+The operation-local page cache preserves `put_many`, so a reducer's sorted
+builder can actually batch its immutable leaf writes through the shared
+uploader. Routing dependencies still persist before a durable root is adopted.
+
+Synchronous publication tree reads release CPU admission while waiting on
+storage and restore it before page integrity checks, decoding, or reducer work.
+The decoded navigation cache carries this capability only in the active
+publication's access bridge; cached pages contain no execution pointer. Cache
+hits in the local page cache keep CPU admission. Serving and asynchronous
+prefetch readers retain their own authority and scheduling, with no publication
+callback installed on a shared backend. A failed read restores CPU admission
+before recoverable error handling; canceled resumption frees fetched buffers and
+ends the operation without retaining an I/O permit.
+
+These are automatic transport improvements with no new user options or persisted
+format changes. Validation distinguishes deterministic concurrency/work bounds
+from archive or cloud latency claims. The native chunk test covers both byte and
+physical-file publishers, ordered payload identities, exhausted upload budgets
+on unchanged refresh, required inline execution, and injected partial upload
+failure. Page-store checks cover batch forwarding through the cache, failed and
+canceled resumption, and a competing CPU operator running during a page read.
+
+Physical capture recognizes the build working-set allocator through synchronized
+worker wrappers, as well as SQL budgets. Its width follows current headroom:
+the production-allocator regression admits three chunks with 8 MiB available,
+then two with only 1 MiB available, and measures physical-file upload overlap
+independently from byte-backed publication. Unknown allocator chains and required
+inline execution retain the single-chunk fallback.
+
+The initial ordered reverse tree, per-segment text summaries, durable document
+frequency and term-directory deltas, and text file/segment/routing directories
+also opt into publication transport. Their synchronous page reads park the
+owning execution; sorted page writes use bounded batches. Serving readers keep
+their independent scheduling. An adapter integration test exercises reverse
+coordinates, thousands of text terms, equivalent direct/manifest/checkpoint file
+directories, and incremental deletion with one CPU lane and three I/O slots.
+It checks batching, exact retained counts, CPU availability during page reads,
+and release of every I/O slot before the owner returns.
+
+Text publication streams each changed or removed file manifest through collection
+statistics, term-directory deltas, and file/segment/routing directory reducers in
+one decode pass. The operation-owned directory publisher copies records into its
+bounded sorts before the manifest arena is reset. It retains no archive-sized
+list of decoded groups. Its spill manager and sort buffers retire before serving
+compaction begins; any failure leaves only private objects and the old published
+root remains usable. Direct groups, streamed manifests, and checkpoint inventories
+share the same directory construction code and immutable page identities.
+
+Manifest and source-span transport explicitly borrow publication I/O admission.
+Verified bytes transfer only after CPU resumption; parsing and reducer work run
+with CPU admission restored. Failed reads restore CPU before error handling, and
+canceled resumption frees the fetched buffer. Serving and asynchronous paths keep
+their existing ownership. The regression reads 256 manifests exactly once across
+the shared consumers, resets the decode arena after each group, checks equivalent
+directory identities, and covers separately paged source spans and failed reads.
+
+Seekable text data packs also use the bounded ordered uploader. Each wave borrows
+up to eight existing 1 MiB segment slices, capped by the worker's I/O capability
+and known allocator headroom for provider staging. Unknown allocator chains and
+required inline execution keep width one. Descriptor construction stays serial
+after all children drain and CPU resumes; the directory/root is uploaded only
+after its referenced packs succeed. A 13-pack regression observes three uploads
+in flight with three I/O slots, preserves the serial directory identity, reads
+across every pack boundary, and drains an injected partial-wave failure. These
+are deterministic request/concurrency bounds, without a cloud latency claim.
+
+### Compaction admission, manifest read-ahead, and typed text projection
+
+Serving compaction now explicitly opts its ownership, term, source-route and tie
+reducers into publication page I/O. Canonical inventories, retained serving roots,
+checkpoint bases, file manifests and separately paged spans use synchronous
+publication reads. These operations park the CPU lane while transport waits and
+resume before metadata decoding or reduction. Batched sorted tree writes retain
+the existing dependency and publication order.
+
+Canonical metadata construction, directory reconstruction and added compaction
+inputs can prefetch one verified manifest while the current group is reduced.
+The child has independent shared I/O admission and no serial publication callback.
+Only wire bytes cross the task boundary; the decode arena remains owner-local.
+Prefetch requires known working-set headroom, is bounded by the existing 4 MiB
+manifest limit, and declines under scheduler or memory pressure. Joining parks the
+owner, restores CPU admission before decoding, and drains cancellation/errors
+before releasing reference strings or buffers. Required inline reads remain the
+fallback. This introduces no archive-sized queue or persistent cache state.
+
+Text projection binds native vectors once per input batch. Selected-field indexes
+consume values directly, including arrays, dictionary strings and nulls, through
+the shared text field/provenance rules. General schema extraction continues to use
+the same mapper. Immutable column leases allow text values to borrow producer
+payloads until segment encoding; retained leases are bounded by eight owners and
+8 MiB, and are released on flush or unwind. Encoded/non-retainable producers copy
+values, and stored-source projections retain their owned tree. No producer view
+survives without a lease, and scalar/vector, analyzer, typed-value and highlight
+behavior remain identical. These changes preserve existing artifact formats and
+require no new public configuration. Archive/cloud throughput still needs the
+controlled qualification described above.
+
+### Compaction posting transport and streamed serving metadata
+
+Compaction owns a dedicated seekable-source read capability for its lifetime.
+Required directory, navigation-bundle and posting-range transport parks its CPU
+execution and restores it before serial decoding continues. Broad reads reserve
+bounded waves of at most four 1 MiB slices, further capped by the publication's
+I/O width and known working-set headroom. Provider scratch is charged to the
+compaction allocator; opaque quotas retain one slice per wave. Children use raw
+transport under the parent's reservation, without
+nested scheduler admission; single-slot execution uses the required serial path.
+Backend failures drain every child and restore admission before returning.
+Serving readers and their speculative workers retain independent capabilities.
+Publication selection belongs to the private source owner; the shared `Read`
+layout stays unchanged. The retained-reader regression still admits twelve
+serving sources under its original 16 KiB heap budget while directory leases
+evict independently and pinned readers remain usable.
+
+Emitted serving groups feed bounded file/segment/routing reducers directly,
+alongside ownership, source-route, tie and term reducers. Separate deletion and
+addition streams apply removals first even when lazy tier activation discovers a
+removal after another pack has been emitted. Each stream uses three bounded sorts
+with durable spill runs; decoded groups and source spans are consumed before
+merge arenas reset. Publication no longer retains a list of all added/removed
+manifest references for reconstruction, nor fetches fresh serving manifests or
+their span pages to rebuild those directories. Missing legacy tie/source-route
+navigation bootstraps from the old inventory before changes; fresh packs supply
+navigation as they are emitted. No persistent artifact format changes.
+
+Manifest read-ahead remains optional after scheduling as well as before it. If a
+child loses its allocation headroom to the active reducer, its failed task is
+joined and retired, CPU admission resumes, cancellation is checked, and a
+required synchronous read retries. Integrity and provider failures remain fatal.
+The pressure regression exhausts a real working-set quota while prefetch waits,
+releases the reducer memory, and verifies successful required publication with
+no retained buffers or reservations. Transport overlap and absence of redundant
+fresh-manifest GETs are deterministic contracts; archive/cloud latency and the
+write cost of the two directory phases still require controlled measurement.
+
+
+### Local compaction intermediates, metadata replay, and optional-memory isolation
+
+Intermediate serving tiers now use operation-private SQL spill files instead of
+uploading segments and summaries that a later tier immediately reads and merges.
+Only final packs produce seekable artifacts and term summaries. Private inputs
+carry explicit retained file ownership, and range readers borrow that ownership
+until the merge drains. The existing four tiers and eight-input fan-in bound
+resident descriptors and open files; a separate 128 MiB spill quota bounds their
+live payloads, including one streamed output alongside retained tier inputs. Files are unlinked on creation and closed on success, allocation
+failure, backend error, or cancellation. Local range reads and writes use the
+publication I/O capability, and each tier releases its merge workspace before
+opening the next. Final roots retain ordinary durable references only; restart
+and fenced publication continue through the canonical durable maintenance state.
+
+Canonical metadata reducers write a sequential, authenticated local replay while
+they decode changed manifests. Serving compaction consumes that replay directly,
+including expanded source spans. It retains no per-file memory index. The replay
+has a 128 MiB disk quota and checks source identity, frame size, payload checksum,
+and decoded group validity. If that optional cache fills, its complete prefix
+remains usable and subsequent files use authenticated artifact reads. This avoids
+repeated remote metadata transport for the cached prefix without requiring an
+archive-sized memory queue or unbounded disk. Replay files share the normal
+private spill lifecycle and never become publication dependencies. Optional
+cache-write failures discard any partial replay and retain the ordinary artifact
+path; replay decode OOM releases partial allocations and cached buffers before
+retrying the required paged manifest path. Cancellation and integrity failures
+remain explicit errors.
+
+Serving file, segment, and routing updates now use three bounded mutation sorts
+and one update of each prior root. Their private delta runs explicitly prefer
+additions over removals, including when lazy tier activation discovers a removal
+later. Equal-priority writes retain chronological order. This replaces the two
+separate deletion/addition directory applications and preserves existing durable
+page values and lookup semantics.
+
+Optional manifest prefetch no longer borrows the required reducer's working-set
+quota. It reserves its own bounded retained bytes through node-level admission
+before launching a transient I/O task. That reservation survives task completion
+until the result is consumed or canceled; a separate allocator enforces the same
+byte bound, and completed results retain no I/O slot. Required reducer work may
+use its full already-admitted quota while prefetch is running or complete. Node
+memory saturation declines prefetch, and optional allocation failures still fall
+back to required authenticated reads. This supersedes the earlier shared-quota
+prefetch pressure behavior described above.
+
+Deterministic regressions cover successful and in-flight prefetch under a fully
+used required quota, retained node-reservation release, optional OOM fallback,
+replay identity/integrity and quota fallback, and interleaved additions/removals
+across private durable runs. The 128-file cross-file compaction case publishes one
+final seekable segment and reads zero canonical manifests through the provider
+when supplied its local replay; coordinate, rank, restart, append, replacement,
+and removal checks remain in that same test. Allocation fault injection checks
+private segment file/allocator cleanup. These contracts establish work reduction;
+cloud latency and identical full-archive throughput remain qualification work.
+
+
+### Streamed compaction, local metadata forests, and producer handoff
+
+Both canonical per-file merges and cross-file serving merges now write through
+one buffered native segment sink backed by an unlinked, quota-accounted spill
+file. The sink supports random table patches and bounded checksum reads; the
+existing segment writer tracks append checksums and rereads only patched pages.
+Its append buffer is 16 KiB. Outputs retain the 32 MiB serving format limit, but
+no complete encoded output is allocated in memory. Final publication captures
+at most one admitted wave of 1 MiB packs from an immutable source. Navigation
+bundles remain capped at 1 MiB, and admission and term summaries read the same
+local source. Per-tier workspaces are released before promoting a staged file.
+The global 128 MiB spill quota accommodates retained small tier inputs plus one
+bounded output. Canonical merge spill has its own 32 MiB limit. Required inline
+and opaque allocator chains use one capture; optional batching never substitutes
+a permissive SQL-only estimate for unknown backing or external admission limits.
+
+Operation-private file, segment, routing, ownership, source-route, tie-bound, and
+checkpoint-file mutation forests now write their intermediate pages to local
+spill, then stream final records into the durable destination. Each forest has a
+fixed 4096-bucket directory (32 KiB) and one spill file; collision links and page
+payloads live on disk rather than in a growing heap map. Page authentication,
+namespace domains, attempts, cancellation, and spill quotas still apply. Local
+I/O borrows publication admission when available. Final tree construction uses
+ordinary artifact references; private references cannot escape through leaf
+record copying. Durable DF/statistics delta forests remain cloud-backed because
+their authenticated closure is required to resume a checkpoint. Local mutation
+files and all their buffers are reclaimed at operation teardown.
+
+Canonical file production now hands fresh manifest bytes to the operation-local
+metadata cache before releasing the file arena. Ordinary fresh groups reuse the
+JSON already serialized for publication; normalized paged groups retain their
+expanded spans. Both canonical metadata reduction and serving compaction read
+this handoff, eliminating the first fresh-manifest GET as well as the later one.
+The cache retains its 128 MiB disk bound and adds a fixed 4096-bucket directory;
+it supports repeated, unordered consumers without a per-file heap map. Reused
+checkpoint groups, cache capacity misses, and optional allocation failures use
+the authenticated artifact path. An OOM retires partial decode state before the
+required retry. Cancellation and integrity failures remain fatal. The cache is
+private to the attempt and does not change checkpoint or publication formats.
+
+Regression contracts include serial success through a 512 KiB opaque backing
+wrapped by a larger SQL budget, zero provider writes/reads during private
+metadata-run construction, rejection of fresh-manifest GETs during real Parquet
+file-first publication, repeated unordered cache consumers, and identical pack
+identities for contiguous and bounded range sources. A 4 MiB sink output is
+constructed with a 128 KiB allocator limit; native memory/file sink bytes are
+identical, including patched tables and checksums. Cross-file tests continue to
+cover coordinates, ranking ties, restart, append/replacement/removal, exact root
+identity after cache OOM, and allocation-failure cleanup. These are deterministic
+work/memory contracts; full-archive and cloud-provider latency remain unmeasured.
+
+### Reclaimable runs, owned encoder output, and write-time summaries
+
+Private metadata forests now assign each newly built immutable tree a local run
+namespace. Forest publication commits its new roots before retiring consumed
+inputs and intermediate carries. The remaining runs share one anonymous SQL
+spill file through reusable 64 KiB extents, including quota accounting and
+cancellation-safe close. Each run has a growing disk hash index with power-of-two
+capacity and at most half occupancy; at most 32 committed runs and 64 transient
+descriptors exist per forest. Closing a run releases its
+buffers and reuses its extents, trimming free tail extents when possible. This
+replaces cumulative merge-history retention without raising the disk quota or
+making checkpointed DF forests private. Local attempt tokens never escape:
+final metadata is rebuilt with the durable destination's attempt and domain.
+
+Text encoding now sends each bounded projection chunk to a synchronous consumer.
+The native producer transfers its encoded buffer directly into the compactor;
+it does not materialize an array of all chunk outputs or duplicate each payload
+on handoff. The compatibility collection API uses the same splitting policy.
+Ownership transfers on every result, including cancellation and failed flushes.
+
+Native initial writers and segment mergers emit term frequency and the same
+encoded scoring-bound metadata through a synchronous observer. Wrapping sinks
+forward the observer and bind the current field; the observer never changes
+segment bytes. Compact binary frames retain native term order within each field; only the small
+field directory is sorted into publication order. A 16 KiB append buffer and
+64 KiB replay buffer bound I/O transitions without per-term JSON or sorting.
+Compaction retains these private summaries with staged outputs across tier
+promotion, uploads summaries only for final packs, and releases summaries with
+their segment owner. An unchanged single-input section still uses compressed
+copying and observes its existing term navigation. Legacy segments can use the
+reader-based summary path. Final summary publication no longer traverses the
+newly written segment's dictionary or reads its scoring-bound pages again.
+
+Global DF accumulation no longer forces a remote delta after every small file.
+It keeps the existing record/disk pressure thresholds and flushes before saving
+a completed-file checkpoint or finishing the build. Checkpoint file inventory
+and durable DF roots still advance together; an interrupted unsaved batch is
+rebuilt from the preceding checkpoint. This reduces tiny immutable trees and
+binary merge traffic for archives of small files without weakening recovery.
+
+The regression contracts cover retained-run quota reuse, full record replay,
+allocation cleanup, encoded-segment ownership, and summary-root/segment-byte
+parity against the reader path for initial construction and deletion merges.
+Provider latency and archive throughput still require controlled measurement.
+
+### Direct summary contributions and bounded encoder overlap
+
+Fresh canonical summaries now feed document-frequency and term-directory
+reducers synchronously as their immutable summary tree is built. Cross-file
+serving compaction uses the same handoff for its final term-directory entries.
+The reducers copy each borrowed record into their existing bounded sort state;
+no archive-sized summary inventory is retained. Completed canonical files are
+marked in an operation-local bitset so subsequent manifest reduction does not
+add their contributions twice. Recovered checkpoint files have no such mark
+and rebuild directory contributions from their authenticated durable summaries.
+DF checkpoint roots and completed-file inventory still advance atomically.
+Summary references and the durable publication closure remain unchanged.
+
+Summary capture is optional acceleration. Allocation or scratch-quota denial
+closes partial capture, releases its quota, and lets the native writer finish.
+Final publication then derives identical records from the completed native
+reader, feeding both reducers through the same synchronous interface. Integrity,
+cancellation, and backend I/O failures remain errors. Cross-file merge scratch
+exhaustion also splits the candidate cohort, eventually reusing unmodified
+remote inputs when necessary; it does not raise the 128 MiB serving scratch
+limit. Required deletion rewrites still enforce ordinary resource limits.
+
+Initial encoding uses an adaptive seekable sink: outputs start in memory and
+migrate their prefix once to private spill when their length exceeds 512 KiB.
+Small chunks retain the direct owned-buffer handoff; large chunks retain a
+file-backed owner through compaction and publication. Patches and checksums use
+the same native sink contract, and segment bytes are identical in either mode.
+Required output and optional summaries have independent pools within the existing
+1 GiB per-file scratch allowance (768 MiB and 256 MiB). Cross-file serving
+compaction similarly divides its 128 MiB allowance into 96 MiB of payload and
+32 MiB of optional summaries. Retained summaries cannot exhaust required output
+space; exhausted summary pools use the reader fallback.
+
+One independently admitted encoder can prepare the next chunk while the serial
+owner builds the next projection batch, merges, or publishes the preceding chunk.
+Admission requires known construction headroom, a separate 48 MiB node retained
+reservation, and a scheduler with more than one CPU worker. The encoder has a
+32 MiB private workspace budget and its own CPU/I/O phase bridge. CPU admission
+uses the publication workers' 8 MiB scheduling allowance and is tried atomically
+before launch; saturated CPU/slot admission stays inline rather than queueing
+behind a related producer. The separate retained reservation covers encoder
+workspace/output memory. Joining parks
+the owner's CPU execution without reserving an I/O slot, so a child can finish
+scratch writes even with one configured I/O lane. The owner adopts outputs in
+input order and replaces child-local capabilities before releasing the child.
+Failure/cancellation drains the child before any borrowed projection columns or
+spill manager retire. Unavailable admission stays serial; speculative encoder
+OOM retries the required encode after its workspace is released. This bounded
+lookahead transfers an owned projection arena and its immutable column leases
+across batch boundaries. Its actual retained capacity has a separate scheduler
+reservation. Each next batch joins the previous encoder before adoption, keeping
+the queue bounded to one input and one encoded output.
+
+Regression coverage compares native artifacts, summary roots, global DF and
+term-directory roots across memory, spill, lookahead and capture-quota fallback.
+Fresh-summary GETs are rejected during that publication test. It also injects a
+publication failure with encoding in flight and checks scratch files and node
+reservations are released. Cross-file tests retain every row and ranking tie
+under a one-byte staging quota, and a prefix-heavy dictionary reproduces summary
+scratch pressure while proving the fitting merged segment remains byte-identical.
+These are work, identity and resource contracts; they do not establish an archive
+throughput or live object-provider latency improvement.
+
+
+### Growing private indexes, compressed summaries, and pack read-ahead
+
+Private page runs replace fixed-bucket collision chains with a separately
+spill-accounted open-addressed index. Slots contain the immutable page digest
+and its payload offset. Capacity doubles before exceeding half occupancy;
+rehashing streams bounded slots through the shared extent pool and commits the
+replacement before releasing the old index. Duplicate digests do not append
+another payload. The regression replays 8,192 pages in fewer than four probes
+per page and checks allocation failures, corrupted references, and quota release.
+
+Captured per-field term summaries use a ten-byte frame header with prefix and
+suffix lengths, resetting compression at field boundaries and every 64 terms.
+This only changes private capture; segment bytes and durable summary roots stay
+identical. An 8,192-term prefix-heavy case retains under 64 bytes per term,
+including headers and summaries. Required segment output and optional summary
+capture keep independent quotas, even when compression makes capture fit where
+it previously exhausted its allowance.
+
+Local spill-backed publication can read one next pack wave while uploading the
+current wave. Reads use independent scheduler I/O admission, retained-byte
+reservations, and a raw local-file reader that never borrows the parent's I/O
+phase. Uploads leave one lane for read-ahead. One-lane configurations, opaque
+headroom and saturated admission use the serial path. Join parks CPU without
+reserving I/O; error and cancellation drain the reader before releasing its
+buffer or source file. Remote providers retain their ordinary authenticated
+read path. Pack ordering, directory identity and durable closure are unchanged.
+
+### Remote access costing and typed covering result delivery
+
+Predicate and ordered-path comparisons now include projected request fan-out,
+authenticated tree traversal, bytes, and per-candidate decode work. Duplicate
+bounds on one field do not count as separate projected column reads. Small-file
+archives therefore incur request work even when their total byte size is small.
+These are relative planner units, not calibrated network-latency predictions.
+Exact predicates, read budgets, snapshot validation and final limits remain the
+execution authority.
+
+Ranked search result delivery can gather requested fields from a complete
+relational covering index under its existing pinned publication. Reverse seeks
+resolve physical rows to forward entries; authenticated covering blocks must
+contain the exact expected key. Native integer, float, boolean and byte vectors
+are retained until response shaping; exact NUMERIC and arrays use the existing
+storage codec. Generated row identity and duplicate/ranked output positions are
+preserved. The optional path has an independent 8 MiB workspace and a 512-row
+selection threshold; missing coverage, partial indexes and larger selections use
+the physical batched reader. Integrity errors remain errors. Results own their
+payloads independently of decoded-cache leases. Tests remove the source object
+in process and damage data pages across public API restart while retaining the
+source identity, footer and embedded pruning structures. The public fixture is
+large enough for sparse metadata discovery; small-file discovery can legitimately
+read and authenticate the whole object before hydration. Successful delivery
+therefore proves that index values supply the result fields.
+
+### Shared SQL memory ownership
+
+Materialized and streaming SQL executions now hold a heap-owned reclaiming
+allocator in the node's resource manager. The appended
+`sql.execution_working_set` slice has a 256 MiB soft and 512 MiB hard default;
+existing query limits still apply independently. Actual allocated capacity,
+including retained results and suspended streams, remains charged until its
+owner closes. Eligible shared caches can yield on host admission denial, and
+concurrent queries cannot each treat the full host budget as free memory.
+Portable result/stream ownership keeps allocator callbacks alive beyond an
+Adapter stack frame and releases the owner only after all execution allocations.
+Host admission failures are distinguishable from genuine backing allocator OOM
+inside nested SQL budgets and at the transport boundary. HTTP delivery and
+Postgres-wire suspended cursors use the same ownership. Shared headroom remains
+visible to optional execution planning without bypassing opaque caller quotas
+or claiming arena frees refund capacity. Stream decline, errors,
+allocation failures and independent concurrent-owner release have regression
+coverage.
+
+Statement spill managers now also own a shared dirty-page execution pager.
+Join spill hash buckets and fixed COUNT/SUM/AVG/boolean group transitions use
+relocatable handles with 16 KiB pages. An explicit lease pins a page until its
+consumer finishes; unpinned pages share an LRU residency allowance (4 MiB by
+default), including across independent operators. Dirty eviction and restore
+use one private spill file and the statement disk quota. Request cancellation,
+I/O failures and allocation failures unwind leases and private files. Known
+parent headroom can reclaim idle pages without bypassing the parent allocator.
+Small states retain their contiguous vector kernels. Pointer-owning keys,
+NUMERIC reducers, DISTINCT, extrema and pattern state retain their typed spill
+codecs rather than writing process pointers into execution pages. The pager
+therefore supports mutable join/group state while preserving explicit typed
+fallbacks for state that is not yet relocatable.
+
+### Identity boundary for external file rewrites
+
+Decision and implementation contract: [Lake row identity and index reuse](lake-row-identity.md).
+
+Antfly-owned serving compaction retains canonical source coordinates and can
+reuse their immutable index artifacts. External Parquet/Iceberg rewrites cannot
+be inferred from file names, row counts or offsets. Stable-key reuse is now
+implemented with delete-aware key verification and per-index typed input
+fingerprints. Unchanged files retain copy-on-write identity state. Unchanged
+indexes retain their exact original artifacts; changed logical fragments update
+native state in the same atomic publication. A stable key alone never establishes unchanged postings.
+Absent a complete proof, native index construction continues normally.
+
+A future durable rewrite map must bind both immutable inventories, source and
+destination row domains, deletion coverage and the indexed-value equivalence
+proof. Publish it atomically with the new generation, include it in reader leases
+and artifact GC closure, and compose mappings to bounded lookup depth. Ambiguous
+keys, missing rows or changed indexed values force rebuild/update. Query readers
+must apply the same mapping to text, scalar predicates, deletes, covering values
+and public identity; a text-only mapping would be incorrect. The current
+stable-key implementation applies these boundaries to scoped resolver views,
+persistent coordinate maps with shared canonical ordering, batched competitive
+tie ranks, budgeted predicate translation, native dense-ID constraints, parallel
+map readers and covering delivery. Logical radix fragments now reuse native
+per-file mutations across append/removal after relocation; their census,
+coordinate maps and native roots share the publication, certificate and GC
+closure. Changed fragments select bounded physical gathers or a single typed
+projected scan with private partition spill. COW input censuses avoid rehashing unaffected
+leaves and isolate native mutation to each input cohort. Shared v2 coordinate
+descriptors bound declaration metadata; quota denial keeps complete physical
+construction available. Sparse posting/docmap compaction uses geometric size
+tiers and exact forward weights to bound fan-out without cumulative score drift.
+A complete external rewrite still requires row-value verification.
+Trusted-producer mapping adapters remain staged in the linked design.
+
+[Lance fragment reuse](https://lance.org/format/index/system/frag_reuse/) defers
+physical index remapping using verified compaction transitions.
+[Databricks row tracking](https://docs.databricks.com/aws/en/tables/features/row-tracking)
+separates stable row IDs from row commit versions. Elasticsearch exposes stable
+[`_id`](https://www.elastic.co/docs/reference/elasticsearch/mapping-reference/mapping-id-field)
+while [Lucene document numbers](https://lucene.apache.org/core/10_3_1/core/org/apache/lucene/index/IndexReader.html)
+remain ephemeral. These are useful identity patterns; none justifies assuming
+unchanged logical rows after an unverified external rewrite.
+
+
+### Row-level native mutation and typed vector input (protocol 76)
+
+Input-only changes inside a logical fragment now produce a bounded, verified
+row delta. Fragment membership changes invalidate that optimization. The
+persisted input fingerprint is a domain-separated composition of row hashes;
+an update removes the old row hash and adds the new one. Legacy fragment
+versions migrate through one full hash. Metadata work for an admitted single
+row update hashes two inputs rather than all 8,192 possible fragment rows.
+The row-delta planner caps each cohort at 32,768 changed identities and retains
+whole-fragment rebuilding when that allowance or coordinate proof is absent.
+
+Ordered and covering indexes invalidate old keys through exact coordinate
+ranges in the retained reverse tree. This handles changed ordering keys and
+rows that cease to satisfy a partial-index predicate. Native dense and sparse
+indexes use stable private coordinate keys, separately authenticated from input
+versions. Their per-file mutation directories preserve untouched key chunks;
+only changed rows are deleted, gathered and inserted. A reader's original
+coordinate space and publication-bound navigation remain authoritative. A
+membership change, legacy private-key generation or incompatible predecessor
+uses the existing full-fragment mutation path. Protocol 76 gates readers on the
+new optional coordinate-key digests in native file state and navigation.
+Protocol 77 extends the verified row plan to native text posting merges and
+persistent aggregate row contributions, as described below.
+
+Dense/sparse publication binds the selected input column once per batch. Native
+f32 vectors remain borrowed until the native write completes, dictionary strings
+stay dictionary-backed, and JSON parsing is confined to selected cells. Plain
+materialized inputs use a stack-resident enrichment unit. Managed field inputs
+share media/chunker semantics without constructing a row object; templates retain
+the complete-row renderer. Dimension, finite-value and sparse validation remain
+shared with the document path.
+
+Covering search hydration treats a declared `_type` as a source column, including
+SQL null. An index that omits it declines coverage and uses physical hydration.
+Generated `_type` metadata is synthesized only when the schema does not declare
+that column. Real Parquet coverage compares covered, omitted-cover and physical
+search paths, and the Parquet/Iceberg row-identity flow changes native vector
+inputs after reuse to exercise retained and mutated rows together.
+
+
+### Bounded mutable execution and publication deltas (protocol 77)
+
+The statement pager uses a free-handle chain and a resident-only idle LRU.
+Creating handles and selecting victims no longer scan spilled/retired handles.
+Busy frames retain their ownership while the directory lock is released for
+positional spill I/O; resident pins on unrelated pages can proceed. A separate
+file lock serializes the spill descriptor and buffer ownership. Cancellation or
+I/O failure restores frame/queue state before waking waiters. Parent admission,
+residency and disk quotas remain independent.
+
+Typed arrays expose leased page windows. COUNT/SUM/AVG/boolean transitions group
+bounded 128-lane tiles by page and invoke the existing contiguous native kernels.
+Each group's lanes retain their original order, including compensated floating
+reductions. Join probe batches gather bucket heads once per reached page; bucket
+initialization and aggregate migration copy/fill page windows rather than pinning
+each element. Pointer-owning reducers retain their typed spill path.
+
+Dense/sparse logical fragments publish their key state in COW directories even
+without a physical immutable-object catalog. Their authenticated input census is
+not object-store immutability evidence. Only changed prior descriptors are loaded;
+untouched key-state pages remain reachable through the retained directory. A
+legacy flat state migrates once. This removes inline key-state root growth and
+whole-directory parsing/serialization for ordinary sparse updates.
+
+Full-text fragments now bind stable private coordinate-key digests independently
+of input versions. A sparse, membership-preserving change gathers and analyzes
+only changed rows. Existing native postings are masked at those coordinates and
+merged with the new postings in private-key order using the shared native sorted
+segment merger. Physical ordinal maps, DF, conservative score summaries, opening
+packs and serving directories are rebuilt from that exact merged output. The
+bounded native fragment is still rewritten; unchanged Parquet rows are not read
+or reanalyzed. Old generations and membership/radix changes use complete fragment
+construction. Merge inputs stay in private spill until the final merged segment
+and summaries are published. Optional merge workspace/output pressure reopens the
+ordinary full-fragment path without exposing partial contributions.
+
+Eligible keyed algebraic cohorts retain a COW tree of typed per-row transitions
+and a reverse row-to-group map in their existing shared tree descriptor. Updates
+replace only changed row contributions. COUNT/integer SUM cohorts retract old
+transitions and add new ones directly; group membership comes from authenticated
+subtree counts. Extrema, boolean and exact NUMERIC cohorts recompute only the old
+and new affected groups from current contributions, avoiding invalid subtraction
+and predecessor chains. Initial publication reduces incoming transitions directly.
+The resulting group tree still feeds the existing file/radix reduction machinery,
+including exact group removal and NULL identities. Unsupported/oversized state
+uses the established complete fragment publisher. Row-state roots belong to the
+same publication, reader lease, cloud closure and resumable GC graph as the result
+root. Protocol 77 gates the optional descriptor edges and text key generation.
+
+Validation includes linear handle bookkeeping with 20,000 live slots, resident
+pins during spill transfers, page-pin counts for mixed aggregate tiles and join
+probes, typed row updates that move groups and retire extrema/NULL values, native
+posting replacement without old-row analysis, optional merge decline, and logical
+key directories without physical immutability. The real Parquet/Iceberg E2Es also
+compare grouped COUNT/SUM/MIN/MAX against a separate physical-scan table across
+rewrites, updates, membership changes and restart. Archive/cloud latency remains a
+separate measurement; these checks assert work bounds and result equivalence.
+
+### Publication refinements under reader protocol 79
+
+The [row-identity contract](lake-row-identity.md#bounded-posting-deltas-and-ordered-extrema-reader-protocol-79)
+now specifies bounded native posting deltas, durable ordered extrema and parallel
+typed rewrite verification. Text updates may retain one complete immutable base
+plus one changed-row segment, with generation-private tombstones and exact live
+DF/field totals. Physical ordinals stay distinct from the live scoring population.
+Mixed bases and subsequent affected updates use the existing bounded compactor.
+GC and retention tracing retain every referenced base, physical map and summary.
+
+Ordered MIN/MAX state removes affected-group refolding for COUNT/integer-SUM/
+extrema cohorts, and shares the existing typed scalar ordering and row-state
+publication. Typed proof kernels run on bounded shared CPU lanes, while duplicate
+validation, payload capture and final adoption remain coordinator-owned.
+Reuse-aware posting publication also batches changed pack uploads and overlaps
+local capture under the same cancellation/admission contract as fresh builds.
+These paths preserve inline/full-construction fallbacks when optional work cannot
+be admitted. No archive-scale speedup is claimed without measurement.

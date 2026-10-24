@@ -54,6 +54,8 @@ pub fn create(root: corpus.Root, store: stores.ArtifactStore, cached: artifacts.
     };
     defer predicate.deinit();
     var sort = local.sql_spill.Sort.init(a, &self.manager, &.{.{}}, 512 * 1024);
+    sort.shared_runs = true;
+    sort.encoded_bytes = true;
     sort.run_limit = 4;
     defer sort.deinit();
     const Sink = struct {
@@ -148,6 +150,8 @@ test "external lake global frontier spilled pack proofs seek beyond flat admissi
     self.manager = .{ .alloc = self.budget.allocator(), .io = std.testing.io, .context = self, .checkpoint = check };
     defer self.deinit();
     var sort = local.sql_spill.Sort.init(self.budget.allocator(), &self.manager, &.{.{}}, 16 * 1024);
+    sort.shared_runs = true;
+    sort.encoded_bytes = true;
     sort.run_limit = 4;
     defer sort.deinit();
     for (0..3) |_| for (0..10000) |i| {

@@ -26,7 +26,7 @@ pub const Digest = [32]u8;
 pub const Token = [16]u8;
 pub const DirectoryRef = struct { artifact_id: []const u8, checksum: []const u8, byte_len: u64, count: u32 };
 pub const max_directory_artifacts: usize = 4096;
-pub const native_reader_protocol: u16 = 65;
+pub const native_reader_protocol: u16 = 79;
 
 // Catalog envelopes must remain readable so reconciliation can replace older
 // derived formats. Serving still requires the current reader protocol.
@@ -121,6 +121,8 @@ pub const Publication = struct {
     base_source: base.BaseSourceDescriptor,
     inventory: artifacts.ArtifactRef,
     source_navigation: ?artifacts.ArtifactRef = null,
+    /// Authenticated logical identity and relocation state, in this publication cut.
+    row_identity: ?artifacts.ArtifactRef = null,
     declarations: []const manifest.DeclaredArtifact = &.{},
     directory: ?DirectoryRef = null,
     cloud_generations: ?CloudGenerations = null,
@@ -131,9 +133,9 @@ pub const Publication = struct {
     contribution_ownership_version: u16 = 0,
     pub fn jsonStringify(self: @This(), writer: anytype) !void {
         if (self.directory) |directory| {
-            try writer.write(.{ .reader_protocol = self.reader_protocol, .reuse_published = self.reuse_published, .store_locator = self.store_locator, .namespace = self.namespace, .generation = self.generation, .token = self.token, .signature = self.signature, .published_at_ms = self.published_at_ms, .base_source = self.base_source, .inventory = self.inventory, .source_navigation = self.source_navigation, .directory = directory, .cloud_generations = self.cloud_generations });
+            try writer.write(.{ .reader_protocol = self.reader_protocol, .reuse_published = self.reuse_published, .store_locator = self.store_locator, .namespace = self.namespace, .generation = self.generation, .token = self.token, .signature = self.signature, .published_at_ms = self.published_at_ms, .base_source = self.base_source, .inventory = self.inventory, .source_navigation = self.source_navigation, .row_identity = self.row_identity, .directory = directory, .cloud_generations = self.cloud_generations });
         } else {
-            try writer.write(.{ .reader_protocol = self.reader_protocol, .reuse_published = self.reuse_published, .store_locator = self.store_locator, .namespace = self.namespace, .generation = self.generation, .token = self.token, .signature = self.signature, .published_at_ms = self.published_at_ms, .base_source = self.base_source, .inventory = self.inventory, .source_navigation = self.source_navigation, .declarations = self.declarations, .cloud_generations = self.cloud_generations });
+            try writer.write(.{ .reader_protocol = self.reader_protocol, .reuse_published = self.reuse_published, .store_locator = self.store_locator, .namespace = self.namespace, .generation = self.generation, .token = self.token, .signature = self.signature, .published_at_ms = self.published_at_ms, .base_source = self.base_source, .inventory = self.inventory, .source_navigation = self.source_navigation, .row_identity = self.row_identity, .declarations = self.declarations, .cloud_generations = self.cloud_generations });
         }
     }
     pub fn validate(self: Publication) !void {
@@ -171,6 +173,11 @@ pub const Publication = struct {
             if (navigation.metadata_version == 3 and self.reader_protocol < 50) return error.InvalidLakeIndexCatalog;
             try artifactValid(navigation);
         }
+        if (self.row_identity) |identity| {
+            if (self.reader_protocol < 66 or self.source_navigation == null or identity.kind != .doc_values or (identity.metadata_version != 1 and identity.metadata_version != 2)) return error.InvalidLakeIndexCatalog;
+            if (identity.metadata_version == 2 and self.reader_protocol < 70) return error.InvalidLakeIndexCatalog;
+            try artifactValid(identity);
+        }
         try artifactValid(self.inventory);
         if (self.inventory.kind != .external_base_source) return error.InvalidLakeIndexCatalog;
         // Paged inventory closure is reachable through the mandatory source
@@ -181,7 +188,10 @@ pub const Publication = struct {
             else => unreachable,
         };
         if (source.file_inventory_artifact == null or !std.mem.eql(u8, source.file_inventory_artifact.?, self.inventory.artifact_id)) return error.InvalidLakeIndexCatalog;
-        try manifest.validateManifestAgainstBaseSource(.{ .artifacts = self.declarations }, self.base_source);
+        // Logical relocation carries original index bindings. The serving
+        // selector authenticates the certificate, exact closure and both cuts
+        // before any consumer can bypass physical snapshot binding.
+        if (self.row_identity != null) try (manifest.Manifest{ .artifacts = self.declarations }).validate() else try manifest.validateManifestAgainstBaseSource(.{ .artifacts = self.declarations }, self.base_source);
         for (self.declarations) |declaration| {
             if (declaration.name.len > 128) return error.InvalidLakeIndexCatalog;
             try artifactValid(declaration.artifact);

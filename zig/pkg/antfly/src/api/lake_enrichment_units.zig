@@ -28,6 +28,9 @@ pub const Unit = struct {
     source_fingerprint: ?[]const u8 = null,
     parts: []const Part = &.{},
     materialized: ?V = null,
+    /// Borrowed physical vector; valid for the input batch lease. Publication
+    /// consumes it before advancing the source, without JSON boxing.
+    dense_vector: ?[]const f32 = null,
     start_offset: ?u32 = null,
     end_offset: ?u32 = null,
     start_time_ms: ?f32 = null,
@@ -68,6 +71,13 @@ pub fn rebind(a: A, key: []const u8, public_parent: []const u8) ![]u8 {
 pub fn prepare(a: A, config: V, column: []const u8, row: V, options: ?managed.InitOptions) ![]const Unit {
     if (row != .object or config != .object) return error.InvalidEmbeddingInput;
     const value = row.object.get(column) orelse .null;
+    return prepareSelected(a, config, value, row, options);
+}
+
+/// Field-only inputs retain the same chunking, remote-media and cancellation
+/// semantics as document enrichment. Only templates need the complete row.
+pub fn prepareSelected(a: A, config: V, value: V, row: ?V, options: ?managed.InitOptions) ![]const Unit {
+    if (config != .object) return error.InvalidEmbeddingInput;
     if (configured(config, "embedder") == null) {
         if (value == .null) return &.{};
         const result = try a.alloc(Unit, 1);
@@ -79,7 +89,7 @@ pub fn prepare(a: A, config: V, column: []const u8, row: V, options: ?managed.In
     if (opts.deadline_ns) |deadline| if (@import("antfly_platform").time.monotonicNs() >= deadline) return error.DeadlineExceeded;
     var parts: []const Part = if (configured(config, "template")) |source| templated: {
         if (source != .string) return error.InvalidEmbeddingInput;
-        const bytes = try std.json.Stringify.valueAlloc(a, row, .{});
+        const bytes = try std.json.Stringify.valueAlloc(a, row orelse return error.InvalidEmbeddingInput, .{});
         defer a.free(bytes);
         break :templated try local.template_remote.renderJsonToPartsWithConfig(a, source.string, bytes, .{
             .io = opts.io,

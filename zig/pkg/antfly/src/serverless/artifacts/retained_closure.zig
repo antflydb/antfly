@@ -26,6 +26,9 @@ const A = std.mem.Allocator;
 const Certificate = struct { version: u8 = 1, root: []const u8, witnesses: []const api.RetentionWitness };
 const Pending = struct { arena: std.heap.ArenaAllocator, root: []const u8, witnesses: []const api.RetentionWitness, fresh: api.UploadScope, epoch: ?[16]u8 };
 pending: std.ArrayList(Pending) = .empty,
+// Parallel native families share this queue. Hold one blocking mutex through
+// inheritance and sealing so roots, arenas and the sealing batch move together.
+mutex: std.Io.Mutex = .init,
 const Self = @This();
 
 pub fn deinit(self: *Self, a: A) void {
@@ -189,6 +192,13 @@ pub fn remember(fs: *Fs, id: []const u8, witnesses: []const api.RetentionWitness
     try @import("fs_store.zig").writeFileAtomicallyWithCancellation(path, framed, token);
 }
 pub fn inherit(self: *Self, fs: *Fs, id: []const u8, previous: ?[]const u8, fresh: api.UploadScope, token: Token) !void {
+    try token.check();
+    var threaded = std.Io.Threaded.init(fs.alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    try self.mutex.lock(io);
+    defer self.mutex.unlock(io);
+    try token.check();
     if (!std.meta.eql((try api.uploadScopeFromArtifactId(id)) orelse return error.InvalidRetentionCertificate, fresh)) return error.InvalidRetentionCertificate;
     // Same-attempt descendants inherit an unsealed proof by construction.
     // Replace the advisory ancestor entry so per-file checkpoints cannot fill
@@ -224,6 +234,13 @@ pub fn inherit(self: *Self, fs: *Fs, id: []const u8, previous: ?[]const u8, fres
     keep = true;
 }
 pub fn seal(self: *Self, fs: *Fs, token: Token) !void {
+    try token.check();
+    var threaded = std.Io.Threaded.init(fs.alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    try self.mutex.lock(io);
+    defer self.mutex.unlock(io);
+    try token.check();
     defer {
         for (self.pending.items) |*pending| pending.arena.deinit();
         self.pending.clearRetainingCapacity();
@@ -322,4 +339,59 @@ test "external lake retained closure pending descendants stay bounded and reject
     try store.delete(leaf.artifact_id);
     try store.sealClosures(.none);
     try std.testing.expect(!try store.retainedClosure(next.artifact_id, .none));
+}
+
+test "external lake retained closure parallel descendants and sealing preserve every family" {
+    const a = std.testing.allocator;
+    var directory = try @import("antfly_local_sources").common_test_directory.TestDirectory.init("parallel-retained-closure");
+    defer directory.cleanup();
+    var fs = try Fs.init(a, directory.path());
+    defer fs.deinit();
+    var store = fs.artifactStore();
+    store.upload_scope = .{ .domain = @splat(7), .attempt = @splat(5) };
+    var roots: [32][3]?api.ArtifactMetadata = @splat(@splat(null));
+    defer for (&roots) |*family| {
+        for (family) |*root| if (root.*) |*value| value.deinit(a);
+    };
+    // Complete immutable uploads before sealing; no later directory mutation
+    // can invalidate a proof while this test races advisory queue operations.
+    for (&roots, 0..) |*family, index| for (family, 0..) |*root, revision| {
+        var bytes: [64]u8 = undefined;
+        root.* = try store.put(try std.fmt.bufPrint(&bytes, "family-{d}-revision-{d}", .{ index, revision }));
+    };
+    const Worker = struct {
+        fn run(owner: *api.ArtifactStore, family: ?*const [3]?api.ArtifactMetadata, failure: *?anyerror) void {
+            execute(owner, family) catch |err| {
+                failure.* = err;
+            };
+        }
+        fn execute(owner: *api.ArtifactStore, family: ?*const [3]?api.ArtifactMetadata) !void {
+            if (family) |chain| {
+                var previous: ?[]const u8 = null;
+                for (chain) |root| {
+                    try owner.inheritClosure(root.?.artifact_id, previous, .none);
+                    previous = root.?.artifact_id;
+                }
+            } else {
+                for (0..8) |_| try owner.sealClosures(.none);
+            }
+        }
+    };
+    var threaded = std.Io.Threaded.init(a, .{});
+    defer threaded.deinit();
+    var group: std.Io.Group = .init;
+    defer group.cancel(threaded.io());
+    var failures: [32]?anyerror = @splat(null);
+    for (&roots, 0..) |*family, index| group.async(threaded.io(), Worker.run, .{ &store, family, &failures[index] });
+    try group.await(threaded.io());
+    for (failures) |failure| if (failure) |err| return err;
+    try std.testing.expectEqual(@as(usize, 32), fs.retention.pending.items.len);
+    // Publication seals after builders drain. Race independent seal callers to
+    // ensure only one can consume or destroy the pending arenas at a time.
+    for (0..8) |index| group.async(threaded.io(), Worker.run, .{ &store, null, &failures[index] });
+    try group.await(threaded.io());
+    for (failures) |failure| if (failure) |err| return err;
+    try store.sealClosures(.none);
+    try std.testing.expectEqual(@as(usize, 0), fs.retention.pending.items.len);
+    for (roots) |family| try std.testing.expect(try store.retainedClosure(family[2].?.artifact_id, .none));
 }

@@ -77,7 +77,18 @@ pub const SearchResults = search_results.SearchResults;
 
 /// Borrowed request-local predicate over native metadata keys. Evaluated before
 /// candidate heap admission, so selective filters do not discard an unfiltered top-k.
-pub const KeyPredicate = struct { ptr: *anyopaque, allows: *const fn (*anyopaque, []const u8) anyerror!bool };
+pub const KeyPredicate = struct {
+    ptr: *anyopaque,
+    allows: *const fn (*anyopaque, []const u8) anyerror!bool,
+    /// Bounded synchronous candidate tiles. All key bytes remain borrowed until
+    /// return; implementations must initialize every output or return an error.
+    allows_many: ?*const fn (*anyopaque, []const []const u8, []bool) anyerror!void = null,
+    pub fn allowsMany(self: @This(), keys: []const []const u8, output: []bool) !void {
+        if (keys.len != output.len) return error.InvalidSearchFilter;
+        if (self.allows_many) |many| return many(self.ptr, keys, output);
+        for (keys, output) |key, *result| result.* = try self.allows(self.ptr, key);
+    }
+};
 pub const SearchRequest = struct {
     key_predicate: ?KeyPredicate = null,
     query: []const f32,

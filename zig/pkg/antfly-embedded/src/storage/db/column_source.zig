@@ -53,6 +53,137 @@ pub const Page = struct {
         for (selection) |index| if (index >= batch.rowCount()) return error.InvalidSqlBackendResponse;
         return gather(a, batch.columns, selection);
     }
+    pub const Position = struct { page: *const Page, row: usize };
+    /// Assemble a bounded scatter from independently owned pages. Preserve
+    /// native scalar types; page-local dictionaries normalize into compact slots.
+    pub fn gatherPositions(a: A, positions: []const Position) !*Page {
+        return gatherProjectedPositions(a, positions, null);
+    }
+    /// Project a scatter once; contiguous tiles borrow the immutable producer
+    /// vectors through an explicit page lease instead of copying their payload.
+    pub fn gatherProjectedPositions(a: A, positions: []const Position, projection_: ?[]const usize) !*Page {
+        if (positions.len == 0 or positions.len > 4096) return error.InvalidSqlBackendResponse;
+        const first = positions[0].page;
+        const width = if (projection_) |indices| indices.len else first.columns.len;
+        for (positions) |position| if (position.row >= position.page.len or position.page.columns.len != first.columns.len or position.page.selection != null) return error.InvalidSqlBackendResponse;
+        if (projection_) |indices| for (indices) |ci| if (ci >= first.columns.len) return error.InvalidSqlBackendResponse;
+        const contiguous = for (positions, 0..) |position, i| {
+            if (position.page != first or position.row != positions[0].row + i) break false;
+        } else true;
+        if (contiguous and positions.len >= first.len / 4 and first.retainedBytes() <= 8 * 1024 * 1024)
+            return borrowRange(a, first, positions[0].row, positions.len, projection_);
+        const self = try a.create(Page);
+        self.* = .{ .a = a, .arena = .init(a), .columns = &.{}, .len = positions.len };
+        errdefer self.release();
+        const pa = self.arena.allocator();
+        const columns = try pa.alloc(rows.ColumnVector, width);
+        for (columns, 0..) |*out, projected_index| {
+            const ci = if (projection_) |indices| indices[projected_index] else projected_index;
+            const original = first.columns[ci];
+            const nulls = try pa.alloc(u8, positions.len);
+            out.* = .{ .name = try pa.dupe(u8, original.name), .values = undefined, .nulls = .{ .bytes = nulls } };
+            for (positions, nulls) |position, *flag| {
+                const column = position.page.columns[ci];
+                if (!std.mem.eql(u8, original.name, column.name)) return error.InvalidSqlBackendResponse;
+                flag.* = @intFromBool(column.nulls.isNull(position.row));
+            }
+            out.values = switch (original.values) {
+                .i64, .dictionary_i64 => blk: {
+                    const values = try pa.alloc(i64, positions.len);
+                    for (positions, values, nulls) |position, *value, flag| value.* = if (flag != 0) 0 else try position.page.columns[ci].integerAt(position.row);
+                    break :blk .{ .i64 = values };
+                },
+                .f64, .dictionary_f64 => blk: {
+                    const values = try pa.alloc(f64, positions.len);
+                    for (positions, values, nulls) |position, *value, flag| value.* = if (flag != 0) 0 else switch (position.page.columns[ci].values) {
+                        .f64 => |v| v[position.row],
+                        .dictionary_f64 => |v| v.at(position.row),
+                        else => return error.RowSourceColumnKindMismatch,
+                    };
+                    break :blk .{ .f64 = values };
+                },
+                .bytes, .dictionary_bytes => blk: {
+                    var dictionary: std.StringHashMapUnmanaged(u32) = .empty;
+                    defer dictionary.deinit(pa);
+                    var values: std.ArrayList([]const u8) = .empty;
+                    try values.append(pa, "");
+                    try dictionary.put(pa, "", 0);
+                    const indices = try pa.alloc(u32, positions.len);
+                    for (positions, indices, nulls) |position, *index, flag| {
+                        if (flag != 0) {
+                            index.* = 0;
+                            continue;
+                        }
+                        const raw = try position.page.columns[ci].bytesAt(position.row);
+                        const entry = try dictionary.getOrPut(pa, raw);
+                        if (!entry.found_existing) {
+                            const owned = try pa.dupe(u8, raw);
+                            entry.key_ptr.* = owned;
+                            entry.value_ptr.* = @intCast(values.items.len);
+                            try values.append(pa, owned);
+                        }
+                        index.* = entry.value_ptr.*;
+                    }
+                    break :blk .{ .dictionary_bytes = .{ .values = values.items, .indices = indices } };
+                },
+                .decimal128 => |decimal| blk: {
+                    var result = decimal;
+                    const values = try pa.alloc(i128, positions.len);
+                    for (positions, values, nulls) |position, *value, flag| {
+                        const source = position.page.columns[ci].values;
+                        if (source != .decimal128 or source.decimal128.scale != decimal.scale) return error.RowSourceColumnKindMismatch;
+                        result.precision = @max(result.precision, source.decimal128.precision);
+                        value.* = if (flag != 0) 0 else source.decimal128.values[position.row];
+                    }
+                    result.values = values;
+                    break :blk .{ .decimal128 = result };
+                },
+                inline .bool, .json, .vector_f32 => |_, tag| blk: {
+                    const T = @typeInfo(@FieldType(rows.ColumnValues, @tagName(tag))).pointer.child;
+                    const values = try pa.alloc(T, positions.len);
+                    for (positions, values, nulls) |position, *value, flag| {
+                        const source = position.page.columns[ci].values;
+                        if (std.meta.activeTag(source) != tag) return error.RowSourceColumnKindMismatch;
+                        const raw = @field(source, @tagName(tag))[position.row];
+                        value.* = if (comptime tag == .bool) flag == 0 and raw else if (flag != 0) &.{} else try pa.dupe(@typeInfo(T).pointer.child, raw);
+                    }
+                    break :blk @unionInit(rows.ColumnValues, @tagName(tag), values);
+                },
+                .encoded => return error.UnsupportedSqlExecution,
+            };
+        }
+        self.columns = columns;
+        return self;
+    }
+    fn releasePage(raw: *anyopaque) void {
+        @as(*Page, @ptrCast(@alignCast(raw))).release();
+    }
+    fn borrowRange(a: A, source: *const Page, begin: usize, count: usize, projection_: ?[]const usize) !*Page {
+        const self = try a.create(Page);
+        self.* = .{ .a = a, .arena = .init(a), .columns = &.{}, .len = count };
+        errdefer self.release();
+        const pa = self.arena.allocator();
+        const columns = try pa.alloc(rows.ColumnVector, if (projection_) |indices| indices.len else source.columns.len);
+        for (columns, 0..) |*column, i| {
+            column.* = source.columns[if (projection_) |indices| indices[i] else i];
+            column.nulls = column.nulls.slice(begin, count);
+            column.values = switch (column.values) {
+                .decimal128 => |v| .{ .decimal128 = v.slice(begin, count) },
+                inline .dictionary_i64, .dictionary_f64, .dictionary_bytes => |v, tag| blk: {
+                    var selected = v;
+                    selected.indices = v.indices[begin..][0..count];
+                    if (comptime @hasField(@TypeOf(selected), "owned")) selected.owned = false;
+                    break :blk @unionInit(rows.ColumnValues, @tagName(tag), selected);
+                },
+                .encoded => return error.UnsupportedSqlExecution,
+                inline else => |v, tag| @unionInit(rows.ColumnValues, @tagName(tag), v[begin..][0..count]),
+            };
+        }
+        @constCast(source).retain();
+        self.owner = .{ .ptr = @constCast(source), .release_fn = releasePage, .retained_bytes = source.retainedBytes() };
+        self.columns = columns;
+        return self;
+    }
     /// Prefer retained payloads for dense selections; sparse selections gather
     /// compact slots so a few hits cannot pin a large decoded page/dictionary.
     pub fn retainOrCopy(a: A, batch: rows.ColumnBatch, selection: []const usize, capability: anytype) !*Page {
@@ -557,4 +688,52 @@ fn retainedPayloadScenario(a: A) !void {
 test "external lake dense column leases share payloads across producer closure and sparse selections gather under OOM" {
     try retainedPayloadScenario(std.testing.allocator);
     try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, retainedPayloadScenario, .{});
+}
+
+test "external lake typed decimal scatter widens precision without losing coefficient bits" {
+    const a = std.testing.allocator;
+    const refs = [_]rows.RowRef{.{ .relational_key = "row" }};
+    const first = try Page.copy(a, .{ .snapshot = .{ .table_id = "t", .snapshot_id = "s" }, .row_refs = &refs, .columns = &.{.{ .name = "price", .values = .{ .decimal128 = .{ .values = &.{9007199254740993}, .precision = 18, .scale = 2 } } }} }, &.{0});
+    defer first.release();
+    const second = try Page.copy(a, .{ .snapshot = .{ .table_id = "t", .snapshot_id = "s" }, .row_refs = &refs, .columns = &.{.{ .name = "price", .values = .{ .decimal128 = .{ .values = &.{-123456789012345678901}, .precision = 24, .scale = 2 } } }} }, &.{0});
+    defer second.release();
+    const gathered = try Page.gatherPositions(a, &.{ .{ .page = first, .row = 0 }, .{ .page = second, .row = 0 }, .{ .page = first, .row = 0 } });
+    defer gathered.release();
+    const decimal = gathered.columns[0].values.decimal128;
+    try std.testing.expectEqual(@as(i32, 24), decimal.precision);
+    try std.testing.expectEqual(@as(i32, 2), decimal.scale);
+    try std.testing.expectEqualSlices(i128, &.{ 9007199254740993, -123456789012345678901, 9007199254740993 }, decimal.values);
+}
+
+test "external lake projected contiguous leases outlive producers and sparse scatters own only requested columns" {
+    const Run = struct {
+        fn run(a: A) !void {
+            const input: rows.ColumnBatch = .{
+                .snapshot = .{ .table_id = "t", .snapshot_id = "s" },
+                .row_refs = &.{ .{ .relational_key = "a" }, .{ .relational_key = "b" }, .{ .relational_key = "c" }, .{ .relational_key = "d" } },
+                .columns = &.{
+                    .{ .name = "id", .values = .{ .i64 = &.{ 1, 2, 3, 4 } } },
+                    .{ .name = "payload", .values = .{ .json = &.{ "null", "[1,2]", "{\"n\":9007199254740993}", "false" } } },
+                    .{ .name = "price", .values = .{ .decimal128 = .{ .values = &.{ 0, 9007199254740993123, -9007199254740993123, 0 }, .precision = 38, .scale = 3 } } },
+                },
+            };
+            const source = try Page.copy(a, input, &.{ 0, 1, 2, 3 });
+            var owns = true;
+            defer if (owns) source.release();
+            const borrowed = try Page.gatherProjectedPositions(a, &.{ .{ .page = source, .row = 1 }, .{ .page = source, .row = 2 } }, &.{ 2, 0 });
+            defer borrowed.release();
+            try std.testing.expect(borrowed.owner != null and borrowed.selection == null);
+            try std.testing.expectEqual(@as(usize, 2), borrowed.columns.len);
+            try std.testing.expect(borrowed.columns[1].values.i64.ptr == source.columns[0].values.i64[1..].ptr);
+            const copied = try Page.gatherProjectedPositions(a, &.{ .{ .page = source, .row = 2 }, .{ .page = source, .row = 1 }, .{ .page = source, .row = 2 } }, &.{ 2, 0 });
+            defer copied.release();
+            try std.testing.expect(copied.owner == null);
+            source.release();
+            owns = false;
+            try std.testing.expectEqual(@as(i128, 9007199254740993123), borrowed.columns[0].values.decimal128.values[0]);
+            try std.testing.expectEqual(@as(i128, -9007199254740993123), copied.columns[0].values.decimal128.values[0]);
+            try std.testing.expectEqual(@as(i64, 3), try copied.columns[1].integerAt(2));
+        }
+    };
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Run.run, .{});
 }

@@ -78,6 +78,10 @@ pub fn recipeFor(a: A, table: local.sql_catalog.Table, config: std.json.Value, m
     return .{ .keys = keys, .inputs = inputs };
 }
 
+pub fn compatibleInputGroup(left: recipes.Recipe, right: recipes.Recipe) bool {
+    return (recipes.Recipe{ .keys = left.keys, .inputs = &.{} }).eql(.{ .keys = right.keys, .inputs = &.{} }) and incrementalRecipe(left) == incrementalRecipe(right);
+}
+
 pub fn recipeIdentity(a: A, recipe: recipes.Recipe) ![]const u8 {
     return std.fmt.allocPrint(a, "native-sql-aggregate-v2:{s}", .{std.fmt.bytesToHex(&recipe.fingerprint(), .lower)});
 }
@@ -94,7 +98,7 @@ pub const BuildResult = struct { declarations: []const Declared, contributions: 
 pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.TableRecord, source: *local.serverless_query_lake_serving.ServingSource, store: *stores.ArtifactStore, provider: *@import("lake_index_row_source.zig").Provider, cancellation: @import("antfly_cancellation").CancellationToken, reusable: []const Declared, old_contributions: []const local.metadata_lake_index_catalog.FileContribution) !BuildResult {
     return buildIndexed(a, out, table, source, store, provider, cancellation, reusable, old_contributions, null);
 }
-pub fn buildIndexed(a: A, out: A, table: local.common_topology_records.TableRecord, source: *local.serverless_query_lake_serving.ServingSource, store: *stores.ArtifactStore, provider: *@import("lake_index_row_source.zig").Provider, cancellation: @import("antfly_cancellation").CancellationToken, reusable: []const Declared, old_contributions: []const local.metadata_lake_index_catalog.FileContribution, contribution_lookup: ?*@import("lake_index_contributions.zig").Index) !BuildResult {
+pub fn buildIndexed(a: A, out: A, table: local.common_topology_records.TableRecord, parent_source: *local.serverless_query_lake_serving.ServingSource, store: *stores.ArtifactStore, parent_provider: *@import("lake_index_row_source.zig").Provider, cancellation: @import("antfly_cancellation").CancellationToken, reusable: []const Declared, old_contributions: []const local.metadata_lake_index_catalog.FileContribution, contribution_lookup: ?*@import("lake_index_contributions.zig").Index) !BuildResult {
     var contributions: std.ArrayList(local.metadata_lake_index_catalog.FileContribution) = .empty;
     var config_arena = std.heap.ArenaAllocator.init(a);
     defer config_arena.deinit();
@@ -107,17 +111,17 @@ pub fn buildIndexed(a: A, out: A, table: local.common_topology_records.TableReco
         };
     } else false;
     if (!has_algebraic) return .{ .declarations = &.{}, .contributions = &.{} };
-    const io = provider.context.io orelse return error.UnsupportedSqlExecution;
-    try source.ensureInventory(provider.context);
-    try source.ensureCanonicalPlan(provider.context);
+    const io = parent_provider.context.io orelse return error.UnsupportedSqlExecution;
+    try parent_source.ensureInventory(parent_provider.context);
+    try parent_source.ensureCanonicalPlan(parent_provider.context);
     var schemas = @import("sql_schema_cache.zig").Cache.init(a);
     defer schemas.deinit();
     const sql_table = try schemas.resolve(io, ca, table.schema_json, table.table_id, table.name);
     const contract = try ca.alloc(local.serverless_query_lake_schema.Column, sql_table.columns.len);
     for (contract, sql_table.columns) |*column, definition| column.* = .{ .name = definition.path, .kind = if (definition.element_type == .numeric) "numeric" else @tagName(definition.type), .required = !definition.nullable };
-    var native_provider = provider.*;
-    native_provider.schema_contract = if (source.iceberg_schema) |selected| selected.columns else contract;
-    if (source.iceberg_schema) |selected| for (contract) |expected| {
+    var native_provider = parent_provider.*;
+    native_provider.schema_contract = if (parent_source.iceberg_schema) |selected| selected.columns else contract;
+    if (parent_source.iceberg_schema) |selected| for (contract) |expected| {
         const actual = for (selected.columns) |column| {
             if (std.mem.eql(u8, column.name, expected.name)) break column;
         } else return error.ExternalLakeSchemaMismatch;
@@ -126,7 +130,6 @@ pub fn buildIndexed(a: A, out: A, table: local.common_topology_records.TableReco
     var old: ContributionIndex = .{};
     defer old.deinit(a);
     for (old_contributions, 0..) |contribution, index| try old.put(a, contributionKey(contribution.file, contribution.recipe, contribution.name), index);
-    var file_keys: ?[][32]u8 = null;
     var declarations: std.ArrayList(Declared) = .empty;
     errdefer {
         // Nested bytes are allocated in the publication arena by the caller.
@@ -149,7 +152,8 @@ pub fn buildIndexed(a: A, out: A, table: local.common_topology_records.TableReco
             if (name != .string or name.string.len == 0) return error.InvalidAlgebraicConfig;
             const identity = try recipeIdentity(ca, recipe);
             const logical_name = try @import("lake_index_names.zig").materialization(out, entry.key_ptr.*, name.string);
-            const contributes = incrementalRecipe(recipe) and source.inventory.deleted_row_groups.len == 0 and (if (source.scanner.iceberg_delete_plan) |plan| plan.files.len == 0 else true);
+            if (!parent_provider.wantsIndex(logical_name)) continue;
+            const contributes = incrementalRecipe(recipe) and parent_source.inventory.deleted_row_groups.len == 0 and (if (parent_source.scanner.iceberg_delete_plan) |plan| plan.files.len == 0 else true);
             // Whole-root reuse remains valid for recipes with no file tree
             // (floating reductions, DISTINCT, or delete-bearing snapshots).
             const previous = for (if (contribution_lookup == null or !contributes) reusable else &.{}) |decl| {
@@ -176,8 +180,16 @@ pub fn buildIndexed(a: A, out: A, table: local.common_topology_records.TableReco
         // Larger sets form another bounded cohort with the same semantic keys.
         for (requests.items[first..], first..) |candidate, index| {
             if (consumed[index]) continue;
-            const key_recipe: recipes.Recipe = .{ .keys = request.recipe.keys, .inputs = &.{} };
-            if (!key_recipe.eql(.{ .keys = candidate.recipe.keys, .inputs = &.{} }) or incrementalRecipe(request.recipe) != incrementalRecipe(candidate.recipe)) continue;
+            if (!compatibleInputGroup(request.recipe, candidate.recipe)) continue;
+            // Fused reducers must agree on the authenticated input census.
+            // Different projected inputs can change independently.
+            if (native_provider.fragment_views.len != 0) {
+                var left_source = parent_source.*;
+                var right_source = parent_source.*;
+                _ = native_provider.forIndex(&left_source, request.name);
+                _ = native_provider.forIndex(&right_source, candidate.name);
+                if (left_source.inventory.files.ptr != right_source.inventory.files.ptr) continue;
+            }
             consumed[index] = true;
             try cohort.append(ca, index);
             if (cohort.items.len == 64) break;
@@ -191,6 +203,11 @@ pub fn buildIndexed(a: A, out: A, table: local.common_topology_records.TableReco
             name.* = requests.items[index].name;
         }
         const recipe: recipes.Recipe = .{ .keys = request.recipe.keys, .inputs = inputs };
+        var source_view = parent_source.*;
+        var selected_provider = native_provider.forIndex(&source_view, names[0]);
+        const provider = &selected_provider;
+        const source = provider.source;
+        var file_keys: ?[][32]u8 = null;
         {
             var projected: std.ArrayList([]const u8) = .empty;
             for (recipe.keys) |key| {
@@ -235,7 +252,7 @@ pub fn buildIndexed(a: A, out: A, table: local.common_topology_records.TableReco
             const budget = if (provider.resume_work) |work| &work.aggregate else &local_budget;
             const incremental = incrementalRecipe(recipe) and source.inventory.deleted_row_groups.len == 0 and (if (source.scanner.iceberg_delete_plan) |plan| plan.files.len == 0 else true);
             if (incremental and source.inventory.files.len != 0) {
-                var resolver: LeafResolver = .{ .a = a, .out = out, .provider = &native_provider, .source = source, .binding = binding, .recipe = recipe, .names = names, .old = &old, .previous = old_contributions, .index = contribution_lookup, .metadata_count = metadata_count, .store = store, .spill = &spill, .budget = budget, .cancellation = cancellation, .contributions = &contributions };
+                var resolver: LeafResolver = .{ .a = a, .out = out, .provider = &selected_provider, .source = source, .binding = binding, .recipe = recipe, .names = names, .old = &old, .previous = old_contributions, .index = contribution_lookup, .metadata_count = metadata_count, .store = store, .spill = &spill, .budget = budget, .cancellation = cancellation, .contributions = &contributions };
                 var metadata_cache = local.serverless_query_lake_serving_cache.Cache.initWithMemoryLimit(a, 2 * 1024 * 1024);
                 defer metadata_cache.deinit();
                 metadata_cache.decoded.max_bytes = 4 * 1024 * 1024;
@@ -243,15 +260,15 @@ pub fn buildIndexed(a: A, out: A, table: local.common_topology_records.TableReco
                 var reduction: Reduction = .{ .cached = cached, .a = a, .out = out, .store = store, .recipe = recipe, .specs = specs, .names = names, .old = &old, .previous = old_contributions, .index = contribution_lookup, .contributions = &contributions, .spill = &spill, .cancellation = cancellation, .resolver = &resolver };
                 defer reduction.shape_keys.deinit(a);
                 defer reduction.proof_memo.deinit(a);
-                native_provider.only_file = null;
-                const root = (try reduction.reduceAppend(&native_provider)) orelse (try reduction.reduceDelta(&native_provider)) orelse full: {
+                selected_provider.only_file = null;
+                const root = (try reduction.reduceAppend(&selected_provider)) orelse (try reduction.reduceDelta(&selected_provider)) orelse full: {
                     if (file_keys == null) {
                         file_keys = try ca.alloc([32]u8, source.inventory.files.len);
                         for (source.inventory.files, file_keys.?) |file, *key| key.* = fileIdentity(source, file);
                     }
                     const leaves = try ca.alloc(Reduction.Leaf, file_keys.?.len);
                     for (file_keys.?, leaves, 0..) |key, *leaf, index| leaf.* = .{ .key = key, .index = index };
-                    var scan_order = @import("lake_index_native_state.zig").ScanOrder.init(&native_provider);
+                    var scan_order = @import("lake_index_native_state.zig").ScanOrder.init(&selected_provider);
                     var pending: [8]Reduction.Leaf = undefined;
                     var count: usize = 0;
                     while (try scan_order.next()) |ordinal| {
@@ -283,20 +300,26 @@ pub fn buildIndexed(a: A, out: A, table: local.common_topology_records.TableReco
                     try declarations.append(out, .{ .name = name, .binding = slot_binding, .artifact = artifact });
                 }
                 continue;
+            } else if (metadata_count and selected_provider.fragment_rows != null) {
+                // The authenticated logical census already applied source
+                // deletes and verified every key; no physical footer is owed.
+                var count: u64 = 0;
+                for (source.inventory.files) |file| count = try std.math.add(u64, count, file.row_count);
+                try group.addGlobalCount(count);
             } else if (metadata_count) {
                 var stream = try local.serverless_query_lake_stream.Stream.init(a, source, columns, &.{}, provider.context, provider.limits);
                 defer stream.deinit();
-                stream.schema_contract = native_provider.schema_contract;
+                stream.schema_contract = selected_provider.schema_contract;
                 stream.identity_only = true;
                 try group.addGlobalCount((try stream.countAll()) orelse return error.UnsupportedExternalLakeIndex);
             } else {
-                if (native_provider.replay_consumer != null) {
-                    var scan = try @import("lake_index_native_state.zig").Plan.init(a, ca, &native_provider, &.{});
+                if (selected_provider.replay_consumer != null) {
+                    var scan = try @import("lake_index_native_state.zig").Plan.init(a, ca, &selected_provider, &.{});
                     defer scan.deinit();
-                    native_provider.only_plan = &scan;
-                    defer native_provider.only_plan = null;
-                    try consumeCohort(a, &native_provider, binding, recipe, group, budget, cancellation);
-                } else try consumeCohort(a, &native_provider, binding, recipe, group, budget, cancellation);
+                    selected_provider.only_plan = &scan;
+                    defer selected_provider.only_plan = null;
+                    try consumeCohort(a, &selected_provider, binding, recipe, group, budget, cancellation);
+                } else try consumeCohort(a, &selected_provider, binding, recipe, group, budget, cancellation);
             }
             const published = try artifacts.publishCohort(a, out, store, names, group, recipe, cancellation);
             for (published, names, cohort.items) |artifact, name, index| {
@@ -426,10 +449,135 @@ const LeafResolver = struct {
         }
         return true;
     }
+    const RowJob = struct {
+        const reservation = 68 * 1024 * 1024;
+        owner: *LeafResolver,
+        leaf: Reduction.Leaf,
+        a: A,
+        arena: std.heap.ArenaAllocator,
+        source: local.serverless_query_lake_serving.ServingSource,
+        store: stores.ArtifactStore,
+        execution: local.sql_parallel_scheduler.Execution,
+        prior: ?local.serverless_manifest_artifact_ref.ArtifactRef = null,
+        result: ?[]local.serverless_manifest_artifact_ref.ArtifactRef = null,
+        future: ?std.Io.Future(anyerror!void) = null,
+        admitted: bool = false,
+        fn check(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try self.owner.provider.context.ensureActive();
+            try self.owner.cancellation.check();
+        }
+        fn run(self: *@This(), io: std.Io) anyerror!void {
+            defer self.execution.pause();
+            self.execution.checkpoint = .{ .ptr = self, .check = check };
+            try check(self);
+            var phase: stores.ExecutionIo = .{ .execution = &self.execution, .io = io };
+            self.store.io_phase = phase.capability();
+            var provider = self.owner.provider.*;
+            provider.source = &self.source;
+            provider.io_phase = self.store.io_phase;
+            provider.replay = null;
+            provider.replay_consumer = null;
+            provider.only_plan = null;
+            provider.only_files = null;
+            self.result = try @import("lake_index_aggregate_rows.zig").build(self.a, self.arena.allocator(), &self.store, &provider, self.owner.binding, self.owner.recipe, self.owner.names, self.leaf.index, self.prior, self.owner.budget, self.owner.cancellation);
+        }
+        fn deinit(self: *@This()) void {
+            self.execution.pause();
+            self.source.closeParallelView(self.owner.source);
+            self.arena.deinit();
+            if (self.admitted) self.execution.scheduler.releasePull(1, reservation);
+        }
+    };
+    fn priorRowRef(self: *LeafResolver, out: A, leaf: Reduction.Leaf) !?local.serverless_manifest_artifact_ref.ArtifactRef {
+        if (self.provider.rowsForFile(leaf.index) != null) if (self.provider.native_delta) |delta| if (self.index) |lookup| {
+            const file = self.source.inventory.files[leaf.index];
+            for (delta.prior_changed) |before| if (std.mem.eql(u8, before.id, file.file_id)) {
+                if (before.aggregate_digest) |digest| {
+                    const single: recipes.Recipe = .{ .keys = self.recipe.keys, .inputs = self.recipe.inputs[0..1] };
+                    if (try lookup.lookup(out, contributionKey(digest, single.fingerprint(), self.names[0]))) |value| return value.artifact;
+                }
+                break;
+            };
+        };
+        return null;
+    }
+    /// Children own their source, allocator arena and CPU/I/O capability. The
+    /// serial owner adopts completed immutable references only after draining.
+    fn resolveRowsParallel(self: *LeafResolver, leaves: []const Reduction.Leaf) ![]const Reduction.Leaf {
+        if (leaves.len < 2 or leaves.len > 8 or !@import("lake_index_aggregate_rows.zig").eligible(self.provider, self.recipe)) return leaves;
+        const phase = self.store.io_phase orelse return leaves;
+        if (phase.park == null or phase.resume_cpu == null) return leaves;
+        const scheduler = phase.scheduler orelse return leaves;
+        const available = @import("../serverless/build/lake_build_limits.zig").WorkingSetAllocator.headroom(self.a) orelse return leaves;
+        const maximum = @min(leaves.len, available / RowJob.reservation);
+        if (maximum < 2 or scheduler.max_workers < 2) return leaves;
+        const io = self.provider.context.io.?;
+        var locked: local.sql_parallel_scheduler.LockedAllocator = .{ .backing = local.sql_memory_budget.reclaimingAllocator(self.a) };
+        var jobs: [8]RowJob = undefined;
+        var initialized: usize = 0;
+        var positions: [8]usize = undefined;
+        defer {
+            // Error/cancellation must park before joining dependent children.
+            for (jobs[0..initialized]) |job| if (job.future != null) {
+                phase.park.?(phase.ptr);
+                break;
+            };
+            for (jobs[0..initialized]) |*job| {
+                if (job.future) |*future| _ = future.cancel(io) catch {};
+                job.deinit();
+            }
+        }
+        // Prepare all immutable inputs before a child can allocate or upload.
+        for (leaves, 0..) |leaf, position| {
+            if (initialized == maximum) break;
+            if (leaf.refs.len != 0 or try self.present(leaf)) continue;
+            const a = locked.allocator();
+            jobs[initialized] = .{ .owner = self, .leaf = leaf, .a = a, .arena = .init(a), .source = try self.source.parallelView(a), .store = self.store.*, .execution = .{ .scheduler = scheduler, .bytes = 8 * 1024 * 1024 } };
+            const job = &jobs[initialized];
+            positions[initialized] = position;
+            initialized += 1;
+            job.store.allocator = a;
+            job.store.io_phase = null;
+            job.prior = try self.priorRowRef(job.arena.allocator(), leaf);
+        }
+        if (initialized < 2) return leaves;
+        var launched: usize = 0;
+        for (jobs[0..initialized]) |*job| {
+            if (!scheduler.reservePull(1, RowJob.reservation)) break;
+            job.admitted = true;
+            if (!job.execution.tryEnter()) break;
+            job.future = io.concurrent(RowJob.run, .{ job, io }) catch {
+                job.execution.pause();
+                break;
+            };
+            launched += 1;
+        }
+        if (launched == 0) return leaves;
+        phase.park.?(phase.ptr);
+        for (jobs[0..launched]) |*job| {
+            const result = job.future.?.await(io);
+            job.future = null;
+            try result;
+        }
+        try phase.resume_cpu.?(phase.ptr);
+        const resolved = try self.out.dupe(Reduction.Leaf, leaves);
+        for (jobs[0..launched], positions[0..launched]) |job, position| if (job.result) |refs| {
+            const encoded = try std.json.Stringify.valueAlloc(self.out, refs, .{});
+            defer self.out.free(encoded);
+            const retained = try std.json.parseFromSliceLeaky([]local.serverless_manifest_artifact_ref.ArtifactRef, self.out, encoded, .{ .allocate = .alloc_always });
+            resolved[position] = try self.resolvePrepared(job.leaf, null, retained);
+        };
+        for (resolved, leaves) |*result, leaf| if (result.refs.len == 0) {
+            result.* = try self.resolve(leaf);
+        };
+        return resolved;
+    }
     /// Only ready replay readers are shared. Capturing the scan, uploading
     /// artifacts and changing contribution ownership remain coordinator work.
     fn resolveParallel(self: *@This(), leaves: []const Reduction.Leaf) ![]const Reduction.Leaf {
         const io = self.provider.context.io.?;
+        if (@import("lake_index_aggregate_rows.zig").eligible(self.provider, self.recipe)) return self.resolveRowsParallel(leaves);
         if (self.provider.replay_consumer != null) return leaves;
         if (leaves.len < 2 or leaves.len > 8 or self.metadata_count) return leaves;
         var needed: [8]bool = @splat(false);
@@ -483,6 +631,9 @@ const LeafResolver = struct {
         return self.resolveWithPartial(leaf, null);
     }
     fn resolveWithPartial(self: *@This(), leaf: Reduction.Leaf, prepared: ?*operators.Grouped) !Reduction.Leaf {
+        return self.resolvePrepared(leaf, prepared, null);
+    }
+    fn resolvePrepared(self: *@This(), leaf: Reduction.Leaf, prepared: ?*operators.Grouped, prepared_rows: ?[]const local.serverless_manifest_artifact_ref.ArtifactRef) !Reduction.Leaf {
         try self.cancellation.check();
         try self.provider.context.ensureActive();
         const refs = try self.out.alloc(local.serverless_manifest_artifact_ref.ArtifactRef, self.names.len);
@@ -502,7 +653,17 @@ const LeafResolver = struct {
                 } else all_present = false;
             } else all_present = false;
         }
-        if (!all_present) {
+        var row_published = prepared_rows != null;
+        if (prepared_rows) |values| @memcpy(refs, values);
+        if (!all_present and !row_published and @import("lake_index_aggregate_rows.zig").eligible(self.provider, self.recipe)) {
+            const previous_ref = try self.priorRowRef(self.out, leaf);
+            if (try @import("lake_index_aggregate_rows.zig").build(self.a, self.out, self.store, self.provider, self.binding, self.recipe, self.names, leaf.index, previous_ref, self.budget, self.cancellation)) |published| {
+                @memcpy(refs, published);
+                self.out.free(published);
+                row_published = true;
+            }
+        }
+        if (!all_present and !row_published) {
             const specs = try self.a.alloc(operators.AggregateSpec, self.recipe.inputs.len);
             defer self.a.free(specs);
             for (self.recipe.inputs, specs) |input, *spec| spec.* = input.spec;
@@ -514,7 +675,7 @@ const LeafResolver = struct {
                 defer self.provider.only_file = null;
                 const file = self.source.inventory.files[leaf.index];
                 if (self.metadata_count) {
-                    if (self.source.inventory.format == .iceberg) {
+                    if (self.source.inventory.format == .iceberg or self.provider.fragment_rows != null) {
                         try partial.addGlobalCount(file.row_count);
                     } else {
                         // Footer discovery qualifies the immutable file version;
@@ -820,7 +981,8 @@ const Reduction = struct {
     fn reduceDelta(self: *@This(), provider: *@import("lake_index_row_source.zig").Provider) anyerror!?Leaf {
         const delta = provider.native_delta orelse return null;
         const index = self.index orelse return null;
-        if (!index.acceptsDelta(delta) or delta.count() != provider.source.inventory.files.len) return null;
+        if (delta.count() != provider.source.inventory.files.len) return null;
+        for (self.names) |name| if (!index.acceptsDeltaFor(name, delta)) return null;
         for (delta.prior_changed) |file| if (file.aggregate_digest == null) return null;
         var prior: ?[32]u8 = null;
         for (self.names, 0..) |name, slot| {
@@ -1450,7 +1612,9 @@ test "external lake partitioned aggregate trees retain unaffected groups with la
         defer index.deinit();
         index.counted = true;
         index.prior_roots = previous_roots;
-        if (previous_navigation) |prior| index.predecessor = .{ .source = prior.source, .schema = prior.schema, .snapshot = prior.snapshot, .count = prior.count };
+        if (previous_navigation) |prior| {
+            for (previous.declarations) |declaration| try index.predecessors.put(a, declaration.name, .{ .source = prior.source, .schema = prior.schema, .snapshot = prior.snapshot, .count = prior.count, .cut = try navigation_api.cutIdentity(a, prior) });
+        }
         var navigation = try navigation_api.build(a, output.allocator(), &store, &provider, previous_navigation, .none);
         defer navigation.deinit();
         provider.native_delta = navigation.delta;
@@ -1799,4 +1963,118 @@ test "external lake exact numeric radix updates reuse unchanged Parquet through 
         previous = built;
     }
     try std.testing.expectEqual(@as(u64, 25), cumulative.aggregate.rows);
+}
+
+test "external lake keyed aggregate jobs own publication phases drain failures and retain row state" {
+    const a = std.testing.allocator;
+    const Scheduler = local.sql_parallel_scheduler;
+    const Rows = local.storage_rowsource_types;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const out = arena.allocator();
+    var directory = try local.common_test_directory.TestDirectory.init("parallel-row-aggregates");
+    defer directory.cleanup();
+    var fs = try @import("../serverless/artifacts/fs_store.zig").FsStore.init(a, directory.path());
+    defer fs.deinit();
+    var store = fs.artifactStore();
+    store.upload_scope = try stores.UploadScope.forPublication(@splat(9), 1, std.testing.io);
+    const Fixture = struct {
+        const Self = @This();
+        opened: std.atomic.Value(usize) = .init(0),
+        active: std.atomic.Value(usize) = .init(0),
+        peak: std.atomic.Value(usize) = .init(0),
+        ready: std.Io.Event = .unset,
+        fail: bool = false,
+        const Cursor = struct {
+            owner: *Self,
+            file: usize,
+            done: bool = false,
+            values: [2]i64,
+            refs: [2]Rows.RowRef = undefined,
+            columns: [2]Rows.ColumnVector = undefined,
+            fn next(raw: *anyopaque, _: A) !?Rows.ColumnBatch {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                if (self.done) return null;
+                self.done = true;
+                if (self.owner.fail and self.file == 0) return error.InjectedUploadFailure;
+                for (&self.refs, 0..) |*ref, row| ref.* = .{ .external = .{ .source_id = "source", .snapshot_id = "snapshot", .file_id = if (self.file == 0) "a" else "b", .row_group_ordinal = 0, .row_ordinal = row } };
+                self.columns = .{ .{ .name = "k", .values = .{ .bytes = &.{ "key", "key" } } }, .{ .name = "n", .values = .{ .i64 = &self.values } } };
+                return .{ .snapshot = .{ .table_id = "source", .snapshot_id = "snapshot" }, .columns = &self.columns, .row_refs = &self.refs };
+            }
+            fn close(raw: *anyopaque, alloc: A) void {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                _ = self.owner.active.fetchSub(1, .monotonic);
+                alloc.destroy(self);
+            }
+        };
+        fn open(raw: *anyopaque, alloc: A, _: local.serverless_segment_source_binding.Binding, file: ?usize, _: @import("antfly_cancellation").CancellationToken, phase: ?*const stores.IoPhase) !Rows.Source {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expect(phase != null);
+            const cursor = try alloc.create(Cursor);
+            cursor.* = .{ .owner = self, .file = file.?, .values = .{ @intCast(file.? + 1), 7 } };
+            const active = self.active.fetchAdd(1, .monotonic) + 1;
+            _ = self.peak.fetchMax(active, .monotonic);
+            if (self.opened.fetchAdd(1, .monotonic) == 1) self.ready.set(std.testing.io);
+            self.ready.wait(std.testing.io) catch |err| {
+                Cursor.close(cursor, alloc);
+                return err;
+            };
+            return .{ .kind = .external_parquet, .ctx = cursor, .next_batch = Cursor.next, .deinit_fn = Cursor.close };
+        }
+    };
+    var files = [_]local.serverless_external_source_types.FileEntry{
+        .{ .file_id = @constCast("a"), .object_uri = @constCast("file:///a"), .row_count = 2, .byte_len = 1, .row_groups = &.{} },
+        .{ .file_id = @constCast("b"), .object_uri = @constCast("file:///b"), .row_count = 2, .byte_len = 1, .row_groups = &.{} },
+    };
+    var source: local.serverless_query_lake_serving.ServingSource = .{ .alloc = a, .store = undefined, .scanner = undefined, .inventory = .{ .format = .parquet, .source_id = @constCast("source"), .source_uri = @constCast("file:///source"), .snapshot_id = @constCast("snapshot"), .schema_fingerprint = @constCast("schema"), .files = &files } };
+    source.scanner.shared_reader = null;
+    source.scanner.iceberg_delete_plan = null;
+    const binding: local.serverless_segment_source_binding.Binding = .{ .sidecar_kind = .algebraic, .source_kind = .external_parquet, .row_ref_kind = .external, .source_id = "source", .snapshot_id = "snapshot", .schema_fingerprint = "schema", .index_config_hash = "rows", .column_bindings = &.{ "k", "n" } };
+    const recipe: recipes.Recipe = .{ .keys = &.{.{ .path = "k", .type = .string, .nullable = false }}, .inputs = &.{.{ .spec = .{ .kind = .sum, .input_type = .integer }, .column = .{ .path = "n", .type = .integer, .nullable = false } }} };
+    const Check = struct {
+        fn check(_: *anyopaque) !void {}
+    };
+    var marker: u8 = 0;
+    var spill: local.sql_spill.Manager = .{ .alloc = a, .io = std.testing.io, .context = &marker, .checkpoint = Check.check };
+    defer spill.deinit();
+    var old: ContributionIndex = .empty;
+    defer old.deinit(a);
+    var contributions: std.ArrayList(local.metadata_lake_index_catalog.FileContribution) = .empty;
+    const scheduler = Scheduler.global();
+    const io_limit = scheduler.max_io_workers;
+    scheduler.max_io_workers = 1;
+    defer scheduler.max_io_workers = io_limit;
+    const initial_pull = scheduler.pull_bytes;
+    const initial_workers = scheduler.workers;
+    for (0..3) |mode| {
+        var fixture: Fixture = .{ .fail = mode == 1 };
+        var provider: @import("lake_index_row_source.zig").Provider = .{ .source = &source, .context = .{ .io = std.testing.io, .deadline_ns = if (mode == 2) 1 else null }, .fragment_rows = .{ .ptr = &fixture, .open = Fixture.open } };
+        var budget = try @import("../serverless/build/lake_build_limits.zig").Budget.init(.{});
+        var execution: Scheduler.Execution = .{ .scheduler = scheduler, .bytes = 8 * 1024 * 1024 };
+        defer execution.pause();
+        try execution.enter(std.testing.io);
+        var io_phase: stores.ExecutionIo = .{ .execution = &execution, .io = std.testing.io };
+        store.io_phase = io_phase.capability();
+        var resolver: LeafResolver = .{ .a = a, .out = out, .provider = &provider, .source = &source, .binding = binding, .recipe = recipe, .names = &.{"sum"}, .old = &old, .previous = &.{}, .index = null, .metadata_count = false, .store = &store, .spill = &spill, .budget = &budget, .cancellation = .none, .contributions = &contributions };
+        const leaves = [_]Reduction.Leaf{ .{ .key = @splat(1), .index = 0 }, .{ .key = @splat(2), .index = 1 } };
+        if (mode == 1) {
+            try std.testing.expectError(error.InjectedUploadFailure, resolver.resolveRowsParallel(&leaves));
+        } else if (mode == 2) {
+            try std.testing.expectError(error.DeadlineExceeded, resolver.resolveRowsParallel(&leaves));
+        } else {
+            const result = try resolver.resolveRowsParallel(&leaves);
+            try std.testing.expect(result.ptr != &leaves);
+            try std.testing.expectEqual(@as(usize, 2), fixture.peak.load(.monotonic));
+            for (result) |leaf| {
+                const seed = (try artifacts.rowSeed(out, store, leaf.refs[0], recipe, .none)).?;
+                try std.testing.expectEqual(@as(u64, 2), seed.rows.rows.?.records);
+                try std.testing.expectEqual(@as(u64, 2), seed.rows.reverse.?.records);
+            }
+        }
+        execution.pause();
+        try std.testing.expectEqual(@as(usize, 0), fixture.active.load(.monotonic));
+        try std.testing.expectEqual(initial_pull, scheduler.pull_bytes);
+        try std.testing.expectEqual(initial_workers, scheduler.workers);
+        try std.testing.expectEqual(@as(usize, 0), scheduler.io_workers);
+    }
 }

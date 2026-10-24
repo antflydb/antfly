@@ -737,6 +737,7 @@ const ParallelScan = struct {
 };
 
 pub const Stream = struct {
+    owner: ?runtime.MemoryOwner = null,
     budget: Budget,
     regex_execution: @import("regex_execution.zig"),
     arena: std.heap.ArenaAllocator,
@@ -768,7 +769,20 @@ pub const Stream = struct {
     /// Caller retains the compiled plan and backend until close. A null result
     /// selects the bounded materializing executor for unsupported shapes or
     /// when spilling is unavailable. No row reads occur on that decline path.
+    pub fn openOwned(owner: runtime.MemoryOwner, backend: catalog.Backend, compiled: *const compiler.Compiled, parameters: []const Json, limits: runtime.Limits) !?*Stream {
+        var adopted = false;
+        defer if (!adopted) owner.deinit();
+        const self = (openInner(owner.allocator, backend, compiled, parameters, limits, owner) catch |err| return owner.mapError(err)) orelse return null;
+        self.owner = owner;
+        adopted = true;
+        return self;
+    }
+
     pub fn open(alloc: std.mem.Allocator, backend: catalog.Backend, compiled: *const compiler.Compiled, parameters: []const Json, limits: runtime.Limits) !?*Stream {
+        return openInner(alloc, backend, compiled, parameters, limits, null);
+    }
+
+    fn openInner(alloc: std.mem.Allocator, backend: catalog.Backend, compiled: *const compiler.Compiled, parameters: []const Json, limits: runtime.Limits, memory_owner: ?runtime.MemoryOwner) !?*Stream {
         if (compiled.statement != .select) return null;
         if (parameters.len != compiled.parameter_count) return error.InvalidSqlParameters;
         if (limits.execution_batch_rows == 0 or limits.execution_batch_rows > 4096 or limits.page_rows == 0 or limits.page_rows > 4096 or limits.page_bytes == 0 or limits.scan_rows == 0 or limits.scan_pages == 0) return error.InvalidSqlLimit;
@@ -776,7 +790,8 @@ pub const Stream = struct {
         const memory = try limits.workingMemory();
         const self = try alloc.create(Stream);
         errdefer alloc.destroy(self);
-        self.budget = .{ .backing = alloc, .limit = memory };
+        self.owner = null;
+        self.budget = .{ .backing = alloc, .limit = memory, .pressure = if (memory_owner) |retained| retained.pressure else null };
         self.regex_execution = .init(self.budget.allocator(), @min(16 * 1024 * 1024, limits.retained_bytes));
         errdefer self.regex_execution.deinit();
         self.arena = std.heap.ArenaAllocator.init(self.budget.allocator());
@@ -977,6 +992,7 @@ pub const Stream = struct {
     }
 
     pub fn close(self: *Stream) void {
+        const owner = self.owner;
         if (self.parallel) |pipeline| pipeline.close();
         if (self.pending_columns) |page| page.deinit();
         if (self.spool) |spool| spool.close();
@@ -992,6 +1008,7 @@ pub const Stream = struct {
         self.arena.deinit();
         std.debug.assert(self.budget.live == 0);
         self.budget.backing.destroy(self);
+        if (owner) |retained| retained.deinit();
     }
 
     pub fn next(self: *Stream, max_rows: u32) !Page {
@@ -1015,7 +1032,7 @@ pub const Stream = struct {
         if (self.cursor) |cursor| cursor.close(cursor.ptr);
         self.cursor = null;
         if (err == error.OutOfMemory and self.budget.exhausted) return error.SqlProgramLimitExceeded;
-        return err;
+        return if (self.owner) |owner| owner.mapError(err) else err;
     }
 
     pub fn nextBatch(self: *Stream, max_rows: u32) !BatchPage {
@@ -2923,4 +2940,34 @@ test "SQL blocking production sort ingestion keeps scan JSON frozen" {
             try std.testing.expectError(error.SqlTypeMismatch, runtime.execute(a, invalid_backend, &narrow, &.{}, .{ .retained_bytes = 512 * 1024, .page_rows = 16 }));
         }
     }
+}
+
+test "SQL owned streams release allocator capability after delivery decline and allocation failures" {
+    const Case = struct {
+        fn release(raw: *anyopaque) void {
+            const calls: *usize = @ptrCast(@alignCast(raw));
+            calls.* += 1;
+        }
+        fn run(a: std.mem.Allocator) !void {
+            var fixture: Fixture = .{ .count = 4 };
+            var compiled = try compiler.compile(a, "SELECT n FROM docs", .{});
+            defer compiled.deinit();
+            var calls: usize = 0;
+            defer std.debug.assert(calls == 1);
+            const owner: runtime.MemoryOwner = .{ .allocator = a, .ptr = &calls, .release = release };
+            const stream = (try Stream.openOwned(owner, fixture.backend(), &compiled, &.{}, .{})).?;
+            defer stream.close();
+            try std.testing.expectEqual(@as(usize, 0), calls);
+            var page = try stream.next(4);
+            defer page.deinit();
+            try std.testing.expectEqual(@as(usize, 4), page.output.rows.len);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
+    var fixture: Fixture = .{};
+    var compiled = try compiler.compile(std.testing.allocator, "CREATE TABLE d (id TEXT PRIMARY KEY)", .{});
+    defer compiled.deinit();
+    var calls: usize = 0;
+    try std.testing.expect((try Stream.openOwned(.{ .allocator = std.testing.allocator, .ptr = &calls, .release = Case.release }, fixture.backend(), &compiled, &.{}, .{})) == null);
+    try std.testing.expectEqual(@as(usize, 1), calls);
 }

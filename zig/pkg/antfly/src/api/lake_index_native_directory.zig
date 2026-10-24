@@ -33,12 +33,18 @@ pub const Access = struct {
     reads: u64 = 512 * 1024 * 1024,
     writes: u64 = 512 * 1024 * 1024,
     work: ?*u64 = null,
+    publication: bool = false,
     pages: page_store.PageStore = undefined,
     pub fn init(self: *Access, store: stores.ArtifactStore, domain: [32]u8, token: Token, cached: ?artifacts.CachedRead) void {
         self.* = .{ .store = store, .domain = domain, .token = token, .cached = cached };
     }
+    pub fn initPublication(self: *Access, store: stores.ArtifactStore, domain: [32]u8, token: Token) void {
+        self.init(store, domain, token, null);
+        self.publication = true;
+    }
     pub fn backing(self: *Access) tree.Store {
         self.pages = .{ .domain = self.domain, .attempt = if (self.store.upload_scope) |scope| scope.attempt else @splat(0), .artifacts = &self.store, .cancellation = self.token, .remaining_read_bytes = &self.reads, .remaining_write_bytes = self.work orelse &self.writes, .read_cache = if (self.cached != null or self.navigation != null) .{ .ptr = self, .read = readPage } else null };
+        if (self.publication) self.pages.admitPublication();
         var result = self.pages.store();
         if (self.navigation != null) result.decoded_page = .{ .ptr = self, .read = acquirePage };
         return result;
@@ -52,11 +58,10 @@ pub const Access = struct {
         try stores.chargeReadBudget(&self.reads, ref.bytes);
         return self.navigation.?.acquirePage(a, self, ref);
     }
-    fn readPage(raw: *anyopaque, a: A, store: *stores.ArtifactStore, ref: local.serverless_manifest_artifact_ref.ArtifactRef, offset: u64, len: usize, _: [32]u8, token: Token, remaining: *u64) ![]u8 {
+    fn readPage(raw: *anyopaque, a: A, store: *stores.ArtifactStore, ref: local.serverless_manifest_artifact_ref.ArtifactRef, offset: u64, len: usize, digest: [32]u8, token: Token, remaining: *u64) ![]u8 {
         const self: *Access = @ptrCast(@alignCast(raw));
-        if (offset != 0 or len != ref.byte_len) return error.InvalidNativeLakeFiles;
-        try stores.chargeReadBudget(remaining, ref.byte_len);
-        return artifacts.readArtifact(a, store.*, .{ .artifact_id = ref.artifact_id, .checksum = ref.checksum, .byte_len = ref.byte_len }, token, self.cached);
+        try stores.chargeReadBudget(remaining, len);
+        return artifacts.readPageRange(a, store.*, .{ .artifact_id = ref.artifact_id, .checksum = ref.checksum, .byte_len = ref.byte_len }, offset, len, digest, token, self.cached);
     }
 };
 pub fn key(ordinal: usize) [8]u8 {
@@ -125,6 +130,13 @@ pub const Navigation = struct {
         hash.update(&access.domain);
         hash.update(&ref.digest);
         hash.update(&ref.attempt);
+        if (ref.pack) |pack_| {
+            hash.update(&pack_.digest);
+            var locator: [8]u8 = undefined;
+            std.mem.writeInt(u32, locator[0..4], pack_.bytes, .big);
+            std.mem.writeInt(u32, locator[4..8], pack_.offset, .big);
+            hash.update(&locator);
+        }
         var shape: [13]u8 = undefined;
         std.mem.writeInt(u32, shape[0..4], ref.bytes, .little);
         shape[4] = ref.height;
@@ -156,6 +168,7 @@ pub const Navigation = struct {
         // belong to the bounded cache item, with no request allocator retained.
         var underlying: Access = undefined;
         underlying.init(access.store, access.domain, access.token, access.cached);
+        underlying.publication = access.publication;
         var loader: Loader = .{ .access = &underlying, .ref = ref };
         const pages = try self.pageCache();
         var digest: [32]u8 = undefined;
@@ -173,12 +186,19 @@ pub const Navigation = struct {
         page.lease = .{ .owner = lease.cache, .item = lease.item, .release = Loader.release };
         return page;
     }
-    fn backing(self: *Navigation, access: *Access, store: stores.ArtifactStore, domain: [32]u8, token: Token, cached: ?artifacts.CachedRead) tree.Store {
+    fn backing(self: *Navigation, access: *Access, store: stores.ArtifactStore, domain: [32]u8, token: Token, cached: ?artifacts.CachedRead, publication: bool) tree.Store {
         access.init(store, domain, token, cached);
         access.navigation = self;
+        access.publication = publication;
         return access.backing();
     }
     pub fn lookup(self: *Navigation, root: files.Root, store: stores.ArtifactStore, path: []const u8, token: Token, cached: ?artifacts.CachedRead) !?files.File {
+        return self.lookupInner(root, store, path, token, cached, false);
+    }
+    pub fn lookupPublication(self: *Navigation, root: files.Root, store: stores.ArtifactStore, path: []const u8, token: Token) !?files.File {
+        return self.lookupInner(root, store, path, token, null, true);
+    }
+    fn lookupInner(self: *Navigation, root: files.Root, store: stores.ArtifactStore, path: []const u8, token: Token, cached: ?artifacts.CachedRead, publication: bool) !?files.File {
         try token.check();
         if (cached) |value| try value.context.ensureActive();
         if (root.directory == null) return root.find(path);
@@ -194,7 +214,7 @@ pub const Navigation = struct {
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
         var access: Access = undefined;
-        var cursor = try tree.Cursor.init(arena.allocator(), self.backing(&access, store, root.domain, token, cached), root.directory, path, null);
+        var cursor = try tree.Cursor.init(arena.allocator(), self.backing(&access, store, root.domain, token, cached, publication), root.directory, path, null);
         defer cursor.deinit();
         const row = (try cursor.next()) orelse return null;
         if (!std.mem.eql(u8, row.key, path)) return null;
@@ -212,6 +232,12 @@ pub const Navigation = struct {
     /// A single seek walks adjacent chunk descriptors, including cross-page
     /// ranges. Returned identities are owned by the operation arena.
     pub fn chunks(self: *Navigation, a: A, root: files.Root, store: stores.ArtifactStore, file: files.File, first: usize, count: usize, token: Token, cached: ?artifacts.CachedRead) ![]const artifacts.ChunkRef {
+        return self.chunksInner(a, root, store, file, first, count, token, cached, false);
+    }
+    pub fn chunksPublication(self: *Navigation, a: A, root: files.Root, store: stores.ArtifactStore, file: files.File, first: usize, count: usize, token: Token) ![]const artifacts.ChunkRef {
+        return self.chunksInner(a, root, store, file, first, count, token, null, true);
+    }
+    fn chunksInner(self: *Navigation, a: A, root: files.Root, store: stores.ArtifactStore, file: files.File, first: usize, count: usize, token: Token, cached: ?artifacts.CachedRead, publication: bool) ![]const artifacts.ChunkRef {
         try token.check();
         if (cached) |value| try value.context.ensureActive();
         const total = file.bytes / files.chunk_bytes + @intFromBool(file.bytes % files.chunk_bytes != 0);
@@ -245,7 +271,7 @@ pub const Navigation = struct {
             }
         }
         var access: Access = undefined;
-        var cursor = try tree.Cursor.init(a, self.backing(&access, store, root.domain, token, cached), file.chunk_root, &key(first), null);
+        var cursor = try tree.Cursor.init(a, self.backing(&access, store, root.domain, token, cached, publication), file.chunk_root, &key(first), null);
         defer cursor.deinit();
         for (result, first..) |*ref, ordinal| {
             const row = (try cursor.next()) orelse return error.InvalidNativeLakeFiles;
@@ -298,12 +324,19 @@ pub fn decodeFile(a: A, path: []const u8, bytes: []const u8, domain: [32]u8) !fi
 /// Return only value-owned references. The path borrows the lookup argument;
 /// no parsed descriptors or page buffers escape this small operation arena.
 pub fn lookup(root: files.Root, store: stores.ArtifactStore, path: []const u8, token: Token, cached: ?artifacts.CachedRead) !?files.File {
+    return lookupInner(root, store, path, token, cached, false);
+}
+pub fn lookupPublication(root: files.Root, store: stores.ArtifactStore, path: []const u8, token: Token) !?files.File {
+    return lookupInner(root, store, path, token, null, true);
+}
+fn lookupInner(root: files.Root, store: stores.ArtifactStore, path: []const u8, token: Token, cached: ?artifacts.CachedRead, publication: bool) !?files.File {
     if (root.directory == null) return root.find(path);
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
     const a = arena.allocator();
     var access: Access = undefined;
     access.init(store, root.domain, token, cached);
+    access.publication = publication;
     var cursor = try tree.Cursor.init(a, access.backing(), root.directory, path, null);
     defer cursor.deinit();
     const row = (try cursor.next()) orelse return null;
@@ -389,7 +422,7 @@ pub fn publishPrefix(a: A, out: A, source: local.storage_lsm_backend.Storage, ph
     try stores.chargeReadBudget(budget.generation, size);
     const scope = store.upload_scope orelse return error.InvalidArtifactUploadScope;
     var access: Access = undefined;
-    access.init(store.*, scope.domain, token, null);
+    access.initPublication(store.*, scope.domain, token);
     access.work = budget.work;
     const old = if (reuse) |previous| try previous.lookup(store.*, relative, token) else null;
     var root: ?tree.Ref = null;
@@ -403,30 +436,42 @@ pub fn publishPrefix(a: A, out: A, source: local.storage_lsm_backend.Storage, ph
     defer arena.deinit();
     var pending: std.ArrayList(tree.Mutation) = .empty;
     var ordinal: usize = if (root != null) begin else 0;
-    while (ordinal < count) : (ordinal += 1) {
-        try token.check();
-        const offset = @as(u64, @intCast(ordinal)) * files.chunk_bytes;
-        const length = @min(files.chunk_bytes, size - offset);
-        const ref = if (old) |prior| retained: {
-            if (offset >= prior.bytes) break :retained null;
-            const previous = if (reuse.?.navigation) |navigation| (try navigation.chunks(arena.allocator(), reuse.?.root, store.*, prior, ordinal, 1, token, null))[0] else try chunk(arena.allocator(), &access, prior, ordinal);
-            break :retained if (previous.byte_len == length) previous else null;
-        } else null;
-        const retained = ref orelse upload: {
-            const bytes = try source.readFileRangeAlloc(a, physical, offset, @intCast(length));
-            defer a.free(bytes);
-            if (budget.work) |remaining| try stores.chargeReadBudget(remaining, bytes.len);
-            var uploaded = try store.putWithCancellation(bytes, token);
-            defer uploaded.deinit(store.allocator);
-            break :upload artifacts.ChunkRef{ .artifact_id = try arena.allocator().dupe(u8, uploaded.artifact_id), .checksum = try arena.allocator().dupe(u8, uploaded.checksum), .byte_len = uploaded.byte_len };
-        };
-        const encoded = try std.json.Stringify.valueAlloc(arena.allocator(), retained, .{});
-        try pending.append(arena.allocator(), .{ .key = try arena.allocator().dupe(u8, &key(ordinal)), .value = encoded });
-        if (pending.items.len == 256 or ordinal + 1 == count) {
+    while (ordinal < count) {
+        const end = @min(count, ordinal + files.captureWidth(a, store));
+        var wave = std.heap.ArenaAllocator.init(a);
+        defer wave.deinit();
+        var refs: [stores.ArtifactStore.max_upload_batch]artifacts.ChunkRef = undefined;
+        var contents: [stores.ArtifactStore.max_upload_batch][]const u8 = undefined;
+        var positions: [stores.ArtifactStore.max_upload_batch]usize = undefined;
+        var uploads: usize = 0;
+        for (ordinal..end) |position| {
+            try token.check();
+            const offset = @as(u64, @intCast(position)) * files.chunk_bytes;
+            const length = @min(files.chunk_bytes, size - offset);
+            if (old) |prior| if (offset < prior.bytes) {
+                const previous = if (reuse.?.navigation) |navigation| (try navigation.chunksPublication(arena.allocator(), reuse.?.root, store.*, prior, position, 1, token))[0] else try chunk(arena.allocator(), &access, prior, position);
+                if (previous.byte_len == length) {
+                    refs[position - ordinal] = previous;
+                    continue;
+                }
+            };
+            contents[uploads] = try source.readFileRangeAlloc(wave.allocator(), physical, offset, @intCast(length));
+            positions[uploads] = position - ordinal;
+            uploads += 1;
+        }
+        var uploaded: [stores.ArtifactStore.max_upload_batch]artifacts.ChunkRef = undefined;
+        try files.uploadChunks(arena.allocator(), store, token, budget, contents[0..uploads], uploaded[0..uploads]);
+        for (positions[0..uploads], uploaded[0..uploads]) |position, ref| refs[position] = ref;
+        for (refs[0 .. end - ordinal], ordinal..) |ref, position| {
+            const encoded = try std.json.Stringify.valueAlloc(arena.allocator(), ref, .{});
+            try pending.append(arena.allocator(), .{ .key = try arena.allocator().dupe(u8, &key(position)), .value = encoded });
+        }
+        if (pending.items.len >= 256 or end == count) {
             root = try tree.apply(a, access.backing(), root, pending.items);
             _ = arena.reset(.free_all);
             pending = .empty;
         }
+        ordinal = end;
     }
     return .{ .path = try out.dupe(u8, relative), .bytes = size, .chunk_root = root, .origin = if (old) |prior| prior.origin else null };
 }
@@ -450,7 +495,7 @@ pub fn applyChanges(a: A, store: *stores.ArtifactStore, prior: files.Root, chang
         if (index != 0 and std.mem.order(u8, changes[index - 1].path, change.path) != .lt) return error.InvalidNativeLakeFiles;
         const old = existing: {
             if (change.file) |file| if (file.origin) |origin| if (origin.matches(prior, change.path)) break :existing @as(?files.File, .{ .path = change.path, .bytes = origin.bytes, .chunk_root = origin.chunk_root });
-            break :existing try navigation.lookup(prior, store.*, change.path, token, null);
+            break :existing try navigation.lookupPublication(prior, store.*, change.path, token);
         };
         if (old) |file| {
             result.file_count = std.math.sub(u32, result.file_count, 1) catch return error.InvalidNativeLakeFiles;
@@ -466,7 +511,7 @@ pub fn applyChanges(a: A, store: *stores.ArtifactStore, prior: files.Root, chang
         }
     }
     var access: Access = undefined;
-    access.init(store.*, prior.domain, token, null);
+    access.initPublication(store.*, prior.domain, token);
     access.work = work;
     result.directory = try tree.apply(a, access.backing(), prior.directory, edits);
     try result.validate();
@@ -482,7 +527,7 @@ pub fn persist(a: A, out: A, store: *stores.ArtifactStore, staging: files.Root, 
     if (!std.mem.eql(u8, &scope.domain, &staging.domain)) return error.InvalidNativeLakeFiles;
     if (previous) |old| if (!std.mem.eql(u8, &old.domain, &staging.domain)) return error.InvalidNativeLakeFiles;
     var access: Access = undefined;
-    access.init(store.*, staging.domain, token, null);
+    access.initPublication(store.*, staging.domain, token);
     access.work = work;
     var root = if (previous) |old| old.directory else null;
     var arena = std.heap.ArenaAllocator.init(a);
@@ -500,7 +545,7 @@ pub fn persist(a: A, out: A, store: *stores.ArtifactStore, staging: files.Root, 
         if (total > files.max_chunks) return error.NativeLakeFilesTooLarge;
         const old = if (previous) |prior| authenticated: {
             if (file.origin) |origin| if (origin.matches(prior, file.path)) break :authenticated files.File{ .path = file.path, .bytes = origin.bytes, .chunk_root = origin.chunk_root };
-            break :authenticated try navigation.lookup(prior, store.*, file.path, token, null);
+            break :authenticated try navigation.lookupPublication(prior, store.*, file.path, token);
         } else null;
         if (root != null) if (old) |value| {
             try known.append(arena.allocator(), file.path);
@@ -510,7 +555,7 @@ pub fn persist(a: A, out: A, store: *stores.ArtifactStore, staging: files.Root, 
             if (prior.bytes == file.bytes and prior.chunk_root != null) {
                 var scratch = std.heap.ArenaAllocator.init(a);
                 defer scratch.deinit();
-                const refs = try navigation.chunks(scratch.allocator(), previous.?, store.*, prior, 0, file.chunks.len, token, null);
+                const refs = try navigation.chunksPublication(scratch.allocator(), previous.?, store.*, prior, 0, file.chunks.len, token);
                 const same = for (file.chunks, refs) |ref, previous_ref| {
                     if (ref.byte_len != previous_ref.byte_len or !std.mem.eql(u8, ref.artifact_id, previous_ref.artifact_id) or !std.mem.eql(u8, ref.checksum, previous_ref.checksum)) break false;
                 } else true;
@@ -780,7 +825,7 @@ test "external lake native decoded navigation leases avoid warm copies preserve 
     var navigation: Navigation = .{ .allocator = a };
     defer navigation.deinit();
     var access: Access = undefined;
-    const backing = navigation.backing(&access, store, root.domain, .none, null);
+    const backing = navigation.backing(&access, store, root.domain, .none, null, false);
     var cold = try tree.readPage(a, backing, root.directory.?);
     defer cold.deinit(a);
     try std.testing.expect(cold.lease != null);
@@ -809,7 +854,7 @@ test "external lake native decoded navigation leases avoid warm copies preserve 
     defer pressure.deinit();
     (try pressure.pageCache()).max_loading_bytes = 1;
     var uncached_access: Access = undefined;
-    var uncached = try tree.readPage(a, pressure.backing(&uncached_access, store, root.domain, .none, null), root.directory.?);
+    var uncached = try tree.readPage(a, pressure.backing(&uncached_access, store, root.domain, .none, null, false), root.directory.?);
     defer uncached.deinit(a);
     try std.testing.expect(uncached.lease == null);
     try std.testing.expectEqualStrings("file", uncached.entries[0].key);
