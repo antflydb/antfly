@@ -1456,8 +1456,10 @@ const TestProofs = struct {
     }
 
     fn nativeAdoptionRequestForHeader(head: barriers.Head, owner: barriers.Owner, destination_root: u128, header: contract.Header) !roots.Request {
+        const historical = header.phase == .released and header.transaction_coverage != null;
+        const history_only = header.phase == .canceled or historical;
         const Directory = @typeInfo(@FieldType(local.storage_db_relational_schema_root_contract.Qualification, "directory_head")).optional.child;
-        const directory: Directory = .{ .scope = try @FieldType(Directory, "scope").fromBinding(owner.binding), .phase = if (header.phase == .canceled) .retired else .ready };
+        const directory: Directory = .{ .scope = try @FieldType(Directory, "scope").fromBinding(owner.binding), .phase = if (history_only) .retired else .ready };
         const encoded = try header.encode(std.testing.allocator);
         defer std.testing.allocator.free(encoded);
         var image: local.storage_db_relational_schema_root_contract.Evidence = .{
@@ -1465,7 +1467,7 @@ const TestProofs = struct {
                 .signing_root = 7,
                 .physical_root = destination_root,
                 .checkpoint_digest = @splat(91),
-                .rows = .{ .header = header, .snapshot_cut = header.updated, .coverage = if (header.phase == .canceled) .none else .full, .records = if (header.phase == .canceled) 0 else header.records, .rows = if (header.phase == .canceled) 0 else header.rows_scanned, .cursor_digest = header.cursor_digest, .reference_coverage = if (owner.binding.purpose == .not_null) null else .{} },
+                .rows = .{ .header = header, .snapshot_cut = header.updated, .coverage = if (historical) .history else if (history_only) .none else .full, .records = if (history_only) 0 else header.records, .rows = if (history_only) 0 else header.rows_scanned, .cursor_digest = if (history_only) contract.hash("") else header.cursor_digest, .reference_coverage = if (owner.binding.purpose == .not_null or historical) null else .{} },
                 .qualification = .{
                     .origin = .{ .physical_root_incarnation = destination_root, .namespace = owner.binding.fence.namespace, .authority = .{ .kind = .native, .namespace = local.storage_db_online_source_contract.namespaceBytes(owner.binding.fence.namespace), .sequence = header.updated.native.sequence }, .applied = null, .schema_header = contract.hash(encoded), .transaction_directory = contract.hash(&try directory.encode()), .schema_outcomes = null },
                     .directory_head = directory,
@@ -3455,6 +3457,180 @@ test "schema validation publication FK dependency admission and final cancellati
     const terminal_head = try readHead(&read, lookup);
     try std.testing.expectEqual(barriers.Phase.canceled, terminal_head.phase);
     try deps.requireSource(a, &read, terminal_head, source, true);
+    try deps.requireUnleased(&read, lookup.group, 7);
+    try verifyGroup(a, &read, lookup.group, &context);
+}
+
+test "schema validation publication FK released root adoption retains history and leases through terminal ACK faults" {
+    // Real metadata LSM with fixture catalog/enrollment callbacks. The native
+    // journal/restore campaign independently qualifies physical history proofs.
+    const a = std.testing.allocator;
+    const deps = @import("schema_validation_dependencies.zig");
+    var directory = try local.common_test_directory.TestDirectory.init("fk-validation-release-root");
+    defer directory.cleanup();
+    const path = try a.dupeSentinel(u8, directory.path(), 0);
+    defer a.free(path);
+    var fixture = try plan_mod.test_support.PlanFixture.init(a);
+    defer fixture.deinit();
+    var plan = fixture.plan();
+    plan.before.schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","unique_constraints":[{"name":"pk","columns":["id"]}],"foreign_keys":[{"name":"fk","child_columns":["parent_id"],"parent_table":"rows","parent_columns":["id"],"not_valid":true}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"},"parent_id":{"type":"integer","nullable":true}},"additionalProperties":false}}}}
+    ;
+    plan.after = try @import("../api/tables.zig").prepareSchemaValidationPublicationRecord(a, &plan.before, .{ .foreign_keys = &.{"fk"} });
+    defer @import("table_manager.zig").freeTable(a, plan.after);
+    var before = try local.schema_mod.PreparedSchemaDefinition.init(a, plan.before.schema_json);
+    defer before.deinit(a);
+    var after = try local.schema_mod.PreparedSchemaDefinition.init(a, plan.after.schema_json);
+    defer after.deinit(a);
+    const before_native = try local.storage_schema.serializeSchema(a, before.runtime_schema);
+    defer a.free(before_native);
+    const after_native = try local.storage_schema.serializeSchema(a, after.runtime_schema);
+    defer a.free(after_native);
+    const source: contract.ForeignKeySource = .{ .table_name = "rows", .parents = &.{.{ .constraint_name = "fk", .declared_parent = "rows", .parent_table = "rows", .parent_table_id = 7, .parent_schema_version = 1, .parent_schema = contract.hash(before_native), .parent_public = contract.hash(plan.before.schema_json), .parent_catalog = contract.hash("fixture-catalog"), .parent_unique = "pk", .parent_generation = @splat(4), .parent_definition = @splat(41) }} };
+    plan.selection = .{ .foreign_keys = source };
+    const payload = try plan.selection.encodePayload(a);
+    defer a.free(payload);
+    const input = try contract.encodeInputs(a, .{ plan.before.schema_json, plan.after.schema_json, "fixture-catalog", payload });
+    defer a.free(input);
+    var intents = fixture.intents;
+    for (&intents) |*intent| {
+        intent.binding.purpose = .foreign_key_source;
+        intent.binding.before_schema = contract.hash(before_native);
+        intent.binding.after_schema = contract.hash(after_native);
+        intent.binding.before_public = contract.hash(plan.before.schema_json);
+        intent.binding.after_public = contract.hash(plan.after.schema_json);
+        intent.binding.inputs = contract.hash(input);
+        intent.binding.fence.catalog_digest = contract.hash("fixture-catalog");
+    }
+    plan.owners = &intents;
+    var prepared = try plan_mod.Prepared.init(a, plan);
+    defer prepared.deinit();
+    const lookup = Lookup.fromHead(prepared.head);
+    const preps = [_]evidence.SignedPreparation{ try TestProofs.preparation(prepared.head, prepared.owners[0]), try TestProofs.preparation(prepared.head, prepared.owners[1]) };
+    var context: TestContext = .{};
+    const Store = local.storage_docstore.DocStore;
+    var store = try Store.open(a, path, .{});
+    var live = true;
+    defer if (live) store.close();
+    try store.put(TestContext.table_key, plan.before.schema_json);
+    var installed: [2]contract.Header = undefined;
+    var released: [2]contract.Header = undefined;
+    var request: roots.Request = undefined;
+    var previous: barriers.Owner = undefined;
+    {
+        var write = try store.beginWriteTxn();
+        errdefer write.abort();
+        try begin(a, &write, &prepared, &preps, &.{input}, &context);
+        var head = try readHead(&write, lookup);
+        var ready: [2]contract.Header = undefined;
+        for (prepared.owners, 0..) |owner, i| {
+            ready[i] = TestProofs.ready(owner);
+            ready[i].transaction_coverage = .{ .record = @splat(43), .physical_root = if (owner.binding.authority == .native) owner.physical_root_incarnation else 0 };
+            head = try acknowledge(&write, lookup, owner.ordinal, head.revision, try TestProofs.signed(head, owner, ready[i]), &context);
+        }
+        head = try decideInstall(&write, lookup, head.revision);
+        for (prepared.owners, 0..) |owner, i| {
+            installed[i] = ready[i];
+            installed[i].installation = .{ .decision = try head.installDecision(), .ready_digest = try ready[i].digest(), .ready_position = ready[i].updated, .ready_last_effect = ready[i].last_effect, .physical_catalog = @splat(16), .activation = @splat(17), .position = TestProofs.position(owner, 4) };
+            installed[i].phase = .installed;
+            installed[i].revision += 1;
+            installed[i].updated = TestProofs.position(owner, 4);
+            installed[i].last_effect = @splat(18);
+            head = try acknowledge(&write, lookup, owner.ordinal, head.revision, try TestProofs.signed(head, owner, installed[i]), &context);
+        }
+        head = try publish(a, &write, lookup, head.revision, &context);
+        for (prepared.owners, 0..) |owner, i| {
+            released[i] = installed[i];
+            released[i].release = .{ .publication = try head.publicationDecision(), .installed_digest = try installed[i].digest(), .installed_last_effect = installed[i].last_effect };
+            released[i].phase = .released;
+            released[i].revision += 1;
+            released[i].updated = TestProofs.position(owner, 5);
+            released[i].last_effect = @splat(19);
+        }
+        previous = try readOwner(&write, head, 0);
+        request = try TestProofs.nativeAdoptionRequestForHeader(head, previous, 97, released[0]);
+        try write.commit();
+    }
+    for ([_]bool{ false, true }) |after_write| for (1..5) |fail_write| {
+        var write = try store.beginWriteTxn();
+        var failing: FaultTxn = .{ .base = &write, .fail_write = fail_write, .after = after_write };
+        try std.testing.expectError(error.InjectedStorageFailure, adoptRoot(&failing, request, &context));
+        write.abort();
+        var read = try store.beginReadTxn();
+        defer read.abort();
+        const head = try readHead(&read, lookup);
+        try std.testing.expectEqualDeep(previous, try readOwner(&read, head, 0));
+        try deps.requireSource(a, &read, head, source, false);
+    };
+    {
+        var write = try store.beginWriteTxn();
+        errdefer write.abort();
+        _ = try adoptRoot(&write, request, &context);
+        try write.commit();
+    }
+    store.close();
+    live = false;
+    store = try Store.open(a, path, .{});
+    live = true;
+    {
+        var write = try store.beginWriteTxn();
+        errdefer write.abort();
+        // A lost adoption reply can be observed after cold restart even if
+        // the previous reporter is no longer authorized to create new proofs.
+        context.reject = true;
+        var counted: FaultTxn = .{ .base = &write };
+        var head = try adoptRoot(&counted, request, &context);
+        try std.testing.expectEqual(@as(usize, 0), counted.writes);
+        context.reject = false;
+        const owner = try readOwner(&write, head, 0);
+        try std.testing.expectEqual(@as(u128, 97), owner.physical_root_incarnation);
+        try std.testing.expectEqual(@as(u64, 1), owner.root_epoch);
+        try std.testing.expectEqualDeep(previous.headers, owner.headers);
+        try std.testing.expectEqualDeep(previous.proofs, owner.proofs);
+        head = try acknowledge(&write, lookup, 0, head.revision, try TestProofs.signed(head, owner, released[0]), &context);
+        try std.testing.expectEqual(@as(u16, 1), head.released);
+        try deps.requireSource(a, &write, head, source, false);
+        try verifyGroup(a, &write, lookup.group, &context);
+        try write.commit();
+    }
+    // Discover the complete final write set without committing it, then inject
+    // failure before and after every write, including lease/lock retirement.
+    const writes = counted: {
+        var write = try store.beginWriteTxn();
+        defer write.abort();
+        var counted: FaultTxn = .{ .base = &write };
+        const head = try readHead(&counted, lookup);
+        const owner = try readOwner(&counted, head, 1);
+        _ = try acknowledge(&counted, lookup, 1, head.revision, try TestProofs.signed(head, owner, released[1]), &context);
+        break :counted counted.writes;
+    };
+    try std.testing.expect(writes > 0);
+    for ([_]bool{ false, true }) |after_write| for (1..writes + 1) |fail_write| {
+        var write = try store.beginWriteTxn();
+        var failing: FaultTxn = .{ .base = &write, .fail_write = fail_write, .after = after_write };
+        const head = try readHead(&failing, lookup);
+        const owner = try readOwner(&failing, head, 1);
+        try std.testing.expectError(error.InjectedStorageFailure, acknowledge(&failing, lookup, 1, head.revision, try TestProofs.signed(head, owner, released[1]), &context));
+        write.abort();
+        var read = try store.beginReadTxn();
+        defer read.abort();
+        const retained = try readHead(&read, lookup);
+        try std.testing.expectEqual(@as(u16, 1), retained.released);
+        try deps.requireSource(a, &read, retained, source, false);
+    };
+    {
+        var write = try store.beginWriteTxn();
+        errdefer write.abort();
+        const head = try readHead(&write, lookup);
+        const owner = try readOwner(&write, head, 1);
+        _ = try acknowledge(&write, lookup, 1, head.revision, try TestProofs.signed(head, owner, released[1]), &context);
+        try write.commit();
+    }
+    var read = try store.beginReadTxn();
+    defer read.abort();
+    const completed_head = try readHead(&read, lookup);
+    try std.testing.expectEqual(barriers.Phase.succeeded, completed_head.phase);
+    try deps.requireSource(a, &read, completed_head, source, true);
     try deps.requireUnleased(&read, lookup.group, 7);
     try verifyGroup(a, &read, lookup.group, &context);
 }

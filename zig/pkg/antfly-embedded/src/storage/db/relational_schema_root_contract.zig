@@ -27,7 +27,8 @@ const Digest = [32]u8;
 const magic = "ASRP\x01\x00\x00\x00";
 const max_body = contract.max_header + 8192;
 pub const max_encoded = 76 + max_body;
-pub const Coverage = enum { none, prefix, full };
+/// History qualifies a completed control decision, never current row validity.
+pub const Coverage = enum { none, prefix, full, history };
 pub const RowSummary = struct {
     header: contract.Header,
     /// Actual audited read cut, not inferred Raft completion.
@@ -56,7 +57,11 @@ pub const RowSummary = struct {
     }
     fn validateCoverage(self: @This(), comptime complete: bool) !void {
         try self.header.validate();
-        if ((self.header.binding.purpose == .not_null) != (self.reference_coverage == null)) return error.InvalidSchemaValidationJob;
+        const historical = self.coverage == .history;
+        if (historical) {
+            if (self.header.phase != .released or self.header.binding.purpose != .foreign_key_source or
+                self.header.transaction_coverage == null or self.reference_coverage != null) return error.InvalidSchemaValidationJob;
+        } else if ((self.header.binding.purpose == .not_null) != (self.reference_coverage == null)) return error.InvalidSchemaValidationJob;
         if (self.reference_coverage) |coverage| try coverage.validate(self.header.binding.purpose, self.records, self.rows, self.header.binding.columns);
         if (complete and self.coverage != .none and self.header.phase != .released and !std.meta.eql(self.reference_coverage, self.header.reference_coverage)) return error.InvalidSchemaValidationJob;
         try self.snapshot_cut.requireNamespace(self.header.binding.fence.namespace);
@@ -65,11 +70,12 @@ pub const RowSummary = struct {
         const expected: Coverage = switch (self.header.phase) {
             .fencing, .canceling, .canceled => .none,
             .scanning, .failed => .prefix,
-            .ready, .installed, .released => .full,
+            .ready, .installed => .full,
+            .released => if (self.header.transaction_coverage != null) .history else .full,
         };
         if (self.coverage != expected or self.rows > self.records or std.mem.allEqual(u8, &self.cursor_digest, 0)) return error.InvalidSchemaValidationJob;
         switch (expected) {
-            .none => if (self.records != 0 or self.rows != 0 or !std.mem.eql(u8, &self.cursor_digest, &contract.hash(""))) return error.InvalidSchemaValidationJob,
+            .none, .history => if (self.records != 0 or self.rows != 0 or !std.mem.eql(u8, &self.cursor_digest, &contract.hash(""))) return error.InvalidSchemaValidationJob,
             .prefix, .full => if (self.header.phase != .released) {
                 if (complete) {
                     if (self.records != self.header.records or self.rows != self.header.rows_scanned or

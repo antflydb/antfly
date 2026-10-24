@@ -429,7 +429,10 @@ pub fn acknowledge(head: Head, owner: Owner, expected_revision: u64, observed: e
     };
     if (owner.binding.purpose == .foreign_key_source and (stage == .ready or stage == .installed or stage == .released or stage == .failed)) {
         const coverage = observed.header.transaction_coverage orelse return error.ForeignKeyValidationRequired;
-        if (owner.binding.authority == .native and coverage.physical_root != observed.physical_root_incarnation) return error.SchemaValidationRuntimeRecoveryRequired;
+        // Release is immutable publication history. Its original transaction
+        // root must remain intact; current-root adoption/authority is checked
+        // independently before this reducer receives terminal evidence.
+        if (owner.binding.authority == .native and stage != .released and coverage.physical_root != observed.physical_root_incarnation) return error.SchemaValidationRuntimeRecoveryRequired;
     }
     const index = @backingInt(stage);
     const header_digest = try observed.header.digest();
@@ -934,4 +937,44 @@ test "schema validation publication foreign keys require transaction coverage an
     try std.testing.expectEqual(Phase.canceling, head.phase);
     try std.testing.expectError(error.GenerationPublicationChanged, head.decideInstall(head.revision));
     try std.testing.expectError(error.GenerationPublicationChanged, Fixture.head().cancel(Fixture.head().revision, .foreign_key_violation));
+}
+
+// Reducer-only fixture. Root adoption and signatures are independently
+// verified by the ledger; this must not weaken ready/installed root checks.
+test "schema validation publication FK release preserves accepted native transaction roots after adoption" {
+    var head = Fixture.head();
+    head.owner_count = 1;
+    var owner = Fixture.owner(0);
+    owner.binding.purpose = .foreign_key_source;
+    var ready = Fixture.ready(owner);
+    ready.transaction_coverage = .{ .record = @splat(41), .physical_root = owner.physical_root_incarnation };
+    try Fixture.apply(&head, &owner, ready);
+    head = try head.decideInstall(head.revision);
+    var installed = ready;
+    installed.installation = .{ .decision = try head.installDecision(), .ready_digest = try ready.digest(), .ready_position = ready.updated, .ready_last_effect = ready.last_effect, .physical_catalog = @splat(16), .activation = @splat(17), .position = Fixture.position(owner, 4) };
+    installed.phase = .installed;
+    installed.revision += 1;
+    installed.updated = Fixture.position(owner, 4);
+    installed.last_effect = @splat(18);
+    try Fixture.apply(&head, &owner, installed);
+    head = try head.publish(head.revision);
+    var released = installed;
+    released.release = .{ .publication = try head.publicationDecision(), .installed_digest = try installed.digest(), .installed_last_effect = installed.last_effect };
+    released.phase = .released;
+    released.revision += 1;
+    released.updated = Fixture.position(owner, 5);
+    released.last_effect = @splat(19);
+    const accepted = owner;
+    owner.root_epoch = 1;
+    owner.root_origin = owner.physical_root_incarnation;
+    owner.root_digest = @splat(44);
+    owner.physical_root_incarnation += 1;
+    try std.testing.expectError(error.SchemaValidationRuntimeRecoveryRequired, acknowledge(head, owner, head.revision, try Fixture.proof(owner, ready)));
+    try std.testing.expectError(error.SchemaValidationRuntimeRecoveryRequired, acknowledge(head, owner, head.revision, try Fixture.proof(owner, installed)));
+    try Fixture.apply(&head, &owner, released);
+    try std.testing.expectEqual(Phase.succeeded, head.phase);
+    try std.testing.expectEqualSlices(u8, &accepted.headers[@backingInt(Stage.ready)], &owner.headers[@backingInt(Stage.ready)]);
+    try std.testing.expectEqualSlices(u8, &accepted.headers[@backingInt(Stage.installed)], &owner.headers[@backingInt(Stage.installed)]);
+    try std.testing.expectEqual(@as(u64, 0), owner.proof_epochs[@backingInt(Stage.installed)]);
+    try std.testing.expectEqual(@as(u64, 1), owner.proof_epochs[@backingInt(Stage.released)]);
 }

@@ -35,6 +35,8 @@ const ranges = [_]local.common_topology_records.RangeRecord{.{ .table_id = 300, 
 const Fixture = struct {
     db: *db_mod.DB,
     next_transaction: u8 = 20,
+    interrupt_after_prepare: bool = false,
+    interrupted_transaction: ?types.TxnId = null,
     fn lookup(ptr: *anyopaque, backing: std.mem.Allocator, table: []const u8, key: []const u8, options: types.LookupOptions, consistency: local.storage_read_consistency.ReadConsistency) !?reads.LookupResponse {
         const self: *@This() = @ptrCast(@alignCast(ptr));
         try std.testing.expectEqualStrings("rows", table);
@@ -52,6 +54,10 @@ const Fixture = struct {
         defer borrowed.deinit();
         const id = self.next_transaction;
         self.next_transaction += 1;
+        if (self.interrupt_after_prepare) {
+            self.interrupted_transaction = try self.prepare(&borrowed, id);
+            return error.InjectedParticipantDisconnect;
+        }
         try self.commit(&borrowed, id);
         return .{ .committed = .{ .participant_count = 1 } };
     }
@@ -609,6 +615,106 @@ fn expectReplacementCancellation(source: *db_mod.DB, directory: []const u8, name
     } else return error.CancellationAuditDidNotConverge;
 }
 
+// The writer is interrupted after a real production participant prepare.
+// Restore preserves that transaction; root restart cannot overtake its decision.
+fn expectPreparedPageRestore(source: *Fixture, directory: []const u8, options: db_mod.OpenOptions, binding: local.storage_db_relational_schema_owner_contract.Binding, inputs: []const u8) !void {
+    const lifecycle = local.storage_db_generation_lifecycle;
+    const rows = @import("schema_validation_rows.zig");
+    try std.testing.expectEqual(rows.Result.pending, try rows.step(a, source.source(), source.writer(), &tables, &ranges, ranges[0], binding, inputs, source.db.root_incarnation, false, .{}));
+    const initial = (try source.db.core.getStoreValue(a, activation.validation_key)).?;
+    defer a.free(initial);
+    source.interrupt_after_prepare = true;
+    defer source.interrupt_after_prepare = false;
+    try std.testing.expectError(error.InjectedParticipantDisconnect, local.api_relational_activation_worker.runForeignKeyValidationPage(a, source.source(), source.writer(), &tables, &ranges, ranges[0], binding.id));
+    source.interrupt_after_prepare = false;
+    const prepared = source.interrupted_transaction.?;
+    // Leave the original source available for the rest of the campaign.
+    defer source.db.abortTransaction(prepared, 9001) catch unreachable;
+    try expectCheckpoint(source.db, initial);
+    _ = try source.db.snapshotNative("prepared-validation");
+    const snapshot = try std.fmt.allocPrint(a, "{s}.snapshots/prepared-validation", .{source.db.core.path});
+    defer a.free(snapshot);
+    for ([_]bool{ false, true }) |commit| {
+        const path = try std.fs.path.join(a, &.{ directory, if (commit) "prepared-commit" else "prepared-abort" });
+        defer a.free(path);
+        {
+            var transition = try lifecycle.beginProcessExclusive(path);
+            defer transition.deinit();
+            var staged = try transition.beginStaging();
+            defer staged.deinit();
+            try db_mod.DB.restoreIdentityPreservingSnapshotToStagedGeneration(&staged, a, snapshot, staged.path(), options, options.identity_namespace.?);
+            _ = try staged.publish();
+        }
+        var restored = try db_mod.DB.open(a, path, options);
+        var live = true;
+        defer if (live) restored.close();
+        try std.testing.expect(source.db.root_incarnation != restored.root_incarnation);
+        try expectCheckpoint(&restored, initial);
+        var receiver: Fixture = .{ .db = &restored, .next_transaction = 120 };
+        try std.testing.expectError(error.IntentConflict, rows.step(a, receiver.source(), receiver.writer(), &tables, &ranges, ranges[0], binding, inputs, restored.root_incarnation, false, .{}));
+        try expectCheckpoint(&restored, initial);
+        if (commit) try restored.commitTransaction(prepared, 9001) else try restored.abortTransaction(prepared, 9001);
+        restored.close();
+        live = false;
+        restored = try db_mod.DB.open(a, path, options);
+        live = true;
+        // The original transaction's durable decision is recovered, not
+        // inferred from the source cursor or reset by a new primary root.
+        if (commit) try restored.commitTransaction(prepared, 9001) else try restored.abortTransaction(prepared, 9001);
+        const decided_raw = (try restored.core.getStoreValue(a, activation.validation_key)).?;
+        defer a.free(decided_raw);
+        const decided = try activation.ForeignKeyValidationRecord.decode(decided_raw);
+        try std.testing.expectEqual(source.db.root_incarnation, decided.physical_root);
+        try std.testing.expectEqual(if (commit) activation.State.enforced else activation.State.validating, decided.progress.state);
+        try std.testing.expectEqual(@as(u64, if (commit) 2 else 0), decided.progress.rows_scanned);
+        try std.testing.expectError(error.SchemaValidationRuntimeRecoveryRequired, restored.prepareNativeSchemaOwnerControl(.{ .binding = binding, .action = .begin, .payload = inputs }, .{}));
+        try std.testing.expectEqual(rows.Result.pending, try rows.step(a, receiver.source(), receiver.writer(), &tables, &ranges, ranges[0], binding, inputs, restored.root_incarnation, false, .{}));
+        const fresh_raw = (try restored.core.getStoreValue(a, activation.validation_key)).?;
+        defer a.free(fresh_raw);
+        const fresh = try activation.ForeignKeyValidationRecord.decode(fresh_raw);
+        try std.testing.expectEqual(restored.root_incarnation, fresh.physical_root);
+        try std.testing.expectEqual(activation.State.validating, fresh.progress.state);
+        try std.testing.expectEqual(@as(u64, 0), fresh.progress.rows_scanned);
+        try std.testing.expectEqual(decided.revision + 1, fresh.revision);
+        for (0..16) |_| {
+            if (try rows.step(a, receiver.source(), receiver.writer(), &tables, &ranges, ranges[0], binding, inputs, restored.root_incarnation, false, .{}) == .ready) break;
+        } else return error.ValidationDidNotConverge;
+        _ = try applyControl(&restored, .{ .binding = binding, .action = .begin, .payload = inputs });
+        const ready = try applyControl(&restored, .{ .binding = binding, .action = .freeze });
+        try std.testing.expectEqual(restored.root_incarnation, ready.transaction_coverage.?.physical_root);
+        var install: [64]u8 = @splat(93);
+        @memcpy(install[32..64], &try ready.digest());
+        const installed = try applyControl(&restored, .{ .binding = binding, .action = .install, .payload = &install });
+        var release: [96]u8 = @splat(94);
+        @memcpy(release[0..32], install[0..32]);
+        @memcpy(release[32..64], &try installed.digest());
+        _ = try applyControl(&restored, .{ .binding = binding, .action = .release, .payload = &release });
+        restored.close();
+        live = false;
+        restored = try db_mod.DB.open(a, path, options);
+        live = true;
+        try std.testing.expectEqual(@as(u32, 2), restored.core.schema.?.version);
+        const public = (try restored.core.getStoreValue(a, "\x00\x00__metadata__:schema_json")).?;
+        defer a.free(public);
+        try std.testing.expect(std.mem.indexOf(u8, public, "\"not_valid\":false") != null);
+        var child = (try restored.lookup(a, "child", .{})).?;
+        defer child.deinit(a);
+        var document = try std.json.parseFromSlice(std.json.Value, a, child.json, .{});
+        defer document.deinit();
+        try std.testing.expectEqual(@as(i64, 1), document.value.object.get("parent_id").?.integer);
+        try std.testing.expectEqualStrings("referencing", document.value.object.get("payload").?.string);
+        const active = [_]local.common_topology_records.TableRecord{.{ .table_id = 300, .name = "rows", .schema_json = public }};
+        referenced: {
+            var deletion = planner.prepareWithCoverageControlled(a, receiver.source(), &active, &ranges, &.{.{ .table_name = "rows", .deletes = &.{"parent"} }}, .{}) catch |err| {
+                try std.testing.expectEqual(error.ForeignKeyReferenced, err);
+                break :referenced;
+            };
+            defer deletion.deinit();
+            try std.testing.expectError(error.ForeignKeyReferenced, receiver.prepare(&deletion, 150));
+        }
+    }
+}
+
 fn replayValidationJournal(journal: *@import("../storage/hot_standby/primary.zig").Primary, db: *db_mod.DB, next_lsn: *u64) !void {
     while (next_lsn.* <= journal.lastLsn()) : (next_lsn.* += 1) {
         var entry = (try journal.log.entryAt(a, next_lsn.*)) orelse return error.MissingReplicationRecord;
@@ -664,6 +770,7 @@ test "foreign key validation native snapshot restarts unaccepted coverage on the
         return err;
     };
     read.abort();
+    try expectPreparedPageRestore(&original, directory.path(), options, binding, candidate.inputs);
     for (0..16) |_| {
         if (try rows.step(a, original.source(), original.writer(), &tables, &ranges, ranges[0], binding, candidate.inputs, source.root_incarnation, false, .{}) == .ready) break;
     } else return error.ValidationDidNotConverge;
@@ -819,7 +926,30 @@ test "foreign key validation native snapshot restarts unaccepted coverage on the
     @memcpy(release_payload[32..64], &try installed.digest());
     const released = try applyControl(&restored, .{ .binding = binding, .action = .release, .payload = &release_payload });
     try replayValidationJournal(&journal, &peer, &next_lsn);
+    peer.close();
+    peer_live = false;
+    peer = try db_mod.DB.open(a, peer_path, options);
+    peer_live = true;
     try std.testing.expectEqualDeep(released, (try peer.observeNativeSchemaOwner(binding, .{})).header.?);
+    // A released FK is publication history, not a new data-validity grant.
+    // Qualify the actual standby root after the transient record was deleted.
+    const signing = try local.storage_db_root_signing_identity.loadOrCreate(a, std.Options.debug_io, peer_path);
+    for (0..256) |_| {
+        const audit = try peer.stepSchemaOwnerRowAudit(binding.fence.owner_group_id, binding, candidate.inputs, .{ .rows = 1, .records = 1 }, peer_path, signing.root_incarnation, .{});
+        try audit.requireFor(binding, signing.root_incarnation, signing.public_key);
+        if (audit == .complete) {
+            try std.testing.expectEqual(peer.root_incarnation, audit.complete.value.physical_root);
+            try std.testing.expectEqualDeep(released, audit.complete.value.rows.header);
+            try std.testing.expectEqual(.history, audit.complete.value.rows.coverage);
+            try std.testing.expectEqual(@as(u64, 0), audit.complete.value.rows.records);
+            try std.testing.expectEqual(@as(u64, 0), audit.complete.value.rows.rows);
+            try std.testing.expectEqual(restored.root_incarnation, audit.complete.value.rows.header.transaction_coverage.?.physical_root);
+            var forged = audit.complete.value.rows;
+            forged.header = ready;
+            try std.testing.expectError(error.InvalidSchemaValidationJob, forged.validate());
+            break;
+        }
+    } else return error.ReleasedHistoryAuditDidNotConverge;
     const remaining = try peer.core.getStoreValue(a, activation.validation_key);
     defer if (remaining) |bytes| a.free(bytes);
     try std.testing.expect(remaining == null);

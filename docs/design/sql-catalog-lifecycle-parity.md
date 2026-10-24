@@ -322,6 +322,59 @@ boundary checks pass. Latest `origin/main` is already contained in this branch.
 This closes cancellation cleanup, not successful replacement-root FK validation;
 the original-case ledger counts and the public FK VALIDATE guard are unchanged.
 
+### Prepared FK page restore and terminal publication history (2026-10-24)
+
+The native restore campaign now interrupts a real participant after preparing a
+source validation page and before its decision. A native checkpoint includes
+the original row guards, parent attachment intents, progress CAS and transaction
+schema lease. Both commit and abort decisions are exercised on real staged,
+identity-preserving replacement roots. Restart is rejected while the old
+transaction still owns its locks. Its recovered decision and duplicate decision
+delivery survive cold reopen; committing the old page does not turn the copied
+root commitment into current-root coverage. The receiver restarts validation
+at zero, completes ordinary guarded parent transactions, installs and releases
+the schema, reopens again and enforces referenced-parent deletion protection.
+The original source independently aborts its prepared page and continues.
+This is a native single-participant 2PC/storage campaign, not a claim of a
+multi-owner backup or Raft quorum qualification.
+
+Released FK owners have a separate `history` audit coverage kind. Their primary
+schema installation and metadata publication are already irrevocable. Recovery
+must attest the retained release decision and accepted installed predecessor;
+it does not need to manufacture a fresh data-validity grant or scan today's
+rows against an obsolete validation cursor. The existing composite audit still
+qualifies the actual root, namespace, committed source clock, transaction
+directory, transaction snapshot and control history at one retained MVCC cut.
+Its row and record coverage counts are zero. History evidence is rejected for
+ready, failed or installed owners, and cannot substitute for full/prefix
+coverage. Existing NOT NULL row audits retain their current behavior.
+
+The native standby journal campaign now obtains and verifies this signed
+history proof on its distinct real physical root after release reclaimed the
+transient validation records. The immutable header retains the primary's
+original transaction root. Metadata accepts a terminal release ACK only for
+the independently adopted current root; it no longer insists that the retained
+historical transaction root equal that replacement root. Ready and installed
+root checks remain strict. The metadata LSM campaign preserves earlier signed
+ACKs through root adoption and cold reopen, injects failure before/after every
+adoption and final release write, and retains shared parent leases until the
+entire owner cohort finishes. Its catalog and enrollment remain explicit test
+fixtures; the separate native campaign supplies physical restore/journal proof.
+
+An exact historical EOF record alone is insufficient to qualify current data
+on a replacement root. No shortcut from transaction counters to a new ready or
+installed root is enabled here. Those nonterminal recovery paths, authenticated
+source lineage/current parent-reference requalification and the original public
+PostgreSQL/distributed fault campaign remain required for `sql-0736`. Original
+case dispositions remain unchanged.
+
+Verification passes in Debug: production build, fifteen supporting FK tests,
+two native campaigns, forty-eight metadata tests in each server configuration,
+thirty-five neighboring nullability/recovery tests and six mounted SQL
+validation/recovery campaigns. Focused gates have no skips or leaks. Generated
+sources, formatting, inventory, licensing and source boundaries pass. No
+assertion or timeout was relaxed.
+
 ### FK VALIDATE: native preparation and read execution in progress
 
 `sql-0736` remains unresolved. Native read-side support now prepares exact

@@ -968,11 +968,11 @@ pub const RowAudit = struct {
             try value.validateProgress();
             try value.snapshot_cut.requireNamespace(value.header.binding.fence.namespace);
             try precedesOrEqual(value.header.updated, value.snapshot_cut);
-            if (value.coverage != coverageFor(value.header.phase) or value.rows > value.records or self.after.len > max_cursor or
+            if (value.coverage != coverageFor(value.header) or value.rows > value.records or self.after.len > max_cursor or
                 !eq(hash(self.after), value.cursor_digest) or ((value.records == 0) != (self.after.len == 0)) or
                 (self.after.len != 0 and !@import("../internal_keys.zig").isRelationalRowKey(self.after))) return error.InvalidSchemaValidationJob;
             switch (value.coverage) {
-                .none => if (!self.complete or value.records != 0 or value.rows != 0) return error.InvalidSchemaValidationJob,
+                .none, .history => if (!self.complete or value.records != 0 or value.rows != 0) return error.InvalidSchemaValidationJob,
                 .prefix => {
                     if (value.records > value.header.records or value.rows > value.header.rows_scanned or
                         self.complete != (value.records == value.header.records) or (value.header.phase == .failed and value.header.records == 0)) return error.InvalidSchemaValidationJob;
@@ -987,11 +987,12 @@ pub const RowAudit = struct {
         }
     };
 
-    fn coverageFor(phase: Phase) Coverage {
-        return switch (phase) {
+    fn coverageFor(header: Header) Coverage {
+        return switch (header.phase) {
             .fencing, .canceling, .canceled => .none,
             .scanning, .failed => .prefix,
-            .ready, .installed, .released => .full,
+            .ready, .installed => .full,
+            .released => if (header.transaction_coverage != null) .history else .full,
         };
     }
     alloc: A,
@@ -1027,12 +1028,12 @@ pub const RowAudit = struct {
         } else if (header.phase != .released and header.phase != .canceled) return error.SchemaValidationJobRequired;
         var candidate = try Candidate.fromInputs(a, retained_inputs, binding, control);
         errdefer candidate.deinit();
-        const coverage = coverageFor(header.phase);
+        const coverage = coverageFor(header);
         // A fresh reader starts at the real beginning. Projection binding is
         // deferred until its first page or authenticated checkpoint resume.
         const snapshot_cut = try currentPosition(&reader.read, binding);
-        var result: @This() = .{ .alloc = a, .reader = reader, .candidate = candidate, .header = header, .snapshot_cut = snapshot_cut, .coverage = coverage, .reference_coverage = if (binding.purpose == .not_null) null else .{}, .cursor_digest = hash("") };
-        if (coverage == .none) result.done = true else if (coverage == .prefix and header.records == 0) {
+        var result: @This() = .{ .alloc = a, .reader = reader, .candidate = candidate, .header = header, .snapshot_cut = snapshot_cut, .coverage = coverage, .reference_coverage = if (binding.purpose == .not_null or coverage == .history) null else .{}, .cursor_digest = hash("") };
+        if (coverage == .none or coverage == .history) result.done = true else if (coverage == .prefix and header.records == 0) {
             if (header.phase == .failed or header.rows_scanned != 0 or !eq(header.cursor_digest, hash(""))) return error.SchemaValidationRuntimeRecoveryRequired;
             result.done = true;
         }
@@ -1056,6 +1057,11 @@ pub const RowAudit = struct {
         if (self.invalid or self.records != 0 or self.reader.after.items.len != 0 or
             !std.meta.eql(self.header, progress.summary.header) or !std.meta.eql(self.snapshot_cut, progress.summary.snapshot_cut) or
             self.coverage != progress.summary.coverage) return error.SchemaValidationRuntimeRecoveryRequired;
+        if (self.coverage == .history) {
+            if (!progress.complete or !std.meta.eql(self.snapshotSummary(), progress.summary) or progress.after.len != 0)
+                return error.SchemaValidationRuntimeRecoveryRequired;
+            return;
+        }
         if (self.candidate.foreign_source) |*source| {
             try self.reader.resumeForeignKeyValidationScan(source, .{ .projection_identity = self.header.binding.projection_identity, .after = progress.after }, control);
         } else try self.reader.resumeNullabilityScan(&self.candidate.plan, .{ .projection_identity = self.header.binding.projection_identity, .after = progress.after }, control);
