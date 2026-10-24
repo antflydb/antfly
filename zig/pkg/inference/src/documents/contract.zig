@@ -333,6 +333,8 @@ pub const Control = struct {
 pub const Run = struct {
     limits: Limits,
     usage: Usage = .{},
+    source_count: usize = 0,
+    source_bytes: usize = 0,
     control: Control = .{},
     event_allocator: ?A = null,
     work_allocator: ?A = null,
@@ -354,6 +356,22 @@ pub const Run = struct {
             if (event.finding) |finding| retained.finding = try a.dupe(u8, finding);
             try self.events.append(a, retained);
         }
+    }
+    /// Absolute ceilings over shared counters. Entering a child never resets
+    /// accounting; leaving it restores only policy, not consumed work.
+    pub fn nestedLimits(self: *const Run, child: Limits) Limits {
+        var result = self.limits;
+        inline for (@typeInfo(Limits).@"struct".field_names) |name| {
+            @field(result, name) = @min(@field(result, name), @field(child, name));
+        }
+        result.max_sources = @min(self.limits.max_sources, self.source_count +| child.max_sources);
+        result.max_source_bytes = @min(self.limits.max_source_bytes, self.source_bytes +| child.max_source_bytes);
+        result.max_pages = @min(self.limits.max_pages, self.usage.visited_pages +| child.max_pages);
+        result.max_model_calls = @min(self.limits.max_model_calls, self.usage.model_calls +| child.max_model_calls);
+        result.max_total_tokens = @min(self.limits.max_total_tokens, self.usage.total_tokens +| child.max_total_tokens);
+        result.max_total_pixels = @min(self.limits.max_total_pixels, self.usage.rendered_pixels +| child.max_total_pixels);
+        result.max_output_bytes = @min(self.limits.max_output_bytes, self.usage.output_bytes +| child.max_output_bytes);
+        return result;
     }
     pub fn call(self: *Run) !void {
         try self.control.check();
@@ -414,4 +432,25 @@ test "document recipe compilation validates backward typed flow and model operat
     try std.testing.expectError(error.InvalidDocumentDataflow, Definition.parse(std.testing.allocator,
         \\{"models":[{"name":"fast","model":"reader","operation":"read"}],"read":{"steps":[{"id":"result","operation":"assemble","input":"future"}]}}
     ));
+}
+
+test "document nested ceilings preserve consumed work and all child resource limits" {
+    var run = Run{ .limits = .{ .max_sources = 10, .max_source_bytes = 100, .max_pages = 10, .max_model_calls = 10, .max_output_bytes = 100, .max_total_tokens = 100, .max_total_pixels = 100 }, .source_count = 2, .source_bytes = 20, .usage = .{ .visited_pages = 2, .model_calls = 2, .output_bytes = 20, .total_tokens = 20, .rendered_pixels = 20 } };
+    const parent = run.limits;
+    run.limits = run.nestedLimits(.{ .max_sources = 1, .max_source_bytes = 5, .max_pages = 1, .max_model_calls = 1, .max_output_bytes = 5, .max_total_tokens = 5, .max_total_pixels = 5, .max_pixels = 4, .max_dimension = 20 });
+    try std.testing.expectEqual(@as(usize, 3), run.limits.max_sources);
+    try std.testing.expectEqual(@as(usize, 25), run.limits.max_source_bytes);
+    try std.testing.expectEqual(@as(usize, 3), run.limits.max_pages);
+    try std.testing.expectEqual(@as(u32, 20), run.limits.max_dimension);
+    try run.call();
+    try std.testing.expectError(error.DocumentBudgetExhausted, run.call());
+    try run.tokens(4, 1);
+    try std.testing.expectError(error.DocumentTokenLimitExceeded, run.tokens(1, 0));
+    try run.pixels(4);
+    try std.testing.expectError(error.DocumentPixelLimitExceeded, run.pixels(2));
+    try run.output(5);
+    try std.testing.expectError(error.DocumentOutputTooLarge, run.output(1));
+    run.limits = parent;
+    try std.testing.expectEqual(@as(usize, 3), run.usage.model_calls);
+    try std.testing.expectEqual(@as(u64, 25), run.usage.total_tokens);
 }

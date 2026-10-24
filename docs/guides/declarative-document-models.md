@@ -87,8 +87,10 @@ Routers receive observations and an executor-owned action set: `accept`,
 `accurate`, `table`, `fallback`, or `unresolved`. They cannot introduce model
 names, URLs, filesystem paths, or code. Document contents remain task data.
 
-A replacement must match source text or be corroborated by a distinct configured
-reader. A confidence increase alone cannot authorize replacement. Unsupported
+A replacement must cover the selected native text or be corroborated by a distinct
+configured reader inspecting the same crop. Native support uses immutable text
+runs in original source coordinates: text elsewhere on the page cannot validate
+a region replacement, and a substring cannot establish whole-page coverage. A confidence increase alone cannot authorize replacement. Unsupported
 revisions leave the original text unresolved. Read results distinguish native
 content and transcription, preserve original source coordinates and render/crop
 transforms, and report incomplete or truncated work. Confidence values remain
@@ -99,7 +101,11 @@ specific to each reader; they are not cross-model calibrated probabilities.
 An extraction composite uses the same source adapters and can select its own
 reading policy. Supply the ordinary extraction `schema` and `schema_version`.
 Named record fields, entity/relation behavior and long-document handling remain
-owned by the selected extraction implementation.
+owned by the selected extraction implementation. String inputs and arrays of
+text content parts normalize once to the same canonical text before any model
+call, so extraction and evidence offsets share one representation. Adjacent text
+parts are separated by a newline. Image-only inputs use the direct document
+form and the composite's reading policy.
 
 An optional extraction policy can set `verification_model` and `fallback_model`
 to other extraction bindings. It compares independent candidate values, tries at
@@ -117,7 +123,16 @@ When a read requested `retain_artifact`, inspect `document.artifact_id` and
 fetching the source or running OCR again. Handles are bearer capabilities with
 256 bits of randomness, process-local storage, a five-minute maximum lifetime,
 and bounded storage with eviction. They are not content hashes or durable jobs.
-Expiry returns 410; absent/evicted handles return 404. A restart invalidates them.
+A shared expiry timer releases unread payloads and their memory charges; it
+reuses the host runtime's I/O pool, with one store-owned fallback for standalone
+callers. Extraction borrows pinned immutable snapshots rather than copying the
+cached JSON. Eviction drops cache ownership while active readers retain the bytes
+and their memory charge. Cache reads and model work run outside the cache lock,
+so allocator reclamation can safely evict entries. Document admission also removes
+expired entries and can evict older readings before retrying memory admission. Shutdown wakes and joins maintenance.
+Recently expired handles return 410; a bounded tombstone ring remembers the
+last 128 expirations. Absent/evicted/older handles return 404. A restart invalidates
+them.
 
 Best-effort reading discloses unresolved pages. Extraction fails atomically when
 reading, evidence validation, disagreement or execution budgets prevent a valid
@@ -178,7 +193,11 @@ OCR with original pixel coordinates and targeted crops. PPTX support includes
 declared slide order, native text, native table cells/merge spans, explicit hidden
 slide policy, and separately attributed speaker notes. Visual slide rendering,
 chart interpretation and perspective correction are unavailable and are reported
-as such. A slide with unsupported visual content remains unresolved.
+as such. XML inspection recognizes drawings independently of namespace prefixes,
+including vector shapes, pictures, charts and embedded content. A slide with
+unsupported visual content remains unresolved. PDF native inspection checks
+painting operators without decoding images or materializing vector paths;
+text-bearing pages with drawings still require visual inspection.
 
 Sources parse once. Remote routing/extraction/verification share one bounded,
 resource-accounted HTTP pool per run. Source buffers release between documents and page scratch
@@ -186,7 +205,9 @@ buffers release between pages. Local child invocations borrow encoded image
 bytes; base64 is introduced only at remote transport boundaries. Orchestration
 holds no parent model execution permit while waiting for a child. Nested readers
 and extractors share cumulative calls, measured tokens, pixels, output ceilings,
-deadlines and cancellation; model identities are captured before execution and
+deadlines and cancellation. Child entry points intersect every resource ceiling
+with the parent's remaining budget, retaining cumulative consumption when the
+child returns; model identities are captured before execution and
 checked again around child calls. Reading metadata includes a run fingerprint of
 source hashes, source-selection options, prompts, effective limits, model
 identities and adapter/runtime versions. Remote providers expose model names

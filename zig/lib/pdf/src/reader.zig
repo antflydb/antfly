@@ -1399,10 +1399,31 @@ const LayoutTextRun = struct {
     }
 };
 
+/// Inspect decoded operators without materializing images or vector paths.
+/// Strings/comments are lexed normally, so text containing operator names does
+/// not trigger visual work. Form/image invocations conservatively require it.
+fn contentHasNontextPaint(alloc: Allocator, bytes: []const u8, cancellation: CancellationProbe) !bool {
+    var scanner = syntax.Scanner.init(alloc, bytes);
+    defer scanner.deinit();
+    var count: usize = 0;
+    while (true) {
+        if (count & 255 == 0) try cancellation.check();
+        count +|= 1;
+        var token = (try readContentLexeme(&scanner)) orelse continue;
+        defer syntax.Scanner.freeLexeme(alloc, &token);
+        if (token == .eof) return false;
+        if (token != .keyword) continue;
+        for ([_][]const u8{ "Do", "BI", "S", "s", "f", "F", "f*", "B", "B*", "b", "b*", "sh" }) |operator| {
+            if (std.mem.eql(u8, token.keyword, operator)) return true;
+        }
+    }
+}
+
 pub const PageTextAnalysis = struct {
     text: []u8,
     runs: []TextRun,
     outline_fallback: bool = false,
+    has_nontext_visual: bool = false,
 
     pub fn deinit(self: *PageTextAnalysis, alloc: Allocator) void {
         alloc.free(self.text);
@@ -4660,7 +4681,9 @@ pub const Reader = struct {
         }
 
         var analysis = try self.extractDecodedTextAnalysisAlloc(decoded_content, stream_ranges.?, fonts, &.{}, forms, color_spaces);
+        errdefer analysis.deinit(self.alloc);
         analysis.outline_fallback = pageFontsUsedOutlineFallback(fonts);
+        analysis.has_nontext_visual = try contentHasNontextPaint(self.alloc, decoded_content, self.cancellation);
         return analysis;
     }
 
@@ -31541,4 +31564,12 @@ test "reader resolves indirect Type0 subtype before decoding" {
     const text = try reader.extractPlainTextAlloc();
     defer alloc.free(text);
     try std.testing.expectEqualStrings("A\n", text);
+}
+
+test "document PDF coverage inspects paint operators without confusing literal text" {
+    const a = std.testing.allocator;
+    try std.testing.expect(!try contentHasNontextPaint(a, "BT (S Do BI) Tj ET % f\n", .{}));
+    try std.testing.expect(try contentHasNontextPaint(a, "0 0 30 40 re f", .{}));
+    try std.testing.expect(try contentHasNontextPaint(a, "/Figure Do", .{}));
+    try std.testing.expect(try contentHasNontextPaint(a, "BI /W 1 /H 1 ID binary", .{}));
 }

@@ -17988,14 +17988,29 @@ pub const Node = struct {
         return self.documentOperationJson(a, json, control, .extract, null);
     }
 
+    fn admitDocumentHost(self: *Node, bytes: usize) !runtime.tier.memory.AdmissionLease {
+        self.document_artifacts.pruneExpired(self.allocator, platform.time.monotonicNs());
+        var evictions: usize = 0;
+        while (true) {
+            return self.model_manager.admitHostPreflight(bytes) catch |err| switch (err) {
+                error.ResourceTemporarilyUnavailable => {
+                    if (evictions >= 128 or !self.document_artifacts.evictOldest(self.allocator)) return err;
+                    evictions += 1;
+                    continue;
+                },
+                else => return err,
+            };
+        }
+    }
+
     fn documentOperationJson(self: *Node, output: std.mem.Allocator, json: []const u8, supplied: InferenceExecutionControl, operation: enum { read, extract }, encoded: ?readers_api.EncodedRequest) ![]u8 {
         const Admission = struct {
             fn acquire(raw: *anyopaque, bytes: usize) !runtime.tier.memory.AdmissionLease {
-                const manager: *model_manager_mod.ModelManager = @ptrCast(@alignCast(raw));
-                return manager.admitHostPreflight(bytes);
+                const node: *Node = @ptrCast(@alignCast(raw));
+                return node.admitDocumentHost(bytes);
             }
         };
-        var admitted = @import("../backends/admitted_allocator.zig").AdmittedAllocator{ .backing = std.heap.smp_allocator, .admission_context = &self.model_manager, .admit = Admission.acquire, .trim_on_free = true };
+        var admitted = @import("../backends/admitted_allocator.zig").AdmittedAllocator{ .backing = std.heap.smp_allocator, .admission_context = self, .admit = Admission.acquire, .trim_on_free = true };
         defer admitted.deinit();
         var bounded = BoundedRequestAllocator{ .backing = admitted.allocator(), .limit = 512 * 1024 * 1024 };
         const a = bounded.allocator();
@@ -18015,6 +18030,8 @@ pub const Node = struct {
             const request = try std.json.parseFromSliceLeaky(std.json.Value, a, json, .{});
             const retain = cloudflare_provider.field(request, "retain_artifact");
             if (retain != null and retain.? == .bool and retain.?.bool) {
+                // Timer failure disables optional retention; reading still succeeds.
+                self.document_artifacts.startMaintenance(self.allocator, self.session_manager.io, platform.time.monotonicNs) catch return output.dupe(u8, result);
                 const Lease = struct {
                     allocator: std.mem.Allocator,
                     lease: runtime.tier.memory.AdmissionLease,
@@ -18025,7 +18042,7 @@ pub const Node = struct {
                     }
                 };
                 const charge = self.allocator.create(Lease) catch return output.dupe(u8, result);
-                charge.* = .{ .allocator = self.allocator, .lease = self.model_manager.admitHostPreflight(result.len + @sizeOf(Lease)) catch {
+                charge.* = .{ .allocator = self.allocator, .lease = self.admitDocumentHost(result.len + @sizeOf(Lease) + @import("../documents/artifacts.zig").retention_overhead) catch {
                     self.allocator.destroy(charge);
                     return output.dupe(u8, result);
                 } };
@@ -18051,6 +18068,10 @@ pub const Node = struct {
             }
         }
         return output.dupe(u8, result);
+    }
+
+    pub fn borrowDocumentArtifact(self: *Node, handle: []const u8) !@import("../documents/artifacts.zig").Snapshot {
+        return self.document_artifacts.acquire(self.allocator, handle, platform.time.monotonicNs());
     }
 
     pub fn readDocumentArtifact(self: *Node, a: std.mem.Allocator, handle: []const u8) ![]u8 {
@@ -29490,7 +29511,7 @@ test "extraction framed attachments preserve input identity and borrowed bytes" 
     }};
     const resolved = try extractionAttachmentsFromEnvelope(
         allocator,
-        parsed.value.inputs,
+        parsed.value.inputs.?,
         &attachments,
         true,
     );
@@ -40760,4 +40781,27 @@ test "document model dispatch preserves client errors for invalid ordinary model
         try std.testing.expectEqual(@as(u16, 400), response.status.code);
         try std.testing.expect(std.mem.indexOf(u8, response.body.?, "InvalidModelIdentifier") != null);
     }
+}
+
+test "document artifact admission reclaims retained memory without evicting on impossible requests" {
+    const a = std.testing.allocator;
+    var node = try Node.init(a, .{ .generation_budget_overrides = .{ .host_limit_bytes = 4096, .scratch_limit_bytes = 4096 } });
+    defer node.deinit();
+    const Owner = struct {
+        lease: ?runtime.tier.memory.AdmissionLease,
+        fn release(raw: ?*anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            if (self.lease) |*lease| lease.release();
+            self.lease = null;
+        }
+    };
+    var owner = Owner{ .lease = try node.model_manager.admitHostPreflight(3072) };
+    errdefer if (owner.lease != null) Owner.release(&owner);
+    try std.testing.expect(try node.document_artifacts.put(a, @splat('a'), "retained", std.math.maxInt(u64), .{ .ptr = &owner, .release_fn = Owner.release }));
+    try std.testing.expectError(error.ResourceLimitExceeded, node.admitDocumentHost(8192));
+    try std.testing.expect(owner.lease != null);
+    var request = try node.admitDocumentHost(2048);
+    defer request.release();
+    try std.testing.expect(owner.lease == null);
+    try std.testing.expectError(error.DocumentArtifactNotFound, node.readDocumentArtifact(a, &@as([64]u8, @splat('a'))));
 }

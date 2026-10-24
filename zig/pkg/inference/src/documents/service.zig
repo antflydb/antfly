@@ -62,6 +62,7 @@ pub fn Service(comptime Node: type) type {
         control: Control,
         source: *sources.Source,
         number: usize,
+        native_regions: []const c.Region = &.{},
         prompt: ?[]const u8,
         max_tokens: ?i64,
         decoded: ?@import("../pipelines/image.zig").Image = null,
@@ -115,6 +116,14 @@ pub fn Service(comptime Node: type) type {
             var owned_run = c.Run{ .event_allocator = a, .work_allocator = backing, .limits = if (@hasDecl(Node, "documentLimits")) node.documentLimits(def.budget) else def.budget, .control = .{ .ptr = &control, .check_fn = Probe.check } };
             defer owned_run.deinit();
             const run = shared orelse &owned_run;
+            const parent_limits = run.limits;
+            const parent_control = run.control;
+            defer {
+                run.limits = parent_limits;
+                run.control = parent_control;
+            }
+            if (shared != null) run.limits = run.nestedLimits(owned_run.limits);
+            run.control = owned_run.control;
             const completed_before = run.usage.completed_pages;
             if ((request.images != null) == (request.documents != null)) return error.InvalidDocumentSource;
             var inputs = std.ArrayList(sources.Input).empty;
@@ -124,21 +133,24 @@ pub fn Service(comptime Node: type) type {
                 // MIME is verified from the actual bytes after download.
                 try inputs.append(a, .{ .id = try std.fmt.allocPrint(a, "image-{d}", .{i}), .url = img.url, .media_type = "" });
             }
-            if (inputs.items.len == 0 or inputs.items.len > run.limits.max_sources) return error.InvalidDocumentSource;
+            if (inputs.items.len == 0 or inputs.items.len > run.limits.max_sources -| run.source_count) return error.InvalidDocumentSource;
             if (attached == null) for (inputs.items, 0..) |input, i| for (inputs.items[0..i]) |prior| if (std.mem.eql(u8, input.id, prior.id)) return error.DuplicateDocumentSource;
             var pages = std.ArrayList(c.Page).empty;
             var fingerprints = std.ArrayList(struct { id: []const u8, sha256: []const u8, page_number: ?u32 = null }).empty;
-            var total_bytes: usize = 0;
             for (inputs.items, 0..) |input_value, source_index| {
                 var input = input_value;
                 var source_arena = std.heap.ArenaAllocator.init(backing);
                 defer source_arena.deinit();
                 const source_alloc = source_arena.allocator();
-                const source_bytes = if (attached) |attachments| attachments.images[source_index].bytes else (try node.documentDownload(source_alloc, input.url, run.limits.max_source_bytes -| total_bytes, control)).data;
-                if (source_bytes.len > run.limits.max_source_bytes -| total_bytes) return error.DocumentSourceLimitExceeded;
-                total_bytes += source_bytes.len;
+                run.source_count += 1;
+                var source_limits = run.limits;
+                source_limits.max_pages = run.limits.max_pages -| run.usage.visited_pages;
+                source_limits.max_source_bytes = run.limits.max_source_bytes -| run.source_bytes;
+                const source_bytes = if (attached) |attachments| attachments.images[source_index].bytes else (try node.documentDownload(source_alloc, input.url, source_limits.max_source_bytes, control)).data;
+                if (source_bytes.len > source_limits.max_source_bytes) return error.DocumentSourceLimitExceeded;
+                run.source_bytes += source_bytes.len;
                 if (input.media_type.len == 0) input.media_type = image.inferenceMimeEssenceForFormat(image.detectFormat(source_bytes)) orelse return error.UnsupportedDocumentFormat;
-                var source = sources.Source.init(source_alloc, input, source_bytes, run.limits, run.control) catch |err| {
+                var source = sources.Source.init(source_alloc, input, source_bytes, source_limits, run.control) catch |err| {
                     try run.control.check();
                     return err;
                 };
@@ -161,7 +173,7 @@ pub fn Service(comptime Node: type) type {
                     if (attached) |attachments| if (attachments.images[source_index].page_number) |original| {
                         page.number = original;
                     };
-                    var context = Self{ .node = node, .definition = def, .work_allocator = sa, .graph = graph, .control = control, .source = &source, .number = number, .prompt = request.prompt, .max_tokens = request.max_tokens };
+                    var context = Self{ .node = node, .definition = def, .work_allocator = sa, .graph = graph, .control = control, .source = &source, .number = number, .native_regions = page.regions, .prompt = request.prompt, .max_tokens = request.max_tokens };
                     const result = if (std.mem.eql(u8, request.model, "antfly/native-document")) native: {
                         var native_page = page;
                         native_page.text = page.native_text;
@@ -218,7 +230,7 @@ pub fn Service(comptime Node: type) type {
                 .events = run.events.items,
             }, .{});
             errdefer backing.free(result);
-            if (result.len > run.limits.max_output_bytes) return error.DocumentOutputTooLarge;
+            if (result.len > @min(def.budget.max_output_bytes, run.limits.max_output_bytes)) return error.DocumentOutputTooLarge;
             return result;
         }
 
@@ -358,6 +370,9 @@ pub fn Service(comptime Node: type) type {
                 raster_height = bottom - top;
             }
             if (self.graph.get(binding.model)) |child| {
+                const view_pixels = @as(u64, raster_width) * raster_height;
+                if (raster_width > child.budget.max_dimension or raster_height > child.budget.max_dimension or
+                    view_pixels > child.budget.max_pixels or view_pixels > child.budget.max_total_pixels) return error.DocumentPixelLimitExceeded;
                 var nested_source = sources.Source{ .input = .{ .id = self.source.input.id, .url = "", .media_type = mime }, .fingerprint = @splat(0), .bytes = data, .parsed = .image };
                 var nested = self.*;
                 nested.definition = child;
@@ -367,14 +382,20 @@ pub fn Service(comptime Node: type) type {
                 nested.control.deadline_ns = if (nested.control.deadline_ns) |deadline| @min(deadline, child_deadline) else child_deadline;
                 const parent_limits = run.limits;
                 defer run.limits = parent_limits;
-                run.limits.max_total_tokens = @min(parent_limits.max_total_tokens, run.usage.total_tokens +| child.budget.max_total_tokens);
-                run.limits.max_model_calls = @min(parent_limits.max_model_calls, run.usage.model_calls +| child.budget.max_model_calls);
-                run.limits.max_output_bytes = @min(parent_limits.max_output_bytes, run.usage.output_bytes +| child.budget.max_output_bytes);
-                run.limits.max_total_pixels = @min(parent_limits.max_total_pixels, run.usage.rendered_pixels +| child.budget.max_total_pixels);
-                run.limits.max_pixels = @min(parent_limits.max_pixels, child.budget.max_pixels);
-                run.limits.max_dimension = @min(parent_limits.max_dimension, child.budget.max_dimension);
-                run.limits.max_regions = @min(parent_limits.max_regions, child.budget.max_regions);
-                run.limits.max_region_attempts = @min(parent_limits.max_region_attempts, child.budget.max_region_attempts);
+                run.limits = run.nestedLimits(child.budget);
+                // The parent already charged this borrowed view. Reserve that
+                // work against the child without double-counting physical pixels.
+                run.limits.max_total_pixels = @min(run.limits.max_total_pixels, run.usage.rendered_pixels +| (child.budget.max_total_pixels - view_pixels));
+                const parent_control = run.control;
+                defer run.control = parent_control;
+                const ChildProbe = struct {
+                    fn check(ptr: ?*anyopaque) !void {
+                        const ctl: *Control = @ptrCast(@alignCast(ptr.?));
+                        try ctl.check();
+                    }
+                };
+                run.control = .{ .ptr = &nested.control, .check_fn = ChildProbe.check };
+                nested.native_regions = &.{};
                 nested.source = &nested_source;
                 nested.rendered = .{ .bytes = data, .mime_type = mime, .width = raster_width, .height = raster_height, .effective_dpi = 0, .raster_to_source = .{} };
                 const page = try executor.readPage(a, child, .{ .ptr = &nested, .read_fn = read, .decide_fn = decide, .validate_fn = validate }, 0, .{ .source_id = self.source.input.id, .number = self.number, .kind = .image }, run);
@@ -490,15 +511,16 @@ pub fn Service(comptime Node: type) type {
             const self: *Self = @ptrCast(@alignCast(raw));
             const original = if (region) |r| r.text else page.text;
             if (std.mem.eql(u8, original, candidate.text)) return true;
-            if (candidate.text.len > 0 and page.native_text.len > 0 and std.mem.indexOf(u8, page.native_text, candidate.text) != null) return true;
+            if (try @import("source_support.zig").nativeSupports(run.work_allocator orelse self.work_allocator, page.native_text, self.native_regions, region, candidate.text)) return true;
+            if (region) |selected| if (selected.bbox == null) return false;
             const name = self.definition.read.?.verification_reader orelse return false;
             const binding = try self.definition.binding(name, .read);
             if (candidate.model) |model| if (std.mem.eql(u8, binding.model, model)) return false;
             try run.call();
-            var arena = std.heap.ArenaAllocator.init(self.work_allocator);
+            var arena = std.heap.ArenaAllocator.init(run.work_allocator orelse self.work_allocator);
             defer arena.deinit();
             const corroboration = try read(raw, arena.allocator(), binding, 0, if (region) |r| r.bbox else null, run);
-            return !corroboration.truncated and std.mem.eql(u8, std.mem.trim(u8, corroboration.text, " \t\r\n"), std.mem.trim(u8, candidate.text, " \t\r\n"));
+            return !corroboration.truncated and (corroboration.status == null or corroboration.status.? == .complete) and (corroboration.origin != .interpretation or candidate.origin == .interpretation) and std.mem.eql(u8, std.mem.trim(u8, corroboration.text, " \t\r\n"), std.mem.trim(u8, candidate.text, " \t\r\n"));
         }
 
         fn inputsFromRead(a: A, root: V) ![]const V {
@@ -597,11 +619,19 @@ pub fn Service(comptime Node: type) type {
             if (binding.provider == .antfly) if (graph.get(binding.model)) |child| {
                 const parent_limits = run.limits;
                 defer run.limits = parent_limits;
-                run.limits.max_model_calls = @min(parent_limits.max_model_calls, run.usage.model_calls +| child.budget.max_model_calls);
-                run.limits.max_total_tokens = @min(parent_limits.max_total_tokens, run.usage.total_tokens +| child.budget.max_total_tokens);
+                run.limits = run.nestedLimits(child.budget);
                 var nested_control = control;
                 const deadline = @import("antfly_platform").time.monotonicNs() +| child.budget.deadline_ms * std.time.ns_per_ms;
                 nested_control.deadline_ns = if (control.deadline_ns) |existing| @min(existing, deadline) else deadline;
+                const parent_control = run.control;
+                defer run.control = parent_control;
+                const ChildProbe = struct {
+                    fn check(ptr: ?*anyopaque) !void {
+                        const ctl: *Control = @ptrCast(@alignCast(ptr.?));
+                        try ctl.check();
+                    }
+                };
+                run.control = .{ .ptr = &nested_control, .check_fn = ChildProbe.check };
                 return applyExtractionPolicy(node, a, child, graph, input, schema, version, options, nested_control, run);
             };
             var scratch = std.heap.ArenaAllocator.init(run.work_allocator orelse a);
@@ -637,7 +667,9 @@ pub fn Service(comptime Node: type) type {
                 if (rows != .array or rows.array.items.len != 1) return error.InvalidDocumentModelResult;
                 item = rows.array.items[0];
             }
-            return std.json.parseFromSliceLeaky(V, a, try std.json.Stringify.valueAlloc(work, item, .{}), .{ .allocate = .alloc_always });
+            const item_json = try std.json.Stringify.valueAlloc(work, item, .{});
+            try run.output(item_json.len);
+            return std.json.parseFromSliceLeaky(V, a, item_json, .{ .allocate = .alloc_always });
         }
 
         pub fn extractJson(node: *Node, backing: A, bytes: []const u8, control: Control) ![]u8 {
@@ -687,8 +719,13 @@ pub fn Service(comptime Node: type) type {
                 if (options != .object or options.object.count() != 0) return error.UnsupportedCloudflareSchema;
             };
             var inputs: std.array_list.Managed(V) = .init(a);
+            var artifact_snapshot: ?@import("artifacts.zig").Snapshot = null;
+            defer if (artifact_snapshot) |*snapshot_value| snapshot_value.release();
             if (cf.field(root, "read_artifact")) |handle| {
-                const cached = try node.readDocumentArtifact(a, try cf.text(handle));
+                const cached = if (@hasDecl(Node, "borrowDocumentArtifact")) cached: {
+                    artifact_snapshot = try node.borrowDocumentArtifact(try cf.text(handle));
+                    break :cached artifact_snapshot.?.bytes();
+                } else try node.readDocumentArtifact(a, try cf.text(handle));
                 const read_result = try std.json.parseFromSliceLeaky(V, a, cached, .{});
                 try inputs.appendSlice(try inputsFromRead(a, read_result));
             } else if (cf.field(root, "documents")) |documents| {
@@ -717,7 +754,8 @@ pub fn Service(comptime Node: type) type {
             // Unknown per-input replacements must never be silently discarded.
             for (inputs.items, 0..) |input, index| {
                 if (input != .object) return error.InvalidDocumentSource;
-                _ = try cf.text(cf.field(input, "content") orelse return error.UnsupportedDocumentFormat);
+                const normalized = try normalizeTextContent(a, cf.field(input, "content") orelse return error.UnsupportedDocumentFormat);
+                try inputs.items[index].object.put(a, "content", cf.string(normalized));
                 for ([_][]const u8{ "schema", "options", "tokens" }) |key| if (cf.field(input, key)) |value| {
                     if (value != .null) return error.UnsupportedDocumentInputOverride;
                 };
@@ -727,7 +765,7 @@ pub fn Service(comptime Node: type) type {
                         if (std.mem.eql(u8, name, try cf.text(prior_id))) return error.DuplicateDocumentSource;
                     };
                 }
-                if (plan) |p| _ = try cf.evidenceRequest(a, binding.model, .{ .state = try cf.text(cf.field(input, "content").?), .images = .{ .array = .init(a) } }, p.fields);
+                if (plan) |p| _ = try cf.evidenceRequest(a, binding.model, .{ .state = try cf.text(cf.field(inputs.items[index], "content").?), .images = .{ .array = .init(a) } }, p.fields);
             }
             var output: std.array_list.Managed(V) = .init(a);
             for (inputs.items) |input| {
@@ -744,6 +782,21 @@ pub fn Service(comptime Node: type) type {
             return response;
         }
     };
+}
+
+/// Normalize text once at the input boundary, before any child is invoked.
+/// The same canonical text is sent to every extractor and used for offsets.
+fn normalizeTextContent(a: A, content: V) ![]const u8 {
+    if (content == .string) return content.string;
+    if (content != .array) return error.InvalidDocumentSource;
+    var output = std.Io.Writer.Allocating.init(a);
+    for (content.array.items, 0..) |part, index| {
+        if (!std.mem.eql(u8, try cf.text(cf.field(part, "type") orelse return error.InvalidDocumentSource), "text")) return error.UnsupportedDocumentFormat;
+        const value = try cf.text(cf.field(part, "text") orelse return error.InvalidDocumentSource);
+        if (index > 0) try output.writer.writeByte('\n');
+        try output.writer.writeAll(value);
+    }
+    return output.toOwnedSlice();
 }
 
 fn boundedText(value: []const u8, max_bytes: usize) []const u8 {
@@ -769,11 +822,15 @@ fn dataUri(a: A, mime: []const u8, bytes: []const u8) ![]const u8 {
 test "document nested composites share one budget and one rendered view" {
     const Fake = struct {
         reads: usize = 0,
-        fn documentDefinition(_: *@This(), a: A, name: []const u8) !?[]const u8 {
+        narrow_child: bool = false,
+        fn documentDefinition(self: *@This(), a: A, name: []const u8) !?[]const u8 {
             const json = if (std.mem.eql(u8, name, "parent"))
                 "{\"models\":[{\"name\":\"child\",\"model\":\"child\",\"operation\":\"read\"}],\"read\":{\"reader\":\"child\"},\"budget\":{\"max_model_calls\":2}}"
             else if (std.mem.eql(u8, name, "child"))
-                "{\"models\":[{\"name\":\"leaf\",\"model\":\"leaf\",\"operation\":\"read\"}],\"read\":{\"reader\":\"leaf\"}}"
+                if (self.narrow_child)
+                    "{\"models\":[{\"name\":\"leaf\",\"model\":\"leaf\",\"operation\":\"read\"}],\"read\":{\"reader\":\"leaf\"},\"budget\":{\"max_pixels\":1}}"
+                else
+                    "{\"models\":[{\"name\":\"leaf\",\"model\":\"leaf\",\"operation\":\"read\"}],\"read\":{\"reader\":\"leaf\"}}"
             else
                 return null;
             return try a.dupe(u8, json);
@@ -819,6 +876,11 @@ test "document nested composites share one budget and one rendered view" {
     try std.testing.expectEqual(@as(i64, 1), usage.get("physical_model_calls").?.integer);
     try std.testing.expectEqual(@as(i64, 1), usage.get("rendered_pixels").?.integer);
     try std.testing.expectEqualStrings("complete", parsed.value.object.get("document").?.object.get("status").?.string);
+    fake.narrow_child = true;
+    const wide = try image.png.encodeRgba(a, 2, 1, &.{ 0, 0, 0, 255, 0, 0, 0, 255 });
+    defer a.free(wide);
+    try std.testing.expectError(error.DocumentPixelLimitExceeded, Service(Fake).readEncodedJson(&fake, a, "parent", .{ .images = &.{.{ .bytes = wide, .mime_type = "image/png" }} }, .{}));
+    try std.testing.expectEqual(@as(usize, 2), fake.reads);
 }
 
 test "document extraction keeps independent sources atomic and reuses retained readings" {
@@ -828,6 +890,12 @@ test "document extraction keeps independent sources atomic and reuses retained r
         calls: usize = 0,
         disagree: bool = false,
         fn documentDefinition(_: *@This(), a: A, name: []const u8) !?[]const u8 {
+            if (std.mem.eql(u8, name, "nested-parent")) return try a.dupe(u8,
+                \\{"models":[{"name":"child","model":"nested-child","operation":"extract"}],"extract":{"model":"child"}}
+            );
+            if (std.mem.eql(u8, name, "nested-child")) return try a.dupe(u8,
+                \\{"models":[{"name":"native","model":"antfly/native-document","operation":"read"},{"name":"extractor","model":"leaf","operation":"extract"}],"read":{"reader":"native"},"extract":{"model":"extractor"},"budget":{"max_pages":1,"max_model_calls":1}}
+            );
             if (!std.mem.eql(u8, name, "composite")) return null;
             return try a.dupe(u8,
                 \\{"models":[{"name":"extractor","model":"leaf","operation":"extract"},{"name":"verifier","model":"verifier","operation":"extract"}],"extract":{"model":"extractor","verification_model":"verifier","require_source_support":true},"budget":{"max_model_calls":4}}
@@ -889,4 +957,20 @@ test "document extraction keeps independent sources atomic and reuses retained r
     try std.testing.expectEqual(@as(usize, 2), fake.calls);
     fake.disagree = true;
     try std.testing.expectError(error.DocumentUnresolved, Service(Fake).extractJson(&fake, a, request, .{}));
+    fake.disagree = false;
+    fake.calls = 0;
+    const parts = try Service(Fake).extractJson(&fake, a,
+        \\{"model":"composite","schema_version":2,"schema":{"structures":{"record":{"fields":{"value":"str"}}}},"inputs":[{"id":"parts","content":[{"type":"text","text":"Total"},{"type":"text","text":"12.50"}]}]}
+    , .{});
+    defer a.free(parts);
+    try std.testing.expectEqual(@as(usize, 2), fake.calls);
+    fake.calls = 0;
+    try std.testing.expectError(error.InvalidCloudflareRequest, Service(Fake).extractJson(&fake, a,
+        \\{"model":"composite","schema_version":2,"schema":{"structures":{"record":{"fields":{"value":"str"}}}},"inputs":[{"content":"Total 12.50"},{"content":[{"type":"text","text":42}]}]}
+    , .{}));
+    try std.testing.expectEqual(@as(usize, 0), fake.calls);
+    try std.testing.expectError(error.DocumentPageLimitExceeded, Service(Fake).extractJson(&fake, a,
+        \\{"model":"nested-parent","schema_version":2,"schema":{"structures":{"record":{"fields":{"value":"str"}}}},"documents":[{"id":"two-pages","url":"fixture","media_type":"application/pdf"}]}
+    , .{}));
+    try std.testing.expectEqual(@as(usize, 0), fake.calls);
 }

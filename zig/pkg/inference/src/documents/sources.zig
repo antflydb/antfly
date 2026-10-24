@@ -121,12 +121,7 @@ pub const Source = struct {
                 for (regions, analysis.runs, 0..) |*region, run, i| region.* = .{ .id = i, .text = try a.dupe(u8, run.text), .bbox = .{ run.x, run.y, run.x + run.advance_width, run.y + run.font_size }, .origin = .native };
                 page.regions = regions;
                 if (analysis.outline_fallback) page.findings = &.{"native_font_fallback"};
-                const images = try p.extractPageImageRunsAlloc(number);
-                defer {
-                    for (images) |*item| item.deinit(p.alloc);
-                    p.alloc.free(images);
-                }
-                if (images.len > 0) page.findings = &.{"visual_content_requires_inspection"};
+                if (analysis.has_nontext_visual) page.findings = &.{"visual_content_requires_inspection"};
             },
             .slides => |s| {
                 if (number == 0 or number > s.slides.len) return error.InvalidDocumentSelection;
@@ -137,7 +132,7 @@ pub const Source = struct {
                 page.native_text = try ooxml.text(a, xml);
                 page.tables = try ooxml.tables(a, xml);
                 // Native extraction alone cannot assert visual completeness.
-                if (std.mem.indexOf(u8, xml, ":pic") != null or std.mem.indexOf(u8, xml, ":graphicFrame") != null)
+                if (try ooxml.needsVisualInspection(xml))
                     page.findings = &.{"slide_visual_inspection_unavailable"};
                 if (slide.hidden and !self.input.include_hidden) return error.HiddenDocumentPage;
                 if (self.input.include_notes) {

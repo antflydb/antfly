@@ -196,6 +196,54 @@ pub const Xml = struct {
     }
 };
 
+/// Native tables and text boxes have a structural projection. Every other
+/// drawing requires a visual reader; inspect XML tokens, never prefix strings.
+pub fn needsVisualInspection(xml: []const u8) !bool {
+    var iter = Xml{ .bytes = xml };
+    var shape = false;
+    var textbox = false;
+    var geometry = false;
+    var nonrect = false;
+    while (try iter.next()) |token| {
+        if (token != .tag) continue;
+        const tag = token.tag;
+        const local = tag.local();
+        if (tag.closing) {
+            if (std.mem.eql(u8, local, "sp")) {
+                if (geometry and (!textbox or nonrect)) return true;
+                shape = false;
+            }
+            continue;
+        }
+        for ([_][]const u8{ "pic", "cxnSp", "grpSp", "oleObj", "contentPart", "chart", "custGeom", "sp3d", "scene3d", "blipFill" }) |drawing| {
+            if (std.mem.eql(u8, local, drawing)) return true;
+        }
+        if (std.mem.eql(u8, local, "graphicData")) {
+            const uri = tag.attr("uri") orelse return true;
+            if (!std.mem.eql(u8, uri, "http://schemas.openxmlformats.org/drawingml/2006/table")) return true;
+        }
+        if (std.mem.eql(u8, local, "sp")) {
+            shape = true;
+            textbox = false;
+            geometry = false;
+            nonrect = false;
+        }
+        if (shape and std.mem.eql(u8, local, "cNvSpPr")) {
+            if (tag.attr("txBox")) |value| textbox = std.mem.eql(u8, value, "1") or std.mem.eql(u8, value, "true");
+        }
+        if (shape and (std.mem.eql(u8, local, "solidFill") or std.mem.eql(u8, local, "gradFill") or std.mem.eql(u8, local, "pattFill"))) geometry = true;
+        if (shape and std.mem.eql(u8, local, "prstGeom")) {
+            geometry = true;
+            nonrect = !std.mem.eql(u8, tag.attr("prst") orelse "", "rect");
+        }
+        if (shape and std.mem.eql(u8, local, "ph")) {
+            const kind = tag.attr("type") orelse "obj";
+            if (std.mem.eql(u8, kind, "pic") or std.mem.eql(u8, kind, "chart") or std.mem.eql(u8, kind, "media")) return true;
+        }
+    }
+    return false;
+}
+
 pub fn text(a: A, xml: []const u8) ![]const u8 {
     var iter = Xml{ .bytes = xml };
     var output = std.Io.Writer.Allocating.init(a);
@@ -329,4 +377,13 @@ test "document XML rejects mismatched and unclosed text rather than returning pa
     try std.testing.expectError(error.InvalidDocumentXml, text(arena.allocator(), "<p:sld><a:t>partial"));
     try std.testing.expectError(error.InvalidDocumentXml, text(arena.allocator(), "<p:sld><a:t>partial</p:sld>"));
     try std.testing.expectError(error.InvalidDocumentXml, text(arena.allocator(), "<p:sld><a:t>\xff</a:t></p:sld>"));
+}
+
+test "document slide coverage detects vector drawings independently of XML prefixes" {
+    try std.testing.expect(try needsVisualInspection("<x:sld><x:sp><d:prstGeom prst='ellipse'/></x:sp></x:sld>"));
+    try std.testing.expect(try needsVisualInspection("<sld><sp><prstGeom prst='rect'/></sp></sld>"));
+    try std.testing.expect(try needsVisualInspection("<sld><pic/></sld>"));
+    try std.testing.expect(try needsVisualInspection("<sld><graphicData uri='chart'/></sld>"));
+    try std.testing.expect(!try needsVisualInspection("<sld><sp><cNvSpPr txBox='1'/><prstGeom prst='rect'/><txBody><t>Native</t></txBody></sp></sld>"));
+    try std.testing.expect(!try needsVisualInspection("<sld><graphicData uri='http://schemas.openxmlformats.org/drawingml/2006/table'><tbl/></graphicData></sld>"));
 }
