@@ -264,6 +264,15 @@ pub fn encodeLegacyPage(alloc: std.mem.Allocator, sequence: u64, input: []const 
                 const value = if (datum.array) |array| try @import("antfly_local_sources").sql_array_wire.toJsonLeaky(a, array.*, .{}) else if (datum.numeric) |number| value: {
                     var context: @import("antfly_local_sources").sql_numeric_value.Context = .{ .alloc = a };
                     break :value std.json.Value{ .string = try @import("antfly_local_sources").sql_numeric_value.format(&context, number.*) };
+                } else if (datum.range()) |range| value: {
+                    try datum.validateTemporal();
+                    const ranges = @import("antfly_local_sources").sql_range_value;
+                    var context: ranges.Context = .{ .alloc = a };
+                    break :value std.json.Value{ .string = try ranges.formatLeaky(&context, range.*) };
+                } else if (datum.temporal()) |temporal| value: {
+                    try datum.validateTemporal();
+                    var text: [@import("antfly_local_sources").sql_temporal_text.output_capacity]u8 = undefined;
+                    break :value std.json.Value{ .string = try a.dupe(u8, try @import("antfly_local_sources").sql_temporal_text.format(temporal.*, &text)) };
                 } else if (datum.value == .float and !std.math.isFinite(datum.value.float))
                     std.json.Value{ .string = if (std.math.isNan(datum.value.float)) "NaN" else if (datum.value.float < 0) "-Infinity" else "Infinity" }
                 else

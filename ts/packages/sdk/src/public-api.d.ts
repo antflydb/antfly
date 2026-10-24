@@ -6655,7 +6655,7 @@ export interface components {
          * @description Logical SQL result type. Integer values and numbers with element_type numeric are decimal strings to preserve exact precision in every client.
          * @enum {string}
          */
-        SQLColumnType: "string" | "uuid" | "integer" | "number" | "boolean" | "datetime" | "json" | "array" | "unknown";
+        SQLColumnType: "string" | "uuid" | "integer" | "number" | "boolean" | "datetime" | "json" | "array" | "unknown" | "numrange" | "daterange" | "tsrange" | "tstzrange";
         /**
          * @description Bound SQL scalar or array-element identity, including numeric widths and exact NUMERIC. Never inferred from JSON value shape.
          * @enum {string}
@@ -17120,7 +17120,7 @@ export interface components {
         /** @enum {string} */
         RelationalExpressionOp: "literal" | "column" | "add" | "subtract" | "multiply" | "divide" | "negate" | "concat" | "coalesce" | "lower_ascii" | "upper_ascii" | "eq" | "ne" | "gt" | "gte" | "lt" | "lte" | "is_null" | "is_not_null" | "is_distinct" | "is_not_distinct" | "and" | "or" | "not" | "cast" | "case_when" | "modulo" | "in_list" | "not_in_list" | "array" | "replace" | "md5" | "abs" | "ceil" | "floor" | "round" | "trunc" | "sign" | "sqrt" | "jsonb_typeof" | "jsonb_array_length" | "jsonb_extract_path" | "jsonb_extract_path_text" | "uuidv4" | "uuidv7" | "transaction_timestamp";
         /** @enum {string} */
-        RelationalExpressionType: "string" | "blob" | "boolean" | "datetime" | "integer" | "number" | "numeric" | "sql_array" | "json";
+        RelationalExpressionType: "string" | "blob" | "boolean" | "datetime" | "integer" | "number" | "numeric" | "sql_array" | "json" | "numrange" | "daterange" | "tsrange" | "tstzrange";
         /**
          * @description Exact PostgreSQL builtin identity for a relational root scalar column.
          *     SQL array columns use SQLArrayElementType for their element identity.
@@ -17751,6 +17751,25 @@ export interface components {
             "x-antfly-sql-type": components["schemas"]["SQLArrayElementType"];
             /** @description Accepted only with numeric element identity. Applies assignment coercion to each non-NULL element while preserving dimensions and lower bounds. Requires reader capability version 23. */
             "x-antfly-sql-numeric-modifier"?: components["schemas"]["SQLNumericModifier"];
+            /** @default false */
+            nullable?: boolean;
+            description?: string;
+        } & {
+            [key: string]: unknown;
+        };
+        /**
+         * @description A relational PostgreSQL range column. JSON ingress and SQL results use
+         *     PostgreSQL range text. The declared subtype supplies identity even for
+         *     NULL, empty and unbounded values. Packed rows retain canonical binary
+         *     endpoints, inclusive/exclusive flags and exact NUMERIC precision.
+         *     Empty ranges, omitted bounds, subtype infinities and SQL NULL are
+         *     distinct. DATE ranges canonicalize finite endpoints to [lower,upper).
+         *     Timestamp endpoints use the execution's UTC zone. Requires schema
+         *     reader capability version 35.
+         */
+        SQLRangeColumnSchema: {
+            /** @enum {string} */
+            type: "numrange" | "daterange" | "tsrange" | "tstzrange";
             /** @default false */
             nullable?: boolean;
             description?: string;

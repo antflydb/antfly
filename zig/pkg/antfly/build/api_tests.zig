@@ -38,7 +38,7 @@ pub const AddTestsResult = struct {
     run_lib_api_standalone_backup_restore_tests: *std.Build.Step.Run,
     distributed_query_availability_step: *std.Build.Step,
     run_public_api_parity_aggregate_tests: *std.Build.Step.Run,
-    run_sql_owner_lifecycle_tests: [8]*std.Build.Step.Run,
+    run_sql_owner_lifecycle_tests: [9]*std.Build.Step.Run,
     run_lib_api_auth_tests: *std.Build.Step.Run,
     run_algebraic_dynamic_template_tests: *std.Build.Step.Run,
     run_lib_api_connections_tests: *std.Build.Step.Run,
@@ -2250,6 +2250,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "mounted SQL original table comment preserves schema rows privileges and all cold owners",
             "mounted SQL original resource comments preserve identities authorization and cold owners",
             "mounted SQL original calendar intervals preserve typed results and cold rows",
+            "mounted SQL range values preserve native bytes typed results and cold owners",
             "mounted SQL original column comment preserves stable identities rows privileges and cold owners",
             "transaction read preflight preserves physical unique absence without relabeling optimistic conflicts",
             "transaction commit version retains nanoseconds and rejects overflow",
@@ -2377,6 +2378,10 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     sql_table_comment_run.addArg("--require-no-skips");
     b.step("antfly-api-sql-table-comment-lifecycle-test", "Verify existing table-description metadata with stable schemas, primary rows and complete cold recovery")
         .dependOn(&sql_table_comment_run.step);
+    const sql_range_run = addFilteredTestRunArtifactWithRuntimeFilters(b, sql_owner_lifecycle_tests, &.{ "mounted SQL range values preserve native bytes typed results and cold owners", "retained read page validates tagged cell extensions before serialization" });
+    sql_range_run.addArg("--require-no-skips");
+    b.step("antfly-api-sql-range-lifecycle-test", "Verify typed range storage, queries and cold catalog/session/data owners")
+        .dependOn(&sql_range_run.step);
     const sql_temporal_arithmetic_run = addFilteredTestRunArtifactWithRuntimeFilters(b, sql_owner_lifecycle_tests, &.{ "mounted SQL original calendar intervals preserve typed results and cold rows", "SQL parity timestamp comparison preserves nanoseconds and timezone offsets rather than textual spelling" });
     sql_temporal_arithmetic_run.addArg("--require-no-skips");
     b.step("antfly-api-sql-temporal-arithmetic-test", "Verify original calendar interval queries and unchanged rows through cold native owners")
@@ -2813,7 +2818,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .run_lib_api_standalone_backup_restore_tests = run_lib_api_standalone_backup_restore_tests,
         .distributed_query_availability_step = lib_api_distributed_query_availability_test_step,
         .run_public_api_parity_aggregate_tests = run_public_api_parity_aggregate_tests,
-        .run_sql_owner_lifecycle_tests = .{ sql_primary_key_rewrite_run, sql_index_lifecycle_run, sql_nullability_run, sql_covering_constraint_run, sql_role_defaults_run, fk_validation_run, sql_resource_comment_run, sql_temporal_arithmetic_run },
+        .run_sql_owner_lifecycle_tests = .{ sql_primary_key_rewrite_run, sql_index_lifecycle_run, sql_nullability_run, sql_covering_constraint_run, sql_role_defaults_run, fk_validation_run, sql_resource_comment_run, sql_temporal_arithmetic_run, sql_range_run },
         .run_lib_api_auth_tests = run_lib_api_auth_tests,
         .run_algebraic_dynamic_template_tests = run_algebraic_dynamic_template_tests,
         .run_lib_api_connections_tests = run_lib_api_connections_tests,

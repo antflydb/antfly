@@ -298,6 +298,36 @@ const JsonPayload = struct {
         return Datum.json(try std.json.parseFromSliceLeaky(std.json.Value, a, self.text.?, .{ .parse_numbers = false }));
     }
 };
+/// Typed extensions share one sparse vector. Both pointed-to values have at
+/// least two-byte alignment, so the low bit retains their kind without growing
+/// every retained column or doubling the existing temporal entry width. These
+/// addresses are owned by Store.arena and never enter a persisted encoding.
+const Extension = struct {
+    bits: usize = 0,
+    fn from(value: Datum) Extension {
+        if (value.range()) |range| {
+            comptime std.debug.assert(@alignOf(@import("range_value.zig").Value) >= 2);
+            const address = @intFromPtr(range);
+            std.debug.assert(address & 1 == 0);
+            return .{ .bits = address | 1 };
+        }
+        if (value.temporal()) |temporal| {
+            comptime std.debug.assert(@alignOf(@import("temporal_value.zig").Value) >= 2);
+            const address = @intFromPtr(temporal);
+            std.debug.assert(address & 1 == 0);
+            return .{ .bits = address };
+        }
+        return .{};
+    }
+    fn datum(self: Extension) Datum {
+        std.debug.assert(self.bits != 0);
+        return if (self.bits & 1 != 0)
+            Datum.typedRange(@ptrFromInt(self.bits & ~@as(usize, 1)))
+        else
+            Datum.typedTemporal(@ptrFromInt(self.bits));
+    }
+};
+
 const Column = struct {
     const Values = union(enum) {
         unknown,
@@ -316,7 +346,7 @@ const Column = struct {
     patterns: std.ArrayList(?*scalar.PatternSet) = .empty,
     arrays: std.ArrayList(?*const @import("array_value.zig").Value) = .empty,
     numerics: std.ArrayList(?*const @import("numeric_value.zig").Value) = .empty,
-    temporals: std.ArrayList(?*const @import("temporal_value.zig").Value) = .empty,
+    extensions: std.ArrayList(Extension) = .empty,
     fn deinit(self: *Column, a: A) void {
         if (self.fixed) |*fixed| fixed.deinit(a);
         if (self.json_bytes) |bytes| {
@@ -332,7 +362,7 @@ const Column = struct {
         self.patterns.deinit(a);
         self.arrays.deinit(a);
         self.numerics.deinit(a);
-        self.temporals.deinit(a);
+        self.extensions.deinit(a);
     }
     fn isNull(self: Column, row: usize) bool {
         return self.nulls.items[row / 64] & (@as(u64, 1) << @as(u6, @intCast(row % 64))) != 0;
@@ -355,14 +385,14 @@ const Column = struct {
         var result = Datum.fromParts(value, false, if (self.patterns.items.len == 0) null else self.patterns.items[row]);
         result.array = if (self.arrays.items.len == 0) null else self.arrays.items[row];
         result.numeric = if (self.numerics.items.len == 0) null else self.numerics.items[row];
-        if (self.temporals.items.len != 0) if (self.temporals.items[row]) |temporal| {
+        if (self.extensions.items.len != 0 and self.extensions.items[row].bits != 0) {
             if (result.patterns() != null or result.numeric != null or result.array != null or result.value != .null) return error.SqlTypeMismatch;
-            return Datum.typedTemporal(temporal);
-        };
+            return self.extensions.items[row].datum();
+        }
         return result;
     }
     fn appendDictionary(self: *Column, a: A, owned: A, begin: usize, batch: @import("execution_batch.zig").Batch) !bool {
-        if (self.temporals.items.len != 0 or self.fixed != null or self.json_bytes != null or batch != .dictionary or self.patterns.items.len != 0 or self.arrays.items.len != 0 or self.numerics.items.len != 0) return false;
+        if (self.extensions.items.len != 0 or self.fixed != null or self.json_bytes != null or batch != .dictionary or self.patterns.items.len != 0 or self.arrays.items.len != 0 or self.numerics.items.len != 0) return false;
         const source = batch.dictionary;
         for (source.indices) |id| if (id >= source.values.len) return error.InvalidSqlBackendResponse;
         const remap = try a.alloc(u32, source.values.len);
@@ -375,7 +405,7 @@ const Column = struct {
         var referenced: usize = 0;
         for (source.values, remap) |value, id| {
             if (id == std.math.maxInt(u32)) continue;
-            if (value.patterns() != null or value.array != null or value.numeric != null or value.temporal() != null) return false;
+            if (value.patterns() != null or value.array != null or value.numeric != null or value.temporal() != null or value.range() != null) return false;
             if (value.sql_null) continue;
             const actual = std.meta.activeTag(value.value);
             if (actual != .integer and actual != .float and actual != .string and actual != .number_string) return false;
@@ -500,12 +530,13 @@ const Column = struct {
     }
     fn append(self: *Column, a: A, owned: A, scratch: A, row: usize, value: Datum) !void {
         try value.validateTemporal();
-        if (self.temporals.items.len != 0 or value.temporal() != null) {
-            if (self.temporals.items.len == 0) {
-                try self.temporals.resize(a, row);
-                @memset(self.temporals.items, null);
+        if (self.extensions.items.len != 0 or value.range() != null or value.temporal() != null) {
+            if (self.extensions.items.len == 0) {
+                try self.extensions.resize(a, row);
+                @memset(self.extensions.items, .{});
             }
-            try self.temporals.append(a, if (value.temporal() != null) (try @import("operators.zig").cloneDatum(owned, value)).temporal() else null);
+            const extension = Extension.from(value);
+            try self.extensions.append(a, if (extension.bits != 0) Extension.from(try @import("operators.zig").cloneDatum(owned, value)) else .{});
         }
         if (self.json_bytes) |bytes| try bytes.append(a, null);
         const coefficient = fixedCoefficient(value);
@@ -856,7 +887,7 @@ pub const Store = struct {
     pub fn dictionaryId(self: *const Store, row_index: usize, column: usize) !?u64 {
         if (row_index >= self.len or column >= self.columns.len) return error.InvalidSqlBackendResponse;
         const stored = self.columns[column];
-        if (stored.patterns.items.len != 0 or stored.arrays.items.len != 0 or stored.numerics.items.len != 0 or stored.temporals.items.len != 0) return null;
+        if (stored.patterns.items.len != 0 or stored.arrays.items.len != 0 or stored.numerics.items.len != 0 or stored.extensions.items.len != 0) return null;
         const id: u32 = switch (stored.values) {
             inline .integers, .numbers => |v| if (v.encoded) v.indices.items[row_index] else return null,
             .strings, .decimals => |v| if (v.flat == null) v.indices.items[row_index] else return null,
@@ -867,7 +898,7 @@ pub const Store = struct {
     pub fn dictionaryBatch(self: *const Store, a: A, column: usize, begin: usize, count: usize) !?@import("execution_batch.zig").Batch {
         if (self.failed or column >= self.columns.len or begin > self.len or count > self.len - begin) return error.InvalidSqlBackendResponse;
         const stored = self.columns[column];
-        if (stored.patterns.items.len != 0 or stored.arrays.items.len != 0 or stored.numerics.items.len != 0 or stored.temporals.items.len != 0) return null;
+        if (stored.patterns.items.len != 0 or stored.arrays.items.len != 0 or stored.numerics.items.len != 0 or stored.extensions.items.len != 0) return null;
         switch (stored.values) {
             inline .integers, .numbers => |v| if (!v.encoded) return null,
             .strings, .decimals => |v| if (v.flat != null) return null,
@@ -1178,7 +1209,7 @@ pub const Store = struct {
                 if ((try scalar.compareDatums(Datum.typedNumeric(&number), value)) != .eq) return false;
                 continue;
             }
-            if (value.array != null or value.numeric != null or value.temporal() != null or (stored.arrays.items.len != 0 and stored.arrays.items[row_index] != null) or (stored.numerics.items.len != 0 and stored.numerics.items[row_index] != null) or (stored.temporals.items.len != 0 and stored.temporals.items[row_index] != null)) {
+            if (value.range() != null or value.array != null or value.numeric != null or value.temporal() != null or (stored.arrays.items.len != 0 and stored.arrays.items[row_index] != null) or (stored.numerics.items.len != 0 and stored.numerics.items[row_index] != null) or (stored.extensions.items.len != 0 and stored.extensions.items[row_index].bits != 0)) {
                 if ((try scalar.compareDatums(try stored.cell(a, row_index), value)) != .eq) return false;
                 continue;
             }
@@ -1766,4 +1797,46 @@ test "native projection refinements benchmark shared JSON lease hash work" {
     try store.appendBatchLeased(batch, &lease);
     try std.testing.expectEqual(text.written().len, lease.hashed_bytes);
     std.debug.print("SHARED_JSON_HASH rows=64 wire={d} before_hash_input={d} after_hash_input={d} unique_payloads={d}\n", .{ text.written().len, 128 * text.written().len, lease.hashed_bytes, store.json_payloads.count() });
+}
+
+test "SQL range retained columns and spill own typed endpoints and preserve observable display" {
+    const ranges = @import("range_value.zig");
+    const a = std.testing.allocator;
+    const Entry = struct { kind: ranges.Kind, input: []const u8, text: ?[]const u8 = null, sqlstate: ?[]const u8 };
+    var reference = try std.json.parseFromSlice(struct { entries: []const Entry }, a, @embedFile("fixtures/sql_range_reference.json"), .{ .ignore_unknown_fields = true });
+    defer reference.deinit();
+    var store = Store.init(a);
+    defer store.deinit();
+    _ = try store.append(&.{.{}});
+    var count: usize = 1;
+    for (reference.value.entries) |entry| {
+        if (entry.sqlstate != null) continue;
+        var input = std.heap.ArenaAllocator.init(a);
+        var context: ranges.Context = .{ .alloc = input.allocator() };
+        const value = ranges.parseLeaky(&context, entry.kind, entry.input) catch |err| {
+            input.deinit();
+            return err;
+        };
+        const row = store.append(&.{Datum.typedRange(&value)}) catch |err| {
+            input.deinit();
+            return err;
+        };
+        input.deinit();
+        try std.testing.expectEqual(count, row);
+        count += 1;
+        var scratch = std.heap.ArenaAllocator.init(a);
+        defer scratch.deinit();
+        var output: ranges.Context = .{ .alloc = scratch.allocator() };
+        const retained = try store.cell(scratch.allocator(), row, 0);
+        try std.testing.expectEqual(entry.kind, retained.range().?.kind);
+        try std.testing.expectEqualStrings(entry.text.?, try ranges.formatLeaky(&output, retained.range().?.*));
+        const encoded = try @import("spill.zig").encodeDatumsAlloc(a, &.{retained}, 1 << 20);
+        defer a.free(encoded);
+        const decoded = try @import("spill.zig").decodeDatumsInArena(scratch.allocator(), encoded, 1 << 20);
+        try std.testing.expect(try store.equal(scratch.allocator(), row, decoded, true));
+        try std.testing.expectEqualStrings(entry.text.?, try ranges.formatLeaky(&output, decoded[0].range().?.*));
+    }
+    try std.testing.expect((try store.cell(a, 0, 0)).sql_null);
+    _ = try store.append(&.{.{}});
+    try std.testing.expect((try store.cell(a, count, 0)).sql_null);
 }

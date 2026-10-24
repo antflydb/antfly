@@ -56,6 +56,10 @@ pub const Column = struct {
             .numeric_modifier = column.numeric_modifier,
             .type = switch (column.column_type) {
                 .string => if (column.sql_element_type == .uuid) .uuid else .string,
+                .numrange => .numrange,
+                .daterange => .daterange,
+                .tsrange => .tsrange,
+                .tstzrange => .tstzrange,
                 .integer => .integer,
                 .number, .numeric => .number,
                 .boolean => .boolean,
@@ -78,7 +82,7 @@ pub const Column = struct {
             .uuid => Kind.uuid,
             .boolean => Kind.boolean,
             .json => Kind.jsonb,
-            .datetime => null,
+            .datetime, .numrange, .daterange, .tsrange, .tstzrange => null,
             .array => return error.InvalidSqlBackendResponse,
         };
         if (self.numeric_modifier) |modifier| {
@@ -514,6 +518,10 @@ pub const Table = struct {
                 .integer => .integer,
                 .number => if (column_.element_type == .numeric) .numeric else .number,
                 .array => .sql_array,
+                .numrange => .numrange,
+                .daterange => .daterange,
+                .tsrange => .tsrange,
+                .tstzrange => .tstzrange,
                 .boolean => .boolean,
                 .datetime => .datetime,
                 .json => .json,

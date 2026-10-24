@@ -161,7 +161,7 @@ pub const PreparedInput = struct {
         switch (node.kind) {
             // Cold numeric/array cells already carry their typed encoding;
             // caching those borrowed views would add allocation without reuse.
-            .numeric, .sql_array => if (self.source != .json) return Plan.readColumn(execution, self.source, node),
+            .numeric, .sql_array, .numrange, .daterange, .tsrange, .tstzrange => if (self.source != .json) return Plan.readColumn(execution, self.source, node),
             .blob, .json => {},
             else => return Plan.readColumn(execution, self.source, node),
         }
@@ -533,6 +533,37 @@ pub fn numericJson(execution: *Execution, input: std.json.Value) !Value {
     defer scratch.deinit();
     const parsed = @import("../sql/numeric_storage.zig").fromJson(&execution.numeric, input) catch |err| return scratch.failure(err);
     return scratch.encode(parsed.value) catch |err| return scratch.failure(err);
+}
+
+fn rangeJson(execution: *Execution, kind: @import("../sql/range_value.zig").Kind, input: std.json.Value) !Value {
+    try execution.charge(0);
+    if (input == .null) return .null;
+    if (input != .string) return error.InvalidRelationalExpressionInput;
+    var scratch: NumericScratch = undefined;
+    scratch.init(execution);
+    defer scratch.deinit();
+    const ranges = @import("../sql/range_value.zig");
+    const value = ranges.parseLeaky(&execution.numeric, kind, input.string) catch |err| return scratch.failure(err);
+    const size = ranges.encodedSize(&execution.numeric, value) catch |err| return scratch.failure(err);
+    if (size > execution.bytes.* -| scratch.memory.footprint()) return execution.limit();
+    const output = try allocateOutput(execution.alloc, size, execution.bytes);
+    errdefer execution.alloc.free(output);
+    var writer: std.Io.Writer = .fixed(output);
+    ranges.encode(&execution.numeric, value, &writer) catch |err| return scratch.failure(err);
+    return .{ .range = .{ .kind = kind, .bytes = output } };
+}
+
+fn rangeJsonOutput(execution: *Execution, range: @import("../sql/range_value.zig").Encoded) !std.json.Value {
+    var scratch: NumericScratch = undefined;
+    scratch.init(execution);
+    defer scratch.deinit();
+    const ranges = @import("../sql/range_value.zig");
+    const value = ranges.decodeCanonicalLeaky(&execution.numeric, range.kind, range.bytes) catch |err| return scratch.failure(err);
+    const text = ranges.formatLeaky(&execution.numeric, value) catch |err| return scratch.failure(err);
+    if (text.len > execution.bytes.* -| scratch.memory.footprint()) return execution.limit();
+    const output = try allocateOutput(execution.alloc, text.len, execution.bytes);
+    @memcpy(output, text);
+    return .{ .string = output };
 }
 
 /// Bind a parsed, explicitly typed array envelope without a JSON round trip.
@@ -1192,6 +1223,7 @@ pub const Plan = struct {
                 const input = json.object.get(node.column_name) orelse .null;
                 if (node.kind == .blob) break :blk try decodeBlob(execution, try BlobOperand.fromJson(input));
                 if (node.kind == .sql_array) break :blk try arrayJson(execution, node.sql_type.?, input, null);
+                if (@import("../sql/range_value.zig").kindFromType(node.kind)) |kind| break :blk try rangeJson(execution, kind, input);
                 break :blk if (node.kind == .numeric) try numericJson(execution, input) else try scalarJson(alloc, node.kind, input, false);
             },
             .row, .bound_row => |row| blk: {
@@ -1207,6 +1239,7 @@ pub const Plan = struct {
                     .integer => .{ .integer = cell.value.i64_val },
                     .number => .{ .number = cell.value.f64_val },
                     .numeric => .{ .numeric = cell.value.bytes_val },
+                    .numrange, .daterange, .tsrange, .tstzrange => .{ .range = .{ .kind = @import("../sql/range_value.zig").kindFromType(node.kind).?, .bytes = cell.value.bytes_val } },
                     .sql_array => .{ .sql_array = .{ .element_type = node.sql_type.?, .bytes = cell.value.bytes_val } },
                     .boolean => .{ .boolean = cell.value.bool_val },
                     .datetime => .{ .datetime = cell.value.u64_val },
@@ -2470,6 +2503,7 @@ fn valueOrderWithContext(a: Value, b: Value, fold_ascii: bool, context: *exact.C
         .number => |value| std.math.order(value, b.number),
         .datetime => |value| std.math.order(value, b.datetime),
         .sql_array => |array| @import("../sql/array_comparison.zig").order(try array.view(), try b.sql_array.view(), context, max_allocated_bytes),
+        .range => |range| (try range.view(context)).order(context, try b.range.view(context)),
         .json => |json| blk: {
             var work: @import("../sql/json_order.zig").Budget = .{ .shared = context };
             break :blk try @import("../sql/json_order.zig").compare(json.value, b.json.value, &work, 0);
@@ -2549,6 +2583,7 @@ fn finite(value: f64) !Value {
 fn valueHasKind(value: Value, kind: Kind) bool {
     return switch (value) {
         .null => true,
+        .range => |range| @import("../sql/range_value.zig").kindFromType(kind) == range.kind,
         inline else => |_, tag| std.mem.eql(u8, @tagName(tag), @tagName(kind)),
     };
 }
@@ -2575,7 +2610,7 @@ fn preparedSourceMask(nodes: []const Node) u8 {
     for (nodes) |node| {
         if (node.op != .column) continue;
         mask |= switch (node.kind) {
-            .numeric, .sql_array => @as(u8, 1),
+            .numeric, .sql_array, .numrange, .daterange, .tsrange, .tstzrange => @as(u8, 1),
             .blob, .json => @as(u8, 3),
             else => @as(u8, 0),
         };
@@ -2691,6 +2726,7 @@ const Compiler = struct {
                 const json_null = if (marker) |present| present.bool else false;
                 switch (node.kind) {
                     .string, .blob, .boolean, .datetime, .integer, .number, .numeric, .sql_array => {},
+                    .numrange, .daterange, .tsrange, .tstzrange => if (!self.table.requires_range_expressions) return error.InvalidRelationalExpressionType,
                     .json => if ((value != .null or json_null) and !self.table.requires_json_expressions) return error.InvalidRelationalExpressionType,
                     else => return error.InvalidRelationalExpressionType,
                 }
@@ -2702,7 +2738,7 @@ const Compiler = struct {
                 }
                 var json_literal: ?JsonLiteral = null;
                 if (node.kind == .json and (value != .null or json_null)) json_literal = try prepareJsonLiteral(self.execution, value);
-                node.literal = (if (json_literal) |literal| literal.value else if (node.kind == .sql_array) arrayJson(self.execution, node.sql_type.?, value, null) else if (node.kind == .numeric) numericJson(self.execution, value) else scalarJson(self.alloc, node.kind, value, true)) catch |err| switch (err) {
+                node.literal = (if (json_literal) |literal| literal.value else if (node.kind == .sql_array) arrayJson(self.execution, node.sql_type.?, value, null) else if (node.kind == .numeric) numericJson(self.execution, value) else if (@import("../sql/range_value.zig").kindFromType(node.kind)) |range_kind| rangeJson(self.execution, range_kind, value) else scalarJson(self.alloc, node.kind, value, true)) catch |err| switch (err) {
                     error.OutOfMemory => return err,
                     error.SqlProgramLimitExceeded, error.RelationalExpressionBudgetExceeded => return err,
                     else => return error.InvalidRelationalExpressionType,
@@ -2720,6 +2756,7 @@ const Compiler = struct {
                 self.literal_bytes += switch (node.literal) {
                     .string, .blob, .numeric => |bytes| bytes.len,
                     .sql_array => |array| array.bytes.len,
+                    .range => |range| range.bytes.len,
                     .json => json_literal.?.encoded_bytes,
                     .datetime => 16,
                     else => 8,
@@ -2745,6 +2782,10 @@ const Compiler = struct {
                         self.hash.update(&bytes);
                     },
                     .sql_array => |array| self.frame(array.bytes),
+                    .range => |range| {
+                        self.frame(@tagName(range.kind));
+                        self.frame(range.bytes);
+                    },
                     // Program identity includes observable JSONB display
                     // scale, unlike the row's semantic content hash.
                     .json => self.frame(&json_literal.?.fingerprint),
@@ -2763,6 +2804,7 @@ const Compiler = struct {
                 if (node.kind == .sql_array and node.sql_type == null) return error.InvalidRelationalExpressionType;
                 switch (node.kind) {
                     .string, .blob, .boolean, .datetime, .integer, .number, .numeric, .sql_array => {},
+                    .numrange, .daterange, .tsrange, .tstzrange => {},
                     .json => if (!self.table.requires_json_expressions) return error.InvalidRelationalExpressionType,
                     else => return error.InvalidRelationalExpressionType,
                 }
@@ -4403,6 +4445,7 @@ pub const Set = struct {
                 .integer => .{ .integer = cell.value.i64_val },
                 .number => .{ .number = cell.value.f64_val },
                 .numeric => .{ .numeric = cell.value.bytes_val },
+                .numrange, .daterange, .tsrange, .tstzrange => .{ .range = .{ .kind = @import("../sql/range_value.zig").kindFromType(column.column_type).?, .bytes = cell.value.bytes_val } },
                 .sql_array => .{ .sql_array = .{ .element_type = column.sql_element_type orelse return error.InvalidRelationalGeneratedValue, .bytes = cell.value.bytes_val } },
                 .boolean => .{ .boolean = cell.value.bool_val },
                 .datetime => .{ .datetime = cell.value.u64_val },
@@ -4475,6 +4518,7 @@ pub const Set = struct {
             if (!self.read_columns[ordinal] or (ignore_generated and self.generated_columns[ordinal])) continue;
             if (input) |scalar| switch (column.column_type) {
                 .numeric => value.* = try numericJson(execution, scalar),
+                .numrange, .daterange, .tsrange, .tstzrange => value.* = try rangeJson(execution, @import("../sql/range_value.zig").kindFromType(column.column_type).?, scalar),
                 .sql_array => value.* = try arrayJson(execution, column.sql_element_type orelse return error.InvalidRelationalExpressionInput, scalar, null),
                 .blob => value.* = try decodeBlob(execution, try BlobOperand.fromJson(scalar)),
                 .json => {
@@ -4518,6 +4562,12 @@ fn generatedDisplayEqual(execution: *Execution, expected: Value, actual: Value) 
         _ = try expected.sql_array.view();
         _ = try actual.sql_array.view();
         return try orderBytes(expected.sql_array.bytes, actual.sql_array.bytes, false, &execution.numeric) == .eq;
+    }
+    if (expected == .range) {
+        if (expected.range.kind != actual.range.kind) return false;
+        _ = try expected.range.view(&execution.numeric);
+        _ = try actual.range.view(&execution.numeric);
+        return try orderBytes(expected.range.bytes, actual.range.bytes, false, &execution.numeric) == .eq;
     }
     if (try compareValues(execution, expected, actual, false) != .eq) return false;
     return switch (expected) {
@@ -4708,7 +4758,7 @@ fn valuesEqual(a: Value, b: Value) !bool {
         .null => true,
         .string => |bytes| std.mem.eql(u8, bytes, b.string),
         .blob => |bytes| std.mem.eql(u8, bytes, b.blob),
-        .numeric, .sql_array, .json => try valueOrder(a, b, false) == .eq,
+        .numeric, .sql_array, .json, .range => try valueOrder(a, b, false) == .eq,
         .integer => |value| value == b.integer,
         .number => |value| value == b.number,
         .boolean => |value| value == b.boolean,
@@ -4832,6 +4882,7 @@ fn boundedValueToJson(execution: *Execution, value: Value) !std.json.Value {
         .json => |json| cloneJsonOutput(execution, json.*),
         .numeric => |bytes| numericJsonOutput(execution, bytes),
         .sql_array => |array| arrayJsonOutputLeaky(execution, array),
+        .range => |range| rangeJsonOutput(execution, range),
         .string => |bytes| blk: {
             const output = try allocateOutput(execution.alloc, bytes.len, execution.bytes);
             @memcpy(output, bytes);
@@ -4872,6 +4923,7 @@ fn retainPreparedResult(execution: *Execution, value: Value, decoded: bool) !Val
     return switch (value) {
         inline .string, .blob, .numeric => |bytes, tag| @unionInit(Value, @tagName(tag), try retainPreparedBytes(execution, bytes)),
         .sql_array => |array| .{ .sql_array = .{ .element_type = array.element_type, .bytes = try retainPreparedBytes(execution, array.bytes) } },
+        .range => |range| .{ .range = .{ .kind = range.kind, .bytes = try retainPreparedBytes(execution, range.bytes) } },
         else => value,
     };
 }
@@ -4910,6 +4962,7 @@ fn valueToJson(alloc: Allocator, value: Value) !std.json.Value {
         .integer => |integer| .{ .integer = integer },
         .number => |number| .{ .float = number },
         .numeric => |bytes| @import("../sql/numeric_storage.zig").jsonValueAlloc(alloc, bytes),
+        .range => |range| @import("../sql/range_storage.zig").jsonValueAlloc(alloc, range.kind, range.bytes),
         .boolean => |boolean| .{ .bool = boolean },
         .datetime => |datetime| .{ .number_string = try std.fmt.allocPrint(alloc, "{d}", .{datetime}) },
         .sql_array => |array| blk: {

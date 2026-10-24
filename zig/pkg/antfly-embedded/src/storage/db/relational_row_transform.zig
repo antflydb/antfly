@@ -474,10 +474,10 @@ fn validateStored(alloc: Allocator, bytes: []const u8, view: registry.SchemaView
 
 fn scalarCell(execution: *expressions.Execution, table: schema.TableSchema, column: schema.RelationalColumn, ordinal: u32, value: expressions.Value) !codec.Cell {
     try execution.charge(1);
-    if (value != .null and !std.mem.eql(u8, @tagName(value), @tagName(column.column_type))) return error.InvalidRelationalExpressionInput;
+    if (value != .null and !(if (value == .range) @import("../../sql/range_value.zig").kindFromType(column.column_type) == value.range.kind else std.mem.eql(u8, @tagName(value), @tagName(column.column_type)))) return error.InvalidRelationalExpressionInput;
     if (value == .sql_array and (column.column_type != .sql_array or value.sql_array.element_type != column.sql_element_type)) return error.InvalidRelationalExpressionInput;
     const value_type: @import("../../section/typed_doc_values.zig").ValueType = switch (column.column_type) {
-        .string, .blob, .numeric, .sql_array, .json => .bytes_val,
+        .string, .blob, .numeric, .sql_array, .json, .numrange, .daterange, .tsrange, .tstzrange => .bytes_val,
         .integer => .i64_val,
         .number => .f64_val,
         .boolean => .bool_val,
@@ -490,6 +490,7 @@ fn scalarCell(execution: *expressions.Execution, table: schema.TableSchema, colu
         .value_type = value_type,
         .is_json = column.is_json,
         .is_numeric = column.column_type == .numeric,
+        .sql_range_kind = @import("../../sql/range_value.zig").kindFromType(column.column_type),
         .sql_array_element_type = if (column.column_type == .sql_array) column.sql_element_type else null,
         .is_null = value == .null,
         .value = switch (value) {
@@ -509,6 +510,7 @@ fn scalarCell(execution: *expressions.Execution, table: schema.TableSchema, colu
             .boolean => |boolean| .{ .bool_val = boolean },
             .datetime => |datetime| .{ .u64_val = std.math.cast(u64, datetime) orelse return error.InvalidRelationalExpressionInput },
             .sql_array => |array| .{ .bytes_val = array.bytes },
+            .range => |range| .{ .bytes_val = range.bytes },
             .json => |json| blk: {
                 var memory: @import("../../sql/memory_budget.zig") = .{ .backing = execution.alloc, .limit = execution.bytes.*, .monotonic = true };
                 defer execution.bytes.* -|= memory.footprint();

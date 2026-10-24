@@ -98,6 +98,13 @@ fn inputLiteral(alloc: std.mem.Allocator, result: scalar.Type, value: scalar.Dat
         .sql_type = @tagName(identity orelse return error.SqlTypeMismatch),
         .value = if (value.sql_null) Json.null else try @import("array_wire.zig").toJsonLeaky(alloc, value.array.?.*, .{}),
     });
+    if (value.range()) |range| {
+        try value.validateTemporal();
+        const ranges = @import("range_value.zig");
+        if (ranges.kindFromType(kind) != range.kind) return error.SqlTypeMismatch;
+        var context: ranges.Context = .{ .alloc = alloc };
+        return json(alloc, .{ .op = "literal", .type = @tagName(range.kind), .value = try ranges.formatLeaky(&context, range.*) });
+    }
     if (value.numeric) |number| {
         var context: @import("numeric_value.zig").Context = .{ .alloc = alloc };
         return json(alloc, .{ .op = "literal", .type = "numeric", .sql_type = "numeric", .value = try @import("numeric_value.zig").format(&context, number.*) });
@@ -197,6 +204,10 @@ pub fn indexInstructionIdentity(alloc: std.mem.Allocator, program: *const scalar
             .integer => .integer,
             .number => if (lowered.element_type == .numeric) .numeric else .number,
             .array => .sql_array,
+            .numrange => .numrange,
+            .daterange => .daterange,
+            .tsrange => .tsrange,
+            .tstzrange => .tstzrange,
             .boolean => .boolean,
             .datetime => .datetime,
             .json => .json,

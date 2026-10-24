@@ -120,6 +120,7 @@ pub fn propertyType(property: anytype) ast.ColumnType {
         if (property.sql_type == .uuid) return .uuid;
     }
     const name = property.field_type orelse return .json;
+    if (std.meta.stringToEnum(@import("range_value.zig").Kind, name)) |kind| return @import("range_value.zig").typeFromKind(ast.ColumnType, kind);
     if (std.mem.eql(u8, name, "integer") or property.integer_only) return .integer;
     if (std.mem.eql(u8, name, "number") or std.mem.eql(u8, name, "numeric")) return .number;
     if (std.mem.eql(u8, name, "boolean")) return .boolean;
@@ -277,7 +278,7 @@ pub const Projection = struct {
             errdefer alloc.free(out.name);
             out.path = if (std.mem.eql(u8, column.name, column.path)) out.name else try alloc.dupe(u8, column.path);
             initialized += 1;
-            has_typed_cells = has_typed_cells or column.type == .array or column.type == .datetime or column.element_type == .numeric;
+            has_typed_cells = has_typed_cells or column.type == .array or column.type == .datetime or column.element_type == .numeric or @import("range_value.zig").kindFromType(column.type) != null;
         }
         return .{ .columns = columns, .has_typed_cells = has_typed_cells, .document_root = table.storage_mode == .document };
     }
@@ -335,7 +336,8 @@ pub const Projection = struct {
                 if (cell.sql_null and !column.nullable) return error.InvalidSqlBackendResponse;
                 if (!cell.sql_null and ((column.type == .array and cell.array == null) or
                     (column.element_type == .numeric and column.type != .array and cell.numeric == null) or
-                    (column.type == .datetime and cell.temporal() == null)))
+                    (column.type == .datetime and cell.temporal() == null) or
+                    (@import("range_value.zig").kindFromType(column.type) != null and cell.range() == null)))
                 {
                     direct = false;
                     break;
@@ -556,6 +558,12 @@ pub const Projection = struct {
 
 fn coerce(alloc: std.mem.Allocator, value: Json, kind: ast.ColumnType) !Json {
     return switch (kind) {
+        .numrange, .daterange, .tsrange, .tstzrange => if (value == .null) .null else range: {
+            if (value != .string) return error.SqlTypeMismatch;
+            const ranges = @import("range_value.zig");
+            var context: ranges.Context = .{ .alloc = alloc };
+            break :range .{ .string = try ranges.formatLeaky(&context, try ranges.parseLeaky(&context, ranges.kindFromType(kind).?, value.string)) };
+        },
         .array => error.UnsupportedSqlShape,
         .json => typed_json.clone(alloc, value),
         .integer => switch (value) {

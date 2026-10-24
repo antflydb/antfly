@@ -1013,6 +1013,7 @@ pub const SQLParameterDescriptor = types.SQLParameterDescriptor;
 pub const SQLPrepareRequest = types.SQLPrepareRequest;
 pub const SQLPreparedExecutionRequest = types.SQLPreparedExecutionRequest;
 pub const SQLPreparedResponse = types.SQLPreparedResponse;
+pub const SQLRangeColumnSchema = types.SQLRangeColumnSchema;
 pub const SQLRequest = types.SQLRequest;
 pub const SQLResponse = types.SQLResponse;
 pub const SQLTemporalKind = types.SQLTemporalKind;

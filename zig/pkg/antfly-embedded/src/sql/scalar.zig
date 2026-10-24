@@ -33,7 +33,7 @@ pub const PatternSet = struct {
 pub const Datum = struct {
     /// Immutable temporal payload owned by the pinned invocation/row region.
     /// The JSON null placeholder is never a temporal value or SQL NULL.
-    extension_kind: enum(u8) { none, patterns, temporal } = .none,
+    extension_kind: enum(u8) { none, patterns, temporal, range } = .none,
     // One tagged, pointer-sized extension; the discriminator fits existing
     // tail padding. Constructors/accessors are the only interpretation boundary.
     extension: ?*const anyopaque = null,
@@ -64,6 +64,12 @@ pub const Datum = struct {
     pub fn temporal(self: Datum) ?*const @import("temporal_value.zig").Value {
         return if (self.extension_kind == .temporal and self.extension != null) @ptrCast(@alignCast(self.extension.?)) else null;
     }
+    pub fn typedRange(value: *const @import("range_value.zig").Value) Datum {
+        return .{ .extension_kind = .range, .extension = value, .sql_null = false };
+    }
+    pub fn range(self: Datum) ?*const @import("range_value.zig").Value {
+        return if (self.extension_kind == .range and self.extension != null) @ptrCast(@alignCast(self.extension.?)) else null;
+    }
     pub fn patterns(self: Datum) ?*PatternSet {
         return if (self.extension_kind == .patterns and self.extension != null) @constCast(@as(*const PatternSet, @ptrCast(@alignCast(self.extension.?)))) else null;
     }
@@ -77,6 +83,10 @@ pub const Datum = struct {
     }
     pub fn validateTemporal(self: Datum) !void {
         if ((self.extension_kind == .none) != (self.extension == null)) return error.SqlTypeMismatch;
+        if (self.range()) |value| {
+            if (self.sql_null or self.numeric != null or self.array != null or self.value != .null) return error.SqlTypeMismatch;
+            if (value.empty and (value.lower != null or value.upper != null or value.lower_inc or value.upper_inc)) return error.SqlTypeMismatch;
+        }
         if (self.temporal()) |value| {
             if (self.sql_null or self.numeric != null or self.array != null or self.patterns() != null or self.value != .null) return error.SqlTypeMismatch;
             var frame: [16]u8 = undefined;
@@ -326,7 +336,7 @@ pub fn assignmentSourceIdentity(kind: ast.ColumnType, element: ?arrays.ElementTy
         .string => .text,
         .uuid => .uuid,
         .json => .jsonb,
-        .datetime, .array => null,
+        .datetime, .array, .numrange, .daterange, .tsrange, .tstzrange => null,
     };
 }
 pub const BindLimits = struct {
@@ -473,6 +483,15 @@ pub const Function = enum {
     uuid_extract_version,
     uuid_extract_timestamp,
     uuidv7,
+    numrange,
+    daterange,
+    tsrange,
+    tstzrange,
+    isempty,
+    lower_inc,
+    upper_inc,
+    lower_inf,
+    upper_inf,
     pub fn volatility(self: Function) Volatility {
         return switch (self) {
             .ai_decide, .ai_choice, .ai_score, .ai_probability, .gen_random_uuid, .uuidv7 => .@"volatile",
@@ -481,6 +500,40 @@ pub const Function = enum {
         };
     }
 };
+
+fn rangeConstructor(function: Function) ?@import("range_value.zig").Kind {
+    return switch (function) {
+        .numrange => .numrange,
+        .daterange => .daterange,
+        .tsrange => .tsrange,
+        .tstzrange => .tstzrange,
+        else => null,
+    };
+}
+fn rangeInformation(function: Function) bool {
+    return switch (function) {
+        .isempty, .lower_inc, .upper_inc, .lower_inf, .upper_inf => true,
+        else => false,
+    };
+}
+fn rangeEndpointDatum(datum: Datum, kind: @import("range_value.zig").Kind) !@import("range_value.zig").Endpoint {
+    if (kind == .numrange) return .{ .number = (datum.numeric orelse return error.SqlTypeMismatch).* };
+    const value = datum.temporal() orelse return error.SqlTypeMismatch;
+    return switch (value.*) {
+        .date => |v| if (kind == .daterange) .{ .date = v } else error.SqlTypeMismatch,
+        .timestamp => |v| if (kind == .tsrange) .{ .timestamp = v } else error.SqlTypeMismatch,
+        .timestamp_tz => |v| if (kind == .tstzrange) .{ .timestamp = v } else error.SqlTypeMismatch,
+        else => error.SqlTypeMismatch,
+    };
+}
+fn rangeEndpointType(kind: @import("range_value.zig").Kind) Type {
+    return switch (kind) {
+        .numrange => .{ .kind = .number, .element_type = .numeric },
+        .daterange => .{ .kind = .datetime, .temporal_kind = .date },
+        .tsrange => .{ .kind = .datetime, .temporal_kind = .timestamp },
+        .tstzrange => .{ .kind = .datetime, .temporal_kind = .timestamp_tz },
+    };
+}
 
 fn clockFunction(function: Function) ?@import("statement_clock.zig").StableFunction {
     return switch (function) {
@@ -1345,6 +1398,10 @@ pub fn assignText(alloc: Allocator, datum: Datum, source_identity: ?arrays.Eleme
     defer arena.deinit();
     const program: Program = .{ .arena = &arena, .instructions = &.{}, .root = 0, .output_type = .{}, .parameter_types = &.{}, .parameter_descriptors = &.{}, .required_columns = &.{} };
     var evaluator: Evaluator = .{ .program = &program, .alloc = alloc, .cells = &.{}, .parameters = &.{}, .limits = limits };
+    if (datum.range()) |range| {
+        var context = evaluator.numericContext();
+        return Datum.json(.{ .string = try @import("range_value.zig").formatLeaky(&context, range.*) });
+    }
     if (datum.temporal() != null) return Datum.json(.{ .string = try evaluator.temporalText(datum) });
     if (datum.array) |array| {
         var text: std.Io.Writer.Allocating = .init(alloc);
@@ -1405,7 +1462,7 @@ pub fn assignArray(alloc: Allocator, datum: Datum, target: arrays.ElementType, l
 /// without turning an already typed text/JSON value into numeric input.
 pub fn assignNumeric(alloc: Allocator, datum: Datum, source_identity: ?arrays.ElementType, target: arrays.ElementType, limits: EvalLimits) !Datum {
     if (!builtin_cast.integral(target) and !builtin_cast.floating(target) and target != .numeric) return error.SqlAssignmentTypeMismatch;
-    if (datum.array != null or datum.patterns() != null or datum.temporal() != null) return error.SqlAssignmentTypeMismatch;
+    if (datum.array != null or datum.patterns() != null or datum.temporal() != null or datum.range() != null) return error.SqlAssignmentTypeMismatch;
     if (datum.sql_null) {
         if (datum.value != .null or datum.numeric != null) return error.SqlTypeMismatch;
         return datum;
@@ -1427,10 +1484,10 @@ pub fn assignNumeric(alloc: Allocator, datum: Datum, source_identity: ?arrays.El
     return evaluator.castDatumBuiltin(datum, source, target);
 }
 
-fn normalizeParameterType(descriptor: Type) !Type {
+pub fn normalizeParameterType(descriptor: Type) !Type {
     try validateParameterType(descriptor);
     var result = descriptor;
-    if (result.kind != null and result.kind != .datetime and result.element_type == null) result.element_type = try parameterElementType(result);
+    if (result.kind != null and result.kind != .datetime and @import("range_value.zig").kindFromType(result.kind.?) == null and result.element_type == null) result.element_type = try parameterElementType(result);
     return result;
 }
 
@@ -2346,7 +2403,7 @@ fn arrayElementType(kind: ast.ColumnType) !arrays.ElementType {
         .number => .float64,
         .boolean => .boolean,
         .json => .jsonb,
-        .datetime, .array => error.UnsupportedSqlShape,
+        .datetime, .array, .numrange, .daterange, .tsrange, .tstzrange => error.UnsupportedSqlShape,
     };
 }
 fn arrayScalarType(kind: arrays.ElementType) ast.ColumnType {
@@ -2836,11 +2893,20 @@ test "SQL scalar regex functions preserve PostgreSQL values OIDs NULLs and error
 }
 
 fn arity(function: Function, count: usize) !void {
+    if (rangeConstructor(function) != null) {
+        if (count != 2 and count != 3) return error.SqlUndefinedFunction;
+        return;
+    }
+    if (rangeInformation(function)) {
+        if (count != 1) return error.SqlUndefinedFunction;
+        return;
+    }
     if (regexFunction(function)) |regex| {
         if (!regex_functions.validArity(regex, count)) return error.SqlUndefinedFunction;
         return;
     }
     const valid = switch (function) {
+        .numrange, .daterange, .tsrange, .tstzrange, .isempty, .lower_inc, .upper_inc, .lower_inf, .upper_inf => unreachable,
         .now, .transaction_timestamp, .@"$current_user", .gen_random_uuid => count == 0,
         .uuidv7 => count <= 1,
         .uuid_extract_version, .uuid_extract_timestamp => count == 1,
@@ -2988,6 +3054,10 @@ const Binder = struct {
                 }
                 if (cast.type == .array) try self.typeArrayConstructors(cast.operand, cast.element_type.?, depth + 1);
                 const source = try self.infer(cast.operand, depth + 1);
+                const range = @import("range_value.zig");
+                if (range.kindFromType(cast.type) != null and source.kind != null and source.kind != .string and source.kind != cast.type) return error.SqlCannotCoerce;
+                if (source.kind != null and range.kindFromType(source.kind.?) != null and cast.type != source.kind and cast.type != .string) return error.SqlCannotCoerce;
+                if (source.kind != null and range.kindFromType(source.kind.?) != null and cast.type == .string) break :blk .{ .kind = .string, .element_type = .text, .nullable = source.nullable };
                 // timestamp with time zone is not an epoch-number domain in
                 // PostgreSQL. Resolve this at binding, even for SQL NULL or
                 // dead branches; an evaluator must not invent unit conversion.
@@ -3080,6 +3150,30 @@ const Binder = struct {
                 }
                 const function = try functionId(call.name);
                 try arity(function, call.args.len);
+                const ranges = @import("range_value.zig");
+                if (rangeConstructor(function)) |range_kind| {
+                    const endpoint = rangeEndpointType(range_kind);
+                    for (call.args[0..2]) |arg| {
+                        const input = try self.infer(arg, depth + 1);
+                        const unknown = arg.* == .literal and arg.literal == .string;
+                        if (input.kind == null or unknown) continue;
+                        if (endpoint.kind == .number) {
+                            if (input.kind != .integer and !(input.kind == .number and input.element_type != .float32 and input.element_type != .float64)) return error.SqlUndefinedFunction;
+                        } else if (input.kind != .datetime or (input.temporal_kind orelse .timestamp_tz) != endpoint.temporal_kind) return error.SqlUndefinedFunction;
+                    }
+                    if (call.args.len == 3) {
+                        const bounds = try self.infer(call.args[2], depth + 1);
+                        if (bounds.kind != null and bounds.kind != .string) return error.SqlUndefinedFunction;
+                    }
+                    break :blk .{ .kind = ranges.typeFromKind(ast.ColumnType, range_kind), .nullable = call.args.len == 3 and (try self.infer(call.args[2], depth + 1)).nullable };
+                }
+                if (rangeInformation(function) or function == .lower or function == .upper) {
+                    const input = try self.infer(call.args[0], depth + 1);
+                    if (input.kind != null) if (ranges.kindFromType(input.kind.?)) |range_kind| {
+                        break :blk if (rangeInformation(function)) .{ .kind = .boolean, .element_type = .boolean, .nullable = input.nullable } else rangeEndpointType(range_kind);
+                    };
+                    if (rangeInformation(function)) return error.SqlUndefinedFunction;
+                }
                 if (function == .gen_random_uuid) break :blk .{ .kind = .uuid, .element_type = .uuid, .nullable = false };
                 if (function == .uuidv7) {
                     if (call.args.len == 1) {
@@ -3193,6 +3287,19 @@ const Binder = struct {
                 if (function == .@"$contains" or function == .@"$overlaps" or function == .jsonb_exists) {
                     const left = try self.infer(call.args[0], depth + 1);
                     const right = try self.infer(call.args[1], depth + 1);
+                    if (left.kind != null) if (ranges.kindFromType(left.kind.?)) |range_kind| {
+                        if (right.kind != left.kind) {
+                            if (function != .@"$contains") return error.SqlUndefinedOperator;
+                            const endpoint = rangeEndpointType(range_kind);
+                            const unknown = call.args[1].* == .literal and call.args[1].literal == .string;
+                            if (right.kind != null and !unknown) {
+                                if (endpoint.kind == .number) {
+                                    if (right.kind != .integer and !(right.kind == .number and right.element_type == .numeric)) return error.SqlUndefinedOperator;
+                                } else if (right.kind != .datetime or (right.temporal_kind orelse .timestamp_tz) != endpoint.temporal_kind) return error.SqlUndefinedOperator;
+                            }
+                        }
+                        break :blk .{ .kind = .boolean, .element_type = .boolean, .nullable = left.nullable or right.nullable };
+                    };
                     if (function == .jsonb_exists) {
                         if ((left.kind != null and left.kind != .json) or (right.kind != null and right.kind != .string)) return error.SqlTypeMismatch;
                     } else {
@@ -3682,6 +3789,36 @@ const Binder = struct {
                     break :blk .{ .call = .{ .function = function, .args = &.{}, .setting_identity = resolved.identity } };
                 }
                 const args = try self.alloc.alloc(u32, call.args.len);
+                const ranges = @import("range_value.zig");
+                if (rangeConstructor(function)) |range_kind| {
+                    const endpoint = rangeEndpointType(range_kind);
+                    for (call.args, args, 0..) |arg, *out, i| {
+                        if (i == 2) {
+                            out.* = try self.compile(arg, .string, depth + 1);
+                            continue;
+                        }
+                        const cast = try self.alloc.create(ast.Scalar);
+                        cast.* = .{ .cast = .{ .operand = arg, .type = endpoint.kind.?, .element_type = endpoint.element_type, .temporal_kind = endpoint.temporal_kind, .coercion = .function } };
+                        out.* = try self.compileTypedContext(cast, endpoint.kind, endpoint.element_type, endpoint.temporal_kind, depth + 1);
+                    }
+                    break :blk .{ .call = .{ .function = function, .args = args } };
+                }
+                if (rangeInformation(function) or function == .lower or function == .upper or function == .@"$contains" or function == .@"$overlaps") {
+                    const input = try self.infer(call.args[0], depth + 1);
+                    if (input.kind != null) if (ranges.kindFromType(input.kind.?)) |range_kind| {
+                        args[0] = try self.compileTypedContext(call.args[0], input.kind, null, null, depth + 1);
+                        if (call.args.len == 2) {
+                            const other = try self.infer(call.args[1], depth + 1);
+                            if (other.kind == input.kind) args[1] = try self.compileTypedContext(call.args[1], input.kind, null, null, depth + 1) else {
+                                const endpoint = rangeEndpointType(range_kind);
+                                const cast = try self.alloc.create(ast.Scalar);
+                                cast.* = .{ .cast = .{ .operand = call.args[1], .type = endpoint.kind.?, .element_type = endpoint.element_type, .temporal_kind = endpoint.temporal_kind, .coercion = .function } };
+                                args[1] = try self.compileTypedContext(cast, endpoint.kind, endpoint.element_type, endpoint.temporal_kind, depth + 1);
+                            }
+                        }
+                        break :blk .{ .call = .{ .function = function, .args = args } };
+                    };
+                }
                 if ((function == .round or function == .trunc) and call.args.len == 2) {
                     for (call.args, args, 0..) |arg, *out, i| {
                         const target: arrays.ElementType = if (i == 0) .numeric else .int32;
@@ -4182,7 +4319,7 @@ const Evaluator = struct {
 
     fn run(self: *Evaluator, index: u32, depth: usize) anyerror!Json {
         const result = try self.runDatum(index, depth);
-        if (result.array != null or result.numeric != null or result.temporal() != null) return error.SqlTypeMismatch;
+        if (result.array != null or result.numeric != null or result.temporal() != null or result.range() != null) return error.SqlTypeMismatch;
         return result.value;
     }
 
@@ -4207,6 +4344,11 @@ const Evaluator = struct {
                 // not PostgreSQL text-format bytes. A JSON string stays a
                 // string even when its contents happen to be valid JSON text.
                 if (instruction.type.kind == .json) break :blk Datum.json(value);
+                if (instruction.type.kind != null) if (@import("range_value.zig").kindFromType(instruction.type.kind.?)) |range_kind| {
+                    if (value != .string) return error.SqlTypeMismatch;
+                    var context = self.numericContext();
+                    break :blk try self.ownRange(try @import("range_value.zig").parseLeaky(&context, range_kind, value.string));
+                };
                 if (instruction.type.temporal_kind) |temporal_kind| {
                     if (value != .string) return error.SqlTypeMismatch;
                     const parsed = try @import("temporal_text.zig").parseInput(temporal_kind, value.string);
@@ -4235,6 +4377,21 @@ const Evaluator = struct {
                 }
                 const datum = try self.runDatum(cast.operand, depth + 1);
                 if (datum.sql_null) break :blk .{};
+                if (datum.range()) |range| {
+                    if (cast.type == self.program.instructions[cast.operand].type.kind) break :blk datum;
+                    if (cast.type != .string) return error.SqlCannotCoerce;
+                    var context = self.numericContext();
+                    const text = try @import("range_value.zig").formatLeaky(&context, range.*);
+                    try self.charge(text.len);
+                    break :blk Datum.json(.{ .string = text });
+                }
+                if (@import("range_value.zig").kindFromType(cast.type)) |range_kind| {
+                    if (datum.value != .string) return error.SqlCannotCoerce;
+                    var context = self.numericContext();
+                    const range = try @import("range_value.zig").parseLeaky(&context, range_kind, datum.value.string);
+                    try self.charge(datum.value.string.len * 2);
+                    break :blk try self.ownRange(range);
+                }
                 if (datum.temporal() != null) {
                     try datum.validateTemporal();
                     if (cast.type == .datetime and datum.temporal().?.kind() == (cast.temporal_kind orelse .timestamp_tz) and cast.element_type == null) break :blk datum;
@@ -4403,6 +4560,69 @@ const Evaluator = struct {
                 break :blk if (unknown) .{} else Datum.json(.{ .bool = list.negated });
             },
             .call => |call| blk: {
+                const ranges = @import("range_value.zig");
+                if (rangeConstructor(call.function)) |range_kind| {
+                    const left = try self.runDatum(call.args[0], depth + 1);
+                    const right = try self.runDatum(call.args[1], depth + 1);
+                    const bounds: []const u8 = if (call.args.len == 2) "[)" else flags: {
+                        const input = try self.runDatum(call.args[2], depth + 1);
+                        if (input.sql_null) break :blk .{};
+                        if (input.value != .string) return error.SqlUndefinedFunction;
+                        break :flags input.value.string;
+                    };
+                    if (bounds.len != 2 or (bounds[0] != '[' and bounds[0] != '(') or (bounds[1] != ']' and bounds[1] != ')')) return error.SqlInvalidParameterValue;
+                    var context = self.numericContext();
+                    break :blk try self.ownRange(try ranges.canonical(&context, .{
+                        .kind = range_kind,
+                        .lower = if (left.sql_null) null else try rangeEndpointDatum(left, range_kind),
+                        .upper = if (right.sql_null) null else try rangeEndpointDatum(right, range_kind),
+                        .lower_inc = bounds[0] == '[',
+                        .upper_inc = bounds[1] == ']',
+                    }));
+                }
+                if (rangeInformation(call.function) or call.function == .lower or call.function == .upper or call.function == .@"$contains" or call.function == .@"$overlaps") {
+                    const source_type = self.program.instructions[call.args[0]].type.kind;
+                    if (source_type != null and ranges.kindFromType(source_type.?) != null) {
+                        const input = try self.runDatum(call.args[0], depth + 1);
+                        if (input.sql_null) break :blk .{};
+                        const range = input.range() orelse return error.SqlTypeMismatch;
+                        if (call.function == .lower or call.function == .upper) {
+                            const point = if (range.empty) null else if (call.function == .lower) range.lower else range.upper;
+                            if (point == null) break :blk .{};
+                            switch (point.?) {
+                                .number => |v| {
+                                    try self.charge(@sizeOf(@import("numeric_value.zig").Value));
+                                    const owned = try self.alloc.create(@import("numeric_value.zig").Value);
+                                    owned.* = v;
+                                    break :blk Datum.typedNumeric(owned);
+                                },
+                                .date, .timestamp => {
+                                    try self.charge(@sizeOf(@import("temporal_value.zig").Value));
+                                    const owned = try self.alloc.create(@import("temporal_value.zig").Value);
+                                    owned.* = switch (point.?) {
+                                        .date => |v| .{ .date = v },
+                                        .timestamp => |v| if (range.kind == .tsrange) .{ .timestamp = v } else .{ .timestamp_tz = v },
+                                        else => unreachable,
+                                    };
+                                    break :blk Datum.typedTemporal(owned);
+                                },
+                            }
+                        }
+                        if (rangeInformation(call.function)) break :blk Datum.json(.{ .bool = switch (call.function) {
+                            .isempty => range.empty,
+                            .lower_inc => range.lower_inc,
+                            .upper_inc => range.upper_inc,
+                            .lower_inf => !range.empty and range.lower == null,
+                            .upper_inf => !range.empty and range.upper == null,
+                            else => unreachable,
+                        } });
+                        const other = try self.runDatum(call.args[1], depth + 1);
+                        if (other.sql_null) break :blk .{};
+                        var context = self.numericContext();
+                        const accepted = if (call.function == .@"$overlaps") try ranges.overlaps(&context, range.*, (other.range() orelse return error.SqlTypeMismatch).*) else if (other.range()) |rhs| try ranges.contains(&context, range.*, rhs.*) else try ranges.containsPoint(&context, range.*, try rangeEndpointDatum(other, range.kind));
+                        break :blk Datum.json(.{ .bool = accepted });
+                    }
+                }
                 if (call.function == .extract or call.function == .date_part) {
                     const unit = try self.runDatum(call.args[0], depth + 1);
                     const source = try self.runDatum(call.args[1], depth + 1);
@@ -5015,6 +5235,7 @@ const Evaluator = struct {
     fn convert(self: *Evaluator, value: Json, kind: ast.ColumnType) anyerror!Json {
         if (value == .null) return .null;
         return switch (kind) {
+            .numrange, .daterange, .tsrange, .tstzrange => error.InvalidSqlProgram,
             .array => error.SqlTypeMismatch,
             .integer => switch (value) {
                 .integer => value,
@@ -5448,6 +5669,13 @@ const Evaluator = struct {
         return Datum.typedNumeric(owner);
     }
 
+    fn ownRange(self: *Evaluator, value: @import("range_value.zig").Value) !Datum {
+        try self.charge(@sizeOf(@import("range_value.zig").Value));
+        const owned = try self.alloc.create(@import("range_value.zig").Value);
+        owned.* = value;
+        return Datum.typedRange(owned);
+    }
+
     fn numericContext(self: *Evaluator) @import("numeric_value.zig").Context {
         return .{
             .alloc = self.alloc,
@@ -5462,6 +5690,7 @@ const Evaluator = struct {
     /// then exact decimal parsing. JSON numbers have neither a float width
     /// nor NaN/infinity payloads; PostgreSQL represents specials as strings.
     fn sqlJson(self: *Evaluator, datum: Datum, descriptor: Type) !Json {
+        if (datum.range() != null) return .{ .string = try self.sqlText(datum, descriptor) };
         if (datum.temporal() != null) return error.UnsupportedSqlShape; // JSON temporal spelling needs exact type activation
         if (datum.sql_null) return .null;
         if (datum.numeric != null) return self.numericJson(datum);
@@ -5675,6 +5904,12 @@ const Evaluator = struct {
     /// floating object keys are text, so JSON numeric canonicalization would
     /// incorrectly expand exponents and discard the sign of negative zero.
     fn sqlText(self: *Evaluator, datum: Datum, descriptor: Type) ![]const u8 {
+        if (datum.range()) |range| {
+            var context = self.numericContext();
+            const text = try @import("range_value.zig").formatLeaky(&context, range.*);
+            try self.charge(text.len);
+            return text;
+        }
         if (datum.temporal() != null) return self.temporalText(datum);
         if (datum.numeric != null) return self.formatText(try self.numericJson(datum));
         if (descriptor.kind == .json) return self.jsonText(datum.value);
@@ -6352,6 +6587,13 @@ pub fn compareDatumsWithBudget(left: Datum, right: Datum, work: *json_order.Budg
     try left.validateTemporal();
     try right.validateTemporal();
     if (left.sql_null or right.sql_null) return if (left.sql_null == right.sql_null) .eq else if (left.sql_null) .gt else .lt;
+    if (left.range()) |range| {
+        var none = std.heap.FixedBufferAllocator.init(&.{});
+        var context = work.numericContext(none.allocator());
+        defer work.remaining = @intCast(context.remaining);
+        return @import("range_value.zig").order(&context, range.*, (right.range() orelse return error.SqlTypeMismatch).*);
+    }
+    if (right.range() != null) return error.SqlTypeMismatch;
     if (left.temporal()) |value| return @import("temporal_ops.zig").compare(value.*, (right.temporal() orelse return error.SqlTypeMismatch).*);
     if (right.temporal() != null) return error.SqlTypeMismatch;
     if (left.numeric) |number| {
@@ -6379,6 +6621,13 @@ pub fn compareDatumsWithBudget(left: Datum, right: Datum, work: *json_order.Budg
 pub fn semanticHashDatum(value: Datum) anyerror!u64 {
     try value.validateTemporal();
     if (value.sql_null) return 0;
+    if (value.range()) |range| {
+        var none = std.heap.FixedBufferAllocator.init(&.{});
+        var context: @import("numeric_value.zig").Context = .{ .alloc = none.allocator() };
+        var hasher = std.hash.Wyhash.init(0);
+        try @import("range_value.zig").hash(&context, range.*, &hasher);
+        return hasher.final();
+    }
     if (value.temporal()) |temporal| return @import("temporal_ops.zig").hash(temporal.*);
     if (value.numeric) |number| {
         var none = std.heap.FixedBufferAllocator.init(&.{});
@@ -8532,5 +8781,70 @@ test "SQL temporal arithmetic normalizes bound timestamp casts without implicit 
         const result = try program.evaluate(arena.allocator(), &.{}, &.{}, .{});
         var output: [@import("temporal_text.zig").output_capacity]u8 = undefined;
         try std.testing.expectEqualStrings("2024-02-29 12:00:00+00", try @import("temporal_text.zig").format(result.temporal().?.*, &output));
+    }
+}
+
+test {
+    _ = @import("range_value.zig");
+    _ = @import("range_key.zig");
+    _ = @import("range_binary.zig");
+}
+
+test "SQL range casts constructors accessors and predicates retain PostgreSQL domains" {
+    _ = @import("typed_store.zig");
+    _ = @import("parameter_frame.zig");
+    _ = @import("../storage/db/relational_index_keys.zig");
+    const a = std.testing.allocator;
+    const ranges = @import("range_value.zig");
+    const fixture = try std.json.parseFromSlice(struct { entries: []const struct { kind: ranges.Kind, input: []const u8, sqlstate: ?[]const u8, text: ?[]const u8 = null } }, a, @embedFile("fixtures/sql_range_reference.json"), .{ .ignore_unknown_fields = true });
+    defer fixture.deinit();
+    for (fixture.value.entries) |entry| {
+        const escaped = try std.mem.replaceOwned(u8, a, entry.input, "'", "''");
+        defer a.free(escaped);
+        const expression = try std.fmt.allocPrint(a, "'{s}'::{s}", .{ escaped, @tagName(entry.kind) });
+        defer a.free(expression);
+        var parsed = try @import("compiler.zig").compileScalar(a, expression, .{});
+        defer parsed.deinit();
+        var program = bind(a, parsed.expression, &.{}, &.{}, .{}) catch |err| {
+            try std.testing.expectEqualStrings(entry.sqlstate orelse return err, @import("errors.zig").describe(err).code);
+            continue;
+        };
+        defer program.deinit();
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const value = program.evaluate(arena.allocator(), &.{}, &.{}, .{}) catch |err| {
+            try std.testing.expectEqualStrings(entry.sqlstate orelse return err, @import("errors.zig").describe(err).code);
+            continue;
+        };
+        try std.testing.expect(entry.sqlstate == null);
+        try std.testing.expectEqual(ranges.typeFromKind(ast.ColumnType, entry.kind), program.output_type.kind.?);
+        try std.testing.expect(!value.sql_null);
+        var ctx: ranges.Context = .{ .alloc = arena.allocator() };
+        try std.testing.expectEqualStrings(entry.text.?, try ranges.formatLeaky(&ctx, value.range().?.*));
+    }
+    const cases = [_]struct { sql: []const u8, expected: []const u8 }{
+        .{ .sql = "numrange(-5,15)::text", .expected = "[-5,15)" },
+        .{ .sql = "daterange(DATE '2025-01-01',DATE '2025-02-01','(]')::text", .expected = "[2025-01-02,2025-02-02)" },
+        .{ .sql = "tstzrange('2025-01-01T01:30:00+01:30','2025-01-02T00:00:00Z')::text", .expected = "[\"2025-01-01 00:00:00+00\",\"2025-01-02 00:00:00+00\")" },
+        .{ .sql = "tsrange('2025-01-01 00:00:00','2025-01-02 00:00:00')::text", .expected = "[\"2025-01-01 00:00:00\",\"2025-01-02 00:00:00\")" },
+        .{ .sql = "lower(numrange(-5,15))::text", .expected = "-5" },
+        .{ .sql = "upper(numrange(-5,15))::text", .expected = "15" },
+        .{ .sql = "(numrange(-5,15) @> 3)::text", .expected = "true" },
+        .{ .sql = "(numrange(-5,15) && numrange(10,20))::text", .expected = "true" },
+        .{ .sql = "isempty(numrange(1,1))::text", .expected = "true" },
+        .{ .sql = "('[1.00,10.000)'::numrange = '[1,10)'::numrange)::text", .expected = "true" },
+        .{ .sql = "('empty'::numrange < '[1,10)'::numrange)::text", .expected = "true" },
+        .{ .sql = "('[1,10)'::numrange IS DISTINCT FROM '[1.00,10.000)'::numrange)::text", .expected = "false" },
+    };
+    for (cases) |case| {
+        var parsed = try @import("compiler.zig").compileScalar(a, case.sql, .{});
+        defer parsed.deinit();
+        var program = try bind(a, parsed.expression, &.{}, &.{}, .{});
+        defer program.deinit();
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        errdefer std.debug.print("range scalar {s}\n", .{case.sql});
+        const value = try program.evaluate(arena.allocator(), &.{}, &.{}, .{});
+        try std.testing.expectEqualStrings(case.expected, value.value.string);
     }
 }

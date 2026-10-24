@@ -1047,3 +1047,90 @@ test "mounted SQL original calendar intervals preserve typed results and cold ro
         } },
     });
 }
+
+test "mounted SQL range values preserve native bytes typed results and cold owners" {
+    // sql-0683: the full original invalid ALTER must preserve schema and rows.
+    const Rejected = struct { id: []const u8, sql: []const u8, sqlstate: []const u8 };
+    const Probe = struct { sql: []const u8, output: SourceResult };
+    const RangeCampaign = struct {
+        pub const native_sessions = true;
+        pub const native_auth = true;
+        pub const cold_catalog = true;
+        inner: SourceCampaign,
+        probes: []const Probe,
+        rejected: []const Rejected,
+        fn record(ctx: *fixture.Context) !@import("../metadata/table_manager.zig").TableRecord {
+            const domain = local.system_catalog_domain;
+            const source = @import("http_server.zig").StatusSource.fromMetadataHttpService(ctx.metadata.server.svc);
+            const bytes = try source.systemCatalog(ctx.alloc, .{}, .{ .resolve = .{ .table = "usage_records" } });
+            defer ctx.alloc.free(bytes);
+            var resolved = try std.json.parseFromSlice(?domain.ResolvedTable, ctx.alloc, bytes, .{});
+            defer resolved.deinit();
+            const binding = resolved.value orelse return error.MissingSourceRelation;
+            const store = ctx.metadata.server.svc.projectedStore() orelse return error.MissingMetadataStore;
+            return (try store.getTable(ctx.alloc, 2188, binding.table_id)) orelse error.MissingSourceRelation;
+        }
+        fn verify(self: *@This(), ctx: *fixture.Context) !void {
+            for (self.rejected) |entry| {
+                try std.testing.expectEqualStrings("sql-0683", entry.id);
+                const manager = @import("../metadata/table_manager.zig");
+                const before = try record(ctx);
+                defer manager.freeTable(ctx.alloc, before);
+                var response = try client.execute(ctx, entry.sql, .never);
+                defer response.deinit(ctx.alloc);
+                if (response.status != 400) std.debug.print("original PERIOD rejection: {d} {s}\n", .{ response.status, response.body });
+                try std.testing.expectEqual(@as(u16, 400), response.status);
+                const result = try std.json.parseFromSlice(wire.SQLDiagnostic, ctx.alloc, response.body, .{});
+                defer result.deinit();
+                try std.testing.expectEqualStrings(entry.sqlstate, result.value.code);
+                const after = try record(ctx);
+                defer manager.freeTable(ctx.alloc, after);
+                try std.testing.expect(manager.tableDefinitionsEqual(before, after));
+            }
+            for (self.probes) |probe| {
+                var response = try client.execute(ctx, probe.sql, .read);
+                defer response.deinit(ctx.alloc);
+                if (response.status != 200) std.debug.print("range native probe {s}: {d} {s}\n", .{ probe.sql, response.status, response.body });
+                try std.testing.expectEqual(@as(u16, 200), response.status);
+                const result = try std.json.parseFromSlice(wire.SQLResponse, ctx.alloc, response.body, .{});
+                defer result.deinit();
+                expectSourceResult(ctx.alloc, result.value, probe.output, true) catch |err| {
+                    std.debug.print("range native result {s}: {s}\n", .{ probe.sql, response.body });
+                    return err;
+                };
+            }
+        }
+        pub fn beforeRestart(self: *@This(), ctx: *fixture.Context) !void {
+            try self.inner.setup(ctx);
+            try self.verify(ctx);
+            // Queries and a rejected ALTER must retain the initial physical
+            // identities, versions and digests, not merely their cold postimage.
+            try self.inner.fingerprints(ctx, .prepared);
+            try self.inner.verify(ctx, false);
+        }
+        pub fn afterRestart(self: *@This(), ctx: *fixture.Context) !void {
+            for (self.inner.entry.tables) |table| _ = try fixture.waitServingSchema(ctx, table.name, 0);
+            try self.verify(ctx);
+            try self.inner.verify(ctx, true);
+        }
+    };
+    const a = std.testing.allocator;
+    const reference = try std.json.parseFromSlice(struct { tables: []const SourceTable, probes: []const Probe, rejected: []const Rejected }, a, local.sql_parity_fixtures.range_reference, .{ .ignore_unknown_fields = true });
+    defer reference.deinit();
+    try std.testing.expectEqual(@as(usize, 5), reference.value.tables.len);
+    var retained = std.heap.ArenaAllocator.init(a);
+    defer retained.deinit();
+    try fixture.runWithState(RangeCampaign, .{
+        .probes = reference.value.probes,
+        .rejected = reference.value.rejected,
+        .inner = .{ .retained = &retained, .entry = .{
+            .id = "range-contract",
+            .profile = "typed native ranges",
+            .sqlstate = null,
+            .command_tag = "SELECT",
+            .affected = 0,
+            .output = .{ .columns = &.{}, .column_oids = &.{}, .rows = &.{} },
+            .tables = reference.value.tables,
+        } },
+    });
+}

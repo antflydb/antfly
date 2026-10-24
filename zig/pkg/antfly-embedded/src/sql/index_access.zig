@@ -224,7 +224,7 @@ const Preparation = struct {
         } else converted.value;
         if (wire == .string and wire.string.len > self.limits().output_bytes) return;
         if (wire == .float and !std.math.isFinite(wire.float)) return;
-        if (converted.temporal() != null or converted.array != null or converted.patterns() != null) return;
+        if (converted.temporal() != null or converted.range() != null or converted.array != null or converted.patterns() != null) return;
         try State.poll(&self.state);
         const owned = try @import("../storage/typed_json.zig").clone(self.output, wire);
         if (direct) |column| {

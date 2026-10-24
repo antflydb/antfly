@@ -2253,6 +2253,7 @@ fn validateTypeArrayDefinition(value: std.json.Array, require_object_only: bool)
 }
 
 fn validateTypeName(schema_type_name: []const u8, require_object_only: bool) ![]const u8 {
+    if (!require_object_only and std.meta.stringToEnum(@import("../sql/range_value.zig").Kind, schema_type_name) != null) return schema_type_name;
     if (require_object_only) {
         if (!std.mem.eql(u8, schema_type_name, "object")) return error.InvalidSchemaUpdateRequest;
         return schema_type_name;
@@ -3089,6 +3090,7 @@ fn validateParsedStorageModeSchema(schema: TableSchema) !void {
 }
 
 fn propertyContainsRelationalOnlySchemaType(property: *const DocumentProperty) bool {
+    if (property.field_type) |kind| if (std.meta.stringToEnum(@import("../sql/range_value.zig").Kind, kind) != null) return true;
     if (property.sql_type != null) return true;
     if (property.field_type) |field_type| {
         if (std.mem.eql(u8, field_type, "geopoint") or
@@ -3569,6 +3571,7 @@ fn relationalPhysicalConstraintsAreExactForKind(property: DocumentProperty, inhe
     // validated as JSON but never lowered into physical numeric cells, so their
     // constraints do not need to fit a relational scalar encoding.
     if (documentPropertyUsesJsonEncoding(property) or propertyIsSqlArray(property)) return true;
+    if (property.field_type) |kind| if (std.meta.stringToEnum(@import("../sql/range_value.zig").Kind, kind) != null) return true;
 
     const kind = inherited_kind orelse relationalNumericKind(property);
     if (kind) |numeric_kind| {
@@ -3633,6 +3636,7 @@ fn relationalNumericLiteralIsEncodable(literal: []const u8, kind: RelationalNume
 }
 
 fn isRelationalStorageProperty(property: DocumentProperty) bool {
+    if (property.field_type) |kind| if (std.meta.stringToEnum(@import("../sql/range_value.zig").Kind, kind) != null) return !relationalPropertyContainsRootRef(property);
     // A root reference is context-sensitive: validation resolves it against
     // the enclosing document schema, while the physical column catalog only
     // sees this property. Reject recursive relational shapes until the catalog
@@ -5232,6 +5236,14 @@ fn validateDocumentFieldValueWithContext(
     if (!exact_numeric) try validateNumericKeywordsWithContext(context, property, value.*);
 
     const field_type = property.field_type orelse return;
+    if (std.meta.stringToEnum(@import("../sql/range_value.zig").Kind, field_type)) |kind| {
+        if (value.* != .string) return error.InvalidBatchRequest;
+        var scratch = std.heap.ArenaAllocator.init(context.alloc);
+        defer scratch.deinit();
+        var range_context: @import("../sql/range_value.zig").Context = .{ .alloc = scratch.allocator() };
+        _ = try @import("../sql/range_value.zig").parseLeaky(&range_context, kind, value.string);
+        return;
+    }
 
     if (exact_numeric) {
         if (std.mem.eql(u8, field_type, "number") or std.mem.eql(u8, field_type, "numeric") or std.mem.eql(u8, field_type, "integer")) {

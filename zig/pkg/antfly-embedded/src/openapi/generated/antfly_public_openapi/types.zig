@@ -13582,6 +13582,10 @@ pub const SQLColumnType = enum {
     json,
     array,
     unknown,
+    numrange,
+    daterange,
+    tsrange,
+    tstzrange,
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         const s = switch (self) {
@@ -13594,6 +13598,10 @@ pub const SQLColumnType = enum {
             .json => "json",
             .array => "array",
             .unknown => "unknown",
+            .numrange => "numrange",
+            .daterange => "daterange",
+            .tsrange => "tsrange",
+            .tstzrange => "tstzrange",
         };
         try jw.write(s);
     }
@@ -13613,6 +13621,10 @@ pub const SQLColumnType = enum {
             .{ "json", .json },
             .{ "array", .array },
             .{ "unknown", .unknown },
+            .{ "numrange", .numrange },
+            .{ "daterange", .daterange },
+            .{ "tsrange", .tsrange },
+            .{ "tstzrange", .tstzrange },
         });
         return map.get(s) orelse error.UnexpectedToken;
     }

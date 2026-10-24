@@ -27,6 +27,9 @@ const Json = std.json.Value;
 // Fallback plans expose owned wire cells. Re-enter the typed pipeline only
 // through the declared column identity, never through JSON shape inference.
 fn outputCellDatum(a: std.mem.Allocator, value: Json, sql_null: bool, column: describe.Column) !@import("scalar.zig").Datum {
+    if (@import("range_value.zig").kindFromType(column.type) != null or column.temporal_kind != null) {
+        return describe.coerceDatumTyped(a, .{ .value = value, .sql_null = sql_null }, .{ .kind = column.type, .element_type = column.element_type, .temporal_kind = column.temporal_kind });
+    }
     if (column.type == .number and column.element_type == .numeric and !sql_null) {
         if (value != .string) return error.SqlTypeMismatch;
         var work: @import("array_value.zig").Budget = .{};

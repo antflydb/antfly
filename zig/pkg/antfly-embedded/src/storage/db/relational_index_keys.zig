@@ -42,6 +42,7 @@ pub const Value = union(enum) {
     number: f64,
     /// Borrowed canonical NUMERIC row bytes; display scale is not identity.
     numeric: []const u8,
+    range: @import("../../sql/range_value.zig").Encoded,
 };
 
 const NumericKeys = @import("../../common/sql_numeric_key_layout.zig");
@@ -171,7 +172,7 @@ pub const TuplePlan = struct {
                 return error.RelationalIndexColumnNotFound else 0;
             const column_type = if (expression) |compiled| compiled.plan.result_kind else table_schema.relational_columns[ordinal].column_type;
             switch (column_type) {
-                .string, .blob, .boolean, .datetime, .integer, .number, .numeric => {},
+                .string, .blob, .boolean, .datetime, .integer, .number, .numeric, .numrange, .daterange, .tsrange, .tstzrange => {},
                 .json, .geopoint, .geoshape, .dense_vector, .sql_array => return error.UnsupportedRelationalIndexColumn,
             }
             var fold_ascii = false;
@@ -436,6 +437,7 @@ pub const TuplePlan = struct {
                 .integer => .{ .integer = value.i64_val },
                 .number => .{ .number = value.f64_val },
                 .numeric => .{ .numeric = value.bytes_val },
+                .numrange, .daterange, .tsrange, .tstzrange => .{ .range = .{ .kind = @import("../../sql/range_value.zig").kindFromType(key.column_type).?, .bytes = value.bytes_val } },
                 else => unreachable,
             }, execution, false);
         }
@@ -453,6 +455,10 @@ pub const TuplePlan = struct {
             pos += 1;
             if (tag == (if (key.nulls_first) @as(u8, 0) else 0xff)) continue;
             if (tag != 0x80) return error.InvalidRelationalIndexKey;
+            if (@import("../../sql/range_value.zig").kindFromType(key.column_type)) |kind| {
+                pos += try @import("../../sql/range_key.zig").prefixLen(kind, bytes[pos..], key.descending);
+                continue;
+            }
             if (key.column_type == .string or key.column_type == .blob) {
                 const marker: u8 = if (key.descending) 0xff else 0;
                 while (true) {
@@ -630,6 +636,14 @@ fn vectorValue(vector: @import("../rowsource/types.zig").ColumnVector, kind: sch
 /// Callers bind the SQL type separately; comparison domains are never mixed.
 pub fn appendSqlScalar(a: std.mem.Allocator, out: *std.ArrayList(u8), datum: @import("../../sql/scalar.zig").Datum, nulls_first: bool) !void {
     if (datum.array != null or datum.patterns() != null) return error.InvalidRelationalIndexBound;
+    if (!datum.sql_null) if (datum.range()) |range| {
+        var context: @import("../../sql/range_value.zig").Context = .{ .alloc = a };
+        const bytes = try @import("../../sql/range_key.zig").encodeAlloc(&context, range.*);
+        defer a.free(bytes);
+        try out.append(a, 0x80);
+        try out.appendSlice(a, bytes);
+        return;
+    };
     if (!datum.sql_null) if (datum.numeric) |number| {
         var context: NumericContext = .{ .alloc = a };
         const bytes = try @import("../../sql/numeric_key.zig").encodeAlloc(&context, number.*);
@@ -675,7 +689,17 @@ fn appendAdmittedValue(alloc: Allocator, out: *std.ArrayList(u8), tuple_start: u
     if (context) |work| try work.charge(1);
     var numeric_budget: NumericBudget = .{ .shared = context };
     var numeric_source: ?NumericKeys.Source = null;
+    var range_scratch = std.heap.ArenaAllocator.init(alloc);
+    defer range_scratch.deinit();
+    var range_bytes: ?[]const u8 = null;
     const encoded_size: usize = switch (value) {
+        .range => |range| block: {
+            const ranges = @import("../../sql/range_value.zig");
+            var range_context: ranges.Context = .{ .alloc = range_scratch.allocator(), .parent = context, .max_output_bytes = max_bytes };
+            const decoded = try ranges.decodeCanonicalLeaky(&range_context, range.kind, range.bytes);
+            range_bytes = try @import("../../sql/range_key.zig").encodeAlloc(&range_context, decoded);
+            break :block 1 + range_bytes.?.len;
+        },
         .numeric => |bytes| blk: {
             numeric_source = try numericSource(bytes, &numeric_budget);
             break :blk 1 + numeric_source.?.encodedSize();
@@ -705,7 +729,14 @@ fn appendAdmittedValue(alloc: Allocator, out: *std.ArrayList(u8), tuple_start: u
     }
     switch (value) {
         .null => unreachable,
+        .range => |range| if (@import("../../sql/range_value.zig").kindFromType(key.column_type) != range.kind) return error.InvalidRelationalIndexBound,
         inline else => |_, tag| if (key.column_type != @field(schema.RelationalColumnType, @tagName(tag))) return error.InvalidRelationalIndexBound,
+    }
+    if (range_bytes) |bytes| {
+        try out.ensureUnusedCapacity(alloc, encoded_size);
+        out.appendAssumeCapacity(0x80);
+        for (bytes) |byte| out.appendAssumeCapacity(if (key.descending) ~byte else byte);
+        return;
     }
     if (numeric_source) |source| {
         try out.ensureUnusedCapacity(alloc, encoded_size);
@@ -743,7 +774,7 @@ fn appendAdmittedValue(alloc: Allocator, out: *std.ArrayList(u8), tuple_start: u
             std.mem.writeInt(u64, scalar[0..8], ordered, .big);
             break :blk scalar[0..8];
         },
-        .null, .numeric => unreachable,
+        .null, .numeric, .range => unreachable,
     };
     if (key.column_type == .string or key.column_type == .blob) {
         try appendVariableScalar(alloc, out, bytes, key.descending, key.fold_ascii);
@@ -1761,4 +1792,36 @@ test "external lake fixed decimal ordered string keys preserve display scale" {
     _ = try bound.append(a, &actual, 0);
     _ = try plan.appendValues(a, &expected, &.{.{ .string = "1.2300" }});
     try std.testing.expectEqualSlices(u8, expected.items, actual.items);
+}
+
+test "SQL range tuple keys bind subtype share numeric equality and preserve canonical framing" {
+    const ranges = @import("../../sql/range_value.zig");
+    const a = std.testing.allocator;
+    for ([_]struct { kind: ranges.Kind, first: []const u8, alias: []const u8 }{
+        .{ .kind = .numrange, .first = "[1.00,10.000)", .alias = "[1,10)" },
+        .{ .kind = .daterange, .first = "[2025-01-01,2025-02-01]", .alias = "[2025-01-01,2025-02-02)" },
+        .{ .kind = .tsrange, .first = "[2000-01-01 00:00:00,2000-01-02 00:00:00)", .alias = "[2000-01-01 00:00:00,2000-01-02 00:00:00)" },
+        .{ .kind = .tstzrange, .first = "[2000-01-01T01:00:00+01:00,2000-01-02T00:00:00Z)", .alias = "[2000-01-01 00:00:00+00,2000-01-02 00:00:00+00)" },
+    }) |entry| {
+        var scratch = std.heap.ArenaAllocator.init(a);
+        defer scratch.deinit();
+        var context: ranges.Context = .{ .alloc = scratch.allocator() };
+        const definition: schema.TableSchema = .{ .version = 1, .storage_mode = .relational, .requires_public_schema = true, .relational_columns = &.{.{ .name = "v", .path = "v", .column_type = ranges.typeFromKind(schema.RelationalColumnType, entry.kind) }} };
+        var layout = try rows.PhysicalLayout.init(a, definition);
+        defer layout.deinit();
+        var plan = try TuplePlan.init(a, definition, &layout, &.{.{ .column = "v" }});
+        defer plan.deinit();
+        var first: std.ArrayList(u8) = .empty;
+        defer first.deinit(a);
+        var alias: std.ArrayList(u8) = .empty;
+        defer alias.deinit(a);
+        const first_bytes = try ranges.encodeLeaky(&context, try ranges.parseLeaky(&context, entry.kind, entry.first));
+        const alias_bytes = try ranges.encodeLeaky(&context, try ranges.parseLeaky(&context, entry.kind, entry.alias));
+        try std.testing.expect(!try plan.appendValues(a, &first, &.{.{ .range = .{ .kind = entry.kind, .bytes = first_bytes } }}));
+        try std.testing.expect(!try plan.appendValues(a, &alias, &.{.{ .range = .{ .kind = entry.kind, .bytes = alias_bytes } }}));
+        try std.testing.expectEqualSlices(u8, first.items, alias.items);
+        const len = first.items.len;
+        try first.appendSlice(a, "primary identity");
+        try std.testing.expectEqual(len, try plan.prefixLen(first.items));
+    }
 }

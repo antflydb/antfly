@@ -138,8 +138,7 @@ pub const Invocation = struct {
             // execution transport's logical type instead of forcing a numeric
             // unused argument through a text decoder. Describe stays unknown.
             if (descriptor.kind == null) descriptor.* = .{ .kind = if (index < self.fallbacks.len) self.fallbacks[index] orelse .string else .string };
-            try scalar.validateParameterType(descriptor.*);
-            if (descriptor.kind != .datetime and descriptor.element_type == null) descriptor.element_type = try scalar.parameterElementType(descriptor.*);
+            descriptor.* = try scalar.normalizeParameterType(descriptor.*);
         }
     }
 

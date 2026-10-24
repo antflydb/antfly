@@ -1380,7 +1380,7 @@ components:
     SQLColumnType:
       type: string
       description: Logical SQL result type. Integer values and numbers with element_type numeric are decimal strings to preserve exact precision in every client.
-      enum: [string, uuid, integer, number, boolean, datetime, json, array, unknown]
+      enum: [string, uuid, integer, number, boolean, datetime, json, array, unknown, numrange, daterange, tsrange, tstzrange]
     SQLArrayElementType:
       $ref: "schema.yaml#/components/schemas/SQLArrayElementType"
     SQLTemporalKind:

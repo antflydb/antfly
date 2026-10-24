@@ -2212,6 +2212,8 @@ from .sql_parameter_descriptor import SQLParameterDescriptor
 from .sql_prepare_request import SQLPrepareRequest
 from .sql_prepared_execution_request import SQLPreparedExecutionRequest
 from .sql_prepared_response import SQLPreparedResponse
+from .sql_range_column_schema import SQLRangeColumnSchema
+from .sql_range_column_schema_type import SQLRangeColumnSchemaType
 from .sql_request import SQLRequest
 from .sql_response import SQLResponse
 from .sql_setting_database_default import SqlSettingDatabaseDefault
@@ -4403,6 +4405,8 @@ __all__ = (
     "SQLPreparedExecutionRequest",
     "SQLPreparedResponse",
     "SQLPrepareRequest",
+    "SQLRangeColumnSchema",
+    "SQLRangeColumnSchemaType",
     "SQLRequest",
     "SQLResponse",
     "SqlSettingDatabaseDefault",

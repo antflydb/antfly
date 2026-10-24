@@ -271,6 +271,14 @@ fn hashRelationalCellCanonical(
         return;
     }
     switch (column.column_type) {
+        .numrange, .daterange, .tsrange, .tstzrange => {
+            var none = std.heap.FixedBufferAllocator.init(&.{});
+            const ranges = @import("../../sql/range_value.zig");
+            var context: ranges.Context = .{ .alloc = none.allocator() };
+            const range = try @import("../../sql/range_binary.zig").View.open(&context, ranges.kindFromType(column.column_type).?, cell.value.bytes_val);
+            hasher.update("R");
+            try range.hash(&context, hasher);
+        },
         .numeric => {
             hasher.update("N");
             const view = try @import("../../common/sql_numeric_layout.zig").View.openAuthenticated(cell.value.bytes_val, .{});
@@ -943,6 +951,16 @@ fn hashRelationalColumnValue(
             defer alloc.free(bytes);
             const view = try @import("../../common/sql_array_layout.zig").View.open(kind, bytes, .{});
             try @import("../../sql/array_storage.zig").updateLogicalHash(alloc, view, hasher);
+        },
+        .numrange, .daterange, .tsrange, .tstzrange => {
+            if (value != .string) return error.InvalidBatchRequest;
+            var scratch = std.heap.ArenaAllocator.init(alloc);
+            defer scratch.deinit();
+            const ranges = @import("../../sql/range_value.zig");
+            var context: ranges.Context = .{ .alloc = scratch.allocator() };
+            const range = try ranges.parseLeaky(&context, ranges.kindFromType(column.column_type).?, value.string);
+            hasher.update("R");
+            try ranges.hash(&context, range, hasher);
         },
         .numeric => {
             const numeric = @import("../../sql/numeric_value.zig");

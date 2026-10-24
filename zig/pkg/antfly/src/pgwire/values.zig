@@ -53,7 +53,14 @@ pub fn parameterOid(descriptor: Parameter) !u32 {
 }
 
 pub fn parameterFromOid(value: u32) !Parameter {
-    if (value == 1186) return .{ .kind = .datetime, .temporal_kind = .interval };
+    switch (value) {
+        1082 => return .{ .kind = .datetime, .temporal_kind = .date },
+        1083 => return .{ .kind = .datetime, .temporal_kind = .time },
+        1266 => return .{ .kind = .datetime, .temporal_kind = .time_tz },
+        1114 => return .{ .kind = .datetime, .temporal_kind = .timestamp },
+        1186 => return .{ .kind = .datetime, .temporal_kind = .interval },
+        else => {},
+    }
     const kind = try fromOid(value);
     const Element = @import("antfly_local_sources").sql_array_value.ElementType;
     const element: ?Element = switch (value) {
@@ -85,6 +92,10 @@ pub fn oid(kind: Type) !u32 {
         .uuid => 2950,
         .string, .unknown => 25,
         .array => error.UnsupportedParameterType,
+        .numrange => 3906,
+        .daterange => 3912,
+        .tsrange => 3908,
+        .tstzrange => 3910,
     };
 }
 
@@ -188,12 +199,24 @@ const BoundedWriter = struct {
 };
 
 pub fn encodeColumnInto(a: std.mem.Allocator, writer: *std.Io.Writer, column: Column, format: u16, value: std.json.Value, wire_bytes: usize) !void {
+    if (@import("antfly_local_sources").sql_range_value.kindFromType(column.type)) |kind| {
+        if (value != .string) return error.InvalidResult;
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        var context: @import("antfly_local_sources").sql_range_value.Context = .{ .alloc = arena.allocator(), .max_output_bytes = wire_bytes };
+        return encodeRangeInto(a, writer, try @import("antfly_local_sources").sql_range_value.parseLeaky(&context, kind, value.string), format, wire_bytes);
+    }
     var bounded: BoundedWriter = .{ .destination = writer, .remaining = wire_bytes };
     encodeColumnUnchecked(a, &bounded.writer, column, format, value, wire_bytes) catch |err| return if (bounded.exceeded) error.ProgramLimitExceeded else err;
 }
 
 /// Native pages retain typed arrays and numerics through the wire boundary.
 pub fn encodeCellInto(a: std.mem.Allocator, writer: *std.Io.Writer, column: Column, format: u16, cell: @import("backend.zig").Cell, wire_bytes: usize) !void {
+    if (cell.range) |range| {
+        if (cell.sql_null or cell.value != .null or cell.array != null or cell.numeric != null or cell.json_bytes != null or cell.frozen_json != null) return error.InvalidResult;
+        if (@import("antfly_local_sources").sql_range_value.kindFromType(column.type) != range.kind) return error.InvalidResult;
+        return encodeRangeInto(a, writer, range.*, format, wire_bytes);
+    }
     if (cell.sql_null or format > 1) return error.InvalidResult;
     if (cell.frozen_json) |frozen| {
         if (column.type != .json or cell.value != .null or cell.array != null or cell.numeric != null or cell.json_bytes != null) return error.InvalidResult;
@@ -280,6 +303,11 @@ fn encodeColumnUnchecked(a: std.mem.Allocator, writer: *std.Io.Writer, column: C
 pub fn fromOid(value: u32) !Type {
     return switch (value) {
         0 => .unknown,
+        1082, 1083, 1266, 1114 => .datetime,
+        3906 => .numrange,
+        3912 => .daterange,
+        3908 => .tsrange,
+        3910 => .tstzrange,
         16 => .boolean,
         20, 21, 23 => .integer,
         700, 701, 1700 => .number,
@@ -313,10 +341,16 @@ pub fn decodeNativeWithContext(alloc: std.mem.Allocator, param_oid: u32, format:
     const src = @import("antfly_local_sources");
     const descriptor = try parameterFromOid(param_oid);
     if (format > 1) return error.UnsupportedParameterFormat;
-    if (param_oid == 1186) {
+    if (descriptor.kind != null) if (src.sql_range_value.kindFromType(descriptor.kind.?)) |kind| {
+        var context: src.sql_range_value.Context = .{ .alloc = alloc, .parent = parent, .max_input_bytes = parent.max_input_bytes, .max_output_bytes = parent.max_output_bytes };
+        const value = try alloc.create(src.sql_range_value.Value);
+        value.* = if (format == 1) try src.sql_range_value.decodeInputLeaky(&context, kind, bytes) else try src.sql_range_value.parseLeaky(&context, kind, bytes);
+        return src.sql_scalar.Datum.typedRange(value);
+    };
+    if (descriptor.temporal_kind) |kind| {
         try parent.charge(bytes.len);
         const value = try alloc.create(temporal.Value);
-        value.* = if (format == 1) try temporal.decode(.interval, bytes) else try temporal_text.parseInput(.interval, bytes);
+        value.* = if (format == 1) try temporal.decode(kind, bytes) else try temporal_text.parseInput(kind, bytes);
         return src.sql_scalar.Datum.typedTemporal(value);
     }
     if (param_oid == 700 or param_oid == 701) {
@@ -367,6 +401,17 @@ pub fn decodeWithContext(alloc: std.mem.Allocator, param_oid: u32, format: u16, 
     }
     const kind = try fromOid(param_oid);
     if (format > 1) return error.UnsupportedParameterFormat;
+    const range_sources = @import("antfly_local_sources");
+    if (range_sources.sql_range_value.kindFromType(kind)) |range_kind| {
+        var range_context: range_sources.sql_range_value.Context = .{ .alloc = alloc, .parent = context, .max_input_bytes = context.max_input_bytes, .max_output_bytes = context.max_output_bytes };
+        const range = if (format == 1) try range_sources.sql_range_value.decodeInputLeaky(&range_context, range_kind, bytes) else try range_sources.sql_range_value.parseLeaky(&range_context, range_kind, bytes);
+        return .{ .string = try range_sources.sql_range_value.formatLeaky(&range_context, range) };
+    }
+    if ((try parameterFromOid(param_oid)).temporal_kind) |temporal_kind| {
+        const value = if (format == 1) try temporal.decode(temporal_kind, bytes) else try temporal_text.parseInput(temporal_kind, bytes);
+        var text: [temporal_text.output_capacity]u8 = undefined;
+        return .{ .string = try alloc.dupe(u8, try temporal_text.format(value, &text)) };
+    }
     if (param_oid == 3802) {
         const sources = @import("antfly_local_sources");
         var work: sources.sql_array_value.Budget = .{ .shared = context };
@@ -484,6 +529,12 @@ pub fn integer(value: std.json.Value) !i64 {
 }
 
 pub fn encode(alloc: std.mem.Allocator, kind: Type, format: u16, value: std.json.Value) ![]const u8 {
+    if (@import("antfly_local_sources").sql_range_value.kindFromType(kind) != null) {
+        var output: std.Io.Writer.Allocating = .init(alloc);
+        errdefer output.deinit();
+        try encodeInto(alloc, &output.writer, kind, format, value);
+        return output.toOwnedSlice();
+    }
     if (kind == .array) return error.InvalidResult;
     if (format > 1) return error.UnsupportedResultFormat;
     if (format == 0) return switch (kind) {
@@ -501,6 +552,7 @@ pub fn encode(alloc: std.mem.Allocator, kind: Type, format: u16, value: std.json
         else => if (value == .string) try alloc.dupe(u8, value.string) else try std.json.Stringify.valueAlloc(alloc, value, .{}),
     };
     return switch (kind) {
+        .numrange, .daterange, .tsrange, .tstzrange => unreachable,
         .array => error.InvalidResult,
         .boolean => if (value == .bool) try alloc.dupe(u8, &.{@intFromBool(value.bool)}) else error.InvalidResult,
         .integer => try encodeInteger(alloc, try integer(value)),
@@ -535,11 +587,32 @@ pub fn encode(alloc: std.mem.Allocator, kind: Type, format: u16, value: std.json
 /// Append a cell directly to a reusable DataRow buffer. Primitive and JSON
 /// values require no intermediate encoded allocation; JSONB owns only its
 /// canonical key-ordering scratch, not a second complete encoded payload.
+fn encodeRangeInto(a: std.mem.Allocator, writer: *std.Io.Writer, value: @import("antfly_local_sources").sql_range_value.Value, format: u16, limit: usize) !void {
+    if (format > 1) return error.UnsupportedResultFormat;
+    const ranges = @import("antfly_local_sources").sql_range_value;
+    var scratch = std.heap.ArenaAllocator.init(a);
+    defer scratch.deinit();
+    var context: ranges.Context = .{ .alloc = scratch.allocator(), .max_output_bytes = limit };
+    if (format == 1) {
+        _ = try ranges.encodedSize(&context, value);
+        return ranges.encode(&context, value, writer);
+    }
+    return writer.writeAll(try ranges.formatLeaky(&context, value));
+}
+
 pub fn encodeInto(a: std.mem.Allocator, writer: *std.Io.Writer, kind: Type, format: u16, value: std.json.Value) !void {
+    if (@import("antfly_local_sources").sql_range_value.kindFromType(kind)) |range_kind| {
+        if (value != .string) return error.InvalidResult;
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        var context: @import("antfly_local_sources").sql_range_value.Context = .{ .alloc = arena.allocator(), .max_output_bytes = 16 * 1024 * 1024 };
+        return encodeRangeInto(a, writer, try @import("antfly_local_sources").sql_range_value.parseLeaky(&context, range_kind, value.string), format, 16 * 1024 * 1024);
+    }
     if (kind == .array) return error.InvalidResult;
     if (format > 1) return error.UnsupportedResultFormat;
     if (format == 0) {
         switch (kind) {
+            .numrange, .daterange, .tsrange, .tstzrange => unreachable,
             .boolean => {
                 if (value != .bool) return error.InvalidResult;
                 try writer.writeAll(if (value.bool) "t" else "f");
@@ -563,6 +636,7 @@ pub fn encodeInto(a: std.mem.Allocator, writer: *std.Io.Writer, kind: Type, form
         return;
     }
     switch (kind) {
+        .numrange, .daterange, .tsrange, .tstzrange => unreachable,
         .array => return error.InvalidResult,
         .boolean => {
             if (value != .bool) return error.InvalidResult;
@@ -1293,4 +1367,39 @@ test "pgwire frozen JSONB cells stream exact values directly with bounded output
         try std.testing.expectError(error.InvalidResult, encodeCellInto(scratch.allocator(), &denied, column, format, .{ .frozen_json = frozen, .json_bytes = "{}", .sql_null = false }, 256));
     }
     std.debug.print("PGWIRE_FROZEN_STREAM formats=2 scratch_allocations=0 identical_frames=true\n", .{});
+}
+
+test "pgwire ranges retain PostgreSQL OIDs canonical text binary bytes and owned frames" {
+    const src = @import("antfly_local_sources");
+    const ranges = src.sql_range_value;
+    const Entry = struct { kind: ranges.Kind, input: []const u8, sqlstate: ?[]const u8, text: ?[]const u8 = null, binary: ?[]const u8 = null };
+    const a = std.testing.allocator;
+    var reference = try std.json.parseFromSlice(struct { entries: []const Entry }, a, src.sql_parity_fixtures.range_reference, .{ .ignore_unknown_fields = true });
+    defer reference.deinit();
+    for (reference.value.entries) |entry| {
+        if (entry.sqlstate != null) continue;
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const alloc = arena.allocator();
+        const descriptor = try parameterFromOid(entry.kind.oid());
+        try std.testing.expectEqual(entry.kind.oid(), try parameterOid(descriptor));
+        const column: Column = .{ .name = "range", .type = ranges.typeFromKind(Type, entry.kind) };
+        try std.testing.expectEqual(entry.kind.oid(), try columnOid(column));
+        try std.testing.expectEqual(@as(i16, -1), columnTypeSize(column));
+        const bytes = try alloc.alloc(u8, entry.binary.?.len / 2);
+        _ = try std.fmt.hexToBytes(bytes, entry.binary.?);
+        for ([_]u16{ 0, 1 }) |format| {
+            const value = try decodeNative(alloc, entry.kind.oid(), format, if (format == 0) entry.input else bytes);
+            try std.testing.expectEqual(entry.kind, value.range().?.kind);
+            var frame = try src.sql_parameter_frame.Frame.prepare(a, &.{descriptor}, &.{.{ .datum = value }}, .{});
+            defer frame.deinit();
+            for ([_]u16{ 0, 1 }) |output_format| {
+                var output: std.Io.Writer.Allocating = .init(a);
+                defer output.deinit();
+                const expected = if (output_format == 0) entry.text.? else bytes;
+                try encodeCellInto(a, &output.writer, column, output_format, .{ .range = frame.values[0].range(), .sql_null = false }, expected.len);
+                try std.testing.expectEqualSlices(u8, expected, output.written());
+            }
+        }
+    }
 }

@@ -21422,6 +21422,10 @@ components:
         - json
         - array
         - unknown
+        - numrange
+        - daterange
+        - tsrange
+        - tstzrange
     SQLArrayElementType:
       type: string
       description: Bound SQL scalar or array-element identity, including numeric widths and exact NUMERIC.
@@ -39335,6 +39339,10 @@ components:
         - numeric
         - sql_array
         - json
+        - numrange
+        - daterange
+        - tsrange
+        - tstzrange
     SQLBuiltinType:
       type: string
       description: >
@@ -40573,6 +40581,40 @@ components:
           default: false
         description:
           type: string
+    SQLRangeColumnSchema:
+      type: object
+      additionalProperties: true
+      required:
+        - type
+      description: >
+        A relational PostgreSQL range column. JSON ingress and SQL results use
+
+        PostgreSQL range text. The declared subtype supplies identity even for
+
+        NULL, empty and unbounded values. Packed rows retain canonical binary
+
+        endpoints, inclusive/exclusive flags and exact NUMERIC precision.
+
+        Empty ranges, omitted bounds, subtype infinities and SQL NULL are
+
+        distinct. DATE ranges canonicalize finite endpoints to [lower,upper).
+
+        Timestamp endpoints use the execution's UTC zone. Requires schema
+
+        reader capability version 35.
+      properties:
+        type:
+          type: string
+          enum:
+            - numrange
+            - daterange
+            - tsrange
+            - tstzrange
+        nullable:
+          type: boolean
+          default: false
+        description:
+          type: string
     DocumentSchema:
       type: object
       description: Defines the structure of a document type
@@ -40595,6 +40637,8 @@ components:
             $ref: '#/components/schemas/SQLNumericModifier'
           x-antfly-sql-array-column-schema:
             $ref: '#/components/schemas/SQLArrayColumnSchema'
+          x-antfly-sql-range-column-schema:
+            $ref: '#/components/schemas/SQLRangeColumnSchema'
     TtlConfig:
       type: object
       additionalProperties: false

@@ -279,7 +279,10 @@ pub const Adapter = struct {
         const cells = try evaluateScalarCells(alloc, request, expressions);
         const result = try alloc.alloc(std.json.Value, cells.len);
         for (cells, request.parameter_types, result) |evaluated, kind, *value| {
-            value.* = if (evaluated.array) |array|
+            value.* = if (evaluated.range()) |range| range_text: {
+                var context: @import("antfly_local_sources").sql_range_value.Context = .{ .alloc = alloc };
+                break :range_text .{ .string = try @import("antfly_local_sources").sql_range_value.formatLeaky(&context, range.*) };
+            } else if (evaluated.array) |array|
                 try @import("antfly_local_sources").sql_array_wire.toJsonLeaky(alloc, array.*, .{})
             else if (evaluated.numeric) |number| numeric: {
                 const exact = @import("antfly_local_sources").sql_numeric_value;
@@ -783,9 +786,16 @@ const OwnedRead = struct {
                 return .{ .json_bytes = bytes, .sql_null = false };
             }
             const value = try self.page.values.cell(alloc, row, column);
+            if (value.range()) |range| {
+                try value.validateTemporal();
+                if (@import("antfly_local_sources").sql_range_value.kindFromType(self.page.columns[column].type) != range.kind) return error.InvalidSqlBackendResponse;
+                return .{ .range = range, .sql_null = false };
+            }
             if (value.temporal()) |temporal_value| {
                 const definition = self.page.columns[column];
-                if (definition.temporal_kind == .interval and temporal_value.kind() == .interval) {
+                const expected_kind = definition.temporal_kind orelse .timestamp_tz;
+                if (definition.type != .datetime or expected_kind != temporal_value.kind()) return error.InvalidSqlBackendResponse;
+                if (expected_kind != .timestamp_tz) {
                     try value.validateTemporal();
                     var text: [@import("antfly_local_sources").sql_temporal_text.output_capacity]u8 = undefined;
                     return .{ .value = .{ .string = try alloc.dupe(u8, try @import("antfly_local_sources").sql_temporal_text.format(temporal_value.*, &text)) }, .sql_null = false };
@@ -1319,6 +1329,11 @@ const NativeResultCells = struct {
         const rows = self.result.output.native_rows orelse return error.InvalidSqlBackendResponse;
         if (row >= rows.len or column >= self.result.output.columns.len or rows[row].len != self.result.output.columns.len) return error.InvalidSqlBackendResponse;
         const datum = rows[row][column];
+        if (datum.range()) |range| {
+            try datum.validateTemporal();
+            if (@import("antfly_local_sources").sql_range_value.kindFromType(self.result.output.columns[column].type) != range.kind) return error.InvalidSqlBackendResponse;
+            return .{ .range = range, .sql_null = false };
+        }
         if (datum.temporal()) |value| {
             try datum.validateTemporal();
             const definition = self.result.output.columns[column];

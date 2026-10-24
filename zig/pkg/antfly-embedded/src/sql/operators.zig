@@ -3447,6 +3447,20 @@ pub const Grouped = struct {
 
 pub fn cloneDatum(alloc: Allocator, value: Datum) anyerror!Datum {
     try value.validateTemporal();
+    if (value.range()) |range| {
+        const ranges = @import("range_value.zig");
+        const owned = try alloc.create(ranges.Value);
+        errdefer alloc.destroy(owned);
+        owned.* = range.*;
+        if (owned.lower) |*point| if (point.* == .number) {
+            point.number.digits = try alloc.dupe(u16, point.number.digits);
+        };
+        errdefer if (owned.lower) |point| if (point == .number) alloc.free(point.number.digits);
+        if (owned.upper) |*point| if (point.* == .number) {
+            point.number.digits = try alloc.dupe(u16, point.number.digits);
+        };
+        return Datum.typedRange(owned);
+    }
     if (value.temporal()) |temporal| {
         const owned = try alloc.create(@import("temporal_value.zig").Value);
         owned.* = temporal.*;
@@ -3642,6 +3656,7 @@ fn cloneJson(alloc: Allocator, value: Json, depth: usize) error{ OutOfMemory, Sq
 }
 pub fn datumBytes(value: Datum) anyerror!usize {
     try value.validateTemporal();
+    if (value.range()) |range| return @sizeOf(Datum) + @import("range_value.zig").retainedSize(range.*);
     if (value.temporal() != null) return @sizeOf(Datum) + @sizeOf(@import("temporal_value.zig").Value);
     if (value.numeric) |number| return @sizeOf(Datum) + @sizeOf(@import("numeric_value.zig").Value) + number.digits.len * 2;
     if (value.array) |array| return @sizeOf(Datum) +| try array.retainedBytes();
@@ -3661,6 +3676,34 @@ fn jsonBytes(value: Json, depth: usize) error{SqlProgramLimitExceeded}!usize {
         else => {},
     }
     return size;
+}
+
+test "SQL range sorting preserves endpoint order and semantic ties" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const ranges = @import("range_value.zig");
+    var context: ranges.Context = .{ .alloc = arena.allocator() };
+    const inputs = [_][]const u8{ "[1,10)", "empty", "(,)", "[1.00,10.000)", "[-Infinity,Infinity]", "[NaN,NaN]" };
+    const values = try arena.allocator().alloc(ranges.Value, inputs.len);
+    const datums = try arena.allocator().alloc(Datum, inputs.len);
+    for (inputs, values, datums) |text, *value, *datum| {
+        value.* = try ranges.parseLeaky(&context, .numrange, text);
+        datum.* = .typedRange(value);
+        try std.testing.expect(@import("sort_key.zig").encode(&.{datum.*}, &[_]Order{.{}}) == null);
+    }
+    for ([_]bool{ false, true }) |descending| {
+        const orders = [_]Order{.{ .descending = descending }};
+        var top = try TopK.init(a, inputs.len, &orders, 128 * 1024);
+        defer top.deinit();
+        for (datums, 0..) |datum, index| try top.add(.{ .values = &.{datum}, .keys = &.{datum}, .ordinal = index });
+        const ordered = try top.finish(a);
+        defer a.free(ordered);
+        for (ordered[0 .. ordered.len - 1], ordered[1..]) |left, right| {
+            try std.testing.expect((try compareRows(left, right, &orders)) != .gt);
+        }
+        try std.testing.expectEqual(@as(u64, if (descending) 5 else 1), ordered[0].ordinal);
+    }
 }
 
 test "SQL typed array physical keys preserve ordering hashes join equality and copied ownership" {

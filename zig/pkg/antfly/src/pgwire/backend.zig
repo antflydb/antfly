@@ -18,7 +18,7 @@
 //! Parameters remain typed values, never interpolated into SQL text.
 const std = @import("std");
 
-pub const Type = enum { string, uuid, integer, number, boolean, datetime, json, array, unknown };
+pub const Type = enum { string, uuid, integer, number, boolean, datetime, json, array, unknown, numrange, daterange, tsrange, tstzrange };
 pub const Parameter = @import("antfly_local_sources").sql_scalar.Type;
 pub const Column = struct {
     name: []const u8,
@@ -185,6 +185,7 @@ pub const Cell = struct {
     sql_null: bool,
     array: ?*const @import("antfly_local_sources").sql_array_value.Value = null,
     numeric: ?*const @import("antfly_local_sources").sql_numeric_value.Value = null,
+    range: ?*const @import("antfly_local_sources").sql_range_value.Value = null,
 };
 pub const Cells = struct {
     context: *anyopaque,

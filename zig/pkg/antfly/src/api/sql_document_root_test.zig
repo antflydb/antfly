@@ -195,6 +195,7 @@ test "httpx SQL original PostgreSQL invalid grammar rejects before catalog acces
         "sql-0354",
         "sql-0355",
         "sql-0682",
+        "sql-0683",
         "sql-0684",
         "sql-0686",
         "sql-0687",

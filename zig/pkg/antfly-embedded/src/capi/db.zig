@@ -9536,6 +9536,9 @@ test "capi SQL owns composite expression partial declarations and exact NUMERIC 
     const first_id = try publishHandle(first);
     defer antfly_db_close(first_id);
     _ = try Test.execute(a, first_id, "CREATE TABLE invoices (amount NUMERIC(20,4), label TEXT, tenant BIGINT)");
+    _ = try Test.execute(a, first_id, "CREATE TABLE range_values (value numrange, dates daterange, ts tsrange, tz tstzrange)");
+    _ = try Test.execute(a, first_id, "INSERT INTO range_values (_id,value,dates,ts,tz) VALUES ('ranges','[1.00,10.000)'::numrange,'[2025-01-01,2025-02-01]'::daterange,tsrange('2000-01-01 00:00:00','2000-01-02 00:00:00'),tstzrange('2000-01-01T01:00:00+01:00','2000-01-02T00:00:00Z'))");
+    try Test.checkRow(try Test.execute(a, first_id, "SELECT value FROM range_values"), "[1.00,10.000)");
     _ = try Test.execute(a, first_id, "INSERT INTO invoices (_id,amount,label,tenant) VALUES ('one',9007199254740993.1250,'READY',7)");
     // A schema CAS alone cannot validate existing rows. The embedded adapter
     // must not expose tightening through its generic DDL fallback.
@@ -9639,6 +9642,12 @@ test "capi SQL owns composite expression partial declarations and exact NUMERIC 
     const final_owner = try openLiteHandleAlloc(path, options, false);
     const final_id = try publishHandle(final_owner);
     defer antfly_db_close(final_id);
+    try Test.checkRow(try Test.execute(a, final_id, "SELECT value FROM range_values"), "[1.00,10.000)");
+    try Test.checkRow(try Test.execute(a, final_id, "SELECT value FROM range_values WHERE value='[1,10)'"), "[1.00,10.000)");
+    try Test.checkRow(try Test.executeParameters(a, final_id, "SELECT value FROM range_values WHERE value=$1::numrange", &.{.{ .string = "[1,10)" }}), "[1.00,10.000)");
+    try Test.checkRow(try Test.execute(a, final_id, "SELECT dates FROM range_values"), "[2025-01-01,2025-02-02)");
+    try Test.checkRow(try Test.execute(a, final_id, "SELECT ts FROM range_values"), "[\"2000-01-01 00:00:00\",\"2000-01-02 00:00:00\")");
+    try Test.checkRow(try Test.execute(a, final_id, "SELECT tz FROM range_values"), "[\"2000-01-01 00:00:00+00\",\"2000-01-02 00:00:00+00\")");
     try Test.reject(a, final_id, "ALTER TABLE invoices ALTER COLUMN amount SET NOT NULL", "0A000");
     try Test.checkRow(try Test.execute(a, final_id, "SELECT g FROM nullable_columns WHERE _id='one'"), "2");
     try Test.checkRow(try Test.execute(a, final_id, "SELECT count(*) FROM nullable_columns WHERE id IS NULL AND g IS NULL"), "1");

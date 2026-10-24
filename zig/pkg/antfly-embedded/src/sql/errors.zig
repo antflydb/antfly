@@ -169,6 +169,7 @@ pub fn describe(err: anyerror) Diagnostic {
         error.SqlArrayAggregateNull => .{ .code = "22004", .message = "Cannot accumulate null arrays." },
         error.SqlArrayAggregateEmpty => .{ .code = "2202E", .message = "Cannot accumulate empty arrays." },
         error.SqlArrayAggregateDimensions => .{ .code = "2202E", .message = "Cannot accumulate arrays of different dimensionality." },
+        error.InvalidRange => .{ .code = "22000", .message = "The lower range bound must not exceed the upper bound." },
         error.SqlArrayAppendDimensions => .{ .code = "22000", .message = "Appending or prepending requires an empty or one-dimensional array.", .hint = "Use array_cat for compatible multidimensional slices." },
         error.SqlArrayConcatenationDimensions => .{ .code = "2202E", .message = "Array dimensions are incompatible for concatenation.", .hint = "Match the element dimensions and lower bounds of the concatenated slices." },
         error.SqlInvalidEscapeSequence => .{ .code = "22025", .message = "A pattern ends with an escape character.", .hint = "Escape the final backslash or supply a complete pattern." },

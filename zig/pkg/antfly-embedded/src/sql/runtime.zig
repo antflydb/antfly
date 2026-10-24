@@ -231,7 +231,7 @@ pub fn parameterFallbackTypesNative(arena: std.mem.Allocator, parameters: []cons
     const native = cells orelse return parameterFallbackTypes(arena, parameters);
     if (native.len != parameters.len) return error.InvalidSqlParameters;
     const kinds = try arena.alloc(?ast.ColumnType, native.len);
-    for (native, kinds) |cell, *kind| kind.* = if (cell.sql_null) null else if (cell.array != null) .array else if (cell.numeric != null) .number else parameterFallbackType(cell.value);
+    for (native, kinds) |cell, *kind| kind.* = if (cell.sql_null) null else if (cell.array != null) .array else if (cell.numeric != null) .number else if (cell.range()) |range| @import("range_value.zig").typeFromKind(ast.ColumnType, range.kind) else parameterFallbackType(cell.value);
     return kinds;
 }
 
@@ -368,6 +368,51 @@ const ProjectedBatch = struct {
         return .{ .reader = .{ .ptr = self, .read = cell, .read_frozen = frozen, .read_json = json, .count = self.selection.len, .width = self.columns.len } };
     }
 };
+test "SQL range comparisons bind typed residuals without JSON storage predicates" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const table: catalog.Table = .{ .id = 1, .physical_name = "ranges", .schema_version = 1, .storage_mode = .relational, .columns = &.{.{ .name = "value", .path = "value", .type = .numrange }} };
+    const context: Context = .{
+        .alloc = a,
+        .arena = a,
+        .backend = undefined,
+        .binding = .{ .table = table, .action = .read, .columns = &.{}, .parameter_types = &.{}, .json_literals = .empty },
+        .parameters = &.{},
+        .limits = .{},
+    };
+    const text = try describe.bindLiteral(a, .{ .string = "[1.00,10.000)" }, .numrange);
+    try std.testing.expectEqualStrings("[1.00,10.000)", text.string);
+    for ([_]ast.Comparison{ .eq, .neq, .lt, .lte, .gt, .gte }) |op| {
+        const predicate: ast.Predicate = .{ .comparison = .{ .field = "value", .op = op, .value = .{ .string = "[1,10)" } } };
+        const bound = try context.conditions(table, &predicate);
+        try std.testing.expectEqual(@as(usize, 0), bound.terms.items.len);
+        try std.testing.expect(!bound.complete);
+        try std.testing.expect(@import("bound_scalars.zig").needsResidual(table, &predicate));
+    }
+}
+
+test "SQL range native parameter identity survives unconstrained transport fallback" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const ranges = @import("range_value.zig");
+    var context: ranges.Context = .{ .alloc = a };
+    for ([_]ranges.Kind{ .numrange, .daterange, .tsrange, .tstzrange }) |kind| {
+        const value = try ranges.parseLeaky(&context, kind, "empty");
+        const cells = [_]Datum{.typedRange(&value)};
+        const hints = try parameterFallbackTypesNative(a, &.{.null}, &cells);
+        const invocation = try @import("parameter_binding.zig").Invocation.initLeaky(a, 1);
+        invocation.fallbacks = hints;
+        try invocation.prepareNativeOrJson(std.testing.allocator, &.{.null}, &cells, .{});
+        defer invocation.deinitFrame();
+        try std.testing.expectEqual(ranges.typeFromKind(ast.ColumnType, kind), invocation.frame.?.descriptors[0].kind.?);
+        try std.testing.expect(invocation.frame.?.descriptors[0].element_type == null);
+        try std.testing.expectEqual(kind, invocation.frame.?.values[0].range().?.kind);
+        try std.testing.expect(invocation.frame.?.values[0].range().? != &value);
+    }
+}
+
 test "SQL native document version conditions remain typed residuals not stored properties" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -661,6 +706,12 @@ pub const Context = struct {
     /// Arrays are owned envelopes and NUMERIC values are exact decimal text,
     /// never their JSON-null placeholders.
     pub fn outputDatum(self: Context, datum: Datum, kind: ?ast.ColumnType, element_type: ?@import("array_value.zig").ElementType) !Json {
+        if (datum.range()) |range| {
+            try datum.validateTemporal();
+            if (kind == null or @import("range_value.zig").kindFromType(kind.?) != range.kind) return error.SqlTypeMismatch;
+            var context: @import("range_value.zig").Context = .{ .alloc = self.arena, .max_output_bytes = self.limits.retained_bytes };
+            return .{ .string = try @import("range_value.zig").formatLeaky(&context, range.*) };
+        }
         if (datum.temporal() != null) {
             var text: [@import("temporal_text.zig").output_capacity]u8 = undefined;
             if (kind != .datetime) return error.SqlTypeMismatch;
@@ -828,7 +879,7 @@ pub const Context = struct {
                 // Native condition values cannot carry typed arrays or exact
                 // NUMERIC limbs. Keep these comparisons in the typed residual
                 // instead of interpreting their JSON placeholder as SQL NULL.
-                if (column.type == .array or column.element_type == .numeric or table_def.isDocumentRoot(column.name) or table_def.isDocumentVersion(column.name)) {
+                if (column.type == .array or column.element_type == .numeric or @import("range_value.zig").kindFromType(column.type) != null or table_def.isDocumentRoot(column.name) or table_def.isDocumentVersion(column.name)) {
                     output.complete = false;
                     return;
                 }
@@ -2088,6 +2139,12 @@ pub fn encodeStorageDatum(arena: std.mem.Allocator, datum: Datum, column: catalo
 }
 
 pub fn encodeStorageDatumTyped(arena: std.mem.Allocator, datum: Datum, column: catalog.Column, source_identity: ?@import("array_value.zig").ElementType, retained_bytes: usize) !Json {
+    if (datum.range()) |range| {
+        try datum.validateTemporal();
+        if (@import("range_value.zig").kindFromType(column.type) != range.kind) return error.SqlTypeMismatch;
+        var context: @import("range_value.zig").Context = .{ .alloc = arena, .max_output_bytes = retained_bytes };
+        return .{ .string = try @import("range_value.zig").formatLeaky(&context, range.*) };
+    }
     if (datum.temporal() != null and column.type != .string) {
         try datum.validateTemporal();
         if (column.type == .datetime and column.element_type == null and

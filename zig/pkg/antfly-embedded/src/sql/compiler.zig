@@ -336,13 +336,17 @@ pub fn compileDiagnostic(allocator: std.mem.Allocator, sql: []const u8, limits: 
         // error later in its arguments. Keep this bounded, allocation-free
         // validation off the supported-query hot path. Quoted names and
         // string contents are never reinterpreted as reserved identifiers.
-        if (err == error.UnsupportedSqlShape) try parser.validateReservedNamedArguments();
+        if (err == error.UnsupportedSqlShape) {
+            try parser.validateReservedNamedArguments();
+            try parser.validateUnsupportedDdlGrammar();
+        }
         return err;
     };
     _ = parser.take(.semicolon);
     const tail_statement = if (statement == .explain) statement.explain.statement.* else statement;
     if (parser.pos != tokens.items.len) {
         try parser.validateReservedNamedArguments();
+        try parser.validateUnsupportedDdlGrammar();
         return parser.fail(switch (tail_statement) {
             // PostgreSQL row locks belong to a SELECT producer, not to the
             // mutation itself. Likewise UPDATE/DELETE do not accept ORDER/LIMIT.
@@ -560,6 +564,24 @@ const Parser = struct {
             .message = message,
         };
         return err;
+    }
+
+    /// Inspect the whole unsupported ALTER before returning a feature error.
+    /// An earlier supported action cannot hide invalid later grammar or execute
+    /// a prefix. Keywords are lexer tokens: quoted identifiers/text do not match.
+    fn validateUnsupportedDdlGrammar(self: *Parser) Error!void {
+        if (self.tokens.len < 3 or !self.tokens[0].isKeyword(.alter) or !self.tokens[1].isKeyword(.table)) return;
+        var depth: usize = 0;
+        for (self.tokens, 0..) |current, index| {
+            if (current.kind == .lparen) depth += 1;
+            if (current.kind == .rparen) depth -|= 1;
+            if (depth == 0 and index + 2 < self.tokens.len and current.isKeyword(.add) and
+                self.tokens[index + 1].isKeyword(.period) and self.tokens[index + 2].isKeyword(.@"for"))
+            {
+                self.pos = index + 1;
+                return self.fail(error.InvalidSqlSyntax, "PostgreSQL does not accept ADD PERIOD FOR; use a range column");
+            }
+        }
     }
 
     fn validateReservedNamedArguments(self: *Parser) Error!void {
@@ -794,10 +816,10 @@ const Parser = struct {
         } else if (self.peek(.identifier) and !self.tokens[self.pos].owned and std.ascii.eqlIgnoreCase(self.tokens[self.pos].text, "array") and self.pos + 1 < self.tokens.len and self.tokens[self.pos + 1].kind == .lbracket) {
             self.pos += 1;
             left = try self.arrayConstructor(depth + 1);
-        } else if (self.peek(.identifier) and !self.tokens[self.pos].owned and (std.ascii.eqlIgnoreCase(self.tokens[self.pos].text, "timestamptz") or std.ascii.eqlIgnoreCase(self.tokens[self.pos].text, "interval")) and self.pos + 1 < self.tokens.len and self.tokens[self.pos + 1].kind == .string) {
+        } else if (self.peek(.identifier) and !self.tokens[self.pos].owned and (std.ascii.eqlIgnoreCase(self.tokens[self.pos].text, "timestamptz") or std.ascii.eqlIgnoreCase(self.tokens[self.pos].text, "interval") or std.ascii.eqlIgnoreCase(self.tokens[self.pos].text, "date") or std.ascii.eqlIgnoreCase(self.tokens[self.pos].text, "timestamp")) and self.pos + 1 < self.tokens.len and self.tokens[self.pos + 1].kind == .string) {
             // Typed literals use the same validating/canonicalizing cast as
             // CAST(text AS timestamptz), including offset normalization.
-            const temporal_kind: ?@import("temporal_value.zig").Kind = if (std.ascii.eqlIgnoreCase(self.tokens[self.pos].text, "interval")) .interval else null;
+            const temporal_kind: ?@import("temporal_value.zig").Kind = if (std.ascii.eqlIgnoreCase(self.tokens[self.pos].text, "interval")) .interval else if (std.ascii.eqlIgnoreCase(self.tokens[self.pos].text, "date")) .date else if (std.ascii.eqlIgnoreCase(self.tokens[self.pos].text, "timestamp")) .timestamp else null;
             self.pos += 1;
             const literal = try self.scalarNode(.{ .literal = try self.value() });
             left = try self.scalarNode(.{ .cast = .{ .operand = literal, .type = .datetime, .temporal_kind = temporal_kind } });
@@ -2194,6 +2216,8 @@ const Parser = struct {
         const name_value = self.tokens[self.pos].text;
         self.pos += 1;
         if (std.ascii.eqlIgnoreCase(name_value, "interval")) return .{ .type = .datetime, .temporal_kind = .interval };
+        if (std.ascii.eqlIgnoreCase(name_value, "date")) return .{ .type = .datetime, .temporal_kind = .date };
+        if (std.ascii.eqlIgnoreCase(name_value, "timestamp")) return .{ .type = .datetime, .temporal_kind = .timestamp };
         const pairs = .{
             .{ "text", @import("array_value.zig").ElementType.text },
             .{ "uuid", @import("array_value.zig").ElementType.uuid },
@@ -2264,6 +2288,8 @@ const Parser = struct {
             .{ "int", ast.ColumnType.integer },          .{ "float8", ast.ColumnType.number },
             .{ "number", ast.ColumnType.number },        .{ "boolean", ast.ColumnType.boolean },
             .{ "bool", ast.ColumnType.boolean },         .{ "datetime", ast.ColumnType.datetime },
+            .{ "numrange", ast.ColumnType.numrange },    .{ "daterange", ast.ColumnType.daterange },
+            .{ "tsrange", ast.ColumnType.tsrange },      .{ "tstzrange", ast.ColumnType.tstzrange },
             .{ "timestamptz", ast.ColumnType.datetime }, .{ "json", ast.ColumnType.json },
             .{ "jsonb", ast.ColumnType.json },
         };
@@ -3154,11 +3180,24 @@ const Parser = struct {
     }
 
     fn ddlColumnList(self: *Parser) Error![]const []const u8 {
+        return self.ddlColumnListMode(false);
+    }
+
+    fn ddlUniqueColumnList(self: *Parser) Error![]const []const u8 {
+        return self.ddlColumnListMode(true);
+    }
+
+    fn ddlColumnListMode(self: *Parser, temporal_unique: bool) Error![]const []const u8 {
         try self.expect(.lparen);
         var columns = std.ArrayList([]const u8).empty;
         while (true) {
             try self.node();
             try columns.append(self.alloc, try self.identifier());
+            if (temporal_unique and self.keyword(.without)) {
+                try self.expectKeyword(.overlaps);
+                try self.expect(.rparen);
+                return self.fail(error.UnsupportedSqlShape, "WITHOUT OVERLAPS requires temporal uniqueness enforcement");
+            }
             if (!self.take(.comma)) break;
         }
         try self.expect(.rparen);
@@ -3241,11 +3280,11 @@ const Parser = struct {
     fn constraintDefinition(self: *Parser, constraint_name: []const u8) Error!ast.SchemaChange {
         if (self.keyword(.primary)) {
             try self.expectKeyword(.key);
-            return self.uniqueTiming(.{ .add_unique = .{ .name = constraint_name, .columns = try self.ddlColumnList(), .primary = true } });
+            return self.uniqueTiming(.{ .add_unique = .{ .name = constraint_name, .columns = try self.ddlUniqueColumnList(), .primary = true } });
         }
         if (self.keyword(.unique)) {
             const nulls_not_distinct = try self.uniqueNulls();
-            return self.uniqueTiming(.{ .add_unique = .{ .name = constraint_name, .columns = try self.ddlColumnList(), .nulls_not_distinct = nulls_not_distinct } });
+            return self.uniqueTiming(.{ .add_unique = .{ .name = constraint_name, .columns = try self.ddlUniqueColumnList(), .nulls_not_distinct = nulls_not_distinct } });
         }
         if (self.keyword(.check)) {
             try self.expect(.lparen);
@@ -4835,6 +4874,7 @@ test "SQL original PostgreSQL invalid grammar retains syntax diagnostics" {
         "sql-0354",
         "sql-0355",
         "sql-0682",
+        "sql-0683",
         "sql-0684",
         "sql-0686",
         "sql-0687",
@@ -4912,4 +4952,32 @@ test "compiler SQL COMMENT resource binds schema database and single quoted iden
         "COMMENT ON SCHEMA public IS $1",
         "COMMENT ON DATABASE appdb IS lower('x')",
     }) |sql| try std.testing.expectError(error.InvalidSqlSyntax, compile(std.testing.allocator, sql, .{}));
+}
+
+test "SQL original multi action ALTER rejects invalid PERIOD grammar without reinterpreting identifiers" {
+    // sql-0683: parse the entire original; a supported ADD COLUMN prefix is
+    // neither executable by itself nor a reason to hide a later syntax error.
+    var corpus = try @import("parity_fixtures.zig").Corpus.init(std.testing.allocator);
+    defer corpus.deinit();
+    const entry = try corpus.get("sql-0683");
+    var diagnostic: Diagnostic = .{};
+    try std.testing.expectError(error.InvalidSqlSyntax, compileDiagnostic(std.testing.allocator, entry.sql, .{}, &diagnostic));
+    try std.testing.expectEqualStrings("PERIOD", entry.sql[diagnostic.start..diagnostic.end]);
+    for ([_][]const u8{
+        "ALTER TABLE t ADD COLUMN note text DEFAULT 'ADD PERIOD FOR x(a,b)', ADD COLUMN n integer",
+        "ALTER TABLE t ADD COLUMN n integer CHECK (n > 0 /* ADD PERIOD FOR x(a,b) */), ADD COLUMN m integer",
+        "ALTER TABLE t ADD COLUMN n integer, ADD COLUMN \"period\" text",
+    }) |sql| try std.testing.expectError(error.UnsupportedSqlShape, compile(std.testing.allocator, sql, .{}));
+}
+
+test "SQL range temporal uniqueness remains explicitly unsupported until enforcement is activated" {
+    const a = std.testing.allocator;
+    var corpus = try @import("parity_fixtures.zig").Corpus.init(a);
+    defer corpus.deinit();
+    // sql-0685 is valid PostgreSQL grammar, but not a closed case. Activating
+    // range storage must not mislabel an unenforced temporal key as syntax.
+    try std.testing.expectError(error.UnsupportedSqlShape, compile(a, (try corpus.get("sql-0685")).sql, .{}));
+    try std.testing.expectError(error.UnsupportedSqlShape, compile(a, "CREATE TABLE t (id text, v numrange, UNIQUE(id,v WITHOUT OVERLAPS))", .{}));
+    try std.testing.expectError(error.InvalidSqlSyntax, compile(a, "CREATE TABLE t (id text, v numrange, PRIMARY KEY(id,v WITHOUT))", .{}));
+    try std.testing.expectError(error.InvalidSqlSyntax, compile(a, "CREATE TABLE t (id text, v numrange, PRIMARY KEY(id,v WITHOUT OVERLAPS,id))", .{}));
 }

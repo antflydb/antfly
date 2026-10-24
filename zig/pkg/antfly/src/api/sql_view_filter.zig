@@ -67,7 +67,17 @@ const Filter = struct {
             const datum = cells[ordinal];
             if (datum.sql_null) continue; // SQL NULL is absent, JSONB null exists.
             const column = self.columns[ordinal];
-            const value: std.json.Value = if (datum.temporal() != null) temporal: {
+            const value: std.json.Value = if (datum.range()) |range| range_text: {
+                if (sources.sql_range_value.kindFromType(column.type) != range.kind) return error.InvalidSqlBackendResponse;
+                var context: sources.sql_range_value.Context = .{ .alloc = scratch };
+                break :range_text .{ .string = try sources.sql_range_value.formatLeaky(&context, range.*) };
+            } else if (datum.temporal()) |value| temporal: {
+                try datum.validateTemporal();
+                if (column.type != .datetime or (column.temporal_kind orelse .timestamp_tz) != value.kind()) return error.InvalidSqlBackendResponse;
+                if (value.kind() != .timestamp_tz) {
+                    var text: [sources.sql_temporal_text.output_capacity]u8 = undefined;
+                    break :temporal .{ .string = try scratch.dupe(u8, try sources.sql_temporal_text.format(value.*, &text)) };
+                }
                 var bytes: [@import("antfly_local_sources").sql_temporal_text.output_capacity]u8 = undefined;
                 break :temporal .{ .string = try scratch.dupe(u8, try scalar.formatTimestampResult(datum, column.type, &bytes)) };
             } else if (datum.numeric != null or datum.array != null)

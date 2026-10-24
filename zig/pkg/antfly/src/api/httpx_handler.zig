@@ -6000,14 +6000,23 @@ pub const AntflyApiHandler = struct {
                         if (column != 0) try writer.writer.writeByte(',');
                         const value = try page.values.cell(page.arena.allocator(), row, column);
                         if (cells % 8 == 0) try nulls.append(a, 0);
-                        if (value.temporal() != null) try value.validateTemporal();
+                        if (value.temporal() != null or value.range() != null) try value.validateTemporal();
                         if (value.sql_null) nulls.items[cells / 8] |= @as(u8, 1) << @intCast(cells % 8);
                         cells += 1;
                         if (value.sql_null) {
                             try writer.writer.writeAll("null");
-                        } else if (value.temporal() != null) {
+                        } else if (value.range()) |range| {
+                            const ranges = @import("antfly_local_sources").sql_range_value;
+                            if (ranges.kindFromType(definition.type) != range.kind) return error.InvalidSqlBackendResponse;
+                            var context: ranges.Context = .{ .alloc = page.arena.allocator(), .max_output_bytes = self.prepared_response_budget.limit };
+                            try std.json.Stringify.value(try ranges.formatLeaky(&context, range.*), .{}, &writer.writer);
+                        } else if (value.temporal()) |temporal| {
+                            if (definition.type != .datetime or (definition.temporal_kind orelse .timestamp_tz) != temporal.kind()) return error.InvalidSqlBackendResponse;
                             var text: [@import("antfly_local_sources").sql_temporal_text.output_capacity]u8 = undefined;
-                            const exact = try @import("antfly_local_sources").sql_scalar.formatTimestampResult(value, definition.type, &text);
+                            const exact = if (temporal.kind() == .timestamp_tz)
+                                try @import("antfly_local_sources").sql_scalar.formatTimestampResult(value, definition.type, &text)
+                            else
+                                try @import("antfly_local_sources").sql_temporal_text.format(temporal.*, &text);
                             try std.json.Stringify.value(exact, .{}, &writer.writer);
                         } else if (value.array) |array| {
                             if (definition.type != .array or definition.element_type != array.element_type or value.value != .null or value.patterns() != null) return error.InvalidSqlBackendResponse;

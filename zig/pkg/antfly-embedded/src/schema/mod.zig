@@ -438,7 +438,7 @@ test "relational index system NOT VALID CHECK enforces writes without historical
     try std.testing.expect(current.requires_deferred_constraints);
     // UUID and clock defaults append independent reader bits. Keep the
     // explicit v32/v31 witnesses without relabeling the current frame.
-    try std.testing.expectEqual(@as(u32, 34), current.decoded_format_version);
+    try std.testing.expectEqual(@as(u32, 35), current.decoded_format_version);
     try std.testing.expect(!current.requires_uuid_defaults);
     try std.testing.expectEqual(@as(u8, 0), current_bytes[current_bytes.len - 1]);
     const bytes = try a.dupe(u8, current_bytes[0 .. current_bytes.len - 2]);
@@ -1953,6 +1953,7 @@ fn expressionCapabilitySchema(schema: ParsedTableSchema) storage_schema.TableSch
         .requires_deferred_constraints = deferredConstraints(schema),
         .requires_uuid_defaults = requiresUuidDefaults(schema),
         .requires_clock_defaults = requiresClockDefaults(schema),
+        .requires_range_expressions = requiresRangeExpressions(schema),
     };
 }
 
@@ -1971,6 +1972,43 @@ fn uuidDefaultExpression(expression: std.json.Value, depth: usize) bool {
     if (expression.object.get("op")) |op| if (op == .string and (std.mem.eql(u8, op.string, "uuidv4") or std.mem.eql(u8, op.string, "uuidv7"))) return true;
     if (expression.object.get("args")) |args| if (args == .array) {
         for (args.array.items) |arg| if (uuidDefaultExpression(arg, depth + 1)) return true;
+    };
+    return false;
+}
+
+fn rangeExpressionJson(expression: std.json.Value, depth: usize) bool {
+    if (depth >= @import("relational_expression.zig").max_depth or expression != .object) return false;
+    if (expression.object.get("type")) |kind| if (kind == .string) {
+        const parsed = std.meta.stringToEnum(storage_schema.RelationalColumnType, kind.string);
+        if (parsed) |tag| if (@import("../sql/range_value.zig").kindFromType(tag) != null) return true;
+    };
+    if (expression.object.get("args")) |args| if (args == .array) for (args.array.items) |arg| {
+        if (rangeExpressionJson(arg, depth + 1)) return true;
+    };
+    return false;
+}
+
+fn rangeExpressionWire(expression: anytype, depth: usize) bool {
+    if (depth >= @import("relational_expression.zig").max_depth) return false;
+    if (expression.type) |kind| if (@import("../sql/range_value.zig").kindFromType(kind) != null) return true;
+    if (expression.args) |args| for (args) |arg| if (rangeExpressionWire(arg, depth + 1)) return true;
+    return false;
+}
+
+fn requiresRangeExpressions(schema: ParsedTableSchema) bool {
+    if (schema.checks) |checks| for (checks.value) |check| if (check.expression) |expression| {
+        if (rangeExpressionWire(expression, 0)) return true;
+    };
+    if (schema.relational_indexes) |indexes| for (indexes.value) |index| {
+        for (index.keys) |key| if (key.expression) |expression| if (rangeExpressionWire(expression, 0)) return true;
+    };
+    if (schema.unique_constraints) |constraints| for (constraints.value) |constraint| if (constraint.keys) |keys| {
+        for (keys) |key| if (key.expression) |expression| if (rangeExpressionWire(expression, 0)) return true;
+    };
+    for ([_]?std.json.Parsed(std.json.Value){ schema.column_defaults, schema.generated_columns }) |definitions| if (definitions) |declarations| {
+        if (declarations.value == .array) for (declarations.value.array.items) |entry| {
+            if (entry == .object) if (entry.object.get("expression")) |expression| if (rangeExpressionJson(expression, 0)) return true;
+        };
     };
     return false;
 }
@@ -2066,6 +2104,7 @@ pub fn runtimeRelationalColumnType(property: impl.DocumentProperty) ?storage_sch
     if (documentPropertyUsesJsonEncoding(property)) return .json;
     if (property.field_type) |field_type| {
         if (std.mem.eql(u8, field_type, "sql_array")) return .sql_array;
+        if (std.meta.stringToEnum(@import("../sql/range_value.zig").Kind, field_type)) |kind| return @import("../sql/range_value.zig").typeFromKind(storage_schema.RelationalColumnType, kind);
         if (property.sql_type == .numeric) return .numeric;
         if (std.mem.eql(u8, field_type, "embedding")) return .dense_vector;
         if (std.mem.eql(u8, field_type, "keyword") or
@@ -4124,4 +4163,29 @@ test "external lake logical key adapters validate native typed schema columns" {
             @import("../storage/schema.zig").freeSchema(a, runtime);
         } else try std.testing.expectError(error.InvalidSchemaUpdateRequest, deriveRuntimeTableSchema(a, parsed));
     }
+}
+
+test "SQL range defaults retain typed literals immutable reader capabilities and generated display" {
+    const a = std.testing.allocator;
+    const sql = "CREATE TABLE range_defaults (id text PRIMARY KEY, value numrange DEFAULT numrange(1.00,10.000))";
+    var compiled = try @import("../sql/compiler.zig").compile(a, sql, .{});
+    defer compiled.deinit();
+    const bytes = try @import("../sql/ddl_runtime.zig").createSchemaAlloc(a, compiled.statement.create_table);
+    defer a.free(bytes);
+    var validator = try CompiledTableValidator.init(a, bytes);
+    defer validator.deinit(a);
+    const runtime = validator.execution.expressions.?.table;
+    try std.testing.expect(runtime.requires_range_expressions);
+    try std.testing.expectEqual(@as(u32, 35), storage_schema.requiredReaderVersion(runtime));
+    const encoded = try storage_schema.serializeSchema(a, runtime);
+    defer a.free(encoded);
+    const restored = try storage_schema.deserializeSchema(a, encoded);
+    defer storage_schema.freeSchema(a, restored);
+    try std.testing.expect(restored.requires_range_expressions);
+    try std.testing.expect(!storage_schema.readerRequirementsForSchema(restored).canInterpret(34));
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    var document = try std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), "{\"id\":\"one\"}", .{});
+    try validator.execution.expressions.?.applyJson(arena.allocator(), &document);
+    try std.testing.expectEqualStrings("[1.00,10.000)", document.object.get("value").?.string);
 }

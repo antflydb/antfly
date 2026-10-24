@@ -92,6 +92,9 @@ pub const Cell = struct {
     /// Element identity is supplied by the pinned immutable layout, not read
     /// from an untrusted payload or inferred from JSON shape.
     sql_array_element_type: ?@import("../../../common/sql_builtin_type.zig").Type = null,
+    /// Range identity is pinned by the immutable column layout; payload bytes
+    /// never infer their subtype or become a JSON string by accident.
+    sql_range_kind: ?@import("../../../sql/range_value.zig").Kind = null,
     /// Distinguishes an explicitly stored JSON null from an absent column.
     /// `value_type` retains the declared physical type; `value` is ignored.
     is_null: bool = false,
@@ -342,7 +345,8 @@ fn serializeOrdinalInternal(
             cell.is_json != column.is_json or
             cell.is_dense_vector != (column.column_type == .dense_vector) or
             cell.is_numeric != (column.column_type == .numeric) or
-            cell.sql_array_element_type != (if (column.column_type == .sql_array) column.sql_element_type else null))
+            cell.sql_array_element_type != (if (column.column_type == .sql_array) column.sql_element_type else null) or
+            cell.sql_range_kind != @import("../../../sql/range_value.zig").kindFromType(column.column_type))
             return error.InvalidRelationalRow;
         if (validate_json_cells) try validateCell(alloc, cell);
         try validateSqlCell(column, cell, true);
@@ -901,6 +905,7 @@ fn jsonValueFromCellAlloc(
             break :blk try @import("../../../sql/array_wire.zig").toJsonLeaky(alloc, decoded.value, .{});
         },
         .numeric => try @import("../../../sql/numeric_storage.zig").jsonValueAlloc(alloc, cell.value.bytes_val),
+        .numrange, .daterange, .tsrange, .tstzrange => try @import("../../../sql/range_storage.zig").jsonValueAlloc(alloc, @import("../../../sql/range_value.zig").kindFromType(column.column_type).?, cell.value.bytes_val),
         .datetime => if (cell.value.u64_val <= std.math.maxInt(i64))
             .{ .integer = @intCast(cell.value.u64_val) }
         else
@@ -1525,6 +1530,13 @@ pub const OrdinalRowView = struct {
                 array.* = try @import("../../../sql/array_storage.zig").viewLeaky(alloc, column.sql_element_type orelse return error.InvalidRelationalRow, cell.value.bytes_val, .{});
                 break :blk Datum.typedArray(array);
             },
+            .numrange, .daterange, .tsrange, .tstzrange => blk: {
+                const ranges = @import("../../../sql/range_value.zig");
+                var context: ranges.Context = .{ .alloc = alloc };
+                const range = try alloc.create(ranges.Value);
+                range.* = try ranges.decodeCanonicalLeaky(&context, ranges.kindFromType(column.column_type).?, cell.value.bytes_val);
+                break :blk Datum.typedRange(range);
+            },
             .numeric => blk: {
                 const numeric = @import("../../../sql/numeric_value.zig");
                 var context: numeric.Context = .{ .alloc = alloc };
@@ -1979,6 +1991,7 @@ fn ordinalCellFromPayloadWithValidation(
         .is_dense_vector = column.column_type == .dense_vector,
         .is_numeric = column.column_type == .numeric,
         .sql_array_element_type = if (column.column_type == .sql_array) column.sql_element_type else null,
+        .sql_range_kind = @import("../../../sql/range_value.zig").kindFromType(column.column_type),
         .is_null = is_null,
         .value = typed_value,
     };
@@ -1997,6 +2010,8 @@ fn ordinalCellFromPayloadWithValidation(
                 _ = try @import("../../../sql/array_storage.zig").validateCanonical(std.heap.page_allocator, column.sql_element_type orelse return error.InvalidRelationalRow, cell.value.bytes_val, .{});
         } else if (column.column_type == .numeric) {
             _ = try @import("../../../common/sql_numeric_layout.zig").View.open(cell.value.bytes_val, .{});
+        } else if (@import("../../../sql/range_value.zig").kindFromType(column.column_type)) |kind| {
+            try @import("../../../sql/range_storage.zig").validateCanonical(std.heap.page_allocator, kind, cell.value.bytes_val);
         } else if (column.column_type == .dense_vector) {
             try validateDenseVectorBytes(cell.value.bytes_val);
         } else if (column.is_json) {
@@ -2221,13 +2236,13 @@ fn columnValueType(column_type: runtime_schema.RelationalColumnType) typed_dv.Va
         .number => .f64_val,
         .boolean => .bool_val,
         .geopoint => .geo_point,
-        .string, .blob, .geoshape, .json, .dense_vector, .sql_array, .numeric => .bytes_val,
+        .string, .blob, .geoshape, .json, .dense_vector, .sql_array, .numeric, .numrange, .daterange, .tsrange, .tstzrange => .bytes_val,
     };
 }
 
 fn isVariableColumn(column: runtime_schema.RelationalColumn) bool {
     return switch (column.column_type) {
-        .string, .blob, .geoshape, .json, .dense_vector, .sql_array, .numeric => true,
+        .string, .blob, .geoshape, .json, .dense_vector, .sql_array, .numeric, .numrange, .daterange, .tsrange, .tstzrange => true,
         .datetime, .integer, .number, .boolean, .geopoint => false,
     };
 }
@@ -2237,7 +2252,7 @@ fn fixedColumnWidth(column: runtime_schema.RelationalColumn) usize {
         .datetime, .integer, .number => 8,
         .boolean => 1,
         .geopoint => 16,
-        .string, .blob, .geoshape, .json, .dense_vector, .sql_array, .numeric => 0,
+        .string, .blob, .geoshape, .json, .dense_vector, .sql_array, .numeric, .numrange, .daterange, .tsrange, .tstzrange => 0,
     };
 }
 
@@ -2749,6 +2764,12 @@ pub const JsonMode = enum { physical, logical };
 
 pub fn writeCellValue(scratch: Allocator, writer: *std.Io.Writer, cell: Cell, mode: JsonMode) !void {
     if (cell.is_null) return writer.writeAll("null");
+    if (cell.sql_range_kind) |kind| {
+        if (cell.value_type != .bytes_val) return error.InvalidRelationalRow;
+        const value = try @import("../../../sql/range_storage.zig").jsonValueAlloc(scratch, kind, cell.value.bytes_val);
+        defer scratch.free(value.string);
+        return std.json.Stringify.value(value, .{}, writer);
+    }
     switch (cell.value_type) {
         .datetime_ns => return error.InvalidRelationalRow,
         .f64_val => if (mode == .physical) try writer.print("{d}", .{cell.value.f64_val}) else try std.json.Stringify.value(cell.value.f64_val, .{}, writer),

@@ -170,7 +170,7 @@ pub fn needsResidual(table: ?catalog.Table, predicate: ?*const ast.Predicate) bo
 fn typedComparisonColumn(table: ?catalog.Table, name: []const u8) bool {
     const definition = table orelse return false;
     const column = definition.column(name) catch return false;
-    return definition.isDocumentVersion(name) or column.type == .json or column.type == .array or column.element_type == .numeric;
+    return definition.isDocumentVersion(name) or column.type == .json or column.type == .array or column.element_type == .numeric or @import("range_value.zig").kindFromType(column.type) != null;
 }
 
 // Floating native columns may receive an explicitly typed NUMERIC parameter.
@@ -727,7 +727,7 @@ const Builder = struct {
         for (self.parameters, 0..) |*parameter, index| {
             if (parameter.kind == null and index < self.fallbacks.len) parameter.* = self.fallbacks[index];
             if (!self.typed_parameters) continue;
-            if (parameter.kind != null and parameter.kind != .datetime and parameter.element_type == null) parameter.element_type = try scalar.parameterElementType(parameter.*);
+            parameter.* = try scalar.normalizeParameterType(parameter.*);
         }
     }
 
@@ -756,7 +756,7 @@ const Builder = struct {
 
     fn inferAssignment(self: *Builder, expression: *const ast.Scalar, column: catalog.Column) !bool {
         var expected: scalar.Type = .{ .kind = column.type, .element_type = column.element_type, .numeric_modifier = column.numeric_modifier };
-        if (self.typed_parameters and expected.kind != .datetime and expected.element_type == null) expected.element_type = try scalar.parameterElementType(expected);
+        if (self.typed_parameters) expected = try scalar.normalizeParameterType(expected);
         if (self.typed_parameters and expression.* == .literal and expression.literal == .parameter) {
             const index = expression.literal.parameter;
             if (index == 0 or index > self.parameters.len) return error.InvalidSqlParameters;

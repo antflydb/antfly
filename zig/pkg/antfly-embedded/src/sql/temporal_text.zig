@@ -266,7 +266,21 @@ fn parseTime(text: []const u8) ParseError!u64 {
 /// SQL input is separate from the canonical persisted/wire representation.
 /// Quantities retain decimal precision, without floating-point month/day math.
 pub fn parseInput(kind: temporal.Kind, input: []const u8) ParseError!temporal.Value {
-    if (kind != .interval) return parseCanonical(kind, input);
+    if (kind != .interval) {
+        return parseCanonical(kind, input) catch |err| {
+            if (kind != .timestamp_tz or input.len > output_capacity) return err;
+            var normalized: [output_capacity + 3]u8 = undefined;
+            @memcpy(normalized[0..input.len], input);
+            var len = input.len;
+            if (std.mem.indexOfScalar(u8, input, ' ')) |space| normalized[space] = 'T';
+            if (len >= 3 and (normalized[len - 3] == '+' or normalized[len - 3] == '-')) {
+                @memcpy(normalized[len..][0..3], ":00");
+                len += 3;
+            }
+            const ns = calendar.parseDateTimeToSignedNs(normalized[0..len]) orelse return err;
+            return .{ .timestamp_tz = try temporal.Timestamp.fromUnixNanoseconds(ns) };
+        };
+    }
     const text = std.mem.trim(u8, input, " \t\r\n");
     if (text.len == 0 or text.len > 4096) return error.InvalidTemporalText;
     if (std.ascii.eqlIgnoreCase(text, "infinity")) return parseCanonical(kind, "infinity");

@@ -296,6 +296,7 @@ pub const Value = union(enum) {
     number: f64,
     numeric: []const u8,
     sql_array: Array,
+    range: @import("range_value.zig").Encoded,
     /// A sparse owner allocates a JSON root only when actually referenced.
     /// Keep DOM container metadata out of every ordinary logical value slot.
     json: *const Json,
@@ -313,6 +314,7 @@ pub const Value = union(enum) {
     pub fn scalar(self: Value, comptime Scalar: type) !Scalar {
         return switch (self) {
             .sql_array, .json => error.UnsupportedRelationalValueType,
+            .range => |range| if (@hasField(Scalar, "range")) .{ .range = range } else error.UnsupportedRelationalValueType,
             inline else => |payload, tag| @unionInit(Scalar, @tagName(tag), payload),
         };
     }

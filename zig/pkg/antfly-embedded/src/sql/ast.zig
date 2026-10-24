@@ -298,7 +298,7 @@ pub const Merge = struct {
 };
 /// Array element identity belongs to the accompanying binding descriptor;
 /// an array is never represented as a JSON column or an unknown NULL type.
-pub const ColumnType = enum { string, uuid, integer, number, boolean, datetime, json, array };
+pub const ColumnType = enum { string, uuid, integer, number, boolean, datetime, json, array, numrange, daterange, tsrange, tstzrange };
 pub const ForeignKey = struct {
     not_valid: bool = false,
     name: []const u8,

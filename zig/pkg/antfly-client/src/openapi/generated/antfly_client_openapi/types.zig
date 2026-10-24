@@ -42998,6 +42998,10 @@ pub const RelationalExpressionType = enum {
     numeric,
     sql_array,
     json,
+    numrange,
+    daterange,
+    tsrange,
+    tstzrange,
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         const s = switch (self) {
@@ -43010,6 +43014,10 @@ pub const RelationalExpressionType = enum {
             .numeric => "numeric",
             .sql_array => "sql_array",
             .json => "json",
+            .numrange => "numrange",
+            .daterange => "daterange",
+            .tsrange => "tsrange",
+            .tstzrange => "tstzrange",
         };
         try jw.write(s);
     }
@@ -43029,6 +43037,10 @@ pub const RelationalExpressionType = enum {
             .{ "numeric", .numeric },
             .{ "sql_array", .sql_array },
             .{ "json", .json },
+            .{ "numrange", .numrange },
+            .{ "daterange", .daterange },
+            .{ "tsrange", .tsrange },
+            .{ "tstzrange", .tstzrange },
         });
         return map.get(s) orelse error.UnexpectedToken;
     }
@@ -49067,6 +49079,10 @@ pub const SQLColumnType = enum {
     json,
     array,
     unknown,
+    numrange,
+    daterange,
+    tsrange,
+    tstzrange,
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         const s = switch (self) {
@@ -49079,6 +49095,10 @@ pub const SQLColumnType = enum {
             .json => "json",
             .array => "array",
             .unknown => "unknown",
+            .numrange => "numrange",
+            .daterange => "daterange",
+            .tsrange => "tsrange",
+            .tstzrange => "tstzrange",
         };
         try jw.write(s);
     }
@@ -49098,6 +49118,10 @@ pub const SQLColumnType = enum {
             .{ "json", .json },
             .{ "array", .array },
             .{ "unknown", .unknown },
+            .{ "numrange", .numrange },
+            .{ "daterange", .daterange },
+            .{ "tsrange", .tsrange },
+            .{ "tstzrange", .tstzrange },
         });
         return map.get(s) orelse error.UnexpectedToken;
     }
@@ -49514,6 +49538,43 @@ pub const SQLPreparedResponse = struct {
     /// Precise positional contracts, aligned with parameter_types. Array arguments use the lossless SQLArrayValue envelope or PostgreSQL array text; plain JSON arrays are not SQL arrays.
     parameter_descriptors: []const SQLParameterDescriptor,
     columns: []const SQLColumn,
+};
+
+/// A relational PostgreSQL range column. JSON ingress and SQL results use PostgreSQL range text. The declared subtype supplies identity even for NULL, empty and unbounded values. Packed rows retain canonical binary endpoints, inclusive/exclusive flags and exact NUMERIC precision. Empty ranges, omitted bounds, subtype infinities and SQL NULL are distinct. DATE ranges canonicalize finite endpoints to [lower,upper). Timestamp endpoints use the execution's UTC zone. Requires schema reader capability version 35.
+pub const SQLRangeColumnSchema = struct {
+    type: []const u8,
+    nullable: ?bool = null,
+    description: ?[]const u8 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "type", "type", false },
+        .{ "nullable", "nullable", true },
+        .{ "description", "description", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("type");
+        try jw.write(self.type);
+        if (self.nullable) |value| {
+            try jw.objectField("nullable");
+            try jw.write(value);
+        }
+        if (self.description) |value| {
+            try jw.objectField("description");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// Execute one SQL statement. Parameters are positional (`$1`, `$2`, ...), never interpolated into SQL text. To preserve integer precision in JavaScript clients, supply integers outside the exact JSON number range as decimal strings; binding coerces parameters to the expected type. The result limit is an admission bound, not an implicit SQL LIMIT: statements whose results exceed it fail instead of silently truncating. Request bodies are limited to 4 MiB, preparation to 8 MiB of allocated memory, and encoded results to a 16 MiB allocation budget.

@@ -137,6 +137,17 @@ test "retained read page validates tagged cell extensions before serialization" 
     const restored = try decoded.rows[0].cell("v");
     try std.testing.expect(!restored.sql_null);
     try std.testing.expectEqual(@as(i64, 42), restored.temporal().?.timestamp.micros);
+    const ranges = sources.sql_range_value;
+    var context: ranges.Context = .{ .alloc = arena.allocator() };
+    const range = try ranges.parseLeaky(&context, .numrange, "[1.00,10.000)");
+    cells[0] = Datum.typedRange(&range);
+    const range_encoded = try encodeVersion(std.testing.allocator, 8, &.{row}, null, .v2);
+    defer std.testing.allocator.free(range_encoded);
+    var range_decoded = try decode(std.testing.allocator, range_encoded, 8, 1, 1);
+    defer range_decoded.deinit();
+    const range_restored = try range_decoded.rows[0].cell("v");
+    try std.testing.expect(!range_restored.sql_null);
+    try std.testing.expectEqualStrings("[1.00,10.000)", try ranges.formatLeaky(&context, range_restored.range().?.*));
 }
 
 fn encodeBounded(comptime direct: bool, alloc: A, output_budget: *sources.sql_memory_budget, sequence: u64, rows: []const View.Row, after: ?[]const u8, version: spill.ColumnarVersion) ![]u8 {

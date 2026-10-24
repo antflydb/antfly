@@ -38,6 +38,7 @@ pub const SQLArrayColumnSchema = types.SQLArrayColumnSchema;
 pub const SQLArrayElementType = types.SQLArrayElementType;
 pub const SQLBuiltinType = types.SQLBuiltinType;
 pub const SQLNumericModifier = types.SQLNumericModifier;
+pub const SQLRangeColumnSchema = types.SQLRangeColumnSchema;
 pub const TableSchema = types.TableSchema;
 pub const TableStorageMode = types.TableStorageMode;
 pub const TemplateFieldMapping = types.TemplateFieldMapping;

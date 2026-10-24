@@ -99,6 +99,29 @@ components:
       description: Bound SQL scalar or array-element identity, including numeric widths and exact NUMERIC. Never inferred from JSON value shape.
       enum: [text, int16, int32, int64, float32, float64, boolean, uuid, jsonb, numeric]
 
+    SQLRangeColumnSchema:
+      type: object
+      additionalProperties: true
+      required: [type]
+      description: |
+        A relational PostgreSQL range column. JSON ingress and SQL results use
+        PostgreSQL range text. The declared subtype supplies identity even for
+        NULL, empty and unbounded values. Packed rows retain canonical binary
+        endpoints, inclusive/exclusive flags and exact NUMERIC precision.
+        Empty ranges, omitted bounds, subtype infinities and SQL NULL are
+        distinct. DATE ranges canonicalize finite endpoints to [lower,upper).
+        Timestamp endpoints use the execution's UTC zone. Requires schema
+        reader capability version 35.
+      properties:
+        type:
+          type: string
+          enum: [numrange, daterange, tsrange, tstzrange]
+        nullable:
+          type: boolean
+          default: false
+        description:
+          type: string
+
     SQLArrayColumnSchema:
       type: object
       additionalProperties: true
@@ -153,6 +176,8 @@ components:
             $ref: "#/components/schemas/SQLNumericModifier"
           x-antfly-sql-array-column-schema:
             $ref: "#/components/schemas/SQLArrayColumnSchema"
+          x-antfly-sql-range-column-schema:
+            $ref: "#/components/schemas/SQLRangeColumnSchema"
 
     TtlConfig:
       type: object
@@ -507,7 +532,7 @@ components:
 
     RelationalExpressionType:
       type: string
-      enum: [string, blob, boolean, datetime, integer, number, numeric, sql_array, json]
+      enum: [string, blob, boolean, datetime, integer, number, numeric, sql_array, json, numrange, daterange, tsrange, tstzrange]
 
     RelationalScalarExpression:
       type: object

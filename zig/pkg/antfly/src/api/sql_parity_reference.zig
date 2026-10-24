@@ -110,6 +110,18 @@ fn postgresTypeMatches(kind: wire.SQLColumnType, oid: u32) bool {
 }
 
 pub fn postgresColumnMatches(column: wire.SQLColumn, oid: u32) bool {
+    switch (oid) {
+        3906 => return column.type == .numrange,
+        3912 => return column.type == .daterange,
+        3908 => return column.type == .tsrange,
+        3910 => return column.type == .tstzrange,
+        1082 => return column.type == .datetime and column.temporal_kind == .date,
+        1083 => return column.type == .datetime and column.temporal_kind == .time,
+        1266 => return column.type == .datetime and column.temporal_kind == .time_tz,
+        1114 => return column.type == .datetime and column.temporal_kind == .timestamp,
+        1186 => return column.type == .datetime and column.temporal_kind == .interval,
+        else => {},
+    }
     if (oid == 1700) return column.type == .number and column.element_type == .numeric;
     if (column.type != .array) return postgresTypeMatches(column.type, oid);
     const element = column.element_type orelse return false;
@@ -202,8 +214,20 @@ pub fn rowMatchesWithNulls(alloc: std.mem.Allocator, columns: []const wire.SQLCo
             .integer => if (cell == .string) {
                 value = .{ .integer = try std.fmt.parseInt(i64, cell.string, 10) };
             },
+            .numrange, .daterange, .tsrange, .tstzrange => {
+                if (cell != .string or want != .string or !std.mem.eql(u8, cell.string, want.string)) return false;
+                continue;
+            },
             .datetime => {
                 if (cell != .string or want != .string) return false;
+                if (column.temporal_kind) |kind| if (kind != .timestamp_tz) {
+                    const sources = @import("antfly_local_sources");
+                    const native_kind = std.meta.stringToEnum(sources.sql_temporal_value.Kind, @tagName(kind)) orelse return false;
+                    const left = sources.sql_temporal_text.parseCanonical(native_kind, cell.string) catch return false;
+                    const right = sources.sql_temporal_text.parseCanonical(native_kind, want.string) catch return false;
+                    if (!std.meta.eql(left, right)) return false;
+                    continue;
+                };
                 const left = timestampInstant(cell.string) orelse return false;
                 const right = timestampInstant(want.string) orelse return false;
                 if (!std.meta.eql(left, right)) return false;

@@ -4439,6 +4439,7 @@ fn buildRelationalRowValueFromParsedInternal(
                     .is_dense_vector = column.column_type == .dense_vector,
                     .is_numeric = column.column_type == .numeric,
                     .sql_array_element_type = if (column.column_type == .sql_array) column.sql_element_type else null,
+                    .sql_range_kind = @import("../../sql/range_value.zig").kindFromType(column.column_type),
                     .is_null = true,
                     .value = relationalZeroValue(value_type),
                 };
@@ -4451,7 +4452,12 @@ fn buildRelationalRowValueFromParsedInternal(
                 .none => return error.InvalidBatchRequest,
             };
 
-            const value = if (column.column_type == .sql_array) blk: {
+            const value = if (@import("../../sql/range_value.zig").kindFromType(column.column_type)) |kind| blk: {
+                const encoded = try @import("../../sql/range_storage.zig").encodeJsonAlloc(output_alloc, kind, found);
+                errdefer output_alloc.free(encoded);
+                try owned_buffers.append(output_alloc, encoded);
+                break :blk typed_dv.TypedValue{ .bytes_val = encoded };
+            } else if (column.column_type == .sql_array) blk: {
                 const kind = column.sql_element_type orelse return error.InvalidBatchRequest;
                 var decoded = try @import("../../sql/array_wire.zig").decodeBorrowedWithModifier(output_alloc, kind, found, column.numeric_modifier, .{});
                 defer decoded.deinit();
@@ -4485,6 +4491,7 @@ fn buildRelationalRowValueFromParsedInternal(
                 .is_dense_vector = column.column_type == .dense_vector,
                 .is_numeric = column.column_type == .numeric,
                 .sql_array_element_type = if (column.column_type == .sql_array) column.sql_element_type else null,
+                .sql_range_kind = @import("../../sql/range_value.zig").kindFromType(column.column_type),
                 .value = value,
             };
         }
@@ -4617,7 +4624,7 @@ fn relationalValueType(column_type: runtime_schema.RelationalColumnType) typed_d
         .number => .f64_val,
         .boolean => .bool_val,
         .geopoint => .geo_point,
-        .string, .blob, .geoshape, .json, .dense_vector, .sql_array, .numeric => .bytes_val,
+        .string, .blob, .geoshape, .json, .dense_vector, .sql_array, .numeric, .numrange, .daterange, .tsrange, .tstzrange => .bytes_val,
     };
 }
 
@@ -4643,7 +4650,7 @@ fn relationalTypedValueAlloc(
     return switch (column_type) {
         // SQL arrays require the complete immutable column descriptor and are
         // prepared by makeCell, never inferred from this coarse type alone.
-        .sql_array, .numeric => error.InvalidBatchRequest,
+        .sql_array, .numeric, .numrange, .daterange, .tsrange, .tstzrange => error.InvalidBatchRequest,
         .string, .blob, .geoshape => switch (value) {
             .string => |text| .{ .bytes_val = text },
             else => null,

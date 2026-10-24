@@ -949,6 +949,12 @@ pub fn bindLiteral(allocator: std.mem.Allocator, node: ast.Value, kind: ast.Colu
         error.InvalidUuid => return error.SqlTypeMismatch,
         else => return err,
     } };
+    if (node == .string) if (@import("range_value.zig").kindFromType(kind)) |range_kind| {
+        const ranges = @import("range_value.zig");
+        var context: ranges.Context = .{ .alloc = allocator };
+        const value = try ranges.parseLeaky(&context, range_kind, node.string);
+        return .{ .string = try ranges.formatLeaky(&context, value) };
+    };
     if (node == .string and kind == .json) {
         // Admit nesting before constructing the tree: otherwise a 1 MiB SQL
         // string of brackets could allocate a huge dynamic JSON value before
@@ -1034,6 +1040,22 @@ pub fn coerceDatumTyped(alloc: std.mem.Allocator, raw: @import("scalar.zig").Dat
 }
 
 pub fn coerceDatum(alloc: std.mem.Allocator, raw: @import("scalar.zig").Datum, kind: ast.ColumnType, element_type: ?@import("array_value.zig").ElementType) !@import("scalar.zig").Datum {
+    const ranges = @import("range_value.zig");
+    if (ranges.kindFromType(kind)) |range_kind| {
+        try raw.validateTemporal();
+        if (element_type != null) return error.SqlTypeMismatch;
+        if (raw.sql_null) return raw;
+        if (raw.range()) |value| {
+            if (value.kind != range_kind) return error.SqlTypeMismatch;
+            return raw;
+        }
+        if (raw.value != .string or raw.array != null or raw.numeric != null or raw.extension != null) return error.SqlTypeMismatch;
+        var context: ranges.Context = .{ .alloc = alloc };
+        const owned = try alloc.create(ranges.Value);
+        owned.* = try ranges.parseLeaky(&context, range_kind, raw.value.string);
+        return .typedRange(owned);
+    }
+    if (raw.range() != null) return error.SqlTypeMismatch;
     if (raw.temporal() != null) {
         try raw.validateTemporal();
         if (kind == .datetime and element_type == null and raw.temporal().?.kind() == .timestamp_tz) return raw;
@@ -1104,6 +1126,7 @@ pub fn coerceAlloc(alloc: std.mem.Allocator, raw: Json, kind: ast.ColumnType) !J
 pub fn coerce(raw: Json, kind: ast.ColumnType) !Json {
     if (raw == .null) return .null;
     return switch (kind) {
+        .numrange, .daterange, .tsrange, .tstzrange => error.SqlTypeMismatch,
         .array => error.SqlTypeMismatch,
         .integer => switch (raw) {
             .integer => raw,

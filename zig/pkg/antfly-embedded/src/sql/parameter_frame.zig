@@ -733,9 +733,10 @@ fn prepareLeaky(a: A, descriptors: []const scalar.Type, inputs: []const Input, l
     }
     try work.consume(inputs.len);
     const types = try a.dupe(scalar.Type, descriptors);
-    for (types) |*descriptor| if (descriptor.kind != .datetime and descriptor.element_type == null) {
-        descriptor.element_type = try scalar.parameterElementType(descriptor.*);
-    };
+    for (types) |*descriptor| {
+        descriptor.* = try scalar.normalizeParameterType(descriptor.*);
+        if (descriptor.kind == null) return error.UnknownSqlParameterType;
+    }
     const values = try a.alloc(scalar.Datum, inputs.len);
     for (types, inputs, values, 1..) |descriptor, input, *value, index| {
         value.* = decodeInput(a, descriptor, input, limits, &work, &wire_bytes) catch |err| {
@@ -776,6 +777,25 @@ fn decodeInput(a: A, descriptor: scalar.Type, input: Input, limits: Limits, work
         if (input == .datum and (input.datum.array != null or input.datum.numeric != null or input.datum.patterns() != null or input.datum.value != .null)) return error.SqlTypeMismatch;
         return .{};
     }
+    const ranges = @import("range_value.zig");
+    if (descriptor.kind) |tag| if (ranges.kindFromType(tag)) |range_kind| {
+        if (input == .array_envelope) return error.SqlTypeMismatch;
+        var context = work.numericContext(a);
+        const initial = context.remaining;
+        defer work.remaining -|= @intCast(initial - context.remaining);
+        context.max_output_bytes = @min(context.max_output_bytes, limits.bytes);
+        if (input == .datum) if (input.datum.range()) |range| {
+            if (range.kind != range_kind) return error.ConflictingSqlParameterTypes;
+            const canonical = try ranges.canonical(&context, range.*);
+            _ = try ranges.encodedSize(&context, canonical);
+            return operators.cloneDatum(a, scalar.Datum.typedRange(&canonical));
+        };
+        const raw = if (input == .text) input.text else if (input == .binary) input.binary else if (input.datum.array == null and input.datum.numeric == null and input.datum.temporal() == null and input.datum.value == .string) input.datum.value.string else return error.SqlTypeMismatch;
+        const owned = try a.create(ranges.Value);
+        owned.* = if (input == .binary) try ranges.decodeInputLeaky(&context, range_kind, raw) else try ranges.parseLeaky(&context, range_kind, raw);
+        return scalar.Datum.typedRange(owned);
+    };
+    if (input == .datum and input.datum.range() != null) return error.SqlTypeMismatch;
     if (descriptor.temporal_kind) |temporal_kind| {
         if (input == .array_envelope) return error.SqlTypeMismatch;
         const temporal = @import("temporal_value.zig");

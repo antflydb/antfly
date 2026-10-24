@@ -151,3 +151,5 @@ pub const Corpus = struct {
 pub const fk_not_valid_reference = @embedFile("fixtures/sql_fk_not_valid_reference.json");
 
 pub const temporal_arithmetic_reference = @embedFile("fixtures/sql_temporal_arithmetic_reference.json");
+
+pub const range_reference = @embedFile("fixtures/sql_range_reference.json");

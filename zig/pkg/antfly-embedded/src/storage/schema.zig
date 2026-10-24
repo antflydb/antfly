@@ -231,6 +231,10 @@ pub const RelationalColumnType = enum(u8) {
     /// Exact canonical PostgreSQL NUMERIC payload, not the legacy f64 number
     /// cell or the heterogeneous typed-doc-value numeric_val union.
     numeric = 11,
+    numrange = 12,
+    daterange = 13,
+    tsrange = 14,
+    tstzrange = 15,
 };
 
 pub const RelationalJsonKind = enum(u8) {
@@ -314,6 +318,8 @@ pub const TableSchema = struct {
     requires_uuid_defaults: bool = false,
     /// Owned transaction-clock defaults must never execute during restoration.
     requires_clock_defaults: bool = false,
+    /// Typed range literals in durable programs also fence scalar-only layouts.
+    requires_range_expressions: bool = false,
     exact_fields: []const ExactField = &.{},
     dynamic_templates: []const DynamicTemplate = &.{},
     declared_fields: []const DeclaredField = &.{},
@@ -452,10 +458,12 @@ pub fn requiredReaderVersion(schema: TableSchema) u32 {
         .{ "requires_deferred_constraints", 32 },
         .{ "requires_uuid_defaults", 33 },
         .{ "requires_clock_defaults", 34 },
+        .{ "requires_range_expressions", 35 },
     }) |requirement| {
         if (@field(schema, requirement[0])) version = @max(version, requirement[1]);
     }
     for (schema.relational_columns) |column| {
+        if (@import("../sql/range_value.zig").kindFromType(column.column_type) != null) version = @max(version, 35);
         if (column.sql_element_type != null) version = @max(version, 16);
         if (column.column_type == .sql_array) version = @max(version, 17);
         if (column.column_type == .numeric or column.sql_element_type == .numeric) version = @max(version, 20);
@@ -487,6 +495,7 @@ test "relational index system schema reader requirements cover every durable exp
         .{ "requires_deferred_constraints", 32 },
         .{ "requires_uuid_defaults", 33 },
         .{ "requires_clock_defaults", 34 },
+        .{ "requires_range_expressions", 35 },
     };
     comptime {
         @setEvalBranchQuota(10_000);
@@ -605,7 +614,7 @@ pub fn schemasEqualForPublicBinding(alloc: Allocator, stored: TableSchema, deriv
         derived.requires_typed_expressions or derived.requires_predicate_expressions or
         derived.requires_exact_numeric_expressions or derived.requires_exact_numeric_validation or
         derived.requires_numeric_modifiers or derived.requires_array_expressions or
-        derived.requires_array_constructors or derived.requires_constant_index_predicates or derived.requires_text_expressions or derived.requires_numeric_functions or derived.requires_jsonb_display or derived.requires_json_expressions or derived.requires_jsonb_array_display or derived.requires_deferred_constraints or derived.requires_uuid_defaults or derived.requires_clock_defaults) return false;
+        derived.requires_array_constructors or derived.requires_constant_index_predicates or derived.requires_text_expressions or derived.requires_numeric_functions or derived.requires_jsonb_display or derived.requires_json_expressions or derived.requires_jsonb_array_display or derived.requires_deferred_constraints or derived.requires_uuid_defaults or derived.requires_clock_defaults or derived.requires_range_expressions) return false;
     var projection = derived;
     projection.relational_columns = &.{};
     const documents = try alloc.dupe(FullTextDocument, derived.full_text_documents);
@@ -689,6 +698,7 @@ pub fn serializeTextProjectionSchema(alloc: Allocator, schema: TableSchema) ![]u
     projection_schema.requires_deferred_constraints = false;
     projection_schema.requires_uuid_defaults = false;
     projection_schema.requires_clock_defaults = false;
+    projection_schema.requires_range_expressions = false;
     const projection_documents = try alloc.dupe(FullTextDocument, schema.full_text_documents);
     defer alloc.free(projection_documents);
     for (projection_documents) |*doc| {
@@ -878,6 +888,7 @@ fn serializeSchemaFormat(alloc: Allocator, schema: TableSchema, format_version: 
     if (format_version >= 32) try buf.append(alloc, @intFromBool(schema.requires_deferred_constraints));
     if (format_version >= 33) try buf.append(alloc, @intFromBool(schema.requires_uuid_defaults));
     if (format_version >= 34) try buf.append(alloc, @intFromBool(schema.requires_clock_defaults));
+    if (format_version >= 35) try buf.append(alloc, @intFromBool(schema.requires_range_expressions));
     return buf.toOwnedSlice(alloc);
 }
 
@@ -1203,6 +1214,10 @@ fn deserializeSchemaOwned(alloc: Allocator, data: []const u8) !TableSchema {
                 9 => .dense_vector,
                 10 => if (fmt_version >= 17) .sql_array else return error.UnsupportedVersion,
                 11 => if (fmt_version >= 20) .numeric else return error.UnsupportedVersion,
+                12 => if (fmt_version >= 35) .numrange else return error.UnsupportedVersion,
+                13 => if (fmt_version >= 35) .daterange else return error.UnsupportedVersion,
+                14 => if (fmt_version >= 35) .tsrange else return error.UnsupportedVersion,
+                15 => if (fmt_version >= 35) .tstzrange else return error.UnsupportedVersion,
                 else => return error.InvalidSchema,
             };
             pos += 1;
@@ -1301,6 +1316,7 @@ fn deserializeSchemaOwned(alloc: Allocator, data: []const u8) !TableSchema {
         .requires_deferred_constraints = if (fmt_version >= 32) data[pos + 13] == 1 else false,
         .requires_uuid_defaults = if (fmt_version >= 33) data[pos + 14] == 1 else false,
         .requires_clock_defaults = if (fmt_version >= 34) data[pos + 15] == 1 else false,
+        .requires_range_expressions = if (fmt_version >= 35) data[pos + 16] == 1 else false,
         .exact_fields = exact_fields,
         .dynamic_templates = templates,
         .declared_fields = declared_fields,
@@ -1517,6 +1533,7 @@ fn validateSerializedSchema(data: []const u8) !void {
             if (column_tag >= std.meta.fieldNames(RelationalColumnType).len) return error.InvalidSchema;
             if (column_tag == @backingInt(RelationalColumnType.sql_array) and format_version < 17) return error.UnsupportedVersion;
             if (column_tag == @backingInt(RelationalColumnType.numeric) and format_version < 20) return error.UnsupportedVersion;
+            if (column_tag >= @backingInt(RelationalColumnType.numrange) and format_version < 35) return error.UnsupportedVersion;
             try cursor.readBool();
             try cursor.readBool();
             try cursor.readBool();
@@ -1562,6 +1579,7 @@ fn validateSerializedSchema(data: []const u8) !void {
     if (format_version >= 32) try cursor.readBool();
     if (format_version >= 33) try cursor.readBool();
     if (format_version >= 34) try cursor.readBool();
+    if (format_version >= 35) try cursor.readBool();
     try cursor.finish();
 }
 
@@ -1569,6 +1587,7 @@ fn validateRelationalSchema(alloc: Allocator, schema: TableSchema) !void {
     if (schema.requires_jsonb_array_display and (schema.storage_mode != .relational or !schema.requires_public_schema)) return error.InvalidSchema;
     if (schema.requires_deferred_constraints and (schema.storage_mode != .relational or !schema.requires_public_schema)) return error.InvalidSchema;
     if (schema.requires_uuid_defaults and (schema.storage_mode != .relational or !schema.requires_public_schema)) return error.InvalidSchema;
+    if (schema.requires_range_expressions and (schema.storage_mode != .relational or !schema.requires_public_schema)) return error.InvalidSchema;
     if (schema.requires_clock_defaults and (schema.storage_mode != .relational or !schema.requires_public_schema)) return error.InvalidSchema;
     if (schema.requires_json_expressions and (schema.storage_mode != .relational or !schema.requires_public_schema)) return error.InvalidSchema;
     if (schema.requires_jsonb_display and (schema.storage_mode != .relational or !schema.requires_public_schema)) return error.InvalidSchema;
@@ -1584,6 +1603,10 @@ fn validateRelationalSchema(alloc: Allocator, schema: TableSchema) !void {
         if (!schema.requires_numeric_modifiers or column.sql_element_type != .numeric or
             (column.column_type != .numeric and column.column_type != .sql_array)) return error.InvalidSchema;
         modifier.validate() catch return error.InvalidSchema;
+    };
+    for (schema.relational_columns) |column| if (@import("../sql/range_value.zig").kindFromType(column.column_type) != null) {
+        if (schema.storage_mode != .relational or !schema.requires_public_schema or column.is_json or column.json_kind != .none or column.sql_element_type != null)
+            return error.InvalidSchema;
     };
     for (schema.relational_columns) |column| if (column.column_type == .numeric) {
         if (schema.storage_mode != .relational or column.sql_element_type != .numeric or column.is_json or column.json_kind != .none)

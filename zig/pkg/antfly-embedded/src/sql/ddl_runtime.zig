@@ -518,6 +518,10 @@ pub fn columnProperty(alloc: std.mem.Allocator, column: ast.Column, nullable: bo
         try std.json.Stringify.valueAlloc(alloc, .{
             .type = switch (column.type) {
                 .array => "sql_array",
+                .numrange => "numrange",
+                .daterange => "daterange",
+                .tsrange => "tsrange",
+                .tstzrange => "tstzrange",
                 .string => "keyword",
                 .uuid => unreachable,
                 .integer => "integer",

@@ -593,7 +593,15 @@ const Encoder = struct {
     fn cell(self: *Encoder, value: Datum) anyerror!void {
         try value.validateTemporal();
         try self.append(&.{@intFromBool(value.sql_null)});
-        if (value.temporal()) |temporal| {
+        if (value.range()) |range| {
+            const ranges = @import("range_value.zig");
+            var context: ranges.Context = .{ .alloc = self.scratch orelse self.a, .max_output_bytes = self.limit };
+            const size = try ranges.encodedSize(&context, range.*);
+            try self.append(&.{ 13, @backingInt(range.kind) });
+            try self.word(size);
+            var writer: std.Io.Writer = .fixed(try self.reserve(size));
+            try ranges.encode(&context, range.*, &writer);
+        } else if (value.temporal()) |temporal| {
             var frame: [16]u8 = undefined;
             const bytes = try @import("temporal_value.zig").encode(temporal.*, &frame);
             try self.append(&.{ 12, @backingInt(temporal.kind()) });
@@ -972,6 +980,20 @@ const Decoder = struct {
                     else => error.InvalidSqlSpill,
                 };
                 value.* = Datum.typedArray(array);
+            } else if (self.position < self.bytes.len and self.bytes[self.position] == 13) {
+                self.position += 1;
+                if (flag != 0) return error.InvalidSqlSpill;
+                const ranges = @import("range_value.zig");
+                const kind = std.enums.fromInt(ranges.Kind, try self.byte()) orelse return error.InvalidSqlSpill;
+                const bytes = try self.take(try self.count());
+                var context: ranges.Context = .{ .alloc = self.a, .max_input_bytes = bytes.len };
+                const decoded = ranges.decodeCanonicalLeaky(&context, kind, bytes) catch |err| return switch (err) {
+                    error.OutOfMemory, error.Canceled, error.SqlProgramLimitExceeded => err,
+                    else => error.InvalidSqlSpill,
+                };
+                const owned = try self.a.create(ranges.Value);
+                owned.* = decoded;
+                value.* = Datum.typedRange(owned);
             } else if (self.position < self.bytes.len and self.bytes[self.position] == 12) {
                 self.position += 1;
                 if (flag != 0) return error.InvalidSqlSpill;
@@ -2584,7 +2606,7 @@ pub const Sequential = struct {
         return true;
     }
     fn tag(value: Datum) u8 {
-        if (value.patterns() != null or value.array != null or value.numeric != null or value.temporal() != null) return 255;
+        if (value.patterns() != null or value.array != null or value.numeric != null or value.temporal() != null or value.range() != null) return 255;
         return switch (value.value) {
             .null => 0,
             .bool => 1,
@@ -2640,7 +2662,7 @@ pub const Sequential = struct {
             for (rows) |row| {
                 const value = (if (keys) row.keys else row.values)[column];
                 try value.validateTemporal();
-                if (value.sql_null or (value.value == .null and value.patterns() == null and value.array == null and value.numeric == null and value.temporal() == null)) continue;
+                if (value.sql_null or (value.value == .null and value.patterns() == null and value.array == null and value.numeric == null and value.temporal() == null and value.range() == null)) continue;
                 const actual = tag(value);
                 kind = if (kind == null or kind.? == actual) actual else 255;
             }
