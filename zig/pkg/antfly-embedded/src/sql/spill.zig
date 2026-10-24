@@ -45,6 +45,7 @@ pub const Manager = struct {
     peak_bytes: u64 = 0,
     written_bytes: u64 = 0,
     merges: usize = 0,
+    merged_rows: u64 = 0,
     read_calls: u64 = 0,
     write_calls: u64 = 0,
     read_bytes: u64 = 0,
@@ -3964,6 +3965,7 @@ pub const PayloadReader = struct {
 };
 
 pub const Sort = struct {
+    const max_logical_runs = @bitSizeOf(usize) * 7;
     const Entry = struct { normalized: ?@import("sort_key.zig").Key, position: usize, ordinal: u64 };
     // Keep resident/narrow sorts inline. At the first spill of a wide run,
     // migrate payloads once to physical pages and sort two-integer references
@@ -4001,6 +4003,10 @@ pub const Sort = struct {
     run_store: ?*RunStore = null,
     owns_run_store: bool = true,
     run_levels: [32]u8 = @splat(0),
+    // Anonymous runs consume extents, not descriptors. Retain equal-level
+    // cohorts independently of a caller's physical-file reservation.
+    shared_directory: std.ArrayList(?Sequential) = .empty,
+    shared_levels: std.ArrayList(u8) = .empty,
     outputs: [8]?Sequential = @splat(null),
     heads: [8]?Decoded = @splat(null),
     owned_heads: [8]?*Sequential.OwnedBlock = @splat(null),
@@ -4108,6 +4114,9 @@ pub const Sort = struct {
         self.keys.deinit();
         self.rows.deinit(self.a);
         for (&self.runs) |*run| if (run.*) |*file| file.close();
+        for (self.shared_directory.items) |*run| if (run.*) |*file| file.close();
+        self.shared_directory.deinit(self.a);
+        self.shared_levels.deinit(self.a);
         for (self.outputs[0..self.output_count], self.head_arenas[0..self.output_count]) |*file, *arena| {
             if (file.*) |*open_file| open_file.close();
             arena.deinit();
@@ -4670,6 +4679,25 @@ pub const Sort = struct {
             try self.admitRun(owned);
         }
     }
+    fn runSlice(self: *Sort) []?Sequential {
+        return if (self.shared_runs) self.shared_directory.items else self.runs[0..self.run_limit];
+    }
+    fn levelSlice(self: *Sort) []u8 {
+        return if (self.shared_runs) self.shared_levels.items else self.run_levels[0..self.run_limit];
+    }
+    fn orderedRuns(self: *Sort, indices: []usize) usize {
+        var count: usize = 0;
+        for (self.runSlice(), 0..) |run, i| if (run != null) {
+            indices[count] = i;
+            count += 1;
+        };
+        std.mem.sort(usize, indices[0..count], self, struct {
+            fn less(owner: *Sort, l: usize, r: usize) bool {
+                return owner.runSlice()[l].?.file.size < owner.runSlice()[r].?.file.size;
+            }
+        }.less);
+        return count;
+    }
     fn admitRun(self: *Sort, input: Sequential) !void {
         self.allow_indirect = false;
         std.debug.assert(self.run_limit >= 1 and self.run_limit <= self.runs.len);
@@ -4682,7 +4710,7 @@ pub const Sort = struct {
             var indices: [8]usize = undefined;
             var count: usize = 0;
             var empty: ?usize = null;
-            for (self.runs[0..self.run_limit], self.run_levels[0..self.run_limit], 0..) |slot, candidate_level, index| {
+            for (self.runSlice(), self.levelSlice(), 0..) |slot, candidate_level, index| {
                 if (slot == null) {
                     empty = index;
                 } else if (candidate_level == level and count < fan_in - 1) {
@@ -4690,9 +4718,17 @@ pub const Sort = struct {
                     count += 1;
                 }
             }
+            if (count < fan_in - 1 and self.shared_runs and empty == null) {
+                if (self.shared_directory.items.len == max_logical_runs) return error.SqlProgramLimitExceeded;
+                try self.shared_directory.ensureUnusedCapacity(self.a, 1);
+                try self.shared_levels.ensureUnusedCapacity(self.a, 1);
+                empty = self.shared_directory.items.len;
+                self.shared_directory.appendAssumeCapacity(null);
+                self.shared_levels.appendAssumeCapacity(0);
+            }
             if (count < fan_in - 1 and empty != null) {
-                self.runs[empty.?] = run;
-                self.run_levels[empty.?] = level;
+                self.runSlice()[empty.?] = run;
+                self.levelSlice()[empty.?] = level;
                 return;
             }
             // A full directory can occur with many unequal levels. Compact
@@ -4704,23 +4740,23 @@ pub const Sort = struct {
                 for (order[0..self.run_limit], 0..) |*index, i| index.* = i;
                 std.mem.sort(usize, order[0..self.run_limit], self, struct {
                     fn less(sort: *Sort, a: usize, b: usize) bool {
-                        return sort.run_levels[a] < sort.run_levels[b];
+                        return sort.levelSlice()[a] < sort.levelSlice()[b];
                     }
                 }.less);
                 for (order[0 .. fan_in - 1]) |index| {
                     indices[count] = index;
                     count += 1;
-                    level = @max(level, self.run_levels[index]);
+                    level = @max(level, self.levelSlice()[index]);
                 }
             }
             var inputs: [8]*Sequential = undefined;
             inputs[0] = &run;
-            for (indices[0..count], inputs[1 .. count + 1]) |index, *file| file.* = &self.runs[index].?;
+            for (indices[0..count], inputs[1 .. count + 1]) |index, *file| file.* = &self.runSlice()[index].?;
             const combined = try self.mergeMany(inputs[0 .. count + 1]);
             run.close();
             for (indices[0..count]) |index| {
-                self.runs[index].?.close();
-                self.runs[index] = null;
+                self.runSlice()[index].?.close();
+                self.runSlice()[index] = null;
             }
             run = combined;
             level = std.math.add(u8, level, 1) catch return error.SqlProgramLimitExceeded;
@@ -4738,7 +4774,8 @@ pub const Sort = struct {
         // Keep one retained run outside a full-directory compaction. Otherwise
         // a small directory with fan-in = run_limit + 1 rewrites its entire
         // growing prefix whenever the next run arrives.
-        return @min(@max(@as(usize, 2), self.run_limit), @min(@min(self.outputs.len, @max(@as(usize, 2), self.merge_fan_in)), @max(@as(usize, 2), self.memory_bytes / @max(1, head_bytes))));
+        const descriptors = if (self.shared_runs) self.outputs.len else self.run_limit;
+        return @min(@max(@as(usize, 2), descriptors), @min(@min(self.outputs.len, @max(@as(usize, 2), self.merge_fan_in)), @max(@as(usize, 2), self.memory_bytes / @max(1, head_bytes))));
     }
     fn readRun(self: *Sort, file: *Sequential, a: Allocator, offset: u64) !Decoded {
         if (offset == 0) try file.seal();
@@ -4835,17 +4872,16 @@ pub const Sort = struct {
         }
         try MergeRows.write(pending[0..count], ordinals[0..count], &output);
         self.manager.increment("merges", 1);
+        var merged: u64 = 0;
+        for (inputs) |input| merged += input.size;
+        self.manager.increment("merged_rows", merged);
         return output;
     }
     fn compactParallel(self: *Sort) !void {
         if (!self.parallel_runs or self.memory_bytes < 512 * 1024) return;
         while (true) {
-            var indices: [32]usize = undefined;
-            var count: usize = 0;
-            for (self.runs, 0..) |file, index| if (file != null) {
-                indices[count] = index;
-                count += 1;
-            };
+            var indices: [max_logical_runs]usize = undefined;
+            const count = self.orderedRuns(&indices);
             if (count <= self.fanIn()) return;
             var jobs: [2]?*MergeJob = @splat(null);
             defer for (jobs) |job| if (job) |owner| owner.close();
@@ -4869,8 +4905,8 @@ pub const Sort = struct {
                 slot.* = job;
                 for (0..width) |i| {
                     const index = indices[claimed + i];
-                    job.inputs[i] = self.runs[index];
-                    self.runs[index] = null;
+                    job.inputs[i] = self.runSlice()[index];
+                    self.runSlice()[index] = null;
                 }
                 claimed += width;
                 job.task = @import("parallel_scheduler.zig").global().submit(self.manager.io, self.memory_bytes / 2, MergeJob.run, .{job});
@@ -4888,10 +4924,10 @@ pub const Sort = struct {
                     combined.close();
                     continue;
                 }
-                const empty = for (self.runs, 0..) |file, index| {
+                const empty = for (self.runSlice(), 0..) |file, index| {
                     if (file == null) break index;
                 } else unreachable;
-                self.runs[empty] = combined;
+                self.runSlice()[empty] = combined;
             };
             if (failure) |err| return err;
         }
@@ -4928,7 +4964,7 @@ pub const Sort = struct {
             try self.flush();
             try self.collectRun();
         }
-        const has_runs = for (self.runs) |run| {
+        const has_runs = for (self.runSlice()) |run| {
             if (run != null) break true;
         } else false;
         if (!has_runs) {
@@ -4946,7 +4982,11 @@ pub const Sort = struct {
             for (self.outputs[0..self.output_count]) |*file| if (file.*) |*active| active.close();
             self.output_count = 0;
         }
-        for (&self.runs) |*slot| if (slot.*) |*run| {
+        var run_indices: [max_logical_runs]usize = undefined;
+        const run_count = self.orderedRuns(&run_indices);
+        for (run_indices[0..run_count]) |run_index| {
+            const slot = &self.runSlice()[run_index];
+            const run = &slot.*.?;
             if (self.output_count == fan_in) {
                 var inputs: [8]*Sequential = undefined;
                 for (self.outputs[0..self.output_count], inputs[0..self.output_count]) |*file, *input| input.* = &file.*.?;
@@ -4961,7 +5001,7 @@ pub const Sort = struct {
             self.outputs[self.output_count] = run.*;
             self.output_count += 1;
             slot.* = null;
-        };
+        }
         for (self.head_arenas[0..self.output_count]) |*arena| arena.* = std.heap.ArenaAllocator.init(self.a);
         errdefer for (self.head_arenas[0..self.output_count]) |*arena| arena.deinit();
         for (self.outputs[0..self.output_count], self.head_arenas[0..self.output_count], self.heads[0..self.output_count], 0..) |*file, *arena, *head, index| {
@@ -9248,4 +9288,31 @@ test "external lake leased sort payloads retain physical columns across spill an
             try std.testing.expectEqual((try leases[i].cell(0)).value.integer, (try batch.cell(a, i, 0)).value.integer);
         }
     }
+}
+
+test "SQL shared spill runs retain balanced tiers independently of descriptor caps" {
+    const a = std.testing.allocator;
+    var state: u8 = 0;
+    var manager: Manager = .{ .alloc = a, .io = std.testing.io, .context = &state, .checkpoint = struct {
+        fn check(_: *anyopaque) !void {}
+    }.check, .async_writes = false };
+    defer manager.deinit();
+    var sort = Sort.init(a, &manager, &.{.{}}, 4096);
+    sort.shared_runs = true;
+    sort.parallel_runs = false;
+    sort.run_limit = 4;
+    defer sort.deinit();
+    const count = 4096;
+    for (0..count) |i| try sort.add(.{ .keys = &.{Datum.json(.{ .integer = @intCast(count - i - 1) })}, .values = &.{}, .ordinal = i });
+    var scratch = std.heap.ArenaAllocator.init(a);
+    defer scratch.deinit();
+    for (0..count) |i| {
+        _ = scratch.reset(.free_all);
+        const row = (try sort.next(scratch.allocator())).?;
+        try std.testing.expectEqual(@as(i64, @intCast(i)), row.keys[0].value.integer);
+    }
+    try std.testing.expect((try sort.next(scratch.allocator())) == null);
+    try std.testing.expect(sort.shared_directory.items.len > sort.run_limit);
+    try std.testing.expect(manager.merged_rows < count * 16);
+    try std.testing.expect(manager.peak_files <= 1);
 }

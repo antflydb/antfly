@@ -888,3 +888,59 @@ reopening without query caches, closure retention of the historical base, and
 compaction on a subsequent affected update. Typed proof lanes must reproduce
 serial bytes and return admission after null-key errors. Archive-scale speedups
 and live-provider qualification remain unmeasured.
+
+
+### Shared spill locality and bounded reducer maintenance (reader protocol 80)
+
+The follow-up to #1234 separates logical merge runs from physical descriptors.
+Shared-run sorts keep a dynamically allocated, quota-accounted directory of
+balanced levels. A caller's four-descriptor reservation no longer forces four
+logical runs into unequal-level merges. Merge heads remain bounded by decoded
+workspace; final consolidation consumes smaller physical runs first. Nonshared
+legacy sorts retain their descriptor cap. Native file-hash and tie directories
+use the shared run owner. The maximum directory follows the machine ordinal
+width and maximum fan-in, independently of archive row count.
+
+Spilled joins use an adaptive radix directory over full 64-bit hash slots when
+the paged path is admitted. A pressured leaf splits locally by the next hash bit;
+fixed typed slots and directory nodes use the statement execution pager. Probe
+tiles group directory and leaf reads by page, and only a complete hash match
+opens the variable-width key/payload record. Full hashes do not replace typed
+equality: exact comparisons still reject collisions, duplicate chains retain
+build order, and matched flags continue to address the original spill records
+for outer joins. Small workspaces retain the existing bounded flat fallback.
+This keeps streaming probe order without materializing the entire probe input.
+
+Native text writers optionally emit exact document/term/frequency evidence while
+encoding ordinary and merged postings. A bounded shared-run sort publishes an
+authenticated forward tree per canonical segment. The explicit version also
+represents complete, empty evidence. Accepted terms too wide for the forward
+key or known optional workspace declines keep the legacy exact statistics path.
+Eligible one-base posting updates seek only the retired documents' forward
+ranges, adjust reached DF keys in COW summary pages and subtract exact field
+lengths. Global DF updates visit only summary differences. The base term
+directory replacement is adopted during finalization, after the last durable
+file checkpoint; its marker survives restart so recovered work cannot apply a
+second retirement. Changed-row segments keep their ordinary exact contributions.
+Mixed serving packs, legacy forward metadata and other ineligible bases retain
+complete construction or the existing exact merge. Both canonical forward roots
+and surviving summary roots belong to publication, certificate, reader-lease and
+GC closure; protocol 80 fences readers that do not know these dependencies.
+
+Mixed exact aggregate cohorts keep independent maintenance capabilities. COUNT,
+integer SUM and indexed extrema update directly. Other accepted exact reducers,
+including NUMERIC SUM/AVG and boolean reducers, read a COW reduction tree instead
+of refolding every contribution in an affected group. A leaf covers 64 stable row
+ordinals; each ancestor folds at most sixteen ordered child summaries. The
+ordered fold preserves exact decimal scales, NULL state and first-row
+presentation. Changed groups repair only their reached leaves and ancestors.
+Legacy row state without summaries rebuilds once. The reduction root is
+versioned, authenticated and retained alongside the contribution, reverse and
+extrema roots. Query behavior and public source identity remain unchanged.
+
+Structural regressions bound merge input work independently of descriptor caps,
+exercise radix splits with one resident frame and exact duplicate/outer-join
+behavior, compare changed-term retractions with a complete native statistics
+oracle, and require a 257-row exact group update to inspect 64 contributions and
+five child summaries while the previous immutable root remains readable. These
+are local work bounds, not archive-scale latency or throughput measurements.

@@ -3835,3 +3835,10 @@ Reuse-aware posting publication also batches changed pack uploads and overlaps
 local capture under the same cancellation/admission contract as fresh builds.
 These paths preserve inline/full-construction fallbacks when optional work cannot
 be admitted. No archive-scale speedup is claimed without measurement.
+
+
+The protocol 80 refinement in [lake row identity](lake-row-identity.md#shared-spill-locality-and-bounded-reducer-maintenance-reader-protocol-80)
+adds descriptor-independent merge runs, adaptive paged join hash partitions,
+per-segment forward term evidence and bounded exact group reduction trees.
+Forward/statistics replacement metadata must survive file checkpoints, and GC
+must mark both new tree families before any corresponding publication is served.

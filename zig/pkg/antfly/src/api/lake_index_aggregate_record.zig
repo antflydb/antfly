@@ -153,9 +153,13 @@ pub fn encodeWithLayout(a: A, group: ops.GroupResult, layout: Layout) ![]u8 {
     defer a.free(keys);
     var bytes = try beginRecord(a, layout, keys);
     errdefer bytes.deinit(a);
+    var scratch = std.heap.ArenaAllocator.init(local.sql_memory_budget.reclaimingAllocator(a));
+    defer scratch.deinit();
     for (layout.slots, 0..) |slot, index| {
-        const state = try partial.read(a, group, index, slot.spec);
-        try writeCells(a, &bytes, slot, try partial.physicalCells(a, state), layout);
+        _ = scratch.reset(.free_all);
+        const work = scratch.allocator();
+        const state = try partial.read(work, group, index, slot.spec);
+        try writeCells(a, &bytes, slot, try partial.physicalCells(work, state), layout);
     }
     return finishRecord(a, &bytes);
 }

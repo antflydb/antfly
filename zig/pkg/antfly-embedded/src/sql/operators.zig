@@ -795,43 +795,36 @@ pub const HashJoin = struct {
     const PayloadCache = struct { block: *@import("spill.zig").Sequential.OwnedBlock, offset: u64 };
     const Buckets = struct {
         flat: []u64 = &.{},
-        paged: ?@import("execution_pager.zig").Array(u64) = null,
+        partitioned: ?@import("join_spill_index.zig").Index = null,
         len: usize = 0,
         fn init(a: Allocator, manager: *@import("spill.zig").Manager, count: usize) !Buckets {
             var result: Buckets = .{ .len = count };
             errdefer result.deinit(a);
             if (count >= 8192 and manager.page_residency_bytes >= @import("execution_pager.zig").page_bytes) {
-                result.paged = .{ .pager = try manager.pager() };
-                try result.paged.?.appendRepeated(@import("spill.zig").none, count);
+                result.partitioned = try @import("join_spill_index.zig").Index.init(manager);
             } else {
                 result.flat = try a.alloc(u64, count);
                 @memset(result.flat, @import("spill.zig").none);
             }
             return result;
         }
-        fn get(self: Buckets, index: usize) !u64 {
-            return if (self.paged) |array| try array.get(index) else self.flat[index];
+        fn get(self: *const Buckets, hash: u64) !u64 {
+            return if (self.partitioned) |*index| try index.get(hash) else self.flat[@intCast(hash & (self.len - 1))];
         }
-        fn set(self: Buckets, index: usize, value: u64) !void {
-            if (self.paged) |array| try array.set(index, value) else self.flat[index] = value;
+        fn set(self: *Buckets, hash: u64, value: u64) !void {
+            if (self.partitioned) |*index| try index.set(hash, value) else self.flat[@intCast(hash & (self.len - 1))] = value;
         }
-        fn seedProbes(self: Buckets, hashes: []const ?u64, probes: []Probe) !void {
+        fn seedProbes(self: *const Buckets, hashes: []const ?u64, probes: []Probe) !void {
             var begin: usize = 0;
             while (begin < hashes.len) {
                 const end = @min(hashes.len, begin + 128);
-                var indices: [128]usize = undefined;
-                var positions: [128]usize = undefined;
-                var values: [128]u64 = undefined;
-                var count: usize = 0;
-                for (hashes[begin..end], begin..) |hash, i| if (hash) |value| {
-                    indices[count] = value & (self.len - 1);
-                    positions[count] = i;
-                    count += 1;
-                };
-                if (self.paged) |array| try array.getMany(indices[0..count], values[0..count]) else {
-                    for (indices[0..count], values[0..count]) |index, *value| value.* = self.flat[index];
+                var values: [128]u64 = @splat(@import("spill.zig").none);
+                if (self.partitioned) |*index| try index.getMany(hashes[begin..end], values[0 .. end - begin]) else {
+                    for (hashes[begin..end], values[0 .. end - begin]) |hash, *value| if (hash) |key| {
+                        value.* = self.flat[@intCast(key & (self.len - 1))];
+                    };
                 }
-                for (values[0..count], positions[0..count]) |head, index| probes[index].cursor = if (head == @import("spill.zig").none) null else @intCast(head);
+                for (values[0 .. end - begin], probes[begin..end]) |head, *probe_| probe_.cursor = if (head == @import("spill.zig").none) null else @intCast(head);
                 begin = end;
             }
         }
@@ -839,7 +832,7 @@ pub const HashJoin = struct {
             return self.flat.len * @sizeOf(u64);
         }
         fn deinit(self: *Buckets, a: Allocator) void {
-            if (self.paged) |*array| array.deinit();
+            if (self.partitioned) |*index| index.deinit();
             a.free(self.flat);
         }
     };
@@ -1140,7 +1133,7 @@ pub const HashJoin = struct {
     /// One bounded producer cohort. Native rows share immutable payload pages;
     /// narrow rows keep the single-file path. Only page offsets and lane IDs
     /// enter key records, so source identities retire before the next pull.
-    fn writeDiskCohort(manager: *@import("spill.zig").Manager, file: *@import("spill.zig").File, payloads: *?*@import("spill.zig").JoinPayloads, heads: Buckets, values: @import("execution_batch.zig").Batch, keys: []const []const Datum, ordinal: usize, inline_budget: usize) !void {
+    fn writeDiskCohort(manager: *@import("spill.zig").Manager, file: *@import("spill.zig").File, payloads: *?*@import("spill.zig").JoinPayloads, heads: *Buckets, values: @import("execution_batch.zig").Batch, keys: []const []const Datum, ordinal: usize, inline_budget: usize) !void {
         const Payloads = @import("spill.zig").JoinPayloads;
         if (values.len() == 0 or values.len() > Payloads.page_rows or keys.len != values.len()) return error.InvalidSqlBackendResponse;
         if (ordinal >= native_payload_bit or values.len() > native_payload_bit - ordinal) return error.SqlProgramLimitExceeded;
@@ -1193,7 +1186,7 @@ pub const HashJoin = struct {
         for (keys, 0..) |key, row| {
             _ = row_scratch.reset(.{ .retain_with_limit = 8192 });
             const hashed = try keyHash(key);
-            const bucket = if (hashed) |hash| hash & (heads.len - 1) else 0;
+            const bucket = if (hashed) |hash| hash else 0;
             const link = if (hashed != null) try heads.get(bucket) else @import("spill.zig").none;
             const offset = if (native[row]) |id| blk: {
                 const ref = refs[id];
@@ -1223,7 +1216,7 @@ pub const HashJoin = struct {
             if (self.entries.items[ordinal].width != self.value_columns.columns.len) {
                 const values = try (Match{ .owner = self, .index = ordinal }).valuesBatch(a);
                 const keys = try self.key_columns.row(a, ordinal);
-                try writeDiskCohort(manager, &file, &payloads, heads, values, &.{keys}, ordinal, self.budget.limit -| heads.residentCharge());
+                try writeDiskCohort(manager, &file, &payloads, &heads, values, &.{keys}, ordinal, self.budget.limit -| heads.residentCharge());
                 ordinal += 1;
                 continue;
             }
@@ -1232,7 +1225,7 @@ pub const HashJoin = struct {
             const keys = try a.alloc([]const Datum, end - ordinal);
             for (keys, ordinal..) |*key, index| key.* = try self.key_columns.row(a, index);
             const values: @import("execution_batch.zig").Batch = .{ .retained = .{ .store = &self.value_columns, .begin = ordinal, .count = end - ordinal } };
-            try writeDiskCohort(manager, &file, &payloads, heads, values, keys, ordinal, self.budget.limit -| heads.residentCharge());
+            try writeDiskCohort(manager, &file, &payloads, &heads, values, keys, ordinal, self.budget.limit -| heads.residentCharge());
             ordinal = end;
         }
         self.value_columns.deinit();
@@ -1251,7 +1244,7 @@ pub const HashJoin = struct {
     fn appendDiskBatch(self: *HashJoin, values: @import("execution_batch.zig").Batch, keys: []const Datum) !void {
         if (keys.len > 256 or (self.key_count != null and self.key_count.? != keys.len)) return error.InvalidSqlBackendResponse;
         const hashed = try keyHash(keys);
-        const bucket = if (hashed) |value| value & (self.disk_heads.len - 1) else 0;
+        const bucket = if (hashed) |value| value else 0;
         const offset = try writeDiskRecord(self.limits.spill.?, &self.disk.?, &self.disk_values, values, keys, self.row_count, if (hashed != null) try self.disk_heads.get(bucket) else @import("spill.zig").none, self.budget.limit -| self.disk_heads.residentCharge());
         if (hashed != null) try self.disk_heads.set(bucket, offset);
         self.key_count = keys.len;
@@ -1397,7 +1390,7 @@ pub const HashJoin = struct {
                 for (positions, begin..) |*position, index| position.* = index;
                 const selected = try batch.select(region.allocator(), positions);
                 if (self.key_count != null and keys[begin].len != self.key_count.?) return error.InvalidSqlBackendResponse;
-                try writeDiskCohort(self.limits.spill.?, &self.disk.?, &self.disk_values, self.disk_heads, selected, keys[begin..end], self.row_count, self.budget.limit -| self.disk_heads.residentCharge());
+                try writeDiskCohort(self.limits.spill.?, &self.disk.?, &self.disk_values, &self.disk_heads, selected, keys[begin..end], self.row_count, self.budget.limit -| self.disk_heads.residentCharge());
                 self.key_count = keys[begin].len;
                 self.row_count += end - begin;
                 begin = end;
@@ -1447,7 +1440,7 @@ pub const HashJoin = struct {
         self.sealed = true;
         if (self.key_count != null and self.key_count.? != keys.len) return error.InvalidSqlBackendResponse;
         if (self.disk != null) {
-            const bucket = if (try keyHash(keys)) |hashed| try self.disk_heads.get(hashed & (self.disk_heads.len - 1)) else @import("spill.zig").none;
+            const bucket = if (try keyHash(keys)) |hashed| try self.disk_heads.get(hashed) else @import("spill.zig").none;
             return .{ .owner = self, .keys = keys, .cursor = if (bucket == @import("spill.zig").none) null else @intCast(bucket) };
         }
         return .{ .owner = self, .keys = keys, .cursor = if (try keyHash(keys)) |hashed| self.heads.get(hashed) else null };
@@ -3294,7 +3287,7 @@ test "SQL execution pager restores join buckets and grouped transitions through 
     const join = try HashJoin.create(a, .{ .bytes = 1024 * 1024, .spill = &manager });
     defer join.deinit();
     try join.startSpill();
-    try std.testing.expect(join.disk_heads.paged != null);
+    try std.testing.expect(join.disk_heads.partitioned != null);
     for (0..1500) |i| try join.add(&.{Datum.json(.{ .integer = @intCast(i + 100) })}, &.{Datum.json(.{ .integer = @intCast(i) })});
     const grouped = try Grouped.create(a, &.{ .{ .kind = .count }, .{ .kind = .sum, .input_type = .integer } }, .{ .bytes = 8 * 1024 * 1024, .spill = &manager });
     defer grouped.deinit();
@@ -5489,4 +5482,47 @@ test "SQL finalized aggregate streams bypass hash retention and fence ownership 
         try std.testing.expectError(error.SqlProgramLimitExceeded, group.nextResultBatch(page.allocator(), 2, false));
     }
     try std.testing.expectEqual(@as(usize, 1), source.closes);
+}
+
+test "SQL spilled joins reject full hash misses before decoding keys and preserve duplicate matches" {
+    const a = std.testing.allocator;
+    var marker: u8 = 0;
+    var manager: @import("spill.zig").Manager = .{ .alloc = a, .io = std.testing.io, .context = &marker, .checkpoint = struct {
+        fn check(_: *anyopaque) !void {}
+    }.check, .page_residency_bytes = 3 * @import("execution_pager.zig").page_bytes, .async_writes = false };
+    defer manager.deinit();
+    const join = try HashJoin.create(a, .{ .bytes = 1024 * 1024, .spill = &manager });
+    defer join.deinit();
+    try join.startSpill();
+    try std.testing.expect(join.disk_heads.partitioned != null);
+    for (0..1024) |i| try join.add(&.{Datum.json(.{ .integer = @intCast(i) })}, &.{Datum.json(.{ .integer = @intCast(i) })});
+    try join.add(&.{Datum.json(.{ .integer = 9001 })}, &.{Datum.json(.{ .integer = 17 })});
+    try join.add(&.{Datum.json(.{ .integer = 9002 })}, &.{Datum.json(.{ .integer = 17 })});
+    var cells: [129]Datum = undefined;
+    var keys: [129][]const Datum = undefined;
+    for (&cells, &keys, 0..) |*cell, *key, i| {
+        cell.* = Datum.json(.{ .integer = if (i == 128) 999999 else @intCast(i) });
+        key.* = @as([*]Datum, @ptrCast(cell))[0..1];
+    }
+    const probes = try join.probeBatch(a, &keys);
+    defer a.free(probes);
+    var matches: usize = 0;
+    for (probes, 0..) |*probe_, i| {
+        var count: usize = 0;
+        while (try probe_.next()) |match| {
+            var scratch = std.heap.ArenaAllocator.init(a);
+            defer scratch.deinit();
+            const value = (try match.materializeValues(scratch.allocator()))[0].value.integer;
+            try std.testing.expect(value == @as(i64, @intCast(i)) or (i == 17 and (value == 9001 or value == 9002)));
+            try join.markMatched(match.index);
+            count += 1;
+        }
+        try std.testing.expectEqual(@as(usize, if (i == 128) 0 else if (i == 17) 3 else 1), count);
+        matches += count;
+    }
+    try std.testing.expectEqual(@as(u64, @intCast(matches)), join.probes);
+    var next: usize = 0;
+    var unmatched: usize = 0;
+    while (try join.unmatched(&next)) |_| unmatched += 1;
+    try std.testing.expectEqual(@as(usize, 1024 - 128), unmatched);
 }

@@ -165,9 +165,13 @@ pub const Captured = struct {
     count: u64 = 0,
     sealed: bool = false,
     disabled: bool = false,
+    forward_sort: ?local.sql_spill.Sort = null,
+    forward_disabled: bool = false,
+    forward_budget: local.sql_memory_budget = undefined,
     pub fn create(a: A, manager: *local.sql_spill.Manager) !*Captured {
         const self = try a.create(Captured);
         self.* = .{ .a = a, .manager = manager };
+        self.forward_budget = .{ .backing = a, .limit = 4 * 1024 * 1024 };
         return self;
     }
     pub fn deinit(self: *Captured) void {
@@ -175,6 +179,7 @@ pub const Captured = struct {
         self.previous.deinit(self.a);
         for (self.fields.items) |field| self.a.free(field.name);
         self.fields.deinit(self.a);
+        if (self.forward_sort) |*sort| sort.deinit();
         self.a.destroy(self);
     }
     fn io(self: *Captured) !stores.IoGuard {
@@ -182,7 +187,49 @@ pub const Captured = struct {
         return .{ .phase = self.phase };
     }
     pub fn observer(self: *Captured) inverted.TermObserver {
-        return .{ .ptr = self, .begin = begin, .finish = finish };
+        return .{ .ptr = self, .begin = begin, .finish = finish, .posting = posting };
+    }
+    fn posting(raw: *anyopaque, doc: u32, frequency: u32) !void {
+        const self: *Captured = @ptrCast(@alignCast(raw));
+        if (self.disabled or self.forward_disabled) return;
+        self.recordPosting(doc, frequency) catch |err| switch (err) {
+            error.OutOfMemory, error.SqlProgramLimitExceeded => {
+                if (err == error.OutOfMemory and !self.forward_budget.isExhausted()) return err;
+                if (self.forward_sort) |*sort| sort.deinit();
+                self.forward_sort = null;
+                self.forward_disabled = true;
+            },
+            else => return err,
+        };
+    }
+    fn recordPosting(self: *Captured, doc: u32, frequency: u32) !void {
+        if (self.forward_sort == null) {
+            var sort = local.sql_spill.Sort.init(self.forward_budget.allocator(), self.manager, &.{.{}}, 512 * 1024);
+            sort.shared_runs = true;
+            sort.encoded_bytes = true;
+            sort.parallel_runs = false;
+            self.forward_sort = sort;
+        }
+        const term = self.term orelse return error.InvalidNativeLakeTextStatistics;
+        const field = self.fields.items[self.fields.items.len - 1].name;
+        const suffix = try keyAlloc(self.a, field, term);
+        defer self.a.free(suffix);
+        if (suffix.len + 4 > tree.max_key_bytes) return error.SqlProgramLimitExceeded;
+        const key = try self.a.alloc(u8, suffix.len + 4);
+        defer self.a.free(key);
+        std.mem.writeInt(u32, key[0..4], doc, .big);
+        @memcpy(key[4..], suffix);
+        var value: [4]u8 = undefined;
+        std.mem.writeInt(u32, &value, frequency, .big);
+        try self.forward_sort.?.add(.{ .keys = &.{local.sql_scalar.Datum.json(.{ .string = key })}, .values = &.{local.sql_scalar.Datum.json(.{ .string = &value })}, .ordinal = self.forward_sort.?.total });
+    }
+    pub fn publishForward(self: *Captured, store: *stores.ArtifactStore, token: Cancellation) !?Ref {
+        if (self.disabled or self.forward_disabled or self.forward_sort == null) return null;
+        return @import("lake_index_text_forward.zig").publish(self.forward_budget.allocator(), store, &self.forward_sort.?, token) catch |err| {
+            if (err != error.SqlProgramLimitExceeded and !(err == error.OutOfMemory and self.forward_budget.isExhausted())) return err;
+            self.forward_disabled = true;
+            return null;
+        };
     }
     fn discard(self: *Captured, err: anyerror) !void {
         switch (err) {
@@ -196,6 +243,9 @@ pub const Captured = struct {
                 for (self.fields.items) |field| self.a.free(field.name);
                 self.fields.deinit(self.a);
                 self.fields = .empty;
+                if (self.forward_sort) |*sort| sort.deinit();
+                self.forward_sort = null;
+                self.forward_disabled = true;
                 self.disabled = true;
             },
             else => return err,
@@ -544,14 +594,38 @@ pub const Builder = struct {
     point_seeks: u64 = 0,
     distinct_changes: u64 = 0,
     durable: ?@import("lake_index_delta_runs.zig").Forest = null,
+    replaced: std.AutoHashMapUnmanaged([32]u8, usize) = .empty,
+    pub fn replace(self: *Builder, storage: tree.Store, previous: ?Ref, current: ?Ref) !void {
+        const Visitor = struct {
+            owner: *Builder,
+            pub fn change(v: *@This(), before: ?tree.Cursor.Record, after: ?tree.Cursor.Record) !void {
+                if (before) |row| try v.owner.addRecord(row, -1);
+                if (after) |row| try v.owner.addRecord(row, 1);
+            }
+        };
+        var visitor: Visitor = .{ .owner = self };
+        try tree.visitDifferences(self.a, storage, previous, current, &visitor);
+        if (previous) |ref| {
+            const slot = try self.replaced.getOrPut(self.a, ref.digest);
+            if (!slot.found_existing) slot.value_ptr.* = 0;
+            slot.value_ptr.* += 1;
+        }
+    }
     pub fn init(a: A, manager: *local.sql_spill.Manager) Builder {
         return .{ .a = a, .sort = local.sql_spill.Sort.init(a, manager, &.{.{}}, 4 * 1024 * 1024) };
     }
     pub fn deinit(self: *Builder) void {
         self.sort.deinit();
+        self.replaced.deinit(self.a);
     }
     pub fn add(self: *Builder, store: tree.Store, root: ?Ref, sign: i64) !void {
         if (sign != 1 and sign != -1) return error.InvalidNativeLakeTextStatistics;
+        if (sign == -1) if (root) |ref| if (self.replaced.getPtr(ref.digest)) |count| {
+            if (count.* != 0) {
+                count.* -= 1;
+                return;
+            }
+        };
         var cursor = try tree.Cursor.init(self.a, store, root, "", null);
         defer cursor.deinit();
         while (try cursor.next()) |record| try self.addRecord(record, sign);

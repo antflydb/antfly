@@ -323,6 +323,8 @@ pub const RowState = struct {
     /// Version distinguishes an indexed all-NULL cohort from legacy state.
     extrema_version: u8 = 0,
     extrema: ?state_tree.tree.Ref = null,
+    reductions_version: u8 = 0,
+    reductions: ?state_tree.tree.Ref = null,
 };
 pub const LeafReferences = struct { blocks: []const ChunkRef, key_index: ?ordered_keys.Index, state_tree: ?state_tree.Index, row_state: ?RowState = null };
 pub fn leafReferences(a: A, store: stores.ArtifactStore, artifact: Ref, cancellation: Cancellation) !LeafReferences {
@@ -689,6 +691,8 @@ fn validateRoot(artifact: Ref, root: Root) !void {
             if (rows.reverse) |page| try page.validate();
             if (rows.extrema_version > 1 or (rows.extrema_version == 0 and rows.extrema != null)) return error.InvalidNativeAggregateArtifact;
             if (rows.extrema) |page| try page.validate();
+            if (rows.reductions_version > 1 or (rows.reductions_version == 0 and rows.reductions != null)) return error.InvalidNativeAggregateArtifact;
+            if (rows.reductions) |page| try page.validate();
             if ((if (rows.rows) |page| page.records else 0) != (if (rows.reverse) |page| page.records else 0)) return error.InvalidNativeAggregateArtifact;
         }
         return;
