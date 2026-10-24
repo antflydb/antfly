@@ -24158,7 +24158,7 @@ test "linear merge HTTP accepts scoped media and rejects an out of range mutatio
     };
     const a = std.testing.allocator;
     var fixture = Fixture{};
-    var status = SchemaUpdateStatusSource{};
+    var status = SchemaUpdateStatusSource{ .schema_allocator = a };
     var api_server = ApiHttpServer.init(a, .{}, status.iface(), fixture.reads(), fixture.writes());
     defer api_server.deinit();
     var server: HttpxE2eServer = undefined;
