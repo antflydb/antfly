@@ -132,7 +132,8 @@ pub const GroupProgress = struct {
     config_generation: u64 = 0,
     effective_generation: u64 = 0,
     backfill_pending: bool = true,
-    // A private owner proof, never inferred from an absent runtime snapshot.
+    // Private owner proofs, never inferred from absent runtime snapshots.
+    retired: bool = false,
     empty: bool = false,
     resolution: types.ReplayStageStats = .{},
     promotion: types.ReplayStageStats = .{},
@@ -140,7 +141,7 @@ pub const GroupProgress = struct {
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
         inline for (@typeInfo(@This()).@"struct".field_names) |name| {
-            if (comptime std.mem.eql(u8, name, "empty") or std.mem.eql(u8, name, "namespace_curation_generation") or std.mem.eql(u8, name, "namespace_curation_table_id") or std.mem.eql(u8, name, "namespace_curation_missing")) continue;
+            if (comptime std.mem.eql(u8, name, "retired") or std.mem.eql(u8, name, "empty") or std.mem.eql(u8, name, "namespace_curation_generation") or std.mem.eql(u8, name, "namespace_curation_table_id") or std.mem.eql(u8, name, "namespace_curation_missing")) continue;
             try jw.objectField(name);
             try jw.write(@field(self, name));
         }
@@ -166,7 +167,12 @@ const ReplayRequirement = struct {
         const revision = if (self.target.authority_table_id != 0) row.namespace_curation_generation else row.curation_revision;
         if (self.target.authority_table_id != 0 and (row.namespace_curation_missing != self.target.authority_missing or row.namespace_curation_table_id != self.target.authority_table_id)) return false;
         if (!row.available or !row.fresh or revision < self.revision or
-            row.config_generation < self.target.config_generation or row.backfill_pending or
+            row.config_generation < self.target.config_generation) return false;
+        // A retired identity has no execution workers. Only a current owner's
+        // acknowledgement at the required namespace/config cut is terminal;
+        // retirement cannot stand in for an explicit source-journal watermark.
+        if (row.retired and self.floor == null) return true;
+        if (row.backfill_pending or
             !curation.stageApplied(row.resolution, row.empty) or
             (self.target.promote and !curation.stageApplied(row.promotion, row.empty))) return false;
         if (self.floor) |floor| if (row.group_id == floor.group) {
@@ -332,6 +338,7 @@ fn mergeOwnerProgress(a: std.mem.Allocator, result: *Sample, group: u64, report:
             .effective_generation = row.effective_generation,
             .backfill_pending = row.backfill_pending,
             .empty = row.empty,
+            .retired = row.retired,
             .resolution = row.resolution,
             .promotion = row.promotion,
         });
@@ -661,6 +668,18 @@ fn entityEffectiveAliases(a: std.mem.Allocator, namespace: curation.Namespace, p
     return native_authority.records.effectiveAliases(a, namespace, profiles, key, into);
 }
 
+/// Scoped consumer rows already contain the selected admission descriptors.
+/// Only the compatibility table cut needs name membership filtering.
+fn consumerAdmissionConfigs(a: std.mem.Allocator, consumer: @import("../metadata/resolver_catalog_read.zig").Consumer) ![]const Config {
+    if (consumer.configs) |selected| return selected;
+    var names: std.StringHashMapUnmanaged(void) = .empty;
+    defer names.deinit(a);
+    for (consumer.names) |name| try names.put(a, name, {});
+    var selected: std.ArrayList(Config) = .empty;
+    for (try configs(a, consumer.table.indexes_json)) |cfg| if (names.contains(cfg.name)) try selected.append(a, cfg);
+    return selected.toOwnedSlice(a);
+}
+
 /// Both passes read the same revision-fenced catalog cut. A page arena owns
 /// transport bytes, table schemas and parsed configs; callbacks retain only
 /// output identities or the folded namespace policy.
@@ -684,15 +703,12 @@ fn scanEntityConsumers(server: anytype, owner: std.mem.Allocator, snapshot: anyt
             var source_reads: std.ArrayList([]const u8) = .empty;
             for (page.consumers) |consumer| {
                 var needs_source_read = false;
-                for (consumer.configs orelse try configs(scratch, consumer.table.indexes_json)) |cfg| {
-                    for (consumer.names) |name| if (std.mem.eql(u8, cfg.name, name)) {
-                        const identity = try std.json.Stringify.valueAlloc(scratch, .{ consumer.table.table_id, cfg.name }, .{});
-                        if (seen.contains(identity)) break;
-                        try seen.put(owner, try owner.dupe(u8, identity), {});
-                        needs_source_read = needs_source_read or !namespaceAdopted(stored, cfg.key_template);
-                        try pending.append(scratch, .{ .source_name = consumer.table.name, .config = cfg });
-                        break;
-                    };
+                for (try consumerAdmissionConfigs(scratch, consumer)) |cfg| {
+                    const identity = try std.json.Stringify.valueAlloc(scratch, .{ consumer.table.table_id, cfg.name }, .{});
+                    if (seen.contains(identity)) continue;
+                    try seen.put(owner, try owner.dupe(u8, identity), {});
+                    needs_source_read = needs_source_read or !namespaceAdopted(stored, cfg.key_template);
+                    try pending.append(scratch, .{ .source_name = consumer.table.name, .config = cfg });
                 }
                 if (needs_source_read) try source_reads.append(scratch, consumer.table.name);
             }
@@ -1894,4 +1910,65 @@ test "resolver curation HTTP streaming adoption owns distinct policy pages" {
     try std.testing.expectEqualStrings("owner-0", namespace.state.suppress.entries[0].origin.actor);
     try std.testing.expectEqual(@as(u64, 5000), namespace.revision);
     try std.testing.expectEqual(@as(?u64, 12), namespace.adoption_revision);
+}
+
+test "resolver curation progress retired owners acknowledge only the fenced namespace cut" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var sample_state: Sample = .{};
+    try sample_state.groups.put(a, 7, {});
+    var row: curation.ProgressRow = .{ .name = "retired", .retired = true, .config_generation = 9, .effective_generation = 9, .curation_revision = 2, .namespace_curation_generation = 6, .namespace_curation_table_id = 42, .backfill_pending = true, .resolution = .{}, .promotion = .{} };
+    const target: ObservationTarget = .{ .name = "retired", .config_generation = 9, .promote = true, .authority_table_id = 42 };
+    const required: ReplayRequirement = .{ .target = target, .revision = 6, .floor = null };
+    try std.testing.expect(!(try sample_state.progressForReplay(a, required)).applied);
+    try mergeOwnerProgress(a, &sample_state, 7, .{ .resolvers = &.{row} });
+    try std.testing.expect((try sample_state.progressForReplay(a, required)).applied);
+    var advanced = required;
+    advanced.revision = 7;
+    try std.testing.expect(!(try sample_state.progressForReplay(a, advanced)).applied);
+    advanced = required;
+    advanced.target.config_generation = 10;
+    try std.testing.expect(!(try sample_state.progressForReplay(a, advanced)).applied);
+    advanced = required;
+    advanced.target.authority_table_id = 43;
+    try std.testing.expect(!(try sample_state.progressForReplay(a, advanced)).applied);
+    advanced = required;
+    advanced.floor = .{ .group = 7, .sequence = 1 };
+    try std.testing.expect(!(try sample_state.progressForReplay(a, advanced)).applied);
+    row.namespace_curation_missing = true;
+    try mergeOwnerProgress(a, &sample_state, 7, .{ .resolvers = &.{row} });
+    try std.testing.expect(!(try sample_state.progressForReplay(a, required)).applied);
+    row.namespace_curation_missing = false;
+    row.retired = false;
+    try mergeOwnerProgress(a, &sample_state, 7, .{ .resolvers = &.{row} });
+    try std.testing.expect(!(try sample_state.progressForReplay(a, required)).applied);
+    row.retired = true;
+    try mergeOwnerProgress(a, &sample_state, 7, .{ .resolvers = &.{row} });
+    sample_state.observations.getPtr("retired").?.getPtr(7).?.fresh = false;
+    try std.testing.expect(!(try sample_state.progressForReplay(a, required)).applied);
+}
+
+test "resolver curation HTTP dense consumer admission is linear and scoped cuts allocate nothing" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const definitions = try a.alloc(Config, 10000);
+    const names = try a.alloc([]const u8, definitions.len);
+    for (definitions, 0..) |*cfg, i| cfg.* = .{ .name = try std.fmt.allocPrint(a, "r-{d}", .{i}), .table = "entities", .source_artifact = "kg", .resolution_artifact = "resolved", .key_template = "concept/{{_key}}", .promote = false };
+    for (names, 0..) |*name, i| name.* = definitions[definitions.len - 1 - i].name;
+    const Consumer = @import("../metadata/resolver_catalog_read.zig").Consumer;
+    var consumer: Consumer = .{ .table = .{ .table_id = 1, .name = "dense" }, .names = names, .configs = definitions };
+    var no_space: [0]u8 = .{};
+    var bounded = std.heap.FixedBufferAllocator.init(&no_space);
+    const scoped = try consumerAdmissionConfigs(bounded.allocator(), consumer);
+    try std.testing.expectEqual(definitions.ptr, scoped.ptr);
+    try std.testing.expectEqual(@as(usize, 10000), scoped.len);
+    consumer.configs = null;
+    consumer.table.indexes_json = try std.json.Stringify.valueAlloc(a, .{ .resolvers = definitions }, .{});
+    consumer.names = names[0..5000];
+    const legacy = try consumerAdmissionConfigs(a, consumer);
+    try std.testing.expectEqual(@as(usize, 5000), legacy.len);
+    try std.testing.expectEqualStrings("r-5000", legacy[0].name);
+    try std.testing.expectEqualStrings("r-9999", legacy[legacy.len - 1].name);
 }

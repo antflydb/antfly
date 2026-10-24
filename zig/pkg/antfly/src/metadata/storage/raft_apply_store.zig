@@ -23491,11 +23491,7 @@ pub const RaftApplyStore = struct {
             const path = try std.fmt.allocPrint(a, "{s}{x:0>16}", .{ try namespaceConsumerPrefix(a, target, original.key_template), record.table_id });
             const entry = try entries.getOrPut(a, path);
             if (!entry.found_existing) entry.value_ptr.* = .{ .root = target, .template = original.key_template };
-            var cfg = original;
-            if (owned_names.contains(cfg.name)) {
-                cfg.merges = &.{};
-                cfg.curation_json = "{}";
-            }
+            const cfg = @import("antfly_local_sources").storage_db_catalog_resolver_catalog.ResolverAdmission.fromConfig(original, owned_names.contains(original.name)).config();
             try entry.value_ptr.configs.append(a, cfg);
         }
         return entries;
@@ -40500,8 +40496,13 @@ test "resolver curation namespace propagation scoped discovery excludes ten thou
         errdefer txn.abort();
         try RaftApplyStore.synchronizeNamespaceConsumersTxn(a, &txn, group, multi, multi);
         try std.testing.expectEqual(@as(usize, 0), RaftApplyStore.test_resolver_consumer_puts.load(.monotonic));
+        // Execution-only edits do not rewrite admission postings.
         configs[0].min_confidence = 0.5;
         var changed = multi;
+        changed.indexes_json = try std.json.Stringify.valueAlloc(a, .{ .resolvers = configs }, .{});
+        try RaftApplyStore.synchronizeNamespaceConsumersTxn(a, &txn, group, multi, changed);
+        try std.testing.expectEqual(@as(usize, 0), RaftApplyStore.test_resolver_consumer_puts.load(.monotonic));
+        configs[0].config_generation += 1;
         changed.indexes_json = try std.json.Stringify.valueAlloc(a, .{ .resolvers = configs }, .{});
         try RaftApplyStore.synchronizeNamespaceConsumersTxn(a, &txn, group, multi, changed);
         try std.testing.expectEqual(@as(usize, 1), RaftApplyStore.test_resolver_consumer_puts.load(.monotonic));

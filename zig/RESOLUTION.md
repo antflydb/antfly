@@ -2136,3 +2136,32 @@ ordinary reconciliation or bounded bootstrap. Dependency maintenance caches
 logical destination resolution per source cut, so repeated declarations do not
 reparse the same destination catalog. Legacy read-only inspection also uses the
 shared streaming union before a namespace has been adopted.
+
+
+### Curation admission and retirement observations
+
+Entity consumer discovery uses the shared native `ResolverAdmission` contract.
+It retains identity, namespace, static aliases and suppression, publication
+clocks, promotion/retirement flags, and legacy policy only until adoption. It
+excludes extraction artifacts, scorer/adjudicator prompts, provider configuration,
+and embedding selectors. Embedded consumers clone that contract; private routed
+consumer rows serialize the same fields. Empty artifact fields preserve existing
+private `ResolverConfig` wire decoders, but admission descriptors must never be
+used as execution definitions. Reconciliation and query execution continue to
+load their complete selected execution contracts.
+
+Scoped consumer rows are already selected and are consumed directly. Legacy
+whole-source rows use a name-membership set, so a dense source with R resolvers
+costs O(R) selection work. Named review/curation reads select one catalog identity
+before cloning policy; review admission still excludes retired and private
+replacement streams.
+
+A named owner progress probe may acknowledge a retained retired resolver, while
+an unselected public progress listing continues to enumerate active resolvers.
+Retirement is a private owner proof, not an inference from missing heartbeat
+rows or a client flag. An acknowledgement is terminal only after the current
+owner reports the required config generation, curation generation, physical
+authority incarnation and missing-authority state. Retired identities have no
+replay workers, so unrelated live-worker backlog cannot hold entity curation
+pending. Retirement never substitutes for an explicit source-journal watermark;
+those waits still require their sequence proof.

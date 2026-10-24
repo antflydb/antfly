@@ -298,6 +298,55 @@ pub const ResolverObservation = struct {
     }
 };
 
+/// Shared curation admission contract. These fields suffice to fold legacy
+/// namespace policy, retain static declarations and fence owner publication.
+/// Execution prompts, providers, artifacts and embedding selectors never travel
+/// with an entity consumer. Empty artifact fields keep the private wire shape
+/// readable by existing ResolverConfig decoders; this is not executable config.
+pub const ResolverAdmission = struct {
+    name: []const u8,
+    table: []const u8,
+    key_template: []const u8,
+    source_artifact: []const u8 = "",
+    resolution_artifact: []const u8 = "",
+    aliases: []const resolver_lib.KeyAlias = &.{},
+    suppress_json: []const u8 = "",
+    merges: []const resolver_lib.KeyAlias = &.{},
+    curation_json: []const u8 = "{}",
+    merge_generation: u64 = 0,
+    merge_state_version: u32 = 0,
+    resolution_generation: u64 = 0,
+    namespace_generation: u64 = 0,
+    config_generation: u64 = 0,
+    curation_revision: u64 = 0,
+    namespace_curation_generation: u64 = 0,
+    namespace_curation_table_id: u64 = 0,
+    namespace_curation_missing: bool = false,
+    retired: bool = false,
+    promote: bool = true,
+
+    pub fn fromConfig(cfg: ResolverConfig, namespace_owned: bool) ResolverAdmission {
+        var result: ResolverAdmission = .{ .name = cfg.name, .table = cfg.table, .key_template = cfg.key_template };
+        inline for (@typeInfo(ResolverAdmission).@"struct".field_names) |field| {
+            if (comptime !std.mem.eql(u8, field, "source_artifact") and !std.mem.eql(u8, field, "resolution_artifact")) @field(result, field) = @field(cfg, field);
+        }
+        if (namespace_owned) {
+            result.merges = &.{};
+            result.curation_json = "{}";
+        }
+        return result;
+    }
+    /// Borrowed adapter for policy helpers shared with resolver execution.
+    pub fn config(self: ResolverAdmission) ResolverConfig {
+        var result: ResolverConfig = .{ .name = self.name, .table = self.table, .key_template = self.key_template, .source_artifact = "", .resolution_artifact = "" };
+        inline for (@typeInfo(ResolverAdmission).@"struct".field_names) |field| @field(result, field) = @field(self, field);
+        return result;
+    }
+    pub fn cloneConfig(a: Allocator, cfg: ResolverConfig, namespace_owned: bool) !ResolverConfig {
+        return ResolverConfig.clone(a, fromConfig(cfg, namespace_owned).config());
+    }
+};
+
 const ResolverConfigField = std.meta.FieldEnum(ResolverConfig);
 
 pub const ResolverConfig = struct {

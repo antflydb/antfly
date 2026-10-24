@@ -85,7 +85,7 @@ fn consumers(root: *h.Handle, a: A, table: []const u8, key: []const u8) ![]const
     for (bindings.items) |binding| {
         if (binding.source_id != 0 and root.embedded_table_records.get(binding.source) != binding.source_id) continue;
         const source = try tables.get(root, binding.source);
-        const cfg = try source.core.index_manager.resolverStaticDescriptor(a, binding.resolver) orelse continue;
+        const cfg = try source.core.index_manager.resolverAdmissionDescriptor(a, binding.resolver, true) orelse continue;
         if (!std.mem.eql(u8, cfg.table, table) or !std.mem.eql(u8, cfg.key_template, binding.key_template)) return error.ResolverCurationConflict;
         try result.append(a, .{ .db = source, .source = binding.source, .cfg = cfg });
     }
@@ -95,9 +95,9 @@ fn legacyConsumers(root: *h.Handle, a: A, table: []const u8, key: []const u8) ![
     try tables.load(root);
     var result: std.ArrayList(Consumer) = .empty;
     var sources = root.embedded_tables.iterator();
-    const defaults = try root.db.core.index_manager.listResolverStaticDescriptors(a);
+    const defaults = try root.db.core.index_manager.listResolverAdmissionDescriptors(a);
     for (defaults) |cfg| if (std.mem.eql(u8, cfg.table, table) and policy.keyInNamespace(cfg.key_template, key)) try result.append(a, .{ .db = &root.db, .source = "default", .cfg = cfg });
-    while (sources.next()) |source| for (try source.value_ptr.*.db.core.index_manager.listResolverStaticDescriptors(a)) |cfg| {
+    while (sources.next()) |source| for (try source.value_ptr.*.db.core.index_manager.listResolverAdmissionDescriptors(a)) |cfg| {
         if (std.mem.eql(u8, cfg.table, table) and policy.keyInNamespace(cfg.key_template, key)) try result.append(a, .{ .db = &source.value_ptr.*.db, .source = source.key_ptr.*, .cfg = cfg });
     };
     return result.items;
@@ -142,7 +142,7 @@ fn prepareAdoption(a: A, destination: *h.db_mod.DB, selected: []const Consumer) 
         if (source.synthetic or try store.head(source.cfg.key_template) != null) continue;
         const fence = try sources.getOrPut(a, source.db);
         if (!fence.found_existing) fence.value_ptr.* = source.db.core.index_manager.write_plan_generation.load(.acquire);
-        const cfg = try source.db.core.index_manager.resolverDescriptor(a, source.cfg.name, false) orelse return error.ResolverCurationConflict;
+        const cfg = try source.db.core.index_manager.resolverAdmissionDescriptor(a, source.cfg.name, false) orelse return error.ResolverCurationConflict;
         if (cfg.config_generation != source.cfg.config_generation or cfg.retired != source.cfg.retired or !std.mem.eql(u8, cfg.table, source.cfg.table) or !std.mem.eql(u8, cfg.key_template, source.cfg.key_template)) return error.ResolverCurationConflict;
         const profile = try json(a, .{ cfg.key_template, cfg.merges, cfg.curation_json, cfg.curation_revision });
         if ((try profiles.getOrPut(a, profile)).found_existing) continue;
@@ -177,7 +177,7 @@ fn inspectionScope(a: A, store: native.Store, selected: []const Consumer, source
     var builder: policy.NamespaceBuilder = .{ .template = source.cfg.key_template };
     for (selected) |consumer| {
         if (consumer.synthetic or !std.mem.eql(u8, consumer.cfg.key_template, source.cfg.key_template)) continue;
-        const cfg = try consumer.db.core.index_manager.resolverDescriptor(a, consumer.cfg.name, false) orelse return error.ResolverCurationConflict;
+        const cfg = try consumer.db.core.index_manager.resolverAdmissionDescriptor(a, consumer.cfg.name, false) orelse return error.ResolverCurationConflict;
         try builder.add(a, a, cfg);
     }
     const namespace = try builder.finish(a);
@@ -599,7 +599,7 @@ pub fn pullProjection(root: *h.Handle, database: *h.db_mod.DB, a: A) !bool {
     return true;
 }
 fn legacyPullProjection(root: *h.Handle, database: *h.db_mod.DB, a: A) !bool {
-    const configs = try database.core.index_manager.listResolverStaticDescriptors(a);
+    const configs = try database.core.index_manager.listResolverAdmissionDescriptors(a);
     for (configs) |cfg| {
         const desired = (try projection(root, a, cfg)) orelse continue;
         if (!desired.changed) continue;
@@ -656,7 +656,7 @@ pub fn hasProjectionDebt(root: *h.Handle, database: *h.db_mod.DB, a: A) !bool {
         var bridge: Bridge = .{ .txn = &read };
         return (try bridge.store(a, "").backend.scan(&bridge, a, @import("../storage/lite/resolver_consumers.zig").work_prefix, null, 1)).rows.len != 0;
     }
-    for (try database.core.index_manager.listResolverStaticDescriptors(a)) |cfg| if (try projection(root, a, cfg)) |desired| {
+    for (try database.core.index_manager.listResolverAdmissionDescriptors(a)) |cfg| if (try projection(root, a, cfg)) |desired| {
         if (desired.changed) return true;
     };
     return false;

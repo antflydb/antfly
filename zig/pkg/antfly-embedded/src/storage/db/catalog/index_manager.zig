@@ -13293,6 +13293,12 @@ pub const IndexManager = struct {
     /// Admission needs static policy and generation identities, never a copy of
     /// every destination-owned correction or its receipts.
     pub fn listResolverStaticDescriptors(self: *IndexManager, alloc: Allocator) ![]ResolverConfig {
+        return self.listResolverDescriptors(alloc, false);
+    }
+    pub fn listResolverAdmissionDescriptors(self: *IndexManager, alloc: Allocator) ![]ResolverConfig {
+        return self.listResolverDescriptors(alloc, true);
+    }
+    fn listResolverDescriptors(self: *IndexManager, alloc: Allocator, admission_only: bool) ![]ResolverConfig {
         self.catalog_mutex.lockShared();
         defer self.catalog_mutex.unlockShared();
         const definitions = try self.resolverDefinitionsAlloc(alloc);
@@ -13307,7 +13313,7 @@ pub const IndexManager = struct {
             var cfg = definition;
             cfg.merges = &.{};
             cfg.curation_json = "{}";
-            try result.append(alloc, try ResolverConfig.clone(alloc, cfg));
+            try result.append(alloc, if (admission_only) try resolver_catalog.ResolverAdmission.cloneConfig(alloc, cfg, true) else try ResolverConfig.clone(alloc, cfg));
         }
         return result.toOwnedSlice(alloc);
     }
@@ -13315,7 +13321,8 @@ pub const IndexManager = struct {
     pub fn resolverObservationDescriptors(self: *IndexManager, alloc: Allocator, names: []const []const u8) ![]resolver_catalog.ResolverObservation {
         return self.resolverScalarDescriptors(alloc, names, false);
     }
-    /// null requests all public active identities; an empty set requests none.
+    /// null requests all public active identities; explicit names also acknowledge
+    /// retained retired identities. An empty set requests none.
     pub fn resolverProgressDescriptors(self: *IndexManager, alloc: Allocator, names: ?[]const []const u8) ![]resolver_catalog.ResolverObservation {
         return self.resolverScalarDescriptors(alloc, names, true);
     }
@@ -13335,7 +13342,7 @@ pub const IndexManager = struct {
                 if ((try seen.getOrPut(alloc, name)).found_existing) continue;
                 const slot = self.resolver_namespace_lookup.?.names.get(name) orelse continue;
                 const cfg = if (slot.retired) self.retired_resolvers.items[slot.index] else self.resolvers.items[slot.index];
-                if (public_only and (cfg.retired or cfg.replacement_index.len > 0)) continue;
+                if (public_only and cfg.replacement_index.len > 0) continue;
                 var owned = try resolver_catalog.ResolverObservation.fromConfig(alloc, cfg);
                 errdefer owned.deinit(alloc);
                 try result.append(alloc, owned);
@@ -13363,6 +13370,26 @@ pub const IndexManager = struct {
             cfg.merges = &.{};
             cfg.curation_json = "{}";
         }
+        return try ResolverConfig.clone(alloc, cfg);
+    }
+    pub fn resolverAdmissionDescriptor(self: *IndexManager, alloc: Allocator, name: []const u8, namespace_owned: bool) !?ResolverConfig {
+        self.catalog_mutex.lockExclusive();
+        defer self.catalog_mutex.unlockExclusive();
+        try self.ensureResolverLookup();
+        const slot = self.resolver_namespace_lookup.?.names.get(name) orelse return null;
+        const cfg = if (slot.retired) self.retired_resolvers.items[slot.index] else self.resolvers.items[slot.index];
+        return try resolver_catalog.ResolverAdmission.cloneConfig(alloc, cfg, namespace_owned);
+    }
+    /// One public active execution definition, with visibility checked before
+    /// cloning any policy. Reviews must never select a retired/private stream.
+    pub fn resolverPublicDescriptor(self: *IndexManager, alloc: Allocator, name: []const u8) !?ResolverConfig {
+        self.catalog_mutex.lockExclusive();
+        defer self.catalog_mutex.unlockExclusive();
+        try self.ensureResolverLookup();
+        const slot = self.resolver_namespace_lookup.?.names.get(name) orelse return null;
+        if (slot.retired) return null;
+        const cfg = self.resolvers.items[slot.index];
+        if (cfg.replacement_index.len > 0) return null;
         return try ResolverConfig.clone(alloc, cfg);
     }
     pub fn resolverStaticDescriptor(self: *IndexManager, alloc: Allocator, name: []const u8) !?ResolverConfig {
