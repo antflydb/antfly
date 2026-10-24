@@ -2340,6 +2340,8 @@ const Parser = struct {
         if (self.keyword(.explain)) {
             var format: @FieldType(@FieldType(ast.Statement, "explain"), "format") = .text;
             var verbose = false;
+            var analyze = self.keyword(.analyze);
+            var costs = false;
             if (self.take(.lparen)) {
                 while (true) {
                     if (self.keyword(.format)) {
@@ -2349,21 +2351,26 @@ const Parser = struct {
                         if (self.keyword(.off)) return self.fail(error.UnsupportedSqlShape, "EXPLAIN VERBOSE OFF is not supported");
                         _ = self.keyword(.on);
                         verbose = true;
+                    } else if (self.keyword(.analyze)) {
+                        analyze = !self.keyword(.off);
+                        _ = self.keyword(.on);
                     } else if (self.keyword(.costs)) {
-                        if (!self.keyword(.off)) return self.fail(error.UnsupportedSqlShape, "EXPLAIN has no cost model; use COSTS OFF");
+                        costs = !self.keyword(.off);
+                        _ = self.keyword(.on);
                     } else return self.fail(error.UnsupportedSqlShape, "unsupported EXPLAIN option");
                     if (!self.take(.comma)) break;
                 }
                 try self.expect(.rparen);
             }
-            if (self.keyword(.analyze)) return self.fail(error.UnsupportedSqlShape, "EXPLAIN ANALYZE requires instrumented execution");
+            if (self.keyword(.analyze)) analyze = true;
+            if (analyze and costs) return self.fail(error.UnsupportedSqlShape, "ANALYZE and COSTS require separate statements and snapshot scopes");
             const inner = try self.alloc.create(ast.Statement);
             inner.* = try self.statement();
             switch (inner.*) {
                 .select, .insert, .update, .delete, .merge => {},
                 else => return self.fail(error.UnsupportedSqlShape, "EXPLAIN requires a supported query or mutation"),
             }
-            return .{ .explain = .{ .statement = inner, .format = format, .verbose = verbose } };
+            return .{ .explain = .{ .statement = inner, .format = format, .verbose = verbose, .analyze = analyze, .costs = costs } };
         }
         if (self.keyword(.truncate)) {
             _ = self.keyword(.table);

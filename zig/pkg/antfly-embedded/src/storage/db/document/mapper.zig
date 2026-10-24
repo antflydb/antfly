@@ -936,6 +936,27 @@ pub const TextProjectionBatch = struct {
     observed_field_analyzers: []const ObservedFieldAnalyzer = &.{},
 };
 
+/// Bind projected vectors once per producer batch. Payload views borrow the
+/// producer or its ColumnOwner; selected text fields need no per-row object.
+pub const TextColumnProjection = struct {
+    batch: @import("../../rowsource/types.zig").ColumnBatch,
+    paths: []const []const u8,
+    columns: []const ?@import("../../rowsource/types.zig").ColumnVector,
+    pub fn bind(a: Allocator, batch_: @import("../../rowsource/types.zig").ColumnBatch, paths: []const []const u8) !TextColumnProjection {
+        const columns = try a.alloc(?@import("../../rowsource/types.zig").ColumnVector, paths.len);
+        for (columns, paths) |*column, path| column.* = batch_.findColumn(path);
+        return .{ .batch = batch_, .paths = paths, .columns = columns };
+    }
+    fn value(self: TextColumnProjection, a: Allocator, row: usize, index: usize) !std.json.Value {
+        if (row >= self.batch.rowCount()) return error.InvalidSqlBackendResponse;
+        if (std.mem.eql(u8, self.paths[index], "_id")) return .{ .string = try @import("../../rowsource/identity.zig").allocId(a, self.batch.rowRef(row)) };
+        const column = self.columns[index] orelse return .null;
+        if (column.nulls.isNull(row)) return .null;
+        if (column.values == .vector_f32) return error.UnsupportedSqlExecution;
+        return column.values.jsonAt(a, row);
+    }
+};
+
 pub const TextProjectionBatchBuilder = struct {
     arena: Allocator,
     text_analysis: introducer_mod.TextAnalysisConfig,
@@ -1026,6 +1047,39 @@ pub const TextProjectionBatchBuilder = struct {
         });
     }
 
+    /// Borrow only under a retained column lease. Otherwise promote source
+    /// values to the builder arena. Stored projections always own their tree.
+    pub fn appendColumnRow(self: *TextProjectionBatchBuilder, projection: TextColumnProjection, row: usize, key: []const u8, store_source: bool, borrowed: bool) !usize {
+        var input_bytes: usize = key.len + 128;
+        if (self.selected_field) |field| if (!store_source) {
+            const index = for (projection.paths, 0..) |path, i| {
+                if (std.mem.eql(u8, path, field)) break i;
+            } else return input_bytes;
+            const raw = try projection.value(self.arena, row, index);
+            const value = if (borrowed) raw else try cloneJsonValue(self.arena, raw);
+            var values: std.ArrayListUnmanaged([]const u8) = .empty;
+            try collectFieldValues(self.arena, &values, value, "");
+            var fields: std.ArrayListUnmanaged(introducer_mod.TextField) = .empty;
+            for (values.items) |text| {
+                input_bytes +|= text.len;
+                try appendSchemaLessStringTextFields(self.arena, &fields, field, text);
+            }
+            if (fields.items.len != 0) try self.text_docs.append(self.arena, .{ .id = key, .stored_data = "", .text_fields = fields.items, .typed_fields = &.{} });
+            return input_bytes;
+        };
+        var root: std.json.Value = .{ .object = .empty };
+        for (projection.paths, 0..) |path, index| {
+            const raw = try projection.value(self.arena, row, index);
+            const value = if (borrowed and !store_source) raw else try cloneJsonValue(self.arena, raw);
+            try putTextProjectionPath(self.arena, &root, path, value);
+            if (value == .string) input_bytes +|= value.string.len;
+        }
+        const stored = if (store_source) try std.json.Stringify.valueAlloc(self.arena, root, .{}) else "";
+        input_bytes +|= stored.len;
+        try self.appendSourceDoc(.{ .key = key, .root = root, .stored_data = stored, .typed_source = if (store_source) root else null });
+        return input_bytes;
+    }
+
     pub fn batch(self: *const TextProjectionBatchBuilder) TextProjectionBatch {
         return .{
             .docs = self.text_docs.items,
@@ -1033,6 +1087,16 @@ pub const TextProjectionBatchBuilder = struct {
         };
     }
 };
+
+fn putTextProjectionPath(a: Allocator, root: *std.json.Value, path: []const u8, value: std.json.Value) !void {
+    if (std.mem.indexOfScalar(u8, path, '.')) |dot| {
+        const key = path[0..dot];
+        if (!root.object.contains(key)) try root.object.put(a, key, .{ .object = .empty });
+        const child = root.object.getPtr(key).?;
+        if (child.* != .object) return error.InvalidTextProjectionPath;
+        try putTextProjectionPath(a, child, path[dot + 1 ..], value);
+    } else try root.object.put(a, path, value);
+}
 
 /// Project exactly one source field while retaining the original stored
 /// document. Missing, null, and non-text values produce no postings. Arrays
@@ -1386,42 +1450,48 @@ pub fn buildTextSegmentsFromProjectionBatch(
     text_analysis: introducer_mod.TextAnalysisConfig,
     options: BuildTextSegmentsOptions,
 ) ![][]u8 {
-    if (projection_batch.docs.len == 0) return try alloc.alloc([]u8, 0);
-
-    var segments = std.ArrayListUnmanaged([]u8).empty;
-    errdefer {
-        for (segments.items) |segment| alloc.free(segment);
-        segments.deinit(alloc);
-    }
-
-    const target_bytes = @max(@as(usize, 1), options.target_segment_bytes);
-    const build_options = buildTextOptionsFromSegmentOptions(options);
-    var start: usize = 0;
-    while (start < projection_batch.docs.len) {
-        const split = introducer_mod.splitTextDocumentsForBuildBudget(projection_batch.docs, start, .{
-            .target_build_memory_bytes = options.target_build_memory_bytes orelse build_options.build_memory_target_bytes,
-            .target_segment_bytes = target_bytes,
-        });
-        const end = split.end;
-        const chunk: TextProjectionBatch = .{
-            .docs = projection_batch.docs[start..end],
-            .observed_field_analyzers = &.{},
-        };
-        const segment = blk: {
-            var output = segment_mod.MemorySegmentSink.init(alloc);
+    const Collector = struct {
+        alloc: Allocator,
+        analysis: introducer_mod.TextAnalysisConfig,
+        scratch_allocator: Allocator,
+        segments: std.ArrayListUnmanaged([]u8) = .empty,
+        pub fn consume(self: *@This(), chunk: TextProjectionBatch, build_options: introducer_mod.BuildTextOptions) !void {
+            var output = segment_mod.MemorySegmentSink.init(self.alloc);
             defer output.deinit();
             var sink = output.sink();
-            try introducer_mod.writeSegmentFromTextWithAnalysisOptions(options.scratch_allocator orelse alloc, chunk.docs, &analysis_mod.default_analyzer, text_analysis, build_options, &sink);
-            break :blk try output.finishOwned();
-        };
-        errdefer alloc.free(segment);
-        if (segment.len > 0) {
-            try segments.append(alloc, segment);
-        } else alloc.free(segment);
-        start = end;
+            try introducer_mod.writeSegmentFromTextWithAnalysisOptions(self.scratch_allocator, chunk.docs, &analysis_mod.default_analyzer, self.analysis, build_options, &sink);
+            const bytes = try output.finishOwned();
+            errdefer self.alloc.free(bytes);
+            if (bytes.len == 0) {
+                self.alloc.free(bytes);
+                return;
+            }
+            try self.segments.append(self.alloc, bytes);
+        }
+    };
+    var collector: Collector = .{ .alloc = alloc, .analysis = text_analysis, .scratch_allocator = options.scratch_allocator orelse alloc };
+    errdefer {
+        for (collector.segments.items) |bytes| alloc.free(bytes);
+        collector.segments.deinit(alloc);
     }
+    try consumeTextProjectionChunks(projection_batch, options, &collector);
+    return collector.segments.toOwnedSlice(alloc);
+}
 
-    return try segments.toOwnedSlice(alloc);
+/// Consume each bounded input chunk synchronously. The consumer can choose a
+/// file or memory sink and take ownership immediately; no batch of encoded
+/// segments or duplicate handoff buffers is required.
+pub fn consumeTextProjectionChunks(batch_: TextProjectionBatch, options: BuildTextSegmentsOptions, consumer: anytype) !void {
+    const build_options = buildTextOptionsFromSegmentOptions(options);
+    var start: usize = 0;
+    while (start < batch_.docs.len) {
+        const split = introducer_mod.splitTextDocumentsForBuildBudget(batch_.docs, start, .{
+            .target_build_memory_bytes = options.target_build_memory_bytes orelse build_options.build_memory_target_bytes,
+            .target_segment_bytes = @max(@as(usize, 1), options.target_segment_bytes),
+        });
+        try consumer.consume(.{ .docs = batch_.docs[start..split.end], .observed_field_analyzers = &.{} }, build_options);
+        start = split.end;
+    }
 }
 
 pub fn freeTextSegments(alloc: Allocator, segments: [][]u8) void {
@@ -1577,6 +1647,12 @@ pub fn extractDenseVectorFieldFromParsed(
 ) !?[]f32 {
     if (root != .object) return null;
     const field = root.object.get(field_name) orelse return null;
+    return extractDenseVectorFromValue(alloc, field, dims);
+}
+
+/// Field-oriented producers share document vector validation without building
+/// a synthetic object around an already selected value.
+pub fn extractDenseVectorFromValue(alloc: Allocator, field: std.json.Value, dims: u32) !?[]f32 {
     if (field != .array) return null;
     if (field.array.items.len != dims) return error.InvalidVectorDimensions;
     const values = try alloc.alloc(f32, dims);
@@ -6954,4 +7030,68 @@ test "document mapper explicit null embeddings own extraction and clone allocati
         }
     };
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
+}
+
+test "external lake typed column text projection matches source schemas arrays nulls and stored provenance" {
+    const a = std.testing.allocator;
+    const columns = @import("../../rowsource/types.zig");
+    const paths = &.{ "payload.text", "tags", "n", "missing" };
+    const batch_: columns.ColumnBatch = .{
+        .snapshot = .{ .table_id = "t", .snapshot_id = "s" },
+        .row_refs = &.{ .{ .relational_key = "a" }, .{ .relational_key = "b" }, .{ .relational_key = "c" } },
+        .columns = &.{
+            .{ .name = "payload.text", .values = .{ .json = &.{ "[\"Alpha\",\"Beta\"]", "null", "\"Gamma\"" } } },
+            .{ .name = "tags", .values = .{ .dictionary_bytes = .{ .values = &.{ "one", "two" }, .indices = &.{ 0, 1, 0 } } } },
+            .{ .name = "n", .values = .{ .i64 = &.{ 4, 5, 6 } }, .nulls = .{ .bytes = &.{ 0, 1, 0 } } },
+        },
+    };
+    const expected = [_][]const u8{
+        "{\"payload\":{\"text\":[\"Alpha\",\"Beta\"]},\"tags\":\"one\",\"n\":4,\"missing\":null}",
+        "{\"payload\":{\"text\":null},\"tags\":\"two\",\"n\":null,\"missing\":null}",
+        "{\"payload\":{\"text\":\"Gamma\"},\"tags\":\"one\",\"n\":6,\"missing\":null}",
+    };
+    const schema: runtime_schema.TableSchema = .{ .version = 0, .default_type = "record", .ttl_field = "_timestamp", .full_text_documents = &.{.{ .name = "record", .fields = &.{.{ .path = "payload.text", .emitted_name = "headline", .analyzer = "keyword", .include_in_all = false }} }} };
+    for ([_]?runtime_schema.TableSchema{ null, schema }) |runtime| {
+        for ([_]?[]const u8{ null, "payload.text" }) |selected| {
+            for ([_]bool{ false, true }) |store_source| {
+                for ([_]bool{ false, true }) |borrowed| {
+                    var arena = std.heap.ArenaAllocator.init(a);
+                    defer arena.deinit();
+                    const out = arena.allocator();
+                    const projection = try TextColumnProjection.bind(out, batch_, paths);
+                    var direct = TextProjectionBatchBuilder.initWithSelectedField(out, .{}, runtime, null, selected);
+                    var source = TextProjectionBatchBuilder.initWithSelectedField(out, .{}, runtime, null, selected);
+                    for (expected, 0..) |json, row| {
+                        const key = batch_.rowRef(row).relational_key;
+                        _ = try direct.appendColumnRow(projection, row, key, store_source, borrowed);
+                        const root = try std.json.parseFromSliceLeaky(std.json.Value, out, json, .{});
+                        const stored = if (store_source) try std.json.Stringify.valueAlloc(out, root, .{}) else "";
+                        try source.appendSourceDoc(.{ .key = key, .root = root, .stored_data = stored, .typed_source = if (store_source) root else null });
+                    }
+                    const actual = (try buildTextSegmentFromProjectionBatch(a, direct.batch(), .{})).?;
+                    defer a.free(actual);
+                    const reference = (try buildTextSegmentFromProjectionBatch(a, source.batch(), .{})).?;
+                    defer a.free(reference);
+                    try std.testing.expectEqualSlices(u8, reference, actual);
+                }
+            }
+        }
+    }
+    // Flat string vectors stay borrowed under a lease and are promoted when
+    // no lease exists; this verifies the fast path's ownership contract.
+    var text = [_]u8{ 's', 't', 'a', 'r' };
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const out = arena.allocator();
+    var flat = batch_;
+    flat.row_refs = batch_.row_refs[0..1];
+    flat.columns = &.{.{ .name = "body", .values = .{ .bytes = &.{&text} } }};
+    const projection = try TextColumnProjection.bind(out, flat, &.{"body"});
+    var borrowing = TextProjectionBatchBuilder.initWithSelectedField(out, .{}, null, null, "body");
+    var owning = TextProjectionBatchBuilder.initWithSelectedField(out, .{}, null, null, "body");
+    _ = try borrowing.appendColumnRow(projection, 0, "a", false, true);
+    _ = try owning.appendColumnRow(projection, 0, "a", false, false);
+    try std.testing.expect(borrowing.batch().docs[0].text_fields[0].text.ptr == text[0..].ptr);
+    text[0] = 'S';
+    try std.testing.expectEqualStrings("star", owning.batch().docs[0].text_fields[0].text);
 }

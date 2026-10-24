@@ -1088,6 +1088,7 @@ pub const InvertedIndexBuilder = struct {
         defer encoded.deinit(alloc);
         const postings_start = if (profile != null) platform_time.monotonicNs() else 0;
         for (sorted) |term| {
+            try beginObservedTerm(sink, term);
             const acc = self.terms.getPtr(term).?;
             const value = if (self.config.wireVersion() == wire_version_current and
                 self.config.postings_layout == .posting_count_v35 and acc.docIds().len > self.config.chunk_size)
@@ -2967,6 +2968,34 @@ pub const LookupResult = union(enum) {
         };
     }
 };
+
+/// Synchronous writer side channel. Begin identifies a field and term; finish
+/// supplies its document frequency and encoded conservative bounds (or a
+/// one-hit norm). Frequency zero discards a term removed by deletions. Views
+/// are borrowed until finish returns; callbacks may propagate cancellation.
+pub const TermObserver = struct {
+    ptr: *anyopaque,
+    begin: *const fn (*anyopaque, []const u8, []const u8) anyerror!void,
+    finish: *const fn (*anyopaque, u32, ?BlockMaxInfo, ?u32) anyerror!void,
+};
+fn beginObservedTerm(sink: anytype, term: []const u8) !void {
+    if (comptime @hasField(@TypeOf(sink.*), "term_observer")) {
+        if (sink.term_observer) |observer| try observer.begin(observer.ptr, sink.term_field, term);
+    }
+}
+fn finishObservedTerm(sink: anytype, frequency: u32, bounds: ?BlockMaxInfo, norm: ?u32) !void {
+    if (comptime @hasField(@TypeOf(sink.*), "term_observer")) {
+        if (sink.term_observer) |observer| try observer.finish(observer.ptr, frequency, bounds, norm);
+    }
+}
+fn encodedBounds(scratch: *const PostingSerializeScratch, config: IndexConfig) ?BlockMaxInfo {
+    const packed_bounds = usesPackedImpactFrequency(config.wireVersion());
+    const separate = usesSeparateImpactRanges(config.wireVersion());
+    const meta = if (packed_bounds) scratch.impact_encoded.items else if (separate) scratch.impact_block_max.items else scratch.block_max.items;
+    if (meta.len == 0) return null;
+    const range_ids = separate and scratch.impact_ids.items.len != 0;
+    return .{ .meta = meta, .chunk_size = if (range_ids) impact_range_doc_count else config.chunk_size, .chunk_meta_data = if (range_ids) scratch.impact_ids.items else scratch.chunk_meta.items, .chunk_meta_count = @intCast(if (separate) scratch.impact_block_max.items.len / blockMaxRecordSize(config.wireVersion()) else scratch.chunks.items.len), .version = config.wireVersion(), .range_ids = range_ids, .packed_impact_frequency = packed_bounds };
+}
 
 /// Per-chunk block-max metadata for WAND scoring acceleration.
 /// Each stored postings chunk has one block-max record. v23-v25 records use
@@ -6196,6 +6225,7 @@ fn writeMappedInvertedSection(
         defer workspace.finishTerm(alloc);
         merged_term.clearRetainingCapacity();
         try merged_term.appendSlice(alloc, min_term);
+        try beginObservedTerm(sink, merged_term.items);
 
         var candidate_frequency: u64 = 0;
         for (current_entries) |entry_opt| {
@@ -6266,7 +6296,10 @@ fn writeMappedInvertedSection(
                 if (std.mem.eql(u8, entry.term, merged_term.items)) current_entries[i] = try term_iters[i].next();
             }
 
-            if (acc.storage.many.doc_ids.items.len == 0) continue;
+            if (acc.docIds().len == 0) {
+                try finishObservedTerm(sink, 0, null, null);
+                continue;
+            }
             try sortPostingAccumulatorByDocIdWithWorkspace(alloc, acc, &workspace);
             const dict_value = try appendMergedTermToSink(alloc, sink, section_start, term_postings, serialize_scratch, acc, config, merged_doc_count);
             try dict_builder.add(merged_term.items, dict_value);
@@ -7126,7 +7159,10 @@ fn appendPostingStreamToSinkWithWorkspace(
         // A positions-bearing term also frames blocks with no locations.
         positions_length = try std.math.add(u64, positions_length, @intCast(position_length));
     }
-    if (doc_freq == 0) return null;
+    if (doc_freq == 0) {
+        try finishObservedTerm(sink, 0, null, null);
+        return null;
+    }
     if (doc_freq > config.chunk_size) {
         try navigation.impact_chunk_ids.append(alloc, current_impact.?);
         try appendImpactRecord(alloc, &navigation.impact_block_max, impact_max, impact_min);
@@ -7148,6 +7184,7 @@ fn appendPostingStreamToSinkWithWorkspace(
     try sink.appendSlice(&.{ 0, 255, 255, 255, 255, 15 });
     const descriptor = StreamedDescriptor{ .doc_frequency = doc_freq, .chunks = @intCast(records.items.len / streamed_record_size), .span_start = span_start - section_start, .span_length = span_length, .table_start = table_start - section_start, .impact_start = impact_start - section_start, .impacts = impacts, .ids_length = @intCast(navigation.impact_ids.items.len), .payload_length = payload_length, .positions_length = positions_length };
     try sink.appendSlice(&descriptor.encode());
+    try finishObservedTerm(sink, doc_freq, if (impacts == 0) null else .{ .meta = navigation.impact_encoded.items, .chunk_size = impact_range_doc_count, .chunk_meta_data = navigation.impact_ids.items, .chunk_meta_count = impacts, .version = config.wireVersion(), .range_ids = true, .packed_impact_frequency = true }, null);
     return @intCast(header_start - section_start - v7_header_size);
 }
 
@@ -7167,6 +7204,7 @@ fn appendMergedTermToSink(
         acc.docIds()[0] <= mask_31_bits)
     {
         const doc_num: u64 = acc.docIds()[0];
+        try finishObservedTerm(sink, 1, null, fieldNormFromId(fieldNormToId(acc.postingMetas()[0].norm)));
         return fstValEncode1Hit(doc_num, 0);
     }
 
@@ -7175,6 +7213,7 @@ fn appendMergedTermToSink(
     term_postings.clearRetainingCapacity();
     try acc.serializeV9(alloc, term_postings, serialize_scratch, config);
     try sink.appendSlice(term_postings.items);
+    try finishObservedTerm(sink, @intCast(acc.docIds().len), encodedBounds(serialize_scratch, config), null);
     return postings_offset;
 }
 

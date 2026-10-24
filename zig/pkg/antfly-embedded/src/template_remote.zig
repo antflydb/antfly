@@ -88,13 +88,14 @@ test "template remote byte budget reads the reloadable config snapshot" {
         config: scraping.RemoteContentConfig,
         releases: usize = 0,
 
-        fn acquire(context: *anyopaque) anyerror!scraping.RemoteContentConfig.Snapshot {
+        fn acquire(context: *anyopaque, output: *scraping.RemoteContentConfig.Snapshot) callconv(.c) scraping.RemoteContentConfig.RemoteContentRuntime.AcquireStatus {
             const self: *@This() = @ptrCast(@alignCast(context));
-            return .{
+            output.* = .{
                 .config = &self.config,
                 .context = context,
                 .release_fn = release,
             };
+            return .ok;
         }
 
         fn release(context: *anyopaque) void {

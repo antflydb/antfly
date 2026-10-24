@@ -451,11 +451,13 @@ comptime {
     _ = @import("antfly_local_sources").storage_portable_backup;
     _ = @import("antfly_local_sources").storage_resource_manager;
     _ = @import("antfly_local_sources").storage_retained_effects;
+    _ = @import("antfly_local_sources").storage_source_proof_registry;
     _ = @import("antfly_local_sources").storage_source_pin_state;
     _ = @import("antfly_local_sources").storage_source_snapshot;
     _ = @import("antfly_local_sources").storage_rowsource_identity;
     _ = @import("antfly_local_sources").storage_rowsource_external;
     _ = @import("antfly_local_sources").storage_rowsource_local;
+    _ = @import("antfly_local_sources").storage_rowsource_logical;
     _ = @import("rowsource/mod.zig");
     _ = @import("antfly_local_sources").storage_rowsource_types;
     _ = @import("antfly_local_sources").storage_schema;

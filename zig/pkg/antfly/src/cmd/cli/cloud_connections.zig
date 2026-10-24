@@ -97,7 +97,7 @@ pub fn run(alloc: std.mem.Allocator, io: std.Io, args: *std.process.Args.Iterato
     const options = try parse(args);
     if (options.provider == .google) {
         if (platform.env.getenv("GOOGLE_APPLICATION_CREDENTIALS") != null) {
-            std.debug.print("GOOGLE_APPLICATION_CREDENTIALS overrides local ADC. Unset it to manage gcloud user login; explicit credential files remain supported by provider configuration.\n", .{});
+            cli.output.notice("GOOGLE_APPLICATION_CREDENTIALS overrides local ADC. Unset it to manage gcloud user login; explicit credential files remain supported by provider configuration.\n", .{});
             return error.GoogleAdcOverrideActive;
         }
         switch (options.operation) {
@@ -107,13 +107,13 @@ pub fn run(alloc: std.mem.Allocator, io: std.Io, args: *std.process.Args.Iterato
                 try argv.appendSlice(alloc, &.{ "gcloud", "auth", "application-default", "login", "--scopes=openid,https://www.googleapis.com/auth/userinfo.email,https://www.googleapis.com/auth/cloud-platform" });
                 if (options.project) |project| try argv.appendSlice(alloc, &.{ "--project", project });
                 if (options.no_browser) try argv.append(alloc, "--no-launch-browser");
-                std.debug.print("Connecting local Google Application Default Credentials using gcloud.\n", .{});
+                cli.output.notice("Connecting local Google Application Default Credentials using gcloud.\n", .{});
                 try interactive(alloc, io, argv.items, .google);
                 try googleList(alloc, io);
             },
             .list => return googleList(alloc, io),
             .logout => {
-                std.debug.print("Revoking local Google Application Default Credentials shared with other local applications.\n", .{});
+                cli.output.notice("Revoking local Google Application Default Credentials shared with other local applications.\n", .{});
                 try interactive(alloc, io, &.{ "gcloud", "auth", "application-default", "revoke", "--quiet" }, .google);
                 try cli.writeJson(alloc, io, .{ .provider = "google", .credential_source = "adc", .status = "disconnected" });
             },
@@ -134,7 +134,7 @@ pub fn run(alloc: std.mem.Allocator, io: std.Io, args: *std.process.Args.Iterato
                 if (sso) try argv.append(alloc, "sso");
                 try argv.appendSlice(alloc, &.{ "login", "--profile", resolved.login_profile, "--no-cli-pager" });
                 if (options.no_browser) try argv.append(alloc, "--no-browser");
-                std.debug.print("Connecting local AWS profile {s} using {s}.\n", .{ profile, if (sso) "IAM Identity Center" else "console sign-in" });
+                cli.output.notice("Connecting local AWS profile {s} using {s}.\n", .{ profile, if (sso) "IAM Identity Center" else "console sign-in" });
                 try interactive(alloc, io, argv.items, .aws);
                 var exported = try credentials.exportAwsCredentials(alloc, io, profile, 30_000, null);
                 defer exported.deinit();
@@ -154,11 +154,11 @@ pub fn run(alloc: std.mem.Allocator, io: std.Io, args: *std.process.Args.Iterato
             },
             .logout => {
                 if (sso) {
-                    std.debug.print("AWS SSO logout clears every cached SSO session. Use aws sso logout explicitly to sign out of all SSO profiles.\n", .{});
+                    cli.output.notice("AWS SSO logout clears every cached SSO session. Use aws sso logout explicitly to sign out of all SSO profiles.\n", .{});
                     return error.AwsSsoLogoutIsGlobal;
                 }
                 if (kind != .console) {
-                    std.debug.print("This AWS profile has no console login session. Manage static credentials and workload identities through their existing credential source.\n", .{});
+                    cli.output.notice("This AWS profile has no console login session. Manage static credentials and workload identities through their existing credential source.\n", .{});
                     return error.AwsBrowserLoginNotConfigured;
                 }
                 try interactive(alloc, io, &.{ "aws", "logout", "--profile", resolved.login_profile, "--no-cli-pager" }, .aws);
@@ -166,7 +166,7 @@ pub fn run(alloc: std.mem.Allocator, io: std.Io, args: *std.process.Args.Iterato
             },
         }
     }
-    std.debug.print("Restart an already-running Antfly server to use the updated local credentials. Cloud credentials stay on this machine; remote servers are not updated.\n", .{});
+    cli.output.notice("Restart an already-running Antfly server to use the updated local credentials. Cloud credentials stay on this machine; remote servers are not updated.\n", .{});
 }
 
 test "connections cloud login validates provider-specific options before execution" {

@@ -18,6 +18,8 @@
 
 const db_zig = @import("db.zig");
 const DB = db_zig.DB;
+const allDocsVisibleFastCallback = DB.allDocsVisibleFastCallback;
+const textLiveFilterDocSetControlledCallback = DB.textLiveFilterDocSetControlledCallback;
 const schema_mod = @import("../schema.zig");
 const range_cardinality = @import("range_cardinality.zig");
 const apply_state = @import("derived/apply_state.zig");
@@ -755,7 +757,10 @@ pub fn searchTextQuery(self: *DB, alloc: Allocator, req: types.SearchRequest, te
         .resolve_doc_set_doc_ids = resolveDocSetDocIdsCallback,
         .resolve_doc_ids_to_doc_set = resolveDocIdsToDocSetCallback,
         .live_filter_doc_set = liveFilterDocSetCallback,
-        .all_docs_visible = allDocsVisibleCallback,
+        .live_filter_doc_set_controlled = textLiveFilterDocSetControlledCallback,
+        // An absent legacy summary is unknown, not a reason to scan the
+        // primary population before searching selective postings.
+        .all_docs_visible = allDocsVisibleFastCallback,
         .requires_full_candidate_visibility_filter = requiresFullCandidateVisibilityFilterCallback,
         .nonvisible_doc_set = nonVisibleDocSetCallback,
         .postprocess = postprocessTextSearchResultCallback,

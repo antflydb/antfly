@@ -6692,7 +6692,7 @@ export interface components {
              * @description Stable machine-readable constraint that prevents exact public execution.
              * @enum {string}
              */
-            reason: "expand_strategy_not_supported" | "direction_must_be_out" | "deduplicate_nodes_must_be_true" | "weight_mode_must_be_min_hops" | "start_selector_not_supported" | "target_selector_not_supported" | "target_required" | "k_must_equal_one" | "pattern_required" | "external_alias_document_filter_not_supported" | "external_alias_source_not_supported" | "reverse_variable_path_not_supported" | "legacy_graph_searches_not_supported" | "request_control_not_supported" | "unsupported_mode";
+            reason: "expand_strategy_not_supported" | "direction_must_be_out" | "deduplicate_nodes_must_be_true" | "weight_mode_must_be_min_hops" | "start_selector_not_supported" | "target_selector_not_supported" | "target_required" | "k_must_equal_one" | "k_must_be_positive" | "pattern_required" | "qualified_start_identity_required" | "external_alias_document_filter_not_supported" | "external_alias_source_not_supported" | "reverse_variable_path_not_supported" | "legacy_graph_searches_not_supported" | "request_control_not_supported" | "unsupported_mode";
         };
         GraphMatchOperationLimitExceededError: {
             /**
@@ -16397,6 +16397,10 @@ export interface components {
              * @enum {integer}
              */
             readonly row_identity_version?: 1 | 2;
+            /** @description Optional verified stable identity for external rewrites. Keys must be non-null and unique in each published snapshot. Uses native typed equality; an unchanged key alone never authorizes index reuse. */
+            row_identity?: {
+                key_columns: string[];
+            };
             /** @default auto */
             schema_fingerprint?: string;
             /**
@@ -19279,7 +19283,13 @@ export interface components {
             field: string;
             boost?: components["schemas"]["Boost"];
         };
+        /** @description Match an indexed post-analysis term exactly. Use match for analyzed natural-language input. */
         TermQuery: {
+            /**
+             * @description Fold ASCII letter case when matching indexed terms, without stemming the pattern.
+             * @default false
+             */
+            case_insensitive?: boolean;
             term: string;
             field?: string;
             boost?: components["schemas"]["Boost"];
@@ -19350,16 +19360,33 @@ export interface components {
          *     substring, exactly like `match` on that field.
          */
         PrefixQuery: {
+            /**
+             * @description Fold ASCII letter case when matching indexed terms, without stemming the pattern.
+             * @default false
+             */
+            case_insensitive?: boolean;
             prefix: string;
             field?: string;
             boost?: components["schemas"]["Boost"];
         };
+        /** @description Match post-analysis indexed terms. Patterns are not stemmed; use match for analyzed natural-language input. */
         RegexpQuery: {
+            /**
+             * @description Fold ASCII letter case when matching indexed terms, without stemming the pattern.
+             * @default false
+             */
+            case_insensitive?: boolean;
             regexp: string;
             field?: string;
             boost?: components["schemas"]["Boost"];
         };
+        /** @description Match post-analysis indexed terms. Patterns are not stemmed; use match for analyzed natural-language input. */
         WildcardQuery: {
+            /**
+             * @description Fold ASCII letter case when matching indexed terms, without stemming the pattern.
+             * @default false
+             */
+            case_insensitive?: boolean;
             wildcard: string;
             field?: string;
             boost?: components["schemas"]["Boost"];

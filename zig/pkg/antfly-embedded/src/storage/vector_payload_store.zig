@@ -1507,8 +1507,18 @@ pub const Store = struct {
         try cancellation.check();
         const store = &self.opened.store;
         var manifest = store.manifest orelse return error.MissingVectorPayloadStore;
-        const sealed_bytes = try manifest.sealed_wals.bytes();
-        const active_bytes = store.wal_committed_bytes - sealed_bytes;
+        var active_bytes = store.wal_committed_bytes - try manifest.sealed_wals.bytes();
+        if (active_bytes > remaining_wal.*) {
+            // Retain a large active WAL as an immutable extent instead of
+            // copying it under the query-cut fence or rewriting all vectors.
+            // Existing reader views remain valid across this authority update.
+            _ = store.sealWal() catch |err| {
+                self.setPoisoned(store.poisoned);
+                return err;
+            };
+            manifest = store.manifest orelse return error.MissingVectorPayloadStore;
+            active_bytes = store.wal_committed_bytes - try manifest.sealed_wals.bytes();
+        }
         remaining_wal.* = std.math.sub(u64, remaining_wal.*, active_bytes) catch return error.QueryCandidateBudgetExceeded;
         const paths = @import("antfly_runtime_fs").fs_paths;
         const backup = @import("db/native/backup.zig");

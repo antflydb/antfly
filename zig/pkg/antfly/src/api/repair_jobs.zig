@@ -466,8 +466,15 @@ pub const Store = struct {
         total.missing_source_docs +|= pass.missing_source_docs;
         total.failed +|= pass.failed;
         total.unsupported +|= pass.unsupported;
-        total.unresolved +|= pass.unresolved;
-        total.in_progress +|= pass.in_progress;
+        if (std.mem.eql(u8, previous.target, "index") and previous.index != null) {
+            // Polling one rebuild observes the same debt until publication.
+            // These are current-state gauges, not repeated units of work.
+            total.unresolved = pass.unresolved;
+            total.in_progress = pass.in_progress;
+        } else {
+            total.unresolved +|= pass.unresolved;
+            total.in_progress +|= pass.in_progress;
+        }
         total.indexes_rebuilt +|= pass.indexes_rebuilt;
         // These are job-level state gauges for the one named index, not work
         // counters. A bounded retry may observe the same index repeatedly;
@@ -1445,6 +1452,8 @@ test "index repair job keeps degradation gauges as snapshots across retries" {
     try std.testing.expectEqualStrings("succeeded", terminal.value.phase);
     try std.testing.expectEqual(@as(u64, 1), terminal.value.result.indexes_degraded_before);
     try std.testing.expectEqual(@as(u64, 0), terminal.value.result.indexes_degraded_after);
+    try std.testing.expectEqual(@as(u64, 0), terminal.value.result.in_progress);
+    try std.testing.expectEqual(@as(u64, 0), terminal.value.result.unresolved);
 }
 
 test "durable cancellation retries transient failures with backoff" {

@@ -186,6 +186,14 @@ check that measured storage/inference compilations fit together and that
 unmeasured hosts, CPU features, targets, modes, backend settings, and sanitizer
 settings retain conservative reservations.
 
+The unstripped native Apple Silicon Zig 0.17.0 ReleaseFast API owner reached
+27,085,701,120 bytes during the logical-input commitment qualification
+(`5eaa13cb68`). Its default macOS reservation is 28 GiB, providing over 10%
+headroom while fitting a 36 GiB developer host's default 28.8 GiB compiler
+budget. The admission regression also prevents overlap with the distributed
+owner under that budget. Qualified stripped profiles and Linux claims retain
+their separate measurements.
+
 `python3 tools/check_storage_compilation.py --report storage-compilation.json`
 checks the real compiler in an isolated source overlay. It measures cold and
 warm builds, then verifies these source changes:
@@ -1540,7 +1548,7 @@ rounded to 8G/2G; their 12/4 GiB claims allow another whole GiB for rounding
 before adding 25% headroom. Other runtime claims retain their conservative
 values. Cross-host, stripped, sanitized and non-baseline profiles do not
 inherit these measurements. Admission tests prevent the API from overlapping
-with distributed/storage work within CI's 22 GiB compiler budget while still
+with distributed/storage work within CI's 20 GiB compiler budget while still
 allowing the smaller CLI alongside it.
 
 The same run measured public-api-parity and data-runtime test objects at
@@ -1548,6 +1556,19 @@ The same run measured public-api-parity and data-runtime test objects at
 are 20/14 GiB, each including at least 25% headroom and fitting that budget
 alone. The policy never lowers an authored claim and leaves other test roots
 and build modes unchanged.
+
+Main run 39957596246 subsequently exhausted the heavy runner's 24 GiB
+cgroup limit while three default 7 GiB compiler claims overlapped under the
+workflow's 22 GiB override. Kernel OOM records showed approximately 23.5 GiB
+of compiler anonymous RSS and killed the entire runner cgroup; file-backed
+pages were negligible. The workflow now matches ARC's 20 GiB aggregate
+compiler budget, retaining 4 GiB for the driver, runner and test processes.
+The largest current Linux claim (storage/public API, 20 GiB) still fits;
+two 8 GiB compiles, or 8 + 8 + 3.75 GiB HTTP work, can still overlap.
+The policy tests evaluate the real storage claim and check both this
+parallel capacity and exclusion of the observed three-compiler overlap.
+This changes scheduler admission without increasing runner resources or
+individual compile reservations.
 
 Native Apple Silicon CPU Debug qualification on 2026-10-16 (Zig 0.17.0,
 macOS SDK 26.3.1) measured public-api-parity at 18,029,035,520 bytes,

@@ -26,44 +26,47 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.Antf
     if (std.mem.eql(u8, subcommand, "drop")) return dropTablespace(allocator, io, client, args);
 
     if (std.mem.eql(u8, subcommand, "rename")) {
-        const name = args.next() orelse cli.fatal("resource name is required", .{});
-        const new_name = args.next() orelse cli.fatal("new name is required", .{});
-        if (args.next() != null) cli.fatal("unexpected rename argument", .{});
+        const name = args.next() orelse cli.argumentError("resource name is required", .{});
+        const new_name = args.next() orelse cli.argumentError("new name is required", .{});
+        if (args.next() != null) cli.argumentError("unexpected rename argument", .{});
         var response = try client.inner.renameTablespace(name, .{ .name = new_name });
         defer response.deinit();
-        if (response.status_code != 204) cli.fatal("rename failed with HTTP {d}", .{response.status_code});
+        cli.expectHttpSuccess(response);
+        if (response.status_code != 204) return error.InvalidApiResponse;
         return;
     }
 
-    cli.fatal("unknown tablespace subcommand: {s}", .{subcommand});
+    cli.argumentError("unknown tablespace subcommand: {s}", .{subcommand});
 }
 
 pub fn listTablespaces(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.AntflyClient) !void {
+    cli.output.context = .{ .scope = .discovery, .execution = .complete };
     var resp = try client.inner.listTablespaces();
     defer resp.deinit();
-    if (resp.status_code < 200 or resp.status_code >= 300) cli.fatal("catalog request failed with HTTP {d}", .{resp.status_code});
+    cli.expectHttpSuccess(resp);
     if (resp.data) |parsed| try cli.writeJson(allocator, io, parsed.value);
 }
 
 pub fn getTablespace(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.AntflyClient, args: *std.process.Args.Iterator) !void {
+    cli.output.context = .{ .scope = .discovery, .execution = .complete };
     const tablespace_name = nextNameArg(args, "tablespace name is required");
     var resp = try client.inner.getTablespace(tablespace_name);
     defer resp.deinit();
-    if (resp.status_code < 200 or resp.status_code >= 300) cli.fatal("catalog request failed with HTTP {d}", .{resp.status_code});
+    cli.expectHttpSuccess(resp);
     if (resp.data) |parsed| try cli.writeJson(allocator, io, parsed.value);
 }
 
 pub fn createTablespace(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.AntflyClient, args: *std.process.Args.Iterator) !void {
     var parsed = parseCreateArgs(allocator, args);
     defer parsed.deinit(allocator);
-    const tablespace_name = parsed.tablespace_name orelse cli.fatal("tablespace name is required", .{});
+    const tablespace_name = parsed.tablespace_name orelse cli.argumentError("tablespace name is required", .{});
     const body = antfly_client.types.CreateTablespaceRequest{
         .location_json = parsed.location_json,
         .placement_policy_json = parsed.placement_policy_json,
     };
     var resp = try client.inner.createTablespace(tablespace_name, body);
     defer resp.deinit();
-    if (resp.status_code < 200 or resp.status_code >= 300) cli.fatal("catalog request failed with HTTP {d}", .{resp.status_code});
+    cli.expectHttpSuccess(resp);
     if (resp.data) |data| try cli.writeJson(allocator, io, data.value);
 }
 
@@ -71,7 +74,7 @@ pub fn dropTablespace(allocator: std.mem.Allocator, io: std.Io, client: *antfly_
     const tablespace_name = nextNameArg(args, "tablespace name is required");
     var resp = try client.inner.dropTablespace(tablespace_name);
     defer resp.deinit();
-    if (resp.status_code < 200 or resp.status_code >= 300) cli.fatal("catalog request failed with HTTP {d}", .{resp.status_code});
+    cli.expectHttpSuccess(resp);
     if (resp.data) |parsed| try cli.writeJson(allocator, io, parsed.value);
 }
 
@@ -90,9 +93,9 @@ fn parseCreateArgs(allocator: std.mem.Allocator, args: *std.process.Args.Iterato
     var out = CreateArgs{};
     while (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "--location-json")) {
-            out.location_json = allocator.dupe(u8, args.next() orelse cli.fatal("--location-json requires a value", .{})) catch cli.fatal("out of memory", .{});
+            out.location_json = allocator.dupe(u8, args.next() orelse cli.argumentError("--location-json requires a value", .{})) catch cli.fatal("out of memory", .{});
         } else if (std.mem.eql(u8, arg, "--placement-policy-json")) {
-            out.placement_policy_json = allocator.dupe(u8, args.next() orelse cli.fatal("--placement-policy-json requires a value", .{})) catch cli.fatal("out of memory", .{});
+            out.placement_policy_json = allocator.dupe(u8, args.next() orelse cli.argumentError("--placement-policy-json requires a value", .{})) catch cli.fatal("out of memory", .{});
         } else if (!std.mem.startsWith(u8, arg, "--") and out.tablespace_name == null) {
             out.tablespace_name = arg;
         }
@@ -103,11 +106,11 @@ fn parseCreateArgs(allocator: std.mem.Allocator, args: *std.process.Args.Iterato
 fn nextNameArg(args: *std.process.Args.Iterator, comptime missing_message: []const u8) []const u8 {
     while (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "--tablespace")) {
-            return args.next() orelse cli.fatal("--tablespace requires a value", .{});
+            return args.next() orelse cli.argumentError("--tablespace requires a value", .{});
         }
         if (!std.mem.startsWith(u8, arg, "--")) return arg;
     }
-    cli.fatal(missing_message, .{});
+    cli.argumentError(missing_message, .{});
 }
 
 test "tablespace cli module compiles" {

@@ -1061,13 +1061,18 @@ def test_native_remote_ordered_index_exact_bounds_and_restart(tmp_path, covering
     objects.mkdir(parents=True)
     base = 9007199254740993
     amounts = [base + i % 100 for i in reversed(range(1200))]
+    columns = {
+        "amount": pa.array(amounts, type=pa.int64()),
+        "label": [f"row-{i}" for i in range(1200)],
+    }
+    if covering:
+        # Keep footer discovery sparse: small objects may legitimately be read
+        # and verified in full before any result hydration takes place.
+        columns["padding"] = [
+            hashlib.shake_256(str(i).encode()).hexdigest(4096) for i in range(1200)
+        ]
     pq.write_table(
-        pa.table(
-            {
-                "amount": pa.array(amounts, type=pa.int64()),
-                "label": [f"row-{i}" for i in range(1200)],
-            }
-        ),
+        pa.table(columns),
         tmp_path / "input.parquet",
         compression="snappy",
         use_dictionary=True,
@@ -1218,6 +1223,48 @@ def test_native_remote_ordered_index_exact_bounds_and_restart(tmp_path, covering
         body["after"] = previous_cursor
         resumed = call("POST", "/tables/lake_ordered/rows/query", body, lines=True)
         assert resumed and resumed[0]["_id"] == collected[1]["_id"]
+        if covering:
+            # Cold public search hydration must use typed index blocks. Retain
+            # immutable source identity/footer but make all data pages invalid.
+            object_path = objects / "part.parquet"
+            search_request = {
+                "full_text_search": {"match_all": {}},
+                "fields": ["amount", "label"],
+                "limit": 5,
+            }
+
+            def check_covering_search():
+                search = call("POST", "/tables/lake_ordered/query", search_request)
+                search = search.get("responses", [search])[0]
+                hits = search["hits"]["hits"]
+                assert len(hits) == 5, search
+                for hit in hits:
+                    row = int(hit["_source"]["label"].removeprefix("row-"))
+                    assert int(hit["_source"]["amount"]) == amounts[row], search
+
+            check_covering_search()
+            original_object = object_path.read_bytes()
+            original_stat = object_path.stat()
+            header = original_object[:84]
+            damaged = bytearray(payload)
+            metadata = pq.ParquetFile(tmp_path / "input.parquet").metadata
+            for group in range(metadata.num_row_groups):
+                row_group = metadata.row_group(group)
+                for column in range(row_group.num_columns):
+                    chunk = row_group.column(column)
+                    start = chunk.dictionary_page_offset or chunk.data_page_offset
+                    end = start + chunk.total_compressed_size
+                    damaged[start:end] = b"\xff" * (end - start)
+            server.pause()
+            object_path.write_bytes(header + damaged)
+            os.utime(object_path, ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns))
+            for cached in list(server.root.rglob("lake-ranges")):
+                if cached.is_dir():
+                    shutil.rmtree(cached)
+            server.resume()
+            for _ in range(2):
+                check_covering_search()
+            object_path.write_bytes(original_object)
         # A source replacement invalidates publication-bound continuation.
         replacement = pa.table(
             {"amount": pa.array([base + 17], type=pa.int64()), "label": ["replacement"]}

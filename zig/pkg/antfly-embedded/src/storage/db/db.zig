@@ -598,6 +598,26 @@ pub fn benchQueryProfileEnabled() bool {
     return platform.env.getenv("ANTFLY_BENCH_QUERY_PROFILE") != null;
 }
 
+/// Phase names remain available in stripped release builds, including the
+/// interrupted phase when cancellation unwinds a capture.
+pub const QueryCaptureProfile = struct {
+    enabled: bool,
+    phase: []const u8,
+    started_ns: u64,
+    pub fn init(enabled: bool, phase: []const u8) @This() {
+        return .{ .enabled = enabled, .phase = phase, .started_ns = if (enabled) monotonicTimeNs() else 0 };
+    }
+    pub fn finish(self: *const @This()) void {
+        if (self.enabled) std.log.info("QUERY_CAPTURE phase={s} elapsed_us={d}", .{ self.phase, (monotonicTimeNs() -| self.started_ns) / std.time.ns_per_us });
+    }
+    pub fn next(self: *@This(), phase: []const u8) void {
+        if (!self.enabled) return;
+        self.finish();
+        self.phase = phase;
+        self.started_ns = monotonicTimeNs();
+    }
+};
+
 pub fn observeSearchFailureMetric(name: ?[]const u8, query_type: db_query_metrics.QueryType, duration_ns: u64) void {
     if (db_query_search.peekLastSortRejectionDiagnostic()) |diagnostic| {
         db_query_metrics.observeSortRejection(name, query_type, duration_ns, diagnostic.reason, diagnostic.detail);
@@ -6353,6 +6373,14 @@ pub const DB = struct {
     fn runGroupSourceSliceWithState(self: *DB, state: *GroupSourceMaintenanceState) !bool {
         if (!state.slice_mutex.tryLock()) return false;
         defer state.slice_mutex.unlock();
+        // The resident scheduler runs independently of foreground index DDL.
+        // A slice borrows the current producer through batchContext as well
+        // as the final wake. Keep that entire bounded, inference-free turn
+        // inside the replacement fence so no borrowed runtime can be freed.
+        // Yield during reconfiguration rather than blocking the scheduler;
+        // durable group queues retain every pending command for the next turn.
+        if (!self.enrichment_owner.replacement_mutex.tryLock()) return false;
+        defer self.enrichment_owner.replacement_mutex.unlock();
         return self.runGroupSourceSliceLocked(state);
     }
 
@@ -7259,6 +7287,7 @@ pub const DB = struct {
         restart_text_merge: bool,
         restart_sparse_compaction: bool,
         catalog_barrier_held: bool = false,
+        catalog_read_held: bool = false,
         active: bool = true,
 
         pub fn acquireCatalogBarrierUntil(self: *@This(), deadline_ns: u64) bool {
@@ -7288,7 +7317,24 @@ pub const DB = struct {
             self.catalog_barrier_held = true;
         }
 
+        /// Retained reads pin immutable backend generations; they do not
+        /// replace catalog pointers. Share admission with existing searches
+        /// and background merges instead of draining those owners.
+        pub fn acquireCatalogReadWithCancellation(self: *@This(), io: std.Io, cancellation: types.CancellationToken) !void {
+            while (!self.db.core.index_manager.tryAcquireCatalogRead()) {
+                try cancellation.check();
+                try io.sleep(.fromMilliseconds(1), .awake);
+            }
+            errdefer self.db.core.index_manager.releaseCatalogRead();
+            try cancellation.check();
+            self.catalog_read_held = true;
+        }
+
         fn releaseCatalogBarrier(self: *@This()) void {
+            if (self.catalog_read_held) {
+                self.db.core.index_manager.releaseCatalogRead();
+                self.catalog_read_held = false;
+            }
             if (!self.catalog_barrier_held) return;
             self.db.endIndexCatalogBarrier();
             self.catalog_barrier_held = false;
@@ -11772,30 +11818,34 @@ pub const DB = struct {
         self.local_execution.native_query_reuse = try native_query_reuse.State.init(request, proof);
         return true;
     }
-    fn captureQueryCutInternal(self: *DB, request: native_query_cut.Request, cancellation: types.CancellationToken, publish: bool) !void {
-        try request.validate(native_query_cut.nowMs());
+    fn captureQueryCutInternal(self: *DB, request: @import("native/query_cut.zig").Request, cancellation: types.CancellationToken, publish: bool) !void {
+        try request.validate(@import("native/query_cut.zig").nowMs());
         _ = try request.namespace(self.core.identity_namespace);
         if (!request.create or request.table_id != self.core.identity_namespace.table_id) return error.CatalogGenerationChanged;
         const io = self.backend_runtime.filesystemIo() orelse return error.BackendRuntimeIoUnavailable;
-        const remaining = request.expires_ms -| native_query_cut.nowMs();
+        const remaining = request.expires_ms -| @import("native/query_cut.zig").nowMs();
         const expiry_deadline = monotonicTimeNs() +| remaining * std.time.ns_per_ms;
         const deadline = if (request.timeout_ms) |value| @min(monotonicTimeNs() +| value *| std.time.ns_per_ms, expiry_deadline) else expiry_deadline;
-        const control: native_query_cut.Control = .{ .parent = cancellation, .deadline_ns = deadline };
+        const control: @import("native/query_cut.zig").Control = .{ .parent = cancellation, .deadline_ns = deadline };
         const token = control.token();
         try token.check();
         if (publish) if (self.backend_runtime.query_cut_repository) |repository| if (self.primary_lsm_storage) |storage| {
             if (try repository.reference(io, request, self.core.identity_namespace, storage, token)) return;
         };
-        var guard = try native_query_cut.lock(self.alloc, io, self.core.path, token);
+        var profile = QueryCaptureProfile.init(benchQueryProfileEnabled(), "query_pin_lock");
+        defer profile.finish();
+        var guard = try @import("native/query_cut.zig").lock(self.alloc, io, self.core.path, token);
         defer guard.deinit();
+        profile.next("reuse_and_admission");
         if (publish and try self.tryReuseNativeQueryCut(io, request, token)) return;
         try self.admitQueryCut(io, request.id, token);
-        const root = try native_query_cut.pathAlloc(self.alloc, self.core.path, request.id);
+        const root = try @import("native/query_cut.zig").pathAlloc(self.alloc, self.core.path, request.id);
         defer self.alloc.free(root);
         const existed = try snapshotPathExists(io, root);
         // A failed new capture must not consume the capacity reserved for
         // usable cursors. The parent guard excludes readers of this new root.
         errdefer if (!existed) std.Io.Dir.cwd().deleteTree(io, root) catch {};
+        profile.next("snapshot");
         _ = self.snapshotInternal(request.id, true, token, deadline, null, false, request) catch |err| {
             try token.check();
             return switch (err) {
@@ -11805,10 +11855,11 @@ pub const DB = struct {
                 else => err,
             };
         };
+        profile.next("repository_publication");
         try self.admitQueryCut(io, request.id, token);
         if (publish) if (self.backend_runtime.query_cut_repository) |repository| {
             if (try repository.publishReusable(io, root, request, self.core.identity_namespace, token)) |proof| {
-                self.local_execution.native_query_reuse = try native_query_reuse.State.init(request, proof);
+                self.local_execution.native_query_reuse = try @import("native/query_reuse.zig").State.init(request, proof);
             }
         };
     }
@@ -11952,6 +12003,13 @@ pub const DB = struct {
 
     pub const primaryOnlySnapshotSupportedLocked = db_restore.primaryOnlySnapshotSupportedLocked;
 
+    pub fn sealedBackupSupportedLocked(self: *DB) !bool {
+        if (self.local_execution.vector_migration_active.load(.acquire)) return false;
+        if (try self.primaryOnlySnapshotSupportedLocked()) return true;
+        return self.local_execution.table_storage.dense_embeddings == .vector_store and
+            self.local_execution.source_vectors.load(.acquire) != null;
+    }
+
     pub fn requireQueryCutStorage(self: *DB) !void {
         if (self.physical_root_mode != .filesystem_managed or self.primary_backend != .lsm) return error.NativeBackupStorageBackendUnsupported;
         try self.enforceVectorMigrationConfigurationGate();
@@ -11962,7 +12020,21 @@ pub const DB = struct {
 
     pub const ensurePrimaryOnlySnapshotLocked = db_restore.ensurePrimaryOnlySnapshotLocked;
 
-    pub const ensurePrimaryOnlySnapshot = db_restore.ensurePrimaryOnlySnapshot;
+    pub fn ensureSnapshotStorageLocked(self: *DB, include_generated: bool) !void {
+        if (include_generated and self.local_execution.table_storage.dense_embeddings == .vector_store) {
+            if (!try self.sealedBackupSupportedLocked()) return error.VectorStoreLifecycleUnsupported;
+            return self.requireQueryCutStorage();
+        }
+        return self.ensurePrimaryOnlySnapshotLocked();
+    }
+
+    pub fn ensureSnapshotStorage(self: *DB, include_generated: bool) !void {
+        lockApplyShared(self);
+        defer self.core.unlockApplyShared();
+        try self.ensureSnapshotStorageLocked(include_generated);
+    }
+
+
 
     pub const snapshotInternal = db_restore.snapshotInternal;
 
@@ -23011,7 +23083,10 @@ pub const DB = struct {
     ) anyerror!doc_set.ResolvedDocSet {
         const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
         const duration_ns = ttlDurationNs(self);
-        var identity_visible = if (try self.allDocsVisibleAtGeneration(generation))
+        // A bounded candidate set can be checked directly when the summary
+        // is absent. Recomputing full stats for every batch defeats pruning.
+        const all_visible = if (set.* == .all) try self.allDocsVisibleAtGeneration(generation) else try self.allDocsVisibleSummaryFast(generation);
+        var identity_visible = if (all_visible)
             try doc_set.cloneAlloc(alloc, set)
         else if (set.* == .all)
             try self.broadLiveDocSetCachedAlloc(alloc, generation)
@@ -23023,6 +23098,23 @@ pub const DB = struct {
         const ttl_visible = try self.ttlVisibleResolvedDocSetNoLockAlloc(alloc, &identity_visible, generation, duration_ns);
         identity_visible.deinit(alloc);
         return ttl_visible;
+    }
+
+    /// The adaptive text path is identity-only; TTL tables retain their full
+    /// visibility fallback. Its bulk scan must obey the request deadline.
+    pub fn textLiveFilterDocSetControlledCallback(ctx: ?*anyopaque, alloc: Allocator, set: *const doc_set.ResolvedDocSet, generation: ?u64, control: db_query_search.QueryExecutionControl) anyerror!doc_set.ResolvedDocSet {
+        const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+        try control.check();
+        if (ttlDurationNs(self) != 0) return error.UnsupportedQueryRequest;
+        var result = if (try self.allDocsVisibleSummaryFast(generation))
+            try doc_set.cloneAlloc(alloc, set)
+        else if (set.* == .all)
+            try self.broadLiveDocSetCachedAllocControlled(alloc, generation, control)
+        else
+            try doc_identity.visibleFilteredDocSetFromStoreAlloc(alloc, self.core.store, set, generation);
+        errdefer result.deinit(alloc);
+        try control.check();
+        return result;
     }
 
     fn ttlVisibleResolvedDocSetNoLockAlloc(
@@ -23054,9 +23146,13 @@ pub const DB = struct {
     }
 
     fn broadLiveDocSetCachedAlloc(self: *DB, alloc: Allocator, generation: ?u64) !doc_set.ResolvedDocSet {
-        const all_set: doc_set.ResolvedDocSet = .all;
+        return self.broadLiveDocSetCachedAllocControlled(alloc, generation, .{});
+    }
+
+    fn broadLiveDocSetCachedAllocControlled(self: *DB, alloc: Allocator, generation: ?u64, control: db_query_search.QueryExecutionControl) !doc_set.ResolvedDocSet {
+        try control.check();
         const gen = generation orelse {
-            return try doc_identity.visibleFilteredDocSetFromStoreAlloc(alloc, self.core.store, &all_set, generation);
+            return (try doc_identity.visiblePrimaryDocSetIfCompleteFromStoreAllocControlled(alloc, self.core.store, generation, control)) orelse .all;
         };
         {
             lockAtomic(&self.core.identity_visibility.live_mutex);
@@ -23067,7 +23163,7 @@ pub const DB = struct {
                 }
             }
         }
-        var computed = try doc_identity.visibleFilteredDocSetFromStoreAlloc(alloc, self.core.store, &all_set, generation);
+        var computed = (try doc_identity.visiblePrimaryDocSetIfCompleteFromStoreAllocControlled(alloc, self.core.store, generation, control)) orelse doc_set.ResolvedDocSet.all;
         errdefer computed.deinit(alloc);
         if (doc_set.cloneAlloc(self.alloc, &computed)) |cloned| {
             lockAtomic(&self.core.identity_visibility.live_mutex);
@@ -36056,7 +36152,20 @@ fn resetPath(path: []const u8) !void {
 pub fn applyDerivedBatchToIndexAsync(ctx_ptr: *anyopaque, batch: derived_types.DerivedBatch, index_ref: index_manager_mod.ManagedIndexRef, token: derived_executor_mod.CatchUpSessionToken) !bool {
     const ctx: *AsyncContext = @ptrCast(@alignCast(ctx_ptr));
     if (comptime storage_engine.enabled) return storage_engine.call(@src().fn_name, .{ ctx, batch, index_ref, token });
-    if (!try batchAffectsManagedIndexForReplay(ctx.index_manager, batch, index_ref)) return false;
+    if (!try batchAffectsManagedIndexForReplay(ctx.index_manager, batch, index_ref)) {
+        // A successful extraction manifest is not a graph source row. Settle
+        // its repair metadata before advancing this otherwise empty window;
+        // journal replay retries cleanup after a crash or transient failure.
+        const has_asset_root = for (batch.changed_artifact_keys) |key| {
+            if (internal_keys.isAssetArtifactKey(key)) break true;
+        } else false;
+        if (has_asset_root) {
+            var replay = try acquireSnapshotReplayAsyncContext(ctx);
+            defer if (replay) |*lease| lease.release();
+            try local_mutation.clearPublishedAssetArtifactRepairIssuesContext(ctx, index_ref.name, batch.changed_artifact_keys, batch.sequence);
+        }
+        return false;
+    }
     if (index_ref.kind == .dense_vector and ctx.dense_admission.external_sessions.load(.acquire) != 0) {
         return error.ReplayDocumentNotVisible;
     }
@@ -43258,8 +43367,8 @@ test "db index catalog barrier canceled query capture unwinds staging and permit
         fn check(raw: *const anyopaque) !void {
             const self: *@This() = @ptrCast(@alignCast(@constCast(raw)));
             // Let maintenance and capture admission finish, then cancel at
-            // exactly the catalog-reader drain which crashed the CI server.
-            self.canceled = self.canceled or self.db.indexCatalogBarrierActive();
+            // the shared catalog pin, without waiting for existing readers.
+            self.canceled = self.canceled or self.db.publishedDenseSearchCount() > 1;
             if (self.canceled) return self.failure;
         }
     };
@@ -43291,6 +43400,178 @@ test "db index catalog barrier canceled query capture unwinds staging and permit
     try db.captureQueryCut(request, .{});
     try native_query_cut.validate(alloc, io, root, request, db.core.identity_namespace, .{});
     try std.testing.expect(!db.indexCatalogBarrierActive());
+}
+
+test "db query capture seals outside mutation fences and retains the selected generation" {
+    for ([_]bool{ false, true }) |missing_summary| {
+        const alloc = std.testing.allocator;
+        var directory = try TestDirectory.init("query-seal-admission");
+        defer directory.cleanup();
+        const path = std.mem.span(directory.path().ptr);
+        defer cleanupTempDir(directory.path().ptr);
+        const pins = try std.fmt.allocPrint(alloc, "{s}.query-pins", .{path});
+        defer alloc.free(pins);
+        defer std.Io.Dir.cwd().deleteTree(std.testing.io, pins) catch {};
+        var db = try DB.open(alloc, path, .{
+            .identity_namespace = .{ .table_id = 7, .shard_id = 1, .range_id = 1 },
+            .start_index_workers = false,
+            .start_optional_runtime_workers = false,
+            .ttl_cleanup = .{ .enabled = false },
+        });
+        defer db.close();
+        try db.addIndex(.{ .name = "text", .kind = .full_text, .config_json = "{}" });
+        const cut = @import("native/query_cut.zig");
+        const empty_id: [64]u8 = @splat('c');
+        var empty_request: cut.Request = .{ .id = &empty_id, .table_id = 7, .expires_ms = cut.nowMs() + 300_000, .create = true };
+        // A foreground reader/maintenance owner can retain catalog admission
+        // throughout capture. No exclusive reader drain is needed for pins.
+        try std.testing.expect(db.beginPublishedDenseSearch());
+        try db.captureQueryCut(empty_request, .none);
+        db.endPublishedDenseSearch();
+        empty_request.create = false;
+        {
+            var empty = try db.openQueryCut(empty_request, .none);
+            defer empty.close();
+            var empty_hits = try empty.search(alloc, .{ .full_text = .{ .match = .{ .field = "body", .text = "original" } }, .include_stored = false });
+            defer empty_hits.deinit();
+            try std.testing.expectEqual(@as(usize, 0), empty_hits.hits.len);
+        }
+        try db.batch(.{ .writes = &.{.{ .key = "doc", .value = "{\"body\":\"original\"}" }}, .sync_level = .full_index });
+        if (missing_summary) {
+            try db.core.store.putBatch(&.{}, &.{internal_keys.identity_visibility_summary_key[0..]});
+            db.core.identity_visibility.summary = null;
+        }
+        const Probe = struct {
+            db: *DB,
+            replace_index: bool,
+            released: bool = false,
+            failure: ?anyerror = null,
+            fn admitted(_: *anyopaque) void {}
+            fn materialize(raw: *anyopaque) void {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                // Fail without blocking if a regression retains any fence. Only
+                // run synchronous writes after proving admission is available.
+                if (!self.db.core.tryLockApplyExclusive()) return;
+                self.db.core.unlockApply();
+                var capture = self.db.core.snapshot_admission.tryAcquireCapture() orelse return;
+                capture.release();
+                var replay = self.db.core.snapshot_replay_admission.tryAcquireCapture() orelse return;
+                replay.release();
+                if (!self.db.local_execution.index_structural_mutation_mutex.tryLock()) return;
+                self.db.local_execution.index_structural_mutation_mutex.unlock();
+                if (self.db.indexCatalogBarrierActive()) return;
+                self.released = true;
+                self.db.batch(.{ .writes = &.{.{ .key = "doc", .value = "{\"body\":\"replacement\"}" }}, .sync_level = .full_index }) catch |err| {
+                    self.failure = err;
+                    return;
+                };
+                _ = self.db.runLsmMaintenanceStepBestEffort() catch |err| {
+                    self.failure = err;
+                    return;
+                };
+                // Catalog admission requires its maintained summary. The
+                // missing-summary variant exercises conservative reads only.
+                if (!self.replace_index) return;
+                const removed = self.db.deleteIndex("text") catch |err| {
+                    self.failure = err;
+                    return;
+                };
+                if (!removed) {
+                    self.failure = error.TestExpectedEqual;
+                    return;
+                }
+                var drained = false;
+                for (0..1000) |_| {
+                    const progress = self.db.advanceGeneratedArtifactCleanupPage("text") catch |err| {
+                        self.failure = err;
+                        return;
+                    };
+                    if (progress == .idle) {
+                        drained = true;
+                        break;
+                    }
+                    if (progress == .busy) std.testing.io.sleep(.fromMilliseconds(1), .awake) catch {};
+                }
+                if (!drained) {
+                    self.failure = error.TestCleanupDidNotComplete;
+                    return;
+                }
+                self.db.addIndex(.{ .name = "text", .kind = .full_text, .config_json = "{}" }) catch |err| {
+                    self.failure = err;
+                    return;
+                };
+            }
+        };
+        var probe = Probe{ .db = &db, .replace_index = !missing_summary };
+        DB.test_snapshot_fence_hook = .{ .ptr = &probe, .after_capture_admission = Probe.admitted, .before_artifact_materialize = Probe.materialize };
+        defer DB.test_snapshot_fence_hook = null;
+        const id: [64]u8 = @splat('b');
+        var request: cut.Request = .{ .id = &id, .table_id = 7, .expires_ms = cut.nowMs() + 300_000, .create = true };
+        try db.captureQueryCut(request, .none);
+        if (probe.failure) |err| return err;
+        try std.testing.expect(probe.released);
+        request.create = false;
+        var retained = try db.openQueryCut(request, .none);
+        defer retained.close();
+        if (missing_summary) try std.testing.expect(try doc_identity.visibilitySummaryFromStore(retained.core.store) == null);
+        const old = (try retained.get(alloc, "doc")).?;
+        defer alloc.free(old);
+        try std.testing.expect(std.mem.indexOf(u8, old, "original") != null);
+        const current = (try db.get(alloc, "doc")).?;
+        defer alloc.free(current);
+        try std.testing.expect(std.mem.indexOf(u8, current, "replacement") != null);
+        var old_hits = try retained.search(alloc, .{ .full_text = .{ .match = .{ .field = "body", .text = "original" } }, .include_stored = false });
+        defer old_hits.deinit();
+        try std.testing.expectEqual(@as(usize, 1), old_hits.hits.len);
+    }
+}
+
+test "db text visibility native rank benchmark" {
+    if (platform.env.getenv("ANTFLY_TEXT_VISIBILITY_BENCH") == null) return error.SkipZigTest;
+    const alloc = std.heap.c_allocator;
+    var directory = try TestDirectory.init("text-visibility-bench");
+    defer directory.cleanup();
+    defer cleanupTempDir(directory.path().ptr);
+    var db = try DB.open(alloc, std.mem.span(directory.path().ptr), .{
+        .start_index_workers = false,
+        .start_optional_runtime_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+    try db.addIndex(.{ .name = "text", .kind = .full_text, .config_json = "{}" });
+    var start: usize = 0;
+    while (start < 100_000) : (start += 1000) {
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        var writes: [1000]types.BatchWrite = undefined;
+        for (&writes, start..) |*write, i| write.* = .{
+            .key = try std.fmt.allocPrint(arena.allocator(), "doc:{d:0>8}", .{i}),
+            .value = if (i % 10_000 == 0) "{\"body\":\"Lolita ghislain raretoken\"}" else "{\"body\":\"ordinary common text document\"}",
+        };
+        try db.batch(.{ .writes = &writes, .sync_level = .full_index });
+    }
+    try db.batch(.{ .deletes = &.{"doc:00000001"}, .sync_level = .full_index });
+    const Rank = struct {
+        fn rank(_: *const anyopaque, doc: u32) u64 {
+            return @as(u64, std.math.maxInt(u32)) - doc;
+        }
+    };
+    const queries = [_]struct { name: []const u8, query: types.TextQuery }{
+        .{ .name = "rare", .query = .{ .match = .{ .field = "body", .text = "Lolita" } } },
+        .{ .name = "common", .query = .{ .match = .{ .field = "body", .text = "ordinary" } } },
+        .{ .name = "prefix", .query = .{ .prefix = .{ .field = "body", .prefix = "ghisl" } } },
+    };
+    for (queries) |query| {
+        var samples: [5]u64 = undefined;
+        for (0..6) |i| {
+            const began = monotonicTimeNs();
+            var result = try db.search(alloc, .{ .full_text = query.query, .limit = 10, .include_stored = false, .native_text_tie_rank = .{ .ptr = &db, .rank = Rank.rank } });
+            defer result.deinit();
+            if (i != 0) samples[i - 1] = (monotonicTimeNs() - began) / std.time.ns_per_us;
+            try std.testing.expectEqual(@as(usize, 10), result.hits.len);
+        }
+        std.debug.print("TEXT_VISIBILITY_BENCH docs=100000 query={s} warm_us={any}\n", .{ query.name, samples });
+    }
 }
 
 test "db published dense admission cannot overflow into catalog closure" {
@@ -77031,6 +77312,9 @@ test "source vector migration cancellation restores sealed backup capability wit
     try std.testing.expect(db.local_execution.source_vectors.load(.acquire) != null);
     try std.testing.expect((try db.relationalTopologyIdentity()).backup_seal_supported);
     try std.testing.expect(try db.snapshotNative("cancelled") > 0);
+    const cancelled_vectors = try std.fmt.allocPrint(alloc, "{s}.snapshots/cancelled/source-vectors", .{path});
+    defer alloc.free(cancelled_vectors);
+    try std.testing.expect(!try snapshotPathExists(db.backend_runtime.filesystemIo().?, cancelled_vectors));
     db.close();
     db = try DB.open(alloc, path, options);
     try std.testing.expect(db.local_execution.source_vectors.load(.acquire) == null);
@@ -77045,7 +77329,10 @@ test "source vector migration cancellation restores sealed backup capability wit
     } else return error.VectorMigrationDidNotFinish;
     try db.publishVectorMigration("publish");
     try std.testing.expect(!(try db.relationalTopologyIdentity()).backup_seal_supported);
-    try std.testing.expectError(error.VectorStoreLifecycleUnsupported, db.snapshotNative("published"));
+    try std.testing.expectError(error.VectorStoreLifecycleUnsupported, db.snapshotNative("consolidating"));
+    try completeVectorMigrationForTest(&db, "publish");
+    try std.testing.expect((try db.relationalTopologyIdentity()).backup_seal_supported);
+    try std.testing.expect(try db.snapshotNative("published") > 0);
 }
 
 test "source vector migration budget rejection is retryable and cancellation survives restart" {
@@ -80828,6 +81115,42 @@ test "logical query readiness distinguishes unrelated replay from unapplied text
     try std.testing.expectError(error.IndexRebuilding, db.search(a, request));
 }
 
+test "grouped sources production yields across producer replacement and resumes durable work" {
+    const a = std.testing.allocator;
+    var tmp = try TestDirectory.init("grouped-producer-replacement");
+    defer tmp.cleanup();
+    const db = try DB.openOwned(a, std.mem.span(tmp.path().ptr), .{
+        .start_optional_runtime_workers = false,
+        .enrichment = .{ .enable_without_producers = true },
+    });
+    defer db.closeOwned();
+    try db.addEnrichment(.{
+        .name = "turns",
+        .kind = .group,
+        .source = .{ .group_by = "thread_id", .order_by = "ordinal", .segment_by = "turn_id", .field = "text" },
+    });
+    const Probe = struct {
+        var called: bool = false;
+        fn run(live: *DB) !void {
+            called = true;
+            const before = live.group_source_owner.state.submitted;
+            try std.testing.expect(!try live.runGroupSourceSlice());
+            try std.testing.expectEqual(before, live.group_source_owner.state.submitted);
+            try std.testing.expect(live.group_source_owner.state.worker == null);
+        }
+    };
+    // The replacement hook runs after constructing the new producer while
+    // still owning the old one. The old implementation entered a group
+    // mutation here, leaving a runtime borrow racing its eventual destruction.
+    Probe.called = false;
+    DB.test_enrichment_reconfigure_after_detached_hook = Probe.run;
+    defer DB.test_enrichment_reconfigure_after_detached_hook = null;
+    try db.reconfigureEnrichmentRuntime(.{ .enable_without_producers = true });
+    try std.testing.expect(Probe.called);
+    try std.testing.expect(try db.runGroupSourceSlice());
+    try std.testing.expect(db.group_source_owner.state.submitted > 0);
+}
+
 test "grouped sources production publishes private units incrementally across delete and reopen" {
     if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
     const a = std.testing.allocator;
@@ -81358,4 +81681,139 @@ test "logical source certificates skip revision reads across unrelated writes an
         try std.testing.expect(std.mem.indexOf(u8, rows[0].bytes.?, "new") != null);
     }
     try std.testing.expectEqual(@as(usize, 1), db.core.store.source_certificates.entries.count());
+}
+
+test "source vector sealed backup retains exact payloads across writes and portable native restore" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/source", .{tmp.sub_path});
+    defer a.free(path);
+    const options: OpenOptions = .{ .identity_namespace = .{ .table_id = 7, .shard_id = 1 }, .table_storage = .{ .dense_embeddings = .vector_store }, .start_optional_runtimes = false, .start_index_workers = false };
+    var source = try DB.open(a, path, options);
+    defer source.close();
+    try source.addIndex(.{ .name = "model", .kind = .dense_vector, .config_json = "{\"field\":\"embedding\",\"dims\":3,\"external\":true}" });
+    try source.batch(.{ .writes = &.{.{ .key = "doc", .value = "{\"text\":\"before\",\"_embeddings\":{\"model\":[1,0,0]}}" }}, .sync_level = .full_index });
+    const key = try expectedDocumentEmbeddingArtifactKeyAlloc(a, "doc", "model");
+    defer a.free(key);
+    // Retention must not depend on fitting a still-active vector WAL into
+    // the remaining primary/generated copy budget. Immutable WAL rotation
+    // can retain the exact authority without copying the payload bytes.
+    const payload_mod = @import("../artifact_payload.zig");
+    const source_vectors = source.local_execution.source_vectors.load(.acquire).?;
+    const prepared = try enrichment_artifact_codec.encodeDenseEmbeddingAlloc(a, 9, &.{ 0, 0, 1 });
+    defer a.free(prepared);
+    {
+        const session = try payload_mod.Session.create(a, source_vectors.interface());
+        defer session.release();
+        _ = try session.put(key, prepared);
+        try session.prepareCommit();
+    }
+    const zero_budget_root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/zero-budget-vectors", .{tmp.sub_path});
+    defer a.free(zero_budget_root);
+    var remaining_wal: u64 = 0;
+    try std.testing.expect(try source_vectors.sealQuerySnapshot(std.testing.io, zero_budget_root, &remaining_wal, .none) > 0);
+    try std.testing.expectEqual(@as(u64, 0), remaining_wal);
+    const identity = try source.relationalTopologyIdentity();
+    try std.testing.expect(identity.backup_seal_supported);
+    const fence: @import("relational_integrity_topology.zig").Fence = .{ .role = .backup_snapshot, .transition_id = 900, .attempt = 1, .peer_group_id = 1, .owner_group_id = 1, .admission_epoch = identity.next_epoch, .namespace = identity.namespace, .catalog_digest = identity.catalog_digest };
+    try source.applyRelationalTopologyControl(.{ .fence = fence, .action = .begin }, null);
+    const handle = try source.sealBackupCohort("vectors", fence, .none);
+    try source.applyRelationalTopologyControl(.{ .fence = fence, .action = .release }, null);
+    try source.batch(.{ .writes = &.{.{ .key = "doc", .value = "{\"text\":\"after\",\"_embeddings\":{\"model\":[0,1,0]}}" }}, .sync_level = .full_index });
+    try source.sync(true);
+    try source.sync(true);
+    try std.testing.expect(try source.snapshotNative("direct-vectors") > 0);
+    try std.testing.expect(try source.exportBackupCohort(handle, "vectors", .none) > 0);
+    const snapshot = try std.fmt.allocPrint(a, "{s}.snapshots/vectors", .{path});
+    defer a.free(snapshot);
+    const restored_path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/native", .{tmp.sub_path});
+    defer a.free(restored_path);
+    // The native archive carries the declared generation inventory. The
+    // local export retry receipt is transport bookkeeping, omitted by AFB.
+    const receipt = try std.fs.path.join(a, &.{ snapshot, "backup-seal-receipt.json" });
+    defer a.free(receipt);
+    try std.Io.Dir.cwd().deleteFile(std.testing.io, receipt);
+    var generation = (try native_backup.validateAndMaterializeWithCancellation(a, std.testing.io, snapshot, restored_path, .none)) orelse return error.TestUnexpectedResult;
+    defer generation.deinit();
+    {
+        var restored = try DB.open(a, restored_path, .{ .open_mode = .query_readonly, .start_optional_runtimes = false, .start_index_workers = false });
+        defer restored.close();
+        try std.testing.expectEqual(.vector_store, restored.local_execution.table_storage.dense_embeddings);
+        const bytes = try restored.core.store.get(a, key);
+        defer a.free(bytes);
+        const vector = try enrichment_artifact_codec.decodeDenseEmbeddingAlloc(a, bytes);
+        defer a.free(vector);
+        try std.testing.expectEqualSlices(f32, &.{ 1, 0, 0 }, vector);
+    }
+    var output = std.Io.Writer.Allocating.init(a);
+    defer output.deinit();
+    try source.exportBackupCohortPortable(handle, &output.writer, .{}, .none);
+    const portable_path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/portable", .{tmp.sub_path});
+    defer a.free(portable_path);
+    var restored = try DB.open(a, portable_path, .{ .identity_namespace = identity.namespace, .start_optional_runtimes = false, .start_index_workers = false });
+    defer restored.close();
+    _ = try portable_backup.importPortableWithOptions(a, restored.core.store, output.written(), .{ .unpublished_staging = true, .cohort = .{ .seal = handle, .namespace = identity.namespace } });
+    try std.testing.expectEqual(.primary_lsm, restored.local_execution.table_storage.dense_embeddings);
+    const bytes = try restored.core.store.get(a, key);
+    defer a.free(bytes);
+    const vector = try enrichment_artifact_codec.decodeDenseEmbeddingAlloc(a, bytes);
+    defer a.free(vector);
+    try std.testing.expectEqualSlices(f32, &.{ 1, 0, 0 }, vector);
+}
+
+test "db successful asset publication clears terminal debt but stale and failed publications do not" {
+    const a = std.testing.allocator;
+    var tmp = try TestDirectory.init("asset-repair-publication");
+    defer tmp.cleanup();
+    var db = try DB.open(a, tmp.path(), .{ .start_optional_runtimes = false, .start_index_workers = false });
+    defer db.close();
+    try db.addIndex(.{ .name = "text", .kind = .full_text, .config_json = "{}" });
+    const key = try internal_keys.artifactNamedPrefixAlloc(a, "doc", "asset", "units");
+    defer a.free(key);
+    try recordArtifactRepairIssueContextDetailed(db.async_context, .asset, "text", "doc", "", "", "units", "", "units", key, null, 5, .enrichment_failed, 1, "RemoteDocumentFetchFailed");
+    try db.core.store.put(key, "{\"route_type\":\"error\",\"merge_plan\":{\"status\":\"failed\"},\"chunk_count\":0}");
+    const batch: derived_types.DerivedBatch = .{ .sequence = 6, .changed_artifact_keys = &.{key} };
+    try local_mutation.applyDerivedBatchToIndexContext(db.async_context, batch, .{ .name = "text", .kind = .full_text });
+    {
+        const issues = try db.listArtifactRepairIssues(a, .asset, "text", 0);
+        defer types.freeArtifactRepairIssues(a, issues);
+        try std.testing.expectEqual(@as(usize, 1), issues.len);
+    }
+    try db.core.store.put(key, "{\"route_type\":\"text\",\"merge_plan\":{\"status\":\"in_progress\"},\"unit_count\":1}");
+    try local_mutation.applyDerivedBatchToIndexContext(db.async_context, batch, .{ .name = "text", .kind = .full_text });
+    {
+        const issues = try db.listArtifactRepairIssues(a, .asset, "text", 0);
+        defer types.freeArtifactRepairIssues(a, issues);
+        try std.testing.expectEqual(@as(usize, 1), issues.len);
+    }
+    try db.core.store.put(key, "{\"route_type\":\"pdf\",\"merge_plan\":{\"status\":\"converged\"},\"unit_count\":1,\"chunk_count\":1,\"ocr_failed_count\":1}");
+    try local_mutation.applyDerivedBatchToIndexContext(db.async_context, batch, .{ .name = "text", .kind = .full_text });
+    {
+        const issues = try db.listArtifactRepairIssues(a, .asset, "text", 0);
+        defer types.freeArtifactRepairIssues(a, issues);
+        try std.testing.expectEqual(@as(usize, 1), issues.len);
+    }
+    try db.core.store.put(key, "{\"route_type\":\"text\",\"merge_plan\":{\"status\":\"converged\"},\"unit_count\":1,\"chunk_count\":1}");
+    var stale = batch;
+    stale.sequence = 4;
+    try local_mutation.applyDerivedBatchToIndexContext(db.async_context, stale, .{ .name = "text", .kind = .full_text });
+    {
+        const issues = try db.listArtifactRepairIssues(a, .asset, "text", 0);
+        defer types.freeArtifactRepairIssues(a, issues);
+        try std.testing.expectEqual(@as(usize, 1), issues.len);
+    }
+    try local_mutation.applyDerivedBatchToIndexContext(db.async_context, batch, .{ .name = "text", .kind = .full_text });
+    try db.runArtifactRepairMetadataMaintenanceUntilIdle();
+    const issues = try db.listArtifactRepairIssues(a, .asset, "text", 0);
+    defer types.freeArtifactRepairIssues(a, issues);
+    try std.testing.expectEqual(@as(usize, 0), issues.len);
+    try db.addIndex(.{ .name = "graph", .kind = .graph, .config_json = "{}" });
+    try recordArtifactRepairIssueContextDetailed(db.async_context, .asset, "graph", "doc", "", "", "units", "", "units", key, null, 5, .enrichment_failed, 1, "ConnectionRefused");
+    // Root manifests are metadata, not extraction-relation rows. Replay must
+    // settle their debt even when no graph projection work is applicable.
+    try std.testing.expect(!try applyDerivedBatchToIndexAsync(db.async_context, batch, .{ .name = "graph", .kind = .graph }, .{}));
+    const graph_issues = try db.listArtifactRepairIssues(a, .asset, "graph", 0);
+    defer types.freeArtifactRepairIssues(a, graph_issues);
+    try std.testing.expectEqual(@as(usize, 0), graph_issues.len);
 }

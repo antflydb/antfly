@@ -18,6 +18,9 @@
 
 const db_zig = @import("db.zig");
 const DB = db_zig.DB;
+const benchQueryProfileEnabled = db_zig.benchQueryProfileEnabled;
+const QueryCaptureProfile = db_zig.QueryCaptureProfile;
+const vector_payload_store_mod = @import("../vector_payload_store.zig");
 const RelationalProjectionPlan = @import("query/relational_projection.zig").Plan;
 const TestDirectory = @import("../../common/test_directory.zig").TestDirectory;
 const antfly_test_error_logs = @import("antfly_test_error_logs");
@@ -1066,6 +1069,21 @@ pub fn exportBackupCohortPortable(self: *DB, handle: native_backup_seal.Handle, 
         defer backend.close();
         var store = try docstore_mod.DocStore.openRuntime(self.alloc, try backend.runtimeStore(self.alloc, .{ .name = "docs" }));
         defer store.close();
+        // Export references through the sealed source-vector authority,
+        // never through the current live store or its GC generation.
+        var vector_storage = try lsm_backend_mod.NativeStorage.init(self.alloc, .threaded);
+        defer vector_storage.deinit();
+        var vector_source: ?vector_payload_store_mod.Store = null;
+        defer if (vector_source) |*source| source.deinit();
+        defer store.configurePayloadPolicy(null, false, null);
+        const vector_root = try std.fs.path.join(self.alloc, &.{ root, "source-vectors" });
+        defer self.alloc.free(vector_root);
+        const vector_current = try std.fs.path.join(self.alloc, &.{ vector_root, "CURRENT" });
+        defer self.alloc.free(vector_current);
+        if (try snapshotPathExists(io, vector_current)) {
+            vector_source = try vector_payload_store_mod.Store.open(self.alloc, vector_storage.storage(), vector_root, true);
+            store.configurePayloadPolicy(vector_source.?.interface(), false, null);
+        }
         try portable_backup.exportPortableToWriterWithOptions(self.alloc, &store, writer, export_options);
     } else if (std.mem.eql(u8, opened.parsed.value.primary.artifact_format, "antfly-kv-stream")) {
         // Logical-backend pins are already a bounded KV stream. Decode
@@ -1107,6 +1125,7 @@ pub fn cancelBackupCohort(self: *DB, fence: relational_integrity_topology.Fence)
 }
 
 pub fn primaryOnlySnapshotSupportedLocked(self: *DB) !bool {
+    if (self.local_execution.vector_migration_active.load(.acquire)) return false;
     if (self.local_execution.table_storage.dense_embeddings != .primary_lsm) return false;
     if (self.local_execution.source_vectors.load(.acquire) == null) return true;
     // Cancellation retains the source object for already-admitted readers
@@ -1126,30 +1145,32 @@ pub fn ensurePrimaryOnlySnapshotLocked(self: *DB) !void {
     if (!try self.primaryOnlySnapshotSupportedLocked()) return error.VectorStoreLifecycleUnsupported;
 }
 
-pub fn ensurePrimaryOnlySnapshot(self: *DB) !void {
-    lockApplyShared(self);
-    defer self.core.unlockApplyShared();
-    try self.ensurePrimaryOnlySnapshotLocked();
-}
+
 
 pub fn snapshotInternal(
     self: *DB,
     id: []const u8,
-    include_generated: bool,
+    requested_generated: bool,
     cancellation: types.CancellationToken,
     maintenance_deadline_ns: ?u64,
-    expected_topology_fence: ?relational_integrity_topology.Fence,
+    expected_topology_fence: ?@import("relational_integrity_topology.zig").Fence,
     backup_seal_only: bool,
-    query_cut: ?native_query_cut.Request,
+    query_cut: ?@import("native/query_cut.zig").Request,
 ) !u64 {
-    if (comptime storage_engine.enabled) return storage_engine.call(@src().fn_name, .{ self, id, include_generated, cancellation, maintenance_deadline_ns, expected_topology_fence, backup_seal_only, query_cut });
+    if (comptime storage_engine.enabled) return storage_engine.call("snapshotInternal", .{ self, id, requested_generated, cancellation, maintenance_deadline_ns, expected_topology_fence, backup_seal_only, query_cut });
     const seal_only = backup_seal_only or query_cut != null;
-    if (query_cut == null) try self.ensurePrimaryOnlySnapshot();
+    // Out-of-line payloads require their immutable physical authority even
+    // for the embedded snapshot API; a primary-only KV copy is incomplete.
+    const include_generated = requested_generated or self.local_execution.table_storage.dense_embeddings == .vector_store;
+    var profile = QueryCaptureProfile.init(query_cut != null and benchQueryProfileEnabled(), "snapshot_publication_lock");
+    defer profile.finish();
+    if (query_cut == null and !backup_seal_only) try self.ensureSnapshotStorage(include_generated);
     // Serialize only snapshot construction/publication. Normal writes can
     // resume before native manifest hashing, while same-ID captures cannot
     // race the fresh-directory check or atomic rename.
     try lockAtomicWithCancellation(&self.snapshot_publication_mutex, cancellation);
     defer self.snapshot_publication_mutex.unlock();
+    profile.next("staging");
     try ensureSnapshotActive(cancellation);
     try validateSnapshotId(id);
     if (include_generated) {
@@ -1172,7 +1193,7 @@ pub fn snapshotInternal(
     const io = self.backend_runtime.filesystemIo() orelse return error.BackendRuntimeIoUnavailable;
     const snapshot_parent = try std.fmt.allocPrint(self.alloc, "{s}.{s}", .{ self.core.path, if (query_cut != null) "query-pins" else if (seal_only) "backup-pins" else "snapshots" });
     defer self.alloc.free(snapshot_parent);
-    var pin_lock: ?native_backup_seal.StoreLock = if (backup_seal_only) try native_backup_seal.StoreLock.acquire(self.alloc, io, self.core.path, cancellation) else null;
+    var pin_lock: ?@import("native/backup_seal.zig").StoreLock = if (backup_seal_only) try @import("native/backup_seal.zig").StoreLock.acquire(self.alloc, io, self.core.path, cancellation) else null;
     defer if (pin_lock) |*held| held.deinit();
     const snapshot_root = try std.fmt.allocPrint(self.alloc, "{s}/{s}", .{ snapshot_parent, id });
     defer self.alloc.free(snapshot_root);
@@ -1182,7 +1203,7 @@ pub fn snapshotInternal(
         defer self.alloc.free(tombstone);
         if (try snapshotPathExists(io, tombstone)) return error.BackupSealReleased;
         if (try snapshotPathExists(io, snapshot_root)) {
-            if (query_cut) |request| try native_query_cut.validate(self.alloc, io, snapshot_root, request, self.core.identity_namespace, cancellation) else _ = try native_backup_seal.readHandle(self.alloc, io, snapshot_root, expected_topology_fence.?);
+            if (query_cut) |request| try @import("native/query_cut.zig").validate(self.alloc, io, snapshot_root, request, self.core.identity_namespace, cancellation) else _ = try @import("native/backup_seal.zig").readHandle(self.alloc, io, snapshot_root, expected_topology_fence.?);
             return 0;
         }
     } else if (try snapshotPathExists(io, snapshot_root)) return error.SnapshotAlreadyExists;
@@ -1246,6 +1267,7 @@ pub fn snapshotInternal(
     // barrier is writer preferring, so continuous client traffic cannot
     // starve capture. Internal enrichment and resolution callbacks remain
     // admitted while maintenance drains already-committed work.
+    profile.next("snapshot_admission");
     var capture = self.core.snapshot_admission.acquireCaptureIo(io, @as(?types.CancellationToken, cancellation)) catch |err| switch (err) {
         error.Cancelled => return error.Canceled,
         else => return err,
@@ -1253,7 +1275,7 @@ pub fn snapshotInternal(
     defer capture.release();
     // Migration may have won admission after the optimistic entry check.
     // Its structural mutation uses this same snapshot fence.
-    if (query_cut == null) try self.ensurePrimaryOnlySnapshot() else try self.requireQueryCutStorage();
+    if (query_cut == null and !backup_seal_only) try self.ensureSnapshotStorage(include_generated) else try self.requireQueryCutStorage();
     if (builtin.is_test) {
         if (DB.test_snapshot_fence_hook) |hook| hook.after_capture_admission(hook.ptr);
     }
@@ -1271,6 +1293,7 @@ pub fn snapshotInternal(
     // optimistic loop, primary writes and catalog churn are already barred,
     // so an external write stream cannot keep this loop alive forever.
     while (true) {
+        profile.next("maintenance_drain");
         const target_sequence = self.currentMaintenanceTargetSequence();
         self.runMaintenanceUntilWithEnrichmentCompletion(
             target_sequence,
@@ -1286,20 +1309,24 @@ pub fn snapshotInternal(
         try self.flushAppliedSequencesForIdle();
 
         if (query_cut != null) {
+            profile.next("structural_mutation_lock");
             try lockAtomicWithCancellation(&self.local_execution.index_structural_mutation_mutex, cancellation);
+            profile.next("projection_worker_drain");
             structural = .{
                 .db = self,
                 .snapshot_mutation = capture.borrowMutation(),
                 .operation = "native query cut",
                 .index_name = "*",
-                .restart_text_merge = self.quiesceTextMergeForStructuralMutation(),
-                .restart_sparse_compaction = self.quiesceSparseCompactionForStructuralMutation(),
+                .restart_text_merge = false,
+                .restart_sparse_compaction = false,
             };
-            try structural.?.acquireCatalogBarrierWithCancellation(io, cancellation);
+            profile.next("catalog_pin");
+            try structural.?.acquireCatalogReadWithCancellation(io, cancellation);
         } else {
             structural = self.beginDrainedIndexStructuralMutationWithLease("native snapshot", "*", capture.borrowMutation());
             if (!structural.?.acquireCatalogBarrierUntil(std.math.maxInt(u64))) unreachable;
         }
+        profile.next("replay_admission");
         replay_capture = self.core.snapshot_replay_admission.acquireCaptureIo(
             io,
             @as(?types.CancellationToken, cancellation),
@@ -1308,6 +1335,7 @@ pub fn snapshotInternal(
             else => return err,
         };
         if (query_cut != null) {
+            profile.next("apply_lock");
             try self.enforcePortableRuntimeGate();
             while (!self.core.tryLockApplyExclusive()) {
                 try cancellation.check();
@@ -1332,13 +1360,14 @@ pub fn snapshotInternal(
         structural = null;
     }
 
-    if (query_cut == null) try self.ensurePrimaryOnlySnapshotLocked() else try self.requireQueryCutStorage();
+    profile.next("checkpoint_pin");
+    if (query_cut == null and !backup_seal_only) try self.ensureSnapshotStorageLocked(include_generated) else try self.requireQueryCutStorage();
     if (expected_topology_fence) |expected| {
         var read = try self.core.store.beginProbeTxn();
         defer read.abort();
         var manager = try self.core.initTxnManager();
         defer manager.deinit();
-        try relational_integrity_topology.requireDrained(&read, &manager, expected);
+        try @import("relational_integrity_topology.zig").requireDrained(&read, &manager, expected);
     }
     try self.core.syncStore(true);
     try self.core.index_manager.syncAll(true);
@@ -1455,17 +1484,45 @@ pub fn snapshotInternal(
     );
     defer generated_metadata.deinit();
 
-    if (seal_only) {
-        const seal = native_backup_seal;
-        const wal_bytes = try generated_checkpoints.walPrefixBytes();
+    const seal = @import("native/backup_seal.zig");
+    const wal_bytes = try generated_checkpoints.walPrefixBytes();
+    var vector_bytes: u64 = 0;
+    // Cancelled migrations retain a candidate for admitted old readers,
+    // but the current primary generation is entirely inline. It must not
+    // depend on that retired candidate's files or WAL admission budget.
+    const source_authoritative = self.local_execution.table_storage.dense_embeddings == .vector_store or
+        self.local_execution.vector_migration_active.load(.acquire);
+    if (source_authoritative) if (self.local_execution.source_vectors.load(.acquire)) |source| {
         if (wal_bytes > seal.wal_budget_bytes) return error.BackupSealWalBudgetExceeded;
-        var vector_bytes: u64 = 0;
-        if (query_cut != null) if (self.local_execution.source_vectors.load(.acquire)) |source| {
-            const vector_root = try std.fs.path.join(self.alloc, &.{ staging_root, "source-vectors" });
-            defer self.alloc.free(vector_root);
-            var remaining_wal = seal.wal_budget_bytes - wal_bytes;
-            vector_bytes = try source.sealQuerySnapshot(io, vector_root, &remaining_wal, cancellation);
+        const vector_root = try std.fs.path.join(self.alloc, &.{ staging_root, "source-vectors" });
+        defer self.alloc.free(vector_root);
+        var remaining_wal = seal.wal_budget_bytes - wal_bytes;
+        vector_bytes = try source.sealQuerySnapshot(io, vector_root, &remaining_wal, cancellation);
+    };
+    if (seal_only) {
+        if (wal_bytes > seal.wal_budget_bytes) return error.BackupSealWalBudgetExceeded;
+        // The source-vector generation and every primary/generated
+        // checkpoint are now retained independently of live publication.
+        // Compute reuse eligibility under the fence, then let writers and
+        // maintenance resume before WAL sealing, inventory and fsyncs.
+        const reuse_digest = if (query_cut != null) reuse: {
+            const final_digest = try self.nativeQueryReuseDigestLocked(self.alloc);
+            break :reuse if (query_reuse_digest != null and final_digest != null and std.mem.eql(u8, &query_reuse_digest.?, &final_digest.?)) query_reuse_digest else null;
+        } else null;
+        self.core.unlockApply();
+        apply_held = false;
+        if (builtin.is_test) if (DB.test_snapshot_fence_hook) |hook| {
+            if (hook.after_apply_release) |run| run(hook.ptr);
         };
+        replay_capture.?.release();
+        replay_capture = null;
+        structural.?.release();
+        structural = null;
+        capture.release();
+        if (builtin.is_test) if (DB.test_snapshot_fence_hook) |hook| {
+            if (hook.before_artifact_materialize) |run| run(hook.ptr);
+        };
+        profile.next("seal_and_publish");
         const primary_root = if (query_cut != null) try self.alloc.dupe(u8, staging_root) else try std.fmt.allocPrint(self.alloc, "{s}/primary-lsm", .{staging_root});
         defer self.alloc.free(primary_root);
         var total: u64 = switch (primary_snapshot) {
@@ -1480,9 +1537,7 @@ pub fn snapshotInternal(
         try std.Io.Dir.cwd().deleteTree(io, generated_native_pin_root);
         try std.Io.Dir.cwd().deleteTree(io, generated_metadata_pin_root);
         if (query_cut) |request| {
-            const final_digest = try self.nativeQueryReuseDigestLocked(self.alloc);
-            const reuse_digest = if (query_reuse_digest != null and final_digest != null and std.mem.eql(u8, &query_reuse_digest.?, &final_digest.?)) query_reuse_digest else null;
-            try native_query_cut.finishWithReuseDigest(self.alloc, io, staging_root, request, self.core.identity_namespace, capture_target_sequence, reuse_digest, cancellation);
+            try @import("native/query_cut.zig").finishWithReuseDigest(self.alloc, io, staging_root, request, self.core.identity_namespace, capture_target_sequence, reuse_digest, cancellation);
         } else _ = try seal.finish(self.alloc, io, staging_root, expected_topology_fence.?, capture_target_sequence, .{
             .artifact_format = primary_snapshot.artifactFormat(),
             .artifact_version = primary_snapshot.artifactVersion(),
@@ -1538,18 +1593,17 @@ pub fn snapshotInternal(
         cancellation,
         receipt_sink,
     )) catch return error.FileTooBig;
-    total = std.math.add(u64, total, try native_backup.finalizeCaptureGenerationFromReceiptsWithCancellation(
-        self.alloc,
-        io,
-        &artifact_receipts,
-        capture_target_sequence,
-        .{
-            .artifact_format = primary_snapshot.artifactFormat(),
-            .artifact_version = primary_snapshot.artifactVersion(),
-            .source_backend = @tagName(self.primary_backend),
-        },
-        cancellation,
-    )) catch return error.FileTooBig;
+    total = std.math.add(u64, total, vector_bytes) catch return error.FileTooBig;
+    const primary_manifest: native_backup.Primary = .{
+        .artifact_format = primary_snapshot.artifactFormat(),
+        .artifact_version = primary_snapshot.artifactVersion(),
+        .source_backend = @tagName(self.primary_backend),
+    };
+    const manifest_bytes = if (vector_bytes != 0)
+        try native_backup.finalizeCaptureGenerationWithCancellation(self.alloc, io, staging_root, capture_target_sequence, projections, primary_manifest, cancellation)
+    else
+        try native_backup.finalizeCaptureGenerationFromReceiptsWithCancellation(self.alloc, io, &artifact_receipts, capture_target_sequence, primary_manifest, cancellation);
+    total = std.math.add(u64, total, manifest_bytes) catch return error.FileTooBig;
     try ensureSnapshotActive(cancellation);
     try publishSnapshotStaging(io, snapshot_parent, staging_root, snapshot_root);
     published = true;

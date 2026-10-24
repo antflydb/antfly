@@ -1006,11 +1006,6 @@ pub const BackendRuntime = struct {
     borrowed_filesystem_io: ?Io = null,
     borrowed_filesystem_receiver: ?@import("antfly_runtime_abi").io_abi.Receiver = null,
     borrowed_receivers: ?BorrowedIoReceivers = null,
-    /// One immutable network-only view is shared by purpose-bound outbound
-    /// transports. General filesystem, storage, scheduling, and randomness
-    /// users retain Threaded's native vtable; a partially decorated `Io` must
-    /// not become the process-wide authority for unrelated operations.
-    threaded_network_io_vtable: ?*Io.VTable = null,
     io_impl: ?*IoImpl = null,
     maintenance_scheduler: std.atomic.Value(?*MaintenanceScheduler) = .init(null),
     /// Specialized executor lanes are activated on first use. The runtime is
@@ -1093,8 +1088,6 @@ pub const BackendRuntime = struct {
             } else {
                 const io_impl = try initIoLane(alloc, config.lane_limits.durable_background);
                 errdefer deinitIoLane(alloc, io_impl);
-                const threaded_network_io_vtable = try threaded_connect_io.createVTable(alloc, io_impl);
-                errdefer alloc.destroy(threaded_network_io_vtable);
                 const threaded_jobs = try alloc.create(ThreadedDurableJobLane);
                 errdefer alloc.destroy(threaded_jobs);
                 threaded_jobs.* = ThreadedDurableJobLane.init(alloc, io_impl, owner_registry);
@@ -1102,7 +1095,6 @@ pub const BackendRuntime = struct {
                 errdefer threaded_jobs.deinit();
 
                 runtime.io_impl = io_impl;
-                runtime.threaded_network_io_vtable = threaded_network_io_vtable;
                 runtime.threaded_jobs = threaded_jobs;
                 runtime.durable_jobs = threaded_jobs.lane();
             }
@@ -1191,10 +1183,6 @@ pub const BackendRuntime = struct {
             deinitIoLane(self.alloc, io_impl);
             self.io_impl = null;
         }
-        if (self.threaded_network_io_vtable) |vtable| {
-            self.alloc.destroy(vtable);
-            self.threaded_network_io_vtable = null;
-        }
         self.native_storage_pool.deinit();
         self.alloc.destroy(self.native_storage_pool);
         self.lsm_owner_clone_registry.deinit();
@@ -1250,9 +1238,8 @@ pub const BackendRuntime = struct {
         return self.borrowed_io != null;
     }
 
-    fn threadedNetworkIo(self: *BackendRuntime, io_impl: *IoImpl) Io {
-        const vtable = self.threaded_network_io_vtable orelse return io_impl.io();
-        return threaded_connect_io.io(io_impl, vtable);
+    fn threadedNetworkIo(_: *BackendRuntime, io_impl: *IoImpl) Io {
+        return threaded_connect_io.io(io_impl);
     }
 
     /// I/O authority for synchronous storage work. Unlike `io`, this may be
@@ -3295,7 +3282,7 @@ test "backend runtime inference lane has an isolated bounded executor" {
     try std.testing.expect(
         @backingInt(handle.ptr().inference_io_impl.load(.acquire).?.async_limit) <= handle.ptr().lane_limits.inference,
     );
-    try std.testing.expect(inference_io.vtable == handle.ptr().threaded_network_io_vtable.?);
+    try std.testing.expect(inference_io.vtable == threaded_connect_io.networkVTable());
     try std.testing.expect(
         inference_io.vtable.netConnectIp != handle.ptr().inference_io_impl.load(.acquire).?.io().vtable.netConnectIp,
     );
@@ -3590,7 +3577,7 @@ test "backend runtime separates native operation IO from outbound network IO" {
 
     const runtime = handle.ptr();
     const native_vtable = runtime.io_impl.?.io().vtable;
-    const network_vtable = runtime.threaded_network_io_vtable.?;
+    const network_vtable = threaded_connect_io.networkVTable();
     const native_lanes = [_]Io{
         runtime.io().?,
         runtime.raftInboundIo().?,

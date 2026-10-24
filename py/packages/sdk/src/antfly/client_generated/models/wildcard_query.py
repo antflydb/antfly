@@ -13,21 +13,27 @@ T = TypeVar("T", bound="WildcardQuery")
 
 @_attrs_define
 class WildcardQuery:
-    """
+    """Match post-analysis indexed terms. Patterns are not stemmed; use match for analyzed natural-language input.
+
     Attributes:
         wildcard (str):
+        case_insensitive (bool | Unset): Fold ASCII letter case when matching indexed terms, without stemming the
+            pattern. Default: False.
         field (str | Unset):
         boost (float | None | Unset): A floating-point number used to decrease or increase the relevance scores of a
             query.
     """
 
     wildcard: str
+    case_insensitive: bool | Unset = False
     field: str | Unset = UNSET
     boost: float | None | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         wildcard = self.wildcard
+
+        case_insensitive = self.case_insensitive
 
         field = self.field
 
@@ -44,6 +50,8 @@ class WildcardQuery:
                 "wildcard": wildcard,
             }
         )
+        if case_insensitive is not UNSET:
+            field_dict["case_insensitive"] = case_insensitive
         if field is not UNSET:
             field_dict["field"] = field
         if boost is not UNSET:
@@ -55,6 +63,8 @@ class WildcardQuery:
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
         d = dict(src_dict)
         wildcard = d.pop("wildcard")
+
+        case_insensitive = d.pop("case_insensitive", UNSET)
 
         field = d.pop("field", UNSET)
 
@@ -69,6 +79,7 @@ class WildcardQuery:
 
         wildcard_query = cls(
             wildcard=wildcard,
+            case_insensitive=case_insensitive,
             field=field,
             boost=boost,
         )

@@ -29,6 +29,7 @@ const Owner = struct {
     a: A,
     arena: std.heap.ArenaAllocator,
     source: *local.serverless_query_lake_serving.ServingSource,
+    row_resolver: ?local.serverless_query_lake_serving.ServingSource.RowResolver = null,
     store: Store,
     owns_store: bool = true,
     store_identity: [32]u8,
@@ -152,14 +153,58 @@ const Owner = struct {
     fn nextEntries(self: *Owner, a: A, limit: usize) ![]const ordered.Reader.Entry {
         while (true) {
             const entries = try self.reader.nextEntries(a, limit);
-            if (entries.len != 0 or !try self.advanceProbe()) return entries;
+            if (entries.len != 0 or !try self.advanceProbe()) {
+                if (!self.isRelocated()) return entries;
+                const mapped = try a.dupe(ordered.Reader.Entry, entries);
+                const refs = try a.alloc(local.storage_rowsource_types.RowRef, entries.len);
+                defer a.free(refs);
+                for (entries, refs) |entry, *ref| ref.* = entry.ref;
+                const translated = try self.mapRefs(a, refs);
+                for (mapped, translated) |*entry, ref| entry.ref = ref;
+                a.free(translated);
+                return mapped;
+            }
         }
     }
     fn nextRefs(self: *Owner, a: A, limit: usize) ![]const local.storage_rowsource_types.RowRef {
         while (true) {
             const refs = try self.reader.next(a, limit);
-            if (refs.len != 0 or !try self.advanceProbe()) return refs;
+            if (refs.len != 0 or !try self.advanceProbe()) return self.mapRefs(a, refs);
         }
+    }
+    fn mapRefs(self: *Owner, a: A, refs: []const local.storage_rowsource_types.RowRef) ![]const local.storage_rowsource_types.RowRef {
+        return self.mapRefsLimited(a, refs, null);
+    }
+    fn mapRefsLimited(self: *Owner, a: A, refs: []const local.storage_rowsource_types.RowRef, allowance: ?*local.serverless_query_lake_serving.ServingSource.TranslationAllowance) ![]const local.storage_rowsource_types.RowRef {
+        if (!self.isRelocated() or refs.len == 0) return refs;
+        const resolver = self.row_resolver.?;
+        if (allowance) |limited| {
+            const translate = resolver.translate_many_bounded orelse return error.QueryCandidateBudgetExceeded;
+            return translate(resolver.ptr, a, refs, true, limited);
+        }
+        if (resolver.translate_many) |translate| return translate(resolver.ptr, a, refs, true);
+        const result = try a.alloc(local.storage_rowsource_types.RowRef, refs.len);
+        for (refs, result) |ref, *target| target.* = try resolver.from_index(resolver.ptr, a, ref);
+        return result;
+    }
+    fn isRelocated(self: *const Owner) bool {
+        return if (self.row_resolver) |resolver| resolver.relocated else false;
+    }
+    fn acceptsCut(self: *const Owner, source: []const u8, snapshot: []const u8) bool {
+        if (self.row_resolver) |resolver| return std.mem.eql(u8, source, resolver.source) and std.mem.eql(u8, snapshot, resolver.snapshot);
+        return self.source.isCurrentCut(source, snapshot);
+    }
+    fn toIndex(self: *Owner, a: A, ref: local.storage_rowsource_types.RowRef) !local.storage_rowsource_types.RowRef {
+        if (self.row_resolver) |resolver| return resolver.to_index(resolver.ptr, a, ref);
+        return ref;
+    }
+    fn mapToIndex(self: *Owner, a: A, refs: []const local.storage_rowsource_types.RowRef) ![]const local.storage_rowsource_types.RowRef {
+        if (!self.isRelocated()) return refs;
+        const resolver = self.row_resolver.?;
+        if (resolver.translate_many) |translate| return translate(resolver.ptr, a, refs, false);
+        const result = try a.alloc(local.storage_rowsource_types.RowRef, refs.len);
+        for (refs, result) |ref, *target| target.* = try resolver.to_index(resolver.ptr, a, ref);
+        return result;
     }
     fn prepare(self: *Owner) !bool {
         try self.read_context.ensureActive();
@@ -499,6 +544,16 @@ pub const Predicate = struct {
         const owner: *Owner = @ptrCast(@alignCast(self.cursor.ptr));
         return owner.predicate_count;
     }
+    /// Estimate complete reverse paths, including remote request overhead.
+    /// This influences path choice only; authenticated read budgets remain the
+    /// execution authority and exact predicates are always rechecked.
+    pub fn membershipWork(self: Predicate, candidates: u64) u64 {
+        if (candidates == 0) return 0;
+        if (self.scan) return std.math.maxInt(u64);
+        const owner: *Owner = @ptrCast(@alignCast(self.cursor.ptr));
+        const reverse = owner.reader.root.reverse orelse return std.math.maxInt(u64);
+        return candidates *| (@as(u64, reverse.height) + 1) *| (64 + tree.target_page_bytes / 1024);
+    }
     pub fn hasMembership(self: Predicate) bool {
         if (self.scan) return false;
         const owner: *Owner = @ptrCast(@alignCast(self.cursor.ptr));
@@ -512,18 +567,48 @@ pub const Predicate = struct {
     pub fn contains(self: *Predicate, ref: local.storage_rowsource_types.RowRef) !bool {
         const owner: *Owner = @ptrCast(@alignCast(self.cursor.ptr));
         try owner.read_context.ensureActive();
-        return owner.reader.containsPhysical(ref, owner.predicate_lower, owner.predicate_upper);
+        var scratch = std.heap.ArenaAllocator.init(owner.a);
+        defer scratch.deinit();
+        const index_ref = try owner.toIndex(scratch.allocator(), ref);
+        return owner.reader.containsPhysical(index_ref, owner.predicate_lower, owner.predicate_upper);
+    }
+    pub fn containsMany(self: *Predicate, refs: []const local.storage_rowsource_types.RowRef, output: []bool) !void {
+        const owner: *Owner = @ptrCast(@alignCast(self.cursor.ptr));
+        try owner.read_context.ensureActive();
+        var workspace: local.sql_memory_budget = .{ .backing = owner.a, .limit = 4 * 1024 * 1024 };
+        var scratch = std.heap.ArenaAllocator.init(workspace.allocator());
+        defer scratch.deinit();
+        const mapped = owner.mapToIndex(scratch.allocator(), refs) catch |err| {
+            if (err == error.OutOfMemory and workspace.isExhausted()) return error.QueryCandidateBudgetExceeded;
+            return err;
+        };
+        owner.reader.containsPhysicalMany(scratch.allocator(), mapped, owner.predicate_lower, owner.predicate_upper, output) catch |err| {
+            if (err == error.OutOfMemory and workspace.isExhausted()) return error.QueryCandidateBudgetExceeded;
+            return err;
+        };
     }
     pub fn intersectsPhysical(self: *Predicate, first: local.storage_rowsource_types.RowRef, last: local.storage_rowsource_types.RowRef) !?bool {
         if (self.scan) return null;
         const owner: *Owner = @ptrCast(@alignCast(self.cursor.ptr));
         try owner.read_context.ensureActive();
+        if (owner.isRelocated()) return null;
         return owner.reader.intersectsPhysical(first, last, owner.predicate_lower, owner.predicate_upper);
     }
     pub fn hasBlocks(self: Predicate) bool {
         if (self.scan) return false;
         const owner: *Owner = @ptrCast(@alignCast(self.cursor.ptr));
-        return owner.reader.root.predicates != null;
+        return !owner.isRelocated() and owner.reader.root.predicates != null;
+    }
+    /// A retained predicate may keep its compressed native blocks when the
+    /// consuming text index proves the exact same original coordinate space.
+    pub fn blocksMatch(self: Predicate, target: ?local.serverless_query_lake_serving.ServingSource.RowResolver) bool {
+        if (self.scan) return false;
+        const owner: *Owner = @ptrCast(@alignCast(self.cursor.ptr));
+        if (owner.reader.root.predicates == null) return false;
+        const left = owner.row_resolver orelse return target == null;
+        const right = target orelse return !left.relocated;
+        if (left.coordinate_space) |space| if (right.coordinate_space) |other| return std.mem.eql(u8, &space, &other);
+        return false;
     }
     pub fn nextBlocks(self: *Predicate, a: A) ![]const ordered.predicate_blocks.Block {
         const owner: *Owner = @ptrCast(@alignCast(self.cursor.ptr));
@@ -534,7 +619,16 @@ pub const Predicate = struct {
         if (self.scan) return self.next(a, count);
         const owner: *Owner = @ptrCast(@alignCast(self.cursor.ptr));
         try owner.read_context.ensureActive();
-        return owner.reader.nextPhysical(a, count, owner.predicate_lower, owner.predicate_upper);
+        return owner.mapRefs(a, try owner.reader.nextPhysical(a, count, owner.predicate_lower, owner.predicate_upper));
+    }
+    /// Optional publication-pack planning shares its conversion allowance
+    /// across metadata->current and current->text index coordinate spaces.
+    pub fn nextPhysicalBounded(self: *Predicate, a: A, count: usize, allowance: *local.serverless_query_lake_serving.ServingSource.TranslationAllowance) ![]const local.storage_rowsource_types.RowRef {
+        if (self.scan) return error.QueryCandidateBudgetExceeded;
+        const owner: *Owner = @ptrCast(@alignCast(self.cursor.ptr));
+        try owner.read_context.ensureActive();
+        const refs = try owner.reader.nextPhysical(a, count, owner.predicate_lower, owner.predicate_upper);
+        return owner.mapRefsLimited(a, refs, allowance);
     }
     pub fn next(self: *Predicate, a: A, count: usize) ![]const local.storage_rowsource_types.RowRef {
         if (self.scan) while (true) {
@@ -554,7 +648,7 @@ pub const Predicate = struct {
             if (owner.reader.exhausted) return &.{};
             return cursor.next(a, count);
         }
-        return owner.reader.next(a, count);
+        return owner.mapRefs(a, try owner.reader.next(a, count));
     }
 };
 /// Borrowed only for the lifetime of the outer query's publication lease.
@@ -599,6 +693,228 @@ pub fn tryOpenPredicateWithContext(a: A, server: *server_api.ApiHttpServer, tabl
     return best;
 }
 
+/// Decoded leases remain admitted until the caller consumes this wave. Each
+/// 16 MiB lane fits the default 32 MiB I/O allowance; saturation runs inline.
+const CoveringWave = struct {
+    const lane_bytes = 16 * 1024 * 1024;
+    const Metadata = @import("lake_index_decoded_metadata.zig");
+    const Block = Metadata.Owned(local.sql_spill.ColumnarBlock);
+    const Job = struct {
+        cached: @import("lake_index_aggregate_artifact.zig").CachedRead,
+        store: @import("../serverless/artifacts/store.zig").ArtifactStore,
+        ref: @import("lake_index_aggregate_artifact.zig").ChunkRef,
+        token: @import("antfly_cancellation").CancellationToken,
+        block: ?Block = null,
+        fn run(self: *@This()) anyerror!void {
+            self.block = try Metadata.acquireColumnBlockBounded(self.cached, self.store, self.ref, self.token, lane_bytes);
+        }
+    };
+    jobs: [4]Job = undefined,
+    count: usize = 0,
+    retained: usize = 0,
+    fn deinit(self: *CoveringWave) void {
+        for (self.jobs[0..self.count]) |job| if (job.block) |block| block.release();
+        if (self.retained != 0) local.sql_parallel_scheduler.global().releasePull(0, self.retained);
+        self.* = .{};
+    }
+    fn read(self: *CoveringWave, cached: @import("lake_index_aggregate_artifact.zig").CachedRead, store: @import("../serverless/artifacts/store.zig").ArtifactStore, refs: []const @import("lake_index_aggregate_artifact.zig").ChunkRef, token: @import("antfly_cancellation").CancellationToken) !void {
+        if (refs.len > self.jobs.len or self.count != 0) return error.InvalidNativeLakeRowIndex;
+        const scheduler = local.sql_parallel_scheduler;
+        const retained = lane_bytes * refs.len;
+        if (!scheduler.global().reservePull(0, retained)) return error.SqlMemoryLimitExceeded;
+        self.retained = retained;
+        for (refs, self.jobs[0..refs.len]) |ref, *job| job.* = .{ .cached = cached, .store = store, .ref = ref, .token = token };
+        self.count = refs.len;
+        var tasks: [4]?scheduler.Task(anyerror!void) = @splat(null);
+        defer if (cached.context.io) |io| for (&tasks) |*task| if (task.*) |*held| {
+            held.cancel(io) catch {};
+        };
+        var failure: ?anyerror = null;
+        for (self.jobs[0..self.count], 0..) |*job, i| {
+            if (failure != null) break;
+            if (cached.context.io) |io| if (self.count > 1) {
+                tasks[i] = scheduler.global().submitIo(io, lane_bytes, Job.run, .{job});
+            };
+            if (tasks[i] == null) job.run() catch |err| {
+                failure = err;
+            };
+        }
+        if (cached.context.io) |io| for (&tasks) |*task| if (task.*) |*held| {
+            held.await(io) catch |err| {
+                if (failure == null) failure = err;
+            };
+            task.* = null;
+        };
+        if (failure) |err| return err;
+        try token.check();
+        try cached.context.ensureActive();
+    }
+};
+
+/// Gather already-ranked physical rows from an existing complete covering
+/// index. This shares the pinned publication and the ordinary typed block
+/// codec; serving-pack compaction does not rewrite or invalidate this layout.
+/// Unknown coverage and large gathers keep the source reader's batched path.
+pub fn gatherCovering(a: A, server: *server_api.ApiHttpServer, table: catalog.Table, source: *local.serverless_query_lake_serving.ServingSource, context: operation.RequestContext, pinned: PredicateContext, refs_: []const local.storage_rowsource_types.RowRef, fields: []const []const u8) !?[]?local.storage_db_types.ColumnSource {
+    var workspace: local.sql_memory_budget = .{ .backing = a, .limit = 8 * 1024 * 1024 };
+    return gatherCoveringInner(workspace.allocator(), a, server, table, source, context, pinned, refs_, fields) catch |err| {
+        if (err == error.OutOfMemory and workspace.isLocallyExhausted()) return null;
+        return err;
+    };
+}
+fn gatherCoveringInner(a: A, out: A, server: *server_api.ApiHttpServer, table: catalog.Table, source: *local.serverless_query_lake_serving.ServingSource, context: operation.RequestContext, pinned: PredicateContext, refs_: []const local.storage_rowsource_types.RowRef, fields: []const []const u8) !?[]?local.storage_db_types.ColumnSource {
+    if (refs_.len == 0 or refs_.len > 512) return null;
+    const definitions = table.external_indexes orelse return null;
+    var parsed = try local.schema_mod.parseValidatedTableSchema(a, definitions.schema_json);
+    defer parsed.deinit(a);
+    var scratch = std.heap.ArenaAllocator.init(a);
+    defer scratch.deinit();
+    const indexes = (try parsed.relationalIndexDefinitions(scratch.allocator())) orelse return null;
+    for (indexes) |definition| {
+        if (definition.where.len != 0) continue;
+        const cover = try native_rows.coverColumns(scratch.allocator(), definition);
+        const sufficient = for (fields) |field| {
+            if (!generatedCoveringField(table, field) and !covers(cover, field)) break false;
+        } else true;
+        if (!sufficient) continue;
+        const cursor = (try openWithContext(a, server, table, .{ .fields = fields, .index_range = .{ .name = definition.name }, .limit = 1 }, context, source, .automatic, null, false, pinned)) orelse continue;
+        defer cursor.close(cursor.ptr);
+        const owner: *Owner = @ptrCast(@alignCast(cursor.ptr));
+        const root = owner.reader.root;
+        if (root.reverse == null) continue;
+        if (!owner.acceptsCut(root.source, root.snapshot)) return error.ExternalLakeSnapshotMismatch;
+        const result = try out.alloc(?local.storage_db_types.ColumnSource, refs_.len);
+        @memset(result, null);
+        var transferred = false;
+        defer if (!transferred) {
+            for (result) |value| if (value) |row| row.deinit();
+            out.free(result);
+        };
+        const Pending = struct { entry: ordered.Reader.Entry, position: usize };
+        const pending = try scratch.allocator().alloc(Pending, refs_.len);
+        // Sort the bounded gather by block identity: one lease, decode and
+        // read-budget charge per block, while preserving ranked output order.
+        const index_refs = try owner.mapToIndex(scratch.allocator(), refs_);
+        const entries = try owner.reader.entriesAtPhysical(scratch.allocator(), index_refs);
+        for (entries, pending, 0..) |found, *item, position| {
+            try owner.read_context.ensureActive();
+            const entry = found orelse return null;
+            if (entry.cover == null) return null;
+            item.* = .{ .entry = entry, .position = position };
+        }
+        std.mem.sort(Pending, pending, {}, struct {
+            fn less(_: void, left: Pending, right: Pending) bool {
+                return std.mem.order(u8, left.entry.cover.?.block.artifact_id, right.entry.cover.?.block.artifact_id) == .lt;
+            }
+        }.less);
+        var row_arena = std.heap.ArenaAllocator.init(a);
+        defer row_arena.deinit();
+        var begin: usize = 0;
+        while (begin < pending.len) {
+            var wave: CoveringWave = .{};
+            defer wave.deinit();
+            var block_refs: [4]@import("lake_index_aggregate_artifact.zig").ChunkRef = undefined;
+            var groups: [4]struct { begin: usize, end: usize } = undefined;
+            var count: usize = 0;
+            while (count < block_refs.len and begin < pending.len) {
+                const reference = pending[begin].entry.cover.?;
+                var end = begin + 1;
+                while (end < pending.len and std.mem.eql(u8, pending[end].entry.cover.?.block.artifact_id, reference.block.artifact_id)) : (end += 1) {
+                    const same = pending[end].entry.cover.?.block;
+                    if (same.byte_len != reference.block.byte_len or !std.mem.eql(u8, same.checksum, reference.block.checksum)) return error.InvalidNativeLakeRowIndex;
+                }
+                try @import("../serverless/artifacts/store.zig").chargeReadBudget(&owner.reader.remaining_reads, reference.block.byte_len);
+                block_refs[count] = reference.block;
+                groups[count] = .{ .begin = begin, .end = end };
+                count += 1;
+                begin = end;
+            }
+            try wave.read(.{ .cache = &server.lake_read_cache, .scope = pinned.store_identity, .context = pinned.read_context }, owner.artifacts, block_refs[0..count], owner.reader.pages.cancellation);
+            for (wave.jobs[0..count], groups[0..count]) |job, group| {
+                const block = job.block.?;
+                for (pending[group.begin..group.end]) |item| {
+                    try owner.read_context.ensureActive();
+                    _ = row_arena.reset(.retain_capacity);
+                    const row = item.entry.cover.?.row;
+                    if (block.value.keys.len != 1 or row >= block.value.count()) return error.InvalidNativeLakeRowIndex;
+                    const key = try block.value.keyCell(row, 0);
+                    if (key.sql_null or key.value != .string or !std.mem.eql(u8, key.value.string, item.entry.key)) return error.InvalidNativeLakeRowIndex;
+                    result[item.position] = try coveringSource(out, row_arena.allocator(), table, root, block.value.*, row, refs_[item.position], fields);
+                }
+            }
+        }
+        transferred = true;
+        return result;
+    }
+    return null;
+}
+
+fn coveringSource(a: A, scratch: A, table: catalog.Table, root: ordered.Root, block: local.sql_spill.ColumnarBlock, row: u16, ref: local.storage_rowsource_types.RowRef, fields: []const []const u8) !local.storage_db_types.ColumnSource {
+    const rows_ = local.storage_rowsource_types;
+    if (row >= block.count() or block.values.len != root.cover.len) return error.InvalidNativeLakeRowIndex;
+    var columns: std.ArrayList(rows_.ColumnVector) = .empty;
+    for (fields) |field| {
+        if (generatedCoveringField(table, field)) continue;
+        // Projection and hidden highlight dependencies can request the same
+        // field. Preserve one physical column, including a declared _type.
+        if (for (columns.items) |column| {
+            if (std.mem.eql(u8, column.name, field)) break true;
+        } else false) continue;
+        const index = for (root.cover, 0..) |name, i| {
+            if (std.mem.eql(u8, name, field)) break i;
+        } else return error.InvalidNativeLakeRowIndex;
+        const cell = try block.cell(row, index);
+        const nulls = try scratch.alloc(u8, 1);
+        nulls[0] = @intFromBool(cell.sql_null);
+        var column: rows_.ColumnVector = .{ .name = field, .nulls = .{ .bytes = nulls }, .values = undefined };
+        const wire: std.json.Value = if (cell.sql_null) .null else if (cell.numeric != null or cell.array != null)
+            try local.sql_runtime.encodeStorageDatum(scratch, cell, try table.column(field), @import("lake_index_aggregate_artifact.zig").max_block_bytes)
+        else
+            cell.value;
+        switch (wire) {
+            .integer => |value| {
+                const values = try scratch.alloc(i64, 1);
+                values[0] = value;
+                column.values = .{ .i64 = values };
+            },
+            .float => |value| {
+                const values = try scratch.alloc(f64, 1);
+                values[0] = value;
+                column.values = .{ .f64 = values };
+            },
+            .bool => |value| {
+                const values = try scratch.alloc(bool, 1);
+                values[0] = value;
+                column.values = .{ .bool = values };
+            },
+            .string => |value| {
+                const values = try scratch.alloc([]const u8, 1);
+                values[0] = value;
+                column.values = .{ .bytes = values };
+            },
+            else => {
+                const values = try scratch.alloc([]const u8, 1);
+                values[0] = try std.json.Stringify.valueAlloc(scratch, wire, .{});
+                column.values = .{ .json = values };
+            },
+        }
+        try columns.append(scratch, column);
+    }
+    const identity = try local.storage_rowsource_identity.allocId(scratch, ref);
+    try columns.append(scratch, .{ .name = "_id", .values = .{ .bytes = try scratch.dupe([]const u8, &.{identity}) } });
+    if (generatedCoveringField(table, "_type")) try columns.append(scratch, .{ .name = "_type", .values = .{ .bytes = try scratch.dupe([]const u8, &.{"row"}) } });
+    const page = try local.storage_db_types.ColumnSourcePage.copy(a, .{ .snapshot = .{ .table_id = root.source, .snapshot_id = root.snapshot }, .row_refs = &.{ref}, .columns = columns.items }, &.{0});
+    defer page.release();
+    return page.row(0);
+}
+
+fn generatedCoveringField(table: catalog.Table, field: []const u8) bool {
+    if (std.mem.eql(u8, field, "_id")) return true;
+    if (!std.mem.eql(u8, field, "_type")) return false;
+    for (table.columns) |column| if (std.mem.eql(u8, column.name, field)) return false;
+    return true;
+}
+
 /// Relative work for vectorized projected decoding/evaluation. Inventory bytes
 /// and rows are upper estimates: no guessed selectivity or LIMIT credit.
 /// Null means the inventory has not established a row-count estimate.
@@ -614,6 +930,7 @@ pub fn predicateScanWork(source: *local.serverless_query_lake_serving.ServingSou
     }
     var rows_count: u64 = 0;
     var bytes: u64 = 0;
+    var requests: u64 = 0;
     for (source.inventory.files) |file| {
         var group_rows: u64 = 0;
         for (file.row_groups) |group| group_rows +|= group.row_count;
@@ -623,23 +940,26 @@ pub fn predicateScanWork(source: *local.serverless_query_lake_serving.ServingSou
         if (file_rows == 0 and file.row_groups.len == 0 and file.byte_len != 0) return null;
         rows_count +|= file_rows;
         bytes +|= predicateProjectedBytes(file, conditions);
+        requests +|= predicateProjectedRequests(file, conditions);
     }
-    return (rows_count *| count +| 31) / 32 +| (bytes +| 1023) / 1024;
+    return (rows_count *| count +| 31) / 32 +| (bytes +| 1023) / 1024 +| requests *| 64;
 }
 
 pub fn predicateResidualWork(source: *local.serverless_query_lake_serving.ServingSource, conditions: []const catalog.Condition, candidates: u64) u64 {
     if (candidates == 0) return 0;
     var bytes: u64 = 0;
     var groups: u64 = 0;
+    var requests: u64 = 0;
     for (source.inventory.files) |file| {
         bytes +|= predicateProjectedBytes(file, conditions);
+        requests +|= predicateProjectedRequests(file, conditions);
         // Without group metadata, gathering even one candidate may read the
         // whole file. Charge one conservative decode region for that file.
         groups +|= @max(@as(u64, 1), file.row_groups.len);
     }
     // Without clustering evidence, a gather can touch every projected group.
     const gather = if (groups == 0) 0 else (bytes / groups) *| @min(candidates, groups);
-    return (candidates *| conditions.len +| 31) / 32 +| (gather +| 1023) / 1024;
+    return (candidates *| conditions.len +| 31) / 32 +| (gather +| 1023) / 1024 +| @min(requests, candidates *| conditions.len) *| 64;
 }
 
 /// Use projected chunk bytes when complete, otherwise the full file length
@@ -665,11 +985,34 @@ fn predicateProjectedBytes(file: local.serverless_external_source_types.FileEntr
     return bytes;
 }
 
+/// Count unique projected column regions, not duplicate bounds. This gives
+/// tiny-file archives an explicit request cost even when their byte count is
+/// small. Coalescing and verified residency may make execution cheaper.
+fn predicateProjectedRequests(file: local.serverless_external_source_types.FileEntry, conditions: []const catalog.Condition) u64 {
+    if (conditions.len == 0 or file.byte_len == 0) return 0;
+    if (file.row_groups.len == 0) return 1;
+    var requests: u64 = 0;
+    for (file.row_groups) |group| {
+        for (conditions, 0..) |condition, i| {
+            const duplicate = for (conditions[0..i]) |previous| {
+                if (std.mem.eql(u8, previous.column, condition.column)) break true;
+            } else false;
+            if (duplicate) continue;
+            // Missing chunk evidence still incurs one projected region per
+            // group; it cannot make the fallback look free.
+            _ = group;
+            requests +|= 1;
+        }
+    }
+    return requests;
+}
+
 fn predicateIndexWork(candidates: u64, metadata_bytes: u64, resident_metadata: bool) u64 {
     // Tuple/predicate decoding is less sequential than projected column batches.
     // Resident metadata needs no provider setup; cold metadata has a fixed seek
     // charge plus authenticated bytes. These are work estimates, not milliseconds.
-    return (candidates +| 7) / 8 +| (if (resident_metadata) @as(u64, 8) else 64 +| (metadata_bytes +| 1023) / 1024);
+    const leaves = if (candidates == 0) 0 else 1 + (candidates - 1) / (tree.bulk_target_page_bytes / 64);
+    return (candidates +| 7) / 8 +| leaves *| 64 +| (if (resident_metadata) @as(u64, 8) else 64 +| (metadata_bytes +| 1023) / 1024);
 }
 
 pub fn compatibleSearchConditions(a: A, table: catalog.Table, conditions: []const catalog.Condition) !bool {
@@ -835,6 +1178,7 @@ fn orderedCandidate(a: A, table: catalog.Table, index: local.storage_relational_
 
 fn preparePublicOrder(a: A, cursor: catalog.Cursor, definition: local.storage_relational_index.RelationalIndexDefinition, parsed: anytype, request: catalog.Scan, reverse: bool, search_order: SearchOrder) !bool {
     const owner: *Owner = @ptrCast(@alignCast(cursor.ptr));
+    if (owner.isRelocated()) return false;
     if (owner.reader.root.tie_version != 1) return false;
     var equal: usize = 0;
     for (definition.keys) |key| {
@@ -1301,6 +1645,7 @@ fn openDynamicContext(a: A, server: *server_api.ApiHttpServer, table: catalog.Ta
             return err;
         };
         owner.read_context = owner.lease.?.readContext();
+        server.attachLakeRepairHint(source);
         selected = (try @import("lake_index_selection.zig").selectCachedWithLease(ca, table, source, &owner.store, owner.read_context, policy, &server.lake_read_cache, owner.lease)) orelse return null;
     }
     var parsed = try local.schema_mod.parseValidatedTableSchema(a, definitions.schema_json);
@@ -1375,11 +1720,12 @@ fn openDynamicContext(a: A, server: *server_api.ApiHttpServer, table: catalog.Ta
     const declaration = for (declarations) |decl| {
         if (decl.artifact.kind == .ordered_row_index and std.mem.eql(u8, decl.name, name)) break decl;
     } else return if (policy == .automatic) null else error.ExternalLakeRowIndexNotPublished;
+    owner.row_resolver = try source.resolverForIndex(declaration.name);
     const cancel: operation.CancellationToken = .{ .ptr = owner, .is_cancelled_fn = Owner.canceled };
     const resident_metadata = if (identities_only) try @import("lake_index_decoded_metadata.zig").resident(ordered.VerifiedRoot, .{ .cache = &server.lake_read_cache, .scope = owner.store_identity, .context = owner.read_context }, declaration.artifact) else false;
     owner.metadata = try @import("lake_index_decoded_metadata.zig").acquire(ordered.VerifiedRoot, .{ .cache = &server.lake_read_cache, .scope = owner.store_identity, .context = owner.read_context }, owner.artifacts, declaration.artifact, cancel, ordered.VerifiedRoot.load);
     const root = owner.metadata.?.value.value;
-    if ((identities_only or dynamic != null) and (!std.mem.eql(u8, root.source, source.inventory.source_id) or !std.mem.eql(u8, root.snapshot, source.inventory.snapshot_id))) return error.ExternalLakeSnapshotMismatch;
+    if ((identities_only or dynamic != null) and !owner.acceptsCut(root.source, root.snapshot)) return error.ExternalLakeSnapshotMismatch;
     const domain = if (pinned) |shared| shared.domain else @import("lake_index_publication.zig").uploadDomainWithNamespace(table.id, owner.store_identity, selected.?.publication().namespace);
     if (!std.mem.eql(u8, &root.domain, &domain)) return error.InvalidNativeLakeRowIndex;
     const expected = native_rows.fingerprint(tuple, predicate, try native_rows.coverColumns(ca, definition));
@@ -1456,7 +1802,7 @@ fn openDynamicContext(a: A, server: *server_api.ApiHttpServer, table: catalog.Ta
                 }
             }
             const goal = if (rangeEnforcesConditions(definition, request, equal_count)) request.row_goal else null;
-            const scan_cost = (source_rows +| (physical_bytes / 1024)) *| @as(u64, if (order_satisfied) 2 else 1);
+            const scan_cost = (source_rows +| (physical_bytes / 1024) +| row_groups *| 64) *| @as(u64, if (order_satisfied) 2 else 1);
             const cutoff = @min(scan_cost, cost_limit);
             var probes: u64 = 0;
             var candidates: u64 = 0;
@@ -1482,13 +1828,13 @@ fn openDynamicContext(a: A, server: *server_api.ApiHttpServer, table: catalog.Ta
                         }
                         pub fn admit(self: *@This(), counts: tree.RangeCounts) !bool {
                             try self.owner.read_context.ensureActive();
-                            return estimatedAccessCost(counts.records, self.owner.covered, self.ordered, self.goal, self.physical_bytes, self.row_groups) +| counts.pages +| (counts.ranges / 64) <= self.cutoff;
+                            return estimatedAccessCost(counts.records, self.owner.covered, self.ordered, self.goal, self.physical_bytes, self.row_groups) +| counts.pages *| 64 +| (counts.ranges / 64) <= self.cutoff;
                         }
                     };
                     var costing: Cost = .{ .owner = owner, .cutoff = cutoff, .goal = goal, .ordered = order_satisfied, .physical_bytes = physical_bytes, .row_groups = row_groups };
                     const counts = (try tree.countSortedRanges(a, owner.probeStore(), root.page, &costing)) orelse return null;
                     candidates = counts.records;
-                    probes = counts.pages +| (counts.ranges / 64);
+                    probes = counts.pages *| 64 +| (counts.ranges / 64);
                     try owner.rewindProbes();
                     owner.reader.exhausted = false;
                     _ = try owner.advanceProbe();
@@ -1552,6 +1898,22 @@ test "external lake predicate costs prefer selective seeks and broad projected s
     try std.testing.expect(predicateIndexWork(1, 1024 * 1024, false) > scan);
     try std.testing.expectEqual(@as(u64, 0), predicateResidualWork(&source, &.{lower}, 0));
     try std.testing.expect(predicateResidualWork(&source, &.{lower}, 1) < predicateResidualWork(&source, &.{lower}, 10000));
+    // Equal projected bytes across many objects must include request fan-out.
+    var small_groups = [_]external.RowGroup{.{ .ordinal = 0, .row_count = 156, .column_chunks = chunks[0..1] }};
+    var small_files: [64]external.FileEntry = undefined;
+    @memset(&small_files, files[0]);
+    for (&small_files) |*file| {
+        file.row_count = 156;
+        file.row_groups = &small_groups;
+        file.byte_len = 256;
+    }
+    const old_chunk_bytes = chunks[0].compressed_len;
+    chunks[0].compressed_len = 256;
+    source.inventory.files = &small_files;
+    try std.testing.expect(predicateScanWork(&source, &.{lower}).? > scan * 4);
+    try std.testing.expectEqual(predicateScanWork(&source, &.{lower}), predicateScanWork(&source, &.{ lower, upper }));
+    source.inventory.files = &files;
+    chunks[0].compressed_len = old_chunk_bytes;
     // Iceberg inventories can know row counts without chunk statistics.
     files[0].row_groups = &.{};
     try std.testing.expect(predicateScanWork(&source, &.{lower}).? > scan);
@@ -1620,7 +1982,10 @@ fn estimatedAccessCost(candidates: u64, covered: bool, ordered_access: bool, row
     var cost = accessCost(consumed, covered, ordered_access);
     // Random candidates may touch one decode region each until all groups
     // are visited. Unknown clustering uses this conservative upper estimate.
-    if (!covered and row_groups != 0) cost +|= ((projected_bytes / row_groups) *| @min(consumed, row_groups)) / 1024;
+    if (!covered and row_groups != 0) {
+        const regions = @min(consumed, row_groups);
+        cost +|= ((projected_bytes / row_groups) *| regions) / 1024 +| regions *| 64;
+    }
     return cost;
 }
 
@@ -1825,4 +2190,218 @@ test "external lake dynamic exact keys share compatible prefix projection and de
     try std.testing.expect(first == second);
     try std.testing.expectEqual(writes, manager.written_bytes);
     try std.testing.expectEqual(@as(u64, 6000), first.sort.total);
+}
+
+test "external lake covering result gathers retain typed values independently of decoded blocks" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const ca = arena.allocator();
+    var work: local.sql_array_value.Budget = .{};
+    const number = try local.sql_scalar.numericTextLeaky(ca, "12345678901234567890.0123456789", &work);
+    const values = [_]local.sql_scalar.Datum{
+        .fromJson(.{ .integer = 9007199254740993 }),
+        .fromJson(.{ .string = "covered title" }),
+        .{},
+        number,
+    };
+    const rows_ = [_]local.sql_operators.Row{.{ .values = &values, .keys = &.{}, .ordinal = 0 }};
+    const encoded = try local.sql_spill.encodeColumnarBlockAlloc(ca, &rows_, 1024 * 1024);
+    const block = try local.sql_spill.decodeColumnarBlockInArena(ca, encoded, 1024 * 1024);
+    const root: ordered.Root = .{ .fingerprint = @splat(1), .domain = @splat(7), .source = "lake", .snapshot = "snapshot", .page = null, .cover = &.{ "amount", "title", "missing", "number" } };
+    const table: catalog.Table = .{ .id = 7, .physical_name = "lake", .schema_version = 1, .columns = &.{
+        .{ .name = "amount", .path = "amount", .type = .integer },
+        .{ .name = "title", .path = "title", .type = .string },
+        .{ .name = "missing", .path = "missing", .type = .string },
+        .{ .name = "number", .path = "number", .type = .number, .element_type = .numeric },
+    } };
+    const ref: local.storage_rowsource_types.RowRef = .{ .external = .{ .source_id = "lake", .snapshot_id = "snapshot", .file_id = "file", .row_group_ordinal = 0, .row_ordinal = 7 } };
+    const Run = struct {
+        fn run(alloc: A, table_: catalog.Table, root_: ordered.Root, block_: local.sql_spill.ColumnarBlock, ref_: local.storage_rowsource_types.RowRef) !void {
+            var scratch = std.heap.ArenaAllocator.init(alloc);
+            var scratch_live = true;
+            defer if (scratch_live) scratch.deinit();
+            const row = try coveringSource(alloc, scratch.allocator(), table_, root_, block_, 0, ref_, root_.cover);
+            defer row.deinit();
+            scratch.deinit();
+            scratch_live = false;
+            var output = std.heap.ArenaAllocator.init(alloc);
+            defer output.deinit();
+            const json = try row.value(&output);
+            try std.testing.expectEqual(@as(i64, 9007199254740993), json.object.get("amount").?.integer);
+            try std.testing.expectEqualStrings("covered title", json.object.get("title").?.string);
+            try std.testing.expect(json.object.get("missing").? == .null);
+            try std.testing.expectEqualStrings("12345678901234567890.0123456789", json.object.get("number").?.string);
+            try std.testing.expectEqualStrings("row", json.object.get("_type").?.string);
+            try std.testing.expect(row.page.columns[0].values == .i64);
+            try std.testing.expect(row.page.columns[1].values == .bytes);
+        }
+    };
+    try Run.run(a, table, root, block, ref);
+    try std.testing.checkAllAllocationFailures(a, Run.run, .{ table, root, block, ref });
+}
+
+test "external lake covering results preserve declared type values and nulls without duplicate fields" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const ca = arena.allocator();
+    const table: catalog.Table = .{ .id = 7, .physical_name = "lake", .schema_version = 1, .columns = &.{.{ .name = "_type", .path = "_type", .type = .string }} };
+    const root: ordered.Root = .{ .fingerprint = @splat(1), .domain = @splat(7), .source = "lake", .snapshot = "snapshot", .page = null, .cover = &.{"_type"} };
+    const ref: local.storage_rowsource_types.RowRef = .{ .external = .{ .source_id = "lake", .snapshot_id = "snapshot", .file_id = "file", .row_group_ordinal = 0, .row_ordinal = 0 } };
+    try std.testing.expect(!generatedCoveringField(table, "_type"));
+    for ([_]local.sql_scalar.Datum{ .fromJson(.{ .string = "story" }), .{} }) |value| {
+        const records = [_]local.sql_operators.Row{.{ .values = &.{value}, .keys = &.{}, .ordinal = 0 }};
+        const encoded = try local.sql_spill.encodeColumnarBlockAlloc(ca, &records, 1024 * 1024);
+        const block = try local.sql_spill.decodeColumnarBlockInArena(ca, encoded, 1024 * 1024);
+        const source = try coveringSource(a, ca, table, root, block, 0, ref, &.{ "_type", "_type" });
+        defer source.deinit();
+        const json = try source.value(&arena);
+        const actual = json.object.get("_type").?;
+        if (value.sql_null) try std.testing.expect(actual == .null) else try std.testing.expectEqualStrings("story", actual.string);
+        try std.testing.expectEqual(@as(usize, 2), source.page.columns.len);
+    }
+}
+
+test "external lake compressed predicates require the exact authenticated coordinate space" {
+    const Resolver = local.serverless_query_lake_serving.ServingSource.RowResolver;
+    // Only block-routing fields are inspected; no source or reader is opened.
+    var owner: Owner = undefined;
+    owner.reader.root.predicates = .{ .digest = @splat(1), .bytes = 64, .height = 0, .records = 2 };
+    var resolver: Resolver = undefined;
+    resolver.relocated = true;
+    resolver.coordinate_space = @splat(7);
+    owner.row_resolver = resolver;
+    const predicate: Predicate = .{ .cursor = .{ .ptr = &owner, .next = undefined, .close = undefined } };
+    try std.testing.expect(!predicate.hasBlocks());
+    try std.testing.expect(predicate.blocksMatch(resolver));
+    var other = resolver;
+    other.coordinate_space = @splat(8);
+    try std.testing.expect(!predicate.blocksMatch(other));
+    other.coordinate_space = null;
+    try std.testing.expect(!predicate.blocksMatch(other));
+    try std.testing.expect(!predicate.blocksMatch(null));
+    resolver.relocated = false;
+    owner.row_resolver = resolver;
+    try std.testing.expect(predicate.hasBlocks());
+    try std.testing.expect(predicate.blocksMatch(null));
+    owner.reader.root.predicates = null;
+    try std.testing.expect(!predicate.blocksMatch(resolver));
+}
+
+test "external lake optional predicate source translation requires bounded capability" {
+    const Serving = local.serverless_query_lake_serving.ServingSource;
+    const RowRef = local.storage_rowsource_types.RowRef;
+    const Mock = struct {
+        calls: usize = 0,
+        fn bounded(raw: *anyopaque, _: A, refs: []const RowRef, forward: bool, allowance: *Serving.TranslationAllowance) ![]const RowRef {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expect(forward);
+            if (refs.len > allowance.remaining_rows) return error.QueryCandidateBudgetExceeded;
+            allowance.remaining_rows -= refs.len;
+            self.calls += 1;
+            return refs;
+        }
+        fn required(_: *anyopaque, _: A, _: []const RowRef, _: bool) ![]const RowRef {
+            return error.UnexpectedUnboundedTranslation;
+        }
+    };
+    var mock: Mock = .{};
+    var owner: Owner = undefined;
+    var resolver: Serving.RowResolver = undefined;
+    resolver.ptr = &mock;
+    resolver.relocated = true;
+    resolver.translate_many_bounded = Mock.bounded;
+    resolver.translate_many = Mock.required;
+    owner.row_resolver = resolver;
+    const refs: []const RowRef = &.{.{ .external = .{ .source_id = "source", .snapshot_id = "old", .file_id = "file", .row_group_ordinal = 0, .row_ordinal = 7 } }};
+    var allowance: Serving.TranslationAllowance = .{ .remaining_rows = 1 };
+    _ = try owner.mapRefsLimited(std.testing.allocator, refs, &allowance);
+    try std.testing.expectEqual(@as(u64, 0), allowance.remaining_rows);
+    try std.testing.expectEqual(@as(usize, 1), mock.calls);
+    try std.testing.expectError(error.QueryCandidateBudgetExceeded, owner.mapRefsLimited(std.testing.allocator, refs, &allowance));
+    try std.testing.expectEqual(@as(usize, 1), mock.calls);
+    resolver.translate_many_bounded = null;
+    owner.row_resolver = resolver;
+    allowance.remaining_rows = 1;
+    try std.testing.expectError(error.QueryCandidateBudgetExceeded, owner.mapRefsLimited(std.testing.allocator, refs, &allowance));
+    try std.testing.expectEqual(@as(usize, 1), mock.calls);
+}
+
+test "external lake covering waves overlap cold blocks retain admission and join failed reads" {
+    const a = std.testing.allocator;
+    const artifacts = @import("lake_index_aggregate_artifact.zig");
+    const stores = @import("../serverless/artifacts/store.zig");
+    const Token = @import("antfly_cancellation").CancellationToken;
+    var directory = try local.common_test_directory.TestDirectory.init("lake-covering-wave");
+    defer directory.cleanup();
+    var fs = try @import("../serverless/artifacts/fs_store.zig").FsStore.init(a, directory.path());
+    defer fs.deinit();
+    var store = fs.artifactStore();
+    store.upload_scope = .{ .domain = @splat(4), .attempt = @splat(1) };
+    var refs: [4]artifacts.ChunkRef = undefined;
+    var initialized: usize = 0;
+    defer for (refs[0..initialized]) |ref| {
+        a.free(ref.artifact_id);
+        a.free(ref.checksum);
+    };
+    for (&refs, 0..) |*ref, i| {
+        const encoded = try local.sql_spill.encodeColumnarBlockAlloc(a, &.{.{ .keys = &.{local.sql_scalar.Datum.json(.{ .string = "key" })}, .values = &.{local.sql_scalar.Datum.json(.{ .integer = @intCast(i) })}, .ordinal = i }}, artifacts.max_block_bytes);
+        defer a.free(encoded);
+        const metadata = try store.put(encoded);
+        ref.* = .{ .artifact_id = metadata.artifact_id, .checksum = metadata.checksum, .byte_len = metadata.byte_len };
+        initialized += 1;
+    }
+    const Probe = struct {
+        var active: *@This() = undefined;
+        base: stores.ArtifactStore,
+        current: std.atomic.Value(usize) = .init(0),
+        peak: std.atomic.Value(usize) = .init(0),
+        cancelled: std.atomic.Value(bool) = .init(false),
+        fail: ?[]const u8 = null,
+        cancel: bool = false,
+        fn canceled(raw: *const anyopaque) bool {
+            return @as(*const @This(), @ptrCast(@alignCast(raw))).cancelled.load(.acquire);
+        }
+        fn read(_: *anyopaque, alloc: A, id: []const u8, maximum: usize, token: Token) ![]u8 {
+            const self = active;
+            const count = self.current.fetchAdd(1, .acq_rel) + 1;
+            defer _ = self.current.fetchSub(1, .acq_rel);
+            _ = self.peak.fetchMax(count, .monotonic);
+            try std.testing.io.sleep(.fromMilliseconds(5), .awake);
+            if (self.fail) |failed| if (std.mem.eql(u8, failed, id)) {
+                if (self.cancel) {
+                    self.cancelled.store(true, .release);
+                    return error.Canceled;
+                }
+                return error.InjectedCoveringReadFailure;
+            };
+            const bytes = try self.base.getVerifiedAllocWithCancellationUsingAllocator(alloc, id, maximum, id[7..71], token);
+            return bytes;
+        }
+    };
+    const scheduler = local.sql_parallel_scheduler.global();
+    const before = scheduler.pull_bytes;
+    for (0..3) |mode| {
+        var probe: Probe = .{ .base = store, .fail = if (mode == 0) null else refs[0].artifact_id, .cancel = mode == 2 };
+        Probe.active = &probe;
+        var vtable = store.vtable.*;
+        vtable.get_bounded_alloc_with_cancellation = Probe.read;
+        var backend = store;
+        backend.vtable = &vtable;
+        var cache = local.serverless_query_lake_serving_cache.Cache.init(a);
+        defer cache.deinit();
+        var wave: CoveringWave = .{};
+        const read = wave.read(.{ .cache = &cache, .scope = @splat(7), .context = .{ .io = std.testing.io } }, backend, &refs, .{ .ptr = &probe, .is_cancelled_fn = Probe.canceled });
+        defer wave.deinit();
+        if (mode == 0) {
+            try read;
+            try std.testing.expect(probe.peak.load(.monotonic) > 1);
+            try std.testing.expectEqual(before + 4 * CoveringWave.lane_bytes, scheduler.pull_bytes);
+            for (wave.jobs, 0..) |job, i| try std.testing.expectEqual(@as(i64, @intCast(i)), (try job.block.?.value.cell(0, 0)).value.integer);
+        } else if (mode == 1) try std.testing.expectError(error.InjectedCoveringReadFailure, read) else try std.testing.expectError(error.Canceled, read);
+        try std.testing.expectEqual(@as(usize, 0), probe.current.load(.acquire));
+        wave.deinit();
+        try std.testing.expectEqual(before, scheduler.pull_bytes);
+    }
 }

@@ -764,7 +764,7 @@ pub fn relationalTopologyIdentity(self: *DB) !RelationalTopologyIdentity {
         .generation_handoff_receipt_authority = handoff_authority,
         .backup_seal_supported = self.primary_backend == .lsm and self.physical_root_mode == .filesystem_managed and
             nativeRestoreStoragePublicationCompatible(self.primary_lsm_storage) and self.backend_runtime.filesystemIo() != null and
-            try self.primaryOnlySnapshotSupportedLocked(),
+            try self.sealedBackupSupportedLocked(),
     };
 }
 

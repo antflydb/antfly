@@ -19,6 +19,8 @@ const local = @import("antfly_local_sources");
 const managed = local.inference_managed_embedder;
 const A = std.mem.Allocator;
 const V = std.json.Value;
+const units_api = @import("lake_enrichment_units.zig");
+const rows = local.storage_rowsource_types;
 pub const Producer = struct {
     allocator: A,
     managed: ?managed.ManagedEmbedder = null,
@@ -48,7 +50,52 @@ pub const Producer = struct {
         if (self.memo) |memo| try memo.context.ensureActive();
         return @import("lake_enrichment_units.zig").prepare(a, self.config, self.column, row, self.options);
     }
+    pub const Input = struct {
+        producer: *Producer,
+        batch: rows.ColumnBatch,
+        column: ?rows.ColumnVector,
+        whole_row: bool,
+        pub const Prepared = struct {
+            single: [1]units_api.Unit = undefined,
+            count: usize = 0,
+            many: ?[]const units_api.Unit = null,
+            pub fn units(self: *const Prepared) []const units_api.Unit {
+                return self.many orelse self.single[0..self.count];
+            }
+        };
+        pub fn units(self: Input, a: A, ordinal: usize) ![]const units_api.Unit {
+            const prepared = try self.prepare(a, ordinal);
+            if (prepared.many) |many| return many;
+            return a.dupe(units_api.Unit, prepared.single[0..prepared.count]);
+        }
+        pub fn prepare(self: Input, a: A, ordinal: usize) !Prepared {
+            if (ordinal >= self.batch.rowCount()) return error.InvalidSqlBackendResponse;
+            if (self.producer.memo) |memo| try memo.context.ensureActive();
+            if (self.whole_row) {
+                const page: local.sql_catalog.ColumnPage = .{ .batch = self.batch, .selection = &.{ordinal} };
+                return .{ .many = try self.producer.units(a, try units_api.rowValue(a, page)) };
+            }
+            const column = self.column orelse return .{};
+            if (column.nulls.isNull(ordinal)) return .{};
+            if (column.values == .vector_f32 and self.producer.managed == null) {
+                return .{ .single = .{.{ .dense_vector = column.values.vector_f32[ordinal] }}, .count = 1 };
+            }
+            const value = try column.values.jsonAt(a, ordinal);
+            if (self.producer.managed == null) return if (value == .null) .{} else .{ .single = .{.{ .materialized = value }}, .count = 1 };
+            return .{ .many = try units_api.prepareSelected(a, self.producer.config, value, null, self.producer.options) };
+        }
+    };
+    /// Resolve the input column once per batch. Unrelated columns stay encoded;
+    /// native vectors remain borrowed and dictionary strings stay dictionary-backed.
+    pub fn bind(self: *Producer, batch: rows.ColumnBatch) Input {
+        return .{ .producer = self, .batch = batch, .column = batch.findColumn(self.column), .whole_row = units_api.configured(self.config, "template") != null and self.managed != null };
+    }
     pub fn denseUnit(self: *Producer, a: A, unit: @import("lake_enrichment_units.zig").Unit, dims: u32) !?[]const f32 {
+        if (unit.dense_vector) |vector| {
+            if (vector.len != dims) return error.InvalidVectorDimensions;
+            for (vector) |value| if (!std.math.isFinite(value)) return error.InvalidVectorValue;
+            return vector;
+        }
         if (unit.materialized) |value| return self.dense(a, value, dims);
         if (unit.parts.len == 1 and unit.parts[0] == .text) return self.dense(a, .{ .string = unit.parts[0].text }, dims);
         const owner = if (self.managed) |*value| value else return error.LakeEmbeddingProviderUnavailable;
@@ -70,6 +117,7 @@ pub const Producer = struct {
         return vector;
     }
     pub fn sparseUnit(self: *Producer, a: A, unit: @import("lake_enrichment_units.zig").Unit) !?local.storage_db_enrichment_embedder.SparseEmbedding {
+        if (unit.dense_vector != null) return error.InvalidEmbeddingField;
         if (unit.materialized) |value| return self.sparse(a, value);
         if (unit.parts.len != 1 or unit.parts[0] != .text) return error.UnsupportedSparseMediaInput;
         return self.sparse(a, .{ .string = unit.parts[0].text });
@@ -94,9 +142,7 @@ pub const Producer = struct {
             return vector;
         }
         const parsed = if (value == .string) try std.json.parseFromSliceLeaky(V, a, value.string, .{}) else value;
-        var root: V = .{ .object = .empty };
-        try root.object.put(a, "vector", parsed);
-        return (try local.storage_db_document_mapper.extractDenseVectorFieldFromParsed(a, root, "vector", dims)) orelse error.InvalidVectorValue;
+        return (try local.storage_db_document_mapper.extractDenseVectorFromValue(a, parsed, dims)) orelse error.InvalidVectorValue;
     }
     pub fn sparse(self: *Producer, a: A, value: V) !?local.storage_db_enrichment_embedder.SparseEmbedding {
         if (value == .null) return null;
@@ -122,9 +168,7 @@ pub const Producer = struct {
 };
 
 fn materializedDense(a: A, value: V, dims: u32) ![]const f32 {
-    var root: V = .{ .object = .empty };
-    try root.object.put(a, "vector", value);
-    return (try local.storage_db_document_mapper.extractDenseVectorFieldFromParsed(a, root, "vector", dims)) orelse error.InvalidVectorValue;
+    return (try local.storage_db_document_mapper.extractDenseVectorFromValue(a, value, dims)) orelse error.InvalidVectorValue;
 }
 fn materializedSparse(a: A, value: V) !local.storage_db_enrichment_embedder.SparseEmbedding {
     const vector = try local.storage_db_document_mapper.parseSparseValue(a, value);
@@ -173,6 +217,48 @@ pub const Memo = struct {
         return vector;
     }
 };
+
+test "external lake vector publication binds typed batches without reading unrelated columns" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const ca = arena.allocator();
+    const config = try std.json.parseFromSliceLeaky(V, ca, "{}", .{});
+    var producer = try Producer.init(a, "dense", "vector", config, null);
+    defer producer.deinit();
+    const Poison = struct {
+        fn read(_: *const anyopaque, _: usize) !V {
+            return error.UnexpectedPayloadMaterialization;
+        }
+    };
+    var dummy: u8 = 0;
+    const batch: rows.ColumnBatch = .{
+        .snapshot = .{ .table_id = "lake", .snapshot_id = "snapshot" },
+        .external_span = .{ .first = .{ .source_id = "lake", .snapshot_id = "snapshot", .file_id = "file", .row_group_ordinal = 0, .row_ordinal = 0 }, .count = 3 },
+        .columns = &.{
+            .{ .name = "vector", .values = .{ .vector_f32 = &.{ &.{ 1, 0 }, &.{ 0, 1 }, &.{} } }, .nulls = .{ .bytes = &.{ 0, 0, 1 } } },
+            .{ .name = "unrelated", .values = .{ .encoded = .{ .ptr = &dummy, .begin = 0, .kind = .json, .count = 3, .read = Poison.read } } },
+        },
+    };
+    const input = producer.bind(batch);
+    const first = (try input.units(ca, 0))[0];
+    const vector = (try producer.denseUnit(ca, first, 2)).?;
+    try std.testing.expect(vector.ptr == batch.columns[0].values.vector_f32[0].ptr);
+    try std.testing.expectEqualSlices(f32, &.{ 1, 0 }, vector);
+    try std.testing.expectEqual(@as(usize, 0), (try input.units(ca, 2)).len);
+    try std.testing.expectError(error.InvalidVectorDimensions, producer.denseUnit(ca, first, 3));
+    try std.testing.expectError(error.InvalidVectorValue, producer.denseUnit(ca, .{ .dense_vector = &.{std.math.nan(f32)} }, 1));
+    try std.testing.expectError(error.InvalidEmbeddingField, producer.sparseUnit(ca, first));
+    var strings = batch;
+    strings.columns = &.{.{ .name = "vector", .values = .{ .dictionary_bytes = .{ .values = &.{"[0,1]"}, .indices = &.{ 0, 0, 0 } } } }};
+    const string_unit = (try producer.bind(strings).units(ca, 1))[0];
+    try std.testing.expectEqualSlices(f32, &.{ 0, 1 }, (try producer.denseUnit(ca, string_unit, 2)).?);
+    strings.columns = &.{.{ .name = "vector", .values = .{ .json = &.{ "{\"indices\":[3],\"values\":[0.5]}", "null", "{}" } } }};
+    const sparse = (try producer.sparseUnit(ca, (try producer.bind(strings).units(ca, 0))[0])).?;
+    try std.testing.expectEqualSlices(u32, &.{3}, sparse.indices);
+    try std.testing.expectEqualSlices(f32, &.{0.5}, sparse.values);
+    try std.testing.expectEqual(@as(usize, 0), (try producer.bind(strings).units(ca, 1)).len);
+}
 
 test "external lake enrichment memo survives reopening and conditional races preserve the first completed vector" {
     const a = std.testing.allocator;

@@ -45,7 +45,7 @@ pub fn usage(comptime resource: Resource) []const u8 {
     inline for (actions) |action| {
         if (resource == .index or action.artifact) text = text ++ "  " ++ @tagName(action.action) ++ "  " ++ (comptime action.text(resource)) ++ "\n";
     }
-    text = text ++ "\n  --job <id>              Select a job for status/advance/cancel\n" ++
+    text = text ++ "\n  --url <url>             Server URL (overrides ANTFLY_URL)\n  --job <id>              Select a job for status/advance/cancel\n" ++
         "  --index <name>          Restrict work to one index\n" ++
         "  --once                  Run one bounded repair/control pass\n" ++
         "  --cursor <cursor>       Continue a bounded pass\n" ++
