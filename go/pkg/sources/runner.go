@@ -31,6 +31,10 @@ import (
 	"time"
 )
 
+// Ownership includes previously attempted writes across interrupted inventories.
+// It is bounded separately from the 10,000-item active inventory.
+const maxOwnedSourceObjects = 100000
+
 type Profile struct {
 	Version           int                   `json:"version"`
 	Endpoint          string                `json:"endpoint"`
@@ -222,7 +226,7 @@ func (r *Runner) syncSource(ctx context.Context, s Source, connection Connection
 	if state.Owned == nil {
 		state.Owned = map[string]string{}
 	}
-	if len(state.Owned) > maxImportSourceObjects {
+	if len(state.Owned) > maxOwnedSourceObjects {
 		return 0, fmt.Errorf("source ownership exceeds budget")
 	}
 	request := Request{SourceNamespace: "job/" + s.ID, Config: s.Config, Mode: ImportModeSource}
@@ -311,11 +315,14 @@ func (r *Runner) syncSource(ctx context.Context, s Source, connection Connection
 		if err != nil {
 			return 0, err
 		}
+		if _, exists := state.Owned[item.ID]; !exists && len(state.Owned) >= maxOwnedSourceObjects {
+			return 0, fmt.Errorf("source ownership exceeds budget; complete reconciliation before selecting more items")
+		}
 		if err := journalOwnership(journalPath, ownershipEvent{ID: item.ID, Revision: item.Revision}); err != nil {
 			return 0, err
 		}
 		state.Owned[item.ID] = item.Revision
-		if len(state.Owned) > maxImportSourceObjects {
+		if len(state.Owned) > maxOwnedSourceObjects {
 			return 0, fmt.Errorf("source ownership exceeds budget")
 		}
 		record := map[string]any{"id": item.ID, "source_id": s.ID, "doc_type": "source_item", "grep": doc}
@@ -339,6 +346,9 @@ func (r *Runner) syncSource(ctx context.Context, s Source, connection Connection
 	for start := 0; start < len(absent); start += 100 {
 		batch := absent[start:min(start+100, len(absent))]
 		if err := r.Publisher.Batch(ctx, s.Table, nil, batch); err != nil {
+			return 0, err
+		}
+		if err := r.Publisher.ReadyAbsent(ctx, s.Table, batch); err != nil {
 			return 0, err
 		}
 		if err := journalOwnership(journalPath, ownershipEvent{Delete: batch}); err != nil {

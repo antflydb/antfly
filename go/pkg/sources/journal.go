@@ -85,7 +85,7 @@ func replayOwnership(path, namespace string, owned map[string]string) error {
 				delete(owned, id)
 			}
 		}
-		if len(owned) > maxImportSourceObjects {
+		if len(owned) > maxOwnedSourceObjects {
 			return fmt.Errorf("ownership count exceeds budget")
 		}
 	}

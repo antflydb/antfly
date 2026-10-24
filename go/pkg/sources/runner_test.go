@@ -298,3 +298,23 @@ func TestRunnerStateLockHonorsCancellation(t *testing.T) {
 		t.Fatal("concurrent runner bypassed state lock")
 	}
 }
+
+func TestDeletionReadinessWaitsForFreshSnapshot(t *testing.T) {
+	calls := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		hits := []any{}
+		if calls == 1 {
+			hits = append(hits, map[string]any{"_id": "retired"})
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"responses": []any{map[string]any{"status": 200, "remote_snapshot": "fresh", "hits": map[string]any{"hits": hits}}}})
+	}))
+	defer server.Close()
+	publisher := Publisher{Endpoint: server.URL}
+	if err := publisher.ReadyAbsent(t.Context(), "sources", []string{"retired"}); err != nil {
+		t.Fatal(err)
+	}
+	if calls != 2 {
+		t.Fatalf("expected a new snapshot after stale deletion, got %d queries", calls)
+	}
+}

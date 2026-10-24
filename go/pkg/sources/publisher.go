@@ -186,3 +186,42 @@ func samePermissions(actual *Permissions, expected Permissions) bool {
 	right, _ := json.Marshal(expected)
 	return bytes.Equal(left, right)
 }
+
+// ReadyAbsent prevents publishing a complete catalog while retired rows are
+// still visible to a fresh query snapshot.
+func (p *Publisher) ReadyAbsent(ctx context.Context, table string, ids []string) error {
+	wait, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	for {
+		data, err := p.call(wait, "POST", tablePath(table)+"/query", map[string]any{"query": map[string]any{"ids": ids}, "fields": []string{"_id"}, "limit": 1, "order_by": []any{map[string]any{"field": "_id", "desc": false}}})
+		if err != nil {
+			return err
+		}
+		var result struct {
+			Responses []struct {
+				Status   int             `json:"status"`
+				Error    json.RawMessage `json:"error"`
+				Snapshot string          `json:"remote_snapshot"`
+				Hits     struct {
+					Hits []json.RawMessage `json:"hits"`
+				} `json:"hits"`
+			} `json:"responses"`
+		}
+		if err := json.Unmarshal(data, &result); err != nil {
+			return err
+		}
+		if len(result.Responses) != 1 || result.Responses[0].Status != 200 || result.Responses[0].Snapshot == "" || len(result.Responses[0].Error) > 0 && string(result.Responses[0].Error) != "null" {
+			return fmt.Errorf("Antfly did not provide successful deletion snapshot readiness")
+		}
+		if len(result.Responses[0].Hits.Hits) == 0 {
+			return nil
+		}
+		timer := time.NewTimer(100 * time.Millisecond)
+		select {
+		case <-wait.Done():
+			timer.Stop()
+			return fmt.Errorf("retired sources remain query-visible: %w", wait.Err())
+		case <-timer.C:
+		}
+	}
+}

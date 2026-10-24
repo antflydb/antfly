@@ -112,3 +112,7 @@ webhooks, distributed scheduling and live-provider qualification are outside thi
 runner's current text-ingestion scope. Removing a source from configuration hides
 it from the emitted catalog and retains its indexed records/state; it is not a
 purge request.
+
+Ownership of up to 100,000 potentially written rows is retained across interrupted
+inventories; active inventories remain limited to 10,000 items. Reconciliation
+checks deletion visibility before publishing a searchable catalog.
