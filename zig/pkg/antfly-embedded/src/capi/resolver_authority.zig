@@ -777,7 +777,7 @@ test "capi resolver curation indexed static profiles exclude seventeen thousand 
         for (static, 0..) |*alias, j| alias.* = .{ .key = try std.fmt.allocPrint(a, "concept/noise-{d}-{d}", .{ i, j }), .target = try std.fmt.allocPrint(a, "concept/target-{d}-{d}", .{ i, j }) };
         if (i == 0) static[0] = .{ .key = "concept/seed", .target = "concept/bridge" };
         if (i == 1) static[0] = .{ .key = "concept/bridge", .target = "concept/end" };
-        try root.db.addResolver(.{ .name = try std.fmt.allocPrint(a, "r-{d}", .{i}), .table = "entities", .source_artifact = try std.fmt.allocPrint(a, "kg-{d}", .{i}), .resolution_artifact = try std.fmt.allocPrint(a, "out-{d}", .{i}), .key_template = "concept/{{_key}}", .aliases = static, .promote = false });
+        _ = try root.db.upsertResolverWithResultOptions(.{ .name = try std.fmt.allocPrint(a, "r-{d}", .{i}), .table = "entities", .source_artifact = try std.fmt.allocPrint(a, "kg-{d}", .{i}), .resolution_artifact = try std.fmt.allocPrint(a, "out-{d}", .{i}), .key_template = "concept/{{_key}}", .aliases = static, .promote = false }, .{ .drain_backfill = false, .wait_for_activity = true });
     }
     var out: h.capi.Buffer = .{};
     defer api.antfly_buffer_free(&out);
