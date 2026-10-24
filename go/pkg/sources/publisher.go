@@ -50,6 +50,9 @@ func ValidateEndpoint(raw string) error {
 	return fmt.Errorf("Antfly endpoint requires HTTPS or loopback HTTP")
 }
 func (p *Publisher) call(ctx context.Context, method, path string, body any) ([]byte, error) {
+	return p.callContentType(ctx, method, path, body, "application/json")
+}
+func (p *Publisher) callContentType(ctx context.Context, method, path string, body any, contentType string) ([]byte, error) {
 	if err := ValidateEndpoint(p.Endpoint); err != nil {
 		return nil, err
 	}
@@ -68,7 +71,7 @@ func (p *Publisher) call(ctx context.Context, method, path string, body any) ([]
 	if err != nil {
 		return nil, err
 	}
-	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("Content-Type", contentType)
 	if p.Token != "" {
 		request.Header.Set("Authorization", "Bearer "+p.Token)
 	}
@@ -177,4 +180,8 @@ func WaitForAbsent(ctx context.Context, query func(context.Context, string, []by
 		case <-timer.C:
 		}
 	}
+}
+
+func (p *Publisher) Merge(ctx context.Context, table string, body []byte) ([]byte, error) {
+	return p.callContentType(ctx, "POST", tablePath(table)+"/merge", json.RawMessage(body), ScopedMergeContentType)
 }

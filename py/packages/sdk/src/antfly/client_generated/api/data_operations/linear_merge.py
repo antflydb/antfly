@@ -9,13 +9,14 @@ from ...client import AuthenticatedClient, Client
 from ...models.error import Error
 from ...models.linear_merge_request import LinearMergeRequest
 from ...models.linear_merge_result import LinearMergeResult
+from ...models.scoped_linear_merge_request import ScopedLinearMergeRequest
 from ...types import Response
 
 
 def _get_kwargs(
     table_name: str,
     *,
-    body: LinearMergeRequest,
+    body: LinearMergeRequest | ScopedLinearMergeRequest,
 ) -> dict[str, Any]:
     headers: dict[str, Any] = {}
 
@@ -26,9 +27,14 @@ def _get_kwargs(
         ),
     }
 
-    _kwargs["json"] = body.to_dict()
+    if isinstance(body, LinearMergeRequest):
+        _kwargs["json"] = body.to_dict()
 
-    headers["Content-Type"] = "application/json"
+        headers["Content-Type"] = "application/json"
+    if isinstance(body, ScopedLinearMergeRequest):
+        _kwargs["json"] = body.to_dict()
+
+        headers["Content-Type"] = "application/vnd.antfly.scoped-merge.v1+json"
 
     _kwargs["headers"] = headers
     return _kwargs
@@ -88,7 +94,7 @@ def sync_detailed(
     table_name: str,
     *,
     client: AuthenticatedClient,
-    body: LinearMergeRequest,
+    body: LinearMergeRequest | ScopedLinearMergeRequest,
 ) -> Response[Error | LinearMergeResult]:
     """Synchronize data from external sources (Shopify, Postgres, S3) using a linear merge
 
@@ -106,6 +112,12 @@ def sync_detailed(
 
     **Use Cases**: Sync production databases, e-commerce APIs (Shopify, WooCommerce),
     data lake exports, or warehouse tables to Antfly for low-latency hybrid search.
+
+    For shared tables, use the bounded `scoped_merge` envelope with media
+    type `application/vnd.antfly.scoped-merge.v1+json`. It limits deletion to
+    exclusive key bounds and supports non-destructive upsert pages followed
+    by metadata-only authoritative reconciliation. Legacy servers reject the
+    envelope without mutating; clients must never retry it as an unbounded merge.
 
     **WARNING**: Not safe for concurrent merges with overlapping ranges.
     Single-client sync API only.
@@ -131,6 +143,10 @@ def sync_detailed(
             4. Use next_cursor as last_merged_id for the next request
 
             **WARNING:** Not safe for concurrent operations with overlapping key ranges.
+        body (ScopedLinearMergeRequest): Bounded LinearMerge v1 envelope. Legacy servers reject
+            this envelope
+            before mutation because it has no top-level records field. Never fall
+            back to an unbounded merge when a server rejects this request.
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -156,7 +172,7 @@ def sync(
     table_name: str,
     *,
     client: AuthenticatedClient,
-    body: LinearMergeRequest,
+    body: LinearMergeRequest | ScopedLinearMergeRequest,
 ) -> Error | LinearMergeResult | None:
     """Synchronize data from external sources (Shopify, Postgres, S3) using a linear merge
 
@@ -174,6 +190,12 @@ def sync(
 
     **Use Cases**: Sync production databases, e-commerce APIs (Shopify, WooCommerce),
     data lake exports, or warehouse tables to Antfly for low-latency hybrid search.
+
+    For shared tables, use the bounded `scoped_merge` envelope with media
+    type `application/vnd.antfly.scoped-merge.v1+json`. It limits deletion to
+    exclusive key bounds and supports non-destructive upsert pages followed
+    by metadata-only authoritative reconciliation. Legacy servers reject the
+    envelope without mutating; clients must never retry it as an unbounded merge.
 
     **WARNING**: Not safe for concurrent merges with overlapping ranges.
     Single-client sync API only.
@@ -199,6 +221,10 @@ def sync(
             4. Use next_cursor as last_merged_id for the next request
 
             **WARNING:** Not safe for concurrent operations with overlapping key ranges.
+        body (ScopedLinearMergeRequest): Bounded LinearMerge v1 envelope. Legacy servers reject
+            this envelope
+            before mutation because it has no top-level records field. Never fall
+            back to an unbounded merge when a server rejects this request.
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -219,7 +245,7 @@ async def asyncio_detailed(
     table_name: str,
     *,
     client: AuthenticatedClient,
-    body: LinearMergeRequest,
+    body: LinearMergeRequest | ScopedLinearMergeRequest,
 ) -> Response[Error | LinearMergeResult]:
     """Synchronize data from external sources (Shopify, Postgres, S3) using a linear merge
 
@@ -237,6 +263,12 @@ async def asyncio_detailed(
 
     **Use Cases**: Sync production databases, e-commerce APIs (Shopify, WooCommerce),
     data lake exports, or warehouse tables to Antfly for low-latency hybrid search.
+
+    For shared tables, use the bounded `scoped_merge` envelope with media
+    type `application/vnd.antfly.scoped-merge.v1+json`. It limits deletion to
+    exclusive key bounds and supports non-destructive upsert pages followed
+    by metadata-only authoritative reconciliation. Legacy servers reject the
+    envelope without mutating; clients must never retry it as an unbounded merge.
 
     **WARNING**: Not safe for concurrent merges with overlapping ranges.
     Single-client sync API only.
@@ -262,6 +294,10 @@ async def asyncio_detailed(
             4. Use next_cursor as last_merged_id for the next request
 
             **WARNING:** Not safe for concurrent operations with overlapping key ranges.
+        body (ScopedLinearMergeRequest): Bounded LinearMerge v1 envelope. Legacy servers reject
+            this envelope
+            before mutation because it has no top-level records field. Never fall
+            back to an unbounded merge when a server rejects this request.
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -285,7 +321,7 @@ async def asyncio(
     table_name: str,
     *,
     client: AuthenticatedClient,
-    body: LinearMergeRequest,
+    body: LinearMergeRequest | ScopedLinearMergeRequest,
 ) -> Error | LinearMergeResult | None:
     """Synchronize data from external sources (Shopify, Postgres, S3) using a linear merge
 
@@ -303,6 +339,12 @@ async def asyncio(
 
     **Use Cases**: Sync production databases, e-commerce APIs (Shopify, WooCommerce),
     data lake exports, or warehouse tables to Antfly for low-latency hybrid search.
+
+    For shared tables, use the bounded `scoped_merge` envelope with media
+    type `application/vnd.antfly.scoped-merge.v1+json`. It limits deletion to
+    exclusive key bounds and supports non-destructive upsert pages followed
+    by metadata-only authoritative reconciliation. Legacy servers reject the
+    envelope without mutating; clients must never retry it as an unbounded merge.
 
     **WARNING**: Not safe for concurrent merges with overlapping ranges.
     Single-client sync API only.
@@ -328,6 +370,10 @@ async def asyncio(
             4. Use next_cursor as last_merged_id for the next request
 
             **WARNING:** Not safe for concurrent operations with overlapping key ranges.
+        body (ScopedLinearMergeRequest): Bounded LinearMerge v1 envelope. Legacy servers reject
+            this envelope
+            before mutation because it has no top-level records field. Never fall
+            back to an unbounded merge when a server rejects this request.
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.

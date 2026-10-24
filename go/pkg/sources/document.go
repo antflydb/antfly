@@ -85,6 +85,8 @@ func Normalize(sourceID string, item Item, data []byte, permissions Permissions,
 		permissions.Readers = []string{}
 	}
 	metadata := cloneSourceMetadata(item.Metadata)
+	// Enumeration position is diagnostic bookkeeping, not document identity.
+	delete(metadata, "object_index")
 	digest := sha256.Sum256(data)
 	metadata["sha256"] = hex.EncodeToString(digest[:])
 	metadata["provider"] = item.SourceKind

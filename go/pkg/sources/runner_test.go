@@ -55,12 +55,13 @@ func (c *fixtureConnector) ValidateAbsentSources(context.Context, Request, []str
 }
 
 type publicationFixture struct {
-	mu              sync.Mutex
-	catalogRecords  map[string]map[string]any
-	records         map[string]map[string]any
-	failAfterWrite  bool
-	deletes         int
-	selectedHeaders []string
+	mu                sync.Mutex
+	catalogRecords    map[string]map[string]any
+	records           map[string]map[string]any
+	failAfterWrite    bool
+	upserted, skipped int
+	deletes           int
+	selectedHeaders   []string
 }
 
 func (f *publicationFixture) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -99,8 +100,10 @@ func (f *publicationFixture) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		if deletes, ok := body["deletes"].([]any); ok {
 			for _, id := range deletes {
+				if _, exists := records[id.(string)]; exists {
+					f.deletes++
+				}
 				delete(records, id.(string))
-				f.deletes++
 			}
 		}
 		if f.failAfterWrite && !strings.Contains(r.URL.Path, "/tables/"+DefaultCatalogTable+"/") {
@@ -109,6 +112,33 @@ func (f *publicationFixture) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		fmt.Fprint(w, `{"inserted":1}`)
+		return
+	}
+	if strings.HasSuffix(r.URL.Path, "/merge") {
+		if r.Header.Get("Content-Type") != ScopedMergeContentType {
+			http.Error(w, "unsafe merge transport", 400)
+			return
+		}
+		raw, _ := json.Marshal(body)
+		var request ScopedMergeRequest
+		if json.Unmarshal(raw, &request) != nil {
+			http.Error(w, "bad merge", 400)
+			return
+		}
+		result, err := fixtureScopedMerge(records, request.ScopedMerge)
+		if err != nil {
+			http.Error(w, err.Error(), 400)
+			return
+		}
+		f.deletes += result.Deleted
+		f.upserted += result.Upserted
+		f.skipped += result.Skipped
+		if f.failAfterWrite {
+			f.failAfterWrite = false
+			http.Error(w, "write ack lost", 500)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(result)
 		return
 	}
 	if !strings.HasSuffix(r.URL.Path, "/query") {
@@ -147,8 +177,28 @@ func (f *publicationFixture) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if n, ok := body["limit"].(float64); ok {
 		limit = int(n)
 	}
+	excluded := map[string]bool{}
+	if q, ok := body["query"].(map[string]any); ok {
+		if b, ok := q["bool"].(map[string]any); ok {
+			if clauses, ok := b["must_not"].([]any); ok {
+				for _, clause := range clauses {
+					if c, ok := clause.(map[string]any); ok {
+						if ids, ok := c["ids"].([]any); ok {
+							for _, id := range ids {
+								excluded[id.(string)] = true
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+	prefix, _ := body["filter_prefix"].(string)
 	hits := []any{}
 	for _, id := range selected {
+		if excluded[id] || prefix != "" && !strings.HasPrefix(id, prefix) {
+			continue
+		}
 		if id <= after {
 			continue
 		}

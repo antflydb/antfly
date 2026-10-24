@@ -20,6 +20,12 @@ REQUIRED_BODY = re.compile(
     r"(body:\s+(?:GlobalStatefulQueryRequest|StatefulQueryRequest)\s+\|\s+File)"
     r"\s+\|\s+Unset\s*=\s*UNSET"
 )
+SCOPED_MERGE = Path("api/data_operations/linear_merge.py")
+SCOPED_MERGE_BODY = re.compile(
+    r"(body:\s+LinearMergeRequest\s+\|\s+ScopedLinearMergeRequest)"
+    r"\s+\|\s+Unset\s*=\s*UNSET"
+)
+SCOPED_MERGE_HEADER = 'headers["Content-Type"] = "application/vnd.antfly.scoped-merge.v1+json"'
 NDJSON_HEADER = 'headers["Content-Type"] = "application/x-ndjson"'
 RELATIONAL_QUERY = Path("api/data_operations/query_relational_rows.py")
 SQL_OPERATIONS = [
@@ -136,6 +142,12 @@ def fix_generated_client(root: Path) -> None:
                 f"required-body signatures={count}, NDJSON headers={source.count(NDJSON_HEADER)}"
             )
         updates[path] = REQUIRED_BODY.sub(r"\1", source)
+
+    path = root / SCOPED_MERGE
+    source = path.read_text(encoding="utf-8")
+    if len(SCOPED_MERGE_BODY.findall(source)) != 5 or source.count(SCOPED_MERGE_HEADER) != 1:
+        raise RuntimeError(f"unexpected generated shape in {SCOPED_MERGE}: required scoped merge body")
+    updates[path] = SCOPED_MERGE_BODY.sub(r"\1", source)
 
     # The generator treats unknown NDJSON media as binary while annotating
     # the schema as str. Decode text, without JSON parsing or integer coercion.
