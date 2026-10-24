@@ -493,7 +493,17 @@ const FlashHeadWork = struct {
     row_max: []f32,
     row_sum: []f32,
     cancelled: bool = false,
-    fn run(raw: *anyopaque) void {
+    const run = if (builtin.cpu.arch.isWasm()) runUnaligned else runAligned;
+
+    fn runUnaligned(raw: *anyopaque) void {
+        runBody(raw);
+    }
+
+    fn runAligned(raw: *anyopaque) align(64) void {
+        runBody(raw);
+    }
+
+    inline fn runBody(raw: *anyopaque) void {
         const self: *FlashHeadWork = @ptrCast(@alignCast(raw));
         const Q = self.Q;
         const K = self.K;

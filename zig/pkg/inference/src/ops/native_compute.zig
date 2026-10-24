@@ -7025,27 +7025,27 @@ const OwnedDenseOutput = struct {
     compute: *NativeCompute,
     storage: ?[]f32,
 
-    fn alloc(compute: *NativeCompute, elements: usize) !@This() {
+    inline fn alloc(compute: *NativeCompute, elements: usize) !@This() {
         return .{ .compute = compute, .storage = try compute.allocator.alloc(f32, elements) };
     }
-    fn copy(compute: *NativeCompute, source: []const f32) !@This() {
+    inline fn copy(compute: *NativeCompute, source: []const f32) !@This() {
         return .{ .compute = compute, .storage = try compute.allocator.dupe(f32, source) };
     }
-    fn deinit(output: *@This()) void {
+    inline fn deinit(output: *@This()) void {
         if (output.storage) |storage| output.compute.allocator.free(storage);
         output.storage = null;
     }
-    fn intoResult(output: *@This()) !CT {
+    inline fn intoResult(output: *@This()) !CT {
         const storage = output.storage.?;
         output.storage = null;
         return output.compute.makeOwnedBuf(storage);
     }
-    fn intoLike(output: *@This(), input: CT) !CT {
+    inline fn intoLike(output: *@This(), input: CT) !CT {
         const result = try output.intoResult();
         errdefer freeTensor(output.compute, result);
         return propagateLogicalShapeLike(output.compute, result, input);
     }
-    fn intoShape(output: *@This(), shape: []const i64) !CT {
+    inline fn intoShape(output: *@This(), shape: []const i64) !CT {
         const result = try output.intoResult();
         errdefer freeTensor(output.compute, result);
         return output.compute.withLogicalShape(result, shape);
