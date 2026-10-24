@@ -1,27 +1,86 @@
 {
- "$schema":"https://json-schema.org/draft/2020-12/schema",
- "title":"Portable source catalog v2",
- "type":"object",
- "required":["version","endpoint","sources","principals"],
- "properties":{
-  "version":{"const":2},
-  "endpoint":{"type":"string","format":"uri-reference","description":"Ordinary Antfly API base. Local catalogs require an absolute HTTPS/loopback URL; the Cloud adapter pins the relative db/v1 reference to its instance context."},
-  "principals":{"type":"array","maxItems":262144,"items":{"type":"string"},"description":"Additional client-side reader filtering, never server authorization."},
-  "subject":{"type":"string","description":"Authenticated identity for paginated remote discovery."},
-  "discovery_id":{"type":"string","description":"Generation binding all remote discovery pages to the same authorized view."},
-  "next_cursor":{"type":"string","maxLength":256,"pattern":"^[A-Za-z0-9_-]+$"},
-  "sources":{"type":"array","maxItems":1000,"items":{
-   "type":"object","required":["id","table","document_field","status","filter"],
-   "properties":{
-    "id":{"type":"string","minLength":1,"maxLength":512},
-    "alias":{"type":"string","minLength":1},
-    "table":{"type":"string","minLength":1},
-    "document_field":{"type":"string","minLength":1,"default":"grep"},
-    "filter":{"type":"object","description":"Selection constraint applied through the normal query filter; grants no authority."},
-    "status":{"enum":["pending","syncing","searchable","stale"]},
-    "valid_until":{"type":"integer","description":"Optional Unix-second readiness/permission lease checked before requests."},
-    "access_id":{"type":"string","minLength":1,"maxLength":128,"pattern":"^[A-Za-z0-9_-]+$","description":"Optional server-specific access-view precondition, never a capability."}
-   }
-  }}
- }
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Portable source catalog v2",
+  "type": "object",
+  "required": [
+    "version",
+    "endpoint",
+    "sources",
+    "principals"
+  ],
+  "properties": {
+    "version": {
+      "const": 2
+    },
+    "endpoint": {
+      "type": "string",
+      "format": "uri-reference",
+      "description": "Ordinary Antfly API base. File catalogs require an absolute HTTPS/loopback URL. Cloud obtains its base from the authenticated instance context."
+    },
+    "principals": {
+      "type": "array",
+      "maxItems": 262144,
+      "items": {
+        "type": "string"
+      },
+      "description": "Additional client-side reader filtering, never server authorization."
+    },
+    "sources": {
+      "type": "array",
+      "maxItems": 1000,
+      "items": {
+        "type": "object",
+        "required": [
+          "id",
+          "table",
+          "document_field",
+          "status",
+          "filter"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 512
+          },
+          "alias": {
+            "type": "string",
+            "minLength": 1
+          },
+          "table": {
+            "type": "string",
+            "minLength": 1
+          },
+          "document_field": {
+            "type": "string",
+            "minLength": 1,
+            "default": "grep"
+          },
+          "filter": {
+            "type": "object",
+            "description": "Selection constraint applied through the normal query filter; grants no authority."
+          },
+          "status": {
+            "enum": [
+              "pending",
+              "syncing",
+              "searchable",
+              "stale"
+            ]
+          },
+          "valid_until": {
+            "type": "integer",
+            "description": "Optional Unix-second readiness/permission lease checked before requests."
+          },
+          "access_id": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128,
+            "pattern": "^[A-Za-z0-9_-]+$",
+            "description": "Optional server-specific access-view precondition, never a capability."
+          }
+        }
+      }
+    }
+  }
 }

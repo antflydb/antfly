@@ -62,6 +62,9 @@ pub fn load(a: A, io: std.Io, path: []const u8) ![]const u8 {
 /// Discover ordinary catalog-table rows through the caller's data-plane identity.
 /// Server authentication/RLS controls which catalog and content rows are visible.
 pub fn discover(a: A, io: std.Io, endpoint: []const u8, catalog_table: []const u8, credential: ?[]const u8, principals: []const []const u8, timeout_ms: u64) ![]const u8 {
+    return discoverWithSession(a, io, endpoint, catalog_table, credential, principals, timeout_ms, null);
+}
+pub fn discoverWithSession(a: A, io: std.Io, endpoint: []const u8, catalog_table: []const u8, credential: ?[]const u8, principals: []const []const u8, timeout_ms: u64, session: ?*@import("cloud.zig").Session) ![]const u8 {
     try @import("providers.zig").validateCustom(endpoint);
     if (catalog_table.len == 0 or std.mem.eql(u8, catalog_table, ".") or std.mem.eql(u8, catalog_table, "..")) return error.InvalidSourceCatalog;
     const httpx = @import("httpx");
@@ -71,21 +74,45 @@ pub fn discover(a: A, io: std.Io, endpoint: []const u8, catalog_table: []const u
     const state = arena.allocator();
     const escaped = try indexed.escape(state, catalog_table);
     const url = try std.fmt.allocPrint(state, "{s}/tables/{s}/query", .{ std.mem.trimEnd(u8, endpoint, "/"), escaped });
-    const auth = if (credential) |token| try std.fmt.allocPrint(state, "Bearer {s}", .{token}) else null;
-    var headers: std.ArrayList([2][]const u8) = .empty;
-    try headers.append(state, .{ "Content-Type", "application/json" });
-    if (auth) |value| try headers.append(state, .{ "Authorization", value });
     var http = httpx.Client.init(a, io);
     defer http.deinit();
     var sources: std.ArrayList(Source) = .empty;
     var snapshot: ?[]const u8 = null;
     var previous: ?[]const u8 = null;
     var wire_bytes: usize = 0;
+    var policy: ?[]const u8 = null;
     for (0..1024) |_| {
         const body = try std.json.Stringify.valueAlloc(state, .{ .query = .{ .equals = "source_catalog", .field = "doc_type" }, .fields = [_][]const u8{ "version", "doc_type", "source", "document_version", "published_revision" }, .limit = @as(u32, 64), .order_by = [_]struct { field: []const u8, desc: bool }{.{ .field = "_id", .desc = false }}, .remote_snapshot = snapshot, .search_after = if (previous) |id| @as(?[1][]const u8, .{id}) else null }, .{ .emit_null_optional_fields = false });
-        var response = try http.post(url, .{ .borrowed_body = body, .headers = headers.items, .timeout_ms = timeout_ms, .max_response_size = 1024 * 1024, .max_retries = 0, .follow_redirects = false, .cookies_enabled = false });
+        var response = response: {
+            for (0..2) |attempt| {
+                const token = if (session) |cloud| cloud.token() else credential;
+                const auth = if (token) |value| try std.fmt.allocPrint(state, "Bearer {s}", .{value}) else null;
+                var headers: std.ArrayList([2][]const u8) = .empty;
+                try headers.append(state, .{ "Content-Type", "application/json" });
+                if (auth) |value| try headers.append(state, .{ "Authorization", value });
+                if (policy) |value| try headers.append(state, .{ "X-Antfly-Catalog-Access", value });
+                var result = try http.post(url, .{ .borrowed_body = body, .headers = headers.items, .timeout_ms = timeout_ms, .max_response_size = 1024 * 1024, .max_retries = 0, .follow_redirects = false, .cookies_enabled = false });
+                if (result.status.code == 401 and attempt == 0 and session != null) {
+                    result.deinit();
+                    try session.?.refresh(token.?);
+                    continue;
+                }
+                errdefer result.deinit();
+                if (session != null and result.status.code == 409) return error.CloudDiscoveryChanged;
+                if (!result.ok()) return error.SourceCatalogUnavailable;
+                break :response result;
+            }
+            return error.CloudLoginRequired;
+        };
         defer response.deinit();
-        if (!response.ok()) return error.SourceCatalogUnavailable;
+        if (session) |cloud| {
+            try cloud.checkSubject(response.header("x-antfly-subject"));
+            const current = response.header("x-antfly-catalog-access") orelse return error.InvalidCloudSourcePolicy;
+            if (current.len == 0 or current.len > 128) return error.InvalidCloudSourcePolicy;
+            if (policy) |expected| {
+                if (!std.mem.eql(u8, expected, current)) return error.CloudDiscoveryChanged;
+            } else policy = try state.dupe(u8, current);
+        }
         const bytes = response.body orelse return error.InvalidSourceCatalog;
         wire_bytes += bytes.len;
         if (wire_bytes > 32 * 1024 * 1024) return error.SourceCatalogBudgetExceeded;

@@ -14,7 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Executable Cloud discovery/session contracts; fixtures never contact providers."""
+"""Cloud login over ordinary catalog/table APIs, with current-policy checks."""
 
 import json
 import os
@@ -23,8 +23,8 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
-from urllib.parse import urlsplit, parse_qs
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 BINARY = str(Path(sys.argv.pop(1)).resolve())
@@ -35,439 +35,402 @@ class CloudTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.directory = Path(self.temp.name)
-        self.requests = []
-        self.revoked = False
-        self.refresh = False
-        self.changed_context = False
-        self.overlapping = False
-        self.different_connections = False
-        self.identity_changed = False
-        self.discovery_requests = []
-        self.source_aliases = ["engineering", "work-drive"]
-        self.selected_ids = []
-        self.paginate = False
-        self.discovery_failure = None
-        self.discovery_refresh = False
-        self.legacy_discovery = False
-        self.too_many_sources = False
-        self.query_scope_changed = False
+        self.catalog_requests = []
+        self.content_requests = []
+        self.context_calls = self.directory / "context-calls"
+        self.mode = "complete"
+        self.aliases = ["manuals", "slides"]
+        self.long_catalog = False
+        self.instance_root = "/cloud/v1/instance"
+        self.subject = "user:alice"
         test = self
 
         class Handler(BaseHTTPRequestHandler):
             def log_message(self, *_):
                 pass
 
-            def reply(self, status, body=None, headers=None):
-                encoded = json.dumps(body).encode() if body is not None else b""
+            def reply(self, status, value=None, **headers):
+                raw = json.dumps(value or {}).encode()
                 self.send_response(status)
-                self.send_header("Content-Length", str(len(encoded)))
                 self.send_header("Content-Type", "application/json")
-                for name, value in (headers or {}).items():
-                    self.send_header(name, value)
+                self.send_header("Content-Length", str(len(raw)))
+                for key, value in headers.items():
+                    self.send_header(key.replace("_", "-"), value)
                 self.end_headers()
-                self.wfile.write(encoded)
+                self.wfile.write(raw)
 
             def do_GET(self):
-                test.discovery_requests.append(self.path)
-                parsed = urlsplit(self.path)
-                if parsed.path != "/cloud/v1/instance/sources":
-                    self.reply(404)
-                    return
-                cursor = parse_qs(parsed.query).get("cursor", [None])[0]
-                if (
-                    cursor
-                    and test.discovery_refresh
-                    and self.headers.get("Authorization") == "Bearer old-session"
-                ):
-                    self.reply(401)
-                    return
-                if cursor and test.discovery_failure == "revoked":
-                    self.reply(403)
-                    return
-                subject = (
-                    "user:bob"
-                    if test.identity_changed
-                    and self.headers.get("Authorization") == "Bearer new-session"
-                    else "user:alice"
-                )
-                if cursor and test.discovery_failure == "identity":
-                    subject = "user:bob"
-                tables = [
-                    {
-                        "id": "repo-one",
-                        "table": "shared-sources",
-                        "filter": {"equals": "repo-one", "field": "source_id"},
-                        "alias": test.source_aliases[0],
-                        "document_field": "grep",
-                        "status": "searchable",
-                        "access_id": "repo-access",
-                    },
-                    {
-                        "id": "drive-two",
-                        "table": "shared-sources",
-                        "filter": {"equals": "drive-two", "field": "source_id"},
-                        "alias": test.source_aliases[1],
-                        "document_field": "grep",
-                        "status": "searchable",
-                        "access_id": "drive-access",
-                    },
-                ]
-                generation = "generation-one"
-                if cursor and test.discovery_failure == "changed":
-                    generation = "generation-two"
-                response = {
-                    "version": 1 if test.legacy_discovery else 2,
-                    "subject": subject,
-                    "page_size": 1,
-                    "principals": ["user:alice"],
-                    "sources": tables,
-                    "endpoint": "db/v1",
-                    "discovery_id": generation,
-                }
-                if cursor and test.discovery_failure == "unsafe-endpoint":
-                    response["endpoint"] = "https://other-host.example/db/v1"
-                if test.too_many_sources:
-                    response["sources"] = [
-                        dict(tables[0], id=f"source-{n}") for n in range(1001)
-                    ]
-                if test.paginate:
-                    response["sources"] = [tables[1] if cursor else tables[0]]
-                    if cursor:
-                        response["principals"].append("group:drive-reader")
-                    if not cursor or test.discovery_failure == "loop":
-                        response["next_cursor"] = "next-page"
-                    if not cursor and test.discovery_failure == "unsafe-cursor":
-                        response["next_cursor"] = "https://other-host.example/steal"
-                    if cursor and test.discovery_failure == "duplicate":
-                        response["sources"] = [tables[0]]
-                if cursor and test.discovery_failure == "missing-access":
-                    response["sources"][0].pop("access_id", None)
-                if cursor and test.discovery_failure == "unsafe-access":
-                    response["sources"][0]["access_id"] = "bad\r\nheader"
-                if test.legacy_discovery:
-                    for table in response["sources"]:
-                        table.pop("access_id", None)
-                self.reply(200, response)
+                self.reply(404)
 
             def do_POST(self):
                 body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
-                test.requests.append(
-                    (self.path, self.headers.get("Authorization"), body)
+                is_catalog = self.path.endswith("/tables/antfly_sources/query")
+                expected_path = (
+                    test.instance_root
+                    + "/db/v1/tables/"
+                    + ("antfly_sources" if is_catalog else "documents")
+                    + "/query"
                 )
-                source = self.headers.get("X-Antfly-Source-ID")
-                test.selected_ids.append(source)
-                test.assertEqual(
-                    self.path, "/cloud/v1/instance/db/v1/tables/shared-sources/query"
-                )
-                test.assertEqual(
-                    self.headers.get("X-Antfly-Source-Access"),
-                    None
-                    if test.legacy_discovery
-                    else ("repo-access" if source == "repo-one" else "drive-access"),
-                )
-                if test.query_scope_changed and source == "drive-two":
-                    self.reply(409, headers={"X-Antfly-Source-Access": "changed"})
+                if self.path != expected_path:
+                    self.reply(404)
                     return
-                if test.revoked and source == "drive-two":
+                token = self.headers.get("Authorization")
+                catalog_call = len(test.catalog_requests)
+                content_call = len(test.content_requests)
+                if is_catalog:
+                    test.catalog_requests.append(body)
+                else:
+                    test.content_requests.append(
+                        (
+                            self.headers.get("X-Antfly-Source-ID"),
+                            self.headers.get("X-Antfly-Source-Access"),
+                            body,
+                        )
+                    )
+                if test.mode == "revoked":
                     self.reply(403)
                     return
+                refresh_catalog = test.mode == "refresh-catalog" and is_catalog
+                refresh_content = (
+                    test.mode in ("refresh", "identity-changed", "instance-changed")
+                    and not is_catalog
+                )
                 if (
-                    test.refresh
-                    and body.get("search_after")
-                    and self.headers.get("Authorization") == "Bearer old-session"
-                ):
+                    refresh_catalog
+                    or refresh_content
+                    or (
+                        test.mode == "refresh-continuation"
+                        and not is_catalog
+                        and body.get("search_after")
+                    )
+                ) and token == "Bearer token-1":
                     self.reply(401)
+                    return
+                subject = (
+                    "user:bob"
+                    if test.mode == "identity-changed" and token == "Bearer token-2"
+                    else test.subject
+                )
+                if is_catalog:
+                    if (
+                        body.get("remote_snapshot")
+                        and test.mode == "catalog-identity-changed"
+                    ):
+                        subject = "user:bob"
+                    if (
+                        body.get("remote_snapshot")
+                        and test.mode == "catalog-policy-changed"
+                    ):
+                        self.reply(
+                            409,
+                            X_Antfly_Catalog_Access="catalog-2",
+                            X_Antfly_Subject=subject,
+                        )
+                        return
+                    if body.get("remote_snapshot") and test.mode == "catalog-failed":
+                        self.reply(503)
+                        return
+                    count = 70 if test.long_catalog else 2
+                    records = []
+                    for i in range(count):
+                        identity = f"source-{i:03}"
+                        records.append(
+                            {
+                                "_id": identity,
+                                "_source": {
+                                    "version": 2 if test.mode == "bad-version" else 1,
+                                    "doc_type": "source_catalog",
+                                    "document_version": 1,
+                                    "published_revision": "inventory-1",
+                                    "source": {
+                                        "id": identity,
+                                        "alias": test.aliases[i]
+                                        if i < 2
+                                        else f"other-{i}",
+                                        "table": "documents",
+                                        "filter": {
+                                            "equals": identity,
+                                            "field": "source_id",
+                                        },
+                                        "document_field": "grep",
+                                        "status": "stale"
+                                        if test.mode == "stale"
+                                        else "searchable",
+                                        "valid_until": 1
+                                        if test.mode == "expired"
+                                        else int(time.time()) + 900,
+                                    },
+                                },
+                            }
+                        )
+                    after = body.get("search_after", [""])[0]
+                    hits = [row for row in records if row["_id"] > after][
+                        : body["limit"]
+                    ]
+                    proof = (
+                        "catalog-2"
+                        if body.get("remote_snapshot")
+                        and test.mode == "catalog-header-changed"
+                        else "catalog-1"
+                    )
+                    headers = (
+                        {}
+                        if test.mode == "missing-policy"
+                        else {"X_Antfly_Catalog_Access": proof}
+                    )
+                    self.reply(
+                        200,
+                        {
+                            "responses": [
+                                {
+                                    "status": 200,
+                                    "remote_snapshot": "catalog-snapshot",
+                                    "hits": {"hits": hits},
+                                }
+                            ]
+                        },
+                        X_Antfly_Subject=subject,
+                        **headers,
+                    )
+                    return
+                identity = self.headers.get("X-Antfly-Source-ID")
+                proof = "policy-" + str(identity)
+                if body.get("search_after") and test.mode == "source-policy-changed":
+                    self.reply(
+                        409, X_Antfly_Source_Access="changed", X_Antfly_Subject=subject
+                    )
+                    return
+                if self.headers.get("X-Antfly-Source-Access") not in (None, proof):
+                    self.reply(
+                        409, X_Antfly_Source_Access="changed", X_Antfly_Subject=subject
+                    )
                     return
                 hits = []
                 if not body.get("search_after"):
-                    hits = [
-                        {
-                            "_id": source + ":item",
-                            "_sort": [source + ":item"],
-                            "_score": 0,
-                            "_source": {
-                                "grep": {
-                                    "version": 1,
-                                    "path": source + "/item.txt",
-                                    "uri": "https://example.com/"
-                                    + ("shared-item" if test.overlapping else source),
-                                    "revision": "rev-1",
-                                    "indexed_at": 123,
-                                    "content": "a shared retry budget\n",
-                                    "permissions": {
-                                        "public": False,
-                                        "readers": ["group:drive-reader"]
-                                        if test.paginate and source == "drive-two"
-                                        else ["user:alice"],
-                                    },
-                                    "metadata": {
-                                        "connection_id": source
-                                        if test.different_connections
-                                        else "shared-connection"
-                                    },
-                                }
-                            },
-                        }
-                    ]
-                # Match the real database projection contract. Never return
-                # fields the client omitted, even if the fixture contains them.
-                for hit in hits:
-                    document = hit["_source"]["grep"]
-                    projected = {}
-                    for field in body.get("fields", []):
-                        if not field.startswith("grep."):
-                            continue
-                        parts = field.split(".")[1:]
-                        value = document
-                        for part in parts:
-                            if not isinstance(value, dict) or part not in value:
-                                break
-                            value = value[part]
-                        else:
-                            target = projected
-                            for part in parts[:-1]:
-                                target = target.setdefault(part, {})
-                            target[parts[-1]] = value
-                    hit["_source"]["grep"] = projected
+                    # A full page exercises proof reuse on snapshot continuation.
+                    count = body["limit"]
+                    if test.mode not in (
+                        "source-policy-changed",
+                        "source-header-changed",
+                        "refresh-continuation",
+                    ):
+                        count = 1
+                    if test.mode == "refresh-continuation":
+                        count = body["limit"]
+                    for i in range(count):
+                        content = (
+                            "Doc retry budget"
+                            if identity == "source-000"
+                            or test.mode in ("overlap", "separate-connections")
+                            else "Slide retry budget"
+                        ) + "\n"
+                        canonical = (
+                            "shared"
+                            if test.mode in ("overlap", "separate-connections")
+                            else identity
+                        )
+                        hits.append(
+                            {
+                                "_id": f"{identity}/{i:04}",
+                                "_sort": [f"{identity}/{i:04}"],
+                                "_source": {
+                                    "grep": {
+                                        "version": 1,
+                                        "uri": f"https://example.com/{canonical}/{i}",
+                                        "path": f"{canonical}/{i}.txt",
+                                        "revision": "revision-1",
+                                        "indexed_at": 1,
+                                        "content": content,
+                                        # Current Cloud gateway authorizes private rows. No client reader union is supplied.
+                                        "permissions": {
+                                            "public": False,
+                                            "readers": ["group:current-engineering"],
+                                        },
+                                        "metadata": {
+                                            "connection_id": identity
+                                            if test.mode == "separate-connections"
+                                            else "shared-connection"
+                                        },
+                                    }
+                                },
+                            }
+                        )
+                headers = {}
+                if test.mode != "source-missing-subject":
+                    headers["X_Antfly_Subject"] = subject
+                if test.mode != "source-missing-proof":
+                    headers["X_Antfly_Source_Access"] = (
+                        "changed-policy"
+                        if body.get("search_after")
+                        and test.mode == "source-header-changed"
+                        else proof
+                    )
                 self.reply(
                     200,
                     {
                         "responses": [
                             {
                                 "status": 200,
-                                "remote_snapshot": "snapshot:" + source,
+                                "remote_snapshot": "snapshot-" + str(identity),
                                 "hits": {"hits": hits},
                             }
                         ]
                     },
+                    **headers,
                 )
 
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
         self.addCleanup(self.stop_server)
-        self.context_url = (
-            f"http://127.0.0.1:{self.server.server_port}/cloud/v1/instance"
-        )
+        self.root = f"http://127.0.0.1:{self.server.server_port}"
         self.cli = self.directory / "cloud-cli"
-        counter = self.directory / "context-calls"
+        self.write_cli()
+        self.env = {
+            key: value
+            for key, value in os.environ.items()
+            if not key.startswith("ANTFLY_GREP_") and key != "RIPGREP_CONFIG_PATH"
+        }
+        self.env.update(ANTFLY_GREP_CONFIG_PATH="", RIPGREP_CONFIG_PATH="")
+
+    def write_cli(self):
         self.cli.write_text(
-            "#!" + sys.executable + "\n"
-            "import json, pathlib, sys\n"
-            "assert sys.argv[1:] == ['context', '--json']\n"
-            f"p = pathlib.Path({str(counter)!r})\n"
-            "n = int(p.read_text()) if p.exists() else 0\n"
-            "p.write_text(str(n + 1))\n"
-            f"url = {self.context_url!r}\n"
-            "if pathlib.Path(__file__).with_name('trailing-slash').exists(): url += '/'\n"
-            "if n and pathlib.Path(__file__).with_name('changed-context').exists(): url += '/other'\n"
-            "print(json.dumps({'url':url,'token':'new-session' if n else 'old-session','org':'test','instance':'test'}))\n"
+            "#!"
+            + sys.executable
+            + "\nimport json,pathlib\np=pathlib.Path("
+            + repr(str(self.context_calls))
+            + ")\nn=int(p.read_text())+1 if p.exists() else 1\np.write_text(str(n))\nprint(json.dumps({'url':"
+            + repr(self.root + self.instance_root)
+            + ("+('/other' if n>1 else '')" if self.mode == "instance-changed" else "")
+            + ",'token':'token-'+str(n)}))\n"
         )
         self.cli.chmod(0o700)
-        self.env = {
-            k: v for k, v in os.environ.items() if not k.startswith("ANTFLY_GREP_")
-        }
-        self.env.update(
-            HOME=str(self.directory),
-            XDG_CONFIG_HOME=str(self.directory),
-            XDG_CACHE_HOME=str(self.directory),
-        )
 
     def stop_server(self):
         self.server.shutdown()
         self.server.server_close()
-        self.thread.join(timeout=3)
+        self.thread.join()
 
     def run_cli(self, *args):
         return subprocess.run(
             [BINARY, "--cloud-cli", str(self.cli), *args],
             cwd=self.directory,
             env=self.env,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            timeout=15,
+            capture_output=True,
+            timeout=20,
+            input=b"",
         )
 
-    def test_mixed_sources_require_no_table_json_and_do_not_walk_local_files(self):
-        (self.directory / "secret.txt").write_text("retry local-only secret")
-        result = self.run_cli("retry")
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn(b"repo-one/item.txt", result.stdout)
-        self.assertIn(b"drive-two/item.txt", result.stdout)
-        self.assertNotIn(b"secret.txt", result.stdout)
-        self.assertTrue(all("/db/v1/tables/" in path for path, _, _ in self.requests))
-
-    def test_instance_root_with_trailing_slash_and_refresh_uses_same_route(self):
-        (self.directory / "trailing-slash").touch()
-        self.refresh = True
-        result = self.run_cli("--source", "engineering", "retry")
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertGreaterEqual(len(self.discovery_requests), 2)
-        self.assertTrue(
-            all(
-                path == "/cloud/v1/instance/sources" for path in self.discovery_requests
-            )
-        )
-
-    def test_overlapping_logical_sources_do_not_duplicate_canonical_items(self):
-        self.overlapping = True
-        for flags in ((), ("--json",), ("--stats",)):
-            with self.subTest(flags=flags):
-                self.requests.clear()
-                result = self.run_cli(*flags, "retry")
-                self.assertEqual(result.returncode, 0, result.stderr)
-                if "--json" in flags:
-                    records = [json.loads(line) for line in result.stdout.splitlines()]
-                    self.assertEqual(
-                        sum(record["type"] == "match" for record in records), 1
-                    )
-                else:
-                    self.assertEqual(result.stdout.count(b"a shared retry budget"), 1)
-                for _, _, body in self.requests:
-                    self.assertTrue(
-                        "grep.metadata.connection_id" in body["fields"]
-                        or "grep.metadata" in body["fields"]
-                    )
-
-    def test_same_uri_in_distinct_connection_namespaces_is_not_collapsed(self):
-        self.overlapping = True
-        self.different_connections = True
-        result = self.run_cli("retry")
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stdout.count(b"a shared retry budget"), 2)
-
-    def test_repeated_selectors_are_deduplicated_and_ids_work(self):
+    def test_private_mixed_sources_need_no_source_api_or_reader_list(self):
         result = self.run_cli(
-            "--source", "engineering", "--source", "repo-one", "retry"
+            "--source", "manuals", "--source", "slides", "retry budget"
         )
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stdout.count(b"a shared retry budget"), 1)
-        self.assertTrue(all(source == "repo-one" for source in self.selected_ids))
+        self.assertIn(b"Doc retry budget", result.stdout)
+        self.assertIn(b"Slide retry budget", result.stdout)
+        self.assertEqual(len(self.catalog_requests), 1)
+        self.assertEqual(
+            {source for source, _, _ in self.content_requests},
+            {"source-000", "source-001"},
+        )
 
-    def test_source_id_takes_precedence_over_another_sources_alias(self):
-        self.source_aliases[0] = "drive-two"
-        result = self.run_cli("--source", "drive-two", "retry")
+    def test_overlapping_authorized_sources_deduplicate_only_within_connection(self):
+        for mode, count in (("overlap", 1), ("separate-connections", 2)):
+            with self.subTest(mode=mode):
+                self.mode = mode
+                result = self.run_cli(
+                    "--source", "manuals", "--source", "slides", "retry budget"
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout.count(b"Doc retry budget"), count)
+
+    def test_catalog_snapshot_pagination_uses_current_policy_proof(self):
+        self.long_catalog = True
+        result = self.run_cli("--source", "manuals", "retry budget")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertTrue(self.requests)
-        self.assertTrue(all(source == "drive-two" for source in self.selected_ids))
-        self.assertNotIn(b"repo-one/item.txt", result.stdout)
-
-    def test_ambiguous_alias_fails_before_any_query_but_ids_still_work(self):
-        self.source_aliases = ["shared", "shared"]
-        result = self.run_cli("--source", "shared", "retry")
-        self.assertEqual(result.returncode, 2)
-        self.assertIn(b"AmbiguousSource", result.stderr)
-        self.assertEqual(self.requests, [])
-        result = self.run_cli("--source", "repo-one", "retry")
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertTrue(self.requests)
-        self.assertTrue(all(source == "repo-one" for source in self.selected_ids))
-
-    def test_refresh_keeps_snapshot_and_cursor(self):
-        self.refresh = True
-        result = self.run_cli("--source", "engineering", "retry")
-        self.assertEqual(result.returncode, 0, result.stderr)
-        rejected = next(
-            r
-            for r in self.requests
-            if r[1] == "Bearer old-session" and r[2].get("search_after")
-        )
-        retried = next(r for r in self.requests if r[1] == "Bearer new-session")
-        self.assertEqual(rejected[2], retried[2])
-        self.assertEqual(retried[2]["remote_snapshot"], "snapshot:repo-one")
-        self.assertEqual(result.stdout.count(b"a shared retry budget"), 1)
-
-    def test_refresh_rejects_authenticated_identity_change(self):
-        self.refresh = True
-        self.identity_changed = True
-        result = self.run_cli("--source", "engineering", "retry")
-        self.assertEqual(result.returncode, 2)
-        self.assertIn(b"CloudIdentityChanged", result.stderr)
-        self.assertFalse(
-            any(auth == "Bearer new-session" for _, auth, _ in self.requests)
+        self.assertEqual(len(self.catalog_requests), 2)
+        self.assertEqual(
+            self.catalog_requests[1]["remote_snapshot"], "catalog-snapshot"
         )
 
-    def test_refresh_rejects_active_instance_change(self):
-        self.refresh = True
-        (self.directory / "changed-context").touch()
-        result = self.run_cli("--source", "engineering", "retry")
-        self.assertEqual(result.returncode, 2)
-        self.assertIn(b"CloudContextChanged", result.stderr)
-        self.assertFalse(
-            any(auth == "Bearer new-session" for _, auth, _ in self.requests)
-        )
+    def test_token_refresh_on_catalog_and_content_queries(self):
+        for mode in ("refresh", "refresh-catalog", "refresh-continuation"):
+            with self.subTest(mode=mode):
+                self.mode = mode
+                self.context_calls.unlink(missing_ok=True)
+                result = self.run_cli("--source", "manuals", "retry budget")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(self.context_calls.read_text(), "2")
 
-    def test_source_revocation_preserves_prior_results_and_is_incomplete(self):
-        self.revoked = True
-        result = self.run_cli("retry")
-        self.assertEqual(result.returncode, 2)
-        self.assertIn(b"repo-one/item.txt", result.stdout)
-        self.assertIn(b"IndexAuthorizationFailed", result.stderr)
-
-    def test_paginated_discovery_collects_all_sources_and_reader_identities(self):
-        self.paginate = True
-        self.discovery_refresh = True
-        result = self.run_cli("retry")
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn(b"repo-one/item.txt", result.stdout)
-        self.assertIn(b"drive-two/item.txt", result.stdout)
-        self.assertTrue(
-            any("cursor=next-page" in path for path in self.discovery_requests)
-        )
-        self.assertTrue(
-            all(auth == "Bearer new-session" for _, auth, _ in self.requests)
-        )
-
-    def test_partial_discovery_is_never_used_to_start_searching(self):
-        self.paginate = True
-        for failure, error in (
-            ("changed", b"CloudDiscoveryChanged"),
-            ("identity", b"CloudIdentityChanged"),
-            ("duplicate", b"DuplicateSourceID"),
-            ("loop", b"InvalidCloudSourceDiscovery"),
-            ("revoked", b"CloudSourceAccessDenied"),
-            ("unsafe-cursor", b"InvalidCloudSourceDiscovery"),
-            ("unsafe-endpoint", b"CloudContextChanged"),
-            ("missing-access", b"InvalidCloudSourceDiscovery"),
-            ("unsafe-access", b"InvalidCloudSourceDiscovery"),
+    def test_identity_and_instance_changes_are_explicit(self):
+        for mode, error in (
+            ("identity-changed", b"CloudIdentityChanged"),
+            ("instance-changed", b"CloudContextChanged"),
         ):
-            with self.subTest(failure=failure):
-                self.discovery_failure = failure
-                self.requests.clear()
-                result = self.run_cli("retry")
+            with self.subTest(mode=mode):
+                self.mode = mode
+                self.context_calls.unlink(missing_ok=True)
+                self.write_cli()
+                result = self.run_cli("--source", "manuals", "retry budget")
                 self.assertEqual(result.returncode, 2, result.stderr)
                 self.assertIn(error, result.stderr)
-                self.assertEqual(self.requests, [])
 
-    def test_discovery_has_an_aggregate_source_budget(self):
-        self.too_many_sources = True
-        result = self.run_cli("retry")
-        self.assertEqual(result.returncode, 2)
-        self.assertIn(b"CloudDiscoveryBudgetExceeded", result.stderr)
-        self.assertEqual(self.requests, [])
+    def test_partial_or_changed_catalog_never_starts_search(self):
+        self.long_catalog = True
+        for mode in (
+            "catalog-policy-changed",
+            "catalog-header-changed",
+            "catalog-failed",
+            "missing-policy",
+            "bad-version",
+            "revoked",
+            "catalog-identity-changed",
+        ):
+            with self.subTest(mode=mode):
+                self.mode = mode
+                result = self.run_cli("--source", "manuals", "retry budget")
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertFalse(self.content_requests)
 
-    def test_changed_reader_view_during_query_is_explicitly_incomplete(self):
-        self.query_scope_changed = True
-        result = self.run_cli("retry")
-        self.assertEqual(result.returncode, 2)
-        self.assertIn(b"CloudSourceAccessChanged", result.stderr)
-        self.assertIn(b"repo-one/item.txt", result.stdout)
-        self.assertNotIn(b"drive-two/item.txt", result.stdout)
+    def test_stale_and_expired_sources_never_start_content_queries(self):
+        for mode in ("stale", "expired"):
+            with self.subTest(mode=mode):
+                self.mode = mode
+                result = self.run_cli("--source", "manuals", "retry budget")
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertIn(b"SourceNotSearchable", result.stderr)
+                self.assertFalse(self.content_requests)
 
-    def test_unsupported_catalog_versions_fail_before_querying(self):
-        self.legacy_discovery = True
-        result = self.run_cli("retry")
-        self.assertEqual(result.returncode, 2)
-        self.assertIn(b"UnsupportedCloudSourceVersion", result.stderr)
-        self.assertEqual(self.requests, [])
+    def test_policy_changes_on_snapshot_continuation_preserve_partial_results(self):
+        for mode in ("source-policy-changed", "source-header-changed"):
+            with self.subTest(mode=mode):
+                self.mode = mode
+                result = self.run_cli("--source", "manuals", "retry budget")
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertIn(b"CloudSourceAccessChanged", result.stderr)
+                self.assertIn(b"Doc retry budget", result.stdout)
+                self.assertTrue(self.content_requests[-1][1])
 
-    def test_unknown_source_and_conflicting_local_scope_fail_explicitly(self):
-        result = self.run_cli("--source", "missing", "retry")
-        self.assertEqual(result.returncode, 2)
-        self.assertIn(b"UnknownTable", result.stderr)
-        result = self.run_cli("retry", ".")
-        self.assertEqual(result.returncode, 2)
-        self.assertIn(b"ConflictingCloudSourceOptions", result.stderr)
+    def test_private_rows_require_authenticated_response_context(self):
+        for mode in ("source-missing-proof", "source-missing-subject"):
+            with self.subTest(mode=mode):
+                self.mode = mode
+                result = self.run_cli("--source", "manuals", "retry budget")
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertFalse(result.stdout)
+
+    def test_ids_deduplicate_and_ambiguous_aliases_fail(self):
+        result = self.run_cli(
+            "--source", "manuals", "--source", "source-000", "retry budget"
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(self.content_requests), 1)
+        self.content_requests.clear()
+        self.aliases = ["duplicate", "duplicate"]
+        result = self.run_cli("--source", "duplicate", "retry budget")
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn(b"AmbiguousSource", result.stderr)
+        self.assertFalse(self.content_requests)
 
 
 if __name__ == "__main__":

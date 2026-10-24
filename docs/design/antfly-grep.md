@@ -276,11 +276,12 @@ An error after a successful unit preserves its completed output as partial resul
 
 ### Portable sources and Cloud delivery
 
-Sources are first-class Cloud control-plane resources under Cloud's existing API
-versioning. A source binds a reusable connection, provider selection, destination,
-sharing policy and sync/run state. It is not a new Antfly database query resource.
-[Colony #790](https://github.com/antflydb/colony/issues/790) tracks the hosted
-experience and the remaining phase-one qualification.
+A source is an existing Colony import job with `mode: source`. Existing
+provider-auth connections hold acquisition credentials; existing import-job
+endpoints own configuration, scheduling, runs, retries, pause/resume and archive.
+The job ID is the stable source ID. There is no parallel Cloud source-management
+or discovery API. [Colony #790](https://github.com/antflydb/colony/issues/790) tracks
+the hosted experience and remaining qualification.
 
 The public [sources module](../../go/pkg/sources/README.md) owns acquisition,
 revision-bound export/normalization, stable identities and provider absence
@@ -293,12 +294,12 @@ Cloud account. It can run from an external scheduler independently of grep.
 
 | Responsibility | Hosted runtime | Self-hosted runtime |
 | --- | --- | --- |
-| Connection/source management | Cloud API/UI/CLI | Source profile or application API |
+| Connection/source management | Existing connection/import-job API/UI/CLI | Source profile or application API |
 | Secret resolution | Encrypted Cloud credentials/current installation access | Injected resolver; runner references environment variables |
 | Acquisition and canonical text | Shared sources module | Shared sources module |
 | Jobs/checkpoints/reconciliation | Colony jobs, staging and ownership ledger | Runner lock, pinned inventory and ownership journal |
 | Storage/query | Ordinary Antfly tables and query snapshots | Ordinary Antfly tables and query snapshots |
-| Search configuration | Cloud discovery/session adapter | Portable catalog file and data-plane credentials |
+| Search configuration | Ordinary catalog queries with Cloud session | Ordinary catalog queries or file export with table credentials |
 
 Grep owns catalog/profile loading, source aliases and selection, authentication
 adapters, exact matching and evidence evaluation. It does not own provider refresh
@@ -325,33 +326,39 @@ catalog rows and snapshots, and non-admin catalog mutations are blocked.
 
 `antfly-grep --source-endpoint URL --source NAME` reads the catalog through normal
 table queries with bounded snapshot pagination. `--source-table` selects a custom
-catalog table. Provider secrets are not needed by grep. Cloud `/sources` is an
-authenticated view of the persisted publication plus current Cloud policy; its
-PostgreSQL records remain operational configuration/jobs, not a substitute for
-searchable catalog publication. File catalogs remain explicit exports/configuration.
+catalog table. Provider secrets are not needed by grep. Cloud applies current policy on these same table queries. PostgreSQL remains
+operational configuration/jobs, not a substitute for searchable catalog publication. File catalogs remain explicit exports/configuration.
 
-The portable catalog is version 2, independently of table configuration/document
-versions. It contains an Antfly API `endpoint`, `sources` with stable `id`, `alias`,
-physical `table`, `document_field`, selection `filter`, readiness `status` and
-optional `valid_until`/`access_id`, plus reader identities for grep's additional
-local check. [The schema](../../zig/pkg/antfly-grep/schema/sources-v2.json) is shared
-by local profiles and hosted discovery. It contains no provider or query tokens.
-A local catalog uses an absolute endpoint; the Cloud adapter accepts only the
-origin-pinned `db/v1` binding relative to its authenticated instance context.
+Portable file exports use catalog version 2, independently of table configuration,
+durable record and document versions. Files contain an absolute Antfly API
+`endpoint`, `sources` bindings and optional explicit reader hints. The
+[file schema](../../zig/pkg/antfly-grep/schema/sources-v2.json) contains no provider
+or query credentials. Both table-record discovery and file loading adapt to the
+same internal indexed-table configuration; a server never chooses a credential
+destination through a catalog record.
 
-Cloud serves catalog discovery at `/cloud/v1/{instance}/sources`, outside the
-database API namespace. Its continuation pages additionally carry authenticated
-`subject`, `discovery_id` and optional `next_cursor`; traversal reauthorizes and
-fails explicitly on a changed view. `antfly-cloud` owns login and returns the
-instance context through its public `context --json` interface. Self-hosted
-`--source-catalog FILE --source NAME` does not execute `antfly-cloud`.
+Cloud grep gets its instance endpoint and short-lived data-plane credential from
+`antfly-cloud context --json`, then uses the same catalog/table query implementation
+as self-hosted grep. There is no `/cloud/v1/{instance}/sources` route. Catalog
+traversal uses the ordinary query snapshot and ID cursor, bounded independently of
+content search. Cloud returns `X-Antfly-Subject` and `X-Antfly-Catalog-Access` on
+catalog queries; continuation requests pin the policy digest and fail explicitly
+if visibility, effective table row policy or identity changes.
 
-All searches and parent/asset projections use the existing Antfly table-query
-route. Cloud accepts `X-Antfly-Source-ID` and optional `X-Antfly-Source-Access` as
-preconditions on that route, checks the table binding, current sharing/readiness
-and authenticated reader view, and adds a trusted source cut through the ordinary
-gateway. These headers grant no authority. A source mismatch, permission change
-or stale source fails explicitly. There is no `/sources/tables/.../query` API.
+Content and parent/asset projections use existing table queries with
+`X-Antfly-Source-ID`. The first successful selected-source query returns its
+`X-Antfly-Source-Access` policy proof. Grep pins it across all later pages and
+asset projections, including after token renewal. The proof binds current source
+sharing, principal/group context and effective row policy, not unrelated source
+sync state. Cloud checks current authorization and readiness on every request.
+These headers grant no authority and do not introduce a database endpoint.
+
+Cloud queries rely on gateway-enforced document ACLs. Grep does not consume or
+union a separately exposed Cloud reader list, avoiding stale client reader hints
+that could silently omit newly authorized rows. It accepts Cloud rows only after
+verifying the authenticated subject and policy response headers. Self-hosted/file
+catalogs retain the additional explicit local principal checks.
+
 Self-hosted deployments retain their normal Antfly authentication/row-policy
 boundary; catalogs and permission metadata cannot replace server authorization.
 

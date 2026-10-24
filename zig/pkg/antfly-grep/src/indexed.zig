@@ -387,7 +387,7 @@ fn scan(search: anytype, http: *httpx.Client, config: Config, table: Table, coun
                 try document.Document.parseListing(value, table.table orelse table.name, id, current_snapshot, std.Io.Clock.real.now(search.io).toSeconds())
             else
                 try document.Document.parse(value, table.table orelse table.name, id, current_snapshot, std.Io.Clock.real.now(search.io).toSeconds());
-            if (!document.allowed(value, config.principals)) {
+            if (search.options.cloud_session == null and !document.allowed(value, config.principals)) {
                 search.skipped();
                 continue;
             }
@@ -499,7 +499,7 @@ fn prefetchAssets(search: anytype, http: *httpx.Client, config: Config, table: T
     for (hits, 0..) |hit, hit_index| {
         const source = document.field(hit, "_source") orelse return null;
         const value = document.at(source, table.document_field) orelse return null;
-        if (!document.allowed(value, config.principals)) continue;
+        if (search.options.cloud_session == null and !document.allowed(value, config.principals)) continue;
         const id = try document.string(hit, "_id");
         const listing = document.Document.parseListing(value, table.table orelse table.name, id, "", 0) catch return null;
         const path = listing.path;
@@ -702,7 +702,8 @@ const Fetch = struct {
                 if (auth) |value| try headers.append(a, .{ "Authorization", value });
                 if (self.options.sourced()) {
                     if (self.source_id) |id| try headers.append(a, .{ "X-Antfly-Source-ID", id });
-                    if (self.access_id) |id| try headers.append(a, .{ "X-Antfly-Source-Access", id });
+                    const proof = if (self.options.cloud_session) |session| (if (self.source_id) |id| session.sourceProof(id) else null) else self.access_id;
+                    if (proof) |id| try headers.append(a, .{ "X-Antfly-Source-Access", id });
                 }
                 var response = self.http.post(self.url, .{ .borrowed_body = body, .headers = headers.items, .timeout_ms = self.options.timeout_ms, .max_response_size = self.config.max_response_bytes, .max_retries = 0, .follow_redirects = false, .cookies_enabled = false, .cancellation = httpx.CancellationToken.fromCallback(self, Fetch.cancelled) }) catch |err| {
                     if (self.ordered and err == error.ResponseTooLarge and page_size.* > 1) {
@@ -723,7 +724,7 @@ const Fetch = struct {
                     continue :resize;
                 }
                 if (status == 409) {
-                    if (response.header("x-antfly-source-access") != null) return error.CloudSourceAccessChanged;
+                    if (response.header("x-antfly-source-access")) |proof| if (std.mem.eql(u8, proof, "changed")) return error.CloudSourceAccessChanged;
                     if (response.header("x-antfly-source-state") != null) return error.SourceNotSearchable;
                     return error.IndexSnapshotExpired;
                 }
@@ -739,6 +740,9 @@ const Fetch = struct {
                     try backoff(self, attempt, delay);
                     attempt += 1;
                     continue;
+                }
+                if (self.options.cloud_session) |session| {
+                    try session.checkSource(self.source_id orelse return error.InvalidCloudSourcePolicy, response.header("x-antfly-subject"), response.header("x-antfly-source-access"));
                 }
                 const response_body = response.body orelse return error.EmptyIndexResponse;
                 // Retain the response instead of copying ordinary JSON strings
@@ -1038,7 +1042,7 @@ fn AssetResolver(comptime SearchType: type) type {
             if (!std.mem.eql(u8, try document.string(hit, "_id"), self.id)) return error.InvalidEvidenceParent;
             const source = document.field(hit, "_source") orelse return error.InvalidIndexResponse;
             const parent = document.at(source, self.table.document_field) orelse return error.InvalidIndexResponse;
-            if (!document.allowed(parent, self.config.principals)) return error.IndexAuthorizationFailed;
+            if (self.search.options.cloud_session == null and !document.allowed(parent, self.config.principals)) return error.IndexAuthorizationFailed;
             if (!std.mem.eql(u8, try document.string(parent, "revision"), self.revision)) return error.EvidenceRevisionChanged;
             if (!borrowed) {
                 for (&self.point_pages) |*slot| if (slot.* == null) {

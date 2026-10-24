@@ -36,13 +36,13 @@ credentials. Identical connection/URI/revision/content from overlapping selectio
 reported once after authorization and path filters. Deduplication memory is bounded by
 `max_page_memory`; independent sources retain independent query snapshots.
 
-Discovery v2 follows bounded pages and verifies the authenticated subject and
-policy generation throughout. All sources and reader identities are collected
-before querying; incomplete discovery fails explicitly. Limits are 1 MiB per
-response, 32 MiB aggregate discovery bytes, 64 MiB parsing memory, 1,000 sources,
-262,144 reader identities and 1,024 pages. Legacy single-page v1 discovery remains
-supported. Document and indexed-table configuration versions are independent of
-discovery.
+Discovery reads the ordinary `antfly_sources` table using bounded snapshot pages.
+Cloud identity and current catalog policy are verified through trusted query
+response headers; continuation requests pin the policy proof. Incomplete or
+changed discovery never starts content search. Limits are 1 MiB per response,
+32 MiB total wire bytes, 64 MiB parsing memory, 1,000 sources and 1,024 pages.
+Cloud uses current server-enforced document permissions, with no separate reader
+list API. File catalogs and self-hosted search retain additional local reader hints.
 
 The session stays in memory. A 401 refreshes through the public CLI and resumes the
 same cursor/snapshot; changing the active instance or authenticated identity fails
@@ -4638,13 +4638,12 @@ validation hashes separately; its performance measurements remain pinned to the
 earlier measured binaries. Failed deferred drains join and discard remaining
 borrowers before retiring any manifest page, including failures inside cleanup.
 
-Cloud discovery uses a catalogue generation for consistent pagination and a
-separate `access_id` for each source. Queries send that source's access ID in
-`X-Antfly-Source-Access`, including snapshot continuations and session refresh.
-An unrelated source's sync or rename does not invalidate a selected-source
-query. A change to the selected source's reader policy or authenticated reader
-identities ends the search explicitly as incomplete; rerun discovery to retry.
-
+Cloud catalog queries return an authenticated policy proof for snapshot traversal.
+A selected source's first successful ordinary content query returns its own
+`X-Antfly-Source-Access` proof; grep pins it across continuations, asset reads and
+session renewal. Unrelated source sync/rename does not invalidate an ongoing scan.
+A selected-source sharing, principal/group or effective row-policy change ends the
+search explicitly as incomplete.
 
 Portable source profiles use [sources-v2.json](schema/sources-v2.json), independently
 of Cloud login. `antfly-grep --source-catalog catalog.json --source manuals PATTERN`
@@ -4658,7 +4657,7 @@ can produce this catalog from GitHub, Drive Docs/Slides, S3 or GCS without Colon
 It uses the same provider/normalization components as hosted imports and can run
 from cron or another scheduler; synchronization is not embedded in grep.
 
-Cloud catalog discovery lives at the authenticated instance root plus `/sources`.
+Cloud catalog discovery uses the same ordinary `antfly_sources` table queries.
 Both Cloud and self-hosted search use ordinary `/tables/{table}/query` requests.
 Cloud applies `X-Antfly-Source-ID` and `X-Antfly-Source-Access` preconditions on that
 route to enforce the current binding, access and readiness. These are Cloud
@@ -4679,3 +4678,9 @@ reconciliation become query-visible. Grep traverses one bounded catalog snapshot
 before searching. Catalog and content visibility require server authorization;
 catalog records grant no authority. `--source-catalog FILE` remains available for
 file exports. See the [source record schema](schema/source-record-v1.json).
+
+Cloud source configuration and sync actions use existing Colony import-job
+endpoints with `mode: source`. There is no separate Cloud `/sources` API. The
+Cloud session adapter pins authenticated query identity and catalog/source policy
+headers across pagination, asset reads and token renewal; the gateway enforces
+current row permissions.
