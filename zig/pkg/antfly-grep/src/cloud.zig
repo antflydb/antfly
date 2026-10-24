@@ -25,6 +25,7 @@ pub const Session = struct {
     context: Context,
     subject: ?[]const u8 = null,
     source_proofs: std.StringHashMapUnmanaged([]const u8) = .empty,
+    source_publications: std.StringHashMapUnmanaged([]const u8) = .empty,
     mutex: std.Io.Mutex = .init,
     pub fn init(a: A, io: std.Io, cli: []const u8) !Session {
         var self: Session = .{ .arena = .init(a), .io = io, .cli = cli, .context = undefined };
@@ -86,19 +87,31 @@ pub const Session = struct {
         defer self.mutex.unlock(self.io);
         return self.source_proofs.get(id);
     }
-    pub fn checkSource(self: *Session, id: []const u8, subject: ?[]const u8, proof: ?[]const u8) !void {
+    pub fn sourcePublication(self: *Session, id: []const u8) ?[]const u8 {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        return self.source_publications.get(id);
+    }
+    pub fn checkSource(self: *Session, id: []const u8, subject: ?[]const u8, proof: ?[]const u8, publication: ?[]const u8) !void {
         try self.mutex.lock(self.io);
         defer self.mutex.unlock(self.io);
         try self.checkSubjectLocked(subject);
         const actual = proof orelse return error.InvalidCloudSourcePolicy;
         if (actual.len == 0 or actual.len > 128) return error.InvalidCloudSourcePolicy;
         for (actual) |char| if (!std.ascii.isAlphanumeric(char) and char != '_' and char != '-') return error.InvalidCloudSourcePolicy;
+        const fence = publication orelse return error.InvalidCloudSourcePublication;
+        if (fence.len == 0 or fence.len > 128) return error.InvalidCloudSourcePublication;
+        for (fence) |char| if (!std.ascii.isAlphanumeric(char) and char != '_' and char != '-') return error.InvalidCloudSourcePublication;
+        if (self.source_publications.get(id)) |expected| {
+            if (!std.mem.eql(u8, expected, fence)) return error.SourcePublicationChanged;
+        }
         if (self.source_proofs.get(id)) |expected| {
             if (!std.mem.eql(u8, expected, actual)) return error.CloudSourceAccessChanged;
         } else {
             if (self.source_proofs.count() >= 1000) return error.CloudDiscoveryBudgetExceeded;
             const a = self.arena.allocator();
             try self.source_proofs.put(a, try a.dupe(u8, id), try a.dupe(u8, actual));
+            try self.source_publications.put(a, try a.dupe(u8, id), try a.dupe(u8, fence));
         }
     }
     pub fn discover(self: *Session, a: A, timeout_ms: u64) ![]const u8 {

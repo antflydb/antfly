@@ -323,7 +323,12 @@ snapshot, a self-hosted reader re-reads the current binding and requires the sam
 searchable publication and unexpired lease before consuming any rows. A sync
 that starts before the snapshot therefore fails closed; a later sync can safely
 coexist with continuations on the already pinned snapshot. Cloud additionally
-checks current policy on each request. There is no cross-table transaction: interruption leaves a
+checks current policy before execution and rechecks the job attempt/catalog
+publication after acquiring query snapshots, before releasing any response bytes.
+The selected query returns `X-Antfly-Source-Publication`; grep requires and pins it
+alongside the access proof, and sends it as a continuation precondition. Job
+attempt identity fences even a completed sync with an unchanged inventory.
+There is no cross-table transaction: interruption leaves a
 non-searchable record or a bounded prior lease, and retry repairs publication.
 The ingestion runtime owns catalog writes. Server authentication and row policy
 control catalog visibility as well as content; sharing metadata is descriptive,
@@ -333,7 +338,9 @@ row-filtered lookups, scans, graph and artifact routes whose contracts cannot
 consume the injected security filter; those readers must use supported query
 routes. Drive Docs/Slides exports have unknown lengths: staging enforces each
 export's byte ceiling and charges actual bytes atomically with its checkpoint
-against the run budget, preserving the charge across retries.
+against the run budget, preserving the charge across retries. S3 canonical URIs
+escape each key path component while acquisition/ownership use the raw key;
+literal `%`, `?` and `#` characters never alter URI identity.
 
 `antfly-grep --source-endpoint URL --source NAME` reads the catalog through normal
 table queries with bounded snapshot pagination. `--source-table` selects a custom

@@ -4640,8 +4640,10 @@ borrowers before retiring any manifest page, including failures inside cleanup.
 
 Cloud catalog queries return an authenticated policy proof for snapshot traversal.
 A selected source's first successful ordinary content query returns its own
-`X-Antfly-Source-Access` proof; grep pins it across continuations, asset reads and
-session renewal. Unrelated source sync/rename does not invalidate an ongoing scan.
+`X-Antfly-Source-Access` proof and `X-Antfly-Source-Publication` fence. The server
+rechecks the job attempt and catalog publication after snapshot acquisition and
+before releasing any rows. Grep requires and pins both headers across
+continuations, asset reads and session renewal. Unrelated source sync/rename does not invalidate an ongoing scan.
 A selected-source sharing, principal/group or effective row-policy change ends the
 search explicitly as incomplete.
 
@@ -4659,8 +4661,8 @@ from cron or another scheduler; synchronization is not embedded in grep.
 
 Cloud catalog discovery uses the same ordinary `antfly_sources` table queries.
 Both Cloud and self-hosted search use ordinary `/tables/{table}/query` requests.
-Cloud applies `X-Antfly-Source-ID` and `X-Antfly-Source-Access` preconditions on that
-route to enforce the current binding, access and readiness. These are Cloud
+Cloud applies `X-Antfly-Source-ID`, `X-Antfly-Source-Access` and
+`X-Antfly-Source-Publication` preconditions on that route to enforce the current binding, access and readiness. These are Cloud
 preconditions, not new Antfly database APIs or authorization capabilities.
 
 Discover the same source catalog directly from a self-hosted Antfly table:

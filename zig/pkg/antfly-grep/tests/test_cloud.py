@@ -205,6 +205,16 @@ class CloudTests(unittest.TestCase):
                         409, X_Antfly_Source_Access="changed", X_Antfly_Subject=subject
                     )
                     return
+                if (
+                    body.get("search_after")
+                    and test.mode == "source-publication-changed"
+                ):
+                    self.reply(
+                        409,
+                        X_Antfly_Source_Publication="changed",
+                        X_Antfly_Subject=subject,
+                    )
+                    return
                 hits = []
                 if not body.get("search_after"):
                     # A full page exercises proof reuse on snapshot continuation.
@@ -212,6 +222,8 @@ class CloudTests(unittest.TestCase):
                     if test.mode not in (
                         "source-policy-changed",
                         "source-header-changed",
+                        "source-publication-changed",
+                        "source-publication-header-changed",
                         "refresh-continuation",
                     ):
                         count = 1
@@ -256,6 +268,13 @@ class CloudTests(unittest.TestCase):
                             }
                         )
                 headers = {}
+                if test.mode != "source-missing-publication":
+                    headers["X_Antfly_Source_Publication"] = (
+                        "publication-new"
+                        if body.get("search_after")
+                        and test.mode == "source-publication-header-changed"
+                        else "publication-" + str(identity)
+                    )
                 if test.mode != "source-missing-subject":
                     headers["X_Antfly_Subject"] = subject
                 if test.mode != "source-missing-proof":
@@ -411,8 +430,21 @@ class CloudTests(unittest.TestCase):
                 self.assertIn(b"Doc retry budget", result.stdout)
                 self.assertTrue(self.content_requests[-1][1])
 
+    def test_publication_changes_on_continuations_fail_closed(self):
+        for mode in ("source-publication-changed", "source-publication-header-changed"):
+            with self.subTest(mode=mode):
+                self.mode = mode
+                result = self.run_cli("--source", "manuals", "retry budget")
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertIn(b"SourcePublicationChanged", result.stderr)
+                self.assertIn(b"Doc retry budget", result.stdout)
+
     def test_private_rows_require_authenticated_response_context(self):
-        for mode in ("source-missing-proof", "source-missing-subject"):
+        for mode in (
+            "source-missing-proof",
+            "source-missing-subject",
+            "source-missing-publication",
+        ):
             with self.subTest(mode=mode):
                 self.mode = mode
                 result = self.run_cli("--source", "manuals", "retry budget")

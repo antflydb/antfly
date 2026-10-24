@@ -705,6 +705,9 @@ const Fetch = struct {
                     if (self.source_id) |id| try headers.append(a, .{ "X-Antfly-Source-ID", id });
                     const proof = if (self.options.cloud_session) |session| (if (self.source_id) |id| session.sourceProof(id) else null) else self.access_id;
                     if (proof) |id| try headers.append(a, .{ "X-Antfly-Source-Access", id });
+                    if (self.options.cloud_session) |session| if (self.source_id) |id| {
+                        if (session.sourcePublication(id)) |fence| try headers.append(a, .{ "X-Antfly-Source-Publication", fence });
+                    };
                 }
                 var response = self.http.post(self.url, .{ .borrowed_body = body, .headers = headers.items, .timeout_ms = self.options.timeout_ms, .max_response_size = self.config.max_response_bytes, .max_retries = 0, .follow_redirects = false, .cookies_enabled = false, .cancellation = httpx.CancellationToken.fromCallback(self, Fetch.cancelled) }) catch |err| {
                     if (self.ordered and err == error.ResponseTooLarge and page_size.* > 1) {
@@ -725,6 +728,7 @@ const Fetch = struct {
                     continue :resize;
                 }
                 if (status == 409) {
+                    if (response.header("x-antfly-source-publication")) |fence| if (std.mem.eql(u8, fence, "changed")) return error.SourcePublicationChanged;
                     if (response.header("x-antfly-source-access")) |proof| if (std.mem.eql(u8, proof, "changed")) return error.CloudSourceAccessChanged;
                     if (response.header("x-antfly-source-state") != null) return error.SourceNotSearchable;
                     return error.IndexSnapshotExpired;
@@ -743,7 +747,7 @@ const Fetch = struct {
                     continue;
                 }
                 if (self.options.cloud_session) |session| {
-                    try session.checkSource(self.source_id orelse return error.InvalidCloudSourcePolicy, response.header("x-antfly-subject"), response.header("x-antfly-source-access"));
+                    try session.checkSource(self.source_id orelse return error.InvalidCloudSourcePolicy, response.header("x-antfly-subject"), response.header("x-antfly-source-access"), response.header("x-antfly-source-publication"));
                 }
                 const response_body = response.body orelse return error.EmptyIndexResponse;
                 // Retain the response instead of copying ordinary JSON strings

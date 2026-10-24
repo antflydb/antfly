@@ -80,7 +80,7 @@ func (c *S3Connector) Enumerate(ctx context.Context, r Request) (Inventory, erro
 		if rev == "" || info.Size < 0 {
 			return fmt.Errorf("invalid S3 revision or size")
 		}
-		uri := "s3://" + cfg.Bucket + "/" + info.Key
+		uri := "s3://" + cfg.Bucket + "/" + escapeSourcePath(info.Key)
 		out.Objects = append(out.Objects, Item{ID: "s3://" + strings.Trim(r.SourceNamespace, "/") + "/" + cfg.Bucket + "/" + info.Key, Path: info.Key, Filename: filepath.Base(info.Key), Revision: rev, URL: uri, Size: info.Size, SourceKind: ProviderS3, ReadMode: sourceReadBytes, ObjectIndex: len(out.Objects) + 1, Metadata: map[string]any{"source_namespace": r.SourceNamespace, "bucket": cfg.Bucket, "key": info.Key, "etag": rev, "size": info.Size}})
 		return nil
 	}

@@ -160,6 +160,8 @@ fn discoverSelected(a: A, io: std.Io, endpoint: []const u8, catalog_table: []con
 /// visible. This ordering closes the discovery/query race without a cross-table
 /// transaction. Continuations stay on the already validated content snapshot.
 pub fn validatePublication(a: A, io: std.Io, options: *const @import("options.zig").Options, endpoint: []const u8, expected: indexed.Table) !void {
+    // Cloud validates around snapshot acquisition on the server. Fetch requires
+    // its publication response fence and pins it for all continuation requests.
     if (!options.sourced() or options.cloud_session != null) return;
     const bytes = if (options.source_catalog) |path|
         try load(a, io, path)
