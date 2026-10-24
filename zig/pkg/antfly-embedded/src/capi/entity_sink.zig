@@ -2779,3 +2779,55 @@ test "capi resolver curation shared remote policies acquire persistent ownership
     changed.aliases = &.{.{ .key = "b", .target = "a" }};
     try std.testing.expectError(error.InvalidResolverAliasCycle, changed.validate());
 }
+
+test "capi resolver curation connection reads accepted policy and finishes waits promptly" {
+    if (h.builtin.single_threaded) return error.SkipZigTest;
+    const api = @import("db.zig");
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    var directory = try api.TestDirectory.init("resolver-connection-visibility");
+    defer directory.cleanup();
+    const path = try std.fmt.allocPrintSentinel(a, "{s}.aflite", .{directory.path()}, 0);
+    defer a.free(path);
+    var handle: ?*anyopaque = null;
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_lite_create(path, &handle));
+    defer api.antfly_db_close(handle);
+    const names = [_][]const u8{ "knowledge", "notes", "history" };
+    var sources: [3]?*anyopaque = @splat(null);
+    defer for (sources) |source| if (source != null) api.antfly_db_close(source);
+    {
+        const guard = api.enterHandle(handle, .exclusive) orelse return error.TestUnexpectedResult;
+        defer guard.leave();
+        const root = guard.handle;
+        try @import("tables.zig").create(root, "entities", "{}", false);
+        for (names) |name| {
+            try @import("tables.zig").create(root, name, "{}", false);
+            const database = try @import("tables.zig").get(root, name);
+            try database.addResolver(.{ .name = "concepts", .table = "entities", .source_artifact = "kg", .resolution_artifact = "resolved", .key_template = "concept/{{uslug _entity.text}}", .promote = false });
+            try database.batch(.{ .writes = &.{.{ .key = "seed", .value = "{\"text\":\"seed\"}" }}, .sync_level = .write });
+        }
+    }
+    for (names, &sources) |name, *source| try std.testing.expectEqual(h.capi.ErrorCode.ok, @import("tables.zig").antfly_db_open_table(handle, .fromSlice(name), source));
+    var out: h.capi.Buffer = .{};
+    defer api.antfly_buffer_free(&out);
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_entity_merge_json(handle, .fromSlice("entities"), .fromSlice("concept/a"), .fromSlice("{\"into\":\"concept/b\"}"), &out));
+    api.antfly_buffer_free(&out);
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_resolver_curation_json(sources[0], .fromSlice("concepts"), &out));
+    const immediate = try scratch.dupe(u8, out.ptr.?[0..out.len]);
+    api.antfly_buffer_free(&out);
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_render_resolver_key_json(sources[0], .fromSlice("concepts"), .fromSlice("{\"text\":\"a\",\"label\":\"concept\"}"), &out));
+    const rendered = try scratch.dupe(u8, out.ptr.?[0..out.len]);
+    api.antfly_buffer_free(&out);
+    const started = std.Io.Clock.awake.now(std.testing.io).nanoseconds;
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_entity_merge_json(handle, .fromSlice("entities"), .fromSlice("concept/c"), .fromSlice("{\"into\":\"concept/d\",\"wait\":{\"timeout_ms\":10000}}"), &out));
+    const elapsed_ms = @divTrunc(std.Io.Clock.awake.now(std.testing.io).nanoseconds - started, std.time.ns_per_ms);
+    std.debug.print("curation connection wait_ms={d}\n", .{elapsed_ms});
+    try std.testing.expect(std.mem.indexOf(u8, immediate, "concept/b") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "\"key\":\"concept/b\"") != null);
+    try std.testing.expect(elapsed_ms < 5000);
+    var result = try std.json.parseFromSlice(std.json.Value, a, out.ptr.?[0..out.len], .{});
+    defer result.deinit();
+    try std.testing.expect(result.value.object.get("applied").?.bool);
+}

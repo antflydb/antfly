@@ -127,10 +127,18 @@ fn searchPage(a: A, input: service.RecallSearchRequest, hits: []service.Neighbor
     return .{ .keys = keys, .more = truncated or end < hits.len };
 }
 
+pub const IndexCatalog = struct {
+    ptr: *anyopaque,
+    create: *const fn (*anyopaque, A, []const u8, []const u8, []const u8) anyerror!void,
+    drop: *const fn (*anyopaque, A, []const u8, []const u8) anyerror!void,
+};
+
 pub const Routed = struct {
     table: []const u8,
     reads: reads_mod.TableReadSource,
     writes: writes_mod.TableWriteSource,
+    /// Server-owned tables publish index DDL through their authoritative catalog.
+    index_catalog: ?IndexCatalog = null,
     context: service.Context,
     resource_ptr: ?*anyopaque = null,
     resource_fn: ?*const fn (*anyopaque, A, service.types.provenance.Resource) anyerror!service.types.provenance.Snapshot = null,
@@ -145,21 +153,29 @@ pub const Routed = struct {
         var receiver = try borrow.receive();
         @import("antfly_platform").entropy.fill(receiver.io(), bytes) catch return error.MemoryCapabilityUnavailable;
     }
+    fn createIndex(self: *Routed, a: A, name: []const u8, json: []const u8) !void {
+        if (self.index_catalog) |catalog| return catalog.create(catalog.ptr, a, self.table, name, json);
+        try self.writes.createIndex(a, self.table, name, json) orelse return error.MemoryCapabilityUnavailable;
+    }
+    fn deleteIndex(self: *Routed, a: A, name: []const u8) !void {
+        if (self.index_catalog) |catalog| return catalog.drop(catalog.ptr, a, self.table, name);
+        try self.writes.dropIndex(a, self.table, name) orelse return error.MemoryCapabilityUnavailable;
+    }
     fn dropIndex(ptr: *anyopaque, a: A, name: []const u8) !void {
         const self: *Routed = @ptrCast(@alignCast(ptr));
         try self.context.requireGrant(.admin);
-        self.writes.dropIndex(a, self.table, name) catch |err| switch (err) {
+        self.deleteIndex(a, name) catch |err| switch (err) {
             error.IndexNotFound => return,
             else => return err,
-        } orelse return error.MemoryCapabilityUnavailable;
+        };
     }
     fn ensureTextIndex(ptr: *anyopaque, a: A, name: []const u8) !void {
         const self: *Routed = @ptrCast(@alignCast(ptr));
         try self.context.requireGrant(.admin);
-        self.writes.createIndex(a, self.table, name, try std.json.Stringify.valueAlloc(a, .{ .type = "full_text", .field = name }, .{})) catch |err| switch (err) {
+        self.createIndex(a, name, try std.json.Stringify.valueAlloc(a, .{ .type = "full_text", .field = name }, .{})) catch |err| switch (err) {
             error.IndexAlreadyExists => return,
             else => return err,
-        } orelse return error.MemoryCapabilityUnavailable;
+        };
     }
     fn searchAssertions(ptr: *anyopaque, a: A, input: service.RecallSearchRequest) !service.RecallSearchPage {
         const self: *Routed = @ptrCast(@alignCast(ptr));
@@ -184,10 +200,10 @@ pub const Routed = struct {
     fn ensureVectorIndex(ptr: *anyopaque, a: A, name: []const u8, dims: u32) !void {
         const self: *Routed = @ptrCast(@alignCast(ptr));
         try self.context.requireGrant(.admin);
-        self.writes.createIndex(a, self.table, name, try std.json.Stringify.valueAlloc(a, .{ .type = "embeddings", .external = true, .dimension = dims, .distance_metric = "cosine" }, .{})) catch |err| switch (err) {
+        self.createIndex(a, name, try std.json.Stringify.valueAlloc(a, .{ .type = "embeddings", .external = true, .dimension = dims, .distance_metric = "cosine" }, .{})) catch |err| switch (err) {
             error.IndexAlreadyExists => return,
             else => return err,
-        } orelse return error.MemoryCapabilityUnavailable;
+        };
     }
     fn neighbors(ptr: *anyopaque, a: A, input: service.NeighborRequest) ![]const service.Neighbor {
         const self: *Routed = @ptrCast(@alignCast(ptr));
@@ -409,4 +425,32 @@ test "capi native memory audience lanes retain the compiled owner text identity"
     oversized = input;
     oversized.text_indexes = &.{ "memory_recall_text_a", "memory_recall_text_b", "memory_recall_text_c" };
     try std.testing.expectError(error.InvalidMemoryRequest, searchLanes(oversized));
+}
+
+test "capi native memory routed index DDL uses catalog authority" {
+    const Counts = struct {
+        creates: usize = 0,
+        drops: usize = 0,
+        fn create(ptr: *anyopaque, _: A, _: []const u8, _: []const u8, _: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.creates += 1;
+        }
+        fn drop(ptr: *anyopaque, _: A, _: []const u8, _: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.drops += 1;
+        }
+        fn source(self: *@This()) IndexCatalog {
+            return .{ .ptr = self, .create = create, .drop = drop };
+        }
+    };
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var catalog: Counts = .{};
+    var adapter: Routed = .{ .table = "memory_space", .reads = undefined, .writes = undefined, .index_catalog = catalog.source(), .context = .{ .principal = "admin", .admin = true, .now_ms = 1 } };
+    try Routed.ensureTextIndex(&adapter, a, "memory_recall_text_test");
+    try Routed.ensureVectorIndex(&adapter, a, "memory_recall_vector_test", 3);
+    try Routed.dropIndex(&adapter, a, "memory_recall_text_test");
+    try std.testing.expectEqual(@as(usize, 2), catalog.creates);
+    try std.testing.expectEqual(@as(usize, 1), catalog.drops);
 }

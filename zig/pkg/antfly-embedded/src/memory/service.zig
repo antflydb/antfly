@@ -2604,7 +2604,16 @@ const Run = struct {
         var found_keys: std.ArrayList([]const u8) = .empty;
         for ([_]bool{ false, true }) |semantic_lane| {
             if (semantic_lane and dense.items.len == 0 or !semantic_lane and request.mode == .semantic) continue;
-            const lane = try self.service.backend.search_assertions.?(self.service.backend.ptr, self.a, .{ .text_indexes = text.items, .vector_indexes = if (semantic_lane) dense.items else &.{}, .query = if (semantic_lane) "" else seed.memory.assertion.statement, .filters = .{ .subjects = try self.identityMembers(seed_record.assertion.subject), .overlapping_scope = if (seed_record.assertion.scope.len > 0) seed_record.assertion.scope else null, .environment = seed_record.assertion.environment, .task = seed_record.assertion.task }, .embedding = if (semantic_lane) query_vector else null, .limit = request.limit + 1 });
+            const lane = self.service.backend.search_assertions.?(self.service.backend.ptr, self.a, .{ .text_indexes = text.items, .vector_indexes = if (semantic_lane) dense.items else &.{}, .query = if (semantic_lane) "" else seed.memory.assertion.statement, .filters = .{ .subjects = try self.identityMembers(seed_record.assertion.subject), .overlapping_scope = if (seed_record.assertion.scope.len > 0) seed_record.assertion.scope else null, .environment = seed_record.assertion.environment, .task = seed_record.assertion.task }, .embedding = if (semantic_lane) query_vector else null, .limit = request.limit + 1 }) catch |err| switch (err) {
+                // Catalog admission precedes serving-index publication. Keep
+                // readiness explicit and discard partial audience/lane results.
+                error.IndexNotFound, error.IndexRebuilding, error.Timeout, error.EnrichmentWaitTimeout => {
+                    page.retrieval = .not_ready;
+                    if (self.state.config.features.semantic_recall) page.semantic_discovery = .not_ready;
+                    return self.encode(page);
+                },
+                else => return err,
+            };
             if (lane.keys.len > request.limit + 1) return error.MemoryCorruptState;
             found.more = found.more or lane.more;
             for (lane.keys) |path| {

@@ -7887,3 +7887,38 @@ test "memory external evaluation freezes arbitrary judge metadata without a mana
     const receipt = try svc.execute(a, .evaluation_verdict, "run", body, "verdict");
     try std.testing.expectEqualStrings(receipt, try svc.execute(a, .evaluation_verdict, "run", body, "verdict"));
 }
+
+test "memory supersession physical index warming reports readiness without hiding backend faults" {
+    const Fault = struct {
+        fn search(ptr: *anyopaque, _: A, _: m.RecallSearchRequest) !m.RecallSearchPage {
+            const store: *Store = @ptrCast(@alignCast(ptr));
+            return switch (store.failures) {
+                0 => error.IndexNotFound,
+                1 => error.IndexRebuilding,
+                2 => error.Timeout,
+                3 => error.EnrichmentWaitTimeout,
+                else => error.InvalidArgument,
+            };
+        }
+    };
+    var store = Store.init();
+    defer store.deinit();
+    const a = store.arena.allocator();
+    var svc = IndexedRecallFixture.service(&store, 10);
+    _ = try svc.execute(a, .create, "", "{}", "create");
+    _ = try svc.execute(a, .observe, "", source, "source");
+    _ = try svc.execute(a, .assertions, "", helm, "helm");
+    try IndexedRecallFixture.drain(svc, a, "index");
+    svc.backend.search_assertions = Fault.search;
+    for (0..4) |failure| {
+        store.failures = @intCast(failure);
+        const page = try std.json.parseFromSliceLeaky(m.types.SupersessionCandidatePage, a, try svc.execute(a, .supersession_candidates, "helm", "{\"mode\":\"lexical\"}", ""), .{});
+        try std.testing.expectEqual(.not_ready, page.retrieval);
+        try std.testing.expectEqual(@as(usize, 0), page.items.len);
+    }
+    store.failures = 4;
+    try std.testing.expectError(error.InvalidArgument, svc.execute(a, .supersession_candidates, "helm", "{\"mode\":\"lexical\"}", ""));
+    svc.backend.search_assertions = IndexedRecallFixture.search;
+    const ready = try std.json.parseFromSliceLeaky(m.types.SupersessionCandidatePage, a, try svc.execute(a, .supersession_candidates, "helm", "{\"mode\":\"lexical\"}", ""), .{});
+    try std.testing.expectEqual(.indexed, ready.retrieval);
+}

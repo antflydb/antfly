@@ -13323,6 +13323,38 @@ pub const IndexManager = struct {
         return result.toOwnedSlice(alloc);
     }
 
+    /// Match listResolvers' active/staged routing selection without copying
+    /// destination-owned projected policy for unrelated resolver siblings.
+    pub fn listResolverRoutingDescriptors(self: *IndexManager, alloc: Allocator) ![]ResolverConfig {
+        self.catalog_mutex.lockShared();
+        defer self.catalog_mutex.unlockShared();
+        const result = try alloc.alloc(ResolverConfig, self.resolvers.items.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (result[0..initialized]) |*cfg| cfg.deinit(alloc);
+            alloc.free(result);
+        }
+        for (self.resolvers.items, result) |definition, *output| {
+            var cfg = definition;
+            cfg.merges = &.{};
+            cfg.curation_json = "{}";
+            output.* = try ResolverConfig.clone(alloc, cfg);
+            initialized += 1;
+        }
+        return result;
+    }
+
+    /// Legacy point reads need only the selected definition's policy, never
+    /// copies of every sibling's projected namespace.
+    pub fn resolverIdentityAlloc(self: *IndexManager, alloc: Allocator, name: []const u8) !?ResolverConfig {
+        self.catalog_mutex.lockShared();
+        defer self.catalog_mutex.unlockShared();
+        for ([_][]const ResolverConfig{ self.resolvers.items, self.retired_resolvers.items }) |definitions| for (definitions) |definition| {
+            if (std.mem.eql(u8, definition.name, name)) return try ResolverConfig.clone(alloc, definition);
+        };
+        return null;
+    }
+
     pub fn resolverStaticDescriptor(self: *IndexManager, alloc: Allocator, name: []const u8) !?ResolverConfig {
         self.catalog_mutex.lockShared();
         defer self.catalog_mutex.unlockShared();

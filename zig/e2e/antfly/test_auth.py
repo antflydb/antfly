@@ -26,6 +26,7 @@ import threading
 import time
 from contextlib import ExitStack
 from pathlib import Path
+from urllib.parse import urlencode
 
 import pytest
 import requests
@@ -77,7 +78,10 @@ def _wait_for_admin_auth(
     session.headers["Authorization"] = _basic_auth("admin", AUTH_BOOTSTRAP_PASSWORD)
     while time.monotonic() < deadline:
         try:
-            request_timeout = max(0.1, min(2.0, deadline - time.monotonic()))
+            # Password verification in a Debug build can exceed two seconds.
+            # Give one verification the remaining setup budget; repeatedly
+            # timing it out only starts more expensive verification work.
+            request_timeout = max(0.1, deadline - time.monotonic())
             response = session.get(f"{auth_url}/me", timeout=request_timeout)
             if (
                 response.status_code == 200
@@ -1317,8 +1321,11 @@ def test_memory_evaluation_pages_and_indexed_candidates_with_admin_key(storage_e
             first = call("GET", space + endpoint + "?limit=1")
             assert len(first["items"]) == 1
             assert first["next_cursor"]
-            second = call(
-                "POST", space + endpoint, {"limit": 1, "cursor": first["next_cursor"]}
+            page_request = {"limit": 1, "cursor": first["next_cursor"]}
+            second = (
+                call("POST", space + endpoint, page_request)
+                if endpoint.endswith("/tasks")
+                else call("GET", space + endpoint + "?" + urlencode(page_request))
             )
             assert len(second["items"]) == 1
             assert first["items"] != second["items"]
@@ -1360,7 +1367,21 @@ def test_memory_evaluation_pages_and_indexed_candidates_with_admin_key(storage_e
         )
         deadline = time.monotonic() + 60
         while True:
-            call("POST", space + "/maintenance", {})
+            try:
+                call("POST", space + "/maintenance", {})
+            except requests.HTTPError as error:
+                # Standalone also advances memory in the background. A lost
+                # revision fence requires a new bounded admission attempt.
+                response = error.response
+                if (
+                    response is None
+                    or response.status_code != 409
+                    or response.json().get("code") != "MemoryRevisionConflict"
+                ):
+                    raise
+                assert time.monotonic() < deadline
+                time.sleep(0.1)
+                continue
             page = call(
                 "POST",
                 space + "/memories/claim-0/supersession-candidates",
@@ -1370,6 +1391,14 @@ def test_memory_evaluation_pages_and_indexed_candidates_with_admin_key(storage_e
                 assert [
                     item["view"]["memory"]["assertion"]["id"] for item in page["items"]
                 ] == ["claim-1"]
+                table = api.get("/tables/memory_qualification")
+                assert (
+                    sum(
+                        name.startswith("memory_recall_text_")
+                        for name in table["indexes"]
+                    )
+                    >= 2
+                )
                 break
             assert time.monotonic() < deadline, page
             time.sleep(0.1)
