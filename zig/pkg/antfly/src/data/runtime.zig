@@ -21504,7 +21504,7 @@ pub const DataServer = struct {
         defer self.alloc.free(local_group_ids);
 
         for (snapshot.tables) |table| {
-            const warmed_groups = self.warmProvisionedTableGroups(snapshot.ranges, local_group_ids, table) catch |err| blk: {
+            const warmed_groups = self.warmProvisionedTableGroups(snapshot.ranges, snapshot.merge_transitions, local_group_ids, table) catch |err| blk: {
                 std.log.warn("provisioned cache warmup failed table={s} err={}", .{ table.name, err });
                 break :blk 0;
             };
@@ -21518,6 +21518,7 @@ pub const DataServer = struct {
     fn warmProvisionedTableGroups(
         self: *DataServer,
         ranges: []const antfly.metadata.table_manager.RangeRecord,
+        merges: []const antfly.metadata.MergeTransitionRecord,
         local_group_ids: []const u64,
         table: antfly.metadata.table_manager.TableRecord,
     ) !u64 {
@@ -21525,8 +21526,23 @@ pub const DataServer = struct {
         const io = (try self.ensureBackendRuntime()).io() orelse
             return error.BackendRuntimeUnavailable;
         for (local_group_ids) |group_id| {
-            const range = findRangeByGroupId(ranges, group_id) orelse continue;
-            if (range.table_id != table.table_id) continue;
+            if (findRangeByGroupId(ranges, group_id)) |range| {
+                if (range.table_id != table.table_id) continue;
+            } else retained: {
+                // Cutover retires serving routing before source cleanup. A
+                // restart must still preopen assigned donors from their
+                // durable transition contract, outside the bounded I/O turn.
+                // Never invent a serving range for that physical owner.
+                for (merges) |merge| {
+                    if (merge.phase == .finalized or merge.phase == .rolled_back or merge.donor_group_id != group_id or
+                        merge.table_contract.table_id != table.table_id or !std.mem.eql(u8, merge.table_contract.table_name, table.name)) continue;
+                    const online = merge.online orelse continue;
+                    if (online.phase != .release) continue;
+                    try merge.table_contract.validateForMerge(merge.allow_doc_identity_reassignment);
+                    break :retained;
+                }
+                continue;
+            }
 
             const db_path = try antfly.metadata.groupDbPathFromReplicaRoot(self.alloc, self.write_source.replica_root_dir, group_id);
             defer self.alloc.free(db_path);
