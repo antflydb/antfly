@@ -41,6 +41,7 @@ class LocalTestPartitions(unittest.TestCase):
             "pkg/antfly-embedded/src/test_error_logs.zig",
             "tools/audit_test_selection.py",
             "tools/run_test_partitions.py",
+            "pkg/antfly/build/runtime_memory.zig",
             "pkg/antfly/build/unit_test_ownership.zig",
             "pkg/antfly/build/unit_test_inventory.zig",
         ):
