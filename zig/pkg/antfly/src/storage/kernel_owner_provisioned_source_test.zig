@@ -38,7 +38,11 @@ test "cold warmup reopens transient owners without disturbing resident siblings"
     const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", alloc);
     defer alloc.free(root);
     const Catalog = struct {
-        fn snapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+        route_removed: bool = false,
+
+        fn snapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (self.route_removed) return error.CatalogRoutingUnavailable;
             return .{
                 .status = .{
                     .metadata_group_id = 1,
@@ -97,6 +101,25 @@ test "cold warmup reopens transient owners without disturbing resident siblings"
         try std.testing.expectEqual(resident, owners.entries.items[0]);
         try std.testing.expect((try owners.writeSource().localRuntimeStatusGroupLocal(alloc, 7502, "warmup_probe")) == null);
     }
+    // Cutover removes serving authority before donor cleanup. Lifecycle reads
+    // keep the exact admitted physical owner and still reject foreign identity.
+    catalog.route_removed = true;
+    const wire = @import("antfly_local_sources").storage_db_online_merge_io_contract;
+    var request: wire.Request = .{ .scope = .{
+        .fence = .{ .admission_epoch = 0, .attempt = 0, .transition_id = 7, .owner_group_id = 7501, .peer_group_id = 7502, .role = .merge_source, .namespace = .{ .table_id = 71, .shard_id = 7501, .range_id = 7501 }, .catalog_digest = @splat(0) },
+        .receiver_namespace = .{ .table_id = 71, .shard_id = 7502, .range_id = 7502 },
+        .consumer_epoch = 0,
+        .copy_attempt = .{},
+    }, .operation = .{ .admission = .donor } };
+    const context: @import("antfly_local_sources").api_operation.RequestContext = .{ .deadline_ns = @import("antfly_platform").time.monotonicNs() + 2 * std.time.ns_per_s };
+    const facts = try owners.onlineMergeIo(alloc, 7501, "warmup_probe", request, context);
+    defer alloc.free(facts);
+    var parsed = try std.json.parseFromSlice(wire.AdmissionFacts, alloc, facts, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(u64, 71), parsed.value.namespace.table_id);
+    request.scope.fence.namespace.table_id = 72;
+    request.scope.receiver_namespace.table_id = 72;
+    try std.testing.expectError(error.OnlineSourceScopeChanged, owners.onlineMergeIo(alloc, 7501, "warmup_probe", request, context));
 }
 
 test "bulk callback ABI retains exact consumer error identity" {

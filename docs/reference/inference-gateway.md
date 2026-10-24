@@ -593,3 +593,63 @@ When disabled, the server rejects public named execution, batches, every session
 Gateway model discovery remains authorized by `inference:read`, returns `public_inference_enabled: false` with an empty catalog, and avoids upstream probing while disabled. Antfarm displays an enablement message. Internal provider calls used by indexing, extraction, and SQL/query execution remain available; this is independent of inference admission and provider configuration.
 
 Colony owns tenant enablement and provisioning this setting. The Kubernetes operator preserves it in `AntflyCluster.spec.config` for standalone and distributed deployments. Entitlements, approved targets, and billing limits remain separate control-plane responsibilities. This setting is deployment configuration and changes take effect when the deployment is restarted; it is not a tenant-writable API toggle.
+
+
+## Caller deadlines and unknown outcomes
+
+Public inference invocations, direct connection invocations, batches, and sessions
+accept one `X-Antfly-Inference-Timeout-Ms` header. Configure the finite default and
+maximum in the node config:
+
+```json
+{
+  "public_inference": {
+    "enabled": true,
+    "default_timeout_ms": 120000,
+    "max_timeout_ms": 600000
+  }
+}
+```
+
+A caller can request `300000` milliseconds for a slower model. Values must be
+ASCII decimal integers between 1 and the configured maximum. Duplicate headers,
+zero, signs, whitespace, overflow, and excessive values fail with HTTP 400 before
+provider submission. The maximum cannot exceed one hour, and the default cannot
+exceed the maximum. Omitting the header uses the configured default.
+
+The gateway converts the budget to one monotonic deadline at admission. Body
+processing, quota and queue waits, authentication to providers, retries, fallback,
+and streaming all consume that deadline. Batch items inherit it. Earlier ingress
+deadlines and stricter provider limits take precedence. Compatible transports
+forward the remaining budget after quota admission; another attempt cannot
+restart it. Configure a downstream Antfly gateway's maximum to permit the forwarded
+budget as well.
+
+Task adapters without transport send proof report `upstream_submitted: null`
+and `phase: execution` once execution has begun, with an unknown outcome and
+`retryable: false`. Absence of proof must never imply that replay is safe.
+
+A gateway timeout before response commitment returns HTTP 504 with `error.code`
+`Timeout`, a `request_id` matching `X-Request-ID`, and these fields:
+
+| Field | Before dispatch | After dispatch |
+|---|---|---|
+| `phase` | `admission` | `upstream` |
+| `upstream_submitted` | `false` | `true` |
+| `outcome` | `not_submitted` | `unknown` |
+| `cancellation` | `not_required` | `requested` |
+| `retryable` | `true` | `false` |
+
+Submission means request bytes may have reached an upstream (or work was handed
+to the local executor); it does not acknowledge that
+the provider accepted or billed the request. After that point a timeout cannot
+prove that upstream work stopped or that replay is safe. Cancellation is requested
+on deadline expiry or client disconnect, and Antfly never restarts inference to
+recover a disconnected response. Providers and uninterruptible native calls may
+finish after cancellation. Durable result retrieval and idempotency are separate
+capabilities.
+
+Once SSE headers commit, a timeout or disconnect terminates the stream; a second
+JSON response would corrupt it. Retain the initial `X-Request-ID` for correlation
+and treat an incomplete stream as an unknown outcome. Stalled streams consume the
+same total invocation budget as streams that keep producing output.

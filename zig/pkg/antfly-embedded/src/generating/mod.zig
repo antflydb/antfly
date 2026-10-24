@@ -534,6 +534,14 @@ const BackendState = struct {
         };
     }
 
+    fn observeSubmission(self: *BackendState, observer: httpx.AttemptObserver) httpx.AttemptObserver {
+        var result = observer;
+        if (self.request_context) |context| if (context.submission) |callback| {
+            result.delivery = .{ .context = callback.ptr, .before_send = callback.notify };
+        };
+        return result;
+    }
+
     fn generate(ptr: *anyopaque, alloc: std.mem.Allocator, model: []const u8, messages: []const ChatMessage) !GenerateResult {
         const self: *BackendState = @ptrCast(@alignCast(ptr));
         if (self.request_context) |context| {
@@ -575,7 +583,7 @@ const BackendState = struct {
         const quota = temporary orelse self.quota.?;
         const media = try generationMediaReservation(self.cfg, messages);
         var reservation = provider_limits.TokenReservation{ .limiter = quota.limiter(), .input_tokens = media.tokens, .include_body_bytes = true, .body_bytes_discount = media.inline_bytes, .output_tokens = try generationOutputBudget(self.cfg, 1), .usage_observer = self.usage_observer };
-        const observer = if (media.tokens > 0 or self.usage_observer != null) reservation.observer() else quota.limiter().observer(try generationOutputBudget(self.cfg, 1));
+        const observer = self.observeSubmission(if (media.tokens > 0 or self.usage_observer != null) reservation.observer() else quota.limiter().observer(try generationOutputBudget(self.cfg, 1)));
         switch (self.provider) {
             inline .openai, .remote_antfly, .vertex, .gemini, .anthropic => |*provider| provider.attempt_observer = observer,
             .bedrock => |*provider| provider.options.attempt_observer = observer,
@@ -1329,7 +1337,7 @@ pub fn generateAntflyTextBatchResponse(
                 null
         else
             null,
-        .attempt_observer = state.quota.?.limiter().observer(output_tokens),
+        .attempt_observer = state.observeSubmission(state.quota.?.limiter().observer(output_tokens)),
     });
 }
 
@@ -1838,17 +1846,19 @@ fn chatResponseWithState(alloc: std.mem.Allocator, state: *BackendState, request
     if (cfg.provider == .antfly) {
         headers[header_count] = .{ "X-Antfly-Inference-Attempts-Remaining", "1" };
         header_count += 1;
-        headers[header_count] = .{ "X-Antfly-Inference-Timeout-Ms", timeout_header };
-        header_count += 1;
     }
+    // OpenAI-compatible private bridges can consume the same bounded budget.
+    headers[header_count] = .{ "X-Antfly-Inference-Timeout-Ms", timeout_header };
+    header_count += 1;
     const media = try generationMediaReservation(cfg, request.messages);
     var reservation = provider_limits.TokenReservation{ .limiter = state.quota.?.limiter(), .input_tokens = media.tokens, .include_body_bytes = true, .body_bytes_discount = media.inline_bytes, .output_tokens = try generationOutputBudget(cfg, 1), .usage_observer = state.usage_observer };
     const request_options = httpx.RequestOptions{
+        .remaining_timeout_header = "X-Antfly-Inference-Timeout-Ms",
         .json = request.body_json,
         .headers = headers[0..header_count],
         .timeout_ms = timeout_ms,
         .cancellation = if (state.request_context) |context| if (context.cancellation) |token| httpx.CancellationToken.fromCallback(token.ptr, token.is_cancelled_fn) else null else null,
-        .attempt_observer = if (media.tokens > 0 or state.usage_observer != null) reservation.observer() else state.quota.?.limiter().observer(try generationOutputBudget(cfg, 1)),
+        .attempt_observer = state.observeSubmission(if (media.tokens > 0 or state.usage_observer != null) reservation.observer() else state.quota.?.limiter().observer(try generationOutputBudget(cfg, 1))),
         .max_retries = 0,
         .follow_redirects = false,
         .cookies_enabled = false,
@@ -1876,7 +1886,7 @@ fn bedrockChatResponseWithState(alloc: std.mem.Allocator, state: *BackendState, 
     var reservation = provider_limits.TokenReservation{ .limiter = state.quota.?.limiter(), .input_tokens = media.tokens, .include_body_bytes = true, .body_bytes_discount = media.inline_bytes, .output_tokens = try generationOutputBudget(state.cfg, 1), .usage_observer = state.usage_observer };
     var attempt = provider_limits.DeferredUsageAttempt{ .delegate = reservation.observer() };
     defer attempt.finish(null);
-    provider.options.attempt_observer = attempt.observer();
+    provider.options.attempt_observer = state.observeSubmission(attempt.observer());
     defer provider.options.attempt_observer = null;
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, request.body_json, .{});
     defer parsed.deinit();
@@ -1904,7 +1914,7 @@ fn anthropicChatResponseWithState(alloc: std.mem.Allocator, state: *BackendState
     var reservation = provider_limits.TokenReservation{ .limiter = state.quota.?.limiter(), .input_tokens = media.tokens, .include_body_bytes = true, .body_bytes_discount = media.inline_bytes, .output_tokens = try generationOutputBudget(state.cfg, 1), .usage_observer = state.usage_observer };
     var attempt = provider_limits.DeferredUsageAttempt{ .delegate = reservation.observer() };
     defer attempt.finish(null);
-    provider.attempt_observer = attempt.observer();
+    provider.attempt_observer = state.observeSubmission(attempt.observer());
     defer provider.attempt_observer = null;
     const response = try provider.chatResponse(alloc, request);
     attempt.finish(&response);
@@ -1943,7 +1953,7 @@ fn googleChatResponseWithState(alloc: std.mem.Allocator, state: *BackendState, r
         .headers = headers.items,
         .timeout_ms = try control.remainingTimeoutMs(),
         .cancellation = cancellation,
-        .attempt_observer = if (media.tokens > 0 or state.usage_observer != null) reservation.observer() else state.quota.?.limiter().observer(try generationOutputBudget(state.cfg, 1)),
+        .attempt_observer = state.observeSubmission(if (media.tokens > 0 or state.usage_observer != null) reservation.observer() else state.quota.?.limiter().observer(try generationOutputBudget(state.cfg, 1))),
         .max_response_size = state.max_response_bytes,
         .max_retries = 0,
         .follow_redirects = false,

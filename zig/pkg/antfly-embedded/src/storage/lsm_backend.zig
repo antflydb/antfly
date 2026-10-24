@@ -1470,6 +1470,9 @@ pub const Backend = struct {
     // before exposing their result. The cache-coherence test below is the
     // oracle for any new mutation method.
     const WalRetentionState = struct {
+        // Proof from our own completed destructive reset, not a sampled byte
+        // count. No append, recovery, or invalidation may preserve this proof.
+        reset_proven: bool = false,
         primary: ?wal_mod.RetentionStats = null,
         primary_ns: u64 = 0,
         replay: ?wal_mod.RetentionStats = null,
@@ -1485,6 +1488,7 @@ pub const Backend = struct {
             options: wal_mod.AppendOptions,
             now_ns: u64,
         ) !wal_mod.AppendResult {
+            self.reset_proven = false;
             errdefer self.invalidatePrimary();
             const result = try wal_mod.appendStateWithOptionsResult(
                 storage,
@@ -1544,6 +1548,7 @@ pub const Backend = struct {
         }
 
         fn invalidatePrimary(self: *@This()) void {
+            self.reset_proven = false;
             self.primary = null;
             self.primary_ns = 0;
         }
@@ -1553,6 +1558,7 @@ pub const Backend = struct {
         }
 
         fn installReset(self: *@This(), now_ns: u64) void {
+            self.reset_proven = true;
             self.primary = .{
                 .oldest_retained_segment = 1,
                 .current_segment = 1,
@@ -6075,6 +6081,15 @@ pub const Backend = struct {
         const start_ns = self.writeStatsNowNs();
         var wal_lock = try self.acquireWalOperationLock(.exclusive);
         defer wal_lock.release();
+        // Manifest publication and projection finalization may checkpoint the
+        // same durable boundary. Rewriting four already-empty WAL objects on
+        // every observation amplifies Lite publication work and retirement.
+        // Only our completed-reset proof permits this shortcut; fresh opens,
+        // partial failures and every append still take the durable I/O path.
+        if (self.wal_retention.reset_proven) {
+            self.clearPublishedWalLogicalDebtLocked();
+            return;
+        }
         try self.wal_retention.reset(
             self.storage.?,
             self.allocator,
@@ -11568,6 +11583,19 @@ fn implementationTests() type {
             try expectWalRetentionCacheMatchesStorage(&backend);
 
             try backend.checkpointWalAfterDurableBoundary();
+            try expectWalRetentionCacheMatchesStorage(&backend);
+            const resets = backend.write_stats.wal_resets;
+            for (0..10) |_| try backend.checkpointWalAfterDurableBoundary();
+            try std.testing.expectEqual(resets, backend.write_stats.wal_resets);
+            // The next append invalidates the proof before touching storage.
+            {
+                var txn = try backend.beginWrite();
+                defer txn.abort();
+                try txn.put(.{ .name = "docs" }, "doc:after-reset", "new");
+                try txn.commit();
+            }
+            try backend.checkpointWalAfterDurableBoundary();
+            try std.testing.expect(backend.write_stats.wal_resets > resets);
             try expectWalRetentionCacheMatchesStorage(&backend);
         }
 

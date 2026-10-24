@@ -2465,7 +2465,13 @@ fn Engine(comptime Context: type) type {
                 };
                 if (self.partition_join != null) return;
                 if (self.hash_join == null) {
-                    self.hash_join = try operators.HashJoin.create(self.engine.context.alloc, .{ .rows = self.engine.context.limits.scan_rows, .bytes = self.engine.context.limits.retained_bytes, .spill = self.engine.context.spill });
+                    // A full build table must still be exportable: partition metadata,
+                    // encoded spill buffers and the borrowed input batch coexist
+                    // until its last retained row has been transferred. Reserve
+                    // that lane before admitting build payloads, not after OOM.
+                    const retained = self.engine.context.limits.retained_bytes;
+                    const build_bytes = if (!shared and self.engine.context.spill != null) retained - retained / 4 else retained;
+                    self.hash_join = try operators.HashJoin.create(self.engine.context.alloc, .{ .rows = self.engine.context.limits.scan_rows, .bytes = build_bytes, .spill = self.engine.context.spill });
                     if (!shared and kind != .left and kind != .full) try self.prepareScanFilter(if (self.flipped_join) join.right_keys else join.left_keys);
                     var scratch = std.heap.ArenaAllocator.init(self.engine.context.alloc);
                     defer scratch.deinit();

@@ -2147,7 +2147,15 @@ pub const ProvisionedKernelOwnerSource = struct {
         if (json.len > @import("online_merge_io.zig").contract.max_request_bytes) return error.InvalidMergePage;
         const native_context = try platformDeadlineContext(context);
         var cancellation = context.cancellation;
-        var lease = try self.acquireWithControls(group_id, table_name, .{ .execution_deadline_ns = native_context.deadline_ns, .cancellation = cancellation });
+        // Lifecycle I/O addresses the durable physical owner, which outlives
+        // its serving route after cutover. Borrow the already admitted owner
+        // without re-resolving that removed route. The read-index above and
+        // the native owner's exact namespace/published-ledger scope checks
+        // still authorize every operation; ordinary query opens retain their
+        // catalog descriptor checks. Cold owners are prepared independently
+        // by placement recovery, never by an unbounded admin read here.
+        var lease = self.acquirePreparedOwner(group_id, table_name) catch
+            try self.acquireWithControls(group_id, table_name, .{ .execution_deadline_ns = native_context.deadline_ns, .cancellation = cancellation });
         defer lease.deinit();
         try context.ensureActive();
         var response = try lease.owner().onlineMergeIoJson(.{ .table_name = .fromSlice(table_name), .request_json = .fromSlice(json), .execution_deadline_ns = native_context.deadline_ns orelse 0, .has_execution_deadline = @intFromBool(native_context.deadline_ns != null), .cancellation_ctx = &cancellation, .cancellation_fn = cancellationTokenRequested });

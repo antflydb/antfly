@@ -153,6 +153,9 @@ pub const ClientConfig = struct {
 pub const RequestOptions = struct {
     delivery_observer: ?Request.DeliveryObserver = null,
     attempt_observer: ?AttemptObserver = null,
+    /// Recompute this trusted forwarding header after quota admission, using
+    /// the request-wide deadline shared by retries and redirects.
+    remaining_timeout_header: ?[]const u8 = null,
     headers: ?[]const [2][]const u8 = null,
     body: ?[]const u8 = null,
     /// Body borrowed only until the synchronous request call returns. Unlike
@@ -1122,6 +1125,7 @@ pub const Client = struct {
         req.max_response_size = reqOpts.max_response_size;
         req.max_retries = reqOpts.max_retries;
         req.attempt_observer = reqOpts.attempt_observer orelse self.config.attempt_observer;
+        req.remaining_timeout_header = reqOpts.remaining_timeout_header;
         req.delivery_observer = reqOpts.delivery_observer;
 
         try req.headers.set(HeaderName.USER_AGENT, self.config.user_agent);
@@ -1246,6 +1250,7 @@ pub const Client = struct {
         req.max_response_size = reqOpts.max_response_size;
         req.max_retries = reqOpts.max_retries;
         req.attempt_observer = reqOpts.attempt_observer orelse self.config.attempt_observer;
+        req.remaining_timeout_header = reqOpts.remaining_timeout_header;
         req.delivery_observer = reqOpts.delivery_observer;
 
         try req.headers.set(HeaderName.USER_AGENT, self.config.user_agent);
@@ -1965,8 +1970,18 @@ pub const Client = struct {
         return @constCast(interrupt).isCancellationRequested();
     }
 
-    fn executeRequestOnceUnobserved(self: *Self, req: *Request, timeout_override_ms: ?u64, deadline_ms: ?i64, interrupt: *RequestInterrupt) !Response {
+    fn prepareAdmittedAttempt(self: *Self, req: *Request, deadline_ms: ?i64) !void {
         try ensureRequestDeadline(self.io, deadline_ms);
+        if (req.remaining_timeout_header) |name| if (deadline_ms) |deadline| {
+            const now = @divFloor(Io.Clock.awake.now(self.io).nanoseconds, std.time.ns_per_ms);
+            const remaining: u64 = @intCast(@max(1, @as(i96, deadline) - now));
+            var buffer: [20]u8 = undefined;
+            try req.headers.set(name, try std.fmt.bufPrint(&buffer, "{d}", .{remaining}));
+        };
+    }
+
+    fn executeRequestOnceUnobserved(self: *Self, req: *Request, timeout_override_ms: ?u64, deadline_ms: ?i64, interrupt: *RequestInterrupt) !Response {
+        try self.prepareAdmittedAttempt(req, deadline_ms);
         const host = req.uri.host orelse return error.InvalidUri;
         const port = req.uri.effectivePort();
         // Use request_ms as a fallback ceiling for socket timeouts when the
@@ -2111,6 +2126,8 @@ pub const Client = struct {
             try writeBufferedBody(&res, writer, progress_cb, progress_ctx);
             return res;
         }
+
+        try self.prepareAdmittedAttempt(req, deadline_ms);
 
         if (req.uri.isTls()) {
             if (self.config.keep_alive and self.config.address_filter == null) {
@@ -6767,4 +6784,38 @@ test "H1 direct connections disable Nagle" {
     var size: std.posix.socklen_t = @sizeOf(c_int);
     try std.testing.expectEqual(std.posix.E.SUCCESS, std.posix.errno(std.posix.system.getsockopt(socket.handle, std.posix.IPPROTO.TCP, std.posix.TCP.NODELAY, @ptrCast(&value), &size)));
     try std.testing.expect(value != 0);
+}
+
+test "admitted transport reports submission and refreshes forwarded remaining deadline" {
+    const Probe = struct {
+        calls: usize = 0,
+        fn submitted(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+        }
+        fn before(_: *anyopaque, _: AttemptObserver.Context) !void {}
+        fn after(_: *anyopaque, _: ?*const Response) void {}
+    };
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var client = Client.initWithConfig(a, io, .{});
+    defer client.deinit();
+    var req = try Request.init(a, .POST, "http://localhost/generate");
+    defer req.deinit();
+    var probe: Probe = .{};
+    req.attempt_observer = .{ .ptr = &probe, .before = Probe.before, .after = Probe.after, .delivery = .{ .context = &probe, .before_send = Probe.submitted } };
+    req.remaining_timeout_header = "X-Remaining-Ms";
+    try req.headers.set("X-Remaining-Ms", "300000");
+    const now: i64 = @intCast(@divFloor(Io.Clock.awake.now(io).nanoseconds, std.time.ns_per_ms));
+    try client.prepareAdmittedAttempt(&req, now + 1000);
+    const first = try std.fmt.parseInt(u64, req.headers.get("X-Remaining-Ms").?, 10);
+    try std.testing.expect(first > 0 and first <= 1000);
+    try client.prepareAdmittedAttempt(&req, now + 100);
+    const second = try std.fmt.parseInt(u64, req.headers.get("X-Remaining-Ms").?, 10);
+    try std.testing.expect(second > 0 and second <= 100 and second < first);
+    try std.testing.expectEqual(@as(usize, 0), probe.calls);
+    req.notifySend();
+    try std.testing.expectEqual(@as(usize, 1), probe.calls);
+    try std.testing.expectError(error.Timeout, client.prepareAdmittedAttempt(&req, now - 1));
+    try std.testing.expectEqual(@as(usize, 1), probe.calls);
 }
