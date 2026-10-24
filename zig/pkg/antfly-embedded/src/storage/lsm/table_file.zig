@@ -1347,6 +1347,17 @@ pub const StreamingEncoder = struct {
         try self.setBlockLargest(entry);
     }
 
+    /// Legacy synchronous final-block boundary. This can invoke sink IO on
+    /// caller CPU; admitted writers still need a retained block producer.
+    /// A partial output failure makes the encoder terminal, never replayable.
+    pub fn finishBlocks(self: *StreamingEncoder) !void {
+        if (self.finished) return error.InvalidTableFile;
+        self.flushBlock() catch |cause| {
+            self.finished = true;
+            return cause;
+        };
+    }
+
     /// The final block must already have been published by its owning writer.
     /// Metadata owns the final filters and borrows this frozen encoder until
     /// result transfer or destruction. It issues no filesystem operations.
@@ -1691,6 +1702,15 @@ pub const StreamingEncoder = struct {
                 }
             }
             return null;
+        }
+
+        /// Coupled receipt: after accepted file IO completes, acknowledge the
+        /// frozen input cursor before another original checkpoint can reject.
+        pub fn writeNextWithAdmission(self: *@This(), writer: anytype, original: read_admission.Port) !bool {
+            const output = (try self.next(original)) orelse return false;
+            try writer.writeWithAdmission(output.offset, output.bytes, original);
+            self.acknowledge();
+            return true;
         }
 
         pub fn takeResult(self: *@This()) !StreamingEncoderResult {

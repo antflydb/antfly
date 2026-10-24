@@ -25412,3 +25412,72 @@ adoption by run construction and manifest publication, and admitted backend
 finalization/teardown. Remaining completion/history relief, provider/legacy
 adoption and default-gate evidence stay open. Full GNU qualification remains
 waived; the full design is incomplete.
+
+### Owning private-file IO and publication
+
+Durability grants now provide an exclusive private-file session on their
+already admitted worker, descriptor slot and bounded scratch. Creation is
+exclusive and never truncates or removes a colliding temporary. Writes freeze
+at most 16 KiB on caller CPU before dispatch. The worker performs file IO only;
+metadata encoding, cache fencing and policy observation remain caller work.
+Publication syncs and closes the data descriptor, renames the temporary, then
+uses the same still-reserved descriptor slot for directory sync. No new worker
+or descriptor admission is required after physical work is accepted.
+
+A retained file owner records accepted create/write/publish/discard operations
+and waits through the original finite scope. Rejected observation or CPU return
+keeps the exact operation, frozen bytes, descriptor and memory credit for retry.
+A physical write error poisons the private image rather than replaying a partial
+append. Publication acceptance retains a possibly-published-output obligation;
+failed directory sync after rename cannot authorize deleting the destination.
+Admitted abort closes/unlinks only the owned temporary. Every retry validates
+its finite control capability before observing accepted IO. Worker retirement
+remains separate, so rejected join reentry keeps its header and descriptor
+charged. Completed outputs can transfer the still-funded grant to the next file
+without reacquiring a descriptor or worker; the reservation follows that grant.
+
+The table metadata producer can hand commands to this owner and acknowledge its
+input cursor immediately after successful IO observation, before another fallible
+checkpoint. The caller retains/prepays encoder, file, grant and output-growth
+ownership; the low-level file owner does not create a fresh application budget.
+Explicit legacy destruction joins accepted work and uses the admitted worker for
+best-effort temporary cleanup before releasing the grant. Higher output/recovery
+owners must retain any unresolved cleanup or publication obligation.
+
+Native ABI 110 and storage-owner ABI 170 fence the extended resource callbacks.
+The original 4 KiB control-file/read limit is preserved despite the larger shared
+scratch. Positional writes flush without truncating existing tails, including
+header backpatches. The explicit legacy final-block boundary remains synchronous
+and terminal on output failure; it does not substitute for admitted block work.
+
+Qualification receipts in the cumulative integration directory:
+
+- `owned-atomic-file-v1` preserves a composition fixture's call to a private
+  block flush method; table/WAL, close, host and error-identity cases passed.
+- `owned-atomic-file-v2` preserves an exact-size verification read hitting the
+  reader's exclusive limit. Investigation also identified tail-truncating
+  Writer.end() in the new positional path; final writes use a non-truncating
+  flush, and the strengthened composition test decodes all published rows.
+- `owned-atomic-file-v3` passes 83/83 build steps, 46 physical-IO cases, 32
+  embedded close cases, 153 and 74 table/WAL cases, 18 host/ABI cases and
+  45/1/8 error-identity cases, with unchanged native inputs. Formatting and
+  whitespace checks pass; receipts, logs, hashes and source snapshots remain.
+
+The new matrix covers cancellation/deadline/FileNotFound at checkpoint, wait
+entry and CPU return for create/write/publish/discard (36 combinations), plus
+rejected worker-join return in each fixture. It checks retained payload credit
+and descriptors, missing-control rejection without losing accepted work, no IO
+replay, preserved foreign temporaries, poisoned partial writes, cached-path
+invalidation and rename ambiguity. The composed encoder/file case verifies all
+192 rows after cancellation during metadata output, then reuses the same grant
+for a second output with every other FD slot reserved. Reserved control work
+runs during physical waits while ordinary capacity stays occupied. Explicit
+physical abandonment waits for accepted IO before discarding and releasing its
+grant.
+
+This supplies owning physical completion and the metadata handoff. Retained final
+block production, prepaid run/output construction, cold-write cache policy and
+manifest/close adoption still need implementation before the full default path
+is admitted. Remaining teardown, completion/history relief, provider/legacy
+adoption and default-gate evidence remain open. Full GNU qualification remains
+waived and the full design is incomplete.

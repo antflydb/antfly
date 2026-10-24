@@ -327,6 +327,7 @@ pub const SyncOperation = struct {
 /// File-size validation and decoding belong on admitted caller CPU.
 pub const ControlFileResult = struct { file_size: u64, bytes: []const u8 };
 pub const max_control_file_bytes: usize = 4096;
+pub const max_atomic_write_bytes: usize = 16 * 1024;
 pub const ControlFileReadOperation = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
@@ -365,6 +366,10 @@ pub const DurabilityResources = struct {
         begin_append: ?*const fn (*anyopaque, []const u8, bool, read_admission.Port) anyerror!SyncOperation = null,
         begin_control_replace: ?*const fn (*anyopaque, []const u8, []const u8, read_admission.Port) anyerror!SyncOperation = null,
         begin_create_directory: ?*const fn (*anyopaque, []const u8, read_admission.Port) anyerror!SyncOperation = null,
+        begin_private_create: ?*const fn (*anyopaque, []const u8, []const u8, read_admission.Port) anyerror!SyncOperation = null,
+        begin_private_write: ?*const fn (*anyopaque, u64, []const u8, read_admission.Port) anyerror!SyncOperation = null,
+        begin_private_publish: ?*const fn (*anyopaque, read_admission.Port) anyerror!SyncOperation = null,
+        begin_private_discard: ?*const fn (*anyopaque, read_admission.Port) anyerror!SyncOperation = null,
     };
     const BoundaryAbi = runtime_callback_abi.Boundary(VTable);
     /// Appends the frozen bytes prepared with this grant. The caller holds
@@ -401,6 +406,28 @@ pub const DurabilityResources = struct {
     pub fn beginSyncParent(self: *DurabilityResources, path: []const u8, original: read_admission.Port) !SyncOperation {
         return BoundaryAbi.call("begin_sync", self.boundary_dispatch, self.vtable.begin_sync, .{ self.ptr, path, true, original });
     }
+    /// A private-file session exclusively owns this grant until publication or
+    /// discard completes. Parent directories already exist. The caller owns
+    /// the unique temporary name and any possibly published output obligation.
+    pub fn beginPrivateCreate(self: *DurabilityResources, path: []const u8, temporary: []const u8, original: read_admission.Port) !SyncOperation {
+        const begin = self.vtable.begin_private_create orelse return error.ExecutionWaitUnsupported;
+        return BoundaryAbi.call("begin_private_create", self.boundary_dispatch, begin, .{ self.ptr, path, temporary, original });
+    }
+    /// Copy one bounded command before dispatch. It cannot reference caller
+    /// bytes after returning, and a rejected wait must retain the operation.
+    pub fn beginPrivateWrite(self: *DurabilityResources, offset: u64, bytes: []const u8, original: read_admission.Port) !SyncOperation {
+        const begin = self.vtable.begin_private_write orelse return error.ExecutionWaitUnsupported;
+        return BoundaryAbi.call("begin_private_write", self.boundary_dispatch, begin, .{ self.ptr, offset, bytes, original });
+    }
+    pub fn beginPrivatePublish(self: *DurabilityResources, original: read_admission.Port) !SyncOperation {
+        const begin = self.vtable.begin_private_publish orelse return error.ExecutionWaitUnsupported;
+        return BoundaryAbi.call("begin_private_publish", self.boundary_dispatch, begin, .{ self.ptr, original });
+    }
+    pub fn beginPrivateDiscard(self: *DurabilityResources, original: read_admission.Port) !SyncOperation {
+        const begin = self.vtable.begin_private_discard orelse return error.ExecutionWaitUnsupported;
+        return BoundaryAbi.call("begin_private_discard", self.boundary_dispatch, begin, .{ self.ptr, original });
+    }
+
     pub fn retireWithAdmission(self: *DurabilityResources, original: read_admission.Port) !void {
         const retire = self.vtable.retire_with_admission orelse return error.ExecutionWaitUnsupported;
         try BoundaryAbi.call("retire_with_admission", self.boundary_dispatch, retire, .{ self.ptr, original });
@@ -3175,7 +3202,7 @@ fn nativeAppendResourceBytes(_: *anyopaque, len: usize) !u64 {
 
 const NativeDurabilityResources = if (!supports_native_storage or builtin.os.tag == .freestanding) struct {} else struct {
     const Phase = enum(u8) { idle, queued, completed, stopping };
-    const Kind = enum { control_read, contents, directory, append, control_replace, create_directory };
+    const Kind = enum { control_read, contents, directory, append, control_replace, create_directory, private_create, private_write, private_publish, private_discard };
     allocator: Allocator,
     permit: NativeFdPermit,
     future: std.Io.Future(void) = undefined,
@@ -3188,15 +3215,21 @@ const NativeDurabilityResources = if (!supports_native_storage or builtin.os.tag
     path_len: usize = 0,
     temporary: [std.fs.max_path_bytes]u8 = undefined,
     temporary_len: usize = 0,
-    buffer: [max_control_file_bytes]u8 = undefined,
+    buffer: [max_atomic_write_bytes]u8 = undefined,
     limit: usize = 0,
     result: ControlFileResult = .{ .file_size = 0, .bytes = &.{} },
     failure: ?anyerror = null,
     append_bytes: ?[]u8 = null,
     append_create: bool = false,
     invalidation_pending: bool = false,
+    private_owned: bool = false, // Caller only; blocks unrelated commands.
+    private_file: ?std.Io.File = null, // Worker only while an operation runs.
+    private_temporary_owned: bool = false,
+    private_final: [std.fs.max_path_bytes]u8 = undefined,
+    private_final_len: usize = 0,
+    private_offset: u64 = 0,
 
-    const vtable: DurabilityResources.VTable = .{ .begin_read = beginRead, .begin_sync = beginSync, .deinit = deinit, .retire_with_admission = retireWithAdmission, .begin_append = beginAppend, .begin_control_replace = beginControlReplace, .begin_create_directory = beginCreateDirectory };
+    const vtable: DurabilityResources.VTable = .{ .begin_read = beginRead, .begin_sync = beginSync, .deinit = deinit, .retire_with_admission = retireWithAdmission, .begin_append = beginAppend, .begin_control_replace = beginControlReplace, .begin_create_directory = beginCreateDirectory, .begin_private_create = beginPrivateCreate, .begin_private_write = beginPrivateWrite, .begin_private_publish = beginPrivatePublish, .begin_private_discard = beginPrivateDiscard };
     const sync_vtable: SyncOperation.VTable = .{ .wait_with_admission = wait, .deinit = retireOperation };
     const read_vtable: ControlFileReadOperation.VTable = .{ .wait_with_admission = waitRead, .deinit = retireOperation };
 
@@ -3247,8 +3280,10 @@ const NativeDurabilityResources = if (!supports_native_storage or builtin.os.tag
     fn prepareCommand(self: *NativeDurabilityResources, path: []const u8, kind: Kind, limit: usize, create_if_missing: bool, original: read_admission.Port) !void {
         try requireControl(original);
         if (self.active or self.joined or self.phase.load(.acquire) == .stopping) return error.ResourceBudgetExceeded;
+        const private = kind == .private_create or kind == .private_write or kind == .private_publish or kind == .private_discard;
+        if (self.private_owned and !private) return error.ResourceBudgetExceeded;
         if (path.len >= self.path.len) return error.NameTooLong;
-        if (kind == .control_read and (limit == 0 or limit > self.buffer.len)) return error.ResourceBudgetExceeded;
+        if (kind == .control_read and (limit == 0 or limit > max_control_file_bytes)) return error.ResourceBudgetExceeded;
         std.debug.assert(self.phase.load(.acquire) == .idle);
         @memcpy(self.path[0..path.len], path);
         self.path_len = path.len;
@@ -3273,7 +3308,7 @@ const NativeDurabilityResources = if (!supports_native_storage or builtin.os.tag
 
     fn beginControlReplace(raw: *anyopaque, path: []const u8, bytes: []const u8, original: read_admission.Port) !SyncOperation {
         const self: *NativeDurabilityResources = @ptrCast(@alignCast(raw));
-        if (bytes.len > self.buffer.len) return error.ResourceBudgetExceeded;
+        if (bytes.len > max_control_file_bytes) return error.ResourceBudgetExceeded;
         // Reserved to the publication owner; a stale crash temporary is safe
         // to replace under that same exclusive filesystem publication lock.
         var temporary: [std.fs.max_path_bytes]u8 = undefined;
@@ -3367,6 +3402,103 @@ const NativeDurabilityResources = if (!supports_native_storage or builtin.os.tag
         if (builtin.is_test and write_len != bytes.len) return error.NoSpaceLeft;
     }
 
+    fn beginPrivateCreate(raw: *anyopaque, path: []const u8, temporary: []const u8, original: read_admission.Port) !SyncOperation {
+        const self: *NativeDurabilityResources = @ptrCast(@alignCast(raw));
+        if (self.private_owned) return error.ResourceBudgetExceeded;
+        if (temporary.len >= self.temporary.len or std.mem.eql(u8, path, temporary)) return error.InvalidArgument;
+        // Rename must remain within the same directory/filesystem. Exclusive
+        // creation never removes or truncates a colliding temporary object.
+        if (!std.mem.eql(u8, std.fs.path.dirname(path) orelse ".", std.fs.path.dirname(temporary) orelse ".")) return error.InvalidArgument;
+        try self.prepareCommand(path, .private_create, 0, false, original);
+        @memcpy(self.private_final[0..path.len], path);
+        self.private_final_len = path.len;
+        @memcpy(self.temporary[0..temporary.len], temporary);
+        self.temporary_len = temporary.len;
+        self.private_owned = true;
+        self.submit();
+        return .{ .ptr = self, .vtable = &sync_vtable };
+    }
+
+    fn preparePrivate(self: *NativeDurabilityResources, kind: Kind, original: read_admission.Port) !void {
+        if (!self.private_owned) return error.ResourceBudgetExceeded;
+        try self.prepareCommand(self.private_final[0..self.private_final_len], kind, 0, false, original);
+    }
+
+    fn beginPrivateWrite(raw: *anyopaque, offset: u64, bytes: []const u8, original: read_admission.Port) !SyncOperation {
+        const self: *NativeDurabilityResources = @ptrCast(@alignCast(raw));
+        if (bytes.len > max_atomic_write_bytes) return error.ResourceBudgetExceeded;
+        try self.preparePrivate(.private_write, original);
+        @memcpy(self.buffer[0..bytes.len], bytes);
+        self.limit = bytes.len;
+        self.private_offset = offset;
+        self.submit();
+        return .{ .ptr = self, .vtable = &sync_vtable };
+    }
+
+    fn beginPrivatePublish(raw: *anyopaque, original: read_admission.Port) !SyncOperation {
+        const self: *NativeDurabilityResources = @ptrCast(@alignCast(raw));
+        if (!self.private_owned) return error.ResourceBudgetExceeded;
+        try self.permit.cache.fencePathRetainingEntries(self.permit.state.cache_namespace, self.permit.io, self.private_final[0..self.private_final_len], original);
+        try self.preparePrivate(.private_publish, original);
+        self.invalidation_pending = true;
+        self.submit();
+        return .{ .ptr = self, .vtable = &sync_vtable };
+    }
+
+    fn beginPrivateDiscard(raw: *anyopaque, original: read_admission.Port) !SyncOperation {
+        const self: *NativeDurabilityResources = @ptrCast(@alignCast(raw));
+        try self.preparePrivate(.private_discard, original);
+        self.submit();
+        return .{ .ptr = self, .vtable = &sync_vtable };
+    }
+
+    fn createPrivate(self: *NativeDurabilityResources) !void {
+        std.debug.assert(self.private_file == null and !self.private_temporary_owned);
+        self.private_file = try openFilePathForWriteWithIo(self.permit.io, self.temporary[0..self.temporary_len], .{ .exclusive = true });
+        self.private_temporary_owned = true;
+    }
+
+    fn writePrivate(self: *NativeDurabilityResources) !void {
+        const file = self.private_file orelse return error.InvalidArgument;
+        var writer = file.writer(self.permit.io, &.{});
+        writer.seekTo(self.private_offset) catch |cause| return writer.err orelse cause;
+        const n = if (builtin.is_test) @min(self.limit, NativeSyncTestControl.append_failure_after.load(.acquire)) else self.limit;
+        writer.interface.writeAll(self.buffer[0..n]) catch |cause| return writer.err orelse cause;
+        // end() sets file length to this write's position, which would
+        // truncate data after an in-place header/backpatch command.
+        writer.interface.flush() catch |cause| return writer.err orelse cause;
+        if (n != self.limit) return error.NoSpaceLeft;
+    }
+
+    fn publishPrivate(self: *NativeDurabilityResources) !void {
+        const io = self.permit.io;
+        const file = self.private_file orelse return error.InvalidArgument;
+        try file.sync(io);
+        file.close(io);
+        self.private_file = null;
+        // Transfer the still-reserved descriptor slot to directory sync.
+        // No new application admission or worker dispatch occurs here.
+        const final = self.private_final[0..self.private_final_len];
+        try std.Io.Dir.cwd().rename(self.temporary[0..self.temporary_len], std.Io.Dir.cwd(), final, io);
+        self.private_temporary_owned = false; // Commit rename before failure.
+        if (builtin.is_test and NativeSyncTestControl.control_failure_after_rename.load(.acquire)) return error.InputOutput;
+        try fs_paths.syncDirPortable(io, std.fs.path.dirname(final) orelse ".");
+    }
+
+    fn discardPrivate(self: *NativeDurabilityResources) !void {
+        if (self.private_file) |file| {
+            file.close(self.permit.io);
+            self.private_file = null;
+        }
+        if (self.private_temporary_owned) {
+            deleteFilePathWithIo(self.permit.io, self.temporary[0..self.temporary_len]) catch |cause| {
+                if (cause != error.FileNotFound) return cause;
+            };
+            self.private_temporary_owned = false;
+        }
+        // A possibly renamed destination is never removed by abandonment.
+    }
+
     fn run(self: *NativeDurabilityResources) void {
         const io = self.permit.io;
         while (true) {
@@ -3389,7 +3521,7 @@ const NativeDurabilityResources = if (!supports_native_storage or builtin.os.tag
             if (builtin.is_test) {
                 if (self.kind == .append) {
                     _ = NativeSyncTestControl.appends.fetchAdd(1, .release);
-                } else if (self.kind == .control_replace or self.kind == .create_directory) {
+                } else if (self.kind == .control_replace or self.kind == .create_directory or self.kind == .private_create or self.kind == .private_write or self.kind == .private_publish or self.kind == .private_discard) {
                     _ = NativeSyncTestControl.metadata.fetchAdd(1, .release);
                 } else NativeSyncTestControl.observe(self.kind == .control_read, path);
             }
@@ -3400,6 +3532,10 @@ const NativeDurabilityResources = if (!supports_native_storage or builtin.os.tag
                 .append => self.appendPrepared(path),
                 .control_replace => self.replaceControl(path),
                 .create_directory => self.createDirectory(path),
+                .private_create => self.createPrivate(),
+                .private_write => self.writePrivate(),
+                .private_publish => self.publishPrivate(),
+                .private_discard => self.discardPrivate(),
             };
             result catch |cause| {
                 self.failure = cause;
@@ -3456,6 +3592,7 @@ const NativeDurabilityResources = if (!supports_native_storage or builtin.os.tag
             self.permit.cache.fencePathRetainingEntries(self.permit.state.cache_namespace, self.permit.io, self.path[0..self.path_len], null) catch unreachable;
             self.invalidation_pending = false;
         }
+        if ((self.kind == .private_publish or self.kind == .private_discard) and self.failure == null) self.private_owned = false;
         self.active = false;
         self.phase.store(.idle, .release);
     }
@@ -3463,7 +3600,7 @@ const NativeDurabilityResources = if (!supports_native_storage or builtin.os.tag
     fn retireWithAdmission(raw: *anyopaque, original: read_admission.Port) !void {
         const self: *NativeDurabilityResources = @ptrCast(@alignCast(raw));
         try requireControl(original);
-        if (self.active) return error.ResourceBudgetExceeded;
+        if (self.active or self.private_owned) return error.ResourceBudgetExceeded;
         self.phase.store(.stopping, .release);
         self.wake.set(self.permit.io);
         if (!self.joined) {
@@ -3491,6 +3628,16 @@ const NativeDurabilityResources = if (!supports_native_storage or builtin.os.tag
     fn deinit(raw: *anyopaque) void {
         const self: *NativeDurabilityResources = @ptrCast(@alignCast(raw));
         if (self.active) retireOperation(self);
+        if (self.private_owned) {
+            // Explicit mandatory fallback uses the admitted worker too. It
+            // never publishes unfinished output or deletes a renamed target.
+            self.kind = .private_discard;
+            self.failure = null;
+            self.submit();
+            while (self.phase.load(.acquire) != .completed)
+                self.permit.io.sleep(.fromMilliseconds(1), .awake) catch {};
+            self.private_owned = false;
+        }
         self.phase.store(.stopping, .release);
         self.wake.set(self.permit.io);
         if (!self.joined) self.future.await(self.permit.io);

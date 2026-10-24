@@ -113,7 +113,8 @@ const builtin = @import("builtin");
 // Final status owns manifest admission, frozen append resources and retry-safe publication.
 // Close retains tentative durability grants and empty-status sync through admitted retirement.
 // Close reclaims retired memory in original CPU quanta before persistence.
-pub const abi_version: u32 = 109;
+// Durability grants own private file writes, publication and discard.
+pub const abi_version: u32 = 110;
 
 pub const zig_compiler_id: u64 = stableId(builtin.zig_version_string);
 

@@ -55,7 +55,8 @@ const failure_abi = @import("runtime_failure_abi");
 // Final status owns manifest admission, frozen append resources and retry-safe publication.
 // Close retains tentative durability grants and empty-status sync through admitted retirement.
 // Close reclaims retired memory in original CPU quanta before persistence.
-pub const abi_version: u32 = 169;
+// Durability grants own private file writes, publication and discard.
+pub const abi_version: u32 = 170;
 pub const Status = failure_abi.Status;
 pub const FailureBoundary = failure_abi.FailureBoundary;
 pub const FailureIdentity = failure_abi.FailureIdentity;
