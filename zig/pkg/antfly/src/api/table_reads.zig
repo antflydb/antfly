@@ -9513,6 +9513,8 @@ const searchRequestHasUnserializableResolvedDocFilter = local_query_contract.sea
 
 const graphHydrateRequestHasResolvedDocFilter = local_query_contract.graphHydrateRequestHasResolvedDocFilter;
 
+const bindDocumentAuthorityToGroup = local_query_contract.bindDocumentAuthorityToGroup;
+
 /// Single-group graph queries execute locally against a snapshot that holds
 /// the graph index's complete row set: mark the request so the storage graph
 /// executors may expand THROUGH cross-table tagged nodes (entity-sourced
@@ -15812,7 +15814,7 @@ fn queryResponseRemote(
     table_name: []const u8,
     input: db_mod.types.SearchRequest,
 ) !query_api.QueryResponse {
-    var req = input;
+    var req = try bindDocumentAuthorityToGroup(input, group_id);
     if (req.native_query_cut) |cut| if (cut.create) {
         req.native_query_cut = try cut.forGroup(group_id);
     };
@@ -27304,6 +27306,7 @@ pub const document_hydration_tests = if (builtin.is_test) struct {
         var parsed = try query_contract.parseQueryRequest(a, null, "docs", body);
         defer parsed.deinit(a);
         try std.testing.expectEqual(.lookup, parsed.req.document_authority_mode);
+        try std.testing.expect(parsed.req.query == .match_all and parsed.req.full_text == null);
         try std.testing.expect(parsed.req.include_stored and parsed.req.include_all_fields and parsed.req.filter_doc_ids_positive);
         try std.testing.expectEqual(@as(usize, 2), parsed.req.filter_doc_ids.len);
         for (request.filter_doc_ids, parsed.req.filter_doc_ids) |expected, actual| try std.testing.expectEqualStrings(expected, actual);
@@ -27311,6 +27314,23 @@ pub const document_hydration_tests = if (builtin.is_test) struct {
         try std.testing.expectEqual(.lookup, shard.document_authority_mode);
         try std.testing.expect(shard.include_stored);
         try std.testing.expectError(error.InvalidQueryRequest, query_contract.parsePublicQueryRequest(a, null, "docs", body));
+        const Remote = struct {
+            fn execute(_: *anyopaque, alloc: std.mem.Allocator, http_request: http_common.HttpRequest) !http_common.HttpResponse {
+                var forwarded = try query_contract.parseQueryRequest(alloc, null, "docs", http_request.body);
+                defer forwarded.deinit(alloc);
+                try std.testing.expectEqual(@as(u64, 11), forwarded.req.document_authority_group);
+                try std.testing.expectEqual(.lookup, forwarded.req.document_authority_mode);
+                try std.testing.expect(forwarded.req.query == .match_all and forwarded.req.full_text == null);
+                return .{ .status = 200, .headers = &.{}, .body = try alloc.dupe(u8, "{}") };
+            }
+        };
+        var context: u8 = 0;
+        const transport: http_common.RequestExecutor = .{ .ptr = &context, .vtable = &.{ .execute = Remote.execute } };
+        var unscoped = request;
+        unscoped.document_authority_group = 0;
+        var remote = try queryResponseRemote(transport, a, "http://native.test", 11, "docs", unscoped);
+        defer remote.deinit(a);
+        try std.testing.expectError(error.InvalidQueryRequest, queryResponseRemote(transport, a, "http://native.test", 12, "docs", request));
     }
 
     test "public graph metric borrowed wire document authority private controls roundtrip and public admission rejects them" {
