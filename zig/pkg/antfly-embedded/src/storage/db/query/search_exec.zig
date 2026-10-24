@@ -682,6 +682,8 @@ pub const MatchAllExecutor = struct {
 
 pub const MatchAllCandidateCollector = struct {
     ctx: ?*anyopaque,
+    // Point enumeration must retain the physical owner range of an identity scan.
+    primary_key_range: types.ByteRange = .{ .start = "", .end = "" },
     /// Snapshot-pinned row providers stream public identities directly.
     scan_ids_ctx: ?*anyopaque = null,
     scan_ids: ?*const fn (?*anyopaque, Allocator, MatchAllCandidateCollectOptions, ?*anyopaque, *const fn (?*anyopaque, []const u8) anyerror!docstore_mod.DocStore.ScanAction) anyerror!void = null,
@@ -18913,6 +18915,34 @@ fn collectMatchAllCandidateStateWithOptions(
         state.constraint_membership = try NativeDocIdConstraintMembership.initAlloc(alloc, constraints);
     }
 
+    // A bounded positive document set is already a complete candidate source.
+    // Route-level exact-ID hydration must never fall through to a primary scan.
+    // Probe existence through the same generation-aware directory and retain
+    // the ordinary expiry, membership, bounds and consumer admission below.
+    if (req.filter_doc_ids_positive and req.filter_doc_ids.len <= 256 and collector.lookup_doc_ordinal != null) {
+        const ids = try alloc.dupe([]const u8, req.filter_doc_ids);
+        defer alloc.free(ids);
+        std.mem.sort([]const u8, ids, {}, struct {
+            fn less(_: void, a: []const u8, b: []const u8) bool {
+                return std.mem.lessThan(u8, a, b);
+            }
+        }.less);
+        if (options.primary_key_reverse) std.mem.reverse([]const u8, ids);
+        for (ids) |id| {
+            try checkSearchRequestDeadline(req);
+            if (!collector.primary_key_range.contains(id)) continue;
+            if (options.primary_key_start_after) |after| if (!std.mem.lessThan(u8, after, id)) continue;
+            if (options.primary_key_stop_before) |before| if (!std.mem.lessThan(u8, id, before)) continue;
+            if (try collector.lookup_doc_ordinal.?(collector.ctx, alloc, id, req.identity_read_generation) == null) continue;
+            try state.consumeRawKey(try alloc.dupe(u8, id));
+            if (state.shouldStopAfterAccepted()) {
+                state.stopped_early = true;
+                break;
+            }
+        }
+        return state;
+    }
+
     if (collector.scan_ids) |scan| {
         const Visitor = struct {
             fn visit(raw: ?*anyopaque, id: []const u8) anyerror!docstore_mod.DocStore.ScanAction {
@@ -35887,4 +35917,49 @@ test "logical value borrowed sorted candidates retain local pins masks and globa
     state.fail_second = true;
     try std.testing.expectError(error.TestReadFailure, buildSortedSegmentDocMembershipAlloc(a, writer.snapshot(), filter, .{}));
     try std.testing.expectEqual(@as(usize, 0), state.active);
+}
+
+test "native memory bounded exact-ID hydration never scans and respects generation expiry dedup and bounds" {
+    const Harness = struct {
+        probes: usize = 0,
+        fn scan(_: ?*anyopaque, _: Allocator, _: []const u8, _: []const u8) anyerror![]docstore_mod.OwnedKVPair {
+            return error.TestUnexpectedResult;
+        }
+        fn ordinal(ptr: ?*anyopaque, _: Allocator, id: []const u8, generation: ?u64) anyerror!?doc_set.DocOrdinal {
+            const self: *@This() = @ptrCast(@alignCast(ptr.?));
+            self.probes += 1;
+            try std.testing.expectEqual(@as(?u64, 37), generation);
+            if (std.mem.eql(u8, id, "missing")) return null;
+            return @intCast(id[0]);
+        }
+        fn expired(_: ?*anyopaque, _: Allocator, id: []const u8) anyerror!bool {
+            return std.mem.eql(u8, id, "b");
+        }
+    };
+    const a = std.testing.allocator;
+    var harness: Harness = .{};
+    const collector: MatchAllCandidateCollector = .{ .ctx = &harness, .scan_store_range = Harness.scan, .lookup_doc_ordinal = Harness.ordinal, .is_expired_key = Harness.expired };
+    const req: types.SearchRequest = .{ .filter_doc_ids_positive = true, .filter_doc_ids = &.{ "c", "missing", "b", "a", "c" }, .identity_read_generation = 37 };
+    var forward = try collectMatchAllCandidatesWithOptions(a, req, collector, .{});
+    defer forward.deinit(a);
+    try std.testing.expectEqual(@as(usize, 2), forward.items.len);
+    try std.testing.expectEqualStrings("a", forward.items[0].id);
+    try std.testing.expectEqualStrings("c", forward.items[1].id);
+    try std.testing.expect(harness.probes <= 2 * req.filter_doc_ids.len);
+    var reverse = try collectMatchAllCandidatesWithOptions(a, req, collector, .{ .primary_key_reverse = true, .primary_key_start_after = "a", .primary_key_stop_before = "missing" });
+    defer reverse.deinit(a);
+    try std.testing.expectEqual(@as(usize, 1), reverse.items.len);
+    try std.testing.expectEqualStrings("c", reverse.items[0].id);
+    var scoped = collector;
+    scoped.primary_key_range = .{ .start = "c", .end = "d" };
+    var owned = try collectMatchAllCandidatesWithOptions(a, req, scoped, .{});
+    defer owned.deinit(a);
+    try std.testing.expectEqual(@as(usize, 1), owned.items.len);
+    try std.testing.expectEqualStrings("c", owned.items[0].id);
+    var empty = req;
+    empty.filter_doc_ids = &.{};
+    var absent = try collectMatchAllCandidatesWithOptions(a, empty, collector, .{});
+    defer absent.deinit(a);
+    try std.testing.expectEqual(@as(usize, 0), absent.items.len);
+    try std.testing.expectError(error.QueryCandidateBudgetExceeded, collectMatchAllCandidatesWithOptions(a, req, collector, .{ .candidate_limit = 1 }));
 }

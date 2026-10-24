@@ -1424,6 +1424,14 @@ pub const AntflyApiHandler = struct {
         try public_server.post("/tables/:table_name/lake/reconcile", httpx.Handler.bind(self, reconcileLakeSource));
         const usermgr_router = usermgr_server_openapi.server.ServerRouter(AntflyApiHandler).init(self);
         try usermgr_router.register(root_server);
+        const memory_handler = httpx.Handler.bind(self, memoryRoute);
+        try root_server.post("/memory/v1/spaces", memory_handler);
+        inline for (.{ "/memory/v1/spaces/:memory_space", "/memory/v1/spaces/:memory_space/*" }) |path| {
+            try root_server.get(path, memory_handler);
+            try root_server.post(path, memory_handler);
+            try root_server.put(path, memory_handler);
+            try root_server.patch(path, memory_handler);
+        }
         if (include_contextual) {
             try self.registerContextualRoutes(root_server, include_probes);
         } else if (include_probes) {
@@ -1440,7 +1448,7 @@ pub const AntflyApiHandler = struct {
             try self.registerProbes(server);
         }
 
-        const mcp_paths = [_][]const u8{ routes.mcp_v1, routes.mcp_v1_prefix ++ "*" };
+        const mcp_paths = [_][]const u8{ routes.mcp_v1, routes.mcp_v1_prefix ++ "*", routes.memory_mcp_v1 };
         const mcp_handler = httpx.Handler.bind(self, mcpRoute);
         inline for (mcp_paths) |path| {
             try server.get(path, mcp_handler);
@@ -1814,6 +1822,57 @@ pub const AntflyApiHandler = struct {
         return ctx.response.build();
     }
 
+    fn memoryRoute(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        const module = @import("memory.zig");
+        var identity: ?AuthenticatedIdentity = null;
+        defer if (identity) |*value| value.deinit(self.api_server.alloc);
+        if (try self.authorizeRequest(ctx, &identity)) |denied| return denied;
+        var arena = std.heap.ArenaAllocator.init(ctx.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const raw_body = (try ctx.body()) orelse "{}";
+        const Create = struct { space: []const u8, config: module.memory.types.Config = .{} };
+        const creating = std.mem.eql(u8, ctx.request.uri.path, "/memory/v1/spaces");
+        const create = if (creating) std.json.parseFromSliceLeaky(Create, a, raw_body, .{}) catch |err| return memoryFailure(ctx, err) else null;
+        const selected = if (create) |input| module.Route{ .space = input.space, .action = .create } else module.route(@tagName(ctx.request.method), ctx.request.uri.path) catch |err| return memoryFailure(ctx, err);
+        const name = (try decodePathParamOrBadRequest(ctx, selected.space)) orelse return ctx.text("invalid memory space");
+        defer ctx.allocator.free(name);
+        module.memory.types.validateId(name) catch |err| return memoryFailure(ctx, err);
+        var query_body: std.json.ObjectMap = .empty;
+        if (ctx.request.method == .GET) {
+            inline for (.{ "cursor", "start", "subject", "predicate", "scope", "task", "environment", "kind", "relationship", "target_id", "missing_relationship" }) |field| if (try ctx.queryDecoded(field)) |decoded| {
+                try query_body.put(a, field, .{ .string = decoded });
+            };
+            inline for (.{ "limit", "valid_at", "known_at" }) |field| if (ctx.query(field)) |v| {
+                const number = std.fmt.parseInt(i64, v, 10) catch return memoryFailure(ctx, error.InvalidMemoryRequest);
+                try query_body.put(a, field, .{ .integer = number });
+            };
+            inline for (.{ "include_history", "include_provisional" }) |field| if (ctx.query(field)) |v| {
+                if (!std.mem.eql(u8, v, "true") and !std.mem.eql(u8, v, "false")) return memoryFailure(ctx, error.InvalidMemoryRequest);
+                try query_body.put(a, field, .{ .bool = std.mem.eql(u8, v, "true") });
+            };
+        }
+        const body = if (create) |input| try std.json.Stringify.valueAlloc(a, input.config, .{}) else if (ctx.request.method == .GET) try std.json.Stringify.valueAlloc(a, std.json.Value{ .object = query_body }, .{}) else raw_body;
+        const identifier = (try decodePathParamOrBadRequest(ctx, selected.id)) orelse return ctx.text("invalid memory id");
+        defer ctx.allocator.free(identifier);
+        var response = try self.api_server.executeMemoryService(name, .{
+            .branch = ctx.header("x-antfly-memory-branch") orelse "",
+            .database = ctx.header("x-antfly-database") orelse "default",
+            .namespace = ctx.header("x-antfly-namespace") orelse "public",
+            .action = selected.action,
+            .id = identifier,
+            .body = try std.json.parseFromSliceLeaky(std.json.Value, a, body, .{ .parse_numbers = false }),
+            .idempotency_key = ctx.header("idempotency-key") orelse "",
+        }, identity, tableMutationContext(ctx, &identity));
+        defer response.deinit(self.api_server.alloc);
+        return jsonResponse(ctx, response.status, response.body);
+    }
+
+    fn memoryFailure(ctx: *httpx.Context, err: anyerror) !httpx.Response {
+        const code = @import("memory.zig").status(err);
+        return jsonResponse(ctx, code, try std.json.Stringify.valueAlloc(ctx.allocator, .{ .code = @errorName(err), .retryable = code == 503 or code == 429, .@"error" = @errorName(err) }, .{}));
+    }
+
     fn extensionRoute(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
         var authenticated_identity: ?AuthenticatedIdentity = null;
         defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
@@ -1948,7 +2007,8 @@ pub const AntflyApiHandler = struct {
         };
         const path = ctx.request.uri.path;
         var extension_name: ?[]const u8 = null;
-        var endpoint_path: []const u8 = routes.mcp_v1;
+        const is_memory = std.mem.eql(u8, path, routes.memory_mcp_v1);
+        var endpoint_path: []const u8 = if (is_memory) routes.memory_mcp_v1 else routes.mcp_v1;
         if (std.mem.startsWith(u8, path, routes.mcp_v1_extension_profiles_prefix)) {
             const profile = path[routes.mcp_v1_extension_profiles_prefix.len..];
             if (!std.mem.eql(u8, profile, "copilot"))
@@ -1959,6 +2019,7 @@ pub const AntflyApiHandler = struct {
         }
         const body = (try ctx.body()) orelse "";
         const request = protocol_adapters.McpRequest{
+            .context = operationContext(ctx, authenticated_identity),
             .method = method,
             .endpoint_path = endpoint_path,
             .authorization = ctx.header("authorization"),
@@ -1966,9 +2027,10 @@ pub const AntflyApiHandler = struct {
             .session_id = ctx.header(mcp.session_id_header),
             .last_event_id = ctx.header(mcp.last_event_id_header),
             .body = body,
-            .context = operationContext(ctx, authenticated_identity),
         };
-        var response = if (extension_name) |name|
+        var response = if (is_memory)
+            try protocol_adapters.executeMemoryMcpRequest(self.api_server, request, authenticated_identity)
+        else if (extension_name) |name|
             try protocol_adapters.executeExtensionMcpRequest(self.api_server, request, authenticated_identity, name)
         else
             try protocol_adapters.executeMcpRequest(self.api_server, request, authenticated_identity);
@@ -11795,6 +11857,8 @@ const LookupStatusSource = struct {
 pub const SchemaUpdateStatusSource = struct {
     // Committed fixture metadata outlives a transport request allocation scope.
     schema_allocator: std.mem.Allocator,
+    memory_logical_name: ?[]const u8 = null,
+    table_name: []const u8 = "docs",
     projection_wait_calls: std.atomic.Value(u32) = .init(0),
     schema_json: ?[]const u8 = null,
     owns_schema_json: bool = false,
@@ -11813,6 +11877,30 @@ pub const SchemaUpdateStatusSource = struct {
                 .mutate_schema = mutateSchema,
                 .wait_table_projection = waitTableProjection,
             },
+        };
+    }
+
+    pub fn memoryIface(self: *@This()) http_server_mod.StatusSource {
+        return .{ .ptr = self, .vtable = &.{ .status = status, .admin_snapshot = adminSnapshot, .free_admin_snapshot = freeAdminSnapshot, .system_catalog = memoryCatalog } };
+    }
+    fn memoryCatalog(ptr: *anyopaque, a: std.mem.Allocator, _: @import("antfly_local_sources").api_operation.RequestContext, call: @import("../system_catalog/server_call.zig").Call) ![]u8 {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        const owned: system_catalog.ResolvedTable = .{ .table_id = 7, .name = self.table_name, .native_service = .memory };
+        return switch (call) {
+            .resolve => |target| std.json.Stringify.valueAlloc(a, @as(?system_catalog.ResolvedTable, if (std.mem.eql(u8, target.table, self.memory_logical_name orelse self.table_name)) owned else null), .{}),
+            .resolve_many => |request| blk: {
+                const tables = try a.alloc(?system_catalog.ResolvedTable, request.targets.len);
+                defer a.free(tables);
+                for (request.targets, tables) |target, *slot| slot.* = if (std.mem.eql(u8, target.table, self.memory_logical_name orelse self.table_name)) owned else null;
+                const names = try a.alloc(?[]const u8, request.storage_names.len);
+                defer a.free(names);
+                for (request.storage_names, names) |name, *slot| slot.* = if (std.mem.eql(u8, name, self.table_name)) self.memory_logical_name orelse self.table_name else null;
+                break :blk std.json.Stringify.valueAlloc(a, system_catalog.ResolvedMany{ .revision = 1, .tables = tables, .logical_names = names }, .{});
+            },
+            .query_definition => std.json.Stringify.valueAlloc(a, system_catalog.QueryDefinition{ .native_service = .memory, .table_id = 7, .schema_json = tables_api.default_schema_json, .read_schema_json = "", .indexes_json = tables_api.default_indexes_json }, .{}),
+            .write_validation => std.json.Stringify.valueAlloc(a, .{ .schema_json = tables_api.default_schema_json, .data_shapes = &[_]struct {}{} }, .{}),
+            .policy_publication_status => a.dupe(u8, "null"),
+            else => error.UnsupportedOperation,
         };
     }
 
@@ -11840,7 +11928,7 @@ pub const SchemaUpdateStatusSource = struct {
         const self: *@This() = @ptrCast(@alignCast(ptr));
         self.table_buf[0] = .{
             .table_id = 7,
-            .name = "docs",
+            .name = self.table_name,
             .schema_json = tables_api.effectiveSchemaJson(self.schema_json),
             .indexes_json = tables_api.default_indexes_json,
             .placement_role = "data",
@@ -22422,6 +22510,275 @@ test "SQL bounded read workers refuse insufficient waiting envelopes and unsuppo
     }
 }
 
+test "native memory HTTP validates route and space without loading a model" {
+    const a = std.testing.allocator;
+    var source = SchemaUpdateStatusSource{};
+    defer source.deinit(a);
+    var api = ApiHttpServer.init(a, .{}, source.iface(), null, null);
+    defer api.deinit();
+    var server: HttpxE2eServer = undefined;
+    try server.init(a, &api);
+    defer server.deinit();
+    var threaded = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer threaded.deinit();
+    var client = httpx.Client.initWithConfig(a, threaded.io(), .{ .keep_alive = false });
+    defer client.deinit();
+    const base = try server.baseUrl(a);
+    defer a.free(base);
+    const url = try std.fmt.allocPrint(a, "{s}/memory/v1/spaces/bad%2Fspace", .{base});
+    defer a.free(url);
+    var response = try requestWithRetry(&client, threaded.io(), .GET, url, "", &.{}, 20);
+    defer response.deinit();
+    try std.testing.expectEqual(@as(u16, 400), response.status.code);
+    try std.testing.expect(std.mem.indexOf(u8, response.body.?, "InvalidMemoryId") != null);
+    const selected = try @import("memory.zig").route("GET", "/memory/v1/spaces/team/memories/a/history");
+    try std.testing.expectEqual(@import("memory.zig").memory.Action.history, selected.action);
+}
+
+test "native memory HTTP and MCP share persistent storage and private provenance" {
+    const a = std.testing.allocator;
+    const module = @import("memory.zig");
+    var directory = try @import("antfly_local_sources").common_test_directory.TestDirectory.init("native-memory-http");
+    defer directory.cleanup();
+    var db = try db_mod.DB.open(a, directory.path(), .{ .start_optional_runtimes = false });
+    defer db.close();
+    const context: module.memory.Context = .{ .principal = "local", .admin = true, .now_ms = 1, .space = "team" };
+    var native: module.engine.Native(db_mod.DB) = .{ .db = &db, .context = context };
+    const created = try (module.memory.Service{ .backend = native.backend(), .context = context }).execute(a, .create, "", "{}", "create");
+    a.free(created);
+    var reads = table_reads.BoundTableReadSource.init("memory_team", 7001, &db, raft_mod.read_gate.alreadyReadSafeBarrier());
+    var writes = @import("antfly_source_root").antfly_sources.table_writes.BoundTableWriteSource.init("memory_team", &db);
+    var status_source = SchemaUpdateStatusSource{ .table_name = "memory_team" };
+    var api = ApiHttpServer.init(a, .{}, status_source.memoryIface(), reads.source(), writes.source());
+    defer api.deinit();
+    var server: HttpxE2eServer = undefined;
+    try server.init(a, &api);
+    defer server.deinit();
+    var threaded = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer threaded.deinit();
+    var client = httpx.Client.initWithConfig(a, threaded.io(), .{ .keep_alive = false });
+    defer client.deinit();
+    const base = try server.baseUrl(a);
+    defer a.free(base);
+    const url = try std.fmt.allocPrint(a, "{s}/memory/v1/spaces/team/observations", .{base});
+    defer a.free(url);
+    // Dynamic request bodies share #1223's iterative serializer before native
+    // typed validation. Unknown deep fields must return a normal client error.
+    var deep: std.ArrayList(u8) = .empty;
+    defer deep.deinit(a);
+    try deep.appendSlice(a, "{\"unknown\":");
+    try deep.appendNTimes(a, '[', 6000);
+    try deep.appendSlice(a, "1e100000");
+    try deep.appendNTimes(a, ']', 6000);
+    try deep.append(a, '}');
+    const deep_headers = [_][2][]const u8{ .{ "content-type", "application/json" }, .{ "idempotency-key", "deep-rejection" } };
+    var rejected_deep = try requestWithRetry(&client, threaded.io(), .POST, url, deep.items, &deep_headers, 20);
+    defer rejected_deep.deinit();
+    try std.testing.expectEqual(@as(u16, 400), rejected_deep.status.code);
+    try std.testing.expect(std.mem.indexOf(u8, rejected_deep.body.?, "UnknownField") != null);
+    const body =
+        \\{"evidence":[{"id":"e1","source_id":"note","source_version":"1","text":"Production uses Terraform","thread_id":"thread","turn_id":"turn","ordinal":0}],"entities":[{"id":"production","name":"Production","evidence":[{"id":"e1"}]}],"assertions":[{"id":"a1","subject":"production","predicate":"deploys_with","value":"Terraform","statement":"Production uses Terraform","evidence":[{"id":"e1"}]}]}
+    ;
+    const headers = [_][2][]const u8{ .{ "content-type", "application/json" }, .{ "idempotency-key", "observe" } };
+    var accepted = try requestWithRetry(&client, threaded.io(), .POST, url, body, &headers, 20);
+    defer accepted.deinit();
+    if (accepted.status.code != 200) std.debug.print("memory HTTP: {s}\n", .{accepted.body orelse ""});
+    try std.testing.expectEqual(@as(u16, 200), accepted.status.code);
+    const feed_url = try std.fmt.allocPrint(a, "{s}/memory/v1/spaces/team/changes?start=beginning&limit=16", .{base});
+    defer a.free(feed_url);
+    var feed = try requestWithRetry(&client, threaded.io(), .GET, feed_url, "", &.{}, 20);
+    defer feed.deinit();
+    try std.testing.expectEqual(@as(u16, 200), feed.status.code);
+    try std.testing.expect(std.mem.indexOf(u8, feed.body.?, "next_cursor") != null);
+    try std.testing.expect(std.mem.indexOf(u8, feed.body.?, "Production uses Terraform") == null);
+    const candidate_url = try std.fmt.allocPrint(a, "{s}/memory/v1/spaces/team/memories/a1/supersession-candidates", .{base});
+    defer a.free(candidate_url);
+    var candidates = try requestWithRetry(&client, threaded.io(), .POST, candidate_url, "{}", &.{.{ "content-type", "application/json" }}, 20);
+    defer candidates.deinit();
+    try std.testing.expectEqual(@as(u16, 200), candidates.status.code);
+    try std.testing.expect(std.mem.indexOf(u8, candidates.body.?, "semantic_discovery") != null);
+    const view_url = try std.fmt.allocPrint(a, "{s}/memory/v1/spaces/team/entities/production/view", .{base});
+    defer a.free(view_url);
+    var derived_view = try requestWithRetry(&client, threaded.io(), .POST, view_url, "{}", &.{.{ "content-type", "application/json" }}, 20);
+    defer derived_view.deinit();
+    try std.testing.expectEqual(@as(u16, 200), derived_view.status.code);
+    try std.testing.expect(std.mem.indexOf(u8, derived_view.body.?, "Production uses Terraform") != null);
+    const episode_url = try std.fmt.allocPrint(a, "{s}/memory/v1/spaces/team/episodes/thread?known_at=0", .{base});
+    defer a.free(episode_url);
+    var before_episode = try requestWithRetry(&client, threaded.io(), .GET, episode_url, "", &.{}, 20);
+    defer before_episode.deinit();
+    try std.testing.expectEqual(@as(u16, 404), before_episode.status.code);
+    const current_episode_url = try std.fmt.allocPrint(a, "{s}/memory/v1/spaces/team/episodes/thread?limit=1", .{base});
+    defer a.free(current_episode_url);
+    var current_episode = try requestWithRetry(&client, threaded.io(), .GET, current_episode_url, "", &.{}, 20);
+    defer current_episode.deinit();
+    try std.testing.expectEqual(@as(u16, 200), current_episode.status.code);
+    try std.testing.expect(std.mem.indexOf(u8, current_episode.body.?, "Production uses Terraform") != null);
+    const outcome_url = try std.fmt.allocPrint(a, "{s}/memory/v1/spaces/team/outcomes", .{base});
+    defer a.free(outcome_url);
+    const feedback =
+        \\{"id":"feedback","task_id":"deployment","success":true,"used_memory_ids":["a1"],"detail":"Deployment succeeded"}
+    ;
+    const outcome_headers = [_][2][]const u8{ .{ "content-type", "application/json" }, .{ "idempotency-key", "feedback" } };
+    var recorded = try requestWithRetry(&client, threaded.io(), .POST, outcome_url, feedback, &outcome_headers, 20);
+    defer recorded.deinit();
+    try std.testing.expectEqual(@as(u16, 200), recorded.status.code);
+    const changed_feedback =
+        \\{"id":"feedback","task_id":"deployment","success":false,"used_memory_ids":["a1"],"detail":"Changed result"}
+    ;
+    const changed_headers = [_][2][]const u8{ .{ "content-type", "application/json" }, .{ "idempotency-key", "changed-feedback" } };
+    var conflict = try requestWithRetry(&client, threaded.io(), .POST, outcome_url, changed_feedback, &changed_headers, 20);
+    defer conflict.deinit();
+    try std.testing.expectEqual(@as(u16, 409), conflict.status.code);
+    try std.testing.expect(std.mem.indexOf(u8, conflict.body.?, "MemoryOutcomeConflict") != null);
+    const retry_headers = [_][2][]const u8{ .{ "content-type", "application/json" }, .{ "idempotency-key", "retry-feedback" } };
+    var retried = try requestWithRetry(&client, threaded.io(), .POST, outcome_url, feedback, &retry_headers, 20);
+    defer retried.deinit();
+    try std.testing.expectEqual(@as(u16, 200), retried.status.code);
+    var visible = try api.executeMemoryService("team", .{ .action = .get, .id = "a1" }, null, .{});
+    defer visible.deinit(a);
+    try std.testing.expectEqual(@as(u16, 200), visible.status);
+    try std.testing.expect(std.mem.indexOf(u8, visible.body, "Production uses Terraform") != null);
+    var initialized = try @import("protocol_adapters.zig").executeMemoryMcpRequest(&api, .{
+        .method = .post,
+        .endpoint_path = "/memory/v1/mcp",
+        .body = "{\"jsonrpc\":\"2.0\",\"id\":0,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2025-06-18\",\"capabilities\":{},\"clientInfo\":{\"name\":\"memory-test\",\"version\":\"1\"}}}",
+    }, @as(?AuthenticatedIdentity, null));
+    defer initialized.deinit(a);
+    const session_id = for (initialized.headers) |header| {
+        if (std.ascii.eqlIgnoreCase(header.name, "mcp-session-id")) break header.value;
+    } else return error.TestExpectedEqual;
+    var mcp_response = try @import("protocol_adapters.zig").executeMemoryMcpRequest(&api, .{
+        .method = .post,
+        .endpoint_path = "/memory/v1/mcp",
+        .session_id = session_id,
+        .body = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"memory_get\",\"arguments\":{\"space\":\"team\",\"id\":\"a1\"}}}",
+    }, @as(?AuthenticatedIdentity, null));
+    defer mcp_response.deinit(a);
+    try std.testing.expectEqual(@as(u16, 200), mcp_response.status);
+    try std.testing.expect(std.mem.indexOf(u8, mcp_response.body, "Production uses Terraform") != null);
+    var mcp_feed = try @import("protocol_adapters.zig").executeMemoryMcpRequest(&api, .{
+        .method = .post,
+        .endpoint_path = "/memory/v1/mcp",
+        .session_id = session_id,
+        .body = "{\"jsonrpc\":\"2.0\",\"id\":20,\"method\":\"tools/call\",\"params\":{\"name\":\"memory_changes\",\"arguments\":{\"space\":\"team\",\"body\":{\"start\":\"beginning\",\"limit\":16}}}}",
+    }, @as(?AuthenticatedIdentity, null));
+    defer mcp_feed.deinit(a);
+    try std.testing.expectEqual(@as(u16, 200), mcp_feed.status);
+    try std.testing.expect(std.mem.indexOf(u8, mcp_feed.body, "next_cursor") != null);
+    var graph_recalled = try @import("protocol_adapters.zig").executeMemoryMcpRequest(&api, .{
+        .method = .post,
+        .endpoint_path = "/memory/v1/mcp",
+        .session_id = session_id,
+        .body =
+        \\{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"memory_recall","arguments":{"space":"team","body":{"graph":{"entity_seeds":["production"]},"token_budget":8192}}}}
+        ,
+    }, @as(?AuthenticatedIdentity, null));
+    defer graph_recalled.deinit(a);
+    try std.testing.expectEqual(@as(u16, 200), graph_recalled.status);
+    try std.testing.expect(std.mem.indexOf(u8, graph_recalled.body, "Production uses Terraform") != null);
+    try std.testing.expect(std.mem.indexOf(u8, graph_recalled.body, "personalized_pagerank") != null);
+    // Verify exact integer-valued decimal tokens through the actual MCP
+    // ingress and the native policy, rather than only the tool adapter.
+    var exact_observation = try @import("protocol_adapters.zig").executeMemoryMcpRequest(&api, .{
+        .method = .post,
+        .endpoint_path = "/memory/v1/mcp",
+        .session_id = session_id,
+        .body =
+        \\{"jsonrpc":"2.0","id":9007199254740993.0,"method":"tools/call","params":{"name":"memory_assertions","arguments":{"space":"team","idempotency_key":"exact-mcp","body":{"assertions":[{"id":"exact","subject":"counter","predicate":"value","value":"Exact","statement":"Exact business boundary","valid_from":9007199254740993.0,"evidence":[{"id":"e1"}]}]}}}}
+        ,
+    }, @as(?AuthenticatedIdentity, null));
+    defer exact_observation.deinit(a);
+    try std.testing.expectEqual(@as(u16, 200), exact_observation.status);
+    try std.testing.expect(std.mem.indexOf(u8, exact_observation.body, "9007199254740993.0") != null);
+    var exact = try api.executeMemoryService("team", .{ .action = .get, .id = "exact" }, null, .{});
+    defer exact.deinit(a);
+    try std.testing.expectEqual(@as(u16, 200), exact.status);
+    const exact_record = try std.json.parseFromSlice(@import("memory.zig").memory.types.StoredAssertion, a, exact.body, .{});
+    defer exact_record.deinit();
+    try std.testing.expectEqual(@as(i64, 9007199254740993), exact_record.value.assertion.valid_from.?);
+    const explain_url = try std.fmt.allocPrint(a, "{s}/memory/v1/spaces/team/memories/a1/explain", .{base});
+    defer a.free(explain_url);
+    const explain_headers = [_][2][]const u8{.{ "content-type", "application/json" }};
+    var explanation = try requestWithRetry(&client, threaded.io(), .POST, explain_url, "{}", &explain_headers, 20);
+    defer explanation.deinit();
+    try std.testing.expectEqual(@as(u16, 200), explanation.status.code);
+    try std.testing.expect(std.mem.indexOf(u8, explanation.body.?, "supported_by") != null);
+    try std.testing.expect(std.mem.indexOf(u8, explanation.body.?, "authenticated") != null);
+    const permission = [_]usermgr.Permission{.{ .resource_type = .table, .resource = @constCast("memory_team"), .type = .read }};
+    const bob: AuthenticatedIdentity = .{ .username = @constCast("bob"), .permissions = @constCast(&permission) };
+    var denied = try api.executeMemoryService("team", .{ .action = .get, .id = "a1" }, bob, .{});
+    defer denied.deinit(a);
+    try std.testing.expectEqual(@as(u16, 403), denied.status);
+    const foreign: module.memory.types.provenance.Resource = .{ .table = "business", .table_id = 7, .kind = .record, .id = "PRIVATE_ROW", .revision = 1 };
+    const foreign_body = try std.json.Stringify.valueAlloc(a, .{ .resource = foreign }, .{});
+    defer a.free(foreign_body);
+    const native_authority = struct {
+        fn allowed(_: *const anyopaque, _: []const u8) bool {
+            return true;
+        }
+    };
+    var foreign_parsed = try std.json.parseFromSlice(std.json.Value, a, foreign_body, .{});
+    defer foreign_parsed.deinit();
+    var foreign_denied = try api.executeMemoryService("team", .{ .action = .explain, .body = foreign_parsed.value }, bob, .{ .table_read_authorization = .{ .ptr = &bob, .allows = native_authority.allowed } });
+    defer foreign_denied.deinit(a);
+    try std.testing.expectEqual(@as(u16, 403), foreign_denied.status);
+    // Table grants never grant raw access to native service storage.
+    // This path used to bypass memory's private provenance checks entirely.
+    var raw_document = try api.executeMcpApplicationOperation(.{ .get_document = .{ .table_name = "memory_team", .key = "a1" } }, bob);
+    defer raw_document.deinit(a);
+    try std.testing.expectEqual(@as(u16, 403), raw_document.status);
+    try std.testing.expect(std.mem.indexOf(u8, raw_document.body, "Production uses Terraform") == null);
+    // Deferred configuration retains its original admin requirement after a
+    // creator is downgraded to read/write. Both ingress and policy must agree.
+    var auth_arena = std.heap.ArenaAllocator.init(a);
+    defer auth_arena.deinit();
+    const aa = auth_arena.allocator();
+    var inspected = try api.executeMemoryService("team", .{ .action = .inspect }, null, .{});
+    defer inspected.deinit(a);
+    const inspection = try std.json.parseFromSliceLeaky(@import("memory.zig").memory.types.Inspection, aa, inspected.body, .{});
+    const config: @import("memory.zig").memory.types.Config = .{ .features = .{ .semantic_recall = true }, .models = .{ .embedder = .{ .provider = "external", .model = "new-space", .revision = "v2", .dimensions = 2 } } };
+    const config_body = try std.json.Stringify.valueAlloc(aa, .{ .expected_revision = inspection.state.revision, .config = config }, .{});
+    var configuring = try api.executeMemoryService("team", .{ .action = .configure, .body = try std.json.parseFromSliceLeaky(std.json.Value, aa, config_body, .{}), .idempotency_key = "configure-external" }, null, .{});
+    defer configuring.deinit(a);
+    try std.testing.expectEqual(@as(u16, 200), configuring.status);
+    const pending = try std.json.parseFromSliceLeaky(@import("memory.zig").memory.types.OperationStatus, aa, configuring.body, .{});
+    const downgraded_permissions = [_]usermgr.Permission{
+        .{ .resource_type = .table, .resource = @constCast("memory_team"), .type = .read },
+        .{ .resource_type = .table, .resource = @constCast("memory_team"), .type = .write },
+    };
+    const downgraded: AuthenticatedIdentity = .{ .username = @constCast("local"), .permissions = @constCast(&downgraded_permissions) };
+    var revoked_advance = try api.executeMemoryService("team", .{ .action = .advance, .id = pending.id, .idempotency_key = "revoked-admin-advance" }, downgraded, .{});
+    defer revoked_advance.deinit(a);
+    try std.testing.expectEqual(@as(u16, 403), revoked_advance.status);
+    var still_serving = try api.executeMemoryService("team", .{ .action = .inspect }, null, .{});
+    defer still_serving.deinit(a);
+    const after = try std.json.parseFromSliceLeaky(@import("memory.zig").memory.types.Inspection, aa, still_serving.body, .{});
+    try std.testing.expect(!after.state.config.features.semantic_recall and after.state.pending_config != null);
+    var forget_arena = std.heap.ArenaAllocator.init(a);
+    defer forget_arena.deinit();
+    var forgotten = try api.executeMemoryService("team", .{ .action = .forget, .body = try std.json.parseFromSliceLeaky(std.json.Value, forget_arena.allocator(), "{\"evidence_ids\":[\"e1\"]}", .{}), .idempotency_key = "forget" }, null, .{});
+    defer forgotten.deinit(a);
+    try std.testing.expectEqual(@as(u16, 200), forgotten.status);
+    var hidden = try api.executeMemoryService("team", .{ .action = .get, .id = "a1" }, null, .{});
+    defer hidden.deinit(a);
+    try std.testing.expectEqual(@as(u16, 404), hidden.status);
+}
+
+test "native memory catalog ownership denies generic and batched data admission" {
+    const a = std.testing.allocator;
+    var fixture: SchemaUpdateStatusSource = .{ .table_name = "memory_team" };
+    const source = fixture.memoryIface();
+    try std.testing.expectError(error.Forbidden, source.systemCatalog(a, .{}, .{ .resolve = .{ .table = "memory_team" } }));
+    try std.testing.expectError(error.Forbidden, source.systemCatalog(a, .{}, .{ .resolve_many = .{ .targets = &.{.{ .table = "memory_team" }} } }));
+    try std.testing.expectError(error.Forbidden, source.systemCatalog(a, .{}, .{ .query_definition = "memory_team" }));
+    try std.testing.expectError(error.Forbidden, source.systemCatalog(a, .{}, .{ .native_memory_create = .{ .mutation = .{ .action = .create, .kind = .table, .name = "memory_other" } } }));
+    try std.testing.expectError(error.Forbidden, source.systemCatalog(a, .{}, .{ .mutate = .{ .mutation = .{ .action = .create, .kind = .table, .name = "memory_other", .native_service = .memory } } }));
+    const native = try source.systemCatalog(a, .{ .native_service = .memory }, .{ .resolve = .{ .table = "memory_team" } });
+    defer a.free(native);
+    try std.testing.expect(std.mem.indexOf(u8, native, "\"native_service\":\"memory\"") != null);
+}
+
 test "httpx inference gateway session owner reserves before upstream creation and releases failures" {
     const Target = struct {
         calls: usize = 0,
@@ -22591,6 +22948,191 @@ test "resolver curation HTTP destination checks ignore opaque control metadata" 
     try std.testing.expect(try graphResolverDestinationsAllowedInConfig(null, payload));
     const actual = try std.json.parseFromSliceLeaky(std.json.Value, a, "{\"graph\":{\"resolvers\":false}}", .{});
     try std.testing.expectError(error.InvalidCreateTableRequest, graphResolverDestinationsAllowedInConfig(null, actual));
+}
+
+test "native memory dedicated MCP and HTTP authorize scoped credentials across catalog aliases" {
+    const a = std.testing.allocator;
+    const module = @import("memory.zig");
+    var auth = try initTestAuthManager(a);
+    try bindTestAuthManager(a, &auth);
+    defer auth.manager.deinit();
+    defer auth.policy_store.deinit();
+    defer auth.store.deinit();
+    var grant = try usermgr.Permission.initOwned(a, .table, "memory_team", .admin);
+    defer grant.deinit(a);
+    var alice = try auth.manager.createUser("memory_alice", "secret", &.{grant});
+    defer alice.deinit(a);
+    var read_grant = try usermgr.Permission.initOwned(a, .table, "memory_team", .read);
+    defer read_grant.deinit(a);
+    var bob = try auth.manager.createUser("memory_bob", "secret", &.{read_grant});
+    defer bob.deinit(a);
+    var curator_grant = try usermgr.Permission.initOwned(a, .table, "memory_team", .curator);
+    defer curator_grant.deinit(a);
+    var curator_user = try auth.manager.createUser("memory_curator", "secret", &.{curator_grant});
+    defer curator_user.deinit(a);
+    const curator_authorization = try encodeBasicAuthorization(a, "memory_curator", "secret");
+    defer a.free(curator_authorization);
+    const authorization = try encodeBasicAuthorization(a, "memory_alice", "secret");
+    defer a.free(authorization);
+    const read_authorization = try encodeBasicAuthorization(a, "memory_bob", "secret");
+    defer a.free(read_authorization);
+    var directory = try @import("antfly_local_sources").common_test_directory.TestDirectory.init("memory-mcp-scoped");
+    defer directory.cleanup();
+    var db = try db_mod.DB.open(a, directory.path(), .{ .start_optional_runtimes = false });
+    defer db.close();
+    const context: module.memory.Context = .{ .table_id = 7, .principal = "memory_alice", .admin = true, .now_ms = 1, .space = "team" };
+    var native: module.engine.Native(db_mod.DB) = .{ .db = &db, .context = context };
+    a.free(try (module.memory.Service{ .backend = native.backend(), .context = context }).execute(a, .create, "", "{}", "create"));
+    const physical = "table:0123456789abcdef0123456789abcdef";
+    var reads = table_reads.BoundTableReadSource.init(physical, 7001, &db, raft_mod.read_gate.alreadyReadSafeBarrier());
+    var writes = @import("antfly_source_root").antfly_sources.table_writes.BoundTableWriteSource.init(physical, &db);
+    var source: SchemaUpdateStatusSource = .{ .table_name = physical, .memory_logical_name = "memory_team" };
+    var api = ApiHttpServer.init(a, .{ .auth_enabled = true, .user_manager = &auth.manager }, source.memoryIface(), reads.source(), writes.source());
+    defer api.deinit();
+    var server: HttpxE2eServer = undefined;
+    try server.init(a, &api);
+    defer server.deinit();
+    var io = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io.deinit();
+    var client = httpx.Client.initWithConfig(a, io.io(), .{ .keep_alive = false });
+    defer client.deinit();
+    const base = try server.baseUrl(a);
+    defer a.free(base);
+    const memory_url = try std.fmt.allocPrint(a, "{s}/memory/v1/mcp", .{base});
+    defer a.free(memory_url);
+    const database_url = try std.fmt.allocPrint(a, "{s}/mcp/v1", .{base});
+    defer a.free(database_url);
+    const inspect_url = try std.fmt.allocPrint(a, "{s}/memory/v1/spaces/team", .{base});
+    defer a.free(inspect_url);
+    const headers = [_][2][]const u8{ .{ "authorization", authorization }, .{ "content-type", "application/json" } };
+    var inspected = try requestWithRetry(&client, io.io(), .GET, inspect_url, "", &headers, 20);
+    defer inspected.deinit();
+    try std.testing.expectEqual(@as(u16, 200), inspected.status.code);
+    const initialize = "{\"jsonrpc\":\"2.0\",\"id\":0,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2025-06-18\",\"capabilities\":{},\"clientInfo\":{\"name\":\"test\",\"version\":\"1\"}}}";
+    var initialized = try requestWithRetry(&client, io.io(), .POST, memory_url, initialize, &headers, 20);
+    defer initialized.deinit();
+    try std.testing.expectEqual(@as(u16, 200), initialized.status.code);
+    const session = initialized.headers.get("mcp-session-id") orelse return error.TestUnexpectedResult;
+    const session_headers = [_][2][]const u8{ .{ "authorization", authorization }, .{ "content-type", "application/json" }, .{ "mcp-session-id", session } };
+    const list = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\"}";
+    var discovered = try requestWithRetry(&client, io.io(), .POST, memory_url, list, &session_headers, 20);
+    defer discovered.deinit();
+    try std.testing.expectEqual(@as(u16, 200), discovered.status.code);
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, discovered.body.?, .{ .parse_numbers = false });
+    defer parsed.deinit();
+    const tools = parsed.value.object.get("result").?.object.get("tools").?.array.items;
+    try std.testing.expectEqual(@typeInfo(module.memory.Action).@"enum".field_names.len, tools.len);
+    var assertions_schema_seen = false;
+    for (tools) |tool| {
+        const name = tool.object.get("name").?.string;
+        try std.testing.expect(std.mem.startsWith(u8, name, "memory_"));
+        if (std.mem.eql(u8, name, "memory_assertions")) {
+            const body = tool.object.get("inputSchema").?.object.get("properties").?.object.get("body").?;
+            try std.testing.expect(body.object.get("properties").?.object.contains("assertions"));
+            assertions_schema_seen = true;
+        }
+    }
+    try std.testing.expect(assertions_schema_seen);
+    // The authenticated scoped owner can mutate through the typed MCP adapter.
+    const observation =
+        \\{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"memory_observe","arguments":{"space":"team","idempotency_key":"observe","body":{"evidence":[{"id":"e1","source_id":"owner-note","source_version":"1","text":"Private owner evidence"}],"assertions":[{"id":"a1","subject":"owner","predicate":"preference","value":"private","statement":"Private owner evidence","evidence":[{"id":"e1"}]}]}}}}
+    ;
+    var observed = try requestWithRetry(&client, io.io(), .POST, memory_url, observation, &session_headers, 20);
+    defer observed.deinit();
+    try std.testing.expectEqual(@as(u16, 200), observed.status.code);
+    if (std.mem.indexOf(u8, observed.body.?, "\"isError\":true") != null) std.debug.print("memory scoped MCP observation: {s}\n", .{observed.body.?});
+    try std.testing.expect(std.mem.indexOf(u8, observed.body.?, "\"isError\":true") == null);
+    const get = "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/call\",\"params\":{\"name\":\"memory_get\",\"arguments\":{\"space\":\"team\",\"id\":\"a1\"}}}";
+    var recalled = try requestWithRetry(&client, io.io(), .POST, memory_url, get, &session_headers, 20);
+    defer recalled.deinit();
+    try std.testing.expect(std.mem.indexOf(u8, recalled.body.?, "Private owner evidence") != null);
+    // A second scoped reader cannot see private owner provenance or discover
+    // write/admin tools, even while reusing a valid transport session.
+    const reader_headers = [_][2][]const u8{ .{ "authorization", read_authorization }, .{ "content-type", "application/json" }, .{ "mcp-session-id", session } };
+    var denied = try requestWithRetry(&client, io.io(), .POST, memory_url, get, &reader_headers, 20);
+    defer denied.deinit();
+    try std.testing.expect(std.mem.indexOf(u8, denied.body.?, "Forbidden") != null);
+    try std.testing.expect(std.mem.indexOf(u8, denied.body.?, "Private owner evidence") == null);
+    var reader_tools = try requestWithRetry(&client, io.io(), .POST, memory_url, list, &reader_headers, 20);
+    defer reader_tools.deinit();
+    try std.testing.expect(std.mem.indexOf(u8, reader_tools.body.?, "memory_get") != null);
+    try std.testing.expect(std.mem.indexOf(u8, reader_tools.body.?, "memory_observe") == null);
+    // The shared curator grant is projected across the same catalog aliases.
+    const curator_headers = [_][2][]const u8{ .{ "authorization", curator_authorization }, .{ "content-type", "application/json" }, .{ "mcp-session-id", session } };
+    var curator_tools = try requestWithRetry(&client, io.io(), .POST, memory_url, list, &curator_headers, 20);
+    defer curator_tools.deinit();
+    try std.testing.expect(std.mem.indexOf(u8, curator_tools.body.?, "memory_propose_entity") != null);
+    try std.testing.expect(std.mem.indexOf(u8, curator_tools.body.?, "memory_review_entity") != null);
+    try std.testing.expect(std.mem.indexOf(u8, curator_tools.body.?, "memory_configure") == null);
+    try std.testing.expect(std.mem.indexOf(u8, curator_tools.body.?, "memory_stage_embeddings") == null);
+    const shared_observation =
+        \\{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"memory_observe","arguments":{"space":"team","idempotency_key":"shared","body":{"evidence":[{"id":"team-e","source_id":"curator-fixture","source_version":"1","text":"Antfly is AntflyDB","visibility":"team"}],"entities":[{"id":"left","name":"Antfly","visibility":"team","evidence":[{"id":"team-e"}]},{"id":"right","name":"AntflyDB","visibility":"team","evidence":[{"id":"team-e"}]}]}}}}
+    ;
+    var shared = try requestWithRetry(&client, io.io(), .POST, memory_url, shared_observation, &session_headers, 20);
+    defer shared.deinit();
+    try std.testing.expect(std.mem.indexOf(u8, shared.body.?, "\"isError\":true") == null);
+    const candidates_url = try std.fmt.allocPrint(a, "{s}/memory/v1/spaces/team/entities/left/candidates", .{base});
+    defer a.free(candidates_url);
+    var candidates = try requestWithRetry(&client, io.io(), .POST, candidates_url, "{}", &curator_headers, 20);
+    defer candidates.deinit();
+    try std.testing.expectEqual(@as(u16, 200), candidates.status.code);
+    const proposals_url = try std.fmt.allocPrint(a, "{s}/memory/v1/spaces/team/entity-proposals", .{base});
+    defer a.free(proposals_url);
+    var proposals = try requestWithRetry(&client, io.io(), .GET, proposals_url, "", &curator_headers, 20);
+    defer proposals.deinit();
+    try std.testing.expectEqual(@as(u16, 200), proposals.status.code);
+    const proposal_headers = curator_headers ++ [_][2][]const u8{.{ "idempotency-key", "curator-proposal" }};
+    var proposed = try requestWithRetry(&client, io.io(), .POST, proposals_url, "{\"expected_revision\":4,\"action\":\"merge\",\"from\":\"left\",\"to\":\"right\"}", &proposal_headers, 20);
+    defer proposed.deinit();
+    try std.testing.expectEqual(@as(u16, 200), proposed.status.code);
+    const receipt = try std.json.parseFromSlice(module.memory.types.OperationStatus, a, proposed.body.?, .{});
+    defer receipt.deinit();
+    const verdict_url = try std.fmt.allocPrint(a, "{s}/{s}/verdict", .{ proposals_url, receipt.value.proposal_id.? });
+    defer a.free(verdict_url);
+    const verdict_headers = curator_headers ++ [_][2][]const u8{.{ "idempotency-key", "curator-review" }};
+    const verdict = try std.fmt.allocPrint(a, "{{\"expected_revision\":{d},\"accept\":true}}", .{receipt.value.revision});
+    defer a.free(verdict);
+    var reviewed = try requestWithRetry(&client, io.io(), .POST, verdict_url, verdict, &verdict_headers, 20);
+    defer reviewed.deinit();
+    try std.testing.expectEqual(@as(u16, 200), reviewed.status.code);
+    inline for (.{ .{ "", httpx.Method.PATCH }, .{ "/forget", httpx.Method.POST }, .{ "/embeddings", httpx.Method.POST } }) |denied_action| {
+        const denied_url = try std.fmt.allocPrint(a, "{s}{s}", .{ inspect_url, denied_action[0] });
+        defer a.free(denied_url);
+        var forbidden = try requestWithRetry(&client, io.io(), denied_action[1], denied_url, "{}", &proposal_headers, 20);
+        defer forbidden.deinit();
+        try std.testing.expectEqual(@as(u16, 403), forbidden.status.code);
+    }
+    try auth.manager.removePermissionFromUser("memory_curator", "memory_team", .table);
+    var revoked = try requestWithRetry(&client, io.io(), .POST, verdict_url, verdict, &verdict_headers, 20);
+    defer revoked.deinit();
+    try std.testing.expectEqual(@as(u16, 403), revoked.status.code);
+    // Both endpoint catalogs and their sessions are isolated.
+    var wrong_session = try requestWithRetry(&client, io.io(), .POST, database_url, list, &session_headers, 20);
+    defer wrong_session.deinit();
+    try std.testing.expectEqual(@as(u16, 404), wrong_session.status.code);
+    var db_initialized = try requestWithRetry(&client, io.io(), .POST, database_url, initialize, &headers, 20);
+    defer db_initialized.deinit();
+    const db_session = db_initialized.headers.get("mcp-session-id") orelse return error.TestUnexpectedResult;
+    const db_headers = [_][2][]const u8{ .{ "authorization", authorization }, .{ "content-type", "application/json" }, .{ "mcp-session-id", db_session } };
+    var database_tools = try requestWithRetry(&client, io.io(), .POST, database_url, list, &db_headers, 20);
+    defer database_tools.deinit();
+    try std.testing.expect(std.mem.indexOf(u8, database_tools.body.?, "memory_") == null);
+    var database_unknown = try requestWithRetry(&client, io.io(), .POST, database_url, get, &db_headers, 20);
+    defer database_unknown.deinit();
+    try std.testing.expect(std.mem.indexOf(u8, database_unknown.body.?, "Private owner evidence") == null);
+    try std.testing.expect(std.mem.indexOf(u8, database_unknown.body.?, "isError") != null or std.mem.indexOf(u8, database_unknown.body.?, "error") != null);
+    var reverse_session = try requestWithRetry(&client, io.io(), .POST, memory_url, list, &db_headers, 20);
+    defer reverse_session.deinit();
+    try std.testing.expectEqual(@as(u16, 404), reverse_session.status.code);
+    var stream = try requestWithRetry(&client, io.io(), .GET, memory_url, "", &session_headers, 20);
+    defer stream.deinit();
+    try std.testing.expect(std.mem.indexOf(u8, stream.body.?, "data: /memory/v1/mcp") != null);
+    var closed = try requestWithRetry(&client, io.io(), .DELETE, memory_url, "", &session_headers, 20);
+    defer closed.deinit();
+    try std.testing.expectEqual(@as(u16, 202), closed.status.code);
+    var expired = try requestWithRetry(&client, io.io(), .POST, memory_url, list, &session_headers, 20);
+    defer expired.deinit();
+    try std.testing.expectEqual(@as(u16, 404), expired.status.code);
 }
 
 test "httpx inference gateway deployment disable fences public routes but preserves internal invocation" {

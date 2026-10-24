@@ -113,6 +113,8 @@ pub const RequestDiagnostics = struct {
 };
 
 pub const RequestContext = struct {
+    /// Native service admission only; never reconstructed from user input.
+    native_service: ?@import("../common/service_ownership.zig").Owner = null,
     /// Granted only after administrator authentication by a trusted native
     /// ingress. Metadata HTTP never reconstructs this from request JSON.
     setting_admin: bool = false,
@@ -494,3 +496,5 @@ test "request context execution lifetime preserves activated completion after fo
     try std.testing.expectEqual(@as(usize, 0), scheduler.stats().operations);
     try std.testing.expectEqual(@as(u64, 0), scheduler.stats().retained_bytes);
 }
+
+pub const requireNativeServiceAccess = @import("../common/service_ownership.zig").requireAccess;

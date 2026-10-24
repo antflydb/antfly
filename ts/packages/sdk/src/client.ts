@@ -12,6 +12,12 @@ import {
   validateIndexMaintenanceResponse,
 } from "./index-maintenance.js";
 import { InferenceCapacityError, isTransientCapacityError } from "./inference-client.js";
+import {
+  createMemoryClient,
+  type MemoryPaths,
+  type MemorySchemas,
+  type OrdinaryPaths,
+} from "./memory.js";
 import type { components, paths } from "./public-api.js";
 import { RequestAdmission } from "./request-admission.js";
 import { parseSSEFrames } from "./sse.js";
@@ -562,6 +568,7 @@ function sleep(ms: number, signal?: AbortSignal): Promise<void> {
 
 export class AntflyClient {
   private client: Client<paths>;
+  private memoryTransport?: Client<MemoryPaths>;
   private config: AntflyConfig;
   private readonly admission: RequestAdmission;
 
@@ -582,9 +589,21 @@ export class AntflyClient {
     this.admission.close();
   }
 
-  /** Typed access to every generated endpoint, including system catalog lifecycle routes. */
-  get api(): Client<paths> {
-    return this.client;
+  /** Typed ordinary endpoints, including system catalog lifecycle routes. */
+  get api(): Client<OrdinaryPaths> {
+    return this.client as unknown as Client<OrdinaryPaths>;
+  }
+
+  /** Typed native memory endpoints with exact integers and the current auth configuration. */
+  get memoryApi(): Client<MemoryPaths> {
+    if (!this.memoryTransport) {
+      this.memoryTransport = createMemoryClient(
+        normalizeBaseUrl(this.config.baseUrl),
+        this.requestHeaders(),
+        this.admission.fetch
+      );
+    }
+    return this.memoryTransport;
   }
 
   /**
@@ -599,6 +618,7 @@ export class AntflyClient {
    * Build the openapi-fetch client with current config.
    */
   private buildClient(): Client<paths> {
+    this.memoryTransport = undefined;
     const headers: Record<string, string> = {
       "Content-Type": "application/json",
       ...this.config.headers,
@@ -636,6 +656,64 @@ export class AntflyClient {
 
     return headers;
   }
+
+  /** Native temporal memory. All calls share the client's authenticated transport. */
+  readonly memory = {
+    create: (body: MemorySchemas["MemoryCreateSpaceRequest"], key: string) =>
+      this.memoryApi.POST("/memory/v1/spaces", {
+        body,
+        params: { header: { "Idempotency-Key": key } },
+      }),
+    inspect: (space: string) =>
+      this.memoryApi.GET("/memory/v1/spaces/{space}", { params: { path: { space } } }),
+    observe: (space: string, body: MemorySchemas["MemoryObservationRequest"], key: string) =>
+      this.memoryApi.POST("/memory/v1/spaces/{space}/observations", {
+        body,
+        params: { path: { space }, header: { "Idempotency-Key": key } },
+      }),
+    assertions: (space: string, body: MemorySchemas["MemoryAssertionRequest"], key: string) =>
+      this.memoryApi.POST("/memory/v1/spaces/{space}/assertions", {
+        body,
+        params: { path: { space }, header: { "Idempotency-Key": key } },
+      }),
+    recall: (space: string, body: MemorySchemas["MemoryRecallRequest"]) =>
+      this.memoryApi.POST("/memory/v1/spaces/{space}/recall", {
+        body,
+        params: { path: { space } },
+      }),
+    explain: (space: string, id: string, body: MemorySchemas["MemoryExplainRequest"] = {}) =>
+      this.memoryApi.POST("/memory/v1/spaces/{space}/memories/{id}/explain", {
+        body,
+        params: { path: { space, id } },
+      }),
+    explainResource: (space: string, body: MemorySchemas["MemoryExplainRequest"]) =>
+      this.memoryApi.POST("/memory/v1/spaces/{space}/explain", {
+        body,
+        params: { path: { space } },
+      }),
+    get: (space: string, id: string) =>
+      this.memoryApi.GET("/memory/v1/spaces/{space}/memories/{id}", {
+        params: { path: { space, id } },
+      }),
+    correct: (space: string, body: MemorySchemas["MemoryCorrection"], key: string) =>
+      this.memoryApi.POST("/memory/v1/spaces/{space}/corrections", {
+        body,
+        params: { path: { space }, header: { "Idempotency-Key": key } },
+      }),
+    forget: (space: string, body: MemorySchemas["MemoryForgetRequest"], key: string) =>
+      this.memoryApi.POST("/memory/v1/spaces/{space}/forget", {
+        body,
+        params: { path: { space }, header: { "Idempotency-Key": key } },
+      }),
+    operation: (space: string, id: string) =>
+      this.memoryApi.GET("/memory/v1/spaces/{space}/operations/{id}", {
+        params: { path: { space, id } },
+      }),
+    advance: (space: string, id: string, key: string) =>
+      this.memoryApi.POST("/memory/v1/spaces/{space}/operations/{id}", {
+        params: { path: { space, id }, header: { "Idempotency-Key": key } },
+      }),
+  };
 
   /** Personal ChatGPT registrations. OAuth credentials never enter this client. */
   readonly chatgpt = {

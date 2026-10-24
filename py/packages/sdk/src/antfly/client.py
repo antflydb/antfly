@@ -807,6 +807,9 @@ class AntflyClient:
                 timeout=Timeout(timeout),
                 httpx_args=httpx_args,
             )
+        from .memory import MemoryOperations
+
+        self.memory = MemoryOperations(self)
         self.indexes = IndexOperations(self)
         from .resolvers import CurationProposalOperations, EntityOperations, ResolverOperations
 

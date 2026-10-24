@@ -75,13 +75,21 @@ test "inference resource type round trips through persisted strings" {
 pub const PermissionType = enum {
     read,
     write,
+    curator,
     admin,
 
     pub fn fromSlice(raw: []const u8) !PermissionType {
         if (std.mem.eql(u8, raw, "read")) return .read;
         if (std.mem.eql(u8, raw, "write")) return .write;
+        if (std.mem.eql(u8, raw, "curator")) return .curator;
         if (std.mem.eql(u8, raw, "admin")) return .admin;
         return error.InvalidPermissionType;
+    }
+
+    /// Curators can read the table and use its admitted curation service, but
+    /// cannot perform arbitrary writes or administer the table.
+    pub fn allows(self: PermissionType, required: PermissionType) bool {
+        return self == .admin or self == required or (self == .curator and required == .read);
     }
 
     pub fn slice(self: PermissionType) []const u8 {
@@ -978,8 +986,7 @@ pub const UserManager = struct {
                 catalog_names.tableResourceMatches(permission.resource, resource)
             else
                 std.mem.eql(u8, permission.resource, "*") or std.mem.eql(u8, permission.resource, resource);
-            const permission_matches = permission.type == .admin or
-                permission.type == permission_type;
+            const permission_matches = permission.type.allows(permission_type);
             if (resource_type_matches and resource_matches and permission_matches) return true;
         }
         return false;
@@ -1128,7 +1135,7 @@ pub const UserManager = struct {
         for (current_permissions) |permission| {
             if ((permission.resource_type == .@"*" or permission.resource_type == .table) and
                 catalog_names.tableResourceMatches(permission.resource, logical_table) and
-                (permission.type == .admin or permission.type == permission_type))
+                permission.type.allows(permission_type))
             {
                 allowed = true;
                 break;
@@ -1748,7 +1755,9 @@ fn permissionIntersection(left: Permission, right: Permission) ?struct {
         right.type
     else if (right.type == .admin)
         left.type
-    else if (left.type == right.type)
+    else if (left.type.allows(right.type))
+        right.type
+    else if (right.type.allows(left.type))
         left.type
     else
         return null;
@@ -2701,4 +2710,20 @@ test "usermgr credential policy snapshots use caller memory through roles filter
     }
     try std.testing.expectEqual(previous_allocations, backing.alloc_index);
     try std.testing.expect(!backing.has_induced_failure);
+}
+
+test "native memory curator permission is read-capable without arbitrary write or admin" {
+    try std.testing.expectEqual(PermissionType.curator, try PermissionType.fromSlice("curator"));
+    try std.testing.expect(PermissionType.curator.allows(.read));
+    try std.testing.expect(PermissionType.curator.allows(.curator));
+    try std.testing.expect(!PermissionType.curator.allows(.write));
+    try std.testing.expect(!PermissionType.curator.allows(.admin));
+    try std.testing.expect(!PermissionType.write.allows(.curator));
+    try std.testing.expect(PermissionType.admin.allows(.curator));
+    const curator: Permission = .{ .resource_type = .table, .resource = @constCast("default.public.memory_team"), .type = .curator };
+    const read: Permission = .{ .resource_type = .table, .resource = @constCast("default.public.memory_team"), .type = .read };
+    const write: Permission = .{ .resource_type = .table, .resource = @constCast("default.public.memory_team"), .type = .write };
+    try std.testing.expectEqual(PermissionType.read, permissionIntersection(curator, read).?.permission_type);
+    try std.testing.expectEqual(PermissionType.read, permissionIntersection(read, curator).?.permission_type);
+    try std.testing.expect(permissionIntersection(curator, write) == null);
 }

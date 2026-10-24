@@ -1502,6 +1502,10 @@ fn listResolverIdentities(self: *DB, alloc: std.mem.Allocator) engine.Outcome([]
     return .{ .value = self.listResolverIdentities(alloc) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
+fn listResolverStaticDescriptors(self: *DB, alloc: std.mem.Allocator) engine.Outcome([]@import("db/catalog/resolver_catalog.zig").ResolverConfig) {
+    return .{ .value = self.listResolverStaticDescriptors(alloc) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+
 fn consumeResolverMetadataDrop(self: *DB, alloc: std.mem.Allocator, identity: @import("db/resolver_curation.zig").MetadataIdentity) engine.Outcome(void) {
     return .{ .value = self.consumeResolverMetadataDrop(alloc, identity) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }

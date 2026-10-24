@@ -117,6 +117,10 @@ pub const FileGroup = struct {
     segments: []const artifacts.ChunkRef,
     rows: []const physical.Block = &.{},
     summaries: []const ?statistics.Ref = &.{},
+    forward_version: u8 = 0,
+    forwards: []const ?statistics.Ref = &.{},
+    /// Build-local directory replacement evidence retained across checkpoints.
+    statistics_replaces: ?[64]u8 = null,
     opening_packs: []const @import("lake_index_text_opening_pack.zig").Pack = &.{},
     admissions: []const local.segment.SegmentReader.Admission = &.{},
     descriptors: []const artifacts.ChunkRef = &.{},
@@ -151,6 +155,8 @@ pub const FileGroup = struct {
             if (live != self.live_collection.?.documents or live != try physical.validate(self.rows)) return error.InvalidNativeLakeTextCorpus;
         }
         if (self.live_collection) |collection| try collection.validate();
+        if (self.forward_version > 1 or (self.forward_version == 0 and self.forwards.len != 0) or (self.forward_version == 1 and self.forwards.len != self.segments.len)) return error.InvalidNativeLakeTextCorpus;
+        for (self.forwards) |ref| if (ref) |page| try page.validate();
         if (self.segments.len > max_segments) return error.InvalidNativeLakeTextCorpus;
         if (self.opening_packs.len > 65536) return error.InvalidNativeLakeTextCorpus;
         for (self.opening_packs) |pack| try pack.validate(domain);
@@ -1289,6 +1295,7 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
             const group = &file_group;
             var segments: std.ArrayList(artifacts.ChunkRef) = .empty;
             var summaries: std.ArrayList(?statistics.Ref) = .empty;
+            var forwards: std.ArrayList(?statistics.Ref) = .empty;
             var admissions: std.ArrayList(local.segment.SegmentReader.Admission) = .empty;
             if (!changed) {
                 if (paged_seed or (baseline != null and reference_seed)) continue;
@@ -1296,6 +1303,8 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
                 group.segments = previous_group.segments;
                 group.rows = previous_group.rows;
                 group.summaries = previous_group.summaries;
+                group.forward_version = previous_group.forward_version;
+                group.forwards = previous_group.forwards;
                 group.opening_packs = previous_group.opening_packs;
                 group.admissions = previous_group.admissions;
                 group.descriptors = previous_group.descriptors;
@@ -1330,7 +1339,7 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
             defer capture_manager.deinit();
             var output_manager: local.sql_spill.Manager = .{ .alloc = a, .io = capture_manager.io, .context = &capture_check, .checkpoint = capture_manager.checkpoint, .max_bytes = 768 * 1024 * 1024, .async_writes = false };
             defer output_manager.deinit();
-            var compactor: Compactor = .{ .context = provider.context, .output_manager = &output_manager, .global = &df, .directory = &directory_builder, .capture_manager = &capture_manager, .a = a, .out = fa, .store = store, .segments = &segments, .summaries = &summaries, .admissions = &admissions, .cancellation = cancellation, .file_ordinal = file_ordinal, .opening = &opening, .io = provider.context.io };
+            var compactor: Compactor = .{ .context = provider.context, .output_manager = &output_manager, .global = &df, .directory = &directory_builder, .capture_manager = &capture_manager, .a = a, .out = fa, .store = store, .segments = &segments, .summaries = &summaries, .forwards = &forwards, .admissions = &admissions, .cancellation = cancellation, .file_ordinal = file_ordinal, .opening = &opening, .io = provider.context.io };
             defer compactor.deinit();
             if (provider.rowsForFile(file_ordinal)) |selected| if (selected.len != 0 and selected.len < source.inventory.files[file_ordinal].row_count / 2 and file.key_digest != null) {
                 const old = if (previous_refs.get(file.id)) |record| try loadRecordedFile(fa, store.*, record, seed.?.domain, cancellation) else previous_groups.get(file.id);
@@ -1472,6 +1481,11 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
             group.rows = ordinals.blocks.items;
             group.segments = segments.items;
             group.summaries = summaries.items;
+            if (compactor.forward_complete) {
+                group.forward_version = 1;
+                group.forwards = forwards.items;
+            }
+            group.statistics_replaces = compactor.statistics_replaces;
             group.admissions = admissions.items;
             _ = batch_arena.reset(.free_all);
             builder = mapper.TextProjectionBatchBuilder.initWithSelectedField(batch_arena.allocator(), analysis, runtime, null, selected_field);
@@ -1566,7 +1580,20 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
                     if (index + 1 < removed_files.items.len) manifests.prefetch(removed_files.items[index + 1].manifest) else if (added_files.items.len != 0 and !try manifest_replay.contains(added_files.items[0].manifest)) manifests.prefetch(added_files.items[0].manifest);
                     try metadata_publisher.add(group, record.manifest, true);
                     try totals.add(group, true);
+                    var next_arena = std.heap.ArenaAllocator.init(a);
+                    defer next_arena.deinit();
+                    const next = if (plan.by_id.get(record.file.id)) |slot| if (file_manifests.get(slot)) |ref| try manifest_replay.load(&next_arena, &manifests, ref, scope.domain) else null else null;
                     if (incremental_directory) for (group.summaries, group.segments) |summary, segment| {
+                        if (next) |replacement| if (replacement.statistics_replaces) |marker| if (summary) |before| {
+                            const id = term_directory.identity(segment.artifact_id);
+                            if (std.mem.eql(u8, &marker, &(before.digest ++ id))) {
+                                const after = for (replacement.segments, replacement.summaries) |candidate, value| {
+                                    if (std.mem.eql(u8, segment.artifact_id, candidate.artifact_id)) break value;
+                                } else return error.InvalidNativeLakeTextCorpus;
+                                try directory_builder.replace(stats_pages.store(), summary, after, id);
+                                continue;
+                            }
+                        };
                         try addStatisticsContribution(a, stats_pages.store(), summary, term_directory.identity(segment.artifact_id), -1, null, &directory_builder);
                     };
                 }
@@ -1576,10 +1603,11 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
                 const group = try manifest_replay.load(&file_arena, &manifests, record.manifest, scope.domain);
                 if (index + 1 < added_files.items.len and !try manifest_replay.contains(added_files.items[index + 1].manifest)) manifests.prefetch(added_files.items[index + 1].manifest);
                 try metadata_publisher.add(group, record.manifest, false);
-                if (!fresh_contributions.isSet(plan.by_id.get(record.file.id) orelse return error.InvalidNativeLakeTextCorpus)) {
-                    for (group.summaries, group.segments) |summary, segment| {
-                        try addStatisticsContribution(a, stats_pages.store(), summary, term_directory.identity(segment.artifact_id), 1, null, &directory_builder);
-                    }
+                const fresh = fresh_contributions.isSet(plan.by_id.get(record.file.id) orelse return error.InvalidNativeLakeTextCorpus);
+                for (group.summaries, group.segments) |summary, segment| {
+                    const replaced = if (group.statistics_replaces) |marker| std.mem.eql(u8, marker[32..], &term_directory.identity(segment.artifact_id)) else false;
+                    if (replaced and incremental_directory) continue;
+                    if (!fresh or replaced) try addStatisticsContribution(a, stats_pages.store(), summary, term_directory.identity(segment.artifact_id), 1, null, &directory_builder);
                 }
                 try totals.add(group, false);
             }
@@ -1893,6 +1921,7 @@ fn validateReuse(backing_a: A, backend: stores.ArtifactStore, root: Root, root_i
             const group = try loadFileManifest(file_arena.allocator(), backend, ref, root.domain, cancellation, null);
             for (group.opening_packs) |pack| try validator.leaf(pack.artifact);
             for (group.summaries) |summary| try validator.pages(summary);
+            for (group.forwards) |forward| try validator.pages(forward);
             for (group.rows) |block| if (block.bitmap) |bitmap| try validator.leaf(bitmap);
             for (group.descriptors) |descriptor| try validator.leaf(descriptor);
             if (group.physical_manifest) |physical_ref| try validator.leaf(physical_ref);
@@ -1902,6 +1931,7 @@ fn validateReuse(backing_a: A, backend: stores.ArtifactStore, root: Root, root_i
     for (root.file_groups) |group| {
         for (group.opening_packs) |pack| try validator.leaf(pack.artifact);
         for (group.summaries) |summary| try validator.pages(summary);
+        for (group.forwards) |forward| try validator.pages(forward);
         for (group.rows) |block| if (block.bitmap) |bitmap| try validator.leaf(bitmap);
     }
     for (root.segments) |ref| try validator.segment(ref, root.seekable);
@@ -2044,6 +2074,9 @@ const Compactor = struct {
     store: *stores.ArtifactStore,
     segments: *std.ArrayList(artifacts.ChunkRef),
     summaries: *std.ArrayList(?statistics.Ref),
+    forwards: ?*std.ArrayList(?statistics.Ref) = null,
+    forward_complete: bool = true,
+    statistics_replaces: ?[64]u8 = null,
     admissions: *std.ArrayList(local.segment.SegmentReader.Admission),
     cancellation: Cancellation,
     file_ordinal: usize,
@@ -2119,7 +2152,8 @@ const Compactor = struct {
             try admissions.appendSlice(a, group.admissions);
         }
         if (retained_rows != rows) return error.InvalidNativeLakeTextCorpus;
-        return .{ .base = .{ .file = previous.file, .segments = segments.items, .admissions = admissions.items }, .intervals = intervals.items };
+        const same = previous.segments.len == 1 and segments.items.len == 1 and std.mem.eql(u8, previous.segments[0].artifact_id, segments.items[0].artifact_id);
+        return .{ .base = .{ .file = previous.file, .segments = segments.items, .admissions = admissions.items, .summaries = if (same) previous.summaries else &.{}, .forward_version = if (same) previous.forward_version else 0, .forwards = if (same) previous.forwards else &.{} }, .intervals = intervals.items };
     }
     fn discardPatch(self: *Compactor) void {
         for (self.patch_inputs.items) |owned| owned.deinit(self.a);
@@ -2209,7 +2243,10 @@ const Compactor = struct {
         for (parts, spans[0..count]) |*part, list| part.* = list.items;
         var removed: std.StringHashMapUnmanaged(u64) = .empty;
         defer removed.deinit(a);
-        const summary = try statistics.publishReaderFiltered(a, self.store, &base, self.cancellation, self.io, statistics.NoContributions{}, &deleted, &removed);
+        const indexed = self.forwards != null and patch.base.forward_version == 1 and patch.base.forwards.len == 1 and patch.base.summaries.len == 1;
+        var forward_manager: local.sql_spill.Manager = .{ .alloc = a, .io = self.io.?, .context = self, .checkpoint = check, .async_writes = false };
+        defer forward_manager.deinit();
+        const summary = if (indexed) try @import("lake_index_text_forward.zig").retract(a, self.store, &forward_manager, patch.base.forwards[0], patch.base.summaries[0], &deleted, &removed, self.cancellation) else try statistics.publishReaderFiltered(a, self.store, &base, self.cancellation, self.io, statistics.NoContributions{}, &deleted, &removed);
         var totals: CollectionBuilder = .{ .a = a };
         defer totals.deinit();
         totals.documents = @intCast(rows.len);
@@ -2227,8 +2264,15 @@ const Compactor = struct {
         const scope = self.store.upload_scope.?;
         var pages: @import("../serverless/graph_segment/page_store.zig").PageStore = .{ .domain = scope.domain, .attempt = scope.attempt, .artifacts = self.store, .cancellation = self.cancellation, .remaining_read_bytes = &reads, .remaining_write_bytes = &writes };
         pages.admitPublication();
-        if (self.global) |global| try global.add(pages.store(), summary, 1);
-        if (self.directory) |directory| try directory.add(pages.store(), summary, term_directory.identity(patch.base.segments[0].artifact_id), 1);
+        if (indexed) {
+            if (self.global) |global| try global.replace(pages.store(), patch.base.summaries[0], summary);
+            if (patch.base.summaries[0]) |prior| self.statistics_replaces = prior.digest ++ term_directory.identity(patch.base.segments[0].artifact_id);
+        } else {
+            if (self.global) |global| try global.add(pages.store(), summary, 1);
+            if (self.directory) |directory| try directory.add(pages.store(), summary, term_directory.identity(patch.base.segments[0].artifact_id), 1);
+        }
+        if (self.forwards) |list| try list.append(self.out, if (indexed) patch.base.forwards[0] else null);
+        if (!indexed) self.forward_complete = false;
         try self.segments.append(self.out, patch.base.segments[0]);
         try self.admissions.append(self.out, patch.base.admissions[0]);
         try self.summaries.append(self.out, summary);
@@ -2309,9 +2353,27 @@ const Compactor = struct {
         const staged = try @import("lake_index_segment_spill.zig").LocalSegment.empty(self.a, self.output_manager.?, self.store);
         errdefer staged.release();
         staged.captureStatistics(self.capture_manager.?);
+        const reusable = staged.statistics != null and patch.base.forward_version == 1 and patch.base.forwards.len == patch.base.segments.len and for (self.patch_inputs.items) |owned| {
+            if (owned.captured == null or !owned.captured.?.hasForward()) break false;
+        } else true;
+        const counts = try a.alloc(u32, inputs.len);
+        defer a.free(counts);
+        var live: u32 = 0;
+        for (inputs, counts) |input, *count_| {
+            count_.* = input.reader.doc_count;
+            live = try std.math.add(u32, live, @intCast(@as(u64, count_.*) - (if (input.deleted) |deleted| deleted.cardinality() else 0)));
+        }
+        var mapping = if (reusable) try local.segment.MergeSourceMap.init(a, counts) else null;
+        defer if (mapping) |*value| value.deinit();
         var sink = staged.sink();
-        try local.segment.writeMergedSegmentToSinkWithOptions(a, &sink, inputs, .{ .input_order = .arbitrary, .index_sort = &.{.{ .field = "_id", .desc = false }} });
+        if (reusable) sink.term_observer.?.posting = null;
+        try local.segment.writeMergedSegmentToSinkWithOptions(a, &sink, inputs, .{ .input_order = .arbitrary, .index_sort = &.{.{ .field = "_id", .desc = false }}, .source_map = if (mapping) |*value| value else null });
         try staged.seal();
+        if (reusable and live != 0) {
+            try mapping.?.finishOutput(live);
+            for (patch.base.forwards, 0..) |forward, i| try staged.statistics.?.reuseForward(self.store, .{ .tree = forward }, i, &mapping.?, self.cancellation);
+            for (self.patch_inputs.items, patch.base.segments.len..) |owned, i| try staged.statistics.?.reuseForward(self.store, .{ .captured = owned.captured.? }, i, &mapping.?, self.cancellation);
+        }
         return staged;
     }
     fn clearRuns(self: *Compactor) void {
@@ -2377,7 +2439,7 @@ const Compactor = struct {
         var opened: usize = 0;
         defer for (readers[0..opened]) |*reader| reader.deinit();
         var inputs: [fan_in]local.segment.MergeInput = undefined;
-        for (self.pending[0..self.count], &readers, &inputs) |bytes, *reader, *input| {
+        for (self.pending[0..self.count], readers[0..self.count], inputs[0..self.count]) |bytes, *reader, *input| {
             reader.* = try local.segment.SegmentReader.initSource(a, bytes.?.source());
             opened += 1;
             input.* = .{ .reader = reader };
@@ -2385,9 +2447,24 @@ const Compactor = struct {
         const staged = try @import("lake_index_segment_spill.zig").LocalSegment.empty(self.a, manager, self.store);
         errdefer staged.release();
         staged.captureStatistics(self.capture_manager orelse manager);
+        const reusable = staged.statistics != null and for (self.pending[0..self.count]) |owned| {
+            if (owned.?.captured == null or !owned.?.captured.?.hasForward()) break false;
+        } else true;
         var sink = staged.sink();
-        try local.segment.writeMergedSegmentToSink(a, &sink, &inputs);
+        var counts: [fan_in]u32 = undefined;
+        for (readers[0..self.count], counts[0..self.count]) |reader, *count| count.* = reader.doc_count;
+        var mapping = if (reusable) try local.segment.MergeSourceMap.init(a, counts[0..self.count]) else null;
+        defer if (mapping) |*value| value.deinit();
+        if (reusable) sink.term_observer.?.posting = null;
+        try local.segment.writeMergedSegmentToSinkWithOptions(a, &sink, inputs[0..self.count], .{ .source_map = if (mapping) |*value| value else null });
         try staged.seal();
+        if (reusable) {
+            var count: u32 = 0;
+            for (counts[0..self.count]) |value| count = try std.math.add(u32, count, value);
+            try mapping.?.finishOutput(count);
+            staged.statistics.?.orderedForward();
+            for (self.pending[0..self.count], 0..) |owned, i| try staged.statistics.?.reuseForward(self.store, .{ .captured = owned.?.captured.? }, i, &mapping.?, self.cancellation);
+        }
         return staged;
     }
     fn publishSource(self: *Compactor, source: local.index.SegmentSource, captured: ?*statistics.Captured) !void {
@@ -2409,6 +2486,11 @@ const Compactor = struct {
         try self.admissions.append(out, try reader.admission(out));
         const contributions: statistics.Contributions = .{ .global = self.global, .directory = self.directory, .segment = term_directory.identity(ref.artifact_id) };
         const summary = (if (captured != null and !captured.?.disabled) captured.?.publishConsuming(store, cancellation, self.io, contributions) else statistics.publishReaderConsuming(a, store, &reader, cancellation, self.io, contributions)) catch |err| return buildFailure(err, "segment_statistics", self.file_ordinal, segments.items.len);
+        if (self.forwards) |list| {
+            const forward = if (captured != null and !captured.?.disabled) try captured.?.publishForward(store, cancellation) else null;
+            if (captured == null or captured.?.disabled or captured.?.forward_disabled) self.forward_complete = false;
+            try list.append(out, forward);
+        }
         try self.summaries.append(out, summary);
         try segments.append(out, .{ .artifact_id = ref.artifact_id, .checksum = ref.checksum, .byte_len = ref.byte_len });
     }
@@ -3365,12 +3447,12 @@ test "external lake canonical multi-pack publication keeps worker allocations ou
 }
 
 test "external lake text row deltas merge retained postings without reanalyzing old rows" {
-    for ([_]bool{ false, true }) |mixed| try rowDeltaMergeScenario(mixed, false, false);
+    for ([_]bool{ false, true }) |mixed| try rowDeltaMergeScenario(mixed, false, false, false);
 }
 test "external lake bounded posting overlays preserve exact scores mappings restart and closure" {
-    for ([_]bool{ false, true }) |remove| try rowDeltaMergeScenario(false, true, remove);
+    for ([_]bool{ false, true }) |remove| for ([_]bool{ false, true }) |indexed| try rowDeltaMergeScenario(false, true, remove, indexed);
 }
-fn rowDeltaMergeScenario(mixed: bool, overlay_mode: bool, remove: bool) !void {
+fn rowDeltaMergeScenario(mixed: bool, overlay_mode: bool, remove: bool, indexed: bool) !void {
     const a = std.testing.allocator;
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
@@ -3390,19 +3472,37 @@ fn rowDeltaMergeScenario(mixed: bool, overlay_mode: bool, remove: bool) !void {
     defer a.free(bytes);
     var reader = try local.segment.SegmentReader.init(a, bytes);
     defer reader.deinit();
-    const metadata = try reader.admission(out);
-    const saved = try @import("lake_index_seekable_text.zig").publish(a, out, &store, bytes, .none);
-    const group: FileGroup = .{ .file = .{ .id = "fragment", .digest = @splat(1), .key_digest = @splat(9) }, .segments = &.{.{ .artifact_id = saved.artifact_id, .checksum = saved.checksum, .byte_len = saved.byte_len }}, .admissions = &.{metadata}, .summaries = &.{null} };
+    var metadata = try reader.admission(out);
+    var saved = try @import("lake_index_seekable_text.zig").publish(a, out, &store, bytes, .none);
+    var group: FileGroup = .{ .file = .{ .id = "fragment", .digest = @splat(1), .key_digest = @splat(9) }, .segments = &.{.{ .artifact_id = saved.artifact_id, .checksum = saved.checksum, .byte_len = saved.byte_len }}, .admissions = &.{metadata}, .summaries = &.{null} };
     const Check = struct {
         fn check(_: *anyopaque) !void {}
     };
     var marker: u8 = 0;
     var manager: local.sql_spill.Manager = .{ .alloc = a, .io = std.testing.io, .context = &marker, .checkpoint = Check.check, .async_writes = false };
     defer manager.deinit();
+    const observed = if (indexed) try @import("lake_index_segment_spill.zig").LocalSegment.empty(a, &manager, &store) else null;
+    defer if (observed) |value| value.release();
+    if (observed) |value| {
+        value.captureStatistics(&manager);
+        var sink = value.sink();
+        try local.segment.writeMergedSegmentToSink(a, &sink, &.{.{ .reader = &reader }});
+        try value.seal();
+        var encoded = try local.segment.SegmentReader.initSource(a, value.source());
+        defer encoded.deinit();
+        metadata = try encoded.admission(out);
+        saved = try @import("lake_index_seekable_text.zig").publishSourceWithOpeningCollector(a, out, &store, value.source(), .none, null);
+        group.segments = try out.dupe(artifacts.ChunkRef, &.{saved});
+        group.admissions = try out.dupe(local.segment.SegmentReader.Admission, &.{metadata});
+        group.summaries = try out.dupe(?statistics.Ref, &.{try value.statistics.?.publishConsuming(&store, .none, std.testing.io, statistics.NoContributions{})});
+        group.forwards = try out.dupe(?statistics.Ref, &.{try value.statistics.?.publishForward(&store, .none)});
+        group.forward_version = 1;
+    }
+    var forwards: std.ArrayList(?statistics.Ref) = .empty;
     var segments: std.ArrayList(artifacts.ChunkRef) = .empty;
     var summaries: std.ArrayList(?statistics.Ref) = .empty;
     var admissions: std.ArrayList(local.segment.SegmentReader.Admission) = .empty;
-    var compactor: Compactor = .{ .a = a, .out = out, .store = &store, .segments = &segments, .summaries = &summaries, .admissions = &admissions, .cancellation = .none, .file_ordinal = 0, .output_manager = &manager, .capture_manager = &manager, .io = std.testing.io, .row_patch = .{ .base = group, .rows = if (overlay_mode) &.{ 2, 3 } else &.{3}, .intervals = if (mixed) &.{&.{.{ .lower = 1, .count = 10 }}} else &.{} } };
+    var compactor: Compactor = .{ .a = a, .out = out, .store = &store, .segments = &segments, .summaries = &summaries, .forwards = if (indexed) &forwards else null, .admissions = &admissions, .cancellation = .none, .file_ordinal = 0, .output_manager = &manager, .capture_manager = &manager, .io = std.testing.io, .row_patch = .{ .base = group, .rows = if (overlay_mode) &.{ 2, 3 } else &.{3}, .intervals = if (mixed) &.{&.{.{ .lower = 1, .count = 10 }}} else &.{} } };
     defer compactor.deinit();
     if (!remove or overlay_mode) {
         const fresh = [_]mapper.MapperDoc{ docs[2], .{ .key = docs[3].key, .value = "{\"body\":\"replacement shared\"}" } };
@@ -3435,6 +3535,7 @@ fn rowDeltaMergeScenario(mixed: bool, overlay_mode: bool, remove: bool) !void {
         compactor.workspace_bytes = 64 * 1024 * 1024;
         store.upload_scope = try stores.UploadScope.forPublication(store.upload_scope.?.domain, 2, std.testing.io);
         const overlay = (try compactor.publishRowOverlay(group.file)).?;
+        if (indexed) try std.testing.expect(compactor.statistics_replaces != null);
         try std.testing.expectEqual(@as(usize, 2), segments.items.len);
         try std.testing.expectEqualStrings(saved.artifact_id, segments.items[0].artifact_id);
         try std.testing.expectEqual(@as(u32, if (remove) 9 else 10), overlay.collection.documents);
@@ -3534,4 +3635,38 @@ fn rowDeltaMergeScenario(mixed: bool, overlay_mode: bool, remove: bool) !void {
     compactor.workspace_bytes = 1;
     try std.testing.expect((try compactor.mergeRows()) == .declined);
     try std.testing.expectEqual(@as(usize, 0), segments.items.len);
+}
+
+test "external lake append compaction carries forward evidence instead of observing postings again" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const out = arena.allocator();
+    var directory = try local.common_test_directory.TestDirectory.init("append-forward-evidence");
+    defer directory.cleanup();
+    var fs = try @import("../serverless/artifacts/fs_store.zig").FsStore.init(a, directory.path());
+    defer fs.deinit();
+    var store = fs.artifactStore();
+    store.upload_scope = try stores.UploadScope.forPublication(@splat(7), 1, std.testing.io);
+    var marker: u8 = 0;
+    var manager: local.sql_spill.Manager = .{ .alloc = a, .io = std.testing.io, .context = &marker, .checkpoint = struct {
+        fn check(_: *anyopaque) !void {}
+    }.check, .async_writes = false };
+    defer manager.deinit();
+    var segments: std.ArrayList(artifacts.ChunkRef) = .empty;
+    var summaries: std.ArrayList(?statistics.Ref) = .empty;
+    var admissions: std.ArrayList(local.segment.SegmentReader.Admission) = .empty;
+    var compactor: Compactor = .{ .a = a, .out = out, .store = &store, .segments = &segments, .summaries = &summaries, .admissions = &admissions, .cancellation = .none, .file_ordinal = 0, .output_manager = &manager, .capture_manager = &manager, .io = std.testing.io };
+    defer compactor.deinit();
+    const first = local.introducer.TextDocument{ .id = "one", .stored_data = "{}", .text_fields = &.{.{ .field_name = "body", .text = "alpha common common" }} };
+    const second = local.introducer.TextDocument{ .id = "two", .stored_data = "{}", .text_fields = &.{.{ .field_name = "title", .text = "beta common" }} };
+    compactor.pending[0] = try EncoderPipeline.encode(a, a, &manager, &manager, &store, .{ .docs = &.{first} }, .{}, .{}, 512 * 1024);
+    compactor.count = 1;
+    compactor.pending[1] = try EncoderPipeline.encode(a, a, &manager, &manager, &store, .{ .docs = &.{second} }, .{}, .{}, 512 * 1024);
+    compactor.count = 2;
+    const merged = try compactor.merge(a, &manager);
+    defer merged.release();
+    try std.testing.expect(merged.statistics.?.hasForward());
+    try std.testing.expectEqual(@as(u64, 4), merged.statistics.?.reused_forward_entries);
+    try std.testing.expect((try merged.statistics.?.publishForward(&store, .none)) != null);
 }

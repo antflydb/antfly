@@ -250,7 +250,7 @@ test "external lake global frontier cloud certificates bind publications restart
     while (leaf_ref.height > 0) {
         var page = try tree.readPage(a, pages.store(), leaf_ref);
         defer page.deinit(a);
-        leaf_ref = page.entries[0].child.?;
+        leaf_ref = page.entries[0].child.?.*;
     }
     try std.testing.expect(leaf_ref.pack != null);
     const navigation: @import("lake_source_navigation.zig").Root = .{ .domain = domain, .source = "source", .schema = "schema", .snapshot = "snapshot", .count = 32, .files = page_root, .public = page_root, .private = page_root };

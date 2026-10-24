@@ -44,3 +44,7 @@ test "standalone worker transient bridge uses the production callback and owner 
 test "standalone worker bootstrap selects the existing process parent and rejects stale create layouts" {
     try runtime.qualifyWorkerBootstrapMemoryParent();
 }
+
+test "system catalog native memory ownership standalone root" {
+    _ = runtime;
+}

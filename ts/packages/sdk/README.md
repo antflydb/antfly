@@ -464,3 +464,15 @@ The JavaScript runtime owns the underlying HTTP connection pool; closing local
 admission does not close that pool. Request serialization can precede admission,
 and these count limits do not bound caller-owned payloads, cloned response
 buffers, or total SDK heap. Server admission still enforces node capacity.
+
+## Native memory integer precision
+
+Use `client.memory` or the typed `client.memoryApi` for `/memory/v1` endpoints.
+Safe JSON integers remain JavaScript numbers; larger native resource IDs,
+revisions, and timestamps decode as `bigint` and are sent back as exact numeric
+JSON. Use bigint literals for full-width inputs, such as `9007199254740993n`.
+Unsafe integer numbers are rejected because their original value is already lost.
+`MemorySchemas` exposes the corresponding `number | bigint` numeric types.
+`parseMemoryJSON` and `stringifyMemoryJSON` provide the same codec for external
+persistence or logging. The ordinary `client.api` surface retains its existing
+number types; native memory endpoints live on `client.memoryApi`.

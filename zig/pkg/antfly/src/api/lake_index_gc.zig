@@ -343,6 +343,7 @@ pub const Collector = struct {
         };
         if (group.physical_manifest) |physical| _ = try self.mark(physical);
         for (group.summaries) |summary| try self.markPages(a, domain, summary, false);
+        for (group.forwards) |forward| try self.markPages(a, domain, forward, false);
         for (group.rows) |block| {
             if (block.bitmap) |bitmap| _ = try self.mark(bitmap);
         }
@@ -403,6 +404,7 @@ pub const Collector = struct {
         for (root.file_groups) |group| {
             for (group.opening_packs) |pack| _ = try self.mark(pack.artifact);
             for (group.summaries) |summary| try self.markPages(a, root.domain, summary, false);
+            for (group.forwards) |forward| try self.markPages(a, root.domain, forward, false);
         }
 
         const manifests = if (paged_text_files) &.{} else if (root.inventory_version == 3) blk: {
@@ -448,6 +450,7 @@ pub const Collector = struct {
                         try self.markPages(a, index.domain, rows.rows, false);
                         try self.markPages(a, index.domain, rows.reverse, false);
                         try self.markPages(a, index.domain, rows.extrema, false);
+                        try self.markPages(a, index.domain, rows.reductions, false);
                     }
                 }
                 for (leaf.blocks) |child| _ = try self.mark(child);

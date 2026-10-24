@@ -8670,7 +8670,7 @@ const PreparedObservationSealFixture = struct {
         errdefer self.store.close();
         try @import("artifact_footprint.zig").initializeEmpty(&self.store);
         try @import("artifact_replay_inventory.zig").initialize(&self.store);
-        try self.floor(14);
+        try self.floor(19);
         self.manager = try TxnManager.init(a, &self.store);
         errdefer self.manager.deinit();
         try self.manager.initTransactionRequiringPreparedEffectsWithBinding(id, 1, 1, &.{}, false, true, .{ .mode = .deferred }, binding, .{}, null);
@@ -8771,7 +8771,7 @@ test "prepared transaction effects observation seal rejects old floors retrofit 
         defer a.free(observations);
         const key = makePreparedReadObservationsKey(F.id);
         if (scenario == 0) {
-            try f.floor(13);
+            try f.floor(18);
             try std.testing.expectError(error.PreparedTransactionProtocolDisabled, f.seal(effect, observations, true, null));
             try f.noSeal();
         } else if (scenario == 1) {
@@ -8922,7 +8922,7 @@ test "prepared transaction effects observation recovery unwinds allocations and 
     };
 }
 
-test "prepared transaction effects range observation seals require reader fifteen on acceptance and recovery" {
+test "prepared transaction effects range observation seals require the range reader epoch on acceptance and recovery" {
     const a = std.testing.allocator;
     const F = PreparedObservationSealFixture;
     var f: F = .{};
@@ -8943,11 +8943,11 @@ test "prepared transaction effects range observation seals require reader fiftee
     defer a.free(frame);
     try std.testing.expectError(error.PreparedTransactionProtocolDisabled, f.seal(effect, frame, false, null));
     try f.noSeal();
-    try f.floor(15);
+    try f.floor(20);
     // A replacement-reader base lower than the canonical floor still fences
     // acceptance. Absent base uses the canonical floor, as for older formats.
     const catalog_module = @import("db/catalog/resolver_catalog.zig");
-    try f.store.put(catalog_module.replacement_reader_base_key, "14");
+    try f.store.put(catalog_module.replacement_reader_base_key, "19");
     try std.testing.expectError(error.PreparedTransactionProtocolDisabled, f.seal(effect, frame, false, null));
     try f.noSeal();
     try f.store.delete(catalog_module.replacement_reader_base_key);
@@ -8959,9 +8959,9 @@ test "prepared transaction effects range observation seals require reader fiftee
         try f.store.put("read-input", "payload-only update");
         try decoded.validate(&f.store, null);
     }
-    try f.floor(14);
+    try f.floor(19);
     try std.testing.expectError(error.PreparedTransactionProtocolDisabled, f.manager.loadPreparedReadObservations(a, F.id, F.namespace, F.binding, null));
-    try f.floor(15);
+    try f.floor(20);
     try f.manager.resolveIntents(F.id, .aborted, 2);
     try std.testing.expectError(error.NotFound, f.store.get(a, &makePreparedReadObservationsKey(F.id)));
 }

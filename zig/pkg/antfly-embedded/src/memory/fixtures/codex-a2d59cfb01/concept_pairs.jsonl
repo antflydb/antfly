@@ -1,0 +1,30 @@
+{"a": "ThreadStore", "b": "thread store", "same": true}
+{"a": "approvals reviewer", "b": "approval reviewer", "same": true}
+{"a": "app-server", "b": "app server", "same": true}
+{"a": "Qwen3", "b": "Qwen3 Embedding", "same": true}
+{"a": "EmbeddingGemma 2", "b": "Embedding Gemma 2", "same": true}
+{"a": "Antfly", "b": "AntflyDB", "same": true}
+{"a": "Antfly", "b": "Antfly database", "same": true}
+{"a": "Codex CLI", "b": "Codex", "same": true}
+{"a": "app-server", "b": "Codex app-server", "same": true}
+{"a": "libantfly", "b": "libantfly.dylib", "same": true}
+{"a": "GLiNER", "b": "GLiNER model", "same": true}
+{"a": "SQLite", "b": "SQLite database", "same": true}
+{"a": "memory pipeline", "b": "memories pipeline", "same": true}
+{"a": "knowledge graph", "b": "KG", "same": true}
+{"a": "Qwen3", "b": "Qwen2", "same": false}
+{"a": "EmbeddingGemma 2", "b": "EmbeddingGemma", "same": false}
+{"a": "Gemma 2", "b": "Gemma 3", "same": false}
+{"a": "stage 1", "b": "stage 2", "same": false}
+{"a": "PageRank", "b": "Personalized PageRank", "same": false}
+{"a": "Codex", "b": "Codex Cloud", "same": false}
+{"a": "SQLite", "b": "PostgreSQL", "same": false}
+{"a": "approval reviewer", "b": "approval policy", "same": false}
+{"a": "Antfly", "b": "Antfarm", "same": false}
+{"a": "memory notes", "b": "memory claims", "same": false}
+{"a": "full-text index", "b": "dense index", "same": false}
+{"a": "Codex", "b": "Claude Code", "same": false}
+{"a": "import batch", "b": "import thread", "same": false}
+{"a": "decide model", "b": "embedding model", "same": false}
+{"a": "thread store", "b": "state runtime", "same": false}
+{"a": "Laya", "b": "Llama", "same": false}

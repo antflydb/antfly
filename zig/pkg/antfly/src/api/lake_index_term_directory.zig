@@ -156,6 +156,18 @@ pub const Builder = struct {
     reduced_records: u64 = 0,
     aggregate_nodes: u64 = 0,
     durable: ?@import("lake_index_delta_runs.zig").Forest = null,
+    pub fn replace(self: *Builder, storage: tree.Store, previous: ?tree.Ref, current: ?tree.Ref, segment: [32]u8) !void {
+        const Visitor = struct {
+            owner: *Builder,
+            segment: [32]u8,
+            pub fn change(v: *@This(), before: ?tree.Cursor.Record, after: ?tree.Cursor.Record) !void {
+                if (before) |row| try v.owner.addRecord(row, v.segment, -1);
+                if (after) |row| try v.owner.addRecord(row, v.segment, 1);
+            }
+        };
+        var visitor: Visitor = .{ .owner = self, .segment = segment };
+        try tree.visitDifferences(self.a, storage, previous, current, &visitor);
+    }
     pub fn init(a: A, manager: *local.sql_spill.Manager) Builder {
         return .{ .a = a, .changes = local.sql_spill.Sort.init(a, manager, &.{.{}}, 4 * 1024 * 1024) };
     }
