@@ -6,6 +6,27 @@ with `GOWORK=off`.
 
 ## Ingestion Examples
 
+## Civic Data Search
+
+### [Portland in Progress](./portland-civic/)
+
+A local permit explorer with Antfly search, neighborhood/status/date filters,
+a map, source-linked permit details, optional hybrid retrieval and generated
+summaries, and housing context from Portland Civic Lab. Includes a reproducible
+real-data snapshot, refresh/import commands, and desktop/mobile browser tests.
+Also includes an Oregon HB 2017 decision explorer: preserved PDFs, cited findings,
+version comparison, an Antfly evidence graph, and explicit research gaps.
+
+See the example README for starting Antfly, then run:
+
+```sh
+cd examples/portland-civic
+pnpm install
+pnpm ingest
+pnpm governance:ingest
+pnpm dev
+```
+
 ### [docsaf](docsaf/)
 
 Ingest documentation from local files, Git repositories, S3, Google Drive, and
