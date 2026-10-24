@@ -404,7 +404,11 @@ test "external lake aggregate compact record kernels preserve typed transitions 
         try partial.merge(&left, right);
         const expected = try encodeWithLayout(out, .{ .keys = &.{}, .aggregates = &.{}, .typed_states = &.{left}, .ordinal = 0 }, layout);
         try std.testing.expectEqualSlices(u8, expected, actual);
-        try std.testing.checkAllAllocationFailures(a, mergeFaultScenario, .{ l, r, &layout, expected });
+        // In-place growth depends on the backing allocator's bucket state.
+        // Deny it here so every explicit allocation failure has a stable index;
+        // the ordinary merge above exercises the normal growth/remap path.
+        var fixed_growth = std.testing.FailingAllocator.init(a, .{ .resize_fail_index = 0 });
+        try std.testing.checkAllAllocationFailures(fixed_growth.allocator(), mergeFaultScenario, .{ l, r, &layout, expected });
     }
 }
 
