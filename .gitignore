@@ -113,3 +113,7 @@ zig-pkg/
 
 # Executing workflow tooling, separate from the admitted PR checkout.
 .ci-dependency-policy/
+
+# Local terminal-recording takes and capture frames
+.recordings/
+.recording-current

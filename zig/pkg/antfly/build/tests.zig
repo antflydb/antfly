@@ -227,7 +227,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     // Parser/worker projection contracts need no HTTP server or linked kernel.
     // Reuse the lean source-discovery root so this boundary remains affordable
     // to check independently of the full API runtime harness.
-    const query_contract_tests = b.addTest(.{ .root_module = functions_test_mod, .filters = &.{ "api query contract", "local query contract", "decision functions worker transport" } });
+    const query_contract_tests = b.addTest(.{ .root_module = functions_test_mod, .filters = selectTestFilters(b, &.{ "api query contract", "local query contract", "decision functions worker transport", "query string:" }) });
     b.step("query-contract-test", "Run query parsing, worker transport and projection contracts").dependOn(&b.addRunArtifact(query_contract_tests).step);
 
     const logical_field_tests = b.addTest(.{ .root_module = functions_test_mod, .filters = selectTestFilters(b, &.{ "logical value", "logical query", "projection checkpoint external storage" }) });
@@ -251,7 +251,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const schema_contract_tests = b.addTest(.{
         .root_module = schema_contract_mod,
         .use_llvm = @import("../../../build_support/embedded/source_owner.zig").llvmBackend(target.result),
-        .filters = selectTestFilters(b, &.{ "relational contract schema parsing uses bounded stack", "created nested response allowlists cover generated schemas", "api http public sort capability gate", "logical field public capability ownership" }),
+        .filters = selectTestFilters(b, &.{ "relational contract schema parsing uses bounded stack", "relational contract property child traversal", "created nested response allowlists cover generated schemas", "api http public sort capability gate", "logical field public capability ownership" }),
     });
     const parser_source = schema_contract_mod.import_table.get("antfly_local_sources").?;
     const parser_selection = b.addOptions();
@@ -260,7 +260,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const schema_parser_tests = b.addTest(.{
         .root_module = parser_source,
         .use_llvm = @import("../../../build_support/embedded/source_owner.zig").llvmBackend(target.result),
-        .filters = selectTestFilters(b, &.{"relational contract schema parsing uses bounded stack"}),
+        .filters = selectTestFilters(b, &.{ "relational contract schema parsing uses bounded stack", "relational contract property child traversal" }),
     });
     const schema_contract_step = b.step("antfly-schema-contract-test", "Run bounded schema parsing and public response/sort contracts");
     schema_contract_step.dependOn(&b.addRunArtifact(schema_contract_tests).step);
@@ -810,7 +810,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
 
     const lib_managed_embedder_tests = b.addTest(.{
         .root_module = antfly_test_mod,
-        .filters = &.{"managed embedder"},
+        .filters = selectTestFilters(b, &.{"managed embedder"}),
     });
     const run_lib_managed_embedder_tests = addFilteredTestRunArtifact(b, lib_managed_embedder_tests);
     const lib_managed_embedder_test_step = b.step("antfly-inference-managed-embedder-test", "Run managed embedder contract and provider tests");
@@ -967,6 +967,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         module.addImport("antfly_platform", platform_mod);
         module.addImport("antfly_hash", antfly_imports.hash);
         module.addImport("inference_checkpoint_control", inference_checkpoint_mod);
+        module.addImport("antfly_scraping", antfly_imports.scraping);
     }
     runtime_io_abi_test_mod.linkLibrary(runtime_io_abi_provider);
     const runtime_io_abi_tests = b.addTest(.{
@@ -1812,6 +1813,21 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const root_test_step = b.step("root-test", "Run fast root-module compile smoke tests");
     root_test_step.dependOn(&run_lib_unit_tests.step);
 
+    const graph_capability_filters = selectTestFilters(b, &.{
+        "unsupported graph diagnostics identify the rejected operation feature",
+        "graph capability diagnostic",
+        "authenticated single-group graph queries require distributed coordination",
+    });
+    const graph_capability_tests = b.addTest(.{
+        .name = "graph-capability-tests",
+        .root_module = antfly_test_mod,
+        .filters = compileFiltersWithAnchors(b, &.{ "api module compiles", "metadata module compiles" }, graph_capability_filters),
+        .max_rss = 7 * 1024 * 1024 * 1024,
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("antfly-graph-capability-test", "Run graph capability admission and request-owned diagnostic contracts")
+        .dependOn(&addFilteredTestRunArtifactWithRuntimeFilters(b, graph_capability_tests, graph_capability_filters).step);
+
     const lib_bedrock_tests = b.addTest(.{
         .root_module = antfly_test_mod,
         .filters = &.{"bedrock provider request helpers"},
@@ -2093,6 +2109,21 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     b.step("antfly-api-native-query-repository-test", "Run native query checkpoint reuse, retention and executor ownership contracts").dependOn(&addFilteredTestRunArtifactWithRuntimeFilters(b, native_query_repository_tests, native_query_repository_filters).step);
+    const execution_budget_filters = &.{ "internal transaction ingress establishes", "online merge ingress bounds", "public execution", "remote shard query phases propagate deadline and request cancellation", "remote scan fails closed without streaming and honors cancellation before transport", "table reads translate request deadlines into the routing clock" };
+    const execution_budget_tests = b.addTest(.{
+        .root_module = api_http_runtime_test_mod,
+        .filters = execution_budget_filters,
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    const execution_budget_step = b.step("antfly-api-execution-budget-test", "Verify public deadlines and SQL engine budgets");
+    execution_budget_step.dependOn(&addFilteredTestRunArtifactWithRuntimeFilters(b, execution_budget_tests, execution_budget_filters).step);
+    const routing_deadline_filters = &.{ "public execution routing budgets", "metadata routing server converts relative budget to local deadline", "system catalog forwarding retains its executor clock" };
+    const routing_deadline_tests = b.addTest(.{
+        .root_module = metadata_unit_baseline_mods[1],
+        .filters = routing_deadline_filters,
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    execution_budget_step.dependOn(&addFilteredTestRunArtifactWithRuntimeFilters(b, routing_deadline_tests, routing_deadline_filters).step);
     const api_http_runtime_test_step = b.step("antfly-api-test", "Run API contracts and linked-boundary tests");
     // Cross-package imports do not discover their libraries' tests in this
     // root. Compile shared contracts at their own module boundary instead.
@@ -2235,7 +2266,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     test_imports.configure(b, lite_reader_test_mod, true, true);
     const lite_reader_tests = b.addTest(.{
         .root_module = lite_reader_test_mod,
-        .filters = &.{ "search.search.", "search.query.", "search.scorer.", "search.aggregation.", "datetime.", "index.", "merger.", "segment.", "section.inverted.", "section.typed_doc_values.", "section.doc_values.", "section.vector_section." },
+        .filters = selectTestFilters(b, &.{ "search.search.", "search.query.", "search.scorer.", "search.aggregation.", "datetime.", "index.", "merger.", "segment.", "section.inverted.", "section.typed_doc_values.", "section.doc_values.", "section.vector_section." }),
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     b.step("lite-bounded-reader-test", "Verify segment scratch reuse and stored search result ownership")
@@ -2284,7 +2315,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     cmd_test_mod.addImport("antfly-client", antfly_client_pkg_mod);
     const cmd_tests = b.addTest(.{
         .root_module = cmd_test_mod,
-        .filters = &.{"cmd.cli."},
+        .filters = &.{ "cmd.cli.", "client URL option" },
         .test_runner = .{
             .path = b.path("pkg/antfly-embedded/src/test_runner.zig"),
             .mode = .simple,
@@ -2296,6 +2327,45 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const run_cmd_tests = @import("../../../build_support/antfly/test_support.zig").addCuratedTestRunArtifact(b, cmd_tests, cmd_tests.filters);
     const cmd_test_step = b.step("antfly-cmd-test", "Run Antfly command and client CLI tests");
     cmd_test_step.dependOn(&run_cmd_tests.step);
+    const agent_policy_tests = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly-embedded/src/cmd/cli/agent.zig"),
+        .target = target,
+        .optimize = optimize,
+    }) });
+    cmd_test_step.dependOn(&b.addRunArtifact(agent_policy_tests).step);
+    const human_output_tests = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly-embedded/src/cmd/cli/human.zig"),
+        .target = target,
+        .optimize = optimize,
+    }) });
+    cmd_test_step.dependOn(&b.addRunArtifact(human_output_tests).step);
+    const invocation_tests = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/cli_invocation.zig"),
+        .target = target,
+        .optimize = optimize,
+    }) });
+    cmd_test_step.dependOn(&b.addRunArtifact(invocation_tests).step);
+    const cli_contract_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/cli_contract_main.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    antfly_imports.configureCli(cli_contract_mod, true);
+    const cli_contract_options = b.addOptions();
+    cli_contract_options.addOption(bool, "linked_runtime_boundaries", true);
+    cli_contract_mod.addOptions("standalone_runtime_options", cli_contract_options);
+    cli_contract_mod.addImport("antfly-client", antfly_client_pkg_mod);
+    const cli_contract = b.addExecutable(.{ .name = "antfly-cli-contract", .root_module = cli_contract_mod });
+    const install_cli_contract = b.addInstallArtifact(cli_contract, .{});
+    b.step("antfly-cli-contract-bin", "Build the lightweight process fixture for the full remote CLI contract").dependOn(&install_cli_contract.step);
+    const cli_agent_process_tests = b.addSystemCommand(&.{ "python3", "../scripts/ci/test_cli_agent_contract.py", "--binary" });
+    cli_agent_process_tests.addArtifactArg(cli_contract);
+    const cli_agent_test_step = b.step("antfly-cli-agent-test", "Run CLI unit, process delivery and paired benchmark contracts");
+    cli_agent_test_step.dependOn(&cli_agent_process_tests.step);
+    cli_agent_test_step.dependOn(cmd_test_step);
+    const cli_evaluation_contract_tests = b.addSystemCommand(&.{ "python3", "-B", "-m", "unittest", "discover", "-s", "../scripts/ci", "-p", "test_cli_coding_agent_eval.py" });
+    cli_agent_test_step.dependOn(&cli_evaluation_contract_tests.step);
+    b.step("cli-agent-evaluation-test", "Verify coding-agent answer grading and token/cost usage attribution without model calls").dependOn(&cli_evaluation_contract_tests.step);
     const index_maintenance_cli_tests = b.addTest(.{ .root_module = cmd_test_mod, .filters = &.{ "cmd.cli.maintenance.", "cmd.cli.index_maintenance_replay." } });
     b.step("antfly-index-maintenance-cli-test", "Run existing and relational index maintenance CLI contracts").dependOn(&addFilteredTestRunArtifact(b, index_maintenance_cli_tests).step);
 
@@ -2841,7 +2911,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     test_imports.configure(b, filtered_topk_mod, true, true);
     const filtered_topk_tests = b.addTest(.{
         .root_module = filtered_topk_mod,
-        .filters = &.{ "producer top k", "deferred membership refines", "streaming boolean", "search.scorer.", "sparse exclusion masks", "public ordering seeks complete ties", "warm tie pagination", "sparse predicate planning", "text statistics", "necessary term routing", "retained closure", "dynamic exact keys", "rank cursors" },
+        .filters = &.{ "producer top k", "logical value borrowed", "deferred membership refines", "streaming boolean", "search.scorer.", "sparse exclusion masks", "public ordering seeks complete ties", "warm tie pagination", "sparse predicate planning", "text statistics", "necessary term routing", "retained closure", "dynamic exact keys", "rank cursors" },
         .max_rss = 8 * 1024 * 1024 * 1024,
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
@@ -3188,6 +3258,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "owned split secondary credit transfers into a budgeted allocator",
         "pinned split credit survives idle allocation windows",
         "logical inference slices can charge only physical host memory",
+        "mapped residency observations never consume inference host admission",
         "batch release accounting errors fail closed",
         "single release and observer mismatch cannot debit unrelated memory",
         "resource identity ledgers bound tombstones across churn and reject stale owners",
@@ -5417,6 +5488,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const vector_payload_test_mod = makeLmdbModule(b, "pkg/antfly/src/vector_payload_store_test_root.zig", target, optimize, build_options, lmdb_engine_mod, platform_mod, hash_mod);
     vector_payload_test_mod.addImport("antfly_test_error_logs", antfly_imports.storage_boundary.test_error_logs);
     antfly_imports.configureRuntimeContracts(vector_payload_test_mod);
+    vector_payload_test_mod.addImport("storage_engine_errors", antfly_imports.storage_boundary.engine_errors);
     vector_payload_test_mod.addImport("bloom", bloom_mod);
     vector_payload_test_mod.addImport("antfly_vectorindex", vectorindex_mod);
     vector_payload_test_mod.addImport("antfly-json", json_mod);
@@ -6194,7 +6266,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .dependOn(&addFilteredTestRunArtifact(b, resolver_alias_tests).step);
     const query_capture_tests = b.addTest(.{
         .root_module = db_test_mod,
-        .filters = &.{"query capture"},
+        .filters = selectTestFilters(b, &.{"query capture"}),
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     b.step("antfly-query-capture-test", "Verify retained query consistency, cancellation and enrichment independence")
@@ -6427,6 +6499,14 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     });
     const run_storage_work_contract_tests = addCuratedTestRunArtifact(b, storage_work_contract_tests, storage_work_contract_tests.filters);
     b.step("storage-work-contract-test", "Run storage boundary and bounded-work regressions").dependOn(&run_storage_work_contract_tests.step);
+
+    const dense_selection_tests = b.addTest(.{
+        .root_module = db_test_mod,
+        .filters = &.{ "one percent native filter routes through integrated dense search exactly", "native dense residual batches cross named callbacks" },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("native-dense-selection-test", "Verify exact lake dense-ID callback intersection and empty selections")
+        .dependOn(&addFilteredTestRunArtifact(b, dense_selection_tests).step);
 
     const release_scale_tests = b.addTest(.{
         .root_module = db_test_mod,
@@ -6972,6 +7052,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "storage.retained_effects.",
             "storage.rewrite_program_cache.",
             "storage.rewrite_tail_spool.",
+            "storage.source_proof_registry.",
             "storage.source_pin_state.",
             "storage.source_snapshot.",
             "storage.restore_owner.",

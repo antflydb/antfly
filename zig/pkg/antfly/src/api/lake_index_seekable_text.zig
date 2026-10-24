@@ -105,10 +105,15 @@ fn upload(a: A, store: *stores.ArtifactStore, bytes: []const u8, cancellation: C
     defer if (ref.provider_version) |version| writer.allocator.free(version);
     return .{ .artifact_id = ref.artifact_id, .checksum = ref.checksum, .byte_len = ref.byte_len };
 }
-fn initialMetadata(a: A, bytes: []const u8) ![]const Range {
+fn initialMetadata(a: A, source: local.index.SegmentSource) ![]const Range {
+    const length = std.math.cast(usize, source.len()) orelse return error.NativeLakeTextCorpusTooLarge;
+    var footer: [24]u8 = undefined;
     // Opaque/legacy fixtures keep their existing all-block representation.
-    if (bytes.len < 56 or !std.mem.eql(u8, bytes[bytes.len - 4 ..], "AFSM")) return &.{};
-    var reader = try local.segment.RangeSegmentReader.init(a, .{ .contiguous = bytes }, .{});
+    if (length < 56) return &.{};
+    try source.readInto(length - footer.len, &footer);
+    if (!std.mem.eql(u8, footer[20..], "AFSM")) return &.{};
+    var reader = try local.segment.RangeSegmentReader.init(a, source, .{});
+    reader.owns_source = false;
     defer reader.deinit();
     var ranges: std.ArrayList(Range) = .empty;
     try ranges.append(a, .{ .offset = @intCast(reader.stored_offset), .len = @intCast(@min(21, reader.stored_metadata_length)) });
@@ -116,8 +121,8 @@ fn initialMetadata(a: A, bytes: []const u8) ![]const Range {
         .offset = @intCast(reader.stored_offset + 21 + @as(u64, reader.doc_count) * 24),
         .len = @as(usize, reader.num_blocks) * 8,
     });
-    const tail = if (reader.paged_source) |paged| paged.directory.offset else std.mem.readInt(u64, bytes[bytes.len - 24 ..][0..8], .big);
-    try ranges.append(a, .{ .offset = @intCast(tail), .len = bytes.len - @as(usize, @intCast(tail)) });
+    const tail = if (reader.paged_source) |paged| paged.directory.offset else std.mem.readInt(u64, footer[0..8], .big);
+    try ranges.append(a, .{ .offset = @intCast(tail), .len = length - @as(usize, @intCast(tail)) });
     for (reader.fields) |field| for (field.sections) |section| {
         if (section.section_type != .inverted_text or section.length == 0) continue;
         const view = (try reader.sectionView(field.name, .inverted_text)).?;
@@ -137,7 +142,7 @@ fn initialMetadata(a: A, bytes: []const u8) ![]const Range {
         // Bundle those same pages so tiny metadata reads do not fetch adjacent
         // original-pack ranges solely to establish the native CRC proof.
         const page_start = requested.offset / block_bytes * block_bytes;
-        const page_end = @min(bytes.len, std.mem.alignForward(usize, requested.offset + requested.len, block_bytes));
+        const page_end = @min(length, std.mem.alignForward(usize, requested.offset + requested.len, block_bytes));
         const range: Range = if (reader.paged_source != null) .{ .offset = page_start, .len = page_end - page_start } else requested;
         if (merged.items.len != 0) {
             const last = &merged.items[merged.items.len - 1];
@@ -148,10 +153,10 @@ fn initialMetadata(a: A, bytes: []const u8) ![]const Range {
         }
         try merged.append(a, range);
     }
-    var length: usize = 0;
-    for (merged.items) |range| length = try std.math.add(usize, length, range.len);
+    var metadata_length: usize = 0;
+    for (merged.items) |range| metadata_length = try std.math.add(usize, metadata_length, range.len);
     // Oversized optional navigation stays in authenticated native blocks.
-    return if (length <= pack_bytes and length < bytes.len / 2) merged.items else &.{};
+    return if (metadata_length <= pack_bytes and metadata_length < length / 2) merged.items else &.{};
 }
 fn packedPiece(a: A, pack: Ref, offset: usize, pack_offset: usize, bytes: []const u8) !Piece {
     var digest: [32]u8 = undefined;
@@ -161,23 +166,285 @@ fn packedPiece(a: A, pack: Ref, offset: usize, pack_offset: usize, bytes: []cons
     const id = try scope.artifactId(checksum);
     return .{ .offset = offset, .ref = .{ .artifact_id = try a.dupe(u8, &id), .checksum = checksum, .byte_len = bytes.len }, .pack = pack, .pack_offset = pack_offset };
 }
+/// Content-defined boundaries resynchronize after posting insertions/deletions.
+/// Logical ranges remain at most 64 KiB and retain ordinary SHA256 proofs.
+const gear_table = blk: {
+    @setEvalBranchQuota(10000);
+    var table: [256]u64 = undefined;
+    for (&table, 0..) |*entry, byte| {
+        var gear = @as(u64, byte) +% 0x9e3779b97f4a7c15;
+        gear = (gear ^ (gear >> 30)) *% 0xbf58476d1ce4e5b9;
+        gear = (gear ^ (gear >> 27)) *% 0x94d049bb133111eb;
+        entry.* = gear ^ (gear >> 31);
+    }
+    break :blk table;
+};
+fn chunkLength(bytes: []const u8) usize {
+    const maximum = @min(block_bytes, bytes.len);
+    if (maximum <= 8 * 1024) return maximum;
+    var rolling: u64 = 0;
+    for (bytes[0..maximum], 0..) |byte, i| {
+        rolling = (rolling << 1) +% gear_table[byte];
+        if (i >= 8 * 1024 and rolling & 0x7fff == 0) return i + 1;
+    }
+    return maximum;
+}
+/// Operation-owned reusable immutable blocks. References keep their original
+/// attempt/pack locators, so existing cloud certificates and GC trace them.
+pub const Reuse = struct {
+    a: A,
+    budget: local.sql_memory_budget,
+    arena: std.heap.ArenaAllocator = undefined,
+    pieces: std.AutoHashMapUnmanaged([32]u8, Piece) = .empty,
+    reused_bytes: u64 = 0,
+    uploaded_bytes: u64 = 0,
+    pub fn create(a: A, store: stores.ArtifactStore, refs: []const Ref, token: Cancellation) !?*Reuse {
+        const self = try a.create(Reuse);
+        self.* = .{ .a = a, .budget = .{ .backing = local.sql_memory_budget.reclaimingAllocator(a), .limit = 16 * 1024 * 1024 } };
+        self.arena = .init(self.budget.allocator());
+        var owned = true;
+        defer if (owned) self.deinit();
+        self.prepare(store, refs, token) catch |err| {
+            if (err == error.OutOfMemory and self.budget.isExhausted()) return null;
+            return err;
+        };
+        owned = false;
+        return self;
+    }
+    fn prepare(self: *Reuse, store: stores.ArtifactStore, refs: []const Ref, token: Cancellation) !void {
+        const a = self.arena.allocator();
+        for (refs) |ref| {
+            try token.check();
+            const directory = try loadDirectoryInner(a, .{ .store = store, .cache = null, .context = .{}, .cancellation = token }, ref, true);
+            for (directory.blocks) |piece| try self.pieces.put(a, try stores.sha256DigestFromChecksum(piece.ref.checksum), piece);
+        }
+    }
+    pub fn deinit(self: *Reuse) void {
+        self.arena.deinit();
+        self.a.destroy(self);
+    }
+};
+/// Repack only changed content. A merge may change every native byte offset,
+/// while unchanged posting blocks keep their authenticated old physical ranges.
+pub fn publishSourceReusing(a: A, out: A, store: *stores.ArtifactStore, source: local.index.SegmentSource, cancellation: Cancellation, opening: ?*@import("lake_index_text_opening_pack.zig").Collector, reuse: ?*Reuse) !Ref {
+    const previous = reuse orelse return publishSourceWithOpeningCollector(a, out, store, source, cancellation, opening);
+    const length = std.math.cast(usize, source.len()) orelse return error.NativeLakeTextCorpusTooLarge;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const ca = arena.allocator();
+    const ranges = try initialMetadata(ca, source);
+    var metadata: std.ArrayList(Piece) = .empty;
+    var blocks: std.ArrayList(Piece) = .empty;
+    var compressed_bundle: ?Ref = null;
+    var decoded_bytes: usize = 0;
+    if (ranges.len != 0) {
+        var bundle: std.ArrayList(u8) = .empty;
+        for (ranges) |range| try source.readInto(range.offset, try bundle.addManyAsSlice(ca, range.len));
+        const compressed = try local.encoding_snappy.encode(ca, bundle.items);
+        if (compressed.len <= bundle.items.len - bundle.items.len / 8) {
+            compressed_bundle = try upload(ca, store, compressed, cancellation);
+            if (opening) |collector| try collector.add(compressed_bundle.?, compressed);
+            decoded_bytes = bundle.items.len;
+        } else {
+            const pack = try upload(ca, store, bundle.items, cancellation);
+            if (opening) |collector| try collector.add(pack, bundle.items);
+            var offset: usize = 0;
+            for (ranges) |range| {
+                try metadata.append(ca, try packedPiece(ca, pack, range.offset, offset, bundle.items[offset..][0..range.len]));
+                offset += range.len;
+            }
+        }
+    }
+    const Pending = struct { offset: usize, bytes: []const u8, pack_offset: usize, pack_slot: usize, retained: ?Piece, metadata: bool };
+    var position: usize = 0;
+    var meta: usize = 0;
+    var ahead: ?*PackReadAhead = null;
+    defer if (ahead) |job| job.deinit(store.io_phase.?.io);
+    while (position < length) {
+        try cancellation.check();
+        var wave = std.heap.ArenaAllocator.init(a);
+        defer wave.deinit();
+        const wa = wave.allocator();
+        var contents: [stores.ArtifactStore.max_upload_batch][]const u8 = undefined;
+        var count: usize = 0;
+        var next = position;
+        const reuse_width = @max(1, @min(uploadWidth(a, store), (@import("../serverless/build/lake_build_limits.zig").WorkingSetAllocator.headroom(a) orelse 0) / (4 * pack_bytes)));
+        const width = if (store.io_phase != null and @import("lake_index_segment_spill.zig").LocalSegment.readAheadSource(source) != null)
+            @min(reuse_width, @max(1, store.io_phase.?.max_parallel -| 1))
+        else
+            reuse_width;
+        const ready = ahead;
+        ahead = null;
+        defer if (ready) |job| job.deinit(store.io_phase.?.io);
+        if (ready) |job| {
+            try job.join(store);
+            count = job.count;
+            for (contents[0..count], 0..) |*payload, i| payload.* = job.bytes[i * pack_bytes .. @min(job.bytes.len, (i + 1) * pack_bytes)];
+            next += job.bytes.len;
+        } else while (count < width and next < length) : (count += 1) {
+            const end = @min(length, next + pack_bytes);
+            contents[count] = if (source == .contiguous) source.contiguous[next..end] else blk: {
+                const bytes = try wa.alloc(u8, end - next);
+                try source.readInto(next, bytes);
+                break :blk bytes;
+            };
+            next = end;
+        }
+        if (next < length) ahead = PackReadAhead.start(a, store, source, next, width, cancellation);
+        var pending: std.ArrayList(Pending) = .empty;
+        var uploads: [stores.ArtifactStore.max_upload_batch][]const u8 = undefined;
+        var upload_count: usize = 0;
+        var base = position;
+        for (contents[0..count]) |payload| {
+            const end = base + payload.len;
+            var changed: std.ArrayList(u8) = .empty;
+            var offset = base;
+            while (offset < end) {
+                while (meta < ranges.len and ranges[meta].offset + ranges[meta].len <= offset) meta += 1;
+                const is_meta = meta < ranges.len and ranges[meta].offset <= offset;
+                const limit = @min(end, if (meta < ranges.len) (if (is_meta) ranges[meta].offset + ranges[meta].len else ranges[meta].offset) else length);
+                if (is_meta and compressed_bundle == null) {
+                    offset = limit;
+                    continue;
+                }
+                const following = if (is_meta) limit else offset + chunkLength(payload[offset - base .. limit - base]);
+                const bytes = payload[offset - base .. following - base];
+                var digest: [32]u8 = undefined;
+                std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
+                const retained = if (!is_meta) previous.pieces.get(digest) else null;
+                const reused = if (retained) |piece| piece.ref.byte_len == bytes.len else false;
+                try pending.append(wa, .{ .offset = offset, .bytes = bytes, .pack_offset = changed.items.len, .pack_slot = upload_count, .retained = if (reused) retained else null, .metadata = is_meta });
+                if (!reused) try changed.appendSlice(wa, bytes);
+                offset = following;
+            }
+            if (changed.items.len != 0) {
+                uploads[upload_count] = changed.items;
+                upload_count += 1;
+            }
+            previous.uploaded_bytes += changed.items.len;
+            base = end;
+        }
+        // One bounded transport wave shares fresh publication's admission and
+        // drain contract. Retained ranges keep their original immutable packs.
+        var uploaded: [stores.ArtifactStore.max_upload_batch]stores.ArtifactMetadata = undefined;
+        try store.putBatchWithCancellation(if (store.io_phase) |phase| phase.io else null, uploads[0..upload_count], uploaded[0..upload_count], cancellation);
+        defer for (uploaded[0..upload_count]) |*item| item.deinit(store.allocator);
+        var packs: [stores.ArtifactStore.max_upload_batch]Ref = undefined;
+        for (uploaded[0..upload_count], packs[0..upload_count]) |item, *pack| pack.* = .{ .artifact_id = try ca.dupe(u8, item.artifact_id), .checksum = try ca.dupe(u8, item.checksum), .byte_len = item.byte_len };
+        for (pending.items) |item| {
+            const piece = if (item.retained) |retained| blk: {
+                var result = retained;
+                result.offset = item.offset;
+                previous.reused_bytes += item.bytes.len;
+                break :blk result;
+            } else try packedPiece(ca, packs[item.pack_slot], item.offset, item.pack_offset, item.bytes);
+            if (item.metadata) try metadata.append(ca, piece) else try blocks.append(ca, piece);
+        }
+        position = next;
+    }
+    const directory: Directory = .{ .version = if (compressed_bundle != null) 5 else 4, .metadata_bundle = compressed_bundle, .metadata_decoded_bytes = decoded_bytes, .bytes = length, .metadata = metadata.items, .blocks = blocks.items, .terms = &.{} };
+    try directory.validate();
+    const encoded = try std.json.Stringify.valueAlloc(ca, directory, .{});
+    if (encoded.len > 4 * 1024 * 1024) return error.NativeLakeTextCorpusTooLarge;
+    const result = try upload(out, store, encoded, cancellation);
+    if (opening) |collector| try collector.add(result, encoded);
+    return result;
+}
+fn uploadWidth(a: A, store: *const stores.ArtifactStore) usize {
+    const phase = store.io_phase orelse return 1;
+    const available = @import("../serverless/build/lake_build_limits.zig").WorkingSetAllocator.headroom(a) orelse return 1;
+    // Borrowed payloads need no capture buffer. Leave conservative headroom
+    // for bounded provider staging and returned identities during parallel I/O.
+    return @max(1, @min(stores.ArtifactStore.max_upload_batch, phase.max_parallel, available / (2 * pack_bytes)));
+}
+/// One optional next wave. The caller owns the source until cancellation/join
+/// drains; a child never borrows its parent's CPU/I/O phase or arena state.
+const PackReadAhead = struct {
+    const Scheduler = local.sql_parallel_scheduler;
+    a: A,
+    source: local.index.SegmentSource,
+    token: Cancellation,
+    offset: usize,
+    bytes: []u8,
+    count: usize,
+    scheduler: *Scheduler.Scheduler,
+    reservation: usize,
+    task: ?Scheduler.Task(anyerror!void) = null,
+    fn run(self: *PackReadAhead) anyerror!void {
+        try self.token.check();
+        try self.source.readInto(self.offset, self.bytes);
+        try self.token.check();
+    }
+    fn start(a: A, store: *stores.ArtifactStore, source: local.index.SegmentSource, offset: usize, width: usize, token: Cancellation) ?*PackReadAhead {
+        const phase = store.io_phase orelse return null;
+        const scheduler = phase.scheduler orelse return null;
+        if (phase.park == null or phase.resume_cpu == null or phase.max_parallel < 2) return null;
+        const raw = @import("lake_index_segment_spill.zig").LocalSegment.readAheadSource(source) orelse return null;
+        const length = @min(width * pack_bytes, source.len() - offset);
+        if (length == 0) return null;
+        const reservation = length * 2 + 64 * 1024;
+        if ((@import("../serverless/build/lake_build_limits.zig").WorkingSetAllocator.headroom(a) orelse 0) < reservation) return null;
+        if (!scheduler.reservePull(0, reservation)) return null;
+        var transferred = false;
+        defer if (!transferred) scheduler.releasePull(0, reservation);
+        const job = a.create(PackReadAhead) catch return null;
+        var job_live = true;
+        defer if (job_live) a.destroy(job);
+        const bytes = a.alloc(u8, length) catch return null;
+        var bytes_live = true;
+        defer if (bytes_live) a.free(bytes);
+        job.* = .{ .a = a, .source = raw, .token = token, .offset = offset, .bytes = bytes, .count = std.math.divCeil(usize, length, pack_bytes) catch unreachable, .scheduler = scheduler, .reservation = reservation };
+        job.task = scheduler.submitIoTransient(phase.io, 0, run, .{job}) orelse return null;
+        transferred = true;
+        job_live = false;
+        bytes_live = false;
+        return job;
+    }
+    fn join(self: *PackReadAhead, store: *stores.ArtifactStore) !void {
+        const phase = store.io_phase.?;
+        phase.park.?(phase.ptr);
+        const result = self.task.?.await(phase.io);
+        self.task = null;
+        try phase.resume_cpu.?(phase.ptr);
+        try result;
+        try self.token.check();
+    }
+    fn deinit(self: *PackReadAhead, io: std.Io) void {
+        if (self.task) |*task| _ = task.cancel(io) catch {};
+        self.a.free(self.bytes);
+        self.scheduler.releasePull(0, self.reservation);
+        self.a.destroy(self);
+    }
+};
 pub fn publish(a: A, out: A, store: *stores.ArtifactStore, bytes: []const u8, cancellation: Cancellation) !Ref {
     return publishWithOpeningCollector(a, out, store, bytes, cancellation, null);
 }
 pub fn publishWithOpeningCollector(a: A, out: A, store: *stores.ArtifactStore, bytes: []const u8, cancellation: Cancellation, opening: ?*@import("lake_index_text_opening_pack.zig").Collector) !Ref {
+    return publishSourceWithOpeningCollector(a, out, store, .{ .contiguous = bytes }, cancellation, opening);
+}
+/// Borrow an immutable source and capture at most one admitted pack wave.
+/// File-backed compaction never needs a complete contiguous output buffer.
+pub fn publishSource(a: A, out: A, store: *stores.ArtifactStore, source: local.index.SegmentSource, cancellation: Cancellation) !Ref {
+    return publishSourceWithOpeningCollector(a, out, store, source, cancellation, null);
+}
+pub fn publishSourceWithOpeningCollector(a: A, out: A, store: *stores.ArtifactStore, source: local.index.SegmentSource, cancellation: Cancellation, opening: ?*@import("lake_index_text_opening_pack.zig").Collector) !Ref {
+    const length = std.math.cast(usize, source.len()) orelse return error.NativeLakeTextCorpusTooLarge;
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
     const ca = arena.allocator();
     // Upload large immutable packs, with independently authenticated bounded
     // range units. Broad reads coalesce adjacent units into one pack range GET,
     // while sparse queries never download an entire pack to authenticate it.
-    const ranges = try initialMetadata(ca, bytes);
+    const ranges = try initialMetadata(ca, source);
     var metadata: std.ArrayList(Piece) = .empty;
     var compressed_bundle: ?Ref = null;
     var decoded_bytes: usize = 0;
     if (ranges.len != 0) {
         var bundle: std.ArrayList(u8) = .empty;
-        for (ranges) |range| try bundle.appendSlice(ca, bytes[range.offset..][0..range.len]);
+        for (ranges) |range| {
+            const target = try bundle.addManyAsSlice(ca, range.len);
+            try source.readInto(range.offset, target);
+        }
         const compressed = try local.encoding_snappy.encode(ca, bundle.items);
         if (compressed.len <= bundle.items.len - bundle.items.len / 8) {
             compressed_bundle = try upload(ca, store, compressed, cancellation);
@@ -196,25 +463,65 @@ pub fn publishWithOpeningCollector(a: A, out: A, store: *stores.ArtifactStore, b
     var blocks: std.ArrayList(Piece) = .empty;
     var position: usize = 0;
     var metadata_position: usize = 0;
-    while (position < bytes.len) {
-        const pack_end = @min(position + pack_bytes, bytes.len);
-        const pack = try upload(ca, store, bytes[position..pack_end], cancellation);
-        var offset = position;
-        while (offset < pack_end) {
-            while (metadata_position < ranges.len and ranges[metadata_position].offset + ranges[metadata_position].len <= offset) metadata_position += 1;
-            if (metadata_position < ranges.len and ranges[metadata_position].offset <= offset) {
-                const end = @min(pack_end, ranges[metadata_position].offset + ranges[metadata_position].len);
-                if (compressed_bundle != null) try metadata.append(ca, try packedPiece(ca, pack, offset, offset - position, bytes[offset..end]));
-                offset = end;
-                continue;
+    var pending: ?*PackReadAhead = null;
+    defer if (pending) |job| job.deinit(store.io_phase.?.io);
+    while (position < length) {
+        var wave = std.heap.ArenaAllocator.init(a);
+        defer wave.deinit();
+        var contents: [stores.ArtifactStore.max_upload_batch][]const u8 = undefined;
+        var uploaded: [stores.ArtifactStore.max_upload_batch]stores.ArtifactMetadata = undefined;
+        var count: usize = 0;
+        var next = position;
+        const width = if (store.io_phase != null and @import("lake_index_segment_spill.zig").LocalSegment.readAheadSource(source) != null)
+            @min(uploadWidth(a, store), @max(1, store.io_phase.?.max_parallel -| 1))
+        else
+            uploadWidth(a, store);
+        const ready = pending;
+        pending = null;
+        defer if (ready) |job| job.deinit(store.io_phase.?.io);
+        if (ready) |job| {
+            try job.join(store);
+            count = job.count;
+            for (contents[0..count], 0..) |*payload, i| payload.* = job.bytes[i * pack_bytes .. @min(job.bytes.len, (i + 1) * pack_bytes)];
+            next += job.bytes.len;
+        } else while (count < width and next < length) : (count += 1) {
+            const end = @min(next + pack_bytes, length);
+            if (source == .contiguous) {
+                contents[count] = source.contiguous[next..end];
+            } else {
+                const captured = try wave.allocator().alloc(u8, end - next);
+                try source.readInto(next, captured);
+                contents[count] = captured;
             }
-            const end = @min(@min(offset + block_bytes, pack_end), if (metadata_position < ranges.len) ranges[metadata_position].offset else bytes.len);
-            try blocks.append(ca, try packedPiece(ca, pack, offset, offset - position, bytes[offset..end]));
-            offset = end;
+            next = end;
         }
-        position = pack_end;
+        if (next < length) pending = PackReadAhead.start(a, store, source, next, width, cancellation);
+        // Payloads borrow the already-admitted immutable segment. Metadata
+        // stays on the synchronized store allocator until every child drains;
+        // only this serial owner mutates descriptor arenas after CPU resumes.
+        try store.putBatchWithCancellation(if (store.io_phase) |phase| phase.io else null, contents[0..count], uploaded[0..count], cancellation);
+        defer for (uploaded[0..count]) |*item| item.deinit(store.allocator);
+        for (contents[0..count], uploaded[0..count]) |payload, item| {
+            const pack: Ref = .{ .artifact_id = try ca.dupe(u8, item.artifact_id), .checksum = try ca.dupe(u8, item.checksum), .byte_len = item.byte_len };
+            const pack_end = position + payload.len;
+            var offset = position;
+            while (offset < pack_end) {
+                while (metadata_position < ranges.len and ranges[metadata_position].offset + ranges[metadata_position].len <= offset) metadata_position += 1;
+                if (metadata_position < ranges.len and ranges[metadata_position].offset <= offset) {
+                    const end = @min(pack_end, ranges[metadata_position].offset + ranges[metadata_position].len);
+                    if (compressed_bundle != null) try metadata.append(ca, try packedPiece(ca, pack, offset, offset - position, payload[offset - position .. end - position]));
+                    offset = end;
+                    continue;
+                }
+                const limit = @min(pack_end, if (metadata_position < ranges.len) ranges[metadata_position].offset else length);
+                const end = offset + chunkLength(payload[offset - position .. limit - position]);
+                try blocks.append(ca, try packedPiece(ca, pack, offset, offset - position, payload[offset - position .. end - position]));
+                offset = end;
+            }
+            position = pack_end;
+        }
     }
-    const directory: Directory = .{ .version = if (compressed_bundle != null) 5 else 4, .metadata_bundle = compressed_bundle, .metadata_decoded_bytes = decoded_bytes, .bytes = bytes.len, .metadata = metadata.items, .blocks = blocks.items, .terms = &.{} };
+    const directory: Directory = .{ .version = if (compressed_bundle != null) 5 else 4, .metadata_bundle = compressed_bundle, .metadata_decoded_bytes = decoded_bytes, .bytes = length, .metadata = metadata.items, .blocks = blocks.items, .terms = &.{} };
     try directory.validate();
     const encoded = try std.json.Stringify.valueAlloc(ca, directory, .{});
     if (encoded.len > 4 * 1024 * 1024) return error.NativeLakeTextCorpusTooLarge;
@@ -223,8 +530,11 @@ pub fn publishWithOpeningCollector(a: A, out: A, store: *stores.ArtifactStore, b
     return ref;
 }
 pub fn loadDirectory(a: A, read: Read, ref: Ref) !Directory {
+    return loadDirectoryInner(a, read, ref, false);
+}
+fn loadDirectoryInner(a: A, read: Read, ref: Ref, publication: bool) !Directory {
     if (ref.byte_len > 4 * 1024 * 1024) return error.InvalidNativeLakeTextCorpus;
-    const bytes = try artifacts.readArtifact(a, read.store, ref, read.cancellation, read.cache);
+    const bytes = if (publication) try artifacts.readPublicationArtifact(a, read.store, ref, read.cancellation) else try artifacts.readArtifact(a, read.store, ref, read.cancellation, read.cache);
     defer a.free(bytes);
     const directory = try std.json.parseFromSliceLeaky(Directory, a, bytes, .{ .allocate = .alloc_always });
     try directory.validate();
@@ -289,7 +599,19 @@ const PhysicalWarm = struct {
         return .{ .value = .{ .bytes = bytes, .digest = digest }, .owner = .{ .bytes = bytes, .owner = .{ .shared = .{ .ptr = holder, .release_fn = release } } } };
     }
 };
+fn requiredRange(a: A, store: stores.ArtifactStore, id: []const u8, offset: u64, length: usize, token: Cancellation, publication: bool) ![]u8 {
+    var phase = if (publication) try store.beginIo(1) else stores.IoGuard{};
+    defer phase.abort();
+    var backend = store;
+    backend.io_phase = null;
+    const bytes = backend.getRangeAllocWithCancellationUsingAllocator(a, id, offset, length, token) catch |err| return phase.failed(err);
+    errdefer a.free(bytes);
+    try phase.finish();
+    try token.check();
+    return bytes;
+}
 const CoalescedRead = struct {
+    publication: bool = false,
     store: stores.ArtifactStore,
     pack: Ref,
     start: u64,
@@ -480,7 +802,7 @@ const CoalescedRead = struct {
     }
     fn range(self: *@This(), a: A, piece: Piece) ![]u8 {
         if (self.bytes == null) {
-            self.bytes = try self.store.getRangeAllocWithCancellationUsingAllocator(self.a, self.pack.artifact_id, self.start, self.length, self.cancellation);
+            self.bytes = try requiredRange(self.a, self.store, self.pack.artifact_id, self.start, self.length, self.cancellation, self.publication);
             if (self.bytes.?.len != self.length) return error.ArtifactIntegrityMismatch;
         }
         const offset: usize = @intCast(piece.pack_offset - self.start);
@@ -488,16 +810,20 @@ const CoalescedRead = struct {
     }
 };
 fn readPieceLease(a: A, store: stores.ArtifactStore, piece: Piece, cancellation: Cancellation, cached: ?artifacts.CachedRead) !local.serverless_query_lake_serving_cache.Cache.ImmutableLease {
-    return readPieceLeaseCoalesced(a, store, piece, cancellation, cached, null);
+    return readPieceLeaseCoalesced(a, store, piece, cancellation, cached, null, false);
 }
-fn readPieceLeaseCoalesced(a: A, store: stores.ArtifactStore, piece: Piece, cancellation: Cancellation, cached: ?artifacts.CachedRead, coalesced: ?*CoalescedRead) !local.serverless_query_lake_serving_cache.Cache.ImmutableLease {
-    if (piece.pack == null) return artifacts.readArtifactLease(a, store, piece.ref, cancellation, cached);
+fn readPieceLeaseCoalesced(a: A, store: stores.ArtifactStore, piece: Piece, cancellation: Cancellation, cached: ?artifacts.CachedRead, coalesced: ?*CoalescedRead, publication: bool) !local.serverless_query_lake_serving_cache.Cache.ImmutableLease {
+    if (piece.pack == null) {
+        if (publication) return .{ .heap = .{ .alloc = a, .bytes = try artifacts.readPublicationArtifact(a, store, piece.ref, cancellation) } };
+        return artifacts.readArtifactLease(a, store, piece.ref, cancellation, cached);
+    }
     const Loader = struct {
         store: stores.ArtifactStore,
         piece: Piece,
         cancellation: Cancellation,
         coalesced: ?*CoalescedRead,
         cached: ?artifacts.CachedRead,
+        publication: bool,
         traffic: local.serverless_query_lake_serving_cache.Cache.ProviderRead = .{ .requests = 0, .bytes = 0 },
         fn providerRead(raw: *anyopaque) local.serverless_query_lake_serving_cache.Cache.ProviderRead {
             const self: *@This() = @ptrCast(@alignCast(raw));
@@ -505,10 +831,9 @@ fn readPieceLeaseCoalesced(a: A, store: stores.ArtifactStore, piece: Piece, canc
         }
         fn load(raw: *anyopaque, alloc: A) ![]u8 {
             const self: *@This() = @ptrCast(@alignCast(raw));
-            var source = self.store;
             self.traffic = if (self.coalesced) |group| if (group.bytes == null) .{ .requests = 1, .bytes = group.length } else .{ .requests = 0, .bytes = 0 } else .{ .requests = 1, .bytes = self.piece.ref.byte_len };
             if (self.coalesced != null and self.cached != null) self.traffic = .{ .requests = 0, .bytes = 0 };
-            const bytes = if (self.coalesced) |group| try group.range(alloc, self.piece) else try source.getRangeAllocWithCancellationUsingAllocator(alloc, self.piece.pack.?.artifact_id, self.piece.pack_offset, @intCast(self.piece.ref.byte_len), self.cancellation);
+            const bytes = if (self.coalesced) |group| try group.range(alloc, self.piece) else try requiredRange(alloc, self.store, self.piece.pack.?.artifact_id, self.piece.pack_offset, @intCast(self.piece.ref.byte_len), self.cancellation, self.publication);
             errdefer alloc.free(bytes);
             if (bytes.len != self.piece.ref.byte_len) return error.ArtifactIntegrityMismatch;
             var digest: [32]u8 = undefined;
@@ -532,7 +857,7 @@ fn readPieceLeaseCoalesced(a: A, store: stores.ArtifactStore, piece: Piece, canc
         };
         return cache.cache.admitVerifiedBlock(a, cache.scope, piece.ref.artifact_id, length, digest, cache.context, verified);
     }
-    var loader: Loader = .{ .store = store, .piece = piece, .cancellation = cancellation, .coalesced = coalesced, .cached = cached };
+    var loader: Loader = .{ .store = store, .piece = piece, .cancellation = cancellation, .coalesced = coalesced, .cached = cached, .publication = publication };
     return .{ .heap = .{ .alloc = a, .bytes = try Loader.load(&loader, a) } };
 }
 const Owner = struct {
@@ -545,6 +870,9 @@ const Owner = struct {
     manifest_ordinal: usize = 0,
     fallback: ?Read,
     query_scoped: bool = false,
+    // Only the operation-owned loadPublication factory opts in. Keep the
+    // shared Read capability and retained serving-owner footprint unchanged.
+    publication: bool = false,
     metadata_bundle: []u8 = &.{},
     metadata_resident_bytes: std.atomic.Value(usize) = .init(0),
     resource_manager: ?*local.storage_resource_manager.ResourceManager = null,
@@ -672,7 +1000,7 @@ const Owner = struct {
             defer if (group) |*value| value.deinit();
             for (pieces) |piece| {
                 try self.capability.check();
-                var lease = try readPieceLeaseCoalesced(std.heap.page_allocator, self.capability.store, piece, token, cached, if (group) |*value| value else null);
+                var lease = try readPieceLeaseCoalesced(std.heap.page_allocator, self.capability.store, piece, token, cached, if (group) |*value| value else null, false);
                 lease.deinit();
             }
         }
@@ -844,6 +1172,7 @@ const Owner = struct {
         defer pin.release();
         const directory = pin.value;
         if (start > directory.bytes or out.len > directory.bytes - start) return error.InvalidNativeLakeTextCorpus;
+        if (self.publication) return self.readPublication(directory, capability, start, out);
         const io = capability.context.io orelse return self.readSerial(directory, capability, start, out);
         if (out.len <= pack_bytes) return self.readSerial(directory, capability, start, out);
         var tasks: [3]?local.sql_parallel_scheduler.Task(anyerror!void) = @splat(null);
@@ -881,13 +1210,54 @@ const Owner = struct {
         }
         try capability.check();
     }
-    fn metadataBytes(self: *@This(), directory: Directory, capability: Read) !?[]const u8 {
+    fn readPublication(self: *@This(), directory: Directory, capability: Read, start: u64, out: []u8) !void {
+        const phase_cap = capability.store.io_phase orelse return self.readSerialPhase(directory, capability, start, out, true);
+        const scratch = self.a;
+        const available = @import("../serverless/build/lake_build_limits.zig").WorkingSetAllocator.headroom(scratch);
+        const memory_width = if (available) |bytes| @max(1, bytes / (pack_bytes * 3)) else 1;
+        const width = @max(1, @min(4, phase_cap.max_parallel, memory_width));
+        if (out.len <= pack_bytes) return self.readSerialPhase(directory, capability, start, out, true);
+        // Reserve the whole bounded wave while parking its CPU owner. Children
+        // use raw transport, so a one-slot scheduler cannot nest I/O admission.
+        var worker = capability;
+        worker.store.io_phase = null;
+        const Worker = struct {
+            fn run(owner: *Owner, dir: Directory, cap: Read, offset: u64, target: []u8, failure: *?anyerror) void {
+                owner.readSerial(dir, cap, offset, target) catch |err| {
+                    failure.* = err;
+                };
+            }
+        };
+        var done: usize = 0;
+        while (done < out.len) {
+            try capability.check();
+            const count = @min(width, std.math.divCeil(usize, out.len - done, pack_bytes) catch unreachable);
+            var phase = try capability.store.beginIo(count);
+            defer phase.abort();
+            var failures: [4]?anyerror = @splat(null);
+            var group: std.Io.Group = .init;
+            defer group.cancel(phase_cap.io);
+            for (0..count) |lane| {
+                const take = @min(pack_bytes, out.len - done);
+                group.async(phase_cap.io, Worker.run, .{ self, directory, worker, start + done, out[done..][0..take], &failures[lane] });
+                done += take;
+            }
+            group.await(phase_cap.io) catch |err| {
+                group.cancel(phase_cap.io);
+                return phase.failed(err);
+            };
+            for (failures[0..count]) |failure| if (failure) |err| return phase.failed(err);
+            try phase.finish();
+        }
+        try capability.check();
+    }
+    fn metadataBytes(self: *@This(), directory: Directory, capability: Read, publication: bool) !?[]const u8 {
         @import("antfly_platform").sync.lockYielding(&self.mutex);
         defer self.mutex.unlock();
         try capability.check();
         if (self.metadata_bundle.len == 0) {
             const pack = directory.metadata_bundle orelse return null;
-            const encoded = artifacts.readArtifact(self.a, capability.store, pack, capability.cancellation, capability.cache) catch |err| switch (err) {
+            const encoded = (if (publication) artifacts.readPublicationArtifact(self.a, capability.store, pack, capability.cancellation) else artifacts.readArtifact(self.a, capability.store, pack, capability.cancellation, capability.cache)) catch |err| switch (err) {
                 // Navigation residency is optional; continue through bounded
                 // verified range leases when this physical owner is full.
                 error.OutOfMemory => return null,
@@ -917,8 +1287,12 @@ const Owner = struct {
         return self.metadata_bundle;
     }
     fn readSerial(self: *@This(), directory: Directory, capability: Read, start: u64, out: []u8) anyerror!void {
+        return self.readSerialPhase(directory, capability, start, out, false);
+    }
+    fn readSerialPhase(self: *@This(), directory: Directory, capability: Read, start: u64, out: []u8, publication: bool) anyerror!void {
         try capability.check();
         if (start > directory.bytes or out.len > directory.bytes - start) return error.InvalidNativeLakeTextCorpus;
+        const transport = if (self.publication) self.a else std.heap.page_allocator;
         var offset: usize = @intCast(start);
         var done: usize = 0;
         var group: ?CoalescedRead = null;
@@ -928,7 +1302,7 @@ const Owner = struct {
             const metadata = containing(directory.metadata, offset);
             const block = if (metadata == null) containing(directory.blocks, offset) else null;
             const piece = if (metadata) |index| directory.metadata[index] else if (block) |index| directory.blocks[index] else return error.InvalidNativeLakeTextCorpus;
-            if (metadata != null and directory.metadata_bundle != null) if (try self.metadataBytes(directory, capability)) |bytes| {
+            if (metadata != null and directory.metadata_bundle != null) if (try self.metadataBytes(directory, capability, publication)) |bytes| {
                 const within = offset - piece.offset;
                 const take = @min(out.len - done, @as(usize, @intCast(piece.ref.byte_len)) - within);
                 try capability.check();
@@ -951,10 +1325,10 @@ const Owner = struct {
                         if (following.offset != piece.offset + length or following.offset >= requested_end or following.pack == null or !std.mem.eql(u8, following.pack.?.artifact_id, pack.artifact_id) or following.pack_offset != piece.pack_offset + length) break;
                         length += @intCast(following.ref.byte_len);
                     }
-                    group = .{ .store = capability.store, .pack = pack, .start = piece.pack_offset, .length = length, .logical_end = piece.offset + length, .cancellation = capability.cancellation, .a = std.heap.page_allocator, .pieces = directory.blocks[index..next] };
+                    group = .{ .publication = publication, .store = capability.store, .pack = pack, .start = piece.pack_offset, .length = length, .logical_end = piece.offset + length, .cancellation = capability.cancellation, .a = transport, .pieces = directory.blocks[index..next] };
                 };
             }
-            var lease = try readPieceLeaseCoalesced(std.heap.page_allocator, capability.store, piece, capability.cancellation, capability.cache, if (group) |*value| value else null);
+            var lease = try readPieceLeaseCoalesced(transport, capability.store, piece, capability.cancellation, capability.cache, if (group) |*value| value else null, publication);
             defer lease.deinit();
             const data = lease.bytes();
             try capability.check();
@@ -1020,11 +1394,20 @@ pub fn routedReader(a: A, source: local.index.SegmentSource) !local.segment.Segm
     if (!std.mem.eql(u8, group.segments[index].artifact_id, ref.artifact_id) or !std.mem.eql(u8, group.segments[index].checksum, ref.checksum) or group.segments[index].byte_len != ref.byte_len) return error.InvalidNativeLakeTextCorpus;
     return local.segment.SegmentReader.initAuthenticated(a, source, group.admissions[index]);
 }
+/// The caller owns this source and all of its readers until merge completion.
+/// It must not publish it into a shared serving corpus.
+pub fn loadPublication(a: A, read: Read, ref: Ref) !local.index.SegmentData {
+    std.debug.assert(read.cache == null);
+    return loadInner(a, read, ref, true);
+}
 pub fn load(a: A, read: Read, ref: Ref) !local.index.SegmentData {
+    return loadInner(a, read, ref, false);
+}
+fn loadInner(a: A, read: Read, ref: Ref, publication: bool) !local.index.SegmentData {
     const owner = try a.create(Owner);
-    owner.* = .{ .a = a, .arena = .init(a), .directory = undefined, .loaded = &.{}, .fallback = read, .resource_manager = read.resource_manager };
+    owner.* = .{ .a = a, .arena = .init(a), .directory = undefined, .loaded = &.{}, .fallback = read, .resource_manager = read.resource_manager, .publication = publication };
     errdefer Owner.release(owner);
-    owner.directory = try loadDirectory(owner.arena.allocator(), read, ref);
+    owner.directory = try loadDirectoryInner(owner.arena.allocator(), read, ref, publication);
     owner.directory_bytes = owner.directory.bytes;
     owner.loaded = try owner.arena.allocator().alloc(bool, owner.directory.blocks.len);
     @memset(owner.loaded, false);
@@ -1783,8 +2166,15 @@ test "external lake required pack reads overlap and return every scheduler reser
         active: std.atomic.Value(usize) = .init(0),
         peak: std.atomic.Value(usize) = .init(0),
         fail: bool = false,
+        execution: ?*local.sql_parallel_scheduler.Execution = null,
         fn range(raw: *anyopaque, alloc: A, id: []const u8, offset: u64, len: usize, cancellation: Cancellation) ![]u8 {
             const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.execution) |execution| {
+                try std.testing.expect(!execution.active);
+                var other: local.sql_parallel_scheduler.Execution = .{ .scheduler = execution.scheduler, .bytes = 1 };
+                try other.enter(std.testing.io);
+                other.pause();
+            }
             const active = self.active.fetchAdd(1, .acq_rel) + 1;
             defer _ = self.active.fetchSub(1, .acq_rel);
             _ = self.peak.fetchMax(active, .monotonic);
@@ -1811,6 +2201,68 @@ test "external lake required pack reads overlap and return every scheduler reser
     try std.testing.expectEqual(@as(usize, 0), provider.active.load(.acquire));
     try std.testing.expectEqual(@as(usize, 0), local.sql_parallel_scheduler.global().workers);
     try std.testing.expectEqual(@as(usize, 0), local.sql_parallel_scheduler.global().bytes);
+    const Phase = struct {
+        execution: local.sql_parallel_scheduler.Execution,
+        pending: ?local.sql_parallel_scheduler.Execution.Io = null,
+        fn begin(raw: *anyopaque, count: usize) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.pending = try self.execution.beginIo(std.testing.io, count);
+        }
+        fn finish(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            var pending = self.pending.?;
+            self.pending = null;
+            try pending.finish();
+        }
+        fn abort(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.pending) |*pending| pending.abort();
+            self.pending = null;
+        }
+    };
+    // Both bounded parallel waves and the single-lane fallback park the CPU
+    // owner for every provider read, then resume it before decoding continues.
+    for ([_]usize{ 1, 3, 3 }, 0..) |width, case| {
+        var build = try @import("../serverless/build/lake_build_limits.zig").WorkingSetAllocator.init(a, .{ .max_working_set_bytes = pack_bytes * 12 });
+        var memory: local.sql_memory_budget = .{ .backing = build.allocator(), .limit = pack_bytes + pack_bytes * 3 * (if (case == 2) @as(usize, 1) else width) };
+        const expected_width: usize = if (case == 2) 1 else width;
+        var scheduler: local.sql_parallel_scheduler.Scheduler = .{ .max_workers = 1, .max_io_workers = width };
+        var phase: Phase = .{ .execution = .{ .scheduler = &scheduler, .bytes = 1 } };
+        try phase.execution.enter(io);
+        defer phase.execution.pause();
+        const capability: stores.IoPhase = .{ .io = io, .ptr = &phase, .max_parallel = width, .begin = Phase.begin, .finish = Phase.finish, .abort = Phase.abort };
+        var publication = read;
+        publication.store.io_phase = &capability;
+        provider.execution = &phase.execution;
+        defer provider.execution = null;
+        provider.fail = false;
+        provider.peak.store(0, .release);
+        {
+            var publication_data = try loadPublication(memory.allocator(), .{ .store = store, .cache = null, .context = .{ .io = io }, .cancellation = .none }, ref);
+            defer publication_data.deinit(memory.allocator());
+            const publication_owner: *Owner = @ptrCast(@alignCast(publication_data.native.ranges.ptr));
+            const retained = memory.live;
+            try publication_owner.read(publication, 0, output);
+            try std.testing.expectEqualSlices(u8, bytes, output);
+            try std.testing.expect(phase.execution.active);
+            try std.testing.expectEqual(@as(usize, 0), scheduler.io_workers);
+            if (expected_width > 1) try std.testing.expect(provider.peak.load(.acquire) > 1);
+            try std.testing.expect(provider.peak.load(.acquire) <= expected_width);
+            try std.testing.expect(memory.peak > retained and memory.peak <= memory.limit);
+            try std.testing.expectEqual(retained, memory.live);
+
+            // Small reads and broad backend failures restore the same admission.
+            try publication_owner.read(publication, 17, output[0..97]);
+            try std.testing.expectEqualSlices(u8, bytes[17..][0..97], output[0..97]);
+            provider.fail = true;
+            try std.testing.expectError(error.TestRemoteUnavailable, publication_owner.read(publication, 0, output));
+            try std.testing.expect(phase.execution.active);
+            try std.testing.expectEqual(@as(usize, 0), provider.active.load(.acquire));
+            try std.testing.expectEqual(@as(usize, 0), scheduler.io_workers);
+        }
+        try std.testing.expectEqual(@as(usize, 0), memory.live);
+        try std.testing.expectEqual(@as(usize, 0), build.live_bytes);
+    }
 }
 
 test "external lake admitted directories evict independently of the corpus heap and pin live readers" {
@@ -1987,4 +2439,204 @@ test "external lake seekable metadata opens all field navigation with two authen
     var expired = packed_read;
     expired.context.deadline_ns = 1;
     try std.testing.expectError(error.DeadlineExceeded, opening.warm(a, store, collector.refs.items[0], store.upload_scope.?.domain, expired, .none));
+}
+
+test "external lake seekable source publication bounds capture and preserves byte backed identity" {
+    const Source = struct {
+        bytes: []const u8,
+        largest: usize = 0,
+        fn read(raw: *anyopaque, offset: u64, out: []u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.largest = @max(self.largest, out.len);
+            @memcpy(out, self.bytes[@intCast(offset)..][0..out.len]);
+        }
+        fn close(_: *anyopaque) void {
+            @panic("publication closed its borrowed source");
+        }
+        fn begin(_: *anyopaque, _: usize) !void {}
+        fn finish(_: *anyopaque) !void {}
+        fn abort(_: *anyopaque) void {}
+    };
+    const a = std.testing.allocator;
+    var temporary = try local.common_test_directory.TestDirectory.init("seekable-source-publication");
+    defer temporary.cleanup();
+    var fs = try @import("../serverless/artifacts/fs_store.zig").FsStore.init(a, temporary.path());
+    defer fs.deinit();
+    var store = fs.artifactStore();
+    store.upload_scope = .{ .domain = @splat(7), .attempt = @splat(1) };
+    const bytes = try a.alloc(u8, 4 * pack_bytes + 17);
+    defer a.free(bytes);
+    @memset(bytes, 7);
+    var source: Source = .{ .bytes = bytes };
+    const phase: stores.IoPhase = .{ .io = std.testing.io, .ptr = &source, .max_parallel = 4, .begin = Source.begin, .finish = Source.finish, .abort = Source.abort };
+    store.io_phase = &phase;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const expected = try publish(a, arena.allocator(), &store, bytes, .none);
+    var memory: local.sql_memory_budget = .{ .backing = a, .limit = 3 * pack_bytes };
+    const actual = try publishSource(memory.allocator(), arena.allocator(), &store, .{ .ranges = .{ .ptr = &source, .length = bytes.len, .read_into = Source.read, .close = Source.close } }, .none);
+    try std.testing.expectEqualStrings(expected.artifact_id, actual.artifact_id);
+    try std.testing.expect(source.largest <= pack_bytes);
+    try std.testing.expectEqual(@as(usize, 0), memory.live);
+    try std.testing.expect(!memory.exhausted);
+    var fixed_bytes: [4096]u8 = undefined;
+    var fixed = std.heap.FixedBufferAllocator.init(&fixed_bytes);
+    var unknown: local.sql_memory_budget = .{ .backing = fixed.allocator(), .limit = 64 * pack_bytes };
+    try std.testing.expectEqual(@as(usize, 1), uploadWidth(unknown.allocator(), &store));
+}
+
+test "external lake seekable source publication pipelines local reads and drains admission" {
+    const a = std.testing.allocator;
+    const Check = struct {
+        fn call(_: *anyopaque) !void {}
+    };
+    var check: u8 = 0;
+    var manager: local.sql_spill.Manager = .{ .alloc = a, .io = std.testing.io, .context = &check, .checkpoint = Check.call, .async_writes = false };
+    defer manager.deinit();
+    var directory = try local.common_test_directory.TestDirectory.init("seekable-pack-read-ahead");
+    defer directory.cleanup();
+    var fs = try @import("../serverless/artifacts/fs_store.zig").FsStore.init(a, directory.path());
+    defer fs.deinit();
+    var store = fs.artifactStore();
+    store.upload_scope = .{ .domain = @splat(7), .attempt = @splat(1) };
+    const bytes = try a.alloc(u8, 7 * pack_bytes + 17);
+    defer a.free(bytes);
+    for (bytes, 0..) |*byte, i| byte.* = @truncate(i);
+    const staged = try @import("lake_index_segment_spill.zig").LocalSegment.create(a, &manager, &store, bytes);
+    defer staged.release();
+    var output = std.heap.ArenaAllocator.init(a);
+    defer output.deinit();
+    const expected = try publish(a, output.allocator(), &store, bytes, .none);
+    const old = try publish(a, output.allocator(), &store, &.{0}, .none);
+    for ([_]bool{ false, true }) |reusing| for ([_]usize{ 1, 3 }) |lanes| {
+        var scheduler: local.sql_parallel_scheduler.Scheduler = .{ .max_workers = 1, .max_io_workers = lanes, .max_bytes = 128 * 1024 * 1024 };
+        var execution: local.sql_parallel_scheduler.Execution = .{ .scheduler = &scheduler, .bytes = 1024 };
+        try execution.enter(std.testing.io);
+        defer execution.pause();
+        var phase: stores.ExecutionIo = .{ .execution = &execution, .io = std.testing.io };
+        store.io_phase = phase.capability();
+        defer store.io_phase = null;
+        staged.test_ahead_reads.store(0, .monotonic);
+        const reuse = if (reusing) (try Reuse.create(a, store, &.{old}, .none)).? else null;
+        defer if (reuse) |prior| prior.deinit();
+        const actual = try publishSourceReusing(a, output.allocator(), &store, staged.source(), .none, null, reuse);
+        try std.testing.expectEqualStrings(expected.artifact_id, actual.artifact_id);
+        try std.testing.expectEqual(lanes > 1, staged.test_ahead_reads.load(.monotonic) > 0);
+        try std.testing.expectEqual(@as(usize, 0), scheduler.pull_bytes);
+        try std.testing.expectEqual(@as(usize, 0), scheduler.io_workers);
+        try std.testing.expect(execution.active);
+    };
+}
+
+test "external lake source pack upload failure and cancellation drain pending local read ahead" {
+    const a = std.testing.allocator;
+    const Check = struct {
+        fn call(_: *anyopaque) !void {}
+    };
+    const Fail = struct {
+        fn put(_: *anyopaque, _: A, _: stores.UploadScope, _: []const u8, _: Cancellation) !stores.ArtifactMetadata {
+            return error.TestUploadFailed;
+        }
+    };
+    var marker: u8 = 0;
+    var manager: local.sql_spill.Manager = .{ .alloc = a, .io = std.testing.io, .context = &marker, .checkpoint = Check.call, .async_writes = false };
+    defer manager.deinit();
+    var directory = try local.common_test_directory.TestDirectory.init("seekable-read-ahead-failure");
+    defer directory.cleanup();
+    var fs = try @import("../serverless/artifacts/fs_store.zig").FsStore.init(a, directory.path());
+    defer fs.deinit();
+    var store = fs.artifactStore();
+    store.upload_scope = .{ .domain = @splat(7), .attempt = @splat(1) };
+    const bytes = try a.alloc(u8, 7 * pack_bytes + 17);
+    defer a.free(bytes);
+    for (bytes, 0..) |*byte, i| byte.* = @truncate(i);
+    const staged = try @import("lake_index_segment_spill.zig").LocalSegment.create(a, &manager, &store, bytes);
+    defer staged.release();
+    var scheduler: local.sql_parallel_scheduler.Scheduler = .{ .max_workers = 1, .max_io_workers = 3, .max_bytes = 128 * 1024 * 1024 };
+    var execution: local.sql_parallel_scheduler.Execution = .{ .scheduler = &scheduler, .bytes = 1024 };
+    try execution.enter(std.testing.io);
+    defer execution.pause();
+    var phase: stores.ExecutionIo = .{ .execution = &execution, .io = std.testing.io };
+    store.io_phase = phase.capability();
+    defer store.io_phase = null;
+    const prior = try publish(a, a, &store, &.{0}, .none);
+    defer a.free(prior.artifact_id);
+    defer a.free(prior.checksum);
+    const reuse = (try Reuse.create(a, store, &.{prior}, .none)).?;
+    defer reuse.deinit();
+    var vtable = store.vtable.*;
+    vtable.put_scoped = Fail.put;
+    store.vtable = &vtable;
+    try std.testing.expectError(error.TestUploadFailed, publishSource(a, a, &store, staged.source(), .none));
+    try std.testing.expectError(error.TestUploadFailed, publishSourceReusing(a, a, &store, staged.source(), .none, null, reuse));
+    try std.testing.expectEqual(@as(usize, 0), scheduler.pull_bytes);
+    try std.testing.expectEqual(@as(usize, 0), scheduler.io_workers);
+    try std.testing.expect(execution.active);
+    // Cancel a separately admitted next wave before adoption. Cancel/drain must
+    // finish before any leased source file or retained buffer is released.
+    var signal = std.atomic.Value(bool).init(false);
+    const token = Cancellation.fromAtomic(&signal);
+    const pending = PackReadAhead.start(a, &store, staged.source(), 0, 2, token) orelse return error.TestExpectedReadAhead;
+    signal.store(true, .release);
+    try std.testing.expectError(error.Canceled, pending.join(&store));
+    pending.deinit(std.testing.io);
+    try std.testing.expectEqual(@as(usize, 0), scheduler.pull_bytes);
+    try std.testing.expectEqual(@as(usize, 0), scheduler.io_workers);
+    try std.testing.expect(execution.active);
+}
+
+test "external lake content block reuse survives shifted offsets restart and integrity checks" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const out = arena.allocator();
+    var directory = try local.common_test_directory.TestDirectory.init("posting-block-reuse");
+    defer directory.cleanup();
+    var fs = try @import("../serverless/artifacts/fs_store.zig").FsStore.init(a, directory.path());
+    defer fs.deinit();
+    var store = fs.artifactStore();
+    store.upload_scope = try stores.UploadScope.forPublication(@splat(8), 1, std.testing.io);
+    const input = try a.alloc(u8, 4 * pack_bytes);
+    defer a.free(input);
+    var random: u64 = 0x123456789abcdef;
+    for (input) |*byte| {
+        random ^= random << 13;
+        random ^= random >> 7;
+        random ^= random << 17;
+        byte.* = @truncate(random);
+    }
+    const first = try publish(a, out, &store, input, .none);
+    const changed = try a.alloc(u8, input.len + 17);
+    defer a.free(changed);
+    @memcpy(changed[0..100], input[0..100]);
+    @memset(changed[100..117], 'x');
+    @memcpy(changed[117..], input[100..]);
+    store.upload_scope = try stores.UploadScope.forPublication(@splat(8), 2, std.testing.io);
+    const reuse = (try Reuse.create(a, store, &.{first}, .none)).?;
+    const second = try publishSourceReusing(a, out, &store, .{ .contiguous = changed }, .none, null, reuse);
+    try std.testing.expect(reuse.reused_bytes > changed.len * 3 / 4);
+    try std.testing.expect(reuse.uploaded_bytes < changed.len / 4);
+    reuse.deinit();
+    // Reopen without local verification caches or the reuse index. The
+    // persisted directory alone owns old and new physical pack ranges.
+    fs.deinit();
+    fs = try @import("../serverless/artifacts/fs_store.zig").FsStore.initExisting(a, directory.path());
+    store = fs.artifactStore();
+    store.upload_scope = try stores.UploadScope.forPublication(@splat(8), 3, std.testing.io);
+    var data = try load(a, .{ .store = fs.artifactStore(), .cache = null, .context = .{}, .cancellation = .none }, second);
+    defer data.deinit(a);
+    const restored = try a.alloc(u8, changed.len);
+    defer a.free(restored);
+    try data.source().readInto(0, restored);
+    try std.testing.expectEqualSlices(u8, changed, restored);
+    const committed = try loadDirectory(out, .{ .store = store, .cache = null, .context = .{}, .cancellation = .none }, second);
+    var old_refs: usize = 0;
+    for (committed.blocks) |piece| {
+        if ((try stores.uploadScopeFromArtifactId(piece.retainedArtifact().artifact_id)).?.fencingToken() == 1) old_refs += 1;
+    }
+    try std.testing.expect(old_refs > 32);
+    const identical = (try Reuse.create(a, store, &.{second}, .none)).?;
+    defer identical.deinit();
+    _ = try publishSourceReusing(a, out, &store, .{ .contiguous = changed }, .none, null, identical);
+    try std.testing.expectEqual(@as(u64, 0), identical.uploaded_bytes);
 }

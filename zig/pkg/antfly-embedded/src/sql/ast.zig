@@ -351,7 +351,7 @@ pub const PolicyDdl = struct {
     check_specified: bool = false,
 };
 pub const Statement = union(enum) {
-    explain: struct { statement: *const Statement, format: enum { text, json } = .text, verbose: bool = false },
+    explain: struct { statement: *const Statement, format: enum { text, json } = .text, verbose: bool = false, analyze: bool = false, costs: bool = false },
     select: Select,
     insert: Insert,
     update: Update,

@@ -306,7 +306,7 @@ class ZigValidationScopeTests(unittest.TestCase):
         for block in (native, wasm, models):
             self.assertIn("needs: [admission, changes]", block)
             self.assertIn("runs-on: arc-antfly-heavy", block)
-            self.assertIn('ANTFLY_ZIG_MAX_RSS: "23622320128"', block)
+            self.assertIn('ANTFLY_ZIG_MAX_RSS: "21474836480"', block)
         self.assertIn("Run hermetic Antfly unit tests", native)
         self.assertIn("Set up Node for generated source checks", native)
         for name in (

@@ -126,7 +126,18 @@ individual string. `matches` uses native Unicode regular-expression search,
 with anchors applying to the complete value. `autocomplete` uses a declared
 search-as-you-type mapping and its analyzer, preserving existing bool-prefix
 matching with alternatives for completed terms and the final prefix. Existing `match` remains analyzed
-full text; `term`, `prefix` and `regexp` retain indexed-term semantics.
+full text; `term`, `prefix`, `wildcard` and `regexp` retain indexed-term semantics.
+These operators match the terms produced by the field's analyzer. For example,
+a stemming analyzer can store `Maxwell` as `maxwel`: use `{"match":"Maxwell","field":"text"}`
+for natural-language input. Exact patterns are not stemmed.
+
+Set `case_insensitive: true` on an exact operator to fold ASCII letter case,
+for example `{"prefix":"Ghisl","field":"text","case_insensitive":true}`.
+This uses the indexed term dictionary and does not scan source documents.
+For Unicode folding over original values, use `equals`, `contains`, or `matches`
+with `case_sensitive: false`. Query-string prefix and wildcard expansions
+lowercase their literal ASCII letters by default; malformed query-string syntax
+returns an invalid-query error.
 
 Index candidates are verified before counts, ordering and pagination. Unindexed
 fallback requires `execution.value_verification.allow_scan`; defaults cap verification
