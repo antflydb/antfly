@@ -36930,13 +36930,16 @@ const TextProjectionProvenance = struct {
             schema_fingerprint = std.hash.Wyhash.hash(0x4154414e414c595a, &witness);
         }
         if (exclusion_revision != 0 and !try textConfigSelectsField(alloc, cfg.config_json)) {
-            if (schema) |value| for (value.exact_fields) |field| {
-                if (field.mapping.do_index or !std.mem.eql(u8, field.field, field.source_field)) continue;
-                var witness: [12]u8 = undefined;
-                std.mem.writeInt(u64, witness[0..8], schema_fingerprint, .little);
-                std.mem.writeInt(u32, witness[8..12], exclusion_revision, .little);
-                schema_fingerprint = std.hash.Wyhash.hash(0x4146444953580001, &witness);
-                break;
+            if (schema) |value| changed: for (value.full_text_documents) |document| {
+                for (document.fields) |field| {
+                    const mapping = schema_mod.resolveDeclaredFieldType(value, field.path) orelse continue;
+                    if (mapping.do_index) continue;
+                    var witness: [12]u8 = undefined;
+                    std.mem.writeInt(u64, witness[0..8], schema_fingerprint, .little);
+                    std.mem.writeInt(u32, witness[8..12], exclusion_revision, .little);
+                    schema_fingerprint = std.hash.Wyhash.hash(0x4146444953580001, &witness);
+                    break :changed;
+                }
             };
         }
         return .{

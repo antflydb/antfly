@@ -12089,7 +12089,7 @@ pub const DB = struct {
         for (state.entries.items) |entry| {
             var unavailable = indexRepairIntentBlocksService(entry.intent);
             if (!unavailable) {
-                if (entry.intent.trigger == .incomplete_bulk_publish) {
+                if ((entry.intent.trigger == .incomplete_bulk_publish or entry.intent.trigger == .text_projection_upgrade)) {
                     const checkpoint = try self.core.loadProjectionCheckpoint(alloc, entry.intent.index_name);
                     unavailable = checkpoint.status != .clean or checkpoint.config_hash != entry.intent.config_hash;
                 }
@@ -12173,7 +12173,7 @@ pub const DB = struct {
             }
             return;
         }
-        if (!unavailable and intent.trigger == .incomplete_bulk_publish) {
+        if (!unavailable and (intent.trigger == .incomplete_bulk_publish or intent.trigger == .text_projection_upgrade)) {
             const checkpoint = try self.core.loadProjectionCheckpoint(alloc, index_name);
             unavailable = checkpoint.status != .clean or checkpoint.config_hash != intent.config_hash;
         }
@@ -12630,7 +12630,7 @@ pub const DB = struct {
         // admission; the ordinary replay-repair exception is not authority.
         if (intent.work_class == .initial_build) return intent.phase != .cleanup;
         return switch (intent.trigger) {
-            .incomplete_bulk_publish => intent.phase != .cleanup,
+            .incomplete_bulk_publish, .text_projection_upgrade => intent.phase != .cleanup,
             // Only an operator-requested rebuild starts from a generation that
             // is still proven healthy. Coverage mismatch or missing proof is
             // fail-closed until replacement validation publishes cleanup.
@@ -13893,7 +13893,7 @@ pub const DB = struct {
             .operator_generation_rebuild, .operator_generation_validation, .storage_format_migration, .artifact_baseline_adoption => 0,
             .artifact_coverage_mismatch, .replay_artifact_unavailable => 1,
             .artifact_counter_missing => 2,
-            .incomplete_bulk_publish, .root_generation_rebuild, .projection_generation_invalid, .catalog_admission => 3,
+            .incomplete_bulk_publish, .text_projection_upgrade, .root_generation_rebuild, .projection_generation_invalid, .catalog_admission => 3,
         };
     }
 
@@ -15004,6 +15004,7 @@ pub const DB = struct {
                 .root_generation = state_identity.root_generation,
                 .index_name = index_name,
                 .kind = cfg.kind,
+                .trigger = if (cfg.kind == .full_text) .text_projection_upgrade else .incomplete_bulk_publish,
                 .config_hash = types.indexConfigHash(cfg),
                 .detected_sequence = target_sequence,
                 .target_sequence = target_sequence,
@@ -15486,12 +15487,12 @@ pub const DB = struct {
                 return result;
             }
         }
-        // Only startup discovery creates incomplete_bulk_publish intents, so
+        // Only startup discovery creates publication/projection-upgrade intents, so
         // this durable provenance is the authority to reclaim quarantine
         // ownership. Operator and generation-health intents may coexist with
         // retry/manual load failures but must not be reclassified as automatic
         // destructive recovery merely because they share an index name.
-        if (entry.intent.trigger == .incomplete_bulk_publish and
+        if ((entry.intent.trigger == .incomplete_bulk_publish or entry.intent.trigger == .text_projection_upgrade) and
             entry.intent.phase != .rolling_back)
         {
             // Retryable terminal phases release their quarantine claim so an
@@ -36338,6 +36339,7 @@ pub const DB = struct {
             item.repair_degraded = false;
         } else switch (intent.trigger) {
             .incomplete_bulk_publish,
+            .text_projection_upgrade,
             .root_generation_rebuild,
             .projection_generation_invalid,
             .operator_generation_validation,
