@@ -19,6 +19,9 @@ test {
     _ = @import("storage/lsm_backend/storage_io.zig");
     _ = @import("storage/lsm_backend/owned_atomic_file.zig");
     _ = @import("storage/lsm_backend/owned_run_writer.zig");
+    _ = @import("storage/lsm_backend/manifest_checkpoint.zig");
+    _ = @import("storage/lsm_backend/atomic_temporary.zig");
+    _ = @import("storage/lsm_backend/owned_manifest_set.zig");
     _ = @import("storage/lsm_backend/wal.zig");
     _ = @import("storage/lsm_backend.zig");
 }

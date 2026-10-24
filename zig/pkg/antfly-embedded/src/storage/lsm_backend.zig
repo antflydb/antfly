@@ -9538,13 +9538,8 @@ pub const Backend = struct {
     }
 
     fn parseRunIdFromRecoveredTableTempFileName(name: []const u8) ?u64 {
-        const marker = ".tbl.tmp-";
-        const marker_index = std.mem.indexOf(u8, name, marker) orelse return null;
-        if (marker_index == 0) return null;
-        const nonce = name[marker_index + marker.len ..];
-        if (nonce.len == 0) return null;
-        _ = std.fmt.parseUnsigned(u64, nonce, 10) catch return null;
-        return std.fmt.parseUnsigned(u64, name[0..marker_index], 10) catch null;
+        const target = @import("lsm_backend/atomic_temporary.zig").target(name) orelse return null;
+        return parseRunIdFromTableFileName(target);
     }
 
     fn runIdTrackedByManifestLocked(self: *Backend, run_id: u64) bool {
@@ -30828,5 +30823,59 @@ test "controlled physical sync interrupted close reclamation retains legacy dest
         try std.testing.expectEqual(@as(u64, 0), manager.sliceStats(.lsm_in_memory_state).used_bytes);
         try std.testing.expectEqual(@as(u64, 0), manager.snapshot().memory.accounting_errors);
         try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+    }
+}
+
+test "controlled physical sync writer recovery inventories both atomic schemes without reclaiming unrelated or mounted files" {
+    if (comptime @import("builtin").os.tag == .freestanding or @import("builtin").os.tag == .windows or @import("builtin").os.tag == .wasi) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = repository_mod.tmpPath(&path_buf, "owned-inventory-recovery");
+    defer repository_mod.cleanupTmp(path);
+    const root = std.mem.span(path);
+    {
+        var backend = try Backend.open(a, root, .{ .flush_threshold = 1 });
+        defer backend.close();
+        var txn = try backend.beginWrite();
+        errdefer txn.abort();
+        try txn.put(.{}, "key", "durable value");
+        try txn.commit();
+    }
+    const names = [_][]const u8{
+        "runs/123456.tbl.owned-42.tmp",
+        "runs/123456.tbl.tmp-43",
+        "manifest-99999.checkpoint.owned-123.tmp",
+        "manifest.bin.owned-456.tmp",
+        "manifest-99998.journal.tmp-789",
+        "manifest.bin.owned-x.tmp",
+        "unrelated.owned-1.tmp",
+        "runs/not-a-run.tbl.owned-1.tmp",
+    };
+    var native = try storage_io.NativeStorage.init(std.heap.page_allocator, .threaded);
+    defer native.deinit();
+    var paths: [names.len][]u8 = undefined;
+    var initialized: usize = 0;
+    defer for (paths[0..initialized]) |owned| a.free(owned);
+    for (names, &paths) |name, *owned| {
+        owned.* = try std.fs.path.join(a, &.{ root, name });
+        initialized += 1;
+        try native.storage().writeFileAbsolute(owned.*, "crash leftover");
+    }
+    {
+        var reader = try Backend.open(a, root, .{ .backend = .{ .read_only = true } });
+        defer reader.close();
+        for (paths) |owned| try std.Io.Dir.cwd().access(std.testing.io, owned, .{});
+    }
+    {
+        var writer = try Backend.open(a, root, .{});
+        defer writer.close();
+        for (paths, 0..) |owned, i| {
+            if (i < 5) try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(std.testing.io, owned, .{})) else try std.Io.Dir.cwd().access(std.testing.io, owned, .{});
+        }
+        const stats = writer.snapshotOpenStats();
+        try std.testing.expectEqual(@as(u64, 2), stats.recovered_table_temp_files_deleted_before_replay);
+        var txn = try writer.beginRead();
+        defer txn.abort();
+        try std.testing.expectEqualStrings("durable value", try txn.get(.{}, "key"));
     }
 }

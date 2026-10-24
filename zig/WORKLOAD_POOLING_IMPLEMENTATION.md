@@ -25843,3 +25843,98 @@ checks, plus the same four Bloom and 45/1/8 error companions. The final receipt
 and log digest and all 5,582 inputs match the unchanged source and preserved
 native snapshots. Formatting and whitespace checks pass. Full GNU qualification
 remains waived and the complete default-adoption design remains incomplete.
+
+
+## Retained manifest checkpoint and one-grant set publication
+
+`manifest_checkpoint.Encoder` serializes pinned run/obsolete metadata without
+heap allocation. Each original checkpoint precedes one bounded cursor callback,
+fixed header or at-most-16-KiB copy/hash step. Counts and label lengths are
+validated before narrowing. The producer maintains both CRC layers and writes
+the same checkpoint frame, including its final header backpatch. Commands stay
+frozen through rejected observation and are acknowledged before another
+fallible operation. Pure format/limit failures poison private progress; original
+rejection preserves it. CPU progress can move before IO borrows its command.
+Scratch retirement retains its slot across original rejection and fences further
+production, erasing no more than one 16-KiB region per checkpoint.
+
+The existing production `manifest_set.writeCheckpoint()` now drives this same
+producer, replacing its heap-allocated 64-KiB staging buffer. This remains an
+explicit synchronous legacy driver: sharing the producer does not enable
+admitted backend scheduling by itself. Wire format and descriptor/journal
+semantics remain unchanged. Existing ABI layouts are unchanged.
+
+`repository.OwnedManifestSetPublication(Source)` writes the checkpoint, empty
+successor journal and final descriptor in that order through owning private
+files. The caller prepays its fixed memory bound and provider grant, fences
+unrelated publication, supplies existing directories and pins immutable source
+metadata. All future paths/capabilities are validated before grant consumption.
+One still-funded completion grant transfers between all three files without
+another descriptor/worker admission; successful durable descriptor publication
+is the receipt authorizing backend installation. The grant remains reusable for
+a subsequent output. No application port or allocator callback is retained.
+
+Attempted and known-published flags survive phase transitions and abort. Abort
+joins accepted work before retiring producer scratch, removes only temporary
+files and retains final-path obligations. A possibly published descriptor
+requires backend recovery fencing; earlier checkpoint/journal outputs remain
+explicit cleanup obligations. The aggregate is a replacement-set publisher, not
+a live journal rotation. Native implementations remain cold writes with
+existing owning-file invalidation.
+
+Backend generation installation, source/output/ticket ownership, manifest
+obsolete-ledger adoption and default provider/caller wiring still need to carry
+these owners. Legacy synchronous callers remain until that integration is
+complete. Completion/history relief and the remaining default-gate requirements
+remain required; full GNU qualification is waived and the full design is
+incomplete.
+
+Crash inventory now recognizes both legacy `.tmp-<nonce>` and owning
+`.owned-<nonce>.tmp` siblings through one strict basename parser. Decimal nonce
+syntax and u64 bounds are checked before classifying the target as an SST or
+owned manifest name. Native writer recovery removes these interrupted private
+outputs under its existing writer fence; read-only opens leave them untouched.
+Malformed/unrelated names and mounted final files retain their existing
+protection. This closes the previously unrecognized owning-file crash residue
+path without broadening reclamation to arbitrary `.tmp` files.
+
+The replacement-set caller must reserve a fresh, unreferenced manifest ID
+before initialization. A successful descriptor receipt authorizes installation
+only against the still-fenced captured backend generation; the low-level owner
+does not infer ID freshness or mutate backend metadata. Those installation and
+recovery/obsolete-ledger obligations remain required for production adoption.
+
+The producer tests compare all bytes with the independent canonical journal
+encoder, including large binary key/obsolete-path labels, both namespace
+forms, compression/tombstone/visibility/GC metadata and both checksum layers.
+Canceled/DeadlineExceeded/FileNotFound are injected before every CPU checkpoint;
+commands, source progress and wire bytes remain exact. Movable CPU progress,
+frozen-command rejection, interrupted retirement, size refusal and malformed
+source counts are covered.
+
+The native pipeline writes an SST, transfers its still-funded grant through all
+three manifest files and into another output, then reads the descriptor and
+reconstructs the mounted codec stream. All other FDs are reserved, query capacity
+is occupied and reserved control work progresses at physical waits. Each
+original rejection is injected during opening/writing/publishing of each file,
+CPU construction and retirement; the legacy production driver produces identical
+bytes. Abandonment covers accepted writes/publication at every file. Separate
+physical failures after rename prove attempted versus known-published receipts,
+unchanged operation counts on retry, retained final paths and descriptor recovery
+uncertainty. Real native reopen verifies both temporary naming schemes under
+writer/read-only mounts while preserving malformed/unrelated files and data.
+
+The caller retains the provider reservation across every grant transfer,
+including reuse after publication. Retiring this publication's scratch/header
+does not release funding still needed by a successor grant owner.
+
+Final `retained-manifest-v3-integrated` passes 83/83 build steps, 70 physical-IO,
+32 embedded close, 170 table/codec, 74 WAL/recovery and 18 host/ABI checks.
+`retained-manifest-v3-fast` passes all 63 optimized physical/table/WAL steps
+with the same 70/170/74 cases. Both pass four standalone Bloom and 45/1/8
+error-identity companions. All 5,585 native/schema inputs and log digests match
+the final source, and seven immutable snapshots preserve every changed native
+file. Formatting and whitespace pass. Earlier v1/v2 receipts preserve corrected
+Zig naming conflicts and the test-only narrow phase-index overflow. Full GNU
+qualification remains waived; backend installation/default adoption and the
+remaining full-design requirements above remain incomplete.
