@@ -3210,3 +3210,47 @@ graph and SQL reducers. Several observers share the statement's immutable read
 cut and cumulative anchor/state quotas; owner-local distinct counts are never
 summed. SQL keeps its own aggregate reduction, NULL/empty-input semantics,
 coercion and final output evaluation.
+
+The eight-group/three-score public-boundary fixture verifies exact outputs on
+Lite and Directory after draining both native indexes. Work is independent of
+the source length for these selected key domains. Entries below are physical
+anchors / intermediate states; both backends report the same counts.
+
+| Query shape | Before, 8,000 documents | After, 8,000 and 64,000 documents |
+| --- | --- | --- |
+| Grouped COUNT(DISTINCT score) + 0 | 8,000 / 336,296 | 85 / 4,091 |
+| Global COUNT(DISTINCT score), output WHERE | 8,000 / 167,985 | 5 / 180 |
+| Grouped COUNT(DISTINCT score), following RETURN ORDER BY | 8,000 / 336,320 | 85 / 3,991 |
+| Grouped COUNT(DISTINCT score), output WHERE | 8,000 / 336,408 | 85 / 4,015 |
+
+The previous grouped shapes exceed the default state allowance at 32,000
+records; the previous global output filter exceeds it at 64,000. The new public
+regressions allow 256 anchors and 2 MiB, compare filtered windows with the
+ordinary executor, and check failing expressions outside nonzero windows.
+A separate 5,000-group regression bounds safe arithmetic, COALESCE and unary
+wrappers with the same allowance; native tests cover providers that decline
+observer ordering or ignore tuple seeks. Scalar DISTINCT also streams 5,000
+keys under a 512 KiB cursor allowance with narrow caller pages.
+
+For SQL over 32,000 documents, warmed median latency (one warmup followed by
+four measured executions) now tracks the scalar index domains rather than the
+source length:
+
+| SQL outer aggregate over GRAPH_TABLE | Lite before / after | Directory before / after |
+| --- | --- | --- |
+| COUNT(DISTINCT score), MIN(score), MAX(score) | 214.36 ms / 0.30 ms | 87.14 ms / 3.24 ms |
+
+At 64,000 documents the same outer aggregate measures 0.34 ms on Lite and
+3.06 ms on Directory. The separate native graph-bridge regression certifies
+all three observer passes before reading and exhausts them under five anchors;
+its narrow pages verify unit multiplicities and independent aggregate slots.
+
+Final verification after merging origin/main (`3f8eeafaaf`): 467 native Cypher
+tests; 1,080 SQL and 226 catalog-related tests plus four transport checks;
+139 system-catalog integration tests; all Go SDK packages; 521 TypeScript SDK
+tests (one skipped) and 290 Antfarm tests; and all 1,136 public Python Cypher
+and performance tests on the final optimized library. Antfarm builds, the
+137-function C API export boundary, generated error checks, formatting and
+whitespace checks also pass. The merge preserves both graph and native-memory
+SDK/UI contracts and assigns separate metadata floors and command tags to the
+new graph/session and resolver capabilities.
