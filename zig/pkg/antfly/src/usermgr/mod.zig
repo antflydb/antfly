@@ -36,6 +36,7 @@ pub const ResourceType = user_manager.ResourceType;
 pub const RowFilterEntry = user_manager.RowFilterEntry;
 pub const User = user_manager.User;
 pub const ValidatedApiKey = user_manager.ValidatedApiKey;
+pub const CredentialPolicySnapshot = user_manager.CredentialPolicySnapshot;
 pub const UserManager = user_manager.UserManager;
 pub const UserStore = user_manager.UserStore;
 pub const StorageCasbinAdapter = storage_adapter.StorageCasbinAdapter;

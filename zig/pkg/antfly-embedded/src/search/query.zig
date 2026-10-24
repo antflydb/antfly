@@ -37,6 +37,8 @@ const levenshtein = @import("levenshtein.zig");
 const regex_mod = @import("regex.zig");
 const typed_dv = @import("../section/typed_doc_values.zig");
 const geo = @import("geo.zig");
+const WorkAuthority = @import("work_authority.zig").Authority;
+const read_admission = @import("../common/read_admission.zig");
 const synonyms_mod = @import("../section/synonyms.zig");
 
 // Range-backed codecs propagate storage failures as well as decode failures.
@@ -122,6 +124,37 @@ pub const Filter = union(enum) {
             .doc_num => |f| f.executeWithOffset(alloc, seg, doc_offset),
             else => self.execute(alloc, seg),
         };
+    }
+
+    /// Borrow lifetime controls only for this invocation. These callbacks never
+    /// suspend: callers may retain analysis/index locks while evaluating filters.
+    pub fn executeWithOffsetAndAuthority(self: Filter, alloc: Allocator, seg: *const index_mod.SegmentEntry, doc_offset: u32, authority: ?WorkAuthority) FilterError!roaring.RoaringBitmap {
+        if (authority == null) return self.executeWithOffset(alloc, seg, doc_offset);
+        try authority.?.check();
+        seg.beginAccess();
+        defer seg.endAccess();
+        var result = switch (self) {
+            .term => |term| try term.executeWithAuthority(alloc, seg, authority),
+            .prefix => |filter| try filter.executeWithAuthority(alloc, seg, authority),
+            .fuzzy => |filter| try filter.executeWithAuthority(alloc, seg, authority),
+            .regexp => |filter| try filter.executeWithAuthority(alloc, seg, authority),
+            .wildcard => |filter| try filter.executeWithAuthority(alloc, seg, authority),
+            .term_range => |filter| try filter.executeWithAuthority(alloc, seg, authority),
+            .bool_filter => |filter| try filter.executeWithOffsetAndAuthority(alloc, seg, doc_offset, authority),
+            .match_all => blk: {
+                var bm = roaring.RoaringBitmap.init(alloc);
+                errdefer bm.deinit();
+                for (0..seg.reader.doc_count) |doc| {
+                    if (doc % 64 == 0) try authority.?.check();
+                    try bm.add(@intCast(doc));
+                }
+                break :blk bm;
+            },
+            else => try self.executeWithOffset(alloc, seg, doc_offset),
+        };
+        errdefer result.deinit();
+        try authority.?.check();
+        return result;
     }
 
     fn matchNone(alloc: Allocator) roaring.RoaringBitmap {
@@ -425,6 +458,19 @@ pub const TermFilter = struct {
     boost: f32 = 1.0,
 
     pub fn execute(self: TermFilter, alloc: Allocator, seg: *const index_mod.SegmentEntry) FilterError!roaring.RoaringBitmap {
+        return self.executeWithAdmission(alloc, seg, null);
+    }
+
+    pub fn executeWithAdmission(self: TermFilter, alloc: Allocator, seg: *const index_mod.SegmentEntry, control: ?read_admission.Port) FilterError!roaring.RoaringBitmap {
+        return self.executeControlled(alloc, seg, control);
+    }
+
+    pub fn executeWithAuthority(self: TermFilter, alloc: Allocator, seg: *const index_mod.SegmentEntry, authority: ?WorkAuthority) FilterError!roaring.RoaringBitmap {
+        return self.executeControlled(alloc, seg, authority);
+    }
+
+    fn executeControlled(self: TermFilter, alloc: Allocator, seg: *const index_mod.SegmentEntry, control: anytype) FilterError!roaring.RoaringBitmap {
+        if (control) |budget| try budget.checkpoint();
         var inv_reader = (try seg.reader.invertedIndexScoped(alloc, self.field)) orelse
             return roaring.RoaringBitmap.init(alloc);
         defer inv_reader.deinit();
@@ -436,7 +482,7 @@ pub const TermFilter = struct {
         if ((try inv_reader.lookup(self.term))) |lookup_result| {
             switch (lookup_result) {
                 .postings => |p| {
-                    var bm = try p.docBitmap(alloc);
+                    var bm = try postingsBitmapWithAdmission(alloc, p, control);
                     defer bm.deinit();
                     try result.orWith(&bm);
                 },
@@ -462,11 +508,12 @@ pub const TermFilter = struct {
                     alloc.free(terms);
                 }
                 for (terms) |syn_term| {
+                    if (control) |budget| try budget.checkpoint();
                     if (std.mem.eql(u8, syn_term, self.term)) continue; // skip primary
                     if ((try inv_reader.lookup(syn_term))) |syn_result| {
                         switch (syn_result) {
                             .postings => |p| {
-                                var bm = try p.docBitmap(alloc);
+                                var bm = try postingsBitmapWithAdmission(alloc, p, control);
                                 defer bm.deinit();
                                 try result.orWith(&bm);
                             },
@@ -477,9 +524,30 @@ pub const TermFilter = struct {
             }
         }
 
+        if (control) |budget| try budget.checkpoint();
         return result;
     }
 };
+
+/// Keep the ordinary bitmap path for uncontrolled callers. Controlled
+/// scans decode bounded postings chunks and checkpoint between groups of hits.
+fn postingsBitmapWithAdmission(alloc: Allocator, postings: inverted.TermPostings, control: anytype) !roaring.RoaringBitmap {
+    const budget = control orelse return postings.docBitmap(alloc);
+    var bitmap = roaring.RoaringBitmap.init(alloc);
+    errdefer bitmap.deinit();
+    var iter = try postings.iterator(alloc);
+    defer iter.deinit();
+    iter.decode_positions = false;
+    var count: usize = 0;
+    while (true) {
+        if (count % 64 == 0) try budget.checkpoint();
+        const hit = (try iter.nextScoring()) orelse break;
+        try bitmap.add(hit.doc_id);
+        count += 1;
+    }
+    try budget.checkpoint();
+    return bitmap;
+}
 
 /// Boolean composition of sub-filters.
 ///
@@ -503,13 +571,18 @@ pub const BoolFilter = struct {
     }
 
     pub fn executeWithOffset(self: BoolFilter, alloc: Allocator, seg: *const index_mod.SegmentEntry, doc_offset: u32) FilterError!roaring.RoaringBitmap {
+        return self.executeWithOffsetAndAuthority(alloc, seg, doc_offset, null);
+    }
+
+    pub fn executeWithOffsetAndAuthority(self: BoolFilter, alloc: Allocator, seg: *const index_mod.SegmentEntry, doc_offset: u32, authority: ?WorkAuthority) FilterError!roaring.RoaringBitmap {
         var result: ?roaring.RoaringBitmap = null;
         errdefer if (result) |*r| r.deinit();
 
         // Process must clauses (AND)
         for (self.must) |clause| {
             try self.control.check();
-            var clause_bm = if (clause == .doc_num) try clause.doc_num.refine(alloc, seg, doc_offset, if (result) |*r| r else null) else try clause.withControl(self.control).executeWithOffset(alloc, seg, doc_offset);
+            if (authority) |owner| try owner.check();
+            var clause_bm = if (clause == .doc_num) try clause.doc_num.refine(alloc, seg, doc_offset, if (result) |*r| r else null) else try clause.withControl(self.control).executeWithOffsetAndAuthority(alloc, seg, doc_offset, authority);
             if (result) |*r| {
                 r.andWith(&clause_bm);
                 clause_bm.deinit();
@@ -522,7 +595,7 @@ pub const BoolFilter = struct {
         if (self.should.len > 0) {
             const required_should: u32 = if (self.min_should_match == 0 and result == null) 1 else self.min_should_match;
             if (required_should > 0) {
-                var should_bm = try executeShouldClauses(alloc, self.should, required_should, seg, doc_offset, self.control);
+                var should_bm = try executeShouldClauses(alloc, self.should, required_should, seg, doc_offset, authority, self.control);
                 errdefer should_bm.deinit();
                 if (result) |*r| {
                     r.andWith(&should_bm);
@@ -541,7 +614,8 @@ pub const BoolFilter = struct {
         // Process must_not clauses (ANDNOT)
         for (self.must_not) |clause| {
             try self.control.check();
-            var clause_bm = if (clause == .doc_num) try clause.doc_num.refine(alloc, seg, doc_offset, &result.?) else try clause.withControl(self.control).executeWithOffset(alloc, seg, doc_offset);
+            if (authority) |owner| try owner.check();
+            var clause_bm = if (clause == .doc_num) try clause.doc_num.refine(alloc, seg, doc_offset, &result.?) else try clause.withControl(self.control).executeWithOffsetAndAuthority(alloc, seg, doc_offset, authority);
             defer clause_bm.deinit();
             result.?.andNotWith(&clause_bm);
         }
@@ -556,6 +630,7 @@ fn executeShouldClauses(
     min_should_match: u32,
     seg: *const index_mod.SegmentEntry,
     doc_offset: u32,
+    authority: ?WorkAuthority,
     control: ExecutionControl,
 ) FilterError!roaring.RoaringBitmap {
     if (min_should_match > should.len) {
@@ -567,7 +642,8 @@ fn executeShouldClauses(
         errdefer result.deinit();
         for (should) |clause| {
             try control.check();
-            var clause_bm = try clause.withControl(control).executeWithOffset(alloc, seg, doc_offset);
+            if (authority) |owner| try owner.check();
+            var clause_bm = try clause.withControl(control).executeWithOffsetAndAuthority(alloc, seg, doc_offset, authority);
             defer clause_bm.deinit();
             try result.orWith(&clause_bm);
         }
@@ -578,15 +654,18 @@ fn executeShouldClauses(
     defer counts.deinit(alloc);
 
     for (should) |clause| {
-        try control.check();
-        var clause_bm = try clause.withControl(control).executeWithOffset(alloc, seg, doc_offset);
+        if (authority) |owner| try owner.check();
+        var clause_bm = try clause.withControl(control).executeWithOffsetAndAuthority(alloc, seg, doc_offset, authority);
         defer clause_bm.deinit();
 
         var iter = clause_bm.iterator();
-        var visited: usize = 0;
+        var collected: usize = 0;
         while (iter.next()) |doc_id| {
-            if (visited % 256 == 0) try control.check();
-            visited += 1;
+            if (collected % 64 == 0) {
+                if (authority) |owner| try owner.check();
+                try control.check();
+            }
+            collected += 1;
             const entry = try counts.getOrPut(alloc, doc_id);
             if (!entry.found_existing) entry.value_ptr.* = 0;
             entry.value_ptr.* += 1;
@@ -596,10 +675,13 @@ fn executeShouldClauses(
     var result = roaring.RoaringBitmap.init(alloc);
     errdefer result.deinit();
     var iter = counts.iterator();
-    var visited: usize = 0;
+    var collected: usize = 0;
     while (iter.next()) |entry| {
-        if (visited % 256 == 0) try control.check();
-        visited += 1;
+        if (collected % 64 == 0) {
+            if (authority) |owner| try owner.check();
+            try control.check();
+        }
+        collected += 1;
         if (entry.value_ptr.* >= min_should_match) {
             try result.add(entry.key_ptr.*);
         }
@@ -622,7 +704,11 @@ pub const PrefixFilter = struct {
     };
 
     pub fn execute(self: PrefixFilter, alloc: Allocator, seg: *const index_mod.SegmentEntry) FilterError!roaring.RoaringBitmap {
-        return self.executeInternal(alloc, seg, false, null);
+        return self.executeInternal(alloc, seg, false, null, null);
+    }
+
+    pub fn executeWithAuthority(self: PrefixFilter, alloc: Allocator, seg: *const index_mod.SegmentEntry, authority: ?WorkAuthority) FilterError!roaring.RoaringBitmap {
+        return self.executeInternal(alloc, seg, false, null, authority);
     }
 
     pub fn executeWithStats(
@@ -632,7 +718,7 @@ pub const PrefixFilter = struct {
         stats: *ExecutionStats,
     ) FilterError!roaring.RoaringBitmap {
         stats.* = .{};
-        return self.executeInternal(alloc, seg, true, stats);
+        return self.executeInternal(alloc, seg, true, stats, null);
     }
 
     fn executeInternal(
@@ -641,6 +727,7 @@ pub const PrefixFilter = struct {
         seg: *const index_mod.SegmentEntry,
         comptime collect_stats: bool,
         stats: ?*ExecutionStats,
+        authority: ?WorkAuthority,
     ) FilterError!roaring.RoaringBitmap {
         if (self.indexed_field) |indexed_field| {
             if (try seg.reader.invertedIndexScoped(alloc, indexed_field)) |opened| {
@@ -652,7 +739,7 @@ pub const PrefixFilter = struct {
                     if (comptime collect_stats) stats.?.matching_terms = 1;
                     switch (lookup) {
                         .postings => |postings| {
-                            var matches = try postings.docBitmap(alloc);
+                            var matches = try postingsBitmapWithAdmission(alloc, postings, authority);
                             defer matches.deinit();
                             try exact.orWith(&matches);
                         },
@@ -673,6 +760,7 @@ pub const PrefixFilter = struct {
         var term_iter = try inv_reader.rangeTermIterator(self.prefix, null);
         term_iter.setControl(self.control);
         defer term_iter.deinit();
+        term_iter.setAuthority(authority);
 
         var result = roaring.RoaringBitmap.init(alloc);
         errdefer result.deinit();
@@ -690,8 +778,7 @@ pub const PrefixFilter = struct {
                 continue;
             }
             if (comptime collect_stats) stats.?.matching_terms += 1;
-            try self.control.check();
-            try unionTermEntry(alloc, &result, entry, self.control);
+            try unionTermEntry(alloc, &result, entry, self.control, authority);
         }
 
         return result;
@@ -875,7 +962,8 @@ pub const AutomatonExecutionStats = struct {
 };
 
 /// Union the postings of one dictionary entry into `result`.
-fn unionTermEntry(alloc: Allocator, result: *roaring.RoaringBitmap, entry: inverted.TermIterator.Entry, control: ExecutionControl) FilterError!void {
+fn unionTermEntry(alloc: Allocator, result: *roaring.RoaringBitmap, entry: inverted.TermIterator.Entry, control: ExecutionControl, authority: ?WorkAuthority) FilterError!void {
+    if (authority) |owner| try owner.check();
     try control.check();
     switch (entry.result) {
         .postings => |p| {
@@ -884,7 +972,10 @@ fn unionTermEntry(alloc: Allocator, result: *roaring.RoaringBitmap, entry: inver
             postings.decode_positions = false;
             var visited: usize = 0;
             while (try postings.next()) |hit| {
-                if (visited % 256 == 0) try control.check();
+                if (visited % 64 == 0) {
+                    if (authority) |owner| try owner.check();
+                    try control.check();
+                }
                 visited += 1;
                 try result.add(hit.doc_id);
             }
@@ -905,6 +996,7 @@ fn collectAutomatonTerms(
     comptime accept: fn (@TypeOf(context), []const u8) bool,
     comptime collect_stats: bool,
     stats: ?*AutomatonExecutionStats,
+    authority: ?WorkAuthority,
 ) FilterError!void {
     term_iter.setControl(context.control);
     while (true) {
@@ -916,7 +1008,7 @@ fn collectAutomatonTerms(
         const entry = next_entry orelse break;
         if (!accept(context, entry.term)) continue;
         if (comptime collect_stats) stats.?.matching_terms += 1;
-        try unionTermEntry(alloc, result, entry, context.control);
+        try unionTermEntry(alloc, result, entry, context.control, authority);
     }
     if (comptime collect_stats) stats.?.blocks_pruned = term_iter.blocksPruned();
 }
@@ -933,7 +1025,11 @@ pub const FuzzyFilter = struct {
     pub const ExecutionStats = AutomatonExecutionStats;
 
     pub fn execute(self: FuzzyFilter, alloc: Allocator, seg: *const index_mod.SegmentEntry) FilterError!roaring.RoaringBitmap {
-        return self.executeInternal(alloc, seg, false, null);
+        return self.executeInternal(alloc, seg, false, null, null);
+    }
+
+    pub fn executeWithAuthority(self: FuzzyFilter, alloc: Allocator, seg: *const index_mod.SegmentEntry, authority: ?WorkAuthority) FilterError!roaring.RoaringBitmap {
+        return self.executeInternal(alloc, seg, false, null, authority);
     }
 
     pub fn executeWithStats(
@@ -943,23 +1039,23 @@ pub const FuzzyFilter = struct {
         stats: *ExecutionStats,
     ) FilterError!roaring.RoaringBitmap {
         stats.* = .{};
-        return self.executeInternal(alloc, seg, true, stats);
+        return self.executeInternal(alloc, seg, true, stats, null);
     }
 
     fn acceptTerm(self: FuzzyFilter, term: []const u8) bool {
         return fuzzyPrefixMatches(self.term, term, self.prefix_len);
     }
 
-    fn executeInternal(self: FuzzyFilter, alloc: Allocator, seg: *const index_mod.SegmentEntry, comptime collect_stats: bool, stats: ?*ExecutionStats) FilterError!roaring.RoaringBitmap {
+    fn executeInternal(self: FuzzyFilter, alloc: Allocator, seg: *const index_mod.SegmentEntry, comptime collect_stats: bool, stats: ?*ExecutionStats, authority: ?WorkAuthority) FilterError!roaring.RoaringBitmap {
         const original_stats = if (stats) |value| value.* else null;
-        return self.executeAttempt(alloc, seg, collect_stats, stats) catch |err| switch (err) {
+        return self.executeAttempt(alloc, seg, collect_stats, stats, authority) catch |err| switch (err) {
             error.PatternProgramBudgetExceeded => blk: {
                 // The failed attempt has released its reader, iterator and
                 // execution lease before the private traversal starts.
                 var fallback = self;
                 fallback.control.pattern_programs = null;
                 if (stats) |value| value.* = original_stats.?;
-                break :blk fallback.executeAttempt(alloc, seg, collect_stats, stats) catch |failure| switch (failure) {
+                break :blk fallback.executeAttempt(alloc, seg, collect_stats, stats, authority) catch |failure| switch (failure) {
                     error.PatternProgramBudgetExceeded => unreachable,
                     else => return failure,
                 };
@@ -974,6 +1070,7 @@ pub const FuzzyFilter = struct {
         seg: *const index_mod.SegmentEntry,
         comptime collect_stats: bool,
         stats: ?*ExecutionStats,
+        authority: ?WorkAuthority,
     ) (FilterError || error{PatternProgramBudgetExceeded})!roaring.RoaringBitmap {
         var inv_reader = (try seg.reader.invertedIndexScoped(alloc, self.field)) orelse
             return roaring.RoaringBitmap.init(alloc);
@@ -991,10 +1088,11 @@ pub const FuzzyFilter = struct {
         const lev = if (execution) |lease| &lease.execution.program.fuzzy else &local;
         var term_iter = try inv_reader.fstSearchIterator(lev.automaton());
         defer term_iter.deinit();
+        term_iter.setAuthority(authority);
 
         var result = roaring.RoaringBitmap.init(alloc);
         errdefer result.deinit();
-        try collectAutomatonTerms(alloc, &term_iter, &result, self, acceptTerm, collect_stats, stats);
+        try collectAutomatonTerms(alloc, &term_iter, &result, self, acceptTerm, collect_stats, stats, authority);
         if (lev.allocation_failed) {
             if (execution) |lease| if (lease.execution.budget.isExhausted() or lease.owner.budget.isExhausted()) {
                 return error.PatternProgramBudgetExceeded;
@@ -1037,7 +1135,11 @@ pub const RegexpFilter = struct {
     pub const ExecutionStats = AutomatonExecutionStats;
 
     pub fn execute(self: RegexpFilter, alloc: Allocator, seg: *const index_mod.SegmentEntry) FilterError!roaring.RoaringBitmap {
-        return self.executeInternal(alloc, seg, false, null);
+        return self.executeInternal(alloc, seg, false, null, null);
+    }
+
+    pub fn executeWithAuthority(self: RegexpFilter, alloc: Allocator, seg: *const index_mod.SegmentEntry, authority: ?WorkAuthority) FilterError!roaring.RoaringBitmap {
+        return self.executeInternal(alloc, seg, false, null, authority);
     }
 
     pub fn executeWithStats(
@@ -1047,23 +1149,23 @@ pub const RegexpFilter = struct {
         stats: *ExecutionStats,
     ) FilterError!roaring.RoaringBitmap {
         stats.* = .{};
-        return self.executeInternal(alloc, seg, true, stats);
+        return self.executeInternal(alloc, seg, true, stats, null);
     }
 
     fn acceptTerm(_: RegexpFilter, _: []const u8) bool {
         return true;
     }
 
-    fn executeInternal(self: RegexpFilter, alloc: Allocator, seg: *const index_mod.SegmentEntry, comptime collect_stats: bool, stats: ?*ExecutionStats) FilterError!roaring.RoaringBitmap {
+    fn executeInternal(self: RegexpFilter, alloc: Allocator, seg: *const index_mod.SegmentEntry, comptime collect_stats: bool, stats: ?*ExecutionStats, authority: ?WorkAuthority) FilterError!roaring.RoaringBitmap {
         const original_stats = if (stats) |value| value.* else null;
-        return self.executeAttempt(alloc, seg, collect_stats, stats) catch |err| switch (err) {
+        return self.executeAttempt(alloc, seg, collect_stats, stats, authority) catch |err| switch (err) {
             error.PatternProgramBudgetExceeded => blk: {
                 // The failed attempt has released its reader, iterator and
                 // execution lease before the private traversal starts.
                 var fallback = self;
                 fallback.control.pattern_programs = null;
                 if (stats) |value| value.* = original_stats.?;
-                break :blk fallback.executeAttempt(alloc, seg, collect_stats, stats) catch |failure| switch (failure) {
+                break :blk fallback.executeAttempt(alloc, seg, collect_stats, stats, authority) catch |failure| switch (failure) {
                     error.PatternProgramBudgetExceeded => unreachable,
                     else => return failure,
                 };
@@ -1078,6 +1180,7 @@ pub const RegexpFilter = struct {
         seg: *const index_mod.SegmentEntry,
         comptime collect_stats: bool,
         stats: ?*ExecutionStats,
+        authority: ?WorkAuthority,
     ) (FilterError || error{PatternProgramBudgetExceeded})!roaring.RoaringBitmap {
         var inv_reader = (try seg.reader.invertedIndexScoped(alloc, self.field)) orelse
             return roaring.RoaringBitmap.init(alloc);
@@ -1100,10 +1203,11 @@ pub const RegexpFilter = struct {
 
         var term_iter = try inv_reader.fstSearchIterator(regex.automaton());
         defer term_iter.deinit();
+        term_iter.setAuthority(authority);
 
         var result = roaring.RoaringBitmap.init(alloc);
         errdefer result.deinit();
-        try collectAutomatonTerms(alloc, &term_iter, &result, self, acceptTerm, collect_stats, stats);
+        try collectAutomatonTerms(alloc, &term_iter, &result, self, acceptTerm, collect_stats, stats, authority);
         if (regex.allocation_failed) {
             if (execution) |lease| if (lease.execution.budget.isExhausted() or lease.owner.budget.isExhausted()) {
                 return error.PatternProgramBudgetExceeded;
@@ -1126,6 +1230,10 @@ pub const TermRangeFilter = struct {
     boost: f32 = 1.0,
 
     pub fn execute(self: TermRangeFilter, alloc: Allocator, seg: *const index_mod.SegmentEntry) FilterError!roaring.RoaringBitmap {
+        return self.executeWithAuthority(alloc, seg, null);
+    }
+
+    pub fn executeWithAuthority(self: TermRangeFilter, alloc: Allocator, seg: *const index_mod.SegmentEntry, authority: ?WorkAuthority) FilterError!roaring.RoaringBitmap {
         var inv_reader = (try seg.reader.invertedIndexScoped(alloc, self.field)) orelse
             return roaring.RoaringBitmap.init(alloc);
         defer inv_reader.deinit();
@@ -1148,6 +1256,7 @@ pub const TermRangeFilter = struct {
         var term_iter = try inv_reader.rangeTermIterator(start, end);
         term_iter.setControl(self.control);
         defer term_iter.deinit();
+        term_iter.setAuthority(authority);
 
         var result = roaring.RoaringBitmap.init(alloc);
         errdefer result.deinit();
@@ -1159,7 +1268,7 @@ pub const TermRangeFilter = struct {
                     if (std.mem.eql(u8, entry.term, m)) continue;
                 }
             }
-            try unionTermEntry(alloc, &result, entry, self.control);
+            try unionTermEntry(alloc, &result, entry, self.control, authority);
         }
 
         return result;
@@ -2011,7 +2120,11 @@ pub const WildcardFilter = struct {
     };
 
     pub fn execute(self: WildcardFilter, alloc: Allocator, seg: *const index_mod.SegmentEntry) FilterError!roaring.RoaringBitmap {
-        return self.executeInternal(alloc, seg, false, null);
+        return self.executeInternal(alloc, seg, false, null, null);
+    }
+
+    pub fn executeWithAuthority(self: WildcardFilter, alloc: Allocator, seg: *const index_mod.SegmentEntry, authority: ?WorkAuthority) FilterError!roaring.RoaringBitmap {
+        return self.executeInternal(alloc, seg, false, null, authority);
     }
 
     pub fn executeWithStats(
@@ -2021,7 +2134,7 @@ pub const WildcardFilter = struct {
         stats: *ExecutionStats,
     ) FilterError!roaring.RoaringBitmap {
         stats.* = .{};
-        return self.executeInternal(alloc, seg, true, stats);
+        return self.executeInternal(alloc, seg, true, stats, null);
     }
 
     fn executeInternal(
@@ -2030,6 +2143,7 @@ pub const WildcardFilter = struct {
         seg: *const index_mod.SegmentEntry,
         comptime collect_stats: bool,
         stats: ?*ExecutionStats,
+        authority: ?WorkAuthority,
     ) FilterError!roaring.RoaringBitmap {
         var inv_reader = (try seg.reader.invertedIndexScoped(alloc, self.field)) orelse
             return roaring.RoaringBitmap.init(alloc);
@@ -2052,7 +2166,7 @@ pub const WildcardFilter = struct {
             if (comptime collect_stats) stats.?.exact_lookup = true;
             if ((try inv_reader.lookup(literal_prefix))) |lookup| {
                 if (comptime collect_stats) stats.?.matching_terms = 1;
-                try unionTermEntry(alloc, &result, .{ .term = literal_prefix, .result = lookup }, self.control);
+                try unionTermEntry(alloc, &result, .{ .term = literal_prefix, .result = lookup }, self.control, authority);
             }
             return result;
         }
@@ -2063,6 +2177,7 @@ pub const WildcardFilter = struct {
             try inv_reader.termIterator();
         term_iter.setControl(self.control);
         defer term_iter.deinit();
+        term_iter.setAuthority(authority);
 
         while (true) {
             const next_entry = if (comptime collect_stats)
@@ -2079,8 +2194,7 @@ pub const WildcardFilter = struct {
             try self.control.check();
             if (!wildcardMatch(self.pattern, entry.term)) continue;
             if (comptime collect_stats) stats.?.matching_terms += 1;
-            try self.control.check();
-            try unionTermEntry(alloc, &result, entry, self.control);
+            try unionTermEntry(alloc, &result, entry, self.control, authority);
         }
 
         return result;
@@ -2262,6 +2376,21 @@ pub fn executeFilter(
     snap: *const index_mod.IndexSnapshot,
     filter: Filter,
 ) ![]u32 {
+    return executeFilterWithAdmission(alloc, snap, filter, null);
+}
+
+/// Borrow controls only for this synchronous scan; never mutate shared readers.
+pub fn executeFilterWithAdmission(alloc: Allocator, snap: *const index_mod.IndexSnapshot, filter: Filter, control: ?read_admission.Port) ![]u32 {
+    return executeFilterControlled(alloc, snap, filter, control, null);
+}
+
+pub fn executeFilterWithAuthority(alloc: Allocator, snap: *const index_mod.IndexSnapshot, filter: Filter, authority: ?WorkAuthority) ![]u32 {
+    return executeFilterControlled(alloc, snap, filter, null, authority);
+}
+
+fn executeFilterControlled(alloc: Allocator, snap: *const index_mod.IndexSnapshot, filter: Filter, control: ?read_admission.Port, authority: ?WorkAuthority) ![]u32 {
+    if (control) |budget| try budget.checkpoint();
+    if (authority) |owner| try owner.check();
     var all_ids = std.ArrayListUnmanaged(u32).empty;
     defer all_ids.deinit(alloc);
 
@@ -2270,7 +2399,17 @@ pub fn executeFilter(
         var segment_lease = try snap.leaseSegment(segment_idx);
         defer segment_lease.deinit();
         const seg = segment_lease.entry;
-        var bm = try filter.executeWithOffset(alloc, seg, doc_offset);
+        if (authority) |owner| try owner.check();
+        if (control) |budget| try budget.checkpoint();
+        var bm = if (filter == .term and control != null) blk: {
+            seg.beginAccess();
+            defer seg.endAccess();
+            break :blk try filter.term.executeWithAdmission(alloc, seg, control);
+        } else try filter.executeWithOffsetAndAuthority(alloc, seg, doc_offset, authority);
+        if (control) |budget| budget.checkpoint() catch |err| {
+            bm.deinit();
+            return err;
+        };
         defer bm.deinit();
 
         // Remove deleted docs while pinning the shared bitmap containers.
@@ -2282,13 +2421,19 @@ pub fn executeFilter(
 
         // Collect with offset
         var iter = bm.iterator();
+        var collected: usize = 0;
         while (iter.next()) |doc_id| {
+            if (collected % 64 == 0) if (control) |budget| try budget.checkpoint();
+            if (collected % 64 == 0) if (authority) |owner| try owner.check();
+            collected += 1;
             try all_ids.append(alloc, doc_id + doc_offset);
         }
 
         doc_offset += seg.reader.doc_count;
     }
 
+    if (control) |budget| try budget.checkpoint();
+    if (authority) |owner| try owner.check();
     return try alloc.dupe(u32, all_ids.items);
 }
 
@@ -2299,6 +2444,11 @@ pub fn executeFilterBitmap(
     snap: *const index_mod.IndexSnapshot,
     filter: Filter,
 ) !roaring.RoaringBitmap {
+    return executeFilterBitmapWithAuthority(alloc, snap, filter, null);
+}
+
+pub fn executeFilterBitmapWithAuthority(alloc: Allocator, snap: *const index_mod.IndexSnapshot, filter: Filter, authority: ?WorkAuthority) !roaring.RoaringBitmap {
+    if (authority) |owner| try owner.check();
     var result = roaring.RoaringBitmap.init(alloc);
     errdefer result.deinit();
 
@@ -2308,7 +2458,7 @@ pub fn executeFilterBitmap(
         var segment_lease = try snap.leaseSegment(segment_idx);
         defer segment_lease.deinit();
         const seg = segment_lease.entry;
-        var local = try filter.executeWithOffset(alloc, seg, doc_offset);
+        var local = try filter.executeWithOffsetAndAuthority(alloc, seg, doc_offset, authority);
         defer local.deinit();
         {
             seg.shared.lockDeletionShared();
@@ -2330,6 +2480,7 @@ pub fn executeFilterBitmap(
         }
         doc_offset = next_offset;
     }
+    if (authority) |owner| try owner.check();
     return result;
 }
 
@@ -2604,10 +2755,16 @@ pub fn countFilter(
     snap: *const index_mod.IndexSnapshot,
     filter: Filter,
 ) !usize {
+    return countFilterWithAuthority(alloc, snap, filter, null);
+}
+
+pub fn countFilterWithAuthority(alloc: Allocator, snap: *const index_mod.IndexSnapshot, filter: Filter, authority: ?WorkAuthority) !usize {
+    if (authority) |owner| try owner.check();
     var total: usize = 0;
     var doc_offset: u32 = 0;
     for (snap.segments, 0..) |_, segment_idx| {
         var seg = &snap.segments[segment_idx];
+        if (authority) |owner| try owner.check();
         const next_offset = std.math.add(u32, doc_offset, seg.reader.doc_count) catch return error.CountOverflow;
         if (filter == .bool_filter) if (try countBorrowedBoolean(seg, filter, doc_offset)) |count| {
             total = std.math.add(usize, total, count) catch return error.CountOverflow;
@@ -2641,7 +2798,7 @@ pub fn countFilter(
         var segment_lease = try snap.leaseSegment(segment_idx);
         defer segment_lease.deinit();
         seg = segment_lease.entry;
-        var bm = try filter.executeWithOffset(alloc, seg, doc_offset);
+        var bm = try filter.executeWithOffsetAndAuthority(alloc, seg, doc_offset, authority);
         defer bm.deinit();
 
         {
@@ -2653,6 +2810,7 @@ pub fn countFilter(
         doc_offset = std.math.add(u32, doc_offset, seg.reader.doc_count) catch
             return error.CountOverflow;
     }
+    if (authority) |owner| try owner.check();
     return total;
 }
 
@@ -4476,6 +4634,240 @@ test "geo shape filter point in polygon" {
     var contains = try contains_filter.execute(alloc, seg);
     defer contains.deinit();
     try testing.expect(contains.isEmpty());
+}
+
+test "term filter with synonym expansion" {
+    const alloc = testing.allocator;
+
+    // Build inverted index: doc0 has "fast", doc1 has "quick"
+    var inv_builder = inverted.InvertedIndexBuilder.init(alloc, .{});
+    defer inv_builder.deinit();
+    try inv_builder.addDocument(0, &.{.{ .term = "fast", .freq = 1, .norm = 10 }});
+    try inv_builder.addDocument(1, &.{.{ .term = "quick", .freq = 1, .norm = 10 }});
+    try inv_builder.addDocument(2, &.{.{ .term = "slow", .freq = 1, .norm = 10 }});
+    const inv_data = try inv_builder.build();
+    defer alloc.free(inv_data);
+
+    // Build synonym section: "fast" and "quick" are synonyms
+    var syn_writer = synonyms_mod.SynonymWriter.init(alloc);
+    defer syn_writer.deinit();
+    try syn_writer.addGroup(&.{ "fast", "quick" }, &.{ 0, 1 });
+    const syn_data = try syn_writer.build();
+    defer alloc.free(syn_data);
+
+    // Build segment with both sections
+    var seg_writer = segment_mod.SegmentWriter.init(alloc);
+    defer seg_writer.deinit();
+    const field_idx = try seg_writer.addField("text");
+    try seg_writer.addSection(field_idx, .inverted_text, inv_data);
+    try seg_writer.addSection(field_idx, .synonym, syn_data);
+    for (0..3) |_| try seg_writer.addStoredDoc("d", "{}");
+    const seg_bytes = try seg_writer.build();
+    defer alloc.free(seg_bytes);
+
+    var writer = try index_mod.IndexWriter.init(alloc);
+    defer writer.deinit();
+    try writer.addSegment(seg_bytes);
+
+    const snap = writer.snapshot();
+    const seg = &snap.segments[0];
+
+    // Search for "fast" — should also match "quick" via synonym expansion
+    const filter = Filter{ .term = .{ .field = "text", .term = "fast" } };
+    var bm = try filter.execute(alloc, seg);
+    defer bm.deinit();
+
+    try testing.expect(bm.contains(0)); // "fast" — direct match
+    try testing.expect(bm.contains(1)); // "quick" — synonym expansion
+    try testing.expect(!bm.contains(2)); // "slow" — not a synonym
+    const Budget = struct {
+        pub fn checkpoint(_: @This()) !void {}
+        pub fn waitForProgress(_: @This()) !void {
+            return error.TestUnexpectedResult;
+        }
+    };
+    var adapter = read_admission.Adapter(Budget){ .budget = .{} };
+    const payload = adapter.payload();
+    const controlled = try executeFilterWithAdmission(alloc, snap, filter, read_admission.Port.init(&payload));
+    defer alloc.free(controlled);
+    try testing.expectEqualSlices(u32, &.{ 0, 1 }, controlled);
+}
+
+test "controlled term filter checkpoints preserve exact results and retire partial scans" {
+    const alloc = testing.allocator;
+    const docs: [193]TestTermDocument = @splat(.{ .terms = &.{.{ .term = "alpha", .freq = 1, .norm = 10 }} });
+    const bytes = try buildTestSegmentWithTerms(alloc, &docs);
+    defer alloc.free(bytes);
+    var writer = try index_mod.IndexWriter.init(alloc);
+    defer writer.deinit();
+    try writer.addSegment(bytes);
+    try writer.addSegment(bytes);
+    _ = try writer.deleteById("17");
+    const snap = writer.snapshot();
+    const filter: Filter = .{ .term = .{ .field = "body", .term = "alpha" } };
+    const expected = try executeFilter(alloc, snap, filter);
+    defer alloc.free(expected);
+    const Budget = struct {
+        checks: usize = 0,
+        fail_at: ?usize = null,
+        cause: anyerror = error.Canceled,
+        pub fn checkpoint(self: *@This()) !void {
+            self.checks += 1;
+            if (self.fail_at == self.checks) return self.cause;
+        }
+        pub fn waitForProgress(_: *@This()) !void {
+            return error.TestUnexpectedResult;
+        }
+    };
+    var budget: Budget = .{};
+    var adapter = read_admission.Adapter(*Budget){ .budget = &budget };
+    const payload = adapter.payload();
+    const port = read_admission.Port.init(&payload);
+    const actual = try executeFilterWithAdmission(alloc, snap, filter, port);
+    defer alloc.free(actual);
+    try testing.expectEqualSlices(u32, expected, actual);
+    try testing.expect(expected.len < docs.len * 2);
+    try testing.expect(expected.len > docs.len);
+    const AllocationCase = struct {
+        fn run(a: Allocator, snapshot: *const index_mod.IndexSnapshot, f: Filter) !void {
+            var b: Budget = .{};
+            var control_adapter = read_admission.Adapter(*Budget){ .budget = &b };
+            const control_payload = control_adapter.payload();
+            const ids = try executeFilterWithAdmission(a, snapshot, f, read_admission.Port.init(&control_payload));
+            defer a.free(ids);
+            try testing.expect(ids.len > 193);
+        }
+    };
+    try testing.checkAllAllocationFailures(alloc, AllocationCase.run, .{ snap, filter });
+    const checks = budget.checks;
+    try testing.expect(checks > 12);
+    for ([_]anyerror{ error.Canceled, error.DeadlineExceeded, error.SchedulerClosed, error.Forbidden }) |cause| {
+        for (1..checks + 1) |fail_at| {
+            budget = .{ .fail_at = fail_at, .cause = cause };
+            try testing.expectError(cause, executeFilterWithAdmission(alloc, snap, filter, port));
+            try testing.expectEqual(fail_at, budget.checks);
+        }
+    }
+    budget = .{};
+    const retry = try executeFilterWithAdmission(alloc, snap, filter, port);
+    defer alloc.free(retry);
+    try testing.expectEqualSlices(u32, expected, retry);
+}
+
+test "controlled count filters retain exact Boolean and live document semantics on rejection" {
+    const a = testing.allocator;
+    const docs: [193]TestTermDocument = @splat(.{ .terms = &.{.{ .term = "alpha", .freq = 1, .norm = 10 }} });
+    const bytes = try buildTestSegmentWithTerms(a, &docs);
+    defer a.free(bytes);
+    var writer = try index_mod.IndexWriter.init(a);
+    defer writer.deinit();
+    try writer.addSegment(bytes);
+    try writer.addSegment(bytes);
+    _ = try writer.deleteById("17");
+    const snapshot = writer.snapshot();
+    const alpha: Filter = .{ .term = .{ .field = "body", .term = "alpha" } };
+    const missing: Filter = .{ .term = .{ .field = "body", .term = "missing" } };
+    const compound: Filter = .{ .bool_filter = .{
+        .must = &.{.{ .bool_filter = .{ .must = &.{alpha}, .should = &.{}, .must_not = &.{} } }},
+        .should = &.{ alpha, alpha },
+        .min_should_match = 2,
+        .must_not = &.{missing},
+    } };
+    const State = struct {
+        calls: usize = 0,
+        fail_at: ?usize = null,
+        cause: anyerror = error.Canceled,
+        fn check(raw: *const anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(raw)));
+            self.calls += 1;
+            if (self.fail_at == self.calls) return self.cause;
+        }
+    };
+    for ([_]Filter{ alpha, compound, .{ .match_all = {} } }) |filter| {
+        const expected = try executeFilter(a, snapshot, filter);
+        defer a.free(expected);
+        var state: State = .{};
+        const authority: WorkAuthority = .{ .context = &state, .check_fn = State.check };
+        const actual = try executeFilterWithAuthority(a, snapshot, filter, authority);
+        defer a.free(actual);
+        try testing.expectEqualSlices(u32, expected, actual);
+        const candidate_checks = state.calls;
+        state = .{};
+        try testing.expectEqual(expected.len, try countFilterWithAuthority(a, snapshot, filter, authority));
+        const count_checks = state.calls;
+        try testing.expect(count_checks > 6);
+        for ([_]anyerror{ error.Canceled, error.Timeout, error.SchedulerClosed }) |cause| {
+            for (1..count_checks + 1) |fail_at| {
+                state = .{ .fail_at = fail_at, .cause = cause };
+                try testing.expectError(cause, countFilterWithAuthority(a, snapshot, filter, authority));
+                try testing.expectEqual(fail_at, state.calls);
+            }
+            for (1..candidate_checks + 1) |fail_at| {
+                state = .{ .fail_at = fail_at, .cause = cause };
+                try testing.expectError(cause, executeFilterWithAuthority(a, snapshot, filter, authority));
+                try testing.expectEqual(fail_at, state.calls);
+            }
+        }
+        state = .{};
+        try testing.expectEqual(expected.len, try countFilterWithAuthority(a, snapshot, filter, authority));
+    }
+}
+
+test "controlled dictionary filters preserve results and retire rejected scans" {
+    const a = testing.allocator;
+    var names: [193][16]u8 = undefined;
+    var hits: [193][2]inverted.InvertedIndexBuilder.TermHit = undefined;
+    var docs: [193]TestTermDocument = undefined;
+    for (&docs, &hits, &names, 0..) |*doc, *terms, *name, i| {
+        terms.* = .{ .{ .term = try std.fmt.bufPrint(name, "a{d:0>4}", .{i}), .freq = 1 }, .{ .term = "common", .freq = 1 } };
+        doc.* = .{ .terms = terms };
+    }
+    const bytes = try buildTestSegmentWithTerms(a, &docs);
+    defer a.free(bytes);
+    var writer = try index_mod.IndexWriter.init(a);
+    defer writer.deinit();
+    try writer.addSegment(bytes);
+    _ = try writer.deleteById("17");
+    const snapshot = writer.snapshot();
+    const State = struct {
+        calls: usize = 0,
+        fail_at: ?usize = null,
+        cause: anyerror = error.Timeout,
+        fn check(raw: *const anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(raw)));
+            self.calls += 1;
+            if (self.fail_at == self.calls) return self.cause;
+        }
+    };
+    for ([_]Filter{
+        .{ .prefix = .{ .field = "body", .prefix = "a" } },
+        .{ .prefix = .{ .field = "body", .prefix = "common", .indexed_field = "body" } },
+        .{ .wildcard = .{ .field = "body", .pattern = "*" } },
+        .{ .wildcard = .{ .field = "body", .pattern = "common" } },
+        .{ .regexp = .{ .field = "body", .pattern = ".*" } },
+        .{ .fuzzy = .{ .field = "body", .term = "a0000", .max_edits = 2 } },
+        .{ .term_range = .{ .field = "body" } },
+    }) |filter| {
+        const expected = try executeFilter(a, snapshot, filter);
+        defer a.free(expected);
+        try testing.expect(expected.len > 1);
+        var state: State = .{};
+        const authority: WorkAuthority = .{ .context = &state, .check_fn = State.check };
+        const actual = try executeFilterWithAuthority(a, snapshot, filter, authority);
+        defer a.free(actual);
+        try testing.expectEqualSlices(u32, expected, actual);
+        const checks = state.calls;
+        try testing.expect(checks > 5);
+        for ([_]anyerror{ error.Timeout, error.Canceled, error.SchedulerClosed }) |cause| {
+            for (1..checks + 1) |fail_at| {
+                state = .{ .fail_at = fail_at, .cause = cause };
+                try testing.expectError(cause, executeFilterWithAuthority(a, snapshot, filter, authority));
+                try testing.expectEqual(fail_at, state.calls);
+            }
+        }
+        state = .{};
+        try testing.expectEqual(expected.len, try countFilterWithAuthority(a, snapshot, filter, authority));
+    }
 }
 
 test "external lake metadata navigation term filter keeps synonym membership complete under pressure" {

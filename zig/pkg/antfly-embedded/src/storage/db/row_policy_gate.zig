@@ -121,11 +121,66 @@ pub const Gate = struct {
             return .{ .gate = self.gate, .expires_at_seconds = self.expires_at_seconds, .expires_at_monotonic_ns = self.expires_at_monotonic_ns, .read_phase = self.read_phase };
         }
 
+        /// Retire only this write admission while speculative work runs. The
+        /// returned guard may restore exactly this authority, never refresh it.
+        pub fn retireForPreparation(self: *Lease, now_seconds: i64) !Preparation {
+            try self.checkAt(now_seconds);
+            if (self.read_phase != null) return error.RowPolicyCatalogChanged;
+            const phase = self.gate.currentPhase();
+            if (phase != .disabled and phase != .active) return error.RowPolicyCatalogChanged;
+            const preparation: Preparation = .{
+                .lease = self,
+                .original = self.*,
+                .phase = phase,
+                .generation = self.gate.generation.load(.acquire),
+                .catalog_epoch = self.gate.catalog_epoch.load(.acquire),
+                .schema_version = self.gate.schema_version.load(.acquire),
+            };
+            self.release();
+            return preparation;
+        }
+
         pub fn release(self: *Lease) void {
             if (self.released) return;
             self.released = true;
             const prior = self.gate.readers.fetchSub(1, .acq_rel);
             std.debug.assert(prior > 0);
+        }
+    };
+
+    /// A released write lease retains its original identity and both expiry
+    /// domains. No principal is reauthenticated and no deadline is extended.
+    pub const Preparation = struct {
+        lease: *Lease,
+        original: Lease,
+        phase: catalog.RowPolicyPhase,
+        generation: u64,
+        catalog_epoch: u64,
+        schema_version: u32,
+        consumed: bool = false,
+
+        fn matches(self: *const @This()) bool {
+            const gate = self.original.gate;
+            return gate.currentPhase() == self.phase and
+                gate.generation.load(.acquire) == self.generation and
+                gate.catalog_epoch.load(.acquire) == self.catalog_epoch and
+                gate.schema_version.load(.acquire) == self.schema_version;
+        }
+
+        pub fn reenter(self: *@This(), now_seconds: i64) !void {
+            if (self.consumed) return error.RowPolicyCatalogChanged;
+            self.consumed = true;
+            if (!self.lease.released or self.lease.gate != self.original.gate or !self.matches()) return error.RowPolicyCatalogChanged;
+            var candidate = self.original;
+            candidate.released = false;
+            try candidate.checkAt(now_seconds);
+            _ = candidate.gate.readers.fetchAdd(1, .acq_rel);
+            errdefer _ = candidate.gate.readers.fetchSub(1, .acq_rel);
+            // Close the publication race, as ordinary gate entry does. Once
+            // retained, publication must drain this write before committing.
+            if (!self.matches()) return error.RowPolicyCatalogChanged;
+            try candidate.checkAt(now_seconds);
+            self.lease.* = candidate;
         }
     };
 

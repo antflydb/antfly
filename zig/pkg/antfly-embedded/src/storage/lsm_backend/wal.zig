@@ -63,6 +63,13 @@ const ControlKind = enum(u8) {
 pub const default_replay_scratch_retained_cap_bytes: usize = replay_chunk_bytes + @max(record_header_len, replay_record_header_len);
 
 fn scratchAllocator(allocator: Allocator) Allocator {
+    // Preserve an explicitly supplied reclaimable root instead of escaping
+    // its process ceiling through libc. Unwrap result arenas so scratch frees
+    // remain independent, and never introduce reclaim callbacks under locks.
+    if (@import("../resource_manager.zig").BudgetedAllocator.fromAllocator(allocator)) |root| {
+        return root.threadSafeNoReclaimAllocator();
+    }
+    if (@import("runtime_memory_abi").Allocator.isStdAdapter(allocator)) return allocator;
     return if (builtin.link_libc) std.heap.c_allocator else allocator;
 }
 
@@ -311,6 +318,164 @@ pub fn syncCurrentState(storage: storage_io.Storage, allocator: Allocator, root_
     defer temp_allocator.free(index_path);
     try storage.appendFileAbsolute(allocator, index_path, "", true);
     return .{ .segment_syncs = 1, .index_syncs = 1 };
+}
+
+/// Owns one WAL durability cut after its caller has acquired publication and
+/// reusable completion resources. Publication must provide release(). The
+/// backend/publication owner outlives this value, and callers serialize methods.
+/// This performs only CURRENT metadata and ordered barriers, not backend flush.
+pub fn CurrentStateSync(comptime Publication: type) type {
+    return struct {
+        const Self = @This();
+        const Stage = enum { current, segment, index, complete, failed };
+        const Pending = union(enum) { none, read: storage_io.ControlFileReadOperation, sync: storage_io.SyncOperation };
+        index_path: [std.fs.max_path_bytes]u8 = undefined,
+        index_len: usize = 0,
+        segment_path: [std.fs.max_path_bytes]u8 = undefined,
+        segment_prefix_len: usize = 0,
+        segment_len: usize = 0,
+        resources: ?storage_io.DurabilityResources = null,
+        publication: ?Publication = null,
+        pending: Pending = .none,
+        stage: Stage = .current,
+        result: SyncResult = .{},
+        failure: ?anyerror = null,
+
+        /// Prepare bounded paths before acquiring any publication lock. This
+        /// value is movable: it stores lengths, never slices into itself.
+        pub fn prepare(root_dir: []const u8) !Self {
+            var self: Self = .{};
+            if (root_dir.len >= std.fs.max_path_bytes) return error.NameTooLong;
+            const separator = if (root_dir.len == 0 or std.mem.endsWith(u8, root_dir, "/")) "" else "/";
+            const prefix = std.fmt.bufPrint(&self.segment_path, "{s}{s}{s}/", .{ root_dir, separator, wal_dir_name }) catch return error.NameTooLong;
+            if (prefix.len + 24 >= self.segment_path.len) return error.NameTooLong;
+            self.segment_prefix_len = prefix.len;
+            const path = std.fmt.bufPrint(&self.index_path, "{s}{s}", .{ prefix, wal_index_file_name }) catch return error.NameTooLong;
+            self.index_len = path.len;
+            return self;
+        }
+
+        /// Transfer both grants only after the initial read is accepted. A
+        /// pre-dispatch failure leaves both arguments owned by the caller.
+        pub fn start(self: *Self, resources: storage_io.DurabilityResources, publication: Publication, original: @import("../../common/read_admission.zig").Port) !void {
+            std.debug.assert(self.resources == null and self.publication == null);
+            var prepared = resources;
+            const read = try prepared.beginControlRead(self.index_path[0..self.index_len], control_pair_len, original);
+            self.resources = prepared;
+            self.publication = publication;
+            self.pending = .{ .read = read };
+        }
+
+        pub fn waitWithAdmission(self: *Self, original: @import("../../common/read_admission.zig").Port) !SyncResult {
+            const admission = @import("../../common/read_admission.zig");
+            _ = (try original.executionWaitAfterLifetime()) orelse return error.ExecutionWaitUnsupported;
+            _ = (try original.deadlineNs()) orelse return error.ExecutionWaitUnsupported;
+            while (true) {
+                try original.checkpoint();
+                switch (self.stage) {
+                    .complete => return self.result,
+                    .failed => return self.failure.?,
+                    .current => {
+                        std.debug.assert(self.pending == .read);
+                        var trace: admission.RejectionTrace = .{};
+                        const control = trace.bind(original).?;
+                        const current = self.pending.read.waitWithAdmission(control) catch |cause| {
+                            // An original FileNotFound is a rejected waiter,
+                            // never evidence that CURRENT is absent.
+                            if (trace.failure) |rejected| return rejected;
+                            if (cause == error.FileNotFound) {
+                                self.retirePending();
+                                self.stage = .complete;
+                                self.releasePublication();
+                                continue;
+                            }
+                            return self.fail(cause);
+                        };
+                        // Only successful reentry authorizes format/checksum
+                        // CPU. Rejection preserves the exact read and bytes.
+                        try original.checkpoint();
+                        if (current.file_size != control_pair_len or current.bytes.len != control_pair_len)
+                            return self.fail(error.CorruptLsmWalIndex);
+                        const payload = decodeControl(current.bytes, .current_segment, 16) catch |cause| return self.fail(cause);
+                        const segment = std.mem.readInt(u64, payload[0..8], .little);
+                        if (segment == 0) return self.fail(error.CorruptLsmWalIndex);
+                        const name = std.fmt.bufPrint(self.segment_path[self.segment_prefix_len..], "{d:0>20}.log", .{segment}) catch unreachable;
+                        self.segment_len = self.segment_prefix_len + name.len;
+                        self.retirePending();
+                        self.stage = .segment;
+                    },
+                    .segment, .index => {
+                        if (self.pending == .none) {
+                            const path = if (self.stage == .segment) self.segment_path[0..self.segment_len] else self.index_path[0..self.index_len];
+                            // These phases use the already admitted worker,
+                            // descriptor and fixed buffers, even under pressure.
+                            self.pending = .{ .sync = try self.resources.?.beginSyncContents(path, original) };
+                        }
+                        var trace: admission.RejectionTrace = .{};
+                        self.pending.sync.waitWithAdmission(trace.bind(original).?) catch |cause| {
+                            if (trace.failure) |rejected| return rejected;
+                            return self.fail(cause);
+                        };
+                        self.retirePending();
+                        if (self.stage == .segment) {
+                            self.result.segment_syncs = 1;
+                            self.stage = .index;
+                        } else {
+                            self.result.index_syncs = 1;
+                            self.stage = .complete;
+                            self.releasePublication();
+                        }
+                    },
+                }
+            }
+        }
+
+        fn fail(self: *Self, cause: anyerror) anyerror {
+            // Called only after admitted observation of physical completion or
+            // admitted validation. A terminal error cannot replay a phase.
+            self.retirePending();
+            self.failure = cause;
+            self.stage = .failed;
+            self.releasePublication();
+            return cause;
+        }
+
+        fn retirePending(self: *Self) void {
+            switch (self.pending) {
+                .read => |*read| read.deinit(),
+                .sync => |*sync| sync.deinit(),
+                .none => {},
+            }
+            self.pending = .none;
+        }
+
+        fn releasePublication(self: *Self) void {
+            if (self.publication) |*publication| publication.release();
+            self.publication = null;
+        }
+
+        /// Terminal worker retirement borrows the original cleanup execution.
+        /// Rejected join/reentry retains the grant and its charge for retry.
+        pub fn retireWithAdmission(self: *Self, original: @import("../../common/read_admission.zig").Port) !void {
+            try original.checkpoint();
+            if (self.stage != .complete and self.stage != .failed) return error.ResourceBudgetExceeded;
+            std.debug.assert(self.pending == .none and self.publication == null);
+            if (self.resources) |*resources| {
+                try resources.retireWithAdmission(original);
+                self.resources = null;
+            }
+        }
+
+        /// Mandatory quiesced retirement, never automatic cleanup after a
+        /// rejected wait. Accepted physical work finishes before publication
+        /// is released; the idle worker and descriptor are retired last.
+        pub fn deinit(self: *Self) void {
+            self.retirePending();
+            self.releasePublication();
+            if (self.resources) |*resources| resources.deinit();
+            self.* = undefined;
+        }
+    };
 }
 
 pub fn replayIntoMutable(
@@ -2583,4 +2748,1080 @@ test "lsm wal replays state and replay rows from shared wal segments" {
     try std.testing.expectEqual(@as(usize, 1), entries.len);
     try std.testing.expectEqual(@as(u64, 1), entries[0].sequence);
     try std.testing.expectEqualStrings("first", entries[0].payload);
+}
+
+test "WAL allocator owner replay scratch preserves the physical root across ABI callbacks" {
+    var manager = resource_manager_mod.ResourceManager.init(.{ .memory_budget = .{ .hard_limit_bytes = 1024 * 1024 }, .identity_allocator = std.testing.allocator });
+    defer manager.deinit(std.testing.allocator);
+    var budget = resource_manager_mod.BudgetedAllocator.initReclaiming(&manager, .lsm_in_memory_state, std.testing.allocator, 1);
+    defer budget.deinit();
+    budget.credit_quantum = 1;
+    var root = budget.threadSafeNoReclaimAllocator();
+    const descriptor = @import("runtime_memory_abi").Allocator.fromStd(&root);
+    for ([_]Allocator{ scratchAllocator(root), scratchAllocator(descriptor.asStd()) }) |scratch| {
+        const bytes = try scratch.alloc(u8, 97);
+        try std.testing.expectEqual(@as(u64, 97), budget.liveBytesThreadSafe());
+        scratch.free(bytes);
+        try std.testing.expectError(error.OutOfMemory, scratch.alloc(u8, 2 * 1024 * 1024));
+        try std.testing.expectEqual(@as(u64, 0), budget.liveBytesThreadSafe());
+    }
+}
+
+const ControlledSyncPublication = struct {
+    held: *bool,
+    releases: *usize,
+    pub fn release(self: *@This()) void {
+        std.debug.assert(self.held.*);
+        self.held.* = false;
+        self.releases.* += 1;
+    }
+};
+
+test "controlled physical sync WAL coordinator retains each accepted phase across original failures" {
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi or builtin.os.tag == .freestanding) return error.SkipZigTest;
+    const cpu = @import("../../common/runnable_scheduler.zig");
+    const admission = @import("../../common/read_admission.zig");
+    const now = platform.time.monotonicNs;
+    const Operation = CurrentStateSync(ControlledSyncPublication);
+    const Mode = enum { begin_failure, end_failure, lifetime_failure };
+    const Target = @FieldType(Operation, "stage");
+    for ([_]Target{ .current, .segment, .index }) |target| for (std.enums.values(Mode)) |mode| {
+        const a = std.testing.allocator;
+        var backing = std.testing.FailingAllocator.init(a, .{});
+        var pool = storage_io.NativeStoragePool.initWithCapacityForTest(a, 16);
+        defer pool.deinit();
+        var native = try storage_io.NativeStorage.initWithPool(backing.allocator(), .threaded, &pool);
+        var native_live = true;
+        defer if (native_live) native.deinit();
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+        defer a.free(root);
+        const directory = try walDirPathAlloc(a, root);
+        defer a.free(directory);
+        try native.storage().createDirPath(directory);
+        try writeCurrentSegment(native.storage(), a, root, 7, 5);
+        const segment = try segmentPathAlloc(a, root, 7);
+        defer a.free(segment);
+        const index_path = try indexPathAlloc(a, root);
+        defer a.free(index_path);
+        try native.storage().writeFileAbsolute(segment, "state");
+        var slots = try cpu.Scheduler.init(.{ .slots = 3, .control_slots = 1, .cleanup_slots = 1 });
+        defer slots.close();
+        var execution: cpu.Execution = .{};
+        defer execution.finish();
+        try execution.start(&slots, .{ .io = std.testing.io, .native_now_ns = now, .allow_wait = true, .deadline_ns = now() + 10 * std.time.ns_per_s }, .query);
+        var health: cpu.Execution = .{};
+        defer health.finish();
+        try health.start(&slots, .{ .io = std.testing.io, .native_now_ns = now }, .control);
+        var operation = try Operation.prepare(root);
+        var held = true;
+        var releases: usize = 0;
+        const Control = struct {
+            operation: *Operation,
+            execution: *cpu.Execution,
+            slots: *cpu.Scheduler,
+            target: Target,
+            mode: ?Mode,
+            previous: ?Target = null,
+            triggered: bool = false,
+            fn lifetime(raw: *anyopaque) !void {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                try self.execution.checkLifetime();
+                if (self.triggered and self.mode == .lifetime_failure) return error.DeadlineExceeded;
+            }
+            fn checkpoint(raw: *anyopaque) !void {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                try lifetime(raw);
+                if (self.slots.state(&self.execution.entry.?) != .running) return error.InvalidRunnableTransition;
+                if (self.previous != self.operation.stage) {
+                    self.previous = self.operation.stage;
+                    storage_io.NativeSyncTestControl.release.store(false, .release);
+                }
+            }
+            fn deadline(raw: *anyopaque) !?u64 {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                return self.execution.entry.?.options.deadline_ns;
+            }
+            fn begin(raw: *anyopaque) !void {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                if (self.operation.stage == self.target and self.mode != null) {
+                    self.triggered = true;
+                    if (self.mode == .begin_failure) return error.FileNotFound;
+                }
+                try self.execution.park(.resource_blocked);
+                if (!(self.triggered and self.mode == .lifetime_failure))
+                    storage_io.NativeSyncTestControl.release.store(true, .release);
+            }
+            fn end(raw: *anyopaque) !void {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                storage_io.NativeSyncTestControl.release.store(true, .release);
+                if (self.triggered and self.mode == .end_failure) return error.Canceled;
+                try self.execution.enter(.query);
+            }
+        };
+        var control: Control = .{ .operation = &operation, .execution = &execution, .slots = &slots, .target = target, .mode = mode };
+        const payload: admission.Payload = .{ .ptr = &control, .vtable = &.{ .checkpoint = Control.checkpoint, .check_lifetime = Control.lifetime, .deadline_ns = Control.deadline }, .execution_wait = .{ .ptr = &control, .begin = Control.begin, .end = Control.end } };
+        const original = admission.Port.init(&payload);
+        storage_io.NativeSyncTestControl.pause.store(true, .release);
+        storage_io.NativeSyncTestControl.release.store(false, .release);
+        storage_io.NativeSyncTestControl.reads.store(0, .release);
+        storage_io.NativeSyncTestControl.calls.store(0, .release);
+        defer {
+            storage_io.NativeSyncTestControl.release.store(true, .release);
+            storage_io.NativeSyncTestControl.pause.store(false, .release);
+        }
+        var resources = (try native.storage().tryPrepareDurabilityWithAdmission(original)) orelse return error.TestUnexpectedResult;
+        operation.start(resources, .{ .held = &held, .releases = &releases }, original) catch |cause| {
+            resources.deinit();
+            return cause;
+        };
+        defer {
+            storage_io.NativeSyncTestControl.release.store(true, .release);
+            execution.finish();
+            operation.deinit();
+        }
+        native.state.threaded.concurrent_limit = .nothing;
+        backing.fail_index = backing.alloc_index;
+        backing.resize_fail_index = backing.resize_index;
+        const alloc_index = backing.alloc_index;
+        const resize_index = backing.resize_index;
+        var reserved: usize = 0;
+        while (pool.tryReserveDescriptorsForTest(std.testing.io, 1)) reserved += 1;
+        defer pool.releaseDescriptorsForTest(std.testing.io, reserved);
+        native.deinit();
+        native_live = false;
+        try std.testing.expectError(switch (mode) {
+            .begin_failure => error.FileNotFound,
+            .end_failure => error.Canceled,
+            .lifetime_failure => error.DeadlineExceeded,
+        }, operation.waitWithAdmission(original));
+        try std.testing.expect(control.triggered);
+        try std.testing.expectEqual(target, operation.stage);
+        try std.testing.expect(held);
+        try std.testing.expectEqual(@as(usize, 0), releases);
+        if (mode == .end_failure) try execution.enter(.query);
+        control.mode = null;
+        storage_io.NativeSyncTestControl.release.store(true, .release);
+        const result = try operation.waitWithAdmission(original);
+        try std.testing.expectEqual(@as(u64, 1), result.segment_syncs);
+        try std.testing.expectEqual(@as(u64, 1), result.index_syncs);
+        try std.testing.expect(!held);
+        try std.testing.expectEqual(@as(usize, 1), releases);
+        _ = try operation.waitWithAdmission(original);
+        try std.testing.expectEqual(@as(usize, 1), storage_io.NativeSyncTestControl.reads.load(.acquire));
+        try std.testing.expectEqual(@as(usize, 2), storage_io.NativeSyncTestControl.calls.load(.acquire));
+        try std.testing.expectEqual(std.hash.Wyhash.hash(0, segment), storage_io.NativeSyncTestControl.sync_path_hashes[0].load(.acquire));
+        try std.testing.expectEqual(std.hash.Wyhash.hash(0, index_path), storage_io.NativeSyncTestControl.sync_path_hashes[1].load(.acquire));
+        try std.testing.expectEqual(alloc_index, backing.alloc_index);
+        try std.testing.expectEqual(resize_index, backing.resize_index);
+        try std.testing.expectEqual(cpu.State.running, slots.state(&health.entry.?));
+    };
+}
+
+test "controlled physical sync WAL coordinator rejects corrupt metadata and never creates a missing segment" {
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi or builtin.os.tag == .freestanding) return error.SkipZigTest;
+    const admission = @import("../../common/read_admission.zig");
+    const Operation = CurrentStateSync(ControlledSyncPublication);
+    const Case = enum { absent, oversized, checksum, zero_segment, missing_segment, valid };
+    const Control = struct {
+        fn check(_: *anyopaque) !void {}
+        fn deadline(_: *anyopaque) !?u64 {
+            return std.math.maxInt(u64);
+        }
+        fn begin(_: *anyopaque) !void {}
+        fn end(_: *anyopaque) !void {}
+    };
+    var marker: u8 = 0;
+    const payload: admission.Payload = .{ .ptr = &marker, .vtable = &.{ .checkpoint = Control.check, .check_lifetime = Control.check, .deadline_ns = Control.deadline }, .execution_wait = .{ .ptr = &marker, .begin = Control.begin, .end = Control.end } };
+    const original = admission.Port.init(&payload);
+    for (std.enums.values(Case)) |case| {
+        const a = std.testing.allocator;
+        var native = try storage_io.NativeStorage.init(a, .threaded);
+        defer native.deinit();
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+        defer a.free(root);
+        const directory = try walDirPathAlloc(a, root);
+        defer a.free(directory);
+        try native.storage().createDirPath(directory);
+        const index = try indexPathAlloc(a, root);
+        defer a.free(index);
+        const segment = try segmentPathAlloc(a, root, 7);
+        defer a.free(segment);
+        switch (case) {
+            .absent => {},
+            .oversized => {
+                const bytes: [8192]u8 = @splat(0);
+                try native.storage().writeFileAbsolute(index, &bytes);
+            },
+            .checksum => {
+                var bytes: [control_pair_len]u8 = undefined;
+                const pair: [16]u8 = @splat(0);
+                encodeControl(&bytes, .current_segment, &pair);
+                bytes[bytes.len - 1] ^= 1;
+                try native.storage().writeFileAbsolute(index, &bytes);
+            },
+            .zero_segment => try writeCurrentSegment(native.storage(), a, root, 0, 0),
+            .missing_segment => try writeCurrentSegment(native.storage(), a, root, 7, 5),
+            .valid => {
+                try writeCurrentSegment(native.storage(), a, root, 7, 5);
+                try native.storage().writeFileAbsolute(segment, "state");
+            },
+        }
+        var held = true;
+        var releases: usize = 0;
+        var operation = try Operation.prepare(root);
+        var resources = (try native.storage().tryPrepareDurabilityWithAdmission(original)) orelse return error.TestUnexpectedResult;
+        operation.start(resources, .{ .held = &held, .releases = &releases }, original) catch |cause| {
+            resources.deinit();
+            return cause;
+        };
+        defer operation.deinit();
+        storage_io.NativeSyncTestControl.reads.store(0, .release);
+        storage_io.NativeSyncTestControl.calls.store(0, .release);
+        // Only sync counters are asserted: the initial read may already run
+        // by the time the caller resets its observation counters.
+        const result = operation.waitWithAdmission(original);
+        if (case == .absent or case == .valid) {
+            const stats = try result;
+            try std.testing.expectEqual(@as(u64, @intFromBool(case == .valid)), stats.segment_syncs);
+            try std.testing.expectEqual(stats.segment_syncs, stats.index_syncs);
+            _ = try operation.waitWithAdmission(original);
+        } else {
+            const expected: anyerror = if (case == .missing_segment) error.FileNotFound else error.CorruptLsmWalIndex;
+            try std.testing.expectError(expected, result);
+            try std.testing.expectError(expected, operation.waitWithAdmission(original));
+            try std.testing.expectError(error.FileNotFound, native.storage().fileSize(segment));
+        }
+        try std.testing.expect(!held);
+        try std.testing.expectEqual(@as(usize, 1), releases);
+        try std.testing.expectEqual(@as(usize, if (case == .valid) 2 else if (case == .missing_segment) 1 else 0), storage_io.NativeSyncTestControl.calls.load(.acquire));
+    }
+}
+
+/// Checked allocation planning shared by capture and canonical encoding. A
+/// rejected addition leaves the entire plan unchanged, including row count.
+pub const StateRecordSize = struct {
+    count: u32 = 0,
+    payload: u32 = 4,
+
+    pub fn add(self: *@This(), namespace_len: usize, key_len: usize, value_len: usize) !void {
+        const count = std.math.add(u32, self.count, 1) catch return error.ResourceBudgetExceeded;
+        var size = std.math.add(u32, self.payload, entry_header_len) catch return error.ResourceBudgetExceeded;
+        for ([_]usize{ namespace_len, key_len, value_len }) |len| {
+            if (len > std.math.maxInt(u32)) return error.ResourceBudgetExceeded;
+            size = std.math.add(u32, size, @intCast(len)) catch return error.ResourceBudgetExceeded;
+        }
+        _ = std.math.add(usize, size, record_header_len) catch return error.ResourceBudgetExceeded;
+        self.count = count;
+        self.payload = size;
+    }
+
+    pub fn total(self: @This()) usize {
+        return if (self.count == 0) 0 else @as(usize, self.payload) + record_header_len;
+    }
+};
+
+/// Canonical state-record preparation on admitted CPU, before publication and
+/// physical dispatch. The stable source outlives this synchronous call only.
+pub fn prepareStateRecordWithAdmission(allocator: Allocator, state: anytype, original: @import("../../common/read_admission.zig").Port) ![]u8 {
+    try original.checkpoint();
+    const count = state.entryCount();
+    if (count == 0) return allocator.alloc(u8, 0);
+    if (count > std.math.maxInt(u32)) return error.ResourceBudgetExceeded;
+    var plan: StateRecordSize = .{};
+    for (0..count) |index| {
+        try original.checkpoint();
+        const entry = state.entryAt(index);
+        const ns = entry.namespace_name orelse "";
+        try plan.add(ns.len, entry.key.len, entry.value.len);
+    }
+    const size = plan.payload;
+    const total = plan.total();
+    const record = try allocator.alloc(u8, total);
+    errdefer allocator.free(record);
+    const payload = record[record_header_len..];
+    var pos: usize = 0;
+    writeIntToPayload(payload, &pos, u32, @intCast(count));
+    for (0..count) |index| {
+        try original.checkpoint();
+        const entry = state.entryAt(index);
+        const ns = entry.namespace_name orelse "";
+        payload[pos] = @as(u8, @intFromBool(entry.tombstone)) | (@as(u8, @intFromBool(entry.namespace_name != null)) << 1);
+        @memset(payload[pos + 1 .. pos + 4], 0);
+        pos += 4;
+        writeIntToPayload(payload, &pos, u32, @intCast(ns.len));
+        writeIntToPayload(payload, &pos, u32, @intCast(entry.key.len));
+        writeIntToPayload(payload, &pos, u32, @intCast(entry.value.len));
+        for ([_][]const u8{ ns, entry.key, entry.value }) |bytes| {
+            var offset: usize = 0;
+            while (offset < bytes.len) {
+                try original.checkpoint();
+                const len = @min(bytes.len - offset, 16 * 1024);
+                @memcpy(payload[pos..][0..len], bytes[offset..][0..len]);
+                pos += len;
+                offset += len;
+            }
+        }
+    }
+    std.debug.assert(pos == size);
+    var crc = Crc32.init();
+    pos = 0;
+    while (pos < payload.len) {
+        try original.checkpoint();
+        const end = pos + @min(payload.len - pos, 16 * 1024);
+        crc.update(payload[pos..end]);
+        pos = end;
+    }
+    try original.checkpoint();
+    std.mem.writeInt(u32, record[0..4], record_magic, .little);
+    std.mem.writeInt(u16, record[4..6], record_version, .little);
+    std.mem.writeInt(u16, record[6..8], record_header_len, .little);
+    std.mem.writeInt(u32, record[8..12], @intCast(payload.len), .little);
+    std.mem.writeInt(u32, record[12..16], crc.final(), .little);
+    return record;
+}
+
+/// Owns canonical WAL bootstrap/rotation, one prepared append and its ordered
+/// barriers. Publication supplies bounded publish(AppendResult), requireRecovery
+/// and release callbacks. It owns a prepared mutable successor and metadata
+/// credits; no writer/maintenance may mutate that backend until retirement.
+/// Successful I/O retains publication until publishWithAdmission atomically
+/// adopts that successor on caller CPU. No caller admission borrow is stored.
+pub fn CurrentStateAppend(comptime Publication: type) type {
+    return struct {
+        const Self = @This();
+        const Stage = enum { current, checkpoint_probe, segment_stat, next_segment_probe, create_directory, directory_parent, current_replace, checkpoint_replace, append, segment_sync, segment_parent, ready, published, failed };
+        const Pending = union(enum) { none, read: storage_io.ControlFileReadOperation, physical: storage_io.SyncOperation };
+        index: [std.fs.max_path_bytes]u8 = undefined,
+        index_len: usize = 0,
+        checkpoint: [std.fs.max_path_bytes]u8 = undefined,
+        checkpoint_len: usize = 0,
+        segment: [std.fs.max_path_bytes]u8 = undefined,
+        prefix_len: usize = 0,
+        segment_len: usize = 0,
+        options: AppendOptions,
+        record_len: usize,
+        bootstrap: bool = false,
+        create_segment: bool = false,
+        mutation_started: bool = false,
+        resources: ?storage_io.DurabilityResources = null,
+        publication: ?Publication = null,
+        pending: Pending = .none,
+        stage: Stage = .current,
+        result: AppendResult = .{},
+        failure: ?anyerror = null,
+
+        pub fn prepare(root: []const u8, record_len: usize, options: AppendOptions) !Self {
+            if (record_len <= record_header_len or options.segment_bytes == 0) return error.ResourceBudgetExceeded;
+            var self: Self = .{ .options = options, .record_len = record_len };
+            const separator = if (root.len == 0 or std.mem.endsWith(u8, root, "/")) "" else "/";
+            const prefix = std.fmt.bufPrint(&self.segment, "{s}{s}{s}/", .{ root, separator, wal_dir_name }) catch return error.NameTooLong;
+            // Every future name, including the reserved control temporary,
+            // must fit before the caller acquires filesystem publication.
+            if (prefix.len + 40 >= self.segment.len) return error.NameTooLong;
+            self.prefix_len = prefix.len;
+            self.index_len = (std.fmt.bufPrint(&self.index, "{s}{s}", .{ prefix, wal_index_file_name }) catch unreachable).len;
+            self.checkpoint_len = (std.fmt.bufPrint(&self.checkpoint, "{s}{s}", .{ prefix, wal_checkpoint_file_name }) catch unreachable).len;
+            return self;
+        }
+
+        /// Ownership transfers only after the first physical read is accepted.
+        /// The grant was prepared with exactly this canonical record's bytes.
+        pub fn start(self: *Self, resources: storage_io.DurabilityResources, publication: Publication, original: @import("../../common/read_admission.zig").Port) !void {
+            std.debug.assert(self.resources == null and self.publication == null);
+            var grant = resources;
+            const read = try grant.beginControlRead(self.index[0..self.index_len], control_pair_len, original);
+            self.resources = grant;
+            self.publication = publication;
+            self.pending = .{ .read = read };
+        }
+
+        fn segmentPath(self: *Self, number: u64) void {
+            self.result.segment = number;
+            const name = std.fmt.bufPrint(self.segment[self.prefix_len..], "{d:0>20}.log", .{number}) catch unreachable;
+            self.segment_len = self.prefix_len + name.len;
+        }
+
+        pub fn waitWithAdmission(self: *Self, original: @import("../../common/read_admission.zig").Port) !AppendResult {
+            const admission = @import("../../common/read_admission.zig");
+            _ = (try original.executionWaitAfterLifetime()) orelse return error.ExecutionWaitUnsupported;
+            _ = (try original.deadlineNs()) orelse return error.ExecutionWaitUnsupported;
+            while (true) {
+                try original.checkpoint();
+                switch (self.stage) {
+                    .ready, .published => return self.result,
+                    .failed => return self.failure.?,
+                    .current, .checkpoint_probe, .segment_stat, .next_segment_probe => {
+                        if (self.pending == .none) {
+                            const path = if (self.stage == .checkpoint_probe) self.checkpoint[0..self.checkpoint_len] else self.segment[0..self.segment_len];
+                            self.pending = .{ .read = try self.resources.?.beginControlRead(path, 1, original) };
+                        }
+                        var trace: admission.RejectionTrace = .{};
+                        var absent = false;
+                        const read = self.pending.read.waitWithAdmission(trace.bind(original).?) catch |cause| blk: {
+                            if (trace.failure) |rejected| return rejected;
+                            if (cause != error.FileNotFound) return self.fail(cause);
+                            absent = true;
+                            break :blk storage_io.ControlFileResult{ .file_size = 0, .bytes = &.{} };
+                        };
+                        try original.checkpoint();
+                        switch (self.stage) {
+                            .current => {
+                                if (absent) {
+                                    self.bootstrap = true;
+                                    self.create_segment = true;
+                                    self.segmentPath(1);
+                                    self.stage = .checkpoint_probe;
+                                } else {
+                                    if (read.file_size != control_pair_len or read.bytes.len != control_pair_len) return self.fail(error.CorruptLsmWalIndex);
+                                    const data = decodeControl(read.bytes, .current_segment, 16) catch |cause| return self.fail(cause);
+                                    const number = std.mem.readInt(u64, data[0..8], .little);
+                                    if (number == 0) return self.fail(error.CorruptLsmWalIndex);
+                                    self.segmentPath(number);
+                                    self.stage = .segment_stat;
+                                }
+                            },
+                            .checkpoint_probe => {
+                                // An orphan checkpoint is recovery evidence,
+                                // never permission to erase retention history.
+                                if (!absent) return self.fail(error.RecoveryRequired);
+                                self.stage = .segment_stat;
+                            },
+                            .segment_stat => {
+                                if (self.bootstrap) {
+                                    if (read.file_size != 0) return self.fail(error.RecoveryRequired);
+                                    self.stage = .create_directory;
+                                } else {
+                                    if (absent) return self.fail(error.FileNotFound);
+                                    const size = std.math.add(u64, read.file_size, self.record_len) catch return self.fail(error.ResourceBudgetExceeded);
+                                    self.create_segment = read.file_size == 0;
+                                    if (read.file_size > 0 and size > self.options.segment_bytes) {
+                                        const next = std.math.add(u64, self.result.segment, 1) catch return self.fail(error.CorruptLsmWalIndex);
+                                        self.segmentPath(next);
+                                        self.create_segment = true;
+                                        self.stage = .next_segment_probe;
+                                    } else self.stage = .append;
+                                }
+                            },
+                            .next_segment_probe => {
+                                if (read.file_size != 0) return self.fail(error.RecoveryRequired);
+                                self.stage = .current_replace;
+                            },
+                            else => unreachable,
+                        }
+                        self.retirePending();
+                    },
+                    else => {
+                        if (self.pending == .none) {
+                            const operation = switch (self.stage) {
+                                .create_directory => try self.resources.?.beginCreateDirectory(self.segment[0 .. self.prefix_len - 1], original),
+                                .directory_parent => try self.resources.?.beginSyncParent(self.segment[0 .. self.prefix_len - 1], original),
+                                .current_replace, .checkpoint_replace => blk: {
+                                    var data: [16]u8 = undefined;
+                                    std.mem.writeInt(u64, data[0..8], if (self.stage == .current_replace) self.result.segment else 1, .little);
+                                    std.mem.writeInt(u64, data[8..16], 0, .little);
+                                    var raw: [control_pair_len]u8 = undefined;
+                                    encodeControl(&raw, if (self.stage == .current_replace) .current_segment else .checkpoint, &data);
+                                    const path = if (self.stage == .current_replace) self.index[0..self.index_len] else self.checkpoint[0..self.checkpoint_len];
+                                    break :blk try self.resources.?.beginControlReplace(path, &raw, original);
+                                },
+                                .append => try self.resources.?.beginPreparedAppend(self.segment[0..self.segment_len], self.create_segment, original),
+                                .segment_sync => try self.resources.?.beginSyncContents(self.segment[0..self.segment_len], original),
+                                .segment_parent => try self.resources.?.beginSyncParent(self.segment[0..self.segment_len], original),
+                                else => unreachable,
+                            };
+                            self.pending = .{ .physical = operation };
+                            if (self.stage == .create_directory or self.stage == .current_replace or self.stage == .checkpoint_replace or self.stage == .append) self.mutation_started = true;
+                        }
+                        var trace: admission.RejectionTrace = .{};
+                        self.pending.physical.waitWithAdmission(trace.bind(original).?) catch |cause| {
+                            if (trace.failure) |rejected| return rejected;
+                            return self.fail(cause);
+                        };
+                        self.retirePending();
+                        self.stage = switch (self.stage) {
+                            .create_directory => .directory_parent,
+                            .directory_parent => .current_replace,
+                            .current_replace => blk: {
+                                self.result.index_syncs += 1;
+                                break :blk if (self.bootstrap) .checkpoint_replace else .append;
+                            },
+                            .checkpoint_replace => blk: {
+                                self.result.index_syncs += 1;
+                                break :blk .append;
+                            },
+                            .append => blk: {
+                                self.result.bytes = self.record_len;
+                                self.result.segment_became_nonempty = self.create_segment;
+                                break :blk .segment_sync;
+                            },
+                            .segment_sync => blk: {
+                                self.result.segment_syncs = 1;
+                                break :blk if (self.create_segment) .segment_parent else .ready;
+                            },
+                            .segment_parent => .ready,
+                            else => unreachable,
+                        };
+                    },
+                }
+            }
+        }
+
+        /// The callback is an already-prepared, bounded, infallible publication
+        /// on caller CPU. No reentry check may split adoption from its receipt.
+        pub fn publishWithAdmission(self: *Self, original: @import("../../common/read_admission.zig").Port) !AppendResult {
+            const result = try self.waitWithAdmission(original);
+            if (self.stage == .published) return result;
+            try original.checkpoint();
+            self.publication.?.publish(result);
+            self.stage = .published;
+            self.releasePublication(false);
+            return result;
+        }
+
+        fn retirePending(self: *Self) void {
+            switch (self.pending) {
+                .read => |*read| read.deinit(),
+                .physical => |*operation| operation.deinit(),
+                .none => {},
+            }
+            self.pending = .none;
+        }
+
+        fn releasePublication(self: *Self, recovery: bool) void {
+            if (self.publication) |*publication| {
+                if (recovery and self.mutation_started) publication.requireRecovery();
+                publication.release();
+            }
+            self.publication = null;
+        }
+
+        fn fail(self: *Self, cause: anyerror) anyerror {
+            self.retirePending();
+            self.failure = cause;
+            self.stage = .failed;
+            self.releasePublication(true);
+            return cause;
+        }
+
+        /// Retire a terminal append's worker on the original wait boundary.
+        /// A failed reentry leaves the grant, frozen bytes and their charge
+        /// reachable for retry, including when physical join already finished.
+        pub fn retireWithAdmission(self: *Self, original: @import("../../common/read_admission.zig").Port) !void {
+            try original.checkpoint();
+            if (self.stage != .published and self.stage != .failed) return error.ResourceBudgetExceeded;
+            std.debug.assert(self.pending == .none and self.publication == null);
+            if (self.resources) |*resources| {
+                try resources.retireWithAdmission(original);
+                self.resources = null;
+            }
+        }
+
+        /// Mandatory quiesced destruction joins only accepted physical work.
+        /// Unpublished possible writes require recovery before releasing the
+        /// guard. It never starts missing barriers or publishes caller state.
+        pub fn deinit(self: *Self) void {
+            self.retirePending();
+            self.releasePublication(self.stage != .published);
+            if (self.resources) |*resources| resources.deinit();
+            self.* = undefined;
+        }
+    };
+}
+
+pub fn validateStateRecordWithAdmission(record: []const u8, original: @import("../../common/read_admission.zig").Port) !u32 {
+    try original.checkpoint();
+    if (record.len < record_header_len + 4) return error.CorruptLsmWal;
+    if (std.mem.readInt(u32, record[0..4], .little) != record_magic) return error.CorruptLsmWal;
+    if (std.mem.readInt(u16, record[4..6], .little) != record_version or std.mem.readInt(u16, record[6..8], .little) != record_header_len) return error.UnsupportedLsmWalHeader;
+    const payload = record[record_header_len..];
+    if (std.mem.readInt(u32, record[8..12], .little) != payload.len) return error.CorruptLsmWal;
+    var crc = Crc32.init();
+    var pos: usize = 0;
+    while (pos < payload.len) {
+        try original.checkpoint();
+        const end = pos + @min(payload.len - pos, 16 * 1024);
+        crc.update(payload[pos..end]);
+        pos = end;
+    }
+    if (crc.final() != std.mem.readInt(u32, record[12..16], .little)) return error.CorruptLsmWal;
+    pos = 0;
+    const count = try readInt(payload, &pos, u32);
+    for (0..count) |_| {
+        try original.checkpoint();
+        if (payload.len - pos < entry_header_len) return error.CorruptLsmWal;
+        pos += 4;
+        const ns = try readInt(payload, &pos, u32);
+        const key = try readInt(payload, &pos, u32);
+        const value = try readInt(payload, &pos, u32);
+        for ([_]u32{ ns, key, value }) |len| {
+            if (len > payload.len - pos) return error.CorruptLsmWal;
+            pos += len;
+        }
+    }
+    if (pos != payload.len) return error.CorruptLsmWal;
+    return count;
+}
+
+const AppendTestAuthority = struct {
+    checks: usize = 0,
+    fail_at: usize = std.math.maxInt(usize),
+    fn check(raw: *anyopaque) !void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        self.checks += 1;
+        if (self.checks >= self.fail_at) return error.NotFound;
+    }
+    fn deadline(_: *anyopaque) !?u64 {
+        return std.math.maxInt(u64);
+    }
+    fn begin(_: *anyopaque) !void {}
+    fn end(_: *anyopaque) !void {}
+    fn payload(self: *@This()) @import("../../common/read_admission.zig").Payload {
+        return .{ .ptr = self, .vtable = &.{ .checkpoint = check, .check_lifetime = check, .deadline_ns = deadline }, .execution_wait = .{ .ptr = self, .begin = begin, .end = end } };
+    }
+};
+
+const AppendTestPublication = struct {
+    held: *bool,
+    publishes: *usize,
+    recover: *bool,
+    releases: *usize,
+    pub fn publish(self: *@This(), _: AppendResult) void {
+        std.debug.assert(self.held.* and self.publishes.* == 0);
+        self.publishes.* += 1;
+    }
+    pub fn requireRecovery(self: *@This()) void {
+        std.debug.assert(self.held.*);
+        self.recover.* = true;
+    }
+    pub fn release(self: *@This()) void {
+        std.debug.assert(self.held.*);
+        self.held.* = false;
+        self.releases.* += 1;
+    }
+};
+
+test "controlled physical sync WAL record planning rejects overflow without advancing its cursor" {
+    var plan: StateRecordSize = .{};
+    try std.testing.expectEqual(@as(usize, 0), plan.total());
+    try std.testing.expectError(error.ResourceBudgetExceeded, plan.add(std.math.maxInt(usize), 0, 0));
+    try std.testing.expectEqual(@as(u32, 0), plan.count);
+    try std.testing.expectEqual(@as(u32, 4), plan.payload);
+    try plan.add(0, 3, 72);
+    try std.testing.expectEqual(@as(usize, record_header_len + 4 + entry_header_len + 3 + 72), plan.total());
+    const before = plan;
+    try std.testing.expectError(error.ResourceBudgetExceeded, plan.add(0, std.math.maxInt(usize), 1));
+    try std.testing.expectEqual(before, plan);
+    plan.count = std.math.maxInt(u32);
+    const full = plan;
+    try std.testing.expectError(error.ResourceBudgetExceeded, plan.add(0, 1, 1));
+    try std.testing.expectEqual(full, plan);
+    try std.testing.expectError(error.ResourceBudgetExceeded, @import("state.zig").sharedEntryAllocationBytes(null, std.math.maxInt(usize), 1));
+}
+
+test "controlled physical sync WAL record preparation preserves canonical bytes and bounds copy checksum work" {
+    const a = std.testing.allocator;
+    var state: State = .{};
+    defer state.deinit(a);
+    const value = try a.alloc(u8, 70 * 1024);
+    defer a.free(value);
+    @memset(value, 'v');
+    try state.upsert(a, .{ .name = "docs" }, "key", value, false);
+    var authority: AppendTestAuthority = .{ .fail_at = 8 };
+    var payload = authority.payload();
+    const original = @import("../../common/read_admission.zig").Port.init(&payload);
+    var backing = std.testing.FailingAllocator.init(a, .{});
+    try std.testing.expectError(error.NotFound, prepareStateRecordWithAdmission(backing.allocator(), &state, original));
+    try std.testing.expectEqual(backing.allocated_bytes, backing.freed_bytes);
+    authority.fail_at = std.math.maxInt(usize);
+    try state.upsert(a, .{}, "deleted", "", true);
+    try state.upsert(a, .{ .name = "" }, "binary\x00key", "\xff\x00", false);
+    const record = try prepareStateRecordWithAdmission(a, &state, original);
+    defer a.free(record);
+    try std.testing.expectEqual(@as(u32, 3), try validateStateRecordWithAdmission(record, original));
+    var memory = storage_io.MemoryStorage.init(a);
+    defer memory.deinit();
+    _ = try appendState(memory.storage(), a, "/canonical", &state, false);
+    const raw = try memory.storage().readFileAlloc(a, "/canonical/wal/00000000000000000001.log", record.len);
+    defer a.free(raw);
+    try std.testing.expectEqualSlices(u8, raw, record);
+    record[record.len - 1] ^= 1;
+    try std.testing.expectError(error.CorruptLsmWal, validateStateRecordWithAdmission(record, original));
+    authority.fail_at = authority.checks + 2;
+    try std.testing.expectError(error.NotFound, validateStateRecordWithAdmission(raw, original));
+}
+
+test "controlled physical sync WAL append retains every bootstrap phase and publishes once under exhausted resources" {
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi or builtin.os.tag == .freestanding) return error.SkipZigTest;
+    const cpu = @import("../../common/runnable_scheduler.zig");
+    const admission = @import("../../common/read_admission.zig");
+    const now = platform.time.monotonicNs;
+    const Operation = CurrentStateAppend(AppendTestPublication);
+    const Target = @FieldType(Operation, "stage");
+    const Mode = enum { begin_failure, end_failure, lifetime_failure };
+    for ([_]Target{ .current, .checkpoint_probe, .segment_stat, .create_directory, .directory_parent, .current_replace, .checkpoint_replace, .append, .segment_sync, .segment_parent }) |target| for (std.enums.values(Mode)) |mode| {
+        const a = std.testing.allocator;
+        var backing = std.testing.FailingAllocator.init(a, .{});
+        var pool = storage_io.NativeStoragePool.initWithCapacityForTest(a, 8);
+        defer pool.deinit();
+        var native = try storage_io.NativeStorage.initWithPool(backing.allocator(), .threaded, &pool);
+        var native_live = true;
+        defer if (native_live) native.deinit();
+        const native_state = native.state;
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+        defer a.free(root);
+        var state: State = .{};
+        defer state.deinit(a);
+        try state.upsert(a, .{ .name = "docs" }, "key", "value", false);
+        var authority: AppendTestAuthority = .{};
+        var preparation_payload = authority.payload();
+        const record = try prepareStateRecordWithAdmission(a, &state, .init(&preparation_payload));
+        defer a.free(record);
+        var operation = try Operation.prepare(root, record.len, .{});
+        var slots = try cpu.Scheduler.init(.{ .slots = 3, .control_slots = 1, .cleanup_slots = 1 });
+        defer slots.close();
+        var execution: cpu.Execution = .{};
+        defer execution.finish();
+        try execution.start(&slots, .{ .io = std.testing.io, .native_now_ns = now, .allow_wait = true, .deadline_ns = now() + 15 * std.time.ns_per_s }, .query);
+        var health: cpu.Execution = .{};
+        defer health.finish();
+        try health.start(&slots, .{ .io = std.testing.io, .native_now_ns = now }, .control);
+        const Control = struct {
+            operation: *Operation,
+            execution: *cpu.Execution,
+            slots: *cpu.Scheduler,
+            target: Target,
+            mode: ?Mode,
+            previous: ?Target = null,
+            triggered: bool = false,
+            reject_publish: bool = false,
+            fn lifetime(raw: *anyopaque) !void {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                try self.execution.checkLifetime();
+                if (self.reject_publish) return error.NotFound;
+                if (self.triggered and self.mode == .lifetime_failure) return error.DeadlineExceeded;
+            }
+            fn check(raw: *anyopaque) !void {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                try lifetime(raw);
+                if (self.slots.state(&self.execution.entry.?) != .running) return error.InvalidRunnableTransition;
+                if (self.previous != self.operation.stage) {
+                    self.previous = self.operation.stage;
+                    storage_io.NativeSyncTestControl.release.store(false, .release);
+                }
+            }
+            fn deadline(raw: *anyopaque) !?u64 {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                return self.execution.entry.?.options.deadline_ns;
+            }
+            fn begin(raw: *anyopaque) !void {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                if (self.operation.stage == self.target and self.mode != null) {
+                    self.triggered = true;
+                    if (self.mode == .begin_failure) return error.FileNotFound;
+                }
+                try self.execution.park(.resource_blocked);
+                if (!(self.triggered and self.mode == .lifetime_failure)) storage_io.NativeSyncTestControl.release.store(true, .release);
+            }
+            fn end(raw: *anyopaque) !void {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                storage_io.NativeSyncTestControl.release.store(true, .release);
+                if (self.triggered and self.mode == .end_failure) return error.Canceled;
+                try self.execution.enter(.query);
+            }
+        };
+        var control: Control = .{ .operation = &operation, .execution = &execution, .slots = &slots, .target = target, .mode = mode };
+        const payload: admission.Payload = .{ .ptr = &control, .vtable = &.{ .checkpoint = Control.check, .check_lifetime = Control.lifetime, .deadline_ns = Control.deadline }, .execution_wait = .{ .ptr = &control, .begin = Control.begin, .end = Control.end } };
+        const original = admission.Port.init(&payload);
+        var held = true;
+        var publishes: usize = 0;
+        var releases: usize = 0;
+        var recover = false;
+        storage_io.NativeSyncTestControl.pause.store(true, .release);
+        storage_io.NativeSyncTestControl.reads.store(0, .release);
+        storage_io.NativeSyncTestControl.calls.store(0, .release);
+        storage_io.NativeSyncTestControl.appends.store(0, .release);
+        storage_io.NativeSyncTestControl.metadata.store(0, .release);
+        var resources = (try native.storage().tryPrepareAppendWithAdmission(record, original)).?;
+        operation.start(resources, .{ .held = &held, .publishes = &publishes, .releases = &releases, .recover = &recover }, original) catch |cause| {
+            resources.deinit();
+            return cause;
+        };
+        defer {
+            storage_io.NativeSyncTestControl.release.store(true, .release);
+            storage_io.NativeSyncTestControl.pause.store(false, .release);
+            execution.finish();
+            operation.deinit();
+        }
+        native_state.threaded.concurrent_limit = .nothing;
+        backing.fail_index = backing.alloc_index;
+        backing.resize_fail_index = backing.resize_index;
+        const allocations = backing.alloc_index;
+        const resizes = backing.resize_index;
+        var reserved: usize = 0;
+        while (pool.tryReserveDescriptorsForTest(std.testing.io, 1)) reserved += 1;
+        defer pool.releaseDescriptorsForTest(std.testing.io, reserved);
+        native.deinit();
+        native_live = false;
+        try std.testing.expectError(switch (mode) {
+            .begin_failure => error.FileNotFound,
+            .end_failure => error.Canceled,
+            .lifetime_failure => error.DeadlineExceeded,
+        }, operation.waitWithAdmission(original));
+        try std.testing.expectEqual(target, operation.stage);
+        try std.testing.expect(held and !recover and publishes == 0 and releases == 0);
+        if (mode == .end_failure) try execution.enter(.query);
+        control.mode = null;
+        storage_io.NativeSyncTestControl.release.store(true, .release);
+        const result = try operation.waitWithAdmission(original);
+        try std.testing.expect(held and publishes == 0);
+        control.reject_publish = true;
+        try std.testing.expectError(error.NotFound, operation.publishWithAdmission(original));
+        try std.testing.expect(held and publishes == 0);
+        control.reject_publish = false;
+        _ = try operation.publishWithAdmission(original);
+        _ = try operation.publishWithAdmission(original);
+        try std.testing.expect(!held and !recover and publishes == 1 and releases == 1);
+        try std.testing.expectEqual(record.len, result.bytes);
+        try std.testing.expectEqual(@as(u64, 1), result.segment);
+        try std.testing.expectEqual(@as(u64, 1), result.segment_syncs);
+        try std.testing.expectEqual(@as(u64, 2), result.index_syncs);
+        try std.testing.expectEqual(@as(usize, 3), storage_io.NativeSyncTestControl.reads.load(.acquire));
+        try std.testing.expectEqual(@as(usize, 3), storage_io.NativeSyncTestControl.metadata.load(.acquire));
+        try std.testing.expectEqual(@as(usize, 1), storage_io.NativeSyncTestControl.appends.load(.acquire));
+        try std.testing.expectEqual(@as(usize, 3), storage_io.NativeSyncTestControl.calls.load(.acquire));
+        try std.testing.expectEqual(allocations, backing.alloc_index);
+        try std.testing.expectEqual(resizes, backing.resize_index);
+        try std.testing.expectEqual(cpu.State.running, slots.state(&health.entry.?));
+        var io_storage = storage_io.IoStorage.init(std.testing.io);
+        var replayed: State = .{};
+        defer replayed.deinit(a);
+        const replay = try replayIntoMutable(io_storage.storage(), a, root, &replayed);
+        try std.testing.expectEqual(@as(u64, 1), replay.records);
+        try std.testing.expectEqualStrings("value", try replayed.get(.{ .name = "docs" }, "key"));
+    };
+}
+
+test "controlled physical sync WAL append preserves rotation recovery and physical failure semantics" {
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi or builtin.os.tag == .freestanding) return error.SkipZigTest;
+    const Case = enum { steady, rotation, empty_segment, missing_segment, orphan_checkpoint, orphan_segment, occupied_next, corrupt_current, bad_checksum, zero_segment, partial_append, metadata_failure, abandoned_publication };
+    for (std.enums.values(Case)) |case| {
+        const a = std.testing.allocator;
+        var native = try storage_io.NativeStorage.init(a, .threaded);
+        defer native.deinit();
+        const store = native.storage();
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+        defer a.free(root);
+        var state: State = .{};
+        defer state.deinit(a);
+        try state.upsert(a, .{ .name = "docs" }, "new", "value", false);
+        var authority: AppendTestAuthority = .{};
+        var payload = authority.payload();
+        const original = @import("../../common/read_admission.zig").Port.init(&payload);
+        const record = try prepareStateRecordWithAdmission(a, &state, original);
+        defer a.free(record);
+        const directory = try walDirPathAlloc(a, root);
+        defer a.free(directory);
+        try store.createDirPath(directory);
+        const current_path = try indexPathAlloc(a, root);
+        defer a.free(current_path);
+        const first_path = try segmentPathAlloc(a, root, 1);
+        defer a.free(first_path);
+        const next_path = try segmentPathAlloc(a, root, 2);
+        defer a.free(next_path);
+        switch (case) {
+            .steady, .rotation, .occupied_next, .partial_append => {
+                var seed: State = .{};
+                defer seed.deinit(a);
+                try seed.upsert(a, .{ .name = "docs" }, "seed", "old", false);
+                _ = try appendState(store, a, root, &seed, false);
+                if (case == .occupied_next) try store.writeFileAbsolute(next_path, "unclaimed-record");
+            },
+            .empty_segment => {
+                try writeCurrentSegment(store, a, root, 1, 999999);
+                try store.writeFileAbsolute(first_path, "");
+            },
+            .missing_segment => try writeCurrentSegment(store, a, root, 1, 0),
+            .orphan_checkpoint => try writeCheckpointIndex(store, a, root, .{ .oldest_retained_segment = 1, .covered_through_segment = 0 }),
+            .orphan_segment => try store.writeFileAbsolute(first_path, "unclaimed-record"),
+            .corrupt_current => try store.writeFileAbsolute(current_path, "bad"),
+            .bad_checksum, .zero_segment => {
+                try writeCurrentSegment(store, a, root, if (case == .zero_segment) 0 else 1, 0);
+                if (case == .bad_checksum) {
+                    const bytes = try store.readFileRangeAlloc(a, current_path, 0, control_pair_len);
+                    defer a.free(bytes);
+                    bytes[bytes.len - 1] ^= 1;
+                    try store.writeFileAbsolute(current_path, bytes);
+                }
+            },
+            .metadata_failure, .abandoned_publication => {},
+        }
+        if (case == .rotation) {
+            var warm: [control_pair_len]u8 = undefined;
+            try store.readFileRangeInto(a, current_path, 0, &warm);
+        }
+        var held = true;
+        var publishes: usize = 0;
+        var releases: usize = 0;
+        var recover = false;
+        const options: AppendOptions = .{ .segment_bytes = if (case == .rotation or case == .occupied_next or case == .empty_segment) 1 else default_wal_segment_bytes };
+        var operation = try CurrentStateAppend(AppendTestPublication).prepare(root, record.len, options);
+        var resources = (try store.tryPrepareAppendWithAdmission(record, original)).?;
+        operation.start(resources, .{ .held = &held, .publishes = &publishes, .releases = &releases, .recover = &recover }, original) catch |cause| {
+            resources.deinit();
+            return cause;
+        };
+        var live = true;
+        defer if (live) operation.deinit();
+        storage_io.NativeSyncTestControl.appends.store(0, .release);
+        if (case == .partial_append) storage_io.NativeSyncTestControl.append_failure_after.store(3, .release);
+        if (case == .metadata_failure) storage_io.NativeSyncTestControl.control_failure_after_rename.store(true, .release);
+        defer {
+            storage_io.NativeSyncTestControl.append_failure_after.store(std.math.maxInt(usize), .release);
+            storage_io.NativeSyncTestControl.control_failure_after_rename.store(false, .release);
+        }
+        const failure: ?anyerror = switch (case) {
+            .missing_segment => error.FileNotFound,
+            .orphan_checkpoint, .orphan_segment, .occupied_next => error.RecoveryRequired,
+            .corrupt_current, .bad_checksum, .zero_segment => error.CorruptLsmWalIndex,
+            .partial_append => error.NoSpaceLeft,
+            .metadata_failure => error.InputOutput,
+            else => null,
+        };
+        if (failure) |expected| {
+            for (0..2) |_| try std.testing.expectError(expected, operation.publishWithAdmission(original));
+            try std.testing.expect(!held and releases == 1 and publishes == 0);
+            try std.testing.expectEqual(case == .partial_append or case == .metadata_failure, recover);
+            try std.testing.expectEqual(@as(usize, if (case == .partial_append) 1 else 0), storage_io.NativeSyncTestControl.appends.load(.acquire));
+            if (case == .metadata_failure) {
+                // The rename did happen even though namespace durability was
+                // unobserved. Never retry or publish this ambiguous outcome.
+                const current = try readCurrentSegmentIfPresent(store, a, root);
+                try std.testing.expectEqual(@as(u64, 1), current.segment);
+            }
+        } else {
+            const result = try operation.waitWithAdmission(original);
+            try std.testing.expect(held and publishes == 0);
+            if (case == .abandoned_publication) {
+                operation.deinit();
+                live = false;
+                try std.testing.expect(!held and recover and publishes == 0 and releases == 1);
+            } else {
+                _ = try operation.publishWithAdmission(original);
+                try std.testing.expect(!held and !recover and publishes == 1);
+                try std.testing.expectEqual(@as(u64, if (case == .rotation) 2 else 1), result.segment);
+                try std.testing.expectEqual(@as(u64, if (case == .rotation) 1 else 0), result.index_syncs);
+                try std.testing.expectEqual(case != .steady, result.segment_became_nonempty);
+                const current = try readCurrentSegmentIfPresent(store, a, root);
+                try std.testing.expectEqual(result.segment, current.segment);
+                var replayed: State = .{};
+                defer replayed.deinit(a);
+                const replay = try replayIntoMutable(store, a, root, &replayed);
+                try std.testing.expectEqual(@as(u64, if (case == .empty_segment) 1 else 2), replay.records);
+                try std.testing.expectEqualStrings("value", try replayed.get(.{ .name = "docs" }, "new"));
+            }
+        }
+    }
+}
+
+test "controlled physical sync WAL append retirement joins accepted writes before poisoning and releasing publication" {
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi or builtin.os.tag == .freestanding) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var native = try storage_io.NativeStorage.init(a, .threaded);
+    defer native.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer a.free(root);
+    var state: State = .{};
+    defer state.deinit(a);
+    try state.upsert(a, .{}, "seed", "value", false);
+    _ = try appendState(native.storage(), a, root, &state, false);
+    const Operation = CurrentStateAppend(AppendTestPublication);
+    const Control = struct {
+        operation: *Operation,
+        fn check(_: *anyopaque) !void {}
+        fn deadline(_: *anyopaque) !?u64 {
+            return std.math.maxInt(u64);
+        }
+        fn begin(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.operation.stage == .append) return error.NotFound;
+        }
+        fn end(_: *anyopaque) !void {}
+    };
+    var authority: AppendTestAuthority = .{};
+    var preparation = authority.payload();
+    const record = try prepareStateRecordWithAdmission(a, &state, .init(&preparation));
+    defer a.free(record);
+    var operation = try Operation.prepare(root, record.len, .{});
+    var control: Control = .{ .operation = &operation };
+    const admission = @import("../../common/read_admission.zig");
+    const payload: admission.Payload = .{ .ptr = &control, .vtable = &.{ .checkpoint = Control.check, .check_lifetime = Control.check, .deadline_ns = Control.deadline }, .execution_wait = .{ .ptr = &control, .begin = Control.begin, .end = Control.end } };
+    const original = admission.Port.init(&payload);
+    var held = true;
+    var publishes: usize = 0;
+    var releases: usize = 0;
+    var recover = false;
+    var grant = (try native.storage().tryPrepareAppendWithAdmission(record, original)).?;
+    operation.start(grant, .{ .held = &held, .publishes = &publishes, .releases = &releases, .recover = &recover }, original) catch |cause| {
+        grant.deinit();
+        return cause;
+    };
+    var transferred = false;
+    defer if (!transferred) {
+        storage_io.NativeSyncTestControl.release.store(true, .release);
+        storage_io.NativeSyncTestControl.pause.store(false, .release);
+        operation.deinit();
+    };
+    // The checkpoint gate pauses only append, after metadata reads succeed.
+    storage_io.NativeSyncTestControl.calls.store(0, .release);
+    storage_io.NativeSyncTestControl.appends.store(0, .release);
+    storage_io.NativeSyncTestControl.pause.store(true, .release);
+    storage_io.NativeSyncTestControl.release.store(true, .release);
+    const Gate = struct {
+        operation: *Operation,
+        fn check(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.operation.stage == .append) storage_io.NativeSyncTestControl.release.store(false, .release);
+        }
+    };
+    var gate: Gate = .{ .operation = &operation };
+    var gated_payload = payload;
+    gated_payload.vtable = &.{ .checkpoint = Gate.check, .check_lifetime = Gate.check, .deadline_ns = Control.deadline };
+    gated_payload.ptr = &gate;
+    // Execution-wait callbacks still reference the original Control.
+    try std.testing.expectError(error.NotFound, operation.waitWithAdmission(.init(&gated_payload)));
+    const Join = struct {
+        operation: *Operation,
+        entered: std.Io.Event = .unset,
+        done: std.atomic.Value(bool) = .init(false),
+        fn run(self: *@This()) void {
+            self.entered.set(std.testing.io);
+            self.operation.deinit();
+            self.done.store(true, .release);
+        }
+    };
+    var joining: Join = .{ .operation = &operation };
+    var thread = try std.testing.io.concurrent(Join.run, .{&joining});
+    transferred = true;
+    defer {
+        storage_io.NativeSyncTestControl.release.store(true, .release);
+        storage_io.NativeSyncTestControl.pause.store(false, .release);
+        thread.await(std.testing.io);
+    }
+    try joining.entered.waitTimeout(std.testing.io, .{ .duration = .{ .raw = .fromSeconds(5), .clock = .awake } });
+    try std.testing.expect(held and !recover and !joining.done.load(.acquire));
+    storage_io.NativeSyncTestControl.release.store(true, .release);
+    thread.await(std.testing.io);
+    try std.testing.expect(!held and recover and publishes == 0 and releases == 1);
+    try std.testing.expectEqual(@as(usize, 1), storage_io.NativeSyncTestControl.appends.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 0), storage_io.NativeSyncTestControl.calls.load(.acquire));
 }

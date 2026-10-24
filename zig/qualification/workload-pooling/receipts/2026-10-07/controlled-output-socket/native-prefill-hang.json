@@ -1,0 +1,10 @@
+{
+  "observed_at": 1791419653.1479092,
+  "test_pid": 86026,
+  "test_binary": "/private/tmp/antfly-worker-phase-native-cache/o/b2d973098ec7df0c10116a8950af2515/root",
+  "state": "terminal",
+  "reason": "Focused new fixture blocked in native sendmsg beyond its intended bounded interval; stack sample preserved. Prefill lacks native kernel timeout.",
+  "sample": "/private/tmp/antfly-controlled-output-native-sample.txt",
+  "exit_code": 1,
+  "finished": 1791419681.046707
+}

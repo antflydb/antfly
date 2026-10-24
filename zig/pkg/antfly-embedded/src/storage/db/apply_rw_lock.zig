@@ -34,6 +34,13 @@ pub const ApplyRwLock = struct {
         exclusive_max_wait_ns: u64 = 0,
     };
 
+    /// Original non-suspending lifetime authority plus an optional CPU wait
+    /// boundary. The caller keeps both alive until acquisition returns.
+    pub const Acquisition = struct {
+        lifetime: @import("../../search/work_authority.zig").Authority,
+        execution_wait: ?@import("../../common/execution_wait.zig").Boundary = null,
+    };
+
     // One atomic word linearizes reader admission against writer closure.
     // Readers never acquire a mutex just to update their shared count.
     const writer_bit: usize = @as(usize, 1) << (@bitSizeOf(usize) - 1);
@@ -121,6 +128,22 @@ pub const ApplyRwLock = struct {
         }
     }
 
+    fn waitControlled(self: *@This(), io: std.Io, epoch: u32, acquisition: Acquisition) !void {
+        if (!self.beginWait(epoch)) return;
+        defer self.endWait();
+        try acquisition.lifetime.check();
+        if (acquisition.execution_wait) |boundary| try boundary.beginWait();
+        // Poll the original owner's lifetime instead of translating its clock
+        // into this lock's Io domain. Unlock wakes immediately; polling also
+        // bounds rejection latency for tokens that cannot register a wake.
+        const result = io.futexWaitTimeout(u32, &self.wake_epoch.raw, epoch, .{
+            .duration = .{ .raw = .fromMilliseconds(1), .clock = .awake },
+        });
+        if (acquisition.execution_wait) |boundary| try boundary.endWait();
+        try acquisition.lifetime.check();
+        try result;
+    }
+
     fn registerReader(self: *@This()) bool {
         _ = self.shared_lock_calls.fetchAdd(1, .monotonic);
         _ = self.shared_waiters.fetchAdd(1, .monotonic);
@@ -144,7 +167,7 @@ pub const ApplyRwLock = struct {
 
     pub fn lockShared(self: *@This()) void {
         if (self.io) |io| {
-            self.lockSharedWithIo(io, null, true) catch unreachable;
+            self.lockSharedWithIo(io, null, true, false, null) catch unreachable;
             return;
         }
         const started_ns = monotonicNs();
@@ -183,10 +206,18 @@ pub const ApplyRwLock = struct {
     /// unbound locks. Callback-only cancellation retains bounded checks;
     /// backend task cancellation wakes the futex itself.
     pub fn lockSharedIo(self: *@This(), io: std.Io, cancellation: anytype) (std.Io.Cancelable || error{Cancelled})!void {
-        return self.lockSharedWithIo(self.io orelse io, cancellation, false);
+        return self.lockSharedWithIo(self.io orelse io, cancellation, false, false, null);
     }
 
-    fn lockSharedWithIo(self: *@This(), io: std.Io, cancellation: anytype, comptime uncancelable: bool) !void {
+    pub fn lockSharedControlledIo(self: *@This(), io: std.Io, acquisition: Acquisition) !void {
+        return self.lockSharedWithIo(self.io orelse io, null, false, true, acquisition);
+    }
+
+    pub fn lockExclusiveControlledIo(self: *@This(), io: std.Io, acquisition: Acquisition) !void {
+        return self.lockExclusiveWithIo(self.io orelse io, null, null, false, true, acquisition);
+    }
+
+    fn lockSharedWithIo(self: *@This(), io: std.Io, cancellation: anytype, comptime uncancelable: bool, comptime controlled: bool, acquisition: ?Acquisition) !void {
         const started_ns = ioMonotonicNs(io);
         const priority = self.registerReader();
         defer self.unregisterReader(priority);
@@ -196,10 +227,17 @@ pub const ApplyRwLock = struct {
             // Capture before checking admission: a concurrent unlock then
             // changes the expected value and prevents parking on a lost wake.
             const epoch = self.wake_epoch.load(.acquire);
+            if (comptime controlled) try acquisition.?.lifetime.check();
             if (cancellation) |token| if (token.isCancelled()) return error.Cancelled;
             if (self.tryLockSharedQueued(priority)) break;
             contended = true;
-            try self.waitForLock(io, epoch, cancellation != null, null, uncancelable);
+            if (comptime controlled) {
+                try self.waitControlled(io, epoch, acquisition.?);
+            } else try self.waitForLock(io, epoch, cancellation != null, null, uncancelable);
+        }
+        if (comptime controlled) {
+            errdefer self.unlockShared();
+            try acquisition.?.lifetime.check();
         }
         if (contended) {
             _ = self.shared_contended_calls.fetchAdd(1, .monotonic);
@@ -208,16 +246,16 @@ pub const ApplyRwLock = struct {
     }
 
     pub fn lockExclusiveIo(self: *@This(), io: std.Io, cancellation: anytype) (std.Io.Cancelable || error{Cancelled})!void {
-        return self.lockExclusiveWithIo(self.io orelse io, cancellation, null, false);
+        return self.lockExclusiveWithIo(self.io orelse io, cancellation, null, false, false, null);
     }
 
     /// A deadline belongs to the bound owner's clock (or the fallback Io). Expiration releases writer
     /// intent and reader admission just like cancellation, returning Timeout.
     pub fn lockExclusiveDeadlineIo(self: *@This(), io: std.Io, deadline: std.Io.Clock.Timestamp) (std.Io.Cancelable || error{Timeout})!void {
-        return self.lockExclusiveWithIo(self.io orelse io, null, @as(?std.Io.Clock.Timestamp, deadline), false);
+        return self.lockExclusiveWithIo(self.io orelse io, null, @as(?std.Io.Clock.Timestamp, deadline), false, false, null);
     }
 
-    fn lockExclusiveWithIo(self: *@This(), io: std.Io, cancellation: anytype, deadline: anytype, comptime uncancelable: bool) !void {
+    fn lockExclusiveWithIo(self: *@This(), io: std.Io, cancellation: anytype, deadline: anytype, comptime uncancelable: bool, comptime controlled: bool, acquisition: ?Acquisition) !void {
         const started_ns = ioMonotonicNs(io);
         _ = self.exclusive_lock_calls.fetchAdd(1, .monotonic);
         _ = self.exclusive_waiters.fetchAdd(1, .acq_rel);
@@ -228,11 +266,14 @@ pub const ApplyRwLock = struct {
             // Capture before checking admission: a concurrent unlock then
             // changes the expected value and prevents parking on a lost wake.
             const epoch = self.wake_epoch.load(.acquire);
+            if (comptime controlled) try acquisition.?.lifetime.check();
             if (cancellation) |token| if (token.isCancelled()) return error.Cancelled;
             if (deadline) |until| if (until.raw.nanoseconds <= until.clock.now(io).nanoseconds) return error.Timeout;
             if (self.priority_shared_waiters.load(.acquire) == 0 and self.writer_gate.tryLock()) break;
             contended = true;
-            try self.waitForLock(io, epoch, cancellation != null, deadline, uncancelable);
+            if (comptime controlled) {
+                try self.waitControlled(io, epoch, acquisition.?);
+            } else try self.waitForLock(io, epoch, cancellation != null, deadline, uncancelable);
         }
         errdefer {
             self.writer_gate.unlock();
@@ -248,12 +289,16 @@ pub const ApplyRwLock = struct {
             // Capture before checking admission: a concurrent unlock then
             // changes the expected value and prevents parking on a lost wake.
             const epoch = self.wake_epoch.load(.acquire);
+            if (comptime controlled) try acquisition.?.lifetime.check();
             if (cancellation) |token| if (token.isCancelled()) return error.Cancelled;
             if (deadline) |until| if (until.raw.nanoseconds <= until.clock.now(io).nanoseconds) return error.Timeout;
             if (self.state.load(.acquire) == writer_bit) break;
             contended = true;
-            try self.waitForLock(io, epoch, cancellation != null, deadline, uncancelable);
+            if (comptime controlled) {
+                try self.waitControlled(io, epoch, acquisition.?);
+            } else try self.waitForLock(io, epoch, cancellation != null, deadline, uncancelable);
         }
+        if (comptime controlled) try acquisition.?.lifetime.check();
         if (contended) {
             _ = self.exclusive_contended_calls.fetchAdd(1, .monotonic);
             noteWait(self, .exclusive, ioMonotonicNs(io) -| started_ns);
@@ -274,6 +319,16 @@ pub const ApplyRwLock = struct {
         if (previous == writer_bit + 1) self.signal();
     }
 
+    /// Count a real non-waiting admission attempt without joining the writer
+    /// queue. Unlike a speculative try-lock probe, this is an operation's
+    /// actual acquisition/rejection and must remain visible in lock metrics.
+    pub fn tryLockExclusiveForAdmission(self: *@This()) bool {
+        _ = self.exclusive_lock_calls.fetchAdd(1, .monotonic);
+        const acquired = self.tryLockExclusive();
+        if (!acquired) _ = self.exclusive_contended_calls.fetchAdd(1, .monotonic);
+        return acquired;
+    }
+
     pub fn tryLockExclusive(self: *@This()) bool {
         if (self.exclusive_waiters.load(.acquire) != 0 or self.priority_shared_waiters.load(.acquire) != 0) return false;
         if (!self.writer_gate.tryLock()) return false;
@@ -287,7 +342,7 @@ pub const ApplyRwLock = struct {
 
     pub fn lockExclusive(self: *@This()) void {
         if (self.io) |io| {
-            self.lockExclusiveWithIo(io, null, null, true) catch unreachable;
+            self.lockExclusiveWithIo(io, null, null, true, false, null) catch unreachable;
             return;
         }
         const started_ns = monotonicNs();
@@ -936,5 +991,233 @@ test "apply rw lock VOPR unlock before parking does not lose its wake" {
     try harness.drain();
     try future.await(io);
     try std.testing.expectEqual(start, std.Io.Clock.awake.now(io).nanoseconds);
+    try runtime.ensureNoCapabilityViolation();
+}
+
+test "controlled apply lock parks CPU while retaining original operation and writer intent" {
+    const native = @import("../../common/runnable_scheduler.zig");
+    var scheduler = try native.Scheduler.init(.{ .slots = 2, .control_slots = 1 });
+    defer scheduler.close();
+    var reader: native.Execution = .{};
+    defer reader.finish();
+    var writer: native.Execution = .{};
+    defer writer.finish();
+    try reader.start(&scheduler, .{ .io = std.testing.io, .retained_bytes = 17 }, .query);
+    var lock: ApplyRwLock = .{};
+    lock.lockShared();
+    var reader_held = true;
+    defer if (reader_held) lock.unlockShared();
+    try reader.park(.resource_blocked);
+    try writer.start(&scheduler, .{ .io = std.testing.io, .retained_bytes = 23 }, .write);
+    const State = struct {
+        scheduler: *native.Scheduler,
+        reader: *native.Execution,
+        writer: *native.Execution,
+        lock: *ApplyRwLock,
+        reader_held: *bool,
+        begins: usize = 0,
+        ends: usize = 0,
+        fn lifetime(raw: *const anyopaque) !void {
+            const self: *const @This() = @ptrCast(@alignCast(raw));
+            try self.writer.checkLifetime();
+        }
+        fn begin(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.begins += 1;
+            try self.writer.park(.resource_blocked);
+            try std.testing.expectEqual(@as(usize, 0), self.scheduler.stats().runnable_slots);
+            try std.testing.expectEqual(@as(usize, 2), self.scheduler.stats().operations);
+            try std.testing.expectEqual(@as(u64, 40), self.scheduler.stats().retained_bytes);
+            try std.testing.expect(!self.lock.tryLockShared());
+            // The sole ordinary CPU slot can now resume the lock holder. No
+            // fresh operation, byte budget, clock or deadline is introduced.
+            try self.reader.enter(.query);
+            self.lock.unlockShared();
+            self.reader_held.* = false;
+            self.reader.finish();
+        }
+        fn end(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.ends += 1;
+            try self.writer.enter(.write);
+        }
+    };
+    var state: State = .{ .scheduler = &scheduler, .reader = &reader, .writer = &writer, .lock = &lock, .reader_held = &reader_held };
+    try lock.lockExclusiveControlledIo(std.testing.io, .{
+        .lifetime = .{ .context = &state, .check_fn = State.lifetime },
+        .execution_wait = .{ .ptr = &state, .begin = State.begin, .end = State.end },
+    });
+    lock.unlockExclusive();
+    try std.testing.expectEqual(@as(usize, 1), state.begins);
+    try std.testing.expectEqual(state.begins, state.ends);
+    try std.testing.expectEqual(@as(u32, 0), lock.parked_waiters.load(.acquire));
+    writer.finish();
+    try std.testing.expectEqual(@as(usize, 0), scheduler.stats().operations);
+    try std.testing.expectEqual(@as(u64, 0), scheduler.stats().retained_bytes);
+    try std.testing.expectEqual(@as(usize, 0), scheduler.stats().runnable_slots);
+}
+
+test "controlled apply lock rejects original lifetime and unwinds acquired locks" {
+    const State = struct {
+        checks: usize = 0,
+        fail_at: usize,
+        cause: anyerror,
+        fn check(raw: *const anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(raw)));
+            self.checks += 1;
+            if (self.checks == self.fail_at) return self.cause;
+        }
+    };
+    for ([_]bool{ false, true }) |shared| {
+        for ([_]anyerror{ error.Timeout, error.Canceled, error.SchedulerClosed }) |cause| {
+            // Initial rejection and rejection after actual lock acquisition.
+            for (1..@as(usize, if (shared) 3 else 4)) |fail_at| {
+                var lock: ApplyRwLock = .{};
+                var state: State = .{ .fail_at = fail_at, .cause = cause };
+                const controls: ApplyRwLock.Acquisition = .{ .lifetime = .{ .context = &state, .check_fn = State.check } };
+                if (shared) {
+                    try std.testing.expectError(cause, lock.lockSharedControlledIo(std.testing.io, controls));
+                } else {
+                    try std.testing.expectError(cause, lock.lockExclusiveControlledIo(std.testing.io, controls));
+                }
+                try std.testing.expectEqual(@as(usize, 0), lock.state.load(.acquire));
+                try std.testing.expectEqual(@as(u32, 0), lock.parked_waiters.load(.acquire));
+                try std.testing.expectEqual(@as(u64, 0), lock.shared_waiters.load(.acquire));
+                try std.testing.expectEqual(@as(u64, 0), lock.priority_shared_waiters.load(.acquire));
+                try std.testing.expectEqual(@as(u64, 0), lock.exclusive_waiters.load(.acquire));
+                try std.testing.expect(lock.tryLockExclusive());
+                lock.unlockExclusive();
+            }
+        }
+    }
+}
+
+test "controlled apply lock failed CPU resumption removes waiter and writer intent" {
+    const State = struct {
+        lock: *ApplyRwLock,
+        shared: bool,
+        fail_begin: bool,
+        begins: usize = 0,
+        ends: usize = 0,
+        holder: bool = true,
+        fn check(_: *const anyopaque) !void {}
+        fn begin(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.begins += 1;
+            if (self.fail_begin) return error.Canceled;
+            if (self.shared) self.lock.unlockExclusive() else self.lock.unlockShared();
+            self.holder = false;
+        }
+        fn end(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.ends += 1;
+            return error.SchedulerClosed;
+        }
+    };
+    for ([_]bool{ false, true }) |shared| for ([_]bool{ false, true }) |fail_begin| {
+        var lock: ApplyRwLock = .{};
+        if (shared) lock.lockExclusive() else lock.lockShared();
+        var state: State = .{ .lock = &lock, .shared = shared, .fail_begin = fail_begin };
+        defer if (state.holder) {
+            if (shared) lock.unlockExclusive() else lock.unlockShared();
+        };
+        const controls: ApplyRwLock.Acquisition = .{
+            .lifetime = .{ .context = &state, .check_fn = State.check },
+            .execution_wait = .{ .ptr = &state, .begin = State.begin, .end = State.end },
+        };
+        const expected = if (fail_begin) error.Canceled else error.SchedulerClosed;
+        if (shared) {
+            try std.testing.expectError(expected, lock.lockSharedControlledIo(std.testing.io, controls));
+        } else {
+            try std.testing.expectError(expected, lock.lockExclusiveControlledIo(std.testing.io, controls));
+        }
+        try std.testing.expectEqual(@as(usize, 1), state.begins);
+        try std.testing.expectEqual(@as(usize, if (fail_begin) 0 else 1), state.ends);
+        try std.testing.expectEqual(@as(u32, 0), lock.parked_waiters.load(.acquire));
+        try std.testing.expectEqual(@as(u64, 0), lock.shared_waiters.load(.acquire));
+        try std.testing.expectEqual(@as(u64, 0), lock.exclusive_waiters.load(.acquire));
+        if (!state.holder) {
+            try std.testing.expect(lock.tryLockExclusive());
+            lock.unlockExclusive();
+        }
+    };
+}
+
+test "controlled apply lock VOPR polls original lifetime while preserving CPU wait pairing" {
+    var runtime = try LockVoprHarness.vopr.vopr_io.VoprIo.init(.{ .monotonic_ns = 100 * std.time.ns_per_s });
+    defer runtime.deinit();
+    const io = runtime.io();
+    var harness: LockVoprHarness = .{ .runtime = &runtime };
+    defer harness.deinit();
+    const State = struct {
+        expired: bool = false,
+        cpu: bool = true,
+        begins: usize = 0,
+        ends: usize = 0,
+        fn lifetime(raw: *const anyopaque) !void {
+            const self: *const @This() = @ptrCast(@alignCast(raw));
+            if (self.expired) return error.DeadlineExceeded;
+        }
+        fn begin(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expect(self.cpu);
+            self.cpu = false;
+            self.begins += 1;
+        }
+        fn end(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expect(!self.cpu);
+            self.cpu = true;
+            self.ends += 1;
+        }
+    };
+    const Work = struct {
+        fn run(lock: *ApplyRwLock, shared: bool, state: *State) anyerror!void {
+            const controls: ApplyRwLock.Acquisition = .{
+                .lifetime = .{ .context = state, .check_fn = State.lifetime },
+                .execution_wait = .{ .ptr = state, .begin = State.begin, .end = State.end },
+            };
+            if (shared) {
+                try lock.lockSharedControlledIo(lock.io.?, controls);
+                lock.unlockShared();
+            } else {
+                try lock.lockExclusiveControlledIo(lock.io.?, controls);
+                lock.unlockExclusive();
+            }
+        }
+    };
+    for ([_]bool{ false, true }) |shared| {
+        var lock: ApplyRwLock = .{ .io = io };
+        if (shared) lock.lockExclusive() else lock.lockShared();
+        defer {
+            if (shared) lock.unlockExclusive() else lock.unlockShared();
+        }
+        var state: State = .{};
+        var future = io.async(Work.run, .{ &lock, shared, &state });
+        defer {
+            _ = runtime.cancelAndDrainTasksForTeardown(std.testing.allocator, 64) catch @panic("lock cleanup failed");
+            _ = future.cancel(io) catch {};
+        }
+        const start = std.Io.Clock.awake.now(io).nanoseconds;
+        const parked = try harness.park(future);
+        try std.testing.expectEqual(start + std.time.ns_per_ms, parked.sleep_deadline_ns.?);
+        try std.testing.expect(!state.cpu);
+        // The original owner decides expiry without comparing its timestamp
+        // to this Io clock, and without introducing a new waiting deadline.
+        state.expired = true;
+        try harness.drain();
+        try std.testing.expectError(error.DeadlineExceeded, future.await(io));
+        try std.testing.expect(state.cpu);
+        try std.testing.expectEqual(@as(usize, 1), state.begins);
+        try std.testing.expectEqual(state.begins, state.ends);
+        try std.testing.expectEqual(start + std.time.ns_per_ms, std.Io.Clock.awake.now(io).nanoseconds);
+        try std.testing.expectEqual(@as(u32, 0), lock.parked_waiters.load(.acquire));
+        try std.testing.expectEqual(@as(u64, 0), lock.shared_waiters.load(.acquire));
+        try std.testing.expectEqual(@as(u64, 0), lock.exclusive_waiters.load(.acquire));
+        if (!shared) {
+            try std.testing.expect(lock.tryLockShared());
+            lock.unlockShared();
+        }
+    }
     try runtime.ensureNoCapabilityViolation();
 }

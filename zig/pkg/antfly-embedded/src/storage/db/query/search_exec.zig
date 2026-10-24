@@ -37,6 +37,7 @@ const typed_dv = @import("../../../section/typed_doc_values.zig");
 const roaring = @import("../../../encoding/roaring.zig");
 const snappy = @import("../../../encoding/snappy.zig");
 const distributed_stats_mod = @import("../../../search/distributed_stats.zig");
+const text_stats_ownership = @import("../../../search/text_stats_ownership.zig");
 const runtime_preflight = @import("../runtime_preflight.zig");
 const control_contract = @import("control_contract.zig");
 const analysis_mod = @import("../../../search/analysis.zig");
@@ -309,6 +310,8 @@ pub const SearchTextQueryExecutor = struct {
 
 pub const SearchTextStatsExecutor = struct {
     ctx: ?*anyopaque,
+    /// Synchronous trusted controls shared by the statistics scan, never wire data.
+    controls: types.SearchRequest = .{},
     text_index_entry: *const fn (
         ctx: ?*anyopaque,
         index_name: ?[]const u8,
@@ -318,6 +321,26 @@ pub const SearchTextStatsExecutor = struct {
         alloc: Allocator,
         keys: []const []const u8,
     ) anyerror![]?[]u8 = null,
+    load_many_stored_controlled: ?*const fn (
+        ctx: ?*anyopaque,
+        alloc: Allocator,
+        keys: []const []const u8,
+        controls: types.SearchRequest,
+    ) anyerror![]?[]u8 = null,
+
+    fn loadManyStored(self: @This(), alloc: Allocator, keys: []const []const u8) ![]?[]u8 {
+        try checkSearchRequestDeadline(self.controls);
+        const loaded = if (self.load_many_stored_controlled) |load|
+            try load(self.ctx, alloc, keys, self.controls)
+        else blk: {
+            if (self.controls.execution_runnable != null or self.controls.execution_deadline_ns != null or self.controls.cancellation != null)
+                return error.ExecutionWaitUnsupported;
+            break :blk try (self.load_many_stored orelse return error.ExecutionWaitUnsupported)(self.ctx, alloc, keys);
+        };
+        errdefer freeOptionalOwnedBytes(alloc, loaded);
+        try checkSearchRequestDeadline(self.controls);
+        return loaded;
+    }
 };
 
 pub const ExplicitTextStatRequest = control_contract.ExplicitTextStatRequest;
@@ -2470,7 +2493,7 @@ fn collectFullTextResolvedDocSetAlloc(
     text_query: types.TextQuery,
 ) !?doc_set.ResolvedDocSet {
     const text_entry = try resolveFilterTextIndexEntry(executor, req.primary_text_index_name, req.index_name) orelse return null;
-    text_entry.lockAnalysisShared();
+    try lockTextAnalysisForSearch(text_entry, req);
     defer text_entry.unlockAnalysisShared();
 
     var arena = std.heap.ArenaAllocator.init(alloc);
@@ -3089,7 +3112,24 @@ fn logExactSortBudgetRejection(
     );
 }
 
+fn checkTextLockLifetime(req: types.SearchRequest) !void {
+    try @import("../../query_controls.zig").nativeTextAuthority(&req).check();
+}
+
+fn lockTextAnalysisForSearch(entry: *index_manager_mod.IndexManager.TextIndex, req: types.SearchRequest) !void {
+    var budget: @import("../../../common/read_execution_budget.zig").Budget(types.SearchRequest, checkTextLockLifetime) = .{ .controls = req, .io = entry.io };
+    try entry.analysis_mutex.lockSharedControlledIo(entry.io, .{
+        .lifetime = @import("../../query_controls.zig").nativeTextAuthority(&req),
+        .execution_wait = budget.executionBoundary(),
+    });
+}
+
 pub fn checkSearchRequestDeadline(req: types.SearchRequest) !void {
+    if (req.execution_runnable) |grant| {
+        try grant.validate();
+        const status = grant.checkpoint(grant.context);
+        if (!status.isOk()) return @import("antfly_runtime_abi").error_abi.errorFromStatus(status);
+    }
     if (req.cancellation) |cancellation| {
         if (cancellation.isCancelled()) return error.Cancelled;
     }
@@ -8955,7 +8995,7 @@ fn collectStructuredFilterResolvedDocSetAlloc(
     filter_query_json: []const u8,
 ) !?doc_set.ResolvedDocSet {
     const text_entry = try resolveFilterTextIndexEntry(executor, req.primary_text_index_name, req.index_name) orelse return null;
-    text_entry.lockAnalysisShared();
+    try lockTextAnalysisForSearch(text_entry, req);
     defer text_entry.unlockAnalysisShared();
 
     var arena = std.heap.ArenaAllocator.init(alloc);
@@ -9072,7 +9112,7 @@ fn collectStructuredFilterTextDocNumsAlloc(
     filter_query_json: []const u8,
 ) !?TextDocNumSet {
     const text_entry = try resolveFilterTextIndexEntry(executor, req.primary_text_index_name, req.index_name) orelse return null;
-    text_entry.lockAnalysisShared();
+    try lockTextAnalysisForSearch(text_entry, req);
     defer text_entry.unlockAnalysisShared();
 
     var arena = std.heap.ArenaAllocator.init(alloc);
@@ -9168,7 +9208,7 @@ fn collectStructuredFilterDocIdsAlloc(
     var identity_scratch = segment_mod.SegmentReadScratch.init(alloc, 64 * 1024);
     defer identity_scratch.deinit();
     const text_entry = try resolveFilterTextIndexEntry(executor, req.primary_text_index_name, req.index_name) orelse return null;
-    text_entry.lockAnalysisShared();
+    try lockTextAnalysisForSearch(text_entry, req);
     defer text_entry.unlockAnalysisShared();
 
     var arena = std.heap.ArenaAllocator.init(alloc);
@@ -9189,6 +9229,7 @@ fn collectStructuredFilterDocIdsAlloc(
     ))) return null;
     const k: u32 = @intCast(@min(snapshot.liveDocCount(), @as(u64, std.math.maxInt(u32))));
     var result = try search_mod.execute(alloc, snapshot, .{
+        .authority = @import("../../query_controls.zig").nativeTextAuthority(&req),
         .query = search_query,
         .control = .{ .cancellation = req.cancellation, .deadline_ns = req.execution_deadline_ns, .pattern_programs = req.text_pattern_programs },
         .k = k,
@@ -12239,7 +12280,7 @@ pub fn searchTextQuery(
         try acquire(executor.ctx, effective_req.index_name)
     else local_source: {
         const entry = (try executor.text_index_entry(executor.ctx, effective_req.index_name)) orelse break :local_source null;
-        entry.lockAnalysisShared();
+        try lockTextAnalysisForSearch(entry, effective_req);
         break :local_source @as(?PinnedTextSource, .{ .snapshot = entry.persistent.acquireSnapshot(), .name = entry.config.name, .text_analysis = entry.text_analysis, .runtime_schema = entry.runtime_schema, .owner = entry, .release_owner = PinnedTextSource.releaseLocal });
     }) orelse return switch (text_query) {
         .match_all => executor.search_match_all(executor.ctx, alloc, effective_req),
@@ -12503,7 +12544,7 @@ pub fn searchTextQuery(
         effective_req.graph_queries.len == 0 and effective_req.aggregations_json.len == 0 and executor.is_expired_key == null)
     {
         try checkSearchRequestDeadline(effective_req);
-        const total = try search_mod.countMatchesPreparedWithControl(alloc, snapshot, search_query, effective_req.text_navigation_plan, .{ .cancellation = effective_req.cancellation, .deadline_ns = effective_req.execution_deadline_ns, .pattern_programs = effective_req.text_pattern_programs });
+        const total = try search_mod.countMatchesPreparedControlled(alloc, snapshot, search_query, effective_req.text_navigation_plan, .{ .cancellation = effective_req.cancellation, .deadline_ns = effective_req.execution_deadline_ns, .pattern_programs = effective_req.text_pattern_programs }, @import("../../query_controls.zig").nativeTextAuthority(&effective_req));
         try checkSearchRequestDeadline(effective_req);
         return .{ .alloc = alloc, .hits = &.{}, .total_hits = total, .total_hits_relation = .exact, .graph_results = &.{} };
     }
@@ -12637,7 +12678,7 @@ pub fn searchTextQuery(
                 const selected = try arena_alloc.alloc(u32, out.hits.len);
                 for (out.hits, selected) |hit, *doc| doc.* = hit.native_text_doc_id orelse return error.InvalidData;
                 std.mem.sort(u32, selected, {}, std.sort.asc(u32));
-                var scored = try search_mod.execute(alloc, snapshot, .{ .query = search_query, .control = .{ .cancellation = effective_req.cancellation, .deadline_ns = effective_req.execution_deadline_ns, .pattern_programs = effective_req.text_pattern_programs, .pattern_cache = effective_req.text_pattern_membership }, .k = @intCast(selected.len), .include_stored = false, .filter_doc_nums = selected, .filter_doc_nums_positive = true, .distributed_text_stats = effective_req.distributed_text_stats });
+                var scored = try search_mod.execute(alloc, snapshot, .{ .authority = @import("../../query_controls.zig").nativeTextAuthority(&effective_req), .query = search_query, .control = .{ .cancellation = effective_req.cancellation, .deadline_ns = effective_req.execution_deadline_ns, .pattern_programs = effective_req.text_pattern_programs, .pattern_cache = effective_req.text_pattern_membership }, .k = @intCast(selected.len), .include_stored = false, .filter_doc_nums = selected, .filter_doc_nums_positive = true, .distributed_text_stats = effective_req.distributed_text_stats });
                 defer scored.deinit();
                 var scores: std.AutoHashMapUnmanaged(u32, f32) = .empty;
                 defer scores.deinit(alloc);
@@ -12722,9 +12763,10 @@ pub fn searchTextQuery(
 
         const execute_start_ns = if (collect_score_timing) platform_time.monotonicNs() else 0;
         var result = if (effective_req.count_only)
-            try search_mod.executeCountCandidatesWithControl(alloc, snapshot, search_query, .{ .cancellation = effective_req.cancellation, .deadline_ns = effective_req.execution_deadline_ns })
+            try search_mod.executeCountCandidatesControlled(alloc, snapshot, search_query, .{ .cancellation = effective_req.cancellation, .deadline_ns = effective_req.execution_deadline_ns }, @import("../../query_controls.zig").nativeTextAuthority(&effective_req))
         else
             try search_mod.execute(alloc, snapshot, .{
+                .authority = @import("../../query_controls.zig").nativeTextAuthority(&effective_req),
                 .query = search_query,
                 .control = .{ .cancellation = effective_req.cancellation, .deadline_ns = effective_req.execution_deadline_ns, .pattern_programs = effective_req.text_pattern_programs, .pattern_cache = effective_req.text_pattern_membership },
                 .k = if (collect_window_candidates) candidate_limit else paging.limit,
@@ -13254,6 +13296,7 @@ pub fn collectSearchRequestTextStats(
     req: types.SearchRequest,
     executor: SearchTextStatsExecutor,
 ) ![]const distributed_stats_mod.TextFieldStats {
+    try checkSearchRequestDeadline(req);
     var stats_map = std.StringHashMapUnmanaged(SearchRequestTextStatEntry){};
     defer {
         var it = stats_map.iterator();
@@ -13271,23 +13314,24 @@ pub fn collectSearchRequestTextStats(
         if (req.full_text) |text_query| {
             const text_entry = (try executor.text_index_entry(executor.ctx, req.index_name)) orelse return &.{};
             {
-                text_entry.lockAnalysisShared();
+                try lockTextAnalysisForSearch(text_entry, req);
                 defer text_entry.unlockAnalysisShared();
                 try collectTextQueryTerms(alloc, &stats_map, req.index_name, text_query, text_entry.text_analysis, text_entry.runtime_schema);
             }
         } else if (isTextQuery(req.query) and !isDefaultMatchAll(req.query)) {
             const text_entry = (try executor.text_index_entry(executor.ctx, req.index_name)) orelse return &.{};
             {
-                text_entry.lockAnalysisShared();
+                try lockTextAnalysisForSearch(text_entry, req);
                 defer text_entry.unlockAnalysisShared();
                 try collectQueryTerms(alloc, &stats_map, req.index_name, req.query, text_entry.text_analysis, text_entry.runtime_schema);
             }
         }
     } else {
         for (req.full_text_queries) |item| {
+            try checkSearchRequestDeadline(req);
             const text_entry = (try executor.text_index_entry(executor.ctx, item.index_name)) orelse continue;
             {
-                text_entry.lockAnalysisShared();
+                try lockTextAnalysisForSearch(text_entry, req);
                 defer text_entry.unlockAnalysisShared();
                 try collectTextQueryTerms(alloc, &stats_map, item.index_name, item.query, text_entry.text_analysis, text_entry.runtime_schema);
             }
@@ -13298,7 +13342,7 @@ pub fn collectSearchRequestTextStats(
         const filter_index_name = req.primary_text_index_name orelse req.index_name;
         const text_entry = (try executor.text_index_entry(executor.ctx, filter_index_name)) orelse return &.{};
         {
-            text_entry.lockAnalysisShared();
+            try lockTextAnalysisForSearch(text_entry, req);
             defer text_entry.unlockAnalysisShared();
             if (req.filter_query_json.len > 0) {
                 try collectPatternFilterQueryTerms(alloc, &stats_map, filter_index_name, req.filter_query_json, text_entry.text_analysis, text_entry.runtime_schema);
@@ -13309,36 +13353,15 @@ pub fn collectSearchRequestTextStats(
         }
     }
 
+    try checkSearchRequestDeadline(req);
     if (stats_map.count() == 0) return &.{};
 
-    var requests = try alloc.alloc(ExplicitTextStatRequest, stats_map.count());
-    defer {
-        for (requests) |request| {
-            for (request.terms) |term| alloc.free(term);
-            if (request.terms.len > 0) alloc.free(request.terms);
-        }
-        alloc.free(requests);
-    }
+    const requests = try text_stats_ownership.requestsFromMap(ExplicitTextStatRequest, alloc, &stats_map);
+    defer text_stats_ownership.freeRequests(alloc, requests, requests.len);
 
-    var request_index: usize = 0;
-    var it = stats_map.iterator();
-    while (it.next()) |entry| {
-        const terms = try alloc.alloc([]const u8, entry.value_ptr.terms.count());
-        var term_index: usize = 0;
-        var term_it = entry.value_ptr.terms.keyIterator();
-        while (term_it.next()) |term| {
-            terms[term_index] = try alloc.dupe(u8, term.*);
-            term_index += 1;
-        }
-        requests[request_index] = .{
-            .index_name = entry.value_ptr.index_name,
-            .field = entry.value_ptr.field,
-            .terms = terms,
-        };
-        request_index += 1;
-    }
-
-    return try collectExplicitTextStats(alloc, requests, executor);
+    var controlled = executor;
+    controlled.controls = req;
+    return try collectExplicitTextStats(alloc, requests, controlled);
 }
 
 pub fn collectExplicitTextStats(
@@ -13346,6 +13369,7 @@ pub fn collectExplicitTextStats(
     requests: []const ExplicitTextStatRequest,
     executor: SearchTextStatsExecutor,
 ) ![]const distributed_stats_mod.TextFieldStats {
+    try checkSearchRequestDeadline(executor.controls);
     if (requests.len == 0) return &.{};
     const out = try alloc.alloc(distributed_stats_mod.TextFieldStats, requests.len);
     var initialized: usize = 0;
@@ -13355,9 +13379,11 @@ pub fn collectExplicitTextStats(
     }
 
     for (requests, 0..) |request, i| {
+        try checkSearchRequestDeadline(executor.controls);
         const text_entry = (try executor.text_index_entry(executor.ctx, request.index_name)) orelse return error.IndexNotFound;
         const snapshot = text_entry.persistent.acquireSnapshot();
         defer snapshot.release();
+        try checkSearchRequestDeadline(executor.controls);
         if (request.resolved_doc_filter) |filter| {
             out[i] = try collectFilteredExplicitTextStats(alloc, snapshot, request, filter, executor);
             initialized += 1;
@@ -13370,10 +13396,8 @@ pub fn collectExplicitTextStats(
             if (term_doc_freqs.len > 0) alloc.free(term_doc_freqs);
         }
         for (request.terms, 0..) |term, term_index| {
-            term_doc_freqs[term_index] = .{
-                .term = try alloc.dupe(u8, term),
-                .doc_freq = try snapshot.termDocFreq(alloc, request.field, term),
-            };
+            try checkSearchRequestDeadline(executor.controls);
+            term_doc_freqs[term_index] = try text_stats_ownership.termDocFreq(alloc, snapshot, request.field, term);
             initialized_terms += 1;
         }
         out[i] = .{
@@ -13384,6 +13408,7 @@ pub fn collectExplicitTextStats(
         };
         initialized += 1;
     }
+    try checkSearchRequestDeadline(executor.controls);
     return out;
 }
 
@@ -13403,6 +13428,7 @@ fn collectFilteredExplicitTextStats(
         if (term_doc_freqs.len > 0) alloc.free(term_doc_freqs);
     }
     for (request.terms, 0..) |term, term_index| {
+        try checkSearchRequestDeadline(executor.controls);
         term_doc_freqs[term_index] = .{
             .term = try alloc.dupe(u8, term),
             .doc_freq = 0,
@@ -13419,10 +13445,12 @@ fn collectFilteredExplicitTextStats(
         var segment_lease = try snapshot.leaseSegment(segment_index);
         defer segment_lease.deinit();
         const seg = segment_lease.entry;
-        {
+        var batch_start: usize = 0;
+        while (batch_start < seg.reader.doc_count) : (batch_start += 64) {
+            try checkSearchRequestDeadline(executor.controls);
             seg.shared.lockDeletionShared();
             defer seg.shared.unlockDeletionShared();
-            for (0..seg.reader.doc_count) |local_doc_usize| {
+            for (batch_start..@min(seg.reader.doc_count, batch_start + 64)) |local_doc_usize| {
                 const local_doc: u32 = @intCast(local_doc_usize);
                 if (seg.shared.deleted) |deleted| {
                     if (deleted.contains(local_doc)) continue;
@@ -13443,11 +13471,13 @@ fn collectFilteredExplicitTextStats(
     // duplicated source JSON. Hydrate only the filtered documents from the
     // primary store, preserving exact projection without a full-index postings
     // scan or restoring the duplicate text-segment copy.
-    if (executor.load_many_stored) |load_many| {
-        const loaded = try load_many(executor.ctx, alloc, selected_doc_keys.items);
+    if (executor.load_many_stored != null or executor.load_many_stored_controlled != null) {
+        try checkSearchRequestDeadline(executor.controls);
+        const loaded = try executor.loadManyStored(alloc, selected_doc_keys.items);
         defer freeOptionalOwnedBytes(alloc, loaded);
         if (loaded.len != selected_doc_keys.items.len) return error.InvalidData;
         for (loaded) |maybe_stored| {
+            try checkSearchRequestDeadline(executor.controls);
             const stored = maybe_stored orelse continue;
             var parsed = std.json.parseFromSlice(std.json.Value, alloc, stored, .{}) catch continue;
             defer parsed.deinit();
@@ -13473,12 +13503,15 @@ fn collectFilteredExplicitTextStats(
             var segment_lease = try snapshot.leaseSegment(segment_index);
             defer segment_lease.deinit();
             const seg = segment_lease.entry;
+            try checkSearchRequestDeadline(executor.controls);
             var allowed_local_docs = roaring.RoaringBitmap.init(alloc);
             defer allowed_local_docs.deinit();
-            {
+            var batch_start: usize = 0;
+            while (batch_start < seg.reader.doc_count) : (batch_start += 64) {
+                try checkSearchRequestDeadline(executor.controls);
                 seg.shared.lockDeletionShared();
                 defer seg.shared.unlockDeletionShared();
-                for (0..seg.reader.doc_count) |local_doc_usize| {
+                for (batch_start..@min(seg.reader.doc_count, batch_start + 64)) |local_doc_usize| {
                     const local_doc: u32 = @intCast(local_doc_usize);
                     if (seg.shared.deleted) |deleted| {
                         if (deleted.contains(local_doc)) continue;
@@ -13495,10 +13528,14 @@ fn collectFilteredExplicitTextStats(
                 var terms = try inv_reader.termIterator();
                 defer terms.deinit();
                 while (try terms.next()) |entry| {
+                    try checkSearchRequestDeadline(executor.controls);
                     var postings = try entry.result.iterator(alloc);
                     defer postings.deinit();
                     postings.decode_positions = false;
+                    var visited: usize = 0;
                     while (try postings.next()) |hit| {
+                        if (visited % 64 == 0) try checkSearchRequestDeadline(executor.controls);
+                        visited += 1;
                         if (!allowed_local_docs.contains(hit.doc_id)) continue;
                         global_total_field_len +|= hit.freq;
                         for (term_doc_freqs) |*item| {
@@ -13511,6 +13548,7 @@ fn collectFilteredExplicitTextStats(
         }
     }
 
+    try checkSearchRequestDeadline(executor.controls);
     return .{
         .field = try alloc.dupe(u8, request.field),
         .global_doc_count = global_doc_count,
@@ -13559,6 +13597,7 @@ pub fn collectExplicitBackgroundTextStats(
 ) ![]const aggregations_mod.DistributedBackgroundTextStats {
     var identity_scratch = segment_mod.SegmentReadScratch.init(alloc, 64 * 1024);
     defer identity_scratch.deinit();
+    try checkSearchRequestDeadline(executor.controls);
     if (requests.len == 0) return &.{};
     const out = try alloc.alloc(aggregations_mod.DistributedBackgroundTextStats, requests.len);
     var initialized: usize = 0;
@@ -13568,9 +13607,11 @@ pub fn collectExplicitBackgroundTextStats(
     }
 
     for (requests, 0..) |request, i| {
+        try checkSearchRequestDeadline(executor.controls);
         const text_entry = (try executor.text_index_entry(executor.ctx, request.index_name)) orelse return error.IndexNotFound;
         const snapshot = text_entry.persistent.acquireSnapshot();
         defer snapshot.release();
+        try checkSearchRequestDeadline(executor.controls);
         var background_result = try executeBackgroundQuery(alloc, snapshot, request.background_query);
         defer background_result.deinit();
 
@@ -13581,6 +13622,7 @@ pub fn collectExplicitBackgroundTextStats(
             if (term_doc_freqs.len > 0) alloc.free(term_doc_freqs);
         }
         for (request.terms, 0..) |term, term_index| {
+            try checkSearchRequestDeadline(executor.controls);
             term_doc_freqs[term_index] = .{
                 .term = try alloc.dupe(u8, term),
                 .doc_freq = 0,
@@ -13595,36 +13637,57 @@ pub fn collectExplicitBackgroundTextStats(
             if (term_doc_sets.len > 0) alloc.free(term_doc_sets);
         }
         for (request.terms, 0..) |term, term_index| {
+            try checkSearchRequestDeadline(executor.controls);
             term_doc_sets[term_index] = roaring.RoaringBitmap.init(alloc);
             initialized_sets += 1;
-            const doc_nums = try snapshot.executeFilter(alloc, .{ .term = .{
+            const Budget = struct {
+                controls: types.SearchRequest,
+                pub fn checkpoint(self: @This()) !void {
+                    try checkSearchRequestDeadline(self.controls);
+                }
+                pub fn waitForProgress(_: @This()) !void {
+                    return error.ExecutionWaitUnsupported;
+                }
+            };
+            const admission = @import("../../../common/read_admission.zig");
+            var adapter = admission.Adapter(Budget){ .budget = .{ .controls = executor.controls } };
+            const payload = adapter.payload();
+            const doc_nums = try query_mod.executeFilterWithAdmission(alloc, snapshot, .{ .term = .{
                 .field = request.field,
                 .term = term,
-            } });
+            } }, admission.Port.init(&payload));
             defer alloc.free(doc_nums);
-            for (doc_nums) |doc_num| try term_doc_sets[term_index].add(doc_num);
+            for (doc_nums, 0..) |doc_num, doc_index| {
+                if (doc_index % 64 == 0) try checkSearchRequestDeadline(executor.controls);
+                try term_doc_sets[term_index].add(doc_num);
+            }
         }
 
         var background_doc_count: u32 = 0;
-        for (background_result.hits) |hit| {
+        try checkSearchRequestDeadline(executor.controls);
+        for (background_result.hits, 0..) |hit, hit_index| {
+            if (hit_index % 64 == 0) try checkSearchRequestDeadline(executor.controls);
             if (request.resolved_doc_filter) |filter| {
                 identity_scratch.reset();
                 if (!(try docAllowedByResolvedFilter(identity_scratch.allocator(), snapshot, hit.doc_id, filter))) continue;
             }
             background_doc_count += 1;
             for (term_doc_freqs, 0..) |*item, term_index| {
+                if (term_index % 64 == 0) try checkSearchRequestDeadline(executor.controls);
                 if (term_doc_sets[term_index].contains(hit.doc_id)) item.doc_freq +|= 1;
             }
         }
 
+        const labels = try text_stats_ownership.backgroundLabels(alloc, request.aggregation_name, request.field);
         out[i] = .{
-            .aggregation_name = try alloc.dupe(u8, request.aggregation_name),
-            .field = try alloc.dupe(u8, request.field),
+            .aggregation_name = labels.aggregation_name,
+            .field = labels.field,
             .background_doc_count = if (request.resolved_doc_filter != null) background_doc_count else background_result.total_hits,
             .term_doc_freqs = term_doc_freqs,
         };
         initialized += 1;
     }
+    try checkSearchRequestDeadline(executor.controls);
     return out;
 }
 
@@ -13704,9 +13767,15 @@ test "text stats use postings when segment source is omitted" {
 
     const Harness = struct {
         entry: *index_manager_mod.IndexManager.TextIndex,
+        cancel_on_entry: bool = false,
+        canceled: bool = false,
+        fn requested(raw: *const anyopaque) bool {
+            return @as(*const @This(), @ptrCast(@alignCast(raw))).canceled;
+        }
 
         fn textIndexEntry(ctx: ?*anyopaque, _: ?[]const u8) anyerror!?*index_manager_mod.IndexManager.TextIndex {
             const self: *@This() = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+            if (self.cancel_on_entry) self.canceled = true;
             return self.entry;
         }
     };
@@ -13748,6 +13817,21 @@ test "text stats use postings when segment source is omitted" {
     try std.testing.expectEqual(@as(u64, 2), explicit_stats[0].global_total_field_len);
     try std.testing.expectEqual(@as(u32, 1), explicit_stats[0].term_doc_freqs[0].doc_freq);
     try std.testing.expectEqual(@as(u32, 1), explicit_stats[0].term_doc_freqs[1].doc_freq);
+    harness.cancel_on_entry = true;
+    const cancellation = types.CancellationToken{ .ptr = &harness, .is_cancelled_fn = Harness.requested };
+    try std.testing.expectError(error.Cancelled, collectExplicitTextStats(alloc, &.{.{
+        .index_name = "ft",
+        .field = "body",
+        .terms = &.{"alpha"},
+    }}, .{ .ctx = &harness, .text_index_entry = Harness.textIndexEntry, .controls = .{ .cancellation = cancellation } }));
+    harness.canceled = false;
+    try std.testing.expectError(error.Cancelled, collectExplicitBackgroundTextStats(alloc, &.{.{
+        .aggregation_name = "sig",
+        .index_name = "ft",
+        .field = "body",
+        .terms = &.{"alpha"},
+        .background_query = .{ .match_all = {} },
+    }}, .{ .ctx = &harness, .text_index_entry = Harness.textIndexEntry, .controls = .{ .cancellation = cancellation } }));
 }
 
 fn collectQueryTerms(
@@ -13811,22 +13895,7 @@ fn appendFieldTerm(
     term: []const u8,
 ) !void {
     const map_key = try textStatsMapKeyAlloc(alloc, index_name, field);
-    errdefer alloc.free(map_key);
-
-    const gop = try stats_map.getOrPut(alloc, map_key);
-    if (!gop.found_existing) {
-        gop.key_ptr.* = map_key;
-        gop.value_ptr.* = .{
-            .field = try alloc.dupe(u8, field),
-            .index_name = index_name,
-        };
-    } else {
-        alloc.free(map_key);
-    }
-    const term_gop = try gop.value_ptr.terms.getOrPut(alloc, term);
-    if (!term_gop.found_existing) {
-        term_gop.key_ptr.* = try alloc.dupe(u8, term);
-    }
+    try text_stats_ownership.appendTerm(SearchRequestTextStatEntry, alloc, stats_map, map_key, index_name, field, term);
 }
 
 fn textStatsMapKeyAlloc(alloc: Allocator, index_name: ?[]const u8, field: []const u8) ![]u8 {
@@ -18102,7 +18171,7 @@ fn planMatchAllSortBeforeCandidatesAlloc(
         );
         return error.UnsupportedExactSort;
     };
-    text_entry.lockAnalysisShared();
+    try lockTextAnalysisForSearch(text_entry, req);
     defer text_entry.unlockAnalysisShared();
     const plan = try planTextNativeSortFields(effective_req, text_entry.persistent.snapshot(), text_entry.runtime_schema);
     if (plan.sorted_segment_executor_available) {
@@ -18176,7 +18245,7 @@ fn buildMatchAllNativeSortContextAlloc(
     if (req.order_by.len == 0 or !requestNeedsNativeSortValues(req)) return null;
     try validateMatchAllSortDoesNotUseScore(req);
     const text_entry = (try executor.text_index_entry(executor.ctx, req.index_name)) orelse return null;
-    text_entry.lockAnalysisShared();
+    try lockTextAnalysisForSearch(text_entry, req);
     defer text_entry.unlockAnalysisShared();
     const snapshot = text_entry.persistent.snapshot();
     const plan = try planTextNativeSortFields(req, snapshot, text_entry.runtime_schema);
@@ -34516,6 +34585,129 @@ test "external lake signed native datetime cursors retain their concrete domain"
         const key = try sortValueFromCursorJsonForSortKey(plan, "time", .{ .datetime_ns = 0 }, cursor);
         try std.testing.expectEqual(@as(i128, -1), key.datetime_ns);
         try std.testing.expectEqual(std.math.Order.lt, compareSortValues(key, .{ .datetime_ns = 0 }));
+    }
+}
+
+test "statistics primary hydration adapter preserves controls and retires rejected publication" {
+    const Fixture = struct {
+        canceled: bool = false,
+        cancel_on_return: bool = false,
+        legacy_calls: usize = 0,
+        deadline: u64,
+        fn requested(raw: *const anyopaque) bool {
+            return @as(*const @This(), @ptrCast(@alignCast(raw))).canceled;
+        }
+        fn entry(_: ?*anyopaque, _: ?[]const u8) !?*index_manager_mod.IndexManager.TextIndex {
+            return error.TestUnexpectedResult;
+        }
+        fn legacy(raw: ?*anyopaque, _: Allocator, _: []const []const u8) ![]?[]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.legacy_calls += 1;
+            return error.TestUnexpectedResult;
+        }
+        fn controlled(raw: ?*anyopaque, a: Allocator, keys: []const []const u8, controls: types.SearchRequest) ![]?[]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            try std.testing.expectEqual(@as(?u64, self.deadline), controls.execution_deadline_ns);
+            try std.testing.expect(controls.cancellation.?.ptr == @as(*const anyopaque, @ptrCast(self)));
+            try std.testing.expectEqualStrings("doc:a", keys[0]);
+            const rows = try a.alloc(?[]u8, 1);
+            @memset(rows, null);
+            errdefer freeOptionalOwnedBytes(a, rows);
+            rows[0] = try a.dupe(u8, "stored alpha");
+            if (self.cancel_on_return) self.canceled = true;
+            return rows;
+        }
+        fn run(a: Allocator) !void {
+            var fixture: @This() = .{ .deadline = platform_time.monotonicNs() + 60 * std.time.ns_per_s };
+            var executor: SearchTextStatsExecutor = .{ .ctx = &fixture, .text_index_entry = entry, .load_many_stored = legacy, .controls = .{ .execution_deadline_ns = fixture.deadline, .cancellation = .{ .ptr = &fixture, .is_cancelled_fn = requested } } };
+            try std.testing.expectError(error.ExecutionWaitUnsupported, executor.loadManyStored(a, &.{"doc:a"}));
+            try std.testing.expectEqual(@as(usize, 0), fixture.legacy_calls);
+            executor.load_many_stored_controlled = controlled;
+            const rows = try executor.loadManyStored(a, &.{"doc:a"});
+            defer freeOptionalOwnedBytes(a, rows);
+            try std.testing.expectEqualStrings("stored alpha", rows[0].?);
+            fixture.cancel_on_return = true;
+            const rejected = executor.loadManyStored(a, &.{"doc:a"}) catch |err| switch (err) {
+                error.Cancelled => return,
+                else => return err,
+            };
+            freeOptionalOwnedBytes(a, rejected);
+            return error.TestUnexpectedResult;
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{});
+}
+
+test "controlled text analysis acquisition retains original borrow and rejects failed resume" {
+    const runtime = @import("antfly_runtime_abi");
+    // Only these fields are used by the production acquisition helper. No
+    // query publication or index storage is manufactured by this fixture.
+    var entry: index_manager_mod.IndexManager.TextIndex = undefined;
+    entry.io = std.testing.io;
+    entry.analysis_mutex = .{};
+    try lockTextAnalysisForSearch(&entry, .{});
+    entry.unlockAnalysisShared();
+    try std.testing.expectError(error.Timeout, lockTextAnalysisForSearch(&entry, .{ .execution_deadline_ns = 0 }));
+    const State = struct {
+        entry: *index_manager_mod.IndexManager.TextIndex,
+        holder: bool = false,
+        deny_resume: bool = false,
+        parks: usize = 0,
+        resumes: usize = 0,
+        checkpoints: usize = 0,
+        fn lifetime(_: *anyopaque) callconv(.c) runtime.error_abi.Status {
+            return .ok;
+        }
+        fn checkpoint(raw: *anyopaque) callconv(.c) runtime.error_abi.Status {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.checkpoints += 1;
+            return runtime.error_abi.statusFromError(error.InvalidRunnableTransition);
+        }
+        fn current(_: *anyopaque, out: *c_int) callconv(.c) runtime.error_abi.Status {
+            out.* = @backingInt(runtime.runnable_abi.Class.query);
+            return .ok;
+        }
+        fn park(raw: *anyopaque, reason: c_int) callconv(.c) runtime.error_abi.Status {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (reason != @backingInt(runtime.runnable_abi.Wait.resource)) return runtime.error_abi.statusFromError(error.InvalidArgument);
+            self.parks += 1;
+            self.entry.analysis_mutex.unlockExclusive();
+            self.holder = false;
+            return .ok;
+        }
+        fn enter(raw: *anyopaque, phase: c_int) callconv(.c) runtime.error_abi.Status {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (phase != @backingInt(runtime.runnable_abi.Class.query)) return runtime.error_abi.statusFromError(error.InvalidArgument);
+            self.resumes += 1;
+            return if (self.deny_resume) runtime.error_abi.statusFromError(error.SchedulerClosed) else .ok;
+        }
+    };
+    for ([_]bool{ false, true }) |deny_resume| {
+        entry.analysis_mutex.lockExclusive();
+        var state: State = .{ .entry = &entry, .holder = true, .deny_resume = deny_resume };
+        defer if (state.holder) entry.analysis_mutex.unlockExclusive();
+        const req: types.SearchRequest = .{ .execution_deadline_ns = 0, .execution_runnable = .{
+            .context = &state,
+            .cpu_slots = 1,
+            .parent_class = @backingInt(runtime.runnable_abi.Class.query),
+            .checkpoint = State.checkpoint,
+            .park = State.park,
+            .enter = State.enter,
+            .check_lifetime = State.lifetime,
+            .current_class = State.current,
+        } };
+        if (deny_resume) {
+            try std.testing.expectError(error.SchedulerClosed, lockTextAnalysisForSearch(&entry, req));
+        } else {
+            try lockTextAnalysisForSearch(&entry, req);
+            entry.unlockAnalysisShared();
+        }
+        try std.testing.expectEqual(@as(usize, 1), state.parks);
+        try std.testing.expectEqual(state.parks, state.resumes);
+        try std.testing.expectEqual(@as(usize, 0), state.checkpoints);
+        try std.testing.expectEqual(@as(u32, 0), entry.analysis_mutex.parked_waiters.load(.acquire));
+        try std.testing.expect(entry.analysis_mutex.tryLockExclusive());
+        entry.analysis_mutex.unlockExclusive();
     }
 }
 

@@ -878,6 +878,7 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
     const pool_id = try kv_manager.addPool(kv_pool_config);
     var kv_storage = try runtime.kv.storage_runtime.KvStorageRuntime.init(allocator, kv_pool_config);
     defer kv_storage.deinit();
+    kv_storage.device_memory_budget = model.prompt_prefix_cache.device_memory_budget;
     try cb.provisionKvDeviceWriteHook(&kv_storage);
 
     var cuda_gemma_prefill_prewarm_ms: u64 = 0;
@@ -943,6 +944,7 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
         .gpt_config = gpt_config,
         .kv_dtype = kv_dtype,
         .shared_moe_cache = model.shared_moe_cache,
+        .device_memory_budget = model.prompt_prefix_cache.device_memory_budget,
         .tokenizer = tokenizer,
         .add_bos_token = model.manifest.add_bos_token,
         .bos_token = model.manifest.bos_token,

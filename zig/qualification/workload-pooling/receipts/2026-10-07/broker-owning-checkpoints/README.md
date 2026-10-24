@@ -1,0 +1,9 @@
+# Owning broker checkpoints and resource waits
+
+The inference owner provider installs an owning-thread checkpoint scope beside its CPU scope. Contended resource waits park its actual capsule and reacquire inference through the original owner. A final admission checkpoint fences publication. Reacquisition failure persists even if a backend swallows its error; boolean owner cancellation retains the original collective deadline cause. Final publication ignores internal Io executor cancellation while preserving original member cancellation/deadlines and owner checks.
+
+Both native macOS and pinned Nix/glibc GNU AArch64 pass 23 adapter/broker tests and 10 real API owner tests (33 tests per platform). The new real-owner fixture verifies zero runnable CPUs while parked, unchanged retained bytes, concurrent query and protected control progress, successful reacquisition, and canceled/expired reacquisition. Clearing the member signal after a failed reacquisition still rejects final publication. Successful late internal cancellation still permits joined output cleanup. Final retirement drains operations, CPU slots and retained bytes.
+
+JSON files pin arguments and source hashes; full logs are compressed alongside them. Initial real-owner compile logs retain the corrected missing fixture clock binding. GNU real-owner uses two CPUs and 3 GiB; adapter uses two CPUs and 2 GiB, neither with extra swap. The image and compiler are pinned in the argument receipts.
+
+The provider is still not installed in production Node. Parent/cohort parking before independent admission, physical worker waits, full backend/memory coverage, consolidated production gates and default overload qualification remain required. These synchronous fixture waits prove the mechanism but not production model workload fairness.

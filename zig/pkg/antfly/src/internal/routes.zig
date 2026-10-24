@@ -17,6 +17,67 @@ const std = @import("std");
 const openapi = @import("antfly_internal_openapi");
 
 pub const base = "/internal/v1";
+pub const remote_attempt_status = base ++ "/attempt/status";
+pub const remote_attempt_fence = base ++ "/attempt/fence";
+pub const remote_attempt_cancel = base ++ "/attempt/cancel";
+pub const remote_attempt_capabilities = base ++ "/attempt/capabilities";
+
+pub fn isRemoteAttemptControl(path: []const u8) bool {
+    return std.mem.eql(u8, path, remote_attempt_status) or std.mem.eql(u8, path, remote_attempt_fence) or std.mem.eql(u8, path, remote_attempt_cancel) or std.mem.eql(u8, path, remote_attempt_capabilities);
+}
+
+/// Only the group-local buffered query has a physical owned-read adapter.
+/// Match the route shape exactly; preflight, streams and aliases have no grant.
+pub fn isOwnedGroupQuery(path: []const u8) bool {
+    return groupTableAction(path, "query");
+}
+pub fn isRetainedRead(path: []const u8) bool {
+    return groupTableAction(path, "retained-read");
+}
+pub const ReadScope = struct { root: u128, reporter: u64 };
+const ReadRoute = struct { retained: bool, scope: ?ReadScope };
+fn readRoute(path: []const u8) ?ReadRoute {
+    if (std.mem.indexOfAny(u8, path, "?#\r\n") != null) return null;
+    var parts = std.mem.splitScalar(u8, path, '/');
+    for ([_][]const u8{ "", "internal", "v1", "groups" }) |part| {
+        if (!std.mem.eql(u8, parts.next() orelse return null, part)) return null;
+    }
+    const group = std.fmt.parseUnsigned(u64, parts.next() orelse return null, 10) catch return null;
+    if (group == 0 or !std.mem.eql(u8, parts.next() orelse return null, "tables")) return null;
+    if ((parts.next() orelse return null).len == 0) return null;
+    const action = parts.next() orelse return null;
+    if (std.mem.eql(u8, action, "query") or std.mem.eql(u8, action, "retained-read")) {
+        if (parts.next() != null) return null;
+        return .{ .retained = std.mem.eql(u8, action, "retained-read"), .scope = null };
+    }
+    if (!std.mem.eql(u8, action, "owned-query") and !std.mem.eql(u8, action, "owned-retained-read")) return null;
+    const root = std.fmt.parseUnsigned(u128, parts.next() orelse return null, 10) catch return null;
+    const reporter = std.fmt.parseUnsigned(u64, parts.next() orelse return null, 10) catch return null;
+    if (root == 0 or reporter == 0 or parts.next() != null) return null;
+    return .{ .retained = std.mem.eql(u8, action, "owned-retained-read"), .scope = .{ .root = root, .reporter = reporter } };
+}
+fn groupTableAction(path: []const u8, action: []const u8) bool {
+    const route = readRoute(path) orelse return false;
+    return route.retained == std.mem.eql(u8, action, "retained-read");
+}
+/// Signed data always uses a distinct endpoint, never a legacy query route.
+/// The URI digest authenticates the exact durable root and process reporter.
+pub fn ownedReadPath(allocator: std.mem.Allocator, path: []const u8, root: u128, reporter: u64) ![]u8 {
+    if (root == 0 or reporter == 0 or !std.mem.startsWith(u8, path, "/internal/v1/") or std.mem.indexOfAny(u8, path, "#\r\n") != null) return error.InvalidRemoteAttemptTarget;
+    const route = readRoute(path) orelse return error.UnsupportedRemoteAttemptProtocol;
+    if (route.scope) |_| {
+        try validateOwnedReadScope(path, root, reporter);
+        return allocator.dupe(u8, path);
+    }
+    const leaf = std.mem.lastIndexOfScalar(u8, path, '/').? + 1;
+    return std.fmt.allocPrint(allocator, "{s}{s}/{d}/{d}", .{ path[0..leaf], if (route.retained) "owned-retained-read" else "owned-query", root, reporter });
+}
+pub fn validateOwnedReadScope(path: []const u8, root: u128, reporter: u64) !void {
+    const route = readRoute(path) orelse return error.UnsupportedRemoteAttemptProtocol;
+    const scope = route.scope orelse return error.UnsupportedRemoteAttemptProtocol;
+    if (scope.root != root or scope.reporter != reporter) return error.RemoteWorkerIdentityChanged;
+}
+
 pub const standby = base ++ "/standby";
 pub const standby_replication = standby ++ "/replication";
 pub const standby_replication_identify = standby_replication ++ "/identify";
@@ -138,4 +199,31 @@ fn expectedHotStandbyReplicationRoute(generated: openapi.server.Route) ?Expected
         return expected;
     }
     return null;
+}
+
+test "remote attempt wire owned paths bind root and process and cannot match legacy read routes" {
+    const a = std.testing.allocator;
+    const legacy = "/internal/v1/groups/7/tables/docs/query";
+    const path = try ownedReadPath(a, legacy, 11, 17);
+    defer a.free(path);
+    try std.testing.expectEqualStrings("/internal/v1/groups/7/tables/docs/owned-query/11/17", path);
+    try std.testing.expect(isOwnedGroupQuery(path));
+    try std.testing.expect(!isRetainedRead(path));
+    try validateOwnedReadScope(path, 11, 17);
+    try std.testing.expectError(error.UnsupportedRemoteAttemptProtocol, validateOwnedReadScope(legacy, 11, 17));
+    try std.testing.expectError(error.RemoteWorkerIdentityChanged, validateOwnedReadScope(path, 11, 18));
+    try std.testing.expectError(error.RemoteWorkerIdentityChanged, ownedReadPath(a, path, 22, 17));
+    const repeated = try ownedReadPath(a, path, 11, 17);
+    defer a.free(repeated);
+    try std.testing.expectEqualStrings(path, repeated);
+    const retained = try ownedReadPath(a, "/internal/v1/groups/7/tables/docs/retained-read", std.math.maxInt(u128), std.math.maxInt(u64));
+    defer a.free(retained);
+    try std.testing.expect(isRetainedRead(retained));
+    try validateOwnedReadScope(retained, std.math.maxInt(u128), std.math.maxInt(u64));
+    for ([_][]const u8{ "/internal/v1/groups/7/tables/docs/owned-query/11/0", "/internal/v1/groups/7/tables/docs/owned-query/0/17", "/internal/v1/groups/7/tables/docs/owned-query/11/18446744073709551616", "/internal/v1/groups/7/tables/docs/owned-query/11/17/extra", "/internal/v1/groups/7/tables/docs/owned-query/11/17?legacy=1" }) |invalid| {
+        try std.testing.expect(!isOwnedGroupQuery(invalid));
+    }
+    var empty: [0]u8 = .{};
+    var oom = std.heap.FixedBufferAllocator.init(&empty);
+    try std.testing.expectError(error.OutOfMemory, ownedReadPath(oom.allocator(), legacy, 11, 17));
 }

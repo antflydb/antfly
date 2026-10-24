@@ -18259,6 +18259,39 @@ pub const HBCIndex = struct {
         };
     }
 
+    /// Status capture observes only serving metadata, with admitted guards.
+    /// Publication owns the generation while the fixed scalar copy is made.
+    pub fn servingStatusWithAdmission(self: *HBCIndex, io: std.Io, original: @import("../common/read_admission.zig").Port) !NativeServingSnapshot {
+        const admission = @import("../common/read_admission.zig");
+        try original.checkpoint();
+        if (self.nativeHbcAuthoritative()) {
+            try @import("../common/cleanup_wait.zig").lockAtomic(&self.experimental_posting_read_generation_mu, io, original);
+            defer self.experimental_posting_read_generation_mu.unlock();
+            if (self.experimental_posting_reads_enabled.load(.acquire)) if (self.experimental_posting_read_generation) |generation| return .{
+                .active_count = generation.search_view.active_count,
+                .node_count = generation.search_view.node_count,
+                .root_node = generation.search_view.root_node,
+                .source_sequence = generation.covered_source_sequence.load(.acquire),
+                .publish_generation = generation.search_view.publish_generation,
+            };
+        }
+        if (self.experimentalPostingWalAuthoritative()) return .{ .active_count = 0, .node_count = 0, .root_node = 0, .source_sequence = 0, .publish_generation = 0 };
+        var trace: admission.RejectionTrace = .{};
+        var control = trace.bind(original).?;
+        const Lifetime = struct {
+            fn check(raw: *const anyopaque) !void {
+                const port: *const admission.Port = @ptrCast(@alignCast(raw));
+                try port.checkLifetime();
+            }
+        };
+        try original.checkpoint();
+        self.published_snapshot_mu.lockSharedControlledIo(io, .{ .lifetime = .{ .context = &control, .check_fn = Lifetime.check }, .execution_wait = (try control.executionWaitAfterLifetime()) orelse return error.ExecutionWaitUnsupported }) catch |cause| return trace.failure orelse cause;
+        defer self.published_snapshot_mu.unlockShared();
+        const generation = self.publishedGeneration();
+        const published = self.loadPublishedStats(generation);
+        return .{ .active_count = published.stats.active_count, .node_count = published.stats.node_count, .root_node = published.stats.root_node, .source_sequence = 0, .publish_generation = published.generation };
+    }
+
     /// Checkpoint sidecars must describe the same generation queries serve.
     /// A missing native reader cannot be replaced with mutable HBC metadata.
     pub fn servingActiveCountForCheckpoint(self: *HBCIndex) ?u64 {
@@ -21844,7 +21877,7 @@ test "hbc standalone cache yields to foreground aggregate admission" {
     defer tp.cleanup();
     const vector = [_]f32{ 1.0, 2.0, 3.0, 4.0 };
     const bytes = estimateVectorCacheBytes(&vector);
-    var resource_manager = resource_manager_mod.ResourceManager.init(.{
+    var resource_manager = try resource_manager_mod.metadata_fixture.init(.{
         .memory_budget = .{ .soft_limit_bytes = bytes, .hard_limit_bytes = bytes + 1 },
     });
     defer resource_manager.deinit(alloc);
@@ -21856,13 +21889,13 @@ test "hbc standalone cache yields to foreground aggregate admission" {
     var foreground = try resource_manager.reserve(.dense_apply_working_set, 2);
     defer foreground.release();
     try std.testing.expectEqual(@as(u64, 0), idx.hbcCacheStats().vector.used_bytes);
-    try std.testing.expectEqual(@as(u64, 2), resource_manager.snapshot().memory.used_bytes);
+    try std.testing.expectEqual(@as(u64, 2), resource_manager_mod.metadata_fixture.payloadUsage(&resource_manager));
 }
 
 test "hbc resource reclaimer never waits for an active cache owner" {
     const vector = [_]f32{ 1.0, 2.0, 3.0, 4.0 };
     const bytes = estimateVectorCacheBytes(&vector);
-    var resource_manager = resource_manager_mod.ResourceManager.init(.{
+    var resource_manager = try resource_manager_mod.metadata_fixture.init(.{
         .memory_budget = .{ .hard_limit_bytes = bytes },
     });
     defer resource_manager.deinit(std.testing.allocator);

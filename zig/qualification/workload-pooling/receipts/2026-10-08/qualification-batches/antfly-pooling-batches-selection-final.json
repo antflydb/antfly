@@ -1,0 +1,61 @@
+{
+  "filter_count": 31,
+  "batch_sizes": [
+    8,
+    8,
+    8,
+    7
+  ],
+  "original_filters_preserved": true,
+  "static_named_test_count": 121,
+  "static_batch_named_test_counts": [
+    88,
+    12,
+    14,
+    7
+  ],
+  "disjoint_static_selection": true,
+  "qualification_scope": "Static source names and filter predicates only; compiled inventory, real test counts and memory peak still pending.",
+  "batches": [
+    [
+      "bounded admission",
+      "runnable scheduler",
+      "runnable execution",
+      "decision functions remote transport",
+      "runnable metrics",
+      "workload envelope",
+      "workload deadline",
+      "config workload envelope"
+    ],
+    [
+      "pgwire retained budget",
+      "pgwire shared session budget",
+      "request admission bounds",
+      "request admission lease",
+      "request admission metrics",
+      "config query waiting",
+      "config runnable scheduler",
+      "httpx workload policy"
+    ],
+    [
+      "httpx query waiting",
+      "SQL query waiting",
+      "httpx query admission",
+      "httpx write admission",
+      "SQL protected executor",
+      "SQL protected control",
+      "httpx stable transaction commit",
+      "httpx SQL executes one relational page"
+    ],
+    [
+      "httpx SQL connection routes",
+      "httpx SQL durable session settings",
+      "SQL pgwire credential snapshot",
+      "SQL read resume fences",
+      "read fence validates each",
+      "read fence owns bounded",
+      "read fence invalidates"
+    ]
+  ],
+  "build_source_sha256": "4498ed232f8c30a43366be960cfa6783dfee67b80af0124bd7d064075e617dd6"
+}

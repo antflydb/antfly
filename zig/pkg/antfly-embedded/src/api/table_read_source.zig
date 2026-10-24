@@ -143,6 +143,7 @@ pub const RelationalStatementRead = struct {
     pub const VTable = struct {
         close: *const fn (*anyopaque) void,
         range_proofs: ?*const fn (*anyopaque, std.mem.Allocator, usize) anyerror![]OwnerRangeProof = null,
+        range_proofs_with_admission: ?*const fn (*anyopaque, std.mem.Allocator, usize, @import("../common/read_admission.zig").Port) anyerror![]OwnerRangeProof = null,
     };
     const Abi = @import("../runtime_callback_abi.zig").Boundary(VTable);
 
@@ -152,6 +153,19 @@ pub const RelationalStatementRead = struct {
     pub fn rangeProofs(self: @This(), alloc: std.mem.Allocator, scan_index: usize) ![]OwnerRangeProof {
         const callback = self.vtable.range_proofs orelse return error.SqlRangeTrackingRequired;
         return Abi.call("range_proofs", self.boundary_dispatch, callback, .{ self.ptr, alloc, scan_index });
+    }
+    pub fn rangeProofsWithAdmission(self: @This(), alloc: std.mem.Allocator, scan_index: usize, control: @import("../common/read_admission.zig").Port) ![]OwnerRangeProof {
+        try control.checkpoint();
+        const result = if (self.vtable.range_proofs_with_admission) |callback|
+            try Abi.call("range_proofs_with_admission", self.boundary_dispatch, callback, .{ self.ptr, alloc, scan_index, control })
+        else
+            try self.rangeProofs(alloc, scan_index);
+        errdefer {
+            for (result) |owner| alloc.free(owner.proofs);
+            alloc.free(result);
+        }
+        try control.checkpoint();
+        return result;
     }
 };
 
@@ -179,6 +193,8 @@ pub const RelationalStatementSnapshot = struct {
         /// for read-only scans but is NOT a serializable SQL read set.
         open_guarded: ?*const fn (*anyopaque, std.mem.Allocator, RelationalStatementScan) anyerror!GuardedRead = null,
         close: *const fn (*anyopaque) void,
+        open_with_admission: ?*const fn (*anyopaque, std.mem.Allocator, RelationalStatementScan, @import("../common/read_admission.zig").Port) anyerror!RelationalReadView = null,
+        open_guarded_with_admission: ?*const fn (*anyopaque, std.mem.Allocator, RelationalStatementScan, @import("../common/read_admission.zig").Port) anyerror!GuardedRead = null,
     };
     const Abi = @import("../runtime_callback_abi.zig").Boundary(VTable);
 
@@ -194,6 +210,32 @@ pub const RelationalStatementSnapshot = struct {
             alloc.free(result.owner_proofs);
         }
         try @import("range_read_guards.zig").validate(result.owner_proofs);
+        return result;
+    }
+    pub fn openWithAdmission(self: @This(), alloc: std.mem.Allocator, scan: RelationalStatementScan, control: @import("../common/read_admission.zig").Port) !RelationalReadView {
+        try control.checkpoint();
+        const result = if (self.vtable.open_with_admission) |callback|
+            try Abi.call("open_with_admission", self.boundary_dispatch, callback, .{ self.ptr, alloc, scan, control })
+        else
+            try self.open(alloc, scan);
+        errdefer result.deinit();
+        try control.checkpoint();
+        return result;
+    }
+    pub fn openGuardedWithAdmission(self: @This(), alloc: std.mem.Allocator, scan: RelationalStatementScan, control: @import("../common/read_admission.zig").Port) !GuardedRead {
+        try control.checkpoint();
+        const result = if (self.vtable.open_guarded_with_admission) |callback|
+            try Abi.call("open_guarded_with_admission", self.boundary_dispatch, callback, .{ self.ptr, alloc, scan, control })
+        else
+            try self.openGuarded(alloc, scan);
+        errdefer result.view.deinit();
+        errdefer {
+            for (result.owner_proofs) |owner| alloc.free(owner.proofs);
+            alloc.free(result.owner_proofs);
+        }
+        try control.checkpoint();
+        try @import("range_read_guards.zig").validate(result.owner_proofs);
+        try control.checkpoint();
         return result;
     }
     pub fn deinit(self: @This()) void {
@@ -421,6 +463,8 @@ pub const TableReadSource = struct {
             body: []const u8,
         ) anyerror!?query_api.QueryResponse = null,
         text_stats_group_local_routed: ?*const fn (*anyopaque, std.mem.Allocator, metadata_api.CatalogRouteFence, u64, []const u8, []const u8) anyerror!?query_api.QueryResponse = null,
+        text_stats_group_local_controlled: ?*const fn (*anyopaque, std.mem.Allocator, u64, []const u8, []const u8, db_types.SearchRequest) anyerror!?query_api.QueryResponse = null,
+        text_stats_group_local_controlled_routed: ?*const fn (*anyopaque, std.mem.Allocator, metadata_api.CatalogRouteFence, u64, []const u8, []const u8, db_types.SearchRequest) anyerror!?query_api.QueryResponse = null,
         algebraic_partials_group_local: ?*const fn (
             ptr: *anyopaque,
             alloc: std.mem.Allocator,
@@ -581,6 +625,9 @@ pub const TableReadSource = struct {
             ptr: *anyopaque,
             cache: *IncomingGraphRouteCache,
         ) void = null,
+        try_statement_read_fence_with_admission: ?*const fn (*anyopaque, std.mem.Allocator, metadata_api.CatalogRouteFence, u64, []const u8, db_types.ScanOptions, read_gate.ReadConsistency, @import("../common/read_admission.zig").Port) anyerror!?StatementReadFence = null,
+        open_relational_statement_with_admission: ?*const fn (*anyopaque, std.mem.Allocator, []const RelationalStatementScan, read_gate.ReadConsistency, @import("../common/read_admission.zig").Port) anyerror!RelationalStatementRead = null,
+        open_relational_statement_snapshot_with_admission: ?*const fn (*anyopaque, std.mem.Allocator, []const u8, u32, read_gate.ReadConsistency, ?CancellationToken, ?u64, @import("../common/read_admission.zig").Port) anyerror!RelationalStatementSnapshot = null,
     };
     const BoundaryAbi = runtime_callback_abi.Boundary(VTable);
 
@@ -598,10 +645,34 @@ pub const TableReadSource = struct {
         return BoundaryAbi.call("open_relational_statement", self.boundary_dispatch, callback, .{ self.ptr, alloc, scans, consistency });
     }
 
+    pub fn openRelationalStatementWithAdmission(self: TableReadSource, alloc: std.mem.Allocator, scans: []const RelationalStatementScan, consistency: read_gate.ReadConsistency, control: @import("../common/read_admission.zig").Port) !RelationalStatementRead {
+        try control.checkpoint();
+        if (self.route_fence != null) return error.SqlStatementSnapshotRequired;
+        const result = if (self.vtable.open_relational_statement_with_admission) |callback|
+            try BoundaryAbi.call("open_relational_statement_with_admission", self.boundary_dispatch, callback, .{ self.ptr, alloc, scans, consistency, control })
+        else
+            try self.openRelationalStatement(alloc, scans, consistency);
+        errdefer result.deinit();
+        try control.checkpoint();
+        return result;
+    }
+
     pub fn openRelationalStatementSnapshot(self: TableReadSource, alloc: std.mem.Allocator, table: []const u8, schema_version: u32, consistency: read_gate.ReadConsistency, cancellation: ?CancellationToken, deadline_ns: ?u64) !RelationalStatementSnapshot {
         if (self.route_fence != null) return error.SqlStatementSnapshotRequired;
         const callback = self.vtable.open_relational_statement_snapshot orelse return error.SqlStatementSnapshotRequired;
         return BoundaryAbi.call("open_relational_statement_snapshot", self.boundary_dispatch, callback, .{ self.ptr, alloc, table, schema_version, consistency, cancellation, deadline_ns });
+    }
+
+    pub fn openRelationalStatementSnapshotWithAdmission(self: TableReadSource, alloc: std.mem.Allocator, table: []const u8, schema_version: u32, consistency: read_gate.ReadConsistency, cancellation: ?CancellationToken, deadline_ns: ?u64, control: @import("../common/read_admission.zig").Port) !RelationalStatementSnapshot {
+        try control.checkpoint();
+        if (self.route_fence != null) return error.SqlStatementSnapshotRequired;
+        const result = if (self.vtable.open_relational_statement_snapshot_with_admission) |callback|
+            try BoundaryAbi.call("open_relational_statement_snapshot_with_admission", self.boundary_dispatch, callback, .{ self.ptr, alloc, table, schema_version, consistency, cancellation, deadline_ns, control })
+        else
+            try self.openRelationalStatementSnapshot(alloc, table, schema_version, consistency, cancellation, deadline_ns);
+        errdefer result.deinit();
+        try control.checkpoint();
+        return result;
     }
 
     pub fn openRelationalStatementSnapshotGroupLocal(self: TableReadSource, alloc: std.mem.Allocator, group: u64, table: []const u8, consistency: read_gate.ReadConsistency, cancellation: ?CancellationToken, deadline_ns: ?u64) !RelationalStatementSnapshot {
@@ -627,6 +698,20 @@ pub const TableReadSource = struct {
         const fence = self.route_fence orelse return error.CatalogRouteFenceRequired;
         const acquire = self.vtable.try_statement_read_fence_group_local_routed orelse return error.SqlStatementSnapshotRequired;
         return BoundaryAbi.call("try_statement_read_fence_group_local_routed", self.boundary_dispatch, acquire, .{ self.ptr, alloc, fence, group, table, opts, consistency });
+    }
+
+    pub fn tryStatementReadFenceGroupLocalWithAdmission(self: TableReadSource, alloc: std.mem.Allocator, group: u64, table: []const u8, opts: db_types.ScanOptions, consistency: read_gate.ReadConsistency, original: @import("../common/read_admission.zig").Port) !?StatementReadFence {
+        var retained_dependency: @import("../common/read_admission.zig").RetainedDependency = .{};
+        const control = retained_dependency.bind(original).?;
+        try control.checkpoint();
+        const route = self.route_fence orelse return error.CatalogRouteFenceRequired;
+        const result = if (self.vtable.try_statement_read_fence_with_admission) |callback|
+            try BoundaryAbi.call("try_statement_read_fence_with_admission", self.boundary_dispatch, callback, .{ self.ptr, alloc, route, group, table, opts, consistency, control })
+        else
+            try self.tryStatementReadFenceGroupLocal(alloc, group, table, opts, consistency);
+        errdefer if (result) |fence| fence.deinit();
+        try control.checkpoint();
+        return result;
     }
 
     pub fn bindCatalogRouteFenceJson(
@@ -1000,6 +1085,33 @@ pub const TableReadSource = struct {
         }
         const fn_ptr = self.vtable.text_stats_group_local orelse return null;
         return try BoundaryAbi.call("text_stats_group_local", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, group_id, table_name, body });
+    }
+
+    pub fn textStatsGroupLocalWithControls(
+        self: TableReadSource,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        body: []const u8,
+        controls: db_types.SearchRequest,
+    ) !?query_api.QueryResponse {
+        try checkStatisticsControls(controls);
+        var response = result: {
+            if (self.route_fence) |fence| {
+                if (self.vtable.text_stats_group_local_controlled_routed) |routed|
+                    break :result try BoundaryAbi.call("text_stats_group_local_controlled_routed", self.boundary_dispatch, routed, .{ self.ptr, alloc, fence, group_id, table_name, body, controls });
+            } else if (self.vtable.text_stats_group_local_controlled) |callback| {
+                break :result try BoundaryAbi.call("text_stats_group_local_controlled", self.boundary_dispatch, callback, .{ self.ptr, alloc, group_id, table_name, body, controls });
+            }
+            // Legacy adapters may serve uncontrolled callers but cannot erase
+            // trusted authority, cancellation or an absolute deadline.
+            if (controls.execution_runnable != null or controls.execution_deadline_ns != null or controls.cancellation != null)
+                return error.UnsupportedQueryRequest;
+            break :result try self.textStatsGroupLocal(alloc, group_id, table_name, body);
+        };
+        errdefer if (response) |*owned| owned.deinit(alloc);
+        try checkStatisticsControls(controls);
+        return response;
     }
 
     pub fn algebraicPartialsGroupLocal(
@@ -1562,4 +1674,14 @@ test "scan stream preserves chunk backpressure without buffered fallback" {
     try std.testing.expectEqual(@as(usize, 0), fake.buffered_calls);
 }
 
+fn checkStatisticsControls(controls: db_types.SearchRequest) !void {
+    if (controls.execution_runnable) |borrow| {
+        try borrow.validate();
+        const status = borrow.checkpoint(borrow.context);
+        if (!status.isOk()) return @import("antfly_runtime_abi").error_abi.errorFromStatus(status);
+    }
+    if (controls.cancellation) |token| try token.check();
+    if (controls.execution_deadline_ns) |deadline|
+        if (@import("antfly_platform").time.monotonicNs() >= deadline) return error.Timeout;
+}
 pub const bindNativeCutBodyAlloc = @import("../storage/db/native_query_cut_contract.zig").bindBodyAlloc;

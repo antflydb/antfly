@@ -22,10 +22,16 @@ const runtime_backend = @import("runtime_backend.zig");
 const storage_io = @import("lsm_backend/storage_io.zig");
 const threaded_connect_io = @import("../common/threaded_connect_io.zig");
 const threaded_io_limits = @import("antfly_runtime_fs").threaded_io_limits;
+const runnable_abi = @import("antfly_runtime_abi").runnable_abi;
 const bounded_worker_lane = @import("../common/bounded_worker_lane.zig");
 pub const MaintenanceScheduler = @import("../common/maintenance_scheduler.zig").Scheduler;
+pub const SqlWorkerMemory = @import("sql_worker_memory.zig");
+pub const RuntimeMemory = @import("runtime_memory.zig");
 
 const Allocator = std.mem.Allocator;
+const execution_services = @import("execution_services.zig");
+const ExecutionBinding = @import("execution_binding.zig").Binding;
+
 const Io = std.Io;
 const AtomicU64 = platform.atomic.Value(u64);
 
@@ -462,6 +468,30 @@ pub const IoImpl = if (builtin.os.tag == .freestanding) void else Io.Threaded;
 pub const default_io_concurrent_limit: u32 = threaded_io_limits.backend_runtime_durable_background;
 
 pub const Config = struct {
+    /// Share the producer's execution policy, capacity and durable registry.
+    /// The local parent still funds context metadata and storage resources.
+    execution_services: ?*const @import("execution_services.zig").Offer = null,
+
+    /// Runtime metadata and owned non-SQL stack mappings charge this parent on
+    /// allocation. Borrowed IO and explicitly funded SQL heaps retain their own
+    /// authority. The parent outlives the complete runtime and handle teardown.
+    memory_parent: ?@import("antfly_runtime_abi").memory_abi.Parent = null,
+    /// Install before executor publication. The parent outlives runtime shutdown
+    /// or an explicit closeSharedSqlMemory, including physical worker joins.
+    shared_sql_memory_parent: ?@import("antfly_runtime_abi").memory_abi.Parent = null,
+    shared_sql_memory_limits: SqlWorkerMemory.Limits = .{},
+    /// Private control executor metadata; its complete configured stack ceiling
+    /// is funded separately. Ordinary lanes cannot borrow this startup credit.
+    control_memory_bytes: usize = 1 << 20,
+    /// Separate prepaid heap per native Raft direction. Stack reservations cover
+    /// the full configured lane ceilings, independently of control and SQL.
+    raft_memory_bytes: usize = 1 << 20,
+    /// The node owner is retained before any runtime work can start and
+    /// released after every lane, recurring callback and durable job joins.
+    /// Callbacks must explicitly adopt CPU stages and mandatory reentry.
+    runnable_owner: ?runnable_abi.Owner = null,
+    /// Includes pending construction and detached callbacks until physical join.
+    maintenance_registration_limit: usize = MaintenanceScheduler.default_max_registrations,
     backend: Backend = runtime_backend.defaultExecutorBackend(),
     /// Value-semantic executor limits. Separate lanes preserve isolation for
     /// nested submissions; validation keeps their simultaneously activatable
@@ -605,8 +635,76 @@ pub const DbOpenConfigurator = struct {
     }
 };
 
+/// Owning completion observation. No registry address or borrowed admission
+/// control is retained. The producer and its allocator outlive this lease.
+pub const OwnerDrain = struct {
+    const Callbacks = struct { wait: *const fn (?*anyopaque) anyerror!void };
+    const Boundary = @import("named_callback.zig").Boundary(Callbacks);
+    context: ?*anyopaque = null,
+    ready_fn: *const fn (?*anyopaque) bool = readyEmpty,
+    wait_fn: *const fn (?*anyopaque) anyerror!void = waitEmpty,
+    release_fn: *const fn (?*anyopaque) void = releaseEmpty,
+    callback_dispatch: @import("named_callback.zig").Dispatch = Boundary.local_dispatch,
+    pub fn init(context: *anyopaque, ready_callback: *const fn (?*anyopaque) bool, wait_callback: *const fn (?*anyopaque) anyerror!void, release_callback: *const fn (?*anyopaque) void) OwnerDrain {
+        return .{ .context = context, .ready_fn = ready_callback, .wait_fn = wait_callback, .release_fn = release_callback };
+    }
+    pub fn ready(self: OwnerDrain) bool {
+        return self.ready_fn(self.context);
+    }
+    pub fn wait(self: OwnerDrain) !void {
+        try Boundary.call("wait", self.callback_dispatch, self.wait_fn, .{self.context});
+    }
+    pub fn release(self: *OwnerDrain) void {
+        self.release_fn(self.context);
+        self.* = .{};
+    }
+    fn readyEmpty(_: ?*anyopaque) bool {
+        return true;
+    }
+    fn waitEmpty(_: ?*anyopaque) !void {}
+    fn releaseEmpty(_: ?*anyopaque) void {}
+};
+
+const OwnerDrainSignal = struct {
+    allocator: Allocator,
+    io: Io,
+    refs: std.atomic.Value(usize) = .init(1),
+    done: Io.Event = .unset,
+    fn retain(self: *OwnerDrainSignal) void {
+        const prior = self.refs.fetchAdd(1, .monotonic);
+        std.debug.assert(prior != 0 and prior != std.math.maxInt(usize));
+    }
+    fn drop(self: *OwnerDrainSignal) void {
+        if (self.refs.fetchSub(1, .acq_rel) != 1) return;
+        const allocator = self.allocator;
+        allocator.destroy(self);
+    }
+    fn ready(raw: ?*anyopaque) bool {
+        const self: *OwnerDrainSignal = @ptrCast(@alignCast(raw.?));
+        return self.done.isSet();
+    }
+    fn wait(raw: ?*anyopaque) !void {
+        const self: *OwnerDrainSignal = @ptrCast(@alignCast(raw.?));
+        self.done.waitTimeout(self.io, .{ .duration = .{ .raw = .fromMilliseconds(1), .clock = .awake } }) catch |cause| switch (cause) {
+            error.Timeout => {},
+            else => return cause,
+        };
+    }
+    fn release(raw: ?*anyopaque) void {
+        const self: *OwnerDrainSignal = @ptrCast(@alignCast(raw.?));
+        self.drop();
+    }
+    fn lease(self: *OwnerDrainSignal) OwnerDrain {
+        return .init(self, ready, wait, release);
+    }
+    fn complete(self: *OwnerDrainSignal) void {
+        self.done.set(self.io);
+        self.drop();
+    }
+};
+
 pub const DurableJobLane = struct {
-    const NativeCallbacks = struct { submit: @FieldType(DurableJobLane.VTable, "submit"), pause_owner: @FieldType(DurableJobLane.VTable, "pause_owner"), resume_owner: @FieldType(DurableJobLane.VTable, "resume_owner"), reopen_owner: @FieldType(DurableJobLane.VTable, "reopen_owner"), poll: @FieldType(DurableJobLane.VTable, "poll") };
+    const NativeCallbacks = struct { begin_owner_drain: @FieldType(DurableJobLane.VTable, "begin_owner_drain"), wait_owner: @FieldType(DurableJobLane.VTable, "wait_owner"), quiesce_owner: @FieldType(DurableJobLane.VTable, "quiesce_owner"), submit: @FieldType(DurableJobLane.VTable, "submit"), pause_owner: @FieldType(DurableJobLane.VTable, "pause_owner"), resume_owner: @FieldType(DurableJobLane.VTable, "resume_owner"), reopen_owner: @FieldType(DurableJobLane.VTable, "reopen_owner"), poll: @FieldType(DurableJobLane.VTable, "poll") };
     const NativeBoundary = @import("named_callback.zig").Boundary(NativeCallbacks);
     callback_dispatch: @import("named_callback.zig").Dispatch = NativeBoundary.local_dispatch,
 
@@ -617,8 +715,19 @@ pub const DurableJobLane = struct {
         return error.BackgroundOwnerLifecycleUnsupported;
     }
 
+    fn quiesceUnsupported(_: *anyopaque, _: u64) anyerror!bool {
+        return error.BackgroundOwnerLifecycleUnsupported;
+    }
+
+    fn drainUnsupported(_: *anyopaque, _: u64, _: @import("../common/read_admission.zig").Port) anyerror!OwnerDrain {
+        return error.ExecutionWaitUnsupported;
+    }
+
     pub const VTable = struct {
+        begin_owner_drain: *const fn (*anyopaque, u64, @import("../common/read_admission.zig").Port) anyerror!OwnerDrain = drainUnsupported,
         submit: *const fn (ptr: *anyopaque, job: Job) anyerror!void,
+        quiesce_owner: *const fn (ptr: *anyopaque, owner_id: u64) anyerror!bool = quiesceUnsupported,
+        wait_owner: *const fn (ptr: *anyopaque, owner_id: u64) anyerror!bool = quiesceUnsupported,
         drain_owner: *const fn (ptr: *anyopaque, owner_id: u64) void,
         close_owner: *const fn (ptr: *anyopaque, owner_id: u64) void,
         pause_owner: *const fn (ptr: *anyopaque, owner_id: u64) anyerror!void = lifecycleUnsupported,
@@ -637,6 +746,65 @@ pub const DurableJobLane = struct {
 
     pub fn drainOwner(self: DurableJobLane, owner_id: u64) void {
         self.vtable.drain_owner(self.ptr, owner_id);
+    }
+
+    /// Fence new jobs/probes and report completion of all accepted callbacks
+    /// and payload destruction. Keep the registry generation until closeOwner.
+    /// This observation never joins a future, runs work or destroys metadata.
+    pub fn quiesceOwner(self: DurableJobLane, owner_id: u64) !bool {
+        return NativeBoundary.call("quiesce_owner", self.callback_dispatch, self.vtable.quiesce_owner, .{ self.ptr, owner_id });
+    }
+
+    /// One notification wait of at most 1 ms. The owner must already be
+    /// fenced, and callers must lend execution before entering this wait.
+    pub fn waitOwner(self: DurableJobLane, owner_id: u64) !bool {
+        return NativeBoundary.call("wait_owner", self.callback_dispatch, self.vtable.wait_owner, .{ self.ptr, owner_id });
+    }
+
+    pub fn beginOwnerDrain(self: DurableJobLane, owner_id: u64, original: @import("../common/read_admission.zig").Port) !OwnerDrain {
+        return NativeBoundary.call("begin_owner_drain", self.callback_dispatch, self.vtable.begin_owner_drain, .{ self.ptr, owner_id, original });
+    }
+
+    pub fn quiesceOwnerWithAdmission(self: DurableJobLane, owner_id: u64, original: @import("../common/read_admission.zig").Port) !void {
+        var trace: @import("../common/read_admission.zig").RejectionTrace = .{};
+        const control = trace.bind(original).?;
+        const boundary = (try control.executionWaitAfterLifetime()) orelse return error.ExecutionWaitUnsupported;
+        _ = (try control.deadlineNs()) orelse return error.ExecutionWaitUnsupported;
+        try control.checkpoint();
+        var completion = try self.beginOwnerDrain(owner_id, control);
+        defer completion.release();
+        while (true) {
+            try control.checkpoint();
+            if (completion.ready()) return;
+            try boundary.beginWait();
+            var failure: ?anyerror = null;
+            while (true) {
+                control.checkLifetime() catch |cause| {
+                    failure = trace.failure orelse cause;
+                    break;
+                };
+                if (completion.ready()) break;
+                completion.wait() catch |cause| {
+                    failure = cause;
+                    break;
+                };
+            }
+            boundary.endWait() catch |cause| {
+                if (failure) |first| return first;
+                return trace.failure orelse cause;
+            };
+            if (failure) |cause| return cause;
+        }
+    }
+
+    /// Drain producers before the owners they may submit dependent work to.
+    /// Keep every generation registered for physical close, including after a
+    /// rejected wait. This borrow never renews the original cleanup lifetime.
+    pub fn quiesceOwnersWithAdmission(self: DurableJobLane, owner_ids: []const u64, original: @import("../common/read_admission.zig").Port) !void {
+        for (owner_ids) |owner_id| {
+            if (owner_id == 0) continue;
+            try self.quiesceOwnerWithAdmission(owner_id, original);
+        }
     }
 
     pub fn closeOwner(self: DurableJobLane, owner_id: u64) void {
@@ -680,6 +848,40 @@ pub const DurableJobLane = struct {
     }
 };
 
+/// Synchronous producers can retain a context outside the durable job count.
+/// This borrow never escapes; only the original execution wait is lent.
+pub fn waitForDirectAdmissionsWithAdmission(runtime: *BackendRuntime, count: *const std.atomic.Value(u32), original: @import("../common/read_admission.zig").Port) !void {
+    var trace: @import("../common/read_admission.zig").RejectionTrace = .{};
+    const control = trace.bind(original).?;
+    const boundary = (try control.executionWaitAfterLifetime()) orelse return error.ExecutionWaitUnsupported;
+    _ = (try control.deadlineNs()) orelse return error.ExecutionWaitUnsupported;
+    while (true) {
+        try control.checkpoint();
+        if (count.load(.acquire) == 0) return;
+        try boundary.beginWait();
+        var failure: ?anyerror = null;
+        while (count.load(.acquire) != 0) {
+            control.checkLifetime() catch |cause| {
+                failure = trace.failure orelse cause;
+                break;
+            };
+            const io = runtime.io() orelse runtime.filesystemIo() orelse {
+                failure = error.BackendRuntimeUnavailable;
+                break;
+            };
+            io.sleep(.fromMilliseconds(1), .awake) catch |cause| {
+                failure = cause;
+                break;
+            };
+        }
+        boundary.endWait() catch |cause| {
+            if (failure) |first| return first;
+            return trace.failure orelse cause;
+        };
+        if (failure) |cause| return cause;
+    }
+}
+
 pub const Job = struct {
     const NativeCallbacks = struct { run: @FieldType(Job, "run") };
     const NativeBoundary = @import("named_callback.zig").Boundary(NativeCallbacks);
@@ -695,6 +897,10 @@ pub const Job = struct {
         commit_durable,
         maintenance,
         cleanup,
+        /// Finite recovery steps only: never sleep between retries or wait
+        /// for another recovery owner. One pending step per registered owner
+        /// is admitted without allocating a job header or executor future.
+        recovery,
     };
 
     pub fn execute(self: Job) !void {
@@ -710,7 +916,20 @@ pub const OwnerMaintenanceProbe = struct {
     run: *const fn (ptr: *anyopaque) void,
 };
 
-fn initIoLane(alloc: Allocator, concurrent_limit: u32) !*IoImpl {
+fn initOwnedThreaded(alloc: Allocator, options: Io.Threaded.InitOptions) Io.Threaded {
+    if (comptime @hasField(Io.Threaded.InitOptions, "joinable_workers")) {
+        var owned = options;
+        owned.joinable_workers = true;
+        if (comptime std.Thread.use_pthreads) {
+            if (owned.worker_stack_allocator == null) owned.worker_stack_allocator = std.heap.page_allocator;
+        }
+        return Io.Threaded.init(alloc, owned);
+    } else {
+        @compileError("Antfly owned executors require the generated Zig library: pass dependency.artifact(\"antfly-lite\").zig_lib_dir to your Compile options");
+    }
+}
+
+fn initIoLane(alloc: Allocator, concurrent_limit: u32, stack_allocator: ?Allocator) !*IoImpl {
     if (comptime is_hostless) {
         return error.UnsupportedPlatform;
     } else {
@@ -720,7 +939,8 @@ fn initIoLane(alloc: Allocator, concurrent_limit: u32) !*IoImpl {
         // lanes. Threaded retains concurrent workers until deinit, so a finite
         // ceiling prevents any lane from converting a transient fan-out spike
         // into an unbounded kernel-thread/stack reservation ratchet.
-        io_impl.* = Io.Threaded.init(alloc, .{
+        io_impl.* = initOwnedThreaded(alloc, .{
+            .worker_stack_allocator = if (std.Thread.use_pthreads) stack_allocator else null,
             .async_limit = boundedIoAsyncLimit(concurrent_limit),
             .concurrent_limit = .limited(concurrent_limit),
         });
@@ -750,11 +970,16 @@ const OwnerRegistry = struct {
         closing: bool = false,
         paused: bool = false,
         in_flight: usize = 0,
+        drain_signal: ?*OwnerDrainSignal = null,
         maintenance_probe: ?OwnerMaintenanceProbe = null,
         maintenance_probe_running: bool = false,
         maintenance_probe_enqueued: bool = false,
         maintenance_probe_prev: u64 = 0,
         maintenance_probe_next: u64 = 0,
+        recovery_pending: ?Job = null,
+        recovery_running: bool = false,
+        recovery_enqueued: bool = false,
+        recovery_next: u64 = 0,
     };
 
     const ProbeWork = struct {
@@ -763,6 +988,7 @@ const OwnerRegistry = struct {
     };
 
     alloc: Allocator,
+    drain_alloc: Allocator,
     sync_io: Io = if (builtin.os.tag == .freestanding) .failing else std.Io.Threaded.global_single_threaded.io(),
     mutex: Io.Mutex = .init,
     idle: Io.Condition = .init,
@@ -770,14 +996,18 @@ const OwnerRegistry = struct {
     maintenance_probe_head: u64 = 0,
     maintenance_probe_tail: u64 = 0,
     maintenance_probe_queued_count: usize = 0,
+    recovery_ready: Io.Condition = .init,
+    recovery_head: u64 = 0,
+    recovery_tail: u64 = 0,
+    recovery_stopping: bool = false,
 
     fn init(alloc: Allocator) OwnerRegistry {
-        return .{ .alloc = alloc };
+        return .{ .alloc = alloc, .drain_alloc = alloc };
     }
 
     pub fn deinit(self: *OwnerRegistry) void {
         var iterator = self.states.valueIterator();
-        while (iterator.next()) |state| std.debug.assert(state.in_flight == 0);
+        while (iterator.next()) |state| std.debug.assert(state.in_flight == 0 and state.drain_signal == null);
         self.states.deinit(self.alloc);
         self.* = undefined;
     }
@@ -800,6 +1030,81 @@ const OwnerRegistry = struct {
         state.in_flight += 1;
     }
 
+    /// Registration prepays the queue slot. Repeated notifications may queue
+    /// one successor while a step runs, but never grow memory or run one owner
+    /// concurrently. A refused job remains entirely owned by its caller.
+    fn submitRecovery(self: *OwnerRegistry, job: Job) !void {
+        self.mutex.lockUncancelable(self.sync_io);
+        defer self.mutex.unlock(self.sync_io);
+        if (self.recovery_stopping) return error.BackendRuntimeShuttingDown;
+        const state = self.states.getPtr(job.owner_id) orelse return error.BackgroundOwnerClosed;
+        if (state.closing) return error.BackgroundOwnerClosing;
+        if (state.paused) return error.BackgroundOwnerPaused;
+        if (state.recovery_pending != null or state.in_flight == std.math.maxInt(usize))
+            return error.BackgroundOwnerCapacityExceeded;
+        state.recovery_pending = job;
+        state.in_flight += 1;
+        if (!state.recovery_running) self.enqueueRecoveryLocked(job.owner_id, state);
+    }
+
+    fn enqueueRecoveryLocked(self: *OwnerRegistry, owner_id: u64, state: *State) void {
+        std.debug.assert(state.recovery_pending != null and !state.recovery_running and !state.recovery_enqueued);
+        std.debug.assert(state.recovery_next == 0);
+        state.recovery_enqueued = true;
+        if (self.recovery_tail != 0) {
+            self.states.getPtr(self.recovery_tail).?.recovery_next = owner_id;
+        } else self.recovery_head = owner_id;
+        self.recovery_tail = owner_id;
+        self.recovery_ready.signal(self.sync_io);
+    }
+
+    fn takeRecoveryLocked(self: *OwnerRegistry) ?Job {
+        const owner_id = self.recovery_head;
+        if (owner_id == 0) return null;
+        const state = self.states.getPtr(owner_id).?;
+        const job = state.recovery_pending.?;
+        self.recovery_head = state.recovery_next;
+        if (self.recovery_head == 0) self.recovery_tail = 0;
+        state.recovery_pending = null;
+        state.recovery_next = 0;
+        state.recovery_enqueued = false;
+        state.recovery_running = true;
+        return job;
+    }
+
+    fn waitRecovery(self: *OwnerRegistry) ?Job {
+        self.mutex.lockUncancelable(self.sync_io);
+        defer self.mutex.unlock(self.sync_io);
+        while (true) {
+            if (self.takeRecoveryLocked()) |job| return job;
+            if (self.recovery_stopping) return null;
+            self.recovery_ready.waitUncancelable(self.sync_io, &self.mutex);
+        }
+    }
+
+    fn finishRecovery(self: *OwnerRegistry, owner_id: u64) void {
+        var completed: ?*OwnerDrainSignal = null;
+        defer if (completed) |signal| signal.complete();
+        self.mutex.lockUncancelable(self.sync_io);
+        defer self.mutex.unlock(self.sync_io);
+        const state = self.states.getPtr(owner_id).?;
+        std.debug.assert(state.recovery_running and state.in_flight > 0);
+        state.recovery_running = false;
+        state.in_flight -= 1;
+        completed = takeDrainSignal(state);
+        // Closing/pausing stops new admission, never accepted work. Append a
+        // successor behind other owners so a hot owner cannot monopolize FIFO.
+        if (state.recovery_pending != null) self.enqueueRecoveryLocked(owner_id, state);
+        if (state.in_flight == 0) self.idle.broadcast(self.sync_io);
+    }
+
+    fn stopRecovery(self: *OwnerRegistry) void {
+        self.mutex.lockUncancelable(self.sync_io);
+        defer self.mutex.unlock(self.sync_io);
+        self.recovery_stopping = true;
+        self.recovery_ready.broadcast(self.sync_io);
+    }
+
     fn setPaused(self: *OwnerRegistry, owner_id: u64, paused: bool) !void {
         self.mutex.lockUncancelable(self.sync_io);
         defer self.mutex.unlock(self.sync_io);
@@ -813,6 +1118,8 @@ const OwnerRegistry = struct {
     }
 
     fn finishJob(self: *OwnerRegistry, owner_id: u64) void {
+        var completed: ?*OwnerDrainSignal = null;
+        defer if (completed) |signal| signal.complete();
         self.mutex.lockUncancelable(self.sync_io);
         defer self.mutex.unlock(self.sync_io);
         const state = self.states.getPtr(owner_id) orelse {
@@ -820,6 +1127,7 @@ const OwnerRegistry = struct {
         };
         std.debug.assert(state.in_flight > 0);
         state.in_flight -= 1;
+        completed = takeDrainSignal(state);
         if (state.in_flight == 0) self.idle.broadcast(self.sync_io);
     }
 
@@ -908,6 +1216,8 @@ const OwnerRegistry = struct {
     }
 
     fn finishMaintenanceProbe(self: *OwnerRegistry, owner_id: u64) void {
+        var completed: ?*OwnerDrainSignal = null;
+        defer if (completed) |signal| signal.complete();
         self.mutex.lockUncancelable(self.sync_io);
         defer self.mutex.unlock(self.sync_io);
         const state = self.states.getPtr(owner_id) orelse {
@@ -917,6 +1227,7 @@ const OwnerRegistry = struct {
         std.debug.assert(state.in_flight > 0);
         state.maintenance_probe_running = false;
         state.in_flight -= 1;
+        completed = takeDrainSignal(state);
         if (state.in_flight == 0) self.idle.broadcast(self.sync_io);
         if (!state.closing and !state.paused and state.maintenance_probe != null) {
             self.enqueueMaintenanceProbeLocked(owner_id, state);
@@ -952,6 +1263,73 @@ const OwnerRegistry = struct {
         return true;
     }
 
+    fn beginDrain(self: *OwnerRegistry, owner_id: u64, original: @import("../common/read_admission.zig").Port) !OwnerDrain {
+        var prepared: ?*OwnerDrainSignal = null;
+        defer if (prepared) |signal| signal.drop();
+        while (true) {
+            try @import("../common/cleanup_wait.zig").lockIo(&self.mutex, self.sync_io, original);
+            var held = true;
+            defer if (held) self.mutex.unlock(self.sync_io);
+            try original.checkLifetime();
+            const state = self.states.getPtr(owner_id) orelse return .{};
+            state.closing = true;
+            state.maintenance_probe = null;
+            if (state.maintenance_probe_enqueued) self.unlinkMaintenanceProbeLocked(owner_id, state);
+            if (state.in_flight == 0) return .{};
+            if (state.drain_signal) |signal| {
+                signal.retain();
+                return signal.lease();
+            }
+            if (prepared) |signal| {
+                signal.retain(); // Registry completion owns an independent ref.
+                state.drain_signal = signal;
+                prepared = null;
+                return signal.lease();
+            }
+            // Allocation and parent accounting run outside the registry guard.
+            self.mutex.unlock(self.sync_io);
+            held = false;
+            try original.checkpoint();
+            prepared = try self.drain_alloc.create(OwnerDrainSignal);
+            prepared.?.* = .{ .allocator = self.drain_alloc, .io = self.sync_io };
+        }
+    }
+
+    fn takeDrainSignal(state: *State) ?*OwnerDrainSignal {
+        if (state.in_flight != 0) return null;
+        const signal = state.drain_signal;
+        state.drain_signal = null;
+        return signal;
+    }
+
+    fn quiesce(self: *OwnerRegistry, owner_id: u64) bool {
+        self.mutex.lockUncancelable(self.sync_io);
+        defer self.mutex.unlock(self.sync_io);
+        const state = self.states.getPtr(owner_id) orelse return true;
+        state.closing = true;
+        state.maintenance_probe = null;
+        if (state.maintenance_probe_enqueued) self.unlinkMaintenanceProbeLocked(owner_id, state);
+        return state.in_flight == 0;
+    }
+
+    fn waitIdleSlice(self: *OwnerRegistry, owner_id: u64) !bool {
+        self.mutex.lockUncancelable(self.sync_io);
+        defer self.mutex.unlock(self.sync_io);
+        const state = self.states.getPtr(owner_id) orelse return true;
+        if (!state.closing) return error.BackgroundOwnerLifecycleUnsupported;
+        if (state.in_flight == 0) return true;
+        self.idle.waitTimeout(self.sync_io, &self.mutex, .{
+            .duration = .{ .raw = .fromMilliseconds(1), .clock = .awake },
+        }) catch |cause| switch (cause) {
+            error.Timeout => {},
+            else => return cause,
+        };
+        // Waiting releases the mutex; never retain the old hash-map pointer.
+        const current = self.states.getPtr(owner_id) orelse return true;
+        if (!current.closing) return error.BackgroundOwnerLifecycleUnsupported;
+        return current.in_flight == 0;
+    }
+
     fn waitIdle(self: *OwnerRegistry, owner_id: u64) void {
         self.mutex.lockUncancelable(self.sync_io);
         defer self.mutex.unlock(self.sync_io);
@@ -978,9 +1356,10 @@ const OwnerRegistry = struct {
         defer self.mutex.unlock(self.sync_io);
         const state = self.states.getPtr(owner_id) orelse return;
         std.debug.assert(state.closing);
-        std.debug.assert(state.in_flight == 0);
+        std.debug.assert(state.in_flight == 0 and state.drain_signal == null);
         std.debug.assert(!state.maintenance_probe_enqueued);
         std.debug.assert(!state.maintenance_probe_running);
+        std.debug.assert(!state.recovery_running and !state.recovery_enqueued and state.recovery_pending == null);
         _ = self.states.remove(owner_id);
     }
 
@@ -992,9 +1371,14 @@ const OwnerRegistry = struct {
 };
 
 pub const BackendRuntime = struct {
+    runnable_owner_lease: ?runnable_abi.Lease = null,
+    execution_services_gate: LaneLeaseGate = .{},
+    shared_execution: ?*ExecutionBinding = null,
     /// Borrowed until every physical owner and retained reader has closed.
     query_cut_repository: ?@import("db/native_query_cut_repository.zig").Port = null,
     alloc: Allocator,
+    runtime_memory: ?*RuntimeMemory.Owner = null,
+    owned_auxiliary_io: ?*IoImpl = null,
     backend: Backend,
     lane_limits: threaded_io_limits.BackendRuntimeLaneLimits,
     next_owner_id: AtomicU64,
@@ -1008,6 +1392,12 @@ pub const BackendRuntime = struct {
     borrowed_receivers: ?BorrowedIoReceivers = null,
     io_impl: ?*IoImpl = null,
     maintenance_scheduler: std.atomic.Value(?*MaintenanceScheduler) = .init(null),
+    maintenance_registration_limit: usize,
+    shared_sql_workers: [4]SharedSqlPool = @splat(.{}),
+    shared_sql_memory: ?*SqlWorkerMemory.Bank = null,
+    shared_sql_memory_mutex: std.atomic.Mutex = .unlocked,
+    shared_sql_started: bool = false,
+    shared_sql_gate: LaneLeaseGate = .{},
     /// Specialized executor lanes are activated on first use. The runtime is
     /// their sole owner; this mutex serializes first publication and teardown
     /// never starts until the corresponding public lease gates are closed.
@@ -1017,6 +1407,7 @@ pub const BackendRuntime = struct {
     raft_outbound_io_impl: std.atomic.Value(?*IoImpl) = .init(null),
     request_forward_io_impl: std.atomic.Value(?*IoImpl) = .init(null),
     request_forward_lane_gate: LaneLeaseGate = .{},
+    raft_outbound_lane_gate: LaneLeaseGate = .{},
     api_io_impl: std.atomic.Value(?*IoImpl) = .init(null),
     inference_io_impl: std.atomic.Value(?*IoImpl) = .init(null),
     pdf_render_executor: std.atomic.Value(?*bounded_worker_lane.Executor) = .init(null),
@@ -1035,6 +1426,8 @@ pub const BackendRuntime = struct {
     pdf_render_lane_acquisitions_total: @import("antfly_platform").atomic.Value(u64) = .init(0),
     pdf_render_lane_rejections_total: @import("antfly_platform").atomic.Value(u64) = .init(0),
     worker_lane_gate: LaneLeaseGate = .{},
+    reserved_service_workers: std.atomic.Value(usize) = .init(0),
+    reserved_sql_workers: std.atomic.Value(usize) = .init(0),
     reserved_workers: std.atomic.Value(usize) = .init(0),
     peak_reserved_workers: std.atomic.Value(usize) = .init(0),
     control_lane_gate: LaneLeaseGate = .{},
@@ -1045,29 +1438,67 @@ pub const BackendRuntime = struct {
     durable_jobs: DurableJobLane,
     db_open_configurator: ?DbOpenConfigurator = null,
 
-    pub fn init(alloc: Allocator, config: Config) !BackendRuntime {
+    pub fn init(backing: Allocator, config: Config) !BackendRuntime {
         try runtime_backend.ensureExecutorBackendAvailable(config.backend);
         try config.lane_limits.validate();
+        if (config.maintenance_registration_limit == 0) return error.InvalidMaintenanceCapacity;
         if (config.borrowed_io != null and config.backend != .manual)
             return error.BorrowedIoRequiresManualBackend;
+        const native = config.execution_services == null and config.backend != .manual and config.borrowed_io == null;
+        const mapping = if (comptime std.Thread.use_pthreads and !is_hostless)
+            try Io.Threaded.workerStackMappingSize((Io.Threaded.InitOptions{}).stack_size)
+        else
+            0;
+        const control_limits: ?RuntimeMemory.Owner.ControlLimits = if (native)
+            .{ .heap = config.control_memory_bytes, .stacks = std.math.mul(usize, mapping, config.lane_limits.control + threaded_io_limits.backend_runtime_recovery) catch return error.InvalidControlMemoryLimit }
+        else
+            null;
+        const raft_limits: ?RuntimeMemory.Owner.RaftLimits = if (native) .{
+            .inbound = .{ .heap = config.raft_memory_bytes, .stacks = std.math.mul(usize, mapping, config.lane_limits.raft_inbound) catch return error.InvalidRaftMemoryLimit },
+            .outbound = .{ .heap = config.raft_memory_bytes, .stacks = std.math.mul(usize, mapping, config.lane_limits.raft_outbound) catch return error.InvalidRaftMemoryLimit },
+        } else null;
+        const runtime_memory = if (config.memory_parent) |parent| try RuntimeMemory.Owner.createWithProgress(backing, parent, control_limits, raft_limits) else null;
+        errdefer if (runtime_memory) |memory| memory.destroy();
+        const alloc = if (runtime_memory) |memory| memory.allocator() else backing;
+        if (config.execution_services != null and (config.borrowed_io != null or config.filesystem_io != null or config.shared_sql_memory_parent != null)) return error.InvalidArgument;
+        const shared = if (config.execution_services) |offer| try ExecutionBinding.create(alloc, offer) else null;
+        errdefer if (shared) |binding| binding.destroy();
+        if (shared) |binding| if (config.runnable_owner) |requested| {
+            const peer = binding.info.runnable_owner orelse return error.InvalidArgument;
+            if (requested.context != peer.context) return error.InvalidArgument;
+        };
+
+        const sql_memory = if (config.shared_sql_memory_parent) |parent|
+            try createSharedSqlMemory(backing, parent, config.shared_sql_memory_limits, if (config.backend == .manual or config.borrowed_io != null) 0 else config.lane_limits.sql_worker_capacity)
+        else
+            null;
+        errdefer if (sql_memory) |memory| memory.destroy();
+
+        var runnable_owner_lease = if (shared == null) (if (config.runnable_owner) |owner| try runnable_abi.Lease.init(owner) else null) else null;
+        errdefer if (runnable_owner_lease) |*lease| lease.deinit();
 
         const owner_registry = try alloc.create(OwnerRegistry);
         errdefer alloc.destroy(owner_registry);
         owner_registry.* = OwnerRegistry.init(alloc);
+        if (runtime_memory) |memory| owner_registry.drain_alloc = memory.controlAllocator();
         if (config.borrowed_io) |borrowed| owner_registry.sync_io = borrowed.general;
         errdefer owner_registry.deinit();
-        const retired_generation_cleanup_owner_id: u64 = 1;
+        const retired_generation_cleanup_owner_id: u64 = if (shared) |binding| try binding.client.allocOwnerId() else 1;
         try owner_registry.register(retired_generation_cleanup_owner_id);
 
         const native_storage_pool = try alloc.create(storage_io.NativeStoragePool);
         errdefer alloc.destroy(native_storage_pool);
         native_storage_pool.* = storage_io.NativeStoragePool.init(alloc);
+        native_storage_pool.memory_parent = config.memory_parent;
         errdefer native_storage_pool.deinit();
 
         var runtime = BackendRuntime{
+            .runnable_owner_lease = runnable_owner_lease,
             .alloc = alloc,
-            .backend = config.backend,
-            .lane_limits = config.lane_limits,
+            .backend = if (shared) |binding| binding.info.backend else config.backend,
+            .lane_limits = if (shared) |binding| binding.info.limits else config.lane_limits,
+            .shared_execution = shared,
+            .maintenance_registration_limit = if (shared) |binding| binding.info.maintenance_registration_limit else config.maintenance_registration_limit,
             .next_owner_id = .init(retired_generation_cleanup_owner_id + 1),
             .retired_generation_cleanup_owner_id = retired_generation_cleanup_owner_id,
             .owner_registry = owner_registry,
@@ -1077,20 +1508,27 @@ pub const BackendRuntime = struct {
             .borrowed_filesystem_receiver = try receiveIo(config.filesystem_io),
             .borrowed_receivers = if (config.borrowed_io) |value| try BorrowedIoReceivers.init(value) else null,
             .durable_jobs = undefined,
-            .borrowed_io = config.borrowed_io,
-            .borrowed_storage = if (config.borrowed_io) |borrowed| storage_io.IoStorage.init(borrowed.general) else null,
+            .borrowed_io = if (shared) |binding| .{ .general = binding.io(.general) } else config.borrowed_io,
+            .shared_sql_memory = sql_memory,
+            .runtime_memory = runtime_memory,
+            .borrowed_storage = if (shared) |binding| storage_io.IoStorage.init(binding.io(.filesystem)) else if (config.borrowed_io) |borrowed| storage_io.IoStorage.init(borrowed.general) else null,
         };
-        runtime.durable_jobs = InlineDurableJobLane.lane(owner_registry);
+        runtime.durable_jobs = if (shared) |binding| try binding.client.durableJobs() else InlineDurableJobLane.lane(owner_registry);
+        if (shared) |binding| owner_registry.sync_io = binding.io(.general);
 
-        if (config.backend != .manual) {
+        if (config.backend != .manual and shared == null) {
             if (comptime is_hostless) {
                 return error.UnsupportedPlatform;
             } else {
-                const io_impl = try initIoLane(alloc, config.lane_limits.durable_background);
+                const io_impl = try initIoLane(alloc, config.lane_limits.durable_background, if (runtime_memory) |memory| memory.stackAllocator() else null);
                 errdefer deinitIoLane(alloc, io_impl);
                 const threaded_jobs = try alloc.create(ThreadedDurableJobLane);
                 errdefer alloc.destroy(threaded_jobs);
                 threaded_jobs.* = ThreadedDurableJobLane.init(alloc, io_impl, owner_registry);
+                const recovery_alloc = runtime.controlAllocator();
+                const recovery_io = try initIoLane(recovery_alloc, threaded_io_limits.backend_runtime_recovery, if (runtime_memory) |memory| memory.controlStackAllocator() else null);
+                errdefer deinitIoLane(recovery_alloc, recovery_io);
+                threaded_jobs.recovery_io_impl = recovery_io;
                 try threaded_jobs.start();
                 errdefer threaded_jobs.deinit();
 
@@ -1103,16 +1541,32 @@ pub const BackendRuntime = struct {
         return runtime;
     }
 
+    /// Borrow only while the runtime is retained through the consumer join.
+    /// Independently started capsules retain their own node-owner lease.
+    pub fn runnableOwner(self: *const BackendRuntime) ?runnable_abi.Owner {
+        if (self.shared_execution) |binding| return binding.info.runnable_owner;
+        return if (self.runnable_owner_lease) |lease| lease.owner else null;
+    }
+
     pub fn maintenanceScheduler(self: *BackendRuntime) !*MaintenanceScheduler {
         lockAtomic(&self.lane_init_mutex);
         defer self.lane_init_mutex.unlock();
         if (self.lanes_closing) return error.BackendRuntimeShuttingDown;
         if (self.maintenance_scheduler.load(.acquire)) |scheduler| return scheduler;
+        if (self.shared_execution) |binding| {
+            const scheduler = try MaintenanceScheduler.createRemote(self.alloc, binding.io(.general), try binding.client.maintenancePort());
+            self.maintenance_scheduler.store(scheduler, .release);
+            return scheduler;
+        }
         const scheduler_io = self.io() orelse return error.MissingBackendRuntimeIo;
         // One coordinator and the durable-job reaper also use this lane.
         if (self.lane_limits.durable_background < 8) return error.InvalidMaintenanceCapacity;
         const cpu_limit = platform.process_memory.cpuCapacity().parallelism();
-        const scheduler = try MaintenanceScheduler.create(self.alloc, scheduler_io, MaintenanceScheduler.cpuLimitedCapacity(cpu_limit, @max(1, self.lane_limits.durable_background / 2)));
+        const scheduler = try MaintenanceScheduler.createWithConfig(self.alloc, scheduler_io, .{
+            .max_active = MaintenanceScheduler.cpuLimitedCapacity(cpu_limit, @max(1, self.lane_limits.durable_background / 2)),
+            .max_registrations = self.maintenance_registration_limit,
+            .runnable_owner = self.runnableOwner(),
+        });
         self.maintenance_scheduler.store(scheduler, .release);
         return scheduler;
     }
@@ -1122,6 +1576,14 @@ pub const BackendRuntime = struct {
     }
 
     pub fn deinit(self: *BackendRuntime) void {
+        var client = self.retire();
+        if (client) |*scope| scope.close() catch @panic("shared execution scope retained");
+    }
+    fn retire(self: *BackendRuntime) ?execution_services.Client {
+        // Existing execution scopes may still need mandatory cleanup and
+        // nested durable-owner drains. Join them before fencing their lanes.
+        self.execution_services_gate.close();
+        self.execution_services_gate.waitDrained(self.io());
         // Publish the activation fence before closing lease admission. A
         // caller that committed a gate acquisition just before shutdown may
         // finish against an already-published lane, but no unused executor can
@@ -1129,28 +1591,41 @@ pub const BackendRuntime = struct {
         // directions, whose callers obey the runtime lifetime contract).
         lockAtomic(&self.lane_init_mutex);
         self.lanes_closing = true;
+        const maintenance = self.maintenance_scheduler.load(.acquire);
         self.lane_init_mutex.unlock();
+        // Recurring work must close before lease draining can block shutdown.
+        // Keep its registered handles and active capacity until physical join.
+        if (maintenance) |scheduler| scheduler.closeAdmission();
         // Close every lane before waiting for any one of them. Otherwise a
         // borrower could continue entering a later lane while teardown drains
         // an earlier one. These waits are production lifetime enforcement,
         // not debug-only diagnostics: no executor is destroyed while a lease
         // can still expose its std.Io interface.
         const coordinator_io = self.io();
+        self.native_storage_pool.closeAdmission();
         self.worker_lane_gate.close();
+        self.shared_sql_gate.close();
         self.request_forward_lane_gate.close();
+        self.raft_outbound_lane_gate.close();
         self.api_lane_gate.close();
         self.inference_lane_gate.close();
         self.pdf_render_lane_gate.close();
         self.control_lane_gate.close();
         self.worker_lane_gate.waitDrained(coordinator_io);
+        self.closeSharedSqlMemory();
         self.request_forward_lane_gate.waitDrained(coordinator_io);
+        self.raft_outbound_lane_gate.waitDrained(coordinator_io);
         self.api_lane_gate.waitDrained(coordinator_io);
         self.inference_lane_gate.waitDrained(coordinator_io);
         self.pdf_render_lane_gate.waitDrained(coordinator_io);
         self.control_lane_gate.waitDrained(coordinator_io);
+        self.native_storage_pool.waitDrained();
         if (self.maintenance_scheduler.swap(null, .acq_rel)) |scheduler| scheduler.destroy();
+        if (self.shared_execution) |binding| binding.quiesce();
         if (self.threaded_jobs) |jobs| {
+            const recovery_io = jobs.recovery_io_impl;
             jobs.deinit();
+            if (recovery_io) |io_impl| deinitIoLane(self.controlAllocator(), io_impl);
             self.alloc.destroy(jobs);
             self.threaded_jobs = null;
         }
@@ -1168,16 +1643,16 @@ pub const BackendRuntime = struct {
             }
         }
         if (self.control_io_impl.swap(null, .acq_rel)) |io_impl| {
-            deinitIoLane(self.alloc, io_impl);
+            deinitIoLane(self.controlAllocator(), io_impl);
         }
         if (self.raft_outbound_io_impl.swap(null, .acq_rel)) |io_impl| {
-            deinitIoLane(self.alloc, io_impl);
+            deinitIoLane(self.raftAllocator(.outbound), io_impl);
         }
         if (self.request_forward_io_impl.swap(null, .acq_rel)) |io_impl| {
             deinitIoLane(self.alloc, io_impl);
         }
         if (self.raft_inbound_io_impl.swap(null, .acq_rel)) |io_impl| {
-            deinitIoLane(self.alloc, io_impl);
+            deinitIoLane(self.raftAllocator(.inbound), io_impl);
         }
         if (self.io_impl) |io_impl| {
             deinitIoLane(self.alloc, io_impl);
@@ -1188,10 +1663,29 @@ pub const BackendRuntime = struct {
         self.lsm_owner_clone_registry.deinit();
         self.owner_registry.deinit();
         self.alloc.destroy(self.owner_registry);
+        if (self.runnable_owner_lease) |*lease| lease.deinit();
+        if (self.owned_auxiliary_io) |io_impl| deinitIoLane(self.alloc, io_impl);
+        const client = if (self.shared_execution) |binding| binding.takeAndDestroyMetadata() else null;
+        if (self.runtime_memory) |memory| memory.destroy();
         self.* = undefined;
+        return client;
+    }
+
+    pub const ExecutionServicesRetention = struct {
+        runtime: ?*BackendRuntime,
+        pub fn release(self: *@This()) void {
+            const runtime = self.runtime orelse return;
+            self.runtime = null;
+            runtime.execution_services_gate.release(runtime.io());
+        }
+    };
+    pub fn retainExecutionServices(self: *BackendRuntime) !ExecutionServicesRetention {
+        _ = self.execution_services_gate.tryAcquire() orelse return error.BackendRuntimeShuttingDown;
+        return .{ .runtime = self };
     }
 
     pub fn io(self: *BackendRuntime) ?Io {
+        if (self.shared_execution) |binding| return binding.io(.general);
         if (self.borrowed_receivers) |*borrowed| return borrowed.general.io();
         if (comptime builtin.os.tag == .freestanding) return null;
         return if (self.io_impl) |io_impl| io_impl.io() else null;
@@ -1234,7 +1728,14 @@ pub const BackendRuntime = struct {
         runtime_io.sleep(.fromMilliseconds(@intCast(@max(ms, 1))), .awake) catch {};
     }
 
+    /// Accounting authority retained by this runtime's caller. A child scope
+    /// keeps this runtime alive until its final physical parent credit return.
+    pub fn memoryParent(self: *const BackendRuntime) ?@import("antfly_runtime_abi").memory_abi.Parent {
+        return if (self.runtime_memory) |memory| memory.parent else null;
+    }
+
     pub fn usesBorrowedIo(self: *const BackendRuntime) bool {
+        if (self.shared_execution) |binding| return binding.info.uses_borrowed_io;
         return self.borrowed_io != null;
     }
 
@@ -1245,6 +1746,7 @@ pub const BackendRuntime = struct {
     /// I/O authority for synchronous storage work. Unlike `io`, this may be
     /// caller-owned and does not imply that background scheduling is enabled.
     pub fn filesystemIo(self: *BackendRuntime) ?Io {
+        if (self.shared_execution) |binding| return binding.io(.filesystem);
         if (self.borrowed_receivers) |*borrowed| return if (self.borrowed_filesystem_receiver) |*filesystem| filesystem.io() else borrowed.general.io();
         if (comptime builtin.os.tag == .freestanding) return if (self.borrowed_filesystem_receiver) |*filesystem| filesystem.io() else null;
         return if (self.io_impl) |io_impl| io_impl.io() else if (self.borrowed_filesystem_receiver) |*filesystem| filesystem.io() else null;
@@ -1335,6 +1837,7 @@ pub const BackendRuntime = struct {
     }
 
     pub fn raftInboundIo(self: *BackendRuntime) ?Io {
+        if (self.shared_execution) |binding| return binding.io(.raft_inbound);
         if (self.borrowed_receivers) |*borrowed| return if (borrowed.raft_inbound) |*receiver| receiver.io() else borrowed.general.io();
         if (comptime builtin.os.tag == .freestanding) return null;
         return if (self.raftInboundIoImpl()) |io_impl| io_impl.io() else null;
@@ -1348,6 +1851,7 @@ pub const BackendRuntime = struct {
     }
 
     pub fn raftOutboundIo(self: *BackendRuntime) ?Io {
+        if (self.shared_execution) |binding| return binding.io(.raft_outbound);
         if (self.borrowed_receivers) |*borrowed| return if (borrowed.raft_outbound) |*receiver| receiver.io() else borrowed.general.io();
         if (comptime builtin.os.tag == .freestanding) return null;
         return if (self.raftOutboundIoImpl()) |io_impl| self.threadedNetworkIo(io_impl) else null;
@@ -1359,6 +1863,7 @@ pub const BackendRuntime = struct {
     /// accounts for completed tasks which have not retired from the executor.
     pub const RequestForwardLaneLease = struct {
         runtime: *BackendRuntime,
+        shared_lease: ?execution_services.Lease = null,
         borrowed_io: Io,
         released: bool = false,
 
@@ -1370,11 +1875,21 @@ pub const BackendRuntime = struct {
         pub fn release(self: *@This()) void {
             if (self.released) return;
             self.released = true;
+            if (self.shared_lease) |*lease| {
+                lease.release() catch @panic("shared purpose retirement");
+                self.shared_lease = null;
+            }
             self.runtime.request_forward_lane_gate.release(self.runtime.io());
         }
     };
 
     pub fn acquireRequestForwardLane(self: *BackendRuntime) !RequestForwardLaneLease {
+        if (self.shared_execution) |binding| {
+            _ = self.request_forward_lane_gate.tryAcquire() orelse return error.BackendRuntimeShuttingDown;
+            errdefer self.request_forward_lane_gate.release(self.io());
+            const lease = try binding.client.acquireIo(.request_forward);
+            return .{ .runtime = self, .borrowed_io = lease.io(), .shared_lease = lease };
+        }
         const capacity = self.lane_limits.request_forward / threaded_io_limits.request_forward_workers_per_request;
         _ = self.request_forward_lane_gate.tryAcquireBounded(capacity) orelse
             return error.RequestForwardCapacityUnavailable;
@@ -1405,6 +1920,67 @@ pub const BackendRuntime = struct {
         return .{ .runtime = self, .borrowed_io = forward_io };
     }
 
+    /// One admitted attempt reserves its entire nested HTTP task graph on the
+    /// shared Raft network owner, including tasks not yet physically retired.
+    pub const RaftOutboundLaneLease = struct {
+        runtime: *BackendRuntime,
+        shared_lease: ?execution_services.Lease = null,
+        borrowed_io: Io,
+        released: bool = false,
+
+        pub fn io(self: *const @This()) Io {
+            std.debug.assert(!self.released);
+            return self.borrowed_io;
+        }
+
+        pub fn release(self: *@This()) void {
+            if (self.released) return;
+            self.released = true;
+            if (self.shared_lease) |*lease| {
+                lease.release() catch @panic("shared purpose retirement");
+                self.shared_lease = null;
+            }
+            self.runtime.raft_outbound_lane_gate.release(self.runtime.io());
+        }
+    };
+
+    pub fn acquireRaftOutboundLane(self: *BackendRuntime) !RaftOutboundLaneLease {
+        if (self.shared_execution) |binding| {
+            _ = self.raft_outbound_lane_gate.tryAcquire() orelse return error.BackendRuntimeShuttingDown;
+            errdefer self.raft_outbound_lane_gate.release(self.io());
+            const lease = try binding.client.acquireIo(.raft_outbound);
+            return .{ .runtime = self, .borrowed_io = lease.io(), .shared_lease = lease };
+        }
+        const capacity = self.lane_limits.raft_outbound / threaded_io_limits.raft_outbound_workers_per_request;
+        _ = self.raft_outbound_lane_gate.tryAcquireBounded(capacity) orelse
+            return error.RaftOutboundCapacityUnavailable;
+        errdefer self.raft_outbound_lane_gate.release(self.io());
+        const outbound_io = if (self.borrowed_receivers) |*borrowed|
+            if (borrowed.raft_outbound) |*receiver| receiver.io() else borrowed.general.io()
+        else if (comptime builtin.os.tag == .freestanding)
+            return error.BackendRuntimeUnavailable
+        else if (self.backend == .manual)
+            if (self.io_impl) |impl| self.threadedNetworkIo(impl) else return error.BackendRuntimeUnavailable
+        else blk: {
+            const impl = self.ensureSpecializedIoLane(&self.raft_outbound_io_impl, self.lane_limits.raft_outbound) orelse
+                return error.BackendRuntimeUnavailable;
+            // Group/Future completion precedes Threaded's busy-count release.
+            // Count every still-busy task, including those whose request lease
+            // has already gone away, plus the full future demand of all leases.
+            // This deliberately overcounts already-submitted work: observing
+            // spare capacity must not steal a sibling's as-yet-unused grant.
+            // No waiting, task submission, or transport occurs under this lock.
+            const sync_io = Io.Threaded.global_single_threaded.io();
+            impl.mutex.lockUncancelable(sync_io);
+            const remaining = @backingInt(impl.concurrent_limit) -| impl.busy_count;
+            const reserved = self.raft_outbound_lane_gate.active() * threaded_io_limits.raft_outbound_workers_per_request;
+            impl.mutex.unlock(sync_io);
+            if (reserved > remaining) return error.RaftOutboundCapacityUnavailable;
+            break :blk self.threadedNetworkIo(impl);
+        };
+        return .{ .runtime = self, .borrowed_io = outbound_io };
+    }
+
     pub fn raftOutboundIoImpl(self: *BackendRuntime) ?*IoImpl {
         if (self.borrowed_io != null) return null;
         if (comptime builtin.os.tag == .freestanding) return null;
@@ -1429,15 +2005,28 @@ pub const BackendRuntime = struct {
         defer self.lane_init_mutex.unlock();
         if (self.lanes_closing) return null;
         if (slot.load(.acquire)) |io_impl| return io_impl;
-        const io_impl = initIoLane(self.alloc, concurrent_limit) catch return null;
+        const direction: ?RuntimeMemory.Owner.RaftDirection = if (slot == &self.raft_inbound_io_impl) .inbound else if (slot == &self.raft_outbound_io_impl) .outbound else null;
+        const control = slot == &self.control_io_impl;
+        const allocator = if (control) self.controlAllocator() else if (direction) |d| self.raftAllocator(d) else self.alloc;
+        const stack_allocator = if (self.runtime_memory) |memory| if (control) memory.controlStackAllocator() else if (direction) |d| memory.raftStackAllocator(d) else memory.stackAllocator() else null;
+        const io_impl = initIoLane(allocator, concurrent_limit, stack_allocator) catch return null;
         slot.store(io_impl, .release);
         return io_impl;
+    }
+
+    fn raftAllocator(self: *BackendRuntime, direction: RuntimeMemory.Owner.RaftDirection) Allocator {
+        return if (self.runtime_memory) |memory| memory.raftAllocator(direction) else self.alloc;
+    }
+
+    fn controlAllocator(self: *BackendRuntime) Allocator {
+        return if (self.runtime_memory) |memory| memory.controlAllocator() else self.alloc;
     }
 
     /// Returns the API executor interface without exposing its implementation.
     /// Components own and await the tasks they submit; BackendRuntime only owns
     /// the executor lane and must outlive every borrower.
     pub fn apiIo(self: *BackendRuntime) ?Io {
+        if (self.shared_execution) |binding| return binding.io(.api);
         if (self.borrowed_receivers) |*borrowed| return if (borrowed.api) |*receiver| receiver.io() else borrowed.general.io();
         const io_impl = self.apiIoImpl() orelse return null;
         return io_impl.io();
@@ -1448,6 +2037,7 @@ pub const BackendRuntime = struct {
     /// the native Threaded contract, while HTTP transports require bounded,
     /// cancellation-safe connect completion.
     pub fn apiNetworkIo(self: *BackendRuntime) ?Io {
+        if (self.shared_execution) |binding| return binding.io(.api_network);
         if (self.borrowed_receivers) |*borrowed| return if (borrowed.api) |*receiver| receiver.io() else borrowed.general.io();
         const io_impl = self.apiIoImpl() orelse return null;
         return self.threadedNetworkIo(io_impl);
@@ -1459,6 +2049,7 @@ pub const BackendRuntime = struct {
     /// the transport reader's `ReadFailed` classification instead of the OS
     /// path error.
     pub fn apiFilesystemIo(self: *BackendRuntime) ?Io {
+        if (self.shared_execution) |binding| return binding.io(.api_filesystem);
         if (self.borrowed_receivers) |*borrowed| return if (borrowed.api) |*receiver| receiver.io() else borrowed.general.io();
         const io_impl = self.apiIoImpl() orelse return null;
         return io_impl.io();
@@ -1466,6 +2057,7 @@ pub const BackendRuntime = struct {
 
     pub const ApiLaneLease = struct {
         runtime: *BackendRuntime,
+        shared_lease: ?execution_services.Lease = null,
         borrowed_io: Io,
         concurrent_capacity: u32,
         released: bool = false,
@@ -1483,6 +2075,10 @@ pub const BackendRuntime = struct {
         pub fn release(self: *ApiLaneLease) void {
             if (self.released) return;
             self.released = true;
+            if (self.shared_lease) |*lease| {
+                lease.release() catch @panic("shared purpose retirement");
+                self.shared_lease = null;
+            }
             self.runtime.api_lane_gate.release(self.runtime.io());
         }
     };
@@ -1490,6 +2086,12 @@ pub const BackendRuntime = struct {
     /// Acquires an explicit lifetime lease for the API executor lane. The
     /// caller must stop and await every submitted task before releasing it.
     pub fn acquireApiLane(self: *BackendRuntime) !ApiLaneLease {
+        if (self.shared_execution) |binding| {
+            _ = self.api_lane_gate.tryAcquire() orelse return error.BackendRuntimeShuttingDown;
+            errdefer self.api_lane_gate.release(self.io());
+            const lease = try binding.client.acquireIo(.api);
+            return .{ .runtime = self, .borrowed_io = lease.io(), .shared_lease = lease, .concurrent_capacity = @intCast(lease.capacity()) };
+        }
         const leases = self.api_lane_gate.tryAcquire() orelse {
             _ = self.api_lane_rejections_total.fetchAdd(1, .monotonic);
             return error.BackendRuntimeShuttingDown;
@@ -1505,6 +2107,11 @@ pub const BackendRuntime = struct {
         };
     }
 
+    /// Includes every admitted forwarding task until its physical I/O joins.
+    pub fn outstandingRequestForwardLeases(self: *const BackendRuntime) usize {
+        return self.request_forward_lane_gate.active();
+    }
+
     pub fn outstandingApiLeases(self: *const BackendRuntime) usize {
         return self.api_lane_gate.active();
     }
@@ -1513,6 +2120,7 @@ pub const BackendRuntime = struct {
     /// fan-out. A lifetime lease is required because the linked inference
     /// archive retains a copy of the interface until its node is destroyed.
     pub fn inferenceIo(self: *BackendRuntime) ?Io {
+        if (self.shared_execution) |binding| return binding.io(.inference);
         if (self.borrowed_receivers) |*borrowed| return if (borrowed.inference) |*receiver| receiver.io() else borrowed.general.io();
         if (comptime builtin.os.tag == .freestanding) return null;
         const io_impl = if (self.backend == .manual)
@@ -1524,6 +2132,7 @@ pub const BackendRuntime = struct {
 
     pub const InferenceLaneLease = struct {
         runtime: *BackendRuntime,
+        shared_lease: ?execution_services.Lease = null,
         borrowed_io: Io,
         concurrent_capacity: u32,
         released: bool = false,
@@ -1541,11 +2150,21 @@ pub const BackendRuntime = struct {
         pub fn release(self: *InferenceLaneLease) void {
             if (self.released) return;
             self.released = true;
+            if (self.shared_lease) |*lease| {
+                lease.release() catch @panic("shared purpose retirement");
+                self.shared_lease = null;
+            }
             self.runtime.inference_lane_gate.release(self.runtime.io());
         }
     };
 
     pub fn acquireInferenceLane(self: *BackendRuntime) !InferenceLaneLease {
+        if (self.shared_execution) |binding| {
+            _ = self.inference_lane_gate.tryAcquire() orelse return error.BackendRuntimeShuttingDown;
+            errdefer self.inference_lane_gate.release(self.io());
+            const lease = try binding.client.acquireIo(.inference);
+            return .{ .runtime = self, .borrowed_io = lease.io(), .shared_lease = lease, .concurrent_capacity = @intCast(lease.capacity()) };
+        }
         const leases = self.inference_lane_gate.tryAcquire() orelse {
             _ = self.inference_lane_rejections_total.fetchAdd(1, .monotonic);
             return error.BackendRuntimeShuttingDown;
@@ -1590,6 +2209,8 @@ pub const BackendRuntime = struct {
         ) catch return null;
         const executor = bounded_worker_lane.Executor.create(self.alloc, .{
             .worker_count = worker_count,
+            .worker_stack_allocator = if (std.Thread.use_pthreads) (if (self.runtime_memory) |memory| memory.stackAllocator() else std.heap.page_allocator) else null,
+            .scratch_allocator = if (self.runtime_memory) |memory| memory.pageAllocator() else std.heap.page_allocator,
             .queue_capacity = worker_count * 2,
             .max_scratch_bytes = physical_scratch_limit,
             .retained_scratch_bytes_per_worker = threaded_io_limits.pdf_render_retained_scratch_bytes_per_worker,
@@ -1603,15 +2224,18 @@ pub const BackendRuntime = struct {
     /// with thread-confined scratch reset after each job.
     pub const PdfRenderLaneLease = struct {
         runtime: *BackendRuntime,
-        borrowed_executor: *bounded_worker_lane.Executor,
+        borrowed_executor: ?*bounded_worker_lane.Executor,
+        shared_lease: ?execution_services.Lease = null,
         released: bool = false,
 
         pub fn executor(self: *const PdfRenderLaneLease) *bounded_worker_lane.Executor {
             std.debug.assert(!self.released);
-            return self.borrowed_executor;
+            std.debug.assert(self.shared_lease == null);
+            return self.borrowed_executor.?;
         }
 
         pub fn concurrentCapacity(self: *const PdfRenderLaneLease) usize {
+            if (self.shared_lease) |*lease| return lease.capacity();
             return self.executor().concurrentCapacity();
         }
 
@@ -1619,6 +2243,7 @@ pub const BackendRuntime = struct {
         /// the lease and must not escape it. Per-window scratch is clamped to
         /// the runtime policy even when a caller supplies a larger PDF option.
         pub fn pageExecutor(self: *const PdfRenderLaneLease) pdf.PageRenderExecutor {
+            if (self.shared_lease) |*lease| return lease.pageExecutor();
             return .{
                 .ptr = self.executor(),
                 .concurrent_capacity = self.concurrentCapacity(),
@@ -1644,11 +2269,21 @@ pub const BackendRuntime = struct {
         pub fn release(self: *PdfRenderLaneLease) void {
             if (self.released) return;
             self.released = true;
+            if (self.shared_lease) |*lease| {
+                lease.release() catch @panic("shared PDF retirement");
+                self.shared_lease = null;
+            }
             self.runtime.pdf_render_lane_gate.release(self.runtime.io());
         }
     };
 
     pub fn acquirePdfRenderLane(self: *BackendRuntime) !PdfRenderLaneLease {
+        if (self.shared_execution) |binding| {
+            _ = self.pdf_render_lane_gate.tryAcquire() orelse return error.BackendRuntimeShuttingDown;
+            errdefer self.pdf_render_lane_gate.release(self.io());
+            const lease = try binding.client.acquirePdf();
+            return .{ .runtime = self, .borrowed_executor = null, .shared_lease = lease };
+        }
         const leases = self.pdf_render_lane_gate.tryAcquire() orelse {
             _ = self.pdf_render_lane_rejections_total.fetchAdd(1, .monotonic);
             return error.BackendRuntimeShuttingDown;
@@ -1665,6 +2300,7 @@ pub const BackendRuntime = struct {
     }
 
     pub fn pdfRenderExecutorStats(self: *const BackendRuntime) ?bounded_worker_lane.Stats {
+        if (self.shared_execution) |binding| return binding.client.pdfStats() catch @panic("shared PDF stats contract");
         const executor = self.pdf_render_executor.load(.acquire) orelse return null;
         return executor.snapshotStats();
     }
@@ -1673,6 +2309,7 @@ pub const BackendRuntime = struct {
     /// coordination. It is intentionally isolated from public API work so
     /// overload cannot consume the runtime's last observable control path.
     pub fn controlIo(self: *BackendRuntime) ?Io {
+        if (self.shared_execution) |binding| return binding.io(.control);
         if (self.borrowed_receivers) |*borrowed| return if (borrowed.control) |*receiver| receiver.io() else borrowed.general.io();
         if (comptime builtin.os.tag == .freestanding) return null;
         const io_impl = if (self.backend == .manual)
@@ -1684,6 +2321,7 @@ pub const BackendRuntime = struct {
 
     pub const ControlLaneLease = struct {
         runtime: *BackendRuntime,
+        shared_lease: ?execution_services.Lease = null,
         borrowed_io: Io,
         concurrent_capacity: u32,
         released: bool = false,
@@ -1701,11 +2339,21 @@ pub const BackendRuntime = struct {
         pub fn release(self: *ControlLaneLease) void {
             if (self.released) return;
             self.released = true;
+            if (self.shared_lease) |*lease| {
+                lease.release() catch @panic("shared purpose retirement");
+                self.shared_lease = null;
+            }
             self.runtime.control_lane_gate.release(self.runtime.io());
         }
     };
 
     pub fn acquireControlLane(self: *BackendRuntime) !ControlLaneLease {
+        if (self.shared_execution) |binding| {
+            _ = self.control_lane_gate.tryAcquire() orelse return error.BackendRuntimeShuttingDown;
+            errdefer self.control_lane_gate.release(self.io());
+            const lease = try binding.client.acquireIo(.control);
+            return .{ .runtime = self, .borrowed_io = lease.io(), .shared_lease = lease, .concurrent_capacity = @intCast(lease.capacity()) };
+        }
         const leases = self.control_lane_gate.tryAcquire() orelse {
             _ = self.control_lane_rejections_total.fetchAdd(1, .monotonic);
             return error.BackendRuntimeShuttingDown;
@@ -1728,6 +2376,12 @@ pub const BackendRuntime = struct {
     pub const WorkerOptions = struct {
         capacity: usize = 1,
         stack_size: usize = (Io.Threaded.InitOptions{}).stack_size,
+        /// Exclusive caller-owned metadata funding. The allocator context must
+        /// remain alive through executor deinit and the physical worker join.
+        allocator: ?Allocator = null,
+        /// Page-mapping authority, distinct from task/metadata funding. The
+        /// allocator must unmap protected pages without dereferencing them.
+        stack_allocator: ?Allocator = null,
     };
 
     /// An exclusive scheduling lane, separate from request and durable-job
@@ -1735,11 +2389,16 @@ pub const BackendRuntime = struct {
     /// accounts for every reserved slot. The owner must stop/wake and join all
     /// users before release; runtime deinit closes admission and waits for it.
     /// Pass only io() to leaf components, never the database runtime itself.
+    const WorkerPool = enum { service, shared_sql };
+
     pub const WorkerLease = struct {
         runtime: ?*BackendRuntime = null,
+        shared_lease: ?execution_services.Lease = null,
         io_impl: ?*IoImpl = null,
         borrowed_io: ?Io = null,
         capacity: usize,
+        pool: WorkerPool = .service,
+        allocator: ?Allocator = null,
 
         pub fn io(self: *const WorkerLease) Io {
             std.debug.assert(self.runtime != null);
@@ -1750,48 +2409,301 @@ pub const BackendRuntime = struct {
 
         pub fn release(self: *WorkerLease) void {
             const runtime = self.runtime orelse return;
-            if (self.io_impl) |io_impl| deinitIoLane(runtime.alloc, io_impl);
+            if (self.shared_lease) |*lease| {
+                lease.release() catch @panic("shared worker retirement");
+                self.shared_lease = null;
+                self.runtime = null;
+                runtime.worker_lane_gate.release(runtime.io());
+                return;
+            }
+            if (self.io_impl) |io_impl| deinitIoLane(self.allocator orelse runtime.alloc, io_impl);
             _ = runtime.reserved_workers.fetchSub(self.capacity, .acq_rel);
+            _ = runtime.workerReservations(self.pool).fetchSub(self.capacity, .acq_rel);
             self.runtime = null;
             runtime.worker_lane_gate.release(runtime.io());
         }
     };
 
+    pub const SharedSqlRole = SqlWorkerMemory.Role;
+    fn createSharedSqlMemory(alloc: Allocator, parent: @import("antfly_runtime_abi").memory_abi.Parent, limits: SqlWorkerMemory.Limits, capacity: usize) !*SqlWorkerMemory.Bank {
+        inline for (std.meta.tags(SharedSqlRole)) |role| {
+            if (limits.get(role) < @sizeOf(IoImpl)) return error.InvalidWorkerMemoryLimit;
+        }
+        var stacks: SqlWorkerMemory.StackLimits = .{};
+        if (comptime std.Thread.use_pthreads and !is_hostless) {
+            const mapping = try Io.Threaded.workerStackMappingSize((Io.Threaded.InitOptions{}).stack_size);
+            stacks = .{
+                .execution = std.math.mul(usize, mapping, sqlCapacity(capacity, .execution)) catch return error.InvalidWorkerMemoryLimit,
+                .control = std.math.mul(usize, mapping, sqlCapacity(capacity, .control)) catch return error.InvalidWorkerMemoryLimit,
+                .cleanup = std.math.mul(usize, mapping, sqlCapacity(capacity, .cleanup)) catch return error.InvalidWorkerMemoryLimit,
+                .bounded_read = std.math.mul(usize, mapping, sqlCapacity(capacity, .bounded_read)) catch return error.InvalidWorkerMemoryLimit,
+            };
+        }
+        return SqlWorkerMemory.Bank.createWithStacks(platform.allocator.processAllocator(alloc), parent, limits, stacks);
+    }
+    /// Late installation supports a storage parent created after the runtime.
+    /// Changing the parent/floors after any shared capability attempt is refused.
+    pub fn installSharedSqlMemory(self: *BackendRuntime, parent: @import("antfly_runtime_abi").memory_abi.Parent, limits: SqlWorkerMemory.Limits) !void {
+        if (self.shared_execution) |binding| return binding.client.installSql(parent, limits);
+        lockAtomic(&self.shared_sql_memory_mutex);
+        defer self.shared_sql_memory_mutex.unlock();
+        if (self.shared_sql_started) return error.SharedSqlMemoryAlreadyPublished;
+        if (self.shared_sql_memory != null) return error.SharedSqlMemoryAlreadyInstalled;
+        // A gate acquisition fences concurrent close while installing metadata.
+        _ = self.shared_sql_gate.tryAcquire() orelse return error.BackendRuntimeShuttingDown;
+        defer self.shared_sql_gate.release(self.io());
+        self.shared_sql_memory = try createSharedSqlMemory(if (self.runtime_memory) |memory| memory.backing else self.alloc, parent, limits, if (self.borrowed_io != null or self.io() == null) 0 else self.lane_limits.sql_worker_capacity);
+    }
+    /// Only shared SQL admission closes here. Other runtime lanes remain usable
+    /// by a storage context that must close after its memory children retire.
+    pub fn closeSharedSqlMemory(self: *BackendRuntime) void {
+        self.shared_sql_gate.close();
+        self.shared_sql_gate.waitDrained(self.io());
+        if (self.shared_execution != null) return;
+        lockAtomic(&self.shared_sql_memory_mutex);
+        defer self.shared_sql_memory_mutex.unlock();
+        const memory = self.shared_sql_memory;
+        self.shared_sql_memory = null;
+        if (memory) |bank| bank.destroy();
+    }
+    pub fn sharedSqlMemoryStats(self: *BackendRuntime, role: SharedSqlRole) ?SqlWorkerMemory.Bank.Stats {
+        if (self.shared_execution) |binding| return binding.client.sqlMemory(role, false) catch @panic("shared SQL memory contract");
+        lockAtomic(&self.shared_sql_memory_mutex);
+        defer self.shared_sql_memory_mutex.unlock();
+        return if (self.shared_sql_memory) |memory| memory.stats(role) else null;
+    }
+    pub fn sharedSqlStackStats(self: *BackendRuntime, role: SharedSqlRole) ?SqlWorkerMemory.Bank.Stats {
+        if (self.shared_execution) |binding| return binding.client.sqlMemory(role, true) catch @panic("shared SQL stack contract");
+        lockAtomic(&self.shared_sql_memory_mutex);
+        defer self.shared_sql_memory_mutex.unlock();
+        return if (self.shared_sql_memory) |memory| memory.stackStats(role) else null;
+    }
+    const SharedSqlPool = struct {
+        mutex: std.atomic.Mutex = .unlocked,
+        workers: ?WorkerLease = null,
+        borrowers: usize = 0,
+        retiring: bool = false,
+        peak_borrowers: usize = 0,
+        acquisitions_total: u64 = 0,
+        rejections_total: std.atomic.Value(u64) = .init(0),
+    };
+    pub const SharedSqlStats = struct {
+        capacity: usize,
+        retained_capacity: usize,
+        borrowers: usize,
+        peak_borrowers: usize,
+        retiring: bool,
+        acquisitions_total: u64,
+        rejections_total: u64,
+    };
+    fn sharedSqlCapacity(self: *const BackendRuntime, role: SharedSqlRole) usize {
+        if (self.borrowed_io != null) return 0;
+        return sqlCapacity(self.lane_limits.sql_worker_capacity, role);
+    }
+    fn sqlCapacity(capacity: usize, role: SharedSqlRole) usize {
+        if (capacity < 10) return 0;
+        return switch (role) {
+            .execution => (capacity / 2) -| 4,
+            .control => 5,
+            .cleanup => capacity / 4,
+            .bounded_read => 1,
+        };
+    }
+    /// Each role is sampled under its mutex. Different roles and the aggregate
+    /// worker counters are independent observations, not a transactional view.
+    pub fn sharedSqlStats(self: *const BackendRuntime, role: SharedSqlRole) SharedSqlStats {
+        if (self.shared_execution) |binding| return binding.client.sqlStats(role) catch @panic("shared SQL stats contract");
+        const pool = &@constCast(self).shared_sql_workers[@backingInt(role)];
+        lockAtomic(&pool.mutex);
+        defer pool.mutex.unlock();
+        const capacity = self.sharedSqlCapacity(role);
+        return .{
+            .capacity = capacity,
+            // Retirement still owns the executor until its physical join and
+            // all role bookkeeping have completed, even with zero borrowers.
+            .retained_capacity = if (pool.workers != null or pool.retiring) capacity else 0,
+            .borrowers = pool.borrowers,
+            .peak_borrowers = pool.peak_borrowers,
+            .retiring = pool.retiring,
+            .acquisitions_total = pool.acquisitions_total,
+            .rejections_total = pool.rejections_total.load(.monotonic),
+        };
+    }
+    pub const SharedSqlLease = struct {
+        runtime: ?*BackendRuntime,
+        shared_lease: ?execution_services.Lease = null,
+        role: SharedSqlRole,
+        capacity: usize,
+        executor_io: Io,
+        pub fn io(self: *const SharedSqlLease) Io {
+            return self.executor_io;
+        }
+        /// Each consumer joins its submissions before release. Peers retain
+        /// the shared executor; the final release physically joins it.
+        pub fn release(self: *SharedSqlLease) void {
+            const runtime = self.runtime orelse return;
+            if (self.shared_lease) |*lease| {
+                lease.release() catch @panic("shared SQL retirement");
+                self.shared_lease = null;
+                self.runtime = null;
+                runtime.worker_lane_gate.release(runtime.io());
+                runtime.shared_sql_gate.release(runtime.io());
+                return;
+            }
+            const pool = &runtime.shared_sql_workers[@backingInt(self.role)];
+            lockAtomic(&pool.mutex);
+            std.debug.assert(pool.borrowers != 0);
+            pool.borrowers -= 1;
+            var retired: ?WorkerLease = null;
+            if (pool.borrowers == 0) {
+                pool.retiring = true;
+                retired = pool.workers;
+                pool.workers = null;
+            }
+            pool.mutex.unlock();
+            // Keep this borrower's runtime gate until all pool bookkeeping is
+            // complete, even after the physical executor's gate is released.
+            if (retired) |*workers| {
+                workers.release();
+                lockAtomic(&pool.mutex);
+                pool.retiring = false;
+                pool.mutex.unlock();
+            }
+            self.runtime = null;
+            runtime.worker_lane_gate.release(runtime.io());
+            runtime.shared_sql_gate.release(runtime.io());
+        }
+    };
+    pub fn acquireSharedSqlWorkers(self: *BackendRuntime, role: SharedSqlRole, minimum: usize) !SharedSqlLease {
+        if (self.shared_execution) |binding| {
+            _ = self.shared_sql_gate.tryAcquire() orelse return error.BackendRuntimeShuttingDown;
+            errdefer self.shared_sql_gate.release(self.io());
+            _ = self.worker_lane_gate.tryAcquire() orelse return error.BackendRuntimeShuttingDown;
+            errdefer self.worker_lane_gate.release(self.io());
+            const lease = try binding.client.acquireSql(role, minimum);
+            return .{ .runtime = self, .role = role, .capacity = lease.capacity(), .executor_io = lease.io(), .shared_lease = lease };
+        }
+        const pool = &self.shared_sql_workers[@backingInt(role)];
+        _ = self.shared_sql_gate.tryAcquire() orelse {
+            _ = pool.rejections_total.fetchAdd(1, .monotonic);
+            return error.BackendRuntimeShuttingDown;
+        };
+        errdefer self.shared_sql_gate.release(self.io());
+        lockAtomic(&self.shared_sql_memory_mutex);
+        self.shared_sql_started = true;
+        const allocator = if (self.shared_sql_memory) |memory| memory.allocator(role) else self.alloc;
+        const stack_allocator = if (self.shared_sql_memory) |memory| memory.stackAllocator(role) else null;
+        self.shared_sql_memory_mutex.unlock();
+        if (self.borrowed_io != null or self.lane_limits.sql_worker_capacity < 10) {
+            _ = pool.rejections_total.fetchAdd(1, .monotonic);
+            return error.BackendRuntimeUnavailable;
+        }
+        const capacity = self.sharedSqlCapacity(role);
+        if (minimum == 0 or minimum > capacity) {
+            _ = pool.rejections_total.fetchAdd(1, .monotonic);
+            return error.InvalidWorkerCapacity;
+        }
+        _ = self.worker_lane_gate.tryAcquire() orelse {
+            _ = pool.rejections_total.fetchAdd(1, .monotonic);
+            return error.BackendRuntimeShuttingDown;
+        };
+        errdefer self.worker_lane_gate.release(self.io());
+        errdefer _ = pool.rejections_total.fetchAdd(1, .monotonic);
+        lockAtomic(&pool.mutex);
+        defer pool.mutex.unlock();
+        if (pool.retiring) return error.WorkerCapacityExceeded;
+        if (pool.workers == null) pool.workers = try self.acquireWorkersInPool(.{ .capacity = capacity, .allocator = allocator, .stack_allocator = stack_allocator }, .shared_sql);
+        pool.borrowers += 1;
+        pool.peak_borrowers = @max(pool.peak_borrowers, pool.borrowers);
+        pool.acquisitions_total +|= 1;
+        return .{ .runtime = self, .role = role, .capacity = capacity, .executor_io = pool.workers.?.io() };
+    }
+
+    fn workerReservations(self: *BackendRuntime, pool: WorkerPool) *std.atomic.Value(usize) {
+        return switch (pool) {
+            .service => &self.reserved_service_workers,
+            .shared_sql => &self.reserved_sql_workers,
+        };
+    }
+
     pub fn acquireWorkers(self: *BackendRuntime, options: WorkerOptions) !WorkerLease {
+        if (self.shared_execution) |binding| {
+            _ = self.worker_lane_gate.tryAcquire() orelse return error.BackendRuntimeShuttingDown;
+            errdefer self.worker_lane_gate.release(self.io());
+            const lease = try binding.client.acquireWorkers(options);
+            return .{ .runtime = self, .borrowed_io = lease.io(), .capacity = lease.capacity(), .shared_lease = lease };
+        }
+        return self.acquireWorkersInPool(options, .service);
+    }
+
+    fn acquireWorkersInPool(self: *BackendRuntime, options: WorkerOptions, pool: WorkerPool) !WorkerLease {
         if (comptime builtin.os.tag == .freestanding) return error.BackendRuntimeUnavailable;
         _ = self.worker_lane_gate.tryAcquire() orelse return error.BackendRuntimeShuttingDown;
         errdefer self.worker_lane_gate.release(self.io());
         if (self.io() == null) return error.BackendRuntimeUnavailable;
         if (options.capacity == 0) return error.InvalidWorkerCapacity;
-        var reserved = self.reserved_workers.load(.acquire);
+        if (comptime std.Thread.use_pthreads) {
+            if (self.borrowed_io == null) _ = Io.Threaded.workerStackMappingSize(options.stack_size) catch return error.InvalidWorkerStackSize;
+        }
+        const reservations = self.workerReservations(pool);
+        const ceiling = switch (pool) {
+            .service => self.lane_limits.worker_capacity,
+            .shared_sql => self.lane_limits.sql_worker_capacity,
+        };
+        var reserved = reservations.load(.acquire);
         while (true) {
-            if (options.capacity > self.lane_limits.worker_capacity -| reserved) return error.WorkerCapacityExceeded;
-            if (self.reserved_workers.cmpxchgWeak(reserved, reserved + options.capacity, .acq_rel, .acquire)) |actual| {
+            if (options.capacity > ceiling -| reserved) return error.WorkerCapacityExceeded;
+            if (reservations.cmpxchgWeak(reserved, reserved + options.capacity, .acq_rel, .acquire)) |actual| {
                 reserved = actual;
             } else break;
         }
+        errdefer _ = reservations.fetchSub(options.capacity, .acq_rel);
+        const aggregate = self.reserved_workers.fetchAdd(options.capacity, .acq_rel) + options.capacity;
         errdefer _ = self.reserved_workers.fetchSub(options.capacity, .acq_rel);
         if (self.borrowed_io != null) {
-            updateAtomicMax(&self.peak_reserved_workers, reserved + options.capacity);
-            return .{ .runtime = self, .borrowed_io = self.io().?, .capacity = options.capacity };
+            updateAtomicMax(&self.peak_reserved_workers, aggregate);
+            return .{ .runtime = self, .borrowed_io = self.io().?, .capacity = options.capacity, .pool = pool };
         }
-        const io_impl = try self.alloc.create(IoImpl);
-        io_impl.* = Io.Threaded.init(self.alloc, .{
+        const allocator = options.allocator orelse self.alloc;
+        const io_impl = try allocator.create(IoImpl);
+        io_impl.* = initOwnedThreaded(allocator, .{
             .stack_size = options.stack_size,
+            .worker_stack_allocator = if (std.Thread.use_pthreads) options.stack_allocator orelse (if (self.runtime_memory) |memory| memory.stackAllocator() else null) else null,
             .async_limit = .nothing,
             .concurrent_limit = .limited(options.capacity),
         });
-        updateAtomicMax(&self.peak_reserved_workers, reserved + options.capacity);
-        return .{ .runtime = self, .io_impl = io_impl, .capacity = options.capacity };
+        updateAtomicMax(&self.peak_reserved_workers, aggregate);
+        return .{ .runtime = self, .io_impl = io_impl, .capacity = options.capacity, .allocator = allocator, .pool = pool };
+    }
+
+    pub const RuntimeMemoryStats = struct {
+        heap: RuntimeMemory.Owner.Stats,
+        stacks: RuntimeMemory.Owner.Stats,
+        scratch: RuntimeMemory.Owner.Stats,
+        control_heap: RuntimeMemory.Owner.Stats,
+        control_stacks: RuntimeMemory.Owner.Stats,
+        control_reserved_bytes: usize,
+        raft_inbound: RuntimeMemory.Owner.ExecutorStats,
+        raft_outbound: RuntimeMemory.Owner.ExecutorStats,
+    };
+    pub fn runtimeMemoryStats(self: *const BackendRuntime) ?RuntimeMemoryStats {
+        if (self.shared_execution) |binding| return binding.client.memoryStats() catch @panic("shared memory stats contract");
+        const memory = self.runtime_memory orelse return null;
+        return .{ .heap = memory.heapStats(), .stacks = memory.stackStats(), .scratch = memory.pageStats(), .control_heap = memory.controlHeapStats(), .control_stacks = memory.controlStackStats(), .control_reserved_bytes = memory.controlReservedBytes(), .raft_inbound = memory.raftStats(.inbound), .raft_outbound = memory.raftStats(.outbound) };
     }
 
     pub const LaneStats = struct {
         limits: threaded_io_limits.BackendRuntimeLaneLimits,
         maintenance: ?MaintenanceScheduler.Stats,
         worker_capacity: usize,
+        sql_worker_capacity: usize,
+        reserved_service_workers: usize,
+        reserved_sql_workers: usize,
         reserved_workers: usize,
         peak_reserved_workers: usize,
         worker_active_leases: usize,
+        raft_outbound_active_leases: usize,
+        raft_outbound_request_capacity: usize,
         api_active_leases: usize,
         api_peak_leases: usize,
         api_acquisitions_total: u64,
@@ -1812,13 +2724,19 @@ pub const BackendRuntime = struct {
     };
 
     pub fn laneStats(self: *const BackendRuntime) LaneStats {
+        if (self.shared_execution) |binding| return binding.client.stats() catch @panic("shared lane stats contract");
         return .{
             .limits = self.lane_limits,
             .maintenance = if (self.maintenance_scheduler.load(.acquire)) |scheduler| scheduler.snapshot() else null,
             .worker_capacity = self.lane_limits.worker_capacity,
+            .sql_worker_capacity = self.lane_limits.sql_worker_capacity,
+            .reserved_service_workers = self.reserved_service_workers.load(.acquire),
+            .reserved_sql_workers = self.reserved_sql_workers.load(.acquire),
             .reserved_workers = self.reserved_workers.load(.acquire),
             .peak_reserved_workers = self.peak_reserved_workers.load(.acquire),
             .worker_active_leases = self.worker_lane_gate.active(),
+            .raft_outbound_active_leases = self.raft_outbound_lane_gate.active(),
+            .raft_outbound_request_capacity = self.lane_limits.raft_outbound / threaded_io_limits.raft_outbound_workers_per_request,
             .api_active_leases = self.api_lane_gate.active(),
             .api_peak_leases = self.api_lane_peak_leases.load(.acquire),
             .api_acquisitions_total = self.api_lane_acquisitions_total.load(.acquire),
@@ -1848,6 +2766,7 @@ pub const BackendRuntime = struct {
     }
 
     pub fn allocOwnerId(self: *BackendRuntime) !u64 {
+        if (self.shared_execution) |binding| return binding.client.allocOwnerId();
         while (true) {
             const owner_id = self.next_owner_id.fetchAdd(1, .monotonic);
             if (owner_id == 0) continue;
@@ -1857,10 +2776,15 @@ pub const BackendRuntime = struct {
     }
 
     pub fn armOwnerMaintenanceProbe(self: *BackendRuntime, owner_id: u64, probe: OwnerMaintenanceProbe) !void {
+        if (self.shared_execution) |binding| return binding.client.armProbe(owner_id, probe);
         try self.owner_registry.armMaintenanceProbe(owner_id, probe);
     }
 
     pub fn disarmOwnerMaintenanceProbe(self: *BackendRuntime, owner_id: u64) void {
+        if (self.shared_execution) |binding| {
+            binding.client.disarmProbe(owner_id) catch @panic("shared probe retirement");
+            return;
+        }
         self.owner_registry.disarmMaintenanceProbe(owner_id);
     }
 };
@@ -1873,51 +2797,65 @@ pub const BackendRuntimeHandle = struct {
     /// runtime handoff atomic and prevents callers from preserving one while
     /// accidentally destroying the other.
     owned_filesystem_io: ?*IoImpl = null,
+    memory_parent: ?@import("antfly_runtime_abi").memory_abi.Parent = null,
 
     pub fn init(alloc: Allocator, config: Config) !BackendRuntimeHandle {
+        if (config.memory_parent) |parent| {
+            if (!parent.valid()) return error.UnsupportedVersion;
+            if (!parent.reserve_fn(parent.ptr, @sizeOf(BackendRuntime))) return error.ResourceBudgetExceeded;
+        }
+        errdefer if (config.memory_parent) |parent| parent.release_fn(parent.ptr, @sizeOf(BackendRuntime));
         const runtime = try alloc.create(BackendRuntime);
         errdefer alloc.destroy(runtime);
         runtime.* = try BackendRuntime.init(alloc, config);
         return .{
             .alloc = alloc,
             .runtime = runtime,
+            .memory_parent = config.memory_parent,
         };
     }
 
     /// Manual storage scheduling with host I/O for request-local inference.
     /// The caller drives publication; this runtime starts no durable worker.
     pub fn initManualWithOwnedIo(alloc: Allocator) !BackendRuntimeHandle {
+        return initManualWithOwnedIoAndParent(alloc, null);
+    }
+    pub fn initManualWithOwnedIoAndParent(alloc: Allocator, parent: ?@import("antfly_runtime_abi").memory_abi.Parent) !BackendRuntimeHandle {
+        return initManualOwnedAuthority(alloc, parent, true);
+    }
+    pub fn initManualWithOwnedFilesystemIo(alloc: Allocator) !BackendRuntimeHandle {
+        return initManualWithOwnedFilesystemIoAndParent(alloc, null);
+    }
+    pub fn initManualWithOwnedFilesystemIoAndParent(alloc: Allocator, parent: ?@import("antfly_runtime_abi").memory_abi.Parent) !BackendRuntimeHandle {
+        return initManualOwnedAuthority(alloc, parent, false);
+    }
+    fn initManualOwnedAuthority(alloc: Allocator, parent: ?@import("antfly_runtime_abi").memory_abi.Parent, general: bool) !BackendRuntimeHandle {
         if (comptime is_hostless) return error.UnsupportedPlatform;
-        const io_impl = try initIoLane(alloc, threaded_io_limits.backend_runtime_inference);
-        errdefer deinitIoLane(alloc, io_impl);
-        var handle = try init(alloc, .{
-            .backend = .manual,
-            .borrowed_io = .{ .general = io_impl.io() },
-        });
+        var handle = try init(alloc, .{ .backend = .manual, .memory_parent = parent });
+        errdefer handle.deinit();
+        const runtime = handle.runtime;
+        const io_impl = try initIoLane(runtime.alloc, if (general) threaded_io_limits.backend_runtime_inference else threaded_io_limits.backend_runtime_durable_background, if (runtime.runtime_memory) |memory| memory.stackAllocator() else null);
+        runtime.owned_auxiliary_io = io_impl;
         handle.owned_filesystem_io = io_impl;
+        if (general) {
+            const borrowed: BorrowedIo = .{ .general = io_impl.io() };
+            runtime.borrowed_io = borrowed;
+            runtime.borrowed_receivers = try BorrowedIoReceivers.init(borrowed);
+            runtime.borrowed_storage = storage_io.IoStorage.init(borrowed.general);
+            runtime.owner_registry.sync_io = borrowed.general;
+        } else {
+            runtime.borrowed_filesystem_io = io_impl.io();
+            runtime.borrowed_filesystem_receiver = try receiveIo(io_impl.io());
+        }
         return handle;
     }
 
-    pub fn initManualWithOwnedFilesystemIo(alloc: Allocator) !BackendRuntimeHandle {
-        if (comptime builtin.os.tag == .freestanding) {
-            return error.UnsupportedPlatform;
-        } else {
-            const filesystem_io = try initIoLane(alloc, threaded_io_limits.backend_runtime_durable_background);
-            errdefer deinitIoLane(alloc, filesystem_io);
-            var handle = try init(alloc, .{
-                .backend = .manual,
-                .filesystem_io = filesystem_io.io(),
-            });
-            handle.owned_filesystem_io = filesystem_io;
-            return handle;
-        }
-    }
-
     pub fn deinit(self: *BackendRuntimeHandle) void {
-        self.runtime.deinit();
+        var client = self.runtime.retire();
         self.alloc.destroy(self.runtime);
-        if (self.owned_filesystem_io) |io_impl| deinitIoLane(self.alloc, io_impl);
+        if (self.memory_parent) |parent| parent.release_fn(parent.ptr, @sizeOf(BackendRuntime));
         self.* = undefined;
+        if (client) |*scope| scope.close() catch @panic("shared runtime handle retained");
     }
 
     pub fn ownsFilesystemIo(self: *const BackendRuntimeHandle) bool {
@@ -1943,6 +2881,21 @@ const InlineDurableJobLane = struct {
         defer owners.finishJob(job.owner_id);
         try job.execute();
         job.deinit(job.ptr);
+    }
+
+    fn waitOwner(ptr: *anyopaque, owner_id: u64) !bool {
+        const owners: *OwnerRegistry = @ptrCast(@alignCast(ptr));
+        return owners.waitIdleSlice(owner_id);
+    }
+
+    fn beginOwnerDrain(ptr: *anyopaque, owner_id: u64, original: @import("../common/read_admission.zig").Port) !OwnerDrain {
+        const self: *OwnerRegistry = @ptrCast(@alignCast(ptr));
+        return self.beginDrain(owner_id, original);
+    }
+
+    fn quiesceOwner(ptr: *anyopaque, owner_id: u64) !bool {
+        const owners: *OwnerRegistry = @ptrCast(@alignCast(ptr));
+        return owners.quiesce(owner_id);
     }
 
     fn drainOwner(ptr: *anyopaque, owner_id: u64) void {
@@ -1977,7 +2930,10 @@ const InlineDurableJobLane = struct {
 };
 
 const inline_vtable = DurableJobLane.VTable{
+    .begin_owner_drain = InlineDurableJobLane.beginOwnerDrain,
     .submit = InlineDurableJobLane.submit,
+    .wait_owner = InlineDurableJobLane.waitOwner,
+    .quiesce_owner = InlineDurableJobLane.quiesceOwner,
     .drain_owner = InlineDurableJobLane.drainOwner,
     .close_owner = InlineDurableJobLane.closeOwner,
     .pause_owner = InlineDurableJobLane.pauseOwner,
@@ -1989,6 +2945,7 @@ const inline_vtable = DurableJobLane.VTable{
 
 const ThreadedDurableJobLane = if (is_hostless) UnsupportedDurableJobLane else NativeDurableJobLane;
 const UnsupportedDurableJobLane = struct {
+    recovery_io_impl: ?*IoImpl = null,
     fn init(_: Allocator, _: *IoImpl, _: *OwnerRegistry) ThreadedDurableJobLane {
         return .{};
     }
@@ -2005,6 +2962,18 @@ const UnsupportedDurableJobLane = struct {
     pub fn deinit(_: *ThreadedDurableJobLane) void {}
 
     fn submit(_: *anyopaque, _: Job) !void {
+        return error.UnsupportedPlatform;
+    }
+
+    fn waitOwner(_: *anyopaque, _: u64) !bool {
+        return error.UnsupportedPlatform;
+    }
+
+    fn beginOwnerDrain(_: *anyopaque, _: u64, _: @import("../common/read_admission.zig").Port) !OwnerDrain {
+        return error.UnsupportedPlatform;
+    }
+
+    fn quiesceOwner(_: *anyopaque, _: u64) !bool {
         return error.UnsupportedPlatform;
     }
 
@@ -2060,6 +3029,8 @@ const NativeDurableJobLane = struct {
     accepting: std.atomic.Value(bool) = .init(true),
     reaper_future: ?Io.Future(void) = null,
     entries: std.ArrayListUnmanaged(*Entry) = .empty,
+    recovery_io_impl: ?*IoImpl = null,
+    recovery_futures: [threaded_io_limits.backend_runtime_recovery]?Io.Future(void) = @splat(null),
 
     fn init(alloc: Allocator, io_impl: *IoImpl, owners: *OwnerRegistry) ThreadedDurableJobLane {
         return .{
@@ -2071,6 +3042,37 @@ const NativeDurableJobLane = struct {
 
     fn start(self: *ThreadedDurableJobLane) !void {
         self.reaper_future = try self.io_impl.io().concurrent(reaperLoop, .{self});
+        errdefer {
+            self.shutdown_reaper.set(self.io_impl.io());
+            _ = self.reaper_future.?.await(self.io_impl.io());
+            self.reaper_future = null;
+        }
+        // All dispatch futures and physical workers are acquired at runtime
+        // construction, before durable debt can rely on this service.
+        errdefer self.stopRecoveryWorkers();
+        if (self.recovery_io_impl) |io_impl| {
+            for (&self.recovery_futures) |*future| future.* = try io_impl.io().concurrent(recoveryLoop, .{self});
+        }
+    }
+
+    fn recoveryLoop(self: *ThreadedDurableJobLane) void {
+        while (self.owners.waitRecovery()) |job| {
+            job.execute() catch |err| {
+                std.log.warn("background recovery step failed owner={} err={s}", .{ job.owner_id, @errorName(err) });
+            };
+            job.deinit(job.ptr);
+            self.owners.finishRecovery(job.owner_id);
+        }
+    }
+
+    fn stopRecoveryWorkers(self: *ThreadedDurableJobLane) void {
+        self.owners.stopRecovery();
+        if (self.recovery_io_impl) |io_impl| {
+            for (&self.recovery_futures) |*future| {
+                if (future.*) |*active| _ = active.await(io_impl.io());
+                future.* = null;
+            }
+        }
     }
 
     fn lane(self: *ThreadedDurableJobLane) DurableJobLane {
@@ -2088,6 +3090,7 @@ const NativeDurableJobLane = struct {
             self.reaper_future = null;
         }
         self.drainAll();
+        self.stopRecoveryWorkers();
         self.entries.deinit(self.alloc);
         self.* = undefined;
     }
@@ -2095,6 +3098,10 @@ const NativeDurableJobLane = struct {
     fn submit(ptr: *anyopaque, job: Job) !void {
         const self: *ThreadedDurableJobLane = @ptrCast(@alignCast(ptr));
         if (!self.accepting.load(.acquire)) return error.BackendRuntimeShuttingDown;
+        if (job.class == .recovery) {
+            if (self.recovery_io_impl == null) return error.BackgroundRuntimeUnavailable;
+            return self.owners.submitRecovery(job);
+        }
         try self.owners.beginJob(job.owner_id);
         errdefer self.owners.finishJob(job.owner_id);
         if (!self.accepting.load(.acquire)) return error.BackendRuntimeShuttingDown;
@@ -2111,6 +3118,21 @@ const NativeDurableJobLane = struct {
         try self.entries.ensureUnusedCapacity(self.alloc, 1);
         entry.future = try self.io_impl.io().concurrent(runEntry, .{entry});
         self.entries.appendAssumeCapacity(entry);
+    }
+
+    fn waitOwner(ptr: *anyopaque, owner_id: u64) !bool {
+        const self: *ThreadedDurableJobLane = @ptrCast(@alignCast(ptr));
+        return self.owners.waitIdleSlice(owner_id);
+    }
+
+    fn beginOwnerDrain(ptr: *anyopaque, owner_id: u64, original: @import("../common/read_admission.zig").Port) !OwnerDrain {
+        const self: *ThreadedDurableJobLane = @ptrCast(@alignCast(ptr));
+        return self.owners.beginDrain(owner_id, original);
+    }
+
+    fn quiesceOwner(ptr: *anyopaque, owner_id: u64) !bool {
+        const self: *ThreadedDurableJobLane = @ptrCast(@alignCast(ptr));
+        return self.owners.quiesce(owner_id);
     }
 
     fn drainOwner(ptr: *anyopaque, owner_id: u64) void {
@@ -2287,7 +3309,10 @@ const NativeDurableJobLane = struct {
 };
 
 const threaded_vtable = DurableJobLane.VTable{
+    .begin_owner_drain = ThreadedDurableJobLane.beginOwnerDrain,
     .submit = ThreadedDurableJobLane.submit,
+    .wait_owner = ThreadedDurableJobLane.waitOwner,
+    .quiesce_owner = ThreadedDurableJobLane.quiesceOwner,
     .drain_owner = ThreadedDurableJobLane.drainOwner,
     .close_owner = ThreadedDurableJobLane.closeOwner,
     .pause_owner = ThreadedDurableJobLane.pauseOwner,
@@ -4265,4 +5290,646 @@ test "backend runtime worker allocation failure returns its capacity and lifetim
     failing.fail_index = std.math.maxInt(usize);
     var lease = try handle.ptr().acquireWorkers(.{});
     defer lease.release();
+}
+
+test "maintenance runtime closes all callback classes before waiting for an API lease" {
+    if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
+    var handle = try BackendRuntimeHandle.init(std.testing.allocator, .{ .backend = .io_threaded });
+    const runtime = handle.ptr();
+    const io = runtime.io().?;
+    const scheduler = try runtime.maintenanceScheduler();
+    var lease = try runtime.acquireApiLane();
+    const Probe = struct {
+        io: Io,
+        entered: Io.Event = .unset,
+        release: Io.Event = .unset,
+        calls: std.atomic.Value(usize) = .init(0),
+        fn step(self: *@This()) ?u64 {
+            _ = self.calls.fetchAdd(1, .acq_rel);
+            self.entered.set(self.io);
+            self.release.waitUncancelable(self.io);
+            return 0;
+        }
+    };
+    var probe: Probe = .{ .io = io };
+    var registration = try scheduler.register(&probe, Probe.step);
+    var joined = false;
+    var deinitialized = std.atomic.Value(bool).init(false);
+    var shutdown: ?std.Thread = null;
+    defer {
+        // This cleanup also runs after failed bounded observations. The
+        // runtime cannot free its scheduler while the API lease is retained.
+        probe.release.set(io);
+        if (!joined) registration.await(io);
+        lease.release();
+        if (shutdown) |thread| thread.join() else handle.deinit();
+    }
+    try probe.entered.waitTimeout(io, .{ .duration = .{ .raw = Io.Duration.fromSeconds(5), .clock = .awake } });
+    shutdown = try std.Thread.spawn(.{}, struct {
+        fn run(h: *BackendRuntimeHandle, done: *std.atomic.Value(bool)) void {
+            h.deinit();
+            done.store(true, .release);
+        }
+    }.run, .{ &handle, &deinitialized });
+    const deadline = platform.time.monotonicNs() + 5 * std.time.ns_per_s;
+    while (!runtime.api_lane_gate.isClosed() and platform.time.monotonicNs() < deadline)
+        io.sleep(.fromMilliseconds(1), .awake) catch {};
+    try std.testing.expect(runtime.api_lane_gate.isClosed());
+    try std.testing.expect(!deinitialized.load(.acquire));
+    try std.testing.expectError(error.BackendRuntimeShuttingDown, runtime.maintenanceScheduler());
+    for (std.enums.values(MaintenanceScheduler.Class)) |class|
+        try std.testing.expectError(error.BackendRuntimeShuttingDown, scheduler.registerClass(class, &probe, Probe.step));
+    scheduler.wake(&probe);
+    scheduler.closeAdmission(); // Closing is idempotent while handles drain.
+    const held = scheduler.snapshot();
+    try std.testing.expectEqual(@as(usize, 1), held.registrations);
+    try std.testing.expectEqual(@as(usize, 1), held.active);
+    try std.testing.expectEqual(@as(usize, 1), probe.calls.load(.acquire));
+    probe.release.set(io);
+    registration.await(io);
+    joined = true;
+    const retired = scheduler.snapshot();
+    try std.testing.expectEqual(@as(usize, 0), retired.registrations);
+    try std.testing.expectEqual(@as(usize, 0), retired.active);
+    try std.testing.expectEqual(@as(usize, 1), probe.calls.load(.acquire));
+    try std.testing.expect(!deinitialized.load(.acquire));
+}
+
+const TestRunnableOwner = struct {
+    const errors = @import("antfly_runtime_abi").error_abi;
+    references: std.atomic.Value(usize) = .init(0),
+    reject: bool = false,
+    fn retain(raw: *anyopaque) callconv(.c) errors.Status {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        if (self.reject) return errors.statusFromError(error.SchedulerClosed);
+        _ = self.references.fetchAdd(1, .acq_rel);
+        return .ok;
+    }
+    fn release(raw: *anyopaque) callconv(.c) void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        std.debug.assert(self.references.fetchSub(1, .acq_rel) > 0);
+    }
+    fn unsupported(_: *anyopaque) callconv(.c) errors.Status {
+        return errors.statusFromError(error.ExecutionWaitUnsupported);
+    }
+    fn transition(raw: *anyopaque, _: c_int) callconv(.c) errors.Status {
+        return unsupported(raw);
+    }
+    fn start(raw: *anyopaque, _: *const runnable_abi.Start) callconv(.c) errors.Status {
+        return unsupported(raw);
+    }
+    fn finish(_: *anyopaque) callconv(.c) void {
+        @panic("test consumer must not manufacture a CPU grant");
+    }
+    fn port(self: *@This()) runnable_abi.Owner {
+        return .{ .context = self, .retain = retain, .release = release, .start = start, .checkpoint = unsupported, .park = transition, .enter = transition, .finish = finish };
+    }
+};
+
+test "maintenance runtime retains its node owner until physical lane retirement" {
+    var owner: TestRunnableOwner = .{};
+    var port = owner.port();
+    var runtime = try BackendRuntimeHandle.init(std.testing.allocator, .{ .backend = .manual, .borrowed_io = .{ .general = std.testing.io, .api = std.testing.io }, .runnable_owner = port });
+    try std.testing.expectEqual(@as(usize, 1), owner.references.load(.acquire));
+    port.version = 0;
+    try std.testing.expect(runtime.ptr().runnableOwner().?.valid());
+    var lane = try runtime.ptr().acquireApiLane();
+    var draining = try std.testing.io.concurrent(struct {
+        fn run(handle: *BackendRuntimeHandle) void {
+            handle.deinit();
+        }
+    }.run, .{&runtime});
+    var released = false;
+    var joined = false;
+    defer {
+        if (!released) lane.release();
+        if (!joined) draining.cancel(std.testing.io);
+    }
+    // This exact lane lease pins the runtime while destruction waits for it.
+    const until = std.Io.Clock.awake.now(std.testing.io).addDuration(.fromSeconds(1));
+    while (runtime.ptr().api_lane_gate.state.load(.acquire) & LaneLeaseGate.closed_bit == 0) {
+        if (std.Io.Clock.awake.now(std.testing.io).nanoseconds >= until.nanoseconds) return error.TestUnexpectedResult;
+        try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+    }
+    try std.testing.expectEqual(@as(usize, 1), owner.references.load(.acquire));
+    lane.release();
+    released = true;
+    draining.await(std.testing.io);
+    joined = true;
+    try std.testing.expectEqual(@as(usize, 0), owner.references.load(.acquire));
+}
+
+test "maintenance runtime owner rejection and allocation rollback preserve exact ownership" {
+    var owner: TestRunnableOwner = .{ .reject = true };
+    try std.testing.expectError(error.SchedulerClosed, BackendRuntime.init(std.testing.allocator, .{ .backend = .manual, .runnable_owner = owner.port() }));
+    try std.testing.expectEqual(@as(usize, 0), owner.references.load(.acquire));
+    owner.reject = false;
+    var port = owner.port();
+    port.version -= 1;
+    try std.testing.expectError(error.UnsupportedVersion, BackendRuntime.init(std.testing.allocator, .{ .backend = .manual, .runnable_owner = port }));
+    try std.testing.expectEqual(@as(usize, 0), owner.references.load(.acquire));
+    for (0..3) |allocation| {
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = allocation });
+        try std.testing.expectError(error.OutOfMemory, BackendRuntime.init(failing.allocator(), .{ .backend = .manual, .runnable_owner = owner.port() }));
+        try std.testing.expect(failing.has_induced_failure);
+        try std.testing.expectEqual(@as(usize, 0), owner.references.load(.acquire));
+    }
+    var runtime = try BackendRuntime.init(std.testing.allocator, .{ .backend = .manual, .runnable_owner = owner.port() });
+    runtime.deinit();
+    try std.testing.expectEqual(@as(usize, 0), owner.references.load(.acquire));
+}
+
+test "maintenance runtime applies finite recurring registration policy at birth" {
+    try std.testing.expectError(error.InvalidMaintenanceCapacity, BackendRuntime.init(std.testing.allocator, .{ .maintenance_registration_limit = 0 }));
+    var handle = try BackendRuntimeHandle.init(std.testing.allocator, .{ .maintenance_registration_limit = 1 });
+    defer handle.deinit();
+    const scheduler = try handle.ptr().maintenanceScheduler();
+    const Probe = struct {
+        fn step(_: *@This()) ?u64 {
+            return null;
+        }
+    };
+    var probe: Probe = .{};
+    var registration = try scheduler.register(&probe, Probe.step);
+    try std.testing.expectEqual(@as(usize, 1), scheduler.snapshot().max_registrations);
+    try std.testing.expectError(error.ResourceBudgetExceeded, scheduler.registerClass(.producer, &probe, Probe.step));
+    registration.await(handle.ptr().io().?);
+    var replacement = try scheduler.registerClass(.derived, &probe, Probe.step);
+    replacement.await(handle.ptr().io().?);
+    try std.testing.expectEqual(@as(usize, 0), scheduler.snapshot().owned_registrations);
+}
+
+test "backend recovery dispatch queue is prepaid fair and preserves accepted work across close" {
+    var owners = OwnerRegistry.init(std.testing.allocator);
+    defer owners.deinit();
+    for (1..258) |id| try owners.register(id);
+    var failure = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    const allocator = owners.alloc;
+    owners.alloc = failure.allocator();
+    defer owners.alloc = allocator;
+    const Payload = struct {
+        fn run(_: *anyopaque) !void {}
+        fn deinit(_: *anyopaque) void {}
+    };
+    var payload: u8 = 0;
+    const first: Job = .{ .owner_id = 1, .class = .recovery, .ptr = &payload, .run = Payload.run, .deinit = Payload.deinit };
+    try owners.submitRecovery(first);
+    try std.testing.expectError(error.BackgroundOwnerCapacityExceeded, owners.submitRecovery(first));
+    try std.testing.expectEqual(@as(u64, 1), owners.waitRecovery().?.owner_id);
+    // A running owner can retain exactly one successor, but must not be
+    // selected by a second worker while its first step is still running.
+    try owners.submitRecovery(first);
+    try std.testing.expectError(error.BackgroundOwnerCapacityExceeded, owners.submitRecovery(first));
+    for (2..258) |id| {
+        var job = first;
+        job.owner_id = id;
+        try owners.submitRecovery(job);
+    }
+    try owners.setPaused(2, true);
+    try std.testing.expect(owners.beginClose(3));
+    var paused = first;
+    paused.owner_id = 2;
+    try std.testing.expectError(error.BackgroundOwnerPaused, owners.submitRecovery(paused));
+    paused.owner_id = 3;
+    try std.testing.expectError(error.BackgroundOwnerClosing, owners.submitRecovery(paused));
+    owners.finishRecovery(1);
+    for (2..258) |id| {
+        const job = owners.waitRecovery().?;
+        try std.testing.expectEqual(@as(u64, id), job.owner_id);
+        owners.finishRecovery(id);
+    }
+    try std.testing.expectEqual(@as(u64, 1), owners.waitRecovery().?.owner_id);
+    owners.finishRecovery(1);
+    owners.retireClosed(3);
+    owners.stopRecovery();
+    try std.testing.expect(owners.waitRecovery() == null);
+    try std.testing.expectError(error.BackendRuntimeShuttingDown, owners.submitRecovery(first));
+    try std.testing.expectEqual(@as(usize, 0), failure.alloc_index);
+}
+
+test "backend recovery dispatch runs with ordinary allocation refused and general workers saturated" {
+    if (comptime is_hostless or builtin.single_threaded) return error.SkipZigTest;
+    var handle = try BackendRuntimeHandle.init(std.testing.allocator, .{ .lane_limits = .{ .durable_background = 3 } });
+    defer handle.deinit();
+    const runtime = handle.ptr();
+    const owner = try runtime.allocOwnerId();
+    const Work = struct {
+        entered: std.atomic.Value(usize) = .init(0),
+        release: std.atomic.Value(bool) = .init(false),
+        recovered: std.atomic.Value(bool) = .init(false),
+        destroyed: std.atomic.Value(bool) = .init(false),
+        fn block(self: *@This()) void {
+            _ = self.entered.fetchAdd(1, .release);
+            while (!self.release.load(.acquire)) platform.time.yieldNow();
+        }
+        fn run(ptr: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.recovered.store(true, .release);
+        }
+        fn deinit(ptr: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.destroyed.store(true, .release);
+        }
+    };
+    var work: Work = .{};
+    const io = runtime.io().?;
+    var a = try io.concurrent(Work.block, .{&work});
+    defer {
+        work.release.store(true, .release);
+        _ = a.await(io);
+    }
+    var b = try io.concurrent(Work.block, .{&work});
+    defer {
+        work.release.store(true, .release);
+        _ = b.await(io);
+    }
+    const end = platform.time.monotonicNs() + 5 * std.time.ns_per_s;
+    while (work.entered.load(.acquire) != 2 and platform.time.monotonicNs() < end) platform.time.yieldNow();
+    try std.testing.expectEqual(@as(usize, 2), work.entered.load(.acquire));
+    var failure = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    const jobs = runtime.threaded_jobs.?;
+    const allocator = jobs.alloc;
+    jobs.alloc = failure.allocator();
+    defer jobs.alloc = allocator;
+    const job: Job = .{ .owner_id = owner, .class = .recovery, .ptr = &work, .run = Work.run, .deinit = Work.deinit };
+    var ordinary = job;
+    ordinary.class = .maintenance;
+    try std.testing.expectError(error.OutOfMemory, runtime.durable_jobs.submit(ordinary));
+    try std.testing.expect(!work.destroyed.load(.acquire));
+    try runtime.durable_jobs.submit(job);
+    runtime.durable_jobs.closeOwner(owner);
+    try std.testing.expect(work.recovered.load(.acquire) and work.destroyed.load(.acquire));
+    try std.testing.expect(!work.release.load(.acquire));
+}
+
+test "maintenance runtime durable owner quiescence retains accepted payload cleanup after original failures" {
+    const admission = @import("../common/read_admission.zig");
+    const Case = enum { success, begin_failure, end_failure, lifetime_in_wait };
+    for (std.enums.values(Job.Class)) |class| for (std.enums.values(Case)) |case| {
+        var runtime = try BackendRuntimeHandle.init(std.testing.allocator, .{});
+        defer runtime.deinit();
+        const lane = runtime.ptr().durable_jobs;
+        const owner = try runtime.ptr().allocOwnerId();
+        defer lane.closeOwner(owner);
+        const io = runtime.ptr().io().?;
+        const F = struct {
+            io: Io,
+            entered: Io.Event = .unset,
+            release: Io.Event = .unset,
+            retired: bool = false,
+            fn run(_: *anyopaque) !void {}
+            fn deinit(raw: *anyopaque) void {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                self.entered.set(self.io);
+                self.release.waitUncancelable(self.io);
+                self.retired = true;
+            }
+        };
+        const Control = struct {
+            f: *F,
+            case: Case,
+            begins: usize = 0,
+            ends: usize = 0,
+            fn check(raw: *anyopaque) !void {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                if (self.case == .lifetime_in_wait and self.begins != 0) return error.DeadlineExceeded;
+            }
+            fn deadline(_: *anyopaque) !?u64 {
+                return 1000;
+            }
+            fn begin(raw: *anyopaque) !void {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                self.begins += 1;
+                if (self.case == .begin_failure) return error.NotFound;
+                if (self.case != .lifetime_in_wait) self.f.release.set(self.f.io);
+            }
+            fn end(raw: *anyopaque) !void {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                self.ends += 1;
+                self.f.release.set(self.f.io);
+                if (self.case == .end_failure) return error.Canceled;
+            }
+        };
+        var f: F = .{ .io = io };
+        defer {
+            f.release.set(io);
+            lane.closeOwner(owner);
+        }
+        try lane.submit(.{ .owner_id = owner, .class = class, .ptr = &f, .run = F.run, .deinit = F.deinit });
+        try f.entered.wait(io);
+        try std.testing.expect(!try lane.quiesceOwner(owner));
+        try std.testing.expectError(error.BackgroundOwnerClosing, lane.submit(.{ .owner_id = owner, .class = class, .ptr = &f, .run = F.run, .deinit = F.deinit }));
+        var control: Control = .{ .f = &f, .case = case };
+        var payload: admission.Payload = .{ .ptr = &control, .vtable = &.{ .checkpoint = Control.check, .check_lifetime = Control.check, .deadline_ns = Control.deadline }, .execution_wait = .{ .ptr = &control, .begin = Control.begin, .end = Control.end } };
+        const result = lane.quiesceOwnerWithAdmission(owner, .init(&payload));
+        if (case == .success) try result else {
+            try std.testing.expectError(switch (case) {
+                .begin_failure => error.NotFound,
+                .end_failure => error.Canceled,
+                .lifetime_in_wait => error.DeadlineExceeded,
+                .success => unreachable,
+            }, result);
+            runtime.ptr().owner_registry.mutex.lockUncancelable(runtime.ptr().owner_registry.sync_io);
+            const retained = runtime.ptr().owner_registry.states.contains(owner);
+            runtime.ptr().owner_registry.mutex.unlock(runtime.ptr().owner_registry.sync_io);
+            try std.testing.expect(retained);
+            f.release.set(io);
+            lane.drainOwner(owner);
+        }
+        try std.testing.expect(try lane.quiesceOwner(owner));
+        try std.testing.expect(f.retired);
+        try std.testing.expectError(error.BackgroundOwnerIdExhausted, lane.reopenOwner(owner));
+        try std.testing.expectEqual(@as(usize, 1), control.begins);
+        try std.testing.expectEqual(@as(usize, if (case == .begin_failure) 0 else 1), control.ends);
+    };
+}
+
+test "maintenance runtime durable owner wait lends the sole ordinary execution slot" {
+    const native = @import("../common/runnable_scheduler.zig");
+    const admission = @import("../common/read_admission.zig");
+    const now = platform.time.monotonicNs;
+    const io = std.testing.io;
+    var cpu = try native.Scheduler.init(.{ .slots = 3, .control_slots = 1, .cleanup_slots = 1, .max_wait_ms = 5000 });
+    defer cpu.close();
+    var producer: native.Execution = .{};
+    defer producer.finish();
+    try producer.start(&cpu, .{ .io = io, .native_now_ns = now, .allow_wait = true, .deadline_ns = now() + 5 * std.time.ns_per_s }, .background);
+    try producer.park(.resource_blocked);
+    var closer: native.Execution = .{};
+    defer closer.finish();
+    try closer.start(&cpu, .{ .io = io, .native_now_ns = now, .allow_wait = true, .deadline_ns = now() + 5 * std.time.ns_per_s }, .query);
+    var health: native.Execution = .{};
+    defer health.finish();
+    try health.start(&cpu, .{ .io = io, .native_now_ns = now }, .control);
+    var runtime = try BackendRuntimeHandle.init(std.testing.allocator, .{});
+    defer runtime.deinit();
+    const owner = try runtime.ptr().allocOwnerId();
+    const lane = runtime.ptr().durable_jobs;
+    const F = struct {
+        io: Io,
+        execution: *native.Execution,
+        completion: ?*Io.Event = null,
+        entered: Io.Event = .unset,
+        ran: bool = false,
+        retired: bool = false,
+        fn run(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            defer self.execution.finish();
+            self.entered.set(self.io);
+            try self.execution.enter(.background);
+            const until = platform.time.monotonicNs() + 5 * std.time.ns_per_s;
+            // Observe the actual completion-event wait, without depending on
+            // the retired registry-condition implementation or a sleep guess.
+            while (@atomicLoad(Io.Event, self.completion.?, .acquire) != .waiting) {
+                if (platform.time.monotonicNs() >= until) return error.TestUnexpectedResult;
+                platform.time.yieldNow();
+            }
+            self.ran = true;
+        }
+        fn deinit(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.retired = true;
+        }
+    };
+    const Control = struct {
+        execution: *native.Execution,
+        begins: usize = 0,
+        ends: usize = 0,
+        fn lifetime(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try self.execution.checkLifetime();
+        }
+        fn checkpoint(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try lifetime(raw);
+            if (self.execution.entry.?.scheduler.?.state(&self.execution.entry.?) != .running) return error.InvalidRunnableTransition;
+        }
+        fn deadline(raw: *anyopaque) !?u64 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            return self.execution.entry.?.options.deadline_ns;
+        }
+        fn begin(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.begins += 1;
+            try self.execution.park(.resource_blocked);
+        }
+        fn end(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.ends += 1;
+            try self.execution.enter(.query);
+        }
+    };
+    var f: F = .{ .io = io, .execution = &producer };
+    defer {
+        closer.finish();
+        lane.closeOwner(owner);
+    }
+    try lane.submit(.{ .owner_id = owner, .class = .maintenance, .ptr = &f, .run = F.run, .deinit = F.deinit });
+    try f.entered.wait(io);
+    var control: Control = .{ .execution = &closer };
+    var payload: admission.Payload = .{ .ptr = &control, .vtable = &.{ .checkpoint = Control.checkpoint, .check_lifetime = Control.lifetime, .deadline_ns = Control.deadline }, .execution_wait = .{ .ptr = &control, .begin = Control.begin, .end = Control.end } };
+    var observation = try lane.beginOwnerDrain(owner, .init(&payload));
+    defer observation.release();
+    runtime.ptr().owner_registry.mutex.lockUncancelable(runtime.ptr().owner_registry.sync_io);
+    f.completion = &runtime.ptr().owner_registry.states.getPtr(owner).?.drain_signal.?.done;
+    runtime.ptr().owner_registry.mutex.unlock(runtime.ptr().owner_registry.sync_io);
+    try lane.quiesceOwnerWithAdmission(owner, .init(&payload));
+    try std.testing.expect(f.ran and f.retired);
+    try std.testing.expectEqual(@as(usize, 1), control.begins);
+    try std.testing.expectEqual(@as(usize, 1), control.ends);
+    try std.testing.expectEqual(native.State.running, cpu.state(&closer.entry.?));
+    try std.testing.expectEqual(native.State.running, cpu.state(&health.entry.?));
+}
+
+test "maintenance runtime durable drain leases survive registry relocation and generation retirement" {
+    const admission = @import("../common/read_admission.zig");
+    const Mode = enum { job, recovery, probe };
+    for (std.enums.values(Mode)) |mode| {
+        var owners = OwnerRegistry.init(std.testing.allocator);
+        defer owners.deinit();
+        owners.sync_io = std.testing.io;
+        try owners.register(1);
+        const F = struct {
+            fn check(_: *anyopaque) !void {}
+            fn deadline(_: *anyopaque) !?u64 {
+                return 1000;
+            }
+            fn unexpected(_: *anyopaque) !void {
+                return error.NotFound;
+            }
+            fn run(_: *anyopaque) !void {}
+            fn retire(_: *anyopaque) void {}
+            fn probe(_: *anyopaque) void {}
+        };
+        var marker: u8 = 0;
+        const payload: admission.Payload = .{ .ptr = &marker, .vtable = &.{ .checkpoint = F.check, .check_lifetime = F.check, .deadline_ns = F.deadline }, .execution_wait = .{ .ptr = &marker, .begin = F.unexpected, .end = F.unexpected } };
+        const control = admission.Port.init(&payload);
+        switch (mode) {
+            .job => try owners.beginJob(1),
+            .recovery => {
+                try owners.submitRecovery(.{ .owner_id = 1, .class = .recovery, .ptr = &marker, .run = F.run, .deinit = F.retire });
+                _ = owners.waitRecovery().?;
+            },
+            .probe => {
+                try owners.armMaintenanceProbe(1, .{ .ptr = &marker, .run = F.probe });
+                _ = owners.beginNextMaintenanceProbe().?;
+            },
+        }
+        var first = try owners.beginDrain(1, control);
+        defer first.release();
+        var second = try owners.beginDrain(1, control);
+        defer second.release();
+        try std.testing.expect(first.context == second.context and !first.ready());
+        // Moving hash-map values cannot move an existing observer's signal.
+        for (2..258) |id| try owners.register(id);
+        try std.testing.expect(!second.ready());
+        switch (mode) {
+            .job => owners.finishJob(1),
+            .recovery => owners.finishRecovery(1),
+            .probe => owners.finishMaintenanceProbe(1),
+        }
+        try std.testing.expect(first.ready() and second.ready());
+        owners.close(1);
+        try owners.register(1);
+        try owners.beginJob(1);
+        var replacement = try owners.beginDrain(1, control);
+        defer replacement.release();
+        try std.testing.expect(replacement.context != first.context and !replacement.ready());
+        first.release();
+        second.release();
+        owners.finishJob(1);
+        try std.testing.expect(replacement.ready());
+        owners.close(1);
+        try std.testing.expect(replacement.ready());
+    }
+}
+
+test "maintenance runtime durable drain metadata rejection retains unfenced ownership until reentry" {
+    const admission = @import("../common/read_admission.zig");
+    const Mode = enum { success, begin_failure, end_failure, expired };
+    for (std.enums.values(Mode)) |mode| {
+        var owners = OwnerRegistry.init(std.testing.allocator);
+        defer owners.deinit();
+        owners.sync_io = std.testing.io;
+        try owners.register(1);
+        const F = struct {
+            owners: *OwnerRegistry,
+            mode: Mode,
+            held: bool = true,
+            begins: usize = 0,
+            ends: usize = 0,
+            fn check(raw: *anyopaque) !void {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                if (self.mode == .expired and self.begins != 0) return error.DeadlineExceeded;
+            }
+            fn deadline(_: *anyopaque) !?u64 {
+                return 1000;
+            }
+            fn begin(raw: *anyopaque) !void {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                self.begins += 1;
+                if (self.mode == .begin_failure) return error.NotFound;
+                self.owners.mutex.unlock(self.owners.sync_io);
+                self.held = false;
+            }
+            fn end(raw: *anyopaque) !void {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                self.ends += 1;
+                try std.testing.expect(self.owners.mutex.tryLock());
+                self.owners.mutex.unlock(self.owners.sync_io);
+                if (self.mode == .end_failure) return error.Canceled;
+            }
+        };
+        try std.testing.expect(owners.mutex.tryLock());
+        var f: F = .{ .owners = &owners, .mode = mode };
+        defer if (f.held) owners.mutex.unlock(owners.sync_io);
+        const payload: admission.Payload = .{ .ptr = &f, .vtable = &.{ .checkpoint = F.check, .check_lifetime = F.check, .deadline_ns = F.deadline }, .execution_wait = .{ .ptr = &f, .begin = F.begin, .end = F.end } };
+        const control = admission.Port.init(&payload);
+        const result = owners.beginDrain(1, control);
+        var lease: OwnerDrain = if (mode == .success) try result else blk: {
+            try std.testing.expectError(switch (mode) {
+                .begin_failure => error.NotFound,
+                .end_failure => error.Canceled,
+                .expired => error.DeadlineExceeded,
+                else => unreachable,
+            }, result);
+            if (f.held) {
+                owners.mutex.unlock(owners.sync_io);
+                f.held = false;
+            }
+            try std.testing.expect(!owners.states.get(1).?.closing);
+            f.mode = .success;
+            break :blk try owners.beginDrain(1, control);
+        };
+        defer lease.release();
+        try std.testing.expect(lease.ready() and owners.states.get(1).?.closing);
+        try std.testing.expectEqual(@as(usize, 1), f.begins);
+        try std.testing.expectEqual(@as(usize, if (mode == .begin_failure) 0 else 1), f.ends);
+    }
+}
+
+test "maintenance runtime durable drain allocation failure and abandoned observers preserve accepted jobs" {
+    const admission = @import("../common/read_admission.zig");
+    var owners = OwnerRegistry.init(std.testing.allocator);
+    defer owners.deinit();
+    owners.sync_io = std.testing.io;
+    try owners.register(1);
+    try owners.beginJob(1);
+    const F = struct {
+        fn check(_: *anyopaque) !void {}
+        fn deadline(_: *anyopaque) !?u64 {
+            return 1000;
+        }
+        fn unexpected(_: *anyopaque) !void {
+            return error.NotFound;
+        }
+    };
+    var marker: u8 = 0;
+    const payload: admission.Payload = .{ .ptr = &marker, .vtable = &.{ .checkpoint = F.check, .check_lifetime = F.check, .deadline_ns = F.deadline }, .execution_wait = .{ .ptr = &marker, .begin = F.unexpected, .end = F.unexpected } };
+    const control = admission.Port.init(&payload);
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    owners.drain_alloc = failing.allocator();
+    const rejected = owners.beginDrain(1, control);
+    owners.drain_alloc = std.testing.allocator;
+    try std.testing.expectError(error.OutOfMemory, rejected);
+    try std.testing.expect(owners.states.get(1).?.closing and owners.states.get(1).?.in_flight == 1);
+    try std.testing.expectError(error.BackgroundOwnerClosing, owners.beginJob(1));
+    var abandoned = try owners.beginDrain(1, control);
+    abandoned.release();
+    // The registry's independent signal ref remains until mandatory retirement.
+    try std.testing.expect(owners.states.get(1).?.drain_signal != null);
+    owners.finishJob(1);
+    owners.close(1);
+    var completed = try owners.beginDrain(1, control);
+    defer completed.release();
+    try std.testing.expect(completed.ready());
+}
+
+test "maintenance runtime controlled durable drain rejects a missing owning completion capability" {
+    const admission = @import("../common/read_admission.zig");
+    const F = struct {
+        legacy_calls: usize = 0,
+        fn check(_: *anyopaque) !void {}
+        fn deadline(_: *anyopaque) !?u64 {
+            return 1000;
+        }
+        fn unexpected(_: *anyopaque) !void {
+            return error.NotFound;
+        }
+        fn submit(_: *anyopaque, _: Job) !void {}
+        fn close(_: *anyopaque, _: u64) void {}
+        fn poll(_: *anyopaque, _: usize) !usize {
+            return 0;
+        }
+        fn quiesce(raw: *anyopaque, _: u64) !bool {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.legacy_calls += 1;
+            return true;
+        }
+    };
+    var f: F = .{};
+    const lane: DurableJobLane = .{ .ptr = &f, .vtable = &.{ .submit = F.submit, .drain_owner = F.close, .close_owner = F.close, .quiesce_owner = F.quiesce, .poll = F.poll } };
+    const payload: admission.Payload = .{ .ptr = &f, .vtable = &.{ .checkpoint = F.check, .check_lifetime = F.check, .deadline_ns = F.deadline }, .execution_wait = .{ .ptr = &f, .begin = F.unexpected, .end = F.unexpected } };
+    try std.testing.expectError(error.ExecutionWaitUnsupported, lane.quiesceOwnerWithAdmission(1, .init(&payload)));
+    try std.testing.expectEqual(@as(usize, 0), f.legacy_calls);
 }

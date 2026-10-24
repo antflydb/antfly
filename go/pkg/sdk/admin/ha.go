@@ -31,6 +31,7 @@ import (
 	"sync"
 
 	"github.com/antflydb/antfly/go/pkg/sdk/admin/oapi"
+	"github.com/antflydb/antfly/go/pkg/sdk/admission"
 )
 
 const (
@@ -385,8 +386,10 @@ const (
 	// PathStyleCanonical sends requests to /admin/v1/standby/... .
 	PathStyleCanonical
 	// PathStyleAuto negotiates: it sends the canonical /admin/v1/standby/...
-	// path first and, on a 404 that looks like an unrouted path rather than
-	// a missing resource, retries the legacy /admin/v1/ha/... spelling once.
+	// path first for reads and, on an unrouted-looking 404, tries the legacy
+	// /admin/v1/ha/... spelling once. Before an unpinned mutation, a status read
+	// discovers the spelling; the mutation itself is sent only once. A mutation
+	// returning 404 is never replayed automatically.
 	// Whichever spelling answers is remembered for the client and, keyed by
 	// base URL, for later clients in the same process, so a short-lived
 	// client (one per reconcile, say) does not pay the probe every time. A
@@ -395,18 +398,67 @@ const (
 	PathStyleAuto
 )
 
-// negotiatedPathStyles remembers, per normalized admin base URL, which
-// spelling a server answered under PathStyleAuto.
-var negotiatedPathStyles sync.Map
+// The process-wide route cache is only an optimization. Bound its retained
+// targets and copied key bytes; live clients retain their own pinned spelling.
+const negotiatedPathCacheEntries = 256
+const negotiatedPathCacheKeyBytes = 4096
+
+type pathStyleCache struct {
+	mu      sync.Mutex
+	entries map[string]int
+	keys    [negotiatedPathCacheEntries]string
+	styles  [negotiatedPathCacheEntries]PathStyle
+	next    int
+}
+
+func (c *pathStyleCache) Load(key string) (PathStyle, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	slot, found := c.entries[key]
+	if !found {
+		return 0, false
+	}
+	return c.styles[slot], true
+}
+
+func (c *pathStyleCache) Store(key string, style PathStyle) {
+	if len(key) == 0 || len(key) > negotiatedPathCacheKeyBytes {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.entries == nil {
+		c.entries = make(map[string]int)
+	}
+	if slot, found := c.entries[key]; found {
+		// Updating by slot preserves the copied key. Reassigning a string map
+		// key could retain the caller's larger backing allocation instead.
+		c.styles[slot] = style
+		return
+	}
+	delete(c.entries, c.keys[c.next])
+	// A short substring must not retain an unbounded caller allocation.
+	key = strings.Clone(key)
+	c.keys[c.next] = key
+	c.styles[c.next] = style
+	c.entries[key] = c.next
+	c.next = (c.next + 1) % len(c.keys)
+}
+
+func (c *pathStyleCache) Reset() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.entries = nil
+	clear(c.keys[:])
+	clear(c.styles[:])
+	c.next = 0
+}
+
+var negotiatedPathStyles pathStyleCache
 
 // ResetNegotiatedPathStyles forgets every spelling remembered by
 // PathStyleAuto. Intended for tests that reuse a base URL across servers.
-func ResetNegotiatedPathStyles() {
-	negotiatedPathStyles.Range(func(key, _ any) bool {
-		negotiatedPathStyles.Delete(key)
-		return true
-	})
-}
+func ResetNegotiatedPathStyles() { negotiatedPathStyles.Reset() }
 
 // pathNegotiator holds a client's PathStyleAuto state.
 type pathNegotiator struct {
@@ -419,7 +471,7 @@ type pathNegotiator struct {
 func newPathNegotiator(cacheKey string) *pathNegotiator {
 	n := &pathNegotiator{cacheKey: cacheKey, style: PathStyleCanonical}
 	if cached, ok := negotiatedPathStyles.Load(cacheKey); ok {
-		n.style = cached.(PathStyle)
+		n.style = cached
 		n.pinned = true
 	}
 	return n
@@ -443,18 +495,30 @@ func (n *pathNegotiator) pin(style PathStyle) {
 // implements PathStyleAuto. The generated client always builds canonical
 // paths; this doer rewrites and retries them as the negotiation dictates.
 type pathNegotiatingDoer struct {
-	inner  oapi.HttpRequestDoer
-	client *StandbyClient
+	admission *admission.Client
+	owned     bool
+	client    *StandbyClient
 }
 
 func (d *pathNegotiatingDoer) Do(req *http.Request) (*http.Response, error) {
+	return d.admission.DoOperation(req, func(current *http.Request, next admission.Doer) (*http.Response, error) {
+		if d.owned {
+			standard := *(next.(*http.Client))
+			standard.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+			next = &standard
+		}
+		return d.negotiate(current, next)
+	})
+}
+
+func (d *pathNegotiatingDoer) negotiate(req *http.Request, next oapi.HttpRequestDoer) (*http.Response, error) {
 	c := d.client
 	if c == nil || c.pathStyle != PathStyleAuto || req == nil || req.URL == nil {
-		return d.inner.Do(req)
+		return next.Do(req)
 	}
 	legacyPath, ok := legacyAdminRequestPath(req.URL.Path)
 	if !ok {
-		return d.inner.Do(req)
+		return next.Do(req)
 	}
 	canonicalPath := req.URL.Path
 	pathFor := func(style PathStyle) string {
@@ -464,19 +528,60 @@ func (d *pathNegotiatingDoer) Do(req *http.Request) (*http.Response, error) {
 		return canonicalPath
 	}
 
+	replaySafe := req.Method == http.MethodGet || req.Method == http.MethodHead
+	sent := false
+	defer func() {
+		if !replaySafe && !sent && req.Body != nil {
+			_ = req.Body.Close()
+		}
+	}()
 	first, pinned := c.negotiator.current()
+	if !replaySafe && !pinned {
+		// A mutation's 404 cannot prove that no effect occurred. Discover the
+		// spelling with a read before sending the original mutation once.
+		probe := requestWithPath(req, StandbyPrimaryStatusPath)
+		probe.Method = http.MethodGet
+		probe.Body = nil
+		probe.GetBody = nil
+		probe.ContentLength = 0
+		probe.TransferEncoding = nil
+		probe.URL.RawQuery = ""
+		probe.URL.ForceQuery = false
+		response, err := d.negotiate(probe, next)
+		if err != nil {
+			return response, err
+		}
+		if response.StatusCode < 200 || response.StatusCode >= 300 {
+			return response, nil
+		}
+		if response.Body != nil {
+			_ = response.Body.Close()
+		}
+		first, pinned = c.negotiator.current()
+		if !pinned {
+			return nil, errors.New("standby route discovery did not establish a route")
+		}
+	}
+	if err := req.Context().Err(); err != nil {
+		return nil, err
+	}
 	firstReq := req
 	if first == PathStyleLegacy {
 		firstReq = requestWithPath(req, legacyPath)
 	}
-	resp, err := d.inner.Do(firstReq)
+	sent = true
+	resp, err := next.Do(firstReq)
 	if err != nil {
 		return resp, err
 	}
 	if resp.StatusCode != http.StatusNotFound {
-		if !pinned {
+		if !pinned && resp.StatusCode >= 200 && resp.StatusCode < 300 {
 			c.negotiator.pin(first)
 		}
+		return resp, nil
+	}
+
+	if !replaySafe {
 		return resp, nil
 	}
 
@@ -485,6 +590,10 @@ func (d *pathNegotiatingDoer) Do(req *http.Request) (*http.Response, error) {
 	// unrouted-looking body triggers a re-probe, so a real SlotNotFound
 	// does not cost an extra round trip.
 	body, restored := peekBody(resp)
+	if err := req.Context().Err(); err != nil {
+		_ = resp.Body.Close()
+		return nil, err
+	}
 	if !restored || (pinned && !looksUnrouted(body)) {
 		return resp, nil
 	}
@@ -496,7 +605,14 @@ func (d *pathNegotiatingDoer) Do(req *http.Request) (*http.Response, error) {
 	if !ok {
 		return resp, nil
 	}
-	retryResp, retryErr := d.inner.Do(retryReq)
+	retryResp, retryErr := next.Do(retryReq)
+	if req.Context().Err() != nil {
+		_ = resp.Body.Close()
+		if retryResp != nil && retryResp.Body != nil {
+			_ = retryResp.Body.Close()
+		}
+		return nil, req.Context().Err()
+	}
 	if retryErr != nil || retryResp.StatusCode == http.StatusNotFound {
 		if retryResp != nil && retryResp.Body != nil {
 			_ = retryResp.Body.Close()
@@ -504,7 +620,9 @@ func (d *pathNegotiatingDoer) Do(req *http.Request) (*http.Response, error) {
 		return resp, nil
 	}
 	_ = resp.Body.Close()
-	c.negotiator.pin(other)
+	if retryResp.StatusCode >= 200 && retryResp.StatusCode < 300 {
+		c.negotiator.pin(other)
+	}
 	return retryResp, nil
 }
 
@@ -565,6 +683,7 @@ func looksUnrouted(body []byte) bool {
 // (still /admin/v1/ha by default this release; see PathStyle).
 type StandbyClient struct {
 	client     *oapi.ClientWithResponses
+	admission  *admission.Client
 	editors    []oapi.RequestEditorFn
 	authEditor oapi.RequestEditorFn
 	pathStyle  PathStyle
@@ -3037,27 +3156,48 @@ func StandbyIsRetryable(err error) bool {
 // server root, an explicit /admin/v1 admin API root, or the /admin/v1/ha HA
 // root advertised to operators.
 func NewStandbyClient(baseURL string, httpClient *http.Client) (*StandbyClient, error) {
-	var doer oapi.HttpRequestDoer = http.DefaultClient
-	if httpClient != nil {
-		doer = httpClient
-	}
-	return newStandbyClientWithDoer(baseURL, doer)
+	return NewStandbyClientWithAdmission(baseURL, httpClient, nil)
 }
 
-func newStandbyClientWithDoer(baseURL string, doer oapi.HttpRequestDoer) (*StandbyClient, error) {
+// NewStandbyClientWithAdmission bounds complete standby HTTP operations,
+// including route negotiation and response decoding. Nil policy selects the
+// SDK defaults; an existing bounded client can be shared with a nil policy.
+func NewStandbyClientWithAdmission(baseURL string, doer HTTPRequestDoer, policy *admission.Config) (*StandbyClient, error) {
 	normalizedBaseURL, err := normalizeAdminBaseURL(baseURL)
 	if err != nil {
 		return nil, err
 	}
-	negotiating := &pathNegotiatingDoer{inner: doer}
-	client, err := oapi.NewClientWithResponses(normalizedBaseURL, oapi.WithHTTPClient(negotiating))
+	bounded, err := admission.New(doer, policy)
 	if err != nil {
 		return nil, err
 	}
-	c := &StandbyClient{client: client, pathStyle: PathStyleLegacy, negotiator: newPathNegotiator(normalizedBaseURL)}
+	standard, isStandard := doer.(*http.Client)
+	owned := doer == nil || (isStandard && standard == nil)
+	negotiating := &pathNegotiatingDoer{admission: bounded, owned: owned}
+	client, err := oapi.NewClientWithResponses(normalizedBaseURL, oapi.WithHTTPClient(negotiating))
+	if err != nil {
+		if owned {
+			_ = bounded.Close()
+		}
+		return nil, err
+	}
+	c := &StandbyClient{client: client, admission: bounded, pathStyle: PathStyleLegacy, negotiator: newPathNegotiator(normalizedBaseURL)}
 	negotiating.client = c
 	c.rebuildEditors()
 	return c, nil
+}
+
+func newStandbyClientWithDoer(baseURL string, doer oapi.HttpRequestDoer) (*StandbyClient, error) {
+	return NewStandbyClientWithAdmission(baseURL, doer, nil)
+}
+
+// Close stops admission and wakes waiters. A shared admission owner closes for
+// every user; the caller retains ownership of any supplied HTTP transport.
+func (c *StandbyClient) Close() error {
+	if c == nil {
+		return nil
+	}
+	return c.admission.Close()
 }
 
 // WithToken configures bearer-token authentication for standby admin requests.

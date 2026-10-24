@@ -53,7 +53,7 @@ fn load() !Api {
     const sgemm_fn = lib.lookup(Sgemm, "cblas_sgemm") orelse return error.InvalidOpenBlasLibrary;
     const set_threads = lib.lookup(*const fn (c_int) callconv(.c) void, "openblas_set_num_threads") orelse return error.InvalidOpenBlasLibrary;
     const get_threads = lib.lookup(*const fn () callconv(.c) c_int, "openblas_get_num_threads") orelse return error.InvalidOpenBlasLibrary;
-    const threads = try threadCount(linalg.pool.cachedCpuCount(), env("OPENBLAS_NUM_THREADS"));
+    const threads = try threadCount(linalg.pool.processCpuCount(), env("OPENBLAS_NUM_THREADS"));
     set_threads(@intCast(threads));
     const actual = get_threads();
     if (actual < 1 or actual > threads) return error.OpenBlasThreadLimitFailed;

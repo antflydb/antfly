@@ -28,6 +28,21 @@ pub fn contextCancellation(context: *const Context) @import("objectstore").Cance
     }.check };
 }
 
+/// Only checked physical provider boundaries may poll without runnable CPU.
+pub fn providerCancellation(context: *const Context) @import("objectstore").CancellationToken {
+    return .{ .ptr = context, .is_cancelled_fn = struct {
+        fn check(raw: *const anyopaque) bool {
+            const current: *const Context = @ptrCast(@alignCast(raw));
+            if (current.wait != null) {
+                current.checkLifetime() catch return true;
+            } else {
+                current.ensureActive() catch return true;
+            }
+            return false;
+        }
+    }.check };
+}
+
 pub const max_metadata_bytes = 16 * 1024 * 1024;
 pub const max_commit_bytes = 4 * 1024 * 1024;
 

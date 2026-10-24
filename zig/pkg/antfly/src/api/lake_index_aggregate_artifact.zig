@@ -23,6 +23,8 @@ const stores = @import("../serverless/artifacts/store.zig");
 const Ref = local.serverless_manifest_artifact_ref.ArtifactRef;
 const Cancellation = @import("antfly_cancellation").CancellationToken;
 const A = std.mem.Allocator;
+const ReadContext = local.serverless_query_lake_read_context.Context;
+const Execution = local.common_request_admission.runnable_scheduler.Execution;
 pub const CachedRead = struct {
     metrics: ?*@import("lake_query_metrics.zig").Metrics = null,
     cache: *local.serverless_query_lake_serving_cache.Cache,
@@ -31,30 +33,37 @@ pub const CachedRead = struct {
 };
 
 pub fn readArtifact(a: A, store: stores.ArtifactStore, ref: ChunkRef, cancellation: Cancellation, cached: ?CachedRead) ![]u8 {
+    return readArtifactFor(a, store, ref, cancellation, cached, if (cached) |cache| cache.context else .{});
+}
+pub fn readArtifactFor(a: A, store: stores.ArtifactStore, ref: ChunkRef, cancellation: Cancellation, cached: ?CachedRead, context: ReadContext) ![]u8 {
     var loader = struct {
         store: stores.ArtifactStore,
         ref: ChunkRef,
         cancellation: Cancellation,
+        context: local.serverless_query_lake_read_context.Context,
         fn load(raw: *anyopaque, alloc: A) ![]u8 {
             const self: *@This() = @ptrCast(@alignCast(raw));
-            return self.store.getVerifiedAllocWithCancellationUsingAllocator(alloc, self.ref.artifact_id, self.ref.byte_len, self.ref.checksum, self.cancellation);
+            return self.store.getVerifiedAllocFor(alloc, self.ref.artifact_id, self.ref.byte_len, self.ref.checksum, self.cancellation, self.context);
         }
-    }{ .store = store, .ref = ref, .cancellation = cancellation };
+    }{ .store = store, .ref = ref, .cancellation = cancellation, .context = context };
     try stores.validateSha256ArtifactIdentity(ref.artifact_id, ref.checksum);
     try cancellation.check();
-    if (cached) |cache| return cache.cache.readImmutableAlloc(a, cache.scope, ref.artifact_id, std.math.cast(usize, ref.byte_len) orelse return error.ArtifactTooLarge, try stores.sha256DigestFromChecksum(ref.checksum), cache.context, .{ .ptr = &loader, .load = @TypeOf(loader).load });
+    if (cached) |cache| return cache.cache.readImmutableAlloc(a, cache.scope, ref.artifact_id, std.math.cast(usize, ref.byte_len) orelse return error.ArtifactTooLarge, try stores.sha256DigestFromChecksum(ref.checksum), context, .{ .ptr = &loader, .load = @TypeOf(loader).load });
     return @TypeOf(loader).load(&loader, a);
 }
 /// Authenticate a page range independently of its containing immutable object.
 /// Range cache identities bind the pack, offset, length and page digest. A cold
 /// seek reads only that page; it never downloads the whole navigation pack.
 pub fn readPageRange(a: A, store: stores.ArtifactStore, ref: ChunkRef, offset: u64, length: usize, digest: [32]u8, cancellation: Cancellation, cached: ?CachedRead) ![]u8 {
+    return readPageRangeFor(a, store, ref, offset, length, digest, cancellation, cached, if (cached) |cache| cache.context else .{});
+}
+pub fn readPageRangeFor(a: A, store: stores.ArtifactStore, ref: ChunkRef, offset: u64, length: usize, digest: [32]u8, cancellation: Cancellation, cached: ?CachedRead, context: ReadContext) ![]u8 {
     try stores.validateSha256ArtifactIdentity(ref.artifact_id, ref.checksum);
     if (offset > ref.byte_len or length > ref.byte_len - offset or length > @import("../serverless/graph_segment/page_tree.zig").max_page_bytes) return error.InvalidGraphPage;
     if (offset == 0 and length == ref.byte_len) {
         const object_digest = try stores.sha256DigestFromChecksum(ref.checksum);
         if (!std.mem.eql(u8, &object_digest, &digest)) return error.ArtifactIntegrityMismatch;
-        return readArtifact(a, store, ref, cancellation, cached);
+        return readArtifactFor(a, store, ref, cancellation, cached, context);
     }
     const Loader = struct {
         store: stores.ArtifactStore,
@@ -63,21 +72,22 @@ pub fn readPageRange(a: A, store: stores.ArtifactStore, ref: ChunkRef, offset: u
         length: usize,
         digest: [32]u8,
         token: Cancellation,
+        context: ReadContext,
         fn load(raw: *anyopaque, alloc: A) ![]u8 {
             const self: *@This() = @ptrCast(@alignCast(raw));
-            const bytes = try self.store.getRangeAllocWithCancellationUsingAllocator(alloc, self.ref.artifact_id, self.offset, self.length, self.token);
+            const bytes = try self.store.getRangeAllocFor(alloc, self.ref.artifact_id, self.offset, self.length, self.token, self.context);
             errdefer alloc.free(bytes);
             if (bytes.len != self.length) return error.ArtifactIntegrityMismatch;
-            try stores.validatePayloadSha256WithCancellation(bytes, &std.fmt.bytesToHex(&self.digest, .lower), self.token);
+            try stores.validatePayloadSha256For(bytes, &std.fmt.bytesToHex(&self.digest, .lower), self.token, self.context);
             return bytes;
         }
     };
-    var loader: Loader = .{ .store = store, .ref = ref, .offset = offset, .length = length, .digest = digest, .token = cancellation };
+    var loader: Loader = .{ .store = store, .ref = ref, .offset = offset, .length = length, .digest = digest, .token = cancellation, .context = context };
     try cancellation.check();
     if (cached) |cache| {
         var identity: [256]u8 = undefined;
         const key = try std.fmt.bufPrint(&identity, "{s}:page:{x}:{x}", .{ ref.artifact_id, offset, length });
-        return cache.cache.readImmutableAlloc(a, cache.scope, key, length, digest, cache.context, .{ .ptr = &loader, .load = Loader.load });
+        return cache.cache.readImmutableAlloc(a, cache.scope, key, length, digest, context, .{ .ptr = &loader, .load = Loader.load });
     }
     return Loader.load(&loader, a);
 }
@@ -97,19 +107,23 @@ pub fn readPublicationArtifact(a: A, store: stores.ArtifactStore, ref: ChunkRef,
 /// Borrow a verified bounded block until the caller has copied/decoded its
 /// requested range. Current authority is checked even when payloads are warm.
 pub fn readArtifactLease(a: A, store: stores.ArtifactStore, ref: ChunkRef, cancellation: Cancellation, cached: ?CachedRead) !local.serverless_query_lake_serving_cache.Cache.ImmutableLease {
+    return readArtifactLeaseFor(a, store, ref, cancellation, cached, if (cached) |cache| cache.context else .{});
+}
+pub fn readArtifactLeaseFor(a: A, store: stores.ArtifactStore, ref: ChunkRef, cancellation: Cancellation, cached: ?CachedRead, context: ReadContext) !local.serverless_query_lake_serving_cache.Cache.ImmutableLease {
     const Loader = struct {
         store: stores.ArtifactStore,
         ref: ChunkRef,
         cancellation: Cancellation,
+        context: local.serverless_query_lake_read_context.Context,
         fn load(raw: *anyopaque, alloc: A) ![]u8 {
             const self: *@This() = @ptrCast(@alignCast(raw));
-            return self.store.getVerifiedAllocWithCancellationUsingAllocator(alloc, self.ref.artifact_id, self.ref.byte_len, self.ref.checksum, self.cancellation);
+            return self.store.getVerifiedAllocFor(alloc, self.ref.artifact_id, self.ref.byte_len, self.ref.checksum, self.cancellation, self.context);
         }
     };
-    var loader: Loader = .{ .store = store, .ref = ref, .cancellation = cancellation };
+    var loader: Loader = .{ .store = store, .ref = ref, .cancellation = cancellation, .context = context };
     try stores.validateSha256ArtifactIdentity(ref.artifact_id, ref.checksum);
     try cancellation.check();
-    if (cached) |cache| return cache.cache.readImmutableBlockLease(a, cache.scope, ref.artifact_id, std.math.cast(usize, ref.byte_len) orelse return error.ArtifactTooLarge, try stores.sha256DigestFromChecksum(ref.checksum), cache.context, .{ .ptr = &loader, .load = Loader.load });
+    if (cached) |cache| return cache.cache.readImmutableBlockLease(a, cache.scope, ref.artifact_id, std.math.cast(usize, ref.byte_len) orelse return error.ArtifactTooLarge, try stores.sha256DigestFromChecksum(ref.checksum), context, .{ .ptr = &loader, .load = Loader.load });
     return .{ .heap = .{ .alloc = a, .bytes = try Loader.load(&loader, a) } };
 }
 
@@ -232,8 +246,11 @@ fn physicalIdentity(a: A, root: Root) !?[32]u8 {
     return hash;
 }
 fn decodeCohort(a: A, store: stores.ArtifactStore, ref: Ref, token: Cancellation, cached: ?CachedRead) !Cohort {
+    return decodeCohortFor(a, store, ref, token, cached, if (cached) |cache| cache.context else .{});
+}
+fn decodeCohortFor(a: A, store: stores.ArtifactStore, ref: Ref, token: Cancellation, cached: ?CachedRead, context: ReadContext) !Cohort {
     if (ref.byte_len > max_root_bytes) return error.InvalidNativeAggregateArtifact;
-    const bytes = try readArtifact(a, store, .{ .artifact_id = ref.artifact_id, .checksum = ref.checksum, .byte_len = ref.byte_len }, token, cached);
+    const bytes = try readArtifactFor(a, store, .{ .artifact_id = ref.artifact_id, .checksum = ref.checksum, .byte_len = ref.byte_len }, token, cached, context);
     defer a.free(bytes);
     const cohort = try std.json.parseFromSliceLeaky(Cohort, a, bytes, .{ .allocate = .alloc_always });
     if (cohort.version != 1 or cohort.recipe.inputs.len == 0 or cohort.recipe.inputs.len > 256 or cohort.members.len != cohort.recipe.inputs.len or cohort.children.len > 64 or cohort.depth > max_partition_depth) return error.InvalidNativeAggregateArtifact;
@@ -434,12 +451,18 @@ const TreeControl = struct {
     }
 };
 fn loadTreeControl(a: A, store: stores.ArtifactStore, ref: Ref, token: Cancellation, cached: ?CachedRead) !TreeControl {
-    return loadTreeControlInner(a, store, ref, token, cached, false);
+    return loadTreeControlFor(a, store, ref, token, cached, if (cached) |cache| cache.context else .{});
+}
+fn loadTreeControlFor(a: A, store: stores.ArtifactStore, ref: Ref, token: Cancellation, cached: ?CachedRead, context: ReadContext) !TreeControl {
+    return loadTreeControlInnerFor(a, store, ref, token, cached, false, context);
 }
 fn loadTreeControlInner(a: A, store: stores.ArtifactStore, ref: Ref, token: Cancellation, cached: ?CachedRead, publication: bool) !TreeControl {
+    return loadTreeControlInnerFor(a, store, ref, token, cached, publication, if (cached) |cache| cache.context else .{});
+}
+fn loadTreeControlInnerFor(a: A, store: stores.ArtifactStore, ref: Ref, token: Cancellation, cached: ?CachedRead, publication: bool, context: ReadContext) !TreeControl {
     if (ref.kind != .algebraic_segment or !isTree(ref.metadata_version) or ref.byte_len > max_root_bytes) return error.InvalidNativeAggregateArtifact;
     const chunk: ChunkRef = .{ .artifact_id = ref.artifact_id, .checksum = ref.checksum, .byte_len = ref.byte_len };
-    const bytes = if (publication) try readPublicationArtifact(a, store, chunk, token) else try readArtifact(a, store, chunk, token, cached);
+    const bytes = if (publication) try readPublicationArtifact(a, store, chunk, token) else try readArtifactFor(a, store, chunk, token, cached, context);
     defer a.free(bytes);
     const value = try std.json.parseFromSliceLeaky(TreeControl, a, bytes, .{ .allocate = .alloc_always });
     if (!std.mem.eql(u8, value.format, if (ref.metadata_version == 8) "native-sql-aggregate-v8" else "native-sql-aggregate-v7") or value.names.len == 0 or value.names.len > 256 or value.names.len != value.recipe.inputs.len) return error.InvalidNativeAggregateArtifact;
@@ -654,10 +677,13 @@ fn publishPartialStream(a: A, result_alloc: A, store: *stores.ArtifactStore, nam
 /// Cache only authenticated immutable directory metadata. The expected query
 /// recipe and the live reader lease are checked on every open, including hits.
 fn loadRoot(a: A, store: stores.ArtifactStore, artifact: Ref, cancellation: Cancellation, cached: ?CachedRead) !Root {
-    if (isTree(artifact.metadata_version)) return (try loadTreeControl(a, store, artifact, cancellation, cached)).root(artifact.name);
+    return loadRootFor(a, store, artifact, cancellation, cached, if (cached) |cache| cache.context else .{});
+}
+fn loadRootFor(a: A, store: stores.ArtifactStore, artifact: Ref, cancellation: Cancellation, cached: ?CachedRead, context: ReadContext) !Root {
+    if (isTree(artifact.metadata_version)) return (try loadTreeControlFor(a, store, artifact, cancellation, cached, context)).root(artifact.name);
+    if (artifact.metadata_version == 6) return (try loadPackedFor(a, store, artifact, cancellation, cached, context)).root(artifact.name);
     if (artifact.kind != .algebraic_segment or !supportsMetadataVersion(artifact.metadata_version) or artifact.byte_len > max_root_bytes) return error.InvalidNativeAggregateArtifact;
-    if (artifact.metadata_version == 6) return (try loadPacked(a, store, artifact, cancellation, cached)).root(artifact.name);
-    const bytes = try readArtifact(a, store, .{ .artifact_id = artifact.artifact_id, .byte_len = artifact.byte_len, .checksum = artifact.checksum }, cancellation, cached);
+    const bytes = try readArtifactFor(a, store, .{ .artifact_id = artifact.artifact_id, .byte_len = artifact.byte_len, .checksum = artifact.checksum }, cancellation, cached, context);
     defer a.free(bytes);
     const root = try std.json.parseFromSliceLeaky(Root, a, bytes, .{ .allocate = .alloc_always });
     try validateRoot(artifact, root);
@@ -758,8 +784,11 @@ const Packed = struct {
 };
 const pack_magic = "AGPK\x01";
 fn loadPacked(a: A, store: stores.ArtifactStore, ref: Ref, token: Cancellation, cached: ?CachedRead) !Packed {
+    return loadPackedFor(a, store, ref, token, cached, if (cached) |cache| cache.context else .{});
+}
+fn loadPackedFor(a: A, store: stores.ArtifactStore, ref: Ref, token: Cancellation, cached: ?CachedRead, context: ReadContext) !Packed {
     if (ref.kind != .algebraic_segment or ref.metadata_version != 6 or ref.byte_len > max_root_bytes) return error.InvalidNativeAggregateArtifact;
-    const bytes = try readArtifact(a, store, .{ .artifact_id = ref.artifact_id, .checksum = ref.checksum, .byte_len = ref.byte_len }, token, cached);
+    const bytes = try readArtifactFor(a, store, .{ .artifact_id = ref.artifact_id, .checksum = ref.checksum, .byte_len = ref.byte_len }, token, cached, context);
     if (bytes.len < 9 or !std.mem.eql(u8, bytes[0..5], pack_magic)) return error.InvalidNativeAggregateArtifact;
     const length = std.mem.readInt(u32, bytes[5..9], .little);
     if (length > bytes.len - 9) return error.InvalidNativeAggregateArtifact;
@@ -912,6 +941,8 @@ pub const Reader = struct {
     store: stores.ArtifactStore,
     cancellation: Cancellation,
     cached: ?CachedRead = null,
+    context: ReadContext = .{},
+    execution: ?*Execution = null,
     pack_data: ?Packed = null,
     pack_metadata: ?@import("lake_index_decoded_metadata.zig").Owned(Packed) = null,
     tree_metadata: ?@import("lake_index_decoded_metadata.zig").Owned(TreeControl) = null,
@@ -969,7 +1000,7 @@ pub const Reader = struct {
     };
     fn fetchTreeFrame(self: *Reader) anyerror!?*TreeFrame {
         try self.cancellation.check();
-        if (self.cached) |cached| try cached.context.ensureActive();
+        try self.currentContext().ensureActive();
         const backing = local.sql_memory_budget.reclaimingAllocator(self.a);
         const frame = try backing.create(TreeFrame);
         frame.* = .{ .allocator = backing, .arena = .init(backing), .records = &.{} };
@@ -1015,6 +1046,17 @@ pub const Reader = struct {
         return openWithCache(a, store, artifact, recipe, cancellation, null);
     }
     pub fn openWithCache(a: A, store: stores.ArtifactStore, artifact: Ref, recipe: recipes.Recipe, cancellation: Cancellation, cached: ?CachedRead) !*Reader {
+        return openWithCacheFor(a, store, artifact, recipe, cancellation, cached, null);
+    }
+    pub fn openWithCacheFor(a: A, store: stores.ArtifactStore, artifact: Ref, recipe: recipes.Recipe, cancellation: Cancellation, cached: ?CachedRead, execution: ?*Execution) !*Reader {
+        const context: ReadContext = if (cached) |cache| cache.context else .{};
+        const active = if (execution) |owner| context.withExecution(owner) else context;
+        try active.ensureActive();
+        const active_cache: ?CachedRead = if (cached) |cache| active_read: {
+            var current = cache;
+            current.context = active;
+            break :active_read current;
+        } else null;
         if (artifact.kind != .algebraic_segment or !supportsMetadataVersion(artifact.metadata_version) or artifact.byte_len > max_root_bytes) return error.InvalidNativeAggregateArtifact;
         const self = try a.create(Reader);
         errdefer a.destroy(self);
@@ -1023,23 +1065,24 @@ pub const Reader = struct {
         const ca = control.allocator();
         var pack_ref = artifact;
         pack_ref.name = ""; // Every logical slot shares one authenticated pack.
-        const pack_metadata = if (artifact.metadata_version == 6 and cached != null) try @import("lake_index_decoded_metadata.zig").acquire(Packed, cached.?, store, pack_ref, cancellation, loadPacked) else null;
+        const pack_metadata = if (artifact.metadata_version == 6 and active_cache != null) try @import("lake_index_decoded_metadata.zig").acquire(Packed, active_cache.?, store, pack_ref, cancellation, loadPacked) else null;
         errdefer if (pack_metadata) |owned| owned.release();
-        const pack_data = if (pack_metadata) |owned| owned.value.* else if (artifact.metadata_version == 6) try loadPacked(ca, store, artifact, cancellation, cached) else null;
-        const tree_metadata = if (isTree(artifact.metadata_version) and cached != null) try @import("lake_index_decoded_metadata.zig").acquire(TreeControl, cached.?, store, pack_ref, cancellation, loadTreeControl) else null;
+        const pack_data = if (pack_metadata) |owned| owned.value.* else if (artifact.metadata_version == 6) try loadPackedFor(ca, store, artifact, cancellation, active_cache, active) else null;
+        const tree_metadata = if (isTree(artifact.metadata_version) and active_cache != null) try @import("lake_index_decoded_metadata.zig").acquire(TreeControl, active_cache.?, store, pack_ref, cancellation, loadTreeControl) else null;
         errdefer if (tree_metadata) |owned| owned.release();
-        const metadata = if (cached != null and pack_data == null and tree_metadata == null) metadata: {
-            const cache = cached.?;
+        const metadata = if (active_cache != null and pack_data == null and tree_metadata == null) metadata: {
+            const cache = active_cache.?;
             break :metadata try @import("lake_index_decoded_metadata.zig").acquire(Root, cache, store, artifact, cancellation, loadRoot);
         } else null;
         errdefer if (metadata) |owned| owned.release();
-        const root = if (pack_data) |pack| try pack.root(artifact.name) else if (tree_metadata) |tree| try tree.value.root(artifact.name) else if (metadata) |owned| owned.value.* else try loadRoot(ca, store, artifact, cancellation, null);
+        const root = if (pack_data) |pack| try pack.root(artifact.name) else if (tree_metadata) |tree| try tree.value.root(artifact.name) else if (metadata) |owned| owned.value.* else try loadRootFor(ca, store, artifact, cancellation, null, active);
+        try active.ensureActive();
         if (!root.recipe.eql(recipe)) return error.InvalidNativeAggregateArtifact;
-        const cohort_metadata = if (cached) |cache| if (root.cohort) |ref| try @import("lake_index_decoded_metadata.zig").acquire(Cohort, cache, store, cohortReference(ref), cancellation, decodeCohort) else null else null;
+        const cohort_metadata = if (active_cache) |cache| if (root.cohort) |ref| try @import("lake_index_decoded_metadata.zig").acquire(Cohort, cache, store, cohortReference(ref), cancellation, decodeCohort) else null else null;
         errdefer if (cohort_metadata) |owned| owned.release();
-        const cohort: ?Cohort = if (cohort_metadata) |owned| owned.value.* else if (root.cohort) |ref| try decodeCohort(ca, store, cohortReference(ref), cancellation, null) else null;
+        const cohort: ?Cohort = if (cohort_metadata) |owned| owned.value.* else if (root.cohort) |ref| try decodeCohortFor(ca, store, cohortReference(ref), cancellation, null, active) else null;
         if (cohort) |proof| try validateCohort(ca, root, proof);
-        self.* = .{ .tree_metadata = tree_metadata, .pack_metadata = pack_metadata, .pack_data = pack_data, .cohort_metadata = cohort_metadata, .cohort = cohort, .a = a, .store = store, .cancellation = cancellation, .cached = cached, .control = control, .page = .init(a), .root = root, .metadata = metadata };
+        self.* = .{ .tree_metadata = tree_metadata, .pack_metadata = pack_metadata, .pack_data = pack_data, .cohort_metadata = cohort_metadata, .cohort = cohort, .a = a, .store = store, .cancellation = cancellation, .cached = cached, .context = context, .control = control, .page = .init(a), .root = root, .metadata = metadata };
         return self;
     }
     /// Roots may fuse only when authenticated state recipes and the entire
@@ -1047,6 +1090,13 @@ pub const Reader = struct {
     pub fn setOutputSlot(self: *Reader, slot: u16) !void {
         self.output_slots = try self.control.allocator().dupe(u16, &.{slot});
         self.state_slots = try self.control.allocator().dupe(u16, &.{self.root.state_slot orelse 0});
+    }
+    pub fn fuseFor(self: *Reader, other: *const Reader, output_slot: u16, execution: ?*Execution) !bool {
+        if (execution) |owner| try bindExecution(self, owner);
+        defer if (execution != null) releaseExecution(self);
+        const result = try self.fuse(other, output_slot);
+        if (execution) |owner| try owner.checkpoint();
+        return result;
     }
     pub fn fuse(self: *Reader, other: *const Reader, output_slot: u16) !bool {
         if (self.root.partitions.len != 0 or other.root.partitions.len != 0) return self.fusePartitions(other, output_slot);
@@ -1082,7 +1132,7 @@ pub const Reader = struct {
     }
     pub fn partitionReaderAllocated(self: *Reader, index: usize, allocator: A) !*Reader {
         const part = self.root.partitions[index];
-        const reader = try Reader.openWithCache(allocator, self.store, part.artifact, self.root.recipe, self.cancellation, self.cached);
+        const reader = try Reader.openWithCacheFor(allocator, self.store, part.artifact, self.root.recipe, self.cancellation, self.cached, self.execution);
         errdefer reader.cursor().close(reader);
         reader.max_typed_bytes = self.max_typed_bytes;
         reader.point_hash = self.point_hash;
@@ -1136,9 +1186,9 @@ pub const Reader = struct {
         const children = try a.alloc(PartitionMap, left.root.partitions.len);
         for (left.root.partitions, right.root.partitions, children, 0..) |l, r, *child, index| {
             if (l.bucket != r.bucket or l.groups != r.groups) return null;
-            const lreader = try Reader.openWithCache(left.a, left.store, l.artifact, left.root.recipe, left.cancellation, left.cached);
+            const lreader = try Reader.openWithCacheFor(left.a, left.store, l.artifact, left.root.recipe, left.cancellation, left.cached, left.execution);
             defer lreader.cursor().close(lreader);
-            const rreader = try Reader.openWithCache(right.a, right.store, r.artifact, right.root.recipe, right.cancellation, right.cached);
+            const rreader = try Reader.openWithCacheFor(right.a, right.store, r.artifact, right.root.recipe, right.cancellation, right.cached, left.execution);
             defer rreader.cursor().close(rreader);
             child.* = (try mergePartitionMap(a, lreader, rreader, if (prior) |map| (if (map.children) |maps| maps[index] else null) else null)) orelse return null;
         }
@@ -1208,16 +1258,40 @@ pub const Reader = struct {
         return true;
     }
     pub fn cursor(self: *Reader) local.sql_catalog.AggregatePartialCursor {
-        return .{ .ptr = self, .next = next, .close = close, .select_point = selectPoint, .select_keys = selectKeys, .final_group_proof = .{ .count = self.root.groups, .slots = self.output_slots orelse &.{0} } };
+        return .{ .ptr = self, .next = next, .close = close, .select_point = selectPoint, .select_keys = selectKeys, .coordinator_execution = .{ .bind = bindExecution, .release = releaseExecution }, .final_group_proof = .{ .count = self.root.groups, .slots = self.output_slots orelse &.{0} } };
+    }
+    fn bindExecution(raw: *anyopaque, execution: *Execution) !void {
+        const self: *Reader = @ptrCast(@alignCast(raw));
+        if (self.execution != null) return error.InvalidRunnableTransition;
+        try self.context.withExecution(execution).ensureActive();
+        self.execution = execution;
+    }
+    fn releaseExecution(raw: *anyopaque) void {
+        const self: *Reader = @ptrCast(@alignCast(raw));
+        self.execution = null;
+        if (self.tree_access) |access| {
+            access.context = self.context;
+            access.cached = self.cached;
+        }
+    }
+    fn currentCache(self: *Reader) ?CachedRead {
+        var cache = self.cached orelse return null;
+        cache.context = self.currentContext();
+        return cache;
+    }
+    fn currentContext(self: *Reader) ReadContext {
+        return if (self.execution) |owner| self.context.withExecution(owner) else self.context;
     }
     fn next(raw: *anyopaque, a: A, maximum: u32) !?[]const operators.GroupResult {
         const self: *Reader = @ptrCast(@alignCast(raw));
+        try self.currentContext().ensureActive();
         self.selection_started = true;
         if (self.ordered_plan) |plan| return plan.next(a, maximum);
         return nextRaw(raw, a, maximum);
     }
     pub fn nextRaw(raw: *anyopaque, a: A, maximum: u32) anyerror!?[]const operators.GroupResult {
         const self: *Reader = @ptrCast(@alignCast(raw));
+        try self.currentContext().ensureActive();
         try self.cancellation.check();
         if (self.cached) |cached| try cached.context.ensureActive();
         if (maximum == 0) return error.InvalidSqlLimit;
@@ -1239,7 +1313,7 @@ pub const Reader = struct {
                 self.child = try self.partitionReader(self.partition_index);
                 self.partition_index += 1;
             }
-            if (try self.child.?.cursor().next(self.child.?, a, maximum)) |rows| {
+            if (try self.child.?.cursor().nextFor(self.execution, a, maximum)) |rows| {
                 self.emitted += rows.len;
                 return rows;
             }
@@ -1266,10 +1340,10 @@ pub const Reader = struct {
             const ref = self.root.blocks[self.block_index];
             const state_recipe = self.root.state_recipe orelse self.root.recipe;
             const fingerprint = state_recipe.fingerprint();
-            const owned = if (self.cached) |cached| if (self.pack_data) |pack_data| try @import("lake_index_decoded_metadata.zig").acquireColumnBlockBytes(cached, self.store, ref.artifact, self.cancellation, pack_data.bytes) else try @import("lake_index_decoded_metadata.zig").acquireColumnBlock(cached, self.store, ref.artifact, self.cancellation) else null;
+            const owned = if (self.currentCache()) |cached| if (self.pack_data) |pack_data| try @import("lake_index_decoded_metadata.zig").acquireColumnBlockBytes(cached, self.store, ref.artifact, self.cancellation, pack_data.bytes) else try @import("lake_index_decoded_metadata.zig").acquireColumnBlock(cached, self.store, ref.artifact, self.cancellation) else null;
             errdefer if (owned) |value| value.release();
             const block = if (owned) |value| value.value.* else decode: {
-                const bytes = if (self.pack_data) |pack_data| pack_data.bytes else try readArtifact(pa, self.store, ref.artifact, self.cancellation, null);
+                const bytes = if (self.pack_data) |pack_data| pack_data.bytes else try readArtifactFor(pa, self.store, ref.artifact, self.cancellation, null, self.currentContext());
                 break :decode try spill.decodeColumnarBlockInArena(pa, bytes, max_block_bytes);
             };
             if (block.count() != ref.rows or block.keys.len != self.root.recipe.keys.len or block.values.len != (if (ref.state_layout != 0) native_partial.physicalWidth(state_recipe.inputs) else state_recipe.inputs.len)) return error.InvalidNativeAggregateArtifact;
@@ -1277,7 +1351,7 @@ pub const Reader = struct {
             var columns: std.ArrayList(@import("lake_index_decoded_metadata.zig").Owned(TypedColumn)) = .empty;
             var typed_bytes: usize = 0;
             errdefer for (columns.items) |column| column.release();
-            if (!self.raw_states) if (self.cached) |cached| for (0..width) |logical| {
+            if (!self.raw_states) if (self.currentCache()) |cached| for (0..width) |logical| {
                 const physical = self.physicalSlot(logical);
                 var interpretation: [35]u8 = undefined;
                 @memcpy(interpretation[0..32], &fingerprint);
@@ -1324,6 +1398,7 @@ pub const Reader = struct {
         const typed_cells = if (self.typed_columns.len != 0) try a.alloc(operators.Aggregate, try std.math.mul(usize, count, width)) else null;
         const encoded_cells = if (typed_cells == null and !native_layout) try a.alloc(local.sql_scalar.Datum, try std.math.mul(usize, count, width)) else null;
         for (result, 0..) |*row, index| {
+            if (index % 64 == 0) try self.currentContext().ensureActive();
             const keys = key_cells[index * block.keys.len ..][0..block.keys.len];
             for (keys, 0..) |*key, column| key.* = try block.keyCell(self.position, column);
             const states = if (typed_cells) |cells| cells[index * width ..][0..width] else null;
@@ -1355,11 +1430,14 @@ pub const Reader = struct {
         if (self.tree_cursor == null) {
             const ca = self.control.allocator();
             const access = try ca.create(@import("lake_index_native_directory.zig").Access);
-            access.init(self.store, index.domain, self.cancellation, self.cached);
+            access.init(self.store, index.domain, self.cancellation, self.currentCache());
+            access.context = self.currentContext();
             self.tree_access = access;
             const range = self.key_range orelse if (self.point_key) |point| group_keys.Range{ .lower = point, .upper = try group_keys.successor(ca, point) } else group_keys.Range{};
             self.tree_cursor = if (self.reverse) try state_tree.tree.Cursor.initReverse(local.sql_memory_budget.reclaimingAllocator(self.a), access.backing(), index.page, range.lower, range.upper) else try state_tree.tree.Cursor.init(local.sql_memory_budget.reclaimingAllocator(self.a), access.backing(), index.page, range.lower, range.upper);
         }
+        self.tree_access.?.context = self.currentContext();
+        self.tree_access.?.cached = self.currentCache();
         // Rows borrow their bounded frame until the next pull. Prefetch owns a
         // separate frame and never invalidates the one being consumed.
         if (self.tree_frame) |frame| if (self.tree_frame_position == frame.records.len) {
@@ -1375,7 +1453,7 @@ pub const Reader = struct {
                 if (self.point_hash == null and self.key_range == null and self.emitted != self.root.groups) return error.InvalidNativeAggregateArtifact;
                 return null;
             }
-            if (self.cached) |cached| if (cached.context.io) |io| if (self.tree_maximum == null or self.tree_loaded < self.tree_maximum.?) {
+            if (self.execution == null and self.context.execution == null) if (self.cached) |cached| if (cached.context.io) |io| if (self.tree_maximum == null or self.tree_loaded < self.tree_maximum.?) {
                 const available = local.sql_memory_budget.optionalHeadroom(local.sql_memory_budget.reclaimingAllocator(self.a)) orelse std.math.maxInt(usize);
                 if (available >= 8 * 1024 * 1024) {
                     self.tree_prefetch = local.sql_parallel_scheduler.global().submitIoTransient(io, 8 * 1024 * 1024, Reader.fetchTreeFrame, .{self});
@@ -1402,6 +1480,7 @@ pub const Reader = struct {
         const slots = self.state_slots orelse try a.dupe(u16, &.{self.root.state_slot.?});
         var n: usize = 0;
         while (n < count) {
+            if (n % 64 == 0) try self.currentContext().ensureActive();
             const record = self.tree_frame.?.records[self.tree_frame_position];
             self.tree_frame_position += 1;
             if (self.selection_rows_left == 0) return error.SqlProgramLimitExceeded;
@@ -1524,7 +1603,7 @@ test "external lake aggregate readers retain version one root compatibility" {
     var page = std.heap.ArenaAllocator.init(a);
     defer page.deinit();
     const rows = (try cursor.next(cursor.ptr, page.allocator(), 32)).?;
-    var state = try local.sql_aggregate_partial.decode(page.allocator(), rows[0].aggregates[0], spec);
+    var state = try local.sql_aggregate_partial.read(page.allocator(), rows[0], 0, spec);
     defer state.deinit();
     try std.testing.expectEqual(@as(u64, 23), state.count);
 }
@@ -2067,6 +2146,155 @@ test "external lake partitioned cohorts fuse once per block and decline late mis
         count += 1;
     };
     try std.testing.expectEqual(@as(usize, 128), count);
+}
+
+test "external lake aggregate cursors attach each call including lazy roots and detach before retirement" {
+    const Runnable = local.common_request_admission.runnable_scheduler;
+    const Case = enum { success, canceled, expired, closed };
+    const Clock = struct {
+        var value: std.atomic.Value(u64) = .init(0);
+        fn now() u64 {
+            return value.load(.acquire);
+        }
+        fn requested(raw: *const anyopaque) bool {
+            return @as(*const std.atomic.Value(bool), @ptrCast(@alignCast(raw))).load(.acquire);
+        }
+    };
+    const Fixture = struct {
+        base: stores.ArtifactStore,
+        scheduler: *Runnable.Scheduler,
+        signal: *std.atomic.Value(bool),
+        block_id: []const u8,
+        case: Case,
+        calls: usize = 0,
+        controls: usize = 0,
+        fn from(raw: *anyopaque) *@This() {
+            return @ptrCast(@alignCast(raw));
+        }
+        fn parked(self: *@This()) !void {
+            try std.testing.expectEqual(@as(usize, 0), self.scheduler.stats().runnable_slots);
+            try std.testing.expectEqual(@as(usize, 1), self.scheduler.stats().resource_blocked);
+            self.calls += 1;
+            var control: Runnable.Execution = .{};
+            try control.start(self.scheduler, .{ .io = std.testing.io, .allow_wait = false }, .control);
+            try control.checkpoint();
+            control.finish();
+            self.controls += 1;
+        }
+        fn stat(raw: *anyopaque, a: A, id: []const u8, token: Cancellation) !stores.ArtifactMetadata {
+            const self = from(raw);
+            try self.parked();
+            return self.base.statWithCancellationUsingAllocator(a, id, token);
+        }
+        fn range(raw: *anyopaque, a: A, id: []const u8, offset: u64, len: usize, token: Cancellation) ![]u8 {
+            const self = from(raw);
+            try self.parked();
+            const bytes = try self.base.getRangeAllocWithCancellationUsingAllocator(a, id, offset, len, token);
+            if (std.mem.eql(u8, id, self.block_id)) switch (self.case) {
+                .canceled => self.signal.store(true, .release),
+                .expired => Clock.value.store(10, .release),
+                .closed => self.scheduler.close(),
+                else => {},
+            };
+            return bytes;
+        }
+    };
+    const Factory = struct {
+        store: stores.ArtifactStore,
+        reference: Ref,
+        recipe: recipes.Recipe,
+        cached: ?CachedRead,
+        opens: usize = 0,
+        fn open(raw: *anyopaque, slot: usize) !local.sql_catalog.AggregatePartialCursor {
+            return openFor(raw, slot, null);
+        }
+        fn scoped(raw: *anyopaque, slot: usize, execution: *Execution) !local.sql_catalog.AggregatePartialCursor {
+            return openFor(raw, slot, execution);
+        }
+        fn openFor(raw: *anyopaque, slot: usize, execution: ?*Execution) !local.sql_catalog.AggregatePartialCursor {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expectEqual(@as(usize, 0), slot);
+            self.opens += 1;
+            return (try Reader.openWithCacheFor(std.testing.allocator, self.store, self.reference, self.recipe, .none, self.cached, execution)).cursor();
+        }
+    };
+    const a = std.testing.allocator;
+    var directory = try local.common_test_directory.TestDirectory.init("aggregate-call-owner");
+    defer directory.cleanup();
+    var fs = try @import("../serverless/artifacts/fs_store.zig").FsStore.init(a, directory.path());
+    defer fs.deinit();
+    var base = fs.artifactStore();
+    const spec: operators.AggregateSpec = .{ .kind = .count };
+    const recipe: recipes.Recipe = .{ .keys = &.{}, .inputs = &.{.{ .spec = spec, .column = null }} };
+    const group = try operators.Grouped.create(a, &.{spec}, .{});
+    defer group.deinit();
+    try group.ensureGlobalGroup();
+    try group.addGlobalCount(23);
+    // Keep the payload separate from its root so the fixture can revoke
+    // authority during a later pull, after the opening execution has retired.
+    var input = PartialStream.init(group, recipe);
+    const references = try publishPartialStream(a, a, &base, &.{"stats.count"}, &input, recipe, .none, null);
+    defer a.free(references);
+    const reference = references[0];
+    defer a.free(reference.artifact_id);
+    defer a.free(reference.checksum);
+    var metadata = std.heap.ArenaAllocator.init(a);
+    defer metadata.deinit();
+    const root = try loadRoot(metadata.allocator(), base, reference, .none, null);
+    for ([_]bool{ false, true }) |cached| for ([_]bool{ false, true }) |composed| for (std.enums.values(Case)) |case| {
+        var scheduler = try Runnable.Scheduler.init(.{ .slots = 2, .max_bytes = 64 * 1024 * 1024 });
+        var signal: std.atomic.Value(bool) = .init(false);
+        Clock.value.store(0, .release);
+        var cache = local.serverless_query_lake_serving_cache.Cache.init(a);
+        defer cache.deinit();
+        var fixture: Fixture = .{ .base = base, .scheduler = &scheduler, .signal = &signal, .block_id = root.blocks[0].artifact.artifact_id, .case = case };
+        var vtable = base.vtable.*;
+        vtable.stat_with_cancellation = Fixture.stat;
+        vtable.get_range_alloc_with_cancellation = Fixture.range;
+        const store: stores.ArtifactStore = .{ .allocator = a, .ptr = &fixture, .vtable = &vtable };
+        var factory: Factory = .{ .store = store, .reference = reference, .recipe = recipe, .cached = if (cached) .{ .cache = &cache, .scope = @splat(9), .context = .{ .io = std.testing.io } } else null };
+        var opening: Execution = .{};
+        try opening.start(&scheduler, .{ .io = std.testing.io, .native_now_ns = Clock.now, .deadline_ns = 10 }, .query);
+        var composition: ?*@import("lake_index_aggregate_composition.zig").Composition = null;
+        const cursor = if (composed) lazy: {
+            composition = try @import("lake_index_aggregate_composition.zig").Composition.create(a, recipe, .{ .ptr = &factory, .open = Factory.open, .open_for = Factory.scoped });
+            break :lazy composition.?.cursor();
+        } else try Factory.openFor(&factory, 0, &opening);
+        defer cursor.close(cursor.ptr);
+        opening.finish();
+        if (composed) try std.testing.expectEqual(@as(usize, 0), fixture.calls);
+        var execution: Execution = .{};
+        try execution.start(&scheduler, .{ .io = std.testing.io, .native_now_ns = Clock.now, .deadline_ns = 10, .cancellation = .{ .ptr = &signal, .requested = Clock.requested } }, .query);
+        defer execution.finish();
+        var page = std.heap.ArenaAllocator.init(a);
+        defer page.deinit();
+        const result = cursor.nextFor(&execution, page.allocator(), 1);
+        if (case == .success) {
+            const rows = (try result).?;
+            try std.testing.expectEqual(@as(usize, 1), rows.len);
+            var state = try local.sql_aggregate_partial.read(page.allocator(), rows[0], 0, spec);
+            defer state.deinit();
+            try std.testing.expectEqual(@as(u64, 23), state.count);
+        } else try std.testing.expectError(switch (case) {
+            .canceled => error.Canceled,
+            .expired => error.DeadlineExceeded,
+            .closed => error.SchedulerClosed,
+            else => unreachable,
+        }, result);
+        const reader: *Reader = @ptrCast(@alignCast(if (composition) |owner| owner.child.?.ptr else cursor.ptr));
+        try std.testing.expect(reader.execution == null and reader.context.execution == null);
+        if (reader.cached) |capability| try std.testing.expect(capability.context.execution == null);
+        if (composition) |owner| try std.testing.expect(owner.execution == null);
+        execution.finish();
+        try std.testing.expectEqual(fixture.calls, fixture.controls);
+        if (case == .success) {
+            var final: Execution = .{};
+            try final.start(&scheduler, .{ .io = std.testing.io }, .query);
+            defer final.finish();
+            try std.testing.expect((try cursor.nextFor(&final, page.allocator(), 1)) == null);
+        }
+        try std.testing.expectEqual(@as(usize, 0), scheduler.stats().operations);
+    };
 }
 
 test "external lake shared cohort maps preserve reordered physical slots and reject invalid child slots" {
@@ -2683,7 +2911,7 @@ test "external lake aggregate ordered frontiers prune payloads and page both dir
     for (rows, 1000..) |row, ordinal| try std.testing.expectEqual(@as(i64, @intCast(ordinal)), row.keys[0].value.integer);
     const exact_range = try Reader.open(a, store, refs[0], recipe, .none);
     defer exact_range.cursor().close(exact_range);
-    try std.testing.expect(try exact_range.cursor().select_keys.?(exact_range, .{ .memory_bytes = 64 * 1024, .row_limit = 1, .conditions = &.{ .{ .column = "k", .op = .gte, .value = .{ .integer = 500 } }, .{ .column = "k", .op = .lt, .value = .{ .integer = 501 } } }, .order = &.{.{ .column = "k" }} }));
+    try std.testing.expect(try exact_range.cursor().select_keys.?(exact_range, .{ .memory_bytes = 128 * 1024, .row_limit = 1, .conditions = &.{ .{ .column = "k", .op = .gte, .value = .{ .integer = 500 } }, .{ .column = "k", .op = .lt, .value = .{ .integer = 501 } } }, .order = &.{.{ .column = "k" }} }));
     try std.testing.expectEqual(@as(usize, 1), exact_range.ordered_plan.?.leaves.items.len);
     try std.testing.expectEqual(@as(i64, 500), (try exact_range.cursor().next(exact_range, out, 1)).?[0].keys[0].value.integer);
     try std.testing.expect((try exact_range.cursor().next(exact_range, out, 1)) == null);

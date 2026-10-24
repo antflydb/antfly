@@ -176,7 +176,7 @@ pub const Cache = struct {
                 const io = context.io orelse return error.SqlMemoryLimitExceeded;
                 while (!flight.finished.load(.acquire)) {
                     try context.ensureActive();
-                    flight.done.waitTimeout(io, .{ .duration = .{ .clock = .awake, .raw = .fromMilliseconds(10) } }) catch |err| switch (err) {
+                    @import("../../sql/execution_wait.zig").run(context.wait, std.Io.Event.waitTimeout, .{ &flight.done, io, std.Io.Timeout{ .duration = .{ .clock = .awake, .raw = .fromMilliseconds(10) } } }) catch |err| switch (err) {
                         error.Timeout => continue,
                         else => return err,
                     };
@@ -198,7 +198,7 @@ pub const Cache = struct {
             if (self.exclusive_loading or (!exclusive and self.exclusive_waiters != 0) or (exclusive and self.flights.count() != 0) or self.flights.count() >= self.max_loaders) {
                 self.mutex.unlock();
                 const io = context.io orelse return error.SqlMemoryLimitExceeded;
-                try io.sleep(.fromMilliseconds(10), .awake);
+                try @import("../../sql/execution_wait.zig").run(context.wait, std.Io.sleep, .{ io, std.Io.Duration.fromMilliseconds(10), .awake });
                 continue;
             }
             const flight = self.a.create(Flight) catch |err| {

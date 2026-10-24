@@ -293,8 +293,11 @@ pub const ResultSlot = struct {
     /// Executor-local physical subgroup identity. Zero means one physical
     /// batch for the coalesced group; capacity subdivision supplies distinct keys.
     physical_group_key: usize = 0,
+    release_allocator: ?std.mem.Allocator = null,
+    release_value: ?*const fn (std.mem.Allocator, *anyopaque) void = null,
 
     pub fn setValue(self: *ResultSlot, comptime T: type, value: T, execution: Execution) void {
+        self.discardValue();
         const output: *T = @ptrCast(@alignCast(self.output));
         output.* = value;
         self.execution = execution;
@@ -302,7 +305,31 @@ pub const ResultSlot = struct {
         self.completed = true;
     }
 
+    /// The slot owns this value until the joined caller takes its result.
+    /// A later member/admission fence can reject publication without leaking.
+    pub fn setOwnedValue(self: *ResultSlot, comptime T: type, value: T, execution: Execution, allocator: std.mem.Allocator, comptime release: *const fn (std.mem.Allocator, T) void) void {
+        self.setValue(T, value, execution);
+        const Cleanup = struct {
+            fn run(alloc: std.mem.Allocator, raw: *anyopaque) void {
+                const output: *T = @ptrCast(@alignCast(raw));
+                release(alloc, output.*);
+                output.* = undefined;
+            }
+        };
+        self.release_allocator = allocator;
+        self.release_value = Cleanup.run;
+    }
+
+    fn discardValue(self: *ResultSlot) void {
+        const release = self.release_value orelse return;
+        const allocator = self.release_allocator.?;
+        self.release_value = null;
+        self.release_allocator = null;
+        release(allocator, self.output);
+    }
+
     pub fn fail(self: *ResultSlot, err: anyerror) void {
+        self.discardValue();
         self.err = err;
         self.completed = true;
     }
@@ -333,6 +360,15 @@ pub const ItemControl = struct {
             (if (self.cancel_requested) |signal| signal.load(.acquire) else false))
             return error.Canceled;
     }
+
+    pub fn checkPublication(self: ItemControl) !void {
+        // A late executor cancellation still joins and hands owned outputs to
+        // its caller for teardown. Original member deadlines/cancellation may
+        // reject publication after the physical call has completed.
+        var original = self;
+        original.cancel_requested = null;
+        try original.check();
+    }
 };
 
 /// A fused invocation serves every live member. One caller cannot cancel
@@ -342,9 +378,17 @@ pub const ExecutionControl = struct {
 
     pub fn check(raw: ?*anyopaque) !void {
         const self: *const @This() = @ptrCast(@alignCast(raw.?));
+        try self.checkMembers(false);
+    }
+
+    pub fn checkPublication(self: *const @This()) !void {
+        try self.checkMembers(true);
+    }
+
+    fn checkMembers(self: *const @This(), publication: bool) !void {
         var any_deadline_expired = false;
         for (self.items) |item| {
-            item.control.check() catch |err| {
+            (if (publication) item.control.checkPublication() else item.control.check()) catch |err| {
                 if (err == error.DeadlineExceeded) any_deadline_expired = true;
                 continue;
             };
@@ -359,7 +403,146 @@ pub const ExecutionControl = struct {
 
 pub const ExecuteFn = *const fn (ctx: *anyopaque, items: []const ExecuteItem) void;
 
+/// Immutable, process-local admission boundary for physical executor calls.
+/// begin may wait, but runs outside every broker shard lock. It borrows the
+/// complete cohort until finish and must use collective ExecutionControl:
+/// neither the leader's cancellation nor the earliest member deadline owns
+/// the physical batch. The provider installs CPU limits on this worker and
+/// retires them in finish, after the synchronous executor has joined.
+pub const ExecutionAdmission = struct {
+    context: *anyopaque,
+    begin: *const fn (*anyopaque, std.Io, Key, usize, ExecutionControl) anyerror!*anyopaque,
+    finish: *const fn (*anyopaque, *anyopaque) void,
+    /// Final owning-worker fence after the callback, before callers can take
+    /// results. A rejected grant must dispose all owned published values.
+    checkpoint: ?*const fn (*anyopaque, *anyopaque) anyerror!void = null,
+    /// Park each synchronous caller before enrollment or independent admission.
+    /// Resume only after all borrowed tickets have joined, outside shard locks.
+    caller_wait_begin: ?*const fn (*anyopaque) anyerror!*anyopaque = null,
+    caller_wait_end: ?*const fn (*anyopaque, *anyopaque) anyerror!void = null,
+};
+
 const TicketState = enum { queued, executing, complete };
+
+test "microbatch execution admission covers singleton and native waves and releases failures" {
+    const Provider = struct {
+        broker: *Broker = undefined,
+        begins: usize = 0,
+        finishes: usize = 0,
+        bytes: usize = 0,
+        reject: bool = false,
+        active: bool = false,
+
+        fn begin(raw: *anyopaque, io: std.Io, _: Key, bytes: usize, control: ExecutionControl) !*anyopaque {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            // Taking the shard locks here proves admission runs outside them.
+            _ = self.broker.snapshot(io);
+            var collective = control;
+            try ExecutionControl.check(&collective);
+            self.begins += 1;
+            self.bytes += bytes;
+            if (self.reject) return error.RunnableAdmissionRejected;
+            std.debug.assert(!self.active);
+            self.active = true;
+            return self;
+        }
+        fn finish(raw: *anyopaque, handle: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            std.debug.assert(handle == raw and self.active);
+            self.active = false;
+            self.finishes += 1;
+        }
+        fn execute(raw: *anyopaque, items: []const ExecuteItem) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            std.debug.assert(self.active);
+            for (items) |item| item.slot.setValue(usize, item.payloadAs(usize).* * 2, if (items.len > 1) .native_batch else .serial);
+        }
+    };
+    var provider = Provider{};
+    var broker = Broker.initWithAdmission(std.testing.allocator, .{ .context = &provider, .begin = Provider.begin, .finish = Provider.finish });
+    provider.broker = &broker;
+    defer broker.deinit();
+    const payloads = [_]usize{ 1, 2, 3 };
+    const shapes = @as([3]Shape, @splat(.{ .bytes = 7 }));
+    const identities = @as([3]Identity, @splat(.{}));
+    for ([_]bool{ false, true }) |reject| {
+        provider.reject = reject;
+        for ([_]BatchMode{ .serial_compatibility, .native }) |mode| {
+            const capacity: usize = if (mode == .native) 2 else 1;
+            const results = try broker.submitBatchControlled(usize, usize, std.testing.io, std.testing.allocator, .{ .model = "admitted", .task = .read, .resource_class = .cpu }, .{ .mode = mode, .preferred_items = capacity, .max_items = capacity, .max_wait_us = 0 }, &shapes, &identities, null, .{}, &payloads, &provider, Provider.execute);
+            defer std.testing.allocator.free(results);
+            for (results, payloads) |result, payload| {
+                if (reject) try std.testing.expectEqual(error.RunnableAdmissionRejected, result.result.item_error.cause) else try std.testing.expectEqual(payload * 2, result.result.value);
+            }
+            try std.testing.expect(!provider.active);
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 10), provider.begins);
+    try std.testing.expectEqual(@as(usize, 5), provider.finishes);
+    try std.testing.expectEqual(@as(usize, 84), provider.bytes);
+}
+
+test "microbatch admission wait removes canceled members without canceling live peers" {
+    const Provider = struct {
+        canceled: std.atomic.Value(bool) = .init(false),
+        cancel_all: bool = false,
+        second: std.atomic.Value(bool) = .init(false),
+        finishes: usize = 0,
+        calls: usize = 0,
+        fn begin(raw: *anyopaque, _: std.Io, _: Key, _: usize, control: ExecutionControl) !*anyopaque {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.canceled.store(true, .release);
+            if (self.cancel_all) self.second.store(true, .release);
+            var collective = control;
+            if (!self.cancel_all) try ExecutionControl.check(&collective);
+            return self;
+        }
+        fn finish(raw: *anyopaque, _: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.finishes += 1;
+        }
+        fn execute(raw: *anyopaque, items: []const ExecuteItem) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            std.debug.assert(items.len == 1);
+            for (items) |item| item.slot.setValue(usize, item.payloadAs(usize).*, .serial);
+        }
+    };
+    var provider = Provider{};
+    var broker = Broker.initWithAdmission(std.testing.allocator, .{ .context = &provider, .begin = Provider.begin, .finish = Provider.finish });
+    defer broker.deinit();
+    const payload: usize = 19;
+    for ([_]bool{ false, true }) |all| {
+        provider.cancel_all = all;
+        provider.canceled.store(false, .release);
+        provider.second.store(false, .release);
+        var outputs: [2]usize = undefined;
+        var slots = [_]ResultSlot{ .{ .output = &outputs[0] }, .{ .output = &outputs[1] } };
+        const items = [_]ExecuteItem{
+            .{ .allocator = std.testing.allocator, .identity = .{}, .payload = &payload, .slot = &slots[0], .control = .{ .cancellation = Cancellation.fromAtomic(&provider.canceled) } },
+            .{ .allocator = std.testing.allocator, .identity = .{}, .payload = &payload, .slot = &slots[1], .control = .{ .cancellation = Cancellation.fromAtomic(&provider.second) } },
+        };
+        broker.execute(std.testing.io, .{ .model = "admitted", .task = .read, .resource_class = .cpu }, 0, &items, &provider, Provider.execute);
+        try std.testing.expectEqual(error.Canceled, slots[0].err.?);
+        if (all) try std.testing.expectEqual(error.Canceled, slots[1].err.?) else try std.testing.expectEqual(payload, outputs[1]);
+    }
+    try std.testing.expectEqual(@as(usize, 2), provider.finishes);
+    try std.testing.expectEqual(@as(usize, 1), provider.calls);
+
+    // Failure to stage live members must still release an acquired grant.
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    var failing_broker = Broker.initWithAdmission(failing.allocator(), broker.admission.?);
+    defer failing_broker.deinit();
+    provider.cancel_all = false;
+    provider.second.store(false, .release);
+    var output: usize = undefined;
+    var slot = ResultSlot{ .output = &output };
+    const item = ExecuteItem{ .allocator = std.testing.allocator, .identity = .{}, .payload = &payload, .slot = &slot };
+    failing_broker.execute(std.testing.io, .{ .model = "admitted", .task = .read, .resource_class = .cpu }, 0, &.{item}, &provider, Provider.execute);
+    try std.testing.expectEqual(error.OutOfMemory, slot.err.?);
+    try std.testing.expectEqual(@as(usize, 3), provider.finishes);
+    try std.testing.expectEqual(@as(usize, 1), provider.calls);
+}
 
 const Ticket = struct {
     item: ExecuteItem,
@@ -434,6 +617,7 @@ fn updateBrokerKeyHash(hasher: *std.hash.Wyhash, value: []const u8) void {
 
 pub const Broker = struct {
     allocator: std.mem.Allocator,
+    admission: ?ExecutionAdmission = null,
     /// Independent model/task cohorts never contend on one process-wide lock.
     /// Exact-key grouping remains unchanged within a shard.
     shards: [broker_shard_count]BrokerShard = @as([broker_shard_count]BrokerShard, @splat(.{})),
@@ -441,6 +625,78 @@ pub const Broker = struct {
 
     pub fn init(allocator: std.mem.Allocator) Broker {
         return .{ .allocator = allocator };
+    }
+
+    /// The provider and its owner lease must outlive all broker submissions.
+    /// Install before publication; changing admission while executing is unsafe.
+    pub fn initWithAdmission(allocator: std.mem.Allocator, admission: ExecutionAdmission) Broker {
+        return .{ .allocator = allocator, .admission = admission };
+    }
+
+    const CallerWait = struct {
+        admission: ?ExecutionAdmission = null,
+        handle: ?*anyopaque = null,
+        fn finish(self: *CallerWait) !void {
+            const handle = self.handle orelse return;
+            self.handle = null;
+            const admission = self.admission.?;
+            try admission.caller_wait_end.?(admission.context, handle);
+        }
+    };
+
+    fn parkCaller(self: *Broker) !CallerWait {
+        const admission = self.admission orelse return .{};
+        const begin = admission.caller_wait_begin orelse return .{};
+        std.debug.assert(admission.caller_wait_end != null);
+        return .{ .admission = admission, .handle = try begin(admission.context) };
+    }
+
+    fn execute(self: *Broker, io: std.Io, key: Key, retained_bytes: usize, items: []const ExecuteItem, context: *anyopaque, callback: ExecuteFn) void {
+        const admission = self.admission orelse {
+            self.executeAndFence(items, context, callback, null, null);
+            return;
+        };
+        const handle = admission.begin(admission.context, io, key, retained_bytes, .{ .items = items }) catch |err| {
+            for (items) |item| item.slot.fail(err);
+            return;
+        };
+        defer admission.finish(admission.context, handle);
+
+        // Admission can outlive individual callers. Recheck every member before
+        // exposing its payload to the backend, without shortening a live peer's
+        // lifetime or mutating the cohort borrowed by the admission provider.
+        const live = self.allocator.alloc(ExecuteItem, items.len) catch {
+            for (items) |item| item.slot.fail(error.OutOfMemory);
+            return;
+        };
+        defer self.allocator.free(live);
+        var count: usize = 0;
+        for (items) |item| {
+            item.control.check() catch |err| {
+                item.slot.fail(err);
+                continue;
+            };
+            live[count] = item;
+            count += 1;
+        }
+        if (count != 0) self.executeAndFence(live[0..count], context, callback, admission, handle);
+    }
+
+    fn executeAndFence(_: *Broker, items: []const ExecuteItem, context: *anyopaque, callback: ExecuteFn, admission: ?ExecutionAdmission, handle: ?*anyopaque) void {
+        callback(context, items);
+        var admission_error: ?anyerror = null;
+        if (admission) |active| if (active.checkpoint) |check| {
+            check(active.context, handle.?) catch |err| {
+                admission_error = err;
+            };
+        };
+        for (items) |item| {
+            item.control.checkPublication() catch |err| {
+                item.slot.fail(err);
+                continue;
+            };
+            if (admission_error) |err| item.slot.fail(err);
+        }
     }
 
     pub fn deinit(self: *Broker) void {
@@ -541,15 +797,19 @@ pub const Broker = struct {
             .cancel_requested = &ticket.cancel_requested,
         };
 
+        var caller_wait = self.parkCaller() catch |err| return resultError(Output, identity, err);
+        defer caller_wait.finish() catch {};
+
         // Serial compatibility is deliberately not queued: accepting a batch
         // envelope is not evidence that the underlying model fuses work.
         if (limits.mode != .native or limits.max_items == 1) {
-            execute_fn(execute_ctx, &.{ticket.item});
+            self.execute(io, key, shape.bytes, &.{ticket.item}, execute_ctx, execute_fn);
             if (!slot.completed) slot.fail(error.MissingMicrobatchResult);
             const shard = self.shardFor(key);
             shard.mutex.lockUncancelable(io);
             shard.stats.bypass_items +|= 1;
             shard.mutex.unlock(io);
+            caller_wait.finish() catch |err| slot.fail(err);
             return takeResult(Output, identity, &output, slot);
         }
 
@@ -565,6 +825,7 @@ pub const Broker = struct {
             self.executeGroup(io, shard, queued.group);
         } else waitForTicket(io, &ticket);
 
+        caller_wait.finish() catch |err| slot.fail(err);
         // Typed execution owns result disposal; never discard an owned Output
         // merely because cancellation raced completion.
         return takeResult(Output, identity, &output, slot);
@@ -721,6 +982,11 @@ pub const Broker = struct {
                     continue;
                 };
             }
+            var caller_wait = self.parkCaller() catch |err| {
+                for (results[start..], identities[start..]) |*result, identity| result.* = resultError(Output, identity, err);
+                return results;
+            };
+            defer caller_wait.finish() catch {};
             shard.mutex.lockUncancelable(io);
             for (0..count) |offset| {
                 const slot = &slots[offset];
@@ -742,9 +1008,18 @@ pub const Broker = struct {
             };
             for (0..count) |offset| {
                 if (enqueued[offset]) |queued| if (!queued.leader) waitForTicket(io, &tickets[offset]);
-                results[start + offset] = takeResult(Output, identities[start + offset], &outputs[offset], slots[offset]);
             }
+            var resume_error: ?anyerror = null;
+            caller_wait.finish() catch |err| {
+                resume_error = err;
+                for (slots[0..count]) |*slot| slot.fail(err);
+            };
+            for (0..count) |offset| results[start + offset] = takeResult(Output, identities[start + offset], &outputs[offset], slots[offset]);
             start += count;
+            if (resume_error) |err| {
+                for (results[start..], identities[start..]) |*result, identity| result.* = resultError(Output, identity, err);
+                return results;
+            }
         }
         return results;
     }
@@ -835,7 +1110,7 @@ pub const Broker = struct {
         var native_batches: usize = 0;
         if (active_count > 0) {
             const execution_id = self.next_execution_id.fetchAdd(1, .monotonic);
-            group.execute_fn(group.execute_ctx, items[0..active_count]);
+            self.execute(io, group.key, group.bytes, items[0..active_count], group.execute_ctx, group.execute_fn);
             for (items[0..active_count], 0..) |item, index| {
                 if (!item.slot.completed) item.slot.fail(error.MissingMicrobatchResult);
                 item.slot.execution_id = execution_id;
@@ -1215,9 +1490,9 @@ test "microbatch array rechecks cancellation between bounded waves" {
     const results = try broker.submitBatchControlled(usize, usize, std.testing.io, std.testing.allocator, .{ .model = "reader", .task = .read, .resource_class = .gpu }, .{ .mode = .native, .preferred_items = 2, .max_items = 2 }, &shapes, &identities, null, Cancellation.fromAtomic(&executor.canceled), &inputs, &executor, Executor.run);
     defer std.testing.allocator.free(results);
     try std.testing.expectEqual(@as(usize, 1), executor.calls);
-    try std.testing.expectEqual(@as(usize, 1), results[0].result.value);
-    try std.testing.expectEqual(@as(usize, 2), results[1].result.value);
-    for (results[2..]) |result| try std.testing.expectEqual(error.Canceled, result.result.item_error.cause);
+    // Original cancellation after the first physical wave also fences its
+    // completed outputs; subsequent waves never execute.
+    for (results) |result| try std.testing.expectEqual(error.Canceled, result.result.item_error.cause);
 }
 
 test "microbatch broker flattens an existing request batch" {
@@ -1449,7 +1724,11 @@ test "microbatch cancellation after execution starts returns owned output" {
                     item.slot.fail(err);
                     continue;
                 };
-                item.slot.setValue([]u8, value, .native_batch);
+                item.slot.setOwnedValue([]u8, value, .native_batch, item.allocator, struct {
+                    fn release(alloc: std.mem.Allocator, bytes: []u8) void {
+                        alloc.free(bytes);
+                    }
+                }.release);
             }
         }
 
@@ -1657,6 +1936,89 @@ test "microbatch broker bypasses nonnative work and honors cancellation deadline
         TestExecutor.run,
     );
     try std.testing.expectEqual(error.DeadlineExceeded, foreign_clock_result.result.item_error.cause);
+}
+
+test "microbatch post execution fences dispose owned values and preserve healthy peers" {
+    const Value = struct {
+        bytes: []u8,
+        releases: *usize,
+        fn release(alloc: std.mem.Allocator, value: @This()) void {
+            value.releases.* += 1;
+            alloc.free(value.bytes);
+        }
+    };
+    const Executor = struct {
+        releases: *usize,
+        cancel_after: ?*std.atomic.Value(bool) = null,
+        fn run(raw: *anyopaque, items: []const ExecuteItem) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            for (items) |item| {
+                const bytes = item.allocator.dupe(u8, "owned") catch |err| {
+                    item.slot.fail(err);
+                    continue;
+                };
+                item.slot.setOwnedValue(Value, .{ .bytes = bytes, .releases = self.releases }, .native_batch, item.allocator, Value.release);
+            }
+            if (self.cancel_after) |signal| signal.store(true, .release);
+        }
+    };
+    const Provider = struct {
+        reject: bool = true,
+        finishes: usize = 0,
+        fn begin(raw: *anyopaque, _: std.Io, _: Key, _: usize, _: ExecutionControl) !*anyopaque {
+            return raw;
+        }
+        fn check(raw: *anyopaque, _: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.reject) return error.Forbidden;
+        }
+        fn finish(raw: *anyopaque, _: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.finishes += 1;
+        }
+    };
+    var releases: usize = 0;
+    var provider = Provider{};
+    var broker = Broker.initWithAdmission(std.testing.allocator, .{ .context = &provider, .begin = Provider.begin, .finish = Provider.finish, .checkpoint = Provider.check });
+    defer broker.deinit();
+    const payload: usize = 0;
+    var outputs: [2]Value = undefined;
+    var slots = [_]ResultSlot{ .{ .output = &outputs[0] }, .{ .output = &outputs[1] } };
+    var canceled = std.atomic.Value(bool).init(false);
+    const items = [_]ExecuteItem{
+        .{ .allocator = std.testing.allocator, .identity = .{}, .payload = &payload, .slot = &slots[0], .control = .{ .cancellation = Cancellation.fromAtomic(&canceled) } },
+        .{ .allocator = std.testing.allocator, .identity = .{}, .payload = &payload, .slot = &slots[1] },
+    };
+    var executor = Executor{ .releases = &releases };
+    const key = Key{ .model = "owned", .task = .read, .resource_class = .cpu };
+    broker.execute(std.testing.io, key, 0, &items, &executor, Executor.run);
+    try std.testing.expectEqual(@as(usize, 2), releases);
+    for (&slots) |*slot| {
+        try std.testing.expectEqual(error.Forbidden, slot.err.?);
+        slot.fail(error.Forbidden); // Cleanup stays single-release.
+    }
+    try std.testing.expectEqual(@as(usize, 2), releases);
+    try std.testing.expectEqual(@as(usize, 1), provider.finishes);
+    slots = .{ .{ .output = &outputs[0] }, .{ .output = &outputs[1] } };
+    provider.reject = false;
+    executor.cancel_after = &canceled;
+    broker.execute(std.testing.io, key, 0, &items, &executor, Executor.run);
+    try std.testing.expectEqual(@as(usize, 3), releases);
+    try std.testing.expectEqual(error.Canceled, slots[0].err.?);
+    try std.testing.expect(slots[1].err == null);
+    Value.release(std.testing.allocator, outputs[1]);
+    try std.testing.expectEqual(@as(usize, 4), releases);
+    try std.testing.expectEqual(@as(usize, 2), provider.finishes);
+    // The unscheduled path uses the same original-member publication fence.
+    slots = .{ .{ .output = &outputs[0] }, .{ .output = &outputs[1] } };
+    canceled.store(false, .release);
+    broker.admission = null;
+    broker.execute(std.testing.io, key, 0, &items, &executor, Executor.run);
+    try std.testing.expectEqual(@as(usize, 5), releases);
+    try std.testing.expectEqual(error.Canceled, slots[0].err.?);
+    try std.testing.expect(slots[1].err == null);
+    Value.release(std.testing.allocator, outputs[1]);
+    try std.testing.expectEqual(@as(usize, 6), releases);
 }
 
 test "microbatch geometry buckets gather interleaved rows and preserve identity" {

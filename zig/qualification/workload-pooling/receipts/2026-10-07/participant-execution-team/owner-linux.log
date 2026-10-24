@@ -1,0 +1,69 @@
+antfly-http-cleanup-owner-test
++- run test http-cleanup-owner-tests w
+H2 stream handler error: error.DeadlineExceeded
+failed command: /cache/o/f2bdb3940f1eafea6b23e0629d662c25/http-cleanup-owner-tests --cache-dir=/cache --seed=0x1e7bbd0f --listen=-
+
+antfly-inference-worker-owner-handoff-test
++- run test inference-worker-owner-handoff-tests w
+REAL_SINK transport=h1 cancel=false start
+REAL_SINK await backpressure
+REAL_SINK output status=timeout begins=5 ends=5
+REAL_SINK await peer EOF
+REAL_SINK transport=h1 cancel=true start
+REAL_SINK await backpressure
+REAL_SINK output status=canceled begins=5 ends=5
+REAL_SINK await peer EOF
+REAL_SINK transport=h2 cancel=false start
+REAL_SINK await backpressure
+REAL_SINK output status=timeout begins=168 ends=168
+REAL_SINK await peer EOF
+REAL_SINK transport=h2 cancel=true start
+REAL_SINK await backpressure
+REAL_SINK output status=canceled begins=168 ends=168
+REAL_SINK await peer EOF
+failed command: /cache/o/236f0269f2cf490885b128b8ee419a07/inference-worker-owner-handoff-tests --cache-dir=/cache --seed=0x1e7bbd0f --listen=-
+
+antfly-inference-worker-process-output-test
++- run test inference-worker-process-output-tests w
+PROCESS_SINK transport=h1 cancel=false start
+PROCESS_SINK await backpressure
+PROCESS_RPC cause=error.Timeout fenced=true reaped=true held=true
+PROCESS_SINK output status=timeout begins=11 ends=11
+PROCESS_SINK await peer EOF
+PROCESS_SINK transport=h1 cancel=true start
+PROCESS_SINK await backpressure
+PROCESS_RPC cause=error.Canceled fenced=true reaped=true held=true
+PROCESS_SINK output status=canceled begins=11 ends=11
+PROCESS_SINK await peer EOF
+PROCESS_SINK transport=h2 cancel=false start
+PROCESS_SINK await backpressure
+PROCESS_RPC cause=error.Timeout fenced=true reaped=true held=true
+PROCESS_SINK output status=timeout begins=168 ends=168
+PROCESS_SINK await peer EOF
+PROCESS_SINK transport=h2 cancel=true start
+PROCESS_SINK await backpressure
+PROCESS_RPC cause=error.Canceled fenced=true reaped=true held=true
+PROCESS_SINK output status=canceled begins=168 ends=168
+PROCESS_SINK await peer EOF
+failed command: cd /cache/o/68da6a99ed24f396648d4f03166bef90 && ANTFLY_TEST_WORKER_OUTPUT_FIXTURE=./inference-worker-output-fixture /cache/o/020568e3334b5f4d7ca483f6f2dd4387/inference-worker-process-output-tests --cache-dir=/cache --seed=0x1e7bbd0f --listen=-
+
+Build Summary: 18/18 steps succeeded; 33/33 tests passed
+antfly-inference-worker-rpc-test success
++- run test inference-worker-rpc-contract-tests cached
+|  +- compile test inference-worker-rpc-contract-tests safe aarch64-linux-gnu cached 434ms MaxRSS:57M
++- run test 6 pass (6 total) 14ms MaxRSS:32M
+   +- compile test safe aarch64-linux-gnu success 17s MaxRSS:464M
+antfly-inference-owner-handoff-test success
++- run test inference-owner-handoff-tests 22 pass (22 total) 11ms MaxRSS:32M
+   +- compile test inference-owner-handoff-tests safe aarch64-linux-gnu success 18s MaxRSS:663M
+antfly-inference-worker-owner-handoff-test success
++- run test inference-worker-owner-handoff-tests 2 pass (2 total) 1s MaxRSS:32M
+   +- compile test inference-worker-owner-handoff-tests safe aarch64-linux-gnu success 19s MaxRSS:704M
+antfly-inference-worker-process-output-test success
++- run test inference-worker-process-output-tests 1 pass (1 total) 1s MaxRSS:32M
+   +- compile test inference-worker-process-output-tests safe aarch64-linux-gnu success 18s MaxRSS:686M
+   +- compile exe inference-worker-output-fixture safe aarch64-linux-gnu cached 272ms MaxRSS:57M
+antfly-http-cleanup-owner-test success
++- run test http-cleanup-owner-tests 2 pass (2 total) 259ms MaxRSS:32M
+   +- compile test http-cleanup-owner-tests safe aarch64-linux-gnu success 17s MaxRSS:736M
+

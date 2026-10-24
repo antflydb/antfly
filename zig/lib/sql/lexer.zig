@@ -23,6 +23,107 @@ const token_mod = @import("token.zig");
 // zero or one token.
 const eager_token_capacity_limit = 256;
 
+/// Optional request-local preparation checkpoint. The caller preserves the
+/// original interruption error outside the lexer. Token buffers never retain it.
+pub const WorkControl = struct {
+    ptr: *anyopaque,
+    checkpoint: *const fn (*anyopaque) error{SqlPreparationInterrupted}!void,
+};
+const Work = struct {
+    control: ?WorkControl,
+    remaining: usize = 1024,
+    fn poll(self: *Work) error{SqlPreparationInterrupted}!void {
+        if (self.control == null) return;
+        self.remaining -= 1;
+        if (self.remaining == 0) {
+            self.remaining = 1024;
+            try self.check();
+        }
+    }
+    fn check(self: *Work) error{SqlPreparationInterrupted}!void {
+        if (self.control) |control| try control.checkpoint(control.ptr);
+    }
+};
+
+pub fn copyControlled(comptime T: type, destination: []T, source: []const T, control: ?WorkControl) !void {
+    std.debug.assert(destination.len == source.len);
+    if (control == null) {
+        @memcpy(destination, source);
+        return;
+    }
+    const chunk = @max(@as(usize, 1), @as(usize, 4096) / @max(@as(usize, 1), @sizeOf(T)));
+    var offset: usize = 0;
+    while (offset < source.len) {
+        const value = control.?;
+        try value.checkpoint(value.ptr);
+        const end = offset + @min(chunk, source.len - offset);
+        @memcpy(destination[offset..end], source[offset..end]);
+        offset = end;
+    }
+}
+
+/// Preserve the original list until a replacement has been fully copied.
+/// Only in-place resize may bypass the controlled copy; remap may move bytes.
+pub fn ensureControlledCapacity(comptime T: type, alloc: std.mem.Allocator, list: *std.ArrayList(T), minimum: usize, control: ?WorkControl) !void {
+    if (control == null or list.capacity >= minimum) return;
+    const value = control.?;
+    try value.checkpoint(value.ptr);
+    const capacity = std.ArrayList(T).growCapacity(minimum);
+    const original = list.allocatedSlice();
+    if (list.capacity != 0 and alloc.resize(original, capacity)) {
+        list.capacity = capacity;
+        return;
+    }
+    const replacement = try alloc.alloc(T, capacity);
+    errdefer alloc.free(replacement);
+    try copyControlled(T, replacement[0..list.items.len], list.items, control);
+    alloc.free(original);
+    list.items.ptr = replacement.ptr;
+    list.capacity = capacity;
+}
+
+const DecodedBuffer = struct {
+    buffer: std.ArrayList(u8) = .empty,
+    work: *Work,
+    fn deinit(self: *DecodedBuffer, alloc: std.mem.Allocator) void {
+        self.buffer.deinit(alloc);
+    }
+    fn append(self: *DecodedBuffer, alloc: std.mem.Allocator, byte: u8) !void {
+        const required = std.math.add(usize, self.buffer.items.len, 1) catch return error.OutOfMemory;
+        try ensureControlledCapacity(u8, alloc, &self.buffer, required, self.work.control);
+        try self.buffer.append(alloc, byte);
+    }
+    fn appendSlice(self: *DecodedBuffer, alloc: std.mem.Allocator, bytes: []const u8) !void {
+        // Escape and UTF-8 appends are at most four bytes. Large buffer copies
+        // occur only in ensureControlledCapacity and toOwnedSlice below.
+        std.debug.assert(bytes.len <= 4);
+        const required = std.math.add(usize, self.buffer.items.len, bytes.len) catch return error.OutOfMemory;
+        try ensureControlledCapacity(u8, alloc, &self.buffer, required, self.work.control);
+        try self.buffer.appendSlice(alloc, bytes);
+    }
+    fn toOwnedSlice(self: *DecodedBuffer, alloc: std.mem.Allocator) ![]u8 {
+        if (self.work.control == null) return self.buffer.toOwnedSlice(alloc);
+        try self.work.check();
+        const original = self.buffer.allocatedSlice();
+        if (self.buffer.items.len == 0) {
+            self.buffer.deinit(alloc);
+            self.buffer = .empty;
+            return &.{};
+        }
+        if (alloc.resize(original, self.buffer.items.len)) {
+            const result = original[0..self.buffer.items.len];
+            self.buffer = .empty;
+            return result;
+        }
+        const replacement = try alloc.alloc(u8, self.buffer.items.len);
+        errdefer alloc.free(replacement);
+        try copyControlled(u8, replacement, self.buffer.items, self.work.control);
+        self.buffer.deinit(alloc);
+        self.buffer = .empty;
+        return replacement;
+    }
+};
+
 pub const Token = token_mod.Token;
 pub const TokenKind = token_mod.TokenKind;
 
@@ -96,15 +197,21 @@ pub fn tokenizeDiagnosticAlloc(alloc: std.mem.Allocator, sql: []const u8) !Token
 /// Enforces the token quota before allocating or decoding the next token.
 /// Whitespace/comments do not consume the quota, including trailing trivia.
 pub fn tokenizeBoundedDiagnosticAlloc(alloc: std.mem.Allocator, sql: []const u8, max_tokens: usize) !TokenizeResult {
+    return tokenizeBoundedDiagnosticControlledAlloc(alloc, sql, max_tokens, null);
+}
+
+pub fn tokenizeBoundedDiagnosticControlledAlloc(alloc: std.mem.Allocator, sql: []const u8, max_tokens: usize, control: ?WorkControl) !TokenizeResult {
+    var work: Work = .{ .control = control };
+    try work.check();
     var diagnostic: LexDiagnostic = undefined;
-    const tokens = tokenizeImpl(alloc, sql, &diagnostic, max_tokens) catch |err| switch (err) {
+    const tokens = tokenizeImpl(alloc, sql, &diagnostic, max_tokens, &work) catch |err| switch (err) {
         error.UnsupportedSqlShape => return .{ .diagnostic = diagnostic },
         else => return err,
     };
     return .{ .tokens = tokens };
 }
 
-fn tokenizeImpl(alloc: std.mem.Allocator, sql: []const u8, diagnostic: *LexDiagnostic, max_tokens: usize) !std.ArrayListUnmanaged(Token) {
+fn tokenizeImpl(alloc: std.mem.Allocator, sql: []const u8, diagnostic: *LexDiagnostic, max_tokens: usize, work: *Work) !std.ArrayListUnmanaged(Token) {
     var tokens = std.ArrayListUnmanaged(Token).empty;
     errdefer freeTokens(alloc, &tokens);
     const estimated_capacity = @min(max_tokens, estimateTokenCapacity(sql));
@@ -112,6 +219,7 @@ fn tokenizeImpl(alloc: std.mem.Allocator, sql: []const u8, diagnostic: *LexDiagn
 
     var i: usize = 0;
     while (i < sql.len) {
+        try work.poll();
         const ch = sql[i];
         if (std.ascii.isWhitespace(ch)) {
             i += 1;
@@ -120,6 +228,7 @@ fn tokenizeImpl(alloc: std.mem.Allocator, sql: []const u8, diagnostic: *LexDiagn
         if (ch == '-' and i + 1 < sql.len and sql[i + 1] == '-') {
             i += 2;
             while (i < sql.len and sql[i] != '\n' and sql[i] != '\r') {
+                try work.poll();
                 i += if (sql[i] >= 0x80) try utf8SequenceWidthAt(sql, i, diagnostic) else 1;
             }
             continue;
@@ -129,6 +238,7 @@ fn tokenizeImpl(alloc: std.mem.Allocator, sql: []const u8, diagnostic: *LexDiagn
             i += 2;
             var depth: usize = 1;
             while (depth != 0) {
+                try work.poll();
                 if (i >= sql.len) return lexError(diagnostic, .unterminated_block_comment, comment_start, sql.len);
                 if (sql[i] >= 0x80) {
                     i += try utf8SequenceWidthAt(sql, i, diagnostic);
@@ -151,6 +261,7 @@ fn tokenizeImpl(alloc: std.mem.Allocator, sql: []const u8, diagnostic: *LexDiagn
             const start = i;
             i += if (ch >= 0x80) try utf8SequenceWidthAt(sql, i, diagnostic) else 1;
             while (i < sql.len) {
+                try work.poll();
                 if (std.ascii.isAlphanumeric(sql[i]) or sql[i] == '_' or sql[i] == '$') {
                     i += 1;
                 } else if (sql[i] >= 0x80) {
@@ -158,6 +269,7 @@ fn tokenizeImpl(alloc: std.mem.Allocator, sql: []const u8, diagnostic: *LexDiagn
                 } else break;
             }
             const end = i;
+            try ensureControlledCapacity(Token, alloc, &tokens, tokens.items.len + 1, work.control);
             try tokens.append(alloc, .{
                 .kind = .identifier,
                 .text = sql[start..end],
@@ -169,10 +281,11 @@ fn tokenizeImpl(alloc: std.mem.Allocator, sql: []const u8, diagnostic: *LexDiagn
         }
         if (ch == '"') {
             const source_start = i;
-            var out = std.ArrayListUnmanaged(u8).empty;
+            var out: DecodedBuffer = .{ .work = work };
             errdefer out.deinit(alloc);
             i += 1;
             while (i < sql.len) {
+                try work.poll();
                 if (sql[i] == '"') {
                     if (i + 1 < sql.len and sql[i + 1] == '"') {
                         try out.append(alloc, '"');
@@ -191,12 +304,13 @@ fn tokenizeImpl(alloc: std.mem.Allocator, sql: []const u8, diagnostic: *LexDiagn
                 }
             }
             if (i >= sql.len) return lexError(diagnostic, .unterminated_quoted_identifier, source_start, sql.len);
-            if (out.items.len == 0) return lexError(diagnostic, .empty_quoted_identifier, source_start, i + 1);
+            if (out.buffer.items.len == 0) return lexError(diagnostic, .empty_quoted_identifier, source_start, i + 1);
             const owned = try out.toOwnedSlice(alloc);
             var owned_transferred = false;
             errdefer if (!owned_transferred) alloc.free(owned);
             i += 1;
             const source_end = i;
+            try ensureControlledCapacity(Token, alloc, &tokens, tokens.items.len + 1, work.control);
             try tokens.append(alloc, .{
                 .kind = .identifier,
                 .text = owned,
@@ -209,10 +323,11 @@ fn tokenizeImpl(alloc: std.mem.Allocator, sql: []const u8, diagnostic: *LexDiagn
         }
         if (ch == '\'' or escape_string) {
             const source_start = i;
-            var out = std.ArrayListUnmanaged(u8).empty;
+            var out: DecodedBuffer = .{ .work = work };
             errdefer out.deinit(alloc);
             i += if (escape_string) @as(usize, 2) else 1;
             while (i < sql.len) {
+                try work.poll();
                 if (sql[i] == '\'') {
                     if (i + 1 < sql.len and sql[i + 1] == '\'') {
                         try out.append(alloc, '\'');
@@ -221,7 +336,7 @@ fn tokenizeImpl(alloc: std.mem.Allocator, sql: []const u8, diagnostic: *LexDiagn
                     }
                     // SQL continuation requires a newline in whitespace or a
                     // line comment. Block comments are not continuation trivia.
-                    if (try stringContinuation(sql, i + 1, diagnostic)) |next| {
+                    if (try stringContinuation(sql, i + 1, diagnostic, work)) |next| {
                         i = next + 1;
                         continue;
                     }
@@ -241,27 +356,30 @@ fn tokenizeImpl(alloc: std.mem.Allocator, sql: []const u8, diagnostic: *LexDiagn
                 }
             }
             if (i >= sql.len) return lexError(diagnostic, .unterminated_string_literal, source_start, sql.len);
-            if (!std.unicode.utf8ValidateSlice(out.items) or std.mem.indexOfScalar(u8, out.items, 0) != null)
+            if (!try validStringEncoding(out.buffer.items, work))
                 return lexError(diagnostic, .invalid_string_encoding, source_start, i + 1);
             const owned = try out.toOwnedSlice(alloc);
             var owned_transferred = false;
             errdefer if (!owned_transferred) alloc.free(owned);
             i += 1;
+            try ensureControlledCapacity(Token, alloc, &tokens, tokens.items.len + 1, work.control);
             try tokens.append(alloc, .{ .kind = .string, .text = owned, .owned = true, .source_start = source_start, .source_end = i });
             owned_transferred = true;
             continue;
         }
         if (std.ascii.isDigit(ch) or (ch == '.' and i + 1 < sql.len and std.ascii.isDigit(sql[i + 1]))) {
             const start = i;
-            i = try scanNumberEnd(sql, start, diagnostic);
+            i = try scanNumberEnd(sql, start, diagnostic, work);
             const end = i;
+            try ensureControlledCapacity(Token, alloc, &tokens, tokens.items.len + 1, work.control);
             try tokens.append(alloc, .{ .kind = .number, .text = sql[start..end] });
             continue;
         }
         if (ch == '$') {
-            if (try sqlDollarQuoteAt(sql, i, diagnostic)) |quote| {
-                try validateUtf8Range(sql, quote.body_start, quote.body_end, diagnostic);
+            if (try sqlDollarQuoteAt(alloc, sql, i, diagnostic, work)) |quote| {
+                try validateUtf8Range(sql, quote.body_start, quote.body_end, diagnostic, work);
                 if (!quote.closed) return lexError(diagnostic, .unterminated_dollar_quote, i, sql.len);
+                try ensureControlledCapacity(Token, alloc, &tokens, tokens.items.len + 1, work.control);
                 try tokens.append(alloc, .{
                     .kind = .string,
                     .text = sql[quote.body_start..quote.body_end],
@@ -273,106 +391,132 @@ fn tokenizeImpl(alloc: std.mem.Allocator, sql: []const u8, diagnostic: *LexDiagn
             }
             const start = i;
             i += 1;
-            while (i < sql.len and std.ascii.isDigit(sql[i])) i += 1;
+            while (i < sql.len and std.ascii.isDigit(sql[i])) {
+                try work.poll();
+                i += 1;
+            }
             if (i == start + 1) return lexError(diagnostic, .invalid_placeholder, start, @min(start + 1, sql.len));
             if (i < sql.len and (std.ascii.isAlphanumeric(sql[i]) or sql[i] == '_' or sql[i] >= 0x80)) {
                 const end = if (sql[i] >= 0x80) i + try utf8SequenceWidthAt(sql, i, diagnostic) else i + 1;
                 return lexError(diagnostic, .invalid_placeholder, start, end);
             }
+            try ensureControlledCapacity(Token, alloc, &tokens, tokens.items.len + 1, work.control);
             try tokens.append(alloc, .{ .kind = .placeholder, .text = sql[start..i] });
             continue;
         }
         switch (ch) {
             ',' => {
+                try ensureControlledCapacity(Token, alloc, &tokens, tokens.items.len + 1, work.control);
                 try tokens.append(alloc, .{ .kind = .comma, .text = sql[i .. i + 1] });
                 i += 1;
             },
             '.' => {
+                try ensureControlledCapacity(Token, alloc, &tokens, tokens.items.len + 1, work.control);
                 try tokens.append(alloc, .{ .kind = .dot, .text = sql[i .. i + 1] });
                 i += 1;
             },
             ':' => {
                 if (i + 1 < sql.len and sql[i + 1] == ':') {
+                    try ensureControlledCapacity(Token, alloc, &tokens, tokens.items.len + 1, work.control);
                     try tokens.append(alloc, .{ .kind = .colon_colon, .text = sql[i .. i + 2] });
                     i += 2;
                 } else {
+                    try ensureControlledCapacity(Token, alloc, &tokens, tokens.items.len + 1, work.control);
                     try tokens.append(alloc, .{ .kind = .colon, .text = sql[i .. i + 1] });
                     i += 1;
                 }
             },
             '*' => {
+                try ensureControlledCapacity(Token, alloc, &tokens, tokens.items.len + 1, work.control);
                 try tokens.append(alloc, .{ .kind = .star, .text = sql[i .. i + 1] });
                 i += 1;
             },
             '+' => {
+                try ensureControlledCapacity(Token, alloc, &tokens, tokens.items.len + 1, work.control);
                 try tokens.append(alloc, .{ .kind = .plus, .text = sql[i .. i + 1] });
                 i += 1;
             },
             '/' => {
+                try ensureControlledCapacity(Token, alloc, &tokens, tokens.items.len + 1, work.control);
                 try tokens.append(alloc, .{ .kind = .slash, .text = sql[i .. i + 1] });
                 i += 1;
             },
             '%' => {
+                try ensureControlledCapacity(Token, alloc, &tokens, tokens.items.len + 1, work.control);
                 try tokens.append(alloc, .{ .kind = .percent, .text = sql[i .. i + 1] });
                 i += 1;
             },
             '(' => {
+                try ensureControlledCapacity(Token, alloc, &tokens, tokens.items.len + 1, work.control);
                 try tokens.append(alloc, .{ .kind = .lparen, .text = sql[i .. i + 1] });
                 i += 1;
             },
             ')' => {
+                try ensureControlledCapacity(Token, alloc, &tokens, tokens.items.len + 1, work.control);
                 try tokens.append(alloc, .{ .kind = .rparen, .text = sql[i .. i + 1] });
                 i += 1;
             },
             '[' => {
+                try ensureControlledCapacity(Token, alloc, &tokens, tokens.items.len + 1, work.control);
                 try tokens.append(alloc, .{ .kind = .lbracket, .text = sql[i .. i + 1] });
                 i += 1;
             },
             ']' => {
+                try ensureControlledCapacity(Token, alloc, &tokens, tokens.items.len + 1, work.control);
                 try tokens.append(alloc, .{ .kind = .rbracket, .text = sql[i .. i + 1] });
                 i += 1;
             },
             '@' => {
                 if (i + 1 >= sql.len or sql[i + 1] != '>') return lexError(diagnostic, .invalid_operator, i, @min(i + 2, sql.len));
+                try ensureControlledCapacity(Token, alloc, &tokens, tokens.items.len + 1, work.control);
                 try tokens.append(alloc, .{ .kind = .at_contains, .text = sql[i .. i + 2] });
                 i += 2;
             },
             '&' => {
                 if (i + 1 >= sql.len or sql[i + 1] != '&') return lexError(diagnostic, .invalid_operator, i, @min(i + 2, sql.len));
+                try ensureControlledCapacity(Token, alloc, &tokens, tokens.items.len + 1, work.control);
                 try tokens.append(alloc, .{ .kind = .range_overlap, .text = sql[i .. i + 2] });
                 i += 2;
             },
             '|' => {
                 if (i + 1 >= sql.len or sql[i + 1] != '|') return lexError(diagnostic, .invalid_operator, i, @min(i + 2, sql.len));
+                try ensureControlledCapacity(Token, alloc, &tokens, tokens.items.len + 1, work.control);
                 try tokens.append(alloc, .{ .kind = .pipe_concat, .text = sql[i .. i + 2] });
                 i += 2;
             },
             '?' => {
                 if (i + 1 < sql.len and sql[i + 1] == '|') {
+                    try ensureControlledCapacity(Token, alloc, &tokens, tokens.items.len + 1, work.control);
                     try tokens.append(alloc, .{ .kind = .question_any, .text = sql[i .. i + 2] });
                     i += 2;
                 } else if (i + 1 < sql.len and sql[i + 1] == '&') {
+                    try ensureControlledCapacity(Token, alloc, &tokens, tokens.items.len + 1, work.control);
                     try tokens.append(alloc, .{ .kind = .question_all, .text = sql[i .. i + 2] });
                     i += 2;
                 } else {
+                    try ensureControlledCapacity(Token, alloc, &tokens, tokens.items.len + 1, work.control);
                     try tokens.append(alloc, .{ .kind = .question, .text = sql[i .. i + 1] });
                     i += 1;
                 }
             },
             '~' => {
                 if (i + 1 < sql.len and sql[i + 1] == '*') {
+                    try ensureControlledCapacity(Token, alloc, &tokens, tokens.items.len + 1, work.control);
                     try tokens.append(alloc, .{ .kind = .regex_imatch, .text = sql[i .. i + 2] });
                     i += 2;
                 } else {
+                    try ensureControlledCapacity(Token, alloc, &tokens, tokens.items.len + 1, work.control);
                     try tokens.append(alloc, .{ .kind = .regex_match, .text = sql[i .. i + 1] });
                     i += 1;
                 }
             },
             '#' => {
                 if (i + 2 < sql.len and sql[i + 1] == '>' and sql[i + 2] == '>') {
+                    try ensureControlledCapacity(Token, alloc, &tokens, tokens.items.len + 1, work.control);
                     try tokens.append(alloc, .{ .kind = .path_arrow_text, .text = sql[i .. i + 3] });
                     i += 3;
                 } else if (i + 1 < sql.len and sql[i + 1] == '>') {
+                    try ensureControlledCapacity(Token, alloc, &tokens, tokens.items.len + 1, work.control);
                     try tokens.append(alloc, .{ .kind = .path_arrow_json, .text = sql[i .. i + 2] });
                     i += 2;
                 } else {
@@ -380,22 +524,27 @@ fn tokenizeImpl(alloc: std.mem.Allocator, sql: []const u8, diagnostic: *LexDiagn
                 }
             },
             ';' => {
+                try ensureControlledCapacity(Token, alloc, &tokens, tokens.items.len + 1, work.control);
                 try tokens.append(alloc, .{ .kind = .semicolon, .text = sql[i .. i + 1] });
                 i += 1;
             },
             '=' => {
+                try ensureControlledCapacity(Token, alloc, &tokens, tokens.items.len + 1, work.control);
                 try tokens.append(alloc, .{ .kind = .eq, .text = sql[i .. i + 1] });
                 i += 1;
             },
             '!' => {
                 if (i + 1 < sql.len and sql[i + 1] == '=') {
+                    try ensureControlledCapacity(Token, alloc, &tokens, tokens.items.len + 1, work.control);
                     try tokens.append(alloc, .{ .kind = .neq, .text = sql[i .. i + 2] });
                     i += 2;
                 } else if (i + 1 < sql.len and sql[i + 1] == '~') {
                     if (i + 2 < sql.len and sql[i + 2] == '*') {
+                        try ensureControlledCapacity(Token, alloc, &tokens, tokens.items.len + 1, work.control);
                         try tokens.append(alloc, .{ .kind = .regex_not_imatch, .text = sql[i .. i + 3] });
                         i += 3;
                     } else {
+                        try ensureControlledCapacity(Token, alloc, &tokens, tokens.items.len + 1, work.control);
                         try tokens.append(alloc, .{ .kind = .regex_not_match, .text = sql[i .. i + 2] });
                         i += 2;
                     }
@@ -403,33 +552,41 @@ fn tokenizeImpl(alloc: std.mem.Allocator, sql: []const u8, diagnostic: *LexDiagn
             },
             '<' => {
                 if (i + 1 < sql.len and sql[i + 1] == '=') {
+                    try ensureControlledCapacity(Token, alloc, &tokens, tokens.items.len + 1, work.control);
                     try tokens.append(alloc, .{ .kind = .lte, .text = sql[i .. i + 2] });
                     i += 2;
                 } else if (i + 1 < sql.len and sql[i + 1] == '>') {
+                    try ensureControlledCapacity(Token, alloc, &tokens, tokens.items.len + 1, work.control);
                     try tokens.append(alloc, .{ .kind = .neq, .text = sql[i .. i + 2] });
                     i += 2;
                 } else {
+                    try ensureControlledCapacity(Token, alloc, &tokens, tokens.items.len + 1, work.control);
                     try tokens.append(alloc, .{ .kind = .lt, .text = sql[i .. i + 1] });
                     i += 1;
                 }
             },
             '>' => {
                 if (i + 1 < sql.len and sql[i + 1] == '=') {
+                    try ensureControlledCapacity(Token, alloc, &tokens, tokens.items.len + 1, work.control);
                     try tokens.append(alloc, .{ .kind = .gte, .text = sql[i .. i + 2] });
                     i += 2;
                 } else {
+                    try ensureControlledCapacity(Token, alloc, &tokens, tokens.items.len + 1, work.control);
                     try tokens.append(alloc, .{ .kind = .gt, .text = sql[i .. i + 1] });
                     i += 1;
                 }
             },
             '-' => {
                 if (i + 1 < sql.len and sql[i + 1] == '>' and i + 2 < sql.len and sql[i + 2] == '>') {
+                    try ensureControlledCapacity(Token, alloc, &tokens, tokens.items.len + 1, work.control);
                     try tokens.append(alloc, .{ .kind = .arrow_text, .text = sql[i .. i + 3] });
                     i += 3;
                 } else if (i + 1 < sql.len and sql[i + 1] == '>') {
+                    try ensureControlledCapacity(Token, alloc, &tokens, tokens.items.len + 1, work.control);
                     try tokens.append(alloc, .{ .kind = .arrow_json, .text = sql[i .. i + 2] });
                     i += 2;
                 } else {
+                    try ensureControlledCapacity(Token, alloc, &tokens, tokens.items.len + 1, work.control);
                     try tokens.append(alloc, .{ .kind = .minus, .text = sql[i .. i + 1] });
                     i += 1;
                 }
@@ -437,7 +594,8 @@ fn tokenizeImpl(alloc: std.mem.Allocator, sql: []const u8, diagnostic: *LexDiagn
             else => return lexError(diagnostic, .invalid_character, i, i + 1),
         }
     }
-    try finalizeTokenSourceSpans(sql, tokens.items);
+    try finalizeTokenSourceSpans(sql, tokens.items, work);
+    try work.check();
     return tokens;
 }
 
@@ -446,17 +604,20 @@ fn estimateTokenCapacity(sql: []const u8) usize {
     return @min(eager_token_capacity_limit, @min(sql.len, sql.len / 4 + 8));
 }
 
-fn stringContinuation(sql: []const u8, start: usize, diagnostic: *LexDiagnostic) !?usize {
+fn stringContinuation(sql: []const u8, start: usize, diagnostic: *LexDiagnostic, work: *Work) !?usize {
     var pos = start;
     var newline = false;
     while (pos < sql.len) {
+        try work.poll();
         if (std.ascii.isWhitespace(sql[pos])) {
             newline = newline or sql[pos] == '\n' or sql[pos] == '\r';
             pos += 1;
         } else if (sql[pos] == '-' and pos + 1 < sql.len and sql[pos + 1] == '-') {
             pos += 2;
-            while (pos < sql.len and sql[pos] != '\n' and sql[pos] != '\r')
+            while (pos < sql.len and sql[pos] != '\n' and sql[pos] != '\r') {
+                try work.poll();
                 pos += if (sql[pos] >= 0x80) try utf8SequenceWidthAt(sql, pos, diagnostic) else 1;
+            }
         } else break;
     }
     return if (newline and pos < sql.len and sql[pos] == '\'') pos else null;
@@ -489,7 +650,7 @@ fn unicodeEscape(sql: []const u8, pos: *usize, diagnostic: *LexDiagnostic) !u32 
 /// Decodes into the token's single owned buffer. Escapes never increase its
 /// size beyond input bytes. Validate byte escapes together at literal end so
 /// independently escaped bytes may form one valid UTF-8 character.
-fn appendStringEscape(alloc: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), sql: []const u8, pos: *usize, diagnostic: *LexDiagnostic) !void {
+fn appendStringEscape(alloc: std.mem.Allocator, out: *DecodedBuffer, sql: []const u8, pos: *usize, diagnostic: *LexDiagnostic) !void {
     const start = pos.*;
     if (start + 1 >= sql.len) return lexError(diagnostic, .unterminated_string_literal, start, sql.len);
     const ch = sql[start + 1];
@@ -613,16 +774,17 @@ test "bounded lexer releases owned tokens on quota failure" {
     try std.testing.expectError(error.SqlTokenLimitExceeded, tokenizeBoundedDiagnosticAlloc(std.testing.allocator, "\"quoted\" 'string' excess", 2));
 }
 
-fn scanDecimalDigitsEnd(sql: []const u8, start: usize) usize {
+fn scanDecimalDigitsEnd(sql: []const u8, start: usize, work: *Work) !usize {
     var i = start;
     while (i < sql.len and std.ascii.isDigit(sql[i])) {
+        try work.poll();
         i += 1;
         if (i + 1 < sql.len and sql[i] == '_' and std.ascii.isDigit(sql[i + 1])) i += 1;
     }
     return i;
 }
 
-fn scanNumberEnd(sql: []const u8, start: usize, diagnostic: *LexDiagnostic) !usize {
+fn scanNumberEnd(sql: []const u8, start: usize, diagnostic: *LexDiagnostic, work: *Work) !usize {
     var i = start;
     var has_decimal_point = false;
 
@@ -630,15 +792,15 @@ fn scanNumberEnd(sql: []const u8, start: usize, diagnostic: *LexDiagnostic) !usi
         has_decimal_point = true;
         i += 1;
         std.debug.assert(i < sql.len and std.ascii.isDigit(sql[i]));
-        i = scanDecimalDigitsEnd(sql, i);
+        i = try scanDecimalDigitsEnd(sql, i, work);
     } else {
         std.debug.assert(std.ascii.isDigit(sql[i]));
-        i = scanDecimalDigitsEnd(sql, i);
+        i = try scanDecimalDigitsEnd(sql, i, work);
         if (i < sql.len and sql[i] == '.') {
             if (i + 1 < sql.len and sql[i + 1] == '.') return lexError(diagnostic, .malformed_numeric_literal, start, i + 2);
             has_decimal_point = true;
             i += 1;
-            i = scanDecimalDigitsEnd(sql, i);
+            i = try scanDecimalDigitsEnd(sql, i, work);
         }
     }
 
@@ -648,7 +810,7 @@ fn scanNumberEnd(sql: []const u8, start: usize, diagnostic: *LexDiagnostic) !usi
         if (i >= sql.len or !std.ascii.isDigit(sql[i])) {
             return lexError(diagnostic, .malformed_numeric_literal, start, @min(i + 1, sql.len));
         }
-        i = scanDecimalDigitsEnd(sql, i);
+        i = try scanDecimalDigitsEnd(sql, i, work);
     }
 
     // Never split a malformed decimal into two NUMBER tokens: doing so can
@@ -673,9 +835,10 @@ fn utf8SequenceWidthAt(sql: []const u8, index: usize, diagnostic: *LexDiagnostic
     return width;
 }
 
-fn validateUtf8Range(sql: []const u8, start: usize, end: usize, diagnostic: *LexDiagnostic) !void {
+fn validateUtf8Range(sql: []const u8, start: usize, end: usize, diagnostic: *LexDiagnostic, work: *Work) !void {
     var index = start;
     while (index < end) {
+        try work.poll();
         index += if (sql[index] >= 0x80) try utf8SequenceWidthAt(sql, index, diagnostic) else 1;
     }
 }
@@ -701,16 +864,67 @@ pub fn freeTokens(alloc: std.mem.Allocator, tokens: *std.ArrayListUnmanaged(Toke
     tokens.deinit(alloc);
 }
 
-fn finalizeTokenSourceSpans(sql: []const u8, tokens: []Token) !void {
+fn finalizeTokenSourceSpans(sql: []const u8, tokens: []Token, work: *Work) !void {
     const sql_start = @intFromPtr(sql.ptr);
     const sql_end = sql_start + sql.len;
     for (tokens) |*token| {
+        try work.poll();
         if (token.source_end > token.source_start or token.text.len == 0) continue;
         const token_start = @intFromPtr(token.text.ptr);
         if (token_start < sql_start or token_start + token.text.len > sql_end) return error.InvalidTokenSourceSpan;
         token.source_start = token_start - sql_start;
         token.source_end = token.source_start + token.text.len;
     }
+}
+
+fn validStringEncoding(bytes: []const u8, work: *Work) !bool {
+    var index: usize = 0;
+    while (index < bytes.len) {
+        try work.poll();
+        if (bytes[index] == 0) return false;
+        const width = std.unicode.utf8ByteSequenceLength(bytes[index]) catch return false;
+        if (width > bytes.len - index) return false;
+        _ = std.unicode.utf8Decode(bytes[index .. index + width]) catch return false;
+        index += width;
+    }
+    return true;
+}
+
+// KMP bounds both delimiter preprocessing and search work, including repeated
+// delimiter prefixes. A large delimiter cannot hide one unbounded comparison.
+fn findDelimiter(alloc: std.mem.Allocator, sql: []const u8, start: usize, delimiter: []const u8, work: *Work) !?usize {
+    if (work.control == null) return std.mem.indexOfPos(u8, sql, start, delimiter);
+    const prefix = try alloc.alloc(usize, delimiter.len);
+    defer alloc.free(prefix);
+    prefix[0] = 0;
+    var matched: usize = 0;
+    var index: usize = 1;
+    while (index < delimiter.len) {
+        try work.poll();
+        if (delimiter[index] == delimiter[matched]) {
+            matched += 1;
+            prefix[index] = matched;
+            index += 1;
+        } else if (matched != 0) {
+            matched = prefix[matched - 1];
+        } else {
+            prefix[index] = 0;
+            index += 1;
+        }
+    }
+    matched = 0;
+    index = start;
+    while (index < sql.len) {
+        try work.poll();
+        if (sql[index] == delimiter[matched]) {
+            matched += 1;
+            index += 1;
+            if (matched == delimiter.len) return index - delimiter.len;
+        } else if (matched != 0) {
+            matched = prefix[matched - 1];
+        } else index += 1;
+    }
+    return null;
 }
 
 const SqlDollarQuote = struct {
@@ -720,7 +934,7 @@ const SqlDollarQuote = struct {
     closed: bool,
 };
 
-fn sqlDollarQuoteAt(sql: []const u8, dollar: usize, diagnostic: *LexDiagnostic) !?SqlDollarQuote {
+fn sqlDollarQuoteAt(alloc: std.mem.Allocator, sql: []const u8, dollar: usize, diagnostic: *LexDiagnostic, work: *Work) !?SqlDollarQuote {
     if (dollar + 1 >= sql.len or sql[dollar] != '$') return null;
     if (std.ascii.isDigit(sql[dollar + 1])) return null;
 
@@ -734,6 +948,7 @@ fn sqlDollarQuoteAt(sql: []const u8, dollar: usize, diagnostic: *LexDiagnostic) 
         else
             1;
         while (delimiter_end < sql.len and sqlDollarQuoteTagContinue(sql[delimiter_end])) {
+            try work.poll();
             delimiter_end += if (sql[delimiter_end] >= 0x80)
                 try utf8SequenceWidthAt(sql, delimiter_end, diagnostic)
             else
@@ -745,7 +960,7 @@ fn sqlDollarQuoteAt(sql: []const u8, dollar: usize, diagnostic: *LexDiagnostic) 
 
     const delimiter = sql[dollar..delimiter_end];
     const body_start = delimiter_end;
-    const body_end = std.mem.indexOfPos(u8, sql, body_start, delimiter) orelse return .{
+    const body_end = (try findDelimiter(alloc, sql, body_start, delimiter, work)) orelse return .{
         .body_start = body_start,
         .body_end = sql.len,
         .token_end = sql.len,
@@ -1052,4 +1267,84 @@ test "sql adapter lexer tokenizes graph relationship labels" {
             try std.testing.expect(saw_dot);
         }
     }
+}
+
+test "controlled SQL lexer interrupts long trivia and single token scans without leaked tokens" {
+    const Interrupt = struct {
+        checks: usize = 0,
+        fn checkpoint(raw: *anyopaque) error{SqlPreparationInterrupted}!void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.checks += 1;
+            if (self.checks == 3) return error.SqlPreparationInterrupted;
+        }
+    };
+    const body: [8192]u8 = @splat('x');
+    const digits: [8192]u8 = @splat('1');
+    for ([_][]const u8{
+        "/*" ++ body ++ "*/ SELECT 1",
+        "SELECT 'owned', /*" ++ body ++ "*/ 1",
+        "--" ++ body ++ "\nSELECT 1",
+        "SELECT '" ++ body ++ "'",
+        "SELECT \"" ++ body ++ "\"",
+        "SELECT $$" ++ body ++ "$$",
+        "SELECT $" ++ body ++ "$literal$" ++ body ++ "$",
+        "SELECT " ++ digits,
+        "SELECT $" ++ digits,
+        "SELECT 'a'\n--" ++ body ++ "\n'b'",
+    }) |statement| {
+        var interrupt: Interrupt = .{};
+        try std.testing.expectError(error.SqlPreparationInterrupted, tokenizeBoundedDiagnosticControlledAlloc(std.testing.allocator, statement, 128, .{ .ptr = &interrupt, .checkpoint = Interrupt.checkpoint }));
+        try std.testing.expectEqual(@as(usize, 3), interrupt.checks);
+    }
+}
+
+test "controlled lexer interrupted buffer relocation preserves original owner and frees replacement" {
+    const Interrupt = struct {
+        checks: usize = 0,
+        fn checkpoint(raw: *anyopaque) error{SqlPreparationInterrupted}!void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.checks += 1;
+            if (self.checks == 3) return error.SqlPreparationInterrupted;
+        }
+    };
+    var no_resize = std.testing.FailingAllocator.init(std.testing.allocator, .{ .resize_fail_index = 0 });
+    const alloc = no_resize.allocator();
+    var bytes: std.ArrayList(u8) = .empty;
+    defer bytes.deinit(alloc);
+    try bytes.ensureTotalCapacityPrecise(alloc, 8192);
+    const contents: [8192]u8 = @splat('q');
+    bytes.appendSliceAssumeCapacity(&contents);
+    const original_pointer = bytes.items.ptr;
+    var interrupt: Interrupt = .{};
+    try std.testing.expectError(error.SqlPreparationInterrupted, ensureControlledCapacity(u8, alloc, &bytes, 8193, .{ .ptr = &interrupt, .checkpoint = Interrupt.checkpoint }));
+    try std.testing.expectEqual(original_pointer, bytes.items.ptr);
+    try std.testing.expectEqual(@as(usize, 8192), bytes.capacity);
+    try std.testing.expectEqualSlices(u8, &contents, bytes.items);
+    try std.testing.expectEqual(@as(usize, 8192), no_resize.allocated_bytes - no_resize.freed_bytes);
+}
+
+test "controlled lexer interrupted owned slice copy retains original decoded buffer" {
+    const Interrupt = struct {
+        checks: usize = 0,
+        fn checkpoint(raw: *anyopaque) error{SqlPreparationInterrupted}!void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.checks += 1;
+            if (self.checks == 3) return error.SqlPreparationInterrupted;
+        }
+    };
+    var no_resize = std.testing.FailingAllocator.init(std.testing.allocator, .{ .resize_fail_index = 0 });
+    const alloc = no_resize.allocator();
+    var interrupt: Interrupt = .{};
+    var work: Work = .{ .control = .{ .ptr = &interrupt, .checkpoint = Interrupt.checkpoint } };
+    var decoded: DecodedBuffer = .{ .work = &work };
+    defer decoded.deinit(alloc);
+    try decoded.buffer.ensureTotalCapacityPrecise(alloc, 16384);
+    const contents: [8192]u8 = @splat('q');
+    decoded.buffer.appendSliceAssumeCapacity(&contents);
+    const original_pointer = decoded.buffer.items.ptr;
+    try std.testing.expectError(error.SqlPreparationInterrupted, decoded.toOwnedSlice(alloc));
+    try std.testing.expectEqual(original_pointer, decoded.buffer.items.ptr);
+    try std.testing.expectEqual(@as(usize, 16384), decoded.buffer.capacity);
+    try std.testing.expectEqualSlices(u8, &contents, decoded.buffer.items);
+    try std.testing.expectEqual(@as(usize, 16384), no_resize.allocated_bytes - no_resize.freed_bytes);
 }

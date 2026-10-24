@@ -13,14 +13,25 @@ const antfly_provider_openapi = @import("antfly_provider_openapi");
 const antfly_reranking_openapi = @import("antfly_reranking_openapi");
 const antfly_scraping_openapi = @import("antfly_scraping_openapi");
 
-/// Node-local foreground database request admission settings.
+/// Node-local foreground database request admission settings. Omitted runnable policy enables automatic startup sizing; omitted query waiting allows eight requests and eight MiB of retained input for at most 250 milliseconds. Explicit runnable null disables scheduling and implicit waiting. Explicit operation counts, including zero, retain their meanings.
 pub const AdmissionConfig = struct {
+    /// Aggregate API-owned durable session and job storage, protocol sessions, provider state and catalogue/cache allocations. Shared across persistent owners and independent of request, transport, storage-engine and model envelopes. In automatic runnable mode this is an upper bound, additionally limited to 1/8 of the effective process memory budget.
+    max_retained_memory_bytes: ?u64 = null,
+    /// Absolute HTTP request and stream lifetime in milliseconds, from ingress through response delivery. Shorter forwarded and query budgets still apply. Expiry bounds caller work and waiting; accepted durable decisions retain their independent completion and recovery ownership.
+    max_request_duration_ms: ?u64 = null,
+    /// Aggregate API request, response, SQL plan, and in-memory transaction allocation envelope. One eighth, capped at 16 MiB, is reserved for verified SQL control work. Storage, inference, transport, and durable completion retain separate envelopes. In automatic runnable mode this is an upper bound, additionally limited to 1/8 of the effective process memory budget.
+    max_request_memory_bytes: ?u64 = null,
+    runnable: OpenApiOptionalNullable(std.meta.Child(RunnableSchedulingConfig)) = .absent,
     query: ?QueryAdmissionConfig = null,
     write: ?WriteAdmissionConfig = null,
     inference: ?InferenceAdmissionConfig = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "max_retained_memory_bytes", "max_retained_memory_bytes", true },
+        .{ "max_request_duration_ms", "max_request_duration_ms", true },
+        .{ "max_request_memory_bytes", "max_request_memory_bytes", true },
+        .{ "runnable", "runnable", false },
         .{ "query", "query", true },
         .{ "write", "write", true },
         .{ "inference", "inference", true },
@@ -36,6 +47,29 @@ pub const AdmissionConfig = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.max_retained_memory_bytes) |value| {
+            try jw.objectField("max_retained_memory_bytes");
+            try jw.write(value);
+        }
+        if (self.max_request_duration_ms) |value| {
+            try jw.objectField("max_request_duration_ms");
+            try jw.write(value);
+        }
+        if (self.max_request_memory_bytes) |value| {
+            try jw.objectField("max_request_memory_bytes");
+            try jw.write(value);
+        }
+        switch (self.runnable) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("runnable");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("runnable");
+                try jw.write(value);
+            },
+        }
         if (self.query) |value| {
             try jw.objectField("query");
             try jw.write(value);
@@ -2295,11 +2329,19 @@ pub const ObjectStorageLocation = struct {
     }
 };
 
-/// Optional PostgreSQL wire listener. Requires authentication. Transactions remain unsupported. Remote bindings require externally protected transport.
+/// Optional PostgreSQL wire listener. Requires authentication. Supports native transactions. Remote bindings require externally protected transport.
 pub const PgwireConfig = struct {
     enabled: ?bool = null,
     bind_host: ?[]const u8 = null,
     bind_port: ?i64 = null,
+    /// Aggregate bytes allocated through pgwire connection budgets, covering protocol messages, prepared state, portals, and caller-owned response arenas. Zero preserves the sum of the per-connection ceilings. This is separate from global backend plan/cache and process memory budgets.
+    max_session_bytes: ?i64 = null,
+    /// Aggregate pgwire retained-state allocation ceiling for prepared plans, portals, cursor state/spools, and settings. Charged within max_session_bytes. Zero uses the sum of per-connection retained ceilings.
+    max_retained_bytes: ?i64 = null,
+    /// Per-connection retained-state allocation ceiling, separate from transient frames and response pages.
+    retained_bytes_per_connection: ?i64 = null,
+    /// Maximum wait for the next message in an active or failed transaction, capped by the ordinary connection idle timeout. Expiry disconnects the owner and runs normal cleanup; durable decisions remain recoverable.
+    idle_transaction_timeout_ms: ?i64 = null,
     max_connections: ?i64 = null,
     /// Acknowledges that a TLS proxy or authenticated private transport protects a non-loopback listener. Does not enable native TLS.
     externally_protected_transport: ?bool = null,
@@ -2309,6 +2351,10 @@ pub const PgwireConfig = struct {
         .{ "enabled", "enabled", true },
         .{ "bind_host", "bind_host", true },
         .{ "bind_port", "bind_port", true },
+        .{ "max_session_bytes", "max_session_bytes", true },
+        .{ "max_retained_bytes", "max_retained_bytes", true },
+        .{ "retained_bytes_per_connection", "retained_bytes_per_connection", true },
+        .{ "idle_transaction_timeout_ms", "idle_transaction_timeout_ms", true },
         .{ "max_connections", "max_connections", true },
         .{ "externally_protected_transport", "externally_protected_transport", true },
     };
@@ -2335,6 +2381,22 @@ pub const PgwireConfig = struct {
             try jw.objectField("bind_port");
             try jw.write(value);
         }
+        if (self.max_session_bytes) |value| {
+            try jw.objectField("max_session_bytes");
+            try jw.write(value);
+        }
+        if (self.max_retained_bytes) |value| {
+            try jw.objectField("max_retained_bytes");
+            try jw.write(value);
+        }
+        if (self.retained_bytes_per_connection) |value| {
+            try jw.objectField("retained_bytes_per_connection");
+            try jw.write(value);
+        }
+        if (self.idle_transaction_timeout_ms) |value| {
+            try jw.objectField("idle_transaction_timeout_ms");
+            try jw.write(value);
+        }
         if (self.max_connections) |value| {
             try jw.objectField("max_connections");
             try jw.write(value);
@@ -2348,11 +2410,13 @@ pub const PgwireConfig = struct {
 };
 
 pub const QueryAdmissionConfig = struct {
-    /// Maximum concurrent query, search, and retrieval requests in this process. The default is 32. The budget is shared by REST, MCP, retrieval-agent, A2A, and direct API-kernel execution. Full-text, vector, hybrid, graph, aggregation, federated searches, and document scans consume it. Point lookups and operational/control-plane reads remain outside it. Excess HTTP work is rejected immediately with HTTP 429 and Retry-After: 1; asynchronous protocols use their native failure response. Excess work is not queued. Set to 0 to disable query admission. This budget is independent of transport safeguards, write admission, and admission.inference.max_concurrent_requests.
+    waiting: ?QueryAdmissionWaiting = null,
+    /// Maximum concurrent query, search, and retrieval requests in this process. The default is 32. The budget is shared by REST, MCP, retrieval-agent, A2A, and direct API-kernel execution. Full-text, vector, hybrid, graph, aggregation, federated searches, and document scans consume it. Point lookups and operational/control-plane reads remain outside it. Supported contextual reads wait within the bounded admission.query.waiting policy before excess work returns HTTP 429 and Retry-After: 1; asynchronous protocols use their native failure response. Explicit empty waiting settings retain immediate rejection. Set to 0 to disable query admission. This budget is independent of transport safeguards, write admission, and admission.inference.max_concurrent_requests.
     max_concurrent_requests: ?i64 = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "waiting", "waiting", true },
         .{ "max_concurrent_requests", "max_concurrent_requests", true },
     };
 
@@ -2366,6 +2430,10 @@ pub const QueryAdmissionConfig = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.waiting) |value| {
+            try jw.objectField("waiting");
+            try jw.write(value);
+        }
         if (self.max_concurrent_requests) |value| {
             try jw.objectField("max_concurrent_requests");
             try jw.write(value);
@@ -2373,6 +2441,169 @@ pub const QueryAdmissionConfig = struct {
         try jw.endObject();
     }
 };
+
+/// Bounded waiting for contextual REST, native SQL and managed serverless reads. Omitting admission.query.waiting uses eight queued requests, eight MiB of retained input and a 250 millisecond ceiling when scheduling is enabled. An explicit object uses the zero property defaults: {} is fail-fast. Waiting retains a bounded runtime task and owned input; existing executor and transport bounds still apply. Write, inference, MCP, and unsupported legacy direct calls remain fail-fast. All three limits must be positive to enable waiting, or all zero to disable it. These are queued input limits, not total heap limits.
+pub const QueryAdmissionWaiting = struct {
+    max_queued_requests: ?i64 = null,
+    max_queued_bytes: ?i64 = null,
+    max_wait_ms: ?i64 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "max_queued_requests", "max_queued_requests", true },
+        .{ "max_queued_bytes", "max_queued_bytes", true },
+        .{ "max_wait_ms", "max_wait_ms", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.max_queued_requests) |value| {
+            try jw.objectField("max_queued_requests");
+            try jw.write(value);
+        }
+        if (self.max_queued_bytes) |value| {
+            try jw.objectField("max_queued_bytes");
+            try jw.write(value);
+        }
+        if (self.max_wait_ms) |value| {
+            try jw.objectField("max_wait_ms");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+pub const RunnableSchedulingConfigValue = struct {
+    /// Fixed preserves declared capacity. Automatic uses affinity and visible CPU quotas, with a protected-lane floor inside the declared slot ceiling, and limits metadata to 1/32 of the effective host/container/process memory budget. Request and retained-state pools each receive at most 1/8 of that budget. Resolution is frozen before publication; active policy is never resized.
+    capacity_mode: ?[]const u8 = null,
+    /// Total runnable slots, or the upper bound in automatic mode, including health/control and cleanup reserves. Managed startup requires at least one ordinary slot after both reserves. Protected lanes can share OS CPU time on small quotas and do not promise dedicated cores.
+    slots: ?i64 = null,
+    /// Health/control CPU slots reserved within slots, independently from cleanup. The combined reserves must leave at least one ordinary slot.
+    control_slots: ?i64 = null,
+    /// Dedicated cleanup CPU slots drawn from slots. Managed startup establishes one slot when zero is configured, before publishing work; it does not increase the total slot limit.
+    cleanup_slots: ?i64 = null,
+    /// Reserve bounded_read_slots ordinary CPU slots, including one nonborrowable floor, and one quarter of ordinary scheduling entries and metadata for server-verified bounded reads. General reads, analytical reads and other ordinary classes share the remainder. Omitted or null selects automatic isolation only in automatic capacity mode with enough ordinary slots for the configured bounded reserve plus one general slot and eight entries; fixed mode defaults to disabled. Explicit false disables isolation, including in automatic mode. Explicit true requires sufficient capacity, including managed cleanup, or startup fails. Unverified plans cannot claim the bounded lane. When enabled, production startup carves one quarter of the ordinary request heap into finite read pools, with half for demoted reads and one quarter each for bounded and transition allocations. This reduces the ordinary heap without increasing max_request_memory_bytes. Existing control and retained-state envelopes remain separate. Only verified operators may use the protected pools; this does not bound every backend allocation or preempt non-yielding work.
+    read_isolation: OpenApiOptionalNullable(bool) = .absent,
+    /// Bounded-read CPU reserve within the total slot ceiling when read isolation is enabled. One slot is a nonborrowable floor. Only capacity above that floor may lend a CPU to a server-verified stage; at most one CPU loan is supported. The default reserves only the floor and permits no CPU lending. The reserve must leave at least one general slot after health and cleanup; automatic isolation is disabled when that capacity is unavailable unless explicitly required.
+    bounded_read_slots: ?i64 = null,
+    /// Query, write, inference and background slot-service weights.
+    weights: ?[]const i64 = null,
+    /// Outstanding operation entries including protected controls. Managed startup requires at least two control entries, reserved within this bound.
+    max_operations: ?i64 = null,
+    /// Caller-declared scheduling metadata bytes across queued, running and blocked operations; not a whole-process heap limit.
+    max_bytes: ?u64 = null,
+    /// Protected scheduling metadata bytes reserved within max_bytes. Up to four operation entries, capped at half max_operations, are also reserved for controls.
+    control_bytes: ?u64 = null,
+    max_wait_ms: ?i64 = null,
+    max_backfills: ?i64 = null,
+    quantum_ms: ?i64 = null,
+    checkpoint_budget: ?i64 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "capacity_mode", "capacity_mode", true },
+        .{ "slots", "slots", true },
+        .{ "control_slots", "control_slots", true },
+        .{ "cleanup_slots", "cleanup_slots", true },
+        .{ "read_isolation", "read_isolation", false },
+        .{ "bounded_read_slots", "bounded_read_slots", true },
+        .{ "weights", "weights", true },
+        .{ "max_operations", "max_operations", true },
+        .{ "max_bytes", "max_bytes", true },
+        .{ "control_bytes", "control_bytes", true },
+        .{ "max_wait_ms", "max_wait_ms", true },
+        .{ "max_backfills", "max_backfills", true },
+        .{ "quantum_ms", "quantum_ms", true },
+        .{ "checkpoint_budget", "checkpoint_budget", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.capacity_mode) |value| {
+            try jw.objectField("capacity_mode");
+            try jw.write(value);
+        }
+        if (self.slots) |value| {
+            try jw.objectField("slots");
+            try jw.write(value);
+        }
+        if (self.control_slots) |value| {
+            try jw.objectField("control_slots");
+            try jw.write(value);
+        }
+        if (self.cleanup_slots) |value| {
+            try jw.objectField("cleanup_slots");
+            try jw.write(value);
+        }
+        switch (self.read_isolation) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("read_isolation");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("read_isolation");
+                try jw.write(value);
+            },
+        }
+        if (self.bounded_read_slots) |value| {
+            try jw.objectField("bounded_read_slots");
+            try jw.write(value);
+        }
+        if (self.weights) |value| {
+            try jw.objectField("weights");
+            try jw.write(value);
+        }
+        if (self.max_operations) |value| {
+            try jw.objectField("max_operations");
+            try jw.write(value);
+        }
+        if (self.max_bytes) |value| {
+            try jw.objectField("max_bytes");
+            try jw.write(value);
+        }
+        if (self.control_bytes) |value| {
+            try jw.objectField("control_bytes");
+            try jw.write(value);
+        }
+        if (self.max_wait_ms) |value| {
+            try jw.objectField("max_wait_ms");
+            try jw.write(value);
+        }
+        if (self.max_backfills) |value| {
+            try jw.objectField("max_backfills");
+            try jw.write(value);
+        }
+        if (self.quantum_ms) |value| {
+            try jw.objectField("quantum_ms");
+            try jw.write(value);
+        }
+        if (self.checkpoint_budget) |value| {
+            try jw.objectField("checkpoint_budget");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+/// Node-wide runnable scheduling across execution classes. Omitting admission.runnable enables automatic initial sizing using the declared defaults as ceilings. Setting null disables runnable scheduling and implicit query waiting. An explicit object uses its property defaults, including fixed mode unless capacity_mode is supplied. Automatic mode resolves once before node publication and preserves protected health and cleanup capacity.
+pub const RunnableSchedulingConfig = ?RunnableSchedulingConfigValue;
 
 pub const RuntimeTaskBinding = struct {
     /// Backend model identity, including any owner prefix.
@@ -2903,6 +3134,51 @@ pub const WriteAdmissionConfig = struct {
         try jw.endObject();
     }
 };
+
+/// Presence-aware representation of an optional OpenAPI property that also permits JSON null.
+pub fn OpenApiOptionalNullable(comptime T: type) type {
+    return union(enum) {
+        absent,
+        null_value,
+        value: T,
+
+        pub fn fromNullable(value: ?T) @This() {
+            return if (value) |item| .{ .value = item } else .null_value;
+        }
+
+        pub fn isPresent(self: @This()) bool {
+            return self != .absent;
+        }
+
+        pub fn valueOrNull(self: @This()) ?T {
+            return switch (self) {
+                .absent, .null_value => null,
+                .value => |item| item,
+            };
+        }
+
+        pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+            if (try source.peekNextTokenType() == .null) {
+                _ = try source.next();
+                return .null_value;
+            }
+            return .{ .value = try std.json.innerParse(T, allocator, source, options) };
+        }
+
+        pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+            if (source == .null) return .null_value;
+            return .{ .value = try std.json.parseFromValueLeaky(T, allocator, source, options) };
+        }
+
+        pub fn jsonStringify(self: @This(), jw: anytype) !void {
+            switch (self) {
+                .absent => return error.OptionalNullablePropertyAbsent,
+                .null_value => try jw.write(@as(?u8, null)),
+                .value => |value| try jw.write(value),
+            }
+        }
+    };
+}
 
 /// Parse an OpenAPI object without materializing a second JSON tree while
 /// rejecting explicit null for optional properties whose schemas are non-nullable.

@@ -79,7 +79,15 @@ pub const BootstrapConfig = struct {
     node_config: ?*const common_config.Config = null,
     secret_store: ?*common_secrets.FileStore = null,
     query_max_concurrent_requests: u32 = common_config.default_query_max_concurrent_requests,
+    /// Omission follows scheduling defaults; an explicit empty policy is fail fast.
+    query_waiting: ?@import("antfly_local_sources").common_bounded_admission.Waiting = null,
     graph_execution_limits: @import("antfly_local_sources").graph_work_budget.Limits = .{},
+    /// One stable scheduler shared by request admission and autonomous work.
+    runnable_policy: ?@import("antfly_local_sources").common_request_admission.runnable_scheduler.Config = common_config.default_runnable_policy,
+    /// Stricter effective process budget; zero leaves platform detection authoritative.
+    process_memory_limit_bytes: u64 = 0,
+    max_request_memory_bytes: u64 = 256 << 20,
+    max_retained_memory_bytes: u64 = 256 << 20,
     write_max_concurrent_requests: u32 = common_config.default_write_max_concurrent_requests,
     /// CPU fanout available to one graph-metric kernel. Work is scheduled on
     /// the shared std.Io backend, so deployments can align this with their
@@ -388,6 +396,8 @@ fn gcsTargetAlloc(alloc: Allocator, uri: []const u8) !?OwnedGcsTarget {
 
 pub const OwnedStack = struct {
     alloc: Allocator,
+    request_memory: @import("../../common/allocation_budget.zig").Partitioned,
+    read_memory: ?@import("../../common/read_memory.zig").Pool = null,
     s3_client_pool: S3ClientPool,
     gcs_client_pool: GcsClientPool,
     artifacts_impl: artifacts_object_store.ObjectStore,
@@ -416,10 +426,37 @@ pub const OwnedStack = struct {
     runtime: runtime_manager.ManagedRuntime,
     status: RuntimeStatus,
     handler: api_mod.HttpHandler,
+    runnable_scheduler: ?@import("antfly_local_sources").common_request_admission.runnable_scheduler.Scheduler = null,
 
-    pub fn init(self: *OwnedStack, alloc: Allocator, cfg: BootstrapConfig, io: std.Io) !void {
-        try validateConfig(alloc, cfg);
+    pub fn init(self: *OwnedStack, backing: Allocator, requested: BootstrapConfig, io: std.Io) !void {
+        const cfg = try resolveStartupConfig(requested);
+        try validateConfig(backing, cfg);
+        const control_bytes: usize = @intCast(@min(4 << 20, cfg.max_request_memory_bytes / 8));
+        self.request_memory = .{
+            .foreground = .{ .child = backing, .limit = @intCast(cfg.max_request_memory_bytes - control_bytes) },
+            .control = .{ .child = backing, .limit = control_bytes },
+            .retained = .{ .child = backing, .limit = @intCast(cfg.max_retained_memory_bytes) },
+        };
+        self.read_memory = null;
+        errdefer self.assertMemoryRetired();
+        if (cfg.runnable_policy) |policy| if (policy.readIsolation()) {
+            const read = @import("../../common/read_memory.zig");
+            self.read_memory = try read.Pool.init(backing, null, try read.startupLimits(self.request_memory.foreground.limit, policy.max_operations));
+            self.request_memory.foreground.limit -= self.read_memory.?.pinned;
+        };
+        errdefer if (self.read_memory) |*pool| {
+            pool.deinit();
+            self.read_memory = null;
+        };
+        const alloc = self.request_memory.retainedAllocator();
+        const effective_policy = cfg.runnable_policy;
         self.alloc = alloc;
+        self.runnable_scheduler = if (effective_policy) |policy|
+            try @import("antfly_local_sources").common_request_admission.runnable_scheduler.Scheduler.init(policy)
+        else
+            null;
+        errdefer if (self.runnable_scheduler) |*scheduler| scheduler.close();
+        if (self.runnable_scheduler) |*scheduler| try scheduler.ensureCleanupCpuBeforePublication();
         self.embedding_provider_runtime = managed_embedder.ProviderRuntime.init(alloc, io);
         errdefer self.embedding_provider_runtime.deinit();
         self.s3_client_pool = try S3ClientPool.init(alloc);
@@ -540,7 +577,7 @@ pub const OwnedStack = struct {
 
         self.builder = build_mod.Builder.init(alloc, &self.artifacts, &self.manifests, &self.progress, &self.wal);
         self.builder.setIo(io);
-        try self.builder.setGraphMetricMaxParallelism(cfg.graph_metric_max_parallelism);
+        try self.builder.setGraphMetricMaxParallelism(if (self.runnable_scheduler) |*scheduler| @intCast(@min(cfg.graph_metric_max_parallelism, scheduler.config.generalSlots())) else cfg.graph_metric_max_parallelism);
         self.catalog = catalog_mod.CatalogService.init(alloc, &self.artifacts, &self.manifests, &self.progress, &self.wal, &self.builder, &self.catalog_store);
         self.external_source_object_store_resolver = .{};
         self.external_source_object_store_resolver.configure(cfg.node_config, cfg.secret_store);
@@ -653,11 +690,18 @@ pub const OwnedStack = struct {
         sparse_query_index_name_owned = false;
         self.runtime.setEnricher(enricher);
         enricher_owned = false;
-        self.handler = api_mod.HttpHandler.init(alloc, &self.api, &self.catalog, &self.manifests, &self.progress, &self.query, &self.status);
+        self.handler = api_mod.HttpHandler.init(self.request_memory.allocator(false), &self.api, &self.catalog, &self.manifests, &self.progress, &self.query, &self.status);
+        self.handler.control_allocator = self.request_memory.allocator(true);
+        self.handler.read_memory_pool = if (self.read_memory) |*pool| pool else null;
         try self.handler.setGraphExecutionLimits(cfg.graph_execution_limits);
         self.handler.setIo(io);
+        const scheduler = if (self.runnable_scheduler) |*owner| owner else null;
+        self.handler.runnable_scheduler = scheduler;
+        self.runtime.runnable_scheduler = scheduler;
+        self.runtime.runnable_slots = if (scheduler) |owner| @min(cfg.graph_metric_max_parallelism, owner.config.generalSlots()) else 1;
+        self.handler.write_runnable_slots = self.runtime.runnable_slots;
         self.handler.setEmbeddingProviderRuntime(&self.embedding_provider_runtime);
-        self.handler.configureAdmission(cfg.query_max_concurrent_requests, cfg.write_max_concurrent_requests);
+        try self.handler.configureAdmissionWithWaiting(cfg.query_max_concurrent_requests, cfg.write_max_concurrent_requests, cfg.query_waiting orelse .{});
         self.handler.setRemoteContent(cfg.remote_content);
         if (self.query_cache) |*query_cache| self.handler.setQueryCache(query_cache);
         self.handler.setPublishedSearchSources(search_sources.publishedSearchSourcesForNames(
@@ -689,8 +733,23 @@ pub const OwnedStack = struct {
         query_cache_owned = false;
     }
 
+    fn assertMemoryRetired(self: *const OwnedStack) void {
+        std.debug.assert(self.request_memory.foreground.stats().used_bytes == 0);
+        std.debug.assert(self.request_memory.control.stats().used_bytes == 0);
+        std.debug.assert(self.request_memory.retained.?.stats().used_bytes == 0);
+        if (self.read_memory) |*pool| {
+            const stats = @constCast(pool).stats();
+            std.debug.assert(stats.total_used == 0 and stats.transition_reserved_groups == 0);
+            for (stats.groups) |count| std.debug.assert(count == 0);
+        }
+    }
+
     pub fn deinit(self: *OwnedStack) void {
         self.runtime.deinit();
+        if (self.runnable_scheduler) |*scheduler| {
+            scheduler.close();
+            std.debug.assert(scheduler.stats().operations == 0);
+        }
         if (self.managed_query_embedder) |*query_embedder| query_embedder.deinit();
         self.embedding_provider_runtime.deinit();
         if (self.dense_query_index_name) |index_name| self.alloc.free(index_name);
@@ -710,6 +769,8 @@ pub const OwnedStack = struct {
         self.artifacts.deinit();
         self.gcs_client_pool.deinit();
         self.s3_client_pool.deinit();
+        self.assertMemoryRetired();
+        if (self.read_memory) |*pool| pool.deinit();
         self.* = undefined;
     }
 };
@@ -724,7 +785,35 @@ fn workLeaseOwnerIdAlloc(alloc: Allocator, io: std.Io) ![]u8 {
     );
 }
 
+/// Freeze the CPU, metadata and frontend pool ceilings from one envelope.
+/// Fixed and disabled policy retain their operator limits unchanged.
+pub fn resolveStartupConfig(cfg: BootstrapConfig) !BootstrapConfig {
+    const requested: common_config.Config.AdmissionConfig = .{
+        .runnable = cfg.runnable_policy,
+        .max_request_memory_bytes = cfg.max_request_memory_bytes,
+        .max_retained_memory_bytes = cfg.max_retained_memory_bytes,
+        .query = .{ .max_concurrent_requests = cfg.query_max_concurrent_requests, .waiting = cfg.query_waiting orelse if (cfg.runnable_policy != null) common_config.default_query_waiting else .{} },
+    };
+    const effective = try requested.resolveForStartup(cfg.process_memory_limit_bytes);
+    var result = cfg;
+    result.runnable_policy = effective.runnable;
+    result.query_waiting = if (cfg.runnable_policy == null and cfg.query_waiting == null) null else effective.query.waiting;
+    result.max_request_memory_bytes = effective.max_request_memory_bytes;
+    result.max_retained_memory_bytes = effective.max_retained_memory_bytes;
+    if (result.runnable_policy) |policy| try policy.validateManagedCleanupCapacity();
+    return result;
+}
+
+/// Resolve before publishing any consumer. Scheduler.init receives a fixed
+/// policy and cannot independently probe or shrink the shared owner.
+pub fn resolveRunnablePolicy(cfg: BootstrapConfig) !?@import("antfly_local_sources").common_request_admission.runnable_scheduler.Config {
+    return (try resolveStartupConfig(cfg)).runnable_policy;
+}
+
 pub fn validateConfig(alloc: Allocator, cfg: BootstrapConfig) !void {
+    if (cfg.runnable_policy) |policy| try policy.validateManagedCleanupCapacity();
+    if (cfg.max_request_memory_bytes < 1 << 20 or cfg.max_request_memory_bytes > std.math.maxInt(usize) or
+        cfg.max_retained_memory_bytes < 1 << 20 or cfg.max_retained_memory_bytes > std.math.maxInt(usize)) return error.InvalidConfig;
     if (cfg.tick_interval_ms == 0) return error.InvalidTickInterval;
     if (cfg.graph_metric_max_parallelism == 0 or cfg.graph_metric_max_parallelism > build_mod.max_graph_metric_compute_parallelism)
         return error.InvalidGraphMetricBuildOptions;
@@ -1389,6 +1478,11 @@ test "runtime bootstrap requires bounded query cache budgets" {
     try validateConfig(alloc, base);
 
     var invalid = base;
+    invalid.runnable_policy = .{};
+    try validateConfig(alloc, invalid);
+    invalid.runnable_policy = .{ .slots = 2 };
+    try std.testing.expectError(error.ManagerCleanupCapacityUnavailable, validateConfig(alloc, invalid));
+    invalid = base;
     invalid.query_cache_max_bytes = 0;
     try std.testing.expectError(error.InvalidQueryCacheBudget, validateConfig(alloc, invalid));
     invalid = base;

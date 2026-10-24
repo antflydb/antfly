@@ -1,0 +1,19 @@
+{
+  "argv": [
+    "/Users/ajroetker/bin/zig-0.17.0/zig",
+    "build",
+    "antfly-inference-parent-phase-test",
+    "-Doptimize=ReleaseSafe",
+    "-j1",
+    "--maxrss",
+    "4294967296",
+    "--cache-dir",
+    "/private/tmp/antfly-parent-phase-focused-cache",
+    "--summary",
+    "all"
+  ],
+  "pid": 67617,
+  "exit_code": 0,
+  "finished": 1791396666.628337,
+  "state": "terminal"
+}

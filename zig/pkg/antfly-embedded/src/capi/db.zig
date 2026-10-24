@@ -728,6 +728,7 @@ pub fn executeLocalSearch(handle: *Handle, req: db_mod.types.SearchRequest) !db_
             req.execution_deadline_ns,
             if (cancellation != null) @ptrCast(&cancellation.?) else null,
             if (cancellation != null) cancellationTokenRequested else null,
+            if (req.execution_runnable) |*borrow| borrow else null,
             &failure,
         );
         defer handle.alloc.free(response.json);
@@ -2716,8 +2717,15 @@ pub fn openLiteHandleAllocWithSharedInference(
     errdefer if (!handle_owns_resources) @import("io_lifetime.zig").release();
     // Each cached generation owns its storage pool. Retired cursors may keep
     // an older generation alive while the same index roots reopen in this one.
+    const owned_resources = if (resolved.externally_locked and backend_runtime == null)
+        try db_mod.DB.createStandaloneResourceManager(alloc)
+    else
+        null;
+    errdefer if (!handle_owns_resources) if (owned_resources) |manager| {
+        manager.releaseOwned(alloc);
+    };
     var owned_runtime: ?db_mod.background_runtime.BackendRuntimeHandle = if (resolved.externally_locked and backend_runtime == null)
-        try db_mod.background_runtime.BackendRuntimeHandle.initManualWithOwnedIo(alloc)
+        try db_mod.background_runtime.BackendRuntimeHandle.initManualWithOwnedIoAndParent(alloc, owned_resources.?.memoryParentPort())
     else
         null;
     errdefer if (!handle_owns_resources) if (owned_runtime) |*runtime| runtime.deinit();
@@ -2727,6 +2735,7 @@ pub fn openLiteHandleAllocWithSharedInference(
             .exclusive = true,
             .no_sync = resolved.no_sync,
             .io = borrowed_io,
+            .resource_manager = owned_resources,
         })
     else
         try lite_backend.Handle.open(alloc, path, .{
@@ -2734,6 +2743,7 @@ pub fn openLiteHandleAllocWithSharedInference(
             .read_only = resolved.open_mode == .query_readonly or resolved.open_mode == .status_only,
             .no_sync = resolved.no_sync,
             .io = borrowed_io,
+            .resource_manager = owned_resources,
         });
     errdefer if (!handle_owns_resources) backend.deinit();
     if (resolved.allocator_verification_owner) |verified| {
@@ -2751,6 +2761,7 @@ pub fn openLiteHandleAllocWithSharedInference(
         .open_mode = resolved.open_mode,
         .external_derived_checkpoints = false,
         .backend_runtime = if (owned_runtime) |runtime| runtime.runtime else backend_runtime,
+        .resource_manager = owned_resources,
         .online_source_authority = .native,
     };
     if (resolved.map_size) |map_size| opts.map_size = map_size;
@@ -2804,6 +2815,7 @@ pub fn openLiteHandleAllocWithSharedInference(
         .open_mode = resolved.open_mode,
         .owned_lite_backend = backend,
         .owned_lite_runtime = owned_runtime,
+        .owned_lite_resource_manager = owned_resources,
         .embedded_path = try alloc.dupe(u8, path),
         .embedded_open_options = opts,
         .lite_profile = resolved.profile,
@@ -5740,6 +5752,7 @@ pub fn searchPublicQueryJson(
                 request_json.bytes(),
                 .public,
                 .{},
+                null,
                 null,
                 null,
                 null,

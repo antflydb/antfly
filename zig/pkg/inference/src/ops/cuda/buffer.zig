@@ -69,6 +69,18 @@ pub const DeviceBuffer = struct {
     /// Suballocations of a graph arena cannot be freed through an op's direct
     /// error cleanup. The arena owner alone releases their physical storage.
     borrowed: bool = false,
+    device_credit: ?@import("../../runtime/kv/device_memory.zig").Credit = null,
+
+    /// Admit the full new allocation while old buffers remain charged. The
+    /// descriptor carries this credit through reuse and deferred-free queues.
+    pub fn allocAdmitted(ctx: *context_mod.CudaContext, len: usize, budget: ?@import("../../runtime/kv/device_memory.zig").Budget) !DeviceBuffer {
+        if (len == 0) return .{};
+        const credit = if (budget) |owner| try owner.reserve(len) else null;
+        errdefer if (credit) |owned| owned.release();
+        var buffer = try alloc(ctx, len);
+        buffer.device_credit = credit;
+        return buffer;
+    }
 
     pub fn alloc(ctx: *context_mod.CudaContext, len: usize) driver_mod.Error!DeviceBuffer {
         if (len == 0) return .{};
@@ -93,14 +105,18 @@ pub const DeviceBuffer = struct {
             return;
         }
         if (self.ptr != 0) {
-            ctx.makeCurrent() catch {};
+            // A failed context switch does not prove this allocation is free.
+            ctx.makeCurrent() catch return;
             const result = ctx.driver.fns.cuMemFree(self.ptr);
             if (result == driver_mod.CUDA_SUCCESS) {
                 ctx.device_allocations.release(self.allocation_bytes);
+                if (self.device_credit) |credit| credit.release();
+                self.device_credit = null;
             } else {
                 // Keep the failed free charged; it cannot authorize a later
                 // allocation. Context teardown remains the final cleanup.
                 std.log.err("CUDA cuMemFree failed: bytes={d} error={s}", .{ self.allocation_bytes, ctx.driver.errorName(result) });
+                return;
             }
             self.ptr = 0;
             self.len = 0;

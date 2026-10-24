@@ -1,0 +1,7 @@
+# Nested admitted inference wait scopes
+
+An independently admitted synchronous child scope now gets an active checkpoint slot even when its caller is parked. Scope teardown restores the caller's suspended resource-wait state; the parent checkpoint remains disabled until its own reacquisition completes. ResourceWait begins through the guarded checkpoint function, so collective/member checks cannot recursively yield the same execution capsule.
+
+The combined antfly-inference-parent-phase-test and antfly-inference-owner-handoff-test command passes all 18 tests on native macOS (18 build steps) and pinned Nix/glibc aarch64-linux-gnu (15 steps), exit 0. Nine tests use the custom host/wire runner and nine use Zig's standard runner; the build summary reports the latter separately. Logs and five checked source hashes are retained. Nested scope tests deliberately invoke recursive controls, verify child checkpoints and independent child waits remain active, and check that the parent's parked state is restored. Existing actual shared-owner CPU/byte/control admission, original deadline/cancellation, lock failure cleanup and callback isolation regressions also pass.
+
+This prepares the checkpoint scope for independently admitted broker cohorts. It does not install production broker admission or qualify numerical workload fairness, worker physical waits, foreign teams, consolidated full API/production behavior, or automatic defaults.

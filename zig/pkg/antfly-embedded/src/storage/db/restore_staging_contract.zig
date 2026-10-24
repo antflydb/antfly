@@ -82,16 +82,25 @@ pub const OwnerBootstrap = struct {
         try jw.endObject();
     }
     pub fn validate(self: @This()) !void {
+        return self.validateInner(null);
+    }
+    pub fn validateWithAdmission(self: @This(), control: @import("../../common/read_admission.zig").Port) !void {
+        try control.checkpoint();
+        try self.validateInner(control);
+        try control.checkpoint();
+    }
+    fn validateInner(self: @This(), control: ?@import("../../common/read_admission.zig").Port) !void {
+        const scan = @import("restore_bootstrap_validation.zig");
         try self.scope.validate();
         // Empty-generation targets cannot be opened without the immutable
         // source authority they must install before publication. Catch a
         // missing cold-descriptor projection before it reaches Raft apply.
         if ((self.scope.empty_generation or self.scope.rewrite != null) and self.empty_generation_handoff == null)
             return error.InvalidRestoreStagingCommand;
-        if (self.table_name.len == 0 or (self.table_name.len > 255 and !(try @import("../../system_catalog/domain.zig").isRestoreTarget(self.table_name))) or std.mem.indexOfAny(u8, self.table_name, "/\\\x00") != null or std.mem.eql(u8, self.table_name, ".") or std.mem.eql(u8, self.table_name, "..") or
+        if (self.table_name.len == 0 or (self.table_name.len > 255 and !(try @import("../../system_catalog/domain.zig").isRestoreTarget(self.table_name))) or try scan.invalidName(self.table_name, control) or std.mem.eql(u8, self.table_name, ".") or std.mem.eql(u8, self.table_name, "..") or
             self.schema_json.len +| self.read_schema_json.len > 4 * 1024 * 1024 or self.indexes_json.len == 0 or self.indexes_json.len > 4 * 1024 * 1024 or
-            !std.unicode.utf8ValidateSlice(self.table_name) or !std.unicode.utf8ValidateSlice(self.schema_json) or !std.unicode.utf8ValidateSlice(self.read_schema_json) or !std.unicode.utf8ValidateSlice(self.indexes_json) or
-            self.byte_range.start.len > 1024 * 1024 or self.byte_range.end.len > 1024 * 1024 or (self.byte_range.end.len != 0 and std.mem.order(u8, self.byte_range.start, self.byte_range.end) != .lt)) return error.InvalidRestoreStagingCommand;
+            !try scan.validUtf8(self.table_name, control) or !try scan.validUtf8(self.schema_json, control) or !try scan.validUtf8(self.read_schema_json, control) or !try scan.validUtf8(self.indexes_json, control) or
+            self.byte_range.start.len > 1024 * 1024 or self.byte_range.end.len > 1024 * 1024 or (self.byte_range.end.len != 0 and !try scan.less(self.byte_range.start, self.byte_range.end, control))) return error.InvalidRestoreStagingCommand;
         if (self.source_generation_proof_digest) |proof_digest| {
             if (self.scope.empty_generation or self.scope.rewrite != null or std.mem.allEqual(u8, &proof_digest, 0))
                 return error.InvalidRestoreStagingCommand;
@@ -195,9 +204,20 @@ pub const InstallGenerationAdmissions = struct {
     mappings: []const GenerationAdmissionMapping,
 
     pub fn validate(self: @This()) !void {
+        return self.validateInner(null);
+    }
+
+    pub fn validateWithAdmission(self: @This(), control: @import("../../common/read_admission.zig").Port) !void {
+        try control.checkpoint();
+        try self.validateInner(control);
+        try control.checkpoint();
+    }
+
+    fn validateInner(self: @This(), control: ?@import("../../common/read_admission.zig").Port) !void {
         if (std.mem.allEqual(u8, &self.scope, 0) or std.mem.allEqual(u8, &self.source_summary_digest, 0) or
             self.mappings.len == 0 or self.mappings.len > 1024) return error.InvalidRestoreStagingCommand;
         for (self.mappings, 0..) |mapping, index| {
+            if (control) |original| if (index % 64 == 0) try original.checkpoint();
             try mapping.validate();
             if (index != 0) {
                 const previous = self.mappings[index - 1];
@@ -212,7 +232,15 @@ pub const InstallGenerationAdmissions = struct {
 /// The metadata receipt expectation and replicated owner result share one
 /// prefix-free logical digest, independent of Raft term/index or JSON layout.
 pub fn admissionReceiptDigest(command: InstallGenerationAdmissions) !Digest {
-    try command.validate();
+    return admissionReceiptDigestInner(command, null);
+}
+
+pub fn admissionReceiptDigestWithAdmission(command: InstallGenerationAdmissions, control: @import("../../common/read_admission.zig").Port) !Digest {
+    return admissionReceiptDigestInner(command, control);
+}
+
+fn admissionReceiptDigestInner(command: InstallGenerationAdmissions, control: ?@import("../../common/read_admission.zig").Port) !Digest {
+    if (control) |original| try command.validateWithAdmission(original) else try command.validate();
     var hash = std.crypto.hash.Blake3.init(.{});
     hash.update("antfly restore mapped child generation admissions v1");
     hash.update(&command.scope);
@@ -221,6 +249,7 @@ pub fn admissionReceiptDigest(command: InstallGenerationAdmissions) !Digest {
     std.mem.writeInt(u64, &number, @intCast(command.mappings.len), .little);
     hash.update(&number);
     for (command.mappings) |mapping| {
+        if (control) |original| try original.checkpoint();
         inline for (.{ mapping.source_child_table_id, mapping.target_child_table_id }) |id| {
             std.mem.writeInt(u64, &number, id, .little);
             hash.update(&number);
@@ -236,6 +265,7 @@ pub fn admissionReceiptDigest(command: InstallGenerationAdmissions) !Digest {
     }
     var result: Digest = undefined;
     hash.final(&result);
+    if (control) |original| try original.checkpoint();
     return result;
 }
 

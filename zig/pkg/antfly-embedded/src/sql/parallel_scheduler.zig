@@ -20,6 +20,246 @@
 //! transient leases end at completion. Both release canceled-before-start slots.
 const std = @import("std");
 const A = std.mem.Allocator;
+const Runnable = @import("../common/runnable_scheduler.zig");
+
+/// An optional prepared operator allocation admitted with the original CPU
+/// continuation. The operator frees its buffer before releasing this lease.
+pub const ScratchLease = struct {
+    allocator: A,
+    context: *anyopaque,
+    release: *const fn (*anyopaque) void,
+
+    pub fn deinit(self: ScratchLease) void {
+        self.release(self.context);
+    }
+};
+pub const ScratchSource = struct {
+    context: *anyopaque,
+    acquire: *const fn (*anyopaque, usize) anyerror!?ScratchLease,
+};
+
+/// Inline arithmetic on an existing root. This view has no worker IO, wait
+/// boundary or child-submission methods; it cannot accidentally select fan-out.
+pub const CoordinatorScope = struct {
+    execution: *Runnable.Execution,
+    allocator: A,
+    check: ?Runnable.AdmissionCheck = null,
+    scratch: ?ScratchSource = null,
+
+    pub fn checkpointCurrent(self: CoordinatorScope) !void {
+        if (self.check) |hook| try hook.checkpoint() else try self.execution.checkpoint();
+    }
+};
+
+/// Coordinator-owned authority for CPU kernels over immutable input and private
+/// operator files with independent receivers. This does not permit sharing a
+/// mutable backend, cursor or policy cache; the manager only retains locked
+/// quotas/directory state and the statement allocation owner.
+/// Its allocator and original parent contexts outlive every physical join.
+pub const ExecutionScope = struct {
+    execution: *Runnable.Execution,
+    allocator: A,
+    io: std.Io,
+    wait: @import("execution_wait.zig").Boundary,
+    /// Coordinator checkpoint on the same context as wait. Production read
+    /// owners validate current authority after any scheduler reentry here.
+    checkpoint: ?*const fn (*anyopaque) anyerror!void = null,
+    scratch: ?ScratchSource = null,
+
+    pub fn coordinator(self: ExecutionScope) CoordinatorScope {
+        return .{ .execution = self.execution, .allocator = self.allocator, .scratch = self.scratch, .check = if (self.checkpoint) |check| .{ .context = self.wait.ptr, .check = check } else null };
+    }
+
+    pub fn checkpointCurrent(self: ExecutionScope) !void {
+        try self.coordinator().checkpointCurrent();
+    }
+
+    pub fn submit(self: ExecutionScope, bytes: usize, result_allocator: A, comptime function: anytype, args: anytype, comptime discard: anytype) !?Task(@TypeOf(@call(.auto, function, args ++ .{@as(*Runnable.Execution, undefined)}))) {
+        return self.submitNotified(bytes, result_allocator, function, args, discard, ignoreRetirement);
+    }
+    fn ignoreRetirement(_: anytype, _: ?anyerror) void {}
+    /// Mandatory notification runs even if activation fails before application
+    /// code starts. Streaming consumers can close their queues and then join;
+    /// no new CPU grant is required merely to publish terminal ownership.
+    pub fn submitNotified(self: ExecutionScope, bytes: usize, result_allocator: A, comptime function: anytype, args: anytype, comptime discard: anytype, comptime retired: anytype) !?Task(@TypeOf(@call(.auto, function, args ++ .{@as(*Runnable.Execution, undefined)}))) {
+        const Result = @TypeOf(@call(.auto, function, args ++ .{@as(*Runnable.Execution, undefined)}));
+        const retained = std.math.add(u64, bytes, @sizeOf(ScopeControl)) catch return error.InvalidRunnableDemand;
+        const control = try self.allocator.create(ScopeControl);
+        errdefer self.allocator.destroy(control);
+        control.* = .{ .scope = self, .result_allocator = result_allocator };
+        control.execution.reserveChild(self.execution, self.io, retained) catch |err| {
+            if (err == error.SchedulerFull) {
+                self.allocator.destroy(control);
+                return null;
+            }
+            return err;
+        };
+        errdefer control.execution.finish();
+        const Worker = struct {
+            fn dispose(allocator: A, result: Result) void {
+                if (result) |value| discard(allocator, value) else |_| {}
+            }
+            fn run(owner: *ScopeControl, arguments: @TypeOf(args)) Result {
+                defer owner.completed.store(true, .release);
+                const result = execute(owner, arguments);
+                retired(arguments, if (result) |_| null else |err| err);
+                return result;
+            }
+            fn execute(owner: *ScopeControl, arguments: @TypeOf(args)) Result {
+                try owner.execution.activateChild();
+                // Finished CPU work still retains metadata and result ownership
+                // until joining, but must not prevent the coordinator resuming.
+                defer owner.execution.park(.resource_blocked) catch {};
+                const value = try @call(.auto, function, arguments ++ .{&owner.execution});
+                errdefer discard(owner.result_allocator, value);
+                try owner.execution.checkpoint();
+                return value;
+            }
+        };
+        const future = try self.io.concurrent(Worker.run, .{ control, args });
+        return .{ .scheduler = undefined, .bytes = bytes, .future = future, .scope = control, .discard_scoped = Worker.dispose, .discard_allocator = result_allocator };
+    }
+};
+
+const ScopeControl = struct {
+    scope: ExecutionScope,
+    result_allocator: A,
+    execution: Runnable.Execution = .{},
+    completed: std.atomic.Value(bool) = .init(false),
+};
+
+test "SQL scoped CPU worker joins before retiring original charges and discards denied results" {
+    const Fixture = struct {
+        execution: *Runnable.Execution,
+        rejected: bool,
+        waits: usize = 0,
+        fn begin(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expect(self.execution.entry.?.children != 0);
+            self.waits += 1;
+            try self.execution.park(.resource_blocked);
+        }
+        fn end(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try self.execution.enter(.query);
+            if (self.rejected) return error.Forbidden;
+        }
+        fn work(a: A, execution: *Runnable.Execution) anyerror!*usize {
+            try execution.checkpoint();
+            const value = try a.create(usize);
+            value.* = 42;
+            return value;
+        }
+        fn discard(a: A, value: *usize) void {
+            a.destroy(value);
+        }
+    };
+    for ([_]bool{ false, true }) |rejected| {
+        var owner = try Runnable.Scheduler.init(.{ .slots = 2 });
+        var parent: Runnable.Execution = .{};
+        try parent.start(&owner, .{ .io = std.testing.io }, .query);
+        defer parent.finish();
+        var fixture = Fixture{ .execution = &parent, .rejected = rejected };
+        const scope = ExecutionScope{ .execution = &parent, .allocator = std.testing.allocator, .io = std.testing.io, .wait = .{ .ptr = &fixture, .begin = Fixture.begin, .end = Fixture.end } };
+        var task = (try scope.submit(31, std.testing.allocator, Fixture.work, .{std.testing.allocator}, Fixture.discard)).?;
+        try std.testing.expectEqual(@as(usize, 1), parent.entry.?.children);
+        try std.testing.expect(owner.stats().retained_bytes >= 31 + @sizeOf(ScopeControl));
+        if (rejected) {
+            try std.testing.expectError(error.Forbidden, task.await(std.testing.io));
+        } else {
+            const value = try task.await(std.testing.io);
+            try std.testing.expectEqual(@as(usize, 42), value.*);
+            Fixture.discard(std.testing.allocator, value);
+        }
+        try std.testing.expectEqual(@as(usize, 1), fixture.waits);
+        try std.testing.expectEqual(@as(usize, 0), parent.entry.?.children);
+        try std.testing.expectEqual(@as(usize, 1), owner.stats().operations);
+        try std.testing.expectEqual(@as(u64, 0), owner.stats().retained_bytes);
+    }
+}
+
+test "SQL scoped CPU worker denied suspension still physically joins canceled publication" {
+    const Fixture = struct {
+        execution: *Runnable.Execution,
+        fn begin(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try self.execution.checkpoint();
+            try self.execution.park(.resource_blocked);
+        }
+        fn end(_: *anyopaque) !void {
+            return error.TestUnexpectedResume;
+        }
+        fn requested(raw: *const anyopaque) bool {
+            return @as(*const std.atomic.Value(bool), @ptrCast(@alignCast(raw))).load(.acquire);
+        }
+        fn work(execution: *Runnable.Execution) anyerror!usize {
+            try execution.checkpoint();
+            return 7;
+        }
+        fn discard(_: A, _: usize) void {}
+    };
+    var owner = try Runnable.Scheduler.init(.{ .slots = 2 });
+    var canceled: std.atomic.Value(bool) = .init(false);
+    var parent: Runnable.Execution = .{};
+    try parent.start(&owner, .{ .io = std.testing.io, .cancellation = .{ .ptr = &canceled, .requested = Fixture.requested } }, .query);
+    defer parent.finish();
+    var fixture = Fixture{ .execution = &parent };
+    const scope = ExecutionScope{ .execution = &parent, .allocator = std.testing.allocator, .io = std.testing.io, .wait = .{ .ptr = &fixture, .begin = Fixture.begin, .end = Fixture.end } };
+    var task = (try scope.submit(17, std.testing.allocator, Fixture.work, .{}, Fixture.discard)).?;
+    canceled.store(true, .release);
+    try std.testing.expectError(error.Canceled, task.await(std.testing.io));
+    try std.testing.expectEqual(@as(usize, 0), parent.entry.?.children);
+    try std.testing.expectEqual(@as(usize, 0), owner.stats().child_operations);
+    try std.testing.expectEqual(@as(u64, 0), owner.stats().retained_bytes);
+}
+
+test "SQL scoped CPU metadata allocation and registry rejection roll back without another queue" {
+    const Fixture = struct {
+        execution: *Runnable.Execution,
+        fn begin(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try self.execution.park(.resource_blocked);
+        }
+        fn end(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try self.execution.enter(.query);
+        }
+        fn work(execution: *Runnable.Execution) anyerror!usize {
+            try execution.checkpoint();
+            return 11;
+        }
+        fn discard(_: A, _: usize) void {}
+        fn scenario(a: A) !void {
+            var owner = try Runnable.Scheduler.init(.{ .slots = 2, .max_operations = 3 });
+            var parent: Runnable.Execution = .{};
+            try parent.start(&owner, .{ .io = std.testing.io }, .query);
+            defer parent.finish();
+            var fixture = @This(){ .execution = &parent };
+            const scope = ExecutionScope{ .execution = &parent, .allocator = a, .io = std.testing.io, .wait = .{ .ptr = &fixture, .begin = begin, .end = end } };
+            var first = (scope.submit(19, std.testing.allocator, work, .{}, discard) catch |err| {
+                try std.testing.expectEqual(@as(usize, 0), parent.entry.?.children);
+                try std.testing.expectEqual(@as(u64, 0), owner.stats().retained_bytes);
+                return err;
+            }).?;
+            defer if (first.future != null) {
+                _ = first.cancel(std.testing.io) catch {};
+            };
+            const retained = owner.stats().retained_bytes;
+            const denied = scope.submit(23, std.testing.allocator, work, .{}, discard) catch |err| {
+                try std.testing.expectEqual(@as(usize, 1), parent.entry.?.children);
+                try std.testing.expectEqual(retained, owner.stats().retained_bytes);
+                return err;
+            };
+            try std.testing.expect(denied == null);
+            try std.testing.expectEqual(@as(usize, 1), parent.entry.?.children);
+            try std.testing.expectEqual(retained, owner.stats().retained_bytes);
+            try std.testing.expectEqual(@as(usize, 11), try first.await(std.testing.io));
+            try std.testing.expectEqual(@as(usize, 0), parent.entry.?.children);
+            try std.testing.expectEqual(@as(u64, 0), owner.stats().retained_bytes);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Fixture.scenario, .{});
+}
 pub const LockedAllocator = struct {
     backing: A,
     mutex: std.atomic.Mutex = .unlocked,
@@ -362,26 +602,61 @@ pub fn Task(comptime Result: type) type {
         class: Class = .cpu,
         future: ?std.Io.Future(Result),
         transient: ?*Admission = null,
+        scope: ?*ScopeControl = null,
+        discard_scoped: ?*const fn (A, Result) void = null,
+        discard_allocator: A = undefined,
         fn release(self: *@This()) void {
-            if (self.transient) |admission| {
+            if (self.scope) |control| {
+                const allocator = control.scope.allocator;
+                control.execution.finish();
+                allocator.destroy(control);
+                self.scope = null;
+            } else if (self.transient) |admission| {
                 admission.release();
                 std.heap.page_allocator.destroy(admission);
                 self.transient = null;
             } else self.scheduler.releaseClass(self.class, self.bytes);
             self.future = null;
         }
-        /// Completion is independent of joining and execution admission.
-        /// Only transient tasks expose this nonblocking readiness contract.
+        /// Logical completion permits nonblocking slot recycling. Callers
+        /// must still join before retiring charges or borrowed input owners.
         pub fn isComplete(self: *const @This()) bool {
+            if (self.scope) |control| return control.completed.load(.acquire);
             return if (self.transient) |admission| admission.completed.load(.acquire) else self.future == null;
         }
         pub fn await(self: *@This(), io: std.Io) Result {
+            if (comptime @typeInfo(Result) == .error_union) {
+                if (self.scope != null) return self.joinScoped(io, false);
+            } else std.debug.assert(self.scope == null);
             defer self.release();
             return self.future.?.await(io);
         }
         pub fn cancel(self: *@This(), io: std.Io) Result {
+            if (comptime @typeInfo(Result) == .error_union) {
+                if (self.scope != null) return self.joinScoped(io, true);
+            } else std.debug.assert(self.scope == null);
             defer self.release();
             return self.future.?.cancel(io);
+        }
+        fn joinScoped(self: *@This(), io: std.Io, comptime canceling: bool) Result {
+            const scope = self.scope.?.scope;
+            const discard = self.discard_scoped.?;
+            const allocator = self.discard_allocator;
+            scope.wait.begin(scope.wait.ptr) catch |err| {
+                // Denied suspension cannot skip joining a published worker or
+                // strand a successful owned result behind the original failure.
+                const result = self.future.?.cancel(io);
+                discard(allocator, result);
+                self.release();
+                return err;
+            };
+            const result = if (canceling) self.future.?.cancel(io) else self.future.?.await(io);
+            self.release();
+            scope.wait.end(scope.wait.ptr) catch |err| {
+                discard(allocator, result);
+                return err;
+            };
+            return result;
         }
     };
 }
@@ -447,6 +722,102 @@ test "SQL adaptive fanout respects useful work, occupied leases and workspace" {
     try std.testing.expectEqual(@as(usize, 1), scheduler.fanout(16, 1024, 128));
     scheduler.release(896);
     try std.testing.expectEqual(@as(usize, 8), scheduler.fanout(16, 1024, 128));
+}
+
+test "SQL scoped streaming retirement notifies before activation failure and preserves the coordinator" {
+    const Clock = struct {
+        var now_ns: std.atomic.Value(u64) = .init(0);
+        fn now() u64 {
+            return now_ns.load(.acquire);
+        }
+    };
+    const Fixture = struct {
+        parent: *Runnable.Execution,
+        calls: std.atomic.Value(usize) = .init(0),
+        retired: std.Io.Event = .unset,
+        failure: ?anyerror = null,
+        fn begin(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try self.parent.checkpoint();
+            try self.parent.park(.resource_blocked);
+        }
+        fn end(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try self.parent.enter(.query);
+        }
+        fn work(self: *@This(), _: *Runnable.Execution) anyerror!void {
+            _ = self.calls.fetchAdd(1, .monotonic);
+        }
+        fn notify(args: anytype, failure: ?anyerror) void {
+            const self: *@This() = args[0];
+            self.failure = failure;
+            self.retired.set(std.testing.io);
+        }
+        fn discard(_: A, _: void) void {}
+    };
+    Clock.now_ns.store(0, .release);
+    var owner = try Runnable.Scheduler.init(.{ .slots = 2, .max_wait_ms = 10 });
+    var parent: Runnable.Execution = .{};
+    try parent.start(&owner, .{ .io = std.testing.io, .native_now_ns = Clock.now }, .query);
+    defer parent.finish();
+    var fixture = Fixture{ .parent = &parent };
+    const scope = ExecutionScope{ .execution = &parent, .allocator = std.testing.allocator, .io = std.testing.io, .wait = .{ .ptr = &fixture, .begin = Fixture.begin, .end = Fixture.end } };
+    var task = (try scope.submitNotified(8192, std.testing.allocator, Fixture.work, .{&fixture}, Fixture.discard, Fixture.notify)).?;
+    defer if (task.future != null) {
+        _ = task.cancel(std.testing.io) catch {};
+    };
+    var queued = false;
+    for (0..2000) |_| {
+        if (owner.stats().queued != 0) {
+            queued = true;
+            break;
+        }
+        try std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake);
+    }
+    try std.testing.expect(queued);
+    Clock.now_ns.store(10 * std.time.ns_per_ms, .release);
+    try fixture.retired.waitTimeout(std.testing.io, .{ .duration = .{ .clock = .awake, .raw = .fromSeconds(2) } });
+    try std.testing.expectEqual(@as(usize, 0), fixture.calls.load(.acquire));
+    try std.testing.expectEqual(error.RunnableWaitTimeout, fixture.failure.?);
+    try std.testing.expectEqual(@as(usize, 1), parent.entry.?.children);
+    try std.testing.expectError(error.RunnableWaitTimeout, task.await(std.testing.io));
+    try parent.checkpoint();
+    try std.testing.expectEqual(@as(usize, 0), parent.entry.?.children);
+    try std.testing.expectEqual(@as(u64, 0), owner.stats().retained_bytes);
+}
+
+test "SQL scoped completion readiness retains child ownership until physical join" {
+    const Fixture = struct {
+        fn work(a: A, _: *Runnable.Execution) anyerror!*usize {
+            const value = try a.create(usize);
+            value.* = 31;
+            return value;
+        }
+        fn discard(a: A, value: *usize) void {
+            a.destroy(value);
+        }
+    };
+    var scheduler = try Runnable.Scheduler.init(.{ .slots = 2 });
+    var parent: Runnable.Execution = .{};
+    try parent.start(&scheduler, .{ .io = std.testing.io }, .query);
+    defer parent.finish();
+    const scope: ExecutionScope = .{ .execution = &parent, .allocator = std.testing.allocator, .io = std.testing.io, .wait = @import("spill.zig").childWait(&parent) };
+    var task = (try scope.submit(64, std.testing.allocator, Fixture.work, .{std.testing.allocator}, Fixture.discard)).?;
+    defer if (task.future != null) {
+        if (task.cancel(std.testing.io)) |value| Fixture.discard(std.testing.allocator, value) else |_| {}
+    };
+    try parent.park(.resource_blocked);
+    while (!task.isComplete()) std.atomic.spinLoopHint();
+    try std.testing.expectEqual(@as(usize, 1), scheduler.stats().child_operations);
+    try std.testing.expect(task.future != null and task.scope != null);
+    try parent.enter(.query);
+    const value = try task.await(std.testing.io);
+    defer Fixture.discard(std.testing.allocator, value);
+    try std.testing.expectEqual(@as(usize, 31), value.*);
+    try std.testing.expect(task.isComplete());
+    try std.testing.expectEqual(@as(usize, 0), scheduler.stats().child_operations);
+    parent.finish();
+    try std.testing.expectEqual(@as(usize, 0), scheduler.stats().operations);
 }
 
 test "SQL remote reads have independent slots and preserve CPU workspace" {

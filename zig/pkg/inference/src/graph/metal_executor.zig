@@ -961,6 +961,7 @@ const ExecutorContext = struct {
     gpt_config: gpt_mod.Config,
     kv_dtype: ?runtime.kv.pool.KvDType = null,
     shared_moe_cache: ?*runtime.moe.shared.SharedExpertCache,
+    device_memory_budget: ?runtime.kv.device_memory.Budget = null,
 };
 
 const DecoderRuntimeSpanState = struct {
@@ -1356,6 +1357,7 @@ const RuntimeContext = struct {
     pool_id: runtime.kv.block.KvPoolId,
     moe_runtime: runtime.moe.runtime.MoeRuntime,
     shared_moe_cache: ?*runtime.moe.shared.SharedExpertCache,
+    device_memory_budget: ?runtime.kv.device_memory.Budget = null,
     kv_metadata: ExecutorKvMetadataLayer,
     mirrored_token_count: usize,
     mirrored_kv_view: ?generation.KvView,
@@ -1375,7 +1377,10 @@ const RuntimeContext = struct {
         gpt_config: gpt_mod.Config,
         kv_dtype_override: ?runtime.kv.pool.KvDType,
         shared_moe_cache: ?*runtime.moe.shared.SharedExpertCache,
+        device_memory_budget: ?runtime.kv.device_memory.Budget,
     ) !*RuntimeContext {
+        const owned_budget = if (device_memory_budget) |budget| try budget.clone() else null;
+        errdefer if (owned_budget) |budget| budget.deinit();
         // The runtime outlives the request that creates it and is cached on
         // the loaded model, so it must not hold the per-request Metal lease.
         const cb = try session_factory.getComputeBackendBorrowingSharedProvider(session, allocator);
@@ -1407,7 +1412,8 @@ const RuntimeContext = struct {
         // write hook if the KV dtype matches the fast path. When unsupported
         // (e.g. f32/int8 KVs, or no decoder runtime), this is a no-op and
         // writes continue through the host path.
-        cb.provisionKvDeviceWriteHook(&kv_storage) catch {};
+        kv_storage.device_memory_budget = owned_budget;
+        try cb.provisionKvDeviceWriteHook(&kv_storage);
 
         const pool_id = kv_storage.poolId();
 
@@ -1421,6 +1427,7 @@ const RuntimeContext = struct {
             .pool_id = pool_id,
             .moe_runtime = runtime.moe.runtime.MoeRuntime.init(allocator, shared_moe_cache),
             .shared_moe_cache = shared_moe_cache,
+            .device_memory_budget = owned_budget,
             .kv_metadata = ExecutorKvMetadataLayer.init(allocator, pool_id, executorUsesLazyDeviceKvReserve(gpt_config)),
             .mirrored_token_count = 0,
             .mirrored_kv_view = null,
@@ -1454,7 +1461,9 @@ const RuntimeContext = struct {
         self.kv_metadata.deinit(&self.kv_storage);
         self.kv_storage.deinit();
         self.cb.deinit();
+        const budget = self.device_memory_budget;
         self.allocator.destroy(self);
+        if (budget) |owned| owned.deinit();
     }
 
     fn invalidateDecoderRuntimeSpanState(self: *RuntimeContext) !void {
@@ -2341,8 +2350,11 @@ pub fn createModelExecutor(
     gpt_config: gpt_mod.Config,
     kv_dtype: ?runtime.kv.pool.KvDType,
     shared_moe_cache: ?*runtime.moe.shared.SharedExpertCache,
+    device_memory_budget: ?runtime.kv.device_memory.Budget,
 ) !model_runtime.ModelExecutor {
     if (!supportsSession(session)) return error.UnsupportedCompileBackend;
+    const owned_budget = if (device_memory_budget) |budget| try budget.clone() else null;
+    errdefer if (owned_budget) |budget| budget.deinit();
     const ctx = try allocator.create(ExecutorContext);
     ctx.* = .{
         .allocator = allocator,
@@ -2350,6 +2362,7 @@ pub fn createModelExecutor(
         .gpt_config = gpt_config,
         .kv_dtype = kv_dtype,
         .shared_moe_cache = shared_moe_cache,
+        .device_memory_budget = owned_budget,
     };
     return .{ .ptr = ctx, .vtable = &executor_vtable };
 }
@@ -2362,13 +2375,16 @@ fn createRuntime(ctx: *anyopaque, allocator: std.mem.Allocator) !model_runtime.M
         exec_ctx.gpt_config,
         exec_ctx.kv_dtype,
         exec_ctx.shared_moe_cache,
+        exec_ctx.device_memory_budget,
     );
     return .{ .ptr = runtime_ctx, .vtable = &runtime_vtable };
 }
 
 fn executorDeinit(ctx: *anyopaque) void {
     const exec_ctx: *ExecutorContext = @ptrCast(@alignCast(ctx));
+    const budget = exec_ctx.device_memory_budget;
     exec_ctx.allocator.destroy(exec_ctx);
+    if (budget) |owned| owned.deinit();
 }
 
 fn runtimeCapabilities(ctx: *anyopaque) model_runtime.RuntimeCapabilities {

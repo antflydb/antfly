@@ -461,8 +461,10 @@ pub const Cache = struct {
         bytes: []const u8,
         digest: [32]u8,
         pub fn authenticate(bytes: []const u8, digest: [32]u8) !@This() {
-            var actual: [32]u8 = undefined;
-            std.crypto.hash.sha2.Sha256.hash(bytes, &actual, .{});
+            return authenticateFor(bytes, digest, .{});
+        }
+        pub fn authenticateFor(bytes: []const u8, digest: [32]u8, context: Context) !@This() {
+            const actual = try Cache.hashImmutableFor(bytes, context);
             if (!std.mem.eql(u8, &actual, &digest)) return error.ArtifactIntegrityMismatch;
             return .{ .bytes = bytes, .digest = digest };
         }
@@ -636,7 +638,7 @@ pub const Cache = struct {
                     defer self.finish(waiting, io);
                     while (!waiting.flight.event.isSet()) {
                         try context.ensureActive();
-                        waiting.flight.event.waitTimeout(io, .{ .duration = .{ .clock = .awake, .raw = .fromMilliseconds(10) } }) catch |err| switch (err) {
+                        @import("../../sql/execution_wait.zig").run(context.wait, std.Io.Event.waitTimeout, .{ &waiting.flight.event, io, std.Io.Timeout{ .duration = .{ .clock = .awake, .raw = .fromMilliseconds(10) } } }) catch |err| switch (err) {
                             error.Timeout => continue,
                             else => return err,
                         };
@@ -648,12 +650,11 @@ pub const Cache = struct {
         }
         defer if (claim) |active| self.finish(active, context.io.?);
         if (claim != null) if (try self.lookup(a, key)) |bytes| return bytes;
-        const disk_bytes = if (self.persistentCache()) |disk| try disk.readAlloc(a, key, length) else null;
+        const disk_bytes = if (self.persistentCache()) |disk| try disk.readAllocFor(a, key, length, context) else null;
         if (disk_bytes) |bytes| {
-            var actual: [32]u8 = undefined;
-            std.crypto.hash.sha2.Sha256.hash(bytes, &actual, .{});
+            errdefer a.free(bytes);
+            const actual = try hashImmutableFor(bytes, context);
             if (bytes.len == length and std.mem.eql(u8, &actual, &digest)) {
-                errdefer a.free(bytes);
                 try context.ensureActive();
                 self.recordRead(true, bytes.len);
                 self.store(key, bytes) catch {};
@@ -666,8 +667,7 @@ pub const Cache = struct {
         const bytes = try loader.load(loader.ptr, a);
         errdefer a.free(bytes);
         try context.ensureActive();
-        var actual: [32]u8 = undefined;
-        std.crypto.hash.sha2.Sha256.hash(bytes, &actual, .{});
+        const actual = try hashImmutableFor(bytes, context);
         if (bytes.len != length or !std.mem.eql(u8, &actual, &digest)) return error.ArtifactIntegrityMismatch;
         const traffic: ProviderRead = if (loader.provider_read) |read| read(loader.ptr) else .{ .requests = 1, .bytes = bytes.len };
         while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
@@ -677,6 +677,18 @@ pub const Cache = struct {
         if (self.persistentCache()) |disk| _ = disk.enqueueWrite(key, bytes);
         self.store(key, bytes) catch {};
         return bytes;
+    }
+    fn hashImmutableFor(bytes: []const u8, context: Context) ![32]u8 {
+        var hash = std.crypto.hash.sha2.Sha256.init(.{});
+        var offset: usize = 0;
+        while (offset < bytes.len) {
+            try context.ensureActive();
+            const len = @min(@as(usize, 256 * 1024), bytes.len - offset);
+            hash.update(bytes[offset..][0..len]);
+            offset += len;
+        }
+        try context.ensureActive();
+        return hash.finalResult();
     }
     fn pin(self: *Cache, key: []const u8) ?ranges.RangeLease {
         while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
@@ -795,7 +807,7 @@ pub const Reader = struct {
         fn canceled(raw: *const anyopaque) bool {
             const self: *const Warm = @ptrCast(@alignCast(raw));
             if (self.cancelled.load(.acquire)) return true;
-            self.reader.context.ensureActive() catch return true;
+            self.reader.context.checkLifetime() catch return true;
             return false;
         }
     };
@@ -803,12 +815,29 @@ pub const Reader = struct {
     base: ObjectReader,
     scope: [32]u8,
     context: Context,
+    request_store: ?@import("lake_read_context.zig").Store = null,
     scheduler: *Scheduling.Scheduler = Scheduling.global(),
     pending: [8]?Prefetch = @splat(null),
     prefetch_bytes: usize = 0,
     /// Rolling lookahead, at most eight ranges and 32 MiB per reader. Shared
     /// I/O admission further limits in-flight bytes under memory pressure.
     /// Workers use independent page allocations, never a SQL arena/quota.
+    /// Bind only an exclusively owned reader before publishing it. The reader
+    /// stays at this address until every required/speculative physical join.
+    pub fn bindExecution(self: *Reader, execution: *@import("../../common/runnable_scheduler.zig").Execution) void {
+        self.bindContext(self.context.withExecution(execution));
+    }
+    pub fn bindContext(self: *Reader, context: Context) void {
+        const Store = @import("lake_read_context.zig").Store;
+        const provider = Store.provider(self.base.client);
+        const allocator = self.base.client.allocator;
+        self.context = context;
+        self.request_store = .{ .base = provider, .context = self.context };
+        self.base.client = self.request_store.?.client(allocator);
+        // The store now suspends the exact physical get/stat/list call. A range
+        // wrapper must not also park around the store's CPU checkpoints.
+        self.base.wait = null;
+    }
     pub fn prefetch(self: *Reader, reads: []const ranges.RangeRead) !void {
         if (self.context.io == null or self.cache.max_bytes == 0) return;
         // Only explicitly planned cold ranges enter an envelope. Zero gap
@@ -893,7 +922,10 @@ pub const Reader = struct {
                     if (claim.leader) work.claims[i] = claim else self.cache.finish(claim, io);
                 }
             }
-            const task = self.scheduler.submitIoTransient(io, @intCast(reserved *| 2), warm, .{work}) orelse {
+            const task = (if (self.context.execution) |execution|
+                try (Scheduling.ExecutionScope{ .execution = execution, .allocator = self.cache.alloc, .io = io, .wait = @import("../../sql/spill.zig").childWait(execution) }).submit(@intCast(reserved *| 2), std.heap.page_allocator, warmChild, .{work}, discardWarm)
+            else
+                self.scheduler.submitIoTransient(io, @intCast(reserved *| 2), warm, .{work})) orelse {
                 work.destroy();
                 discarded = true;
                 // Shared admission may fit individual pages even when their
@@ -918,7 +950,14 @@ pub const Reader = struct {
             pending.* = null;
         };
     }
+    fn discardWarm(_: Allocator, _: void) void {}
+    fn warmChild(work: *Warm, execution: *@import("../../common/runnable_scheduler.zig").Execution) anyerror!void {
+        return warmFor(work, execution);
+    }
     fn warm(work: *Warm) anyerror!void {
+        return warmFor(work, null);
+    }
+    fn warmFor(work: *Warm, execution: ?*@import("../../common/runnable_scheduler.zig").Execution) anyerror!void {
         const self = work.reader;
         const read = work.read;
         defer work.releaseClaims();
@@ -926,6 +965,7 @@ pub const Reader = struct {
         const token: @import("../../storage/object_storage.zig").CancellationToken = .{ .ptr = work, .is_cancelled_fn = Warm.canceled };
         worker.context.cancellation = token;
         worker.base.cancellation = token;
+        if (execution) |child| worker.bindExecution(child);
         if (work.members.len != 0) {
             var missing: [8]ranges.RangeRead = undefined;
             var count: usize = 0;
@@ -1002,6 +1042,21 @@ pub const Reader = struct {
     }
     /// Prefetch failures are speculative. Required reads preserve their own
     /// errors; close cancels/joins before footer metadata or clients are freed.
+    /// Join every published prefetch and release its descriptor, preserving
+    /// the first worker failure after all borrowed readers have retired.
+    pub fn joinPrefetch(self: *Reader) !void {
+        const io = self.context.io orelse return;
+        var failure: ?anyerror = null;
+        for (&self.pending) |*pending| if (pending.*) |*active| {
+            active.task.await(io) catch |err| {
+                failure = failure orelse err;
+            };
+            self.prefetch_bytes -= active.bytes;
+            active.work.destroy();
+            pending.* = null;
+        };
+        if (failure) |err| return err;
+    }
     pub fn drain(self: *Reader, cancel: bool) void {
         self.drainExceptFooter(cancel, false);
     }
@@ -1108,7 +1163,7 @@ pub const Reader = struct {
                     defer self.cache.finish(waiting, io);
                     while (!waiting.flight.event.isSet()) {
                         try self.context.ensureActive();
-                        waiting.flight.event.waitTimeout(io, .{ .duration = .{ .clock = .awake, .raw = .fromMilliseconds(10) } }) catch |err| switch (err) {
+                        @import("../../sql/execution_wait.zig").run(self.context.wait, std.Io.Event.waitTimeout, .{ &waiting.flight.event, io, std.Io.Timeout{ .duration = .{ .clock = .awake, .raw = .fromMilliseconds(10) } } }) catch |err| switch (err) {
                             error.Timeout => continue,
                             else => return err,
                         };
@@ -1126,7 +1181,7 @@ pub const Reader = struct {
         // The credential-scoped, versioned key is identical in both tiers.
         // Disk corruption/missing entries are misses inside the persistent
         // cache; an allocation failure still belongs to this request.
-        const disk_bytes = if (self.cache.persistentCache()) |disk| try disk.readAlloc(alloc, key, read.range.len) else null;
+        const disk_bytes = if (self.cache.persistentCache()) |disk| try disk.readAllocFor(alloc, key, read.range.len, self.context) else null;
         const bytes = disk_bytes orelse try self.base.parquetReader().readPlannedAlloc(alloc, read);
         self.cache.recordRead(disk_bytes != null, bytes.len);
         errdefer alloc.free(bytes);
@@ -2004,6 +2059,45 @@ test "external lake verified slice admission retains denied ownership and copies
     try std.testing.expectError(error.ArtifactIntegrityMismatch, cache.admitVerifiedBlock(a, @splat(2), "unit", bytes.len + 1, digest, .{}, verified));
     try std.testing.expectEqual(@as(usize, 3), owner.released);
     try std.testing.expectError(error.ArtifactIntegrityMismatch, Cache.VerifiedBytes.authenticate("corrupt", digest));
+}
+
+test "lake SQL immutable artifact hash checkpoints discard an interrupted provider buffer" {
+    const Fixture = struct {
+        checks: usize = 0,
+        loads: usize = 0,
+        fail_at: ?usize,
+        fn check(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.checks += 1;
+            if (self.fail_at == self.checks) return error.Canceled;
+        }
+        fn load(raw: *anyopaque, a: Allocator) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.loads += 1;
+            const bytes = try a.alloc(u8, 300 * 1024);
+            @memset(bytes, 7);
+            return bytes;
+        }
+    };
+    const a = std.testing.allocator;
+    const payload: [300 * 1024]u8 = @splat(7);
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(&payload, &digest, .{});
+    var cache = Cache.init(a);
+    defer cache.deinit();
+    var fixture: Fixture = .{ .fail_at = 4 };
+    const context: Context = .{ .checkpoint = .{ .ptr = &fixture, .check = Fixture.check } };
+    const loader: Cache.ImmutableLoader = .{ .ptr = &fixture, .load = Fixture.load };
+    try std.testing.expectError(error.Canceled, cache.readImmutableAlloc(a, @splat(1), "scoped-artifact", payload.len, digest, context, loader));
+    try std.testing.expectEqual(@as(usize, 1), fixture.loads);
+    try std.testing.expectEqual(@as(u64, 0), cache.snapshot().provider_reads);
+    fixture.fail_at = null;
+    fixture.checks = 0;
+    const bytes = try cache.readImmutableAlloc(a, @splat(1), "scoped-artifact", payload.len, digest, context, loader);
+    defer a.free(bytes);
+    try std.testing.expectEqualSlices(u8, &payload, bytes);
+    try std.testing.expect(fixture.checks >= 5);
+    try std.testing.expectEqual(@as(usize, 2), fixture.loads);
 }
 
 test "external lake prefetch coalesces adjacent pages with shared bounded lease slices" {

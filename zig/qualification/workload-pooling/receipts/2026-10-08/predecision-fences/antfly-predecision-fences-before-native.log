@@ -1,0 +1,25 @@
+antfly-table-write-execution-contract-test
++- run test table-write-execution-contract-tests 3 pass, 1 fail (4 total)
+error: 'api.table_write_source.consumerTests.Suite.test.compiled table write boundary never discards pre-decision fences in legacy fallback' failed:
+       expected error.UnsupportedOperation, found void
+failed command: /private/tmp/antfly-parent-phase-focused-cache/o/d0b35a4b50bb1966843c9cf7087844d9/table-write-execution-contract-tests --cache-dir=/private/tmp/antfly-parent-phase-focused-cache --seed=0x1670addf --listen=-
+
+Build Summary: 12/14 steps succeeded (1 failed); 3/4 tests passed (1 failed)
+antfly-table-write-execution-contract-test transitive failure
++- run test table-write-execution-contract-tests 3 pass, 1 fail (4 total)
+   +- compile test table-write-execution-contract-tests safe native success 9s MaxRSS:845M
+      +- WriteFile macos-sdk-libc.txt cached
+      +- options success
+      +- options success
+      +- options success
+      +- WriteFile tokenizer.json success
+      +- WriteFile lib/pdf/fonts/roboto/Roboto-Regular.ttf success
+      +- options cached
+      +- run exe patch_sentencepiece_proto (sentencepiece_proto) success 109ms
+         +- compile exe patch_sentencepiece_proto safe native success 5s MaxRSS:351M
+         |  +- WriteFile macos-sdk-libc.txt (reused)
+         +- run exe protoc-zig (sentencepiece_proto_raw) success 109ms
+         |  +- compile exe protoc-zig safe native success 7s MaxRSS:370M
+         |     +- WriteFile macos-sdk-libc.txt (reused)
+         +- run exe protoc-zig (sentencepiece_proto_raw) (+1 more reused dependencies)
+

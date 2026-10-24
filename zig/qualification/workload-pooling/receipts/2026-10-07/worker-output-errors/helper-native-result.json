@@ -1,0 +1,15 @@
+{
+  "state": "terminal",
+  "exit_code": 0,
+  "source_sha256": {
+    "zig/pkg/inference/src/host/worker_output_error.zig": "5fd4d5a19bc90d60735b603be01f775a27ae2e807fa6b3524baee0d5dcea6e5f",
+    "zig/pkg/inference/src/host/worker.zig": "7eef3b0b5b8fcd6077f0182bac894ce082cb5db4618f1bfe49118d8f72d25b8b",
+    "zig/pkg/antfly/build/api_tests.zig": "9f5e4bee65c35790613d3ec91901a1143f7c18d838df432f3f4ca647f9c061c4",
+    "zig/lib/runtime/src/runtime_http_abi.zig": "bc6638c7aed404600d3cbcd0f94aead0fa6b825acc201f9a8740f8786895ae7a"
+  },
+  "hash_capture": "after completion; matches Linux launch hashes",
+  "zig": "/Users/ajroetker/bin/zig-0.17.0/zig",
+  "scope": "helper",
+  "summary": "4/4 build steps; 3/3 tests passed",
+  "log": "helper-native.log"
+}

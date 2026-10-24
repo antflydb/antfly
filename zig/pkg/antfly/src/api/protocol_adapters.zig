@@ -343,12 +343,14 @@ pub fn executeExtensionMcpRequest(server_ptr: anytype, request: McpRequest, auth
 }
 
 fn executeMcpRequestFiltered(server_ptr: anytype, request: McpRequest, authenticated_identity: anytype, extension_name_filter: ?[]const u8) !contextual_operations.OwnedResponse {
+    try request.context.ensureActive();
     const Server = @TypeOf(server_ptr);
     const ToolContext = struct {
         server: Server,
         authenticated_identity: @TypeOf(authenticated_identity),
         permissions: ?[]const usermgr.Permission,
         spec: McpToolSpec,
+        operation_context: @import("antfly_local_sources").api_operation.RequestContext,
 
         fn handler(ctx: *@This()) mcp.ToolHandler {
             return .{ .ptr = ctx, .call_fn = call };
@@ -585,7 +587,10 @@ fn executeMcpRequestFiltered(server_ptr: anytype, request: McpRequest, authentic
         }
 
         fn executeOperation(ctx: *@This(), alloc: std.mem.Allocator, operation: contextual_operations.McpApplicationOperation) !mcp.CallToolResult {
-            var resp = try ctx.server.executeMcpApplicationOperation(operation, ctx.authenticated_identity);
+            var resp = if (@hasDecl(@typeInfo(Server).pointer.child, "executeMcpApplicationOperationWithContext"))
+                try ctx.server.executeMcpApplicationOperationWithContext(operation, ctx.authenticated_identity, ctx.operation_context)
+            else
+                try ctx.server.executeMcpApplicationOperation(operation, ctx.authenticated_identity);
             defer resp.deinit(ctx.server.alloc);
             return try mcpResultFromOwnedResponse(alloc, resp);
         }
@@ -596,6 +601,7 @@ fn executeMcpRequestFiltered(server_ptr: anytype, request: McpRequest, authentic
         permissions: ?[]const usermgr.Permission,
         installed: *const extension_domain.InstalledExtension,
         tool: *const ExtensionMcpTool,
+        operation_context: @import("antfly_local_sources").api_operation.RequestContext = .{},
 
         fn handler(ctx: *@This()) mcp.ToolHandler {
             return .{ .ptr = ctx, .call_fn = call };
@@ -608,7 +614,7 @@ fn executeMcpRequestFiltered(server_ptr: anytype, request: McpRequest, authentic
                     return mcpError(alloc, "permission denied");
                 }
             }
-            return try callExtensionMcpTool(alloc, ctx.server, ctx.authenticated_identity, ctx.installed, ctx.tool.*, args);
+            return try callExtensionMcpTool(alloc, ctx.server, ctx.authenticated_identity, ctx.installed, ctx.tool.*, args, ctx.operation_context);
         }
     };
 
@@ -619,6 +625,7 @@ fn executeMcpRequestFiltered(server_ptr: anytype, request: McpRequest, authentic
             .authenticated_identity = authenticated_identity,
             .permissions = if (authenticated_identity) |identity| identity.permissions else null,
             .spec = spec,
+            .operation_context = request.context,
         };
     }
 
@@ -657,6 +664,7 @@ fn executeMcpRequestFiltered(server_ptr: anytype, request: McpRequest, authentic
             .permissions = if (authenticated_identity) |identity| identity.permissions else null,
             .installed = installed,
             .tool = &extension_tools.items[i],
+            .operation_context = request.context,
         };
     }
 
@@ -1201,7 +1209,8 @@ fn findInstalledExtensionForRuntimeTool(installed_extensions: []const extension_
     return null;
 }
 
-fn callExtensionMcpTool(alloc: std.mem.Allocator, server: anytype, authenticated_identity: anytype, installed: *const extension_domain.InstalledExtension, tool: ExtensionMcpTool, args: std.json.Value) !mcp.CallToolResult {
+fn callExtensionMcpTool(alloc: std.mem.Allocator, server: anytype, authenticated_identity: anytype, installed: *const extension_domain.InstalledExtension, tool: ExtensionMcpTool, args: std.json.Value, context: @import("antfly_local_sources").api_operation.RequestContext) !mcp.CallToolResult {
+    try context.ensureActive();
     if (parseWasmHandler(tool.handler)) |handler| {
         const tool_name = handler.tool_name;
         if (!std.mem.eql(u8, tool_name, tool.member.object_name)) {
@@ -1215,6 +1224,7 @@ fn callExtensionMcpTool(alloc: std.mem.Allocator, server: anytype, authenticated
             .authenticated_identity = authenticated_identity,
             .installed = installed,
             .expected_storage_name = if (tool.member.table_name.len != 0) tool.member.table_name else null,
+            .operation_context = context,
         };
         if (wasmtime_runtime.invokeExtensionWithOptions(alloc, binding.runtime(), tool_name, request_json, .{
             .package_store_root = server.cfg.extension_package_store_dir,
@@ -1261,6 +1271,7 @@ fn ExtensionHostContext(comptime Server: type, comptime Identity: type) type {
         installed: *const extension_domain.InstalledExtension,
         expected_storage_name: ?[]const u8,
         binding_failed: bool = false,
+        operation_context: @import("antfly_local_sources").api_operation.RequestContext = .{},
 
         fn noteBindingFailure(ctx: *@This(), err: anyerror) void {
             switch (err) {
@@ -1272,6 +1283,7 @@ fn ExtensionHostContext(comptime Server: type, comptime Identity: type) type {
         fn dbQuery(ptr: ?*anyopaque, alloc: std.mem.Allocator, table: []const u8, query_json: []const u8) anyerror![]u8 {
             var zig017_return_error: ?anyerror = null;
             const ctx = hostContext(ptr);
+            try ctx.operation_context.ensureActive();
             errdefer if (zig017_return_error) |err| ctx.noteBindingFailure(err);
             (ctx.requireCapability("db:read") catch |zig017_err| {
                 zig017_return_error = zig017_err;
@@ -1286,6 +1298,11 @@ fn ExtensionHostContext(comptime Server: type, comptime Identity: type) type {
                 return zig017_err;
             });
             defer alloc.free(body);
+            if (@hasDecl(@typeInfo(Server).pointer.child, "executeExtensionHostQueryWithContext"))
+                return ctx.server.executeExtensionHostQueryWithContext(alloc, table_name, body, ctx.authenticated_identity, ctx.expected_storage_name, ctx.operation_context) catch |err| {
+                    ctx.noteBindingFailure(err);
+                    return err;
+                };
             return (ctx.server.executeExtensionHostQuery(alloc, table_name, body, ctx.authenticated_identity, ctx.expected_storage_name) catch |zig017_err| {
                 zig017_return_error = zig017_err;
                 return zig017_err;
@@ -1295,6 +1312,7 @@ fn ExtensionHostContext(comptime Server: type, comptime Identity: type) type {
         fn dbWrite(ptr: ?*anyopaque, alloc: std.mem.Allocator, table: []const u8, writes_json: []const u8) anyerror![]u8 {
             var zig017_return_error: ?anyerror = null;
             const ctx = hostContext(ptr);
+            try ctx.operation_context.ensureActive();
             errdefer if (zig017_return_error) |err| ctx.noteBindingFailure(err);
             (ctx.requireCapability("db:write") catch |zig017_err| {
                 zig017_return_error = zig017_err;
@@ -1309,6 +1327,11 @@ fn ExtensionHostContext(comptime Server: type, comptime Identity: type) type {
                 return zig017_err;
             });
             defer alloc.free(body);
+            if (@hasDecl(@typeInfo(Server).pointer.child, "executeExtensionHostBatchWithContext"))
+                return ctx.server.executeExtensionHostBatchWithContext(alloc, table_name, body, ctx.authenticated_identity, ctx.expected_storage_name, ctx.operation_context) catch |err| {
+                    ctx.noteBindingFailure(err);
+                    return err;
+                };
             return (ctx.server.executeExtensionHostBatch(alloc, table_name, body, ctx.authenticated_identity, ctx.expected_storage_name) catch |zig017_err| {
                 zig017_return_error = zig017_err;
                 return zig017_err;
@@ -1317,6 +1340,7 @@ fn ExtensionHostContext(comptime Server: type, comptime Identity: type) type {
 
         fn aiEmbed(ptr: ?*anyopaque, alloc: std.mem.Allocator, _: []const u8, text: []const u8) anyerror![]f32 {
             const ctx = hostContext(ptr);
+            try ctx.operation_context.ensureActive();
             try ctx.requireCapability("ai:embed");
             const out = try alloc.alloc(f32, 8);
             var hash = std.hash.Wyhash.init(0);
@@ -1496,6 +1520,18 @@ pub fn executeA2aRequest(
     query_embedding_security_scope: anytype,
     authenticated_identity: anytype,
 ) !contextual_operations.OwnedResponse {
+    return executeA2aRequestWithContext(server_ptr, authorization, body, query_embedding_security_scope, authenticated_identity, .{});
+}
+
+pub fn executeA2aRequestWithContext(
+    server_ptr: anytype,
+    authorization: ?[]const u8,
+    body: []const u8,
+    query_embedding_security_scope: anytype,
+    authenticated_identity: anytype,
+    context: @import("antfly_local_sources").api_operation.RequestContext,
+) !contextual_operations.OwnedResponse {
+    try context.ensureActive();
     var arena_impl = std.heap.ArenaAllocator.init(server_ptr.alloc);
     defer arena_impl.deinit();
     var dispatcher = try buildA2aDispatcher(
@@ -1504,6 +1540,7 @@ pub fn executeA2aRequest(
         authorization,
         query_embedding_security_scope,
         authenticated_identity,
+        context,
     );
     if (isJsonRpcMethod(arena_impl.allocator(), body, "message/stream")) {
         var sink = A2aSseSink{};
@@ -1546,6 +1583,7 @@ pub fn a2aCardJsonAlloc(
         null,
         query_embedding_security_scope,
         authenticated_identity,
+        .{},
     );
     const card = try dispatcher.agentCard(arena_impl.allocator());
     return stringifyJsonValue(server_ptr.alloc, card);
@@ -1557,6 +1595,7 @@ fn buildA2aDispatcher(
     authorization: ?[]const u8,
     query_embedding_security_scope: anytype,
     authenticated_identity: anytype,
+    operation_context: @import("antfly_local_sources").api_operation.RequestContext,
 ) !a2a.Dispatcher {
     const Server = @TypeOf(server_ptr);
     const HandlerKind = enum { query_builder, retrieval, research };
@@ -1566,6 +1605,7 @@ fn buildA2aDispatcher(
         query_embedding_security_scope: @TypeOf(query_embedding_security_scope),
         authenticated_identity: @TypeOf(authenticated_identity),
         kind: HandlerKind,
+        operation_context: @import("antfly_local_sources").api_operation.RequestContext,
 
         fn iface(ctx: *@This()) a2a.AgentHandler {
             return .{
@@ -1596,6 +1636,7 @@ fn buildA2aDispatcher(
 
         fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, request_ctx: a2a.RequestContext, queue: *a2a.EventQueue) !void {
             const ctx: *@This() = @ptrCast(@alignCast(ptr));
+            try ctx.operation_context.ensureActive();
             return switch (ctx.kind) {
                 .query_builder => try ctx.executeQueryBuilder(alloc, request_ctx, queue),
                 .retrieval => try ctx.executeRetrieval(alloc, request_ctx, queue),
@@ -1614,7 +1655,11 @@ fn buildA2aDispatcher(
                 }
             }
             const body_json = try stringifyJsonValue(alloc, .{ .object = body });
-            var resp = try ctx.server.executeQueryBuilderAgent(body_json, ctx.authenticated_identity);
+            const native = try ctx.operation_context.platformDeadline();
+            var resp = if (@hasDecl(@typeInfo(Server).pointer.child, "executeQueryBuilderAgentWithContext"))
+                try ctx.server.executeQueryBuilderAgentWithContext(body_json, ctx.authenticated_identity, .{ .io = ctx.server.inferenceIo(), .deadline_ns = @min(native.deadline_ns orelse std.math.maxInt(u64), @import("antfly_platform").time.monotonicNs() +| 5 * std.time.ns_per_min), .cancellation = native.cancellation })
+            else
+                try ctx.server.executeQueryBuilderAgent(body_json, ctx.authenticated_identity);
             defer resp.deinit(ctx.server.alloc);
             if (resp.status < 200 or resp.status >= 300) {
                 try queue.status(alloc, request_ctx.task_id, request_ctx.context_id, "failed", resp.body);
@@ -1651,6 +1696,10 @@ fn buildA2aDispatcher(
             }
             try body.put(alloc, "queries", .{ .array = queries });
             const body_json = try stringifyJsonValue(alloc, .{ .object = body });
+            if (@hasDecl(@typeInfo(Server).pointer.child, "executeA2aAgentWithContext")) {
+                try ctx.server.executeA2aAgentWithContext(.research, alloc, body_json, request_ctx.task_id, request_ctx.context_id, queue, ctx.query_embedding_security_scope, ctx.authenticated_identity, ctx.operation_context);
+                return;
+            }
             try ctx.server.executeA2aResearch(
                 alloc,
                 body_json,
@@ -1687,6 +1736,10 @@ fn buildA2aDispatcher(
                 }
             }
             const body_json = try stringifyJsonValue(alloc, .{ .object = body });
+            if (@hasDecl(@typeInfo(Server).pointer.child, "executeA2aAgentWithContext")) {
+                try ctx.server.executeA2aAgentWithContext(.retrieval, alloc, body_json, request_ctx.task_id, request_ctx.context_id, queue, ctx.query_embedding_security_scope, ctx.authenticated_identity, ctx.operation_context);
+                return;
+            }
             try ctx.server.executeA2aRetrieval(
                 alloc,
                 body_json,
@@ -1720,6 +1773,7 @@ fn buildA2aDispatcher(
     contexts[0] = .{
         .server = server_ptr,
         .authorization = authorization,
+        .operation_context = operation_context,
         .query_embedding_security_scope = query_embedding_security_scope,
         .authenticated_identity = authenticated_identity,
         .kind = .query_builder,
@@ -1727,6 +1781,7 @@ fn buildA2aDispatcher(
     contexts[1] = .{
         .server = server_ptr,
         .authorization = authorization,
+        .operation_context = operation_context,
         .query_embedding_security_scope = query_embedding_security_scope,
         .authenticated_identity = authenticated_identity,
         .kind = .retrieval,
@@ -1734,6 +1789,7 @@ fn buildA2aDispatcher(
     contexts[2] = .{
         .server = server_ptr,
         .authorization = authorization,
+        .operation_context = operation_context,
         .query_embedding_security_scope = query_embedding_security_scope,
         .authenticated_identity = authenticated_identity,
         .kind = .research,

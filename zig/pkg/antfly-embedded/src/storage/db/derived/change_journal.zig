@@ -19,6 +19,7 @@ const derived_log_mod = @import("derived_log.zig");
 const derived_types = @import("derived_types.zig");
 const internal_keys = @import("../../internal_keys.zig");
 const resource_manager_mod = @import("../../resource_manager.zig");
+const read_control = @import("../../../common/read_admission.zig");
 
 pub const Journal = derived_log_mod.DerivedLog;
 pub const StorageBackend = derived_log_mod.StorageBackend;
@@ -172,7 +173,8 @@ pub const BorrowedBinaryRecordScratch = struct {
     }
 };
 
-const binary_magic = "CJ2\x00";
+pub const wire_shape = @import("../../replay_record_shape.zig");
+const binary_magic = wire_shape.magic;
 const FieldMask = packed struct(u8) {
     changed_doc_keys: bool = false,
     deleted_doc_keys: bool = false,
@@ -376,8 +378,38 @@ fn appendUniqueHintAlloc(alloc: Allocator, list: *std.ArrayListUnmanaged(TargetH
 }
 
 pub fn encodeRecord(alloc: Allocator, record: Record) ![]u8 {
-    var payload = std.ArrayListUnmanaged(u8).empty;
-    errdefer payload.deinit(alloc);
+    return encodeRecordWithAdmission(alloc, record, null);
+}
+
+/// Exact CJ2 wire bytes, including list counts and key-length prefixes. This
+/// measures borrowed immutable keys without scanning their contents or allocating.
+/// It does not predict which artifact keys a later mutation will produce.
+pub fn encodedRecordSize(record: Record, control: ?read_control.Port) !usize {
+    if (control) |port| try port.checkpoint();
+    var shape: wire_shape.Record = .{};
+    inline for (comptime std.meta.fieldNames(wire_shape.Record)) |name| {
+        const keys = @field(record, name);
+        if (keys.len > std.math.maxInt(u32)) return error.RecordTooLarge;
+        for (keys, 0..) |key, index| {
+            if (index % 64 == 0) if (control) |port| try port.checkpoint();
+            try @field(shape, name).addKey(key.len);
+        }
+    }
+    if (control) |port| try port.checkpoint();
+    return std.math.cast(usize, try shape.encodedBytes()) orelse error.RecordTooLarge;
+}
+
+/// Fund one exact buffer before copying. Checks bound key copying to 4 KiB and
+/// metadata traversal to 64 entries; the original control remains borrowed only
+/// through this call. Callers holding physical fences retain their runnable lease.
+pub fn encodeRecordWithAdmission(alloc: Allocator, record: Record, control: ?read_control.Port) ![]u8 {
+    const size = try encodedRecordSize(record, control);
+    const payload = alloc.alloc(u8, size) catch |cause| {
+        if (control) |port| try port.checkpoint();
+        return cause;
+    };
+    errdefer alloc.free(payload);
+    if (control) |port| try port.checkpoint();
 
     const field_mask = FieldMask{
         .changed_doc_keys = record.changed_doc_keys.len > 0,
@@ -386,18 +418,53 @@ pub fn encodeRecord(alloc: Allocator, record: Record) ![]u8 {
         .changed_artifact_keys = record.changed_artifact_keys.len > 0,
     };
 
-    try payload.appendSlice(alloc, binary_magic);
-    try appendInt(&payload, alloc, u16, record.version);
-    try appendInt(&payload, alloc, u64, record.sequence);
-    try payload.append(alloc, hintMask(record.target_hints));
-    try payload.append(alloc, @bitCast(field_mask));
-
-    if (field_mask.changed_doc_keys) try encodeStringList(&payload, alloc, record.changed_doc_keys);
-    if (field_mask.deleted_doc_keys) try encodeStringList(&payload, alloc, record.deleted_doc_keys);
-    if (field_mask.overwritten_doc_keys) try encodeStringList(&payload, alloc, record.overwritten_doc_keys);
-    if (field_mask.changed_artifact_keys) try encodeStringList(&payload, alloc, record.changed_artifact_keys);
-
-    return try payload.toOwnedSlice(alloc);
+    @memcpy(payload[0..4], binary_magic);
+    std.mem.writeInt(u16, payload[4..6], record.version, .little);
+    std.mem.writeInt(u64, payload[6..14], record.sequence, .little);
+    var hints: u8 = 0;
+    for (record.target_hints, 0..) |hint, index| {
+        if (index % 64 == 0) if (control) |port| try port.checkpoint();
+        hints |= singleHintMask(hint);
+    }
+    payload[14] = hints;
+    payload[15] = @bitCast(field_mask);
+    var offset: usize = 16;
+    var quantum: usize = 0;
+    inline for (.{ record.changed_doc_keys, record.deleted_doc_keys, record.overwritten_doc_keys, record.changed_artifact_keys }) |keys| {
+        if (keys.len != 0) {
+            if (quantum > 4092) {
+                if (control) |port| try port.checkpoint();
+                quantum = 0;
+            }
+            std.mem.writeInt(u32, payload[offset..][0..4], @intCast(keys.len), .little);
+            offset += 4;
+            quantum += 4;
+        }
+        for (keys, 0..) |key, index| {
+            if (index % 64 == 0 or quantum > 4092) {
+                if (control) |port| try port.checkpoint();
+                quantum = 0;
+            }
+            std.mem.writeInt(u32, payload[offset..][0..4], @intCast(key.len), .little);
+            offset += 4;
+            quantum += 4;
+            var copied: usize = 0;
+            while (copied < key.len) {
+                if (quantum == 4096) {
+                    if (control) |port| try port.checkpoint();
+                    quantum = 0;
+                }
+                const len = @min(4096 - quantum, key.len - copied);
+                @memcpy(payload[offset..][0..len], key[copied..][0..len]);
+                offset += len;
+                copied += len;
+                quantum += len;
+            }
+        }
+    }
+    std.debug.assert(offset == size);
+    if (control) |port| try port.checkpoint();
+    return payload;
 }
 
 pub fn decodeRecord(alloc: Allocator, raw: []const u8) !DecodedRecord {
@@ -651,6 +718,67 @@ const BinaryCursor = struct {
     }
 };
 
+/// Validated CJ2 shape, without retaining input pointers or allocating. These
+/// totals count allocator payload bytes, excluding the input buffer, allocator
+/// headers/alignment and reusable ArrayList spare capacity. They are not a
+/// durable completion grant or a prediction of future replay keys.
+pub const BinaryRecordInspection = struct {
+    encoded_bytes: usize,
+    key_counts: [4]usize = @splat(0),
+    key_bytes: [4]usize = @splat(0),
+    hint_count: usize,
+
+    pub fn borrowedAllocationBytes(self: @This(), fields: RecordFields) !usize {
+        var bytes: usize = if (self.hint_count > 1) self.hint_count * @sizeOf(TargetHint) else 0;
+        inline for (.{ fields.changed_doc_keys, fields.deleted_doc_keys, fields.overwritten_doc_keys, fields.changed_artifact_keys }, 0..) |selected, index| {
+            if (selected) {
+                const descriptors = std.math.mul(usize, self.key_counts[index], @sizeOf([]const u8)) catch return error.RecordTooLarge;
+                bytes = std.math.add(usize, bytes, descriptors) catch return error.RecordTooLarge;
+            }
+        }
+        return bytes;
+    }
+
+    pub fn ownedAllocationBytes(self: @This()) !usize {
+        var bytes = try self.borrowedAllocationBytes(.{});
+        for (self.key_bytes) |len| bytes = std.math.add(usize, bytes, len) catch return error.RecordTooLarge;
+        return bytes;
+    }
+};
+
+/// Validate every field, including unselected fields, before a decoder can
+/// allocate from wire counts. Skip key contents in constant time; original
+/// controls bound metadata traversal to 64 entries. The caller retains raw
+/// bytes unchanged through inspection and decoding.
+pub fn inspectBinaryRecord(raw: []const u8, control: ?read_control.Port) !BinaryRecordInspection {
+    if (control) |port| try port.checkpoint();
+    if (!looksLikeBinaryRecord(raw)) return error.InvalidBinaryRecord;
+    var cursor: BinaryCursor = .{ .raw = raw, .index = binary_magic.len };
+    _ = try cursor.readInt(u16);
+    _ = try cursor.readInt(u64);
+    const hints = try cursor.readInt(u8);
+    const fields = try cursor.readInt(u8);
+    if (fields & 0xf0 != 0) return error.InvalidBinaryRecord;
+    var result: BinaryRecordInspection = .{ .encoded_bytes = raw.len, .hint_count = @popCount(hints) };
+    for (0..4) |field| {
+        if (fields & (@as(u8, 1) << @intCast(field)) == 0) continue;
+        const count = try cursor.readInt(u32);
+        // Each key needs at least its length prefix. An impossible count must
+        // never reach alloc(), even when its wrapped descriptor size would fit.
+        if (count > cursor.remaining() / @sizeOf(u32)) return error.UnexpectedEndOfInput;
+        result.key_counts[field] = count;
+        for (0..count) |index| {
+            if (index % 64 == 0) if (control) |port| try port.checkpoint();
+            const len = try cursor.readInt(u32);
+            _ = try cursor.readBytes(len);
+            result.key_bytes[field] = std.math.add(usize, result.key_bytes[field], len) catch return error.RecordTooLarge;
+        }
+    }
+    if (cursor.remaining() != 0) return error.InvalidBinaryRecord;
+    if (control) |port| try port.checkpoint();
+    return result;
+}
+
 fn decodeBinaryStringList(alloc: Allocator, cursor: *BinaryCursor) BinaryDecodeError![]const []const u8 {
     const count = try cursor.readInt(u32);
     if (count == 0) return &.{};
@@ -712,6 +840,7 @@ fn decodeBinaryStringListBorrowedScratch(
 }
 
 fn decodeBinaryRecord(alloc: Allocator, raw: []const u8) !Record {
+    _ = try (try inspectBinaryRecord(raw, null)).ownedAllocationBytes();
     var cursor = BinaryCursor{
         .raw = raw[binary_magic.len..],
         .index = 0,
@@ -789,7 +918,7 @@ pub const GraphRefreshCursor = struct {
 };
 
 pub fn decodeBinaryRecordBorrowed(alloc: Allocator, raw: []const u8) !BorrowedBinaryRecord {
-    if (!looksLikeBinaryRecord(raw)) return error.InvalidBinaryRecord;
+    _ = try (try inspectBinaryRecord(raw, null)).borrowedAllocationBytes(.{});
 
     var cursor = BinaryCursor{
         .raw = raw[binary_magic.len..],
@@ -865,7 +994,7 @@ fn decodeSelectedArtifacts(alloc: Allocator, cursor: *BinaryCursor, list: *std.A
 }
 
 pub fn decodeBinaryRecordBorrowedScratchSelected(alloc: Allocator, raw: []const u8, scratch: *BorrowedBinaryRecordScratch, fields: RecordFields) !Record {
-    if (!looksLikeBinaryRecord(raw)) return error.InvalidBinaryRecord;
+    _ = try (try inspectBinaryRecord(raw, null)).borrowedAllocationBytes(fields);
     scratch.reset();
     var cursor = BinaryCursor{ .raw = raw[binary_magic.len..], .index = 0 };
     const version = try cursor.readInt(u16);
@@ -1582,6 +1711,216 @@ test "change journal trimming preserves small buffers after an oversized record"
     try std.testing.expect(scratch.retainedCapacityBytes() <= 4096);
     scratch.trimRetainedCapacity(alloc, 0);
     try std.testing.expectEqual(@as(usize, 0), scratch.retainedCapacityBytes());
+}
+
+test "change journal exact encoding matches legacy wire in an exactly funded buffer" {
+    const a = std.testing.allocator;
+    const Legacy = struct {
+        fn encode(allocator: Allocator, record: Record) ![]u8 {
+            var bytes = std.ArrayListUnmanaged(u8).empty;
+            errdefer bytes.deinit(allocator);
+            try bytes.appendSlice(allocator, binary_magic);
+            try appendInt(&bytes, allocator, u16, record.version);
+            try appendInt(&bytes, allocator, u64, record.sequence);
+            try bytes.append(allocator, hintMask(record.target_hints));
+            const mask: FieldMask = .{
+                .changed_doc_keys = record.changed_doc_keys.len != 0,
+                .deleted_doc_keys = record.deleted_doc_keys.len != 0,
+                .overwritten_doc_keys = record.overwritten_doc_keys.len != 0,
+                .changed_artifact_keys = record.changed_artifact_keys.len != 0,
+            };
+            try bytes.append(allocator, @bitCast(mask));
+            inline for (.{ record.changed_doc_keys, record.deleted_doc_keys, record.overwritten_doc_keys, record.changed_artifact_keys }) |keys| {
+                if (keys.len != 0) try encodeStringList(&bytes, allocator, keys);
+            }
+            return bytes.toOwnedSlice(allocator);
+        }
+    };
+    var bytes: [8193]u8 = undefined;
+    for (&bytes, 0..) |*byte, i| byte.* = @truncate(i *% 73 +% 41);
+    for ([_]usize{ 0, 1, 4091, 4092, 4093, 4096, 8193 }) |len| {
+        const keys: []const []const u8 = &.{ bytes[0..len], "\x00\xff", "", "tail" };
+        for (0..16) |bits| {
+            const record: Record = .{
+                .version = 1,
+                .sequence = std.math.maxInt(u64),
+                .changed_doc_keys = if (bits & 1 != 0) keys else &.{},
+                .deleted_doc_keys = if (bits & 2 != 0) keys else &.{},
+                .overwritten_doc_keys = if (bits & 4 != 0) keys else &.{},
+                .changed_artifact_keys = if (bits & 8 != 0) keys else &.{},
+                .target_hints = &.{ .enrichment, .full_text, .dense_vector, .sparse_vector, .graph, .algebraic, .resolution, .promotion },
+            };
+            const expected = try Legacy.encode(a, record);
+            defer a.free(expected);
+            try std.testing.expectEqual(expected.len, try encodedRecordSize(record, null));
+            const backing = try a.alloc(u8, expected.len);
+            defer a.free(backing);
+            var fixed = std.heap.FixedBufferAllocator.init(backing);
+            const actual = try encodeRecordWithAdmission(fixed.allocator(), record, null);
+            try std.testing.expectEqualSlices(u8, expected, actual);
+            try std.testing.expectEqual(expected.len, fixed.end_index);
+            var decoded = try decodeRecord(a, actual);
+            defer decoded.deinit();
+            try std.testing.expectEqual(record.sequence, decoded.record.sequence);
+        }
+    }
+}
+
+test "change journal exact encoding preserves every original refusal and unwinds allocations" {
+    const a = std.testing.allocator;
+    const large: [8193]u8 = @splat(97);
+    var keys: [130][]const u8 = @splat("short");
+    keys[64] = &large;
+    const hints: [129]TargetHint = @splat(.full_text);
+    const record: Record = .{ .changed_doc_keys = &keys, .changed_artifact_keys = &keys, .target_hints = &hints };
+    const State = struct {
+        checks: usize = 0,
+        reject: usize = std.math.maxInt(usize),
+        failure: ?*std.testing.FailingAllocator = null,
+        fn check(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.checks += 1;
+            if (self.checks == self.reject or (if (self.failure) |f| f.has_induced_failure else false)) return error.DeadlineExceeded;
+        }
+    };
+    var state: State = .{};
+    const payload: read_control.Payload = .{ .ptr = &state, .vtable = &.{ .checkpoint = State.check } };
+    const port = read_control.Port.init(&payload);
+    const encoded = try encodeRecordWithAdmission(a, record, port);
+    a.free(encoded);
+    const checks = state.checks;
+    try std.testing.expect(checks > 20);
+    for (1..checks + 1) |reject| {
+        state = .{ .reject = reject };
+        try std.testing.expectError(error.DeadlineExceeded, encodeRecordWithAdmission(a, record, port));
+        try std.testing.expectEqual(reject, state.checks);
+    }
+    const Fixture = struct {
+        fn run(allocator: Allocator, value: Record) !void {
+            const owned = try encodeRecordWithAdmission(allocator, value, null);
+            defer allocator.free(owned);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(a, Fixture.run, .{record});
+    var deny = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+    state = .{ .failure = &deny };
+    try std.testing.expectError(error.DeadlineExceeded, encodeRecordWithAdmission(deny.allocator(), record, port));
+    try std.testing.expect(deny.has_induced_failure);
+    try std.testing.expectEqual(@as(usize, 0), deny.allocated_bytes - deny.freed_bytes);
+}
+
+test "change journal exact encoding rejects oversized wire lengths before allocation or key access" {
+    if (comptime @bitSizeOf(usize) > 32) {
+        var empty: [0]u8 = .{};
+        var deny = std.heap.FixedBufferAllocator.init(&empty);
+        const too_large = @as(usize, std.math.maxInt(u32)) + 1;
+        const byte: u8 = 0;
+        const oversized_key = @as([*]const u8, @ptrCast(&byte))[0..too_large];
+        try std.testing.expectError(error.RecordTooLarge, encodedRecordSize(.{ .changed_doc_keys = &.{oversized_key} }, null));
+        try std.testing.expectError(error.RecordTooLarge, encodeRecord(deny.allocator(), .{ .changed_artifact_keys = &.{oversized_key} }));
+        const key: []const u8 = "";
+        const oversized_list = @as([*]const []const u8, @ptrCast(&key))[0..too_large];
+        try std.testing.expectError(error.RecordTooLarge, encodedRecordSize(.{ .deleted_doc_keys = oversized_list }, null));
+        try std.testing.expectError(error.RecordTooLarge, encodeRecord(deny.allocator(), .{ .overwritten_doc_keys = oversized_list }));
+    }
+}
+
+test "change journal binary inspection exactly bounds owned and borrowed allocation payloads" {
+    const a = std.testing.allocator;
+    const values = [_][]const u8{ "", "a", "unaligned", "binary\x00\xff" };
+    for (0..16) |fields| for (0..256) |hints| {
+        var hint_storage: [8]TargetHint = undefined;
+        var hint_count: usize = 0;
+        for (0..8) |bit| if (hints & (@as(usize, 1) << @intCast(bit)) != 0) {
+            hint_storage[hint_count] = @fromBackingInt(@intCast(bit));
+            hint_count += 1;
+        };
+        const record: Record = .{
+            .version = 7,
+            .sequence = 9001,
+            .changed_doc_keys = if (fields & 1 != 0) &values else &.{},
+            .deleted_doc_keys = if (fields & 2 != 0) &values else &.{},
+            .overwritten_doc_keys = if (fields & 4 != 0) &values else &.{},
+            .changed_artifact_keys = if (fields & 8 != 0) &values else &.{},
+            .target_hints = hint_storage[0..hint_count],
+        };
+        const raw = try encodeRecord(a, record);
+        defer a.free(raw);
+        const inspected = try inspectBinaryRecord(raw, null);
+        try std.testing.expectEqual(raw.len, inspected.encoded_bytes);
+        try std.testing.expectEqual(hint_count, inspected.hint_count);
+        var owned_counter = std.testing.FailingAllocator.init(a, .{});
+        var owned = try decodeRecord(owned_counter.allocator(), raw);
+        try std.testing.expectEqual(try inspected.ownedAllocationBytes(), owned_counter.allocated_bytes);
+        try std.testing.expectEqualDeep(record, owned.record);
+        owned.deinit();
+        try std.testing.expectEqual(owned_counter.allocated_bytes, owned_counter.freed_bytes);
+        var borrowed_counter = std.testing.FailingAllocator.init(a, .{});
+        var borrowed = try decodeBinaryRecordBorrowed(borrowed_counter.allocator(), raw);
+        try std.testing.expectEqual(try inspected.borrowedAllocationBytes(.{}), borrowed_counter.allocated_bytes);
+        try std.testing.expectEqualDeep(record, borrowed.record);
+        borrowed.deinit();
+        try std.testing.expectEqual(borrowed_counter.allocated_bytes, borrowed_counter.freed_bytes);
+    };
+}
+
+test "change journal binary decoders reject every truncated or trailing field before allocation" {
+    const a = std.testing.allocator;
+    const raw = try encodeRecord(a, .{ .changed_doc_keys = &.{ "first", "second" }, .deleted_doc_keys = &.{"deleted"}, .overwritten_doc_keys = &.{"overwritten"}, .changed_artifact_keys = &.{"artifact"}, .target_hints = &.{ .graph, .enrichment, .full_text } });
+    defer a.free(raw);
+    const Fixture = struct {
+        fn reject(payload: []const u8, expected: anyerror) !void {
+            var denied = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+            const alloc = denied.allocator();
+            try std.testing.expectError(expected, decodeRecord(alloc, payload));
+            try std.testing.expectError(expected, decodeBinaryRecordBorrowed(alloc, payload));
+            var scratch: BorrowedBinaryRecordScratch = .{};
+            defer scratch.deinit(alloc);
+            // The last field is unselected; it still must be validated before
+            // allocating descriptors for the first, otherwise valid, field.
+            try std.testing.expectError(expected, decodeBinaryRecordBorrowedScratchSelected(alloc, payload, &scratch, .{ .changed_artifact_keys = false }));
+            try std.testing.expect(!denied.has_induced_failure);
+            try std.testing.expectEqual(@as(usize, 0), denied.allocated_bytes);
+        }
+    };
+    for (binary_magic.len..raw.len) |end| try Fixture.reject(raw[0..end], error.UnexpectedEndOfInput);
+    const trailing = try std.mem.concat(a, u8, &.{ raw, "x" });
+    defer a.free(trailing);
+    try Fixture.reject(trailing, error.InvalidBinaryRecord);
+    const forged = try a.dupe(u8, raw);
+    defer a.free(forged);
+    std.mem.writeInt(u32, forged[16..20], std.math.maxInt(u32), .little);
+    try Fixture.reject(forged, error.UnexpectedEndOfInput);
+    @memcpy(forged, raw);
+    forged[15] |= 0x80;
+    try Fixture.reject(forged, error.InvalidBinaryRecord);
+}
+
+test "change journal binary inspection polls original controls without allocation or copying keys" {
+    const a = std.testing.allocator;
+    const keys: [130][]const u8 = @splat("key");
+    const raw = try encodeRecord(a, .{ .changed_doc_keys = &keys, .changed_artifact_keys = &keys });
+    defer a.free(raw);
+    const Check = struct {
+        calls: usize = 0,
+        reject: usize = std.math.maxInt(usize),
+        fn check(ptr: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            if (self.calls == self.reject) return error.OriginalReplayInspectionRejected;
+        }
+    };
+    var check: Check = .{};
+    const payload: read_control.Payload = .{ .ptr = &check, .vtable = &.{ .checkpoint = Check.check } };
+    const port = read_control.Port.init(&payload);
+    _ = try inspectBinaryRecord(raw, port);
+    const calls = check.calls;
+    try std.testing.expectEqual(@as(usize, 8), calls);
+    for (1..calls + 1) |reject| {
+        check = .{ .reject = reject };
+        try std.testing.expectError(error.OriginalReplayInspectionRejected, inspectBinaryRecord(raw, port));
+        try std.testing.expectEqual(reject, check.calls);
+    }
 }
 
 test "change journal asset metadata decode retains only root descriptors" {

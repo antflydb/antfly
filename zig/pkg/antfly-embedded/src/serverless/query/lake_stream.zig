@@ -222,7 +222,7 @@ pub const Stream = struct {
     fn lookaheadCanceled(raw: *const anyopaque) bool {
         const self: *const Stream = @ptrCast(@alignCast(raw));
         if (self.lookahead_cancelled.load(.acquire)) return true;
-        self.context.ensureActive() catch return true;
+        self.context.checkLifetime() catch return true;
         return false;
     }
     fn joinLookahead(self: *Stream, cancel: bool) void {
@@ -269,26 +269,49 @@ pub const Stream = struct {
             if (self.selection) |selection| if (!selection.rangeMayMatch(self.active_file, group.ordinal, 0, group.row_count)) continue;
             // Probe before the first matching group, including all-negative
             // cursor scans. A monotonic plan position avoids duplicate jobs.
-            self.bloom_lookahead[slot] = reader.scheduler.submitIoTransient(io, 64 * 1024, warmBloom, .{ self, plan.inventory, input.row_group_ordinal });
+            self.bloom_lookahead[slot] = if (reader.context.execution) |execution|
+                (@import("../../sql/parallel_scheduler.zig").ExecutionScope{ .execution = execution, .allocator = std.heap.page_allocator, .io = io, .wait = @import("../../sql/spill.zig").childWait(execution) }).submit(64 * 1024, std.heap.page_allocator, warmBloomChild, .{ self, plan.inventory, input.row_group_ordinal }, discardWarm) catch null
+            else
+                reader.scheduler.submitIoTransient(io, 64 * 1024, warmBloom, .{ self, plan.inventory, input.row_group_ordinal });
             if (self.bloom_lookahead[slot] == null) return; // Required reads remain synchronous on pressure.
             slot += 1;
         }
     }
+    fn warmBloomChild(self: *Stream, inventory: external.Inventory, ordinal: u32, execution: *@import("../../common/runnable_scheduler.zig").Execution) anyerror!void {
+        return self.warmBloomFor(inventory, ordinal, execution);
+    }
     fn warmBloom(self: *Stream, inventory: external.Inventory, ordinal: u32) anyerror!void {
+        return self.warmBloomFor(inventory, ordinal, null);
+    }
+    fn warmBloomFor(self: *Stream, inventory: external.Inventory, ordinal: u32, execution: ?*@import("../../common/runnable_scheduler.zig").Execution) anyerror!void {
         const reader = self.source.scanner.shared_reader.?;
         var worker: @import("lake_serving_cache.zig").Reader = .{ .cache = reader.cache, .base = reader.base, .scope = reader.scope, .context = reader.context };
         const token: @import("../../storage/object_storage.zig").CancellationToken = .{ .ptr = self, .is_cancelled_fn = lookaheadCanceled };
         worker.context.cancellation = token;
         worker.base.cancellation = token;
+        if (execution) |owner| worker.bindExecution(owner);
         var stats: Stats = .{};
         _ = try bloomGroupMayMatch(std.heap.page_allocator, worker.reader(), inventory.files[0], inventory.files[0].row_groups[ordinal], self.groupPredicates(), worker.context, &stats);
     }
+    pub fn retireSpeculation(self: *Stream) void {
+        self.joinLookahead(true);
+        self.freeLookaheadDescriptors();
+        if (self.source.scanner.shared_reader) |reader| reader.drain(true);
+    }
+    fn discardWarm(_: std.mem.Allocator, _: void) void {}
+    fn warmGroupChild(self: *Stream, inventory: external.Inventory, ordinal: u32, names: []const []const u8, required: []const bool, execution: *@import("../../common/runnable_scheduler.zig").Execution) anyerror!void {
+        return self.warmGroupFor(inventory, ordinal, names, required, execution);
+    }
     fn warmGroup(self: *Stream, inventory: external.Inventory, ordinal: u32, names: []const []const u8, required: []const bool) anyerror!void {
+        return self.warmGroupFor(inventory, ordinal, names, required, null);
+    }
+    fn warmGroupFor(self: *Stream, inventory: external.Inventory, ordinal: u32, names: []const []const u8, required: []const bool, execution: ?*@import("../../common/runnable_scheduler.zig").Execution) anyerror!void {
         const reader = self.source.scanner.shared_reader.?;
         var worker_reader: @import("lake_serving_cache.zig").Reader = .{ .cache = reader.cache, .base = reader.base, .scope = reader.scope, .context = reader.context };
         const token: @import("../../storage/object_storage.zig").CancellationToken = .{ .ptr = self, .is_cancelled_fn = lookaheadCanceled };
         worker_reader.context.cancellation = token;
         worker_reader.base.cancellation = token;
+        if (execution) |owner| worker_reader.bindExecution(owner);
         // Worker allocations never mutate a statement arena. Decoded buffers
         // belong to the bounded shared cache, and temporary work is admitted
         // by the same scheduler used by kernels, spill writes and prefetch.
@@ -354,7 +377,10 @@ pub const Stream = struct {
                     self.lookahead_next_input += 1;
                     continue;
                 }
-                slot.* = reader.scheduler.submitTransient(io, self.lookaheadWorkspace(), warmGroup, .{ self, plan.inventory, input.row_group_ordinal, self.lookahead_names, self.lookahead_required });
+                slot.* = if (reader.context.execution) |execution|
+                    (@import("../../sql/parallel_scheduler.zig").ExecutionScope{ .execution = execution, .allocator = std.heap.page_allocator, .io = io, .wait = @import("../../sql/spill.zig").childWait(execution) }).submit(self.lookaheadWorkspace(), std.heap.page_allocator, warmGroupChild, .{ self, plan.inventory, input.row_group_ordinal, self.lookahead_names, self.lookahead_required }, discardWarm) catch null
+                else
+                    reader.scheduler.submitTransient(io, self.lookaheadWorkspace(), warmGroup, .{ self, plan.inventory, input.row_group_ordinal, self.lookahead_names, self.lookahead_required });
                 if (slot.* == null) return; // Retry on the next pull as pressure falls.
                 self.lookahead_next_input += 1;
                 self.lookahead_started += 1;
@@ -645,7 +671,12 @@ pub const Stream = struct {
             // state. The coordinator prepares deletes after a footer survives.
             const scheduler = @import("../../sql/parallel_scheduler.zig");
             var locked: scheduler.LockedAllocator = .{ .backing = self.alloc };
-            const width = @min(maximum, scheduler.global().fanout(self.files.len, self.limits.max_decoded_bytes, 1024 * 1024));
+            const execution = self.context.execution;
+            const width = if (execution != null)
+                @min(@as(usize, 8), @min(maximum, @min(self.files.len, @max(@as(usize, 1), self.limits.max_decoded_bytes / (1024 * 1024)))))
+            else
+                @min(maximum, scheduler.global().fanout(self.files.len, self.limits.max_decoded_bytes, 1024 * 1024));
+            const scope: ?scheduler.ExecutionScope = if (execution) |owner| .{ .execution = owner, .allocator = locked.allocator(), .io = planning_io.?, .wait = self.context.wait.? } else null;
             var offset: usize = 0;
             while (offset < self.files.len) {
                 const count = @min(width, self.files.len - offset);
@@ -656,7 +687,12 @@ pub const Stream = struct {
                 // While tasks run, every request allocation uses the same
                 // lock. Join the entire wave before touching coordinator state.
                 for (jobs[0..count], 0..) |*job, lane| {
-                    tasks[lane] = scheduler.global().submit(planning_io.?, 1024 * 1024, PlanningJob.run, .{job});
+                    if (scope) |owner| {
+                        tasks[lane] = owner.submit(1024 * 1024, locked.allocator(), PlanningJob.runChild, .{job}, PlanningJob.discard) catch |err| {
+                            failures[lane] = err;
+                            break;
+                        };
+                    } else tasks[lane] = scheduler.global().submit(planning_io.?, 1024 * 1024, PlanningJob.run, .{job});
                     if (tasks[lane] == null) PlanningJob.run(job) catch |err| {
                         failures[lane] = err;
                     };
@@ -667,6 +703,7 @@ pub const Stream = struct {
                     };
                 };
                 defer for (jobs[0..count]) |*job| if (job.plan) |*plan| plan.deinit(self.alloc);
+                try self.context.ensureActive();
                 for (failures[0..count]) |failure| if (failure) |err| return err;
                 for (jobs[0..count]) |*job| {
                     self.stats.files_opened += job.stats.files_opened;
@@ -730,9 +767,18 @@ pub const Stream = struct {
         index: usize,
         plan: ?ScanWork.FilePlan = null,
         stats: Stats = .{},
+        fn discard(_: Allocator, _: void) void {}
+        fn runChild(job: *@This(), execution: *@import("../../common/runnable_scheduler.zig").Execution) anyerror!void {
+            return job.runFor(execution);
+        }
         fn run(job: *@This()) anyerror!void {
+            return job.runFor(null);
+        }
+        fn runFor(job: *@This(), execution: ?*@import("../../common/runnable_scheduler.zig").Execution) anyerror!void {
             const parent = job.parent;
-            try parent.context.ensureActive();
+            try parent.context.checkLifetime();
+            const context = if (execution) |owner| parent.context.withExecution(owner) else parent.context;
+            try context.ensureActive();
             if (!parent.fileMatches(parent.source.inventory.files[job.index])) {
                 job.stats.files_pruned = 1;
                 return;
@@ -760,9 +806,13 @@ pub const Stream = struct {
                 .context = parent.source.scanner.shared_reader.?.context,
             };
             reader.base.client.allocator = job.alloc;
+            if (execution) |owner| {
+                reader.bindExecution(owner);
+                source.scanner.object_reader = reader.base;
+            }
             source.scanner.shared_reader = &reader;
             source.scanner.object_reader.client.allocator = job.alloc;
-            var worker: Stream = .{ .alloc = job.alloc, .source = &source, .columns = parent.columns, .predicates = parent.predicates, .context = parent.context, .limits = parent.limits, .files = &.{}, .owns_files = false, .schema_contract = parent.schema_contract, .identity_only = parent.identity_only };
+            var worker: Stream = .{ .alloc = job.alloc, .source = &source, .columns = parent.columns, .predicates = parent.predicates, .context = context, .limits = parent.limits, .files = &.{}, .owns_files = false, .schema_contract = parent.schema_contract, .identity_only = parent.identity_only };
             defer worker.deinit();
             try worker.loadFile(job.index);
             job.plan = worker.takeFilePlan();

@@ -408,6 +408,10 @@ test "embeddinggemma2 declarations compile" {
     _ = server;
 }
 
+test "runnable execution HTTP native deadline discovers server contracts" {
+    std.testing.refAllDecls(server);
+}
+
 /// Shared CLI diagnostics for the public and development inference entry points.
 pub fn printMetalInfo() void {
     std.debug.print("metal build_enabled={}\n", .{build_options.enable_metal});

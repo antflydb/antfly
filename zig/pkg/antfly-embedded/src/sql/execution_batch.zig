@@ -19,6 +19,8 @@
 const std = @import("std");
 const scalar = @import("scalar.zig");
 const A = std.mem.Allocator;
+const Work = @import("operator_work.zig");
+pub const ReadControl = Work.Control;
 /// A borrowed physical column plus its logical row mapping. The declaration
 /// proves scalar boundary coercion is an identity; unsupported coercions decline.
 pub const PhysicalColumn = struct {
@@ -234,7 +236,7 @@ pub const Batch = union(enum) {
     /// Stable retained columns; ownership belongs to the enclosing lease.
     retained: struct { store: *const @import("typed_store.zig").Store, begin: usize = 0, count: usize },
     /// Operator-specific column access without constructing a row matrix.
-    reader: struct { ptr: *anyopaque, read: *const fn (*anyopaque, A, usize, usize) anyerror!scalar.Datum, free_owned: ?*const fn (*anyopaque, A) void = null, read_decimal_selected: ?*const fn (*anyopaque, A, usize, ?[]const usize) anyerror!?DecimalColumn = null, read_physical: ?*const fn (*anyopaque, A, usize) anyerror!?PhysicalColumn = null, read_physical_selected: ?*const fn (*anyopaque, A, usize, ?[]const usize) anyerror!?PhysicalColumn = null, cohort: ?struct { source: *const Batch, positions: []const usize } = null, read_frozen: ?*const fn (*anyopaque, usize, usize) anyerror!?FrozenJson = null, read_json: ?*const fn (*anyopaque, usize, usize) anyerror!?[]const u8 = null, read_dictionary: ?*const fn (*anyopaque, A, usize) anyerror!?Batch = null, read_identity: ?*const fn (*anyopaque, usize, usize) anyerror!?u64 = null, count: usize, width: usize },
+    reader: struct { ptr: *anyopaque, read_controlled: ?*const fn (*anyopaque, A, usize, usize, ?Work.Control) anyerror!scalar.Datum = null, read: *const fn (*anyopaque, A, usize, usize) anyerror!scalar.Datum, free_owned: ?*const fn (*anyopaque, A) void = null, read_decimal_selected: ?*const fn (*anyopaque, A, usize, ?[]const usize) anyerror!?DecimalColumn = null, read_physical: ?*const fn (*anyopaque, A, usize) anyerror!?PhysicalColumn = null, read_physical_selected: ?*const fn (*anyopaque, A, usize, ?[]const usize) anyerror!?PhysicalColumn = null, cohort: ?struct { source: *const Batch, positions: []const usize } = null, read_frozen: ?*const fn (*anyopaque, usize, usize) anyerror!?FrozenJson = null, read_json: ?*const fn (*anyopaque, usize, usize) anyerror!?[]const u8 = null, read_dictionary: ?*const fn (*anyopaque, A, usize) anyerror!?Batch = null, read_identity: ?*const fn (*anyopaque, usize, usize) anyerror!?u64 = null, count: usize, width: usize },
     columns: struct { page: @import("catalog.zig").ColumnPage, definitions: []const scalar.Column },
     rows: []const []const scalar.Datum,
     vectors: struct { values: []const []const scalar.Datum, count: usize },
@@ -310,6 +312,11 @@ pub const Batch = union(enum) {
                 const view: *@This() = @ptrCast(@alignCast(raw));
                 return view.source.cell(alloc, row_index, view.column);
             }
+            fn readControlled(raw: *anyopaque, alloc: A, row_index: usize, _: usize, control: ?Work.Control) !scalar.Datum {
+                const view: *@This() = @ptrCast(@alignCast(raw));
+                return view.source.cellControlled(alloc, row_index, view.column, control);
+            }
+
             fn dictionary(raw: *anyopaque, alloc: A, _: usize) !?Batch {
                 const view: *@This() = @ptrCast(@alignCast(raw));
                 return view.source.dictionaryColumn(alloc, view.column);
@@ -329,7 +336,7 @@ pub const Batch = union(enum) {
         };
         const view = try a.create(View);
         view.* = .{ .source = self, .column = column };
-        return .{ .reader = .{ .ptr = view, .read = View.read, .read_physical = View.physicalView, .read_decimal_selected = View.decimalSelected, .read_physical_selected = View.physicalSelected, .read_dictionary = View.dictionary, .read_identity = View.identity, .read_json = View.json, .read_frozen = View.frozen, .count = self.len(), .width = 1 } };
+        return .{ .reader = .{ .ptr = view, .read = View.read, .read_controlled = View.readControlled, .read_physical = View.physicalView, .read_decimal_selected = View.decimalSelected, .read_physical_selected = View.physicalSelected, .read_dictionary = View.dictionary, .read_identity = View.identity, .read_json = View.json, .read_frozen = View.frozen, .count = self.len(), .width = 1 } };
     }
     /// Keep FILTER cohorts sparse. Aggregate consumers gather group IDs for
     /// accepted lanes directly; scalar fallback observes SQL NULL elsewhere.
@@ -668,6 +675,11 @@ pub const Batch = union(enum) {
                 const view: *@This() = @ptrCast(@alignCast(raw));
                 return view.source.cell(alloc, view.selection[row_index], column);
             }
+            fn readControlled(raw: *anyopaque, alloc: A, row_index: usize, column: usize, control: ?Work.Control) !scalar.Datum {
+                const view: *@This() = @ptrCast(@alignCast(raw));
+                return view.source.cellControlled(alloc, view.selection[row_index], column, control);
+            }
+
             fn decimalSelected(raw: *anyopaque, alloc: A, column: usize, outer_selection: ?[]const usize) !?DecimalColumn {
                 const view: *@This() = @ptrCast(@alignCast(raw));
                 return view.source.decimalColumnSelected(alloc, column, try selectedRows(alloc, view.selection, outer_selection));
@@ -718,35 +730,50 @@ pub const Batch = union(enum) {
         for (selection) |index| if (index >= self.len()) return error.InvalidSqlBackendResponse;
         const view = try a.create(View);
         view.* = .{ .source = self, .selection = selection };
-        return .{ .reader = .{ .ptr = view, .count = selection.len, .width = self.width(), .read = View.read, .read_physical = View.physical, .read_decimal_selected = View.decimalSelected, .read_physical_selected = View.physicalSelected, .read_dictionary = View.dictionary, .read_identity = View.identity, .read_json = View.json, .read_frozen = View.frozen } };
+        return .{ .reader = .{ .ptr = view, .count = selection.len, .width = self.width(), .read = View.read, .read_controlled = View.readControlled, .read_physical = View.physical, .read_decimal_selected = View.decimalSelected, .read_physical_selected = View.physicalSelected, .read_dictionary = View.dictionary, .read_identity = View.identity, .read_json = View.json, .read_frozen = View.frozen } };
     }
     pub fn cell(self: Batch, a: A, index: usize, column: usize) anyerror!scalar.Datum {
+        return self.cellControlled(a, index, column, null);
+    }
+    pub fn cellControlled(self: Batch, a: A, index: usize, column: usize, control: ?Work.Control) anyerror!scalar.Datum {
+        try Work.poll(control);
         if (index >= self.len() or column >= self.width()) return error.InvalidSqlBackendResponse;
         return switch (self) {
             .dictionary => |v| if (v.indices[index] < v.values.len) v.values[v.indices[index]] else error.InvalidSqlBackendResponse,
-            .retained => |v| v.store.cell(a, v.begin + index, column),
-            .reader => |v| v.read(v.ptr, a, index, column),
+            .retained => |v| v.store.cellControlled(a, v.begin + index, column, control),
+            .reader => |v| blk: {
+                if (v.read_controlled) |read| break :blk try read(v.ptr, a, index, column, control);
+                // Representation capabilities cannot replace a reader's
+                // validation, policy checks or precise row errors.
+                const value = try v.read(v.ptr, a, index, column);
+                try Work.poll(control);
+                break :blk value;
+            },
             .rows => |v| v[index][column],
             .vectors => |v| v.values[column][index],
             .mapped => |v| blk: {
                 if (v.ordinals[column] == std.math.maxInt(usize)) break :blk .{};
-                const value = try v.source.cell(a, v.selection[index], v.ordinals[column]);
+                const value = try v.source.cellControlled(a, v.selection[index], v.ordinals[column], control);
                 if (column >= v.types.len) return error.InvalidSqlBackendResponse;
                 const type_ = v.types[column];
                 break :blk try @import("describe.zig").coerceDatum(a, value, type_.kind orelse return error.InvalidSqlBackendResponse, type_.element_type);
             },
             .columns => |v| blk: {
                 const definition = v.definitions[column];
-                const value = try v.page.typedCell(a, index, definition.name, definition.element_type == .numeric);
+                const value = try v.page.typedCellControlled(a, index, definition.name, definition.element_type == .numeric, control);
                 break :blk try @import("describe.zig").coerceDatum(a, value, definition.type, definition.element_type);
             },
         };
     }
     pub fn row(self: Batch, a: A, index: usize) ![]const scalar.Datum {
+        return self.rowControlled(a, index, null);
+    }
+    pub fn rowControlled(self: Batch, a: A, index: usize, control: ?Work.Control) ![]const scalar.Datum {
+        try Work.poll(control);
         if (index >= self.len()) return error.InvalidSqlBackendResponse;
         if (self == .rows) return self.rows[index];
         const values = try a.alloc(scalar.Datum, self.width());
-        for (values, 0..) |*value, column| value.* = try self.cell(a, index, column);
+        for (values, 0..) |*value, column| value.* = try self.cellControlled(a, index, column, control);
         return values;
     }
 };

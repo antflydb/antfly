@@ -806,6 +806,9 @@
       "Maintained Antfly Zig port; see PORTING.md and SOURCE_NOTICES.md."
     ]
   },
+  "zig/pkg/antfly-embedded/src/sql/float_parse/LICENSE": {
+    "file": "LICENSES/third-party/Zig-SHA256-MIT.txt"
+  },
   "zig/pkg/inference/src/ops/cuda/video_headers/dynlink_cuda.h": {
     "file": "LICENSES/third-party/NV-Codec-CUDA-MIT.txt"
   },

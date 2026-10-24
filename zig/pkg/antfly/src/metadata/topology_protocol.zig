@@ -74,7 +74,7 @@ const std = @import("std");
 /// Version 39 decodes native per-record resolver authority and its atomic heads.
 /// Version 40 carries compact physical namespace bindings and projection reads.
 /// Version 41 carries shared content-addressed namespace execution attachments.
-pub const current_version: u16 = 42;
+pub const current_version: u16 = 43;
 pub const resolver_records_version: u16 = 42;
 pub const native_service_tables_version: u16 = 38;
 pub const resolver_namespaces_version: u16 = 37;
@@ -87,6 +87,8 @@ pub fn usesResolverNamespaces(indexes_json: []const u8) bool {
     return std.mem.indexOf(u8, indexes_json, "_resolver_namespaces") != null or std.mem.indexOf(u8, indexes_json, "namespace_owned") != null or std.mem.indexOf(u8, indexes_json, "resolvers") != null or std.mem.indexOf(u8, indexes_json, "_resolver_curation") != null or std.mem.indexOf(u8, indexes_json, "_curation_proposals") != null;
 }
 
+/// Version 43 persists permanent, root-signed remote journal initialization.
+pub const remote_attempt_initialization_version: u16 = 43;
 pub const relation_mutation_version: u16 = 33;
 pub const relation_publication_version: u16 = 32;
 pub const relation_reconciliation_version: u16 = 31;
@@ -270,3 +272,8 @@ pub const store_report_baseline_version: u16 = 10;
 
 /// Atomic, bounded acknowledgements for local schema migration readiness.
 pub const schema_progress_batch_version: u16 = 10;
+
+test "remote initialization merged epoch follows native resolver epochs" {
+    try std.testing.expect(remote_attempt_initialization_version > resolver_records_version);
+    try std.testing.expect(current_version >= remote_attempt_initialization_version);
+}

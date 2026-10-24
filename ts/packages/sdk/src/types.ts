@@ -5,6 +5,7 @@
 
 import type { components, operations } from "./public-api.js";
 import type { components as QueryComponents } from "./query.js";
+import type { RequestAdmission, RequestAdmissionOptions } from "./request-admission.js";
 
 // Antfly Query type for type-safe query construction
 export type AntflyQuery = QueryComponents["schemas"]["Query"];
@@ -546,6 +547,8 @@ export type AntflyAuth =
 
 // Configuration types for the client
 export interface AntflyConfig {
+  /** Bounded local admission; pass an owner to share capacity across clients. */
+  requestAdmission?: RequestAdmission | RequestAdmissionOptions;
   baseUrl: string;
   headers?: Record<string, string>;
   auth?: AntflyAuth;
@@ -647,7 +650,7 @@ export interface RunResearchJobOptions {
   maxPhasesPerAdvance?: number;
   /** Called with the latest job snapshot after start and after every advance or poll. */
   onJob?: (job: ResearchJob) => void;
-  /** Aborts the polling loop. Does not cancel the durable job itself. */
+  /** Aborts queued/in-flight calls and polling waits. Does not cancel the durable job itself. */
   signal?: AbortSignal;
 }
 

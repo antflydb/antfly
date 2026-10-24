@@ -1,0 +1,57 @@
+{
+  "version": 1,
+  "name": "linux-container-authenticated-large",
+  "http_connections": 64,
+  "pgwire_connections": 64,
+  "samples": 5,
+  "sample_interval_seconds": 0.2,
+  "recovery_seconds": 3,
+  "thresholds": {
+    "idle_rss_growth_bytes": 268435456,
+    "idle_thread_growth": 256,
+    "idle_fd_growth": 144,
+    "control_latency_seconds": 2,
+    "recovery_fd_growth": 8,
+    "recovery_rss_growth_bytes": 268435456
+  },
+  "pgwire_mode": "authenticated",
+  "held_cursors": 32,
+  "fixture_rows": 129,
+  "process_limits": {
+    "cpu_count": 4,
+    "max_fds": 1024
+  },
+  "container_limits": {
+    "cpu_count": 4,
+    "memory_bytes": 4294967296,
+    "pids": 768
+  },
+  "configuration": {
+    "pgwire": {
+      "max_connections": 64
+    },
+    "admission": {
+      "query": {
+        "max_concurrent_requests": 4
+      },
+      "write": {
+        "max_concurrent_requests": 2
+      }
+    }
+  },
+  "candidate_configuration": {
+    "admission": {
+      "max_request_memory_bytes": 67108864,
+      "max_retained_memory_bytes": 67108864,
+      "query": {
+        "max_concurrent_requests": 4,
+        "waiting": {
+          "max_queued_requests": 4,
+          "max_queued_bytes": 1048576,
+          "max_wait_ms": 250
+        }
+      }
+    }
+  },
+  "extended_portals": 2
+}

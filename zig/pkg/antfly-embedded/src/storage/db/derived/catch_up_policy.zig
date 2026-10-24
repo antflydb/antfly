@@ -77,6 +77,8 @@ pub const RecoverableRetryCounters = struct {
         switch (err) {
             error.WriterLocked, error.WouldBlock, error.FileBusy => _ = self.writer_locked.fetchAdd(1, .monotonic),
             error.ResourceBudgetExceeded,
+            error.SchedulerFull,
+            error.ResourceTemporarilyUnavailable,
             error.PostingWalTooLarge,
             error.PostingRowBackpressure,
             error.PersistentDescriptorAdmissionExhausted,
@@ -112,6 +114,8 @@ pub fn isRecoverableAdmissionError(err: anyerror) bool {
         error.WouldBlock,
         error.FileBusy,
         error.ResourceBudgetExceeded,
+        error.SchedulerFull,
+        error.ResourceTemporarilyUnavailable,
         error.PostingWalTooLarge,
         error.PostingRowBackpressure,
         error.PersistentDescriptorAdmissionExhausted,

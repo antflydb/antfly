@@ -1057,9 +1057,16 @@ def test_metadata_quorum_leader_discovery_requires_self_confirmation() -> None:
 class ThreeByThreeBackupCluster:
     # Use the executable's production Raft/control cadence. A 5 ms Raft tick
     # makes real disk sync latency exceed the election budget on CI storage.
-    def __init__(self, binary: str, *, online_merge_enabled: bool | None = None):
+    def __init__(
+        self,
+        binary: str,
+        *,
+        online_merge_enabled: bool | None = None,
+        data_auth_enabled: bool = False,
+    ):
         self.binary = binary
         self.online_merge_enabled = online_merge_enabled
+        self.data_auth_enabled = data_auth_enabled
         self.host = "127.0.0.1"
         self.table_ids: dict[str, int] = {}
         with ExitStack() as setup:
@@ -1087,7 +1094,13 @@ class ThreeByThreeBackupCluster:
             self.data_raft_ports = list(self.port_reservations.reserve_many(3))
             self.data_urls = [f"http://{self.host}:{port}" for port in self.data_ports]
             self.data_api_urls = [
-                antfly_public_api_url(url, binary=binary) for url in self.data_urls
+                antfly_public_api_url(
+                    f"http://admin:{AUTH_BOOTSTRAP_PASSWORD}@{self.host}:{port}"
+                    if data_auth_enabled
+                    else url,
+                    binary=binary,
+                )
+                for url, port in zip(self.data_urls, self.data_ports, strict=True)
             ]
 
             self.config_path = self.root / "antfly-metadata-cluster.json"
@@ -1230,6 +1243,8 @@ class ThreeByThreeBackupCluster:
         ]
         for url in self.metadata_admin_urls:
             command.extend(["--metadata-api", url])
+        if self.data_auth_enabled:
+            command.extend(["--auth", "true"])
         return command
 
     def _start(self) -> None:
@@ -1289,6 +1304,14 @@ class ThreeByThreeBackupCluster:
                 lambda command=data_command, log_file=self.data_log_files[i]: (
                     subprocess.Popen(
                         debuggable_command(command),
+                        env=(
+                            {
+                                **os.environ,
+                                "ANTFLY_BOOTSTRAP_ADMIN_PASSWORD": AUTH_BOOTSTRAP_PASSWORD,
+                            }
+                            if self.data_auth_enabled
+                            else None
+                        ),
                         stdout=log_file,
                         stderr=subprocess.STDOUT,
                         cwd=REPO_ROOT,
@@ -1591,6 +1614,14 @@ class ThreeByThreeBackupCluster:
             ports,
             lambda: subprocess.Popen(
                 debuggable_command(command),
+                env=(
+                    {
+                        **os.environ,
+                        "ANTFLY_BOOTSTRAP_ADMIN_PASSWORD": AUTH_BOOTSTRAP_PASSWORD,
+                    }
+                    if not metadata and self.data_auth_enabled
+                    else None
+                ),
                 stdout=log,
                 stderr=subprocess.STDOUT,
                 cwd=REPO_ROOT,
@@ -1816,9 +1847,13 @@ def three_by_three_backup_cluster(
     if not resolved.exists():
         pytest.skip(f"antfly binary not built: {resolved}")
 
-    cluster = ThreeByThreeBackupCluster(
-        str(resolved), online_merge_enabled=getattr(request, "param", None)
+    parameters = getattr(request, "param", None)
+    options = (
+        parameters
+        if isinstance(parameters, dict)
+        else {"online_merge_enabled": parameters}
     )
+    cluster = ThreeByThreeBackupCluster(str(resolved), **options)
     try:
         yield cluster
     finally:

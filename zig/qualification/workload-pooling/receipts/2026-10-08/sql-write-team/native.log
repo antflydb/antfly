@@ -1,0 +1,6 @@
+Build Summary: 4/4 steps succeeded; 4/4 tests passed
+antfly-sql-write-team-test success
++- run test sql-write-team-tests 4 pass (4 total) 102ms MaxRSS:2M
+   +- compile test sql-write-team-tests safe native success 6s MaxRSS:803M
+      +- WriteFile macos-sdk-libc.txt cached
+

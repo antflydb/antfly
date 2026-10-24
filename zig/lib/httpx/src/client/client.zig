@@ -91,7 +91,14 @@ fn parsedResponseReusable(parser: *const Parser, req_method: types.Method) bool 
 }
 
 /// HTTP client configuration.
+pub const OutboundAdmission = @import("admission.zig").Admission;
+pub const OutboundAdmissionConfig = @import("admission.zig").Config;
+
 pub const ClientConfig = struct {
+    /// One operation envelope across TCP, TLS, H2 and streaming attempts.
+    outbound: OutboundAdmissionConfig = .{},
+    /// Optional service-owned envelope shared by multiple clients. Must outlive joined requests.
+    outbound_admission: ?*OutboundAdmission = null,
     attempt_observer: ?AttemptObserver = null,
     base_url: ?[]const u8 = null,
     timeouts: types.Timeouts = .{},
@@ -123,6 +130,7 @@ pub const ClientConfig = struct {
     keep_alive: bool = true,
     pool_max_connections: u32 = 20,
     pool_max_per_host: u32 = 5,
+    pool_max_requests_per_connection: u32 = 1000,
     max_cookies: usize = 1000,
     /// Disable cookie persistence for credentialed or policy-constrained
     /// transports where ambient state must not cross requests.
@@ -144,9 +152,13 @@ pub const ClientConfig = struct {
     /// Send a PING health check after this many ms of no frames received on
     /// an H2 connection. 0 = disabled. Similar to Go's http2.Transport.ReadIdleTimeout.
     h2_read_idle_timeout_ms: u64 = 30_000,
-    /// How long to wait for a PING ACK before declaring the connection dead (ms).
+    /// One timeout across the PING write lock, wire output and ACK (ms).
     /// Similar to Go's http2.Transport.PingTimeout. Only used when read_idle_timeout > 0.
     h2_ping_timeout_ms: u64 = 15_000,
+    /// Finite transport envelope captured by each H2 connection before it is
+    /// published. Cleanup activation starts one deadline across lock and wire
+    /// output; this does not supply scheduler CPU/cleanup authority.
+    h2_cleanup_timeout_ms: u32 = 1_000,
 };
 
 /// Per-request options.
@@ -183,6 +195,11 @@ pub const RequestOptions = struct {
     /// Borrowed transport-neutral cancellation source. It must remain valid
     /// until the request method returns.
     cancellation: ?CancellationToken = null,
+    /// Borrowed by the request until all transport tasks physically join.
+    /// Applies to HTTP/1 socket reads/writes (including TLS) and buffered H2
+    /// completion waits. Parsing and body decoding retain CPU; shared H2
+    /// readers never borrow a stream's grant.
+    socket_control: ?socket_mod.WriteControl = null,
 };
 
 const RequestHeadSerializer = struct {
@@ -509,7 +526,8 @@ const RequestInterrupt = struct {
 
     fn cancelH2Locked(_: *RequestInterrupt, entry: *H2PoolEntry, stream_id: u31, io: Io) void {
         const h2 = &entry.h2;
-        h2.write_mutex.lockUncancelable(io);
+        var budget = H2ConnectionBudget.init(io, entry.cleanup_timeout_ms);
+        const can_reset = budget.lock(entry);
         const stream = h2.stream_manager.getStream(stream_id) orelse {
             h2.write_mutex.unlock(io);
             return;
@@ -523,13 +541,9 @@ const RequestInterrupt = struct {
         stream.stream_error = error.Cancelled;
         stream.completed = true;
         stream.reset();
-        if (entry.is_tls) {
-            if (entry.session.getWriter()) |writer|
-                h2.sendRstStream(writer, stream_id, .cancel) catch {}
-            else |_| {}
-        } else {
-            h2.sendRstStream(&entry.socket, stream_id, .cancel) catch {};
-        }
+        if (can_reset) budget.resetLocked(entry, stream_id) catch {
+            H2ConnectionBudget.retire(entry, io);
+        };
         // Posting while still holding write_mutex is paired with waiter
         // teardown below: a woken owner must acquire this mutex to unregister
         // its pointer before destroying it, so no producer can retain a raw
@@ -539,7 +553,7 @@ const RequestInterrupt = struct {
         h2.write_mutex.unlock(io);
 
         // A body blocked on flow control can now observe stream_error.
-        h2.send_window_event.set(io);
+        h2.notifySendCredit(io);
         if (!entry.recv_running) entry.socket.setRecvTimeout(1) catch {};
     }
 
@@ -568,6 +582,18 @@ fn requestDeadlineMs(io: Io, timeout_ms: u64) ?i64 {
     if (timeout_ms == 0) return null;
     const bounded_timeout = std.math.cast(i64, timeout_ms) orelse std.math.maxInt(i64);
     return common.milliTimestamp(io) +| bounded_timeout;
+}
+
+/// Capture one absolute envelope before dispatch. A borrowed original budget
+/// can tighten configuration, including unlimited configuration, but cannot
+/// be renewed by reconnects, redirects, or resumed transport operations.
+fn requestDeadlineForControl(io: Io, configured_ms: u64, control: ?socket_mod.WriteControl) !?i64 {
+    const started_ms = common.milliTimestamp(io);
+    const configured = if (configured_ms == 0) null else started_ms +| (std.math.cast(i64, configured_ms) orelse std.math.maxInt(i64));
+    const original = control orelse return configured;
+    const remaining_ms = (try original.timeout(null)) orelse return configured;
+    const deadline = started_ms +| (std.math.cast(i64, remaining_ms) orelse std.math.maxInt(i64));
+    return if (configured) |limit| @min(limit, deadline) else deadline;
 }
 
 fn ensureRequestDeadline(io: Io, deadline_ms: ?i64) !void {
@@ -714,6 +740,7 @@ const H2PoolEntry = struct {
     /// Existing request leases keep it alive until they release.
     retired: bool = false,
     active_requests: u32 = 0,
+    owns_socket_slot: bool = false,
     /// Owned map key retained after retirement so the final lease can free it.
     retired_key: ?[]const u8 = null,
     /// Tracks the background receive-loop fiber (if spawned).
@@ -728,14 +755,66 @@ const H2PoolEntry = struct {
     /// Client config for timeout values (set during creation).
     read_idle_timeout_ms: u64 = 0,
     ping_timeout_ms: u64 = 15_000,
+    cleanup_timeout_ms: u32 = 1_000,
     io: Io = undefined,
+};
+
+const H2ConnectionBudget = struct {
+    io: Io,
+    deadline_ns: i128,
+
+    fn init(io: Io, ms: u64) H2ConnectionBudget {
+        return .{ .io = io, .deadline_ns = Io.Clock.awake.now(io).nanoseconds + @as(i128, ms) * std.time.ns_per_ms };
+    }
+    fn remaining(raw: ?*anyopaque) socket_mod.WriteControl.Error!?u64 {
+        const self: *@This() = @ptrCast(@alignCast(raw.?));
+        const ns = self.deadline_ns - Io.Clock.awake.now(self.io).nanoseconds;
+        if (ns <= 0) return error.Timeout;
+        return @intCast(@divTrunc(ns + std.time.ns_per_ms - 1, std.time.ns_per_ms));
+    }
+    fn control(self: *@This()) socket_mod.WriteControl {
+        return .{ .ptr = self, .remaining_ms_fn = remaining };
+    }
+    fn retire(entry: *H2PoolEntry, io: Io) void {
+        entry.broken = true;
+        entry.socket.shutdown();
+        entry.h2.notifySendCredit(io);
+    }
+    fn lock(self: *@This(), entry: *H2PoolEntry) bool {
+        self.control().lock(&entry.h2.write_mutex, self.io) catch {
+            // Wake a blocked connection writer before waiting for its physical
+            // lock handoff. Keep the descriptor owned until worker joining.
+            retire(entry, self.io);
+            entry.h2.write_mutex.lockUncancelable(self.io);
+            return false;
+        };
+        return true;
+    }
+    fn resetLocked(self: *@This(), entry: *H2PoolEntry, stream_id: u31) !void {
+        const control_value = self.control();
+        if (entry.is_tls) {
+            const net_out = if (entry.session.net_out) |*writer| writer else return error.NotConnected;
+            // All H2 writers hold write_mutex. Do not install callbacks on
+            // the shared TLS reader or retain this stack budget in the entry.
+            const previous = net_out.control;
+            net_out.control = control_value;
+            defer net_out.control = previous;
+            net_out.last_write_error = null;
+            const writer = try entry.session.getWriter();
+            try entry.h2.sendRstStream(writer, stream_id, .cancel);
+            try entry.session.flush();
+        } else {
+            var writer = socket_mod.ControlledWriter{ .socket = &entry.socket, .control = control_value };
+            try entry.h2.sendRstStream(&writer, stream_id, .cancel);
+        }
+    }
 };
 
 const TlsSessionIoReader = struct {
     inner: *TlsSession,
     max_read: usize,
     reader_iface: Io.Reader,
-    read_error: ?TlsSession.ReadError = null,
+    read_error: ?anyerror = null,
     const max_empty_reads: usize = 5000;
 
     fn init(inner: *TlsSession, max_read: usize, buffer: []u8) TlsSessionIoReader {
@@ -755,7 +834,7 @@ const TlsSessionIoReader = struct {
         return @fieldParentPtr("reader_iface", r);
     }
 
-    fn checkReadError(self: *const TlsSessionIoReader) TlsSession.ReadError!void {
+    fn checkReadError(self: *const TlsSessionIoReader) !void {
         if (self.read_error) |err| return err;
     }
 
@@ -771,7 +850,7 @@ const TlsSessionIoReader = struct {
 
         while (true) {
             p.read_error = null;
-            const n = p.inner.read(read_buf) catch |err| {
+            const n = p.inner.readControlled(read_buf) catch |err| {
                 p.read_error = err;
                 return error.ReadFailed;
             };
@@ -945,9 +1024,15 @@ pub const Client = struct {
     /// Protects h2_conns from concurrent fiber access during connection
     /// creation (getOrCreateH2Conn yields on DNS, connect, TLS handshake).
     h2_mutex: Io.Mutex = Io.Mutex.init,
+    h2_opening: std.StringHashMapUnmanaged(void) = .empty,
+    h2_changed: Io.Condition = .init,
+    h2_changed_generation: u64 = 0,
+    h2_waiting: usize = 0,
     resolved_addresses: std.StringHashMapUnmanaged(Address) = .{},
     resolved_addresses_mutex: Io.Mutex = Io.Mutex.init,
     request_gate: RequestGate = .{},
+    outbound: OutboundAdmission,
+    connection_slots: @import("pool.zig").ConnectionSlots,
 
     const Self = @This();
 
@@ -975,11 +1060,14 @@ pub const Client = struct {
         const pool_cfg = @import("pool.zig").PoolConfig{
             .max_connections = config.pool_max_connections,
             .max_per_host = config.pool_max_per_host,
+            .max_requests_per_connection = if (config.pool_max_requests_per_connection == 0) std.math.maxInt(u32) else config.pool_max_requests_per_connection,
         };
         return .{
             .allocator = allocator,
             .io = io,
             .config = config,
+            .outbound = OutboundAdmission.init(allocator, io, config.outbound),
+            .connection_slots = .{ .limit = config.pool_max_connections },
             .pool = ConnectionPool.initWithConfig(allocator, io, pool_cfg, {}),
             .tls_pool = TlsPool.initWithConfig(allocator, io, pool_cfg, .{
                 .verify_ssl = config.verify_ssl,
@@ -1004,6 +1092,7 @@ pub const Client = struct {
             self.allocator.free(entry.value_ptr.*);
         }
         self.cookies.deinit(self.allocator);
+        self.outbound.deinit();
         self.pool.deinit();
         self.tls_pool.deinit();
         var address_it = self.resolved_addresses.iterator();
@@ -1025,10 +1114,14 @@ pub const Client = struct {
             e.ping_group.await(self.io) catch {};
             e.h2.deinit();
             e.session.deinit();
+            if (e.owns_socket_slot) self.connection_slots.release();
             self.allocator.destroy(e);
             self.allocator.free(entry.key_ptr.*);
         }
         self.h2_conns.deinit(self.allocator);
+        std.debug.assert(self.h2_opening.count() == 0 and self.h2_waiting == 0);
+        self.h2_opening.deinit(self.allocator);
+        std.debug.assert(self.connection_slots.used.load(.acquire) == 0);
     }
 
     /// Closes request admission and waits until all admitted requests return.
@@ -1043,6 +1136,9 @@ pub const Client = struct {
     /// avoiding dependency cycles between nested HTTP requests.
     pub fn beginShutdown(self: *Self) void {
         self.request_gate.close(self.io);
+        self.outbound.close();
+        self.pool.close();
+        self.tls_pool.close();
     }
 
     /// Wait for all request leases after shutdown has been published.
@@ -1064,7 +1160,7 @@ pub const Client = struct {
 
     /// Makes an HTTP request.
     pub fn request(self: *Self, method: types.Method, url: []const u8, reqOpts: RequestOptions) !Response {
-        const deadline_ms = requestDeadlineMs(self.io, reqOpts.timeout_ms orelse self.config.timeouts.request_ms);
+        const deadline_ms = try requestDeadlineForControl(self.io, reqOpts.timeout_ms orelse self.config.timeouts.request_ms, reqOpts.socket_control);
         var lease = try self.request_gate.tryAcquire(self.io);
         defer lease.deinit();
         if (!self.config.cancel_in_flight_on_shutdown) return self.requestInternal(method, url, reqOpts, 0, deadline_ms);
@@ -1086,7 +1182,7 @@ pub const Client = struct {
         progress_cb: ?WriterProgressCallback,
         progress_ctx: ?*anyopaque,
     ) !Response {
-        const deadline_ms = requestDeadlineMs(self.io, reqOpts.timeout_ms orelse self.config.timeouts.request_ms);
+        const deadline_ms = try requestDeadlineForControl(self.io, reqOpts.timeout_ms orelse self.config.timeouts.request_ms, reqOpts.socket_control);
         var lease = try self.request_gate.tryAcquire(self.io);
         defer lease.deinit();
         if (!self.config.cancel_in_flight_on_shutdown) return self.requestToWriterInternal(method, url, reqOpts, writer, progress_cb, progress_ctx, 0, deadline_ms);
@@ -1123,6 +1219,7 @@ pub const Client = struct {
         req.max_retries = reqOpts.max_retries;
         req.attempt_observer = reqOpts.attempt_observer orelse self.config.attempt_observer;
         req.delivery_observer = reqOpts.delivery_observer;
+        req.socket_control = reqOpts.socket_control;
 
         try req.headers.set(HeaderName.USER_AGENT, self.config.user_agent);
 
@@ -1247,6 +1344,7 @@ pub const Client = struct {
         req.max_retries = reqOpts.max_retries;
         req.attempt_observer = reqOpts.attempt_observer orelse self.config.attempt_observer;
         req.delivery_observer = reqOpts.delivery_observer;
+        req.socket_control = reqOpts.socket_control;
 
         try req.headers.set(HeaderName.USER_AGENT, self.config.user_agent);
 
@@ -1766,7 +1864,7 @@ pub const Client = struct {
         socket.setRequestDeadline(null);
     }
 
-    fn connectHost(self: *Self, host: []const u8, port: u16, deadline_ms: ?i64) !Socket {
+    fn connectHost(self: *Self, host: []const u8, port: u16, deadline_ms: ?i64, control: ?socket_mod.WriteControl) !Socket {
         const timeout_ms = self.config.timeouts.connect_ms;
         // The whole-request task already owns cancellation of DNS/connect.
         // When its deadline is tighter, a nested connect task/watchdog adds
@@ -1775,9 +1873,9 @@ pub const Client = struct {
             try ensureRequestDeadline(self.io, deadline);
             const remaining_ms: u64 = @intCast(@max(0, deadline - common.milliTimestamp(self.io)));
             if (timeout_ms == 0 or remaining_ms <= timeout_ms)
-                return self.connectHostDirect(host, port);
+                return self.connectHostDirect(host, port, control);
         }
-        if (timeout_ms == 0) return self.connectHostDirect(host, port);
+        if (timeout_ms == 0) return self.connectHostDirect(host, port, control);
 
         const ConnectResult = anyerror!Socket;
         const SelectResult = union(enum) {
@@ -1785,8 +1883,8 @@ pub const Client = struct {
             watchdog: anyerror!RequestWatchdogOutcome,
         };
         const Task = struct {
-            fn connectTask(client: *Self, target_host: []const u8, target_port: u16) ConnectResult {
-                return client.connectHostDirect(target_host, target_port);
+            fn connectTask(client: *Self, target_host: []const u8, target_port: u16, original: ?socket_mod.WriteControl) ConnectResult {
+                return client.connectHostDirect(target_host, target_port, original);
             }
 
             fn watchdogTask(io: Io, stop: *const std.atomic.Value(u32), deadline: ?i64) anyerror!RequestWatchdogOutcome {
@@ -1810,7 +1908,7 @@ pub const Client = struct {
         const connect_deadline_ms = requestDeadlineMs(self.io, timeout_ms);
         var admission = TaskAdmission.init(self.io, connect_deadline_ms, null);
         try admission.concurrent(&select, .watchdog, Task.watchdogTask, .{ self.io, &watchdog_stop, connect_deadline_ms });
-        admission.concurrent(&select, .connect, Task.connectTask, .{ self, host, port }) catch |err| {
+        admission.concurrent(&select, .connect, Task.connectTask, .{ self, host, port, control }) catch |err| {
             stopRequestWatchdog(self.io, &watchdog_stop, null);
             while (select.cancel()) |late| Task.drainLateResult(late);
             return err;
@@ -1834,33 +1932,36 @@ pub const Client = struct {
         }
     }
 
-    fn connectHostDirect(self: *Self, host: []const u8, port: u16) !Socket {
-        var socket = try self.connectHostAddress(host, port);
-        // HTTP headers and bodies may be separate writes. Nagle plus delayed
-        // ACK otherwise adds a timer per request on persistent H1 sockets.
-        // Match H2's existing low-latency policy, including direct/TLS paths.
+    fn connectHostDirect(self: *Self, host: []const u8, port: u16, original: ?socket_mod.WriteControl) !Socket {
+        var socket = try self.connectHostAddress(host, port, original);
+        // Preserve H1 low latency for direct and TLS connections too.
         socket.setNoDelay(true) catch {};
         return socket;
     }
-    fn connectHostAddress(self: *Self, host: []const u8, port: u16) !Socket {
+
+    fn connectHostAddress(self: *Self, host: []const u8, port: u16, original: ?socket_mod.WriteControl) !Socket {
+        const control = original orelse socket_mod.WriteControl{};
+        var rejected = false;
+        try control.check();
         if (self.config.address_filter != null) {
-            const address = try resolveAddressFiltered(self.io, host, port, self.config.address_filter);
-            return try Socket.connect(address, self.io);
+            const address = try socket_mod.resolveAddressFilteredControlled(self.io, host, port, self.config.address_filter, control);
+            return try Socket.connectControlled(address, self.io, control, &rejected);
         }
         if (!self.config.cache_resolved_addresses) {
-            return try Socket.connectHost(host, port, self.io);
+            return (try Socket.connectHostResolvedControlled(host, port, self.io, control, &rejected)).socket;
         }
 
         var key_buffer: [HostName.max_len + 8]u8 = undefined;
         const key = std.fmt.bufPrint(&key_buffer, "{s}:{d}", .{ host, port }) catch
             return error.InvalidHostName;
         if (self.cachedResolvedAddress(key)) |address| {
-            if (Socket.connect(address, self.io)) |socket| return socket else |_| {
+            if (Socket.connectControlled(address, self.io, control, &rejected)) |socket| return socket else |err| {
+                if (rejected) return err;
                 self.removeCachedResolvedAddress(key);
             }
         }
 
-        const connected = try Socket.connectHostResolved(host, port, self.io);
+        const connected = try Socket.connectHostResolvedControlled(host, port, self.io, control, &rejected);
         self.cacheResolvedAddress(key, connected.address) catch {};
         return connected.socket;
     }
@@ -1960,6 +2061,43 @@ pub const Client = struct {
         return response;
     }
 
+    fn outboundRetainedBytes(req: *const Request) usize {
+        var bytes = @sizeOf(Request) +| @sizeOf(RequestInterrupt) +| req.uri.raw.len;
+        bytes +|= if (req.body_allocation) |allocation| allocation.len else req.bodyLen();
+        bytes +|= req.headers.entries.capacity *| @sizeOf(@TypeOf(req.headers.entries.items[0]));
+        for (req.headers.iterator()) |header| bytes +|= header.name.len +| header.value.len;
+        if (req.body_segments) |segments| bytes +|= segments.len *| @sizeOf([]const u8);
+        if (req.uri.query) |query| bytes +|= query.len;
+        return bytes;
+    }
+
+    fn acquireOutbound(self: *Self, req: *Request, deadline_ms: ?i64, interrupt: *RequestInterrupt) !OutboundAdmission.Lease {
+        const Context = struct {
+            client: *Self,
+            interrupt: *RequestInterrupt,
+            fn cancelled(raw: *const anyopaque) bool {
+                const context: *const @This() = @ptrCast(@alignCast(raw));
+                return context.client.request_gate.isClosed() or context.interrupt.isCancellationRequested();
+            }
+        };
+        const context: Context = .{ .client = self, .interrupt = interrupt };
+        self.pool.bindSlots(&self.connection_slots);
+        self.tls_pool.bindSlots(&self.connection_slots);
+        // Idle sockets from the other transport must not monopolize the shared envelope.
+        if (self.connection_slots.used.load(.acquire) >= self.connection_slots.limit) {
+            if (req.uri.isTls()) self.pool.retireIdle() else self.tls_pool.retireIdle();
+            if (!shouldUseHttp2(self.config)) self.retireUnusedH2(false);
+        }
+        const owner = self.config.outbound_admission orelse &self.outbound;
+        return owner.acquire(req.uri.host orelse return error.InvalidUri, req.uri.effectivePort(), .{
+            .deadline_ms = deadline_ms,
+            .retained_bytes = outboundRetainedBytes(req),
+            .execution_wait = req.socket_control,
+            .context = &context,
+            .cancelled = Context.cancelled,
+        });
+    }
+
     fn attemptCancelled(ptr: *const anyopaque) bool {
         const interrupt: *const RequestInterrupt = @ptrCast(@alignCast(ptr));
         return @constCast(interrupt).isCancellationRequested();
@@ -1968,6 +2106,8 @@ pub const Client = struct {
     fn executeRequestOnceUnobserved(self: *Self, req: *Request, timeout_override_ms: ?u64, deadline_ms: ?i64, interrupt: *RequestInterrupt) !Response {
         try ensureRequestDeadline(self.io, deadline_ms);
         const host = req.uri.host orelse return error.InvalidUri;
+        var outbound_lease = try self.acquireOutbound(req, deadline_ms, interrupt);
+        defer outbound_lease.release();
         const port = req.uri.effectivePort();
         // Use request_ms as a fallback ceiling for socket timeouts when the
         // specific read/write timeouts are not set via per-request override.
@@ -1984,15 +2124,16 @@ pub const Client = struct {
         // Reuses a pooled connection per host when available.
         if (shouldUseHttp2(self.config)) {
             const is_tls = req.uri.isTls();
-            var lease = try self.getOrCreateH2Conn(host, port, is_tls);
+            var lease = try self.getOrCreateH2Conn(host, port, is_tls, deadline_ms, interrupt, req.socket_control);
             defer lease.release();
             const entry = lease.entry;
-            const result = self.executeH2OnPooled(entry, req, interrupt) catch |err| {
+            var wait_rejected = false;
+            const result = self.executeH2OnPooled(entry, req, interrupt, &wait_rejected) catch |err| {
                 // Only mark the connection broken for transport/framing errors.
                 // Stream-level errors (MaxConcurrentStreamsExceeded, ContentLengthMismatch,
                 // StreamDataOverflow) don't indicate a bad connection — other streams
                 // may still be healthy.
-                switch (err) {
+                if (!wait_rejected) switch (err) {
                     // A caller cancellation only reset its own stream. The
                     // shared H2 connection remains usable by other requests.
                     error.Cancelled,
@@ -2001,7 +2142,7 @@ pub const Client = struct {
                     error.StreamDataOverflow,
                     => {},
                     else => entry.broken = true,
-                }
+                };
                 return normalizeH2ResponseError(err);
             };
             // Mark broken if peer sent GOAWAY — next request gets a fresh connection.
@@ -2009,9 +2150,12 @@ pub const Client = struct {
             return result;
         }
 
+        const direct_socket = !self.config.keep_alive or self.config.address_filter != null;
+        if (direct_socket and !self.connection_slots.acquire()) return error.PoolExhausted;
+        defer if (direct_socket) self.connection_slots.release();
         if (req.uri.isTls()) {
             if (self.config.keep_alive and self.config.address_filter == null) {
-                var tls_conn = try acquirePooledConnection(TlsConnection, &self.tls_pool, self.io, host, port, deadline_ms, interrupt);
+                var tls_conn = try self.tls_pool.getConnectionWait(host, port, .{ .deadline_ms = deadline_ms, .execution_wait = req.socket_control, .context = interrupt, .cancelled = attemptCancelled }, self.config.outbound.max_waiters, self.config.outbound.max_wait_ms);
                 var ok = false;
                 defer {
                     if (ok) self.tls_pool.releaseConnection(tls_conn) else self.tls_pool.evictConnection(tls_conn);
@@ -2025,7 +2169,7 @@ pub const Client = struct {
             }
 
             // Non-pooled TLS fallback (keep_alive disabled).
-            var socket = try self.connectHost(host, port, deadline_ms);
+            var socket = try self.connectHost(host, port, deadline_ms, req.socket_control);
             defer socket.close();
             try applyTimeouts(&socket, timeout_ms, write_timeout_ms, deadline_ms);
             try interrupt.publish(&socket, self.io);
@@ -2035,7 +2179,7 @@ pub const Client = struct {
         }
 
         if (self.config.keep_alive and self.config.address_filter == null) {
-            var conn = try acquirePooledConnection(@import("pool.zig").Connection, &self.pool, self.io, host, port, deadline_ms, interrupt);
+            var conn = try self.pool.getConnectionWait(host, port, .{ .deadline_ms = deadline_ms, .execution_wait = req.socket_control, .context = interrupt, .cancelled = attemptCancelled }, self.config.outbound.max_waiters, self.config.outbound.max_wait_ms);
             var ok = false;
             defer {
                 if (ok) self.pool.releaseConnection(conn) else self.pool.evictConnection(conn);
@@ -2048,7 +2192,7 @@ pub const Client = struct {
             return self.executeOnSocket(&conn.socket, req, &ok);
         }
 
-        var socket = try self.connectHost(host, port, deadline_ms);
+        var socket = try self.connectHost(host, port, deadline_ms, req.socket_control);
         defer socket.close();
         try applyTimeouts(&socket, timeout_ms, write_timeout_ms, deadline_ms);
         try interrupt.publish(&socket, self.io);
@@ -2093,6 +2237,7 @@ pub const Client = struct {
         progress_ctx: ?*anyopaque,
         interrupt: *RequestInterrupt,
     ) !Response {
+        try ensureRequestDeadline(self.io, deadline_ms);
         const host = req.uri.host orelse return error.InvalidUri;
         const port = req.uri.effectivePort();
         const timeout_ms = timeout_override_ms orelse blk: {
@@ -2112,9 +2257,14 @@ pub const Client = struct {
             return res;
         }
 
+        var outbound_lease = try self.acquireOutbound(req, deadline_ms, interrupt);
+        defer outbound_lease.release();
+        const direct_socket = !self.config.keep_alive or self.config.address_filter != null;
+        if (direct_socket and !self.connection_slots.acquire()) return error.PoolExhausted;
+        defer if (direct_socket) self.connection_slots.release();
         if (req.uri.isTls()) {
             if (self.config.keep_alive and self.config.address_filter == null) {
-                var tls_conn = try acquirePooledConnection(TlsConnection, &self.tls_pool, self.io, host, port, deadline_ms, interrupt);
+                var tls_conn = try self.tls_pool.getConnectionWait(host, port, .{ .deadline_ms = deadline_ms, .execution_wait = req.socket_control, .context = interrupt, .cancelled = attemptCancelled }, self.config.outbound.max_waiters, self.config.outbound.max_wait_ms);
                 var ok = false;
                 defer {
                     if (ok) self.tls_pool.releaseConnection(tls_conn) else self.tls_pool.evictConnection(tls_conn);
@@ -2127,7 +2277,7 @@ pub const Client = struct {
                 return self.executeOnTlsToWriter(&tls_conn.session, req, writer, progress_cb, progress_ctx, &ok);
             }
 
-            var socket = try self.connectHost(host, port, deadline_ms);
+            var socket = try self.connectHost(host, port, deadline_ms, req.socket_control);
             defer socket.close();
             try applyTimeouts(&socket, timeout_ms, write_timeout_ms, deadline_ms);
             try interrupt.publish(&socket, self.io);
@@ -2137,7 +2287,7 @@ pub const Client = struct {
         }
 
         if (self.config.keep_alive and self.config.address_filter == null) {
-            var conn = try acquirePooledConnection(@import("pool.zig").Connection, &self.pool, self.io, host, port, deadline_ms, interrupt);
+            var conn = try self.pool.getConnectionWait(host, port, .{ .deadline_ms = deadline_ms, .execution_wait = req.socket_control, .context = interrupt, .cancelled = attemptCancelled }, self.config.outbound.max_waiters, self.config.outbound.max_wait_ms);
             var ok = false;
             defer {
                 if (ok) self.pool.releaseConnection(conn) else self.pool.evictConnection(conn);
@@ -2150,7 +2300,7 @@ pub const Client = struct {
             return self.executeOnSocketToWriter(&conn.socket, req, writer, progress_cb, progress_ctx, &ok);
         }
 
-        var socket = try self.connectHost(host, port, deadline_ms);
+        var socket = try self.connectHost(host, port, deadline_ms, req.socket_control);
         defer socket.close();
         try applyTimeouts(&socket, timeout_ms, write_timeout_ms, deadline_ms);
         try interrupt.publish(&socket, self.io);
@@ -2165,6 +2315,15 @@ pub const Client = struct {
         const request_head = try serializeRequestHeadAlloc(self.allocator, req);
         defer self.allocator.free(request_head);
         req.notifySend();
+        if (req.socket_control) |control| {
+            var writer = socket_mod.ControlledWriter{ .socket = socket, .control = control };
+            try writer.writeAll(request_head);
+            try req.writeBody(&writer);
+            var source = ControlledSocketSource{ .socket = socket, .control = control };
+            const result = try self.readResponse(&source, req.method, self.responseSizeLimit(req));
+            if (keep_alive_out) |out| out.* = result.reusable;
+            return result.response;
+        }
         try socket.sendAll(request_head);
         try req.writeBody(socket);
         const result = try self.readResponse(socket, req.method, self.responseSizeLimit(req));
@@ -2186,6 +2345,15 @@ pub const Client = struct {
         const request_head = try serializeRequestHeadAlloc(self.allocator, req);
         defer self.allocator.free(request_head);
         req.notifySend();
+        if (req.socket_control) |control| {
+            var transport_writer = socket_mod.ControlledWriter{ .socket = socket, .control = control };
+            try transport_writer.writeAll(request_head);
+            try req.writeBody(&transport_writer);
+            var source = ControlledSocketSource{ .socket = socket, .control = control };
+            const result = try self.readResponseToWriter(&source, req.method, self.responseSizeLimit(req), writer, progress_cb, progress_ctx);
+            if (keep_alive_out) |out| out.* = result.reusable;
+            return result.response;
+        }
         try socket.sendAll(request_head);
         if (req.body_stream != null) return self.executeDuplex(socket, socket, req, writer, progress_cb, progress_ctx);
         try req.writeBody(socket);
@@ -2206,13 +2374,24 @@ pub const Client = struct {
     /// Sends request and reads response over an established TLS session.
     /// If `keep_alive_out` is non-null, sets it based on the response's keep-alive header.
     fn executeOnTls(self: *Self, session: *TlsSession, req: *Request, keep_alive_out: ?*bool) !Response {
+        var transport_scope = try session.controlTransport(req.socket_control);
+        defer transport_scope.deinit();
         const request_head = try serializeRequestHeadAlloc(self.allocator, req);
         defer self.allocator.free(request_head);
         const w = try session.getWriter();
         req.notifySend();
-        try w.writeAll(request_head);
-        try req.writeBody(w);
-        try session.flush();
+        w.writeAll(request_head) catch |err| {
+            try session.checkTransportError();
+            return err;
+        };
+        req.writeBody(w) catch |err| {
+            try session.checkTransportError();
+            return err;
+        };
+        session.flush() catch |err| {
+            try session.checkTransportError();
+            return err;
+        };
         const result = try self.readResponse(session, req.method, self.responseSizeLimit(req));
         if (keep_alive_out) |out| {
             out.* = result.reusable;
@@ -2229,17 +2408,31 @@ pub const Client = struct {
         progress_ctx: ?*anyopaque,
         keep_alive_out: ?*bool,
     ) !Response {
+        var transport_scope = try session.controlTransport(req.socket_control);
+        defer transport_scope.deinit();
         const request_head = try serializeRequestHeadAlloc(self.allocator, req);
         defer self.allocator.free(request_head);
         const w = try session.getWriter();
         req.notifySend();
-        try w.writeAll(request_head);
+        w.writeAll(request_head) catch |err| {
+            try session.checkTransportError();
+            return err;
+        };
         if (req.body_stream != null) {
-            try session.flush();
+            session.flush() catch |err| {
+                try session.checkTransportError();
+                return err;
+            };
             return self.executeDuplex(session, w, req, writer, progress_cb, progress_ctx);
         }
-        try req.writeBody(w);
-        try session.flush();
+        req.writeBody(w) catch |err| {
+            try session.checkTransportError();
+            return err;
+        };
+        session.flush() catch |err| {
+            try session.checkTransportError();
+            return err;
+        };
         const result = try self.readResponseToWriter(
             session,
             req.method,
@@ -2304,7 +2497,14 @@ pub const Client = struct {
         var session = TlsSession.init(tls_cfg, self.io);
         defer session.deinit();
         session.attachSocket(socket);
-        try session.handshake(host);
+        {
+            var transport_scope = try session.controlTransport(req.socket_control);
+            defer transport_scope.deinit();
+            session.handshake(host) catch |err| {
+                try session.checkTransportError();
+                return err;
+            };
+        }
         return self.executeOnTls(&session, req, null);
     }
 
@@ -2322,8 +2522,35 @@ pub const Client = struct {
         var session = TlsSession.init(tls_cfg, self.io);
         defer session.deinit();
         session.attachSocket(socket);
-        try session.handshake(host);
+        {
+            var transport_scope = try session.controlTransport(req.socket_control);
+            defer transport_scope.deinit();
+            session.handshake(host) catch |err| {
+                try session.checkTransportError();
+                return err;
+            };
+        }
         return self.executeOnTlsToWriter(&session, req, writer, progress_cb, progress_ctx, null);
+    }
+
+    fn retireUnusedH2(self: *Self, broken_only: bool) void {
+        while (true) {
+            self.h2_mutex.lockUncancelable(self.io);
+            var candidate: ?[]const u8 = null;
+            var it = self.h2_conns.iterator();
+            while (it.next()) |entry| {
+                if (entry.value_ptr.*.active_requests == 0 and (!broken_only or entry.value_ptr.*.broken or entry.value_ptr.*.h2.goaway_received)) {
+                    candidate = entry.key_ptr.*;
+                    break;
+                }
+            }
+            const removed = if (candidate) |key| self.h2_conns.fetchRemove(key) else null;
+            self.h2_mutex.unlock(self.io);
+            if (removed) |item| {
+                self.destroyH2Entry(item.value);
+                self.allocator.free(item.key);
+            } else return;
+        }
     }
 
     /// Gets or creates a pooled HTTP/2 connection for the given host:port.
@@ -2334,15 +2561,30 @@ pub const Client = struct {
     /// blocking I/O (DNS, TCP connect, TLS handshake, SETTINGS exchange).
     /// If two fibers race to create the same host:port, the loser discards
     /// its connection and uses the winner's.
-    fn getOrCreateH2Conn(self: *Self, host: []const u8, port: u16, is_tls: bool) !H2Lease {
+    fn getOrCreateH2Conn(self: *Self, host: []const u8, port: u16, is_tls: bool, deadline_ms: ?i64, interrupt: *RequestInterrupt, execution_wait: ?socket_mod.WriteControl) !H2Lease {
+        var setup_control = socket_mod.DeadlineControl{ .io = self.io, .deadline_ms = deadline_ms, .original = execution_wait orelse .{} };
+        const wait_options = @import("admission.zig").Options{ .execution_wait = setup_control.view() };
+        try wait_options.check();
         var key_buf: [280]u8 = undefined;
-        const key = std.fmt.bufPrint(&key_buf, "{s}:{d}", .{ host, port }) catch return error.InvalidUri;
+        const key = std.fmt.bufPrint(&key_buf, "{s}:{s}:{d}", .{ if (is_tls) "https" else "http", host, port }) catch return error.InvalidUri;
 
-        // --- Phase 1: Check map under lock ---
-        {
+        const wait_deadline = @min(deadline_ms orelse std.math.maxInt(i64), common.milliTimestamp(self.io) +| self.config.outbound.max_wait_ms);
+        var waiting = false;
+        defer if (waiting) {
+            self.h2_mutex.lockUncancelable(self.io);
+            self.h2_waiting -= 1;
+            self.h2_mutex.unlock(self.io);
+        };
+        // One handshake owner per endpoint. Followers wait within the same
+        // operation/deadline envelope instead of opening redundant sockets.
+        while (true) {
+            try wait_options.check();
             self.h2_mutex.lockUncancelable(self.io);
             defer self.h2_mutex.unlock(self.io);
-
+            if (self.request_gate.isClosed()) return error.ClientClosed;
+            if (interrupt.isCancellationRequested()) return error.Cancelled;
+            try ensureRequestDeadline(self.io, deadline_ms);
+            if (waiting and common.milliTimestamp(self.io) >= wait_deadline) return error.Timeout;
             if (self.h2_conns.get(key)) |entry| {
                 if (!entry.retired and !entry.broken and !entry.h2.goaway_received) {
                     entry.active_requests += 1;
@@ -2350,7 +2592,36 @@ pub const Client = struct {
                 }
                 if (entry.h2.goaway_received) entry.broken = true;
             }
+            if (!self.h2_opening.contains(key)) {
+                const owned = try self.allocator.dupe(u8, key);
+                errdefer self.allocator.free(owned);
+                try self.h2_opening.put(self.allocator, owned, {});
+                break;
+            }
+            if (!waiting) {
+                if (self.h2_waiting >= self.config.outbound.max_waiters or self.config.outbound.max_wait_ms == 0) return error.PoolExhaustedForHost;
+                waiting = true;
+                self.h2_waiting += 1;
+            }
+            const wake_ns = @as(i128, @min(wait_deadline, common.milliTimestamp(self.io) +| 25)) * std.time.ns_per_ms;
+            try wait_options.waitCapacity(self.io, &self.h2_mutex, &self.h2_changed, &self.h2_changed_generation, wake_ns);
         }
+        defer {
+            self.h2_mutex.lockUncancelable(self.io);
+            defer self.h2_mutex.unlock(self.io);
+            const removed = self.h2_opening.fetchRemove(key).?;
+            self.allocator.free(removed.key);
+            self.h2_changed_generation +%= 1;
+            self.h2_changed.broadcast(self.io);
+        }
+        self.retireUnusedH2(true);
+        if (!self.connection_slots.acquire()) {
+            self.pool.retireIdle();
+            self.tls_pool.retireIdle();
+            self.retireUnusedH2(false);
+            if (!self.connection_slots.acquire()) return error.PoolExhausted;
+        }
+        errdefer self.connection_slots.release();
 
         // --- Phase 2: Create connection without lock (blocking I/O) ---
         const entry = try self.allocator.create(H2PoolEntry);
@@ -2359,13 +2630,17 @@ pub const Client = struct {
             .session = undefined,
             .h2 = undefined,
             .is_tls = is_tls,
+            .owns_socket_slot = true,
         };
         errdefer self.allocator.destroy(entry);
 
-        entry.socket = try self.connectHost(host, port, null);
+        entry.socket = try self.connectHost(host, port, deadline_ms, setup_control.view());
         // Guard socket close only until fibers take ownership (recv_running).
         // After fibers start, the errdefer at line ~521 handles shutdown.
         errdefer if (!entry.recv_running) entry.socket.close();
+        // The socket is not yet available to the request interrupter. Bound
+        // setup transport itself with the same captured request deadline.
+        entry.socket.setRequestDeadline(deadline_ms);
         entry.socket.setNoDelay(true) catch {};
         entry.socket.setKeepAlive(true) catch {};
 
@@ -2379,7 +2654,17 @@ pub const Client = struct {
             entry.session = TlsSession.init(tls_cfg, self.io);
             errdefer entry.session.deinit();
             entry.session.attachSocket(&entry.socket);
-            try entry.session.handshake(host);
+            var transport_scope = try entry.session.controlTransport(setup_control.view());
+            defer transport_scope.deinit();
+            entry.session.handshake(host) catch |err| {
+                try entry.session.checkTransportError();
+                return err;
+            };
+            wait_options.check() catch |err| {
+                entry.socket.abortRequest();
+                entry.socket.shutdown();
+                return err;
+            };
         } else {
             // Initialize a dummy session (deinit is safe on un-handshaked session).
             entry.session = TlsSession.init(TlsConfig.init(self.allocator), self.io);
@@ -2394,18 +2679,50 @@ pub const Client = struct {
         entry.last_frame_ts = common.milliTimestamp(self.io);
         entry.read_idle_timeout_ms = self.config.h2_read_idle_timeout_ms;
         entry.ping_timeout_ms = self.config.h2_ping_timeout_ms;
+        entry.cleanup_timeout_ms = self.config.h2_cleanup_timeout_ms;
         errdefer entry.h2.deinit();
 
         // Perform h2 handshake: preface + SETTINGS exchange.
         if (is_tls) {
+            // The connection remains exclusive until SETTINGS completes. The
+            // scope ends before any shared reader/ping task is published.
+            var transport_scope = try entry.session.controlTransport(setup_control.view());
+            defer transport_scope.deinit();
             const w = try entry.session.getWriter();
-            try entry.h2.sendClientPreface(w);
+            entry.h2.sendClientPreface(w) catch |err| {
+                try entry.session.checkTransportError();
+                return err;
+            };
             const r = try entry.session.getReader();
-            try self.exchangeH2Settings(&entry.h2, r, w);
+            self.exchangeH2Settings(&entry.h2, r, w) catch |err| {
+                try entry.session.checkTransportError();
+                return err;
+            };
         } else {
-            try entry.h2.sendClientPreface(&entry.socket);
-            try self.exchangeH2Settings(&entry.h2, &entry.socket, &entry.socket);
+            var writer = socket_mod.ControlledWriter{ .socket = &entry.socket, .control = setup_control.view() };
+            const Reader = struct {
+                socket: *Socket,
+                control: socket_mod.WriteControl,
+                pub fn recv(reader: *@This(), bytes: []u8) !usize {
+                    return reader.socket.recvControlled(bytes, reader.control);
+                }
+            };
+            var reader = Reader{ .socket = &entry.socket, .control = setup_control.view() };
+            try entry.h2.sendClientPreface(&writer);
+            try self.exchangeH2Settings(&entry.h2, &reader, &writer);
         }
+
+        wait_options.check() catch |err| {
+            entry.socket.abortRequest();
+            entry.socket.shutdown();
+            return err;
+        };
+
+        // A shared connection must not retain its creator's request deadline
+        // or the temporary native socket timeouts used during setup.
+        entry.socket.setRequestDeadline(null);
+        try entry.socket.setRecvTimeout(0);
+        try entry.socket.setSendTimeout(0);
 
         // Spawn background fibers before taking the lock for insertion.
         if (entry.recv_group.concurrent(self.io, h2RecvLoopFiber, .{entry})) {
@@ -2416,9 +2733,16 @@ pub const Client = struct {
         } else |_| {}
 
         errdefer if (entry.recv_running) {
-            entry.socket.close();
+            entry.socket.shutdown();
+            entry.ping_group.cancel(self.io);
             entry.recv_group.await(self.io) catch {};
-            entry.ping_group.await(self.io) catch {};
+            entry.socket.close();
+        };
+
+        wait_options.check() catch |err| {
+            entry.socket.abortRequest();
+            entry.socket.shutdown();
+            return err;
         };
 
         // --- Phase 3: Re-check and insert under lock ---
@@ -2449,7 +2773,7 @@ pub const Client = struct {
                     if (stale.active_requests == 0) stale_to_destroy = stale;
                 }
 
-                const owned_key = try std.fmt.allocPrint(self.allocator, "{s}:{d}", .{ host, port });
+                const owned_key = try std.fmt.allocPrint(self.allocator, "{s}:{s}:{d}", .{ if (is_tls) "https" else "http", host, port });
                 errdefer self.allocator.free(owned_key);
                 try self.h2_conns.put(self.allocator, owned_key, entry);
                 entry.active_requests = 1;
@@ -2473,14 +2797,16 @@ pub const Client = struct {
     /// Tears down an H2PoolEntry that was never inserted into h2_conns.
     fn destroyH2Entry(self: *Self, entry: *H2PoolEntry) void {
         if (entry.recv_running) {
-            entry.socket.close();
+            entry.socket.shutdown();
+            entry.ping_group.cancel(self.io);
             entry.recv_group.await(self.io) catch {};
-            entry.ping_group.await(self.io) catch {};
+            entry.socket.close();
         } else {
             entry.socket.close();
         }
         entry.h2.deinit();
         entry.session.deinit();
+        if (entry.owns_socket_slot) self.connection_slots.release();
         self.allocator.destroy(entry);
     }
 
@@ -2571,7 +2897,6 @@ pub const Client = struct {
     /// tear down the connection (similar to Go's http2.Transport health check).
     fn h2PingTimerFiber(entry: *H2PoolEntry) Io.Cancelable!void {
         const idle_ms = entry.read_idle_timeout_ms;
-        const ping_ms = entry.ping_timeout_ms;
         if (idle_ms == 0) return;
 
         while (!entry.broken) {
@@ -2585,36 +2910,45 @@ pub const Client = struct {
             const since_last = now - entry.last_frame_ts;
             if (since_last < @as(i64, @intCast(idle_ms))) continue;
 
-            // No frames received — send a PING to probe liveness.
-            {
-                entry.h2.write_mutex.lockUncancelable(entry.io);
-                defer entry.h2.write_mutex.unlock(entry.io);
-                // Reset inside mutex so a stale ACK from a prior cycle
-                // (processed between reset and send) can't satisfy this wait.
-                entry.h2.ping_ack_event.reset();
-                if (entry.is_tls) {
-                    if (entry.session.getWriter()) |w|
-                        entry.h2.sendPing(w, .{ 0x68, 0x32, 0x70, 0x69, 0x6e, 0x67, 0x00, 0x00 }) catch {}
-                    else |_| {}
-                } else {
-                    entry.h2.sendPing(&entry.socket, .{ 0x68, 0x32, 0x70, 0x69, 0x6e, 0x67, 0x00, 0x00 }) catch {};
-                }
-            }
-
-            // Wait for PING ACK with timeout.
-            const timeout: Io.Timeout = .{ .duration = .{
-                .raw = Io.Duration.fromMilliseconds(@intCast(ping_ms)),
-                .clock = .awake,
-            } };
-            entry.h2.ping_ack_event.waitTimeout(entry.io, timeout) catch {
-                // Timeout or canceled — connection is dead.
-                entry.broken = true;
-                entry.socket.close();
-                return;
-            };
+            // Lock, write, flush and ACK share one absolute probe deadline.
+            // Failed admission publishes no stream requiring a lock handoff.
+            h2PingProbe(entry) catch return;
             // ACK received — connection is alive. Update timestamp.
             entry.last_frame_ts = common.milliTimestamp(entry.io);
         }
+    }
+
+    fn h2PingProbe(entry: *H2PoolEntry) !void {
+        var budget = H2ConnectionBudget.init(entry.io, entry.ping_timeout_ms);
+        errdefer H2ConnectionBudget.retire(entry, entry.io);
+        const control = budget.control();
+        {
+            try control.lock(&entry.h2.write_mutex, entry.io);
+            defer entry.h2.write_mutex.unlock(entry.io);
+            // The receive loop uses this mutex when dispatching ACKs.
+            entry.h2.ping_ack_event.reset();
+            const payload = [8]u8{ 0x68, 0x32, 0x70, 0x69, 0x6e, 0x67, 0x00, 0x00 };
+            if (entry.is_tls) {
+                const net_out = if (entry.session.net_out) |*writer| writer else return error.NotConnected;
+                const previous = net_out.control;
+                net_out.control = control;
+                defer net_out.control = previous;
+                net_out.last_write_error = null;
+                const writer = try entry.session.getWriter();
+                try entry.h2.sendPing(writer, payload);
+                try entry.session.flush();
+            } else {
+                var writer = socket_mod.ControlledWriter{ .socket = &entry.socket, .control = control };
+                try entry.h2.sendPing(&writer, payload);
+            }
+        }
+        try control.check();
+        try entry.h2.ping_ack_event.waitTimeout(entry.io, .{ .deadline = .{
+            .clock = .awake,
+            .raw = .{ .nanoseconds = @intCast(@min(budget.deadline_ns, std.math.maxInt(i96))) },
+        } });
+        // A ready ACK cannot supersede an expired probe deadline.
+        try control.check();
     }
 
     /// Executes a request on a pooled H2 connection. Creates a stream, sends
@@ -2623,7 +2957,7 @@ pub const Client = struct {
     /// In multiplexed mode (recv_running=true), the background receive fiber
     /// pumps frames while this fiber waits on a per-stream event.
     /// In fallback mode, frames are pumped inline via awaitStreamComplete.
-    fn executeH2OnPooled(self: *Self, entry: *H2PoolEntry, req: *Request, interrupt: *RequestInterrupt) !Response {
+    fn executeH2OnPooled(self: *Self, entry: *H2PoolEntry, req: *Request, interrupt: *RequestInterrupt, wait_rejected: *bool) !Response {
         const h2 = &entry.h2;
         const stream = self.createH2ResponseStream(h2, req) catch |err| {
             if (err == error.ConnectionClosed) entry.broken = true;
@@ -2719,7 +3053,16 @@ pub const Client = struct {
             }
 
             // Wait for the receive loop to deliver the response.
-            try stream.completion_event.wait(self.io);
+            if (req.socket_control) |control| {
+                // No connection/mailbox lock crosses weighted reentry. The
+                // receive loop keeps its own transport lifetime and never
+                // stores this request's borrowed callbacks.
+                control.withWait(Io.Event.wait, .{ &stream.completion_event, self.io }) catch |err| {
+                    wait_rejected.* = true;
+                    cleanupH2Stream(entry, stream_id, null, true, self.io, self.allocator);
+                    return err;
+                };
+            } else try stream.completion_event.wait(self.io);
         } else {
             // Fallback mode: pump frames inline (no fiber support).
             if (interrupt.isCancellationRequested()) return error.Cancelled;
@@ -2818,6 +3161,9 @@ pub const Client = struct {
         data_event: *Io.Event,
         allocator: Allocator,
         lease: ?H2Lease = null,
+        request_lease: ?RequestLease = null,
+        outbound_lease: ?OutboundAdmission.Lease = null,
+        closed: bool = false,
         read_timeout: Io.Timeout = .none,
 
         /// Reads up to `buf.len` bytes. Blocks until data is available.
@@ -2875,6 +3221,8 @@ pub const Client = struct {
         /// Releases the stream. Sends RST_STREAM(CANCEL) if the stream
         /// hasn't completed, telling the server to stop sending DATA frames.
         pub fn close(self: *H2StreamReader) void {
+            if (self.closed) return;
+            self.closed = true;
             Client.cleanupH2Stream(
                 self.entry,
                 self.stream.id,
@@ -2884,6 +3232,8 @@ pub const Client = struct {
                 self.allocator,
             );
             if (self.lease) |*lease| lease.release();
+            if (self.outbound_lease) |*lease| lease.release();
+            if (self.request_lease) |*lease| lease.deinit();
         }
     };
 
@@ -2901,17 +3251,12 @@ pub const Client = struct {
         allocator: Allocator,
     ) void {
         const h2 = &entry.h2;
-        h2.write_mutex.lockUncancelable(io);
+        var budget = H2ConnectionBudget.init(io, entry.cleanup_timeout_ms);
+        const can_reset = budget.lock(entry);
         const cancel_peer = prepareH2StreamCleanupLocked(h2, stream_id, data_event, headers_sent);
-        if (cancel_peer) {
-            if (entry.is_tls) {
-                if (entry.session.getWriter()) |writer|
-                    h2.sendRstStream(writer, stream_id, .cancel) catch {}
-                else |_| {}
-            } else {
-                h2.sendRstStream(&entry.socket, stream_id, .cancel) catch {};
-            }
-        }
+        if (cancel_peer and can_reset) budget.resetLocked(entry, stream_id) catch {
+            H2ConnectionBudget.retire(entry, io);
+        };
         h2.stream_manager.removeStream(stream_id);
         h2.write_mutex.unlock(io);
 
@@ -2959,10 +3304,17 @@ pub const Client = struct {
     /// waiting for END_STREAM. Requires multiplexed mode (recv_running=true).
     pub fn requestStream(self: *Self, req: *Request) !H2StreamResponse {
         if (req.body_stream != null) return error.StreamingRequestRequiresWriter;
+        var request_lease = try self.request_gate.tryAcquire(self.io);
+        var owners_transferred = false;
+        defer if (!owners_transferred) request_lease.deinit();
+        const deadline_ms = try requestDeadlineForControl(self.io, self.config.timeouts.request_ms, req.socket_control);
+        var interrupt: RequestInterrupt = .{ .external_cancellation = self.config.request_cancellation };
+        var outbound_lease = try self.acquireOutbound(req, deadline_ms, &interrupt);
+        defer if (!owners_transferred) outbound_lease.release();
         const host = req.uri.host orelse return error.InvalidUri;
         const is_tls = req.uri.isTls();
         const port = req.uri.effectivePort();
-        var lease = try self.getOrCreateH2Conn(host, port, is_tls);
+        var lease = try self.getOrCreateH2Conn(host, port, is_tls, deadline_ms, &interrupt, req.socket_control);
         var lease_transferred = false;
         defer if (!lease_transferred) lease.release();
         const entry = lease.entry;
@@ -3094,6 +3446,7 @@ pub const Client = struct {
         }
 
         const code = try transferStreamLeaseAfterStatus(&lease_transferred, status_code);
+        owners_transferred = true;
         return .{
             .status_code = code,
             .headers = response_headers,
@@ -3105,6 +3458,8 @@ pub const Client = struct {
                 .data_event = data_event.?,
                 .allocator = self.allocator,
                 .lease = lease,
+                .request_lease = request_lease,
+                .outbound_lease = outbound_lease,
             },
         };
     }
@@ -3258,15 +3613,22 @@ pub const Client = struct {
         };
     }
 
+    const ControlledSocketSource = struct {
+        socket: *Socket,
+        control: socket_mod.WriteControl,
+    };
+
     /// Read bytes from either a Socket or a TlsSession into `buf`.
     fn recvFrom(source: anytype, buf: []u8) !usize {
         const Source = @TypeOf(source);
         if (Source == *Socket) {
             return source.recv(buf);
+        } else if (Source == *ControlledSocketSource) {
+            return source.socket.recvControlled(buf, source.control);
         } else if (Source == *TlsSession) {
             var empty_read_policy = EmptyReadPolicy.init(TlsSessionIoReader.max_empty_reads);
             while (true) {
-                const n = try source.read(buf);
+                const n = try source.readControlled(buf);
                 switch (empty_read_policy.observe(n)) {
                     .done => return n,
                     .retry => sleepAfterEmptyRead(source.io),
@@ -3284,6 +3646,9 @@ pub const Client = struct {
         if (Source == *Socket) {
             socket_reader.* = SocketIoReader.init(source, io_buf);
             return &socket_reader.reader_iface;
+        } else if (Source == *ControlledSocketSource) {
+            socket_reader.* = SocketIoReader.initControlled(source.socket, io_buf, source.control);
+            return &socket_reader.reader_iface;
         } else if (Source == *TlsSession) {
             tls_reader.* = TlsSessionIoReader.init(source, io_buf.len, io_buf);
             return &tls_reader.reader_iface;
@@ -3295,6 +3660,14 @@ pub const Client = struct {
     fn readSomeOnce(reader: *Io.Reader, buf: []u8) !usize {
         var iov = [_][]u8{buf};
         return reader.readVec(&iov);
+    }
+
+    fn checkSourceReadError(source: anytype, socket_reader: *const SocketIoReader, tls_reader: *const TlsSessionIoReader) !void {
+        if (@TypeOf(source) == *ControlledSocketSource) {
+            if (socket_reader.last_read_error) |err| return err;
+        } else if (@TypeOf(source) == *TlsSession) {
+            try tls_reader.checkReadError();
+        }
     }
     const ResponseContentCoding = enum {
         gzip,
@@ -3467,7 +3840,7 @@ pub const Client = struct {
 
             while (true) {
                 const n = readSomeOnce(framed_reader, &read_buf) catch |err| {
-                    if (@TypeOf(source) == *TlsSession) try tls_reader.checkReadError();
+                    try checkSourceReadError(source, &socket_reader, &tls_reader);
                     try checkBodyFramingError(parser, &cl_reader, &chunked_reader);
                     if (err == error.EndOfStream) break;
                     if (err == error.ReadFailed and close_delimited_body) break;
@@ -3496,7 +3869,7 @@ pub const Client = struct {
         } else {
             while (true) {
                 const n = readSomeOnce(framed_reader, &read_buf) catch |err| {
-                    if (@TypeOf(source) == *TlsSession) try tls_reader.checkReadError();
+                    try checkSourceReadError(source, &socket_reader, &tls_reader);
                     try checkBodyFramingError(parser, &cl_reader, &chunked_reader);
                     if (err == error.EndOfStream) break;
                     if (err == error.ReadFailed and close_delimited_body) break;
@@ -3588,7 +3961,7 @@ pub const Client = struct {
         if (is_redirect) {
             while (true) {
                 const n = readSomeOnce(framed_reader, &read_buf) catch |err| {
-                    if (@TypeOf(source) == *TlsSession) try tls_reader.checkReadError();
+                    try checkSourceReadError(source, &socket_reader, &tls_reader);
                     try checkBodyFramingError(parser, &cl_reader, &chunked_reader);
                     if (err == error.EndOfStream) break;
                     if (err == error.ReadFailed and close_delimited_body) break;
@@ -3606,7 +3979,7 @@ pub const Client = struct {
             var encoded_prefix_len: usize = 0;
             while (encoded_prefix_len < encoded_prefix.len) {
                 const n = readSomeOnce(framed_reader, encoded_prefix[encoded_prefix_len..]) catch |err| {
-                    if (@TypeOf(source) == *TlsSession) try tls_reader.checkReadError();
+                    try checkSourceReadError(source, &socket_reader, &tls_reader);
                     try checkBodyFramingError(parser, &cl_reader, &chunked_reader);
                     if (err == error.EndOfStream) break;
                     if (err == error.ReadFailed and close_delimited_body) break;
@@ -3628,7 +4001,7 @@ pub const Client = struct {
                 defer encoded.deinit(parser.allocator);
                 while (true) {
                     const n = readSomeOnce(&encoded_reader.reader_iface, &read_buf) catch |err| {
-                        if (@TypeOf(source) == *TlsSession) try tls_reader.checkReadError();
+                        try checkSourceReadError(source, &socket_reader, &tls_reader);
                         try checkBodyFramingError(parser, &cl_reader, &chunked_reader);
                         if (err == error.EndOfStream) break;
                         if (err == error.ReadFailed and close_delimited_body) break;
@@ -3667,7 +4040,7 @@ pub const Client = struct {
 
                 while (true) {
                     const n = decompressor.reader.readSliceShort(&read_buf) catch |err| {
-                        if (@TypeOf(source) == *TlsSession) try tls_reader.checkReadError();
+                        try checkSourceReadError(source, &socket_reader, &tls_reader);
                         try checkBodyFramingError(parser, &cl_reader, &chunked_reader);
                         if (err == error.EndOfStream) break;
                         if (err == error.ReadFailed and close_delimited_body) break;
@@ -3690,7 +4063,7 @@ pub const Client = struct {
         } else {
             while (true) {
                 const n = readSomeOnce(framed_reader, &read_buf) catch |err| {
-                    if (@TypeOf(source) == *TlsSession) try tls_reader.checkReadError();
+                    try checkSourceReadError(source, &socket_reader, &tls_reader);
                     try checkBodyFramingError(parser, &cl_reader, &chunked_reader);
                     if (err == error.EndOfStream) break;
                     if (err == error.ReadFailed and close_delimited_body) break;
@@ -3722,7 +4095,7 @@ pub const Client = struct {
             var discarded: usize = 0;
             while (true) {
                 const n = readSomeOnce(framed_reader, &read_buf) catch |err| {
-                    if (@TypeOf(source) == *TlsSession) try tls_reader.checkReadError();
+                    try checkSourceReadError(source, &socket_reader, &tls_reader);
                     try checkBodyFramingError(parser, &cl_reader, &chunked_reader);
                     if (err == error.EndOfStream) break;
                     return err;
@@ -3738,11 +4111,7 @@ pub const Client = struct {
         if (res.body) |body| {
             try writer.writeAll(body);
             if (progress_cb) |cb| cb(.{ .bytes_written = body.len, .total_bytes = res.contentLength() }, progress_ctx);
-            if (res.body_owned) {
-                res.allocator.free(body);
-                res.body_owned = false;
-            }
-            res.body = null;
+            res.releaseBody();
         }
     }
 
@@ -5361,7 +5730,7 @@ test "request task admission saturation unwinds watchdog without sending" {
         try std.testing.expectError(error.ConcurrencyUnavailable, client.getToWriter("http://127.0.0.1:1/", options, arrayListWriter(&bytes, allocator), null, null));
         try std.testing.expectEqual(@as(usize, 0), bytes.items.len);
     }
-    try std.testing.expectError(error.ConcurrencyUnavailable, client.connectHost("127.0.0.1", 1, null));
+    try std.testing.expectError(error.ConcurrencyUnavailable, client.connectHost("127.0.0.1", 1, null, null));
     try std.testing.expectEqual(@as(usize, 0), sends.load(.acquire));
 }
 
@@ -5503,13 +5872,9 @@ test "request cancellation before socket publication prevents sending" {
             } else |err| {
                 try std.testing.expectEqual(error.Cancelled, err);
             }
-            // Pooled admission observes cancellation before connecting. The
-            // non-pooled path still exercises cancellation at publication.
-            if (keep_alive) {
-                serving.cancel(fixture_io) catch {};
-            } else {
-                try serving.await(fixture_io);
-            }
+            // Admission and socket controls can both reject before connect.
+            // Join the listener even when cancellation leaves it in accept.
+            serving.cancel(fixture_io) catch {};
             try std.testing.expectEqual(@as(usize, 0), server.routeHitCount(0));
             try std.testing.expectEqual(@as(usize, 0), client.pool.stats().total);
             try std.testing.expectEqual(@as(usize, 0), bytes.items.len);
@@ -6548,6 +6913,1077 @@ test "client body replay preserves method safety after truncation" {
     }
 }
 
+test "outbound admission includes retained headers before transmission" {
+    var client = Client.initWithConfig(std.testing.allocator, std.testing.io, .{
+        .outbound = .{ .max_active = 1, .max_per_endpoint = 1, .max_waiters = 1, .max_wait_bytes = 1024 },
+        .retry_policy = .{ .max_retries = 0 },
+    });
+    defer client.deinit();
+    var held = try client.outbound.acquire("held", 80, .{});
+    defer held.release();
+    const large_header: [4096]u8 = @splat('x');
+    var sends: std.atomic.Value(usize) = .init(0);
+    const Observer = struct {
+        fn send(raw: *anyopaque) void {
+            _ = @as(*std.atomic.Value(usize), @ptrCast(@alignCast(raw))).fetchAdd(1, .acq_rel);
+        }
+    };
+    try std.testing.expectError(error.OutboundCapacityUnavailable, client.post("http://127.0.0.1:1/never-sent", .{
+        .headers = &.{.{ "X-Large", &large_header }},
+        .timeout_ms = 1000,
+        .delivery_observer = .{ .context = &sends, .before_send = Observer.send },
+    }));
+    try std.testing.expectEqual(@as(usize, 0), sends.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 0), client.outbound.snapshot().waiting);
+    try std.testing.expectEqual(@as(usize, 0), client.connection_slots.used.load(.acquire));
+}
+
+test "HTTP1 request controls fence header and body input before publication" {
+    const Mode = enum { success, denied_resume, canceled_resume };
+    const Framing = enum { fixed, chunked, close_delimited };
+    const State = struct {
+        mode: Mode,
+        io: Io,
+        header_read: Io.Event = .unset,
+        parked: bool = false,
+        begins: usize = 0,
+        ends: usize = 0,
+        fn check(raw: ?*anyopaque) socket_mod.WriteControl.Error!void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            if (self.mode == .canceled_resume and self.ends >= 4) return error.Canceled;
+        }
+        fn begin(raw: ?*anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            try std.testing.expect(!self.parked);
+            self.begins += 1;
+            self.parked = true;
+        }
+        fn end(raw: ?*anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            try std.testing.expect(self.parked);
+            self.ends += 1;
+            // One connect, one request-head write, then a header read. Keep
+            // body bytes out of that read so the body adapter must do IO.
+            if (self.ends == 3) self.header_read.set(self.io);
+            if (self.ends >= 4 and self.mode == .denied_resume) return error.DeadlineExceeded;
+            self.parked = false;
+        }
+        fn serve(listener: *socket_mod.TcpListener, state: *@This(), framing: Framing) !void {
+            var accepted = try listener.accept();
+            defer accepted.socket.close();
+            try accepted.socket.setRecvTimeout(2_000);
+            var request: [1024]u8 = undefined;
+            var size: usize = 0;
+            while (std.mem.indexOf(u8, request[0..size], "\r\n\r\n") == null) {
+                const n = try accepted.socket.recv(request[size..]);
+                if (n == 0) return error.UnexpectedEof;
+                size += n;
+            }
+            const head = switch (framing) {
+                .fixed => "HTTP/1.1 200 OK\r\nContent-Length: 7\r\nConnection: close\r\n\r\n",
+                .chunked => "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
+                .close_delimited => "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n",
+            };
+            try accepted.socket.sendAll(head);
+            try state.header_read.waitTimeout(state.io, .{ .duration = .{ .raw = .fromSeconds(2), .clock = .awake } });
+            try accepted.socket.sendAll(if (framing == .chunked) "7\r\npayload\r\n0\r\n\r\n" else "payload");
+        }
+    };
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    for ([_]bool{ false, true }) |streaming| for (std.enums.values(Framing)) |framing| for (std.enums.values(Mode)) |mode| {
+        var listener = try socket_mod.TcpListener.init(.{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } }, io);
+        defer listener.deinit();
+        var state: State = .{ .mode = mode, .io = io };
+        var server = try io.concurrent(State.serve, .{ &listener, &state, framing });
+        defer server.cancel(io) catch {};
+        const url = try std.fmt.allocPrint(alloc, "http://127.0.0.1:{d}/", .{listener.getLocalAddress().getPort()});
+        defer alloc.free(url);
+        var client = Client.initWithConfig(alloc, io, .{ .keep_alive = false, .retry_policy = .{ .max_retries = 0 } });
+        defer client.deinit();
+        const options: RequestOptions = .{ .socket_control = .{ .ptr = &state, .check_fn = State.check, .wait_begin_fn = State.begin, .wait_end_fn = State.end }, .timeout_ms = 2_000 };
+        var output: std.ArrayListUnmanaged(u8) = .empty;
+        defer output.deinit(alloc);
+        const result = if (streaming) client.getToWriter(url, options, arrayListWriter(&output, alloc), null, null) else client.get(url, options);
+        switch (mode) {
+            .success => {
+                var response = try result;
+                defer response.deinit();
+                try std.testing.expectEqualStrings("payload", if (streaming) output.items else response.body.?);
+                try std.testing.expect(!state.parked);
+            },
+            .denied_resume => try std.testing.expectError(error.DeadlineExceeded, result),
+            .canceled_resume => try std.testing.expectError(error.Canceled, result),
+        }
+        if (mode != .success) try std.testing.expectEqual(@as(usize, 0), output.items.len);
+        try server.await(io);
+        try std.testing.expectEqual(state.begins, state.ends);
+        try std.testing.expect(state.ends >= 4);
+    };
+}
+
+const python_tls_control_server =
+    \\import socket, ssl, sys, time
+    \\ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    \\ctx.maximum_version = ssl.TLSVersion.TLSv1_2
+    \\ctx.load_cert_chain('cert.pem', 'key.pem')
+    \\listener = socket.socket()
+    \\listener.bind(('127.0.0.1', 0))
+    \\listener.listen(1)
+    \\print(listener.getsockname()[1], flush=True)
+    \\try:
+    \\    raw, _ = listener.accept()
+    \\    raw.settimeout(3)
+    \\    with ctx.wrap_socket(raw, server_side=True) as conn:
+    \\        request_count = 2 if len(sys.argv) > 2 and sys.argv[2] == 'reuse' else 1
+    \\        for request_index in range(request_count):
+    \\            data = b''
+    \\            while b'\r\n\r\n' not in data:
+    \\                part = conn.recv(4096)
+    \\                if not part: raise EOFError()
+    \\                data += part
+    \\            framing = sys.argv[1]
+    \\            head = b'HTTP/1.1 200 OK\r\nConnection: ' + (b'keep-alive' if request_index + 1 < request_count else b'close') + b'\r\n'
+    \\            if framing == 'fixed': head += b'Content-Length: 7\r\n'
+    \\            if framing == 'chunked': head += b'Transfer-Encoding: chunked\r\n'
+    \\            conn.sendall(head + b'\r\n')
+    \\            time.sleep(0.02)
+    \\            conn.sendall(b'7\r\npayload\r\n0\r\n\r\n' if framing == 'chunked' else b'payload')
+    \\except (OSError, EOFError):
+    \\    pass
+;
+
+test "HTTPS request controls retire denied handshake and body waits without retaining grants" {
+    const Mode = enum { success, denied_write, denied_read, canceled_read };
+    const Framing = enum { fixed, chunked, close_delimited };
+    const State = struct {
+        mode: Mode,
+        // This fixture uses a literal IP: one controlled connect precedes
+        // TLS for both direct and pooled requests. Keep denial injection on the TLS transport so
+        // connect coverage does not replace handshake/body coverage.
+        connect_waits: usize = 0,
+        parked: bool = false,
+        begins: usize = 0,
+        ends: usize = 0,
+        fn check(raw: ?*anyopaque) socket_mod.WriteControl.Error!void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            if (self.mode == .canceled_read and self.ends >= self.connect_waits + 3) return error.Canceled;
+        }
+        fn begin(raw: ?*anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            try std.testing.expect(!self.parked);
+            self.begins += 1;
+            self.parked = true;
+        }
+        fn end(raw: ?*anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            try std.testing.expect(self.parked);
+            self.ends += 1;
+            if ((self.mode == .denied_write and self.ends > self.connect_waits) or (self.mode == .denied_read and self.ends >= self.connect_waits + 3)) return error.DeadlineExceeded;
+            self.parked = false;
+        }
+    };
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    for ([_]bool{ false, true }) |pooled| for ([_]bool{ false, true }) |streaming| for (std.enums.values(Framing)) |framing| for (std.enums.values(Mode)) |mode| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        try tmp.dir.writeFile(io, .{ .sub_path = "cert.pem", .data = test_tls_cert_pem });
+        try tmp.dir.writeFile(io, .{ .sub_path = "key.pem", .data = test_tls_key_pem });
+        try tmp.dir.writeFile(io, .{ .sub_path = "server.py", .data = python_tls_control_server });
+        var child = try std.process.spawn(io, .{ .argv = &.{ "python3", "server.py", @tagName(framing) }, .cwd = .{ .dir = tmp.dir }, .stdin = .ignore, .stdout = .pipe, .stderr = .inherit });
+        defer child.kill(io);
+        var stdout_buffer: [64]u8 = undefined;
+        var stdout_reader = child.stdout.?.readerStreaming(io, &stdout_buffer);
+        const port_line = (try stdout_reader.interface.takeDelimiter('\n')) orelse return error.TestServerExited;
+        const port = try std.fmt.parseUnsigned(u16, port_line, 10);
+        const url = try std.fmt.allocPrint(alloc, "https://127.0.0.1:{d}/", .{port});
+        defer alloc.free(url);
+        var state: State = .{ .mode = mode, .connect_waits = 1 };
+        var completed_ends: usize = 0;
+        {
+            var client = Client.initWithConfig(alloc, io, .{ .keep_alive = pooled, .verify_ssl = false, .retry_policy = .{ .max_retries = 0 } });
+            defer client.deinit();
+            const options: RequestOptions = .{ .timeout_ms = 3_000, .socket_control = .{ .ptr = &state, .check_fn = State.check, .wait_begin_fn = State.begin, .wait_end_fn = State.end } };
+            var output: std.ArrayListUnmanaged(u8) = .empty;
+            defer output.deinit(alloc);
+            const result = if (streaming) client.getToWriter(url, options, arrayListWriter(&output, alloc), null, null) else client.get(url, options);
+            switch (mode) {
+                .success => {
+                    var response = try result;
+                    defer response.deinit();
+                    try std.testing.expectEqualStrings("payload", if (streaming) output.items else response.body.?);
+                    try std.testing.expect(!state.parked);
+                },
+                .denied_write, .denied_read => try std.testing.expectError(error.DeadlineExceeded, result),
+                .canceled_read => try std.testing.expectError(error.Canceled, result),
+            }
+            if (mode != .success) try std.testing.expectEqual(@as(usize, 0), output.items.len);
+            try std.testing.expectEqual(state.begins, state.ends);
+            try std.testing.expect(state.ends > 0);
+            completed_ends = state.ends;
+        }
+        // Client/pool retirement must not call the departed request context.
+        try std.testing.expectEqual(completed_ends, state.ends);
+    };
+}
+
+test "HTTPS pooled reuse clears the previous request transport controls" {
+    const Control = struct {
+        parked: bool = false,
+        ends: usize = 0,
+        fn begin(raw: ?*anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            try std.testing.expect(!self.parked);
+            self.parked = true;
+        }
+        fn end(raw: ?*anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            try std.testing.expect(self.parked);
+            self.parked = false;
+            self.ends += 1;
+        }
+        fn options(self: *@This()) RequestOptions {
+            return .{ .timeout_ms = 3_000, .socket_control = .{ .ptr = self, .wait_begin_fn = begin, .wait_end_fn = end } };
+        }
+    };
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "cert.pem", .data = test_tls_cert_pem });
+    try tmp.dir.writeFile(io, .{ .sub_path = "key.pem", .data = test_tls_key_pem });
+    try tmp.dir.writeFile(io, .{ .sub_path = "server.py", .data = python_tls_control_server });
+    var child = try std.process.spawn(io, .{ .argv = &.{ "python3", "server.py", "fixed", "reuse" }, .cwd = .{ .dir = tmp.dir }, .stdin = .ignore, .stdout = .pipe, .stderr = .inherit });
+    defer child.kill(io);
+    var stdout_buffer: [64]u8 = undefined;
+    var stdout_reader = child.stdout.?.readerStreaming(io, &stdout_buffer);
+    const port_line = (try stdout_reader.interface.takeDelimiter('\n')) orelse return error.TestServerExited;
+    const port = try std.fmt.parseUnsigned(u16, port_line, 10);
+    const url = try std.fmt.allocPrint(alloc, "https://127.0.0.1:{d}/", .{port});
+    defer alloc.free(url);
+    var client = Client.initWithConfig(alloc, io, .{ .keep_alive = true, .verify_ssl = false, .retry_policy = .{ .max_retries = 0 } });
+    defer client.deinit();
+    var first: Control = .{};
+    var response = try client.get(url, first.options());
+    defer response.deinit();
+    try std.testing.expectEqualStrings("payload", response.body.?);
+    try std.testing.expect(first.ends > 0 and !first.parked);
+    const first_ends = first.ends;
+    var second: Control = .{};
+    var next_response = try client.get(url, second.options());
+    defer next_response.deinit();
+    try std.testing.expectEqualStrings("payload", next_response.body.?);
+    try std.testing.expect(second.ends > 0 and !second.parked);
+    try std.testing.expectEqual(first_ends, first.ends);
+}
+
+test "H2 completion waits reject publication and preserve the shared connection" {
+    const Mode = enum { success, begin_failure, end_failure, canceled_resume };
+    const State = struct {
+        mode: Mode,
+        io: Io,
+        started: Io.Event = .unset,
+        finished: Io.Event = .unset,
+        parked: std.atomic.Value(bool) = .init(false),
+        begins: usize = 0,
+        ends: usize = 0,
+        fn check(raw: ?*anyopaque) socket_mod.WriteControl.Error!void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            if (self.mode == .canceled_resume and self.ends > 0) return error.Canceled;
+        }
+        fn begin(raw: ?*anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            try std.testing.expect(!self.parked.load(.acquire));
+            self.begins += 1;
+            if (self.mode == .begin_failure) {
+                self.started.set(self.io);
+                return error.SchedulerClosed;
+            }
+            self.parked.store(true, .release);
+            self.started.set(self.io);
+        }
+        fn end(raw: ?*anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            try std.testing.expect(self.parked.load(.acquire));
+            self.ends += 1;
+            if (self.mode == .end_failure) return error.DeadlineExceeded;
+            self.parked.store(false, .release);
+        }
+        fn serve(listener: *socket_mod.TcpListener, state: *@This()) !void {
+            const alloc = std.testing.allocator;
+            var accepted = try listener.accept();
+            defer accepted.socket.close();
+            try accepted.socket.setRecvTimeout(3_000);
+            var reader = accepted.socket.reader();
+            var h2 = H2Connection.initServer(alloc, state.io);
+            defer h2.deinit();
+            try h2.readClientPreface(&reader);
+            try h2.sendSettings(&accepted.socket);
+            var requests: usize = 0;
+            while (requests < 2) {
+                var frame = try h2.readFrame(&reader);
+                defer frame.deinit(alloc);
+                switch (frame.header.frame_type) {
+                    .settings => try h2.handleSettings(&frame, &accepted.socket),
+                    .headers => {
+                        const stream_id = frame.header.stream_id;
+                        _ = try h2.stream_manager.getOrCreateStream(stream_id);
+                        if (requests == 0) {
+                            try state.started.waitTimeout(state.io, .{ .duration = .{ .raw = .fromSeconds(3), .clock = .awake } });
+                            if (state.mode != .begin_failure) try std.testing.expect(state.parked.load(.acquire));
+                        }
+                        try h2.sendHeaders(&accepted.socket, stream_id, &.{ .{ .name = ":status", .value = "200" }, .{ .name = "x-shared", .value = "preserved" } }, false);
+                        try h2.writeData(&accepted.socket, stream_id, "payload", true);
+                        requests += 1;
+                    },
+                    else => {},
+                }
+            }
+            try state.finished.waitTimeout(state.io, .{ .duration = .{ .raw = .fromSeconds(3), .clock = .awake } });
+        }
+    };
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    for (std.enums.values(Mode)) |mode| {
+        std.debug.print("H2_WAIT mode={s}\n", .{@tagName(mode)});
+        var listener = try socket_mod.TcpListener.init(.{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } }, io);
+        defer listener.deinit();
+        var state: State = .{ .mode = mode, .io = io };
+        var server = try io.concurrent(State.serve, .{ &listener, &state });
+        defer server.cancel(io) catch {};
+        const url = try std.fmt.allocPrint(alloc, "http://127.0.0.1:{d}/", .{listener.getLocalAddress().getPort()});
+        defer alloc.free(url);
+        var client = Client.initWithConfig(alloc, io, .{ .http2_enabled = true, .h2_read_idle_timeout_ms = 0, .retry_policy = .{ .max_retries = 0 } });
+        defer client.deinit();
+        // Exercise completion authority on an established shared connection;
+        // setup authority has its own physical retirement regression below.
+        var setup_interrupt = RequestInterrupt{};
+        var setup = try client.getOrCreateH2Conn("127.0.0.1", listener.getLocalAddress().getPort(), false, requestDeadlineMs(io, 3_000), &setup_interrupt, null);
+        setup.release();
+        const result = client.get(url, .{ .timeout_ms = 3_000, .socket_control = .{ .ptr = &state, .check_fn = State.check, .wait_begin_fn = State.begin, .wait_end_fn = State.end } });
+        switch (mode) {
+            .success => {
+                var response = try result;
+                defer response.deinit();
+                try std.testing.expectEqualStrings("payload", response.body.?);
+            },
+            .begin_failure => try std.testing.expectError(error.SchedulerClosed, result),
+            .end_failure => try std.testing.expectError(error.DeadlineExceeded, result),
+            .canceled_resume => try std.testing.expectError(error.Canceled, result),
+        }
+        try std.testing.expectEqual(@as(usize, 1), state.begins);
+        try std.testing.expectEqual(@as(usize, if (mode == .begin_failure) 0 else 1), state.ends);
+        const completed_ends = state.ends;
+        // The peer accepts exactly one TCP connection. A sibling request must
+        // still succeed on it after the first stream loses request authority.
+        var sibling = try client.get(url, .{ .timeout_ms = 3_000 });
+        defer sibling.deinit();
+        try std.testing.expectEqualStrings("payload", sibling.body.?);
+        try std.testing.expectEqualStrings("preserved", sibling.headers.get("x-shared").?);
+        try std.testing.expectEqual(completed_ends, state.ends);
+        state.finished.set(io);
+        try server.await(io);
+    }
+}
+
+test "H2 cleanup lock deadline wakes the physical holder before retirement" {
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    var listener = try socket_mod.TcpListener.init(.{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } }, io);
+    defer listener.deinit();
+    var socket = try Socket.connect(listener.getLocalAddress(), io);
+    defer socket.close();
+    var accepted = try listener.accept();
+    defer accepted.socket.close();
+    var entry: H2PoolEntry = .{ .socket = socket, .session = undefined, .h2 = H2Connection.initClient(alloc, io), .is_tls = false, .io = io, .cleanup_timeout_ms = 30 };
+    defer entry.h2.deinit();
+    var held: Io.Event = .unset;
+    const Worker = struct {
+        fn run(target: *H2PoolEntry, ready: *Io.Event) !void {
+            target.h2.write_mutex.lockUncancelable(target.io);
+            defer target.h2.write_mutex.unlock(target.io);
+            ready.set(target.io);
+            var byte: [1]u8 = undefined;
+            _ = target.socket.recv(&byte) catch |err| switch (err) {
+                error.RecvFailed => return,
+                else => return err,
+            };
+        }
+    };
+    var holder = try io.concurrent(Worker.run, .{ &entry, &held });
+    defer holder.cancel(io) catch {};
+    try held.wait(io);
+    var budget = H2ConnectionBudget.init(io, entry.cleanup_timeout_ms);
+    const started = Io.Clock.awake.now(io).nanoseconds;
+    try std.testing.expect(!budget.lock(&entry));
+    defer entry.h2.write_mutex.unlock(io);
+    try holder.await(io);
+    const elapsed = Io.Clock.awake.now(io).nanoseconds - started;
+    try std.testing.expect(elapsed >= 20 * std.time.ns_per_ms and elapsed < std.time.ns_per_s);
+    try std.testing.expect(entry.broken);
+    try std.testing.expect(entry.h2.send_window_event.isSet());
+}
+
+test "H2 cleanup reset has one finite wire budget under backpressure" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    for ([_]bool{ false, true }) |blocked| {
+        var listener = try socket_mod.TcpListener.init(.{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } }, io);
+        defer listener.deinit();
+        var socket = try Socket.connect(listener.getLocalAddress(), io);
+        defer socket.close();
+        var accepted = try listener.accept();
+        defer accepted.socket.close();
+        if (!socket.native_timeouts) return error.SkipZigTest;
+        if (blocked) {
+            const receive_size: u32 = 4096;
+            try std.posix.setsockopt(accepted.socket.handle, std.posix.SOL.SOCKET, std.posix.SO.RCVBUF, std.mem.asBytes(&receive_size));
+            try socket.setSendTimeout(10);
+            var payload: [64 * 1024]u8 = @splat('b');
+            var saturated = false;
+            for (0..4096) |_| {
+                _ = socket.send(&payload) catch |err| {
+                    if (err != error.Timeout) return err;
+                    saturated = true;
+                    break;
+                };
+            }
+            try std.testing.expect(saturated);
+            try socket.setSendTimeout(0);
+        }
+        var entry: H2PoolEntry = .{ .socket = socket, .session = undefined, .h2 = H2Connection.initClient(alloc, io), .is_tls = false, .io = io, .cleanup_timeout_ms = 30 };
+        defer entry.h2.deinit();
+        const stream = try entry.h2.stream_manager.createStream();
+        const stream_id = stream.id;
+        stream.state = .open;
+        const started = Io.Clock.awake.now(io).nanoseconds;
+        Client.cleanupH2Stream(&entry, stream_id, null, true, io, alloc);
+        const elapsed = Io.Clock.awake.now(io).nanoseconds - started;
+        try std.testing.expect(elapsed < std.time.ns_per_s);
+        try std.testing.expectEqual(blocked, entry.broken);
+        try std.testing.expectEqual(@as(usize, 0), entry.h2.stream_manager.activeStreamCount());
+        if (!blocked) {
+            try accepted.socket.setRecvTimeout(500);
+            var frame: [13]u8 = undefined;
+            var received: usize = 0;
+            while (received < frame.len) received += try accepted.socket.recv(frame[received..]);
+            try std.testing.expectEqual(@as(u8, 3), frame[3]); // RST_STREAM
+            try std.testing.expectEqual(@as(u32, 8), std.mem.readInt(u32, frame[9..13], .big)); // CANCEL
+        }
+    }
+}
+
+test "H2 cleanup never renews the reserved transport deadline" {
+    const io = std.testing.io;
+    var budget = H2ConnectionBudget.init(io, 20);
+    const original = budget.deadline_ns;
+    try std.testing.expect((try budget.control().timeout(100)).? <= 20);
+    try io.sleep(.fromMilliseconds(25), .awake);
+    for (0..3) |_| try std.testing.expectError(error.Timeout, budget.control().check());
+    try std.testing.expectEqual(original, budget.deadline_ns);
+}
+
+test "outbound admission public clients reject capacity resume before transmission" {
+    const Mode = enum { begin_denied, end_denied, canceled };
+    const State = struct {
+        client: *Client,
+        held: *OutboundAdmission.Lease,
+        mode: Mode,
+        canceled: bool = false,
+        begins: usize = 0,
+        ends: usize = 0,
+        fn check(raw: ?*anyopaque) socket_mod.WriteControl.Error!void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            if (self.canceled) return error.Canceled;
+        }
+        fn begin(raw: ?*anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            try std.testing.expect(self.client.outbound.mutex.tryLock());
+            self.client.outbound.mutex.unlock(self.client.io);
+            try std.testing.expectEqual(@as(usize, 1), self.client.outbound.snapshot().waiting);
+            self.begins += 1;
+            if (self.mode == .begin_denied) return error.SchedulerClosed;
+            self.held.release();
+        }
+        fn end(raw: ?*anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            try std.testing.expect(self.client.outbound.mutex.tryLock());
+            self.client.outbound.mutex.unlock(self.client.io);
+            self.ends += 1;
+            if (self.mode == .end_denied) return error.DeadlineExceeded;
+            self.canceled = true;
+        }
+        fn send(raw: *anyopaque) void {
+            _ = @as(*std.atomic.Value(usize), @ptrCast(@alignCast(raw))).fetchAdd(1, .acq_rel);
+        }
+    };
+    for ([_]bool{ false, true }) |streaming| for ([_][]const u8{ "http://127.0.0.1:1/never", "https://127.0.0.1:1/never" }) |url| for (std.enums.values(Mode)) |mode| {
+        const alloc = std.testing.allocator;
+        var client = Client.initWithConfig(alloc, std.testing.io, .{ .outbound = .{ .max_active = 1, .max_waiters = 1 }, .retry_policy = .{ .max_retries = 0 } });
+        defer client.deinit();
+        var held = try client.outbound.acquire("held", 80, .{});
+        defer held.release();
+        var state: State = .{ .client = &client, .held = &held, .mode = mode };
+        var sends = std.atomic.Value(usize).init(0);
+        const opts: RequestOptions = .{ .timeout_ms = 2000, .socket_control = .{ .ptr = &state, .check_fn = State.check, .wait_begin_fn = State.begin, .wait_end_fn = State.end }, .delivery_observer = .{ .context = &sends, .before_send = State.send } };
+        var output: std.ArrayListUnmanaged(u8) = .empty;
+        defer output.deinit(alloc);
+        const result = if (streaming) client.getToWriter(url, opts, arrayListWriter(&output, alloc), null, null) else client.get(url, opts);
+        try std.testing.expectError(switch (mode) {
+            .begin_denied => error.SchedulerClosed,
+            .end_denied => error.DeadlineExceeded,
+            .canceled => error.Canceled,
+        }, result);
+        try std.testing.expectEqual(@as(usize, 1), state.begins);
+        try std.testing.expectEqual(@as(usize, if (mode == .begin_denied) 0 else 1), state.ends);
+        try std.testing.expectEqual(@as(usize, 0), sends.load(.acquire));
+        try std.testing.expectEqual(@as(usize, 0), output.items.len);
+        try std.testing.expectEqual(@as(usize, 0), client.connection_slots.used.load(.acquire));
+        try std.testing.expectEqual(@as(usize, 0), client.outbound.snapshot().waiting_bytes);
+        held.release();
+        try std.testing.expectEqual(@as(usize, 0), client.outbound.snapshot().active);
+    };
+}
+
+test "H2 opening capacity wait resumes outside connection locks before rejection" {
+    const State = struct {
+        client: *Client,
+        begins: usize = 0,
+        ends: usize = 0,
+        fn begin(raw: ?*anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            try std.testing.expect(self.client.h2_mutex.tryLock());
+            self.client.h2_mutex.unlock(self.client.io);
+            try std.testing.expectEqual(@as(usize, 1), self.client.h2_waiting);
+            self.begins += 1;
+        }
+        fn end(raw: ?*anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            try std.testing.expect(self.client.h2_mutex.tryLock());
+            self.client.h2_mutex.unlock(self.client.io);
+            self.ends += 1;
+            return error.DeadlineExceeded;
+        }
+    };
+    const alloc = std.testing.allocator;
+    var client = Client.initWithConfig(alloc, std.testing.io, .{ .http2_enabled = true, .outbound = .{ .max_waiters = 1 }, .retry_policy = .{ .max_retries = 0 } });
+    defer client.deinit();
+    const key = try alloc.dupe(u8, "http:127.0.0.1:1");
+    try client.h2_opening.put(alloc, key, {});
+    defer {
+        _ = client.h2_opening.remove(key);
+        alloc.free(key);
+    }
+    var state: State = .{ .client = &client };
+    try std.testing.expectError(error.DeadlineExceeded, client.get("http://127.0.0.1:1/never", .{ .timeout_ms = 2000, .socket_control = .{ .ptr = &state, .wait_begin_fn = State.begin, .wait_end_fn = State.end } }));
+    try std.testing.expectEqual(@as(usize, 1), state.begins);
+    try std.testing.expectEqual(@as(usize, 1), state.ends);
+    try std.testing.expectEqual(@as(usize, 0), client.h2_waiting);
+    try std.testing.expectEqual(@as(usize, 0), client.h2_conns.count());
+    try std.testing.expectEqual(@as(usize, 0), client.connection_slots.used.load(.acquire));
+}
+
+test "H2 setup denied resume retires unpublished connection and shared slot" {
+    const Mode = enum { connect, preface, settings_read };
+    const State = struct {
+        io: Io,
+        mode: Mode,
+        server_settings: std.atomic.Value(bool) = .init(false),
+        parked: bool = false,
+        begins: usize = 0,
+        ends: usize = 0,
+        fn begin(raw: ?*anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            try std.testing.expect(!self.parked);
+            self.parked = true;
+            self.begins += 1;
+        }
+        fn end(raw: ?*anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            try std.testing.expect(self.parked);
+            self.ends += 1;
+            const denied = switch (self.mode) {
+                .connect => self.ends == 1,
+                .preface => self.ends == 2,
+                .settings_read => self.server_settings.load(.acquire),
+            };
+            if (denied) return error.ResumeDenied;
+            self.parked = false;
+        }
+        fn serve(listener: *socket_mod.TcpListener, state: *@This()) !void {
+            var peer = try listener.accept();
+            defer peer.socket.close();
+            peer.socket.enableNativeTimeouts();
+            try peer.socket.setRecvTimeout(2_000);
+            if (state.mode == .settings_read) {
+                var reader = peer.socket.reader();
+                var h2 = H2Connection.initServer(std.testing.allocator, state.io);
+                defer h2.deinit();
+                try h2.readClientPreface(&reader);
+                var frame = try h2.readFrame(&reader);
+                defer frame.deinit(std.testing.allocator);
+                try std.testing.expect(frame.header.frame_type == .settings);
+                state.server_settings.store(true, .release);
+                // Empty SETTINGS requires one header read and no payload.
+                try peer.socket.sendAll(&.{ 0, 0, 0, 4, 0, 0, 0, 0, 0 });
+            }
+            var bytes: [128]u8 = undefined;
+            // EOF proves that rejection closes the actual connection before
+            // the fixture can return; a timeout is a failed retirement.
+            while (try peer.socket.recv(&bytes) != 0) {}
+        }
+    };
+    const io = std.testing.io;
+    for (std.enums.values(Mode)) |mode| {
+        var listener = try socket_mod.TcpListener.init(.{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } }, io);
+        defer listener.deinit();
+        var state = State{ .io = io, .mode = mode };
+        var server = try io.concurrent(State.serve, .{ &listener, &state });
+        defer server.cancel(io) catch {};
+        var client = Client.initWithConfig(std.testing.allocator, io, .{ .http2_enabled = true, .h2_read_idle_timeout_ms = 0, .timeouts = .{ .connect_ms = 0 } });
+        defer client.deinit();
+        var interrupt = RequestInterrupt{};
+        try std.testing.expectError(error.ResumeDenied, client.getOrCreateH2Conn("127.0.0.1", listener.getLocalAddress().getPort(), false, requestDeadlineMs(io, 2_000), &interrupt, .{ .ptr = &state, .wait_begin_fn = State.begin, .wait_end_fn = State.end }));
+        try server.await(io);
+        try std.testing.expectEqual(state.begins, state.ends);
+        try std.testing.expectEqual(@as(usize, 0), client.connection_slots.used.load(.acquire));
+        try std.testing.expectEqual(@as(usize, 0), client.h2_opening.count());
+        try std.testing.expectEqual(@as(usize, 0), client.h2_conns.count());
+    }
+}
+
+test "direct cached connect denied resume keeps cache and sends no request" {
+    const State = struct {
+        ends: usize = 0,
+        fn begin(_: ?*anyopaque) !void {}
+        fn end(raw: ?*anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.ends += 1;
+            return error.ResumeDenied;
+        }
+    };
+    const io = std.testing.io;
+    var listener = try socket_mod.TcpListener.init(.{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } }, io);
+    defer listener.deinit();
+    var client = Client.initWithConfig(std.testing.allocator, io, .{ .keep_alive = false, .cache_resolved_addresses = true, .timeouts = .{ .connect_ms = 0 } });
+    defer client.deinit();
+    const port = listener.getLocalAddress().getPort();
+    var key_buffer: [64]u8 = undefined;
+    const key = try std.fmt.bufPrint(&key_buffer, "unresolvable.invalid:{d}", .{port});
+    try client.cacheResolvedAddress(key, listener.getLocalAddress());
+    var state = State{};
+    try std.testing.expectError(error.ResumeDenied, client.connectHost("unresolvable.invalid", port, requestDeadlineMs(io, 2_000), .{ .ptr = &state, .wait_begin_fn = State.begin, .wait_end_fn = State.end }));
+    try std.testing.expectEqual(@as(usize, 1), state.ends);
+    try std.testing.expect(client.cachedResolvedAddress(key) != null);
+    var peer = try listener.accept();
+    defer peer.socket.close();
+    peer.socket.enableNativeTimeouts();
+    try peer.socket.setRecvTimeout(1000);
+    var byte: [1]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 0), try peer.socket.recv(&byte));
+}
+
+test "original request control deadline interrupts stalled TLS setup before publication" {
+    const State = struct {
+        io: Io,
+        deadline_ms: i64,
+        parked: bool = false,
+        begins: usize = 0,
+        ends: usize = 0,
+        fn remaining(raw: ?*anyopaque) socket_mod.WriteControl.Error!?u64 {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            return @intCast(@max(0, self.deadline_ms - common.milliTimestamp(self.io)));
+        }
+        fn begin(raw: ?*anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            try std.testing.expect(!self.parked);
+            self.parked = true;
+            self.begins += 1;
+        }
+        fn end(raw: ?*anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            try std.testing.expect(self.parked);
+            self.parked = false;
+            self.ends += 1;
+        }
+        fn serve(listener: *socket_mod.TcpListener) !void {
+            var peer = try listener.accept();
+            defer peer.socket.close();
+            peer.socket.enableNativeTimeouts();
+            try peer.socket.setRecvTimeout(2_000);
+            var bytes: [4096]u8 = undefined;
+            var received: usize = 0;
+            while (true) {
+                const n = std.posix.read(peer.socket.handle, &bytes) catch |err| switch (err) {
+                    // Cancellation can close with unread TLS bytes, yielding
+                    // a peer reset rather than FIN. Both physically retire
+                    // the socket; timeout and every other error still fail.
+                    error.ConnectionResetByPeer => break,
+                    else => return err,
+                };
+                if (n == 0) break;
+                received += n;
+                // Deliberately never answer the TLS ClientHello.
+            }
+            try std.testing.expect(received > 0);
+        }
+    };
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const io = std.testing.io;
+    for ([_]bool{ false, true }) |borrowed_budget| for ([_]bool{ false, true }) |pooled| for ([_]bool{ false, true }) |streaming| {
+        var listener = try socket_mod.TcpListener.init(.{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } }, io);
+        defer listener.deinit();
+        var server = try io.concurrent(State.serve, .{&listener});
+        defer server.cancel(io) catch {};
+        var client = Client.initWithConfig(std.testing.allocator, io, .{ .keep_alive = pooled, .verify_ssl = false, .retry_policy = .{ .max_retries = 0 }, .timeouts = .{ .connect_ms = 30_000, .request_ms = if (!borrowed_budget) 300 else if (streaming) 0 else 30_000 } });
+        defer client.deinit();
+        const url = try std.fmt.allocPrint(std.testing.allocator, "https://127.0.0.1:{d}/", .{listener.getLocalAddress().getPort()});
+        defer std.testing.allocator.free(url);
+        const started = common.milliTimestamp(io);
+        var state = State{ .io = io, .deadline_ms = started + 300 };
+        const options = RequestOptions{ .socket_control = .{ .ptr = &state, .remaining_ms_fn = if (borrowed_budget) State.remaining else null, .wait_begin_fn = State.begin, .wait_end_fn = State.end } };
+        var output: std.ArrayListUnmanaged(u8) = .empty;
+        defer output.deinit(std.testing.allocator);
+        if (streaming) {
+            try std.testing.expectError(error.Timeout, client.getToWriter(url, options, arrayListWriter(&output, std.testing.allocator), null, null));
+        } else {
+            try std.testing.expectError(error.Timeout, client.get(url, options));
+        }
+        try server.await(io);
+        try std.testing.expect(common.milliTimestamp(io) - started < 2_000);
+        try std.testing.expect(state.begins > 0);
+        try std.testing.expectEqual(state.begins, state.ends);
+        try std.testing.expect(!state.parked);
+        try std.testing.expectEqual(@as(usize, 0), output.items.len);
+        try std.testing.expectEqual(@as(usize, 0), client.connection_slots.used.load(.acquire));
+        try std.testing.expectEqual(@as(usize, 0), client.tls_pool.stats().connecting);
+        try std.testing.expectEqual(@as(usize, 0), client.tls_pool.stats().total);
+    };
+}
+
+test "H2 setup deadline physically interrupts silent settings without published interrupter" {
+    const Server = struct {
+        fn serve(listener: *socket_mod.TcpListener, io: Io) !void {
+            var peer = try listener.accept();
+            defer peer.socket.close();
+            peer.socket.enableNativeTimeouts();
+            try peer.socket.setRecvTimeout(2_000);
+            var reader = peer.socket.reader();
+            var h2 = H2Connection.initServer(std.testing.allocator, io);
+            defer h2.deinit();
+            try h2.readClientPreface(&reader);
+            var settings = try h2.readFrame(&reader);
+            defer settings.deinit(std.testing.allocator);
+            try std.testing.expect(settings.header.frame_type == .settings);
+            // Never send server SETTINGS. The unpublished connection has no
+            // background reader or request interrupter to close it for us.
+            var bytes: [128]u8 = undefined;
+            while (true) {
+                const n = std.posix.read(peer.socket.handle, &bytes) catch |err| switch (err) {
+                    error.ConnectionResetByPeer => break,
+                    else => return err,
+                };
+                if (n == 0) break;
+            }
+        }
+    };
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const io = std.testing.io;
+    var listener = try socket_mod.TcpListener.init(.{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } }, io);
+    defer listener.deinit();
+    var server = try io.concurrent(Server.serve, .{ &listener, io });
+    defer server.cancel(io) catch {};
+    var client = Client.initWithConfig(std.testing.allocator, io, .{ .http2_enabled = true, .h2_read_idle_timeout_ms = 0, .timeouts = .{ .connect_ms = 0 } });
+    defer client.deinit();
+    var interrupt = RequestInterrupt{};
+    const started = common.milliTimestamp(io);
+    try std.testing.expectError(error.Timeout, client.getOrCreateH2Conn("127.0.0.1", listener.getLocalAddress().getPort(), false, started + 300, &interrupt, null));
+    try server.await(io);
+    try std.testing.expect(common.milliTimestamp(io) - started < 2_000);
+    try std.testing.expectEqual(@as(usize, 0), client.connection_slots.used.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 0), client.h2_opening.count());
+    try std.testing.expectEqual(@as(usize, 0), client.h2_conns.count());
+    try std.testing.expect(interrupt.socket == null and interrupt.h2_entry == null);
+}
+
+test "H2 health probe bounds physical lock wire and ACK waits with one deadline" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const Mode = enum { healthy, held_lock, blocked_wire, missing_ack, expired };
+    const Probe = struct {
+        entry: *H2PoolEntry,
+        done: Io.Event = .unset,
+        result: anyerror!void = undefined,
+        fn run(self: *@This()) void {
+            self.result = Client.h2PingProbe(self.entry);
+            self.done.set(self.entry.io);
+        }
+    };
+    const Peer = struct {
+        fn run(socket: *Socket, io: Io) anyerror!void {
+            var server = H2Connection.initServer(std.testing.allocator, io);
+            defer server.deinit();
+            var frame = try server.readFrame(socket);
+            defer frame.deinit(std.testing.allocator);
+            try std.testing.expectEqual(@as(u8, 6), @backingInt(frame.header.frame_type));
+            try std.testing.expectEqualStrings("h2ping\x00\x00", frame.payload);
+            try server.handlePing(&frame, socket);
+        }
+        fn receive(entry: *H2PoolEntry) anyerror!void {
+            _ = try entry.h2.processOneFrameLocked(&entry.socket, &entry.socket);
+        }
+    };
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    for (std.enums.values(Mode)) |mode| {
+        var listener = try socket_mod.TcpListener.init(.{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } }, io);
+        defer listener.deinit();
+        var socket = try Socket.connect(listener.getLocalAddress(), io);
+        defer socket.close();
+        var accepted = try listener.accept();
+        defer accepted.socket.close();
+        if (!socket.native_timeouts) return error.SkipZigTest;
+        try socket.setRecvTimeout(500);
+        try accepted.socket.setRecvTimeout(500);
+        if (mode == .blocked_wire) {
+            const receive_size: u32 = 4096;
+            try std.posix.setsockopt(accepted.socket.handle, std.posix.SOL.SOCKET, std.posix.SO.RCVBUF, std.mem.asBytes(&receive_size));
+            try socket.setSendTimeout(10);
+            var payload: [64 * 1024]u8 = @splat('p');
+            var saturated = false;
+            for (0..4096) |_| {
+                _ = socket.send(&payload) catch |err| {
+                    if (err != error.Timeout) return err;
+                    saturated = true;
+                    break;
+                };
+            }
+            try std.testing.expect(saturated);
+            try socket.setSendTimeout(0);
+        }
+        var entry: H2PoolEntry = .{ .socket = socket, .session = undefined, .h2 = H2Connection.initClient(alloc, io), .is_tls = false, .io = io, .ping_timeout_ms = if (mode == .healthy) 500 else if (mode == .expired) 0 else 30 };
+        defer entry.h2.deinit();
+        // A stale ready event cannot rescue a missing or expired ACK.
+        entry.h2.ping_ack_event.set(io);
+        var locked = mode == .held_lock;
+        if (locked) try std.testing.expect(entry.h2.write_mutex.tryLock());
+        defer if (locked) entry.h2.write_mutex.unlock(io);
+        var peer: ?Io.Future(anyerror!void) = null;
+        defer if (peer) |*task| task.cancel(io) catch {};
+        var receive: ?Io.Future(anyerror!void) = null;
+        defer if (receive) |*task| task.cancel(io) catch {};
+        if (mode == .healthy) {
+            peer = try io.concurrent(Peer.run, .{ &accepted.socket, io });
+            receive = try io.concurrent(Peer.receive, .{&entry});
+        }
+        var probe: Probe = .{ .entry = &entry };
+        var task = try io.concurrent(Probe.run, .{&probe});
+        defer {
+            // Even a broken implementation must relinquish the injected holder
+            // before joining its task; observation never retires entry ownership.
+            if (locked) {
+                entry.h2.write_mutex.unlock(io);
+                locked = false;
+            }
+            task.cancel(io);
+        }
+        try probe.done.waitTimeout(io, .{ .duration = .{ .raw = .fromSeconds(1), .clock = .awake } });
+        task.await(io);
+        if (mode == .healthy) {
+            try probe.result;
+            try peer.?.await(io);
+            peer = null;
+            try receive.?.await(io);
+            receive = null;
+            try std.testing.expect(!entry.broken);
+        } else {
+            try std.testing.expectError(error.Timeout, probe.result);
+            try std.testing.expect(entry.broken);
+            try std.testing.expect(entry.h2.send_window_event.isSet());
+        }
+        if (locked) {
+            try std.testing.expect(!entry.h2.write_mutex.tryLock());
+        } else {
+            try std.testing.expect(entry.h2.write_mutex.tryLock());
+            entry.h2.write_mutex.unlock(io);
+        }
+        try std.testing.expectEqual(@as(usize, 0), entry.h2.stream_manager.activeStreamCount());
+        if (mode == .missing_ack) {
+            var frame: [17]u8 = undefined;
+            var received: usize = 0;
+            while (received < frame.len) {
+                const n = try accepted.socket.recv(frame[received..]);
+                if (n == 0) return error.TestUnexpectedResult;
+                received += n;
+            }
+            try std.testing.expectEqual(@as(u8, 6), frame[3]);
+            try std.testing.expectEqualStrings("h2ping\x00\x00", frame[9..]);
+        }
+    }
+}
+
+const python_h2_tls_probe_server =
+    \\import socket, ssl, sys, time
+    \\ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    \\ctx.load_cert_chain('cert.pem', 'key.pem')
+    \\ctx.set_alpn_protocols(['h2'])
+    \\ctx.minimum_version = ctx.maximum_version = getattr(ssl.TLSVersion, sys.argv[2])
+    \\listener = socket.socket()
+    \\listener.settimeout(3)
+    \\listener.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
+    \\listener.bind(('127.0.0.1', 0))
+    \\listener.listen(1)
+    \\print(listener.getsockname()[1], flush=True)
+    \\raw, _ = listener.accept()
+    \\raw.settimeout(3)
+    \\with ctx.wrap_socket(raw, server_side=True) as conn:
+    \\    print('ready', flush=True)
+    \\    if sys.argv[1] == 'blocked_wire':
+    \\        time.sleep(3)
+    \\    else:
+    \\        frame = b''
+    \\        while len(frame) < 17:
+    \\            part = conn.recv(17 - len(frame))
+    \\            if not part: raise EOFError('missing probe')
+    \\            frame += part
+    \\        assert frame[:9] == bytes([0, 0, 8, 6, 0, 0, 0, 0, 0]), frame
+    \\        assert frame[9:] == b'h2ping\x00\x00', frame
+    \\        if sys.argv[1] == 'healthy':
+    \\            conn.sendall(frame[:4] + bytes([1]) + frame[5:])
+    \\            print('acknowledged', flush=True)
+    \\        else:
+    \\            assert conn.recv(1) == b'', 'probe must shut down on missing ACK'
+    \\            print('retired', flush=True)
+;
+
+test "H2 health probe TLS preserves transport controls through wire deadline and ACK retirement" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const Mode = enum { healthy, blocked_wire, missing_ack };
+    const Probe = struct {
+        entry: *H2PoolEntry,
+        done: Io.Event = .unset,
+        result: anyerror!void = undefined,
+        fn run(self: *@This()) void {
+            self.result = Client.h2PingProbe(self.entry);
+            self.done.set(self.entry.io);
+        }
+        fn receive(entry: *H2PoolEntry) anyerror!void {
+            const reader = try entry.session.getReader();
+            const writer = try entry.session.getWriter();
+            _ = entry.h2.processOneFrameLocked(reader, writer) catch |err| {
+                std.debug.print("TLS_PROBE receive failed={s}\n", .{@errorName(err)});
+                return err;
+            };
+            std.debug.print("TLS_PROBE receive completed ack={any}\n", .{entry.h2.ping_ack_event.isSet()});
+        }
+        fn oldControl(_: ?*anyopaque) socket_mod.WriteControl.Error!void {
+            return error.Canceled;
+        }
+    };
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    const python_override = std.testing.environ.getAlloc(alloc, "ANTFLY_TEST_TLS_PYTHON") catch |err| switch (err) {
+        error.EnvironmentVariableMissing => null,
+        else => return err,
+    };
+    defer if (python_override) |path| alloc.free(path);
+    const python = python_override orelse "python3";
+    for ([_][]const u8{ "TLSv1_2", "TLSv1_3" }) |version| for (std.enums.values(Mode)) |mode| {
+        std.debug.print("TLS_PROBE version={s} mode={s} stage=start\n", .{ version, @tagName(mode) });
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        try tmp.dir.writeFile(io, .{ .sub_path = "cert.pem", .data = test_tls_cert_pem });
+        try tmp.dir.writeFile(io, .{ .sub_path = "key.pem", .data = test_tls_key_pem });
+        try tmp.dir.writeFile(io, .{ .sub_path = "server.py", .data = python_h2_tls_probe_server });
+        var child = std.process.spawn(io, .{ .argv = &.{ python, "server.py", @tagName(mode), version }, .cwd = .{ .dir = tmp.dir }, .stdin = .ignore, .stdout = .pipe, .stderr = .inherit }) catch |err| switch (err) {
+            error.FileNotFound => return error.SkipZigTest,
+            else => return err,
+        };
+        defer child.kill(io);
+        var stdout_buffer: [128]u8 = undefined;
+        var stdout_reader = child.stdout.?.readerStreaming(io, &stdout_buffer);
+        const line = (try stdout_reader.interface.takeDelimiter('\n')) orelse return error.TestServerExited;
+        const port = try std.fmt.parseUnsigned(u16, line, 10);
+        var entry: H2PoolEntry = .{ .socket = try Socket.connect(.{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = port } }, io), .session = TlsSession.init(TlsConfig.insecure(alloc), io), .h2 = H2Connection.initClient(alloc, io), .is_tls = true, .io = io, .ping_timeout_ms = if (mode == .healthy) 500 else 30 };
+        defer entry.socket.close();
+        defer entry.session.deinit();
+        defer entry.h2.deinit();
+        if (!entry.socket.native_timeouts) return error.SkipZigTest;
+        entry.socket.setRequestDeadline(requestDeadlineMs(io, 2000));
+        entry.session.attachSocket(&entry.socket);
+        try entry.session.handshake("127.0.0.1");
+        try std.testing.expectEqual(if (std.mem.eql(u8, version, "TLSv1_2")) std.crypto.tls.ProtocolVersion.tls_1_2 else .tls_1_3, entry.session.client.?.tls_version);
+        try std.testing.expectEqualStrings("ready", (try stdout_reader.interface.takeDelimiter('\n')) orelse return error.TestServerExited);
+        entry.socket.setRequestDeadline(null);
+        try entry.socket.setRecvTimeout(500);
+        if (mode == .blocked_wire) {
+            const send_size: u32 = 4096;
+            try std.posix.setsockopt(entry.socket.handle, std.posix.SOL.SOCKET, std.posix.SO.SNDBUF, std.mem.asBytes(&send_size));
+            try entry.socket.setSendTimeout(10);
+            var payload: [64 * 1024]u8 = @splat('t');
+            var saturated = false;
+            for (0..4096) |_| {
+                _ = entry.session.write(&payload) catch |err| {
+                    try std.testing.expectEqual(error.WriteFailed, err);
+                    try std.testing.expectEqual(@as(?anyerror, error.Timeout), entry.session.net_out.?.last_write_error);
+                    saturated = true;
+                    break;
+                };
+            }
+            try std.testing.expect(saturated);
+            try entry.socket.setSendTimeout(0);
+        }
+        var marker: u8 = 0;
+        const prior: socket_mod.WriteControl = .{ .ptr = &marker, .check_fn = Probe.oldControl };
+        entry.session.net_out.?.control = prior;
+        const reader_control = entry.session.net_in.?.control;
+        var receive: ?Io.Future(anyerror!void) = if (mode == .healthy) try io.concurrent(Probe.receive, .{&entry}) else null;
+        defer if (receive) |*task| {
+            entry.socket.shutdown();
+            task.cancel(io) catch {};
+        };
+        var probe: Probe = .{ .entry = &entry };
+        var task = try io.concurrent(Probe.run, .{&probe});
+        defer {
+            entry.socket.shutdown();
+            task.cancel(io);
+        }
+        try probe.done.waitTimeout(io, .{ .duration = .{ .raw = .fromSeconds(1), .clock = .awake } });
+        task.await(io);
+        if (mode == .healthy) {
+            try probe.result;
+            try receive.?.await(io);
+            receive = null;
+            try std.testing.expectEqualStrings("acknowledged", (try stdout_reader.interface.takeDelimiter('\n')) orelse return error.TestServerExited);
+            try std.testing.expect(!entry.broken);
+        } else {
+            if (mode == .missing_ack) try std.testing.expectError(error.Timeout, probe.result) else {
+                try std.testing.expectError(error.WriteFailed, probe.result);
+                try std.testing.expectEqual(@as(?anyerror, error.Timeout), entry.session.net_out.?.last_write_error);
+            }
+            try std.testing.expect(entry.broken);
+            try std.testing.expect(entry.h2.send_window_event.isSet());
+            if (mode == .missing_ack) try std.testing.expectEqualStrings("retired", (try stdout_reader.interface.takeDelimiter('\n')) orelse return error.TestServerExited);
+        }
+        const restored = entry.session.net_out.?.control.?;
+        try std.testing.expectEqual(prior.ptr, restored.ptr);
+        try std.testing.expectEqual(prior.check_fn, restored.check_fn);
+        try std.testing.expectEqual(prior.remaining_ms_fn, restored.remaining_ms_fn);
+        try std.testing.expectEqual(prior.wait_begin_fn, restored.wait_begin_fn);
+        try std.testing.expectEqual(prior.wait_end_fn, restored.wait_end_fn);
+        try std.testing.expectEqual(reader_control.ptr, entry.session.net_in.?.control.ptr);
+        try std.testing.expectEqual(reader_control.check_fn, entry.session.net_in.?.control.check_fn);
+        try std.testing.expectEqual(reader_control.remaining_ms_fn, entry.session.net_in.?.control.remaining_ms_fn);
+        try std.testing.expectEqual(reader_control.wait_begin_fn, entry.session.net_in.?.control.wait_begin_fn);
+        try std.testing.expectEqual(reader_control.wait_end_fn, entry.session.net_in.?.control.wait_end_fn);
+        try std.testing.expect(entry.session.transport_control == null);
+        try std.testing.expect(entry.h2.write_mutex.tryLock());
+        entry.h2.write_mutex.unlock(io);
+        try std.testing.expectEqual(@as(usize, 0), entry.h2.stream_manager.activeStreamCount());
+    };
+}
+
 test "HTTPS client uploads large immutable packs without truncation" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
@@ -6761,7 +8197,7 @@ test "H1 direct connections disable Nagle" {
     defer listener.deinit();
     var client = Client.init(std.testing.allocator, io);
     defer client.deinit();
-    var socket = try client.connectHostDirect("127.0.0.1", listener.getLocalAddress().getPort());
+    var socket = try client.connectHostDirect("127.0.0.1", listener.getLocalAddress().getPort(), null);
     defer socket.close();
     var value: c_int = 0;
     var size: std.posix.socklen_t = @sizeOf(c_int);

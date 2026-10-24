@@ -229,7 +229,7 @@ pub const Ledger = struct {
         errdefer alloc.free(path);
         const root = try alloc.dupe(u8, lifecycle_root);
         errdefer alloc.free(root);
-        const wal = try wal_mod.WAL.open(path.ptr, options.wal_options);
+        const wal = try wal_mod.WAL.openWithAllocator(alloc, path.ptr, options.wal_options);
         return .{
             .alloc = alloc,
             .root = root,

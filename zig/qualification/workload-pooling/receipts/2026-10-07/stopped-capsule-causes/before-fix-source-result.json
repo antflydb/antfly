@@ -1,0 +1,8 @@
+{
+  "base_commit": "068594bebae59c525458a06a70084cce262ca4c9",
+  "fixture": "Base scheduler implementation with the strengthened denied-reentry regression test, in a separate temporary copy.",
+  "source_sha256": {
+    "bounded_admission.zig": "de3752df68796efa72f122cc02ca56b030b367bacfc21fa314b853c21bbaa732",
+    "runnable_scheduler.zig": "80971f36f557a54b7dad2268f0b2c4abc645d9f7c60fd269dfa2eef706901921"
+  }
+}

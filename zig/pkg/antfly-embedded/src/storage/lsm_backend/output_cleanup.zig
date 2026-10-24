@@ -20,6 +20,7 @@
 const std = @import("std");
 const resources = @import("../resource_manager.zig");
 const sync = @import("antfly_platform").sync;
+const admission = @import("../../common/read_admission.zig");
 
 pub const Queue = struct {
     allocator: std.mem.Allocator,
@@ -31,6 +32,7 @@ pub const Queue = struct {
     bytes: @import("antfly_platform").atomic.Value(u64) = .init(0),
     manager: ?*resources.ResourceManager = null,
     wake_context: ?*anyopaque = null,
+    /// Nonblocking notification only, including from admitted queue handoff.
     wake_fn: ?*const fn (*anyopaque) void = null,
 
     /// Reserved ticket allocations have a single accounting owner. Without
@@ -54,18 +56,40 @@ pub const Queue = struct {
     }
 
     pub fn append(self: *Queue, ticket: *Ticket) void {
-        ticket.next = null;
         sync.lockYielding(&self.mutex);
+        self.appendLocked(ticket);
+        self.mutex.unlock();
+        if (self.wake_fn) |wake| wake(self.wake_context.?);
+    }
+
+    pub fn appendWithAdmission(self: *Queue, ticket: *Ticket, original: admission.Port) !void {
+        try @import("../../common/bounded_mutex.zig").lockAtomic(&self.mutex, original);
+        self.appendLocked(ticket);
+        self.mutex.unlock();
+        if (self.wake_fn) |wake| wake(self.wake_context.?);
+    }
+
+    fn appendLocked(self: *Queue, ticket: *Ticket) void {
+        ticket.next = null;
         if (self.tail) |tail| tail.next = ticket else self.head = ticket;
         self.tail = ticket;
         _ = self.pending.fetchAdd(1, .release);
-        self.mutex.unlock();
-        if (self.wake_fn) |wake| wake(self.wake_context.?);
     }
 
     pub fn pop(self: *Queue) ?*Ticket {
         sync.lockYielding(&self.mutex);
         defer self.mutex.unlock();
+        return self.popLocked();
+    }
+
+    /// Rejected admission leaves the obligation in the queue.
+    pub fn popWithAdmission(self: *Queue, original: admission.Port) !?*Ticket {
+        try @import("../../common/bounded_mutex.zig").lockAtomic(&self.mutex, original);
+        defer self.mutex.unlock();
+        return self.popLocked();
+    }
+
+    fn popLocked(self: *Queue) ?*Ticket {
         const ticket = self.head orelse return null;
         self.head = ticket.next;
         if (self.head == null) self.tail = null;
@@ -78,7 +102,23 @@ pub const Queue = struct {
     /// Normal sync first transfers every pending ticket to the durable ledger.
     pub fn deinit(self: *Queue) void {
         while (self.pop()) |ticket| ticket.destroy();
+        if (self.manager) |manager| while (self.live.load(.acquire) != 0) {
+            if (manager.drainPayloadRetirementQuiesced() == 0) @import("antfly_platform").time.yieldBriefly();
+        };
         std.debug.assert(self.live.load(.acquire) == 0);
+    }
+
+    /// All ticket owners must first commit/abandon, and the pending deletion
+    /// obligations must be handed to the durable ledger before joining memory.
+    pub fn joinRetirementsWithAdmission(self: *Queue, io: std.Io, original: admission.Port) !void {
+        try original.checkpoint();
+        if (self.pending.load(.acquire) != 0) return error.ResourceBudgetExceeded;
+        const manager = self.manager orelse return error.ExecutionWaitUnsupported;
+        while (self.live.load(.acquire) != 0) {
+            _ = try manager.drainForegroundPayloadRetirementWithAdmission(original);
+            if (self.live.load(.acquire) == 0) return;
+            try @import("../../common/cleanup_wait.zig").waitForRetry(io, original);
+        }
     }
 };
 
@@ -87,18 +127,154 @@ pub const Ticket = struct {
     path: []u8,
     next: ?*Ticket = null,
     reservation: ?resources.Reservation = null,
+    retirement: resources.PayloadRetirement = .{},
 
     pub fn abandon(self: *Ticket) void {
         self.queue.append(self);
     }
 
+    pub fn abandonWithAdmission(self: *Ticket, original: admission.Port) !void {
+        try self.prepareRetirementWithAdmission(original);
+        try self.queue.appendWithAdmission(self, original);
+    }
+
+    fn prepareRetirementWithAdmission(self: *Ticket, original: admission.Port) !void {
+        if (self.retirement.credit != null) return;
+        _ = try Creation.memoryBound(self.path.len);
+        const manager = self.queue.manager orelse return error.ExecutionWaitUnsupported;
+        const credit = if (self.reservation) |*reservation| reservation else return error.ResourceAccountingMismatch;
+        try manager.registerExistingPayloadRetirementWithAdmission(&self.retirement, credit, self, destroyRegistered, original);
+    }
+
+    /// Upgrade a legacy ticket without fresh payload credit, then hand it to
+    /// the manager. Rejected registration leaves sole ownership with caller.
+    pub fn retireWithAdmission(self: *Ticket, original: admission.Port) !void {
+        try self.prepareRetirementWithAdmission(original);
+        self.retirement.publish();
+    }
+
     pub fn destroy(self: *Ticket) void {
+        if (self.retirement.credit != null) {
+            self.retirement.publish(); // Final ticket access; manager owns it.
+            return;
+        }
         const queue = self.queue;
-        _ = queue.live.fetchSub(1, .monotonic);
-        _ = queue.bytes.fetchSub(@sizeOf(Ticket) + self.path.len, .monotonic);
-        if (self.reservation) |*lease| lease.release();
+        var reservation = self.reservation;
+        const bytes = @sizeOf(Ticket) + self.path.len;
         queue.allocator.free(self.path);
         queue.allocator.destroy(self);
+        _ = queue.bytes.fetchSub(bytes, .monotonic);
+        _ = queue.live.fetchSub(1, .release);
+        if (reservation) |*lease| lease.release();
+    }
+
+    fn destroyRegistered(raw: *anyopaque) void {
+        comptime std.debug.assert(@sizeOf(Ticket) + 4096 <= 16 * 1024);
+        const self: *Ticket = @ptrCast(@alignCast(raw));
+        const queue = self.queue;
+        const bytes = @sizeOf(Ticket) + self.path.len;
+        queue.allocator.free(self.path);
+        queue.allocator.destroy(self);
+        _ = queue.bytes.fetchSub(bytes, .monotonic);
+        // Queue lifetime joins this final release before freeing its allocator.
+        _ = queue.live.fetchSub(1, .release);
+    }
+};
+
+/// Retained construction, including allocation/registration refusal. Fixed
+/// caller-owned header; queue, manager, allocator and input outlive it. Input
+/// may be released after successful construction. No original port is retained.
+pub const Creation = struct {
+    const Phase = enum { reserve, path, copy, ticket, register, ready, taken, retired };
+    queue: *Queue,
+    input: []const u8,
+    path: ?[]u8 = null,
+    ticket: ?*Ticket = null,
+    credit: ?resources.ConstructionCredit = null,
+    phase: Phase = .reserve,
+    registered: bool = false,
+    retiring: bool = false,
+
+    pub fn init(queue: *Queue, path: []const u8) Creation {
+        return .{ .queue = queue, .input = path };
+    }
+    pub fn memoryBound(path_len: usize) !usize {
+        if (path_len == 0) return error.InvalidArgument;
+        if (path_len >= std.fs.max_path_bytes or path_len > 4096) return error.NameTooLong;
+        return @sizeOf(Ticket) + path_len;
+    }
+    pub fn resumeWithAdmission(self: *Creation, original: admission.Port) !void {
+        if (self.retiring or self.phase == .taken or self.phase == .retired) return error.InvalidArgument;
+        const manager = self.queue.manager orelse return error.ExecutionWaitUnsupported;
+        const bytes = try memoryBound(self.input.len);
+        while (self.phase != .ready) {
+            try original.checkpoint();
+            switch (self.phase) {
+                .reserve => {
+                    self.credit = try manager.reserveConstructionWithAdmission(.lsm_table_builder_working_set, bytes, original);
+                    self.phase = .path;
+                },
+                .path => {
+                    self.path = try self.queue.allocator.alloc(u8, self.input.len);
+                    self.phase = .copy;
+                },
+                .copy => {
+                    @memcpy(self.path.?, self.input);
+                    self.phase = .ticket;
+                },
+                .ticket => {
+                    const ticket = try self.queue.allocator.create(Ticket);
+                    ticket.* = .{ .queue = self.queue, .path = self.path.? };
+                    self.path = null;
+                    self.ticket = ticket;
+                    self.phase = .register;
+                },
+                .register => {
+                    const ticket = self.ticket.?;
+                    try manager.registerPayloadRetirementWithAdmission(&ticket.retirement, &ticket.reservation, &self.credit.?, ticket, Ticket.destroyRegistered, original);
+                    self.credit = null;
+                    self.registered = true;
+                    _ = self.queue.live.fetchAdd(1, .monotonic);
+                    _ = self.queue.bytes.fetchAdd(bytes, .monotonic);
+                    self.phase = .ready;
+                },
+                .ready, .taken, .retired => unreachable,
+            }
+        }
+    }
+    pub fn take(self: *Creation) !*Ticket {
+        if (self.phase != .ready or self.retiring) return error.InvalidArgument;
+        const ticket = self.ticket.?;
+        self.ticket = null;
+        self.phase = .taken;
+        return ticket;
+    }
+    pub fn retireWithAdmission(self: *Creation, original: ?admission.Port) !void {
+        if (self.phase == .retired) return;
+        self.retiring = true;
+        if (self.ticket) |ticket| {
+            if (self.registered) ticket.destroy() else {
+                if (ticket.path.len != 0) {
+                    if (original) |control| try control.checkpoint();
+                    self.queue.allocator.free(ticket.path);
+                    ticket.path = &.{};
+                }
+                if (original) |control| try control.checkpoint();
+                self.queue.allocator.destroy(ticket);
+            }
+            self.ticket = null;
+        }
+        if (self.path) |path| {
+            if (original) |control| try control.checkpoint();
+            self.queue.allocator.free(path);
+            self.path = null;
+        }
+        if (self.credit) |*credit| credit.retire();
+        self.credit = null;
+        self.phase = .retired;
+    }
+    pub fn deinit(self: *Creation) void {
+        self.retireWithAdmission(null) catch unreachable;
     }
 };
 
@@ -321,5 +497,254 @@ test "output cleanup off-lock handoff scaling benchmark" {
         // This rootless fixture measures only the ownership handoff, not
         // durable ledger admission or physical deletion.
         while (queue.pop()) |ticket| ticket.destroy();
+    }
+}
+
+const Fault = struct {
+    checks: usize = 0,
+    at: usize = std.math.maxInt(usize),
+    failure: anyerror = error.Canceled,
+    rejected: bool = false,
+    reject_wait: bool = false,
+    fn check(raw: *anyopaque) !void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        const at = self.checks;
+        self.checks += 1;
+        if (!self.rejected and at == self.at) {
+            self.rejected = true;
+            return self.failure;
+        }
+    }
+    fn wait(raw: *anyopaque) !void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        if (self.reject_wait) return self.failure;
+        return error.UnexpectedWait;
+    }
+    fn payload(self: *@This()) admission.Payload {
+        return .{ .ptr = self, .vtable = &.{ .checkpoint = check, .wait_for_progress = wait } };
+    }
+};
+const FundedAllocator = struct {
+    manager: *resources.ResourceManager,
+    live: usize = 0,
+    calls: usize = 0,
+    fail_at: usize = std.math.maxInt(usize),
+    fn allocator(self: *@This()) std.mem.Allocator {
+        return .{ .ptr = self, .vtable = &.{ .alloc = alloc, .resize = std.mem.Allocator.noResize, .remap = std.mem.Allocator.noRemap, .free = free } };
+    }
+    fn alloc(raw: *anyopaque, len: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        std.debug.assert(self.manager.sliceStats(.lsm_table_builder_working_set).used_bytes >= self.live + len);
+        const index = self.calls;
+        self.calls += 1;
+        if (index == self.fail_at) return null;
+        const ptr = std.testing.allocator.rawAlloc(len, alignment, ra) orelse return null;
+        self.live += len;
+        return ptr;
+    }
+    fn free(raw: *anyopaque, bytes: []u8, alignment: std.mem.Alignment, ra: usize) void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        std.debug.assert(self.manager.sliceStats(.lsm_table_builder_working_set).used_bytes >= self.live);
+        std.testing.allocator.rawFree(bytes, alignment, ra);
+        self.live -= bytes.len;
+    }
+};
+fn finishCreation(creation: *Creation, original: admission.Port, fault: *Fault) !void {
+    while (true) {
+        creation.resumeWithAdmission(original) catch |cause| {
+            try std.testing.expectEqual(fault.failure, cause);
+            continue;
+        };
+        return;
+    }
+}
+fn checkCreationRejection(at: usize, failure: anyerror) !usize {
+    const a = std.testing.allocator;
+    var manager = resources.ResourceManager.init(.{ .identity_allocator = a });
+    defer manager.deinit(a);
+    var witness: FundedAllocator = .{ .manager = &manager };
+    var queue: Queue = .{ .allocator = witness.allocator(), .manager = &manager };
+    defer queue.deinit();
+    var fault: Fault = .{ .at = at, .failure = failure };
+    const payload = fault.payload();
+    const original = admission.Port.init(&payload);
+    var creation = Creation.init(&queue, "registered-output");
+    defer creation.deinit();
+    try finishCreation(&creation, original, &fault);
+    const checks = fault.checks;
+    if (at != std.math.maxInt(usize)) try std.testing.expect(fault.rejected);
+    try std.testing.expectEqual(@as(usize, 2), witness.calls);
+    try std.testing.expectEqual(@as(usize, 1), queue.live.load(.acquire));
+    const bytes = try Creation.memoryBound("registered-output".len);
+    try std.testing.expectEqual(bytes, witness.live);
+    try std.testing.expectEqual(@as(u64, bytes), manager.sliceStats(.lsm_table_builder_working_set).used_bytes);
+    var owned: ?*Ticket = try creation.take();
+    defer if (owned) |ticket| ticket.destroy();
+    try std.testing.expectEqualStrings("registered-output", owned.?.path);
+    try std.testing.expectError(error.InvalidArgument, creation.take());
+    owned.?.destroy();
+    owned = null;
+    // Retirement publication cannot release either the physical bytes or credit.
+    try std.testing.expectEqual(@as(usize, 1), queue.live.load(.acquire));
+    try std.testing.expectEqual(bytes, witness.live);
+    try queue.joinRetirementsWithAdmission(std.testing.io, original);
+    try std.testing.expectEqual(@as(usize, 0), witness.live);
+    try std.testing.expectEqual(@as(u64, 0), manager.sliceStats(.lsm_table_builder_working_set).used_bytes);
+    try resources.qualifyNoLiveReservations(&manager);
+    return checks;
+}
+
+test "controlled physical sync cleanup ticket prepays every allocation and preserves all original construction rejections" {
+    const count = try checkCreationRejection(std.math.maxInt(usize), error.Canceled);
+    for ([_]anyerror{ error.Canceled, error.DeadlineExceeded, error.FileNotFound }) |failure| {
+        for (0..count) |at| {
+            _ = try checkCreationRejection(at, failure);
+        }
+    }
+}
+
+test "controlled physical sync cleanup ticket allocation refusal and abandoned partial construction retain exact funding" {
+    const a = std.testing.allocator;
+    for ([_]bool{ false, true }) |recover| for (0..2) |at| {
+        var manager = resources.ResourceManager.init(.{ .identity_allocator = a });
+        defer manager.deinit(a);
+        var witness: FundedAllocator = .{ .manager = &manager, .fail_at = at };
+        var queue: Queue = .{ .allocator = witness.allocator(), .manager = &manager };
+        defer queue.deinit();
+        var fault: Fault = .{};
+        const payload = fault.payload();
+        const original = admission.Port.init(&payload);
+        var creation = Creation.init(&queue, "allocation-refusal");
+        defer creation.deinit();
+        try std.testing.expectError(error.OutOfMemory, creation.resumeWithAdmission(original));
+        try std.testing.expect(creation.credit != null and creation.phase != .ready);
+        try std.testing.expectEqual(@as(usize, 0), queue.live.load(.acquire));
+        witness.fail_at = std.math.maxInt(usize);
+        if (recover) {
+            try creation.resumeWithAdmission(original);
+            const ticket = try creation.take();
+            ticket.destroy();
+            try queue.joinRetirementsWithAdmission(std.testing.io, original);
+        } else {
+            if (witness.live != 0) {
+                fault.at = fault.checks;
+                try std.testing.expectError(error.Canceled, creation.retireWithAdmission(original));
+                try std.testing.expect(creation.retiring and creation.credit != null);
+                try std.testing.expectError(error.InvalidArgument, creation.resumeWithAdmission(original));
+            }
+            try creation.retireWithAdmission(original);
+        }
+        try std.testing.expectEqual(@as(usize, 0), witness.live);
+        try resources.qualifyNoLiveReservations(&manager);
+    };
+}
+
+test "controlled physical sync cleanup ticket admission denial allocates nothing and rejected queue waiting transfers nothing" {
+    const a = std.testing.allocator;
+    var budgets = resources.Options.defaultBudgets();
+    budgets[@backingInt(resources.Slice.lsm_table_builder_working_set)] = .{ .hard_limit_bytes = 1 };
+    var manager = resources.ResourceManager.init(.{ .identity_allocator = a, .budgets = budgets });
+    defer manager.deinit(a);
+    var witness: FundedAllocator = .{ .manager = &manager };
+    var queue: Queue = .{ .allocator = witness.allocator(), .manager = &manager };
+    defer queue.deinit();
+    var fault: Fault = .{};
+    const payload = fault.payload();
+    const original = admission.Port.init(&payload);
+    var refused = Creation.init(&queue, "unfunded");
+    defer refused.deinit();
+    try std.testing.expectError(error.ResourceBudgetExceeded, refused.resumeWithAdmission(original));
+    try std.testing.expectEqual(@as(usize, 0), witness.calls);
+    // Raise only the test slice ceiling, then construct a funded ticket.
+    manager.slices[@backingInt(resources.Slice.lsm_table_builder_working_set)].budget.hard_limit_bytes = 4096;
+    var creation = Creation.init(&queue, "queued-output");
+    defer creation.deinit();
+    try creation.resumeWithAdmission(original);
+    const ticket = try creation.take();
+    try std.testing.expect(queue.mutex.tryLock());
+    fault.reject_wait = true;
+    const rejected = ticket.abandonWithAdmission(original);
+    queue.mutex.unlock();
+    fault.reject_wait = false;
+    try std.testing.expectError(error.Canceled, rejected);
+    try std.testing.expectEqual(@as(usize, 0), queue.pending.load(.acquire));
+    try std.testing.expect(queue.head == null and ticket.next == null);
+    try ticket.abandonWithAdmission(original);
+    try std.testing.expectEqual(@as(usize, 1), queue.pending.load(.acquire));
+    try std.testing.expectError(error.ResourceBudgetExceeded, queue.joinRetirementsWithAdmission(std.testing.io, original));
+    try std.testing.expect(queue.pop().? == ticket);
+    ticket.destroy();
+    try queue.joinRetirementsWithAdmission(std.testing.io, original);
+    try std.testing.expectEqual(@as(usize, 0), witness.live);
+    try resources.qualifyNoLiveReservations(&manager);
+}
+
+test "controlled physical sync cleanup ticket destruction retains parent accounting debt after releasing all physical memory" {
+    const a = std.testing.allocator;
+    var parent = try resources.metadata_fixture.init(.{ .identity_allocator = a });
+    defer parent.deinit(a);
+    var manager = try resources.metadata_fixture.init(.{ .identity_allocator = a });
+    defer manager.deinit(a);
+    try resources.metadata_fixture.installParent(&manager, &parent);
+    var witness: FundedAllocator = .{ .manager = &manager };
+    var queue: Queue = .{ .allocator = witness.allocator(), .manager = &manager };
+    defer queue.deinit();
+    var fault: Fault = .{};
+    const payload = fault.payload();
+    const original = admission.Port.init(&payload);
+    var creation = Creation.init(&queue, "parent-debt");
+    defer creation.deinit();
+    try creation.resumeWithAdmission(original);
+    const ticket = try creation.take();
+    const charged = manager.sliceStats(.lsm_table_builder_working_set).used_bytes;
+    ticket.destroy();
+    try std.testing.expect(parent.mutex.tryLock());
+    const result = manager.drainPayloadRetirementWithAdmission(original);
+    parent.mutex.unlock();
+    _ = try result;
+    try std.testing.expectEqual(@as(usize, 0), witness.live);
+    try std.testing.expectEqual(@as(usize, 0), queue.live.load(.acquire));
+    try std.testing.expectEqual(charged, manager.sliceStats(.lsm_table_builder_working_set).used_bytes);
+    try std.testing.expect(manager.cleanupPending());
+    try manager.drainConstructionCleanupWithAdmission(original);
+    try std.testing.expectEqual(@as(u64, 0), manager.sliceStats(.lsm_table_builder_working_set).used_bytes);
+    try resources.qualifyNoLiveReservations(&manager);
+}
+
+test "controlled physical sync legacy cleanup tickets upgrade registration without new payload credit or raw scoped release" {
+    const a = std.testing.allocator;
+    for ([_]bool{ false, true }) |commit| {
+        var manager = resources.ResourceManager.init(.{ .identity_allocator = a });
+        defer manager.deinit(a);
+        var witness: FundedAllocator = .{ .manager = &manager };
+        var queue: Queue = .{ .allocator = witness.allocator(), .manager = &manager };
+        defer queue.deinit();
+        var owned: ?*Ticket = try queue.create("legacy-output");
+        defer if (owned) |ticket| ticket.destroy();
+        const ticket = owned.?;
+        const before = manager.snapshot().memory.used_bytes;
+        var fault: Fault = .{ .at = 0 };
+        const payload = fault.payload();
+        const original = admission.Port.init(&payload);
+        const refused = if (commit) ticket.retireWithAdmission(original) else ticket.abandonWithAdmission(original);
+        try std.testing.expectError(error.Canceled, refused);
+        try std.testing.expect(ticket.retirement.credit == null and queue.pending.load(.acquire) == 0);
+        try std.testing.expectEqual(before, manager.snapshot().memory.used_bytes);
+        if (commit) {
+            try ticket.retireWithAdmission(original);
+            owned = null;
+        } else {
+            try ticket.abandonWithAdmission(original);
+            owned = null;
+            try std.testing.expectEqual(before, manager.snapshot().memory.used_bytes);
+            owned = queue.pop().?;
+            try std.testing.expect(owned.? == ticket);
+            owned.?.destroy();
+            owned = null;
+        }
+        try std.testing.expectEqual(@as(usize, 2), witness.calls);
+        try queue.joinRetirementsWithAdmission(std.testing.io, original);
+        try std.testing.expectEqual(@as(usize, 0), witness.live);
+        try resources.qualifyNoLiveReservations(&manager);
     }
 }

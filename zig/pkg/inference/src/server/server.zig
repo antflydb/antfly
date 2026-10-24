@@ -119,7 +119,25 @@ const InferenceExecutionControl = execution_control_mod.InferenceExecutionContro
 const cancellable_rerank_batch_size: usize = 8;
 const native_call_cancellation_grace_ns: u64 = 5 * std.time.ns_per_s;
 
+const borrowed_http_control_key = "antfly.inference.borrowed_execution_control";
+
+/// The caller owns this control until the synchronous handler has joined. It
+/// carries progress and the serial executor without adding a second HTTP ABI.
+pub fn installHttpExecutionControl(ctx: *httpx.Context, control: *const InferenceExecutionControl) !void {
+    try ctx.setData(borrowed_http_control_key, @constCast(control), null);
+}
+
 fn httpInferenceExecutionControl(node: *Node, ctx: *httpx.Context) InferenceExecutionControl {
+    const context_deadline = ctx.nativeDeadlineInClock(platform.time.monotonicNs);
+    if (ctx.getData(borrowed_http_control_key)) |raw| {
+        const borrowed: *const InferenceExecutionControl = @ptrCast(@alignCast(raw));
+        var control = borrowed.*;
+        if (context_deadline) |deadline| control.deadline_ns = @min(control.deadline_ns orelse deadline, deadline);
+        if (control.hard_cancellation == null) {
+            if (node.hard_cancellation_watchdog) |watchdog| control.hard_cancellation = watchdog.boundary();
+        }
+        return control;
+    }
     const Check = struct {
         fn check(raw: ?*anyopaque) !void {
             const request: *const httpx.Context = @ptrCast(@alignCast(raw.?));
@@ -134,7 +152,7 @@ fn httpInferenceExecutionControl(node: *Node, ctx: *httpx.Context) InferenceExec
     return .{
         .io = ctx.io,
         .native_call_policy = node.session_manager.native_call_policy,
-        .deadline_ns = ctx.application_deadline_ns,
+        .deadline_ns = context_deadline,
         .cancellation_grace_ns = native_call_cancellation_grace_ns,
         .ptr = ctx,
         .check_fn = Check.check,
@@ -1265,6 +1283,10 @@ pub const NodeConfig = struct {
     executor_microbatch_max_wait_us: u64 = 200,
     kernel_jit: graph_mod.kernel_jit.Config = .{},
     prompt_cache: PromptCacheConfig = .{},
+    /// Physical host cache buffers use this allocator; its owner outlives models.
+    /// Native cache estimates are not billed again; GPU observation remains
+    /// conservative until device-buffer ownership has a physical admission port.
+    prompt_cache_allocator: ?std.mem.Allocator = null,
     prompt_cache_resource_usage_observer: ?runtime.kv.prompt_cache.ResourceUsageObserver = null,
     tokenizer_cache: hf_tokenizer_mod.HfTokenizer.BpeCacheConfig = .{},
     tokenizer_parallel_bpe: hf_tokenizer_mod.HfTokenizer.ParallelBpeConfig = .{},
@@ -3835,6 +3857,10 @@ test "direct generation rejects non-generator manifests before execution" {
     );
 }
 
+pub fn ExecutorAdmissionProvider(comptime RuntimeAbi: type) type {
+    return @import("runnable_execution.zig").ProviderFor(@import("../execution_control.zig"), RuntimeAbi);
+}
+
 fn usesDeclaredSpanV2Route(manifest: manifest_mod.ModelManifest) bool {
     return manifest.gliner_architecture == .span and manifest.gliner_span_declared;
 }
@@ -4011,6 +4037,7 @@ pub const Node = struct {
     /// Ownership is here, rather than the storage BackendRuntime, because Node
     /// owns resolved model generations and concrete fused executor callbacks.
     executor_microbatch_broker: ?executor_microbatch.Broker = null,
+    executor_admission: ?executor_microbatch.ExecutionAdmission = null,
     executor_microbatch_init_mutex: std.atomic.Mutex = .unlocked,
     admission_metrics_mutex: std.atomic.Mutex = .unlocked,
     compatibility_cache: std.StringHashMapUnmanaged(*CachedCompatibility) = .empty,
@@ -4096,6 +4123,18 @@ pub const Node = struct {
         }
     };
 
+    /// Host buffers use the admitted allocator; CUDA and Metal buffers carry
+    /// independent physical credits through actual resource retirement.
+    pub fn promptCacheRuntimeConfig(self: *const Node, backend: runtime.kv.pool.BackendKind) runtime.kv.prompt_cache.Config {
+        const physical = self.config.prompt_cache_allocator != null and
+            (backend == .native or ((backend == .cuda or backend == .metal) and self.model_manager.hasPromptCacheDeviceBudget()));
+        const observer = if (physical)
+            null
+        else
+            self.config.prompt_cache_resource_usage_observer;
+        return self.config.prompt_cache.runtimeConfig(observer);
+    }
+
     pub fn init(allocator: std.mem.Allocator, supplied_config: NodeConfig) !Node {
         var config = supplied_config;
         config.chunking_limits = try config.chunking_limits.environment(allocator);
@@ -4152,6 +4191,7 @@ pub const Node = struct {
             .compatibility_cache = .empty,
             .hard_cancellation_watchdog = hard_cancellation_watchdog,
         };
+        node.model_manager.prompt_cache_allocator = config.prompt_cache_allocator;
         try node.model_manager.configureResourceOwnership(config.resource_ownership);
         node.model_manager.configureProcessMemoryLimit(
             config.process_memory_limit_bytes,
@@ -4298,11 +4338,44 @@ pub const Node = struct {
         self.compatibility_cache.deinit(self.allocator);
     }
 
+    /// Startup-only installation. The host retains the provider/owner until
+    /// all requests join and Node teardown disposes the broker.
+    pub fn configureExecutorAdmission(self: *Node, admission: executor_microbatch.ExecutionAdmission) !void {
+        if (self.request_surfaces_published or self.executor_admission != null)
+            return error.InvalidRunnableTransition;
+        // Preload calls may have created an unscheduled broker. Warmup has
+        // joined before installation; replace it before request publication.
+        if (self.executor_microbatch_broker) |*broker| broker.deinit();
+        self.executor_microbatch_broker = null;
+        self.executor_admission = admission;
+    }
+
+    pub fn testExecutorAdmission(self: *Node) !void {
+        if (!builtin.is_test) @compileError("test-only executor admission fixture");
+        const Executor = struct {
+            fn run(_: *anyopaque, items: []const executor_microbatch.ExecuteItem) void {
+                std.debug.assert(@import("inference_linalg").pool.scopedWorkerLimit() == 1);
+                for (items) |item| item.slot.setValue(usize, item.payloadAs(usize).*, .serial);
+            }
+        };
+        const payload: usize = 42;
+        const broker = self.executorMicrobatchBroker();
+        const result = try broker.submit(usize, usize, std.testing.io, std.testing.allocator, .{ .model = "fixture", .task = .embed, .resource_class = .cpu }, .{ .mode = .serial_compatibility, .preferred_items = 1, .max_items = 1 }, .{}, .{}, null, null, &payload, self, Executor.run);
+        try std.testing.expectEqual(payload, result.result.value);
+        const values = [_]usize{ 1, 2 };
+        const results = try broker.submitBatchControlled(usize, usize, std.testing.io, std.testing.allocator, .{ .model = "fixture", .task = .embed, .resource_class = .cpu }, .{ .mode = .native, .preferred_items = 2, .max_items = 2 }, &.{ .{}, .{} }, &.{ .{}, .{} }, null, .{}, &values, self, Executor.run);
+        defer std.testing.allocator.free(results);
+        for (results, values) |value, expected| try std.testing.expectEqual(expected, value.result.value);
+    }
+
     fn executorMicrobatchBroker(self: *Node) *executor_microbatch.Broker {
         spinLock(&self.executor_microbatch_init_mutex);
         defer self.executor_microbatch_init_mutex.unlock();
         if (self.executor_microbatch_broker == null)
-            self.executor_microbatch_broker = executor_microbatch.Broker.init(self.allocator);
+            self.executor_microbatch_broker = if (self.executor_admission) |admission|
+                executor_microbatch.Broker.initWithAdmission(self.allocator, admission)
+            else
+                executor_microbatch.Broker.init(self.allocator);
         return &self.executor_microbatch_broker.?;
     }
 
@@ -5922,7 +5995,7 @@ pub const Node = struct {
         var active_kv_storage: ?*runtime.kv.storage_runtime.KvStorageRuntime = null;
         var pool_id: runtime.kv.block.KvPoolId = undefined;
         if (prompt_cache_requested) {
-            const prompt_cache_config = self.config.prompt_cache.runtimeConfig(self.config.prompt_cache_resource_usage_observer);
+            const prompt_cache_config = self.promptCacheRuntimeConfig(backend_kind);
             self.model_manager.rebalancePromptCaches(model, prompt_cache_config);
             const cache_ready = if (backend_kind == .metal or backend_kind == .cuda) blk: {
                 const ensured = model.prompt_prefix_cache.ensureStorage(kv_pool_config) catch |err| {
@@ -5966,6 +6039,7 @@ pub const Node = struct {
         else
             null;
         defer if (kv_storage) |*storage| storage.deinit();
+        if (kv_storage) |*storage| storage.device_memory_budget = model.prompt_prefix_cache.device_memory_budget;
         if (kv_storage) |*storage| try cb.provisionKvDeviceWriteHook(storage);
         var decode_state = generation.NativeDecodeState.initPaged(allocator, active_kv_manager, pool_id, model.shared_moe_cache);
         if (active_kv_storage) |storage| {
@@ -6963,7 +7037,7 @@ pub const Node = struct {
                 item.slot.fail(err);
                 continue;
             };
-            item.slot.setValue(if (scoring) []f32 else []gliner_mod.Entity, row, @fromBackingInt(@backingInt(observation.execution(items.len))));
+            item.slot.setOwnedValue(if (scoring) []f32 else []gliner_mod.Entity, row, @fromBackingInt(@backingInt(observation.execution(items.len))), shared, free);
         }
     }
 
@@ -6984,6 +7058,11 @@ pub const Node = struct {
         var pipeline = embedding_mod.EmbeddingPipeline.init(allocator, model.session, model.getTokenizer(), .{ .text_prefix = model.manifest.embedding_profile.document.prefix });
         const owned = try applyDenseEmbeddingRequestOptions(allocator, &pipeline, &model.manifest, .{ .model = "", .input = .null, .encoding_format = null, .dimensions = null, .task_type = task_type, .instruction = instruction });
         return .{ .prefix = pipeline.config.text_prefix, .owned = owned };
+    }
+
+    fn freeReadRow(allocator: std.mem.Allocator, result: readers_api.Result) void {
+        var owned = result;
+        readers_api.deinitResult(allocator, &owned);
     }
 
     fn freeDenseRow(allocator: std.mem.Allocator, row: []f32) void {
@@ -7086,7 +7165,7 @@ pub const Node = struct {
                 item.slot.fail(err);
                 continue;
             };
-            item.slot.setValue(DirectSparseEmbedding, row, @fromBackingInt(@backingInt(observation.execution(items.len))));
+            item.slot.setOwnedValue(DirectSparseEmbedding, row, @fromBackingInt(@backingInt(observation.execution(items.len))), alloc, freeSparseRow);
         }
     }
 
@@ -7121,7 +7200,7 @@ pub const Node = struct {
                 item.slot.fail(err);
                 continue;
             };
-            item.slot.setValue([]f32, vector, @fromBackingInt(@backingInt(observation.execution(items.len))));
+            item.slot.setOwnedValue([]f32, vector, @fromBackingInt(@backingInt(observation.execution(items.len))), alloc, freeDenseRow);
         }
     }
 
@@ -7208,7 +7287,7 @@ pub const Node = struct {
                 item.slot.fail(err);
                 continue;
             };
-            item.slot.setValue([]f32, row, @fromBackingInt(@backingInt(batch.execution)));
+            item.slot.setOwnedValue([]f32, row, @fromBackingInt(@backingInt(batch.execution)), shared, freeDenseRow);
         }
     }
 
@@ -7431,11 +7510,11 @@ pub const Node = struct {
                 item.slot.fail(err);
                 continue;
             };
-            item.slot.setValue([]f32, vector, switch (batch.execution) {
+            item.slot.setOwnedValue([]f32, vector, switch (batch.execution) {
                 .native_batch => .native_batch,
                 .serial => .serial,
                 .fallback => .fallback,
-            });
+            }, alloc, freeDenseRow);
         }
         alloc.free(vectors);
     }
@@ -8503,7 +8582,7 @@ pub const Node = struct {
                 item.slot.fail(err);
                 continue;
             };
-            item.slot.setValue(readers_api.Result, result, execution);
+            item.slot.setOwnedValue(readers_api.Result, result, execution, item.allocator, freeReadRow);
         }
     }
 
@@ -8611,7 +8690,7 @@ pub const Node = struct {
                 item.slot.fail(err);
                 continue;
             };
-            item.slot.setValue(readers_api.Result, result, execution);
+            item.slot.setOwnedValue(readers_api.Result, result, execution, item.allocator, freeReadRow);
         }
     }
 
@@ -13818,9 +13897,7 @@ pub const Node = struct {
             effective_draft_model_name == null and
             config.cache_compaction_ratio == null)
         {
-            const prompt_cache_config = self.config.prompt_cache.runtimeConfig(
-                self.config.prompt_cache_resource_usage_observer,
-            );
+            const prompt_cache_config = self.promptCacheRuntimeConfig(backend_kind);
             self.model_manager.rebalancePromptCaches(
                 model,
                 prompt_cache_config,
@@ -13873,6 +13950,7 @@ pub const Node = struct {
         else
             null;
         defer if (kv_storage) |*storage| storage.deinit();
+        if (kv_storage) |*storage| storage.device_memory_budget = model.prompt_prefix_cache.device_memory_budget;
         if (kv_storage) |*storage| {
             cb.provisionKvDeviceWriteHook(storage) catch |err|
                 return ctx.status(500).json(.{ .@"error" = "BACKEND_ERROR", .message = @errorName(err) });
@@ -13947,6 +14025,7 @@ pub const Node = struct {
             .gpt_config = gpt_config,
             .kv_dtype = kv_dtype,
             .shared_moe_cache = model.shared_moe_cache,
+            .device_memory_budget = model.prompt_prefix_cache.device_memory_budget,
             .tokenizer = tok,
             .add_bos_token = model.manifest.add_bos_token,
             .bos_token = model.manifest.bos_token,
@@ -15870,6 +15949,7 @@ pub const Node = struct {
                     continue;
                 };
                 defer kv_storage.deinit();
+                kv_storage.device_memory_budget = model.prompt_prefix_cache.device_memory_budget;
                 if (shared_cb) |*cb| {
                     cb.provisionKvDeviceWriteHook(&kv_storage) catch |err| {
                         for (group_indices.items) |idx| {
@@ -15949,6 +16029,7 @@ pub const Node = struct {
                             .gpt_config = gpt_config,
                             .kv_dtype = kv_dtype,
                             .shared_moe_cache = model.shared_moe_cache,
+                            .device_memory_budget = model.prompt_prefix_cache.device_memory_budget,
                             .tokenizer = model.getTokenizer(),
                             .add_bos_token = model.manifest.add_bos_token,
                             .bos_token = model.manifest.bos_token,
@@ -20431,7 +20512,7 @@ pub const Node = struct {
         const request = public_request.inner;
         var owned_io: ?std.Io.Threaded = null;
         defer if (owned_io) |*io_impl| io_impl.deinit();
-        const io = self.inferenceIo(a, null, &owned_io);
+        const io = (if (control) |active| active.io else null) orelse self.inferenceIo(a, null, &owned_io);
         const path = self.resolveRequestModelPath(a, io, request.model, "extractors") catch |err| switch (err) {
             error.ModelNotFound => try self.resolveRequestModelPath(a, io, request.model, "embedders"),
             else => return err,
@@ -40142,6 +40223,64 @@ test "embeddinggemma2 video partial DASH pretrained windows preserve vectors acr
     }
     try std.testing.expect(max_error <= if (metal) @as(f32, 1e-3) else @as(f32, 1e-4));
     std.debug.print("partial DASH live pretrained metal={} windows={d} callbacks={d} early={d} prefix=2 requests={d} max_error={d:.9}\n", .{ metal, capture.count, capture.calls, capture.early, transport.requests, max_error });
+}
+
+test "runnable execution HTTP native deadline preserves borrowed authority and intersects context time" {
+    const State = struct {
+        fn check(_: ?*anyopaque) !void {}
+    };
+    var node: Node = undefined;
+    node.hard_cancellation_watchdog = null;
+    var request = try httpx.Request.init(std.testing.allocator, .GET, "/");
+    defer request.deinit();
+    var context = httpx.Context.init(std.testing.allocator, std.testing.io, &request);
+    defer context.deinit();
+    var marker: u8 = 0;
+    var borrowed: InferenceExecutionControl = .{ .deadline_ns = 1000, .ptr = &marker, .check_fn = State.check, .io = std.testing.io };
+    try installHttpExecutionControl(&context, &borrowed);
+    context.application_deadline_ns = 50;
+    var result = httpInferenceExecutionControl(&node, &context);
+    try std.testing.expectEqual(@as(?u64, 50), result.deadline_ns);
+    try std.testing.expect(result.ptr == borrowed.ptr and result.check_fn == borrowed.check_fn);
+    context.application_deadline_ns = 5000;
+    try std.testing.expectEqual(@as(?u64, 1000), httpInferenceExecutionControl(&node, &context).deadline_ns);
+    borrowed.deadline_ns = 0;
+    try std.testing.expectEqual(@as(?u64, 0), httpInferenceExecutionControl(&node, &context).deadline_ns);
+    borrowed.deadline_ns = 1000;
+    context.application_deadline_ns = null;
+    result = httpInferenceExecutionControl(&node, &context);
+    try std.testing.expectEqual(borrowed.deadline_ns, result.deadline_ns);
+    try std.testing.expect(result.ptr == borrowed.ptr and result.check_fn == borrowed.check_fn);
+}
+
+test "runnable execution HTTP native deadline projects Io time for borrowed and fallback controls" {
+    const Clock = struct {
+        fn now(_: ?*anyopaque, _: std.Io.Clock) std.Io.Timestamp {
+            return .{ .nanoseconds = 500 * std.time.ns_per_s };
+        }
+    };
+    var vtable = std.Io.failing.vtable.*;
+    vtable.now = Clock.now;
+    const source_io: std.Io = .{ .userdata = null, .vtable = &vtable };
+    var node: Node = undefined;
+    node.hard_cancellation_watchdog = null;
+    node.session_manager.native_call_policy = .require_supervision;
+    var request = try httpx.Request.init(std.testing.allocator, .GET, "/");
+    defer request.deinit();
+    for ([_]bool{ false, true }) |with_borrowed| {
+        var context = httpx.Context.init(std.testing.allocator, source_io, &request);
+        defer context.deinit();
+        context.application_deadline_ns = 500 * std.time.ns_per_s + 200 * std.time.ns_per_ms;
+        context.application_deadline_io = source_io;
+        var borrowed: InferenceExecutionControl = .{ .deadline_ns = platform.time.monotonicNs() + std.time.ns_per_s };
+        if (with_borrowed) try installHttpExecutionControl(&context, &borrowed);
+        const before = platform.time.monotonicNs();
+        const result = httpInferenceExecutionControl(&node, &context);
+        const after = platform.time.monotonicNs();
+        try std.testing.expect(result.deadline_ns.? >= before + 200 * std.time.ns_per_ms);
+        try std.testing.expect(result.deadline_ns.? <= after + 200 * std.time.ns_per_ms);
+        try std.testing.expectEqual(@as(?u64, 500 * std.time.ns_per_s + 200 * std.time.ns_per_ms), context.application_deadline_ns);
+    }
 }
 
 /// Serialize exact token bytes directly. Building a JSON Value for every byte

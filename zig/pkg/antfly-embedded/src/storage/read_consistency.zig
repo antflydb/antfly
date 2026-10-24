@@ -48,11 +48,22 @@ pub const ReadIndexRequester = struct {
 pub const ReadSafetyBarrier = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
+    boundary_dispatch: Abi.Dispatch = Abi.local_dispatch,
+
+    const Wait = @import("../common/execution_wait.zig").Boundary;
+    const Abi = @import("../runtime_callback_abi.zig").Boundary(VTable);
 
     pub const VTable = struct {
         wait_read_safe: *const fn (ptr: *anyopaque, group_id: u64, request_ctx: []const u8) anyerror!void,
         capture_frozen: ?*const fn (*anyopaque, u64) anyerror!FrozenProof = null,
         validate_frozen: ?*const fn (*anyopaque, u64, FrozenProof, ?u64, @import("antfly_cancellation").CancellationToken) anyerror!void = null,
+        /// The provider releases execution only at genuine wait points inside
+        /// the barrier. Wrapping its entire callback would release CPU too.
+        wait_read_safe_with_execution: ?*const fn (*anyopaque, u64, []const u8, Wait) anyerror!void = null,
+        validate_frozen_with_admission: ?*const fn (*anyopaque, u64, FrozenProof, ?u64, @import("antfly_cancellation").CancellationToken, @import("../common/read_admission.zig").Port) anyerror!void = null,
+        /// For an immutable cut already certified under its short mutation
+        /// fence. Ordinary Raft progress must not force recapture of that cut.
+        validate_retained_snapshot: ?*const fn (*anyopaque, u64, FrozenProof, ?u64, @import("antfly_cancellation").CancellationToken, ?@import("../common/read_admission.zig").Port) anyerror!void = null,
     };
 
     pub const FrozenProof = struct {
@@ -64,10 +75,82 @@ pub const ReadSafetyBarrier = struct {
             if (!is_leader or incarnation != self.incarnation or term != self.term) return error.NotLeader;
             if (quorum_index > self.applied_index) return error.ReadUnavailable;
         }
+
+        /// Unlike the capture freeze, a certified immutable snapshot tolerates
+        /// newer commits. It still requires its original Raft incarnation/term,
+        /// a current leader quorum, and a state machine which has not regressed.
+        pub fn validateRetained(self: @This(), incarnation: u128, term: u64, is_leader: bool, applied_index: u64, quorum_index: u64) !void {
+            if (!is_leader or incarnation != self.incarnation or term != self.term) return error.NotLeader;
+            if (applied_index < self.applied_index or quorum_index < self.applied_index) return error.ReadUnavailable;
+        }
     };
 
+    /// Translate callback errors in the provider image before returning to
+    /// the consumer. A raw call can reinterpret compilation-local error IDs.
+    pub fn captureFrozen(self: ReadSafetyBarrier, group: u64) !FrozenProof {
+        const capture = self.vtable.capture_frozen orelse return error.SqlStatementSnapshotRequired;
+        return Abi.call("capture_frozen", self.boundary_dispatch, capture, .{ self.ptr, group });
+    }
+
+    pub fn validateFrozen(self: ReadSafetyBarrier, group: u64, proof: FrozenProof, deadline: ?u64, cancellation: @import("antfly_cancellation").CancellationToken) !void {
+        return self.validateFrozenWithAdmission(group, proof, deadline, cancellation, null);
+    }
+    pub fn validateFrozenWithAdmission(self: ReadSafetyBarrier, group: u64, proof: FrozenProof, deadline: ?u64, cancellation: @import("antfly_cancellation").CancellationToken, control: ?@import("../common/read_admission.zig").Port) !void {
+        var bounded = deadline;
+        if (control) |port| {
+            try port.checkpoint();
+            if (try port.deadlineNs()) |original| bounded = @min(bounded orelse original, original);
+        }
+        if (control) |port| {
+            if (self.vtable.validate_frozen_with_admission) |callback| {
+                try Abi.call("validate_frozen_with_admission", self.boundary_dispatch, callback, .{ self.ptr, group, proof, bounded, cancellation, port });
+                try port.checkpoint();
+                return;
+            }
+        }
+        const callback = self.vtable.validate_frozen orelse return error.SqlStatementSnapshotRequired;
+        // Legacy callbacks retain CPU; only providers may identify actual waits.
+        try Abi.call("validate_frozen", self.boundary_dispatch, callback, .{ self.ptr, group, proof, bounded, cancellation });
+        if (control) |port| try port.checkpoint();
+    }
+
+    /// Only use after capture was certified while mutation was frozen. This
+    /// checks continued serving authority, without changing the captured cut.
+    pub fn validateRetainedSnapshotWithAdmission(self: ReadSafetyBarrier, group: u64, proof: FrozenProof, deadline: ?u64, cancellation: @import("antfly_cancellation").CancellationToken, control: ?@import("../common/read_admission.zig").Port) !void {
+        var bounded = deadline;
+        if (control) |port| {
+            try port.checkpoint();
+            if (try port.deadlineNs()) |original| bounded = @min(bounded orelse original, original);
+        }
+        if (self.vtable.validate_retained_snapshot) |callback| {
+            try Abi.call("validate_retained_snapshot", self.boundary_dispatch, callback, .{ self.ptr, group, proof, bounded, cancellation, control });
+            if (control) |port| try port.checkpoint();
+        } else {
+            // A legacy provider may conservatively reject newer commits; never
+            // silently accept an owner that cannot revalidate its authority.
+            try self.validateFrozenWithAdmission(group, proof, bounded, cancellation, control);
+        }
+    }
+
+    /// Wait for quorum observation using the Raft owner's Io/clock, not the
+    /// API caller's progress scheduler. Registration/proof work retains CPU.
+    pub fn waitFrozenProgress(io: std.Io, control: ?@import("../common/read_admission.zig").Port) !void {
+        const wait = if (control) |port| try port.executionWait() else null;
+        if (wait) |boundary| try boundary.beginWait();
+        const result = io.sleep(.fromMilliseconds(1), .awake);
+        if (wait) |boundary| try boundary.endWait();
+        if (control) |port| try port.checkpoint();
+        try result;
+    }
+
     pub fn waitReadSafe(self: ReadSafetyBarrier, group_id: u64, request_ctx: []const u8) !void {
-        try self.vtable.wait_read_safe(self.ptr, group_id, request_ctx);
+        try Abi.call("wait_read_safe", self.boundary_dispatch, self.vtable.wait_read_safe, .{ self.ptr, group_id, request_ctx });
+    }
+
+    pub fn waitReadSafeWithExecution(self: ReadSafetyBarrier, group_id: u64, request_ctx: []const u8, wait: ?Wait) !void {
+        const boundary = wait orelse return self.waitReadSafe(group_id, request_ctx);
+        const callback = self.vtable.wait_read_safe_with_execution orelse return error.ExecutionWaitUnsupported;
+        try Abi.call("wait_read_safe_with_execution", self.boundary_dispatch, callback, .{ self.ptr, group_id, request_ctx, boundary });
     }
 };
 
@@ -106,11 +189,13 @@ pub fn alreadyReadSafeBarrier() ReadSafetyBarrier {
         .ptr = undefined,
         .vtable = &.{
             .wait_read_safe = waitReadSafeNoop,
+            .wait_read_safe_with_execution = waitReadSafeNoopWithExecution,
         },
     };
 }
 
 fn waitReadSafeNoop(_: *anyopaque, _: u64, _: []const u8) !void {}
+fn waitReadSafeNoopWithExecution(_: *anyopaque, _: u64, _: []const u8, _: ReadSafetyBarrier.Wait) !void {}
 
 /// Fail-closed placeholder for a replicated read source whose owner has not
 /// installed its applied-state barrier yet.
@@ -119,11 +204,15 @@ pub fn unavailableReadSafetyBarrier() ReadSafetyBarrier {
         .ptr = undefined,
         .vtable = &.{
             .wait_read_safe = waitReadSafeUnavailable,
+            .wait_read_safe_with_execution = waitReadSafeUnavailableWithExecution,
         },
     };
 }
 
 fn waitReadSafeUnavailable(_: *anyopaque, _: u64, _: []const u8) !void {
+    return error.ReadSafetyBarrierUnavailable;
+}
+fn waitReadSafeUnavailableWithExecution(_: *anyopaque, _: u64, _: []const u8, _: ReadSafetyBarrier.Wait) !void {
     return error.ReadSafetyBarrierUnavailable;
 }
 
@@ -211,8 +300,10 @@ pub const EnrichmentReadGate = struct {
     ) !void {
         _ = from_key;
         _ = to_key;
-        _ = opts;
-        try self.prepare(group_id, .scan, consistency);
+        if (consistency == .stale) return;
+        var buf: [96]u8 = undefined;
+        const request_ctx = try enrichmentRequestContext(&buf, .scan, consistency);
+        try self.barrier.waitReadSafeWithExecution(group_id, request_ctx, opts.execution_wait);
     }
 };
 

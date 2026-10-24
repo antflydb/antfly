@@ -18,6 +18,11 @@
 pub const antfly_sources = @import("source_owner_storage.zig");
 
 const std = @import("std");
+// The final native link owns one pthread signal stack. Keep crash handlers.
+pub const std_options: std.Options = .{
+    .signal_stack_size = if (@import("builtin").link_libc and
+        (@import("builtin").os.tag == .macos or (@import("builtin").os.tag == .linux and @import("builtin").abi.isGnu()))) null else 1 << 18,
+};
 
 const bridge = @import("runtime_bridge.zig");
 
@@ -87,6 +92,9 @@ comptime {
     exportInternal(&storage_kernel_exports.storageOwnerContextConfigureRemoteContentSource, "antfly_storage_context_configure_remote_content_source");
     exportInternal(&storage_kernel_exports.storageOwnerContextConfigureRemoteContentSecurity, "antfly_storage_context_configure_remote_content_security");
     exportInternal(&storage_kernel_exports.storageOwnerContextMetrics, "antfly_storage_context_metrics");
+    exportInternal(&storage_kernel_exports.storageOwnerContextReserveExternal, "antfly_storage_context_reserve_external");
+    exportInternal(&storage_kernel_exports.storageOwnerContextReleaseExternal, "antfly_storage_context_release_external");
+    exportInternal(&storage_kernel_exports.storageOwnerContextMemoryParent, "antfly_storage_context_memory_parent");
     exportInternal(&storage_kernel_exports.storageOwnerContextInvalidateCaches, "antfly_storage_context_invalidate_caches");
     exportInternal(&storage_kernel_exports.storageContextSystemStoreOpen, "antfly_storage_context_system_store_open");
     exportInternal(&storage_kernel_exports.storageSystemStoreClose, "antfly_storage_system_store_close");
@@ -123,6 +131,8 @@ comptime {
     exportInternal(&storage_kernel_exports.metadataApplyPreparedSnapshotCancel, "antfly_metadata_apply_prepared_snapshot_cancel");
     exportInternal(&storage_kernel_exports.metadataApplyPreparedSnapshotDestroy, "antfly_metadata_apply_prepared_snapshot_destroy");
     exportInternal(&storage_kernel_exports.metadataApplyStoreProjection, "antfly_metadata_apply_store_projection");
+    exportInternal(&storage_kernel_exports.metadataApplyStoreControlRouting, "antfly_metadata_apply_store_control_routing");
+    exportInternal(&storage_kernel_exports.metadataApplyStoreTransactionRouting, "antfly_metadata_apply_store_transaction_routing");
     exportInternal(&storage_kernel_exports.metadataApplyStoreBindHotStandby, "antfly_metadata_apply_store_bind_ha");
     exportInternal(&storage_kernel_exports.metadataApplyStoreAddListeners, "antfly_metadata_apply_store_add_listeners");
     exportInternal(&storage_kernel_exports.metadataApplyStoreRemoveListeners, "antfly_metadata_apply_store_remove_listeners");
@@ -151,6 +161,7 @@ comptime {
     exportInternal(&storage_kernel_exports.storageOwnerLocalTransition, "antfly_storage_owner_local_transition");
     exportInternal(&storage_kernel_exports.storageOwnerOpen, "antfly_storage_owner_open");
     exportInternal(&storage_kernel_exports.storageOwnerClose, "antfly_storage_owner_close");
+    exportInternal(&storage_kernel_exports.storageOwnerDrainClose, "antfly_storage_owner_drain_close");
     exportInternal(&storage_kernel_exports.storageHotStandbySeedActivateJson, "antfly_storage_hot_standby_seed_activate_json");
     exportInternal(&storage_kernel_exports.storageHotStandbySeedValidateJson, "antfly_storage_hot_standby_seed_validate_json");
     exportInternal(&storage_kernel_exports.storageHotStandbySeedPruneJson, "antfly_storage_hot_standby_seed_prune_json");
@@ -162,11 +173,17 @@ comptime {
     exportInternal(&storage_kernel_exports.storageOwnerBulkFinish, "antfly_storage_owner_bulk_finish");
     exportInternal(&storage_kernel_exports.storageOwnerBulkAbort, "antfly_storage_owner_bulk_abort");
     exportInternal(&storage_kernel_exports.storageOwnerBatchJson, "antfly_storage_owner_batch_json");
+    exportInternal(&storage_kernel_exports.storageOwnerBatchJsonWithAdmission, "antfly_storage_owner_batch_json_with_admission");
+    exportInternal(&storage_kernel_exports.storageOwnerTransactionBeginWithAdmission, "antfly_storage_owner_transaction_begin_with_admission");
+    exportInternal(&storage_kernel_exports.storageOwnerTransactionPrepareWithAdmission, "antfly_storage_owner_transaction_prepare_with_admission");
+    exportInternal(&storage_kernel_exports.storageOwnerTransactionAcknowledgeWithAdmission, "antfly_storage_owner_transaction_acknowledge_with_admission");
+    exportInternal(&storage_kernel_exports.storageOwnerTransactionResolveWithAdmission, "antfly_storage_owner_transaction_resolve_with_admission");
     exportInternal(&storage_kernel_exports.storageOwnerReplicatedBatchJson, "antfly_storage_owner_replicated_batch_json");
     exportInternal(&storage_kernel_exports.storageOwnerReplicatedBatchAtRaftEntryJson, "antfly_storage_owner_replicated_batch_at_raft_entry_json");
     exportInternal(&storage_kernel_exports.storageOwnerNativeInitialChildControlJson, "antfly_storage_owner_native_initial_child_control_json");
     exportInternal(&storage_kernel_exports.storageOwnerNativeFkGenerationControlJson, "antfly_storage_owner_native_fk_generation_control_json");
     exportInternal(&storage_kernel_exports.storageOwnerTransactionStatus, "antfly_storage_owner_transaction_status");
+    exportInternal(&storage_kernel_exports.storageOwnerTransactionPreparationStatus, "antfly_storage_owner_transaction_preparation_status");
     exportInternal(&storage_kernel_exports.storageOwnerWaitForSync, "antfly_storage_owner_wait_for_sync");
     exportInternal(&storage_kernel_exports.storageOwnerApplyHotStandbyReplicationRecord, "antfly_storage_owner_apply_hot_standby_replication_record");
     exportInternal(&storage_kernel_exports.storageOwnerBackupJson, "antfly_storage_owner_backup_json");
@@ -197,6 +214,7 @@ comptime {
     exportInternal(&storage_kernel_exports.storageOwnerResolverOperationJson, "antfly_storage_owner_resolver_operation_json");
     exportInternal(&storage_kernel_exports.storageOwnerPreflightJson, "antfly_storage_owner_preflight_json");
     exportInternal(&storage_kernel_exports.storageOwnerTextStatsJson, "antfly_storage_owner_text_stats_json");
+    exportInternal(&storage_kernel_exports.storageOwnerTextStatsControlledJson, "antfly_storage_owner_text_stats_controlled_json");
     exportInternal(&storage_kernel_exports.storageOwnerAlgebraicPartialsJson, "antfly_storage_owner_algebraic_partials_json");
     exportInternal(&storage_kernel_exports.storageAggregateJson, "antfly_storage_aggregate_json");
     exportInternal(&storage_kernel_exports.storageOwnerGraphExpandJson, "antfly_storage_owner_graph_expand_json");
@@ -212,16 +230,31 @@ comptime {
     exportInternal(&storage_kernel_exports.storageOwnerTextMemoryJson, "antfly_storage_owner_text_memory_json");
     exportInternal(&storage_kernel_exports.storageOwnerMaintenance, "antfly_storage_owner_maintenance");
     exportInternal(&storage_kernel_exports.storageWalOpen, "antfly_storage_wal_open");
+    exportInternal(&storage_kernel_exports.storageWalOpenWithAllocator, "antfly_storage_wal_open_with_allocator");
+    exportInternal(&storage_kernel_exports.storageWalReadWithAllocator, "antfly_storage_wal_read_with_allocator");
+    exportInternal(&storage_kernel_exports.storageWalOwnedReadBegin, "antfly_storage_wal_owned_read_begin");
+    exportInternal(&storage_kernel_exports.storageWalOwnedReadStep, "antfly_storage_wal_owned_read_step");
+    exportInternal(&storage_kernel_exports.storageWalOwnedReadChunk, "antfly_storage_wal_owned_read_chunk");
+    exportInternal(&storage_kernel_exports.storageWalOwnedReadDestroy, "antfly_storage_wal_owned_read_destroy");
+
+    exportInternal(&storage_kernel_exports.storageWalIterateWithAllocator, "antfly_storage_wal_iterate_with_allocator");
     exportInternal(&storage_kernel_exports.storageWalClose, "antfly_storage_wal_close");
     exportInternal(&storage_kernel_exports.storageWalAppend, "antfly_storage_wal_append");
+    exportInternal(&storage_kernel_exports.storageWalPrepareAppend, "antfly_storage_wal_prepare_append");
+    exportInternal(&storage_kernel_exports.storageWalPreparedPublish, "antfly_storage_wal_prepared_publish");
+    exportInternal(&storage_kernel_exports.storageWalPreparedDestroy, "antfly_storage_wal_prepared_destroy");
+    exportInternal(&storage_kernel_exports.storageWalRecoveryPosition, "antfly_storage_wal_recovery_position");
+    exportInternal(&storage_kernel_exports.storageWalAppendIfRecoveryPosition, "antfly_storage_wal_append_if_recovery_position");
     exportInternal(&storage_kernel_exports.storageWalAppendIdempotent, "antfly_storage_wal_append_idempotent");
     exportInternal(&storage_kernel_exports.storageWalSync, "antfly_storage_wal_sync");
     exportInternal(&storage_kernel_exports.storageWalTruncatePrefix, "antfly_storage_wal_truncate_prefix");
     exportInternal(&storage_kernel_exports.storageWalTruncateSuffix, "antfly_storage_wal_truncate_suffix");
     exportInternal(&storage_kernel_exports.storageWalIterate, "antfly_storage_wal_iterate");
     exportInternal(&storage_kernel_exports.storageWalRead, "antfly_storage_wal_read");
+    exportInternal(&storage_kernel_exports.storageWalReadWithAdmission, "antfly_storage_wal_read_with_admission");
     exportInternal(&storage_kernel_exports.storageWalStatsSnapshot, "antfly_storage_wal_stats_snapshot");
     exportInternal(&storage_kernel_exports.storageWalLastLsn, "antfly_storage_wal_last_lsn");
+    exportInternal(&storage_kernel_exports.storageWalLastLsnWithAdmission, "antfly_storage_wal_last_lsn_with_admission");
     exportInternal(&storage_kernel_exports.storageOwnerBufferDestroy, "antfly_storage_owner_buffer_destroy");
     exportInternal(&local_query_exports.execute, "antfly_local_query_execute");
     exportInternal(&local_query_exports.bufferDestroy, "antfly_local_query_buffer_destroy");

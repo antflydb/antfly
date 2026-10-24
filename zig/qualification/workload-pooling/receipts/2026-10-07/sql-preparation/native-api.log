@@ -1,0 +1,204 @@
+antfly-workload-pooling-test
++- run test default-workload-pooling-tests
+   +- run test default-workload-pooling-tests-local w
+1/36 sql.read_fence.test.read fence validates each resumed grant and forced output without caching failure...OK
+2/36 sql.read_fence.test.read fence owns bounded immutable table and policy pins across allocation failure...OK
+3/36 sql.read_fence.test.read fence invalidates a grant when binding adds a table and protects validation ownership...OK
+4/36 common.config.test.config query waiting validates complete bounds and keeps legacy defaults...OK
+5/36 common.config.test.config query waiting pgwire aggregate memory round trips...OK
+6/36 common.config.test.config query waiting retained pgwire policy validates independent budgets...OK
+7/36 common.config.test.config workload envelope validates finite allocation limits...OK
+8/36 common.config.test.config workload envelope validates retained allocation limits...OK
+9/36 common.config.test.config runnable scheduler validates canonical opt-in policy...OK
+10/36 common.request_admission.test.request admission bounds positive capacity and preserves unlimited mode...OK
+11/36 common.request_admission.test.request admission lease releases exactly once...OK
+12/36 common.request_admission.test.request admission metrics use the shared admission namespace...OK
+13/36 common.bounded_admission.test.bounded admission contextual leases measure ownership once under both policies...OK
+14/36 common.bounded_admission.test.bounded admission FIFO grant cancellation and close transfer one owner...OK
+15/36 common.bounded_admission.test.bounded admission rejects count bytes oversized and invalid policies...OK
+16/36 common.bounded_admission.test.bounded admission wait ceiling and expired fast path never execute...OK
+17/36 common.bounded_admission.test.bounded admission native queue leaves completion capacity and drains a burst...OK
+18/36 common.bounded_admission.test.bounded admission queued external cancellation retires without execution...OK
+19/36 common.bounded_admission.test.bounded admission unsupported executor remains fail fast without enqueue...OK
+20/36 common.bounded_admission.test.bounded admission live shrink preserves grants and retires newest waiters...OK
+21/36 common.bounded_admission.test.bounded admission suspension and terminal drain reconcile caller ownership...OK
+22/36 common.runnable_scheduler.test.runnable scheduler preserves blocked ownership and protected capacity...OK
+23/36 common.runnable_scheduler.test.runnable scheduler bounds backfill and grants a large operation...OK
+24/36 common.runnable_scheduler.test.runnable scheduler weighted sharing charges slots across busy classes...OK
+25/36 common.runnable_scheduler.test.runnable scheduler cancellation after grant returns every reservation...OK
+26/36 common.runnable_scheduler.test.runnable scheduler deadline and shutdown retire blocked and queued owners...OK
+27/36 common.runnable_scheduler.test.runnable scheduler yield hands execution to another operation...OK
+28/36 common.runnable_scheduler.test.runnable scheduler queue bound starts at enqueue including grant race...OK
+29/36 common.runnable_scheduler.test.runnable scheduler real queue timeout releases count and bytes...OK
+30/36 common.runnable_scheduler.test.runnable scheduler rejects invalid policy and oversized demand atomically...OK
+31/36 common.runnable_scheduler.test.runnable scheduler shutdown racing a new block cannot strand an owner...OK
+32/36 common.runnable_scheduler.test.runnable scheduler execution quanta preserve deadline and parked ownership...OK
+33/36 common.runnable_scheduler.test.runnable scheduler checkpoint work budget and disabled execution...OK
+34/36 common.runnable_scheduler.test.runnable scheduler reserves control metadata at full ordinary outstanding limits...OK
+35/36 common.runnable_metrics.test.runnable metrics distinguish disabled scheduling from configured capacity...OK
+36/36 common.runnable_metrics.test.runnable metrics preserve parked memory and separate protected execution...OK
+36 passed; 0 skipped; 0 failed; 0 leaked.
+failed command: /private/tmp/antfly-default-pooling-cache/o/f0502587c24fa1de0c77baf8705be9c3/default-workload-pooling-tests-local --suite-filter "bounded admission" --suite-filter "runnable scheduler" --suite-filter "runnable metrics" --suite-filter "workload envelope" --suite-filter "workload deadline" --suite-filter "config workload envelope" --suite-filter "pgwire retained budget" --suite-filter "pgwire shared session budget" --suite-filter "request admission bounds" --suite-filter "request admission lease" --suite-filter "request admission metrics" --suite-filter "config query waiting" --suite-filter "config runnable scheduler" --suite-filter "httpx workload policy" --suite-filter "httpx query waiting" --suite-filter "SQL query waiting" --suite-filter "httpx query admission" --suite-filter "httpx write admission" --suite-filter "SQL protected executor" --suite-filter "SQL protected control" --suite-filter "httpx stable transaction commit" --suite-filter "httpx SQL executes one relational page" --suite-filter "httpx SQL connection routes" --suite-filter "httpx SQL durable session settings" --suite-filter "SQL pgwire credential snapshot" --suite-filter "SQL read resume fences" --suite-filter "read fence validates each" --suite-filter "read fence owns bounded" --suite-filter "read fence invalidates" --allow-empty-test-filter --allow-empty-owner
+
+antfly-workload-pooling-test
++- run test default-workload-pooling-tests w
+1/39 api.sql_pgwire.test.SQL pgwire credential snapshot observes policy revocation and password rotation...OK
+2/39 api.sql_pgwire.test.SQL query waiting pgwire preserves deadline cancellation and typed parameters...OK
+3/39 api.sql_pgwire.test.workload deadline normalizes pgwire clock before native metadata handoff...OK
+4/39 api.sql_execution.test.SQL read resume fences validate live policy and catalog before continuing...read fence case success: no runnable or metadata charges
+read fence case filter: no runnable or metadata charges
+read fence case permission: no runnable or metadata charges
+read fence case roles: no runnable or metadata charges
+read fence case roles_without_filter: no runnable or metadata charges
+read fence case metadata_without_filter: no runnable or metadata charges
+read fence case unprotected_roles_change: no runnable or metadata charges
+read fence case unprotected_metadata_change: no runnable or metadata charges
+read fence case account: no runnable or metadata charges
+read fence case replacement: no runnable or metadata charges
+read fence case schema: no runnable or metadata charges
+read fence case revision: no runnable or metadata charges
+read fence case physical: no runnable or metadata charges
+read fence case key_expiry: no runnable or metadata charges
+read fence case key_deletion: no runnable or metadata charges
+read fence case during_catalog: no runnable or metadata charges
+read fence case deadline: no runnable or metadata charges
+read fence case policy_enable: no runnable or metadata charges
+read fence case policy_generation: no runnable or metadata charges
+read fence case policy_disable: no runnable or metadata charges
+read fence case policy_pending: no runnable or metadata charges
+read fence case policy_transition: no runnable or metadata charges
+OK
+5/39 api.distributed_join.test.workload envelope distributed join fanout bounds concurrency drains errors and preserves group order...OK
+6/39 api.http_server.test.workload envelope fail-fast transport reserves controls within its task ceiling...OK
+7/39 api.http_server.test.workload envelope preserves control allocation under aggregate foreground exhaustion...OK
+8/39 api.http_server.test.workload envelope pins HTTP transport and control through node memory exhaustion...OK
+9/39 api.http_server.test.workload deadline survives NDJSON lines and MCP dispatch...OK
+10/39 api.http_server.test.workload envelope accounts persistent MCP sessions and recovers from exhaustion...OK
+11/39 api.http_server.test.workload deadline bounds internal planning retrieval and administrative waits...OK
+12/39 api.httpx_handler.test.httpx stable transaction commit durably hands off recovery before acknowledgement...[warn] (default): row policy publication deferred err=UnsupportedOperation
+[warn] (default): stable transaction recovered coordinator acknowledgement deferred txn_id=000000000000000018dc3f3c72a995d8 err=InjectedAcknowledgementFailure
+[warn] (default): row policy publication deferred err=UnsupportedOperation
+[warn] (default): row policy publication deferred err=UnsupportedOperation
+OK
+13/39 api.httpx_handler.test.httpx query admission rejects saturated queries without blocking control routes...OK
+14/39 api.httpx_handler.test.httpx query admission releases a cancelled query slot...OK
+15/39 api.httpx_handler.test.httpx write admission rejects saturated table mutations...OK
+16/39 api.httpx_handler.test.httpx query admission treats zero capacity as unlimited...OK
+17/39 api.httpx_handler.test.httpx SQL durable session settings enforce scoped typed authority...OK
+18/39 api.httpx_handler.test.httpx SQL connection routes preserve settings and retire prepared resources...OK
+19/39 api.httpx_handler.test.httpx SQL executes one relational page with exact integer parameters...H2 stream handler error: error.StreamReset
+OK
+20/39 api.httpx_handler.test.httpx query waiting expires before execution and preserves original timeout...OK
+21/39 api.httpx_handler.test.SQL query waiting shares HTTP owner and retains fail fast writes...OK
+22/39 api.httpx_handler.test.httpx query waiting real sockets absorb burst and keep status responsive...OK
+23/39 api.httpx_handler.test.SQL protected executor reserves bounded workers and rolls back exhaustion...OK
+24/39 api.httpx_handler.test.SQL protected executor preserves an explicitly disabled dedicated worker budget...OK
+25/39 api.httpx_handler.test.SQL protected control transport validates typed paths before granting reserve...OK
+26/39 api.httpx_handler.test.httpx workload policy requires admin and versioned bounded updates...OK
+27/39 common.allocation_budget.test.workload envelope preserves allocation provenance across control ownership transfers...OK
+28/39 common.allocation_budget.test.workload envelope node accounting rolls back allocation and growth failures...OK
+29/39 common.allocation_budget.test.workload envelope service control survives node exhaustion and returns its pin after joins...OK
+30/39 api.sql_control.test.SQL protected control classification rejects fresh work and multiple statements...OK
+31/39 pgwire.server.test.pgwire shared session budget rejects impossible aggregate limits...OK
+32/39 pgwire.protocol.test.workload envelope pgwire authenticated startup retires partitioned frames under bulk OOM...OK
+33/39 pgwire.protocol.test.workload envelope pgwire frame parsing preserves control reserve under bulk OOM...OK
+34/39 pgwire.protocol.test.workload envelope pgwire verified simple controls acknowledge under bulk OOM...OK
+35/39 pgwire.budget.test.pgwire shared session budget bounds aggregate connections and reclaims capacity...OK
+36/39 pgwire.budget.test.pgwire shared session budget rolls back a failed backing allocation...OK
+37/39 pgwire.budget.test.pgwire retained budget independently charges aggregate and connection allocation...OK
+38/39 pgwire.budget.test.pgwire retained budget rolls back failed backing allocation...OK
+39/39 common.fanout_memory.test.workload envelope fanout children share caller charge and retire after joins...OK
+39 passed; 0 skipped; 0 failed; 0 leaked.
+failed command: /private/tmp/antfly-default-pooling-cache/o/87089f4b8e0072961b4686408d870fb5/default-workload-pooling-tests --suite-filter "bounded admission" --suite-filter "runnable scheduler" --suite-filter "runnable metrics" --suite-filter "workload envelope" --suite-filter "workload deadline" --suite-filter "config workload envelope" --suite-filter "pgwire retained budget" --suite-filter "pgwire shared session budget" --suite-filter "request admission bounds" --suite-filter "request admission lease" --suite-filter "request admission metrics" --suite-filter "config query waiting" --suite-filter "config runnable scheduler" --suite-filter "httpx workload policy" --suite-filter "httpx query waiting" --suite-filter "SQL query waiting" --suite-filter "httpx query admission" --suite-filter "httpx write admission" --suite-filter "SQL protected executor" --suite-filter "SQL protected control" --suite-filter "httpx stable transaction commit" --suite-filter "httpx SQL executes one relational page" --suite-filter "httpx SQL connection routes" --suite-filter "httpx SQL durable session settings" --suite-filter "SQL pgwire credential snapshot" --suite-filter "SQL read resume fences" --suite-filter "read fence validates each" --suite-filter "read fence owns bounded" --suite-filter "read fence invalidates" --allow-empty-test-filter --allow-empty-owner
+
+Build Summary: 50/50 steps succeeded
+antfly-workload-pooling-test success
++- run test default-workload-pooling-tests success 10s
+   +- compile test default-workload-pooling-tests safe native success 11m MaxRSS:16G
+   |  +- WriteFile macos-sdk-libc.txt cached
+   |  +- options cached
+   |  +- options cached
+   |  +- options cached
+   |  +- options cached
+   |  +- WriteFile tokenizer.json cached
+   |  +- translate-c lmdb cached
+   |  |  +- compile exe translate-c debug native cached 31ms MaxRSS:31M
+   |  |  |  +- WriteFile macos-sdk-libc.txt (reused)
+   |  |  |  +- options cached
+   |  |  |  +- options cached
+   |  |  |  +- options cached
+   |  |  |  +- run exe generate-def (aarch64.zig) cached
+   |  |  |  |  +- compile exe generate-def debug native cached 26ms MaxRSS:31M
+   |  |  |  |     +- WriteFile macos-sdk-libc.txt (reused)
+   |  |  |  +- run exe generate-def (amdgcn.zig) cached
+   |  |  |  |  +- compile exe generate-def debug native (+1 more reused dependencies)
+   |  |  |  +- run exe generate-def (arm.zig) cached
+   |  |  |  |  +- compile exe generate-def debug native (+1 more reused dependencies)
+   |  |  |  +- run exe generate-def (bpf.zig) cached
+   |  |  |  |  +- compile exe generate-def debug native (+1 more reused dependencies)
+   |  |  |  +- run exe generate-def (common.zig) cached
+   |  |  |  |  +- compile exe generate-def debug native (+1 more reused dependencies)
+   |  |  |  +- run exe generate-def (hexagon.zig) cached
+   |  |  |  |  +- compile exe generate-def debug native (+1 more reused dependencies)
+   |  |  |  +- run exe generate-def (loongarch.zig) cached
+   |  |  |  |  +- compile exe generate-def debug native (+1 more reused dependencies)
+   |  |  |  +- run exe generate-def (mips.zig) cached
+   |  |  |  |  +- compile exe generate-def debug native (+1 more reused dependencies)
+   |  |  |  +- run exe generate-def (neon.zig) cached
+   |  |  |  |  +- compile exe generate-def debug native (+1 more reused dependencies)
+   |  |  |  +- run exe generate-def (nvptx.zig) cached
+   |  |  |  |  +- compile exe generate-def debug native (+1 more reused dependencies)
+   |  |  |  +- run exe generate-def (powerpc.zig) cached
+   |  |  |  |  +- compile exe generate-def debug native (+1 more reused dependencies)
+   |  |  |  +- run exe generate-def (riscv.zig) cached
+   |  |  |  |  +- compile exe generate-def debug native (+1 more reused dependencies)
+   |  |  |  +- run exe generate-def (s390x.zig) cached
+   |  |  |  |  +- compile exe generate-def debug native (+1 more reused dependencies)
+   |  |  |  +- run exe generate-def (ve.zig) cached
+   |  |  |  |  +- compile exe generate-def debug native (+1 more reused dependencies)
+   |  |  |  +- run exe generate-def (wasm.zig) cached
+   |  |  |  |  +- compile exe generate-def debug native (+1 more reused dependencies)
+   |  |  |  +- run exe generate-def (x86_64.zig) cached
+   |  |  |  |  +- compile exe generate-def debug native (+1 more reused dependencies)
+   |  |  |  +- run exe generate-def (x86.zig) cached
+   |  |  |  |  +- compile exe generate-def debug native (+1 more reused dependencies)
+   |  |  |  +- run exe generate-def (xcore.zig) cached
+   |  |  |     +- compile exe generate-def debug native (+1 more reused dependencies)
+   |  |  +- WriteFile macos-sdk-libc.txt (reused)
+   |  +- options cached
+   |  +- options cached
+   |  +- WriteFile lib/pdf/fonts/roboto/Roboto-Regular.ttf cached
+   |  +- run exe jit-source-identity (metal_identity.zig) cached
+   |  |  +- compile exe jit-source-identity safe native cached 25ms MaxRSS:31M
+   |  |     +- WriteFile macos-sdk-libc.txt (reused)
+   |  +- options cached
+   |  +- options cached
+   |  +- run exe patch_sentencepiece_proto (sentencepiece_proto) cached
+   |     +- compile exe patch_sentencepiece_proto safe native cached 27ms MaxRSS:31M
+   |     |  +- WriteFile macos-sdk-libc.txt (reused)
+   |     +- run exe protoc-zig (sentencepiece_proto_raw) cached
+   |     |  +- compile exe protoc-zig safe native cached 29ms MaxRSS:31M
+   |     |     +- WriteFile macos-sdk-libc.txt (reused)
+   |     +- run exe protoc-zig (sentencepiece_proto_raw) (+1 more reused dependencies)
+   +- run test default-workload-pooling-tests-local success 12ms
+      +- compile test default-workload-pooling-tests-local safe native success 18s MaxRSS:1G
+      |  +- WriteFile macos-sdk-libc.txt (reused)
+      |  +- options success
+      |  +- options (reused)
+      |  +- options (reused)
+      |  +- options (reused)
+      |  +- options (reused)
+      |  +- WriteFile tokenizer.json (reused)
+      |  +- translate-c lmdb (+2 more reused dependencies)
+      |  +- options (reused)
+      |  +- WriteFile lib/pdf/fonts/roboto/Roboto-Regular.ttf (reused)
+      |  +- run exe jit-source-identity (metal_identity.zig) (+1 more reused dependencies)
+      |  +- options (reused)
+      |  +- options (reused)
+      |  +- run exe patch_sentencepiece_proto (sentencepiece_proto) (+3 more reused dependencies)
+      +- run python3 success 49ms
+         +- run test default-workload-pooling-tests success 533ms
+         |  +- compile test default-workload-pooling-tests safe native (+14 more reused dependencies)
+         +- run test default-workload-pooling-tests-local success 135ms
+            +- compile test default-workload-pooling-tests-local safe native (+14 more reused dependencies)
+

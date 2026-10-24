@@ -22,9 +22,105 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
+// Cancellation and inference checkpoints carry their owning error-domain
+// dispatcher. Reject older native handles before reading the added field.
+// Execution leases and recurring handles carry a shared-services capability.
+// Reject older native layouts before interpreting those added fields.
+// Publisher bindings now carry an optional completion-poll capability.
+// Reject the previous binding layout before any native payload is decoded.
+// Publisher recovery vtables include a controlled WAL matching callback.
+// Reject old vtables before dereferencing their changed callback layout.
+// Namespace store/read vtables include original-control snapshot and lookup callbacks.
+// Reject older layouts before interpreting these added capabilities.
+// Durable outbox callback values carry a copied immutable recovery identity.
+// Reject older native callbacks before passing the larger argument layout.
+// Namespace stores now expose owned stepped lookups and detached values.
+// Reject older namespace vtables before reading the added callback.
+// DB recovery cursors now own a funded provider continuation and destructor.
+// Reject the prior scalar-only layout before interpreting callback payloads.
+// Single-namespace stores now expose caller-owned stepped point reads.
+// Reject prior store vtables before interpreting the added callback.
+// DB local execution now owns a separate intent capture continuation.
+// Reject prior DB layouts before accessing its reader and value owners.
+// Store vtables and DB state now include an owned snapshot key cursor.
+// Reject prior layouts before interpreting the cursor and its ownership.
+// Version 19 adds retained cold-index continuations to owned namespace reads.
+// Metadata arrays and retained cursor layout must agree across native modules.
+// Version 20 adds progress-aware recovery ports and capture generations.
+// Reject earlier native retry/capture layouts before reading those fields.
+// Provider recovery progress and retry probes now carry independent tokens.
+// Reject previous cursor and progress-return layouts before interpreting them.
+// Publication owners now carry a distinct finite-step recovery callback.
+// Reject earlier owner/port layouts before interpreting the reserved path.
+// DocStore transactions now retain precommit durable publication accounting.
+// Reject earlier transaction layouts before crossing the native boundary.
+// Publisher ports now return provider-owned, precommit envelope funding.
+// Reject older callback and prepared-publication layouts.
+// Metadata and physical-maintenance completion retain prepared publication.
+// Reject previous retained-owner and publication method contracts.
+// Canonical generated-effect type identities no longer depend on physical DB owners.
+// Reject earlier native type contracts before interpreting prepared payloads.
+// Required preparation now gates transaction commit. Reject native owners
+// that do not enforce the durable requirement before resolving intents.
+// Transaction resolution carries its accepted decoded-effect owner.
+// Sealed frames retain their catalog definitions through resolution.
+// Reject older native owners that publish through that durable lease.
+// Merged inference callback dispatch and CUDA allocation ownership require
+// the combined native contract, beyond either pre-merge owner layout.
+// DocStore transactions and catalog publishers carry revision witnesses.
+// Reject earlier layouts before reading mutation flags or publication stamps.
+// Participant workers carry negotiated preparation and seal callbacks.
+// Transaction records retain their original required-preparation contract.
+// Replicated BEGIN carries an explicit required-preparation contract.
+// Accepted effect seals can atomically publish an ordered apply receipt.
+// Required transaction records and native methods retain exact seal bindings.
+// CommitControl retains a lease-fenced original participant-plan store.
+// Required status evidence carries the saved participant/route binding.
+// Typed status callbacks distinguish successful absence from original errors.
 // Tokenizer vtables include additive token-byte decoding. Reject older
 // native handles before interpreting the added callback slot.
-pub const abi_version: u32 = 10;
+// Owners must enforce prepared replay credits through inventory mutation and HA acknowledgement.
+// Backend batches can atomically reserve prepared replay credit with seals.
+// Fence merged logical-query layouts and failure/guard contracts.
+// Read transcripts distinguish an empty upper bound from clearing the bound.
+// Reject prior native observations before interpreting their bound operations.
+// Accepted seals retain and account bound observations through recovery.
+// Reject owners which can silently drop that durable preparation state.
+// Snapshot cursor semantics are explicit when compiling read-conflict gaps.
+// Reject older capability layouts before trusting those semantics.
+// Semantic range observations own bounds and membership predicates.
+// Fence prior native owners before interpreting the expanded read set.
+// Read-guard metadata carries an exact actor through native batch dispatch.
+// Semantic predicate enforcement adds typed native batch retirement.
+// Replay reservation writers retain input contracts through final commit validation.
+// Batch preparation can return owned uncommitted bytes and their witnesses.
+// Owned assemblies and resolution options carry final-writer counter programs.
+// Coverage outcome transitions join final-writer metadata programs.
+// Owned replay binding recipes and whole-operation refresh expand native state.
+// Owned assemblies retain checked memory state; native retries observe commits.
+// Projection supervisors own shared recurring registrations and join state.
+// Durable drain leases own completion signals and pin their producing scope.
+// TTL and sparse maintenance retain exclusive controlled close state.
+// Graph metric owners use shared maintenance and exclusive controlled joins.
+// Index managers permanently fence detached graph snapshots during controlled close.
+// Physical sync operations retain native state and descriptor admission through controlled retries.
+// Bounded control-file read owners retain physical buffers through durability retries.
+// Storage durability grants retain reusable worker, descriptor and buffer ownership.
+// Durability grants include bounded atomic control replacement and directory creation.
+// DB close retains bounded mutable-snapshot fencing and accounting preflight.
+// Final status owns prepaid capture, packed input and canonical WAL preparation.
+// Retirement cannot yield under its registry; SQL workspace preserves shared IO headroom.
+// Final status owns manifest admission, frozen append resources and retry-safe publication.
+// Close retains tentative durability grants and empty-status sync through admitted retirement.
+// Close reclaims retired memory in original CPU quanta before persistence.
+// Durability grants own private file writes, publication and discard.
+// Cleanup tickets embed registered retirement ownership across cancellation.
+// State retirement retains partial row, tree-node, vector and arena byte ownership.
+// Path pins retain radix-group, cursor and detached-allocation ownership.
+// Reject earlier opaque pin owners before interpreting their native headers.
+// Registry allocations retain their quota owner and physical release debt.
+pub const abi_version: u32 = 117;
+
 pub const zig_compiler_id: u64 = stableId(builtin.zig_version_string);
 
 pub const TypeContract = extern struct {

@@ -301,11 +301,11 @@ fn decodeElement(a: A, kind: arrays.ElementType, text: []const u8, work: *arrays
     if (kind == .numeric) return @import("scalar.zig").numericTextLeaky(a, text, work);
     return arrays.Element.json(switch (kind) {
         .numeric => unreachable,
-        .text => .{ .string = try a.dupe(u8, text) },
-        .int16, .int32, .int64 => .{ .integer = try builtin_cast.integerText(text, kind) },
-        .float32 => .{ .float = try builtin_cast.floatValue(f32, .{ .string = text }) },
-        .float64 => .{ .float = try builtin_cast.floatValue(f64, .{ .string = text }) },
-        .boolean => .{ .bool = try builtin_cast.booleanText(text) },
+        .text => .{ .string = if (work.shared) |context| try @import("cooperative_json_output.zig").copyAlloc(a, text, .{ .ptr = context, .check = textCheckpoint }) else try a.dupe(u8, text) },
+        .int16, .int32, .int64 => .{ .integer = try builtin_cast.integerTextWithContext(text, kind, work.shared) },
+        .float32 => .{ .float = try builtin_cast.floatValueControlled(f32, .{ .string = text }, work.shared) },
+        .float64 => .{ .float = try builtin_cast.floatValueControlled(f64, .{ .string = text }, work.shared) },
+        .boolean => .{ .bool = try builtin_cast.booleanTextControlled(text, work.shared) },
         .uuid => .{ .string = uuid.canonicalAlloc(a, text) catch |err| switch (err) {
             error.OutOfMemory => return err,
             else => return error.SqlInvalidTextRepresentation,
@@ -316,10 +316,21 @@ fn decodeElement(a: A, kind: arrays.ElementType, text: []const u8, work: *arrays
 
 /// Scalar text-protocol input uses the same builtin codecs as array cells,
 /// without array tokenization or SQL NULL inference from the string "NULL".
+fn textCheckpoint(raw: *anyopaque) !void {
+    try @as(*@import("numeric_value.zig").Context, @ptrCast(@alignCast(raw))).checkpointNow();
+}
+fn validateText(text: []const u8, context: ?*@import("numeric_value.zig").Context) !void {
+    if (context) |owner| {
+        try @import("scalar_input.zig").validateDomainText(text, owner);
+    } else {
+        if (!std.unicode.utf8ValidateSlice(text)) return error.SqlInvalidTextEncoding;
+        if (std.mem.indexOfScalar(u8, text, 0) != null) return error.SqlUntranslatableCharacter;
+    }
+}
+
 pub fn decodeElementLeaky(a: A, kind: arrays.ElementType, text: []const u8, work: *arrays.Budget) !arrays.Element {
     try work.consume(text.len);
-    if (!std.unicode.utf8ValidateSlice(text)) return error.SqlInvalidTextEncoding;
-    if (std.mem.indexOfScalar(u8, text, 0) != null) return error.SqlUntranslatableCharacter;
+    try validateText(text, work.shared);
     return decodeElement(a, kind, text, work);
 }
 
@@ -339,7 +350,7 @@ fn decodeLeakyInner(a: A, kind: arrays.ElementType, bytes: []const u8, options: 
     try work.consume(0);
     if (bytes.len > options.wire_bytes or bytes.len > options.values.work / 2) return if (options.context) |context| context.limit() else error.SqlProgramLimitExceeded;
     try work.consume(bytes.len);
-    if (!std.unicode.utf8ValidateSlice(bytes) or std.mem.indexOfScalar(u8, bytes, 0) != null) return error.SqlInvalidTextEncoding;
+    try validateText(bytes, options.context);
     var reader: Reader = .{ .bytes = bytes, .limit = options.values.elements, .work = &work };
     try reader.space();
     var declared: [6]arrays.Dimension = undefined;
@@ -583,6 +594,6 @@ test "SQL text arrays unwind allocation faults and admit shape before cell stora
     try std.testing.expectError(error.SqlProgramLimitExceeded, decode(a, .text, "{a,b}", .{ .values = .{ .bytes = 1 } }));
     try std.testing.expectError(error.SqlProgramLimitExceeded, decode(a, .text, "{a,b}", .{ .values = .{ .work = 1 } }));
     try std.testing.expectError(error.SqlProgramLimitExceeded, decode(a, .text, "{a,b}", .{ .wire_bytes = 1 }));
-    try std.testing.expectError(error.SqlInvalidTextEncoding, decode(a, .text, "{a\x00}", .{}));
+    try std.testing.expectError(error.SqlUntranslatableCharacter, decode(a, .text, "{a\x00}", .{}));
     try std.testing.expectError(error.SqlInvalidTextEncoding, decode(a, .text, "{\xff}", .{}));
 }

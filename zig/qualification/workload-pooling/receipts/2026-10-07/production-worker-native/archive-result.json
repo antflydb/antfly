@@ -1,0 +1,26 @@
+{
+  "argv": [
+    "/Users/ajroetker/bin/zig-0.17.0/zig",
+    "build",
+    "linked-inference-abi-integration-test",
+    "-Doptimize=ReleaseSafe",
+    "-j1",
+    "--maxrss",
+    "23622320128",
+    "--cache-dir",
+    "/private/tmp/antfly-default-pooling-cache",
+    "--summary",
+    "all"
+  ],
+  "source_sha256": {
+    "pkg/inference/src/host/bridge.zig": "9157f112c6191f5e44d3343741d138035999be49696f10b37235af41dbd28c4e",
+    "pkg/inference/src/host/host.zig": "38f0cc56a2071704b14e9166ec9f131573bd4603e52cbf55a94c0b786a4315c2",
+    "pkg/inference/src/host/worker.zig": "ac2f920973c7045630cb98316d44f3512353836d21f456772b6cb45b245bc9ff",
+    "pkg/inference/src/host/worker_wire.zig": "9fccb0482f6584dc69fb089d7879fa5474ce08162896370a24553f5f88fc0dd3",
+    "pkg/antfly/src/inference_abi_integration.zig": "c75c5b429a27a315fdd08d19841e117236343a2a88c490aab07744460297afa1"
+  },
+  "pid": 2426,
+  "exit_code": 0,
+  "finished": 1791399377.3843489,
+  "state": "terminal"
+}

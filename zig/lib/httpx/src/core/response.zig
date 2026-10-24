@@ -19,6 +19,26 @@ const Headers = @import("headers.zig").Headers;
 const HeaderName = @import("headers.zig").HeaderName;
 const Status = @import("status.zig").Status;
 const Json = @import("../util/json.zig").Json;
+
+/// One stable reservation, held until the final response has retired.
+const HeaderArena = struct {
+    backing: Allocator,
+    bytes: []u8,
+    fixed: std.heap.FixedBufferAllocator,
+
+    fn create(backing: Allocator, capacity: usize) !*HeaderArena {
+        const self = try backing.create(HeaderArena);
+        errdefer backing.destroy(self);
+        const bytes = try backing.alloc(u8, capacity);
+        self.* = .{ .backing = backing, .bytes = bytes, .fixed = .init(bytes) };
+        return self;
+    }
+    fn destroy(self: *HeaderArena) void {
+        const backing = self.backing;
+        backing.free(self.bytes);
+        backing.destroy(self);
+    }
+};
 /// HTTP response representation.
 pub const Response = struct {
     allocator: Allocator,
@@ -27,7 +47,10 @@ pub const Response = struct {
     headers: Headers,
     body: ?[]const u8 = null,
     body_owned: bool = false,
+    /// Stable allocator that owns a transferred body independently of headers.
     body_allocator: ?Allocator = null,
+    header_arena: ?*HeaderArena = null,
+    retirement: ?struct { ptr: *anyopaque, release: *const fn (*anyopaque) void } = null,
 
     const Self = @This();
 
@@ -44,11 +67,16 @@ pub const Response = struct {
     pub fn deinit(self: *Self) void {
         self.headers.deinit();
         self.releaseBody();
+        if (self.header_arena) |arena| arena.destroy();
+        self.header_arena = null;
+        if (self.retirement) |owner| owner.release(owner.ptr);
+        self.retirement = null;
     }
 
-    /// Release a transferred body through its original allocation domain.
     pub fn releaseBody(self: *Self) void {
-        if (self.body_owned) if (self.body) |bytes| (self.body_allocator orelse self.allocator).free(bytes);
+        if (self.body_owned) {
+            if (self.body) |b| (self.body_allocator orelse self.allocator).free(b);
+        }
         self.body = null;
         self.body_owned = false;
         self.body_allocator = null;
@@ -183,7 +211,10 @@ pub const ResponseBuilder = struct {
     headers: Headers,
     body_data: ?[]const u8 = null,
     body_owned: bool = false,
+    /// Stable allocator that owns a transferred body independently of headers.
     body_allocator: ?Allocator = null,
+    header_arena: ?*HeaderArena = null,
+    retirement: ?struct { ptr: *anyopaque, release: *const fn (*anyopaque) void } = null,
 
     const Self = @This();
 
@@ -199,6 +230,22 @@ pub const ResponseBuilder = struct {
     pub fn deinit(self: *Self) void {
         self.freeOwnedBody();
         self.headers.deinit();
+        if (self.header_arena) |arena| arena.destroy();
+        self.header_arena = null;
+    }
+
+    /// Reserve bounded metadata before work can cross a durable boundary.
+    /// Existing headers are copied before replacing their original owner.
+    pub fn reserveHeaderMemory(self: *Self, capacity: usize) !void {
+        if (self.header_arena != null) return error.HeaderMemoryAlreadyReserved;
+        const arena = try HeaderArena.create(self.allocator, capacity);
+        errdefer arena.destroy();
+        const headers = try self.headers.clone(arena.fixed.allocator());
+        if (self.body_owned and self.body_allocator == null) self.body_allocator = self.allocator;
+        self.headers.deinit();
+        self.headers = headers;
+        self.allocator = arena.fixed.allocator();
+        self.header_arena = arena;
     }
 
     fn freeOwnedBody(self: *Self) void {
@@ -208,8 +255,10 @@ pub const ResponseBuilder = struct {
             }
             self.body_owned = false;
             self.body_data = null;
+            self.body_allocator = null;
         }
-        self.body_allocator = null;
+        if (self.retirement) |owner| owner.release(owner.ptr);
+        self.retirement = null;
     }
 
     /// Sets the status code.
@@ -231,9 +280,13 @@ pub const ResponseBuilder = struct {
         return self;
     }
 
-    /// Consume an owned buffer without copying it. The allocator and buffer
-    /// must outlive the response; build failures still release it exactly once.
+    /// Transfer an owned buffer using the allocator-first API.
     pub fn bodyOwned(self: *Self, owner: Allocator, data: []u8) *Self {
+        return self.ownedBody(data, owner);
+    }
+
+    /// Takes ownership without copying. The owner must outlive response teardown.
+    pub fn ownedBody(self: *Self, data: []u8, owner: Allocator) *Self {
         self.freeOwnedBody();
         self.body_data = data;
         self.body_owned = true;
@@ -283,11 +336,19 @@ pub const ResponseBuilder = struct {
     pub fn build(self: *Self) !Response {
         var response = Response.init(self.allocator, self.status_code);
         errdefer response.deinit();
+        if (self.retirement) |owner| response.retirement = .{ .ptr = owner.ptr, .release = owner.release };
+        self.retirement = null;
 
         // Transfer header ownership directly instead of copying each entry.
         response.headers.deinit();
         response.headers.entries = self.headers.entries;
         self.headers.entries = .empty;
+        if (self.header_arena) |arena| {
+            response.header_arena = arena;
+            self.header_arena = null;
+            self.allocator = arena.backing;
+            self.headers = Headers.init(arena.backing);
+        }
 
         if (self.body_data) |b| {
             const body_len = b.len;
@@ -295,11 +356,11 @@ pub const ResponseBuilder = struct {
                 // Transfer ownership instead of copying.
                 response.body = b;
                 response.body_allocator = self.body_allocator;
-                self.body_allocator = null;
                 self.body_data = null;
                 self.body_owned = false;
+                self.body_allocator = null;
             } else {
-                response.body = try self.allocator.dupe(u8, b);
+                response.body = try response.allocator.dupe(u8, b);
             }
             response.body_owned = true;
 

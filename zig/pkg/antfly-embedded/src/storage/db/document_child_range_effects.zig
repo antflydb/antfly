@@ -29,6 +29,19 @@ const freeDocumentArtifactChildRanges = manifest.freeDocumentArtifactChildRanges
 pub const Reader = struct {
     ptr: *anyopaque,
     get: *const fn (*anyopaque, Allocator, []const u8) anyerror!?[]u8,
+    /// The reader is borrowed through synchronous planning; get returns bytes
+    /// allocated by the caller, including when a preparation observer wraps it.
+    pub fn fromStore(store: anytype) Reader {
+        const T = @TypeOf(store);
+        const Bridge = struct {
+            fn get(ptr: *anyopaque, alloc: Allocator, key: []const u8) !?[]u8 {
+                const typed: T = @ptrCast(@alignCast(ptr));
+                const raw = typed.get(alloc, key) catch |err| return if (err == error.NotFound) null else err;
+                return @constCast(raw);
+            }
+        };
+        return .{ .ptr = store, .get = Bridge.get };
+    }
 };
 pub const Selector = struct {
     ptr: *anyopaque,

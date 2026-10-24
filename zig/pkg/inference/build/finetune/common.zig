@@ -433,6 +433,7 @@ fn configureMetal(
     module.linkFramework("MetalPerformanceShaders", .{});
     if (owns_metal_kernels) {
         module.addCSourceFile(.{ .file = ctx.path("src/backends/metal_kernels.m"), .flags = &.{"-fobjc-arc"} });
+        module.addCSourceFile(.{ .file = ctx.path("src/backends/metal_device_credit.m"), .flags = &.{"-fobjc-arc"} });
     }
 }
 

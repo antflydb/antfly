@@ -34,7 +34,17 @@ pub fn executeOnce(
     api: *http_server.ApiHttpServer,
     req: http_common.HttpRequest,
 ) !http_common.HttpResponse {
-    var runtime = try Runtime.startOwned(alloc, api);
+    return executeOnceWithSurface(false, alloc, api, req);
+}
+
+/// Same production control route registration and middleware over a real TCP
+/// listener, without unrelated public execution routes in this focused fixture.
+pub fn executeRemoteAttemptControlOnce(alloc: std.mem.Allocator, api: *http_server.ApiHttpServer, req: http_common.HttpRequest) !http_common.HttpResponse {
+    return executeOnceWithSurface(true, alloc, api, req);
+}
+
+fn executeOnceWithSurface(comptime control_only: bool, alloc: std.mem.Allocator, api: *http_server.ApiHttpServer, req: http_common.HttpRequest) !http_common.HttpResponse {
+    var runtime = try Runtime.startOwnedWithSurface(control_only, alloc, api);
     defer runtime.deinit();
 
     const base_uri = try runtime.baseUri(alloc);
@@ -108,11 +118,25 @@ pub const Runtime = struct {
     }
 
     pub fn startOwned(alloc: std.mem.Allocator, api: *http_server.ApiHttpServer) !Runtime {
+        return startOwnedWithSurface(false, alloc, api);
+    }
+    pub fn startRemoteAttemptControlOwned(alloc: std.mem.Allocator, api: *http_server.ApiHttpServer) !Runtime {
+        return startOwnedWithSurface(true, alloc, api);
+    }
+    /// Install fixture middleware before the listener can accept requests.
+    /// The bound middleware owner must outlive Runtime.deinit's listener join.
+    pub fn startOwnedWithMiddleware(alloc: std.mem.Allocator, api: *http_server.ApiHttpServer, middleware: httpx.Middleware) !Runtime {
+        return startOwnedWithSurfaceAndMiddleware(false, alloc, api, middleware);
+    }
+    fn startOwnedWithSurface(comptime control_only: bool, alloc: std.mem.Allocator, api: *http_server.ApiHttpServer) !Runtime {
+        return startOwnedWithSurfaceAndMiddleware(control_only, alloc, api, null);
+    }
+    fn startOwnedWithSurfaceAndMiddleware(comptime control_only: bool, alloc: std.mem.Allocator, api: *http_server.ApiHttpServer, middleware: ?httpx.Middleware) !Runtime {
         const io_impl = try alloc.create(std.Io.Threaded);
         errdefer alloc.destroy(io_impl);
         io_impl.* = std.Io.Threaded.init(alloc, .{});
         errdefer io_impl.deinit();
-        var runtime = try startShared(alloc, io_impl.io(), api);
+        var runtime = try startSharedWithSurfaceAndMiddleware(control_only, alloc, io_impl.io(), api, middleware);
         runtime.owned_io = io_impl;
         return runtime;
     }
@@ -126,6 +150,12 @@ pub const Runtime = struct {
         io: std.Io,
         api: *http_server.ApiHttpServer,
     ) !Runtime {
+        return startSharedWithSurface(false, alloc, io, api);
+    }
+    fn startSharedWithSurface(comptime control_only: bool, alloc: std.mem.Allocator, io: std.Io, api: *http_server.ApiHttpServer) !Runtime {
+        return startSharedWithSurfaceAndMiddleware(control_only, alloc, io, api, null);
+    }
+    fn startSharedWithSurfaceAndMiddleware(comptime control_only: bool, alloc: std.mem.Allocator, io: std.Io, api: *http_server.ApiHttpServer, middleware: ?httpx.Middleware) !Runtime {
         const handler = try alloc.create(httpx_handler.AntflyApiHandler);
         errdefer alloc.destroy(handler);
         handler.* = .{ .api_server = api };
@@ -149,7 +179,8 @@ pub const Runtime = struct {
             .h1_disconnect_cancellation = .disabled,
         });
         errdefer server.deinit();
-        try handler.registerRoutes(server);
+        if (control_only) try handler.registerRemoteAttemptControlRoutesWithMiddleware(server) else try handler.registerRoutes(server);
+        if (middleware) |value| try server.use(value);
 
         const listener_task = try alloc.create(httpx.ListenerTask);
         errdefer alloc.destroy(listener_task);

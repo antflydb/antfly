@@ -19,6 +19,8 @@ const std = @import("std");
 const operators = @import("operators.zig");
 const Datum = @import("scalar.zig").Datum;
 const A = std.mem.Allocator;
+const Work = @import("operator_work.zig");
+const Access = @import("execution_pager.zig").Access;
 pub const Column = struct {
     const Integer = struct { count: u64 = 0, sum: i128 = 0, selected: i64 = 0 };
     const Number = struct { count: u64 = 0, sum: f64 = 0, compensation: f64 = 0, mean: f64 = 0, selected: f64 = 0 };
@@ -91,10 +93,10 @@ pub const Column = struct {
         } };
     }
     const PageView = struct { column: Column, lease: paging.Pager.Lease };
-    fn pageView(self: *const Column, index: usize, write: bool) !PageView {
+    fn pageView(self: *const Column, index: usize, write: bool, access: Access) !PageView {
         switch (self.paged.?) {
             inline else => |array, tag| {
-                const pinned = try array.pin(index, write);
+                const pinned = try array.pinFor(index, write, access);
                 return .{ .lease = pinned.lease, .column = .{ .spec = self.spec, .values = @unionInit(Values, @tagName(tag), .{ .items = @as([*]@TypeOf(pinned.value.*), @ptrCast(pinned.value))[0..1], .capacity = 1, .pointer_stability = .{} }) } };
             },
         }
@@ -104,17 +106,17 @@ pub const Column = struct {
             inline else => |array| array.pageStart(index),
         };
     }
-    fn pageWindow(self: *const Column, index: usize) !PageView {
+    fn pageWindow(self: *const Column, index: usize, access: Access) !PageView {
         switch (self.paged.?) {
             inline else => |array, tag| {
-                const window = try array.pinPage(index, true);
+                const window = try array.pinPageFor(index, true, access);
                 return .{ .lease = window.lease, .column = .{ .spec = self.spec, .values = @unionInit(Values, @tagName(tag), .{ .items = window.values, .capacity = window.values.len, .pointer_stability = .{} }) } };
             },
         }
     }
     /// Group a bounded input tile by resident page. Each group's lanes keep
     /// their original order, including compensated floating reductions.
-    fn updatePaged(self: *Column, a: A, ids: []const usize, values: ?[]const Datum, physical: ?@import("execution_batch.zig").PhysicalColumn) anyerror!void {
+    fn updatePaged(self: *Column, a: A, ids: []const usize, values: ?[]const Datum, physical: ?@import("execution_batch.zig").PhysicalColumn, access: Access) anyerror!void {
         var begin: usize = 0;
         while (begin < ids.len) {
             const end = @min(ids.len, begin + 128);
@@ -134,21 +136,21 @@ pub const Column = struct {
                     if (physical) |input| rows[count] = input.rowAt(begin + position);
                     count += 1;
                 }
-                var view = try self.pageWindow(id);
+                var view = try self.pageWindow(id, access);
                 defer view.lease.release();
                 if (physical) |input| {
                     var tile = input;
                     tile.range = null;
                     tile.selection = rows[0..count];
-                    if (!try view.column.updatePhysical(a, selected[0..count], tile)) {
-                        for (selected[0..count], 0..) |slot, position| try view.column.update(a, slot, try tile.cell(position));
+                    if (!try view.column.updatePhysicalFor(a, selected[0..count], tile, access)) {
+                        for (selected[0..count], 0..) |slot, position| try view.column.updateFor(a, slot, try tile.cell(position), access);
                     }
-                } else try view.column.updateBatch(a, selected[0..count], cells[0..count]);
+                } else try view.column.updateBatchFor(a, selected[0..count], cells[0..count], access);
             }
             begin = end;
         }
     }
-    fn startPaging(self: *Column, a: A) !void {
+    fn startPaging(self: *Column, a: A, access: Access) !void {
         if (self.page_manager == null or self.paged != null) return;
         const manager = self.page_manager.?;
         if (manager.page_residency_bytes < paging.page_bytes) return;
@@ -156,9 +158,9 @@ pub const Column = struct {
         switch (self.values) {
             inline .counts, .integers, .numbers, .booleans => |*values, tag| {
                 if (values.items.len < 2048) return;
-                var array: @FieldType(Paged, @tagName(tag)) = .{ .pager = try manager.pager() };
+                var array: @FieldType(Paged, @tagName(tag)) = .{ .pager = try manager.pagerFor(access) };
                 errdefer array.deinit();
-                try array.appendSlice(values.items);
+                try array.appendSliceFor(values.items, access);
                 values.clearAndFree(a);
                 self.paged = @unionInit(Paged, @tagName(tag), array);
             },
@@ -182,13 +184,21 @@ pub const Column = struct {
         }
     }
     pub fn append(self: *Column, a: A) !void {
-        try self.startPaging(a);
+        return self.appendControlled(a, null);
+    }
+    pub fn appendControlled(self: *Column, a: A, control: ?Work.Control) !void {
+        return self.appendFor(a, .{ .control = control });
+    }
+    pub fn appendFor(self: *Column, a: A, access: Access) !void {
+        const control = access.control;
+        try Work.poll(control);
+        try self.startPaging(a, access);
         if (self.paged) |*paged| {
             switch (paged.*) {
-                .counts => |*array| try array.append(0),
-                .integers => |*array| try array.append(.{}),
-                .numbers => |*array| try array.append(.{}),
-                .booleans => |*array| try array.append(.{ .value = self.spec.kind == .bool_and }),
+                .counts => |*array| try array.appendFor(0, access),
+                .integers => |*array| try array.appendFor(.{}, access),
+                .numbers => |*array| try array.appendFor(.{}, access),
+                .booleans => |*array| try array.appendFor(.{ .value = self.spec.kind == .bool_and }, access),
             }
             return;
         }
@@ -210,10 +220,18 @@ pub const Column = struct {
         }
     }
     pub fn snapshot(self: *const Column, a: A, index: usize) !operators.Aggregate {
+        return self.snapshotControlled(a, index, null);
+    }
+    pub fn snapshotControlled(self: *const Column, a: A, index: usize, control: ?Work.Control) !operators.Aggregate {
+        return self.snapshotFor(a, index, .{ .control = control });
+    }
+    pub fn snapshotFor(self: *const Column, a: A, index: usize, access: Access) !operators.Aggregate {
+        const control = access.control;
+        try Work.poll(control);
         if (self.paged != null) {
-            const view = try self.pageView(index, false);
+            const view = try self.pageView(index, false, access);
             defer view.lease.release();
-            return view.column.snapshot(a, 0);
+            return view.column.snapshotFor(a, 0, access);
         }
         var state: operators.Aggregate = .{ .alloc = a, .kind = self.spec.kind, .input_type = self.spec.input_type, .input_element = self.spec.input_element, .boolean = self.spec.kind == .bool_and };
         var selected: ?Datum = null;
@@ -231,7 +249,7 @@ pub const Column = struct {
             .exact => |v| {
                 const reducer = try a.create(@import("numeric_aggregate.zig").Reducer);
                 errdefer a.destroy(reducer);
-                reducer.* = try v.items[index].clone(a);
+                reducer.* = try v.items[index].cloneControlled(a, control);
                 state.numeric = reducer;
                 state.count = reducer.state.count;
             },
@@ -261,15 +279,19 @@ pub const Column = struct {
         if ((self.spec.kind == .min or self.spec.kind == .max) and state.count != 0) {
             // Snapshot ownership belongs to the caller's arena, not live state.
             const RowOwner = @TypeOf(state.selected.?);
-            state.selected = try RowOwner.init(a, .{ .values = &.{selected.?}, .keys = &.{}, .ordinal = 0 });
+            state.selected = try RowOwner.initControlled(a, .{ .values = &.{selected.?}, .keys = &.{}, .ordinal = 0 }, control);
         }
         return state;
     }
     pub fn set(self: *Column, index: usize, state: operators.Aggregate) !void {
+        return self.setFor(index, state, .{});
+    }
+    pub fn setFor(self: *Column, index: usize, state: operators.Aggregate, access: Access) !void {
+        try Work.poll(access.control);
         if (self.paged != null) {
-            var view = try self.pageView(index, true);
+            var view = try self.pageView(index, true, access);
             defer view.lease.release();
-            return view.column.set(0, state);
+            return view.column.setFor(0, state, access);
         }
         switch (self.values) {
             .counts => |*v| v.items[index] = state.count,
@@ -287,7 +309,7 @@ pub const Column = struct {
             .bytes, .dynamic, .exact, .fixed => unreachable,
         }
     }
-    fn promote(self: *Column, a: A) !void {
+    fn promote(self: *Column, a: A, control: ?Work.Control) !void {
         var states: std.ArrayList(operators.Aggregate) = .empty;
         errdefer {
             for (states.items) |*state| state.deinit();
@@ -297,7 +319,7 @@ pub const Column = struct {
             inline else => |values| values.items.len,
         };
         try states.ensureTotalCapacity(a, count);
-        for (0..count) |index| states.appendAssumeCapacity(try self.snapshot(a, index));
+        for (0..count) |index| states.appendAssumeCapacity(try self.snapshotControlled(a, index, control));
         self.clear(a);
         self.values = .{ .dynamic = states };
     }
@@ -369,19 +391,27 @@ pub const Column = struct {
         return .{ .coefficient = coefficient, .scale = number.scale };
     }
     pub fn update(self: *Column, a: A, index: usize, value: Datum) !void {
+        return self.updateControlled(a, index, value, null);
+    }
+    pub fn updateControlled(self: *Column, a: A, index: usize, value: Datum, control: ?Work.Control) !void {
+        return self.updateFor(a, index, value, .{ .control = control });
+    }
+    pub fn updateFor(self: *Column, a: A, index: usize, value: Datum, access: Access) !void {
+        const control = access.control;
+        try Work.poll(control);
         if (self.paged != null) {
-            var view = try self.pageView(index, true);
+            var view = try self.pageView(index, true, access);
             defer view.lease.release();
-            return view.column.update(a, 0, value);
+            return view.column.updateFor(a, 0, value, access);
         }
-        if (self.values == .dynamic) return self.values.dynamic.items[index].update(value);
+        if (self.values == .dynamic) return self.values.dynamic.items[index].updateControlled(value, control);
         if (value.sql_null) return;
         if (self.values == .fixed) {
             if (fixedValue(value)) |fixed| return self.values.fixed.items[index].add(fixed.coefficient, fixed.scale, 1, self.spec.kind == .min);
-            try self.promote(a);
-            return self.values.dynamic.items[index].update(value);
+            try self.promote(a, control);
+            return self.values.dynamic.items[index].updateControlled(value, control);
         }
-        if (self.values == .exact) return self.values.exact.items[index].add((value.numeric orelse return error.SqlTypeMismatch).*);
+        if (self.values == .exact) return self.values.exact.items[index].addControlled((value.numeric orelse return error.SqlTypeMismatch).*, control);
         if (self.spec.kind == .min or self.spec.kind == .max) {
             const compatible = switch (self.values) {
                 .integers => value.value == .integer,
@@ -391,8 +421,8 @@ pub const Column = struct {
                 else => unreachable,
             };
             if (!compatible) {
-                try self.promote(a);
-                return self.values.dynamic.items[index].update(value);
+                try self.promote(a, control);
+                return self.values.dynamic.items[index].updateControlled(value, control);
             }
             var count: u64 = 0;
             var prior: ?Datum = null;
@@ -420,7 +450,7 @@ pub const Column = struct {
                 else => unreachable,
             }
             if (count == std.math.maxInt(i64)) return error.SqlNumericOutOfRange;
-            const replace = count == 0 or (try @import("scalar.zig").compareDatums(value, prior.?)) == (if (self.spec.kind == .min) std.math.Order.lt else .gt);
+            const replace = count == 0 or (try @import("scalar.zig").compareDatumsControlled(value, prior.?, control)) == (if (self.spec.kind == .min) std.math.Order.lt else .gt);
             switch (self.values) {
                 .integers => |*v| {
                     v.items[index].count += 1;
@@ -436,7 +466,7 @@ pub const Column = struct {
                 },
                 .bytes => |*v| {
                     if (replace) {
-                        const owned = try a.dupe(u8, value.value.string);
+                        const owned = try Work.dupe(u8, a, value.value.string, control);
                         if (v.items[index].value) |bytes| a.free(bytes);
                         v.items[index].value = owned;
                     }
@@ -446,34 +476,47 @@ pub const Column = struct {
             }
             return;
         }
-        var state = try self.snapshot(a, index);
-        try state.update(value);
-        try self.set(index, state);
+        var state = try self.snapshotFor(a, index, access);
+        try state.updateControlled(value, control);
+        try self.setFor(index, state, access);
     }
     /// Dispatch once per aggregate vector. Each group's lane order remains
     /// stable, including compensated floating reductions in the fallback.
     pub fn updateBatch(self: *Column, a: A, ids: []const usize, values: []const Datum) !void {
+        return self.updateBatchControlled(a, ids, values, null);
+    }
+    pub fn updateBatchControlled(self: *Column, a: A, ids: []const usize, values: []const Datum, control: ?Work.Control) !void {
+        return self.updateBatchFor(a, ids, values, .{ .control = control });
+    }
+    pub fn updateBatchFor(self: *Column, a: A, ids: []const usize, values: []const Datum, access: Access) !void {
+        const control = access.control;
+        try Work.poll(control);
         if (self.paged != null) {
             if (ids.len != values.len) return error.InvalidSqlBackendResponse;
-            return self.updatePaged(a, ids, values, null);
+            return self.updatePaged(a, ids, values, null, access);
         }
         if (ids.len != values.len) return error.InvalidSqlBackendResponse;
         switch (self.values) {
             .counts => |*counts| for (ids, values) |id, value| {
+                try Work.poll(control);
                 if (value.sql_null) continue;
                 counts.items[id] = std.math.add(u64, counts.items[id], 1) catch return error.SqlNumericOutOfRange;
                 if (counts.items[id] > std.math.maxInt(i64)) return error.SqlNumericOutOfRange;
             },
             .integers => |*integers| {
                 if (self.spec.kind != .sum) {
-                    for (ids, values) |id, value| try self.update(a, id, value);
+                    for (ids, values) |id, value| try self.updateFor(a, id, value, access);
                     return;
                 }
-                for (values) |value| if (!value.sql_null and value.value != .integer) {
-                    for (ids, values) |id, cell| try self.update(a, id, cell);
-                    return;
-                };
+                for (values) |value| {
+                    try Work.poll(control);
+                    if (!value.sql_null and value.value != .integer) {
+                        for (ids, values) |id, cell| try self.updateFor(a, id, cell, access);
+                        return;
+                    }
+                }
                 for (ids, values) |id, value| {
+                    try Work.poll(control);
                     if (value.sql_null) continue;
                     const state = &integers.items[id];
                     state.sum = std.math.add(i128, state.sum, value.value.integer) catch return error.SqlNumericOutOfRange;
@@ -483,11 +526,15 @@ pub const Column = struct {
             },
             .booleans => |*booleans| {
                 if (self.spec.kind != .bool_and and self.spec.kind != .bool_or) {
-                    for (ids, values) |id, value| try self.update(a, id, value);
+                    for (ids, values) |id, value| try self.updateFor(a, id, value, access);
                     return;
                 }
-                for (values) |value| if (!value.sql_null and value.value != .bool) return error.SqlTypeMismatch;
+                for (values) |value| {
+                    try Work.poll(control);
+                    if (!value.sql_null and value.value != .bool) return error.SqlTypeMismatch;
+                }
                 for (ids, values) |id, value| {
+                    try Work.poll(control);
                     if (value.sql_null) continue;
                     const state = &booleans.items[id];
                     state.value = if (self.spec.kind == .bool_and) state.value and value.value.bool else state.value or value.value.bool;
@@ -495,25 +542,33 @@ pub const Column = struct {
                     if (state.count > std.math.maxInt(i64)) return error.SqlNumericOutOfRange;
                 }
             },
-            else => for (ids, values) |id, value| try self.update(a, id, value),
+            else => for (ids, values) |id, value| try self.updateFor(a, id, value, access),
         }
     }
     /// Consume a borrowed physical vector without expanding dictionary IDs.
     /// Iterate source lanes in order so floating and dynamic reductions retain
     /// exactly the same update order as the scalar path.
     pub fn updateEncoded(self: *Column, a: A, ids: []const usize, batch: @import("execution_batch.zig").Batch) !void {
+        return self.updateEncodedControlled(a, ids, batch, null);
+    }
+    pub fn updateEncodedControlled(self: *Column, a: A, ids: []const usize, batch: @import("execution_batch.zig").Batch, control: ?Work.Control) !void {
+        return self.updateEncodedFor(a, ids, batch, .{ .control = control });
+    }
+    pub fn updateEncodedFor(self: *Column, a: A, ids: []const usize, batch: @import("execution_batch.zig").Batch, access: Access) !void {
+        const control = access.control;
+        try Work.poll(control);
         if (self.paged != null) {
             if (batch.width() != 1 or batch.len() != ids.len) return error.InvalidSqlBackendResponse;
-            if (batch == .reader) if (batch.reader.cohort) |cohort| return self.updateCohort(a, ids, cohort.source.*, cohort.positions);
+            if (batch == .reader) if (batch.reader.cohort) |cohort| return self.updateCohortFor(a, ids, cohort.source.*, cohort.positions, access);
             var scratch = std.heap.ArenaAllocator.init(@import("memory_budget.zig").reclaimingAllocator(a));
             defer scratch.deinit();
-            if (try batch.physicalColumn(scratch.allocator(), 0)) |physical| if (try self.updatePhysical(a, ids, physical)) return;
-            for (ids, 0..) |id, row| try self.update(a, id, try batch.cell(scratch.allocator(), row, 0));
+            if (try batch.physicalColumn(scratch.allocator(), 0)) |physical| if (try self.updatePhysicalFor(a, ids, physical, access)) return;
+            for (ids, 0..) |id, row| try self.updateFor(a, id, try batch.cell(scratch.allocator(), row, 0), access);
             return;
         }
         if (batch.width() != 1 or batch.len() != ids.len) return error.InvalidSqlBackendResponse;
         if (batch == .reader) if (batch.reader.cohort) |cohort| {
-            return self.updateCohort(a, ids, cohort.source.*, cohort.positions);
+            return self.updateCohortFor(a, ids, cohort.source.*, cohort.positions, access);
         };
         var scratch = std.heap.ArenaAllocator.init(a);
         defer scratch.deinit();
@@ -538,26 +593,32 @@ pub const Column = struct {
             }
             return;
         };
-        if (try batch.physicalColumn(scratch.allocator(), 0)) |physical| if (try self.updatePhysical(a, ids, physical)) return;
+        if (try batch.physicalColumn(scratch.allocator(), 0)) |physical| if (try self.updatePhysicalFor(a, ids, physical, access)) return;
         switch (batch) {
-            .vectors => |vectors| return self.updateBatch(a, ids, vectors.values[0]),
+            .vectors => |vectors| return self.updateBatchFor(a, ids, vectors.values[0], access),
             .dictionary => |dictionary| {
                 if (self.values == .counts) {
                     for (ids, dictionary.indices) |id, index| {
+                        try Work.poll(control);
                         if (index >= dictionary.values.len) return error.InvalidSqlBackendResponse;
                         if (!dictionary.values[index].sql_null) self.values.counts.items[id] = try mergedCount(self.values.counts.items[id], 1);
                     }
                     return;
                 }
                 for (ids, dictionary.indices) |id, index| {
+                    try Work.poll(control);
                     if (index >= dictionary.values.len) return error.InvalidSqlBackendResponse;
-                    try self.update(a, id, dictionary.values[index]);
+                    try self.updateFor(a, id, dictionary.values[index], access);
                 }
             },
-            else => for (ids, 0..) |id, index| try self.update(a, id, try batch.cell(scratch.allocator(), index, 0)),
+            else => for (ids, 0..) |id, index| try self.updateFor(a, id, try batch.cellControlled(scratch.allocator(), index, 0, control), access),
         }
     }
     pub fn updateCohort(self: *Column, a: A, ids: []const usize, source: @import("execution_batch.zig").Batch, positions: []const usize) !void {
+        return self.updateCohortFor(a, ids, source, positions, .{});
+    }
+    pub fn updateCohortFor(self: *Column, a: A, ids: []const usize, source: @import("execution_batch.zig").Batch, positions: []const usize, access: Access) !void {
+        try Work.poll(access.control);
         if (source.len() != positions.len) return error.InvalidSqlBackendResponse;
         var scratch = std.heap.ArenaAllocator.init(a);
         defer scratch.deinit();
@@ -567,7 +628,7 @@ pub const Column = struct {
                 var fixed: @import("numeric_value.zig").ScaledInteger = undefined;
                 var number: @import("numeric_value.zig").Value = undefined;
                 const value = try decimal.cell(lane, &fixed, &number);
-                if (!value.sql_null) try self.update(a, ids[position], value);
+                if (!value.sql_null) try self.updateFor(a, ids[position], value, access);
             }
             return;
         };
@@ -582,12 +643,12 @@ pub const Column = struct {
             }
             if (physical) |native| {
                 const view = native.slice(begin, begin + length);
-                if (try self.updatePhysical(a, selected_ids[0..length], view)) {
+                if (try self.updatePhysicalFor(a, selected_ids[0..length], view, access)) {
                     begin += length;
                     continue;
                 }
             }
-            for (selected_ids[0..length], 0..) |id, offset| try self.update(a, id, try source.cell(scratch.allocator(), begin + offset, 0));
+            for (selected_ids[0..length], 0..) |id, offset| try self.updateFor(a, id, try source.cell(scratch.allocator(), begin + offset, 0), access);
             begin += length;
         }
     }
@@ -603,10 +664,14 @@ pub const Column = struct {
     /// Dispatch once per state/vector pair. Nulls and selections stay physical;
     /// dictionary IDs are gathered directly without creating Datum arrays.
     pub fn updatePhysical(self: *Column, a: A, ids: []const usize, physical: @import("execution_batch.zig").PhysicalColumn) !bool {
+        return self.updatePhysicalFor(a, ids, physical, .{});
+    }
+    pub fn updatePhysicalFor(self: *Column, a: A, ids: []const usize, physical: @import("execution_batch.zig").PhysicalColumn, access: Access) !bool {
+        try Work.poll(access.control);
         if (self.paged != null) {
             if (physical.len() != ids.len) return error.InvalidSqlBackendResponse;
             try physical.validate();
-            try self.updatePaged(a, ids, null, physical);
+            try self.updatePaged(a, ids, null, physical, access);
             return true;
         }
         if (physical.len() != ids.len) return error.InvalidSqlBackendResponse;
@@ -704,6 +769,10 @@ pub const Column = struct {
     }
     /// Merge one validated AGS column after a shared destination-key census.
     pub fn mergeFixedBatch(self: *Column, a: A, ids: []const usize, states: []const @import("aggregate_partial.zig").Fixed) !void {
+        return self.mergeFixedBatchFor(a, ids, states, .{});
+    }
+    pub fn mergeFixedBatchFor(self: *Column, a: A, ids: []const usize, states: []const @import("aggregate_partial.zig").Fixed, access: Access) !void {
+        try Work.poll(access.control);
         if (self.paged != null) {
             if (ids.len != states.len) return error.InvalidSqlBackendResponse;
             var begin: usize = 0;
@@ -723,9 +792,9 @@ pub const Column = struct {
                         input[count] = states[begin + i];
                         count += 1;
                     }
-                    var view = try self.pageWindow(id);
+                    var view = try self.pageWindow(id, access);
                     defer view.lease.release();
-                    try view.column.mergeFixedBatch(a, selected[0..count], input[0..count]);
+                    try view.column.mergeFixedBatchFor(a, selected[0..count], input[0..count], access);
                 }
                 begin = end;
             }
@@ -745,7 +814,7 @@ pub const Column = struct {
                             continue;
                         }
                     }
-                    if (self.values != .dynamic) try self.promote(a);
+                    if (self.values != .dynamic) try self.promote(a, null);
                     var state = try operators.Aggregate.initTyped(a, self.spec.kind, self.spec.input_type, self.spec.input_element);
                     defer state.deinit();
                     try state.update(from.selected);
@@ -785,14 +854,22 @@ pub const Column = struct {
     /// Merge compact partial vectors directly after resolving destination IDs.
     /// Typed states need no Aggregate snapshots, cloned reducers or OwnedRows.
     pub fn mergeBatch(self: *Column, a: A, ids: []const usize, source: *const Column, begin: usize) !void {
-        return self.mergeSelectedBatch(a, ids, source, begin, null);
+        return self.mergeBatchFor(a, ids, source, begin, .{});
+    }
+    pub fn mergeBatchFor(self: *Column, a: A, ids: []const usize, source: *const Column, begin: usize, access: Access) !void {
+        try Work.poll(access.control);
+        return self.mergeSelectedBatchFor(a, ids, source, begin, null, access);
     }
     /// Selection vectors keep partial states typed across hash-owner exchanges.
     pub fn mergeSelectedBatch(self: *Column, a: A, ids: []const usize, source: *const Column, begin: usize, indices: ?[]const usize) anyerror!void {
+        return self.mergeSelectedBatchFor(a, ids, source, begin, indices, .{});
+    }
+    pub fn mergeSelectedBatchFor(self: *Column, a: A, ids: []const usize, source: *const Column, begin: usize, indices: ?[]const usize, access: Access) anyerror!void {
+        try Work.poll(access.control);
         if (!std.meta.eql(self.spec, source.spec)) return error.InvalidSqlBackendResponse;
         if (indices) |selected| if (selected.len != ids.len) return error.InvalidSqlBackendResponse;
         if (self == source and self.paged != null) {
-            for (ids, 0..) |id, lane| try self.mergeExact(a, id, try source.snapshot(a, if (indices) |selected| selected[lane] else begin + lane));
+            for (ids, 0..) |id, lane| try self.mergeExactFor(a, id, try source.snapshotFor(a, if (indices) |selected| selected[lane] else begin + lane, access), access);
             return;
         }
         if (source.paged) |paged| switch (paged) {
@@ -809,25 +886,25 @@ pub const Column = struct {
                         .booleans => Boolean,
                     };
                     var values: [128]Element = undefined;
-                    try array.getMany(selected[0 .. end - offset], values[0 .. end - offset]);
+                    try array.getManyFor(selected[0 .. end - offset], values[0 .. end - offset], access);
                     const tile: Column = .{ .spec = source.spec, .values = @unionInit(Values, @tagName(tag), .{ .items = values[0 .. end - offset], .capacity = values.len, .pointer_stability = .{} }) };
-                    try self.mergeDestinationTiles(a, ids[offset..end], &tile, 0, null);
+                    try self.mergeDestinationTiles(a, ids[offset..end], &tile, 0, null, access);
                     offset = end;
                 }
                 return;
             },
         };
-        if (self.paged != null) return self.mergeDestinationTiles(a, ids, source, begin, indices);
+        if (self.paged != null) return self.mergeDestinationTiles(a, ids, source, begin, indices, access);
         if (indices) |selected| if (selected.len != ids.len) return error.InvalidSqlBackendResponse;
         if (!std.meta.eql(self.spec, source.spec)) return error.InvalidSqlBackendResponse;
         if (std.meta.activeTag(self.values) != std.meta.activeTag(source.values)) {
-            if (self.values != .dynamic) try self.promote(a);
+            if (self.values != .dynamic) try self.promote(a, null);
             var arena = std.heap.ArenaAllocator.init(a);
             defer arena.deinit();
             for (ids, 0..) |id, offset| {
                 const index = if (indices) |selected| selected[offset] else begin + offset;
                 _ = arena.reset(.retain_capacity);
-                try @import("aggregate_partial.zig").merge(&self.values.dynamic.items[id], try source.snapshot(arena.allocator(), index));
+                try @import("aggregate_partial.zig").merge(&self.values.dynamic.items[id], try source.snapshotFor(arena.allocator(), index, access));
             }
             return;
         }
@@ -887,7 +964,7 @@ pub const Column = struct {
                 for (ids, 0..) |id, offset| {
                     const index = if (indices) |selected| selected[offset] else begin + offset;
                     _ = arena.reset(.retain_capacity);
-                    try self.mergeExact(a, id, try source.snapshot(arena.allocator(), index));
+                    try self.mergeExactFor(a, id, try source.snapshotFor(arena.allocator(), index, access), access);
                 }
             },
         }
@@ -895,8 +972,8 @@ pub const Column = struct {
     /// Source pages are gathered before destination pinning, so one-frame
     /// residency and a shared source/destination pager cannot deadlock. Lanes
     /// for each destination retain their exact partial-reduction order.
-    fn mergeDestinationTiles(self: *Column, a: A, ids: []const usize, source: *const Column, begin: usize, indices: ?[]const usize) anyerror!void {
-        if (self.paged == null) return self.mergeSelectedBatch(a, ids, source, begin, indices);
+    fn mergeDestinationTiles(self: *Column, a: A, ids: []const usize, source: *const Column, begin: usize, indices: ?[]const usize, access: Access) anyerror!void {
+        if (self.paged == null) return self.mergeSelectedBatchFor(a, ids, source, begin, indices, access);
         var offset: usize = 0;
         while (offset < ids.len) {
             const end = @min(ids.len, offset + 128);
@@ -914,9 +991,9 @@ pub const Column = struct {
                     input[count] = if (indices) |selected| selected[offset + position] else begin + offset + position;
                     count += 1;
                 }
-                var view = try self.pageWindow(id);
+                var view = try self.pageWindow(id, access);
                 defer view.lease.release();
-                try view.column.mergeSelectedBatch(a, target[0..count], source, 0, input[0..count]);
+                try view.column.mergeSelectedBatchFor(a, target[0..count], source, 0, input[0..count], access);
             }
             offset = end;
         }
@@ -942,18 +1019,26 @@ pub const Column = struct {
         return 0;
     }
     pub fn mergeExact(self: *Column, a: A, index: usize, state: operators.Aggregate) !void {
+        return self.mergeExactControlled(a, index, state, null);
+    }
+    pub fn mergeExactControlled(self: *Column, a: A, index: usize, state: operators.Aggregate, control: ?Work.Control) !void {
+        return self.mergeExactFor(a, index, state, .{ .control = control });
+    }
+    pub fn mergeExactFor(self: *Column, a: A, index: usize, state: operators.Aggregate, access: Access) !void {
+        const control = access.control;
+        try Work.poll(control);
         if (self.paged != null) {
-            var view = try self.pageView(index, true);
+            var view = try self.pageView(index, true, access);
             defer view.lease.release();
-            return view.column.mergeExact(a, 0, state);
+            return view.column.mergeExactFor(a, 0, state, access);
         }
         if (state.kind != self.spec.kind or state.input_type != self.spec.input_type or state.input_element != self.spec.input_element or state.distinct != self.spec.distinct) return error.InvalidSqlBackendResponse;
         if (self.values == .exact) {
             const reducer = state.numeric orelse return error.InvalidSqlBackendResponse;
             if (reducer.state.count != state.count) return error.InvalidSqlBackendResponse;
-            return self.values.exact.items[index].merge(reducer.state);
+            return self.values.exact.items[index].mergeControlled(reducer.state, control);
         }
-        if (self.values == .dynamic) return @import("aggregate_partial.zig").merge(&self.values.dynamic.items[index], state);
+        if (self.values == .dynamic) return @import("aggregate_partial.zig").mergeControlled(&self.values.dynamic.items[index], state, control);
         if (self.spec.kind == .min or self.spec.kind == .max) {
             if (state.count == 0) return;
             const prior = switch (self.values) {
@@ -962,7 +1047,7 @@ pub const Column = struct {
             };
             const total = std.math.add(u64, prior, state.count) catch return error.SqlNumericOutOfRange;
             if (total > std.math.maxInt(i64)) return error.SqlNumericOutOfRange;
-            try self.update(a, index, state.selected.?.row.values[0]);
+            try self.updateFor(a, index, state.selected.?.row.values[0], access);
             switch (self.values) {
                 .counts => unreachable,
                 .exact => unreachable,
@@ -972,9 +1057,9 @@ pub const Column = struct {
             return;
         }
         if (self.values == .numbers) {
-            var target = try self.snapshot(a, index);
-            try @import("aggregate_partial.zig").merge(&target, state);
-            try self.set(index, target);
+            var target = try self.snapshotFor(a, index, access);
+            try @import("aggregate_partial.zig").mergeControlled(&target, state, control);
+            try self.setFor(index, target, access);
             return;
         }
         switch (self.values) {
@@ -1000,10 +1085,18 @@ pub const Column = struct {
         }
     }
     pub fn finish(self: *const Column, index: usize) !Datum {
-        if (self.paged != null) return (try self.snapshot(std.heap.page_allocator, index)).finish();
+        return self.finishControlled(index, null);
+    }
+    pub fn finishControlled(self: *const Column, index: usize, control: ?Work.Control) !Datum {
+        return self.finishFor(index, .{ .control = control });
+    }
+    pub fn finishFor(self: *const Column, index: usize, access: Access) !Datum {
+        const control = access.control;
+        try Work.poll(control);
+        if (self.paged != null) return (try self.snapshotFor(std.heap.page_allocator, index, access)).finishControlled(control);
         if (self.values == .fixed) return self.values.fixed.items[index].finish();
-        if (self.values == .exact) return if (try self.values.exact.items[index].finish(self.spec.kind == .avg)) |value| Datum.typedNumeric(value) else .{};
-        if (self.values == .dynamic) return self.values.dynamic.items[index].finish();
+        if (self.values == .exact) return if (try self.values.exact.items[index].finishControlled(self.spec.kind == .avg, control)) |value| Datum.typedNumeric(value) else .{};
+        if (self.values == .dynamic) return self.values.dynamic.items[index].finishControlled(control);
         if (self.spec.kind == .min or self.spec.kind == .max) return switch (self.values) {
             .integers => |v| if (v.items[index].count == 0) .{} else Datum.json(.{ .integer = v.items[index].selected }),
             .numbers => |v| if (v.items[index].count == 0) .{} else Datum.json(.{ .float = v.items[index].selected }),
@@ -1011,7 +1104,7 @@ pub const Column = struct {
             .bytes => |v| if (v.items[index].value) |bytes| Datum.json(.{ .string = bytes }) else .{},
             else => unreachable,
         };
-        return (try self.snapshot(std.heap.page_allocator, index)).finish();
+        return (try self.snapshotFor(std.heap.page_allocator, index, access)).finishControlled(control);
     }
 };
 

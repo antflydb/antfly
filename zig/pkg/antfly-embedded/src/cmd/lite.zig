@@ -1045,6 +1045,7 @@ fn searchJson(allocator: Allocator, db: *db_mod.DB, body: []const u8) ![]u8 {
             null,
             null,
             null,
+            null,
             &failure,
         );
         return response.json;

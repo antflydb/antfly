@@ -24,6 +24,48 @@ pub const resolver_key = "\x00\x00__metadata__:resolvers";
 pub const ordered_key = "\x00\x00__metadata__:ordered_artifact_catalog";
 pub const local_key = "\x00\x00__metadata__:artifact_inventory";
 
+/// The accepted frame is the durable catalog lease. Presence alone fences
+/// publication, including malformed/orphan frames awaiting abort or repair.
+/// Call under the DB apply fence or the catalog writer transaction.
+pub fn hasPreparedCatalogLease(txn: anytype) !bool {
+    const backlog = @import("../publication_backlog.zig");
+    var cursor = try txn.openCursor();
+    defer cursor.close();
+    cursor.setKeysOnly();
+    for ([_][]const u8{ backlog.prepared_effects_prefix, backlog.prepared_observations_prefix }) |prefix| {
+        if (try cursor.seekAtOrAfter(prefix)) |entry|
+            if (std.mem.startsWith(u8, entry.key, prefix)) return true;
+    }
+    return false;
+}
+
+pub fn requireNoPreparedCatalogLease(txn: anytype) !void {
+    if (try hasPreparedCatalogLease(txn)) return error.SchemaInUse;
+}
+
+pub fn isPreparedCatalogKey(key: []const u8) bool {
+    return std.mem.eql(u8, key, index_key) or std.mem.eql(u8, key, enrichment_key) or std.mem.eql(u8, key, resolver_key);
+}
+
+/// The observed lease is read under the same DB apply fence as publication.
+/// This variant also supports point-lookup-only metadata probes.
+pub fn requirePreparedCatalogUnchangedWhileLeased(txn: anytype, key: []const u8, candidate: []const u8, leased: bool) !void {
+    if (!leased or !isPreparedCatalogKey(key)) return;
+    const existing = txn.get(key) catch |err| blk: {
+        if (err != error.NotFound) return err;
+        break :blk null;
+    };
+    if (existing) |bytes| if (std.mem.eql(u8, bytes, candidate)) return;
+    return error.SchemaInUse;
+}
+
+/// Idempotent publication is legal. Resolver merge progress and other mutable
+/// runtime state are not catalog definitions and must remain able to drain.
+pub fn requirePreparedCatalogUnchanged(txn: anytype, key: []const u8, candidate: []const u8) !void {
+    if (!isPreparedCatalogKey(key)) return;
+    try requirePreparedCatalogUnchangedWhileLeased(txn, key, candidate, try hasPreparedCatalogLease(txn));
+}
+
 pub const Binding = struct {
     epoch: u64,
     digest: [32]u8,

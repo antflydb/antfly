@@ -1,0 +1,15 @@
+{
+  "command": "ZIG_GLOBAL_CACHE_DIR=/private/tmp/antfly-default-pooling-global /Users/ajroetker/bin/zig-0.17.0/zig build antfly-workload-pooling-test -Doptimize=ReleaseSafe -j1 --cache-dir /private/tmp/antfly-default-pooling-cache --summary all",
+  "exit_code": 0,
+  "build_steps_succeeded": 50,
+  "embedded_tests_passed": 36,
+  "coordinator_tests_passed": 39,
+  "skipped": 0,
+  "failed": 0,
+  "leaked": 0,
+  "source_sha256": {
+    "zig/pkg/antfly/src/api/httpx_handler.zig": "bfa53fb050bb36a07dc7bfcb3df6689b863206f45eb29a6039712d4b6cec7120",
+    "zig/pkg/antfly/src/api/sql_execution.zig": "3b8c7676af7c24fc0b6b8545932f0e2893e60e86f5a7611a2402e25fa3d88a9f",
+    "zig/pkg/antfly/src/api/sql_pgwire.zig": "bae67cb69951befd2c422736ef9a935f740e6ec7a6236b1af96d643356ace2d0"
+  }
+}

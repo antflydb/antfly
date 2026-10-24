@@ -84,6 +84,9 @@ pub const FsStore = struct {
         return .{ .alloc = alloc, .root_dir = root, .inventory_root = try alloc.dupe(u8, inventory_root) };
     }
     pub fn registerScopedUpload(self: *FsStore, scope: artifact_store.UploadScope, checksum: []const u8, cancellation: CancellationToken) !void {
+        return self.registerScopedUploadWithWait(scope, checksum, cancellation, null);
+    }
+    pub fn registerScopedUploadWithWait(self: *FsStore, scope: artifact_store.UploadScope, checksum: []const u8, cancellation: CancellationToken, wait: ?@import("antfly_local_sources").sql_execution_wait.Boundary) !void {
         try scope.validate();
         try artifact_store.validateSha256Checksum(checksum);
         const path = try std.fs.path.join(self.alloc, &.{ self.root_dir, "graph", &std.fmt.bytesToHex(&scope.domain, .lower), &std.fmt.bytesToHex(&scope.attempt, .lower) });
@@ -91,6 +94,10 @@ pub const FsStore = struct {
         var io_impl = threadedIo();
         defer io_impl.deinit();
         const io = io_impl.io();
+        // Path and checksum preparation precede the durable inventory provider.
+        try @import("antfly_local_sources").sql_execution_wait.run(wait, registerPreparedUpload, .{ self, io, path, scope, checksum, cancellation });
+    }
+    fn registerPreparedUpload(self: *FsStore, io: std.Io, path: []const u8, scope: artifact_store.UploadScope, checksum: []const u8, cancellation: CancellationToken) !void {
         try self.durable_dirs.ensure(self.alloc, io, path);
         const attempt = try std.Io.Dir.cwd().openDir(io, path, .{ .iterate = true, .follow_symlinks = false });
         defer attempt.close(io);
@@ -194,8 +201,8 @@ pub const FsStore = struct {
         cancellation: CancellationToken,
     ) ![]u8 {
         try cancellation.check();
-        const path = try pathForArtifactIdAlloc(self.alloc, self.root_dir, artifact_id);
-        defer self.alloc.free(path);
+        const path = try pathForArtifactIdAlloc(alloc, self.root_dir, artifact_id);
+        defer alloc.free(path);
         return try readFileAllocWithCancellation(alloc, path, cancellation);
     }
 
@@ -212,8 +219,8 @@ pub const FsStore = struct {
         cancellation: CancellationToken,
     ) ![]u8 {
         try cancellation.check();
-        const path = try pathForArtifactIdAlloc(self.alloc, self.root_dir, artifact_id);
-        defer self.alloc.free(path);
+        const path = try pathForArtifactIdAlloc(alloc, self.root_dir, artifact_id);
+        defer alloc.free(path);
         return try readFileRangeAllocWithCancellation(alloc, path, offset, len, cancellation);
     }
 

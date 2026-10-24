@@ -102,6 +102,8 @@ pub const ManagedRuntime = struct {
     work_lease_owner_id: ?[]u8 = null,
     work_lease_ttl_ns: u64 = 30 * std.time.ns_per_s,
     work_cost_port: ?RuntimeWorkCostPort = null,
+    runnable_slots: usize = 1,
+    runnable_scheduler: ?*@import("antfly_local_sources").common_request_admission.runnable_scheduler.Scheduler = null,
 
     pub fn init(
         alloc: Allocator,
@@ -208,6 +210,21 @@ pub const ManagedRuntime = struct {
         pass.cooperative = cancellation;
         var bridge = maintenance_cancellation.GraphBridge{ .maintenance = pass };
         try pass.check();
+        const Runnable = @import("antfly_local_sources").common_request_admission.runnable_scheduler;
+        var execution: Runnable.Execution = .{};
+        defer execution.finish();
+        if (self.runnable_scheduler) |scheduler| {
+            const token = bridge.token();
+            execution.startWithSlots(scheduler, .{
+                .io = self.io,
+                .cancellation = .{ .ptr = token.ptr.?, .requested = token.is_cancelled_fn.? },
+                .retained_bytes = @sizeOf(Runnable.Execution),
+            }, .background, self.runnable_slots) catch |err| {
+                try pass.check();
+                return err;
+            };
+            try pass.check();
+        }
         try lockAtomicWithCancellation(&self.run_mu, bridge.token());
         defer self.run_mu.unlock();
 
@@ -547,10 +564,13 @@ pub const ManagedRuntime = struct {
         while (!self.stop_requested.load(.monotonic)) {
             _ = self.runOnce() catch |err| {
                 if (err == error.Canceled and self.stop_requested.load(.acquire)) return;
-                lockAtomic(&self.failure_mu);
-                if (self.run_failure == null) self.run_failure = err;
-                self.failure_mu.unlock();
-                return;
+                if (err != error.RunnableWaitTimeout and err != error.SchedulerFull) {
+                    lockAtomic(&self.failure_mu);
+                    if (self.run_failure == null) self.run_failure = err;
+                    self.failure_mu.unlock();
+                    return;
+                }
+                // Capacity pressure defers a tick; it never poisons the runtime.
             };
             self.stop_wake.waitTimeout(self.io, .{ .duration = .{
                 .raw = .fromMilliseconds(@intCast(self.publisher.nextWakeDelayMs(self.cfg.tick_interval_ms))),

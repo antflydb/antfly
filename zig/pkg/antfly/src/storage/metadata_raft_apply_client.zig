@@ -679,6 +679,105 @@ pub const RaftApplyStore = struct {
         };
     }
 
+    pub fn captureControlRoutingProjection(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, groups: []const u64, original: @import("antfly_local_sources").common_read_admission.Port) !std.json.Parsed(contract.ControlRoutingProjection) {
+        const read = @import("antfly_local_sources").common_read_admission;
+        try original.validate();
+        var trace: read.RejectionTrace = .{};
+        const control = trace.bind(original).?;
+        var caller_allocator = alloc;
+        const memory = @import("runtime_memory_abi").Allocator.fromStd(&caller_allocator);
+        var response: abi.OwnedBytes = .{};
+        defer if (response.ptr) |bytes| alloc.free(bytes[0..@intCast(response.len)]);
+        const status = abi.antfly_metadata_apply_store_control_routing(self.handle, &.{ .group_id = group_id, .groups = .fromSlice(std.mem.sliceAsBytes(groups)), .control = &control, .allocator = &memory }, &response);
+        if (trace.failure) |cause| return cause;
+        try statusToError(status);
+        const Adapter = struct {
+            original: read.Port,
+            fn check(ptr: *anyopaque) !void {
+                const adapter: *@This() = @ptrCast(@alignCast(ptr));
+                try adapter.original.checkpoint();
+            }
+        };
+        var adapter: Adapter = .{ .original = original };
+        const parsed = try @import("../api/sql_json_source.zig").parse(contract.ControlRoutingProjection, alloc, response.slice(), .{ .allocate = .alloc_always }, .{ .ptr = &adapter, .check = Adapter.check });
+        errdefer parsed.deinit();
+        try original.checkpoint();
+        return parsed;
+    }
+
+    pub fn captureTransactionRoutingProjection(
+        self: *RaftApplyStore,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        budget: @import("antfly_local_sources").api_routing_budget.RoutingBudget,
+    ) !contract.TransactionRoutingProjectionSnapshot {
+        const port = @import("transaction_routing_budget_port.zig");
+        const Adapter = struct {
+            original: @import("antfly_local_sources").api_routing_budget.RoutingBudget,
+            failure: ?anyerror = null,
+            fn checkpoint(ptr: *anyopaque) !void {
+                const adapter: *@This() = @ptrCast(@alignCast(ptr));
+                adapter.original.checkpoint() catch |err| {
+                    if (adapter.failure == null) adapter.failure = err;
+                    return err;
+                };
+            }
+            fn waitForProgress(ptr: *anyopaque) !void {
+                const adapter: *@This() = @ptrCast(@alignCast(ptr));
+                adapter.original.waitForProgress() catch |err| {
+                    if (adapter.failure == null) adapter.failure = err;
+                    return err;
+                };
+            }
+        };
+        var adapter = Adapter{ .original = budget };
+        const payload = port.Payload{ .ptr = &adapter, .vtable = &.{ .checkpoint = Adapter.checkpoint, .wait_for_progress = Adapter.waitForProgress } };
+        const control = port.Port.init(&payload);
+        var caller_allocator = alloc;
+        const memory = @import("runtime_memory_abi").Allocator.fromStd(&caller_allocator);
+        var response: abi.OwnedBytes = .{};
+        defer if (response.ptr) |bytes| alloc.free(bytes[0..@intCast(response.len)]);
+        const status = abi.antfly_metadata_apply_store_transaction_routing(self.handle, &.{ .group_id = group_id, .control = &control, .allocator = &memory }, &response);
+        // The coarse storage status must never erase a caller's scoped fence
+        // failure. The synchronous callback retains its exact original error.
+        if (adapter.failure) |err| return err;
+        try statusToError(status);
+        try budget.checkpoint();
+        const parsed = std.json.parseFromSlice(contract.TransactionRoutingProjectionSnapshot, alloc, response.slice(), .{ .allocate = .alloc_always }) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return error.StorageKernelFailure,
+        };
+        defer parsed.deinit();
+        try budget.checkpoint();
+        const tables = try cloneTransactionRecords(metadata.TableRecord, alloc, parsed.value.tables, budget, metadata_table_manager.cloneTable, metadata_table_manager.freeTable);
+        errdefer self.freeTables(alloc, tables);
+        const ranges = try cloneTransactionRecords(metadata.RangeRecord, alloc, parsed.value.ranges, budget, metadata_table_manager.cloneRange, metadata_table_manager.freeRange);
+        errdefer self.freeRanges(alloc, ranges);
+        const splits = try cloneTransactionRecords(metadata.SplitTransitionRecord, alloc, parsed.value.split_transitions, budget, metadata_table_manager.cloneSplitTransitionRecord, metadata_table_manager.freeSplitTransitionRecord);
+        errdefer self.freeSplitTransitions(alloc, splits);
+        const merges = try cloneTransactionRecords(metadata.MergeTransitionRecord, alloc, parsed.value.merge_transitions, budget, metadata_table_manager.cloneMergeTransitionRecord, metadata_table_manager.freeMergeTransitionRecord);
+        errdefer self.freeMergeTransitions(alloc, merges);
+        try budget.checkpoint();
+        return .{ .metadata_incarnation = parsed.value.metadata_incarnation, .catalog_revision = parsed.value.catalog_revision, .tables = tables, .ranges = ranges, .split_transitions = splits, .merge_transitions = merges };
+    }
+
+    fn cloneTransactionRecords(comptime Record: type, alloc: std.mem.Allocator, source: []const Record, budget: @import("antfly_local_sources").api_routing_budget.RoutingBudget, comptime clone_fn: anytype, comptime free_fn: anytype) ![]Record {
+        try budget.checkpoint();
+        const records = try alloc.alloc(Record, source.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (records[0..initialized]) |record| free_fn(alloc, record);
+            alloc.free(records);
+        }
+        for (source, records) |record, *destination| {
+            try budget.checkpoint();
+            destination.* = try clone_fn(alloc, record);
+            initialized += 1;
+        }
+        try budget.checkpoint();
+        return records;
+    }
+
     pub fn captureCatalogCursor(self: *RaftApplyStore, group_id: u64) !CatalogCursor {
         return try self.projection(CatalogCursor, .{
             .kind = .catalog_cursor,

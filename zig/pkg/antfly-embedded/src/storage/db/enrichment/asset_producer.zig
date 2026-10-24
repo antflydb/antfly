@@ -32,9 +32,15 @@ pub const InvocationContext = struct {
     cancellation: CancellationToken = .none,
     max_response_bytes: ?usize = null,
     progress: ?request_context.ProgressSink = null,
+    runnable: ?@import("antfly_runtime_abi").runnable_abi.Borrowed = null,
+
+    pub fn requiresControlledProvider(self: InvocationContext) bool {
+        return self.deadline_ns != null or self.runnable != null or self.cancellation.check_fn != null;
+    }
 
     pub fn check(self: InvocationContext) !void {
         try self.cancellation.check();
+        if (self.runnable) |borrow| try borrow.checkLifetime();
         if (self.deadline_ns) |deadline| {
             if (@import("antfly_platform").time.monotonicNs() >= deadline) return error.Timeout;
         }
@@ -46,6 +52,7 @@ pub const InvocationContext = struct {
             .deadline_ns = context.deadline_ns,
             .cancellation = context.cancellation orelse .none,
             .progress = context.progress,
+            .runnable = context.runnable,
         };
     }
 };
@@ -322,6 +329,7 @@ pub const Producer = struct {
     }
 
     pub fn produce(self: Producer, alloc: Allocator, request: Request) ![]u8 {
+        try self.invocation_context.check();
         const requests = [_]Request{request};
         const plan = try self.resolvedInvocationPlan(alloc, &requests);
         if (plan) |resolved| {
@@ -331,7 +339,7 @@ pub const Producer = struct {
             );
             const bounded_alloc = bounded.allocator();
             const output = self.invokeProduce(bounded_alloc, request) catch |err| {
-                if (bounded.limit_exceeded) {
+                if (err == error.OutOfMemory and bounded.limit_exceeded) {
                     std.log.warn(
                         "asset producer invocation exceeded its memory plan: limit_bytes={d} peak_live_bytes={d} source_bytes={d} producer={s}",
                         .{ bounded.max_live_bytes, bounded.peak_live_bytes, request.source_text.len, @tagName(request.producer_type) },
@@ -350,14 +358,55 @@ pub const Producer = struct {
     }
 
     fn invokeProduce(self: Producer, alloc: Allocator, request: Request) ![]u8 {
-        if (self.vtable.produce_with_context) |produce_fn|
-            return try produce_fn(self.ptr, alloc, request, self.invocation_context);
-        return try self.vtable.produce(self.ptr, alloc, request);
+        try self.invocation_context.check();
+        const output = if (self.vtable.produce_with_context) |produce_fn|
+            try produce_fn(self.ptr, alloc, request, self.invocation_context)
+        else blk: {
+            if (self.invocation_context.requiresControlledProvider()) return error.UncancellableInferenceProvider;
+            break :blk try self.vtable.produce(self.ptr, alloc, request);
+        };
+        errdefer alloc.free(output);
+        if (self.invocation_context.requiresControlledProvider()) try self.invocation_context.check();
+        return output;
+    }
+
+    fn checkedOutputs(self: Producer, alloc: Allocator, outputs: [][]u8) ![][]u8 {
+        errdefer {
+            for (outputs) |item| if (item.len > 0) alloc.free(item);
+            alloc.free(outputs);
+        }
+        if (self.invocation_context.requiresControlledProvider()) try self.invocation_context.check();
+        return outputs;
+    }
+
+    fn inferenceControlError(cause: anyerror) anyerror {
+        return switch (cause) {
+            error.Canceled => error.Cancelled,
+            error.DeadlineExceeded => error.Timeout,
+            else => cause,
+        };
+    }
+
+    /// Synchronous value copy: legacy batch callbacks must not hide a controlled
+    /// scalar path, and memory planning must receive the same original controls.
+    fn callbacksForContext(self: Producer, context: RequestContext) !VTable {
+        var callbacks = self.vtable.*;
+        if (!context.requiresControlledProvider()) return callbacks;
+        if (callbacks.invocation_memory_for_requests != null and callbacks.invocation_memory_for_requests_with_context == null)
+            return error.UncancellableInferenceProvider;
+        callbacks.produce_batch = null;
+        callbacks.produce_batch_reported = null;
+        return callbacks;
     }
 
     pub fn produceWithContext(self: Producer, alloc: Allocator, request: Request, context: RequestContext) ![]u8 {
         try context.check();
-        const output = try self.withInvocationContext(.fromRequestContext(context)).produce(alloc, request);
+        if (context.requiresControlledProvider() and self.vtable.produce_with_context == null)
+            return error.UncancellableInferenceProvider;
+        var callbacks = try self.callbacksForContext(context);
+        var scoped = self.withInvocationContext(.fromRequestContext(context));
+        scoped.vtable = &callbacks;
+        const output = scoped.produce(alloc, request) catch |err| return inferenceControlError(err);
         context.check() catch |err| {
             alloc.free(output);
             return err;
@@ -366,6 +415,7 @@ pub const Producer = struct {
     }
 
     pub fn produceBatch(self: Producer, alloc: Allocator, requests: []const Request) ![][]u8 {
+        try self.invocation_context.check();
         const plan = try self.resolvedInvocationPlan(alloc, requests);
         if (plan) |resolved| {
             var bounded = inference_work.BoundedInvocationAllocator.init(
@@ -373,7 +423,7 @@ pub const Producer = struct {
                 try invocationAllocatorLimit(resolved, requests),
             );
             const outputs = self.produceBatchUnchecked(bounded.allocator(), requests) catch |err| {
-                if (bounded.limit_exceeded) return error.InferenceInvocationMemoryExceeded;
+                if (err == error.OutOfMemory and bounded.limit_exceeded) return error.InferenceInvocationMemoryExceeded;
                 return err;
             };
             validateOutputBytes(outputs, resolved.max_result_bytes_per_item, resolved.max_result_bytes) catch |err| {
@@ -381,15 +431,18 @@ pub const Producer = struct {
                 alloc.free(outputs);
                 return err;
             };
-            return outputs;
+            return self.checkedOutputs(alloc, outputs);
         }
-        return try self.produceBatchUnchecked(alloc, requests);
+        return self.checkedOutputs(alloc, try self.produceBatchUnchecked(alloc, requests));
     }
 
     fn produceBatchUnchecked(self: Producer, alloc: Allocator, requests: []const Request) ![][]u8 {
+        try self.invocation_context.check();
         if (self.vtable.produce_batch_with_context) |produce_batch|
             return try produce_batch(self.ptr, alloc, requests, self.invocation_context);
-        if (self.vtable.produce_batch_reported_with_context != null or self.vtable.produce_batch_reported != null) {
+        if (self.vtable.produce_batch_reported_with_context != null or
+            (!self.invocation_context.requiresControlledProvider() and self.vtable.produce_batch_reported != null))
+        {
             var batch = if (self.vtable.produce_batch_reported_with_context) |reported|
                 try reported(self.ptr, alloc, requests, self.invocation_context)
             else
@@ -397,7 +450,8 @@ pub const Producer = struct {
             defer batch.deinit(alloc);
             return try batch.intoOutputs(alloc);
         }
-        if (self.vtable.produce_batch) |produce_batch| return try produce_batch(self.ptr, alloc, requests);
+        if (if (self.invocation_context.requiresControlledProvider()) null else self.vtable.produce_batch) |produce_batch|
+            return try produce_batch(self.ptr, alloc, requests);
 
         const out = try alloc.alloc([]u8, requests.len);
         errdefer {
@@ -417,6 +471,7 @@ pub const Producer = struct {
     /// are conservatively classified as compatibility execution; capability
     /// prediction is never presented as observed telemetry.
     pub fn produceBatchReported(self: Producer, alloc: Allocator, requests: []const Request) !ProducedBatch {
+        try self.invocation_context.check();
         const plan = try self.resolvedInvocationPlan(alloc, requests);
         if (plan) |resolved| {
             var bounded = inference_work.BoundedInvocationAllocator.init(
@@ -424,7 +479,7 @@ pub const Producer = struct {
                 try invocationAllocatorLimit(resolved, requests),
             );
             var batch = self.produceBatchReportedUnchecked(bounded.allocator(), requests) catch |err| {
-                if (bounded.limit_exceeded) return error.InferenceInvocationMemoryExceeded;
+                if (err == error.OutOfMemory and bounded.limit_exceeded) return error.InferenceInvocationMemoryExceeded;
                 return err;
             };
             validateProducedResultBytes(
@@ -451,6 +506,7 @@ pub const Producer = struct {
         requests: []const Request,
         rasters: []const antfly_image.BorrowedRasterAttachment,
     ) !ProducedBatch {
+        try self.invocation_context.check();
         if (requests.len == 0 or requests.len != rasters.len)
             return error.InvalidBorrowedRasterCardinality;
         for (rasters, requests) |raster, request| {
@@ -482,7 +538,7 @@ pub const Producer = struct {
                 requests,
                 rasters,
             ) catch |err| {
-                if (bounded.limit_exceeded) return error.InferenceInvocationMemoryExceeded;
+                if (err == error.OutOfMemory and bounded.limit_exceeded) return error.InferenceInvocationMemoryExceeded;
                 return err;
             };
             validateProducedResultBytes(
@@ -507,9 +563,15 @@ pub const Producer = struct {
         alloc: Allocator,
         requests: []const Request,
     ) !bool {
+        try self.invocation_context.check();
         if (requests.len == 0) return false;
-        if (self.vtable.borrowed_raster_batch_available_with_context) |available|
-            return try available(self.ptr, alloc, requests, self.invocation_context);
+        if (self.vtable.borrowed_raster_batch_available_with_context) |available| {
+            const result = try available(self.ptr, alloc, requests, self.invocation_context);
+            try self.invocation_context.check();
+            return result;
+        }
+        if (self.invocation_context.requiresControlledProvider() and self.vtable.borrowed_raster_batch_available != null)
+            return error.UncancellableInferenceProvider;
         if (self.vtable.borrowed_raster_batch_available) |available|
             return try available(self.ptr, alloc, requests);
         return false;
@@ -521,6 +583,9 @@ pub const Producer = struct {
         requests: []const Request,
         rasters: []const antfly_image.BorrowedRasterAttachment,
     ) !ProducedBatch {
+        try self.invocation_context.check();
+        if (self.invocation_context.requiresControlledProvider() and self.vtable.produce_borrowed_raster_batch_reported_with_context == null)
+            return error.UncancellableInferenceProvider;
         var batch = if (self.vtable.produce_borrowed_raster_batch_reported_with_context) |reported|
             try reported(self.ptr, alloc, requests, rasters, self.invocation_context)
         else if (self.vtable.produce_borrowed_raster_batch_reported) |reported|
@@ -528,25 +593,32 @@ pub const Producer = struct {
         else
             return error.BorrowedRasterUnsupported;
         errdefer batch.deinit(alloc);
+        if (self.invocation_context.requiresControlledProvider()) try self.invocation_context.check();
         try batch.validateForRequests(requests);
         return batch;
     }
 
     fn produceBatchReportedUnchecked(self: Producer, alloc: Allocator, requests: []const Request) !ProducedBatch {
+        try self.invocation_context.check();
         if (self.vtable.produce_batch_reported_with_context) |reported| {
             var batch = try reported(self.ptr, alloc, requests, self.invocation_context);
             errdefer batch.deinit(alloc);
+            if (self.invocation_context.requiresControlledProvider()) try self.invocation_context.check();
             try batch.validateForRequests(requests);
             return batch;
         }
-        if (self.vtable.produce_batch_reported) |reported| {
+        if (if (self.invocation_context.requiresControlledProvider()) null else self.vtable.produce_batch_reported) |reported| {
             var batch = try reported(self.ptr, alloc, requests);
             errdefer batch.deinit(alloc);
+            if (self.invocation_context.requiresControlledProvider()) try self.invocation_context.check();
             try batch.validateForRequests(requests);
             return batch;
         }
         const items = try self.produceBatchUnchecked(alloc, requests);
-        return try producedBatchFromOutputs(alloc, requests, items, inference_work.ExecutionReport.compatibility(requests.len));
+        var batch = try producedBatchFromOutputs(alloc, requests, items, inference_work.ExecutionReport.compatibility(requests.len));
+        errdefer batch.deinit(alloc);
+        if (self.invocation_context.requiresControlledProvider()) try self.invocation_context.check();
+        return batch;
     }
 
     fn resolvedInvocationPlan(
@@ -569,10 +641,16 @@ pub const Producer = struct {
     /// distinction between a fused/native model batch and an API-compatible
     /// serial loop.
     pub fn batchMode(self: Producer, alloc: Allocator, requests: []const Request) !inference_work.BatchMode {
+        try self.invocation_context.check();
         if (self.vtable.produce_batch == null and self.vtable.produce_batch_with_context == null and
             self.vtable.produce_batch_reported == null and self.vtable.produce_batch_reported_with_context == null) return .none;
-        if (self.vtable.batch_mode_with_context) |batch_mode|
-            return try batch_mode(self.ptr, alloc, requests, self.invocation_context);
+        if (self.vtable.batch_mode_with_context) |batch_mode| {
+            const result = try batch_mode(self.ptr, alloc, requests, self.invocation_context);
+            try self.invocation_context.check();
+            return result;
+        }
+        if (self.invocation_context.requiresControlledProvider() and (self.vtable.batch_mode != null or self.vtable.can_produce_batch != null))
+            return error.UncancellableInferenceProvider;
         if (self.vtable.batch_mode) |batch_mode|
             return try batch_mode(self.ptr, alloc, requests);
         if (self.vtable.can_produce_batch) |can_produce_batch|
@@ -582,7 +660,13 @@ pub const Producer = struct {
 
     pub fn produceBatchWithContext(self: Producer, alloc: Allocator, requests: []const Request, context: RequestContext) ![][]u8 {
         try context.check();
-        const out = try self.withInvocationContext(.fromRequestContext(context)).produceBatch(alloc, requests);
+        if (context.requiresControlledProvider() and self.vtable.produce_with_context == null and
+            self.vtable.produce_batch_with_context == null and self.vtable.produce_batch_reported_with_context == null)
+            return error.UncancellableInferenceProvider;
+        var callbacks = try self.callbacksForContext(context);
+        var scoped = self.withInvocationContext(.fromRequestContext(context));
+        scoped.vtable = &callbacks;
+        const out = scoped.produceBatch(alloc, requests) catch |err| return inferenceControlError(err);
         context.check() catch |err| {
             for (out) |item| if (item.len > 0) alloc.free(item);
             alloc.free(out);
@@ -598,11 +682,15 @@ pub const Producer = struct {
     }
 
     pub fn capabilitiesForRequests(self: Producer, alloc: Allocator, requests: []const Request) !?inference_work.InferenceCapabilities {
+        try self.invocation_context.check();
         if (self.vtable.capabilities_for_requests_with_context) |resolve| {
             const result = try resolve(self.ptr, alloc, requests, self.invocation_context);
+            try self.invocation_context.check();
             if (result) |capabilities| try capabilities.validate();
             return result;
         }
+        if (self.invocation_context.requiresControlledProvider() and self.vtable.capabilities_for_requests != null)
+            return error.UncancellableInferenceProvider;
         const resolve = self.vtable.capabilities_for_requests orelse return null;
         const result = try resolve(self.ptr, alloc, requests);
         if (result) |capabilities| try capabilities.validate();
@@ -631,6 +719,9 @@ pub const Producer = struct {
     ) !inference_work.InvocationMemoryPlan {
         const resolve = self.vtable.invocation_memory_for_requests;
         const resolve_with_context = self.vtable.invocation_memory_for_requests_with_context;
+        try self.invocation_context.check();
+        if (self.invocation_context.requiresControlledProvider() and resolve_with_context == null)
+            return error.UncancellableInferenceProvider;
         if (resolve == null and resolve_with_context == null)
             return error.InferenceInvocationMemoryUnavailable;
         var bounded = inference_work.BoundedInvocationAllocator.init(
@@ -641,9 +732,10 @@ pub const Producer = struct {
             contextual(self.ptr, bounded.allocator(), requests, self.invocation_context)
         else
             resolve.?(self.ptr, bounded.allocator(), requests)) catch |err| {
-            if (bounded.limit_exceeded) return error.InferenceInvocationMemoryExceeded;
+            if (err == error.OutOfMemory and bounded.limit_exceeded) return error.InferenceInvocationMemoryExceeded;
             return err;
         };
+        try self.invocation_context.check();
         if (requests.len > 0) try plan.validate();
         return plan;
     }
@@ -1263,6 +1355,7 @@ test "asset producer enforces invocation contracts with immutable planning and e
     const State = struct {
         planning_calls: usize = 0,
         execution_calls: usize = 0,
+        reject_after_denial: bool = false,
 
         fn legacyProduce(_: *anyopaque, _: Allocator, _: Request) anyerror![]u8 {
             return error.LegacyCallbackInvoked;
@@ -1276,10 +1369,14 @@ test "asset producer enforces invocation contracts with immutable planning and e
         ) anyerror![]u8 {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.execution_calls += 1;
-            try std.testing.expectEqual(@as(?u64, 1234), context.deadline_ns);
+            try std.testing.expectEqual(@as(?u64, std.math.maxInt(u64)), context.deadline_ns);
             try std.testing.expectEqual(@as(?usize, 2048), context.max_response_bytes);
             try context.cancellation.check();
             try std.testing.expect(context.io != null);
+            if (self.reject_after_denial) {
+                _ = alloc.alloc(u8, 4097) catch {};
+                return error.OriginalProviderAuthorityRejected;
+            }
             return try alloc.dupe(u8, "contextual");
         }
 
@@ -1291,7 +1388,7 @@ test "asset producer enforces invocation contracts with immutable planning and e
         ) anyerror!inference_work.InvocationMemoryPlan {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.planning_calls += 1;
-            try std.testing.expectEqual(@as(?u64, 1234), context.deadline_ns);
+            try std.testing.expectEqual(@as(?u64, std.math.maxInt(u64)), context.deadline_ns);
             try std.testing.expectEqual(@as(?usize, 2048), context.max_response_bytes);
             return .{
                 .attachment_transport = .borrowed_binary,
@@ -1315,7 +1412,7 @@ test "asset producer enforces invocation contracts with immutable planning and e
     var canceled = std.atomic.Value(bool).init(false);
     const scoped = producer.withInvocationContext(.{
         .io = std.Io.Threaded.global_single_threaded.io(),
-        .deadline_ns = 1234,
+        .deadline_ns = std.math.maxInt(u64),
         .cancellation = CancellationToken.fromAtomic(&canceled),
         .max_response_bytes = 2048,
     });
@@ -1331,6 +1428,13 @@ test "asset producer enforces invocation contracts with immutable planning and e
     try std.testing.expectEqual(@as(usize, 1), state.execution_calls);
     try std.testing.expectEqual(@as(?u64, null), producer.invocation_context.deadline_ns);
     try std.testing.expectEqual(@as(?usize, null), producer.invocation_context.max_response_bytes);
+
+    state.reject_after_denial = true;
+    try std.testing.expectError(error.OriginalProviderAuthorityRejected, scoped.produce(std.testing.allocator, .{
+        .producer_type = .generator,
+        .config_json = "{}",
+        .source_text = "source",
+    }));
 }
 
 test "asset producer forwards request context to cancellable implementations" {
@@ -1423,4 +1527,119 @@ test "asset producer preserves legacy native batch under request context" {
         },
     ));
     try std.testing.expectEqual(@as(usize, 2), probe.batch_calls);
+}
+
+test "provider controls reject legacy asset dispatch and retain controlled scalar batch fallback" {
+    const Probe = struct {
+        legacy_calls: usize = 0,
+        controlled_calls: usize = 0,
+        failure: ?anyerror = null,
+        fail_after: ?usize = null,
+        fail_cause: anyerror = error.OriginalAssetAuthorityRejected,
+        fn check(raw: *const anyopaque) !void {
+            const self: *const @This() = @ptrCast(@alignCast(raw));
+            if (self.failure) |cause| return cause;
+        }
+        fn legacy(raw: *anyopaque, _: Allocator, _: Request) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.legacy_calls += 1;
+            return error.UncontrolledProviderDispatched;
+        }
+        fn batch(raw: *anyopaque, _: Allocator, _: []const Request) ![][]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.legacy_calls += 1;
+            return error.UncontrolledProviderDispatched;
+        }
+        fn controlled(raw: *anyopaque, a: Allocator, req: Request, context: InvocationContext) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try context.check();
+            self.controlled_calls += 1;
+            const output = try a.dupe(u8, req.source_text);
+            if (self.fail_after == self.controlled_calls) self.failure = self.fail_cause;
+            return output;
+        }
+        fn available(raw: *anyopaque, _: Allocator, _: []const Request) !bool {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.legacy_calls += 1;
+            return error.UncontrolledProviderDispatched;
+        }
+        fn mode(raw: *anyopaque, _: Allocator, _: []const Request) !inference_work.BatchMode {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.legacy_calls += 1;
+            return error.UncontrolledProviderDispatched;
+        }
+        fn capabilities(raw: *anyopaque, _: Allocator, _: []const Request) !?inference_work.InferenceCapabilities {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.legacy_calls += 1;
+            return error.UncontrolledProviderDispatched;
+        }
+        fn raster(raw: *anyopaque, _: Allocator, _: []const Request, _: []const antfly_image.BorrowedRasterAttachment) !ProducedBatch {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.legacy_calls += 1;
+            return error.UncontrolledProviderDispatched;
+        }
+        fn memory(raw: *anyopaque, _: Allocator, _: []const Request) !inference_work.InvocationMemoryPlan {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.legacy_calls += 1;
+            return error.UncontrolledProviderDispatched;
+        }
+    };
+    var probe: Probe = .{};
+    const requests = [_]Request{ .{ .producer_type = .copy, .config_json = "", .source_text = "one" }, .{ .producer_type = .copy, .config_json = "", .source_text = "two" } };
+    const context: RequestContext = .{ .io = std.testing.io, .deadline_ns = std.math.maxInt(u64), .cancellation = .{ .ptr = &probe, .check_fn = Probe.check } };
+    const legacy = Producer{ .ptr = &probe, .vtable = &.{ .produce = Probe.legacy, .produce_batch = Probe.batch } };
+    var expired = context;
+    expired.deadline_ns = 0;
+    try std.testing.expectError(error.Timeout, legacy.produceWithContext(std.testing.allocator, requests[0], expired));
+    try std.testing.expectEqual(@as(usize, 0), probe.legacy_calls);
+    try std.testing.expectError(error.UncancellableInferenceProvider, legacy.produceWithContext(std.testing.allocator, requests[0], context));
+    try std.testing.expectError(error.UncancellableInferenceProvider, legacy.produceBatchWithContext(std.testing.allocator, &requests, context));
+    const provider = Producer{ .ptr = &probe, .vtable = &.{ .produce = Probe.legacy, .produce_with_context = Probe.controlled, .produce_batch = Probe.batch } };
+    const outputs = try provider.produceBatchWithContext(std.testing.allocator, &requests, context);
+    const value_scoped = provider.withInvocationContext(.fromRequestContext(context));
+    const observed = try value_scoped.produceBatchReported(std.testing.allocator, &requests);
+    var owned_observed = observed;
+    defer owned_observed.deinit(std.testing.allocator);
+    defer {
+        for (outputs) |item| std.testing.allocator.free(item);
+        std.testing.allocator.free(outputs);
+    }
+    try std.testing.expectEqualStrings("one", outputs[0]);
+    try std.testing.expectEqualStrings("two", outputs[1]);
+    try std.testing.expectEqual(@as(usize, 4), probe.controlled_calls);
+    try std.testing.expectEqual(@as(usize, 0), probe.legacy_calls);
+    var callbacks = provider.vtable.*;
+    callbacks.invocation_memory_for_requests = Probe.memory;
+    const unscoped_plan = Producer{ .ptr = &probe, .vtable = &callbacks };
+    try std.testing.expectError(error.UncancellableInferenceProvider, unscoped_plan.produceWithContext(std.testing.allocator, requests[0], context));
+    try std.testing.expectEqual(@as(usize, 0), probe.legacy_calls);
+    var metadata_callbacks = provider.vtable.*;
+    metadata_callbacks.capabilities_for_requests = Probe.capabilities;
+    metadata_callbacks.batch_mode = Probe.mode;
+    metadata_callbacks.borrowed_raster_batch_available = Probe.available;
+    metadata_callbacks.produce_borrowed_raster_batch_reported = Probe.raster;
+    const metadata_scoped = (Producer{ .ptr = &probe, .vtable = &metadata_callbacks }).withInvocationContext(.fromRequestContext(context));
+    try std.testing.expectError(error.UncancellableInferenceProvider, metadata_scoped.capabilitiesForRequests(std.testing.allocator, &requests));
+    try std.testing.expectError(error.UncancellableInferenceProvider, metadata_scoped.batchMode(std.testing.allocator, &requests));
+    try std.testing.expectError(error.UncancellableInferenceProvider, metadata_scoped.borrowedRasterBatchAvailable(std.testing.allocator, &requests));
+    const rasters = [_]antfly_image.BorrowedRasterAttachment{.{ .bytes = &.{ 1, 2, 3, 4 }, .width = 1, .height = 1, .stride_bytes = 4 }};
+    try std.testing.expectError(error.UncancellableInferenceProvider, metadata_scoped.produceBorrowedRasterBatchReported(std.testing.allocator, requests[0..1], &rasters));
+    try std.testing.expectEqual(@as(usize, 0), probe.legacy_calls);
+    probe.failure = error.OriginalAssetAuthorityRejected;
+    try std.testing.expectError(error.OriginalAssetAuthorityRejected, provider.produceBatchWithContext(std.testing.allocator, &requests, context));
+    try std.testing.expectEqual(@as(usize, 4), probe.controlled_calls);
+
+    probe.failure = null;
+    probe.fail_after = 5;
+    // The first controlled member returns owned output, then loses authority.
+    // The second member must not dispatch and the partial batch must retire.
+    try std.testing.expectError(error.OriginalAssetAuthorityRejected, value_scoped.produceBatchReported(std.testing.allocator, &requests));
+    try std.testing.expectEqual(@as(usize, 5), probe.controlled_calls);
+    try std.testing.expectEqual(@as(usize, 0), probe.legacy_calls);
+
+    probe.failure = null;
+    probe.fail_after = 6;
+    probe.fail_cause = error.Canceled;
+    try std.testing.expectError(error.Cancelled, provider.produceWithContext(std.testing.allocator, requests[0], context));
+    try std.testing.expectEqual(@as(usize, 6), probe.controlled_calls);
 }

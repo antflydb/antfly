@@ -1034,12 +1034,13 @@ pub const CachedSegments = struct {
             store: stores.ArtifactStore,
             ref: artifacts.ChunkRef,
             cancellation: Cancellation,
+            context: local.serverless_query_lake_read_context.Context,
             fn load(ptr: *anyopaque, alloc: A) ![]u8 {
                 const provider: *@This() = @ptrCast(@alignCast(ptr));
-                return provider.store.getVerifiedAllocWithCancellationUsingAllocator(alloc, provider.ref.artifact_id, provider.ref.byte_len, provider.ref.checksum, provider.cancellation);
+                return provider.store.getVerifiedAllocFor(alloc, provider.ref.artifact_id, provider.ref.byte_len, provider.ref.checksum, provider.cancellation, provider.context);
             }
         };
-        var provider: Provider = .{ .store = self.store, .ref = ref, .cancellation = cancellation };
+        var provider: Provider = .{ .store = self.store, .ref = ref, .cancellation = cancellation, .context = self.cache.context };
         const owner = try a.create(OwnedLease);
         errdefer a.destroy(owner);
         owner.* = .{ .a = a, .lease = try self.cache.cache.readImmutableLease(a, self.cache.scope, ref.artifact_id, std.math.cast(usize, ref.byte_len) orelse return error.InvalidNativeLakeTextCorpus, try stores.sha256DigestFromChecksum(ref.checksum), self.cache.context, .{ .ptr = &provider, .load = Provider.load }) };

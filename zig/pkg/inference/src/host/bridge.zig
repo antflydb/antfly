@@ -21,10 +21,19 @@ const std = @import("std");
 const error_abi = @import("antfly_runtime_abi").error_abi;
 const http_abi = @import("antfly_runtime_abi").http_abi;
 const native_abi = @import("antfly_runtime_abi").native_abi;
+pub const MemoryParent = @import("antfly_runtime_abi").memory_abi.Parent;
+pub const runnable_abi = @import("antfly_runtime_abi").runnable_abi;
 const antfly_image = @import("antfly_image");
 
-// Version 31 adds incremental request reads to the shared HTTP body source.
-pub const abi_version: u32 = 31;
+// Incremental HTTP request reads compose with pooled host ownership.
+// Includes runnable execution control, CUDA preload precision, raster embedding,
+// host-owned execution placement, and memory-admission diagnostics.
+// Mixed runtime versions fail closed.
+// Version 42 adds runtime-owned Metal KV buffer credits, including graph aliases.
+// Version 41 introduced CUDA cache credits surviving cache/host teardown.
+// Version 40 introduced the parented/supervised host cache allocator contract.
+// Worker Create.bridge_version also fences older executables before startup.
+pub const abi_version: u32 = 44;
 pub const ai_api_prefix = "/ai/v1";
 pub const public_api_prefix = "/ml/v1";
 pub const Status = error_abi.Status;
@@ -116,6 +125,9 @@ pub const CreateContext = extern struct {
     executor: native_abi.IoBorrow,
     out_handle: *?*anyopaque,
     execution_host: ExecutionHost = .server,
+    /// Process-local bootstrap accounting, borrowed through Client destruction
+    /// and any retained result. Never serialized into child launch settings.
+    bootstrap_memory_parent: ?*const MemoryParent = null,
 };
 
 pub const ConfigureContext = extern struct {
@@ -123,6 +135,9 @@ pub const ConfigureContext = extern struct {
     struct_size: u32 = @sizeOf(@This()),
     handle: *anyopaque,
     resource_budget: *const ResourceBudget,
+    /// Borrowed during configure; the inference host retains its own lease
+    /// through worker and node teardown. Null preserves unconfigured execution.
+    runnable_owner: ?*const runnable_abi.Owner = null,
 };
 
 pub const AdmissionAmounts = extern struct {
@@ -145,8 +160,15 @@ pub const ResourceBudget = extern struct {
     reserve_admission: *const fn (*anyopaque, *const AdmissionAmounts, *usize) callconv(.c) Status,
     retain_admission: *const fn (*anyopaque, usize, *const AdmissionAmounts) callconv(.c) Status,
     release_admission: *const fn (*anyopaque, usize) callconv(.c) void,
+    /// Both tokens must already be registered. Failure preserves both owners;
+    /// success moves existing credit without changing aggregate usage.
+    transfer_admission: ?*const fn (*anyopaque, usize, usize, *const AdmissionAmounts) callconv(.c) Status = null,
     observe_prompt_cache: *const fn (*anyopaque, usize, u64, u64) callconv(.c) u8,
     observe_tokenizer_cache: *const fn (*anyopaque, usize, u64, u64) callconv(.c) u8,
+    /// Admit aggregate live parent-side transport/result bytes. Identity is
+    /// process-local, stable for one Client budget, and never crosses IPC.
+    /// Growth must precede allocation; validated shrink must always succeed.
+    adjust_transient_host: ?*const fn (*anyopaque, usize, u64, u64) callconv(.c) u8 = null,
 };
 
 /// Stable operation identifiers for the embedded inference service. Requests
@@ -179,6 +201,10 @@ pub const ProviderOperation = enum(c_int) {
     /// Documents as ordered content parts; binary parts travel as payloads
     /// whose refs index the parts flattened in document order.
     rerank_documents = 22,
+    /// Raw JSON routes preserve the HTTP status and body contract while using
+    /// the provider request context and private-worker CPU grant transport.
+    generate_json = 23,
+    decide_json = 24,
 };
 
 pub const ProviderBinaryPayload = extern struct {
@@ -296,6 +322,12 @@ pub const ProviderInvokeContext = extern struct {
     cancellation: http_abi.CancellationView = .{},
     /// Appended in ABI v19 and extended in v20 with model/backend detail.
     progress: ProgressView = .{},
+    /// Borrowed through this synchronous invocation only. The receiver copies
+    /// the descriptor and never publishes callbacks to cancellation monitors.
+    runnable: ?*const runnable_abi.Borrowed = null,
+    /// Private worker-protocol CPU demand. Zero means no delegated grant.
+    /// The parent keeps ownership; process-local callbacks never enter IPC.
+    admitted_cpu_slots: u32 = 0,
 };
 
 pub const RouteManifestEntry = extern struct {
@@ -324,6 +356,12 @@ pub const HttpHandleContext = extern struct {
     stream: http_abi.StreamSink = .{},
     out_response_handle: *?*anyopaque,
     out_response: *http_abi.HttpResponseView,
+    deadline_ns: u64 = 0,
+    has_deadline: u8 = 0,
+    /// Synchronous HTTP dispatch borrows its caller's execution capsule.
+    runnable: ?*const runnable_abi.Borrowed = null,
+    /// A worker receives only scalar CPU demand, never parent callbacks.
+    admitted_cpu_slots: u32 = 0,
 };
 
 pub const Capability = struct {
@@ -461,6 +499,19 @@ pub fn requiredFunctionTableSize(required_capabilities: u64) ?u32 {
 
 pub extern fn antfly_standalone_inference_get_function_table() callconv(.c) *const FunctionTable;
 
+test "linked inference configure rejects old layouts before borrowing the runnable owner" {
+    try std.testing.expectEqual(.@"extern", @typeInfo(ConfigureContext).@"struct".layout);
+    const context: ConfigureContext = .{
+        .abi_version = abi_version,
+        .handle = @ptrFromInt(8),
+        .resource_budget = @ptrFromInt(8),
+        .runnable_owner = @ptrFromInt(8),
+    };
+    try std.testing.expect(validContext(ConfigureContext, context.abi_version, context.struct_size));
+    try std.testing.expect(!validContext(ConfigureContext, abi_version - 1, context.struct_size));
+    try std.testing.expect(!validContext(ConfigureContext, abi_version, @offsetOf(ConfigureContext, "runnable_owner")));
+}
+
 test "linked inference ABI rejects mismatched context and function-table prefixes" {
     try std.testing.expectEqual(@as(u8, 0), @backingInt(ProcessMemoryLimitProvenance.automatic));
     try std.testing.expectEqual(@as(u8, 1), @backingInt(ProcessMemoryLimitProvenance.explicit));
@@ -483,4 +534,10 @@ test "linked inference ABI rejects mismatched context and function-table prefixe
     table.struct_size = requiredFunctionTableSize(Capability.provider).?;
     try std.testing.expect(validFunctionTable(&table, Capability.provider));
     try std.testing.expect(!validFunctionTable(&table, 1 << 63));
+}
+
+test "inference worker create context requires the bootstrap memory parent ABI tail" {
+    try std.testing.expect(validContext(CreateContext, abi_version, @sizeOf(CreateContext)));
+    try std.testing.expect(!validContext(CreateContext, abi_version - 1, @sizeOf(CreateContext)));
+    try std.testing.expect(!validContext(CreateContext, abi_version, @offsetOf(CreateContext, "bootstrap_memory_parent")));
 }

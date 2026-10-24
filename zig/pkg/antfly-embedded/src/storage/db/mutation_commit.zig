@@ -98,7 +98,6 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
         const RequestPreparationContext = execution_resources.RequestPreparationContext;
         const ShadowState = execution_resources.ShadowState;
         const appendDocumentChildRangeOutboxWrites = D.appendDocumentChildRangeOutboxWrites;
-        const decodeDurableReplicationOutbox = D.decodeDurableReplicationOutbox;
         const durableReplicationOutboxKeyAlloc = D.durableReplicationOutboxKeyAlloc;
         const durableReplicationOutboxKindFromKey = D.durableReplicationOutboxKindFromKey;
         const encodeDurableReplicationOutboxAlloc = D.encodeDurableReplicationOutboxAlloc;
@@ -121,7 +120,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
         const GeneratedWriteReadSnapshot = S.GeneratedWriteReadSnapshot;
         const appendArtifactSourceRevisionWritesFromReplay = S.appendArtifactSourceRevisionWritesFromReplay;
         const appendAssetArtifactSourceIndexMutations = S.appendAssetArtifactSourceIndexMutations;
-        const appendDenseArtifactCounterMutations = S.appendDenseArtifactCounterMutations;
+        const prepareDenseArtifactCounterMutations = S.prepareDenseArtifactCounterMutations;
         const appendDirectGraphTtlDueWrite = S.appendDirectGraphTtlDueWrite;
         const appendEmbeddingArtifactWrite = S.appendEmbeddingArtifactWrite;
         const appendGraphEdgeArtifactWrite = S.appendGraphEdgeArtifactWrite;
@@ -129,7 +128,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
         const appendGraphLifecycleGeneration = S.appendGraphLifecycleGeneration;
         const appendImportedGraphContenderMutations = S.appendImportedGraphContenderMutations;
         const appendMixedDirectGraphContenderMutations = S.appendMixedDirectGraphContenderMutations;
-        const appendPrecomputedCoverageOutcomeMutations = S.appendPrecomputedCoverageOutcomeMutations;
+        const preparePrecomputedCoverageOutcomes = S.preparePrecomputedCoverageOutcomes;
         const appendPreparedGraphEdgeArtifactWrite = S.appendPreparedGraphEdgeArtifactWrite;
         const appendRetiredDirectGraphTtlDueDeletes = S.appendRetiredDirectGraphTtlDueDeletes;
         const appendSparseEmbeddingArtifactWrite = S.appendSparseEmbeddingArtifactWrite;
@@ -166,7 +165,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
         const makeTimestampKey = S.makeTimestampKey;
         const overwriteProbeLessThan = S.overwriteProbeLessThan;
         const planGeneratedEnrichmentsForRows = S.planGeneratedEnrichmentsForRows;
-        const prepareGeneratedEnrichments = S.prepareGeneratedEnrichments;
+        const prepareGeneratedEnrichmentsWithContext = S.prepareGeneratedEnrichmentsWithContext;
         const prepareRelationalRows = S.prepareRelationalRows;
         const projectedBatchLsmAdmissionBytes = S.projectedBatchLsmAdmissionBytes;
         const relationalColumns = S.relationalColumns;
@@ -184,12 +183,17 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
         const validateDocumentExtractionInlineSourcesSnapshotParsed = S.validateDocumentExtractionInlineSourcesSnapshotParsed;
         pub fn acquireReplicationMutationShared(self: anytype) ?MutationBarrier.SharedLease {
             const barrier = self.replicationMutationBarrier() orelse return null;
+            if (@import("mutation_admission.zig").receiverMutationRoot(self)) |root| {
+                std.debug.assert(root.barrier == barrier);
+                return root.borrowPhase();
+            }
             return barrier.acquireShared();
         }
 
         pub fn batchContext(self: anytype) BatchExecutionContext {
             const resources = S.ownerField(self, "core").*.batchExecutionResources();
             return .{
+                .mutation_root = @import("mutation_admission.zig").receiverMutationRoot(self),
                 .alloc = S.ownerField(self, "alloc").*,
                 .store = resources.store,
                 .applied_sequence_checkpoint_path = resources.applied_sequence_checkpoint_path,
@@ -223,6 +227,12 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             };
         }
 
+        pub fn batchContextWithMutationRoot(self: anytype, root: ?*MutationBarrier.RootSharedLease) BatchExecutionContext {
+            var ctx = batchContext(self);
+            ctx.mutation_root = root orelse ctx.mutation_root;
+            return ctx;
+        }
+
         pub fn batchInternalPrepared(
             self: anytype,
             req: types.BatchRequest,
@@ -248,10 +258,38 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 prepared_row_allocator.captureIoDomain();
                 return @import("antfly_source_root").antfly_sources.storage_engine.call("batchPrepared", .{ self, req, profile, opts, generated_memo, prepared_row_allocator });
             }
+            var metadata_reads = @import("prepared_read_set.zig").Owned.init(if (opts.assembly) |output| output.allocator else prepared_row_allocator.allocator(), null);
+            defer metadata_reads.deinit();
+            return batchInternalPreparedOwnedInner(self, req, profile, opts, generated_memo, prepared_row_allocator, &metadata_reads) catch |err| return metadata_reads.failure orelse err;
+        }
+
+        noinline fn batchInternalPreparedOwnedInner(
+            self: *S.PreparedBatchOwner,
+            req: types.BatchRequest,
+            profile: ?*BatchProfile,
+            opts: BatchExecutionOptions,
+            generated_memo: *GeneratedEmbeddingMemo,
+            prepared_row_allocator: *PreparedRowAllocator,
+            metadata_reads: *@import("prepared_read_set.zig").Owned,
+        ) anyerror!void {
             @setEvalBranchQuota(100_000);
+            if (opts.assembly) |output| {
+                if (output.plan != null) return error.InvalidArgument;
+                const resolution = opts.transaction_resolution orelse return error.PreparedEffectsRequired;
+                if (resolution.accepted_effects == null or resolution.status != .committed or
+                    opts.ordered_apply_receipt != null or opts.replication_applied_lsn_marker != null or
+                    opts.bypass_replication_write_gate or opts.suppress_derived_replay_append or
+                    opts.group_source_command != null or opts.resolver_review_command != null or
+                    opts.extra_store_writes.len != 0 or opts.extra_store_deletes.len != 0 or
+                    req.merge_replication != null or req.merge_checkpoint != null or req.split_replication != null or
+                    req.split_checkpoint != null or req.artifact_catalog != null or req.relational_topology != null)
+                    return error.InvalidBatchRequest;
+            }
+            var root_binding = try @import("mutation_admission.zig").bindReceiverMutationRoot(self, opts.mutation_root);
+            defer root_binding.release();
             const maintenance_contract = @import("relational_index_maintenance_contract.zig");
             var maintenance_attempted = false;
-            defer if (maintenance_attempted) {
+            defer if (maintenance_attempted and opts.assembly == null) {
                 // Only a scheduling hint: the worker re-reads durable desired state.
                 // Also wake on an ambiguous result after the store committed.
                 S.ownerField(self, "local_execution").*.relational_index_maintenance_sweep.request();
@@ -272,11 +310,31 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             if (schema_namespace != S.ownerField(self, "core").*.schemaNamespaceGeneration()) return error.PreparedGenerationChanged;
             if (openModeRequiresReadOnlyBackends(S.ownerField(self, "open_mode").*)) return error.ReadOnly;
             if (!opts.bypass_replication_write_gate and self.denseRepairWriteBackpressured()) return error.DenseRepairBackpressure;
-            var replication_mutation = if (opts.bypass_replication_write_gate) null else self.acquireReplicationMutationShared();
-            defer if (replication_mutation) |*lease| lease.release();
-            if (!opts.bypass_replication_write_gate) try self.ensureDurableReplicationStartupBarrier();
+            const mutation_admission = @import("mutation_admission.zig");
+            // A supplied snapshot or policy lease is retained before the
+            // initial replication wait. Keep its original lifetime, with CPU
+            // authority retained until capture holders adopt mandatory reentry.
+            if (opts.row_policy_retirement) |owned|
+                if (opts.row_policy_lease != owned) return error.InvalidArgument;
+            const initial_controls = if (opts.snapshot_mutation != null or opts.row_policy_lease != null)
+                mutation_admission.retainedLeaseControls(opts.admission_controls)
+            else
+                opts.admission_controls;
+            // Startup recovery is a separate durable obligation. Do not wrap
+            // its remote acknowledgement in this batch's primary mutation reader.
+            if (!opts.bypass_replication_write_gate and opts.assembly == null) {
+                const enclosing = opts.enclosing_mutation_retirement;
+                const reacquire_enclosing = if (enclosing) |slot| slot.* != null else false;
+                if (enclosing) |slot| releaseReplicationMutationShared(slot);
+                if (opts.avoid_admission_capacity_cycle)
+                    try @import("replication_startup_admission.zig").ensurePreDecisionWithRoot(self, initial_controls, opts.mutation_root orelse mutation_admission.receiverMutationRoot(self))
+                else
+                    try @import("replication_startup_admission.zig").ensureWithRoot(self, initial_controls, opts.mutation_root orelse mutation_admission.receiverMutationRoot(self));
+                if (reacquire_enclosing) enclosing.?.* = try mutation_admission.acquireReplicationMutationSharedScoped(self, initial_controls, opts.mutation_root orelse mutation_admission.receiverMutationRoot(self));
+            }
             if (!opts.bypass_replication_write_gate) try self.enforceReplicationWriteGate();
-            if (!opts.bypass_replication_write_gate) try self.preflightReplicationBatchSyncCommit();
+            if (!opts.bypass_replication_write_gate) try preflightReplicationBatchSyncCommitWithAdmission(self, initial_controls, opts.mutation_root orelse mutation_admission.receiverMutationRoot(self));
+            const prepared_catalog_revision = S.ownerField(self, "core").*.store.resolver_catalog_revision.read();
             const total_start_ns = monotonicTimeNs();
             var schedule_replication_recovery_on_exit = false;
             defer {
@@ -287,18 +345,49 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             }
 
             try S.ownerField(self, "executor").*.checkSyncLevelHealth(req.sync_level);
+            // Admit projected LSM pressure before spending CPU, memory, or provider
+            // calls on a PreparedRow that cannot yet commit. This advisory wait
+            // precedes the primary reader so capture and maintenance can progress.
+            // Allocation/WAL admission remains the authoritative hard guard.
+            if (S.ownerField(self, "core").*.index_manager.resource_manager) |manager| {
+                var pressure_admission: mutation_admission.IntentCollection = .{};
+                const pressure_control = if (opts.avoid_admission_capacity_cycle)
+                    pressure_admission.bindPreDecisionBeforeMutation(initial_controls, S.ownerField(self, "core").*.apply_mutex.io, opts.mutation_root orelse mutation_admission.receiverMutationRoot(self))
+                else
+                    pressure_admission.bindBeforeMutation(initial_controls, S.ownerField(self, "core").*.apply_mutex.io, opts.mutation_root orelse mutation_admission.receiverMutationRoot(self));
+                if (pressure_control) |control| {
+                    if (opts.avoid_admission_capacity_cycle)
+                        try manager.awaitAdmissionPreDecisionWithAdmission(.lsm_in_memory_state, projectedBatchLsmAdmissionBytes(req), control)
+                    else
+                        try manager.awaitAdmissionWithAdmission(.lsm_in_memory_state, projectedBatchLsmAdmissionBytes(req), control);
+                } else {
+                    try manager.awaitAdmission(.lsm_in_memory_state, projectedBatchLsmAdmissionBytes(req));
+                }
+            }
+            var replication_mutation = if (opts.bypass_replication_write_gate) null else if (opts.avoid_admission_capacity_cycle)
+                try mutation_admission.acquireReplicationMutationSharedPreDecisionScoped(self, initial_controls, opts.mutation_root orelse mutation_admission.receiverMutationRoot(self))
+            else
+                try mutation_admission.acquireReplicationMutationSharedScoped(self, initial_controls, opts.mutation_root orelse mutation_admission.receiverMutationRoot(self));
+            defer if (replication_mutation) |*lease| lease.release();
+            if (!opts.bypass_replication_write_gate) try self.enforceReplicationWriteGate();
+            if (!opts.bypass_replication_write_gate) try preflightReplicationBatchSyncCommitWithAdmission(self, initial_controls, opts.mutation_root orelse mutation_admission.receiverMutationRoot(self));
+            try S.ownerField(self, "executor").*.checkSyncLevelHealth(req.sync_level);
 
             var foreground_write = resource_manager_mod.ResourceManager.ForegroundWriteLease{};
             defer foreground_write.release();
 
-            // Admit projected LSM pressure before spending CPU, memory, or provider
-            // calls on a PreparedRow that cannot yet commit. Maintenance workers
-            // remain able to drain the pressure because no DB apply lock is held.
-            if (S.ownerField(self, "core").*.index_manager.resource_manager) |manager| {
-                try manager.awaitAdmission(.lsm_in_memory_state, projectedBatchLsmAdmissionBytes(req));
-            }
             const preparation_timestamp_ns = if (req.timestamp_ns != 0) req.timestamp_ns else S.ownerField(self, "backend_runtime").*.clock().nowRealtimeNs();
             const preparation_alloc = prepared_row_allocator.allocator();
+            const replay_bindings = @import("prepared_replay_bindings.zig");
+            var sequence_sources = replay_bindings.Sources.init(preparation_alloc);
+            defer sequence_sources.deinit();
+            // Relational graph TTL effects read primary artifacts before apply.
+            // Retain those observations under the original lifetime, then seal
+            // this stage before under-apply capture installs its own controls.
+            var preparation_admission: mutation_admission.IntentCollection = .{};
+            metadata_reads.control = preparation_admission.bind(initial_controls, S.ownerField(self, "core").*.apply_mutex.io);
+            const preparation_store = @import("prepared_read_set.zig").observe(S.ownerField(self, "core").*.store, metadata_reads);
+            const prepared_payload_policy_generation = try S.ownerField(self, "core").*.store.payloadPolicyGeneration(metadata_reads.control);
 
             // Resolve request ordering and transforms before row preparation. A
             // transform that reads durable state carries an optimistic version
@@ -514,10 +603,10 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     break;
                 };
                 if (eligible) {
-                    const requires_inline_generated =
-                        (req.sync_level == .full_text or req.sync_level == .enrichments or req.sync_level == .full_index) or
-                        opts.force_generated_artifact_names.len != 0 or
-                        splitShadowRequiresMaterializedDerivedBatch(self);
+                    const requires_inline_generated = (if (opts.transaction_resolution) |resolution| resolution.accepted_effects == null else true) and
+                        ((req.sync_level == .full_text or req.sync_level == .enrichments or req.sync_level == .full_index) or
+                            opts.force_generated_artifact_names.len != 0 or
+                            splitShadowRequiresMaterializedDerivedBatch(self));
                     const rows = try preparation_alloc.alloc(?mapper.PreparedRelationalWrite, effective_req.writes.len);
                     @memset(rows, null);
                     preprepared_rows = rows;
@@ -609,9 +698,8 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                                     );
                                 }
                                 for (row.extracted.graph_writes) |graph_write| {
-                                    const generation = write_plan_snapshot.?.plan().graphCoverageGeneration(graph_write.index_name) orelse return error.IndexNotFound;
-                                    const graph_entry = S.ownerField(self, "core").*.index_manager.graphIndex(graph_write.index_name) orelse return error.IndexNotFound;
-                                    try appendPreparedGraphEdgeArtifactWrite(effects_alloc, S.ownerField(self, "core").*.store, &effect.graph_writes, graph_write, generation, graph_entry.ttl_duration_ns, preparation_timestamp_ns);
+                                    const graph_plan = write_plan_snapshot.?.plan().graphField(graph_write.index_name) orelse return error.IndexNotFound;
+                                    try appendPreparedGraphEdgeArtifactWrite(effects_alloc, preparation_store, &effect.graph_writes, graph_write, graph_plan.coverage_generation, graph_plan.ttl_duration_ns, preparation_timestamp_ns);
                                 }
                                 for (row.extracted.mentioned_graph_indexes) |index_name| {
                                     const clear = try GraphArtifactClear.initAlloc(effects_alloc, write.key, index_name);
@@ -639,7 +727,14 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                         var extracted_rows = try preparation_alloc.alloc(mapper.ExtractedWrite, rows.len);
                         defer preparation_alloc.free(extracted_rows);
                         for (rows, 0..) |maybe_row, index| extracted_rows[index] = maybe_row.?.extracted;
-                        preprepared_generated = try prepareGeneratedEnrichments(
+                        var preparation_holders: ?mutation_admission.SpeculativePreparation = if (opts.provider_context != null and opts.snapshot_mutation == null and (opts.row_policy_lease == null or opts.row_policy_retirement != null))
+                            try mutation_admission.SpeculativePreparation.begin(&replication_mutation, opts.enclosing_mutation_retirement, opts.mutation_root orelse mutation_admission.receiverMutationRoot(self), opts.row_policy_retirement, opts.admission_controls)
+                        else
+                            null;
+                        var producer_stage: @import("preparation_execution.zig").Stage = .{};
+                        defer producer_stage.deinit();
+                        if (preparation_holders) |*holders| try producer_stage.begin(holders, opts.provider_execution, opts.provider_context);
+                        preprepared_generated = try prepareGeneratedEnrichmentsWithContext(
                             self,
                             preparation_alloc,
                             effective_req,
@@ -648,7 +743,14 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                             opts.force_generated_artifact_names,
                             &preprepared_generated_plan.?,
                             generated_memo,
+                            opts.provider_context,
+                            if (preparation_holders != null) &producer_stage else null,
                         );
+                        try producer_stage.complete();
+                        if (preparation_holders) |*holders| {
+                            if (!opts.bypass_replication_write_gate) try self.enforceReplicationWriteGate();
+                            try holders.reenter(self);
+                        }
                     }
                     if (profile) |active_profile| {
                         recordProfileNs(profile, &active_profile.relational_prepare_ns, prepare_start_ns);
@@ -675,10 +777,10 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             if (opts.transaction_resolution == null and
                 !(if (request_schema_view) |view| view.storageMode() == .relational else false))
             {
-                const requires_inline_generated =
-                    (effective_req.sync_level == .full_text or effective_req.sync_level == .enrichments or effective_req.sync_level == .full_index) or
-                    opts.force_generated_artifact_names.len != 0 or
-                    splitShadowRequiresMaterializedDerivedBatch(self);
+                const requires_inline_generated = (if (opts.transaction_resolution) |resolution| resolution.accepted_effects == null else true) and
+                    ((effective_req.sync_level == .full_text or effective_req.sync_level == .enrichments or effective_req.sync_level == .full_index) or
+                        opts.force_generated_artifact_names.len != 0 or
+                        splitShadowRequiresMaterializedDerivedBatch(self));
                 if (requires_inline_generated and effective_req.writes.len > 0) {
                     const precompute_generated_start_ns = monotonicTimeNs();
                     generated_precompute_snapshot = try self.captureGeneratedWriteReadSnapshot(preparation_alloc, effective_req.writes);
@@ -728,7 +830,14 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                             try doc_plan.appendIndexFieldEmbeddingsFromParsedToExtractedWrite(preparation_alloc, write.key, parsed.value, &extracted_rows[i]);
                         }
                     }
-                    preprepared_document_generated = try prepareGeneratedEnrichments(
+                    var preparation_holders: ?mutation_admission.SpeculativePreparation = if (opts.provider_context != null and opts.snapshot_mutation == null and (opts.row_policy_lease == null or opts.row_policy_retirement != null))
+                        try mutation_admission.SpeculativePreparation.begin(&replication_mutation, opts.enclosing_mutation_retirement, opts.mutation_root orelse mutation_admission.receiverMutationRoot(self), opts.row_policy_retirement, opts.admission_controls)
+                    else
+                        null;
+                    var producer_stage: @import("preparation_execution.zig").Stage = .{};
+                    defer producer_stage.deinit();
+                    if (preparation_holders) |*holders| try producer_stage.begin(holders, opts.provider_execution, opts.provider_context);
+                    preprepared_document_generated = try prepareGeneratedEnrichmentsWithContext(
                         self,
                         preparation_alloc,
                         effective_req,
@@ -737,7 +846,14 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                         opts.force_generated_artifact_names,
                         null,
                         generated_memo,
+                        opts.provider_context,
+                        if (preparation_holders != null) &producer_stage else null,
                     );
+                    try producer_stage.complete();
+                    if (preparation_holders) |*holders| {
+                        if (!opts.bypass_replication_write_gate) try self.enforceReplicationWriteGate();
+                        try holders.reenter(self);
+                    }
                     if (profile) |active_profile| recordProfileNs(profile, &active_profile.precompute_generated_ns, precompute_generated_start_ns);
                 }
             }
@@ -805,8 +921,53 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 );
             }
 
-            var snapshot_mutation = if (opts.snapshot_mutation) |lease| lease.retain() else S.ownerField(self, "core").*.snapshot_admission.acquireMutation();
+            try metadata_reads.finish();
+            var preapply_reads = try metadata_reads.take();
+            defer preapply_reads.deinit();
+
+            const snapshot_controls = if (replication_mutation != null)
+                mutation_admission.retainedLeaseControls(initial_controls)
+            else
+                initial_controls;
+            var snapshot_mutation = if (snapshot_controls) |controls|
+                if (opts.avoid_admission_capacity_cycle)
+                    try S.ownerField(self, "core").*.snapshot_admission.acquireMutationPreDecisionControlledIo(
+                        S.ownerField(self, "core").*.apply_mutex.io orelse return error.MissingBackendRuntimeIo,
+                        controls,
+                        opts.snapshot_mutation,
+                    )
+                else
+                    try S.ownerField(self, "core").*.snapshot_admission.acquireMutationControlledIo(
+                        S.ownerField(self, "core").*.apply_mutex.io orelse return error.MissingBackendRuntimeIo,
+                        controls,
+                        opts.snapshot_mutation,
+                    )
+            else if (opts.snapshot_mutation) |lease| lease.retain() else S.ownerField(self, "core").*.snapshot_admission.acquireMutation();
             defer snapshot_mutation.release();
+            // Retain target names until error-exit delivery has run. This
+            // handler precedes apply/read/graph guards in declaration order,
+            // so those holders unwind before any committed notification.
+            var sync_targets: ManagedSyncTargets = .{};
+            defer sync_targets.deinit(S.ownerField(self, "alloc").*);
+            var committed_replay_sequence: ?u64 = null;
+            var committed_replay_sync: types.SyncLevel = .write;
+            var query_target_notified = false;
+            var executor_notified = false;
+            var enrichment_notified = false;
+            var resolvers_notified = false;
+            errdefer if (committed_replay_sequence) |committed_sequence| {
+                foreground_write.release();
+                (mutation_admission.MutationRetirement{
+                    .current = &replication_mutation,
+                    .enclosing = opts.enclosing_mutation_retirement,
+                    .snapshot = &snapshot_mutation,
+                    .row_policy = opts.row_policy_retirement,
+                }).retire();
+                if (!query_target_notified) notifyQueryVisibilityTargetAdvancedScoped(S.ownerField(self, "async_context").*, committed_sequence, sync_targets.target_identities, sync_targets.target_scope_known);
+                if (!executor_notified and S.ownerField(self, "executor").*.hasWorkers()) notifyExecutorForSyncLevelWithDenseBulkDeferral(S.ownerField(self, "async_context").*, S.ownerField(self, "executor").*, committed_replay_sync, committed_sequence, sync_targets);
+                if (!enrichment_notified) if (S.ownerField(self, "enrichment_runtime").*) |runtime| runtime.notifySequence(committed_sequence);
+                if (!resolvers_notified) self.notifyResolverReplayRuntimes(committed_sequence);
+            };
             std.debug.assert(snapshot_mutation.admission == S.ownerField(self, "core").*.snapshot_admission);
             if (builtin.is_test) {
                 if (D.test_portable_runtime_batch_prelock_hook.*) |hook| {
@@ -818,13 +979,18 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             // hot-standby replay may bypass the primary-role gate, but it must never bypass
             // portable runtime activation. Rechecking under apply also closes the
             // interval between the fast preflight above and lock acquisition.
+            var publication_admission: mutation_admission.IntentCollection = .{};
+            const publication_control = publication_admission.bind(snapshot_controls, S.ownerField(self, "core").*.apply_mutex.io);
             var prepared_artifacts = try self.prepareMergeArtifactEffects(preparation_alloc, req);
             defer prepared_artifacts.deinit();
             if (write_plan_snapshot == null and (S.ownerField(self, "core").*.index_manager.hasGroupSources() or opts.group_source_command != null) and
                 (effective_req.writes.len != 0 or effective_req.deletes.len != 0 or opts.group_source_command != null))
                 write_plan_snapshot = try S.ownerField(self, "core").*.index_manager.acquireWritePlanSnapshot();
             const apply_lock_wait_start_ns = monotonicTimeNs();
-            try self.lockApplyForPortableRuntime();
+            if (opts.avoid_admission_capacity_cycle)
+                try mutation_admission.lockApplyPreDecision(self, mutation_admission.retainedLeaseControls(snapshot_controls))
+            else
+                try mutation_admission.lockApply(self, mutation_admission.retainedLeaseControls(snapshot_controls));
             if (profile) |active_profile| active_profile.apply_lock_wait_ns += monotonicTimeNs() - apply_lock_wait_start_ns;
             if (S.ownerField(self, "local_execution").*.source_vectors.load(.acquire)) |source| source.recordBatchLockWait(monotonicTimeNs() -| apply_lock_wait_start_ns);
             var filtered_cleanup_edges: ?[]types.GraphEdgeDelete = null;
@@ -843,9 +1009,23 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 for (items[0..initialized_cleanup_deletes]) |*item| item.deinit(preparation_alloc);
                 preparation_alloc.free(items);
             };
+            // Native authored effects are only known after extraction. Begin
+            // observing conservatively for vector-bearing primary writes so
+            // earlier checks cannot escape the eventual retained physical plan.
+            const capture_preparation_points = opts.assembly != null or (if (opts.transaction_resolution) |resolution| resolution.accepted_effects != null else false) or
+                (S.ownerField(self, "root_incarnation").* != 0 and effective_req.writes.len != 0 and
+                    (S.ownerField(self, "core").*.index_manager.dense_indexes.items.len != 0 or S.ownerField(self, "core").*.index_manager.sparse_indexes.items.len != 0));
+            metadata_reads.control = publication_control;
+            const preparation_observations = if (capture_preparation_points) metadata_reads else null;
+            const observed_store = @import("prepared_read_set.zig").observe(S.ownerField(self, "core").*.store, preparation_observations);
             var apply_mutex_held = true;
             const apply_lock_acquired_ns = monotonicTimeNs();
             errdefer if (apply_mutex_held) unlockProfiledApply(self, profile, &apply_mutex_held, apply_lock_acquired_ns);
+            const prepared_core_facts = @import("prepared_mutation_dependencies.zig").CoreFacts.capture(S.ownerField(self, "core").*);
+            if (prepared_payload_policy_generation != try S.ownerField(self, "core").*.store.payloadPolicyGeneration(publication_control)) return error.PreparedGenerationChanged;
+            // Trusted bulk state is a mutable allocation cache, not a retained
+            // read witness. Observe the persistent ordinal inputs before voting.
+            if (preparation_observations != null and S.ownerField(self, "bulk_identity").*.enabled) self.clearBulkIngestIdentityAllNewLocked();
             // A durable epoch survives active-schema publication, not replacement
             // of the entire database namespace with reused version/transaction IDs.
             if (schema_namespace != S.ownerField(self, "core").*.schemaNamespaceGeneration()) return error.PreparedGenerationChanged;
@@ -860,13 +1040,15 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             if (req.schema_version != null) try self.validatePreparedSchemaViewLocked(request_schema_view);
             if (!S.ownerField(self, "core").*.relational_indexes.isCurrent(relational_index_snapshot)) return error.PreparedGenerationChanged;
             if (live_replication_apply) {
-                var integrity_read = try S.ownerField(self, "core").*.store.beginProbeTxn();
-                defer integrity_read.abort();
+                var integrity_read_txn = try S.ownerField(self, "core").*.store.beginProbeTxn();
+                defer integrity_read_txn.abort();
+                var integrity_read = @import("prepared_read_set.zig").observeTxn(&integrity_read_txn, preparation_observations);
                 try self.validateLiveReplicationIntegrityEffects(preparation_alloc, &integrity_read, effective_req);
             }
             if (S.ownerField(self, "local_execution").*.restore_staging_required.load(.acquire) or opts.restore_staging != null or effective_req.restore_staging_scope != null) {
-                var restore_read = try S.ownerField(self, "core").*.store.beginProbeTxn();
-                defer restore_read.abort();
+                var restore_read_txn = try S.ownerField(self, "core").*.store.beginProbeTxn();
+                defer restore_read_txn.abort();
+                var restore_read = @import("prepared_read_set.zig").observeTxn(&restore_read_txn, preparation_observations);
                 if (opts.restore_staging) |admission|
                     try @import("restore_staging.zig").validateImport(preparation_alloc, &restore_read, admission, effective_req.writes.len, effective_req.deletes.len)
                 else if (opts.transaction_resolution == null) {
@@ -879,7 +1061,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
 
             if (opts.ordered_apply_receipt) |identity| {
                 switch (try orderedApplyDisposition(
-                    try readOrderedApplyReceipt(S.ownerField(self, "alloc").*, S.ownerField(self, "core").*.store),
+                    try readOrderedApplyReceipt(S.ownerField(self, "alloc").*, observed_store),
                     identity,
                 )) {
                     .apply => {},
@@ -901,7 +1083,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 req.graph_writes.len != 0 or req.graph_deletes.len != 0))
                 return error.InvalidBatchRequest;
             if (req.merge_replication) |replication| if (req.merge_checkpoint == null) {
-                const raw = try merge_state_mod.loadRawAlloc(S.ownerField(self, "alloc").*, S.ownerField(self, "core").*.store);
+                const raw = try merge_state_mod.loadRawAlloc(S.ownerField(self, "alloc").*, observed_store);
                 defer if (raw) |value| S.ownerField(self, "alloc").*.free(value);
                 var state = if (raw) |value| try merge_state_mod.decodeAlloc(S.ownerField(self, "alloc").*, value) else null;
                 defer if (state) |*value| value.deinit(S.ownerField(self, "alloc").*);
@@ -922,7 +1104,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     return;
                 }
                 const pages = @import("merge_page_contract.zig");
-                const page_raw = try S.ownerField(self, "core").*.getStoreValue(S.ownerField(self, "alloc").*, pages.key);
+                const page_raw = try observed_store.getOptional(S.ownerField(self, "alloc").*, pages.key);
                 defer if (page_raw) |value| S.ownerField(self, "alloc").*.free(value);
                 if (req.merge_page != null or page_raw != null) {
                     var progress = if (page_raw) |value| try pages.decode(S.ownerField(self, "alloc").*, value) else return error.MergePageSourceMissing;
@@ -981,8 +1163,9 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             const transferred_artifacts = prepared_artifacts.effects;
             const artifact_source = if (req.merge_page) |page| @as(?@import("merge_page_contract.zig").Source, page.source) else if (req.merge_checkpoint) |checkpoint| checkpoint.page_source else null;
             if (artifact_source) |source| if (source.artifact_catalog) |binding| {
-                var read = try S.ownerField(self, "core").*.store.beginReadTxn();
-                defer read.abort();
+                var read_txn = try S.ownerField(self, "core").*.store.beginReadTxn();
+                defer read_txn.abort();
+                var read = @import("prepared_read_set.zig").observeTxn(&read_txn, preparation_observations);
                 var namespace: [24]u8 = undefined;
                 doc_identity.encodeNamespace(&namespace, S.ownerField(self, "core").*.identity_namespace);
                 if (req.artifact_catalog) |install| {
@@ -1038,11 +1221,14 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             }
 
             if (opts.transaction_resolution) |resolution| {
+                if (resolution.accepted_effects) |plan| {
+                    if (!std.mem.eql(u8, &plan.decoded.plan.contract.catalog_digest, &try S.ownerField(self, "core").*.preparedEffectsCatalogDigest(publication_control))) return error.PreparedGenerationChanged;
+                }
                 const intent_snapshot = try S.ownerField(self, "core").*.validateTransactionIntentSnapshot(
                     resolution.txn_id,
                     resolution.expected_intent_revision,
                 );
-                if (!intent_snapshot.has_intents) {
+                if (!intent_snapshot.has_intents and resolution.accepted_effects == null) {
                     // Validate the requested decision while still avoiding mapper
                     // and index preparation on an idempotent resolve retry. Intent
                     // resolution does not advance the prepare revision, so another
@@ -1062,12 +1248,21 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                         .{
                             .completion_writes = completion_writes,
                             .resolved_participant = resolution.resolved_participant,
+                            .defer_retained_coordinator_acknowledgement = resolution.defer_retained_coordinator_acknowledgement,
                             .expected_intent_revision = resolution.expected_intent_revision,
                             .known_intent_keys = resolution.intent_keys,
                         },
                     );
                     unlockProfiledApply(self, profile, &apply_mutex_held, apply_lock_acquired_ns);
-                    if (!opts.bypass_replication_write_gate) try self.flushTransactionReplicationOutbox(resolution.txn_id);
+                    const retirement: @import("mutation_admission.zig").MutationRetirement = .{
+                        .current = &replication_mutation,
+                        .enclosing = opts.enclosing_mutation_retirement,
+                        .snapshot = &snapshot_mutation,
+                        .row_policy = opts.row_policy_retirement,
+                    };
+                    if (!opts.bypass_replication_write_gate) {
+                        try flushTransactionReplicationOutboxWithRetirement(self, resolution.txn_id, retirement, opts.mutation_root orelse mutation_admission.receiverMutationRoot(self));
+                    } else retirement.retire();
                     try self.waitForResolvedTransactionSync(req.sync_level, outcome.replay_sequence);
                     return;
                 }
@@ -1086,14 +1281,16 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
 
             var coordinated_handoff = false;
             if (req.split_replication != null or req.split_checkpoint != null) {
-                var topology_read = try S.ownerField(self, "core").*.store.beginProbeTxn();
-                defer topology_read.abort();
+                var topology_read_txn = try S.ownerField(self, "core").*.store.beginProbeTxn();
+                defer topology_read_txn.abort();
+                var topology_read = @import("prepared_read_set.zig").observeTxn(&topology_read_txn, preparation_observations);
                 coordinated_handoff = try @import("relational_integrity_handoff.zig").admitSplitRequest(S.ownerField(self, "alloc").*, &topology_read, req);
                 if (hasCoordinatedConstraints(request_schema_view) and !coordinated_handoff) return error.CoordinatedConstraintTopologyUnsupported;
             }
             if (req.merge_replication != null or req.merge_checkpoint != null or req.merge_page != null) {
-                var topology_read = try S.ownerField(self, "core").*.store.beginProbeTxn();
-                defer topology_read.abort();
+                var topology_read_txn = try S.ownerField(self, "core").*.store.beginProbeTxn();
+                defer topology_read_txn.abort();
+                var topology_read = @import("prepared_read_set.zig").observeTxn(&topology_read_txn, preparation_observations);
                 // Source retention remains authoritative after its brief pin
                 // fence is released. Receiving another merge would replace that
                 // source's range state while its immutable cut/tail are in use.
@@ -1111,8 +1308,9 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             if (!coordinated_handoff and opts.transaction_resolution == null and !live_replication_apply and !scoped_restore_replication_apply and (effective_req.writes.len != 0 or effective_req.deletes.len != 0 or
                 effective_req.graph_writes.len != 0 or effective_req.graph_deletes.len != 0))
             {
-                var topology_read = try S.ownerField(self, "core").*.store.beginProbeTxn();
-                defer topology_read.abort();
+                var topology_read_txn = try S.ownerField(self, "core").*.store.beginProbeTxn();
+                defer topology_read_txn.abort();
+                var topology_read = @import("prepared_read_set.zig").observeTxn(&topology_read_txn, preparation_observations);
                 try @import("relational_integrity_topology.zig").requireUnfenced(&topology_read);
             }
 
@@ -1203,7 +1401,10 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             if (opts.transaction_resolution == null) {
                 try S.ownerField(self, "core").*.checkOrdinaryWriteConflicts(effective_ops.writes, effective_ops.deletes);
             }
-            try self.validateTransformReadSnapshot(transform_snapshot);
+            try self.validateTransformReadSnapshotWithAdmission(transform_snapshot, publication_control);
+            // Coalescer draining can release apply. Validate speculative TTL
+            // inputs only after reentry, immediately before consuming effects.
+            try preapply_reads.validate(S.ownerField(self, "core").*.store, publication_control);
             // Catches a concurrent commit to one of this batch's own write keys
             // between the pre-lock precompute read and this lock acquisition --
             // the race the catalog-generation check above cannot see, since it
@@ -1249,10 +1450,11 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             var index_read: ?docstore_mod.DocStore.Txn = if (relational_index_snapshot != null) try S.ownerField(self, "core").*.store.beginReadTxn() else null;
             defer if (index_read) |*read| read.abort();
             if (relational_index_snapshot) |index_snapshot| for (index_snapshot.plan.boundIndexes(), index_ready) |index, *ready| {
-                ready.* = (try relational_index_jobs.status(&index_read.?, index)).state == .ready;
+                ready.* = (try relational_index_jobs.status(@import("prepared_read_set.zig").observeTxn(&index_read.?, preparation_observations), index)).state == .ready;
             };
             var index_stage: ?relational_index_records.Staged = if (index_read) |*read| relational_index_records.Staged.init(preparation_alloc, read) else null;
             defer if (index_stage) |*stage| stage.deinit();
+            if (index_stage) |*stage| stage.observations = preparation_observations;
             var prior_membership = try RelationalPriorMembership.init(preparation_alloc, if (relational_index_snapshot) |index_snapshot| index_snapshot.plan else null);
             defer prior_membership.deinit();
             // Consume the coalesced logical request, not raw input ordering. API
@@ -1261,7 +1463,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             if (index_stage) |*stage| for (effective_req.deletes) |key| {
                 if (isMetadataKey(key)) continue;
                 const plan = relational_index_snapshot.?.plan;
-                const members = try prior_membership.read(&.{ .core = S.ownerField(self, "core").* }, &index_read.?, plan, index_ready, key);
+                const members = try prior_membership.read(&.{ .core = S.ownerField(self, "core").* }, @import("prepared_read_set.zig").observeTxn(&index_read.?, preparation_observations), plan, index_ready, key);
                 if (members.len != 0) for (plan.boundIndexes(), members) |index, member| {
                     if (member) _ = try stage.deleteIndex(&index_writer, index.id(), key, .indexed);
                 };
@@ -1275,7 +1477,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             if (req.activate_range_tracking) {
                 const ranges = @import("../range_protection.zig");
                 try ranges.validateRequest(req);
-                var probe = try S.ownerField(self, "core").*.store.beginReadTxn();
+                var probe = try observed_store.beginReadTxn();
                 defer probe.abort();
                 if (!try ranges.isActive(&probe)) {
                     if (try S.ownerField(self, "core").*.hasTopologySensitiveTransactions()) return error.IntentConflict;
@@ -1373,7 +1575,11 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 // the scheduler or foreground drain probed it.
                 if (try self.maintenanceRequiresOrderedApply()) return error.InvalidBatchRequest;
                 effective_req.graph_endpoint_cleanup_planned = true;
-                graph_cleanup_page = try S.ownerField(self, "core").*.store.prepareGraphEndpointCleanupPage(S.ownerField(self, "alloc").*);
+                if (try S.ownerField(self, "core").*.store.maintainGraphCleanupDirectory()) {
+                    var cleanup_read = try observed_store.beginReadTxn();
+                    defer cleanup_read.abort();
+                    graph_cleanup_page = try docstore_mod.DocStore.planGraphEndpointCleanupPage(S.ownerField(self, "alloc").*, &cleanup_read);
+                } else graph_cleanup_page = try docstore_mod.DocStore.emptyGraphCleanupPage(S.ownerField(self, "alloc").*);
                 if (graph_cleanup_page) |page| {
                     const graph_deletes = try graphEndpointCleanupDeletesAlloc(preparation_alloc, page);
                     cleanup_graph_deletes = graph_deletes;
@@ -1406,8 +1612,9 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     var iterator = live_jobs.keyIterator();
                     while (iterator.next()) |job| preparation_alloc.free(job.*);
                 }
-                var read = try S.ownerField(self, "core").*.store.beginReadTxn();
-                defer read.abort();
+                var read_txn = try S.ownerField(self, "core").*.store.beginReadTxn();
+                defer read_txn.abort();
+                var read = @import("prepared_read_set.zig").observeTxn(&read_txn, preparation_observations);
                 for (effective_req.graph_endpoint_cleanup_guards) |guard| {
                     const job = try contract.guardKeyAlloc(preparation_alloc, guard);
                     defer preparation_alloc.free(job);
@@ -1616,7 +1823,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     for (extracted[i].graph_writes) |graph_write| {
                         const generation = (S.ownerField(self, "core").*.index_manager.graphIndex(graph_write.index_name) orelse return error.IndexNotFound).config.coverage_generation;
                         const graph_entry = S.ownerField(self, "core").*.index_manager.graphIndex(graph_write.index_name) orelse return error.IndexNotFound;
-                        try appendGraphEdgeArtifactWrite(S.ownerField(self, "alloc").*, S.ownerField(self, "core").*.store, &explicit_graph_artifact_writes, graph_write, generation, graph_entry.ttl_duration_ns, batch_timestamp_ns);
+                        try appendGraphEdgeArtifactWrite(S.ownerField(self, "alloc").*, observed_store, &explicit_graph_artifact_writes, graph_write, generation, graph_entry.ttl_duration_ns, batch_timestamp_ns);
                     }
                     for (extracted[i].mentioned_graph_indexes) |index_name| {
                         const clear = try GraphArtifactClear.initAlloc(S.ownerField(self, "alloc").*, write.key, index_name);
@@ -1660,7 +1867,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                         const plan = relational_index_snapshot.?.plan;
                         // Effective writes/deletes are coalesced before this loop,
                         // so the pinned base is the exact prior row for each key.
-                        const members = try prior_membership.read(&.{ .core = S.ownerField(self, "core").* }, &index_read.?, plan, index_ready, write.key);
+                        const members = try prior_membership.read(&.{ .core = S.ownerField(self, "core").* }, @import("prepared_read_set.zig").observeTxn(&index_read.?, preparation_observations), plan, index_ready, write.key);
                         try stage.upsertPreparedWithMembership(&index_writer, plan, keys, row, write.key, index_ready, members);
                     };
                     if (!use_preprepared_rows) {
@@ -1748,7 +1955,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 const overwrite_probe_admission: backend_types.Namespace.BlockCacheAdmission = if (opts.store_batch_options.mode == .bulk_ingest or self.bulkSessionActive()) .transient else .retain;
                 var overwrite_probe_txn = try S.ownerField(self, "core").*.store.beginProbeTxnWithBlockCacheAdmission(overwrite_probe_admission);
                 defer overwrite_probe_txn.abort();
-                try overwrite_probe_txn.getManySorted(probe_keys, probe_values);
+                try @import("prepared_read_set.zig").observeTxn(&overwrite_probe_txn, preparation_observations).getManySorted(probe_keys, probe_values);
                 for (overwrite_probe_entries.items, 0..) |entry, i| {
                     const existing = probe_values[i] orelse continue;
                     overwritten_flags[entry.write_index] = true;
@@ -1798,13 +2005,13 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             for (effective_req.graph_writes) |graph_write| {
                 const generation = (S.ownerField(self, "core").*.index_manager.graphIndex(graph_write.index_name) orelse return error.IndexNotFound).config.coverage_generation;
                 const graph_entry = S.ownerField(self, "core").*.index_manager.graphIndex(graph_write.index_name) orelse return error.IndexNotFound;
-                try appendGraphEdgeArtifactWrite(S.ownerField(self, "alloc").*, S.ownerField(self, "core").*.store, &explicit_graph_artifact_writes, graph_write, generation, graph_entry.ttl_duration_ns, batch_timestamp_ns);
+                try appendGraphEdgeArtifactWrite(S.ownerField(self, "alloc").*, observed_store, &explicit_graph_artifact_writes, graph_write, generation, graph_entry.ttl_duration_ns, batch_timestamp_ns);
             }
 
             const cleanup_contract = @import("../graph_cleanup_contract.zig");
             var graph_lifecycle_generation: u64 = if (effective_req.graph_endpoint_cleanup or effective_req.graph_deletes.len != 0 or effective_req.deletes.len != 0 or
                 (std.mem.indexOfScalar(bool, derived_changed_flags, true) != null))
-                try appendGraphLifecycleGeneration(S.ownerField(self, "alloc").*, S.ownerField(self, "core").*.store, if (opts.ordered_apply_receipt) |entry| entry.index else 0, &store_writes, &owned_store_values)
+                try appendGraphLifecycleGeneration(S.ownerField(self, "alloc").*, observed_store, if (opts.ordered_apply_receipt) |entry| entry.index else 0, &store_writes, &owned_store_values)
             else
                 0;
 
@@ -1836,7 +2043,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             );
             for (owned_delete_keys.items) |key| graph_delete_key_set.putAssumeCapacity(key, {});
             for (graph_artifact_clears.items) |clear| {
-                const existing = try collectGraphArtifactsForDocIndex(S.ownerField(self, "alloc").*, S.ownerField(self, "core").*.store, clear.doc_key, clear.index_name);
+                const existing = try collectGraphArtifactsForDocIndex(S.ownerField(self, "alloc").*, observed_store, clear.doc_key, clear.index_name);
                 defer docstore_mod.DocStore.freeResults(S.ownerField(self, "alloc").*, existing);
                 for (existing) |entry| {
                     // Field replacement owns the direct contributor only.
@@ -1847,7 +2054,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                         defer S.ownerField(self, "alloc").*.free(state);
                         const contender = try internal_keys.graphGlobalEdgeContenderKeyAlloc(S.ownerField(self, "alloc").*, clear.index_name, graph_entry.config.coverage_generation, entry.key, @intCast(graph_mod.direct_source_priority), state);
                         defer S.ownerField(self, "alloc").*.free(contender);
-                        const direct = S.ownerField(self, "core").*.store.get(S.ownerField(self, "alloc").*, contender) catch |err| switch (err) {
+                        const direct = observed_store.get(S.ownerField(self, "alloc").*, contender) catch |err| switch (err) {
                             error.NotFound => null,
                             else => return err,
                         };
@@ -2068,18 +2275,18 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 const job_key = try cleanup_contract.ownerJobKeyAlloc(S.ownerField(self, "alloc").*, write.key);
                 var key_owned = true;
                 defer if (key_owned) S.ownerField(self, "alloc").*.free(job_key);
-                const pending = S.ownerField(self, "core").*.store.get(S.ownerField(self, "alloc").*, job_key) catch |err| switch (err) {
+                const pending = observed_store.get(S.ownerField(self, "alloc").*, job_key) catch |err| switch (err) {
                     error.NotFound => null,
                     else => return err,
                 };
                 defer if (pending) |value| S.ownerField(self, "alloc").*.free(value);
                 var needs_revival = pending != null;
-                if (!needs_revival and try S.ownerField(self, "core").*.store.mayHaveGraphRetirements()) {
+                if (!needs_revival and try observed_store.mayHaveGraphRetirements()) {
                     const prefix = try internal_keys.graphRetirementPrefixAlloc(S.ownerField(self, "alloc").*, write.key);
                     defer S.ownerField(self, "alloc").*.free(prefix);
                     // One prefix seek proves presence; never enumerate owner history
                     // or retained artifact inputs in the foreground mutation.
-                    const markers = try S.ownerField(self, "core").*.store.scanPrefixKeysPage(S.ownerField(self, "alloc").*, prefix, null, 1);
+                    const markers = try observed_store.scanPrefixKeysPage(S.ownerField(self, "alloc").*, prefix, null, 1);
                     defer freeOwnedKeySlice(S.ownerField(self, "alloc").*, markers);
                     needs_revival = markers.len != 0;
                 }
@@ -2114,13 +2321,14 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             // every retirement receives this commit's nonzero lifecycle stamp.
             if (graph_lifecycle_generation == 0) for (deleted_artifact_keys) |artifact| {
                 if (internal_keys.graphInlineTargetComponent(artifact) == null) continue;
-                graph_lifecycle_generation = try appendGraphLifecycleGeneration(S.ownerField(self, "alloc").*, S.ownerField(self, "core").*.store, if (opts.ordered_apply_receipt) |entry| entry.index else 0, &store_writes, &owned_store_values);
+                graph_lifecycle_generation = try appendGraphLifecycleGeneration(S.ownerField(self, "alloc").*, observed_store, if (opts.ordered_apply_receipt) |entry| entry.index else 0, &store_writes, &owned_store_values);
                 break;
             };
             try appendGraphEndpointRetirements(S.ownerField(self, "alloc").*, S.ownerField(self, "core").*.store, graph_lifecycle_generation, effective_req.deletes, S.ownerField(self, "core").*.index_manager.hasGraphIndexes(), deleted_artifact_keys, &store_writes, &owned_store_keys, &owned_store_values);
             if (profile) |active_profile| recordProfileNs(profile, &active_profile.delete_artifacts_ns, delete_artifacts_start_ns);
 
-            const use_thin_replay_fast_path =
+            const accepted_effects = if (opts.transaction_resolution) |resolution| resolution.accepted_effects else null;
+            const use_thin_replay_fast_path = accepted_effects == null and
                 effective_req.sync_level != .full_text and
                 effective_req.sync_level != .enrichments and
                 effective_req.sync_level != .full_index and
@@ -2159,14 +2367,16 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             }
             if (!use_thin_replay_fast_path) {
                 const precompute_generated_start_ns = monotonicTimeNs();
-                if (use_preprepared_rows and preprepared_generated != null) {
+                if (accepted_effects) |plan| {
+                    precomputed_generated = try @import("prepared_transaction_effects.zig").cloneForMaterialization(preparation_alloc, plan.decoded.plan, publication_control);
+                } else if (use_preprepared_rows and preprepared_generated != null) {
                     precomputed_generated = preprepared_generated.?;
                     preprepared_generated = null;
                 } else if (use_preprepared_document_generated) {
                     precomputed_generated = preprepared_document_generated.?;
                     preprepared_document_generated = null;
                 } else {
-                    precomputed_generated = try prepareGeneratedEnrichments(
+                    precomputed_generated = try prepareGeneratedEnrichmentsWithContext(
                         self,
                         preparation_alloc,
                         effective_req,
@@ -2175,11 +2385,14 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                         opts.force_generated_artifact_names,
                         null,
                         generated_memo,
+                        opts.provider_context,
+                        null,
                     );
                 }
 
                 if (opts.document_child_range_dispatcher) |dispatcher| {
-                    try document_child_range_effects.partitionRemoteDocumentChildRangeGeneratedBatch(childRangeManifestReader(self), preparation_alloc, &precomputed_generated, &remote_child_range_dispatches, .{ .ptr = dispatcher.ptr, .select = dispatcher.select_destination });
+                    var manifest_reader = observed_store;
+                    try document_child_range_effects.partitionRemoteDocumentChildRangeGeneratedBatch(document_child_range_effects.Reader.fromStore(&manifest_reader), preparation_alloc, &precomputed_generated, &remote_child_range_dispatches, .{ .ptr = dispatcher.ptr, .select = dispatcher.select_destination });
                 }
 
                 for (precomputed_generated.artifact_writes) |write| {
@@ -2216,7 +2429,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             );
             try appendMixedDirectGraphContenderMutations(
                 S.ownerField(self, "alloc").*,
-                S.ownerField(self, "core").*.store,
+                observed_store,
                 S.ownerField(self, "core").*.index_manager,
                 explicit_graph_artifact_writes.items,
                 &store_writes,
@@ -2227,7 +2440,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             );
             if (effective_req.merge_artifacts.len != 0) try appendImportedGraphContenderMutations(
                 S.ownerField(self, "alloc").*,
-                S.ownerField(self, "core").*.store,
+                observed_store,
                 S.ownerField(self, "core").*.index_manager,
                 effective_req.merge_artifacts,
                 &store_writes,
@@ -2240,7 +2453,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             );
             try appendRetiredDirectGraphTtlDueDeletes(
                 S.ownerField(self, "alloc").*,
-                S.ownerField(self, "core").*.store,
+                observed_store,
                 S.ownerField(self, "core").*.index_manager,
                 store_writes.items,
                 delete_keys.items,
@@ -2248,8 +2461,6 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 &owned_delete_keys,
             );
 
-            var sync_targets: ManagedSyncTargets = .{};
-            defer sync_targets.deinit(S.ownerField(self, "alloc").*);
             var split_shadow_ticket: ?u64 = null;
             var materialized_derived_batch: ?derived_types.DerivedBatch = null;
             defer if (materialized_derived_batch) |*materialized_batch| derived_types.deinitDerivedBatch(preparation_alloc, materialized_batch);
@@ -2266,8 +2477,8 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             // instead of reserving a sequence that would either be lost (and make
             // the in-memory generation move backwards after restart) or require a
             // synthetic replay item that every managed consumer must drain.
-            var group_overlay = group_mutations.Overlay{ .completion_root = S.ownerField(self, "root_incarnation").*, .source_revision = if (opts.ordered_apply_receipt) |receipt| receipt.index else null, .owner_incarnation = @import("group_source_owner_identity.zig").fromNamespace(S.ownerField(self, "core").*.identity_namespace, S.ownerField(self, "root_incarnation").*), .allocator = group_alloc, .reader = group_mutations.Reader.fromStore(S.ownerField(self, "core").*.store) };
-            const review_plan = if (opts.resolver_review_command) |command| try @import("resolver_review.zig").plan(group_alloc, S.ownerField(self, "core").*, command.*, true) else null;
+            var group_overlay = group_mutations.Overlay{ .captured_reads = if (capture_preparation_points) metadata_reads else null, .completion_root = S.ownerField(self, "root_incarnation").*, .source_revision = if (opts.ordered_apply_receipt) |receipt| receipt.index else null, .owner_incarnation = @import("group_source_owner_identity.zig").fromNamespace(S.ownerField(self, "core").*.identity_namespace, S.ownerField(self, "root_incarnation").*), .allocator = group_alloc, .reader = group_mutations.Reader.fromStore(S.ownerField(self, "core").*.store) };
+            const review_plan = if (opts.resolver_review_command) |command| try @import("resolver_review.zig").planWithReader(group_alloc, S.ownerField(self, "core").*, observed_store, command.*, true) else null;
             if (review_plan) |review| if (review.source_key) |key| try appendUniqueOwnedKeyIndexed(S.ownerField(self, "alloc").*, &changed_graph_artifact_keys, &changed_graph_artifact_key_set, key);
             var group_staged = @import("group_source_snapshot.zig").Staged{ .changed = &.{}, .deleted = &.{}, .sequence = 0 };
             var transferred_group_changed: std.ArrayList([]const u8) = .empty;
@@ -2340,12 +2551,15 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 } else if (command.action == .backfill) {
                     const Owner = @TypeOf(S.ownerField(self, "core").*);
                     const Materializer = struct {
+                        owner: Owner,
+                        reader: @TypeOf(observed_store),
                         fn read(ptr: *anyopaque, a: Allocator, document: []const u8) !?std.json.Value {
-                            const owner: Owner = @ptrCast(@alignCast(ptr));
-                            return group_mutations.currentRow(owner, a, document);
+                            const context: *@This() = @ptrCast(@alignCast(ptr));
+                            return group_mutations.currentRowWithReader(context.owner, context.reader, a, document);
                         }
                     };
-                    try @import("group_source_baseline.zig").applyPage(internal_keys, group_alloc, &group_overlay, command.definition, @import("group_source_baseline.zig").sourceGeneration(S.ownerField(self, "core").*.index_manager.activeSchemaVersion() orelse 0, namespace, S.ownerField(self, "core").*.byteRange().start, S.ownerField(self, "core").*.byteRange().end, S.ownerField(self, "root_incarnation").*), command.backfill.?.page.?, .{ .ptr = S.ownerField(self, "core").*, .read_fn = Materializer.read }, group_mutations.Plan.Projector{ .entry = matched_entry.?, .bounds = .{ .start = S.ownerField(self, "core").*.byteRange().start, .end = S.ownerField(self, "core").*.byteRange().end } });
+                    var materializer: Materializer = .{ .owner = S.ownerField(self, "core").*, .reader = observed_store };
+                    try @import("group_source_baseline.zig").applyPage(internal_keys, group_alloc, &group_overlay, command.definition, @import("group_source_baseline.zig").sourceGeneration(S.ownerField(self, "core").*.index_manager.activeSchemaVersion() orelse 0, namespace, S.ownerField(self, "core").*.byteRange().start, S.ownerField(self, "core").*.byteRange().end, S.ownerField(self, "root_incarnation").*), command.backfill.?.page.?, .{ .ptr = &materializer, .read_fn = Materializer.read }, group_mutations.Plan.Projector{ .entry = matched_entry.?, .bounds = .{ .start = S.ownerField(self, "core").*.byteRange().start, .end = S.ownerField(self, "core").*.byteRange().end } });
                 } else group_staged = @import("group_source_apply.zig").stage(group_alloc, &group_overlay, command.*, S.ownerField(self, "core").*.nextDerivedAppendSequence(), matched_entry.?.horizons) catch |err| switch (err) {
                     error.EnrichmentSourceChanged, error.ArtifactPublicationPending, error.GroupedSourceRetirementPending, error.GroupedSourceBusy, error.GroupedSourceEarlierWorkPending => blk: {
                         // A committed control race is an ordered rejection. No
@@ -2368,10 +2582,14 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     changed_graph_artifact_keys.items,
                     derived_changed_flags,
                 ));
+            const assembly_replay_next = if (opts.assembly != null) S.ownerField(self, "core").*.nextDerivedAppendSequence() else 0;
+            if (opts.assembly != null and (assembly_replay_next == 0 or assembly_replay_next >= replay_bindings.symbolic)) return error.ResourceLimitExceeded;
             const sequence = if (elide_semantic_noop_replay)
                 S.ownerField(self, "core").*.nextDerivedSequence()
+            else if (opts.assembly != null)
+                replay_bindings.symbolic
             else
-                S.ownerField(self, "core").*.reserveDerivedAppendSequence();
+                S.ownerField(self, "core").*.nextDerivedAppendSequence();
             if (group_plan) |plan| {
                 const overlay = &group_overlay;
                 const table = try group_mutations.tableIdentity(overlay, S.ownerField(self, "core").*.identity_namespace.table_id, S.ownerField(self, "root_incarnation").*);
@@ -2392,7 +2610,13 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 delete_keys.shrinkRetainingCapacity(retained_deletes);
                 var effects = overlay.effects.iterator();
                 while (effects.next()) |effect| {
-                    if (effect.value_ptr.*) |value| try store_writes.append(S.ownerField(self, "alloc").*, .{ .key = effect.key_ptr.*, .value = value }) else try delete_keys.append(S.ownerField(self, "alloc").*, effect.key_ptr.*);
+                    if (effect.value_ptr.*) |value| {
+                        try store_writes.append(S.ownerField(self, "alloc").*, .{ .key = effect.key_ptr.*, .value = value });
+                        if (opts.assembly != null) try sequence_sources.remember(.group, effect.key_ptr.*, value);
+                    } else {
+                        try delete_keys.append(S.ownerField(self, "alloc").*, effect.key_ptr.*);
+                        if (opts.assembly != null) try sequence_sources.rememberDelete(.group, effect.key_ptr.*);
+                    }
                 }
             }
             if (review_plan) |review| {
@@ -2405,7 +2629,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             if (profile) |active_profile| active_profile.source_sequence = sequence;
             const identity_metadata_start_ns = monotonicTimeNs();
             const identity_live_before = if (identity_upsert_keys.items.len != 0 or effective_req.deletes.len != 0)
-                (try doc_identity.fastStatsFromStore(S.ownerField(self, "core").*.store)).live_ordinals
+                (try doc_identity.fastStatsFromStore(observed_store)).live_ordinals
             else
                 0;
             var used_trusted_identity_path = false;
@@ -2431,7 +2655,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             if (!used_trusted_identity_path) {
                 try doc_identity.appendBatchIdentityMetadataForNamespaceWithDeletesAlloc(
                     S.ownerField(self, "alloc").*,
-                    S.ownerField(self, "core").*.store,
+                    observed_store,
                     S.ownerField(self, "core").*.identity_namespace,
                     sequence,
                     &identity_writes,
@@ -2447,17 +2671,17 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             const pending_identity_visibility_summary = try doc_identity.visibilitySummaryFromWrites(identity_writes.items);
             // Plan once under the apply lock: counts, page state, and the durable
             // transition must agree on whether a delayed checkpoint has authority.
-            const merge_existing_raw = if (req.merge_checkpoint != null) try merge_state_mod.loadRawAlloc(S.ownerField(self, "alloc").*, S.ownerField(self, "core").*.store) else null;
+            const merge_existing_raw = if (req.merge_checkpoint != null) try merge_state_mod.loadRawAlloc(S.ownerField(self, "alloc").*, observed_store) else null;
             defer if (merge_existing_raw) |value| S.ownerField(self, "alloc").*.free(value);
             var merge_existing_state: ?merge_state_mod.State = if (merge_existing_raw) |value| try merge_state_mod.decodeAlloc(S.ownerField(self, "alloc").*, value) else null;
             defer if (merge_existing_state) |*state| state.deinit(S.ownerField(self, "alloc").*);
             const merge_plan: ?merge_state_mod.ApplyPlan = if (req.merge_checkpoint) |checkpoint| try merge_state_mod.planCheckpointApply(S.ownerField(self, "alloc").*, if (merge_existing_state) |*state| state else null, S.ownerField(self, "core").*.byteRange(), checkpoint) else null;
             defer if (merge_plan) |plan| plan.deinit(S.ownerField(self, "alloc").*);
-            const merge_count_prepared = try @import("merge_cardinality.zig").prepare(S.ownerField(self, "alloc").*, S.ownerField(self, "core").*.store, effective_req, if (merge_plan) |plan| plan.applies_checkpoint else false, identity_upsert_keys.items, effective_req.deletes, identity_live_before, if (pending_identity_visibility_summary) |summary| summary.live_ordinals else identity_live_before, &identity_writes);
+            const merge_count_prepared = try @import("merge_cardinality.zig").prepare(S.ownerField(self, "alloc").*, observed_store, effective_req, if (merge_plan) |plan| plan.applies_checkpoint else false, identity_upsert_keys.items, effective_req.deletes, identity_live_before, if (pending_identity_visibility_summary) |summary| summary.live_ordinals else identity_live_before, &identity_writes);
             if (!merge_count_prepared) if (pending_identity_visibility_summary) |summary| {
                 try range_cardinality.appendIdentityTransitionAlloc(
                     S.ownerField(self, "alloc").*,
-                    S.ownerField(self, "core").*.store,
+                    observed_store,
                     S.ownerField(self, "core").*.byteRange(),
                     identity_live_before,
                     summary.live_ordinals,
@@ -2480,7 +2704,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 // Persist only the empty/non-empty transition. Exact cardinality
                 // is already transactional in the range-local counter. A split
                 // intentionally retains foreign identities in the shared namespace.
-                catalog.row_count = @intFromBool(try range_cardinality.afterIdentityTransition(S.ownerField(self, "alloc").*, S.ownerField(self, "core").*.store, identity_writes.items) != 0);
+                catalog.row_count = @intFromBool(try range_cardinality.afterIdentityTransition(S.ownerField(self, "alloc").*, observed_store, identity_writes.items) != 0);
                 catalog.reconciled = true;
                 if (catalog.mode_initialized != previous.mode_initialized or
                     catalog.storage_mode != previous.storage_mode or
@@ -2513,6 +2737,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 }
             }
             try store_writes.appendSlice(S.ownerField(self, "alloc").*, identity_writes.items);
+            if (opts.assembly != null) for (identity_writes.items) |write| try sequence_sources.remember(.identity, write.key, write.value);
             if (next_table_catalog != null) try store_writes.append(S.ownerField(self, "alloc").*, .{
                 .key = table_catalog_mod.key,
                 .value = &table_catalog_value,
@@ -2526,11 +2751,12 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 &owned_child_range_outbox_keys,
                 &owned_child_range_outbox_values,
             );
+            if (opts.assembly != null) for (owned_child_range_outbox_keys.items, owned_child_range_outbox_values.items) |key, value| try sequence_sources.remember(.child, key, value);
             const build_derived_start_ns = monotonicTimeNs();
             var replay_payload = if (opts.group_source_command != null)
                 try change_journal_mod.encodeRecord(S.ownerField(self, "alloc").*, .{ .sequence = sequence, .changed_doc_keys = try group_staged.replayDocuments(group_alloc), .deleted_doc_keys = group_staged.deleted, .changed_artifact_keys = changed_graph_artifact_keys.items, .target_hints = &.{ .enrichment, .graph, .dense_vector, .sparse_vector } })
             else if (use_thin_replay_fast_path)
-                try encodeThinReplayRecordPayload(
+                try encodeThinReplayRecordPayloadWithAdmission(
                     S.ownerField(self, "alloc").*,
                     effective_req,
                     extracted[0..extracted_initialized],
@@ -2543,6 +2769,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     S.ownerField(self, "core").*.index_manager,
                     &sync_targets,
                     S.ownerField(self, "local_execution").*.row_policy_table_name,
+                    publication_control,
                 )
             else blk: {
                 materialized_derived_batch = try buildDerivedBatch(
@@ -2562,9 +2789,9 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 materialized_derived_batch.?.generated_enrichment_refs = precomputed_generated.generated_enrichment_refs;
                 precomputed_generated.generated_enrichment_refs = &.{};
                 materialized_derived_batch.?.sequence = sequence;
-                var record = try prepareDirectChangeRecord(&self.batchContext(), materialized_derived_batch.?, sequence, effective_req, S.ownerField(self, "local_execution").*.row_policy_table_name);
+                var record = try prepareDirectChangeRecord(&batchContextWithMutationRoot(self, opts.mutation_root), materialized_derived_batch.?, sequence, effective_req, S.ownerField(self, "local_execution").*.row_policy_table_name);
                 defer change_journal_mod.deinitRecord(S.ownerField(self, "alloc").*, &record);
-                const payload = try change_journal_mod.encodeRecord(S.ownerField(self, "alloc").*, record);
+                const payload = try change_journal_mod.encodeRecordWithAdmission(S.ownerField(self, "alloc").*, record, publication_control);
                 errdefer S.ownerField(self, "alloc").*.free(payload);
                 if (write_plan_snapshot == null or write_plan_snapshot.?.plan().has_text_consumers or splitShadowRequiresMaterializedDerivedBatch(self))
                     try attachPreparedUpsertDocumentProjections(preparation_alloc, &materialized_derived_batch.?, effective_req, extracted[0..extracted_initialized]);
@@ -2601,6 +2828,8 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             const append_derived_replay = !opts.suppress_derived_replay_append and
                 !elide_semantic_noop_replay;
             if (append_derived_replay) {
+                const revision_keys_start = owned_store_keys.items.len;
+                const revision_values_start = owned_store_values.items.len;
                 try appendArtifactSourceRevisionWritesFromReplay(
                     S.ownerField(self, "alloc").*,
                     replay_payload,
@@ -2609,6 +2838,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     &owned_store_keys,
                     &owned_store_values,
                 );
+                if (opts.assembly != null) for (owned_store_keys.items[revision_keys_start..], owned_store_values.items[revision_values_start..]) |key, value| try sequence_sources.remember(.artifact_revision, key, value);
             }
             var durable_replication_batch_payload: ?[]u8 = null;
             var durable_replication_replay_payload: ?[]u8 = null;
@@ -2702,8 +2932,9 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             defer if (ordered_artifact_value) |value| S.ownerField(self, "alloc").*.free(value);
             if (req.artifact_catalog) |command| {
                 const entry = opts.ordered_apply_receipt orelse return error.InvalidArtifactCatalogCommand;
-                var read = try S.ownerField(self, "core").*.store.beginReadTxn();
-                defer read.abort();
+                var read_txn = try S.ownerField(self, "core").*.store.beginReadTxn();
+                defer read_txn.abort();
+                var read = @import("prepared_read_set.zig").observeTxn(&read_txn, preparation_observations);
                 if (!std.mem.eql(u8, &command.namespace, &@import("online_source_contract.zig").namespaceBytes(S.ownerField(self, "core").*.identity_namespace))) return error.IdentityNamespaceMismatch;
                 if (!std.mem.eql(u8, &command.binding.digest, &(try @import("artifact_inventory.zig").local(&read)).digest)) return error.ArtifactCatalogDrift;
                 ordered_artifact_value = try @import("artifact_inventory.zig").prepareOrdered(S.ownerField(self, "alloc").*, &read, command, entry.index);
@@ -2728,7 +2959,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             }
             if (req.split_checkpoint) |checkpoint| {
                 if (coordinated_handoff and checkpoint.kind == .destination_complete) {
-                    const raw_catalog = (try S.ownerField(self, "core").*.getStoreValue(S.ownerField(self, "alloc").*, @import("relational_integrity_catalog.zig").key)) orelse return error.IntegrityCatalogChanged;
+                    const raw_catalog = (try observed_store.getOptional(S.ownerField(self, "alloc").*, @import("relational_integrity_catalog.zig").key)) orelse return error.IntegrityCatalogChanged;
                     defer S.ownerField(self, "alloc").*.free(raw_catalog);
                     integrity_coverage_value = try @import("relational_integrity_handoff.zig").coverageForRange(S.ownerField(self, "alloc").*, raw_catalog, S.ownerField(self, "core").*.identity_namespace, .{ .start = checkpoint.range_start, .end = checkpoint.range_end });
                     try store_writes.append(S.ownerField(self, "alloc").*, .{ .key = @import("relational_integrity_activation.zig").key, .value = integrity_coverage_value.? });
@@ -2770,7 +3001,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 const pages = @import("merge_page_contract.zig");
                 if ((checkpoint.page_source != null) != (checkpoint.page_receiver_namespace != null) or
                     (checkpoint.page_source != null and checkpoint.kind != .begin_copy and !(checkpoint.kind == .accept and (checkpoint.page_source.?.integrity != null or checkpoint.page_source.?.artifact_catalog != null)))) return error.InvalidMergeCheckpoint;
-                const page_raw = try S.ownerField(self, "core").*.getStoreValue(S.ownerField(self, "alloc").*, pages.key);
+                const page_raw = try observed_store.getOptional(S.ownerField(self, "alloc").*, pages.key);
                 defer if (page_raw) |value| S.ownerField(self, "alloc").*.free(value);
                 var page_progress = if (page_raw) |value| try pages.decode(S.ownerField(self, "alloc").*, value) else null;
                 defer if (page_progress) |*value| value.deinit();
@@ -2793,7 +3024,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 }
                 if (page_plan != .unchanged) {
                     const chunks = @import("merge_page_chunks.zig");
-                    const manifest = S.ownerField(self, "core").*.store.get(S.ownerField(self, "alloc").*, chunks.manifest_key) catch |err| switch (err) {
+                    const manifest = observed_store.get(S.ownerField(self, "alloc").*, chunks.manifest_key) catch |err| switch (err) {
                         error.NotFound => null,
                         else => return err,
                     };
@@ -2842,7 +3073,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 }
                 if (plan.applies_checkpoint and coordinated_handoff and (checkpoint.kind == .finalize or checkpoint.kind == .rollback)) {
                     const catalog = @import("relational_integrity_catalog.zig");
-                    const raw_catalog = try S.ownerField(self, "core").*.store.get(S.ownerField(self, "alloc").*, catalog.key);
+                    const raw_catalog = try observed_store.get(S.ownerField(self, "alloc").*, catalog.key);
                     defer S.ownerField(self, "alloc").*.free(raw_catalog);
                     const coverage = try @import("relational_integrity_handoff.zig").coverageForRange(S.ownerField(self, "alloc").*, raw_catalog, S.ownerField(self, "core").*.identity_namespace, plan.range);
                     try owned_store_values.append(S.ownerField(self, "alloc").*, coverage);
@@ -2850,14 +3081,19 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 }
             }
             if (persisted_range) |range| try S.ownerField(self, "core").*.index_manager.validateRangeTransition(range);
-            try appendDenseArtifactCounterMutations(
+            const counter_program = @import("dense_artifact_counter_deltas.zig");
+            var counter_deltas = counter_program.Program.init(if (opts.assembly) |output| output.allocator else preparation_alloc);
+            defer counter_deltas.deinit();
+            try prepareDenseArtifactCounterMutations(
                 S.ownerField(self, "alloc").*,
-                S.ownerField(self, "core").*.store,
+                observed_store,
                 S.ownerField(self, "core").*.index_manager,
                 &store_writes,
                 delete_keys.items,
                 &owned_store_keys,
                 &owned_store_values,
+                &counter_deltas,
+                publication_control,
             );
             // Synchronous enrichment is the producer for every request it consumes.
             // Commit its terminal coverage decisions in the same backend batch as
@@ -2866,7 +3102,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             // responsible only for requests retained in generated_enrichment_refs.
             // Local producer receipts are fenced by the latest primary mutation,
             // not by the immutable document identity. Stamp in the primary batch.
-            if (S.ownerField(self, "core").*.hasGeneratedEnrichmentTargets() and !try orderedCoverageActive(S.ownerField(self, "core").*.store)) {
+            if (S.ownerField(self, "core").*.hasGeneratedEnrichmentTargets() and !try orderedCoverageActive(observed_store)) {
                 const readiness = @import("artifact_producer_readiness.zig");
                 for (identity_upsert_keys.items, identity_upsert_write_indexes.items) |document, write_index| {
                     // An identical logical row creates no producer replay debt.
@@ -2883,6 +3119,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     };
                     std.mem.writeInt(u64, value[0..8], sequence, .little);
                     try store_writes.append(S.ownerField(self, "alloc").*, .{ .key = key, .value = value });
+                    if (opts.assembly != null) try sequence_sources.remember(.primary_revision, key, value);
                 }
                 for (effective_req.deletes) |document| {
                     const key = try readiness.localPrimaryRevisionKeyAlloc(S.ownerField(self, "alloc").*, document);
@@ -2898,15 +3135,16 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             else
                 index_manager_mod.IndexManager.LocalCoverageGuard{};
             defer local_coverage_guard.release();
-            try appendPrecomputedCoverageOutcomeMutations(
-                S.ownerField(self, "alloc").*,
-                S.ownerField(self, "core").*.store,
+            const coverage_program = @import("prepared_coverage_outcomes.zig");
+            var coverage_outcomes = coverage_program.Program.init(if (opts.assembly) |output| output.allocator else preparation_alloc);
+            defer coverage_outcomes.deinit();
+            try preparePrecomputedCoverageOutcomes(
+                observed_store,
                 S.ownerField(self, "core").*.index_manager,
                 precomputed_generated.coverage_outcomes,
                 sequence,
-                &store_writes,
-                &owned_store_keys,
-                &owned_store_values,
+                &coverage_outcomes,
+                publication_control,
             );
             try store_writes.appendSlice(S.ownerField(self, "alloc").*, opts.extra_store_writes);
             if (req.merge_page) |page| if (page.integrity.len != 0) {
@@ -2915,7 +3153,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 // shadow records commit with primary/index effects and receipt.
                 if (!coordinated_handoff) return error.CoordinatedConstraintTopologyUnsupported;
                 const catalog_mod = @import("relational_integrity_catalog.zig");
-                const raw = try S.ownerField(self, "core").*.store.get(S.ownerField(self, "alloc").*, catalog_mod.key);
+                const raw = try observed_store.get(S.ownerField(self, "alloc").*, catalog_mod.key);
                 defer S.ownerField(self, "alloc").*.free(raw);
                 var compiled = try catalog_mod.decode(S.ownerField(self, "alloc").*, raw);
                 defer compiled.deinit();
@@ -2977,6 +3215,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     try owned_store_keys.append(S.ownerField(self, "alloc").*, key);
                     try store_writes.append(S.ownerField(self, "alloc").*, .{ .key = key, .value = payload });
                     transaction_replication_replay_payload = payload;
+                    if (opts.assembly != null) try sequence_sources.remember(.journal, key, payload);
                 };
             };
             const replay_append: ?docstore_mod.DocStore.ReplayAppend = if (append_derived_replay)
@@ -3003,35 +3242,135 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             if (opts.row_policy_lease) |lease| try lease.checkAt(@intCast(@divFloor(platform_time.realtimeNs(), std.time.ns_per_s)));
             const authored_root = blk: {
                 if (S.ownerField(self, "root_incarnation").* == 0 or explicit_embedding_artifact_writes.items.len == 0) break :blk 0;
-                var probe = try S.ownerField(self, "core").*.store.beginProbeTxn();
-                defer probe.abort();
+                var probe_txn = try S.ownerField(self, "core").*.store.beginProbeTxn();
+                defer probe_txn.abort();
+                var probe = @import("prepared_read_set.zig").observeTxn(&probe_txn, preparation_observations);
                 if (try @import("artifact_publication.zig").authority(&probe) == null) break :blk 0;
                 break :blk S.ownerField(self, "root_incarnation").*;
             };
-            var authored_acceptance = try @import("artifact_authored_acceptance.zig").Prepared.init(
-                S.ownerField(self, "alloc").*,
+            const authored = @import("artifact_authored_acceptance.zig");
+            const owns_physical = opts.assembly != null or authored_root != 0 or (if (opts.transaction_resolution) |resolution| resolution.accepted_effects != null else false);
+            const physical_allocator = if (opts.assembly) |output| output.allocator else preparation_alloc;
+            var prepared_physical: ?authored.OwnedPhysicalPlan = if (owns_physical) try authored.OwnedPhysicalPlan.init(
+                physical_allocator,
                 authored_root,
                 explicit_embedding_artifact_writes.items,
                 store_writes.items,
-            );
-            defer authored_acceptance.deinit();
+                delete_keys.items,
+                if (replay_append) |entry| .{ .sequence = entry.sequence, .payload = entry.payload } else null,
+                publication_control,
+            ) else null;
+            defer if (prepared_physical) |*plan| plan.deinit();
+            const commit_state_mod = @import("prepared_commit_state.zig");
+            if (prepared_physical) |*plan| {
+                plan.commit_state = try commit_state_mod.State.capture(plan.bytes.writes, pending_identity_visibility_summary, next_table_catalog, publication_control);
+                plan.counter_deltas = counter_deltas;
+                counter_deltas = counter_program.Program.init(counter_deltas.allocator);
+                plan.coverage_outcomes = coverage_outcomes;
+                coverage_outcomes = coverage_program.Program.init(coverage_outcomes.allocator);
+            }
+            if (prepared_physical) |*plan| try plan.retainDependencies(physical_allocator, S.ownerField(self, "core").*, .{
+                .schema_namespace = schema_namespace,
+                .catalog_revision = prepared_catalog_revision orelse return error.PreparedGenerationChanged,
+                .core_facts = prepared_core_facts,
+                .payload_policy_generation = prepared_payload_policy_generation,
+                .schema_view = if (apply_schema_view) |view| view else request_schema_view,
+                .require_current_schema = request_schema_binding == null,
+                .write_plan = write_plan_snapshot,
+                .relational_indexes = relational_index_snapshot,
+                .policy_lease = opts.row_policy_lease,
+                .generated_reads = generated_precompute_snapshot.entries,
+                .transform_reads = transform_snapshot.entries,
+            }, publication_control);
+            // A candidate read set may exist even when extraction produced no
+            // retained physical plan. Never publish after a swallowed capture
+            // failure, and retire borrowed controls/cursors on either path.
+            try metadata_reads.finish();
+            if (prepared_physical) |*plan| {
+                plan.dependencies.?.metadata_reads = try metadata_reads.take();
+                plan.dependencies.?.preapply_reads = try preapply_reads.take();
+            }
+            if (opts.assembly) |output| {
+                const accepted = opts.transaction_resolution.?.accepted_effects.?;
+                prepared_physical.?.preparation = .{
+                    .contract = accepted.decoded.plan.contract,
+                    .fingerprint = accepted.fingerprint,
+                    .replay_next = assembly_replay_next,
+                };
+                prepared_physical.?.completion = try @import("prepared_completion.zig").Owned.capture(output.allocator, materialized_derived_batch, sync_targets, effective_req.sync_level, append_derived_replay, sequence, publication_control);
+                const bindings = try replay_bindings.Bindings.capture(output.allocator, S.ownerField(self, "core").*.store, store_writes.items, delete_keys.items, &prepared_physical.?.bytes, &sequence_sources, assembly_replay_next, publication_control);
+                prepared_physical.?.replay_bindings = bindings;
+                try prepared_physical.?.validateCoverageSequence(replay_bindings.symbolic, publication_control);
+                prepared_physical.?.replay_bindings.?.bindValidated(&prepared_physical.?.bytes, assembly_replay_next);
+                prepared_physical.?.bindReplayPrograms(replay_bindings.symbolic, assembly_replay_next);
+                try prepared_physical.?.validateDependencies(S.ownerField(self, "core").*, publication_control);
+                prepared_physical.?.backlog_admission.?.* = backlog_admission;
+                backlog_admission = .{};
+                try prepared_physical.?.attachLifetime(S.ownerField(self, "local_execution").*.retained_preparation_owner orelse return error.Canceled);
+                output.plan = prepared_physical;
+                prepared_physical = null;
+                unlockProfiledApply(self, profile, &apply_mutex_held, apply_lock_acquired_ns);
+                return;
+            }
+            const commit_state: commit_state_mod.State = if (prepared_physical) |plan| plan.commit_state else .{ .visibility = pending_identity_visibility_summary, .table_catalog = next_table_catalog };
+            const commit_writes = if (prepared_physical) |plan| plan.bytes.writes else store_writes.items;
+            const commit_deletes = if (prepared_physical) |plan| plan.bytes.deletes else delete_keys.items;
+            const commit_replay: ?docstore_mod.DocStore.ReplayAppend = if (prepared_physical) |plan|
+                if (plan.bytes.replay) |entry| .{ .sequence = entry.sequence, .payload = entry.payload } else null
+            else
+                replay_append;
+            const commit_participant = if (prepared_physical) |*plan| plan.participant() else null;
+            const commit_counters: *const counter_program.Program = if (prepared_physical) |*plan| &plan.counter_deltas.? else &counter_deltas;
+            const commit_coverage: *const coverage_program.Program = if (prepared_physical) |*plan| &plan.coverage_outcomes.? else &coverage_outcomes;
             if (opts.row_policy_lease) |lease| try lease.checkAt(@intCast(@divFloor(platform_time.realtimeNs(), std.time.ns_per_s)));
+            // Known mandatory publication envelopes are funded before the
+            // local primary decision. Native allocation failure is final here;
+            // never retry the same envelope through allocating publish later.
+            var prepared_batch_publication: ?@import("replication_contract.zig").PreparedPublication = null;
+            defer if (prepared_batch_publication) |*prepared| prepared.deinit();
+            var prepared_replay_publication: ?@import("replication_contract.zig").PreparedPublication = null;
+            defer if (prepared_replay_publication) |*prepared| prepared.deinit();
+            const publication_ctx = batchContextWithMutationRoot(self, opts.mutation_root);
+            if (transaction_replication_batch_payload orelse durable_replication_batch_payload) |payload| {
+                const mirror = publication_ctx.replication_async_batch_mirror orelse return error.ReplicationPublisherUnavailable;
+                prepared_batch_publication = try mirror.publisher.prepare(mirror, if (scoped_replication) .restore_batch else .batch, payload, publication_ctx.identity_namespace, publication_control);
+            }
+            if (transaction_replication_replay_payload orelse durable_replication_replay_payload) |payload| {
+                const mirror = publication_ctx.replication_async_effect_mirror orelse return error.ReplicationPublisherUnavailable;
+                prepared_replay_publication = try mirror.publisher.prepare(mirror, .replay, payload, publication_ctx.identity_namespace, publication_control);
+            }
+            // Preparation can copy/checksum an entire envelope. Preserve the
+            // original lifetime and signed policy expiry at the actual decision
+            // boundary, after all fallible precommit funding is complete.
+            if (publication_control) |control| try control.checkpoint();
+            if (opts.row_policy_lease) |lease| try lease.checkAt(@intCast(@divFloor(platform_time.realtimeNs(), std.time.ns_per_s)));
+            if (prepared_physical) |*plan| try plan.validateDependencies(S.ownerField(self, "core").*, publication_control);
+            // All pure assembly, backlog admission, envelope preparation and
+            // original pre-decision checks precede this process-local claim.
+            // Keep the sequence already encoded in every metadata/replay byte;
+            // a competing reservation must reject, never relabel that batch.
+            if (!elide_semantic_noop_replay) try S.ownerField(self, "core").*.claimDerivedAppendSequence(sequence);
             const transaction_applied = if (opts.transaction_resolution) |resolution| blk: {
-                const outcome = try S.ownerField(self, "core").*.resolveTransactionIntentsWithExtraBatch(
+                const outcome = try S.ownerField(self, "core").*.resolveTransactionIntentsWithAcceptedEffects(
                     resolution.txn_id,
                     resolution.status,
                     resolution.commit_version,
                     .{
-                        .commit_participant = if (authored_acceptance.vectors.len != 0) authored_acceptance.participant() else null,
-                        .writes = store_writes.items,
-                        .deletes = delete_keys.items,
-                        .replay = if (replay_append) |entry| .{ .sequence = entry.sequence, .payload = entry.payload } else null,
+                        .commit_participant = commit_participant,
+                        .dense_counter_deltas = commit_counters,
+                        .coverage_outcomes = commit_coverage,
+                        .writes = commit_writes,
+                        .deletes = commit_deletes,
+                        .replay = if (commit_replay) |entry| .{ .sequence = entry.sequence, .payload = entry.payload } else null,
                         .expected_intent_revision = resolution.expected_intent_revision,
                         .known_intent_keys = resolution.intent_keys,
                         .skip_all_intent_application = relationalColumns(self) != null,
                         .completion_writes = if (ordered_apply_receipt_write) |write| &.{write} else &.{},
                         .resolved_participant = resolution.resolved_participant,
+                        .defer_retained_coordinator_acknowledgement = resolution.defer_retained_coordinator_acknowledgement,
                     },
+                    resolution.accepted_effects,
+                    publication_control,
                 );
                 if (outcome.applied) {
                     if (replay_append) |entry| S.ownerField(self, "core").*.store.observeExternalReplayCommit(entry.sequence);
@@ -3040,18 +3379,40 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             } else blk: {
                 if (durable_replication_batch_outbox_key != null or durable_replication_replay_outbox_key != null)
                     S.ownerField(self, "local_execution").*.durable_replication_outbox_maybe.store(true, .release);
-                try S.ownerField(self, "core").*.store.putBatchWithReplayAndParticipant(
+                try S.ownerField(self, "core").*.store.putBatchWithReplayAndParticipantAndMetadata(
                     S.ownerField(self, "backend_runtime").*.io(),
-                    store_writes.items,
-                    delete_keys.items,
-                    replay_append,
+                    commit_writes,
+                    commit_deletes,
+                    commit_replay,
                     store_batch_options,
-                    if (authored_acceptance.vectors.len != 0) authored_acceptance.participant() else null,
+                    commit_participant,
+                    .{ .dense = commit_counters, .coverage = commit_coverage },
+                    publication_control,
                 );
                 schedule_replication_recovery_on_exit = durable_replication_batch_outbox_key != null or durable_replication_replay_outbox_key != null;
                 break :blk transactions_mod.ResolutionOutcome{ .applied = true, .replay_sequence = sequence };
             };
+            if (opts.primary_commit_observed) |observed| observed.* = true;
+            if (transaction_applied.applied and append_derived_replay) {
+                committed_replay_sequence = sequence;
+                committed_replay_sync = effective_req.sync_level;
+            }
+            // Counter scratch belongs to preparation, including the path with
+            // no authored physical owner. Retire it before any visibility wait.
+            counter_deltas.deinit();
+            counter_deltas = counter_program.Program.init(preparation_alloc);
+            coverage_outcomes.deinit();
+            coverage_outcomes = coverage_program.Program.init(preparation_alloc);
+            // Backend commit has joined every participant callback. Detached
+            // postimages must not retain preparation capacity across remote
+            // durability or derived-visibility waits below.
+            if (prepared_physical) |*plan| plan.deinit();
+            prepared_physical = null;
             local_coverage_guard.release();
+            // Staged effects own their buffers; no post-commit work reads the
+            // base transaction. Retire its storage generation before waits.
+            if (index_read) |*read| read.abort();
+            index_read = null;
             if (graph_publication) |*lease| lease.release();
             if (!transaction_applied.applied) {
                 // Recovery may have committed this participant before the
@@ -3059,29 +3420,51 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 // the foreground maintenance deferral just like a fresh commit.
                 foreground_write.release();
                 unlockProfiledApply(self, profile, &apply_mutex_held, apply_lock_acquired_ns);
+                const retirement: mutation_admission.MutationRetirement = .{
+                    .current = &replication_mutation,
+                    .enclosing = opts.enclosing_mutation_retirement,
+                    .snapshot = &snapshot_mutation,
+                    .row_policy = opts.row_policy_retirement,
+                };
+                if (!opts.bypass_replication_write_gate) {
+                    try flushTransactionReplicationOutboxWithRetirement(self, opts.transaction_resolution.?.txn_id, retirement, opts.mutation_root orelse mutation_admission.receiverMutationRoot(self));
+                } else retirement.retire();
                 try self.waitForResolvedTransactionSync(effective_req.sync_level, transaction_applied.replay_sequence);
                 return;
             }
+            // Preparation readers have retired. Adopt the durable primary
+            // facts and its reserved replay credit before fallible completion.
             if (review_plan) |review| if (review.accepted) S.ownerField(self, "core").*.index_manager.minimum_reader_version.store(review.minimum_reader, .release);
-            if (next_table_catalog) |catalog| S.ownerField(self, "core").*.table_catalog = catalog;
+            commit_state.adopt(S.ownerField(self, "core").*);
             if (persisted_range != null) {
                 S.ownerField(self, "core").*.adoptPersistedRangeOwned(persisted_range_start_owned.?, persisted_range_end_owned.?);
                 persisted_range_start_owned = null;
                 persisted_range_end_owned = null;
             }
+            if (append_derived_replay) {
+                const append_replay_journal_start_ns = monotonicTimeNs();
+                S.ownerField(self, "executor").*.commitBacklogAdmission(sequence, &backlog_admission);
+                if (profile) |active_profile| recordProfileNs(profile, &active_profile.append_replay_journal_ns, append_replay_journal_start_ns);
+            }
             var deferred_replication_gates = ReplicationDeferredCommitGates{};
             defer deferred_replication_gates.releaseTransition();
             if (!opts.bypass_replication_write_gate) {
-                var replication_ctx = self.batchContext();
+                var replication_ctx = batchContextWithMutationRoot(self, opts.mutation_root);
                 deferred_replication_gates = ReplicationDeferredCommitGates.begin(replicationTransitionMutexFromContext(&replication_ctx));
-                if (transaction_replication_batch_payload) |payload| {
+                if (prepared_batch_publication) |*prepared| {
+                    const projected = replicationCommitContext(&replication_ctx);
+                    deferred_replication_gates.append(try replication_commit.appendPreparedPublicationCommitLockedContext(&projected, replication_ctx.replication_async_batch_mirror.?, prepared, scoped_replication));
+                } else if (transaction_replication_batch_payload) |payload| {
                     deferred_replication_gates.append(try appendReplicationEncodedBatchMutationCommitLockedContext(&replication_ctx, payload));
                 } else if (durable_replication_batch_payload) |payload| {
                     deferred_replication_gates.append(try appendReplicationEncodedBatchMutationCommitLockedContextStrict(&replication_ctx, payload, scoped_replication));
                 } else if (preencoded_replication_batch_payload) |payload| {
                     deferred_replication_gates.append(try appendReplicationEncodedBatchMutationCommitLockedContext(&replication_ctx, payload));
                 } else deferred_replication_gates.append(try appendReplicationBatchMutationCommitLockedContext(&replication_ctx, effective_req));
-                if (transaction_replication_replay_payload) |payload| {
+                if (prepared_replay_publication) |*prepared| {
+                    const projected = replicationCommitContext(&replication_ctx);
+                    deferred_replication_gates.append(try replication_commit.appendPreparedPublicationCommitLockedContext(&projected, replication_ctx.replication_async_effect_mirror.?, prepared, false));
+                } else if (transaction_replication_replay_payload) |payload| {
                     deferred_replication_gates.append(try appendReplicationReplayPayloadCommitLockedContext(&replication_ctx, payload));
                 } else if (durable_replication_replay_payload) |payload| {
                     deferred_replication_gates.append(try appendReplicationReplayPayloadCommitLockedContext(&replication_ctx, payload));
@@ -3089,11 +3472,6 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             }
             if (opts.committed_batch_effects_observer) |observer| {
                 try observer.observe(if (append_derived_replay) replay_payload else "");
-            }
-            if (pending_identity_visibility_summary) |summary| {
-                S.ownerField(self, "core").*.identity_visibility.summary = summary;
-                self.clearLiveDocSetCache();
-                self.clearNonVisibleDocSetCache();
             }
             if (profile) |active_profile| {
                 recordProfileNs(profile, &active_profile.store_write_ns, store_write_start_ns);
@@ -3110,11 +3488,6 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 if (profile) |active_profile| recordProfileNs(profile, &active_profile.split_delta_ns, split_delta_start_ns);
             }
 
-            if (append_derived_replay) {
-                const append_replay_journal_start_ns = monotonicTimeNs();
-                S.ownerField(self, "executor").*.commitBacklogAdmission(sequence, &backlog_admission);
-                if (profile) |active_profile| recordProfileNs(profile, &active_profile.append_replay_journal_ns, append_replay_journal_start_ns);
-            }
             if (materialized_derived_batch != null) {
                 split_shadow_ticket = reserveSplitShadowApplyTicket(self);
             }
@@ -3129,14 +3502,21 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             // admission. Releasing here lets optional maintenance make progress
             // while `.full_index` deliberately waits below.
             foreground_write.release();
-            if (append_derived_replay)
+            if (append_derived_replay) {
                 notifyQueryVisibilityTargetAdvancedScoped(
                     S.ownerField(self, "async_context").*,
                     sequence,
                     sync_targets.target_identities,
                     sync_targets.target_scope_known,
                 );
-            releaseReplicationMutationShared(&replication_mutation);
+                query_target_notified = true;
+            }
+            (@import("mutation_admission.zig").MutationRetirement{
+                .current = &replication_mutation,
+                .enclosing = opts.enclosing_mutation_retirement,
+                .snapshot = &snapshot_mutation,
+                .row_policy = opts.row_policy_retirement,
+            }).retire();
             if (builtin.is_test and opts.restore_staging != null and D.test_fail_restore_projection_apply.*) {
                 D.test_fail_restore_projection_apply.* = false;
                 return error.InjectedRestoreProjectionApplyFailure;
@@ -3148,18 +3528,25 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             if (append_derived_replay and S.ownerField(self, "executor").*.hasWorkers()) {
                 const notify_executor_start_ns = monotonicTimeNs();
                 notifyExecutorForSyncLevelWithDenseBulkDeferral(S.ownerField(self, "async_context").*, S.ownerField(self, "executor").*, effective_req.sync_level, sequence, sync_targets);
+                executor_notified = true;
                 if (profile) |active_profile| recordProfileNs(profile, &active_profile.executor_notify_ns, notify_executor_start_ns);
             }
             if (!opts.bypass_replication_write_gate) {
-                const replication_ctx = self.batchContext();
+                const replication_ctx = batchContextWithMutationRoot(self, opts.mutation_root);
                 try deferred_replication_gates.waitForDurabilityAndAuthority(replication_ctx.replication_write_gate);
                 if (opts.transaction_resolution != null or durable_replication_batch_payload != null or durable_replication_replay_payload != null) {
                     // The outbox is cleared only after every appended record has
                     // satisfied durability and the final authority recheck. Keep
                     // the cleanup atomic with other local DB mutations without
                     // retaining the apply lock across the remote wait above.
+                    var cleanup_mutation = try @import("mutation_admission.zig").acquireReplicationMutationSharedScoped(self, null, opts.mutation_root orelse mutation_admission.receiverMutationRoot(self));
+                    defer releaseReplicationMutationShared(&cleanup_mutation);
+                    try self.enforceReplicationWriteGate();
                     lockApply(self);
                     defer S.ownerField(self, "core").*.unlockApply();
+                    // Apply acquisition can wait behind another mutation. A
+                    // fence during that wait must retain delivery debt.
+                    try self.enforceReplicationWriteGate();
                     if (opts.transaction_resolution) |resolution| {
                         if (transaction_replication_batch_payload != null)
                             try S.ownerField(self, "core").*.clearTransactionReplicationOutbox(resolution.txn_id, .batch);
@@ -3181,15 +3568,31 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 }
             }
             if (opts.document_child_range_dispatcher) |dispatcher| {
-                _ = try self.drainDocumentArtifactChildRangeOutbox(dispatcher, 0);
+                _ = try self.drainDocumentArtifactChildRangeOutboxWithRoot(dispatcher, 0, opts.mutation_root orelse mutation_admission.receiverMutationRoot(self));
             }
             if (append_derived_replay) {
-                var pressure_ctx = self.batchContext();
+                var pressure_ctx = batchContextWithMutationRoot(self, opts.mutation_root);
                 const backlog_pressure_start_ns = monotonicTimeNs();
                 try self.markPrecomputedEnrichmentAppliedForSync(effective_req.sync_level, sequence);
                 try applyDerivedBacklogPressureContext(&pressure_ctx, sequence, effective_req.sync_level, sync_targets);
                 if (profile) |active_profile| recordProfileNs(profile, &active_profile.backlog_pressure_ns, backlog_pressure_start_ns);
             }
+            var visibility_controls = opts.admission_controls;
+            if (visibility_controls) |*original| {
+                if (opts.committed_visibility_wait) |boundary| original.execution_wait = boundary;
+            }
+            if (builtin.is_test and @hasDecl(D, "test_committed_visibility_retirement_hook")) {
+                if (opts.transaction_resolution) |resolution| if (D.test_committed_visibility_retirement_hook.*) |hook|
+                    hook.observe_fn(hook.ptr, resolution.txn_id, apply_mutex_held, snapshot_mutation.active);
+            }
+            const visibility_boundary = mutation_admission.committedVisibilityBoundary(visibility_controls, .{
+                .snapshot = opts.snapshot_mutation,
+                .row_policy = opts.row_policy_lease,
+                .root = opts.mutation_root orelse mutation_admission.receiverMutationRoot(self),
+                .capture_barrier_present = self.replicationMutationBarrier() != null,
+                .mutation_reader_active = replication_mutation != null or
+                    (if (opts.enclosing_mutation_retirement) |slot| slot.* != null else false),
+            });
             const wait_sync_start_ns = monotonicTimeNs();
             if (append_derived_replay and S.ownerField(self, "executor").*.hasWorkers()) {
                 if (opts.wait_for_sync_level) {
@@ -3201,7 +3604,12 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                         completion.enrichment_fully_precomputed = enrichment_fully_precomputed;
                         completion.targets = sync_targets;
                         sync_targets = .{};
-                    } else try self.waitForSyncLevelWithCancellation(effective_req.sync_level, sequence, sync_targets, opts.visibility_cancellation, enrichment_fully_precomputed);
+                    } else if (comptime @hasDecl(@TypeOf(self.*), "waitForSyncLevelWithExecutionWait")) {
+                        try self.waitForSyncLevelWithExecutionWait(effective_req.sync_level, sequence, sync_targets, opts.visibility_cancellation, enrichment_fully_precomputed, visibility_boundary);
+                    } else {
+                        try self.waitForSyncLevelWithCancellation(effective_req.sync_level, sequence, sync_targets, opts.visibility_cancellation, enrichment_fully_precomputed);
+                    }
+
                     if (profile) |active_profile| recordProfileNs(profile, &active_profile.sync_wait_ns, sync_wait_start_ns);
                 }
             } else if (append_derived_replay) {
@@ -3223,7 +3631,12 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                         completion.enrichment_fully_precomputed = enrichment_fully_precomputed;
                         completion.targets = sync_targets;
                         sync_targets = .{};
-                    } else try self.waitForSyncLevelWithCancellation(effective_req.sync_level, sequence, sync_targets, opts.visibility_cancellation, enrichment_fully_precomputed);
+                    } else if (comptime @hasDecl(@TypeOf(self.*), "waitForSyncLevelWithExecutionWait")) {
+                        try self.waitForSyncLevelWithExecutionWait(effective_req.sync_level, sequence, sync_targets, opts.visibility_cancellation, enrichment_fully_precomputed, visibility_boundary);
+                    } else {
+                        try self.waitForSyncLevelWithCancellation(effective_req.sync_level, sequence, sync_targets, opts.visibility_cancellation, enrichment_fully_precomputed);
+                    }
+
                     if (profile) |active_profile| recordProfileNs(profile, &active_profile.sync_wait_ns, sync_wait_start_ns);
                 }
             }
@@ -3234,7 +3647,9 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     runtime.notifySequence(sequence);
                     if (profile) |active_profile| recordProfileNs(profile, &active_profile.notify_enrichment_ns, notify_enrichment_start_ns);
                 }
+                enrichment_notified = true;
                 self.notifyResolverReplayRuntimes(sequence);
+                resolvers_notified = true;
             }
         }
 
@@ -3245,9 +3660,19 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             opts: BatchExecutionOptions,
             allocator_guard: *PreparedRowAllocator,
         ) anyerror!void {
+            // One binding spans every optimistic retry and mandatory completion.
+            // Nested helpers borrow the receiver root, never a TLS reader.
+            var root_binding = try @import("mutation_admission.zig").bindReceiverMutationRoot(self, opts.mutation_root);
+            defer root_binding.release();
             try types.validateMergeArtifacts(req);
             const max_prepared_generation_retries = 2;
             var retry_count: usize = 0;
+            var primary_commit_observed = false;
+            var attempt_options = opts;
+            attempt_options.primary_commit_observed = &primary_commit_observed;
+            defer if (primary_commit_observed) {
+                if (opts.primary_commit_observed) |parent| parent.* = true;
+            };
             // Provider results are semantic request data, not schema/index-plan
             // data. Keep them across optimistic publication retries so catalog
             // churn cannot multiply expensive external work.
@@ -3257,13 +3682,18 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             generated_memo.reuse_stored_artifacts = if (opts.restore_staging) |admission| !admission.rewrite else false;
             defer generated_memo.deinit();
             while (true) {
-                self.batchInternalPrepared(req, profile, opts, &generated_memo, allocator_guard) catch |err| switch (err) {
-                    error.PreparedGenerationChanged, error.PreparedReadSetChanged => {
-                        if (retry_count >= max_prepared_generation_retries) return err;
-                        retry_count += 1;
-                        continue;
-                    },
-                    else => return err,
+                self.batchInternalPrepared(req, profile, attempt_options, &generated_memo, allocator_guard) catch |err| {
+                    // A completion callback can return a preparation retry
+                    // name after acceptance. Never replay a committed batch.
+                    if (primary_commit_observed) return err;
+                    switch (err) {
+                        error.PreparedGenerationChanged, error.PreparedReadSetChanged => {
+                            if (retry_count >= max_prepared_generation_retries) return err;
+                            retry_count += 1;
+                            continue;
+                        },
+                        else => return err,
+                    }
                 };
                 // Completion errors happen after commit. Keep this outside the
                 // preparation retry handler so they cannot replay the user batch.
@@ -3283,9 +3713,33 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
         }
 
         pub fn clearDurableReplicationOutbox(self: anytype, key: []const u8) !void {
-            try self.lockApplyForPortableRuntime();
+            return clearDurableReplicationOutboxWithRoot(self, key, @import("mutation_admission.zig").receiverMutationRoot(self));
+        }
+
+        fn clearDurableReplicationOutboxWithRoot(self: anytype, key: []const u8, root: ?*MutationBarrier.RootSharedLease) !void {
+            return clearDurableReplicationOutboxMode(self, key, root, .wait);
+        }
+
+        fn clearDurableReplicationOutboxMode(self: anytype, key: []const u8, root: ?*MutationBarrier.RootSharedLease, comptime completion: @FieldType(replication_commit.RecoveryContext, "completion")) !void {
+            const admission = @import("mutation_admission.zig");
+            var mutation = if (completion == .poll) try admission.tryAcquireRecoveryMutationShared(self, root) else try admission.acquireReplicationMutationSharedScoped(self, null, root);
+            defer releaseReplicationMutationShared(&mutation);
+            const outbox_mod = @import("durable_outbox.zig");
+            const cursor = &S.ownerField(self, "local_execution").*.replication_recovery_cursor;
+            // Declared first: the apply-unlock defer runs before this cleanup.
+            var cleared = false;
+            defer if (cleared and std.mem.startsWith(u8, key, outbox_mod.replication_outbox_v2_prefix) and key.len >= outbox_mod.replication_outbox_id_len) {
+                const identity = key[key.len - outbox_mod.replication_outbox_id_len ..][0..outbox_mod.replication_outbox_id_len].*;
+                cursor.retireIdentity(identity);
+                S.ownerField(self, "local_execution").*.replication_intent_capture.retireIdentity(identity);
+            };
+            if (completion == .poll) try admission.tryLockApplyForRecovery(self) else try self.lockApplyForPortableRuntime();
             defer S.ownerField(self, "core").*.unlockApply();
+            // Recovery is repairing the pending-append flag. Check captured
+            // write authority without making that flag reject its own cleanup.
+            try enforceReplicationWriteGateOptional(S.ownerField(self, "local_execution").*.replication_write_gate);
             try durable_outbox_store.clearPublished(S.ownerField(self, "core").*.store, key);
+            cleared = true;
         }
 
         pub fn clearLiveDocSetCache(self: anytype) void {
@@ -3383,31 +3837,11 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
         }
 
         pub fn ensureDurableReplicationStartupBarrier(self: anytype) !void {
-            // A failed primary append must complete before a later mutation can
-            // overtake its afterimage in the hot-standby tail.
-            while (S.ownerField(self, "async_context").*.primary_replication_append_pending.load(.acquire)) try self.flushDurableReplicationOutboxes();
-            if (!S.ownerField(self, "local_execution").*.durable_replication_startup_barrier_pending.load(.acquire) and
-                !S.ownerField(self, "local_execution").*.row_policy_replication_outbox_pending.load(.acquire)) return;
-            const io = S.ownerField(self, "backend_runtime").*.io() orelse std.Options.debug_io;
-            S.ownerField(self, "local_execution").*.durable_replication_flush_mutex.lockUncancelable(io);
-            defer S.ownerField(self, "local_execution").*.durable_replication_flush_mutex.unlock(io);
-            if (!S.ownerField(self, "local_execution").*.durable_replication_startup_barrier_pending.load(.acquire) and
-                !S.ownerField(self, "local_execution").*.row_policy_replication_outbox_pending.load(.acquire)) return;
-            while (true) {
-                while (S.ownerField(self, "local_execution").*.durable_replication_outbox_maybe.load(.acquire))
-                    try self.flushDurableReplicationOutboxesLocked();
-                // Close the race with a policy commit that published its flag just
-                // after the final scan. The same apply fence orders that commit
-                // and the flag clear against subsequent row writers.
-                try self.lockApplyForPortableRuntime();
-                const empty = !S.ownerField(self, "local_execution").*.durable_replication_outbox_maybe.load(.acquire);
-                if (empty) {
-                    S.ownerField(self, "local_execution").*.durable_replication_startup_barrier_pending.store(false, .release);
-                    S.ownerField(self, "local_execution").*.row_policy_replication_outbox_pending.store(false, .release);
-                }
-                S.ownerField(self, "core").*.unlockApply();
-                if (empty) return;
-            }
+            try self.ensureDurableReplicationStartupBarrierWithAdmission(null);
+        }
+
+        pub fn ensureDurableReplicationStartupBarrierWithAdmission(self: anytype, controls: ?@import("apply_rw_lock.zig").ApplyRwLock.Acquisition) !void {
+            try @import("replication_startup_admission.zig").ensure(self, controls);
         }
 
         pub fn failIfIdentityOrdinalExhaustedForNewUpserts(self: anytype, doc_ids: []const []const u8) !void {
@@ -3488,20 +3922,228 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
         }
 
         pub fn flushDurableReplicationOutboxes(self: anytype) !void {
+            try self.flushDurableReplicationOutboxesWithAdmission(null);
+        }
+
+        /// Background supervision may return pending while preserving every
+        /// durable key. This does not change foreground startup/commit waits.
+        pub fn flushDurableReplicationOutboxesStep(self: anytype) !void {
+            return flushPublicationStep(self, false);
+        }
+
+        /// Reserved recovery workers may never fall through to legacy page
+        /// materialization or a publisher's blocking completion contract.
+        pub fn flushDurableReplicationOutboxesReservedStep(self: anytype) !void {
+            return flushPublicationStep(self, true);
+        }
+
+        fn flushPublicationStep(self: anytype, comptime bounded_only: bool) !void {
+            const lifetime: @import("mutation_admission.zig").BackgroundPublication = .{
+                .closing = &S.ownerField(self, "async_context").*.background_closing,
+                .stopping = &S.ownerField(self, "publication_recovery").*.stopping,
+            };
+            const controls = lifetime.controls();
+            try controls.lifetime.check();
             if (S.ownerField(self, "async_context").*.primary_replication_outbox_pending.load(.acquire)) S.ownerField(self, "local_execution").*.durable_replication_outbox_maybe.store(true, .release);
             if (!S.ownerField(self, "local_execution").*.durable_replication_outbox_maybe.load(.acquire)) return;
             const io = S.ownerField(self, "backend_runtime").*.io() orelse std.Options.debug_io;
-            S.ownerField(self, "local_execution").*.durable_replication_flush_mutex.lockUncancelable(io);
+            if (!S.ownerField(self, "local_execution").*.durable_replication_flush_mutex.tryLock()) return error.CommitCompletionPending;
             defer S.ownerField(self, "local_execution").*.durable_replication_flush_mutex.unlock(io);
-            try self.flushDurableReplicationOutboxesLocked();
+            try flushDurableReplicationOutboxesMode(self, controls, @import("mutation_admission.zig").receiverMutationRoot(self), .poll, bounded_only);
+        }
+
+        pub fn flushDurableReplicationOutboxesWithAdmission(self: anytype, controls: ?@import("apply_rw_lock.zig").ApplyRwLock.Acquisition) !void {
+            return flushDurableReplicationOutboxesWithAdmissionAndRoot(self, controls, @import("mutation_admission.zig").receiverMutationRoot(self));
+        }
+
+        pub fn flushDurableReplicationOutboxesWithAdmissionAndRoot(self: anytype, controls: ?@import("apply_rw_lock.zig").ApplyRwLock.Acquisition, root: ?*MutationBarrier.RootSharedLease) !void {
+            const admission = @import("replication_startup_admission.zig");
+            const retained = @import("mutation_admission.zig").retainedLeaseControls(controls);
+            try @import("mutation_admission.zig").checkLifetime(retained);
+            if (S.ownerField(self, "async_context").*.primary_replication_outbox_pending.load(.acquire)) S.ownerField(self, "local_execution").*.durable_replication_outbox_maybe.store(true, .release);
+            if (!S.ownerField(self, "local_execution").*.durable_replication_outbox_maybe.load(.acquire)) return;
+            const io = S.ownerField(self, "backend_runtime").*.io() orelse std.Options.debug_io;
+            try admission.lockFlush(&S.ownerField(self, "local_execution").*.durable_replication_flush_mutex, io, admission.entryControls(controls, root));
+            defer S.ownerField(self, "local_execution").*.durable_replication_flush_mutex.unlock(io);
+            try flushDurableReplicationOutboxesLockedWithAdmissionAndRoot(self, retained, root);
         }
 
         pub fn flushDurableReplicationOutboxesLocked(self: anytype) !void {
+            try self.flushDurableReplicationOutboxesLockedWithAdmission(null);
+        }
+
+        pub fn flushDurableReplicationOutboxesLockedWithAdmission(self: anytype, controls: ?@import("apply_rw_lock.zig").ApplyRwLock.Acquisition) !void {
+            return flushDurableReplicationOutboxesLockedWithAdmissionAndRoot(self, controls, @import("mutation_admission.zig").receiverMutationRoot(self));
+        }
+
+        pub fn flushDurableReplicationOutboxesLockedWithAdmissionAndRoot(self: anytype, controls: ?@import("apply_rw_lock.zig").ApplyRwLock.Acquisition, root: ?*MutationBarrier.RootSharedLease) !void {
+            return flushDurableReplicationOutboxesMode(self, controls, root, .wait, false);
+        }
+
+        /// A publication fence may hold apply while waiting for import readers.
+        /// Finish an existing immutable capture without reacquiring apply, so
+        /// its reader can retire. Fresh key/generation checks still precede all
+        /// publication. This shares the attempt's budget with post-apply work.
+        fn resumeOwnedIntentCapture(self: anytype, control: @import("../../common/read_admission.zig").Port, budget: *usize) !void {
+            try control.checkpoint();
+            const capture = &S.ownerField(self, "local_execution").*.replication_intent_capture;
+            if (!capture.mutex.tryLock()) return error.CommitCompletionPending;
+            defer capture.mutex.unlock();
+            if (!capture.hasWork()) return;
+            while (budget.* != 0) {
+                budget.* -= 1;
+                const status = capture.step(4096, control) catch |err| {
+                    capture.discard();
+                    return err;
+                };
+                if (status == .ready and !capture.hasWork()) return;
+            }
+            return error.CommitCompletionPending;
+        }
+
+        /// Poll one modern intent with a single snapshot across key discovery
+        /// and value capture. Index/snapshot metadata is still separate work;
+        /// block IO/codec, row probes, key/value copies and AHO1 are resumable.
+        fn flushOwnedDurableReplicationIntent(self: anytype, retained: ?@import("apply_rw_lock.zig").ApplyRwLock.Acquisition, root: ?*MutationBarrier.RootSharedLease, control: @import("../../common/read_admission.zig").Port, apply_held: *bool, budget: *usize) !bool {
+            const admission = @import("mutation_admission.zig");
+            const core = S.ownerField(self, "core").*;
+            const local = S.ownerField(self, "local_execution");
+            const capture = &local.*.replication_intent_capture;
+            if (!capture.mutex.tryLock()) return error.CommitCompletionPending;
+            var capture_held = true;
+            var keep_pending = false;
+            defer if (capture_held) {
+                if (!keep_pending) capture.discard();
+                capture.mutex.unlock();
+            };
+            if (core.store.runtime_store.vtable.begin_owned_value_read == null) return false;
+            if (core.store.runtime_store.vtable.begin_owned_key_cursor == null) return error.ExecutionWaitUnsupported;
+            while (true) {
+                if (!capture.matches(core.store, core.identity_namespace, core.root_generation)) {
+                    capture.discard();
+                    capture.after = null;
+                }
+                if (capture.selection_result) |selected| switch (selected) {
+                    .legacy => return false,
+                    .empty => {
+                        const current = core.store.query_generation_revision.load(.acquire);
+                        if (current != capture.selection_query_revision or current == std.math.maxInt(u64)) {
+                            capture.discard();
+                        } else {
+                            capture.discard();
+                            capture.after = null;
+                            local.*.durable_replication_outbox_maybe.store(false, .release);
+                            S.ownerField(self, "async_context").*.primary_replication_outbox_pending.store(false, .release);
+                            S.ownerField(self, "async_context").*.primary_replication_append_pending.store(false, .release);
+                            core.unlockApply();
+                            apply_held.* = false;
+                            local.*.replication_recovery_cursor.reset();
+                            return true;
+                        }
+                    },
+                    .key => unreachable,
+                };
+                if (capture.value != null and capture.validation_result != null) {
+                    const validation = capture.validation_result.?;
+                    if (std.meta.activeTag(validation) == .legacy) return false;
+                    const present = switch (validation) {
+                        .key => |key| std.mem.eql(u8, &key, &capture.key.?),
+                        else => false,
+                    };
+                    if (!present) {
+                        const identity = capture.value.?.identity;
+                        capture.discard();
+                        core.unlockApply();
+                        apply_held.* = false;
+                        capture.mutex.unlock();
+                        capture_held = false;
+                        local.*.replication_recovery_cursor.retireIdentity(identity);
+                        return error.CommitCompletionPending;
+                    }
+                    const current = core.store.query_generation_revision.load(.acquire);
+                    if (capture.validation_fresh or (current == capture.validation_query_revision and current != std.math.maxInt(u64))) break;
+                    capture.validation_result = null;
+                }
+                if (!capture.hasWork()) {
+                    if (budget.* == 0) {
+                        keep_pending = true;
+                        return error.CommitCompletionPending;
+                    }
+                    budget.* -= 1;
+                    if (capture.value != null) try capture.beginValidation(control) else try capture.beginDiscovery(core.store, core.identity_namespace, core.root_generation, control);
+                }
+                core.unlockApply();
+                apply_held.* = false;
+                while (budget.* != 0 and capture.hasWork()) {
+                    budget.* -= 1;
+                    _ = try capture.step(4096, control);
+                }
+                if (capture.hasWork()) {
+                    keep_pending = true;
+                    return error.CommitCompletionPending;
+                }
+                admission.tryLockApplyForRecovery(self) catch |err| {
+                    keep_pending = err == error.CommitCompletionPending;
+                    return err;
+                };
+                apply_held.* = true;
+            }
+            // A completed presence snapshot authorizes this attempt. A later
+            // ordinary write invalidates cached presence on the next poll, but
+            // does not restart a validation already making bounded progress.
+            capture.validation_fresh = false;
+            core.unlockApply();
+            apply_held.* = false;
+            try admission.checkLifetime(retained);
+            try self.enforcePortableRuntimeGate();
+            try enforceReplicationWriteGateOptional(local.*.replication_write_gate);
+            const kind = capture.value.?.kind;
+            const mirror = switch (kind) {
+                .batch, .restore_batch => local.*.replication_async_batch_mirror,
+                .replay, .primary_effect => local.*.replication_async_effect_mirror,
+                .schema, .row_policy => local.*.replication_async_metadata_mirror,
+            } orelse return error.ReplicationPublisherUnavailable;
+            if (kind != .restore_batch and kind != .primary_effect and kind != .row_policy and !replicationMirrorRequiresDurableOutbox(mirror)) return error.ReplicationPublisherUnavailable;
+            var owned = capture.value.?.borrow();
+            owned.recovery_cursor = &local.*.replication_recovery_cursor;
+            var ctx = batchContextWithMutationRoot(self, root);
+            recoverDurableReplicationOutboxContextMode(&ctx, mirror, owned, kind, control, .poll) catch |err| {
+                keep_pending = err == error.CommitCompletionPending;
+                return err;
+            };
+            const key = capture.key.?;
+            capture.mutex.unlock();
+            capture_held = false;
+            try clearDurableReplicationOutboxMode(self, &key, root, .poll);
+            return true;
+        }
+
+        fn flushDurableReplicationOutboxesMode(self: anytype, controls: ?@import("apply_rw_lock.zig").ApplyRwLock.Acquisition, root: ?*MutationBarrier.RootSharedLease, comptime completion: @FieldType(replication_commit.RecoveryContext, "completion"), comptime bounded_only: bool) !void {
+            const admission = @import("mutation_admission.zig");
+            const retained = admission.retainedLeaseControls(controls);
+            try admission.checkLifetime(retained);
             if (!S.ownerField(self, "local_execution").*.durable_replication_outbox_maybe.load(.acquire)) return;
-            try self.lockApplyForPortableRuntime();
+            if (completion == .poll) enforceReplicationWriteGateOptional(S.ownerField(self, "local_execution").*.replication_write_gate) catch |err| {
+                S.ownerField(self, "local_execution").*.replication_intent_capture.reset();
+                return err;
+            };
+            var read_scope: admission.IntentCollection = .{};
+            const read_control = read_scope.bind(retained, S.ownerField(self, "backend_runtime").*.io());
+            var capture_budget: usize = 16;
+            if (completion == .poll) if (read_control) |control| {
+                try resumeOwnedIntentCapture(self, control, &capture_budget);
+            };
+            if (completion == .poll) try admission.tryLockApplyForRecovery(self) else try admission.lockApply(self, retained);
             var apply_held = true;
             errdefer if (apply_held) S.ownerField(self, "core").*.unlockApply();
-            var page = try durable_outbox_store.readPending(S.ownerField(self, "alloc").*, S.ownerField(self, "core").*.store);
+            if (completion == .poll) if (read_control) |control| {
+                if (try flushOwnedDurableReplicationIntent(self, retained, root, control, &apply_held, &capture_budget)) return;
+            };
+            if (bounded_only) return error.PublicationRecoveryNeedsMaintenance;
+            var page = if (read_control) |control|
+                try durable_outbox_store.readPendingWithAdmission(S.ownerField(self, "alloc").*, S.ownerField(self, "core").*.store, control)
+            else
+                try durable_outbox_store.readPending(S.ownerField(self, "alloc").*, S.ownerField(self, "core").*.store);
             defer page.deinit(S.ownerField(self, "alloc").*);
             const batch_raw = page.legacy_batch;
             const replay_raw = page.legacy_replay;
@@ -3515,11 +4157,15 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             }
             S.ownerField(self, "core").*.unlockApply();
             apply_held = false;
-            if (!any_pending) return;
+            if (!any_pending) {
+                S.ownerField(self, "local_execution").*.replication_intent_capture.reset();
+                S.ownerField(self, "local_execution").*.replication_recovery_cursor.reset();
+                return;
+            }
 
-            const batch_outbox = if (batch_raw) |raw| try decodeDurableReplicationOutbox(raw) else null;
-            const replay_outbox = if (replay_raw) |raw| try decodeDurableReplicationOutbox(raw) else null;
-            const schema_outbox = if (schema_raw) |raw| try decodeDurableReplicationOutbox(raw) else null;
+            const batch_outbox = if (batch_raw) |raw| try @import("durable_outbox.zig").decodeDurableReplicationOutboxWithAdmission(raw, read_control) else null;
+            const replay_outbox = if (replay_raw) |raw| try @import("durable_outbox.zig").decodeDurableReplicationOutboxWithAdmission(raw, read_control) else null;
+            const schema_outbox = if (schema_raw) |raw| try @import("durable_outbox.zig").decodeDurableReplicationOutboxWithAdmission(raw, read_control) else null;
 
             if (batch_outbox != null) {
                 const mirror = S.ownerField(self, "local_execution").*.replication_async_batch_mirror orelse return error.ReplicationPublisherUnavailable;
@@ -3538,46 +4184,69 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             try enforceReplicationWriteGateOptional(S.ownerField(self, "local_execution").*.replication_write_gate);
 
             if (batch_outbox) |outbox| {
-                var ctx = self.batchContext();
-                try recoverDurableReplicationOutboxContext(&ctx, S.ownerField(self, "local_execution").*.replication_async_batch_mirror.?, outbox, .batch);
-                try self.clearDurableReplicationOutbox(replication_batch_outbox_key);
+                try admission.checkLifetime(retained);
+                var ctx = batchContextWithMutationRoot(self, root);
+                try recoverDurableReplicationOutboxContextMode(&ctx, S.ownerField(self, "local_execution").*.replication_async_batch_mirror.?, outbox, .batch, read_control, completion);
+                try clearDurableReplicationOutboxMode(self, replication_batch_outbox_key, root, completion);
             }
             if (replay_outbox) |outbox| {
-                var ctx = self.batchContext();
-                try recoverDurableReplicationOutboxContext(&ctx, S.ownerField(self, "local_execution").*.replication_async_effect_mirror.?, outbox, .replay);
-                try self.clearDurableReplicationOutbox(replication_replay_outbox_key);
+                try admission.checkLifetime(retained);
+                var ctx = batchContextWithMutationRoot(self, root);
+                try recoverDurableReplicationOutboxContextMode(&ctx, S.ownerField(self, "local_execution").*.replication_async_effect_mirror.?, outbox, .replay, read_control, completion);
+                try clearDurableReplicationOutboxMode(self, replication_replay_outbox_key, root, completion);
             }
             if (schema_outbox) |outbox| {
-                var ctx = self.batchContext();
-                try recoverDurableReplicationOutboxContext(&ctx, S.ownerField(self, "local_execution").*.replication_async_metadata_mirror.?, outbox, .schema);
-                try self.clearDurableReplicationOutbox(replication_schema_outbox_key);
+                try admission.checkLifetime(retained);
+                var ctx = batchContextWithMutationRoot(self, root);
+                try recoverDurableReplicationOutboxContextMode(&ctx, S.ownerField(self, "local_execution").*.replication_async_metadata_mirror.?, outbox, .schema, read_control, completion);
+                try clearDurableReplicationOutboxMode(self, replication_schema_outbox_key, root, completion);
             }
 
             for (pending) |entry| {
+                try admission.checkLifetime(retained);
                 const kind = try durableReplicationOutboxKindFromKey(entry.key);
-                const outbox = try decodeDurableReplicationOutbox(entry.value);
+                var outbox = try (try @import("durable_outbox.zig").decodeDurableReplicationOutboxWithAdmission(entry.value, read_control)).withRecoveryKey(entry.key);
+                outbox.recovery_cursor = &S.ownerField(self, "local_execution").*.replication_recovery_cursor;
                 const mirror = switch (kind) {
                     .batch, .restore_batch => S.ownerField(self, "local_execution").*.replication_async_batch_mirror,
                     .replay, .primary_effect => S.ownerField(self, "local_execution").*.replication_async_effect_mirror,
                     .schema, .row_policy => S.ownerField(self, "local_execution").*.replication_async_metadata_mirror,
                 } orelse return error.ReplicationPublisherUnavailable;
                 if (kind != .restore_batch and kind != .primary_effect and kind != .row_policy and !replicationMirrorRequiresDurableOutbox(mirror)) return error.ReplicationPublisherUnavailable;
-                var ctx = self.batchContext();
-                try recoverDurableReplicationOutboxContext(&ctx, mirror, outbox, kind);
+                var ctx = batchContextWithMutationRoot(self, root);
+                try recoverDurableReplicationOutboxContextMode(&ctx, mirror, outbox, kind, read_control, completion);
                 // The key names this exact mutation, so concurrent publishers cannot
                 // replace the record which this recovery pass is about to remove.
-                try self.clearDurableReplicationOutbox(entry.key);
+                try clearDurableReplicationOutboxMode(self, entry.key, root, completion);
             }
         }
 
         pub fn flushTransactionReplicationOutbox(self: anytype, txn_id: transactions_mod.TxnId) !void {
+            try flushTransactionReplicationOutboxWithRoot(self, txn_id, @import("mutation_admission.zig").receiverMutationRoot(self));
+        }
+
+        /// Invocation ownership survives retirement of the append phase. The
+        /// same stable root opens each acknowledged outbox cleanup phase.
+        pub fn flushTransactionReplicationOutboxWithRoot(self: anytype, txn_id: transactions_mod.TxnId, root: ?*MutationBarrier.RootSharedLease) !void {
+            var mutation = try @import("mutation_admission.zig").acquireReplicationMutationSharedScoped(self, null, root);
+            defer releaseReplicationMutationShared(&mutation);
+            try flushTransactionReplicationOutboxWithRetirement(self, txn_id, .{ .current = &mutation }, root);
+        }
+
+        fn flushTransactionReplicationOutboxWithRetirement(
+            self: anytype,
+            txn_id: transactions_mod.TxnId,
+            retirement: @import("mutation_admission.zig").MutationRetirement,
+            root: ?*MutationBarrier.RootSharedLease,
+        ) !void {
             var outbox = try S.ownerField(self, "core").*.loadTransactionReplicationOutbox(S.ownerField(self, "alloc").*, txn_id);
             defer outbox.deinit(S.ownerField(self, "alloc").*);
-            if (outbox.batch_payload == null and outbox.replay_payload == null) return;
-
-            // An outbox entry is a durable synchronous-replication obligation. Do
-            // not silently discard it if a restart temporarily removes or
-            // downgrades the corresponding mirror configuration.
+            if (outbox.batch_payload == null and outbox.replay_payload == null) {
+                retirement.retire();
+                return;
+            }
+            // Durable obligations survive unavailable publishers and uncertain
+            // replies. Append every local tail before surrendering capture protection.
             if (outbox.batch_payload != null) {
                 const mirror = S.ownerField(self, "local_execution").*.replication_async_batch_mirror orelse return error.ReplicationPublisherUnavailable;
                 if (!replicationMirrorSyncEnabled(mirror)) return error.ReplicationPublisherUnavailable;
@@ -3587,21 +4256,40 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 if (!replicationMirrorSyncEnabled(mirror)) return error.ReplicationPublisherUnavailable;
             }
             try self.enforceReplicationWriteGate();
-            var ctx = self.batchContext();
+            var ctx = batchContextWithMutationRoot(self, root);
             if (outbox.batch_payload != null) try preflightReplicationMirrorSyncCommitContext(&ctx, ctx.replication_async_batch_mirror);
             if (outbox.replay_payload != null) try preflightReplicationMirrorSyncCommitContext(&ctx, ctx.replication_async_effect_mirror);
+            const projected = replicationCommitContext(&ctx);
+            var tails = ReplicationDeferredCommitGates.begin(projected.transition_mutex);
+            defer tails.releaseTransition();
+            const batch_gate = if (outbox.batch_payload) |payload|
+                try appendReplicationEncodedBatchMutationCommitLockedContext(&ctx, payload)
+            else
+                null;
+            const replay_gate = if (outbox.replay_payload) |payload|
+                try appendReplicationReplayPayloadCommitLockedContext(&ctx, payload)
+            else
+                null;
+            tails.releaseTransition();
+            retirement.retire();
 
-            if (outbox.batch_payload) |payload| {
-                try self.mirrorReplicationEncodedBatchMutationCommit(payload);
+            // Preserve per-outbox acknowledgement: an acknowledged batch may be
+            // cleared even when the replay reply is lost. Each completion rechecks
+            // authority, then cleanup takes fresh local capture/apply protection.
+            const gates = [_]?ReplicationDeferredCommitGate{ batch_gate, replay_gate };
+            const present = [_]bool{ outbox.batch_payload != null, outbox.replay_payload != null };
+            for (gates, present, 0..) |gate, has_payload, i| {
+                if (!has_payload) continue;
+                var completion: ReplicationDeferredCommitGates = .{ .transition_mutex = projected.transition_mutex };
+                completion.append(gate);
+                try completion.waitForDurabilityAndAuthority(ctx.replication_write_gate);
+                var cleanup_mutation = try @import("mutation_admission.zig").acquireReplicationMutationSharedScoped(self, null, root);
+                defer releaseReplicationMutationShared(&cleanup_mutation);
+                try self.enforceReplicationWriteGate();
                 try self.lockApplyForPortableRuntime();
                 defer S.ownerField(self, "core").*.unlockApply();
-                try S.ownerField(self, "core").*.clearTransactionReplicationOutbox(txn_id, .batch);
-            }
-            if (outbox.replay_payload) |payload| {
-                try self.mirrorReplicationReplayPayloadCommit(payload);
-                try self.lockApplyForPortableRuntime();
-                defer S.ownerField(self, "core").*.unlockApply();
-                try S.ownerField(self, "core").*.clearTransactionReplicationOutbox(txn_id, .replay);
+                try self.enforceReplicationWriteGate();
+                try S.ownerField(self, "core").*.clearTransactionReplicationOutbox(txn_id, if (i == 0) .batch else .replay);
             }
         }
 
@@ -3766,6 +4454,14 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             try preflightReplicationMirrorSyncCommitContext(&ctx, ctx.replication_async_effect_mirror);
         }
 
+        pub fn preflightReplicationBatchSyncCommitWithAdmission(self: anytype, controls: ?@import("apply_rw_lock.zig").ApplyRwLock.Acquisition, root: ?*MutationBarrier.RootSharedLease) !void {
+            var admission: @import("mutation_admission.zig").IntentCollection = .{};
+            const original = admission.bindBeforeMutation(controls, S.ownerField(self, "core").*.apply_mutex.io, root);
+            const ctx = self.batchContext();
+            try replication_commit.preflightWithAdmission(ctx.replication_async_batch_mirror, ctx.log_mutex, original);
+            try replication_commit.preflightWithAdmission(ctx.replication_async_effect_mirror, ctx.log_mutex, original);
+        }
+
         pub fn rememberBulkIngestAllNewIdentityUpserts(self: anytype, doc_ids: []const []const u8) !bool {
             return S.ownerField(self, "bulk_identity").*.remember(S.ownerField(self, "alloc").*, doc_ids);
         }
@@ -3801,10 +4497,39 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             ordered_receipt: ?OrderedApplyReceipt,
             resolved_participant: ?[]const u8,
         ) !void {
+            return self.resolveTransactionIntentsInternalWithControls(txn_id, status, commit_version, sync_level, visibility_cancellation, ordered_receipt, resolved_participant, null);
+        }
+
+        pub fn resolveTransactionIntentsInternalWithControls(
+            self: anytype,
+            txn_id: transactions_mod.TxnId,
+            status: transactions_mod.TxnStatus,
+            commit_version: u64,
+            sync_level: types.SyncLevel,
+            visibility_cancellation: types.CancellationToken,
+            ordered_receipt: ?OrderedApplyReceipt,
+            resolved_participant: ?[]const u8,
+            controls: ?@import("apply_rw_lock.zig").ApplyRwLock.Acquisition,
+        ) !void {
+            return self.resolveTransactionIntentsInternalWithAcknowledgementPolicy(txn_id, status, commit_version, sync_level, visibility_cancellation, ordered_receipt, resolved_participant, controls, false);
+        }
+
+        pub fn resolveTransactionIntentsInternalWithAcknowledgementPolicy(
+            self: anytype,
+            txn_id: transactions_mod.TxnId,
+            status: transactions_mod.TxnStatus,
+            commit_version: u64,
+            sync_level: types.SyncLevel,
+            visibility_cancellation: types.CancellationToken,
+            ordered_receipt: ?OrderedApplyReceipt,
+            resolved_participant: ?[]const u8,
+            controls: ?@import("apply_rw_lock.zig").ApplyRwLock.Acquisition,
+            defer_retained_coordinator_acknowledgement: bool,
+        ) !void {
             var preparation: RequestPreparationContext = undefined;
             preparation.init(self);
             defer preparation.deinit();
-            self.resolveTransactionIntentsPrepared(
+            self.resolveTransactionIntentsPreparedWithAcknowledgementPolicy(
                 txn_id,
                 status,
                 commit_version,
@@ -3813,6 +4538,8 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 ordered_receipt,
                 resolved_participant,
                 &preparation.guard,
+                controls,
+                defer_retained_coordinator_acknowledgement,
             ) catch |err| return preparation.mapError(err);
         }
 
@@ -3827,6 +4554,42 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             resolved_participant: ?[]const u8,
             preparation: *PreparedRowAllocator,
         ) !void {
+            return self.resolveTransactionIntentsPreparedWithControls(txn_id, status, commit_version, sync_level, visibility_cancellation, ordered_receipt, resolved_participant, preparation, null);
+        }
+
+        pub fn resolveTransactionIntentsPreparedWithControls(
+            self: anytype,
+            txn_id: transactions_mod.TxnId,
+            status: transactions_mod.TxnStatus,
+            commit_version: u64,
+            sync_level: types.SyncLevel,
+            visibility_cancellation: types.CancellationToken,
+            ordered_receipt: ?OrderedApplyReceipt,
+            resolved_participant: ?[]const u8,
+            preparation: *PreparedRowAllocator,
+            controls: ?@import("apply_rw_lock.zig").ApplyRwLock.Acquisition,
+        ) !void {
+            return self.resolveTransactionIntentsPreparedWithAcknowledgementPolicy(txn_id, status, commit_version, sync_level, visibility_cancellation, ordered_receipt, resolved_participant, preparation, controls, false);
+        }
+
+        pub fn resolveTransactionIntentsPreparedWithAcknowledgementPolicy(
+            self: anytype,
+            txn_id: transactions_mod.TxnId,
+            status: transactions_mod.TxnStatus,
+            commit_version: u64,
+            sync_level: types.SyncLevel,
+            visibility_cancellation: types.CancellationToken,
+            ordered_receipt: ?OrderedApplyReceipt,
+            resolved_participant: ?[]const u8,
+            preparation: *PreparedRowAllocator,
+            controls: ?@import("apply_rw_lock.zig").ApplyRwLock.Acquisition,
+            defer_retained_coordinator_acknowledgement: bool,
+        ) !void {
+            const admission = @import("mutation_admission.zig");
+            try admission.checkLifetime(controls);
+            const retained = admission.retainedLeaseControls(controls);
+            var collection: admission.IntentCollection = .{};
+            const collection_control = collection.bind(retained, S.ownerField(self, "core").*.apply_mutex.io);
             const alloc = preparation.allocator();
             // Ordered apply must never await work whose publication needs a
             // subsequent Raft entry. The request coordinator owns the derived
@@ -3837,12 +4600,12 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             const restore_scope: ?[32]u8 = if (staging_progress) |progress| progress.value.scope.digest() else null;
             const mirror_scoped_restore = restore_scope != null and S.ownerField(self, "local_execution").*.replication_async_batch_mirror != null;
             const bypass_replication_write_gate = ordered_receipt != null and !mirror_scoped_restore;
-            var replication_mutation = if (!bypass_replication_write_gate) self.acquireReplicationMutationShared() else null;
+            if (mirror_scoped_restore) try self.flushDurableReplicationOutboxesWithAdmission(retained);
+            var replication_mutation = if (!bypass_replication_write_gate) try admission.acquireReplicationMutationShared(self, controls) else null;
             defer if (replication_mutation) |*lease| lease.release();
             if (!bypass_replication_write_gate) try self.enforceReplicationWriteGate();
-            if (mirror_scoped_restore) try self.flushDurableReplicationOutboxes();
             if (status != .committed) {
-                try self.lockApplyForPortableRuntime();
+                try admission.lockApplyForCompletion(self, retained);
                 defer S.ownerField(self, "core").*.unlockApply();
                 var marker_value_buf: [ordered_apply_receipt_value_len]u8 = undefined;
                 const marker_writes: []const docstore_mod.KVPair = if (ordered_receipt) |identity| blk: {
@@ -3855,6 +4618,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 _ = S.ownerField(self, "core").*.resolveTransactionIntentsWithExtraBatch(txn_id, status, commit_version, .{
                     .completion_writes = marker_writes,
                     .resolved_participant = resolved_participant,
+                    .defer_retained_coordinator_acknowledgement = defer_retained_coordinator_acknowledgement,
                 }) catch |err| switch (err) {
                     // An abort decision for a participant that was declared but
                     // never enlisted is already satisfied. Treat it as an
@@ -3870,15 +4634,42 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
 
             var attempts: usize = 0;
             while (attempts < 8) : (attempts += 1) {
+                try admission.checkLifetime(retained);
                 const schema_namespace = S.ownerField(self, "core").*.schemaNamespaceGeneration();
-                var intents = try S.ownerField(self, "core").*.collectTransactionIntentBatch(alloc, txn_id);
-                defer intents.deinit(alloc);
+                var prepared_inputs: ?transactions_mod.PreparedResolutionInputs = blk: {
+                    try admission.lockApplyForCompletion(self, retained);
+                    defer S.ownerField(self, "core").*.unlockApply();
+                    var manager = try S.ownerField(self, "core").*.initTxnManager();
+                    defer manager.deinit();
+                    // Preserve authoritative terminal conflict priority.
+                    if (try manager.getTransactionStatusWithAdmission(txn_id, collection_control) == .aborted) return transactions_mod.TxnError.DecisionConflict;
+                    const result = try manager.loadPreparedEffectsWithInputs(alloc, txn_id, collection_control);
+                    if (result == null and (try manager.loadPreparationRequirement(txn_id, collection_control)) != null) return error.PreparedEffectsRequired;
+                    break :blk result;
+                };
+                defer if (prepared_inputs) |*plan| plan.deinit();
+                const accepted: ?*const transactions_mod.PreparedEffects = if (prepared_inputs) |*plan| &plan.effects else null;
+                var legacy_intents: transactions_mod.IntentBatch = .{};
+                defer legacy_intents.deinit(alloc);
+                // Accepted effects and application input share the same owned
+                // witness. Only legacy transactions collect a separate batch.
+                const intents = if (prepared_inputs) |*plan| &plan.inputs.batch else blk: {
+                    legacy_intents = try S.ownerField(self, "core").*.collectTransactionIntentBatchWithAdmission(alloc, txn_id, collection_control);
+                    break :blk &legacy_intents;
+                };
+                try admission.checkLifetime(retained);
                 const intent_keys = try alloc.alloc([]const u8, intents.writes.len + intents.deletes.len);
                 defer alloc.free(intent_keys);
-                for (intents.writes, 0..) |write, i| intent_keys[i] = write.key;
-                for (intents.deletes, 0..) |key, i| intent_keys[intents.writes.len + i] = key;
-                if (intents.writes.len == 0 and intents.deletes.len == 0) {
-                    try self.lockApplyForPortableRuntime();
+                for (intents.writes, 0..) |write, i| {
+                    if (i % 64 == 0) try admission.checkLifetime(retained);
+                    intent_keys[i] = write.key;
+                }
+                for (intents.deletes, 0..) |key, i| {
+                    if (i % 64 == 0) try admission.checkLifetime(retained);
+                    intent_keys[intents.writes.len + i] = key;
+                }
+                if (accepted == null and intents.writes.len == 0 and intents.deletes.len == 0) {
+                    try admission.lockApplyForCompletion(self, retained);
                     if (schema_namespace != S.ownerField(self, "core").*.schemaNamespaceGeneration()) {
                         S.ownerField(self, "core").*.unlockApply();
                         return error.PreparedGenerationChanged;
@@ -3901,6 +4692,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                         .{
                             .completion_writes = marker_writes,
                             .resolved_participant = resolved_participant,
+                            .defer_retained_coordinator_acknowledgement = defer_retained_coordinator_acknowledgement,
                             .expected_intent_revision = intents.revision,
                             .known_intent_keys = intent_keys,
                         },
@@ -3910,19 +4702,23 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                         return err;
                     };
                     S.ownerField(self, "core").*.unlockApply();
-                    try self.flushTransactionReplicationOutbox(txn_id);
+                    try flushTransactionReplicationOutboxWithRetirement(self, txn_id, .{ .current = &replication_mutation }, admission.receiverMutationRoot(self));
                     try self.waitForResolvedTransactionSyncWithCancellation(commit_sync_level, outcome.replay_sequence, visibility_cancellation);
                     return;
                 }
 
                 const writes = try alloc.alloc(types.BatchWrite, intents.writes.len);
                 defer alloc.free(writes);
-                for (intents.writes, 0..) |write, i| writes[i] = .{ .key = write.key, .value = write.value };
+                for (intents.writes, 0..) |write, i| {
+                    if (i % 64 == 0) try admission.checkLifetime(retained);
+                    writes[i] = .{ .key = write.key, .value = write.value };
+                }
                 var durable_rows = std.StringHashMapUnmanaged([]const u8).empty;
                 defer durable_rows.deinit(alloc);
-                for (intents.prepared_rows, 0..) |maybe_row, i| if (maybe_row) |row| {
-                    try durable_rows.put(alloc, intents.writes[i].key, row);
-                };
+                for (intents.prepared_rows, 0..) |maybe_row, i| {
+                    if (i % 64 == 0) try admission.checkLifetime(retained);
+                    if (maybe_row) |row| try durable_rows.put(alloc, intents.writes[i].key, row);
+                }
                 self.batchInternalWithPreparationAllocator(.{
                     .writes = writes,
                     .deletes = intents.deletes,
@@ -3931,16 +4727,23 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     .restore_staging_scope = restore_scope,
                 }, null, .{
                     .visibility_cancellation = visibility_cancellation,
+                    .admission_controls = retained,
+                    .avoid_admission_capacity_cycle = controls != null,
+                    .committed_visibility_wait = if (controls) |original| original.execution_wait else null,
+                    .enclosing_mutation_retirement = &replication_mutation,
+                    .mutation_root = admission.receiverMutationRoot(self),
                     .bypass_replication_write_gate = bypass_replication_write_gate,
                     .ordered_apply_receipt = ordered_receipt,
                     .durable_rows = &durable_rows,
                     .transaction_resolution = .{
+                        .accepted_effects = accepted,
                         .txn_id = txn_id,
                         .status = status,
                         .commit_version = commit_version,
                         .expected_intent_revision = intents.revision,
                         .intent_keys = intent_keys,
                         .resolved_participant = resolved_participant,
+                        .defer_retained_coordinator_acknowledgement = defer_retained_coordinator_acknowledgement,
                         .schema_binding = intents.schema_binding,
                         .schema_namespace_generation = schema_namespace,
                     },
@@ -4499,6 +5302,24 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             sync_targets_out: ?*ManagedSyncTargets,
             owning_table: ?[]const u8,
         ) ![]u8 {
+            return encodeThinReplayRecordPayloadWithAdmission(alloc, req, extracted, deleted_artifact_keys, changed_artifact_keys, overwritten_flags, derived_changed_flags, sequence, include_generated_enrichment_hint, index_manager, sync_targets_out, owning_table, null);
+        }
+
+        fn encodeThinReplayRecordPayloadWithAdmission(
+            alloc: Allocator,
+            req: types.BatchRequest,
+            extracted: []const mapper.ExtractedWrite,
+            deleted_artifact_keys: []const []u8,
+            changed_artifact_keys: []const []u8,
+            overwritten_flags: []const bool,
+            derived_changed_flags: []const bool,
+            sequence: u64,
+            include_generated_enrichment_hint: bool,
+            index_manager: ?*index_manager_mod.IndexManager,
+            sync_targets_out: ?*ManagedSyncTargets,
+            owning_table: ?[]const u8,
+            control: ?@import("../../common/read_admission.zig").Port,
+        ) ![]u8 {
             if ((index_manager == null) != (sync_targets_out == null)) return error.InvalidArgument;
             if (derived_changed_flags.len != req.writes.len) return error.InvalidArgument;
             var changed_doc_keys = std.ArrayListUnmanaged([]const u8).empty;
@@ -4689,7 +5510,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             record.target_hints = try target_hints.toOwnedSlice(alloc);
             if (sync_targets_out) |out|
                 out.* = try collectManagedSyncTargetsForRecord(alloc, index_manager.?, record);
-            return try change_journal_mod.encodeRecord(alloc, record);
+            return try change_journal_mod.encodeRecordWithAdmission(alloc, record, control);
         }
 
         pub fn enforcePortableRuntimeGateOptional(pending: ?*const std.atomic.Value(bool)) !void {
@@ -4887,7 +5708,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             return open_mode == .query_readonly or open_mode == .status_only;
         }
 
-        pub fn orderedCoverageActive(store: *docstore_mod.DocStore) !bool {
+        pub fn orderedCoverageActive(store: anytype) !bool {
             var probe = try store.beginProbeTxnWithBlockCacheAdmission(.transient);
             defer probe.abort();
             return try @import("artifact_publication.zig").authority(&probe) != null;
@@ -4934,7 +5755,35 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             outbox: DurableReplicationOutbox,
             kind: DurableReplicationOutboxKind,
         ) !void {
+            try recoverDurableReplicationOutboxContextWithAdmission(ctx, mirror, outbox, kind, null);
+        }
+
+        pub fn recoverDurableReplicationOutboxContextWithAdmission(
+            ctx: *const BatchExecutionContext,
+            mirror: ReplicationAsyncEffectMirror,
+            outbox: DurableReplicationOutbox,
+            kind: DurableReplicationOutboxKind,
+            control: ?@import("../../common/read_admission.zig").Port,
+        ) !void {
+            return recoverDurableReplicationOutboxContextMode(ctx, mirror, outbox, kind, control, .wait);
+        }
+
+        fn recoverDurableReplicationOutboxContextMode(ctx: *const BatchExecutionContext, mirror: ReplicationAsyncEffectMirror, outbox: DurableReplicationOutbox, kind: DurableReplicationOutboxKind, control: ?@import("../../common/read_admission.zig").Port, comptime completion: @FieldType(replication_commit.RecoveryContext, "completion")) !void {
+            var mutation_barrier: ?*MutationBarrier = null;
+            inline for (.{ ctx.replication_async_batch_mirror, ctx.replication_async_effect_mirror, ctx.replication_async_metadata_mirror }) |configured| {
+                if (configured) |binding| {
+                    if (binding.mutation_barrier) |barrier| {
+                        if (mutation_barrier) |existing| std.debug.assert(existing == barrier);
+                        mutation_barrier = barrier;
+                    }
+                }
+            }
             try replication_commit.recoverDurableOutbox(.{
+                .completion = completion,
+                .mutation_barrier = mutation_barrier,
+                .io = ctx.io,
+                .admission = control,
+                .mutation_root = ctx.mutation_root,
                 .transition_mutex = replicationTransitionMutexFromContext(ctx),
                 .log_mutex = ctx.log_mutex,
                 .namespace = ctx.identity_namespace,
@@ -5145,4 +5994,160 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             }
         }
     };
+}
+
+test "mutation batch root production retry wrapper preserves receiver identity memo and accepted completion" {
+    const admission = @import("mutation_admission.zig");
+    const Barrier = execution_resources.MutationBarrier;
+    const Pipeline = ImplementationFor(struct {}, struct {});
+    const Mode = enum { retry_success, preparation_failure, retry_exhaustion, completion_failure, accepted_failure, inherited_success, conflict };
+    const Receiver = struct {
+        mutation_root: ?*Barrier.RootSharedLease = null,
+        expected_root: *Barrier.RootSharedLease,
+        barrier: *Barrier,
+        core: struct { apply_mutex: *@import("apply_rw_lock.zig").ApplyRwLock },
+        mode: Mode,
+        attempts: usize = 0,
+        accepted: usize = 0,
+        completions: usize = 0,
+        memo: ?*execution_resources.GeneratedEmbeddingMemo = null,
+        vector: ?[*]f32 = null,
+        pub fn deinitScratch(_: *@This()) void {}
+        pub fn replicationMutationBarrier(self: *@This()) ?*Barrier {
+            return self.barrier;
+        }
+        pub fn batchInternalPrepared(self: *@This(), _: types.BatchRequest, _: ?*execution_resources.BatchProfile, options: execution_resources.BatchExecutionOptions, memo: *execution_resources.GeneratedEmbeddingMemo, _: *execution_resources.PreparedRowAllocator) !void {
+            self.attempts += 1;
+            try std.testing.expect(self.mutation_root == self.expected_root and (options.mutation_root == null or options.mutation_root == self.expected_root));
+            // This lookup follows the same receiver-only nested helper path as
+            // production. A queued capture must not force a new reader wait.
+            var borrow = (try admission.acquireReplicationMutationShared(self, null)).?;
+            defer borrow.release();
+            try std.testing.expect(borrow.root == self.expected_root and !borrow.phase_owner);
+            const key: execution_resources.GeneratedEmbeddingMemo.Key = @splat(1);
+            if (self.memo) |previous| {
+                try std.testing.expect(previous == memo);
+                try std.testing.expectEqual(self.vector.?, memo.dense.get(key).?.ptr);
+            } else {
+                self.memo = memo;
+                const vector = try memo.alloc.alloc(f32, 3);
+                errdefer memo.alloc.free(vector);
+                @memset(vector, 1);
+                try memo.dense.put(memo.alloc, key, vector);
+                self.vector = vector.ptr;
+            }
+            try std.testing.expect(!memo.reuse_stored_artifacts);
+            switch (self.mode) {
+                .retry_success => {
+                    if (self.attempts == 1) return error.PreparedGenerationChanged;
+                    if (self.attempts == 2) return error.PreparedReadSetChanged;
+                },
+                .preparation_failure => return error.Canceled,
+                .retry_exhaustion => return error.PreparedGenerationChanged,
+                .completion_failure, .accepted_failure, .inherited_success, .conflict => {},
+            }
+            self.accepted += 1;
+            options.primary_commit_observed.?.* = true;
+            if (self.mode == .accepted_failure) return error.PreparedGenerationChanged;
+        }
+        pub fn finishBatchGraphEndpointCleanup(self: *@This(), _: types.BatchRequest, _: execution_resources.BatchExecutionOptions) !void {
+            self.completions += 1;
+            try std.testing.expect(self.mutation_root == self.expected_root);
+            try std.testing.expectEqual(@as(usize, 0), self.expected_root.borrowers.load(.acquire));
+            // This error belongs to the retry set, but follows primary acceptance.
+            // The production wrapper must propagate it without replaying prepare.
+            if (self.mode == .completion_failure) return error.PreparedGenerationChanged;
+        }
+    };
+    const Check = struct {
+        pub fn checkpoint(_: *@This()) !void {}
+        pub fn executionBoundary(_: *@This()) ?@import("../../common/execution_wait.zig").Boundary {
+            return null;
+        }
+    };
+    for ([_]Mode{ .retry_success, .preparation_failure, .retry_exhaustion, .completion_failure, .accepted_failure, .inherited_success, .conflict }) |mode| {
+        var barrier: Barrier = .{};
+        var check: Check = .{};
+        var root = try barrier.acquireSharedRootControlled(std.testing.io, &check);
+        defer root.release();
+        var conflicting_root = Barrier.RootSharedLease.initRetired(&barrier);
+        defer conflicting_root.release();
+        var mutex: @import("apply_rw_lock.zig").ApplyRwLock = .{ .io = std.testing.io };
+        var receiver: Receiver = .{ .expected_root = &root, .barrier = &barrier, .core = .{ .apply_mutex = &mutex }, .mode = mode };
+        receiver.mutation_root = switch (mode) {
+            .inherited_success => &root,
+            .conflict => &conflicting_root,
+            else => null,
+        };
+        const previous = receiver.mutation_root;
+        var guard: execution_resources.PreparedRowAllocator = .{ .child = std.testing.allocator, .io = std.testing.io };
+        try std.testing.expect(barrier.reader_gate.tryLock());
+        defer barrier.reader_gate.unlock();
+        var observed = false;
+        const result = Pipeline.batchInternalWithPreparationAllocator(&receiver, .{ .sync_level = .propose }, null, .{ .mutation_root = if (mode == .inherited_success) null else &root, .primary_commit_observed = &observed }, &guard);
+        switch (mode) {
+            .inherited_success => {
+                try result;
+                try std.testing.expectEqual(@as(usize, 1), receiver.attempts);
+                try std.testing.expectEqual(@as(usize, 1), receiver.accepted);
+                try std.testing.expectEqual(@as(usize, 1), receiver.completions);
+            },
+            .conflict => {
+                try std.testing.expectError(error.InvalidArgument, result);
+                try std.testing.expectEqual(@as(usize, 0), receiver.attempts);
+                try std.testing.expectEqual(@as(usize, 0), receiver.accepted);
+                try std.testing.expectEqual(@as(usize, 0), receiver.completions);
+                try std.testing.expect(receiver.memo == null);
+            },
+            .retry_success => {
+                try result;
+                try std.testing.expectEqual(@as(usize, 3), receiver.attempts);
+                try std.testing.expectEqual(@as(usize, 1), receiver.accepted);
+                try std.testing.expectEqual(@as(usize, 1), receiver.completions);
+            },
+            .preparation_failure => {
+                try std.testing.expectError(error.Canceled, result);
+                try std.testing.expectEqual(@as(usize, 1), receiver.attempts);
+                try std.testing.expectEqual(@as(usize, 0), receiver.accepted);
+                try std.testing.expectEqual(@as(usize, 0), receiver.completions);
+            },
+            .retry_exhaustion => {
+                try std.testing.expectError(error.PreparedGenerationChanged, result);
+                try std.testing.expectEqual(@as(usize, 3), receiver.attempts);
+                try std.testing.expectEqual(@as(usize, 0), receiver.accepted);
+                try std.testing.expectEqual(@as(usize, 0), receiver.completions);
+            },
+            .accepted_failure => {
+                try std.testing.expectError(error.PreparedGenerationChanged, result);
+                try std.testing.expectEqual(@as(usize, 1), receiver.attempts);
+                try std.testing.expectEqual(@as(usize, 1), receiver.accepted);
+                try std.testing.expectEqual(@as(usize, 0), receiver.completions);
+            },
+            .completion_failure => {
+                try std.testing.expectError(error.PreparedGenerationChanged, result);
+                try std.testing.expectEqual(@as(usize, 1), receiver.attempts);
+                try std.testing.expectEqual(@as(usize, 1), receiver.accepted);
+                try std.testing.expectEqual(@as(usize, 1), receiver.completions);
+            },
+        }
+        try std.testing.expectEqual(receiver.accepted != 0, observed);
+        try std.testing.expect(receiver.mutation_root == previous);
+        try std.testing.expect(root.held and root.borrowers.load(.acquire) == 0);
+    }
+    const AllocationFixture = struct {
+        fn run(allocator: execution_resources.Allocator) !void {
+            var barrier: Barrier = .{};
+            var check: Check = .{};
+            var root = try barrier.acquireSharedRootControlled(std.testing.io, &check);
+            defer root.release();
+            var mutex: @import("apply_rw_lock.zig").ApplyRwLock = .{ .io = std.testing.io };
+            var receiver: Receiver = .{ .expected_root = &root, .barrier = &barrier, .core = .{ .apply_mutex = &mutex }, .mode = .retry_success };
+            var guard: execution_resources.PreparedRowAllocator = .{ .child = allocator, .io = std.testing.io };
+            defer std.debug.assert(receiver.mutation_root == null and root.borrowers.load(.acquire) == 0);
+            try Pipeline.batchInternalWithPreparationAllocator(&receiver, .{ .sync_level = .propose }, null, .{ .mutation_root = &root }, &guard);
+            try std.testing.expectEqual(@as(usize, 1), receiver.accepted);
+            try std.testing.expectEqual(@as(usize, 1), receiver.completions);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, AllocationFixture.run, .{});
 }

@@ -94,12 +94,17 @@ const SyncWaitCancellation = struct {
     deadline_ns: u64,
 
     fn token(self: *const @This()) CancellationToken {
-        return .{ .ptr = self, .is_cancelled_fn = isCancelled };
+        return .{ .ptr = self, .is_cancelled_fn = isCancelled, .check_fn = check };
     }
 
     fn isCancelled(ptr: *const anyopaque) bool {
+        check(ptr) catch return true;
+        return false;
+    }
+    fn check(ptr: *const anyopaque) !void {
         const state: *const @This() = @ptrCast(@alignCast(ptr));
-        return state.upstream.isCancelled() or platform_time.monotonicNs() >= state.deadline_ns;
+        try state.upstream.check();
+        if (platform_time.monotonicNs() >= state.deadline_ns) return error.DeadlineExceeded;
     }
 };
 const json_helpers = @import("antfly_local_sources").api_json_helpers;
@@ -227,6 +232,8 @@ fn normalizeServerlessCreateIndexConfig(
 
 pub const HttpHandler = struct {
     alloc: Allocator,
+    /// Compatible provenance-aware view of the same owner as alloc.
+    control_allocator: ?Allocator = null,
     api: *api_service.Service,
     catalog: *catalog_mod.CatalogService,
     manifests: *manifest_mod.ManifestStore,
@@ -241,7 +248,10 @@ pub const HttpHandler = struct {
     published_search_sources: search_sources.PublishedSearchSources = .{},
     runtime_status: *const api_types.RuntimeStatusResult,
     runtime_metrics: ?*runtime_manager.ManagedRuntime = null,
+    read_memory_pool: ?*@import("../../common/read_memory.zig").Pool = null,
     graph_execution_limits: @import("antfly_local_sources").graph_work_budget.Limits = .{},
+    write_runnable_slots: usize = 1,
+    runnable_scheduler: ?*@import("antfly_local_sources").common_request_admission.runnable_scheduler.Scheduler = null,
     query_admission: RequestAdmission = RequestAdmission.init(common_config.default_query_max_concurrent_requests),
     write_admission: RequestAdmission = RequestAdmission.init(common_config.default_write_max_concurrent_requests),
 
@@ -276,29 +286,147 @@ pub const HttpHandler = struct {
         self.graph_execution_limits = limits;
     }
 
+    const ResponseExecution = struct {
+        alloc: Allocator,
+        guard: http_types.RequestGuard,
+        execution: @import("antfly_local_sources").common_request_admission.runnable_scheduler.Execution = .{},
+        admission: ?RequestAdmission.Lease = null,
+        fn release(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.execution.finish();
+            if (self.admission) |*lease| lease.release();
+            const alloc = self.alloc;
+            alloc.destroy(self);
+        }
+    };
+
+    pub fn requestRetainedBytes() usize {
+        return @sizeOf(ResponseExecution);
+    }
+
     pub fn handle(self: *HttpHandler, input: HttpRequest) !HttpResponse {
-        const guard = http_types.RequestGuard{ .context = try input.context().platformDeadline() };
+        var local_guard = http_types.RequestGuard{ .context = try input.context().platformDeadline() };
+        try local_guard.checkpoint();
+        const route = http_routes.match(input.method, input.path) orelse return try textResponse(self.alloc, 404, "not found");
+        const response_execution = if (self.runnable_scheduler != null) owned: {
+            const alloc = switch (route) {
+                .healthz, .readyz => self.control_allocator orelse self.alloc,
+                else => self.alloc,
+            };
+            const owner = try alloc.create(ResponseExecution);
+            owner.* = .{ .alloc = alloc, .guard = .{ .context = local_guard.context } };
+            break :owned owner;
+        } else null;
+        var transferred = false;
+        defer if (response_execution) |owner| {
+            if (!transferred) ResponseExecution.release(owner);
+        };
+        const guard = if (response_execution) |owner| &owner.guard else &local_guard;
         var req = input;
         req.cancellation = guard.token();
         const request_context = guard.context;
-        try guard.context.ensureActive();
-        const route = http_routes.match(req.method, req.path) orelse return try textResponse(self.alloc, 404, "not found");
         const admission: ?*RequestAdmission = switch (http_routes.admissionClass(route)) {
             .none => null,
             .query => &self.query_admission,
             .write => &self.write_admission,
         };
+        var admission_lease: ?RequestAdmission.Lease = null;
+        defer if (response_execution == null) {
+            if (admission_lease) |*lease| lease.release();
+        };
         if (admission) |gate| {
-            if (!gate.tryAcquire()) {
+            const token = guard.token();
+            admission_lease = if (gate == &self.query_admission and gate.stats().waiting.max_wait_ms != 0 and self.io != null) gate.acquire(.{
+                .io = self.io orelse return error.MissingBackendRuntimeIo,
+                .native_now_ns = @import("antfly_platform").time.monotonicNs,
+                .deadline_ns = request_context.deadline_ns,
+                .cancellation = .{ .ptr = token.ptr.?, .requested = token.is_cancelled_fn.? },
+                .retained_bytes = @as(u64, requestRetainedBytes()) +| req.body.len,
+            }) catch |err| switch (err) {
+                error.AdmissionFull, error.AdmissionQueueFull, error.AdmissionBytesExhausted, error.AdmissionRequestTooLarge, error.AdmissionWaitTimeout, error.AdmissionClosed => null,
+                else => {
+                    // The admission token exposes a boolean. Recover the
+                    // original scoped rejection (including deadline expiry).
+                    try guard.checkpoint();
+                    return err;
+                },
+            } else gate.tryAcquireLease();
+            if (admission_lease == null) {
+                try guard.checkpoint();
                 var response = try textResponse(self.alloc, 429, if (gate == &self.query_admission) "query capacity exhausted" else "write capacity exhausted");
                 response.retry_after_seconds = 1;
                 return response;
             }
         }
-        defer if (admission) |gate| gate.release();
-        try guard.context.ensureActive();
+        if (response_execution) |owner| owner.admission = admission_lease;
+        try guard.checkpoint();
 
-        var response = switch (route) {
+        const Runnable = @import("antfly_local_sources").common_request_admission.runnable_scheduler;
+        var local_execution: Runnable.Execution = .{};
+        const execution = if (response_execution) |owner| &owner.execution else &local_execution;
+        defer if (response_execution == null) local_execution.finish();
+        if (self.runnable_scheduler) |scheduler| {
+            const token = guard.token();
+            const class: Runnable.Class = switch (route) {
+                .healthz, .readyz => .control,
+                else => switch (http_routes.admissionClass(route)) {
+                    .query => .query,
+                    .write => .write,
+                    .none => if (req.method == .get) .query else .write,
+                },
+            };
+            const completion_bytes: u64 = switch (route) {
+                .ingest_batch, .ingest_table_batch => api_service.Service.completionRetainedBytes(),
+                else => 0,
+            };
+            execution.startWithSlots(scheduler, .{
+                .io = self.io orelse return error.MissingBackendRuntimeIo,
+                .native_now_ns = @import("antfly_platform").time.monotonicNs,
+                .deadline_ns = request_context.deadline_ns,
+                .cancellation = .{ .ptr = token.ptr.?, .requested = token.is_cancelled_fn.? },
+                .retained_bytes = @as(u64, requestRetainedBytes()) +| req.body.len +| completion_bytes,
+                .allow_wait = class != .control,
+            }, class, if (class == .write) self.write_runnable_slots else 1) catch |err| {
+                try guard.checkpoint();
+                return err;
+            };
+            try guard.checkpoint();
+        }
+
+        var response = self.dispatchRoute(req, route, request_context, if (self.runnable_scheduler != null) execution else null) catch |err| {
+            // A boolean-only engine may return Canceled after observing a
+            // scoped rejection. Recover its first cause before the response.
+            // Accepted batches retain their existing durable response rules.
+            if (route != .table_batch and !retainedIngest(route, execution)) try guard.checkpoint();
+            return err;
+        };
+        errdefer response.deinit(self.alloc);
+        // Batch responses carry durable WAL acceptance, including pending
+        // publication. Never replace them with a pre-commit timeout response.
+        const accepted_ingest = response.status == 202 and switch (route) {
+            .ingest_batch, .ingest_table_batch => true,
+            else => false,
+        };
+        if (route != .table_batch and !accepted_ingest and !retainedIngest(route, execution)) try guard.checkpoint();
+        if (response_execution) |owner| {
+            execution.park(.output_blocked) catch |err| {
+                if (err != error.SchedulerClosed or (route != .table_batch and !accepted_ingest and !retainedIngest(route, execution))) return err;
+            };
+            response.retirement = .{ .ptr = owner, .release = ResponseExecution.release };
+            transferred = true;
+        }
+        return response;
+    }
+
+    fn retainedIngest(route: http_routes.Route, execution: *const @import("antfly_local_sources").common_request_admission.runnable_scheduler.Execution) bool {
+        return switch (route) {
+            .ingest_batch, .ingest_table_batch => if (execution.entry) |entry| entry.completion_active else false,
+            else => false,
+        };
+    }
+
+    fn dispatchRoute(self: *HttpHandler, req: HttpRequest, route: http_routes.Route, request_context: api_operation.RequestContext, execution: ?*@import("antfly_local_sources").common_request_admission.runnable_scheduler.Execution) !HttpResponse {
+        return switch (route) {
             .health => try self.handleHealth(),
             .healthz => try self.handleHealthz(),
             .readyz => try self.handleReadyz(),
@@ -315,8 +443,8 @@ pub const HttpHandler = struct {
                 .delete => try self.handlePublicTableDeleteIndex(value.table_name, value.index_name),
                 else => unreachable,
             },
-            .ingest_batch => |value| try self.handleIngestBatch(value.namespace, req.body),
-            .ingest_table_batch => |value| try self.handleIngestTableBatch(value.table_name, req.body),
+            .ingest_batch => |value| try self.handleIngestBatch(value.namespace, req.body, req.cancellation, execution),
+            .ingest_table_batch => |value| try self.handleIngestTableBatch(value.table_name, req.body, req.cancellation, execution),
             .table_batch => |value| try self.handleTableBatch(value.table_name, req.body, request_context),
             .build_namespace => |value| try self.handleBuildNamespace(value.namespace),
             .internal_table_build => |value| try self.handleBuildTable(value.table_name),
@@ -356,15 +484,15 @@ pub const HttpHandler = struct {
             .query_head_artifact => |value| try self.handleQueryHeadArtifact(value.namespace, value.artifact_index, req.cancellation),
             .query_version_artifact => |value| try self.handleQueryVersionArtifact(value.namespace, value.version.?, value.artifact_index, req.cancellation),
         };
-        errdefer response.deinit(self.alloc);
-        // Batch responses carry durable WAL acceptance, including pending
-        // publication. Never replace them with a pre-commit timeout response.
-        if (route != .table_batch) try guard.context.ensureActive();
-        return response;
     }
 
     pub fn configureAdmission(self: *HttpHandler, query_capacity: usize, write_capacity: usize) void {
         self.query_admission = RequestAdmission.init(query_capacity);
+        self.write_admission = RequestAdmission.init(write_capacity);
+    }
+
+    pub fn configureAdmissionWithWaiting(self: *HttpHandler, query_capacity: usize, write_capacity: usize, waiting: @import("antfly_local_sources").common_bounded_admission.Waiting) !void {
+        self.query_admission = try RequestAdmission.initConfigured(query_capacity, waiting);
         self.write_admission = RequestAdmission.init(write_capacity);
     }
 
@@ -431,12 +559,12 @@ pub const HttpHandler = struct {
     }
 
     fn handleHealthz(self: *HttpHandler) !HttpResponse {
-        return try jsonResponse(self.alloc, 200, .{ .status = "ok" });
+        return try jsonResponse(self.control_allocator orelse self.alloc, 200, .{ .status = "ok" });
     }
 
     fn handleReadyz(self: *HttpHandler) !HttpResponse {
         const ready = self.runtime_status.validated;
-        return try jsonResponse(self.alloc, if (ready) 200 else 503, .{
+        return try jsonResponse(self.control_allocator orelse self.alloc, if (ready) 200 else 503, .{
             .status = if (ready) "ready" else "not_ready",
             .validated = ready,
         });
@@ -1025,7 +1153,12 @@ pub const HttpHandler = struct {
         return try jsonResponse(self.alloc, 201, struct {}{});
     }
 
-    fn handleIngestBatch(self: *HttpHandler, namespace: []const u8, body: []const u8) !HttpResponse {
+    fn ingestWithExecution(self: *HttpHandler, req: api_types.IngestBatchRequest, cancellation: @import("antfly_cancellation").CancellationToken, execution: ?*@import("antfly_local_sources").common_request_admission.runnable_scheduler.Execution) !api_types.IngestBatchResult {
+        if (execution) |active| return self.api.ingestBatchWithExecution(req, cancellation, active, self.io orelse return error.MissingBackendRuntimeIo);
+        return self.api.ingestBatchWithCancellation(req, cancellation);
+    }
+
+    fn handleIngestBatch(self: *HttpHandler, namespace: []const u8, body: []const u8, cancellation: @import("antfly_cancellation").CancellationToken, execution: ?*@import("antfly_local_sources").common_request_admission.runnable_scheduler.Execution) !HttpResponse {
         if (try self.requireMutableRoute()) |resp| return resp;
         self.catalog.ensureNamespaceWritesAllowed(namespace) catch |err| switch (err) {
             error.RelationalStorageUnavailable => return try textResponse(self.alloc, 405, "relational writes require the native storage-owner runtime"),
@@ -1041,12 +1174,16 @@ pub const HttpHandler = struct {
         const req = parseIngestBatchRequest(self.alloc, namespace, body) catch return try textResponse(self.alloc, 400, "invalid ingest request");
         defer freeDocumentMutations(self.alloc, req.mutations);
 
-        var result = self.api.ingestBatch(req) catch return try textResponse(self.alloc, 500, "ingest failed");
+        var acknowledgement = try PreparedIngestResponse.init(self.alloc, .{ .namespace = namespace, .mutation_count = req.mutations.len, .start_lsn = std.math.maxInt(u64), .end_lsn = std.math.maxInt(u64) });
+        var acknowledgement_transferred = false;
+        defer if (!acknowledgement_transferred) acknowledgement.response.deinit(self.alloc);
+        var result = self.ingestWithExecution(req, cancellation, execution) catch return try textResponse(self.alloc, 500, "ingest failed");
         defer result.deinit(self.alloc);
-        return try jsonResponse(self.alloc, 202, result);
+        acknowledgement_transferred = true;
+        return acknowledgement.finish(result.start_lsn, result.end_lsn);
     }
 
-    fn handleIngestTableBatch(self: *HttpHandler, table_name: []const u8, body: []const u8) !HttpResponse {
+    fn handleIngestTableBatch(self: *HttpHandler, table_name: []const u8, body: []const u8, cancellation: @import("antfly_cancellation").CancellationToken, execution: ?*@import("antfly_local_sources").common_request_admission.runnable_scheduler.Execution) !HttpResponse {
         if (try self.requireMutableRoute()) |resp| return resp;
         self.catalog.ensureTableWritesAllowed(table_name) catch |err| switch (err) {
             error.RelationalStorageUnavailable => return try textResponse(self.alloc, 405, "relational writes require the native storage-owner runtime"),
@@ -1077,21 +1214,18 @@ pub const HttpHandler = struct {
         const namespace = self.catalog.resolveTableNamespaceAlloc(table_name) catch return try textResponse(self.alloc, 404, "not found");
         defer self.alloc.free(namespace);
 
-        var result = self.api.ingestBatch(.{
+        var acknowledgement = try PreparedIngestResponse.init(self.alloc, .{ .table_name = table_name, .mutation_count = mutations.len, .start_lsn = std.math.maxInt(u64), .end_lsn = std.math.maxInt(u64) });
+        var acknowledgement_transferred = false;
+        defer if (!acknowledgement_transferred) acknowledgement.response.deinit(self.alloc);
+        var result = self.ingestWithExecution(.{
             .namespace = namespace,
             .timestamp_ns = parsed.value.timestamp_ns,
             .mutations = mutations,
-        }) catch return try textResponse(self.alloc, 500, "ingest failed");
+        }, cancellation, execution) catch return try textResponse(self.alloc, 500, "ingest failed");
         defer result.deinit(self.alloc);
 
-        var table_result = api_types.TableIngestBatchResult{
-            .table_name = try self.alloc.dupe(u8, table_name),
-            .mutation_count = result.mutation_count,
-            .start_lsn = result.start_lsn,
-            .end_lsn = result.end_lsn,
-        };
-        defer table_result.deinit(self.alloc);
-        return try jsonResponse(self.alloc, 202, table_result);
+        acknowledgement_transferred = true;
+        return acknowledgement.finish(result.start_lsn, result.end_lsn);
     }
 
     fn handleTableBatch(self: *HttpHandler, table_name: []const u8, body: []const u8, request: api_operation.RequestContext) !HttpResponse {
@@ -6151,7 +6285,7 @@ pub const HttpHandler = struct {
         _ = alloc;
         _ = row_filter_json;
         const self: *HttpHandler = @ptrCast(@alignCast(ptr));
-        const guard = http_types.RequestGuard{ .context = request };
+        var guard = http_types.RequestGuard{ .context = request };
         request.ensureActive() catch |err| return if (err == error.DeadlineExceeded) error.DeadlineExceeded else if (err == error.Canceled) error.Canceled else error.InternalFailure;
         return self.executePublicTableQueryJsonAlloc(table_name, body, guard.token()) catch |err| switch (err) {
             error.ManifestReadLeaseContended, error.ManifestVersionRetired => return error.StorageReadTemporarilyUnavailable,
@@ -10071,10 +10205,64 @@ fn updateJoinedResponseMetadata(
     });
 }
 
+/// Reserve the entire acknowledgement before ingest can accept a WAL record.
+/// JSON permits leading whitespace before numbers, so fixed-width LSN fields
+/// can be filled without resizing or allocating after acceptance.
+const PreparedIngestResponse = struct {
+    response: HttpResponse,
+    start_offset: usize,
+    end_offset: usize,
+    fn init(alloc: Allocator, value: anytype) !PreparedIngestResponse {
+        var response = try jsonResponse(alloc, 202, value);
+        errdefer response.deinit(alloc);
+        const start_marker = "\"start_lsn\":";
+        const end_marker = "\"end_lsn\":";
+        return .{
+            .response = response,
+            .start_offset = (std.mem.lastIndexOf(u8, response.body, start_marker) orelse return error.InvalidIngestAcknowledgement) + start_marker.len,
+            .end_offset = (std.mem.lastIndexOf(u8, response.body, end_marker) orelse return error.InvalidIngestAcknowledgement) + end_marker.len,
+        };
+    }
+    fn finish(self: *PreparedIngestResponse, start_lsn: u64, end_lsn: u64) HttpResponse {
+        _ = std.fmt.bufPrint(self.response.body[self.start_offset..][0..20], "{d: >20}", .{start_lsn}) catch unreachable;
+        _ = std.fmt.bufPrint(self.response.body[self.end_offset..][0..20], "{d: >20}", .{end_lsn}) catch unreachable;
+        return self.response;
+    }
+};
+
+test "serverless execution ingest acknowledgement needs no memory after acceptance" {
+    const Fixture = struct {
+        fn run(alloc: Allocator) !void {
+            var prepared = try PreparedIngestResponse.init(alloc, .{ .namespace = "escaped\"\\\nname", .mutation_count = @as(usize, 2), .start_lsn = std.math.maxInt(u64), .end_lsn = std.math.maxInt(u64) });
+            var response = prepared.finish(1, std.math.maxInt(u64));
+            defer response.deinit(alloc);
+            var parsed = try std.json.parseFromSlice(api_types.IngestBatchResult, std.testing.allocator, response.body, .{});
+            defer parsed.deinit();
+            try std.testing.expectEqualStrings("escaped\"\\\nname", parsed.value.namespace);
+            try std.testing.expectEqual(@as(u64, 1), parsed.value.start_lsn);
+            try std.testing.expectEqual(std.math.maxInt(u64), parsed.value.end_lsn);
+        }
+    };
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{});
+    var budget: @import("../../common/allocation_budget.zig").Shared = .{ .child = std.testing.allocator, .limit = 4096 };
+    var prepared = try PreparedIngestResponse.init(budget.allocator(), .{ .table_name = "docs", .mutation_count = @as(usize, 0), .start_lsn = std.math.maxInt(u64), .end_lsn = std.math.maxInt(u64) });
+    budget.limit = 0;
+    var response = prepared.finish(0, 0);
+    var parsed = try std.json.parseFromSlice(api_types.TableIngestBatchResult, std.testing.allocator, response.body, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("docs", parsed.value.table_name);
+    try std.testing.expectEqual(@as(u64, 0), parsed.value.start_lsn);
+    try std.testing.expectEqual(@as(u64, 0), parsed.value.end_lsn);
+    response.deinit(budget.allocator());
+    try std.testing.expectEqual(@as(usize, 0), budget.stats().used_bytes);
+}
+
 fn jsonResponse(alloc: Allocator, status: u16, value: anytype) !HttpResponse {
+    const content_type = try alloc.dupe(u8, "application/json");
+    errdefer alloc.free(content_type);
     return .{
         .status = status,
-        .content_type = try alloc.dupe(u8, "application/json"),
+        .content_type = content_type,
         .body = try std.json.Stringify.valueAlloc(alloc, value, .{}),
     };
 }
@@ -12655,14 +12843,31 @@ test "serverless request deadlines preserve accepted WAL and pending publication
     defer alloc.free(namespace);
     const Clock = struct {
         var ticks: i96 = 0;
+        var accepted: bool = false;
+        var scheduler: ?*@import("antfly_local_sources").common_request_admission.runnable_scheduler.Scheduler = null;
+        var close_after_append: bool = false;
         var append_fn: @FieldType(wal_mod.WalStore.VTable, "append") = undefined;
+        var append_execution_fn: @FieldType(wal_mod.WalStore.VTable, "append_with_execution") = null;
         fn now(_: ?*anyopaque, _: std.Io.Clock) std.Io.Timestamp {
             return .{ .nanoseconds = ticks };
         }
         fn append(ptr: *anyopaque, ns: []const u8, timestamp: u64, payload: []const u8) !u64 {
-            const lsn = try append_fn(ptr, ns, timestamp, payload);
+            return acceptedLsn(try append_fn(ptr, ns, timestamp, payload));
+        }
+        fn appendWithExecution(ptr: *anyopaque, ns: []const u8, timestamp: u64, payload: []const u8, execution: *@import("antfly_local_sources").common_request_admission.runnable_scheduler.Execution) !u64 {
+            return acceptedLsn(try append_execution_fn.?(ptr, ns, timestamp, payload, execution));
+        }
+        fn acceptedLsn(lsn: u64) !u64 {
             // Deterministic expiry immediately after durable append.
             ticks = 100;
+            accepted = true;
+            if (scheduler) |owner| {
+                try std.testing.expect(owner.mutex.tryLock());
+                const retained = if (owner.entries) |entry| entry.completion_active else false;
+                owner.mutex.unlock();
+                try std.testing.expect(retained);
+                if (close_after_append) owner.close();
+            }
             return lsn;
         }
     };
@@ -12679,8 +12884,10 @@ test "serverless request deadlines preserve accepted WAL and pending publication
 
     const original_vtable = wal_store.vtable;
     Clock.append_fn = original_vtable.append;
+    Clock.append_execution_fn = original_vtable.append_with_execution;
     var wal_vtable = original_vtable.*;
     wal_vtable.append = Clock.append;
+    wal_vtable.append_with_execution = Clock.appendWithExecution;
     wal_store.vtable = &wal_vtable;
     defer wal_store.vtable = original_vtable;
     table_api.request.deadline_ns = 100;
@@ -12690,10 +12897,85 @@ test "serverless request deadlines preserve accepted WAL and pending publication
     try std.testing.expect(std.mem.indexOf(u8, pending.body, "committed") != null);
     try std.testing.expectEqual(@as(u64, 1), try wal_store.latestLsn(namespace));
 
+    const Runnable = @import("antfly_local_sources").common_request_admission.runnable_scheduler;
+    var scheduler = try Runnable.Scheduler.init(.{ .slots = 3, .cleanup_slots = 1 });
+    defer scheduler.close();
+    handler.setIo(std.testing.io);
+    const namespace_path = try std.fmt.allocPrint(alloc, "/internal/v1/namespaces/{s}/ingest-batch", .{namespace});
+    defer alloc.free(namespace_path);
+    const Probe = struct {
+        cause: anyerror,
+        calls: usize = 0,
+        reject_call: ?usize = null,
+        fn check(raw: *const anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(raw)));
+            self.calls += 1;
+            if (Clock.accepted or self.reject_call == self.calls) return self.cause;
+        }
+    };
+    const inputs = [_]struct { path: []const u8, body: []const u8 }{
+        .{ .path = namespace_path, .body = "{\"timestamp_ns\":1,\"mutations\":[{\"kind\":\"upsert\",\"doc_id\":\"doc:b\",\"body\":\"beta\"},{\"kind\":\"upsert\",\"doc_id\":\"doc:c\",\"body\":\"gamma\"}]}" },
+        .{ .path = "/tables/docs/ingest-batch", .body = "{\"timestamp_ns\":1,\"mutations\":[{\"kind\":\"upsert\",\"doc_id\":\"doc:b\",\"document\":{\"body\":\"beta\"}},{\"kind\":\"upsert\",\"doc_id\":\"doc:c\",\"document\":{\"body\":\"gamma\"}}]}" },
+    };
+    for ([_]bool{ false, true }) |scheduled| {
+        handler.runnable_scheduler = if (scheduled) &scheduler else null;
+        Clock.scheduler = handler.runnable_scheduler;
+        for (inputs) |input| for ([_]anyerror{ error.Canceled, error.DeadlineExceeded, error.SchedulerClosed, error.CatalogGenerationChanged }) |cause| {
+            Clock.accepted = false;
+            const original_lsn = try wal_store.latestLsn(namespace);
+            // Reject the original guard after input parsing, before durable
+            // completion activation. No mutation may reach the physical WAL.
+            var rejected: Probe = .{ .cause = cause, .reject_call = if (scheduled) 5 else 3 };
+            try std.testing.expectError(cause, handler.handle(.{ .method = .put, .path = input.path, .body = input.body, .cancellation = .{ .ptr = &rejected, .check_fn = Probe.check } }));
+            try std.testing.expectEqual(original_lsn, try wal_store.latestLsn(namespace));
+            try std.testing.expect(!Clock.accepted);
+            try std.testing.expectEqual(rejected.reject_call.?, rejected.calls);
+            try std.testing.expectEqual(@as(usize, 0), scheduler.stats().operations);
+
+            // The first physical append rejects the foreground lifetime.
+            // Both mutations still finish and the actual handler returns 202.
+            var accepted: Probe = .{ .cause = cause };
+            var acknowledged = try handler.handle(.{ .method = .put, .path = input.path, .body = input.body, .cancellation = .{ .ptr = &accepted, .check_fn = Probe.check } });
+            var acknowledged_live = true;
+            defer if (acknowledged_live) acknowledged.deinit(alloc);
+            try std.testing.expectEqual(@as(u16, 202), acknowledged.status);
+            try std.testing.expect(Clock.accepted);
+            try std.testing.expectEqual(original_lsn + 2, try wal_store.latestLsn(namespace));
+            try std.testing.expect(std.mem.indexOf(u8, acknowledged.body, "mutation_count") != null);
+            try std.testing.expectEqual(@as(usize, if (scheduled) 1 else 0), scheduler.stats().operations);
+            try std.testing.expectEqual(@as(usize, 0), scheduler.stats().runnable_slots);
+            acknowledged.deinit(alloc);
+            acknowledged_live = false;
+            try std.testing.expectEqual(@as(usize, 0), scheduler.stats().operations);
+            try std.testing.expectEqual(@as(usize, 0), scheduler.stats().runnable_slots);
+            try std.testing.expectEqual(@as(u64, 0), scheduler.stats().retained_bytes);
+        };
+    }
+    var closing_scheduler = try Runnable.Scheduler.init(.{ .slots = 3, .cleanup_slots = 1, .checkpoint_budget = 1 });
+    defer closing_scheduler.close();
+    handler.runnable_scheduler = &closing_scheduler;
+    Clock.scheduler = &closing_scheduler;
+    Clock.close_after_append = true;
+    Clock.accepted = false;
+    const before_close_lsn = try wal_store.latestLsn(namespace);
+    var closed_response = try handler.handle(.{ .method = .put, .path = inputs[1].path, .body = inputs[1].body });
+    var closed_response_live = true;
+    defer if (closed_response_live) closed_response.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 202), closed_response.status);
+    try std.testing.expectEqual(before_close_lsn + 2, try wal_store.latestLsn(namespace));
+    try std.testing.expectEqual(@as(usize, 1), closing_scheduler.stats().operations);
+    closed_response.deinit(alloc);
+    closed_response_live = false;
+    try std.testing.expectEqual(@as(usize, 0), closing_scheduler.stats().operations);
+    try std.testing.expectEqual(@as(usize, 0), closing_scheduler.stats().runnable_slots);
+    handler.runnable_scheduler = null;
+    Clock.scheduler = null;
+    Clock.close_after_append = false;
+
     // Query read checkpoints preserve the deadline error rather than reducing
     // it to a disconnected-client cancellation.
     Clock.ticks = 0;
-    const guard = http_types.RequestGuard{ .context = .{ .deadline_ns = 100, .deadline_io = borrow } };
+    var guard = http_types.RequestGuard{ .context = .{ .deadline_ns = 100, .deadline_io = borrow } };
     try guard.token().check();
     Clock.ticks = 100;
     try std.testing.expectError(error.DeadlineExceeded, guard.token().check());
@@ -13812,6 +14094,7 @@ test "serverless sync wait cancellation combines request cancellation and deadli
         .deadline_ns = 0,
     };
     try std.testing.expect(expired.token().isCancelled());
+    try std.testing.expectError(error.DeadlineExceeded, expired.token().check());
 
     const upstream_only = SyncWaitCancellation{
         .upstream = CancellationToken.fromAtomic(&upstream_signal),

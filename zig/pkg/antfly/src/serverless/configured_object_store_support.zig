@@ -37,6 +37,10 @@ pub fn openNativeArtifactObjectStoreAlloc(
     secret_store: ?*common_secrets.FileStore,
     read_only: bool,
 ) !object_store_support.OpenedObjectStore {
+    return openNativeArtifactObjectStoreFor(alloc, node_config, secret_store, read_only, .{});
+}
+pub fn openNativeArtifactObjectStoreFor(alloc: Allocator, node_config: *const common_config.Config, secret_store: ?*common_secrets.FileStore, read_only: bool, context: @import("antfly_local_sources").serverless_query_lake_read_context.Context) !object_store_support.OpenedObjectStore {
+    try context.ensureActive();
     const location = node_config.storage.artifacts;
     const connection_id = location.connection orelse return error.NativeArtifactStorageRequired;
     const bucket = location.bucket orelse return error.NativeArtifactStorageRequired;
@@ -45,8 +49,8 @@ pub fn openNativeArtifactObjectStoreAlloc(
     if (connection.kind != .external_io or !hasConnectionCapability(connection, "storage.primary")) return error.NativeArtifactStorageUnauthorized;
     const external_io = connection.external_io orelse return error.NativeArtifactStorageUnauthorized;
     return switch (external_io.protocol) {
-        .s3 => try openCredentialedS3PrefixAlloc(alloc, secret_store, external_io, bucket, prefix, read_only),
-        .gcs => try openCredentialedGcsPrefixAlloc(alloc, secret_store, external_io, bucket, prefix, read_only),
+        .s3 => try openCredentialedS3PrefixFor(alloc, secret_store, external_io, bucket, prefix, read_only, context),
+        .gcs => try openCredentialedGcsPrefixFor(alloc, secret_store, external_io, bucket, prefix, read_only, context),
         .filesystem => blk: {
             const root = external_io.root orelse return error.NativeArtifactStorageUnauthorized;
             try validateFilesystemSourceRelativePath(prefix);
@@ -54,7 +58,7 @@ pub fn openNativeArtifactObjectStoreAlloc(
             defer alloc.free(path);
             const uri = try std.fmt.allocPrint(alloc, "file://{s}", .{path});
             defer alloc.free(uri);
-            break :blk try object_store_support.OpenedObjectStore.initFileUriWithOptions(alloc, uri, bucket, .{ .ensure_bucket = !read_only });
+            break :blk try object_store_support.OpenedObjectStore.initFileUriWithOptions(alloc, uri, bucket, .{ .ensure_bucket = !read_only, .context = context });
         },
         else => error.NativeArtifactStorageUnauthorized,
     };
@@ -138,7 +142,7 @@ pub fn executeLakeCatalogAlloc(a: Allocator, binding: catalog_binding.Binding, o
     if (mutation and binding.write_policy != .iceberg_writer) return error.ExternalLakeReadOnly;
     var source_options = options;
     source_options.read_only = !mutation or config.type == .rest;
-    var opened = try openBindingObjectStoreAlloc(a, binding, source_options);
+    var opened = try openBindingObjectStoreFor(a, binding, source_options, context);
     defer opened.deinit();
     var catalog: lake_catalog.Catalog = undefined;
     if (config.type == .managed) {
@@ -173,7 +177,7 @@ pub fn executeLakeCatalogAlloc(a: Allocator, binding: catalog_binding.Binding, o
     defer if (journal_store) |*store| store.deinit();
     var journal: ?lake_catalog.rest.Journal = null;
     if (mutation or operation == .resolve) {
-        journal_store = try openNativeArtifactObjectStoreAlloc(a, node, options.secret_store, !mutation);
+        journal_store = try openNativeArtifactObjectStoreFor(a, node, options.secret_store, !mutation, context);
         const authority = try std.json.Stringify.valueAlloc(scratch, .{ .source = binding.source_uri, .catalog = config }, .{});
         const prefix = try std.fmt.allocPrint(scratch, "{s}/lake-catalog/{d}/{d}/{s}", .{ journal_store.?.prefix, options.catalog_table_id, options.catalog_generation, lake_catalog.types.digestHex(authority) });
         journal = .{ .client = journal_store.?.client, .bucket = journal_store.?.bucket, .prefix = prefix };
@@ -253,21 +257,26 @@ pub fn openBindingObjectStoreAlloc(
     binding: catalog_binding.Binding,
     options: BindingObjectStoreOpenOptions,
 ) !object_store_support.OpenedObjectStore {
+    return openBindingObjectStoreFor(alloc, binding, options, .{});
+}
+pub fn openBindingObjectStoreFor(alloc: Allocator, binding: catalog_binding.Binding, options: BindingObjectStoreOpenOptions, context: @import("antfly_local_sources").serverless_query_lake_read_context.Context) !object_store_support.OpenedObjectStore {
+    try context.ensureActive();
     try binding.validate();
     if (binding.format != .parquet and binding.format != .iceberg) return error.UnsupportedRowsQuery;
     if (binding.credential_ref == null) return try object_store_support.OpenedObjectStore.initRemoteUriWithOptions(
         alloc,
         binding.source_uri,
         options.file_bucket,
-        .{ .ensure_bucket = !options.read_only },
+        .{ .ensure_bucket = !options.read_only, .context = context },
     );
-    return try openCredentialedBindingObjectStoreAlloc(alloc, binding, options);
+    return try openCredentialedBindingObjectStoreFor(alloc, binding, options, context);
 }
 
-fn openCredentialedBindingObjectStoreAlloc(
+fn openCredentialedBindingObjectStoreFor(
     alloc: Allocator,
     binding: catalog_binding.Binding,
     options: BindingObjectStoreOpenOptions,
+    context: @import("antfly_local_sources").serverless_query_lake_read_context.Context,
 ) !object_store_support.OpenedObjectStore {
     const credential = binding.credential_ref orelse return error.ExternalLakeCredentialRefRequired;
     const node_config = options.node_config orelse return error.ExternalLakeCredentialRefNotFound;
@@ -286,24 +295,26 @@ fn openCredentialedBindingObjectStoreAlloc(
     return switch (parsed) {
         .s3 => |value| blk: {
             try ensurePrefixAllowed(value.prefix, credential.scope);
-            break :blk try openCredentialedS3PrefixAlloc(
+            break :blk try openCredentialedS3PrefixFor(
                 alloc,
                 options.secret_store,
                 external_io,
                 value.bucket,
                 value.prefix,
                 options.read_only,
+                context,
             );
         },
         .gcs => |value| blk: {
             try ensurePrefixAllowed(value.prefix, credential.scope);
-            break :blk try openCredentialedGcsPrefixAlloc(
+            break :blk try openCredentialedGcsPrefixFor(
                 alloc,
                 options.secret_store,
                 external_io,
                 value.bucket,
                 value.prefix,
                 options.read_only,
+                context,
             );
         },
         .file => |path| blk: {
@@ -318,7 +329,7 @@ fn openCredentialedBindingObjectStoreAlloc(
                 alloc,
                 file_uri,
                 options.file_bucket,
-                .{ .ensure_bucket = !options.read_only },
+                .{ .ensure_bucket = !options.read_only, .context = context },
             );
         },
     };
@@ -332,6 +343,19 @@ fn openCredentialedS3PrefixAlloc(
     prefix: []const u8,
     read_only: bool,
 ) !object_store_support.OpenedObjectStore {
+    return openCredentialedS3PrefixFor(alloc, secret_store, external_io, bucket, prefix, read_only, .{});
+}
+
+fn openCredentialedS3PrefixFor(
+    alloc: Allocator,
+    secret_store: ?*common_secrets.FileStore,
+    external_io: common_config.Config.ExternalIoConnectionConfig,
+    bucket: []const u8,
+    prefix: []const u8,
+    read_only: bool,
+    context: @import("antfly_local_sources").serverless_query_lake_read_context.Context,
+) !object_store_support.OpenedObjectStore {
+    try context.ensureActive();
     if (external_io.protocol != .s3) return error.UnsupportedExternalLakeCredentialRef;
     try ensureBucketAllowed(bucket, external_io.buckets);
     if (external_io.prefix) |allowed| try ensurePrefixAllowed(prefix, allowed);
@@ -362,7 +386,7 @@ fn openCredentialedS3PrefixAlloc(
                 .virtual_hosted => .virtual_hosted,
             },
         },
-        .{ .ensure_bucket = !read_only and resolved.bucket_provisioning == .create_if_missing },
+        .{ .ensure_bucket = !read_only and resolved.bucket_provisioning == .create_if_missing, .context = context },
     );
 }
 
@@ -374,6 +398,19 @@ fn openCredentialedGcsPrefixAlloc(
     prefix: []const u8,
     read_only: bool,
 ) !object_store_support.OpenedObjectStore {
+    return openCredentialedGcsPrefixFor(alloc, secret_store, external_io, bucket, prefix, read_only, .{});
+}
+
+fn openCredentialedGcsPrefixFor(
+    alloc: Allocator,
+    secret_store: ?*common_secrets.FileStore,
+    external_io: common_config.Config.ExternalIoConnectionConfig,
+    bucket: []const u8,
+    prefix: []const u8,
+    read_only: bool,
+    context: @import("antfly_local_sources").serverless_query_lake_read_context.Context,
+) !object_store_support.OpenedObjectStore {
+    try context.ensureActive();
     if (external_io.protocol != .gcs) return error.UnsupportedExternalLakeCredentialRef;
     try ensureBucketAllowed(bucket, external_io.buckets);
     if (external_io.prefix) |allowed| try ensurePrefixAllowed(prefix, allowed);
@@ -391,7 +428,7 @@ fn openCredentialedGcsPrefixAlloc(
         bucket,
         prefix,
         bearer_token,
-        .{ .ensure_bucket = !read_only and resolved.bucket_provisioning == .create_if_missing },
+        .{ .ensure_bucket = !read_only and resolved.bucket_provisioning == .create_if_missing, .context = context },
     );
 }
 

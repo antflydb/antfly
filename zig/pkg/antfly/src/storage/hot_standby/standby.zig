@@ -71,7 +71,7 @@ pub fn validateIdentity(identity: Identity) !void {
 /// the identity a standby was opened with instead of typing it. It does not
 /// validate progress monotonicity; `Standby.open` still does that.
 pub fn readPersistedIdentity(alloc: Allocator, progress_wal_path: [*:0]const u8, options: OpenOptions) !?Identity {
-    var progress_wal = try wal_mod.WAL.open(progress_wal_path, options.progress_wal_options);
+    var progress_wal = try wal_mod.WAL.openWithAllocator(alloc, progress_wal_path, options.progress_wal_options);
     defer progress_wal.close();
     const entries = try progress_wal.iterateFrom(alloc, 1);
     defer {
@@ -201,8 +201,8 @@ pub const Standby = struct {
         const owned_progress_wal_path = try alloc.dupeSentinel(u8, std.mem.span(progress_wal_path), 0);
         var progress_path_owned_locally = true;
         errdefer if (progress_path_owned_locally) alloc.free(owned_progress_wal_path);
-        var receive_log = try replication_log.ReplicationLog.open(owned_receive_log_path.ptr, options.receive_log_options);
-        const progress_wal = wal_mod.WAL.open(owned_progress_wal_path.ptr, options.progress_wal_options) catch |err| {
+        var receive_log = try replication_log.ReplicationLog.openWithAllocator(alloc, owned_receive_log_path.ptr, options.receive_log_options);
+        const progress_wal = wal_mod.WAL.openWithAllocator(alloc, owned_progress_wal_path.ptr, options.progress_wal_options) catch |err| {
             receive_log.close();
             return err;
         };

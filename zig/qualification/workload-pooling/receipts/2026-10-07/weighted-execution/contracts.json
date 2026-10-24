@@ -1,0 +1,34 @@
+{
+  "base_commit": "f9e1e0c37d",
+  "source_sha256": {
+    "zig/pkg/antfly-embedded/src/common/runnable_scheduler.zig": "f1dc5d220a393912334cdb170d40d6a71aae7c3a50845d8a895e6d6991afca34",
+    "zig/lib/runtime/src/runtime_error_abi.zig": "29c895d245253f03acf1f6491393c27efc260ad9a60280729c1b02c397609b65"
+  },
+  "native_core_tests": 15,
+  "linux_core_tests": 15,
+  "native_error_abi_tests": 26,
+  "linux_error_abi_tests": 26,
+  "linux_compiler_image": "sha256:fb3236b6cc7411028d62f76eb418110a6c34e246b9437a9d093d58a53a3e2954",
+  "linux_container_cpus": 2,
+  "linux_container_memory_bytes": 1073741824,
+  "linux_container_memory_swap_bytes": 1073741824,
+  "commands": {
+    "core": "zig test zig/pkg/antfly-embedded/src/common/runnable_scheduler.zig -Osafe --test-filter 'runnable scheduler' --cache-dir <cache>",
+    "error": "zig test zig/lib/runtime/src/runtime_error_abi.zig -Osafe --cache-dir <cache>",
+    "linux_target": "-target aarch64-linux-gnu"
+  },
+  "covered": [
+    "multi-slot execution survives resource/output blocking and class transitions",
+    "yield reacquisition preserves demand and independent retained bytes",
+    "protected control grant remains available beside inference/background demand",
+    "oversized and zero demand reject without leaked entries or bytes",
+    "new demand error detail appends without renumbering and rejects forged behavior codes"
+  ],
+  "pending": [
+    "checked cross-archive execution capsule operations",
+    "inference/backend CPU team demand enforcement",
+    "background execution callers",
+    "full API/production gate of these new core bytes",
+    "automatic default sizing and pressure qualification"
+  ]
+}

@@ -1,0 +1,109 @@
+Build Summary: 56/56 steps succeeded
+install success
++- licenses-antfly-lite success
+|  +- install ../LICENSES/Apache-2.0.txt to share/licenses/antfly-lite/LICENSE success
+|  +- install ../LICENSES/Apache-2.0.txt to share/licenses/antfly-lite/LICENSES/Apache-2.0.txt success
+|  +- install ../THIRD_PARTY_NOTICES.md to share/licenses/antfly-lite/THIRD_PARTY_NOTICES.md success
+|  +- install ../scripts/apache_engine_files.txt to share/licenses/antfly-lite/scripts/apache_engine_files.txt success
+|  +- install ../scripts/source_license_roots.json to share/licenses/antfly-lite/scripts/source_license_roots.json success
+|  +- install ../scripts/embedded_asset_licenses.json to share/licenses/antfly-lite/scripts/embedded_asset_licenses.json success
+|  +- install ../LICENSES/third-party/ success
++- install antfly success
+|  +- compile exe antfly safe native success 6s MaxRSS:1G
+|     +- WriteFile macos-sdk-libc.txt cached
+|     +- WriteFile cached
+|     +- compile obj antfly-build-info safe native cached 28ms MaxRSS:31M
+|     |  +- WriteFile macos-sdk-libc.txt (reused)
+|     |  +- options cached
+|     +- WriteFile cached
+|     +- compile lib antfly-runtime-cli safe native success 1m MaxRSS:3G
+|     |  +- WriteFile macos-sdk-libc.txt (reused)
+|     |  +- options cached
+|     |  +- options cached
+|     |  +- options cached
+|     +- WriteFile cached
+|     +- compile lib antfly-runtime-serverless safe native success 2m MaxRSS:7G
+|     |  +- WriteFile macos-sdk-libc.txt (reused)
+|     |  +- options (reused)
+|     |  +- options (reused)
+|     |  +- options cached
+|     |  +- options cached
+|     |  +- WriteFile tokenizer.json cached
+|     |  +- WriteFile lib/pdf/fonts/roboto/Roboto-Regular.ttf cached
+|     |  +- options cached
+|     |  +- run exe patch_sentencepiece_proto (sentencepiece_proto) cached
+|     |     +- compile exe patch_sentencepiece_proto safe native cached 39ms MaxRSS:31M
+|     |     |  +- WriteFile macos-sdk-libc.txt (reused)
+|     |     +- run exe protoc-zig (sentencepiece_proto_raw) cached
+|     |     |  +- compile exe protoc-zig safe native cached 39ms MaxRSS:31M
+|     |     |     +- WriteFile macos-sdk-libc.txt (reused)
+|     |     +- run exe protoc-zig (sentencepiece_proto_raw) (+1 more reused dependencies)
+|     +- WriteFile cached
+|     +- compile lib antfly-runtime-distributed safe native success 5m MaxRSS:13G
+|     |  +- WriteFile macos-sdk-libc.txt (reused)
+|     |  +- options (reused)
+|     |  +- options (reused)
+|     |  +- options (reused)
+|     |  +- options cached
+|     |  +- options cached
+|     |  +- WriteFile tokenizer.json (reused)
+|     |  +- WriteFile lib/pdf/fonts/roboto/Roboto-Regular.ttf (reused)
+|     |  +- options (reused)
+|     |  +- run exe patch_sentencepiece_proto (sentencepiece_proto) (+3 more reused dependencies)
+|     +- WriteFile cached
+|     +- compile lib antfly-runtime-api_kernel safe native success 5m MaxRSS:12G
+|     |  +- WriteFile macos-sdk-libc.txt (reused)
+|     |  +- options (reused)
+|     |  +- options (reused)
+|     |  +- options (reused)
+|     |  +- options cached
+|     |  +- WriteFile tokenizer.json (reused)
+|     |  +- WriteFile lib/pdf/fonts/roboto/Roboto-Regular.ttf (reused)
+|     |  +- options (reused)
+|     |  +- run exe patch_sentencepiece_proto (sentencepiece_proto) (+3 more reused dependencies)
+|     +- WriteFile cached
+|     +- compile lib antfly-storage-kernel safe native success 11m MaxRSS:16G
+|     |  +- WriteFile macos-sdk-libc.txt (reused)
+|     |  +- options cached
+|     |  +- options (reused)
+|     |  +- options (reused)
+|     |  +- options (reused)
+|     |  +- options cached
+|     |  +- options cached
+|     |  +- WriteFile tokenizer.json (reused)
+|     |  +- WriteFile lib/pdf/fonts/roboto/Roboto-Regular.ttf (reused)
+|     |  +- options (reused)
+|     |  +- run exe patch_sentencepiece_proto (sentencepiece_proto) (+3 more reused dependencies)
+|     +- WriteFile cached
+|     +- compile lib antfly-runtime-enrichment_compute safe native success 27s MaxRSS:1G
+|     |  +- WriteFile macos-sdk-libc.txt (reused)
+|     |  +- options cached
+|     |  +- options (reused)
+|     |  +- options (reused)
+|     |  +- options cached
+|     |  +- WriteFile lib/pdf/fonts/roboto/Roboto-Regular.ttf (reused)
+|     +- WriteFile cached
+|     +- compile lib antfly-runtime-inference safe native success 5m MaxRSS:15G
+|     |  +- WriteFile macos-sdk-libc.txt (reused)
+|     |  +- options cached
+|     |  +- options (reused)
+|     |  +- options (reused)
+|     |  +- options (reused)
+|     |  +- run exe jit-source-identity (metal_identity.zig) cached
+|     |  |  +- compile exe jit-source-identity safe native cached 26ms MaxRSS:31M
+|     |  |     +- WriteFile macos-sdk-libc.txt (reused)
+|     |  +- options cached
+|     |  +- WriteFile tokenizer.json (reused)
+|     |  +- options cached
+|     |  +- options cached
+|     |  +- run exe patch_sentencepiece_proto (sentencepiece_proto) (+3 more reused dependencies)
+|     +- compile obj antfly-build-info safe native (+2 more reused dependencies)
+|     +- compile lib antfly-runtime-cli safe native (+4 more reused dependencies)
+|     +- compile lib antfly-runtime-serverless safe native (+9 more reused dependencies)
+|     +- compile lib antfly-runtime-distributed safe native (+10 more reused dependencies)
+|     +- compile lib antfly-runtime-api_kernel safe native (+9 more reused dependencies)
+|     +- compile lib antfly-storage-kernel safe native (+11 more reused dependencies)
+|     +- compile lib antfly-runtime-enrichment_compute safe native (+6 more reused dependencies)
+|     +- compile lib antfly-runtime-inference safe native (+11 more reused dependencies)
++- install pkg/antfly/antfarm/ success
+

@@ -1,0 +1,9 @@
+info: standalone inference paths models_dir=/tmp/antfly-pooling-qualification-34hi6fyn/models ml_dir=/tmp/antfly-pooling-qualification-34hi6fyn/ml
+info: inference resource policy ownership=external_required process_memory_limit_bytes=2147483648 process_memory_limit_provenance=cgroup_v2
+info: process memory policy operator_source=automatic effective_source=cgroup_v2 configured_limit_bytes=0 effective_limit_bytes=2147483648 managed_hard_limit_bytes=1073741824
+standalone public api listening on http://127.0.0.1:48867
+standalone local metadata enabled (raft disabled)
+info: public create table begin table=table:431898ba1f63b0e160eddfd186cf0b18
+info: public create table metadata done table=table:431898ba1f63b0e160eddfd186cf0b18
+info: public create table wait projected presence table=table:431898ba1f63b0e160eddfd186cf0b18
+info: public create table visible table=table:431898ba1f63b0e160eddfd186cf0b18

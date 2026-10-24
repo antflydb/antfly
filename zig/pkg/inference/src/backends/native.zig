@@ -19,6 +19,13 @@ const linalg = @import("inference_linalg");
 pub const openblas = @import("openblas.zig");
 
 pub fn useBlas() bool {
+    if (linalg.pool.scopedWorkerLimit()) |limit| {
+        // System BLAS has no verified per-call team bound. OpenBLAS exposes
+        // its process team; use native bounded kernels when it cannot fit.
+        if (comptime build_options.enable_system_blas) return false;
+        const threads = openblas.threadLimit() orelse return false;
+        return threads <= limit;
+    }
     return build_options.enable_system_blas or openblas.available();
 }
 
@@ -250,6 +257,21 @@ pub fn sgemmTransBStrided(
             linalg.sgemmTransBSync(1, n, k, alpha, input_row, b, beta, output_row);
         }
     }
+}
+
+test "admitted worker scope selects bounded native backend and preserves beta" {
+    var scope = try linalg.pool.WorkerScope.init(1);
+    defer scope.deinit();
+    // A one-worker scope cannot enter a system BLAS team with an unknown
+    // bound. Optional OpenBLAS is usable only when its measured team fits.
+    if (comptime build_options.enable_system_blas) try std.testing.expect(!useBlas());
+    if (useBlas()) try std.testing.expect((openblas.threadLimit() orelse return error.TestUnexpectedResult) <= 1);
+    const a = [_]f32{ 1, 2, 3, 4 };
+    const b = [_]f32{ 5, 6, 7, 8 };
+    var result = [_]f32{ 1, 1, 1, 1 };
+    try sgemm(std.testing.io, 2, 2, 2, 1, &a, &b, 0.5, &result);
+    const expected = [_]f32{ 19.5, 22.5, 43.5, 50.5 };
+    for (expected, result) |x, y| try std.testing.expectApproxEqAbs(x, y, 1e-5);
 }
 
 test "sgemmTransBStrided preserves padding offsets and beta" {

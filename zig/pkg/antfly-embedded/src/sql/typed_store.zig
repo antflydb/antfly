@@ -20,15 +20,20 @@ const std = @import("std");
 const scalar = @import("scalar.zig");
 const Datum = scalar.Datum;
 const A = std.mem.Allocator;
+const Work = @import("operator_work.zig");
 /// Conservative physical payload estimate before cardinality is known.
 /// Allocation admission still accounts for actual vector/hash capacity growth.
 pub fn retainedCellBytes(value: Datum) !usize {
+    return retainedCellBytesControlled(value, null);
+}
+pub fn retainedCellBytesControlled(value: Datum, control: ?Work.Control) !usize {
+    try Work.poll(control);
     if (fixedCoefficient(value) != null) return 19;
     return 1 +| (if (value.patterns != null) @sizeOf(?*scalar.PatternSet) else @as(usize, 0)) +| switch (value.value) {
         .integer, .float => @as(usize, 8),
         .bool => @as(usize, 1),
         .string, .number_string => |text| @sizeOf([]const u8) +| text.len +| 32,
-        else => try @import("operators.zig").datumBytes(value),
+        else => try @import("operators.zig").datumBytesWithControl(value, control),
     };
 }
 pub fn columnMetadataBytes(width: usize) usize {
@@ -37,55 +42,85 @@ pub fn columnMetadataBytes(width: usize) usize {
 const Dictionary = struct {
     values: std.ArrayList([]const u8) = .empty,
     indices: std.ArrayList(u32) = .empty,
-    lookup: std.StringHashMapUnmanaged(u32) = .empty,
+    lookup: std.AutoHashMapUnmanaged(u64, u32) = .empty,
+    next: std.ArrayList(?u32) = .empty,
     flat: ?std.ArrayList([]const u8) = null,
     const empty: Dictionary = .{};
     fn growthBytes(self: *const Dictionary, additional: usize) usize {
-        if (self.flat != null or additional <= self.lookup.available) return 0;
+        if (self.flat != null) return 0;
+        const links = if (additional <= self.next.capacity - self.next.items.len) 0 else (self.next.items.len +| additional +| 8) *| 2 *| @sizeOf(?u32);
+        if (additional <= self.lookup.available) return links;
         // A hash-table resize allocates the replacement before releasing the
         // old table. Account for that capacity jump rather than one cell's
         // payload, including metadata, keys, values and alignment/header space.
         const entries = self.lookup.count() +| additional;
         const required = entries *| 100 / std.hash_map.default_max_load_percentage +| 1;
         const capacity = std.math.ceilPowerOfTwo(usize, @max(8, required)) catch return std.math.maxInt(usize);
-        return capacity *| (@sizeOf(u8) + @sizeOf([]const u8) + @sizeOf(u32)) +| 64;
+        return links +| capacity *| (@sizeOf(u8) + @sizeOf(u64) + @sizeOf(u32)) +| 64;
     }
     fn deinit(self: *Dictionary, a: A) void {
         self.values.deinit(a);
         self.indices.deinit(a);
         self.lookup.deinit(a);
+        self.next.deinit(a);
         if (self.flat) |*values| values.deinit(a);
     }
-    fn append(self: *Dictionary, a: A, owned: A, value: ?[]const u8) !void {
+    fn append(self: *Dictionary, a: A, owned: A, value: ?[]const u8, control: ?Work.Control) !void {
+        try Work.poll(control);
         // High-cardinality columns revert to flat storage after a bounded
         // sample; dictionary overhead must not penalize unique identifiers.
         if (self.flat == null and self.values.items.len >= 512 and self.values.items.len > self.indices.items.len / 2) {
             var flat: std.ArrayList([]const u8) = .empty;
             errdefer flat.deinit(a);
             try flat.ensureTotalCapacity(a, self.indices.items.len + 1);
-            for (self.indices.items) |index| flat.appendAssumeCapacity(self.values.items[index]);
+            for (self.indices.items) |index| {
+                try Work.poll(control);
+                flat.appendAssumeCapacity(self.values.items[index]);
+            }
             self.values.clearAndFree(a);
             self.indices.clearAndFree(a);
             self.lookup.clearAndFree(a);
+            self.next.clearAndFree(a);
             self.flat = flat;
         }
         if (self.flat) |*values| {
-            try values.append(a, if (value) |bytes| try owned.dupe(u8, bytes) else &.{});
+            try values.append(a, if (value) |bytes| try Work.dupe(u8, owned, bytes, control) else &.{});
             return;
         }
         const text = value orelse {
             try self.indices.append(a, 0);
             return;
         };
-        if (self.lookup.get(text)) |index| {
-            try self.indices.append(a, index);
-            return;
-        }
-        const index = std.math.cast(u32, self.values.items.len) orelse return error.SqlProgramLimitExceeded;
-        const bytes = try owned.dupe(u8, text);
-        try self.values.append(a, bytes);
-        try self.lookup.put(a, bytes, index);
+        const index = try self.intern(a, owned, text, control);
         try self.indices.append(a, index);
+    }
+    fn findHashed(self: *const Dictionary, text: []const u8, hash: u64, control: ?Work.Control) !?u32 {
+        var slot = self.lookup.get(hash);
+        while (slot) |index| {
+            if (try Work.equalBytes(control, self.values.items[index], text)) return index;
+            slot = self.next.items[index];
+        }
+        return null;
+    }
+    fn find(self: *const Dictionary, text: []const u8, control: ?Work.Control) !?u32 {
+        try Work.poll(control);
+        if (self.lookup.count() == 0) return null;
+        return self.findHashed(text, try Work.hashBytes(control, 0, text), control);
+    }
+    fn intern(self: *Dictionary, a: A, owned: A, text: []const u8, control: ?Work.Control) !u32 {
+        const hash = try Work.hashBytes(control, 0, text);
+        if (try self.findHashed(text, hash, control)) |index| return index;
+        const index = std.math.cast(u32, self.values.items.len) orelse return error.SqlProgramLimitExceeded;
+        // All fallible byte work precedes publication. Map growth hashes only
+        // fixed-width integers, never whole retained keys under a callback.
+        try self.values.ensureUnusedCapacity(a, 1);
+        try self.next.ensureUnusedCapacity(a, 1);
+        try self.lookup.ensureUnusedCapacity(a, 1);
+        const bytes = try Work.dupe(u8, owned, text, control);
+        self.values.appendAssumeCapacity(bytes);
+        self.next.appendAssumeCapacity(self.lookup.get(hash));
+        self.lookup.putAssumeCapacity(hash, index);
+        return index;
     }
     fn resizeNulls(self: *Dictionary, a: A, count: usize) !void {
         try self.indices.resize(a, count);
@@ -219,6 +254,7 @@ const JsonCache = struct {
     entries: ?*Entry = null,
     mutex: std.atomic.Mutex = .unlocked,
     admission: ?*std.atomic.Mutex = null,
+    decoding: bool = false,
     const Entry = struct { arena: std.heap.ArenaAllocator, datum: Datum, next: ?*Entry };
     fn deinit(self: *JsonCache) void {
         while (self.entries) |entry| {
@@ -232,30 +268,84 @@ const JsonCache = struct {
         while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
     }
     fn materialize(self: *JsonCache, payload: *JsonPayload, a: A) !Datum {
-        self.lock();
-        const entry = blk: {
-            defer self.mutex.unlock();
-            if (!payload.attempted) {
-                if (self.admission) |gate| while (!gate.tryLock()) std.atomic.spinLoopHint();
-                defer if (self.admission) |gate| gate.unlock();
-                payload.cached = try self.cache(payload.*);
-                payload.attempted = true;
-            }
-            break :blk payload.cached;
+        return self.materializeControlled(payload, a, null);
+    }
+    fn materializeControlled(self: *JsonCache, payload: *JsonPayload, a: A, control: ?Work.Control) !Datum {
+        // Only constant-time metadata is protected by this physical mutex.
+        // Decode may yield. Other readers decline the optional decode token
+        // rather than waiting on a decoder that needs their execution slot.
+        try Work.poll(control);
+        while (!self.mutex.tryLock()) {
+            try Work.poll(control);
+            std.atomic.spinLoopHint();
+        }
+        if (payload.cached) |cached| {
+            self.mutex.unlock();
+            return cached.datum;
+        }
+        if (payload.attempted or self.decoding) {
+            const snapshot = payload.*;
+            self.mutex.unlock();
+            return snapshot.decodeControlled(a, control);
+        }
+        if (self.admission) |gate| if (!gate.tryLock()) {
+            const snapshot = payload.*;
+            self.mutex.unlock();
+            return snapshot.decodeControlled(a, control);
         };
-        if (entry) |cached| return cached.datum;
-        return payload.decode(a);
+        self.decoding = true;
+        self.mutex.unlock();
+        var claimed = true;
+        defer if (claimed) self.endDecodeToken();
+        const candidate = try self.cache(payload.*, control);
+        self.lock();
+        payload.cached = candidate;
+        payload.attempted = true;
+        const snapshot = payload.*;
+        self.mutex.unlock();
+        self.endDecodeToken();
+        claimed = false;
+        if (candidate) |cached| return cached.datum;
+        return snapshot.decodeControlled(a, control);
+    }
+    fn endDecodeToken(self: *JsonCache) void {
+        // Publication/rollback cannot yield or be canceled while holding
+        // metadata. The optional token has no blocking consumer.
+        self.lock();
+        self.decoding = false;
+        self.mutex.unlock();
+        if (self.admission) |gate| gate.unlock();
     }
     fn encoded(self: *JsonCache, payload: *JsonPayload) !?[]const u8 {
         self.lock();
-        defer self.mutex.unlock();
-        if (payload.text) |text| return text;
-        const frozen = payload.frozen orelse return null;
-        if (!frozen.lossless_text) return null;
-        payload.text = try @import("spill.zig").frozenJsonText(self.text_arena.allocator(), frozen);
-        return payload.text;
+        if (payload.text) |text| {
+            self.mutex.unlock();
+            return text;
+        }
+        const frozen = payload.frozen orelse {
+            self.mutex.unlock();
+            return null;
+        };
+        if (!frozen.lossless_text or self.decoding) {
+            self.mutex.unlock();
+            return null;
+        }
+        if (self.admission) |gate| if (!gate.tryLock()) {
+            self.mutex.unlock();
+            return null;
+        };
+        self.decoding = true;
+        self.mutex.unlock();
+        defer self.endDecodeToken();
+        // Encoded text is an optional capability. A busy cache declines it;
+        // callers can use frozen bytes or scalar access without waiting.
+        const text = try @import("spill.zig").frozenJsonText(self.text_arena.allocator(), frozen);
+        self.lock();
+        payload.text = text;
+        self.mutex.unlock();
+        return text;
     }
-    fn cache(self: *JsonCache, payload: JsonPayload) !?*Entry {
+    fn cache(self: *JsonCache, payload: JsonPayload, control: ?Work.Control) !?*Entry {
         // Avoid speculative decoding for a value that cannot plausibly fit.
         const bytes = if (payload.frozen) |v| v.bytes else payload.text.?;
         if (bytes.len > self.budget.limit -| self.budget.live) return null;
@@ -277,7 +367,7 @@ const JsonCache = struct {
             entry.arena.deinit();
             self.budget.allocator().destroy(entry);
         };
-        entry.datum = payload.decode(entry.arena.allocator()) catch |err| {
+        entry.datum = payload.decodeControlled(entry.arena.allocator(), control) catch |err| {
             if (err == error.OutOfMemory and self.budget.exhausted) return null;
             return err;
         };
@@ -294,8 +384,11 @@ const JsonPayload = struct {
     attempted: bool = false,
     shared: ?*Store.SharedJson = null,
     fn decode(self: JsonPayload, a: A) !Datum {
-        if (self.frozen) |value| return @import("spill.zig").materializeFrozenJson(a, value);
-        return Datum.json(try std.json.parseFromSliceLeaky(std.json.Value, a, self.text.?, .{ .parse_numbers = false }));
+        return self.decodeControlled(a, null);
+    }
+    fn decodeControlled(self: JsonPayload, a: A, control: ?Work.Control) !Datum {
+        if (self.frozen) |value| return @import("spill.zig").materializeFrozenJsonControlled(a, value, control);
+        return Datum.json(try @import("controlled_json_text.zig").parseLeaky(a, self.text.?, control));
     }
 };
 const Column = struct {
@@ -336,10 +429,14 @@ const Column = struct {
         return self.nulls.items[row / 64] & (@as(u64, 1) << @as(u6, @intCast(row % 64))) != 0;
     }
     fn cell(self: Column, a: A, row: usize) !Datum {
+        return self.cellControlled(a, row, null);
+    }
+    fn cellControlled(self: Column, a: A, row: usize, control: ?Work.Control) !Datum {
+        try Work.poll(control);
         if (self.isNull(row)) return .{};
         if (self.fixed) |fixed| return fixed.cell(a, row);
         if (self.json_bytes) |bytes| if (bytes.items[row]) |json| {
-            return (if (json.shared) |shared| &shared.cache else self.json_cache.?).materialize(json, a);
+            return (if (json.shared) |shared| &shared.cache else self.json_cache.?).materializeControlled(json, a, control);
         };
         const value: std.json.Value = switch (self.values) {
             .unknown => return error.InvalidSqlBackendResponse,
@@ -352,19 +449,24 @@ const Column = struct {
         };
         return .{ .value = value, .sql_null = false, .patterns = if (self.patterns.items.len == 0) null else self.patterns.items[row], .array = if (self.arrays.items.len == 0) null else self.arrays.items[row], .numeric = if (self.numerics.items.len == 0) null else self.numerics.items[row] };
     }
-    fn appendDictionary(self: *Column, a: A, owned: A, begin: usize, batch: @import("execution_batch.zig").Batch) !bool {
+    fn appendDictionary(self: *Column, a: A, owned: A, begin: usize, batch: @import("execution_batch.zig").Batch, control: ?Work.Control) !bool {
         if (self.fixed != null or self.json_bytes != null or batch != .dictionary or self.patterns.items.len != 0 or self.arrays.items.len != 0 or self.numerics.items.len != 0) return false;
         const source = batch.dictionary;
-        for (source.indices) |id| if (id >= source.values.len) return error.InvalidSqlBackendResponse;
+        for (source.indices) |id| {
+            try Work.poll(control);
+            if (id >= source.values.len) return error.InvalidSqlBackendResponse;
+        }
         const remap = try a.alloc(u32, source.values.len);
         defer a.free(remap);
         @memset(remap, std.math.maxInt(u32));
         for (source.indices) |id| {
+            try Work.poll(control);
             remap[id] = 0;
         }
         var tag: ?std.meta.Tag(std.json.Value) = null;
         var referenced: usize = 0;
         for (source.values, remap) |value, id| {
+            try Work.poll(control);
             if (id == std.math.maxInt(u32)) continue;
             if (value.patterns != null or value.array != null or value.numeric != null) return false;
             if (value.sql_null) continue;
@@ -410,12 +512,16 @@ const Column = struct {
         switch (self.values) {
             inline .integers, .numbers => |*v| {
                 if (!v.encoded) {
-                    for (v.flat.items) |value| try v.encodeOne(a, value);
+                    for (v.flat.items) |value| {
+                        try Work.poll(control);
+                        try v.encodeOne(a, value);
+                    }
                     v.flat.clearAndFree(a);
                     v.encoded = true;
                     v.sampled = true;
                 }
                 for (source.values, remap) |value, *id| {
+                    try Work.poll(control);
                     if (id.* == std.math.maxInt(u32)) continue;
                     id.* = 0;
                     if (value.sql_null) continue;
@@ -428,12 +534,18 @@ const Column = struct {
                     id.* = entry.value_ptr.*;
                 }
                 try v.indices.ensureUnusedCapacity(a, source.indices.len);
-                for (source.indices) |id| v.indices.appendAssumeCapacity(remap[id]);
+                for (source.indices) |id| {
+                    try Work.poll(control);
+                    v.indices.appendAssumeCapacity(remap[id]);
+                }
                 if (v.values.items.len >= 512 and v.values.items.len > v.indices.items.len / 2) {
                     var flat: @TypeOf(v.flat) = .empty;
                     errdefer flat.deinit(a);
                     try flat.ensureTotalCapacity(a, v.indices.items.len);
-                    for (v.indices.items) |id| flat.appendAssumeCapacity(v.values.items[id]);
+                    for (v.indices.items) |id| {
+                        try Work.poll(control);
+                        flat.appendAssumeCapacity(v.values.items[id]);
+                    }
                     v.values.clearAndFree(a);
                     v.indices.clearAndFree(a);
                     v.lookup.clearAndFree(a);
@@ -443,42 +555,44 @@ const Column = struct {
             },
             .strings, .decimals => |*v| {
                 for (source.values, remap) |value, *id| {
+                    try Work.poll(control);
                     if (id.* == std.math.maxInt(u32)) continue;
                     id.* = 0;
                     if (value.sql_null) continue;
                     const text = if (value.value == .string) value.value.string else value.value.number_string;
-                    if (v.lookup.get(text)) |prior| {
-                        id.* = prior;
-                        continue;
-                    }
-                    const bytes = try owned.dupe(u8, text);
-                    id.* = std.math.cast(u32, v.values.items.len) orelse return error.SqlProgramLimitExceeded;
-                    try v.values.append(a, bytes);
-                    try v.lookup.put(a, bytes, id.*);
+                    id.* = try v.intern(a, owned, text, control);
                 }
                 try v.indices.ensureUnusedCapacity(a, source.indices.len);
-                for (source.indices) |id| v.indices.appendAssumeCapacity(remap[id]);
+                for (source.indices) |id| {
+                    try Work.poll(control);
+                    v.indices.appendAssumeCapacity(remap[id]);
+                }
                 if (v.values.items.len >= 512 and v.values.items.len > v.indices.items.len / 2) {
                     var flat: std.ArrayList([]const u8) = .empty;
                     errdefer flat.deinit(a);
                     try flat.ensureTotalCapacity(a, v.indices.items.len);
-                    for (v.indices.items) |id| flat.appendAssumeCapacity(if (v.values.items.len == 0) &.{} else v.values.items[id]);
+                    for (v.indices.items) |id| {
+                        try Work.poll(control);
+                        flat.appendAssumeCapacity(if (v.values.items.len == 0) &.{} else v.values.items[id]);
+                    }
                     v.values.clearAndFree(a);
                     v.indices.clearAndFree(a);
                     v.lookup.clearAndFree(a);
+                    v.next.clearAndFree(a);
                     v.flat = flat;
                 }
             },
             else => unreachable,
         }
         for (source.indices, 0..) |id, offset| {
+            try Work.poll(control);
             const row = begin + offset;
             if (row % 64 == 0) try self.nulls.append(a, 0);
             if (source.values[id].sql_null) self.nulls.items[row / 64] |= @as(u64, 1) << @as(u6, @intCast(row % 64));
         }
         return true;
     }
-    fn appendJson(self: *Column, a: A, owned: A, scratch: A, row: usize, payload: *JsonPayload) !void {
+    fn appendJson(self: *Column, a: A, owned: A, scratch: A, row: usize, payload: *JsonPayload, control: ?Work.Control) !void {
         if (self.json_bytes == null) {
             const values = try a.create(std.ArrayList(?*JsonPayload));
             values.* = .empty;
@@ -486,10 +600,11 @@ const Column = struct {
             try values.resize(a, row);
             @memset(values.items, null);
         }
-        try self.append(a, owned, scratch, row, Datum.json(.null));
+        try self.append(a, owned, scratch, row, Datum.json(.null), control);
         self.json_bytes.?.items[row] = payload;
     }
-    fn append(self: *Column, a: A, owned: A, scratch: A, row: usize, value: Datum) !void {
+    fn append(self: *Column, a: A, owned: A, scratch: A, row: usize, value: Datum, control: ?Work.Control) !void {
+        try Work.poll(control);
         if (self.json_bytes) |bytes| try bytes.append(a, null);
         const coefficient = fixedCoefficient(value);
         if (self.fixed == null and self.json_bytes == null and self.values == .unknown and self.numerics.items.len == 0 and self.arrays.items.len == 0 and self.patterns.items.len == 0 and coefficient != null) {
@@ -530,14 +645,14 @@ const Column = struct {
                 try self.numerics.resize(a, row);
                 @memset(self.numerics.items, null);
             }
-            try self.numerics.append(a, if (value.numeric != null) (try @import("operators.zig").cloneDatum(owned, value)).numeric else null);
+            try self.numerics.append(a, if (value.numeric != null) (try @import("operators.zig").cloneDatumControlled(owned, value, control)).numeric else null);
         }
         if (self.arrays.items.len != 0 or value.array != null) {
             if (self.arrays.items.len == 0) {
                 try self.arrays.resize(a, row);
                 @memset(self.arrays.items, null);
             }
-            try self.arrays.append(a, if (value.array != null) (try @import("operators.zig").cloneDatum(owned, value)).array else null);
+            try self.arrays.append(a, if (value.array != null) (try @import("operators.zig").cloneDatumControlled(owned, value, control)).array else null);
         }
         if (row % 64 == 0) try self.nulls.append(a, 0);
         if (value.sql_null) self.nulls.items[row / 64] |= @as(u64, 1) << @as(u6, @intCast(row % 64));
@@ -600,9 +715,9 @@ const Column = struct {
             .integers => |*v| try v.append(a, if (value.sql_null) 0 else value.value.integer),
             .numbers => |*v| try v.append(a, if (value.sql_null) 0 else value.value.float),
             .booleans => |*v| try v.append(a, !value.sql_null and value.value.bool),
-            .strings => |*v| try v.append(a, owned, if (value.sql_null) null else value.value.string),
-            .decimals => |*v| try v.append(a, owned, if (value.sql_null) null else value.value.number_string),
-            .encoded => |*v| try v.append(a, if (value.sql_null or value.array != null or value.numeric != null) .null else (try @import("operators.zig").cloneDatum(owned, value)).value),
+            .strings => |*v| try v.append(a, owned, if (value.sql_null) null else value.value.string, control),
+            .decimals => |*v| try v.append(a, owned, if (value.sql_null) null else value.value.number_string, control),
+            .encoded => |*v| try v.append(a, if (value.sql_null or value.array != null or value.numeric != null) .null else (try @import("operators.zig").cloneDatumControlled(owned, value, control)).value),
         }
     }
 };
@@ -653,22 +768,22 @@ pub const Store = struct {
             std.debug.assert(self.budget.live == 0);
             a.destroy(self);
         }
-        fn acquire(self: *JsonPool, key: JsonKey, payload: JsonPayload) !*JsonPayload {
-            if (self.bodies.get(key)) |owner| {
+        fn acquire(self: *JsonPool, key: JsonKey, payload: JsonPayload, control: ?Work.Control) !*JsonPayload {
+            if (try jsonGet(&self.bodies, key, control)) |owner| {
                 owner.references += 1;
                 return &owner.payload;
             }
             const a = self.budget.allocator();
             const owner = try a.create(SharedJson);
             errdefer a.destroy(owner);
-            const bytes = try a.dupe(u8, key.bytes);
+            const bytes = try Work.dupe(u8, a, key.bytes, control);
             errdefer a.free(bytes);
             var owned_key = key;
             owned_key.bytes = bytes;
             owner.* = .{ .pool = self, .key = owned_key, .payload = payload, .cache = .{ .budget = .{ .backing = self.cache_budget.allocator(), .limit = JsonCache.limit }, .text_arena = .init(a), .admission = &self.cache_mutex } };
             owner.payload.shared = owner;
             if (payload.frozen != null) owner.payload.frozen.?.bytes = bytes else owner.payload.text = bytes;
-            try self.bodies.put(a, owned_key, owner);
+            _ = try jsonPut(&self.bodies, a, owned_key, owner, control);
             return &owner.payload;
         }
         fn release(self: *JsonPool, payload: *JsonPayload) void {
@@ -699,10 +814,15 @@ pub const Store = struct {
         // Local counters make hash work measurable without global test hooks.
         hashed_bytes: usize = 0,
         generation: usize = 0,
+        /// Synchronous producer-lease borrow. Never copied into retained data.
+        control: ?Work.Control = null,
         const Identity = struct { address: usize, len: usize, representation: u8 };
         const Resolution = struct { key: JsonKey, owned: ?*JsonPayload, estimated: usize = 0 };
         pub fn init(a: A) JsonLease {
-            return .{ .a = @import("memory_budget.zig").reclaimingAllocator(a) };
+            return initControlled(a, null);
+        }
+        pub fn initControlled(a: A, control: ?Work.Control) JsonLease {
+            return .{ .a = @import("memory_budget.zig").reclaimingAllocator(a), .control = control };
         }
         pub fn deinit(self: *JsonLease) void {
             self.identities.deinit(self.a);
@@ -714,14 +834,17 @@ pub const Store = struct {
             while (entries.next()) |entry| entry.owned = null;
         }
         fn resolve(self: *JsonLease, store: *const Store, payload: JsonPayload) !*Resolution {
+            try Work.poll(self.control);
             const bytes = if (payload.frozen) |value| value.bytes else payload.text.?;
             const representation: u8 = if (payload.frozen) |value| (if (value.lossless_text) @as(u8, 3) else 2) else 1;
-            const slot = try self.identities.getOrPut(self.a, .{ .address = @intFromPtr(bytes.ptr), .len = bytes.len, .representation = representation });
-            if (!slot.found_existing) {
-                const key: JsonKey = .{ .representation = representation, .bytes = bytes, .hash = std.hash.Wyhash.hash(representation, bytes) };
-                self.hashed_bytes +|= bytes.len;
-                slot.value_ptr.* = .{ .key = key, .owned = store.json_payloads.get(key) };
-            }
+            const identity: Identity = .{ .address = @intFromPtr(bytes.ptr), .len = bytes.len, .representation = representation };
+            if (self.identities.getPtr(identity)) |existing| return existing;
+            // Finish interruptible work before publishing an initialized memo.
+            const key: JsonKey = .{ .representation = representation, .bytes = bytes, .hash = try Work.hashBytes(self.control, representation, bytes) };
+            self.hashed_bytes +|= bytes.len;
+            const owned = try jsonGet(&store.json_payloads, key, self.control);
+            const slot = try self.identities.getOrPut(self.a, identity);
+            slot.value_ptr.* = .{ .key = key, .owned = owned };
             return slot.value_ptr;
         }
     };
@@ -733,6 +856,39 @@ pub const Store = struct {
             return left.representation == right.representation and std.mem.eql(u8, left.bytes, right.bytes);
         }
     };
+    // Hash-map equality cannot return an error. A failed comparison stops the
+    // probe as a provisional match; callers check the original error before
+    // consuming a value or publishing a key. No adapter escapes this call.
+    const JsonKeyAdapter = struct {
+        control: ?Work.Control,
+        failure: *?anyerror,
+        pub fn hash(_: @This(), key: JsonKey) u64 {
+            return key.hash;
+        }
+        pub fn eql(self: @This(), left: JsonKey, right: JsonKey) bool {
+            if (left.representation != right.representation) return false;
+            return Work.equalBytes(self.control, left.bytes, right.bytes) catch |err| {
+                self.failure.* = err;
+                return true;
+            };
+        }
+    };
+    fn jsonGet(map: anytype, key: JsonKey, control: ?Work.Control) !@TypeOf(map.get(key)) {
+        try Work.poll(control);
+        var failure: ?anyerror = null;
+        const result = map.getAdapted(key, JsonKeyAdapter{ .control = control, .failure = &failure });
+        if (failure) |err| return err;
+        return result;
+    }
+    fn jsonPut(map: anytype, a: A, key: JsonKey, value: anytype, control: ?Work.Control) !bool {
+        try Work.poll(control);
+        var failure: ?anyerror = null;
+        const slot = map.getOrPutAdapted(a, key, JsonKeyAdapter{ .control = control, .failure = &failure }) catch |err| return failure orelse err;
+        if (failure) |err| return err;
+        if (!slot.found_existing) slot.key_ptr.* = key;
+        slot.value_ptr.* = value;
+        return !slot.found_existing;
+    }
     fn ownJson(self: *Store, payload: JsonPayload, lease: *JsonLease) !*JsonPayload {
         const source = if (payload.frozen) |value| value.bytes else payload.text.?;
         const resolved = if (source.len >= 256) try lease.resolve(self, payload) else null;
@@ -740,27 +896,27 @@ pub const Store = struct {
             if (entry.owned) |existing| return existing;
             // A different source address with equal content may have been
             // retained since admission. Cached hashes keep this lookup cheap.
-            if (self.json_payloads.get(entry.key)) |existing| {
+            if (try jsonGet(&self.json_payloads, entry.key, lease.control)) |existing| {
                 entry.owned = existing;
                 return existing;
             }
         }
         if (resolved) |entry| if (self.json_pool) |pool| {
-            const result = try pool.acquire(entry.key, payload);
+            const result = try pool.acquire(entry.key, payload, lease.control);
             errdefer pool.release(result);
-            try self.json_payloads.put(self.a, result.shared.?.key, result);
+            _ = try jsonPut(&self.json_payloads, self.a, result.shared.?.key, result, lease.control);
             entry.owned = result;
             return result;
         };
         const owned = self.arena.allocator();
         const result = try owned.create(JsonPayload);
         result.* = payload;
-        const bytes = try owned.dupe(u8, source);
+        const bytes = try Work.dupe(u8, owned, source, lease.control);
         if (payload.frozen != null) result.frozen.?.bytes = bytes else result.text = bytes;
         if (resolved) |entry| {
             var key = entry.key;
             key.bytes = bytes;
-            try self.json_payloads.put(self.a, key, result);
+            _ = try jsonPut(&self.json_payloads, self.a, key, result, lease.control);
             entry.owned = result;
         }
         return result;
@@ -883,25 +1039,36 @@ pub const Store = struct {
         return .{ .dictionary = .{ .values = try a.realloc(values, used), .indices = indices } };
     }
     pub fn appendBytes(self: *const Store, values: []const Datum) !usize {
+        return self.appendBytesControlled(values, null);
+    }
+    pub fn appendBytesControlled(self: *const Store, values: []const Datum, control: ?Work.Control) !usize {
+        try Work.poll(control);
+        // Estimate retained column storage, not a reconstructed Datum row.
+        // Callers reserve growth headroom separately; the allocator remains
+        // the authority for actual admission, including representation changes.
         var bytes: usize = if (self.initialized) 0 else columnMetadataBytes(values.len);
-        for (values, 0..) |value, column| bytes +|= try self.cellAppendBytes(column, value);
+        for (values, 0..) |value, column| bytes +|= try self.cellAppendBytesControlled(column, value, control);
         return bytes;
     }
     fn cellAppendBytes(self: *const Store, index: usize, value: Datum) !usize {
+        return self.cellAppendBytesControlled(index, value, null);
+    }
+    fn cellAppendBytesControlled(self: *const Store, index: usize, value: Datum, control: ?Work.Control) !usize {
+        try Work.poll(control);
         var bytes: usize = 0;
         var repeated = false;
         if (!value.sql_null and index < self.columns.len) {
             const column = self.columns[index];
             if (column.fixed != null and fixedCoefficient(value) != null) return 19;
             if (column.fixed != null and fixedCoefficient(value) == null) bytes +|= self.len *| 256;
-            if (column.values == .strings and value.value == .string) repeated = column.values.strings.flat == null and column.values.strings.lookup.contains(value.value.string);
-            if (column.values == .decimals and value.value == .number_string) repeated = column.values.decimals.flat == null and column.values.decimals.lookup.contains(value.value.number_string);
+            if (column.values == .strings and value.value == .string) repeated = (try column.values.strings.find(value.value.string, control)) != null;
+            if (column.values == .decimals and value.value == .number_string) repeated = (try column.values.decimals.find(value.value.number_string, control)) != null;
             if (!repeated) {
                 if (column.values == .strings and value.value == .string) bytes +|= column.values.strings.growthBytes(1);
                 if (column.values == .decimals and value.value == .number_string) bytes +|= column.values.decimals.growthBytes(1);
             }
         }
-        bytes +|= if (repeated) @sizeOf(u32) + 1 else try retainedCellBytes(value);
+        bytes +|= if (repeated) @sizeOf(u32) + 1 else try retainedCellBytesControlled(value, control);
         if (repeated and value.patterns != null) bytes +|= @sizeOf(?*scalar.PatternSet);
         return bytes;
     }
@@ -931,6 +1098,7 @@ pub const Store = struct {
         }
         var bytes: usize = 0;
         for (0..batch.width()) |column| for (0..batch.len()) |index| {
+            try Work.poll(lease.control);
             const payload: ?JsonPayload = if (try batch.frozenJson(index, column)) |frozen|
                 .{ .frozen = frozen }
             else if (try batch.encodedJson(index, column)) |text|
@@ -945,18 +1113,17 @@ pub const Store = struct {
                     const resolved = try lease.resolve(self, native);
                     if (resolved.estimated == lease.generation) continue;
                     resolved.estimated = lease.generation;
-                    if (resolved.owned == null) resolved.owned = self.json_payloads.get(resolved.key);
+                    if (resolved.owned == null) resolved.owned = try jsonGet(&self.json_payloads, resolved.key, lease.control);
                     if (resolved.owned != null) continue;
-                    if (self.json_pool) |pool| if (pool.bodies.contains(resolved.key)) continue;
+                    if (self.json_pool) |pool| if (try jsonGet(&pool.bodies, resolved.key, lease.control) != null) continue;
                     const prior_growth = if (self.json_pool) |pool| pool.growthBytes(incoming.count()) else @as(usize, 0);
-                    const entry = try incoming.getOrPut(work, resolved.key);
-                    if (entry.found_existing) continue;
+                    if (!try jsonPut(&incoming, work, resolved.key, {}, lease.control)) continue;
                     if (self.json_pool) |pool| bytes +|= pool.growthBytes(incoming.count()) -| prior_growth;
                 }
                 bytes +|= source.len +| @sizeOf(JsonPayload) +| 64;
             } else {
                 _ = cell_region.reset(.retain_capacity);
-                bytes +|= try self.cellAppendBytes(column, try batch.cell(cell_region.allocator(), index, column));
+                bytes +|= try self.cellAppendBytesControlled(column, try batch.cellControlled(cell_region.allocator(), index, column, lease.control), lease.control);
             }
             // Reject before temporary identity state can outgrow admission.
             if (bytes > maximum) return bytes;
@@ -1041,6 +1208,7 @@ pub const Store = struct {
         var scratch = std.heap.ArenaAllocator.init(self.a);
         defer scratch.deinit();
         for (self.columns, 0..) |*column, ordinal| {
+            try Work.poll(lease.control);
             _ = scratch.reset(.free_all);
             if (column.fixed != null or (column.values == .unknown and column.numerics.items.len == 0 and column.arrays.items.len == 0 and column.patterns.items.len == 0)) {
                 if (try batch.decimalColumnSelected(scratch.allocator(), ordinal, null)) |decimal| {
@@ -1048,35 +1216,40 @@ pub const Store = struct {
                         var coefficient: @import("numeric_value.zig").ScaledInteger = undefined;
                         var number: @import("numeric_value.zig").Value = undefined;
                         const value = try decimal.cell(index, &coefficient, &number);
-                        try column.append(self.a, self.arena.allocator(), scratch.allocator(), self.len + index, value);
+                        try column.append(self.a, self.arena.allocator(), scratch.allocator(), self.len + index, value, lease.control);
                     }
                     continue;
                 }
             }
             if (try batch.dictionaryColumn(scratch.allocator(), ordinal)) |encoded| {
                 if (encoded.len() != batch.len()) return error.InvalidSqlBackendResponse;
-                if (try column.appendDictionary(self.a, self.arena.allocator(), self.len, encoded)) continue;
+                if (try column.appendDictionary(self.a, self.arena.allocator(), self.len, encoded, lease.control)) continue;
             }
             _ = scratch.reset(.free_all);
             for (0..batch.len()) |index| {
+                try Work.poll(lease.control);
                 _ = scratch.reset(.retain_capacity);
                 if (try batch.frozenJson(index, ordinal)) |frozen| {
                     column.json_cache = try self.jsonCache();
-                    try column.appendJson(self.a, self.arena.allocator(), scratch.allocator(), self.len + index, try self.ownJson(.{ .frozen = frozen }, lease));
+                    try column.appendJson(self.a, self.arena.allocator(), scratch.allocator(), self.len + index, try self.ownJson(.{ .frozen = frozen }, lease), lease.control);
                     continue;
                 }
                 if (try batch.encodedJson(index, ordinal)) |bytes| {
                     column.json_cache = try self.jsonCache();
-                    try column.appendJson(self.a, self.arena.allocator(), scratch.allocator(), self.len + index, try self.ownJson(.{ .text = bytes }, lease));
+                    try column.appendJson(self.a, self.arena.allocator(), scratch.allocator(), self.len + index, try self.ownJson(.{ .text = bytes }, lease), lease.control);
                     continue;
                 }
-                const value = try batch.cell(scratch.allocator(), index, ordinal);
-                try column.append(self.a, self.arena.allocator(), scratch.allocator(), self.len + index, value);
+                const value = try batch.cellControlled(scratch.allocator(), index, ordinal, lease.control);
+                try column.append(self.a, self.arena.allocator(), scratch.allocator(), self.len + index, value, lease.control);
             }
         }
         self.len += batch.len();
     }
     pub fn append(self: *Store, values: []const Datum) !usize {
+        return self.appendControlled(values, null);
+    }
+    pub fn appendControlled(self: *Store, values: []const Datum, control: ?Work.Control) !usize {
+        try Work.poll(control);
         if (self.failed or (self.initialized and values.len != self.columns.len)) return error.InvalidSqlBackendResponse;
         errdefer self.failed = true;
         if (!self.initialized) {
@@ -1086,7 +1259,7 @@ pub const Store = struct {
         }
         var scratch = std.heap.ArenaAllocator.init(self.a);
         defer scratch.deinit();
-        for (self.columns, values) |*column, value| try column.append(self.a, self.arena.allocator(), scratch.allocator(), self.len, value);
+        for (self.columns, values) |*column, value| try column.append(self.a, self.arena.allocator(), scratch.allocator(), self.len, value, control);
         const index = self.len;
         self.len += 1;
         return index;
@@ -1101,7 +1274,7 @@ pub const Store = struct {
             const prior_width = self.columns.len;
             self.a.free(self.columns);
             self.columns = wider;
-            for (self.columns[prior_width..]) |*column| for (0..self.len) |index| try column.append(self.a, self.arena.allocator(), self.a, index, .{});
+            for (self.columns[prior_width..]) |*column| for (0..self.len) |index| try column.append(self.a, self.arena.allocator(), self.a, index, .{}, null);
         }
         const padded = try self.a.alloc(Datum, self.columns.len);
         defer self.a.free(padded);
@@ -1129,19 +1302,26 @@ pub const Store = struct {
         return payload.frozen;
     }
     pub fn cellBytes(self: *const Store, a: A, index: usize, column: usize) !usize {
+        return self.cellBytesControlled(a, index, column, null);
+    }
+    pub fn cellBytesControlled(self: *const Store, a: A, index: usize, column: usize, control: ?Work.Control) !usize {
+        try Work.poll(control);
         if (try self.frozenJson(index, column)) |value| return value.bytes.len;
         if (try self.encodedJson(index, column)) |bytes| return bytes.len;
-        return @import("operators.zig").datumBytes(try self.cell(a, index, column));
+        return @import("operators.zig").datumBytesWithControl(try self.cellControlled(a, index, column, control), control);
     }
     pub fn cell(self: *const Store, a: A, index: usize, column: usize) !Datum {
+        return self.cellControlled(a, index, column, null);
+    }
+    pub fn cellControlled(self: *const Store, a: A, index: usize, column: usize, control: ?Work.Control) !Datum {
         if (self.failed or index >= self.len or column >= self.columns.len) return error.InvalidSqlBackendResponse;
         if (self.columns[column].fixed != null) {
             const owner = @constCast(self);
             while (!owner.reader_mutex.tryLock()) std.atomic.spinLoopHint();
             defer owner.reader_mutex.unlock();
-            return self.columns[column].cell(owner.arena.allocator(), index);
+            return self.columns[column].cellControlled(owner.arena.allocator(), index, control);
         }
-        return self.columns[column].cell(a, index);
+        return self.columns[column].cellControlled(a, index, control);
     }
     pub fn row(self: *const Store, a: A, index: usize) ![]const Datum {
         if (self.failed or index >= self.len) return error.InvalidSqlBackendResponse;
@@ -1151,8 +1331,13 @@ pub const Store = struct {
         return result;
     }
     pub fn equal(self: *const Store, a: A, row_index: usize, values: []const Datum, null_equal: bool) !bool {
+        return self.equalControlled(a, row_index, values, null_equal, null);
+    }
+    pub fn equalControlled(self: *const Store, a: A, row_index: usize, values: []const Datum, null_equal: bool, control: ?@import("operator_work.zig").Control) !bool {
+        try @import("operator_work.zig").poll(control);
         if (self.failed or values.len != self.columns.len or row_index >= self.len) return error.InvalidSqlBackendResponse;
         for (values, 0..) |value, column| {
+            try @import("operator_work.zig").poll(control);
             const stored = self.columns[column];
             const is_null = stored.isNull(row_index);
             if (is_null or value.sql_null) {
@@ -1166,7 +1351,7 @@ pub const Store = struct {
                 continue;
             }
             if (value.array != null or value.numeric != null or (stored.arrays.items.len != 0 and stored.arrays.items[row_index] != null) or (stored.numerics.items.len != 0 and stored.numerics.items[row_index] != null)) {
-                if ((try scalar.compareDatums(try stored.cell(a, row_index), value)) != .eq) return false;
+                if ((try scalar.compareDatumsControlled(try stored.cellControlled(a, row_index, control), value, control)) != .eq) return false;
                 continue;
             }
             // Dispatch on the retained physical type, without constructing a
@@ -1175,12 +1360,12 @@ pub const Store = struct {
                 .integers => |v| if (value.value == .integer) v.get(row_index) == value.value.integer else null,
                 .numbers => |v| if (value.value == .float and std.math.isFinite(v.get(row_index)) and std.math.isFinite(value.value.float)) v.get(row_index) == value.value.float else null,
                 .booleans => |v| if (value.value == .bool) v.items[row_index] == value.value.bool else null,
-                .strings => |v| if (value.value == .string) std.mem.eql(u8, v.getText(row_index), value.value.string) else null,
+                .strings => |v| if (value.value == .string) try @import("operator_work.zig").equalBytes(control, v.getText(row_index), value.value.string) else null,
                 else => null,
             };
             if (equal_) |matches| {
                 if (!matches) return false;
-            } else if ((try scalar.compareDatums(try stored.cell(a, row_index), value)) != .eq) return false;
+            } else if ((try scalar.compareDatumsControlled(try stored.cellControlled(a, row_index, control), value, control)) != .eq) return false;
         }
         return true;
     }
@@ -1530,7 +1715,7 @@ const SharedJsonFixture = struct {
         for (0..count) |row| {
             const value = try owned.create(JsonPayload);
             value.* = if (self.frozen) |frozen| .{ .frozen = .{ .bytes = try owned.dupe(u8, frozen.bytes), .lossless_text = frozen.lossless_text } } else .{ .text = try owned.dupe(u8, self.text) };
-            try store.columns[0].appendJson(store.a, owned, owned, row, value);
+            try store.columns[0].appendJson(store.a, owned, owned, row, value, null);
             store.len += 1;
         }
     }
@@ -1753,4 +1938,346 @@ test "native projection refinements benchmark shared JSON lease hash work" {
     try store.appendBatchLeased(batch, &lease);
     try std.testing.expectEqual(text.written().len, lease.hashed_bytes);
     std.debug.print("SHARED_JSON_HASH rows=64 wire={d} before_hash_input={d} after_hash_input={d} unique_payloads={d}\n", .{ text.written().len, 128 * text.written().len, lease.hashed_bytes, store.json_payloads.count() });
+}
+
+test "SQL grouping work retained dictionary collision chains compare full keys cooperatively" {
+    const a = std.testing.allocator;
+    var first: [8192]u8 = @splat('x');
+    var second = first;
+    first[first.len - 1] = 'a';
+    second[second.len - 1] = 'b';
+    var dictionary: Dictionary = .{};
+    defer dictionary.deinit(a);
+    try dictionary.values.appendSlice(a, &.{ &first, &second });
+    try dictionary.next.appendSlice(a, &.{ null, 0 });
+    // Force a raw hash collision to exercise the exact chain, independently
+    // of the hash implementation's resistance to naturally colliding keys.
+    try dictionary.lookup.put(a, 42, 1);
+    const Poll = struct {
+        calls: usize = 0,
+        stop: usize = std.math.maxInt(usize),
+        fn check(raw: ?*anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.calls += 1;
+            if (self.calls == self.stop) return error.OriginalKeyCanceled;
+        }
+        fn control(self: *@This()) Work.Control {
+            return .{ .ptr = self, .checkpoint = check };
+        }
+    };
+    var poll: Poll = .{};
+    try std.testing.expectEqual(@as(?u32, 0), try dictionary.findHashed(&first, 42, poll.control()));
+    try std.testing.expect(poll.calls > 32);
+    poll = .{ .stop = 8 };
+    try std.testing.expectError(error.OriginalKeyCanceled, dictionary.findHashed(&first, 42, poll.control()));
+    try std.testing.expectEqual(@as(usize, 2), dictionary.values.items.len);
+}
+
+const JsonLeasePoll = struct {
+    calls: usize = 0,
+    stop: usize = std.math.maxInt(usize),
+    fn check(raw: ?*anyopaque) !void {
+        const self: *@This() = @ptrCast(@alignCast(raw.?));
+        self.calls += 1;
+        if (self.calls >= self.stop) return error.OriginalJsonLeaseCanceled;
+    }
+    fn control(self: *@This()) Work.Control {
+        return .{ .ptr = self, .checkpoint = check };
+    }
+};
+
+test "SQL native JSON lease cancellation interrupts hashing before memo publication and permits retry" {
+    const a = std.testing.allocator;
+    const text = try a.alloc(u8, 64 * 1024);
+    defer a.free(text);
+    @memset(text, 'x');
+    text[0] = '"';
+    text[text.len - 1] = '"';
+    const Source = struct {
+        text: []const u8,
+        fn json(raw: *anyopaque, _: usize, _: usize) !?[]const u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            return self.text;
+        }
+        fn cell(_: *anyopaque, _: A, _: usize, _: usize) !Datum {
+            return error.UnexpectedScalarMaterialization;
+        }
+    };
+    var source: Source = .{ .text = text };
+    const batch: @import("execution_batch.zig").Batch = .{ .reader = .{ .ptr = &source, .read = Source.cell, .read_json = Source.json, .count = 2, .width = 1 } };
+    var store = Store.init(a);
+    defer store.deinit();
+    var poll: JsonLeasePoll = .{ .stop = 6 };
+    var lease = Store.JsonLease.initControlled(a, poll.control());
+    defer lease.deinit();
+    try std.testing.expectError(error.OriginalJsonLeaseCanceled, store.batchAppendBytesLeased(a, batch, std.math.maxInt(usize), &lease));
+    try std.testing.expectEqual(@as(usize, 0), lease.identities.count());
+    try std.testing.expectEqual(@as(usize, 0), store.len);
+    poll = .{};
+    _ = try store.batchAppendBytesLeased(a, batch, std.math.maxInt(usize), &lease);
+    try std.testing.expectEqual(text.len, lease.hashed_bytes);
+    try std.testing.expectEqual(@as(usize, 1), lease.identities.count());
+    try store.appendBatchLeased(batch, &lease);
+    try std.testing.expectEqual(@as(usize, 2), store.len);
+    try std.testing.expectEqual(text.len, lease.hashed_bytes);
+    // Retained state borrows no work authority after the synchronous lease.
+    poll.stop = 1;
+    try std.testing.expectEqualStrings(text, (try store.encodedJson(1, 0)).?);
+}
+
+test "SQL native JSON lease content collisions preserve cancellation and do not publish provisional matches" {
+    const a = std.testing.allocator;
+    var left: [16 * 1024]u8 = @splat('x');
+    var right = left;
+    right[right.len - 1] = 'y';
+    const original: Store.JsonKey = .{ .representation = 1, .hash = 42, .bytes = &left };
+    const collision: Store.JsonKey = .{ .representation = 1, .hash = 42, .bytes = &right };
+    var map: std.HashMapUnmanaged(Store.JsonKey, u32, Store.JsonKeyContext, 80) = .empty;
+    defer map.deinit(a);
+    _ = try Store.jsonPut(&map, a, original, @as(u32, 7), null);
+    var poll: JsonLeasePoll = .{ .stop = 8 };
+    try std.testing.expectError(error.OriginalJsonLeaseCanceled, Store.jsonGet(&map, collision, poll.control()));
+    poll = .{ .stop = 8 };
+    try std.testing.expectError(error.OriginalJsonLeaseCanceled, Store.jsonPut(&map, a, collision, @as(u32, 9), poll.control()));
+    try std.testing.expectEqual(@as(usize, 1), map.count());
+    try std.testing.expectEqual(@as(?u32, 7), map.get(original));
+    poll = .{};
+    try std.testing.expectEqual(@as(?u32, null), try Store.jsonGet(&map, collision, poll.control()));
+    try std.testing.expect(try Store.jsonPut(&map, a, collision, @as(u32, 9), poll.control()));
+    try std.testing.expectEqual(@as(usize, 2), map.count());
+}
+
+test "SQL native JSON lease interrupted pooled copy releases all unpublished ownership" {
+    const a = std.testing.allocator;
+    const pool = try Store.JsonPool.create(a);
+    defer pool.deinit();
+    var text: [16 * 1024]u8 = @splat('x');
+    const key: Store.JsonKey = .{ .representation = 1, .hash = std.hash.Wyhash.hash(1, &text), .bytes = &text };
+    var poll: JsonLeasePoll = .{ .stop = 4 };
+    try std.testing.expectError(error.OriginalJsonLeaseCanceled, pool.acquire(key, .{ .text = &text }, poll.control()));
+    try std.testing.expectEqual(@as(usize, 0), pool.bodies.count());
+    try std.testing.expectEqual(@as(usize, 0), pool.budget.live);
+    poll = .{};
+    const payload = try pool.acquire(key, .{ .text = &text }, poll.control());
+    try std.testing.expectEqualStrings(&text, payload.text.?);
+    pool.release(payload);
+}
+
+test "SQL consumer JSON decoding cancels text refills rolls back cache and retries with a new owner" {
+    const a = std.testing.allocator;
+    const text = try a.alloc(u8, 96 * 1024);
+    defer a.free(text);
+    @memset(text, 'x');
+    text[0] = '"';
+    text[text.len - 1] = '"';
+    var source: SharedJsonFixture = .{ .text = text };
+    var store = Store.init(a);
+    defer store.deinit();
+    try source.populate(&store, 1, false);
+    var first: JsonLeasePoll = .{ .stop = 12 };
+    var scratch = std.heap.ArenaAllocator.init(a);
+    defer scratch.deinit();
+    try std.testing.expectError(error.OriginalJsonLeaseCanceled, store.cellControlled(scratch.allocator(), 0, 0, first.control()));
+    try std.testing.expectEqual(@as(usize, 0), store.json_cache.?.budget.live);
+    var second: JsonLeasePoll = .{};
+    const value = try store.cellControlled(scratch.allocator(), 0, 0, second.control());
+    try std.testing.expectEqualStrings(text[1 .. text.len - 1], value.value.string);
+    const old_calls = first.calls;
+    const current_calls = second.calls;
+    // A cached read belongs to this new consumer, not the canceled producer.
+    const again = try store.cellControlled(scratch.allocator(), 0, 0, second.control());
+    try std.testing.expectEqualStrings(value.value.string, again.value.string);
+    try std.testing.expectEqual(old_calls, first.calls);
+    try std.testing.expect(second.calls > current_calls);
+}
+
+test "SQL consumer JSON decoding cancels frozen byte copies and preserves native scalar tags on retry" {
+    const a = std.testing.allocator;
+    var source_arena = std.heap.ArenaAllocator.init(a);
+    defer source_arena.deinit();
+    const sa = source_arena.allocator();
+    const large = try sa.alloc(u8, 64 * 1024);
+    @memset(large, 'x');
+    var object: std.json.ObjectMap = .empty;
+    try object.put(sa, "body", .{ .string = large });
+    try object.put(sa, "integer", .{ .integer = 9007199254740993 });
+    try object.put(sa, "float", .{ .float = 1.25 });
+    try object.put(sa, "lexeme", .{ .number_string = "2.00" });
+    const spill = @import("spill.zig");
+    const wire = try spill.encodeColumnarBlockVersionAlloc(sa, &.{.{ .values = &.{Datum.json(.{ .object = object })}, .keys = &.{}, .ordinal = 0 }}, 1 << 20, .v2);
+    const block = try spill.decodeColumnarBlockForForwarding(sa, a, wire, 1 << 20);
+    defer block.deinit();
+    var source: SharedJsonFixture = .{ .text = "", .frozen = (try block.frozenJson(0, 0, false)).? };
+    var store = Store.init(a);
+    defer store.deinit();
+    try source.populate(&store, 1, false);
+    var poll: JsonLeasePoll = .{ .stop = 12 };
+    var scratch = std.heap.ArenaAllocator.init(a);
+    defer scratch.deinit();
+    try std.testing.expectError(error.OriginalJsonLeaseCanceled, store.cellControlled(scratch.allocator(), 0, 0, poll.control()));
+    try std.testing.expectEqual(@as(usize, 0), store.json_cache.?.budget.live);
+    poll = .{};
+    const result = (try store.cellControlled(scratch.allocator(), 0, 0, poll.control())).value.object;
+    try std.testing.expectEqualStrings(large, result.get("body").?.string);
+    try std.testing.expectEqual(@as(i64, 9007199254740993), result.get("integer").?.integer);
+    try std.testing.expectEqual(@as(f64, 1.25), result.get("float").?.float);
+    try std.testing.expectEqualStrings("2.00", result.get("lexeme").?.number_string);
+}
+
+test "SQL consumer JSON cache mutex waits preserve the caller error and another owners lock" {
+    const a = std.testing.allocator;
+    var source: SharedJsonFixture = .{ .text = "{\"x\":1}" };
+    var store = Store.init(a);
+    defer store.deinit();
+    try source.populate(&store, 1, false);
+    const cache = store.json_cache.?;
+    try std.testing.expect(cache.mutex.tryLock());
+    var locked = true;
+    defer if (locked) cache.mutex.unlock();
+    var poll: JsonLeasePoll = .{ .stop = 6 };
+    var scratch = std.heap.ArenaAllocator.init(a);
+    defer scratch.deinit();
+    try std.testing.expectError(error.OriginalJsonLeaseCanceled, store.cellControlled(scratch.allocator(), 0, 0, poll.control()));
+    try std.testing.expect(!cache.mutex.tryLock());
+    cache.mutex.unlock();
+    locked = false;
+    poll = .{};
+    try std.testing.expectEqualStrings("1", (try store.cellControlled(scratch.allocator(), 0, 0, poll.control())).value.object.get("x").?.number_string);
+}
+
+test "SQL consumer JSON busy cache token permits reentrant scratch progress without physical mutex ownership" {
+    const a = std.testing.allocator;
+    const pool = try Store.JsonPool.create(a);
+    defer pool.deinit();
+    const text = try a.alloc(u8, 16 * 1024);
+    defer a.free(text);
+    @memset(text, 'x');
+    text[0] = '"';
+    text[text.len - 1] = '"';
+    var source: SharedJsonFixture = .{ .text = text };
+    var first = Store.init(a);
+    first.json_pool = pool;
+    defer first.deinit();
+    try source.populate(&first, 1, false);
+    text[1] = 'y';
+    var second = Store.init(a);
+    second.json_pool = pool;
+    defer second.deinit();
+    try source.populate(&second, 1, false);
+    const cache = &first.columns[0].json_bytes.?.items[0].?.shared.?.cache;
+    const Fixture = struct {
+        first_cache: *JsonCache,
+        other: *Store,
+        nested: bool = false,
+        fn check(raw: ?*anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            // A checkpoint is never called with the physical cache lock held.
+            try std.testing.expect(self.first_cache.mutex.tryLock());
+            const decoding = self.first_cache.decoding;
+            self.first_cache.mutex.unlock();
+            if (decoding and !self.nested) {
+                self.nested = true;
+                var scratch = std.heap.ArenaAllocator.init(std.testing.allocator);
+                defer scratch.deinit();
+                var poll: JsonLeasePoll = .{};
+                const result = try self.other.cellControlled(scratch.allocator(), 0, 0, poll.control());
+                try std.testing.expectEqual(@as(u8, 'y'), result.value.string[0]);
+            }
+        }
+    };
+    var fixture: Fixture = .{ .first_cache = cache, .other = &second };
+    var scratch = std.heap.ArenaAllocator.init(a);
+    defer scratch.deinit();
+    const result = try first.cellControlled(scratch.allocator(), 0, 0, .{ .ptr = &fixture, .checkpoint = Fixture.check });
+    try std.testing.expect(fixture.nested);
+    try std.testing.expectEqual(@as(u8, 'x'), result.value.string[0]);
+}
+
+test "SQL consumer JSON projected selected native columns use the current reader without retaining its authority" {
+    const a = std.testing.allocator;
+    var source: SharedJsonFixture = .{ .text = "{\"x\":[9007199254740993,1.25]}" };
+    var store = Store.init(a);
+    defer store.deinit();
+    try source.populate(&store, 2, false);
+    var scratch = std.heap.ArenaAllocator.init(a);
+    defer scratch.deinit();
+    const sa = scratch.allocator();
+    const Batch = @import("execution_batch.zig").Batch;
+    const retained: Batch = .{ .retained = .{ .store = &store, .count = 2 } };
+    const projected = try retained.project(sa, 0);
+    const selected = try projected.select(sa, &.{1});
+    const page: @import("catalog.zig").ColumnPage = .{ .native = .{ .values = &selected, .names = &.{"payload"} }, .selection = &.{0} };
+    var canceled: JsonLeasePoll = .{ .stop = 8 };
+    try std.testing.expectError(error.OriginalJsonLeaseCanceled, page.cellControlled(sa, 0, "payload", canceled.control()));
+    var reader: JsonLeasePoll = .{};
+    const result = try page.cellControlled(sa, 0, "payload", reader.control());
+    try std.testing.expectEqualStrings("9007199254740993", result.value.object.get("x").?.array.items[0].number_string);
+    const stopped_calls = canceled.calls;
+    _ = try selected.cellControlled(sa, 0, 0, reader.control());
+    try std.testing.expectEqual(stopped_calls, canceled.calls);
+    try std.testing.expect(reader.calls > 0);
+}
+
+test "SQL consumer JSON representation capabilities do not bypass an opaque readers precise error" {
+    const Fixture = struct {
+        fn cell(_: *anyopaque, _: A, _: usize, _: usize) !Datum {
+            return error.OriginalRowPolicyRejected;
+        }
+        fn json(_: *anyopaque, _: usize, _: usize) !?[]const u8 {
+            return "{\"x\":1}";
+        }
+    };
+    var raw: u8 = 0;
+    const batch: @import("execution_batch.zig").Batch = .{ .reader = .{ .ptr = &raw, .read = Fixture.cell, .read_json = Fixture.json, .count = 1, .width = 1 } };
+    var poll: JsonLeasePoll = .{};
+    try std.testing.expectError(error.OriginalRowPolicyRejected, batch.cellControlled(std.testing.allocator, 0, 0, poll.control()));
+}
+
+test "SQL consumer JSON streaming matches complete input escapes exact numbers and validation errors" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const sa = arena.allocator();
+    const prefix = "{\"body\":\"";
+    const suffix = "\\uD83D\\uDE80\",\"n\":9007199254740993,\"a\":[null,true,1.25,\"λ\"]}";
+    const text = try sa.alloc(u8, 4093 + suffix.len);
+    @memcpy(text[0..prefix.len], prefix);
+    @memset(text[prefix.len..4093], 'x');
+    @memcpy(text[4093..], suffix);
+    const expected = try std.json.parseFromSliceLeaky(std.json.Value, sa, text, .{ .parse_numbers = false });
+    var poll: JsonLeasePoll = .{};
+    const actual = try @import("controlled_json_text.zig").parseLeaky(sa, text, poll.control());
+    // The DOM must own tokens even when a refill reuses the scanner's buffer.
+    @memset(text, '?');
+    try std.testing.expectEqualStrings(try std.json.Stringify.valueAlloc(sa, expected, .{}), try std.json.Stringify.valueAlloc(sa, actual, .{}));
+    for ([_][]const u8{ "{\"x\":1} garbage", "{\"x\":1,\"x\":2}", "\"unterminated", "\"\\uD800\"" }) |bad| {
+        const wanted = error_case: {
+            _ = std.json.parseFromSliceLeaky(std.json.Value, sa, bad, .{ .parse_numbers = false }) catch |err| break :error_case err;
+            return error.TestExpectedError;
+        };
+        try std.testing.expectError(wanted, @import("controlled_json_text.zig").parseLeaky(sa, bad, poll.control()));
+    }
+}
+
+test "SQL consumer JSON controlled cache and scanner unwind every allocation failure" {
+    const Fixture = struct {
+        fn run(a: A) !void {
+            const text = try a.alloc(u8, 8192);
+            defer a.free(text);
+            @memset(text, 'x');
+            text[0] = '"';
+            text[text.len - 1] = '"';
+            var source: SharedJsonFixture = .{ .text = text };
+            var store = Store.init(a);
+            defer store.deinit();
+            try source.populate(&store, 1, false);
+            var scratch = std.heap.ArenaAllocator.init(a);
+            defer scratch.deinit();
+            var poll: JsonLeasePoll = .{};
+            const value = try store.cellControlled(scratch.allocator(), 0, 0, poll.control());
+            try std.testing.expectEqualStrings(text[1 .. text.len - 1], value.value.string);
+        }
+    };
+    try Fixture.run(std.testing.allocator);
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{});
 }

@@ -94,6 +94,15 @@ class LiteralSourceOwnership(unittest.TestCase):
                     measurement.literal_import_path(catalog, local / relative)
                 )
 
+    def test_intent_collection_root_owns_storage_without_complete_db(self):
+        root = (
+            measurement.ZIG_ROOT
+            / "pkg/antfly-embedded/src/intent_collection_controls_test_root.zig"
+        )
+        physical_db = measurement.ZIG_ROOT / "pkg/antfly-embedded/src/storage/db/db.zig"
+        self.assertTrue(root.is_file())
+        self.assertIsNone(measurement.literal_import_path(root, physical_db))
+
     def test_control_roots_have_no_physical_implementation_import_path(self):
         source = measurement.ZIG_ROOT / "pkg/antfly/src"
         physical_db = measurement.ZIG_ROOT / "pkg/antfly-embedded/src/storage/db/db.zig"
@@ -116,6 +125,10 @@ class LiteralSourceOwnership(unittest.TestCase):
             "api_table_reads_test_root.zig",
             "api_table_writes_test_root.zig",
             "data_runtime_test_root.zig",
+            "participant_fanout_control_test_root.zig",
+            "ha_table_request_admission_test_root.zig",
+            "ha_operation_admission_test_root.zig",
+            "relational_source_contract_test_root.zig",
         ]
         for name in roots:
             with self.subTest(root=name):

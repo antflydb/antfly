@@ -1,0 +1,77 @@
+antfly-inference-worker-rpc-test
++- run test inference-worker-rpc-contract-tests w
+[default] (warn): inference worker transport closed err=InvalidWorkerFrame
+[default] (warn): inference worker transport closed err=InvalidWorkerFrame
+[default] (warn): inference worker transport closed err=InvalidResourceFrame
+[default] (warn): inference worker transport closed err=ResourceCallbackCapacity
+failed command: /cache/o/53fd9376c8f387203a3212a2faf2c53e/inference-worker-rpc-contract-tests --cache-dir=/cache --seed=0x8203a092 --listen=-
+
+antfly-inference-worker-owner-handoff-test
++- run test inference-worker-owner-handoff-tests w
+REAL_SINK transport=h1 cancel=false start
+REAL_SINK await backpressure
+REAL_SINK output status=timeout begins=5 ends=5
+REAL_SINK await peer EOF
+REAL_SINK transport=h1 cancel=true start
+REAL_SINK await backpressure
+REAL_SINK output status=canceled begins=5 ends=5
+REAL_SINK await peer EOF
+REAL_SINK transport=h2 cancel=false start
+REAL_SINK await backpressure
+REAL_SINK output status=timeout begins=168 ends=168
+REAL_SINK await peer EOF
+REAL_SINK transport=h2 cancel=true start
+REAL_SINK await backpressure
+REAL_SINK output status=canceled begins=164 ends=164
+REAL_SINK await peer EOF
+failed command: /cache/o/a31c2e5f2af68f35b39be3b51f82f040/inference-worker-owner-handoff-tests --cache-dir=/cache --seed=0x8203a092 --listen=-
+
+antfly-inference-worker-process-output-test
++- run test inference-worker-process-output-tests w
+PROCESS_SINK transport=h1 cancel=false start
+PROCESS_SINK await backpressure
+PROCESS_RPC cause=error.Timeout fenced=true reaped=true held=true
+PROCESS_SINK output status=timeout begins=11 ends=11
+PROCESS_SINK await peer EOF
+PROCESS_SINK transport=h1 cancel=true start
+PROCESS_SINK await backpressure
+PROCESS_RPC cause=error.Canceled fenced=true reaped=true held=true
+PROCESS_SINK output status=canceled begins=11 ends=11
+PROCESS_SINK await peer EOF
+PROCESS_SINK transport=h2 cancel=false start
+PROCESS_SINK await backpressure
+PROCESS_RPC cause=error.Timeout fenced=true reaped=true held=true
+PROCESS_SINK output status=timeout begins=168 ends=168
+PROCESS_SINK await peer EOF
+PROCESS_SINK transport=h2 cancel=true start
+PROCESS_SINK await backpressure
+PROCESS_RPC cause=error.Canceled fenced=true reaped=true held=true
+PROCESS_SINK output status=canceled begins=164 ends=164
+PROCESS_SINK await peer EOF
+failed command: cd /cache/o/68da6a99ed24f396648d4f03166bef90 && HOSTNAME=7c73bfbdf296 ANTFLY_TEST_WORKER_OUTPUT_FIXTURE=./inference-worker-output-fixture /cache/o/0329df9ebf66e43cc2f1bba560f4d0c6/inference-worker-process-output-tests --cache-dir=/cache --seed=0x8203a092 --listen=-
+
+antfly-http-cleanup-owner-test
++- run test http-cleanup-owner-tests w
+H2 stream handler error: error.DeadlineExceeded
+failed command: /cache/o/5c13b3858227e921b74242e84efed0eb/http-cleanup-owner-tests --cache-dir=/cache --seed=0x8203a092 --listen=-
+
+Build Summary: 18/18 steps succeeded; 55/55 tests passed
+antfly-inference-worker-rpc-test success
++- run test inference-worker-rpc-contract-tests 26 pass (26 total) 495ms MaxRSS:271M
+|  +- compile test inference-worker-rpc-contract-tests safe aarch64-linux-gnu success 9s MaxRSS:447M
++- run test 6 pass (6 total) 7ms MaxRSS:21M
+   +- compile test safe aarch64-linux-gnu success 10s MaxRSS:470M
+antfly-inference-owner-handoff-test success
++- run test inference-owner-handoff-tests 18 pass (18 total) 3ms MaxRSS:21M
+   +- compile test inference-owner-handoff-tests safe aarch64-linux-gnu success 11s MaxRSS:661M
+antfly-inference-worker-owner-handoff-test success
++- run test inference-worker-owner-handoff-tests 2 pass (2 total) 1s MaxRSS:21M
+   +- compile test inference-worker-owner-handoff-tests safe aarch64-linux-gnu success 12s MaxRSS:701M
+antfly-inference-worker-process-output-test success
++- run test inference-worker-process-output-tests 1 pass (1 total) 1s MaxRSS:21M
+   +- compile test inference-worker-process-output-tests safe aarch64-linux-gnu success 13s MaxRSS:689M
+   +- compile exe inference-worker-output-fixture safe aarch64-linux-gnu success 7s MaxRSS:394M
+antfly-http-cleanup-owner-test success
++- run test http-cleanup-owner-tests 2 pass (2 total) 257ms MaxRSS:21M
+   +- compile test http-cleanup-owner-tests safe aarch64-linux-gnu success 13s MaxRSS:737M
+

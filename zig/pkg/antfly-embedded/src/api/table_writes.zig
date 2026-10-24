@@ -27,6 +27,7 @@ pub const backend_types = @import("../storage/backend_types.zig");
 pub const portable_backup = @import("../storage/portable_backup.zig");
 pub const table_catalog = @import("routing_budget.zig");
 pub const table_write_source = @import("table_write_source.zig");
+const runnable_abi = @import("antfly_runtime_abi").runnable_abi;
 pub const table_index_config = @import("table_index_config.zig");
 pub const tables_api = @import("tables.zig");
 pub const runtime_status = @import("runtime_status.zig");
@@ -67,16 +68,7 @@ pub fn repairNativeRestoreProjectionsUntilCompleteWithIo(
 }
 
 pub const TableWriteSource = table_write_source.TableWriteSource;
-pub fn ensurePreDecisionContextActive(context: distributed_txn.PreDecisionContext) !void {
-    try context.cancellation.check();
-    if (context.deadline_ns) |deadline_ns| {
-        // This check is deliberately adjacent to mutation admission. Keep its
-        // error distinct from generic storage and transport deadlines so only
-        // this proven pre-proposal outcome may authorize replica failover.
-        const now_ns = (table_catalog.RoutingBudget{ .io = context.deadline_io }).nowNs();
-        if (now_ns >= deadline_ns) return error.PreDecisionDeadlineExceeded;
-    }
-}
+pub const ensurePreDecisionContextActive = @import("mutation_admission_controls.zig").checkPreDecision;
 
 pub const BoundTableWriteSource = struct {
     table_name: []const u8,
@@ -118,8 +110,12 @@ pub const BoundTableWriteSource = struct {
                 .commit_transaction_with_cancellation = commitTransactionWithCancellation,
                 .commit_batch = commitBatch,
                 .commit_batch_with_cancellation = commitBatchWithCancellation,
+                .commit_batch_with_execution = commitBatchWithExecution,
+                .commit_batch_with_control = commitBatchWithControl,
                 .commit_transaction_with_id = commitTransactionWithId,
                 .commit_transaction_with_id_with_cancellation = commitTransactionWithIdAndCancellation,
+                .commit_transaction_with_id_with_execution = commitTransactionWithIdAndExecution,
+                .commit_transaction_with_id_with_control = commitTransactionWithIdAndControl,
                 .acknowledge_transaction_commit = acknowledgeTransactionCommit,
                 .batch = batch,
                 .begin_bulk_ingest = beginBulkIngest,
@@ -132,6 +128,7 @@ pub const BoundTableWriteSource = struct {
                 .txn_prepare_group_local_with_pre_decision_context = txnPrepareGroupLocalWithPreDecisionContext,
                 .txn_resolve_group_local = txnResolveGroupLocal,
                 .txn_resolve_group_local_with_cancellation = txnResolveGroupLocalWithCancellation,
+                .txn_resolve_group_local_with_execution = txnResolveGroupLocalWithExecution,
                 .txn_status_group_local = txnStatusGroupLocal,
                 .txn_acknowledge_group_local = txnAcknowledgeGroupLocal,
                 .corrupt_embedding_artifact = corruptEmbeddingArtifact,
@@ -532,6 +529,13 @@ pub const BoundTableWriteSource = struct {
         const db_path = try alloc.dupe(u8, db.core.path);
         defer alloc.free(db_path);
         const primary_backend = db.primary_backend;
+        // The retained runtime's IO and storage states still charge this
+        // manager. Transfer both owners across close/reopen, including recovery;
+        // on failure join the runtime before releasing its memory authority.
+        const resource_manager = db.core.index_manager.resource_manager;
+        var owned_resource_manager = db.owned_resource_manager;
+        db.owned_resource_manager = null;
+        errdefer if (owned_resource_manager) |manager| manager.releaseOwned(alloc);
         var owned_backend_runtime = db.owned_backend_runtime;
         db.owned_backend_runtime = null;
         errdefer if (owned_backend_runtime) |*runtime| runtime.deinit();
@@ -561,6 +565,8 @@ pub const BoundTableWriteSource = struct {
             effective_recovery_open_options.identity_namespace = identity_namespace;
             effective_restored_open_options = try resolved.optionsForTarget(db_path);
         }
+        effective_recovery_open_options.resource_manager = resource_manager;
+        effective_restored_open_options.resource_manager = resource_manager;
         const publication_outcome = restoreBoundTableGeneration(
             alloc,
             snapshot_root,
@@ -578,6 +584,8 @@ pub const BoundTableWriteSource = struct {
             };
             self.db.owned_backend_runtime = owned_backend_runtime;
             owned_backend_runtime = null;
+            self.db.owned_resource_manager = owned_resource_manager;
+            owned_resource_manager = null;
             return restore_err;
         };
         self.db.* = db_mod.DB.open(alloc, db_path, effective_restored_open_options) catch |reopen_err| {
@@ -586,6 +594,8 @@ pub const BoundTableWriteSource = struct {
         };
         self.db.owned_backend_runtime = owned_backend_runtime;
         owned_backend_runtime = null;
+        self.db.owned_resource_manager = owned_resource_manager;
+        owned_resource_manager = null;
         if (publication_outcome == .durability_uncertain) return error.GenerationDurabilityUncertain;
     }
 
@@ -724,6 +734,21 @@ pub const BoundTableWriteSource = struct {
         sync_level: db_mod.types.SyncLevel,
         cancellation: db_mod.types.CancellationToken,
     ) !?distributed_txn.CommitOutcome {
+        return commitBatchWithPreDecisionContext(ptr, alloc, tables, sync_level, cancellation, .{}, null);
+    }
+
+    fn commitBatchWithPreDecisionContext(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        tables: []const distributed_txn.TableCommitRequest,
+        sync_level: db_mod.types.SyncLevel,
+        cancellation: db_mod.types.CancellationToken,
+        pre_decision: distributed_txn.PreDecisionContext,
+        borrow: ?runnable_abi.Borrowed,
+    ) !?distributed_txn.CommitOutcome {
+        try ensurePreDecisionContextActive(pre_decision);
+        if (pre_decision.route_fence != null) return error.CatalogRouteFenceUnsupported;
+        if (pre_decision.restore_staging_scope != null or pre_decision.restore_staging_plan_id != null) return error.UnsupportedOperation;
         if (tables.len == 1 and tables[0].predicates.len == 0 and tables[0].relational_index_maintenance == null) {
             const table = tables[0];
             const self: *BoundTableWriteSource = @ptrCast(@alignCast(ptr));
@@ -736,7 +761,12 @@ pub const BoundTableWriteSource = struct {
                 .sync_level = sync_level,
             };
             try validateTableBatchAgainstLocalSchema(alloc, db, req.writes, req.deletes, req.transforms);
-            db.batchWithVisibilityCancellation(req, cancellation) catch |err| switch (err) {
+            try ensurePreDecisionContextActive(pre_decision);
+            // Keep this stack-owned budget alive through the synchronous DB
+            // call. Post-durability visibility retains its independent token.
+            const admission = @import("mutation_admission_controls.zig");
+            var budget = admission.init(pre_decision, borrow, db.backend_runtime.io() orelse return error.MissingBackendRuntimeIo);
+            db.batchWithAdmissionControls(req, admission.acquisition(&budget), cancellation) catch |err| switch (err) {
                 error.IntentConflict, error.VersionConflict => return .{ .conflict = boundConflict(table, err) },
                 else => return err,
             };
@@ -745,7 +775,7 @@ pub const BoundTableWriteSource = struct {
         const txn_source: *BoundTableWriteSource = @ptrCast(@alignCast(ptr));
         const txn_io: ?Io = txn_source.db.backend_runtime.io();
         const txn_id = nextTxnId(txn_io);
-        return try commitBoundTransaction(ptr, alloc, txn_id, nextTxnTimestamp(txn_io), tables, sync_level, false, cancellation);
+        return try commitBoundTransactionWithPreDecisionContext(ptr, alloc, txn_id, nextTxnTimestamp(txn_io), tables, sync_level, false, cancellation, pre_decision, borrow);
     }
 
     pub fn commitTransactionWithId(
@@ -769,6 +799,64 @@ pub const BoundTableWriteSource = struct {
         cancellation: db_mod.types.CancellationToken,
     ) !?distributed_txn.CommitOutcome {
         return try commitBoundTransaction(ptr, alloc, txn_id, begin_timestamp, tables, sync_level, true, cancellation);
+    }
+
+    fn commitBatchWithExecution(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        tables: []const distributed_txn.TableCommitRequest,
+        sync_level: db_mod.types.SyncLevel,
+        cancellation: db_mod.types.CancellationToken,
+        team: *runnable_abi.Team,
+    ) !?distributed_txn.CommitOutcome {
+        // Bound storage has one coordinator participant and no child fanout.
+        // Validate the original execution fences before contacting storage.
+        try team.reserve(0);
+        defer team.finish();
+        return commitBatchWithPreDecisionContext(ptr, alloc, tables, sync_level, cancellation, .{}, team.borrow);
+    }
+
+    fn commitTransactionWithIdAndExecution(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        txn_id: db_mod.types.TxnId,
+        begin_timestamp: u64,
+        tables: []const distributed_txn.TableCommitRequest,
+        sync_level: db_mod.types.SyncLevel,
+        cancellation: db_mod.types.CancellationToken,
+        team: *runnable_abi.Team,
+    ) !?distributed_txn.CommitOutcome {
+        try team.reserve(0);
+        defer team.finish();
+        return commitBoundTransactionWithPreDecisionContext(ptr, alloc, txn_id, begin_timestamp, tables, sync_level, true, cancellation, .{}, team.borrow);
+    }
+
+    fn commitBatchWithControl(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        tables: []const distributed_txn.TableCommitRequest,
+        sync_level: db_mod.types.SyncLevel,
+        cancellation: db_mod.types.CancellationToken,
+        control: distributed_txn.CommitControl,
+    ) !?distributed_txn.CommitOutcome {
+        if (control.team) |team| try team.reserve(0);
+        defer if (control.team) |team| team.finish();
+        return commitBatchWithPreDecisionContext(ptr, alloc, tables, sync_level, cancellation, control.pre_decision, if (control.team) |team| team.borrow else null);
+    }
+
+    fn commitTransactionWithIdAndControl(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        txn_id: db_mod.types.TxnId,
+        begin_timestamp: u64,
+        tables: []const distributed_txn.TableCommitRequest,
+        sync_level: db_mod.types.SyncLevel,
+        cancellation: db_mod.types.CancellationToken,
+        control: distributed_txn.CommitControl,
+    ) !?distributed_txn.CommitOutcome {
+        if (control.team) |team| try team.reserve(0);
+        defer if (control.team) |team| team.finish();
+        return commitBoundTransactionWithPreDecisionContext(ptr, alloc, txn_id, begin_timestamp, tables, sync_level, true, cancellation, control.pre_decision, if (control.team) |team| team.borrow else null);
     }
 
     pub fn acknowledgeTransactionCommit(
@@ -796,6 +884,24 @@ pub const BoundTableWriteSource = struct {
         retain_terminal: bool,
         cancellation: db_mod.types.CancellationToken,
     ) !?distributed_txn.CommitOutcome {
+        return commitBoundTransactionWithPreDecisionContext(ptr, alloc, txn_id, begin_timestamp, tables, sync_level, retain_terminal, cancellation, .{}, null);
+    }
+
+    fn commitBoundTransactionWithPreDecisionContext(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        txn_id: db_mod.types.TxnId,
+        begin_timestamp: u64,
+        tables: []const distributed_txn.TableCommitRequest,
+        sync_level: db_mod.types.SyncLevel,
+        retain_terminal: bool,
+        cancellation: db_mod.types.CancellationToken,
+        pre_decision: distributed_txn.PreDecisionContext,
+        borrow: ?runnable_abi.Borrowed,
+    ) !?distributed_txn.CommitOutcome {
+        try ensurePreDecisionContextActive(pre_decision);
+        if (pre_decision.route_fence != null) return error.CatalogRouteFenceUnsupported;
+        if (pre_decision.restore_staging_scope != null or pre_decision.restore_staging_plan_id != null) return error.UnsupportedOperation;
         const self: *BoundTableWriteSource = @ptrCast(@alignCast(ptr));
         if (tables.len != 1) return error.UnsupportedOperation;
         const table = tables[0];
@@ -810,13 +916,17 @@ pub const BoundTableWriteSource = struct {
         defer alloc.free(local_participant);
         const participants = [_][]const u8{local_participant};
 
-        _ = db.beginTransactionWithIdAndParticipantsCreatedAtRoleAndRetention(
+        const admission = @import("mutation_admission_controls.zig");
+        var admission_budget = admission.init(pre_decision, borrow, db.backend_runtime.io() orelse return error.MissingBackendRuntimeIo);
+        try admission_budget.checkpoint();
+        _ = db.beginTransactionWithAdmissionControls(
             txn_id,
             begin_timestamp,
             nextTxnTimestamp(db.backend_runtime.io()),
             &participants,
             true,
             retain_terminal,
+            admission.acquisition(&admission_budget),
         ) catch |err| switch (err) {
             error.DecisionConflict => switch (try db.getTransactionStatus(txn_id)) {
                 .committed => {
@@ -865,7 +975,7 @@ pub const BoundTableWriteSource = struct {
             },
             else => return err,
         };
-        db.writeTransaction(txn_id, .{
+        prepareBoundTransactionWithAdmissionControls(db, txn_id, .{
             .writes = table.writes,
             .deletes = table.deletes,
             .transforms = table.transforms,
@@ -881,7 +991,7 @@ pub const BoundTableWriteSource = struct {
             .restore_staging_scope = table.restore_staging_scope,
             .restore_staging_plan_id = table.restore_staging_plan_id,
             .relational_repair = table.relational_repair,
-        }) catch |err| {
+        }, &admission_budget) catch |err| {
             // A begun local transaction must reach a terminal state on every
             // rejected write. In particular, graph transform validation is
             // performed by DB.writeTransaction after begin, so returning the
@@ -948,6 +1058,15 @@ pub const BoundTableWriteSource = struct {
             .coordinator_table_name = if (retain_terminal) table.table_name else null,
             .propagation_pending = propagation_pending,
         } };
+    }
+
+    fn prepareBoundTransactionWithAdmissionControls(db: *db_mod.DB, txn_id: db_mod.types.TxnId, req: db_mod.types.TransactionIntentRequest, budget: *@import("mutation_admission_controls.zig").Budget) !void {
+        const admission = @import("mutation_admission_controls.zig");
+        try budget.checkpoint();
+        try db.writeTransactionWithAdmissionControls(txn_id, req, admission.acquisition(budget));
+        // Once preparation is accepted, caller rejection must still drive the
+        // transaction's independent durable abort and acknowledgement path.
+        try budget.checkpoint();
     }
 
     pub fn createIndex(
@@ -1095,13 +1214,17 @@ pub const BoundTableWriteSource = struct {
         const self: *BoundTableWriteSource = @ptrCast(@alignCast(ptr));
         if (!std.mem.eql(u8, self.table_name, table_name)) return null;
         try ensurePreDecisionContextActive(context);
-        _ = try (try self.activeDb()).beginTransactionWithIdAndParticipantsCreatedAtRoleAndRetention(
+        const db = try self.activeDb();
+        const admission = @import("mutation_admission_controls.zig");
+        var budget = admission.initParticipant(context, db.backend_runtime.io() orelse return error.MissingBackendRuntimeIo);
+        _ = try db.beginTransactionWithAdmissionControls(
             txn_id,
             begin_timestamp,
             nextTxnTimestamp(self.db.backend_runtime.io()),
             participants,
             true,
             retain_terminal,
+            admission.acquisition(&budget),
         );
     }
 
@@ -1134,8 +1257,9 @@ pub const BoundTableWriteSource = struct {
         if (context.route_fence != null) return error.CatalogRouteFenceUnsupported;
         try validateTransactionAgainstLocalSchema(alloc, db, txn_id, req.writes, req.deletes, req.transforms);
         if (req.relational_index_maintenance) |command| if (command.owner_group_id != (self.owner_group_id orelse return error.UnsupportedOperation)) return error.PreparedGenerationChanged;
-        try ensurePreDecisionContextActive(context);
-        try db.writeTransaction(txn_id, req);
+        const admission = @import("mutation_admission_controls.zig");
+        var budget = admission.initParticipant(context, db.backend_runtime.io() orelse return error.MissingBackendRuntimeIo);
+        try prepareBoundTransactionWithAdmissionControls(db, txn_id, req, &budget);
     }
 
     pub fn txnResolveGroupLocal(
@@ -1164,16 +1288,24 @@ pub const BoundTableWriteSource = struct {
         sync_level: db_mod.types.SyncLevel,
         cancellation: db_mod.types.CancellationToken,
     ) !?void {
+        return txnResolveGroupLocalControlled(ptr, group_id, table_name, txn_id, status, commit_version, sync_level, cancellation, null);
+    }
+
+    fn txnResolveGroupLocalControlled(ptr: *anyopaque, group_id: u64, table_name: []const u8, txn_id: db_mod.types.TxnId, status: db_mod.types.TxnStatus, commit_version: u64, sync_level: db_mod.types.SyncLevel, cancellation: db_mod.types.CancellationToken, borrow: ?runnable_abi.Borrowed) !?void {
         const self: *BoundTableWriteSource = @ptrCast(@alignCast(ptr));
         if (!std.mem.eql(u8, self.table_name, table_name)) return null;
         const db = try self.activeDb();
-        try db.resolveTransactionIntentsWithSyncLevelAndCancellation(txn_id, status, commit_version, sync_level, cancellation);
         const participant = try distributed_txn.participantIdForGroup(db.alloc, table_name, group_id);
         defer db.alloc.free(participant);
-        db.markTransactionParticipantResolved(txn_id, participant) catch |err| switch (err) {
-            transactions_mod.TxnError.TxnNotFound => if (status != .aborted) return err,
-            else => return err,
-        };
+        try db.resolveTransactionIntentsAndAcknowledgeParticipant(txn_id, status, commit_version, sync_level, cancellation, participant, borrow);
+    }
+
+    pub fn txnResolveGroupLocalWithExecution(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, txn_id: db_mod.types.TxnId, status: db_mod.types.TxnStatus, commit_version: u64, _: u64, sync_level: db_mod.types.SyncLevel, context: distributed_txn.PreDecisionContext) !?void {
+        try ensurePreDecisionContextActive(context);
+        // The ordinary bound DB is not a hidden restore owner.
+        if (context.restore_staging_scope != null or context.restore_staging_plan_id != null) return error.UnsupportedOperation;
+        _ = alloc;
+        return txnResolveGroupLocalControlled(ptr, group_id, table_name, txn_id, status, commit_version, sync_level, context.cancellation, context.execution_runnable);
     }
 
     pub fn txnStatusGroupLocal(

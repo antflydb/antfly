@@ -56,12 +56,12 @@ pub const Handle = struct {
     }
     pub fn readContext(self: *Handle) Context {
         var context = self.parent;
-        context.checkpoint = .{ .ptr = self, .check = checkpoint };
+        context.authority = .{ .ptr = self, .check = checkpoint };
         return context;
     }
     fn checkpoint(raw: *anyopaque) !void {
         const self: *Handle = @ptrCast(@alignCast(raw));
-        try self.parent.ensureActive();
+        try self.parent.checkLifetime();
         try self.owner.check();
     }
     pub fn retain(self: *const Handle) !*Handle {
@@ -315,8 +315,20 @@ test "external lake native reader pool amortizes admission and fences every cach
     // Existing sessions retain their exact snapshot even after logical DROP.
     try first.owner.renew();
     try first.readContext().ensureActive();
+    const Runnable = local.common_request_admission.runnable_scheduler;
+    var scheduler = try Runnable.Scheduler.init(.{ .slots = 2 });
+    var execution: Runnable.Execution = .{};
+    try execution.start(&scheduler, .{ .io = std.testing.io }, .query);
+    defer execution.finish();
+    const active = first.readContext().withExecution(&execution);
+    try active.ensureActive();
+    try execution.park(.resource_blocked);
+    try active.checkLifetime();
     first.owner.authority_deadline.store(0, .release);
     try std.testing.expectError(error.LakeIndexReaderLeaseExpired, first.readContext().ensureActive());
+    try std.testing.expectError(error.LakeIndexReaderLeaseExpired, active.checkLifetime());
+    try std.testing.expectError(error.LakeIndexReaderLeaseExpired, active.ensureActive());
+    try std.testing.expectEqual(@as(usize, 0), scheduler.stats().runnable_slots);
 }
 
 test "external lake cold reader admission retains deadline and cancellation" {

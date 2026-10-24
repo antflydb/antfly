@@ -15,6 +15,7 @@
 
 const std = @import("std");
 const platform = @import("antfly_platform");
+const resources = @import("../resource_manager.zig");
 
 /// Cache ownership and cursor ownership are independent. Eviction drops only
 /// the cache reference; outstanding scans retain immutable bytes.
@@ -24,6 +25,7 @@ pub const SharedBytes = struct {
     bytes: []u8,
     /// Assigned before publication; credit follows the payload, not cache membership.
     reservation: ?@import("../resource_manager.zig").Reservation = null,
+    retirement: resources.PayloadRetirement = .{},
     cache_admitted: bool = false,
     result_pins_allowed: bool = true,
 
@@ -32,12 +34,29 @@ pub const SharedBytes = struct {
         self.* = .{ .allocator = allocator, .bytes = bytes };
         return self;
     }
+    pub fn registerRetirementWithAdmission(self: *SharedBytes, construction: *resources.ConstructionCredit, control: @import("../../common/read_admission.zig").Port) !void {
+        try construction.manager.registerPayloadRetirementWithAdmission(&self.retirement, &self.reservation, construction, self, destroyRetired, control);
+    }
+    pub fn enableRetirementWithAdmission(self: *SharedBytes, control: @import("../../common/read_admission.zig").Port) !void {
+        if (self.retirement.credit != null) return;
+        if (self.reservation) |*credit| try credit.manager.registerExistingPayloadRetirementWithAdmission(&self.retirement, credit, self, destroyRetired, control);
+    }
+    fn destroyRetired(raw: *anyopaque) void {
+        const self: *SharedBytes = @ptrCast(@alignCast(raw));
+        const allocator = self.allocator;
+        allocator.free(self.bytes);
+        allocator.destroy(self);
+    }
     pub fn retain(self: *SharedBytes) *SharedBytes {
         _ = self.refs.fetchAdd(1, .monotonic);
         return self;
     }
     pub fn release(self: *SharedBytes) void {
         if (self.refs.fetchSub(1, .acq_rel) == 1) {
+            if (self.retirement.credit != null) {
+                self.retirement.publish();
+                return;
+            }
             const allocator = self.allocator;
             allocator.free(self.bytes);
             var reservation = self.reservation;

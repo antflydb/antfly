@@ -19,7 +19,49 @@
 const failure_abi = @import("runtime_failure_abi");
 
 // Storage layouts evolve independently of the shared failure envelope.
-pub const abi_version: u32 = 82;
+// Owners must enforce prepared replay credits through inventory mutation and HA acknowledgement.
+// Backend batches can atomically reserve prepared replay credit with seals.
+// Fence merged logical-query layouts and failure/guard contracts.
+// Read transcripts distinguish an empty upper bound from clearing the bound.
+// Reject prior native observations before interpreting their bound operations.
+// Accepted seals retain and account bound observations through recovery.
+// Reject owners which can silently drop that durable preparation state.
+// Snapshot cursor semantics are explicit when compiling read-conflict gaps.
+// Reject older capability layouts before trusting those semantics.
+// Semantic range observations own bounds and membership predicates.
+// Fence prior native owners before interpreting the expanded read set.
+// Read-guard metadata carries an exact actor through native batch dispatch.
+// Durable semantic predicate capture expands native writer ownership.
+// Replay reservation writers retain input contracts through final commit validation.
+// Batch preparation can return owned uncommitted bytes and their witnesses.
+// Owned assemblies and resolution options carry final-writer counter programs.
+// Coverage outcome transitions join final-writer metadata programs.
+// Owned replay binding recipes and whole-operation refresh expand native state.
+// Owned assemblies retain checked memory state; native retries observe commits.
+// Close preflight drains restore/rewrite cache callbacks with caller execution.
+// Projection supervision uses shared maintenance dispatch and controlled close.
+// Close preflight drains accepted HLL/repair/backend work in dependency order.
+// Controlled close requires admitted metadata fencing and owning drain leases.
+// Close preflight fences TTL and sparse producers before derived finalization.
+// Graph metric producer close precedes derived and durable dependency fences.
+// Close preflight drains detached index pins before durable backend admission closes.
+// Storage durability providers return owning physical sync operations.
+// Storage durability metadata uses owning bounded read operations.
+// Storage durability grants retain reusable worker, descriptor and buffer ownership.
+// Durability grants include bounded atomic control replacement and directory creation.
+// DB close retains bounded mutable-snapshot fencing and accounting preflight.
+// Final status owns prepaid capture, packed input and canonical WAL preparation.
+// Retirement cannot yield under its registry; SQL workspace preserves shared IO headroom.
+// Final status owns manifest admission, frozen append resources and retry-safe publication.
+// Close retains tentative durability grants and empty-status sync through admitted retirement.
+// Close reclaims retired memory in original CPU quanta before persistence.
+// Durability grants own private file writes, publication and discard.
+// Output tickets carry registered physical/accounting retirement ownership.
+// State retirement retains partial row, tree-node, vector and arena byte ownership.
+// Pin registration retains radix traversal and detached physical ownership.
+// Reject earlier kernel/native pin capabilities before decoding their headers.
+// Registry construction and allocation provenance retain shared quota ownership.
+pub const abi_version: u32 = 177;
 pub const Status = failure_abi.Status;
 pub const FailureBoundary = failure_abi.FailureBoundary;
 pub const FailureIdentity = failure_abi.FailureIdentity;
@@ -86,6 +128,15 @@ pub const WalOpenRequest = extern struct {
     _reserved0: [5]u8 = @splat(0),
 };
 
+/// Additive open entry point. The callback descriptor is copied by the owner;
+/// its allocation context must remain alive until WAL close returns.
+pub const WalOpenAllocatorRequest = extern struct {
+    version: u32 = abi_version,
+    _reserved: u32 = 0,
+    options: ?*const WalOpenRequest = null,
+    allocator: ?*const @import("runtime_memory_abi").Allocator = null,
+};
+
 pub const WalOpenResult = extern struct {
     handle: ?*anyopaque = null,
     next_lsn: u64 = 1,
@@ -99,10 +150,77 @@ pub const WalAppendRequest = extern struct {
     data: BorrowedBytes = .{},
 };
 
+/// Volatile, in-process identity/position of one open WAL. Never persist this
+/// token or interpret its identity words as pointers.
+pub const WalRecoveryPosition = extern struct {
+    origin: u64 = 0,
+    owner: u64 = 0,
+    revision: u64 = 0,
+    next_lsn: u64 = 0,
+};
+
+pub const WalRecoveryPositionRequest = extern struct {
+    version: u32 = abi_version,
+    _reserved: u32 = 0,
+    port: ?*const anyopaque = null,
+};
+
+pub const WalRecoveryPositionResult = extern struct {
+    position: WalRecoveryPosition = .{},
+    busy: u8 = 0,
+    _reserved: [7]u8 = @splat(0),
+};
+
+pub const WalRecoveryAppendRequest = extern struct {
+    version: u32 = abi_version,
+    _reserved: u32 = 0,
+    expected: WalRecoveryPosition = .{},
+    data: BorrowedBytes = .{},
+    port: ?*const anyopaque = null,
+};
+
+pub const WalRecoveryAppendResult = extern struct {
+    // 0 = changed, 1 = busy, 2 = appended. Only appended carries an LSN.
+    outcome: u8 = 0,
+    _reserved: [7]u8 = @splat(0),
+    assigned_lsn: u64 = 0,
+    next_lsn: u64 = 0,
+};
+
+pub extern fn antfly_storage_wal_recovery_position(
+    wal: ?*anyopaque,
+    request: *const WalRecoveryPositionRequest,
+    out_result: *WalRecoveryPositionResult,
+) callconv(.c) Status;
+
+pub extern fn antfly_storage_wal_append_if_recovery_position(
+    wal: ?*anyopaque,
+    request: *const WalRecoveryAppendRequest,
+    out_result: *WalRecoveryAppendResult,
+) callconv(.c) Status;
+
 pub const WalAppendResult = extern struct {
     assigned_lsn: u64 = 0,
     next_lsn: u64 = 1,
 };
+
+pub const WalPrepareAppendRequest = extern struct {
+    version: u32 = abi_version,
+    prefix_len: u32 = 0,
+    tail: BorrowedBytes = .{},
+    port: ?*const anyopaque = null,
+};
+pub const WalPrepareAppendResult = extern struct {
+    handle: ?*anyopaque = null,
+};
+pub const WalPreparedPublishRequest = extern struct {
+    version: u32 = abi_version,
+    _reserved: u32 = 0,
+    prefix: BorrowedBytes = .{},
+};
+pub extern fn antfly_storage_wal_prepare_append(wal: ?*anyopaque, request: *const WalPrepareAppendRequest, output: *WalPrepareAppendResult) callconv(.c) Status;
+pub extern fn antfly_storage_wal_prepared_publish(prepared: ?*anyopaque, request: *const WalPreparedPublishRequest, output: *WalAppendResult) callconv(.c) Status;
+pub extern fn antfly_storage_wal_prepared_destroy(prepared: ?*anyopaque) callconv(.c) void;
 
 pub const WalIdempotentAppendRequest = extern struct {
     version: u32 = abi_version,
@@ -130,6 +248,66 @@ pub const WalScanRequest = extern struct {
     from_lsn: u64 = 0,
     max_entries: u64 = 0,
     max_bytes: u64 = 0,
+};
+
+/// Reply allocation is a synchronous borrow. Returned bytes belong to this
+/// allocator and must be freed by its origin, never the legacy C destructor.
+pub const WalReadAllocatorRequest = extern struct {
+    version: u32 = abi_version,
+    _reserved: u32 = 0,
+    lsn: u64 = 0,
+    port: ?*const anyopaque = null,
+    allocator: ?*const @import("runtime_memory_abi").Allocator = null,
+};
+
+/// Detached operation metadata and results use this caller root. Its context
+/// must outlive read_destroy, independently of the WAL/open allocator. Ports
+/// and output windows are synchronous borrows only. Additive owner ABI 100.
+pub const WalOwnedReadBeginRequest = extern struct {
+    version: u32 = abi_version,
+    _reserved: u32 = 0,
+    lsn: u64 = 0,
+    allocator: ?*const @import("runtime_memory_abi").Allocator = null,
+    port: ?*const anyopaque = null,
+};
+pub const WalOwnedReadBeginResult = extern struct {
+    handle: ?*anyopaque = null,
+};
+pub const WalOwnedReadStepRequest = extern struct {
+    version: u32 = abi_version,
+    _reserved: u32 = 0,
+    quantum: u64 = 0,
+    port: ?*const anyopaque = null,
+};
+pub const WalOwnedReadStepResult = extern struct {
+    ready: u8 = 0,
+    _reserved: [7]u8 = @splat(0),
+};
+pub const WalOwnedReadChunkRequest = extern struct {
+    version: u32 = abi_version,
+    _reserved: u32 = 0,
+    offset: u64 = 0,
+    output: OwnedBytes = .{},
+    port: ?*const anyopaque = null,
+};
+pub const WalOwnedReadChunkResult = extern struct {
+    len: u64 = 0,
+    done: u8 = 0,
+    _reserved: [7]u8 = @splat(0),
+};
+
+pub extern fn antfly_storage_wal_owned_read_begin(wal: ?*anyopaque, request: *const WalOwnedReadBeginRequest, output: *WalOwnedReadBeginResult) callconv(.c) Status;
+pub extern fn antfly_storage_wal_owned_read_step(read: ?*anyopaque, request: *const WalOwnedReadStepRequest, output: *WalOwnedReadStepResult) callconv(.c) Status;
+pub extern fn antfly_storage_wal_owned_read_chunk(read: ?*anyopaque, request: *const WalOwnedReadChunkRequest, output: *WalOwnedReadChunkResult) callconv(.c) Status;
+/// Requires no execution grant. Join caller use before destroying its handle;
+/// concurrent WAL close is supported, including destruction after WAL close.
+pub extern fn antfly_storage_wal_owned_read_destroy(read: ?*anyopaque) callconv(.c) void;
+
+pub const WalScanAllocatorRequest = extern struct {
+    version: u32 = abi_version,
+    _reserved: u32 = 0,
+    options: ?*const WalScanRequest = null,
+    allocator: ?*const @import("runtime_memory_abi").Allocator = null,
 };
 
 pub const WalScanResult = extern struct {
@@ -287,6 +465,10 @@ pub const LocalQueryRequest = extern struct {
     cancellation_ctx: ?*anyopaque = null,
     cancellation_fn: ?CancellationCheckFn = null,
     execution_deadline_ns: u64 = 0,
+    /// Synchronous invocation-local pointer to runtime_runnable_abi.Borrowed.
+    /// The caller retains its capsule until this call returns. Never encoded
+    /// in request JSON, retained by the provider, or reconstructed from input.
+    execution_runnable: ?*const anyopaque = null,
 };
 
 /// Process-scoped physical-storage owner. The handle owns shared caches and
@@ -432,6 +614,7 @@ pub const ContextResourceBudgetStats = extern struct {
     hard_limit_rejections: u64 = 0,
     oversized_single_grants: u64 = 0,
     accounting_errors: u64 = 0,
+    external_bytes: u64 = 0,
 
     /// Project aggregate or slice counters without importing the storage
     /// implementation across this ABI. Inapplicable counters remain zero.
@@ -445,6 +628,7 @@ pub const ContextResourceBudgetStats = extern struct {
             .hard_limit_rejections = stats.hard_limit_rejections,
             .oversized_single_grants = if (@hasField(@TypeOf(stats), "oversized_single_grants")) stats.oversized_single_grants else 0,
             .accounting_errors = if (@hasField(@TypeOf(stats), "accounting_errors")) stats.accounting_errors else 0,
+            .external_bytes = if (@hasField(@TypeOf(stats), "external_bytes")) stats.external_bytes else 0,
         };
     }
 };
@@ -1396,6 +1580,9 @@ pub const MaintenanceRequest = extern struct {
     deadline_ns: u64 = 0,
     snapshot_token: BorrowedBytes = .{},
     destination_root: BorrowedBytes = .{},
+    /// Synchronous borrowed runtime_runnable_abi.Reentry lifetime check.
+    /// Never serialized or retained beyond this maintenance invocation.
+    lifetime_check: ?*const anyopaque = null,
 };
 
 pub const MaintenanceResult = extern struct {
@@ -1412,6 +1599,64 @@ pub const MaintenanceResult = extern struct {
     next_wake_delay_ns: u64 = 0,
 };
 
+/// Synchronous pre-decision BEGIN. Participant bytes and the original read
+/// admission port remain borrowed until the durable operation returns.
+pub const TransactionBeginRequest = extern struct {
+    version: u32 = abi_version,
+    retain_terminal: u8 = 0,
+    has_scope: u8 = 0,
+    _reserved: [2]u8 = @splat(0),
+    table_name: BorrowedBytes = .{},
+    txn_id: TxnId = .{},
+    begin_timestamp: u64 = 0,
+    created_at_ns: u64 = 0,
+    /// Checked api/transaction_begin_admission.Port, synchronously borrowed.
+    participants: ?*const anyopaque = null,
+    participants_len: u64 = 0,
+    scope: [32]u8 = @splat(0),
+    plan_id: [16]u8 = @splat(0),
+    port: ?*const anyopaque = null,
+};
+pub extern fn antfly_storage_owner_transaction_begin_with_admission(owner: ?*anyopaque, request: *const TransactionBeginRequest) callconv(.c) Status;
+
+/// Synchronous intent preparation. The checked native request and original
+/// admission remain borrowed until all preparation and physical writes return.
+pub const TransactionPrepareRequest = extern struct {
+    version: u32 = abi_version,
+    _reserved: u32 = 0,
+    table_name: BorrowedBytes = .{},
+    txn_id: TxnId = .{},
+    intents: ?*const anyopaque = null,
+    port: ?*const anyopaque = null,
+};
+pub extern fn antfly_storage_owner_transaction_prepare_with_admission(owner: ?*anyopaque, request: *const TransactionPrepareRequest) callconv(.c) Status;
+
+/// Ordinary local completion. The caller owns admission through resolution and
+/// visibility waiting; hidden-owner completion requires a separate Plan fence.
+pub const TransactionResolveRequest = extern struct {
+    version: u32 = abi_version,
+    status: u32 = @backingInt(TxnStatus.aborted),
+    sync_level: u32 = @backingInt(SyncLevel.write),
+    _reserved: u32 = 0,
+    table_name: BorrowedBytes = .{},
+    txn_id: TxnId = .{},
+    commit_version: u64 = 0,
+    port: ?*const anyopaque = null,
+};
+pub extern fn antfly_storage_owner_transaction_resolve_with_admission(owner: ?*anyopaque, request: *const TransactionResolveRequest) callconv(.c) Status;
+
+/// Bounded, synchronous acknowledgement of an enlisted cohort subset.
+/// The checked participant slice and original admission cannot escape.
+pub const TransactionAcknowledgeRequest = extern struct {
+    version: u32 = abi_version,
+    _reserved: u32 = 0,
+    table_name: BorrowedBytes = .{},
+    txn_id: TxnId = .{},
+    participants: ?*const anyopaque = null,
+    port: ?*const anyopaque = null,
+};
+pub extern fn antfly_storage_owner_transaction_acknowledge_with_admission(owner: ?*anyopaque, request: *const TransactionAcknowledgeRequest) callconv(.c) Status;
+
 pub const TransactionStatusRequest = extern struct {
     version: u32 = abi_version,
     _reserved0: u32 = 0,
@@ -1423,6 +1668,26 @@ pub const TransactionStatusResult = extern struct {
     version: u32 = abi_version,
     status: TxnStatus = .pending,
 };
+
+/// Additive status operation. Old enum-only status request/result layouts are
+/// unchanged. The read port is checked, borrowed and never retained.
+pub const TransactionPreparationStatusRequest = extern struct {
+    version: u32 = abi_version,
+    _reserved: u32 = 0,
+    table_name: BorrowedBytes = .{},
+    txn_id: TxnId = .{},
+    port: ?*const anyopaque = null,
+};
+pub const TransactionPreparationStatusResult = extern struct {
+    version: u32 = abi_version,
+    status: TxnStatus = .pending,
+    present: u8 = 0,
+    mode: u8 = 255,
+    has_binding: u8 = 0,
+    _reserved: [5]u8 = @splat(0),
+    binding: [80]u8 = @splat(0),
+};
+pub extern fn antfly_storage_owner_transaction_preparation_status(owner: ?*anyopaque, request: *const TransactionPreparationStatusRequest, output: *TransactionPreparationStatusResult) callconv(.c) Status;
 
 pub const BulkProgressPhase = enum(u32) {
     begin = 0,
@@ -1640,6 +1905,10 @@ pub const ControlledJsonOperationRequest = extern struct {
     _reserved1: [7]u8 = @splat(0),
     cancellation_ctx: ?*anyopaque = null,
     cancellation_fn: ?CancellationCheckFn = null,
+    /// Synchronous invocation-local pointer to runtime_runnable_abi.Borrowed.
+    /// The caller retains its capsule until this call returns. Never encoded
+    /// in request JSON, retained by the provider, or reconstructed from input.
+    execution_runnable: ?*const anyopaque = null,
 };
 
 /// Prepare one scoped restore step inside an already leased physical owner.
@@ -1718,6 +1987,16 @@ pub extern fn antfly_storage_context_configure_remote_content_security(
     context: ?*anyopaque,
     security_json: BorrowedBytes,
 ) callconv(.c) Status;
+
+/// Allocation-free borrowed accounting. The caller must release all charges
+/// before destroying the context; reservation failure leaves ownership unchanged.
+pub extern fn antfly_storage_context_reserve_external(context: ?*anyopaque, bytes: usize) callconv(.c) bool;
+pub extern fn antfly_storage_context_release_external(context: ?*anyopaque, bytes: usize) callconv(.c) void;
+
+/// Borrows the context's node accounting/pressure owner. Every child must
+/// release its final observer balance before context destruction.
+pub const MemoryParent = @import("runtime_memory_abi").Parent;
+pub extern fn antfly_storage_context_memory_parent(context: ?*anyopaque, out_parent: *MemoryParent) callconv(.c) bool;
 
 pub extern fn antfly_storage_context_metrics(
     context: ?*anyopaque,
@@ -1813,6 +2092,40 @@ pub extern fn antfly_metadata_apply_prepared_snapshot_materialize(
 ) callconv(.c) Status;
 pub extern fn antfly_metadata_apply_prepared_snapshot_cancel(prepared: ?*anyopaque) callconv(.c) Status;
 pub extern fn antfly_metadata_apply_prepared_snapshot_destroy(prepared: ?*anyopaque) callconv(.c) void;
+/// A synchronous checked native control borrow. The port retains the exact
+/// caller budget; no duration is reconstructed at the storage boundary.
+pub const MetadataControlRoutingRequest = extern struct {
+    pub const abi_version: u32 = 1;
+    version: u32 = MetadataControlRoutingRequest.abi_version,
+    _reserved: u32 = 0,
+    group_id: u64,
+    /// Borrowed native-endian u64 IDs, aligned and retained through return.
+    groups: BorrowedBytes = .{},
+    control: ?*const anyopaque = null,
+    allocator: ?*const anyopaque = null,
+};
+/// Response memory belongs to request.allocator, not the storage owner.
+pub extern fn antfly_metadata_apply_store_control_routing(store: ?*anyopaque, request: *const MetadataControlRoutingRequest, out_json: *OwnedBytes) callconv(.c) Status;
+
+pub const MetadataTransactionRoutingRequest = extern struct {
+    /// Independent version rejects earlier capture requests before reading
+    /// the newly required allocator field.
+    pub const abi_version: u32 = 1;
+    version: u32 = MetadataTransactionRoutingRequest.abi_version,
+    _reserved: u32 = 0,
+    group_id: u64,
+    control: ?*const anyopaque,
+    /// runtime_memory_abi.Allocator, borrowed synchronously through return.
+    allocator: ?*const anyopaque = null,
+};
+/// Returned bytes use request.allocator. Release them through that allocator;
+/// antfly_storage_owner_buffer_destroy must never receive this result.
+pub extern fn antfly_metadata_apply_store_transaction_routing(
+    store: ?*anyopaque,
+    request: *const MetadataTransactionRoutingRequest,
+    out_json: *OwnedBytes,
+) callconv(.c) Status;
+
 pub extern fn antfly_metadata_apply_store_projection(
     store: ?*anyopaque,
     request: *const MetadataProjectionRequest,
@@ -1945,6 +2258,18 @@ pub extern fn antfly_storage_owner_open(
     out_owner: *?*anyopaque,
 ) callconv(.c) Status;
 
+/// Synchronous close preflight uses the registry's existing cleanup capsule
+/// and its original clock/deadline. The physical owner remains registered on
+/// failure. This header is never reconstructed from public input.
+pub const CloseDrainRequest = extern struct {
+    version: u32 = abi_version,
+    reserved: u32 = 0,
+    deadline_ns: u64,
+    execution_runnable: ?*const anyopaque,
+    clock_io: ?*const anyopaque,
+};
+pub extern fn antfly_storage_owner_drain_close(owner: ?*anyopaque, request: *const CloseDrainRequest) callconv(.c) Status;
+
 pub extern fn antfly_storage_owner_close(owner: ?*anyopaque) callconv(.c) void;
 
 pub extern fn antfly_storage_hot_standby_seed_activate_json(
@@ -2009,6 +2334,15 @@ pub extern fn antfly_storage_owner_bulk_abort(
 pub extern fn antfly_storage_owner_batch_json(
     owner: ?*anyopaque,
     request: *const BatchJsonOperationRequest,
+    out_response: *OwnedBytes,
+) callconv(.c) Status;
+
+/// Original synchronous pre-decision authority. The port is checked and never
+/// retained; the existing batch request layout remains unchanged.
+pub extern fn antfly_storage_owner_batch_json_with_admission(
+    owner: ?*anyopaque,
+    request: *const BatchJsonOperationRequest,
+    admission_port: *const anyopaque,
     out_response: *OwnedBytes,
 ) callconv(.c) Status;
 
@@ -2185,6 +2519,14 @@ pub extern fn antfly_storage_owner_text_stats_json(
     out_failure: *FailureIdentity,
 ) callconv(.c) Status;
 
+/// Trusted synchronous statistics controls; borrowed authority is never JSON.
+pub extern fn antfly_storage_owner_text_stats_controlled_json(
+    owner: ?*anyopaque,
+    request: *const ControlledJsonOperationRequest,
+    out_response: *OwnedBytes,
+    out_failure: *FailureIdentity,
+) callconv(.c) Status;
+
 pub extern fn antfly_storage_owner_algebraic_partials_json(
     owner: ?*anyopaque,
     request: *const JsonOperationRequest,
@@ -2286,6 +2628,23 @@ pub extern fn antfly_storage_wal_open(
     out_result: *WalOpenResult,
 ) callconv(.c) Status;
 
+pub extern fn antfly_storage_wal_open_with_allocator(
+    request: *const WalOpenAllocatorRequest,
+    out_result: *WalOpenResult,
+) callconv(.c) Status;
+
+pub extern fn antfly_storage_wal_read_with_allocator(
+    wal: ?*anyopaque,
+    request: *const WalReadAllocatorRequest,
+    out_result: *WalReadResult,
+) callconv(.c) Status;
+
+pub extern fn antfly_storage_wal_iterate_with_allocator(
+    wal: ?*anyopaque,
+    request: *const WalScanAllocatorRequest,
+    out_result: *WalScanResult,
+) callconv(.c) Status;
+
 pub extern fn antfly_storage_wal_close(wal: ?*anyopaque) callconv(.c) void;
 
 pub extern fn antfly_storage_wal_append(
@@ -2322,6 +2681,21 @@ pub extern fn antfly_storage_wal_read(
     out_result: *WalReadResult,
 ) callconv(.c) Status;
 
+/// Additive controlled read operation; old position/read layouts are unchanged.
+pub const WalReadAdmissionRequest = extern struct {
+    version: u32 = abi_version,
+    _reserved: u32 = 0,
+    lsn: u64 = 0,
+    /// Checked synchronous common.read_admission.Port; never retained.
+    port: ?*const anyopaque = null,
+};
+
+pub extern fn antfly_storage_wal_read_with_admission(
+    wal: ?*anyopaque,
+    request: *const WalReadAdmissionRequest,
+    out_result: *WalReadResult,
+) callconv(.c) Status;
+
 pub extern fn antfly_storage_wal_stats_snapshot(
     wal: ?*anyopaque,
     out_stats: *WalStats,
@@ -2329,6 +2703,19 @@ pub extern fn antfly_storage_wal_stats_snapshot(
 
 pub extern fn antfly_storage_wal_last_lsn(
     wal: ?*anyopaque,
+    out_last_lsn: *u64,
+) callconv(.c) Status;
+
+pub const WalSnapshotAdmissionRequest = extern struct {
+    version: u32 = abi_version,
+    _reserved: u32 = 0,
+    /// Checked synchronous common.read_admission.Port; never retained.
+    port: ?*const anyopaque = null,
+};
+
+pub extern fn antfly_storage_wal_last_lsn_with_admission(
+    wal: ?*anyopaque,
+    request: *const WalSnapshotAdmissionRequest,
     out_last_lsn: *u64,
 ) callconv(.c) Status;
 

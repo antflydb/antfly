@@ -1,0 +1,138 @@
+{
+  "passed": true,
+  "failures": [],
+  "comparisons": [
+    {
+      "name": "burst",
+      "success_p95_ratio": 1.017740941881242,
+      "throughput_ratio": 1.3386609540250765,
+      "by_kind": {
+        "cheap": {
+          "baseline_successful": 320,
+          "candidate_successful": 470,
+          "throughput_ratio": 1.4513597370236386,
+          "success_p95_ratio": 3.6830010263920543
+        },
+        "expensive": {
+          "baseline_successful": 69,
+          "candidate_successful": 78,
+          "throughput_ratio": 1.1170502323808207,
+          "success_p95_ratio": 3.0756973450048823
+        },
+        "slow_reader": {
+          "baseline_successful": 32,
+          "candidate_successful": 39,
+          "throughput_ratio": 1.2043197817855724,
+          "success_p95_ratio": 1.072820375409246
+        },
+        "write": {
+          "baseline_successful": 47,
+          "candidate_successful": 47,
+          "throughput_ratio": 0.9881598209522646,
+          "success_p95_ratio": 1.549911952323968
+        }
+      }
+    },
+    {
+      "name": "low-load",
+      "success_p95_ratio": 0.4309696228971033,
+      "throughput_ratio": 1.0028852693290722,
+      "by_kind": {
+        "cheap": {
+          "baseline_successful": 15,
+          "candidate_successful": 15,
+          "throughput_ratio": 1.0028852693290724,
+          "success_p95_ratio": 2.4560201973605613
+        },
+        "expensive": {
+          "baseline_successful": 3,
+          "candidate_successful": 3,
+          "throughput_ratio": 1.0028852693290724,
+          "success_p95_ratio": 1.2990684940768396
+        },
+        "slow_reader": {
+          "baseline_successful": 1,
+          "candidate_successful": 1,
+          "throughput_ratio": 1.0028852693290724,
+          "success_p95_ratio": 0.9943553832191836
+        },
+        "write": {
+          "baseline_successful": 1,
+          "candidate_successful": 1,
+          "throughput_ratio": 1.0028852693290724,
+          "success_p95_ratio": 2.018810244787279
+        }
+      }
+    },
+    {
+      "name": "recovery",
+      "success_p95_ratio": 0.8075883792879929,
+      "throughput_ratio": 0.9996740180634065,
+      "by_kind": {
+        "cheap": {
+          "baseline_successful": 15,
+          "candidate_successful": 15,
+          "throughput_ratio": 0.9996740180634064,
+          "success_p95_ratio": 0.9109539444022845
+        },
+        "expensive": {
+          "baseline_successful": 3,
+          "candidate_successful": 3,
+          "throughput_ratio": 0.9996740180634065,
+          "success_p95_ratio": 0.9275055403628795
+        },
+        "slow_reader": {
+          "baseline_successful": 1,
+          "candidate_successful": 1,
+          "throughput_ratio": 0.9996740180634064,
+          "success_p95_ratio": 1.0083010124681988
+        },
+        "write": {
+          "baseline_successful": 1,
+          "candidate_successful": 1,
+          "throughput_ratio": 0.9996740180634064,
+          "success_p95_ratio": 0.9534342025083259
+        }
+      }
+    },
+    {
+      "name": "sustained-overload",
+      "success_p95_ratio": 5.102355244894763,
+      "throughput_ratio": 1.085296453762897,
+      "by_kind": {
+        "cheap": {
+          "baseline_successful": 967,
+          "candidate_successful": 1080,
+          "throughput_ratio": 1.1141789471639116,
+          "success_p95_ratio": 6.07118620505209
+        },
+        "expensive": {
+          "baseline_successful": 151,
+          "candidate_successful": 155,
+          "throughput_ratio": 1.0240293812586638,
+          "success_p95_ratio": 3.3253553629300816
+        },
+        "slow_reader": {
+          "baseline_successful": 70,
+          "candidate_successful": 78,
+          "throughput_ratio": 1.1116145670474233,
+          "success_p95_ratio": 1.291248108694191
+        },
+        "write": {
+          "baseline_successful": 234,
+          "candidate_successful": 234,
+          "throughput_ratio": 0.9976028165810209,
+          "success_p95_ratio": 3.388395510161509
+        }
+      }
+    }
+  ],
+  "baseline_binary_sha256": "4f9ef9cf8fc1af6a816cc29602a4718f331e1c190f95d44dc5fc4d1b3fdc41d3",
+  "candidate_binary_sha256": "788f00b58d8368ce1efb5e4fd8c3659f499e7d49ccf3f62ecfd80ebd0c77987c",
+  "automatic_defaults_qualified": false,
+  "remaining_default_gates": [
+    "Linux and larger profiles",
+    "whole-node ownership closure",
+    "distributed protected progress"
+  ]
+}

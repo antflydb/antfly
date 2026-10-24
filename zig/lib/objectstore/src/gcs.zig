@@ -1136,8 +1136,10 @@ pub fn jsonApiConfigAlloc(alloc: Allocator, bucket: []const u8) !Config {
 }
 
 pub fn jsonApiClientConfigAlloc(alloc: Allocator) !JsonApiConfig {
+    const endpoint = try alloc.dupe(u8, "https://storage.googleapis.com/storage/v1");
+    errdefer alloc.free(endpoint);
     return .{
-        .endpoint = try alloc.dupe(u8, "https://storage.googleapis.com/storage/v1"),
+        .endpoint = endpoint,
         .upload_endpoint = try alloc.dupe(u8, "https://storage.googleapis.com/upload/storage/v1"),
         .auth = .none,
     };

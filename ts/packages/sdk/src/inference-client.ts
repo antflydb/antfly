@@ -42,6 +42,7 @@ import type {
   TransientCapacityError,
 } from "./inference-types.js";
 import type { components, paths } from "./public-api.js";
+import { RequestAdmission } from "./request-admission.js";
 import { parseSSEFrames } from "./sse.js";
 
 const MAX_INFERENCE_JSON_RESPONSE_BYTES = 16 << 20;
@@ -109,8 +110,13 @@ export class InferenceClient {
   private baseUrl: string;
   private headers: Record<string, string>;
   private maxBinaryResponseBytes: number;
+  private readonly admission: RequestAdmission;
 
   constructor(config: InferenceConfig) {
+    this.admission =
+      config.requestAdmission instanceof RequestAdmission
+        ? config.requestAdmission
+        : new RequestAdmission(config.requestAdmission);
     this.baseUrl = normalizeBaseUrl(config.baseUrl);
     this.headers = {
       "Content-Type": "application/json",
@@ -128,8 +134,14 @@ export class InferenceClient {
         ...this.headers,
         Accept: "application/json",
       },
-      fetch: (request) => fetchLimitedInferenceResponse(request, this.maxBinaryResponseBytes),
+      fetch: (request) =>
+        fetchLimitedInferenceResponse(request, this.maxBinaryResponseBytes, this.admission.fetch),
     });
+  }
+
+  /** Close the admission owner. Explicitly shared owners close for every client. */
+  close(): void {
+    this.admission.close();
   }
 
   /** Generate one non-streaming chat completion. */
@@ -137,7 +149,7 @@ export class InferenceClient {
     request: Omit<GenerateRequest, "stream">,
     options?: RequestOptions
   ): Promise<GenerateResponse> {
-    const response = await fetch(`${this.baseUrl}/ai/v1/generate`, {
+    const response = await this.admission.fetch(`${this.baseUrl}/ai/v1/generate`, {
       method: "POST",
       headers: {
         ...this.headers,
@@ -167,7 +179,7 @@ export class InferenceClient {
     request: Omit<GenerateRequest, "stream">,
     options?: RequestOptions
   ): AsyncGenerator<GenerateChunk, void, void> {
-    const response = await fetch(`${this.baseUrl}/ai/v1/generate`, {
+    const response = await this.admission.fetch(`${this.baseUrl}/ai/v1/generate`, {
       method: "POST",
       headers: {
         ...this.headers,
@@ -274,7 +286,7 @@ export class InferenceClient {
     input: EmbedInput,
     options?: { truncate?: boolean }
   ): Promise<number[][]> {
-    const response = await fetch(`${this.baseUrl}/ai/v1/embed`, {
+    const response = await this.admission.fetch(`${this.baseUrl}/ai/v1/embed`, {
       method: "POST",
       headers: {
         ...this.headers,
@@ -385,7 +397,7 @@ export class InferenceClient {
     request: ChunkEmbeddingRequest,
     options?: RequestOptions
   ): AsyncGenerator<ChunkEmbeddingStreamEvent> {
-    const response = await fetch(`${this.baseUrl}/ai/v1/chunk`, {
+    const response = await this.admission.fetch(`${this.baseUrl}/ai/v1/chunk`, {
       method: "POST",
       headers: { ...this.headers, Accept: "application/x-ndjson" },
       body: JSON.stringify({ ...request, stream: true }),
@@ -399,8 +411,10 @@ export class InferenceClient {
     if (
       response.headers.get("content-type")?.split(";", 1)[0]?.trim() !== "application/x-ndjson" ||
       !response.body
-    )
+    ) {
+      await response.body?.cancel().catch(() => {});
       throw new Error("Expected chunk embedding NDJSON stream");
+    }
     let plan: string | undefined = request.continuation?.slice(0, 64);
     let next: number | undefined = request.continuation
       ? Number(request.continuation.slice(65))
@@ -892,9 +906,10 @@ function requestAcceptsEventStream(request: Request): boolean {
 
 async function fetchLimitedInferenceResponse(
   request: Request,
-  maxBinaryResponseBytes: number
+  maxBinaryResponseBytes: number,
+  fetchRequest: typeof globalThis.fetch
 ): Promise<Response> {
-  const response = await globalThis.fetch(request);
+  const response = await fetchRequest(request);
   if (!response.body) return response;
 
   const mediaType = responseMediaType(response);

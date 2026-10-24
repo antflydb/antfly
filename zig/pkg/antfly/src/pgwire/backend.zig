@@ -33,7 +33,35 @@ pub const Identity = struct {
     release: *const fn (*anyopaque, std.mem.Allocator) void,
 };
 
+/// Borrowed during open_stream. Retain before returning a stream that keeps
+/// frontend allocator state; release only after its last physical use. A lease
+/// is move-only: copying an acquired lease does not acquire another reference.
+pub const RetainedLifetime = struct {
+    context: *anyopaque,
+    retain_fn: *const fn (*anyopaque) void,
+    release_fn: *const fn (*anyopaque) void,
+
+    pub fn retain(self: RetainedLifetime) Lease {
+        self.retain_fn(self.context);
+        return .{ .lifetime = self };
+    }
+
+    pub const Lease = struct {
+        lifetime: ?RetainedLifetime = null,
+
+        pub fn release(self: *Lease) void {
+            const lifetime = self.lifetime orelse return;
+            self.lifetime = null;
+            lifetime.release_fn(lifetime.context);
+        }
+    };
+};
+
 pub const Request = struct {
+    /// Listener-owned flag only for draining an existing WITH HOLD cursor
+    /// before COMMIT. It never admits a new statement or stream.
+    completion_drain: bool = false,
+    retained_lifetime: ?RetainedLifetime = null,
     statement: []const u8,
     /// Reclaiming allocator sharing the connection cap. Result envelopes use
     /// the describe/execute arena; backend-owned execution scratch/results can
@@ -139,10 +167,18 @@ pub const Result = struct {
     }
 
     pub fn cell(self: Result, alloc: std.mem.Allocator, row: usize, column: usize) !Cell {
+        return self.cellControlled(alloc, row, column, null);
+    }
+    pub fn cellControlled(self: Result, alloc: std.mem.Allocator, row: usize, column: usize, control: ?ReadControl) !Cell {
+        if (control) |owner| try owner.checkpoint(owner.ptr);
         if (row >= self.rowCount() or column >= self.columns.len) return error.InvalidResult;
         if (self.cells) |cells| {
             if (self.rows.len != 0 or self.sql_nulls != null or cells.width != self.columns.len) return error.InvalidResult;
-            return cells.read(cells.context, alloc, std.math.add(usize, cells.begin, row) catch return error.InvalidResult, column);
+            const physical = std.math.add(usize, cells.begin, row) catch return error.InvalidResult;
+            if (cells.read_controlled) |read| return read(cells.context, alloc, physical, column, control);
+            const value = try cells.read(cells.context, alloc, physical, column);
+            if (control) |owner| try owner.checkpoint(owner.ptr);
+            return value;
         }
         if (self.rows[row].len != self.columns.len) return error.InvalidResult;
         if (self.sql_nulls) |flags| if (flags.len != self.rows.len or flags[row].len != self.columns.len) return error.InvalidResult;
@@ -169,6 +205,14 @@ pub const Result = struct {
     }
 };
 
+pub const ReadControl = @import("antfly_local_sources").sql_execution_batch.ReadControl;
+/// A synchronous borrow. Delivery must physically join before returning;
+/// payloads, allocators and the work/control frame remain caller-owned.
+pub const DeliveryWork = struct {
+    context: *anyopaque,
+    run: *const fn (*anyopaque, ?ReadControl) anyerror!void,
+};
+
 pub const Cell = struct {
     /// Canonical JSONB bytes owned by the result lease. JSON null remains a
     /// non-NULL value; ordinary scalars keep their existing representation.
@@ -187,6 +231,7 @@ pub const Cells = struct {
     count: usize,
     width: usize,
     read: *const fn (*anyopaque, std.mem.Allocator, usize, usize) anyerror!Cell,
+    read_controlled: ?*const fn (*anyopaque, std.mem.Allocator, usize, usize, ?ReadControl) anyerror!Cell = null,
 };
 
 pub const Backend = struct {
@@ -195,6 +240,9 @@ pub const Backend = struct {
 
     pub const VTable = struct {
         native_parameters: bool = false,
+        /// Encode a read row on bounded shared execution, joining before
+        /// transport writes. Controls are classified from Request.statement.
+        deliver_row: ?*const fn (*anyopaque, Identity, Request, DeliveryWork) anyerror!void = null,
         // Called even when a deployment permits anonymous access. The backend
         // alone decides whether credentials authorize a principal; a startup
         // username/database never itself grants access.

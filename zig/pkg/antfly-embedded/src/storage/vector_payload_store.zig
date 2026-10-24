@@ -26,6 +26,7 @@ const vector_block = @import("antfly_vectorindex").vector_block;
 const Allocator = std.mem.Allocator;
 const resources = @import("resource_manager.zig");
 const time = @import("antfly_platform").time;
+const original_lifetime = @import("../common/seed_snapshot_lifetime.zig");
 const LiveSet = @import("source_vector_live_set.zig").LiveSet;
 const generation_publication = @import("generation_publication.zig");
 
@@ -675,8 +676,74 @@ pub const Store = struct {
         }
     };
 
+    /// Each turn performs at most the requested number of item/heap steps.
+    /// A heap step has at most log2(live.count()) fixed-size comparisons;
+    /// no full-size sort scratch or caller capability survives a turn.
+    const CollectionPlan = struct {
+        phase: enum { fill, heap, sort, done } = .fill,
+        iterator: ?LiveSet.Iterator = null,
+        written: usize = 0,
+        heap_remaining: usize = 0,
+        sort_end: usize = 0,
+
+        fn advance(self: *CollectionPlan, collection: *Collection, quantum: usize, lifetime: ?*const original_lifetime.Control) !void {
+            for (0..quantum) |_| {
+                try original_lifetime.checkpoint(lifetime);
+                switch (self.phase) {
+                    .fill => {
+                        if (self.iterator == null) self.iterator = collection.live.iterator();
+                        switch (self.iterator.?.nextStep(1)) {
+                            .item => |item| {
+                                const hash = vector_block.keyHash(&item.key_ptr.*);
+                                collection.items[self.written] = .{ .digest = item.key_ptr.*, .dims = item.value_ptr.*, .hash = hash, .shard = @intCast(hash & (collection.shards - 1)) };
+                                self.written += 1;
+                            },
+                            .yielded => {},
+                            .done => {
+                                std.debug.assert(self.written == collection.items.len);
+                                self.iterator = null;
+                                self.heap_remaining = collection.items.len / 2;
+                                self.sort_end = collection.items.len;
+                                self.phase = .heap;
+                            },
+                        }
+                    },
+                    .heap => {
+                        if (self.heap_remaining == 0) {
+                            self.phase = .sort;
+                        } else {
+                            self.heap_remaining -= 1;
+                            sift(collection.items, self.heap_remaining);
+                        }
+                    },
+                    .sort => {
+                        if (self.sort_end <= 1) {
+                            self.phase = .done;
+                            return;
+                        }
+                        self.sort_end -= 1;
+                        std.mem.swap(CollectionItem, &collection.items[0], &collection.items[self.sort_end]);
+                        sift(collection.items[0..self.sort_end], 0);
+                    },
+                    .done => return,
+                }
+            }
+        }
+        fn sift(items: []CollectionItem, initial: usize) void {
+            var root = initial;
+            while (root < items.len / 2) {
+                var child = root * 2 + 1;
+                if (child + 1 < items.len and CollectionItem.less({}, items[child], items[child + 1])) child += 1;
+                if (!CollectionItem.less({}, items[root], items[child])) return;
+                std.mem.swap(CollectionItem, &items[root], &items[child]);
+                root = child;
+            }
+        }
+    };
+
     const Collection = struct {
         plan_ready: bool = true,
+        plan: CollectionPlan = .{},
         background_hint: bool = false,
         input: native.Opened,
         live: LiveSet,
@@ -869,12 +936,14 @@ pub const Store = struct {
         }
     }
 
-    fn scanMarking(marking: *Marking, started: u64, budget_ns: u64, limit: usize, allow_verification: bool, progress: *ScanProgress) !void {
+    fn scanMarking(marking: *Marking, started: u64, budget_ns: u64, limit: usize, allow_verification: bool, progress: *ScanProgress, lifetime: ?*const original_lifetime.Control) !void {
         while (marking.live.locatorPending()) {
+            try original_lifetime.checkpoint(lifetime);
             if (markBudgetExpired(started, budget_ns, limit, progress)) return;
             if (try marking.live.advanceLocator()) progress.rows += 1;
         }
         while (!marking.primary_done) {
+            try original_lifetime.checkpoint(lifetime);
             if (markBudgetExpired(started, budget_ns, limit, progress)) return;
             const entry = if (!marking.started)
                 (if (marking.indexed) try marking.cursor.seekAtOrAfter(payload.ownership_prefix) else try marking.cursor.first())
@@ -903,6 +972,7 @@ pub const Store = struct {
             while (marking.ann_reader < ann.readers.len) {
                 const reader = ann.readers[marking.ann_reader];
                 while (marking.ann_row < reader.count) : (marking.ann_row += 1) {
+                    try original_lifetime.checkpoint(lifetime);
                     if (markBudgetExpired(started, budget_ns, limit, progress)) return;
                     progress.rows += 1;
                     const row = reader.sourceIdentityAt(marking.ann_row);
@@ -912,6 +982,7 @@ pub const Store = struct {
                 marking.ann_reader += 1;
             }
             while (marking.ann_wal < ann.wal.records.items.len) : (marking.ann_wal += 1) {
+                try original_lifetime.checkpoint(lifetime);
                 if (markBudgetExpired(started, budget_ns, limit, progress)) return;
                 progress.rows += 1;
                 const record = ann.wal.records.items[marking.ann_wal];
@@ -921,11 +992,17 @@ pub const Store = struct {
         if (marking.cost_policy or (allow_verification and marking.live.count() == marking.retained_at_cut)) {
             if (marking.verification == null) marking.verification = marking.live.iterator();
             while (true) {
+                try original_lifetime.checkpoint(lifetime);
                 if (markBudgetExpired(started, budget_ns, limit, progress)) return;
-                const item = marking.verification.?.next() orelse break;
-                progress.rows += 1;
-                try verifyLiveLocation(&marking.source, item.key_ptr.*, item.value_ptr.*);
-                marking.verified_bytes += @as(u64, item.value_ptr.*) * 4;
+                switch (marking.verification.?.nextStep(1)) {
+                    .done => break,
+                    .yielded => progress.rows += 1,
+                    .item => |item| {
+                        progress.rows += 1;
+                        try verifyLiveLocation(&marking.source, item.key_ptr.*, item.value_ptr.*);
+                        marking.verified_bytes += @as(u64, item.value_ptr.*) * 4;
+                    },
+                }
             }
             marking.verification_done = true;
         }
@@ -933,6 +1010,7 @@ pub const Store = struct {
             if (!marking.verification_done or marking.planning_required) while (marking.planning_reader < marking.source.readers.len) {
                 const reader = marking.source.readers[marking.planning_reader];
                 while (marking.planning_row < reader.count) : (marking.planning_row += 1) {
+                    try original_lifetime.checkpoint(lifetime);
                     if (markBudgetExpired(started, budget_ns, limit, progress)) return;
                     progress.rows += 1;
                     try stats[marking.planning_reader].add(reader, marking.planning_row, &marking.live);
@@ -947,6 +1025,9 @@ pub const Store = struct {
     // Enter and return with the source mutex held, including on scan failure.
     // A running mark owns its snapshots until this function rejoins the writer.
     fn scanMarkingLocked(self: *Store, outside_lock: bool) !bool {
+        return self.scanMarkingLockedWithLifetime(outside_lock, null);
+    }
+    fn scanMarkingLockedWithLifetime(self: *Store, outside_lock: bool, lifetime: ?*const original_lifetime.Control) !bool {
         const marking = self.marking orelse return false;
         if (marking.running) {
             self.stats.collection_mark_busy_deferrals += 1;
@@ -963,7 +1044,7 @@ pub const Store = struct {
             if (self.mark_test_hook) |hook| hook(self);
         }
         var progress: ScanProgress = .{};
-        const result = scanMarking(marking, started, budget_ns, limit, allow_verification, &progress);
+        const result = scanMarking(marking, started, budget_ns, limit, allow_verification, &progress, lifetime);
         const elapsed = time.monotonicNs() -| started;
         if (outside_lock) self.lock();
         marking.running = false;
@@ -1079,19 +1160,30 @@ pub const Store = struct {
     /// No primary publication or catalog access: safe before taking DB.apply.
     /// Only immutable leases and scanner-private state are accessed unlocked.
     pub fn advanceMarkingSnapshot(self: *Store) !void {
+        return self.advanceMarkingSnapshotInternal(null, null);
+    }
+    pub fn advanceMarkingSnapshotWithLifetime(self: *Store, io: std.Io, lifetime: *const original_lifetime.Control) !void {
+        return self.advanceMarkingSnapshotInternal(io, lifetime);
+    }
+    fn lockWithLifetime(self: *Store, io: ?std.Io, lifetime: ?*const original_lifetime.Control) !void {
+        if (lifetime) |control| try original_lifetime.lockAtomic(io.?, &self.mutex, control) else self.lock();
+    }
+    fn advanceMarkingSnapshotInternal(self: *Store, io: ?std.Io, lifetime: ?*const original_lifetime.Control) !void {
+        try original_lifetime.checkpoint(lifetime);
         if (self.cost_based_gc) if (self.preparation_manager) |manager| if (manager.capacitySource()) |probe| {
             const observation = probe.current() catch null;
-            self.lock();
+            try self.lockWithLifetime(io, lifetime);
             self.capacity_observation = observation;
             self.mutex.unlock();
         };
-        try self.advanceCollectionReaders();
+        try self.advanceCollectionReadersInternal(io, lifetime);
+        try original_lifetime.checkpoint(lifetime);
         if (!self.mark_outside_lock) return;
-        self.lock();
+        try self.lockWithLifetime(io, lifetime);
         defer self.mutex.unlock();
         if (self.poisoned) return error.VectorPayloadStorePoisoned;
         if (self.stats.unresolved_primary_commits != 0) return;
-        _ = try self.scanMarkingLocked(true);
+        _ = try self.scanMarkingLockedWithLifetime(true, lifetime);
     }
 
     fn advanceMarkingLocked(self: *Store, budget_bytes: u64) !bool {
@@ -1108,7 +1200,10 @@ pub const Store = struct {
     /// Build one immutable reader per turn; neither a corpus validation nor old
     /// generation destruction belongs inside the publication fence.
     pub fn advanceCollectionReaders(self: *Store) !void {
-        self.lock();
+        return self.advanceCollectionReadersInternal(null, null);
+    }
+    fn advanceCollectionReadersInternal(self: *Store, io: ?std.Io, lifetime: ?*const original_lifetime.Control) !void {
+        try self.lockWithLifetime(io, lifetime);
         if (self.retiring) |retired| {
             self.retiring = null;
             self.mutex.unlock();
@@ -1118,28 +1213,26 @@ pub const Store = struct {
             self.stats.collection_retire_outside_lock_ns += time.monotonicNs() -| start;
         }
         defer self.mutex.unlock();
-        if (!self.detached_collection or self.poisoned) return;
+        if (self.poisoned) return;
         const collection = self.collection orelse return;
         if (collection.validation_running or collection.validation_error != null) return;
         if (!collection.plan_ready) {
             collection.validation_running = true;
             self.mutex.unlock();
             const start = time.monotonicNs();
-            var it = collection.live.iterator();
-            var pos: usize = 0;
-            while (it.next()) |item| : (pos += 1) {
-                const hash = vector_block.keyHash(&item.key_ptr.*);
-                collection.items[pos] = .{ .digest = item.key_ptr.*, .dims = item.value_ptr.*, .hash = hash, .shard = @intCast(hash & (collection.shards - 1)) };
-            }
-            std.debug.assert(pos == collection.items.len);
-            std.mem.sort(CollectionItem, collection.items, {}, CollectionItem.less);
+            const result = collection.plan.advance(collection, 4096, lifetime);
             const elapsed = time.monotonicNs() -| start;
+            // A claimed planner must rejoin before its caller can reject.
+            // Its cursor belongs to the immutable collection, never the
+            // borrowed lifetime, so later maintenance can resume the same cut.
             self.lock();
-            collection.plan_ready = true;
             collection.validation_running = false;
+            collection.plan_ready = collection.plan.phase == .done;
             self.stats.collection_plan_outside_lock_ns += elapsed;
+            try result;
             return;
         }
+        if (!self.detached_collection) return;
         if (collection.validated.items.len == collection.staged.items.len) return;
         collection.validated.ensureUnusedCapacity(self.alloc, 1) catch |err| {
             collection.validation_error = err;
@@ -2958,7 +3051,7 @@ pub const Store = struct {
         while (copy_dims.next()) |dims| copy_bytes += @as(u64, dims.*) * 4;
         const items = try self.alloc.alloc(CollectionItem, copying.count());
         errdefer if (constructing) self.alloc.free(items);
-        const detached_plan = self.detached_collection and !partial;
+        const detached_plan = (self.detached_collection or self.background_gc) and !partial;
         if (!detached_plan) {
             var it = copying.iterator();
             var pos: usize = 0;
@@ -5454,7 +5547,7 @@ test "source vector payloads mark workspace admission releases snapshots and res
         source.sparse_gc_copy_bytes = 64 * 1024 * 1024;
         try std.testing.expect(!try source.startMarkingLocked(&raw));
         var progress: Store.ScanProgress = .{};
-        try Store.scanMarking(source.marking.?, time.monotonicNs(), 0, std.math.maxInt(usize), true, &progress);
+        try Store.scanMarking(source.marking.?, time.monotonicNs(), 0, std.math.maxInt(usize), true, &progress, null);
         try std.testing.expect(source.marking.?.scan_done);
         budget.reservation.shrink(budget.reservation.bytes - budget.live_bytes);
         var plan_pressure = try manager.reserve(.dense_source_payload_state, limit - manager.sliceStats(.dense_source_payload_state).used_bytes);
@@ -6693,7 +6786,7 @@ test "source vector payloads GC scan preserves snapshots without admitting prima
     try store.delete(key);
     const before = cache.snapshotStats();
     var progress: Store.ScanProgress = .{};
-    try Store.scanMarking(source.marking.?, time.monotonicNs(), 0, std.math.maxInt(usize), true, &progress);
+    try Store.scanMarking(source.marking.?, time.monotonicNs(), 0, std.math.maxInt(usize), true, &progress, null);
     try std.testing.expect(source.marking.?.verification_done);
     try std.testing.expectEqual(@as(u64, 12), source.marking.?.verified_bytes);
     const after = cache.snapshotStats();
@@ -7334,4 +7427,504 @@ test "source vector payloads session duplicate insertion at capacity does not gr
     for (0..256) |_| _ = try session.put(first, artifact);
     try std.testing.expectEqual(capacity, session.prepared.capacity());
     try std.testing.expectEqual(@as(usize, 0), failing.alloc_index);
+}
+
+test "source vector payloads original maintenance lifetime rejects actual marking and remains reusable" {
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
+    const mem = @import("mem_backend.zig");
+    const docs = @import("docstore.zig");
+    const keys = @import("internal_keys.zig");
+    const runtime = @import("antfly_runtime_abi");
+    var memory = lsm.MemoryStorage.init(alloc);
+    defer memory.deinit();
+    var backend = mem.Backend.init(alloc, .{});
+    defer backend.close();
+    var raw = try backend.runtimeStore(alloc, .{ .name = "docs" });
+    defer raw.deinit();
+    var source = try Store.open(alloc, memory.storage(), "/original-maintenance-mark", false);
+    defer source.deinit();
+    source.mark_outside_lock = true;
+    source.mark_step_rows = 16384;
+    source.mark_step_ns = 0;
+    var store = try docs.DocStore.openRuntime(alloc, &raw);
+    defer store.close();
+    store.payload_store = source.interface();
+    const artifact = try codec.encodeDenseEmbeddingAlloc(alloc, 1, &.{ 1, 2, 3 });
+    defer alloc.free(artifact);
+    for (0..80) |i| {
+        var buf: [32]u8 = undefined;
+        const key = try keys.embeddingArtifactKeyForDocumentAlloc(alloc, try std.fmt.bufPrint(&buf, "doc-{d}", .{i}), "model");
+        defer alloc.free(key);
+        try store.put(key, artifact);
+    }
+    const Check = struct {
+        calls: usize = 0,
+        fail_after: usize,
+        cause: anyerror,
+        fn check(raw_control: *anyopaque) callconv(.c) runtime.error_abi.Status {
+            const self: *@This() = @ptrCast(@alignCast(raw_control));
+            self.calls += 1;
+            if (self.calls >= self.fail_after) return runtime.error_abi.statusFromError(self.cause);
+            return .ok;
+        }
+    };
+    // Initial source contention must reject without unlocking another holder.
+    try std.testing.expect(source.mutex.tryLock());
+    var held: Check = .{ .fail_after = 3, .cause = error.DeadlineExceeded };
+    const held_control: original_lifetime.Control = .{ .context = &held, .check = Check.check };
+    const held_result = source.advanceMarkingSnapshotWithLifetime(std.testing.io, &held_control);
+    try std.testing.expect(!source.mutex.tryLock());
+    source.mutex.unlock();
+    try std.testing.expectError(error.DeadlineExceeded, held_result);
+    for ([_]anyerror{ error.Canceled, error.DeadlineExceeded, error.SchedulerClosed }) |cause| {
+        try std.testing.expect(!try source.collectStepDeferredMark(&raw, std.math.maxInt(u64)));
+        try std.testing.expect(source.marking != null);
+        const before = source.statsSnapshot().collection_mark_rows;
+        var check: Check = .{ .fail_after = 16, .cause = cause };
+        const lifetime: original_lifetime.Control = .{ .context = &check, .check = Check.check };
+        try std.testing.expectError(cause, source.advanceMarkingSnapshotWithLifetime(std.testing.io, &lifetime));
+        try std.testing.expect(source.statsSnapshot().collection_mark_rows > before);
+        try std.testing.expect(source.marking == null);
+        try std.testing.expect(source.mutex.tryLock());
+        source.mutex.unlock();
+        try std.testing.expectEqual(@as(u64, 80), source.statsSnapshot().retained_payloads);
+    }
+    var turns: usize = 0;
+    while (!try source.collectStep(&raw, std.math.maxInt(u64))) : (turns += 1) try std.testing.expect(turns < 256);
+    const key = try keys.embeddingArtifactKeyForDocumentAlloc(alloc, "doc-0", "model");
+    defer alloc.free(key);
+    const restored = try store.get(alloc, key);
+    defer alloc.free(restored);
+    try std.testing.expectEqualSlices(u8, artifact, restored);
+}
+
+test "source vector payloads resumable heap planning matches deterministic shard ordering" {
+    const alloc = std.testing.allocator;
+    for (0..66) |count| {
+        const items = try alloc.alloc(Store.CollectionItem, count);
+        defer alloc.free(items);
+        for (items, 0..) |*item, i| {
+            var digest: payload.Digest = @splat(0);
+            std.mem.writeInt(u64, digest[0..8], @intCast(count - i), .little);
+            const hash = vector_block.keyHash(&digest);
+            item.* = .{ .digest = digest, .dims = @intCast(i + 1), .hash = hash, .shard = @intCast(hash & 15) };
+        }
+        const expected = try alloc.dupe(Store.CollectionItem, items);
+        defer alloc.free(expected);
+        std.mem.sort(Store.CollectionItem, expected, {}, Store.CollectionItem.less);
+        // Sorting touches only initialized items and its explicit cursors.
+        var collection: Store.Collection = .{ .input = undefined, .live = undefined, .tail = undefined, .items = items, .shards = 16, .generation = 0, .boundary = undefined, .total_live_bytes = 0, .marked_live_bytes = 0, .primary_epoch = 0, .ann = @splat(0) };
+        var plan: Store.CollectionPlan = .{ .phase = .heap, .written = count, .heap_remaining = count / 2, .sort_end = count };
+        var turns: usize = 0;
+        while (plan.phase != .done) : (turns += 1) {
+            try std.testing.expect(turns < count * 3 + 8);
+            try plan.advance(&collection, 1, null);
+        }
+        for (expected, items) |a, b| try std.testing.expectEqualDeep(a, b);
+    }
+}
+
+test "source vector payloads default background planning resumes original lifetime rejection without publication" {
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
+    const mem = @import("mem_backend.zig");
+    const docs = @import("docstore.zig");
+    const keys = @import("internal_keys.zig");
+    const runtime = @import("antfly_runtime_abi");
+    var memory = lsm.MemoryStorage.init(alloc);
+    defer memory.deinit();
+    var backend = mem.Backend.init(alloc, .{});
+    defer backend.close();
+    var raw = try backend.runtimeStore(alloc, .{ .name = "docs" });
+    defer raw.deinit();
+    var source = try Store.open(alloc, memory.storage(), "/original-collection-plan", false);
+    defer source.deinit();
+    source.background_gc = true;
+    source.mark_outside_lock = true;
+    source.mark_step_ns = 0;
+    source.detached_collection = false;
+    var store = try docs.DocStore.openRuntime(alloc, &raw);
+    defer store.close();
+    store.payload_store = source.interface();
+    const artifact = try codec.encodeDenseEmbeddingAlloc(alloc, 1, &.{ 1, 2, 3 });
+    defer alloc.free(artifact);
+    for (0..80) |i| {
+        var buf: [32]u8 = undefined;
+        const key = try keys.embeddingArtifactKeyForDocumentAlloc(alloc, try std.fmt.bufPrint(&buf, "doc-{d}", .{i}), "model");
+        defer alloc.free(key);
+        try store.put(key, artifact);
+    }
+    // One uncommitted preparation requires a genuine collection plan rather
+    // than the all-live fast path; it never changes primary query authority.
+    const orphan = try payload.Reference.forArtifact("uncommitted", artifact);
+    try Store.prepare(&source, &.{.{ .reference = orphan, .artifact = artifact }});
+    try std.testing.expect(!try source.collectBackgroundStepDeferredMark(&raw, std.math.maxInt(u64)));
+    try source.advanceMarkingSnapshot();
+    try std.testing.expect(!try source.collectBackgroundStepDeferredMark(&raw, std.math.maxInt(u64)));
+    const collection = source.collection.?;
+    try std.testing.expect(!collection.plan_ready);
+    const original_generation = source.currentGeneration();
+    const Check = struct {
+        plan: *Store.CollectionPlan,
+        calls: usize = 0,
+        phase: @FieldType(Store.CollectionPlan, "phase"),
+        cause: ?anyerror,
+        fn check(raw_control: *anyopaque) callconv(.c) runtime.error_abi.Status {
+            const self: *@This() = @ptrCast(@alignCast(raw_control));
+            self.calls += 1;
+            if (self.calls >= 16 and self.plan.written != 0 and self.plan.phase == self.phase) if (self.cause) |cause| return runtime.error_abi.statusFromError(cause);
+            return .ok;
+        }
+    };
+    for ([_]anyerror{ error.Canceled, error.DeadlineExceeded, error.SchedulerClosed }, [_]@FieldType(Store.CollectionPlan, "phase"){ .fill, .heap, .sort }) |cause, phase| {
+        var check: Check = .{ .plan = &collection.plan, .phase = phase, .cause = cause };
+        const lifetime: original_lifetime.Control = .{ .context = &check, .check = Check.check };
+        try std.testing.expectError(cause, source.advanceMarkingSnapshotWithLifetime(std.testing.io, &lifetime));
+        try std.testing.expect(source.collection == collection);
+        try std.testing.expect(collection.plan.written > 0);
+        try std.testing.expect(!collection.validation_running);
+        try std.testing.expect(!collection.plan_ready);
+        try std.testing.expectEqual(phase, collection.plan.phase);
+        try std.testing.expectEqual(original_generation, source.currentGeneration());
+        try std.testing.expectEqual(@as(u64, 0), source.statsSnapshot().collections);
+        try std.testing.expect(source.mutex.tryLock());
+        source.mutex.unlock();
+    }
+    try source.advanceMarkingSnapshot();
+    try std.testing.expect(collection.plan_ready);
+    for (collection.items[1..], collection.items[0 .. collection.items.len - 1]) |item, previous| try std.testing.expect(!Store.CollectionItem.less({}, item, previous));
+    var turns: usize = 0;
+    while (!try source.collectBackgroundStepDeferredMark(&raw, std.math.maxInt(u64))) : (turns += 1) try std.testing.expect(turns < 256);
+    const key = try keys.embeddingArtifactKeyForDocumentAlloc(alloc, "doc-0", "model");
+    defer alloc.free(key);
+    const restored = try store.get(alloc, key);
+    defer alloc.free(restored);
+    try std.testing.expectEqualSlices(u8, artifact, restored);
+    try std.testing.expectEqual(@as(u64, 80), source.statsSnapshot().retained_payloads);
+}
+
+test "source vector payloads production planning quantum returns before finishing a large plan" {
+    const alloc = std.testing.allocator;
+    const count = 4097;
+    const items = try alloc.alloc(Store.CollectionItem, count);
+    defer alloc.free(items);
+    var collection: Store.Collection = .{ .plan_ready = false, .input = undefined, .live = LiveSet.init(alloc), .tail = undefined, .items = items, .shards = 16, .generation = 0, .boundary = undefined, .total_live_bytes = 0, .marked_live_bytes = 0, .primary_epoch = 0, .ann = @splat(0) };
+    defer collection.live.deinit();
+    for (0..count) |i| {
+        var digest: payload.Digest = @splat(0);
+        std.mem.writeInt(u64, digest[0..8], @intCast(i), .little);
+        try collection.live.put(digest, @intCast(i + 1));
+    }
+    try collection.plan.advance(&collection, 4096, null);
+    try std.testing.expect(collection.plan.written > 0 and collection.plan.written < count);
+    try std.testing.expectEqual(collection.live.map.capacity() - 4096, collection.plan.iterator.?.keys.len);
+    try std.testing.expectEqual(.fill, collection.plan.phase);
+    try collection.plan.advance(&collection, 4096, null);
+    try std.testing.expectEqual(.fill, collection.plan.phase);
+    try std.testing.expectEqual(@as(usize, count), collection.plan.written);
+    try collection.plan.advance(&collection, 4096, null);
+    try std.testing.expectEqual(.sort, collection.plan.phase);
+    try std.testing.expect(collection.plan.sort_end > 1);
+    const expected = try alloc.dupe(Store.CollectionItem, items);
+    defer alloc.free(expected);
+    std.mem.sort(Store.CollectionItem, expected, {}, Store.CollectionItem.less);
+    try collection.plan.advance(&collection, 4096, null);
+    try std.testing.expectEqual(.done, collection.plan.phase);
+    for (expected, items) |a, b| try std.testing.expectEqualDeep(a, b);
+}
+
+test "source vector payloads bounded live iteration yields across sparse fallback slots" {
+    var live = LiveSet.init(std.testing.allocator);
+    defer live.deinit();
+    try live.map.ensureTotalCapacity(65536);
+    var digest: payload.Digest = @splat(0);
+    var selected = false;
+    for (0..1024) |i| {
+        std.mem.writeInt(u64, digest[0..8], @intCast(i), .little);
+        try live.put(digest, 7);
+        var ordinary = live.map.iterator();
+        _ = ordinary.next().?;
+        if (ordinary.index > 32) {
+            selected = true;
+            break;
+        }
+        live.map.clearRetainingCapacity();
+    }
+    try std.testing.expect(selected);
+    var iterator = live.iterator();
+    try std.testing.expectEqual(.yielded, std.meta.activeTag(iterator.nextStep(0)));
+    try std.testing.expectEqual(.yielded, std.meta.activeTag(iterator.nextStep(32)));
+    try std.testing.expectEqual(live.map.capacity() - 32, iterator.keys.len);
+    var seen: usize = 0;
+    var turns: usize = 0;
+    while (true) : (turns += 1) switch (iterator.nextStep(32)) {
+        .yielded => try std.testing.expect(turns < live.map.capacity()),
+        .done => break,
+        .item => |entry| {
+            seen += 1;
+            try std.testing.expectEqualSlices(u8, &digest, entry.key_ptr);
+            try std.testing.expectEqual(@as(u32, 7), entry.value_ptr.*);
+        },
+    };
+    try std.testing.expectEqual(@as(usize, 1), seen);
+    var legacy = live.iterator();
+    try std.testing.expectEqualSlices(u8, &digest, legacy.next().?.key_ptr);
+    try std.testing.expect(legacy.next() == null);
+}
+
+test "source vector payloads bounded live iteration resumes sparse physical bitmap rows and locator words" {
+    const alloc = std.testing.allocator;
+    var memory = lsm.MemoryStorage.init(alloc);
+    defer memory.deinit();
+    var source = try Store.open(alloc, memory.storage(), "/bounded-live-bitmap", false);
+    defer source.deinit();
+    const artifact = try codec.encodeDenseEmbeddingAlloc(alloc, 1, &.{ 1, 2, 3 });
+    defer alloc.free(artifact);
+    var preparations: [128]payload.Prepared = undefined;
+    for (&preparations, 0..) |*item, i| {
+        var identity: [8]u8 = undefined;
+        std.mem.writeInt(u64, &identity, @intCast(i), .little);
+        item.* = .{ .reference = try payload.Reference.forArtifact(&identity, artifact), .artifact = artifact };
+    }
+    try Store.prepare(&source, &preparations);
+    try source.checkpoint();
+    try std.testing.expect(source.opened.readers.len != 0);
+    const reader = source.opened.readers[source.opened.readers.len - 1];
+    const last = reader.sourceIdentityAt(reader.count - 1);
+    for ([_]bool{ false, true }) |indexed| {
+        var live = LiveSet.init(alloc);
+        defer live.deinit();
+        try live.enableBitmapsMode(&source.opened, indexed);
+        try live.put(last.key[0..32].*, last.dims);
+        var iterator = live.iterator();
+        try std.testing.expectEqual(.yielded, std.meta.activeTag(iterator.nextStep(1)));
+        var seen: usize = 0;
+        var turns: usize = 0;
+        while (true) : (turns += 1) switch (iterator.nextStep(1)) {
+            .yielded => try std.testing.expect(turns < 1024),
+            .done => break,
+            .item => |entry| {
+                seen += 1;
+                try std.testing.expectEqualSlices(u8, last.key, entry.key_ptr);
+                try std.testing.expectEqual(last.dims, entry.value_ptr.*);
+            },
+        };
+        try std.testing.expectEqual(@as(usize, 1), seen);
+        var legacy = live.iterator();
+        try std.testing.expectEqualSlices(u8, last.key, legacy.next().?.key_ptr);
+        try std.testing.expect(legacy.next() == null);
+    }
+}
+
+test "source vector payloads live verification charges sparse searches and rejects original lifetime mid-search" {
+    const alloc = std.testing.allocator;
+    const mem = @import("mem_backend.zig");
+    const docs = @import("docstore.zig");
+    const keys = @import("internal_keys.zig");
+    const runtime = @import("antfly_runtime_abi");
+    var memory = lsm.MemoryStorage.init(alloc);
+    defer memory.deinit();
+    var backend = mem.Backend.init(alloc, .{});
+    defer backend.close();
+    var raw = try backend.runtimeStore(alloc, .{ .name = "docs" });
+    defer raw.deinit();
+    var source = try Store.open(alloc, memory.storage(), "/bounded-live-verification", false);
+    defer source.deinit();
+    source.mark_outside_lock = true;
+    source.mark_step_rows = 1;
+    source.mark_step_ns = 0;
+    var store = try docs.DocStore.openRuntime(alloc, &raw);
+    defer store.close();
+    store.payload_store = source.interface();
+    const artifact = try codec.encodeDenseEmbeddingAlloc(alloc, 1, &.{ 1, 2, 3 });
+    defer alloc.free(artifact);
+    for (0..8) |i| {
+        var buf: [32]u8 = undefined;
+        const key = try keys.embeddingArtifactKeyForDocumentAlloc(alloc, try std.fmt.bufPrint(&buf, "doc-{d}", .{i}), "model");
+        defer alloc.free(key);
+        try store.put(key, artifact);
+    }
+    try std.testing.expect(!try source.collectStepDeferredMark(&raw, std.math.maxInt(u64)));
+    var turns: usize = 0;
+    while (source.marking.?.verification == null) : (turns += 1) {
+        try std.testing.expect(turns < 256);
+        try source.advanceMarkingSnapshot();
+    }
+    const mark = source.marking.?;
+    try mark.live.map.ensureTotalCapacity(65536);
+    mark.verification = mark.live.iterator();
+    mark.verified_bytes = 0;
+    mark.verification_done = false;
+    mark.scan_done = false;
+    for (0..4) |_| {
+        const slots_before = mark.verification.?.keys.len;
+        const work_before = source.statsSnapshot().collection_mark_rows;
+        try source.advanceMarkingSnapshot();
+        try std.testing.expectEqual(slots_before - 1, mark.verification.?.keys.len);
+        try std.testing.expectEqual(work_before + 1, source.statsSnapshot().collection_mark_rows);
+        try std.testing.expect(!mark.verification_done);
+    }
+    const Check = struct {
+        source: *Store,
+        slots: usize,
+        fn check(raw_control: *anyopaque) callconv(.c) runtime.error_abi.Status {
+            const self: *@This() = @ptrCast(@alignCast(raw_control));
+            if (self.source.marking) |active| if (active.verification) |cursor| {
+                if (cursor.keys.len < self.slots) return runtime.error_abi.statusFromError(error.DeadlineExceeded);
+            };
+            return .ok;
+        }
+    };
+    var check: Check = .{ .source = &source, .slots = mark.verification.?.keys.len };
+    const lifetime: original_lifetime.Control = .{ .context = &check, .check = Check.check };
+    const work_before = source.statsSnapshot().collection_mark_rows;
+    try std.testing.expectError(error.DeadlineExceeded, source.advanceMarkingSnapshotWithLifetime(std.testing.io, &lifetime));
+    try std.testing.expectEqual(work_before + 1, source.statsSnapshot().collection_mark_rows);
+    try std.testing.expect(source.marking == null);
+    try std.testing.expect(source.mutex.tryLock());
+    source.mutex.unlock();
+    source.mark_step_rows = 4096;
+    turns = 0;
+    while (!try source.collectStep(&raw, std.math.maxInt(u64))) : (turns += 1) try std.testing.expect(turns < 256);
+    const key = try keys.embeddingArtifactKeyForDocumentAlloc(alloc, "doc-0", "model");
+    defer alloc.free(key);
+    const restored = try store.get(alloc, key);
+    defer alloc.free(restored);
+    try std.testing.expectEqualSlices(u8, artifact, restored);
+}
+
+test "source vector payloads locator collision probes yield and preserve original rejection and full identity" {
+    const alloc = std.testing.allocator;
+    const mem = @import("mem_backend.zig");
+    const docs = @import("docstore.zig");
+    const keys = @import("internal_keys.zig");
+    const runtime = @import("antfly_runtime_abi");
+    var memory = lsm.MemoryStorage.init(alloc);
+    defer memory.deinit();
+    var backend = mem.Backend.init(alloc, .{});
+    defer backend.close();
+    var raw = try backend.runtimeStore(alloc, .{ .name = "docs" });
+    defer raw.deinit();
+    var source = try Store.open(alloc, memory.storage(), "/bounded-locator-probes", false);
+    defer source.deinit();
+    source.bitmap_marking = true;
+    source.bitmap_locator = true;
+    source.mark_outside_lock = true;
+    source.mark_step_rows = 1;
+    source.mark_step_ns = 0;
+    var store = try docs.DocStore.openRuntime(alloc, &raw);
+    defer store.close();
+    store.payload_store = source.interface();
+    const artifact = try codec.encodeDenseEmbeddingAlloc(alloc, 1, &.{ 1, 2, 3 });
+    defer alloc.free(artifact);
+    var references: [32]payload.Reference = undefined;
+    var selected: usize = 0;
+    var selected_keys: [32][]u8 = undefined;
+    defer for (selected_keys[0..selected]) |key| alloc.free(key);
+    var attempt: usize = 0;
+    while (selected < references.len) : (attempt += 1) {
+        try std.testing.expect(attempt < 65536);
+        var buf: [32]u8 = undefined;
+        const key = try keys.embeddingArtifactKeyForDocumentAlloc(alloc, try std.fmt.bufPrint(&buf, "doc-{d}", .{attempt}), "model");
+        defer alloc.free(key);
+        const reference = try payload.Reference.forArtifact(key, artifact);
+        // 32 unique rows require 64 locator buckets.
+        if (std.mem.readInt(u64, reference.digest[0..8], .little) & 63 != 0) continue;
+        try store.put(key, artifact);
+        selected_keys[selected] = try alloc.dupe(u8, key);
+        references[selected] = reference;
+        selected += 1;
+    }
+    try source.checkpoint();
+    var indexed = LiveSet.init(alloc);
+    defer indexed.deinit();
+    try indexed.enableBitmapsDeferred(&source.opened, true);
+    try std.testing.expectEqual(@as(usize, 64), indexed.locator.?.slots.len);
+    var turns: usize = 0;
+    while (try indexed.advanceLocator()) : (turns += 1) {
+        try std.testing.expect(turns < 2048);
+        if (indexed.locator.?.probe) |probe| {
+            const position = probe.position;
+            try std.testing.expect(indexed.locatorPending());
+            try std.testing.expect(try indexed.advanceLocator());
+            turns += 1;
+            if (indexed.locator.?.probe) |next| try std.testing.expectEqual((position + 1) & 63, next.position);
+        }
+    }
+    // The old row-sized quantum took only 32 turns despite this long chain.
+    try std.testing.expect(turns >= 32 * 33 / 2);
+    for (references) |reference| try indexed.put(reference.digest, reference.dims);
+    try std.testing.expectEqual(@as(u32, 32), indexed.count());
+    var newest_reader: ?usize = null;
+    var order_pos = source.opened.reader_order.len;
+    while (order_pos != 0 and newest_reader == null) {
+        order_pos -= 1;
+        const reader_index = source.opened.reader_order[order_pos];
+        const reader = source.opened.readers[reader_index];
+        for (0..reader.count) |row| {
+            if (std.mem.eql(u8, reader.sourceIdentityAt(row).key, &references[0].digest)) {
+                newest_reader = reader_index;
+                break;
+            }
+        }
+    }
+    try std.testing.expect(newest_reader != null);
+    var newest_found = false;
+    for (indexed.locator.?.slots) |slot| {
+        if (slot == 0) continue;
+        const reader_index: usize = @intCast((slot >> 32) - 1);
+        const row: usize = @as(u32, @truncate(slot));
+        if (std.mem.eql(u8, source.opened.readers[reader_index].sourceIdentityAt(row).key, &references[0].digest)) {
+            try std.testing.expectEqual(newest_reader.?, reader_index);
+            newest_found = true;
+        }
+    }
+    try std.testing.expect(newest_found);
+    const Check = struct {
+        source: *Store,
+        position: usize,
+        rejection: anyerror,
+        fn check(raw_control: *anyopaque) callconv(.c) runtime.error_abi.Status {
+            const self: *@This() = @ptrCast(@alignCast(raw_control));
+            if (self.source.marking) |mark| if (mark.live.locator.?.probe) |probe| {
+                if (probe.position != self.position) return runtime.error_abi.statusFromError(self.rejection);
+            } else return runtime.error_abi.statusFromError(self.rejection);
+            return .ok;
+        }
+    };
+    for ([_]anyerror{ error.Canceled, error.DeadlineExceeded, error.SchedulerClosed }) |rejection| {
+        try std.testing.expect(!try source.collectStepDeferredMark(&raw, std.math.maxInt(u64)));
+        turns = 0;
+        while (source.marking.?.live.locator.?.probe == null) : (turns += 1) {
+            try std.testing.expect(turns < 64);
+            try source.advanceMarkingSnapshot();
+        }
+        var check: Check = .{ .source = &source, .position = source.marking.?.live.locator.?.probe.?.position, .rejection = rejection };
+        const lifetime: original_lifetime.Control = .{ .context = &check, .check = Check.check };
+        const before = source.statsSnapshot().collection_mark_rows;
+        source.mark_step_rows = 8;
+        try std.testing.expectError(rejection, source.advanceMarkingSnapshotWithLifetime(std.testing.io, &lifetime));
+        try std.testing.expectEqual(before + 1, source.statsSnapshot().collection_mark_rows);
+        try std.testing.expect(source.marking == null);
+        try std.testing.expect(source.mutex.tryLock());
+        source.mutex.unlock();
+        source.mark_step_rows = 1;
+        for (selected_keys) |key| {
+            const restored = try store.get(alloc, key);
+            defer alloc.free(restored);
+            try std.testing.expectEqualSlices(u8, artifact, restored);
+        }
+    }
+    source.mark_step_rows = 4096;
+    turns = 0;
+    while (!try source.collectStep(&raw, std.math.maxInt(u64))) : (turns += 1)
+        try std.testing.expect(turns < 256);
+    for (selected_keys) |key| {
+        const restored = try store.get(alloc, key);
+        defer alloc.free(restored);
+        try std.testing.expectEqualSlices(u8, artifact, restored);
+    }
 }

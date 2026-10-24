@@ -1322,6 +1322,9 @@ fn resolveModels(
 
     const now_ns = platform_time.monotonicNs();
 
+    var fanout_memory: @import("../common/fanout_memory.zig").FanoutMemory = undefined;
+    fanout_memory.init(arena, sources.network_io orelse std.Io.Threaded.global_single_threaded.io(), 64 << 20);
+    defer fanout_memory.deinit();
     // Pending live fetches after cache lookups and local fast paths.
     var pending = std.ArrayListUnmanaged(struct { index: usize, job: *ModelsJob }).empty;
     defer for (pending.items) |item| item.job.arena_state.deinit();
@@ -1388,7 +1391,7 @@ fn resolveModels(
                 .workspace_id = instance.workspace_id,
             },
             .timeout_ms = opts.timeout_ms,
-            .arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator),
+            .arena_state = std.heap.ArenaAllocator.init(fanout_memory.allocator()),
             .cache = cache,
             .cache_key = instance.key,
             .request_started_ns = now_ns,
@@ -1530,6 +1533,9 @@ fn resolveExternalIoProbes(
         cache_key: []const u8,
         job: *ObjectProbeJob,
     };
+    var fanout_memory: @import("../common/fanout_memory.zig").FanoutMemory = undefined;
+    fanout_memory.init(arena, network_io orelse std.Io.Threaded.global_single_threaded.io(), 64 << 20);
+    defer fanout_memory.deinit();
     var pending = std.ArrayListUnmanaged(Pending).empty;
     defer for (pending.items) |item| item.job.arena_state.deinit();
     const now_ns = platform_time.monotonicNs();
@@ -1581,7 +1587,7 @@ fn resolveExternalIoProbes(
         job.* = .{
             .cfg = cfg,
             .timeout_ms = @max(opts.timeout_ms, 1),
-            .arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator),
+            .arena_state = std.heap.ArenaAllocator.init(fanout_memory.allocator()),
             .cache = cache,
             .cache_key = cache_key,
             .request_started_ns = now_ns,

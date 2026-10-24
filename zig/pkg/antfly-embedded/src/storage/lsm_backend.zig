@@ -46,6 +46,8 @@ const platform_time = @import("antfly_platform").time;
 const fs_paths = @import("antfly_runtime_fs").fs_paths;
 const CancellationToken = @import("antfly_cancellation").CancellationToken;
 const SharedBytes = @import("lsm_backend/shared_bytes.zig").SharedBytes;
+const read_admission = @import("../common/read_admission.zig");
+const bounded_mutex = @import("../common/bounded_mutex.zig");
 const LocalReader = @import("lsm_backend/local_reader.zig").Pool;
 const RunSourceLease = @import("lsm_backend/source_lease.zig").Lease;
 const native_artifact_sink = @import("native_artifact_sink.zig");
@@ -170,51 +172,11 @@ var obsolete_path_refs = ObsoletePathRefRegistry{};
 // borrows separately from open-manifest ownership so compaction can retire
 // each generation as soon as its own last reader exits, without waiting for a
 // backend-wide reader-free instant.
-const RunSnapshotRefRegistry = struct {
-    mutex: std.atomic.Mutex = .unlocked,
-    refs: std.StringHashMapUnmanaged(u64) = .empty,
+pub const PinQuota = @import("lsm_backend/pin_quota.zig");
+const run_pin_registry = @import("lsm_backend/run_pin_registry.zig");
+const RunSnapshotRefRegistry = run_pin_registry.Registry;
 
-    fn retain(self: *RunSnapshotRefRegistry, path: []const u8) !void {
-        lockWorkerMutex(&self.mutex);
-        defer self.mutex.unlock();
-        if (self.refs.getPtr(path)) |count| {
-            count.* +|= 1;
-            return;
-        }
-        // Cache one stable path allocation for the run generation rather than
-        // allocating a path for every read transaction.
-        const owned = try std.heap.page_allocator.dupe(u8, path);
-        errdefer std.heap.page_allocator.free(owned);
-        try self.refs.put(std.heap.page_allocator, owned, 1);
-    }
-
-    fn release(self: *RunSnapshotRefRegistry, path: []const u8) void {
-        lockWorkerMutex(&self.mutex);
-        defer self.mutex.unlock();
-        const count = self.refs.getPtr(path) orelse return;
-        if (count.* > 0) {
-            count.* -= 1;
-            if (count.* == 0) _ = file_pin_release_epoch.fetchAdd(1, .release);
-        }
-    }
-
-    fn isRetained(self: *RunSnapshotRefRegistry, path: []const u8) bool {
-        lockWorkerMutex(&self.mutex);
-        defer self.mutex.unlock();
-        return if (self.refs.get(path)) |count| count > 0 else false;
-    }
-
-    fn forget(self: *RunSnapshotRefRegistry, path: []const u8) void {
-        lockWorkerMutex(&self.mutex);
-        defer self.mutex.unlock();
-        const count = self.refs.get(path) orelse return;
-        if (count != 0) return;
-        const removed = self.refs.fetchRemove(path) orelse return;
-        std.heap.page_allocator.free(removed.key);
-    }
-};
-
-var run_snapshot_refs = RunSnapshotRefRegistry{};
+var run_snapshot_refs = RunSnapshotRefRegistry{ .epoch = &file_pin_release_epoch };
 
 fn writeCheckpointBytes(io: std.Io, path: []const u8, bytes: []const u8, sink: ?native_artifact_sink.Sink) !u64 {
     if (std.fs.path.dirname(path)) |parent| try fs_paths.createDirPathPortable(io, parent);
@@ -309,6 +271,7 @@ const MutableSnapshotReaderRef = struct {
 
 pub const MaintenanceWaker = struct {
     ptr: *anyopaque,
+    /// Nonblocking notification only; callers may hold publication ownership.
     wake_fn: *const fn (ptr: *anyopaque) void,
 
     pub fn wake(self: MaintenanceWaker) void {
@@ -443,6 +406,9 @@ pub const Options = struct {
     /// compaction input domains, never entry ordering or the persisted format.
     /// Namespace isolation still applies. Overrides the fixed prefix.
     run_partition_key: ?*const fn ([]const u8) []const u8 = null,
+    /// Equivalent extraction under original admission; labels borrow the pinned
+    /// key or stable backend storage. Required for admitted custom planning.
+    run_partition_key_with_admission: ?*const fn ([]const u8, read_admission.Port) anyerror![]const u8 = null,
     bloom: bloom.Config = lsm_table_file.default_filter_config,
     table_block_compression: lsm_table_file.CompressionPolicy = .snappy_adaptive,
     table_prefix_extractor: lsm_table_file.PrefixExtractor = lsm_table_file.default_prefix_extractor,
@@ -1370,6 +1336,7 @@ pub const Backend = struct {
 
         const Value = union(enum) {
             owned: lsm_table_file.BorrowedDecoded,
+            admitted_owned: cache_mod.Cache.DecodedTable,
             shared: SharedValue,
         };
 
@@ -1381,6 +1348,7 @@ pub const Backend = struct {
             allocator.free(self.path);
             switch (self.value) {
                 .owned => |*owned_table| owned_table.deinit(allocator),
+                .admitted_owned => |*owned_table| owned_table.deinit(),
                 .shared => |*shared| shared.deinit(),
             }
             self.* = undefined;
@@ -1389,6 +1357,7 @@ pub const Backend = struct {
         pub fn table(self: *const CachedRunTable) *const lsm_table_file.BorrowedDecoded {
             return switch (self.value) {
                 .owned => |*owned| owned,
+                .admitted_owned => |*owned| &owned.table,
                 .shared => |*shared| &shared.table,
             };
         }
@@ -1420,8 +1389,6 @@ pub const Backend = struct {
         path: []u8,
         epoch: u64,
         refs: usize = 1,
-        io: ?std.Io,
-        done: std.Io.Event = .unset,
         completed: std.atomic.Value(bool) = .init(false),
         result: ?*RunSourceLease = null,
         failure: ?anyerror = null,
@@ -1433,7 +1400,7 @@ pub const Backend = struct {
         offset: u64 = 0,
         len: u32 = 0,
         misses: u8 = 0,
-        promoting: bool = false,
+        promotion: std.atomic.Value(runtime_mod.LocalBlockPromotion.State) = .init(.idle),
         cooldown: u8 = 0,
         access: u64 = 0,
     };
@@ -1441,15 +1408,48 @@ pub const Backend = struct {
     const CachedRunBlock = struct {
         run_id: u64,
         path: []u8,
+        path_owner: ?*SharedBytes = null,
         block_offset: u64,
         block_len: u32,
         payload: *SharedBytes,
         last_access: u64,
 
         pub fn deinit(self: *CachedRunBlock, allocator: Allocator) void {
-            allocator.free(self.path);
+            if (self.path_owner) |owner| owner.release() else allocator.free(self.path);
             self.payload.release();
             self.* = undefined;
+        }
+    };
+
+    /// Stable owner for the cache entry slab; entries transfer to a replacement
+    /// slab before this record becomes ready. Its destructor never reads entries.
+    const LocalCacheEntries = struct {
+        allocator: Allocator,
+        entries: []CachedRunBlock,
+        reservation: ?resource_manager_mod.Reservation = null,
+        retirement: resource_manager_mod.PayloadRetirement = .{},
+
+        fn create(allocator: Allocator, manager: *resource_manager_mod.ResourceManager, existing: ?[]CachedRunBlock, control: read_admission.Port) !*LocalCacheEntries {
+            const count = if (existing) |entries| entries.len else max_local_cached_run_blocks;
+            var construction = try manager.reserveConstructionWithAdmission(.lsm_block_table_cache, @sizeOf(LocalCacheEntries) + count * @sizeOf(CachedRunBlock), control);
+            defer construction.retire();
+            const self = try allocator.create(LocalCacheEntries);
+            errdefer allocator.destroy(self);
+            const entries = existing orelse try allocator.alloc(CachedRunBlock, count);
+            errdefer if (existing == null) allocator.free(entries);
+            self.* = .{ .allocator = allocator, .entries = entries };
+            try manager.registerPayloadRetirementWithAdmission(&self.retirement, &self.reservation, &construction, self, destroy, control);
+            // Ownership transfer has no fallible checkpoint after registration.
+            return self;
+        }
+        fn destroy(raw: *anyopaque) void {
+            const self: *LocalCacheEntries = @ptrCast(@alignCast(raw));
+            const allocator = self.allocator;
+            allocator.free(self.entries);
+            allocator.destroy(self);
+        }
+        fn release(self: *LocalCacheEntries) void {
+            self.retirement.publish();
         }
     };
 
@@ -1598,6 +1598,7 @@ pub const Backend = struct {
     /// Opt-in gate shared by every graph-store view of this backend. Durable
     /// roots already enforce a single open writer across processes/handles.
     serialized_write_mutex: std.atomic.Mutex = .unlocked,
+    publication_backlog_mutex: std.atomic.Mutex = .unlocked,
     mu: std.atomic.Mutex = .unlocked,
     // Serialize off-lock planner construction without holding the writer lock.
     domain_index_build_mu: std.Io.Mutex = .init,
@@ -1667,6 +1668,7 @@ pub const Backend = struct {
     run_state_cache: std.ArrayListUnmanaged(CachedRunState) = .empty,
     run_index_cache: std.ArrayListUnmanaged(CachedRunIndex) = .empty,
     run_block_cache: std.ArrayListUnmanaged(CachedRunBlock) = .empty,
+    run_block_cache_owner: ?*LocalCacheEntries = null,
     local_reader: LocalReader = .{},
     // Independent slots keep shared point batches from blocking local decoders.
     point_reader: LocalReader = .{},
@@ -1919,6 +1921,10 @@ pub const Backend = struct {
         return progressed;
     }
 
+    pub const QuiescedCheckpointPreparation = @import("lsm_backend/checkpoint_preparation.zig").Preparation(Backend);
+
+    pub const QuiescedOutputCleanup = @import("lsm_backend/prepared_output_cleanup.zig").Consumer(Backend);
+
     fn drainOutputCleanupLocked(self: *Backend) !void {
         while (self.outputCleanupDelayLocked() != null) {
             _ = try self.drainOutputCleanupSliceLocked();
@@ -2059,7 +2065,7 @@ pub const Backend = struct {
         process_lock_mode: ?storage_io.NativePathLockMode = null,
         native_locked: bool = false,
 
-        fn release(self: *WalOperationLock) void {
+        pub fn release(self: *WalOperationLock) void {
             if (self.native_locked) {
                 self.backend.wal_operation_lock_file.?.unlock();
                 self.native_locked = false;
@@ -2099,6 +2105,10 @@ pub const Backend = struct {
     }
 
     fn tryAcquireWalOperationLock(self: *Backend, mode: storage_io.NativePathLockMode) !?WalOperationLock {
+        return self.tryAcquireWalOperationLockImpl(mode, true);
+    }
+
+    fn tryAcquireWalOperationLockImpl(self: *Backend, mode: storage_io.NativePathLockMode, prepare_if_missing: bool) !?WalOperationLock {
         var guard = WalOperationLock{ .backend = self };
         if (!self.options.wal_enabled or self.root_dir == null) return guard;
 
@@ -2113,7 +2123,10 @@ pub const Backend = struct {
         errdefer guard.release();
 
         if (self.storage.?.supportsNativePathLocks()) {
-            if (self.wal_operation_lock_file == null) try self.prepareWalOperationLockFile();
+            if (self.wal_operation_lock_file == null) {
+                if (!prepare_if_missing) return error.ExecutionWaitUnsupported;
+                try self.prepareWalOperationLockFile();
+            }
             if (self.wal_operation_lock_file) |*lock_file| {
                 if (!try lock_file.tryLock(mode)) {
                     guard.release();
@@ -2123,6 +2136,571 @@ pub const Backend = struct {
             }
         }
         return guard;
+    }
+
+    /// Owns an idle tentative grant after a publication race or pre-dispatch
+    /// rejection. The backend, immutable record and its prepaid credit remain
+    /// alive until retry retires this owner or explicit physical destruction.
+    /// No admission borrow or payload is retained here.
+    pub const QuiescedDurabilityPreparation = struct {
+        resources: ?storage_io.DurabilityResources = null,
+        backend: ?*Backend = null,
+        record: ?[]const u8 = null,
+        failure: ?anyerror = null,
+
+        fn resumeRetirement(self: *@This(), backend: *Backend, record: ?[]const u8, original: read_admission.Port) !bool {
+            if (self.resources) |*resources| {
+                std.debug.assert(self.backend == backend);
+                std.debug.assert((self.record == null) == (record == null));
+                if (record) |bytes| std.debug.assert(self.record.?.ptr == bytes.ptr and self.record.?.len == bytes.len);
+                try resources.retireWithAdmission(original);
+                const failure = self.failure;
+                self.* = .{};
+                if (failure) |cause| return cause;
+                return true;
+            }
+            return false;
+        }
+
+        fn reject(self: *@This(), backend: *Backend, record: ?[]const u8, resources: storage_io.DurabilityResources, failure: ?anyerror, original: read_admission.Port) !void {
+            std.debug.assert(self.resources == null);
+            self.* = .{ .resources = resources, .backend = backend, .record = record, .failure = failure };
+            _ = try self.resumeRetirement(backend, record, original);
+        }
+
+        /// Explicit legacy fallback only; admitted rejection never calls this.
+        pub fn deinit(self: *@This()) void {
+            if (self.resources) |*resources| resources.deinit();
+            self.* = .{};
+        }
+    };
+
+    pub const QuiescedWalSync = wal_mod.CurrentStateSync(WalOperationLock);
+
+    /// The caller has fenced this backend's writers/maintenance and retains
+    /// the backend through operation retirement. No backend mutex is held
+    /// while publication or physical I/O is awaited. Legacy acquirers must
+    /// not occupy every CPU slot needed for this cleanup execution's reentry.
+    pub fn tryBeginQuiescedWalSyncWithAdmission(self: *Backend, preparation: *QuiescedDurabilityPreparation, original: read_admission.Port) !?QuiescedWalSync {
+        if (try preparation.resumeRetirement(self, null, original)) return null;
+        try original.checkpoint();
+        if (!self.options.wal_enabled or self.root_dir == null or self.storage == null) return error.ExecutionWaitUnsupported;
+        // Opening lock files or installing root state here would introduce
+        // hidden descriptor/metadata acquisition into compound publication.
+        if (!self.storage.?.supportsNativePathLocks() or self.root_lock_state == null or self.wal_operation_lock_file == null)
+            return error.ExecutionWaitUnsupported;
+        var operation = try QuiescedWalSync.prepare(self.root_dir.?);
+        // Avoid allocating a grant for an already-busy publication owner. The
+        // real acquisition below still handles a race after this probe.
+        var probe = (try self.tryAcquireWalOperationLockImpl(.exclusive, false)) orelse return null;
+        probe.release();
+        const resources = (try self.storage.?.tryPrepareDurabilityWithAdmission(original)) orelse return null;
+        var publication = (self.tryAcquireWalOperationLockImpl(.exclusive, false) catch |cause| {
+            try preparation.reject(self, null, resources, cause, original);
+            unreachable;
+        }) orelse {
+            try preparation.reject(self, null, resources, null, original);
+            return null;
+        };
+        operation.start(resources, publication, original) catch |cause| {
+            publication.release();
+            try preparation.reject(self, null, resources, cause, original);
+            unreachable;
+        };
+        return operation;
+    }
+
+    pub fn beginQuiescedWalSyncWithAdmission(self: *Backend, io: std.Io, preparation: *QuiescedDurabilityPreparation, original: read_admission.Port) !QuiescedWalSync {
+        while (true) {
+            if (try self.tryBeginQuiescedWalSyncWithAdmission(preparation, original)) |operation| return operation;
+            // Both publication and tentative completion resources are gone
+            // before relinquishing CPU and waiting under the original scope.
+            try @import("../common/cleanup_wait.zig").waitForRetry(io, original);
+        }
+    }
+
+    /// Close owns exclusive observation as well as mutation of this backend
+    /// across this continuation. All producer, reader and accounting admission
+    /// must be fenced; cached-reader releases may finish before detachment.
+    /// Detachment and observation allocate nothing and issue no filesystem
+    /// work. Final ledger reconciliation may admit existing-usage metadata.
+    pub const QuiescedClosePreflight = struct {
+        const Phase = enum {
+            mutable,
+            fixed,
+            active_ledger_reclamations,
+            ledger_snapshots,
+            active_compaction_publications,
+            retired_run_stores,
+            retired_admissions,
+            active_bulk_plans,
+            retired_bulk_plans,
+            retired_closures,
+            retired_gc,
+            live_read_versions,
+            retired_run_directories,
+            retired_read_versions,
+            immutable,
+            retired_immutable,
+            bulk_accounts,
+            cached,
+            retired_mutable,
+            retired_memory,
+            reclaiming,
+            reconcile,
+            done,
+        };
+        backend: ?*Backend = null,
+        detached: bool = false,
+        pass: u64 = 0,
+        phase: Phase = .mutable,
+        bytes: u64 = 0,
+        index: usize = 0,
+        current: ?*anyopaque = null,
+        initialized: bool = false,
+        mutable: ActiveMemTable.Accounting = .{},
+        state: State.Accounting = .{},
+        batch: ?*ReclaimingMemory = null,
+        version: ?*runtime_mod.ReadVersion = null,
+
+        fn advance(self: *@This()) void {
+            self.phase = @fromBackingInt(@intCast(@backingInt(self.phase) + 1));
+            self.index = 0;
+            self.current = null;
+            self.initialized = false;
+            self.state = .{};
+        }
+
+        fn detach(self: *@This(), backend: *Backend, io: std.Io, original: read_admission.Port) !bool {
+            try @import("../common/cleanup_wait.zig").lockAtomic(&backend.mu, io, original);
+            defer backend.mu.unlock();
+            if (backend.active_readers != 0) return false;
+            if (backend.mutable_read_snapshot) |snapshot| {
+                const ref = backend.mutableSnapshotReaderRefIndex(snapshot) orelse unreachable;
+                if (backend.mutable_snapshot_reader_refs.items[ref].readers != 0) return false;
+                backend.mutable_read_snapshot = null;
+                _ = backend.removeMutableSnapshotReaderRef(ref);
+                // The already-owned header carries retirement. Keep it reachable
+                // by legacy and admitted accounting until physical reclamation;
+                // no destructor or new background job runs after durable drain.
+                @import("lsm_backend/memtable_reclamation.zig").retire(backend, snapshot);
+            }
+            self.detached = true;
+            return true;
+        }
+
+        fn fixed(self: *@This(), b: *Backend) void {
+            const pass = self.pass;
+            if (b.options.unpublished_outputs) |queue| self.bytes +|= queue.observedMemoryBytes();
+            self.bytes +|= b.runs.memoryBytes(pass);
+            if (b.store_reclaimer) |*job| self.bytes +|= @sizeOf(RunStore) +| job.store.memoryBytes(pass);
+            inline for (.{ "run_directory", "manifest_directory", "manifest_checkpoint_directory" }) |field|
+                if (@field(b, field)) |directory| {
+                    self.bytes +|= directory.accountedMemoryBytes(pass);
+                };
+            inline for (.{ "pending_directory_closure", "pending_l0_directory_closure" }) |field|
+                if (@field(b, field)) |pending| {
+                    self.bytes +|= pending.directory.accountedMemoryBytes(pass);
+                };
+            for (b.pending_admissions) |pending| if (pending) |job| {
+                self.bytes +|= job.accountedMemoryBytes(pass);
+            };
+            if (b.pending_tombstone_reconcile) |pending| self.bytes +|= pending.account.chargeOnce(pass);
+            if (b.pending_gc) |pending| self.bytes +|= pending.accountedMemoryBytes(pass);
+            self.bytes +|= b.manifest_journal.obsolete.memoryBytes(pass);
+            self.bytes +|= b.obsolete_paths.memoryBytes(pass);
+            if (b.obsolete_reclaim_after) |path| self.bytes +|= path.len;
+            if (b.directory_reclaimer) |*job| self.bytes +|= job.directory.accountedMemoryBytes(pass);
+            if (b.domain_index) |value| self.bytes +|= value.memoryBytes();
+            self.bytes +|= b.bulk_snapshot_unshared_bytes;
+            if (b.memtable_reclaimer) |*job| self.bytes +|= job.memoryBytes(pass);
+        }
+
+        fn list(self: *@This(), b: *Backend, comptime phase: Phase) void {
+            const field = @tagName(phase);
+            const Pointer = @typeInfo(@FieldType(Backend, field)).optional.child;
+            const next = switch (phase) {
+                .active_ledger_reclamations, .active_compaction_publications => "next",
+                .ledger_snapshots, .active_bulk_plans => "active_next",
+                .live_read_versions => "live_next",
+                else => "retired_next",
+            };
+            if (!self.initialized) {
+                self.current = @field(b, field);
+                self.initialized = true;
+            }
+            if (self.current) |raw| {
+                const node: Pointer = @ptrCast(@alignCast(raw));
+                self.bytes +|= switch (phase) {
+                    .active_ledger_reclamations, .ledger_snapshots => node.memoryBytes(self.pass),
+                    .retired_run_stores => @sizeOf(RunStore) +| node.memoryBytes(self.pass),
+                    .retired_closures => node.directory.accountedMemoryBytes(self.pass),
+                    else => node.accountedMemoryBytes(self.pass),
+                };
+                self.current = @field(node, next);
+            } else self.advance();
+        }
+
+        fn stateStep(self: *@This(), value: *const State) bool {
+            var credits: usize = 64;
+            if (!self.state.step(value, self.pass, &credits)) return false;
+            self.bytes +|= self.state.bytes;
+            self.state = .{};
+            return true;
+        }
+
+        pub fn resumeWithAdmission(self: *@This(), b: *Backend, io: std.Io, original: read_admission.Port) !void {
+            try original.checkpoint();
+            if (self.backend) |bound| std.debug.assert(bound == b) else self.backend = b;
+            while (!self.detached) {
+                if (!try self.detach(b, io, original))
+                    try @import("../common/cleanup_wait.zig").waitForRetry(io, original);
+            }
+            if (self.pass == 0) self.pass = state_mod.memory_account.nextPass();
+            while (self.phase != .done) {
+                try original.checkpoint();
+                switch (self.phase) {
+                    .mutable => {
+                        var credits: usize = 64;
+                        if (self.mutable.step(&b.mutable, self.pass, &credits)) {
+                            self.bytes +|= self.mutable.bytes;
+                            self.advance();
+                        }
+                    },
+                    .fixed => {
+                        self.fixed(b);
+                        self.advance();
+                    },
+                    inline .active_ledger_reclamations, .ledger_snapshots, .active_compaction_publications, .retired_run_stores, .retired_admissions, .active_bulk_plans, .retired_bulk_plans, .retired_closures, .retired_gc, .live_read_versions, .retired_run_directories, .retired_read_versions => |phase| self.list(b, phase),
+                    .immutable, .retired_immutable, .retired_mutable => {
+                        const items = switch (self.phase) {
+                            .immutable => b.activeImmutableMemtables(),
+                            .retired_immutable => b.retired_immutable_memtables.items,
+                            .retired_mutable => b.retired_mutable_snapshots.items,
+                            else => unreachable,
+                        };
+                        if (self.index == items.len) self.advance() else if (self.stateStep(items[self.index])) self.index += 1;
+                    },
+                    .bulk_accounts => {
+                        const accounts = &b.bulk_snapshot_accounts;
+                        if (accounts.count() == 0 or self.index == accounts.capacity()) {
+                            self.advance();
+                        } else {
+                            // Iterator.next() can scan a sparse table without a
+                            // checkpoint. Enter it only at occupied slots, so
+                            // it returns immediately; inspect at most 64 slots.
+                            const end = @min(accounts.capacity(), self.index + 64);
+                            while (self.index < end) : (self.index += 1) {
+                                if (accounts.metadata.?[self.index].isUsed()) {
+                                    var iterator = accounts.iterator();
+                                    iterator.index = @intCast(self.index);
+                                    const entry = iterator.next().?;
+                                    self.bytes +|= entry.key_ptr.*.chargeOnce(self.pass);
+                                }
+                            }
+                        }
+                    },
+                    .cached => {
+                        if (b.mutable_read_snapshot) |snapshot| {
+                            if (self.stateStep(snapshot)) self.advance();
+                        } else self.advance();
+                    },
+                    .retired_memory => {
+                        if (!self.initialized) {
+                            self.current = b.retired_memory_head;
+                            self.initialized = true;
+                        }
+                        if (self.current) |raw| {
+                            const value: *State = @ptrCast(@alignCast(raw));
+                            if (self.stateStep(value)) {
+                                self.bytes +|= @sizeOf(State);
+                                self.current = value.retired_next;
+                            }
+                        } else self.advance();
+                    },
+                    .reclaiming => {
+                        if (!self.initialized) {
+                            self.batch = b.reclaiming_memory;
+                            self.version = if (self.batch) |batch| batch.versions else null;
+                            self.initialized = true;
+                        }
+                        if (self.version) |version| {
+                            self.bytes +|= version.accountedMemoryBytes(self.pass);
+                            self.version = version.retired_next;
+                        } else if (self.batch) |batch| {
+                            self.batch = batch.next;
+                            self.version = if (self.batch) |next| next.versions else null;
+                        } else self.advance();
+                    },
+                    .reconcile => {
+                        std.debug.assert(b.active_readers == 0 and b.mutable_read_snapshot == null);
+                        if (b.options.resource_manager) |manager|
+                            try manager.adjustUsageWithAdmission(.lsm_in_memory_state, &b.tracked_in_memory_state_bytes, self.bytes, original);
+                        self.advance();
+                    },
+                    .done => unreachable,
+                }
+            }
+        }
+    };
+
+    /// Reclaim obsolete memory before close needs final persistence headroom.
+    /// Serving, producer and accounting admission must remain permanently
+    /// fenced. Only retired queues are consumed; live mutable/immutable data,
+    /// ledger roots and durable finalization obligations remain backend-owned.
+    /// The original finite execution is borrowed on each call, never retained.
+    pub const QuiescedClosePreparation = struct {
+        phase: enum { observe, memtables, ledgers, reconcile, done } = .observe,
+        before: QuiescedClosePreflight = .{},
+        after: QuiescedClosePreflight = .{},
+
+        pub fn resumeWithAdmission(self: *@This(), backend: *Backend, io: std.Io, original: read_admission.Port) !void {
+            try original.checkpoint();
+            if (self.before.backend) |bound| std.debug.assert(bound == backend);
+            while (self.phase != .done) {
+                try original.checkpoint();
+                switch (self.phase) {
+                    .observe => {
+                        // Establish the full retained charge before destroying
+                        // anything, including cold legacy snapshot accounting.
+                        try self.before.resumeWithAdmission(backend, io, original);
+                        if (backend.memtable_reclaimer == null and backend.retired_memory_head == null and backend.retired_ledger_snapshots == null) {
+                            // No physical ownership changed. Reuse the first
+                            // observation instead of scanning live state twice.
+                            self.after = self.before;
+                            self.phase = .done;
+                        } else self.phase = .memtables;
+                    },
+                    .memtables => {
+                        var credits: usize = 64;
+                        if (@import("lsm_backend/memtable_reclamation.zig").reclaimQuiescedStep(backend, &credits)) self.phase = .ledgers;
+                    },
+                    .ledgers => {
+                        var credits: usize = 64;
+                        if (@import("lsm_backend/ledger_reclamation.zig").reclaimQuiescedStep(backend, &credits)) self.phase = .reconcile;
+                    },
+                    .reconcile => {
+                        // Shared allocation accounts may still be referenced
+                        // by live generations. Reobserve once in bounded CPU
+                        // slices; never subtract a whole retired generation or
+                        // rescan the backend after every destructor quantum.
+                        try self.after.resumeWithAdmission(backend, io, original);
+                        self.phase = .done;
+                    },
+                    .done => unreachable,
+                }
+            }
+        }
+    };
+
+    /// Own construction credit and a bounded mutable successor through WAL
+    /// publication and old-state retirement. The backend, its observed usage
+    /// identity and every unrelated account mutation must remain quiesced and
+    /// stable until this owner retires. Input/WAL residency is prepaid by their
+    /// respective owners; this reservation covers additional successor bytes.
+    /// The caller first reconciles existing backend usage while quiescing it;
+    /// this delta owner cannot repair unobserved legacy allocations. Default
+    /// controlled close must detach cached mutable snapshots and establish
+    /// that baseline on admitted CPU before creating this owner.
+    pub const QuiescedMutablePublication = struct {
+        const Account = state_mod.memory_account.Account;
+        backend: *Backend,
+        cpu: ActiveMemTable.PublicationPreparation,
+        credit: ?resource_manager_mod.ConstructionCredit = null,
+        meter: ?*Account,
+        baseline_account_bytes: u64,
+        baseline_spare_bytes: u64,
+        baseline_usage: u64,
+        adopted: bool = false,
+        retirement_usage: ?u64 = null,
+        retired: bool = false,
+
+        pub fn init(backend: *Backend, source: *State) @This() {
+            std.debug.assert(backend.mutable_read_snapshot == null);
+            const account = backend.mutable.ordered.account;
+            const bytes = if (account) |a| a.bytes.load(.acquire) else 0;
+            const spares = spareBytes(&backend.mutable);
+            if (backend.options.resource_manager != null) {
+                const queue = if (backend.options.unpublished_outputs) |q| q.observedMemoryBytes() else 0;
+                std.debug.assert(backend.tracked_in_memory_state_bytes >= bytes + spares + queue);
+            }
+            return .{
+                .backend = backend,
+                .cpu = .init(&backend.mutable, source),
+                .meter = if (account) |a| a.retain() else null,
+                .baseline_account_bytes = bytes,
+                .baseline_spare_bytes = spares,
+                .baseline_usage = backend.tracked_in_memory_state_bytes,
+            };
+        }
+
+        fn spareBytes(table: *const ActiveMemTable) u64 {
+            return table.ordered.spare.capacity * @sizeOf(*anyopaque);
+        }
+
+        fn pinMeter(self: *@This()) void {
+            if (self.meter == null) {
+                if (self.cpu.candidate.ordered.account) |a| self.meter = a.retain();
+            }
+        }
+
+        pub fn resumeWithAdmission(self: *@This(), original: read_admission.Port) !void {
+            std.debug.assert(!self.retired and self.retirement_usage == null and !self.cpu.published);
+            const bound = try self.cpu.memoryBoundWithAdmission(original);
+            if (self.backend.options.resource_manager) |manager| {
+                try manager.prepareUsageWithAdmission(.lsm_in_memory_state, &self.backend.tracked_in_memory_state_bytes, original);
+                if (self.credit == null)
+                    self.credit = try manager.reserveConstructionWithAdmission(.lsm_table_builder_working_set, bound, original);
+            }
+            self.cpu.resumeWithAdmission(self.backend.allocator, original) catch |cause| {
+                self.pinMeter();
+                return cause;
+            };
+            self.pinMeter();
+            if (!self.adopted) {
+                const bytes = if (self.meter) |a| a.bytes.load(.acquire) else 0;
+                std.debug.assert(bytes >= self.baseline_account_bytes);
+                const added = bytes - self.baseline_account_bytes + spareBytes(&self.cpu.candidate);
+                std.debug.assert(added <= bound);
+                if (self.credit) |*credit| {
+                    if (added != 0) try credit.adoptUsageWithAdmission(.lsm_in_memory_state, &self.backend.tracked_in_memory_state_bytes, added, original);
+                }
+                self.adopted = true;
+            }
+        }
+
+        /// Called only by the owning WAL coordinator's infallible callback.
+        /// No ledger lock, observer scan or retirement can occur here.
+        pub fn publish(self: *@This()) void {
+            std.debug.assert(self.adopted and !self.retired);
+            std.debug.assert(self.backend.mutable_read_snapshot == null);
+            self.cpu.publish(&self.backend.mutable);
+        }
+
+        fn finishPhysicalRetirement(self: *@This()) void {
+            if (self.retirement_usage != null) return;
+            std.debug.assert(self.cpu.retired);
+            const current_account = self.backend.mutable.ordered.account;
+            const bytes = if (current_account) |a| blk: {
+                std.debug.assert(a == self.meter.?);
+                break :blk a.bytes.load(.acquire);
+            } else blk: {
+                if (self.meter) |a| std.debug.assert(a.bytes.load(.acquire) == @sizeOf(Account));
+                break :blk @as(u64, 0);
+            };
+            self.retirement_usage = if (self.backend.options.resource_manager != null)
+                self.baseline_usage - self.baseline_account_bytes - self.baseline_spare_bytes + bytes + spareBytes(&self.backend.mutable)
+            else
+                0;
+            // Free a speculative account header before making its capacity
+            // available. A rejected ledger retry retains the target and charge.
+            if (self.meter) |a| a.release();
+            self.meter = null;
+        }
+
+        pub fn retireWithAdmission(self: *@This(), original: read_admission.Port) !void {
+            try original.checkpoint();
+            if (self.retired) return;
+            self.pinMeter();
+            try self.cpu.retireWithAdmission(self.backend.allocator, original);
+            self.finishPhysicalRetirement();
+            if (self.backend.options.resource_manager) |manager| {
+                const next = self.retirement_usage.?;
+                std.debug.assert(next <= self.backend.tracked_in_memory_state_bytes);
+                try manager.adjustUsageWithAdmission(.lsm_in_memory_state, &self.backend.tracked_in_memory_state_bytes, next, original);
+            }
+            if (self.credit) |*credit| credit.retire();
+            self.credit = null;
+            self.retired = true;
+        }
+
+        /// Mandatory quiesced fallback after the owning WAL operation joins.
+        pub fn deinit(self: *@This()) void {
+            if (self.retired) return;
+            self.pinMeter();
+            self.cpu.deinit(self.backend.allocator);
+            self.finishPhysicalRetirement();
+            if (self.backend.options.resource_manager) |manager|
+                std.debug.assert(manager.tryObserveUsage(.lsm_in_memory_state, &self.backend.tracked_in_memory_state_bytes, self.retirement_usage.?));
+            if (self.credit) |*credit| credit.retire();
+            self.credit = null;
+            self.retired = true;
+        }
+    };
+
+    /// Payload owns a prepared bounded CPU publication and its credits. It
+    /// provides publish(AppendResult), requireRecovery() and release(). The
+    /// caller fences all same-backend writers/readers/maintenance and retains
+    /// the backend until operation retirement, just as for QuiescedWalSync.
+    pub fn QuiescedWalAppend(comptime Payload: type) type {
+        return wal_mod.CurrentStateAppend(struct {
+            backend: *Backend,
+            guard: WalOperationLock,
+            payload: Payload,
+            entries: u32,
+            pub fn publish(self: *@This(), result: wal_mod.AppendResult) void {
+                self.payload.publish(result);
+                // Invalidate scalar cache generations without scanning or
+                // allocating while this prepared publication is adopted.
+                self.backend.wal_retention.invalidateAll();
+                self.backend.noteMutableWalSegment(result.segment);
+                self.backend.write_stats.wal_append_records += 1;
+                self.backend.write_stats.wal_append_entries += self.entries;
+                self.backend.write_stats.wal_append_bytes += result.bytes;
+                self.backend.write_stats.wal_segment_syncs += result.segment_syncs;
+                self.backend.write_stats.wal_index_syncs += result.index_syncs;
+                self.backend.write_stats.wal_sync_records += 1;
+            }
+            pub fn requireRecovery(self: *@This()) void {
+                self.backend.manifest_recovery_required = true;
+                self.backend.wal_retention.invalidateAll();
+                self.payload.requireRecovery();
+            }
+            pub fn release(self: *@This()) void {
+                self.payload.release();
+                self.guard.release();
+            }
+        });
+    }
+
+    /// A failed try/initial dispatch leaves Payload with the caller. Prepared
+    /// append bytes and descriptor/worker credit precede publication acquisition;
+    /// a busy guard retires the tentative grant under the original execution
+    /// before waiting for publication. Rejection retains the preparation.
+    pub fn tryBeginQuiescedWalAppendWithAdmission(self: *Backend, preparation: *QuiescedDurabilityPreparation, record: []const u8, payload: anytype, original: read_admission.Port) !?QuiescedWalAppend(@TypeOf(payload)) {
+        if (try preparation.resumeRetirement(self, record, original)) return null;
+        try original.checkpoint();
+        if (self.options.backend.read_only) return error.ReadOnly;
+        if (self.manifest_recovery_required) return error.RecoveryRequired;
+        if (!self.options.wal_enabled or self.root_dir == null or self.storage == null or
+            !self.storage.?.supportsNativePathLocks() or self.root_lock_state == null or self.wal_operation_lock_file == null)
+            return error.ExecutionWaitUnsupported;
+        const entries = try wal_mod.validateStateRecordWithAdmission(record, original);
+        if (entries == 0) return error.ResourceBudgetExceeded;
+        var operation = try QuiescedWalAppend(@TypeOf(payload)).prepare(self.root_dir.?, record.len, .{ .segment_bytes = self.options.wal_segment_bytes });
+        var probe = (try self.tryAcquireWalOperationLockImpl(.exclusive, false)) orelse return null;
+        probe.release();
+        const resources = (try self.storage.?.tryPrepareAppendWithAdmission(record, original)) orelse return null;
+        var guard = (self.tryAcquireWalOperationLockImpl(.exclusive, false) catch |cause| {
+            try preparation.reject(self, record, resources, cause, original);
+            unreachable;
+        }) orelse {
+            try preparation.reject(self, record, resources, null, original);
+            return null;
+        };
+        operation.start(resources, .{ .backend = self, .guard = guard, .payload = payload, .entries = entries }, original) catch |cause| {
+            guard.release();
+            try preparation.reject(self, record, resources, cause, original);
+            unreachable;
+        };
+        return operation;
+    }
+
+    pub fn beginQuiescedWalAppendWithAdmission(self: *Backend, io: std.Io, preparation: *QuiescedDurabilityPreparation, record: []const u8, payload: anytype, original: read_admission.Port) !QuiescedWalAppend(@TypeOf(payload)) {
+        while (true) {
+            if (try self.tryBeginQuiescedWalAppendWithAdmission(preparation, record, payload, original)) |operation| return operation;
+            try @import("../common/cleanup_wait.zig").waitForRetry(io, original);
+        }
     }
 
     fn resolveBackgroundExecutor(configured: ?*const BackgroundExecutor) BackgroundExecutor {
@@ -4344,6 +4922,20 @@ pub const Backend = struct {
         return try NamespaceReadTxn.open(self);
     }
 
+    pub fn beginReadWithAdmission(self: *Backend, control: read_admission.Port) !NamespaceReadTxn {
+        return try NamespaceReadTxn.openWithAdmission(self, control);
+    }
+
+    /// One snapshot and an owned lookup that can return between worker calls.
+    /// The caller retires pending operations before closing this backend.
+    pub fn beginOwnedKeyCursor(self: *Backend, allocator: Allocator, namespace: backend_types.Namespace, control: ?read_admission.Port) !runtime_mod.OwnedNamespaceKeyCursor(Backend) {
+        return runtime_mod.OwnedNamespaceKeyCursor(Backend).init(self, allocator, namespace, control);
+    }
+
+    pub fn beginOwnedValueRead(self: *Backend, allocator: Allocator, namespace: backend_types.Namespace, key: []const u8, control: ?read_admission.Port) !runtime_mod.OwnedNamespaceValueRead(Backend) {
+        return runtime_mod.OwnedNamespaceValueRead(Backend).init(self, allocator, namespace, key, control);
+    }
+
     pub fn beginProbe(self: *Backend) !NamespaceProbeTxn {
         return NamespaceProbeTxn.open(self);
     }
@@ -5645,6 +6237,38 @@ pub const Backend = struct {
         }
     };
 
+    /// Caller holds the backend mutex. A busy lane is observed without raw
+    /// waiting; release this mutex before the original execution waits/retries.
+    pub fn tryBeginManifestTurnWithAdmission(self: *Backend, original: read_admission.Port) !?ManifestTurn {
+        _ = (try original.executionWaitAfterLifetime()) orelse return error.ExecutionWaitUnsupported;
+        _ = (try original.deadlineNs()) orelse return error.ExecutionWaitUnsupported;
+        const io = self.manifestCoordinationIo();
+        if (!(if (io != null) self.manifest_publish_mu.tryLock() else self.manifest_publish_fallback_mu.tryLock())) return null;
+        errdefer if (io) |runtime| self.manifest_publish_mu.unlock(runtime) else self.manifest_publish_fallback_mu.unlock();
+        try original.checkLifetime();
+        self.retainReaderKind(.other);
+        self.manifest_publish_in_flight = true;
+        return .{ .backend = self, .io = io, .waited = false };
+    }
+
+    pub const QuiescedPreparedCheckpoint = @import("lsm_backend/prepared_checkpoint.zig").Publication(Backend);
+
+    /// Fixed post-descriptor receipt under the backend mutex/publication lane.
+    /// Prepared roots were registered and funded before physical publication.
+    pub fn installPreparedManifestCheckpoint(self: *Backend, fence: *const repository_mod.ManifestJournal.CheckpointFence, descriptor: repository_mod.manifest_set.Descriptor, next_run_id: u64, bytes: u64, directory: *RunDirectory, ledger: *repository_mod.ObsoleteLedger, covered_logical_bytes: u64, started: u64) !void {
+        const result = try self.manifest_journal.installPreparedCheckpoint(self, fence, descriptor, next_run_id, bytes, directory, ledger);
+        self.current_manifest_bytes = result.total;
+        self.write_stats.manifest_writes +|= 1;
+        self.write_stats.manifest_checkpoints +|= 1;
+        self.write_stats.manifest_bytes +|= result.written;
+        self.write_stats.manifest_ns +|= self.writeStatsElapsedNs(started);
+        self.unpublished_wal_logical_bytes -|= covered_logical_bytes;
+        if (self.unpublished_wal_logical_bytes == 0) self.unpublished_wal_max_batch_logical_bytes = 0;
+        self.manifest_dirty = !self.manifestCoversCurrentRuns();
+        self.obsolete_manifest_dirty = self.obsolete_paths.tree.root != self.manifest_journal.obsolete.tree.root;
+        self.reconcileManifestCredit();
+    }
+
     /// The lane serializes durable metadata, not readers or incoming flushes.
     /// Waiters prepare from the latest root after admission, naturally grouping
     /// publications accumulated during the previous fsync into one next edit.
@@ -5777,6 +6401,60 @@ pub const Backend = struct {
         self.manifest_reserved_mutation_bytes += wire;
         return .{ .backend = self, .bytes = wire };
     }
+
+    /// Allocation-free planning and no-flush admission for a quiesced sorted
+    /// successor. Its complete mutable epoch conservatively covers incoming
+    /// output without charging one descriptor for each unsorted source row.
+    pub const QuiescedCommitPreparation = struct {
+        planner: @import("lsm_backend/manifest_credit.zig").SortedEstimate = .{},
+        generation: usize = 0,
+        recovered: u64 = 0,
+        baseline_done: bool = false,
+        input_index: usize = 0,
+        input_bytes: u64 = 0,
+
+        pub fn resumeWithAdmission(self: *@This(), backend: *Backend, candidate: *const ActiveMemTable, input: *const State, original: read_admission.Port) !CommitAdmission {
+            try original.checkpoint();
+            if (backend.manifest_recovery_required) return error.RecoveryRequired;
+            const root = backend.root_dir orelse return error.ExecutionWaitUnsupported;
+            if (!self.baseline_done) {
+                if (!backend.manifest_credit_reconciled) {
+                    while (self.generation <= backend.activeImmutableMemtableCount()) {
+                        const wire = if (self.generation == 0)
+                            try self.planner.resumeWithAdmission(backend.options, root.len, &backend.mutable, original)
+                        else
+                            try self.planner.resumeWithAdmission(backend.options, root.len, backend.activeImmutableMemtables()[self.generation - 1], original);
+                        self.recovered +|= wire;
+                        self.planner = .{};
+                        self.generation += 1;
+                    }
+                    try original.checkpoint();
+                    backend.manifest_unpublished_wire_bytes = self.recovered;
+                    backend.manifest_credit_reconciled = true;
+                }
+                self.baseline_done = true;
+            }
+            const wire = try self.planner.resumeWithAdmission(backend.options, root.len, candidate, original);
+            while (self.input_index < input.entryCount()) {
+                try original.checkpoint();
+                const entry = input.entryAt(self.input_index);
+                self.input_bytes +|= @as(u64, @sizeOf(state_mod.OwnedEntry)) +| entry.key.len +| entry.value.len +| if (entry.namespace_name) |name| name.len else @as(usize, 0);
+                self.input_index += 1;
+            }
+            try original.checkpoint();
+            const bytes = self.input_bytes;
+            if (backend.manifest_admitted_commits >= backend.options.manifest_publication_max_waiters +| 1 or
+                bytes > backend.options.manifest_commit_backlog_bytes -| backend.manifest_admitted_bytes) return error.ResourceBudgetExceeded;
+            backend.reconcileManifestCredit();
+            const credit = std.math.mul(u64, 2, wire) catch return error.ResourceBudgetExceeded;
+            // History pressure refuses before WAL. No hidden flush or IO.
+            if (!backend.manifestCreditFits(credit)) return error.ResourceBudgetExceeded;
+            backend.manifest_admitted_commits += 1;
+            backend.manifest_admitted_bytes += bytes;
+            backend.manifest_admitted_wire_bytes += credit;
+            return .{ .backend = backend, .bytes = bytes, .wire_bytes = wire, .counted = true };
+        }
+    };
 
     pub fn admitPreparedCommit(self: *Backend, incoming: *const ActiveMemTable, bulk: *const State, wire: u64) !CommitAdmission {
         if (self.manifest_recovery_required) return error.RecoveryRequired;
@@ -6458,37 +7136,84 @@ pub const Backend = struct {
     /// Caller owns an epoch reference and holds the backend mutex. The exact
     /// pinned epoch is prepared once, even if publication advances meanwhile.
     pub fn prepareReadVersion(self: *Backend, version: *runtime_mod.ReadVersion) !void {
+        return self.prepareReadVersionControlled(version, null);
+    }
+
+    pub fn prepareReadVersionWithAdmission(self: *Backend, version: *runtime_mod.ReadVersion, control: read_admission.Port) !void {
+        return self.prepareReadVersionControlled(version, control);
+    }
+
+    /// Returns with the backend mutex held on every outcome. Rejection uses
+    /// mandatory physical reentry before releasing epoch/accounting ownership.
+    fn reacquireReadPreparationBackend(self: *Backend, control: ?read_admission.Port) !void {
+        if (control) |owner| {
+            _ = runtime_mod.lockBackendWithAdmission(Backend, self, owner) catch |err| {
+                _ = runtime_mod.lockBackend(Backend, self);
+                return err;
+            };
+        } else _ = runtime_mod.lockBackend(Backend, self);
+    }
+
+    fn prepareReadVersionControlled(self: *Backend, version: *runtime_mod.ReadVersion, control: ?read_admission.Port) !void {
+        if (control) |owner| try owner.checkLifetime();
         if (version.prepared) return;
         self.retainReaderKind(.other);
-        runtime_mod.unlockBackend(Backend, self, true);
-        const build_io: ?std.Io = if (comptime builtin.os.tag == .freestanding) null else if (self.options.read_runtime) |read_runtime| read_runtime.io else null;
-        if (build_io) |io| {
-            version.build_mu.lockUncancelable(io);
-        } else {
-            platform.sync.lockYielding(&version.build_fallback_mu);
-        }
-        _ = runtime_mod.lockBackend(Backend, self);
         defer self.releaseReaderKind(.other);
-        defer if (build_io) |io| version.build_mu.unlock(io) else version.build_fallback_mu.unlock();
-        if (version.prepared) return;
+        var owns_build = false;
+        defer if (owns_build) {
+            std.debug.assert(version.preparing);
+            version.preparing = false;
+        };
+        while (true) {
+            if (control) |owner| try owner.checkLifetime();
+            if (version.prepared) return;
+            if (!version.preparing) {
+                version.preparing = true;
+                owns_build = true;
+                break;
+            }
+            const owner = control orelse break;
+            // A coarse wait may retain the very CPU slot the producer needs.
+            // Only coalesce callers that can lend execution while suspended.
+            if (!try owner.hasExecutionWait()) break;
+            // Coalesce admitted peers, but never block a legacy caller on a
+            // producer that may need its CPU slot. Legacy callers may build a
+            // separately reserved candidate and race publication instead.
+            runtime_mod.unlockBackend(Backend, self, true);
+            const waited = owner.waitForProgress();
+            const reentry = self.reacquireReadPreparationBackend(control);
+            try reentry;
+            try waited;
+        }
         const directory = version.directory.?;
         const build_started = self.readStatsNowNs();
         runtime_mod.unlockBackend(Backend, self, true);
         var reservation: ?resource_manager_mod.Reservation = null;
-        const built = blk: {
+        const built: anyerror!*runtime_mod.ReadVersion = blk: {
+            if (control) |owner| owner.checkpoint() catch |err| break :blk err;
             if (self.options.resource_manager) |manager| {
                 reservation = manager.reserve(.lsm_in_memory_state, runtime_mod.ReadVersion.buildMemoryBound(directory.count())) catch |err| break :blk @as(anyerror!*runtime_mod.ReadVersion, err);
             }
-            break :blk runtime_mod.ReadVersion.createFromDirectory(self.allocator, directory);
+            break :blk runtime_mod.ReadVersion.createFromDirectoryWithAdmission(self.allocator, directory, control);
         };
-        _ = runtime_mod.lockBackend(Backend, self);
         defer if (reservation) |*lease| lease.release();
+        var transferred = false;
+        defer if (!transferred) {
+            if (built) |projection| projection.discardProjection() else |_| {}
+        };
+        const final_reentry = self.reacquireReadPreparationBackend(control);
+        try final_reentry;
         const projection = try built;
+        if (control) |owner| try owner.checkLifetime();
+        // A legacy candidate may have won while this producer was suspended.
+        // Discard our arrays without releasing the epoch's directory ownership.
+        if (version.prepared) return;
         // Transfer only the projection. The epoch already owns this root.
         version.runs = projection.runs;
         version.l0_groups = projection.l0_groups;
         version.levels = projection.levels;
         version.projection_bytes = projection.projection_bytes;
+        transferred = true;
         self.allocator.destroy(projection);
         version.prepared = true;
         self.read_version_builds +|= 1;
@@ -6567,6 +7292,67 @@ pub const Backend = struct {
     pub fn planningDirectory(self: *Backend) !*const RunDirectory {
         try self.ensureRunDirectory();
         return self.run_directory.?;
+    }
+
+    /// Directory payloads keep this stable pin capability until their final
+    /// release. No backend pointer or borrowed map slot escapes registration.
+    pub fn retainDirectoryRunSnapshotPin(_: *Backend, run: *Run) !RunDirectory.EntryPin {
+        if (run.version_ref_pinned) return error.InvalidArgument;
+        const path = run.path orelse return .{ .owner = &run_snapshot_refs, .release = releaseDirectorySnapshotPin };
+        while (true) {
+            var registration = prepareRunSnapshotRefOperation(path, .retain);
+            defer registration.deinit();
+            _ = registration.planWithAdmission(null) catch |cause| {
+                if (cause == error.CompactionPlanningStale) continue;
+                return cause;
+            };
+            try registration.resumeWithAdmission(null);
+            registration.publishWithAdmission(null) catch |cause| {
+                if (cause == error.CompactionPlanningStale) continue;
+                return cause;
+            };
+            return completeDirectorySnapshotPin(&registration, run, null);
+        }
+    }
+    /// Caller prepays the operation header and planned additional allocation,
+    /// pins input, and registers physical retirement before running this cursor.
+    pub fn prepareRunSnapshotRefOperation(path: []const u8, mode: run_pin_registry.Mode) run_pin_registry.Operation {
+        return .init(&run_snapshot_refs, path, mode);
+    }
+    fn completeDirectorySnapshotPin(registration: *run_pin_registry.Operation, run: *Run, original: ?@import("../common/read_admission.zig").Port) !RunDirectory.EntryPin {
+        if (original) |port| try port.checkpoint();
+        if (registration.registry != &run_snapshot_refs or registration.mode != .retain) return error.InvalidArgument;
+        if (run.version_ref_pinned) return error.InvalidArgument;
+        const path = run.path orelse return error.CompactionPlanningStale;
+        if (path.ptr != registration.path.ptr or path.len != registration.path.len) return error.CompactionPlanningStale;
+        const pin = try registration.takePinWithAdmission(null);
+        // The checked original cannot reject between taking the owned file
+        // pin and marking its immutable run. No allocation or callback here.
+        run.version_ref_pinned = true;
+        return .{ .owner = pin, .release = releaseDirectorySnapshotPin };
+    }
+    pub fn completeDirectorySnapshotPinWithAdmission(registration: *run_pin_registry.Operation, run: *Run, original: @import("../common/read_admission.zig").Port) !RunDirectory.EntryPin {
+        return completeDirectorySnapshotPin(registration, run, original);
+    }
+    fn releaseDirectorySnapshotPin(owner: *anyopaque, run: *Run) void {
+        if (!run.version_ref_pinned) return;
+        const pin: *RunSnapshotRefRegistry.Pin = @ptrCast(@alignCast(owner));
+        pin.release();
+        run.version_ref_pinned = false;
+    }
+    /// Fail closed before interpreting a foreign/legacy opaque pin owner.
+    pub fn beginDirectorySnapshotRetirement(lease: *RunDirectory.EntryLease, original: @import("../common/read_admission.zig").Port) !RunDirectory.EntryLease.Retirement {
+        return lease.beginRetirementForPinWithAdmission(releaseDirectorySnapshotPin, directorySnapshotPinRetirement(), original);
+    }
+    /// Only for directory EntryPins issued above. The context is global and
+    /// release never dereferences a backend, hashes a path, allocates or locks.
+    fn directorySnapshotPinRetirement() RunDirectory.EntryLease.PinRelease {
+        return .{ .context = &run_snapshot_refs, .resume_fn = struct {
+            fn call(_: *anyopaque, owner: *anyopaque, run: *Run, original: ?@import("../common/read_admission.zig").Port) !void {
+                if (original) |port| try port.checkpoint();
+                releaseDirectorySnapshotPin(owner, run);
+            }
+        }.call };
     }
 
     pub fn retainRunSnapshotRef(_: *Backend, run: *Run) !void {
@@ -6988,8 +7774,8 @@ pub const Backend = struct {
             const generation = self.root_generation;
             var handle = while (true) {
                 if (cache.retainRunState(path, run_id, generation)) |retained| break retained;
-                try cache.beginLoad(path, run_id, generation, .run_state);
-                defer cache.finishLoad(path, run_id, generation, .run_state);
+                var load_claim = try cache.beginLoadClaim(path, run_id, generation, .run_state, 0, 0, null);
+                defer load_claim.transferToCache();
                 if (cache.retainRunState(path, run_id, generation)) |retained| break retained;
                 const loaded = try repository_mod.loadRunStateAllocWithStorage(self.storage.?, cache.valueAllocator(), path);
                 break try cache.putRunState(path, run_id, generation, loaded);
@@ -7031,7 +7817,13 @@ pub const Backend = struct {
     }
 
     pub fn getCachedRunIndexIndex(self: *Backend, path: []const u8, run_id: u64) !usize {
+        return self.getCachedRunIndexIndexWithAdmission(path, run_id, null);
+    }
+
+    pub fn getCachedRunIndexIndexWithAdmission(self: *Backend, path: []const u8, run_id: u64, control: ?@import("../common/read_admission.zig").Port) !usize {
+        if (control) |budget| try budget.checkpoint();
         for (self.run_index_cache.items, 0..) |*cached, i| {
+            if (control) |budget| try budget.checkpoint();
             if (cached.run_id == run_id and std.mem.eql(u8, cached.path, path)) return i;
         }
 
@@ -7041,10 +7833,11 @@ pub const Backend = struct {
         const loaded = try self.allocator.create(lsm_table_file.TableIndex);
         errdefer self.allocator.destroy(loaded);
         const start_ns = self.readStatsNowNs();
-        const loaded_index = repository_mod.loadRunTableIndexAllocWithStorage(self.storage.?, self.allocator, path);
+        const loaded_index = repository_mod.loadRunTableIndexAllocWithStorageAndAdmission(self.storage.?, self.allocator, path, control);
         self.recordTableIndexLoad(self.readStatsElapsedNs(start_ns));
         loaded.* = try loaded_index;
         errdefer loaded.deinit(self.allocator);
+        if (control) |budget| try budget.checkpoint();
         try self.run_index_cache.append(self.allocator, .{
             .run_id = run_id,
             .path = cached_path,
@@ -7054,7 +7847,13 @@ pub const Backend = struct {
     }
 
     pub fn getCachedRunTableIndex(self: *Backend, path: []const u8, run_id: u64) !usize {
+        return self.getCachedRunTableIndexWithAdmission(path, run_id, null);
+    }
+
+    pub fn getCachedRunTableIndexWithAdmission(self: *Backend, path: []const u8, run_id: u64, control: ?@import("../common/read_admission.zig").Port) !usize {
+        if (control) |budget| try budget.checkpoint();
         for (self.run_table_cache.items, 0..) |*cached, i| {
+            if (control) |budget| try budget.checkpoint();
             if (cached.run_id == run_id and std.mem.eql(u8, cached.path, path)) return i;
         }
 
@@ -7064,49 +7863,64 @@ pub const Backend = struct {
         if (self.options.cache) |cache| {
             const generation = self.root_generation;
             var raw_handle = while (true) {
-                if (cache.retainRunTableRaw(path, run_id, generation)) |retained| break retained;
-                try cache.beginLoad(path, run_id, generation, .run_table_raw);
-                defer cache.finishLoad(path, run_id, generation, .run_table_raw);
-                if (cache.retainRunTableRaw(path, run_id, generation)) |retained| break retained;
+                if (try cache.retainRunTableRawWithAdmission(path, run_id, generation, control)) |retained| break retained;
+                var load_claim = try cache.beginLoadClaim(path, run_id, generation, .run_table_raw, 0, 0, control);
+                defer load_claim.transferToCache();
+                if (try cache.retainRunTableRawWithAdmission(path, run_id, generation, control)) |retained| break retained;
                 const max_read_bytes = repository_mod.maxRunFileReadBytes();
-                const raw = self.storage.?.readFileAlloc(cache.valueAllocator(), path, max_read_bytes) catch |err| {
+                break cache.readRunTableRawWithAdmission(self.storage.?, path, run_id, generation, max_read_bytes, control) catch |err| {
                     logStreamTooLongForPath(self.storage.?, path, max_read_bytes, "Backend.getCachedRunTableIndex.raw", err);
                     return err;
                 };
-                break try cache.putRunTableRaw(path, run_id, generation, raw);
             };
-            errdefer raw_handle.release();
+            errdefer if (control != null) raw_handle.releaseForAdmissionFailure() else raw_handle.release();
 
             var index_handle = while (true) {
-                if (cache.retainRunTableIndex(path, run_id, generation)) |retained| break retained;
-                try cache.beginLoad(path, run_id, generation, .run_table_index);
-                defer cache.finishLoad(path, run_id, generation, .run_table_index);
-                if (cache.retainRunTableIndex(path, run_id, generation)) |retained| break retained;
+                if (try cache.retainRunTableIndexWithAdmission(path, run_id, generation, control)) |retained| break retained;
+                var load_claim = try cache.beginLoadClaim(path, run_id, generation, .run_table_index, 0, 0, control);
+                defer load_claim.transferToCache();
+                if (try cache.retainRunTableIndexWithAdmission(path, run_id, generation, control)) |retained| break retained;
                 const start_ns = self.readStatsNowNs();
-                const decoded = lsm_table_file.decodeIndexAlloc(cache.valueAllocator(), raw_handle.runTableRaw());
+                const result = cache.decodeRunTableIndexWithAdmission(path, raw_handle.runTableRaw(), control);
                 self.recordTableIndexDecode(self.readStatsElapsedNs(start_ns));
-                const index = try decoded;
-                break try cache.putRunTableIndex(path, run_id, generation, index);
+                var decoded = try result;
+                defer decoded.deinit();
+                break try decoded.publish(run_id, generation, control);
             };
-            errdefer index_handle.release();
+            errdefer if (control != null) index_handle.releaseForAdmissionFailure() else index_handle.release();
 
             if (lsm_table_file.indexHasCompressedBlocks(index_handle.runTableIndex())) {
+                if (control) |budget| {
+                    var loaded = try cache.copyAndDecodeRunTableWithAdmission(self.allocator, raw_handle.runTableRaw(), budget);
+                    errdefer loaded.deinit();
+                    try budget.checkpoint();
+                    try self.run_table_cache.append(self.allocator, .{
+                        .run_id = run_id,
+                        .path = cached_path,
+                        .value = .{ .admitted_owned = loaded },
+                    });
+                    raw_handle.releaseWithAdmission(control);
+                    index_handle.releaseWithAdmission(control);
+                    return self.run_table_cache.items.len - 1;
+                }
                 const raw_copy = try self.allocator.dupe(u8, raw_handle.runTableRaw());
-                var loaded = lsm_table_file.decodeBorrowedOwnedAlloc(self.allocator, raw_copy) catch |err| {
+                var loaded = lsm_table_file.decodeBorrowedOwnedAllocWithAdmission(self.allocator, raw_copy, control) catch |err| {
                     self.allocator.free(raw_copy);
                     return err;
                 };
                 errdefer loaded.deinit(self.allocator);
+                if (control) |budget| try budget.checkpoint();
                 try self.run_table_cache.append(self.allocator, .{
                     .run_id = run_id,
                     .path = cached_path,
                     .value = .{ .owned = loaded },
                 });
-                raw_handle.release();
-                index_handle.release();
+                raw_handle.releaseWithAdmission(control);
+                index_handle.releaseWithAdmission(control);
                 return self.run_table_cache.items.len - 1;
             }
 
+            if (control) |budget| try budget.checkpoint();
             try self.run_table_cache.append(self.allocator, .{
                 .run_id = run_id,
                 .path = cached_path,
@@ -7119,8 +7933,9 @@ pub const Backend = struct {
             return self.run_table_cache.items.len - 1;
         }
 
-        var loaded = try repository_mod.loadRunTableBorrowedAllocWithStorage(self.storage.?, self.allocator, path);
+        var loaded = try repository_mod.loadRunTableBorrowedAllocWithStorageAndAdmission(self.storage.?, self.allocator, path, control);
         errdefer loaded.deinit(self.allocator);
+        if (control) |budget| try budget.checkpoint();
         try self.run_table_cache.append(self.allocator, .{
             .run_id = run_id,
             .path = cached_path,
@@ -7174,27 +7989,46 @@ pub const Backend = struct {
     /// Called under the backend mutex. Fixed metadata records two misses before
     /// promotion; one promoter owns the attempt and budget denials back off.
     pub fn beginLocalBlockPromotion(self: *Backend, path: []const u8, run_id: u64, offset: u64, len: u32, decoded_len: usize) bool {
-        if (!self.localBlockCacheEligible(decoded_len)) return false;
+        return self.beginLocalBlockPromotionClaim(path, run_id, offset, len, decoded_len) != null;
+    }
+
+    pub fn beginLocalBlockPromotionClaim(self: *Backend, path: []const u8, run_id: u64, offset: u64, len: u32, decoded_len: usize) ?runtime_mod.LocalBlockPromotion {
+        if (!self.localBlockCacheEligible(decoded_len)) return null;
         const path_hash = std.hash.Wyhash.hash(0, path);
         const access = self.nextLocalCacheAccess();
         var victim: ?usize = null;
         for (&self.local_block_heat, 0..) |*heat, i| {
+            const active = reconcileLocalBlockPromotion(heat);
             if (heat.valid and heat.run_id == run_id and heat.path_hash == path_hash and heat.offset == offset and heat.len == len) {
                 heat.access = access;
-                if (heat.promoting) return false;
+                if (active) return null;
                 if (heat.cooldown != 0) {
                     heat.cooldown -= 1;
-                    return false;
+                    return null;
                 }
                 heat.misses +|= 1;
-                if (heat.misses < 2) return false;
-                heat.promoting = true;
-                return true;
+                if (heat.misses < 2) return null;
+                heat.promotion.store(.active, .monotonic);
+                return .{ .completion = &heat.promotion };
             }
-            if (!heat.promoting and (victim == null or !heat.valid or heat.access < self.local_block_heat[victim.?].access)) victim = i;
+            if (!active and (victim == null or !heat.valid or heat.access < self.local_block_heat[victim.?].access)) victim = i;
         }
-        const slot = victim orelse return false;
+        const slot = victim orelse return null;
         self.local_block_heat[slot] = .{ .valid = true, .run_id = run_id, .path_hash = path_hash, .offset = offset, .len = len, .misses = 1, .access = access };
+        return null;
+    }
+
+    // Called only under the backend mutex. Completion publication is the sole
+    // cross-thread mutation; active slots cannot be evicted or reassigned.
+    fn reconcileLocalBlockPromotion(heat: *LocalBlockHeat) bool {
+        const state = heat.promotion.load(.acquire);
+        // Keep one snapshot for selection: a completion racing this load is
+        // reconciled on the next pass, before its cooldown can be bypassed.
+        if (state == .active) return true;
+        if (state != .admitted and state != .denied) return false;
+        heat.misses = 0;
+        heat.cooldown = if (state == .admitted) 0 else 64;
+        heat.promotion.store(.idle, .monotonic);
         return false;
     }
 
@@ -7202,9 +8036,8 @@ pub const Backend = struct {
         const path_hash = std.hash.Wyhash.hash(0, path);
         for (&self.local_block_heat) |*heat| {
             if (!heat.valid or heat.run_id != run_id or heat.path_hash != path_hash or heat.offset != offset or heat.len != len) continue;
-            heat.promoting = false;
-            heat.misses = 0;
-            heat.cooldown = if (admitted) 0 else 64;
+            heat.promotion.store(if (admitted) .admitted else .denied, .release);
+            _ = reconcileLocalBlockPromotion(heat);
             return;
         }
     }
@@ -7236,13 +8069,87 @@ pub const Backend = struct {
     /// Optional cache admission never fails the mandatory read. Only admitted
     /// payloads gain cache ownership; resource credit follows their last lease.
     pub fn cacheRunBlockLease(self: *Backend, path: []const u8, run_id: u64, offset: u64, len: u32, payload: *SharedBytes) bool {
+        return self.cacheRunBlockLeaseControlled(path, run_id, offset, len, payload, null) catch unreachable;
+    }
+
+    pub fn cacheRunBlockLeaseWithAdmission(self: *Backend, path: []const u8, run_id: u64, offset: u64, len: u32, payload: *SharedBytes, control: @import("../common/read_admission.zig").Port) !bool {
+        return self.cacheRunBlockLeaseControlled(path, run_id, offset, len, payload, control);
+    }
+
+    fn cachePathEqualWithAdmission(left: []const u8, right: []const u8, control: ?@import("../common/read_admission.zig").Port) !bool {
+        if (left.len != right.len) return false;
+        if (control) |budget| {
+            var checked: usize = 0;
+            while (checked < left.len) {
+                try budget.checkpoint();
+                const next = checked + @min(left.len - checked, 64 * 1024);
+                if (!std.mem.eql(u8, left[checked..next], right[checked..next])) return false;
+                checked = next;
+            }
+            try budget.checkpoint();
+            return true;
+        }
+        return std.mem.eql(u8, left, right);
+    }
+
+    fn prepareLocalCacheEntries(self: *Backend, control: ?read_admission.Port) !bool {
+        const manager = self.options.resource_manager;
+        if (control == null or manager == null) {
+            // A managed slab has room for the fixed cache ceiling. Never ask
+            // ArrayList to resize a buffer owned by an intrusive retirement node.
+            if (self.run_block_cache_owner != null) return true;
+            self.run_block_cache.ensureUnusedCapacity(self.allocator, 1) catch return false;
+            return true;
+        }
+        const budget = control.?;
+        if (self.run_block_cache_owner == null and self.run_block_cache.capacity != 0) {
+            // Adopt a legacy slab before replacement can free it. The exact
+            // retained capacity, including slack, is charged before publication.
+            const owned = try LocalCacheEntries.create(self.allocator, manager.?, self.run_block_cache.allocatedSlice(), budget);
+            self.run_block_cache_owner = owned;
+        }
+        if (self.run_block_cache_owner != null and self.run_block_cache.capacity >= max_local_cached_run_blocks) return true;
+        const replacement = try LocalCacheEntries.create(self.allocator, manager.?, null, budget);
+        var published = false;
+        defer if (!published) replacement.release();
+        for (self.run_block_cache.items, 0..) |entry, i| {
+            try budget.checkpoint();
+            replacement.entries[i] = entry;
+        }
+        try budget.checkpoint();
+        const previous = self.run_block_cache_owner;
+        const length = self.run_block_cache.items.len;
+        self.run_block_cache = .empty;
+        self.run_block_cache.items = replacement.entries[0..length];
+        self.run_block_cache.capacity = replacement.entries.len;
+        self.run_block_cache_owner = replacement;
+        published = true;
+        if (previous) |owned| owned.release();
+        return true;
+    }
+
+    pub fn deinitRunBlockCache(self: *Backend) void {
+        for (self.run_block_cache.items) |*cached| cached.deinit(self.allocator);
+        if (self.run_block_cache_owner) |owned| owned.release() else self.run_block_cache.deinit(self.allocator);
+        self.run_block_cache_owner = null;
+        self.run_block_cache = .empty;
+        self.run_block_cache_bytes = 0;
+    }
+
+    fn cacheRunBlockLeaseControlled(self: *Backend, path: []const u8, run_id: u64, offset: u64, len: u32, payload: *SharedBytes, control: ?@import("../common/read_admission.zig").Port) !bool {
+        if (control) |budget| try budget.checkpoint();
         if (!self.localBlockCacheEligible(payload.bytes.len) or self.closing.load(.acquire) or payload.cache_admitted) return false;
         for (self.run_block_cache.items) |cached| {
-            if (cached.run_id == run_id and cached.block_offset == offset and cached.block_len == len and std.mem.eql(u8, cached.path, path)) return false;
+            if (control) |budget| try budget.checkpoint();
+            if (cached.run_id == run_id and cached.block_offset == offset and cached.block_len == len and try cachePathEqualWithAdmission(cached.path, path, control)) return false;
         }
         if (self.options.resource_manager) |manager| {
             // First read/cache admission occurs at the backend's stable address.
-            if (self.local_block_cache_reclaimer == null) self.local_block_cache_reclaimer = manager.registerReclaimer(.lsm_block_table_cache, self, reclaimLocalBlocks) catch return false;
+            if (control != null and (payload.reservation == null or payload.reservation.?.manager != manager)) return false;
+            if (self.local_block_cache_reclaimer == null) self.local_block_cache_reclaimer = (if (control) |budget| manager.registerReclaimerWithAdmission(.lsm_block_table_cache, self, reclaimLocalBlocks, budget) else manager.registerReclaimer(.lsm_block_table_cache, self, reclaimLocalBlocks)) catch |err| {
+                if (err == error.OutOfMemory or err == error.ResourceBudgetExceeded or err == error.ResourceTemporarilyUnavailable) return false;
+                return err;
+            };
         }
         // Only reclaim when this owner can actually make admission succeed.
         // An impossible candidate or metadata OOM must preserve useful blocks.
@@ -7250,29 +8157,70 @@ pub const Backend = struct {
             const required = payload.bytes.len + @sizeOf(SharedBytes);
             var reclaimable: u64 = 0;
             for (self.run_block_cache.items) |cached| {
-                if (cached.payload.refs.load(.acquire) == 1) {
+                if (control) |budget| try budget.checkpoint();
+                if (cached.payload.refs.load(.acquire) == 1 and (control != null or cached.payload.retirement.credit == null)) {
                     if (cached.payload.reservation) |credit| reclaimable +|= credit.reservedBytes();
                 }
             }
             const available = if (payload.reservation != null) blk: {
                 // The read payload already owns its host charge. Reclassification
                 // needs destination slice headroom, not another aggregate charge.
-                const stats = manager.sliceStats(.lsm_block_table_cache);
+                const stats = if (control) |budget| try manager.sliceStatsWithAdmission(.lsm_block_table_cache, budget) else manager.sliceStats(.lsm_block_table_cache);
                 break :blk if (stats.hard_limit_bytes == 0) std.math.maxInt(u64) else stats.hard_limit_bytes -| stats.used_bytes;
             } else manager.availableAdmissionBytes(.lsm_block_table_cache);
             if (required > available +| reclaimable) return false;
         }
-        const cached_path = self.allocator.dupe(u8, path) catch return false;
+        if (control) |budget| try budget.checkpoint();
+        var path_construction: ?resource_manager_mod.ConstructionCredit = null;
+        if (control) |budget| if (self.options.resource_manager) |manager| {
+            path_construction = manager.reserveConstructionWithAdmission(.lsm_block_table_cache, @sizeOf(SharedBytes) + path.len, budget) catch |err| {
+                if (err == error.ResourceBudgetExceeded or err == error.ResourceTemporarilyUnavailable) return false;
+                return err;
+            };
+        };
+        defer if (path_construction) |*credit| credit.retire();
+        const cached_path = self.allocator.alloc(u8, path.len) catch return false;
+        var path_owner: ?*SharedBytes = null;
         var admitted = false;
-        defer if (!admitted) self.allocator.free(cached_path);
-        self.run_block_cache.ensureUnusedCapacity(self.allocator, 1) catch return false;
+        defer if (!admitted) {
+            if (path_owner) |owned| owned.release() else self.allocator.free(cached_path);
+        };
+        if (control) |budget| {
+            var copied: usize = 0;
+            while (copied < path.len) {
+                try budget.checkpoint();
+                const next = copied + @min(path.len - copied, 64 * 1024);
+                @memcpy(cached_path[copied..next], path[copied..next]);
+                copied = next;
+            }
+            try budget.checkpoint();
+        } else @memcpy(cached_path, path);
+        if (path_construction) |*credit| {
+            const owner = SharedBytes.create(self.allocator, cached_path) catch return false;
+            path_owner = owner;
+            try owner.registerRetirementWithAdmission(credit, control.?);
+        }
+        if (!(self.prepareLocalCacheEntries(control) catch |err| {
+            if (err == error.OutOfMemory or err == error.ResourceBudgetExceeded or err == error.ResourceTemporarilyUnavailable) return false;
+            return err;
+        })) return false;
+        if (control) |budget| try budget.checkpoint();
         if (self.options.resource_manager) |manager| {
             const bytes = payload.bytes.len + @sizeOf(SharedBytes);
             while (true) {
                 if (payload.reservation) |*credit| {
-                    credit.reclassify(.lsm_block_table_cache) catch |err| {
-                        if (err != error.ResourceBudgetExceeded or self.run_block_cache.items.len == 0) return false;
-                        _ = self.evictOldestLocalBlock();
+                    (if (control) |budget| credit.reclassifyWithAdmission(.lsm_block_table_cache, budget) else credit.reclassify(.lsm_block_table_cache)) catch |err| {
+                        if (err != error.ResourceBudgetExceeded) {
+                            if (control != null) return err;
+                            return false;
+                        }
+                        if (self.run_block_cache.items.len == 0) return false;
+                        if (control) |budget| {
+                            _ = try self.evictOldestLocalBlockWithAdmission(budget);
+                            _ = try manager.drainForegroundPayloadRetirementWithAdmission(budget);
+                            if (manager.cleanup_consumer_bound.load(.acquire)) return false;
+                            try manager.drainConstructionCleanupWithAdmission(budget);
+                        } else _ = self.evictOldestLocalBlock();
                         continue;
                     };
                 } else {
@@ -7287,9 +8235,10 @@ pub const Backend = struct {
             }
         }
         while (self.run_block_cache.items.len >= max_local_cached_run_blocks or self.run_block_cache_bytes > self.options.local_block_cache_bytes - payload.bytes.len) {
-            _ = self.evictOldestLocalBlock();
+            if (control) |budget| _ = try self.evictOldestLocalBlockWithAdmission(budget) else _ = self.evictOldestLocalBlock();
         }
-        self.run_block_cache.appendAssumeCapacity(.{ .run_id = run_id, .path = cached_path, .block_offset = offset, .block_len = len, .payload = payload, .last_access = self.nextLocalCacheAccess() });
+        if (control) |budget| try budget.checkpoint();
+        self.run_block_cache.appendAssumeCapacity(.{ .run_id = run_id, .path = cached_path, .path_owner = path_owner, .block_offset = offset, .block_len = len, .payload = payload, .last_access = self.nextLocalCacheAccess() });
         _ = payload.retain();
         payload.cache_admitted = true;
         payload.result_pins_allowed = true;
@@ -7301,13 +8250,92 @@ pub const Backend = struct {
     /// Lease exactly the immutable artifact roots, not the whole checkpoint.
     /// A bounded LRU avoids unbounded catalog leases and descriptor residency.
     pub fn readRunRangeAlloc(self: *Backend, a: Allocator, path: []const u8, offset: u64, len: usize) ![]u8 {
+        return self.readRunRangeAllocWithAdmission(a, path, offset, len, null);
+    }
+
+    /// One source binding for an immutable run range. The caller pins the run
+    /// read version (and backend/storage) through deinit; replaceable paths such
+    /// as CURRENT or WAL files are not eligible. Leased providers retain one
+    /// physical generation across every window and verification pass.
+    pub const RunRangeReader = struct {
+        allocator: Allocator,
+        storage: Storage,
+        lease: ?*RunSourceLease,
+        path: []const u8,
+        offset: u64,
+        length: usize,
+
+        pub fn deinit(self: *@This()) void {
+            if (self.lease) |lease| lease.release();
+            self.* = undefined;
+        }
+
+        pub fn readInto(self: *@This(), offset: u64, out: []u8, control: ?read_admission.Port) !void {
+            if (offset > self.length or out.len > self.length - offset) return error.InvalidArgument;
+            const absolute = std.math.add(u64, self.offset, offset) catch return error.InvalidArgument;
+            if (control) |port| try port.checkpoint();
+            if (self.lease) |lease| {
+                // Only original lendable authority permits CPU handoff. A
+                // retained-dependency port intentionally supplies no boundary.
+                const boundary = switch (lease.source) {
+                    .contiguous => null, // bounded CPU copy, not a physical wait
+                    .ranges => if (control) |port| try port.executionWait() else null,
+                };
+                if (boundary) |wait| try wait.beginWait();
+                const loaded = lease.source.readInto(absolute, out);
+                if (boundary) |wait| try wait.endWait();
+                if (control) |port| try port.checkpoint();
+                return loaded;
+            } else if (control) |port| {
+                try self.storage.readFileRangeIntoWithAdmission(self.path, absolute, out, port);
+            } else {
+                try self.storage.readFileRangeInto(self.allocator, self.path, absolute, out);
+            }
+            if (control) |port| try port.checkpoint();
+        }
+    };
+
+    pub fn supportsRunRangeReader(self: *Backend, control: ?read_admission.Port) bool {
+        const storage = self.storage orelse return false;
+        return storage.vtable.open_leased_immutable_source != null or
+            (storage.vtable.read_file_range_into != null and
+                (control == null or storage.vtable.read_file_range_into_with_admission != null));
+    }
+
+    pub fn openRunRangeReaderWithAdmission(self: *Backend, path: []const u8, offset: u64, len: usize, control: ?read_admission.Port) !RunRangeReader {
+        if (control) |port| try port.checkpoint();
+        _ = std.math.add(u64, offset, len) catch return error.InvalidArgument;
+        if (!self.supportsRunRangeReader(control)) return error.ExecutionWaitUnsupported;
         const storage = self.storage.?;
-        if (storage.vtable.open_leased_immutable_source == null) return storage.readFileRangeAlloc(a, path, offset, len);
-        const lease = try self.retainRunSource(path);
+        const lease = if (storage.vtable.open_leased_immutable_source != null) try self.retainRunSourceWithAdmission(path, control) else null;
+        errdefer if (lease) |held| held.release();
+        if (control) |port| try port.checkpoint();
+        return .{ .allocator = self.allocator, .storage = storage, .lease = lease, .path = path, .offset = offset, .length = len };
+    }
+
+    pub fn readRunRangeAllocWithAdmission(self: *Backend, a: Allocator, path: []const u8, offset: u64, len: usize, control: ?read_admission.Port) ![]u8 {
+        if (control) |budget| try budget.checkpoint();
+        const storage = self.storage.?;
+        if (storage.vtable.open_leased_immutable_source == null) {
+            const bytes = if (control) |budget| try storage.readFileRangeAllocWithAdmission(a, path, offset, len, budget) else try storage.readFileRangeAlloc(a, path, offset, len);
+            errdefer a.free(bytes);
+            if (control) |budget| try budget.checkpoint();
+            return bytes;
+        }
+        const lease = try self.retainRunSourceWithAdmission(path, control);
         defer lease.release();
         const bytes = try a.alloc(u8, len);
         errdefer a.free(bytes);
-        try lease.source.readInto(offset, bytes);
+        // Keep the physical source use until every chunk has returned. A
+        // cancelled read frees its buffer before returning the use and lease.
+        var position: usize = 0;
+        while (position < bytes.len) {
+            if (control) |budget| try budget.checkpoint();
+            const end = position + @min(bytes.len - position, 64 * 1024);
+            try lease.source.readInto(std.math.add(u64, offset, position) catch return error.InvalidArgument, bytes[position..end]);
+            position = end;
+        }
+        if (control) |budget| try budget.checkpoint();
         return bytes;
     }
 
@@ -7332,10 +8360,36 @@ pub const Backend = struct {
         }
     }
 
-    fn openRunSource(self: *Backend, flight: *SourceOpen) !*RunSourceLease {
+    fn openRunSourcePhysical(self: *Backend, path: []const u8, control: ?read_admission.Port) !@import("../segment_source.zig").Source {
+        const original = control orelse return self.storage.?.openLeasedImmutableSource(self.allocator, path);
+        try original.checkLifetime();
+        const boundary = try original.executionWait();
+        if (boundary) |wait| try wait.beginWait();
+        const opened = self.storage.?.openLeasedImmutableSource(self.allocator, path);
+        // The provider has physically returned before mandatory CPU reentry.
+        // A rejected resume must discard a successfully opened descriptor/pin.
+        const resumed: anyerror!void = if (boundary) |wait| wait.endWait() else {};
+        resumed catch |cause| {
+            if (opened) |value| {
+                var source = value;
+                source.close();
+            } else |_| {}
+            return cause;
+        };
+        original.checkLifetime() catch |cause| {
+            if (opened) |value| {
+                var source = value;
+                source.close();
+            } else |_| {}
+            return cause;
+        };
+        return opened;
+    }
+
+    fn openRunSource(self: *Backend, flight: *SourceOpen, control: ?read_admission.Port) !*RunSourceLease {
         const lease = try self.allocator.create(RunSourceLease);
         errdefer self.allocator.destroy(lease);
-        var source = try self.storage.?.openLeasedImmutableSource(self.allocator, flight.path);
+        var source = try self.openRunSourcePhysical(flight.path, control);
         errdefer source.close();
         lease.* = .{ .allocator = self.allocator, .source = source };
         // Protect the initial read before opting into expiry. Retirement can
@@ -7346,12 +8400,26 @@ pub const Backend = struct {
         source.enableIdleExpiry();
         const owned_path = try self.allocator.dupe(u8, flight.path);
         errdefer self.allocator.free(owned_path);
-        platform.sync.lockYielding(&self.run_source_mutex);
+        if (control) |budget| try bounded_mutex.lockAtomic(&self.run_source_mutex, budget) else platform.sync.lockYielding(&self.run_source_mutex);
         if (flight.epoch != self.run_source_epoch) {
             self.run_source_mutex.unlock();
             self.allocator.free(owned_path);
             lease.releaseOwner();
             return lease;
+        }
+        // Non-lending callers may open independently rather than wait for a
+        // parked producer. Publish at most one cache owner for this epoch/path.
+        // Provider activation and loser destruction must run outside the lock.
+        if (self.findRunSourceAssumeLocked(flight.path)) |winner| {
+            self.run_source_mutex.unlock();
+            self.allocator.free(owned_path);
+            lease.releaseOwner(); // no cache owner was installed for this candidate
+            if (winner.activateHeld()) {
+                lease.release();
+                return winner;
+            }
+            winner.releaseOwner();
+            return lease; // own active use; expired cache entry cannot replace it
         }
         self.run_source_clock +%= 1;
         self.run_sources.append(self.allocator, .{ .path = owned_path, .lease = lease, .access = self.run_source_clock }) catch |err| {
@@ -7359,16 +8427,31 @@ pub const Backend = struct {
             return err;
         };
         self.run_source_mutex.unlock();
-        self.trimRunSources();
         return lease;
     }
 
     fn retainRunSource(self: *Backend, path: []const u8) !*RunSourceLease {
+        return self.retainRunSourceWithAdmission(path, null);
+    }
+
+    fn retainRunSourceWithAdmission(self: *Backend, path: []const u8, control: ?read_admission.Port) !*RunSourceLease {
+        return self.retainRunSourceWithAdmissionPolicy(path, control, true);
+    }
+
+    fn retainRunSourceWithAdmissionPolicy(self: *Backend, path: []const u8, control: ?read_admission.Port, allow_coalescing: bool) !*RunSourceLease {
+        if (control) |budget| try budget.checkpoint();
+        // Capability discovery is outside the cache lock. Only a caller which
+        // can lend its original CPU may depend on another in-flight producer.
+        const may_join = allow_coalescing and if (control) |budget| try budget.hasExecutionWait() else false;
         while (true) {
-            platform.sync.lockYielding(&self.run_source_mutex);
+            if (control) |budget| try bounded_mutex.lockAtomic(&self.run_source_mutex, budget) else platform.sync.lockYielding(&self.run_source_mutex);
             const cached = self.findRunSourceAssumeLocked(path) orelse break;
             self.run_source_mutex.unlock();
-            if (cached.activateHeld()) return cached;
+            if (cached.activateHeld()) {
+                errdefer cached.release();
+                if (control) |budget| try budget.checkpoint();
+                return cached;
+            }
             // Keep metadata alive while removing an expired cache owner. No
             // provider callbacks or descriptor cleanup run under this lock.
             platform.sync.lockYielding(&self.run_source_mutex);
@@ -7383,15 +8466,19 @@ pub const Backend = struct {
         }
         // A miss exits the loop holding the cache lock, so joining/creating
         // an in-flight open is atomic with the last cache lookup.
-        for (self.run_source_opens.items) |flight| if (std.mem.eql(u8, flight.path, path)) {
+        for (self.run_source_opens.items) |flight| if (may_join and flight.epoch == self.run_source_epoch and std.mem.eql(u8, flight.path, path)) {
             flight.refs += 1;
             self.run_source_mutex.unlock();
             defer self.releaseSourceOpen(flight);
-            if (flight.io) |io| flight.done.waitUncancelable(io) else {
-                while (!flight.completed.load(.acquire)) platform_time.yieldBriefly();
-            }
-            if (flight.failure) |err| return err;
-            return flight.result.?.retain().?;
+            const budget = control.?;
+            while (!flight.completed.load(.acquire)) try budget.waitForProgress();
+            try budget.checkpoint();
+            // A failed producer's scope is not this waiter's authority. Make
+            // at most one independent attempt under this waiter's original
+            // scope instead of inheriting foreign cancellation or retrying an
+            // unbounded chain of failed producers.
+            if (flight.failure != null) return self.retainRunSourceWithAdmissionPolicy(path, control, false);
+            return flight.result.?.retain() orelse self.retainRunSourceWithAdmissionPolicy(path, control, false);
         };
         const flight = self.allocator.create(SourceOpen) catch |err| {
             self.run_source_mutex.unlock();
@@ -7402,7 +8489,7 @@ pub const Backend = struct {
             self.run_source_mutex.unlock();
             return err;
         };
-        flight.* = .{ .path = owned_path, .epoch = self.run_source_epoch, .io = self.manifestCoordinationIo() };
+        flight.* = .{ .path = owned_path, .epoch = self.run_source_epoch };
         self.run_source_opens.append(self.allocator, flight) catch |err| {
             self.allocator.free(owned_path);
             self.allocator.destroy(flight);
@@ -7411,7 +8498,17 @@ pub const Backend = struct {
         };
         self.run_source_mutex.unlock();
         defer self.releaseSourceOpen(flight);
-        const opened = self.openRunSource(flight);
+        const opened = blk: {
+            if (control) |budget| budget.checkpoint() catch |err| break :blk @as(anyerror!*RunSourceLease, err);
+            const lease = self.openRunSource(flight, control) catch |err| break :blk @as(anyerror!*RunSourceLease, err);
+            // Publication transferred the cache owner. A failed trim releases
+            // only the flight's active use, leaving the published owner valid.
+            self.trimRunSourcesWithAdmission(control) catch |err| {
+                lease.release();
+                break :blk @as(anyerror!*RunSourceLease, err);
+            };
+            break :blk @as(anyerror!*RunSourceLease, lease);
+        };
         platform.sync.lockYielding(&self.run_source_mutex);
         if (opened) |lease| flight.result = lease else |err| flight.failure = err;
         for (self.run_source_opens.items, 0..) |pending, i| if (pending == flight) {
@@ -7419,18 +8516,26 @@ pub const Backend = struct {
             break;
         };
         flight.completed.store(true, .release);
-        if (flight.io) |io| flight.done.set(io);
         self.run_source_mutex.unlock();
         if (flight.failure) |err| return err;
+        if (control) |budget| try budget.checkpoint();
         return flight.result.?.retain().?;
     }
 
     pub fn retainCachedRunSource(self: *Backend, path: []const u8) ?*RunSourceLease {
-        platform.sync.lockYielding(&self.run_source_mutex);
+        return self.retainCachedRunSourceWithAdmission(path, null) catch unreachable;
+    }
+
+    pub fn retainCachedRunSourceWithAdmission(self: *Backend, path: []const u8, control: ?read_admission.Port) !?*RunSourceLease {
+        if (control) |budget| try bounded_mutex.lockAtomic(&self.run_source_mutex, budget) else platform.sync.lockYielding(&self.run_source_mutex);
         const lease = self.findRunSourceAssumeLocked(path);
         self.run_source_mutex.unlock();
         if (lease) |held| {
-            if (held.activateHeld()) return held;
+            if (held.activateHeld()) {
+                errdefer held.release();
+                if (control) |budget| try budget.checkpoint();
+                return held;
+            }
             held.releaseOwner();
         }
         return null;
@@ -7439,8 +8544,12 @@ pub const Backend = struct {
     // Active cursors retain one lease per run. Only idle entries compete for
     // LRU space, avoiding catalog/descriptor thrash in broad merge cursors.
     pub fn trimRunSources(self: *Backend) void {
+        self.trimRunSourcesWithAdmission(null) catch unreachable;
+    }
+
+    fn trimRunSourcesWithAdmission(self: *Backend, control: ?read_admission.Port) !void {
         while (true) {
-            @import("antfly_platform").sync.lockYielding(&self.run_source_mutex);
+            if (control) |budget| try bounded_mutex.lockAtomic(&self.run_source_mutex, budget) else platform.sync.lockYielding(&self.run_source_mutex);
             if (self.run_sources.items.len <= 16) {
                 self.run_source_mutex.unlock();
                 return;
@@ -8487,13 +9596,8 @@ pub const Backend = struct {
     }
 
     fn parseRunIdFromRecoveredTableTempFileName(name: []const u8) ?u64 {
-        const marker = ".tbl.tmp-";
-        const marker_index = std.mem.indexOf(u8, name, marker) orelse return null;
-        if (marker_index == 0) return null;
-        const nonce = name[marker_index + marker.len ..];
-        if (nonce.len == 0) return null;
-        _ = std.fmt.parseUnsigned(u64, nonce, 10) catch return null;
-        return std.fmt.parseUnsigned(u64, name[0..marker_index], 10) catch null;
+        const target = @import("lsm_backend/atomic_temporary.zig").target(name) orelse return null;
+        return parseRunIdFromTableFileName(target);
     }
 
     fn runIdTrackedByManifestLocked(self: *Backend, run_id: u64) bool {
@@ -8911,6 +10015,22 @@ pub const Backend = struct {
         }
     }
 
+    fn evictOldestLocalBlockWithAdmission(self: *Backend, control: @import("../common/read_admission.zig").Port) !u64 {
+        std.debug.assert(self.run_block_cache.items.len != 0);
+        var victim: usize = 0;
+        for (self.run_block_cache.items, 0..) |cached, i| {
+            try control.checkpoint();
+            if (cached.last_access < self.run_block_cache.items[victim].last_access) victim = i;
+        }
+        try self.run_block_cache.items[victim].payload.enableRetirementWithAdmission(control);
+        try control.checkpoint();
+        var removed = self.run_block_cache.orderedRemove(victim);
+        self.run_block_cache_bytes -= removed.payload.bytes.len;
+        removed.deinit(self.allocator);
+        // Publication of readiness does not promise physical reclamation.
+        return 0;
+    }
+
     fn evictOldestLocalBlock(self: *Backend) u64 {
         std.debug.assert(self.run_block_cache.items.len != 0);
         var victim_index: usize = 0;
@@ -8919,7 +10039,7 @@ pub const Backend = struct {
         }
         var victim = self.run_block_cache.orderedRemove(victim_index);
         self.run_block_cache_bytes -= victim.payload.bytes.len;
-        const released = if (victim.payload.refs.load(.acquire) == 1)
+        const released = if (victim.payload.refs.load(.acquire) == 1 and victim.payload.retirement.credit == null)
             (if (victim.payload.reservation) |credit| credit.reservedBytes() else 0)
         else
             0;
@@ -8980,8 +10100,8 @@ const InternalFlushWorker = if (builtin.os.tag == .freestanding or builtin.singl
     future: ?std.Io.Future(void) = null,
     stop_requested: bool = false,
     drain_on_stop: bool = false,
-    wake_requested: bool = false,
-    wakeups: u64 = 0,
+    wake_requested: std.atomic.Value(bool) = .init(false),
+    wakeups: std.atomic.Value(u64) = .init(0),
     maintenance_steps: u64 = 0,
     errors: u64 = 0,
     joined: bool = false,
@@ -9021,7 +10141,7 @@ const InternalFlushWorker = if (builtin.os.tag == .freestanding or builtin.singl
         self.mutex.lockUncancelable(self.io());
         self.stop_requested = true;
         self.drain_on_stop = self.drain_on_stop or drain;
-        self.wake_requested = true;
+        self.wake_requested.store(true, .release);
         self.mutex.unlock(self.io());
 
         self.wake_event.set(self.io());
@@ -9038,18 +10158,16 @@ const InternalFlushWorker = if (builtin.os.tag == .freestanding or builtin.singl
 
     fn wake(ptr: *anyopaque) void {
         const self: *InternalFlushWorker = @ptrCast(@alignCast(ptr));
-        self.mutex.lockUncancelable(self.io());
-        self.wake_requested = true;
-        self.wakeups +|= 1;
+        self.wake_requested.store(true, .release);
+        _ = self.wakeups.fetchAdd(1, .monotonic);
         self.wake_event.set(self.io());
-        self.mutex.unlock(self.io());
     }
 
     fn snapshotStats(self: *InternalFlushWorker) Stats {
         self.mutex.lockUncancelable(self.io());
         defer self.mutex.unlock(self.io());
         return .{
-            .wakeups = self.wakeups,
+            .wakeups = self.wakeups.load(.monotonic),
             .maintenance_steps = self.maintenance_steps,
             .errors = self.errors,
             .joined = self.joined,
@@ -9080,14 +10198,17 @@ const InternalFlushWorker = if (builtin.os.tag == .freestanding or builtin.singl
                 self.mutex.unlock(io_ctx);
                 return work;
             }
-            if (self.wake_requested) {
-                self.wake_requested = false;
+            if (self.wake_requested.swap(false, .acq_rel)) {
                 self.mutex.unlock(io_ctx);
                 return .run;
             }
-            // Reset under the same mutex used to publish wakes. A wake
-            // arriving before wait remains latched and cannot be lost.
+            // Wakes never take this mutex. Check the atomic latch again after
+            // resetting the event so a concurrent set/reset cannot lose work.
             self.wake_event.reset();
+            if (self.wake_requested.swap(false, .acq_rel)) {
+                self.mutex.unlock(io_ctx);
+                return .run;
+            }
             self.mutex.unlock(io_ctx);
             if (deadline_ns) |deadline| {
                 const now = platform.time.monotonicNs();
@@ -9115,9 +10236,7 @@ const InternalFlushWorker = if (builtin.os.tag == .freestanding or builtin.singl
             if (!progressed) return self.backend.nextMaintenanceWakeDelayNsBestEffort();
             self.recordStep();
         }
-        self.mutex.lockUncancelable(self.io());
-        self.wake_requested = true;
-        self.mutex.unlock(self.io());
+        self.wake_requested.store(true, .release);
         return null;
     }
 
@@ -25576,6 +26695,457 @@ fn z17RepeatString(comptime bytes: []const u8, comptime repetitions: usize) *con
     return &result;
 }
 
+test "lsm routing cursor interrupts internal tombstone scans with original admission" {
+    const admission = @import("../common/read_admission.zig");
+    var backend = Backend.init(std.testing.allocator, .{ .wal_enabled = false, .flush_threshold = 10000 });
+    defer backend.close();
+    var runtime = try backend.runtimeStore(std.testing.allocator, .{ .name = "docs" });
+    defer runtime.deinit();
+    var write = try runtime.beginWrite();
+    var key: [8]u8 = undefined;
+    for (0..64) |i| {
+        std.mem.writeInt(u64, &key, i, .big);
+        try write.put(&key, "value");
+    }
+    try write.commit();
+    var remove = try runtime.beginWrite();
+    for (0..63) |i| {
+        std.mem.writeInt(u64, &key, i, .big);
+        try remove.delete(&key);
+    }
+    try remove.commit();
+    const Budget = struct {
+        fail_at: usize,
+        checks: usize = 0,
+        pub fn checkpoint(self: *@This()) !void {
+            self.checks += 1;
+            if (self.checks == self.fail_at) return error.GenerationPublicationChanged;
+        }
+        pub fn waitForProgress(_: *@This()) !void {
+            return error.TestUnexpectedResult;
+        }
+    };
+    var completed = false;
+    for (1..4096) |fail_at| {
+        var read = try runtime.beginRead();
+        defer read.abort();
+        var cursor = try read.openCursor();
+        defer cursor.close();
+        var budget = Budget{ .fail_at = fail_at };
+        var adapter = admission.Adapter(*Budget){ .budget = &budget };
+        const payload = adapter.payload();
+        const control = admission.Port.init(&payload);
+        const found = cursor.seekAtOrAfterWithAdmission("", control) catch |err| {
+            try std.testing.expectEqual(error.GenerationPublicationChanged, err);
+            continue;
+        };
+        try std.testing.expect(found != null);
+        try std.testing.expectEqual(@as(u64, 63), std.mem.readInt(u64, found.?.key[0..8], .big));
+        try std.testing.expect(budget.checks > 32);
+        completed = true;
+        break;
+    }
+    try std.testing.expect(completed);
+}
+
+test "lsm routing cursor carries the original deadline into a held cache loader" {
+    const admission = @import("../common/read_admission.zig");
+    var memory = storage_io.MemoryStorage.init(std.testing.allocator);
+    defer memory.deinit();
+    var cache = Cache.init(std.testing.allocator, 1024 * 1024);
+    defer cache.deinit();
+    var backend = try Backend.open(std.testing.allocator, "/bounded-routing-cache", .{ .storage = memory.storage(), .cache = &cache, .wal_enabled = false, .flush_threshold = 1, .compact_threshold_runs = 10000 });
+    defer backend.close();
+    var runtime = try backend.runtimeStore(std.testing.allocator, .{ .name = "docs" });
+    defer runtime.deinit();
+    var write = try runtime.beginWrite();
+    try write.put("doc:a", "value");
+    try write.commit();
+    try std.testing.expect(backend.runs.count() > 0);
+    const persisted_run = backend.runs.at(0);
+    const path = persisted_run.path orelse return error.TestExpectedPersistedRun;
+    var read = try runtime.beginRead();
+    defer read.abort();
+    var cursor = try read.openCursor();
+    defer cursor.close();
+    cache.invalidatePath(path);
+    const generation = backend.root_generation;
+    try cache.beginLoad(path, persisted_run.id, generation, .run_table_index);
+    defer cache.finishLoad(path, persisted_run.id, generation, .run_table_index);
+    // Bound the test even if a regression reintroduces an unbudgeted wait.
+    const Rescue = struct {
+        fn run(done: *std.atomic.Value(bool), held: *Cache, held_path: []const u8, id: u64, gen: u64) void {
+            for (0..100) |_| {
+                if (done.load(.acquire)) return;
+                std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake) catch return;
+            }
+            held.finishLoad(held_path, id, gen, .run_table_index);
+        }
+    };
+    var done = std.atomic.Value(bool).init(false);
+    var rescue = try std.testing.io.concurrent(Rescue.run, .{ &done, &cache, path, persisted_run.id, generation });
+    defer {
+        done.store(true, .release);
+        rescue.await(std.testing.io);
+    }
+    const Budget = struct {
+        now_ns: u64 = 7 * std.time.ns_per_s,
+        deadline_ns: u64 = 8 * std.time.ns_per_s,
+        waits: usize = 0,
+        pub fn checkpoint(self: *@This()) !void {
+            if (self.now_ns >= self.deadline_ns) return error.CatalogRoutingSnapshotTimeout;
+        }
+        pub fn waitForProgress(self: *@This()) !void {
+            self.waits += 1;
+            self.now_ns = self.deadline_ns;
+        }
+    };
+    var budget = Budget{};
+    var adapter = admission.Adapter(*Budget){ .budget = &budget };
+    const payload = adapter.payload();
+    const result = cursor.seekAtOrAfterWithAdmission("doc:a", admission.Port.init(&payload));
+    done.store(true, .release);
+    try std.testing.expectError(error.CatalogRoutingSnapshotTimeout, result);
+    try std.testing.expectEqual(@as(usize, 1), budget.waits);
+}
+
+test "lsm routing cursor cancels cold index decoding and resumes a clean loader" {
+    const admission = @import("../common/read_admission.zig");
+    var memory = storage_io.MemoryStorage.init(std.testing.allocator);
+    defer memory.deinit();
+    var cache = Cache.init(std.testing.allocator, 4 * 1024 * 1024);
+    defer cache.deinit();
+    var backend = try Backend.open(std.testing.allocator, "/bounded-index-decode", .{
+        .storage = memory.storage(),
+        .cache = &cache,
+        .wal_enabled = false,
+        .flush_threshold = 1,
+        .compact_threshold_runs = 10000,
+    });
+    defer backend.close();
+    var runtime = try backend.runtimeStore(std.testing.allocator, .{ .name = "docs" });
+    defer runtime.deinit();
+    var write = try runtime.beginWrite();
+    var key: [8]u8 = undefined;
+    const value: [1024]u8 = @splat('v');
+    for (0..600) |i| {
+        std.mem.writeInt(u64, &key, i, .big);
+        try write.put(&key, &value);
+    }
+    try write.commit();
+    try std.testing.expect(backend.runs.count() > 0);
+    const path = backend.runs.at(0).path orelse return error.TestExpectedPersistedRun;
+    const Budget = struct {
+        checks: usize = 0,
+        fail_at: usize,
+        pub fn checkpoint(self: *@This()) !void {
+            self.checks += 1;
+            if (self.checks >= self.fail_at) return error.GenerationPublicationChanged;
+        }
+        pub fn waitForProgress(_: *@This()) !void {
+            return error.TestUnexpectedResult;
+        }
+    };
+    var completed = false;
+    for (1..2048) |fail_at| {
+        cache.invalidatePath(path);
+        var read = try runtime.beginRead();
+        defer read.abort();
+        var cursor = try read.openCursor();
+        defer cursor.close();
+        var budget = Budget{ .fail_at = fail_at };
+        var adapter = admission.Adapter(*Budget){ .budget = &budget };
+        const payload = adapter.payload();
+        const result = cursor.seekAtOrAfterWithAdmission("", admission.Port.init(&payload));
+        // Every remaining registration must have transferred to a reserved
+        // cache owner; no request stack or failed foreground scope is retained.
+        for (cache.shards) |*shard| {
+            var pending = shard.pending_loads.iterator();
+            while (pending.next()) |item| {
+                var owned = false;
+                for (&shard.load_cleanup) |*slot| {
+                    if (slot.state.load(.acquire) == .pending and slot.identity == item.value_ptr.identity) owned = true;
+                }
+                try std.testing.expect(owned);
+            }
+        }
+        const CleanupBudget = struct {
+            checks: usize = 0,
+            pub fn checkpoint(self: *@This()) !void {
+                self.checks += 1;
+                if (self.checks > 64) return error.DeadlineExceeded;
+            }
+            pub fn waitForProgress(_: *@This()) !void {
+                return error.TestUnexpectedResult;
+            }
+        };
+        const foreground_checks = budget.checks;
+        var cleanup_budget = CleanupBudget{};
+        var cleanup_adapter = admission.Adapter(*CleanupBudget){ .budget = &cleanup_budget };
+        const cleanup_payload = cleanup_adapter.payload();
+        try cache.drainLoadCleanupWithAdmission(admission.Port.init(&cleanup_payload));
+        try std.testing.expectEqual(foreground_checks, budget.checks);
+        for (cache.shards) |*shard| try std.testing.expectEqual(@as(usize, 0), shard.pending_loads.count());
+        const found = result catch |err| {
+            try std.testing.expectEqual(error.GenerationPublicationChanged, err);
+            continue;
+        };
+        try std.testing.expect(found != null);
+        try std.testing.expectEqual(@as(u64, 0), std.mem.readInt(u64, found.?.key[0..8], .big));
+        try std.testing.expectEqualSlices(u8, &value, found.?.value);
+        try std.testing.expect(budget.checks > 30);
+        completed = true;
+        break;
+    }
+    try std.testing.expect(completed);
+}
+
+test "lsm backend loader ownership admits key bytes before storage and retries correct data" {
+    const resource_manager = @import("resource_manager.zig");
+    const admission = @import("../common/read_admission.zig");
+    var small = resource_manager.ResourceManager.init(.{
+        .memory_budget = .{ .hard_limit_bytes = 1 },
+        .identity_allocator = std.testing.allocator,
+    });
+    defer small.deinit(std.testing.allocator);
+    var ample = resource_manager.ResourceManager.init(.{
+        .memory_budget = .{ .hard_limit_bytes = 1024 * 1024 },
+        .identity_allocator = std.testing.allocator,
+    });
+    defer ample.deinit(std.testing.allocator);
+    var memory = storage_io.MemoryStorage.init(std.testing.allocator);
+    defer memory.deinit();
+    var cache = Cache.init(std.testing.allocator, 1024 * 1024);
+    defer cache.deinit();
+    var backend = try Backend.open(std.testing.allocator, "/backend-owned-loaders", .{
+        .storage = memory.storage(),
+        .wal_enabled = false,
+        .flush_threshold = 1,
+        .compact_threshold_runs = 10000,
+    });
+    defer backend.close();
+    var runtime = try backend.runtimeStore(std.testing.allocator, .{ .name = "docs" });
+    defer runtime.deinit();
+    var write = try runtime.beginWrite();
+    try write.put("doc:a", "value");
+    try write.commit();
+    try std.testing.expect(backend.runs.count() > 0);
+    const run = backend.runs.at(0);
+    const path = run.path orelse return error.TestExpectedPersistedRun;
+    backend.options.cache = &cache;
+    cache.attachResourceManager(&small);
+    // A missing file would return a storage error if key admission were bypassed.
+    try std.testing.expectError(error.ResourceBudgetExceeded, backend.getCachedRunStateIndex("/missing-loader-state", 999));
+    try std.testing.expectError(error.ResourceBudgetExceeded, backend.getCachedRunTableIndex("/missing-loader-table", 999));
+    try std.testing.expectEqual(@as(usize, 0), backend.run_state_cache.items.len);
+    try std.testing.expectEqual(@as(usize, 0), backend.run_table_cache.items.len);
+    try std.testing.expectEqual(@as(u64, 0), small.snapshot().memory.used_bytes);
+    cache.attachResourceManager(&ample);
+    const state_index = try backend.getCachedRunStateIndex(path, run.id);
+    const state = backend.getCachedRunStateByIndex(state_index);
+    try std.testing.expect(state.entries.items.len > 0);
+    _ = try backend.getCachedRunTableIndex(path, run.id);
+    // Physical loader exits transfer both keys and registry ownership. Every
+    // remaining registration must have an exact cache-owned cleanup identity.
+    var registrations: usize = 0;
+    for (cache.shards) |*shard| {
+        var iterator = shard.pending_loads.iterator();
+        while (iterator.next()) |item| {
+            registrations += 1;
+            var owned = false;
+            for (&shard.load_cleanup) |*slot| {
+                if (slot.state.load(.acquire) == .pending and slot.identity == item.value_ptr.identity) owned = true;
+            }
+            try std.testing.expect(owned);
+        }
+    }
+    try std.testing.expect(registrations > 0);
+    const Budget = struct {
+        pub fn checkpoint(_: *@This()) !void {}
+        pub fn waitForProgress(_: *@This()) !void {
+            return error.TestUnexpectedResult;
+        }
+    };
+    var budget = Budget{};
+    var adapter = admission.Adapter(*Budget){ .budget = &budget };
+    const payload = adapter.payload();
+    try cache.drainLoadCleanupWithAdmission(admission.Port.init(&payload));
+    for (cache.shards) |*shard| try std.testing.expectEqual(@as(usize, 0), shard.pending_loads.count());
+    var read = try runtime.beginRead();
+    defer read.abort();
+    try std.testing.expectEqualStrings("value", try read.get("doc:a"));
+}
+
+test "lsm backend fallback reads interrupt internal decoding with original scope and retry" {
+    const admission = @import("../common/read_admission.zig");
+    for ([_]bool{ false, true }) |shared_cache| {
+        var memory = storage_io.MemoryStorage.init(std.testing.allocator);
+        defer memory.deinit();
+        var cache = Cache.init(std.testing.allocator, 4 * 1024 * 1024);
+        defer cache.deinit();
+        var backend = try Backend.open(std.testing.allocator, "/fallback-read-scope", .{
+            .storage = memory.storage(),
+            .wal_enabled = false,
+            .flush_threshold = 1,
+            .compact_threshold_runs = 10000,
+            .table_block_compression = .snappy_adaptive,
+        });
+        defer backend.close();
+        var runtime = try backend.runtimeStore(std.testing.allocator, .{ .name = "docs" });
+        defer runtime.deinit();
+        var write = try runtime.beginWrite();
+        var key: [8]u8 = undefined;
+        const value: [512]u8 = @splat('v');
+        for (0..600) |i| {
+            std.mem.writeInt(u64, &key, i, .big);
+            try write.put(&key, &value);
+        }
+        try write.commit();
+        const run = backend.runs.at(0);
+        const path = run.path orelse return error.TestExpectedPersistedRun;
+        backend.options.cache = if (shared_cache) &cache else null;
+        const Budget = struct {
+            checks: usize = 0,
+            fail_at: usize = std.math.maxInt(usize),
+            pub fn checkpoint(self: *@This()) !void {
+                self.checks += 1;
+                if (self.checks >= self.fail_at) return error.GenerationPublicationChanged;
+            }
+            pub fn waitForProgress(self: *@This()) !void {
+                try self.checkpoint();
+            }
+        };
+        for ([_]bool{ false, true }) |whole_table| {
+            var completed = false;
+            var late_failure = false;
+            for (1..512) |fail_at| {
+                var budget = Budget{ .fail_at = fail_at };
+                var adapter = admission.Adapter(*Budget){ .budget = &budget };
+                const payload = adapter.payload();
+                const control = admission.Port.init(&payload);
+                const result = if (whole_table)
+                    backend.getCachedRunTableIndexWithAdmission(path, run.id, control)
+                else
+                    backend.getCachedRunIndexIndexWithAdmission(path, run.id, control);
+                if (result) |index| {
+                    const count = if (whole_table) backend.getCachedRunTableByIndex(index).entryCount() else backend.getCachedRunIndexByIndex(index).entryCount();
+                    try std.testing.expect(count >= 600);
+                    try std.testing.expect(budget.checks > 8);
+                    completed = true;
+                    break;
+                } else |err| {
+                    try std.testing.expectEqual(error.GenerationPublicationChanged, err);
+                    if (fail_at > 8) late_failure = true;
+                    try std.testing.expectEqual(@as(usize, 0), if (whole_table) backend.run_table_cache.items.len else backend.run_index_cache.items.len);
+                    const original_checks = budget.checks;
+                    var cleanup = Budget{};
+                    var cleanup_adapter = admission.Adapter(*Budget){ .budget = &cleanup };
+                    const cleanup_payload = cleanup_adapter.payload();
+                    try cache.drainLoadCleanupWithAdmission(admission.Port.init(&cleanup_payload));
+                    try std.testing.expectEqual(original_checks, budget.checks);
+                    for (cache.shards) |*shard| try std.testing.expectEqual(@as(usize, 0), shard.pending_loads.count());
+                }
+            }
+            // Decoder checkpoint density can exceed the finite fault sweep.
+            // Keep every swept failure assertion, then prove the same physical
+            // source completes correctly through an independent healthy scope.
+            if (!completed) {
+                var fresh = Budget{};
+                var fresh_adapter = admission.Adapter(*Budget){ .budget = &fresh };
+                const fresh_payload = fresh_adapter.payload();
+                const fresh_control = admission.Port.init(&fresh_payload);
+                const index = if (whole_table)
+                    try backend.getCachedRunTableIndexWithAdmission(path, run.id, fresh_control)
+                else
+                    try backend.getCachedRunIndexIndexWithAdmission(path, run.id, fresh_control);
+                const count = if (whole_table) backend.getCachedRunTableByIndex(index).entryCount() else backend.getCachedRunIndexByIndex(index).entryCount();
+                try std.testing.expect(count >= 600);
+                try std.testing.expect(fresh.checks > 8);
+                completed = true;
+            }
+            try std.testing.expect(completed);
+            try std.testing.expect(late_failure);
+        }
+        var read = try runtime.beginRead();
+        defer read.abort();
+        std.mem.writeInt(u64, &key, 599, .big);
+        try std.testing.expectEqualStrings(&value, try read.get(&key));
+    }
+}
+
+test "lsm admitted successful cursor close transfers pins under held cache shards without borrowing expired scope" {
+    const admission = @import("../common/read_admission.zig");
+    var memory = storage_io.MemoryStorage.init(std.testing.allocator);
+    defer memory.deinit();
+    var cache = Cache.init(std.testing.allocator, 1024 * 1024);
+    defer cache.deinit();
+    var backend = try Backend.open(std.testing.allocator, "/controlled-cursor-close", .{
+        .storage = memory.storage(),
+        .cache = &cache,
+        .wal_enabled = false,
+        .flush_threshold = 1,
+        .compact_threshold_runs = 10000,
+    });
+    defer backend.close();
+    var runtime = try backend.runtimeStore(std.testing.allocator, .{ .name = "docs" });
+    defer runtime.deinit();
+    var write = try runtime.beginWrite();
+    try write.put("doc:a", "value");
+    try write.commit();
+    const Budget = struct {
+        checks: usize = 0,
+        expired: bool = false,
+        pub fn checkpoint(self: *@This()) !void {
+            self.checks += 1;
+            if (self.expired) return error.GenerationPublicationChanged;
+        }
+        pub fn waitForProgress(_: *@This()) !void {
+            return error.TestUnexpectedResult;
+        }
+    };
+    var budget = Budget{};
+    var adapter = admission.Adapter(*Budget){ .budget = &budget };
+    const payload = adapter.payload();
+    var read = try runtime.beginRead();
+    defer read.abort();
+    var cursor = try read.openCursor();
+    var cursor_open = true;
+    defer if (cursor_open) cursor.close();
+    const found = try cursor.seekAtOrAfterWithAdmission("", admission.Port.init(&payload));
+    try std.testing.expect(found != null);
+    try std.testing.expectEqualStrings("doc:a", found.?.key);
+    try std.testing.expectEqualStrings("value", found.?.value);
+    const checks = budget.checks;
+    budget.expired = true;
+    const pending_before = cache.deferred_pin_releases.load(.acquire);
+    var held: usize = 0;
+    defer for (cache.shards[0..held]) |*shard| shard.mutex.unlock();
+    for (cache.shards) |*shard| {
+        try std.testing.expect(shard.mutex.tryLock());
+        held += 1;
+    }
+    cursor.close();
+    cursor_open = false;
+    for (cache.shards[0..held]) |*shard| shard.mutex.unlock();
+    held = 0;
+    try std.testing.expectEqual(checks, budget.checks);
+    try std.testing.expect(cache.deferred_pin_releases.load(.acquire) > pending_before);
+    // An independent admission collects the pins and can read the same data.
+    var fresh = Budget{};
+    var fresh_adapter = admission.Adapter(*Budget){ .budget = &fresh };
+    const fresh_payload = fresh_adapter.payload();
+    const fresh_port = admission.Port.init(&fresh_payload);
+    try cache.drainDeferredPinsWithAdmission(fresh_port);
+    try std.testing.expectEqual(@as(usize, 0), cache.deferred_pin_releases.load(.acquire));
+    try std.testing.expectEqual(checks, budget.checks);
+    var retry = try read.openCursor();
+    defer retry.close();
+    const again = try retry.seekAtOrAfterWithAdmission("", fresh_port);
+    try std.testing.expect(again != null);
+    try std.testing.expectEqualStrings("doc:a", again.?.key);
+    try std.testing.expectEqualStrings("value", again.?.value);
+}
+
 test "lsm local decoded block borrowing survives eviction and performs no warm allocation" {
     const a = std.testing.allocator;
     var budget = @import("lite/test_allocator.zig").BudgetAllocator{ .backing = a };
@@ -25723,7 +27293,7 @@ test "lsm local cold source open releases every partial allocation" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{});
 }
 
-test "lsm local cold source failure wakes all waiters and allows retry" {
+test "lsm local cold source failure wakes admitted waiters and allows bounded retries" {
     const Hook = struct {
         var entered: std.Io.Event = .unset;
         var release: std.Io.Event = .unset;
@@ -25736,8 +27306,22 @@ test "lsm local cold source failure wakes all waiters and allows retry" {
             if (fail) return error.InjectedSourceOpenFailure;
             return .{ .contiguous = "immutable" };
         }
+        const Budget = struct {
+            pub fn checkpoint(_: *@This()) !void {}
+            pub fn checkLifetime(_: *@This()) !void {}
+            fn transfer(_: *anyopaque) !void {}
+            pub fn executionBoundary(self: *@This()) ?@import("../common/execution_wait.zig").Boundary {
+                return .{ .ptr = self, .begin = transfer, .end = transfer };
+            }
+            pub fn waitForProgress(_: *@This()) !void {
+                try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+            }
+        };
         fn read(backend: *Backend) anyerror!void {
-            try std.testing.expectError(error.InjectedSourceOpenFailure, backend.readRunRangeAlloc(std.testing.allocator, "/cold", 0, 9));
+            var budget: Budget = .{};
+            var adapter: read_admission.Adapter(*Budget) = .{ .budget = &budget };
+            const payload = adapter.payload();
+            try std.testing.expectError(error.InjectedSourceOpenFailure, backend.readRunRangeAllocWithAdmission(std.testing.allocator, "/cold", 0, 9, .init(&payload)));
         }
     };
     const a = std.testing.allocator;
@@ -25771,15 +27355,18 @@ test "lsm local cold source failure wakes all waiters and allows retry" {
         if (std.Io.Clock.awake.now(std.testing.io).nanoseconds > deadline.nanoseconds) return error.Timeout;
         try std.testing.io.sleep(.fromMilliseconds(1), .awake);
     }
+    try std.testing.expectEqual(@as(usize, 1), Hook.calls.load(.monotonic));
     Hook.release.set(std.testing.io);
     for (&readers) |*reader| try reader.await(std.testing.io);
-    try std.testing.expectEqual(@as(usize, 1), Hook.calls.load(.monotonic));
+    // The producer fails once; each of its seven waiters gets one independent
+    // attempt under its own authority, even when the provider remains broken.
+    try std.testing.expectEqual(readers.len, Hook.calls.load(.monotonic));
     try std.testing.expectEqual(@as(usize, 0), backend.run_source_opens.items.len);
     Hook.fail = false;
     const bytes = try backend.readRunRangeAlloc(a, "/cold", 0, 9);
     defer a.free(bytes);
     try std.testing.expectEqualStrings("immutable", bytes);
-    try std.testing.expectEqual(@as(usize, 2), Hook.calls.load(.monotonic));
+    try std.testing.expectEqual(readers.len + 1, Hook.calls.load(.monotonic));
 }
 
 test "lsm local compressed point reads borrow warm decoded blocks" {
@@ -25890,6 +27477,71 @@ test "lsm local hot compressed point reads promote and repeated batches deduplic
         try std.testing.expectEqual(@as(usize, 1), batch.held_blocks.items.len);
         try std.testing.expectEqual(@as(usize, 0), batch.held_values.items.len);
     }
+}
+
+pub fn qualifyLocalPromotionRetirement(control: @import("../common/read_admission.zig").Port, admitted: bool) !void {
+    if (!builtin.is_test) @compileError("qualification requires a test build");
+    const a = std.testing.allocator;
+    var backend = Backend.init(a, .{ .local_block_cache_bytes = 4096, .local_block_cache_max_block_bytes = 4096 });
+    defer backend.close();
+    var claims: [64]?runtime_mod.LocalBlockPromotion = @splat(null);
+    defer {
+        for (&claims) |*claim| if (claim.*) |*owned| owned.finish(false);
+        for (&backend.local_block_heat) |*heat| std.debug.assert(heat.promotion.load(.acquire) != .active);
+    }
+    const first_path = try a.dupe(u8, "/local-promotion:0");
+    var first_path_alive = true;
+    defer if (first_path_alive) a.free(first_path);
+    for (&claims, 0..) |*claim, i| {
+        try control.checkpoint();
+        var bytes: [64]u8 = undefined;
+        const path = if (i == 0) first_path else try std.fmt.bufPrint(&bytes, "/local-promotion:{d}", .{i});
+        std.debug.assert(backend.mu.tryLock());
+        defer backend.mu.unlock();
+        try std.testing.expect(backend.beginLocalBlockPromotionClaim(path, i, 0, 40, 40) == null);
+        claim.* = backend.beginLocalBlockPromotionClaim(path, i, 0, 40, 40) orelse return error.TestUnexpectedResult;
+        try std.testing.expect(backend.beginLocalBlockPromotionClaim(path, i, 0, 40, 40) == null);
+    }
+    // No active slot may be reassigned to a newcomer. Borrowed request paths
+    // can die before completion: the token owns only fixed backend metadata.
+    a.free(first_path);
+    first_path_alive = false;
+    const first_completion = claims[0].?.completion.?;
+    const expected: runtime_mod.LocalBlockPromotion.State = if (admitted) .admitted else .denied;
+    const result = blk: {
+        std.debug.assert(backend.mu.tryLock());
+        defer backend.mu.unlock();
+        try std.testing.expect(backend.beginLocalBlockPromotionClaim("/newcomer", 65, 0, 40, 40) == null);
+        const checkpoint = control.checkpoint();
+        // The original scope can already be rejected, and the backend mutex is
+        // unavailable. Every completion must still publish without waiting.
+        for (&claims) |*claim| if (claim.*) |*owned| owned.finish(admitted);
+        claims[0].?.finish(!admitted);
+        std.debug.assert(first_completion.load(.acquire) == expected);
+        break :blk checkpoint;
+    };
+    try result;
+    std.debug.assert(backend.mu.tryLock());
+    defer backend.mu.unlock();
+    const misses: usize = if (admitted) 1 else 65;
+    for (0..misses) |_| try std.testing.expect(backend.beginLocalBlockPromotionClaim("/local-promotion:0", 0, 0, 40, 40) == null);
+    var retry = backend.beginLocalBlockPromotionClaim("/local-promotion:0", 0, 0, 40, 40) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(retry.completion.? == first_completion);
+    retry.finish(true);
+    // Reuse after full-table reconciliation consumes each completed election
+    // once. A stale finished token cannot change the new owner's outcome.
+    claims[0].?.finish(false);
+    try std.testing.expectEqual(runtime_mod.LocalBlockPromotion.State.admitted, first_completion.load(.acquire));
+    try std.testing.expect(backend.beginLocalBlockPromotionClaim("/newcomer", 65, 0, 40, 40) == null);
+    var newcomer = backend.beginLocalBlockPromotionClaim("/newcomer", 65, 0, 40, 40) orelse return error.TestUnexpectedResult;
+    newcomer.finish(false);
+    // The legacy mutex-held entry points keep the same election and backoff.
+    try std.testing.expect(!backend.beginLocalBlockPromotion("/legacy", 66, 0, 40, 40));
+    try std.testing.expect(backend.beginLocalBlockPromotion("/legacy", 66, 0, 40, 40));
+    backend.finishLocalBlockPromotion("/legacy", 66, 0, 40, false);
+    for (0..65) |_| try std.testing.expect(!backend.beginLocalBlockPromotion("/legacy", 66, 0, 40, 40));
+    try std.testing.expect(backend.beginLocalBlockPromotion("/legacy", 66, 0, 40, 40));
+    backend.finishLocalBlockPromotion("/legacy", 66, 0, 40, true);
 }
 
 test "lsm local byte budget evicts cache ownership but charges pinned payload until final release" {
@@ -26150,7 +27802,7 @@ test "lsm local writer batches borrow within owner limits and preserve mutable r
     try std.testing.expectEqualStrings("new-value", mutable_value);
 }
 
-test "lsm local concurrent cold batches share success and failure decodes" {
+test "lsm local decoder admission concurrent cold batches share success and independently retry failures" {
     const Hook = struct {
         var original: *const storage_io.Storage.VTable = undefined;
         var offset: u64 = 0;
@@ -26166,6 +27818,17 @@ test "lsm local concurrent cold batches share success and failure decodes" {
             }
             return original.read_file_range_alloc(ptr, a, path, at, len);
         }
+        const Budget = struct {
+            pub fn checkpoint(_: *@This()) !void {}
+            pub const checkLifetime = checkpoint;
+            fn noop(_: *anyopaque) !void {}
+            pub fn executionBoundary(self: *@This()) ?@import("../common/execution_wait.zig").Boundary {
+                return .{ .ptr = self, .begin = noop, .end = noop };
+            }
+            pub fn waitForProgress(_: *@This()) !void {
+                try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+            }
+        };
         fn worker(backend: *Backend) anyerror!void {
             var read_tx = try runtime_mod.BoundReadTxn(Backend).open(backend, .{ .name = "docs" });
             defer read_tx.abort();
@@ -26173,10 +27836,13 @@ test "lsm local concurrent cold batches share success and failure decodes" {
             defer scope.close();
             const keys = [_][]const u8{ "document:long-shared-prefix-for-compression:00", "document:long-shared-prefix-for-compression:01" };
             var values: [2]?[]const u8 = undefined;
+            var budget: Budget = .{};
+            var adapter: read_admission.Adapter(*Budget) = .{ .budget = &budget };
+            const payload = adapter.payload();
             if (fail) {
-                try std.testing.expectError(error.InjectedDecodeReadFailure, scope.getManySorted(&keys, &values));
+                try std.testing.expectError(error.InjectedDecodeReadFailure, scope.getManySortedWithAdmission(&keys, &values, .init(&payload)));
             } else {
-                try scope.getManySorted(&keys, &values);
+                try scope.getManySortedWithAdmission(&keys, &values, .init(&payload));
                 try std.testing.expectEqualStrings("value", values[0].?);
                 try std.testing.expectEqualStrings("other", values[1].?);
             }
@@ -26242,7 +27908,7 @@ test "lsm local concurrent cold batches share success and failure decodes" {
         try std.testing.expectEqual(@as(usize, 7), joined_now);
         const extra = backend.read_stats.table_block_loads.load(.monotonic) - loads;
         std.debug.print("lite shared cold decode probe: failure={any}, readers=8, joined={d}, encoded loads={d}\n", .{ fail, joined_now, extra });
-        try std.testing.expectEqual(@as(u64, 1), extra);
+        try std.testing.expectEqual(@as(u64, if (fail) 8 else 1), extra);
         try std.testing.expectEqual(@as(usize, 0), backend.local_reader.active);
     }
 }
@@ -26293,6 +27959,391 @@ test "lsm local transient reads preserve hot cache and reuse compressed point sc
     }
 }
 
+test "lsm routing cursor local decoder admission rejects exhausted workspace and flights with original scope" {
+    for ([_]bool{ false, true }) |exhaust_flights| {
+        for ([_]anyerror{ error.Canceled, error.DeadlineExceeded }) |failure| {
+            var memory = storage_io.MemoryStorage.init(std.testing.allocator);
+            defer memory.deinit();
+            var backend = try Backend.open(std.testing.allocator, "/local-decoder-admission", .{
+                .storage = memory.storage(),
+                .wal_enabled = false,
+                .flush_threshold = 1,
+                .compact_threshold_runs = 10000,
+                .table_block_compression = .snappy_adaptive,
+            });
+            defer backend.close();
+            try std.testing.expect(backend.localBlockCacheEnabled());
+            try std.testing.expect(backend.options.cache == null);
+            var runtime = try backend.runtimeStore(std.testing.allocator, .{ .name = "docs" });
+            defer runtime.deinit();
+            var write = try runtime.beginWrite();
+            const value: [1024]u8 = @splat('v');
+            try write.put("doc:a", &value);
+            try write.commit();
+            try std.testing.expectEqual(@as(usize, 0), backend.run_block_cache.items.len);
+            var read = try runtime.beginRead();
+            defer read.abort();
+            var cursor = try read.openCursor();
+            var cursor_open = true;
+            defer if (cursor_open) cursor.close();
+            var workspaces: [LocalReader.workspace_count]LocalReader.Workspace = undefined;
+            var tickets: [LocalReader.flight_count]LocalReader.Ticket = undefined;
+            var held: usize = 0;
+            defer {
+                for (0..held) |i| {
+                    if (exhaust_flights) {
+                        backend.local_reader.finish(tickets[i].flight, error.TestHeldFlight);
+                        backend.local_reader.releaseFlight(tickets[i].flight);
+                    } else workspaces[i].release();
+                }
+            }
+            const Budget = struct {
+                failure: anyerror,
+                failed: bool = false,
+                waits: usize = 0,
+                pub fn checkpoint(self: *@This()) !void {
+                    if (self.failed) return self.failure;
+                }
+                pub const checkLifetime = checkpoint;
+                fn waitBoundary(_: *anyopaque) !void {}
+                pub fn executionBoundary(self: *@This()) ?@import("../common/execution_wait.zig").Boundary {
+                    return .{ .ptr = self, .begin = waitBoundary, .end = waitBoundary };
+                }
+                pub fn waitForProgress(self: *@This()) !void {
+                    self.waits += 1;
+                    self.failed = true;
+                }
+            };
+            var budget = Budget{ .failure = failure };
+            var adapter = read_admission.Adapter(*Budget){ .budget = &budget };
+            const payload = adapter.payload();
+            if (exhaust_flights) {
+                for (&tickets, 0..) |*ticket, i| {
+                    ticket.* = (try backend.local_reader.beginWithAdmission(std.testing.allocator, null, .{
+                        .path = "other-block",
+                        .generation = .{ .issuer = 1, .sequence = i + 1 },
+                        .run_id = i + 100,
+                        .offset = 0,
+                        .physical_len = 64,
+                        .logical_len = 64,
+                        .compression = .none,
+                        .checksum = 0,
+                        .admit = true,
+                    }, .init(&payload))).?;
+                    held += 1;
+                }
+            } else {
+                for (&workspaces) |*workspace| {
+                    workspace.* = backend.local_reader.acquire(std.testing.allocator, null, null, 64, backend.options.local_decode_working_bytes, 0);
+                    held += 1;
+                }
+            }
+            try std.testing.expectError(failure, cursor.seekAtOrAfterWithAdmission("doc:a", .init(&payload)));
+            try std.testing.expectEqual(@as(usize, 1), budget.waits);
+            cursor.close();
+            cursor_open = false;
+            const original_checks = budget.waits;
+            for (0..held) |i| {
+                if (exhaust_flights) {
+                    backend.local_reader.finish(tickets[i].flight, error.TestHeldFlight);
+                    backend.local_reader.releaseFlight(tickets[i].flight);
+                } else workspaces[i].release();
+            }
+            held = 0;
+            for (&backend.local_reader.flights) |*flight| try std.testing.expectEqual(@as(usize, 0), flight.refs);
+            try std.testing.expectEqual(@as(usize, 0), backend.local_reader.active);
+            var retry = try read.openCursor();
+            defer retry.close();
+            const found = try retry.seekAtOrAfter("doc:a");
+            try std.testing.expect(found != null);
+            try std.testing.expectEqualStrings(&value, found.?.value);
+            try std.testing.expectEqual(original_checks, budget.waits);
+        }
+    }
+}
+
+test "lsm routing cursor local decoder admission cancels cold compressed decode and retries correct rows" {
+    for ([_]bool{ false, true }) |local_cache| {
+        var memory = storage_io.MemoryStorage.init(std.testing.allocator);
+        defer memory.deinit();
+        var backend = try Backend.open(std.testing.allocator, "/local-decode-checkpoints", .{
+            .storage = memory.storage(),
+            .wal_enabled = false,
+            .flush_threshold = 1,
+            .compact_threshold_runs = 10000,
+            .table_block_compression = .snappy_adaptive,
+            .local_block_cache_enabled = local_cache,
+        });
+        defer backend.close();
+        var runtime = try backend.runtimeStore(std.testing.allocator, .{ .name = "docs" });
+        defer runtime.deinit();
+        var write = try runtime.beginWrite();
+        const value: [16384]u8 = @splat('v');
+        try write.put("doc:a", &value);
+        try write.commit();
+        const Budget = struct {
+            checks: usize = 0,
+            fail_at: usize,
+            pub fn checkpoint(self: *@This()) !void {
+                self.checks += 1;
+                if (self.checks >= self.fail_at) return error.Canceled;
+            }
+            pub fn waitForProgress(_: *@This()) !void {
+                return error.TestUnexpectedResult;
+            }
+        };
+        var late_failure = false;
+        var completed = false;
+        for (1..256) |fail_at| {
+            while (backend.run_block_cache.items.len != 0) _ = backend.evictOldestLocalBlock();
+            var read = try runtime.beginRead();
+            defer read.abort();
+            var cursor = try read.openCursor();
+            var budget = Budget{ .fail_at = fail_at };
+            var adapter = read_admission.Adapter(*Budget){ .budget = &budget };
+            const payload = adapter.payload();
+            const result = cursor.seekAtOrAfterWithAdmission("doc:a", .init(&payload));
+            if (result) |found| {
+                try std.testing.expect(found != null);
+                try std.testing.expectEqualStrings(&value, found.?.value);
+                completed = true;
+            } else |err| {
+                try std.testing.expectEqual(error.Canceled, err);
+                if (fail_at > 32) late_failure = true;
+            }
+            const checks = budget.checks;
+            cursor.close();
+            try std.testing.expectEqual(checks, budget.checks);
+            try std.testing.expectEqual(@as(usize, 0), backend.local_reader.active);
+            for (&backend.local_reader.flights) |*flight| try std.testing.expectEqual(@as(usize, 0), flight.refs);
+            if (completed) break;
+        }
+        try std.testing.expect(late_failure);
+        try std.testing.expect(completed);
+        var read = try runtime.beginRead();
+        defer read.abort();
+        try std.testing.expectEqualStrings(&value, try read.get("doc:a"));
+    }
+}
+
+test "lsm source read admission preserves original publication trim and warm-retain failure ownership" {
+    const Stage = enum { publication, trim, warm_retain };
+    const Context = struct {
+        backend: *Backend,
+        stage: Stage,
+        held: std.atomic.Value(bool) = .init(false),
+        trim_armed: bool = true,
+        active: usize = 0,
+        opens: usize = 0,
+        closes: usize = 0,
+        var current: *@This() = undefined;
+        fn releaseMutex(self: *@This()) void {
+            if (self.held.swap(false, .acq_rel)) self.backend.run_source_mutex.unlock();
+        }
+        fn open(_: *anyopaque, _: Allocator, _: []const u8) !@import("../segment_source.zig").Source {
+            const self = current;
+            self.opens += 1;
+            if (self.stage == .publication) {
+                try std.testing.expect(self.backend.run_source_mutex.tryLock());
+                self.held.store(true, .release);
+            }
+            return .{ .ranges = .{ .ptr = self, .length = 9, .read_into = read, .close = close, .acquire_use = acquire, .release_use = release } };
+        }
+        fn read(_: *anyopaque, offset: u64, out: []u8) !void {
+            const bytes = "immutable";
+            @memcpy(out, bytes[@intCast(offset)..][0..out.len]);
+        }
+        fn acquire(raw: *anyopaque) bool {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.active += 1;
+            return true;
+        }
+        fn release(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            std.debug.assert(self.active != 0);
+            self.active -= 1;
+        }
+        fn close(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            std.debug.assert(self.active == 0);
+            self.closes += 1;
+        }
+        fn rescue(self: *@This(), done: *std.atomic.Value(bool)) void {
+            const deadline = std.Io.Clock.awake.now(std.testing.io).addDuration(.fromSeconds(5));
+            while (!done.load(.acquire)) {
+                if (std.Io.Clock.awake.now(std.testing.io).nanoseconds >= deadline.nanoseconds) break;
+                platform_time.yieldBriefly();
+            }
+            self.releaseMutex();
+        }
+    };
+    const Budget = struct {
+        context: *Context,
+        failure: ?anyerror,
+        failed: bool = false,
+        waits: usize = 0,
+        pub fn checkpoint(self: *@This()) !void {
+            if (self.failed) return self.failure.?;
+            if (self.context.stage == .trim and self.context.trim_armed and self.context.backend.run_sources.items.len == 1) {
+                self.context.trim_armed = false;
+                try std.testing.expect(self.context.backend.run_source_mutex.tryLock());
+                self.context.held.store(true, .release);
+            }
+        }
+        pub fn waitForProgress(self: *@This()) !void {
+            self.waits += 1;
+            self.context.releaseMutex();
+            self.failed = self.failure != null;
+        }
+    };
+    for ([_]Stage{ .publication, .trim, .warm_retain }) |stage| {
+        for ([_]?anyerror{ error.Canceled, error.DeadlineExceeded, null }) |failure| {
+            var memory = storage_io.MemoryStorage.init(std.testing.allocator);
+            defer memory.deinit();
+            var vtable = memory.storage().vtable.*;
+            vtable.open_leased_immutable_source = Context.open;
+            var backend = Backend.init(std.testing.allocator, .{ .storage = .{ .ptr = memory.storage().ptr, .vtable = &vtable } });
+            var context = Context{ .backend = &backend, .stage = stage };
+            Context.current = &context;
+            defer backend.close();
+            var budget = Budget{ .context = &context, .failure = failure };
+            var adapter = read_admission.Adapter(*Budget){ .budget = &budget };
+            const payload = adapter.payload();
+            if (stage == .warm_retain) {
+                const bytes = try backend.readRunRangeAlloc(std.testing.allocator, "/source", 0, 9);
+                std.testing.allocator.free(bytes);
+                try std.testing.expect(backend.run_source_mutex.tryLock());
+                context.held.store(true, .release);
+            }
+            var done: std.atomic.Value(bool) = .init(false);
+            const rescue = try std.Thread.spawn(.{}, Context.rescue, .{ &context, &done });
+            defer {
+                done.store(true, .release);
+                rescue.join();
+            }
+            if (stage == .warm_retain) {
+                const retained = backend.retainCachedRunSourceWithAdmission("/source", .init(&payload));
+                if (failure) |err| try std.testing.expectError(err, retained) else {
+                    const lease = (try retained) orelse return error.TestExpectedSource;
+                    lease.release();
+                }
+            } else {
+                const result = backend.readRunRangeAllocWithAdmission(std.testing.allocator, "/source", 0, 9, .init(&payload));
+                if (failure) |err| try std.testing.expectError(err, result) else {
+                    const bytes = try result;
+                    defer std.testing.allocator.free(bytes);
+                    try std.testing.expectEqualStrings("immutable", bytes);
+                }
+            }
+            try std.testing.expectEqual(@as(usize, 1), budget.waits);
+            try std.testing.expectEqual(@as(usize, 0), context.active);
+            try std.testing.expectEqual(@as(usize, 0), backend.run_source_opens.items.len);
+            if (stage == .publication and failure != null) {
+                try std.testing.expectEqual(@as(usize, 0), backend.run_sources.items.len);
+                try std.testing.expectEqual(@as(usize, 1), context.closes);
+            } else {
+                try std.testing.expectEqual(@as(usize, 1), backend.run_sources.items.len);
+                try std.testing.expectEqual(@as(usize, 0), context.closes);
+                try std.testing.expectEqual(@as(usize, 1), backend.run_sources.items[0].lease.refs.load(.acquire));
+            }
+            // Ordinary retry uses an independent scope after the failed borrow
+            // has ended; it can reuse only valid cache-owned provider state.
+            context.stage = .warm_retain;
+            const retry = try backend.readRunRangeAlloc(std.testing.allocator, "/source", 0, 9);
+            defer std.testing.allocator.free(retry);
+            try std.testing.expectEqualStrings("immutable", retry);
+            try std.testing.expectEqual(@as(usize, 0), context.active);
+        }
+    }
+}
+
+test "lsm source read admission cancels one coalesced waiter without retiring the producer" {
+    const Hook = struct {
+        var entered: std.Io.Event = .unset;
+        var go: std.Io.Event = .unset;
+        var opens: std.atomic.Value(usize) = .init(0);
+        fn open(_: *anyopaque, _: Allocator, _: []const u8) !@import("../segment_source.zig").Source {
+            _ = opens.fetchAdd(1, .monotonic);
+            entered.set(std.testing.io);
+            go.waitUncancelable(std.testing.io);
+            return .{ .contiguous = "immutable" };
+        }
+        fn produce(backend: *Backend) !void {
+            const bytes = try backend.readRunRangeAlloc(std.testing.allocator, "/source", 0, 9);
+            defer std.testing.allocator.free(bytes);
+            try std.testing.expectEqualStrings("immutable", bytes);
+        }
+        fn rescue(done: *std.atomic.Value(bool)) void {
+            const deadline = std.Io.Clock.awake.now(std.testing.io).addDuration(.fromSeconds(5));
+            while (!done.load(.acquire)) {
+                if (std.Io.Clock.awake.now(std.testing.io).nanoseconds >= deadline.nanoseconds) break;
+                platform_time.yieldBriefly();
+            }
+            go.set(std.testing.io);
+        }
+    };
+    const Budget = struct {
+        failed: bool = false,
+        waits: usize = 0,
+        failure: anyerror,
+        pub fn checkpoint(self: *@This()) !void {
+            if (self.failed) return self.failure;
+        }
+        pub fn checkLifetime(self: *@This()) !void {
+            try self.checkpoint();
+        }
+        fn transfer(_: *anyopaque) !void {
+            return error.UnexpectedExecutionWait;
+        }
+        pub fn executionBoundary(self: *@This()) ?@import("../common/execution_wait.zig").Boundary {
+            return .{ .ptr = self, .begin = transfer, .end = transfer };
+        }
+        pub fn waitForProgress(self: *@This()) !void {
+            self.waits += 1;
+            self.failed = true;
+        }
+    };
+    for ([_]anyerror{ error.Canceled, error.DeadlineExceeded }) |failure| {
+        var memory = storage_io.MemoryStorage.init(std.testing.allocator);
+        defer memory.deinit();
+        var vtable = memory.storage().vtable.*;
+        vtable.open_leased_immutable_source = Hook.open;
+        var backend = Backend.init(std.testing.allocator, .{ .storage = .{ .ptr = memory.storage().ptr, .vtable = &vtable } });
+        defer backend.close();
+        Hook.entered.reset();
+        Hook.go.reset();
+        Hook.opens.store(0, .monotonic);
+        var producer = try std.testing.io.concurrent(Hook.produce, .{&backend});
+        defer {
+            Hook.go.set(std.testing.io);
+            producer.await(std.testing.io) catch {};
+        }
+        try Hook.entered.waitTimeout(std.testing.io, .{ .duration = .{ .raw = .fromSeconds(5), .clock = .awake } });
+        var done: std.atomic.Value(bool) = .init(false);
+        const rescue = try std.Thread.spawn(.{}, Hook.rescue, .{&done});
+        defer {
+            done.store(true, .release);
+            rescue.join();
+        }
+        var budget = Budget{ .failure = failure };
+        var adapter = read_admission.Adapter(*Budget){ .budget = &budget };
+        const payload = adapter.payload();
+        try std.testing.expectError(failure, backend.readRunRangeAllocWithAdmission(std.testing.allocator, "/source", 0, 9, .init(&payload)));
+        try std.testing.expectEqual(@as(usize, 1), budget.waits);
+        platform.sync.lockYielding(&backend.run_source_mutex);
+        const retained_producer = backend.run_source_opens.items.len == 1 and backend.run_source_opens.items[0].refs == 1 and !backend.run_source_opens.items[0].completed.load(.acquire);
+        backend.run_source_mutex.unlock();
+        try std.testing.expect(retained_producer);
+        Hook.go.set(std.testing.io);
+        try producer.await(std.testing.io);
+        try std.testing.expectEqual(@as(usize, 0), backend.run_source_opens.items.len);
+        const retry = try backend.readRunRangeAlloc(std.testing.allocator, "/source", 0, 9);
+        defer std.testing.allocator.free(retry);
+        try std.testing.expectEqualStrings("immutable", retry);
+        try std.testing.expectEqual(@as(usize, 1), Hook.opens.load(.monotonic));
+    }
+}
+
 test "lsm cold optimization writer reuses mutable probe metadata across short lived probes" {
     const a = std.testing.allocator;
     var storage = storage_io.MemoryStorage.init(a);
@@ -26325,4 +28376,3338 @@ test "lsm cold optimization writer reuses mutable probe metadata across short li
     std.debug.print("lite mixed writer: 100 batches, metadata allocations={d}\n", .{metadata.alloc_calls - calls});
     try std.testing.expectEqual(@as(usize, 0), metadata.alloc_calls - calls);
     metadata.limit = std.math.maxInt(usize);
+}
+
+pub fn qualifyLocalPayloadRetirement(control: @import("../common/read_admission.zig").Port, fixture: usize) !void {
+    if (!builtin.is_test) @compileError("qualification requires a test build");
+    const resources = @import("resource_manager.zig");
+    const admission = @import("../common/read_admission.zig");
+    const a = std.testing.allocator;
+    var parent = resources.ResourceManager.init(.{ .identity_allocator = a });
+    defer parent.deinit(a);
+    var manager = resources.ResourceManager.init(.{ .identity_allocator = a });
+    defer manager.deinit(a);
+    try manager.installMemoryParent(parent.memoryParentPort());
+    var leases: [65]?*SharedBytes = @splat(null);
+    defer for (&leases) |*lease| if (lease.*) |value| value.release();
+    const count: usize = if (fixture == 2) 65 else 2;
+    for (leases[0..count]) |*lease| {
+        var credit = try manager.reserveConstructionWithAdmission(.lsm_read_working_set, @sizeOf(SharedBytes) + 8, control);
+        defer credit.retire();
+        const value = blk: {
+            const bytes = try a.dupe(u8, "retained");
+            errdefer a.free(bytes);
+            break :blk try SharedBytes.create(a, bytes);
+        };
+        errdefer value.release();
+        try value.registerRetirementWithAdmission(&credit, control);
+        lease.* = value;
+    }
+    if (fixture != 2) {
+        var backend = Backend.init(a, .{ .resource_manager = &manager, .local_block_cache_bytes = 4096, .local_block_cache_max_block_bytes = 4096 });
+        defer backend.close();
+        try std.testing.expect(backend.cacheRunBlockLease("/pinned", 1, 0, 8, leases[0].?));
+        try std.testing.expect(backend.cacheRunBlockLease("/unpinned", 2, 0, 8, leases[1].?));
+        leases[1].?.release();
+        leases[1] = null;
+        // Eviction reports no physical reclaim for deferred registered owners.
+        try std.testing.expectEqual(@as(u64, 0), backend.evictOldestLocalBlock());
+        try std.testing.expectEqual(@as(u64, 0), backend.evictOldestLocalBlock());
+    }
+    // Backend close above precedes the final pinned result. The manager owns
+    // retirement independently; borrowed paths and backend metadata are gone.
+    try std.testing.expectEqualStrings("retained", leases[0].?.bytes);
+    const before = manager.snapshot().memory.used_bytes;
+    const result = blk: {
+        std.debug.assert(manager.mutex.tryLock());
+        defer manager.mutex.unlock();
+        std.debug.assert(parent.mutex.tryLock());
+        defer parent.mutex.unlock();
+        std.debug.assert(manager.payload_retirement_mutex.tryLock());
+        defer manager.payload_retirement_mutex.unlock();
+        const checkpoint = control.checkpoint();
+        // None of these locks, the allocator, or a rejected read scope can be
+        // entered by last release. Every physical buffer is still charged.
+        for (&leases) |*lease| if (lease.*) |value| {
+            lease.* = null;
+            value.release();
+        };
+        break :blk checkpoint;
+    };
+    try std.testing.expectEqual(before, manager.snapshot().memory.used_bytes);
+    try std.testing.expectEqual(before, parent.snapshot().memory.used_bytes);
+    const Cleanup = struct {
+        fn checkpoint(_: *anyopaque) !void {}
+        fn wait(_: *anyopaque) !void {
+            return error.TestUnexpectedWait;
+        }
+    };
+    var context: u8 = 0;
+    const payload: admission.Payload = .{ .ptr = &context, .vtable = &.{ .checkpoint = Cleanup.checkpoint, .wait_for_progress = Cleanup.wait } };
+    const cleanup = admission.Port.init(&payload);
+    const held = if (fixture == 0) &manager.mutex else &parent.mutex;
+    std.debug.assert(held.tryLock());
+    const retired = manager.drainPayloadRetirementWithAdmission(cleanup) catch |err| {
+        held.unlock();
+        return err;
+    };
+    try std.testing.expectEqual(@min(count, 64), retired);
+    // All 64 fixed debt slots may be busy. The 65th physical owner remains
+    // linked and charged, rather than overflowing a hidden allocation queue.
+    if (fixture == 2) try std.testing.expectEqual(@as(usize, 0), try manager.drainPayloadRetirementWithAdmission(cleanup));
+    held.unlock();
+    try std.testing.expectEqual(before, manager.snapshot().memory.used_bytes);
+    try std.testing.expectEqual(before, parent.snapshot().memory.used_bytes);
+    try manager.drainConstructionCleanupWithAdmission(cleanup);
+    if (fixture == 2) try std.testing.expectEqual(@as(usize, 1), try manager.drainPayloadRetirementWithAdmission(cleanup));
+    try std.testing.expect(manager.payload_retirement_head == null);
+    try std.testing.expect(manager.payload_retirement_cursor == null);
+    try resources.metadata_fixture.expectUsage(@as(u64, 0), &manager, &.{&manager});
+    try resources.metadata_fixture.expectUsage(@as(u64, 0), &parent, &.{ &parent, &manager });
+    try result;
+}
+
+pub fn qualifyControlledLocalCache(control: @import("../common/read_admission.zig").Port, fixture: usize) !void {
+    if (!builtin.is_test) @compileError("qualification requires a test build");
+    const resources = @import("resource_manager.zig");
+    const a = std.testing.allocator;
+    const cost = @sizeOf(SharedBytes) + 8;
+    const metadata = resources.ResourceManager.qualifyReclaimerInitialBytes() + @sizeOf(Backend.LocalCacheEntries) + max_local_cached_run_blocks * @sizeOf(Backend.CachedRunBlock) + @sizeOf(SharedBytes) + (if (fixture == 1) @as(usize, 192 * 1024) else 4);
+    const parent_limit = 2 * cost + metadata;
+    var parent = resources.ResourceManager.init(.{ .identity_allocator = a, .memory_budget = .{ .hard_limit_bytes = parent_limit } });
+    defer parent.deinit(a);
+    var options: resources.Options = .{ .identity_allocator = a };
+    options.budgets[@backingInt(resources.Slice.lsm_block_table_cache)].hard_limit_bytes = if (fixture == 3) 1 else if (fixture == 2) cost + metadata else parent_limit;
+    var manager = try resources.metadata_fixture.init(options);
+    defer manager.deinit(a);
+    parent.memory.budget.hard_limit_bytes += manager.identity_metadata_bytes;
+    try manager.installMemoryParent(parent.memoryParentPort());
+    var backend = Backend.init(a, .{ .resource_manager = &manager, .local_block_cache_bytes = 8, .local_block_cache_max_block_bytes = 4096 });
+    defer backend.close();
+    if (fixture == 2) {
+        try std.testing.expect(try backend.prepareLocalCacheEntries(control));
+        backend.local_block_cache_reclaimer = try manager.registerReclaimerWithAdmission(.lsm_block_table_cache, &backend, Backend.reclaimLocalBlocks, control);
+    }
+    if (fixture == 2 or fixture == 4) {
+        const old = blk: {
+            const bytes = try a.dupe(u8, "oldbytes");
+            errdefer a.free(bytes);
+            break :blk try SharedBytes.create(a, bytes);
+        };
+        defer old.release();
+        old.reservation = try manager.reserveWithoutReclaim(.lsm_read_working_set, cost);
+        try std.testing.expect(backend.cacheRunBlockLease("/old", 1, 0, 8, old));
+    }
+    var credit = try manager.reserveConstructionWithAdmission(.lsm_read_working_set, cost, control);
+    defer credit.retire();
+    const value = blk: {
+        const bytes = try a.dupe(u8, "newbytes");
+        errdefer a.free(bytes);
+        break :blk try SharedBytes.create(a, bytes);
+    };
+    defer value.release();
+    value.result_pins_allowed = false;
+    try value.registerRetirementWithAdmission(&credit, control);
+    const wide = if (fixture == 1) try a.alloc(u8, 192 * 1024) else null;
+    defer if (wide) |bytes| a.free(bytes);
+    if (wide) |bytes| @memset(bytes, 'p');
+    const path = wide orelse "/new";
+    std.debug.assert(backend.mu.tryLock());
+    defer backend.mu.unlock();
+    var failures = std.testing.FailingAllocator.init(a, .{ .fail_index = if (fixture >= 5) fixture - 4 else 0 });
+    const admitted = blk: {
+        if (fixture >= 4) backend.allocator = failures.allocator();
+        defer backend.allocator = a;
+        break :blk try backend.cacheRunBlockLeaseWithAdmission(path, 2, 0, 8, value, control);
+    };
+    try std.testing.expectEqual(fixture < 3, admitted);
+    try std.testing.expectEqual(admitted, value.cache_admitted);
+    try std.testing.expectEqual(admitted, value.result_pins_allowed);
+    try std.testing.expectEqualStrings("newbytes", value.bytes);
+    if (admitted) {
+        try std.testing.expectEqual(@as(usize, 1), backend.run_block_cache.items.len);
+        try std.testing.expectEqualStrings(path, backend.run_block_cache.items[0].path);
+        // A duplicate never grows ownership. A fresh legacy caller receives
+        // the same stable payload and bytes after controlled publication.
+        try std.testing.expect(!try backend.cacheRunBlockLeaseWithAdmission(path, 2, 0, 8, value, control));
+        var duplicate_credit = try manager.reserveConstructionWithAdmission(.lsm_read_working_set, cost, control);
+        defer duplicate_credit.retire();
+        const duplicate = blk: {
+            const bytes = try a.dupe(u8, "newbytes");
+            errdefer a.free(bytes);
+            break :blk try SharedBytes.create(a, bytes);
+        };
+        defer duplicate.release();
+        duplicate.result_pins_allowed = false;
+        try duplicate.registerRetirementWithAdmission(&duplicate_credit, control);
+        try std.testing.expect(!try backend.cacheRunBlockLeaseWithAdmission(path, 2, 0, 8, duplicate, control));
+        try std.testing.expectEqual(resources.Slice.lsm_read_working_set, duplicate.reservation.?.slice);
+        try std.testing.expectEqual(@as(usize, 1), duplicate.refs.load(.acquire));
+        const pinned = backend.retainCachedRunBlock(path, 2, 0, 8) orelse return error.TestUnexpectedResult;
+        pinned.release();
+        try std.testing.expectEqual(@as(usize, 2), value.refs.load(.acquire));
+        try std.testing.expectEqual(resources.Slice.lsm_block_table_cache, value.reservation.?.slice);
+    } else {
+        try std.testing.expectEqual(@as(usize, if (fixture == 4) 1 else 0), backend.run_block_cache.items.len);
+        if (fixture == 4) try std.testing.expectEqualStrings("oldbytes", backend.run_block_cache.items[0].payload.bytes);
+        try std.testing.expectEqual(resources.Slice.lsm_read_working_set, value.reservation.?.slice);
+    }
+    // The parent also owns the charged identity tables installed above.
+    try std.testing.expect(parent.snapshot().memory.peak_bytes <= parent.memory.budget.hard_limit_bytes);
+    try std.testing.expectEqual(@as(u64, 0), manager.snapshot().memory.accounting_errors);
+}
+
+pub fn qualifyControlledLocalCacheContention(control: @import("../common/read_admission.zig").Port, stage: usize) !void {
+    if (!builtin.is_test) @compileError("qualification requires a test build");
+    const resources = @import("resource_manager.zig");
+    const admission = @import("../common/read_admission.zig");
+    const a = std.testing.allocator;
+    const cost = @sizeOf(SharedBytes) + 8;
+    var parent = resources.ResourceManager.init(.{ .identity_allocator = a });
+    defer parent.deinit(a);
+    var options: resources.Options = .{ .identity_allocator = a };
+    options.budgets[@backingInt(resources.Slice.lsm_block_table_cache)].hard_limit_bytes = resources.ResourceManager.qualifyReclaimerInitialBytes() + cost + @sizeOf(SharedBytes) + 4 + @sizeOf(Backend.LocalCacheEntries) + max_local_cached_run_blocks * @sizeOf(Backend.CachedRunBlock);
+    var manager = resources.ResourceManager.init(options);
+    defer manager.deinit(a);
+    try manager.installMemoryParent(parent.memoryParentPort());
+    var backend = Backend.init(a, .{ .resource_manager = &manager, .local_block_cache_bytes = 8, .local_block_cache_max_block_bytes = 4096 });
+    defer backend.close();
+    try std.testing.expect(try backend.prepareLocalCacheEntries(control));
+    if (stage >= 3) {
+        backend.local_block_cache_reclaimer = try manager.registerReclaimerWithAdmission(.lsm_block_table_cache, &backend, Backend.reclaimLocalBlocks, control);
+        const old = blk: {
+            const bytes = try a.dupe(u8, "oldbytes");
+            errdefer a.free(bytes);
+            break :blk try SharedBytes.create(a, bytes);
+        };
+        defer old.release();
+        old.reservation = try manager.reserveWithoutReclaim(.lsm_read_working_set, cost);
+        try std.testing.expect(backend.cacheRunBlockLease("/old", 1, 0, 8, old));
+    }
+    var credit = try manager.reserveConstructionWithAdmission(.lsm_read_working_set, cost, control);
+    defer credit.retire();
+    const value = blk: {
+        const bytes = try a.dupe(u8, "newbytes");
+        errdefer a.free(bytes);
+        break :blk try SharedBytes.create(a, bytes);
+    };
+    defer value.release();
+    value.result_pins_allowed = false;
+    try value.registerRetirementWithAdmission(&credit, control);
+    const Probe = struct {
+        control: admission.Port,
+        manager: *resources.ResourceManager,
+        held: ?*std.atomic.Mutex = null,
+        pressure: ?*std.c.pthread_mutex_t = null,
+        waits: usize = 0,
+        pub fn checkpoint(self: *@This()) !void {
+            try self.control.checkpoint();
+        }
+        pub fn waitForProgress(self: *@This()) !void {
+            // Cooperative waits must release the child's accounting lock.
+            if (self.held != &self.manager.mutex) {
+                try std.testing.expect(self.manager.mutex.tryLock());
+                self.manager.mutex.unlock();
+            }
+            self.waits += 1;
+            try self.control.waitForProgress();
+            self.unlock();
+        }
+        fn unlock(self: *@This()) void {
+            if (self.held) |mutex| mutex.unlock();
+            if (self.pressure) |mutex| std.debug.assert(std.c.pthread_mutex_unlock(mutex) == .SUCCESS);
+            self.held = null;
+            self.pressure = null;
+        }
+        fn hold(self: *@This(), mutex: *std.atomic.Mutex) void {
+            std.debug.assert(mutex.tryLock());
+            self.held = mutex;
+        }
+        fn holdPressure(self: *@This(), mutex: *std.c.pthread_mutex_t) void {
+            std.debug.assert(std.c.pthread_mutex_trylock(mutex) == .SUCCESS);
+            self.pressure = mutex;
+        }
+    };
+    var probe = Probe{ .control = control, .manager = &manager };
+    defer probe.unlock();
+    switch (stage) {
+        0 => probe.hold(&manager.reclaimer_mutex),
+        1 => probe.hold(&manager.mutex),
+        2 => probe.holdPressure(&manager.pressure_change.mutex),
+        3 => probe.hold(&manager.payload_retirement_mutex),
+        4 => probe.hold(&parent.mutex),
+        else => probe.holdPressure(&parent.pressure_change.mutex),
+    }
+    const original_notify = manager.memory_parent.?.notify_fn;
+    defer manager.memory_parent.?.notify_fn = original_notify;
+    const Legacy = struct {
+        fn notify(_: *anyopaque) callconv(.c) void {
+            @panic("controlled local cache entered legacy parent notification");
+        }
+    };
+    manager.memory_parent.?.notify_fn = Legacy.notify;
+    var adapter = admission.Adapter(*Probe){ .budget = &probe };
+    const payload = adapter.payload();
+    std.debug.assert(backend.mu.tryLock());
+    defer backend.mu.unlock();
+    try std.testing.expect(try backend.cacheRunBlockLeaseWithAdmission("/new", 2, 0, 8, value, admission.Port.init(&payload)));
+    try std.testing.expectEqual(@as(usize, 1), probe.waits);
+    try std.testing.expectEqual(@as(usize, 1), backend.run_block_cache.items.len);
+    try std.testing.expectEqualStrings("newbytes", backend.run_block_cache.items[0].payload.bytes);
+    try std.testing.expectEqual(resources.Slice.lsm_block_table_cache, value.reservation.?.slice);
+    try std.testing.expectEqual(@as(u64, 0), manager.snapshot().memory.accounting_errors);
+}
+
+pub fn qualifyMakeManagedCleanupPayload(manager: *@import("resource_manager.zig").ResourceManager, control: @import("../common/read_admission.zig").Port) !*SharedBytes {
+    if (!builtin.is_test) @compileError("qualification requires a test build");
+    const a = std.testing.allocator;
+    var credit = try manager.reserveConstructionWithAdmission(.lsm_read_working_set, @sizeOf(SharedBytes) + 8, control);
+    defer credit.retire();
+    const value = blk: {
+        const bytes = try a.dupe(u8, "retained");
+        errdefer a.free(bytes);
+        break :blk try SharedBytes.create(a, bytes);
+    };
+    errdefer value.release();
+    try value.registerRetirementWithAdmission(&credit, control);
+    return value;
+}
+
+pub fn qualifyControlledLocalCacheMetadata(control: read_admission.Port, deny: bool) !void {
+    if (!builtin.is_test) @compileError("qualification requires a test build");
+    const a = std.testing.allocator;
+    const path = "/physically-charged-cache-path";
+    const payload_cost = @sizeOf(SharedBytes) + 8;
+    const path_cost = @sizeOf(SharedBytes) + path.len;
+    const registry_cost = resource_manager_mod.ResourceManager.qualifyReclaimerInitialBytes();
+    const slab_cost = @sizeOf(Backend.LocalCacheEntries) + max_local_cached_run_blocks * @sizeOf(Backend.CachedRunBlock);
+    var parent = resource_manager_mod.ResourceManager.init(.{ .identity_allocator = a, .memory_budget = .{ .hard_limit_bytes = if (deny) payload_cost else payload_cost + path_cost + slab_cost + registry_cost } });
+    defer parent.deinit(a);
+    var manager = try resource_manager_mod.metadata_fixture.init(.{ .identity_allocator = a });
+    defer manager.deinit(a);
+    parent.memory.budget.hard_limit_bytes += manager.identity_metadata_bytes;
+    try manager.installMemoryParent(parent.memoryParentPort());
+    var backend = Backend.init(a, .{ .resource_manager = &manager });
+    defer backend.close();
+    var credit = try manager.reserveConstructionWithAdmission(.lsm_read_working_set, payload_cost, control);
+    defer credit.retire();
+    const value = blk: {
+        const bytes = try a.dupe(u8, "retained");
+        errdefer a.free(bytes);
+        break :blk try SharedBytes.create(a, bytes);
+    };
+    var value_owned = true;
+    defer if (value_owned) value.release();
+    try value.registerRetirementWithAdmission(&credit, control);
+    var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+    if (deny) backend.allocator = failing.allocator();
+    const admitted = backend.cacheRunBlockLeaseWithAdmission(path, 1, 0, 8, value, control);
+    backend.allocator = a;
+    try std.testing.expectEqual(!deny, try admitted);
+    if (deny) {
+        // Parent denial happens before any path or slab allocation attempt.
+        try std.testing.expectEqual(@as(usize, 0), failing.alloc_index);
+        try std.testing.expect(!failing.has_induced_failure);
+        try std.testing.expectEqual(@as(usize, 0), backend.run_block_cache.items.len);
+        try resource_manager_mod.metadata_fixture.expectUsage(@as(u64, payload_cost), &manager, &.{&manager});
+        return;
+    }
+    const charged = payload_cost + path_cost + slab_cost + registry_cost;
+    try resource_manager_mod.metadata_fixture.expectUsage(@as(u64, charged), &manager, &.{&manager});
+    try resource_manager_mod.metadata_fixture.expectUsage(@as(u64, charged), &parent, &.{ &parent, &manager });
+    value_owned = false;
+    value.release();
+    std.debug.assert(parent.mutex.tryLock());
+    defer parent.mutex.unlock();
+    std.debug.assert(manager.mutex.tryLock());
+    defer manager.mutex.unlock();
+    std.debug.assert(manager.payload_retirement_mutex.tryLock());
+    defer manager.payload_retirement_mutex.unlock();
+    backend.deinitRunBlockCache();
+    // Dropping cache ownership runs no destructor, ledger callback or lock wait.
+    try std.testing.expectEqual(@as(u64, charged) + manager.identity_metadata_bytes + manager.identity_metadata_retirement_bytes, manager.memory.used_bytes);
+    try std.testing.expectEqual(@as(u64, charged) + manager.identity_metadata_bytes + manager.identity_metadata_retirement_bytes + parent.identity_metadata_bytes + parent.identity_metadata_retirement_bytes, parent.memory.used_bytes);
+    try std.testing.expectEqual(@as(usize, 3), manager.payload_retirement_ready.load(.acquire));
+    try std.testing.expect(backend.run_block_cache_owner == null);
+}
+
+pub fn qualifyLockedCaptureCheckpoints() !void {
+    if (!builtin.is_test) @compileError("qualification requires a test build");
+    const scheduling = @import("../common/runnable_scheduler.zig");
+    const Kind = enum { snapshot, probe, current };
+    const Mode = enum { success, contended, reject_locked, reject_return };
+    const Budget = struct {
+        backend: *Backend,
+        scheduler: *scheduling.Scheduler,
+        execution: *scheduling.Execution,
+        mode: Mode,
+        wait_capability: bool,
+        other_holds: bool,
+        checks: usize = 0,
+        locked_checks: usize = 0,
+        waits: usize = 0,
+        pub fn checkpoint(self: *@This()) !void {
+            self.checks += 1;
+            if (!self.other_holds) {
+                // Every cooperative checkpoint must be outside our backend
+                // mutex. A budget of one exercises a real yield each time.
+                if (!self.backend.mu.tryLock()) return error.TestCpuCheckpointUnderBackendLock;
+                self.backend.mu.unlock();
+            }
+            if (self.mode == .reject_return and self.locked_checks != 0) return error.Canceled;
+            try self.execution.checkpoint();
+        }
+        pub fn checkLifetime(self: *@This()) !void {
+            if (!self.backend.mu.tryLock()) {
+                if (!self.other_holds) self.locked_checks += 1;
+                if (self.mode == .reject_locked and !self.other_holds) return error.Canceled;
+            } else self.backend.mu.unlock();
+            try self.execution.checkLifetime();
+        }
+        pub fn waitForProgress(self: *@This()) !void {
+            try std.testing.expect(self.other_holds);
+            self.waits += 1;
+            try self.execution.park(.resource_blocked);
+            try std.testing.expectEqual(@as(usize, 0), self.scheduler.stats().runnable_slots);
+            try std.testing.expectEqual(@as(usize, 1), self.scheduler.stats().operations);
+            try std.testing.expectEqual(@as(u64, 17), self.scheduler.stats().retained_bytes);
+            var health: scheduling.Execution = .{};
+            try health.start(self.scheduler, .{ .io = std.testing.io, .allow_wait = false }, .control);
+            health.finish();
+            self.backend.mu.unlock();
+            self.other_holds = false;
+            try self.execution.enter(.query);
+        }
+        pub fn executionBoundary(self: *@This()) ?@import("../common/execution_wait.zig").Boundary {
+            return if (self.wait_capability) .{ .ptr = self, .begin = unexpectedWait, .end = unexpectedWait } else null;
+        }
+        fn unexpectedWait(_: *anyopaque) !void {
+            return error.TestUnexpectedPhysicalCaptureIo;
+        }
+        fn capture(comptime kind: Kind, runtime: *backend_erased.Store, port: read_admission.Port) !void {
+            switch (kind) {
+                .snapshot => {
+                    var txn = try runtime.beginReadWithAdmission(.retain, port);
+                    defer txn.abort();
+                    try std.testing.expectEqualStrings("value", try txn.get("key"));
+                },
+                .probe => {
+                    var txn = try runtime.beginProbeWithAdmission(.retain, port);
+                    defer txn.abort();
+                    try std.testing.expectEqualStrings("value", try txn.get("key"));
+                },
+                .current => {
+                    var txn = try runtime.beginCurrentScanWithAdmission(port);
+                    defer txn.abort();
+                },
+            }
+        }
+    };
+    const a = std.testing.allocator;
+    inline for (.{ Kind.snapshot, .probe, .current }) |kind| {
+        for ([_]bool{ false, true }) |flushed| {
+            for ([_]bool{ false, true }) |wait_capability| {
+                for ([_]Mode{ .success, .contended, .reject_locked, .reject_return }) |mode| {
+                    var memory = storage_io.MemoryStorage.init(a);
+                    defer memory.deinit();
+                    var backend = try Backend.open(a, "/locked-capture-checkpoints", .{ .storage = memory.storage(), .wal_enabled = false, .flush_threshold = if (flushed) 1 else 1024 * 1024, .compact_threshold_runs = 10000 });
+                    defer backend.close();
+                    var runtime = try backend.runtimeStore(a, .{ .name = "docs" });
+                    defer runtime.deinit();
+                    {
+                        var writer = try runtime.beginWrite();
+                        errdefer writer.abort();
+                        try writer.put("key", "value");
+                        try writer.commit();
+                    }
+                    if (flushed) try std.testing.expect(backend.runs.count() > 0) else try std.testing.expect(backend.mutable.entryCount() > 0);
+                    var scheduler = try scheduling.Scheduler.init(.{ .slots = 2, .checkpoint_budget = 1 });
+                    var execution: scheduling.Execution = .{};
+                    try execution.start(&scheduler, .{ .io = std.testing.io, .allow_wait = false, .retained_bytes = 17 }, .query);
+                    defer execution.finish();
+                    var budget: Budget = .{ .backend = &backend, .scheduler = &scheduler, .execution = &execution, .mode = mode, .wait_capability = wait_capability, .other_holds = mode == .contended };
+                    if (budget.other_holds) try std.testing.expect(backend.mu.tryLock());
+                    defer if (budget.other_holds) backend.mu.unlock();
+                    var bridge: read_admission.Adapter(*Budget) = .{ .budget = &budget };
+                    const payload = bridge.payload();
+                    const port = read_admission.Port.init(&payload);
+                    // Capability discovery itself must not checkpoint or yield.
+                    const before = budget.checks;
+                    try std.testing.expectEqual(wait_capability, try port.hasExecutionWait());
+                    try std.testing.expectEqual(before, budget.checks);
+                    const result = Budget.capture(kind, &runtime, port);
+                    if (mode == .reject_locked or mode == .reject_return) try std.testing.expectError(error.Canceled, result) else try result;
+                    try std.testing.expect(budget.locked_checks > 0);
+                    try std.testing.expectEqual(@as(usize, if (mode == .contended) 1 else 0), budget.waits);
+                    try std.testing.expectEqual(@as(usize, 0), backend.active_readers);
+                    try std.testing.expect(backend.mu.tryLock());
+                    backend.mu.unlock();
+                    execution.finish();
+                    try std.testing.expectEqual(@as(usize, 0), scheduler.stats().operations);
+                    try std.testing.expectEqual(@as(u64, 0), scheduler.stats().retained_bytes);
+                }
+            }
+        }
+    }
+}
+
+pub fn qualifyReadVersionBuildAdmission() !void {
+    if (!builtin.is_test) @compileError("qualification requires a test build");
+    const scheduling = @import("../common/runnable_scheduler.zig");
+    const Mode = enum { success, canceled_waiter, expired_waiter, legacy_wins, coarse_wins, changed_epoch, producer_canceled, producer_oom };
+    const Fixture = struct {
+        const Self = @This();
+        backend: *Backend,
+        runtime: *backend_erased.Store,
+        version: *runtime_mod.ReadVersion,
+        scheduler: *scheduling.Scheduler,
+        producer: *scheduling.Execution,
+        failing: *std.testing.FailingAllocator,
+        mode: Mode,
+        injected: bool = false,
+        producer_failure: ?anyerror = null,
+        peer_failure: ?anyerror = null,
+        peer_waits: usize = 0,
+        published_runs: ?[*]repository_mod.Run = null,
+        const Budget = struct {
+            fixture: *Self,
+            execution: *scheduling.Execution,
+            peer: bool,
+            pub fn checkLifetime(self: *@This()) !void {
+                if (if (self.peer) self.fixture.peer_failure else self.fixture.producer_failure) |cause| return cause;
+                try self.execution.checkLifetime();
+            }
+            pub fn checkpoint(self: *@This()) !void {
+                try self.checkLifetime();
+                if (!self.fixture.backend.mu.tryLock()) return error.TestBuildCheckpointUnderBackendLock;
+                self.fixture.backend.mu.unlock();
+                if (!self.peer and !self.fixture.injected) {
+                    self.fixture.injected = true;
+                    try self.fixture.interleave();
+                }
+                try self.checkLifetime();
+                try self.execution.checkpoint();
+            }
+            pub fn executionBoundary(self: *@This()) ?@import("../common/execution_wait.zig").Boundary {
+                if (self.peer and self.fixture.mode == .coarse_wins) return null;
+                return .{ .ptr = self, .begin = unexpectedPhysicalWait, .end = unexpectedPhysicalWait };
+            }
+            fn unexpectedPhysicalWait(_: *anyopaque) !void {
+                return error.TestUnexpectedProjectionIo;
+            }
+            pub fn waitForProgress(self: *@This()) !void {
+                try std.testing.expect(self.peer);
+                const f = self.fixture;
+                f.peer_waits += 1;
+                try self.execution.park(.resource_blocked);
+                try std.testing.expectEqual(@as(usize, 0), f.scheduler.stats().runnable_slots);
+                if (f.mode == .canceled_waiter or f.mode == .expired_waiter) {
+                    f.peer_failure = if (f.mode == .expired_waiter) error.DeadlineExceeded else error.Canceled;
+                    return f.peer_failure.?;
+                }
+                try std.testing.expectEqual(Mode.legacy_wins, f.mode);
+                try f.legacyBuild(false);
+                try self.execution.enter(.query);
+            }
+        };
+        fn legacyBuild(self: *Self, advance: bool) !void {
+            var legacy: scheduling.Execution = .{};
+            try legacy.start(self.scheduler, .{ .io = std.testing.io, .allow_wait = false, .retained_bytes = 31 }, .query);
+            defer legacy.finish();
+            if (advance) {
+                var writer = try self.runtime.beginWrite();
+                errdefer writer.abort();
+                try writer.put("later", "new");
+                try writer.commit();
+            }
+            _ = runtime_mod.lockBackend(Backend, self.backend);
+            defer runtime_mod.unlockBackend(Backend, self.backend, true);
+            const target = if (advance) try self.backend.createReadVersionFromDirectory() else self.version;
+            try self.backend.prepareReadVersion(target);
+            try std.testing.expect(target.prepared);
+            if (!advance) {
+                try std.testing.expect(target.preparing);
+                self.published_runs = target.runs.ptr;
+            } else {
+                try std.testing.expect(target != self.version);
+                try std.testing.expectEqual(@as(usize, 2), target.runs.len);
+            }
+        }
+        fn interleave(self: *Self) !void {
+            try std.testing.expect(self.version.preparing);
+            try self.producer.park(.resource_blocked);
+            try std.testing.expectEqual(@as(usize, 0), self.scheduler.stats().runnable_slots);
+            try std.testing.expectEqual(@as(usize, 1), self.scheduler.stats().operations);
+            try std.testing.expectEqual(@as(u64, 17), self.scheduler.stats().retained_bytes);
+            var health: scheduling.Execution = .{};
+            try health.start(self.scheduler, .{ .io = std.testing.io, .allow_wait = false }, .control);
+            health.finish();
+            switch (self.mode) {
+                .canceled_waiter, .expired_waiter, .legacy_wins, .coarse_wins => {
+                    var peer: scheduling.Execution = .{};
+                    try peer.start(self.scheduler, .{ .io = std.testing.io, .allow_wait = false, .retained_bytes = 23 }, .query);
+                    defer peer.finish();
+                    var peer_budget: Budget = .{ .fixture = self, .execution = &peer, .peer = true };
+                    var bridge: read_admission.Adapter(*Budget) = .{ .budget = &peer_budget };
+                    const payload = bridge.payload();
+                    _ = runtime_mod.lockBackend(Backend, self.backend);
+                    const result = self.backend.prepareReadVersionWithAdmission(self.version, read_admission.Port.init(&payload));
+                    // The provider promises physical backend ownership even
+                    // after the waiter's CPU return is rejected.
+                    try std.testing.expect(!self.backend.mu.tryLock());
+                    runtime_mod.unlockBackend(Backend, self.backend, true);
+                    if (self.mode == .legacy_wins or self.mode == .coarse_wins) {
+                        try result;
+                        self.published_runs = self.version.runs.ptr;
+                    } else try std.testing.expectError(self.peer_failure.?, result);
+                    try std.testing.expect(self.version.preparing);
+                    try std.testing.expectEqual(@as(usize, 1), self.backend.active_readers);
+                },
+                .changed_epoch => try self.legacyBuild(true),
+                .producer_canceled => self.producer_failure = error.Canceled,
+                .producer_oom => self.backend.allocator = self.failing.allocator(),
+                .success => {},
+            }
+            try self.producer.enter(.query);
+        }
+    };
+    const a = std.testing.allocator;
+    for ([_]Mode{ .success, .canceled_waiter, .expired_waiter, .legacy_wins, .coarse_wins, .changed_epoch, .producer_canceled, .producer_oom }) |mode| {
+        var memory = storage_io.MemoryStorage.init(a);
+        defer memory.deinit();
+        var manager = resource_manager_mod.ResourceManager.init(.{ .identity_allocator = a });
+        defer manager.deinit(a);
+        var backend = try Backend.open(a, "/version-build-admission", .{ .storage = memory.storage(), .wal_enabled = false, .flush_threshold = 1, .compact_threshold_runs = 10000, .resource_manager = &manager });
+        defer backend.close();
+        var runtime = try backend.runtimeStore(a, .{ .name = "docs" });
+        defer runtime.deinit();
+        {
+            var writer = try runtime.beginWrite();
+            errdefer writer.abort();
+            try writer.put("initial", "old");
+            try writer.commit();
+        }
+        _ = runtime_mod.lockBackend(Backend, &backend);
+        var locked = true;
+        defer if (locked) runtime_mod.unlockBackend(Backend, &backend, true);
+        const version = try backend.createReadVersionFromDirectory();
+        _ = version.references.fetchAdd(1, .monotonic);
+        var version_owned = true;
+        defer if (version_owned) {
+            if (!locked) _ = runtime_mod.lockBackend(Backend, &backend);
+            version.release(&backend);
+            if (!locked) runtime_mod.unlockBackend(Backend, &backend, true);
+        };
+        try std.testing.expect(!version.prepared);
+        try std.testing.expectEqual(@as(usize, 1), version.directory.?.count());
+        const directory = version.directory;
+        const initial_bytes = manager.snapshot().memory.used_bytes;
+        var scheduler = try scheduling.Scheduler.init(.{ .slots = 3, .checkpoint_budget = 1 });
+        var producer: scheduling.Execution = .{};
+        try producer.start(&scheduler, .{ .io = std.testing.io, .allow_wait = false, .retained_bytes = 17 }, .query);
+        defer producer.finish();
+        var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+        var fixture: Fixture = .{ .backend = &backend, .runtime = &runtime, .version = version, .scheduler = &scheduler, .producer = &producer, .failing = &failing, .mode = mode };
+        var budget: Fixture.Budget = .{ .fixture = &fixture, .execution = &producer, .peer = false };
+        var bridge: read_admission.Adapter(*Fixture.Budget) = .{ .budget = &budget };
+        const payload = bridge.payload();
+        const result = backend.prepareReadVersionWithAdmission(version, read_admission.Port.init(&payload));
+        backend.allocator = a;
+        try std.testing.expect(!backend.mu.tryLock());
+        try std.testing.expect(!version.preparing);
+        try std.testing.expectEqual(@as(usize, 0), backend.active_readers);
+        if (mode == .producer_canceled or mode == .producer_oom) {
+            try std.testing.expectError(if (mode == .producer_oom) error.OutOfMemory else error.Canceled, result);
+            try std.testing.expect(!version.prepared);
+            try std.testing.expectEqual(initial_bytes, manager.snapshot().memory.used_bytes);
+        } else {
+            try result;
+            try std.testing.expect(version.prepared);
+            try std.testing.expectEqual(directory, version.directory);
+            try std.testing.expectEqual(@as(usize, 1), version.runs.len);
+            if (mode == .legacy_wins or mode == .coarse_wins) try std.testing.expectEqual(fixture.published_runs.?, version.runs.ptr);
+            if (mode == .changed_epoch) try std.testing.expect(backend.read_version.? != version);
+            try std.testing.expectEqual(@as(u64, if (mode == .changed_epoch) 2 else 1), backend.read_version_builds);
+        }
+        try std.testing.expectEqual(@as(usize, if (mode == .canceled_waiter or mode == .expired_waiter or mode == .legacy_wins) 1 else 0), fixture.peer_waits);
+        version.release(&backend);
+        version_owned = false;
+        runtime_mod.unlockBackend(Backend, &backend, true);
+        locked = false;
+        producer.finish();
+        try std.testing.expectEqual(@as(usize, 0), scheduler.stats().operations);
+        try std.testing.expectEqual(@as(u64, 0), scheduler.stats().retained_bytes);
+    }
+}
+
+pub fn qualifyConcurrentReadVersionBuild() !void {
+    if (!builtin.is_test) @compileError("qualification requires a test build");
+    if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
+    const scheduling = @import("../common/runnable_scheduler.zig");
+    const Fixture = struct {
+        const Self = @This();
+        backend: *Backend,
+        version: *runtime_mod.ReadVersion,
+        scheduler: *scheduling.Scheduler,
+        io: std.Io,
+        producer_blocked: std.Io.Event = .unset,
+        producer_release: std.Io.Event = .unset,
+        peer_waiting: std.Io.Event = .unset,
+        stop: std.atomic.Value(bool) = .init(false),
+        const Scope = struct {
+            fixture: *Self,
+            producer: bool,
+            execution: scheduling.Execution = .{},
+            first: bool = true,
+            waits: usize = 0,
+            failure: ?anyerror = null,
+            pub fn checkLifetime(self: *@This()) !void {
+                if (self.fixture.stop.load(.acquire)) return error.Canceled;
+                try self.execution.checkLifetime();
+            }
+            pub fn checkpoint(self: *@This()) !void {
+                try self.checkLifetime();
+                if (self.producer and self.first) {
+                    self.first = false;
+                    try self.execution.park(.resource_blocked);
+                    self.fixture.producer_blocked.set(self.fixture.io);
+                    self.fixture.producer_release.waitUncancelable(self.fixture.io);
+                    try self.execution.enter(.query);
+                    try self.checkLifetime();
+                }
+                try self.execution.checkpoint();
+            }
+            pub fn executionBoundary(self: *@This()) ?@import("../common/execution_wait.zig").Boundary {
+                return .{ .ptr = self, .begin = begin, .end = end };
+            }
+            fn begin(raw: *anyopaque) !void {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                try self.execution.park(.resource_blocked);
+                try self.checkLifetime();
+            }
+            fn end(raw: *anyopaque) !void {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                try self.execution.enter(.query);
+                try self.checkLifetime();
+            }
+            pub fn waitForProgress(self: *@This()) !void {
+                try std.testing.expect(!self.producer);
+                self.waits += 1;
+                try begin(self);
+                if (self.first) {
+                    self.first = false;
+                    try std.testing.expectEqual(@as(usize, 0), self.fixture.scheduler.stats().runnable_slots);
+                    try std.testing.expectEqual(@as(usize, 2), self.fixture.scheduler.stats().operations);
+                    try std.testing.expectEqual(@as(u64, 40), self.fixture.scheduler.stats().retained_bytes);
+                    self.fixture.peer_waiting.set(self.fixture.io);
+                }
+                const result = self.fixture.io.sleep(.fromMilliseconds(1), .awake);
+                try end(self);
+                try result;
+            }
+            fn canceled(raw: *const anyopaque) bool {
+                const fixture: *const Self = @ptrCast(@alignCast(raw));
+                return fixture.stop.load(.acquire);
+            }
+            fn run(self: *@This()) void {
+                self.execute() catch |err| {
+                    self.failure = err;
+                };
+            }
+            fn execute(self: *@This()) !void {
+                try self.execution.start(self.fixture.scheduler, .{ .io = self.fixture.io, .allow_wait = false, .retained_bytes = if (self.producer) 17 else 23, .cancellation = .{ .ptr = self.fixture, .requested = canceled } }, .query);
+                defer self.execution.finish();
+                var bridge: read_admission.Adapter(*@This()) = .{ .budget = self };
+                const payload = bridge.payload();
+                _ = runtime_mod.lockBackend(Backend, self.fixture.backend);
+                defer runtime_mod.unlockBackend(Backend, self.fixture.backend, true);
+                try self.fixture.backend.prepareReadVersionWithAdmission(self.fixture.version, read_admission.Port.init(&payload));
+            }
+        };
+    };
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var memory = storage_io.MemoryStorage.init(a);
+    defer memory.deinit();
+    var backend = try Backend.open(a, "/concurrent-version-build", .{ .storage = memory.storage(), .wal_enabled = false, .flush_threshold = 1, .compact_threshold_runs = 10000 });
+    defer backend.close();
+    var runtime = try backend.runtimeStore(a, .{ .name = "docs" });
+    defer runtime.deinit();
+    {
+        var writer = try runtime.beginWrite();
+        errdefer writer.abort();
+        try writer.put("key", "value");
+        try writer.commit();
+    }
+    _ = runtime_mod.lockBackend(Backend, &backend);
+    const version = backend.createReadVersionFromDirectory() catch |err| {
+        runtime_mod.unlockBackend(Backend, &backend, true);
+        return err;
+    };
+    _ = version.references.fetchAdd(1, .monotonic);
+    runtime_mod.unlockBackend(Backend, &backend, true);
+    defer {
+        _ = runtime_mod.lockBackend(Backend, &backend);
+        version.release(&backend);
+        runtime_mod.unlockBackend(Backend, &backend, true);
+    }
+    var scheduler = try scheduling.Scheduler.init(.{ .slots = 2, .checkpoint_budget = 1 });
+    var fixture: Fixture = .{ .backend = &backend, .version = version, .scheduler = &scheduler, .io = io };
+    var producer: Fixture.Scope = .{ .fixture = &fixture, .producer = true };
+    var peer: Fixture.Scope = .{ .fixture = &fixture, .producer = false };
+    const producer_thread = try std.Thread.spawn(.{}, Fixture.Scope.run, .{&producer});
+    var peer_thread: ?std.Thread = null;
+    var joined = false;
+    defer if (!joined) {
+        fixture.stop.store(true, .release);
+        fixture.producer_release.set(io);
+        producer_thread.join();
+        if (peer_thread) |thread| thread.join();
+    };
+    try fixture.producer_blocked.waitTimeout(io, .{ .duration = .{ .raw = .fromSeconds(5), .clock = .awake } });
+    peer_thread = try std.Thread.spawn(.{}, Fixture.Scope.run, .{&peer});
+    try fixture.peer_waiting.waitTimeout(io, .{ .duration = .{ .raw = .fromSeconds(5), .clock = .awake } });
+    fixture.producer_release.set(io);
+    producer_thread.join();
+    peer_thread.?.join();
+    joined = true;
+    try std.testing.expectEqual(@as(?anyerror, null), producer.failure);
+    try std.testing.expectEqual(@as(?anyerror, null), peer.failure);
+    try std.testing.expect(peer.waits > 0);
+    try std.testing.expect(version.prepared);
+    try std.testing.expect(!version.preparing);
+    try std.testing.expectEqual(@as(usize, 1), version.runs.len);
+    try std.testing.expectEqual(@as(u64, 1), backend.read_version_builds);
+    try std.testing.expectEqual(@as(usize, 0), backend.active_readers);
+    try std.testing.expectEqual(@as(usize, 0), scheduler.stats().operations);
+    try std.testing.expectEqual(@as(u64, 0), scheduler.stats().retained_bytes);
+}
+
+pub fn qualifyRunSourceOpenAdmission() !void {
+    if (!builtin.is_test) @compileError("qualification requires a test build");
+    if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
+    const native = @import("../common/runnable_scheduler.zig");
+    const Mode = enum { legacy_wins, coarse_wins, new_epoch, coalesced, foreign_cancel, foreign_io, all_io_fail, begin_reject, resume_cancel, resume_expire, resume_shutdown, late_cancel };
+    const Fixture = struct {
+        const Self = @This();
+        backend: *Backend,
+        scheduler: *native.Scheduler,
+        io: std.Io,
+        mode: Mode,
+        entered: std.Io.Event = .unset,
+        release: std.Io.Event = .unset,
+        peer_waiting: std.Io.Event = .unset,
+        stop: std.atomic.Value(bool) = .init(false),
+        opens: std.atomic.Value(usize) = .init(0),
+        closes: std.atomic.Value(usize) = .init(0),
+        active: std.atomic.Value(usize) = .init(0),
+        var current: *Self = undefined;
+        const Source = struct {
+            owner: *Self,
+            a: Allocator,
+            id: usize,
+            uses: std.atomic.Value(usize) = .init(0),
+            fn read(_: *anyopaque, offset: u64, out: []u8) !void {
+                const bytes = "immutable";
+                @memcpy(out, bytes[@intCast(offset)..][0..out.len]);
+            }
+            fn acquire(raw: *anyopaque) bool {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                _ = self.uses.fetchAdd(1, .monotonic);
+                _ = self.owner.active.fetchAdd(1, .monotonic);
+                return true;
+            }
+            fn releaseUse(raw: *anyopaque) void {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                std.debug.assert(self.uses.fetchSub(1, .acq_rel) > 0);
+                std.debug.assert(self.owner.active.fetchSub(1, .acq_rel) > 0);
+            }
+            fn close(raw: *anyopaque) void {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                std.debug.assert(self.uses.load(.acquire) == 0);
+                _ = self.owner.closes.fetchAdd(1, .monotonic);
+                self.a.destroy(self);
+            }
+        };
+        fn open(_: *anyopaque, a: Allocator, _: []const u8) !@import("../segment_source.zig").Source {
+            const self = current;
+            const id = self.opens.fetchAdd(1, .acq_rel) + 1;
+            if (id == 1) {
+                self.entered.set(self.io);
+                self.release.waitUncancelable(self.io);
+            }
+            if (self.mode == .all_io_fail or (self.mode == .foreign_io and id == 1)) return error.FileNotFound;
+            const source = try a.create(Source);
+            source.* = .{ .owner = self, .a = a, .id = id };
+            return .{ .ranges = .{ .ptr = source, .length = 9, .read_into = Source.read, .close = Source.close, .acquire_use = Source.acquire, .release_use = Source.releaseUse } };
+        }
+        fn hasPeer(self: *Self) bool {
+            return switch (self.mode) {
+                .legacy_wins, .coarse_wins, .new_epoch, .coalesced, .foreign_cancel, .foreign_io, .all_io_fail => true,
+                else => false,
+            };
+        }
+        fn peerIndependent(self: *Self) bool {
+            return self.mode == .legacy_wins or self.mode == .coarse_wins or self.mode == .new_epoch;
+        }
+        const Scope = struct {
+            fixture: *Self,
+            producer: bool,
+            execution: native.Execution = .{},
+            failure: ?anyerror = null,
+            reject: ?anyerror = null,
+            waits: usize = 0,
+            done: std.Io.Event = .unset,
+            fn phase(self: *@This()) native.Class {
+                return if (self.producer) .background else .write;
+            }
+            pub fn checkLifetime(self: *@This()) !void {
+                if (self.reject) |cause| return cause;
+                if (self.fixture.stop.load(.acquire)) return error.Canceled;
+                try self.execution.checkLifetime();
+            }
+            pub fn checkpoint(self: *@This()) !void {
+                try self.checkLifetime();
+            }
+            fn begin(raw: *anyopaque) !void {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                if (self.producer and self.fixture.mode == .begin_reject) return error.Canceled;
+                try self.execution.park(.resource_blocked);
+                try self.checkLifetime();
+            }
+            fn end(raw: *anyopaque) !void {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                if (self.producer) switch (self.fixture.mode) {
+                    .foreign_cancel, .resume_cancel => {
+                        self.reject = error.Canceled;
+                        return error.Canceled;
+                    },
+                    .resume_expire => {
+                        self.reject = error.DeadlineExceeded;
+                        return error.DeadlineExceeded;
+                    },
+                    .resume_shutdown => {
+                        self.fixture.scheduler.close();
+                        return error.SchedulerClosed;
+                    },
+                    else => {},
+                };
+                try self.execution.enter(self.phase());
+                if (self.producer and self.fixture.mode == .late_cancel) self.reject = error.Canceled;
+                try self.checkLifetime();
+            }
+            pub fn executionBoundary(self: *@This()) ?@import("../common/execution_wait.zig").Boundary {
+                if (!self.producer and self.fixture.mode == .coarse_wins) return null;
+                return .{ .ptr = self, .begin = begin, .end = end };
+            }
+            pub fn waitForProgress(self: *@This()) !void {
+                if (self.fixture.mode == .coarse_wins) return error.UnexpectedCoarseSourceWait;
+                self.waits += 1;
+                try begin(self);
+                if (!self.producer) self.fixture.peer_waiting.set(self.fixture.io);
+                const result = self.fixture.io.sleep(.fromMilliseconds(1), .awake);
+                try end(self);
+                try result;
+            }
+            fn canceled(raw: *const anyopaque) bool {
+                const self: *const Self = @ptrCast(@alignCast(raw));
+                return self.stop.load(.acquire);
+            }
+            fn run(self: *@This()) void {
+                self.execute() catch |err| {
+                    self.failure = err;
+                };
+                self.done.set(self.fixture.io);
+            }
+            fn execute(self: *@This()) !void {
+                const now: u64 = @intCast(std.Io.Clock.now(.awake, self.fixture.io).nanoseconds);
+                try self.execution.start(self.fixture.scheduler, .{ .io = self.fixture.io, .allow_wait = true, .deadline_ns = now + 5 * std.time.ns_per_s, .retained_bytes = if (self.producer) 17 else 23, .cancellation = .{ .ptr = self.fixture, .requested = canceled } }, self.phase());
+                defer self.execution.finish();
+                var bridge: read_admission.Adapter(*@This()) = .{ .budget = self };
+                const payload = bridge.payload();
+                const control: ?read_admission.Port = if (!self.producer and self.fixture.mode == .legacy_wins) null else .init(&payload);
+                const bytes = try self.fixture.backend.readRunRangeAllocWithAdmission(std.testing.allocator, "/source", 0, 9, control);
+                defer std.testing.allocator.free(bytes);
+                try std.testing.expectEqualStrings("immutable", bytes);
+                try std.testing.expectEqual(self.phase(), self.execution.entry.?.class);
+            }
+        };
+    };
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const timeout: std.Io.Timeout = .{ .duration = .{ .raw = .fromSeconds(5), .clock = .awake } };
+    for (std.enums.values(Mode)) |mode| {
+        var memory = storage_io.MemoryStorage.init(a);
+        defer memory.deinit();
+        var vtable = memory.storage().vtable.*;
+        vtable.open_leased_immutable_source = Fixture.open;
+        var backend = Backend.init(a, .{ .storage = .{ .ptr = memory.storage().ptr, .vtable = &vtable } });
+        var backend_open = true;
+        defer if (backend_open) backend.close();
+        var scheduler = try native.Scheduler.init(.{ .slots = 2 });
+        defer scheduler.close();
+        var fixture: Fixture = .{ .backend = &backend, .scheduler = &scheduler, .io = io, .mode = mode };
+        Fixture.current = &fixture;
+        var producer: Fixture.Scope = .{ .fixture = &fixture, .producer = true };
+        var peer: Fixture.Scope = .{ .fixture = &fixture, .producer = false };
+        const producer_thread = try std.Thread.spawn(.{}, Fixture.Scope.run, .{&producer});
+        var peer_thread: ?std.Thread = null;
+        var joined = false;
+        defer if (!joined) {
+            fixture.stop.store(true, .release);
+            fixture.release.set(io);
+            producer_thread.join();
+            if (peer_thread) |thread| thread.join();
+        };
+        if (mode != .begin_reject) {
+            try fixture.entered.waitTimeout(io, timeout);
+            try std.testing.expectEqual(@as(usize, 0), scheduler.stats().runnable_slots);
+            if (fixture.hasPeer()) {
+                if (mode == .new_epoch) backend.evictLocalCachesForRun("/source", 1);
+                peer_thread = try std.Thread.spawn(.{}, Fixture.Scope.run, .{&peer});
+                if (fixture.peerIndependent()) {
+                    // Completion before producer release is the progress proof.
+                    try peer.done.waitTimeout(io, timeout);
+                    try std.testing.expectEqual(@as(?anyerror, null), peer.failure);
+                    try std.testing.expectEqual(@as(usize, 2), fixture.opens.load(.acquire));
+                } else {
+                    try fixture.peer_waiting.waitTimeout(io, timeout);
+                    platform.sync.lockYielding(&backend.run_source_mutex);
+                    const coalesced = backend.run_source_opens.items.len == 1 and backend.run_source_opens.items[0].refs == 2;
+                    backend.run_source_mutex.unlock();
+                    try std.testing.expect(coalesced);
+                    try std.testing.expectEqual(@as(u64, 40), scheduler.stats().retained_bytes);
+                }
+            }
+            var health: native.Execution = .{};
+            try health.start(&scheduler, .{ .io = io, .allow_wait = false }, .control);
+            health.finish();
+        }
+        fixture.release.set(io);
+        try producer.done.waitTimeout(io, timeout);
+        if (peer_thread != null) try peer.done.waitTimeout(io, timeout);
+        producer_thread.join();
+        if (peer_thread) |thread| thread.join();
+        joined = true;
+        const expected: ?anyerror = switch (mode) {
+            .foreign_cancel, .resume_cancel, .late_cancel, .begin_reject => error.Canceled,
+            .resume_expire => error.DeadlineExceeded,
+            .resume_shutdown => error.SchedulerClosed,
+            .foreign_io, .all_io_fail => error.FileNotFound,
+            else => null,
+        };
+        try std.testing.expectEqual(expected, producer.failure);
+        if (fixture.hasPeer()) try std.testing.expectEqual(@as(?anyerror, if (mode == .all_io_fail) error.FileNotFound else null), peer.failure);
+        const source_count: usize = switch (mode) {
+            .begin_reject => 0,
+            .legacy_wins, .coarse_wins, .new_epoch, .foreign_cancel, .foreign_io, .all_io_fail => 2,
+            else => 1,
+        };
+        try std.testing.expectEqual(source_count, fixture.opens.load(.acquire));
+        try std.testing.expectEqual(@as(usize, 0), backend.run_source_opens.items.len);
+        const cached: usize = if (fixture.hasPeer() and mode != .all_io_fail) 1 else 0;
+        try std.testing.expectEqual(cached, backend.run_sources.items.len);
+        if (cached == 1) {
+            const source: *Fixture.Source = @ptrCast(@alignCast(backend.run_sources.items[0].lease.source.ranges.ptr));
+            try std.testing.expectEqual(@as(usize, if (mode == .coalesced) 1 else 2), source.id);
+            try std.testing.expectEqual(@as(usize, 1), backend.run_sources.items[0].lease.refs.load(.acquire));
+        }
+        try std.testing.expectEqual(@as(usize, 0), fixture.active.load(.acquire));
+        try std.testing.expectEqual(@as(usize, 0), scheduler.stats().operations);
+        try std.testing.expectEqual(@as(u64, 0), scheduler.stats().retained_bytes);
+        backend.close();
+        backend_open = false;
+        const allocated = source_count - @as(usize, if (mode == .all_io_fail) 2 else if (mode == .foreign_io) 1 else 0);
+        try std.testing.expectEqual(allocated, fixture.closes.load(.acquire));
+    }
+}
+
+test "lsm source read admission original opens preserve producer progress and independent authority" {
+    try qualifyRunSourceOpenAdmission();
+}
+
+pub fn qualifyNativeRunSourceOpenAdmission() !void {
+    if (!builtin.is_test) @compileError("qualification requires a test build");
+    const native = @import("../common/runnable_scheduler.zig");
+    const docs_mod = @import("lite/docstore.zig");
+    const index_mod = @import("lite/index_storage.zig");
+    const Mode = enum { success, rejected_resume, late_rejection };
+    const Scope = struct {
+        scheduler: *native.Scheduler,
+        execution: native.Execution = .{},
+        mode: Mode,
+        reject: bool = false,
+        checks: usize = 0,
+        opens: usize = 0,
+        pub fn checkLifetime(self: *@This()) !void {
+            self.checks += 1;
+            if (self.reject) return error.Canceled;
+            try self.execution.checkLifetime();
+        }
+        pub fn checkpoint(self: *@This()) !void {
+            try self.checkLifetime();
+        }
+        fn begin(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.opens += 1;
+            try self.execution.park(.resource_blocked);
+            try std.testing.expectEqual(@as(usize, 0), self.scheduler.stats().runnable_slots);
+            try std.testing.expectEqual(@as(u64, 17), self.scheduler.stats().retained_bytes);
+            var health: native.Execution = .{};
+            try health.start(self.scheduler, .{ .io = std.testing.io, .allow_wait = false }, .control);
+            health.finish();
+        }
+        fn end(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.mode == .rejected_resume) {
+                self.reject = true;
+                return error.Canceled;
+            }
+            try self.execution.enter(.query);
+            if (self.mode == .late_rejection) self.reject = true;
+        }
+        pub fn executionBoundary(self: *@This()) ?@import("../common/execution_wait.zig").Boundary {
+            return .{ .ptr = self, .begin = begin, .end = end };
+        }
+        pub fn waitForProgress(_: *@This()) !void {
+            return error.UnexpectedNativeSourceWait;
+        }
+        fn start(self: *@This()) !void {
+            try self.execution.start(self.scheduler, .{ .io = std.testing.io, .allow_wait = false, .retained_bytes = 17 }, .query);
+        }
+    };
+    const a = std.testing.allocator;
+    for (std.enums.values(Mode)) |mode| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/source.aflite", .{tmp.sub_path});
+        defer a.free(path);
+        var docs = try docs_mod.Store.createWithOptions(a, path, .{ .no_sync = true, .io = std.testing.io, .reclamation = .{ .enabled = false, .page_reuse = true } });
+        var docs_open = true;
+        defer if (docs_open) docs.close();
+        docs.maintenance_start_suppressed = true;
+        var index = index_mod.Store.init(a, &docs);
+        const storage = index.storage();
+        const bytes = try a.alloc(u8, 128 * 1024);
+        defer a.free(bytes);
+        for (bytes, 0..) |*byte, i| byte.* = @truncate(i);
+        try storage.writeFileAbsolute("/leased", bytes);
+        var backend = Backend.init(a, .{ .storage = storage });
+        var backend_open = true;
+        defer if (backend_open) backend.close();
+        var scheduler = try native.Scheduler.init(.{ .slots = 2 });
+        defer scheduler.close();
+        var scope: Scope = .{ .scheduler = &scheduler, .mode = mode };
+        try scope.start();
+        defer scope.execution.finish();
+        var bridge: read_admission.Adapter(*Scope) = .{ .budget = &scope };
+        const payload = bridge.payload();
+        const control = read_admission.Port.init(&payload);
+        const result = backend.readRunRangeAllocWithAdmission(a, "/leased", 12345, 137, control);
+        if (mode != .success) {
+            try std.testing.expectError(error.Canceled, result);
+            try std.testing.expectEqual(@as(usize, 0), backend.run_source_opens.items.len);
+            try std.testing.expectEqual(@as(usize, 0), backend.run_sources.items.len);
+            try std.testing.expect(docs.artifact_registry.?.first == null);
+            scope.execution.finish();
+            // A new scope can reopen unchanged data after the rejected source's
+            // marker, independent descriptor and generation pin have retired.
+            var retry: Scope = .{ .scheduler = &scheduler, .mode = .success };
+            try retry.start();
+            defer retry.execution.finish();
+            var retry_bridge: read_admission.Adapter(*Scope) = .{ .budget = &retry };
+            const retry_payload = retry_bridge.payload();
+            const retried = try backend.readRunRangeAllocWithAdmission(a, "/leased", 12345, 137, .init(&retry_payload));
+            defer a.free(retried);
+            try std.testing.expectEqualSlices(u8, bytes[12345..][0..137], retried);
+            retry.execution.finish();
+        } else {
+            const read = try result;
+            defer a.free(read);
+            try std.testing.expectEqualSlices(u8, bytes[12345..][0..137], read);
+            const warm = try backend.readRunRangeAllocWithAdmission(a, "/leased", 12345, 137, control);
+            defer a.free(warm);
+            try std.testing.expectEqualSlices(u8, read, warm);
+            try std.testing.expectEqual(@as(usize, 1), scope.opens);
+            const held = backend.retainCachedRunSource("/leased") orelse return error.MissingNativeSource;
+            defer held.release();
+            try storage.deleteFileAbsolute("/leased");
+            for (0..4) |_| {
+                try storage.writeFileAbsolute("/other", bytes);
+                try storage.deleteFileAbsolute("/other");
+                try docs.maintainOnce(false);
+            }
+            scope.execution.finish();
+            const checks = scope.checks;
+            docs.close();
+            docs_open = false;
+            backend.close();
+            backend_open = false;
+            var retained: [137]u8 = undefined;
+            try held.source.readInto(12345, &retained);
+            try std.testing.expectEqualSlices(u8, bytes[12345..][0..137], &retained);
+            try std.testing.expectEqual(checks, scope.checks);
+        }
+        try std.testing.expectEqual(@as(usize, 0), scheduler.stats().operations);
+        try std.testing.expectEqual(@as(u64, 0), scheduler.stats().retained_bytes);
+    }
+}
+
+test "lsm source read admission native artifact opens retire rejected scopes and preserve immutable ownership" {
+    try qualifyNativeRunSourceOpenAdmission();
+}
+
+test "lsm routing cursor local decoder admission coarse saturation is retryable and leaves no borrowed scope" {
+    for ([_]bool{ false, true }) |coarse| {
+        const a = std.testing.allocator;
+        var memory = storage_io.MemoryStorage.init(a);
+        defer memory.deinit();
+        var backend = try Backend.open(a, "/local-coarse-workspace", .{ .storage = memory.storage(), .wal_enabled = false, .flush_threshold = 1, .compact_threshold_runs = 10000, .table_block_compression = .snappy_adaptive });
+        defer backend.close();
+        var runtime = try backend.runtimeStore(a, .{ .name = "docs" });
+        defer runtime.deinit();
+        var write = try runtime.beginWrite();
+        const value: [1024]u8 = @splat('v');
+        try write.put("doc:a", &value);
+        try write.commit();
+        var read = try runtime.beginRead();
+        defer read.abort();
+        var cursor = try read.openCursor();
+        var live = true;
+        defer if (live) cursor.close();
+        var workspaces: [LocalReader.workspace_count]LocalReader.Workspace = undefined;
+        var held: usize = 0;
+        defer for (workspaces[0..held]) |*workspace| workspace.release();
+        for (&workspaces) |*workspace| {
+            workspace.* = backend.local_reader.acquire(a, null, null, 64, backend.options.local_decode_working_bytes, 0);
+            held += 1;
+        }
+        const Budget = struct {
+            checks: usize = 0,
+            pub fn checkpoint(self: *@This()) !void {
+                self.checks += 1;
+            }
+            pub fn waitForProgress(_: *@This()) !void {
+                return error.UnexpectedCoarseDecodeWait;
+            }
+        };
+        var budget: Budget = .{};
+        var adapter: read_admission.Adapter(*Budget) = .{ .budget = &budget };
+        const payload = adapter.payload();
+        const attempt = if (coarse) cursor.seekAtOrAfterWithAdmission("doc:a", .init(&payload)) else cursor.seekAtOrAfter("doc:a");
+        try std.testing.expectError(error.Backpressured, attempt);
+        cursor.close();
+        live = false;
+        const checks = budget.checks;
+        for (workspaces[0..held]) |*workspace| workspace.release();
+        held = 0;
+        for (&backend.local_reader.flights) |*flight| try std.testing.expectEqual(@as(usize, 0), flight.refs);
+        var retry = try read.openCursor();
+        defer retry.close();
+        const found = try retry.seekAtOrAfter("doc:a");
+        try std.testing.expect(found != null);
+        try std.testing.expectEqualStrings(&value, found.?.value);
+        try std.testing.expectEqual(checks, budget.checks);
+    }
+}
+
+test "LSM streaming block leased reads lend only original runnable ownership and retire rejected resumes" {
+    const scheduling = @import("../common/runnable_scheduler.zig");
+    const Mode = enum { success, begin_reject, io_failure, end_reject, both_fail, retained_dependency, resident };
+    const Scope = struct {
+        scheduler: *scheduling.Scheduler,
+        execution: scheduling.Execution = .{},
+        mode: Mode,
+        begins: usize = 0,
+        ends: usize = 0,
+        pub fn checkLifetime(self: *@This()) !void {
+            try self.execution.checkLifetime();
+        }
+        pub fn checkpoint(self: *@This()) !void {
+            try self.checkLifetime();
+        }
+        pub fn waitForProgress(_: *@This()) !void {
+            return error.TestUnexpectedReadWait;
+        }
+        fn begin(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.begins += 1;
+            if (self.mode == .begin_reject) return error.Forbidden;
+            try self.execution.park(.resource_blocked);
+        }
+        fn end(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.ends += 1;
+            if (self.mode == .end_reject or self.mode == .both_fail) return error.Canceled;
+            try self.execution.enter(.query);
+        }
+        pub fn executionBoundary(self: *@This()) ?@import("../common/execution_wait.zig").Boundary {
+            return .{ .ptr = self, .begin = begin, .end = end };
+        }
+    };
+    const Fixture = struct {
+        scope: *Scope,
+        reads: usize = 0,
+        uses: usize = 0,
+        var current: *@This() = undefined;
+        const resident: [64]u8 = @splat(42);
+        fn open(_: *anyopaque, _: Allocator, _: []const u8) !@import("../segment_source.zig").Source {
+            if (current.scope.mode == .resident) return .{ .contiguous = &resident };
+            return .{ .ranges = .{ .ptr = current, .length = 64, .read_into = read, .close = close, .acquire_use = acquire, .release_use = release } };
+        }
+        fn read(raw: *anyopaque, _: u64, out: []u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.reads += 1;
+            try std.testing.expectEqual(@as(usize, if (self.scope.mode == .retained_dependency) 1 else 0), self.scope.scheduler.stats().runnable_slots);
+            try std.testing.expectEqual(@as(u64, 17), self.scope.scheduler.stats().retained_bytes);
+            var health: scheduling.Execution = .{};
+            try health.start(self.scope.scheduler, .{ .io = std.testing.io, .allow_wait = false }, .control);
+            health.finish();
+            @memset(out, 42);
+            if (self.scope.mode == .io_failure or self.scope.mode == .both_fail) return error.InputOutput;
+        }
+        fn acquire(raw: *anyopaque) bool {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.uses += 1;
+            return true;
+        }
+        fn release(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.uses -= 1;
+        }
+        fn close(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            std.debug.assert(self.uses == 0);
+        }
+    };
+    for (std.enums.values(Mode)) |mode| {
+        var scheduler = try scheduling.Scheduler.init(.{ .slots = 2 });
+        defer scheduler.close();
+        var scope: Scope = .{ .scheduler = &scheduler, .mode = mode };
+        var fixture: Fixture = .{ .scope = &scope };
+        Fixture.current = &fixture;
+        var memory = storage_io.MemoryStorage.init(std.testing.allocator);
+        defer memory.deinit();
+        var storage = memory.storage();
+        var table = storage.vtable.*;
+        table.open_leased_immutable_source = Fixture.open;
+        storage.vtable = &table;
+        var backend = Backend.init(std.testing.allocator, .{ .storage = storage });
+        defer backend.close();
+        var reader = try backend.openRunRangeReaderWithAdmission("immutable-run", 0, 64, null);
+        var reader_live = true;
+        defer if (reader_live) reader.deinit();
+        try scope.execution.start(&scheduler, .{ .io = std.testing.io, .allow_wait = false, .retained_bytes = 17 }, .query);
+        defer scope.execution.finish();
+        var adapter: read_admission.Adapter(*Scope) = .{ .budget = &scope };
+        const payload = adapter.payload();
+        const original = read_admission.Port.init(&payload);
+        var dependency: read_admission.RetainedDependency = .{};
+        const authority = if (mode == .retained_dependency) dependency.bind(original) else original;
+        var output: [64]u8 = undefined;
+        const result = reader.readInto(0, &output, authority);
+        switch (mode) {
+            .success, .retained_dependency, .resident => {
+                try result;
+                for (output) |byte| try std.testing.expectEqual(@as(u8, 42), byte);
+            },
+            .begin_reject => try std.testing.expectError(error.Forbidden, result),
+            .io_failure => try std.testing.expectError(error.InputOutput, result),
+            .end_reject, .both_fail => try std.testing.expectError(error.Canceled, result),
+        }
+        reader.deinit();
+        reader_live = false;
+        try std.testing.expectEqual(@as(usize, 0), fixture.uses);
+        try std.testing.expectEqual(@as(usize, if (mode == .retained_dependency or mode == .resident) 0 else 1), scope.begins);
+        try std.testing.expectEqual(@as(usize, if (mode == .retained_dependency or mode == .resident or mode == .begin_reject) 0 else 1), scope.ends);
+        try std.testing.expectEqual(@as(usize, if (mode == .begin_reject or mode == .resident) 0 else 1), fixture.reads);
+        scope.execution.finish();
+        try std.testing.expectEqual(@as(usize, 0), scheduler.stats().operations);
+        try std.testing.expectEqual(@as(u64, 0), scheduler.stats().retained_bytes);
+    }
+}
+
+test "controlled physical sync WAL compound acquisition drops tentative resources before publication waits" {
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi or builtin.os.tag == .freestanding) return error.SkipZigTest;
+    const admission = @import("../common/read_admission.zig");
+    const cpu = @import("../common/runnable_scheduler.zig");
+    const now = platform.time.monotonicNs;
+    const Mode = enum { success, begin_failure, end_failure, lifetime_failure };
+    for (std.enums.values(Mode)) |mode| {
+        const a = std.testing.allocator;
+        var pool = storage_io.NativeStoragePool.initWithCapacityForTest(a, 32);
+        defer pool.deinit();
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+        defer a.free(root);
+        var backend = try Backend.open(a, root, .{ .native_storage_pool = &pool, .flush_threshold = 1024 * 1024 });
+        defer backend.close();
+        {
+            var store = try backend.runtimeStore(a, .{ .name = "docs" });
+            defer store.deinit();
+            var write = try store.beginWrite();
+            errdefer write.abort();
+            try write.put("doc", "state");
+            try write.commit();
+        }
+        var slots = try cpu.Scheduler.init(.{ .slots = 3, .control_slots = 1, .cleanup_slots = 1 });
+        defer slots.close();
+        var cleanup: cpu.Execution = .{};
+        defer cleanup.finish();
+        try cleanup.reserveCleanupRoot(&slots, .{ .io = std.testing.io, .native_now_ns = now, .allow_wait = true }, 10 * std.time.ns_per_s);
+        try cleanup.activateCleanup();
+        // A legacy query retains the sole ordinary slot while cleanup must
+        // still relinquish and reenter its protected execution capacity.
+        var query: cpu.Execution = .{};
+        defer query.finish();
+        try query.start(&slots, .{ .io = std.testing.io, .native_now_ns = now }, .query);
+        var publication = try backend.acquireWalOperationLock(.exclusive);
+        var publication_live = true;
+        defer if (publication_live) publication.release();
+        var reserved: usize = 0;
+        while (pool.tryReserveDescriptorsForTest(std.testing.io, 1)) reserved += 1;
+        defer pool.releaseDescriptorsForTest(std.testing.io, reserved);
+        try std.testing.expect(reserved != 0);
+        pool.releaseDescriptorsForTest(std.testing.io, 1);
+        reserved -= 1; // Leave exactly one completion descriptor available.
+        const expected_fds = pool.snapshotStats().fd_admitted_descriptors;
+        const Control = struct {
+            cleanup: *cpu.Execution,
+            slots: *cpu.Scheduler,
+            pool: *storage_io.NativeStoragePool,
+            publication: *Backend.WalOperationLock,
+            publication_live: *bool,
+            reserved: *usize,
+            expected_fds: usize,
+            mode: Mode,
+            begins: usize = 0,
+            fn lifetime(raw: *anyopaque) !void {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                try self.cleanup.checkLifetime();
+                if (self.begins != 0 and self.mode == .lifetime_failure) return error.DeadlineExceeded;
+            }
+            fn checkpoint(raw: *anyopaque) !void {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                try lifetime(raw);
+                if (self.slots.state(&self.cleanup.entry.?) != .running) return error.InvalidRunnableTransition;
+            }
+            fn deadline(raw: *anyopaque) !?u64 {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                return self.cleanup.entry.?.options.deadline_ns;
+            }
+            fn begin(raw: *anyopaque) !void {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                self.begins += 1;
+                if (self.publication_live.*) {
+                    // There is no tentative grant left when CPU is parked:
+                    // the publication holder can still acquire the last FD.
+                    try std.testing.expectEqual(self.expected_fds, self.pool.snapshotStats().fd_admitted_descriptors);
+                    try std.testing.expect(self.pool.tryReserveDescriptorsForTest(std.testing.io, 1));
+                    self.pool.releaseDescriptorsForTest(std.testing.io, 1);
+                    if (self.mode == .begin_failure) return error.FileNotFound;
+                }
+                try self.cleanup.park(.resource_blocked);
+                if (self.publication_live.*) {
+                    self.publication.release();
+                    self.publication_live.* = false;
+                    self.pool.releaseDescriptorsForTest(std.testing.io, self.reserved.*);
+                    self.reserved.* = 0;
+                }
+            }
+            fn end(raw: *anyopaque) !void {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                if (self.mode == .end_failure) return error.Canceled;
+                try self.cleanup.enter(.write);
+            }
+        };
+        var control: Control = .{ .cleanup = &cleanup, .slots = &slots, .pool = &pool, .publication = &publication, .publication_live = &publication_live, .reserved = &reserved, .expected_fds = expected_fds, .mode = mode };
+        const payload: admission.Payload = .{ .ptr = &control, .vtable = &.{ .checkpoint = Control.checkpoint, .check_lifetime = Control.lifetime, .deadline_ns = Control.deadline }, .execution_wait = .{ .ptr = &control, .begin = Control.begin, .end = Control.end } };
+        const original = admission.Port.init(&payload);
+        var durability_preparation: Backend.QuiescedDurabilityPreparation = .{};
+        defer durability_preparation.deinit();
+        try std.testing.expect(try backend.tryBeginQuiescedWalSyncWithAdmission(&durability_preparation, original) == null);
+        try std.testing.expectEqual(expected_fds, pool.snapshotStats().fd_admitted_descriptors);
+        const first = backend.beginQuiescedWalSyncWithAdmission(std.testing.io, &durability_preparation, original);
+        var operation: Backend.QuiescedWalSync = undefined;
+        if (mode == .success) operation = try first else {
+            try std.testing.expectError(switch (mode) {
+                .begin_failure => error.FileNotFound,
+                .end_failure => error.Canceled,
+                .lifetime_failure => error.DeadlineExceeded,
+                .success => unreachable,
+            }, first);
+            if (mode == .end_failure) try cleanup.enter(.write);
+            control.mode = .success;
+            operation = try backend.beginQuiescedWalSyncWithAdmission(std.testing.io, &durability_preparation, original);
+        }
+        defer {
+            cleanup.finish();
+            operation.deinit();
+        }
+        try std.testing.expect(try backend.tryAcquireWalOperationLock(.shared) == null);
+        control.mode = .lifetime_failure;
+        try std.testing.expectError(error.DeadlineExceeded, operation.waitWithAdmission(original));
+        // Accepted CURRENT work retains both actual publication guards even
+        // when the original scope rejects before observing its completion.
+        try std.testing.expect(try backend.tryAcquireWalOperationLock(.shared) == null);
+        control.mode = .success;
+        const result = try operation.waitWithAdmission(original);
+        try std.testing.expectEqual(@as(u64, 1), result.segment_syncs);
+        try std.testing.expectEqual(@as(u64, 1), result.index_syncs);
+        try std.testing.expect(!publication_live);
+        try std.testing.expectEqual(cpu.State.running, slots.state(&query.entry.?));
+        try std.testing.expect(control.begins != 0);
+        // Completion released both real publication locks, before the grant's
+        // explicit retirement; no backend metadata lock was retained either.
+        var acquired = (try backend.tryAcquireWalOperationLock(.shared)) orelse return error.TestUnexpectedResult;
+        acquired.release();
+        try std.testing.expect(backend.mu.tryLock());
+        backend.mu.unlock();
+        backend.closeWalOperationLockFile();
+        const without_prepared_file = pool.snapshotStats().fd_admitted_descriptors;
+        try std.testing.expectError(error.ExecutionWaitUnsupported, backend.tryBeginQuiescedWalSyncWithAdmission(&durability_preparation, original));
+        try std.testing.expect(backend.wal_operation_lock_file == null);
+        try std.testing.expectEqual(without_prepared_file, pool.snapshotStats().fd_admitted_descriptors);
+        try backend.prepareWalOperationLockFile();
+    }
+}
+
+test "controlled physical sync WAL retirement keeps peer publication blocked until accepted I/O finishes" {
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi or builtin.os.tag == .freestanding) return error.SkipZigTest;
+    const admission = @import("../common/read_admission.zig");
+    const a = std.testing.allocator;
+    var pool = storage_io.NativeStoragePool.initWithCapacityForTest(a, 32);
+    defer pool.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer a.free(root);
+    var backend = try Backend.open(a, root, .{ .native_storage_pool = &pool });
+    defer backend.close();
+    var peer = try Backend.open(a, root, .{ .native_storage_pool = &pool, .backend = .{ .read_only = true, .create_if_missing = false } });
+    defer peer.close();
+    const Control = struct {
+        fn check(_: *anyopaque) !void {}
+        fn deadline(_: *anyopaque) !?u64 {
+            return std.math.maxInt(u64);
+        }
+        fn begin(_: *anyopaque) !void {}
+        fn end(_: *anyopaque) !void {}
+    };
+    var marker: u8 = 0;
+    const payload: admission.Payload = .{ .ptr = &marker, .vtable = &.{ .checkpoint = Control.check, .check_lifetime = Control.check, .deadline_ns = Control.deadline }, .execution_wait = .{ .ptr = &marker, .begin = Control.begin, .end = Control.end } };
+    const original = admission.Port.init(&payload);
+    const before = pool.snapshotStats().fd_admitted_descriptors;
+    storage_io.NativeSyncTestControl.pause.store(true, .release);
+    storage_io.NativeSyncTestControl.started.store(false, .release);
+    storage_io.NativeSyncTestControl.release.store(false, .release);
+    storage_io.NativeSyncTestControl.reads.store(0, .release);
+    storage_io.NativeSyncTestControl.calls.store(0, .release);
+    defer {
+        storage_io.NativeSyncTestControl.release.store(true, .release);
+        storage_io.NativeSyncTestControl.pause.store(false, .release);
+    }
+    var durability_preparation: Backend.QuiescedDurabilityPreparation = .{};
+    defer durability_preparation.deinit();
+    var operation = try backend.beginQuiescedWalSyncWithAdmission(std.testing.io, &durability_preparation, original);
+    var transferred = false;
+    defer if (!transferred) {
+        storage_io.NativeSyncTestControl.release.store(true, .release);
+        operation.deinit();
+    };
+    const until = platform.time.monotonicNs() + 5 * std.time.ns_per_s;
+    while (!storage_io.NativeSyncTestControl.started.load(.acquire)) {
+        if (platform.time.monotonicNs() >= until) return error.TestUnexpectedResult;
+        try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+    }
+    const Join = struct {
+        operation: *Backend.QuiescedWalSync,
+        joining: std.Io.Event = .unset,
+        retired: std.atomic.Value(bool) = .init(false),
+        fn run(self: *@This()) void {
+            self.joining.set(std.testing.io);
+            self.operation.deinit();
+            self.retired.store(true, .release);
+        }
+    };
+    var join: Join = .{ .operation = &operation };
+    var thread = try std.testing.io.concurrent(Join.run, .{&join});
+    transferred = true;
+    defer {
+        storage_io.NativeSyncTestControl.release.store(true, .release);
+        thread.await(std.testing.io);
+    }
+    try join.joining.waitTimeout(std.testing.io, .{ .duration = .{ .raw = .fromSeconds(5), .clock = .awake } });
+    try std.testing.expect(!join.retired.load(.acquire));
+    try std.testing.expect(try peer.tryAcquireWalOperationLock(.shared) == null);
+    try std.testing.expect(backend.mu.tryLock());
+    backend.mu.unlock();
+    try std.testing.expectEqual(@as(usize, 0), storage_io.NativeSyncTestControl.reads.load(.acquire));
+    storage_io.NativeSyncTestControl.release.store(true, .release);
+    thread.await(std.testing.io);
+    try std.testing.expect(join.retired.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 1), storage_io.NativeSyncTestControl.reads.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 0), storage_io.NativeSyncTestControl.calls.load(.acquire));
+    try std.testing.expectEqual(before, pool.snapshotStats().fd_admitted_descriptors);
+    var acquired = (try peer.tryAcquireWalOperationLock(.shared)) orelse return error.TestUnexpectedResult;
+    acquired.release();
+}
+
+const ClosePreflightTestControl = struct {
+    calls: usize = 0,
+    fail_at: usize = std.math.maxInt(usize),
+    failure: anyerror = error.Cancelled,
+    fn check(raw: *anyopaque) !void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        const call = self.calls;
+        self.calls += 1;
+        if (call == self.fail_at) return self.failure;
+    }
+    fn lifetime(_: *anyopaque) !void {}
+    fn deadline(_: *anyopaque) !?u64 {
+        return std.math.maxInt(u64);
+    }
+    fn begin(_: *anyopaque) !void {
+        return error.TestUnexpectedWait;
+    }
+    fn end(_: *anyopaque) !void {}
+};
+
+test "controlled physical sync close preflight fences snapshots and resumes every accounting checkpoint without allocation" {
+    const admission = @import("../common/read_admission.zig");
+    const a = std.testing.allocator;
+    var calls: usize = 0;
+    var offset: usize = 0;
+    while (offset <= calls) : (offset += 1) {
+        for ([_]anyerror{ error.Cancelled, error.DeadlineExceeded, error.FileNotFound }) |failure| {
+            var manager = resource_manager_mod.ResourceManager.init(.{ .identity_allocator = a });
+            defer manager.deinit(a);
+            var failing = std.testing.FailingAllocator.init(a, .{});
+            const allocator = failing.allocator();
+            var backend = Backend.init(allocator, .{ .resource_manager = &manager, .wal_enabled = false });
+            defer backend.close();
+            try backend.initOutputCleanup();
+            for (0..192) |i| {
+                var key: [8]u8 = undefined;
+                std.mem.writeInt(u64, &key, i, .big);
+                try backend.mutable.upsert(allocator, .{}, &key, "value", false);
+            }
+            const cached = try backend.snapshotMutableState();
+            backend.releaseMutableReadSnapshot(cached);
+            // Shared-account flat rows must be visited in slices without
+            // charging that account again for every row or generation.
+            try backend.mutable_read_snapshot.?.ensureFlat(allocator);
+            backend.mutable_read_snapshot.?.freezeMemoryAccounting();
+            const arena = try allocator.create(State);
+            arena.* = .{};
+            var arena_transferred = false;
+            errdefer if (!arena_transferred) {
+                arena.deinit(allocator);
+                allocator.destroy(arena);
+            };
+            arena.* = try backend.mutable.cloneArena(allocator);
+            try backend.immutable_memtables.append(allocator, arena);
+            arena_transferred = true;
+            try backend.immutable_wal_ranges.append(allocator, .{});
+            // Unfrozen arena accounting walks one block per credit.
+            try std.testing.expect(arena.frozen_memory_bytes == null);
+            var accounts: [64]*state_mod.memory_account.Account = undefined;
+            var account_count: usize = 0;
+            defer {
+                backend.bulk_snapshot_accounts.clearRetainingCapacity();
+                for (accounts[0..account_count]) |account| account.release();
+            }
+            for (&accounts) |*entry| {
+                entry.* = try state_mod.memory_account.Account.create(allocator);
+                account_count += 1;
+                try backend.bulk_snapshot_accounts.put(allocator, entry.*, 1);
+            }
+            var iterator = backend.bulk_snapshot_accounts.iterator();
+            var last: *state_mod.memory_account.Account = undefined;
+            while (iterator.next()) |entry| last = entry.key_ptr.*;
+            for (accounts) |account| if (account != last) {
+                _ = backend.bulk_snapshot_accounts.remove(account);
+            };
+            try std.testing.expectEqual(@as(usize, 1), backend.bulk_snapshot_accounts.count());
+            const baseline = backend.tracked_in_memory_state_bytes;
+            var preflight: Backend.QuiescedClosePreflight = .{};
+            var control: ClosePreflightTestControl = .{ .failure = failure };
+            const payload: admission.Payload = .{ .ptr = &control, .vtable = &.{ .checkpoint = ClosePreflightTestControl.check, .check_lifetime = ClosePreflightTestControl.lifetime, .deadline_ns = ClosePreflightTestControl.deadline }, .execution_wait = .{ .ptr = &control, .begin = ClosePreflightTestControl.begin, .end = ClosePreflightTestControl.end } };
+            const original = admission.Port.init(&payload);
+            if (offset != 0) control.fail_at = offset - 1;
+            failing.fail_index = failing.alloc_index;
+            preflight.resumeWithAdmission(&backend, std.testing.io, original) catch |cause| {
+                try std.testing.expectEqual(failure, cause);
+                try std.testing.expectEqual(baseline, backend.tracked_in_memory_state_bytes);
+                control.fail_at = std.math.maxInt(usize);
+                try preflight.resumeWithAdmission(&backend, std.testing.io, original);
+            };
+            failing.fail_index = std.math.maxInt(usize);
+            if (offset == 0) calls = control.calls;
+            try std.testing.expect(preflight.detached and preflight.phase == .done);
+            try std.testing.expect(backend.mutable_read_snapshot == null);
+            try std.testing.expect(backend.retired_memory_head == cached);
+            try std.testing.expectEqual(@as(usize, 1), backend.memtable_reclaim_pending);
+            try std.testing.expectEqual(@as(usize, 0), backend.mutable_snapshot_reader_refs.items.len);
+            try std.testing.expectEqual(backend.estimateInMemoryStateBytesLocked(), preflight.bytes);
+            try std.testing.expectEqual(preflight.bytes, backend.tracked_in_memory_state_bytes);
+            try std.testing.expectEqualStrings("value", try cached.get(.{}, &@as([8]u8, @splat(0))));
+            try std.testing.expect(backend.mu.tryLock());
+            backend.mu.unlock();
+            try std.testing.expectEqual(@as(u64, 0), manager.snapshot().memory.accounting_errors);
+        }
+    }
+    try std.testing.expect(calls > 30);
+}
+
+test "controlled physical sync close preflight retains a cold legacy arena baseline through ledger allocation rejection" {
+    const admission = @import("../common/read_admission.zig");
+    const Control = struct {
+        preflight: *Backend.QuiescedClosePreflight,
+        failing: *std.testing.FailingAllocator,
+        reject: bool = true,
+        fn check(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.reject and self.preflight.phase == .reconcile) self.failing.fail_index = self.failing.alloc_index;
+        }
+        fn lifetime(_: *anyopaque) !void {}
+        fn deadline(_: *anyopaque) !?u64 {
+            return std.math.maxInt(u64);
+        }
+        fn begin(_: *anyopaque) !void {
+            return error.TestUnexpectedWait;
+        }
+        fn end(_: *anyopaque) !void {}
+    };
+    const a = std.testing.allocator;
+    var metadata = std.testing.FailingAllocator.init(a, .{});
+    var manager = resource_manager_mod.ResourceManager.init(.{ .identity_allocator = metadata.allocator() });
+    defer manager.deinit(a);
+    var backend = Backend.init(a, .{ .resource_manager = &manager, .wal_enabled = false });
+    defer backend.close();
+    try backend.initOutputCleanup();
+    backend.mutable.ordered_enabled = false;
+    try backend.mutable.upsert(a, .{}, "legacy", "retained", false);
+    const arena = try backend.mutable.ensureArenaAllocator(a);
+    _ = try arena.alloc(u8, 17 * 1024);
+    _ = try arena.alloc(u8, 65 * 1024);
+    try std.testing.expectEqual(@as(u64, 0), backend.tracked_in_memory_state_bytes);
+    var preflight: Backend.QuiescedClosePreflight = .{};
+    var control: Control = .{ .preflight = &preflight, .failing = &metadata };
+    const payload: admission.Payload = .{ .ptr = &control, .vtable = &.{ .checkpoint = Control.check, .check_lifetime = Control.lifetime, .deadline_ns = Control.deadline }, .execution_wait = .{ .ptr = &control, .begin = Control.begin, .end = Control.end } };
+    const original = admission.Port.init(&payload);
+    try std.testing.expectError(error.OutOfMemory, preflight.resumeWithAdmission(&backend, std.testing.io, original));
+    try std.testing.expect(preflight.detached and preflight.phase == .reconcile);
+    try std.testing.expectEqual(@as(u64, 0), backend.tracked_in_memory_state_bytes);
+    try std.testing.expectEqualStrings("retained", try backend.mutable.get(.{}, "legacy"));
+    const observed = preflight.bytes;
+    control.reject = false;
+    metadata.fail_index = std.math.maxInt(usize);
+    try preflight.resumeWithAdmission(&backend, std.testing.io, original);
+    try std.testing.expect(preflight.phase == .done);
+    try std.testing.expectEqual(observed, preflight.bytes);
+    try std.testing.expectEqual(backend.estimateInMemoryStateBytesLocked(), backend.tracked_in_memory_state_bytes);
+    try std.testing.expectEqual(@as(u64, 0), manager.snapshot().memory.accounting_errors);
+}
+
+test "controlled physical sync close preflight retains reader ownership across original wait rejection" {
+    const admission = @import("../common/read_admission.zig");
+    const Mode = enum { begin_failure, end_failure, lifetime_failure };
+    const Control = struct {
+        backend: *Backend,
+        snapshot: *const State,
+        mode: Mode,
+        parked: bool = false,
+        released: bool = false,
+        cached_reader: bool,
+        fn check(_: *anyopaque) !void {}
+        fn lifetime(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.parked and self.mode == .lifetime_failure) return error.DeadlineExceeded;
+        }
+        fn deadline(_: *anyopaque) !?u64 {
+            return std.math.maxInt(u64);
+        }
+        fn begin(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            std.debug.assert(self.backend.mu.tryLock());
+            defer self.backend.mu.unlock();
+            if (!self.released) {
+                if (self.cached_reader) self.backend.releaseMutableReadSnapshot(self.snapshot);
+                self.backend.releaseReader();
+                self.released = true;
+            }
+            if (self.mode == .begin_failure) return error.FileNotFound;
+            self.parked = true;
+        }
+        fn end(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.parked = false;
+            if (self.mode == .end_failure) return error.Cancelled;
+        }
+    };
+    const a = std.testing.allocator;
+    for (std.enums.values(Mode)) |mode| for ([_]bool{ false, true }) |cached_reader| {
+        var backend = Backend.init(a, .{ .wal_enabled = false });
+        defer backend.close();
+        try backend.mutable.upsert(a, .{}, "status", "old", false);
+        const snapshot = try backend.snapshotMutableState();
+        if (!cached_reader) backend.releaseMutableReadSnapshot(snapshot);
+        backend.retainReader();
+        var preflight: Backend.QuiescedClosePreflight = .{};
+        var control: Control = .{ .backend = &backend, .snapshot = snapshot, .mode = mode, .cached_reader = cached_reader };
+        const payload: admission.Payload = .{ .ptr = &control, .vtable = &.{ .checkpoint = Control.check, .check_lifetime = Control.lifetime, .deadline_ns = Control.deadline }, .execution_wait = .{ .ptr = &control, .begin = Control.begin, .end = Control.end } };
+        const original = admission.Port.init(&payload);
+        try std.testing.expectError(switch (mode) {
+            .begin_failure => error.FileNotFound,
+            .end_failure => error.Cancelled,
+            .lifetime_failure => error.DeadlineExceeded,
+        }, preflight.resumeWithAdmission(&backend, std.testing.io, original));
+        try std.testing.expect(!preflight.detached and control.released);
+        try std.testing.expect(backend.mutable_read_snapshot == snapshot and backend.retired_memory_head == null);
+        try std.testing.expectEqualStrings("old", try snapshot.get(.{}, "status"));
+        // The accepted reader completed. Retry needs no new wait boundary.
+        try preflight.resumeWithAdmission(&backend, std.testing.io, original);
+        try std.testing.expect(preflight.detached and preflight.phase == .done);
+        try std.testing.expect(backend.retired_memory_head == snapshot);
+    };
+}
+
+const MutablePublicationCreditControl = struct {
+    manager: *resource_manager_mod.ResourceManager,
+    owner: *Backend.QuiescedMutablePublication,
+    failure: anyerror = error.Cancelled,
+    hold_ready: bool = false,
+    hold_retired: bool = false,
+    held: bool = false,
+    hold_target: ?*resource_manager_mod.ResourceManager = null,
+    waits: usize = 0,
+    freeze_identity: ?*std.testing.FailingAllocator = null,
+
+    fn check(raw: *anyopaque) !void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        if (self.owner.cpu.ready) {
+            if (self.freeze_identity) |failing| failing.fail_index = failing.alloc_index;
+        }
+        if (!self.held and ((self.hold_ready and self.owner.cpu.ready) or (self.hold_retired and self.owner.cpu.retired))) {
+            std.debug.assert((self.hold_target orelse self.manager).mutex.tryLock());
+            self.held = true;
+        }
+    }
+    fn lifetime(_: *anyopaque) !void {}
+    fn wait(raw: *anyopaque) !void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        self.waits += 1;
+        // Neither preparation nor ledger waits may retain Backend.mu.
+        std.debug.assert(self.owner.backend.mu.tryLock());
+        self.owner.backend.mu.unlock();
+        if (self.hold_target != null and self.hold_target.? != self.manager) {
+            std.debug.assert(self.manager.mutex.tryLock());
+            self.manager.mutex.unlock();
+        }
+        return self.failure;
+    }
+    fn unlock(self: *@This()) void {
+        if (self.held) (self.hold_target orelse self.manager).mutex.unlock();
+        self.held = false;
+        self.hold_ready = false;
+        self.hold_retired = false;
+        self.hold_target = null;
+    }
+};
+
+test "controlled physical sync mutable publication prepays capacity and retains credit across rejected adoption and retirement" {
+    const admission = @import("../common/read_admission.zig");
+    const resources = resource_manager_mod;
+    const a = std.testing.allocator;
+    for ([_]anyerror{ error.Cancelled, error.DeadlineExceeded, error.FileNotFound }) |failure| {
+        var parent = resources.ResourceManager.init(.{ .identity_allocator = a });
+        defer parent.deinit(a);
+        var identity_failing = std.testing.FailingAllocator.init(a, .{});
+        var manager = resources.ResourceManager.init(.{ .identity_allocator = identity_failing.allocator() });
+        defer manager.deinit(a);
+        try manager.installMemoryParent(parent.memoryParentPort());
+        var failing = std.testing.FailingAllocator.init(a, .{});
+        const allocator = failing.allocator();
+        var backend = Backend.init(allocator, .{ .resource_manager = &manager, .wal_enabled = false });
+        defer backend.close();
+        try backend.mutable.upsert(allocator, .{}, "status", "old", false);
+        backend.syncTrackedInMemoryStateUsageCurrentLocked();
+        var pinned = try backend.mutable.snapshot(allocator);
+        defer pinned.deinit(allocator);
+        var source: State = .{};
+        defer source.deinit(allocator);
+        try source.upsert(allocator, .{}, "status", "new", false);
+        var owner = Backend.QuiescedMutablePublication.init(&backend, &source);
+        defer owner.deinit();
+        var control: MutablePublicationCreditControl = .{ .manager = &manager, .owner = &owner, .failure = failure };
+        defer control.unlock();
+        const payload: admission.Payload = .{ .ptr = &control, .vtable = &.{ .checkpoint = MutablePublicationCreditControl.check, .check_lifetime = MutablePublicationCreditControl.lifetime, .wait_for_progress = MutablePublicationCreditControl.wait } };
+        const original = admission.Port.init(&payload);
+        const bound = try owner.cpu.memoryBoundWithAdmission(original);
+        const before_allocations = failing.alloc_index;
+        const baseline = backend.tracked_in_memory_state_bytes;
+        const root = backend.mutable.ordered.root;
+        const builder_slice = @backingInt(resources.Slice.lsm_table_builder_working_set);
+        manager.slices[builder_slice].budget.hard_limit_bytes = bound - 1;
+        try std.testing.expectError(error.ResourceBudgetExceeded, owner.resumeWithAdmission(original));
+        try std.testing.expect(owner.credit == null);
+        try std.testing.expectEqual(before_allocations, failing.alloc_index);
+        try std.testing.expectEqual(root, backend.mutable.ordered.root);
+        manager.slices[builder_slice].budget.hard_limit_bytes = 0;
+        parent.memory.budget.hard_limit_bytes = parent.snapshot().memory.used_bytes + bound - 1;
+        try std.testing.expectError(error.ResourceBudgetExceeded, owner.resumeWithAdmission(original));
+        try std.testing.expect(owner.credit == null);
+        try std.testing.expectEqual(before_allocations, failing.alloc_index);
+        parent.memory.budget.hard_limit_bytes = 0;
+        control.hold_ready = true;
+        try std.testing.expectError(failure, owner.resumeWithAdmission(original));
+        control.unlock();
+        try std.testing.expect(owner.cpu.ready and !owner.adopted and owner.credit != null);
+        try std.testing.expectEqual(baseline, backend.tracked_in_memory_state_bytes);
+        try std.testing.expectEqual(bound, manager.sliceStats(.lsm_table_builder_working_set).used_bytes);
+        const prepared = owner.cpu.candidate.ordered.root;
+        failing.fail_index = failing.alloc_index;
+        identity_failing.fail_index = identity_failing.alloc_index;
+        try owner.resumeWithAdmission(original);
+        try std.testing.expect(owner.adopted);
+        try std.testing.expectEqual(prepared, owner.cpu.candidate.ordered.root);
+        try std.testing.expectEqual(backend.estimateInMemoryStateBytesWithCandidateLocked(&owner.cpu.candidate), backend.tracked_in_memory_state_bytes);
+        // Publication needs neither additional heap nor the held ledger.
+        std.debug.assert(manager.mutex.tryLock());
+        owner.publish();
+        manager.mutex.unlock();
+        failing.fail_index = std.math.maxInt(usize);
+        try std.testing.expectEqualStrings("new", try backend.mutable.get(.{}, "status"));
+        try std.testing.expectEqualStrings("old", try pinned.get(.{}, "status"));
+        const charged = backend.tracked_in_memory_state_bytes;
+        control.hold_target = &parent;
+        control.hold_retired = true;
+        try std.testing.expectError(failure, owner.retireWithAdmission(original));
+        control.unlock();
+        try std.testing.expect(owner.cpu.retired and !owner.retired and owner.credit != null);
+        try std.testing.expectEqual(charged, backend.tracked_in_memory_state_bytes);
+        try owner.retireWithAdmission(original);
+        try std.testing.expect(owner.retired and owner.credit == null);
+        try std.testing.expectEqual(backend.estimateInMemoryStateBytesLocked(), backend.tracked_in_memory_state_bytes);
+        try std.testing.expectEqual(@as(u64, 0), manager.sliceStats(.lsm_table_builder_working_set).used_bytes);
+        try std.testing.expectEqual(@as(u64, 0), manager.snapshot().memory.accounting_errors);
+        try std.testing.expectEqual(@as(u64, 0), parent.snapshot().memory.accounting_errors);
+        try std.testing.expectEqual(@as(usize, 2), control.waits);
+    }
+}
+
+test "controlled physical sync mutable publication abandonment keeps producer credit separate and retires partial new accounts" {
+    const admission = @import("../common/read_admission.zig");
+    const a = std.testing.allocator;
+    for ([_]bool{ false, true }) |allocation_failure| {
+        var identity_failing = std.testing.FailingAllocator.init(a, .{});
+        var manager = resource_manager_mod.ResourceManager.init(.{ .identity_allocator = identity_failing.allocator() });
+        defer manager.deinit(a);
+        var failing = std.testing.FailingAllocator.init(a, .{});
+        const allocator = failing.allocator();
+        var backend = Backend.init(allocator, .{ .resource_manager = &manager, .wal_enabled = false });
+        defer backend.close();
+        var producer: ActiveMemTable = .{ .ordered_enabled = false };
+        defer producer.deinit(allocator);
+        try producer.upsert(allocator, .{}, "status", "producer-owned", false);
+        var source = try producer.clone(allocator);
+        defer source.deinit(allocator);
+        var owner = Backend.QuiescedMutablePublication.init(&backend, &source);
+        defer owner.deinit();
+        var control: MutablePublicationCreditControl = .{ .manager = &manager, .owner = &owner, .freeze_identity = &identity_failing };
+        defer control.unlock();
+        const payload: admission.Payload = .{ .ptr = &control, .vtable = &.{ .checkpoint = MutablePublicationCreditControl.check, .check_lifetime = MutablePublicationCreditControl.lifetime, .wait_for_progress = MutablePublicationCreditControl.wait } };
+        const original = admission.Port.init(&payload);
+        if (allocation_failure) failing.fail_index = failing.alloc_index + 3;
+        const result = owner.resumeWithAdmission(original);
+        failing.fail_index = std.math.maxInt(usize);
+        if (allocation_failure) {
+            try std.testing.expectError(error.OutOfMemory, result);
+            try std.testing.expect(!owner.adopted and owner.credit != null);
+        } else {
+            try result;
+            try std.testing.expect(owner.adopted);
+            try std.testing.expect(owner.cpu.candidate.entryAt(0).shared != producer.entryAt(0).shared);
+        }
+        try std.testing.expect(producer.entryAt(0).shared.?.account == null);
+        control.hold_retired = true;
+        try std.testing.expectError(error.Cancelled, owner.retireWithAdmission(original));
+        control.unlock();
+        try std.testing.expect(owner.meter == null and owner.cpu.retired and owner.credit != null);
+        try std.testing.expectEqualStrings("producer-owned", try producer.get(.{}, "status"));
+        try owner.retireWithAdmission(original);
+        try std.testing.expectEqual(backend.estimateInMemoryStateBytesLocked(), backend.tracked_in_memory_state_bytes);
+        try std.testing.expectEqual(@as(u64, 0), manager.sliceStats(.lsm_table_builder_working_set).used_bytes);
+        try std.testing.expectEqual(@as(u64, 0), manager.snapshot().memory.accounting_errors);
+    }
+}
+
+test "controlled physical sync backend WAL append owns actual publication and a prepared mutable successor" {
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi or builtin.os.tag == .freestanding) return error.SkipZigTest;
+    const Mode = enum { publish, abandon, partial_failure };
+    const admission = @import("../common/read_admission.zig");
+    const Control = struct {
+        fn check(_: *anyopaque) !void {}
+        fn deadline(_: *anyopaque) !?u64 {
+            return std.math.maxInt(u64);
+        }
+        fn begin(_: *anyopaque) !void {}
+        fn end(_: *anyopaque) !void {}
+    };
+    for (std.enums.values(Mode)) |mode| {
+        const a = std.testing.allocator;
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+        defer a.free(root);
+        var pool = storage_io.NativeStoragePool.initWithCapacityForTest(a, 16);
+        defer pool.deinit();
+        var manager = resource_manager_mod.ResourceManager.init(.{ .identity_allocator = a });
+        defer manager.deinit(a);
+        var backend: Backend = undefined;
+        try backend.openInto(a, root, .{ .native_storage_pool = &pool, .resource_manager = &manager });
+        defer backend.close();
+        var marker: u8 = 0;
+        const payload: admission.Payload = .{ .ptr = &marker, .vtable = &.{ .checkpoint = Control.check, .check_lifetime = Control.check, .deadline_ns = Control.deadline }, .execution_wait = .{ .ptr = &marker, .begin = Control.begin, .end = Control.end } };
+        const original = admission.Port.init(&payload);
+        // Establish the existing allocation baseline before the delta owner.
+        // This fresh fixture has only fixed cleanup-queue metadata to observe.
+        try manager.adjustUsageWithAdmission(.lsm_in_memory_state, &backend.tracked_in_memory_state_bytes, backend.estimateInMemoryStateBytesLocked(), original);
+        var incoming: ActiveMemTable = .{ .ordered_enabled = false };
+        defer incoming.deinit(a);
+        try incoming.upsert(a, .{ .name = "docs" }, "final", "status", false);
+        var source = try incoming.toStateMove(a);
+        defer source.deinit(a);
+        var preparation = Backend.QuiescedMutablePublication.init(&backend, &source);
+        defer preparation.deinit();
+        try preparation.resumeWithAdmission(original);
+        const record = try wal_mod.prepareStateRecordWithAdmission(a, &preparation.cpu.source, original);
+        defer a.free(record);
+        var published = false;
+        var recover = false;
+        var releases: usize = 0;
+        const Publication = struct {
+            backend: *Backend,
+            preparation: *Backend.QuiescedMutablePublication,
+            published: *bool,
+            recover: *bool,
+            releases: *usize,
+            pub fn publish(self: *@This(), _: wal_mod.AppendResult) void {
+                std.debug.assert(!self.published.*);
+                std.debug.assert(self.backend.mutable_read_snapshot == null);
+                self.preparation.publish();
+                self.published.* = true;
+            }
+            pub fn requireRecovery(self: *@This()) void {
+                self.recover.* = true;
+            }
+            pub fn release(self: *@This()) void {
+                self.releases.* += 1;
+            }
+        };
+        const publication: Publication = .{ .backend = &backend, .preparation = &preparation, .published = &published, .recover = &recover, .releases = &releases };
+        const baseline_fds = pool.snapshotStats().fd_admitted_descriptors;
+        var held = try backend.acquireWalOperationLock(.exclusive);
+        var held_live = true;
+        defer if (held_live) held.release();
+        var durability_preparation: Backend.QuiescedDurabilityPreparation = .{};
+        defer durability_preparation.deinit();
+        try std.testing.expect(try backend.tryBeginQuiescedWalAppendWithAdmission(&durability_preparation, record, publication, original) == null);
+        try std.testing.expectEqual(baseline_fds, pool.snapshotStats().fd_admitted_descriptors);
+        try std.testing.expect(!published and releases == 0);
+        try std.testing.expectError(error.CorruptLsmWal, backend.tryBeginQuiescedWalAppendWithAdmission(&durability_preparation, "bad", publication, original));
+        held.release();
+        held_live = false;
+        const before_records = backend.write_stats.wal_append_records;
+        const before_entries = backend.write_stats.wal_append_entries;
+        if (mode == .partial_failure) storage_io.NativeSyncTestControl.append_failure_after.store(3, .release);
+        defer storage_io.NativeSyncTestControl.append_failure_after.store(std.math.maxInt(usize), .release);
+        var operation = try backend.beginQuiescedWalAppendWithAdmission(std.testing.io, &durability_preparation, record, publication, original);
+        var live = true;
+        defer if (live) operation.deinit();
+        try std.testing.expect(try backend.tryAcquireWalOperationLock(.shared) == null);
+        try std.testing.expect(backend.mu.tryLock());
+        backend.mu.unlock();
+        if (mode == .partial_failure) {
+            try std.testing.expectError(error.NoSpaceLeft, operation.publishWithAdmission(original));
+            try std.testing.expect(!published and recover and releases == 1);
+        } else {
+            _ = try operation.waitWithAdmission(original);
+            try std.testing.expect(try backend.tryAcquireWalOperationLock(.shared) == null);
+            try std.testing.expectError(error.NotFound, backend.mutable.get(.{ .name = "docs" }, "final"));
+            if (mode == .publish) {
+                _ = try operation.publishWithAdmission(original);
+                _ = try operation.publishWithAdmission(original);
+                try std.testing.expect(published and !recover and releases == 1);
+                try std.testing.expectEqualStrings("status", try backend.mutable.get(.{ .name = "docs" }, "final"));
+                try std.testing.expectEqual(before_records + 1, backend.write_stats.wal_append_records);
+                try std.testing.expectEqual(before_entries + 1, backend.write_stats.wal_append_entries);
+            } else {
+                operation.deinit();
+                live = false;
+                try std.testing.expect(!published and recover and releases == 1);
+                try std.testing.expectError(error.NotFound, backend.mutable.get(.{ .name = "docs" }, "final"));
+            }
+        }
+        try std.testing.expectEqual(mode != .publish, backend.manifest_recovery_required);
+        if (mode != .publish) try std.testing.expectError(error.RecoveryRequired, backend.tryBeginQuiescedWalAppendWithAdmission(&durability_preparation, record, publication, original));
+        var shared = (try backend.tryAcquireWalOperationLock(.shared)) orelse return error.TestUnexpectedResult;
+        shared.release();
+        try preparation.retireWithAdmission(original);
+        try std.testing.expectEqual(backend.estimateInMemoryStateBytesLocked(), backend.tracked_in_memory_state_bytes);
+        try std.testing.expectEqual(@as(u64, 0), manager.snapshot().memory.accounting_errors);
+    }
+}
+
+test "controlled physical sync sorted manifest planning resumes every rejection without allocation" {
+    const admission = @import("../common/read_admission.zig");
+    const manifest = @import("lsm_backend/manifest_credit.zig");
+    const Control = struct {
+        calls: usize = 0,
+        stop: usize = std.math.maxInt(usize),
+        failure: anyerror = error.Canceled,
+        fn check(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const call = self.calls;
+            self.calls += 1;
+            if (call == self.stop) return self.failure;
+        }
+        fn partition(key: []const u8) []const u8 {
+            return key;
+        }
+        fn admitted(key: []const u8, original: admission.Port) ![]const u8 {
+            try original.checkpoint();
+            return partition(key);
+        }
+    };
+    const a = std.testing.allocator;
+    var data: State = .{};
+    defer data.deinit(a);
+    const name = try a.alloc(u8, 70 * 1024);
+    defer a.free(name);
+    @memset(name, 'n');
+    const key = try a.alloc(u8, 70 * 1024);
+    defer a.free(key);
+    @memset(key, 'k');
+    for ([_]?[]const u8{ null, "", name }) |namespace| {
+        for ([_]u8{ 'a', 'b' }) |last| {
+            key[key.len - 1] = last;
+            try data.upsert(a, .{ .name = namespace }, key, "value", false);
+        }
+    }
+    for (0..4) |mode| {
+        var options: Options = .{};
+        if (mode == 1) options.run_partition_prefix_bytes = key.len;
+        if (mode == 2) {
+            options.run_partition_key = Control.partition;
+            options.run_partition_key_with_admission = Control.admitted;
+        }
+        if (mode == 3) {
+            options.run_partition_prefix_bytes = 1;
+            options.max_run_file_physical_bytes = 64 * 1024;
+            options.max_run_file_entries = 2;
+        }
+        const expected = try manifest.estimate(a, options, 71, &data, &@as(State, .{}));
+        var calls: usize = 0;
+        for ([_]anyerror{ error.Canceled, error.DeadlineExceeded, error.FileNotFound }) |failure| {
+            var stop: usize = 0;
+            while (stop <= calls) : (stop += 1) {
+                var control: Control = .{ .stop = if (stop == 0) std.math.maxInt(usize) else stop - 1, .failure = failure };
+                const payload: admission.Payload = .{ .ptr = &control, .vtable = &.{ .checkpoint = Control.check } };
+                const original = admission.Port.init(&payload);
+                var plan: manifest.SortedEstimate = .{};
+                const actual = plan.resumeWithAdmission(options, 71, &data, original) catch |cause| blk: {
+                    try std.testing.expectEqual(failure, cause);
+                    control.stop = std.math.maxInt(usize);
+                    break :blk try plan.resumeWithAdmission(options, 71, &data, original);
+                };
+                try std.testing.expectEqual(expected, actual);
+                try std.testing.expect(plan.complete and plan.index == data.entryCount());
+                if (stop == 0) calls = control.calls;
+                try std.testing.expectEqual(expected, try plan.resumeWithAdmission(options, 71, &data, original));
+            }
+        }
+    }
+}
+
+test "controlled physical sync tentative WAL grants survive publication races and rejected retirement" {
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi or builtin.os.tag == .freestanding) return error.SkipZigTest;
+    const Hook = struct {
+        var active: *@This() = undefined;
+        backend: *Backend,
+        storage: storage_io.Storage,
+        publication: ?Backend.WalOperationLock = null,
+        race: bool,
+        reject_dispatch: bool = false,
+        reject_end: bool = true,
+        reject_begin: bool = false,
+        begins: usize = 0,
+        ends: usize = 0,
+        fn prepared(grant: ?storage_io.DurabilityResources) !?storage_io.DurabilityResources {
+            if (grant != null) {
+                if (active.race) active.publication = try active.backend.acquireWalOperationLock(.exclusive) else active.reject_dispatch = true;
+            }
+            return grant;
+        }
+        fn sync(raw: *anyopaque, original: read_admission.Port) !?storage_io.DurabilityResources {
+            return prepared(try active.storage.vtable.try_prepare_durability_with_admission.?(raw, original));
+        }
+        fn append(raw: *anyopaque, bytes: []const u8, original: read_admission.Port) !?storage_io.DurabilityResources {
+            return prepared(try active.storage.vtable.try_prepare_append_with_admission.?(raw, bytes, original));
+        }
+        fn check(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.reject_dispatch) {
+                self.reject_dispatch = false;
+                return error.FileNotFound;
+            }
+        }
+        fn lifetime(_: *anyopaque) !void {}
+        fn deadline(_: *anyopaque) !?u64 {
+            return std.math.maxInt(u64);
+        }
+        fn begin(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.begins += 1;
+            if (self.reject_begin) return error.Canceled;
+        }
+        fn end(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.ends += 1;
+            if (self.reject_end) return error.Canceled;
+        }
+    };
+    const Payload = struct {
+        pub fn publish(_: *@This(), _: wal_mod.AppendResult) void {
+            unreachable;
+        }
+        pub fn requireRecovery(_: *@This()) void {
+            unreachable;
+        }
+        pub fn release(_: *@This()) void {
+            unreachable;
+        }
+    };
+    for ([_]bool{ false, true }) |append| for ([_]bool{ false, true }) |race| for ([_]bool{ false, true }) |reject_begin| {
+        const a = std.testing.allocator;
+        var pool = storage_io.NativeStoragePool.initWithCapacityForTest(a, 16);
+        defer pool.deinit();
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+        defer a.free(root);
+        var backend: Backend = undefined;
+        try backend.openInto(a, root, .{ .native_storage_pool = &pool });
+        defer backend.abandonAfterCrash();
+        var hook: Hook = .{ .backend = &backend, .storage = backend.storage.?, .race = race, .reject_begin = reject_begin };
+        Hook.active = &hook;
+        defer if (hook.publication) |*guard| guard.release();
+        const payload: read_admission.Payload = .{ .ptr = &hook, .vtable = &.{ .checkpoint = Hook.check, .check_lifetime = Hook.lifetime, .deadline_ns = Hook.deadline }, .execution_wait = .{ .ptr = &hook, .begin = Hook.begin, .end = Hook.end } };
+        const original = read_admission.Port.init(&payload);
+        var source: State = .{};
+        defer source.deinit(a);
+        try source.upsert(a, .{ .name = "docs" }, "key", "value", false);
+        const record = try wal_mod.prepareStateRecordWithAdmission(a, &source, original);
+        defer a.free(record);
+        var vtable = hook.storage.vtable.*;
+        vtable.try_prepare_durability_with_admission = Hook.sync;
+        vtable.try_prepare_append_with_admission = Hook.append;
+        backend.storage.?.vtable = &vtable;
+        defer backend.storage = hook.storage;
+        var preparation: Backend.QuiescedDurabilityPreparation = .{};
+        defer preparation.deinit();
+        const fds = pool.snapshotStats().fd_admitted_descriptors;
+        const reads = storage_io.NativeSyncTestControl.reads.load(.acquire);
+        const appends = storage_io.NativeSyncTestControl.appends.load(.acquire);
+        if (append) {
+            try std.testing.expectError(error.Canceled, backend.tryBeginQuiescedWalAppendWithAdmission(&preparation, record, Payload{}, original));
+        } else {
+            try std.testing.expectError(error.Canceled, backend.tryBeginQuiescedWalSyncWithAdmission(&preparation, original));
+        }
+        // Rejected join entry or return still owns the descriptor and frozen
+        // append bytes. Retry retires that same grant without replay.
+        try std.testing.expect(preparation.resources != null);
+        try std.testing.expectEqual(fds + 1, pool.snapshotStats().fd_admitted_descriptors);
+        try std.testing.expectEqual(@as(usize, 1), hook.begins);
+        try std.testing.expectEqual(@as(usize, if (reject_begin) 0 else 1), hook.ends);
+        hook.reject_end = false;
+        hook.reject_begin = false;
+        // Retirement precedes fresh backend policy checks, so a changed
+        // policy cannot strand a tentative grant or replace its saved error.
+        backend.manifest_recovery_required = true;
+        if (append) {
+            const result = backend.tryBeginQuiescedWalAppendWithAdmission(&preparation, record, Payload{}, original);
+            if (race) try std.testing.expect(try result == null) else try std.testing.expectError(error.FileNotFound, result);
+        } else {
+            const result = backend.tryBeginQuiescedWalSyncWithAdmission(&preparation, original);
+            if (race) try std.testing.expect(try result == null) else try std.testing.expectError(error.FileNotFound, result);
+        }
+        try std.testing.expect(preparation.resources == null);
+        try std.testing.expectEqual(fds, pool.snapshotStats().fd_admitted_descriptors);
+        try std.testing.expectEqual(@as(usize, if (reject_begin) 2 else 1), hook.begins);
+        backend.manifest_recovery_required = false;
+        try std.testing.expectEqual(reads, storage_io.NativeSyncTestControl.reads.load(.acquire));
+        try std.testing.expectEqual(appends, storage_io.NativeSyncTestControl.appends.load(.acquire));
+        try std.testing.expectEqual(@as(u64, 0), backend.write_stats.wal_append_records);
+        try std.testing.expect(!backend.manifest_recovery_required);
+    };
+}
+
+test "controlled physical sync close preparation reclaims retired memory under original CPU without early refund" {
+    const cpu = @import("../common/runnable_scheduler.zig");
+    const ledger_mod = @import("lsm_backend/ledger_reclamation.zig");
+    const Control = struct {
+        backend: *Backend,
+        preparation: *Backend.QuiescedClosePreparation,
+        cleanup: *cpu.Execution,
+        slots: *cpu.Scheduler,
+        calls: usize = 0,
+        fail_at: usize = std.math.maxInt(usize),
+        failure: anyerror,
+        progress_turns: usize = 0,
+        apply_pressure: bool = false,
+        pressure_checked: bool = false,
+        fn check(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try self.cleanup.checkLifetime();
+            try std.testing.expectEqual(cpu.State.running, self.slots.state(&self.cleanup.entry.?));
+            try std.testing.expect(self.backend.mu.tryLock());
+            self.backend.mu.unlock();
+            if (self.preparation.phase == .memtables or self.preparation.phase == .ledgers) {
+                // Physical frees never refund shared allocations piecemeal.
+                try std.testing.expectEqual(self.preparation.before.bytes, self.backend.tracked_in_memory_state_bytes);
+                if (self.apply_pressure and !self.pressure_checked) {
+                    const manager = self.backend.options.resource_manager.?;
+                    manager.memory.budget.hard_limit_bytes = manager.snapshot().memory.used_bytes;
+                    try std.testing.expectError(error.ResourceBudgetExceeded, manager.reserve(.lsm_wal_write_working_set, 1));
+                    self.pressure_checked = true;
+                }
+                try self.cleanup.park(.resource_blocked);
+                var control: cpu.Execution = .{};
+                defer control.finish();
+                try control.start(self.slots, .{ .io = std.testing.io, .native_now_ns = platform.time.monotonicNs }, .control);
+                self.progress_turns += 1;
+                control.finish();
+                try self.cleanup.enter(.write);
+            }
+            const call = self.calls;
+            self.calls += 1;
+            if (call == self.fail_at) return self.failure;
+        }
+        fn lifetime(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try self.cleanup.checkLifetime();
+        }
+        fn deadline(_: *anyopaque) !?u64 {
+            return std.math.maxInt(u64);
+        }
+        fn begin(_: *anyopaque) !void {
+            return error.TestUnexpectedWait;
+        }
+        fn end(_: *anyopaque) !void {}
+    };
+    const a = std.testing.allocator;
+    var count: usize = 0;
+    var offset: usize = 0;
+    while (offset <= count) : (offset += 1) {
+        for ([_]anyerror{ error.Canceled, error.DeadlineExceeded, error.FileNotFound }) |failure| {
+            var manager = resource_manager_mod.ResourceManager.init(.{ .identity_allocator = a });
+            defer manager.deinit(a);
+            var failing = std.testing.FailingAllocator.init(a, .{});
+            const allocator = failing.allocator();
+            var backend = Backend.init(allocator, .{ .resource_manager = &manager, .wal_enabled = false });
+            defer backend.close();
+            for (0..96) |i| {
+                var key: [8]u8 = undefined;
+                std.mem.writeInt(u64, &key, i, .big);
+                try backend.mutable.upsert(allocator, .{}, &key, "live", false);
+            }
+            for (0..3) |kind| {
+                const retired = try allocator.create(State);
+                retired.* = switch (kind) {
+                    0 => try backend.mutable.snapshot(allocator),
+                    1 => try backend.mutable.clone(allocator),
+                    else => try backend.mutable.cloneArena(allocator),
+                };
+                retired.freezeMemoryAccounting();
+                @import("lsm_backend/memtable_reclamation.zig").retire(&backend, retired);
+            }
+            const cached = try backend.snapshotMutableState();
+            backend.releaseMutableReadSnapshot(cached);
+            // Preserve a live ledger root shared by one retired snapshot and
+            // an old-only root owned solely by another retired snapshot.
+            var old: repository_mod.ObsoleteLedger = .empty;
+            defer old.deinit(allocator);
+            for (0..96) |i| {
+                const path = try std.fmt.allocPrint(allocator, "live-{d}", .{i});
+                try backend.obsolete_paths.append(allocator, .{ .path = path, .delete_after_ns = 0 });
+                const retired_path = try std.fmt.allocPrint(allocator, "old-{d}", .{i});
+                try old.append(allocator, .{ .path = retired_path, .delete_after_ns = 0 });
+            }
+            const active = try ledger_mod.Snapshot.capture(&backend, &backend.obsolete_paths);
+            defer active.retire(&backend);
+            const shared = try ledger_mod.Snapshot.capture(&backend, &backend.obsolete_paths);
+            shared.retire(&backend);
+            const unique = try ledger_mod.Snapshot.capture(&backend, &old);
+            unique.retire(&backend);
+            old.deinit(allocator);
+            var slots = try cpu.Scheduler.init(.{ .slots = 3, .control_slots = 1, .cleanup_slots = 1 });
+            defer slots.close();
+            var cleanup: cpu.Execution = .{};
+            defer cleanup.finish();
+            try cleanup.reserveCleanupRoot(&slots, .{ .io = std.testing.io, .native_now_ns = platform.time.monotonicNs, .allow_wait = true }, 10 * std.time.ns_per_s);
+            try cleanup.activateCleanup();
+            // Ordinary work holds its only slot throughout every destructor
+            // quantum; the cleanup owner can still yield to reserved control.
+            var query: cpu.Execution = .{};
+            defer query.finish();
+            try query.start(&slots, .{ .io = std.testing.io, .native_now_ns = platform.time.monotonicNs }, .query);
+            var preparation: Backend.QuiescedClosePreparation = .{};
+            var control: Control = .{ .backend = &backend, .preparation = &preparation, .cleanup = &cleanup, .slots = &slots, .failure = failure, .apply_pressure = offset == 0 };
+            const payload: read_admission.Payload = .{ .ptr = &control, .vtable = &.{ .checkpoint = Control.check, .check_lifetime = Control.lifetime, .deadline_ns = Control.deadline }, .execution_wait = .{ .ptr = &control, .begin = Control.begin, .end = Control.end } };
+            const original = read_admission.Port.init(&payload);
+            if (offset != 0) control.fail_at = offset - 1;
+            const allocs = failing.alloc_index;
+            failing.fail_index = allocs;
+            preparation.resumeWithAdmission(&backend, std.testing.io, original) catch |cause| {
+                try std.testing.expectEqual(failure, cause);
+                // The same backend queues/partial destructors survive retry;
+                // the caller never constructs replacement retirement owners.
+                control.fail_at = std.math.maxInt(usize);
+                try preparation.resumeWithAdmission(&backend, std.testing.io, original);
+            };
+            failing.fail_index = std.math.maxInt(usize);
+            if (offset == 0) count = control.calls;
+            try std.testing.expectEqual(allocs, failing.alloc_index);
+            try std.testing.expect(preparation.phase == .done);
+            try std.testing.expect(control.progress_turns > 4);
+            try std.testing.expect(backend.retired_memory_head == null and backend.retired_memory_tail == null and backend.memtable_reclaimer == null);
+            try std.testing.expectEqual(@as(usize, 0), backend.memtable_reclaim_pending);
+            try std.testing.expect(backend.ledger_snapshots == active and backend.retired_ledger_snapshots == null and backend.retired_ledger_tail == null);
+            try std.testing.expect(!active.retired and active.active_next == null and active.active_previous == null);
+            try std.testing.expectEqual(@as(usize, 96), active.value.count());
+            try std.testing.expect(preparation.after.bytes < preparation.before.bytes);
+            try std.testing.expectEqual(backend.estimateInMemoryStateBytesLocked(), backend.tracked_in_memory_state_bytes);
+            try std.testing.expectEqual(preparation.after.bytes, backend.tracked_in_memory_state_bytes);
+            try std.testing.expectEqual(@as(usize, 96), backend.obsolete_paths.count());
+            try std.testing.expectEqualStrings("live", try backend.mutable.get(.{}, &@as([8]u8, @splat(0))));
+            try std.testing.expectEqual(cpu.State.running, slots.state(&query.entry.?));
+            if (control.apply_pressure) {
+                try std.testing.expect(control.pressure_checked);
+                // The aggregate ceiling has not increased: only physical
+                // reclamation and reconciliation permit fresh WAL capacity.
+                var completion = try manager.reserve(.lsm_wal_write_working_set, 64);
+                completion.release();
+            }
+            try std.testing.expectEqual(@as(u64, 0), manager.snapshot().memory.accounting_errors);
+        }
+    }
+    try std.testing.expect(count > 20);
+}
+
+test "controlled physical sync interrupted close reclamation retains legacy destruction ownership" {
+    const Phase = enum { memtables, ledgers, reconcile };
+    const Control = struct {
+        backend: *Backend,
+        preparation: *Backend.QuiescedClosePreparation,
+        phase: Phase,
+        rejected: bool = false,
+        fn check(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const ready = switch (self.phase) {
+                .memtables => self.preparation.phase == .memtables and self.backend.memtable_reclaimer != null,
+                .ledgers => self.preparation.phase == .ledgers and self.backend.ledger_reclaim_slices != 0,
+                .reconcile => self.preparation.phase == .reconcile,
+            };
+            if (ready) {
+                self.rejected = true;
+                return error.Canceled;
+            }
+        }
+        fn lifetime(_: *anyopaque) !void {}
+        fn deadline(_: *anyopaque) !?u64 {
+            return std.math.maxInt(u64);
+        }
+        fn begin(_: *anyopaque) !void {
+            return error.TestUnexpectedWait;
+        }
+        fn end(_: *anyopaque) !void {}
+    };
+    const a = std.testing.allocator;
+    for (std.enums.values(Phase)) |phase| {
+        var manager = resource_manager_mod.ResourceManager.init(.{ .identity_allocator = a });
+        defer manager.deinit(a);
+        var failing = std.testing.FailingAllocator.init(a, .{});
+        const allocator = failing.allocator();
+        var backend = Backend.init(allocator, .{ .resource_manager = &manager, .wal_enabled = false });
+        var live = true;
+        defer if (live) backend.close();
+        for (0..96) |i| {
+            var key: [8]u8 = undefined;
+            std.mem.writeInt(u64, &key, i, .big);
+            try backend.mutable.upsert(allocator, .{}, &key, "live", false);
+        }
+        const retired = try allocator.create(State);
+        retired.* = try backend.mutable.clone(allocator);
+        retired.freezeMemoryAccounting();
+        @import("lsm_backend/memtable_reclamation.zig").retire(&backend, retired);
+        var ledger: repository_mod.ObsoleteLedger = .empty;
+        defer ledger.deinit(allocator);
+        for (0..96) |i| {
+            const path = try std.fmt.allocPrint(allocator, "old-{d}", .{i});
+            try ledger.append(allocator, .{ .path = path, .delete_after_ns = 0 });
+        }
+        const snapshot = try @import("lsm_backend/ledger_reclamation.zig").Snapshot.capture(&backend, &ledger);
+        snapshot.retire(&backend);
+        ledger.deinit(allocator);
+        var preparation: Backend.QuiescedClosePreparation = .{};
+        var control: Control = .{ .backend = &backend, .preparation = &preparation, .phase = phase };
+        const payload: read_admission.Payload = .{ .ptr = &control, .vtable = &.{ .checkpoint = Control.check, .check_lifetime = Control.lifetime, .deadline_ns = Control.deadline }, .execution_wait = .{ .ptr = &control, .begin = Control.begin, .end = Control.end } };
+        const original = read_admission.Port.init(&payload);
+        failing.fail_index = failing.alloc_index;
+        try std.testing.expectError(error.Canceled, preparation.resumeWithAdmission(&backend, std.testing.io, original));
+        try std.testing.expect(control.rejected);
+        try std.testing.expectEqual(preparation.before.bytes, backend.tracked_in_memory_state_bytes);
+        if (phase == .reconcile) {
+            try std.testing.expect(backend.memtable_reclaimer == null and backend.retired_memory_head == null and backend.retired_ledger_snapshots == null);
+        }
+        // Explicit legacy teardown must finish the same partial destructors;
+        // it has no admission callback and cannot allocate replacement owners.
+        backend.close();
+        live = false;
+        try std.testing.expectEqual(@as(u64, 0), manager.sliceStats(.lsm_in_memory_state).used_bytes);
+        try std.testing.expectEqual(@as(u64, 0), manager.snapshot().memory.accounting_errors);
+        try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+    }
+}
+
+test "controlled physical sync writer recovery inventories both atomic schemes without reclaiming unrelated or mounted files" {
+    if (comptime @import("builtin").os.tag == .freestanding or @import("builtin").os.tag == .windows or @import("builtin").os.tag == .wasi) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = repository_mod.tmpPath(&path_buf, "owned-inventory-recovery");
+    defer repository_mod.cleanupTmp(path);
+    const root = std.mem.span(path);
+    {
+        var backend = try Backend.open(a, root, .{ .flush_threshold = 1 });
+        defer backend.close();
+        var txn = try backend.beginWrite();
+        errdefer txn.abort();
+        try txn.put(.{}, "key", "durable value");
+        try txn.commit();
+    }
+    const names = [_][]const u8{
+        "runs/123456.tbl.owned-42.tmp",
+        "runs/123456.tbl.tmp-43",
+        "manifest-99999.checkpoint.owned-123.tmp",
+        "manifest.bin.owned-456.tmp",
+        "manifest-99998.journal.tmp-789",
+        "manifest.bin.owned-x.tmp",
+        "unrelated.owned-1.tmp",
+        "runs/not-a-run.tbl.owned-1.tmp",
+    };
+    var native = try storage_io.NativeStorage.init(std.heap.page_allocator, .threaded);
+    defer native.deinit();
+    var paths: [names.len][]u8 = undefined;
+    var initialized: usize = 0;
+    defer for (paths[0..initialized]) |owned| a.free(owned);
+    for (names, &paths) |name, *owned| {
+        owned.* = try std.fs.path.join(a, &.{ root, name });
+        initialized += 1;
+        try native.storage().writeFileAbsolute(owned.*, "crash leftover");
+    }
+    {
+        var reader = try Backend.open(a, root, .{ .backend = .{ .read_only = true } });
+        defer reader.close();
+        for (paths) |owned| try std.Io.Dir.cwd().access(std.testing.io, owned, .{});
+    }
+    {
+        var writer = try Backend.open(a, root, .{});
+        defer writer.close();
+        for (paths, 0..) |owned, i| {
+            if (i < 5) try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(std.testing.io, owned, .{})) else try std.Io.Dir.cwd().access(std.testing.io, owned, .{});
+        }
+        const stats = writer.snapshotOpenStats();
+        try std.testing.expectEqual(@as(u64, 2), stats.recovered_table_temp_files_deleted_before_replay);
+        var txn = try writer.beginRead();
+        defer txn.abort();
+        try std.testing.expectEqualStrings("durable value", try txn.get(.{}, "key"));
+    }
+}
+
+test "controlled physical sync cleanup wake never waits on the maintenance mutex and preserves the atomic latch" {
+    if (comptime builtin.os.tag != .macos and builtin.os.tag != .linux) return error.SkipZigTest;
+    var backend = Backend.init(std.testing.allocator, .{});
+    defer backend.close();
+    var worker = InternalFlushWorker.init(&backend, std.testing.io);
+    defer worker.deinit();
+    try std.testing.expect(worker.mutex.tryLock());
+    worker.waker().wake();
+    worker.mutex.unlock(worker.io());
+    try std.testing.expectEqual(@as(u64, 1), worker.snapshotStats().wakeups);
+    // Even if an event reset races the set, the independent latch carries it.
+    worker.wake_event.reset();
+    try std.testing.expectEqual(InternalFlushWorker.Work.run, worker.waitForWork(null));
+    try std.testing.expect(!worker.wake_requested.load(.acquire));
+    worker.waker().wake();
+    try std.testing.expectEqual(InternalFlushWorker.Work.run, worker.waitForWork(null));
+    try std.testing.expectEqual(@as(u64, 2), worker.snapshotStats().wakeups);
+}
+
+test "controlled physical sync output cleanup retains ledger ownership at every admission refusal" {
+    const admission = @import("../common/read_admission.zig");
+    const Fault = struct {
+        checks: usize = 0,
+        at: usize = std.math.maxInt(usize),
+        rejected: bool = false,
+        failure: anyerror = error.Canceled,
+        fn check(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const at = self.checks;
+            self.checks += 1;
+            if (!self.rejected and at == self.at) {
+                self.rejected = true;
+                return self.failure;
+            }
+        }
+    };
+    // Discover the successful operation's checkpoints, then reject each one
+    // using all three original error classes. Retry and abandonment both run.
+    var checkpoints: usize = 1;
+    var target: usize = 0;
+    while (target <= checkpoints) : (target += 1) {
+        for ([_]bool{ false, true }) |abandon| {
+            const a = std.testing.allocator;
+            var manager = resource_manager_mod.ResourceManager.init(.{ .identity_allocator = a });
+            defer manager.deinit(a);
+            var b = Backend.init(a, .{ .resource_manager = &manager, .wal_enabled = false });
+            defer b.close();
+            try b.initOutputCleanup();
+            try b.obsolete_paths.append(a, .{ .path = try a.dupe(u8, "older-output"), .delete_after_ns = 1 });
+            b.syncTrackedInMemoryStateUsageCurrentLocked();
+            const queue = b.options.unpublished_outputs.?;
+            const ticket = try queue.create("new-output");
+            ticket.abandon();
+            var fault: Fault = .{ .at = if (target == 0) std.math.maxInt(usize) else target - 1, .failure = switch (target % 3) {
+                0 => error.Canceled,
+                1 => error.DeadlineExceeded,
+                else => error.FileNotFound,
+            } };
+            const payload: admission.Payload = .{ .ptr = &fault, .vtable = &.{ .checkpoint = Fault.check } };
+            const original = admission.Port.init(&payload);
+            var owner = Backend.QuiescedOutputCleanup.init(&b);
+            defer owner.deinit();
+            const result = owner.resumeWithAdmission(original);
+            if (target == 0) {
+                try result;
+                checkpoints = fault.checks;
+            } else {
+                try std.testing.expectError(fault.failure, result);
+                try std.testing.expect(fault.rejected);
+            }
+            if (!abandon) try owner.resumeWithAdmission(original);
+            const published = owner.published;
+            // Refusal of retirement also retains the original ticket/credit.
+            fault.at = fault.checks;
+            fault.rejected = false;
+            try std.testing.expectError(fault.failure, owner.retireWithAdmission(original));
+            try std.testing.expect(!owner.retired);
+            try owner.retireWithAdmission(original);
+            try std.testing.expect(b.obsolete_paths.contains("older-output"));
+            try std.testing.expectEqual(published, b.obsolete_paths.contains("new-output"));
+            try std.testing.expectEqual(@as(usize, if (published) 0 else 1), queue.pending.load(.acquire));
+            try std.testing.expectEqual(b.estimateInMemoryStateBytesLocked(), b.tracked_in_memory_state_bytes);
+            if (!published) {
+                var retry = Backend.QuiescedOutputCleanup.init(&b);
+                defer retry.deinit();
+                try retry.resumeWithAdmission(original);
+                try retry.retireWithAdmission(original);
+            }
+            // A duplicate handoff must preserve the original ledger deadline.
+            const deadline = b.obsolete_paths.get("new-output").?.delete_after_ns;
+            const duplicate = try queue.create("new-output");
+            duplicate.abandon();
+            var same = Backend.QuiescedOutputCleanup.init(&b);
+            defer same.deinit();
+            try same.resumeWithAdmission(original);
+            try same.retireWithAdmission(original);
+            try std.testing.expectEqual(deadline, b.obsolete_paths.get("new-output").?.delete_after_ns);
+            try queue.joinRetirementsWithAdmission(std.testing.io, original);
+            try std.testing.expectEqual(@as(u64, 0), manager.sliceStats(.lsm_table_builder_working_set).used_bytes);
+            try std.testing.expectEqual(b.estimateInMemoryStateBytesLocked(), b.tracked_in_memory_state_bytes);
+            try std.testing.expectEqual(@as(u64, 0), manager.snapshot().memory.accounting_errors);
+        }
+    }
+}
+
+test "controlled physical sync output cleanup abandons every partial allocation without losing intent" {
+    const Fixture = struct {
+        fn check(a: Allocator) !void {
+            var manager = resource_manager_mod.ResourceManager.init(.{ .identity_allocator = std.testing.allocator });
+            defer manager.deinit(std.testing.allocator);
+            var b = Backend.init(a, .{ .resource_manager = &manager, .wal_enabled = false });
+            defer b.close();
+            try b.initOutputCleanup();
+            b.syncTrackedInMemoryStateUsageCurrentLocked();
+            const queue = b.options.unpublished_outputs.?;
+            const ticket = try queue.create("allocation-output");
+            ticket.abandon();
+            const Control = struct {
+                fn check(_: *anyopaque) !void {}
+            };
+            var marker: u8 = 0;
+            const payload: read_admission.Payload = .{ .ptr = &marker, .vtable = &.{ .checkpoint = Control.check } };
+            const original = read_admission.Port.init(&payload);
+            var owner = Backend.QuiescedOutputCleanup.init(&b);
+            defer owner.deinit();
+            owner.resumeWithAdmission(original) catch |cause| {
+                try owner.retireWithAdmission(original);
+                try std.testing.expectEqual(@as(usize, 1), queue.pending.load(.acquire));
+                try std.testing.expect(!b.obsolete_paths.contains("allocation-output"));
+                try std.testing.expectEqual(b.estimateInMemoryStateBytesLocked(), b.tracked_in_memory_state_bytes);
+                return cause;
+            };
+            try owner.retireWithAdmission(original);
+            try queue.joinRetirementsWithAdmission(std.testing.io, original);
+            try std.testing.expectEqual(b.estimateInMemoryStateBytesLocked(), b.tracked_in_memory_state_bytes);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Fixture.check, .{});
+}
+
+test "controlled physical sync output cleanup retirement retains every rejected physical and accounting step" {
+    const Control = struct {
+        checks: usize = 0,
+        at: usize = std.math.maxInt(usize),
+        fn check(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const at = self.checks;
+            self.checks += 1;
+            if (at == self.at) return error.DeadlineExceeded;
+        }
+    };
+    var checkpoints: usize = 1;
+    var target: usize = 0;
+    while (target <= checkpoints) : (target += 1) {
+        const a = std.testing.allocator;
+        var manager = resource_manager_mod.ResourceManager.init(.{ .identity_allocator = a });
+        defer manager.deinit(a);
+        var b = Backend.init(a, .{ .resource_manager = &manager, .wal_enabled = false });
+        defer b.close();
+        try b.initOutputCleanup();
+        for ([_][]const u8{ "old-a", "old-b", "old-c" }) |name| try b.obsolete_paths.append(a, .{ .path = try a.dupe(u8, name), .delete_after_ns = 1 });
+        b.syncTrackedInMemoryStateUsageCurrentLocked();
+        const queue = b.options.unpublished_outputs.?;
+        const ticket = try queue.create("retirement-output");
+        ticket.abandon();
+        var control: Control = .{};
+        const payload: read_admission.Payload = .{ .ptr = &control, .vtable = &.{ .checkpoint = Control.check } };
+        const original = read_admission.Port.init(&payload);
+        var owner = Backend.QuiescedOutputCleanup.init(&b);
+        defer owner.deinit();
+        try owner.resumeWithAdmission(original);
+        control.checks = 0;
+        control.at = if (target == 0) std.math.maxInt(usize) else target - 1;
+        const result = owner.retireWithAdmission(original);
+        if (target == 0) {
+            try result;
+            checkpoints = control.checks;
+        } else {
+            try std.testing.expectError(error.DeadlineExceeded, result);
+            try std.testing.expect(!owner.retired);
+            try std.testing.expect(b.obsolete_paths.contains("retirement-output"));
+            try owner.retireWithAdmission(original);
+        }
+        try queue.joinRetirementsWithAdmission(std.testing.io, original);
+        try std.testing.expectEqual(b.estimateInMemoryStateBytesLocked(), b.tracked_in_memory_state_bytes);
+        try std.testing.expectEqual(@as(u64, 0), manager.sliceStats(.lsm_table_builder_working_set).used_bytes);
+        try std.testing.expectEqual(@as(u64, 0), manager.snapshot().memory.accounting_errors);
+    }
+}
+
+test "controlled physical sync output cleanup rejects queue contention without dropping retained intent" {
+    const Control = struct {
+        owner: ?*Backend.QuiescedOutputCleanup = null,
+        rejected: bool = false,
+        fn check(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.owner) |owner| if (!self.rejected and owner.phase == .adopt) {
+                self.rejected = true;
+                return error.Canceled;
+            };
+        }
+        fn wait(_: *anyopaque) !void {
+            return error.DeadlineExceeded;
+        }
+    };
+    const a = std.testing.allocator;
+    var manager = resource_manager_mod.ResourceManager.init(.{ .identity_allocator = a });
+    defer manager.deinit(a);
+    var b = Backend.init(a, .{ .resource_manager = &manager, .wal_enabled = false });
+    defer b.close();
+    try b.initOutputCleanup();
+    b.syncTrackedInMemoryStateUsageCurrentLocked();
+    const queue = b.options.unpublished_outputs.?;
+    const ticket = try queue.create("contended-output");
+    ticket.abandon();
+    var control: Control = .{};
+    const payload: read_admission.Payload = .{ .ptr = &control, .vtable = &.{ .checkpoint = Control.check, .wait_for_progress = Control.wait } };
+    const original = read_admission.Port.init(&payload);
+    var owner = Backend.QuiescedOutputCleanup.init(&b);
+    defer owner.deinit();
+    try std.testing.expect(queue.mutex.tryLock());
+    const take = owner.resumeWithAdmission(original);
+    queue.mutex.unlock();
+    try std.testing.expectError(error.DeadlineExceeded, take);
+    try std.testing.expectEqual(@as(usize, 1), queue.pending.load(.acquire));
+    try std.testing.expect(owner.ticket == null);
+    control.owner = &owner;
+    try std.testing.expectError(error.Canceled, owner.resumeWithAdmission(original));
+    try std.testing.expect(owner.ticket.? == ticket and owner.credit != null and owner.candidate != null);
+    try std.testing.expect(queue.mutex.tryLock());
+    const give_back = owner.retireWithAdmission(original);
+    queue.mutex.unlock();
+    try std.testing.expectError(error.DeadlineExceeded, give_back);
+    try std.testing.expect(owner.ticket.? == ticket and owner.credit != null and owner.candidate != null);
+    try std.testing.expectEqual(@as(usize, 0), queue.pending.load(.acquire));
+    try owner.retireWithAdmission(original);
+    try std.testing.expectEqual(@as(usize, 1), queue.pending.load(.acquire));
+    try std.testing.expect(!b.obsolete_paths.contains("contended-output"));
+    try std.testing.expectEqual(b.estimateInMemoryStateBytesLocked(), b.tracked_in_memory_state_bytes);
+    try std.testing.expectEqual(@as(u64, 0), manager.snapshot().memory.accounting_errors);
+}
+
+const CheckpointPreparationFixture = struct {
+    memory: storage_io.MemoryStorage = undefined,
+    manager: resource_manager_mod.ResourceManager = undefined,
+    allocations: std.testing.FailingAllocator = undefined,
+    backend: Backend = undefined,
+    fn init(self: *@This()) !void {
+        const a = std.testing.allocator;
+        self.memory = storage_io.MemoryStorage.init(a);
+        errdefer self.memory.deinit();
+        self.manager = resource_manager_mod.ResourceManager.init(.{ .identity_allocator = a });
+        errdefer self.manager.deinit(a);
+        self.allocations = std.testing.FailingAllocator.init(a, .{});
+        try self.backend.openInto(self.allocations.allocator(), "/admitted-checkpoint-preparation", .{ .storage = self.memory.storage(), .resource_manager = &self.manager, .wal_enabled = false, .flush_threshold = 1 });
+        errdefer self.backend.close();
+        var txn = try self.backend.beginWrite();
+        errdefer txn.abort();
+        try txn.put(.{ .name = "docs" }, "durable", "value");
+        try txn.commit();
+        _ = try self.backend.planningDirectory();
+        try std.testing.expect(self.backend.manifest_journal.descriptor != null);
+        try self.backend.obsolete_paths.append(self.backend.allocator, .{ .path = try self.backend.allocator.dupe(u8, "already-obsolete"), .delete_after_ns = 7 });
+        self.backend.syncTrackedInMemoryStateUsageCurrentLocked();
+    }
+    fn releaseRoots(self: *@This(), inputs: *Backend.QuiescedCheckpointPreparation.Inputs) void {
+        inputs.retire(&self.backend);
+    }
+    fn verify(self: *@This()) !void {
+        try std.testing.expect(self.backend.manifest_checkpoint_directory == null);
+        try std.testing.expectEqual(self.backend.estimateInMemoryStateBytesLocked(), self.backend.tracked_in_memory_state_bytes);
+        try std.testing.expectEqual(@as(u64, 0), self.manager.sliceStats(.lsm_table_builder_working_set).used_bytes);
+        try std.testing.expectEqual(@as(u64, 0), self.manager.snapshot().memory.accounting_errors);
+        try std.testing.expectEqual(@as(u64, 0), self.backend.manifest_reserved_mutation_bytes);
+        try std.testing.expectEqual(@as(u64, 7), self.backend.obsolete_paths.get("already-obsolete").?.delete_after_ns);
+    }
+    fn deinit(self: *@This()) void {
+        self.allocations.fail_index = std.math.maxInt(usize);
+        self.allocations.resize_fail_index = std.math.maxInt(usize);
+        self.backend.close();
+        self.manager.deinit(std.testing.allocator);
+        self.memory.deinit();
+    }
+};
+
+test "controlled physical sync checkpoint preparation retains every original preparation transfer and retirement rejection" {
+    const Stage = enum { construct, take, retire };
+    const Fault = struct {
+        checks: usize = 0,
+        at: usize = std.math.maxInt(usize),
+        rejected: bool = false,
+        failure: anyerror = error.Canceled,
+        fn check(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const at = self.checks;
+            self.checks += 1;
+            if (!self.rejected and at == self.at) {
+                self.rejected = true;
+                return self.failure;
+            }
+        }
+    };
+    for (std.enums.values(Stage)) |stage| {
+        var checkpoints: usize = 1;
+        var target: usize = 0;
+        while (target <= checkpoints) : (target += 1) {
+            var fixture: CheckpointPreparationFixture = undefined;
+            try fixture.init();
+            defer fixture.deinit();
+            const b = &fixture.backend;
+            const next_id = b.next_run_id;
+            const live_root = b.obsolete_paths.tree.root;
+            const files = fixture.memory.files.count();
+            var owner = try Backend.QuiescedCheckpointPreparation.init(b);
+            defer owner.deinit();
+            var fault: Fault = .{ .failure = switch (target % 3) {
+                0 => error.Canceled,
+                1 => error.DeadlineExceeded,
+                else => error.FileNotFound,
+            } };
+            const payload: read_admission.Payload = .{ .ptr = &fault, .vtable = &.{ .checkpoint = Fault.check } };
+            const original = read_admission.Port.init(&payload);
+            if (stage != .construct) try owner.resumeWithAdmission(original);
+            fault.checks = 0;
+            fault.at = if (target == 0) std.math.maxInt(usize) else target - 1;
+            var snapshot: ?Backend.QuiescedCheckpointPreparation.Inputs = null;
+            const result: anyerror!void = switch (stage) {
+                .construct => owner.resumeWithAdmission(original),
+                .take => take: {
+                    snapshot = owner.takeWithAdmission(original) catch |cause| break :take cause;
+                    break :take {};
+                },
+                .retire => owner.retireWithAdmission(original),
+            };
+            if (target == 0) {
+                try result;
+                checkpoints = fault.checks;
+            } else {
+                try std.testing.expectError(fault.failure, result);
+                try std.testing.expect(fault.rejected and !owner.transferred and !owner.retired);
+            }
+            if (snapshot) |*value| fixture.releaseRoots(value) else if (stage == .retire or target % 2 == 1) {
+                try owner.retireWithAdmission(original);
+                try std.testing.expectError(error.InvalidArgument, owner.resumeWithAdmission(original));
+            } else {
+                try owner.resumeWithAdmission(original);
+                var value = try owner.takeWithAdmission(original);
+                try std.testing.expect(value.matches(b));
+                try std.testing.expect(value.live_snapshot == b.ledger_snapshots);
+                try std.testing.expect(value.snapshot.value.tree.root != b.obsolete_paths.tree.root);
+                try std.testing.expect(b.manifest_checkpoint_directory.?.tree.root == b.run_directory.?.tree.root);
+                fixture.releaseRoots(&value);
+            }
+            try std.testing.expectEqual(next_id, b.next_run_id);
+            try std.testing.expect(b.obsolete_paths.tree.root == live_root);
+            try std.testing.expectEqual(files, fixture.memory.files.count());
+            try fixture.verify();
+        }
+    }
+}
+
+test "controlled physical sync checkpoint preparation owns every allocation refusal before root publication" {
+    const Control = struct {
+        fn check(_: *anyopaque) !void {}
+    };
+    for ([_]bool{ false, true }) |abandon| {
+        var offset: usize = 0;
+        while (offset < 128) : (offset += 1) {
+            var fixture: CheckpointPreparationFixture = undefined;
+            try fixture.init();
+            defer fixture.deinit();
+            const b = &fixture.backend;
+            var marker: u8 = 0;
+            const payload: read_admission.Payload = .{ .ptr = &marker, .vtable = &.{ .checkpoint = Control.check } };
+            const original = read_admission.Port.init(&payload);
+            var owner = try Backend.QuiescedCheckpointPreparation.init(b);
+            defer owner.deinit();
+            const root = b.obsolete_paths.tree.root;
+            fixture.allocations.fail_index = fixture.allocations.alloc_index + offset;
+            fixture.allocations.resize_fail_index = fixture.allocations.resize_index;
+            const result = owner.resumeWithAdmission(original);
+            fixture.allocations.fail_index = std.math.maxInt(usize);
+            fixture.allocations.resize_fail_index = std.math.maxInt(usize);
+            if (result) |_| {
+                var snapshot = try owner.takeWithAdmission(original);
+                fixture.releaseRoots(&snapshot);
+                try fixture.verify();
+                try std.testing.expect(offset > 2);
+                break;
+            } else |cause| {
+                try std.testing.expectEqual(error.OutOfMemory, cause);
+                try std.testing.expect(!owner.published and owner.credit != null);
+                try std.testing.expect(b.obsolete_paths.tree.root == root and b.manifest_checkpoint_directory == null and b.ledger_snapshots == null);
+                if (abandon) try owner.retireWithAdmission(original) else {
+                    try owner.resumeWithAdmission(original);
+                    var snapshot = try owner.takeWithAdmission(original);
+                    fixture.releaseRoots(&snapshot);
+                }
+                try fixture.verify();
+            }
+        }
+        try std.testing.expect(offset < 128);
+    }
+}
+
+test "controlled physical sync checkpoint preparation keeps new accounts private and rejects stale lineage and denied admission" {
+    const Mode = enum { empty, denied, stale_before, stale_at_receipt, stale_after, dirty };
+    const Control = struct {
+        owner: ?*Backend.QuiescedCheckpointPreparation = null,
+        changed: bool = false,
+        fn check(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.owner) |owner| if (!self.changed and owner.phase == .publish) {
+                self.changed = true;
+                owner.backend.manifest_journal.next_run_id += 1;
+            };
+        }
+    };
+    for (std.enums.values(Mode)) |mode| {
+        var fixture: CheckpointPreparationFixture = undefined;
+        try fixture.init();
+        defer fixture.deinit();
+        const b = &fixture.backend;
+        if (mode == .empty) {
+            b.obsolete_paths.deinit(b.allocator);
+            b.syncTrackedInMemoryStateUsageCurrentLocked();
+        }
+        const root = b.obsolete_paths.tree.root;
+        const files = fixture.memory.files.count();
+        const baseline = b.tracked_in_memory_state_bytes;
+        const allocator_calls = fixture.allocations.alloc_index;
+        if (mode == .dirty) {
+            b.run_directory_dirty = true;
+            const result = Backend.QuiescedCheckpointPreparation.init(b);
+            b.run_directory_dirty = false;
+            try std.testing.expectError(error.ExecutionWaitUnsupported, result);
+            try std.testing.expectEqual(allocator_calls, fixture.allocations.alloc_index);
+            continue;
+        }
+        var owner = try Backend.QuiescedCheckpointPreparation.init(b);
+        defer owner.deinit();
+        var control: Control = .{};
+        const payload: read_admission.Payload = .{ .ptr = &control, .vtable = &.{ .checkpoint = Control.check } };
+        const original = read_admission.Port.init(&payload);
+        const journal_id = b.manifest_journal.next_run_id;
+        if (mode == .stale_before) b.manifest_journal.next_run_id += 1;
+        if (mode == .stale_at_receipt) control.owner = &owner;
+        if (mode == .denied) {
+            const slice = &fixture.manager.slices[@backingInt(resource_manager_mod.Slice.lsm_table_builder_working_set)];
+            const budget = slice.budget;
+            slice.budget = .{ .hard_limit_bytes = 1 };
+            const result = owner.resumeWithAdmission(original);
+            slice.budget = budget;
+            try std.testing.expectError(error.ResourceBudgetExceeded, result);
+            try std.testing.expect(owner.credit == null and owner.candidate == null and owner.directory == null and owner.snapshot == null);
+            try std.testing.expectEqual(allocator_calls, fixture.allocations.alloc_index);
+        }
+        if (mode == .stale_before or mode == .stale_at_receipt) {
+            try std.testing.expectError(error.RecoveryRequired, owner.resumeWithAdmission(original));
+            try std.testing.expect(!owner.published);
+            try owner.retireWithAdmission(original);
+            try std.testing.expectEqual(baseline, b.tracked_in_memory_state_bytes);
+            b.manifest_journal.next_run_id = journal_id;
+        } else {
+            try owner.resumeWithAdmission(original);
+            if (mode == .stale_after) {
+                b.manifest_journal.next_run_id += 1;
+                try std.testing.expectError(error.RecoveryRequired, owner.takeWithAdmission(original));
+                try std.testing.expect(!owner.transferred);
+                try owner.retireWithAdmission(original);
+                b.manifest_journal.next_run_id = journal_id;
+            } else {
+                var inputs = try owner.takeWithAdmission(original);
+                try std.testing.expect(inputs.matches(b));
+                var buffer: [std.fs.max_path_bytes]u8 = undefined;
+                for (0..inputs.fence.retiredPathCount()) |i| {
+                    const path = try inputs.fence.retiredPathAt(b.root_dir.?, i, &buffer);
+                    try std.testing.expect(inputs.snapshot.value.get(path).?.delete_after_ns != std.math.maxInt(u64));
+                    try std.testing.expect(!b.obsolete_paths.contains(path));
+                }
+                inputs.retire(b);
+                try std.testing.expect(!inputs.matches(b));
+            }
+        }
+        try std.testing.expect(b.obsolete_paths.tree.root == root);
+        try std.testing.expectEqual(files, fixture.memory.files.count());
+        try std.testing.expectEqual(b.estimateInMemoryStateBytesLocked(), b.tracked_in_memory_state_bytes);
+        try std.testing.expectEqual(@as(u64, 0), fixture.manager.sliceStats(.lsm_table_builder_working_set).used_bytes);
+        try std.testing.expectEqual(@as(u64, 0), b.manifest_reserved_mutation_bytes);
+    }
+}
+
+test "controlled physical sync stable directory pin release retires under held registry mutex after backend close" {
+    const a = std.testing.allocator;
+    const admission = @import("../common/read_admission.zig");
+    const Fault = struct {
+        checks: usize = 0,
+        at: usize = std.math.maxInt(usize),
+        failure: anyerror = error.Canceled,
+        fn check(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const at = self.checks;
+            self.checks += 1;
+            if (at == self.at) return self.failure;
+        }
+    };
+    const path = try a.alloc(u8, 3 * 16 * 1024 + 3);
+    defer a.free(path);
+    @memset(path, 'p');
+    const source = Run{ .id = 931, .level = 0, .size_bytes = 1, .path = path, .smallest_namespace_name = null, .smallest_key = @constCast("a"), .largest_namespace_name = null, .largest_key = @constCast("z"), .entry_count = 1, .bloom_filter = null, .state = null, .owns_metadata = false };
+    var total: usize = 0;
+    var target: usize = 0;
+    while (target <= total) : (target += 1) {
+        for ([_]bool{ false, true }) |quiesced| {
+            if (target == 0 and quiesced) continue;
+            var backend = Backend.init(a, .{});
+            var backend_alive = true;
+            defer if (backend_alive) backend.close();
+            const directory = try RunDirectory.create(a);
+            defer directory.destroy(a);
+            try directory.tree.prepare(a);
+            const account = directory.tree.account.?;
+            const baseline = account.bytes.load(.acquire);
+            defer run_snapshot_refs.forget(path);
+            var lease: ?RunDirectory.EntryLease = try directory.prepareEntryLegacy(&backend, source);
+            defer if (lease) |*value| value.deinit(a);
+            const charge = account.bytes.load(.acquire);
+            try std.testing.expect(charge > baseline);
+            backend.close();
+            backend_alive = false;
+            var retirement: ?RunDirectory.EntryLease.Retirement = null;
+            defer if (retirement) |*value| value.deinit(a);
+            var fault: Fault = .{ .at = if (target == 0) std.math.maxInt(usize) else target - 1, .failure = switch (target % 3) {
+                0 => error.Canceled,
+                1 => error.DeadlineExceeded,
+                else => error.FileNotFound,
+            } };
+            const payload: admission.Payload = .{ .ptr = &fault, .vtable = &.{ .checkpoint = Fault.check } };
+            const original = admission.Port.init(&payload);
+            const epoch = file_pin_release_epoch.load(.acquire);
+            {
+                try std.testing.expect(run_snapshot_refs.mutex.tryLock());
+                defer run_snapshot_refs.mutex.unlock();
+                const result: anyerror!void = blk: {
+                    retirement = Backend.beginDirectorySnapshotRetirement(&lease.?, original) catch |err| break :blk err;
+                    lease = null;
+                    retirement.?.retireWithAdmission(a, original) catch |err| break :blk err;
+                    break :blk {};
+                };
+                if (target == 0) {
+                    try result;
+                    total = fault.checks;
+                    try std.testing.expect(total > 10);
+                } else {
+                    try std.testing.expectError(fault.failure, result);
+                    try std.testing.expectEqual(charge, account.bytes.load(.acquire));
+                }
+                if (lease) |*value| {
+                    retirement = try Backend.beginDirectorySnapshotRetirement(value, original);
+                    lease = null;
+                }
+                if (quiesced) retirement.?.deinit(a) else try retirement.?.retireWithAdmission(a, original);
+                try std.testing.expectEqual(baseline, account.bytes.load(.acquire));
+                try std.testing.expectEqual(epoch + 1, file_pin_release_epoch.load(.acquire));
+                try std.testing.expectEqual(@as(u64, 0), run_snapshot_refs.findLockedJoined(path).?.refs.load(.acquire));
+                fault.at = fault.checks;
+                try std.testing.expectError(fault.failure, retirement.?.retireWithAdmission(a, original));
+                try retirement.?.retireWithAdmission(a, original);
+                try std.testing.expectEqual(epoch + 1, file_pin_release_epoch.load(.acquire));
+            }
+            try std.testing.expect(!run_snapshot_refs.isRetained(path));
+        }
+    }
+    // Ordinary directory destruction also uses the same direct pin capability.
+    var backend = Backend.init(a, .{});
+    defer backend.close();
+    const directory = try RunDirectory.create(a);
+    var directory_alive = true;
+    defer if (directory_alive) directory.destroy(a);
+    defer run_snapshot_refs.forget(path);
+    try run_snapshot_refs.retain(path); // Independent path-only checkpoint pin.
+    defer run_snapshot_refs.release(path);
+    try directory.put(&backend, source);
+    {
+        try std.testing.expect(run_snapshot_refs.mutex.tryLock());
+        defer run_snapshot_refs.mutex.unlock();
+        directory.destroy(a);
+        directory_alive = false;
+        try std.testing.expectEqual(@as(u64, 1), run_snapshot_refs.findLockedJoined(path).?.refs.load(.acquire));
+    }
+    run_snapshot_refs.forget(path);
+    try std.testing.expect(run_snapshot_refs.isRetained(path));
+    run_snapshot_refs.release(path);
+    try std.testing.expect(!run_snapshot_refs.isRetained(path));
+}
+
+test "controlled physical sync production pin retirement rejects legacy capability before ownership transfer" {
+    const a = std.testing.allocator;
+    const admission = @import("../common/read_admission.zig");
+    const Fixture = struct {
+        allocator: Allocator,
+        pins: usize = 0,
+        pub fn retainRunSnapshotRef(self: *@This(), _: *Run) !void {
+            self.pins += 1;
+        }
+        pub fn releaseRunSnapshotRef(self: *@This(), _: *Run) void {
+            self.pins -= 1;
+        }
+    };
+    const Control = struct {
+        rejected: bool = false,
+        fn check(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (!self.rejected) {
+                self.rejected = true;
+                return error.DeadlineExceeded;
+            }
+        }
+    };
+    var fixture: Fixture = .{ .allocator = a };
+    const directory = try RunDirectory.create(a);
+    defer directory.destroy(a);
+    try directory.tree.prepare(a);
+    var lease = try directory.prepareEntryLegacy(&fixture, .{ .id = 932, .level = 0, .size_bytes = 1, .path = @constCast("/stable/legacy.sst"), .smallest_namespace_name = null, .smallest_key = @constCast("a"), .largest_namespace_name = null, .largest_key = @constCast("z"), .entry_count = 1, .bloom_filter = null, .state = null });
+    var alive = true;
+    defer if (alive) lease.deinit(a);
+    const run = lease.run();
+    var control: Control = .{};
+    const payload: admission.Payload = .{ .ptr = &control, .vtable = &.{ .checkpoint = Control.check } };
+    const original = admission.Port.init(&payload);
+    try std.testing.expectError(error.DeadlineExceeded, Backend.beginDirectorySnapshotRetirement(&lease, original));
+    try std.testing.expectError(error.ExecutionWaitUnsupported, Backend.beginDirectorySnapshotRetirement(&lease, original));
+    try std.testing.expect(lease.run() == run);
+    try std.testing.expectEqual(@as(usize, 1), fixture.pins);
+    lease.deinit(a);
+    alive = false;
+    try std.testing.expectEqual(@as(usize, 0), fixture.pins);
+}
+
+test "controlled physical sync stable snapshot pins survive radix growth concurrent release forget and allocation failure" {
+    const Fixture = struct {
+        fn close(registry: *RunSnapshotRefRegistry) void {
+            // Test-only joined cleanup: no pin consumer survives this fixture.
+            registry.deinitJoined();
+        }
+        fn allocationFailures(a: Allocator) !void {
+            var registry: RunSnapshotRefRegistry = .{ .allocator = a };
+            defer close(&registry);
+            const pin = try registry.retainPin("/stable/oom.sst");
+            pin.release();
+            const same = try registry.retainPin("/stable/oom.sst");
+            try std.testing.expect(pin == same);
+            registry.forget("/stable/oom.sst");
+            try std.testing.expect(registry.isRetained("/stable/oom.sst"));
+            same.release();
+            registry.forget("/stable/oom.sst");
+            try std.testing.expectEqual(@as(usize, 0), registry.key_count);
+            const empty = try registry.retainPin("");
+            empty.release();
+            registry.forget("");
+            try std.testing.expectEqual(@as(usize, 0), registry.key_count);
+        }
+        fn drop(pin: *RunSnapshotRefRegistry.Pin, count: usize) void {
+            for (0..count) |_| pin.release();
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Fixture.allocationFailures, .{});
+    {
+        var measured = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+        var packed_registry: RunSnapshotRefRegistry = .{ .allocator = measured.allocator() };
+        defer Fixture.close(&packed_registry);
+        const path = "/stable/one-allocation.sst";
+        const pin = try packed_registry.retainPin(path);
+        // Header+path, hash group, and one speculative branch header.
+        try std.testing.expectEqual(@as(usize, 3), measured.allocations);
+        try std.testing.expectEqual(@intFromPtr(pin) + @sizeOf(RunSnapshotRefRegistry.Pin), @intFromPtr(pin.path().ptr));
+        try std.testing.expectEqualStrings(path, pin.path());
+        pin.release();
+        packed_registry.forget(path);
+        Fixture.close(&packed_registry);
+        try std.testing.expectEqual(measured.allocated_bytes, measured.freed_bytes);
+    }
+    var registry: RunSnapshotRefRegistry = .{ .allocator = std.testing.allocator };
+    defer Fixture.close(&registry);
+    const anchor = try registry.retainPin("/stable/anchor.sst");
+    defer anchor.release();
+    const branches = registry.branch_count;
+    for (0..512) |i| {
+        var buffer: [64]u8 = undefined;
+        const path = try std.fmt.bufPrint(&buffer, "/stable/rehash/{d}.sst", .{i});
+        const pin = try registry.retainPin(path);
+        pin.release();
+    }
+    try std.testing.expect(registry.branch_count > branches);
+    try std.testing.expect(anchor == registry.findLockedJoined("/stable/anchor.sst").?);
+    const same = try registry.retainPin("/stable/anchor.sst");
+    try std.testing.expect(anchor == same);
+    {
+        try std.testing.expect(registry.mutex.tryLock());
+        defer registry.mutex.unlock();
+        same.release();
+        try std.testing.expectEqual(@as(u64, 1), anchor.refs.load(.acquire));
+    }
+    anchor.refs.store(std.math.maxInt(u64), .release);
+    try std.testing.expectError(error.Overflow, registry.retainPin("/stable/anchor.sst"));
+    try std.testing.expectEqual(std.math.maxInt(u64), anchor.refs.load(.acquire));
+    anchor.refs.store(1, .release);
+    const concurrent_path = "/stable/concurrent.sst";
+    var concurrent: *RunSnapshotRefRegistry.Pin = undefined;
+    for (0..256) |_| concurrent = try registry.retainPin(concurrent_path);
+    var threads: [4]?std.Thread = @splat(null);
+    defer for (&threads) |*thread| if (thread.*) |handle| handle.join();
+    for (&threads) |*thread| thread.* = try std.Thread.spawn(.{}, Fixture.drop, .{ concurrent, @as(usize, 64) });
+    // The last atomic drop may race physical deletion of the record. The drop
+    // must not read its record again after making the count zero.
+    for (0..128) |_| registry.forget(concurrent_path);
+    for (&threads) |*thread| {
+        thread.*.?.join();
+        thread.* = null;
+    }
+    registry.forget(concurrent_path);
+    try std.testing.expect(registry.findLockedJoined(concurrent_path) == null);
+    // Path-only releases coexist with direct handles and tolerate cached zero.
+    try registry.retain("/stable/anchor.sst");
+    registry.release("/stable/anchor.sst");
+    try std.testing.expectEqual(@as(u64, 1), anchor.refs.load(.acquire));
+}
+
+test "controlled physical sync directory registration handoff validates run and registry before transferring file ownership" {
+    const a = std.testing.allocator;
+    const admission = @import("../common/read_admission.zig");
+    const Control = struct {
+        failure: ?anyerror = error.DeadlineExceeded,
+        fn check(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.failure) |failure| {
+                self.failure = null;
+                return failure;
+            }
+        }
+    };
+    var control: Control = .{};
+    const payload: admission.Payload = .{ .ptr = &control, .vtable = &.{ .checkpoint = Control.check } };
+    const original = admission.Port.init(&payload);
+    const path = "/pin-registration-handoff.sst";
+    defer run_snapshot_refs.forget(path);
+    var registration = Backend.prepareRunSnapshotRefOperation(path, .retain);
+    defer registration.deinit();
+    _ = try registration.planWithAdmission(null);
+    try registration.resumeWithAdmission(null);
+    try registration.publishWithAdmission(null);
+    var run: Run = .{ .id = 934, .level = 0, .size_bytes = 1, .path = @constCast("/wrong.sst"), .smallest_namespace_name = null, .smallest_key = @constCast("a"), .largest_namespace_name = null, .largest_key = @constCast("z"), .entry_count = 1, .bloom_filter = null, .state = null, .owns_metadata = false };
+    try std.testing.expectError(error.DeadlineExceeded, Backend.completeDirectorySnapshotPinWithAdmission(&registration, &run, original));
+    try std.testing.expectError(error.CompactionPlanningStale, Backend.completeDirectorySnapshotPinWithAdmission(&registration, &run, original));
+    try std.testing.expect(!registration.taken and !run.version_ref_pinned);
+    run.path = @constCast(path);
+    run.version_ref_pinned = true;
+    try std.testing.expectError(error.InvalidArgument, Backend.completeDirectorySnapshotPinWithAdmission(&registration, &run, original));
+    run.version_ref_pinned = false;
+    const pin = try Backend.completeDirectorySnapshotPinWithAdmission(&registration, &run, original);
+    try std.testing.expect(run.version_ref_pinned and registration.taken);
+    pin.release(pin.owner, &run);
+    try std.testing.expect(!run.version_ref_pinned);
+    try std.testing.expectError(error.InvalidArgument, Backend.completeDirectorySnapshotPinWithAdmission(&registration, &run, original));
+    var other: RunSnapshotRefRegistry = .{ .allocator = a };
+    defer other.deinitJoined();
+    var foreign = run_pin_registry.Operation.init(&other, path, .retain);
+    defer foreign.deinit();
+    _ = try foreign.planWithAdmission(null);
+    try foreign.resumeWithAdmission(null);
+    try foreign.publishWithAdmission(null);
+    try std.testing.expectError(error.InvalidArgument, Backend.completeDirectorySnapshotPinWithAdmission(&foreign, &run, original));
+    try std.testing.expect(!foreign.taken and !run.version_ref_pinned);
 }

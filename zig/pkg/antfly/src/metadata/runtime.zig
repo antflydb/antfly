@@ -25,6 +25,10 @@ const build_options = @import("build_options");
 const raft_engine = @import("raft_engine");
 const platform = @import("antfly_platform");
 const tracing = @import("../tracing/mod.zig");
+const resource_manager_mod = @import("antfly_local_sources").storage_resource_manager;
+const owned_io = @import("antfly_local_sources").storage_owned_io;
+const startup_admission = @import("startup_admission.zig");
+const process_memory_budget = @import("antfly_local_sources").common_process_memory_budget;
 const backend_runtime_mod = @import("antfly_local_sources").storage_background_runtime;
 const metadata_http_client = @import("http_client.zig");
 const platform_time = @import("antfly_platform").time;
@@ -141,6 +145,7 @@ fn metadataWalReplicaStateConfig() antfly.raft.storage.WalReplicaStateConfig {
 
 const CliConfig = struct {
     config_path: ?[]const u8 = null,
+    process_memory_budget_mb: ?usize = null,
     online_merge_enabled: bool = true,
     experimental: bool = false,
     raft_host: ?[]const u8 = null,
@@ -312,6 +317,7 @@ pub const HealthSource = struct {
             try append(writer, "antfly_executor_inference_peak_leases", "gauge", "Peak inference executor lifetime leases", lanes.inference_peak_leases);
             try append(writer, "antfly_executor_inference_acquisitions_total", "counter", "Successful inference executor lease acquisitions", lanes.inference_acquisitions_total);
             try append(writer, "antfly_executor_inference_rejections_total", "counter", "Inference executor lease acquisitions rejected during shutdown", lanes.inference_rejections_total);
+            try @import("../api/sql_worker_metrics.zig").append(writer, runtime);
             try append(writer, "antfly_executor_worker_capacity", "gauge", "Maximum dedicated service worker reservations", lanes.worker_capacity);
             try append(writer, "antfly_executor_reserved_workers", "gauge", "Dedicated service workers reserved by runtime owners", lanes.reserved_workers);
             try append(writer, "antfly_executor_peak_reserved_workers", "gauge", "Peak dedicated service worker reservations", lanes.peak_reserved_workers);
@@ -503,6 +509,7 @@ pub const ServerConfig = struct {
     admin_bind_host: []const u8 = "127.0.0.1",
     admin_bind_port: u16 = 0,
     reconciler_config: antfly.metadata.reconciler.Reconciler.Config = .{},
+    runtime_memory: @import("runtime_resources.zig").Config = .{},
     backend_runtime: ?*backend_runtime_mod.BackendRuntime = null,
     secret_store: ?*antfly.common.secrets.FileStore = null,
     api_server_cfg: antfly.public_api.http_server.ApiHttpServerConfig = .{},
@@ -657,6 +664,7 @@ pub const Server = struct {
         const service_cfg = antfly.metadata_service.MetadataServiceConfig{
             .observe_local_replica_root = cfg.observe_local_replica_root,
             .local_data_owner = false,
+            .runtime_memory = cfg.runtime_memory,
             .backend_runtime = cfg.backend_runtime,
             .secret_store = cfg.secret_store,
             .reallocation_protocol_peers = result.reallocation_protocol_peers,
@@ -691,6 +699,7 @@ pub const Server = struct {
                 .max_connection_threads = 32,
             },
             .service = service_cfg,
+            .storage_context = cfg.storage_context,
             .api_server_cfg = cfg.api_server_cfg,
             .reconciler_config = cfg.reconciler_config,
         }, .{
@@ -1040,8 +1049,21 @@ pub fn runFromIterator(
     }
     var supervisor = antfly.common.runtime_lifecycle.RuntimeSupervisor.init(30_000);
     defer supervisor.markStopped();
-    var setup_io = std.Io.Threaded.init(alloc, .{ .stack_size = setup_io_thread_stack_size });
-    defer setup_io.deinit();
+    const memory_resolution = try process_memory_budget.resolveSystemDetailed(
+        cli.process_memory_budget_mb,
+        init.environ_map.get(process_memory_budget.canonical_env),
+        init.environ_map.get(process_memory_budget.inference_compat_env),
+    );
+    var node_memory_root = resource_manager_mod.ResourceManager.init(.{
+        .memory_budget = .{ .hard_limit_bytes = memory_resolution.limit_bytes },
+        .identity_allocator = alloc,
+    });
+    defer node_memory_root.deinit(alloc);
+    var process_memory_parent = node_memory_root.memoryParentPort();
+    const setup_io = try owned_io.Owner.create(alloc, &node_memory_root);
+    // Preserve the existing bootstrap stack payload; only its funding changes.
+    setup_io.threaded.stack_size = setup_io_thread_stack_size;
+    defer setup_io.destroy();
     const runtime_cadence = antfly.raft.RuntimeCadence.fromMillis(
         cli.raft_tick_ms,
         cli.control_tick_ms,
@@ -1188,12 +1210,27 @@ pub fn runFromIterator(
     );
     defer active_audio_runtime.deinit();
 
+    var admission_owner = try startup_admission.Owner.init(alloc, if (loaded_config) |*cfg| cfg.admission else .{}, memory_resolution.limit_bytes);
+    defer admission_owner.deinit() catch @panic("metadata scheduler still retained after consumer joins");
+    const storage_runnable_port = try admission_owner.port();
+
+    var node_backend_runtime = try backend_runtime_mod.BackendRuntimeHandle.init(alloc, .{
+        .runnable_owner = storage_runnable_port,
+        .memory_parent = process_memory_parent,
+        .shared_sql_memory_parent = process_memory_parent,
+    });
+    defer node_backend_runtime.deinit();
+    const storage_execution_offer = @import("antfly_local_sources").storage_execution_services.Offer.init(node_backend_runtime.ptr());
     var storage_kernel_context: ?StorageKernelContext = null;
     defer if (storage_kernel_context) |*context| context.deinit();
     if (comptime linked_storage) {
         var context = kernel_owner_client.Context{};
-        try context.ensureWith(.{
-            .auth_storage_path = .fromSlice(if (auth_enabled) resolved.auth_store_root_dir else ""),
+        try context.ensureWithRuntime(.{
+            .context = .{ .auth_storage_path = .fromSlice(if (auth_enabled) resolved.auth_store_root_dir else "") },
+            .memory_limit_bytes = memory_resolution.limit_bytes,
+            .memory_parent = &process_memory_parent,
+            .execution_services = &storage_execution_offer,
+            .runnable_owner = if (storage_runnable_port) |*port| port else null,
         });
         storage_kernel_context = context;
         try storage_kernel_context.?.configureRemoteContent(remote_content);
@@ -1270,6 +1307,7 @@ pub fn runFromIterator(
     }
 
     var server = try Server.init(alloc, .{
+        .backend_runtime = node_backend_runtime.ptr(),
         .online_merge_enabled = cli.online_merge_enabled,
         .local_node_id = local_node_id,
         .metadata_group_id = metadata_group_id,
@@ -1283,7 +1321,7 @@ pub fn runFromIterator(
         .admin_bind_port = admin_listener.bind_port,
         .reconciler_config = shardAllocationReconcilerConfig(if (loaded_config) |*cfg| cfg else null),
         .secret_store = if (secret_store_initialized) &secret_store else null,
-        .api_server_cfg = .{
+        .api_server_cfg = admission_owner.configureApi(.{
             .auth_enabled = effective_auth_enabled,
             .experimental = cli.experimental,
             .trusted_principal_secret = trusted_principal_secret,
@@ -1305,16 +1343,16 @@ pub fn runFromIterator(
             .extension_package_store_dir = resolved.extension_package_store_dir,
             .mcp_max_tool_result_bytes = if (loaded_config) |*cfg| cfg.mcp.max_tool_result_bytes else antfly.common.config.default_mcp_max_tool_result_bytes,
             .pgwire = if (loaded_config) |*cfg| cfg.pgwire else null,
-            .query_max_concurrent_requests = if (loaded_config) |*cfg| cfg.admission.query.max_concurrent_requests else antfly.common.config.default_query_max_concurrent_requests,
             .graph_execution_limits = if (loaded_config) |*cfg| cfg.graph_execution else .{},
-            .write_max_concurrent_requests = if (loaded_config) |*cfg| cfg.admission.write.max_concurrent_requests else antfly.common.config.default_write_max_concurrent_requests,
-            .inference_max_concurrent_requests = if (loaded_config) |*cfg| cfg.admission.inference.max_concurrent_requests else antfly.common.config.default_inference_max_concurrent_requests,
             .backup_operation_timeout_ms = if (loaded_config) |*cfg| cfg.backup.operation_timeout_ms else antfly.common.config.default_backup_operation_timeout_ms,
             .node_config = if (loaded_config) |*cfg| cfg else null,
-        },
+        }),
         .storage_context = storageKernelContextHandle(storage_kernel_context),
     });
-    defer server.deinitWithDeadline(supervisor.deadline());
+    defer {
+        admission_owner.close() catch @panic("metadata scheduler close failed");
+        server.deinitWithDeadline(supervisor.deadline());
+    }
     if (secret_store_initialized) {
         if (secret_store.native_config) |native| {
             native_secrets = try @import("secret_store.zig").Store.init(alloc, setup_io.io(), native.value.scope, native_keys.provider(), .{ .service = server.server.svc });
@@ -1484,6 +1522,10 @@ fn parseCli(alloc: std.mem.Allocator, args: *std.process.Args.Iterator) !CliConf
         }
         if (std.mem.startsWith(u8, arg, "--online-merge-enabled=")) {
             cfg.online_merge_enabled = parseBoolFlag(arg["--online-merge-enabled=".len..]) orelse return error.InvalidArguments;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--process-memory-budget-mb")) {
+            cfg.process_memory_budget_mb = try std.fmt.parseInt(usize, args.next() orelse return error.InvalidArguments, 10);
             continue;
         }
         if (std.mem.eql(u8, arg, "--data-dir")) {
@@ -1929,6 +1971,7 @@ fn printUsage(argv0: []const u8) void {
         \\  --control-tick-ms <ms>         Control scheduling interval, 1-60000 (default: 100)
         \\  --online-merge-enabled <bool>  Prefer online copying for eligible new merges (default: true; requires authenticated native storage)
         \\                                 False stops new admission, but completes in-flight online merges
+        \\  --process-memory-budget-mb <MiB>  Process memory envelope (0: automatic)
         \\  --data-dir <path>              Local storage root for metadata data
         \\  --replica-root-dir <path>      Replica root directory
         \\  --replica-catalog-path <path>  Replica catalog file path
@@ -3189,4 +3232,134 @@ fn expectMetadataOwnershipRemoteProgress(svc: *antfly.metadata_service.MetadataH
     try std.testing.expectEqual(@as(u64, 3), restore[0].node_id);
     std.debug.print("OWNERSHIP_ASSERT progress boot={d} phase={s} restore_backup_id\n", .{ boot, phase });
     try std.testing.expectEqualStrings("remote-backup", restore[0].backup_id);
+}
+
+test "metadata runtime process memory CLI preserves explicit zero and rejects overflow" {
+    var argv = [_][*:0]const u8{ "--process-memory-budget-mb", "0" };
+    var iterator = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
+    var cfg = try parseCli(std.testing.allocator, &iterator);
+    defer cfg.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(?usize, 0), cfg.process_memory_budget_mb);
+    var invalid = [_][*:0]const u8{ "--process-memory-budget-mb", "999999999999999999999999999" };
+    var invalid_iterator = std.process.Args.Iterator.init(.{ .vector = invalid[0..] });
+    try std.testing.expectError(error.Overflow, parseCli(std.testing.allocator, &invalid_iterator));
+}
+
+test "metadata runtime service memory rejects construction before publishing an unfunded executor" {
+    const a = std.testing.allocator;
+    var root = resource_manager_mod.ResourceManager.init(.{ .memory_budget = .{ .hard_limit_bytes = 1 } });
+    defer root.deinit(a);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/unfunded", .{tmp.sub_path});
+    defer a.free(path);
+    try std.testing.expectError(error.ResourceBudgetExceeded, Server.init(a, .{
+        .replica_root_dir = path,
+        .replica_catalog_path = path,
+        .snapshot_root_dir = path,
+        .runtime_memory = .{ .parent = root.memoryParentPort() },
+    }));
+    try std.testing.expectEqual(@as(u64, 0), root.snapshot().memory.used_bytes);
+}
+
+test "metadata runtime service memory owns its default budget and leaves a borrowed runtime alive" {
+    const a = std.testing.allocator;
+    var root = resource_manager_mod.ResourceManager.init(.{ .memory_budget = .{ .hard_limit_bytes = 2048 << 20 } });
+    defer root.deinit(a);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const replicas = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/replicas", .{tmp.sub_path});
+    defer a.free(replicas);
+    const catalog = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/catalog", .{tmp.sub_path});
+    defer a.free(catalog);
+    const snapshots = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/snapshots", .{tmp.sub_path});
+    defer a.free(snapshots);
+    {
+        var server = try Server.init(a, .{
+            .replica_root_dir = replicas,
+            .replica_catalog_path = catalog,
+            .snapshot_root_dir = snapshots,
+            .runtime_memory = .{ .parent = root.memoryParentPort() },
+        });
+        defer server.deinit();
+        try std.testing.expect(server.server.svc.owned_backend_runtime != null);
+        try std.testing.expect(root.snapshot().memory.used_bytes > 0);
+        _ = try server.server.svc.ensureBackendRuntime();
+    }
+    try std.testing.expectEqual(@as(u64, 0), root.snapshot().memory.used_bytes);
+    var borrowed = try @import("runtime_resources.zig").Owner.init(a, .{ .parent = root.memoryParentPort() });
+    defer borrowed.deinit();
+    {
+        var server = try Server.init(a, .{
+            .replica_root_dir = replicas,
+            .replica_catalog_path = catalog,
+            .snapshot_root_dir = snapshots,
+            .backend_runtime = borrowed.ptr(),
+        });
+        defer server.deinit();
+        try std.testing.expect(server.server.svc.owned_backend_runtime == null);
+        try std.testing.expectEqual(borrowed.ptr(), try server.server.svc.ensureBackendRuntime());
+    }
+    var lane = try borrowed.ptr().acquireControlLane();
+    defer lane.release();
+    const Work = struct {
+        fn run() u32 {
+            return 42;
+        }
+    };
+    var task = try lane.io().concurrent(Work.run, .{});
+    try std.testing.expectEqual(@as(u32, 42), task.await(lane.io()));
+}
+
+test "metadata runtime service memory shares one frozen scheduler across API and backend" {
+    const a = std.testing.allocator;
+    var admission = try startup_admission.Owner.init(a, .{}, 2048 << 20);
+    defer admission.deinit() catch @panic("metadata test scheduler retained");
+    const port = (try admission.port()).?;
+    var root = resource_manager_mod.ResourceManager.init(.{ .memory_budget = .{ .hard_limit_bytes = 2048 << 20 } });
+    defer root.deinit(a);
+    var runtime = try backend_runtime_mod.BackendRuntimeHandle.init(a, .{ .memory_parent = root.memoryParentPort(), .shared_sql_memory_parent = root.memoryParentPort(), .runnable_owner = port });
+    defer runtime.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const replicas = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/replicas", .{tmp.sub_path});
+    defer a.free(replicas);
+    const catalog = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/catalog", .{tmp.sub_path});
+    defer a.free(catalog);
+    const snapshots = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/snapshots", .{tmp.sub_path});
+    defer a.free(snapshots);
+    const cfg = admission.configureApi(.{});
+    try std.testing.expect(cfg.query_waiting.max_queued_requests > 0);
+    var server = try Server.init(a, .{ .replica_root_dir = replicas, .replica_catalog_path = catalog, .snapshot_root_dir = snapshots, .backend_runtime = runtime.ptr(), .api_server_cfg = cfg });
+    defer {
+        admission.close() catch @panic("metadata test scheduler close failed");
+        server.deinit();
+    }
+    const backend_owner = runtime.ptr().runnableOwner().?;
+    try std.testing.expectEqual(port.context, backend_owner.context);
+    const api = server.server.owned_public_http_server.?;
+    try std.testing.expect(api.runnableSchedulingStats().enabled);
+    const io = std.testing.io;
+    const borrow = @import("antfly_runtime_abi").io_abi.Borrow.init(&io);
+    var handle: ?*anyopaque = null;
+    const status = backend_owner.start(backend_owner.context, &.{ .io = &borrow, .class = @backingInt(@import("antfly_runtime_abi").runnable_abi.Class.background), .allow_wait = 0, .out_handle = &handle });
+    try std.testing.expect(status.isOk());
+    defer backend_owner.finish(handle.?);
+    try std.testing.expectEqual(@as(u64, 1), api.runnableSchedulingStats().runnable_slots);
+}
+
+test "metadata runtime cli frozen policy preserves fixed disabled and fail fast overrides" {
+    const a = std.testing.allocator;
+    _ = a;
+    const disabled: startup_admission.Owner = .{ .effective = try startup_admission.resolve(.{ .runnable = null, .query = .{ .max_concurrent_requests = 2, .waiting = .{} } }, 2048 << 20), .node = null };
+    try std.testing.expect((try disabled.port()) == null);
+    const disabled_api = disabled.configureApi(.{});
+    try std.testing.expect(disabled_api.runnable_owner_handle == null);
+    try std.testing.expectEqual(@as(u32, 2), disabled_api.query_max_concurrent_requests);
+    try std.testing.expectEqual(@as(u32, 0), disabled_api.query_waiting.max_queued_requests);
+    const fixed: startup_admission.Owner = .{ .effective = try startup_admission.resolve(.{ .runnable = .{ .capacity_mode = .fixed, .slots = 2 }, .query = .{ .max_concurrent_requests = 3, .waiting = .{} }, .max_request_memory_bytes = 32 << 20, .max_retained_memory_bytes = 24 << 20 }, 8 << 20), .node = null };
+    const fixed_api = fixed.configureApi(.{});
+    try std.testing.expectEqual(@as(usize, 32 << 20), fixed_api.request_memory_bytes);
+    try std.testing.expectEqual(@as(usize, 24 << 20), fixed_api.retained_memory_bytes);
+    try std.testing.expectEqual(@as(u32, 0), fixed_api.query_waiting.max_queued_requests);
 }

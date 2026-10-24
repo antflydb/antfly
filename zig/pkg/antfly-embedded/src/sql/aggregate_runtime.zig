@@ -98,7 +98,7 @@ fn addRows(context: anytype, bound: *const binding.Bound, grouped: anytype, allo
 // scalar instructions construct a temporary input row; retained aggregate
 // inputs contain the computed values, never the complete input row matrix.
 fn columnValues(context: anytype, bound: *const binding.Bound, a: std.mem.Allocator, page: catalog.ColumnPage, program: *const scalar.Program) ![]const Datum {
-    if (try @import("vector_eval.zig").evaluateColumnsScheduled(a, program, page, bound.input.columns, context.parameters, context.backend.execution_io)) |values| return values;
+    if (try @import("vector_eval.zig").evaluateColumnsWithScopes(a, program, page, bound.input.columns, context.parameters, context.backend.execution_io, context.backend.cpu_scope, context.backend.coordinator_scope)) |values| return values;
     const values = try a.alloc(Datum, page.selection.len);
     for (values, 0..) |*value, index| value.* = try context.evaluate(a, program.*, try bound.input.columnCells(a, page, index));
     return values;
@@ -129,7 +129,7 @@ pub fn addColumns(context: anytype, bound: *const binding.Bound, grouped: anytyp
             try slots.append(a, index);
         } else input_batches[index] = try constantBatch(a, accepted.selection.len);
     };
-    const outputs = try vector.evaluateColumnsEncodedMany(a, programs.items, accepted, bound.input.columns, context.parameters, context.backend.execution_io);
+    const outputs = try vector.evaluateColumnsEncodedManyWithScopes(a, programs.items, accepted, bound.input.columns, context.parameters, context.backend.execution_io, context.backend.cpu_scope, context.backend.coordinator_scope);
     for (key_batches, outputs[0..key_batches.len], programs.items[0..key_batches.len]) |*batch, output, program| batch.* = output orelse try scalarBatch(context, bound, a, accepted, program);
     for (slots.items, outputs[key_batches.len..], programs.items[key_batches.len..]) |slot, output, program| input_batches[slot] = output orelse try scalarBatch(context, bound, a, accepted, program);
     // Each FILTER cohort evaluates inputs only for accepted physical lanes.
@@ -167,7 +167,7 @@ pub fn addColumns(context: anytype, bound: *const binding.Bound, grouped: anytyp
                 input_batches[index] = try source.mask(a, positions.items, accepted.selection.len);
             }
         }
-        const encoded = try vector.evaluateColumnsEncodedMany(a, programs.items, selected, bound.input.columns, context.parameters, context.backend.execution_io);
+        const encoded = try vector.evaluateColumnsEncodedManyWithScopes(a, programs.items, selected, bound.input.columns, context.parameters, context.backend.execution_io, context.backend.cpu_scope, context.backend.coordinator_scope);
         for (programs.items, encoded, slots.items) |program, output, slot| {
             const source = try a.create(Batch);
             source.* = output orelse try scalarBatch(context, bound, a, selected, program);
@@ -315,7 +315,7 @@ fn loadMaterialized(context: anytype, bound: *const binding.Bound, grouped_owner
         try context.checkpoint();
         var arena = std.heap.ArenaAllocator.init(context.alloc);
         defer arena.deinit();
-        const partials = (try cursor.next(cursor.ptr, arena.allocator(), context.limits.executionRows())) orelse break;
+        const partials = (try cursor.nextFor(if (context.backend.cpu_scope) |scope| scope.execution else null, arena.allocator(), context.limits.executionRows())) orelse break;
         if (partials.len == 0 or partials.len > context.limits.executionRows()) return error.InvalidSqlBackendResponse;
         pages += 1;
         if (pages > context.limits.scan_pages or partials.len > context.limits.scan_rows -| groups) return error.SqlProgramLimitExceeded;
@@ -389,7 +389,7 @@ pub fn execute(context: anytype, statement: ast.Select) !@import("runtime.zig").
     const offset = try context.offsetCount(statement.offset);
     if (limit > context.limits.result_rows or offset > context.limits.scan_rows) return error.SqlProgramLimitExceeded;
     if (limit == 0) return .{ .columns = context.binding.columns, .command_tag = "SELECT" };
-    var grouped = try operators.Grouped.create(context.alloc, bound.specs, .{ .groups = context.limits.scan_rows, .bytes = context.limits.retained_bytes / 2, .spill = context.spill });
+    var grouped = try operators.Grouped.create(context.alloc, bound.specs, .{ .groups = context.limits.scan_rows, .bytes = context.limits.retained_bytes / 2, .spill = context.spill, .coordinator_scope = context.backend.coordinator_scope, .control = if (context.backend.scalar_control) |owner| .{ .ptr = owner.ptr, .checkpoint = owner.checkpoint } else null });
     defer grouped.deinit();
     // Backends without an Io still support bounded in-memory execution. A
     // zero-byte manager rejects spill admission before touching the filesystem.

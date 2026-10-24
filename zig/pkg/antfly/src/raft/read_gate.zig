@@ -229,6 +229,169 @@ pub const alreadyReadSafeBarrier = read_contract.alreadyReadSafeBarrier;
 pub const unavailableReadSafetyBarrier = read_contract.unavailableReadSafetyBarrier;
 pub const EnrichmentReadIndexRequester = read_contract.EnrichmentReadIndexRequester;
 pub const EnrichmentReadGate = read_contract.EnrichmentReadGate;
+
+test "read-index execution waits keep stale and already-safe reads free of false yields" {
+    const Wait = @import("antfly_local_sources").common_execution_wait.Boundary;
+    const Recorder = struct {
+        calls: usize = 0,
+        begins: usize = 0,
+        ends: usize = 0,
+        fn legacy(raw: *anyopaque, _: u64, _: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+        }
+        fn begin(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.begins += 1;
+        }
+        fn end(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.ends += 1;
+        }
+    };
+    var recorder: Recorder = .{};
+    const wait: Wait = .{ .ptr = &recorder, .begin = Recorder.begin, .end = Recorder.end };
+    const legacy: ReadSafetyBarrier = .{ .ptr = &recorder, .vtable = &.{ .wait_read_safe = Recorder.legacy } };
+    const gate = EnrichmentReadGate.init(legacy);
+    try gate.prepareScan(7, "", "", .{ .execution_wait = wait }, .stale);
+    try std.testing.expectEqual(@as(usize, 0), recorder.calls);
+    try std.testing.expectError(error.ExecutionWaitUnsupported, gate.prepareScan(7, "", "", .{ .execution_wait = wait }, .read_index));
+    try std.testing.expectEqual(@as(usize, 0), recorder.calls);
+    try gate.prepareScan(7, "", "", .{}, .read_index);
+    try std.testing.expectEqual(@as(usize, 1), recorder.calls);
+    try EnrichmentReadGate.init(alreadyReadSafeBarrier()).prepareScan(7, "", "", .{ .execution_wait = wait }, .read_index);
+    try std.testing.expectError(error.ReadSafetyBarrierUnavailable, EnrichmentReadGate.init(unavailableReadSafetyBarrier()).prepareScan(7, "", "", .{ .execution_wait = wait }, .read_index));
+    try std.testing.expectEqual(@as(usize, 0), recorder.begins);
+    try std.testing.expectEqual(@as(usize, 0), recorder.ends);
+}
+
+test "read-index execution waits preserve request identity and retire ownership after failed resume" {
+    const runnable = @import("antfly_local_sources").common_request_admission.runnable_scheduler;
+    const Wait = @import("antfly_local_sources").common_execution_wait.Boundary;
+    const Case = enum { success, canceled, deadline, shutdown, io_error, forbidden };
+    const Owner = struct {
+        execution: runnable.Execution = .{},
+        canceled: std.atomic.Value(bool) = .init(false),
+        revoked: bool = false,
+        fn requested(raw: *const anyopaque) bool {
+            const flag: *const std.atomic.Value(bool) = @ptrCast(@alignCast(raw));
+            return flag.load(.acquire);
+        }
+        fn begin(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try self.execution.park(.resource_blocked);
+        }
+        fn end(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try self.execution.enter(.query);
+            if (self.revoked) return error.Forbidden;
+        }
+    };
+    const Provider = struct {
+        io: std.Io,
+        owner: *Owner,
+        entered: std.Io.Event = .unset,
+        release: std.Io.Event = .unset,
+        fail: bool,
+        registered: bool = false,
+        continued: bool = false,
+        fn legacy(_: *anyopaque, _: u64, _: []const u8) !void {
+            return error.LegacyBarrierMustNotRun;
+        }
+        fn scheduled(raw: *anyopaque, group: u64, ctx: []const u8, wait: Wait) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expectEqual(@as(u64, 77), group);
+            try std.testing.expectEqualStrings("enrichment:scan:read_index", ctx);
+            self.registered = true;
+            defer self.registered = false;
+            // Registration/probing retains execution; only the actual event
+            // wait runs without a permit, under the same request identity.
+            const entry = &self.owner.execution.entry.?;
+            try std.testing.expectEqual(@import("antfly_local_sources").common_request_admission.runnable_scheduler.State.running, entry.scheduler.?.state(entry));
+            try wait.run(awaitReady, .{self});
+            try std.testing.expectEqualStrings("enrichment:scan:read_index", ctx);
+            self.continued = true;
+        }
+        fn awaitReady(self: *@This()) !void {
+            try std.testing.expect(self.registered);
+            self.entered.set(self.io);
+            try self.release.wait(self.io);
+            if (self.fail) return error.Timeout;
+        }
+    };
+    const Worker = struct {
+        provider: *Provider,
+        wait: Wait,
+        failure: ?anyerror = null,
+        fn run(self: *@This()) void {
+            const barrier: ReadSafetyBarrier = .{ .ptr = self.provider, .vtable = &.{ .wait_read_safe = Provider.legacy, .wait_read_safe_with_execution = Provider.scheduled } };
+            EnrichmentReadGate.init(barrier).prepareScan(77, "", "", .{ .execution_wait = self.wait }, .read_index) catch |err| {
+                self.failure = err;
+            };
+        }
+    };
+    const io = std.testing.io;
+    for (std.enums.values(Case)) |case| {
+        var scheduler = try runnable.Scheduler.init(.{ .slots = 2, .max_operations = 8, .max_bytes = 100, .control_bytes = 10, .max_wait_ms = 2000 });
+        defer scheduler.close();
+        var owner: Owner = .{};
+        defer owner.execution.finish();
+        const deadline: u64 = @intCast(std.Io.Clock.awake.now(io).addDuration(.fromMilliseconds(if (case == .deadline) 500 else 5000)).nanoseconds);
+        try owner.execution.start(&scheduler, .{ .io = io, .retained_bytes = 17, .deadline_ns = deadline, .cancellation = .{ .ptr = &owner.canceled, .requested = Owner.requested } }, .query);
+        var provider: Provider = .{ .io = io, .owner = &owner, .fail = case == .io_error };
+        var worker: Worker = .{ .provider = &provider, .wait = .{ .ptr = &owner, .begin = Owner.begin, .end = Owner.end } };
+        var group: std.Io.Group = .init;
+        defer group.cancel(io);
+        defer provider.release.set(io);
+        try group.concurrent(io, Worker.run, .{&worker});
+        try provider.entered.waitTimeout(io, .{ .duration = .{ .raw = .fromSeconds(3), .clock = .awake } });
+        try std.testing.expectEqual(@as(usize, 0), scheduler.stats().runnable_slots);
+        try std.testing.expectEqual(@as(usize, 1), scheduler.stats().resource_blocked);
+        try std.testing.expectEqual(@as(u64, 17), scheduler.stats().retained_bytes);
+        var other: runnable.Execution = .{};
+        defer other.finish();
+        try other.start(&scheduler, .{ .io = io }, .query);
+        var control: runnable.Execution = .{};
+        defer control.finish();
+        try control.start(&scheduler, .{ .io = io }, .control);
+        try std.testing.expectEqual(@as(usize, 2), scheduler.stats().runnable_slots);
+        control.finish();
+        switch (case) {
+            .canceled => owner.canceled.store(true, .release),
+            .deadline => try io.sleep(.fromMilliseconds(600), .awake),
+            .shutdown => scheduler.close(),
+            .forbidden => owner.revoked = true,
+            else => {},
+        }
+        provider.release.set(io);
+        if (case == .success or case == .io_error or case == .forbidden) {
+            const until = std.Io.Clock.awake.now(io).addDuration(.fromSeconds(3));
+            while (scheduler.stats().queued != 1) {
+                if (std.Io.Clock.awake.now(io).nanoseconds >= until.nanoseconds) return error.ResumeDidNotQueue;
+                try io.sleep(.fromMilliseconds(1), .awake);
+            }
+            other.finish();
+        }
+        try group.await(io);
+        try std.testing.expect(!provider.registered);
+        try std.testing.expectEqual(case == .success, provider.continued);
+        try std.testing.expectEqual(deadline, owner.execution.entry.?.options.deadline_ns.?);
+        try std.testing.expectEqual(@as(?anyerror, switch (case) {
+            .success => null,
+            .canceled => error.Canceled,
+            .deadline => error.DeadlineExceeded,
+            .shutdown => error.SchedulerClosed,
+            .io_error => error.Timeout,
+            .forbidden => error.Forbidden,
+        }), worker.failure);
+        other.finish();
+        owner.execution.finish();
+        try std.testing.expectEqual(@as(usize, 0), scheduler.stats().operations);
+        try std.testing.expectEqual(@as(usize, 0), scheduler.stats().runnable_slots);
+        try std.testing.expectEqual(@as(u64, 0), scheduler.stats().retained_bytes);
+        std.debug.print("read-index wait case {s}: request identity preserved, operations=0 slots=0\n", .{@tagName(case)});
+    }
+}
 test "frozen read quorum proof is observable without falsely completing apply" {
     var tracker = AppliedReadTracker.init(std.testing.allocator, 7);
     defer tracker.deinit();
@@ -479,4 +642,142 @@ test "applied read tracker never reuses identities after counter exhaustion" {
     try std.testing.expectError(error.AppliedReadIdentityExhausted, tracker.register(1, &buffer));
     try std.testing.expectError(error.AppliedReadIdentityExhausted, tracker.register(1, &buffer));
     try std.testing.expectEqual(@as(usize, 0), tracker.pendingCount());
+}
+
+test "frozen quorum admission lends CPU preserves captured proof and retires registrations" {
+    const a = std.testing.allocator;
+    const native = @import("antfly_local_sources").common_request_admission.runnable_scheduler;
+    const admission = @import("antfly_local_sources").common_read_admission;
+    const time = @import("antfly_platform").time;
+    const Mode = enum { success, newer_index, changed_term, changed_incarnation, lost_leadership, regressed_apply, older_quorum, unavailable_quorum, canceled, expired, shutdown };
+    const Fixture = struct {
+        execution: *native.Execution,
+        scheduler: *native.Scheduler,
+        tracker: *AppliedReadTracker,
+        mode: Mode,
+        retained: bool,
+        deadline: u64,
+        term: u64 = 3,
+        index: u64 = 10,
+        failure: ?anyerror = null,
+        live: bool = false,
+        waits: usize = 0,
+        callbacks: usize = 0,
+        pub fn checkpoint(self: *@This()) !void {
+            try self.checkLifetime();
+            try self.execution.checkpoint();
+        }
+        pub fn checkLifetime(self: *@This()) !void {
+            if (self.failure) |cause| return cause;
+            try self.execution.checkLifetime();
+        }
+        pub fn deadlineNs(self: *@This()) !?u64 {
+            return self.deadline;
+        }
+        pub fn waitForProgress(_: *@This()) !void {
+            return error.TestWrongProgressClock;
+        }
+        pub fn executionBoundary(self: *@This()) ?@import("antfly_local_sources").common_execution_wait.Boundary {
+            return .{ .ptr = self, .begin = begin, .end = end };
+        }
+        fn begin(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expect(self.live);
+            try std.testing.expectEqual(@as(usize, 1), self.tracker.waiters.count());
+            try self.execution.park(.resource_blocked);
+            try self.checkLifetime();
+            self.waits += 1;
+            try std.testing.expectEqual(@as(usize, 0), self.scheduler.stats().runnable_slots);
+            try std.testing.expectEqual(@as(usize, 1), self.scheduler.stats().operations);
+            try std.testing.expectEqual(@as(u64, 17), self.scheduler.stats().retained_bytes);
+            var health: native.Execution = .{};
+            try health.start(self.scheduler, .{ .io = std.testing.io, .allow_wait = false }, .control);
+            health.finish();
+        }
+        fn end(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            switch (self.mode) {
+                .success, .changed_incarnation, .lost_leadership, .regressed_apply, .older_quorum, .unavailable_quorum => {},
+                .newer_index => self.index = 11,
+                .changed_term => self.term = 4,
+                .canceled => self.failure = error.Canceled,
+                .expired => self.failure = error.DeadlineExceeded,
+                .shutdown => self.scheduler.close(),
+            }
+            try self.checkLifetime();
+            try self.execution.enter(.query);
+        }
+        fn waitSafe(_: *anyopaque, _: u64, _: []const u8) !void {}
+        fn legacy(raw: *anyopaque, _: u64, _: ReadSafetyBarrier.FrozenProof, _: ?u64, _: @import("antfly_cancellation").CancellationToken) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expectEqual(@as(usize, 1), self.scheduler.stats().runnable_slots);
+            return error.TestLegacyValidation;
+        }
+        fn validateRetained(raw: *anyopaque, group: u64, proof: ReadSafetyBarrier.FrozenProof, deadline: ?u64, cancellation: @import("antfly_cancellation").CancellationToken, control: ?admission.Port) !void {
+            return validate(raw, group, proof, deadline, cancellation, control orelse return error.TestMissingAdmission);
+        }
+        fn validate(raw: *anyopaque, group: u64, proof: ReadSafetyBarrier.FrozenProof, deadline: ?u64, cancellation: @import("antfly_cancellation").CancellationToken, control: admission.Port) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.callbacks += 1;
+            try std.testing.expectEqual(@as(u64, 7), group);
+            try std.testing.expectEqual(@as(?u64, self.deadline), deadline);
+            try cancellation.check();
+            var buffer: [160]u8 = undefined;
+            const registration = try self.tracker.register(group, &buffer);
+            defer self.tracker.cancel(registration.token);
+            self.live = true;
+            defer self.live = false;
+            try ReadSafetyBarrier.waitFrozenProgress(std.testing.io, control);
+            if (self.mode == .unavailable_quorum) return error.ReadUnavailable;
+            if (self.mode == .older_quorum) self.index = 9;
+            self.tracker.observeReadStates(group, &.{.{ .index = self.index, .request_ctx = @constCast(registration.request_ctx) }});
+            const index = self.tracker.takeObservedIndex(registration.token) orelse return error.TestMissingQuorumProof;
+            const incarnation: u128 = if (self.mode == .changed_incarnation) 8 else 7;
+            const leader = self.mode != .lost_leadership;
+            if (self.retained)
+                try proof.validateRetained(incarnation, self.term, leader, if (self.mode == .regressed_apply) 9 else 20, index)
+            else
+                try proof.validate(incarnation, self.term, leader, index);
+        }
+    };
+    for ([_]bool{ false, true }) |retained| {
+        for ([_]Mode{ .success, .newer_index, .changed_term, .changed_incarnation, .lost_leadership, .regressed_apply, .older_quorum, .unavailable_quorum, .canceled, .expired, .shutdown }) |mode| {
+            var scheduler = try native.Scheduler.init(.{ .slots = 2 });
+            var execution: native.Execution = .{};
+            try execution.start(&scheduler, .{ .io = std.testing.io, .allow_wait = false, .retained_bytes = 17 }, .query);
+            defer execution.finish();
+            var tracker = AppliedReadTracker.init(a, 7);
+            defer tracker.deinit();
+            try tracker.noteApplied(7, 10);
+            const deadline = time.monotonicNs() + 5 * std.time.ns_per_s;
+            var fixture: Fixture = .{ .execution = &execution, .scheduler = &scheduler, .tracker = &tracker, .mode = mode, .retained = retained, .deadline = deadline };
+            var bridge: admission.Adapter(*Fixture) = .{ .budget = &fixture };
+            const payload = bridge.payload();
+            const port = admission.Port.init(&payload);
+            const barrier: ReadSafetyBarrier = .{ .ptr = &fixture, .vtable = &.{ .wait_read_safe = Fixture.waitSafe, .validate_frozen = Fixture.legacy, .validate_frozen_with_admission = Fixture.validate, .validate_retained_snapshot = Fixture.validateRetained } };
+            const proof: ReadSafetyBarrier.FrozenProof = .{ .incarnation = 7, .term = 3, .applied_index = 10 };
+            const result = if (retained) barrier.validateRetainedSnapshotWithAdmission(7, proof, deadline + std.time.ns_per_s, .none, port) else barrier.validateFrozenWithAdmission(7, proof, deadline + std.time.ns_per_s, .none, port);
+            const success = mode == .success or (retained and mode == .newer_index) or (!retained and (mode == .regressed_apply or mode == .older_quorum));
+            if (success) {
+                try result;
+                const legacy: ReadSafetyBarrier = .{ .ptr = &fixture, .vtable = &.{ .wait_read_safe = Fixture.waitSafe, .validate_frozen = Fixture.legacy } };
+                try std.testing.expectError(error.TestLegacyValidation, legacy.validateFrozenWithAdmission(7, proof, null, .none, port));
+                try std.testing.expectError(error.TestLegacyValidation, legacy.validateRetainedSnapshotWithAdmission(7, proof, null, .none, port));
+            } else try std.testing.expectError(switch (mode) {
+                .newer_index, .regressed_apply, .older_quorum, .unavailable_quorum => error.ReadUnavailable,
+                .changed_term, .changed_incarnation, .lost_leadership => error.NotLeader,
+                .canceled => error.Canceled,
+                .expired => error.DeadlineExceeded,
+                .shutdown => error.SchedulerClosed,
+                .success => unreachable,
+            }, result);
+            try std.testing.expect(!fixture.live);
+            try std.testing.expectEqual(@as(usize, 1), fixture.callbacks);
+            try std.testing.expectEqual(@as(usize, 1), fixture.waits);
+            try std.testing.expectEqual(@as(usize, 0), tracker.waiters.count());
+            execution.finish();
+            try std.testing.expectEqual(@as(usize, 0), scheduler.stats().operations);
+            try std.testing.expectEqual(@as(u64, 0), scheduler.stats().retained_bytes);
+        }
+    }
 }

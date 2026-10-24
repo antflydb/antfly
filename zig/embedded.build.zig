@@ -24,6 +24,9 @@ pub fn build(b: *std.Build) void {
 }
 
 pub fn buildDependency(b: *std.Build, comptime asking_build_zig: type) void {
+    const joinable_threaded = @import("build_support/joinable_threaded.zig");
+    const owned_worker_library = joinable_threaded.prepare(b);
+    defer joinable_threaded.attach(b, owned_worker_library);
     defer @import("antfly_platform").finalizeMacosSdk(b);
     const shared = dependencies.create(b, asking_build_zig) orelse return;
     defer {

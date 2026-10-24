@@ -51,6 +51,7 @@ BUILD_INPUTS = {
     "zig/lib/tokenizer/testdata/embedder/tokenizer.json",
     "zig/tools/build_support.zig",
     "zig/tools/check_files_equal.zig",
+    "zig/tools/prepare_joinable_threaded.py",
     "zig/examples/antfly_wasm.zig",
     "zig/examples/antfly_c_smoke.c",
     "scripts/yaml_to_json.py",
@@ -81,6 +82,11 @@ def selected(path: str) -> bool:
     if path in BUILD_INPUTS:
         return True
     if not path.startswith(SOURCE_OWNERS):
+        return False
+    # Standalone library test entrypoints are not consumer dependencies. Any
+    # actually imported source is restored by the literal dependency closure
+    # below and still passes the fail-closed license check.
+    if path.startswith("zig/lib/") and path.endswith("_test_root.zig"):
         return False
     # Compile-time embedded fixtures are added individually below, instead of
     # shipping complete third-party fuzz corpora and training datasets.

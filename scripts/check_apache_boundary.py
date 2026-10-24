@@ -290,6 +290,7 @@ SOURCE_MODULES = {
     "inference_audio": ("zig/lib/audio/src/mod.zig",),
     "inference_chunker": ("zig/lib/chunker/src/mod.zig",),
     "inference_client": ("zig/pkg/inference-client/src/root.zig",),
+    "inference_execution_control": ("zig/pkg/inference/src/execution_control.zig",),
     "inference_finetune_assets": (
         "zig/pkg/inference/src/finetune_assets_colqwen2.zig",
         "zig/pkg/inference/src/finetune_assets_entity_cleanup.zig",

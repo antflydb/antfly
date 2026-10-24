@@ -62,6 +62,7 @@ pub const Join = struct {
     };
     a: A,
     manager: *spill.Manager,
+    execution: ?*@import("../common/runnable_scheduler.zig").Execution = null,
     limits: operators.HashJoin.Limits,
     partitions: usize,
     workspace_bytes: usize,
@@ -123,6 +124,51 @@ pub const Join = struct {
         };
         self.output.?.finish(failure);
         return true;
+    }
+    /// Only this worker owns these files/hash state. Preparation detaches
+    /// every receiver before handing the state back to the coordinator.
+    fn bindExecution(self: *Join, execution: ?*@import("../common/runnable_scheduler.zig").Execution) void {
+        self.execution = execution;
+        self.limits.execution = execution;
+        if (self.skew) |skew| {
+            skew.execution = execution;
+            if (skew.matches) |*file| file.execution = execution;
+        }
+
+        for (&self.build, &self.probes) |*build, *probe| {
+            if (build.*) |*file| file.file.execution = execution;
+            if (probe.*) |*file| file.file.execution = execution;
+        }
+        if (self.active) |*task| {
+            if (task.build) |*file| file.file.execution = execution;
+            if (task.probes) |*file| file.file.execution = execution;
+        }
+        for (self.pending[0..self.pending_count]) |*task| {
+            if (task.build) |*file| file.file.execution = execution;
+            if (task.probes) |*file| file.file.execution = execution;
+        }
+        if (self.hash) |hash| {
+            hash.limits.execution = execution;
+            if (hash.disk) |*file| file.execution = execution;
+        }
+    }
+    fn executeChild(self: *Join, execution: *@import("../common/runnable_scheduler.zig").Execution) anyerror!bool {
+        self.bindExecution(execution);
+        defer self.bindExecution(null);
+        self.output.?.producer_execution = execution;
+        defer self.output.?.producer_execution = null;
+        return self.executePartition();
+    }
+    fn prepareChild(self: *Join, execution: *@import("../common/runnable_scheduler.zig").Execution) anyerror!bool {
+        self.bindExecution(execution);
+        defer self.bindExecution(null);
+        return self.prepare();
+    }
+    // Parent-owned Join retains every prepared result and closes it on errors;
+    // task result is only status, with no separately transferred allocation.
+    fn discardStatus(_: A, _: bool) void {}
+    fn retiredOutput(args: anytype, failure: ?anyerror) void {
+        if (failure != null) args[0].output.?.abort(failure);
     }
     fn spoolPartition(self: *Join, file: *@import("parallel_output.zig").Pipe) !void {
         var arena = std.heap.ArenaAllocator.init(self.a);
@@ -224,14 +270,20 @@ pub const Join = struct {
                 slot.* = child;
                 if (self.evaluation != null) {
                     child.output = try @import("parallel_output.zig").Pipe.create(self.manager, child.limits.bytes / 64);
-                    child.output_task = @import("parallel_scheduler.zig").global().submit(self.manager.io, child.limits.bytes, Join.executePartition, .{child});
+                    child.output_task = if (self.manager.cpu_scope) |scope|
+                        try scope.submitNotified(child.limits.bytes +| @sizeOf(Join), self.a, Join.executeChild, .{child}, discardStatus, retiredOutput)
+                    else
+                        self.manager.submit(child.limits.bytes, Join.executePartition, .{child});
                     if (child.output_task == null) {
                         child.output.?.close();
                         child.output = null;
                         _ = try child.prepare();
                     } else self.parallel_builds_started += 1;
                 } else {
-                    task.* = @import("parallel_scheduler.zig").global().submit(self.manager.io, child.limits.bytes, Join.prepare, .{child});
+                    task.* = if (self.manager.cpu_scope) |scope|
+                        try scope.submit(child.limits.bytes +| @sizeOf(Join), self.a, Join.prepareChild, .{child}, discardStatus)
+                    else
+                        self.manager.submit(child.limits.bytes, Join.prepare, .{child});
                     if (task.* == null) _ = try child.prepare() else self.parallel_builds_started += 1;
                 }
                 break;
@@ -318,8 +370,11 @@ pub const Join = struct {
         const target = @max(@as(usize, 1), bytes / 16);
         const wanted = @min(@as(u64, 16), @max(@as(u64, 2), build_bytes / target + 1));
         const partitions = std.math.ceilPowerOfTwo(usize, @intCast(wanted)) catch unreachable;
-        const lanes = requested_lanes orelse @import("parallel_scheduler.zig").global().fanout(partitions, bytes, 256 * 1024);
-        const parallel = !assigned and bytes >= 512 * 1024 and lanes >= 2;
+        const lanes = requested_lanes orelse if (manager.cpu_scope != null)
+            @max(1, @min(@as(usize, 8), @min(partitions, bytes / (256 * 1024))))
+        else
+            @import("parallel_scheduler.zig").global().fanout(partitions, bytes, 256 * 1024);
+        const parallel = !assigned and bytes >= 512 * 1024 and lanes >= 2 and (manager.parallel_work or manager.cpu_scope != null);
         self.* = .{ .a = a, .manager = manager, .workspace_bytes = bytes, .build_lanes = lanes, .limits = .{ .bytes = @max(8192, if (parallel) bytes / (lanes + 1) else bytes), .rows = rows, .spill = manager }, .partitions = partitions, .outer_left = outer_left, .outer_right = outer_right, .scratch = .init(a), .candidate = .init(a), .output_arena = .init(a), .filter = filter, .parallel_builds = parallel };
         return self;
     }
@@ -328,7 +383,7 @@ pub const Join = struct {
         var offset = begin;
         const key_batch: @import("execution_batch.zig").Batch = .{ .rows = keys };
         while (offset < keys.len) {
-            try self.manager.check();
+            try self.manager.checkFor(self.execution);
             var arena = std.heap.ArenaAllocator.init(self.a);
             defer arena.deinit();
             const a = arena.allocator();
@@ -468,7 +523,7 @@ pub const Join = struct {
         if (self.outer_right) try self.hash.?.markMatched(index);
     }
     fn partitionFile(self: *Join) !spill.Sequential {
-        var file = try spill.Sequential.init(self.manager, @min(4096, self.workspace_bytes / 512));
+        var file = try spill.Sequential.initFor(self.manager, @min(4096, self.workspace_bytes / 512), self.execution);
         file.buffer_bytes = @max(128, @min(4096, self.workspace_bytes / 512));
         return file;
     }
@@ -490,7 +545,7 @@ pub const Join = struct {
                 file.rewind();
                 var offset: u64 = 0;
                 while (offset < file.size) {
-                    try self.manager.check();
+                    try self.manager.checkFor(self.execution);
                     _ = self.scratch.reset(.free_all);
                     var input = try file.readInputBlockBorrowed(offset);
                     defer input.deinit();
@@ -532,7 +587,7 @@ pub const Join = struct {
         return true;
     }
     fn compactSkewInput(self: *Join, source: *spill.Sequential) !void {
-        var compact = try spill.Sequential.init(self.manager, @max(512, @min(32 * 1024, self.limits.bytes / 16)));
+        var compact = try spill.Sequential.initFor(self.manager, @max(512, @min(32 * 1024, self.limits.bytes / 16)), self.execution);
         errdefer compact.close();
         compact.buffer_bytes = @max(128, @min(4096, self.limits.bytes / 64));
         source.rewind();
@@ -553,7 +608,7 @@ pub const Join = struct {
     }
     fn prepare(self: *Join) anyerror!bool {
         while (self.hash == null and self.skew == null) {
-            try self.manager.check();
+            try self.manager.checkFor(self.execution);
             if (self.active == null) {
                 if (self.pending_count != 0) {
                     self.pending_count -= 1;
@@ -578,6 +633,7 @@ pub const Join = struct {
             if (self.active.?.build) |*file| {
                 var offset: u64 = 0;
                 while (offset < file.size) {
+                    try self.manager.checkFor(self.execution);
                     var input = try file.readInputBlock(offset);
                     defer input.deinit();
                     const block = input.view();
@@ -591,7 +647,40 @@ pub const Join = struct {
                         for (row, 0..) |*cell, column| cell.* = try block.keyCell(index, column);
                         key.* = row;
                     }
-                    const consumed = try self.hash.?.addBatchUntilFull(self.a, values, keys[0..block.count()]);
+                    const consumed = self.hash.?.addBatchUntilFull(self.a, values, keys[0..block.count()]) catch |err| {
+                        if (err != error.OutOfMemory) return err;
+                        // The shared statement allocator can deny growth even
+                        // when the hash's local estimate fits. Typed appends
+                        // may already be partial, so retire the entire hash
+                        // before splitting and replaying the immutable build.
+                        // No prefix is published or transferred twice.
+                        self.hash.?.deinit();
+                        self.hash = null;
+                        _ = self.scratch.reset(.free_all);
+                        file.rewind();
+                        var replay: u64 = 0;
+                        var all_hash_union: u64 = 0;
+                        var all_hash_intersection: u64 = std.math.maxInt(u64);
+                        while (replay < file.size) {
+                            try self.manager.checkFor(self.execution);
+                            const scanned = try file.readBatchBorrowed(replay, 256);
+                            for (scanned.rows) |row| {
+                                const h = (try operators.HashJoin.keyHash(row.keys)) orelse 0;
+                                all_hash_union |= h;
+                                all_hash_intersection &= h;
+                            }
+                            replay = scanned.following;
+                        }
+                        if (!try self.split(all_hash_union ^ all_hash_intersection)) {
+                            try self.compactSkewInput(file);
+                            if (self.active.?.probes) |*probes| try self.compactSkewInput(probes);
+                            self.skew = try @import("skew_join.zig").Join.createFor(self.manager, self.outer_left, self.outer_right, self.execution);
+                            file.rewind();
+                            break;
+                        }
+                        repartitioned = true;
+                        break;
+                    };
                     offset += consumed;
                     if (consumed == block.count()) continue;
                     // Exact ingestion summaries include unread blocks. Do
@@ -608,7 +697,7 @@ pub const Join = struct {
                     self.hash = null;
                     try self.compactSkewInput(file);
                     if (self.active.?.probes) |*probes| try self.compactSkewInput(probes);
-                    self.skew = try @import("skew_join.zig").Join.create(self.manager, self.outer_left, self.outer_right);
+                    self.skew = try @import("skew_join.zig").Join.createFor(self.manager, self.outer_left, self.outer_right, self.execution);
                     file.rewind();
                     break;
                 }
@@ -965,7 +1054,7 @@ pub const Join = struct {
     fn nextNativePair(self: *Join, may_advance: bool) anyerror!?NativePair {
         if (!may_advance and self.hash == null and self.skew == null) return null;
         while (try self.prepare()) {
-            try self.manager.check();
+            try self.manager.checkFor(self.execution);
             if (self.skew) |skew| {
                 if (try skew.nextNative(&self.active.?.build.?, if (self.active.?.probes) |*file| file else null, may_advance)) |pair| return .{
                     .left = if (pair.left) |row| .{ .source = .{ .probe = row.block }, .index = row.index, .width = row.block.width() } else null,
@@ -1394,100 +1483,264 @@ test "SQL compact probe blocks retain rows through duplicate matches and early c
     }
 }
 
-test "SQL partitioned join block skew fallback preserves residual outer matches and bounded replay" {
-    const a = std.testing.allocator;
-    var context: u8 = 0;
-    var manager: spill.Manager = .{ .alloc = a, .io = std.testing.io, .context = &context, .checkpoint = struct {
-        fn check(_: *anyopaque) !void {}
-    }.check, .async_writes = false };
-    defer manager.deinit();
-    const join = try Join.create(a, &manager, 32 * 1024, 2000, 0, true, true);
-    defer join.close();
-    const key = Datum.json(.{ .integer = 7 });
-    for (0..1200) |i| try join.add(true, &.{Datum.json(.{ .integer = @intCast(i) })}, &.{key}, i);
-    for (0..40) |i| try join.add(false, &.{Datum.json(.{ .integer = @intCast(i) })}, &.{key}, i);
-    var accepted: usize = 0;
-    var left_only: usize = 0;
-    var right_only: usize = 0;
-    while (try join.next()) |pair| {
-        if (pair.match) |match| {
-            if (pair.left.?[0].value.integer == pair.right.?[0].value.integer and pair.left.?[0].value.integer < 20) {
-                try join.accept(match);
-                accepted += 1;
-            }
-        } else if (pair.left != null) left_only += 1 else right_only += 1;
-    }
-    try std.testing.expectEqual(@as(usize, 20), accepted);
-    try std.testing.expectEqual(@as(usize, 20), left_only);
-    try std.testing.expectEqual(@as(usize, 1180), right_only);
-    try std.testing.expect(join.skew_blocks_read != 0);
-    try std.testing.expect(join.skew_blocks_read < 1200 * 4);
-    std.debug.print("SQL skew join: candidates=48000 typed_build_block_decodes={d}\n", .{join.skew_blocks_read});
-}
-
-fn skewEarlyClose(a: A) !void {
-    var context: u8 = 0;
-    var manager: spill.Manager = .{ .alloc = a, .io = std.testing.io, .context = &context, .checkpoint = struct {
-        fn check(_: *anyopaque) !void {}
-    }.check, .async_writes = false };
-    defer manager.deinit();
-    var build = try spill.Sequential.init(&manager, 1024);
-    defer build.close();
-    var probes = try spill.Sequential.init(&manager, 1024);
-    defer probes.close();
-    const key = Datum.json(.{ .integer = 7 });
-    for (0..3) |i| _ = try build.append(.{ .values = &.{Datum.json(.{ .integer = @intCast(i) })}, .keys = &.{key}, .ordinal = i }, spill.none);
-    _ = try probes.append(.{ .values = &.{key}, .keys = &.{key}, .ordinal = 0 }, spill.none);
-    try build.seal();
-    try probes.seal();
-    const skew = try @import("skew_join.zig").Join.create(&manager, true, true);
-    defer skew.close();
-    const first = (try skew.next(&build, &probes)) orelse return error.TestUnexpectedResult;
-    try skew.accept(first.match orelse return error.TestUnexpectedResult);
-}
-
-test "SQL partitioned join block skew releases typed inputs and match state on early close and allocation faults" {
-    try skewEarlyClose(std.testing.allocator);
-    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, skewEarlyClose, .{});
-}
-
-test "SQL parallel partition residuals use logical output permutations" {
-    const a = std.testing.allocator;
-    const Hook = struct {
-        fn check(_: *anyopaque) !void {}
+test "SQL scoped join workers preserve residual outer semantics and physically retire original failures" {
+    const Runnable = @import("../common/runnable_scheduler.zig");
+    const Mode = enum { prepared, complete, typed, early_close, canceled, deadline, revoked, registry_full };
+    const Clock = struct {
+        var now_ns: std.atomic.Value(u64) = .init(0);
+        fn now() u64 {
+            return now_ns.load(.acquire);
+        }
     };
-    for ([_]bool{ false, true }) |flipped| {
-        var dummy: u8 = 0;
-        var manager: spill.Manager = .{ .alloc = a, .io = std.testing.io, .context = &dummy, .checkpoint = Hook.check };
+    const Fixture = struct {
+        execution: *Runnable.Execution,
+        revoked: bool = false,
+        invalid_callbacks: std.atomic.Value(usize) = .init(0),
+        fn requested(raw: *const anyopaque) bool {
+            return @as(*const std.atomic.Value(bool), @ptrCast(@alignCast(raw))).load(.acquire);
+        }
+        fn check(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const state = self.execution.entry.?.state;
+            if (state != .running and state != .stopped) {
+                _ = self.invalid_callbacks.fetchAdd(1, .monotonic);
+                return error.TestUnexpectedCoordinatorCallback;
+            }
+            try self.execution.checkpoint();
+            if (self.revoked) return error.Forbidden;
+        }
+        fn begin(raw: *anyopaque) !void {
+            try check(raw);
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try self.execution.park(.resource_blocked);
+        }
+        fn end(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try self.execution.enter(.query);
+            try check(raw);
+        }
+    };
+    const a = std.testing.allocator;
+    for (std.enums.values(Mode)) |mode| {
+        Clock.now_ns.store(0, .release);
+        var scheduler = try Runnable.Scheduler.init(.{ .slots = 2, .checkpoint_budget = 1, .max_operations = if (mode == .registry_full) 2 else 32 });
+        var cancel: std.atomic.Value(bool) = .init(false);
+        var execution: Runnable.Execution = .{};
+        try execution.start(&scheduler, .{ .io = std.testing.io, .deadline_ns = 100, .native_now_ns = Clock.now, .cancellation = .{ .ptr = &cancel, .requested = Fixture.requested } }, .query);
+        defer execution.finish();
+        var fixture = Fixture{ .execution = &execution };
+        const boundary = @import("execution_wait.zig").Boundary{ .ptr = &fixture, .begin = Fixture.begin, .end = Fixture.end };
+        var manager = spill.Manager{ .alloc = a, .io = std.testing.io, .context = &fixture, .checkpoint = Fixture.check, .parallel_work = false, .async_writes = false, .wait = boundary, .cpu_scope = .{ .execution = &execution, .allocator = a, .io = std.testing.io, .wait = boundary } };
         defer manager.deinit();
-        var compiled = try @import("compiler.zig").compileScalar(a, if (flipped) "rk=lk AND rv-lv = -10000" else "rk=lk AND rv-lv = 10000", .{});
+        var compiled = try @import("compiler.zig").compileScalar(a, "l = r AND l <> 777", .{});
         defer compiled.deinit();
-        var condition = try @import("scalar.zig").bind(a, compiled.expression, &.{ .{ .name = "rk", .type = .integer }, .{ .name = "rv", .type = .integer }, .{ .name = "lk", .type = .integer }, .{ .name = "lv", .type = .integer } }, &.{}, .{});
+        var condition = try @import("scalar.zig").bind(a, compiled.expression, &.{ .{ .name = "l", .type = .integer }, .{ .name = "r", .type = .integer } }, &.{}, .{});
         defer condition.deinit();
-        const join = try Join.create(a, &manager, 512 * 1024, 10000, 200000, false, false);
-        defer join.close();
-        join.evaluation = .{ .condition = &condition, .left_width = 2, .right_width = 2, .flipped = flipped, .output_order = &.{ 2, 3, 0, 1 } };
-        for (0..512) |i| {
-            const key = Datum.json(.{ .integer = @intCast(i) });
-            try join.add(true, &.{ key, Datum.json(.{ .integer = @intCast(i + 20000) }) }, &.{key}, i);
-        }
-        for (0..512) |i| {
-            const key = Datum.json(.{ .integer = @intCast(i) });
-            try join.add(false, &.{ key, Datum.json(.{ .integer = @intCast(i + 10000) }) }, &.{key}, i);
-        }
-        var count: usize = 0;
-        while (try join.nextTypedBatch(137)) |view| {
-            defer view.deinit();
-            for (0..view.count) |row| {
-                const values = view.values();
-                const left = (try values.cell(a, row, 1)).value.integer;
-                const right = (try values.cell(a, row, 3)).value.integer;
-                try std.testing.expectEqual(@as(i64, 10000), right - left);
-                count += 1;
+        {
+            const join = try Join.create(a, &manager, 512 * 1024, 10000, 200000, true, true);
+            defer join.close();
+            if (mode != .prepared) join.evaluation = .{ .condition = &condition, .left_width = 1, .right_width = 1 };
+            for (0..1000) |index| {
+                const key = Datum.json(.{ .integer = @intCast(index) });
+                try join.add(true, &.{key}, &.{key}, index);
+            }
+            for (500..1500) |index| {
+                const key = Datum.json(.{ .integer = @intCast(index) });
+                try join.add(false, &.{key}, &.{key}, index);
+            }
+            try join.finishInputs();
+            try std.testing.expect(join.parallel_builds);
+            try join.startBuilds();
+            if (mode == .registry_full) {
+                try std.testing.expectEqual(@as(usize, 0), join.parallel_builds_started);
+                try std.testing.expectEqual(@as(usize, 0), execution.entry.?.children);
+            } else {
+                try std.testing.expect(join.parallel_builds_started >= 2);
+                try std.testing.expect(execution.entry.?.children >= 2);
+            }
+            var health: Runnable.Execution = .{};
+            try health.start(&scheduler, .{ .io = std.testing.io, .allow_wait = false }, .control);
+            try health.checkpoint();
+            health.finish();
+            switch (mode) {
+                .early_close => {},
+                .canceled => {
+                    cancel.store(true, .release);
+                    try std.testing.expectError(error.Canceled, join.next());
+                },
+                .deadline => {
+                    Clock.now_ns.store(100, .release);
+                    try std.testing.expectError(error.DeadlineExceeded, join.next());
+                },
+                .revoked => {
+                    fixture.revoked = true;
+                    try std.testing.expectError(error.Forbidden, join.next());
+                },
+                .prepared, .complete, .typed, .registry_full => {
+                    var matches: usize = 0;
+                    var lefts: usize = 0;
+                    var rights: usize = 0;
+                    if (mode == .typed) {
+                        while (try join.nextTypedBatch(17)) |view| {
+                            defer view.deinit();
+                            for (0..view.count) |row| {
+                                const left = (try view.keys().cell(a, row, 0)).value.bool;
+                                const right = (try view.keys().cell(a, row, 1)).value.bool;
+                                if (left and right) {
+                                    const l = (try view.values().cell(a, row, 0)).value.integer;
+                                    try std.testing.expectEqual(l, (try view.values().cell(a, row, 1)).value.integer);
+                                    try std.testing.expect(l != 777);
+                                    matches += 1;
+                                } else if (left) {
+                                    try std.testing.expect((try view.values().cell(a, row, 1)).sql_null);
+                                    lefts += 1;
+                                } else {
+                                    try std.testing.expect((try view.values().cell(a, row, 0)).sql_null);
+                                    rights += 1;
+                                }
+                            }
+                        }
+                    } else while (try join.next()) |pair| {
+                        if (join.active_join) |child| if (child.output == null) {
+                            try std.testing.expect(child.execution == null and child.limits.execution == null);
+                            if (child.hash) |hash| {
+                                try std.testing.expect(hash.limits.execution == null);
+                                if (hash.disk) |file| try std.testing.expect(file.execution == null);
+                            }
+                        };
+                        if (pair.match) |index| {
+                            if (pair.left.?[0].value.integer == 777) continue;
+                            try join.accept(index);
+                        }
+                        if (pair.left != null and pair.right != null) {
+                            try std.testing.expectEqual(pair.left.?[0].value.integer, pair.right.?[0].value.integer);
+                            try std.testing.expect(pair.left.?[0].value.integer != 777);
+                            matches += 1;
+                        } else if (pair.left != null) lefts += 1 else rights += 1;
+                    }
+                    try std.testing.expectEqual(@as(usize, 499), matches);
+                    try std.testing.expectEqual(@as(usize, 501), lefts);
+                    try std.testing.expectEqual(@as(usize, 501), rights);
+                },
             }
         }
-        try std.testing.expectEqual(@as(usize, 512), count);
-        try std.testing.expect(join.parallel_partitions_completed > 1);
+        switch (mode) {
+            .prepared, .complete, .typed, .early_close, .registry_full => try execution.checkpoint(),
+            .canceled, .deadline, .revoked => {},
+        }
+        try std.testing.expectEqual(@as(usize, 0), fixture.invalid_callbacks.load(.acquire));
+        try std.testing.expectEqual(@as(usize, 0), manager.files);
+        try std.testing.expectEqual(@as(u64, 0), manager.live_bytes);
+        try std.testing.expectEqual(@as(usize, 0), scheduler.stats().child_operations);
+        try std.testing.expectEqual(@as(u64, 0), scheduler.stats().retained_bytes);
+        try std.testing.expectEqual(@as(usize, 0), execution.entry.?.children);
+    }
+}
+
+test "SQL scoped join preparation detaches recursive partitions and identical key disk chains before handoff" {
+    const Runnable = @import("../common/runnable_scheduler.zig");
+    const Fixture = struct {
+        execution: *Runnable.Execution,
+        invalid_callbacks: std.atomic.Value(usize) = .init(0),
+        fn check(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.execution.entry.?.state != .running) {
+                _ = self.invalid_callbacks.fetchAdd(1, .monotonic);
+                return error.TestUnexpectedCoordinatorCallback;
+            }
+            try self.execution.checkpoint();
+        }
+        fn begin(raw: *anyopaque) !void {
+            try check(raw);
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try self.execution.park(.resource_blocked);
+        }
+        fn end(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try self.execution.enter(.query);
+        }
+        fn detached(join: *Join) !void {
+            try std.testing.expect(join.execution == null and join.limits.execution == null);
+            if (join.active) |task| {
+                if (task.build) |file| try std.testing.expect(file.file.execution == null);
+                if (task.probes) |file| try std.testing.expect(file.file.execution == null);
+            }
+            for (join.pending[0..join.pending_count]) |task| {
+                if (task.build) |file| try std.testing.expect(file.file.execution == null);
+                if (task.probes) |file| try std.testing.expect(file.file.execution == null);
+            }
+            if (join.hash) |hash| {
+                try std.testing.expect(hash.limits.execution == null);
+                if (hash.disk) |file| try std.testing.expect(file.execution == null);
+            }
+        }
+    };
+    const a = std.testing.allocator;
+    for ([_]bool{ false, true }) |identical| {
+        var owner = try Runnable.Scheduler.init(.{ .slots = 2, .checkpoint_budget = 1 });
+        var execution: Runnable.Execution = .{};
+        try execution.start(&owner, .{ .io = std.testing.io }, .query);
+        defer execution.finish();
+        var fixture = Fixture{ .execution = &execution };
+        const boundary = @import("execution_wait.zig").Boundary{ .ptr = &fixture, .begin = Fixture.begin, .end = Fixture.end };
+        const scope = @import("parallel_scheduler.zig").ExecutionScope{ .execution = &execution, .allocator = a, .io = std.testing.io, .wait = boundary };
+        var manager = spill.Manager{ .alloc = a, .io = std.testing.io, .context = &fixture, .checkpoint = Fixture.check, .parallel_work = false, .async_writes = false, .wait = boundary, .cpu_scope = scope };
+        defer manager.deinit();
+        {
+            const join = try Join.createWithLanes(&manager, 16 * 1024, 10000, 0, true, true, 1, true);
+            defer join.close();
+            join.active = .{ .build = try join.partitionFile(), .probes = null, .used_bits = 0 };
+            join.partitions = 0;
+            join.finished = true;
+            for (0..1000) |index| {
+                const key = Datum.json(.{ .integer = if (identical) 7 else @intCast(index) });
+                _ = try join.active.?.build.?.append(.{ .values = &.{key}, .keys = &.{key}, .ordinal = index }, spill.none);
+                join.active.?.hashes.add((try operators.HashJoin.keyHash(&.{key})).?);
+            }
+            try join.active.?.build.?.seal();
+            join.active.?.probes = try join.partitionFile();
+            if (identical) {
+                const key = Datum.json(.{ .integer = 7 });
+                _ = try join.active.?.probes.?.append(.{ .values = &.{key}, .keys = &.{key}, .ordinal = 0 }, spill.none);
+            } else {
+                for (950..1050) |index| {
+                    const key = Datum.json(.{ .integer = @intCast(index) });
+                    _ = try join.active.?.probes.?.append(.{ .values = &.{key}, .keys = &.{key}, .ordinal = index }, spill.none);
+                }
+            }
+            try join.active.?.probes.?.seal();
+            var task = (try scope.submit(16 * 1024 + @sizeOf(Join), a, Join.prepareChild, .{join}, Join.discardStatus)).?;
+            defer if (task.future != null) {
+                _ = task.cancel(std.testing.io) catch false;
+            };
+            try std.testing.expect(try task.await(std.testing.io));
+            try Fixture.detached(join);
+            if (identical) {
+                try std.testing.expect(join.skew != null);
+                try std.testing.expect(join.skew.?.execution == null);
+                if (join.skew.?.matches) |file| try std.testing.expect(file.execution == null);
+            } else {
+                try std.testing.expect(join.repartitions > 0 and join.pending_count > 0);
+            }
+            var matches: usize = 0;
+            var lefts: usize = 0;
+            var rights: usize = 0;
+            while (try join.next()) |pair| {
+                if (pair.match) |index| {
+                    try std.testing.expectEqual(pair.left.?[0].value.integer, pair.right.?[0].value.integer);
+                    try join.accept(index);
+                    matches += 1;
+                } else if (pair.left != null) lefts += 1 else rights += 1;
+            }
+            try std.testing.expectEqual(@as(usize, if (identical) 1000 else 50), matches);
+            try std.testing.expectEqual(@as(usize, if (identical) 0 else 50), lefts);
+            try std.testing.expectEqual(@as(usize, if (identical) 0 else 950), rights);
+        }
+        try std.testing.expectEqual(@as(usize, 0), fixture.invalid_callbacks.load(.acquire));
+        try std.testing.expectEqual(@as(usize, 0), manager.files);
+        try std.testing.expectEqual(@as(u64, 0), manager.live_bytes);
+        try std.testing.expectEqual(@as(usize, 0), owner.stats().child_operations);
+        try std.testing.expectEqual(@as(u64, 0), owner.stats().retained_bytes);
     }
 }
 
@@ -1829,10 +2082,10 @@ test "SQL rejected partition candidates bound output scratch" {
     try Fixture.run(64, 128, 128 << 10);
 }
 
-test "SQL native partition row references preserve duplicate cohorts and disk fallbacks" {
+test "SQL native partition row references preserve duplicate cohorts and bounded skew fallbacks" {
     const Fixture = struct {
         fn check(_: *anyopaque) !void {}
-        fn run(a: A, disk: bool, output_failure: bool) !void {
+        fn run(a: A, skewed: bool, output_failure: bool) !void {
             var dummy: u8 = 0;
             var manager: spill.Manager = .{ .alloc = a, .io = std.testing.io, .context = &dummy, .checkpoint = check, .compression = .none, .async_writes = false };
             defer manager.deinit();
@@ -1841,11 +2094,11 @@ test "SQL native partition row references preserve duplicate cohorts and disk fa
             join.parallel_builds = false;
             join.evaluation = .{ .left_width = 1, .right_width = 2 };
             const key = Datum.json(.{ .integer = 7 });
-            // Distinct large strings force the bounded block-skew fallback.
+            // Distinct large strings force bounded skew replay.
             var text: [2048]u8 = @splat('x');
             for (0..32) |i| {
                 text[0] = @as(u8, @intCast(i)) + 'A';
-                try join.add(true, &.{ Datum.json(.{ .integer = @intCast(i) }), Datum.json(.{ .string = if (disk) &text else text[0..1] }) }, &.{key}, i);
+                try join.add(true, &.{ Datum.json(.{ .integer = @intCast(i) }), Datum.json(.{ .string = if (skewed) &text else text[0..1] }) }, &.{key}, i);
             }
             for (0..9) |i| try join.add(false, &.{Datum.json(.{ .integer = @intCast(i) })}, &.{key}, i);
             if (output_failure) {
@@ -1855,19 +2108,18 @@ test "SQL native partition row references preserve duplicate cohorts and disk fa
                 try std.testing.expectEqual(@as(usize, 0), batch.len());
                 try std.testing.expect(failure != null);
                 try std.testing.expectEqual(error.OutOfMemory, failure.?);
-                try std.testing.expect(join.skew != null or (join.hash != null and join.hash.?.disk != null));
+                try std.testing.expect(join.skew != null);
                 return;
             }
             var page = std.heap.ArenaAllocator.init(a);
             defer page.deinit();
             var seen: [9][32]bool = @splat(@splat(false));
             var count: usize = 0;
-            var saw_disk = false;
+            var saw_skew = false;
             while (true) {
                 _ = page.reset(.free_all);
                 const batch = try join.nextBatch(page.allocator(), 91, null);
-                if (join.hash) |hash| saw_disk = saw_disk or hash.disk != null;
-                saw_disk = saw_disk or join.skew != null;
+                saw_skew = saw_skew or join.skew != null;
                 if (batch.len() == 0) break;
                 // Read only after the entire delivery page has been staged.
                 // This catches mutable probe selections and transient disks.
@@ -1878,18 +2130,115 @@ test "SQL native partition row references preserve duplicate cohorts and disk fa
                     try std.testing.expect(left < 9 and right < 32);
                     try std.testing.expect(!seen[left][right]);
                     seen[left][right] = true;
-                    try std.testing.expectEqual(if (disk) @as(usize, 2048) else 1, payload.len);
+                    try std.testing.expectEqual(if (skewed) @as(usize, 2048) else 1, payload.len);
                     try std.testing.expectEqual(@as(u8, @intCast(right)) + 'A', payload[0]);
                     count += 1;
                 }
             }
             try std.testing.expectEqual(@as(usize, 9 * 32), count);
-            try std.testing.expectEqual(disk, saw_disk);
+            try std.testing.expectEqual(skewed, saw_skew);
         }
     };
-    for ([_]bool{ false, true }) |disk| try Fixture.run(std.testing.allocator, disk, false);
+    for ([_]bool{ false, true }) |skewed| try Fixture.run(std.testing.allocator, skewed, false);
     try Fixture.run(std.testing.allocator, true, true);
     try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{ false, false });
+}
+
+test "SQL partitioned join block skew fallback preserves residual outer matches and bounded replay" {
+    const a = std.testing.allocator;
+    var context: u8 = 0;
+    var manager: spill.Manager = .{ .alloc = a, .io = std.testing.io, .context = &context, .checkpoint = struct {
+        fn check(_: *anyopaque) !void {}
+    }.check, .async_writes = false };
+    defer manager.deinit();
+    const join = try Join.create(a, &manager, 32 * 1024, 2000, 0, true, true);
+    defer join.close();
+    const key = Datum.json(.{ .integer = 7 });
+    for (0..1200) |i| try join.add(true, &.{Datum.json(.{ .integer = @intCast(i) })}, &.{key}, i);
+    for (0..40) |i| try join.add(false, &.{Datum.json(.{ .integer = @intCast(i) })}, &.{key}, i);
+    var accepted: usize = 0;
+    var left_only: usize = 0;
+    var right_only: usize = 0;
+    while (try join.next()) |pair| {
+        if (pair.match) |match| {
+            if (pair.left.?[0].value.integer == pair.right.?[0].value.integer and pair.left.?[0].value.integer < 20) {
+                try join.accept(match);
+                accepted += 1;
+            }
+        } else if (pair.left != null) left_only += 1 else right_only += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 20), accepted);
+    try std.testing.expectEqual(@as(usize, 20), left_only);
+    try std.testing.expectEqual(@as(usize, 1180), right_only);
+    try std.testing.expect(join.skew_blocks_read != 0);
+    try std.testing.expect(join.skew_blocks_read < 1200 * 4);
+    std.debug.print("SQL skew join: candidates=48000 typed_build_block_decodes={d}\n", .{join.skew_blocks_read});
+}
+
+fn skewEarlyClose(a: A) !void {
+    var context: u8 = 0;
+    var manager: spill.Manager = .{ .alloc = a, .io = std.testing.io, .context = &context, .checkpoint = struct {
+        fn check(_: *anyopaque) !void {}
+    }.check, .async_writes = false };
+    defer manager.deinit();
+    var build = try spill.Sequential.init(&manager, 1024);
+    defer build.close();
+    var probes = try spill.Sequential.init(&manager, 1024);
+    defer probes.close();
+    const key = Datum.json(.{ .integer = 7 });
+    for (0..3) |i| _ = try build.append(.{ .values = &.{Datum.json(.{ .integer = @intCast(i) })}, .keys = &.{key}, .ordinal = i }, spill.none);
+    _ = try probes.append(.{ .values = &.{key}, .keys = &.{key}, .ordinal = 0 }, spill.none);
+    try build.seal();
+    try probes.seal();
+    const skew = try @import("skew_join.zig").Join.create(&manager, true, true);
+    defer skew.close();
+    const first = (try skew.next(&build, &probes)) orelse return error.TestUnexpectedResult;
+    try skew.accept(first.match orelse return error.TestUnexpectedResult);
+}
+
+test "SQL partitioned join block skew releases typed inputs and match state on early close and allocation faults" {
+    try skewEarlyClose(std.testing.allocator);
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, skewEarlyClose, .{});
+}
+
+test "SQL parallel partition residuals use logical output permutations" {
+    const a = std.testing.allocator;
+    const Hook = struct {
+        fn check(_: *anyopaque) !void {}
+    };
+    for ([_]bool{ false, true }) |flipped| {
+        var dummy: u8 = 0;
+        var manager: spill.Manager = .{ .alloc = a, .io = std.testing.io, .context = &dummy, .checkpoint = Hook.check };
+        defer manager.deinit();
+        var compiled = try @import("compiler.zig").compileScalar(a, if (flipped) "rk=lk AND rv-lv = -10000" else "rk=lk AND rv-lv = 10000", .{});
+        defer compiled.deinit();
+        var condition = try @import("scalar.zig").bind(a, compiled.expression, &.{ .{ .name = "rk", .type = .integer }, .{ .name = "rv", .type = .integer }, .{ .name = "lk", .type = .integer }, .{ .name = "lv", .type = .integer } }, &.{}, .{});
+        defer condition.deinit();
+        const join = try Join.create(a, &manager, 512 * 1024, 10000, 200000, false, false);
+        defer join.close();
+        join.evaluation = .{ .condition = &condition, .left_width = 2, .right_width = 2, .flipped = flipped, .output_order = &.{ 2, 3, 0, 1 } };
+        for (0..512) |i| {
+            const key = Datum.json(.{ .integer = @intCast(i) });
+            try join.add(true, &.{ key, Datum.json(.{ .integer = @intCast(i + 20000) }) }, &.{key}, i);
+        }
+        for (0..512) |i| {
+            const key = Datum.json(.{ .integer = @intCast(i) });
+            try join.add(false, &.{ key, Datum.json(.{ .integer = @intCast(i + 10000) }) }, &.{key}, i);
+        }
+        var count: usize = 0;
+        while (try join.nextTypedBatch(137)) |view| {
+            defer view.deinit();
+            for (0..view.count) |row| {
+                const values = view.values();
+                const left = (try values.cell(a, row, 1)).value.integer;
+                const right = (try values.cell(a, row, 3)).value.integer;
+                try std.testing.expectEqual(@as(i64, 10000), right - left);
+                count += 1;
+            }
+        }
+        try std.testing.expectEqual(@as(usize, 512), count);
+        try std.testing.expect(join.parallel_partitions_completed > 1);
+    }
 }
 
 test "SQL partitioned vector residual batches preserve skew outer matches" {

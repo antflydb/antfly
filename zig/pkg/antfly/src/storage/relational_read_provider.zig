@@ -32,11 +32,25 @@ pub const Provider = struct {
     pub const VTable = struct {
         open: *const fn (*anyopaque, std.mem.Allocator, []const u8, []const u8, []const u8, types.ScanOptions) anyerror!View,
         try_fence: ?*const fn (*anyopaque, std.mem.Allocator, []const u8, types.ScanOptions) anyerror!?Fence = null,
+        try_fence_with_admission: ?*const fn (*anyopaque, std.mem.Allocator, []const u8, types.ScanOptions, View.Admission) anyerror!?Fence = null,
     };
     const Abi = callbacks.Boundary(VTable);
 
     pub fn open(self: Provider, alloc: std.mem.Allocator, table: []const u8, from: []const u8, to: []const u8, opts: types.ScanOptions) !View {
         return Abi.call("open", self.dispatch, self.vtable.open, .{ self.ptr, alloc, table, from, to, opts });
+    }
+
+    pub fn tryFenceWithAdmission(self: Provider, alloc: std.mem.Allocator, table: []const u8, opts: types.ScanOptions, original: View.Admission) !?Fence {
+        var retained_dependency: @import("antfly_local_sources").common_read_admission.RetainedDependency = .{};
+        const control = retained_dependency.bind(original).?;
+        try control.checkpoint();
+        const result = if (self.vtable.try_fence_with_admission) |callback|
+            try Abi.call("try_fence_with_admission", self.dispatch, callback, .{ self.ptr, alloc, table, opts, control })
+        else
+            try self.tryFence(alloc, table, opts);
+        errdefer if (result) |fence| fence.deinit();
+        try control.checkpoint();
+        return result;
     }
 
     pub fn tryFence(self: Provider, alloc: std.mem.Allocator, table: []const u8, opts: types.ScanOptions) !?Fence {

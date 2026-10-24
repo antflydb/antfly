@@ -149,6 +149,7 @@ pub const TlsSession = struct {
     tls_write_buf: ?[]u8 = null,
     net_in: ?SocketIoReader = null,
     net_out: ?SocketIoWriter = null,
+    transport_control: ?@import("../net/socket.zig").WriteControl = null,
 
     ca_bundle: ?std.crypto.Certificate.Bundle = null,
     ca_bundle_lock: std.Io.RwLock = .init,
@@ -160,6 +161,51 @@ pub const TlsSession = struct {
     negotiated_protocol: ?[]const u8 = null,
 
     const Self = @This();
+
+    pub const TransportScope = struct {
+        session: *TlsSession,
+        active: bool,
+        pub fn deinit(self: *@This()) void {
+            if (!self.active) return;
+            self.active = false;
+            const session = self.session;
+            // An interrupted record cannot be replayed by close_notify after
+            // dropping the borrowed request. Retire before clearing controls.
+            const read_failed = if (session.net_in) |*r| r.last_read_error != null else false;
+            const write_failed = if (session.net_out) |*w| w.last_write_error != null else false;
+            if (read_failed or write_failed) if (session.socket) |socket| {
+                socket.abortRequest();
+                socket.shutdown();
+            };
+            session.transport_control = null;
+            if (session.net_in) |*reader| reader.control = .{};
+            if (session.net_out) |*writer| writer.control = null;
+        }
+    };
+
+    /// Exclusive transport owner only: HTTP/1 requests or unpublished H2
+    /// setup. End the scope before releasing a pool lease or starting a shared
+    /// H2 reader. Published H2 sessions must not borrow a stream's controls.
+    pub fn controlTransport(self: *Self, control: ?@import("../net/socket.zig").WriteControl) !TransportScope {
+        if (control == null) return .{ .session = self, .active = false };
+        if (self.transport_control != null) return error.InvalidOutputWait;
+        self.transport_control = control;
+        if (self.net_in) |*reader| {
+            reader.control = control.?;
+            reader.last_read_error = null;
+        }
+        if (self.net_out) |*writer| {
+            writer.control = control;
+            writer.last_write_error = null;
+        }
+        return .{ .session = self, .active = true };
+    }
+
+    pub fn checkTransportError(self: *const Self) !void {
+        if (self.transport_control == null) return;
+        if (self.net_in) |reader| if (reader.last_read_error) |err| return err;
+        if (self.net_out) |writer| if (writer.last_write_error) |err| return err;
+    }
 
     /// Creates a new TLS session with the given configuration.
     pub fn init(config: TlsConfig, io: Io) Self {
@@ -218,8 +264,9 @@ pub const TlsSession = struct {
         if (self.tls_read_buf == null) self.tls_read_buf = try self.allocator.alloc(u8, min_tls_buf);
         if (self.tls_write_buf == null) self.tls_write_buf = try self.allocator.alloc(u8, min_tls_buf);
 
-        const net_in = SocketIoReader.init(sock, self.net_read_buf.?);
-        const net_out = SocketIoWriter.init(sock, self.net_write_buf.?);
+        const net_in = SocketIoReader.initControlled(sock, self.net_read_buf.?, self.transport_control orelse .{});
+        var net_out = SocketIoWriter.init(sock, self.net_write_buf.?);
+        net_out.control = self.transport_control;
         self.net_in = net_in;
         self.net_out = net_out;
 
@@ -338,6 +385,14 @@ pub const TlsSession = struct {
         @memcpy(buffer[0..len], available[0..len]);
         c.reader.toss(len);
         return len;
+    }
+
+    /// Recover scheduler/authority failures narrowed by the TLS reader ABI.
+    /// Ciphertext received after denied reentry is never published as payload.
+    pub fn readControlled(self: *Self, buffer: []u8) !usize {
+        const result = self.read(buffer);
+        try self.checkTransportError();
+        return result;
     }
 
     /// Writes data to be encrypted and sent.

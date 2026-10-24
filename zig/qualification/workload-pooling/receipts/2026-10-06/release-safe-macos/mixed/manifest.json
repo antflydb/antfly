@@ -1,0 +1,101 @@
+{
+  "version": 1,
+  "kind": "load",
+  "name": "macos-mixed-open-loop-api-key",
+  "fixture_rows": 256,
+  "fixture_payload_bytes": 4096,
+  "client_workers": 32,
+  "max_pending_clients": 128,
+  "request_timeout_seconds": 5,
+  "slow_reader_delay_seconds": 0.2,
+  "recovery_seconds": 3,
+  "recovery_fd_growth_max": 8,
+  "recovery_status_seconds_max": 2,
+  "process_limits": {
+    "max_fds": 512
+  },
+  "configuration": {
+    "pgwire": {
+      "max_connections": 32
+    },
+    "admission": {
+      "query": {
+        "max_concurrent_requests": 4
+      },
+      "write": {
+        "max_concurrent_requests": 2
+      }
+    }
+  },
+  "candidate_configuration": {
+    "admission": {
+      "max_request_memory_bytes": 67108864,
+      "max_retained_memory_bytes": 67108864,
+      "query": {
+        "max_concurrent_requests": 4,
+        "waiting": {
+          "max_queued_requests": 4,
+          "max_queued_bytes": 1048576,
+          "max_wait_ms": 250
+        }
+      }
+    }
+  },
+  "resource_thresholds": {
+    "rss_bytes": 1073741824,
+    "threads": 320,
+    "fds": 400
+  },
+  "comparison_thresholds": {
+    "low_load_p95_ratio_max": 1.25,
+    "throughput_ratio_min": 0.9
+  },
+  "phases": [
+    {
+      "name": "low-load",
+      "offered_per_second": 5,
+      "duration_seconds": 4,
+      "thresholds": {
+        "successful_per_second_min": 3,
+        "success_p95_seconds_max": 1,
+        "generator_dropped_max": 0,
+        "control_seconds_max": 2
+      }
+    },
+    {
+      "name": "burst",
+      "offered_per_second": 100,
+      "duration_seconds": 2,
+      "thresholds": {
+        "successful_per_second_min": 5,
+        "success_p95_seconds_max": 5,
+        "generator_dropped_max": 0,
+        "control_seconds_max": 2
+      }
+    },
+    {
+      "name": "sustained-overload",
+      "offered_per_second": 200,
+      "duration_seconds": 5,
+      "thresholds": {
+        "successful_per_second_min": 5,
+        "success_p95_seconds_max": 5,
+        "generator_dropped_max": 0,
+        "control_seconds_max": 2
+      }
+    },
+    {
+      "name": "recovery",
+      "offered_per_second": 5,
+      "duration_seconds": 4,
+      "thresholds": {
+        "successful_per_second_min": 3,
+        "success_p95_seconds_max": 1,
+        "generator_dropped_max": 0,
+        "control_seconds_max": 2
+      }
+    }
+  ],
+  "verify_operator_controls": true,
+  "http_auth_mode": "api_key"
+}

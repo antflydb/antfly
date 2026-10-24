@@ -40,6 +40,11 @@ pub const Owner = struct {
     mutex: std.atomic.Mutex = .unlocked,
     state: State = .{},
     stopping: std.atomic.Value(bool) = .init(false),
+    stop_started: bool = false,
+    joined: std.Io.Event = .unset,
+    stop_progress: std.Io.Event = .unset,
+    stop_generation: std.atomic.Value(u64) = .init(0),
+    stop_waiters: std.atomic.Value(u32) = .init(0),
     pub fn start(self: *Owner, port: Port) void {
         while (!self.mutex.tryLock()) @import("antfly_platform").time.yieldNow();
         defer self.mutex.unlock();
@@ -48,15 +53,22 @@ pub const Owner = struct {
         const scheduler = port.runtime.maintenanceScheduler() catch return;
         self.registration = scheduler.registerClass(.producer, self, step) catch return;
     }
+    fn shutdown(self: *Owner) @import("maintenance_stop.zig").Borrowed {
+        return .{ .mutex = &self.mutex, .registration = &self.registration, .stopping = &self.stopping, .finisher = &self.stop_started, .joined = &self.joined, .changed = &self.stop_progress, .generation = &self.stop_generation, .waiters = &self.stop_waiters };
+    }
     pub fn stop(self: *Owner, io: ?std.Io) void {
-        while (!self.mutex.tryLock()) @import("antfly_platform").time.yieldNow();
-        self.stopping.store(true, .release);
-        var task = self.registration;
-        self.registration = null;
-        self.mutex.unlock();
-        if (task) |*handle| handle.await(io.?);
+        self.shutdown().stop(io, false);
         while (!self.state.slice_mutex.tryLock()) @import("antfly_platform").time.yieldNow();
         defer self.state.slice_mutex.unlock();
+        self.clearWorker();
+    }
+    pub fn stopWithAdmission(self: *Owner, io: ?std.Io, original: @import("../../common/read_admission.zig").Port) !void {
+        try self.shutdown().stopWithAdmission(io, original);
+        try @import("../../common/cleanup_wait.zig").lockAtomic(&self.state.slice_mutex, io, original);
+        defer self.state.slice_mutex.unlock();
+        self.clearWorker();
+    }
+    fn clearWorker(self: *Owner) void {
         self.state.deinit();
     }
     fn step(self: *Owner) ?u64 {
@@ -68,3 +80,81 @@ pub const Owner = struct {
         return if (changed) 1 else 100;
     }
 };
+
+test "maintenance runtime group source retirement retains cursor state after original failure" {
+    const admission = @import("../../common/read_admission.zig");
+    const Case = enum { success, begin_failure, end_failure, lifetime_in_wait };
+    for (std.enums.values(Case)) |case| {
+        var backend = try runtime.BackendRuntimeHandle.init(std.testing.allocator, .{});
+        defer backend.deinit();
+        const io = backend.ptr().io().?;
+        var owner: Owner = .{};
+        owner.state.worker = .{ .allocator = std.testing.allocator, .identity = @splat(1) };
+        try owner.state.worker.?.scopes.put(std.testing.allocator, @splat(2), .{ .source = try std.testing.allocator.dupe(u8, "source"), .group = try std.testing.allocator.dupe(u8, "group") });
+        const F = struct {
+            owner: *Owner,
+            io: std.Io,
+            entered: std.Io.Event = .unset,
+            release: std.Io.Event = .unset,
+            fn run(raw: *anyopaque) !bool {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                while (!self.owner.state.slice_mutex.tryLock()) @import("antfly_platform").time.yieldNow();
+                defer self.owner.state.slice_mutex.unlock();
+                self.entered.set(self.io);
+                self.release.waitUncancelable(self.io);
+                std.debug.assert(self.owner.state.worker != null);
+                return false;
+            }
+        };
+        const Control = struct {
+            f: *F,
+            case: Case,
+            begins: usize = 0,
+            ends: usize = 0,
+            fn check(raw: *anyopaque) !void {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                if (self.case == .lifetime_in_wait and self.begins != 0) return error.DeadlineExceeded;
+            }
+            fn deadline(_: *anyopaque) !?u64 {
+                return 1000;
+            }
+            fn begin(raw: *anyopaque) !void {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                self.begins += 1;
+                if (self.case == .begin_failure) return error.NotFound;
+                if (self.case != .lifetime_in_wait) self.f.release.set(self.f.io);
+            }
+            fn end(raw: *anyopaque) !void {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                self.ends += 1;
+                self.f.release.set(self.f.io);
+                if (self.case == .end_failure) return error.Canceled;
+            }
+        };
+        var f: F = .{ .owner = &owner, .io = io };
+        defer {
+            f.release.set(io);
+            owner.stop(io);
+        }
+        owner.start(.{ .ptr = &f, .runtime = backend.ptr(), .run = F.run });
+        try f.entered.wait(io);
+        var control: Control = .{ .f = &f, .case = case };
+        var payload: admission.Payload = .{ .ptr = &control, .vtable = &.{ .checkpoint = Control.check, .check_lifetime = Control.check, .deadline_ns = Control.deadline }, .execution_wait = .{ .ptr = &control, .begin = Control.begin, .end = Control.end } };
+        const result = owner.stopWithAdmission(io, .init(&payload));
+        if (case == .success) try result else {
+            try std.testing.expectError(switch (case) {
+                .begin_failure => error.NotFound,
+                .end_failure => error.Canceled,
+                .lifetime_in_wait => error.DeadlineExceeded,
+                .success => unreachable,
+            }, result);
+            try std.testing.expect(owner.registration != null and owner.state.worker != null);
+            try std.testing.expectEqual(@as(usize, 1), owner.state.worker.?.scopes.count());
+            f.release.set(io);
+            owner.stop(io);
+        }
+        try std.testing.expect(owner.state.worker == null and owner.registration == null);
+        try std.testing.expectEqual(@as(usize, 1), control.begins);
+        try std.testing.expectEqual(@as(usize, if (case == .begin_failure) 0 else 1), control.ends);
+    }
+}

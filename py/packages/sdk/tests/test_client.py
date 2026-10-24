@@ -3,7 +3,7 @@
 import json
 from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta, timezone
-from unittest.mock import MagicMock, Mock, patch
+from unittest.mock import ANY, MagicMock, Mock, patch
 
 import httpx
 import pytest
@@ -302,7 +302,7 @@ class TestAntflyClient:
         tables = client.list_tables()
 
         assert tables == []
-        mock_httpx.stream.assert_called_once_with("GET", "/db/v1/tables")
+        mock_httpx.stream.assert_called_once_with("GET", "/db/v1/tables", timeout=ANY)
 
     @patch("antfly.client.Client")
     def test_create_table(self, mock_client_class: MagicMock) -> None:
@@ -315,7 +315,9 @@ class TestAntflyClient:
         result = client.create_table(name="test_table", num_shards=2)
 
         assert result["name"] == "test_table"
-        mock_httpx.stream.assert_called_once_with("POST", "/db/v1/tables/test_table", json={"num_shards": 2})
+        mock_httpx.stream.assert_called_once_with(
+            "POST", "/db/v1/tables/test_table", json={"num_shards": 2}, timeout=ANY
+        )
 
     @patch("antfly.client.Client")
     def test_create_table_failure(self, mock_client_class: MagicMock) -> None:
@@ -370,6 +372,7 @@ class TestAntflyClient:
             "POST",
             "/db/v1/tables/wiki%2Fmedia/indexes/thumbnail%20image",
             json=config,
+            timeout=ANY,
         )
 
     @patch("antfly.client.Client")
@@ -403,6 +406,7 @@ class TestAntflyClient:
                 "min_weight": 0.0,
                 "chunk_size": 1024,
             },
+            timeout=ANY,
         )
 
     @patch("antfly.client.Client")
@@ -418,7 +422,9 @@ class TestAntflyClient:
         assert [key.column for key in result.keys] == ["tenant", "created_at"]
         assert not isinstance(result.keys[1].direction, Unset)
         assert result.keys[1].direction.value == "desc"
-        mock_httpx.stream.assert_called_once_with("POST", "/db/v1/tables/orders/indexes/recent", json=request.to_dict())
+        mock_httpx.stream.assert_called_once_with(
+            "POST", "/db/v1/tables/orders/indexes/recent", json=request.to_dict(), timeout=ANY
+        )
 
     def test_create_index_rejects_duplicate_body_identity(self) -> None:
         client = AntflyClient(base_url="http://localhost:8080")
@@ -449,7 +455,10 @@ class TestAntflyClient:
         assert isinstance(result, CreatedRelationalIndex)
         assert result.to_dict()["keys"] == keys
         mock_httpx.stream.assert_called_once_with(
-            "POST", "/db/v1/tables/orders/indexes/computed", json=request.to_dict()
+            "POST",
+            "/db/v1/tables/orders/indexes/computed",
+            json=request.to_dict(),
+            timeout=ANY,
         )
 
     @patch("antfly.client.Client")
@@ -563,6 +572,7 @@ class TestAntflyClient:
                 "search_after": ["2025-12-31T00:00:00Z", "doc:1"],
                 "profile": False,
             },
+            timeout=ANY,
         )
         assert not isinstance(result.responses, Unset)
         query_result = result.responses[0]
@@ -592,6 +602,7 @@ class TestAntflyClient:
                 "full_text_search": {"match": "singularity", "field": "text"},
                 "full_text_index": "document_text",
             },
+            timeout=ANY,
         )
 
     def test_query_rejects_ambiguous_aggregation_aliases(self) -> None:
@@ -646,6 +657,7 @@ class TestAntflyClient:
                     }
                 }
             },
+            timeout=ANY,
         )
 
     def test_graph_count_helpers_construct_valid_generated_models(self) -> None:
@@ -985,32 +997,33 @@ class TestAntflyClient:
         with pytest.raises(AntflyException, match="maximum graph predicate depth"):
             client.query(table="docs", graph_queries={"people": query})
 
-    @patch("antfly.client.Client")
-    @patch("antfly.client.lookup_key")
-    def test_get_record(self, mock_lookup_key: MagicMock, mock_client_class: MagicMock) -> None:
-        """Test getting a record by key."""
-        mock_response = Mock()
-        mock_response.to_dict.return_value = {"name": "John Doe"}
-        mock_lookup_key.sync.return_value = mock_response
+    def test_get_record(self) -> None:
+        """Lookup shares admission, bounded response reading and the reusable pool."""
+        seen = []
 
-        client = AntflyClient(base_url="http://localhost:8080")
-        record = client.get(table="users", key="user:1")
+        def respond(request: httpx.Request) -> httpx.Response:
+            seen.append(request)
+            return httpx.Response(200, json={"name": "John Doe"})
 
-        assert record == {"name": "John Doe"}
-        mock_lookup_key.sync.assert_called_once_with(table_name="users", key="user:1", client=client._client)
+        with AntflyClient("http://test") as client:
+            client._client.set_httpx_client(
+                httpx.Client(transport=httpx.MockTransport(respond), base_url="http://test")
+            )
+            assert client.get("users", "user:1") == {"name": "John Doe"}
+        assert len(seen) == 1
+        assert seen[0].url.path == "/db/v1/tables/users/documents/user:1"
+        assert seen[0].url.params["consistency"] == "read_index"
 
-    @patch("antfly.client.Client")
-    @patch("antfly.client.lookup_key")
-    def test_get_record_failure(self, mock_lookup_key: MagicMock, mock_client_class: MagicMock) -> None:
-        """Test handling of get record failure."""
-        mock_lookup_key.sync.return_value = None
-
-        client = AntflyClient(base_url="http://localhost:8080")
-
-        with pytest.raises(AntflyException) as exc_info:
-            client.get(table="users", key="user:1")
-
-        assert "Failed to get key 'user:1' from table 'users'" in str(exc_info.value)
+    def test_get_record_failure(self) -> None:
+        with AntflyClient("http://test") as client:
+            client._client.set_httpx_client(
+                httpx.Client(
+                    transport=httpx.MockTransport(lambda request: httpx.Response(200, json=None)),
+                    base_url="http://test",
+                )
+            )
+            with pytest.raises(AntflyException):
+                client.get("users", "user:1")
 
     @patch("antfly.client.Client")
     def test_batch_rejects_oversized_request(self, mock_client_class: MagicMock) -> None:
@@ -1043,6 +1056,7 @@ class TestAntflyClient:
             "/db/v1/tables/users/batch",
             content=expected_content,
             headers={"Content-Type": "application/json"},
+            timeout=ANY,
         )
 
     def test_request_reads_chunked_json_and_closes(self) -> None:

@@ -1,0 +1,20 @@
+Build Summary: 15/15 steps succeeded; 1/1 tests passed
+antfly-table-write-execution-contract-test success
++- run test table-write-execution-contract-tests 1 pass (1 total) 120ms MaxRSS:6M
+   +- compile test table-write-execution-contract-tests safe native success 6s MaxRSS:445M
+      +- WriteFile macos-sdk-libc.txt cached
+      +- options cached
+      +- options cached
+      +- options cached
+      +- options cached
+      +- WriteFile tokenizer.json cached
+      +- WriteFile lib/pdf/fonts/roboto/Roboto-Regular.ttf cached
+      +- options cached
+      +- run exe patch_sentencepiece_proto (sentencepiece_proto) cached
+         +- compile exe patch_sentencepiece_proto safe native cached 48ms MaxRSS:31M
+         |  +- WriteFile macos-sdk-libc.txt (reused)
+         +- run exe protoc-zig (sentencepiece_proto_raw) cached
+         |  +- compile exe protoc-zig safe native cached 48ms MaxRSS:31M
+         |     +- WriteFile macos-sdk-libc.txt (reused)
+         +- run exe protoc-zig (sentencepiece_proto_raw) (+1 more reused dependencies)
+

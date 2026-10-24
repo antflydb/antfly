@@ -2,6 +2,14 @@
 
 const std = @import("std");
 
+/// Selected once after initial headers, before retaining payload. The allocator
+/// and quota must outlive the parser/stream; trailer headers cannot change them.
+pub const BodyMemory = struct {
+    allocator: std.mem.Allocator,
+    budget: ?*SharedBodyBudget,
+    max_bytes: ?usize = null,
+};
+
 /// Process-wide byte budget shared by every inbound HTTP connection.
 ///
 /// Fixed-length HTTP/1 requests reserve once before allocating their body

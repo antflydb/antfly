@@ -75,12 +75,7 @@ pub fn pathAlloc(allocator: Allocator, root: []const u8, id: u64, kind: Kind) ![
 /// Only atomic-writer siblings of owned manifest names are inventory garbage.
 /// Callers must hold the native writer lease with no publication in flight.
 pub fn isTemporaryFile(name: []const u8) bool {
-    const marker = std.mem.lastIndexOf(u8, name, ".tmp-") orelse return false;
-    const nonce = name[marker + 5 ..];
-    if (nonce.len == 0) return false;
-    for (nonce) |byte| if (!std.ascii.isDigit(byte)) return false;
-    _ = std.fmt.parseUnsigned(u64, nonce, 10) catch return false;
-    const target = name[0..marker];
+    const target = @import("atomic_temporary.zig").target(name) orelse return false;
     return std.mem.eql(u8, target, "manifest.bin") or identify(target) != null;
 }
 
@@ -91,6 +86,10 @@ fn header(tag: *const [8]u8, id: u64, value: u64) [header_len]u8 {
     std.mem.writeInt(u64, out[16..24], value, .little);
     std.mem.writeInt(u32, out[24..28], Crc32.hash(out[0..24]), .little);
     return out;
+}
+
+pub fn segmentHeader(id: u64, first_sequence: u64) [header_len]u8 {
+    return header(segment_magic, id, first_sequence);
 }
 
 fn parseHeader(raw: []const u8, tag: *const [8]u8, id: u64) !u64 {
@@ -124,7 +123,7 @@ pub fn replace(allocator: Allocator, storage: Storage, path: []const u8, bytes: 
 pub fn createSegment(allocator: Allocator, storage: Storage, root: []const u8, id: u64, first_sequence: u64) !void {
     const path = try pathAlloc(allocator, root, id, .journal);
     defer allocator.free(path);
-    try replace(allocator, storage, path, &header(segment_magic, id, first_sequence));
+    try replace(allocator, storage, path, &segmentHeader(id, first_sequence));
 }
 
 /// The caller serializes this handoff with appends. A failed or ambiguous
@@ -146,94 +145,22 @@ pub fn publish(allocator: Allocator, storage: Storage, root: []const u8, descrip
 /// One pass over pinned metadata, with fixed scratch independent of SST count
 /// or key length. The framing header is patched before the atomic sink finishes.
 pub fn writeCheckpoint(allocator: Allocator, storage: Storage, root: []const u8, id: u64, sequence: u64, next_run_id: u64, source: anytype, limit: usize) !usize {
+    var encoder = try @import("manifest_checkpoint.zig").Encoder(@TypeOf(source)).init(source, sequence, next_run_id, limit);
     const path = try pathAlloc(allocator, root, id, .checkpoint);
     defer allocator.free(path);
     var sink = try storage.beginAtomicWrite(allocator, path);
     var owned = true;
     errdefer if (owned) sink.abort();
-    const buffer = try allocator.alloc(u8, 64 * 1024);
-    defer allocator.free(buffer);
-    const Writer = struct {
-        sink: *storage_io.AtomicWriteSink,
-        buffer: []u8,
-        used: usize = 0,
-        total: usize = 0,
-        limit: usize,
-        inner: Crc32 = Crc32.init(),
-        outer: Crc32 = Crc32.init(),
-
-        fn append(self: *@This(), bytes: []const u8) !void {
-            if (bytes.len > self.limit -| self.total) return error.FileTooBig;
-            self.total += bytes.len;
-            var remaining = bytes;
-            while (remaining.len != 0) {
-                const len = @min(remaining.len, self.buffer.len - self.used);
-                @memcpy(self.buffer[self.used..][0..len], remaining[0..len]);
-                self.used += len;
-                remaining = remaining[len..];
-                if (self.used == self.buffer.len) try self.flush();
-            }
-        }
-        fn flush(self: *@This()) !void {
-            try self.sink.appendSlice(self.buffer[0..self.used]);
-            self.used = 0;
-        }
-        fn body(self: *@This(), bytes: []const u8) !void {
-            self.outer.update(bytes);
-            try self.append(bytes);
-        }
-        fn logical(self: *@This(), bytes: []const u8) !void {
-            self.inner.update(bytes);
-            try self.body(bytes);
-        }
-    };
-    var writer = Writer{ .sink = &sink, .buffer = buffer, .limit = limit };
-    try writer.append(&(@as([32]u8, @splat(0))));
-    try writer.body(&(@as([8]u8, @splat(0))));
-    var inner_header: [28]u8 = undefined;
-    @memcpy(inner_header[0..8], manifest.magic);
-    std.mem.writeInt(u32, inner_header[8..12], manifest.version, .little);
-    std.mem.writeInt(u64, inner_header[12..20], next_run_id, .little);
-    std.mem.writeInt(u32, inner_header[20..24], @intCast(source.runCount()), .little);
-    std.mem.writeInt(u32, inner_header[24..28], @intCast(source.obsoleteCount()), .little);
-    try writer.logical(&inner_header);
-    var runs: usize = 0;
-    while (source.nextRun()) |run| {
-        runs += 1;
-        try writer.logical(&manifest.runHeader(run));
-        try writer.logical(run.path);
-        if (run.smallest_namespace_name) |name| try writer.logical(name);
-        try writer.logical(run.smallest_key);
-        if (run.largest_namespace_name) |name| try writer.logical(name);
-        try writer.logical(run.largest_key);
+    // Explicit legacy driver uses the same bounded wire producer. Admitted
+    // callers compose it with owned_atomic_file instead of this raw sink.
+    while (try encoder.next(null)) |command| {
+        if (command.append) try sink.appendSlice(command.bytes) else try sink.writeAt(command.offset, command.bytes);
+        encoder.acknowledge();
     }
-    var paths: usize = 0;
-    while (source.nextObsolete()) |obsolete| {
-        paths += 1;
-        var path_header: [12]u8 = undefined;
-        std.mem.writeInt(u64, path_header[0..8], obsolete.delete_after_ns, .little);
-        std.mem.writeInt(u32, path_header[8..12], @intCast(obsolete.path.len), .little);
-        try writer.logical(&path_header);
-        try writer.logical(obsolete.path);
-    }
-    if (runs != source.runCount() or paths != source.obsoleteCount()) return error.InvalidManifest;
-    var checksum: [4]u8 = undefined;
-    std.mem.writeInt(u32, &checksum, writer.inner.final(), .little);
-    try writer.body(&checksum);
-    const body_len = writer.total - 32;
-    std.mem.writeInt(u32, &checksum, writer.outer.final(), .little);
-    try writer.append(&checksum);
-    try writer.flush();
-    var frame_header: [32]u8 = undefined;
-    @memcpy(frame_header[0..8], manifest.journal_magic);
-    std.mem.writeInt(u64, frame_header[8..16], body_len, .little);
-    std.mem.writeInt(u64, frame_header[16..24], sequence, .little);
-    std.mem.writeInt(u32, frame_header[24..28], 1, .little);
-    std.mem.writeInt(u32, frame_header[28..32], Crc32.hash(frame_header[8..28]), .little);
-    try sink.writeAt(0, &frame_header);
+    try encoder.retireWithAdmission(null);
     owned = false;
     try sink.finish();
-    return writer.total;
+    return encoder.total;
 }
 
 pub const Loaded = struct {

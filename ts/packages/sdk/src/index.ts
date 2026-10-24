@@ -536,6 +536,11 @@ export { ChatGPTConnectionError } from "./client.js";
 export type { MemoryNumbers, MemoryPaths, MemorySchemas } from "./memory.js";
 export { parseMemoryJSON, stringifyMemoryJSON } from "./memory.js";
 export * from "./models.js";
+export {
+  ClientCapacityError,
+  RequestAdmission,
+  type RequestAdmissionOptions,
+} from "./request-admission.js";
 export type {
   CatalogTablespaceBindingRequest,
   ChatGPTAccount,

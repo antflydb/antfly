@@ -1,0 +1,17 @@
+lib/httpx/src/server/server.zig:3646:44: error: expected type '*net.socket.Socket', found '*server.server.test.HTTP/2 oversized body before handler claim writes 413.TestWriter'
+                self.sendH2ErrorInPump(h2, sock, stream_id, status);
+                                           ^~~~
+lib/httpx/src/server/server.zig:3646:44: note: pointer type child 'server.server.test.HTTP/2 oversized body before handler claim writes 413.TestWriter' cannot cast into pointer type child 'net.socket.Socket'
+lib/httpx/src/server/server.zig:4368:24: note: struct declared here
+    const TestWriter = struct {
+                       ^~~~~~
+lib/httpx/src/net/socket.zig:313:20: note: struct declared here
+pub const Socket = struct {
+                   ^~~~~~
+lib/httpx/src/server/server.zig:3600:66: note: parameter type declared here
+    fn sendH2ErrorInPump(self: *Self, h2: *H2Connection, socket: *Socket, stream_id: u31, code: u16) void {
+                                                                 ^~~~~~~
+referenced by:
+    test.HTTP/2 oversized body before handler claim writes 413: lib/httpx/src/server/server.zig:4377:59
+    server_mod: lib/httpx/src/httpx.zig:97:32
+    1 reference(s) hidden; use '-freference-trace=3' to see all references

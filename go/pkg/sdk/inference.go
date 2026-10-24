@@ -113,8 +113,18 @@ func NewMultimodalUserMessage(text string, imageDataURIs ...string) (oapi.Infere
 
 // InferenceClient is a client for interacting with the Antfly inference API.
 type InferenceClient struct {
-	client  *oapi.ClientWithResponses
-	baseURL string
+	client    *oapi.ClientWithResponses
+	baseURL   string
+	admission *BoundedHTTPClient
+}
+
+// Close stops this admission owner and releases its owned idle connections.
+// A caller-supplied HTTP client and its transport remain caller-owned.
+func (c *InferenceClient) Close() error {
+	if c == nil || c.admission == nil {
+		return nil
+	}
+	return c.admission.Close()
 }
 
 // InferenceCapacityError is returned when an inference request was rejected

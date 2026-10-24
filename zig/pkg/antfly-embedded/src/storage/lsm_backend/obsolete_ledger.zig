@@ -169,8 +169,25 @@ pub const Ledger = struct {
             self.spare.appendAssumeCapacity(payload);
         }
     }
+    /// One edit only. Partial preparation belongs to this ledger on every
+    /// refusal; its construction credit must remain held until reclamation.
+    pub fn prepareWithAdmission(self: *Ledger, allocator: std.mem.Allocator, original: @import("../../common/read_admission.zig").Port) !void {
+        self.allocator = allocator;
+        try self.tree.prepareWithAdmission(allocator, original);
+        try original.checkpoint();
+        try self.spare.ensureTotalCapacity(allocator, 1);
+        if (self.spare.items.len == 0) {
+            try original.checkpoint();
+            const payload = try allocator.create(Payload);
+            self.tree.account.?.charge(@sizeOf(Payload));
+            self.spare.appendAssumeCapacity(payload);
+        }
+    }
+    pub fn spareBytes(self: *const Ledger) u64 {
+        return (self.spare.capacity + self.tree.spare.capacity) * @sizeOf(*anyopaque);
+    }
     pub fn prepareMemoryBound(self: *const Ledger, edits: usize) !u64 {
-        return std.math.add(u64, try self.tree.prepareMemoryBound(edits), try std.math.mul(u64, edits, @sizeOf(Payload) + 2 * @sizeOf(*Payload)));
+        return std.math.add(u64, try self.tree.prepareMemoryBound(edits), try std.math.add(u64, try std.math.mul(u64, edits, @sizeOf(Payload)), try std.math.mul(u64, if (edits == 0) 0 else std.ArrayListUnmanaged(*Payload).growCapacity(edits), 2 * @sizeOf(*Payload))));
     }
     /// Takes ownership of path; reserves all fallible work before publication.
     pub fn append(self: *Ledger, allocator: std.mem.Allocator, path: Path) !void {

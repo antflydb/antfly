@@ -150,8 +150,10 @@ pub const RowFilterEntry = struct {
     filter: []u8,
 
     pub fn initOwned(alloc: Allocator, table: []const u8, filter: []const u8) !RowFilterEntry {
+        const owned_table = try alloc.dupe(u8, table);
+        errdefer alloc.free(owned_table);
         return .{
-            .table = try alloc.dupe(u8, table),
+            .table = owned_table,
             .filter = try alloc.dupe(u8, filter),
         };
     }
@@ -285,6 +287,7 @@ pub const ApiKeyRecord = struct {
 };
 
 pub const ValidatedApiKey = struct {
+    user_instance_id: [16]u8,
     username: []u8,
     permissions: []Permission,
     row_filter: []RowFilterEntry,
@@ -299,6 +302,18 @@ pub const ValidatedApiKey = struct {
         alloc.free(self.row_filter);
         if (self.metadata_json.len > 0) alloc.free(self.metadata_json);
         freeOwnedStrings(alloc, self.roles);
+        self.* = undefined;
+    }
+};
+
+/// Current policy state for a credential that ingress already authenticated.
+/// This contains no credential verifier and does not authenticate a caller.
+pub const CredentialPolicySnapshot = struct {
+    instance_id: [16]u8,
+    policy: ValidatedApiKey,
+
+    pub fn deinit(self: *CredentialPolicySnapshot, alloc: Allocator) void {
+        self.policy.deinit(alloc);
         self.* = undefined;
     }
 };
@@ -733,6 +748,9 @@ pub const UserManager = struct {
         pub fn getUser(self: *const SnapshotLease, username: []const u8) !User {
             return self.manager.cloneUserUnlocked(username);
         }
+        pub fn getUserAlloc(self: *const SnapshotLease, alloc: Allocator, username: []const u8) !User {
+            return self.manager.cloneUserUnlockedAlloc(alloc, username);
+        }
         pub fn release(self: *SnapshotLease) void {
             var receiver = self.manager.io_borrow.receive() catch @panic("invalid UserManager executor");
             self.manager.mutation_mutex.unlock(receiver.io());
@@ -755,17 +773,21 @@ pub const UserManager = struct {
     }
 
     fn cloneUserUnlocked(self: *UserManager, username: []const u8) !User {
+        return self.cloneUserUnlockedAlloc(self.alloc, username);
+    }
+
+    fn cloneUserUnlockedAlloc(self: *UserManager, alloc: Allocator, username: []const u8) !User {
         const password_hash = self.users.get(username) orelse return error.UserNotFound;
         const metadata_json = self.user_metadata.get(username) orelse "{}";
-        const owned_username = try self.alloc.dupe(u8, username);
-        errdefer self.alloc.free(owned_username);
-        const owned_hash = try self.alloc.dupe(u8, password_hash);
-        errdefer self.alloc.free(owned_hash);
+        const owned_username = try alloc.dupe(u8, username);
+        errdefer alloc.free(owned_username);
+        const owned_hash = try alloc.dupe(u8, password_hash);
+        errdefer alloc.free(owned_hash);
         return .{
             .instance_id = self.user_instances.get(username) orelse return error.UserNotFound,
             .username = owned_username,
             .password_hash = owned_hash,
-            .metadata_json = try self.alloc.dupe(u8, metadata_json),
+            .metadata_json = try alloc.dupe(u8, metadata_json),
         };
     }
 
@@ -905,28 +927,34 @@ pub const UserManager = struct {
     }
 
     pub fn getPermissionsForUser(self: *const UserManager, username: []const u8) ![]Permission {
+        return self.getPermissionsForUserAlloc(self.alloc, username);
+    }
+
+    fn getPermissionsForUserAlloc(self: *const UserManager, alloc: Allocator, username: []const u8) ![]Permission {
         if (!self.users.contains(username)) return error.UserNotFound;
-        const rules = try self.enforcer.getPermissionsForUser(self.alloc, username);
+        const rules = try self.enforcer.getPermissionsForUser(alloc, username);
         defer {
-            for (rules) |*rule| rule.deinit(self.alloc);
-            self.alloc.free(rules);
+            for (rules) |*rule| rule.deinit(alloc);
+            alloc.free(rules);
         }
 
         var out = std.ArrayList(Permission).empty;
         errdefer {
-            for (out.items) |*perm| perm.deinit(self.alloc);
-            out.deinit(self.alloc);
+            for (out.items) |*perm| perm.deinit(alloc);
+            out.deinit(alloc);
         }
         for (rules) |rule| {
             if (rule.fields.len < 4) continue;
-            try out.append(self.alloc, try Permission.initOwned(
-                self.alloc,
+            var permission = try Permission.initOwned(
+                alloc,
                 try ResourceType.fromSlice(rule.fields[1]),
                 rule.fields[2],
                 try PermissionType.fromSlice(rule.fields[3]),
-            ));
+            );
+            errdefer permission.deinit(alloc);
+            try out.append(alloc, permission);
         }
-        return try out.toOwnedSlice(self.alloc);
+        return try out.toOwnedSlice(alloc);
     }
 
     /// Re-check one permission against the current policy under the same
@@ -1011,57 +1039,61 @@ pub const UserManager = struct {
     }
 
     pub fn getRolesForUser(self: *const UserManager, username: []const u8) ![][]u8 {
+        return self.getRolesForUserAlloc(self.alloc, username);
+    }
+
+    fn getRolesForUserAlloc(self: *const UserManager, alloc: Allocator, username: []const u8) ![][]u8 {
         if (!self.users.contains(username)) return error.UserNotFound;
 
         var queue = std.ArrayList([]const u8).empty;
-        defer queue.deinit(self.alloc);
+        defer queue.deinit(alloc);
         var visited = std.StringHashMapUnmanaged(void){};
         defer {
             var it = visited.iterator();
-            while (it.next()) |entry| self.alloc.free(entry.key_ptr.*);
-            visited.deinit(self.alloc);
+            while (it.next()) |entry| alloc.free(entry.key_ptr.*);
+            visited.deinit(alloc);
         }
         var out = std.ArrayList([]u8).empty;
         errdefer {
-            for (out.items) |role| self.alloc.free(role);
-            out.deinit(self.alloc);
+            for (out.items) |role| alloc.free(role);
+            out.deinit(alloc);
         }
 
-        const owned_username = try self.alloc.dupe(u8, username);
-        visited.put(self.alloc, owned_username, {}) catch |err| {
-            self.alloc.free(owned_username);
+        const owned_username = try alloc.dupe(u8, username);
+        visited.put(alloc, owned_username, {}) catch |err| {
+            alloc.free(owned_username);
             return err;
         };
-        try queue.append(self.alloc, owned_username);
+        try queue.append(alloc, owned_username);
 
         var index: usize = 0;
         while (index < queue.items.len) : (index += 1) {
             const current = queue.items[index];
-            const rules = try self.enforcer.getFilteredNamedPolicy(self.alloc, "g", 0, &.{current});
+            const rules = try self.enforcer.getFilteredNamedPolicy(alloc, "g", 0, &.{current});
             defer {
-                for (rules) |*rule| rule.deinit(self.alloc);
-                self.alloc.free(rules);
+                for (rules) |*rule| rule.deinit(alloc);
+                alloc.free(rules);
             }
 
             for (rules) |rule| {
                 if (rule.fields.len < 2) continue;
                 const role = rule.fields[1];
                 if (visited.contains(role)) continue;
-                const owned_role = try self.alloc.dupe(u8, role);
-                visited.put(self.alloc, owned_role, {}) catch |err| {
-                    self.alloc.free(owned_role);
+                const owned_role = try alloc.dupe(u8, role);
+                visited.put(alloc, owned_role, {}) catch |err| {
+                    alloc.free(owned_role);
                     return err;
                 };
-                try queue.append(self.alloc, owned_role);
-                const out_role = try self.alloc.dupe(u8, role);
-                out.append(self.alloc, out_role) catch |err| {
-                    self.alloc.free(out_role);
+                try queue.append(alloc, owned_role);
+                const out_role = try alloc.dupe(u8, role);
+                out.append(alloc, out_role) catch |err| {
+                    alloc.free(out_role);
                     return err;
                 };
             }
         }
 
-        return try out.toOwnedSlice(self.alloc);
+        return try out.toOwnedSlice(alloc);
     }
 
     /// Recheck the previously admitted credential and table permission under
@@ -1239,21 +1271,27 @@ pub const UserManager = struct {
     }
 
     pub fn listSubjectRowFilters(self: *const UserManager, subject: []const u8) ![]RowFilterEntry {
-        const rules = try self.enforcer.getFilteredNamedPolicy(self.alloc, "p2", 0, &.{subject});
+        return self.listSubjectRowFiltersAlloc(self.alloc, subject);
+    }
+
+    fn listSubjectRowFiltersAlloc(self: *const UserManager, alloc: Allocator, subject: []const u8) ![]RowFilterEntry {
+        const rules = try self.enforcer.getFilteredNamedPolicy(alloc, "p2", 0, &.{subject});
         defer {
-            for (rules) |*rule| rule.deinit(self.alloc);
-            self.alloc.free(rules);
+            for (rules) |*rule| rule.deinit(alloc);
+            alloc.free(rules);
         }
         var out = std.ArrayList(RowFilterEntry).empty;
         errdefer {
-            for (out.items) |*entry| entry.deinit(self.alloc);
-            out.deinit(self.alloc);
+            for (out.items) |*entry| entry.deinit(alloc);
+            out.deinit(alloc);
         }
         for (rules) |rule| {
             if (rule.fields.len < 3) continue;
-            try out.append(self.alloc, try RowFilterEntry.initOwned(self.alloc, rule.fields[1], rule.fields[2]));
+            var entry = try RowFilterEntry.initOwned(alloc, rule.fields[1], rule.fields[2]);
+            errdefer entry.deinit(alloc);
+            try out.append(alloc, entry);
         }
-        return try out.toOwnedSlice(self.alloc);
+        return try out.toOwnedSlice(alloc);
     }
 
     pub fn listRowFilters(self: *const UserManager, username: []const u8) ![]RowFilterEntry {
@@ -1262,54 +1300,57 @@ pub const UserManager = struct {
     }
 
     pub fn getRowFilters(self: *const UserManager, username: []const u8) ![]RowFilterEntry {
+        return self.getRowFiltersAlloc(self.alloc, username);
+    }
+
+    fn getRowFiltersAlloc(self: *const UserManager, alloc: Allocator, username: []const u8) ![]RowFilterEntry {
         if (!self.users.contains(username)) return error.UserNotFound;
-        const listed = try self.listSubjectRowFilters(username);
+        const listed = try self.listSubjectRowFiltersAlloc(alloc, username);
         defer {
-            for (listed) |*entry| entry.deinit(self.alloc);
-            self.alloc.free(listed);
+            for (listed) |*entry| entry.deinit(alloc);
+            alloc.free(listed);
         }
-        const roles = try self.getRolesForUser(username);
-        defer freeOwnedStrings(self.alloc, roles);
+        const roles = try self.getRolesForUserAlloc(alloc, username);
+        defer freeOwnedStrings(alloc, roles);
 
         var merged = std.StringArrayHashMapUnmanaged([]u8){};
         defer {
             var it = merged.iterator();
             while (it.next()) |entry| {
-                self.alloc.free(entry.key_ptr.*);
-                self.alloc.free(entry.value_ptr.*);
+                alloc.free(entry.key_ptr.*);
+                alloc.free(entry.value_ptr.*);
             }
-            merged.deinit(self.alloc);
+            merged.deinit(alloc);
         }
 
         for (listed) |entry| {
-            try mergeRowFilterEntry(self.alloc, &merged, entry);
+            try mergeRowFilterEntry(alloc, &merged, entry);
         }
 
         for (roles) |role| {
-            const role_filters = try self.listSubjectRowFilters(role);
+            const role_filters = try self.listSubjectRowFiltersAlloc(alloc, role);
             defer {
-                for (role_filters) |*entry| entry.deinit(self.alloc);
-                self.alloc.free(role_filters);
+                for (role_filters) |*entry| entry.deinit(alloc);
+                alloc.free(role_filters);
             }
             for (role_filters) |entry| {
-                try mergeRowFilterEntry(self.alloc, &merged, entry);
+                try mergeRowFilterEntry(alloc, &merged, entry);
             }
         }
 
         var out = std.ArrayList(RowFilterEntry).empty;
         errdefer {
-            for (out.items) |*entry| entry.deinit(self.alloc);
-            out.deinit(self.alloc);
+            for (out.items) |*entry| entry.deinit(alloc);
+            out.deinit(alloc);
         }
 
         var it = merged.iterator();
         while (it.next()) |entry| {
-            try out.append(self.alloc, .{
-                .table = try self.alloc.dupe(u8, entry.key_ptr.*),
-                .filter = try self.alloc.dupe(u8, entry.value_ptr.*),
-            });
+            var owned = try RowFilterEntry.initOwned(alloc, entry.key_ptr.*, entry.value_ptr.*);
+            errdefer owned.deinit(alloc);
+            try out.append(alloc, owned);
         }
-        return try out.toOwnedSlice(self.alloc);
+        return try out.toOwnedSlice(alloc);
     }
 
     pub fn createApiKey(
@@ -1409,6 +1450,7 @@ pub const UserManager = struct {
         }
 
         return .{
+            .user_instance_id = self.user_instances.get(record.key.username) orelse return error.UserNotFound,
             .username = try self.alloc.dupe(u8, record.key.username),
             .permissions = effective_permissions,
             .row_filter = try combineLayeredRowFilters(self.alloc, owner_row_filter, record.key.row_filter),
@@ -1429,6 +1471,68 @@ pub const UserManager = struct {
         mutable.mutation_mutex.lockUncancelable(io);
         defer mutable.mutation_mutex.unlock(io);
         return try self.effectiveApiKeyPermissionsUnlocked(key_id);
+    }
+
+    /// Capture permissions, layered filters, metadata, roles, and account
+    /// identity under one mutation lock. Resumed reads compare this with their
+    /// admitted scope; a newer grant must not broaden an existing operation.
+    /// Credential validation remains the caller's responsibility.
+    pub fn snapshotCredentialPolicies(self: *const UserManager, principal: []const u8) !CredentialPolicySnapshot {
+        return self.snapshotCredentialPoliciesAlloc(self.alloc, principal);
+    }
+
+    /// All snapshot and transient policy allocations belong to alloc. The
+    /// caller releases the snapshot with that same allocator; no new authority
+    /// is acquired and the original mutation-lock snapshot remains coherent.
+    pub fn snapshotCredentialPoliciesAlloc(self: *const UserManager, alloc: Allocator, principal: []const u8) !CredentialPolicySnapshot {
+        var receiver = try self.io_borrow.receive();
+        const io = receiver.io();
+        const mutable: *UserManager = @constCast(self);
+        try mutable.mutation_mutex.lock(io);
+        defer mutable.mutation_mutex.unlock(io);
+
+        const key_record: ?ApiKeyRecord = if (std.mem.startsWith(u8, principal, "basic:"))
+            null
+        else if (std.mem.startsWith(u8, principal, "api-key:"))
+            self.api_keys.get(principal["api-key:".len..]) orelse return error.ApiKeyNotFound
+        else
+            return error.InvalidDestinationGrantPrincipal;
+        const username = if (key_record) |record| record.key.username else principal["basic:".len..];
+        const instance_id = self.user_instances.get(username) orelse return error.UserNotFound;
+        const permissions = if (key_record) |record|
+            try self.effectiveApiKeyPermissionsUnlockedAlloc(alloc, record.key.key_id)
+        else
+            try self.getPermissionsForUserAlloc(alloc, username);
+        errdefer {
+            for (permissions) |*permission| permission.deinit(alloc);
+            alloc.free(permissions);
+        }
+        const owner_filters = try self.getRowFiltersAlloc(alloc, username);
+        defer if (key_record != null) {
+            for (owner_filters) |*entry| entry.deinit(alloc);
+            alloc.free(owner_filters);
+        };
+        const filters = if (key_record) |record|
+            try combineLayeredRowFilters(alloc, owner_filters, record.key.row_filter)
+        else
+            owner_filters;
+        errdefer {
+            for (filters) |*entry| entry.deinit(alloc);
+            alloc.free(filters);
+        }
+        const roles = try self.getRolesForUserAlloc(alloc, username);
+        errdefer freeOwnedStrings(alloc, roles);
+        const metadata = try alloc.dupe(u8, self.user_metadata.get(username) orelse "{}");
+        errdefer alloc.free(metadata);
+        const owned_username = try alloc.dupe(u8, username);
+        return .{ .instance_id = instance_id, .policy = .{
+            .user_instance_id = instance_id,
+            .username = owned_username,
+            .permissions = permissions,
+            .row_filter = filters,
+            .metadata_json = metadata,
+            .roles = roles,
+        } };
     }
 
     /// Recheck the restrictions attached to an already authenticated durable
@@ -1457,21 +1561,25 @@ pub const UserManager = struct {
     }
 
     fn effectiveApiKeyPermissionsUnlocked(self: *const UserManager, key_id: []const u8) ![]Permission {
+        return self.effectiveApiKeyPermissionsUnlockedAlloc(self.alloc, key_id);
+    }
+
+    fn effectiveApiKeyPermissionsUnlockedAlloc(self: *const UserManager, alloc: Allocator, key_id: []const u8) ![]Permission {
         var receiver = self.io_borrow.receive() catch @panic("invalid UserManager executor");
         const io = receiver.io();
         const record = self.api_keys.get(key_id) orelse return error.ApiKeyNotFound;
         if (record.key.expires_at_ns) |expires_at_ns| {
             if (nowNs(io) > expires_at_ns) return error.ApiKeyExpired;
         }
-        const owner_permissions = try self.getPermissionsForUser(record.key.username);
+        const owner_permissions = try self.getPermissionsForUserAlloc(alloc, record.key.username);
         defer {
-            for (owner_permissions) |*permission| permission.deinit(self.alloc);
-            self.alloc.free(owner_permissions);
+            for (owner_permissions) |*permission| permission.deinit(alloc);
+            alloc.free(owner_permissions);
         }
         return if (record.key.permissions.len > 0)
-            try intersectPermissions(self.alloc, record.key.permissions, owner_permissions)
+            try intersectPermissions(alloc, record.key.permissions, owner_permissions)
         else
-            try clonePermissions(self.alloc, owner_permissions);
+            try clonePermissions(alloc, owner_permissions);
     }
 
     /// Produce a server-only authenticator for durable authorization records.
@@ -1688,12 +1796,11 @@ fn intersectPermissions(
                     break;
                 }
             }
-            if (!duplicate) try out.append(alloc, try Permission.initOwned(
-                alloc,
-                intersection.resource_type,
-                intersection.resource,
-                intersection.permission_type,
-            ));
+            if (!duplicate) {
+                var permission = try Permission.initOwned(alloc, intersection.resource_type, intersection.resource, intersection.permission_type);
+                errdefer permission.deinit(alloc);
+                try out.append(alloc, permission);
+            }
         }
     }
     return try out.toOwnedSlice(alloc);
@@ -1721,20 +1828,23 @@ fn mergeRowFilterEntry(
     merged: *std.StringArrayHashMapUnmanaged([]u8),
     entry: RowFilterEntry,
 ) !void {
-    const gop = try merged.getOrPut(alloc, entry.table);
-    if (!gop.found_existing) {
-        gop.key_ptr.* = try alloc.dupe(u8, entry.table);
-        gop.value_ptr.* = try alloc.dupe(u8, entry.filter);
+    const existing = merged.getPtr(entry.table);
+    if (existing == null) {
+        const table = try alloc.dupe(u8, entry.table);
+        errdefer alloc.free(table);
+        const filter = try alloc.dupe(u8, entry.filter);
+        errdefer alloc.free(filter);
+        try merged.put(alloc, table, filter);
         return;
     }
 
     const combined = try std.fmt.allocPrint(
         alloc,
         "{{\"conjuncts\":[{s},{s}]}}",
-        .{ gop.value_ptr.*, entry.filter },
+        .{ existing.?.*, entry.filter },
     );
-    alloc.free(gop.value_ptr.*);
-    gop.value_ptr.* = combined;
+    alloc.free(existing.?.*);
+    existing.?.* = combined;
 }
 
 fn inferAuthSubjectKind(subject: []const u8) AuthSubjectKind {
@@ -1836,11 +1946,10 @@ fn collectExplicitRowFilterTables(
 ) !void {
     for (row_filters) |entry| {
         if (std.mem.eql(u8, entry.table, "*")) continue;
-        const gop = try tables.getOrPut(alloc, entry.table);
-        if (!gop.found_existing) {
-            gop.key_ptr.* = try alloc.dupe(u8, entry.table);
-            gop.value_ptr.* = {};
-        }
+        if (tables.contains(entry.table)) continue;
+        const table = try alloc.dupe(u8, entry.table);
+        errdefer alloc.free(table);
+        try tables.put(alloc, table, {});
     }
 }
 
@@ -2298,6 +2407,7 @@ test "usermgr api keys validate and persist creator-scoped permissions" {
 
     var validated = try manager.validateApiKey(created.key.key_id, created.key_secret);
     defer validated.deinit(alloc);
+    try std.testing.expectEqual(user.instance_id, validated.user_instance_id);
     try std.testing.expectEqualStrings("alice", validated.username);
     try std.testing.expectEqualStrings("{}", validated.metadata_json);
     try std.testing.expectEqual(@as(usize, 1), validated.permissions.len);
@@ -2370,6 +2480,124 @@ fn newUserInstance(io: std.Io) ![16]u8 {
     }
 }
 
+test "usermgr credential policy snapshots observe role revocation and account replacement" {
+    const a = std.testing.allocator;
+    var store = MemoryStore.init(a);
+    defer store.deinit();
+    var policies = casbin.MemoryAdapter.init(a);
+    defer policies.deinit();
+    var users = try UserManager.init(a, store.iface(), try initDefaultEnforcer(a, policies.iface()));
+    defer users.deinit();
+    var user = try users.createUserWithMetadata("alice", "secret", &.{}, "{\"tenant\":\"first\"}");
+    defer user.deinit(a);
+    var read = try Permission.initOwned(a, .table, "docs", .read);
+    defer read.deinit(a);
+    try users.addPermissionToSubject("role:reader", read);
+    try users.addRoleToUser("alice", "role:reader");
+    try users.setSubjectRowFilter("role:reader", "docs", "{\"term\":{\"team\":\"first\"}}");
+    var admitted = try users.snapshotCredentialPolicies("basic:alice");
+    defer admitted.deinit(a);
+    try std.testing.expectEqual(user.instance_id, admitted.instance_id);
+    try std.testing.expectEqualStrings("alice", admitted.policy.username);
+    try std.testing.expectEqualStrings("{\"tenant\":\"first\"}", admitted.policy.metadata_json);
+    try std.testing.expectEqual(@as(usize, 1), admitted.policy.permissions.len);
+    try std.testing.expectEqualStrings("role:reader", admitted.policy.roles[0]);
+    try std.testing.expectEqual(@as(usize, 1), admitted.policy.row_filter.len);
+
+    try users.setSubjectRowFilter("role:reader", "docs", "{\"term\":{\"team\":\"second\"}}");
+    var changed = try users.snapshotCredentialPolicies("basic:alice");
+    defer changed.deinit(a);
+    try std.testing.expect(std.mem.indexOf(u8, changed.policy.row_filter[0].filter, "second") != null);
+    try std.testing.expect(std.mem.indexOf(u8, admitted.policy.row_filter[0].filter, "first") != null);
+    try users.removeRoleFromUser("alice", "role:reader");
+    var revoked = try users.snapshotCredentialPolicies("basic:alice");
+    defer revoked.deinit(a);
+    try std.testing.expectEqual(@as(usize, 0), revoked.policy.permissions.len);
+    try std.testing.expectEqual(@as(usize, 0), revoked.policy.roles.len);
+    try std.testing.expectEqual(@as(usize, 0), revoked.policy.row_filter.len);
+    // Basic snapshots preserve exact entries, including a null override;
+    // layering is reserved for API-key restrictions.
+    try users.setRowFilter("alice", "*", "{\"term\":{\"tenant\":\"wildcard\"}}");
+    try users.setRowFilter("alice", "docs", "null");
+    var exact = try users.snapshotCredentialPolicies("basic:alice");
+    defer exact.deinit(a);
+    try std.testing.expectEqual(@as(usize, 2), exact.policy.row_filter.len);
+    var found_null = false;
+    for (exact.policy.row_filter) |entry| {
+        if (std.mem.eql(u8, entry.table, "docs")) {
+            try std.testing.expectEqualStrings("null", entry.filter);
+            found_null = true;
+        }
+    }
+    try std.testing.expect(found_null);
+    try users.deleteUser("alice");
+    try std.testing.expectError(error.UserNotFound, users.snapshotCredentialPolicies("basic:alice"));
+    var replacement = try users.createUserWithMetadata("alice", "secret", &.{read}, "{\"tenant\":\"replacement\"}");
+    defer replacement.deinit(a);
+    var replaced = try users.snapshotCredentialPolicies("basic:alice");
+    defer replaced.deinit(a);
+    try std.testing.expect(!std.mem.eql(u8, &admitted.instance_id, &replaced.instance_id));
+    try std.testing.expectEqualStrings("{\"tenant\":\"replacement\"}", replaced.policy.metadata_json);
+    try std.testing.expectError(error.InvalidDestinationGrantPrincipal, users.snapshotCredentialPolicies("alice"));
+}
+
+test "usermgr credential policy snapshots preserve API key restrictions and expiry" {
+    const a = std.testing.allocator;
+    var store = MemoryStore.init(a);
+    defer store.deinit();
+    var policies = casbin.MemoryAdapter.init(a);
+    defer policies.deinit();
+    var users = try UserManager.init(a, store.iface(), try initDefaultEnforcer(a, policies.iface()));
+    defer users.deinit();
+    var read = try Permission.initOwned(a, .table, "docs", .read);
+    defer read.deinit(a);
+    var user = try users.createUser("alice", "secret", &.{read});
+    defer user.deinit(a);
+    try users.addRoleToUser("alice", "role:reader");
+    try users.addRoleToSubject("role:reader", "group:team");
+    try users.setRowFilter("alice", "docs", "{\"term\":{\"tenant\":\"owner\"}}");
+    var key_filter = try RowFilterEntry.initOwned(a, "docs", "{\"term\":{\"team\":\"key\"}}");
+    defer key_filter.deinit(a);
+    var key = try users.createApiKey("alice", "reader", &.{read}, &.{key_filter}, null);
+    defer key.deinit(a);
+    const principal = try std.fmt.allocPrint(a, "api-key:{s}", .{key.key.key_id});
+    defer a.free(principal);
+    var snapshot = try users.snapshotCredentialPolicies(principal);
+    defer snapshot.deinit(a);
+    try std.testing.expectEqual(user.instance_id, snapshot.instance_id);
+    try std.testing.expectEqual(@as(usize, 2), snapshot.policy.roles.len);
+    try std.testing.expectEqual(@as(usize, 1), snapshot.policy.permissions.len);
+    try std.testing.expectEqual(@as(usize, 1), snapshot.policy.row_filter.len);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot.policy.row_filter[0].filter, "owner") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot.policy.row_filter[0].filter, "key") != null);
+    const AllocationSweep = struct {
+        fn run(alloc: Allocator, manager: *UserManager, credential: []const u8) !void {
+            // Only this synchronous call uses the failing allocator. Restore
+            // the manager before fixture mutation or destruction.
+            const original = manager.alloc;
+            manager.alloc = alloc;
+            defer manager.alloc = original;
+            var current = try manager.snapshotCredentialPolicies(credential);
+            defer current.deinit(alloc);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(a, AllocationSweep.run, .{ &users, principal });
+    try std.testing.checkAllAllocationFailures(a, AllocationSweep.run, .{ &users, "basic:alice" });
+    try users.removePermissionFromUser("alice", "docs", .table);
+    var revoked = try users.snapshotCredentialPolicies(principal);
+    defer revoked.deinit(a);
+    try std.testing.expectEqual(@as(usize, 0), revoked.policy.permissions.len);
+    try users.deleteApiKey("alice", key.key.key_id);
+    try std.testing.expectError(error.ApiKeyNotFound, users.snapshotCredentialPolicies(principal));
+    // Fixture mutation represents a persisted key whose deadline elapsed.
+    var expired = try users.createApiKey("alice", "expired", &.{}, &.{}, null);
+    defer expired.deinit(a);
+    users.api_keys.getPtr(expired.key.key_id).?.key.expires_at_ns = 0;
+    const expired_principal = try std.fmt.allocPrint(a, "api-key:{s}", .{expired.key.key_id});
+    defer a.free(expired_principal);
+    try std.testing.expectError(error.ApiKeyExpired, users.snapshotCredentialPolicies(expired_principal));
+}
+
 test "usermgr instance identity survives password changes and fences failed deletion" {
     const a = std.testing.allocator;
     var store = MemoryStore.init(a);
@@ -2423,6 +2651,65 @@ test "usermgr upgrades legacy user identities durably before serving" {
     var persisted = try reopened.authenticateUser("alice", "secret");
     defer persisted.deinit(a);
     try std.testing.expectEqual(migrated.instance_id, persisted.instance_id);
+}
+
+test "usermgr credential policy snapshots use caller memory through roles filters and key intersections" {
+    const a = std.testing.allocator;
+    var backing = std.testing.FailingAllocator.init(a, .{});
+    const manager_alloc = backing.allocator();
+    var store = MemoryStore.init(manager_alloc);
+    defer store.deinit();
+    var policies = casbin.MemoryAdapter.init(manager_alloc);
+    defer policies.deinit();
+    var users = try UserManager.init(manager_alloc, store.iface(), try initDefaultEnforcer(manager_alloc, policies.iface()));
+    defer users.deinit();
+    var user = try users.createUserWithMetadata("alice", "secret", &.{}, "{\"tenant\":\"initial\"}");
+    defer user.deinit(manager_alloc);
+    var permission = try Permission.initOwned(manager_alloc, .table, "*", .read);
+    defer permission.deinit(manager_alloc);
+    try users.addPermissionToSubject("role:base", permission);
+    try users.addRoleToUser("alice", "role:reader");
+    try users.addRoleToSubject("role:reader", "role:base");
+    try users.setSubjectRowFilter("role:base", "docs", "{\"term\":{\"tenant\":\"owner\"}}");
+    var restricted = try Permission.initOwned(manager_alloc, .table, "docs", .read);
+    defer restricted.deinit(manager_alloc);
+    var filter = try RowFilterEntry.initOwned(manager_alloc, "docs", "{\"term\":{\"key\":true}}");
+    defer filter.deinit(manager_alloc);
+    var key = try users.createApiKey("alice", "snapshot", &.{restricted}, &.{filter}, null);
+    defer key.deinit(manager_alloc);
+    const principal = try std.fmt.allocPrint(a, "api-key:{s}", .{key.key.key_id});
+    defer a.free(principal);
+    const Probe = struct {
+        fn run(alloc: Allocator, manager: *UserManager, credential: []const u8) !void {
+            var lease = try manager.acquireSnapshotLease();
+            var user_snapshot = lease.getUserAlloc(alloc, "alice") catch |err| {
+                lease.release();
+                return err;
+            };
+            lease.release();
+            defer user_snapshot.deinit(alloc);
+            try std.testing.expectEqualStrings("alice", user_snapshot.username);
+            var snapshot = try manager.snapshotCredentialPoliciesAlloc(alloc, credential);
+            defer snapshot.deinit(alloc);
+            try std.testing.expectEqualStrings("alice", snapshot.policy.username);
+            try std.testing.expectEqualStrings("{\"tenant\":\"initial\"}", snapshot.policy.metadata_json);
+            try std.testing.expectEqual(@as(usize, 2), snapshot.policy.roles.len);
+            try std.testing.expectEqual(@as(usize, 1), snapshot.policy.permissions.len);
+            try std.testing.expectEqualStrings(if (std.mem.startsWith(u8, credential, "api-key:")) "docs" else "*", snapshot.policy.permissions[0].resource);
+            try std.testing.expectEqual(@as(usize, 1), snapshot.policy.row_filter.len);
+            try std.testing.expect(std.mem.indexOf(u8, snapshot.policy.row_filter[0].filter, "owner") != null);
+            if (std.mem.startsWith(u8, credential, "api-key:")) try std.testing.expect(std.mem.indexOf(u8, snapshot.policy.row_filter[0].filter, "key") != null);
+        }
+    };
+    const previous_allocations = backing.alloc_index;
+    backing.fail_index = previous_allocations;
+    defer backing.fail_index = std.math.maxInt(usize);
+    for ([_][]const u8{ "basic:alice", principal }) |credential| {
+        try Probe.run(a, &users, credential);
+        try std.testing.checkAllAllocationFailures(a, Probe.run, .{ &users, credential });
+    }
+    try std.testing.expectEqual(previous_allocations, backing.alloc_index);
+    try std.testing.expect(!backing.has_induced_failure);
 }
 
 test "native memory curator permission is read-capable without arbitrary write or admin" {

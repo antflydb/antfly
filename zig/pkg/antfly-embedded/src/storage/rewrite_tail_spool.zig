@@ -72,6 +72,14 @@ pub const Cache = struct {
         }
     }
 
+    /// Exclusive owner close after foreground and preparation admission fences.
+    /// The immutable spool remains owned across any rejected callback wait.
+    pub fn drainCallbacksWithAdmission(self: *Cache, io: std.Io, original: @import("../common/read_admission.zig").Port) !void {
+        if (self.manager) |manager| try manager.unregisterReclaimerWithAdmission(self.reclaimer, io, original);
+        self.reclaimer = 0;
+        self.manager = null;
+    }
+
     pub fn deinit(self: *Cache, io: std.Io) void {
         // Unregister without our mutex: an in-flight callback may be trying
         // to acquire it. Owner teardown has already drained foreground users.

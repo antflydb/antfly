@@ -18,6 +18,13 @@ const object_storage = @import("antfly_local_sources").storage_object_storage;
 
 test {
     _ = manifest_object_store;
+    _ = @import("serverless/artifacts/store.zig");
+    _ = @import("api/lake_index_aggregate_artifact.zig");
+    _ = @import("api/lake_index_aggregate_composition.zig");
+    _ = @import("api/lake_index_reader_lease.zig");
+    _ = @import("api/lake_index_seekable_text.zig");
+    _ = @import("api/lake_index_ordered_rows.zig");
+    _ = @import("api/sql_worker_lease.zig");
     _ = @import("serverless/manifest/fs_store.zig");
     _ = @import("serverless/manifest/remote_store.zig");
     _ = object_storage;

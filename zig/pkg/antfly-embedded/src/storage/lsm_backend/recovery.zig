@@ -103,10 +103,10 @@ pub fn openInto(comptime BackendType: type, backend: *BackendType, allocator: Al
         if (backend_options.storage) |storage| {
             backend.storage = storage;
         } else {
-            const owned = try std.heap.page_allocator.create(storage_io.NativeStorage);
-            errdefer std.heap.page_allocator.destroy(owned);
+            const owned = try backend.allocator.create(storage_io.NativeStorage);
+            errdefer backend.allocator.destroy(owned);
             owned.* = try storage_io.NativeStorage.initWithPool(
-                std.heap.page_allocator,
+                backend.allocator,
                 backend_options.io_runtime,
                 backend_options.native_storage_pool,
             );
@@ -389,7 +389,9 @@ fn cleanup(comptime BackendType: type, backend: *BackendType, finalize_deferred:
     if (@hasDecl(BackendType, "deinitRunSources")) backend.deinitRunSources();
     if (@hasField(BackendType, "local_reader")) backend.local_reader.deinit();
     if (@hasField(BackendType, "point_reader")) backend.point_reader.deinit();
-    if (@hasField(BackendType, "run_block_cache")) {
+    if (@hasDecl(BackendType, "deinitRunBlockCache")) {
+        backend.deinitRunBlockCache();
+    } else if (@hasField(BackendType, "run_block_cache")) {
         for (backend.run_block_cache.items) |*cached| cached.deinit(backend.allocator);
         backend.run_block_cache.deinit(backend.allocator);
         if (@hasField(BackendType, "run_block_cache_bytes")) backend.run_block_cache_bytes = 0;
@@ -416,7 +418,7 @@ fn cleanup(comptime BackendType: type, backend: *BackendType, finalize_deferred:
     if (@hasField(BackendType, "storage_owner")) {
         if (backend.storage_owner) |owned| {
             owned.deinit();
-            std.heap.page_allocator.destroy(owned);
+            backend.allocator.destroy(owned);
         }
     }
     if (backend.root_dir) |root_dir| backend.allocator.free(root_dir);

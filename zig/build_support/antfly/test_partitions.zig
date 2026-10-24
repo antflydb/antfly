@@ -444,22 +444,25 @@ pub fn add(b: *std.Build) void {
                         const local = partition(b, executable) orelse continue;
                         if (hasInventory(run, local, previous.?)) continue;
                         const extra = inventory(b, local, inv);
-                        run.addArg(previous.?);
-                        run.addFileArg(extra.captureStdErr(.{}));
-                        // Audit controls precede the runtime passthrough separator.
-                        // addFileArg also records the inventory dependency.
-                        const path_arg = run.argv.pop().?;
-                        const flag_arg = run.argv.pop().?;
-                        var insert: usize = 0;
-                        while (insert < run.argv.items.len) : (insert += 1) {
-                            const current = run.argv.items[insert];
-                            if (current == .bytes and std.mem.eql(u8, current.bytes, "--")) break;
-                        }
-                        run.argv.insertSlice(b.allocator, insert, &.{ flag_arg, path_arg }) catch @panic("OOM");
+                        addInventoryBeforeRuntimeArgs(b, run, previous.?, extra.captureStdErr(.{}));
                     }
                 }
             }
             previous = null;
         }
     }
+}
+
+/// Local partitions expand an existing audit after it has attached runtime
+/// passthrough arguments. Keep generated inventory metadata on the audit side
+/// of that boundary; the runtime parser deliberately rejects these controls.
+fn addInventoryBeforeRuntimeArgs(b: *std.Build, run: *std.Build.Step.Run, flag: []const u8, path: std.Build.LazyPath) void {
+    const insertion = for (run.argv.items, 0..) |arg, index| {
+        if (arg == .passthru or (arg == .bytes and std.mem.eql(u8, arg.bytes, "--"))) break index;
+    } else run.argv.items.len;
+    run.addArg(flag);
+    run.addFileArg(path);
+    const file_arg = run.argv.pop().?;
+    const flag_arg = run.argv.pop().?;
+    run.argv.insertSlice(b.allocator, insertion, &.{ flag_arg, file_arg }) catch @panic("OOM");
 }

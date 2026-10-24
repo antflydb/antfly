@@ -198,6 +198,7 @@ pub fn add(b: *std.Build, sentencepiece_proto_source: std.Build.LazyPath) Result
         .target = wasm_target,
         .optimize = optimize,
     });
+    wasm_runtime_abi_mod.addImport("runtime_memory_abi", wasm_storage_boundary.memory);
     wasm_cancellation_mod.addImport("antfly_runtime_abi", wasm_runtime_abi_mod);
     wasm_runtime_abi_mod.addImport("httpx", httpx_mod);
     wasm_runtime_abi_mod.addImport("antfly_platform", wasm_platform_mod);
@@ -273,6 +274,7 @@ pub fn add(b: *std.Build, sentencepiece_proto_source: std.Build.LazyPath) Result
     });
     inference_execution_control_mod.addImport("antfly_platform", wasm_platform_mod);
     inference_execution_control_mod.addImport("antfly_cancellation", wasm_cancellation_mod);
+    inference_execution_control_mod.addImport("antfly_runtime_abi", wasm_runtime_abi_mod);
     const inference_execution_context_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly-embedded/src/inference/execution_context.zig"),
         .target = wasm_target,

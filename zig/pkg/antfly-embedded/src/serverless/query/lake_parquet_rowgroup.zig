@@ -411,6 +411,14 @@ pub const PersistentObjectRangeCache = struct {
         cache_key: []const u8,
         expected_len: usize,
     ) !?[]u8 {
+        return self.readAllocFor(alloc, cache_key, expected_len, .{});
+    }
+
+    /// The request retains the cache/allocator through every wait and owns all
+    /// returned bytes. Failed resumption is never a cache miss/provider retry.
+    pub fn readAllocFor(self: *PersistentObjectRangeCache, alloc: Allocator, cache_key: []const u8, expected_len: usize, context: @import("lake_read_context.zig").Context) !?[]u8 {
+        try context.ensureActive();
+        var request = CacheReadIo{ .context = context };
         if (expected_len > range_io.max_physical_range_read_bytes) return error.InvalidLakeRangeRead;
         const state = self.state;
         if (cache_key.len > state.policy.max_cache_key_bytes) {
@@ -432,17 +440,22 @@ pub const PersistentObjectRangeCache = struct {
             path,
             cache_key,
             expected_len,
-        ) catch |err| switch (err) {
-            error.OutOfMemory => return err,
-            error.FileNotFound, error.InvalidPersistentObjectRangeCache => {
-                valid = false;
-                state.recordReadMiss();
-                return null;
-            },
-            else => {
-                state.recordReadError();
-                return null;
-            },
+            &request,
+        ) catch |err| {
+            if (request.failure != null) return err;
+            try context.ensureActive();
+            switch (err) {
+                error.OutOfMemory => return err,
+                error.FileNotFound, error.InvalidPersistentObjectRangeCache => {
+                    valid = false;
+                    state.recordReadMiss();
+                    return null;
+                },
+                else => {
+                    state.recordReadError();
+                    return null;
+                },
+            }
         };
         state.recordReadHit();
         return bytes;
@@ -484,6 +497,7 @@ pub const PersistentObjectRangeCache = struct {
     pub fn readMapped(self: *PersistentObjectRangeCache, alloc: Allocator, cache_key: []const u8, expected_len: usize, expected_digest: [32]u8, context: @import("lake_read_context.zig").Context) !?MappedEntry {
         if (comptime @import("builtin").os.tag == .freestanding or @import("builtin").os.tag == .wasi or @import("builtin").os.tag == .windows) return null;
         try context.ensureActive();
+        var request = CacheReadIo{ .context = context };
         if (expected_len > range_io.max_physical_range_read_bytes) return error.InvalidLakeRangeRead;
         const state = self.state;
         if (cache_key.len > state.policy.max_cache_key_bytes) return null;
@@ -495,16 +509,20 @@ pub const PersistentObjectRangeCache = struct {
         defer if (!retained) state.releaseEntry(entry, valid);
         const header_len = std.math.add(usize, persistent_object_range_cache_magic.len + 4 + 32, cache_key.len) catch return error.InvalidLakeRangeRead;
         const exact_len = std.math.add(usize, header_len, expected_len) catch return error.InvalidLakeRangeRead;
-        const file = std.Io.Dir.cwd().openFile(state.io, path, .{}) catch {
+        const file = @import("../../sql/execution_wait.zig").runOwned(request.boundary(), openCacheReadFile, .{ state.io, path }, closeCacheReadFile, .{state.io}) catch |err| {
+            if (request.failure != null) return err;
             valid = false;
             return null;
         };
         defer file.close(state.io);
-        if (try file.length(state.io) != exact_len) {
+        if (try @import("../../sql/execution_wait.zig").run(request.boundary(), std.Io.File.length, .{ file, state.io }) != exact_len) {
             valid = false;
             return null;
         }
-        const mapping = std.posix.mmap(null, exact_len, .{ .READ = true }, .{ .TYPE = .SHARED }, file.handle, 0) catch return null;
+        const mapping = @import("../../sql/execution_wait.zig").runOwned(request.boundary(), mapCacheReadFile, .{ file, exact_len }, discardCacheReadMapping, .{}) catch |err| {
+            if (request.failure != null) return err;
+            return null;
+        };
         defer if (!retained) std.posix.munmap(mapping);
         const magic_len = persistent_object_range_cache_magic.len;
         const key_end = magic_len + 4 + cache_key.len;
@@ -1433,12 +1451,58 @@ fn persistentObjectRangeEncodeAlloc(alloc: Allocator, cache_key: []const u8, byt
     return encoded;
 }
 
+// Keep denied execution separate from evictable local disk failures. Cache
+// misses may retry the provider; lost original authority must never do so.
+const CacheReadIo = struct {
+    context: @import("lake_read_context.zig").Context,
+    failure: ?anyerror = null,
+    fn check(self: *@This()) !void {
+        self.context.ensureActive() catch |err| {
+            self.failure = err;
+            return err;
+        };
+    }
+    fn boundary(self: *@This()) ?@import("../../sql/execution_wait.zig").Boundary {
+        if (self.context.wait == null) return null;
+        return .{ .ptr = self, .begin = begin, .end = end };
+    }
+    fn begin(raw: *anyopaque) !void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        const wait = self.context.wait.?;
+        wait.begin(wait.ptr) catch |err| {
+            self.failure = err;
+            return err;
+        };
+    }
+    fn end(raw: *anyopaque) !void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        const wait = self.context.wait.?;
+        wait.end(wait.ptr) catch |err| {
+            self.failure = err;
+            return err;
+        };
+    }
+};
+fn openCacheReadFile(io: std.Io, path: []const u8) !std.Io.File {
+    return if (std.fs.path.isAbsolute(path)) std.Io.Dir.openFileAbsolute(io, path, .{}) else std.Io.Dir.cwd().openFile(io, path, .{});
+}
+fn closeCacheReadFile(file: std.Io.File, io: std.Io) void {
+    file.close(io);
+}
+fn mapCacheReadFile(file: std.Io.File, length: usize) ![]align(std.heap.page_size_min) u8 {
+    return std.posix.mmap(null, length, .{ .READ = true }, .{ .TYPE = .SHARED }, file.handle, 0);
+}
+fn discardCacheReadMapping(mapping: []align(std.heap.page_size_min) u8) void {
+    std.posix.munmap(mapping);
+}
+
 fn persistentObjectRangeReadEntryWithIoAlloc(
     io: std.Io,
     alloc: Allocator,
     path: []const u8,
     cache_key: []const u8,
     expected_len: usize,
+    request: *CacheReadIo,
 ) ![]u8 {
     const digest_len = std.crypto.hash.sha2.Sha256.digest_length;
     const key_len_field = 4;
@@ -1450,15 +1514,12 @@ fn persistentObjectRangeReadEntryWithIoAlloc(
     const exact_len_u64 = std.math.cast(u64, exact_len) orelse
         return error.InvalidPersistentObjectRangeCache;
 
-    var file = if (std.fs.path.isAbsolute(path))
-        try std.Io.Dir.openFileAbsolute(io, path, .{})
-    else
-        try std.Io.Dir.cwd().openFile(io, path, .{});
+    const file = try @import("../../sql/execution_wait.zig").runOwned(request.boundary(), openCacheReadFile, .{ io, path }, closeCacheReadFile, .{io});
     defer file.close(io);
-    if (try file.length(io) != exact_len_u64) return error.InvalidPersistentObjectRangeCache;
+    if (try @import("../../sql/execution_wait.zig").run(request.boundary(), std.Io.File.length, .{ file, io }) != exact_len_u64) return error.InvalidPersistentObjectRangeCache;
 
     var prefix: [persistent_object_range_cache_magic.len + key_len_field]u8 = undefined;
-    if (try file.readPositionalAll(io, &prefix, 0) != prefix.len)
+    if (try @import("../../sql/execution_wait.zig").run(request.boundary(), std.Io.File.readPositionalAll, .{ file, io, &prefix, 0 }) != prefix.len)
         return error.InvalidPersistentObjectRangeCache;
     if (!std.mem.eql(u8, prefix[0..persistent_object_range_cache_magic.len], persistent_object_range_cache_magic))
         return error.InvalidPersistentObjectRangeCache;
@@ -1477,7 +1538,7 @@ fn persistentObjectRangeReadEntryWithIoAlloc(
     var compare_buffer: [4096]u8 = undefined;
     while (key_offset < cache_key.len) {
         const chunk_len = @min(compare_buffer.len, cache_key.len - key_offset);
-        if (try file.readPositionalAll(io, compare_buffer[0..chunk_len], offset) != chunk_len)
+        if (try @import("../../sql/execution_wait.zig").run(request.boundary(), std.Io.File.readPositionalAll, .{ file, io, compare_buffer[0..chunk_len], offset }) != chunk_len)
             return error.InvalidPersistentObjectRangeCache;
         if (!std.mem.eql(u8, compare_buffer[0..chunk_len], cache_key[key_offset..][0..chunk_len]))
             return error.InvalidPersistentObjectRangeCache;
@@ -1486,19 +1547,28 @@ fn persistentObjectRangeReadEntryWithIoAlloc(
     }
 
     var expected_checksum: [digest_len]u8 = undefined;
-    if (try file.readPositionalAll(io, &expected_checksum, offset) != digest_len)
+    if (try @import("../../sql/execution_wait.zig").run(request.boundary(), std.Io.File.readPositionalAll, .{ file, io, &expected_checksum, offset }) != digest_len)
         return error.InvalidPersistentObjectRangeCache;
     offset += digest_len;
 
     const payload = try alloc.alloc(u8, expected_len);
     errdefer alloc.free(payload);
-    if (try file.readPositionalAll(io, payload, offset) != expected_len)
+    if (try @import("../../sql/execution_wait.zig").run(request.boundary(), std.Io.File.readPositionalAll, .{ file, io, payload, offset }) != expected_len)
         return error.InvalidPersistentObjectRangeCache;
     var extra: [1]u8 = undefined;
-    if (try file.readPositionalAll(io, &extra, exact_len_u64) != 0)
+    if (try @import("../../sql/execution_wait.zig").run(request.boundary(), std.Io.File.readPositionalAll, .{ file, io, &extra, exact_len_u64 }) != 0)
         return error.InvalidPersistentObjectRangeCache;
-    if (try file.length(io) != exact_len_u64) return error.InvalidPersistentObjectRangeCache;
-    const actual_checksum = objectRangeCacheDigest(payload);
+    if (try @import("../../sql/execution_wait.zig").run(request.boundary(), std.Io.File.length, .{ file, io }) != exact_len_u64) return error.InvalidPersistentObjectRangeCache;
+    var checksum = std.crypto.hash.sha2.Sha256.init(.{});
+    var hashed: usize = 0;
+    while (hashed < payload.len) {
+        try request.check();
+        const end = @min(hashed + 256 * 1024, payload.len);
+        checksum.update(payload[hashed..end]);
+        hashed = end;
+    }
+    try request.check();
+    const actual_checksum = checksum.finalResult();
     if (!std.crypto.timing_safe.eql([digest_len]u8, expected_checksum, actual_checksum))
         return error.InvalidPersistentObjectRangeCache;
     return payload;
@@ -10302,6 +10372,257 @@ test "lake persistent cache recovery preserves priority when capacity shrinks" {
     }
 }
 
+test "parquet persistent request reads park physical IO and preserve denied resume ownership" {
+    const Runnable = @import("../../common/runnable_scheduler.zig");
+    const Case = enum { heap, mapped, heap_open, heap_payload, mapped_open, mapped_resume, canceled, deadline, begin_failure };
+    const Clock = struct {
+        var now_ns: std.atomic.Value(u64) = .init(0);
+        fn now() u64 {
+            return now_ns.load(.acquire);
+        }
+    };
+    const Fixture = struct {
+        var active: *@This() = undefined;
+        base: std.Io,
+        scheduler: *Runnable.Scheduler,
+        execution: *Runnable.Execution,
+        case: Case,
+        observing: std.atomic.Value(bool) = .init(false),
+        canceled: std.atomic.Value(bool) = .init(false),
+        ends: usize = 0,
+        opens: usize = 0,
+        closes: usize = 0,
+        physical: usize = 0,
+        invalid: usize = 0,
+        fn requested(raw: *const anyopaque) bool {
+            const self: *const @This() = @ptrCast(@alignCast(raw));
+            return self.canceled.load(.acquire);
+        }
+        fn observe(self: *@This()) void {
+            if (!self.observing.load(.acquire)) return;
+            self.physical += 1;
+            const stats = self.scheduler.stats();
+            if (stats.runnable_slots != 0 or stats.resource_blocked != 1) self.invalid += 1;
+            var health: Runnable.Execution = .{};
+            health.start(self.scheduler, .{ .io = std.testing.io, .allow_wait = false }, .control) catch {
+                self.invalid += 1;
+                return;
+            };
+            defer health.finish();
+            health.checkpoint() catch {
+                self.invalid += 1;
+            };
+        }
+        fn open(raw: ?*anyopaque, dir: std.Io.Dir, path: []const u8, options: std.Io.Dir.OpenFileOptions) std.Io.File.OpenError!std.Io.File {
+            active.observe();
+            const result = try active.base.vtable.dirOpenFile(raw, dir, path, options);
+            if (active.observing.load(.acquire)) active.opens += 1;
+            return result;
+        }
+        fn length(raw: ?*anyopaque, file: std.Io.File) std.Io.File.LengthError!u64 {
+            active.observe();
+            return active.base.vtable.fileLength(raw, file);
+        }
+        fn read(raw: ?*anyopaque, file: std.Io.File, data: []const []u8, offset: u64) std.Io.File.ReadPositionalError!usize {
+            active.observe();
+            return active.base.vtable.fileReadPositional(raw, file, data, offset);
+        }
+        fn close(raw: ?*anyopaque, files: []const std.Io.File) void {
+            if (active.observing.load(.acquire)) active.closes += files.len;
+            active.base.vtable.fileClose(raw, files);
+        }
+        fn begin(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.case == .begin_failure) return error.Forbidden;
+            try self.execution.checkpoint();
+            try self.execution.park(.resource_blocked);
+        }
+        fn end(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.ends += 1;
+            if (self.case == .canceled and self.ends == 6) self.canceled.store(true, .release);
+            if (self.case == .deadline and self.ends == 6) Clock.now_ns.store(10, .release);
+            try self.execution.enter(.query);
+            if (((self.case == .heap_open or self.case == .mapped_open) and self.ends == 1) or
+                (self.case == .heap_payload and self.ends == 6) or
+                (self.case == .mapped_resume and self.ends == 3)) return error.Forbidden;
+        }
+        fn check(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.scheduler.stats().runnable_slots != 1) self.invalid += 1;
+            try self.execution.checkpoint();
+        }
+    };
+    for (std.enums.values(Case)) |case| {
+        if ((case == .mapped or case == .mapped_open or case == .mapped_resume) and
+            (comptime @import("builtin").os.tag == .windows or @import("builtin").os.tag == .freestanding or @import("builtin").os.tag == .wasi)) continue;
+        const a = std.testing.allocator;
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/request-io", .{tmp.sub_path});
+        defer a.free(root);
+        Clock.now_ns.store(0, .release);
+        var scheduler = try Runnable.Scheduler.init(.{ .slots = 2 });
+        var execution: Runnable.Execution = .{};
+        defer execution.finish();
+        var fixture = Fixture{ .base = std.testing.io, .scheduler = &scheduler, .execution = &execution, .case = case };
+        Fixture.active = &fixture;
+        try execution.start(&scheduler, .{ .io = std.testing.io, .native_now_ns = Clock.now, .deadline_ns = 10, .cancellation = .{ .ptr = &fixture, .requested = Fixture.requested } }, .query);
+        var vtable = std.testing.io.vtable.*;
+        vtable.dirOpenFile = Fixture.open;
+        vtable.fileLength = Fixture.length;
+        vtable.fileReadPositional = Fixture.read;
+        vtable.fileClose = Fixture.close;
+        var disk = try PersistentObjectRangeCache.init(.{ .userdata = std.testing.io.userdata, .vtable = &vtable }, root);
+        defer disk.deinit();
+        try std.testing.expectEqual(.enqueued, disk.enqueueWrite("key", "data"));
+        disk.flush();
+        const context: @import("lake_read_context.zig").Context = .{ .io = std.testing.io, .checkpoint = .{ .ptr = &fixture, .check = Fixture.check }, .wait = .{ .ptr = &fixture, .begin = Fixture.begin, .end = Fixture.end } };
+        const path = try disk.cachePathAlloc(a, "key");
+        defer a.free(path);
+        fixture.observing.store(true, .release);
+        defer fixture.observing.store(false, .release);
+        if (case == .mapped or case == .mapped_open or case == .mapped_resume) {
+            var digest: [32]u8 = undefined;
+            std.crypto.hash.sha2.Sha256.hash("data", &digest, .{});
+            const result = disk.readMapped(a, "key", 4, digest, context);
+            if (case == .mapped) {
+                var lease = (try result).?;
+                try std.testing.expectEqualStrings("data", lease.bytes);
+                lease.deinit();
+            } else try std.testing.expectError(error.Forbidden, result);
+        } else {
+            const result = disk.readAllocFor(a, "key", 4, context);
+            switch (case) {
+                .heap => {
+                    const bytes = (try result).?;
+                    defer a.free(bytes);
+                    try std.testing.expectEqualStrings("data", bytes);
+                },
+                .canceled => try std.testing.expectError(error.Canceled, result),
+                .deadline => try std.testing.expectError(error.DeadlineExceeded, result),
+                else => try std.testing.expectError(error.Forbidden, result),
+            }
+        }
+        fixture.observing.store(false, .release);
+        try std.testing.expectEqual(@as(usize, 0), fixture.invalid);
+        try std.testing.expectEqual(fixture.opens, fixture.closes);
+        if (case == .begin_failure) try std.testing.expectEqual(@as(usize, 0), fixture.physical) else try std.testing.expect(fixture.physical > 0);
+        disk.state.mutex.lockUncancelable(disk.state.io);
+        const pins = disk.state.entries.get(std.fs.path.basename(path)).?.pin_count;
+        disk.state.mutex.unlock(disk.state.io);
+        try std.testing.expectEqual(@as(usize, 0), pins);
+    }
+}
+
+test "parquet wide large pages retain columns without duplicate row identities" {
+    const a = std.testing.allocator;
+    const row_count = 145186;
+    const values = try a.alloc(i64, row_count);
+    defer a.free(values);
+    for (values, 0..) |*value, index| value.* = @intCast(index);
+    var bytes: std.ArrayList(u8) = .empty;
+    defer bytes.deinit(a);
+    var chunks: [12]external_source.ColumnChunk = undefined;
+    var names: [12][]const u8 = undefined;
+    var name_buffers: [12][16]u8 = undefined;
+    for (&chunks, &names, &name_buffers, 0..) |*chunk, *name, *buffer, index| {
+        name.* = try std.fmt.bufPrint(buffer, "column_{d}", .{index});
+        const offset = bytes.items.len;
+        try appendPlainI64DataPage(&bytes, a, values);
+        chunk.* = .{ .column_id = @constCast(name.*), .file_offset = offset, .compressed_len = bytes.items.len - offset, .uncompressed_len = bytes.items.len - offset, .physical_type = @constCast("int64"), .encoding = @constCast("plain") };
+    }
+    const storage = @import("../../storage/object_storage.zig");
+    var memory = storage.MemoryObjectStorage.init(a);
+    defer memory.deinit();
+    var client = memory.client();
+    try client.makeBucket("bucket");
+    var put = try client.putObject("bucket", "data", bytes.items, .{});
+    defer put.deinit(a);
+    var groups = [_]external_source.RowGroup{.{ .ordinal = 0, .row_count = row_count, .file_offset = 0, .total_byte_len = bytes.items.len, .column_chunks = &chunks }};
+    var files = [_]external_source.FileEntry{.{ .file_id = @constCast("data"), .object_uri = @constCast("s3://bucket/data"), .etag = put.etag.?, .byte_len = bytes.items.len, .row_count = row_count, .row_groups = &groups }};
+    const inventory: external_source.Inventory = .{ .format = .parquet, .source_id = @constCast("events"), .source_uri = @constCast("s3://bucket"), .snapshot_id = @constCast("v1"), .schema_fingerprint = @constCast("v1"), .files = &files };
+    const inputs = [_]ColumnChunkInput{.{ .column_id = names[0], .bytes = bytes.items[0..chunks[0].compressed_len] }};
+    const share = 32 * 1024 * 1024 / chunks.len;
+    // Complete batches still account for their physical row-reference arrays.
+    try std.testing.expectError(error.ParquetRowGroupTooLarge, buildSupportedI64RowGroupBatchAllocWithLimits(a, inventory, "data", 0, &inputs, .{ .max_struct_allocation_bytes = share }));
+    // Decoded payload and structural allocations have independent 32 MiB limits.
+    var budget: @import("../../sql/memory_budget.zig") = .{ .backing = a, .limit = share * 2 };
+    var decoded = try buildSupportedColumnsAllocWithLimits(budget.allocator(), inventory, "data", 0, &inputs, .{ .max_struct_allocation_bytes = share });
+    defer decoded.deinit(budget.allocator());
+    try std.testing.expect(budget.peak <= share * 2);
+    std.debug.print("Column page: rows={d} peak_bytes={d} per_column_budget={d}\n", .{ row_count, budget.peak, share * 2 });
+    try std.testing.expectEqual(@as(usize, row_count), decoded.row_count);
+    try std.testing.expectEqual(@as(i64, row_count - 1), try decoded.columns[0].integerAt(row_count - 1));
+    try std.testing.expectError(error.ParquetRowGroupTooLarge, buildSupportedColumnsAllocWithLimits(a, inventory, "data", 0, &inputs, .{ .max_struct_allocation_bytes = 1024 }));
+    const shared = @import("lake_serving_cache.zig");
+    var cache = shared.Cache.init(a);
+    defer cache.deinit();
+    var reader: shared.Reader = .{ .cache = &cache, .base = @import("lake_object_reader.zig").ObjectStorageRangeReader.init(client), .scope = @splat(0), .context = .{ .io = std.testing.io } };
+    defer reader.drain(true);
+    for ([_]bool{ false, true }) |cached| {
+        var cursor = try @import("lake_parquet_cursor.zig").Cursor.init(a, reader.reader(), inventory, "data", 0, &names, .{ .max_input_bytes = 32 * 1024 * 1024, .max_decoded_bytes = 32 * 1024 * 1024, .max_struct_allocation_bytes = 32 * 1024 * 1024 });
+        defer cursor.deinit();
+        if (cached) cursor.shared_reader = &reader;
+        var position: usize = 0;
+        while (try cursor.next()) |batch| {
+            try batch.validate();
+            try std.testing.expect(batch.rowCount() <= 4096);
+            for (batch.row_refs, 0..) |ref, index| {
+                try std.testing.expectEqual(@as(u64, position + index), ref.external.row_ordinal);
+                for (batch.columns) |column| try std.testing.expectEqual(@as(i64, @intCast(position + index)), try column.integerAt(index));
+            }
+            position += batch.rowCount();
+        }
+        try std.testing.expectEqual(@as(usize, row_count), position);
+        try std.testing.expectEqual(@as(usize, chunks.len), cursor.pages_decoded);
+    }
+}
+
+test "lake persistent cache keeps restart reads and retries writer admission after executor pressure" {
+    if (comptime @import("builtin").os.tag == .freestanding or @import("builtin").os.tag == .wasi or @import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const Gate = struct {
+        var base: std.Io = undefined;
+        var denied: bool = true;
+        fn concurrent(userdata: ?*anyopaque, result_len: usize, result_alignment: std.mem.Alignment, context: []const u8, context_alignment: std.mem.Alignment, start: *const fn (*const anyopaque, *anyopaque) void) std.Io.ConcurrentError!*std.Io.AnyFuture {
+            if (denied) return error.ConcurrencyUnavailable;
+            return base.vtable.concurrent(userdata, result_len, result_alignment, context, context_alignment, start);
+        }
+    };
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/writer-pressure", .{tmp.sub_path});
+    defer a.free(root);
+    {
+        var cache = try PersistentObjectRangeCache.init(io, root);
+        defer cache.deinit();
+        try std.testing.expectEqual(.enqueued, cache.enqueueWrite("existing", "data"));
+        cache.flush();
+    }
+    Gate.base = io;
+    Gate.denied = true;
+    var vtable = io.vtable.*;
+    vtable.concurrent = Gate.concurrent;
+    var cache = try PersistentObjectRangeCache.init(.{ .userdata = io.userdata, .vtable = &vtable }, root);
+    defer cache.deinit();
+    try std.testing.expect(cache.state.worker == null);
+    const bytes = (try cache.readAlloc(a, "existing", 4)).?;
+    defer a.free(bytes);
+    try std.testing.expectEqualStrings("data", bytes);
+    try std.testing.expectEqual(.dropped, cache.enqueueWrite("new", "next"));
+    cache.flush();
+    try std.testing.expectEqual(@as(usize, 0), cache.statsSnapshot().queued_entries);
+    Gate.denied = false;
+    try std.testing.expectEqual(.enqueued, cache.enqueueWrite("new", "next"));
+    cache.flush();
+    try std.testing.expectEqual(@as(usize, 1), cache.statsSnapshot().writes_completed);
+    const next = (try cache.readAlloc(a, "new", 4)).?;
+    defer a.free(next);
+    try std.testing.expectEqualStrings("next", next);
+}
+
 test "external lake compact Parquet wide pages retain columns without duplicate row identities" {
     const a = std.testing.allocator;
     const row_count = 145186;
@@ -10367,50 +10688,6 @@ test "external lake compact Parquet wide pages retain columns without duplicate 
         try std.testing.expectEqual(@as(usize, row_count), position);
         try std.testing.expectEqual(@as(usize, chunks.len), cursor.pages_decoded);
     }
-}
-
-test "lake persistent cache keeps restart reads and retries writer admission after executor pressure" {
-    if (comptime @import("builtin").os.tag == .freestanding or @import("builtin").os.tag == .wasi or @import("builtin").os.tag == .windows) return error.SkipZigTest;
-    const Gate = struct {
-        var base: std.Io = undefined;
-        var denied: bool = true;
-        fn concurrent(userdata: ?*anyopaque, result_len: usize, result_alignment: std.mem.Alignment, context: []const u8, context_alignment: std.mem.Alignment, start: *const fn (*const anyopaque, *anyopaque) void) std.Io.ConcurrentError!*std.Io.AnyFuture {
-            if (denied) return error.ConcurrencyUnavailable;
-            return base.vtable.concurrent(userdata, result_len, result_alignment, context, context_alignment, start);
-        }
-    };
-    const a = std.testing.allocator;
-    const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/writer-pressure", .{tmp.sub_path});
-    defer a.free(root);
-    {
-        var cache = try PersistentObjectRangeCache.init(io, root);
-        defer cache.deinit();
-        try std.testing.expectEqual(.enqueued, cache.enqueueWrite("existing", "data"));
-        cache.flush();
-    }
-    Gate.base = io;
-    Gate.denied = true;
-    var vtable = io.vtable.*;
-    vtable.concurrent = Gate.concurrent;
-    var cache = try PersistentObjectRangeCache.init(.{ .userdata = io.userdata, .vtable = &vtable }, root);
-    defer cache.deinit();
-    try std.testing.expect(cache.state.worker == null);
-    const bytes = (try cache.readAlloc(a, "existing", 4)).?;
-    defer a.free(bytes);
-    try std.testing.expectEqualStrings("data", bytes);
-    try std.testing.expectEqual(.dropped, cache.enqueueWrite("new", "next"));
-    cache.flush();
-    try std.testing.expectEqual(@as(usize, 0), cache.statsSnapshot().queued_entries);
-    Gate.denied = false;
-    try std.testing.expectEqual(.enqueued, cache.enqueueWrite("new", "next"));
-    cache.flush();
-    try std.testing.expectEqual(@as(usize, 1), cache.statsSnapshot().writes_completed);
-    const next = (try cache.readAlloc(a, "new", 4)).?;
-    defer a.free(next);
-    try std.testing.expectEqualStrings("next", next);
 }
 
 test "external lake OffsetIndex reads large pages once and validates lengths and ordinals" {

@@ -633,6 +633,36 @@ fn refMatmulTransBForTest(
     }
 }
 
+test "admitted worker scope preserves matrix results for sync and Io kernels" {
+    const allocator = std.testing.allocator;
+    const m: usize = 96;
+    const n: usize = 96;
+    const k: usize = 480;
+    const a = try allocator.alloc(f32, m * k);
+    defer allocator.free(a);
+    const b = try allocator.alloc(f32, n * k);
+    defer allocator.free(b);
+    const expected = try allocator.alloc(f32, m * n);
+    defer allocator.free(expected);
+    const actual = try allocator.alloc(f32, m * n);
+    defer allocator.free(actual);
+    var prng = std.Random.DefaultPrng.init(0xad017ed);
+    for (a) |*value| value.* = prng.random().float(f32) * 2 - 1;
+    for (b) |*value| value.* = prng.random().float(f32) * 2 - 1;
+    @memset(expected, 1);
+    refMatmulTransBForTest(m, n, k, 0.75, a, b, 0.25, expected);
+    for ([_]usize{ 1, 2 }) |workers| {
+        var scope = try pool.WorkerScope.init(workers);
+        defer scope.deinit();
+        @memset(actual, 1);
+        sgemmTransBSync(m, n, k, 0.75, a, b, 0.25, actual);
+        for (expected, actual) |x, y| try std.testing.expect(@abs(x - y) < 5e-4);
+        @memset(actual, 1);
+        try sgemmTransB(std.testing.io, m, n, k, 0.75, a, b, 0.25, actual);
+        for (expected, actual) |x, y| try std.testing.expect(@abs(x - y) < 5e-4);
+    }
+}
+
 test "sgemmTransB threaded path matches reference" {
     const allocator = std.testing.allocator;
     // Shape large enough to trip the >= 4M FMA threading threshold.

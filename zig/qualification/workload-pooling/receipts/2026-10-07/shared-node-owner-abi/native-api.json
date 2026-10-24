@@ -1,0 +1,35 @@
+{
+  "source_snapshot_base": "0d9f795459",
+  "source_sha256": {
+    "zig/pkg/antfly-embedded/src/common/runnable_scheduler.zig": "05074412ab1214795923cc108f8e04614fe3b27e18d4f0592b42edb384aec77e",
+    "zig/pkg/antfly/src/api/http_server.zig": "550d63a71a218e4c7724c06058161f80992e8bb5cf64ec23f6c7922a7afdb761",
+    "zig/pkg/antfly/src/api/httpx_handler.zig": "0bbb8034f8b00bd1f0795071e969cdf2c66df367de8f861d93b3a02078f2c19e",
+    "zig/pkg/antfly/src/api/kernel_abi.zig": "b66cbe90d56d362e206e8af650eee9f4533aabe1604e9304c55289abb5e8d522",
+    "zig/pkg/antfly/src/api/kernel_exports.zig": "a2a487051977496981eb3e6fc764bd397de5aaae81276bfe27405e2f89aadbae",
+    "zig/pkg/antfly/src/api/kernel_bridge.zig": "710898a270ea3eb487cd9b914a4cca9e54f52e916fadf45ffbf6a49c1b859fc6",
+    "zig/pkg/antfly/src/standalone/runtime.zig": "6ec91ae044d756c7cf3cac9e0ec8f46be55fbf07851d00d04989a26b1af4fba0",
+    "zig/pkg/antfly/src/api/sql_execution.zig": "159429282f3e114464e532fa01876930e8581ca4ed7f069cf2a2e3140da7e634",
+    "zig/pkg/antfly-embedded/src/functions/runtime.zig": "9da875b4e18fdb10521056a926aa56f439c4848bcbf1c69c5a50162df534cd00"
+  },
+  "command": "ZIG_GLOBAL_CACHE_DIR=/private/tmp/antfly-default-pooling-global /Users/ajroetker/bin/zig-0.17.0/zig build antfly-workload-pooling-test -Doptimize=ReleaseSafe -j1 --cache-dir /private/tmp/antfly-default-pooling-cache --summary all",
+  "exit_code": 0,
+  "build_steps": 50,
+  "embedded_tests": 37,
+  "coordinator_tests": 41,
+  "reported_coordinator_compile_peak": "19G rounded Zig summary",
+  "covered": [
+    "two API borrowers share one node scheduler",
+    "API retirement preserves owner and another borrower",
+    "checked owner factory and destruction rejection",
+    "opaque wrapper retains allocation owner on refused destruction",
+    "scheduled provider checkpoints and parallel selection",
+    "existing HTTP/pgwire control, read, write and policy contracts"
+  ],
+  "not_covered": [
+    "GNU full API gate",
+    "separately compiled node-owner caller and owner",
+    "standalone production startup/shutdown of new wiring",
+    "inference/background execution admission",
+    "automatic defaults and service pressure"
+  ]
+}

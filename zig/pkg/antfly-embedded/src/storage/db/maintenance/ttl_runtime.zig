@@ -16,6 +16,10 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const Io = std.Io;
+const admission = @import("../../../common/read_admission.zig");
+const cleanup_wait = @import("../../../common/cleanup_wait.zig");
+const maintenance_stop = @import("../maintenance_stop.zig");
+
 const Allocator = std.mem.Allocator;
 const backend_erased = @import("../../backend_erased.zig");
 const backend_scan = @import("../../backend_scan.zig");
@@ -108,6 +112,11 @@ const UnsupportedTtlRuntime = struct {
         return false;
     }
 
+    pub fn stopWithAdmission(self: *@This(), original: admission.Port) !void {
+        try original.checkpoint();
+        if (self.config.enabled) return error.UnsupportedPlatform;
+    }
+
     pub fn pause(_: *@This()) bool {
         return false;
     }
@@ -150,6 +159,12 @@ const PlatformTtlRuntime = struct {
     mutex: Io.Mutex = .init,
     lifecycle_mutex: Io.Mutex = .init,
     scan_mutex: Io.Mutex = .init,
+    closing: std.atomic.Value(bool) = .init(false),
+    join_finisher: bool = false,
+    joined: Io.Event = .unset,
+    join_changed: Io.Event = .unset,
+    join_generation: std.atomic.Value(u64) = .init(0),
+    join_waiters: std.atomic.Value(u32) = .init(0),
     desired_running: bool = false,
     paused: bool = false,
     shutdown: bool = false,
@@ -208,26 +223,77 @@ const PlatformTtlRuntime = struct {
     }
 
     pub fn start(self: *TtlRuntime) !void {
+        if (self.closing.load(.acquire)) return error.Canceled;
         if (!self.config.enabled) return;
         self.lifecycle_mutex.lockUncancelable(self.io.?);
         defer self.lifecycle_mutex.unlock(self.io.?);
+        if (self.closing.load(.acquire)) return error.Canceled;
         self.desired_running = true;
         self.paused = false;
         try self.startLocked();
     }
 
     pub fn stop(self: *TtlRuntime) bool {
+        if (self.closing.load(.acquire)) {
+            self.finalJoin().stop(self.io, false);
+            return false;
+        }
         if (!self.config.enabled) return false;
         self.lifecycle_mutex.lockUncancelable(self.io.?);
+        if (self.closing.load(.acquire)) {
+            self.lifecycle_mutex.unlock(self.io.?);
+            self.finalJoin().stop(self.io, false);
+            return false;
+        }
         defer self.lifecycle_mutex.unlock(self.io.?);
         self.desired_running = false;
         self.paused = true;
         return self.stopLocked();
     }
 
+    fn finalJoin(self: *TtlRuntime) maintenance_stop.BorrowedIo {
+        return .{
+            .mutex = &self.lifecycle_mutex,
+            .registration = &self.future,
+            .stopping = &self.closing,
+            .finisher = &self.join_finisher,
+            .joined = &self.joined,
+            .changed = &self.join_changed,
+            .generation = &self.join_generation,
+            .waiters = &self.join_waiters,
+        };
+    }
+
+    /// Permanently fence new passes, then lend the original cleanup execution
+    /// while the accepted callback retires. A rejected wait retains its handle
+    /// and lease for retry; physical destruction owns lease release.
+    pub fn stopWithAdmission(self: *TtlRuntime, original: admission.Port) !void {
+        self.closing.store(true, .release);
+        if (self.io) |io| {
+            try cleanup_wait.lockIo(&self.lifecycle_mutex, io, original);
+            self.desired_running = false;
+            self.paused = true;
+            self.lifecycle_mutex.unlock(io);
+            try cleanup_wait.lockIo(&self.mutex, io, original);
+            self.shutdown = true;
+
+            self.mutex.unlock(io);
+        }
+        try self.finalJoin().stopWithAdmission(self.io, original);
+    }
+
     pub fn pause(self: *TtlRuntime) bool {
+        if (self.closing.load(.acquire)) {
+            self.finalJoin().stop(self.io, false);
+            return false;
+        }
         if (!self.config.enabled) return false;
         self.lifecycle_mutex.lockUncancelable(self.io.?);
+        if (self.closing.load(.acquire)) {
+            self.lifecycle_mutex.unlock(self.io.?);
+            self.finalJoin().stop(self.io, false);
+            return false;
+        }
         defer self.lifecycle_mutex.unlock(self.io.?);
         self.paused = true;
         const desired = self.desired_running;
@@ -236,17 +302,21 @@ const PlatformTtlRuntime = struct {
     }
 
     pub fn resumeAfterPause(self: *TtlRuntime) !void {
+        if (self.closing.load(.acquire)) return error.Canceled;
         if (!self.config.enabled) return;
         self.lifecycle_mutex.lockUncancelable(self.io.?);
         defer self.lifecycle_mutex.unlock(self.io.?);
+        if (self.closing.load(.acquire)) return error.Canceled;
         self.paused = false;
         if (self.desired_running) try self.startLocked();
     }
 
     pub fn ensureRunning(self: *TtlRuntime) !bool {
+        if (self.closing.load(.acquire)) return error.Canceled;
         if (!self.config.enabled) return true;
         self.lifecycle_mutex.lockUncancelable(self.io.?);
         defer self.lifecycle_mutex.unlock(self.io.?);
+        if (self.closing.load(.acquire)) return error.Canceled;
         if (!self.desired_running) return true;
         if (self.paused) return false;
         try self.startLocked();
@@ -258,6 +328,7 @@ const PlatformTtlRuntime = struct {
     }
 
     fn startLocked(self: *TtlRuntime) !void {
+        if (self.closing.load(.acquire)) return error.Canceled;
         if (self.future != null or self.paused or !self.desired_running) return;
         const io = self.io orelse return error.MissingBackendRuntimeIo;
         self.mutex.lockUncancelable(io);
@@ -279,6 +350,7 @@ const PlatformTtlRuntime = struct {
     }
 
     pub fn runOnce(self: *TtlRuntime) !void {
+        if (self.closing.load(.acquire)) return error.Canceled;
         if (!self.config.enabled) return;
         if (workDeferred(self)) return;
         const now_ns = self.config.clock.nowRealtimeNs();
@@ -628,6 +700,7 @@ fn initRuntimeStore(alloc: Allocator, store: anytype) !RuntimeStoreHandle {
 }
 
 fn isShutdown(runtime: *TtlRuntime) bool {
+    if (runtime.closing.load(.acquire)) return true;
     const io = runtime.io orelse return runtime.shutdown;
     runtime.mutex.lockUncancelable(io);
     defer runtime.mutex.unlock(io);
@@ -1005,4 +1078,30 @@ test "db graph ttl shared GC serves graphs during document admission pressure" {
     try runtime.runOnce();
     try std.testing.expectEqual(@as(u64, 1), runtime.stats().deleted_docs);
     try expectMissingDoc(&store, alloc, "doc:a");
+}
+
+test "maintenance producer close TTL fence precedes shutdown mutex publication" {
+    const alloc = std.testing.allocator;
+    var backend = mem_backend.Backend.init(alloc, .{});
+    defer backend.close();
+    var store = try backend.runtimeStore(alloc, .{ .name = "docs" });
+    defer store.deinit();
+    var delete_ctx = TestDeleteContext{ .alloc = alloc, .store = &store };
+    var backend_runtime = try background_runtime_mod.BackendRuntimeHandle.init(alloc, .{});
+    defer backend_runtime.deinit();
+    var runtime = try TtlRuntime.init(alloc, store, &delete_ctx, TestDeleteContext.deleteCandidates, null, backend_runtime.ptr(), .{ .enabled = true, .lease_owned = true });
+    defer runtime.deinit();
+    const Reject = struct {
+        fn check(_: *anyopaque) !void {
+            return error.DeadlineExceeded;
+        }
+    };
+    var context: u8 = 0;
+    var payload: admission.Payload = .{ .ptr = &context, .vtable = &.{ .checkpoint = Reject.check, .check_lifetime = Reject.check } };
+    try std.testing.expectError(error.DeadlineExceeded, runtime.stopWithAdmission(.init(&payload)));
+    try std.testing.expect(runtime.closing.load(.acquire) and !runtime.shutdown);
+    // The callback must not acquire a lease or start a scan after a rejected
+    // close, even though shutdown could not be published under the mutex.
+    try std.testing.expectEqual(@as(?u64, null), workerStep(&runtime));
+    try std.testing.expect(!runtime.stats().has_lease);
 }

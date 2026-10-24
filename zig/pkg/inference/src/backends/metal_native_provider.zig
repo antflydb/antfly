@@ -187,13 +187,23 @@ pub const MetalNativeProvider = if (build_options.enable_metal) struct {
     }
 
     pub fn createWithKernelJitOptions(options: metal_runtime.MetalJitOptions) !MetalNativeProvider {
+        return createWithKernelJitOptionsAndDeviceBudget(options, null);
+    }
+
+    pub fn createWithKernelJitOptionsAndDeviceBudget(options: metal_runtime.MetalJitOptions, budget: ?@import("../runtime/kv/device_memory.zig").Budget) !MetalNativeProvider {
         const raw_provider = metal_runtime.termite_metal_provider_create();
         const raw_decode_runtime = metal_runtime.termite_metal_decode_runtime_create();
+        return initializeOwned(raw_provider, raw_decode_runtime, options, budget);
+    }
+
+    /// Takes ownership immediately, including failure before qualification.
+    pub fn initializeOwned(raw_provider: ?*RawMetalProvider, raw_decode_runtime: ?*RawMetalDecodeRuntime, options: metal_runtime.MetalJitOptions, budget: ?@import("../runtime/kv/device_memory.zig").Budget) !MetalNativeProvider {
         var result = MetalNativeProvider{
             .raw_provider = raw_provider,
             .raw_decode_runtime = raw_decode_runtime,
         };
         errdefer result.deinitOwned();
+        if (budget) |capability| try result.configureDeviceMemoryBudget(capability);
         // Non-generative Metal graphs (embedding, vision, and audio encoders)
         // have no later regime transition hook. Generation explicitly switches
         // to prefill/decode/speculative regimes before dispatching its work.
@@ -204,6 +214,23 @@ pub const MetalNativeProvider = if (build_options.enable_metal) struct {
         // against a published provider.
         try metal_runtime.initializeMetalKernelJitWithOptions(&result, options);
         return result;
+    }
+
+    pub fn configureDeviceMemoryBudget(provider: *MetalNativeProvider, budget: @import("../runtime/kv/device_memory.zig").Budget) !void {
+        if (budget.family != .kv) return error.MetalDeviceBudgetOwnershipConflict;
+        const raw = provider.raw_decode_runtime orelse return;
+        if (metal_runtime.termite_metal_decode_runtime_kv_device_budget_identity(raw)) |identity| {
+            if (identity != budget.context) return error.MetalDeviceBudgetOwnershipConflict;
+            return;
+        }
+        const bridge = @import("../backends/metal_device_credit.zig");
+        const port = try bridge.create(budget);
+        defer port.release_context(port.context);
+        switch (metal_runtime.termite_metal_decode_runtime_install_kv_device_budget(raw, &port)) {
+            0 => {},
+            -3, -5 => return error.ResourceTemporarilyUnavailable,
+            else => return error.MetalDeviceBudgetOwnershipConflict,
+        }
     }
 
     pub fn hasDecoderRuntime(self: *const MetalNativeProvider) bool {

@@ -24,7 +24,10 @@ const row_policy_gate_mod = @import("row_policy_gate.zig");
 const RelationalRows = @import("relational_rows.zig");
 const platform_time = @import("antfly_platform").time;
 
+const admission = @import("../../common/read_admission.zig");
+
 pub const Session = struct {
+    call_admission: admission.Scope = .{},
     row_policy_lease: ?row_policy_gate_mod.Gate.Lease = null,
     range_proofs: ?[]@import("../range_protection.zig").Proof = null,
     page_bytes: usize = 16 * 1024 * 1024,
@@ -46,10 +49,26 @@ pub const Session = struct {
     }
 
     pub fn checkpoint(session: *const Session) !void {
+        try session.call_admission.checkpoint();
         if (comptime storage_engine.enabled) return @import("antfly_source_root").antfly_sources.storage_engine.call("relationalSessionCheckpoint", .{session});
         if (session.cancellation) |cancellation| try cancellation.check();
         if (session.deadline_ns) |deadline| if (platform_time.monotonicNs() >= deadline) return error.DeadlineExceeded;
         if (session.row_policy_lease) |*lease| try lease.checkAt(@intCast(@divFloor(platform_time.realtimeNs(), std.time.ns_per_s)));
+    }
+    pub fn rangeProofsWithAdmission(session: *Session, alloc: Allocator, control: admission.Port) ![]@import("../range_protection.zig").Proof {
+        if (comptime storage_engine.enabled) return @import("antfly_source_root").antfly_sources.storage_engine.call("relationalSessionRangeProofsWithAdmission", .{ session, alloc, control });
+        const guard = try session.call_admission.enter(control);
+        defer guard.deinit();
+        const result = try session.rangeProofs(alloc);
+        errdefer alloc.free(result);
+        try control.checkpoint();
+        return result;
+    }
+    pub fn normalizeRowsWithAdmission(session: *Session, alloc: Allocator, writes: []const types.BatchWrite, control: admission.Port) ![]types.BatchWrite {
+        if (comptime storage_engine.enabled) return @import("antfly_source_root").antfly_sources.storage_engine.call("relationalSessionNormalizeRowsWithAdmission", .{ session, alloc, writes, control });
+        const guard = try session.call_admission.enter(control);
+        defer guard.deinit();
+        return session.normalizeRows(alloc, writes);
     }
     pub fn rangeProofs(session: *Session, alloc: Allocator) ![]@import("../range_protection.zig").Proof {
         if (comptime storage_engine.enabled) return @import("antfly_source_root").antfly_sources.storage_engine.call("relationalSessionRangeProofs", .{ session, alloc });
@@ -65,6 +84,18 @@ pub const Session = struct {
         var page = try session.reader.nextTypedPage(alloc, io, bounded);
         errdefer page.deinit();
         try session.checkpoint();
+        return page;
+    }
+
+    pub fn nextTypedPageWithAdmission(session: *Session, alloc: Allocator, io: ?std.Io, budget: RelationalRows.Budget, control: @import("../../common/read_admission.zig").Port) !RelationalRows.Page {
+        if (comptime storage_engine.enabled) return @import("antfly_source_root").antfly_sources.storage_engine.call("relationalSessionNextTypedPageWithAdmission", .{ session, alloc, io, budget, control });
+        try session.checkpoint();
+        var bounded = budget;
+        bounded.target_bytes = @min(bounded.output_bytes, if (bounded.target_bytes == 0) session.page_bytes else @min(bounded.target_bytes, session.page_bytes));
+        var page = try session.reader.nextTypedPageWithAdmission(alloc, io, bounded, control);
+        errdefer page.deinit();
+        try session.checkpoint();
+        try control.checkpoint();
         return page;
     }
 

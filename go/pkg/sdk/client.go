@@ -60,6 +60,9 @@ type Config struct {
 	InferenceBaseURL string
 	// HTTPClient is shared by Antfly and inference clients when provided.
 	HTTPClient *http.Client
+	// RequestAdmission configures shared database/inference HTTP admission.
+	// Nil selects 100 active requests, 100 waiters and a one-second wait ceiling.
+	RequestAdmission *RequestAdmissionConfig
 	// RequestEditors are applied to both Antfly and inference requests. Use
 	// WithBasicAuth, WithApiKey, or WithToken for authentication.
 	RequestEditors []oapi.RequestEditorFn
@@ -75,13 +78,19 @@ type Client struct {
 // NewClient creates a consolidated SDK client. The generated client uses the
 // public contract rooted at /db/v1, /auth/v1, and /ai/v1.
 func NewClient(config Config) (*Client, error) {
+	var next oapi.HttpRequestDoer
+	if config.HTTPClient != nil {
+		next = config.HTTPClient
+	}
+	shared, err := NewBoundedHTTPClient(next, config.RequestAdmission)
+	if err != nil {
+		return nil, err
+	}
 	baseURL := strings.TrimRight(config.BaseURL, "/")
 	antflyOptions := make([]oapi.ClientOption, 0, len(config.RequestEditors)+1)
 	inferenceOptions := make([]oapi.ClientOption, 0, len(config.RequestEditors)+1)
-	if config.HTTPClient != nil {
-		antflyOptions = append(antflyOptions, oapi.WithHTTPClient(config.HTTPClient))
-		inferenceOptions = append(inferenceOptions, oapi.WithHTTPClient(config.HTTPClient))
-	}
+	antflyOptions = append(antflyOptions, oapi.WithHTTPClient(shared))
+	inferenceOptions = append(inferenceOptions, oapi.WithHTTPClient(shared))
 	for _, editor := range config.RequestEditors {
 		if editor == nil {
 			continue
@@ -92,6 +101,7 @@ func NewClient(config Config) (*Client, error) {
 
 	antfly, err := NewAntflyClientWithOptions(baseURL, antflyOptions...)
 	if err != nil {
+		_ = shared.Close()
 		return nil, fmt.Errorf("creating antfly client: %w", err)
 	}
 
@@ -101,10 +111,21 @@ func NewClient(config Config) (*Client, error) {
 	}
 	inference, err := NewInferenceClientWithOptions(inferenceBaseURL, inferenceOptions...)
 	if err != nil {
+		_ = shared.Close()
 		return nil, fmt.Errorf("creating inference client: %w", err)
 	}
 
 	return &Client{antfly: antfly, inference: inference}, nil
+}
+
+// Close stops admission for both product surfaces and releases owned idle
+// connections. Caller-supplied HTTP clients remain owned by the caller.
+func (c *Client) Close() error {
+	if c == nil {
+		return nil
+	}
+	_ = c.antfly.Close()
+	return c.inference.Close()
 }
 
 // Antfly returns the Antfly product API surface.
@@ -125,18 +146,17 @@ func (c *Client) Inference() *InferenceClient {
 
 // AntflyClient is a client for interacting with the Antfly API
 type AntflyClient struct {
-	client *oapi.Client
+	client    *oapi.Client
+	admission *BoundedHTTPClient
 }
 
 // NewAntflyClient creates a new Antfly client with an HTTP client.
 func NewAntflyClient(baseURL string, httpClient *http.Client) (*AntflyClient, error) {
-	client, err := oapi.NewClient(NormalizeBaseURL(baseURL), oapi.WithHTTPClient(httpClient))
-	if err != nil {
-		return nil, err
+	var opts []oapi.ClientOption
+	if httpClient != nil {
+		opts = append(opts, oapi.WithHTTPClient(httpClient))
 	}
-	return &AntflyClient{
-		client: client,
-	}, nil
+	return NewAntflyClientWithOptions(baseURL, opts...)
 }
 
 // NewAntflyClientWithToken creates a new Antfly client that sends a bearer token
@@ -153,13 +173,25 @@ func NewAntflyClientWithToken(baseURL string, httpClient *http.Client, token str
 // For authentication, wrap WithBasicAuth, WithApiKey, or WithToken with
 // oapi.WithRequestEditorFn; these helpers return request editors, not client options.
 func NewAntflyClientWithOptions(baseURL string, opts ...oapi.ClientOption) (*AntflyClient, error) {
+	var admission *BoundedHTTPClient
+	opts = append(append([]oapi.ClientOption(nil), opts...), withRequestAdmission(&admission))
 	client, err := oapi.NewClient(NormalizeBaseURL(baseURL), opts...)
 	if err != nil {
 		return nil, err
 	}
 	return &AntflyClient{
-		client: client,
+		client:    client,
+		admission: admission,
 	}, nil
+}
+
+// Close stops this admission owner and releases its owned idle connections.
+// Clients explicitly sharing a BoundedHTTPClient share its closing lifetime.
+func (c *AntflyClient) Close() error {
+	if c == nil || c.admission == nil {
+		return nil
+	}
+	return c.admission.Close()
 }
 
 // WithBasicAuth returns a RequestEditorFn that adds HTTP Basic Authentication.

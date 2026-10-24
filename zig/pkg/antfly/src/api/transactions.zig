@@ -973,6 +973,11 @@ pub const Session = struct {
     /// Exact internally prepared participant input, sealed atomically with
     /// execution-start. Recovery must never re-plan against later row state.
     execution_plan: ?[]u8 = null,
+    /// New plans freeze their complete routed cohort before any BEGIN. Older
+    /// executing sessions retain their compatibility path and cannot be
+    /// retroactively assigned a different cohort.
+    participant_plan_required: bool = false,
+    participant_plan: ?[]u8 = null,
     /// Persisted before releasing the retained coordinator's topology fence.
     terminal_commit: ?TerminalCommit = null,
     /// Definite post-proposal conflict/abort, retained until any owning
@@ -1000,6 +1005,7 @@ pub const Session = struct {
         if (self.principal) |principal| alloc.free(principal);
         if (self.staged) |*staged| staged.deinit(alloc);
         if (self.execution_plan) |bytes| alloc.free(bytes);
+        if (self.participant_plan) |bytes| alloc.free(bytes);
         if (self.terminal_commit) |*terminal| terminal.deinit(alloc);
         deinitReadSnapshotMap(alloc, &self.lake_cuts);
         deinitReadSnapshotMap(alloc, &self.read_snapshots);
@@ -1023,12 +1029,14 @@ pub const Session = struct {
             .next_savepoint_id = self.next_savepoint_id,
             .commit_body_digest = self.commit_body_digest,
             .commit_execution_started = self.commit_execution_started,
+            .participant_plan_required = self.participant_plan_required,
             .terminal_abort = self.terminal_abort,
         };
         errdefer out.deinit(alloc);
         if (self.sql) |metadata| out.sql = try metadata.clone(alloc);
         if (self.staged) |staged| out.staged = try staged.clone(alloc);
         if (self.execution_plan) |bytes| out.execution_plan = try alloc.dupe(u8, bytes);
+        if (self.participant_plan) |bytes| out.participant_plan = try alloc.dupe(u8, bytes);
         if (self.terminal_commit) |terminal| out.terminal_commit = try terminal.clone(alloc);
         out.lake_cuts = try cloneReadSnapshotMap(alloc, self.lake_cuts);
         out.read_snapshots = try cloneReadSnapshotMap(alloc, self.read_snapshots);
@@ -1866,7 +1874,7 @@ pub const SessionRegistry = struct {
             self.mutex.unlock();
             return err;
         };
-        self.sessions.ensureUnusedCapacity(alloc, 1) catch |err| {
+        self.ensurePublicationCapacityLocked(alloc) catch |err| {
             self.mutex.unlock();
             return err;
         };
@@ -2507,9 +2515,53 @@ pub const SessionRegistry = struct {
         const selected = if (candidate.commit_execution_started) try candidate.staged.?.distributedTables(alloc) else null;
         defer if (selected) |value| value.deinit();
         candidate.execution_plan = try encodeExecutionPlan(alloc, if (selected) |value| value.tables else tables);
+        candidate.participant_plan_required = !candidate.commit_execution_started;
         var result = try parseExecutionPlan(alloc, candidate.execution_plan.?);
         errdefer result.deinit();
         candidate.commit_execution_started = true;
+        touchSession(&candidate);
+        try self.renewLeaseLocked(txn_id, candidate.owner_node_id);
+        try self.persistLocked(candidate);
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const target = self.sessions.getPtr(txn_id) orelse return error.SessionRemovedDuringMutation;
+        self.publishCandidateLocked(alloc, target, &candidate);
+        return result;
+    }
+
+    pub fn participantPlanStore(self: *SessionRegistry) @import("antfly_local_sources").api_distributed_txn_contract.ParticipantPlanStore {
+        return .{ .ptr = self, .load = loadParticipantPlan, .seal = sealParticipantPlan };
+    }
+
+    fn loadParticipantPlan(raw: *anyopaque, alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId) !@import("antfly_local_sources").api_distributed_txn_contract.ParticipantPlanStore.Loaded {
+        const self: *SessionRegistry = @ptrCast(@alignCast(raw));
+        const lock = self.sessionLock(txn_id);
+        lock.lock();
+        defer lock.unlock();
+        var candidate = (try self.loadSessionCloneAssumeStripe(alloc, txn_id)) orelse return error.InvalidTransactionSessionRecord;
+        defer candidate.deinit(alloc);
+        if (!candidate.commit_execution_started or candidate.commit_body_digest == null) return error.InvalidTransactionSessionRecord;
+        if (!candidate.participant_plan_required) return .legacy;
+        if (candidate.participant_plan) |bytes| return .{ .planned = try alloc.dupe(u8, bytes) };
+        return .unplanned;
+    }
+
+    fn sealParticipantPlan(raw: *anyopaque, alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId, bytes: []const u8) ![]u8 {
+        const self: *SessionRegistry = @ptrCast(@alignCast(raw));
+        const lock = self.sessionLock(txn_id);
+        lock.lock();
+        defer lock.unlock();
+        var candidate = (try self.loadSessionCloneAssumeStripe(alloc, txn_id)) orelse return error.InvalidTransactionSessionRecord;
+        errdefer candidate.deinit(alloc);
+        if (!candidate.participant_plan_required or candidate.execution_plan == null or !candidate.commit_execution_started) return error.InvalidTransactionSessionRecord;
+        if (candidate.participant_plan) |existing| {
+            const result = try alloc.dupe(u8, existing);
+            candidate.deinit(alloc);
+            return result;
+        }
+        candidate.participant_plan = try alloc.dupe(u8, bytes);
+        const result = try alloc.dupe(u8, bytes);
+        errdefer alloc.free(result);
         touchSession(&candidate);
         try self.renewLeaseLocked(txn_id, candidate.owner_node_id);
         try self.persistLocked(candidate);
@@ -3294,10 +3346,11 @@ pub const SessionRegistry = struct {
             self.mutex.unlock();
             return;
         }
-        self.sessions.put(alloc, txn_id, candidate.*) catch |err| {
+        self.ensurePublicationCapacityLocked(alloc) catch |err| {
             self.mutex.unlock();
             return err;
         };
+        self.sessions.putAssumeCapacity(txn_id, candidate.*);
         candidate.* = undefined;
         self.mutex.unlock();
     }
@@ -3318,7 +3371,18 @@ pub const SessionRegistry = struct {
     fn ensureSessionCapacityLocked(self: *SessionRegistry) !void {
         const limit = self.max_sessions orelse return;
         const count = if (self.durable != null) self.known_durable_session_count orelse return error.SessionCapacityUnavailable else self.sessions.count();
-        if (count + self.reserved_session_count >= limit) return error.SessionLimitExceeded;
+        if (count >= limit or self.reserved_session_count >= limit - count) return error.SessionLimitExceeded;
+    }
+
+    /// Every new insertion preserves slots promised to BEGINs persisting
+    /// outside this mutex. ensureUnusedCapacity(1) alone does not reserve a
+    /// slot: another BEGIN, lazy load or adoption could consume the same one.
+    /// Reserve before persistence so BEGIN's final publication cannot allocate.
+    fn ensurePublicationCapacityLocked(self: *SessionRegistry, alloc: std.mem.Allocator) !void {
+        const pending = std.math.cast(u32, self.reserved_session_count) orelse return error.OutOfMemory;
+        const additional = std.math.add(u32, pending, 1) catch return error.OutOfMemory;
+        const total = std.math.add(u32, self.sessions.count(), additional) catch return error.OutOfMemory;
+        try self.sessions.ensureTotalCapacity(alloc, total);
     }
 
     fn initializeDurableSessionCount(self: *SessionRegistry) !void {
@@ -3359,7 +3423,8 @@ pub const SessionRegistry = struct {
             loaded_owned = false;
             return try session.clone(alloc);
         }
-        try self.sessions.put(alloc, txn_id, loaded);
+        try self.ensurePublicationCapacityLocked(alloc);
+        self.sessions.putAssumeCapacity(txn_id, loaded);
         loaded_owned = false;
         return try self.sessions.getPtr(txn_id).?.clone(alloc);
     }
@@ -5197,6 +5262,15 @@ fn leaseRecordOwnerNodeId(owner_id: []const u8) ?u64 {
 }
 
 fn encodeSessionRecord(alloc: std.mem.Allocator, session: Session) ![]u8 {
+    const bytes = try encodeSessionRecordBody(alloc, session);
+    if (!session.participant_plan_required) return bytes;
+    defer alloc.free(bytes);
+    // Old binaries require an object and reject this envelope. They must not
+    // silently regroup an executing session whose cohort they cannot read.
+    return std.fmt.allocPrint(alloc, "[\"participant-cohort-v1\",{s}]", .{bytes});
+}
+
+fn encodeSessionRecordBody(alloc: std.mem.Allocator, session: Session) ![]u8 {
     var out = std.ArrayListUnmanaged(u8).empty;
     defer out.deinit(alloc);
     try out.appendSlice(alloc, "{\"owner_node_id\":");
@@ -5247,6 +5321,10 @@ fn encodeSessionRecord(alloc: std.mem.Allocator, session: Session) ![]u8 {
     try out.appendSlice(alloc, if (session.terminal_abort) "true" else "false");
     try out.appendSlice(alloc, ",\"execution_plan\":");
     if (session.execution_plan) |bytes| try appendJsonString(alloc, &out, bytes) else try out.appendSlice(alloc, "null");
+    try out.appendSlice(alloc, ",\"participant_plan_required\":");
+    try out.appendSlice(alloc, if (session.participant_plan_required) "true" else "false");
+    try out.appendSlice(alloc, ",\"participant_plan\":");
+    if (session.participant_plan) |bytes| try appendJsonString(alloc, &out, bytes) else try out.appendSlice(alloc, "null");
     try out.appendSlice(alloc, ",\"terminal_commit\":");
     if (session.terminal_commit) |terminal| {
         try out.appendSlice(alloc, "{\"status\":");
@@ -5339,8 +5417,14 @@ fn decodeSessionRecord(alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId, bod
     // Do not convert any user number until its schema is available.
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{ .parse_numbers = false });
     defer parsed.deinit();
-    const obj = switch (parsed.value) {
-        .object => |obj| obj,
+    const versioned = parsed.value == .array;
+    const record_value = if (versioned) blk: {
+        const array = parsed.value.array.items;
+        if (array.len != 2 or array[0] != .string or !std.mem.eql(u8, array[0].string, "participant-cohort-v1")) return error.InvalidTransactionSessionRecord;
+        break :blk array[1];
+    } else parsed.value;
+    const obj = switch (record_value) {
+        .object => |object| object,
         else => return error.InvalidTransactionSessionRecord,
     };
     var session: Session = .{
@@ -5433,6 +5517,19 @@ fn decodeSessionRecord(alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId, bod
             var plan = try parseExecutionPlan(alloc, bytes);
             defer plan.deinit();
             session.execution_plan = try alloc.dupe(u8, bytes);
+        },
+        else => return error.InvalidTransactionSessionRecord,
+    };
+    session.participant_plan_required = if (obj.get("participant_plan_required")) |value| switch (value) {
+        .bool => |required| required,
+        else => return error.InvalidTransactionSessionRecord,
+    } else false;
+    if (session.participant_plan_required != versioned or (session.participant_plan_required and (!session.commit_execution_started or session.execution_plan == null))) return error.InvalidTransactionSessionRecord;
+    if (obj.get("participant_plan")) |value| switch (value) {
+        .null => {},
+        .string => |bytes| {
+            if (!session.participant_plan_required or bytes.len == 0) return error.InvalidTransactionSessionRecord;
+            session.participant_plan = try alloc.dupe(u8, bytes);
         },
         else => return error.InvalidTransactionSessionRecord,
     };
@@ -6244,6 +6341,119 @@ test "terminal commit response preserves live debt ahead of repair" {
     );
 }
 
+// Inject a second public operation at the durable allocator boundary, after
+// BEGIN releases its mutex but before it can publish. This deterministically
+// exercises an allowed interleaving without concurrent backend transactions.
+const SessionPublicationInterleaving = struct {
+    registry: *SessionRegistry,
+    action: enum { begin, load, adopt },
+    durable_id: db_mod.types.TxnId,
+    armed: bool = false,
+    abort_outer: bool = true,
+    fired: bool = false,
+    preserved: bool = false,
+    failure: ?anyerror = null,
+
+    fn allocator(self: *@This()) std.mem.Allocator {
+        return .{ .ptr = self, .vtable = &.{ .alloc = allocate, .resize = resize, .remap = remap, .free = free } };
+    }
+
+    fn interleave(self: *@This()) !void {
+        switch (self.action) {
+            .begin => {
+                _ = try self.registry.begin(std.testing.allocator, .{ .sync_level = .write }, 2);
+            },
+            .load => {
+                var details = (try self.registry.getDetails(std.testing.allocator, self.durable_id)) orelse return error.MissingSession;
+                defer details.deinit(std.testing.allocator);
+            },
+            .adopt => if (!(try self.registry.adopt(std.testing.allocator, self.durable_id, 3))) return error.MissingSession,
+        }
+    }
+
+    fn allocate(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
+        const self: *@This() = @ptrCast(@alignCast(ctx));
+        if (self.armed) {
+            self.armed = false;
+            self.fired = true;
+            self.interleave() catch |err| {
+                self.failure = err;
+                return null;
+            };
+            self.registry.mutex.lock();
+            self.preserved = self.registry.sessions.available >= self.registry.reserved_session_count;
+            self.registry.mutex.unlock();
+            // Stop before putAssumeCapacity on the unfixed implementation;
+            // observe the lost reservation instead of crashing the runner.
+            if (self.abort_outer) return null;
+        }
+        return std.testing.allocator.rawAlloc(len, alignment, ret_addr);
+    }
+
+    fn resize(_: *anyopaque, memory: []u8, alignment: std.mem.Alignment, len: usize, ret_addr: usize) bool {
+        return std.testing.allocator.rawResize(memory, alignment, len, ret_addr);
+    }
+    fn remap(_: *anyopaque, memory: []u8, alignment: std.mem.Alignment, len: usize, ret_addr: usize) ?[*]u8 {
+        return std.testing.allocator.rawRemap(memory, alignment, len, ret_addr);
+    }
+    fn free(_: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
+        std.testing.allocator.rawFree(memory, alignment, ret_addr);
+    }
+};
+
+fn exerciseSessionPublicationInterleaving(action: @FieldType(SessionPublicationInterleaving, "action")) !void {
+    const alloc = std.testing.allocator;
+    var backend = mem_backend.Backend.init(alloc, .{});
+    defer backend.close();
+    var store = try backend.runtimeStore(alloc, .{ .name = "system/api-transaction-sessions" });
+    defer store.deinit();
+    var durable = DurableSessionStore.initRuntime(alloc, &store);
+    var writer = SessionRegistry.init(&durable);
+    defer writer.deinit(alloc);
+    const uncached = try writer.begin(alloc, .{ .sync_level = .write }, 9);
+    var registry = SessionRegistry.init(&durable);
+    defer registry.deinit(alloc);
+    // Leave exactly one publication slot, shared by the two overlapping calls.
+    while (registry.sessions.available != 1) {
+        _ = try registry.begin(alloc, .{ .sync_level = .write }, 1);
+    }
+    var hook: SessionPublicationInterleaving = .{ .registry = &registry, .action = action, .durable_id = uncached.txn_id };
+    durable.alloc = hook.allocator();
+    hook.armed = true;
+    try std.testing.expectError(error.OutOfMemory, registry.begin(alloc, .{ .sync_level = .write }, 1));
+    if (hook.failure) |err| return err;
+    try std.testing.expect(hook.fired);
+    try std.testing.expect(hook.preserved);
+    try std.testing.expectEqual(@as(usize, 0), registry.reserved_session_count);
+    try std.testing.expectEqual(try durable.sessionCount(), registry.known_durable_session_count.?);
+
+    // Exercise successful durable handoff too, including a fresh uncached ID.
+    const another = try writer.begin(alloc, .{ .sync_level = .write }, 9);
+    hook.durable_id = another.txn_id;
+    hook.abort_outer = false;
+    hook.armed = true;
+    hook.fired = false;
+    const outer = try registry.begin(alloc, .{ .sync_level = .write }, 1);
+    if (hook.failure) |err| return err;
+    try std.testing.expect(hook.fired and hook.preserved);
+    try std.testing.expect(registry.getInfo(outer.txn_id) != null);
+    var persisted = (try durable.load(outer.txn_id)).?;
+    defer persisted.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), registry.reserved_session_count);
+}
+
+test "durable session publication protects pending BEGIN slots from another BEGIN" {
+    try exerciseSessionPublicationInterleaving(.begin);
+}
+
+test "durable session publication protects pending BEGIN slots from lazy loading" {
+    try exerciseSessionPublicationInterleaving(.load);
+}
+
+test "durable session publication protects pending BEGIN slots from ownership adoption" {
+    try exerciseSessionPublicationInterleaving(.adopt);
+}
+
 test "durable session limits bound count and encoded record size" {
     var backend = mem_backend.Backend.init(std.testing.allocator, .{});
     defer backend.close();
@@ -6642,11 +6852,17 @@ test "transaction session registry renews and releases separate lease records" {
     const initial_status = (try registry.getStatus(std.testing.allocator, session.txn_id)) orelse return error.TestExpectedEqual;
     try std.testing.expect(initial_status.lease_expires_at > 0);
 
-    std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
     _ = (try registry.createSavepoint(std.testing.allocator, session.txn_id)) orelse return error.TestExpectedEqual;
 
     const renewed_status = (try registry.getStatus(std.testing.allocator, session.txn_id)) orelse return error.TestExpectedEqual;
-    try std.testing.expect(renewed_status.lease_expires_at > initial_status.lease_expires_at);
+    // Savepoint renewal may occur within the same millisecond as BEGIN.
+    try std.testing.expect(renewed_status.lease_expires_at >= initial_status.lease_expires_at);
+    // The public maintenance path accepts an explicit time; prove advancement
+    // and exact persisted expiry without depending on scheduler sleep duration.
+    const renewal_time = renewed_status.lease_expires_at;
+    try std.testing.expectEqual(@as(usize, 1), try registry.renewOwnedLeases(15, renewal_time));
+    const advanced_status = (try registry.getStatus(std.testing.allocator, session.txn_id)) orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(renewal_time + 10 * std.time.ns_per_ms, advanced_status.lease_expires_at);
 
     try std.testing.expect(registry.remove(std.testing.allocator, session.txn_id));
     try std.testing.expect((try lease_store.load(std.testing.allocator, session.txn_id)) == null);
@@ -6914,6 +7130,7 @@ test "distributed txn SQL range guards survive durability and savepoint rollback
             try std.testing.expect(std.mem.indexOf(u8, public, "range_guards") == null);
         }
     };
+
     try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
 }
 
@@ -6926,7 +7143,7 @@ test "distributed txn table views isolate statement scratch from request ownersh
         );
         defer request.deinit(budget.allocator());
         request.tables[0].batch.writes[0].json_null_fields = try cloneJsonNullFields(budget.allocator(), &.{"nullable"});
-        const owned_bytes = budget.used;
+        const owned_bytes = budget.used.load(.acquire);
         // The SQL executor's conflict lookup receives an arena allocator even
         // though the staged request belongs to the connection budget. Destroy
         // that arena between lookups, then clean up the request via its owner.
@@ -6935,7 +7152,7 @@ test "distributed txn table views isolate statement scratch from request ownersh
             defer scratch.deinit();
             const view = try request.distributedTables(scratch.allocator());
             defer view.deinit();
-            try std.testing.expectEqual(owned_bytes, budget.used);
+            try std.testing.expectEqual(owned_bytes, budget.used.load(.acquire));
             try std.testing.expectEqual(@as(usize, 2), view.tables.len);
             for (request.tables, view.tables) |source, table| {
                 try std.testing.expectEqual(source.batch.writes.len, table.writes.len);
@@ -6954,9 +7171,9 @@ test "distributed txn table views isolate statement scratch from request ownersh
             }
         };
         try std.testing.checkAllAllocationFailures(alloc, Harness.run, .{&request});
-        try std.testing.expectEqual(owned_bytes, budget.used);
+        try std.testing.expectEqual(owned_bytes, budget.used.load(.acquire));
     }
-    try std.testing.expectEqual(@as(usize, 0), budget.used);
+    try std.testing.expectEqual(@as(usize, 0), budget.used.load(.acquire));
     const empty: OwnedTransactionCommitRequest = .{};
     const view = try empty.distributedTables(alloc);
     defer view.deinit();
@@ -7426,4 +7643,92 @@ test "lake SQL session cuts survive savepoint rollback and durable record recove
     var recovered = (try cloneReadSnapshotForKey(a, &restored.lake_cuts, "events", "accepted")).?;
     defer recovered.deinit(a);
     try std.testing.expectEqualStrings(held.document_json.?, recovered.document_json.?);
+}
+
+test "distributed txn sessions retain one original cohort across failed saves reopen and recovery" {
+    const alloc = std.testing.allocator;
+    var backend = mem_backend.Backend.init(alloc, .{});
+    defer backend.close();
+    var runtime_store = try backend.runtimeStore(alloc, .{ .name = "system/api-transaction-sessions" });
+    defer runtime_store.deinit();
+    var durable = DurableSessionStore.initRuntime(alloc, &runtime_store);
+    var writer = SessionRegistry.init(&durable);
+    defer writer.deinit(alloc);
+    const session = try writer.begin(alloc, .{ .sync_level = .write }, 9);
+    const unsealed_port = writer.participantPlanStore();
+    try std.testing.expectError(error.InvalidTransactionSessionRecord, unsealed_port.load(unsealed_port.ptr, alloc, session.txn_id));
+    var request = try parseCommitRequest(alloc,
+        \\{"read_set":[],"tables":{"docs":{"inserts":{"a":{"id":1}}}}}
+    );
+    defer request.deinit(alloc);
+    var sealed = (try writer.cloneCommitRequest(alloc, session.txn_id, &request)).?;
+    defer sealed.deinit(alloc);
+    const tables_view = try sealed.distributedTables(alloc);
+    defer tables_view.deinit();
+    const tables = tables_view.tables;
+    var logical = (try writer.sealExecutionPlan(alloc, session.txn_id, tables)).?;
+    defer logical.deinit();
+    const port = writer.participantPlanStore();
+    try std.testing.expect((try port.load(port.ptr, alloc, session.txn_id)) == .unplanned);
+    durable.fail_writes_for_test = true;
+    try std.testing.expectError(error.InjectedSessionStoreFailure, port.seal(port.ptr, alloc, session.txn_id, "original-cohort"));
+    try std.testing.expect((try port.load(port.ptr, alloc, session.txn_id)) == .unplanned);
+    durable.fail_writes_for_test = false;
+    const first = try port.seal(port.ptr, alloc, session.txn_id, "original-cohort");
+    defer alloc.free(first);
+    const second = try port.seal(port.ptr, alloc, session.txn_id, "rerouted-cohort");
+    defer alloc.free(second);
+    try std.testing.expectEqualStrings(first, second);
+    var reopened = SessionRegistry.init(&durable);
+    defer reopened.deinit(alloc);
+    var recovery = (try reopened.claimPendingRecovery(alloc, session.txn_id, 9, nextTxnTimestamp())).?;
+    defer recovery.deinit(alloc);
+    const recovery_port = reopened.participantPlanStore();
+    const loaded = try recovery_port.load(recovery_port.ptr, alloc, session.txn_id);
+    defer alloc.free(loaded.planned);
+    try std.testing.expectEqualStrings("original-cohort", loaded.planned);
+    const retry = try recovery_port.seal(recovery_port.ptr, alloc, session.txn_id, "new-topology");
+    defer alloc.free(retry);
+    try std.testing.expectEqualStrings(first, retry);
+    // Executing records from before the cohort contract cannot acquire a
+    // freshly routed cohort and misrepresent it as their original one.
+    const old = try writer.begin(alloc, .{ .sync_level = .write }, 9);
+    var old_sealed = (try writer.cloneCommitRequest(alloc, old.txn_id, &request)).?;
+    defer old_sealed.deinit(alloc);
+    _ = try writer.markCommitExecutionStarted(alloc, old.txn_id);
+    var old_plan = (try writer.sealExecutionPlan(alloc, old.txn_id, tables)).?;
+    defer old_plan.deinit();
+    try std.testing.expect((try port.load(port.ptr, alloc, old.txn_id)) == .legacy);
+    try std.testing.expectError(error.InvalidTransactionSessionRecord, port.seal(port.ptr, alloc, old.txn_id, "not-original"));
+}
+
+test "distributed txn cohort session envelope rejects old readers stripped framing and every allocation failure" {
+    const Harness = struct {
+        fn run(alloc: std.mem.Allocator) !void {
+            var session: Session = .{ .txn_id = @splat(1), .owner_node_id = 1, .begin_timestamp = 2, .last_touched_timestamp = 3, .sync_level = .write, .commit_body_digest = @splat(4), .commit_execution_started = true, .execution_plan = try alloc.dupe(u8, "[]"), .participant_plan_required = true };
+            defer session.deinit(alloc);
+            session.participant_plan = try alloc.dupe(u8, "binary-cohort");
+            const bytes = try encodeSessionRecord(alloc, session);
+            defer alloc.free(bytes);
+            try std.testing.expect(std.mem.startsWith(u8, bytes, "[\"participant-cohort-v1\","));
+            var decoded = try decodeSessionRecord(alloc, session.txn_id, bytes);
+            defer decoded.deinit(alloc);
+            try std.testing.expect(decoded.participant_plan_required);
+            try std.testing.expectEqualStrings(session.participant_plan.?, decoded.participant_plan.?);
+            var clone = try decoded.clone(alloc);
+            defer clone.deinit(alloc);
+            try std.testing.expectEqualStrings(decoded.participant_plan.?, clone.participant_plan.?);
+            const prefix = "[\"participant-cohort-v1\",";
+            if (decodeSessionRecord(alloc, session.txn_id, bytes[prefix.len .. bytes.len - 1])) |value| {
+                var unexpected = value;
+                unexpected.deinit(alloc);
+                return error.TestExpectedError;
+            } else |err| if (err != error.InvalidTransactionSessionRecord) return err;
+            // The former reader accepts only an object at the root.
+            var old = try std.json.parseFromSlice(std.json.Value, alloc, bytes, .{});
+            defer old.deinit();
+            try std.testing.expect(old.value != .object);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Harness.run, .{});
 }

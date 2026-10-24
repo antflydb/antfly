@@ -42,6 +42,11 @@ pub const Owner = struct {
     lifecycle_mutex: std.atomic.Mutex = .unlocked,
     future: ?runtime_mod.MaintenanceScheduler.Handle = null,
     stopping: std.atomic.Value(bool) = .init(false),
+    stop_started: bool = false,
+    joined: std.Io.Event = .unset,
+    stop_progress: std.Io.Event = .unset,
+    stop_generation: std.atomic.Value(u64) = .init(0),
+    stop_waiters: std.atomic.Value(u32) = .init(0),
     repair_retry_after_ns: u64 = 0,
     pub const idle_poll_ns: u64 = 5 * std.time.ns_per_s;
     pub const active_poll_ns: u64 = 100 * std.time.ns_per_ms;
@@ -63,19 +68,14 @@ pub const Owner = struct {
             return;
         };
     }
+    fn shutdown(self: *Owner) @import("maintenance_stop.zig").Borrowed {
+        return .{ .mutex = &self.lifecycle_mutex, .registration = &self.future, .stopping = &self.stopping, .finisher = &self.stop_started, .joined = &self.joined, .changed = &self.stop_progress, .generation = &self.stop_generation, .waiters = &self.stop_waiters };
+    }
     pub fn stop(self: *Owner, runtime: *runtime_mod.BackendRuntime) void {
-        self.lock();
-        self.stopping.store(true, .release);
-        var future = self.future;
-        self.future = null;
-        self.lifecycle_mutex.unlock();
-        // The callback may invoke another local lifecycle operation. Join
-        // outside admission so its completion cannot deadlock shutdown.
-        if (future) |*task| {
-            if (runtime.io()) |io| task.await(io);
-        }
-        self.lock();
-        self.lifecycle_mutex.unlock();
+        self.shutdown().stop(runtime.io(), false);
+    }
+    pub fn stopWithAdmission(self: *Owner, runtime: *runtime_mod.BackendRuntime, original: @import("../../common/read_admission.zig").Port) !void {
+        try self.shutdown().stopWithAdmission(runtime.io(), original);
     }
     fn scheduledStep(self: *Owner) ?u64 {
         return self.step(self.port);
@@ -83,6 +83,7 @@ pub const Owner = struct {
     pub fn step(self: *Owner, port: Port) ?u64 {
         if (self.stopping.load(.acquire)) return null;
         self.run(port);
+        if (self.stopping.load(.acquire)) return null;
         return self.delayMs(port.now(port.ptr), port.activity(port.ptr));
     }
     pub fn delayMs(self: *const Owner, now_ns: u64, activity: Activity) u64 {
@@ -91,15 +92,20 @@ pub const Owner = struct {
         return std.math.divCeil(u64, activity.scan_pause_ns orelse if (active) active_poll_ns else idle_poll_ns, std.time.ns_per_ms) catch unreachable;
     }
     pub fn run(self: *Owner, port: Port) void {
-        if (!port.ready(port.ptr)) return;
+        if (self.stopping.load(.acquire) or !port.ready(port.ptr)) return;
+        // Each check admits one stage. Shutdown joins the already admitted
+        // stage through this callback's future, then denies later stages.
+        if (self.stopping.load(.acquire)) return;
         _ = port.run(port.ptr, .upload) catch |err| switch (err) {
             error.NotLeader, error.Canceled, error.ResourceLimitExceeded, error.ResourceBudgetExceeded, error.ArtifactCatalogDrift => {},
             else => std.log.warn("artifact upload recovery failed: {s}", .{@errorName(err)}),
         };
+        if (self.stopping.load(.acquire)) return;
         _ = port.run(port.ptr, .authority) catch |err| switch (err) {
             error.NotLeader, error.ReadOnly, error.Canceled, error.WriterLocked, error.OnlineSourcePinPending, error.ResourceBudgetExceeded, error.DocumentAuthorityCursorChanged, error.PortableRuntimeActivationPending => {},
             else => std.log.warn("document authority cache migration failed: {s}", .{@errorName(err)}),
         };
+        if (self.stopping.load(.acquire)) return;
         _ = port.run(port.ptr, .baseline) catch |err| blk: {
             port.failed(port.ptr, .baseline);
             switch (err) {
@@ -108,10 +114,12 @@ pub const Owner = struct {
             }
             break :blk false;
         };
+        if (self.stopping.load(.acquire)) return;
         _ = port.run(port.ptr, .producer) catch |err| switch (err) {
             error.NotLeader, error.Canceled, error.ResourceLimitExceeded, error.ResourceBudgetExceeded, error.ArtifactCatalogDrift, error.EnrichmentSourceChanged, error.OnlineSourcePinPending, error.WriterLocked => {},
             else => std.log.warn("artifact producer scheduling failed: {s}", .{@errorName(err)}),
         };
+        if (self.stopping.load(.acquire)) return;
         _ = port.run(port.ptr, .footprint) catch |err| blk: {
             // A prepared source pin and writer contention are temporary. Keep
             // the normal idle retry cadence instead of spinning on a fence.
@@ -122,7 +130,9 @@ pub const Owner = struct {
             }
             break :blk false;
         };
+        if (self.stopping.load(.acquire)) return;
         if (port.now(port.ptr) >= self.repair_retry_after_ns) {
+            if (self.stopping.load(.acquire)) return;
             _ = port.run(port.ptr, .repair) catch |err| failed: {
                 if (err == error.PortableRuntimeActivationPending) return;
                 self.repair_retry_after_ns = port.now(port.ptr) +| idle_poll_ns;
@@ -132,10 +142,12 @@ pub const Owner = struct {
         }
         // Drain a time/range budget, then yield to other owner work. A
         // backlog uses the active cadence rather than the idle poll.
+        if (self.stopping.load(.acquire)) return;
         _ = port.run(port.ptr, .column) catch |err| switch (err) {
             error.Canceled, error.PreparedGenerationChanged, error.ResourceBudgetExceeded => {},
             else => std.log.warn("relational column maintenance failed: {s}", .{@errorName(err)}),
         };
+        if (self.stopping.load(.acquire)) return;
         _ = port.run(port.ptr, .index) catch |err| switch (err) {
             error.Canceled, error.PreparedGenerationChanged, error.IntentConflict, error.ResourceBudgetExceeded, error.PortableRuntimeActivationPending, error.IndexNotFound => {},
             else => std.log.warn("relational index maintenance failed: {s}", .{@errorName(err)}),
@@ -197,6 +209,7 @@ test "independent maintenance joins callbacks outside its lifecycle lock" {
         owner: *Owner,
         entered: std.atomic.Value(bool) = .init(false),
         unlocked: std.atomic.Value(bool) = .init(false),
+        work_calls: [7]std.atomic.Value(usize) = @splat(.init(0)),
         fn now(_: *anyopaque) u64 {
             return 0;
         }
@@ -205,6 +218,7 @@ test "independent maintenance joins callbacks outside its lifecycle lock" {
         }
         fn run(ptr: *anyopaque, work: Owner.Work) !bool {
             const self: *@This() = @ptrCast(@alignCast(ptr));
+            _ = self.work_calls[@backingInt(work)].fetchAdd(1, .acq_rel);
             if (work == .upload) {
                 self.entered.store(true, .release);
                 while (!self.owner.stopping.load(.acquire)) @import("antfly_platform").time.yieldNow();
@@ -240,4 +254,168 @@ test "independent maintenance joins callbacks outside its lifecycle lock" {
     owner.stop(runtime.ptr());
     try std.testing.expect(fixture.unlocked.load(.acquire));
     try std.testing.expect(owner.future == null);
+    try std.testing.expectEqual(@as(usize, 1), fixture.work_calls[0].load(.acquire));
+    for (fixture.work_calls[1..]) |*calls| try std.testing.expectEqual(@as(usize, 0), calls.load(.acquire));
+}
+
+test "independent maintenance shutdown fences every later stage and preserves current failure cleanup" {
+    const Fixture = struct {
+        owner: *Owner,
+        stop_after: Owner.Work,
+        fail_current: bool,
+        calls: [std.meta.tags(Owner.Work).len]Owner.Work = undefined,
+        count: usize = 0,
+        failed_count: usize = 0,
+        fn ready(_: *anyopaque) bool {
+            return true;
+        }
+        fn now(_: *anyopaque) u64 {
+            return 10;
+        }
+        fn run(raw: *anyopaque, work: Owner.Work) !bool {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls[self.count] = work;
+            self.count += 1;
+            if (work == self.stop_after) {
+                self.owner.stopping.store(true, .release);
+                if (self.fail_current) return error.Canceled;
+            }
+            return false;
+        }
+        fn failed(raw: *anyopaque, work: Owner.Work) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            std.debug.assert(self.owner.stopping.load(.acquire));
+            std.debug.assert(work == self.stop_after);
+            self.failed_count += 1;
+        }
+        fn activity(_: *anyopaque) Owner.Activity {
+            @panic("shutdown must not start another activity observation");
+        }
+    };
+    const order = [_]Owner.Work{ .upload, .authority, .baseline, .producer, .footprint, .repair, .column, .index };
+    for (order, 0..) |work, index| {
+        for ([_]bool{ false, true }) |fail_current| {
+            if (fail_current and work != .baseline and work != .footprint) continue;
+            var owner: Owner = .{};
+            var fixture: Fixture = .{ .owner = &owner, .stop_after = work, .fail_current = fail_current };
+            const port: Owner.Port = .{ .ptr = &fixture, .runtime = undefined, .now = Fixture.now, .ready = Fixture.ready, .run = Fixture.run, .failed = Fixture.failed, .activity = Fixture.activity };
+            try std.testing.expect(owner.step(port) == null);
+            try std.testing.expectEqualSlices(Owner.Work, order[0 .. index + 1], fixture.calls[0..fixture.count]);
+            try std.testing.expectEqual(@as(usize, @intFromBool(fail_current)), fixture.failed_count);
+            // Already stopped direct callers cannot bypass the stage gate.
+            owner.run(port);
+            try std.testing.expectEqual(index + 1, fixture.count);
+        }
+    }
+}
+
+test "independent maintenance shutdown during readiness denies the first stage" {
+    const Fixture = struct {
+        owner: *Owner,
+        fn ready(raw: *anyopaque) bool {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.owner.stopping.store(true, .release);
+            return true;
+        }
+        fn now(_: *anyopaque) u64 {
+            @panic("shutdown must not schedule a retry");
+        }
+        fn run(_: *anyopaque, _: Owner.Work) !bool {
+            @panic("shutdown during readiness must deny work");
+        }
+        fn failed(_: *anyopaque, _: Owner.Work) void {
+            @panic("no stage was admitted");
+        }
+        fn activity(_: *anyopaque) Owner.Activity {
+            @panic("shutdown must not observe activity");
+        }
+    };
+    var owner: Owner = .{};
+    var fixture: Fixture = .{ .owner = &owner };
+    const port: Owner.Port = .{ .ptr = &fixture, .runtime = undefined, .now = Fixture.now, .ready = Fixture.ready, .run = Fixture.run, .failed = Fixture.failed, .activity = Fixture.activity };
+    try std.testing.expect(owner.step(port) == null);
+}
+
+test "independent maintenance concurrent shutdown callers both join physical callback retirement" {
+    const builtin = @import("builtin");
+    if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
+    var runtime = try runtime_mod.BackendRuntimeHandle.init(std.testing.allocator, .{});
+    defer runtime.deinit();
+    const io = runtime.ptr().io().?;
+    var owner: Owner = .{};
+    const Fixture = struct {
+        io: std.Io,
+        entered: std.Io.Event = .unset,
+        release: std.Io.Event = .unset,
+        retired: std.atomic.Value(bool) = .init(false),
+        later_stages: std.atomic.Value(usize) = .init(0),
+        fn now(_: *anyopaque) u64 {
+            return 0;
+        }
+        fn ready(_: *anyopaque) bool {
+            return true;
+        }
+        fn run(raw: *anyopaque, work: Owner.Work) !bool {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (work == .upload) {
+                self.entered.set(self.io);
+                self.release.waitUncancelable(self.io);
+                self.retired.store(true, .release);
+            } else _ = self.later_stages.fetchAdd(1, .acq_rel);
+            return false;
+        }
+        fn failed(_: *anyopaque, _: Owner.Work) void {}
+        fn activity(_: *anyopaque) Owner.Activity {
+            return .{};
+        }
+    };
+    const Stopper = struct {
+        owner: *Owner,
+        runtime: *runtime_mod.BackendRuntime,
+        returned: std.atomic.Value(bool) = .init(false),
+        fn stop(self: *@This()) void {
+            self.owner.stop(self.runtime);
+            self.returned.store(true, .release);
+        }
+    };
+    var fixture: Fixture = .{ .io = io };
+    defer owner.stop(runtime.ptr());
+    // Always release the callback before joining stoppers, even if a bounded
+    // observation fails. A regression must fail rather than strand shutdown.
+    owner.start(.{ .ptr = &fixture, .runtime = runtime.ptr(), .now = Fixture.now, .ready = Fixture.ready, .run = Fixture.run, .failed = Fixture.failed, .activity = Fixture.activity });
+    const deadline = @import("antfly_platform").time.monotonicNs() + 5 * std.time.ns_per_s;
+    defer fixture.release.set(io);
+    while (!fixture.entered.isSet() and @import("antfly_platform").time.monotonicNs() < deadline)
+        io.sleep(.fromMilliseconds(1), .awake) catch {};
+    try std.testing.expect(fixture.entered.isSet());
+    var first: Stopper = .{ .owner = &owner, .runtime = runtime.ptr() };
+    const first_thread = try std.Thread.spawn(.{}, Stopper.stop, .{&first});
+    defer first_thread.join();
+    defer fixture.release.set(io);
+    while (!owner.stopping.load(.acquire) and @import("antfly_platform").time.monotonicNs() < deadline)
+        io.sleep(.fromMilliseconds(1), .awake) catch {};
+    try std.testing.expect(owner.stopping.load(.acquire));
+    var second: Stopper = .{ .owner = &owner, .runtime = runtime.ptr() };
+    const second_thread = try std.Thread.spawn(.{}, Stopper.stop, .{&second});
+    defer second_thread.join();
+    defer fixture.release.set(io);
+    while (owner.stop_waiters.load(.acquire) == 0 and
+        !second.returned.load(.acquire) and @import("antfly_platform").time.monotonicNs() < deadline)
+        io.sleep(.fromMilliseconds(1), .awake) catch {};
+    // The second caller really reached the retirement wait; this is not an
+    // inference from an arbitrary sleep while a thread might be unscheduled.
+    try std.testing.expect(owner.stop_waiters.load(.acquire) > 0);
+    try std.testing.expect(!first.returned.load(.acquire));
+    try std.testing.expect(!second.returned.load(.acquire));
+    try std.testing.expect(!fixture.retired.load(.acquire));
+    const scheduler = try runtime.ptr().maintenanceScheduler();
+    const held = scheduler.snapshot();
+    try std.testing.expectEqual(@as(usize, 0), held.registrations);
+    try std.testing.expectEqual(@as(usize, 1), held.active);
+    fixture.release.set(io);
+    owner.joined.waitUncancelable(io);
+    try std.testing.expect(fixture.retired.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 0), fixture.later_stages.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 0), scheduler.snapshot().active);
+    owner.stop(runtime.ptr());
 }

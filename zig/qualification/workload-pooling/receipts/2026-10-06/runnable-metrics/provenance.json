@@ -1,0 +1,32 @@
+{
+  "base_revision": "c01a26488ac2bee110df3eaec5008722413b3d94",
+  "scope": "Exported scheduler and telemetry with the real runtime ABI root; local canonical-config shard separately",
+  "source_sha256": {
+    "zig/pkg/antfly-embedded/src/common/runnable_scheduler.zig": "085bfd633e348ef3d6bf1dbb5d89ced7b724c7b529d27b1644eedf011accf95a",
+    "zig/pkg/antfly-embedded/src/common/runnable_metrics.zig": "ee32e3d7dc07736a12429f07a5a20ddc3e2f652951ed2232c65294e4c99b15b5",
+    "zig/pkg/antfly-embedded/src/common/request_admission.zig": "db18b4d6099b00abb179fab80a1e57aeb48021c1768f778ca810e718cc343ec0",
+    "zig/pkg/antfly-embedded/src/common/prometheus.zig": "66fce4de1a831044fe997f3d892c0bb0487297d0a4067529899b8c45109868a2",
+    "zig/lib/runtime/src/root.zig": "7c5c2ac57a4c70649767cfacd7970e6a38b6d74ad20b289f3f08d91368dd6910",
+    "zig/lib/runtime/src/runtime_workload_abi.zig": "90832b65d59fb2c0bedf2833d5e3b9ef91011df01b0b3efc81e226fa705cfb29",
+    "zig/pkg/antfly-embedded/src/common/config.zig": "b278601d0fd497f04feeb35769794de364b1a5f1645f7ab78edd545c559559a9"
+  },
+  "native_runnable_total_tests": 16,
+  "linux_runnable_total_tests": 16,
+  "native_runnable_named_tests": 15,
+  "linux_runnable_named_tests": 15,
+  "native_local_pooling_tests": 31,
+  "source_boundary_sources": 735,
+  "linux_toolchain": [
+    "/nix/store/ms802lv410k52rd15fxpg4qllfw57baw-zig-0.17.0/bin/zig",
+    "0.17.0",
+    "4818e9e28e752456421034db9229035c165c0e3392bf534421016e79de33d022  /opt/zig-nix/bin/zig"
+  ],
+  "linux_limits": {
+    "cpus": 2,
+    "memory_bytes": 2147483648,
+    "memory_swap_bytes": 2147483648
+  },
+  "production_defaults_enabled": false,
+  "full_api_protocol_qualification": "pending; previous direct protocol run aborted on a fixture allocator mismatch, now corrected in source",
+  "runtime_endpoint_qualification": "pending"
+}
