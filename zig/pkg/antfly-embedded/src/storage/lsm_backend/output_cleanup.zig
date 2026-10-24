@@ -79,6 +79,17 @@ pub const Queue = struct {
     pub fn pop(self: *Queue) ?*Ticket {
         sync.lockYielding(&self.mutex);
         defer self.mutex.unlock();
+        return self.popLocked();
+    }
+
+    /// Rejected admission leaves the obligation in the queue.
+    pub fn popWithAdmission(self: *Queue, original: admission.Port) !?*Ticket {
+        try @import("../../common/bounded_mutex.zig").lockAtomic(&self.mutex, original);
+        defer self.mutex.unlock();
+        return self.popLocked();
+    }
+
+    fn popLocked(self: *Queue) ?*Ticket {
         const ticket = self.head orelse return null;
         self.head = ticket.next;
         if (self.head == null) self.tail = null;

@@ -563,8 +563,24 @@ test "controlled physical sync prepared backend checkpoint installs once across 
         reserved = 0;
         fixed.release();
         if (mode == .abort_output) {
-            // Exercise the existing real consumer outside an admitted execution.
-            // Its admitted replacement remains part of default caller adoption.
+            // Drive queue-to-ledger adoption on the original cleanup CPU.
+            // Final manifest persistence and deletion still use the legacy
+            // finalizer after that execution has finished.
+            var observation: Backend.QuiescedClosePreflight = .{};
+            try observation.resumeWithAdmission(&backend, std.testing.io, original);
+            {
+                var header = try manager.reserveConstructionWithAdmission(.lsm_table_builder_working_set, @sizeOf(Backend.QuiescedOutputCleanup), original);
+                defer header.retire();
+                var cleanup = Backend.QuiescedOutputCleanup.init(&backend);
+                defer cleanup.deinit();
+                try cleanup.resumeWithAdmission(original);
+                try std.testing.expect(cleanup.published);
+                try cleanup.retireWithAdmission(original);
+            }
+            try std.testing.expectEqual(@as(usize, 0), queue.pending.load(.acquire));
+            try std.testing.expect(backend.obsolete_paths.contains(owner.physical.paths[0][0..owner.physical.path_lens[0]]));
+            // Adoption alone cannot delete a file before durable intent.
+            _ = try native.storage().fileSize(owner.physical.paths[0][0..owner.physical.path_lens[0]]);
             execution.finish();
             query.finish();
             try backend.finalizeDeferredStorageWork();

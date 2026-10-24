@@ -26086,3 +26086,61 @@ and log digests match the final source and preserved snapshots. Formatting and
 whitespace pass. Full GNU qualification remains waived; admitted metadata and
 durable cleanup consumption, combined/default caller admission and the other
 full-design requirements above remain incomplete.
+
+
+### Retained output intent adoption
+
+`Backend.QuiescedOutputCleanup` now owns one real cleanup ticket through
+admitted queue acquisition, manifest wire admission, prepaid private obsolete
+ledger construction, memory adoption, and fixed root publication. The owner
+prepares one height-bounded edit with original checkpoints and retains every
+partial node, vector, payload and path across admission/OOM. The ledger memory
+bound now includes actual payload-vector growth and relocation headroom.
+No shared ledger is edited until the private candidate is ready and its memory
+has been adopted into the backend's stable observed-usage identity.
+
+The caller must permanently fence unrelated backend mutation, maintenance and
+accounting through retirement, establish the observed baseline, prepay the
+fixed owner header, and retain the backend/manager/allocator. No backend lock
+spans original CPU admission. This is an explicit coordinator building block,
+not default maintenance wiring. Successful handoff marks obsolete metadata
+dirty and preserves manifest wire debt; it does not make intent durable or
+perform a deletion. Manifest publication must still precede physical delete.
+Duplicates preserve the existing deadline. Abandonment requeues the original
+ticket before reclaiming the private candidate. A rejected queue return keeps
+both owners; a rejected accounting release keeps credit after physical frees.
+The old immutable ledger is reclaimed one step per original checkpoint, and
+usage is reduced only after physical retirement. The quiesced destructor is an
+explicit joined fallback, never the scoped rejection path.
+
+Qualification rejects each preparation and retirement checkpoint, all partial
+allocations, and queue contention on both take and return. Assertions compare
+actual backend memory estimates with observed usage and ensure unique deletion
+intent. The native aborted-checkpoint regression drives the original cleanup
+execution through observed-baseline preparation, queue-to-ledger adoption and
+retirement; it verifies that the final file still exists before leaving that
+execution for legacy durable finalization and deletion, then reopens read-only
+and checks all durable rows.
+
+Still required: admitted manifest root/retired-path preparation, combined
+metadata/ticket/provider/grant admission, integration into the default retained
+coordinator, admitted durable finalization/deletion, the remaining completion
+and history-relief work, and the full default-gate evidence described above.
+Full GNU qualification remains waived. The full design remains incomplete.
+
+
+Final `admitted-output-ledger-v3-integrated` passes 83/83 Debug build steps,
+81 physical-IO, 32 close, 170 table/codec, 74 WAL/recovery and 18 host/ABI
+checks. `admitted-output-ledger-v3-fast` passes 63/63 optimized build steps,
+including all 81/170/74 physical/table/recovery cases. Both pass four Bloom
+and 45/1/8 error-identity companion checks (companions use Debug). All 5,587
+native/schema input hashes and both log digests match the tested source;
+five immutable snapshots preserve every changed native file, including the
+explicit fixed-owner header reservation in the native abort consumer. The
+commit hook subsequently required the standard full license comment on the
+new module. The normalization receipt proves that its entire body is byte
+identical to the tested snapshot and all other 5,586 inputs are unchanged;
+a separate final snapshot manifest preserves that comment-only correction.
+Earlier v1/v2 receipts preserve the successful incremental checks. Formatting
+and whitespace pass. Full GNU qualification remains waived; the full design
+and the default coordinator/durable-finalization integration remain incomplete.

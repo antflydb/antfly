@@ -1961,6 +1961,8 @@ pub const Backend = struct {
         return progressed;
     }
 
+    pub const QuiescedOutputCleanup = @import("lsm_backend/prepared_output_cleanup.zig").Consumer(Backend);
+
     fn drainOutputCleanupLocked(self: *Backend) !void {
         while (self.outputCleanupDelayLocked() != null) {
             _ = try self.drainOutputCleanupSliceLocked();
@@ -30929,4 +30931,227 @@ test "controlled physical sync cleanup wake never waits on the maintenance mutex
     worker.waker().wake();
     try std.testing.expectEqual(InternalFlushWorker.Work.run, worker.waitForWork(null));
     try std.testing.expectEqual(@as(u64, 2), worker.snapshotStats().wakeups);
+}
+
+test "controlled physical sync output cleanup retains ledger ownership at every admission refusal" {
+    const admission = @import("../common/read_admission.zig");
+    const Fault = struct {
+        checks: usize = 0,
+        at: usize = std.math.maxInt(usize),
+        rejected: bool = false,
+        failure: anyerror = error.Canceled,
+        fn check(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const at = self.checks;
+            self.checks += 1;
+            if (!self.rejected and at == self.at) {
+                self.rejected = true;
+                return self.failure;
+            }
+        }
+    };
+    // Discover the successful operation's checkpoints, then reject each one
+    // using all three original error classes. Retry and abandonment both run.
+    var checkpoints: usize = 1;
+    var target: usize = 0;
+    while (target <= checkpoints) : (target += 1) {
+        for ([_]bool{ false, true }) |abandon| {
+            const a = std.testing.allocator;
+            var manager = resource_manager_mod.ResourceManager.init(.{ .identity_allocator = a });
+            defer manager.deinit(a);
+            var b = Backend.init(a, .{ .resource_manager = &manager, .wal_enabled = false });
+            defer b.close();
+            try b.initOutputCleanup();
+            try b.obsolete_paths.append(a, .{ .path = try a.dupe(u8, "older-output"), .delete_after_ns = 1 });
+            b.syncTrackedInMemoryStateUsageCurrentLocked();
+            const queue = b.options.unpublished_outputs.?;
+            const ticket = try queue.create("new-output");
+            ticket.abandon();
+            var fault: Fault = .{ .at = if (target == 0) std.math.maxInt(usize) else target - 1, .failure = switch (target % 3) {
+                0 => error.Canceled,
+                1 => error.DeadlineExceeded,
+                else => error.FileNotFound,
+            } };
+            const payload: admission.Payload = .{ .ptr = &fault, .vtable = &.{ .checkpoint = Fault.check } };
+            const original = admission.Port.init(&payload);
+            var owner = Backend.QuiescedOutputCleanup.init(&b);
+            defer owner.deinit();
+            const result = owner.resumeWithAdmission(original);
+            if (target == 0) {
+                try result;
+                checkpoints = fault.checks;
+            } else {
+                try std.testing.expectError(fault.failure, result);
+                try std.testing.expect(fault.rejected);
+            }
+            if (!abandon) try owner.resumeWithAdmission(original);
+            const published = owner.published;
+            // Refusal of retirement also retains the original ticket/credit.
+            fault.at = fault.checks;
+            fault.rejected = false;
+            try std.testing.expectError(fault.failure, owner.retireWithAdmission(original));
+            try std.testing.expect(!owner.retired);
+            try owner.retireWithAdmission(original);
+            try std.testing.expect(b.obsolete_paths.contains("older-output"));
+            try std.testing.expectEqual(published, b.obsolete_paths.contains("new-output"));
+            try std.testing.expectEqual(@as(usize, if (published) 0 else 1), queue.pending.load(.acquire));
+            try std.testing.expectEqual(b.estimateInMemoryStateBytesLocked(), b.tracked_in_memory_state_bytes);
+            if (!published) {
+                var retry = Backend.QuiescedOutputCleanup.init(&b);
+                defer retry.deinit();
+                try retry.resumeWithAdmission(original);
+                try retry.retireWithAdmission(original);
+            }
+            // A duplicate handoff must preserve the original ledger deadline.
+            const deadline = b.obsolete_paths.get("new-output").?.delete_after_ns;
+            const duplicate = try queue.create("new-output");
+            duplicate.abandon();
+            var same = Backend.QuiescedOutputCleanup.init(&b);
+            defer same.deinit();
+            try same.resumeWithAdmission(original);
+            try same.retireWithAdmission(original);
+            try std.testing.expectEqual(deadline, b.obsolete_paths.get("new-output").?.delete_after_ns);
+            try queue.joinRetirementsWithAdmission(std.testing.io, original);
+            try std.testing.expectEqual(@as(u64, 0), manager.sliceStats(.lsm_table_builder_working_set).used_bytes);
+            try std.testing.expectEqual(b.estimateInMemoryStateBytesLocked(), b.tracked_in_memory_state_bytes);
+            try std.testing.expectEqual(@as(u64, 0), manager.snapshot().memory.accounting_errors);
+        }
+    }
+}
+
+test "controlled physical sync output cleanup abandons every partial allocation without losing intent" {
+    const Fixture = struct {
+        fn check(a: Allocator) !void {
+            var manager = resource_manager_mod.ResourceManager.init(.{ .identity_allocator = std.testing.allocator });
+            defer manager.deinit(std.testing.allocator);
+            var b = Backend.init(a, .{ .resource_manager = &manager, .wal_enabled = false });
+            defer b.close();
+            try b.initOutputCleanup();
+            b.syncTrackedInMemoryStateUsageCurrentLocked();
+            const queue = b.options.unpublished_outputs.?;
+            const ticket = try queue.create("allocation-output");
+            ticket.abandon();
+            const Control = struct {
+                fn check(_: *anyopaque) !void {}
+            };
+            var marker: u8 = 0;
+            const payload: read_admission.Payload = .{ .ptr = &marker, .vtable = &.{ .checkpoint = Control.check } };
+            const original = read_admission.Port.init(&payload);
+            var owner = Backend.QuiescedOutputCleanup.init(&b);
+            defer owner.deinit();
+            owner.resumeWithAdmission(original) catch |cause| {
+                try owner.retireWithAdmission(original);
+                try std.testing.expectEqual(@as(usize, 1), queue.pending.load(.acquire));
+                try std.testing.expect(!b.obsolete_paths.contains("allocation-output"));
+                try std.testing.expectEqual(b.estimateInMemoryStateBytesLocked(), b.tracked_in_memory_state_bytes);
+                return cause;
+            };
+            try owner.retireWithAdmission(original);
+            try queue.joinRetirementsWithAdmission(std.testing.io, original);
+            try std.testing.expectEqual(b.estimateInMemoryStateBytesLocked(), b.tracked_in_memory_state_bytes);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Fixture.check, .{});
+}
+
+test "controlled physical sync output cleanup retirement retains every rejected physical and accounting step" {
+    const Control = struct {
+        checks: usize = 0,
+        at: usize = std.math.maxInt(usize),
+        fn check(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const at = self.checks;
+            self.checks += 1;
+            if (at == self.at) return error.DeadlineExceeded;
+        }
+    };
+    var checkpoints: usize = 1;
+    var target: usize = 0;
+    while (target <= checkpoints) : (target += 1) {
+        const a = std.testing.allocator;
+        var manager = resource_manager_mod.ResourceManager.init(.{ .identity_allocator = a });
+        defer manager.deinit(a);
+        var b = Backend.init(a, .{ .resource_manager = &manager, .wal_enabled = false });
+        defer b.close();
+        try b.initOutputCleanup();
+        for ([_][]const u8{ "old-a", "old-b", "old-c" }) |name| try b.obsolete_paths.append(a, .{ .path = try a.dupe(u8, name), .delete_after_ns = 1 });
+        b.syncTrackedInMemoryStateUsageCurrentLocked();
+        const queue = b.options.unpublished_outputs.?;
+        const ticket = try queue.create("retirement-output");
+        ticket.abandon();
+        var control: Control = .{};
+        const payload: read_admission.Payload = .{ .ptr = &control, .vtable = &.{ .checkpoint = Control.check } };
+        const original = read_admission.Port.init(&payload);
+        var owner = Backend.QuiescedOutputCleanup.init(&b);
+        defer owner.deinit();
+        try owner.resumeWithAdmission(original);
+        control.checks = 0;
+        control.at = if (target == 0) std.math.maxInt(usize) else target - 1;
+        const result = owner.retireWithAdmission(original);
+        if (target == 0) {
+            try result;
+            checkpoints = control.checks;
+        } else {
+            try std.testing.expectError(error.DeadlineExceeded, result);
+            try std.testing.expect(!owner.retired);
+            try std.testing.expect(b.obsolete_paths.contains("retirement-output"));
+            try owner.retireWithAdmission(original);
+        }
+        try queue.joinRetirementsWithAdmission(std.testing.io, original);
+        try std.testing.expectEqual(b.estimateInMemoryStateBytesLocked(), b.tracked_in_memory_state_bytes);
+        try std.testing.expectEqual(@as(u64, 0), manager.sliceStats(.lsm_table_builder_working_set).used_bytes);
+        try std.testing.expectEqual(@as(u64, 0), manager.snapshot().memory.accounting_errors);
+    }
+}
+
+test "controlled physical sync output cleanup rejects queue contention without dropping retained intent" {
+    const Control = struct {
+        owner: ?*Backend.QuiescedOutputCleanup = null,
+        rejected: bool = false,
+        fn check(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.owner) |owner| if (!self.rejected and owner.phase == .adopt) {
+                self.rejected = true;
+                return error.Canceled;
+            };
+        }
+        fn wait(_: *anyopaque) !void {
+            return error.DeadlineExceeded;
+        }
+    };
+    const a = std.testing.allocator;
+    var manager = resource_manager_mod.ResourceManager.init(.{ .identity_allocator = a });
+    defer manager.deinit(a);
+    var b = Backend.init(a, .{ .resource_manager = &manager, .wal_enabled = false });
+    defer b.close();
+    try b.initOutputCleanup();
+    b.syncTrackedInMemoryStateUsageCurrentLocked();
+    const queue = b.options.unpublished_outputs.?;
+    const ticket = try queue.create("contended-output");
+    ticket.abandon();
+    var control: Control = .{};
+    const payload: read_admission.Payload = .{ .ptr = &control, .vtable = &.{ .checkpoint = Control.check, .wait_for_progress = Control.wait } };
+    const original = read_admission.Port.init(&payload);
+    var owner = Backend.QuiescedOutputCleanup.init(&b);
+    defer owner.deinit();
+    try std.testing.expect(queue.mutex.tryLock());
+    const take = owner.resumeWithAdmission(original);
+    queue.mutex.unlock();
+    try std.testing.expectError(error.DeadlineExceeded, take);
+    try std.testing.expectEqual(@as(usize, 1), queue.pending.load(.acquire));
+    try std.testing.expect(owner.ticket == null);
+    control.owner = &owner;
+    try std.testing.expectError(error.Canceled, owner.resumeWithAdmission(original));
+    try std.testing.expect(owner.ticket.? == ticket and owner.credit != null and owner.candidate != null);
+    try std.testing.expect(queue.mutex.tryLock());
+    const give_back = owner.retireWithAdmission(original);
+    queue.mutex.unlock();
+    try std.testing.expectError(error.DeadlineExceeded, give_back);
+    try std.testing.expect(owner.ticket.? == ticket and owner.credit != null and owner.candidate != null);
+    try std.testing.expectEqual(@as(usize, 0), queue.pending.load(.acquire));
+    try owner.retireWithAdmission(original);
+    try std.testing.expectEqual(@as(usize, 1), queue.pending.load(.acquire));
+    try std.testing.expect(!b.obsolete_paths.contains("contended-output"));
+    try std.testing.expectEqual(b.estimateInMemoryStateBytesLocked(), b.tracked_in_memory_state_bytes);
+    try std.testing.expectEqual(@as(u64, 0), manager.snapshot().memory.accounting_errors);
 }
