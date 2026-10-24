@@ -41,7 +41,10 @@ fn key(a: A, group: []const u8, level: u8, block: u64) ![]u8 {
 }
 pub fn touch(a: A, dirty: *Dirty, group: []const u8, row: u64) !void {
     const encoded = try key(a, group, 0, row >> 6);
-    const entry = try dirty.getOrPut(a, encoded);
+    const entry = dirty.getOrPut(a, encoded) catch |err| {
+        a.free(encoded);
+        return err;
+    };
     if (entry.found_existing) a.free(encoded);
 }
 pub fn clear(a: A, dirty: *Dirty) void {
@@ -171,4 +174,17 @@ test "external lake exact reduction trees refresh a bounded leaf and retain prio
     const current = try lookup(out, memory.store(), after, group, count, &layout);
     try std.testing.expectEqual(std.math.Order.eq, try local.sql_scalar.compareDatums(try previous.finish(out, 0, recipe.inputs[0].spec), try local.sql_scalar.numericTextLeaky(out, "257.00", &work)));
     try std.testing.expectEqual(std.math.Order.eq, try local.sql_scalar.compareDatums(try current.finish(out, 0, recipe.inputs[0].spec), try local.sql_scalar.numericTextLeaky(out, "258.1250", &work)));
+}
+
+test "external lake exact reduction dirty keys unwind allocation failures" {
+    const Case = struct {
+        fn run(a: A) !void {
+            var dirty: Dirty = .empty;
+            defer clear(a, &dirty);
+            try touch(a, &dirty, "group", 7);
+            try touch(a, &dirty, "group", 8);
+            try std.testing.expectEqual(@as(usize, 1), dirty.count());
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
 }

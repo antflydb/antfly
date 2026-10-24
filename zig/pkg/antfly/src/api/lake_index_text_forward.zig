@@ -81,14 +81,20 @@ pub fn retractMeasured(a: A, store: *stores.ArtifactStore, manager: *local.sql_s
             if (frequency == 0) return error.InvalidNativeLakeTextStatistics;
             const existing = try counts.getOrPut(a, key);
             if (!existing.found_existing) {
-                existing.key_ptr.* = try a.dupe(u8, key);
+                existing.key_ptr.* = a.dupe(u8, key) catch |err| {
+                    _ = counts.remove(key);
+                    return err;
+                };
                 existing.value_ptr.* = 0;
             }
             existing.value_ptr.* = try std.math.add(u32, existing.value_ptr.*, 1);
             const field = key[4..][0..size];
             const length = try lengths.getOrPut(a, field);
             if (!length.found_existing) {
-                length.key_ptr.* = try a.dupe(u8, field);
+                length.key_ptr.* = a.dupe(u8, field) catch |err| {
+                    _ = lengths.remove(field);
+                    return err;
+                };
                 length.value_ptr.* = 0;
             }
             length.value_ptr.* = try std.math.add(u64, length.value_ptr.*, frequency);
@@ -169,4 +175,31 @@ test "external lake forward text retractions seek changed terms and match comple
     var writes: u64 = 0;
     var pages: Pages = .{ .domain = store.upload_scope.?.domain, .artifacts = &store, .remaining_read_bytes = &reads, .remaining_write_bytes = &writes };
     try std.testing.expect(try tree.equivalent(a, pages.store(), expected, after, .{}));
+    const FailureCase = struct {
+        fn run(failing: A, backend: *stores.ArtifactStore, evidence: ?tree.Ref, original: ?tree.Ref, retired: *const local.encoding_roaring.RoaringBitmap) !void {
+            var failure_token: u8 = 0;
+            var owner: local.sql_spill.Manager = .{ .alloc = failing, .io = std.testing.io, .context = &failure_token, .checkpoint = struct {
+                fn check(_: *anyopaque) !void {}
+            }.check, .async_writes = false };
+            defer owner.deinit();
+            var removed: std.StringHashMapUnmanaged(u64) = .empty;
+            defer {
+                var fields = removed.keyIterator();
+                while (fields.next()) |field| failing.free(field.*);
+                removed.deinit(failing);
+            }
+            _ = try retract(failing, backend, &owner, evidence, original, retired, &removed, .none);
+        }
+    };
+    var probe = std.testing.FailingAllocator.init(a, .{});
+    try FailureCase.run(probe.allocator(), &store, forward, before, &deleted);
+    // Content-addressed writes can allocate less once the store is warm.
+    // Still induce every observed failure position and verify exact cleanup.
+    for (0..probe.alloc_index) |fail_index| {
+        var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = fail_index });
+        if (FailureCase.run(failing.allocator(), &store, forward, before, &deleted)) |_| {
+            try std.testing.expect(!failing.has_induced_failure);
+        } else |err| if (err != error.OutOfMemory) return err;
+        try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+    }
 }
