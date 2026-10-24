@@ -5943,24 +5943,23 @@ pub const ApiHttpServer = struct {
         deadline_ns: u64,
         stream: kernel_abi.StreamSink,
     ) !connections_api.InvokeResult {
-        if (std.mem.eql(u8, connection_id, common_config.local_inference_connection_id)) {
-            return connections_api.invokeInferenceConnection(
-                alloc,
-                null,
-                self.cfg.node_config,
-                self.cfg.local_inference_connection_target,
-                self.cfg.secret_store,
-                connection_id,
-                operation,
-                body,
-                cancellation,
-                deadline_ns,
-                stream,
-            );
-        }
+        return self.invokeInferenceConnectionObserved(alloc, connection_id, operation, body, cancellation, deadline_ns, stream, null);
+    }
+
+    pub fn invokeInferenceConnectionObserved(
+        self: *ApiHttpServer,
+        alloc: std.mem.Allocator,
+        connection_id: []const u8,
+        operation: []const u8,
+        body: []const u8,
+        cancellation: ?httpx.CancellationToken,
+        deadline_ns: u64,
+        stream: kernel_abi.StreamSink,
+        observer: ?httpx.AttemptObserver,
+    ) !connections_api.InvokeResult {
         var client = httpx.Client.initWithConfig(alloc, self.inferenceIo(), .{ .keep_alive = false });
         defer client.deinit();
-        return connections_api.invokeInferenceConnection(
+        return connections_api.invokeInferenceConnectionWithRequest(
             alloc,
             &client,
             self.cfg.node_config,
@@ -5972,6 +5971,8 @@ pub const ApiHttpServer = struct {
             cancellation,
             deadline_ns,
             stream,
+            .post,
+            .{ .attempt_observer = observer },
         );
     }
 

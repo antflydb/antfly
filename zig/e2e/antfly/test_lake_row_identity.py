@@ -30,7 +30,10 @@ from conftest import (
     resolve_binary_path,
 )
 
-pytestmark = pytest.mark.fresh_antfly_process
+pytestmark = [
+    pytest.mark.fresh_antfly_process,
+    pytest.mark.e2e_resource("antfly_process"),
+]
 
 
 @pytest.mark.parametrize(

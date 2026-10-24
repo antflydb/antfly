@@ -2135,6 +2135,7 @@ pub fn tableGroupDescriptorProjectionControlled(
         }
     }
     for (admin.split_transitions) |transition| {
+        if (transition.phase == .finalized or transition.phase == .rolled_back) continue;
         if ((transition.source_group_id != group_id and transition.destination_group_id != group_id) or
             !std.mem.eql(u8, transition.table_contract.table_name, table_name)) continue;
         try transition.table_contract.validateForSplit();
@@ -2155,6 +2156,7 @@ pub fn tableGroupDescriptorProjectionControlled(
         );
     }
     for (admin.merge_transitions) |transition| {
+        if (transition.phase == .finalized or transition.phase == .rolled_back) continue;
         if ((transition.donor_group_id != group_id and transition.receiver_group_id != group_id) or
             !std.mem.eql(u8, transition.table_contract.table_name, table_name)) continue;
         try transition.table_contract.validateForMerge(transition.allow_doc_identity_reassignment);

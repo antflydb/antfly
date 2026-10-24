@@ -328,6 +328,9 @@ pub const RaftApplyStore = struct {
     pub fn loadStandaloneCatalogSnapshot(self: *RaftApplyStore, alloc: std.mem.Allocator) !?[]u8 {
         return self.projectionWithAllocator(?[]u8, alloc, .{ .kind = .standalone_catalog, .arg0 = 1 });
     }
+    pub fn exportStandalonePortableCatalog(self: *RaftApplyStore, alloc: std.mem.Allocator) ![]u8 {
+        return self.catalogProjection([]u8, alloc, @import("antfly_local_sources").common_group_ids.main_metadata_group_id, .{ .catalog_export_standalone_portable = {} });
+    }
     pub fn standaloneRevision(self: *RaftApplyStore) !u64 {
         return self.projection(u64, .{ .kind = .standalone_revision });
     }

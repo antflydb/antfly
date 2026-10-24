@@ -6204,7 +6204,7 @@ fn repeatedProbeScenario(a: Allocator, comptime count: usize) !void {
             const hashes = try @import("batch_hash.zig").rows(probe_alloc, keys, false);
             defer probe_alloc.free(hashes);
             for (keys, probes) |row, *probe_| probe_.* = .{ .owner = join, .keys = row, .cursor = null };
-            try join.disk_heads.seedProbes(hashes, probes);
+            try join.disk_heads.seedProbesFor(hashes, probes, join.pageAccess());
             // Equal offsets already have the old wave's physical ordering.
             // This oracle performs one exact scalar decode per candidate lane.
             for (probes) |*probe_| if (try probe_.next()) |value| {

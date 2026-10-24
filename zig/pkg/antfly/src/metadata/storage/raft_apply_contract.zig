@@ -301,6 +301,7 @@ pub const CatalogProjectionRequest = union(enum) {
     read_store_report_targets: struct { store_id: u64, group_ids: []const u64, full: bool, include_runtime: bool },
     catalog_read: system_catalog.Read,
     catalog_export: void,
+    catalog_export_standalone_portable: void,
     catalog_list_tables: system_catalog.TableList,
     catalog_meta: void,
     catalog_admission: system_catalog.Mutation,

@@ -103,6 +103,29 @@ pub const Config = struct {
 
     pub const PublicInferenceConfig = struct {
         enabled: bool = false,
+        default_timeout_ms: u32 = 120_000,
+        max_timeout_ms: u32 = 3_600_000,
+
+        pub fn validate(self: PublicInferenceConfig) !void {
+            if (self.default_timeout_ms == 0 or self.default_timeout_ms > self.max_timeout_ms or self.max_timeout_ms > 3_600_000)
+                return error.InvalidConfig;
+        }
+
+        /// Parse every occurrence to reject duplicate budgets before dispatch.
+        /// Existing ingress deadlines may narrow this budget, never extend it.
+        pub fn deadline(self: PublicInferenceConfig, headers: anytype, now: u64, existing: ?u64) !u64 {
+            try self.validate();
+            var timeout_ms = self.default_timeout_ms;
+            var seen = false;
+            for (headers) |entry| if (std.ascii.eqlIgnoreCase(entry.name, "X-Antfly-Inference-Timeout-Ms")) {
+                if (seen or entry.value.len == 0) return error.InvalidInferenceRequest;
+                seen = true;
+                for (entry.value) |byte| if (byte < '0' or byte > '9') return error.InvalidInferenceRequest;
+                timeout_ms = std.fmt.parseUnsigned(u32, entry.value, 10) catch return error.InvalidInferenceRequest;
+                if (timeout_ms == 0 or timeout_ms > self.max_timeout_ms) return error.InvalidInferenceRequest;
+            };
+            return @min(now +| @as(u64, timeout_ms) * std.time.ns_per_ms, existing orelse std.math.maxInt(u64));
+        }
     };
 
     pub const RequestAdmissionConfig = struct {
@@ -846,11 +869,17 @@ pub const Config = struct {
             .object => |object| object,
             else => return error.InvalidConfig,
         };
-        if (root.contains("public_inference")) try validateObjectMemberFields(root, "public_inference", &.{"enabled"});
+        if (root.contains("public_inference")) try validateObjectMemberFields(root, "public_inference", &.{ "enabled", "default_timeout_ms", "max_timeout_ms" });
         const public_inference_enabled = if (root.get("public_inference")) |policy|
             try optionalBoolField(policy.object, "enabled") orelse false
         else
             false;
+        const public_inference: PublicInferenceConfig = if (root.get("public_inference")) |policy| .{
+            .enabled = public_inference_enabled,
+            .default_timeout_ms = try optionalU32Field(policy.object, "default_timeout_ms") orelse 120_000,
+            .max_timeout_ms = try optionalU32Field(policy.object, "max_timeout_ms") orelse 3_600_000,
+        } else .{};
+        try public_inference.validate();
         var canonical_inference_max_concurrent_requests: ?u32 = null;
         var query_waiting = default_query_waiting;
         var query_waiting_explicit = false;
@@ -1073,7 +1102,7 @@ pub const Config = struct {
             .transcribers = transcribers,
             .readers = reader_registry,
             .text_to_speech = text_to_speech,
-            .public_inference = .{ .enabled = public_inference_enabled },
+            .public_inference = public_inference,
             .auth_enabled = try optionalBoolField(root, "enable_auth") orelse false,
             .deployment_mode = deployment_mode,
             .health_enabled = try optionalBoolField(root, "health_enabled") orelse true,
@@ -4322,4 +4351,37 @@ test "provider registry gateway connection image token bounds are positive and o
         defer a.free(input);
         try std.testing.expectError(error.InvalidConfig, Config.parseFromSlice(a, input));
     }
+}
+
+test "public inference deadlines validate server policy and bounded caller metadata" {
+    const a = std.testing.allocator;
+    var config = try Config.parseFromSlice(a,
+        \\{"public_inference":{"enabled":true,"default_timeout_ms":240000,"max_timeout_ms":600000}}
+    );
+    defer config.deinit();
+    const policy = config.public_inference;
+    const Header = struct { name: []const u8, value: []const u8 };
+    const now: u64 = 10;
+    try std.testing.expectEqual(now + 240_000 * std.time.ns_per_ms, try policy.deadline(&[_]Header{}, now, null));
+    const permitted = [_]Header{.{ .name = "x-antfly-inference-timeout-ms", .value = "300000" }};
+    try std.testing.expectEqual(now + 300_000 * std.time.ns_per_ms, try policy.deadline(&permitted, now, null));
+    try std.testing.expectEqual(now, try policy.deadline(&permitted, now, now));
+    for ([_][]const u8{ "", "0", "-1", "+1", " 1", "1 ", "1.1", "1,2", "600001", "4294967296", "18446744073709551616" }) |text| {
+        const headers = [_]Header{.{ .name = "X-Antfly-Inference-Timeout-Ms", .value = text }};
+        try std.testing.expectError(error.InvalidInferenceRequest, policy.deadline(&headers, now, null));
+    }
+    try std.testing.expectError(error.InvalidInferenceRequest, policy.deadline(&[_]Header{
+        .{ .name = "X-Antfly-Inference-Timeout-Ms", .value = "1" },
+        .{ .name = "x-antfly-inference-timeout-ms", .value = "1" },
+    }, now, null));
+    for ([_][]const u8{
+        \\{"public_inference":{"default_timeout_ms":0}}
+        ,
+        \\{"public_inference":{"default_timeout_ms":300000,"max_timeout_ms":120000}}
+        ,
+        \\{"public_inference":{"max_timeout_ms":3600001}}
+        ,
+        \\{"public_inference":{"max_timeout_ms":-1}}
+        ,
+    }) |body| try std.testing.expectError(error.InvalidConfig, Config.parseFromSlice(a, body));
 }

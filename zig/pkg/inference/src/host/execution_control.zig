@@ -56,6 +56,9 @@ pub const RequestContext = struct {
     deadline_ns: ?u64,
     cancellation: ?CancellationToken = null,
     progress: ?ProgressSink = null,
+    /// Notified immediately before request bytes may reach an upstream.
+    /// A notification means the upstream outcome may be unknown on timeout.
+    submission: ?struct { ptr: *anyopaque, notify: *const fn (*anyopaque) void } = null,
     /// Synchronous provider phases may borrow this caller's execution grant.
     /// Never forward its callbacks to watchdogs or parallel children.
     runnable: ?@import("antfly_runtime_abi").runnable_abi.Borrowed = null,

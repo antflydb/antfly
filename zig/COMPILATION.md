@@ -1672,3 +1672,41 @@ authored reservations.
 The sibling self-FK and initial-FK recovery roots measured 11,942,445,056
 and 11,940,200,448 bytes, respectively; each native Darwin Debug claim is
 14 GiB with the same headroom policy.
+
+
+### Native Linux Debug test admission (2026-10-24)
+
+Main run `40093707715` used Nix's **glibc-linked Zig 0.17.0**, baseline x86_64
+GNU Debug, and an aggregate admission budget of **20 GiB**. The repeated run
+reported the following per-compiler high-water marks. No OOM kill was reported;
+Zig rejected successful code generation because the declared bound was false.
+Changing to the glibc toolchain would not address these measurements.
+
+| Compilation owner | Measured peak bytes | Old claim | New claim |
+|---|---:|---:|---:|
+| Standalone inline inference owner tests | 15,286,923,264 | 7 GiB | 16 GiB |
+| Data physical implementation tests | 17,153,777,664 | 14 GiB | 18 GiB |
+| Hosted initial-FK real-service recovery | 13,219,102,720 | 7 GiB | 14 GiB |
+| SQL physical test partition | 8,168,538,112 | 7 GiB | 9 GiB |
+
+These roots deliberately exercise physical implementations or the inline host;
+substituting consumer facades would weaken their coverage. The data implementation
+previously inherited its *consumer's* reservation; a local partition could also
+inherit a default unrelated to its selected source closure. Their measured
+reservations now belong to distinct stable compile names. This does not change
+runtime archive claims or unmeasured platforms/modes, and does not add ordering
+edges. The previous fallback floors for other physical partitions are retained.
+
+Claims round each observed peak plus 10% up to whole GiB (about 10–18% actual
+headroom). All four can overlap a 2 GiB compile within 20 GiB. SQL can overlap a
+normal 7 GiB compile, and hosted recovery can overlap a 6 GiB compile. Policy
+regressions assert these admission combinations and preserve larger authored
+claims. Future source growth still requires measurement, rather than raising the
+aggregate runner size or applying a blanket margin to every test.
+
+Model E2E binaries may use `-Dinference-optimize=ReleaseFast` with a Debug product.
+Only the model execution module graph changes mode; API/storage retain Debug
+checks. This lets the embedded standalone composition check exercise the same
+optimized kernels as the separate inference HTTP helper. BLAS accelerates only
+part of model execution and cannot make the remaining Debug kernels satisfy
+serving-latency deadlines.
