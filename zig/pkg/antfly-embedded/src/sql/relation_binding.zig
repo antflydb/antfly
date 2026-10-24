@@ -1812,7 +1812,7 @@ fn graphScanConditions(alloc: Allocator, root: *const Node, source: *const Node,
     if (depth >= 128 or output.items.len + predicates.items.len >= 256) return;
     if (index >= program.instructions.len) return error.InvalidSqlProgram;
     const instruction = program.instructions[index];
-    if (instruction.operation == .in_list or (instruction.operation == .binary and instruction.operation.binary.op == .@"or")) {
+    if (instruction.operation == .unary or instruction.operation == .in_list or (instruction.operation == .binary and instruction.operation.binary.op == .@"or")) {
         var remaining: usize = 256;
         if (try graphBoolean(alloc, root, source, program, index, &remaining)) |predicate| try predicates.append(alloc, predicate);
         return;
@@ -1849,6 +1849,13 @@ fn graphScalarCondition(root: *const Node, source: *const Node, program: scalar.
         };
     }
     if (program.instructions[column_index].operation != .column or !constantScanOperand(program, value_index, 0)) return null;
+    const name = (try graphScalarColumn(root, source, program, column_index)) orelse return null;
+    var operand = program;
+    operand.root = value_index;
+    return .{ .column = name, .op = op, .operand = operand };
+}
+fn graphScalarColumn(root: *const Node, source: *const Node, program: scalar.Program, column_index: u32) !?[]const u8 {
+    if (program.instructions[column_index].operation != .column) return null;
     const scan = source.operation.scan;
     const ordinal = program.instructions[column_index].operation.column;
     if (ordinal >= root.columns.len) return error.InvalidSqlProgram;
@@ -1859,9 +1866,7 @@ fn graphScalarCondition(root: *const Node, source: *const Node, program: scalar.
     if (column.element_type == .numeric or (column.type != .integer and column.type != .number and column.type != .string and column.type != .boolean)) return null;
     const name = scan.source_columns[local];
     if (std.mem.eql(u8, name, "_id")) return null;
-    var operand = program;
-    operand.root = value_index;
-    return .{ .column = name, .op = op, .operand = operand };
+    return name;
 }
 // OR/IN are atomic optimization candidates: dropping an unsupported arm
 // would remove valid rows. The SQL program remains the authoritative residual.
@@ -1886,6 +1891,25 @@ fn graphBoolean(alloc: Allocator, root: *const Node, source: *const Node, progra
             child.* = .{ .comparison = (try graphScalarCondition(root, source, program, if (list.negated) .neq else .eq, list.operand, value)) orelse return null };
         }
         return if (list.negated) .{ .all = children } else .{ .any = children };
+    }
+    if (operation == .unary) {
+        const unary = operation.unary;
+        if (unary.op != .is_null and unary.op != .is_not_null) return null;
+        const name = (try graphScalarColumn(root, source, program, unary.operand)) orelse return null;
+        // A NULL test has no RHS. Give the invocation binder a closed NULL
+        // program, independent of the row, decimal plan and expression caches.
+        const instructions = try alloc.alloc(scalar.Instruction, 1);
+        instructions[0] = .{ .type = program.instructions[unary.operand].type, .operation = .{ .literal = .null } };
+        const operand: scalar.Program = .{
+            .arena = program.arena,
+            .instructions = instructions,
+            .root = 0,
+            .output_type = program.instructions[unary.operand].type,
+            .parameter_types = &.{},
+            .parameter_descriptors = &.{},
+            .required_columns = &.{},
+        };
+        return .{ .comparison = .{ .column = name, .op = if (unary.op == .is_null) .is_null else .is_not_null, .operand = operand } };
     }
     if (operation != .binary) return null;
     const binary = operation.binary;

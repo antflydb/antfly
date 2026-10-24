@@ -2697,7 +2697,12 @@ const Engine = struct {
             // DISTINCT with reducers may collapse different complete groups;
             // only a pure DISTINCT key window licenses candidate-local membership.
             if (projection.distinct) for (projection.items) |item| if (aggregates(item.expression) or !reduction_plan.repeatable(item.expression)) return null;
-            if (!scalar or @as(u64, engine.limits.intermediate_states) > std.math.maxInt(i64) or projection.predicate != null or projection.order.len == 0 or !engine.boundedGroupWindow(projection)) return null;
+            const ordered_unbounded = projection.limit == null and engine.node_order != null and engine.node_order.?.grouped and engine.node_order.?.active;
+            if (!scalar or @as(u64, engine.limits.intermediate_states) > std.math.maxInt(i64) or projection.predicate != null or projection.order.len == 0 or (!engine.boundedGroupWindow(projection) and !ordered_unbounded)) return null;
+            if (ordered_unbounded) if (projection.skip) |expression| {
+                const skip = engine.constant(expression, &.{}) orelse return null;
+                if (skip != .integer or skip.integer < 0 or std.math.cast(usize, skip.integer) == null) return null;
+            };
             var keys: std.ArrayList(*const ast.Expr) = .empty;
             var uses_extended = false;
             for (projection.items) |item| {
@@ -2741,6 +2746,7 @@ const Engine = struct {
                 }
                 slot.* = found orelse return null;
             }
+            if (ordered_unbounded) return .{ .capacity = std.math.maxInt(usize), .slots = slots, .uniform = uniform, .extended = uses_extended };
             const limit = try engine.count(projection.limit.?);
             return .{ .capacity = if (limit == 0) 0 else (if (projection.skip) |skip| try engine.count(skip) else 0) + limit, .slots = slots, .uniform = uniform, .extended = uses_extended };
         }
@@ -2792,8 +2798,14 @@ const Engine = struct {
             return engine.compareProjected(projected(left), projected(right), orders);
         }
         fn admit(self: *@This(), engine: *Engine, fold: *StreamFold, key: []const v.Value, row: Row, hash: u64) !?usize {
-            const rank = try engine.a.alloc(v.Value, self.slots.len);
-            for (self.slots, rank) |slot, *value| value.* = if (slot == std.math.maxInt(usize)) .null else key[slot];
+            // Ordered admission never compares candidate ranks. Avoid this
+            // temporary allocation; only the current group's owned rank is needed.
+            var rank: []const v.Value = &.{};
+            if (!self.ordered) {
+                const values = try engine.a.alloc(v.Value, self.slots.len);
+                for (self.slots, values) |slot, *value| value.* = if (slot == std.math.maxInt(usize)) .null else key[slot];
+                rank = values;
+            }
             const candidate: Projected = .{ .row = &.{}, .source = &.{}, .group = null, .keys = rank, .sequence = self.sequence };
             self.sequence += 1;
             const full = if (self.ordered) self.ordered_count == self.capacity else self.heap.items.len == self.capacity;
@@ -2956,6 +2968,11 @@ const Engine = struct {
         return true;
     }
     fn retireOrderedGroup(self: *Engine, window: *GroupWindow, groups: []const StreamGroup, calls: *const reduction_plan.Calls, retention: *const GroupRetention, projection: ast.Projection) !void {
+        if (groups.len == 0) return;
+        // These groups have already evaluated every total observer. Their
+        // output cannot escape SKIP, so do not clone it into the statement arena.
+        const skip = if (projection.skip) |expression| try self.count(expression) else 0;
+        if (window.ordered_count <= skip) return;
         var domain = projection;
         domain.order = &.{};
         domain.skip = null;
@@ -2965,11 +2982,7 @@ const Engine = struct {
     }
     fn finishOrderedGroups(self: *Engine, window: *GroupWindow, groups: []const StreamGroup, calls: *const reduction_plan.Calls, retention: *const GroupRetention, projection: ast.Projection) ![]const Row {
         try self.retireOrderedGroup(window, groups, calls, retention, projection);
-        const skip = if (projection.skip) |expression| try self.count(expression) else 0;
-        const start = @min(skip, window.ordered_rows.items.len);
-        const limit = try self.count(projection.limit.?);
-        const end = start + @min(limit, window.ordered_rows.items.len - start);
-        return window.ordered_rows.items[start..end];
+        return window.ordered_rows.items;
     }
     fn finishStreamGroups(self: *Engine, groups: []const StreamGroup, calls: *const reduction_plan.Calls, retention: *const GroupRetention, projection: ast.Projection) ![]const Row {
         var projected: std.ArrayList(Projected) = .empty;
@@ -7542,9 +7555,8 @@ const Engine = struct {
     }
     noinline fn streamMatchProjectionInto(self: *Engine, input: []const Row, input_weights: ?[]const Count, operation: ast.Match, projection: ast.Projection, original_middle: []const ast.Clause, match_span: ast.Span, projection_span: ast.Span, continuation: @FieldType(StreamFold, "continuation"), consumer: ?*PatternConsumer) anyerror!?[]const Row {
         if (continuation == null and consumer == null and (input_weights == null or (input_weights.?.len == 1 and input_weights.?[0].isOne()))) {
-            if (try self.indexedCardinality(input, operation, projection, original_middle, match_span, projection_span)) |rows| return rows;
             if (try self.indexedGroups(input, operation, projection, original_middle, match_span, projection_span)) |rows| return rows;
-            if (try self.indexedExtrema(input, operation, projection, original_middle, match_span, projection_span)) |rows| return rows;
+            if (try self.indexedObservers(input, operation, projection, original_middle, match_span, projection_span)) |rows| return rows;
         }
         return self.streamMatchProjectionAttempt(input, input_weights, operation, projection, original_middle, match_span, projection_span, continuation, consumer, true) catch |err| {
             if (err != error.CypherGroupWindowDeclined) return err;
@@ -7554,63 +7566,11 @@ const Engine = struct {
             return self.streamMatchProjectionAttempt(input, input_weights, operation, projection, original_middle, match_span, projection_span, continuation, consumer, false);
         };
     }
-    /// Count the global union of ordered key domains without materializing
-    /// projected rows. The coordinator's ordinary ordered source owns merging,
-    /// authorization and budgets; owner-local cardinalities are never summed.
-    noinline fn indexedCardinality(self: *Engine, input: []const Row, operation: ast.Match, projection: ast.Projection, middle: []const ast.Clause, match_span: ast.Span, projection_span: ast.Span) anyerror!?[]const Row {
-        if (!self.read_only or input.len != 1 or projection.items.len == 0 or projection.wildcard or projection.predicate != null or projection.order.len != 0 or projection.skip != null or projection.limit != null or middle.len >= self.limits.recursion_depth -| self.recursion or self.limits.scanned_anchors > std.math.maxInt(i64)) return null;
-        const plans = try self.a.alloc(ast.Projection, projection.items.len);
-        const pipelines = try self.a.alloc([]const ast.Clause, projection.items.len);
-        for (projection.items, plans, pipelines) |item, *plan, *pipeline| {
-            if (item.expression.value != .call) return null;
-            const call_value = item.expression.value.call;
-            if (!std.ascii.eqlIgnoreCase(call_value.name, "count") or call_value.star or call_value.args.len != 1) return null;
-            const arg = call_value.args[0];
-            const closed = self.constant(arg, input[0]);
-            if (!call_value.distinct and !(closed != null and closed.? == .null)) return null;
-            const predicate = try self.a.create(ast.Expr);
-            predicate.* = .{ .span = arg.span, .value = .{ .unary = .{ .op = .is_not_null, .operand = arg } } };
-            const clauses = try self.a.alloc(ast.Clause, middle.len + 1);
-            @memcpy(clauses[0..middle.len], middle);
-            clauses[middle.len] = .{ .span = projection_span, .operation = .{ .project = .{ .final = false, .value = .{ .items = &.{}, .wildcard = true, .predicate = predicate } } } };
-            pipeline.* = clauses;
-            const items = try self.a.alloc(ast.Item, 1);
-            items[0] = .{ .expression = arg, .alias = "__antfly_domain_count" };
-            const orders = try self.a.alloc(ast.Order, 1);
-            orders[0] = .{ .expression = arg, .descending = true, .execution_nonnull = true };
-            plan.* = .{ .items = items, .distinct = true, .order = orders, .execution_count = true };
-            const proof = (try self.planNodeOrder(input, operation, plan.*, clauses, false)) orelse return null;
-            if (proof.declined or proof.distinct != .adjacent) return null;
-            if (!proof.primary) {
-                const read = self.backend.vtable.scan_ordered orelse return null;
-                const page = (try read(self.backend.ptr, self.a, proof.table, proof.filters, proof.fields, null, 0, 0)) orelse return null;
-                if (page.items.len != 0 or (page.examined orelse 0) != 0 or page.next == null) return error.CypherInvalidBackendPage;
-            }
-        }
-        const row = try self.a.alloc(v.Entry, projection.items.len);
-        const columns = try self.a.alloc([]const u8, projection.items.len);
-        for (projection.items, plans, pipelines, row, columns) |item, plan, pipeline, *entry, *column| {
-            const closed = self.constant(item.expression.value.call.args[0], input[0]);
-            const cardinality: v.Value = if (closed != null and closed.? == .null) .{ .integer = 0 } else cardinality: {
-                const scope = PatternScope.enter(self);
-                defer scope.leave(self);
-                const rows = (try self.streamMatchProjectionAttempt(input, null, operation, plan, pipeline, match_span, projection_span, null, null, true)) orelse return error.CypherInvalidBackendPage;
-                if (rows.len != 1) return error.CypherInvalidBackendPage;
-                break :cardinality rows[0][0].value;
-            };
-            const name = item.alias orelse try self.expressionName(item.expression);
-            column.* = name;
-            entry.* = .{ .name = name, .value = cardinality };
-        }
-        self.columns = columns;
-        try self.stages.append(self.a, .{ .operation = "index_cardinality", .span = projection_span, .input_rows = input.len, .output_rows = 1 });
-        return try self.a.dupe(Row, &.{row});
-    }
     /// Discover only the requested group keys, then observe each selected
     /// equality domain once. Native tuple seeks bound discovery independently
     /// of group size; COUNT consumes the complete domain and extrema may seek.
     noinline fn indexedGroups(self: *Engine, input: []const Row, operation: ast.Match, projection: ast.Projection, middle: []const ast.Clause, match_span: ast.Span, projection_span: ast.Span) anyerror!?[]const Row {
-        if (!self.read_only or input.len != 1 or projection.wildcard or projection.distinct or projection.predicate != null or projection.limit == null or projection.order.len == 0 or middle.len + 2 > self.limits.recursion_depth -| self.recursion or self.limits.scanned_anchors > std.math.maxInt(i64)) return null;
+        if (!self.read_only or input.len != 1 or projection.wildcard or projection.distinct or projection.predicate != null or projection.order.len == 0 or middle.len + 2 > self.limits.recursion_depth -| self.recursion or self.limits.scanned_anchors > std.math.maxInt(i64)) return null;
         const read = self.backend.vtable.scan_ordered orelse return null;
         var keys: std.ArrayList(ast.Item) = .empty;
         var observers: std.ArrayList(ast.Item) = .empty;
@@ -7667,7 +7627,7 @@ const Engine = struct {
                 @memcpy(orders[0..projection.order.len], projection.order);
                 if (needs_order) orders[orders.len - 1] = .{ .expression = argument, .descending = descending };
                 domain.order = orders;
-                const certificate = (try self.planNodeOrder(input, operation, domain, middle, false)) orelse continue;
+                const certificate = (try self.planNodeOrder(input, operation, domain, middle, projection.limit == null)) orelse continue;
                 if (certificate.declined) continue;
                 if (needs_order and certificate.fields.len == proof.fields.len) {
                     const grouped = for (keys.items) |key| {
@@ -7693,7 +7653,7 @@ const Engine = struct {
         // single ordered pass. For extrema, sample a bounded source prefix and
         // compare observed density with the cost of per-group observer seeks.
         // Replay the charged sample; never pay for or read it twice.
-        var seek_groups = for (observers.items) |item| {
+        var seek_groups = projection.limit != null and for (observers.items) |item| {
             if (std.ascii.eqlIgnoreCase(item.expression.value.call.name, "count")) break false;
         } else true;
         if (try self.anchorKeys(operation.predicate, operation.paths[0].nodes[0].alias, input[0]) != null) return null;
@@ -7821,9 +7781,11 @@ const Engine = struct {
         try self.stages.append(self.a, .{ .operation = "index_groups", .span = projection_span, .input_rows = input.len, .output_rows = rows.len });
         return rows;
     }
-    /// Negotiate all observers before consuming any source. Every admitted
-    /// extremum uses the normal total, authorized ordered-window executor.
-    noinline fn indexedExtrema(self: *Engine, input: []const Row, operation: ast.Match, projection: ast.Projection, middle: []const ast.Clause, match_span: ast.Span, projection_span: ast.Span) anyerror!?[]const Row {
+    /// Negotiate the complete observer set before consuming any source. COUNT
+    /// observes the global union of ordered keys; extrema use finite windows.
+    /// Both use ordinary authorized cursors and share equivalent observers.
+    /// Owner-local cardinalities are never summed.
+    noinline fn indexedObservers(self: *Engine, input: []const Row, operation: ast.Match, projection: ast.Projection, middle: []const ast.Clause, match_span: ast.Span, projection_span: ast.Span) anyerror!?[]const Row {
         if (!self.read_only or input.len != 1 or projection.items.len == 0 or projection.wildcard or projection.predicate != null or projection.order.len != 0 or projection.skip != null or projection.limit != null) return null;
         // The synthetic non-NULL stage needs one additional pipeline frame.
         // A legal original fold must remain available at the caller's ceiling.
@@ -7831,20 +7793,26 @@ const Engine = struct {
         const read = self.backend.vtable.scan_ordered;
         const plans = try self.a.alloc(ast.Projection, projection.items.len);
         const stages = try self.a.alloc([]const ast.Clause, projection.items.len);
-        for (projection.items, plans, stages, 0..) |item, *plan, *pipeline, position| {
+        const certificates = try self.a.alloc(NodeOrder, projection.items.len);
+        for (projection.items, plans, stages, certificates, 0..) |item, *plan, *pipeline, *certificate, position| {
             const previous = for (projection.items[0..position], 0..) |earlier, index| {
                 if (@import("expressions.zig").same(earlier.expression, item.expression)) break index;
             } else null;
             if (previous) |index| {
                 plan.* = plans[index];
                 pipeline.* = stages[index];
+                certificate.* = certificates[index];
                 continue;
             }
             if (item.expression.value != .call) return null;
             const call_value = item.expression.value.call;
             const maximum = std.ascii.eqlIgnoreCase(call_value.name, "max");
-            if ((!maximum and !std.ascii.eqlIgnoreCase(call_value.name, "min")) or call_value.star or call_value.args.len != 1) return null;
+            const cardinality = std.ascii.eqlIgnoreCase(call_value.name, "count");
+            if ((!maximum and !cardinality and !std.ascii.eqlIgnoreCase(call_value.name, "min")) or call_value.star or call_value.args.len != 1) return null;
             const argument = call_value.args[0];
+            const closed = self.constant(argument, input[0]);
+            if (cardinality and self.limits.scanned_anchors > std.math.maxInt(i64)) return null;
+            if (cardinality and !call_value.distinct and !(closed != null and closed.? == .null)) return null;
             const nonnull = try self.a.create(ast.Expr);
             nonnull.* = .{ .span = argument.span, .value = .{ .unary = .{ .op = .is_not_null, .operand = argument } } };
             const clauses = try self.a.alloc(ast.Clause, middle.len + 1);
@@ -7856,28 +7824,36 @@ const Engine = struct {
             const items = try self.a.alloc(ast.Item, 1);
             items[0] = .{ .expression = argument, .alias = "__antfly_extremum" };
             const orders = try self.a.alloc(ast.Order, 1);
-            orders[0] = .{ .expression = argument, .descending = maximum, .execution_nonnull = true, .execution_fixed = true };
-            plan.* = .{ .items = items, .distinct = true, .order = orders, .limit = one };
-            const proof = (try self.planNodeOrder(input, operation, plan.*, clauses, false)) orelse return null;
-            if (proof.declined) return null;
+            orders[0] = .{ .expression = argument, .descending = maximum or cardinality, .execution_nonnull = true, .execution_fixed = !cardinality };
+            plan.* = .{ .items = items, .distinct = true, .order = orders, .limit = if (cardinality) null else one, .execution_count = cardinality };
+            var proof = (try self.planNodeOrder(input, operation, plan.*, clauses, false)) orelse return null;
+            if (proof.declined or (cardinality and proof.distinct != .adjacent)) return null;
             if (!proof.primary) {
                 if (proof.fields.len != 1) return null;
                 const ordered = read orelse return null;
                 const page = (try ordered(self.backend.ptr, self.a, proof.table, proof.filters, proof.fields, null, 0, 0)) orelse return null;
-                if (page.items.len != 0 or (page.examined orelse 0) != 0 or page.next == null) return error.CypherInvalidBackendPage;
+                try proof.certify(page);
             }
+            certificate.* = proof;
         }
         const row = try self.a.alloc(v.Entry, projection.items.len);
         const columns = try self.a.alloc([]const u8, row.len);
-        for (projection.items, plans, stages, row, columns, 0..) |item, plan, pipeline, *out, *column, position| {
+        for (projection.items, plans, stages, certificates, row, columns, 0..) |item, plan, pipeline, certificate, *out, *column, position| {
             const previous = for (projection.items[0..position], 0..) |earlier, index| {
                 if (@import("expressions.zig").same(earlier.expression, item.expression)) break index;
             } else null;
             const closed = self.constant(item.expression.value.call.args[0], input[0]);
-            const value = if (closed != null and closed.? == .null) v.Value.null else if (previous) |index| row[index].value else value: {
+            const cardinality = std.ascii.eqlIgnoreCase(item.expression.value.call.name, "count");
+            const value = if (closed != null and closed.? == .null) (if (cardinality) v.Value{ .integer = 0 } else v.Value.null) else if (previous) |index| row[index].value else value: {
                 const scope = PatternScope.enter(self);
                 defer scope.leave(self);
+                // Execute the captured certificate: negotiation is complete,
+                // including representation/tie flags and the initial cursor.
+                const saved = self.forced_order;
+                self.forced_order = certificate;
+                defer self.forced_order = saved;
                 const rows = (try self.streamMatchProjectionAttempt(input, null, operation, plan, pipeline, match_span, projection_span, null, null, true)) orelse return error.CypherInvalidBackendPage;
+                if (cardinality and rows.len != 1) return error.CypherInvalidBackendPage;
                 break :value if (rows.len == 0) v.Value.null else rows[0][0].value;
             };
             const name = item.alias orelse try self.expressionName(item.expression);
@@ -7885,7 +7861,7 @@ const Engine = struct {
             column.* = name;
         }
         self.columns = columns;
-        try self.stages.append(self.a, .{ .operation = "index_extrema", .span = projection_span, .input_rows = input.len, .output_rows = 1 });
+        try self.stages.append(self.a, .{ .operation = "index_observers", .span = projection_span, .input_rows = input.len, .output_rows = 1 });
         return try self.a.dupe(Row, &.{row});
     }
     noinline fn streamMatchProjectionAttempt(self: *Engine, input: []const Row, input_weights: ?[]const Count, operation: ast.Match, projection: ast.Projection, original_middle: []const ast.Clause, match_span: ast.Span, projection_span: ast.Span, continuation: @FieldType(StreamFold, "continuation"), consumer: ?*PatternConsumer, allow_group_window: bool) anyerror!?[]const Row {
@@ -10565,8 +10541,8 @@ const Engine = struct {
                 return page;
             }
             const wanted = if (self.stream_fold) |fold| if (fold.top.*) |top| wanted: {
-                if (!order.singleton and top.projection.limit == null and order.distinct == .adjacent and (order.outputOrdered() or top.count_only)) {
-                    // Sparse unbounded domains need batched transport too.
+                if (!order.singleton and order.distinct == .adjacent and (order.outputOrdered() or top.count_only)) {
+                    // Both finite and unbounded sparse domains need batching.
                     // Grow through rejected prefixes and fully productive
                     // pages. Confirmed duplicate-heavy domains return to
                     // exclusive seeks; ignored seeks still batch their ties.
@@ -10575,7 +10551,8 @@ const Engine = struct {
                         order.refill = if (produced == 0 or produced >= order.refill) @min(128, order.refill * 2) else if (produced * 2 < order.refill) 1 else order.refill;
                     }
                     order.previous_total = top.total;
-                    break :wanted @min(bounded_demand, order.refill);
+                    const remaining = if (top.projection.limit == null) bounded_demand else top.capacity -| top.total;
+                    break :wanted @min(bounded_demand, @min(remaining, order.refill));
                 }
                 const remaining = if (order.singleton or (order.distinct == .adjacent and (order.outputOrdered() or top.count_only))) @as(usize, 1) else top.capacity -| top.total;
                 const stalled = order.previous_total != null and order.previous_total.? == top.total;

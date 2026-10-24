@@ -8405,16 +8405,20 @@ def test_group_observer_plans_retire_between_selected_domains(graph_db):
 def test_broad_ordered_groups_use_one_source_pass(graph_db):
     populate(graph_db, 5000)
     graph_db.sql("CREATE INDEX grouping ON docs(id,score DESC)")
+    graph_db.run_until_idle()
     for observer in ("count(*)", "max(n.score)", "count(n.score),min(n.score),max(n.score)"):
-        query = f"MATCH (n:D) RETURN n.id,{observer} ORDER BY n.id LIMIT 5000"
-        actual = graph_db.cypher_json("g", {"query": query, "limits": {"scanned_anchors": 5000}})
-        control = graph_db.cypher_json(
-            "g", {"query": query.replace("ORDER BY n.id", "ORDER BY CASE WHEN true THEN n.id END")}
-        )
-        assert actual["rows"] == control["rows"]
-        assert len(actual["rows"]) == 5000
-        assert actual["stats"]["scanned_anchors"] == 5000
-        assert actual["stats"]["intermediate_states"] < 900000
+        for window in ("", " LIMIT 5000"):
+            query = f"MATCH (n:D) RETURN n.id,{observer} ORDER BY n.id{window}"
+            actual = graph_db.cypher_json(
+                "g", {"query": query, "limits": {"scanned_anchors": 5000, "memory_bytes": 10 << 20}}
+            )
+            control = graph_db.cypher_json(
+                "g", {"query": query.replace("ORDER BY n.id", "ORDER BY CASE WHEN true THEN n.id END")}
+            )
+            assert actual["rows"] == control["rows"]
+            assert len(actual["rows"]) == 5000
+            assert actual["stats"]["scanned_anchors"] == 5000
+            assert actual["stats"]["intermediate_states"] < 900000
 
 
 def test_unbounded_key_domains_and_cardinality_skip_duplicate_runs(graph_db):
@@ -8469,3 +8473,76 @@ def test_unbounded_key_domains_and_cardinality_skip_duplicate_runs(graph_db):
         )
         assert result["rows"] == [[{"type": "null", "value": None}]]
         assert result["stats"]["scanned_anchors"] == 1
+
+
+@pytest.mark.parametrize("count", [8000, 50000])
+def test_ordered_group_offset_does_not_retain_discarded_output(graph_db, count):
+    populate(graph_db, count)
+    graph_db.sql("CREATE INDEX grouping ON docs(id,score DESC)")
+    graph_db.run_until_idle()
+    ordered = sorted((f"n{i}", str(i)) for i in range(count))
+    observers = "count(*),min(n.score),max(n.score)" if count == 8000 else "count(*)"
+    for skip, limit in ((count - 100, 5), (count - 1, None), (count + 1000, 5)):
+        window = f"SKIP {skip}" + (f" LIMIT {limit}" if limit is not None else "")
+        query = f"MATCH (n:D) RETURN n.id,{observers} ORDER BY n.id {window}"
+        actual = graph_db.cypher_json("g", {"query": query, "limits": {"memory_bytes": 2 << 20}})
+        expected = [
+            [key, "1"] + ([value, value] if count == 8000 else [])
+            for key, value in ordered[skip : skip + limit if limit is not None else None]
+        ]
+        assert [[cell["value"] for cell in row] for row in actual["rows"]] == expected
+        assert actual["stats"]["memory_bytes"] <= 2 << 20
+
+
+def test_mixed_index_observers_share_domains_and_preserve_empty_nulls(graph_db):
+    populate(graph_db, 8000)
+    for start in range(0, 8000, 1000):
+        keys = ",".join(repr(f"n{i}") for i in range(start, start + 1000))
+        graph_db.sql(f"UPDATE docs SET score=score%3 WHERE _id IN ({keys})")
+    graph_db.sql("CREATE INDEX ranked ON docs(score DESC)")
+    graph_db.run_until_idle()
+    observers = "count(DISTINCT n.score) AS c,min(n.score),max(n.score),count(DISTINCT n.score) AS again,count(null)"
+    for predicate, expected in (("", ["3", "0", "2", "3", "0"]), (" WHERE false", ["0", None, None, "0", "0"])):
+        result = graph_db.cypher_json(
+            "g",
+            {
+                "query": f"MATCH (n:D){predicate} RETURN {observers}",
+                "limits": {"scanned_anchors": 8 if not predicate else 24000},
+            },
+        )
+        assert [cell["value"] for cell in result["rows"][0]] == expected
+        if not predicate:
+            assert result["stats"]["scanned_anchors"] <= 8
+    for fallible in (
+        "min(n.score),count(DISTINCT 1/(n.score-n.score))",
+        "count(DISTINCT n.score),sum(1/(n.score-n.score))",
+    ):
+        with pytest.raises(af.GraphError, match="CypherDivisionByZero"):
+            graph_db.cypher_json("g", {"query": f"MATCH (n:D) RETURN {fallible}"})
+    graph_db.sql("UPDATE docs SET score=NULL WHERE _id='n0'")
+    result = graph_db.cypher_json("g", {"query": f"MATCH (n:D) WHERE n.score IS NULL RETURN {observers}"})
+    assert [cell["value"] for cell in result["rows"][0]] == ["0", None, None, "0", "0"]
+
+
+def test_sql_graph_null_filters_preserve_three_valued_windows(graph_db):
+    populate(graph_db, 100)
+    graph_db.sql("UPDATE docs SET score=NULL WHERE score%3=0")
+    graph_db.sql("CREATE INDEX ranked ON docs(score DESC)")
+    graph_db.run_until_idle()
+    relation = "GRAPH_TABLE(g MATCH (n IS D) COLUMNS(n.id AS id,n.score AS score)) q"
+    for predicate in (
+        "q.score IS NULL",
+        "q.score IS NOT NULL",
+        "q.score IS NULL OR q.score>=50",
+        "q.score IS NOT NULL AND q.score<50",
+    ):
+        for direction in ("ASC NULLS LAST", "DESC NULLS FIRST"):
+            query = f"SELECT q.id,q.score FROM {relation} WHERE {predicate} ORDER BY q.score {direction},q.id OFFSET 2 LIMIT 5"
+            actual = graph_db.sql(query)
+            control = graph_db.sql(query.replace("ORDER BY q.score", "ORDER BY q.score+0"))
+            assert actual["rows"] == control["rows"]
+    query = f"SELECT q.score FROM {relation} WHERE q.score IS NOT NULL AND q.score >= $1 ORDER BY q.score ASC LIMIT 5"
+    for value in (None, 50):
+        actual = graph_db.sql(query, [value])
+        control = graph_db.sql(query.replace("ORDER BY q.score", "ORDER BY q.score+0"), [value])
+        assert actual["rows"] == control["rows"]

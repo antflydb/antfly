@@ -4774,6 +4774,9 @@ test "transparent graph relations forward order requests and certificates throug
     for ([_][]const u8{
         "SELECT g.score FROM GRAPH_TABLE(g MATCH (n IS D) COLUMNS(n.score AS score)) g ORDER BY g.score DESC LIMIT 5",
         "SELECT g.score FROM GRAPH_TABLE(g MATCH (n IS D) COLUMNS(n.score AS score)) g WHERE g.score>=0 ORDER BY g.score DESC LIMIT 5",
+        "SELECT g.score FROM GRAPH_TABLE(g MATCH (n IS D) COLUMNS(n.score AS score)) g WHERE g.score IS NOT NULL ORDER BY g.score DESC LIMIT 5",
+        "SELECT g.score FROM GRAPH_TABLE(g MATCH (n IS D) COLUMNS(n.score AS score)) g WHERE g.score IS NULL OR g.score IS NOT NULL ORDER BY g.score DESC LIMIT 5",
+        "SELECT g.score FROM GRAPH_TABLE(g MATCH (n IS D) COLUMNS(n.score AS score)) g WHERE g.score IS NOT NULL AND g.score>=0 ORDER BY g.score DESC LIMIT 5",
         "SELECT d.s FROM (SELECT g.score AS s FROM GRAPH_TABLE(g MATCH (n IS D) COLUMNS(n.score AS score)) g) d WHERE d.s>=0 AND d.s<13000 ORDER BY d.s DESC LIMIT 5",
         "SELECT g.score FROM GRAPH_TABLE(g MATCH (n IS D) COLUMNS(n.score AS score)) g WHERE g.score>=0 OR g.score IN (1,2,NULL) ORDER BY g.score DESC LIMIT 5",
         "SELECT d.s FROM (SELECT g.score AS s FROM GRAPH_TABLE(g MATCH (n IS D) COLUMNS(n.score AS score)) g) d ORDER BY d.s DESC LIMIT 5",

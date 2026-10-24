@@ -2883,7 +2883,7 @@ Unsupported observers or fallible expressions retain the ordinary aggregate
 fold. Typed NULL tuple bounds complement the authoritative runtime non-NULL
 predicate. Empty and all-NULL inputs still produce one NULL aggregate row.
 Internal window, multiplicity, and profile state stays scoped to each observer;
-the outer physical plan reports index_extrema. Subsequent weighted stages receive
+the outer physical plan reports index_observers. Subsequent weighted stages receive
 the ordinary one-row aggregate result.
 
 For an adjacent scalar DISTINCT over one or more varying physical keys, a
@@ -3049,3 +3049,60 @@ and from 113.5 ms to 3.1 ms on Directory. Timings depend on the environment;
 complete predicate transfer and bounded source work are the contract. A partial
 predicate, unsupported OR arm, inner selection frame, or fallible output retains
 the complete source and normal SQL residual evaluation.
+
+
+#### Composed observers and streaming group retirement
+
+Global COUNT(DISTINCT), MIN and MAX now negotiate one complete observer plan
+before reading data. Every argument still needs the normal total ordered-source
+proof; an unsupported observer declines the complete rewrite. Identical observer
+expressions reuse one result even when their output aliases differ. Execution
+reuses the captured ordering certificates, including cursor and representation
+flags, so observers do not renegotiate after preflight. Cardinality
+continues to traverse the coordinator's global union of authorized keys rather
+than adding owner-local counts. COUNT(NULL) remains a zero-read observer.
+
+Ordered DISTINCT uses the same adaptive page sizing for finite and unbounded
+consumers, capped by remaining logical demand for finite windows. Sparse and
+rejected prefixes grow transport batches; duplicate-heavy pages return to seeks.
+The existing representation, tie-order and residual proofs remain mandatory.
+
+A certified complete group-key source can fold both bounded and unbounded
+ordered COUNT/MIN/MAX output. Each completed group releases its reducer arena before
+the next group is admitted. Groups before SKIP consume their required observers
+without cloning discarded output into the statement arena; only emitted rows
+remain owned. Ordered admission also avoids unused temporary candidate ranks. Unbounded output still needs memory proportional to its result.
+
+SQL complete-filter certificates also transfer typed direct-column IS NULL and
+IS NOT NULL predicates, including within supported AND/OR trees. Null tests bind
+a closed NULL operand rather than trying to evaluate a row column at invocation
+binding. Numeric/structured domains, partial filters, source ordinals and inner
+selection barriers retain their existing fallback behavior and SQL residuals.
+
+
+The public measurements below use ready indexes and 8,000 source documents.
+Memory is charged query memory, including returned rows and the source working
+page. Performance fixtures drain pending index work before asserting budgets;
+client requests can tighten service ceilings, but cannot raise them.
+
+| Query shape | Before | After |
+| --- | ---: | ---: |
+| Mixed COUNT(DISTINCT score), MIN, MAX | 8,000 anchors; 311,980 states | 7 anchors; 245 states |
+| Duplicate COUNT(DISTINCT score) | 10 anchors | 5 anchors |
+| Unbounded ordered grouped COUNT | 20.3–23.9 MB; 369,664 states | 8.08 MB; 160,066 states |
+| Unbounded ordered grouped MAX | 20.3–23.9 MB; 425,664 states | 9.03 MB; 216,068 states |
+| Grouped SKIP 7900 LIMIT 5 | exceeds a 2 MiB budget | 0.61 MB; 5 rows |
+
+A separate SQL-populated fixture over 50,000 documents returns five grouped
+COUNT rows after SKIP 49900 using approximately 1.13 MB on both storage backends,
+under a 2 MiB allowance. The native fixture also covers COUNT/MIN/MAX across
+that offset under 256 KiB, isolating reducer/output ownership from document
+page decoding. Beyond-end and unbounded-offset cases retain their empty/last-row
+semantics. Unbounded results still require memory proportional to emitted rows.
+
+Finite sparse DISTINCT now satisfies the same native transport bound as its
+unbounded equivalent: fewer than 100 data requests for 5,000 records. Typed SQL
+NULL-test certificates are covered by five-row licensed windows over a
+13,000-row source, plus nullable AND/OR, derived fallback, and parameterized
+public result comparisons. Mixed observers also retain empty-input, all-NULL,
+duplicate-alias and fallible-expression behavior.
