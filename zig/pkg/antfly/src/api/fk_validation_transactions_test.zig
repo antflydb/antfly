@@ -324,6 +324,7 @@ test "foreign key validation native transaction preserves atomic pages and publi
     try std.testing.expectEqual(@as(?u16, 0), failed_header.failure_column);
     try std.testing.expectEqual(db.root_incarnation, failed_header.transaction_coverage.?.physical_root);
     try std.testing.expectEqual(@as(u64, 1), failed_header.rows_scanned);
+    try expectReplacementCancellation(&db, directory.path(), "cancel-failed", options, failed_header, candidate.inputs);
     const canceled_failure = try applyControl(&db, .{ .binding = source_binding, .action = .cancel });
     try std.testing.expectEqual(job.Phase.canceled, canceled_failure.phase);
     var repair = try planner.prepareWithCoverageControlled(a, fixture.source(), &tables, &ranges, &.{.{ .table_name = "rows", .writes = &.{.{ .key = "repaired_parent", .value = "{\"id\":99,\"parent_id\":null,\"payload\":\"repair\"}" }} }}, .{});
@@ -514,6 +515,100 @@ fn applyControl(db: *db_mod.DB, command: db_mod.DB.NativeSchemaOwnerControl.Comm
     return (try db.applyPreparedNativeSchemaOwnerControl(&prepared, null)).header.?;
 }
 
+// Restore real native artifacts to a distinct published root. Cancellation
+// must finish without borrowing the source root's data-validation authority.
+fn expectReplacementCancellation(source: *db_mod.DB, directory: []const u8, name: []const u8, options: db_mod.OpenOptions, expected: local.storage_db_relational_nullability_job.Header, inputs: []const u8) !void {
+    const job = local.storage_db_relational_nullability_job;
+    const lifecycle = local.storage_db_generation_lifecycle;
+    _ = try source.snapshotNative(name);
+    const snapshot = try std.fmt.allocPrint(a, "{s}.snapshots/{s}", .{ source.core.path, name });
+    defer a.free(snapshot);
+    const path = try std.fs.path.join(a, &.{ directory, name });
+    defer a.free(path);
+    {
+        var transition = try lifecycle.beginProcessExclusive(path);
+        defer transition.deinit();
+        var staged = try transition.beginStaging();
+        defer staged.deinit();
+        try db_mod.DB.restoreIdentityPreservingSnapshotToStagedGeneration(&staged, a, snapshot, staged.path(), options, options.identity_namespace.?);
+        _ = try staged.publish();
+    }
+    var replacement = try db_mod.DB.open(a, path, options);
+    var live = true;
+    defer if (live) replacement.close();
+    try std.testing.expect(source.root_incarnation != replacement.root_incarnation);
+    const binding = expected.binding;
+    try std.testing.expectError(error.SchemaValidationRuntimeRecoveryRequired, replacement.prepareNativeSchemaOwnerControl(.{ .binding = binding, .action = .freeze }, .{}));
+    if (expected.phase == .installed) {
+        // Installation is irreversible even when metadata has not ACKed it.
+        try std.testing.expectError(error.SchemaValidationRuntimeRecoveryRequired, applyControl(&replacement, .{ .binding = binding, .action = .cancel }));
+        var direct = try db_mod.DB.NativeSchemaOwnerControl.Prepared.init(a, replacement.core, .{ .binding = binding, .action = .cancel }, .{});
+        defer direct.deinit();
+        try std.testing.expectError(error.SchemaValidationRuntimeRecoveryRequired, replacement.applyPreparedNativeSchemaOwnerControl(&direct, null));
+        return;
+    }
+    if (expected.phase == .fencing) {
+        // No current-row claim: recovery can observe/audit the real debt cut.
+        try std.testing.expectEqualDeep(expected, (try replacement.observeNativeSchemaOwner(binding, .{})).header.?);
+        for (0..256) |_| {
+            var debt_page = (try replacement.prepareSchemaOwnerTransactionDebtPage(binding, .{})) orelse break;
+            defer debt_page.deinit();
+            _ = try replacement.applyPreparedNativeSchemaOwnerControl(&debt_page, null);
+        } else return error.CancellationDebtDidNotConverge;
+    } else {
+        try std.testing.expectError(error.SchemaValidationRuntimeRecoveryRequired, replacement.observeNativeSchemaOwner(binding, .{}));
+        const predecessor: [32]u8 = @splat(71);
+        try std.testing.expectError(error.SchemaValidationRuntimeRecoveryRequired, replacement.prepareNativeSchemaOwnerControl(.{ .binding = binding, .action = .reconcile_transactions, .payload = &predecessor }, .{}));
+    }
+    var other = binding;
+    other.id[0] ^= 1;
+    try std.testing.expectError(error.SchemaValidationRuntimeRecoveryRequired, replacement.prepareNativeSchemaOwnerControl(.{ .binding = other, .action = .cancel }, .{}));
+    const row_key = try local.storage_internal_keys.relationalRowKeyAlloc(a, "child");
+    defer a.free(row_key);
+    const before_row = try replacement.core.store.get(a, row_key);
+    defer a.free(before_row);
+    const canceled = try applyControl(&replacement, .{ .binding = binding, .action = .cancel });
+    try std.testing.expectEqual(job.Phase.canceled, canceled.phase);
+    try std.testing.expectEqualDeep(expected.transaction_coverage, canceled.transaction_coverage);
+    try std.testing.expect(canceled.updated.strictlyAfter(expected.updated));
+    replacement.close();
+    live = false;
+    replacement = try db_mod.DB.open(a, path, options);
+    live = true;
+    const observed = try replacement.observeNativeSchemaOwner(binding, .{});
+    try std.testing.expectEqualDeep(canceled, observed.header.?);
+    try std.testing.expectEqual(replacement.root_incarnation, observed.physical_root_incarnation);
+    try std.testing.expectEqual(@as(u32, 1), replacement.core.schema.?.version);
+    try std.testing.expectEqualDeep(canceled, try applyControl(&replacement, .{ .binding = binding, .action = .cancel }));
+    const after_row = try replacement.core.store.get(a, row_key);
+    defer a.free(after_row);
+    try std.testing.expectEqualSlices(u8, before_row, after_row);
+    const raw = (try replacement.core.getStoreValue(a, activation.validation_key)).?;
+    defer a.free(raw);
+    const terminal = try activation.ForeignKeyValidationRecord.decode(raw);
+    try std.testing.expectEqual(activation.State.invalid, terminal.progress.state);
+    try std.testing.expectEqualStrings("Canceled", terminal.progress.failure);
+    {
+        var read = try replacement.core.store.beginReadTxn();
+        defer read.abort();
+        try local.storage_db_relational_integrity_topology.requireUnfenced(&read);
+    }
+    // The existing composite audit independently checks rows, transaction
+    // debt, transaction snapshots and committed control history at one MVCC cut.
+    const signing = try local.storage_db_root_signing_identity.loadOrCreate(a, std.Options.debug_io, path);
+    for (0..256) |_| {
+        const result = try replacement.stepSchemaOwnerRowAudit(binding.fence.owner_group_id, binding, inputs, .{ .rows = 1, .records = 1 }, path, signing.root_incarnation, .{});
+        try result.requireFor(binding, signing.root_incarnation, signing.public_key);
+        if (result == .complete) {
+            try std.testing.expectEqual(replacement.root_incarnation, result.complete.value.physical_root);
+            try std.testing.expectEqualDeep(canceled, result.complete.value.rows.header);
+            try std.testing.expectEqual(.none, result.complete.value.rows.coverage);
+            try std.testing.expectEqual(@as(u64, 0), result.complete.value.rows.rows);
+            break;
+        }
+    } else return error.CancellationAuditDidNotConverge;
+}
+
 fn replayValidationJournal(journal: *@import("../storage/hot_standby/primary.zig").Primary, db: *db_mod.DB, next_lsn: *u64) !void {
     while (next_lsn.* <= journal.lastLsn()) : (next_lsn.* += 1) {
         var entry = (try journal.log.entryAt(a, next_lsn.*)) orelse return error.MissingReplicationRecord;
@@ -670,7 +765,8 @@ test "foreign key validation native snapshot restarts unaccepted coverage on the
         restored.local_execution.replication_async_batch_mirror = null;
     }
     var next_lsn: u64 = 1;
-    _ = try applyControl(&restored, .{ .binding = binding, .action = .begin, .payload = candidate.inputs });
+    const fencing = try applyControl(&restored, .{ .binding = binding, .action = .begin, .payload = candidate.inputs });
+    try expectReplacementCancellation(&restored, directory.path(), "cancel-fencing", options, fencing, candidate.inputs);
     try replayValidationJournal(&journal, &peer, &next_lsn);
     const ready = try applyControl(&restored, .{ .binding = binding, .action = .freeze });
     try replayValidationJournal(&journal, &peer, &next_lsn);
@@ -684,6 +780,7 @@ test "foreign key validation native snapshot restarts unaccepted coverage on the
     // evidence or control on the standby's distinct native root.
     try std.testing.expectError(error.SchemaValidationRuntimeRecoveryRequired, peer.observeNativeSchemaOwner(binding, .{}));
     try std.testing.expectError(error.SchemaValidationRuntimeRecoveryRequired, peer.prepareNativeSchemaOwnerControl(.{ .binding = binding, .action = .freeze }, .{}));
+    try expectReplacementCancellation(&restored, directory.path(), "cancel-ready", options, ready, candidate.inputs);
     try std.testing.expectEqual(job.Phase.ready, ready.phase);
     try std.testing.expectEqual(restored.root_incarnation, ready.transaction_coverage.?.physical_root);
     const terminal_raw = (try restored.core.getStoreValue(a, activation.validation_key)).?;
@@ -706,6 +803,7 @@ test "foreign key validation native snapshot restarts unaccepted coverage on the
     @memcpy(install_payload[32..64], &try ready.digest());
     const installed = try applyControl(&restored, .{ .binding = binding, .action = .install, .payload = &install_payload });
     try replayValidationJournal(&journal, &peer, &next_lsn);
+    try expectReplacementCancellation(&restored, directory.path(), "refuse-installed-cancel", options, installed, candidate.inputs);
     peer.close();
     peer_live = false;
     peer = try db_mod.DB.open(a, peer_path, options);

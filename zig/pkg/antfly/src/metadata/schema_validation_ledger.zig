@@ -1452,9 +1452,12 @@ const TestProofs = struct {
     }
 
     fn nativeAdoptionRequest(head: barriers.Head, owner: barriers.Owner, destination_root: u128) !roots.Request {
-        const header = ready(owner);
+        return nativeAdoptionRequestForHeader(head, owner, destination_root, ready(owner));
+    }
+
+    fn nativeAdoptionRequestForHeader(head: barriers.Head, owner: barriers.Owner, destination_root: u128, header: contract.Header) !roots.Request {
         const Directory = @typeInfo(@FieldType(local.storage_db_relational_schema_root_contract.Qualification, "directory_head")).optional.child;
-        const directory: Directory = .{ .scope = try @FieldType(Directory, "scope").fromBinding(owner.binding), .phase = .ready };
+        const directory: Directory = .{ .scope = try @FieldType(Directory, "scope").fromBinding(owner.binding), .phase = if (header.phase == .canceled) .retired else .ready };
         const encoded = try header.encode(std.testing.allocator);
         defer std.testing.allocator.free(encoded);
         var image: local.storage_db_relational_schema_root_contract.Evidence = .{
@@ -1462,7 +1465,7 @@ const TestProofs = struct {
                 .signing_root = 7,
                 .physical_root = destination_root,
                 .checkpoint_digest = @splat(91),
-                .rows = .{ .header = header, .snapshot_cut = header.updated, .coverage = .full, .records = header.records, .rows = header.rows_scanned, .cursor_digest = header.cursor_digest },
+                .rows = .{ .header = header, .snapshot_cut = header.updated, .coverage = if (header.phase == .canceled) .none else .full, .records = if (header.phase == .canceled) 0 else header.records, .rows = if (header.phase == .canceled) 0 else header.rows_scanned, .cursor_digest = header.cursor_digest, .reference_coverage = if (owner.binding.purpose == .not_null) null else .{} },
                 .qualification = .{
                     .origin = .{ .physical_root_incarnation = destination_root, .namespace = owner.binding.fence.namespace, .authority = .{ .kind = .native, .namespace = local.storage_db_online_source_contract.namespaceBytes(owner.binding.fence.namespace), .sequence = header.updated.native.sequence }, .applied = null, .schema_header = contract.hash(encoded), .transaction_directory = contract.hash(&try directory.encode()), .schema_outcomes = null },
                     .directory_head = directory,
@@ -3382,11 +3385,26 @@ test "schema validation publication FK dependency admission and final cancellati
         try std.testing.expectEqual(@as(u64, 1), adopted_owner.root_epoch);
         try std.testing.expectEqual(@as(u16, 0), head.ready);
         try deps.requireSource(a, &write, head, source, false);
+        var ready = TestProofs.ready(adopted_owner);
+        ready.transaction_coverage = .{ .record = @splat(43), .physical_root = adopted_owner.physical_root_incarnation };
+        head = try acknowledge(&write, lookup, adopted_owner.ordinal, head.revision, try TestProofs.signed(head, adopted_owner, ready), &context);
+        try std.testing.expectEqual(@as(u16, 1), head.ready);
         head = try cancel(&write, lookup, head.revision, .requested);
-        const owner = try readOwner(&write, head, 0);
-        var canceled = TestProofs.ready(owner);
-        canceled.reference_coverage = .{};
+        const previous_owner = try readOwner(&write, head, 0);
+        var canceled = ready;
         canceled.phase = .canceled;
+        canceled.revision += 1;
+        canceled.updated = TestProofs.position(previous_owner, 4);
+        // Fixture proof for the ledger reducer: the real physical cancellation
+        // and composite audits are exercised by the native FK transaction gate.
+        const adoption = try TestProofs.nativeAdoptionRequestForHeader(head, previous_owner, 98, canceled);
+        head = try adoptRoot(&write, adoption, &context);
+        const owner = try readOwner(&write, head, 0);
+        try std.testing.expectEqual(@as(u64, 2), owner.root_epoch);
+        try std.testing.expectEqual(@as(u128, 98), owner.physical_root_incarnation);
+        try std.testing.expectEqualDeep(previous_owner.headers, owner.headers);
+        try std.testing.expectEqual(@as(u16, 1), head.ready);
+        try deps.requireSource(a, &write, head, source, false);
         _ = try acknowledge(&write, lookup, owner.ordinal, head.revision, try TestProofs.signed(head, owner, canceled), &context);
         try write.commit();
     }
@@ -3401,8 +3419,8 @@ test "schema validation publication FK dependency admission and final cancellati
         var recovered = try recover(a, &read, lookup);
         defer recovered.deinit();
         try std.testing.expectEqual(@as(u16, 1), recovered.head.canceled);
-        try std.testing.expectEqual(@as(u64, 1), recovered.owners[0].root_epoch);
-        try std.testing.expectEqual(@as(u128, 97), recovered.owners[0].physical_root_incarnation);
+        try std.testing.expectEqual(@as(u64, 2), recovered.owners[0].root_epoch);
+        try std.testing.expectEqual(@as(u128, 98), recovered.owners[0].physical_root_incarnation);
         try verifyGroup(a, &read, lookup.group, &context);
     }
     for (1..8) |fail_write| for ([_]bool{ false, true }) |after_write| {

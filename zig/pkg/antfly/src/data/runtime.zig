@@ -7196,6 +7196,23 @@ pub const DataServer = struct {
             job.continue_audit = true;
             return self.stepSchemaOwner(job, a, control, discovered, root, context);
         }
+        // A canceled job publishes no candidate schema. Finish physical cleanup
+        // before asking metadata to adopt this root; accepted ready/failed ACKs
+        // remain immutable history and are replay-qualified by the later audit.
+        if (native and control.head.phase == .canceling and control.head.install_revision == 0) {
+            if (discovered.state.header) |header| {
+                if (std.meta.eql(header.binding, control.owner.binding) and header.binding.purpose == .foreign_key_source and
+                    header.admitted != null and header.installation == null and (header.phase == .ready or header.phase == .failed))
+                {
+                    _ = try self.schemaRecoveryNativeScope(header.binding, discovered.root_generation, discovered.state.physical_root_incarnation, lookup.metadata_incarnation, root, context);
+                    if (self.hotStandbyWriteGate()) |gate| try gate.check();
+                    _ = try source.applyNativeSchemaOwnerControlAtRoot(group, table, .{ .binding = header.binding, .action = .cancel }, 1024, 5 * std.time.ns_per_ms, .{ .root_generation = discovered.root_generation, .physical_root_incarnation = discovered.state.physical_root_incarnation }, context);
+                    job.pending_adoption = null;
+                    job.pending_state = null;
+                    return true;
+                }
+            }
+        }
         const request = adoption: {
             if (job.pending_adoption) |pending| cached: {
                 if (!std.meta.eql(job.pending_state, @as(?antfly.public_api.ProvisionedKernelOwnerSource.RootedSchemaOwnerState, discovered))) break :cached;
@@ -7250,7 +7267,7 @@ pub const DataServer = struct {
                 _ = self.schema_recovery_input_fetches.fetchAdd(1, .monotonic);
                 if (native) {
                     const scope = try self.schemaRecoveryNativeScope(control.owner.binding, discovered.root_generation, discovered.state.physical_root_incarnation, lookup.metadata_incarnation, root, context);
-                    const prepared = try source.attestSchemaPreparationAtRoot(group, table, .{ .id = control.owner.binding.id, .provisional_plan = control.owner.binding.plan_digest, .fence = control.owner.binding.fence, .authority = .native }, input, .{ .identity = scope.signing.identity, .reporter_incarnation = scope.signing.reporter_incarnation, .authority = .{ .native = scope.signing.binding_digest } }, root, context);
+                    const prepared = try source.attestSchemaPreparationAtRoot(group, table, .{ .id = control.owner.binding.id, .provisional_plan = control.owner.binding.plan_digest, .fence = control.owner.binding.fence, .purpose = control.owner.binding.purpose, .authority = .native }, input, .{ .identity = scope.signing.identity, .reporter_incarnation = scope.signing.reporter_incarnation, .authority = .{ .native = scope.signing.binding_digest } }, root, context);
                     break :adoption (try reads.prepareNativeAdoption(control, .{ .native_bootstrap = prepared })) orelse return false;
                 }
                 const scope = try self.schemaRecoveryRaftScope(control.owner.binding, discovered.root_generation, discovered.state.physical_root_incarnation, lookup.metadata_incarnation, root, context);
@@ -7258,6 +7275,7 @@ pub const DataServer = struct {
                     .id = control.owner.binding.id,
                     .provisional_plan = control.owner.binding.plan_digest,
                     .fence = control.owner.binding.fence,
+                    .purpose = control.owner.binding.purpose,
                     .authority = .raft,
                 }, input, scope, root, context);
                 break :adoption (try reads.prepareBootstrapAdoption(control, certified)) orelse return false;

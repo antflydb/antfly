@@ -1,7 +1,7 @@
 # SQL catalog lifecycle and original-case qualification
 
 Status: draft follow-up PR #1061 to merged PR #1048, merged with `origin/main`
-at `fd329daaf9` (verified 2026-10-23). Earlier implementation and
+at `fd329daaf9` (verified 2026-10-24). Earlier implementation and
 qualification checkpoints are retained below with their exact scope.
 This is an implementation and qualification backlog, not
 a completion claim. PostgreSQL is the SQL standard and independent test oracle.
@@ -270,15 +270,57 @@ restore tests and six mounted SQL validation/recovery campaigns. Strict focused
 gates have no skips or leaks. Generated-source, formatting, inventory, licensing
 and source-boundary checks also pass.
 
-Post-handoff replacement-root recovery remains unfinished, including cleanup
-of failed/ready owners and promotion during installation. It must retain the
-accepted header and ACK roots, qualify the new root's parent/reference and
-transaction state, then commit the existing root-epoch CAS. Rewriting the old
-header's root, accepting copied EOF counters, or treating the standby LSN as a
-native data proof would bypass that requirement. Committed standby replay alone
-does not complete promotion qualification. The public `sql-0736` guard and all
-original-case counts remain unchanged until this and the public PostgreSQL /
-distributed fault campaign pass.
+Successful post-handoff replacement-root recovery remains unfinished,
+including ready/installed promotion. It must retain the accepted header and ACK
+roots, qualify the new root's parent/reference and transaction state, then commit
+the existing root-epoch CAS. Rewriting the old header's root, accepting copied
+EOF counters, or treating the standby LSN as a native data proof would bypass
+that requirement. Committed standby replay alone does not complete promotion
+qualification. Cancellation recovery is described below. The public `sql-0736`
+guard and all original-case counts remain unchanged until the full public
+PostgreSQL / distributed fault campaign passes.
+
+### Native FK cancellation after root replacement (2026-10-24)
+
+A copied admitted FK job may now clean up an uninstalled fencing, ready or
+failed owner. Both native preparation and the common apply boundary restrict
+the exception to the exact binding and cleanup action; debt reconciliation is
+allowed only while fencing. The existing atomic cancellation still requires
+committed control history, the actual topology fence and drained transaction
+debt. Pre-header row work retains its ordinary 2PC cancellation requirement.
+An installed owner cannot cancel, including through a directly prepared ABI
+command. Begin, freeze, page, install and release retain current-root checks.
+
+Fencing observations claim no row coverage and may therefore enter the existing
+bounded debt/transaction/history audit. Ready/failed observations on a copied
+root remain unavailable. When metadata has irrevocably chosen cancellation and
+has no install decision, recovery authenticates the actual standalone owner,
+signing root and hot-standby write gate, then cancels the physical ready/failed
+job before adopting the root. A later quantum independently audits the canceled
+cut and submits the existing root-epoch CAS. No original ready/failed ACK,
+transaction commitment or source-root identity is rewritten.
+
+Native restore campaigns cover fencing, failed, ready and installed images on
+real published replacement roots. They verify unchanged primary row bytes and
+schema, cold reopen, idempotent cancellation, mismatched binding rejection,
+installed cancellation refusal at both admission boundaries, and a signed
+composite audit of the actual canceled root with zero row-validity coverage.
+The metadata LSM/fault campaign separately checks accepted ready history, root
+epochs, shared target leases and the all-owner terminal barrier through cold
+restart and failed final ACK writes. Its signer/catalog callbacks remain
+fixtures, rather than substitutes for physical-root evidence.
+
+Recovery bootstrap now carries the selected validation purpose for both native
+and Raft descriptors; an FK source must not silently select the default NOT NULL
+candidate parser. The existing CI integration DAG now includes the same focused
+native FK transaction campaign as the local gate, without a duplicate test run.
+The production Debug build, fifteen supporting FK tests, two real native
+campaigns, forty-six metadata tests in each server configuration, three runtime
+recovery tests and six mounted SQL validation/recovery campaigns pass without
+skips or leaks. Generated-source, formatting, inventory, licensing and source
+boundary checks pass. Latest `origin/main` is already contained in this branch.
+This closes cancellation cleanup, not successful replacement-root FK validation;
+the original-case ledger counts and the public FK VALIDATE guard are unchanged.
 
 ### FK VALIDATE: native preparation and read execution in progress
 

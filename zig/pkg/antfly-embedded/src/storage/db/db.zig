@@ -9805,7 +9805,10 @@ pub const DB = struct {
         else
             null;
         if (header) |value| {
-            if (value.phase != .released and value.phase != .canceled) {
+            // Fencing/canceling cuts attest only debt and control history;
+            // they claim no current-root row coverage. Ready/failed/installed
+            // cuts still require proof from this physical root.
+            if (value.phase != .released and value.phase != .canceled and value.phase != .fencing and value.phase != .canceling) {
                 if (value.transaction_coverage) |coverage| if (coverage.physical_root != physical_root_incarnation) return error.SchemaValidationRuntimeRecoveryRequired;
             }
             if (value.phase == .installed) try resident.require(value);
@@ -9826,15 +9829,24 @@ pub const DB = struct {
     /// Trusted owner adapter, not ordinary RPC/batch admission. The receiving
     /// service authenticates metadata/root/cohort and capability authority.
     pub fn prepareNativeSchemaOwnerControl(self: *DB, command: NativeSchemaOwnerControl.Command, context: @import("../../api/operation.zig").RequestContext) !NativeSchemaOwnerControl.Prepared {
-        try self.requireNativeSchemaOwnerValidationRoot(command.binding);
+        try self.requireNativeSchemaOwnerValidationRoot(command);
         return NativeSchemaOwnerControl.Prepared.init(self.alloc, self.core, command, context);
     }
 
-    fn requireNativeSchemaOwnerValidationRoot(self: *DB, binding: @import("relational_schema_owner_contract.zig").Binding) !void {
+    fn requireNativeSchemaOwnerValidationRoot(self: *DB, command: NativeSchemaOwnerControl.Command) !void {
+        const binding = command.binding;
         if (binding.purpose != .foreign_key_source) return;
         var read = try self.core.store.beginReadTxn();
         defer read.abort();
         if (try @import("relational_nullability_job.zig").load(&read)) |header| {
+            // Cleanup may consume an admitted, uninstalled job on a new root.
+            // It cannot convert copied transaction coverage into row validity.
+            // stageCancel still checks the actual fence, committed clock and
+            // drained transaction debt atomically, and rejects active row work.
+            if (std.meta.eql(header.binding, binding) and header.admitted != null and header.installation == null) {
+                if (command.action == .cancel and (header.phase == .fencing or header.phase == .ready or header.phase == .failed)) return;
+                if (command.action == .reconcile_transactions and header.phase == .fencing) return;
+            }
             if (header.phase != .released and header.phase != .canceled) {
                 if (header.transaction_coverage) |coverage| if (coverage.physical_root != self.root_incarnation) return error.SchemaValidationRuntimeRecoveryRequired;
             }
@@ -9850,7 +9862,7 @@ pub const DB = struct {
     pub fn applyPreparedNativeSchemaOwnerControl(self: *DB, prepared: *NativeSchemaOwnerControl.Prepared, replay: ?NativeIndexReplay) !NativeSchemaOwnerControl.Outcome {
         // C/ABI producers use a budgeted allocator and prepare directly. Keep
         // this check at the common DB admission boundary as well.
-        try self.requireNativeSchemaOwnerValidationRoot(prepared.command.binding);
+        try self.requireNativeSchemaOwnerValidationRoot(prepared.command);
         return self.applyPreparedNativeOwnerEffect(prepared, replay);
     }
 
