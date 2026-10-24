@@ -4035,6 +4035,12 @@ fn parallelDenseBatchPlanned(alloc: Allocator, io: Io, provider: embedder_mod.De
         dims: u32,
         context: inference_request_context.RequestContext,
         fn run(self: *@This()) anyerror![]const []const f32 {
+            // Providers without context callbacks keep the serial legacy path,
+            // matching the unbounded dispatch in embedDenseBatchAttemptLimits.
+            if (self.provider.dense_embed_batch_with_context_fn == null and self.provider.dense_embed_with_context_fn == null) {
+                try self.context.check();
+                return self.provider.embedDenseBatch(self.alloc, self.name, self.texts, self.dims);
+            }
             return self.provider.embedDenseBatchWithContext(self.alloc, self.name, self.texts, self.dims, self.context);
         }
     };
