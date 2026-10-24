@@ -25703,3 +25703,74 @@ The production `repository.StreamingRunFileWriter` still uses the legacy adapter
 and observational working-set accounting. Prepaid initialization and its real
 run/output ownership adoption are the next integration boundary. Full GNU
 qualification remains waived and the full design remains incomplete.
+
+
+## Retained encoder construction and complete CPU retirement
+
+`StreamingEncoder.Initialization` validates entry/filter/hash-count limits and
+the header extent before allocation. Its additional memory bound covers the
+construction/encoder headers and run Bloom bytes; callers retain/prepay the
+original allocator authority. The raw filter allocation is zeroed in at most
+16 KiB per original checkpoint. One immutable 20-byte header command remains
+stable through rejected IO observation and is acknowledged before another
+fallible checkpoint. Keep the construction owner address stable while that
+command is borrowed by accepted IO. `takeEncoder()` transfers the still-funded
+filter without copying or reacquiring a budget.
+
+Owned construction disables synchronous append/finish boundaries. This makes
+accidental fallback to a sink operation fail explicitly rather than performing
+IO inside an admitted CPU turn. Entry/block/metadata owners remain available and
+track physical output independently of the borrowed legacy sink. The legacy
+constructor drives the same initialization and enables its explicit synchronous
+wrappers, preserving table wire bytes. Oversized or overflowing filter estimates
+are rejected before provider allocation, including empty hostile configurations.
+
+`Metadata.retireWithAdmission()` retains its filter/builder slots and byte offset
+through original rejection, fences further output/result transfer, and keeps
+the encoder borrowed until all owned metadata memory retires. Taken result
+filters remain independently owned and funded by the caller. Accepted file IO
+must settle before retiring any borrowed producer command.
+
+`prepareRetirement()` freezes the encoder and rejects active entry, block or
+metadata producers. Its movable CPU continuation releases at most one 16 KiB
+chunk per step. It walks each completed block's seven owned allocations before
+retiring the descriptor array, then retires all encoder vectors, buffers and
+current/spare bounds. Memory/working-set counters change only with the final
+chunk's raw allocator release; partial poisoning retains the full allocation
+credit. Both legacy destruction and admitted retirement share these primitives.
+Repeated completed retirement is harmless, and the retired encoder cannot resume
+production. Native ABI 113 and storage-owner ABI 173 fence the added state.
+
+The real file composition uses retained initialization, entries, blocks and
+metadata, then retires metadata/encoder CPU memory under the original scope
+before durable publication. Error-path destruction joins the file before its
+producer owners. This closes low-level construction/teardown gaps but does not
+wire a fresh application budget or replace production resource admission.
+`repository.StreamingRunFileWriter` still needs prepaid run/output construction
+and adoption instead of the legacy adapter and late observational accounting.
+Cold-write policy, manifest/close adoption, remaining allocation/teardown and
+completion/history relief, provider/legacy adoption and default-gate evidence
+remain open. Full GNU qualification is waived and the full design is incomplete.
+
+Qualification `encoder-lifecycle-v1-integrated` passes 83/83 build steps, 58
+physical-IO cases, 32 embedded close cases, 170 table/codec cases, 74 WAL/recovery
+cases and 18 host/ABI checks. `encoder-lifecycle-v1-fast` passes the focused
+optimized table/WAL target (60/60 build steps, 170/74 cases). Both runners pass
+four standalone Bloom cases and 45/1/8 error-identity cases. Native source hashes
+and log digests were verified against the final source, and snapshots preserve
+all changed native files. Formatting and whitespace pass.
+
+The construction matrix prepays a fixed buffer for a million-row estimate,
+checks at-most-16-KiB initialization, moves CPU progress before issuing IO,
+rejects every checkpoint with Canceled/DeadlineExceeded/FileNotFound, preserves
+header identity, transfers the filter once and verifies synchronous fallback
+refusal. Invalid size/hash/header estimates allocate nothing. Encoder retirement
+is interrupted at every step; partial chunks keep the entire allocation live.
+The metadata test cancels partial prefix initialization, retires both final and
+partial filters through chunk rejection, then deeply retires many completed
+blocks and proves exact allocated/freed-byte balance. Deterministic fault
+injection covers constructor/filter/header failure. The real file composition
+rejects an accepted header without replay and uses admitted metadata/encoder
+retirement, preserving published rows, sole-FD completion and control progress.
+Full GNU qualification remains waived; production run-writer prepayment and
+adoption, plus the other default-gate requirements above, remain incomplete.

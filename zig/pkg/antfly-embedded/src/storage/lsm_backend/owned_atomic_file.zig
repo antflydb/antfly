@@ -378,8 +378,14 @@ test "controlled physical sync table metadata publishes through owning file with
     var memory = table.MemoryTableSink.init(a);
     defer memory.deinit();
     var sink = memory.sink();
-    var encoder = try table.StreamingEncoder.init(a, &sink, 192, .{});
-    defer encoder.deinit();
+    var construction = try table.StreamingEncoder.Initialization.init(a, 192, .{}, 0);
+    defer construction.deinit();
+    var encoder: table.StreamingEncoder = undefined;
+    var have_encoder = false;
+    defer if (have_encoder) encoder.deinit();
+    var metadata: table.StreamingEncoder.Metadata = undefined;
+    var have_metadata = false;
+    defer if (have_metadata) metadata.deinit();
     var block: table.StreamingEncoder.Block = undefined;
     var have_block = false;
     // The owning file, declared below, joins accepted borrows before this
@@ -410,6 +416,8 @@ test "controlled physical sync table metadata publishes through owning file with
         slots: *cpu.Scheduler,
         file: *File,
         physical_waits: usize = 0,
+        reject_header: bool = false,
+        header_rejected: bool = false,
         reject_entry: bool = false,
         entry_rejected: bool = false,
         reject_block_write: bool = false,
@@ -420,6 +428,11 @@ test "controlled physical sync table metadata publishes through owning file with
             const self: *@This() = @ptrCast(@alignCast(raw));
             try self.execution.checkLifetime();
             try std.testing.expectEqual(cpu.State.running, self.slots.state(&self.execution.entry.?));
+            if (self.reject_header and self.file.phase == .writing) {
+                self.reject_header = false;
+                self.header_rejected = true;
+                return error.Canceled;
+            }
             if (self.reject_entry) {
                 self.reject_entry = false;
                 self.entry_rejected = true;
@@ -477,12 +490,21 @@ test "controlled physical sync table metadata publishes through owning file with
     defer storage_io.NativeSyncTestControl.pause.store(false, .release);
     defer storage_io.NativeSyncTestControl.release.store(true, .release);
     try file.openWithAdmission(original);
-    var offset: usize = 0;
-    while (offset < memory.out.items.len) {
-        const n = @min(memory.out.items.len - offset, storage_io.max_atomic_write_bytes);
-        try file.writeWithAdmission(offset, memory.out.items[offset..][0..n], original);
-        offset += n;
+    control.reject_header = true;
+    const header_before = storage_io.NativeSyncTestControl.metadata.load(.acquire);
+    while (true) {
+        const more = construction.writeNextWithAdmission(&file, original) catch |cause| {
+            try std.testing.expectEqual(error.Canceled, cause);
+            try std.testing.expect(control.header_rejected and file.pending != null);
+            continue;
+        };
+        if (!more) break;
     }
+    try std.testing.expect(control.header_rejected);
+    try std.testing.expectEqual(header_before + 1, storage_io.NativeSyncTestControl.metadata.load(.acquire));
+    encoder = try construction.takeEncoder(&sink);
+    have_encoder = true;
+    try std.testing.expectEqual(@as(usize, 0), memory.out.items.len);
     control.reject_entry = true;
     const before_entries = storage_io.NativeSyncTestControl.metadata.load(.acquire);
     for (0..192) |i| {
@@ -523,8 +545,8 @@ test "controlled physical sync table metadata publishes through owning file with
     try std.testing.expect(control.block_rejected and block.published);
     try std.testing.expectEqual(block_writes_before + block_written, storage_io.NativeSyncTestControl.metadata.load(.acquire));
     try block.retireWithAdmission(original);
-    var metadata = try encoder.prepareMetadata();
-    defer metadata.deinit();
+    metadata = try encoder.prepareMetadata();
+    have_metadata = true;
     control.reject_metadata_write = true;
     const writes_before = storage_io.NativeSyncTestControl.metadata.load(.acquire);
     var written: usize = 0;
@@ -542,6 +564,11 @@ test "controlled physical sync table metadata publishes through owning file with
     var result = try metadata.takeResult();
     defer result.filter.deinit(a);
     try std.testing.expectEqual(@as(u64, result.size_bytes), file.logical_len);
+    try metadata.retireWithAdmission(original);
+    var encoder_retirement = try encoder.prepareRetirement();
+    defer encoder_retirement.deinit();
+    while (!(try encoder_retirement.step(original))) {}
+    try std.testing.expectEqual(@as(u64, 0), encoder.workingSetBytes());
     try file.finishWithAdmission(original);
     const held = pool.snapshotStats().fd_admitted_descriptors;
     const next_path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/second", .{tmp.sub_path});
