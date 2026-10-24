@@ -797,6 +797,13 @@ fn executeMcpTransport(server_ptr: anytype, protocol_server: *mcp.Server, reques
 }
 
 fn mcpToolVisibleForIdentity(spec: McpToolSpec, authenticated_identity: anytype) bool {
+    if (spec.kind == .create_table or spec.kind == .restore) {
+        if (authenticated_identity) |identity| {
+            if (@hasField(@TypeOf(identity), "mcp_creation_discovery")) {
+                if (identity.mcp_creation_discovery) return true;
+            }
+        }
+    }
     return mcpPermissionVisibleForIdentity(spec.permission, authenticated_identity);
 }
 
@@ -1998,4 +2005,21 @@ test "native memory MCP numeric helpers accept only exact bounded integer argume
     const raw = "{\"value\":1.0000000000000001}";
     const result = try mcpResultFromOwnedResponse(a, .{ .status = 200, .content_type = "application/json", .body = try a.dupe(u8, raw) });
     try std.testing.expectEqualStrings("1.0000000000000001", result.structured.?.object.get("value").?.number_string);
+}
+
+test "trusted principal table operations creation discovery never grants mutation authority" {
+    const alloc = std.testing.allocator;
+    const permissions = [_]usermgr.Permission{};
+    const Identity = struct { permissions: []const usermgr.Permission, mcp_creation_discovery: bool };
+    const identity: ?Identity = .{ .permissions = &permissions, .mcp_creation_discovery = true };
+    const args = try std.json.parseFromSlice(std.json.Value, alloc, "{\"tableName\":\"new_table\"}", .{});
+    defer args.deinit();
+    for (mcp_tool_specs) |spec| {
+        if (spec.kind == .create_table or spec.kind == .restore) {
+            try std.testing.expect(mcpToolVisibleForIdentity(spec, identity));
+            try std.testing.expect(!mcpToolInvocationAllowed(spec, args.value, &permissions));
+        } else if (spec.kind == .drop_table) {
+            try std.testing.expect(!mcpToolVisibleForIdentity(spec, identity));
+        }
+    }
 }
