@@ -24,7 +24,9 @@ pub const positional_record_version: u16 = 15;
 pub const previous_record_version: u16 = positional_record_version;
 pub const inference_diagnostics_record_version: u16 = 16;
 pub const framed_index_record_version: u16 = 17;
-pub const current_record_version: u16 = 18;
+pub const schema_epoch_record_version: u16 = 18;
+pub const media_output_record_version: u16 = 19;
+pub const current_record_version: u16 = media_output_record_version;
 pub const legacy_record_version: u16 = v0_2_0_record_version;
 
 pub const Profile = enum(u16) {
@@ -32,6 +34,7 @@ pub const Profile = enum(u16) {
     positional = positional_record_version,
     inference_diagnostics = inference_diagnostics_record_version,
     framed_index = framed_index_record_version,
+    schema_epoch = schema_epoch_record_version,
     current = current_record_version,
 
     pub fn wireVersion(self: @This()) u16 {
@@ -52,8 +55,9 @@ pub fn profileSatisfies(available_version: u16, required_version: u16) bool {
     return switch (required) {
         .released_v0_2_0 => true,
         .positional => available != .released_v0_2_0,
-        .inference_diagnostics => available == .inference_diagnostics or available == .framed_index or available == .current,
-        .framed_index => available == .framed_index or available == .current,
+        .inference_diagnostics => available == .inference_diagnostics or available == .framed_index or available == .schema_epoch or available == .current,
+        .framed_index => available == .framed_index or available == .schema_epoch or available == .current,
+        .schema_epoch => available == .schema_epoch or available == .current,
         .current => available == .current,
     };
 }
@@ -62,7 +66,7 @@ pub fn profileSatisfies(available_version: u16, required_version: u16) bool {
 /// Version integers identify formats; compatibility is never inferred from
 /// numeric ordering.
 pub fn greatestCommonProfile(left_version: u16, right_version: u16) ?Profile {
-    const candidates = [_]Profile{ .current, .framed_index, .inference_diagnostics, .positional, .released_v0_2_0 };
+    const candidates = [_]Profile{ .current, .schema_epoch, .framed_index, .inference_diagnostics, .positional, .released_v0_2_0 };
     for (candidates) |candidate| {
         const version = candidate.wireVersion();
         if (profileSatisfies(left_version, version) and
@@ -88,7 +92,6 @@ pub const vector_projection_record_version: u16 = framed_index_record_version;
 pub const dense_native_storage_record_version: u16 = framed_index_record_version;
 pub const framed_index_status_record_version: u16 = framed_index_record_version;
 pub const dense_native_capability_record_version: u16 = framed_index_record_version;
-pub const schema_epoch_record_version: u16 = current_record_version;
 
 pub fn isSupported(version: u16) bool {
     return isNegotiable(version);
@@ -108,7 +111,8 @@ test "runtime status exposes only released compatibility profiles" {
     try std.testing.expect(!isSupported(14));
     try std.testing.expect(isSupported(16));
     try std.testing.expect(isSupported(18));
-    try std.testing.expect(!isSupported(19));
+    try std.testing.expect(isSupported(19));
+    try std.testing.expect(!isSupported(20));
 
     try std.testing.expect(isNegotiable(v0_2_0_record_version));
     try std.testing.expect(isNegotiable(positional_record_version));
@@ -122,7 +126,7 @@ test "runtime status exposes only released compatibility profiles" {
     try std.testing.expectEqual(Profile.positional, profileForVersion(15).?);
     try std.testing.expectEqual(Profile.inference_diagnostics, profileForVersion(16).?);
     try std.testing.expectEqual(Profile.framed_index, profileForVersion(17).?);
-    try std.testing.expectEqual(Profile.current, profileForVersion(18).?);
+    try std.testing.expectEqual(Profile.schema_epoch, profileForVersion(18).?);
 
     try std.testing.expect(profileSatisfies(12, 12));
     try std.testing.expect(profileSatisfies(15, 12));
@@ -151,6 +155,9 @@ test "runtime status exposes only released compatibility profiles" {
     try std.testing.expectEqual(Profile.inference_diagnostics, greatestCommonProfile(17, 16).?);
     try std.testing.expectEqual(Profile.inference_diagnostics, greatestCommonProfile(18, 16).?);
 
+    try std.testing.expectEqual(Profile.schema_epoch, greatestCommonProfile(19, 18).?);
+    try std.testing.expect(!profileSatisfies(18, 19));
+    try std.testing.expect(profileSatisfies(19, 18));
     var rolling_common = Profile.current;
     for ([_]u16{ 16, 15, 16 }) |peer_version| {
         rolling_common = greatestCommonProfile(rolling_common.wireVersion(), peer_version).?;

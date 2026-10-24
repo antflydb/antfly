@@ -17,6 +17,12 @@
 const std = @import("std");
 const chunker = @import("inference_chunker");
 const planning = chunker.planning;
+const output_types = chunker.outputs;
+pub const OutputCoverage = struct { name: []const u8, required: bool, complete: usize = 0, failed: usize = 0, skipped: usize = 0 };
+pub const OutputExecutor = struct {
+    context: *anyopaque,
+    execute: *const fn (*anyopaque, std.mem.Allocator, Payload, planning.Descriptor, ?EmbeddingContext, ?Output, ?anyerror, bool) anyerror![]const output_types.Result,
+};
 const image = @import("antfly_image");
 const pdf = @import("antfly_pdf");
 const media = @import("antfly_media");
@@ -28,7 +34,7 @@ pub const Payload = union(enum) {
     text: []const u8,
     raster: image.BorrowedRasterAttachment,
     pcm: audio.PcmAudio,
-    video: struct { webm: ?@import("embedding_gemma2_video.zig").WebmInput = null, bytes: []const u8, reader: ?*const media.mp4.Reader = null, policy: video.sampling.TimestampPolicy, source_timestamps: bool = false, selection: ?*const @import("embedding_gemma2_video.zig").ReaderSelection = null, packet_base: usize = 0, plan: ?*const @import("embedding_gemma2_video.zig").Plan = null, ahead: ?*@import("embedding_gemma2.zig").VideoAhead = null, prepared: ?@import("embedding_gemma2.zig").VideoPreparedHook = null },
+    video: struct { audio: ?audio.PcmAudio = null, audio_start_ns: ?i64 = null, audio_failure: ?anyerror = null, webm: ?@import("embedding_gemma2_video.zig").WebmInput = null, bytes: []const u8, reader: ?*const media.mp4.Reader = null, policy: video.sampling.TimestampPolicy, source_timestamps: bool = false, selection: ?*const @import("embedding_gemma2_video.zig").ReaderSelection = null, packet_base: usize = 0, plan: ?*const @import("embedding_gemma2_video.zig").Plan = null, ahead: ?*@import("embedding_gemma2.zig").VideoAhead = null, prepared: ?@import("embedding_gemma2.zig").VideoPreparedHook = null },
 };
 pub const Preflight = struct { video_plan: ?@import("embedding_gemma2_video.zig").Plan = null, input_tokens: usize, picture_count: ?u32 = null, selected_pictures: ?[]const u64 = null, picture_basis: ?planning.PictureBasis = null };
 pub const Output = struct { vector: []f32, input_tokens: usize };
@@ -47,6 +53,12 @@ pub const Executor = struct {
 };
 pub const Limits = @import("media_chunk_limits.zig").Limits;
 pub const Request = struct {
+    outputs: ?output_types.Config = null,
+    output_executor: ?OutputExecutor = null,
+    transcribe_boundary: bool = false,
+    audio_boundary: bool = false,
+    needs_audio: bool = false,
+    execute_outputs: bool = true,
     limits: Limits = .{},
     input: chunker.Input,
     /// Borrow immutable provider context through completed execution/cancellation.
@@ -70,6 +82,7 @@ pub const Item = struct {
     descriptor: planning.Descriptor,
     id: []const u8,
     mime_type: []const u8,
+    outputs: []const output_types.Result = &.{},
     embedding: ?[]const f32 = null,
     failure: ?anyerror = null,
     text: ?[]const u8 = null,
@@ -87,6 +100,11 @@ pub const Summary = struct {
     failed: usize = 0,
     retry_ordinal: ?u64 = null,
     complete: bool = false,
+    /// Enumeration completion is independent of output failures.
+    source_complete: bool = false,
+    degraded: bool = false,
+    output_counts: [16]OutputCoverage = @splat(.{ .name = "", .required = true }),
+    output_count: usize = 0,
 };
 pub const Runner = struct {
     allocator: std.mem.Allocator,
@@ -100,8 +118,14 @@ pub const Runner = struct {
     stopped: bool = false,
     page_box: ?[4]f64 = null,
     page_rotation: ?i32 = null,
+    audio_provider: ?@import("media_chunking_audio.zig").Provider = null,
+    audio_failure: ?anyerror = null,
     pub fn init(a: std.mem.Allocator, request: Request, executor: Executor, control: Control, sink: Sink) !Runner {
         try control.check();
+        if (request.outputs) |config| {
+            try config.validate();
+            if (request.output_executor == null) return error.InvalidChunkOutputs;
+        }
         try request.policy.validate();
         try request.limits.validate();
         if (request.max_chunks > request.limits.max_chunks or request.max_working_bytes == 0) return error.InvalidChunkPolicy;
@@ -117,7 +141,12 @@ pub const Runner = struct {
         };
         const identity = if (request.native_source) |source| try planning.Identity.initPinned(source.identity, mime, request.source_version, executor.model, request.policy) else try planning.Identity.init(bytes, mime, request.source_version, executor.model, request.policy);
         const start = if (request.continuation) |cursor| try identity.parseContinuation(cursor) else 0;
-        return .{ .allocator = a, .executor = executor, .request = request, .control = control, .sink = sink, .summary = .{ .identity = identity, .start_ordinal = start, .next_ordinal = start }, .pool = .{ .limits = .{ .host_bytes = request.max_working_bytes } } };
+        var self = Runner{ .allocator = a, .executor = executor, .request = request, .control = control, .sink = sink, .summary = .{ .identity = identity, .start_ordinal = start, .next_ordinal = start }, .pool = .{ .limits = .{ .host_bytes = request.max_working_bytes } } };
+        if (request.outputs) |config| {
+            self.summary.output_count = config.targets.len;
+            for (config.targets, 0..) |target, i| self.summary.output_counts[i] = .{ .name = target.name, .required = target.required };
+        }
+        return self;
     }
     fn check(raw: ?*const anyopaque) !void {
         const self: *const Runner = @ptrCast(@alignCast(raw.?));
@@ -190,6 +219,59 @@ pub const Runner = struct {
                 item.descriptor.input_tokens = value.input_tokens;
             }
         }
+        var output_arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer output_arena.deinit();
+        var output_payload = payload;
+        var borrowed_audio: ?@import("media_chunking_audio.zig").Lease = null;
+        defer if (borrowed_audio) |*lease| lease.deinit(self.allocator);
+        if (payload == .video and self.request.needs_audio) {
+            output_payload.video.audio_failure = self.audio_failure;
+            if (self.audio_provider) |provider| {
+                const start: u128 = @intCast(descriptor.coordinates.start_ns orelse return error.InvalidChunkCoordinates);
+                const end: u128 = @intCast(descriptor.coordinates.end_ns orelse return error.InvalidChunkCoordinates);
+                const first = std.math.cast(usize, @divFloor(start * provider.sample_rate + std.time.ns_per_s - 1, std.time.ns_per_s)) orelse return error.InvalidChunkCoordinates;
+                const last = std.math.cast(usize, @divFloor(end * provider.sample_rate + std.time.ns_per_s - 1, std.time.ns_per_s)) orelse return error.InvalidChunkCoordinates;
+                borrowed_audio = if (first >= provider.samples) .{ .pcm = .{ .samples = &.{}, .sample_rate = provider.sample_rate } } else provider.read(provider.context, self.allocator, first, @min(last, provider.samples)) catch |err| blk: {
+                    if (abort(err)) return err;
+                    output_payload.video.audio_failure = err;
+                    break :blk null;
+                };
+                if (borrowed_audio) |lease| {
+                    output_payload.video.audio = lease.pcm;
+                    output_payload.video.audio_start_ns = std.math.cast(i64, @divFloor(@as(u128, first) * std.time.ns_per_s, provider.sample_rate)) orelse return error.InvalidChunkCoordinates;
+                }
+            }
+        }
+        if (self.request.execute_outputs) {
+            if (self.request.output_executor) |consumer| item.outputs = try consumer.execute(consumer.context, output_arena.allocator(), output_payload, descriptor, item.context, result, item.failure, self.request.allow_partial);
+        }
+        var required_failure = item.failure != null;
+        var optional_failure = false;
+        var coverage = self.summary.output_counts;
+        if (if (self.request.execute_outputs) self.request.outputs else null) |config| {
+            for (config.targets, 0..) |target, index| {
+                var seen: usize = 0;
+                for (item.outputs) |value| {
+                    if (!std.mem.eql(u8, value.name, target.name)) continue;
+                    try value.validate(target);
+                    if (value.kind != target.kind or value.required != target.required or !std.mem.eql(u8, value.model, target.model) or value.sub_index != seen) return error.InvalidChunkOutput;
+                    seen += 1;
+                    if (value.status == .failed) {
+                        coverage[index].failed += 1;
+                        if (target.required) required_failure = true else optional_failure = true;
+                    } else if (value.status == .skipped) coverage[index].skipped += 1 else coverage[index].complete += 1;
+                }
+                if (seen == 0) return error.InvalidChunkOutput;
+            }
+            for (item.outputs) |value| {
+                var known = false;
+                for (config.targets) |target| if (std.mem.eql(u8, value.name, target.name)) {
+                    known = true;
+                    break;
+                };
+                if (!known) return error.InvalidChunkOutput;
+            }
+        }
         if (self.request.native_content and payload == .text) item.text = payload.text;
         var content: ?[]u8 = null;
         defer if (content) |bytes| self.allocator.free(bytes);
@@ -210,8 +292,10 @@ pub const Runner = struct {
         };
         try self.sink.accept(self.sink.context, item);
         self.summary.emitted += 1;
-        self.summary.failed += @intFromBool(item.failure != null);
-        if (item.failure != null and self.summary.retry_ordinal == null) self.summary.retry_ordinal = ordinal;
+        self.summary.output_counts = coverage;
+        self.summary.degraded = self.summary.degraded or optional_failure;
+        self.summary.failed += @intFromBool(required_failure);
+        if (required_failure and self.summary.retry_ordinal == null) self.summary.retry_ordinal = ordinal;
         self.summary.next_ordinal = self.ordinal;
         return true;
     }
@@ -242,7 +326,8 @@ pub const Runner = struct {
             },
         }
         if (!self.stopped and self.ordinal < self.summary.start_ordinal) return error.InvalidChunkContinuation;
-        self.summary.complete = !self.stopped and self.summary.failed == 0;
+        self.summary.source_complete = !self.stopped;
+        self.summary.complete = self.summary.source_complete and self.summary.failed == 0;
         return self.summary;
     }
     fn textChunks(self: *Runner, bytes: []const u8, page: ?u32) !void {
@@ -478,16 +563,32 @@ pub const Runner = struct {
         const adapter = self.control.imageWorkControl();
         var source = media.source.Source{ .allocator = self.allocator, .storage = supplied.storage, .identity = supplied.identity, .limits = supplied.limits, .admission_pool = &self.pool, .control = .{ .context = adapter.context, .check_fn = adapter.check_fn } };
         const mime = self.request.input.binary.mime_type;
-        if (std.ascii.startsWithIgnoreCase(mime, "video/")) {
+        if (std.ascii.startsWithIgnoreCase(mime, "video/") and !self.request.audio_boundary) {
             var prefix = try source.read(0, @intCast(@min(4, source.length())));
             const webm = prefix.bytes.len == 4 and std.mem.eql(u8, prefix.bytes, "\x1a\x45\xdf\xa3");
             prefix.deinit();
             if (webm) {
+                var audio_track: ?@import("media_chunking_audio_source.zig").Track = if (self.request.needs_audio) @import("media_chunking_audio_source.zig").Track.init(self.allocator, &source, self.control, self.request.max_working_bytes, self.request.limits.max_index_packets) catch |err| blk: {
+                    if (abort(err) and err != error.AudioTooLarge) return err;
+                    self.audio_failure = err;
+                    break :blk null;
+                } else null;
+                defer if (audio_track) |*track_owner| track_owner.deinit();
+                if (audio_track) |*track_owner| self.audio_provider = track_owner.provider();
+                defer self.audio_provider = null;
                 var reader = try media.webm.Reader.init(self.allocator, &source, .{ .max_packets = self.request.limits.max_index_packets });
                 defer reader.deinit();
                 try self.webmWindows(&reader);
                 return;
             } else {
+                var audio_track: ?@import("media_chunking_audio_source.zig").Track = if (self.request.needs_audio) @import("media_chunking_audio_source.zig").Track.init(self.allocator, &source, self.control, self.request.max_working_bytes, self.request.limits.max_index_packets) catch |err| blk: {
+                    if (abort(err) and err != error.AudioTooLarge) return err;
+                    self.audio_failure = err;
+                    break :blk null;
+                } else null;
+                defer if (audio_track) |*track_owner| track_owner.deinit();
+                if (audio_track) |*track_owner| self.audio_provider = track_owner.provider();
+                defer self.audio_provider = null;
                 var reader = try media.mp4.Reader.init(self.allocator, &source, .{ .max_samples = self.request.limits.max_index_packets, .max_index_bytes = @min(self.request.max_working_bytes, try std.math.mul(usize, self.request.limits.max_index_packets, @sizeOf(media.mp4.Packet))) });
                 defer reader.deinit();
                 var owner = try @import("media_chunking_video.zig").Owner.init(self.allocator, &reader, &self.pool, self.request.limits);
@@ -495,6 +596,12 @@ pub const Runner = struct {
                 try self.videoWindows(&.{}, &reader, try owner.durationNs(), owner.origin, reader.track.timescale, &owner, null);
                 return;
             }
+        }
+        if ((self.request.audio_boundary and std.ascii.startsWithIgnoreCase(mime, "video/")) or (std.ascii.startsWithIgnoreCase(mime, "audio/") and audio.detectFormatFromMime(mime) == .mp4)) {
+            var audio_track = try @import("media_chunking_audio_source.zig").Track.init(self.allocator, &source, self.control, self.request.max_working_bytes, self.request.limits.max_index_packets);
+            defer audio_track.deinit();
+            try self.soundWindows(audio_track.provider());
+            return;
         }
         if (audio.detectFormatFromMime(mime)) |format| if (format == .wav) {
             var wav = @import("media_chunking_audio.zig").SourceWav{ .layout = try audio.wav.readSourceLayout(&source), .source = &source };
@@ -518,14 +625,31 @@ pub const Runner = struct {
         if (std.ascii.startsWithIgnoreCase(essence, "text/") or std.ascii.eqlIgnoreCase(essence, "application/json")) try self.textChunks(bytes, null) else if (std.ascii.eqlIgnoreCase(essence, "application/pdf")) try self.document(bytes) else if (std.ascii.eqlIgnoreCase(essence, "image/gif")) try self.animation(bytes) else if (std.ascii.startsWithIgnoreCase(essence, "image/")) try self.still(bytes) else if (std.ascii.startsWithIgnoreCase(essence, "audio/")) try self.sound(bytes) else if (std.ascii.startsWithIgnoreCase(essence, "video/")) try self.movie(bytes) else return error.UnsupportedChunkMediaType;
     }
     fn movie(self: *Runner, bytes: []const u8) !void {
+        if (self.request.audio_boundary) return self.sound(bytes);
         const adapter = self.control.imageWorkControl();
         const content_identity = std.fmt.bytesToHex(self.summary.identity.source, .lower);
         var source = media.source.Source{ .allocator = self.allocator, .storage = .{ .borrowed = bytes }, .identity = &content_identity, .limits = .{ .max_total_bytes = 512 * 1024 * 1024 }, .admission_pool = &self.pool, .control = .{ .context = adapter.context, .check_fn = adapter.check_fn } };
         if (bytes.len >= 4 and std.mem.eql(u8, bytes[0..4], "\x1a\x45\xdf\xa3")) {
+            var audio_track: ?@import("media_chunking_audio_source.zig").Track = if (self.request.needs_audio) @import("media_chunking_audio_source.zig").Track.init(self.allocator, &source, self.control, self.request.max_working_bytes, self.request.limits.max_index_packets) catch |err| blk: {
+                if (abort(err) and err != error.AudioTooLarge) return err;
+                self.audio_failure = err;
+                break :blk null;
+            } else null;
+            defer if (audio_track) |*track_owner| track_owner.deinit();
+            if (audio_track) |*track_owner| self.audio_provider = track_owner.provider();
+            defer self.audio_provider = null;
             var reader = try media.webm.Reader.init(self.allocator, &source, .{ .max_packets = self.request.limits.max_index_packets });
             defer reader.deinit();
             try self.webmWindows(&reader);
         } else {
+            var audio_track: ?@import("media_chunking_audio_source.zig").Track = if (self.request.needs_audio) @import("media_chunking_audio_source.zig").Track.init(self.allocator, &source, self.control, self.request.max_working_bytes, self.request.limits.max_index_packets) catch |err| blk: {
+                if (abort(err) and err != error.AudioTooLarge) return err;
+                self.audio_failure = err;
+                break :blk null;
+            } else null;
+            defer if (audio_track) |*track_owner| track_owner.deinit();
+            if (audio_track) |*track_owner| self.audio_provider = track_owner.provider();
+            defer self.audio_provider = null;
             var input = try @import("embedding_gemma2_video.zig").PacketInput.init(self.allocator, &source, bytes);
             defer input.deinit();
             var owner = try @import("media_chunking_video.zig").Owner.init(self.allocator, &input.reader, &self.pool, self.request.limits);
@@ -1348,4 +1472,47 @@ test "model aware media video backbone cohorts preserve acknowledgements and pre
     try std.testing.expectEqual(@as(usize, 3), fake.accepted);
     try std.testing.expectEqual(@as(u64, 3), runner.summary.next_ordinal);
     try std.testing.expectEqual(media.admission.Resources{}, runner.pool.snapshot());
+}
+
+test "model aware media outputs preserve boundary plans and distinguish required coverage from optional degradation" {
+    const Fixture = struct {
+        required: bool = false,
+        reject_delivery: bool = false,
+        fn execute(raw: *anyopaque, a: std.mem.Allocator, _: Payload, _: planning.Descriptor, _: ?EmbeddingContext, primary: ?Output, _: ?anyerror, _: bool) anyerror![]const output_types.Result {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const values = try a.alloc(output_types.Result, 2);
+            values[0] = .{ .name = "clip", .kind = .embedding, .required = true, .model = "clip", .model_identity = "1111111111111111111111111111111111111111111111111111111111111111", .model_revision = "2222222222222222222222222222222222222222222222222222222222222222", .recipe_id = "3333333333333333333333333333333333333333333333333333333333333333", .status = .complete, .embedding = primary.?.vector };
+            values[1] = .{ .name = "events", .kind = .classify, .required = self.required, .model = "events", .model_identity = "1111111111111111111111111111111111111111111111111111111111111111", .model_revision = "2222222222222222222222222222222222222222222222222222222222222222", .recipe_id = "3333333333333333333333333333333333333333333333333333333333333333", .status = .failed, .code = "InvalidClassifierOutput" };
+            return values;
+        }
+        fn accept(raw: *anyopaque, item: Item) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.reject_delivery) return error.BrokenPipe;
+            try std.testing.expectEqual(@as(usize, 2), item.outputs.len);
+            try std.testing.expect(item.outputs[0].embedding != null);
+            try std.testing.expectEqualStrings("InvalidClassifierOutput", item.outputs[1].code.?);
+        }
+    };
+    const a = std.testing.allocator;
+    var fixture = Fixture{};
+    var target = [_]output_types.Target{ .{ .name = "clip", .kind = .embedding, .model = "clip" }, .{ .name = "events", .kind = .classify, .model = "events", .required = false } };
+    var executor = Qualification{};
+    const request = Request{ .input = .{ .text = "hello" }, .outputs = .{ .boundary_model = "clip", .targets = &target }, .output_executor = .{ .context = &fixture, .execute = Fixture.execute }, .allow_partial = true };
+    var runner = try Runner.init(a, request, executor.executor(), .{}, .{ .context = &fixture, .accept = Fixture.accept });
+    const optional = try runner.run();
+    try std.testing.expect(optional.complete and optional.source_complete and optional.degraded);
+    try std.testing.expectEqual(@as(usize, 1), optional.output_counts[0].complete);
+    try std.testing.expectEqual(@as(usize, 1), optional.output_counts[1].failed);
+    fixture.required = true;
+    target[1].required = true;
+    runner = try Runner.init(a, request, executor.executor(), .{}, .{ .context = &fixture, .accept = Fixture.accept });
+    const required = try runner.run();
+    try std.testing.expect(!required.complete and required.source_complete and !required.degraded);
+    try std.testing.expectEqualSlices(u8, &optional.identity.plan, &required.identity.plan);
+    try std.testing.expectEqual(@as(usize, 1), required.failed);
+    fixture.reject_delivery = true;
+    runner = try Runner.init(a, request, executor.executor(), .{}, .{ .context = &fixture, .accept = Fixture.accept });
+    try std.testing.expectError(error.BrokenPipe, runner.run());
+    try std.testing.expectEqual(@as(u64, 0), runner.summary.next_ordinal);
+    try std.testing.expectEqual(@as(usize, 0), runner.summary.output_counts[1].failed);
 }

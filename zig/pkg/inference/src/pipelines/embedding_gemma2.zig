@@ -377,6 +377,8 @@ pub const MediaTimings = struct {
     device_owned_peak_bytes: ?u64 = null,
 };
 pub const Options = struct {
+    video_prepared_frames: ?[]const @import("embedding_gemma2_video.zig").PreparedFrame = null,
+    video_observer: ?@import("antfly_video").preparation.FrameObserver = null,
     video_coefficients: ?*const @import("antfly_video").preparation.CoefficientCache = null,
     video_inspection_scope: ?*@import("embedding_gemma2_video.zig").InspectionScope = null,
     video_cache_pins: ?*@import("embedding_gemma2_video.zig").CachePins = null,
@@ -962,7 +964,7 @@ fn embedScoped(bounded: *@import("../runtime/bounded_allocator.zig").BoundedAllo
         prefetched = ahead.producer;
         if (prefetched) |producer| options.video_coefficients = producer.coefficients;
     }
-    if (has_video and prefetched == null) {
+    if (has_video and prefetched == null and options.video_observer == null and options.video_prepared_frames == null) {
         const context = try factory.videoPreparationContext(session, command_slots != 0);
         options.video_coefficients = context.coefficients;
         if (effective.io orelse context.io) |io| {
@@ -2365,7 +2367,7 @@ fn prepareGroupCombined(a: std.mem.Allocator, cb: *const ComputeBackend, tokeniz
                 } else if (!used_prefetch and prefetched != null) blk: {
                     used_prefetch = true;
                     break :blk try prefetched.?.encodeAllocStaged(a, cb, cb.embedding_stage);
-                } else try @import("embedding_gemma2_video.zig").encodeConfigured(a, cb, bytes, if (@TypeOf(payload) == SampledVideo) payload.reader else null, effective, .{ .stage = cb.embedding_stage, .sampling = sampling, .pool = video_budget, .selection = if (@TypeOf(payload) == SampledVideo) payload.selection else null, .webm = if (@TypeOf(payload) == SampledVideo) payload.webm else null, .cache = cache, .decoder = options.video_decoder, .cache_pins = options.video_cache_pins, .inspection_scope = options.video_inspection_scope, .coefficients = options.video_coefficients });
+                } else try @import("embedding_gemma2_video.zig").encodeConfigured(a, cb, bytes, if (@TypeOf(payload) == SampledVideo) payload.reader else null, effective, .{ .prepared_frames = options.video_prepared_frames, .observer = options.video_observer, .stage = cb.embedding_stage, .sampling = sampling, .pool = video_budget, .selection = if (@TypeOf(payload) == SampledVideo) payload.selection else null, .webm = if (@TypeOf(payload) == SampledVideo) payload.webm else null, .cache = cache, .decoder = options.video_decoder, .cache_pins = options.video_cache_pins, .inspection_scope = options.video_inspection_scope, .coefficients = options.video_coefficients });
                 defer encoded.deinit(a);
                 var count_video: usize = 0;
                 for (encoded.frame_tokens) |frame_count| count_video += frame_count;

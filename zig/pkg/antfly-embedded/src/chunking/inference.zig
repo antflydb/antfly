@@ -49,7 +49,11 @@ const ChunkInputWithContextFn = *const fn (
     config: chunking_types.Config,
     context: execution_context.RequestContext,
 ) anyerror![]inference_chunker.Chunk;
+pub const ChunkPage = inference_chunker.types.ChunkPage;
+pub const RemoteMetadata = inference_chunker.types.ModelMetadata;
+const ChunkPageWithContextFn = *const fn (*anyopaque, Allocator, []const u8, inference_chunker.Input, chunking_types.Config, execution_context.RequestContext) anyerror!ChunkPage;
 const ChunkProviderVTable = struct {
+    chunk_page_with_context: ?ChunkPageWithContextFn = null,
     chunk_input: ?ChunkInputFn = null,
     chunk_input_with_context: ?ChunkInputWithContextFn = null,
 };
@@ -98,6 +102,10 @@ pub fn chunkTextWithProvider(
 pub fn chunkMediaWithProvider(a: Allocator, cfg: chunking_types.Config, input: RemoteInput, provider: ?chunk_provider.Provider) ![]Chunk {
     const source = try chunkInputWithProvider(a, cfg, input, provider);
     defer freeRemoteChunks(a, source);
+    return cloneMediaChunks(a, source);
+}
+
+pub fn cloneMediaChunks(a: Allocator, source: []const RemoteChunk) ![]Chunk {
     const chunks = try a.alloc(Chunk, source.len);
     var initialized: usize = 0;
     errdefer {
@@ -135,20 +143,54 @@ pub fn chunkInputWithProvider(
     input: RemoteInput,
     antfly_provider: ?chunk_provider.Provider,
 ) ![]RemoteChunk {
+    return chunkInputDispatch(false, alloc, cfg, input, antfly_provider);
+}
+
+pub fn supportsPagedCalls(cfg: chunking_types.Config, provider: ?chunk_provider.Provider) bool {
+    const resolved = provider orelse return true;
+    if (resolved.chunk_page_with_context_callback != null) return true;
+    const has_legacy = resolved.chunk_input_callback != null or resolved.chunk_input_with_context_callback != null;
+    const trimmed = std.mem.trim(u8, cfg.api_url, " \t\r\n");
+    return resolved.execution.resolveAntflyEndpoint(if (trimmed.len != 0) trimmed else null, has_legacy) != null or !has_legacy;
+}
+
+pub fn chunkPageWithProvider(alloc: Allocator, cfg: chunking_types.Config, input: RemoteInput, provider: ?chunk_provider.Provider) !ChunkPage {
+    if (!cfg.page or cfg.max_chunks == 0 or !cfg.isModelAware()) return error.InvalidChunkerConfig;
+    const empty = switch (input) {
+        .text => |value| value.len == 0,
+        .binary => |value| value.data.len == 0,
+        .source => false,
+    };
+    if (empty and cfg.replay == null) {
+        const chunks = try alloc.alloc(RemoteChunk, 0);
+        errdefer alloc.free(chunks);
+        const plan = try alloc.dupe(u8, "");
+        errdefer alloc.free(plan);
+        const source = try alloc.dupe(u8, "");
+        errdefer alloc.free(source);
+        return .{ .chunks = chunks, .plan_id = plan, .source_fingerprint = source, .source_version = try alloc.dupe(u8, ""), .start_ordinal = 0, .covered_through_ordinal = 0, .complete = true };
+    }
+    var page = try chunkInputDispatch(true, alloc, cfg, input, provider);
+    errdefer page.deinit(alloc);
+    if (input == .source and !std.mem.eql(u8, input.source.version, page.source_version)) return error.EnrichmentSourceChanged;
+    return page;
+}
+
+fn chunkInputDispatch(comptime paged: bool, alloc: Allocator, cfg: chunking_types.Config, input: RemoteInput, antfly_provider: ?chunk_provider.Provider) !(if (paged) ChunkPage else []RemoteChunk) {
     // An empty source has nothing to chunk. Short-circuit before any
     // provider or remote dispatch: the inference endpoint rejects an empty
     // input as a 400 that the retry classifier treats as transient, which
     // turns a permanently empty document field into a retry loop instead of
     // a clean zero-chunk skip.
-    switch (input) {
-        .source => if (cfg.embedding == null) return error.ModelAwareChunkProviderRequired,
+    if (!paged) switch (input) {
+        .source => if (!cfg.isModelAware()) return error.ModelAwareChunkProviderRequired,
         .text => |text| if (text.len == 0) return try alloc.alloc(RemoteChunk, 0),
         .binary => |binary| if (binary.data.len == 0) return try alloc.alloc(RemoteChunk, 0),
-    }
+    };
     const execution: execution_context.Context = if (antfly_provider) |provider| provider.execution else .{};
     try execution.check(platform_time.monotonicNs());
     const linked_callback_available = if (antfly_provider) |provider|
-        provider.chunk_input_with_context_callback != null or provider.chunk_input_callback != null
+        if (paged) provider.chunk_page_with_context_callback != null else provider.chunk_input_with_context_callback != null or provider.chunk_input_callback != null
     else
         false;
     const trimmed_endpoint = std.mem.trim(u8, cfg.api_url, " \t\r\n");
@@ -169,6 +211,14 @@ pub fn chunkInputWithProvider(
             std.Io.Threaded.global_single_threaded.io();
         const request_context = execution.requestContext(io);
         try request_context.check();
+        if (paged) {
+            const callback: ChunkPageWithContextFn = @ptrCast(@alignCast(provider.chunk_page_with_context_callback orelse return error.InvalidChunkProvider));
+            var page = try ChunkProviderBoundary.call("chunk_page_with_context", dispatch, callback, .{ ptr, alloc, if (cfg.model.len > 0) cfg.model else "fixed", input, cfg, request_context });
+            errdefer page.deinit(alloc);
+            try validateChunkPage(cfg, page);
+            try request_context.check();
+            return page;
+        }
         const chunks = if (provider.chunk_input_with_context_callback) |callback| blk: {
             const chunk_input: ChunkInputWithContextFn = @ptrCast(@alignCast(callback));
             break :blk try ChunkProviderBoundary.call("chunk_input_with_context", dispatch, chunk_input, .{ ptr, alloc, if (cfg.model.len > 0) cfg.model else "fixed", input, cfg, request_context });
@@ -181,11 +231,14 @@ pub fn chunkInputWithProvider(
         try request_context.check();
         return try cloneRemoteChunks(alloc, chunks);
     };
-    const endpoint_raw = resolved_endpoint orelse return try chunkInputDirect(alloc, cfg, input);
+    const endpoint_raw = resolved_endpoint orelse {
+        if (paged) return error.ModelAwareChunkProviderRequired;
+        return try chunkInputDirect(alloc, cfg, input);
+    };
     // Browser storage uses direct chunking or a host callback. Native HTTP
     // discovery/sockets are unavailable in a freestanding module.
     if (comptime builtin.os.tag == .freestanding) return error.UnsupportedPlatform;
-    if (cfg.model.len == 0 and cfg.embedding == null) return error.InvalidChunkerConfig;
+    if (cfg.model.len == 0 and !cfg.isModelAware()) return error.InvalidChunkerConfig;
     // Unlike `managed_embedder.zig`'s embedder/extractor base URLs, a
     // chunker's `api_url` reached this call unnormalized: a bare
     // `host:port` (the natural way to configure "the same inference
@@ -222,8 +275,14 @@ pub fn chunkInputWithProvider(
         fallback_capability_cache = remote_capabilities.Cache.init(alloc, http.io);
         capability_cache = &fallback_capability_cache.?;
     }
-    const model = if (cfg.embedding) |target| target.model else if (cfg.model.len > 0) cfg.model else "fixed";
-    const capability_task: inference_work.Operation = if (cfg.embedding != null) .embed else .chunk;
+    var resolved_outputs: ?std.json.Parsed(inference_chunker.outputs.Config) = if (cfg.outputs_json.len > 0) try std.json.parseFromSlice(inference_chunker.outputs.Config, alloc, cfg.outputs_json, .{}) else null;
+    defer if (resolved_outputs) |*value| value.deinit();
+    if (cfg.embedding) |legacy| if (resolved_outputs) |*value| {
+        value.value = try value.value.includingEmbedding(value.arena.allocator(), .{ .name = "embedding", .kind = .embedding, .model = legacy.model, .model_identity = legacy.model_identity, .task_type = legacy.task_type orelse "RETRIEVAL_DOCUMENT", .dimensions = if (legacy.dimensions) |n| std.math.cast(usize, n) orelse return error.InvalidChunkOutputs else null });
+    };
+    const boundary = if (resolved_outputs) |value| try value.value.boundary() else null;
+    const model = if (boundary) |value| value.model else if (cfg.embedding) |target| target.model else if (cfg.model.len > 0) cfg.model else "fixed";
+    const capability_task: inference_work.Operation = if (boundary) |value| if (value.kind == .transcribe) .transcribe else .embed else if (cfg.embedding != null) .embed else .chunk;
     var routing_header_storage: [1][2][]const u8 = undefined;
     const routing_header_count = try execution.routing.appendHeaders(&routing_header_storage, 0);
     const routing_headers = routing_header_storage[0..routing_header_count];
@@ -237,7 +296,7 @@ pub fn chunkInputWithProvider(
     );
     var attachment_transport: inference_work.AttachmentTransport = .base64_payload;
     if (capability_lease.capabilities) |capabilities| {
-        if (cfg.embedding != null and !capabilities.model_aware_chunking_v1) return error.ModelAwareChunkProviderRequired;
+        if (cfg.isModelAware() and !capabilities.model_aware_chunking_v1) return error.ModelAwareChunkProviderRequired;
         if (capabilities.framed_attachments and switch (input) {
             .binary => true,
             .text, .source => false,
@@ -252,7 +311,7 @@ pub fn chunkInputWithProvider(
             },
             .binary => |binary| .{
                 .item_count = 1,
-                .modalities = if (cfg.embedding != null and std.ascii.startsWithIgnoreCase(binary.mime_type, "video/")) .{ .image = true } else inference_work.modalityForMimeType(binary.mime_type) orelse
+                .modalities = if (cfg.isModelAware() and std.ascii.startsWithIgnoreCase(binary.mime_type, "video/")) .{ .image = true } else inference_work.modalityForMimeType(binary.mime_type) orelse
                     return error.UnsupportedChunkMediaType,
                 .encoded_media_bytes = try attachment_transport.wireSize(
                     binary.data.len,
@@ -261,7 +320,7 @@ pub fn chunkInputWithProvider(
                 .max_media_parts_per_item = 1,
             },
         };
-        if (cfg.embedding == null) try capabilities.validateInvocation(.chunk, shape);
+        if (!cfg.isModelAware()) try capabilities.validateInvocation(.chunk, shape);
     }
 
     const url = try std.fmt.allocPrint(alloc, "{s}/chunk", .{endpoint});
@@ -320,9 +379,21 @@ pub fn chunkInputWithProvider(
             try capability_cache.?.invalidate(endpoint, model, capability_task, routing_headers);
             return error.InferenceCapabilitiesStale;
         }
+        if (paged and resp.status.code == 409) {
+            if (std.json.parseFromSlice(struct { @"error": []const u8 }, alloc, resp.body orelse "", .{ .ignore_unknown_fields = true })) |failure| {
+                defer failure.deinit();
+                return remoteChunkFailure(failure.value.@"error");
+            } else |_| {}
+        }
         return error.ChunkRequestFailed;
     }
     const response_body = resp.body orelse return error.EmptyResponse;
+    if (paged) {
+        var page = try parseModelChunkStream(alloc, response_body, cfg);
+        errdefer page.deinit(alloc);
+        try execution.check(platform_time.monotonicNs());
+        return page;
+    }
     const chunks = if (cfg.replay) |replay| try parseModelChunkResponse(alloc, response_body, replay) else try parseChunkResponse(alloc, response_body);
     errdefer inference_chunker.types.freeChunks(alloc, chunks);
     try validateModelChunks(cfg, chunks);
@@ -331,11 +402,46 @@ pub fn chunkInputWithProvider(
 }
 
 fn validateModelChunks(cfg: chunking_types.Config, chunks: []const RemoteChunk) !void {
+    if (cfg.outputs_json.len != 0) {
+        const a = std.heap.smp_allocator;
+        var config = try std.json.parseFromSlice(inference_chunker.outputs.Config, a, cfg.outputs_json, .{});
+        defer config.deinit();
+        if (cfg.embedding) |legacy| config.value = try config.value.includingEmbedding(config.arena.allocator(), .{ .name = "embedding", .kind = .embedding, .model = legacy.model, .model_identity = legacy.model_identity, .task_type = legacy.task_type orelse "RETRIEVAL_DOCUMENT", .dimensions = if (legacy.dimensions) |n| std.math.cast(usize, n) orelse return error.InvalidChunkOutputs else null });
+        const boundary = try config.value.boundary();
+        for (chunks) |chunk| {
+            const metadata = chunk.metadata orelse return error.ModelAwareChunkProviderRequired;
+            if (!std.mem.eql(u8, metadata.model, boundary.model)) return error.InvalidChunkOutput;
+            const results_json = metadata.outputs_json orelse return error.InvalidChunkOutput;
+            var results = try std.json.parseFromSlice([]inference_chunker.outputs.Result, a, results_json, .{});
+            defer results.deinit();
+            for (config.value.targets) |target| {
+                var seen: usize = 0;
+                for (results.value) |result| if (std.mem.eql(u8, result.name, target.name)) {
+                    try result.validate(target);
+                    if (result.sub_index != seen) return error.InvalidChunkOutput;
+                    if (result.status == .failed and !cfg.page) return error.IncompleteChunkCoverage;
+                    seen += 1;
+                };
+                if (seen == 0) return error.InvalidChunkOutput;
+            }
+            for (results.value) |result| {
+                var known = false;
+                for (config.value.targets) |target| if (std.mem.eql(u8, result.name, target.name)) {
+                    known = true;
+                    break;
+                };
+                if (!known) return error.InvalidChunkOutput;
+            }
+        }
+        return;
+    }
     const target = cfg.embedding orelse return;
     for (chunks) |chunk| {
         const metadata = chunk.metadata orelse return error.ModelAwareChunkProviderRequired;
         if (!std.mem.eql(u8, target.model, metadata.model) or !std.mem.eql(u8, target.task_type orelse "RETRIEVAL_DOCUMENT", metadata.task_type)) return error.InvalidChunkerResponse;
+        if (target.model_identity) |identity| if (!std.mem.eql(u8, identity, metadata.model_identity)) return error.EmbeddingIdentityMismatch;
         if (target.dimensions) |dimensions| if (metadata.dimensions != dimensions) return error.InvalidChunkerResponse;
+        if (metadata.embedding_error != null and cfg.page) continue;
         if (target.execute orelse true) {
             const vector = metadata.embedding orelse return error.InvalidEmbeddingResponse;
             if (vector.len != metadata.dimensions or vector.len == 0) return error.InvalidEmbeddingResponse;
@@ -360,7 +466,7 @@ fn normalizedAntflyChunkEndpointAlloc(alloc: Allocator, raw: []const u8) ![]u8 {
 }
 
 fn chunkInputDirect(alloc: Allocator, cfg: chunking_types.Config, input: RemoteInput) ![]RemoteChunk {
-    if (cfg.embedding != null) return error.ModelAwareChunkProviderRequired;
+    if (cfg.isModelAware()) return error.ModelAwareChunkProviderRequired;
     var fixed_cfg = inference_chunker.FixedChunkConfig{};
     if (cfg.model.len > 0) fixed_cfg.model = cfg.model;
     if (cfg.max_chunks > 0) fixed_cfg.max_chunks = @intCast(cfg.max_chunks);
@@ -430,17 +536,26 @@ fn convertOptional(comptime T: type, value: anytype) ?T {
     return converted;
 }
 
+fn requestEmbedding(cfg: chunking_types.Config) ?inference_api.ChunkEmbeddingTarget {
+    var target = convertOptional(inference_api.ChunkEmbeddingTarget, cfg.embedding) orelse return null;
+    if (cfg.page) target.allow_partial = true;
+    return target;
+}
+
 fn encodeChunkRequest(
     alloc: Allocator,
     cfg: chunking_types.Config,
     input: RemoteInput,
     attachment_transport: inference_work.AttachmentTransport,
 ) !EncodedChunkRequest {
+    var output_config: ?std.json.Parsed(inference_api.ChunkOutputs) = if (cfg.outputs_json.len != 0) try std.json.parseFromSlice(inference_api.ChunkOutputs, alloc, cfg.outputs_json, .{}) else null;
+    defer if (output_config) |*value| value.deinit();
+    const requested_outputs = if (output_config) |value| value.value else null;
     const continuation = if (cfg.replay) |replay| try std.fmt.allocPrint(alloc, "{s}:{d}", .{ replay.plan_id, replay.ordinal }) else null;
     defer if (continuation) |cursor| alloc.free(cursor);
     const config: inference_api.ChunkConfig = .{
         .model = cfg.model,
-        .max_chunks = if (cfg.replay != null) 1 else if (cfg.max_chunks > 0) cfg.max_chunks else null,
+        .max_chunks = if (cfg.replay != null and !cfg.page) 1 else if (cfg.max_chunks > 0) cfg.max_chunks else null,
         .threshold = cfg.threshold,
         .text = if (cfg.text.target_tokens > 0 or cfg.text.overlap_tokens > 0 or cfg.text.separator.len > 0) .{
             .target_tokens = if (cfg.text.target_tokens > 0) cfg.text.target_tokens else null,
@@ -455,17 +570,20 @@ fn encodeChunkRequest(
 
     switch (input) {
         .source => |reference| {
-            if (cfg.embedding == null) return error.ModelAwareChunkProviderRequired;
-            const request = .{ .input = .{ .type = "source", .uri = reference.uri, .mime_type = reference.mime_type, .version = reference.version, .version_kind = @tagName(reference.version_kind), .length = reference.length }, .config = config, .embedding = convertOptional(inference_api.ChunkEmbeddingTarget, cfg.embedding), .policy = convertOptional(inference_api.MediaChunkPolicy, cfg.policy), .include_content = true, .continuation = continuation, .source_version = if (cfg.replay) |replay| replay.source_version else null };
+            if (!cfg.isModelAware()) return error.ModelAwareChunkProviderRequired;
+            const request = .{ .input = .{ .type = "source", .uri = reference.uri, .mime_type = reference.mime_type, .version = reference.version, .version_kind = @tagName(reference.version_kind), .length = reference.length }, .config = config, .outputs = requested_outputs, .allow_partial = if (cfg.page) true else null, .embedding = requestEmbedding(cfg), .policy = convertOptional(inference_api.MediaChunkPolicy, cfg.policy), .include_content = !cfg.page, .stream = cfg.page, .continuation = continuation, .source_version = if (cfg.replay) |replay| replay.source_version else null };
             return .{ .metadata_or_json = try httpx.json.Json.stringify(alloc, request) };
         },
         .text => |text| {
             const request = inference_api.ChunkRequest{
                 .input = .{ .string = text },
                 .config = config,
-                .embedding = convertOptional(inference_api.ChunkEmbeddingTarget, cfg.embedding),
+                .outputs = requested_outputs,
+                .allow_partial = if (cfg.page) true else null,
+                .embedding = requestEmbedding(cfg),
                 .policy = convertOptional(inference_api.MediaChunkPolicy, cfg.policy),
-                .include_content = if (cfg.embedding != null) true else null,
+                .include_content = if (cfg.isModelAware()) true else null,
+                .stream = if (cfg.page) true else null,
                 .continuation = continuation,
                 .source_version = if (cfg.replay) |replay| replay.source_version else null,
             };
@@ -481,9 +599,12 @@ fn encodeChunkRequest(
             const request = struct {
                 input: inference_api.MediaContentPart,
                 config: inference_api.ChunkConfig,
+                outputs: ?inference_api.ChunkOutputs,
+                allow_partial: ?bool,
                 embedding: ?inference_api.ChunkEmbeddingTarget,
                 policy: ?inference_api.MediaChunkPolicy,
                 include_content: ?bool,
+                stream: ?bool,
                 continuation: ?[]const u8,
                 source_version: ?[]const u8,
             }{
@@ -493,9 +614,12 @@ fn encodeChunkRequest(
                     .mime_type = binary.mime_type,
                 },
                 .config = config,
-                .embedding = convertOptional(inference_api.ChunkEmbeddingTarget, cfg.embedding),
+                .outputs = requested_outputs,
+                .allow_partial = if (cfg.page) true else null,
+                .embedding = requestEmbedding(cfg),
                 .policy = convertOptional(inference_api.MediaChunkPolicy, cfg.policy),
-                .include_content = if (cfg.embedding != null) true else null,
+                .include_content = if (cfg.isModelAware()) !cfg.page else null,
+                .stream = if (cfg.page) true else null,
                 .continuation = continuation,
                 .source_version = if (cfg.replay) |replay| replay.source_version else null,
             };
@@ -578,10 +702,17 @@ fn parseChunkResponse(alloc: Allocator, response_body: []const u8) ![]RemoteChun
 }
 
 fn parseModelChunkResponse(a: Allocator, body: []const u8, replay: ?chunking_types.Replay) ![]RemoteChunk {
+    return parseModelChunks(a, body, replay, false);
+}
+
+fn parseModelChunks(a: Allocator, body: []const u8, replay: ?chunking_types.Replay, paged: bool) ![]RemoteChunk {
     var parsed = try std.json.parseFromSlice(inference_api.ChunkEmbeddingResponse, a, body, .{ .ignore_unknown_fields = true });
     defer parsed.deinit();
     const response = parsed.value;
-    if (replay) |expected| {
+    if (paged) {
+        if (response.@"error") |failure| return remoteChunkFailure(failure.code);
+        if ((!std.mem.eql(u8, response.status, "complete") and !std.mem.eql(u8, response.status, "partial")) or response.start_ordinal < 0 or response.covered_through_ordinal < response.start_ordinal or response.covered_through_ordinal - response.start_ordinal != response.data.len) return error.IncompleteChunkCoverage;
+    } else if (replay) |expected| {
         if ((!std.mem.eql(u8, response.status, "complete") and !std.mem.eql(u8, response.status, "partial")) or response.gaps.len != 0 or response.data.len != 1 or response.@"error" != null or response.start_ordinal != expected.ordinal or response.covered_through_ordinal != expected.ordinal + 1 or !std.mem.eql(u8, expected.plan_id, response.plan_id) or !std.mem.eql(u8, expected.source_fingerprint, response.source_fingerprint) or !std.mem.eql(u8, expected.source_version, response.source_version)) return error.InvalidChunkReplay;
     } else if (!std.mem.eql(u8, response.status, "complete") or response.next_continuation != null or response.gaps.len != 0 or response.start_ordinal != 0 or response.covered_through_ordinal != response.data.len) return error.IncompleteChunkCoverage;
     if (response.source_fingerprint.len != 64 or response.plan_id.len != 64 or response.model_identity.len != 64 or response.source_version.len == 0 or response.dimensions < 0) return error.InvalidChunkerResponse;
@@ -596,8 +727,8 @@ fn parseModelChunkResponse(a: Allocator, body: []const u8, replay: ?chunking_typ
         a.free(chunks);
     }
     for (response.data, chunks, 0..) |item, *chunk, i| {
-        const ordinal: u64 = try std.math.add(u64, if (replay) |expected| expected.ordinal else 0, i);
-        if (item.@"error" != null or item.descriptor.ordinal != ordinal) return error.InvalidChunkerResponse;
+        const ordinal: u64 = try std.math.add(u64, if (paged) @intCast(response.start_ordinal) else if (replay) |expected| expected.ordinal else 0, i);
+        if ((!paged and item.@"error" != null) or item.descriptor.ordinal != ordinal) return error.InvalidChunkerResponse;
         var cursor: [85]u8 = undefined;
         if (!std.mem.eql(u8, item.descriptor.id, (inference_chunker.planning.Identity{ .plan = plan, .source = source }).cursor(ordinal, &cursor))) return error.InvalidChunkerResponse;
         const raw = item.descriptor.coordinates;
@@ -649,7 +780,9 @@ fn parseModelChunkResponse(a: Allocator, body: []const u8, replay: ?chunking_typ
         }
         chunk.start_char = if (coordinates.start_byte) |n| std.math.cast(u32, n) else null;
         chunk.end_char = if (coordinates.end_byte) |n| std.math.cast(u32, n) else null;
-        chunk.metadata = try (inference_chunker.types.ModelMetadata{ .descriptor = .{ .ordinal = ordinal, .coordinates = coordinates, .input_tokens = std.math.cast(usize, item.descriptor.input_tokens) orelse return error.InvalidChunkerResponse }, .inference_id = item.descriptor.id, .source_fingerprint = response.source_fingerprint, .source_version = response.source_version, .plan_id = response.plan_id, .model = response.model, .model_identity = response.model_identity, .model_revision = response.model_revision, .task_type = response.task_type, .dimensions = @intCast(response.dimensions), .policy = policy, .embedding = item.embedding }).clone(a);
+        const output_json = if (item.outputs) |values| try std.json.Stringify.valueAlloc(a, values, .{ .emit_null_optional_fields = false }) else null;
+        defer if (output_json) |bytes| a.free(bytes);
+        chunk.metadata = try (inference_chunker.types.ModelMetadata{ .descriptor = .{ .ordinal = ordinal, .coordinates = coordinates, .input_tokens = std.math.cast(usize, item.descriptor.input_tokens) orelse return error.InvalidChunkerResponse }, .inference_id = item.descriptor.id, .source_fingerprint = response.source_fingerprint, .source_version = response.source_version, .plan_id = response.plan_id, .model = response.model, .model_identity = response.model_identity, .model_revision = response.model_revision, .task_type = response.task_type, .dimensions = @intCast(response.dimensions), .policy = policy, .embedding = item.embedding, .embedding_error = if (item.@"error") |failure| failure.message else null, .outputs_json = output_json }).clone(a);
         chunk.owns_metadata = true;
     }
     return chunks;
@@ -1040,11 +1173,13 @@ test "antfly chunker execution-only provider preserves local fallback and cancel
     try std.testing.expectError(error.Canceled, chunkTextWithProvider(alloc, cfg, "alpha beta", provider));
 }
 
+const model_page_fixture =
+    \\{"object":"chunk.embedding.list","data":[{"descriptor":{"id":"1111111111111111111111111111111111111111111111111111111111111111:0","ordinal":0,"coordinates":{"kind":"video","start_ns":0,"end_ns":1000000000,"start_tick":0,"end_tick":90000,"timescale":90000},"input_tokens":144},"mime_type":"video/mp4","embedding":[0.6,0.8]}],"status":"complete","source_fingerprint":"2222222222222222222222222222222222222222222222222222222222222222","source_version":"v1","plan_id":"1111111111111111111111111111111111111111111111111111111111111111","model":"model","model_identity":"3333333333333333333333333333333333333333333333333333333333333333","model_revision":"4444444444444444444444444444444444444444444444444444444444444444","task_type":"RETRIEVAL_DOCUMENT","dimensions":2,"policy":{},"start_ordinal":0,"covered_through_ordinal":1,"gaps":[]}
+;
+
 test "model aware media transport retains vector provenance and rejects incomplete coverage" {
     const Fixture = struct {
-        const raw =
-            \\{"object":"chunk.embedding.list","data":[{"descriptor":{"id":"1111111111111111111111111111111111111111111111111111111111111111:0","ordinal":0,"coordinates":{"kind":"video","start_ns":0,"end_ns":1000000000,"start_tick":0,"end_tick":90000,"timescale":90000},"input_tokens":144},"mime_type":"video/mp4","embedding":[0.6,0.8]}],"status":"complete","source_fingerprint":"2222222222222222222222222222222222222222222222222222222222222222","source_version":"v1","plan_id":"1111111111111111111111111111111111111111111111111111111111111111","model":"model","model_identity":"3333333333333333333333333333333333333333333333333333333333333333","model_revision":"4444444444444444444444444444444444444444444444444444444444444444","task_type":"RETRIEVAL_DOCUMENT","dimensions":2,"policy":{},"start_ordinal":0,"covered_through_ordinal":1,"gaps":[]}
-        ;
+        const raw = model_page_fixture;
         fn qualify(a: Allocator) !void {
             const chunks = try parseChunkResponse(a, raw);
             defer freeRemoteChunks(a, chunks);
@@ -1062,4 +1197,179 @@ test "model aware media transport retains vector provenance and rejects incomple
     const partial = try std.mem.replaceOwned(u8, std.testing.allocator, Fixture.raw, "\"complete\"", "\"partial\"");
     defer std.testing.allocator.free(partial);
     try std.testing.expectError(error.IncompleteChunkCoverage, parseChunkResponse(std.testing.allocator, partial));
+}
+
+fn remoteChunkFailure(code: []const u8) anyerror {
+    if (std.mem.eql(u8, code, "StaleChunkContinuation") or std.mem.eql(u8, code, "SourceVersionChanged")) return error.StaleChunkContinuation;
+    if (std.mem.eql(u8, code, "EmbeddingIdentityMismatch")) return error.EmbeddingIdentityMismatch;
+    return error.ChunkRequestFailed;
+}
+
+fn parseModelChunkPage(a: Allocator, body: []const u8, cfg: chunking_types.Config) !ChunkPage {
+    var parsed = try std.json.parseFromSlice(inference_api.ChunkEmbeddingResponse, a, body, .{ .ignore_unknown_fields = true });
+    defer parsed.deinit();
+    const r = parsed.value;
+    const chunks = try parseModelChunks(a, body, cfg.replay, true);
+    errdefer freeRemoteChunks(a, chunks);
+    const plan = try a.dupe(u8, r.plan_id);
+    errdefer a.free(plan);
+    const source = try a.dupe(u8, r.source_fingerprint);
+    errdefer a.free(source);
+    const version = try a.dupe(u8, r.source_version);
+    errdefer a.free(version);
+    const page = ChunkPage{ .chunks = chunks, .plan_id = plan, .source_fingerprint = source, .source_version = version, .start_ordinal = @intCast(r.start_ordinal), .covered_through_ordinal = @intCast(r.covered_through_ordinal), .complete = r.source_complete orelse (std.mem.eql(u8, r.status, "complete") and r.next_continuation == null) };
+    if (r.next_continuation) |next| {
+        if (page.complete) return error.InvalidChunkerResponse;
+        var buffer: [85]u8 = undefined;
+        const expected = try std.fmt.bufPrint(&buffer, "{s}:{d}", .{ page.plan_id, page.covered_through_ordinal });
+        if (!std.mem.eql(u8, expected, next)) return error.InvalidChunkerResponse;
+    } else if (!page.complete) return error.IncompleteChunkCoverage;
+    var gaps: usize = 0;
+    for (chunks) |chunk| if (chunk.metadata.?.embedding_error != null) {
+        gaps += 1;
+    };
+    if (gaps != r.gaps.len) return error.InvalidChunkerResponse;
+    try validateChunkPage(cfg, page);
+    return page;
+}
+
+pub fn validateChunkPage(cfg: chunking_types.Config, page: ChunkPage) !void {
+    const start = if (cfg.replay) |position| position.ordinal else 0;
+    if (page.chunks.len != 0 or start != 0) {
+        if (page.plan_id.len != 64 or page.source_fingerprint.len != 64 or page.source_version.len == 0) return error.InvalidChunkerResponse;
+        var digest: [32]u8 = undefined;
+        _ = std.fmt.hexToBytes(&digest, page.plan_id) catch return error.InvalidChunkerResponse;
+        _ = std.fmt.hexToBytes(&digest, page.source_fingerprint) catch return error.InvalidChunkerResponse;
+    }
+    if (page.start_ordinal != start or page.covered_through_ordinal < start or page.covered_through_ordinal - start != page.chunks.len or page.chunks.len > cfg.max_chunks or (!page.complete and page.chunks.len == 0)) return error.IncompleteChunkCoverage;
+    if (cfg.replay) |position| if (!std.mem.eql(u8, position.plan_id, page.plan_id) or !std.mem.eql(u8, position.source_fingerprint, page.source_fingerprint) or !std.mem.eql(u8, position.source_version, page.source_version)) return error.StaleChunkContinuation;
+    for (page.chunks, 0..) |chunk, i| {
+        const metadata = chunk.metadata orelse return error.InvalidChunkerResponse;
+        if (metadata.model_identity.len != 64 or metadata.model_revision.len != 64) return error.InvalidChunkerResponse;
+        try metadata.descriptor.coordinates.validate();
+        try metadata.policy.validate();
+        var id_buffer: [85]u8 = undefined;
+        const expected_id = try std.fmt.bufPrint(&id_buffer, "{s}:{d}", .{ page.plan_id, start + i });
+        if (!std.mem.eql(u8, metadata.inference_id, expected_id)) return error.InvalidChunkerResponse;
+        if (metadata.descriptor.ordinal != start + i or chunk.id != start + i or !std.mem.eql(u8, metadata.plan_id, page.plan_id) or !std.mem.eql(u8, metadata.source_fingerprint, page.source_fingerprint) or !std.mem.eql(u8, metadata.source_version, page.source_version)) return error.InvalidChunkerResponse;
+        if (metadata.embedding_error != null and metadata.embedding != null) return error.InvalidChunkerResponse;
+    }
+    try validateModelChunks(cfg, page.chunks);
+}
+
+test "model aware media pages preserve continuation coverage and partial output failures" {
+    const a = std.testing.allocator;
+    const cfg = chunking_types.Config{ .provider = .antfly, .embedding = .{ .model = "model", .dimensions = 2 }, .page = true, .max_chunks = 1 };
+    var page = try parseModelChunkPage(a, model_page_fixture, cfg);
+    defer page.deinit(a);
+    try std.testing.expect(page.complete);
+    const partial = try std.mem.replaceOwned(u8, a, model_page_fixture, "\"status\":\"complete\"", "\"status\":\"partial\",\"next_continuation\":\"1111111111111111111111111111111111111111111111111111111111111111:1\"");
+    defer a.free(partial);
+    var prefix = try parseModelChunkPage(a, partial, cfg);
+    defer prefix.deinit(a);
+    try std.testing.expect(!prefix.complete);
+    var resumed = cfg;
+    resumed.replay = .{ .plan_id = page.plan_id, .source_fingerprint = page.source_fingerprint, .source_version = page.source_version, .ordinal = 1 };
+    try std.testing.expectError(error.IncompleteChunkCoverage, parseModelChunkPage(a, partial, resumed));
+    const empty = try std.mem.replaceOwned(u8, a, partial, "\"covered_through_ordinal\":1", "\"covered_through_ordinal\":0");
+    defer a.free(empty);
+    try std.testing.expectError(error.IncompleteChunkCoverage, parseModelChunkPage(a, empty, cfg));
+    const failed = try std.mem.replaceOwned(u8, a, model_page_fixture, "\"embedding\":[0.6,0.8]", "\"error\":{\"code\":\"CHUNK_EMBEDDING_FAILED\",\"message\":\"InvalidAudio\"}");
+    defer a.free(failed);
+    const gaps = try std.mem.replaceOwned(u8, a, failed, "\"gaps\":[]", "\"gaps\":[{\"kind\":\"video\",\"start_ns\":0,\"end_ns\":1000000000,\"start_tick\":0,\"end_tick\":90000,\"timescale\":90000}]");
+    defer a.free(gaps);
+    var degraded = try parseModelChunkPage(a, gaps, cfg);
+    defer degraded.deinit(a);
+    try std.testing.expect(degraded.complete);
+    try std.testing.expectEqualStrings("InvalidAudio", degraded.chunks[0].metadata.?.embedding_error.?);
+    try std.testing.expect(degraded.chunks[0].metadata.?.embedding == null);
+    const exhausted = try std.mem.replaceOwned(u8, a, gaps, "\"status\":\"complete\"", "\"status\":\"partial\",\"source_complete\":true");
+    defer a.free(exhausted);
+    var exhausted_page = try parseModelChunkPage(a, exhausted, cfg);
+    defer exhausted_page.deinit(a);
+    try std.testing.expect(exhausted_page.complete);
+}
+
+fn parseModelChunkStream(a: Allocator, body: []const u8, cfg: chunking_types.Config) !ChunkPage {
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const temporary = arena.allocator();
+    const Response = inference_api.ChunkEmbeddingResponse;
+    const WireItem = @typeInfo(@TypeOf(@as(Response, undefined).data)).pointer.child;
+    var header: ?inference_api.ChunkEmbeddingContext = null;
+    var terminal: ?Response = null;
+    var items: std.ArrayListUnmanaged(WireItem) = .empty;
+    var lines = std.mem.splitScalar(u8, body, '\n');
+    while (lines.next()) |line| {
+        const trimmed = std.mem.trim(u8, line, " \t\r");
+        if (trimmed.len == 0) continue;
+        if (terminal != null) return error.InvalidChunkerResponse;
+        const tag = try std.json.parseFromSliceLeaky(struct { object: []const u8 }, temporary, trimmed, .{ .ignore_unknown_fields = true });
+        if (std.mem.eql(u8, tag.object, "chunk.embedding.error")) {
+            const failure = try std.json.parseFromSliceLeaky(struct { code: []const u8 }, temporary, trimmed, .{ .ignore_unknown_fields = true });
+            return remoteChunkFailure(failure.code);
+        } else if (std.mem.eql(u8, tag.object, "chunk.embedding.start")) {
+            if (header != null or items.items.len != 0) return error.InvalidChunkerResponse;
+            header = (try std.json.parseFromSliceLeaky(struct { context: inference_api.ChunkEmbeddingContext }, temporary, trimmed, .{ .ignore_unknown_fields = true })).context;
+        } else if (std.mem.eql(u8, tag.object, "chunk.embedding")) {
+            if (header == null or items.items.len >= cfg.max_chunks) return error.InvalidChunkerResponse;
+            const event = try std.json.parseFromSliceLeaky(struct { data: WireItem }, temporary, trimmed, .{ .ignore_unknown_fields = true });
+            try items.append(temporary, event.data);
+        } else if (std.mem.eql(u8, tag.object, "chunk.embedding.complete")) {
+            if (header == null) return error.InvalidChunkerResponse;
+            terminal = (try std.json.parseFromSliceLeaky(struct { response: Response }, temporary, trimmed, .{ .ignore_unknown_fields = true })).response;
+        } else return error.InvalidChunkerResponse;
+    }
+    var response = terminal orelse return error.IncompleteChunkCoverage;
+    const start = header orelse return error.InvalidChunkerResponse;
+    inline for (.{ "plan_id", "source_fingerprint", "source_version", "model", "model_identity", "model_revision", "task_type" }) |field| {
+        if (!std.mem.eql(u8, @field(start, field), @field(response, field))) return error.InvalidChunkerResponse;
+    }
+    if (start.start_ordinal != response.start_ordinal or !std.meta.eql(start.policy, response.policy) or response.data.len != 0) return error.InvalidChunkerResponse;
+    if (start.dimensions) |dimensions| if (dimensions != response.dimensions) return error.InvalidChunkerResponse;
+    response.data = items.items;
+    const encoded = try std.json.Stringify.valueAlloc(temporary, response, .{});
+    return parseModelChunkPage(a, encoded, cfg);
+}
+
+test "model aware media NDJSON acknowledges only matching terminal coverage" {
+    const a = std.testing.allocator;
+    var response = try std.json.parseFromSlice(inference_api.ChunkEmbeddingResponse, a, model_page_fixture, .{});
+    defer response.deinit();
+    const r = response.value;
+    const context = inference_api.ChunkEmbeddingContext{ .source_fingerprint = r.source_fingerprint, .source_version = r.source_version, .plan_id = r.plan_id, .model = r.model, .model_identity = r.model_identity, .model_revision = r.model_revision, .task_type = r.task_type, .dimensions = r.dimensions, .policy = r.policy, .start_ordinal = r.start_ordinal };
+    const start = try std.json.Stringify.valueAlloc(a, .{ .object = "chunk.embedding.start", .context = context }, .{});
+    defer a.free(start);
+    const event = try std.json.Stringify.valueAlloc(a, .{ .object = "chunk.embedding", .data = r.data[0] }, .{});
+    defer a.free(event);
+    var terminal_response = r;
+    terminal_response.data = &.{};
+    const terminal = try std.json.Stringify.valueAlloc(a, .{ .object = "chunk.embedding.complete", .response = terminal_response }, .{});
+    defer a.free(terminal);
+    const stream = try std.fmt.allocPrint(a, "{s}\n{s}\n{s}\n", .{ start, event, terminal });
+    defer a.free(stream);
+    const cfg = chunking_types.Config{ .provider = .antfly, .embedding = .{ .model = "model", .dimensions = 2 }, .page = true, .max_chunks = 64 };
+    var page = try parseModelChunkStream(a, stream, cfg);
+    defer page.deinit(a);
+    try std.testing.expectEqual(@as(u64, 1), page.covered_through_ordinal);
+    try std.testing.expectEqual(@as(usize, 1), page.chunks.len);
+    const disconnected = try std.fmt.allocPrint(a, "{s}\n{s}\n", .{ start, event });
+    defer a.free(disconnected);
+    try std.testing.expectError(error.IncompleteChunkCoverage, parseModelChunkStream(a, disconnected, cfg));
+    const missing = try std.fmt.allocPrint(a, "{s}\n{s}\n", .{ start, terminal });
+    defer a.free(missing);
+    try std.testing.expectError(error.IncompleteChunkCoverage, parseModelChunkStream(a, missing, cfg));
+    try std.testing.expectError(error.StaleChunkContinuation, parseModelChunkStream(a, "{\"object\":\"chunk.embedding.error\",\"code\":\"StaleChunkContinuation\"}\n", cfg));
+}
+
+test "model aware media remote transcription pages request partial results without a legacy embedding target" {
+    const a = std.testing.allocator;
+    const config = chunking_types.Config{ .provider = .antfly, .page = true, .max_chunks = 2, .outputs_json = "{\"boundary_model\":\"speech\",\"targets\":[{\"name\":\"speech\",\"kind\":\"transcribe\",\"model\":\"whisper\"}]}" };
+    var encoded = try encodeChunkRequest(a, config, .{ .binary = .{ .mime_type = "audio/wav", .data = &.{ 1, 2, 3 } } }, .base64_payload);
+    defer encoded.deinit(a);
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, encoded.metadata_or_json, .{});
+    defer parsed.deinit();
+    try std.testing.expect(parsed.value.object.get("allow_partial").?.bool);
+    try std.testing.expect(parsed.value.object.get("embedding") == null or parsed.value.object.get("embedding").? == .null);
+    try std.testing.expectEqualStrings("speech", parsed.value.object.get("outputs").?.object.get("boundary_model").?.string);
 }

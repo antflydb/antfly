@@ -152,14 +152,19 @@ pub const PreparedRows = struct {
     manifest: ?Manifest,
 
     pub fn init(alloc: std.mem.Allocator, document: []const u8, producer: []const u8, source_field: []const u8, chunks: []const @import("../../chunking/chunk.zig").Chunk) !PreparedRows {
-        return prepare(alloc, document, producer, source_field, chunks, false);
+        return prepare(alloc, document, producer, source_field, chunks, false, true);
     }
 
     pub fn initProjection(alloc: std.mem.Allocator, document: []const u8, producer: []const u8, source_field: []const u8, chunks: []const @import("../../chunking/chunk.zig").Chunk) !PreparedRows {
-        return prepare(alloc, document, producer, source_field, chunks, true);
+        return prepare(alloc, document, producer, source_field, chunks, true, true);
     }
 
-    fn prepare(alloc: std.mem.Allocator, document: []const u8, producer: []const u8, source_field: []const u8, chunks: []const @import("../../chunking/chunk.zig").Chunk, text_only: bool) !PreparedRows {
+    pub fn initRecipes(alloc: std.mem.Allocator, document: []const u8, producer: []const u8, source_field: []const u8, chunks: []const @import("../../chunking/chunk.zig").Chunk) !PreparedRows {
+        for (chunks) |chunk| if (chunk.metadata == null) return error.InvalidBatchRequest;
+        return prepare(alloc, document, producer, source_field, chunks, false, false);
+    }
+
+    fn prepare(alloc: std.mem.Allocator, document: []const u8, producer: []const u8, source_field: []const u8, chunks: []const @import("../../chunking/chunk.zig").Chunk, text_only: bool, include_payload: bool) !PreparedRows {
         var scratch = std.heap.ArenaAllocator.init(alloc);
         defer scratch.deinit();
         const rows = try alloc.alloc(publication.Mutation, chunks.len);
@@ -188,7 +193,7 @@ pub const PreparedRows = struct {
             try obj.put(temporary, "_parent_doc_key", .{ .string = document });
             try obj.put(temporary, "_artifact_name", .{ .string = producer });
             try obj.put(temporary, "_source_field", .{ .string = source_field });
-            try @import("../../chunking/chunk.zig").appendArtifactFields(temporary, &obj, source_field, chunk, true);
+            try @import("../../chunking/chunk.zig").appendArtifactFields(temporary, &obj, source_field, chunk, include_payload);
             const payload = try std.json.Stringify.valueAlloc(alloc, std.json.Value{ .object = obj }, .{});
             errdefer alloc.free(payload);
             if (!text_only) try builder.append(chunk.chunk_id, payload);

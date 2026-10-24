@@ -362,7 +362,9 @@ pub const storage_db_enrichment_enrichment_runtime = @import("storage/db/enrichm
 pub const storage_db_enrichment_enrichment_state = @import("storage/db/enrichment/enrichment_state.zig");
 pub const storage_db_enrichment_enrichment_types = @import("storage/db/enrichment/enrichment_types.zig");
 pub const storage_db_enrichment_enrichment_worker = @import("storage/db/enrichment/enrichment_worker.zig");
+pub const storage_db_enrichment_media_pass = @import("storage/db/enrichment/media_pass.zig");
 pub const storage_db_enrichment_neighbor_context = @import("storage/db/enrichment/neighbor_context.zig");
+pub const storage_db_enrichment_vector_labels = @import("storage/db/enrichment/vector_labels.zig");
 pub const storage_db_enrichment_utf8_text = @import("storage/db/enrichment/utf8_text.zig");
 pub const storage_db_generation_lifecycle = @import("storage/db/generation_lifecycle.zig");
 pub const storage_db_graph_asset_state = @import("storage/db/graph_asset_state.zig");
@@ -607,6 +609,7 @@ pub const storage_sim_fixture = @import("storage/sim_fixture.zig");
 pub const storage_sim_runtime = @import("storage/sim_runtime.zig");
 pub const storage_source_authority = @import("storage/source_authority.zig");
 pub const storage_source_pin_state = @import("storage/source_pin_state.zig");
+pub const storage_source_proof_registry = @import("storage/source_proof_registry.zig");
 pub const storage_source_snapshot = @import("storage/source_snapshot.zig");
 pub const storage_statement_read_fence = @import("storage/statement_read_fence.zig");
 pub const storage_lite_test_allocator = @import("storage/lite/test_allocator.zig");
@@ -820,3 +823,7 @@ pub const storage_db_group_source_retirement = @import("storage/db/group_source_
 pub const storage_db_group_source_snapshot = @import("storage/db/group_source_snapshot.zig");
 pub const storage_db_group_source_state = @import("storage/db/group_source_state.zig");
 pub const storage_db_group_source_transfer = @import("storage/db/group_source_transfer.zig");
+
+pub const storage_db_enrichment_media_output = @import("storage/db/enrichment/media_output.zig");
+
+pub const storage_db_enrichment_media_output_counts = @import("storage/db/enrichment/media_output_counts.zig");

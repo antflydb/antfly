@@ -1,0 +1,273 @@
+// Copyright 2026 Antfly, Inc.
+// SPDX-License-Identifier: Apache-2.0
+
+//! Media outputs have independent recipes. Only the selected boundary recipe
+//! participates in planning; adding consumers cannot change parent identities.
+const std = @import("std");
+
+pub const Kind = enum { embedding, transcribe, classify };
+pub const Target = struct {
+    name: []const u8,
+    kind: Kind,
+    model: []const u8,
+    required: bool = true,
+    execute: bool = true,
+    model_identity: ?[]const u8 = null,
+    task_type: []const u8 = "RETRIEVAL_DOCUMENT",
+    dimensions: ?usize = null,
+    language: ?[]const u8 = null,
+    diarize: bool = false,
+    top_k: usize = 5,
+
+    pub fn recipeIdentity(self: Target, a: std.mem.Allocator, identity: []const u8, revision: []const u8) ![64]u8 {
+        var recipe = self;
+        recipe.model_identity = null;
+        recipe.execute = true;
+        recipe.required = true; // Coverage policy does not change inference work.
+        const encoded = try std.json.Stringify.valueAlloc(a, .{ .format = "antfly-media-output-v1", .target = recipe, .model_identity = identity, .model_revision = revision }, .{ .emit_null_optional_fields = false });
+        defer a.free(encoded);
+        var digest: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(encoded, &digest, .{});
+        return std.fmt.bytesToHex(digest, .lower);
+    }
+};
+pub const Config = struct {
+    boundary_model: []const u8,
+    targets: []const Target,
+
+    /// The pre-existing embedding member is a named compatibility output.
+    pub fn includingEmbedding(self: Config, a: std.mem.Allocator, legacy: Target) !Config {
+        for (self.targets) |target| if (std.mem.eql(u8, target.name, "embedding")) {
+            if (target.kind != .embedding or !std.mem.eql(u8, target.model, legacy.model) or target.dimensions != legacy.dimensions or !std.mem.eql(u8, target.task_type, legacy.task_type)) return error.InvalidChunkOutputs;
+            return self;
+        };
+        if (self.targets.len >= 16) return error.InvalidChunkOutputs;
+        const targets = try a.alloc(Target, self.targets.len + 1);
+        @memcpy(targets[0..self.targets.len], self.targets);
+        targets[self.targets.len] = legacy;
+        return .{ .boundary_model = self.boundary_model, .targets = targets };
+    }
+
+    pub fn validate(self: Config) !void {
+        if (self.targets.len == 0 or self.targets.len > 16) return error.InvalidChunkOutputs;
+        var found = false;
+        for (self.targets, 0..) |target, index| {
+            if (target.name.len == 0 or target.name.len > 128 or target.model.len == 0 or target.model.len > 4096 or !std.unicode.utf8ValidateSlice(target.name)) return error.InvalidChunkOutputs;
+            if (target.dimensions == 0 or target.top_k == 0 or target.top_k > 128) return error.InvalidChunkOutputs;
+            if (target.model_identity) |identity| {
+                if (identity.len != 64) return error.InvalidChunkOutputs;
+                for (identity) |c| if (!std.ascii.isDigit(c) and (c < 'a' or c > 'f')) return error.InvalidChunkOutputs;
+            }
+            for (self.targets[0..index]) |earlier| if (std.mem.eql(u8, target.name, earlier.name)) return error.InvalidChunkOutputs;
+            if (std.mem.eql(u8, target.name, self.boundary_model)) {
+                if (target.kind == .classify) return error.InvalidChunkBoundaryModel;
+                found = true;
+            }
+        }
+        if (!found) return error.InvalidChunkBoundaryModel;
+    }
+    pub fn boundary(self: Config) !Target {
+        try self.validate();
+        for (self.targets) |target| if (std.mem.eql(u8, target.name, self.boundary_model)) return target;
+        unreachable;
+    }
+};
+pub const Span = struct {
+    text: []const u8,
+    start_ns: i64,
+    end_ns: i64,
+    /// Local to this output sub-window. Speaker numbering across independent
+    /// windows requires an explicit diarization stitching stage.
+    speaker_index: ?u32 = null,
+};
+pub const Label = struct { label: []const u8, score: f32 };
+pub const Result = struct {
+    name: []const u8,
+    kind: Kind,
+    required: bool,
+    model: []const u8,
+    model_identity: []const u8,
+    model_revision: []const u8,
+    recipe_id: []const u8,
+    sub_index: u32 = 0,
+    start_ns: ?i64 = null,
+    end_ns: ?i64 = null,
+    status: enum { complete, failed, skipped },
+    code: ?[]const u8 = null,
+    attempts: u32 = 0,
+    terminal: bool = false,
+    embedding: ?[]const f32 = null,
+    spans: ?[]const Span = null,
+    labels: ?[]const Label = null,
+
+    pub fn validate(self: Result, target: Target) !void {
+        if (!std.mem.eql(u8, self.name, target.name) or self.kind != target.kind or self.required != target.required or !std.mem.eql(u8, self.model, target.model)) return error.InvalidChunkOutput;
+        if ((self.start_ns == null) != (self.end_ns == null)) return error.InvalidChunkOutput;
+        if (self.start_ns) |start| if (start < 0 or self.end_ns.? < start) return error.InvalidChunkOutput;
+        if (self.status == .skipped) {
+            if (target.execute or self.code != null or self.embedding != null or self.spans != null or self.labels != null) return error.InvalidChunkOutput;
+            return;
+        }
+        if (self.status == .failed) {
+            if (self.code == null or self.embedding != null or self.spans != null or self.labels != null) return error.InvalidChunkOutput;
+            return;
+        }
+        if (self.terminal or self.code != null or self.model_identity.len != 64 or self.model_revision.len != 64 or self.recipe_id.len != 64) return error.InvalidChunkOutput;
+        if (target.model_identity) |expected| if (!std.mem.eql(u8, expected, self.model_identity)) return error.EmbeddingIdentityMismatch;
+        var digest: [32]u8 = undefined;
+        for ([_][]const u8{ self.model_identity, self.model_revision, self.recipe_id }) |value| _ = std.fmt.hexToBytes(&digest, value) catch return error.InvalidChunkOutput;
+
+        switch (self.kind) {
+            .embedding => {
+                if (self.spans != null or self.labels != null) return error.InvalidChunkOutput;
+                const vector = self.embedding orelse return error.InvalidChunkOutput;
+                if (vector.len == 0 or (target.dimensions != null and target.dimensions.? != vector.len)) return error.InvalidChunkOutput;
+                for (vector) |value| if (!std.math.isFinite(value)) return error.InvalidChunkOutput;
+            },
+            .transcribe => {
+                if (self.embedding != null or self.labels != null) return error.InvalidChunkOutput;
+                const spans = self.spans orelse return error.InvalidChunkOutput;
+                const start = self.start_ns orelse return error.InvalidChunkOutput;
+                const end = self.end_ns orelse return error.InvalidChunkOutput;
+                var previous = start;
+                for (spans) |span| {
+                    if (!std.unicode.utf8ValidateSlice(span.text) or span.start_ns < previous or span.end_ns < span.start_ns or span.end_ns > end) return error.InvalidChunkOutput;
+                    previous = span.start_ns;
+                }
+            },
+            .classify => {
+                if (self.embedding != null or self.spans != null) return error.InvalidChunkOutput;
+                const labels = self.labels orelse return error.InvalidChunkOutput;
+                if (labels.len > target.top_k) return error.InvalidChunkOutput;
+                var previous: f32 = std.math.inf(f32);
+                for (labels, 0..) |label, index| {
+                    if (label.label.len == 0 or !std.math.isFinite(label.score) or label.score < 0 or label.score > 1 or label.score > previous) return error.InvalidChunkOutput;
+                    for (labels[0..index]) |earlier| if (std.mem.eql(u8, earlier.label, label.label)) return error.InvalidChunkOutput;
+                    previous = label.score;
+                }
+            },
+        }
+    }
+};
+
+/// Sample-aligned sub-windows never participate in parent plan identity.
+/// Integer clocks avoid accumulating rounding drift at non-kHz sample rates.
+pub const AudioWindows = struct {
+    samples: usize,
+    sample_rate: u32,
+    max_ns: i64,
+    parent_start_ns: i64,
+    position: usize = 0,
+    sub_index: u32 = 0,
+    pub const Window = struct { first: usize, last: usize, sub_index: u32, start_ns: i64, end_ns: i64 };
+    pub fn next(self: *AudioWindows) !?Window {
+        if (self.sample_rate == 0 or self.max_ns <= 0 or self.parent_start_ns < 0) return error.InvalidChunkCoordinates;
+        if (self.position == self.samples) return null;
+        const count = std.math.cast(usize, @divFloor(@as(u128, @intCast(self.max_ns)) * self.sample_rate, std.time.ns_per_s)) orelse return error.InvalidChunkCoordinates;
+        if (count == 0) return error.InvalidChunkCoordinates;
+        const first = self.position;
+        const last = first + @min(count, self.samples - first);
+        const start_ns = try std.math.add(i64, self.parent_start_ns, std.math.cast(i64, @divFloor(@as(u128, first) * std.time.ns_per_s, self.sample_rate)) orelse return error.InvalidChunkCoordinates);
+        const end_ns = try std.math.add(i64, self.parent_start_ns, std.math.cast(i64, @divFloor(@as(u128, last) * std.time.ns_per_s, self.sample_rate)) orelse return error.InvalidChunkCoordinates);
+        const result = Window{ .first = first, .last = last, .sub_index = self.sub_index, .start_ns = start_ns, .end_ns = end_ns };
+        self.position = last;
+        self.sub_index = try std.math.add(u32, self.sub_index, 1);
+        return result;
+    }
+};
+
+test "model aware media output boundary remains explicit when independent consumers change" {
+    const targets = [_]Target{ .{ .name = "clip", .kind = .embedding, .model = "clip-v1" }, .{ .name = "speech", .kind = .transcribe, .model = "whisper-v1" } };
+    const config = Config{ .boundary_model = "clip", .targets = &targets };
+    try std.testing.expectEqualStrings("clip-v1", (try config.boundary()).model);
+    try std.testing.expectError(error.InvalidChunkBoundaryModel, (Config{ .boundary_model = "missing", .targets = &targets }).validate());
+    try std.testing.expectError(error.InvalidChunkOutputs, (Config{ .boundary_model = "clip", .targets = &.{ targets[0], targets[0] } }).validate());
+}
+
+test "model aware media output audio subwindows retain parent clocks and complete tails" {
+    var windows = AudioWindows{ .samples = 32 * 44100 + 7, .sample_rate = 44100, .max_ns = 30 * std.time.ns_per_s, .parent_start_ns = 64 * std.time.ns_per_s };
+    const first = (try windows.next()).?;
+    const last = (try windows.next()).?;
+    try std.testing.expectEqual(@as(u32, 0), first.sub_index);
+    try std.testing.expectEqual(@as(u32, 1), last.sub_index);
+    try std.testing.expectEqual(first.last, last.first);
+    try std.testing.expectEqual(first.end_ns, last.start_ns);
+    try std.testing.expectEqual(windows.samples, last.last);
+    try std.testing.expect(try windows.next() == null);
+}
+
+pub const Row = struct { chunk_id: u32, outputs: []const Result };
+pub const TranscriptSpan = struct {
+    char_start: u32,
+    char_end: u32,
+    start_ns: i64,
+    end_ns: i64,
+    parent_ordinal: u32,
+    sub_index: u32,
+    speaker_index: ?u32,
+};
+pub const Projection = struct {
+    text: []const u8,
+    transcript_spans: []const TranscriptSpan,
+    complete_chunks: u64 = 0,
+    failed_chunks: u64 = 0,
+    terminal_chunks: u64 = 0,
+    status: enum { complete, degraded, failed } = .complete,
+};
+
+/// The caller owns an arena. Timing remains attached to original utterances;
+/// overlapping windows and local speaker scopes are explicit, never silently
+/// merged into invented global speaker identities or interpolated timestamps.
+pub fn project(a: std.mem.Allocator, rows: []const Row) !Projection {
+    var text = std.ArrayList(u8).empty;
+    var spans = std.ArrayList(TranscriptSpan).empty;
+    var projection = Projection{ .text = "", .transcript_spans = &.{} };
+    for (rows) |row| {
+        var failed = false;
+        var terminal = false;
+        for (row.outputs) |output| {
+            if (output.status == .failed) {
+                failed = true;
+                terminal = terminal or output.terminal;
+                if (output.required) projection.status = .failed else if (projection.status != .failed) {
+                    projection.status = .degraded;
+                }
+                continue;
+            }
+            if (output.spans) |phrases| for (phrases) |phrase| {
+                if (phrase.text.len == 0) continue;
+                if (text.items.len + phrase.text.len + 1 > 16 * 1024 * 1024) return error.ResourceLimitExceeded;
+                if (text.items.len != 0) try text.append(a, ' ');
+                const first: u32 = @intCast(text.items.len);
+                try text.appendSlice(a, phrase.text);
+                try spans.append(a, .{ .char_start = first, .char_end = @intCast(text.items.len), .start_ns = phrase.start_ns, .end_ns = phrase.end_ns, .parent_ordinal = row.chunk_id, .sub_index = output.sub_index, .speaker_index = phrase.speaker_index });
+            };
+        }
+        if (failed) projection.failed_chunks += 1 else projection.complete_chunks += 1;
+        if (terminal) projection.terminal_chunks += 1;
+    }
+    projection.text = try text.toOwnedSlice(a);
+    projection.transcript_spans = try spans.toOwnedSlice(a);
+    return projection;
+}
+
+pub const CoverageValues = struct { complete: u64 = 0, failed: u64 = 0, terminal: u64 = 0, degraded: u64 = 0 };
+pub const CoverageCounts = struct {
+    embedding: CoverageValues = .{},
+    transcribe: CoverageValues = .{},
+    classify: CoverageValues = .{},
+    pub fn add(self: CoverageCounts, delta: CoverageCounts) CoverageCounts {
+        var result = self;
+        inline for (.{ "embedding", "transcribe", "classify" }) |kind| inline for (.{ "complete", "failed", "terminal", "degraded" }) |name| {
+            @field(@field(result, kind), name) +|= @field(@field(delta, kind), name);
+        };
+        return result;
+    }
+    pub fn mergeMaximum(self: CoverageCounts, other: CoverageCounts) CoverageCounts {
+        var result = self;
+        inline for (.{ "embedding", "transcribe", "classify" }) |kind| inline for (.{ "complete", "failed", "terminal", "degraded" }) |name| {
+            @field(@field(result, kind), name) = @max(@field(@field(result, kind), name), @field(@field(other, kind), name));
+        };
+        return result;
+    }
+};

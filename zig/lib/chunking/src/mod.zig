@@ -91,23 +91,28 @@ pub const Config = struct {
     threshold: ?f32 = null,
     text: TextChunkOptions = .{},
     audio: AudioChunkOptions = .{},
+    outputs_json: []const u8 = "",
     embedding: ?EmbeddingTarget = null,
     policy: ?MediaPolicy = null,
     replay: ?Replay = null,
+    /// Internal bounded media-pass request; never part of the persisted policy.
+    page: bool = false,
 
     pub fn clone(self: Config, alloc: Allocator) !Config {
-        var copy = Config{ .provider = self.provider, .store_chunks = self.store_chunks, .max_chunks = self.max_chunks, .threshold = self.threshold, .audio = self.audio, .policy = self.policy };
+        var copy = Config{ .provider = self.provider, .store_chunks = self.store_chunks, .max_chunks = self.max_chunks, .threshold = self.threshold, .audio = self.audio, .policy = self.policy, .page = self.page };
         errdefer copy.deinit(alloc);
         copy.api_url = try alloc.dupe(u8, self.api_url);
         copy.model = try alloc.dupe(u8, self.model);
         copy.full_text_index_json = try alloc.dupe(u8, self.full_text_index_json);
         copy.text = try self.text.clone(alloc);
         copy.replay = if (self.replay) |value| try cloneReplay(alloc, value) else null;
+        copy.outputs_json = try alloc.dupe(u8, self.outputs_json);
         copy.embedding = if (self.embedding) |value| try cloneEmbeddingTarget(alloc, value) else null;
         return copy;
     }
 
     pub fn deinit(self: *Config, alloc: Allocator) void {
+        if (self.outputs_json.len > 0) alloc.free(self.outputs_json);
         if (self.replay) |value| freeReplay(alloc, value);
         if (self.embedding) |value| {
             alloc.free(value.model);
@@ -119,6 +124,10 @@ pub const Config = struct {
         if (self.full_text_index_json.len > 0) alloc.free(self.full_text_index_json);
         self.text.deinit(alloc);
         self.* = undefined;
+    }
+
+    pub fn isModelAware(self: Config) bool {
+        return self.embedding != null or self.outputs_json.len > 0;
     }
 
     pub fn hasTextChunking(self: Config) bool {
@@ -184,14 +193,12 @@ pub fn parseHasFullTextIndexFromSlice(alloc: Allocator, raw: []const u8) !bool {
 }
 
 pub fn stringifyAlloc(alloc: Allocator, cfg: Config) ![]u8 {
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
     var generated = openApiFromConfig(cfg);
-    if (cfg.full_text_index_json.len > 0) {
-        const parsed = try json.parseFromSlice(json.Value, alloc, cfg.full_text_index_json, .{});
-        defer parsed.deinit();
-        generated.full_text_index = parsed.value;
-        return try json.Stringify.valueAlloc(alloc, generated, .{ .emit_null_optional_fields = false });
-    }
-    return try json.Stringify.valueAlloc(alloc, generated, .{ .emit_null_optional_fields = false });
+    if (cfg.full_text_index_json.len > 0) generated.full_text_index = try std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), cfg.full_text_index_json, .{});
+    if (cfg.outputs_json.len > 0) generated.outputs = try std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), cfg.outputs_json, .{});
+    return json.Stringify.valueAlloc(alloc, generated, .{ .emit_null_optional_fields = false });
 }
 
 fn configFromOpenApi(
@@ -210,12 +217,13 @@ fn configFromOpenApi(
     cfg.audio = try audioChunkOptionsFromOpenApi(chunk_options.audio);
     cfg.embedding = if (chunk_options.embedding) |value| try cloneEmbeddingTarget(alloc, value) else null;
     cfg.policy = chunk_options.policy;
+    if (chunk_options.outputs) |value| cfg.outputs_json = try json.Stringify.valueAlloc(alloc, value, .{ .emit_null_optional_fields = false });
 
     if (provider_cfg.full_text_index) |full_text_index| {
         cfg.full_text_index_json = try json.Stringify.valueAlloc(alloc, full_text_index, .{});
     }
 
-    if (cfg.provider == .antfly and cfg.api_url.len > 0 and cfg.model.len == 0 and cfg.embedding == null) return error.InvalidChunkerConfig;
+    if (cfg.provider == .antfly and cfg.api_url.len > 0 and cfg.model.len == 0 and !cfg.isModelAware()) return error.InvalidChunkerConfig;
     return cfg;
 }
 
@@ -268,6 +276,7 @@ const CombinedChunkerConfig = struct {
     text: ?api_openapi.TextChunkOptions = null,
     audio: ?api_openapi.AudioChunkOptions = null,
     embedding: ?EmbeddingTarget = null,
+    outputs: ?json.Value = null,
     policy: ?MediaPolicy = null,
 };
 

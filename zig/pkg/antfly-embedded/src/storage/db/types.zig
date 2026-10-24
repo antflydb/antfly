@@ -3385,6 +3385,8 @@ pub const EnrichmentActiveModel = InlineStatusText(256);
 pub const EnrichmentActiveBackend = InlineStatusText(32);
 
 pub const EnrichmentStats = struct {
+    output_counts: @import("enrichment/media_output_counts.zig").Counts = .{},
+    output_counts_available: bool = true,
     last_error_code: RuntimeErrorName = .{},
     enabled: bool = false,
     lease_owned: bool = true,

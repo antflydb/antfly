@@ -115,10 +115,12 @@ pub const SparseTermWeight = struct {
 pub const ChunkEmbedding = struct {
     chunk: []u8,
     embedding: []f32,
+    descriptor_json: ?[]u8 = null,
 
     pub fn deinit(self: *ChunkEmbedding, alloc: Allocator) void {
         alloc.free(self.chunk);
         alloc.free(self.embedding);
+        if (self.descriptor_json) |recipe| alloc.free(recipe);
         self.* = undefined;
     }
 };
@@ -426,11 +428,10 @@ fn cloneChunkEmbeddingsAlloc(alloc: Allocator, values: []const std.json.Value) !
         if (value != .object) return error.InvalidSparseEmbeddingValue;
         const chunk = findString(value.object, "chunk") orelse findString(value.object, "text") orelse return error.InvalidSparseEmbeddingValue;
         const embedding = findEmbedding(value.object) orelse return error.InvalidSparseEmbeddingValue;
-        out[initialized] = .{
-            .chunk = try alloc.dupe(u8, chunk),
-            .embedding = try cloneEmbeddingAlloc(alloc, embedding),
-        };
+        out[initialized] = .{ .chunk = try alloc.dupe(u8, chunk), .embedding = &.{} };
         initialized += 1;
+        out[initialized - 1].embedding = try cloneEmbeddingAlloc(alloc, embedding);
+        if (value.object.get("_chunk")) |recipe| out[initialized - 1].descriptor_json = try std.json.Stringify.valueAlloc(alloc, recipe, .{});
     }
     return out;
 }

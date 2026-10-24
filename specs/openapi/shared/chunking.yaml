@@ -107,11 +107,12 @@ components:
           minimum: 0
           maximum: 4096
           description: >-
-            Maximum number of chunks to generate per document. Zero (the
-            default when omitted) means unlimited: the document is chunked in
-            full. Set an explicit value up to 4096 to cap output; any chunks
-            beyond the cap are silently omitted, so treat a result whose
-            chunk count equals `max_chunks` as potentially truncated.
+            Maximum chunks in one response; zero requests the full result.
+            Model-aware responses return continuation coverage when a page is
+            full: follow next_continuation until source_complete. Embedded
+            model-aware enrichment uses this as its page size and continues
+            through the entire source. Fixed chunking without model-aware
+            outputs retains its per-call truncation behavior.
         threshold:
           type: number
           format: float
@@ -124,6 +125,8 @@ components:
           $ref: "#/components/schemas/AudioChunkOptions"
         embedding:
           $ref: '#/components/schemas/ChunkEmbeddingTarget'
+        outputs:
+          $ref: '#/components/schemas/ChunkOutputs'
         policy:
           $ref: '#/components/schemas/MediaChunkPolicy'
 
@@ -177,11 +180,12 @@ components:
           minimum: 0
           maximum: 4096
           description: >-
-            Maximum number of chunks to generate per document. Zero (the
-            default when omitted) means unlimited: the document is chunked in
-            full. Set an explicit value up to 4096 to cap output; any chunks
-            beyond the cap are silently omitted, so treat a result whose
-            chunk count equals `max_chunks` as potentially truncated.
+            Maximum chunks in one response; zero requests the full result.
+            Model-aware responses return continuation coverage when a page is
+            full: follow next_continuation until source_complete. Embedded
+            model-aware enrichment uses this as its page size and continues
+            through the entire source. Fixed chunking without model-aware
+            outputs retains its per-call truncation behavior.
         threshold:
           type: number
           format: float
@@ -213,6 +217,11 @@ components:
           $ref: "#/components/schemas/InferenceChunkConfig"
         embedding:
           $ref: '#/components/schemas/ChunkEmbeddingTarget'
+        outputs:
+          $ref: '#/components/schemas/ChunkOutputs'
+        allow_partial:
+          type: boolean
+          description: Continue enumerating descriptors after individual output failures. Applies to named outputs, including transcribe-only requests; overrides the legacy embedding.allow_partial option when present.
         policy:
           $ref: '#/components/schemas/MediaChunkPolicy'
         source_id:
@@ -239,6 +248,162 @@ components:
         - $ref: "generating.yaml#/components/schemas/TextContentPart"
         - $ref: "generating.yaml#/components/schemas/MediaContentPart"
         - $ref: "#/components/schemas/ChunkSourceReference"
+
+    ChunkOutputs:
+      type: object
+      required: [boundary_model, targets]
+      description: >-
+        Named independent media outputs. The named boundary model alone determines
+        the shared plan; adding or changing another output preserves parent IDs.
+        The compatibility embedding target is named embedding. Smaller output
+        windows are identified by the parent ordinal and sub_index.
+      properties:
+        boundary_model:
+          type: string
+          minLength: 1
+        targets:
+          type: array
+          minItems: 1
+          maxItems: 16
+          items:
+            $ref: '#/components/schemas/ChunkOutputTarget'
+    ChunkOutputTarget:
+      type: object
+      required: [name, kind, model]
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 128
+        kind:
+          type: string
+          enum: [embedding, transcribe, classify]
+        model:
+          type: string
+          minLength: 1
+          maxLength: 4096
+        execute:
+          type: boolean
+          default: true
+          description: False retains this model as a planning boundary while skipping its inference; used for independent output repairs.
+        required:
+          type: boolean
+          default: true
+        model_identity:
+          type: string
+          pattern: '^[0-9a-f]{64}$'
+        task_type:
+          type: string
+          default: RETRIEVAL_DOCUMENT
+        dimensions:
+          type: integer
+          minimum: 1
+        language:
+          type: string
+        diarize:
+          type: boolean
+          default: false
+        top_k:
+          type: integer
+          minimum: 1
+          maximum: 128
+          default: 5
+    ChunkTranscriptSpan:
+      type: object
+      required: [text, start_ns, end_ns]
+      properties:
+        text:
+          type: string
+        start_ns:
+          type: integer
+          format: int64
+        end_ns:
+          type: integer
+          format: int64
+        speaker_index:
+          type: integer
+          minimum: 0
+          description: Speaker index local to this output sub-window; global identities require diarization stitching.
+    ChunkOutputLabel:
+      type: object
+      required: [label, score]
+      properties:
+        label:
+          type: string
+        score:
+          type: number
+          format: float
+    ChunkOutputResult:
+      type: object
+      required: [name, kind, required, model, model_identity, model_revision, recipe_id, sub_index, status]
+      properties:
+        name:
+          type: string
+        kind:
+          type: string
+          enum: [embedding, transcribe, classify]
+        required:
+          type: boolean
+        model:
+          type: string
+        model_identity:
+          type: string
+        model_revision:
+          type: string
+        recipe_id:
+          type: string
+          description: Independent output identity over resolved model and execution options; requiredness is a coverage policy.
+        sub_index:
+          type: integer
+          minimum: 0
+        start_ns:
+          type: integer
+          format: int64
+        end_ns:
+          type: integer
+          format: int64
+        status:
+          type: string
+          enum: [complete, failed, skipped]
+        attempts:
+          type: integer
+          minimum: 0
+          description: Durable repair attempts made by the enrichment consumer.
+        terminal:
+          type: boolean
+          description: True when the configured repair budget is exhausted.
+        code:
+          type: string
+        embedding:
+          type: array
+          items:
+            type: number
+            format: float
+        spans:
+          type: array
+          items:
+            $ref: '#/components/schemas/ChunkTranscriptSpan'
+        labels:
+          type: array
+          items:
+            $ref: '#/components/schemas/ChunkOutputLabel'
+    ChunkOutputCoverage:
+      type: object
+      required: [name, required, complete, failed]
+      properties:
+        name:
+          type: string
+        required:
+          type: boolean
+        complete:
+          type: integer
+          minimum: 0
+        skipped:
+          type: integer
+          minimum: 0
+        failed:
+          type: integer
+          minimum: 0
 
     ChunkEmbeddingTarget:
       type: object
@@ -466,6 +631,10 @@ components:
           $ref: '#/components/schemas/ChunkDescriptor'
         mime_type:
           type: string
+        outputs:
+          type: array
+          items:
+            $ref: '#/components/schemas/ChunkOutputResult'
         embedding:
           type: array
           items:
@@ -494,6 +663,16 @@ components:
           type: string
           enum: [complete, partial, failed]
           description: Completion of this response's suffix starting at start_ordinal; callers must retain earlier acknowledged coverage.
+        output_coverage:
+          type: array
+          items:
+            $ref: '#/components/schemas/ChunkOutputCoverage'
+        degraded:
+          type: boolean
+          description: Optional outputs failed without preventing required-output coverage.
+        source_complete:
+          type: boolean
+          description: True when source enumeration reached EOF, independently of per-output gaps. Resume enumeration at covered_through_ordinal; repair gaps separately.
         source_reference:
           $ref: '#/components/schemas/ChunkSourceReference'
         source_id:

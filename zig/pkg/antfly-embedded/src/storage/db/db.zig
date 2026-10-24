@@ -31189,6 +31189,7 @@ pub const DB = struct {
             .error_count = status.error_count,
             .retryable_error_count = status.retryable_error_count,
             .fatal_error_count = status.fatal_error_count,
+            .output_counts = status.output_counts,
             .consecutive_retry_count = status.consecutive_retry_count,
             .next_retry_at_ms = status.next_retry_at_ms,
             .retrying = status.retrying,

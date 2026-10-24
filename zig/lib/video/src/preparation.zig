@@ -442,6 +442,52 @@ pub fn referenceHostScalar(allocator: std.mem.Allocator, host: HostSurface, opti
 fn referenceHostImpl(allocator: std.mem.Allocator, host: HostSurface, options: Options, control: media.source.Control, simd: bool) ![]f32 {
     try control.check();
     const g = try geometry(host.width, host.height, options);
+    var displayed = try displayHostImpl(allocator, host, options, control, simd);
+    defer displayed.deinit(allocator);
+    return prepareRgb(allocator, displayed.bytes, displayed.width, displayed.height, g, options, control);
+}
+
+pub const DisplayImage = struct {
+    bytes: []u8,
+    width: u32,
+    height: u32,
+    pub fn deinit(self: *DisplayImage, allocator: std.mem.Allocator) void {
+        allocator.free(self.bytes);
+    }
+    pub fn view(self: DisplayImage) image.ImageU8 {
+        return .{ .data = self.bytes, .width = self.width, .height = self.height, .format = .rgb8 };
+    }
+};
+pub const BorrowedFrame = union(enum) {
+    host: HostSurface,
+    surface: *const apple.Surface,
+    rgba: struct { bytes: []const u8, width: u32, height: u32 },
+    pub fn prepare(self: BorrowedFrame, allocator: std.mem.Allocator, options: Options, control: media.source.Control) ![]f32 {
+        return switch (self) {
+            .host => |host| referenceHost(allocator, host, options, control),
+            .surface => |surface| reference(allocator, surface, options, control),
+            .rgba => |raster| referenceRgba(allocator, raster.bytes, raster.width, raster.height, options, control),
+        };
+    }
+    pub fn display(self: BorrowedFrame, allocator: std.mem.Allocator, options: Options, control: media.source.Control) !DisplayImage {
+        return switch (self) {
+            .host => |host| displayHostImpl(allocator, host, options, control, true),
+            .surface => |surface| blk: {
+                var mapping = try surface.map();
+                defer mapping.deinit();
+                break :blk displayHostImpl(allocator, .{ .width = surface.width, .height = surface.height, .format = surface.format, .bit_depth = surface.format.bitDepth(), .planes = mapping.planes }, options, control, true);
+            },
+            .rgba => |raster| displayRgba(allocator, raster.bytes, raster.width, raster.height, options, control),
+        };
+    }
+};
+pub const FrameObserver = struct {
+    context: *anyopaque,
+    accept: *const fn (*anyopaque, usize, BorrowedFrame, Options, media.source.Control) anyerror!void,
+};
+fn displayHostImpl(allocator: std.mem.Allocator, host: HostSurface, options: Options, control: media.source.Control, simd: bool) !DisplayImage {
+    try control.check();
+    if (host.width == 0 or host.height == 0 or @as(u64, host.width) * host.height > options.max_source_pixels or @as(u64, host.width) * host.height * 3 > options.max_scratch_bytes) return error.ResourceLimitExceeded;
     const rotated = options.rotation == .clockwise90 or options.rotation == .clockwise270;
     const cropped = try croppedSize(host.width, host.height, options.crop);
     const width = if (rotated) cropped[1] else cropped[0];
@@ -453,7 +499,7 @@ fn referenceHostImpl(allocator: std.mem.Allocator, host: HostSurface, options: O
     const chroma_horizontal = if (chroma_plan) |*plan| try reconstructedHorizontal(allocator, host, plan, control, simd) else null;
     defer if (chroma_horizontal) |values| allocator.free(values);
     const bytes = try allocator.alloc(u8, @as(usize, width) * height * 3);
-    defer allocator.free(bytes);
+    errdefer allocator.free(bytes);
     for (0..height) |y| {
         try control.check();
         var x: usize = 0;
@@ -470,7 +516,7 @@ fn referenceHostImpl(allocator: std.mem.Allocator, host: HostSurface, options: O
             @memcpy(bytes[(y * width + x) * 3 ..][0..3], &color);
         }
     }
-    return prepareRgb(allocator, bytes, width, height, g, options, control);
+    return .{ .bytes = bytes, .width = @intCast(width), .height = @intCast(height) };
 }
 
 fn reconstructedHorizontal(a: std.mem.Allocator, host: HostSurface, plan: *const chroma_filter.Plan, control: media.source.Control, simd: bool) ![]i16 {
@@ -616,6 +662,13 @@ fn integerRgbRow8(out: []u8, host: HostSurface, x: usize, y: usize, options: Opt
 pub fn referenceRgba(allocator: std.mem.Allocator, bytes: []const u8, source_width: u32, source_height: u32, options: Options, control: media.source.Control) ![]f32 {
     try control.check();
     const g = try geometry(source_width, source_height, options);
+    var displayed = try displayRgba(allocator, bytes, source_width, source_height, options, control);
+    defer displayed.deinit(allocator);
+    return prepareRgb(allocator, displayed.bytes, displayed.width, displayed.height, g, options, control);
+}
+fn displayRgba(allocator: std.mem.Allocator, bytes: []const u8, source_width: u32, source_height: u32, options: Options, control: media.source.Control) !DisplayImage {
+    try control.check();
+    if (source_width == 0 or source_height == 0 or @as(u64, source_width) * source_height > options.max_source_pixels or @as(u64, source_width) * source_height * 3 > options.max_scratch_bytes) return error.ResourceLimitExceeded;
     if (options.tone_mapping != .none) return error.UnsupportedVideoColor;
     if (bytes.len != @as(usize, source_width) * source_height * 4) return error.InvalidVideoGeometry;
     const rotated = options.rotation == .clockwise90 or options.rotation == .clockwise270;
@@ -623,7 +676,7 @@ pub fn referenceRgba(allocator: std.mem.Allocator, bytes: []const u8, source_wid
     const width = if (rotated) cropped[1] else cropped[0];
     const height = if (rotated) cropped[0] else cropped[1];
     const rgb_bytes = try allocator.alloc(u8, @as(usize, width) * height * 3);
-    defer allocator.free(rgb_bytes);
+    errdefer allocator.free(rgb_bytes);
     for (0..height) |y| {
         try control.check();
         for (0..width) |x| {
@@ -633,8 +686,9 @@ pub fn referenceRgba(allocator: std.mem.Allocator, bytes: []const u8, source_wid
             @memcpy(rgb_bytes[(y * width + x) * 3 ..][0..3], bytes[offset..][0..3]);
         }
     }
-    return prepareRgb(allocator, rgb_bytes, width, height, g, options, control);
+    return .{ .bytes = rgb_bytes, .width = @intCast(width), .height = @intCast(height) };
 }
+
 fn prepareRgb(allocator: std.mem.Allocator, bytes: []const u8, width: usize, height: usize, g: Geometry, options: Options, control: media.source.Control) ![]f32 {
     // Shared image control follows the same deadline through both resize passes.
     var scope = image.work_control.Scope.enter(.{ .context = control.context, .check_fn = control.check_fn });

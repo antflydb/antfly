@@ -70,11 +70,14 @@ pub const Chunk = struct {
     /// diarized and the chunk does not straddle a turn. Stored as the index
     /// the unit's transcript spans carry; the document field is its label.
     speaker_index: ?u8 = null,
+    /// Owned exact phrase clocks and parent media selectors for transcript chunks.
+    media_spans_json: ?[]const u8 = null,
     frame_index: ?u32 = null,
     frame_delay_ms: ?u32 = null,
     metadata: ?*@import("inference_chunker").types.ModelMetadata = null,
 
     pub fn deinit(self: *Chunk, alloc: Allocator) void {
+        if (self.media_spans_json) |json| alloc.free(json);
         if (self.metadata) |metadata| metadata.deinit(alloc);
         if (self.text) |text| alloc.free(text);
         if (self.data) |data| alloc.free(data);
@@ -167,17 +170,36 @@ pub fn appendArtifactFieldsWithProvenance(
         const label = std.fmt.bufPrint(&label_buf, "SPEAKER_{d:0>2}", .{index}) catch unreachable;
         try obj.put(alloc, try alloc.dupe(u8, "_speaker"), .{ .string = try alloc.dupe(u8, label) });
     }
+    if (chunk.media_spans_json) |json| {
+        var parsed_media = try std.json.parseFromSlice(std.json.Value, alloc, json, .{});
+        defer parsed_media.deinit();
+        try putClonedJsonValue(alloc, obj, "_media", parsed_media.value);
+    }
     if (chunk.frame_index) |value| try obj.put(alloc, try alloc.dupe(u8, "_frame_index"), .{ .integer = value });
     if (chunk.frame_delay_ms) |value| try obj.put(alloc, try alloc.dupe(u8, "_frame_delay_ms"), .{ .integer = value });
     try appendProvenanceFields(alloc, obj, source_field, chunk, provenance);
     if (chunk.metadata) |metadata| {
         // Keep vectors in the embedding artifact family. This recipe is enough
         // to navigate or reconstruct the source chunk without duplicated media.
-        const encoded = try std.json.Stringify.valueAlloc(alloc, .{ .descriptor = metadata.descriptor, .inference_id = metadata.inference_id, .source_fingerprint = metadata.source_fingerprint, .source_version = metadata.source_version, .plan_id = metadata.plan_id, .model = metadata.model, .model_identity = metadata.model_identity, .model_revision = metadata.model_revision, .task_type = metadata.task_type, .dimensions = metadata.dimensions, .policy = metadata.policy }, .{});
+        const encoded = try std.json.Stringify.valueAlloc(alloc, .{ .descriptor = metadata.descriptor, .inference_id = metadata.inference_id, .source_fingerprint = metadata.source_fingerprint, .source_version = metadata.source_version, .plan_id = metadata.plan_id, .model = metadata.model, .model_identity = metadata.model_identity, .model_revision = metadata.model_revision, .task_type = metadata.task_type, .dimensions = metadata.dimensions, .policy = metadata.policy, .embedding_error = metadata.embedding_error }, .{ .emit_null_optional_fields = false });
         defer alloc.free(encoded);
         var parsed = try std.json.parseFromSlice(std.json.Value, alloc, encoded, .{ .allocate = .alloc_always });
         defer parsed.deinit();
-        try putClonedJsonValue(alloc, obj, "_chunk", parsed.value);
+        if (metadata.outputs_json) |results| {
+            var values = try std.json.parseFromSlice(std.json.Value, alloc, results, .{});
+            defer values.deinit();
+            if (values.value != .array) return error.InvalidChunkOutput;
+            for (values.value.array.items) |*value| {
+                if (value.* != .object) return error.InvalidChunkOutput;
+                // Retain identities/statuses on the recipe. Vectors, transcript
+                // spans and supervised predictions belong to output artifacts.
+                for ([_][]const u8{ "embedding", "spans", "labels" }) |name| _ = value.object.swapRemove(name);
+            }
+            try parsed.value.object.put(parsed.arena.allocator(), "outputs", values.value);
+            try putClonedJsonValue(alloc, obj, "_chunk", parsed.value);
+        } else {
+            try putClonedJsonValue(alloc, obj, "_chunk", parsed.value);
+        }
     }
 
     if (!include_payload) return;
@@ -586,6 +608,8 @@ pub fn modelMetadataAlloc(a: Allocator, payload: []const u8) !?*@import("inferen
 pub fn modelMemoKey(a: Allocator, metadata: @import("inference_chunker").types.ModelMetadata) ![32]u8 {
     var recipe = metadata;
     recipe.embedding = null;
+    recipe.embedding_error = null;
+    recipe.outputs_json = null;
     const bytes = try std.json.Stringify.valueAlloc(a, recipe, .{ .emit_null_optional_fields = false });
     defer a.free(bytes);
     var hash = std.crypto.hash.sha2.Sha256.init(.{});
@@ -612,6 +636,10 @@ test "model chunk artifact retains reconstruction coordinates independently of v
     try std.testing.expectEqualSlices(u64, &.{ 900, 930 }, replay.descriptor.coordinates.selected_pictures.?);
     try std.testing.expectEqual(@as(?[]const f32, null), replay.embedding);
     try std.testing.expectEqualSlices(u8, &try modelMemoKey(a, metadata), &try modelMemoKey(a, replay.*));
+    var independent = metadata;
+    independent.outputs_json = "changed independent transcription receipt";
+    independent.embedding_error = "repaired primary attempt";
+    try std.testing.expectEqualSlices(u8, &try modelMemoKey(a, metadata), &try modelMemoKey(a, independent));
     var changed = replay.*;
     changed.model_identity = "weights-v2";
     try std.testing.expect(!std.mem.eql(u8, &try modelMemoKey(a, replay.*), &try modelMemoKey(a, changed)));

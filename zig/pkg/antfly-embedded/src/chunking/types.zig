@@ -58,6 +58,13 @@ pub const EmbeddingTarget = if (build_options.bench_minimal_deps) @import("infer
 pub const MediaPolicy = if (build_options.bench_minimal_deps) @import("inference_api").MediaChunkPolicy else lib.MediaPolicy;
 
 pub const Replay = if (build_options.bench_minimal_deps) struct { source_version: []const u8, source_fingerprint: []const u8, plan_id: []const u8, ordinal: u64 } else lib.Replay;
+pub fn cloneReplay(a: Allocator, value: Replay) !Replay {
+    const version = try a.dupe(u8, value.source_version);
+    errdefer a.free(version);
+    const source = try a.dupe(u8, value.source_fingerprint);
+    errdefer a.free(source);
+    return .{ .source_version = version, .source_fingerprint = source, .plan_id = try a.dupe(u8, value.plan_id), .ordinal = value.ordinal };
+}
 pub const Config = if (build_options.bench_minimal_deps) struct {
     provider: Provider,
     api_url: []const u8 = "",
@@ -68,17 +75,21 @@ pub const Config = if (build_options.bench_minimal_deps) struct {
     threshold: ?f32 = null,
     text: TextChunkOptions = .{},
     audio: AudioChunkOptions = .{},
+    outputs_json: []const u8 = "",
     embedding: ?EmbeddingTarget = null,
     policy: ?MediaPolicy = null,
     replay: ?Replay = null,
+    /// Internal bounded media-pass request; never part of the persisted policy.
+    page: bool = false,
 
     pub fn clone(self: Config, alloc: Allocator) !Config {
-        var copy = Config{ .provider = self.provider, .store_chunks = self.store_chunks, .max_chunks = self.max_chunks, .threshold = self.threshold, .audio = self.audio, .policy = self.policy };
+        var copy = Config{ .provider = self.provider, .store_chunks = self.store_chunks, .max_chunks = self.max_chunks, .threshold = self.threshold, .audio = self.audio, .policy = self.policy, .page = self.page };
         errdefer copy.deinit(alloc);
         copy.api_url = try alloc.dupe(u8, self.api_url);
         copy.model = try alloc.dupe(u8, self.model);
         copy.full_text_index_json = try alloc.dupe(u8, self.full_text_index_json);
         copy.text = try self.text.clone(alloc);
+        copy.outputs_json = try alloc.dupe(u8, self.outputs_json);
         if (self.replay) |value| {
             const version = try alloc.dupe(u8, value.source_version);
             errdefer alloc.free(version);
@@ -99,6 +110,7 @@ pub const Config = if (build_options.bench_minimal_deps) struct {
     }
 
     pub fn deinit(self: *Config, alloc: Allocator) void {
+        if (self.outputs_json.len > 0) alloc.free(self.outputs_json);
         if (self.replay) |value| {
             alloc.free(value.source_version);
             alloc.free(value.source_fingerprint);
@@ -114,6 +126,10 @@ pub const Config = if (build_options.bench_minimal_deps) struct {
         if (self.full_text_index_json.len > 0) alloc.free(self.full_text_index_json);
         self.text.deinit(alloc);
         self.* = undefined;
+    }
+
+    pub fn isModelAware(self: Config) bool {
+        return self.embedding != null or self.outputs_json.len > 0;
     }
 
     pub fn hasTextChunking(self: Config) bool {

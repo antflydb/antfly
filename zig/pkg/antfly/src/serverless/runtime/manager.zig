@@ -446,8 +446,10 @@ pub const ManagedRuntime = struct {
                         errdefer if (embedder_owned) dense_embedder.deinit(self.alloc);
                         try enricher.setChunkEmbedder(dense_embedder, dense_name, dims);
                         embedder_owned = false;
+                        try enricher.configureModelChunkerFromIndexes(parsed.value, dense_name, self.cfg.embedder_options);
                     } else {
                         enricher.clearChunkEmbedder();
+                        enricher.clearModelChunker();
                     }
                 },
                 .chunk_preview, .rerank_terms => {},
@@ -458,6 +460,7 @@ pub const ManagedRuntime = struct {
             // namespace's managed embedder configuration.
             enricher.clearSparseEmbedder();
             enricher.clearChunkEmbedder();
+            enricher.clearModelChunker();
         }
 
         try cancellation.check();

@@ -27540,6 +27540,12 @@ fn appendRuntimeEnrichmentStatusRecord(
         try appendInt(alloc, out, u64, record.inference_timeout_count);
         try appendInt(alloc, out, u64, record.inference_cancel_count);
     }
+    if (runtime_status_protocol.profileSatisfies(version, runtime_status_protocol.media_output_record_version)) {
+        try out.append(alloc, @intFromBool(record.output_counts_available));
+        inline for (.{ "embedding", "transcribe", "classify" }) |kind| inline for (.{ "complete", "failed", "terminal", "degraded" }) |name| {
+            try appendInt(alloc, out, u64, @field(@field(record.output_counts, kind), name));
+        };
+    }
 }
 
 fn readRuntimeEnrichmentStatusRecord(
@@ -27647,6 +27653,14 @@ fn readRuntimeEnrichmentStatusRecord(
         result.active_progress_total = try readInt(encoded, pos, u64);
         result.inference_timeout_count = try readInt(encoded, pos, u64);
         result.inference_cancel_count = try readInt(encoded, pos, u64);
+    }
+    if (runtime_status_protocol.profileSatisfies(version, runtime_status_protocol.media_output_record_version)) {
+        if (pos.* >= encoded.len or encoded[pos.*] > 1) return error.InvalidMetadataTransitionEncoding;
+        result.output_counts_available = encoded[pos.*] != 0;
+        pos.* += 1;
+        inline for (.{ "embedding", "transcribe", "classify" }) |kind| inline for (.{ "complete", "failed", "terminal", "degraded" }) |name| {
+            @field(@field(result.output_counts, kind), name) = try readInt(encoded, pos, u64);
+        };
     }
     return result;
 }
@@ -36173,13 +36187,13 @@ test "runtime status V18 carries schema epoch without changing V17 layout" {
         .node_id = 4,
         .schema_epoch = 9,
     };
-    try appendRuntimeGroupStatusRecord(alloc, &encoded, status, runtime_status_protocol.current_record_version);
+    try appendRuntimeGroupStatusRecord(alloc, &encoded, status, runtime_status_protocol.schema_epoch_record_version);
     var pos: usize = 0;
     const decoded = try readRuntimeGroupStatusRecord(alloc, encoded.items, &pos);
     defer metadata_table_manager.freeRuntimeGroupStatusReport(alloc, decoded);
     try std.testing.expectEqual(encoded.items.len, pos);
     try std.testing.expectEqual(@as(u32, 9), decoded.schema_epoch);
-    try std.testing.expectEqual(runtime_status_protocol.current_record_version, runtimeGroupStatusRecordVersion(status));
+    try std.testing.expectEqual(runtime_status_protocol.schema_epoch_record_version, runtimeGroupStatusRecordVersion(status));
 
     encoded.clearRetainingCapacity();
     try std.testing.expectError(error.InvalidMetadataTransitionEncoding, appendRuntimeGroupStatusRecord(
@@ -39553,4 +39567,26 @@ test "resolver curation namespace propagation rejects source edits racing propos
     try std.testing.expect(try store.resolverProjectionValid(a, group, ordinary));
     try store.applyStandaloneCommand(group, .{ .compare_and_replace_table = .{ .expected = source, .replacement = ordinary } });
     try std.testing.expectEqualStrings(ordinary.schema_json, (try store.getTable(a, group, 2)).?.schema_json);
+}
+
+test "runtime status media output counts preserve the v18 wire profile and round trip v19" {
+    const alloc = std.testing.allocator;
+    const report = metadata.RuntimeEnrichmentStatusReport{ .output_counts_available = true, .output_counts = .{ .embedding = .{ .complete = 4 }, .transcribe = .{ .failed = 2, .terminal = 1 } } };
+    var encoded = std.ArrayListUnmanaged(u8).empty;
+    defer encoded.deinit(alloc);
+    for ([_]u16{ runtime_status_protocol.schema_epoch_record_version, runtime_status_protocol.media_output_record_version }) |version| {
+        encoded.clearRetainingCapacity();
+        try appendRuntimeEnrichmentStatusRecord(alloc, &encoded, report, version);
+        var position: usize = 0;
+        const decoded = try readRuntimeEnrichmentStatusRecord(alloc, encoded.items, &position, version);
+        defer metadata_table_manager.freeRuntimeEnrichmentStatusReport(alloc, decoded);
+        try std.testing.expectEqual(encoded.items.len, position);
+        if (version == runtime_status_protocol.media_output_record_version) {
+            try std.testing.expect(decoded.output_counts_available);
+            try std.testing.expectEqualDeep(report.output_counts, decoded.output_counts);
+        } else {
+            try std.testing.expect(!decoded.output_counts_available);
+            try std.testing.expectEqual(@as(u64, 0), decoded.output_counts.embedding.complete);
+        }
+    }
 }

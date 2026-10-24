@@ -1,0 +1,145 @@
+---
+title: Resumable Media Enrichment
+description: Plan media once and produce independent embeddings, transcripts, and supervised predictions.
+---
+
+## Plan and Output Identity
+
+Model-aware `/chunk` requests name their boundary model explicitly. Only that model, the source version, and the chunk policy determine the plan and parent chunk IDs. Each named output carries its own model identity, revision, and recipe ID. Updating an independent output preserves the parent plan; changing the boundary model or policy creates a new plan.
+
+```json
+{
+  "input": {
+    "type": "source",
+    "uri": "https://recordings.example.com/call.mp4",
+    "mime_type": "video/mp4",
+    "version": "\"immutable-object-etag\"",
+    "version_kind": "strong_etag",
+    "length": 10485760
+  },
+  "outputs": {
+    "boundary_model": "embedding",
+    "targets": [
+      {"name": "embedding", "kind": "embedding", "model": "google/embeddinggemma-2", "dimensions": 768},
+      {"name": "speech", "kind": "transcribe", "model": "openai/whisper-small", "diarize": true, "required": false}
+    ]
+  },
+  "embedding": {"model": "google/embeddinggemma-2", "dimensions": 768, "allow_partial": true},
+  "config": {"max_chunks": 64},
+  "allow_partial": true,
+  "stream": true
+}
+```
+
+The legacy `embedding` option remains supported and corresponds to the output named `embedding`. With named outputs, the explicit boundary wins. A transcribe-only request omits `embedding`, names its transcription target as `boundary_model`, and uses the transcriber's 30-second planning limit. Smaller consumers split a parent window into results keyed by `(parent ordinal, sub_index)`.
+
+Use `model_identity` to pin a deployed model generation when reproducibility across model-alias updates is required. Source references require a strong ETag or S3 version ID. Inline base64 media and plain text use the same client and output contract.
+
+## Durable Embedded Enrichment
+
+An embedded model-aware chunk enrichment requests bounded pages with partial results enabled. The worker commits each page and its cursor together under the current source and worker-ownership fences. A restart reuses those pages and continues from the acknowledged ordinal. A stale continuation restarts preparation from ordinal zero. Single-ordinal replay repairs isolated output gaps; each output retains its own retry count and terminal receipt.
+
+Preparation is private until the existing ordered artifact publisher accepts a complete replacement. Visible chunk recipes, vectors, and output assets keep their existing atomic publication guarantees. After every configured consumer accepts its output, checkpoint compaction removes copied vectors and output payloads. Descriptor pages remain available for later independent-output work, and healthy results are loaded from their published artifact families. A source or boundary change retires the previous checkpoint.
+
+Declare the shared chunk producer once. A dense enrichment consumes its primary vectors. Each independent output that must be stored has an asset enrichment:
+
+```json
+[
+  {
+    "name": "media_windows",
+    "kind": "chunk",
+    "field": "recording",
+    "chunker": {
+      "provider": "antfly",
+      "embedding": {"model": "google/embeddinggemma-2", "dimensions": 768},
+      "outputs": {
+        "boundary_model": "embedding",
+        "targets": [
+          {"name": "embedding", "kind": "embedding", "model": "google/embeddinggemma-2", "dimensions": 768},
+          {"name": "speech", "kind": "transcribe", "model": "openai/whisper-small", "required": false}
+        ]
+      }
+    }
+  },
+  {
+    "name": "media_vectors",
+    "kind": "embedding",
+    "field": "text",
+    "source_artifact_name": "media_windows",
+    "expected_dims": 768
+  },
+  {
+    "name": "transcript",
+    "kind": "asset",
+    "source_artifact_name": "media_windows",
+    "producer": {"type": "media_output", "config": {"output_name": "speech"}}
+  },
+  {
+    "name": "transcript_chunks",
+    "kind": "chunk",
+    "field": "text",
+    "source_artifact_name": "transcript",
+    "chunk_size": 512,
+    "full_text_index": true
+  }
+]
+```
+
+These are entries in an index's `enrichments` list. The embeddings index's `embedder` must match the primary embedding model, task, and dimensions; its source is `media_vectors`. A full-text index can select `transcript_chunks` as its source. Model-aware chunk rows always retain descriptors; `store_chunks` additionally retains their payloads. Output payloads are stored separately from chunk recipes.
+
+A `media_output` asset has `object: "media.output.list"`, per-parent output results, searchable `text`, and `transcript_spans`. Spans retain UTF-8 byte offsets, exact nanosecond phrase clocks, parent ordinal, sub-index, and local speaker index. Text chunks cut from that asset retain `_media.transcript_spans` with offsets relative to the text chunk, plus `_media.start_ns` and `_media.end_ns`. Cutting through a phrase preserves that phrase's timing envelope; it does not invent word timestamps. A speaker index is scoped to its parent and sub-window, rather than a recording-wide identity.
+
+For a new fused media pipeline, replace the recording's `transcriber`/`document_extraction` enrichment with the named transcription output and `media_output` asset above. Text consumers read that asset. This removes the separate extraction decode from the new pipeline. The older transcription shorthand remains available for existing provider configurations and PDF/document extraction workflows.
+
+## Failures and Status
+
+A required output must cover every ordinal. A terminal required failure is retained as failed coverage and repair debt. An optional failure makes its output asset `degraded` while healthy vectors remain searchable. The asset reports complete, failed, and terminal parent-chunk counts and preserves the provider error on each failed result.
+
+Runtime status exposes cumulative `output_counts` for embedding, transcription, and classification. Counts are persisted with consumer acknowledgements, so crash replay does not count an acknowledgement twice. They describe accepted output coverage across source/configuration generations, not every inference retry or the current table's row count. During rolling upgrades the aggregate omits this field if any reporting peer lacks the v19 status profile.
+
+## Zero-Shot Labels from Stored Vectors
+
+A `vector_labels` asset consumes a dense embedding enrichment, rather than media. For example:
+
+```json
+{
+  "name": "scene_labels",
+  "kind": "asset",
+  "source_artifact_name": "media_vectors",
+  "producer": {
+    "type": "vector_labels",
+    "config": {
+      "labels": [
+        {"label": "meeting", "prompt": "people speaking in a meeting"},
+        {"label": "music", "prompt": "music playing"}
+      ],
+      "top_k": 2,
+      "min_score": 0.1
+    }
+  }
+}
+```
+
+Vocabulary prompts use the source embedding provider and its computation cache. The stage scores each stored vector with raw dot products, retaining top labels and scores in a derived asset. Scores are similarities, not calibrated probabilities. Changing the vocabulary reads stored vectors and embeds vocabulary prompts; it never fetches or decodes media. Labels used for filtering or aggregation belong in stored assets; ad-hoc semantic queries can continue to query the vectors directly.
+
+## Supervised Media Outputs
+
+A target with `kind: "classify"` names a supervised classifier model. Its vocabulary and preprocessing come from the model bundle, not caller label prompts. The bundle declares `media_classifier` in its manifest, alongside its classification capability, task, and `id2label` vocabulary:
+
+```json
+{
+  "media_classifier": {
+    "input": "waveform",
+    "score_transform": "softmax",
+    "sample_rate": 16000,
+    "normalize_waveform": true,
+    "max_audio_ns": 10000000000
+  }
+}
+```
+
+Waveform sessions accept one float32 `input_values` tensor and return float32 `logits`. Pixel sessions accept `pixel_values` and also declare `width`, `height`, `mean`, `std_dev`, and `resample` in the profile. Scores use the declared softmax or sigmoid transform. Compatible secondary video embedders reuse prepared frame patches from the same decode. Audio classifiers borrow shared PCM; frame classifiers consume the selected decoded frames and prepare their own model-sized pixels. Their model execution runs after decoder-surface preprocessing, without holding another model's execution lock. A planning-only embedding boundary (`execute: false`) also supports frame classification and output repair without running the boundary embedder.
+
+## Serverless
+
+Configured Antfly dense enrichment uses the same model-aware paged client as embedded enrichment. It accepts text, inline media, and immutable source references, and stores chunk descriptors, vectors, independent media results, and transcript spans in the derived document. Other enrichment stages preserve those fields. Serverless publication remains a document-level WAL update; the embedded private-page checkpoint format is not a serverless catalog format.

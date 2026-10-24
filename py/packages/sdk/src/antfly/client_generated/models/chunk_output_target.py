@@ -1,0 +1,153 @@
+from __future__ import annotations
+
+from collections.abc import Mapping
+from typing import Any, TypeVar
+
+from attrs import define as _attrs_define
+from attrs import field as _attrs_field
+
+from ..models.chunk_output_target_kind import ChunkOutputTargetKind
+from ..types import UNSET, Unset
+
+T = TypeVar("T", bound="ChunkOutputTarget")
+
+
+@_attrs_define
+class ChunkOutputTarget:
+    """
+    Attributes:
+        name (str):
+        kind (ChunkOutputTargetKind):
+        model (str):
+        execute (bool | Unset): False retains this model as a planning boundary while skipping its inference; used for
+            independent output repairs. Default: True.
+        required (bool | Unset):  Default: True.
+        model_identity (str | Unset):
+        task_type (str | Unset):  Default: 'RETRIEVAL_DOCUMENT'.
+        dimensions (int | Unset):
+        language (str | Unset):
+        diarize (bool | Unset):  Default: False.
+        top_k (int | Unset):  Default: 5.
+    """
+
+    name: str
+    kind: ChunkOutputTargetKind
+    model: str
+    execute: bool | Unset = True
+    required: bool | Unset = True
+    model_identity: str | Unset = UNSET
+    task_type: str | Unset = "RETRIEVAL_DOCUMENT"
+    dimensions: int | Unset = UNSET
+    language: str | Unset = UNSET
+    diarize: bool | Unset = False
+    top_k: int | Unset = 5
+    additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
+
+    def to_dict(self) -> dict[str, Any]:
+        name = self.name
+
+        kind = self.kind.value
+
+        model = self.model
+
+        execute = self.execute
+
+        required = self.required
+
+        model_identity = self.model_identity
+
+        task_type = self.task_type
+
+        dimensions = self.dimensions
+
+        language = self.language
+
+        diarize = self.diarize
+
+        top_k = self.top_k
+
+        field_dict: dict[str, Any] = {}
+        field_dict.update(self.additional_properties)
+        field_dict.update(
+            {
+                "name": name,
+                "kind": kind,
+                "model": model,
+            }
+        )
+        if execute is not UNSET:
+            field_dict["execute"] = execute
+        if required is not UNSET:
+            field_dict["required"] = required
+        if model_identity is not UNSET:
+            field_dict["model_identity"] = model_identity
+        if task_type is not UNSET:
+            field_dict["task_type"] = task_type
+        if dimensions is not UNSET:
+            field_dict["dimensions"] = dimensions
+        if language is not UNSET:
+            field_dict["language"] = language
+        if diarize is not UNSET:
+            field_dict["diarize"] = diarize
+        if top_k is not UNSET:
+            field_dict["top_k"] = top_k
+
+        return field_dict
+
+    @classmethod
+    def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
+        d = dict(src_dict)
+        name = d.pop("name")
+
+        kind = ChunkOutputTargetKind(d.pop("kind"))
+
+        model = d.pop("model")
+
+        execute = d.pop("execute", UNSET)
+
+        required = d.pop("required", UNSET)
+
+        model_identity = d.pop("model_identity", UNSET)
+
+        task_type = d.pop("task_type", UNSET)
+
+        dimensions = d.pop("dimensions", UNSET)
+
+        language = d.pop("language", UNSET)
+
+        diarize = d.pop("diarize", UNSET)
+
+        top_k = d.pop("top_k", UNSET)
+
+        chunk_output_target = cls(
+            name=name,
+            kind=kind,
+            model=model,
+            execute=execute,
+            required=required,
+            model_identity=model_identity,
+            task_type=task_type,
+            dimensions=dimensions,
+            language=language,
+            diarize=diarize,
+            top_k=top_k,
+        )
+
+        chunk_output_target.additional_properties = d
+        return chunk_output_target
+
+    @property
+    def additional_keys(self) -> list[str]:
+        return list(self.additional_properties.keys())
+
+    def __getitem__(self, key: str) -> Any:
+        return self.additional_properties[key]
+
+    def __setitem__(self, key: str, value: Any) -> None:
+        self.additional_properties[key] = value
+
+    def __delitem__(self, key: str) -> None:
+        del self.additional_properties[key]
+
+    def __contains__(self, key: str) -> bool:
+        return key in self.additional_properties
