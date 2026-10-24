@@ -28,7 +28,7 @@ const Bridge = native.Transaction(docstore.DocStore.Txn);
 const prefix = native.lite_prefix;
 const marker = native.lite_marker;
 const AbsorbedMap = std.StringHashMapUnmanaged([]const c.AbsorbedResult);
-const Consumer = struct { db: *h.db_mod.DB, source: []const u8, cfg: h.db_mod.ResolverConfig, synthetic: bool = false };
+const Consumer = struct { db: *h.db_mod.DB, source: []const u8, cfg: h.db_mod.ResolverConfig, synthetic: bool = false, scope_head: ?native.Head = null };
 pub const Input = struct { action: enum { redirects, merge, unmerge, suppress, unsuppress, distinct }, into: ?[]const u8 = null, replace: bool = false, pin_distinct: bool = false, absorbed: c.Absorbed = .reject, actor: []const u8 = "", reason: []const u8 = "", expected_revision: ?u64 = null, wait: ?c.Wait = null };
 pub const Operation = enum { list, get, create, decide };
 fn json(a: A, item: anytype) ![]u8 {
@@ -56,11 +56,11 @@ fn ensureConsumerIndex(root: *h.Handle, a: A) !void {
             errdefer write.abort();
             try directory.bootstrap(a, &write);
             try write.commit();
-            root.db.core.index_manager.minimum_reader_version.store(catalog.resolver_projection_delta_reader_version, .release);
+            root.db.core.index_manager.minimum_reader_version.store(catalog.resolver_static_profiles_reader_version, .release);
         }
     }
 }
-fn consumers(root: *h.Handle, a: A, table: []const u8, key: []const u8) ![]const Consumer {
+fn consumers(root: *h.Handle, a: A, table: []const u8, key: []const u8, observed_epoch: ?*?u64) ![]const Consumer {
     const directory = @import("../storage/lite/resolver_consumers.zig");
     // Native Lite stores share a physical transaction space. Bootstrap legacy
     // bindings once from catalog bytes; warm calls seek only this destination.
@@ -69,6 +69,7 @@ fn consumers(root: *h.Handle, a: A, table: []const u8, key: []const u8) ![]const
     try ensureConsumerIndex(root, a);
     var txn = try physical.?.beginRead();
     defer txn.abort();
+    if (observed_epoch) |captured_epoch| captured_epoch.* = try directory.epoch(&txn);
     var bindings: std.ArrayList(directory.Binding) = .empty;
     for (try directory.matchingNamespacePrefixes(a, &txn, table, key)) |target| {
         var cursor = try txn.openCursor();
@@ -85,7 +86,8 @@ fn consumers(root: *h.Handle, a: A, table: []const u8, key: []const u8) ![]const
     for (bindings.items) |binding| {
         if (binding.source_id != 0 and root.embedded_table_records.get(binding.source) != binding.source_id) continue;
         const source = try tables.get(root, binding.source);
-        const cfg = try source.core.index_manager.resolverAdmissionDescriptor(a, binding.resolver, true) orelse continue;
+        const cfg = try source.core.index_manager.resolverAdmissionIdentity(a, binding.resolver) orelse continue;
+        if (cfg.config_generation != binding.config_generation or !std.mem.eql(u8, cfg.admission_profile, binding.profile_id) or binding.profile_id.len == 0) return error.ResolverCurationConflict;
         if (!std.mem.eql(u8, cfg.table, table) or !std.mem.eql(u8, cfg.key_template, binding.key_template)) return error.ResolverCurationConflict;
         try result.append(a, .{ .db = source, .source = binding.source, .cfg = cfg });
     }
@@ -102,6 +104,60 @@ fn legacyConsumers(root: *h.Handle, a: A, table: []const u8, key: []const u8) ![
     };
     return result.items;
 }
+/// Resolve static adjacency outside writer ownership against a pinned physical
+/// index and curated read cut. Publication rechecks both source and head fences.
+fn prepareStaticProfiles(root: *h.Handle, a: A, destination: *h.db_mod.DB, table: []const u8, key: []const u8, into: ?[]const u8, inputs: []const Consumer, expected_epoch: ?u64) ![]const Consumer {
+    const physical = if (root.owned_lite_backend) |*backend| backend.native_docstore else null;
+    if (physical == null or inputs.len == 0) return inputs;
+    const selected = try a.dupe(Consumer, inputs);
+    var physical_read = try physical.?.beginRead();
+    defer physical_read.abort();
+    if (expected_epoch) |expected| if (try @import("../storage/lite/resolver_consumers.zig").epoch(&physical_read) != expected) return error.ResolverCurationConflict;
+    var directory: native.static_profiles.ReadTransaction(@TypeOf(physical_read)) = .{ .txn = &physical_read };
+    var read = try destination.core.store.beginReadTxn();
+    defer read.abort();
+    var bridge: Bridge = .{ .txn = &read };
+    const store = bridge.store(a, prefix);
+    var seen: std.StringHashMapUnmanaged(void) = .empty;
+    for (selected) |source| {
+        const template = source.cfg.key_template;
+        if ((try seen.getOrPut(a, template)).found_existing) continue;
+        const head = try store.head(template);
+        if (head == null) {
+            // Legacy adoption is one cold fold. Until it owns a native head,
+            // source-owned redirects may connect any static declarations.
+            for (selected) |*entry| if (std.mem.eql(u8, entry.cfg.key_template, template)) {
+                const cfg = try entry.db.core.index_manager.resolverAdmissionDescriptor(a, entry.cfg.name, true) orelse return error.ResolverCurationConflict;
+                if (cfg.effectiveGeneration() != entry.cfg.effectiveGeneration()) return error.ResolverCurationConflict;
+                entry.cfg.aliases = cfg.aliases;
+            };
+            continue;
+        }
+        var indexed: native.static_profiles.Reader = .{ .a = a, .backend = directory.backend(), .root = try @import("../storage/lite/resolver_consumers.zig").profileRoot(a, table, template) };
+        _ = (try store.componentIndexed(template, if (into) |target| &.{ key, target } else &.{key}, indexed.lookup())) orelse return error.ResolverCurationConflict;
+        for (selected) |*entry| if (std.mem.eql(u8, entry.cfg.key_template, template)) {
+            entry.scope_head = head;
+            entry.cfg.aliases = indexed.aliases(entry.cfg.admission_profile);
+        };
+    }
+    return selected;
+}
+fn checkDirectoryEpoch(root: *h.Handle, expected: ?u64) !void {
+    const expected_epoch = expected orelse return;
+    const physical = if (root.owned_lite_backend) |*backend| backend.native_docstore else null;
+    if (physical == null) return error.ResolverCurationConflict;
+    var read = try physical.?.beginRead();
+    defer read.abort();
+    if (try @import("../storage/lite/resolver_consumers.zig").epoch(&read) != expected_epoch) return error.ResolverCurationConflict;
+}
+fn checkScopeHeads(a: A, store: native.Store, selected: []const Consumer) !void {
+    var seen: std.StringHashMapUnmanaged(void) = .empty;
+    for (selected) |source| if (source.scope_head) |expected| {
+        if ((try seen.getOrPut(a, expected.key_template)).found_existing) continue;
+        const current = (try store.head(expected.key_template)) orelse return error.ResolverCurationConflict;
+        if (current.revision != expected.revision or !std.mem.eql(u8, &current.fingerprint, &expected.fingerprint)) return error.ResolverCurationConflict;
+    };
+}
 fn ownedConsumers(a: A, store: native.Store, destination: *h.db_mod.DB, current: []const Consumer, table: []const u8, key: []const u8) ![]const Consumer {
     var out: std.ArrayList(Consumer) = .empty;
     try out.appendSlice(a, current);
@@ -114,7 +170,7 @@ fn ownedConsumers(a: A, store: native.Store, destination: *h.db_mod.DB, current:
     return out.items;
 }
 fn initialize(a: A, bridge: *Bridge, store: native.Store, legacy: c.State) !void {
-    try bridge.backendPut(a, catalog.minimum_reader_key, try catalog.readerVersionBytes(catalog.resolver_projection_delta_reader_version));
+    try bridge.backendPut(a, catalog.minimum_reader_key, try catalog.readerVersionBytes(catalog.resolver_static_profiles_reader_version));
     try store.ensureHeadRoutes();
     if (try bridge.backendGet(a, marker) != null) return;
     if (legacy.proposals.len != 0 or legacy.receipt_scope != null) try store.applyQueue(.{ .expected_revision = 0, .revision = 1, .receipt_scope = legacy.receipt_scope, .proposals = legacy.proposals });
@@ -139,9 +195,12 @@ fn prepareAdoption(a: A, destination: *h.db_mod.DB, selected: []const Consumer) 
     var sources: std.AutoHashMapUnmanaged(*h.db_mod.DB, u64) = .empty;
     var profiles: std.StringHashMapUnmanaged(void) = .empty;
     for (selected) |source| {
-        if (source.synthetic or try store.head(source.cfg.key_template) != null) continue;
+        if (source.synthetic) continue;
         const fence = try sources.getOrPut(a, source.db);
         if (!fence.found_existing) fence.value_ptr.* = source.db.core.index_manager.write_plan_generation.load(.acquire);
+        const identity = try source.db.core.index_manager.resolverAdmissionIdentity(a, source.cfg.name) orelse return error.ResolverCurationConflict;
+        if (identity.effectiveGeneration() != source.cfg.effectiveGeneration() or identity.retired != source.cfg.retired or !std.mem.eql(u8, identity.table, source.cfg.table) or !std.mem.eql(u8, identity.key_template, source.cfg.key_template)) return error.ResolverCurationConflict;
+        if (try store.head(source.cfg.key_template) != null) continue;
         const cfg = try source.db.core.index_manager.resolverAdmissionDescriptor(a, source.cfg.name, false) orelse return error.ResolverCurationConflict;
         if (cfg.config_generation != source.cfg.config_generation or cfg.retired != source.cfg.retired or !std.mem.eql(u8, cfg.table, source.cfg.table) or !std.mem.eql(u8, cfg.key_template, source.cfg.key_template)) return error.ResolverCurationConflict;
         const profile = try json(a, .{ cfg.key_template, cfg.merges, cfg.curation_json, cfg.curation_revision });
@@ -266,15 +325,17 @@ fn finish(a: A, bridge: *Bridge, txn: *docstore.DocStore.Txn, db: *h.db_mod.DB, 
     try lease.checkAt(@intCast(@divFloor(@import("antfly_platform").time.realtimeNs(), std.time.ns_per_s)));
     try bridge.flush(a);
     try txn.commit();
-    db.core.index_manager.minimum_reader_version.store(catalog.resolver_projection_delta_reader_version, .release);
+    db.core.index_manager.minimum_reader_version.store(catalog.resolver_static_profiles_reader_version, .release);
 }
 pub fn entity(root: *h.Handle, a: A, table: []const u8, key: []const u8, input: Input, legacy: c.State) ![]const u8 {
     const db = try tables.get(root, table);
     const reading = input.action == .redirects;
     if (!reading and try db.maintenanceRequiresOrderedApply()) return error.OrderedResolverReviewRequired;
     var selected: []const Consumer = &.{};
+    var directory_epoch: ?u64 = null;
     if (!reading) {
-        selected = try consumers(root, a, table, key);
+        selected = try consumers(root, a, table, key, &directory_epoch);
+        selected = try prepareStaticProfiles(root, a, db, table, key, input.into, selected, directory_epoch);
     }
     const prepared = if (reading) PreparedAdoption{} else try prepareAdoption(a, db, selected);
     var lease = if (reading) try db.local_execution.row_policy_gate.enterRawRead() else try db.local_execution.row_policy_gate.enterRaw();
@@ -285,6 +346,8 @@ pub fn entity(root: *h.Handle, a: A, table: []const u8, key: []const u8, input: 
     var bridge: Bridge = .{ .txn = &txn };
     const store = bridge.store(a, prefix);
     if (!reading) {
+        try checkDirectoryEpoch(root, directory_epoch);
+        try checkScopeHeads(a, store, selected);
         try initialize(a, &bridge, store, legacy);
         try adopt(a, store, prepared);
     }
@@ -294,7 +357,7 @@ pub fn entity(root: *h.Handle, a: A, table: []const u8, key: []const u8, input: 
         txn_live = false;
         // Consumer discovery may bootstrap its physical reverse index and
         // open matching sources. Do that before pinning the destination read.
-        selected = try consumers(root, a, table, key);
+        selected = try consumers(root, a, table, key, null);
         txn = try db.core.store.beginReadTxn();
         txn_live = true;
     }
@@ -344,6 +407,7 @@ pub fn proposals(root: *h.Handle, a: A, operation: Operation, table: []const u8,
     // Open matching sources before the destination write transaction. All
     // namespaces share the native file writer; queue-only decisions need none.
     var selected: []const Consumer = &.{};
+    var directory_epoch: ?u64 = null;
     if (!reading) {
         const create = if (operation == .create) try std.json.parseFromSliceLeaky(c.ProposalRequest, a, raw, .{}) else null;
         const decision = if (operation == .decide) try std.json.parseFromSliceLeaky(c.ProposalDecision, a, raw, .{}) else null;
@@ -360,7 +424,9 @@ pub fn proposals(root: *h.Handle, a: A, operation: Operation, table: []const u8,
         const need_sources = if (create != null) current == null else decision.?.accept or decision.?.pin_distinct or decision.?.expected_revision != null or terminal_policy;
         if (need_sources) {
             const key = if (current) |proposal| proposal.key else if (create) |request| request.key else return error.NotFound;
-            selected = try consumers(root, a, table, key);
+            selected = try consumers(root, a, table, key, &directory_epoch);
+            const into = if (current) |proposal| proposal.into else if (create) |request| request.into else null;
+            selected = try prepareStaticProfiles(root, a, db, table, key, into, selected, directory_epoch);
         }
     }
     const prepared = if (reading) PreparedAdoption{} else try prepareAdoption(a, db, selected);
@@ -371,7 +437,11 @@ pub fn proposals(root: *h.Handle, a: A, operation: Operation, table: []const u8,
     defer if (txn_live) txn.abort();
     var bridge: Bridge = .{ .txn = &txn };
     const store = bridge.store(a, prefix);
-    if (!reading) try initialize(a, &bridge, store, legacy);
+    if (!reading) {
+        try checkDirectoryEpoch(root, directory_epoch);
+        try checkScopeHeads(a, store, selected);
+        try initialize(a, &bridge, store, legacy);
+    }
     if (operation == .list) {
         const Query = struct { state: enum { open, accepted, rejected, superseded, all } = .open, action: ?c.EntityAction = null, cursor: []const u8 = "", limit: u16 = 64 };
         const query = try std.json.parseFromSliceLeaky(Query, a, if (raw.len == 0) "{}" else raw, .{});
@@ -677,7 +747,7 @@ test "capi resolver curation prepared adoption fences a source config edit" {
     var cfg: h.db_mod.ResolverConfig = .{ .name = "r", .table = "entities", .source_artifact = "kg", .resolution_artifact = "resolved", .key_template = "concept/{{_key}}", .promote = false };
     try root.db.addResolver(cfg);
     const db = try tables.get(root, "entities");
-    const prepared = try prepareAdoption(a, db, try consumers(root, a, "entities", "concept/a"));
+    const prepared = try prepareAdoption(a, db, try consumers(root, a, "entities", "concept/a", null));
     try std.testing.expectEqual(@as(usize, 1), prepared.namespaces.len);
     cfg.min_confidence = 0.5;
     _ = try root.db.upsertResolverWithResultOptions(cfg, .{ .drain_backfill = false, .wait_for_activity = true });
@@ -687,4 +757,67 @@ test "capi resolver curation prepared adoption fences a source config edit" {
     const store = bridge.store(a, prefix);
     try std.testing.expectError(error.ResolverCurationConflict, adopt(a, store, prepared));
     try std.testing.expect(try store.head(cfg.key_template) == null);
+}
+
+test "capi resolver curation indexed static profiles exclude seventeen thousand unrelated aliases after projection and reopen" {
+    const api = @import("db.zig");
+    const a0 = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a0);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = try api.TestDirectory.init("resolver-indexed-static-profiles");
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, "{s}.aflite", .{tmp.path()});
+    var root = try api.openLiteHandleAllocWithRuntime(std.heap.c_allocator, path, .{ .profile = .native, .externally_locked = true }, true, null, null);
+    var handle = try api.publishHandle(root);
+    defer api.antfly_db_close(handle);
+    try tables.create(root, "entities", "{}", false);
+    for (0..17) |i| {
+        const static = try a.alloc(@import("antfly_resolver").KeyAlias, 1000);
+        for (static, 0..) |*alias, j| alias.* = .{ .key = try std.fmt.allocPrint(a, "concept/noise-{d}-{d}", .{ i, j }), .target = try std.fmt.allocPrint(a, "concept/target-{d}-{d}", .{ i, j }) };
+        if (i == 0) static[0] = .{ .key = "concept/seed", .target = "concept/bridge" };
+        if (i == 1) static[0] = .{ .key = "concept/bridge", .target = "concept/end" };
+        try root.db.addResolver(.{ .name = try std.fmt.allocPrint(a, "r-{d}", .{i}), .table = "entities", .source_artifact = try std.fmt.allocPrint(a, "kg-{d}", .{i}), .resolution_artifact = try std.fmt.allocPrint(a, "out-{d}", .{i}), .key_template = "concept/{{_key}}", .aliases = static, .promote = false });
+    }
+    var out: h.capi.Buffer = .{};
+    defer api.antfly_buffer_free(&out);
+    // Cold adoption folds legacy policy once. Warm operations use adjacency.
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_entity_merge_json(handle, .fromSlice("entities"), .fromSlice("concept/new"), .fromSlice("{\"into\":\"concept/new-target\"}"), &out));
+    api.antfly_buffer_free(&out);
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_run_until_idle(handle));
+    native.static_profiles.test_edge_visits.store(0, .monotonic);
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_entity_merge_json(handle, .fromSlice("entities"), .fromSlice("concept/seed"), .fromSlice("{\"into\":\"concept/final\",\"replace\":true}"), &out));
+    api.antfly_buffer_free(&out);
+    try std.testing.expect(native.static_profiles.test_edge_visits.load(.monotonic) <= 8);
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_run_until_idle(handle));
+    api.antfly_db_close(handle);
+    root = try api.openLiteHandleAllocWithRuntime(std.heap.c_allocator, path, .{ .profile = .native, .externally_locked = true }, false, null, null);
+    handle = try api.publishHandle(root);
+    native.static_profiles.test_edge_visits.store(0, .monotonic);
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_entity_unmerge_json(handle, .fromSlice("entities"), .fromSlice("concept/seed"), .fromSlice("{\"pin_distinct\":true}"), &out));
+    api.antfly_buffer_free(&out);
+    try std.testing.expect(native.static_profiles.test_edge_visits.load(.monotonic) <= 8);
+    try std.testing.expectEqualStrings("16", try root.db.core.store.get(a, catalog.minimum_reader_key));
+}
+
+test "capi resolver curation static directory fences consumers enrolled after discovery" {
+    const api = @import("db.zig");
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = try api.TestDirectory.init("resolver-static-directory-fence");
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, "{s}.aflite", .{tmp.path()});
+    const root = try api.openLiteHandleAllocWithRuntime(std.heap.c_allocator, path, .{ .profile = .native, .externally_locked = true }, true, null, null);
+    const handle = try api.publishHandle(root);
+    defer api.antfly_db_close(handle);
+    try tables.create(root, "entities", "{}", false);
+    var observed: ?u64 = null;
+    const empty = try consumers(root, a, "entities", "concept/seed", &observed);
+    try std.testing.expectEqual(@as(usize, 0), empty.len);
+    try checkDirectoryEpoch(root, observed);
+    try tables.create(root, "late", "{}", false);
+    const late = try tables.get(root, "late");
+    try late.addResolver(.{ .name = "late", .table = "entities", .source_artifact = "kg", .resolution_artifact = "resolved", .key_template = "concept/{{_key}}", .aliases = &.{.{ .key = "concept/seed", .target = "concept/blocked" }}, .promote = false });
+    try std.testing.expectError(error.ResolverCurationConflict, checkDirectoryEpoch(root, observed));
 }

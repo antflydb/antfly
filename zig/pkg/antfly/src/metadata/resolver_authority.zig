@@ -30,18 +30,32 @@ pub const Read = struct {
     into: ?[]const u8 = null,
     seeds: []const []const u8 = &.{},
     profiles: []const AliasProfile = &.{},
+    static_profiles: bool = false,
     include_proposals: bool = true,
     id: []const u8 = "",
     state: ?c.ProposalState = null,
     action: ?c.EntityAction = null,
     cursor: ?[]const u8 = null,
     limit: u32 = 64,
+    pub fn jsonStringify(self: @This(), writer: anytype) !void {
+        try writer.beginObject();
+        inline for (@typeInfo(@This()).@"struct".field_names) |field| {
+            const include = if (comptime std.mem.eql(u8, field, "static_profiles")) self.static_profiles else true;
+            if (include) {
+                try writer.objectField(field);
+                try writer.write(@field(self, field));
+            }
+        }
+        try writer.endObject();
+    }
 };
 pub const View = struct {
     version: u8 = 1,
     native: bool,
     table_id: u64,
     namespaces: []const records.Snapshot = &.{},
+    profiles_indexed: bool = false,
+    profiles: []const AliasProfile = &.{},
     queue_revision: u64 = 0,
     proposals: c.State = .{},
     next_cursor: ?[]const u8 = null,

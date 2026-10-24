@@ -75,10 +75,11 @@ const std = @import("std");
 /// Version 40 carries compact physical namespace bindings and projection reads.
 /// Version 41 carries shared content-addressed namespace execution attachments.
 /// Version 43 maintains shared namespace-scoped consumer routes and readiness.
-pub const current_version: u16 = 43;
-pub const resolver_records_version: u16 = 43;
+/// Version 44 maintains content-addressed static resolver profile adjacency.
+pub const current_version: u16 = 44;
+pub const resolver_records_version: u16 = 44;
 pub const native_service_tables_version: u16 = 38;
-pub const resolver_namespaces_version: u16 = 43;
+pub const resolver_namespaces_version: u16 = 44;
 /// Conservative admission over canonical stored JSON, shared by catalog and
 /// direct table writers so neither entry path can bypass the decoder floor.
 pub fn usesResolverRecords(indexes_json: []const u8) bool {

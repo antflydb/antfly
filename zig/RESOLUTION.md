@@ -2165,3 +2165,43 @@ authority incarnation and missing-authority state. Retired identities have no
 replay workers, so unrelated live-worker backlog cannot hold entity curation
 pending. Retirement never substitutes for an explicit source-journal watermark;
 those waits still require their sequence proof.
+
+
+### Indexed static profiles and compact owner observations
+
+Static declarations have a shared content-addressed adjacency index. A profile
+identity includes its key template, aliases and suppression policy. Source
+bindings reference that immutable identity; profile refcounts and forward/reverse
+edges change atomically with source enrollment, edits, retirement and removal.
+Identical profiles share their graph. Source execution-only edits leave it intact.
+The per-owner descriptor cache retains profile identities until catalog changes;
+worker projection clocks do not invalidate static content identity.
+
+Native point planning traverses curated and indexed static edges together, then
+loads only the incident aliases for profile validation. A namespace with 17,000
+unrelated static aliases no longer transports, copies or reindexes that universe
+for a tiny correction. Traversal limits cover the visited component and its
+edges, consistently for routed and embedded execution. Suppression policies and
+source publication fences still apply. Legacy adoption folds source-owned state
+once; warm native operations use the index.
+
+Metadata publishes v4 consumer/profile readiness only after its bounded backfill
+finishes, under topology protocol 44. Lite bootstraps the same layout atomically
+and installs reader floor 16. Embedded planning builds the static component
+outside writer ownership, checks source/catalog generations and validates the
+observed curated head again inside the final transaction. Routed publication
+retains the catalog revision, physical authority and head fences.
+
+Resolver progress reads the compact, named current-owner contract directly,
+without constructing full runtime-status/index snapshots. A non-waiting request
+samples once; a waiting request repeats bounded group batches within its budget.
+Both can obtain retirement and empty-owner proofs. Ordinary runtime snapshots
+also preserve every namespace publication clock when cloning diagnostics.
+
+
+Lite additionally captures the static-directory epoch with consumer discovery
+and checks it after acquiring the destination writer. Late enrollment, source
+removal and directory changes fence publication even when no initially selected
+source changes. Read-only redirect inspection retains curated-only traversal.
+Progress routing uses identity and range directories directly; it neither loads
+DDL bodies nor builds runtime snapshots.

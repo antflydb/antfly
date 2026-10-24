@@ -12909,7 +12909,7 @@ pub const IndexManager = struct {
     /// Import immutable policy once into this owner's allocator. Transient
     /// metadata arenas never lend their lifetime to persistent catalog slots.
     const ResolverSlot = struct { retired: bool, index: usize };
-    const ResolverNamespaceLookup = struct { arena: std.heap.ArenaAllocator, slots: std.StringHashMapUnmanaged(std.ArrayList(ResolverSlot)), names: std.StringHashMapUnmanaged(ResolverSlot), reserved: std.StringHashMapUnmanaged(void) };
+    const ResolverNamespaceLookup = struct { arena: std.heap.ArenaAllocator, slots: std.StringHashMapUnmanaged(std.ArrayList(ResolverSlot)), names: std.StringHashMapUnmanaged(ResolverSlot), profiles: std.StringHashMapUnmanaged([]const u8) = .empty, reserved: std.StringHashMapUnmanaged(void) };
     fn invalidateResolverNamespaceLookup(self: *IndexManager) void {
         if (self.resolver_namespace_lookup) |*lookup| lookup.arena.deinit();
         self.resolver_namespace_lookup = null;
@@ -13258,7 +13258,7 @@ pub const IndexManager = struct {
         try txn.put(try durable.key(arena.allocator(), table, namespace.key_template), try std.json.Stringify.valueAlloc(arena.allocator(), durable.Record{ .table = table, .table_id = table_id, .namespace = namespace, .bindings = bindings }, .{}));
         const epoch = if (txn.get(durable.epoch_key)) |raw| try std.fmt.parseInt(u64, raw, 10) else |err| if (err == error.NotFound) @as(u64, 0) else return err;
         try txn.put(durable.epoch_key, try std.fmt.allocPrint(arena.allocator(), "{d}", .{try std.math.add(u64, epoch, 1)}));
-        try txn.put(resolver_catalog.minimum_reader_key, try resolver_catalog.readerVersionBytes(resolver_catalog.resolver_projection_delta_reader_version));
+        try txn.put(resolver_catalog.minimum_reader_key, try resolver_catalog.readerVersionBytes(resolver_catalog.resolver_static_profiles_reader_version));
         try txn.put(resolver_catalog.reresolve_resume_key, "");
         try txn.put(resolver_catalog.reresolve_repair_resume_key, "");
         if (completion) |work| {
@@ -13266,7 +13266,7 @@ pub const IndexManager = struct {
             try txn.put(@import("../../lite/resolver_consumers.zig").cursor_key, work.key);
         }
         try txn.commit();
-        self.minimum_reader_version.store(resolver_catalog.resolver_projection_delta_reader_version, .release);
+        self.minimum_reader_version.store(resolver_catalog.resolver_static_profiles_reader_version, .release);
         self.invalidateWritePlanSnapshot();
         published = true;
         return true;
@@ -13379,6 +13379,30 @@ pub const IndexManager = struct {
         const slot = self.resolver_namespace_lookup.?.names.get(name) orelse return null;
         const cfg = if (slot.retired) self.retired_resolvers.items[slot.index] else self.resolvers.items[slot.index];
         return try resolver_catalog.ResolverAdmission.cloneConfig(alloc, cfg, namespace_owned);
+    }
+    /// Indexed consumers need source clocks and suppression, not the complete
+    /// alias universe. The physical static-profile directory supplies adjacency.
+    pub fn resolverAdmissionIdentity(self: *IndexManager, alloc: Allocator, name: []const u8) !?ResolverConfig {
+        self.catalog_mutex.lockExclusive();
+        defer self.catalog_mutex.unlockExclusive();
+        try self.ensureResolverLookup();
+        const slot = self.resolver_namespace_lookup.?.names.get(name) orelse return null;
+        const cfg = if (slot.retired) self.retired_resolvers.items[slot.index] else self.resolvers.items[slot.index];
+        var descriptor = resolver_catalog.ResolverAdmission.fromConfig(cfg, true);
+        // Namespace projection clocks advance independently of static source
+        // definitions. Cache content identity until catalog publication, never
+        // fence static adjacency on a projected resolution-generation clock.
+        const lookup = &self.resolver_namespace_lookup.?;
+        const profile = try lookup.profiles.getOrPut(lookup.arena.allocator(), cfg.name);
+        if (!profile.found_existing) {
+            errdefer _ = lookup.profiles.remove(cfg.name);
+            const definition: @import("../resolver_static_profiles.zig").Definition = .{ .key_template = cfg.key_template, .aliases = cfg.aliases, .suppress_json = cfg.suppress_json };
+            profile.key_ptr.* = try lookup.arena.allocator().dupe(u8, cfg.name);
+            profile.value_ptr.* = try definition.identity(lookup.arena.allocator());
+        }
+        descriptor.admission_profile = profile.value_ptr.*;
+        descriptor.aliases = &.{};
+        return try ResolverConfig.clone(alloc, descriptor.config());
     }
     /// One public active execution definition, with visibility checked before
     /// cloning any policy. Reviews must never select a retired/private stream.

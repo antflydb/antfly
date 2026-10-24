@@ -22,6 +22,7 @@ const resolver = @import("antfly_resolver");
 const c = resolver.curation;
 const policy = @import("resolver_namespace.zig");
 const A = std.mem.Allocator;
+pub const static_profiles = @import("resolver_static_profiles.zig");
 pub const lite_prefix = "\x00\x00__metadata__:resolver_authority:v1:";
 pub const lite_marker = lite_prefix ++ "version";
 pub const Row = struct { key: []const u8, value: []const u8 };
@@ -50,7 +51,8 @@ pub const Edit = struct { kind: Kind, id: []const u8, value: ?std.json.Value };
 pub const Patch = struct { expected_revision: u64, next: Head, edits: []const Edit };
 pub const QueueHead = struct { version: u8 = 1, revision: u64 = 0, count: u32 = 0, bytes: u64 = 0, receipt_scope: ?c.ReceiptScope = null };
 pub const QueuePatch = struct { expected_revision: u64, revision: u64, receipt_scope: ?c.ReceiptScope = null, proposals: []const c.Proposal = &.{} };
-pub const AliasProfile = struct { key_template: []const u8, aliases: []const resolver.KeyAlias, suppress_json: []const u8 = "" };
+pub const AliasLookup = struct { ptr: *anyopaque, expand: *const fn (*anyopaque, A, []const u8, bool) anyerror![]const resolver.KeyAlias };
+pub const AliasProfile = struct { id: []const u8 = "", key_template: []const u8, aliases: []const resolver.KeyAlias, suppress_json: []const u8 = "" };
 pub fn effectiveAliases(a: A, namespace: policy.Namespace, profiles: []const AliasProfile, key: []const u8, into: ?[]const u8) ![]const resolver.KeyAlias {
     const Edge = struct { target: []const u8, conflict: bool = false };
     var authoritative: std.StringHashMapUnmanaged(void) = .empty;
@@ -308,6 +310,12 @@ pub const Store = struct {
         return self.componentWithAliases(template, seeds, &.{});
     }
     pub fn componentWithAliases(self: Store, template: []const u8, seeds: []const []const u8, static_aliases: []const resolver.KeyAlias) !?Snapshot {
+        return self.componentGraph(template, seeds, static_aliases, null);
+    }
+    pub fn componentIndexed(self: Store, template: []const u8, seeds: []const []const u8, lookup: AliasLookup) !?Snapshot {
+        return self.componentGraph(template, seeds, &.{}, lookup);
+    }
+    fn componentGraph(self: Store, template: []const u8, seeds: []const []const u8, static_aliases: []const resolver.KeyAlias, lookup: ?AliasLookup) !?Snapshot {
         var forward: std.StringHashMapUnmanaged(std.ArrayList([]const u8)) = .empty;
         var reverse: std.StringHashMapUnmanaged(std.ArrayList([]const u8)) = .empty;
         for (static_aliases) |alias| {
@@ -329,6 +337,10 @@ pub const Store = struct {
             const id = pending.items[offset];
             if ((try seen.getOrPut(self.a, id)).found_existing) continue;
             if (seen.count() > 16384) return error.ResolverCurationLimitExceeded;
+            if (lookup) |indexed| for (try indexed.expand(indexed.ptr, self.a, id, false)) |edge| {
+                try pending.append(self.a, edge.key);
+                try pending.append(self.a, edge.target);
+            };
             if (forward.get(id)) |edges| try pending.appendSlice(self.a, edges.items);
             if (reverse.get(id)) |edges| try pending.appendSlice(self.a, edges.items);
             if (try self.get(resolver.KeyAlias, template, .redirect, id)) |alias| {
@@ -363,6 +375,7 @@ pub const Store = struct {
                 const id = paths.items[path_offset];
                 if ((try seen.getOrPut(self.a, id)).found_existing) continue;
                 if (seen.count() > 16384) return error.ResolverCurationLimitExceeded;
+                if (lookup) |indexed| for (try indexed.expand(indexed.ptr, self.a, id, true)) |edge| try paths.append(self.a, edge.target);
                 if (forward.get(id)) |edges| try paths.appendSlice(self.a, edges.items);
                 if (try self.get(resolver.KeyAlias, template, .redirect, id)) |alias| {
                     try values.aliases.append(self.a, alias);

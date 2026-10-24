@@ -79,7 +79,8 @@ pub const native_resolver_records_reader_version: u32 = 12;
 pub const resolver_projection_bindings_reader_version: u32 = 13;
 pub const resolver_projection_work_reader_version: u32 = 14;
 pub const resolver_projection_delta_reader_version: u32 = 15;
-pub const supported_reader_version: u32 = resolver_projection_delta_reader_version;
+pub const resolver_static_profiles_reader_version: u32 = 16;
+pub const supported_reader_version: u32 = resolver_static_profiles_reader_version;
 
 pub fn readerVersionBytes(version: u32) ![]const u8 {
     return switch (version) {
@@ -309,6 +310,7 @@ pub const ResolverAdmission = struct {
     key_template: []const u8,
     source_artifact: []const u8 = "",
     resolution_artifact: []const u8 = "",
+    admission_profile: []const u8 = "",
     aliases: []const resolver_lib.KeyAlias = &.{},
     suppress_json: []const u8 = "",
     merges: []const resolver_lib.KeyAlias = &.{},
@@ -364,6 +366,7 @@ pub const ResolverConfig = struct {
     /// Template that renders a canonical entity key from a mention.
     key_template: []const u8,
     /// Explicit key redirects, usable without entity promotion.
+    admission_profile: []const u8 = "",
     aliases: []const resolver_lib.KeyAlias = &.{},
     /// API-created redirects are durable identity state, never inline config.
     merges: []const resolver_lib.KeyAlias = &.{},
@@ -567,7 +570,7 @@ pub const ResolverConfig = struct {
                     .adjudicate_json, .suppress_json, .curation_json => @field(self, field).len == 0,
                     .namespace_curation_missing, .retired => !@field(self, field),
                     .namespace_curation_table_id, .namespace_curation_generation, .curation_revision, .merge_generation, .merge_state_version, .resolution_generation, .namespace_generation => @field(self, field) == 0,
-                    .aliases, .replacement_index, .replacement_resolver => @field(self, field).len == 0,
+                    .aliases, .admission_profile, .replacement_index, .replacement_resolver => @field(self, field).len == 0,
                     .promote => self.promote,
                     .inline_managed => self.inline_managed == null,
                     .retain_work => self.retain_work == .full,
@@ -706,6 +709,7 @@ pub const ResolverConfig = struct {
         if (self.candidate_ann_index.len > 0) alloc.free(@constCast(self.candidate_ann_index));
         if (self.name_embedding.len > 0) alloc.free(@constCast(self.name_embedding));
         if (self.fusion_combine.len > 0) alloc.free(@constCast(self.fusion_combine));
+        if (self.admission_profile.len > 0) alloc.free(self.admission_profile);
         if (self.replacement_index.len > 0) alloc.free(self.replacement_index);
         if (self.replacement_resolver.len > 0) alloc.free(self.replacement_resolver);
         self.* = undefined;
@@ -731,6 +735,7 @@ pub const ResolverConfig = struct {
         try @import("../resolver_authority.zig").validateProfile(a, .{ .key_template = self.key_template, .merges = self.merges, .state = try resolver_lib.curation.parseState(a, self.curation_json) }, self.aliases, self.suppress_json);
     }
     pub fn validateDefinition(self: ResolverConfig) !void {
+        if (self.admission_profile.len != 0) return error.InvalidResolverConfig;
         if (self.adjudicate_json.len > 0) {
             if (self.scorer_json.len == 0) return error.InvalidResolverConfig;
             try @import("../../../functions/resolver_adjudication.zig").validate(std.heap.page_allocator, self.adjudicate_json);

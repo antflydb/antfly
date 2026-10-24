@@ -1,0 +1,189 @@
+// Copyright 2026 Antfly, Inc.
+// SPDX-License-Identifier: Apache-2.0
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//! Content-addressed static alias profiles and indexed component adjacency.
+//! Source enrollment/refcounts and both edge directions publish atomically.
+const std = @import("std");
+const records = @import("resolver_authority.zig");
+const resolver = @import("antfly_resolver");
+const A = std.mem.Allocator;
+pub var test_edge_visits: std.atomic.Value(usize) = .init(0);
+const routes = @import("resolver_namespace_routes.zig");
+pub const Definition = struct {
+    key_template: []const u8,
+    aliases: []const resolver.KeyAlias = &.{},
+    suppress_json: []const u8 = "",
+    pub fn identity(self: Definition, a: A) ![]const u8 {
+        var buffer: [1024]u8 = undefined;
+        var writer: std.Io.Writer.Hashing(std.crypto.hash.sha2.Sha256) = .init(&buffer);
+        try std.json.Stringify.value(self, .{}, &writer.writer);
+        try writer.writer.flush();
+        var digest: [32]u8 = undefined;
+        writer.hasher.final(&digest);
+        return a.dupe(u8, &std.fmt.bytesToHex(digest, .lower));
+    }
+};
+const Head = struct { refs: u64, key_template: []const u8, suppress_json: []const u8 };
+const Edge = struct { profile: []const u8, key: []const u8, target: []const u8 };
+fn headKey(a: A, root: []const u8, id: []const u8) ![]const u8 {
+    return std.fmt.allocPrint(a, "{s}profile/{s}", .{ root, id });
+}
+fn edgeKey(a: A, root: []const u8, direction: []const u8, node: []const u8, profile: []const u8, key: []const u8) ![]const u8 {
+    return std.fmt.allocPrint(a, "{s}{s}/{s}/{s}/{s}", .{ root, direction, try routes.digest(a, node), profile, try routes.digest(a, key) });
+}
+/// Deltas are per source/namespace. Identical profiles share one graph, even
+/// when thousands of resolvers reference it. Execution-only edits do no work.
+pub fn synchronize(a: A, txn: anytype, root: []const u8, before: []const Definition, after: []const Definition) !void {
+    const Count = struct { delta: i64 = 0, definition: Definition };
+    var counts: std.StringHashMapUnmanaged(Count) = .empty;
+    inline for (.{ before, after }, .{ @as(i64, -1), @as(i64, 1) }) |definitions, delta| for (definitions) |definition| {
+        const id = try definition.identity(a);
+        const entry = try counts.getOrPut(a, id);
+        if (!entry.found_existing) entry.value_ptr.* = .{ .definition = definition };
+        entry.value_ptr.delta = try std.math.add(i64, entry.value_ptr.delta, delta);
+    };
+    var it = counts.iterator();
+    while (it.next()) |entry| {
+        const delta = entry.value_ptr.delta;
+        if (delta == 0) continue;
+        const definition = entry.value_ptr.definition;
+        const id = entry.key_ptr.*;
+        const key = try headKey(a, root, id);
+        const old = txn.get(key) catch |err| if (err == error.NotFound) null else return err;
+        var head: Head = if (old) |raw| try std.json.parseFromSliceLeaky(Head, a, raw, .{}) else .{ .refs = 0, .key_template = definition.key_template, .suppress_json = definition.suppress_json };
+        const prior = head.refs;
+        head.refs = if (delta > 0) try std.math.add(u64, head.refs, @intCast(delta)) else try std.math.sub(u64, head.refs, @intCast(-delta));
+        if (head.refs == 0) try txn.delete(key) else try txn.put(key, try std.json.Stringify.valueAlloc(a, head, .{}));
+        if ((prior == 0) == (head.refs == 0)) continue;
+        for (definition.aliases) |alias| {
+            const out = try edgeKey(a, root, "out", alias.key, id, alias.key);
+            const in = try edgeKey(a, root, "in", alias.target, id, alias.key);
+            if (head.refs == 0) {
+                try txn.delete(out);
+                try txn.delete(in);
+            } else {
+                const raw = try std.json.Stringify.valueAlloc(a, Edge{ .profile = id, .key = alias.key, .target = alias.target }, .{});
+                try txn.put(out, raw);
+                try txn.put(in, raw);
+            }
+        }
+    }
+}
+pub const Reader = struct {
+    a: A,
+    backend: records.Backend,
+    root: []const u8,
+    profiles: std.StringArrayHashMapUnmanaged(Profile) = .empty,
+    seen: std.StringHashMapUnmanaged(void) = .empty,
+    visits: usize = 0,
+    const Profile = struct { head: Head, aliases: std.ArrayList(resolver.KeyAlias) = .empty };
+    pub fn lookup(self: *Reader) records.AliasLookup {
+        return .{ .ptr = self, .expand = expand };
+    }
+    pub fn aliases(self: *Reader, id: []const u8) []const resolver.KeyAlias {
+        return if (self.profiles.get(id)) |profile| profile.aliases.items else &.{};
+    }
+    pub fn values(self: *Reader) ![]const records.AliasProfile {
+        const result = try self.a.alloc(records.AliasProfile, self.profiles.count());
+        for (self.profiles.keys(), self.profiles.values(), result) |id, profile, *value| value.* = .{ .id = id, .key_template = profile.head.key_template, .suppress_json = profile.head.suppress_json, .aliases = profile.aliases.items };
+        return result;
+    }
+    fn expand(ptr: *anyopaque, a: A, id: []const u8, forward_only: bool) ![]const resolver.KeyAlias {
+        const self: *Reader = @ptrCast(@alignCast(ptr));
+        var edges: std.ArrayList(resolver.KeyAlias) = .empty;
+        for ([_][]const u8{ "out", "in" }, 0..) |direction, i| {
+            if (forward_only and i == 1) break;
+            const prefix = try std.fmt.allocPrint(a, "{s}{s}/{s}/", .{ self.root, direction, try routes.digest(a, id) });
+            var after: ?[]const u8 = null;
+            while (true) {
+                const page = try self.backend.scan(self.backend.ptr, a, prefix, after, 128);
+                for (page.rows) |row| {
+                    self.visits += 1;
+                    if (comptime @import("builtin").is_test) _ = test_edge_visits.fetchAdd(1, .monotonic);
+                    const edge = try std.json.parseFromSliceLeaky(Edge, a, row.value, .{ .allocate = .alloc_always });
+                    if (!std.mem.eql(u8, if (i == 0) edge.key else edge.target, id)) return error.InvalidCatalogRecord;
+                    const alias: resolver.KeyAlias = .{ .key = edge.key, .target = edge.target };
+                    try edges.append(a, alias);
+                    if ((try self.seen.getOrPut(a, row.value)).found_existing) continue;
+                    if (self.seen.count() > 16384) return error.ResolverCurationLimitExceeded;
+                    const profile = try self.profiles.getOrPut(a, edge.profile);
+                    if (!profile.found_existing) {
+                        const raw = (try self.backend.get(self.backend.ptr, a, try headKey(a, self.root, edge.profile))) orelse return error.InvalidCatalogRecord;
+                        profile.value_ptr.* = .{ .head = try std.json.parseFromSliceLeaky(Head, a, raw, .{}) };
+                    }
+                    try profile.value_ptr.aliases.append(a, alias);
+                }
+                after = page.next;
+                if (after == null) break;
+            }
+        }
+        return edges.items;
+    }
+};
+
+/// Read-only adapter for the Lite physical transaction. Unlike logical DB
+/// stores this can see cross-source adjacency in the shared file snapshot.
+pub fn ReadTransaction(comptime Txn: type) type {
+    return struct {
+        txn: *Txn,
+        fn get(ptr: *anyopaque, a: A, key: []const u8) !?[]const u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            const raw = self.txn.get(key) catch |err| return if (err == error.NotFound) null else err;
+            return try a.dupe(u8, raw);
+        }
+        fn put(_: *anyopaque, _: A, _: []const u8, _: []const u8) !void {
+            return error.ReadOnly;
+        }
+        fn remove(_: *anyopaque, _: A, _: []const u8) !void {
+            return error.ReadOnly;
+        }
+        fn scan(ptr: *anyopaque, a: A, prefix: []const u8, after: ?[]const u8, limit: u32) !records.Page {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            var cursor = try self.txn.openCursor();
+            defer cursor.close();
+            const Payload = @typeInfo(@TypeOf(cursor.seekAtOrAfter(prefix))).error_union.payload;
+            const Entry = if (@typeInfo(Payload) == .optional) @typeInfo(Payload).optional.child else Payload;
+            var row: ?Entry = cursor.seekAtOrAfter(after orelse prefix) catch |err| if (err == error.NotFound) null else return err;
+            if (after) |key| if (row) |entry| if (std.mem.eql(u8, entry.key, key)) {
+                row = cursor.next() catch |err| if (err == error.NotFound) null else return err;
+            };
+            var rows: std.ArrayList(records.Row) = .empty;
+            while (row) |entry| {
+                if (!std.mem.startsWith(u8, entry.key, prefix)) break;
+                if (rows.items.len == limit) return .{ .rows = rows.items, .next = rows.items[rows.items.len - 1].key };
+                try rows.append(a, .{ .key = try a.dupe(u8, entry.key), .value = try a.dupe(u8, entry.value) });
+                row = cursor.next() catch |err| if (err == error.NotFound) null else return err;
+            }
+            return .{ .rows = rows.items };
+        }
+        pub fn backend(self: *@This()) records.Backend {
+            return .{ .ptr = self, .get = get, .put = put, .remove = remove, .scan = scan };
+        }
+    };
+}
+
+test "resolver curation namespace propagation static profile identities stream large declarations" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const entries = try a.alloc(resolver.KeyAlias, 1000);
+    for (entries, 0..) |*alias, i| alias.* = .{ .key = try std.fmt.allocPrint(a, "concept/from-{d}", .{i}), .target = try std.fmt.allocPrint(a, "concept/into-{d}", .{i}) };
+    const definition: Definition = .{ .key_template = "concept/{{_key}}", .aliases = entries, .suppress_json = "{}" };
+    var buffer: [64]u8 = undefined;
+    var bounded = std.heap.FixedBufferAllocator.init(&buffer);
+    const id = try definition.identity(bounded.allocator());
+    const expected = try routes.digest(a, try std.json.Stringify.valueAlloc(a, definition, .{}));
+    try std.testing.expectEqualStrings(expected, id);
+}

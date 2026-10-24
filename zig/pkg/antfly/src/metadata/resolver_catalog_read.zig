@@ -29,10 +29,12 @@ pub const Request = struct {
     /// null expands all policies; an empty list is a descriptor/status cut.
     projection_names: ?[]const []const u8 = null,
     routing_siblings: bool = false,
+    /// Progress routing needs identity/ranges, never DDL or policy bodies.
+    identity_only: bool = false,
     pub fn jsonStringify(self: @This(), writer: anytype) !void {
         try writer.beginObject();
         inline for (@typeInfo(@This()).@"struct".field_names) |field| {
-            const include = if (comptime std.mem.eql(u8, field, "authority")) self.authority != null else if (comptime std.mem.eql(u8, field, "table_id")) self.table_id != 0 else if (comptime std.mem.eql(u8, field, "compact_consumers")) self.compact_consumers else true;
+            const include = if (comptime std.mem.eql(u8, field, "identity_only")) self.identity_only else if (comptime std.mem.eql(u8, field, "authority")) self.authority != null else if (comptime std.mem.eql(u8, field, "table_id")) self.table_id != 0 else if (comptime std.mem.eql(u8, field, "compact_consumers")) self.compact_consumers else true;
             if (include) {
                 try writer.objectField(field);
                 try writer.write(@field(self, field));
