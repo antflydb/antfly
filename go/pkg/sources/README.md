@@ -23,7 +23,7 @@ Create `sources.json` with secret **references**, rather than secret values:
 ```json
 {
   "version": 1,
-  "endpoint": "http://127.0.0.1:8080/api/v1",
+  "endpoint": "http://127.0.0.1:8080/db/v1",
   "data_plane_token_env": "ANTFLY_WRITE_KEY",
   "connections": {
     "company-docs": {
@@ -129,7 +129,7 @@ runner also retains a private mirror in its state directory for recovery.
 
 ```sh
 antfly-source sync --config sources.json --state-dir /var/lib/antfly-sources
-antfly-grep --source-endpoint https://antfly.example/api/v1 \
+antfly-grep --source-endpoint https://antfly.example/db/v1 \
   --source manuals 'retry budget'
 ```
 

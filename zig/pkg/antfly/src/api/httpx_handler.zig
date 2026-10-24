@@ -20219,7 +20219,7 @@ test "linear merge HTTP accepts scoped media and rejects an out of range mutatio
     defer client.deinit();
     const base = try server.baseUrl(a);
     defer a.free(base);
-    const url = try std.fmt.allocPrint(a, "{s}/tables/docs/merge", .{base});
+    const url = try std.fmt.allocPrint(a, "{s}/db/v1/tables/docs/merge", .{base});
     defer a.free(url);
     const headers = [_][2][]const u8{.{ "content-type", "application/vnd.antfly.scoped-merge.v1+json" }};
     var good = try requestWithRetry(&client, io.io(), .POST, url,
