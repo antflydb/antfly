@@ -485,7 +485,9 @@ fn orderProjectedFragment(self: *Build, a: A, pages: *Pages, fragment: Fragment,
     const seen = try a.alloc(bool, count);
     @memset(seen, false);
     var positions: std.StringHashMapUnmanaged(usize) = .empty;
-    var reader: identity.Reader = .{ .root = self.root, .pages = pages };
+    var cache: tree.Cache = .{ .alloc = a, .underlying = pages.store(), .max_bytes = 1024 * 1024 };
+    defer cache.deinit();
+    var reader: identity.Reader = .{ .root = self.root, .pages = pages, .cache = &cache };
     const upper = upperBound(fragment.prefix, fragment.bits);
     var logical = try tree.Cursor.init(a, pages.store(), self.root.current.by_id, &fragment.prefix, if (upper) |*value| value else null);
     defer logical.deinit();
@@ -557,6 +559,10 @@ fn orderProjectedFragment(self: *Build, a: A, pages: *Pages, fragment: Fragment,
 }
 
 fn orderingValue(a: A, columns: []const rows.ColumnVector, row: usize, path: []const u8) !std.json.Value {
+    for (columns) |column| if (std.mem.eql(u8, column.name, path)) {
+        if (column.nulls.isNull(row)) return .null;
+        return column.values.jsonAt(a, row);
+    };
     var parts = std.mem.splitScalar(u8, path, '.');
     const first = parts.next() orelse return .null;
     var value = for (columns) |column| {
