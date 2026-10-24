@@ -33,8 +33,9 @@ pub const Cache = struct {
         context: *anyopaque,
         acquire: *const fn (*anyopaque, usize) anyerror!@import("../runtime/tier/memory.zig").AdmissionLease,
     };
-    pub const Input = union(enum) { mp4: media.mp4.Reader, webm: media.webm.Reader, audio: audio_seek.Index };
+    pub const Input = union(enum) { mp4: media.mp4.Reader, webm: media.webm.Reader, audio: audio_seek.Index, aac: @import("media_chunking_audio_source.zig").Mp4 };
     pub const Data = union(enum) {
+        aac: @import("media_chunking_audio_source.zig").Mp4.Snapshot,
         audio: audio_seek.Index,
         mp4: struct {
             track: media.mp4.Track,
@@ -120,6 +121,15 @@ pub const Cache = struct {
         hash.final(&result);
         return result;
     }
+    pub fn aacKey(source: *const media.source.Source, max_packets: usize, max_working_bytes: usize) ?[32]u8 {
+        const base = key(source, false, max_packets, max_working_bytes) orelse return null;
+        var hash = std.crypto.hash.Blake3.init(.{});
+        hash.update("media-aac-window-index-v1");
+        hash.update(&base);
+        var result: [32]u8 = undefined;
+        hash.final(&result);
+        return result;
+    }
     fn lock(self: *Cache) void {
         while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
     }
@@ -143,6 +153,7 @@ pub const Cache = struct {
     }
     pub fn rememberPlanned(self: *Cache, a: std.mem.Allocator, identity: [32]u8, data: Input, admission: Admission, planning: ?Planning) void {
         const estimate = switch (data) {
+            .aac => |owner| @import("media_chunking_audio_source.zig").Mp4.Snapshot.estimatedBytes(owner),
             .audio => |index| index.estimatedBytes(),
             .mp4 => |r| std.math.mul(usize, r.packets.len, @sizeOf(media.mp4.Packet)) catch return,
             .webm => |r| (std.math.mul(usize, r.packets.len, @sizeOf(media.webm.Packet)) catch return) +| (std.math.mul(usize, r.cues.len, @sizeOf(media.webm.Cue)) catch return),
@@ -209,6 +220,7 @@ pub const Cache = struct {
     fn copy(_: *Cache, entry: *Entry, data: Input) !void {
         const a = entry.arena.allocator();
         switch (data) {
+            .aac => |owner| entry.data = .{ .aac = try @import("media_chunking_audio_source.zig").Mp4.Snapshot.copy(a, owner) },
             .audio => |index| entry.data = .{ .audio = try index.copy(a) },
             .mp4 => |original| {
                 var track = original.track;
@@ -349,7 +361,7 @@ test "model aware media audio index clones own payloads and release admission un
             return controller.tryAcquire(.cpu, .{ .host_limit_bytes = Cache.max_bytes }, .{ .host_scratch_bytes = bytes }, false);
         }
     };
-    for ([_][]const u8{ "tone.mp3", "codec-corpus/tone-stereo.flac" }) |name| {
+    for ([_][]const u8{ "tone.mp3", "codec-corpus/tone-stereo.flac", "codec-corpus/tone-stereo.opus", "codec-corpus/tone-stereo.oga" }) |name| {
         const path = try std.fmt.allocPrint(a, "../../lib/audio/testdata/{s}", .{name});
         defer a.free(path);
         const bytes = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, path, a, .limited(1024 * 1024));
@@ -369,7 +381,7 @@ test "model aware media audio index clones own payloads and release admission un
         // Best-effort insertion absorbs OOM, but every partial clone and lease
         // must still be released. Stop after the first successful allocation run.
         var fail_index: usize = 0;
-        while (fail_index < 256) : (fail_index += 1) {
+        while (fail_index < 4096) : (fail_index += 1) {
             var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = fail_index });
             var fault_cache: Cache = .{};
             fault_cache.remember(failing.allocator(), @splat(2), .{ .audio = hit.data.audio }, .{ .context = &controller, .acquire = Admission.acquire });
@@ -378,7 +390,7 @@ test "model aware media audio index clones own payloads and release admission un
             try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
             if (retained) break;
         }
-        try std.testing.expect(fail_index < 256);
+        try std.testing.expect(fail_index < 4096);
         cache.release(hit);
         try std.testing.expect(Cache.reclaim(&cache, Cache.max_bytes) > 0);
         try std.testing.expectEqual(@as(usize, 0), controller.snapshot().hostTotalBytes());

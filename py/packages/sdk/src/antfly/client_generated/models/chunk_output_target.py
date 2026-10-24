@@ -1,13 +1,17 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import Any, TypeVar
+from typing import TYPE_CHECKING, Any, TypeVar
 
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 
 from ..models.chunk_output_target_kind import ChunkOutputTargetKind
 from ..types import UNSET, Unset
+
+if TYPE_CHECKING:
+    from ..models.chunk_output_target_skip_windows_item import ChunkOutputTargetSkipWindowsItem
+
 
 T = TypeVar("T", bound="ChunkOutputTarget")
 
@@ -21,6 +25,9 @@ class ChunkOutputTarget:
         model (str):
         execute (bool | Unset): False retains this model as a planning boundary while skipping its inference; used for
             independent output repairs. Default: True.
+        skip_windows (list[ChunkOutputTargetSkipWindowsItem] | Unset): Execution-only repair mask for already accepted
+            sub-windows; does not affect the model recipe or boundary plan. Skipped windows return receipts with status
+            skipped.
         required (bool | Unset):  Default: True.
         model_identity (str | Unset):
         task_type (str | Unset):  Default: 'RETRIEVAL_DOCUMENT'.
@@ -34,6 +41,7 @@ class ChunkOutputTarget:
     kind: ChunkOutputTargetKind
     model: str
     execute: bool | Unset = True
+    skip_windows: list[ChunkOutputTargetSkipWindowsItem] | Unset = UNSET
     required: bool | Unset = True
     model_identity: str | Unset = UNSET
     task_type: str | Unset = "RETRIEVAL_DOCUMENT"
@@ -51,6 +59,13 @@ class ChunkOutputTarget:
         model = self.model
 
         execute = self.execute
+
+        skip_windows: list[dict[str, Any]] | Unset = UNSET
+        if not isinstance(self.skip_windows, Unset):
+            skip_windows = []
+            for skip_windows_item_data in self.skip_windows:
+                skip_windows_item = skip_windows_item_data.to_dict()
+                skip_windows.append(skip_windows_item)
 
         required = self.required
 
@@ -77,6 +92,8 @@ class ChunkOutputTarget:
         )
         if execute is not UNSET:
             field_dict["execute"] = execute
+        if skip_windows is not UNSET:
+            field_dict["skip_windows"] = skip_windows
         if required is not UNSET:
             field_dict["required"] = required
         if model_identity is not UNSET:
@@ -96,6 +113,8 @@ class ChunkOutputTarget:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
+        from ..models.chunk_output_target_skip_windows_item import ChunkOutputTargetSkipWindowsItem
+
         d = dict(src_dict)
         name = d.pop("name")
 
@@ -104,6 +123,15 @@ class ChunkOutputTarget:
         model = d.pop("model")
 
         execute = d.pop("execute", UNSET)
+
+        _skip_windows = d.pop("skip_windows", UNSET)
+        skip_windows: list[ChunkOutputTargetSkipWindowsItem] | Unset = UNSET
+        if _skip_windows is not UNSET:
+            skip_windows = []
+            for skip_windows_item_data in _skip_windows:
+                skip_windows_item = ChunkOutputTargetSkipWindowsItem.from_dict(skip_windows_item_data)
+
+                skip_windows.append(skip_windows_item)
 
         required = d.pop("required", UNSET)
 
@@ -124,6 +152,7 @@ class ChunkOutputTarget:
             kind=kind,
             model=model,
             execute=execute,
+            skip_windows=skip_windows,
             required=required,
             model_identity=model_identity,
             task_type=task_type,

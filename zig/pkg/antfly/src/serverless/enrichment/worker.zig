@@ -117,6 +117,58 @@ const EnrichmentError = error{
     ChunkEmbeddingModelFailed,
 };
 
+/// One bounded audit's model-generation observation. Never retained across
+/// namespaces or ticks, and never used as another document's source/plan proof.
+const MediaGenerationSnapshot = struct {
+    const Boundary = struct { model: []const u8, model_identity: []const u8, model_revision: []const u8, task_type: []const u8, dimensions: usize };
+    arena: std.heap.ArenaAllocator,
+    boundary: ?Boundary = null,
+    identities: []const media_outputs.Result = &.{},
+    fn observe(self: *@This(), temporary: Allocator, metadata: *const chunking.inference.RemoteMetadata) !void {
+        if (self.boundary != null) return;
+        const raw = metadata.outputs_json orelse return;
+        if (raw.len > 1024 * 1024) return;
+        var parsed = try std.json.parseFromSlice([]media_outputs.Result, temporary, raw, .{});
+        defer parsed.deinit();
+        if (parsed.value.len > 16) return;
+        const a = self.arena.allocator();
+        const identities = try a.alloc(media_outputs.Result, parsed.value.len);
+        for (identities, parsed.value) |*dest, value| dest.* = .{ .name = try a.dupe(u8, value.name), .kind = value.kind, .required = value.required, .model = try a.dupe(u8, value.model), .model_identity = try a.dupe(u8, value.model_identity), .model_revision = try a.dupe(u8, value.model_revision), .recipe_id = try a.dupe(u8, value.recipe_id), .status = .skipped };
+        self.identities = identities;
+        self.boundary = .{ .model = try a.dupe(u8, metadata.model), .model_identity = try a.dupe(u8, metadata.model_identity), .model_revision = try a.dupe(u8, metadata.model_revision), .task_type = try a.dupe(u8, metadata.task_type), .dimensions = metadata.dimensions };
+    }
+    fn matches(self: *const @This(), a: Allocator, document: std.json.Value, recipe: []const u8, version: u32, legacy: bool) !bool {
+        const boundary = self.boundary orelse return false;
+        const state = document.object.get("_enrichment") orelse return false;
+        if (state != .object or serverlessMediaPending(state)) return false;
+        const old_recipe = state.object.get("chunk_embeddings_recipe") orelse return false;
+        const old_version = state.object.get("chunk_embeddings_version") orelse return false;
+        if (old_recipe != .string or !std.mem.eql(u8, old_recipe.string, recipe) or old_version != .integer or old_version.integer < version) return false;
+        const vectors = document.object.get("chunk_embeddings") orelse return false;
+        if (vectors != .array or vectors.array.items.len == 0) return false;
+        for (vectors.array.items) |row| {
+            if (row != .object) return false;
+            const descriptor = row.object.get("_chunk") orelse return false;
+            if (descriptor != .object) return false;
+            inline for (.{ "model", "model_identity", "model_revision", "task_type" }) |field| {
+                const value = descriptor.object.get(field) orelse return false;
+                if (value != .string or !std.mem.eql(u8, value.string, @field(boundary, field))) return false;
+            }
+            const dimensions = descriptor.object.get("dimensions") orelse return false;
+            if (dimensions != .integer or dimensions.integer < 0 or @as(u64, @intCast(dimensions.integer)) != boundary.dimensions) return false;
+        }
+        const cached = document.object.get("media_outputs") orelse return legacy;
+        if (cached != .object or !cached.object.contains("chunks")) return false;
+        const rows = try std.json.parseFromValueLeaky(struct { chunks: []const media_outputs.Row }, a, cached, .{ .ignore_unknown_fields = true });
+        if (rows.chunks.len == 0 or self.identities.len == 0) return false;
+        for (self.identities) |identity| {
+            const target = media_outputs.Target{ .name = identity.name, .kind = identity.kind, .model = identity.model };
+            for (rows.chunks) |row| if (needsServerlessOutput(target, row.outputs, self.identities)) return false;
+        }
+        return true;
+    }
+};
+
 pub const SparseEnricher = struct {
     alloc: Allocator,
     artifacts: *artifacts_mod.ArtifactStore,
@@ -132,6 +184,7 @@ pub const SparseEnricher = struct {
     model_chunk_provider: ?chunking.Provider = null,
     model_chunk_field: []const u8 = "",
     media_output_max_attempts: u32 = 3,
+    generation_snapshot: ?*MediaGenerationSnapshot = null,
 
     pub fn init(
         alloc: Allocator,
@@ -325,6 +378,19 @@ pub const SparseEnricher = struct {
         if (try @import("../build/document_facts_builder.zig").needsRebuild(self.alloc, facts, manifest.stats.policy, manifest.stats.indexes_json)) return error.EnrichmentPolicyChanged;
         const stage_index: usize = @backingInt(cfg.stage) - 1;
         const pending_count = facts.counts[3 + stage_index];
+        const media_scan = cfg.stage == .chunk_embeddings and self.model_chunker != null;
+        const scan_count = if (media_scan) facts.document_count else pending_count;
+        var scan_fingerprint = facts.policy_fingerprint;
+        if (media_scan) {
+            const canonical = try chunking.types.stringifyAlloc(self.alloc, self.model_chunker.?);
+            defer self.alloc.free(canonical);
+            var hash = std.crypto.hash.sha2.Sha256.init(.{});
+            hash.update("serverless-media-audit-v1");
+            hash.update(&facts.policy_fingerprint);
+            hash.update(canonical);
+            scan_fingerprint = hash.finalResult();
+        }
+
         const pending_page = facts.pending_pages[stage_index];
         const policy = manifest.stats.policy;
         const enabled = switch (cfg.stage) {
@@ -354,7 +420,7 @@ pub const SparseEnricher = struct {
         defer if (previous) |*value| value.deinit(self.progress.allocator);
         if (previous) |value| if (value.head_version > head) return error.EnrichmentProgressChanged;
         const same_pipeline = if (previous) |value| value.pipeline_version == cfg.pipeline_version and
-            std.mem.eql(u8, &value.policy_fingerprint, &facts.policy_fingerprint) else false;
+            std.mem.eql(u8, &value.policy_fingerprint, &scan_fingerprint) else false;
         if (same_pipeline) if (previous.?.cycle_upper_order_key) |key| {
             if (key.len <= 8 or std.mem.readInt(u64, key[0..8], .big) > facts.wal_end_lsn)
                 return error.InvalidEnrichmentStageProgress;
@@ -369,17 +435,19 @@ pub const SparseEnricher = struct {
         var next_offset: u64 = if (same_pipeline and previous.?.head_version == head) previous.?.doc_offset else 0;
         var cycles: u64 = if (previous) |value| value.completed_cycles else 0;
         var stats = EnrichmentRunStats{};
+        var generations = MediaGenerationSnapshot{ .arena = std.heap.ArenaAllocator.init(self.alloc) };
+        defer generations.arena.deinit();
         var expected_latest_lsn = latest_lsn;
-        if (pending_count != 0) {
+        if (scan_count != 0) {
             if (cycle_upper == null) {
                 // Capture one finite cycle under the pinned source. Rank seek
                 // is O(tree height), not a scan of the pending population.
-                var tail = try document_facts.pendingCursorAtRank(self.alloc, pages.store(), facts, stage_index, pending_count - 1);
+                var tail = if (media_scan) try document_facts.mediaCursor(self.alloc, pages.store(), facts, "", scan_count - 1) else try document_facts.pendingCursorAtRank(self.alloc, pages.store(), facts, stage_index, pending_count - 1);
                 defer tail.deinit();
                 const last = (try tail.next()) orelse return error.InvalidDocumentFactsRoot;
                 cycle_upper = try self.alloc.dupe(u8, last.order_key);
             }
-            var cursor = try document_facts.pendingCursor(self.alloc, pages.store(), facts, stage_index, after orelse "");
+            var cursor = if (media_scan) try document_facts.mediaCursor(self.alloc, pages.store(), facts, after orelse "", null) else try document_facts.pendingCursor(self.alloc, pages.store(), facts, stage_index, after orelse "");
             defer cursor.deinit();
             var scanned: usize = 0;
             while (scanned < cfg.scan_batch_size) {
@@ -413,7 +481,7 @@ pub const SparseEnricher = struct {
                 const completed_key = try self.alloc.dupe(u8, record.order_key);
                 var owns_completed_key = true;
                 errdefer if (owns_completed_key) self.alloc.free(completed_key);
-                expected_latest_lsn = self.processPendingDocument(namespace, cfg, &pin, &body_pages, fact, record.key, head, expected_latest_lsn, &stats) catch |err| failed: {
+                expected_latest_lsn = self.processPendingDocument(namespace, cfg, &pin, &body_pages, fact, record.key, head, expected_latest_lsn, &stats, &generations) catch |err| failed: {
                     if (!isRecoverableEnrichmentError(err) and err != error.EnrichmentDocumentBudgetExceeded) return err;
                     stats.failed_documents += 1;
                     if (cfg.failure_policy == .fail_stage) return err;
@@ -440,7 +508,7 @@ pub const SparseEnricher = struct {
             .doc_offset = next_offset,
             .revision = try std.math.add(u64, if (previous) |value| value.revision else 0, 1),
             .pipeline_version = cfg.pipeline_version,
-            .policy_fingerprint = facts.policy_fingerprint,
+            .policy_fingerprint = scan_fingerprint,
             .after_order_key = next_key,
             .cycle_upper_order_key = cycle_upper,
             .completed_cycles = cycles,
@@ -455,11 +523,12 @@ pub const SparseEnricher = struct {
         return stats;
     }
 
-    fn processPendingDocument(self: *SparseEnricher, namespace: []const u8, cfg: SparseEnricherConfig, pin: *SourcePin, pages: *PageStore, fact: document_facts.Fact, key: []const u8, head: u64, expected_lsn: u64, stats: *EnrichmentRunStats) !u64 {
+    fn processPendingDocument(self: *SparseEnricher, namespace: []const u8, cfg: SparseEnricherConfig, pin: *SourcePin, pages: *PageStore, fact: document_facts.Fact, key: []const u8, head: u64, expected_lsn: u64, stats: *EnrichmentRunStats, generations: *MediaGenerationSnapshot) !u64 {
         if (try bodyPayloadBytes(fact.body.bytes) > cfg.document_limits.max_input_bytes) return error.EnrichmentDocumentBudgetExceeded;
         var working = try build_limits.WorkingSetAllocator.init(self.alloc, cfg.document_limits);
         var worker = self.*;
         worker.alloc = working.allocator();
+        worker.generation_snapshot = generations;
         worker.media_output_max_attempts = @max(cfg.media_output_max_attempts, 1);
         return worker.processAdmittedDocument(namespace, cfg, pin, pages, fact, key, head, expected_lsn, stats) catch |err| {
             if (err == error.OutOfMemory and working.limit_exceeded) return error.EnrichmentDocumentBudgetExceeded;
@@ -713,51 +782,13 @@ fn needsServerlessOutput(target: media_outputs.Target, cached: []const media_out
     var seen = false;
     for (cached) |value| if (std.mem.eql(u8, value.name, target.name)) {
         seen = true;
-        if (!std.mem.eql(u8, identity, value.recipe_id) or (value.status != .complete and !value.terminal)) return true;
+        if (!std.mem.eql(u8, identity, value.recipe_id) or !value.reusable()) return true;
     };
     return !seen;
 }
 
 fn mergeServerlessOutputs(a: Allocator, fresh: []const media_outputs.Result, cached: []const media_outputs.Result, max_attempts: u32) ![]const media_outputs.Result {
-    var results = std.ArrayList(media_outputs.Result).empty;
-    errdefer results.deinit(a);
-    for (fresh) |incoming| {
-        // A skipped target is a single recipe-level placeholder, regardless of
-        // how many windows that target produced. Restore the entire result set.
-        if (incoming.status == .skipped) {
-            for (results.items) |value| {
-                if (std.mem.eql(u8, value.name, incoming.name) and std.mem.eql(u8, value.recipe_id, incoming.recipe_id)) break;
-            } else {
-                var found = false;
-                for (cached) |old| {
-                    if (!std.mem.eql(u8, old.name, incoming.name) or !std.mem.eql(u8, old.recipe_id, incoming.recipe_id)) continue;
-                    if (old.status != .complete and !old.terminal) return error.IncompleteChunkCoverage;
-                    var restored = old;
-                    restored.required = incoming.required;
-                    try results.append(a, restored);
-                    found = true;
-                }
-                if (!found) return error.IncompleteChunkCoverage;
-            }
-            continue;
-        }
-        var value = incoming;
-        const previous: ?media_outputs.Result = for (cached) |old| {
-            if (std.mem.eql(u8, old.name, value.name) and old.sub_index == value.sub_index and std.mem.eql(u8, old.recipe_id, value.recipe_id)) break old;
-        } else null;
-        if (previous) |old| if (old.status == .complete or old.terminal) {
-            const required = value.required;
-            value = old;
-            value.required = required;
-            try results.append(a, value);
-            continue;
-        };
-        if (value.status == .skipped) return error.IncompleteChunkCoverage;
-        value.attempts = (if (previous) |old| old.attempts else @as(u32, 0)) +| 1;
-        value.terminal = value.status == .failed and value.attempts >= @max(max_attempts, 1);
-        try results.append(a, value);
-    }
-    return results.toOwnedSlice(a);
+    return media_outputs.mergeResults(a, fresh, cached, max_attempts);
 }
 
 fn appendServerlessEmbeddingRows(a: Allocator, target: chunking.types.EmbeddingTarget, metadata: *const chunking.inference.RemoteMetadata, results: []const media_outputs.Result, text: []const u8, rows: *std.ArrayListUnmanaged(std.json.Value), previews: *std.ArrayListUnmanaged(std.json.Value)) !void {
@@ -840,6 +871,7 @@ fn buildModelAwareChunkBodyAlloc(self: *SparseEnricher, body: []const u8, pipeli
     }
     recipe_hash.update(&std.mem.toBytes(std.mem.nativeToLittle(u32, pipeline_version)));
     const recipe_fingerprint = std.fmt.bytesToHex(recipe_hash.finalResult(), .lower);
+    if (self.generation_snapshot) |snapshot| if (try snapshot.matches(scratch, document, &recipe_fingerprint, pipeline_version, self.model_chunker.?.outputs_json.len == 0)) return .{};
     const selected = try chunking.chunk.modelSourceFromValue(field);
     var decoded: ?[]u8 = null;
     defer if (decoded) |bytes| a.free(bytes);
@@ -871,6 +903,7 @@ fn buildModelAwareChunkBodyAlloc(self: *SparseEnricher, body: []const u8, pipeli
     if (input != null and (has_output_rows or legacy_rows != null)) {
         var probe = try chunking.inference.probeModelPageWithProvider(a, base_config, input.?, self.model_chunk_provider);
         defer probe.deinit(a);
+        if (self.generation_snapshot) |snapshot| if (probe.chunks.len != 0) try snapshot.observe(a, probe.chunks[0].metadata orelse return error.InvalidChunkerResponse);
         if (has_output_rows) {
             const parsed = try std.json.parseFromValueLeaky(struct { chunks: []const media_outputs.Row, plan_id: []const u8 }, scratch, cached_document_outputs.?, .{ .ignore_unknown_fields = true });
             if (std.mem.eql(u8, probe.plan_id, parsed.plan_id) and probe.chunks.len != 0) {
@@ -956,6 +989,16 @@ fn buildModelAwareChunkBodyAlloc(self: *SparseEnricher, body: []const u8, pipeli
                     }
                 }
                 if (first >= cached_rows.len) target.execute = true;
+                var skips = std.ArrayList(media_outputs.Target.Window).empty;
+                const current_recipe = for (current_identities) |identity| {
+                    if (std.mem.eql(u8, identity.name, target.name)) break identity.recipe_id;
+                } else "";
+                for (first..@min(first + config.max_chunks, cached_rows.len)) |ordinal| {
+                    for (cached_rows[ordinal].outputs) |value| {
+                        if (skips.items.len < 4096 and std.mem.eql(u8, value.name, target.name) and std.mem.eql(u8, value.recipe_id, current_recipe) and value.reusable()) try skips.append(scratch, .{ .ordinal = ordinal, .sub_index = value.sub_index });
+                    }
+                }
+                target.skip_windows = skips.items;
             }
             config.embedding = null;
             config.outputs_json = try std.json.Stringify.valueAlloc(scratch, media_outputs.Config{ .boundary_model = consumers.boundary_model, .targets = targets }, .{ .emit_null_optional_fields = false });
@@ -3139,11 +3182,13 @@ test "model aware media serverless consumer edits preserve healthy model work" {
 
 const ServerlessMediaTestProvider = struct {
     speech_revision_changed: bool = false,
+    pages: usize = 0,
     boundary_revision_changed: bool = false,
     calls: [3]usize = @splat(0),
     fail: bool = true,
     fn page(raw: *anyopaque, a: Allocator, _: []const u8, _: chunking.inference.RemoteInput, cfg: chunking.types.Config, _: @import("antfly_inference_execution_context").RequestContext) anyerror!chunking.inference.ChunkPage {
         const self: *@This() = @ptrCast(@alignCast(raw));
+        self.pages += 1;
         var config = try std.json.parseFromSlice(media_outputs.Config, a, cfg.outputs_json, .{});
         defer config.deinit();
         var arena = std.heap.ArenaAllocator.init(a);
@@ -3219,4 +3264,67 @@ test "model aware media serverless settled outputs probe secondary generations b
     defer if (replanned.body) |body| a.free(body);
     try std.testing.expect(replanned.body != null);
     try std.testing.expectEqualDeep([_]usize{ 2, 2, 3 }, fake.calls);
+}
+
+test "model aware media completed namespace discovers secondary generations through bounded durable scans" {
+    const alloc = std.testing.allocator;
+
+    var artifact_root_buf: [256]u8 = undefined;
+    var manifest_root_buf: [256]u8 = undefined;
+    var wal_root_buf: [256]u8 = undefined;
+    const artifact_root = tmpPath(&artifact_root_buf, "artifacts-chunk-embeddings");
+    const manifest_root = tmpPath(&manifest_root_buf, "manifests-chunk-embeddings");
+    const wal_root = tmpPath(&wal_root_buf, "wal-chunk-embeddings");
+    defer cleanupTmp(artifact_root);
+    defer cleanupTmp(manifest_root);
+    defer cleanupTmp(wal_root);
+
+    var fs_artifacts = try artifacts_mod.FsStore.init(alloc, std.mem.span(artifact_root));
+    var artifact_store = fs_artifacts.artifactStore();
+    defer artifact_store.deinit();
+
+    var fs_manifests = try manifest_mod.FsStore.init(alloc, std.mem.span(manifest_root));
+    var manifest_store = fs_manifests.manifestStore();
+    defer manifest_store.deinit();
+
+    var fs_progress = try catalog_mod.FsProgressStore.init(alloc, std.mem.span(manifest_root));
+    var progress_store = fs_progress.progressStore();
+    defer progress_store.deinit();
+
+    var fs_wal = try wal_mod.FsStore.init(alloc, std.mem.span(wal_root));
+    var wal_store = fs_wal.walStore();
+    defer wal_store.deinit();
+
+    var builder = @import("../build/builder.zig").Builder.init(alloc, &artifact_store, &manifest_store, &progress_store, &wal_store);
+    var api = @import("../api/service.zig").Service.init(alloc, &wal_store, &builder);
+
+    var fake = ServerlessMediaTestProvider{ .fail = false };
+    var enricher = SparseEnricher.init(alloc, &artifact_store, &manifest_store, &progress_store, &wal_store);
+    defer enricher.deinit();
+    const Boundary = @import("antfly_runtime_abi").callback_abi.Boundary(struct { chunk_page_with_context: ?*const @TypeOf(ServerlessMediaTestProvider.page) = null });
+    try enricher.setModelChunker(.{ .provider = .antfly, .embedding = .{ .model = "indexA", .dimensions = 2 }, .outputs_json = "{\"boundary_model\":\"boundary\",\"targets\":[{\"name\":\"boundary\",\"kind\":\"embedding\",\"model\":\"boundaryB\",\"dimensions\":2},{\"name\":\"embedding\",\"kind\":\"embedding\",\"model\":\"indexA\",\"dimensions\":2},{\"name\":\"speech\",\"kind\":\"transcribe\",\"model\":\"speech\"}]}" }, "clip", .{ .ptr = &fake, .boundary_dispatch = Boundary.local_dispatch, .chunk_page_with_context_callback = @ptrCast(&ServerlessMediaTestProvider.page) });
+    const completed = try buildDerivedBodyAlloc(&enricher, .chunk_embeddings, "{\"text\":\"audio source\",\"clip\":\"audio source\"}", 1, .require_model);
+    defer alloc.free(completed.body.?);
+    const batch = [_]api_types.DocumentMutation{ .{ .kind = .upsert, .doc_id = "doc-a", .body = completed.body.? }, .{ .kind = .upsert, .doc_id = "doc-b", .body = completed.body.? } };
+    var ingest = try api.ingestBatch(.{ .namespace = "docs", .timestamp_ns = 100, .mutations = &batch });
+    defer ingest.deinit(alloc);
+    var build = try publishEnrichmentFixture(&builder);
+    defer build.deinit(alloc);
+    fake.calls = @splat(0);
+    fake.pages = 0;
+    const settled = try enricher.runNamespaceWithConfig("docs", .{ .batch_size = 4, .scan_batch_size = 3, .pipeline_version = 1, .stage = .chunk_embeddings });
+    try std.testing.expectEqual(@as(usize, 0), settled.enriched_documents);
+    try std.testing.expectEqual(@as(usize, 1), fake.pages);
+    try std.testing.expectEqualDeep([_]usize{ 0, 0, 0 }, fake.calls);
+    fake.speech_revision_changed = true;
+    const repaired = try enricher.runNamespaceWithConfig("docs", .{ .batch_size = 4, .scan_batch_size = 1, .pipeline_version = 1, .stage = .chunk_embeddings });
+    try std.testing.expectEqual(@as(usize, 1), repaired.enriched_documents);
+    try std.testing.expectEqualDeep([_]usize{ 0, 0, 1 }, fake.calls);
+    // The first repair advances HEAD. Durable ID-order progress must continue
+    // to the next completed record rather than restart at the first document.
+    var next_head = try publishEnrichmentFixture(&builder);
+    defer next_head.deinit(alloc);
+    const continued = try enricher.runNamespaceWithConfig("docs", .{ .batch_size = 4, .scan_batch_size = 1, .pipeline_version = 1, .stage = .chunk_embeddings });
+    try std.testing.expectEqual(@as(usize, 1), continued.enriched_documents);
+    try std.testing.expectEqualDeep([_]usize{ 0, 0, 2 }, fake.calls);
 }

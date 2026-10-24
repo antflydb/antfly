@@ -175,6 +175,29 @@ pub fn classifyPreparedFrames(a: std.mem.Allocator, session: backends.Session, p
     return results;
 }
 
+/// Keep batching for the outstanding subset while leaving accepted frames out
+/// of tensor construction and backend inference. Empty rows are skipped slots.
+pub fn classifyPreparedFramesSelected(a: std.mem.Allocator, session: backends.Session, profile: Profile, labels: []const []const u8, frames: []const []const f32, target: outputs.Target, ordinal: u64, control: Control) ![][]outputs.Label {
+    try control.check();
+    if (frames.len == 0 or frames.len > 32) return error.InvalidInputShape;
+    const rows = try a.alloc([]outputs.Label, frames.len);
+    errdefer a.free(rows);
+    @memset(rows, @constCast(&[_]outputs.Label{}));
+    var selected: [32][]const f32 = undefined;
+    var slots: [32]usize = undefined;
+    var count: usize = 0;
+    for (frames, 0..) |frame, i| if (target.wants(ordinal, @intCast(i))) {
+        selected[count] = frame;
+        slots[count] = i;
+        count += 1;
+    };
+    if (count == 0) return rows;
+    const computed = try classifyPreparedFrames(a, session, profile, labels, selected[0..count], target.top_k, control);
+    defer a.free(computed);
+    for (computed, slots[0..count]) |row, slot| rows[slot] = row;
+    return rows;
+}
+
 pub fn classifyPreparedBatch(a: std.mem.Allocator, session: backends.Session, profile: Profile, labels: []const []const u8, frames: []const []const f32, top_k: usize, control: Control) ![][]outputs.Label {
     try profile.validate();
     try control.check();
@@ -429,4 +452,32 @@ test "model aware media frame classifiers batch compatible tensors with one mode
     try std.testing.expectEqual(@as(usize, 5), tiled.len);
     try std.testing.expectEqual(before + 3, fake.calls);
     try std.testing.expectEqualStrings("positive", tiled[4][0].label);
+    fake.fixed_two = false;
+    fake.fixed = true;
+    fake.deny_batch = false;
+    const frames32: [32][]const f32 = @splat(&.{ 1, 0, 0 });
+    const before_selective = fake.calls;
+    const complete = try classifyPreparedFrames(a, fake.session(), profile, &.{ "negative", "positive" }, &frames32, 1, .{});
+    defer {
+        for (complete) |row| {
+            for (row) |label| a.free(label.label);
+            a.free(row);
+        }
+        a.free(complete);
+    }
+    try std.testing.expectEqual(before_selective + 32, fake.calls);
+    var mask: [31]outputs.Target.Window = undefined;
+    for (&mask, 0..) |*window, i| window.* = .{ .ordinal = 9, .sub_index = @intCast(i) };
+    const target = outputs.Target{ .name = "events", .kind = .classify, .model = "model", .top_k = 1, .skip_windows = &mask };
+    const selected = try classifyPreparedFramesSelected(a, fake.session(), profile, &.{ "negative", "positive" }, &frames32, target, 9, .{});
+    defer {
+        for (selected) |row| {
+            for (row) |label| a.free(label.label);
+            a.free(row);
+        }
+        a.free(selected);
+    }
+    try std.testing.expectEqual(before_selective + 33, fake.calls);
+    for (selected[0..31]) |row| try std.testing.expectEqual(@as(usize, 0), row.len);
+    try std.testing.expectEqualStrings(complete[31][0].label, selected[31][0].label);
 }

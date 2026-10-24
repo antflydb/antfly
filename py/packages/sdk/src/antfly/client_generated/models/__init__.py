@@ -144,6 +144,7 @@ from .chunk_output_result_kind import ChunkOutputResultKind
 from .chunk_output_result_status import ChunkOutputResultStatus
 from .chunk_output_target import ChunkOutputTarget
 from .chunk_output_target_kind import ChunkOutputTargetKind
+from .chunk_output_target_skip_windows_item import ChunkOutputTargetSkipWindowsItem
 from .chunk_outputs import ChunkOutputs
 from .chunk_source_reference import ChunkSourceReference
 from .chunk_source_reference_type import ChunkSourceReferenceType
@@ -1873,6 +1874,7 @@ __all__ = (
     "ChunkOutputs",
     "ChunkOutputTarget",
     "ChunkOutputTargetKind",
+    "ChunkOutputTargetSkipWindowsItem",
     "ChunkSourceReference",
     "ChunkSourceReferenceType",
     "ChunkSourceReferenceVersionKind",

@@ -14353,6 +14353,13 @@ export interface components {
              * @default true
              */
             execute?: boolean;
+            /** @description Execution-only repair mask for already accepted sub-windows; does not affect the model recipe or boundary plan. Skipped windows return receipts with status skipped. */
+            skip_windows?: {
+                /** Format: uint64 */
+                ordinal: number;
+                /** Format: uint32 */
+                sub_index: number;
+            }[];
             /** @default true */
             required?: boolean;
             model_identity?: string;

@@ -40854,6 +40854,11 @@ const MediaOutputExecution = struct {
             const shared_embedding = target.kind == .embedding and boundary_target.kind == .embedding and (primary != null or primary_error != null) and std.mem.eql(u8, target.model, boundary_target.model) and std.mem.eql(u8, target.task_type, boundary_target.task_type) and target.dimensions == boundary_target.dimensions;
             if (target.kind == .embedding and (index == boundary_index or shared_embedding)) {
                 var value = base;
+                if (!target.wants(descriptor.ordinal, 0)) {
+                    value.status = .skipped;
+                    try results.append(a, value);
+                    continue;
+                }
                 if (primary_error) |err| {
                     value.status = .failed;
                     value.embedding = null;
@@ -40868,7 +40873,7 @@ const MediaOutputExecution = struct {
             }
             if (payload == .video and resolved.classifier_profile != null and resolved.classifier_profile.?.input == .pixels) {
                 const pictures = descriptor.coordinates.selected_pictures orelse return error.InvalidChunkCoordinates;
-                const batched = self.runFrameBatch(a, target, resolved, index, pictures) catch |err| failed: {
+                const batched = self.runFrameBatch(a, target, resolved, index, pictures, descriptor.ordinal) catch |err| failed: {
                     if (chunks.abort(err) or (!allow_partial and target.required)) return err;
                     // Preserve independent frame receipts when a batch fails.
                     break :failed null;
@@ -40877,6 +40882,11 @@ const MediaOutputExecution = struct {
                 for (pictures, 0..) |picture, slot| {
                     var value = base;
                     value.sub_index = @intCast(slot);
+                    if (!target.wants(descriptor.ordinal, value.sub_index)) {
+                        value.status = .skipped;
+                        try results.append(a, value);
+                        continue;
+                    }
                     // A repeated sampling timestamp can select the same picture.
                     var prepared = self.prepared_frames[index][slot];
                     if (prepared == null) for (pictures[0..slot], 0..) |earlier, previous| {
@@ -40940,6 +40950,11 @@ const MediaOutputExecution = struct {
                     value.sub_index = window.sub_index;
                     value.start_ns = window.start_ns;
                     value.end_ns = @min(window.end_ns, descriptor.coordinates.end_ns orelse window.end_ns);
+                    if (!target.wants(descriptor.ordinal, window.sub_index)) {
+                        value.status = .skipped;
+                        try results.append(a, value);
+                        continue;
+                    }
                     self.run(a, target, resolved, .{ .pcm = .{ .samples = selected_payload.pcm.samples[window.first..window.last], .sample_rate = selected_payload.pcm.sample_rate } }, &value) catch |err| {
                         if (chunks.abort(err) or (!allow_partial and target.required)) return err;
                         value.status = .failed;
@@ -40965,11 +40980,24 @@ const MediaOutputExecution = struct {
         }
         return results.toOwnedSlice(a);
     }
-    fn runFrameBatch(self: *MediaOutputExecution, a: std.mem.Allocator, target: outputs.Target, resolved: *const Resolved, index: usize, pictures: []const u64) !?[][]outputs.Label {
+    fn runFrameBatch(self: *MediaOutputExecution, a: std.mem.Allocator, target: outputs.Target, resolved: *const Resolved, index: usize, pictures: []const u64, ordinal: u64) !?[][]outputs.Label {
         const classification = @import("../pipelines/media_classification.zig");
         if (self.frame_errors[index] != null or pictures.len < 2 or pictures.len > 32) return null;
+        for (pictures, 0..) |_, slot| {
+            if (target.wants(ordinal, @intCast(slot))) break;
+        } else {
+            const rows = try a.alloc([]outputs.Label, pictures.len);
+            @memset(rows, @constCast(&[_]outputs.Label{}));
+            return rows;
+        }
+        // A sparse repair runs only missing frames. Dense cohorts retain the
+        // existing batch path; healthy frames never re-enter classifier work.
         var frames: [32][]const f32 = undefined;
         for (pictures, 0..) |picture, slot| {
+            if (!target.wants(ordinal, @intCast(slot))) {
+                frames[slot] = &.{};
+                continue;
+            }
             var pixels = self.prepared_frames[index][slot];
             if (pixels == null) for (pictures[0..slot], 0..) |earlier, previous| {
                 if (earlier == picture) {
@@ -40983,7 +41011,7 @@ const MediaOutputExecution = struct {
         defer handle.release();
         const loaded = handle.get();
         try validateLoadedMediaRevision(resolved.revision, loaded.resolution_revision);
-        const rows = try classification.classifyPreparedFrames(a, loaded.session, resolved.classifier_profile.?, loaded.manifest.id2label orelse return error.UnsupportedMediaClassifier, frames[0..pictures.len], target.top_k, self.control);
+        const rows = try classification.classifyPreparedFramesSelected(a, loaded.session, resolved.classifier_profile.?, loaded.manifest.id2label orelse return error.UnsupportedMediaClassifier, frames[0..pictures.len], target, ordinal, self.control);
         errdefer {
             for (rows) |row| {
                 for (row) |label| a.free(label.label);

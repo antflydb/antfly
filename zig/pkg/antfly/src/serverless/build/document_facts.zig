@@ -170,9 +170,12 @@ pub const PendingCursor = struct {
     cursor: tree.Cursor,
     stage_bit: u4,
     wal_end_lsn: u64,
+    audit_allocator: ?Allocator = null,
+    audit_key: std.ArrayList(u8) = .empty,
 
     pub fn deinit(self: *PendingCursor) void {
         self.cursor.deinit();
+        if (self.audit_allocator) |a| self.audit_key.deinit(a);
     }
     /// Borrowed until next/deinit, with the same lifetime as a tree record.
     pub const Record = struct { key: []const u8, order_key: []const u8, value: []const u8 };
@@ -180,6 +183,13 @@ pub const PendingCursor = struct {
     pub fn next(self: *PendingCursor) !?Record {
         const record = (try self.cursor.next()) orelse return null;
         const fact = try Fact.decode(record.value);
+        if (self.audit_allocator) |a| {
+            if (fact.last_lsn > self.wal_end_lsn or record.key.len == 0 or record.key.len + 8 > max_pending_key_bytes) return error.InvalidDocumentFact;
+            self.audit_key.clearRetainingCapacity();
+            try self.audit_key.appendSlice(a, &@as([8]u8, @splat(0)));
+            try self.audit_key.appendSlice(a, record.key);
+            return .{ .key = record.key, .order_key = self.audit_key.items, .value = record.value };
+        }
         if (fact.pending & self.stage_bit == 0 or fact.last_lsn > self.wal_end_lsn or
             record.key.len <= 8 or record.key.len > max_pending_key_bytes or
             std.mem.readInt(u64, record.key[0..8], .big) != fact.last_lsn) return error.InvalidDocumentFact;
@@ -209,6 +219,18 @@ pub fn pendingCursorAtRank(alloc: Allocator, store: tree.Store, root: Root, stag
         .stage_bit = @as(u4, 1) << @intCast(stage_index),
         .wal_end_lsn = root.wal_end_lsn,
     };
+}
+
+/// Model aliases are mutable even when document facts are settled. A bounded
+/// round-robin scan includes completed documents and retains an ID boundary
+/// across HEAD changes, so continual ingest cannot starve old documents.
+/// Zero-prefix keys reuse the versioned durable scan cursor without claiming
+/// a WAL position; ordinary pending scans retain their LSN ordering.
+pub fn mediaCursor(a: Allocator, store: tree.Store, root: Root, lower: []const u8, rank: ?u64) !PendingCursor {
+    if ((if (root.page) |page| page.records else @as(u64, 0)) != root.document_count) return error.InvalidDocumentFactsRoot;
+    if (!std.mem.eql(u8, &root.domain, &store.domain)) return error.GraphPageDomainMismatch;
+    if (lower.len != 0 and (lower.len <= 8 or !std.mem.allEqual(u8, lower[0..8], 0))) return error.InvalidEnrichmentStageProgress;
+    return .{ .cursor = if (rank) |value| try tree.Cursor.initAtRank(a, store, root.page, value) else try tree.Cursor.init(a, store, root.page, if (lower.len == 0) "" else lower[8..], null), .stage_bit = 0, .wal_end_lsn = root.wal_end_lsn, .audit_allocator = a };
 }
 
 pub const Replacement = struct { id: []const u8, value: ?Fact };

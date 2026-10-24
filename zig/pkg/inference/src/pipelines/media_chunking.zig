@@ -209,7 +209,8 @@ pub const Runner = struct {
         try descriptor.coordinates.validate();
         var id: [85]u8 = undefined;
         var item = Item{ .identity = self.summary.identity, .context = if (self.executor.describe) |describe| describe(self.executor.context) else null, .descriptor = descriptor, .id = self.summary.identity.cursor(ordinal, &id), .mime_type = mime };
-        if (self.request.execute) {
+        const execute_boundary = self.request.execute and if (self.request.outputs) |config| (try config.boundary()).wants(ordinal, 0) else true;
+        if (execute_boundary) {
             if (ready == null) result = self.executor.embed(self.executor.context, self.allocator, payload) catch |err| blk: {
                 // A busy provider is admission pressure, including after an
                 // acknowledged prefix. Never publish it as a failed chunk or
@@ -265,6 +266,7 @@ pub const Runner = struct {
                 for (item.outputs) |value| {
                     if (!std.mem.eql(u8, value.name, target.name)) continue;
                     try value.validate(target);
+                    if (value.status == .skipped and target.wants(ordinal, value.sub_index)) return error.InvalidChunkOutput;
                     if (value.kind != target.kind or value.required != target.required or !std.mem.eql(u8, value.model, target.model) or value.sub_index != seen) return error.InvalidChunkOutput;
                     seen += 1;
                     if (value.status == .failed) {
@@ -579,7 +581,7 @@ pub const Runner = struct {
             const webm = prefix.bytes.len == 4 and std.mem.eql(u8, prefix.bytes, "\x1a\x45\xdf\xa3");
             prefix.deinit();
             if (webm) {
-                var audio_track: ?@import("media_chunking_audio_source.zig").Track = if (self.request.needs_audio) @import("media_chunking_audio_source.zig").Track.init(self.allocator, &source, self.control, self.request.max_working_bytes, self.request.limits.max_index_packets) catch |err| blk: {
+                var audio_track: ?@import("media_chunking_audio_source.zig").Track = if (self.request.needs_audio) @import("media_chunking_audio_source.zig").Track.initCached(self.allocator, &source, self.control, self.request.max_working_bytes, self.request.limits.max_index_packets, self.request.index_cache, self.request.index_cache_admission) catch |err| blk: {
                     if (abort(err) and err != error.AudioTooLarge) return err;
                     self.audio_failure = err;
                     break :blk null;
@@ -600,7 +602,7 @@ pub const Runner = struct {
                 try self.webmWindowsCached(&reader, identity);
                 return;
             } else {
-                var audio_track: ?@import("media_chunking_audio_source.zig").Track = if (self.request.needs_audio) @import("media_chunking_audio_source.zig").Track.init(self.allocator, &source, self.control, self.request.max_working_bytes, self.request.limits.max_index_packets) catch |err| blk: {
+                var audio_track: ?@import("media_chunking_audio_source.zig").Track = if (self.request.needs_audio) @import("media_chunking_audio_source.zig").Track.initCached(self.allocator, &source, self.control, self.request.max_working_bytes, self.request.limits.max_index_packets, self.request.index_cache, self.request.index_cache_admission) catch |err| blk: {
                     if (abort(err) and err != error.AudioTooLarge) return err;
                     self.audio_failure = err;
                     break :blk null;
@@ -628,7 +630,7 @@ pub const Runner = struct {
             }
         }
         if ((self.request.audio_boundary and std.ascii.startsWithIgnoreCase(mime, "video/")) or (std.ascii.startsWithIgnoreCase(mime, "audio/") and audio.detectFormatFromMime(mime) == .mp4)) {
-            var audio_track = try @import("media_chunking_audio_source.zig").Track.init(self.allocator, &source, self.control, self.request.max_working_bytes, self.request.limits.max_index_packets);
+            var audio_track = try @import("media_chunking_audio_source.zig").Track.initCached(self.allocator, &source, self.control, self.request.max_working_bytes, self.request.limits.max_index_packets, self.request.index_cache, self.request.index_cache_admission);
             defer audio_track.deinit();
             try self.soundWindows(audio_track.provider());
             return;
@@ -638,7 +640,7 @@ pub const Runner = struct {
             try self.soundWindows(try wav.provider());
             return;
         };
-        const seek_audio = if (audio.detectFormatFromMime(mime)) |format| format == .mp3 or format == .flac else false;
+        const seek_audio = if (audio.detectFormatFromMime(mime)) |format| format == .mp3 or format == .flac or format == .ogg or format == .opus else false;
         const audio_key = if (seek_audio) @import("media_index_cache.zig").Cache.audioKey(&source, self.request.limits.max_index_packets, self.request.max_working_bytes) else null;
         if (audio_key) |key| if (self.request.index_cache) |cache| if (cache.get(key)) |entry| {
             defer cache.release(entry);
@@ -662,7 +664,13 @@ pub const Runner = struct {
         if (audio_key != null and self.request.index_cache != null and self.request.index_cache_admission != null) {
             const audio_scope = @import("inference_audio").work_control.Scope.enter(.{ .context = adapter.context, .check_fn = adapter.check_fn });
             defer audio_scope.deinit();
-            var index = try @import("media_audio_seek.zig").Index.init(self.allocator, bytes, self.request.limits.max_index_packets);
+            var index = @import("media_audio_seek.zig").Index.init(self.allocator, bytes, self.request.limits.max_index_packets) catch |err| switch (err) {
+                error.UnsupportedAudioFormat, error.UnsupportedStreamingAudioProfile => {
+                    try self.sound(bytes);
+                    return;
+                },
+                else => return err,
+            };
             defer index.deinit();
             if (audio_key) |key| if (self.request.index_cache) |cache| if (self.request.index_cache_admission) |admission| cache.remember(std.heap.smp_allocator, key, .{ .audio = index }, admission);
             var reader = @import("media_audio_seek.zig").Reader{ .index = &index, .bytes = bytes, .control = self.control };
@@ -678,7 +686,7 @@ pub const Runner = struct {
         const content_identity = std.fmt.bytesToHex(self.summary.identity.source, .lower);
         var source = media.source.Source{ .allocator = self.allocator, .storage = .{ .borrowed = bytes }, .identity = &content_identity, .limits = .{ .max_total_bytes = 512 * 1024 * 1024 }, .admission_pool = &self.pool, .control = .{ .context = adapter.context, .check_fn = adapter.check_fn } };
         if (bytes.len >= 4 and std.mem.eql(u8, bytes[0..4], "\x1a\x45\xdf\xa3")) {
-            var audio_track: ?@import("media_chunking_audio_source.zig").Track = if (self.request.needs_audio) @import("media_chunking_audio_source.zig").Track.init(self.allocator, &source, self.control, self.request.max_working_bytes, self.request.limits.max_index_packets) catch |err| blk: {
+            var audio_track: ?@import("media_chunking_audio_source.zig").Track = if (self.request.needs_audio) @import("media_chunking_audio_source.zig").Track.initCached(self.allocator, &source, self.control, self.request.max_working_bytes, self.request.limits.max_index_packets, self.request.index_cache, self.request.index_cache_admission) catch |err| blk: {
                 if (abort(err) and err != error.AudioTooLarge) return err;
                 self.audio_failure = err;
                 break :blk null;
@@ -690,7 +698,7 @@ pub const Runner = struct {
             defer reader.deinit();
             try self.webmWindows(&reader);
         } else {
-            var audio_track: ?@import("media_chunking_audio_source.zig").Track = if (self.request.needs_audio) @import("media_chunking_audio_source.zig").Track.init(self.allocator, &source, self.control, self.request.max_working_bytes, self.request.limits.max_index_packets) catch |err| blk: {
+            var audio_track: ?@import("media_chunking_audio_source.zig").Track = if (self.request.needs_audio) @import("media_chunking_audio_source.zig").Track.initCached(self.allocator, &source, self.control, self.request.max_working_bytes, self.request.limits.max_index_packets, self.request.index_cache, self.request.index_cache_admission) catch |err| blk: {
                 if (abort(err) and err != error.AudioTooLarge) return err;
                 self.audio_failure = err;
                 break :blk null;
@@ -810,6 +818,7 @@ pub const Runner = struct {
         next: ?*VideoSlot,
         second: ?*VideoSlot = null,
         cache_preflight: bool = false,
+        primary_ahead: bool = true,
         work: ?*VideoSlot = null,
         thread: ?std.Thread = null,
         fn join(self: *@This()) void {
@@ -855,6 +864,7 @@ pub const Runner = struct {
                     };
                 }
             }
+            if (!self.primary_ahead) return;
             const start = self.runner.executor.start_video orelse return;
             next.ahead = start(self.runner.executor.context, next.payload, &self.runner.pool) catch |err| {
                 // Speculation must never deny a request which fits serially.
@@ -989,7 +999,8 @@ pub const Runner = struct {
         const source = VideoSource{ .bytes = bytes, .reader = reader, .origin = origin, .timescale = timescale, .owner = owner, .webm = webm };
         const end = std.math.cast(i64, duration) orelse return error.TimestampOverflow;
         var cursor = planning.Temporal{ .kind = .video, .end_ns = end, .policy = self.request.policy, .model = self.executor.model, .picture_tokens = 142 };
-        if (self.request.execute and self.executor.embed_video_batch != null) return self.videoBatches(source, &cursor);
+        const selective = if (self.request.outputs) |config| (try config.boundary()).skip_windows.len != 0 else false;
+        if (self.request.execute and !selective and self.executor.embed_video_batch != null) return self.videoBatches(source, &cursor);
         var slots = [_]VideoSlot{ .{}, .{} };
         defer for (&slots) |*slot| slot.deinit();
         var active: usize = 0;
@@ -1012,7 +1023,7 @@ pub const Runner = struct {
             const next_shape = if (self.request.max_chunks != 0 and self.summary.emitted + 1 >= self.request.max_chunks) null else try cursor.next();
             const next = &slots[active ^ 1];
             if (next_shape) |shape| next.shape = shape;
-            var schedule = VideoSchedule{ .runner = self, .source = source, .next = if (next_shape != null) next else null, .cache_preflight = self.executor.prepare_video_outputs != null };
+            var schedule = VideoSchedule{ .runner = self, .source = source, .next = if (next_shape != null) next else null, .cache_preflight = self.executor.prepare_video_outputs != null, .primary_ahead = !selective };
             defer schedule.join(); // Includes failure, cancellation and early sink termination.
             if (self.request.execute and (self.executor.start_video != null or self.executor.prepare_video_outputs != null)) {
                 current.payload.video.prepared = .{ .context = &schedule, .ready = VideoSchedule.ready };

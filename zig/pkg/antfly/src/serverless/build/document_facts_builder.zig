@@ -95,6 +95,12 @@ pub fn fingerprint(alloc: Allocator, policy: catalog.NamespacePolicy, indexes_js
     return hash.finalResult();
 }
 
+pub fn hasModelSources(a: Allocator, indexes_json: []const u8) !bool {
+    const fields = try mediaFields(a, indexes_json);
+    defer freeMediaFields(a, fields);
+    return fields.len != 0;
+}
+
 // Only fields consumed by model-aware indexes affect media pending facts.
 fn mediaFields(a: Allocator, indexes_json: []const u8) ![][]const u8 {
     if (std.mem.trim(u8, indexes_json, " \t\r\n").len == 0) return a.alloc([]const u8, 0);

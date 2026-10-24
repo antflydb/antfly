@@ -286,6 +286,22 @@ components:
           type: boolean
           default: true
           description: False retains this model as a planning boundary while skipping its inference; used for independent output repairs.
+        skip_windows:
+          type: array
+          maxItems: 4096
+          description: Execution-only repair mask for already accepted sub-windows; does not affect the model recipe or boundary plan. Skipped windows return receipts with status skipped.
+          items:
+            type: object
+            required: [ordinal, sub_index]
+            properties:
+              ordinal:
+                type: integer
+                format: uint64
+                minimum: 0
+              sub_index:
+                type: integer
+                format: uint32
+                minimum: 0
         required:
           type: boolean
           default: true

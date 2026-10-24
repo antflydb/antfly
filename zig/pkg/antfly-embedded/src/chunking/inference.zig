@@ -438,6 +438,7 @@ fn validateModelChunks(cfg: chunking_types.Config, chunks: []const RemoteChunk) 
                 var seen: usize = 0;
                 for (results.value) |result| if (std.mem.eql(u8, result.name, target.name)) {
                     try result.validate(target);
+                    if (result.status == .skipped and target.wants(metadata.descriptor.ordinal, result.sub_index)) return error.InvalidChunkOutput;
                     if (result.sub_index != seen) return error.InvalidChunkOutput;
                     if (result.status == .failed and !cfg.page) return error.IncompleteChunkCoverage;
                     seen += 1;

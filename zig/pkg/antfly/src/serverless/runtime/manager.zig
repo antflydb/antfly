@@ -380,7 +380,7 @@ pub const ManagedRuntime = struct {
         stats: *RuntimeRunStats,
     ) !bool {
         try cancellation.check();
-        if (!self.cfg.enrichment_enabled or status.enrichment_active_stage == null) return true;
+        if (!self.cfg.enrichment_enabled) return true;
         const enricher = if (self.enricher) |*value| value else return true;
 
         var effective_policy = policy;
@@ -388,7 +388,13 @@ pub const ManagedRuntime = struct {
         effective_policy.chunk_preview_enabled = status.chunk_preview_enabled;
         effective_policy.chunk_embeddings_enabled = status.chunk_embeddings_enabled;
         effective_policy.rerank_terms_enabled = status.rerank_terms_enabled;
-        const stage = status.enrichment_active_stage.?;
+        const stage = status.enrichment_active_stage orelse audit: {
+            if (!effective_policy.chunk_embeddings_enabled) return true;
+            var table = (try self.catalog.getTableForNamespaceAlloc(self.alloc, namespace)) orelse return true;
+            defer table.deinit(self.alloc);
+            if (!try @import("../build/document_facts_builder.zig").hasModelSources(self.alloc, table.indexes_json)) return true;
+            break :audit catalog_mod.EnrichmentStage.chunk_embeddings;
+        };
         const stage_spec = enrichment_mod.builtinPipelineForPolicy(effective_policy).stageSpec(stage) orelse return false;
 
         var held_lease: ?build_mod.work_lease.HeldLease = null;

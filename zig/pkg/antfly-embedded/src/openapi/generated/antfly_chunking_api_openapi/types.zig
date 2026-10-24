@@ -908,6 +908,8 @@ pub const ChunkOutputTarget = struct {
     model: []const u8,
     /// False retains this model as a planning boundary while skipping its inference; used for independent output repairs.
     execute: ?bool = null,
+    /// Execution-only repair mask for already accepted sub-windows; does not affect the model recipe or boundary plan. Skipped windows return receipts with status skipped.
+    skip_windows: ?[]const std.json.Value = null,
     required: ?bool = null,
     model_identity: ?[]const u8 = null,
     task_type: ?[]const u8 = null,
@@ -922,6 +924,7 @@ pub const ChunkOutputTarget = struct {
         .{ "kind", "kind", false },
         .{ "model", "model", false },
         .{ "execute", "execute", true },
+        .{ "skip_windows", "skip_windows", true },
         .{ "required", "required", true },
         .{ "model_identity", "model_identity", true },
         .{ "task_type", "task_type", true },
@@ -949,6 +952,10 @@ pub const ChunkOutputTarget = struct {
         try jw.write(self.model);
         if (self.execute) |value| {
             try jw.objectField("execute");
+            try jw.write(value);
+        }
+        if (self.skip_windows) |value| {
+            try jw.objectField("skip_windows");
             try jw.write(value);
         }
         if (self.required) |value| {

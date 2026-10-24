@@ -24,6 +24,9 @@ pub const Target = struct {
     model: []const u8,
     required: bool = true,
     execute: bool = true,
+    /// Execution-only receipts which the caller already owns. Parent identity
+    /// and recipe hashes never depend on this selective-repair mask.
+    skip_windows: []const Window = &.{},
     model_identity: ?[]const u8 = null,
     task_type: []const u8 = "RETRIEVAL_DOCUMENT",
     dimensions: ?usize = null,
@@ -31,12 +34,23 @@ pub const Target = struct {
     diarize: bool = false,
     top_k: usize = 5,
 
+    pub const Window = struct { ordinal: u64, sub_index: u32 };
+    pub fn wants(self: Target, ordinal: u64, sub_index: u32) bool {
+        if (!self.execute) return false;
+        for (self.skip_windows) |window| if (window.ordinal == ordinal and window.sub_index == sub_index) return false;
+        return true;
+    }
+
     pub fn recipeIdentity(self: Target, a: std.mem.Allocator, identity: []const u8, revision: []const u8) ![64]u8 {
         var recipe = self;
         recipe.model_identity = null;
         recipe.execute = true;
+        recipe.skip_windows = &.{};
         recipe.required = true; // Coverage policy does not change inference work.
-        const encoded = try std.json.Stringify.valueAlloc(a, .{ .format = "antfly-media-output-v1", .target = recipe, .model_identity = identity, .model_revision = revision }, .{ .emit_null_optional_fields = false });
+        // Keep the original v1 canonical field set: adding an execution mask
+        // must not invalidate every previously accepted model computation.
+        const stable = .{ .name = recipe.name, .kind = recipe.kind, .model = recipe.model, .required = recipe.required, .execute = recipe.execute, .model_identity = recipe.model_identity, .task_type = recipe.task_type, .dimensions = recipe.dimensions, .language = recipe.language, .diarize = recipe.diarize, .top_k = recipe.top_k };
+        const encoded = try std.json.Stringify.valueAlloc(a, .{ .format = "antfly-media-output-v1", .target = stable, .model_identity = identity, .model_revision = revision }, .{ .emit_null_optional_fields = false });
         defer a.free(encoded);
         var digest: [32]u8 = undefined;
         std.crypto.hash.sha2.Sha256.hash(encoded, &digest, .{});
@@ -76,6 +90,7 @@ pub const Config = struct {
         var found = false;
         for (self.targets, 0..) |target, index| {
             if (target.name.len == 0 or target.name.len > 128 or target.model.len == 0 or target.model.len > 4096 or !std.unicode.utf8ValidateSlice(target.name)) return error.InvalidChunkOutputs;
+            if (target.skip_windows.len > 4096) return error.InvalidChunkOutputs;
             if (target.dimensions == 0 or target.top_k == 0 or target.top_k > 128) return error.InvalidChunkOutputs;
             if (target.model_identity) |identity| {
                 if (identity.len != 64) return error.InvalidChunkOutputs;
@@ -123,12 +138,20 @@ pub const Result = struct {
     spans: ?[]const Span = null,
     labels: ?[]const Label = null,
 
+    pub fn reusable(self: Result) bool {
+        return (self.status == .failed and self.terminal) or (self.status == .complete and switch (self.kind) {
+            .embedding => self.embedding != null,
+            .transcribe => self.spans != null,
+            .classify => self.labels != null,
+        });
+    }
+
     pub fn validate(self: Result, target: Target) !void {
         if (!std.mem.eql(u8, self.name, target.name) or self.kind != target.kind or self.required != target.required or !std.mem.eql(u8, self.model, target.model)) return error.InvalidChunkOutput;
         if ((self.start_ns == null) != (self.end_ns == null)) return error.InvalidChunkOutput;
         if (self.start_ns) |start| if (start < 0 or self.end_ns.? < start) return error.InvalidChunkOutput;
         if (self.status == .skipped) {
-            if (target.execute or self.code != null or self.embedding != null or self.spans != null or self.labels != null) return error.InvalidChunkOutput;
+            if ((target.execute and target.skip_windows.len == 0) or self.code != null or self.embedding != null or self.spans != null or self.labels != null) return error.InvalidChunkOutput;
             return;
         }
         if (self.status == .failed) {
@@ -307,4 +330,136 @@ test "model aware media legacy embedding pins merge without weakening either dec
     const merged = try (Config{ .boundary_model = "embedding", .targets = &.{named} }).includingEmbedding(a, legacy);
     defer a.free(merged.targets);
     try std.testing.expectEqualStrings(&pin, merged.targets[0].model_identity.?);
+}
+
+/// Merge independent receipts without regressing accepted or terminal work.
+/// Allocations belong to the caller's arena.
+pub fn mergeResults(a: std.mem.Allocator, fresh: []const Result, cached: []const Result, max_attempts: u32) ![]const Result {
+    var results = std.ArrayList(Result).empty;
+    errdefer results.deinit(a);
+    var counts = std.StringHashMap(usize).init(a);
+    defer counts.deinit();
+    for (fresh) |value| {
+        const entry = try counts.getOrPut(value.name);
+        if (!entry.found_existing) entry.value_ptr.* = 0;
+        entry.value_ptr.* += 1;
+    }
+    const Key = struct { name: []const u8, recipe: []const u8, sub_index: u32 };
+    const Context = struct {
+        pub fn hash(_: @This(), value: Key) u64 {
+            var digest = std.hash.Wyhash.init(0);
+            digest.update(value.name);
+            digest.update(&.{0});
+            digest.update(value.recipe);
+            digest.update(std.mem.asBytes(&value.sub_index));
+            return digest.final();
+        }
+        pub fn eql(_: @This(), left: Key, right: Key) bool {
+            return left.sub_index == right.sub_index and std.mem.eql(u8, left.name, right.name) and std.mem.eql(u8, left.recipe, right.recipe);
+        }
+    };
+    var previous_by_window = std.HashMap(Key, Result, Context, 80).init(a);
+    defer previous_by_window.deinit();
+    for (cached) |value| {
+        const entry = try previous_by_window.getOrPut(.{ .name = value.name, .recipe = value.recipe_id, .sub_index = value.sub_index });
+        if (entry.found_existing) return error.InvalidChunkOutput;
+        entry.value_ptr.* = value;
+    }
+    for (fresh) |incoming| {
+        // A skipped target is a single recipe-level placeholder, regardless of
+        // how many windows that target produced. Restore the entire result set.
+        if (incoming.status == .skipped) {
+            // execute:false emits one target-level placeholder. Selective
+            // execution emits an ordered receipt for each actual sub-window.
+            const whole_target = counts.get(incoming.name).? == 1;
+            if (!whole_target) {
+                var old = previous_by_window.get(.{ .name = incoming.name, .recipe = incoming.recipe_id, .sub_index = incoming.sub_index }) orelse return error.IncompleteChunkCoverage;
+                if (!old.reusable()) return error.IncompleteChunkCoverage;
+                old.required = incoming.required;
+                try results.append(a, old);
+                continue;
+            }
+            var found = false;
+            for (cached) |old| {
+                if (!std.mem.eql(u8, old.name, incoming.name) or !std.mem.eql(u8, old.recipe_id, incoming.recipe_id)) continue;
+                if (!old.reusable()) return error.IncompleteChunkCoverage;
+                var restored = old;
+                restored.required = incoming.required;
+                try results.append(a, restored);
+                found = true;
+            }
+            if (!found) return error.IncompleteChunkCoverage;
+            continue;
+        }
+        var value = incoming;
+        const previous = previous_by_window.get(.{ .name = value.name, .recipe = value.recipe_id, .sub_index = value.sub_index });
+        if (previous) |old| if (old.reusable()) {
+            const required = value.required;
+            value = old;
+            value.required = required;
+            try results.append(a, value);
+            continue;
+        };
+        if (value.status == .skipped) return error.IncompleteChunkCoverage;
+        value.attempts = (if (previous) |old| old.attempts else @as(u32, 0)) +| 1;
+        value.terminal = value.status == .failed and value.attempts >= @max(max_attempts, 1);
+        try results.append(a, value);
+    }
+    return results.toOwnedSlice(a);
+}
+
+test "model aware media selective receipts preserve healthy windows and independent attempt budgets" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const target = Target{ .name = "frames", .kind = .classify, .model = "model" };
+    const recipe = try target.recipeIdentity(a, "identity", "revision");
+    const base = Result{ .name = "frames", .kind = .classify, .required = true, .model = "model", .model_identity = "identity", .model_revision = "revision", .recipe_id = &recipe, .status = .complete, .labels = &.{.{ .label = "speech", .score = 1 }}, .attempts = 1 };
+    var cached: [32]Result = undefined;
+    var fresh: [32]Result = undefined;
+    var skips: [31]Target.Window = undefined;
+    for (&cached, &fresh, 0..) |*old, *next, i| {
+        old.* = base;
+        old.sub_index = @intCast(i);
+        next.* = old.*;
+        next.status = .skipped;
+        next.labels = null;
+        if (i < skips.len) skips[i] = .{ .ordinal = 7, .sub_index = @intCast(i) };
+    }
+    cached[31].status = .failed;
+    cached[31].labels = null;
+    cached[31].code = "Unavailable";
+    fresh[31] = base;
+    fresh[31].sub_index = 31;
+    var selective = target;
+    selective.skip_windows = &skips;
+    try std.testing.expectEqualSlices(u8, &recipe, &try selective.recipeIdentity(a, "identity", "revision"));
+    var executed: usize = 0;
+    for (0..32) |i| if (selective.wants(7, @intCast(i))) {
+        executed += 1;
+    };
+    try std.testing.expectEqual(@as(usize, 1), executed);
+    try std.testing.expect(selective.wants(8, 0));
+    const merged = try mergeResults(arena.allocator(), &fresh, &cached, 3);
+    try std.testing.expectEqual(@as(usize, 32), merged.len);
+    for (merged[0..31]) |value| {
+        try std.testing.expect(value.status == .complete);
+        try std.testing.expectEqual(@as(u32, 1), value.attempts);
+    }
+    try std.testing.expectEqual(@as(u32, 2), merged[31].attempts);
+    cached[31].attempts = 3;
+    cached[31].terminal = true;
+    fresh[31].status = .failed;
+    fresh[31].labels = null;
+    fresh[31].code = "Unavailable";
+    const terminal = try mergeResults(arena.allocator(), &fresh, &cached, 3);
+    try std.testing.expect(terminal[31].terminal);
+    try std.testing.expectEqual(@as(u32, 3), terminal[31].attempts);
+    // Compacted recipes without a hydrated payload are debt, not reusable
+    // completed work. A fresh successful result must fill that missing data.
+    cached[0].labels = null;
+    fresh[0] = base;
+    const hydrated = try mergeResults(arena.allocator(), &fresh, &cached, 3);
+    try std.testing.expect(hydrated[0].labels != null);
+    try std.testing.expectEqual(@as(u32, 2), hydrated[0].attempts);
 }

@@ -30,6 +30,7 @@ pub const Mp4 = struct {
     leading_samples: usize,
     trim: u64,
     frame_samples: usize,
+    borrowed: bool = false,
 
     pub fn init(a: std.mem.Allocator, source: *media.source.Source, max_metadata_bytes: usize, max_packets: usize) !Mp4 {
         if (source.limits.max_read_bytes == 0 or max_packets == 0) return error.ResourceLimitExceeded;
@@ -96,10 +97,34 @@ pub const Mp4 = struct {
         return error.UnsupportedAudioFormat;
     }
     pub fn deinit(self: *Mp4) void {
+        if (self.borrowed) return;
         self.tables.deinit(self.allocator);
         self.allocator.free(self.offsets);
         self.allocator.free(self.metadata);
     }
+    /// Immutable, arena-owned metadata. No source or execution control escapes.
+    pub const Snapshot = struct {
+        decoder_config: []const u8,
+        sizes: []u32,
+        offsets: []u64,
+        rate: u32,
+        samples: usize,
+        leading: usize,
+        trim: u64,
+        frame_samples: usize,
+        pub fn copy(a: std.mem.Allocator, owner: Mp4) !Snapshot {
+            return .{ .decoder_config = try a.dupe(u8, owner.tables.decoder_config), .sizes = try a.dupe(u32, owner.tables.sample_sizes.items), .offsets = try a.dupe(u64, owner.offsets), .rate = owner.tables.sample_rate, .samples = owner.samples, .leading = owner.leading_samples, .trim = owner.trim, .frame_samples = owner.frame_samples };
+        }
+        pub fn estimatedBytes(owner: Mp4) usize {
+            return owner.tables.decoder_config.len +| owner.tables.sample_sizes.items.len *| @sizeOf(u32) +| owner.offsets.len *| @sizeOf(u64);
+        }
+        pub fn reader(self: Snapshot, a: std.mem.Allocator, source: *media.source.Source) Mp4 {
+            var owner = Mp4{ .allocator = a, .source = source, .metadata = &.{}, .tables = .{ .codec = .aac, .decoder_config = self.decoder_config, .sample_rate = self.rate }, .offsets = self.offsets, .samples = self.samples, .leading_samples = self.leading, .trim = self.trim, .frame_samples = self.frame_samples, .borrowed = true };
+            owner.tables.sample_sizes.items = self.sizes;
+            owner.tables.sample_sizes.capacity = self.sizes.len;
+            return owner;
+        }
+    };
     pub fn provider(self: *Mp4) providers.Provider {
         return .{ .context = self, .samples = self.samples, .sample_rate = self.tables.sample_rate, .read = read };
     }
@@ -175,14 +200,35 @@ fn readInto(source: *media.source.Source, offset: u64, out: []u8) !void {
 /// and a forward codec-block queue, never a full decoded PCM copy.
 pub const Track = struct {
     allocator: std.mem.Allocator,
+    control: @import("../execution_control.zig").InferenceExecutionControl = .{},
     mp4: ?Mp4 = null,
     stream: ?*providers.Stream = null,
     bytes: ?[]u8 = null,
     decoded: ?audio.Audio = null,
     pcm: providers.Pcm = undefined,
+    cache: ?*@import("media_index_cache.zig").Cache = null,
+    cached: ?*@import("media_index_cache.zig").Cache.Entry = null,
+    seek: ?@import("media_audio_seek.zig").Index = null,
+    seek_reader: @import("media_audio_seek.zig").Reader = undefined,
     pub fn init(a: std.mem.Allocator, source: *media.source.Source, control: @import("../execution_control.zig").InferenceExecutionControl, max_bytes: usize, max_packets: usize) !Track {
-        var self = Track{ .allocator = a };
+        return initCached(a, source, control, max_bytes, max_packets, null, null);
+    }
+    pub fn initCached(a: std.mem.Allocator, source: *media.source.Source, control: @import("../execution_control.zig").InferenceExecutionControl, max_bytes: usize, max_packets: usize, cache: ?*@import("media_index_cache.zig").Cache, admission: ?@import("media_index_cache.zig").Cache.Admission) !Track {
+        var self = Track{ .allocator = a, .cache = cache, .control = control };
         errdefer self.deinit();
+        try control.check();
+        const identity = @import("media_index_cache.zig").Cache.aacKey(source, max_packets, max_bytes);
+        if (identity) |key| if (cache) |retained| if (retained.get(key)) |hit| {
+            self.cached = hit;
+            self.mp4 = hit.data.aac.reader(a, source);
+            return self;
+        };
+        const audio_identity = @import("media_index_cache.zig").Cache.audioKey(source, max_packets, max_bytes);
+        if (audio_identity) |key| if (cache) |retained| if (retained.get(key)) |hit| {
+            self.cached = hit;
+            self.seek_reader = .{ .index = &hit.data.audio, .source = source, .control = control };
+            return self;
+        };
         var prefix: [4]u8 = undefined;
         if (source.length() < 4) return error.UnsupportedAudioFormat;
         try readInto(source, 0, &prefix);
@@ -191,12 +237,28 @@ pub const Track = struct {
                 error.UnsupportedAudioFormat, error.UnsupportedStreamingAudioProfile => null,
                 else => return err,
             };
-            if (self.mp4 != null) return self;
+            if (self.mp4) |owner| {
+                if (identity) |key| if (cache) |retained| if (admission) |admit| retained.remember(std.heap.smp_allocator, key, .{ .aac = owner }, admit);
+                return self;
+            }
         }
         const length = std.math.cast(usize, source.length()) orelse return error.AudioTooLarge;
         if (length > max_bytes) return error.AudioTooLarge;
         self.bytes = try a.alloc(u8, length);
         try readInto(source, 0, self.bytes.?);
+        if (audio_identity != null and cache != null and admission != null) {
+            const check = control.imageWorkControl();
+            const scope = audio.work_control.Scope.enter(.{ .context = check.context, .check_fn = check.check_fn });
+            defer scope.deinit();
+            self.seek = @import("media_audio_seek.zig").Index.init(a, self.bytes.?, max_packets) catch |err| switch (err) {
+                error.UnsupportedAudioFormat, error.UnsupportedStreamingAudioProfile => null,
+                else => return err,
+            };
+            if (self.seek) |index| {
+                cache.?.remember(std.heap.smp_allocator, audio_identity.?, .{ .audio = index }, admission.?);
+                return self;
+            }
+        }
         self.stream = try providers.Stream.start(a, self.bytes.?, control);
         if (self.stream == null) {
             const check = control.imageWorkControl();
@@ -206,12 +268,19 @@ pub const Track = struct {
     }
     pub fn deinit(self: *Track) void {
         if (self.mp4) |*owner| owner.deinit();
+        if (self.seek) |*owner| owner.deinit();
+        if (self.cached) |entry| self.cache.?.release(entry);
         if (self.stream) |owner| owner.deinit();
         if (self.decoded) |*owner| owner.deinit();
         if (self.bytes) |bytes| self.allocator.free(bytes);
     }
     pub fn provider(self: *Track) providers.Provider {
         if (self.mp4) |*owner| return owner.provider();
+        if (self.seek) |*index| {
+            self.seek_reader = .{ .index = index, .bytes = self.bytes.?, .control = self.control };
+            return self.seek_reader.provider();
+        }
+        if (self.cached != null) return self.seek_reader.provider();
         if (self.stream) |owner| return owner.provider();
         self.pcm = .{ .pcm = .{ .samples = self.decoded.?.samples, .sample_rate = self.decoded.?.sample_rate } };
         return self.pcm.provider();
@@ -241,4 +310,58 @@ test "model aware media MP4 audio windows preserve complete PCM clocks across bo
     var track = try Track.init(a, &source, .{ .io = io }, 4 * 1024 * 1024, 100000);
     defer track.deinit();
     try std.testing.expect(track.mp4 != null and track.bytes == null and track.stream == null);
+}
+
+test "model aware media AAC snapshots own tables rebind transports and keep busy admission pinned" {
+    const Cache = @import("media_index_cache.zig").Cache;
+    const memory = @import("../runtime/tier/memory.zig");
+    const Provider = struct {
+        bytes: []const u8,
+        reads: usize = 0,
+        controller: memory.AdmissionController = .{},
+        fn acquire(raw: *anyopaque, bytes: usize) !memory.AdmissionLease {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            return self.controller.tryAcquire(.cpu, .{ .host_limit_bytes = Cache.max_bytes }, .{ .host_scratch_bytes = bytes }, false);
+        }
+        fn read(raw: *anyopaque, offset: u64, out: []u8, control: media.source.Control) !usize {
+            try control.check();
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.reads += 1;
+            @memcpy(out, self.bytes[@intCast(offset)..][0..out.len]);
+            return out.len;
+        }
+    };
+    const a = std.testing.allocator;
+    const bytes = std.Io.Dir.cwd().readFileAlloc(std.testing.io, "lib/audio/testdata/codec-corpus/tone-stereo.mp4", a, .limited(1024 * 1024)) catch try std.Io.Dir.cwd().readFileAlloc(std.testing.io, "../../lib/audio/testdata/codec-corpus/tone-stereo.mp4", a, .limited(1024 * 1024));
+    defer a.free(bytes);
+    var cache: Cache = .{};
+    defer cache.deinit();
+    var first = Provider{ .bytes = bytes };
+    var next = Provider{ .bytes = bytes };
+    var source = media.source.Source{ .allocator = a, .identity = "aac/v1", .storage = .{ .range = .{ .context = &first, .length = bytes.len, .read_at = Provider.read, .immutable_binding = @splat(1) } } };
+    const admission = Cache.Admission{ .context = &first, .acquire = Provider.acquire };
+    {
+        var owner = try Track.initCached(a, &source, .{}, 1024 * 1024, 100000, &cache, admission);
+        defer owner.deinit();
+        try std.testing.expect(owner.mp4 != null);
+    }
+    const first_reads = first.reads;
+    source.storage.range.context = &next;
+    {
+        var warm = try Track.initCached(a, &source, .{}, 1024 * 1024, 100000, &cache, admission);
+        defer warm.deinit();
+        try std.testing.expectEqual(@as(usize, 0), next.reads);
+        try std.testing.expectEqual(@as(usize, 0), Cache.reclaim(&cache, Cache.max_bytes));
+        var reference = try audio.decode(a, bytes, .{});
+        defer reference.deinit();
+        var window = try warm.provider().read(warm.provider().context, a, warm.mp4.?.leading_samples, warm.mp4.?.leading_samples + @min(3000, reference.samples.len));
+        defer window.deinit(a);
+        for (window.pcm.samples, reference.samples[0..window.pcm.samples.len]) |actual, expected| try std.testing.expectApproxEqAbs(expected, actual, 0.00001);
+        try std.testing.expect(next.reads != 0);
+        try std.testing.expectEqual(first_reads, first.reads);
+    }
+    source.storage.range.immutable_binding = @splat(2);
+    try std.testing.expect(cache.get(Cache.aacKey(&source, 100000, 1024 * 1024).?) == null);
+    try std.testing.expect(Cache.reclaim(&cache, Cache.max_bytes) != 0);
+    try std.testing.expectEqual(@as(usize, 0), first.controller.snapshot().hostTotalBytes());
 }

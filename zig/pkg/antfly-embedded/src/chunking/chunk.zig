@@ -601,6 +601,11 @@ pub fn modelMetadataAlloc(a: Allocator, payload: []const u8) !?*@import("inferen
     const raw = parsed.value.object.get("_chunk") orelse return null;
     var metadata = try std.json.parseFromValue(@import("inference_chunker").types.ModelMetadata, a, raw, .{ .ignore_unknown_fields = true });
     defer metadata.deinit();
+    // Artifact recipes retain output identities under `outputs`, separately
+    // from payloads. Restore those receipts for independent vector consumers.
+    if (raw == .object) if (raw.object.get("outputs")) |outputs| {
+        metadata.value.outputs_json = try std.json.Stringify.valueAlloc(metadata.arena.allocator(), outputs, .{});
+    };
     return try metadata.value.clone(a);
 }
 
