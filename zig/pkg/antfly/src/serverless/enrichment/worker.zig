@@ -840,10 +840,6 @@ fn buildModelAwareChunkBodyAlloc(self: *SparseEnricher, body: []const u8, pipeli
     }
     recipe_hash.update(&std.mem.toBytes(std.mem.nativeToLittle(u32, pipeline_version)));
     const recipe_fingerprint = std.fmt.bytesToHex(recipe_hash.finalResult(), .lower);
-    if (document.object.get("_enrichment")) |state| if (state == .object) {
-        const old_recipe = state.object.get("chunk_embeddings_recipe");
-        if (state.object.get("chunk_embeddings_version")) |version| if (version == .integer and version.integer >= pipeline_version and !serverlessMediaPending(state) and old_recipe != null and old_recipe.? == .string and std.mem.eql(u8, old_recipe.?.string, &recipe_fingerprint)) return .{};
-    };
     const selected = try chunking.chunk.modelSourceFromValue(field);
     var decoded: ?[]u8 = null;
     defer if (decoded) |bytes| a.free(bytes);
@@ -868,17 +864,67 @@ fn buildModelAwareChunkBodyAlloc(self: *SparseEnricher, body: []const u8, pipeli
     // The provider's plan authenticates source and boundary identity. Output
     // recipes below authorize each reusable result independently, including
     // across consumer edits and pipeline-version changes.
-    if (input != null) if (document.object.get("media_outputs")) |cached| {
-        if (cached == .object and cached.object.contains("chunks")) {
-            const parsed = try std.json.parseFromValueLeaky(struct { chunks: []const media_outputs.Row, plan_id: []const u8 }, scratch, cached, .{ .ignore_unknown_fields = true });
-            var probe = try chunking.inference.probeModelPageWithProvider(a, base_config, input.?, self.model_chunk_provider);
-            defer probe.deinit(a);
+    var legacy_current = false;
+    const cached_document_outputs = document.object.get("media_outputs");
+    const has_output_rows = if (cached_document_outputs) |value| value == .object and value.object.contains("chunks") else false;
+    const legacy_rows = document.object.get("chunk_embeddings");
+    if (input != null and (has_output_rows or legacy_rows != null)) {
+        var probe = try chunking.inference.probeModelPageWithProvider(a, base_config, input.?, self.model_chunk_provider);
+        defer probe.deinit(a);
+        if (has_output_rows) {
+            const parsed = try std.json.parseFromValueLeaky(struct { chunks: []const media_outputs.Row, plan_id: []const u8 }, scratch, cached_document_outputs.?, .{ .ignore_unknown_fields = true });
             if (std.mem.eql(u8, probe.plan_id, parsed.plan_id) and probe.chunks.len != 0) {
                 cached_rows = parsed.chunks;
                 current_identities = try std.json.parseFromSliceLeaky([]media_outputs.Result, scratch, probe.chunks[0].metadata.?.outputs_json orelse return error.InvalidChunkerResponse, .{ .allocate = .alloc_always });
             }
+        } else if (base_config.outputs_json.len == 0 and probe.chunks.len != 0) {
+            // Legacy single-embedding providers have no output recipes. Their
+            // persisted descriptors must still authenticate the deployed model.
+            const metadata = probe.chunks[0].metadata orelse return error.InvalidChunkerResponse;
+            legacy_current = legacy_rows.? == .array and legacy_rows.?.array.items.len != 0;
+            if (legacy_current) for (legacy_rows.?.array.items) |row| {
+                if (row != .object) {
+                    legacy_current = false;
+                    break;
+                }
+                const descriptor = row.object.get("_chunk") orelse {
+                    legacy_current = false;
+                    break;
+                };
+                if (descriptor != .object) {
+                    legacy_current = false;
+                    break;
+                }
+                const names = [_][]const u8{ "plan_id", "source_fingerprint", "source_version", "model_identity", "model_revision" };
+                const values = [_][]const u8{ metadata.plan_id, metadata.source_fingerprint, metadata.source_version, metadata.model_identity, metadata.model_revision };
+                for (names, values) |name, expected| {
+                    const value = descriptor.object.get(name) orelse {
+                        legacy_current = false;
+                        break;
+                    };
+                    if (value != .string or !std.mem.eql(u8, value.string, expected)) {
+                        legacy_current = false;
+                        break;
+                    }
+                }
+                if (!legacy_current) break;
+            };
         }
-    };
+    }
+    // A configuration fingerprint cannot certify mutable deployed aliases.
+    // Probe every configured recipe before the completed-document fast path.
+    const current_outputs = input == null or legacy_current or (cached_rows.len != 0 and for (consumers.targets) |target| {
+        for (cached_rows) |row| {
+            if (needsServerlessOutput(target, row.outputs, current_identities)) break;
+        } else continue;
+        break false;
+    } else true);
+    if (current_outputs) {
+        if (document.object.get("_enrichment")) |state| if (state == .object) {
+            const old_recipe = state.object.get("chunk_embeddings_recipe");
+            if (state.object.get("chunk_embeddings_version")) |version| if (version == .integer and version.integer >= pipeline_version and !serverlessMediaPending(state) and old_recipe != null and old_recipe.? == .string and std.mem.eql(u8, old_recipe.?.string, &recipe_fingerprint)) return .{};
+        };
+    }
     var config = base_config;
     config.page = true;
     config.max_chunks = if (config.max_chunks == 0) 64 else @min(config.max_chunks, 64);
@@ -2887,6 +2933,16 @@ test "model aware media serverless chunks use the shared paged provider and reta
             chunks[0].metadata = try (chunking.inference.RemoteMetadata{ .descriptor = .{ .ordinal = ordinal, .input_tokens = 1, .coordinates = .{ .kind = .video, .start_ns = @intCast(ordinal * 100), .end_ns = @intCast((ordinal + 1) * 100) } }, .inference_id = id, .plan_id = "1111111111111111111111111111111111111111111111111111111111111111", .source_fingerprint = "2222222222222222222222222222222222222222222222222222222222222222", .source_version = "v1", .model = "model", .model_identity = "3333333333333333333333333333333333333333333333333333333333333333", .model_revision = "4444444444444444444444444444444444444444444444444444444444444444", .task_type = "RETRIEVAL_DOCUMENT", .dimensions = 2, .policy = .{}, .embedding = &.{ 0.6, 0.8 } }).clone(alloc);
             chunks[0].owns_metadata = true;
             errdefer chunks[0].deinit(alloc);
+            if (cfg.outputs_json.len != 0) {
+                var consumers = try std.json.parseFromSlice(media_outputs.Config, alloc, cfg.outputs_json, .{});
+                defer consumers.deinit();
+                const target = consumers.value.targets[0];
+                try std.testing.expect(!target.execute);
+                const metadata = chunks[0].metadata.?;
+                const recipe_id = try target.recipeIdentity(alloc, metadata.model_identity, metadata.model_revision);
+                chunks[0].metadata.?.outputs_json = try std.json.Stringify.valueAlloc(alloc, [_]media_outputs.Result{.{ .name = target.name, .kind = target.kind, .required = target.required, .model = target.model, .model_identity = metadata.model_identity, .model_revision = metadata.model_revision, .recipe_id = &recipe_id, .status = .skipped }}, .{ .emit_null_optional_fields = false });
+            }
+
             const plan = try alloc.dupe(u8, "1111111111111111111111111111111111111111111111111111111111111111");
             errdefer alloc.free(plan);
             const source = try alloc.dupe(u8, "2222222222222222222222222222222222222222222222222222222222222222");
@@ -2918,11 +2974,11 @@ test "model aware media serverless chunks use the shared paged provider and reta
     try std.testing.expect(parsed.value.object.get("embedding") == null);
     const skipped = try buildDerivedBodyAlloc(&worker, .chunk_embeddings, result.body.?, 2, .require_model);
     try std.testing.expect(skipped.body == null);
-    try std.testing.expectEqual(@as(usize, 2), fake.calls);
+    try std.testing.expectEqual(@as(usize, 3), fake.calls);
     worker.model_chunker.?.max_chunks = 2;
     const repaged = try buildDerivedBodyAlloc(&worker, .chunk_embeddings, result.body.?, 2, .require_model);
     try std.testing.expect(repaged.body == null);
-    try std.testing.expectEqual(@as(usize, 2), fake.calls);
+    try std.testing.expectEqual(@as(usize, 4), fake.calls);
 }
 
 test "model aware media serverless enrichment stages preserve independent outputs and metadata" {
@@ -3082,6 +3138,8 @@ test "model aware media serverless consumer edits preserve healthy model work" {
 }
 
 const ServerlessMediaTestProvider = struct {
+    speech_revision_changed: bool = false,
+    boundary_revision_changed: bool = false,
     calls: [3]usize = @splat(0),
     fail: bool = true,
     fn page(raw: *anyopaque, a: Allocator, _: []const u8, _: chunking.inference.RemoteInput, cfg: chunking.types.Config, _: @import("antfly_inference_execution_context").RequestContext) anyerror!chunking.inference.ChunkPage {
@@ -3095,7 +3153,7 @@ const ServerlessMediaTestProvider = struct {
         for (config.value.targets, 0..) |target, index| {
             if (target.execute) self.calls[index] += 1;
             const identity = "3333333333333333333333333333333333333333333333333333333333333333";
-            const revision = "4444444444444444444444444444444444444444444444444444444444444444";
+            const revision = if ((index == 2 and self.speech_revision_changed) or (index == 0 and self.boundary_revision_changed)) "5555555555555555555555555555555555555555555555555555555555555555" else "4444444444444444444444444444444444444444444444444444444444444444";
             const recipe = try target.recipeIdentity(scratch, identity, revision);
             const copies: usize = if (index == 1 and target.execute) 2 else 1;
             for (0..copies) |sub_index| {
@@ -3108,11 +3166,12 @@ const ServerlessMediaTestProvider = struct {
             }
         }
         const encoded = try std.json.Stringify.valueAlloc(scratch, results.items, .{ .emit_null_optional_fields = false });
-        const plan = "1111111111111111111111111111111111111111111111111111111111111111";
+        const plan = if (self.boundary_revision_changed) "6666666666666666666666666666666666666666666666666666666666666666" else "1111111111111111111111111111111111111111111111111111111111111111";
+        const inference_id = try std.fmt.allocPrint(scratch, "{s}:0", .{plan});
         const fingerprint = "2222222222222222222222222222222222222222222222222222222222222222";
         const chunks = try a.alloc(chunking.inference.RemoteChunk, 1);
         errdefer a.free(chunks);
-        chunks[0] = .{ .id = 0, .mime_type = "audio/wav", .metadata = try (chunking.inference.RemoteMetadata{ .descriptor = .{ .ordinal = 0, .input_tokens = 1, .coordinates = .{ .kind = .audio, .start_ns = 0, .end_ns = 100 } }, .inference_id = plan ++ ":0", .plan_id = plan, .source_fingerprint = fingerprint, .source_version = "v1", .model = "boundaryB", .model_identity = results.items[0].model_identity, .model_revision = results.items[0].model_revision, .task_type = "RETRIEVAL_DOCUMENT", .dimensions = 2, .policy = .{}, .embedding = if (config.value.targets[0].execute) &.{ 1, 0 } else null, .outputs_json = encoded }).clone(a), .owns_metadata = true };
+        chunks[0] = .{ .id = 0, .mime_type = "audio/wav", .metadata = try (chunking.inference.RemoteMetadata{ .descriptor = .{ .ordinal = 0, .input_tokens = 1, .coordinates = .{ .kind = .audio, .start_ns = 0, .end_ns = 100 } }, .inference_id = inference_id, .plan_id = plan, .source_fingerprint = fingerprint, .source_version = "v1", .model = "boundaryB", .model_identity = results.items[0].model_identity, .model_revision = results.items[0].model_revision, .task_type = "RETRIEVAL_DOCUMENT", .dimensions = 2, .policy = .{}, .embedding = if (config.value.targets[0].execute) &.{ 1, 0 } else null, .outputs_json = encoded }).clone(a), .owns_metadata = true };
         errdefer chunks[0].deinit(a);
         const owned_plan = try a.dupe(u8, plan);
         errdefer a.free(owned_plan);
@@ -3133,4 +3192,31 @@ test "model aware media serverless skipped placeholder preserves every cached su
     const merged = try mergeServerlessOutputs(a, &.{skipped}, &.{ first, second }, 3);
     defer a.free(merged);
     try std.testing.expectEqual(@as(usize, 2), merged.len);
+}
+
+test "model aware media serverless settled outputs probe secondary generations before accepting completion" {
+    const Fake = ServerlessMediaTestProvider;
+    const a = std.testing.allocator;
+    var fake = Fake{ .fail = false };
+    var worker = SparseEnricher{ .alloc = a, .artifacts = undefined, .manifests = undefined, .progress = undefined, .wal = undefined };
+    defer worker.deinit();
+    const Boundary = @import("antfly_runtime_abi").callback_abi.Boundary(struct { chunk_page_with_context: ?*const @TypeOf(Fake.page) = null });
+    try worker.setModelChunker(.{ .provider = .antfly, .embedding = .{ .model = "indexA", .dimensions = 2 }, .outputs_json = "{\"boundary_model\":\"boundary\",\"targets\":[{\"name\":\"boundary\",\"kind\":\"embedding\",\"model\":\"boundaryB\",\"dimensions\":2},{\"name\":\"embedding\",\"kind\":\"embedding\",\"model\":\"indexA\",\"dimensions\":2},{\"name\":\"speech\",\"kind\":\"transcribe\",\"model\":\"speech\"}]}" }, "clip", .{ .ptr = &fake, .boundary_dispatch = Boundary.local_dispatch, .chunk_page_with_context_callback = @ptrCast(&Fake.page) });
+
+    const first = try buildDerivedBodyAlloc(&worker, .chunk_embeddings, "{\"clip\":\"audio source\"}", 1, .require_model);
+    defer a.free(first.body.?);
+    const unchanged = try buildDerivedBodyAlloc(&worker, .chunk_embeddings, first.body.?, 1, .require_model);
+    defer if (unchanged.body) |body| a.free(body);
+    try std.testing.expect(unchanged.body == null);
+    try std.testing.expectEqualDeep([_]usize{ 1, 1, 1 }, fake.calls);
+    fake.speech_revision_changed = true;
+    const second = try buildDerivedBodyAlloc(&worker, .chunk_embeddings, first.body.?, 1, .require_model);
+    defer if (second.body) |body| a.free(body);
+    try std.testing.expect(second.body != null);
+    try std.testing.expectEqualDeep([_]usize{ 1, 1, 2 }, fake.calls);
+    fake.boundary_revision_changed = true;
+    const replanned = try buildDerivedBodyAlloc(&worker, .chunk_embeddings, second.body.?, 1, .require_model);
+    defer if (replanned.body) |body| a.free(body);
+    try std.testing.expect(replanned.body != null);
+    try std.testing.expectEqualDeep([_]usize{ 2, 2, 3 }, fake.calls);
 }

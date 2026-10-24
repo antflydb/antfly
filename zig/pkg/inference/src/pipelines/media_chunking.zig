@@ -638,6 +638,14 @@ pub const Runner = struct {
             try self.soundWindows(try wav.provider());
             return;
         };
+        const seek_audio = if (audio.detectFormatFromMime(mime)) |format| format == .mp3 or format == .flac else false;
+        const audio_key = if (seek_audio) @import("media_index_cache.zig").Cache.audioKey(&source, self.request.limits.max_index_packets, self.request.max_working_bytes) else null;
+        if (audio_key) |key| if (self.request.index_cache) |cache| if (cache.get(key)) |entry| {
+            defer cache.release(entry);
+            var reader = @import("media_audio_seek.zig").Reader{ .index = &entry.data.audio, .source = &source, .control = self.control };
+            try self.soundWindows(reader.provider());
+            return;
+        };
         // Still/document decoders own a bounded contiguous input. Keep this
         // explicit spool separate from the source-backed coded-video path.
         const length = std.math.cast(usize, source.length()) orelse return error.ResourceLimitExceeded;
@@ -650,6 +658,16 @@ pub const Runner = struct {
             defer lease.deinit();
             @memcpy(bytes[offset..][0..lease.bytes.len], lease.bytes);
             offset += lease.bytes.len;
+        }
+        if (audio_key != null and self.request.index_cache != null and self.request.index_cache_admission != null) {
+            const audio_scope = @import("inference_audio").work_control.Scope.enter(.{ .context = adapter.context, .check_fn = adapter.check_fn });
+            defer audio_scope.deinit();
+            var index = try @import("media_audio_seek.zig").Index.init(self.allocator, bytes, self.request.limits.max_index_packets);
+            defer index.deinit();
+            if (audio_key) |key| if (self.request.index_cache) |cache| if (self.request.index_cache_admission) |admission| cache.remember(std.heap.smp_allocator, key, .{ .audio = index }, admission);
+            var reader = @import("media_audio_seek.zig").Reader{ .index = &index, .bytes = bytes, .control = self.control };
+            try self.soundWindows(reader.provider());
+            return;
         }
         const essence = mime[0 .. std.mem.indexOfScalar(u8, mime, ';') orelse mime.len];
         if (std.ascii.startsWithIgnoreCase(essence, "text/") or std.ascii.eqlIgnoreCase(essence, "application/json")) try self.textChunks(bytes, null) else if (std.ascii.eqlIgnoreCase(essence, "application/pdf")) try self.document(bytes) else if (std.ascii.eqlIgnoreCase(essence, "image/gif")) try self.animation(bytes) else if (std.ascii.startsWithIgnoreCase(essence, "image/")) try self.still(bytes) else if (std.ascii.startsWithIgnoreCase(essence, "audio/")) try self.sound(bytes) else if (std.ascii.startsWithIgnoreCase(essence, "video/")) try self.movie(bytes) else return error.UnsupportedChunkMediaType;
@@ -1659,6 +1677,70 @@ test "model aware media cached planning owns indexes and rebinds sources across 
         try std.testing.expectEqual(old_reads, provider.reads);
         try std.testing.expectEqual(@as(usize, 1), second.seen);
         try std.testing.expectEqual(@as(u64, summary.next_ordinal + 1), replay.summary.next_ordinal);
+        try std.testing.expect(Cache.reclaim(&cache, Cache.max_bytes) > 0);
+        try std.testing.expectEqual(@as(usize, 0), provider.controller.snapshot().hostTotalBytes());
+    }
+}
+
+test "model aware media audio pages reuse admitted indexes and bind only the current source" {
+    const Cache = @import("media_index_cache.zig").Cache;
+    const memory = @import("../runtime/tier/memory.zig");
+    const Provider = struct {
+        bytes: []const u8,
+        read_bytes: usize = 0,
+        controller: memory.AdmissionController = .{},
+        fn acquire(raw: *anyopaque, bytes: usize) !memory.AdmissionLease {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            return self.controller.tryAcquire(.cpu, .{ .host_limit_bytes = Cache.max_bytes }, .{ .host_scratch_bytes = bytes }, false);
+        }
+        fn read(raw: *anyopaque, offset: u64, out: []u8, control: media.source.Control) !usize {
+            try control.check();
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const first: usize = @intCast(offset);
+            const count = @min(out.len, self.bytes.len - first);
+            @memcpy(out[0..count], self.bytes[first..][0..count]);
+            self.read_bytes += count;
+            return count;
+        }
+        fn cancelled(_: ?*anyopaque) bool {
+            return true;
+        }
+    };
+    const a = std.testing.allocator;
+    for ([_][]const u8{ "tone.mp3", "codec-corpus/tone-stereo.flac" }) |name| {
+        const path = try std.fmt.allocPrint(a, "../../lib/audio/testdata/{s}", .{name});
+        defer a.free(path);
+        const bytes = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, path, a, .limited(1024 * 1024));
+        defer a.free(bytes);
+        var cache: Cache = .{};
+        defer cache.deinit();
+        var provider = Provider{ .bytes = bytes };
+        var next = Provider{ .bytes = bytes };
+        var source = media.source.Source{ .allocator = a, .identity = name, .storage = .{ .range = .{ .context = &provider, .read_at = Provider.read, .length = bytes.len, .immutable_binding = @splat(1) } } };
+        const mp3 = std.mem.endsWith(u8, name, ".mp3");
+        const request = Request{ .input = .{ .binary = .{ .mime_type = if (mp3) "audio/mpeg" else "audio/flac", .data = &.{} } }, .native_source = &source, .source_version = "v1", .index_cache = &cache, .index_cache_admission = .{ .context = &provider, .acquire = Provider.acquire }, .policy = .{ .window_ns = 100 * std.time.ns_per_ms, .step_ns = 100 * std.time.ns_per_ms }, .max_chunks = 1 };
+        var first = Qualification{};
+        var runner = try Runner.init(a, request, first.executor(), .{}, .{ .context = &first, .accept = Qualification.accept });
+        const summary = try runner.run();
+        try std.testing.expectEqual(bytes.len, provider.read_bytes);
+        var cursor: [85]u8 = undefined;
+        var resumed = request;
+        resumed.continuation = summary.identity.cursor(summary.next_ordinal, &cursor);
+        source.storage.range.context = &next;
+        var second = Qualification{};
+        var replay = try Runner.init(a, resumed, second.executor(), .{}, .{ .context = &second, .accept = Qualification.accept });
+        _ = try replay.run();
+        try std.testing.expectEqual(bytes.len, provider.read_bytes);
+        try std.testing.expectEqual(@as(usize, 1), second.seen);
+        try std.testing.expectEqual(summary.next_ordinal, second.ordinals[0]);
+        if (mp3) try std.testing.expectEqual(@as(usize, 0), next.read_bytes) else try std.testing.expect(next.read_bytes > 0 and next.read_bytes < bytes.len);
+        const old_reads = next.read_bytes;
+        replay = try Runner.init(a, resumed, second.executor(), .{}, .{ .context = &second, .accept = Qualification.accept });
+        replay.control.cancellation = .{ .is_cancelled_fn = Provider.cancelled };
+        try std.testing.expectError(error.Cancelled, replay.run());
+        try std.testing.expectEqual(old_reads, next.read_bytes);
+        source.storage.range.immutable_binding = @splat(2);
+        try std.testing.expect(cache.get(Cache.audioKey(&source, request.limits.max_index_packets, request.max_working_bytes).?) == null);
         try std.testing.expect(Cache.reclaim(&cache, Cache.max_bytes) > 0);
         try std.testing.expectEqual(@as(usize, 0), provider.controller.snapshot().hostTotalBytes());
     }

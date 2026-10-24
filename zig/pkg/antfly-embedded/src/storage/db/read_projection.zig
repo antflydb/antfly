@@ -365,15 +365,11 @@ pub fn loadArtifactFieldValueTxn(
     read_txn: ?*docstore_mod.DocStore.Txn,
     artifact_catalog: ?*const index_manager_mod.IndexManager.AssetContentTypeSnapshot,
 ) !?std.json.Value {
-    const prefix = try internal_keys.artifactRootPrefixAlloc(alloc, doc_key);
-    defer alloc.free(prefix);
-
-    const artifacts = if (read_txn) |txn|
-        try docstore_mod.DocStore.scanPrefixTxn(alloc, txn, prefix)
-    else
-        try self.core.scanStorePrefix(alloc, prefix);
-    defer docstore_mod.DocStore.freeResults(alloc, artifacts);
-
+    if (read_txn == null) {
+        var read = try self.core.store.beginReadTxnWithBlockCacheAdmission(.transient);
+        defer read.abort();
+        return loadArtifactFieldValueTxn(self, alloc, doc_key, &read, artifact_catalog);
+    }
     var artifacts_obj = std.json.ObjectMap.empty;
     errdefer {
         var it = artifacts_obj.iterator();
@@ -385,15 +381,35 @@ pub fn loadArtifactFieldValueTxn(
     }
 
     var artifact_count: usize = 0;
-    for (artifacts) |entry| {
-        var artifact_ref = (try decodeArtifactRefIfKnownAlloc(alloc, entry.key)) orelse continue;
-        defer artifact_ref.deinit(alloc);
-
-        var artifact_value = try artifactProjectionValue(self, alloc, artifact_ref, entry.value, artifact_catalog);
-        errdefer freeJsonValue(alloc, &artifact_value);
-
-        try appendArtifactProjectionValue(alloc, &artifacts_obj, artifact_ref.name, artifact_ref.kind, artifact_value);
-        artifact_count += 1;
+    // Preserve the physical family order for legacy names shared across kinds.
+    // Only the logical cursor may enumerate chunks: legacy rows can be hidden
+    // by a selected generation (including an empty replacement).
+    for ([_]types.ArtifactKind{ .asset, .chunk, .embedding }) |kind| {
+        if (kind == .chunk) {
+            var chunks = try @import("artifact_chunk_cursor.zig").Cursor(docstore_mod.DocStore.Txn).open(alloc, read_txn.?, doc_key);
+            defer chunks.close();
+            while (try chunks.next()) |entry| {
+                var ref = (try decodeArtifactRefIfKnownAlloc(alloc, entry.key)) orelse return error.ArtifactCatalogCorrupt;
+                defer ref.deinit(alloc);
+                var value = try artifactProjectionValue(self, alloc, ref, entry.value, artifact_catalog);
+                errdefer freeJsonValue(alloc, &value);
+                try appendArtifactProjectionValue(alloc, &artifacts_obj, ref.name, ref.kind, value);
+                artifact_count += 1;
+            }
+        } else {
+            const prefix = try internal_keys.artifactTypePrefixAlloc(alloc, doc_key, @tagName(kind));
+            defer alloc.free(prefix);
+            const artifacts = try docstore_mod.DocStore.scanPrefixTxn(alloc, read_txn.?, prefix);
+            defer docstore_mod.DocStore.freeResults(alloc, artifacts);
+            for (artifacts) |entry| {
+                var ref = (try decodeArtifactRefIfKnownAlloc(alloc, entry.key)) orelse continue;
+                defer ref.deinit(alloc);
+                var value = try artifactProjectionValue(self, alloc, ref, entry.value, artifact_catalog);
+                errdefer freeJsonValue(alloc, &value);
+                try appendArtifactProjectionValue(alloc, &artifacts_obj, ref.name, ref.kind, value);
+                artifact_count += 1;
+            }
+        }
     }
 
     if (artifact_count == 0) {

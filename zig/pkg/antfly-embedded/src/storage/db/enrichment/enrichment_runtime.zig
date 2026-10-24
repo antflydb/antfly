@@ -38850,6 +38850,16 @@ test "model aware media ordered generation publishes beyond 4095 chunks and resu
     try db.runUntilIdle();
     try std.testing.expectEqual(@as(u32, 5000), db.core.index_manager.textIndex("text").?.snapshot().liveDocCount());
     {
+        var lookup = (try db.lookup(a, "doc", .{ .fields = &.{ "_chunks", "_artifacts" }, .include_all_fields = false })).?;
+        defer lookup.deinit(a);
+        var parsed = try std.json.parseFromSlice(std.json.Value, a, lookup.json, .{});
+        defer parsed.deinit();
+        const chunks = parsed.value.object.get("_chunks").?.object.get("chunks").?.array.items;
+        try std.testing.expectEqual(@as(usize, 5000), chunks.len);
+        const artifacts = parsed.value.object.get("_artifacts").?.object.get("chunks").?.object.get("items").?.array.items;
+        try std.testing.expectEqual(chunks.len, artifacts.len);
+    }
+    {
         var results = try db.search(a, .{ .index_name = "text", .full_text = .{ .match = .{ .field = "body", .text = "hello" } }, .return_mode = .member, .limit = 5000 });
         defer results.deinit();
         try std.testing.expectEqual(@as(u32, 5000), results.total_hits);
@@ -38873,6 +38883,13 @@ test "model aware media ordered generation publishes beyond 4095 chunks and resu
         var results = try db.search(a, .{ .index_name = "text", .full_text = .{ .match_all = {} }, .return_mode = .member, .limit = 0 });
         defer results.deinit();
         try std.testing.expectEqual(@as(u32, 0), results.total_hits);
+    }
+    {
+        var lookup = (try db.lookup(a, "doc", .{ .fields = &.{ "_chunks", "_artifacts" }, .include_all_fields = false })).?;
+        defer lookup.deinit(a);
+        var parsed = try std.json.parseFromSlice(std.json.Value, a, lookup.json, .{});
+        defer parsed.deinit();
+        try std.testing.expect(parsed.value.object.get("_artifacts") == null or parsed.value.object.get("_artifacts").? == .null);
     }
     var rounds: usize = 0;
     while (rounds < 50) : (rounds += 1) {
