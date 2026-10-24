@@ -170,3 +170,22 @@ test "model aware media preparation owns descriptor recipes and separate vectors
     try Fixture.run(std.testing.allocator);
     try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{});
 }
+
+/// Serving recipes retain computation identities and coverage, while private
+/// pages and accepted assets own the vectors/transcripts/predictions.
+pub fn releaseResultPayloads(a: Allocator, metadata: *chunker.types.ModelMetadata) !void {
+    if (metadata.embedding) |vector| a.free(vector);
+    metadata.embedding = null;
+    if (metadata.outputs_json) |encoded| {
+        var values = try std.json.parseFromSlice([]chunker.outputs.Result, a, encoded, .{});
+        defer values.deinit();
+        for (values.value) |*value| {
+            value.embedding = null;
+            value.spans = null;
+            value.labels = null;
+        }
+        const receipts = try std.json.Stringify.valueAlloc(a, values.value, .{ .emit_null_optional_fields = false });
+        a.free(encoded);
+        metadata.outputs_json = receipts;
+    }
+}

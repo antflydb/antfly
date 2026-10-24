@@ -100,3 +100,81 @@ test "model aware media transcript rechunking preserves exact phrase clocks and 
         try std.testing.expectEqual(@as(u32, 1), media.value.transcript_spans[0].sub_index);
     }
 }
+
+/// One page of parsed output results is live at a time. The final bounded JSON
+/// buffer can pass to atomic publication without rebuilding a document-wide
+/// result graph containing copied vectors, labels, and transcript payloads.
+pub const PageCollector = struct {
+    a: std.mem.Allocator,
+    rows: std.ArrayList(u8) = .empty,
+    text: std.ArrayList(u8) = .empty,
+    spans: std.ArrayList(TranscriptSpan) = .empty,
+    count: usize = 0,
+    complete: u64 = 0,
+    failed: u64 = 0,
+    terminal: u64 = 0,
+    status: @FieldType(Projection, "status") = .complete,
+    pub fn deinit(self: *@This()) void {
+        self.rows.deinit(self.a);
+        self.text.deinit(self.a);
+        self.spans.deinit(self.a);
+    }
+    pub fn append(self: *@This(), rows: []const Row) !void {
+        var arena = std.heap.ArenaAllocator.init(self.a);
+        defer arena.deinit();
+        const projection = try project(arena.allocator(), rows);
+        const separator: usize = @intFromBool(self.text.items.len != 0 and projection.text.len != 0);
+        const base = self.text.items.len + separator;
+        if (separator != 0) try self.text.append(self.a, ' ');
+        try self.text.appendSlice(self.a, projection.text);
+        for (projection.transcript_spans) |span| {
+            var shifted = span;
+            shifted.char_start = std.math.cast(u32, base + span.char_start) orelse return error.ResourceLimitExceeded;
+            shifted.char_end = std.math.cast(u32, base + span.char_end) orelse return error.ResourceLimitExceeded;
+            try self.spans.append(self.a, shifted);
+        }
+        for (rows) |row| {
+            if (row.chunk_id != self.count) return error.InvalidChunkOutput;
+            const encoded = try std.json.Stringify.valueAlloc(self.a, row, .{ .emit_null_optional_fields = false });
+            defer self.a.free(encoded);
+            if (self.rows.items.len + encoded.len + self.text.items.len + self.spans.items.len * @sizeOf(TranscriptSpan) > 16 * 1024 * 1024) return error.ResourceLimitExceeded;
+            if (self.count != 0) try self.rows.append(self.a, ',');
+            try self.rows.appendSlice(self.a, encoded);
+            self.count += 1;
+        }
+        self.complete += projection.complete_chunks;
+        self.failed += projection.failed_chunks;
+        self.terminal += projection.terminal_chunks;
+        if (projection.status == .failed or (projection.status == .degraded and self.status == .complete)) self.status = projection.status;
+    }
+    pub const RawRows = struct {
+        bytes: []const u8,
+        pub fn jsonStringify(self: @This(), writer: anytype) !void {
+            try writer.print("[{s}]", .{self.bytes});
+        }
+    };
+    pub fn rawRows(self: *const @This()) RawRows {
+        return .{ .bytes = self.rows.items };
+    }
+};
+
+test "model aware media page collector matches whole projection and preserves UTF8 offsets" {
+    const a = std.testing.allocator;
+    var collector = PageCollector{ .a = a };
+    defer collector.deinit();
+    const result = Result{ .name = "speech", .kind = .transcribe, .required = true, .model = "model", .model_identity = "identity", .model_revision = "revision", .recipe_id = "recipe", .status = .complete, .spans = &.{.{ .text = "世界", .start_ns = 10, .end_ns = 20 }} };
+    const rows = [_]Row{ .{ .chunk_id = 0, .outputs = &.{result} }, .{ .chunk_id = 1, .outputs = &.{result} } };
+    try collector.append(rows[0..1]);
+    try collector.append(rows[1..2]);
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const expected = try project(arena.allocator(), &rows);
+    try std.testing.expectEqualStrings(expected.text, collector.text.items);
+    try std.testing.expectEqualDeep(expected.transcript_spans, collector.spans.items);
+    try std.testing.expectEqual(expected.complete_chunks, collector.complete);
+    const encoded = try std.json.Stringify.valueAlloc(a, .{ .chunks = collector.rawRows() }, .{});
+    defer a.free(encoded);
+    var parsed = try std.json.parseFromSlice(struct { chunks: []const Row }, a, encoded, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(usize, 2), parsed.value.chunks.len);
+}

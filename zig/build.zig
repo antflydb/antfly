@@ -754,7 +754,7 @@ pub fn create(b: *std.Build) ?Artifacts {
     const antfly_test_mod = owner_tests.antfly_test_mod;
     const model_chunk_tests = b.addTest(.{
         .root_module = antfly_test_mod,
-        .filters = &.{ "model aware media", "model chunk artifact" },
+        .filters = &.{ "model aware media", "model chunk artifact", "chunked dense", "ordered artifact inventory chunk vector callback" },
     });
     const model_chunk_step = b.step("antfly-media-chunking-test", "Qualify typed chunk provider ownership, artifact recipes and incomplete coverage");
     model_chunk_step.dependOn(&b.addRunArtifact(model_chunk_tests).step);

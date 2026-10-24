@@ -117,6 +117,41 @@ pub fn supportsPreparedBatch(session: backends.Session, profile: Profile, count:
 /// Reuse one acquired session for both batch exports and fixed batch-one models.
 pub fn classifyPreparedFrames(a: std.mem.Allocator, session: backends.Session, profile: Profile, labels: []const []const u8, frames: []const []const f32, top_k: usize, control: Control) ![][]outputs.Label {
     if (frames.len == 0 or frames.len > 32) return error.InvalidInputShape;
+    const inputs = session.inputInfo();
+    const info = session.outputInfo();
+    const fixed = if (inputs.len == 1 and inputs[0].shape.len == 4) inputs[0].shape[0] else 0;
+    if (fixed > 1) {
+        if (fixed > 32 or info.len != 1 or info[0].shape.len != 2 or (info[0].shape[0] > 0 and info[0].shape[0] != fixed)) return error.UnsupportedMediaClassifier;
+        // Fixed exports need full tensor batches, including a padded tail. The
+        // repeated final input owns no extra result in the public frame list.
+        const width: usize = @intCast(fixed);
+        const results = try a.alloc([]outputs.Label, frames.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (results[0..initialized]) |row| {
+                for (row) |label| a.free(label.label);
+                a.free(row);
+            }
+            a.free(results);
+        }
+        var first: usize = 0;
+        while (first < frames.len) {
+            try control.check();
+            const count = @min(width, frames.len - first);
+            var batch: [32][]const f32 = undefined;
+            for (batch[0..width], 0..) |*frame, i| frame.* = frames[first + @min(i, count - 1)];
+            const rows = try classifyPreparedBatch(a, session, profile, labels, batch[0..width], top_k, control);
+            defer a.free(rows);
+            @memcpy(results[first..][0..count], rows[0..count]);
+            initialized += count;
+            for (rows[count..]) |row| {
+                for (row) |label| a.free(label.label);
+                a.free(row);
+            }
+            first += count;
+        }
+        return results;
+    }
     if (supportsPreparedBatch(session, profile, frames.len)) {
         const batched: ?[][]outputs.Label = classifyPreparedBatch(a, session, profile, labels, frames, top_k, control) catch |err| switch (err) {
             error.ResourceTemporarilyUnavailable, error.QueueFull, error.OutOfMemory, error.SharedAdmissionExceeded, error.MemoryBudgetExceeded, error.InferenceAdmissionQueueFull, error.ConcurrencyUnavailable => null,
@@ -307,10 +342,11 @@ test "model aware media frame classifiers batch compatible tensors with one mode
     const Fake = struct {
         calls: usize = 0,
         fixed: bool = false,
+        fixed_two: bool = false,
         deny_batch: bool = false,
         fn inputs(raw: *anyopaque) []const backends.TensorInfo {
             const self: *@This() = @ptrCast(@alignCast(raw));
-            return if (self.fixed) &.{.{ .name = "pixel_values", .dtype = .f32, .shape = &.{ 1, 3, 1, 1 } }} else &.{.{ .name = "pixel_values", .dtype = .f32, .shape = &.{ -1, 3, 1, 1 } }};
+            return if (self.fixed_two) &.{.{ .name = "pixel_values", .dtype = .f32, .shape = &.{ 2, 3, 1, 1 } }} else if (self.fixed) &.{.{ .name = "pixel_values", .dtype = .f32, .shape = &.{ 1, 3, 1, 1 } }} else &.{.{ .name = "pixel_values", .dtype = .f32, .shape = &.{ -1, 3, 1, 1 } }};
         }
         fn outputInfo(_: *anyopaque) []const backends.TensorInfo {
             return &.{.{ .name = "logits", .dtype = .f32, .shape = &.{ -1, 2 } }};
@@ -325,7 +361,7 @@ test "model aware media frame classifiers batch compatible tensors with one mode
             const serial = tensors[0].shape[0] == 1;
             if (self.deny_batch and !serial) return error.ResourceTemporarilyUnavailable;
             try std.testing.expectEqualSlices(i64, if (serial) &.{ 1, 3, 1, 1 } else &.{ 2, 3, 1, 1 }, tensors[0].shape);
-            if (!serial) try std.testing.expectEqualSlices(f32, &.{ 1, 0, 0, 0, 1, 0 }, tensors[0].asFloat32());
+            if (!serial and !self.fixed_two) try std.testing.expectEqualSlices(f32, &.{ 1, 0, 0, 0, 1, 0 }, tensors[0].asFloat32());
             const result = try a.alloc(backends.Tensor, 1);
             errdefer a.free(result);
             result[0] = if (serial) try backends.Tensor.initFloat32(a, "logits", &.{ 1, 2 }, &.{ -1, 1 }) else try backends.Tensor.initFloat32(a, "logits", &.{ 2, 2 }, &.{ -1, 1, 2, -2 });
@@ -379,4 +415,18 @@ test "model aware media frame classifiers batch compatible tensors with one mode
         a.free(fallback);
     }
     try std.testing.expectEqual(@as(usize, 6), fake.calls);
+    fake.deny_batch = false;
+    fake.fixed_two = true;
+    const before = fake.calls;
+    const tiled = try classifyPreparedFrames(a, fake.session(), profile, &.{ "negative", "positive" }, &.{ &.{ 1, 0, 0 }, &.{ 0, 1, 0 }, &.{ 1, 0, 0 }, &.{ 0, 1, 0 }, &.{ 1, 0, 0 } }, 1, .{});
+    defer {
+        for (tiled) |row| {
+            for (row) |label| a.free(label.label);
+            a.free(row);
+        }
+        a.free(tiled);
+    }
+    try std.testing.expectEqual(@as(usize, 5), tiled.len);
+    try std.testing.expectEqual(before + 3, fake.calls);
+    try std.testing.expectEqualStrings("positive", tiled[4][0].label);
 }

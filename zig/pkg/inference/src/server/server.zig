@@ -11837,10 +11837,10 @@ pub const Node = struct {
         return .{ .summary = summary, .model_identity = resolved.identity, .model_revision = resolved.revision, .dimensions = 0, .failure = failure };
     }
 
-    fn embedMediaOutput(self: *Node, a: std.mem.Allocator, io: std.Io, control: InferenceExecutionControl, target: lib_chunker.outputs.Target, payload: @import("../pipelines/media_chunking.zig").Payload, prepared_frames: ?[]const @import("../pipelines/embedding_gemma2_video.zig").PreparedFrame) !@import("../pipelines/media_chunking.zig").Output {
-        const path = try self.resolveRequestModelPath(a, io, target.model, "embedders");
-        defer a.free(path);
-        var handle = try self.model_manager.acquireFromDirWithControl(path, control);
+    fn embedMediaOutput(self: *Node, a: std.mem.Allocator, control: InferenceExecutionControl, resolved: *const MediaOutputExecution.Resolved, target: lib_chunker.outputs.Target, payload: @import("../pipelines/media_chunking.zig").Payload, prepared_frames: ?[]const @import("../pipelines/embedding_gemma2_video.zig").PreparedFrame) !@import("../pipelines/media_chunking.zig").Output {
+        // Use the canonical path captured with the receipt. Resolving an alias
+        // again here could execute a different generation from that receipt.
+        var handle = try self.model_manager.acquireFromDirWithControl(resolved.path, control);
         defer handle.release();
         const loaded = handle.get();
         try loaded.verifyEmbeddingIdentityWithControl(control);
@@ -11852,6 +11852,7 @@ pub const Node = struct {
         const capacity = @min(manifest.maxTextSequenceLength(), contract.batch.max_input_tokens_per_item orelse std.math.maxInt(usize));
         const revision = loaded.resolution_revision orelse return error.InvalidEmbeddingIdentity;
         const identity = loaded.embedding_identity orelse std.fmt.bytesToHex(revision, .lower);
+        try validateMediaOutputGeneration(resolved.identity, resolved.revision, identity, std.fmt.bytesToHex(revision, .lower));
         if (target.model_identity) |expected| if (!std.mem.eql(u8, expected, &identity)) return error.EmbeddingIdentityMismatch;
         var config: embedding_mod.EmbeddingConfig = .{ .text_prefix = manifest.embedding_profile.document.prefix, .ensure_trailing_eos_id = if (manifest.isLastTokenDecoderEmbedder() and manifest.embedding_style != .embedding_gemma2 and tokenizer.specialTokens().sep_id >= 0) tokenizer.specialTokens().sep_id else null };
         const prefix = try applyDenseEmbeddingConfigRequestOptions(a, &config, manifest, .{ .model = target.model, .input = .null, .encoding_format = null, .dimensions = if (target.dimensions) |d| @intCast(d) else null, .task_type = task });
@@ -40540,6 +40541,16 @@ const MediaFramePreparationCache = struct {
     }
 };
 
+fn validateMediaOutputGeneration(expected_identity: [64]u8, expected_revision: [64]u8, identity: [64]u8, revision: [64]u8) !void {
+    if (!std.mem.eql(u8, &expected_identity, &identity) or !std.mem.eql(u8, &expected_revision, &revision)) return error.ModelConfigurationChanged;
+}
+
+test "model aware media output generation rejects an alias replacement before execution" {
+    try validateMediaOutputGeneration(@splat('a'), @splat('b'), @splat('a'), @splat('b'));
+    try std.testing.expectError(error.ModelConfigurationChanged, validateMediaOutputGeneration(@splat('a'), @splat('b'), @splat('c'), @splat('b')));
+    try std.testing.expectError(error.ModelConfigurationChanged, validateMediaOutputGeneration(@splat('a'), @splat('b'), @splat('a'), @splat('c')));
+}
+
 const MediaOutputExecution = struct {
     const chunks = @import("../pipelines/media_chunking.zig");
     const outputs = lib_chunker.outputs;
@@ -40988,7 +40999,7 @@ const MediaOutputExecution = struct {
                     }
                     break :shared frames[0..self.picture_ids.len];
                 } else null;
-                const output = try self.node.embedMediaOutput(a, self.io, self.control, target, payload, shared_frames);
+                const output = try self.node.embedMediaOutput(a, self.control, resolved, target, payload, shared_frames);
                 value.embedding = output.vector;
             },
             .transcribe => {
