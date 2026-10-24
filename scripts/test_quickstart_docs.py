@@ -21,6 +21,7 @@ from __future__ import annotations
 import ast
 import json
 import re
+import shlex
 import subprocess
 import sys
 from pathlib import Path
@@ -153,6 +154,42 @@ def check_terminology() -> None:
                     )
 
 
+def check_recording_coverage_wait(tape: str) -> None:
+    # VHS Line waits inspect the cursor's current line. Completion prose can
+    # already have scrolled away when the next directive starts, so follow the
+    # prompt instead. Bind that wait to its command, not unrelated tape text.
+    waits = re.findall(
+        r"^Type(?:@\S+)? `([^`\n]*antfly index wait[^`\n]*)`\n"
+        r"((?:(?!^Type).*(?:\n|$))*)",
+        tape,
+        re.MULTILINE,
+    )
+    if len(waits) != 1:
+        fail("the quickstart recording must have one source-coverage wait")
+    command, following = waits[0]
+    args = shlex.split(command)
+    for flags, expected in (
+        (("-t", "--table"), "wikipedia"),
+        (("-i", "--index"), "title_body"),
+        (("--until",), "source-covered=10%"),
+        (("--timeout",), "45m"),
+    ):
+        values = [args[i + 1] for i, arg in enumerate(args[:-1]) if arg in flags]
+        if values != [expected]:
+            fail(f"the quickstart recording wait requires {flags[-1]} {expected}")
+    directives = [
+        line.strip()
+        for line in following.splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
+    ]
+    if (
+        len(directives) < 2
+        or directives[0] != "Enter"
+        or directives[1] not in {"Wait@2700s /❯/", "Wait+Line@2700s /❯/"}
+    ):
+        fail("the quickstart recording must wait for the prompt after source coverage")
+
+
 def main() -> int:
     for page in LAUNCH_PAGES:
         check_page_blocks(page)
@@ -266,13 +303,7 @@ def main() -> int:
             fail(f"the {index} wait must use {condition} with a 45-minute timeout")
     if "rg '" in source:
         fail("quickstart troubleshooting must not require undeclared ripgrep tooling")
-    if "--until source-covered=10%" not in quickstart_tape:
-        fail("the quickstart recording must wait for 10% source coverage")
-    if (
-        "Wait@2700s /reached source-covered=10%:/" not in quickstart_tape
-        or "--timeout 45m" not in quickstart_tape
-    ):
-        fail("the quickstart recording must match the source-coverage success message")
+    check_recording_coverage_wait(quickstart_tape)
     if "--until searchable-artifacts=1" in quickstart_tape:
         fail("the quickstart recording must not retain the legacy single-artifact wait")
     if "wiki-articles.jsonl" not in quickstart_tape:

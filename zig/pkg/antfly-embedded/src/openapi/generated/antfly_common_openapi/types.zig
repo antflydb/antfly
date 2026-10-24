@@ -1687,6 +1687,8 @@ pub const InferenceConnectionConfig = struct {
     project_id: ?[]const u8 = null,
     /// Google Cloud location when applicable. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials.
     location: ?[]const u8 = null,
+    /// Anthropic workspace for an API key that is not workspace-scoped.
+    workspace_id: ?[]const u8 = null,
     /// Filesystem path to provider credentials when applicable. Shared Vertex credential field; see vertex.yaml#/components/schemas/VertexCredentials.
     credentials_path: ?[]const u8 = null,
     /// Per-image input token upper bound for hosted decisions. Required to enable images; must cover every admitted decision model on this connection. Named deciders can specify tighter per-model bounds.
@@ -1704,6 +1706,7 @@ pub const InferenceConnectionConfig = struct {
         .{ "region", "region", true },
         .{ "project_id", "project_id", true },
         .{ "location", "location", true },
+        .{ "workspace_id", "workspace_id", true },
         .{ "credentials_path", "credentials_path", true },
         .{ "max_image_input_tokens", "max_image_input_tokens", true },
         .{ "names", "names", true },
@@ -1740,6 +1743,10 @@ pub const InferenceConnectionConfig = struct {
         }
         if (self.location) |value| {
             try jw.objectField("location");
+            try jw.write(value);
+        }
+        if (self.workspace_id) |value| {
+            try jw.objectField("workspace_id");
             try jw.write(value);
         }
         if (self.credentials_path) |value| {

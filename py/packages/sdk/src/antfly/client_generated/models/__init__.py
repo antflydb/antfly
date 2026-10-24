@@ -46,6 +46,8 @@ from .antfly_generator_config_provider import AntflyGeneratorConfigProvider
 from .antfly_reranker_config import AntflyRerankerConfig
 from .antfly_reranker_config_provider import AntflyRerankerConfigProvider
 from .antfly_type import AntflyType
+from .anthropic_generator_config import AnthropicGeneratorConfig
+from .anthropic_generator_config_provider import AnthropicGeneratorConfigProvider
 from .api_key import ApiKey
 from .api_key_row_filter_type_0 import ApiKeyRowFilterType0
 from .api_key_with_secret import ApiKeyWithSecret
@@ -79,6 +81,8 @@ from .batch_response_status import BatchResponseStatus
 from .bedrock_embedder_config import BedrockEmbedderConfig
 from .bedrock_embedder_config_provider import BedrockEmbedderConfigProvider
 from .bedrock_embedder_config_request_format import BedrockEmbedderConfigRequestFormat
+from .bedrock_generator_config import BedrockGeneratorConfig
+from .bedrock_generator_config_provider import BedrockGeneratorConfigProvider
 from .bool_field_query import BoolFieldQuery
 from .bool_query import BoolQuery
 from .bool_query_body import BoolQueryBody
@@ -107,6 +111,7 @@ from .chat_gpt_generator_config_provider import ChatGPTGeneratorConfigProvider
 from .chat_gpt_outcome import ChatGPTOutcome
 from .chat_gpt_outcome_status import ChatGPTOutcomeStatus
 from .chat_message import ChatMessage
+from .chat_message_extra_content import ChatMessageExtraContent
 from .chat_message_role import ChatMessageRole
 from .chat_tool_name import ChatToolName
 from .chat_tools_config import ChatToolsConfig
@@ -901,6 +906,7 @@ from .inference_binary_content import InferenceBinaryContent
 from .inference_capacity_error import InferenceCapacityError
 from .inference_capacity_error_reason import InferenceCapacityErrorReason
 from .inference_chat_message import InferenceChatMessage
+from .inference_chat_message_extra_content import InferenceChatMessageExtraContent
 from .inference_chunk import InferenceChunk
 from .inference_chunk_config import InferenceChunkConfig
 from .inference_chunk_embedding_response import InferenceChunkEmbeddingResponse
@@ -965,9 +971,11 @@ from .inference_generate_chunk import InferenceGenerateChunk
 from .inference_generate_chunk_choice import InferenceGenerateChunkChoice
 from .inference_generate_chunk_object import InferenceGenerateChunkObject
 from .inference_generate_delta import InferenceGenerateDelta
+from .inference_generate_delta_extra_content import InferenceGenerateDeltaExtraContent
 from .inference_generate_json_schema_config import InferenceGenerateJsonSchemaConfig
 from .inference_generate_json_schema_config_schema import InferenceGenerateJsonSchemaConfigSchema
 from .inference_generate_message import InferenceGenerateMessage
+from .inference_generate_message_extra_content import InferenceGenerateMessageExtraContent
 from .inference_generate_request import InferenceGenerateRequest
 from .inference_generate_request_cache_dtype import InferenceGenerateRequestCacheDtype
 from .inference_generate_request_compiled_target import InferenceGenerateRequestCompiledTarget
@@ -1621,6 +1629,7 @@ from .text_chunk_options import TextChunkOptions
 from .text_content_part import TextContentPart
 from .text_content_part_type import TextContentPartType
 from .tool_call import ToolCall
+from .tool_call_extra_content import ToolCallExtraContent
 from .tool_call_function import ToolCallFunction
 from .tool_call_type import ToolCallType
 from .topology_changed_error import TopologyChangedError
@@ -1763,6 +1772,8 @@ __all__ = (
     "AntflyRerankerConfig",
     "AntflyRerankerConfigProvider",
     "AntflyType",
+    "AnthropicGeneratorConfig",
+    "AnthropicGeneratorConfigProvider",
     "ApiKey",
     "ApiKeyRowFilterType0",
     "ApiKeyWithSecret",
@@ -1796,6 +1807,8 @@ __all__ = (
     "BedrockEmbedderConfig",
     "BedrockEmbedderConfigProvider",
     "BedrockEmbedderConfigRequestFormat",
+    "BedrockGeneratorConfig",
+    "BedrockGeneratorConfigProvider",
     "BooleanQuery",
     "BoolFieldQuery",
     "BoolQuery",
@@ -1824,6 +1837,7 @@ __all__ = (
     "ChatGPTOutcome",
     "ChatGPTOutcomeStatus",
     "ChatMessage",
+    "ChatMessageExtraContent",
     "ChatMessageRole",
     "ChatToolName",
     "ChatToolsConfig",
@@ -2608,6 +2622,7 @@ __all__ = (
     "InferenceCapacityError",
     "InferenceCapacityErrorReason",
     "InferenceChatMessage",
+    "InferenceChatMessageExtraContent",
     "InferenceChunk",
     "InferenceChunkConfig",
     "InferenceChunkEmbeddingResponse",
@@ -2672,9 +2687,11 @@ __all__ = (
     "InferenceGenerateChunkChoice",
     "InferenceGenerateChunkObject",
     "InferenceGenerateDelta",
+    "InferenceGenerateDeltaExtraContent",
     "InferenceGenerateJsonSchemaConfig",
     "InferenceGenerateJsonSchemaConfigSchema",
     "InferenceGenerateMessage",
+    "InferenceGenerateMessageExtraContent",
     "InferenceGenerateRequest",
     "InferenceGenerateRequestCacheDtype",
     "InferenceGenerateRequestCompiledTarget",
@@ -3322,6 +3339,7 @@ __all__ = (
     "TextContentPart",
     "TextContentPartType",
     "ToolCall",
+    "ToolCallExtraContent",
     "ToolCallFunction",
     "ToolCallType",
     "TopologyChangedError",

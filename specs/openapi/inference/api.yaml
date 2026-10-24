@@ -3650,6 +3650,10 @@ components:
       required:
         - role
       properties:
+        extra_content:
+          type: object
+          additionalProperties: true
+          description: Opaque provider message metadata. Preserve unchanged when replaying assistant messages; native Anthropic content retains signed thinking blocks.
         role:
           $ref: '#/components/schemas/Role'
         content:
@@ -4129,6 +4133,10 @@ components:
       required:
         - role
       properties:
+        extra_content:
+          type: object
+          additionalProperties: true
+          description: Opaque provider message metadata. Preserve unchanged when replaying assistant messages; native Anthropic content retains signed thinking blocks.
         role:
           $ref: '#/components/schemas/Role'
         content:
@@ -4241,6 +4249,10 @@ components:
       type: object
       description: Delta content for streaming
       properties:
+        extra_content:
+          type: object
+          additionalProperties: true
+          description: Opaque provider stream metadata, including native Anthropic thinking and signature events. Preserve it when assembling provider-native assistant history.
         role:
           $ref: '#/components/schemas/Role'
         content:

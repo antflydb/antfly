@@ -122,6 +122,8 @@ pub const BackendRuntimes = struct {
 };
 
 pub const ChatMessage = struct {
+    /// Opaque provider message metadata. Preserve unchanged when replaying assistant messages; native Anthropic content retains signed thinking blocks.
+    extra_content: ?std.json.ArrayHashMap(std.json.Value) = null,
     role: Role,
     content: ?ChatMessageContent = null,
     /// Tool calls made by the assistant (only for role=assistant)
@@ -131,6 +133,7 @@ pub const ChatMessage = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "extra_content", "extra_content", true },
         .{ "role", "role", false },
         .{ "content", "content", true },
         .{ "tool_calls", "tool_calls", true },
@@ -147,6 +150,10 @@ pub const ChatMessage = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.extra_content) |value| {
+            try jw.objectField("extra_content");
+            try jw.write(value);
+        }
         try jw.objectField("role");
         try jw.write(self.role);
         if (self.content) |value| {
@@ -940,6 +947,8 @@ pub const GenerateChunkChoice = struct {
 
 /// Delta content for streaming
 pub const GenerateDelta = struct {
+    /// Opaque provider stream metadata, including native Anthropic thinking and signature events. Preserve it when assembling provider-native assistant history.
+    extra_content: ?std.json.ArrayHashMap(std.json.Value) = null,
     role: ?Role = null,
     /// Token content delta
     content: OpenApiOptionalNullable([]const u8) = .absent,
@@ -948,6 +957,7 @@ pub const GenerateDelta = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "extra_content", "extra_content", true },
         .{ "role", "role", true },
         .{ "content", "content", false },
         .{ "tool_calls", "tool_calls", true },
@@ -963,6 +973,10 @@ pub const GenerateDelta = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.extra_content) |value| {
+            try jw.objectField("extra_content");
+            try jw.write(value);
+        }
         if (self.role) |value| {
             try jw.objectField("role");
             try jw.write(value);
@@ -987,6 +1001,8 @@ pub const GenerateDelta = struct {
 };
 
 pub const GenerateMessage = struct {
+    /// Opaque provider message metadata. Preserve unchanged when replaying assistant messages; native Anthropic content retains signed thinking blocks.
+    extra_content: ?std.json.ArrayHashMap(std.json.Value) = null,
     role: Role,
     /// The generated message content (null when tool_calls is present)
     content: OpenApiOptionalNullable([]const u8) = .absent,
@@ -995,6 +1011,7 @@ pub const GenerateMessage = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "extra_content", "extra_content", true },
         .{ "role", "role", false },
         .{ "content", "content", false },
         .{ "tool_calls", "tool_calls", true },
@@ -1010,6 +1027,10 @@ pub const GenerateMessage = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.extra_content) |value| {
+            try jw.objectField("extra_content");
+            try jw.write(value);
+        }
         try jw.objectField("role");
         try jw.write(self.role);
         switch (self.content) {
