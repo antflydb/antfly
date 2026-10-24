@@ -40166,7 +40166,20 @@ test "model aware media terminal scalar output acknowledges failure without mode
         defer a.free(scalar_key);
         const stale = try enrichment_artifact_codec.encodeDenseEmbeddingAlloc(a, 0, &.{ 0.6, 0.8 });
         defer a.free(stale);
-        try storePutBatchWithRetry(runtime, &.{.{ .key = scalar_key, .value = stale }}, &.{});
+        // Seed restored scalar state with its committed Raft position. The
+        // legacy helper cannot write under active ordered publication, and
+        // the concrete transaction requires this exact-write fence.
+        {
+            var seed = try db.core.store.beginWriteTxn();
+            errdefer seed.abort();
+            var restored_position: [16]u8 = undefined;
+            std.mem.writeInt(u64, restored_position[0..8], 1, .little);
+            std.mem.writeInt(u64, restored_position[8..16], harness.next_index, .little);
+            try seed.put(scalar_key, stale);
+            try seed.put(&internal_keys.ordered_document_applied_entry_key, &restored_position);
+            try seed.commit();
+            harness.next_index += 1;
+        }
         var input = blk: {
             var read = try runtime.store.beginRead();
             defer read.abort();
