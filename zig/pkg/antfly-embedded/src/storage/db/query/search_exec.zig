@@ -189,6 +189,7 @@ pub const IndexedTextPredicate = struct {
 /// Providers may prove the complete order, including the public-ID tie. Older
 /// producers prove only the primary keys and must finish the boundary tie group.
 pub const OrderedTextCandidates = struct {
+    source: []const u8 = "ordered_lake_index",
     complete_order: bool = false,
     ptr: *anyopaque,
     scanned_count: ?*const fn (*anyopaque) u64 = null,
@@ -8227,6 +8228,21 @@ fn sortedSegmentSeekStartDocAlloc(
     load_stored: *const fn (?*anyopaque, Allocator, []const u8) anyerror!?[]u8,
     reverse: bool,
 ) !i64 {
+    return sortedSegmentSeekStartDocWithTiesAlloc(alloc, req, plan, snapshot, iterator, native_loader, load_ctx, load_stored, reverse, false);
+}
+
+fn sortedSegmentSeekStartDocWithTiesAlloc(
+    alloc: Allocator,
+    req: types.SearchRequest,
+    plan: SortExecutionPlan,
+    snapshot: *const index_mod.IndexSnapshot,
+    iterator: SortedSegmentIterator,
+    native_loader: NativeSortValueLoader,
+    load_ctx: ?*anyopaque,
+    load_stored: *const fn (?*anyopaque, Allocator, []const u8) anyerror!?[]u8,
+    reverse: bool,
+    inclusive: bool,
+) !i64 {
     var segment_lease = try snapshot.leaseSegment(iterator.segment_index);
     defer segment_lease.deinit();
     const segment = segment_lease.entry;
@@ -8237,7 +8253,7 @@ fn sortedSegmentSeekStartDocAlloc(
         return if (reverse) @as(i64, @intCast(doc_count)) - 1 else 0;
     }
 
-    if (plan.sorted_segment_bounds_available) {
+    if (plan.sorted_segment_bounds_available and !inclusive) {
         if (try segment.reader.indexSortBoundsAlloc(alloc)) |bounds| {
             var owned_bounds = bounds;
             defer owned_bounds.deinit(alloc);
@@ -8270,7 +8286,7 @@ fn sortedSegmentSeekStartDocAlloc(
                 load_ctx,
                 load_stored,
             );
-            if (order == .gt) {
+            if (order == .gt or (inclusive and order == .eq)) {
                 high = mid;
             } else {
                 low = mid + 1;
@@ -8293,7 +8309,7 @@ fn sortedSegmentSeekStartDocAlloc(
             load_ctx,
             load_stored,
         );
-        if (order == .lt) {
+        if (order == .lt or (inclusive and order == .eq)) {
             low = mid + 1;
         } else {
             high = mid;
@@ -11619,6 +11635,92 @@ fn sortAndPageTextDocValueDocNumsAlloc(
     return sortAndPageTextDocValueCandidatesAlloc(alloc, req, snapshot, doc_nums, null, executor, plan);
 }
 
+/// Merge native runs by their primary tuple. Public identities may permute a
+/// final tie group, so the existing collector owns identity projection, exact
+/// cursor filtering and the complete boundary tie. One head per segment and
+/// bounded native probes avoid decorating every matching row.
+const SortedPrimaryCandidates = struct {
+    a: Allocator,
+    req: types.SearchRequest,
+    snapshot: *const index_mod.IndexSnapshot,
+    plan: SortExecutionPlan,
+    values: TextDocValueSortContext,
+    iterators: std.ArrayListUnmanaged(SortedSegmentIterator) = .empty,
+    heap: std.PriorityQueue(SortedSegmentHead, SortedSegmentHeadHeapContext, sortedSegmentHeadOrder),
+    scanned: u64 = 0,
+    primed: bool = false,
+    fn unavailable(_: ?*anyopaque, _: Allocator, _: []const u8) anyerror!?[]u8 {
+        return error.UnsupportedExactSort;
+    }
+    fn loader(self: *@This()) NativeSortValueLoader {
+        return .{ .ctx = &self.values, .require_native = true, .load = loadTextDocValueSortValue };
+    }
+    fn open(a: Allocator, req: types.SearchRequest, snapshot: *const index_mod.IndexSnapshot, plan: SortExecutionPlan) !?OrderedTextCandidates {
+        if (!plan.sorted_segment_executor_available or req.order_by.len < 2 or
+            !std.mem.eql(u8, req.order_by[req.order_by.len - 1].field, "_id")) return null;
+        const self = try a.create(@This());
+        var primary = req;
+        primary.order_by = req.order_by[0 .. req.order_by.len - 1];
+        if (primary.search_after.len != 0) primary.search_after = primary.search_after[0..primary.order_by.len];
+        if (primary.search_before.len != 0) primary.search_before = primary.search_before[0..primary.order_by.len];
+        self.* = .{ .a = a, .req = primary, .snapshot = snapshot, .plan = plan, .values = .{ .snapshot = snapshot }, .heap = .initContext(.{ .req = primary, .reverse = req.search_before.len != 0 }) };
+        errdefer close(self);
+        var base: u32 = 0;
+        for (snapshot.segments, 0..) |*segment, index| {
+            defer base += segment.reader.doc_count;
+            if (segment.liveDocCount() == 0) continue;
+            var iterator: SortedSegmentIterator = .{ .segment_index = index, .doc_base = base, .next_doc = 0 };
+            iterator.next_doc = try sortedSegmentSeekStartDocWithTiesAlloc(a, primary, plan, snapshot, iterator, self.loader(), null, unavailable, req.search_before.len != 0, true);
+            if (!sortedSegmentIteratorDone(snapshot, iterator, req.search_before.len != 0)) try self.iterators.append(a, iterator);
+        }
+        // Seek kept the entire public boundary tie. Do not reject its members
+        // using private identities while traversing the native runs.
+        self.req.search_after = &.{};
+        self.req.search_before = &.{};
+        return .{ .source = "sorted_segment_membership", .complete_order = false, .ptr = self, .scanned_count = count, .next = next, .close = close };
+    }
+    fn count(raw: *anyopaque) u64 {
+        return @as(*@This(), @ptrCast(@alignCast(raw))).scanned;
+    }
+    fn pull(self: *@This(), index: usize, budget: u64) !void {
+        const constraints: NativeDocIdConstraints = .{};
+        var membership = try NativeDocIdConstraintMembership.initAlloc(self.a, &constraints);
+        defer membership.deinit(self.a);
+        const executor: MatchAllExecutor = .{ .ctx = null, .collect_candidates = undefined, .text_index_entry = undefined, .load_projected_document = undefined, .load_stored = unavailable };
+        const head = nextSortedSegmentHeadAlloc(self.a, self.req, self.plan, self.snapshot, index, self.iterators.items, &constraints, &membership, null, executor, self.loader(), null, self.heap.context.reverse, &self.scanned, budget) catch |err| switch (err) {
+            error.QueryCandidateBudgetExceeded => return error.OrderedCandidateBudgetExceeded,
+            else => return err,
+        };
+        if (head) |value| {
+            var owned = value;
+            errdefer owned.decorated.deinit(self.a);
+            try self.heap.push(self.a, value);
+        }
+    }
+    fn next(raw: *anyopaque, remaining: usize) anyerror!?u32 {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        if (remaining == 0) return error.OrderedCandidateBudgetExceeded;
+        const budget = self.scanned +| remaining;
+        if (!self.primed) {
+            for (self.iterators.items, 0..) |_, i| try self.pull(i, budget);
+            self.primed = true;
+        }
+        var head = self.heap.pop() orelse return null;
+        defer head.decorated.deinit(self.a);
+        const doc = head.decorated.hit.native_text_doc_id orelse return error.InvalidSegment;
+        try self.pull(head.iterator_index, budget);
+        return doc;
+    }
+    fn close(raw: *anyopaque) void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        deinitSortedSegmentHeads(self.a, self.heap.items);
+        self.heap.deinit(self.a);
+        self.iterators.deinit(self.a);
+        self.values.deinit();
+        self.a.destroy(self);
+    }
+};
+
 fn preferOrderedCandidates(matches: usize, live: u64, goal: usize) bool {
     if (matches == 0 or matches <= goal) return false;
     const expected_probes = (@as(u128, goal) + 1) * live / matches;
@@ -11732,12 +11834,13 @@ fn sortAndPageTextDocValueCandidatesAlloc(
         .require_native = plan.require_native,
         .load = loadTextDocValueSortValue,
     };
-    var ordered = if (bitmap != null and preferOrderedCandidates(bitmap.?.cardinality(), snapshot.liveDocCount(), sortWindowCapacity(effective_req)) and effective_req.limit > 0 and executor.native_count_visibility_exact and executor.is_expired_key == null)
-        if (executor.open_ordered_candidates) |open| try open(executor.ctx, alloc, effective_req, snapshot) else null
-    else
-        null;
+    var ordered: ?OrderedTextCandidates = null;
+    if (bitmap != null and preferOrderedCandidates(bitmap.?.cardinality(), snapshot.liveDocCount(), sortWindowCapacity(effective_req)) and effective_req.limit > 0 and executor.native_count_visibility_exact and executor.is_expired_key == null) {
+        if (executor.open_ordered_candidates) |open| ordered = try open(executor.ctx, alloc, effective_req, snapshot);
+        if (ordered == null) ordered = try SortedPrimaryCandidates.open(alloc, effective_req, snapshot, plan);
+    }
     defer if (ordered) |stream| stream.close(stream.ptr);
-    if (ordered != null) observeSortCandidateSource(if (collect_sort_profile) &profile else null, "ordered_lake_index");
+    if (ordered) |stream| observeSortCandidateSource(if (collect_sort_profile) &profile else null, stream.source);
     const ordered_scan_budget: usize = @max(1024, candidate_count);
     var ordered_probes: usize = 0;
     var visible_candidate_count: usize = 0;
@@ -11750,7 +11853,7 @@ fn sortAndPageTextDocValueCandidatesAlloc(
         if (ordered) |stream| if (ordered_probes >= ordered_scan_budget) {
             if (collect_sort_profile) {
                 if (stream.scanned_count) |count| profile.ordered_scanned_count = count(stream.ptr);
-                profile.candidate_source = "ordered_lake_index_then_text_postings";
+                profile.candidate_source = if (std.mem.eql(u8, stream.source, "sorted_segment_membership")) "sorted_segment_then_text_postings" else "ordered_lake_index_then_text_postings";
             }
             stream.close(stream.ptr);
             ordered = null;
@@ -12513,8 +12616,12 @@ pub fn searchTextQuery(
     const load_stored_in_search_engine = false;
     var field_sort_plan = SortExecutionPlan{ .kind = .none };
     if (requires_field_sort) field_sort_plan = try planTextNativeSortFields(effective_req, snapshot, text_source.runtime_schema);
-    if (requires_field_sort and executor.project_key != null and field_sort_plan.sorted_segment_executor_available)
+    if (requires_field_sort and executor.project_key != null and field_sort_plan.sorted_segment_executor_available) {
         field_sort_plan = docValuesCollectorPlanForSelectiveFilter(field_sort_plan);
+        // Public-ID projection requires the exact tie-aware collector. Its
+        // native primary stream remains available; this is not selectivity.
+        field_sort_plan.selective_filter_doc_values_preferred = false;
+    }
     if (requires_field_sort and executor.project_key == null and
         field_sort_plan.sorted_segment_executor_available and
         !chunk_backed and
@@ -35770,4 +35877,57 @@ test "native memory bounded exact-ID hydration never scans and respects generati
     defer absent.deinit(a);
     try std.testing.expectEqual(@as(usize, 0), absent.items.len);
     try std.testing.expectError(error.QueryCandidateBudgetExceeded, collectMatchAllCandidatesWithOptions(a, req, collector, .{ .candidate_limit = 1 }));
+}
+
+test "native public ordering seeks complete ties through sorted segment streams" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const ca = arena.allocator();
+    const docs = try ca.alloc(TestSortedPriceDoc, 64);
+    for (docs, 0..) |*doc, i| doc.* = .{ .id = try std.fmt.allocPrint(ca, "native-{d:0>2}", .{i}), .price = @floatFromInt(i / 4), .ordinal = @intCast(i + 1) };
+    var writer = try index_mod.IndexWriter.init(a);
+    defer writer.deinit();
+    for (0..2) |part| {
+        const bytes = try buildTestSortedPriceSegmentAlloc(a, docs[part * 32 ..][0..32]);
+        defer a.free(bytes);
+        try writer.addSegment(bytes);
+    }
+    try std.testing.expect(try writer.deleteById("native-63"));
+    const Harness = struct {
+        fn project(_: ?*anyopaque, out: Allocator, id: []const u8) ![]u8 {
+            return std.fmt.allocPrint(out, "public-{d:0>4}", .{63 - try std.fmt.parseInt(u32, id[7..], 10)});
+        }
+    };
+    const executor: SearchTextQueryExecutor = .{ .ctx = null, .text_index_entry = undefined, .text_index_is_chunk_backed = undefined, .search_match_all = undefined, .project_stored_search = undefined, .load_stored = testUnexpectedLoadStoredCallback, .postprocess = undefined, .native_count_visibility_exact = true, .project_key = Harness.project };
+    const req: types.SearchRequest = .{ .include_stored = false, .limit = 3, .profile = true, .order_by = &.{ .{ .field = "price" }, .{ .field = "_id" } } };
+    const plan: SortExecutionPlan = .{ .kind = .native_doc_values_top_n, .require_native = true, .runtime_schema = testSortedPriceSchema(), .index_sort_match = true, .sorted_segment_executor_available = true, .sorted_segment_bounds_available = true };
+    var first = try sortAndPageTextDocValueFilterAlloc(a, req, writer.snapshot(), .{ .match_all = {} }, executor, plan);
+    defer first.deinit();
+    try std.testing.expectEqual(@as(u32, 63), first.total_hits);
+    try std.testing.expectEqualStrings("public-0060", first.hits[0].id);
+    try std.testing.expectEqualStrings("public-0062", first.hits[2].id);
+    try std.testing.expect(first.sort_profile.?.candidate_count < 63);
+    try std.testing.expect(first.sort_profile.?.ordered_scanned_count > 0);
+    try std.testing.expectEqualStrings("sorted_segment_membership", first.sort_profile.?.candidate_source);
+    var after_req = req;
+    after_req.search_after = first.hits[2].sort_values;
+    var after = try sortAndPageTextDocValueFilterAlloc(a, after_req, writer.snapshot(), .{ .match_all = {} }, executor, plan);
+    defer after.deinit();
+    try std.testing.expectEqualStrings("public-0063", after.hits[0].id);
+    try std.testing.expectEqualStrings("public-0056", after.hits[1].id);
+    var before_req = req;
+    before_req.search_before = after.hits[0].sort_values;
+    var before = try sortAndPageTextDocValueFilterAlloc(a, before_req, writer.snapshot(), .{ .match_all = {} }, executor, plan);
+    defer before.deinit();
+    for (first.hits, before.hits) |left, right| try std.testing.expectEqualStrings(left.id, right.id);
+    const bounded = (try SortedPrimaryCandidates.open(a, req, writer.snapshot(), plan)).?;
+    defer bounded.close(bounded.ptr);
+    try std.testing.expectError(error.OrderedCandidateBudgetExceeded, bounded.next(bounded.ptr, 1));
+    // Local reads retain the exact collector as a control oracle.
+    var control = executor;
+    control.native_count_visibility_exact = false;
+    var exhaustive = try sortAndPageTextDocValueFilterAlloc(a, after_req, writer.snapshot(), .{ .match_all = {} }, control, plan);
+    defer exhaustive.deinit();
+    for (after.hits, exhaustive.hits) |left, right| try std.testing.expectEqualStrings(left.id, right.id);
 }

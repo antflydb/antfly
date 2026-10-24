@@ -193,6 +193,16 @@ def test_imported_parquet_awaits_embedded_indexes_and_uses_declared_identity(
             }
         ],
     }
+    filtered = dict(plan["cases"][0]["request"])
+    filtered["filter_query"] = {"range": {"path": "/hn_id", "gte": 64}}
+    plan["cases"].append(
+        {
+            "name": "filtered_identity",
+            "identity_field": "hn_id",
+            "expected_ids": list(range(64, 84)),
+            "request": filtered,
+        }
+    )
     if not additional_declarations:
         del plan["indexes"]
     plan_path = tmp_path / "plan.json"
@@ -230,8 +240,17 @@ def test_imported_parquet_awaits_embedded_indexes_and_uses_declared_identity(
     assert report["complete"] is True
     assert set(report["initial_index_revisions"]) == {"text", "hn_key"}
     assert all(report["initial_index_revisions"].values())
-    assert len(report["samples"]) == 2
-    assert len({s["result_sha256"] for s in report["samples"]}) == 1
+    assert len(report["samples"]) == 4
+    for case in ("custom_identity", "filtered_identity"):
+        assert (
+            len({s["result_sha256"] for s in report["samples"] if s["case"] == case})
+            == 1
+        )
+    filtered_answer = json.loads((output / "filtered_identity-answer.json").read_text())
+    assert [
+        (h["_source"]["hn_id"], h["_source"]["body"])
+        for h in filtered_answer["hits"]["hits"]
+    ] == [(i, f"quasar row{i}") for i in range(64, 84)]
     answer = json.loads((output / "custom_identity-answer.json").read_text())
     assert [h["_source"]["hn_id"] for h in answer["hits"]["hits"]] == list(range(20))
 
@@ -242,4 +261,5 @@ def test_imported_parquet_awaits_embedded_indexes_and_uses_declared_identity(
     assert all(p["index_sort_coverage"] == "covered_with_bounds" for p in profiles), (
         profiles
     )
-    assert all(p["ordered_scanned_count"] < 128 for p in profiles), profiles
+    assert all(0 < p["ordered_scanned_count"] < 128 for p in profiles), profiles
+    assert all(p["candidate_count"] < 128 for p in profiles), profiles

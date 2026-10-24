@@ -202,6 +202,7 @@ fn planRange(self: *Build, a: A, pages: *Pages, prefix: [32]u8, bits: u16, fragm
 }
 fn prepareInner(self: *Build, a: A, table: local.common_topology_records.TableRecord, provider: *Provider, previous: ?identity.Root) !void {
     const out = self.arena.allocator();
+    self.table = try self.schemas.resolve(self.context.io.?, out, table.schema_json, table.table_id, table.name);
     var reads: u64 = 0;
     var writes: u64 = 0;
     var pages = self.pageStore(&reads, &writes);
@@ -376,7 +377,6 @@ fn prepareInner(self: *Build, a: A, table: local.common_topology_records.TableRe
     const encoded = try std.json.Stringify.valueAlloc(a, prospective, .{});
     defer a.free(encoded);
     if (encoded.len +| 4096 > identity.max_root_bytes) return error.LogicalRowIdentityAdmissionDeclined;
-    self.table = try self.schemas.resolve(self.context.io.?, out, table.schema_json, table.table_id, table.name);
 }
 
 fn orderTagMatches(tag: ?[]const u8, recipe: ?[32]u8) bool {
@@ -406,7 +406,11 @@ const OrderedFragment = struct { states: []identity.logical.State, indices: []u3
 /// Existing by-ID/by-location maps authenticate the permutation and its inverse;
 /// readers, maintenance and GC keep their existing publication-bound closure.
 fn orderFragment(self: *Build, a: A, pages: *Pages, fragment: Fragment, schema: local.storage_schema.TableSchema, fields: []const local.segment.SegmentIndexSortField) !?OrderedFragment {
-    const capture = self.order_capture orelse return error.LogicalRowIdentityAdmissionDeclined;
+    // Native private IDs encode the assigned coordinate. They can close a
+    // key tuple ascending, but cannot lead it or reverse it without a separate
+    // segment permutation. Keep those declarations on the exact fallback.
+    for (fields, 0..) |field, i| if (std.mem.eql(u8, field.field, "_id") and (field.desc or i + 1 != fields.len)) return null;
+    const capture = self.order_capture orelse return orderProjectedFragment(self, a, pages, fragment, schema, fields);
     if (!capture.complete or capture.rows != self.root.current.rows or fragment.count > max_rows) return error.InvalidLogicalRowIdentity;
     const previous_phase = capture.routes.phase;
     capture.routes.phase = self.store.io_phase;
@@ -443,21 +447,108 @@ fn orderFragment(self: *Build, a: A, pages: *Pages, fragment: Fragment, schema: 
             offset = at;
         }
         if (index >= page.?.len) return error.InvalidLogicalRowIdentity;
-        var values: std.ArrayList(local.introducer.TypedFieldValue) = .empty;
-        for (fields) |field| {
-            if (std.mem.eql(u8, field.field, "_id")) continue;
-            const resolved = local.storage_schema.resolveLogicalDocValues(schema, field.field) orelse return null;
-            const source = for (schema.exact_fields) |mapped| {
-                if (std.mem.eql(u8, mapped.field, resolved.field)) break mapped.source_field;
-            } else field.field;
-            const raw = try orderingValue(a, page.?.columns, index, source);
-            const value = (try local.storage_db_document_mapper.typedDocValueForMappedFieldAlloc(a, resolved.mapping, raw)) orelse return null;
-            try values.append(a, .{ .field_name = field.field, .value_type = local.storage_db_document_mapper.typedValueType(value), .value = value });
-        }
-        docs[row] = .{ .id = &states[row].id, .stored_data = "", .text_fields = &.{}, .typed_fields = values.items };
+        docs[row] = (try orderingDocument(a, page.?.columns, index, &states[row], schema, fields)) orelse return null;
         row += 1;
     }
     if (row != count or (try payload.next()) != null) return error.InvalidLogicalRowIdentity;
+    const indices = local.introducer.sortedTextDocumentIndicesAlloc(a, docs, fields) catch |err| switch (err) {
+        error.InvalidSegment, error.UnsupportedTypedDocValues => return null,
+        else => return err,
+    };
+    return .{ .states = states, .indices = indices };
+}
+
+fn orderingDocument(a: A, columns: []const rows.ColumnVector, row: usize, state: *const identity.logical.State, schema: local.storage_schema.TableSchema, fields: []const local.segment.SegmentIndexSortField) !?local.introducer.TextDocument {
+    var values: std.ArrayList(local.introducer.TypedFieldValue) = .empty;
+    for (fields) |field| {
+        if (std.mem.eql(u8, field.field, "_id")) continue;
+        const resolved = local.storage_schema.resolveLogicalDocValues(schema, field.field) orelse return null;
+        const source = for (schema.exact_fields) |mapped| {
+            if (std.mem.eql(u8, mapped.field, resolved.field)) break mapped.source_field;
+        } else field.field;
+        const raw = try orderingValue(a, columns, row, source);
+        const value = (try local.storage_db_document_mapper.typedDocValueForMappedFieldAlloc(a, resolved.mapping, raw)) orelse return null;
+        try values.append(a, .{ .field_name = field.field, .value_type = local.storage_db_document_mapper.typedValueType(value), .value = value });
+    }
+    return .{ .id = &state.id, .stored_data = "", .text_fields = &.{}, .typed_fields = values.items };
+}
+
+/// Incremental verification may retain no complete payload capture. Gather only
+/// the declared ordering columns at this changed fragment's authenticated
+/// physical coordinates; unrelated rows and source bodies never enter the sort.
+fn orderProjectedFragment(self: *Build, a: A, pages: *Pages, fragment: Fragment, schema: local.storage_schema.TableSchema, fields: []const local.segment.SegmentIndexSortField) !?OrderedFragment {
+    const count: usize = @intCast(fragment.count);
+    if (count > max_rows) return error.InvalidLogicalRowIdentity;
+    const states = try a.alloc(identity.logical.State, count);
+    const docs = try a.alloc(local.introducer.TextDocument, count);
+    const refs = try a.alloc(rows.RowRef, count);
+    const seen = try a.alloc(bool, count);
+    @memset(seen, false);
+    var positions: std.StringHashMapUnmanaged(usize) = .empty;
+    var reader: identity.Reader = .{ .root = self.root, .pages = pages };
+    const upper = upperBound(fragment.prefix, fragment.bits);
+    var logical = try tree.Cursor.init(a, pages.store(), self.root.current.by_id, &fragment.prefix, if (upper) |*value| value else null);
+    defer logical.deinit();
+    var row: usize = 0;
+    while (try logical.next()) |record| {
+        try Build.check(self);
+        if (row == count) return error.InvalidLogicalRowIdentity;
+        const resolved = try identity.decodeState(self.root.current, record.key, record.value);
+        states[row] = resolved.state;
+        refs[row] = try reader.reference(a, self.root.current, resolved);
+        refs[row].external.identity_version = self.physical.inventory.row_identity_version;
+        const key = try local.storage_rowsource_identity.allocId(a, refs[row]);
+        const entry = try positions.getOrPut(a, key);
+        if (entry.found_existing) return error.InvalidLogicalRowIdentity;
+        entry.value_ptr.* = row;
+        row += 1;
+    }
+    if (row != count) return error.InvalidLogicalRowIdentity;
+    var columns: std.StringHashMapUnmanaged(void) = .empty;
+    for (fields) |field| {
+        if (std.mem.eql(u8, field.field, "_id")) continue;
+        const resolved = local.storage_schema.resolveLogicalDocValues(schema, field.field) orelse return null;
+        const source = for (schema.exact_fields) |mapped| {
+            if (std.mem.eql(u8, mapped.field, resolved.field)) break mapped.source_field;
+        } else field.field;
+        try columns.put(a, source, {});
+    }
+    if (columns.count() == 0 or count == 0) {
+        for (states, docs) |*state, *doc| doc.* = .{ .id = &state.id, .stored_data = "", .text_fields = &.{}, .typed_fields = &.{} };
+    } else {
+        const paths = try a.alloc([]const u8, columns.count());
+        var names = columns.keyIterator();
+        for (paths) |*path| path.* = names.next().?.*;
+        var physical = try self.physical.parallelView(a);
+        defer physical.closeParallelView(self.physical);
+        const cursor = try local.sql_lake_cursor.openPinned(a, self.table, .{ .fields = paths, .row_refs = refs, .limit = @intCast(count) }, .{ .deadline_ns = self.context.deadline_ns, .cancellation = self.token }, &physical);
+        defer cursor.close(cursor.ptr);
+        const next = cursor.next_columns orelse return error.UnsupportedSqlExecution;
+        var found: usize = 0;
+        while (true) {
+            try Build.check(self);
+            var phase = try self.store.beginIo(1);
+            defer phase.abort();
+            const page = next(cursor.ptr, a, 256) catch |err| return phase.failed(err);
+            try phase.finish();
+            if (page.selection.len == 0) break;
+            const projected = try a.dupe(rows.ColumnVector, page.batch.columns);
+            for (projected) |*column| for (self.table.columns) |definition| {
+                if (std.mem.eql(u8, column.name, definition.name)) column.name = definition.path;
+            };
+            for (page.selection) |selected| {
+                var ref = page.batch.rowRef(selected);
+                ref.external.identity_version = self.physical.inventory.row_identity_version;
+                const key = try local.storage_rowsource_identity.allocId(a, ref);
+                const position = positions.get(key) orelse return error.InvalidLogicalRowIdentity;
+                if (seen[position]) return error.InvalidLogicalRowIdentity;
+                seen[position] = true;
+                docs[position] = (try orderingDocument(a, projected, selected, &states[position], schema, fields)) orelse return null;
+                found += 1;
+            }
+        }
+        if (found != count) return error.InvalidLogicalRowIdentity;
+    }
     const indices = local.introducer.sortedTextDocumentIndicesAlloc(a, docs, fields) catch |err| switch (err) {
         error.InvalidSegment, error.UnsupportedTypedDocValues => return null,
         else => return err,
@@ -1666,6 +1757,9 @@ test "external lake logical fragments reuse captured payloads for selective chan
 test "external lake logical fragments sort captured typed keys and preserve physical hydration" {
     try broadSpoolScenario(true, false, false, true);
 }
+test "external lake logical fragments sort projected keys without verification capture" {
+    try broadSpoolScenario(false, false, false, true);
+}
 fn broadSpoolScenario(comptime fused: bool, comptime selective: bool, comptime hashed: bool, comptime ordered: bool) !void {
     const a = std.testing.allocator;
     const row_count = if (hashed) 8193 else 257;
@@ -1691,10 +1785,10 @@ fn broadSpoolScenario(comptime fused: bool, comptime selective: bool, comptime h
     var uploaded = try client.putObject("antfly", "wide.parquet", bytes, .{});
     uploaded.deinit(a);
     const raw_schema = try std.fmt.allocPrint(a,
-        \\{{"version":1,"storage_mode":"relational","default_type":"row","base_source":{{"kind":"external","table_id":"source","format":"parquet","uri":"file://{s}","schema_fingerprint":"schema","row_identity":{{"key_columns":["id"]}}}},"document_schemas":{{"row":{{"schema":{{"type":"object","additionalProperties":false,"properties":{{"id":{{"type":"integer"}},"body":{{"type":"string"}},"price":{{"type":"number","x-antfly-sql-type":"numeric"}}}}}}}}}}}}
+        \\{{"version":1,"storage_mode":"relational","default_type":"row","base_source":{{"kind":"external","table_id":"source","format":"parquet","uri":"file://{s}","schema_fingerprint":"schema","row_identity":{{"key_columns":["id"]}}}},"document_schemas":{{"row":{{"schema":{{"type":"object","additionalProperties":false,"properties":{{"id":{{"type":"integer","x-antfly-field":{{"type":"number","sortable":true}}}},"body":{{"type":"string"}},"price":{{"type":"number","x-antfly-sql-type":"numeric"}}}}}}}}}}}}
     , .{directory.path()});
     defer a.free(raw_schema);
-    const schema = if (ordered) try std.mem.concat(a, u8, &.{ "{\"index_sort\":[{\"field\":\"id\",\"desc\":false},{\"field\":\"_id\",\"desc\":false}],", raw_schema[1..] }) else try a.dupe(u8, raw_schema);
+    const schema = if (ordered) try std.mem.concat(a, u8, &.{ "{\"index_sort\":[{\"field\":\"id\",\"order\":\"asc\"},{\"field\":\"_id\",\"order\":\"asc\"}],", raw_schema[1..] }) else try a.dupe(u8, raw_schema);
     defer a.free(schema);
     var binding = (try local.serverless_external_source_schema_binding.externalBindingFromSchemaJsonAlloc(a, schema)).?;
     defer binding.deinit(a);

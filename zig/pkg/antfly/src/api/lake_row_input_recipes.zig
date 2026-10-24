@@ -149,6 +149,7 @@ pub fn plan(a: A, out: A, table: local.common_topology_records.TableRecord, sour
                 try columns.append(ca, path);
             }
         }
+        try appendOrderingInputs(ca, schema, &columns);
         try result.append(out, try make(out, input_schema, artifact.name, artifact.binding.index_config_hash, columns.items, reusable));
     }
     // Native reducers can share one encoded cohort across materializations.
@@ -182,6 +183,7 @@ pub fn plan(a: A, out: A, table: local.common_topology_records.TableRecord, sour
             for (candidate.recipe.keys) |key| try columns.append(ca, key.path);
             for (candidate.recipe.inputs) |input| if (input.column) |column| try columns.append(ca, column.path);
         }
+        try appendOrderingInputs(ca, schema, &columns);
         try result.append(out, try make(out, input_schema, aggregate.name, aggregate.configuration, columns.items, reusable));
     }
     if (try parsed.relationalIndexDefinitions(ca)) |indexes| for (indexes) |index| {
@@ -195,9 +197,22 @@ pub fn plan(a: A, out: A, table: local.common_topology_records.TableRecord, sour
             defer predicate.deinit();
             for (predicate.conditions) |condition| for (try condition.tuple.columnBindings(ca)) |name| try columns.append(ca, normalize(schema, name) orelse return error.InvalidLogicalRowIdentity);
         }
+        try appendOrderingInputs(ca, schema, &columns);
         try result.append(out, try make(out, input_schema, try @import("lake_index_native_rows.zig").logicalName(ca, index.name), try std.json.Stringify.valueAlloc(ca, index, .{}), columns.items, true));
     };
     return result.toOwnedSlice(out);
+}
+// Ordering changes the shared native coordinate layout. Capture its source
+// values and bind them into every consumer cohort, even for a field-only index.
+fn appendOrderingInputs(a: A, schema: local.storage_schema.TableSchema, columns: *std.ArrayList([]const u8)) !void {
+    for (schema.index_sort) |field| {
+        if (std.mem.eql(u8, field.field, "_id")) continue;
+        const resolved = local.storage_schema.resolveLogicalDocValues(schema, field.field) orelse continue;
+        const source = for (schema.exact_fields) |mapped| {
+            if (std.mem.eql(u8, mapped.field, resolved.field)) break mapped.source_field;
+        } else field.field;
+        if (normalize(schema, source)) |path| try columns.append(a, path);
+    }
 }
 fn normalize(schema: local.storage_schema.TableSchema, name: []const u8) ?[]const u8 {
     for (schema.relational_columns) |column| if (std.mem.eql(u8, name, column.name) or std.mem.eql(u8, name, column.path)) return column.path;
@@ -282,4 +297,26 @@ test "external lake input recipes decline payload capture for enrichment and leg
         const config = try std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), bytes_, .{});
         try std.testing.expectEqual(i < 2, nativeFragmentsEligible(config));
     }
+}
+
+test "external lake ordering inputs bind sort columns outside selected text" {
+    const a = std.testing.allocator;
+    const schema_json =
+        \\{"storage_mode":"relational","default_type":"row","index_sort":[{"field":"rank","order":"asc"},{"field":"_id","order":"asc"}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"body":{"type":"string"},"rank":{"type":"integer","x-antfly-field":{"type":"number","sortable":true}}}}}}}
+    ;
+    var parsed = try local.schema_mod.parseValidatedTableSchema(a, schema_json);
+    defer parsed.deinit(a);
+    const schema = try local.schema_mod.deriveRuntimeTableSchema(a, parsed);
+    defer local.storage_schema.freeSchema(a, schema);
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const ca = arena.allocator();
+    var columns: std.ArrayList([]const u8) = .empty;
+    try columns.append(ca, "body");
+    try appendOrderingInputs(ca, schema, &columns);
+    try std.testing.expectEqual(@as(usize, 2), columns.items.len);
+    try std.testing.expectEqualStrings("rank", columns.items[1]);
+    const before = try make(ca, schema_json, "text", "config", &.{"body"}, true);
+    const after = try make(ca, schema_json, "text", "config", columns.items, true);
+    try std.testing.expect(!std.mem.eql(u8, &before.digest, &after.digest));
 }

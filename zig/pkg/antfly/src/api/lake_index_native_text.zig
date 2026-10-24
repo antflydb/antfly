@@ -1130,6 +1130,7 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
         const config = try std.json.parseFromSliceLeaky(std.json.Value, ca, spec.config_json, .{});
         const store_source = try storesSource(config);
         const selected_field: ?[]const u8 = if (config.object.get("field")) |field| if (field == .string) field.string else null else null;
+        const effective_sort: []const local.segment.SegmentIndexSortField = if (selected_field != null and !store_source) &.{} else index_sort;
         var binding = want.binding;
         if (selected_field == null or store_source) {
             const paths = try ca.alloc([]const u8, runtime.relational_columns.len);
@@ -1366,7 +1367,7 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
             defer capture_manager.deinit();
             var output_manager: local.sql_spill.Manager = .{ .alloc = a, .io = capture_manager.io, .context = &capture_check, .checkpoint = capture_manager.checkpoint, .max_bytes = 768 * 1024 * 1024, .async_writes = false };
             defer output_manager.deinit();
-            var compactor: Compactor = .{ .index_sort = index_sort, .ordered_coordinates = provider.fragment_rows != null and std.mem.startsWith(u8, source.inventory.files[file_ordinal].etag, "so1-"), .context = provider.context, .output_manager = &output_manager, .global = &df, .directory = &directory_builder, .capture_manager = &capture_manager, .a = a, .out = fa, .store = store, .segments = &segments, .summaries = &summaries, .forwards = &forwards, .admissions = &admissions, .cancellation = cancellation, .file_ordinal = file_ordinal, .opening = &opening, .io = provider.context.io };
+            var compactor: Compactor = .{ .index_sort = effective_sort, .ordered_coordinates = effective_sort.len != 0 and provider.fragment_rows != null and std.mem.startsWith(u8, source.inventory.files[file_ordinal].etag, "so1-"), .context = provider.context, .output_manager = &output_manager, .global = &df, .directory = &directory_builder, .capture_manager = &capture_manager, .a = a, .out = fa, .store = store, .segments = &segments, .summaries = &summaries, .forwards = &forwards, .admissions = &admissions, .cancellation = cancellation, .file_ordinal = file_ordinal, .opening = &opening, .io = provider.context.io };
             defer compactor.deinit();
             if (provider.rowsForFile(file_ordinal)) |selected| if (selected.len != 0 and selected.len < source.inventory.files[file_ordinal].row_count / 2 and file.key_digest != null) {
                 const old = if (previous_refs.get(file.id)) |record| try loadRecordedFile(fa, store.*, record, seed.?.domain, cancellation) else previous_groups.get(file.id);

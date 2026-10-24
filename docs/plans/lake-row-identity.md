@@ -1166,9 +1166,15 @@ For stable-key sources, logical fragments assign native coordinates in declared
 maps authenticate both directions; the physical source space and public stable
 identity remain independent. Sorting uses captured typed payloads and the shared
 native key comparator, with at most 8,192 rows per fragment and the existing
-scheduler, memory and spill admission. Only changed input fragments are sorted.
-Missing, null or unsupported keys retain canonical coordinates and the exact
-doc-values top-N fallback. Failed admission retains the physical-source fallback.
+scheduler, memory and spill admission. Only changed input fragments are sorted. Incremental verification can omit a
+complete payload capture; those fragments gather only ordering columns at their
+authenticated physical row coordinates instead of abandoning native layout.
+Sort inputs participate in every consumer cohort, including field-only text
+indexes, so a non-key sort update cannot escape layout invalidation. Missing,
+null or unsupported keys retain canonical coordinates and the exact
+doc-values top-N fallback. Failed admission retains the physical-source fallback. Reversed or leading
+`_id` sort components retain the exact fallback; private coordinate IDs can close
+an otherwise ordered tuple ascending.
 
 A normalized ordering recipe and ordered-member digest travel in authenticated
 fragment navigation. The digest also binds native coordinate reuse: a changed
@@ -1177,6 +1183,14 @@ retain row patches. Source recipes fence earlier producers that omitted ordering
 or ignored disabled detailed text mappings. Native encoders attest the observed
 physical order before writing ordinary sort metadata and endpoint bounds. They
 never silently rearrange documents after source ordinals have been assigned.
+
+Public-ID projection uses a bounded k-way merge of native primary sort tuples.
+Cursor seeks retain the complete primary boundary tie, then the existing exact
+collector applies public identities and final cursor comparisons. The stream
+holds one head per leased segment and shares the candidate-probe budget; skewed
+membership resumes the original compressed membership iterator after discarding
+the partial window. Metadata coverage alone is insufficient qualification:
+profiles must show positive ordered work and fewer decorated candidates.
 
 Append compaction preserves ordering only when all input metadata and bounds
 prove the concatenation monotone. Lake serving compaction retains sorted runs
