@@ -20173,3 +20173,65 @@ test "public execution composes every internal budget and validates combined hea
     try AntflyApiHandler.establishExecutionDeadlines(&ctx);
     try std.testing.expectEqual(@as(u64, 0), ctx.application_deadline_ns.?);
 }
+
+test "linear merge HTTP accepts scoped media and rejects an out of range mutation" {
+    if (comptime builtin.os.tag == .windows or builtin.os.tag == .freestanding) return;
+    const Fixture = struct {
+        calls: std.atomic.Value(usize) = .init(0),
+        fn reads(self: *@This()) table_reads.TableReadSource {
+            return .{ .ptr = self, .vtable = &.{ .lookup = lookup, .query = query, .scan = scan } };
+        }
+        fn writes(self: *@This()) table_writes.TableWriteSource {
+            return .{ .ptr = self, .vtable = &.{ .batch = batch } };
+        }
+        fn lookup(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: db_mod.types.LookupOptions, _: raft_mod.ReadConsistency) !?table_reads.LookupResponse {
+            return null;
+        }
+        fn query(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: db_mod.types.SearchRequest, _: raft_mod.ReadConsistency) !?query_api.QueryResponse {
+            return null;
+        }
+        fn scan(_: *anyopaque, a: std.mem.Allocator, _: []const u8, from: []const u8, to: []const u8, opts: db_mod.types.ScanOptions, _: raft_mod.ReadConsistency) !?table_reads.ScanResponse {
+            try std.testing.expectEqualStrings("source/", from);
+            try std.testing.expectEqualStrings("source/a", to);
+            try std.testing.expect(!opts.inclusive_from);
+            return .{ .ndjson = try a.dupe(u8, "") };
+        }
+        fn batch(ptr: *anyopaque, _: std.mem.Allocator, _: []const u8, req: db_mod.types.BatchRequest) !?void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqual(@as(usize, 1), req.writes.len);
+            try std.testing.expectEqual(@as(usize, 0), req.deletes.len);
+            try std.testing.expectEqualStrings("source/a", req.writes[0].key);
+            _ = self.calls.fetchAdd(1, .monotonic);
+            return {};
+        }
+    };
+    const a = std.testing.allocator;
+    var fixture = Fixture{};
+    var status = SchemaUpdateStatusSource{};
+    var api_server = ApiHttpServer.init(a, .{}, status.iface(), fixture.reads(), fixture.writes());
+    defer api_server.deinit();
+    var server: HttpxE2eServer = undefined;
+    try server.init(a, &api_server);
+    defer server.deinit();
+    var io = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io.deinit();
+    var client = httpx.Client.initWithConfig(a, io.io(), .{ .keep_alive = false });
+    defer client.deinit();
+    const base = try server.baseUrl(a);
+    defer a.free(base);
+    const url = try std.fmt.allocPrint(a, "{s}/db/v1/tables/docs/merge", .{base});
+    defer a.free(url);
+    const headers = [_][2][]const u8{.{ "content-type", "application/vnd.antfly.scoped-merge.v1+json" }};
+    var good = try requestWithRetry(&client, io.io(), .POST, url,
+        \\{"scoped_merge":{"key_range":{"from":"source/","to":"source0"},"records":{"source/a":{"value":1}},"sync_level":"write"}}
+    , &headers, 20);
+    defer good.deinit();
+    try std.testing.expectEqual(@as(u16, 200), good.status.code);
+    try std.testing.expectEqual(@as(usize, 1), fixture.calls.load(.monotonic));
+    var bad = try requestWithRetry(&client, io.io(), .POST, url,
+        \\{"scoped_merge":{"key_range":{"from":"source/","to":"source0"},"records":{"other/a":{"value":1}},"delete_missing":true}}
+    , &headers, 20);
+    defer bad.deinit();
+    try std.testing.expectEqual(@as(u16, 400), bad.status.code);
+    try std.testing.expectEqual(@as(usize, 1), fixture.calls.load(.monotonic));
+}
