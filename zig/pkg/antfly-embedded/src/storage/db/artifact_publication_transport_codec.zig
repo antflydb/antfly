@@ -41,7 +41,8 @@ comptime {
         @typeInfo(publication.Source).@"struct".field_names.len != 5 or
         @typeInfo(publication.ArtifactSource).@"struct".field_names.len != 4 or
         @typeInfo(publication.Mutation).@"struct".field_names.len != 4 or
-        @typeInfo(publication.CompletionPage).@"struct".field_names.len != 6)
+        @typeInfo(publication.CompletionPage).@"struct".field_names.len != 6 or
+        @typeInfo(publication.ChunkGeneration).@"struct".field_names.len != 3)
         @compileError("update compact publication transport projection");
 }
 
@@ -117,7 +118,7 @@ pub fn encodedLength(command: publication.Command) !usize {
         try add(&size, 8 + 64);
         try blobSize(&size, page.document_key);
     }
-    if (command.chunk_generation) |page| try add(&size, 1 + 252 + 1 + (if (page.previous != null) @as(usize, 80) else 0));
+    if (command.chunk_generation) |page| try add(&size, 1 + 252 + 1 + (if (page.previous != null) @as(usize, 80) else 0) + 1 + (if (page.retired_through != null) @as(usize, 4) else 0));
     return size;
 }
 
@@ -236,10 +237,12 @@ pub fn encodeAlloc(alloc: Allocator, command: publication.Command) ![]u8 {
         writer.write(&page.after);
     }
     if (command.chunk_generation) |page| {
-        writer.byte(1);
+        writer.byte(2);
         writer.write(&page.spec);
         writer.byte(@intFromBool(page.previous != null));
         if (page.previous) |previous| writer.write(&previous.encode());
+        writer.byte(@intFromBool(page.retired_through != null));
+        if (page.retired_through) |cursor| writer.writeU32(cursor);
     }
     const checksum = digest(out[0..writer.pos]);
     writer.write(&checksum);
@@ -441,14 +444,19 @@ fn decode(alloc: Allocator, bytes: []const u8, owns_bytes: bool) !Decoded {
         else => return error.InvalidBatchRequest,
     };
     const chunk_generation: ?publication.ChunkGeneration = if (cursor.pos != cursor.bytes.len) blk: {
-        if (try cursor.byte() != 1) return error.InvalidBatchRequest;
+        if (try cursor.byte() != 2) return error.InvalidBatchRequest;
         const spec = (try cursor.take(252))[0..252].*;
         const previous: ?@import("artifact_chunk_manifest.zig").Manifest = switch (try cursor.byte()) {
             0 => null,
             1 => try @import("artifact_chunk_manifest.zig").Manifest.decode(try cursor.take(80)),
             else => return error.InvalidBatchRequest,
         };
-        break :blk .{ .spec = spec, .previous = previous };
+        const retired_through: ?u32 = switch (try cursor.byte()) {
+            0 => null,
+            1 => try cursor.readU32(),
+            else => return error.InvalidBatchRequest,
+        };
+        break :blk .{ .spec = spec, .previous = previous, .retired_through = retired_through };
     } else null;
     if (cursor.pos != cursor.bytes.len) return error.InvalidBatchRequest;
     const command: publication.Command = .{

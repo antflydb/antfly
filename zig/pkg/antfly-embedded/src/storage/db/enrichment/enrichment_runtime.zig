@@ -5676,6 +5676,8 @@ const UnsupportedEnrichmentRuntime = struct {
     status_hook: ?StatusHook = null,
     dense_result_cache: ?embedder_mod.DenseResultCache = null,
     vector_label_cache: @import("vector_label_cache.zig").Cache = .{},
+    /// Invocation-local runtimes borrow the lifecycle owner's cache.
+    shared_vector_label_cache: ?*@import("vector_label_cache.zig").Cache = null,
     generated_publication: ?GeneratedPublicationPort = null,
     shared_pdf_windows: ?*SharedPdfWindowScheduler = null,
     /// Borrowed from the owning DB, which stops and destroys this runtime
@@ -6316,6 +6318,8 @@ const PlatformEnrichmentRuntime = struct {
     status_hook: ?StatusHook = null,
     dense_result_cache: ?embedder_mod.DenseResultCache = null,
     vector_label_cache: @import("vector_label_cache.zig").Cache = .{},
+    /// Invocation-local runtimes borrow the lifecycle owner's cache.
+    shared_vector_label_cache: ?*@import("vector_label_cache.zig").Cache = null,
     generated_publication: ?GeneratedPublicationPort = null,
     future: ?background_runtime_mod.MaintenanceScheduler.Handle = null,
 
@@ -14869,6 +14873,7 @@ fn processMediaOutput(runtime: *EnrichmentRuntime, request: enrichment_types.Gen
 fn processVectorLabels(runtime: *EnrichmentRuntime, request: enrichment_types.GeneratedEnrichmentRequest, config_json: []const u8, token: ?*@import("../artifact_producer_context.zig").Token, raw_doc: []const u8, output_key: []const u8, window: *GeneratedReplayWindow) !void {
     const labels = @import("vector_labels.zig");
     const a = runtime.alloc;
+    const scorer_cache = runtime.shared_vector_label_cache orelse &runtime.vector_label_cache;
     const upstream = runtime.index_manager.getEnrichment(.embedding, request.upstream_artifact_name) orelse return error.InvalidEnrichmentConfig;
     if (upstream.source_artifact_name.len == 0) return error.InvalidEnrichmentConfig;
     const provider = runtime.config.dense_embedder orelse return error.MissingDenseEmbedder;
@@ -14943,9 +14948,16 @@ fn processVectorLabels(runtime: *EnrichmentRuntime, request: enrichment_types.Ge
     var cache_key: [32]u8 = undefined;
     hash.final(&cache_key);
     const Cache = @import("vector_label_cache.zig").Cache;
-    const cached = if (revision != null and vectors.items.len != 0) runtime.vector_label_cache.get(cache_key) else null;
-    const entry = cached orelse try Cache.Entry.createAdmitted(a, cache_key, config_json, runtime.config.resource_manager orelse runtime.index_manager.resource_manager);
-    defer runtime.vector_label_cache.release(entry);
+    const manager = runtime.config.resource_manager orelse runtime.index_manager.resource_manager;
+    const cacheable = scorer_cache.bind(manager);
+    const cached = if (cacheable and revision != null and vectors.items.len != 0) scorer_cache.get(cache_key) else null;
+    const entry = cached orelse blk: {
+        break :blk Cache.Entry.createAdmitted(a, cache_key, config_json, manager) catch |err| retry: {
+            if (err != error.ResourceBudgetExceeded or Cache.reclaim(scorer_cache, Cache.max_bytes) == 0) return err;
+            break :retry try Cache.Entry.createAdmitted(a, cache_key, config_json, manager);
+        };
+    };
+    defer scorer_cache.release(entry);
     if (cached == null and vectors.items.len != 0) {
         const prompts = try a.alloc([]const u8, entry.config.labels.len);
         defer a.free(prompts);
@@ -14955,11 +14967,15 @@ fn processVectorLabels(runtime: *EnrichmentRuntime, request: enrichment_types.Ge
             for (prompt_vectors) |vector| a.free(vector);
             a.free(prompt_vectors);
         }
-        entry.scorer = labels.Scorer.initValidated(entry.arena.allocator(), entry.config, prompt_vectors) catch |err| return entry.admissionError(err);
+        entry.scorer = labels.Scorer.initValidated(entry.arena.allocator(), entry.config, prompt_vectors) catch |err| blk: {
+            const admitted = entry.admissionError(err);
+            if (admitted != error.ResourceBudgetExceeded or Cache.reclaim(scorer_cache, Cache.max_bytes) == 0) return admitted;
+            break :blk labels.Scorer.initValidated(entry.arena.allocator(), entry.config, prompt_vectors) catch |retry| return entry.admissionError(retry);
+        };
         if (revision) |before| {
             const after = (try revision_fn.?(provider.ptr, a, upstream.name)) orelse return error.EmbeddingIdentityMismatch;
             if (!std.mem.eql(u8, &before, &after)) return error.EmbeddingIdentityMismatch;
-            runtime.vector_label_cache.retain(entry);
+            if (cacheable) scorer_cache.retain(entry);
         }
     }
     const Row = struct { chunk_id: u32, labels: []labels.Score };
@@ -16265,6 +16281,7 @@ pub const PrecommitDocumentExecution = struct {
                 .notify_ctx = self,
                 .notify_fn = ignoreNotification,
                 .config = parent.config,
+                .shared_vector_label_cache = parent.shared_vector_label_cache orelse &parent.vector_label_cache,
                 .ownership = try ownership_mod.State.init(alloc, parent.store, "precommit-no-lease", .{}),
             },
             .scheduler = undefined,
@@ -16332,6 +16349,7 @@ pub const PrecommitDocumentExecution = struct {
         clearPublishedGeneratedArtifacts(&self.runtime);
         clearIsolatedFailedIndexes(&self.runtime);
         self.runtime.inference_recovery.deinit(alloc);
+        self.runtime.vector_label_cache.deinit();
         if (builtin.os.tag != .freestanding) self.runtime.ownership.deinit(alloc);
         alloc.destroy(self);
     }
@@ -27809,6 +27827,7 @@ fn processOrderedChunkText(runtime: *EnrichmentRuntime, request: enrichment_type
 }
 
 fn submitChunkGenerationCommand(runtime: *EnrichmentRuntime, token: *@import("../artifact_producer_context.zig").Token, command: *ordered_publication.Command) !void {
+    try heartbeatEnrichmentLease(runtime);
     {
         const fence = try requiredRuntimeStoreWriteFence(runtime);
         var read = try runtime.store.beginProbe();
@@ -27832,7 +27851,7 @@ fn pruneOrderedChunkGenerations(runtime: *EnrichmentRuntime, token: *@import("..
         if (page.selected) |selected| if (std.mem.eql(u8, &selected, &state.spec.id())) continue;
         var command = try token.command(&.{});
         command.mode = .prune_chunks;
-        command.chunk_generation = .{ .spec = state.spec.encode() };
+        command.chunk_generation = .{ .spec = state.spec.encode(), .retired_through = state.retired_through };
         try submitChunkGenerationCommand(runtime, token, &command);
         return error.ArtifactPublicationPending;
     }
@@ -27867,6 +27886,7 @@ fn publishOrderedChunkGeneration(runtime: *EnrichmentRuntime, request: enrichmen
     // recipes are durable already; staging does not repeat model inference.
     var output = manifests.Builder.init();
     for (desired, 0..) |_, ordinal| {
+        if (ordinal % 128 == 0) try heartbeatEnrichmentLease(runtime);
         try runtime.active_provider_guard.check();
         var row = try manifests.PreparedRows.initPage(a, request.doc_key, requestArtifactName(request), request.source_field, desired[ordinal..][0..1], retain_payload);
         defer row.deinit();
@@ -38673,6 +38693,7 @@ test "model aware media ordered generation publishes beyond 4095 chunks and resu
         next_index: u64 = 4,
         calls: usize = 0,
         remaining: ?usize = 2,
+        last_retirement: ?[32]u8 = null,
         fn enqueue(raw: *anyopaque, _: ordered_publication.Namespace, bytes: []const u8) !void {
             const self: *@This() = @ptrCast(@alignCast(raw));
             if (self.remaining) |*remaining| {
@@ -38681,6 +38702,11 @@ test "model aware media ordered generation publishes beyond 4095 chunks and resu
             }
             var decoded = try @import("../artifact_publication_transport_codec.zig").decodeBorrowed(std.testing.allocator, bytes);
             defer decoded.deinit();
+            // Model the production upload transport's digest deduplication.
+            if (decoded.command.mode == .prune_chunks) {
+                if (self.last_retirement) |last| if (std.mem.eql(u8, &last, &decoded.command.publication_digest)) return;
+                self.last_retirement = decoded.command.publication_digest;
+            }
             if (decoded.command.mode == .append_chunks) try std.testing.expect(decoded.command.mutations.len <= 128);
             if (decoded.command.mode == .publish) try std.testing.expectEqual(@as(usize, 2), decoded.command.mutations.len);
             try server_test_adapter.applyOrdered(self.db.?, .{ .artifact_publication = decoded.command }, .{ .term = 1, .index = self.next_index });
@@ -38748,7 +38774,7 @@ test "model aware media ordered generation publishes beyond 4095 chunks and resu
     };
     defer enrichment_types.freeGeneratedRequest(a, request);
     {
-        try db.reconfigureEnrichmentRuntimePaused(.{ .enable_without_producers = true });
+        try db.reconfigureEnrichmentRuntimePaused(.{ .enable_without_producers = true, .lease_ttl_ms = 600_000 });
         const runtime = db.enrichment_runtime.?;
         try std.testing.expect(try runtime.ownership.ensureLease(runtime.clock.nowRealtimeMs()));
         var token = try Harness.capture(runtime, request, scope);
@@ -38789,7 +38815,7 @@ test "model aware media ordered generation publishes beyond 4095 chunks and resu
     open = true;
     harness.db = &db;
     harness.remaining = null;
-    try db.reconfigureEnrichmentRuntimePaused(.{ .enable_without_producers = true });
+    try db.reconfigureEnrichmentRuntimePaused(.{ .enable_without_producers = true, .lease_ttl_ms = 600_000 });
     const runtime = db.enrichment_runtime.?;
     try std.testing.expect(try runtime.ownership.ensureLease(runtime.clock.nowRealtimeMs()));
     {

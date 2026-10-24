@@ -27,6 +27,8 @@ pub const Cache = struct {
     entries: [max_entries]?*Entry = @splat(null),
     bytes: usize = 0,
     clock: u64 = 0,
+    manager: ?*resources.ResourceManager = null,
+    reclaimer_id: u64 = 0,
     pub const Entry = struct {
         backing: Allocator,
         budget: ?resources.BudgetedAllocator = null,
@@ -43,7 +45,7 @@ pub const Cache = struct {
         }
         pub fn createAdmitted(a: Allocator, key: [32]u8, raw: []const u8, manager: ?*resources.ResourceManager) !*Entry {
             const entry = try a.create(Entry);
-            entry.* = .{ .backing = a, .arena = undefined, .key = key, .config = undefined, .budget = if (manager) |resource_manager| resources.BudgetedAllocator.init(resource_manager, .shard_transition_working_set, a, 1) else null };
+            entry.* = .{ .backing = a, .arena = undefined, .key = key, .config = undefined, .budget = if (manager) |resource_manager| resources.BudgetedAllocator.init(resource_manager, .document_extraction_working_set, a, 1) else null };
             entry.arena = .init(if (entry.budget) |*budget| budget.allocator() else a);
             errdefer entry.destroy();
             entry.initialize(raw) catch |err| return entry.admissionError(err);
@@ -69,6 +71,38 @@ pub const Cache = struct {
     fn lock(self: *Cache) void {
         while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
     }
+    /// Register only at the lifecycle owner's stable address. A different
+    /// admission domain bypasses retention rather than borrowing its budget.
+    pub fn bind(self: *Cache, manager: ?*resources.ResourceManager) bool {
+        self.lock();
+        defer self.mutex.unlock();
+        if (self.manager) |current| return manager == current;
+        if (manager) |current| {
+            for (self.entries) |slot| if (slot != null) return false;
+            self.reclaimer_id = current.registerReclaimer(.document_extraction_working_set, self, reclaim) catch return false;
+            self.manager = current;
+        }
+        return true;
+    }
+    pub fn reclaim(raw: *anyopaque, target_bytes: u64) u64 {
+        const self: *Cache = @ptrCast(@alignCast(raw));
+        if (!self.mutex.tryLock()) return 0;
+        defer self.mutex.unlock();
+        var released: u64 = 0;
+        while (released < target_bytes) {
+            var victim: ?usize = null;
+            for (self.entries, 0..) |slot, index| if (slot) |entry| {
+                if (entry.refs == 0 and (victim == null or entry.used < self.entries[victim.?].?.used)) victim = index;
+            };
+            const index = victim orelse break;
+            const entry = self.entries[index].?;
+            self.entries[index] = null;
+            self.bytes -= entry.bytes;
+            released += if (entry.budget) |budget| budget.reservation.bytes else entry.bytes;
+            entry.destroy();
+        }
+        return released;
+    }
     pub fn get(self: *Cache, key: [32]u8) ?*Entry {
         self.lock();
         defer self.mutex.unlock();
@@ -85,6 +119,7 @@ pub const Cache = struct {
     /// Takes the creator's single lease. Failure to retain is a cache miss,
     /// not an inference failure; the caller still owns the entry until release.
     pub fn retain(self: *Cache, entry: *Entry) void {
+        if (!self.bind(if (entry.budget) |budget| budget.reservation.manager else null)) return;
         entry.bytes = entry.arena.queryCapacity() + @sizeOf(Entry);
         if (entry.bytes > max_bytes) return;
         self.lock();
@@ -124,6 +159,10 @@ pub const Cache = struct {
     }
     /// Called after runtime execution lanes have joined.
     pub fn deinit(self: *Cache) void {
+        // Unregistration drains callbacks without holding the cache lock.
+        if (self.manager) |manager| manager.unregisterReclaimer(self.reclaimer_id);
+        self.manager = null;
+        self.reclaimer_id = 0;
         for (self.entries) |slot| if (slot) |entry| {
             std.debug.assert(entry.refs == 0);
             entry.destroy();
@@ -162,11 +201,11 @@ test "model aware media vocabulary cache owns strings fences generations and pre
 test "model aware media vocabulary construction and retained matrices hold resource admission until eviction" {
     const a = std.testing.allocator;
     var budgets = resources.Options.defaultBudgets();
-    budgets[@backingInt(resources.Slice.shard_transition_working_set)] = .{ .hard_limit_bytes = 1 };
+    budgets[@backingInt(resources.Slice.document_extraction_working_set)] = .{ .hard_limit_bytes = 1 };
     var denied = resources.ResourceManager.init(.{ .budgets = budgets });
     defer denied.deinit(a);
     try std.testing.expectError(error.ResourceBudgetExceeded, Cache.Entry.createAdmitted(a, @splat(1), "{\"labels\":[{\"label\":\"speech\"}]}", &denied));
-    try std.testing.expectEqual(@as(u64, 0), denied.sliceStats(.shard_transition_working_set).used_bytes);
+    try std.testing.expectEqual(@as(u64, 0), denied.sliceStats(.document_extraction_working_set).used_bytes);
     var manager = resources.ResourceManager.init(.{});
     defer manager.deinit(a);
     var cache: Cache = .{};
@@ -174,7 +213,26 @@ test "model aware media vocabulary construction and retained matrices hold resou
     entry.scorer = try labels.Scorer.initValidated(entry.arena.allocator(), entry.config, &.{&.{ 1, 0 }});
     cache.retain(entry);
     cache.release(entry);
-    try std.testing.expect(manager.sliceStats(.shard_transition_working_set).used_bytes > 0);
+    try std.testing.expect(manager.sliceStats(.document_extraction_working_set).used_bytes > 0);
     cache.deinit();
-    try std.testing.expectEqual(@as(u64, 0), manager.sliceStats(.shard_transition_working_set).used_bytes);
+    try std.testing.expectEqual(@as(u64, 0), manager.sliceStats(.document_extraction_working_set).used_bytes);
+}
+
+test "model aware media vocabulary cache releases idle admission under pressure and keeps scoring leases pinned" {
+    const a = std.testing.allocator;
+    var budgets = resources.Options.defaultBudgets();
+    const limit = 64 * 1024;
+    budgets[@backingInt(resources.Slice.document_extraction_working_set)] = .{ .hard_limit_bytes = limit };
+    var manager = resources.ResourceManager.init(.{ .budgets = budgets });
+    defer manager.deinit(a);
+    var cache: Cache = .{};
+    defer cache.deinit();
+    const entry = try Cache.Entry.createAdmitted(a, @splat(1), "{\"labels\":[{\"label\":\"speech\"}]}", &manager);
+    cache.retain(entry);
+    try std.testing.expectEqual(@as(u64, 0), Cache.reclaim(&cache, limit));
+    cache.release(entry);
+    var required = try manager.reserve(.document_extraction_working_set, limit);
+    defer required.release();
+    try std.testing.expectEqual(@as(usize, 0), cache.bytes);
+    try std.testing.expect(cache.get(@splat(1)) == null);
 }

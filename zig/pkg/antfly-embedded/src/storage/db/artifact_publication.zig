@@ -183,6 +183,8 @@ pub const CompletionPage = struct {
 pub const ChunkGeneration = struct {
     spec: [252]u8,
     previous: ?@import("artifact_chunk_manifest.zig").Manifest = null,
+    /// Each retirement page has its own immutable transport identity.
+    retired_through: ?u32 = null,
 };
 pub const Command = struct {
     mode: enum { activate, publish, baseline, validate_inputs, census, complete_streams, reconcile_units, append_chunks, prune_chunks } = .publish,
@@ -315,10 +317,12 @@ pub const Command = struct {
             hash.update(&page.after);
         }
         if (self.chunk_generation) |page| {
-            hash.update("antfly:staged-chunks:v1:");
+            hash.update("antfly:staged-chunks:v2:");
             hash.update(&page.spec);
             hash.update(&.{@intFromBool(page.previous != null)});
             if (page.previous) |previous| hash.update(&previous.encode());
+            hash.update(&.{@intFromBool(page.retired_through != null)});
+            if (page.retired_through) |cursor| number(&hash, cursor);
         }
         var out: Digest = undefined;
         hash.final(&out);
@@ -388,6 +392,7 @@ pub const Command = struct {
                 self.producer_kind != .enrichment or self.producer_scope_key.len != 0 or
                 self.producer_generation != self.authority_epoch or !std.mem.eql(u8, self.producer_name, self.producer_artifact_name)) return error.InvalidBatchRequest;
             if ((self.mode == .append_chunks) != (self.chunk_generation.?.previous != null)) return error.InvalidBatchRequest;
+            if ((self.mode == .prune_chunks) != (self.chunk_generation.?.retired_through != null)) return error.InvalidBatchRequest;
             if (self.mode == .append_chunks and self.mutations.len > 128) return error.InvalidBatchRequest;
             if (self.mode == .prune_chunks and self.mutations.len != 0) return error.InvalidBatchRequest;
         }

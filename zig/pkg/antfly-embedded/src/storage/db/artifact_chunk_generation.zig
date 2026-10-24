@@ -565,3 +565,42 @@ pub fn View(comptime Txn: type) type {
         }
     };
 }
+
+test "model aware media member batch reads replace legacy rows and hide tails with one selected-head lookup" {
+    const a = std.testing.allocator;
+    const scope = try chunks.keyAlloc(a, "doc", "chunks");
+    defer a.free(scope);
+    var builder = chunks.Builder.init();
+    try builder.append(0, "accepted");
+    const spec = try Spec.init(.{ .namespace = @splat(1), .epoch = 1, .catalog_digest = @splat(2) }, scope, @splat(3), builder.finish(), 1);
+    var plan = try Plan.init(a, scope, spec);
+    defer plan.deinit();
+    const Fake = struct {
+        head: []const u8,
+        prefix: []const u8,
+        encoded: [252]u8,
+        heads: usize = 0,
+        missing: bool = false,
+        pub fn get(self: *@This(), key: []const u8) anyerror![]const u8 {
+            if (std.mem.eql(u8, key, self.head)) {
+                self.heads += 1;
+                return &self.encoded;
+            }
+            if (!self.missing and std.mem.startsWith(u8, key, self.prefix) and std.mem.allEqual(u8, key[self.prefix.len..], 0)) return "accepted";
+            return error.NotFound;
+        }
+    };
+    var read: Fake = .{ .head = plan.head_key, .prefix = plan.row_prefix, .encoded = spec.encode() };
+    var members = MemberReader.init(a);
+    defer members.deinit();
+    const zero = try keys.chunkArtifactKeyAlloc(a, "doc", "chunks", 0);
+    defer a.free(zero);
+    const tail = try keys.chunkArtifactKeyAlloc(a, "doc", "chunks", 1);
+    defer a.free(tail);
+    try std.testing.expectEqualStrings("accepted", (try members.override(&read, zero, "stale legacy row")).?);
+    try std.testing.expect((try members.override(&read, tail, "stale legacy tail")) == null);
+    try std.testing.expectEqualStrings("ordinary", (try members.override(&read, "base-document", "ordinary")).?);
+    try std.testing.expectEqual(@as(usize, 1), read.heads);
+    read.missing = true;
+    try std.testing.expectError(error.ArtifactCatalogCorrupt, members.override(&read, zero, null));
+}

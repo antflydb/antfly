@@ -99,7 +99,11 @@ pub const Control = struct {
         try publication.validateArtifactSources(a, txn, self.command.namespace, self.command.sources, self.command.mutation_preconditions);
         const authority = (try publication.authority(txn)) orelse return error.ArtifactCatalogDrift;
         if (authority.epoch != self.command.authority_epoch or !std.mem.eql(u8, &authority.catalog_digest, &self.command.catalog_digest)) return error.ArtifactCatalogDrift;
-        if (try @import("artifact_producer_obligations.zig").load(txn)) |obligations| if (obligations.sealed_attempt != null) return error.RetainedEffectsFenceMismatch;
+        // Collecting unselected private rows cannot change a sealed logical
+        // source cut. Appends still obey the producer admission fence.
+        if (self.command.mode != .prune_chunks) {
+            if (try @import("artifact_producer_obligations.zig").load(txn)) |obligations| if (obligations.sealed_attempt != null) return error.RetainedEffectsFenceMismatch;
+        }
         if (self.command.mode == .append_chunks and self.append == null) {
             _ = try self.plan.begin(txn);
         } else if (self.append) |*append| {
@@ -145,8 +149,11 @@ pub fn prepareControl(a: Allocator, txn: anytype, command: publication.Command, 
         } else result.append = try generations.PreparedAppend.init(a, &plan, .{ .spec = plan.spec, .progress = previous }, payloads);
     } else {
         var state = plan.load(txn) catch |err| if (err == error.NotFound) return error.EnrichmentSourceChanged else return err;
+        const claimed = command.chunk_generation.?.retired_through.?;
+        if (claimed > state.progress.count) return error.InvalidBatchRequest;
+        if (claimed > state.retired_through) return error.ArtifactPublicationPending;
         state.retiring = true;
-        result.retirement = try generations.PreparedRetirement.init(a, &plan, .{ .namespace = command.namespace, .epoch = command.authority_epoch, .catalog_digest = command.catalog_digest }, state, 128);
+        if (claimed == state.retired_through) result.retirement = try generations.PreparedRetirement.init(a, &plan, .{ .namespace = command.namespace, .epoch = command.authority_epoch, .catalog_digest = command.catalog_digest }, state, 128);
     }
     result.arena = arena;
     return result;

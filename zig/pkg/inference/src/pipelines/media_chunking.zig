@@ -591,9 +591,7 @@ pub const Runner = struct {
                 const cached = if (identity) |key| if (self.request.index_cache) |cache| cache.get(key) else null else null;
                 defer if (cached) |entry| self.request.index_cache.?.release(entry);
                 if (cached) |entry| {
-                    var reader = entry.data.webm;
-                    reader.input = &source;
-                    reader.allocator = self.allocator;
+                    var reader = entry.data.webm.reader(self.allocator, &source);
                     try self.webmWindows(&reader);
                     return;
                 }
@@ -615,9 +613,7 @@ pub const Runner = struct {
                 const cached = if (identity) |key| if (self.request.index_cache) |cache| cache.get(key) else null else null;
                 defer if (cached) |entry| self.request.index_cache.?.release(entry);
                 if (cached) |entry| {
-                    var reader = entry.data.mp4;
-                    reader.input = &source;
-                    reader.allocator = self.allocator;
+                    var reader = entry.data.mp4.reader(self.allocator, &source);
                     var owner = try @import("media_chunking_video.zig").Owner.init(self.allocator, &reader, &self.pool, self.request.limits);
                     defer owner.deinit();
                     try self.videoWindows(&.{}, &reader, try owner.durationNs(), owner.origin, reader.track.timescale, &owner, null);

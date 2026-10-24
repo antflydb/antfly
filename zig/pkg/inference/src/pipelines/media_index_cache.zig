@@ -30,7 +30,27 @@ pub const Cache = struct {
         context: *anyopaque,
         acquire: *const fn (*anyopaque, usize) anyerror!@import("../runtime/tier/memory.zig").AdmissionLease,
     };
-    pub const Data = union(enum) { mp4: media.mp4.Reader, webm: media.webm.Reader };
+    pub const Input = union(enum) { mp4: media.mp4.Reader, webm: media.webm.Reader };
+    pub const Data = union(enum) {
+        mp4: struct {
+            track: media.mp4.Track,
+            packets: []media.mp4.Packet,
+            limits: media.mp4.Limits,
+            pub fn reader(self: @This(), a: std.mem.Allocator, source: *media.source.Source) media.mp4.Reader {
+                return .{ .allocator = a, .input = source, .metadata = .{ .bytes = &.{}, .source = null }, .track = self.track, .packets = self.packets, .limits = self.limits };
+            }
+        },
+        webm: struct {
+            track: media.webm.Track,
+            packets: []media.webm.Packet,
+            cues: []media.webm.Cue,
+            timestamp_scale_ns: u64,
+            duration_seconds: ?f64,
+            pub fn reader(self: @This(), a: std.mem.Allocator, source: *media.source.Source) media.webm.Reader {
+                return .{ .allocator = a, .input = source, .metadata = .{ .bytes = &.{}, .source = null }, .track = self.track, .packets = self.packets, .cues = self.cues, .timestamp_scale_ns = self.timestamp_scale_ns, .duration_seconds = self.duration_seconds };
+            }
+        },
+    };
     pub const Entry = struct {
         allocation: admitted.AdmittedAllocator,
         arena: std.heap.ArenaAllocator,
@@ -83,7 +103,7 @@ pub const Cache = struct {
     }
     /// Best-effort retention after admitted parsing. The cache holds its own
     /// node host-memory reservation rather than borrowing a request's permit.
-    pub fn remember(self: *Cache, a: std.mem.Allocator, identity: [32]u8, data: Data, admission: Admission) void {
+    pub fn remember(self: *Cache, a: std.mem.Allocator, identity: [32]u8, data: Input, admission: Admission) void {
         const estimate = switch (data) {
             .mp4 => |r| std.math.mul(usize, r.packets.len, @sizeOf(media.mp4.Packet)) catch return,
             .webm => |r| (std.math.mul(usize, r.packets.len, @sizeOf(media.webm.Packet)) catch return) +| (std.math.mul(usize, r.cues.len, @sizeOf(media.webm.Cue)) catch return),
@@ -134,32 +154,42 @@ pub const Cache = struct {
             old.destroy();
         }
     }
-    fn copy(_: *Cache, entry: *Entry, data: Data) !void {
+    fn copy(_: *Cache, entry: *Entry, data: Input) !void {
         const a = entry.arena.allocator();
         switch (data) {
             .mp4 => |original| {
-                var r = original;
-                r.input = undefined;
-                r.allocator = a;
-                r.metadata = .{ .bytes = &.{}, .source = null };
-                r.index_reservation = .{};
-                r.track.avcc = try a.dupe(u8, r.track.avcc);
-                r.track.color_info = try a.dupe(u8, r.track.color_info);
-                r.packets = try a.dupe(media.mp4.Packet, r.packets);
-                entry.data = .{ .mp4 = r };
+                var track = original.track;
+                track.avcc = try a.dupe(u8, track.avcc);
+                track.color_info = try a.dupe(u8, track.color_info);
+                entry.data = .{ .mp4 = .{ .track = track, .packets = try a.dupe(media.mp4.Packet, original.packets), .limits = original.limits } };
             },
             .webm => |original| {
-                var r = original;
-                r.input = undefined;
-                r.allocator = a;
-                r.metadata = .{ .bytes = &.{}, .source = null };
-                r.index_reservation = .{};
-                r.track.codec_private = try a.dupe(u8, r.track.codec_private);
-                r.packets = try a.dupe(media.webm.Packet, r.packets);
-                r.cues = try a.dupe(media.webm.Cue, r.cues);
-                entry.data = .{ .webm = r };
+                var track = original.track;
+                track.codec_private = try a.dupe(u8, track.codec_private);
+                track.presentation.projection_private = try a.dupe(u8, track.presentation.projection_private);
+                track.colour.mastering = try a.dupe(u8, track.colour.mastering);
+                entry.data = .{ .webm = .{ .track = track, .packets = try a.dupe(media.webm.Packet, original.packets), .cues = try a.dupe(media.webm.Cue, original.cues), .timestamp_scale_ns = original.timestamp_scale_ns, .duration_seconds = original.duration_seconds } };
             },
         }
+    }
+    pub fn reclaim(raw: *anyopaque, target_bytes: usize) usize {
+        const self: *Cache = @ptrCast(@alignCast(raw));
+        if (!self.mutex.tryLock()) return 0;
+        defer self.mutex.unlock();
+        var released: usize = 0;
+        while (released < target_bytes) {
+            var victim: ?usize = null;
+            for (self.entries, 0..) |slot, index| if (slot) |entry| {
+                if (entry.refs == 0 and (victim == null or entry.used < self.entries[victim.?].?.used)) victim = index;
+            };
+            const index = victim orelse break;
+            const entry = self.entries[index].?;
+            self.entries[index] = null;
+            self.bytes -= entry.bytes;
+            released += entry.bytes;
+            entry.destroy();
+        }
+        return released;
     }
     pub fn release(self: *Cache, entry: *Entry) void {
         self.lock();
@@ -200,16 +230,33 @@ test "model aware media immutable container cache owns metadata and fences sourc
     cache.remember(a, identity, .{ .mp4 = reader }, .{ .context = &provider, .acquire = Provider.acquire });
     @memset(&private, 0);
     packets[0].offset = 99;
-    const hit = cache.get(identity).?;
-    defer cache.release(hit);
-    try std.testing.expectEqualSlices(u8, &.{ 1, 2, 3 }, hit.data.mp4.track.avcc);
-    try std.testing.expectEqual(@as(u64, 20), hit.data.mp4.packets[0].offset);
-    source.storage.range.immutable_binding = @splat(2);
-    try std.testing.expect(cache.get(Cache.key(&source, false, 100, 1024).?) == null);
-    source.storage.range.immutable_binding = @splat(1);
-    try std.testing.expect(cache.get(Cache.key(&source, false, 99, 1024).?) == null);
-    try std.testing.expect(cache.get(Cache.key(&source, true, 100, 1024).?) == null);
-    source.storage.range.immutable_binding = null;
-    try std.testing.expect(Cache.key(&source, false, 100, 1024) == null);
-    try std.testing.expect(cache.bytes <= Cache.max_bytes);
+    {
+        const hit = cache.get(identity).?;
+        defer cache.release(hit);
+        try std.testing.expectEqualSlices(u8, &.{ 1, 2, 3 }, hit.data.mp4.track.avcc);
+        try std.testing.expectEqual(@as(u64, 20), hit.data.mp4.packets[0].offset);
+        source.storage.range.immutable_binding = @splat(2);
+        try std.testing.expect(cache.get(Cache.key(&source, false, 100, 1024).?) == null);
+        source.storage.range.immutable_binding = @splat(1);
+        try std.testing.expect(cache.get(Cache.key(&source, false, 99, 1024).?) == null);
+        try std.testing.expect(cache.get(Cache.key(&source, true, 100, 1024).?) == null);
+        source.storage.range.immutable_binding = @splat(3);
+        const webm_identity = Cache.key(&source, true, 100, 1024).?;
+        private = .{ 4, 5, 6 };
+        const webm_reader = media.webm.Reader{ .allocator = a, .input = &source, .metadata = .{ .bytes = &.{}, .source = null }, .track = .{ .number = 1, .codec = .vp9, .width = 1, .height = 1, .codec_private = &private, .presentation = .{ .projection_private = &private }, .colour = .{ .mastering = &private } }, .packets = &.{}, .cues = &.{}, .timestamp_scale_ns = 1_000_000 };
+        cache.remember(a, webm_identity, .{ .webm = webm_reader }, .{ .context = &provider, .acquire = Provider.acquire });
+        @memset(&private, 0);
+        const webm_hit = cache.get(webm_identity).?;
+        defer cache.release(webm_hit);
+        try std.testing.expectEqualSlices(u8, &.{ 4, 5, 6 }, webm_hit.data.webm.track.codec_private);
+        try std.testing.expectEqualSlices(u8, &.{ 4, 5, 6 }, webm_hit.data.webm.track.presentation.projection_private);
+        try std.testing.expectEqualSlices(u8, &.{ 4, 5, 6 }, webm_hit.data.webm.track.colour.mastering);
+        source.storage.range.immutable_binding = null;
+        try std.testing.expect(Cache.key(&source, false, 100, 1024) == null);
+        try std.testing.expect(cache.bytes <= Cache.max_bytes);
+        try std.testing.expectEqual(@as(usize, 0), Cache.reclaim(&cache, Cache.max_bytes));
+    }
+    try std.testing.expect(Cache.reclaim(&cache, Cache.max_bytes) > 0);
+    try std.testing.expectEqual(@as(usize, 0), cache.bytes);
+    try std.testing.expectEqual(@as(usize, 0), provider.controller.snapshot().hostTotalBytes());
 }
