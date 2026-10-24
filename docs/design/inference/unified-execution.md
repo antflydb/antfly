@@ -1941,6 +1941,224 @@ browser WASM checks, all 15 artifact/accounting/qualification script tests, and
 large penalty histories, convolution and metadata/error paths run on their real
 consumers rather than inferred wrappers.
 
+## Proposed structural kernel and adapter consolidation campaign
+
+This is a new campaign against `5f9bc994ed`, after the completed R01–R36
+campaign. Its 55,668-byte / 1,040-line reduction is frozen and excluded from
+new savings. The plan contains **40 work packages in eight waves**, targeting
+**35–60 KB net authored production reduction**: approximately 20–35 KB of
+native Metal/CUDA source and 15–25 KB of host/adapter code after charging every
+new helper, contract and field list. These are provisional whole-campaign
+ranges, not promised or additive per-package savings. S04 replaces them with
+prototype budgets before broad migration. A slower or larger abstraction is
+rejected even if that reduces the final deletion total.
+
+The next boundary is matching execution phases across existing specialized
+families: packed projection traversal, matrix staging, attention phases, and
+validated layout geometry. Keep schedule dimensions, codecs, folds, masks,
+epilogues, publication and ownership explicit. Reuse the current static owners,
+`launch_abi.ArgumentsFor`, `OwnedDenseOutput`, dense-input leases and
+`kernel_geometry`; add no runtime kernel interpreter or universal tensor owner.
+
+### Inventory and exclusions
+
+A fresh brace-delimited inventory identifies **37 distinct maintained exports /
+121,071 exposed source bytes**. Generated regions are excluded and each export
+occurs once. The inventory measures candidate declarations/bodies, including
+unique phases; it is not a deletion estimate. Metal entries decode maintained C
+string fragments for explicit bodies; this does not replace preprocessed full
+shader accounting. The inventory script, source hashes and per-export sizes
+are retained under `.benchmark-assets/1166/structural-consolidation-plan/`.
+
+| Candidate family | Exports | Exposed bytes | Packages |
+| --- | ---: | ---: | --- |
+| Metal Q4_0 aligned/tail/unrolled matrix | 3 | 10,766 | S05/S06 |
+| Metal Q8 MMV storage/single/pair/QKV | 5 | 14,296 | S07/S08 |
+| Metal Polar4/Turbo3 attention spans | 2 | 7,913 | S09 |
+| Metal segmented and ModernBERT forward attention | 4 | 18,792 | S10/S11 |
+| Metal grouped matrix32/matrix64 attention | 2 | 12,325 | S12 |
+| Metal vision HD64 Q8/Q32 attention | 2 | 7,882 | S13 |
+| CUDA packed Q4_0 projection/activation | 4 | 10,070 | S14/S17 |
+| CUDA fixed E4B attention/down projection | 5 | 10,814 | S15/S16 |
+| CUDA Q8 ordinary-input pair/QKV | 2 | 4,328 | S18 |
+| CUDA Q6_K E4B projection/argmax | 2 | 5,598 | S19 |
+| CUDA ordinary argmax reduction/publication | 2 | 4,538 | S20 |
+| CUDA block/local attention | 2 | 6,400 | S21 |
+| CUDA dense fast prefill/device-scalar decode | 2 | 7,349 | S22 |
+| **Total** | **37** | **121,071** | |
+
+The source also contains 13 six-buffer and 15 seven-buffer contiguous Metal
+binding runs, plus remaining smaller runs. Those counts include diagnostic or
+benchmark callers and are upper bounds, not 28 promised runtime migrations.
+The CUDA compute adapter has 99 matching device-allocation/errdefer scaffolds;
+S29/S30 select compatible ordinary output owners rather than migrating all 99.
+
+Several differences are especially narrow: packed CUDA tile4 versus tile4_w8
+changes the exact partial-array warp extent and final reduction specialization;
+the E4B attention 2048/4096 bodies differ only in their static block count.
+Metal aligned versus aligned-tail matrix kernels share staging/MMA while
+retaining different tail acquisition/publication. These are the first
+prototypes. Similarity alone does not establish rounding or schedule parity.
+
+Do not reopen R20's TurboQuant MMA/prefill merge, R17's multirow register-tile
+merge, R18's generic/A4B/E4B argmax schedule merge, or the GLiNER encoder
+short/M64 merge without new evidence. They are outside this batch. S19 instead
+compares the same five-warp E4B dot phase in ordinary projection and argmax;
+S20 shares only the matching reduction/publication after distinct codec dots.
+S14/S17 compare packed-Q8 consumers with each other, rather than repeating
+R15's rejected scalar-F32 versus packed-Q8 acquisition merge. Previously shared
+scalar quantization, RMS, codec, ranking and generated schedule leaves earn no
+new credit. No model, dtype or architecture admission is expanded by this plan.
+
+### Wave A — freeze and prove the boundaries (S01–S04)
+
+| ID | Work package and concrete result |
+| --- | --- |
+| S01 | Freeze `5f9bc994ed` sources, all three images, decoded/preprocessed shader, Mac/Spark binaries, fixtures and route counters. Preserve the R campaign as history; establish new A/B reference binaries with identical benchmark instrumentation. |
+| S02 | Map every selected native body, matching phase and host call site to one source-budget owner. Separate generated text, parameter lists, new headers, inline tests and tooling. Record which of the 99 output scaffolds and remaining Metal binding runs have compatible lifetime/argument contracts. |
+| S03 | Extend existing fixture builders for the new matrix/packed-projection/attention routes. Include independent references, poison/guard checks, partial-allocation failures, changed-device-scalar replay and forced route selection before source migration. Preserve existing timing protocols and failed receipts. |
+| S04 | Prototype Metal aligned/tail Q4 matrix staging, CUDA packed tile4/warp4/8 traversal, and one resolved broadcast-geometry consumer pair. Measure net source cost, exact native arrays, seven-target CUDA resources/SASS and host/whole-model overhead. Admit owners separately; replace the provisional budget with measured cohort ranges. |
+
+### Wave B — Metal projection and compressed-span owners (S05–S09)
+
+All native shader changes are in `src/backends/metal_kernels.m`. S06 depends
+on S05; S08 depends on S07. Each pair shares one budget.
+
+| ID | Work package and preserved specialization |
+| --- | --- |
+| S05 | Share the aligned/aligned-tail `q4_0_linear_mm_sg` staging and MMA schedule. Keep full-row direct stores versus tail scratch publication, source-row clamping, barriers and existing scratch aliasing explicit static phases. |
+| S06 | Reuse matching acquisition/staging pieces in `_unrolled`; retain its unroll and accumulator/fragment schedule. A common whole body is optional and requires identical code/resources. Do not merge distinct register schedules to force a deletion target. |
+| S07 | Share `q8_0_linear_mmv` / `_in_f16` storage acquisition and matching `linear_rms_scale_mmv` phases through static input/epilogue leaves. Keep conversion, scaling, fold order and exact two-row accumulators. This is the MMV family, not the already-consolidated extended Q8 owner. |
+| S08 | Reuse matching MMV block-dot and reduction phases for `q8_0_pair_linear_mmv` and the Q/KV branches of `q8_0_qkv_linear_mmv`. Instantiate actual single/pair projection extents; preserve unequal Q/KV widths, offsets and branch-specific scratch. Never allocate a maximum three-plane workspace for a two-plane caller. |
+| S09 | Share Polar4/Turbo3 span traversal, masking, max/denominator folds and publication with static codec/query-preparation leaves. Turbo3 alone owns its 32 residual projections; Polar4 must acquire no residual array or extra live values. Preserve repeated-score arithmetic and all nonfinite handling. |
+
+### Wave C — matching Metal attention phases (S10–S13)
+
+These are phase owners for the listed schedules, not a single universal
+attention kernel. Forward and training storage/signature differences stay at
+their actual callers; existing backward kernels retain their schedules.
+
+| ID | Work package and preserved specialization |
+| --- | --- |
+| S10 | Share matching `sdpa_f32_segments_tiled` / `modernbert_training_attention_flash_forward` Q/K/V staging, MMA and online-output phases. Keep packed versus separate QKV acquisition, signed versus unsigned range validation, fragment initialization and training statistics publication distinct. |
+| S11 | Reuse matching scalar/row pieces between `sdpa_f32_segments` and `modernbert_training_attention_forward`. Preserve segment membership, local-window positions, training outputs and the original exponential/reduction sequence. S10/S11 share an inventory group, not an assumed common schedule. |
+| S12 | Share matched phases in `sdpa_f32_grouped_matrix32` / `_matrix64`, with actual query/key tile extents and fragment counts. Retain each schedule's staging, barriers and online update. Exact scratch and register pressure are admission gates. |
+| S13 | Share repeated HD64 vision Q8/Q32 address, mask and compatible score/output phases. Retain query-tile reduction/scratch distinctions. The Q16 flash kernel is excluded; add no wrappers for leaves already shared. |
+
+### Wave D — packed CUDA projection phases (S14–S20)
+
+Device bodies are in `src/ops/cuda/artifacts/inference_cuda_kernels.cu`, with
+small private body headers only where they simplify ownership. Reuse existing
+DP4A/codec/store leaves. No new exported kernel names or dispatch thresholds
+are needed. S16 depends on S15, and S17 depends on S14.
+
+| ID | Work package and preserved specialization |
+| --- | --- |
+| S14 | Own packed-input `linear_q4_0_q8_1_f32_tile4`, `_tile4_w8` and `_tile8` traversal once with static column/warp extents. Preserve full/tail branches, exact `[Cols][Warps]` partials, DP4A acquisition and original final sums. |
+| S15 | Share fixed E4B `tile4_e4b_attn_2048` / `_4096` acquisition/dots with compile-time 64/128 block counts. Their exact model shapes and argument handling remain specialized. |
+| S16 | Connect `tile4_w8_e4b_down`, `_w10_e4b_down` and `_w8_e4b_down_rows` at matching S15 phases. Preserve 8/10-warp scratch, fixed versus live row selection and all existing shape gates. No padded maximum-warp arrays. |
+| S17 | Connect packed `activation_slice_last_dim_q8_1_f32_tile4` to S14's matching partial-dot owner. Keep the exported activation/slice epilogue if moving it changes libdevice code or registers, as in R14. No extra input quantization or header change. |
+| S18 | Share ordinary-input Q8 `pair_nobias_f32_tile4` / `qkv_nobias_f32_tile4` input/dot phases with exact projection counts. Keep unequal output widths, tail masks, accumulators and warp folds explicit. This differs from R16's ordinary Q4 QKV owner. |
+| S19 | Share only the five-warp, ten-block Q6_K E4B dot/partial phase between `q8_1_f32_tile8_e4b` and `q8_1_argmax_rows_stage1_tile8_e4b`. Keep linear output stores and argmax ranking/suppression contracts in separate original epilogues. Generic and A4B argmax schedules remain separate. |
+| S20 | Share the matching four-column ordinary argmax block-reduction/ranking/publication phase in Q8_0 and Q4_K consumers. Distinct acquisition loops and codec folds remain. Reuse existing ranking leaves; preserve ties, suppression, inactive tails and the `[4][256]` scratch/fold exactly. |
+
+### Wave E — CUDA attention phases and Metal host bindings (S21–S26)
+
+| ID | Work package and preserved specialization |
+| --- | --- |
+| S21 | Share matching dot/reduction/value-fold phases in CUDA `attention_f32_block` / `laya_local_attention_f32`. Static range/mask/bias policy preserves full versus local traversal, head layout, `-FLT_MAX` versus `-INFINITY`, all-masked behavior and existing barriers. Keep different exponential validity checks explicit. |
+| S22 | Share matching dense fast prefill/device-scalar decode online traversal in `gqa_attention_prefill_fast_f32` / `gqa_attention_decode_scalars_fast_f32`. Keep scalar acquisition live on every replay, original causal/cache ranges and online folds. TurboQuant prefill schedules are excluded. |
+| S23 | Add actual six-/seven-buffer forced-inline Metal binding owners for repeated runtime multi-output/attention calls. Filter benchmark-only sites from production credit. Preserve every offset, parameter index, dynamic scratch binding, resource retention and encoder boundary. Leave the unique nine-buffer sequence alone unless another real consumer appears. |
+| S24 | Migrate compatible remaining two-/three-/four-/five-buffer runs whose constants are separate or multiple. Extract buffer-only inline leaves beneath current binding owners where profitable; constants remain in caller order. No runtime argument list, side-effect reordering or duplicate helper catalogue. |
+| S25 | Extend existing native/MSL field-list ownership to selected repeated QKV/head-norm parameter records used by this batch. Emit both layouts from one list and assert every offset/size. Charge macro/assertion cost; retain the existing representation if no useful shared contract results. |
+| S26 | Apply the same field ownership to selected segmented/span attention records, preserving signed range/position wires and alignment. Validate native/MSL round trips on actual consumers. S25/S26 are drift prevention, not guaranteed source savings; their added bytes reduce the overall budget. |
+
+### Wave F — CUDA ABI and ordinary output ownership (S27–S30)
+
+| ID | Work package and concrete consumer |
+| --- | --- |
+| S27 | Extend native parameter macros plus `launch_abi.ArgumentsFor` to repeated forward RMS/layer-norm families in `src/ops/cuda/kernels.zig`. Reuse value-record factories only for identical signatures. Keep validation/conversion/error order and per-launch statistics at callers. Native normalization bodies already shared earn no credit. |
+| S28 | Migrate repeated RoPE/device-scalar and compatible gather/transpose/broadcast launch argument setup to native-owned records. Retain unique tuples where a record only adds code. Never copy a mutable slot away from the storage used by a later launch or graph replay; device scalar pointers stay device pointers. |
+| S29 | Introduce one private forced-inline ordinary CUDA output lease around the existing shape allocation, `allocDeviceBuffer` and `createTensorWithDType` transfer in `cuda_compute.zig`. Abort uses the original free/deferred-free policy; successful creation transfers shape/buffer exactly once. It adds no allocation, synchronization, stream change or device pool. Prove partial failures before migration. |
+| S30 | Migrate compatible primitive unary/softmax/reduction and selected F32/BF16 normalization output adapters to S29. Measure allocator calls and source cost including the lease. Prepared outputs, pinned views, BF16 mirrors, captured frame leases and donated buffers keep their current owners unless separately proven compatible. No blanket migration of all 99 scaffolds. |
+
+### Wave G — consume shared geometry in adapters and descriptors (S31–S36)
+
+Put compact pure geometry in the existing `src/ops/kernel_geometry.zig`.
+Backend adapters first resolve their own logical/storage shape conventions;
+common records describe the resolved operation. The refactor preserves existing
+error/decline order and does not unify backend dtype/admission policy.
+
+| ID | Work package and actual consumers |
+| --- | --- |
+| S31 | Resolved broadcast geometry: rank, axis mapping, input/output extents and checked counts/strides consumed by CPU, Metal and CUDA `primBroadcastInDimOp`. Preserve graph rank-zero scalars versus CUDA `[1]` storage, duplicate-axis checks, existing singleton/divisible-extent rules and backend-specific dynamic-dimension resolution. Keep incompatible resolution paths local. |
+| S32 | Resolved transpose geometry: checked permutation/output extents/strides consumed by primitive CPU/Metal/CUDA transpose adapters. Native coalesced rank-two and generic rank-eight CUDA kernels remain separate. Validate before allocation/submission and preserve integer data widths. |
+| S33 | Resolved positive-stride slice geometry: shared output extents, source origin and strides in real CPU/Metal/CUDA slice adapters. Preserve CPU views, Metal donation/selective conversion and CUDA copies. Negative/unsupported stride or backend-specific clipping paths remain explicit. |
+| S34 | Axis-gather geometry: prefix/axis/suffix products, scalar-index shape normalization and output shape shared by the compatible ordinary gather paths. CPU gather-ND/source-backed paths stay separate. Preserve integer versus F32 index wires; this does not silently enable CUDA's currently unsupported integer generic-gather route. |
+| S35 | Replace duplicated layout derivation in `kernel_descriptor.lower` and assigned Metal/CUDA invocation with consumed S31/S32 records. Store only metadata needed by real consumers, inline in the existing tagged descriptor. Backend admission still owns quantization, dtype, device residency and auxiliaries; null-output admission remains allocation/readback free. CPU may retain its current layout decline. |
+| S36 | Connect compatible CPU allocating slice/gather/concat results to existing `OwnedDenseOutput` while consuming S31–S34 geometry. Keep zero-copy/source-backed views at their current lifetime owner. Remove superseded local geometry/cleanup only after actual callers migrate; no new dynamic input bundle or ownership hierarchy. |
+
+### Wave H — close and qualify the composition (S37–S40)
+
+| ID | Work package and acceptance artifact |
+| --- | --- |
+| S37 | Close native include/JIT/watch dependencies, exact symbols, ABI offsets and owner coverage. Use the current transitive-include checks; preprocess Objective-C before extracting the full shader so field macros are present. Verify generated regions remain fresh and retire replaced private bodies in their owning cohort. |
+| S38 | Run final direct/reference/error/replay/route tests for every moved phase and all existing Metal/CUDA regression cases. Require actual hardware execution and explicit route assertions for specialization-only cases. Preserve rejected candidates and timing controls; no rerun-until-pass acceptance. |
+| S39 | Qualify final composition on Mac CPU/Metal and Spark CUDA: all 19 applicable model cases, independent decoder logits, CPU backward primitives, host-encoding probes, training/lifetime selection, seven 120-second soaks, native/WASM and generated/runtime shader checks. Regenerate/check all three pinned CUDA images and compare resources/code on all seven targets. |
+| S40 | Publish net source and image ledgers against `5f9bc994ed`, owner/package outcomes and source/binary identities. Separate authored native bodies, host code, contracts, generated owners/copies, tests, tooling and docs. Finish coherent reviewable commits, clean worktree and cache GC on both machines. No earlier R/N savings are counted again. |
+
+### Execution order and acceptance
+
+After S01–S04, implement each native family as one measured cohort. S05→S06,
+S07→S08, S14→S17, S15→S16, S29→S30 and S31/S32→S35 are explicit dependencies.
+S36 follows the applicable geometry owners. Qualify a cohort's direct paths,
+resources and relevant ownership checks before connecting further consumers.
+Run the full model/soak composition at S39; avoid repeating every unrelated
+full suite after each mechanical adapter migration. If an owner fails, keep its
+specialized schedule and record zero deletion credit while continuing with the
+independent cohorts. Do not let a failed common attention owner block profitable
+packed projection or host-geometry work.
+
+* Correctness: byte-identical A/B outputs/replay by default, independent oracles
+  with their existing explicit precision contracts, output poison/guards, and
+  meaningful allocation/metadata failures. Cover Q4 matrix rows 1/31/32/33/63/64/65,
+  packed columns 1/3/4/5/7/8/9, actual 4/5/8/10-warp profiles, unequal Q/KV
+  dimensions, exact 2048/4096 shapes, full E4B argmax, multiple/empty segments,
+  all-masked/nonfinite attention, local-window boundaries, rank-zero/rank-eight
+  geometry and overflow. Force unsupported paths to decline before writes.
+* Performance: preserve the balanced 32-arm protocols, direct-kernel 5% ceiling
+  and model P50 ≤ 1.05 / P95 ≤ 1.10. Collect identical-source/reversed controls
+  where noise requires them under a declared equal protocol. Keep separate
+  host-encoding/preparation probes and exact submit/compute/blit counts.
+  Protect CPU GEMM/attention vector code and alignment and the tiny backward
+  primitives that caught the R campaign's code-layout regression.
+* Native shape: exact schedule-specific arrays, barriers, conversion sites and
+  accumulation order. Prefer baseline-identical CUDA SASS; compare instruction
+  counts, registers, shared/stack/local memory and occupancy across all seven
+  targets. A register/spill/resource regression triggers redesign or retention,
+  rather than acceptance based only on Spark's timing. Direct native body
+  includes remain available when inlined device functions change shared-storage
+  lowering; all header bytes and cache dependencies count.
+* Ownership: no extra allocations, copies, synchronization or device readbacks
+  in an admitted path. Verify fail-every-host-allocation plus device-budget
+  failures, capture/reset, retained outputs beyond frame-pool capacity, BF16
+  mirror lifetime and teardown. Keep fresh outputs' disjointness contracts and
+  aliased/borrowed inputs distinct. Any claimed memory-traffic improvement must
+  be measured independently of source deletion.
+* Baseline limits: reproduce the existing legacy GLiNER2 integer-gather failures
+  and six broader GLiNER2.5 admission/diagnostic failures rather than relabeling
+  them as passes. New failures are regressions. Spark's current driver rejects
+  both baseline and candidate portable PTX 9.2; qualify native fatbin execution,
+  preserve that blocked-runtime result, and still require all pinned artifact
+  freshness checks. Run portable runtime parity if a compatible driver becomes
+  available. Keep the existing model/checkpoint admission envelope.
+
+This batch is complete when every package has an implemented-and-qualified or
+measured-retention outcome, superseded code is removed, the final combined
+candidate passes its applicable gates, and the ledger includes all replacement
+costs. The deletion target guides prioritization; it does not override the
+kernel performance and ownership contracts.
+
 ## Original checkpoint qualification
 
 Use repository-pinned Zig 0.17.0. Real Metal tests need access to the host GPU;
